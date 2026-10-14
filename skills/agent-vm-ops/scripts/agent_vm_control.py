@@ -43,6 +43,7 @@ DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS = 5
 DIAGNOSTIC_LOG_LIMIT = 8192
 DIAGNOSTIC_LOG_TRUNCATION_MARKER = "\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
 DEFAULT_CONFIG_PATH = Path("/etc/agent-vm-native/config.json")
+CONFIG_ENVIRONMENT_VARIABLE = "AGENT_VM_CONFIG"
 DEFAULT_TIMER_DIR = Path("/etc/systemd/system")
 REQUIRED_ENVIRONMENT_FIELDS = (
     "project",
@@ -3306,13 +3307,33 @@ def parse_timer_args(argv: Sequence[str]) -> dict[str, Any] | None:
     return None
 
 
+def parse_config_args(argv: Sequence[str]) -> tuple[Path, list[str]]:
+    """Extract an optional deployment-selected config path from CLI arguments."""
+    configured = os.environ.get(CONFIG_ENVIRONMENT_VARIABLE)
+    config_path = Path(configured) if configured else DEFAULT_CONFIG_PATH
+    remaining: list[str] = []
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument == "--config":
+            if index + 1 >= len(argv) or not argv[index + 1]:
+                raise ControlError("invalid_request", "--config requires a path")
+            config_path = Path(argv[index + 1])
+            index += 2
+            continue
+        remaining.append(argument)
+        index += 1
+    return config_path, remaining
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
     try:
-        config = load_config()
-        request = parse_timer_args(argv)
+        config_path, command_argv = parse_config_args(argv)
+        config = load_config(config_path)
+        request = parse_timer_args(command_argv)
         if request is None:
-            if argv:
+            if command_argv:
                 raise ControlError("invalid_request", "unknown command-line arguments")
             request = request_from_stdin()
         control = Control(config)

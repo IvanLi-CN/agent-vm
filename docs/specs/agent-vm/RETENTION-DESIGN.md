@@ -10,7 +10,7 @@ An expected continuation is a reason to retain an effective lease, not an indepe
 
 ## Responsibility and evidence
 
-[agent-vm](../../../skills/agent-vm/SKILL.md#retain-and-renew) owns the retention, renewal and Finish procedure. [project-engineering-workflow](../../../skills/project-engineering-workflow/SKILL.md#step-6-post-merge) invokes it at the relevant phase and closure points. This keeps one operating policy while preserving the engineering flow's independent review, CI and publication duties.
+[agent-vm](../../../skills/agent-vm/SKILL.md#retain-and-renew) owns the retention, renewal and Finish procedure. The consuming engineering workflow invokes it at the relevant phase and closure points. This keeps one operating policy while preserving the consumer's independent review, CI and publication duties.
 
 [Implementation coverage](contracts/cli.md#reclamation-and-retry-behavior) records the public retry and cleanup boundary separately from native deployment and live-model evidence. Closure is established by observed lease/access/guest state; a command dispatch or prior expiry cannot substitute for that observation. Existing data-loss authorization remains unchanged.
 

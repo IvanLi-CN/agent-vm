@@ -33,6 +33,18 @@ CLI = load("native_cli", "skills/agent-vm/scripts/agent_vm.py")
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_config_path_cli_overrides_environment(self):
+        with mock.patch.dict(os.environ, {CONTROL.CONFIG_ENVIRONMENT_VARIABLE: "/env/config.json"}, clear=False):
+            path, arguments = CONTROL.parse_config_args(["--config", "/cli/config.json", "--timer-reconcile"])
+        self.assertEqual(path, Path("/cli/config.json"))
+        self.assertEqual(arguments, ["--timer-reconcile"])
+
+    def test_config_path_uses_environment_fallback(self):
+        with mock.patch.dict(os.environ, {CONTROL.CONFIG_ENVIRONMENT_VARIABLE: "/env/config.json"}, clear=False):
+            path, arguments = CONTROL.parse_config_args(["--timer-age-gc"])
+        self.assertEqual(path, Path("/env/config.json"))
+        self.assertEqual(arguments, ["--timer-age-gc"])
+
     def test_environment_fields_are_required(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
