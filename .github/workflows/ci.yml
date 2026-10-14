@@ -1,0 +1,39 @@
+name: checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install Skill test dependencies
+        run: python3 -m pip install --disable-pip-version-check -r requirements-dev.txt
+      - name: Check Skill index
+        run: python3 bin/skills_index_check.py
+      - name: Run repository tests
+        run: python3 -m unittest discover -s bin -p 'test_*.py'
+      - name: Run Skill tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r test_file; do
+            echo "::group::$test_file"
+            case "$test_file" in
+              *.py) python3 "$test_file" ;;
+              *.sh) bash "$test_file" ;;
+            esac
+            echo "::endgroup::"
+          done < <(find skills -type f \( -name 'test_*.py' -o -name 'test-*.sh' \) | sort)
+      - name: Check public boundary
+        run: python3 bin/public_boundary_check.py
+      - name: Check public Skill coupling boundary
+        run: python3 bin/public_skill_boundary_check.py

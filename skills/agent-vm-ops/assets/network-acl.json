@@ -1,0 +1,33 @@
+{
+  "name": "agent-vm-isolation",
+  "description": "Native Agent VM peer and host management isolation",
+  "config": {
+    "user.agent-vm.managed": "native-v1"
+  },
+  "ingress": [
+    {
+      "action": "drop",
+      "state": "enabled",
+      "source": "198.51.100.20-198.51.100.250"
+    }
+  ],
+  "egress": [
+    {
+      "action": "drop",
+      "state": "enabled",
+      "destination": "198.51.100.20-198.51.100.250"
+    },
+    {
+      "action": "drop",
+      "state": "enabled",
+      "destination": "198.51.100.19"
+    },
+    {
+      "action": "drop",
+      "state": "enabled",
+      "destination": "198.51.100.1",
+      "protocol": "tcp",
+      "destination_port": "22"
+    }
+  ]
+}

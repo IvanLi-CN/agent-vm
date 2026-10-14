@@ -1,0 +1,14 @@
+[Unit]
+Description=Expire one native agent VM lease
+After=incus.service
+StartLimitIntervalSec=5min
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-expire %i
+NoNewPrivileges=yes
+PrivateTmp=yes
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=90s

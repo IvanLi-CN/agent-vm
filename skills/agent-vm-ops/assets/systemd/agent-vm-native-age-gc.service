@@ -1,0 +1,9 @@
+[Unit]
+Description=Reclaim expired native agent VM caches
+After=agent-vm-native-reconcile.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-age-gc
+NoNewPrivileges=yes
+PrivateTmp=yes

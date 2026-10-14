@@ -1,0 +1,32 @@
+---
+name: agent-vm-ops
+description: Maintain a configured native Incus Agent VM installation, image, timers, capacity admission and exact reconciliation under an explicit infrastructure task. Daily code execution uses agent-vm.
+---
+
+# Agent VM operations
+
+Use this Skill only for an explicitly authorized infrastructure task. Daily and admin commands share the configured management access; `session_id` is ownership metadata, not a credential boundary. The CLI is described in [the command contract](../../docs/specs/agent-vm/contracts/cli.md); [SPEC](../../docs/specs/agent-vm/SPEC.md) owns lifecycle and capacity policy.
+
+## Inspect and maintain
+
+Begin with `agent-vm doctor`, `agent-vm admin status`, `agent-vm admin session list` and `ssh -G <configured-control-alias>`. The alias and address must come from the explicit operations configuration; daily VM SSH uses task connection information instead. Inspect exact candidate revision/checksums, component versions, native units, Incus project/pool/network/profile and CT-local filesystem capacity before mutation.
+
+For planned maintenance enter `agent-vm admin drain enter`, inspect drain status and wait for effective leases to end and cleanup to confirm NAT/flows closed and VMs stopped. Drain refuses new leases and renewals, permits online retrieval/release, and does not silently extend deadlines. Forced interruption requires explicit separate authorization naming the affected resources.
+
+Review the complete control-environment package transaction and required native dependencies (including conntrack-tools); do not substitute a partial upgrade. Inspect native Incus/systemd/OpenSSH behavior after upgrades. This Skill does not authorize external host lifecycle changes, automatic control-environment restart or broad cleanup.
+
+Deploy only canonical candidate copies of [one-shot control](scripts/agent_vm_control.py) and [systemd assets](assets/systemd/). Follow [the deployment reference](references/deployment.md) for paths and validation. Update the independent client and protected connection material without synchronizing any consumer runtime home. Do not add a resident Python service, HTTP listener, extra sshd, gateway or automatic keepalive. Exit drain only after component health, expiry/reconciliation and storage admission checks are sound.
+
+Client/control use protocol 4. It adds explicit live memory-only adjustment; incompatible older peers fail before effects. Before upgrading, inspect and resolve old pending operation records without rewriting their requests or replaying native effects; retain the database, generations and journals. Under drain, install matching candidate files/config atomically with protected recovery copies. Verify the accepted absence of aggregate CPU/RAM and VM-count quotas, preserving container-only and unrelated restrictions and per-VM limits. Control reports a conflict rather than modifying project configuration on a daily request. Failed health checks keep drain enabled; quota conflicts during restoration require reporting, not deleting caches.
+
+## Images and exact cleanup
+
+Prepare a Debian 13 image with OpenSSH, Python, rsync, Docker/Compose and growpart, verify guest startup and pin the accepted fingerprint. VM image pinning does not restrict a project's container images. Keep non-ephemeral instances and `boot.autostart=false`.
+
+Inspect `agent-vm admin reconcile` and `agent-vm admin gc` dry-runs first. Use `--apply` only within the maintenance task's exact scope. Recheck managed identity, lease generation, state and native resources before deleting anything. Manual GC selects all stopped, no-valid-lease managed caches with confirmed access cleanup, regardless of age. Apply only the authorized scope after reviewing the preview. The native age timer independently selects caches idle at least 24 hours; admission-triggered disk reclaim selects eligible caches oldest first and stops when enough space exists. There is no minimum cache retention time. Never target valid leases, transitional objects, a current resize target, unknown resources or revocation backups. Do not flush conntrack globally.
+
+Check actual disk allocation and current free space only within the CT's Incus pool filesystem. PVE storage inspection and external capacity probes are outside this Skill; do not request PVE addresses or access. Missing local measurements must block admission. CPU/RAM have separate budgets. Pressure must not stop an effective lease. Report real I/O/ENOSPC or partial resize/cleanup failures and preserve non-active records for bounded retry.
+
+Keep non-oversold base budgets within verified CT-visible capacity. Configure finite ratios at least one, CPU 4 and RAM 4 over the 15-vCPU/12288-MiB bases, yielding 60 vCPU/49152 MiB. These are logical allocation ceilings and may exceed CT-visible capacity; only the bases must fit it. Allocation ceilings count occupied/transition records with conservative max(current,target) reservations and exclude stopped caches. Memory observation uses the visible CT root cgroup and verified LXCfs meminfo only; unlimited cgroup memory requires LXCfs. Invalid metrics refuse new admission, while queries expose the structured error and existing lease operations remain available. Below max(1 GiB, 10% effective visible capacity), block new creation/resume/growth without preempting guests. Do not increase bases automatically, inspect ancestors, add a balancer, or stress production memory to prove overselling.
+
+Use precisely owned temporary VMs and isolated storage for faults. Do not fill production disks, change the production clock or affect unrelated flows. Report candidate identity, commands/results, server-time observations, storage facts and remaining blockers; Incus daemon health alone does not establish full service acceptance.
