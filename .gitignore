@@ -1,0 +1,32 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Local operator configuration and credentials.
+config.local.json
+*.local.json
+*.secret
+*.secrets
+.env
+.env.*
+!.env.example
+
+# Deployment inventories belong in the operator's protected configuration.
+skills/*/references/hosts.txt
+skills/*/references/inventory.md
+skills/*/references/deployment-policy.yaml
+skills/*/references/*.env
+
+# Generated previews and reports.
+coverage/
+reports/
+artifacts/
+tmp/

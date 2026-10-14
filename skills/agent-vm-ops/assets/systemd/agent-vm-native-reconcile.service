@@ -1,0 +1,13 @@
+[Unit]
+Description=Reconcile native agent VM state after boot
+After=incus.service
+Wants=incus.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodic native agent VM cache reclamation
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=yes
+AccuracySec=1s
+RandomizedDelaySec=0
+Unit=agent-vm-native-age-gc.service
+
+[Install]
+WantedBy=timers.target
