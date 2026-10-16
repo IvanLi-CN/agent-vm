@@ -67,10 +67,13 @@ test("requires shell tests to contain a test command", () => {
   try {
     const noOp = join(root, "test_noop.sh");
     const valid = join(root, "test_valid.sh");
+    const grouped = join(root, "test_grouped.sh");
     writeFileSync(noOp, "#!/usr/bin/env bash\necho 'test TESTS_RUN=1'\n");
     writeFileSync(valid, "#!/usr/bin/env bash\ntest -e /tmp\n");
+    writeFileSync(grouped, "#!/usr/bin/env bash\n( test -e /tmp )\n");
     expect(() => ensureTestSources([{ path: noOp, kind: "shell" }])).toThrow("without maintained test declarations");
     expect(() => ensureTestSources([{ path: valid, kind: "shell" }])).not.toThrow();
+    expect(() => ensureTestSources([{ path: grouped, kind: "shell" }])).not.toThrow();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -80,7 +83,7 @@ test("accepts Bun parameterized test declarations", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-bun-each-"));
   try {
     const path = join(root, "test_each.test.ts");
-    writeFileSync(path, "test.each([1, 2])('value', (value) => expect(value).toBeTruthy())\n");
+    writeFileSync(path, "test.each([1, 2])('value', (value) => expect(value).toBeTruthy())\ntest.concurrent('concurrent', () => {})\ntest.skipIf(false).each([1])('skipped condition', () => {})\n");
     expect(() => ensureTestSources([{ path, kind: "bun" }])).not.toThrow();
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -220,6 +223,18 @@ test("fails closed for decorated async Python tests", async () => {
   try {
     const path = join(root, "test_decorated_async.py");
     writeFileSync(path, "import functools\n\n@functools.lru_cache()\nasync def test_not_run():\n    raise AssertionError('must be awaited')\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for TestCase methods that return awaitables", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-testcase-awaitable-"));
+  try {
+    const path = join(root, "test_testcase_awaitable.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def test_not_run(self):\n        async def hidden():\n            raise AssertionError('must be awaited')\n        return hidden()\n");
     const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
     expect(await child.exited).toBe(1);
   } finally {

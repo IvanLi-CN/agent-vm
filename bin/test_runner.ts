@@ -49,6 +49,22 @@ const PYTHON_TEST_RUNNER = [
   "async_names += async_test_names(suite)",
   "if async_names:",
   "    raise TypeError('async tests are unsupported: ' + ', '.join(async_names))",
+  "def guard_test_cases(test_suite):",
+  "    for case in test_suite:",
+  "        if isinstance(case, unittest.TestSuite):",
+  "            guard_test_cases(case)",
+  "        elif isinstance(case, unittest.TestCase):",
+  "            method_name = getattr(case, '_testMethodName', '')",
+  "            original = getattr(case, method_name, None)",
+  "            if original is None:",
+  "                continue",
+  "            def guarded(original=original):",
+  "                result = original()",
+  "                if inspect.isawaitable(result) or inspect.isasyncgen(result) or inspect.isgenerator(result):",
+  "                    raise TypeError('async or generator tests are unsupported')",
+  "                return result",
+  "            setattr(case, method_name, guarded)",
+  "guard_test_cases(suite)",
   "def run_module_test(value):",
   "    def run():",
   "        result = value()",
@@ -102,14 +118,14 @@ export function ensureTestSources(files: TestFile[]): void {
   const invalid = files.filter((test) => {
     const source = readText(test.path);
     if (source.trim().length === 0) return true;
-    if (test.kind === "bun") return !/\b(?:test|it|describe)(?:\s*\.\s*each)?\s*\(/.test(source);
+    if (test.kind === "bun") return !/\b(?:test|it|describe)(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\(/.test(source);
     if (test.kind === "python") return !/\b(?:unittest\.|TestCase\b|def\s+test_)/.test(source);
     const hasTestCommand = source.split("\n").some((line) => {
       const executableLine = line
         .replace(/'(?:[^'\\]|\\.)*'/g, "''")
         .replace(/"(?:[^"\\]|\\.)*"/g, "\"\"")
         .replace(/\s+#.*$/, "");
-      const commandBoundary = /(?:^|[;&|]\s*|\bthen\s+)(?:if\s+)?!?\s*/;
+      const commandBoundary = /(?:^|[;&|(){}]\s*|\b(?:then|do)\s+)(?:if\s+)?!?\s*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|(){}]+\s*)*/;
       return new RegExp(`${commandBoundary.source}test\\b`).test(executableLine);
     });
     return !hasTestCommand;
