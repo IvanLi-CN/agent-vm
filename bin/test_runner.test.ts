@@ -150,6 +150,21 @@ test("counts explicit builtin and command shell tests", async () => {
   }
 });
 
+test("preserves shell test counts when a suite replaces the DEBUG trap", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-debug-trap-"));
+  try {
+    const path = join(root, "test_debug_trap.sh");
+    writeFileSync(path, "trap ':' DEBUG\nbuiltin test -e /tmp\ntrap - DEBUG\ncommand test -e /tmp\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(0);
+    expect(executedTestCount("shell", `${stdout}\n${stderr}`)).toBe(2);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("requires a nonzero runtime test count for Bun and Python suites", () => {
   expect(executedTestCount("bun", "Ran 0 tests across 1 files.\nRan 2 tests across 1 files.")).toBe(2);
   expect(executedTestCount("bun", "Ran 0 tests in a comment")).toBeUndefined();
@@ -275,6 +290,23 @@ test("fails closed for TestCase lifecycle hooks that return awaitables", async (
 
     const classPath = join(root, "test_class_hook.py");
     writeFileSync(classPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        async def hidden():\n            return None\n        return hidden()\n    def test_not_run(self):\n        pass\n");
+    const classChild = Bun.spawn(commandForTest({ path: classPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await classChild.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for Python cleanup callbacks that return unsupported values", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-testcase-cleanup-"));
+  try {
+    const instancePath = join(root, "test_instance_cleanup.py");
+    writeFileSync(instancePath, "import unittest\n\nclass Tests(unittest.TestCase):\n    def test_runs(self):\n        async def hidden():\n            return None\n        self.addCleanup(lambda: hidden())\n");
+    const instanceChild = Bun.spawn(commandForTest({ path: instancePath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await instanceChild.exited).toBe(1);
+
+    const classPath = join(root, "test_class_cleanup.py");
+    writeFileSync(classPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        def hidden():\n            yield None\n        cls.addClassCleanup(hidden)\n    def test_runs(self):\n        pass\n");
     const classChild = Bun.spawn(commandForTest({ path: classPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
     expect(await classChild.exited).toBe(1);
   } finally {
