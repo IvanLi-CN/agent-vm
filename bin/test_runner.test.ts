@@ -103,6 +103,21 @@ test("preserves shell assertion status in conditional contexts", async () => {
   }
 });
 
+test("reports shell counts before an explicit successful exit", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-explicit-exit-"));
+  try {
+    const path = join(root, "test_explicit_exit.sh");
+    writeFileSync(path, "test 1 -eq 1\nexit 0\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(0);
+    expect(executedTestCount("shell", `${stdout}\n${stderr}`)).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("requires a nonzero runtime test count for Bun and Python suites", () => {
   expect(executedTestCount("bun", "Ran 0 tests across 1 files.\nRan 2 tests across 1 files.")).toBe(2);
   expect(executedTestCount("bun", "Ran 0 tests in a comment")).toBeUndefined();
