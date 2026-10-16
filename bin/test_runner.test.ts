@@ -313,3 +313,37 @@ test("fails closed for Python cleanup callbacks that return unsupported values",
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("preserves unittest decorators and inherited class lifecycle receivers", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-testcase-metadata-"));
+  try {
+    const path = join(root, "test_metadata.py");
+    writeFileSync(path, "import unittest\n\nclass Base(unittest.TestCase):\n    marker = []\n    @classmethod\n    def setUpClass(cls):\n        cls.marker = [cls.__name__]\n    @classmethod\n    def tearDownClass(cls):\n        if cls.marker != [cls.__name__]:\n            raise AssertionError(cls.marker)\n    def test_base(self):\n        self.assertEqual(self.marker, [self.__class__.__name__])\n\nclass Child(Base):\n    @unittest.skip('decorator metadata')\n    def test_skipped(self):\n        raise AssertionError('skip metadata was lost')\n    @unittest.expectedFailure\n    def test_expected_failure(self):\n        self.fail('expected failure metadata was lost')\n    def test_child(self):\n        self.assertEqual(self.marker, [self.__class__.__name__])\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for unsupported Python module lifecycle and import-time class cleanups", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-module-lifecycle-"));
+  try {
+    const setupPath = join(root, "test_module_setup.py");
+    writeFileSync(setupPath, "import unittest\n\nasync def setUpModule():\n    raise AssertionError('module setup must not be skipped')\n\nclass Tests(unittest.TestCase):\n    def test_runs(self):\n        pass\n");
+    const setupChild = Bun.spawn(commandForTest({ path: setupPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await setupChild.exited).toBe(1);
+
+    const moduleCleanupPath = join(root, "test_module_cleanup.py");
+    writeFileSync(moduleCleanupPath, "import unittest\n\nasync def hidden():\n    raise AssertionError('module cleanup must not be skipped')\nunittest.addModuleCleanup(hidden)\n\nclass Tests(unittest.TestCase):\n    def test_runs(self):\n        pass\n");
+    const moduleCleanupChild = Bun.spawn(commandForTest({ path: moduleCleanupPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await moduleCleanupChild.exited).toBe(1);
+
+    const classCleanupPath = join(root, "test_import_class_cleanup.py");
+    writeFileSync(classCleanupPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    async def hidden():\n        raise AssertionError('class cleanup must not be skipped')\n    def test_runs(self):\n        pass\n\nTests.addClassCleanup(Tests.hidden)\n");
+    const classCleanupChild = Bun.spawn(commandForTest({ path: classCleanupPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await classCleanupChild.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
