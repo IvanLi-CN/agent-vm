@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { commandForTest, discoverTests, ensureTestSelection, testKind } from "./test_runner.ts";
+import { commandForTest, discoverTests, ensureTestSelection, ensureTestSources, testKind } from "./test_runner.ts";
 
 test("discovers maintained TS, Python, and Shell tests automatically", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-"));
@@ -40,4 +40,20 @@ test("runs Python files through unittest discovery so files without a main guard
   expect(commandForTest({ path: "/repo/skills/example/tests/test_reclamation.py", kind: "python" })).toEqual([
     "python3", "-m", "unittest", "discover", "-s", "/repo/skills/example/tests", "-p", "test_reclamation.py",
   ]);
+});
+
+test("fails closed for empty and non-test source files", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-invalid-"));
+  try {
+    const empty = join(root, "test_empty.py");
+    const nonTest = join(root, "test_non_test.py");
+    writeFileSync(empty, "");
+    writeFileSync(nonTest, "print('not a unittest suite')\n");
+    expect(() => ensureTestSources([
+      { path: empty, kind: "python" },
+      { path: nonTest, kind: "python" },
+    ])).toThrow("without maintained test declarations");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

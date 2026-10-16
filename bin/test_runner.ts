@@ -2,7 +2,7 @@
 /** Discover and run maintained TS, Python, and Shell tests without a root edit per sibling. */
 
 import { basename, dirname, join, relative } from "node:path";
-import { isDirectRegularFile, isPathInside, REPO_ROOT, relativePath, walkFiles } from "./repo_util.ts";
+import { isDirectRegularFile, isPathInside, readText, REPO_ROOT, relativePath, walkFiles } from "./repo_util.ts";
 
 export type TestScope = "repo" | "skills";
 export type TestKind = "bun" | "python" | "shell";
@@ -39,6 +39,19 @@ export function discoverTests(root: string = REPO_ROOT, scope: TestScope = "repo
 export function ensureTestSelection(files: TestFile[], scope: TestScope): void {
   if (files.length === 0) {
     throw new Error(`no maintained ${scope} tests were discovered; refusing to pass an empty test selection`);
+  }
+}
+
+export function ensureTestSources(files: TestFile[]): void {
+  const invalid = files.filter((test) => {
+    const source = readText(test.path);
+    if (source.trim().length === 0) return true;
+    if (test.kind === "bun") return !/\b(?:test|it|describe)\s*\(/.test(source);
+    if (test.kind === "python") return !/\b(?:unittest\.|TestCase\b|def\s+test_)/.test(source);
+    return false;
+  });
+  if (invalid.length > 0) {
+    throw new Error(`refusing to run test files without maintained test declarations: ${invalid.map((test) => test.path).join(", ")}`);
   }
 }
 
@@ -87,6 +100,7 @@ export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> 
   const tests = discoverTests(REPO_ROOT, scope);
   try {
     ensureTestSelection(tests, scope);
+    ensureTestSources(tests);
   } catch (error) {
     console.error(`ERROR ${String(error)}`);
     return 1;
