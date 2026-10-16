@@ -8,8 +8,9 @@ export type TestScope = "repo" | "skills";
 export type TestKind = "bun" | "python" | "shell";
 export type TestFile = { path: string; kind: TestKind };
 
-const IGNORED_DIRECTORIES = new Set([
-  ".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "coverage", "reports", "artifacts", "tmp",
+const IGNORED_DIRECTORIES = new Set([".git"]);
+const IGNORED_ROOT_DIRECTORIES = new Set([
+  "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "coverage", "reports", "artifacts", "tmp",
 ]);
 
 export function testKind(path: string): TestKind | undefined {
@@ -21,7 +22,10 @@ export function testKind(path: string): TestKind | undefined {
 }
 
 export function discoverTests(root: string = REPO_ROOT, scope: TestScope = "repo"): TestFile[] {
-  const files = walkFiles(root, { ignoredDirectories: IGNORED_DIRECTORIES });
+  const files = walkFiles(root, {
+    ignoredDirectories: IGNORED_DIRECTORIES,
+    ignoredDirectoriesAtRoot: IGNORED_ROOT_DIRECTORIES,
+  });
   return files
     .filter((path) => path !== join(root, "bin", "test_runner.ts"))
     .filter((path) => (scope === "repo" ? !path.startsWith(join(root, "skills") + "/") && !path.startsWith(join(root, "skills") + "\\") : path.startsWith(join(root, "skills") + "/") || path.startsWith(join(root, "skills") + "\\")))

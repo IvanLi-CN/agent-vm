@@ -14,13 +14,15 @@ test("discovers maintained TS, Python, and Shell tests automatically", () => {
     writeFileSync(join(root, "skills", "alpha", "test_python.py"), "");
     writeFileSync(join(root, "skills", "alpha", "test-shell.sh"), "");
     writeFileSync(join(root, "skills", "alpha", "test_runner.ts"), "");
+    mkdirSync(join(root, "skills", "alpha", "tmp"), { recursive: true });
+    writeFileSync(join(root, "skills", "alpha", "tmp", "test_nested.py"), "");
     writeFileSync(join(root, "build", "test_generated.py"), "");
     expect(testKind("example.test.ts")).toBe("bun");
     expect(testKind("test_python.py")).toBe("python");
     expect(testKind("test-shell.sh")).toBe("shell");
     expect(testKind("test_runner.ts")).toBe("bun");
     expect(discoverTests(root, "repo").map((testFile) => testFile.kind)).toEqual(["bun"]);
-    expect(discoverTests(root, "skills").map((testFile) => testFile.kind).sort()).toEqual(["bun", "python", "shell"]);
+    expect(discoverTests(root, "skills").map((testFile) => testFile.kind).sort()).toEqual(["bun", "python", "python", "shell"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

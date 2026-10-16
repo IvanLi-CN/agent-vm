@@ -3,7 +3,7 @@
 
 import { existsSync, lstatSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { REPO_ROOT, readText } from "./repo_util.ts";
+import { isPathInside, REPO_ROOT, readText } from "./repo_util.ts";
 
 const TOP_LEVEL_RE = /^##\s+(.+?)\s*$/;
 const REQ_RE = /\bREQ-[A-Z0-9][A-Z0-9_-]*\b/g;
@@ -52,8 +52,12 @@ function sectionMap(lines: string[]): Map<string, { start: number; body: string[
 
 export function check(path: string, root: string = REPO_ROOT): string[] {
   const absolute = resolve(path);
-  const relativePath = relative(resolve(root), absolute).split("\\").join("/");
+  const rootAbsolute = resolve(root);
+  const relativePath = relative(rootAbsolute, absolute).split("\\").join("/");
   const errors: string[] = [];
+  if (!isPathInside(rootAbsolute, absolute)) {
+    return [emit(relativePath, "SPEC_PATH_INVALID", "Spec path must remain inside the repository root")];
+  }
   if (!/^docs\/specs\/[a-z0-9]+(?:-[a-z0-9]+)*\/SPEC\.md$/.test(relativePath)) {
     return [emit(relativePath, "SPEC_PATH_INVALID", "strict checking only applies to canonical docs/specs/<slug>/SPEC.md")];
   }
@@ -139,11 +143,12 @@ export function check(path: string, root: string = REPO_ROOT): string[] {
 }
 
 type ParsedArgs = { paths: string[]; root: string };
+const USAGE = "usage: spec_contract_check.ts --path <path> [--path <path> ...]";
 
 function requiredValue(args: string[], index: number): string {
   const value = args[index + 1];
   if (!value || value.startsWith("--")) {
-    throw new Error("usage: spec_contract_check.ts --path <path> [--path <path> ...]");
+    throw new Error(USAGE);
   }
   return value;
 }
@@ -156,17 +161,29 @@ export function parseArgs(args: string[]): ParsedArgs {
     if (arg === "--path") {
       paths.push(requiredValue(args, index));
       index += 1;
+    } else if (arg.startsWith("--path=")) {
+      const value = arg.slice("--path=".length);
+      if (!value) throw new Error(USAGE);
+      paths.push(value);
     } else if (arg === "--repo-root") {
       root = resolve(requiredValue(args, index));
       index += 1;
+    } else if (arg.startsWith("--repo-root=")) {
+      const value = arg.slice("--repo-root=".length);
+      if (!value) throw new Error(USAGE);
+      root = resolve(value);
     } else {
-      throw new Error("usage: spec_contract_check.ts --path <path> [--path <path> ...]");
+      throw new Error(USAGE);
     }
   }
   return { paths, root };
 }
 
 export function main(args: string[] = Bun.argv.slice(2)): number {
+  if (args.includes("--help")) {
+    console.log(USAGE);
+    return 0;
+  }
   let parsed: ParsedArgs;
   try {
     parsed = parseArgs(args);
@@ -176,7 +193,7 @@ export function main(args: string[] = Bun.argv.slice(2)): number {
   }
   const paths = parsed.paths.map((path) => resolve(parsed.root, path));
   if (paths.length === 0) {
-    console.error("usage: spec_contract_check.ts --path <path> [--path <path> ...]");
+    console.error(USAGE);
     return 2;
   }
   const errors = paths.flatMap((path) => check(path, parsed.root));
