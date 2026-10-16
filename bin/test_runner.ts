@@ -55,6 +55,12 @@ export function ensureTestSources(files: TestFile[]): void {
   }
 }
 
+export function executedTestCount(kind: TestKind, output: string): number | undefined {
+  if (kind === "shell") return undefined;
+  const match = /Ran\s+(\d+)\s+tests?\b/i.exec(output);
+  return match ? Number(match[1]) : undefined;
+}
+
 export function commandForTest(test: TestFile): string[] {
   if (test.kind === "bun") return [process.execPath, "test", test.path];
   if (test.kind === "python") return ["python3", "-m", "unittest", "discover", "-s", dirname(test.path), "-p", basename(test.path)];
@@ -69,11 +75,21 @@ async function runTest(test: TestFile): Promise<number> {
   console.log(`::group::${relativePath(test.path)}`);
   const child = Bun.spawn(commandForTest(test), {
     cwd: REPO_ROOT,
-    stdout: "inherit",
-    stderr: "inherit",
+    stdout: "pipe",
+    stderr: "pipe",
   });
+  const stdout = new Response(child.stdout).text();
+  const stderr = new Response(child.stderr).text();
   const exitCode = await child.exited;
+  const [out, err] = await Promise.all([stdout, stderr]);
+  process.stdout.write(out);
+  process.stderr.write(err);
   console.log("::endgroup::");
+  const count = executedTestCount(test.kind, `${out}\n${err}`);
+  if (exitCode === 0 && test.kind !== "shell" && (count === undefined || count === 0)) {
+    console.error(`ERROR test command reported zero executed tests: ${test.path}`);
+    return 1;
+  }
   return exitCode;
 }
 

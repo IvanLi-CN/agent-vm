@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { commandForTest, discoverTests, ensureTestSelection, ensureTestSources, testKind } from "./test_runner.ts";
+import { commandForTest, discoverTests, ensureTestSelection, ensureTestSources, executedTestCount, testKind } from "./test_runner.ts";
 
 test("discovers maintained TS, Python, and Shell tests automatically", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-"));
@@ -56,4 +56,10 @@ test("fails closed for empty and non-test source files", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("requires a nonzero runtime test count for Bun and Python suites", () => {
+  expect(executedTestCount("bun", "Ran 0 tests across 1 files.")).toBe(0);
+  expect(executedTestCount("python", "Ran 21 tests in 0.1s")).toBe(21);
+  expect(executedTestCount("shell", "shell completed")).toBeUndefined();
 });
