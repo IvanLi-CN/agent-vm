@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /** Discover and run maintained TS, Python, and Shell tests without a root edit per sibling. */
 
-import { basename, dirname, join, relative } from "node:path";
+import { dirname, join, relative } from "node:path";
 import { isDirectRegularFile, isPathInside, readText, REPO_ROOT, relativePath, walkFiles } from "./repo_util.ts";
 
 export type TestScope = "repo" | "skills";
@@ -12,6 +12,24 @@ const IGNORED_DIRECTORIES = new Set([
   "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build", "coverage", "reports", "artifacts", "tmp",
   ".git",
 ]);
+
+const PYTHON_TEST_RUNNER = [
+  "import importlib.util",
+  "import pathlib",
+  "import sys",
+  "import unittest",
+  "path = pathlib.Path(sys.argv[1])",
+  "sys.path.insert(0, str(path.parent))",
+  "spec = importlib.util.spec_from_file_location('agent_toolkit_test_module', path)",
+  "if spec is None or spec.loader is None:",
+  "    raise ImportError(path)",
+  "module = importlib.util.module_from_spec(spec)",
+  "sys.modules[spec.name] = module",
+  "spec.loader.exec_module(module)",
+  "suite = unittest.defaultTestLoader.loadTestsFromModule(module)",
+  "result = unittest.TextTestRunner(verbosity=1).run(suite)",
+  "raise SystemExit(0 if result.wasSuccessful() else 1)",
+].join("\n");
 
 export function testKind(path: string): TestKind | undefined {
   const name = path.split(/[\\/]/).at(-1) ?? "";
@@ -85,7 +103,7 @@ export function executedTestCount(kind: TestKind, output: string): number | unde
 
 export function commandForTest(test: TestFile): string[] {
   if (test.kind === "bun") return [process.execPath, "test", test.path];
-  if (test.kind === "python") return ["python3", "-m", "unittest", "discover", "-s", dirname(test.path), "-p", basename(test.path)];
+  if (test.kind === "python") return ["python3", "-c", PYTHON_TEST_RUNNER, test.path];
   return [
     "bash",
     "-c",

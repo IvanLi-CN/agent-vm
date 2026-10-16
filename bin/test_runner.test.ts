@@ -38,10 +38,12 @@ test("fails closed when deliberate test selection omits every file", () => {
   expect(() => ensureTestSelection([], "repo")).toThrow("refusing to pass an empty test selection");
 });
 
-test("runs Python files through unittest discovery so files without a main guard are executed", () => {
+test("runs Python files by path so files without a main guard or with hyphens are executed", () => {
   expect(commandForTest({ path: "/repo/skills/example/tests/test_reclamation.py", kind: "python" })).toEqual([
-    "python3", "-m", "unittest", "discover", "-s", "/repo/skills/example/tests", "-p", "test_reclamation.py",
+    "python3", "-c", expect.any(String), "/repo/skills/example/tests/test_reclamation.py",
   ]);
+  const command = commandForTest({ path: "/repo/skills/example/tests/test_reclamation.py", kind: "python" });
+  expect(command[2]).toContain("spec_from_file_location");
 });
 
 test("fails closed for empty and non-test source files", () => {
@@ -106,6 +108,21 @@ test("executes a Python unittest suite without a main guard", async () => {
     const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
     expect(await child.exited).toBe(0);
     expect(existsSync(marker)).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executes a hyphenated Python unittest file", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-hyphenated-"));
+  try {
+    const path = join(root, "test-hyphenated.py");
+    writeFileSync(path, "import unittest\n\nclass HyphenatedTests(unittest.TestCase):\n    def test_runs(self):\n        self.assertTrue(True)\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(0);
+    expect(executedTestCount("python", `${stdout}\n${stderr}`)).toBe(1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
