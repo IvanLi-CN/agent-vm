@@ -80,7 +80,7 @@ test("fails shell suites when no test command executes", async () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-runtime-"));
   try {
     const path = join(root, "test_dead_branch.sh");
-    writeFileSync(path, "#!/usr/bin/env bash\nif false; then test -e /missing; fi\n");
+    writeFileSync(path, "#!/usr/bin/env bash\ncount=1\nif false; then test -e /missing; fi\n");
     const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
     const stdout = await new Response(child.stdout).text();
     const stderr = await new Response(child.stderr).text();

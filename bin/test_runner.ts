@@ -108,7 +108,7 @@ export function commandForTest(test: TestFile): string[] {
   return [
     "bash",
     "-c",
-    "set -euo pipefail\ncount=0\ntest() { count=$((count + 1)); builtin test \"$@\"; }\nsource \"$0\"\nif ((count == 0)); then exit 1; fi\nprintf 'TESTS_RUN=%s\\n' \"$count\"\n",
+    "set -euo pipefail\nmarker_file=$(mktemp)\nreadonly marker_file\ntrap 'rm -f -- \"$marker_file\"' EXIT\ntest() { builtin test \"$@\"; builtin printf '.\\n' >> \"$marker_file\"; }\nreadonly -f test\nsource \"$0\"\ncount=$(wc -l < \"$marker_file\")\nif ((count == 0)); then exit 1; fi\nbuiltin printf 'TESTS_RUN=%s\\n' \"$count\"\n",
     test.path,
   ];
 }

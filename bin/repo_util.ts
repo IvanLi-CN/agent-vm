@@ -22,7 +22,7 @@ const GIT_REPOSITORY_ENVIRONMENT = new Set([
 ]);
 
 export function gitEnvironment(environment: Record<string, string | undefined>): Record<string, string> {
-  return Object.fromEntries(Object.entries(environment).filter(([key, value]) => value !== undefined && !GIT_REPOSITORY_ENVIRONMENT.has(key) && key !== "GIT_CONFIG" && !key.startsWith("GIT_CONFIG_"))) as Record<string, string>;
+  return Object.fromEntries(Object.entries(environment).filter(([key, value]) => value !== undefined && !GIT_REPOSITORY_ENVIRONMENT.has(key) && key !== "GIT_CONFIG" && !key.startsWith("GIT_CONFIG_") && key !== "GIT_TEMPLATE_DIR")) as Record<string, string>;
 }
 
 function decode(output: Uint8Array): string {
