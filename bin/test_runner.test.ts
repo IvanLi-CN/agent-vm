@@ -60,15 +60,30 @@ test("fails closed for empty and non-test source files", () => {
   }
 });
 
-test("requires shell tests to contain an assertion and a positive count marker", () => {
+test("requires shell tests to contain a test command", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-"));
   try {
     const noOp = join(root, "test_noop.sh");
     const valid = join(root, "test_valid.sh");
-    writeFileSync(noOp, "#!/usr/bin/env bash\necho 'test TESTS_RUN=1'\nprintf 'TESTS_RUN=%s\\n' 1\n");
-    writeFileSync(valid, "#!/usr/bin/env bash\ntest -e /tmp\nprintf 'TESTS_RUN=%s\\n' 1\n");
+    writeFileSync(noOp, "#!/usr/bin/env bash\necho 'test TESTS_RUN=1'\n");
+    writeFileSync(valid, "#!/usr/bin/env bash\ntest -e /tmp\n");
     expect(() => ensureTestSources([{ path: noOp, kind: "shell" }])).toThrow("without maintained test declarations");
     expect(() => ensureTestSources([{ path: valid, kind: "shell" }])).not.toThrow();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails shell suites when no test command executes", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-runtime-"));
+  try {
+    const path = join(root, "test_dead_branch.sh");
+    writeFileSync(path, "#!/usr/bin/env bash\nif false; then test -e /missing; fi\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(1);
+    expect(executedTestCount("shell", `${stdout}\n${stderr}`)).toBeUndefined();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
