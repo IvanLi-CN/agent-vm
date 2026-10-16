@@ -8,11 +8,12 @@ export type TestScope = "repo" | "skills";
 export type TestKind = "bun" | "python" | "shell";
 export type TestFile = { path: string; kind: TestKind };
 
-const IGNORED_DIRECTORIES = new Set([".git", "node_modules", ".venv", "venv", "__pycache__"]);
+const IGNORED_DIRECTORIES = new Set([
+  ".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "coverage", "reports", "artifacts", "tmp",
+]);
 
 export function testKind(path: string): TestKind | undefined {
   const name = path.split(/[\\/]/).at(-1) ?? "";
-  if (name === "test_runner.ts") return undefined;
   if (name.endsWith(".test.ts") || /^test[-_].*\.ts$/.test(name) || /_test\.ts$/.test(name)) return "bun";
   if (name.endsWith(".test.py") || /^test[-_].*\.py$/.test(name) || /_test\.py$/.test(name)) return "python";
   if (name.endsWith(".test.sh") || /^test[-_].*\.sh$/.test(name) || /_test\.sh$/.test(name)) return "shell";
@@ -22,12 +23,13 @@ export function testKind(path: string): TestKind | undefined {
 export function discoverTests(root: string = REPO_ROOT, scope: TestScope = "repo"): TestFile[] {
   const files = walkFiles(root, { ignoredDirectories: IGNORED_DIRECTORIES });
   return files
+    .filter((path) => path !== join(root, "bin", "test_runner.ts"))
     .filter((path) => (scope === "repo" ? !path.startsWith(join(root, "skills") + "/") && !path.startsWith(join(root, "skills") + "\\") : path.startsWith(join(root, "skills") + "/") || path.startsWith(join(root, "skills") + "\\")))
     .flatMap((path) => {
       const kind = testKind(path);
       return kind ? [{ path, kind }] : [];
     })
-    .sort((left, right) => left.path.localeCompare(right.path));
+    .sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
 }
 
 export function ensureTestSelection(files: TestFile[], scope: TestScope): void {
@@ -55,11 +57,15 @@ async function runTest(test: TestFile): Promise<number> {
 }
 
 function parseScope(args: string[]): TestScope {
-  const value = args.find((arg) => arg.startsWith("--scope="))?.slice("--scope=".length) ?? args[args.indexOf("--scope") + 1] ?? "";
-  if (value !== "repo" && value !== "skills") {
-    throw new Error("usage: test_runner.ts --scope repo|skills");
+  if (args.length === 1 && args[0].startsWith("--scope=")) {
+    const value = args[0].slice("--scope=".length);
+    if (value === "repo" || value === "skills") return value;
   }
-  return value;
+  if (args.length === 2 && args[0] === "--scope") {
+    const value = args[1];
+    if (value === "repo" || value === "skills") return value;
+  }
+  throw new Error("usage: test_runner.ts --scope repo|skills");
 }
 
 export async function main(args: string[] = Bun.argv.slice(2)): Promise<number> {

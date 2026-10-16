@@ -3,7 +3,7 @@
 
 import { existsSync, lstatSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { REPO_ROOT, readText, walkFiles } from "./repo_util.ts";
+import { REPO_ROOT, readText } from "./repo_util.ts";
 
 const TOP_LEVEL_RE = /^##\s+(.+?)\s*$/;
 const REQ_RE = /\bREQ-[A-Z0-9][A-Z0-9_-]*\b/g;
@@ -138,36 +138,45 @@ export function check(path: string, root: string = REPO_ROOT): string[] {
   return errors;
 }
 
-export function canonicalSpecs(root: string = REPO_ROOT): string[] {
-  return walkFiles(join(root, "docs", "specs"))
-    .filter((path) => /\/SPEC\.md$/.test(path) || path.endsWith("\\SPEC.md"))
-    .sort();
+type ParsedArgs = { paths: string[]; root: string };
+
+function requiredValue(args: string[], index: number): string {
+  const value = args[index + 1];
+  if (!value || value.startsWith("--")) {
+    throw new Error("usage: spec_contract_check.ts --path <path> [--path <path> ...]");
+  }
+  return value;
 }
 
-function parseArgs(args: string[]): { paths: string[]; root: string; all: boolean } {
+export function parseArgs(args: string[]): ParsedArgs {
   const paths: string[] = [];
   let root = REPO_ROOT;
-  let all = false;
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--path") {
-      const path = args[++index];
-      if (path) paths.push(path);
+      paths.push(requiredValue(args, index));
+      index += 1;
     } else if (arg === "--repo-root") {
-      const value = args[++index];
-      if (value) root = resolve(value);
-    } else if (arg === "--all") {
-      all = true;
+      root = resolve(requiredValue(args, index));
+      index += 1;
+    } else {
+      throw new Error("usage: spec_contract_check.ts --path <path> [--path <path> ...]");
     }
   }
-  return { paths, root, all };
+  return { paths, root };
 }
 
 export function main(args: string[] = Bun.argv.slice(2)): number {
-  const parsed = parseArgs(args);
-  const paths = parsed.all ? canonicalSpecs(parsed.root) : parsed.paths.map((path) => resolve(parsed.root, path));
+  let parsed: ParsedArgs;
+  try {
+    parsed = parseArgs(args);
+  } catch (error) {
+    console.error(`ERROR ${String(error)}`);
+    return 2;
+  }
+  const paths = parsed.paths.map((path) => resolve(parsed.root, path));
   if (paths.length === 0) {
-    console.error("usage: spec_contract_check.ts --path <path> [--path <path> ...] | --all");
+    console.error("usage: spec_contract_check.ts --path <path> [--path <path> ...]");
     return 2;
   }
   const errors = paths.flatMap((path) => check(path, parsed.root));
@@ -175,7 +184,7 @@ export function main(args: string[] = Bun.argv.slice(2)): number {
     errors.forEach((error) => console.log(error));
     return 1;
   }
-  for (const path of parsed.all ? paths.map((item) => relative(parsed.root, item)) : parsed.paths) {
+  for (const path of parsed.paths) {
     console.log(`PASS path=${path} checks=ok`);
   }
   return 0;

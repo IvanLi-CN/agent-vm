@@ -1,5 +1,5 @@
-import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
-import { dirname, join, relative, resolve } from "node:path";
+import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -40,6 +40,7 @@ export function trackedFiles(repoRoot: string = REPO_ROOT): string[] {
 
 export type WalkOptions = {
   ignoredDirectories?: Set<string>;
+  onRejectedSymlink?: (path: string) => void;
 };
 
 export function walkFiles(root: string, options: WalkOptions = {}): string[] {
@@ -48,13 +49,32 @@ export function walkFiles(root: string, options: WalkOptions = {}): string[] {
   }
 
   const ignored = options.ignoredDirectories ?? new Set<string>();
+  const rootRealPath = realpathSync(root);
+  const visitedDirectories = new Set<string>();
   const files: string[] = [];
-  const visit = (directory: string): void => {
+  const isInsideRoot = (path: string): boolean => path === rootRealPath || path.startsWith(`${rootRealPath}${sep}`);
+  const visit = (directory: string, realDirectory: string = realpathSync(directory)): void => {
+    if (visitedDirectories.has(realDirectory)) return;
+    visitedDirectories.add(realDirectory);
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       if (entry.isSymbolicLink()) {
-        if (entry.isFile()) {
-          files.push(path);
+        try {
+          const realPath = realpathSync(path);
+          if (!isInsideRoot(realPath)) {
+            options.onRejectedSymlink?.(path);
+            continue;
+          }
+          const stats = statSync(path);
+          if (stats.isFile()) {
+            files.push(path);
+          } else if (stats.isDirectory() && !ignored.has(entry.name)) {
+            visit(path, realPath);
+          } else {
+            options.onRejectedSymlink?.(path);
+          }
+        } catch {
+          options.onRejectedSymlink?.(path);
         }
         continue;
       }
@@ -77,16 +97,18 @@ export function readText(path: string): string {
   return readFileSync(path, "utf8");
 }
 
+export function isRegularFile(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 export function relativePath(path: string, repoRoot: string = REPO_ROOT): string {
   return relative(repoRoot, path).split("\\").join("/");
 }
 
 export function resolveExistingFile(candidates: string[]): string | undefined {
-  return candidates.find((candidate) => {
-    try {
-      return lstatSync(candidate).isFile();
-    } catch {
-      return false;
-    }
-  });
+  return candidates.find((candidate) => isRegularFile(candidate));
 }
