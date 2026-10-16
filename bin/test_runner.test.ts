@@ -91,6 +91,18 @@ test("fails shell suites when no test command executes", async () => {
   }
 });
 
+test("preserves shell assertion status in conditional contexts", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-status-"));
+  try {
+    const path = join(root, "test_failed_assertion.sh");
+    writeFileSync(path, "test 1 -eq 2 || exit 1\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("requires a nonzero runtime test count for Bun and Python suites", () => {
   expect(executedTestCount("bun", "Ran 0 tests across 1 files.\nRan 2 tests across 1 files.")).toBe(2);
   expect(executedTestCount("bun", "Ran 0 tests in a comment")).toBeUndefined();
