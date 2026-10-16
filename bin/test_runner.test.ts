@@ -150,6 +150,139 @@ test("counts explicit builtin and command shell tests", async () => {
   }
 });
 
+test("counts command test options and rejects command-name prefixes", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-command-options-"));
+  try {
+    const validPath = join(root, "test_command_options.sh");
+    writeFileSync(validPath, "X=1 command -- test -e /tmp\ncommand -p -- \"test\" -e /tmp\ncommand 'test' -e /tmp\n");
+    const validChild = Bun.spawn(commandForTest({ path: validPath, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const validStdout = await new Response(validChild.stdout).text();
+    const validStderr = await new Response(validChild.stderr).text();
+    expect(await validChild.exited).toBe(0);
+    expect(executedTestCount("shell", `${validStdout}\n${validStderr}`)).toBe(3);
+
+    const prefixPath = join(root, "test_command_prefix.sh");
+    writeFileSync(prefixPath, "if false; then test -e /missing; fi\ncommand test_not_a_builtin || true\ncommand test -e /tmp < /definitely-missing-agent-toolkit-input || true\n");
+    const prefixChild = Bun.spawn(commandForTest({ path: prefixPath, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await prefixChild.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("counts shell assertions with comparison characters and valid redirection", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-builtin-redirection-"));
+  try {
+    const path = join(root, "test_builtin_redirection.sh");
+    writeFileSync(path, "builtin test 'a>b' = 'a>b'\nbuiltin test 'a<b' = 'a<b'\nbuiltin test 1 -eq 1 > /dev/null\nbuiltin test 1 -eq 1 < /dev/null\nbuiltin test 1 -eq 1 > '/dev/null'\nbuiltin test 1 -eq 1 > \"/dev/null\"\ncommand test 'a>b' = 'a>b'\ncommand test 'a<b' = 'a<b'\ncommand test 1 -eq 1 > /dev/null\ncommand test 1 -eq 1 < /dev/null\ncommand test 1 -eq 1 > '/dev/null'\ncommand test 1 -eq 1 < \"/dev/null\"\nbuiltin test -d / < /definitely-missing-agent-toolkit-input || true\ncommand test -d / > /definitely-missing-agent-toolkit-output/out || true\nbuiltin test -d / > . || true\ncommand test -d / > . || true\nbuiltin test 1 -eq 1 > /dev/null > . || true\ncommand test 1 -eq 1 < /dev/null < /definitely-missing-agent-toolkit-input || true\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(0);
+    expect(executedTestCount("shell", `${stdout}\n${stderr}`)).toBe(12);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("counts valid file-descriptor, force, and here-string redirections", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-valid-redirections-"));
+  try {
+    const path = join(root, "test_valid_redirections.sh");
+    writeFileSync(path, "builtin test 1 -eq 1 >&1\nbuiltin test 1 -eq 1 >&2\nbuiltin test 1 -eq 1 >| README.md\nbuiltin test 1 -eq 1 <<< \"hello\"\nbuiltin test 1 -eq 1 > /dev/fd/1\ntarget=/dev/null\nbuiltin test 1 -eq 1 > \"$target\"\nexec 3>&1\nbuiltin test 1 -eq 1 3>&1 1>&3\nbuiltin test 1 -eq 1 3>/dev/null >&3\n");
+    writeFileSync(join(root, "README.md"), "existing\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(0);
+    expect(executedTestCount("shell", `${stdout}\n${stderr}`)).toBe(8);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("counts redirections with resolved targets, descriptor moves, and heredocs", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-redirection-state-"));
+  try {
+    const path = join(root, "test_redirection_state.sh");
+    writeFileSync(path, "builtin test 1 -eq 1 >> README.md\nbuiltin test 1 -eq 1 > /dev/fd/./1\nbuiltin test 1 -eq 1 > /dev/./fd/1\ninput_target=/dev/null\nbuiltin test 1 -eq 1 < \"$input_target\"\nfd=1\nbuiltin test 1 -eq 1 >&\"$fd\"\noutput_target=/dev/null\nbuiltin test 1 -eq 1 > \"$output_target\"\nexec 3<&0\nbuiltin test 1 -eq 1 3<&0 0<&3\nexec 4>&1\nbuiltin test 1 -eq 1 4>&1- 1>&4\nbuiltin test 1 -eq 1 <<EOF\nbody\nEOF\n");
+    writeFileSync(join(root, "README.md"), "existing\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(0);
+    expect(executedTestCount("shell", `${stdout}\n${stderr}`)).toBe(9);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects empty, split, and traversal redirection targets", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-invalid-targets-"));
+  try {
+    const path = join(root, "test_invalid_targets.sh");
+    writeFileSync(path, "empty=\"\"\nbuiltin test 1 -eq 1 > \"$empty\" || true\nspaced=\"bad target\"\nbuiltin test 1 -eq 1 > $spaced || true\nbuiltin test 1 -eq 1 > /dev/fd/../fd/999 || true\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("tracks closed input descriptors and literal quoted redirection variables", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-redirection-closed-input-"));
+  try {
+    const path = join(root, "test_closed_input.sh");
+    writeFileSync(path, "exec 3>/dev/null\nbuiltin test 1 -eq 1 3>&- 0<&3 || true\nx=README.md\nbuiltin test 1 -eq 1 < '$x' || true\n");
+    writeFileSync(join(root, "README.md"), "existing\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("accepts embedded variable expansion in quoted output targets", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-redirection-variable-"));
+  try {
+    const path = join(root, "test_embedded_target.sh");
+    writeFileSync(path, "dest=null\nbuiltin test 1 -eq 1 >\"/dev/$dest\"\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(0);
+    expect(executedTestCount("shell", `${stdout}\n${stderr}`)).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects shell assertions whose redirections cannot execute", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-invalid-redirections-"));
+  try {
+    const path = join(root, "test_invalid_redirections.sh");
+    writeFileSync(path, "set -C\ntarget=.; builtin test 1 -eq 1 > \"$target\" || true\nbuiltin test 1 -eq 1 > /dev/fd/999 || true\nbuiltin test 1 -eq 1 >&999 || true\nbuiltin test 1 -eq 1 > /dev/./fd/999 || true\nbuiltin test 1 -eq 1 > README.md || true\nexec 3>&1\nbuiltin test 1 -eq 1 3>&- >&3 || true\nbuiltin test 1 -eq 1 1>&- 2>&1 || true\n");
+    writeFileSync(join(root, "README.md"), "existing\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects output redirection through a read-only standard input descriptor", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-readonly-fd-"));
+  try {
+    const path = join(root, "test_readonly_fd.sh");
+    writeFileSync(path, "builtin test 1 -eq 1 > /dev/fd/0 || true\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    child.stdin?.end();
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("preserves shell test counts when a suite replaces the DEBUG trap", async () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-debug-trap-"));
   try {
@@ -166,11 +299,129 @@ test("preserves shell test counts when a suite replaces the DEBUG trap", async (
 });
 
 test("requires a nonzero runtime test count for Bun and Python suites", () => {
-  expect(executedTestCount("bun", "Ran 0 tests across 1 files.\nRan 2 tests across 1 files.")).toBe(2);
+  expect(executedTestCount("bun", "Ran 0 tests across 1 files.\nRan 2 tests across 1 files.")).toBeUndefined();
   expect(executedTestCount("bun", "Ran 0 tests in a comment")).toBeUndefined();
   expect(executedTestCount("python", "Ran 21 tests in 0.1s")).toBe(21);
   expect(executedTestCount("shell", "TESTS_RUN=3\n")).toBe(3);
   expect(executedTestCount("shell", "shell completed")).toBeUndefined();
+});
+
+test("rejects conflicting test summaries that could be appended by a child process", () => {
+  expect(executedTestCount("python", "Ran 1 test in 0.1s\nRan 999 tests in 0.1s")).toBeUndefined();
+  expect(executedTestCount("shell", "TESTS_RUN=1\nTESTS_RUN=999\n")).toBeUndefined();
+});
+
+test("rejects a test module that exits during import after printing a fake summary", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-python-import-exit-"));
+  try {
+    const path = join(root, "test_import_exit.py");
+    writeFileSync(path, "import sys\nimport unittest\nprint('Ran 1 test in 0.001s', file=sys.stderr)\nsys.exit(0)\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for class-level expected-failure test replacements during setup", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-class-test-replacement-"));
+  try {
+    const path = join(root, "test_class_test_replacement.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def setUp(self):\n        type(self).test_runs = lambda self: self.fail('replacement must not be hidden')\n    @unittest.expectedFailure\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("does not copy expected-failure metadata onto instance replacements", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-instance-test-replacement-"));
+  try {
+    const path = join(root, "test_instance_test_replacement.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    @unittest.expectedFailure\n    def test_runs(self):\n        pass\n\ndef load_tests(loader, tests, pattern):\n    case = Tests('test_runs')\n    case.test_runs = lambda: case.fail('instance replacement must not be hidden')\n    return unittest.TestSuite([case])\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("guards module setup replacements across loaded test modules", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-cross-module-setup-replacement-"));
+  try {
+    const path = join(root, "test_cross_module_setup.py");
+    writeFileSync(path, "import sys\nimport types\nimport unittest\n\nmodule_a = types.ModuleType('module_a')\nmodule_b = types.ModuleType('module_b')\nsys.modules[module_a.__name__] = module_a\nsys.modules[module_b.__name__] = module_b\n\ndef setup_b():\n    pass\nmodule_b.setUpModule = setup_b\n\nclass First(unittest.TestCase):\n    def test_replace(self):\n        async def hidden():\n            raise AssertionError('module setup replacement must not run unguarded')\n        module_b.setUpModule = hidden\nFirst.__module__ = 'module_a'\n\nclass Second(unittest.TestCase):\n    def test_runs(self):\n        pass\nSecond.__module__ = 'module_b'\n\ndef load_tests(loader, tests, pattern):\n    return unittest.TestSuite([First('test_replace'), Second('test_runs')])\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves instance method replacements installed by the method itself", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-self-replacing-instance-method-"));
+  try {
+    const path = join(root, "test_self_replacing_instance_method.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def setUp(self):\n        self.setUp = lambda: self.fail('replacement setup must run')\n    def test_runs(self):\n        pass\n\ndef load_tests(loader, tests, pattern):\n    case = Tests('test_runs')\n    return unittest.TestSuite([case, case])\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects load_tests hooks that exit successfully before returning a suite", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-load-tests-exit-"));
+  try {
+    const path = join(root, "test_load_tests_exit.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def test_should_not_run(self):\n        raise AssertionError('load_tests must not skip the discovered suite')\n\ndef load_tests(loader, tests, pattern):\n    raise SystemExit(0)\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("guards FunctionTestCase callbacks replaced during execution", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-function-case-replacement-"));
+  try {
+    const setupPath = join(root, "test_function_case_setup_replacement.py");
+    writeFileSync(setupPath, "import unittest\n\nasync def hidden():\n    raise AssertionError('async replacement must not run')\n\ndef load_tests(loader, tests, pattern):\n    case = unittest.FunctionTestCase(lambda: None)\n    def setup():\n        case._testFunc = hidden\n    case._setUpFunc = setup\n    return unittest.TestSuite([case])\n");
+    const setupChild = Bun.spawn(commandForTest({ path: setupPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await setupChild.exited).toBe(1);
+
+    const teardownPath = join(root, "test_function_case_teardown_replacement.py");
+    writeFileSync(teardownPath, "import unittest\n\nasync def hidden():\n    return None\n\ndef load_tests(loader, tests, pattern):\n    case = unittest.FunctionTestCase(lambda: setattr(case, '_tearDownFunc', hidden))\n    case._tearDownFunc = lambda: None\n    return unittest.TestSuite([case])\n");
+    const teardownChild = Bun.spawn(commandForTest({ path: teardownPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await teardownChild.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("guards FunctionTestCase callbacks replaced by another case", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-function-case-cross-replacement-"));
+  try {
+    const path = join(root, "test_function_case_cross_replacement.py");
+    writeFileSync(path, "import unittest\n\nasync def hidden():\n    raise AssertionError('async replacement must not run')\n\nsecond = unittest.FunctionTestCase(lambda: None)\ndef replace():\n    second._testFunc = hidden\n\ndef load_tests(loader, tests, pattern):\n    return unittest.TestSuite([unittest.FunctionTestCase(replace), second])\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("supports unhashable Python TestCase instances", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-unhashable-testcase-"));
+  try {
+    const path = join(root, "test_unhashable.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    __hash__ = None\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("executes a Python unittest suite without a main guard", async () => {
@@ -292,6 +543,11 @@ test("fails closed for TestCase lifecycle hooks that return awaitables", async (
     writeFileSync(classPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        async def hidden():\n            return None\n        return hidden()\n    def test_not_run(self):\n        pass\n");
     const classChild = Bun.spawn(commandForTest({ path: classPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
     expect(await classChild.exited).toBe(1);
+
+    const replacementPath = join(root, "test_cleanup_lifecycle_replacement.py");
+    writeFileSync(replacementPath, "import unittest\n\nasync def hidden():\n    raise AssertionError('replaced class lifecycle must not run')\n\nclass Tests(unittest.TestCase):\n    @classmethod\n    def tearDownClass(cls):\n        pass\n    def test_runs(self):\n        self.addCleanup(lambda: setattr(type(self), 'tearDownClass', staticmethod(hidden)))\n");
+    const replacementChild = Bun.spawn(commandForTest({ path: replacementPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await replacementChild.exited).toBe(1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -343,6 +599,403 @@ test("fails closed for unsupported Python module lifecycle and import-time class
     writeFileSync(classCleanupPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    async def hidden():\n        raise AssertionError('class cleanup must not be skipped')\n    def test_runs(self):\n        pass\n\nTests.addClassCleanup(Tests.hidden)\n");
     const classCleanupChild = Bun.spawn(commandForTest({ path: classCleanupPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
     expect(await classCleanupChild.exited).toBe(1);
+
+    const replacementPath = join(root, "test_runtime_module_cleanup_replacement.py");
+    writeFileSync(replacementPath, "import unittest\n\ndef setUpModule():\n    async def replacement(function, /, *args, **kwargs):\n        return None\n    unittest.addModuleCleanup = replacement\n\nclass Tests(unittest.TestCase):\n    def test_register(self):\n        unittest.addModuleCleanup(lambda: None)\n");
+    const replacementChild = Bun.spawn(commandForTest({ path: replacementPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await replacementChild.exited).toBe(1);
+
+    const importReplacementPath = join(root, "test_import_module_cleanup_replacement.py");
+    writeFileSync(importReplacementPath, "import unittest\n\nasync def replacement(function, /, *args, **kwargs):\n    return None\nunittest.addModuleCleanup = replacement\n\nclass Tests(unittest.TestCase):\n    def test_register(self):\n        unittest.addModuleCleanup(lambda: None)\n");
+    const importReplacementChild = Bun.spawn(commandForTest({ path: importReplacementPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await importReplacementChild.exited).toBe(1);
+
+    const doCleanupsPath = join(root, "test_async_do_cleanups.py");
+    writeFileSync(doCleanupsPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    async def doCleanups(self):\n        return None\n    def test_runs(self):\n        pass\n");
+    const doCleanupsChild = Bun.spawn(commandForTest({ path: doCleanupsPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await doCleanupsChild.exited).toBe(1);
+
+    const doModuleCleanupsPath = join(root, "test_async_do_module_cleanups.py");
+    writeFileSync(doModuleCleanupsPath, "import unittest\n\ndef setUpModule():\n    async def replacement(*args, **kwargs):\n        return None\n    unittest.doModuleCleanups = replacement\n    unittest.case.doModuleCleanups = replacement\n\nunittest.addModuleCleanup(lambda: None)\n\nclass Tests(unittest.TestCase):\n    def test_runs(self):\n        pass\n");
+    const doModuleCleanupsChild = Bun.spawn(commandForTest({ path: doModuleCleanupsPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await doModuleCleanupsChild.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("executes synchronous Python module cleanups registered during import", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-module-cleanup-registration-"));
+  try {
+    const path = join(root, "test_module_cleanup_registration.py");
+    writeFileSync(path, "import unittest\n\ndef cleanup():\n    pass\n\nunittest.addModuleCleanup(cleanup)\n\nclass Tests(unittest.TestCase):\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("guards Python module cleanups already present in the registry", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-module-cleanup-registry-"));
+  try {
+    const path = join(root, "test_module_cleanup_registry.py");
+    writeFileSync(path, "import unittest\n\nasync def hidden():\n    raise AssertionError('module cleanup registry must be guarded')\n\nunittest._module_cleanups.append((hidden, (), {}))\n\nclass Tests(unittest.TestCase):\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("applies module lifecycle to module-level function tests", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-module-function-lifecycle-"));
+  try {
+    const path = join(root, "test_module_function_lifecycle.py");
+    writeFileSync(path, "def setUpModule():\n    raise AssertionError('module setup must run')\n\ndef test_runs():\n    pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("guards constructor-registered Python cleanups before suite loading", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-constructor-cleanup-"));
+  try {
+    const path = join(root, "test_constructor_cleanup.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def __init__(self, methodName='runTest'):\n        super().__init__(methodName)\n        async def hidden():\n            return None\n        self.addCleanup(hidden)\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("forwards cleanup callback keyword arguments without shadowing wrappers", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-cleanup-keyword-arguments-"));
+  try {
+    const path = join(root, "test_cleanup_keyword_arguments.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def test_runs(self):\n        def restore(original=None):\n            if original != 42:\n                raise AssertionError(original)\n        self.addCleanup(restore, original=42)\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves positional-only cleanup registration parameters", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-cleanup-positional-only-"));
+  try {
+    const path = join(root, "test_cleanup_positional_only.py");
+    writeFileSync(path, "import unittest\n\ndef restore(function=None, case=None, test_class=None):\n    values = [value for value in (function, case, test_class) if value is not None]\n    if len(values) != 1 or values[0] not in (42, 43, 44):\n        raise AssertionError((function, case, test_class))\n\nunittest.addModuleCleanup(restore, function=42)\n\nclass Tests(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        cls.addClassCleanup(restore, test_class=44)\n    def setUp(self):\n        self.addCleanup(restore, case=43)\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves valid static Python class lifecycle hooks", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-static-class-hooks-"));
+  try {
+    const path = join(root, "test_static_class_hooks.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    @staticmethod\n    def setUpClass():\n        pass\n    @staticmethod\n    def tearDownClass():\n        pass\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("uses class lifecycle replacements installed after suite construction", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-dynamic-instance-hook-"));
+  try {
+    const path = join(root, "test_dynamic_instance_hook.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        def failing_setup(instance):\n            raise AssertionError('replacement setup must run')\n        cls.setUp = failing_setup\n    def setUp(self):\n        pass\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves instance-replaced test methods selected by load_tests", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-instance-replaced-test-"));
+  try {
+    const path = join(root, "test_instance_replaced_test.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def test_runs(self):\n        pass\n\ndef load_tests(loader, tests, pattern):\n    case = Tests('test_runs')\n    def failing():\n        raise AssertionError('replacement test must run')\n    case.test_runs = failing\n    return unittest.TestSuite([case])\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves skipped Python test metadata on guarded methods", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-skipped-test-metadata-"));
+  try {
+    const path = join(root, "test_skipped_method_metadata.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def setUp(self):\n        raise AssertionError('skipped setup must not run')\n    @unittest.skip('covered elsewhere')\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("guards lifecycle replacements installed during setup", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-runtime-lifecycle-replacements-"));
+  try {
+    const instancePath = join(root, "test_instance_lifecycle_replacement.py");
+    writeFileSync(instancePath, "import unittest\n\nclass Tests(unittest.TestCase):\n    def setUp(self):\n        async def replacement():\n            return None\n        self.tearDown = replacement\n    def tearDown(self):\n        pass\n    def test_runs(self):\n        pass\n");
+    const instanceChild = Bun.spawn(commandForTest({ path: instancePath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await instanceChild.exited).toBe(1);
+
+    const classPath = join(root, "test_class_lifecycle_replacement.py");
+    writeFileSync(classPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        async def replacement():\n            return None\n        cls.tearDownClass = replacement\n    @classmethod\n    def tearDownClass(cls):\n        pass\n    def test_runs(self):\n        pass\n");
+    const classChild = Bun.spawn(commandForTest({ path: classPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await classChild.exited).toBe(1);
+
+    const modulePath = join(root, "test_module_lifecycle_replacement.py");
+    writeFileSync(modulePath, "import unittest\n\ndef setUpModule():\n    async def replacement():\n        return None\n    globals()['tearDownModule'] = replacement\n\ndef tearDownModule():\n    pass\n\nclass Tests(unittest.TestCase):\n    def test_runs(self):\n        pass\n");
+    const moduleChild = Bun.spawn(commandForTest({ path: modulePath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await moduleChild.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("does not let runtime test replacements retain expected-failure metadata", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-runtime-test-metadata-"));
+  try {
+    const path = join(root, "test_runtime_test_metadata.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        cls.test_runs = lambda self: self.fail('runtime replacement must fail')\n    @unittest.expectedFailure\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("guards lifecycle replacements installed by a test body", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-runtime-body-replacements-"));
+  try {
+    const instancePath = join(root, "test_body_instance_replacement.py");
+    writeFileSync(instancePath, "import unittest\n\nclass Tests(unittest.TestCase):\n    def tearDown(self):\n        pass\n    def test_runs(self):\n        async def replacement():\n            return None\n        self.tearDown = replacement\n");
+    const instanceChild = Bun.spawn(commandForTest({ path: instancePath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await instanceChild.exited).toBe(1);
+
+    const classPath = join(root, "test_body_class_replacement.py");
+    writeFileSync(classPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    @classmethod\n    def tearDownClass(cls):\n        pass\n    def test_runs(self):\n        async def replacement():\n            return None\n        type(self).tearDownClass = replacement\n");
+    const classChild = Bun.spawn(commandForTest({ path: classPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await classChild.exited).toBe(1);
+
+    const modulePath = join(root, "test_body_module_replacement.py");
+    writeFileSync(modulePath, "import unittest\n\ndef tearDownModule():\n    pass\n\nclass Tests(unittest.TestCase):\n    def test_runs(self):\n        async def replacement():\n            return None\n        globals()['tearDownModule'] = replacement\n");
+    const moduleChild = Bun.spawn(commandForTest({ path: modulePath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await moduleChild.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed when setUp replaces a test method with stale expected-failure metadata", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-setup-test-replacement-"));
+  try {
+    const path = join(root, "test_setup_test_replacement.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def setUp(self):\n        self.test_runs = lambda: self.fail('replacement must not be hidden')\n    @unittest.expectedFailure\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("guards class lifecycle replacements installed by module setup", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-module-class-replacement-"));
+  try {
+    const path = join(root, "test_module_class_replacement.py");
+    writeFileSync(path, "import unittest\n\ndef setUpModule():\n    async def replacement():\n        return None\n    Tests.setUpClass = replacement\n\nclass Tests(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        pass\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves bound Python class lifecycle receivers", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-bound-class-lifecycle-"));
+  try {
+    const path = join(root, "test_bound_class_lifecycle.py");
+    writeFileSync(path, "import unittest\n\nclass Hooks:\n    def setup(self):\n        pass\n\nhooks = Hooks()\n\nclass Tests(unittest.TestCase):\n    setUpClass = hooks.setup\n    tearDownClass = hooks.setup\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves static Python class cleanup registration", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-static-class-cleanup-"));
+  try {
+    const path = join(root, "test_static_class_cleanup.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    @staticmethod\n    def addClassCleanup(function, /, *args, **kwargs):\n        function(*args, **kwargs)\n    @classmethod\n    def setUpClass(cls):\n        cls.addClassCleanup(lambda: None)\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves plain Python class cleanup registration", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-plain-class-cleanup-"));
+  try {
+    const path = join(root, "test_plain_class_cleanup.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def addClassCleanup(self, function, /, *args, **kwargs):\n        self.assertTrue(callable(function))\n    def test_runs(self):\n        self.addClassCleanup(lambda: None)\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("guards class cleanup replacements installed after suite setup", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-class-cleanup-replacement-"));
+  try {
+    const path = join(root, "test_class_cleanup_replacement.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def test_a_replace(self):\n        def replacement(function, /, *args, **kwargs):\n            type(self)._class_cleanups.append((function, args, kwargs))\n        type(self).addClassCleanup = staticmethod(replacement)\n    def test_b_register(self):\n        async def hidden():\n            return None\n        self.addClassCleanup(hidden)\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects unsupported results from runtime cleanup registrations", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-runtime-cleanup-registration-result-"));
+  try {
+    const instancePath = join(root, "test_instance_cleanup_registration_result.py");
+    writeFileSync(instancePath, "import unittest\n\nclass Tests(unittest.TestCase):\n    def setUp(self):\n        async def replacement(function, /, *args, **kwargs):\n            return None\n        self.addCleanup = replacement\n    def test_runs(self):\n        self.addCleanup(lambda: None)\n");
+    const instanceChild = Bun.spawn(commandForTest({ path: instancePath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await instanceChild.exited).toBe(1);
+
+    const classPath = join(root, "test_class_cleanup_registration_result.py");
+    writeFileSync(classPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        async def replacement(receiver, function, /, *args, **kwargs):\n            return None\n        cls.addClassCleanup = classmethod(replacement)\n    def test_runs(self):\n        self.addClassCleanup(lambda: None)\n");
+    const classChild = Bun.spawn(commandForTest({ path: classPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await classChild.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("guards bound and subclass-specific Python class cleanup registries", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-class-cleanup-registries-"));
+  try {
+    const boundPath = join(root, "test_bound_class_cleanup.py");
+    writeFileSync(boundPath, "import unittest\n\nclass Hooks:\n    def register(self, function, /, *args, **kwargs):\n        function(*args, **kwargs)\n\nhooks = Hooks()\n\nclass Tests(unittest.TestCase):\n    addClassCleanup = hooks.register\n    @classmethod\n    def setUpClass(cls):\n        async def hidden():\n            return None\n        cls.addClassCleanup(hidden)\n    def test_runs(self):\n        pass\n");
+    const boundChild = Bun.spawn(commandForTest({ path: boundPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await boundChild.exited).toBe(1);
+
+    const subclassPath = join(root, "test_subclass_class_cleanup.py");
+    writeFileSync(subclassPath, "import unittest\n\nclass Base(unittest.TestCase):\n    def test_base(self):\n        pass\n\nclass Child(Base):\n    @staticmethod\n    def addClassCleanup(function, /, *args, **kwargs):\n        function(*args, **kwargs)\n    @classmethod\n    def setUpClass(cls):\n        async def hidden():\n            return None\n        cls.addClassCleanup(hidden)\n    def test_child(self):\n        pass\n");
+    const subclassChild = Bun.spawn(commandForTest({ path: subclassPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await subclassChild.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for module context cleanups and loaded FunctionTestCases", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-python-extension-cases-"));
+  try {
+    const contextPath = join(root, "test_module_context.py");
+    writeFileSync(contextPath, "import unittest\n\nclass Context:\n    def __enter__(self):\n        return self\n    async def __exit__(self, exc_type, exc_value, traceback):\n        return False\n\nunittest.enterModuleContext(Context())\ndef test_runs():\n    pass\n");
+    const contextChild = Bun.spawn(commandForTest({ path: contextPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await contextChild.exited).toBe(1);
+
+    const functionCasePath = join(root, "test_loaded_function_case.py");
+    writeFileSync(functionCasePath, "import unittest\n\nasync def hidden():\n    return None\n\ndef load_tests(loader, tests, pattern):\n    return unittest.TestSuite([unittest.FunctionTestCase(hidden)])\n");
+    const functionCaseChild = Bun.spawn(commandForTest({ path: functionCasePath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await functionCaseChild.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for async tests nested in BaseTestSuite", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-base-test-suite-"));
+  try {
+    const path = join(root, "test_base_test_suite.py");
+    writeFileSync(path, "import unittest\n\nasync def hidden():\n    return None\n\ndef load_tests(loader, tests, pattern):\n    return unittest.BaseTestSuite([unittest.FunctionTestCase(hidden)])\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("guards async lifecycle hooks from modules returned by load_tests", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-loaded-module-lifecycle-"));
+  try {
+    writeFileSync(join(root, "helper.py"), "import unittest\n\nasync def setUpModule():\n    return None\n\nclass Tests(unittest.TestCase):\n    def test_runs(self):\n        pass\n");
+    const path = join(root, "test_loaded_module_lifecycle.py");
+    writeFileSync(path, "import unittest\nfrom helper import Tests\n\ndef load_tests(loader, tests, pattern):\n    return loader.loadTestsFromTestCase(Tests)\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("does not duplicate module functions when load_tests supplies the suite", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-load-tests-deduplication-"));
+  try {
+    const path = join(root, "test_load_tests_deduplication.py");
+    writeFileSync(path, "import unittest\n\ncalls = []\ndef test_runs():\n    calls.append(1)\n\ndef load_tests(loader, tests, pattern):\n    return unittest.TestSuite([unittest.FunctionTestCase(test_runs)])\n\ndef tearDownModule():\n    if calls != [1]:\n        raise AssertionError(calls)\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("only rejects async tests selected by load_tests", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-load-tests-selection-"));
+  try {
+    const path = join(root, "test_load_tests_selection.py");
+    writeFileSync(path, "import unittest\n\nclass Hidden(unittest.TestCase):\n    async def test_hidden(self):\n        return None\n\nclass Visible(unittest.TestCase):\n    def test_visible(self):\n        pass\n\ndef load_tests(loader, tests, pattern):\n    return loader.loadTestsFromTestCase(Visible)\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("does not let expectedFailure hide unsupported Python results", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-python-expected-failure-"));
+  try {
+    const casePath = join(root, "test_expected_failure_case.py");
+    writeFileSync(casePath, "import unittest\n\nclass Tests(unittest.TestCase):\n    @unittest.expectedFailure\n    def test_runs(self):\n        async def hidden():\n            return None\n        return hidden()\n");
+    const caseChild = Bun.spawn(commandForTest({ path: casePath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await caseChild.exited).toBe(1);
+
+    const modulePath = join(root, "test_expected_failure_module.py");
+    writeFileSync(modulePath, "import unittest\n\n@unittest.expectedFailure\ndef test_expected_failure():\n    raise AssertionError('expected')\n");
+    const moduleChild = Bun.spawn(commandForTest({ path: modulePath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await moduleChild.exited).toBe(0);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preserves zero-argument Python class lifecycle hooks", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-zero-argument-class-hooks-"));
+  try {
+    const path = join(root, "test_zero_argument_class_hooks.py");
+    writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def setUpClass():\n        pass\n    def tearDownClass():\n        pass\n    def test_runs(self):\n        pass\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

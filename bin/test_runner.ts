@@ -20,6 +20,7 @@ const PYTHON_TEST_RUNNER = [
   "import pathlib",
   "import sys",
   "import unittest",
+  "import unittest.case",
   "path = pathlib.Path(sys.argv[1])",
   "sys.path.insert(0, str(path.parent))",
   "spec = importlib.util.spec_from_file_location('agent_toolkit_test_module', path)",
@@ -27,45 +28,88 @@ const PYTHON_TEST_RUNNER = [
   "    raise ImportError(path)",
   "module = importlib.util.module_from_spec(spec)",
   "sys.modules[spec.name] = module",
+  "unsupported_results = []",
   "def reject_unsupported_result(result):",
   "    if inspect.isawaitable(result) or inspect.isasyncgen(result) or inspect.isgenerator(result):",
+  "        unsupported_results.append(True)",
   "        raise TypeError('async or generator tests are unsupported')",
   "    return result",
+  "def refresh_runtime_guards():",
+  "    pass",
   "def guard_cleanup_callback(original):",
-  "    def guarded(*args, original=original, **kwargs):",
-  "        return reject_unsupported_result(original(*args, **kwargs))",
+  "    if getattr(original, '_agent_toolkit_cleanup_guarded', False):",
+  "        return original",
+  "    def guarded(*args, **kwargs):",
+  "        try:",
+  "            return reject_unsupported_result(original(*args, **kwargs))",
+  "        finally:",
+  "            refresh_runtime_guards()",
+  "    setattr(guarded, '_agent_toolkit_cleanup_guarded', True)",
   "    return guarded",
   "original_add_module_cleanup = unittest.addModuleCleanup",
-  "def guarded_add_module_cleanup(function, *args, original=original_add_module_cleanup, **kwargs):",
-  "    return original(guard_cleanup_callback(function), *args, **kwargs)",
+  "def guarded_add_module_cleanup(function, /, *args, **kwargs):",
+  "    return reject_unsupported_result(original_add_module_cleanup(guard_cleanup_callback(function), *args, **kwargs))",
+  "setattr(guarded_add_module_cleanup, '_agent_toolkit_cleanup_registration_guarded', True)",
   "unittest.addModuleCleanup = guarded_add_module_cleanup",
+  "unittest.case.addModuleCleanup = guarded_add_module_cleanup",
   "original_add_class_cleanup = unittest.TestCase.addClassCleanup.__func__",
-  "def guarded_add_class_cleanup(test_class, function, *args, original=original_add_class_cleanup, **kwargs):",
-  "    return original(test_class, guard_cleanup_callback(function), *args, **kwargs)",
+  "def guarded_add_class_cleanup(test_class, function, /, *args, **kwargs):",
+  "    return reject_unsupported_result(original_add_class_cleanup(test_class, guard_cleanup_callback(function), *args, **kwargs))",
   "unittest.TestCase.addClassCleanup = classmethod(guarded_add_class_cleanup)",
-  "spec.loader.exec_module(module)",
+  "original_add_instance_cleanup = unittest.TestCase.addCleanup",
+  "def guarded_add_instance_cleanup(case, function, /, *args, **kwargs):",
+  "    return reject_unsupported_result(original_add_instance_cleanup(case, guard_cleanup_callback(function), *args, **kwargs))",
+  "unittest.TestCase.addCleanup = guarded_add_instance_cleanup",
+  "try:",
+  "    spec.loader.exec_module(module)",
+  "except SystemExit as error:",
+  "    raise RuntimeError(f'test module exited during import: {error.code!r}') from error",
   "def unwrapped(value):",
   "    try:",
   "        return inspect.unwrap(value)",
   "    except (TypeError, ValueError):",
   "        return value",
-  "async_names = [name for name, value in vars(module).items() if name.startswith('test_') and (inspect.iscoroutinefunction(unwrapped(value)) or inspect.isasyncgenfunction(unwrapped(value)) or inspect.isgeneratorfunction(unwrapped(value)))]",
-  "async_names += [f'{name}.{method}' for name, value in vars(module).items() if inspect.isclass(value) and issubclass(value, unittest.TestCase) for method, member in vars(value).items() if method.startswith('test_') and (inspect.iscoroutinefunction(unwrapped(member)) or inspect.isasyncgenfunction(unwrapped(member)) or inspect.isgeneratorfunction(unwrapped(member)))]",
-  "async_names += [f'{name}.{hook}' for name, value in vars(module).items() if inspect.isclass(value) and issubclass(value, unittest.TestCase) for hook in ('setUp', 'tearDown', 'setUpClass', 'tearDownClass') if hasattr(value, hook) and (inspect.iscoroutinefunction(unwrapped(getattr(value, hook))) or inspect.isasyncgenfunction(unwrapped(getattr(value, hook))) or inspect.isgeneratorfunction(unwrapped(getattr(value, hook))))]",
-  "async_names += [hook for hook in ('setUpModule', 'tearDownModule') if hasattr(module, hook) and (inspect.iscoroutinefunction(unwrapped(getattr(module, hook))) or inspect.isasyncgenfunction(unwrapped(getattr(module, hook))) or inspect.isgeneratorfunction(unwrapped(getattr(module, hook))))]",
-  "suite = unittest.defaultTestLoader.loadTestsFromModule(module)",
+  "load_tests_hook = getattr(module, 'load_tests', None)",
+  "async_names = []",
+  "try:",
+  "    suite = unittest.defaultTestLoader.loadTestsFromModule(module)",
+  "except SystemExit as error:",
+  "    raise RuntimeError(f'test module exited during test discovery: {error.code!r}') from error",
   "def async_test_names(test_suite):",
   "    names = []",
+  "    classes = set()",
+  "    modules = set()",
   "    for case in test_suite:",
-  "        if isinstance(case, unittest.TestSuite):",
+  "        if isinstance(case, unittest.BaseTestSuite):",
   "            names.extend(async_test_names(case))",
   "        elif isinstance(case, unittest.TestCase):",
+  "            classes.add(case.__class__)",
+  "            modules.add(case.__class__.__module__)",
+  "            if isinstance(case, unittest.FunctionTestCase):",
+  "                for attribute in ('_testFunc', '_setUpFunc', '_tearDownFunc'):",
+  "                    function = unwrapped(getattr(case, attribute, None))",
+  "                    if function is not None and (inspect.iscoroutinefunction(function) or inspect.isasyncgenfunction(function) or inspect.isgeneratorfunction(function)):",
+  "                        names.append(f'{case.id()}.{attribute}')",
+  "                continue",
   "            method_name = getattr(case, '_testMethodName', '')",
   "            method = unwrapped(getattr(case, method_name, None))",
   "            if method is not None and (inspect.iscoroutinefunction(method) or inspect.isasyncgenfunction(method) or inspect.isgeneratorfunction(method)):",
   "                names.append(f'{case.__class__.__name__}.{method_name}')",
+  "    for test_class in classes:",
+  "        for hook in ('setUp', 'tearDown', 'setUpClass', 'tearDownClass'):",
+  "            method = unwrapped(getattr(test_class, hook, None))",
+  "            if method is not None and (inspect.iscoroutinefunction(method) or inspect.isasyncgenfunction(method) or inspect.isgeneratorfunction(method)):",
+  "                names.append(f'{test_class.__module__}.{test_class.__name__}.{hook}')",
+  "    for module_name in modules:",
+  "        target_module = sys.modules.get(module_name)",
+  "        for hook in ('setUpModule', 'tearDownModule'):",
+  "            method = unwrapped(getattr(target_module, hook, None)) if target_module is not None else None",
+  "            if method is not None and (inspect.iscoroutinefunction(method) or inspect.isasyncgenfunction(method) or inspect.isgeneratorfunction(method)):",
+  "                names.append(f'{module_name}.{hook}')",
   "    return names",
   "async_names += async_test_names(suite)",
+  "if not callable(load_tests_hook):",
+  "    async_names += [name for name, value in vars(module).items() if name.startswith('test_') and (inspect.iscoroutinefunction(unwrapped(value)) or inspect.isasyncgenfunction(unwrapped(value)) or inspect.isgeneratorfunction(unwrapped(value)))]",
   "if async_names:",
   "    raise TypeError('async tests are unsupported: ' + ', '.join(async_names))",
   "def preserve_metadata(original, guarded):",
@@ -73,72 +117,326 @@ const PYTHON_TEST_RUNNER = [
   "        return functools.update_wrapper(guarded, original)",
   "    except (AttributeError, TypeError):",
   "        return guarded",
+  "def guard_result_function(original, refresh=None, target_getter=None):",
+  "    if getattr(original, '_agent_toolkit_guarded_function', False):",
+  "        return original",
+  "    def guarded(*args, **kwargs):",
+  "        target = original",
+  "        if target_getter is not None:",
+  "            candidate = target_getter()",
+  "            if candidate is not guarded:",
+  "                if refresh is not None:",
+  "                    refresh()",
+  "                    candidate = target_getter()",
+  "                if candidate is not guarded and candidate is not None:",
+  "                    target = candidate",
+  "        try:",
+  "            return reject_unsupported_result(target(*args, **kwargs))",
+  "        finally:",
+  "            if refresh is not None:",
+  "                refresh()",
+  "    guarded = preserve_metadata(original, guarded)",
+  "    setattr(guarded, '_agent_toolkit_guarded_function', True)",
+  "    return guarded",
+  "guarded_cases_by_class = {}",
+  "guarded_function_cases = []",
+  "def same_method_target(left, right):",
+  "    return left is right or (getattr(left, '__self__', None) is getattr(right, '__self__', None) and getattr(left, '__func__', left) is getattr(right, '__func__', right))",
+  "def sync_method_metadata(guarded, target):",
+  "    for metadata in ('__unittest_expecting_failure__', '__unittest_skip__', '__unittest_skip_why__'):",
+  "        if hasattr(target, metadata):",
+  "            setattr(guarded, metadata, getattr(target, metadata))",
+  "        else:",
+  "            try:",
+  "                delattr(guarded, metadata)",
+  "            except AttributeError:",
+  "                pass",
+  "def refresh_instance_method_metadata(test_class):",
+  "    for case in guarded_cases_by_class.get(test_class, ()):",
+  "        for method_name, guarded in list(case.__dict__.items()):",
+  "            if not getattr(guarded, '_agent_toolkit_guarded_method', False):",
+  "                continue",
+  "            class_target = getattr(test_class, method_name, None)",
+  "            if class_target is not None and class_target is not guarded:",
+  "                if getattr(guarded, '_agent_toolkit_initial_instance_target', None) is not None:",
+  "                    continue",
+  "                initial_class_target = getattr(guarded, '_agent_toolkit_initial_class_target', None)",
+  "                if method_name == getattr(case, '_testMethodName', None) and getattr(guarded, '__unittest_expecting_failure__', False) and initial_class_target is not None and not same_method_target(class_target, initial_class_target):",
+  "                    raise AssertionError('test method was replaced on its class; expected-failure metadata is no longer reliable')",
+  "                sync_method_metadata(guarded, class_target)",
+  "def refresh_test_method_after_setup(case):",
+  "    test_method_name = getattr(case, '_testMethodName', '')",
+  "    guarded = getattr(case, '_agent_toolkit_test_method_guard', None)",
+  "    replacement = case.__dict__.get(test_method_name)",
+  "    if not getattr(guarded, '_agent_toolkit_guarded_method', False) or replacement is None or replacement is guarded:",
+  "        return",
+  "    if getattr(guarded, '__unittest_expecting_failure__', False):",
+  "        raise AssertionError('test method was replaced during setUp; expected-failure metadata is no longer reliable')",
+  "    sync_method_metadata(guarded, replacement)",
+  "def guard_module_test_classes(module):",
+  "    for test_class in list(guarded_cases_by_class):",
+  "        if test_class.__module__ != module.__name__:",
+  "            continue",
+  "        guard_class_method(test_class, 'setUpClass')",
+  "        guard_class_method(test_class, 'tearDownClass')",
+  "        guard_class_cleanup(test_class)",
+  "        refresh_instance_method_metadata(test_class)",
   "def guard_module_method(module, method_name):",
-  "    original = getattr(module, method_name, None)",
+  "    existing = getattr(module, method_name, None)",
+  "    if getattr(existing, '_agent_toolkit_guarded_method', False):",
+  "        return",
+  "    original = existing",
   "    if original is None:",
   "        return",
-  "    def guarded(original=original):",
-  "        return reject_unsupported_result(original())",
-  "    setattr(module, method_name, preserve_metadata(original, guarded))",
+  "    def guarded(*args, **kwargs):",
+  "        try:",
+  "            return reject_unsupported_result(original(*args, **kwargs))",
+  "        finally:",
+  "            refresh_runtime_guards()",
+  "    guarded = preserve_metadata(original, guarded)",
+  "    setattr(guarded, '_agent_toolkit_guarded_method', True)",
+  "    setattr(module, method_name, guarded)",
   "guard_module_method(module, 'setUpModule')",
   "guard_module_method(module, 'tearDownModule')",
+  "def guard_module_cleanup_registration(target_module):",
+  "    existing = getattr(target_module, 'addModuleCleanup', None)",
+  "    if existing is not None and not getattr(existing, '_agent_toolkit_cleanup_registration_guarded', False):",
+  "        def guarded(function, /, *args, **kwargs):",
+  "            return reject_unsupported_result(existing(guard_cleanup_callback(function), *args, **kwargs))",
+  "        setattr(guarded, '_agent_toolkit_cleanup_registration_guarded', True)",
+  "        setattr(target_module, 'addModuleCleanup', guarded)",
+  "    cleanups = getattr(target_module, '_module_cleanups', None)",
+  "    if isinstance(cleanups, list):",
+  "        for index, (function, args, kwargs) in enumerate(cleanups):",
+  "            cleanups[index] = (guard_cleanup_callback(function), args, kwargs)",
   "def guard_instance_method(case, method_name):",
+  "    existing = case.__dict__.get(method_name)",
+  "    if getattr(existing, '_agent_toolkit_guarded_method', False):",
+  "        return",
   "    original = getattr(case, method_name, None)",
   "    if original is None:",
   "        return",
-  "    def guarded(original=original):",
-  "        return reject_unsupported_result(original())",
-  "    setattr(case, method_name, preserve_metadata(original, guarded))",
+  "    initial_instance_method = case.__dict__.get(method_name)",
+  "    initial_target = original",
+  "    initial_class_target = getattr(case.__class__, method_name, None)",
+  "    def guarded(*args, **kwargs):",
+  "        replacement = case.__dict__.get(method_name)",
+  "        case.__dict__.pop(method_name, None)",
+  "        try:",
+  "            target = replacement if replacement is not None and replacement is not guarded else (initial_instance_method if initial_instance_method is not None else getattr(case, method_name, None))",
+  "            if target is None:",
+  "                target = initial_target",
+  "            sync_method_metadata(guarded, target)",
+  "            return reject_unsupported_result(target(*args, **kwargs))",
+  "        finally:",
+  "            current = case.__dict__.get(method_name)",
+  "            if current is None or current is guarded:",
+  "                case.__dict__[method_name] = guarded",
+  "            refresh_runtime_guards()",
+  "    guarded = preserve_metadata(original, guarded)",
+  "    setattr(guarded, '_agent_toolkit_guarded_method', True)",
+  "    setattr(case, method_name, guarded)",
+  "    setattr(guarded, '_agent_toolkit_initial_instance_target', initial_instance_method)",
+  "    if method_name == getattr(case, '_testMethodName', None):",
+  "        setattr(case, '_agent_toolkit_test_method_guard', guarded)",
+  "        setattr(guarded, '_agent_toolkit_initial_class_target', initial_class_target)",
+  "    cases = guarded_cases_by_class.setdefault(case.__class__, [])",
+  "    if not any(existing is case for existing in cases):",
+  "        cases.append(case)",
+  "def guard_function_test_case(case):",
+  "    if not any(existing is case for existing in guarded_function_cases):",
+  "        guarded_function_cases.append(case)",
+  "    for attribute in ('_testFunc', '_setUpFunc', '_tearDownFunc'):",
+  "        original = getattr(case, attribute, None)",
+  "        if original is None or getattr(original, '_agent_toolkit_guarded_function', False):",
+  "            continue",
+  "        if attribute == '_testFunc':",
+  "            initial = case.__dict__.setdefault('_agent_toolkit_initial_test_func', original)",
+  "            if original is not initial and getattr(case, '__unittest_expecting_failure__', False):",
+  "                raise AssertionError('FunctionTestCase test function was replaced; expected-failure metadata is no longer reliable')",
+  "        setattr(case, attribute, guard_result_function(original, lambda: refresh_runtime_guards(), lambda attribute=attribute: getattr(case, attribute, None)))",
+  "        if attribute == '_testFunc':",
+  "            for metadata in ('__unittest_expecting_failure__', '__unittest_skip__', '__unittest_skip_why__'):",
+  "                if hasattr(original, metadata):",
+  "                    setattr(case, metadata, getattr(original, metadata))",
+  "def refresh_function_cases():",
+  "    for case in list(guarded_function_cases):",
+  "        guard_function_test_case(case)",
   "def guard_instance_cleanup(case):",
   "    original = getattr(case, 'addCleanup', None)",
-  "    if original is None:",
-  "        return",
-  "    def guarded(function, *args, original=original, **kwargs):",
-  "        return original(guard_cleanup_callback(function), *args, **kwargs)",
-  "    setattr(case, 'addCleanup', guarded)",
+  "    if original is not None and not getattr(original, '_agent_toolkit_cleanup_method_guarded', False):",
+  "        def guarded(function, /, *args, **kwargs):",
+  "            return reject_unsupported_result(original(guard_cleanup_callback(function), *args, **kwargs))",
+  "        setattr(guarded, '_agent_toolkit_cleanup_method_guarded', True)",
+  "        setattr(case, 'addCleanup', guarded)",
+  "    cleanups = getattr(case, '_cleanups', None)",
+  "    if isinstance(cleanups, list):",
+  "        for index, (function, args, kwargs) in enumerate(cleanups):",
+  "            cleanups[index] = (guard_cleanup_callback(function), args, kwargs)",
   "def guard_class_cleanup(test_class):",
-  "    if getattr(test_class, '_agent_toolkit_class_cleanup_guarded', False):",
+  "    cleanups = getattr(test_class, '_class_cleanups', None)",
+  "    if isinstance(cleanups, list):",
+  "        for index, (function, args, kwargs) in enumerate(cleanups):",
+  "            cleanups[index] = (guard_cleanup_callback(function), args, kwargs)",
+  "    current = inspect.getattr_static(test_class, 'addClassCleanup', None)",
+  "    previous = test_class.__dict__.get('_agent_toolkit_class_cleanup_wrapper')",
+  "    if previous is not None and getattr(current, '__func__', current) is previous:",
   "        return",
+  "    descriptor = current",
   "    original = getattr(test_class, 'addClassCleanup', None)",
   "    if original is None:",
   "        return",
-  "    original_function = getattr(original, '__func__', original)",
-  "    def guarded(test_class, function, *args, original=original_function, **kwargs):",
-  "        return original(test_class, guard_cleanup_callback(function), *args, **kwargs)",
-  "    setattr(test_class, 'addClassCleanup', classmethod(preserve_metadata(original_function, guarded)))",
+  "    if getattr(original, '_agent_toolkit_cleanup_method_guarded', False):",
+  "        return",
+  "    if isinstance(descriptor, staticmethod):",
+  "        def guarded(function, /, *args, **kwargs):",
+  "            return reject_unsupported_result(original(guard_cleanup_callback(function), *args, **kwargs))",
+  "        setattr(test_class, 'addClassCleanup', staticmethod(preserve_metadata(original, guarded)))",
+  "    elif isinstance(descriptor, classmethod):",
+  "        original_function = descriptor.__func__",
+  "        def guarded(receiver, function, /, *args, **kwargs):",
+  "            return reject_unsupported_result(original_function(receiver, guard_cleanup_callback(function), *args, **kwargs))",
+  "        setattr(test_class, 'addClassCleanup', classmethod(preserve_metadata(original_function, guarded)))",
+  "    elif inspect.ismethod(original) and not inspect.isfunction(descriptor):",
+  "        def guarded(function, /, *args, **kwargs):",
+  "            return reject_unsupported_result(original(guard_cleanup_callback(function), *args, **kwargs))",
+  "        setattr(test_class, 'addClassCleanup', staticmethod(preserve_metadata(original, guarded)))",
+    "    elif inspect.isfunction(descriptor):",
+    "        original_function = descriptor",
+    "        def guarded(receiver, function, /, *args, **kwargs):",
+    "            return reject_unsupported_result(original_function(receiver, guard_cleanup_callback(function), *args, **kwargs))",
+    "        setattr(test_class, 'addClassCleanup', preserve_metadata(original_function, guarded))",
+    "    else:",
+  "        original_function = descriptor if descriptor is not None else original",
+  "        def guarded(function, /, *args, **kwargs):",
+  "            return reject_unsupported_result(original_function(guard_cleanup_callback(function), *args, **kwargs))",
+  "        setattr(test_class, 'addClassCleanup', preserve_metadata(original_function, guarded))",
+  "    current = inspect.getattr_static(test_class, 'addClassCleanup', None)",
+  "    setattr(test_class, '_agent_toolkit_class_cleanup_wrapper', getattr(current, '__func__', current))",
   "    setattr(test_class, '_agent_toolkit_class_cleanup_guarded', True)",
   "def guard_class_method(test_class, method_name):",
+  "    descriptor = inspect.getattr_static(test_class, method_name, None)",
   "    original = getattr(test_class, method_name, None)",
   "    if original is None:",
   "        return",
-  "    original_function = getattr(original, '__func__', original)",
-  "    def guarded(test_class, original=original_function):",
-  "        return reject_unsupported_result(original(test_class))",
-  "    setattr(test_class, method_name, classmethod(preserve_metadata(original_function, guarded)))",
+  "    original_function = getattr(descriptor, '__func__', descriptor)",
+  "    if getattr(original_function, '_agent_toolkit_guarded_method', False):",
+  "        return",
+  "    if isinstance(descriptor, classmethod):",
+  "        def guarded(receiver):",
+  "            try:",
+  "                return reject_unsupported_result(original_function(receiver))",
+  "            finally:",
+  "                refresh_runtime_guards()",
+  "    elif isinstance(descriptor, staticmethod):",
+  "        def guarded(receiver):",
+  "            try:",
+  "                return reject_unsupported_result(original_function())",
+  "            finally:",
+  "                refresh_runtime_guards()",
+  "    elif inspect.ismethod(original) and not inspect.isfunction(descriptor):",
+  "        def guarded(receiver):",
+  "            try:",
+  "                return reject_unsupported_result(original())",
+  "            finally:",
+  "                refresh_runtime_guards()",
+  "    else:",
+  "        def guarded(receiver):",
+  "            try:",
+  "                return reject_unsupported_result(original())",
+  "            finally:",
+  "                refresh_runtime_guards()",
+  "    guarded = preserve_metadata(original_function, guarded)",
+  "    setattr(guarded, '_agent_toolkit_guarded_method', True)",
+  "    setattr(test_class, method_name, classmethod(guarded))",
   "def guard_test_cases(test_suite):",
   "    classes = set()",
   "    for case in test_suite:",
-  "        if isinstance(case, unittest.TestSuite):",
+  "        if isinstance(case, unittest.BaseTestSuite):",
   "            guard_test_cases(case)",
   "        elif isinstance(case, unittest.TestCase):",
   "            classes.add(case.__class__)",
+  "            if isinstance(case, unittest.FunctionTestCase):",
+  "                guard_function_test_case(case)",
   "            guard_instance_cleanup(case)",
   "            method_name = getattr(case, '_testMethodName', '')",
   "            guard_instance_method(case, method_name)",
   "            guard_instance_method(case, 'setUp')",
   "            guard_instance_method(case, 'tearDown')",
+  "            guard_instance_method(case, 'doCleanups')",
   "    for test_class in classes:",
   "        guard_class_cleanup(test_class)",
   "        guard_class_method(test_class, 'setUpClass')",
   "        guard_class_method(test_class, 'tearDownClass')",
+  "        guard_class_method(test_class, 'doClassCleanups')",
   "guard_test_cases(suite)",
+  "def suite_modules(test_suite):",
+  "    modules = set()",
+  "    for case in test_suite:",
+  "        if isinstance(case, unittest.BaseTestSuite):",
+  "            modules.update(suite_modules(case))",
+  "        elif isinstance(case, unittest.TestCase):",
+  "            modules.add(case.__class__.__module__)",
+  "    return modules",
+  "guarded_module_names = {module.__name__}",
+  "guarded_module_names.update(suite_modules(suite))",
+  "def refresh_runtime_guards():",
+  "    guard_module_cleanup_registration(unittest)",
+  "    guard_module_cleanup_registration(unittest.case)",
+  "    guard_module_method(unittest, 'doModuleCleanups')",
+  "    guard_module_method(unittest.case, 'doModuleCleanups')",
+  "    refresh_function_cases()",
+  "    for test_class, cases in list(guarded_cases_by_class.items()):",
+  "        for case in list(cases):",
+  "            refresh_test_method_after_setup(case)",
+  "            guard_instance_method(case, getattr(case, '_testMethodName', ''))",
+  "            guard_instance_method(case, 'setUp')",
+  "            guard_instance_method(case, 'tearDown')",
+  "            guard_instance_method(case, 'doCleanups')",
+  "            guard_instance_cleanup(case)",
+  "        guard_class_method(test_class, 'setUpClass')",
+  "        guard_class_method(test_class, 'tearDownClass')",
+  "        guard_class_method(test_class, 'doClassCleanups')",
+  "        guard_class_cleanup(test_class)",
+  "        refresh_instance_method_metadata(test_class)",
+  "    for module_name in guarded_module_names:",
+  "        target_module = sys.modules.get(module_name)",
+  "        if target_module is not None:",
+  "            guard_module_method(target_module, 'setUpModule')",
+  "            guard_module_method(target_module, 'tearDownModule')",
+  "guard_module_cleanup_registration(unittest)",
+  "guard_module_cleanup_registration(unittest.case)",
+  "guard_module_method(unittest, 'doModuleCleanups')",
+  "guard_module_method(unittest.case, 'doModuleCleanups')",
+  "for module_name in guarded_module_names:",
+  "    target_module = sys.modules.get(module_name)",
+  "    if target_module is not None:",
+  "        guard_module_method(target_module, 'setUpModule')",
+  "        guard_module_method(target_module, 'tearDownModule')",
   "def run_module_test(value):",
   "    def run():",
-  "        result = value()",
-  "        reject_unsupported_result(result)",
+  "        try:",
+  "            result = value()",
+  "            reject_unsupported_result(result)",
+  "        finally:",
+  "            refresh_runtime_guards()",
   "    return preserve_metadata(value, run)",
-  "suite.addTests(unittest.FunctionTestCase(run_module_test(value)) for name, value in vars(module).items() if name.startswith('test_') and callable(value))",
+  "def module_function_case(value):",
+  "    test_function = run_module_test(value)",
+  "    metadata = {'__module__': module.__name__}",
+  "    for name in ('__unittest_expecting_failure__', '__unittest_skip__', '__unittest_skip_why__'):",
+  "        if hasattr(test_function, name):",
+  "            metadata[name] = getattr(test_function, name)",
+  "    test_case_type = type('ModuleFunctionTestCase', (unittest.FunctionTestCase,), metadata)",
+  "    return test_case_type(test_function)",
+  "if not callable(load_tests_hook):",
+  "    suite.addTests(module_function_case(value) for name, value in vars(module).items() if name.startswith('test_') and callable(value))",
+  "    guard_test_cases(suite)",
   "result = unittest.TextTestRunner(verbosity=1).run(suite)",
+  "if result.testsRun == 0:",
+  "    raise SystemExit(1)",
+  "if unsupported_results:",
+  "    raise SystemExit(1)",
   "raise SystemExit(0 if result.wasSuccessful() else 1)",
 ].join("\n");
 
@@ -192,7 +490,7 @@ export function ensureTestSources(files: TestFile[]): void {
         .replace(/"(?:[^"\\]|\\.)*"/g, "\"\"")
         .replace(/\s+#.*$/, "");
       const commandBoundary = /(?:^|[;&|(){}]\s*|\b(?:then|do)\s+)(?:if\s+)?!?\s*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|(){}]+\s*)*/;
-      return new RegExp(`${commandBoundary.source}(?:(?:builtin|command)\\s+)?test\\b`).test(executableLine);
+      return new RegExp(`${commandBoundary.source}(?:(?:builtin|command)(?:\\s+(?:--|-p))*\\s+)?(?:["']?test["']?)(?:\\s|$|[;&|(){}])`).test(executableLine);
     });
     return !hasTestCommand;
   });
@@ -208,8 +506,8 @@ export function executedTestCount(kind: TestKind, output: string): number | unde
       ? /^\s*Ran\s+(\d+)\s+tests?\s+across\b/gim
       : /^\s*Ran\s+(\d+)\s+tests?\s+in\b/gim;
   const matches = [...output.matchAll(summary)];
-  const match = matches.at(-1);
-  return match ? Number(match[1]) : undefined;
+  if (matches.length !== 1) return undefined;
+  return Number(matches[0]?.[1]);
 }
 
 export function commandForTest(test: TestFile): string[] {
@@ -224,10 +522,267 @@ export function commandForTest(test: TestFile): string[] {
     "test() { local status; __agent_toolkit_inside_test=1; builtin test \"$@\"; status=$?; __agent_toolkit_inside_test=; builtin printf '.\\n' >> \"$marker_file\" || true; return \"$status\"; }",
     "readonly -f test",
     "__agent_toolkit_record_builtin_test() { builtin printf '.\\n' >> \"$marker_file\" || true; }",
-    "__agent_toolkit_debug_counter() { local command=\"$1\"; case \"$command\" in builtin\\ test*|command\\ test*) if [[ -z \"$__agent_toolkit_inside_test\" ]]; then __agent_toolkit_record_builtin_test; fi;; esac; }",
+    "__agent_toolkit_fd_is_open() { local fd=\"$1\"; [[ \"$fd\" == \"-\" ]] && return 0; (builtin true >&\"$fd\") 2>/dev/null; }",
+    "__agent_toolkit_fd_is_readable() { local fd=\"$1\"; [[ \"$fd\" == \"-\" ]] && return 0; (builtin true <&\"$fd\") 2>/dev/null; }",
+    "__agent_toolkit_read_redirection_target() { local text=\"$1\" quote=\"\" char target=\"\"; while [[ -n \"$text\" ]]; do char=\"\${text:0:1}\"; if [[ -n \"$quote\" ]]; then if [[ \"$quote\" == \"'\" ]]; then if [[ \"$char\" == \"'\" ]]; then quote=\"\"; else target=\"$target$char\"; fi; text=\"\${text:1}\"; continue; fi; if [[ \"$char\" == '\"' ]]; then quote=\"\"; text=\"\${text:1}\"; continue; fi; if [[ \"$char\" == \"\\\\\" ]]; then text=\"\${text:1}\"; [[ -n \"$text\" ]] || return 1; target=\"$target\${text:0:1}\"; text=\"\${text:1}\"; continue; fi; target=\"$target$char\"; text=\"\${text:1}\"; continue; fi; if [[ \"$char\" == \"'\" || \"$char\" == '\"' ]]; then quote=\"$char\"; text=\"\${text:1}\"; continue; fi; if [[ \"$char\" == \"\\\\\" ]]; then text=\"\${text:1}\"; [[ -n \"$text\" ]] || return 1; target=\"$target\${text:0:1}\"; text=\"\${text:1}\"; continue; fi; if [[ \"$char\" =~ [[:space:]] ]] || [[ \"$char\" == \";\" || \"$char\" == \"|\" || \"$char\" == \"&\" || \"$char\" == \"(\" || \"$char\" == \")\" || \"$char\" == \"{\" || \"$char\" == \"}\" ]]; then break; fi; target=\"$target$char\"; text=\"\${text:1}\"; done; [[ -z \"$quote\" ]] || return 1; __agent_toolkit_redirection_target=\"$target\"; __agent_toolkit_redirection_rest=\"$text\"; return 0; }",
+    "__agent_toolkit_has_unquoted_input_redirection() { local text=\"$1\" quote=\"\" char target; while [[ -n \"$text\" ]]; do char=\"\${text:0:1}\"; text=\"\${text:1}\"; if [[ -n \"$quote\" ]]; then if [[ \"$char\" == \"\\\\\" ]]; then text=\"\${text:1}\"; elif [[ \"$char\" == \"$quote\" ]]; then quote=\"\"; fi; elif [[ \"$char\" == \"'\" || \"$char\" == '\"' ]]; then quote=\"$char\"; elif [[ \"$char\" == \"\\\\\" ]]; then text=\"\${text:1}\"; elif [[ \"$char\" == '<' ]]; then if [[ \"\${text:0:1}\" == '<' ]]; then return 0; fi; while [[ \"\${text:0:1}\" =~ [[:space:]] ]]; do text=\"\${text:1}\"; done; if ! __agent_toolkit_read_redirection_target \"$text\"; then return 0; fi; target=\"$__agent_toolkit_redirection_target\"; text=\"$__agent_toolkit_redirection_rest\"; if [[ -z \"$target\" || \"$target\" != \"/dev/null\" && ! -f \"$target\" ]]; then return 0; fi; fi; done; return 1; }",
+    "__agent_toolkit_has_unusable_output_redirection() { local text=\"$1\" quote=\"\" char target parent; while [[ -n \"$text\" ]]; do char=\"\${text:0:1}\"; text=\"\${text:1}\"; if [[ -n \"$quote\" ]]; then if [[ \"$char\" == \"\\\\\" ]]; then text=\"\${text:1}\"; elif [[ \"$char\" == \"$quote\" ]]; then quote=\"\"; fi; elif [[ \"$char\" == \"'\" || \"$char\" == '\"' ]]; then quote=\"$char\"; elif [[ \"$char\" == \"\\\\\" ]]; then text=\"\${text:1}\"; elif [[ \"$char\" == '>' ]]; then if [[ \"\${text:0:1}\" == '>' ]]; then text=\"\${text:1}\"; fi; while [[ \"\${text:0:1}\" =~ [[:space:]] ]]; do text=\"\${text:1}\"; done; if [[ \"\${text:0:1}\" == '&' ]]; then return 0; fi; if ! __agent_toolkit_read_redirection_target \"$text\"; then return 0; fi; target=\"$__agent_toolkit_redirection_target\"; text=\"$__agent_toolkit_redirection_rest\"; if [[ -z \"$target\" ]]; then return 0; fi; if [[ \"$target\" != \"/dev/null\" ]]; then [[ -d \"$target\" ]] && return 0; if [[ \"$target\" == */* ]]; then parent=\"\${target%/*}\"; [[ -n \"$parent\" ]] || parent=\"/\"; else parent=\".\"; fi; [[ -d \"$parent\" ]] || return 0; fi; fi; done; return 1; }",
+    "__agent_toolkit_has_unquoted_input_redirection() {",
+    "  local text=\"$1\" quote=\"\" char target fd",
+    "  while [[ -n \"$text\" ]]; do",
+    "    char=\"\${text:0:1}\"; text=\"\${text:1}\"",
+    "    if [[ -n \"$quote\" ]]; then",
+    "      if [[ \"$char\" == \"\\\\\" ]]; then text=\"\${text:1}\"; elif [[ \"$char\" == \"$quote\" ]]; then quote=\"\"; fi",
+    "    elif [[ \"$char\" == \"'\" || \"$char\" == '\"' ]]; then quote=\"$char\"",
+    "    elif [[ \"$char\" == \"\\\\\" ]]; then text=\"\${text:1}\"",
+    "    elif [[ \"$char\" == \"<\" ]]; then",
+    "      if [[ \"\${text:0:1}\" == \"<\" ]]; then",
+    "        [[ \"\${text:1:1}\" == \"<\" ]] || return 0",
+    "        text=\"\${text:2}\"; while [[ \"\${text:0:1}\" =~ [[:space:]] ]]; do text=\"\${text:1}\"; done",
+    "        __agent_toolkit_read_redirection_target \"$text\" || return 0; target=\"$__agent_toolkit_redirection_target\"; text=\"$__agent_toolkit_redirection_rest\"; [[ -n \"$target\" ]] || return 0",
+    "      elif [[ \"\${text:0:1}\" == \"&\" ]]; then",
+    "        text=\"\${text:1}\"; fd=\"\"; if [[ \"\${text:0:1}\" == \"-\" ]]; then text=\"\${text:1}\"; continue; fi",
+    "        while [[ \"\${text:0:1}\" =~ [0-9] ]]; do fd=\"$fd\${text:0:1}\"; text=\"\${text:1}\"; done; [[ -n \"$fd\" ]] && __agent_toolkit_fd_is_open \"$fd\" || return 0",
+    "      else",
+    "        while [[ \"\${text:0:1}\" =~ [[:space:]] ]]; do text=\"\${text:1}\"; done; __agent_toolkit_read_redirection_target \"$text\" || return 0; target=\"$__agent_toolkit_redirection_target\"; text=\"$__agent_toolkit_redirection_rest\"; if [[ -z \"$target\" || \"$target\" != \"/dev/null\" && ! -f \"$target\" ]]; then return 0; fi",
+    "      fi",
+    "    fi",
+    "  done",
+    "  return 1",
+    "}",
+    "__agent_toolkit_has_unusable_output_redirection() {",
+    "  local text=\"$1\" quote=\"\" char target parent fd force",
+    "  while [[ -n \"$text\" ]]; do",
+    "    char=\"\${text:0:1}\"; text=\"\${text:1}\"",
+    "    if [[ -n \"$quote\" ]]; then",
+    "      if [[ \"$char\" == \"\\\\\" ]]; then text=\"\${text:1}\"; elif [[ \"$char\" == \"$quote\" ]]; then quote=\"\"; fi",
+    "    elif [[ \"$char\" == \"'\" || \"$char\" == '\"' ]]; then quote=\"$char\"",
+    "    elif [[ \"$char\" == \"\\\\\" ]]; then text=\"\${text:1}\"",
+    "    elif [[ \"$char\" == '>' ]]; then",
+    "      force=\"\"; [[ \"\${text:0:1}\" == '>' ]] && text=\"\${text:1}\"; if [[ \"\${text:0:1}\" == '|' ]]; then force=\"1\"; text=\"\${text:1}\"; fi",
+    "      while [[ \"\${text:0:1}\" =~ [[:space:]] ]]; do text=\"\${text:1}\"; done",
+    "      if [[ \"\${text:0:1}\" == '&' ]]; then",
+    "        text=\"\${text:1}\"; fd=\"\"; if [[ \"\${text:0:1}\" == \"-\" ]]; then text=\"\${text:1}\"; continue; fi",
+    "        while [[ \"\${text:0:1}\" =~ [0-9] ]]; do fd=\"$fd\${text:0:1}\"; text=\"\${text:1}\"; done; [[ -n \"$fd\" ]] && __agent_toolkit_fd_is_open \"$fd\" || return 0; continue",
+    "      fi",
+    "      [[ \"$text\" == *'$'* || \"$text\" == *'`'* ]] && return 0",
+    "      __agent_toolkit_read_redirection_target \"$text\" || return 0; target=\"$__agent_toolkit_redirection_target\"; text=\"$__agent_toolkit_redirection_rest\"; [[ -n \"$target\" ]] || return 0",
+    "      if [[ \"$target\" == /dev/fd/* ]]; then fd=\"\${target#/dev/fd/}\"; [[ \"$fd\" =~ ^[0-9]+$ ]] && __agent_toolkit_fd_is_open \"$fd\" || return 0; fi",
+    "      if [[ \"$target\" != \"/dev/null\" ]]; then",
+    "        [[ -d \"$target\" ]] && return 0; if [[ \"$target\" == */* ]]; then parent=\"\${target%/*}\"; [[ -n \"$parent\" ]] || parent=\"/\"; else parent=\".\"; fi; [[ -d \"$parent\" ]] || return 0; [[ -z \"$force\" && -o noclobber && -f \"$target\" ]] && return 0",
+    "      fi",
+    "    fi",
+    "  done",
+    "  return 1",
+    "}",
+    "__agent_toolkit_debug_counter() { local command=\"$1\"; command=\"\${command//\\\"test\\\"/test}\"; command=\"\${command//\\'test\\'/test}\"; if [[ \"$command\" =~ ^([A-Za-z_][A-Za-z0-9_]*=[^[:space:];|(){}]+[[:space:]]+)*(builtin|command)([[:space:]]+(-p|--))*[[:space:]]+test([[:space:]]|$) ]] && [[ -z \"$__agent_toolkit_inside_test\" ]] && ! __agent_toolkit_has_unquoted_input_redirection \"$command\" && ! __agent_toolkit_has_unusable_output_redirection \"$command\"; then __agent_toolkit_record_builtin_test; fi; }",
     "__agent_toolkit_install_debug_trap() { local action=\"$1\"; if [[ \"$action\" == \"-\" ]]; then action=\"\"; fi; if [[ -n \"$action\" ]]; then builtin trap \"__agent_toolkit_debug_counter \\\"\\$BASH_COMMAND\\\"; $action\" DEBUG; else builtin trap '__agent_toolkit_debug_counter \"$BASH_COMMAND\"' DEBUG; fi; }",
     "trap() { if (( $# == 2 )) && [[ \"$2\" == \"DEBUG\" && \"$1\" != \"-p\" ]]; then __agent_toolkit_install_debug_trap \"$1\"; else builtin trap \"$@\"; fi; }",
-    "readonly -f trap __agent_toolkit_record_builtin_test __agent_toolkit_debug_counter __agent_toolkit_install_debug_trap",
+    String.raw`__agent_toolkit_read_redirection_target() {
+  local agentText="$1" agentQuote="" agentChar agentTarget="" agentQuoted="" agentExpandable=1
+  while [[ -n "$agentText" ]]; do
+    agentChar="\${agentText:0:1}"; agentText="\${agentText:1}"
+    if [[ -n "$agentQuote" ]]; then
+      if [[ "$agentQuote" == "'" ]]; then
+        if [[ "$agentChar" == "'" ]]; then agentQuote=""; else agentTarget="$agentTarget$agentChar"; fi
+      elif [[ "$agentChar" == '"' ]]; then
+        agentQuote=""
+      elif [[ "$agentChar" == "\\" ]]; then
+        [[ -n "$agentText" ]] || return 1
+        agentTarget="$agentTarget\${agentText:0:1}"; agentText="\${agentText:1}"; agentExpandable=0
+      else
+        agentTarget="$agentTarget$agentChar"
+      fi
+      continue
+    fi
+    if [[ "$agentChar" == "'" || "$agentChar" == '"' ]]; then
+      agentQuote="$agentChar"; agentQuoted=1; [[ "$agentChar" == "'" ]] && agentExpandable=0
+    elif [[ "$agentChar" == "\\" ]]; then
+      [[ -n "$agentText" ]] || return 1
+      agentTarget="$agentTarget\${agentText:0:1}"; agentText="\${agentText:1}"; agentQuoted=1; agentExpandable=0
+    elif [[ "$agentChar" =~ [[:space:]] ]] || [[ "$agentChar" == ";" || "$agentChar" == "|" || "$agentChar" == "&" || "$agentChar" == "(" || "$agentChar" == ")" || "$agentChar" == "{" || "$agentChar" == "}" ]]; then
+      break
+    else
+      agentTarget="$agentTarget$agentChar"
+    fi
+  done
+  [[ -z "$agentQuote" ]] || return 1
+  __agent_toolkit_redirection_target="$agentTarget"
+  __agent_toolkit_redirection_quoted="$agentQuoted"
+  __agent_toolkit_redirection_expandable="$agentExpandable"
+  __agent_toolkit_redirection_rest="$agentText"
+  return 0
+}
+__agent_toolkit_resolve_redirection_value() {
+  local agentValue="$1" agentQuoted="$2" agentExpandable="\${3:-1}" agentVariableName agentPrefix agentSuffix
+  if [[ "$agentExpandable" == 1 ]]; then
+    while [[ "$agentValue" =~ ^(.*)\$\{([A-Za-z_][A-Za-z0-9_]*)\}(.*)$ ]]; do
+      agentPrefix="\${BASH_REMATCH[1]}"; agentVariableName="\${BASH_REMATCH[2]}"; agentSuffix="\${BASH_REMATCH[3]}"
+      declare -p "$agentVariableName" >/dev/null 2>&1 || return 1
+      agentValue="$agentPrefix\${!agentVariableName}$agentSuffix"
+    done
+    while [[ "$agentValue" =~ ^(.*)\$([A-Za-z_][A-Za-z0-9_]*)(.*)$ ]]; do
+      agentPrefix="\${BASH_REMATCH[1]}"; agentVariableName="\${BASH_REMATCH[2]}"; agentSuffix="\${BASH_REMATCH[3]}"
+      declare -p "$agentVariableName" >/dev/null 2>&1 || return 1
+      agentValue="$agentPrefix\${!agentVariableName}$agentSuffix"
+    done
+  fi
+  [[ "$agentValue" == *'$'* || "$agentValue" == *$'\x60'* ]] && return 1
+  [[ -n "$agentValue" ]] || return 1
+  [[ "$agentQuoted" == 1 || "$agentValue" != *[[:space:]]* ]] || return 1
+  __agent_toolkit_resolved_redirection_value="$agentValue"
+  return 0
+}
+__agent_toolkit_fd_path_number() {
+  local agentPath="$1"
+  if [[ "$agentPath" =~ ^/dev/(fd|fd/\.|\./fd|fd/\.\./fd)/[0-9]+$ ]]; then
+    __agent_toolkit_fd_path_value="\${agentPath##*/}"
+  else
+    __agent_toolkit_fd_path_value=""
+  fi
+}
+__agent_toolkit_has_unquoted_input_redirection() {
+  local agentText="$1" agentQuote="" agentChar agentTarget agentFd agentSourceFd agentMove agentDigits="" agentParent agentTargetFd agentOpenFds=":" agentClosedFds=":"
+  for agentFd in 0 1 2; do
+    if __agent_toolkit_fd_is_readable "$agentFd"; then agentOpenFds="$agentOpenFds$agentFd:"; else agentClosedFds="$agentClosedFds$agentFd:"; fi
+  done
+  while [[ -n "$agentText" ]]; do
+    agentChar="\${agentText:0:1}"; agentText="\${agentText:1}"
+    if [[ -n "$agentQuote" ]]; then
+      if [[ "$agentChar" == "\\" ]]; then agentText="\${agentText:1}"; elif [[ "$agentChar" == "$agentQuote" ]]; then agentQuote=""; fi
+      agentDigits=""; continue
+    fi
+    if [[ "$agentChar" == "'" || "$agentChar" == '"' ]]; then agentQuote="$agentChar"; agentDigits=""
+    elif [[ "$agentChar" == "\\" ]]; then agentText="\${agentText:1}"; agentDigits=""
+    elif [[ "$agentChar" =~ [0-9] ]]; then agentDigits="$agentDigits$agentChar"
+    elif [[ "$agentChar" == '<' ]]; then
+      agentFd="\${agentDigits:-0}"; agentDigits=""
+      if [[ "\${agentText:0:1}" == '<' ]]; then
+        agentText="\${agentText:1}"
+        if [[ "\${agentText:0:1}" == '<' ]]; then agentText="\${agentText:1}"; while [[ "\${agentText:0:1}" =~ [[:space:]] ]]; do agentText="\${agentText:1}"; done; __agent_toolkit_read_redirection_target "$agentText" || return 0; agentTarget="$__agent_toolkit_redirection_target"; agentText="$__agent_toolkit_redirection_rest"; [[ -n "$agentTarget" || "$__agent_toolkit_redirection_quoted" == 1 ]] || return 0
+        else while [[ "\${agentText:0:1}" =~ [[:space:]] ]]; do agentText="\${agentText:1}"; done; __agent_toolkit_read_redirection_target "$agentText" || return 0; agentTarget="$__agent_toolkit_redirection_target"; agentText="$__agent_toolkit_redirection_rest"; [[ -n "$agentTarget" ]] || return 0; fi
+        agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"; agentOpenFds="$agentOpenFds$agentFd:"; continue
+      fi
+      if [[ "\${agentText:0:1}" == '&' ]]; then
+        agentText="\${agentText:1}"; while [[ "\${agentText:0:1}" =~ [[:space:]] ]]; do agentText="\${agentText:1}"; done
+        __agent_toolkit_read_redirection_target "$agentText" || return 0; agentTarget="$__agent_toolkit_redirection_target"; agentText="$__agent_toolkit_redirection_rest"; agentMove=""
+        if [[ "$agentTarget" == "-" ]]; then agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"; agentClosedFds="$agentClosedFds$agentFd:"; continue; fi
+        __agent_toolkit_resolve_redirection_value "$agentTarget" "$__agent_toolkit_redirection_quoted" "$__agent_toolkit_redirection_expandable" || return 0; agentSourceFd="$__agent_toolkit_resolved_redirection_value"
+        if [[ "$agentSourceFd" =~ ^([0-9]+)-$ ]]; then agentMove=1; agentSourceFd="\${BASH_REMATCH[1]}"; fi
+        [[ "$agentSourceFd" =~ ^[0-9]+$ ]] || return 0
+        if [[ "$agentClosedFds" == *":$agentSourceFd:"* ]]; then return 0; fi
+        if [[ "$agentOpenFds" != *":$agentSourceFd:"* ]]; then __agent_toolkit_fd_is_readable "$agentSourceFd" || return 0; agentOpenFds="$agentOpenFds$agentSourceFd:"; fi
+        agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"; agentOpenFds="$agentOpenFds$agentFd:"
+        if [[ -n "$agentMove" ]]; then agentOpenFds="\${agentOpenFds//:$agentSourceFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentSourceFd:/:}"; agentClosedFds="$agentClosedFds$agentSourceFd:"; fi
+      else
+        while [[ "\${agentText:0:1}" =~ [[:space:]] ]]; do agentText="\${agentText:1}"; done
+        __agent_toolkit_read_redirection_target "$agentText" || return 0; agentTarget="$__agent_toolkit_redirection_target"; agentText="$__agent_toolkit_redirection_rest"
+        __agent_toolkit_resolve_redirection_value "$agentTarget" "$__agent_toolkit_redirection_quoted" "$__agent_toolkit_redirection_expandable" || return 0; agentTarget="$__agent_toolkit_resolved_redirection_value"
+        __agent_toolkit_fd_path_number "$agentTarget"; agentTargetFd="$__agent_toolkit_fd_path_value"
+        if [[ -n "$agentTargetFd" ]]; then
+          if [[ "$agentClosedFds" == *":$agentTargetFd:"* ]]; then return 0; fi
+          if [[ "$agentOpenFds" != *":$agentTargetFd:"* ]]; then __agent_toolkit_fd_is_readable "$agentTargetFd" || return 0; agentOpenFds="$agentOpenFds$agentTargetFd:"; fi
+        elif [[ "$agentTarget" == /dev/fd/* || "$agentTarget" == /dev/./fd/* || "$agentTarget" == /dev/fd/../fd/* ]]; then return 0
+        elif [[ "$agentTarget" != "/dev/null" ]]; then
+          [[ -d "$agentTarget" ]] && return 0; [[ -f "$agentTarget" ]] || return 0
+        fi
+        agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"; agentOpenFds="$agentOpenFds$agentFd:"
+      fi
+    elif [[ "$agentChar" == '>' ]]; then
+      agentFd="\${agentDigits:-1}"; agentDigits=""
+      if [[ "\${agentText:0:1}" == '>' ]]; then agentText="\${agentText:1}"; fi
+      while [[ "\${agentText:0:1}" =~ [[:space:]] ]]; do agentText="\${agentText:1}"; done
+      if [[ "\${agentText:0:1}" == '&' ]]; then
+        agentText="\${agentText:1}"; while [[ "\${agentText:0:1}" =~ [[:space:]] ]]; do agentText="\${agentText:1}"; done
+        __agent_toolkit_read_redirection_target "$agentText" || return 0; agentTarget="$__agent_toolkit_redirection_target"; agentText="$__agent_toolkit_redirection_rest"; agentMove=""
+        if [[ "$agentTarget" == "-" ]]; then agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"; agentClosedFds="$agentClosedFds$agentFd:"; continue; fi
+        __agent_toolkit_resolve_redirection_value "$agentTarget" "$__agent_toolkit_redirection_quoted" "$__agent_toolkit_redirection_expandable" || return 0; agentSourceFd="$__agent_toolkit_resolved_redirection_value"
+        if [[ "$agentSourceFd" =~ ^([0-9]+)-$ ]]; then agentMove=1; agentSourceFd="\${BASH_REMATCH[1]}"; fi
+        agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"
+        if [[ "$agentSourceFd" =~ ^[0-9]+$ ]] && __agent_toolkit_fd_is_readable "$agentSourceFd"; then agentOpenFds="$agentOpenFds$agentFd:"; else agentClosedFds="$agentClosedFds$agentFd:"; fi
+        if [[ -n "$agentMove" ]]; then agentOpenFds="\${agentOpenFds//:$agentSourceFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentSourceFd:/:}"; agentClosedFds="$agentClosedFds$agentSourceFd:"; fi
+      else
+        __agent_toolkit_read_redirection_target "$agentText" || return 0; agentText="$__agent_toolkit_redirection_rest"
+        agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"; agentClosedFds="$agentClosedFds$agentFd:"
+      fi
+    else
+      agentDigits=""
+    fi
+  done
+  return 1
+}
+__agent_toolkit_has_unusable_output_redirection() {
+  local agentText="$1" agentQuote="" agentChar agentTarget agentFd agentSourceFd agentMove agentDigits="" agentParent agentForce agentAppend agentTargetFd agentOpenFds=":" agentClosedFds=":"
+  for agentFd in 0 1 2; do
+    if __agent_toolkit_fd_is_open "$agentFd"; then agentOpenFds="$agentOpenFds$agentFd:"; else agentClosedFds="$agentClosedFds$agentFd:"; fi
+  done
+  while [[ -n "$agentText" ]]; do
+    agentChar="\${agentText:0:1}"; agentText="\${agentText:1}"
+    if [[ -n "$agentQuote" ]]; then
+      if [[ "$agentChar" == "\\" ]]; then agentText="\${agentText:1}"; elif [[ "$agentChar" == "$agentQuote" ]]; then agentQuote=""; fi
+      agentDigits=""; continue
+    fi
+    if [[ "$agentChar" == "'" || "$agentChar" == '"' ]]; then agentQuote="$agentChar"; agentDigits=""
+    elif [[ "$agentChar" == "\\" ]]; then agentText="\${agentText:1}"; agentDigits=""
+    elif [[ "$agentChar" =~ [0-9] ]]; then agentDigits="$agentDigits$agentChar"
+    elif [[ "$agentChar" == '>' ]]; then
+      agentFd="\${agentDigits:-1}"; agentDigits=""; agentAppend=""; agentForce=""
+      if [[ "\${agentText:0:1}" == '>' ]]; then agentAppend=1; agentText="\${agentText:1}"; fi
+      if [[ "\${agentText:0:1}" == '|' ]]; then [[ -z "$agentAppend" ]] || return 0; agentForce=1; agentText="\${agentText:1}"; fi
+      while [[ "\${agentText:0:1}" =~ [[:space:]] ]]; do agentText="\${agentText:1}"; done
+      if [[ "\${agentText:0:1}" == '&' ]]; then
+        agentText="\${agentText:1}"; while [[ "\${agentText:0:1}" =~ [[:space:]] ]]; do agentText="\${agentText:1}"; done
+        __agent_toolkit_read_redirection_target "$agentText" || return 0; agentTarget="$__agent_toolkit_redirection_target"; agentText="$__agent_toolkit_redirection_rest"; agentMove=""
+        if [[ "$agentTarget" == "-" ]]; then agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"; agentClosedFds="$agentClosedFds$agentFd:"; continue; fi
+        __agent_toolkit_resolve_redirection_value "$agentTarget" "$__agent_toolkit_redirection_quoted" "$__agent_toolkit_redirection_expandable" || return 0; agentSourceFd="$__agent_toolkit_resolved_redirection_value"
+        if [[ "$agentSourceFd" =~ ^([0-9]+)-$ ]]; then agentMove=1; agentSourceFd="\${BASH_REMATCH[1]}"; fi
+        [[ "$agentSourceFd" =~ ^[0-9]+$ ]] || return 0
+        if [[ "$agentClosedFds" == *":$agentSourceFd:"* ]]; then return 0; fi
+        if [[ "$agentOpenFds" != *":$agentSourceFd:"* ]]; then __agent_toolkit_fd_is_open "$agentSourceFd" || return 0; agentOpenFds="$agentOpenFds$agentSourceFd:"; fi
+        agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"; agentOpenFds="$agentOpenFds$agentFd:"
+        if [[ -n "$agentMove" ]]; then agentOpenFds="\${agentOpenFds//:$agentSourceFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentSourceFd:/:}"; agentClosedFds="$agentClosedFds$agentSourceFd:"; fi
+        continue
+      fi
+      __agent_toolkit_read_redirection_target "$agentText" || return 0; agentTarget="$__agent_toolkit_redirection_target"; agentText="$__agent_toolkit_redirection_rest"
+      __agent_toolkit_resolve_redirection_value "$agentTarget" "$__agent_toolkit_redirection_quoted" "$__agent_toolkit_redirection_expandable" || return 0; agentTarget="$__agent_toolkit_resolved_redirection_value"
+      __agent_toolkit_fd_path_number "$agentTarget"; agentTargetFd="$__agent_toolkit_fd_path_value"
+      if [[ -n "$agentTargetFd" ]]; then
+        if [[ "$agentClosedFds" == *":$agentTargetFd:"* ]]; then return 0; fi
+        if [[ "$agentTargetFd" == 0 ]] && ! (builtin true > "$agentTarget") 2>/dev/null; then return 0; fi
+        if [[ "$agentOpenFds" != *":$agentTargetFd:"* ]]; then __agent_toolkit_fd_is_open "$agentTargetFd" || return 0; agentOpenFds="$agentOpenFds$agentTargetFd:"; fi
+      elif [[ "$agentTarget" == /dev/fd/* || "$agentTarget" == /dev/./fd/* || "$agentTarget" == /dev/fd/../fd/* ]]; then return 0
+      elif [[ "$agentTarget" != "/dev/null" ]]; then
+        [[ -d "$agentTarget" ]] && return 0
+        if [[ "$agentTarget" == */* ]]; then agentParent="\${agentTarget%/*}"; [[ -n "$agentParent" ]] || agentParent="/"; else agentParent="."; fi
+        [[ -d "$agentParent" ]] || return 0
+        [[ -z "$agentForce" && -z "$agentAppend" && -o noclobber && -f "$agentTarget" ]] && return 0
+      fi
+      agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"; agentOpenFds="$agentOpenFds$agentFd:"
+    elif [[ "$agentChar" == '<' ]]; then
+      agentFd="\${agentDigits:-0}"; agentDigits=""
+      if [[ "\${agentText:0:1}" == '<' ]]; then agentText="\${agentText:1}"; fi
+      while [[ "\${agentText:0:1}" =~ [[:space:]] ]]; do agentText="\${agentText:1}"; done
+      if [[ "\${agentText:0:1}" == '&' ]]; then
+        agentText="\${agentText:1}"; while [[ "\${agentText:0:1}" =~ [[:space:]] ]]; do agentText="\${agentText:1}"; done
+        __agent_toolkit_read_redirection_target "$agentText" || return 0; agentTarget="$__agent_toolkit_redirection_target"; agentText="$__agent_toolkit_redirection_rest"; agentMove=""
+        if [[ "$agentTarget" == "-" ]]; then agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"; agentClosedFds="$agentClosedFds$agentFd:"; continue; fi
+        __agent_toolkit_resolve_redirection_value "$agentTarget" "$__agent_toolkit_redirection_quoted" "$__agent_toolkit_redirection_expandable" || return 0; agentSourceFd="$__agent_toolkit_resolved_redirection_value"
+        if [[ "$agentSourceFd" =~ ^([0-9]+)-$ ]]; then agentMove=1; agentSourceFd="\${BASH_REMATCH[1]}"; fi
+        agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"
+        if [[ "$agentSourceFd" =~ ^[0-9]+$ ]] && __agent_toolkit_fd_is_open "$agentSourceFd"; then agentOpenFds="$agentOpenFds$agentFd:"; else agentClosedFds="$agentClosedFds$agentFd:"; fi
+        if [[ -n "$agentMove" ]]; then agentOpenFds="\${agentOpenFds//:$agentSourceFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentSourceFd:/:}"; agentClosedFds="$agentClosedFds$agentSourceFd:"; fi
+      else
+        __agent_toolkit_read_redirection_target "$agentText" || return 0; agentText="$__agent_toolkit_redirection_rest"
+        agentOpenFds="\${agentOpenFds//:$agentFd:/:}"; agentClosedFds="\${agentClosedFds//:$agentFd:/:}"; agentClosedFds="$agentClosedFds$agentFd:"
+      fi
+    else
+      agentDigits=""
+    fi
+  done
+  return 1
+}
+`.replaceAll("\\${", "${"),
+    "readonly -f test trap __agent_toolkit_record_builtin_test __agent_toolkit_fd_is_open __agent_toolkit_fd_is_readable __agent_toolkit_read_redirection_target __agent_toolkit_resolve_redirection_value __agent_toolkit_fd_path_number __agent_toolkit_has_unquoted_input_redirection __agent_toolkit_has_unusable_output_redirection __agent_toolkit_debug_counter __agent_toolkit_install_debug_trap",
     "set +e",
     "(",
     "  set -euo pipefail",
