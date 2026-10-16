@@ -60,10 +60,25 @@ test("fails closed for empty and non-test source files", () => {
   }
 });
 
+test("requires shell tests to contain an assertion and a positive count marker", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-"));
+  try {
+    const noOp = join(root, "test_noop.sh");
+    const valid = join(root, "test_valid.sh");
+    writeFileSync(noOp, "#!/usr/bin/env bash\ntrue\nprintf 'TESTS_RUN=%s\\n' 1\n");
+    writeFileSync(valid, "#!/usr/bin/env bash\ntest -e /tmp\nprintf 'TESTS_RUN=%s\\n' 1\n");
+    expect(() => ensureTestSources([{ path: noOp, kind: "shell" }])).toThrow("without maintained test declarations");
+    expect(() => ensureTestSources([{ path: valid, kind: "shell" }])).not.toThrow();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("requires a nonzero runtime test count for Bun and Python suites", () => {
   expect(executedTestCount("bun", "Ran 0 tests across 1 files.\nRan 2 tests across 1 files.")).toBe(2);
   expect(executedTestCount("bun", "Ran 0 tests in a comment")).toBeUndefined();
   expect(executedTestCount("python", "Ran 21 tests in 0.1s")).toBe(21);
+  expect(executedTestCount("shell", "TESTS_RUN=3\n")).toBe(3);
   expect(executedTestCount("shell", "shell completed")).toBeUndefined();
 });
 

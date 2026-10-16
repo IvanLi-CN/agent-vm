@@ -53,6 +53,10 @@ export function walkFiles(root: string, options: WalkOptions = {}): string[] {
   const rootRealPath = realpathSync(root);
   const visitedDirectories = new Set<string>();
   const files: string[] = [];
+  const rejectSymlink = options.onRejectedSymlink;
+  const reportRejectedSymlink = (path: string): void => {
+    rejectSymlink?.(path);
+  };
   const isInsideRoot = (path: string): boolean => path === rootRealPath || path.startsWith(`${rootRealPath}${sep}`);
   const shouldIgnore = (path: string, name: string): boolean => options.shouldIgnoreDirectory
     ? options.shouldIgnoreDirectory(path, name)
@@ -64,10 +68,14 @@ export function walkFiles(root: string, options: WalkOptions = {}): string[] {
       const path = join(directory, entry.name);
       if (entry.isSymbolicLink()) {
         if (shouldIgnore(path, entry.name)) continue;
+        if (rejectSymlink) {
+          rejectSymlink(path);
+          continue;
+        }
         try {
           const realPath = realpathSync(path);
           if (!isInsideRoot(realPath)) {
-            options.onRejectedSymlink?.(path);
+            reportRejectedSymlink(path);
             continue;
           }
           const stats = statSync(path);
@@ -76,10 +84,10 @@ export function walkFiles(root: string, options: WalkOptions = {}): string[] {
           } else if (stats.isDirectory() && !shouldIgnore(path, entry.name)) {
             visit(path, realPath);
           } else {
-            options.onRejectedSymlink?.(path);
+            reportRejectedSymlink(path);
           }
         } catch {
-          options.onRejectedSymlink?.(path);
+          reportRejectedSymlink(path);
         }
         continue;
       }

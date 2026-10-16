@@ -57,7 +57,11 @@ export function ensureTestSources(files: TestFile[]): void {
     if (source.trim().length === 0) return true;
     if (test.kind === "bun") return !/\b(?:test|it|describe)\s*\(/.test(source);
     if (test.kind === "python") return !/\b(?:unittest\.|TestCase\b|def\s+test_)/.test(source);
-    return false;
+    const executableSource = source
+      .split("\n")
+      .filter((line) => !/^\s*#/.test(line))
+      .join("\n");
+    return !/\b(?:test|grep|diff|cmp|assert)\b|\[\[?\s/.test(executableSource) || !/\bTESTS_RUN\s*=/.test(executableSource);
   });
   if (invalid.length > 0) {
     throw new Error(`refusing to run test files without maintained test declarations: ${invalid.map((test) => test.path).join(", ")}`);
@@ -65,10 +69,11 @@ export function ensureTestSources(files: TestFile[]): void {
 }
 
 export function executedTestCount(kind: TestKind, output: string): number | undefined {
-  if (kind === "shell") return undefined;
-  const summary = kind === "bun"
-    ? /^\s*Ran\s+(\d+)\s+tests?\s+across\b/gim
-    : /^\s*Ran\s+(\d+)\s+tests?\s+in\b/gim;
+  const summary = kind === "shell"
+    ? /^\s*TESTS_RUN\s*=\s*(\d+)\s*$/gim
+    : kind === "bun"
+      ? /^\s*Ran\s+(\d+)\s+tests?\s+across\b/gim
+      : /^\s*Ran\s+(\d+)\s+tests?\s+in\b/gim;
   const matches = [...output.matchAll(summary)];
   const match = matches.at(-1);
   return match ? Number(match[1]) : undefined;
@@ -99,7 +104,7 @@ async function runTest(test: TestFile): Promise<number> {
   process.stderr.write(err);
   console.log("::endgroup::");
   const count = executedTestCount(test.kind, `${out}\n${err}`);
-  if (exitCode === 0 && test.kind !== "shell" && (count === undefined || count === 0)) {
+  if (exitCode === 0 && (count === undefined || count === 0)) {
     console.error(`ERROR test command reported zero executed tests: ${test.path}`);
     return 1;
   }
