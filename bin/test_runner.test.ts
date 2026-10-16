@@ -177,6 +177,11 @@ test("fails closed for unsupported async Python tests", async () => {
     writeFileSync(path, "async def test_not_run():\n    raise AssertionError('must be awaited')\n");
     const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
     expect(await child.exited).toBe(1);
+
+    const generator = join(root, "test_generator.py");
+    writeFileSync(generator, "def test_generator():\n    yield 1\n    raise AssertionError('must not be skipped')\n");
+    const generatorChild = Bun.spawn(commandForTest({ path: generator, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await generatorChild.exited).toBe(1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
