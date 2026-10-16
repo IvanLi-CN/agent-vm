@@ -76,6 +76,17 @@ test("requires shell tests to contain a test command", () => {
   }
 });
 
+test("accepts Bun parameterized test declarations", () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-bun-each-"));
+  try {
+    const path = join(root, "test_each.test.ts");
+    writeFileSync(path, "test.each([1, 2])('value', (value) => expect(value).toBeTruthy())\n");
+    expect(() => ensureTestSources([{ path, kind: "bun" }])).not.toThrow();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("fails shell suites when no test command executes", async () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-runtime-"));
   try {
@@ -199,6 +210,18 @@ test("fails closed for inherited async and async-generator Python tests", async 
     writeFileSync(generator, "async def test_generator():\n    yield 1\n    raise AssertionError('must not run')\n");
     const generatorChild = Bun.spawn(commandForTest({ path: generator, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
     expect(await generatorChild.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for decorated async Python tests", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-decorated-async-"));
+  try {
+    const path = join(root, "test_decorated_async.py");
+    writeFileSync(path, "import functools\n\n@functools.lru_cache()\nasync def test_not_run():\n    raise AssertionError('must be awaited')\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

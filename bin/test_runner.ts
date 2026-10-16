@@ -27,8 +27,13 @@ const PYTHON_TEST_RUNNER = [
   "module = importlib.util.module_from_spec(spec)",
   "sys.modules[spec.name] = module",
   "spec.loader.exec_module(module)",
-  "async_names = [name for name, value in vars(module).items() if name.startswith('test_') and (inspect.iscoroutinefunction(value) or inspect.isasyncgenfunction(value) or inspect.isgeneratorfunction(value))]",
-  "async_names += [f'{name}.{method}' for name, value in vars(module).items() if inspect.isclass(value) and issubclass(value, unittest.TestCase) for method, member in vars(value).items() if method.startswith('test_') and (inspect.iscoroutinefunction(member) or inspect.isasyncgenfunction(member) or inspect.isgeneratorfunction(member))]",
+  "def unwrapped(value):",
+  "    try:",
+  "        return inspect.unwrap(value)",
+  "    except (TypeError, ValueError):",
+  "        return value",
+  "async_names = [name for name, value in vars(module).items() if name.startswith('test_') and (inspect.iscoroutinefunction(unwrapped(value)) or inspect.isasyncgenfunction(unwrapped(value)) or inspect.isgeneratorfunction(unwrapped(value)))]",
+  "async_names += [f'{name}.{method}' for name, value in vars(module).items() if inspect.isclass(value) and issubclass(value, unittest.TestCase) for method, member in vars(value).items() if method.startswith('test_') and (inspect.iscoroutinefunction(unwrapped(member)) or inspect.isasyncgenfunction(unwrapped(member)) or inspect.isgeneratorfunction(unwrapped(member)))]",
   "suite = unittest.defaultTestLoader.loadTestsFromModule(module)",
   "def async_test_names(test_suite):",
   "    names = []",
@@ -37,14 +42,20 @@ const PYTHON_TEST_RUNNER = [
   "            names.extend(async_test_names(case))",
   "        elif isinstance(case, unittest.TestCase):",
   "            method_name = getattr(case, '_testMethodName', '')",
-  "            method = getattr(case, method_name, None)",
+  "            method = unwrapped(getattr(case, method_name, None))",
   "            if method is not None and (inspect.iscoroutinefunction(method) or inspect.isasyncgenfunction(method) or inspect.isgeneratorfunction(method)):",
   "                names.append(f'{case.__class__.__name__}.{method_name}')",
   "    return names",
   "async_names += async_test_names(suite)",
   "if async_names:",
   "    raise TypeError('async tests are unsupported: ' + ', '.join(async_names))",
-  "suite.addTests(unittest.FunctionTestCase(value) for name, value in vars(module).items() if name.startswith('test_') and callable(value))",
+  "def run_module_test(value):",
+  "    def run():",
+  "        result = value()",
+  "        if inspect.isawaitable(result) or inspect.isasyncgen(result) or inspect.isgenerator(result):",
+  "            raise TypeError('async or generator tests are unsupported')",
+  "    return run",
+  "suite.addTests(unittest.FunctionTestCase(run_module_test(value)) for name, value in vars(module).items() if name.startswith('test_') and callable(value))",
   "result = unittest.TextTestRunner(verbosity=1).run(suite)",
   "raise SystemExit(0 if result.wasSuccessful() else 1)",
 ].join("\n");
@@ -91,7 +102,7 @@ export function ensureTestSources(files: TestFile[]): void {
   const invalid = files.filter((test) => {
     const source = readText(test.path);
     if (source.trim().length === 0) return true;
-    if (test.kind === "bun") return !/\b(?:test|it|describe)\s*\(/.test(source);
+    if (test.kind === "bun") return !/\b(?:test|it|describe)(?:\s*\.\s*each)?\s*\(/.test(source);
     if (test.kind === "python") return !/\b(?:unittest\.|TestCase\b|def\s+test_)/.test(source);
     const hasTestCommand = source.split("\n").some((line) => {
       const executableLine = line
