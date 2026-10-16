@@ -107,7 +107,7 @@ test("reports shell counts before an explicit successful exit", async () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-explicit-exit-"));
   try {
     const path = join(root, "test_explicit_exit.sh");
-    writeFileSync(path, "test 1 -eq 1\nexit 0\n");
+    writeFileSync(path, "trap ':' EXIT\ntest 1 -eq 1\nexit 0\n");
     const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
     const stdout = await new Response(child.stdout).text();
     const stderr = await new Response(child.stderr).text();
@@ -165,6 +165,18 @@ test("executes a module-level Python test function", async () => {
     const stderr = await new Response(child.stderr).text();
     expect(await child.exited).toBe(0);
     expect(executedTestCount("python", `${stdout}\n${stderr}`)).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for unsupported async Python tests", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-async-function-"));
+  try {
+    const path = join(root, "test_async.py");
+    writeFileSync(path, "async def test_not_run():\n    raise AssertionError('must be awaited')\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

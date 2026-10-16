@@ -15,6 +15,7 @@ const IGNORED_DIRECTORIES = new Set([
 
 const PYTHON_TEST_RUNNER = [
   "import importlib.util",
+  "import inspect",
   "import pathlib",
   "import sys",
   "import unittest",
@@ -26,6 +27,10 @@ const PYTHON_TEST_RUNNER = [
   "module = importlib.util.module_from_spec(spec)",
   "sys.modules[spec.name] = module",
   "spec.loader.exec_module(module)",
+  "async_names = [name for name, value in vars(module).items() if name.startswith('test_') and inspect.iscoroutinefunction(value)]",
+  "async_names += [f'{name}.{method}' for name, value in vars(module).items() if inspect.isclass(value) and issubclass(value, unittest.TestCase) for method, member in vars(value).items() if method.startswith('test_') and inspect.iscoroutinefunction(member)]",
+  "if async_names:",
+  "    raise TypeError('async tests are unsupported: ' + ', '.join(async_names))",
   "suite = unittest.defaultTestLoader.loadTestsFromModule(module)",
   "suite.addTests(unittest.FunctionTestCase(value) for name, value in vars(module).items() if name.startswith('test_') and callable(value))",
   "result = unittest.TextTestRunner(verbosity=1).run(suite)",
@@ -108,7 +113,7 @@ export function commandForTest(test: TestFile): string[] {
   return [
     "bash",
     "-c",
-    "set -euo pipefail\nmarker_file=$(mktemp)\nreadonly marker_file\ntrap 'exit_status=$?; count=$(wc -l < \"$marker_file\"); if ((exit_status == 0 && count == 0)); then exit_status=1; fi; if ((exit_status == 0)); then builtin printf \"TESTS_RUN=%s\\n\" \"$count\"; fi; rm -f -- \"$marker_file\"; exit \"$exit_status\"' EXIT\ntest() { local status; builtin test \"$@\"; status=$?; builtin printf '.\\n' >> \"$marker_file\" || true; return \"$status\"; }\nreadonly -f test\nsource \"$0\"\n",
+    "set -euo pipefail\nmarker_file=$(mktemp)\nreadonly marker_file\ntrap 'rm -f -- \"$marker_file\"' EXIT\ntest() { local status; builtin test \"$@\"; status=$?; builtin printf '.\\n' >> \"$marker_file\" || true; return \"$status\"; }\nreadonly -f test\nset +e\n(\n  set -euo pipefail\n  source \"$0\"\n)\nexit_status=$?\nset -e\ncount=$(wc -l < \"$marker_file\")\nif ((exit_status == 0 && count == 0)); then exit_status=1; fi\nif ((exit_status == 0)); then builtin printf \"TESTS_RUN=%s\\n\" \"$count\"; fi\nexit \"$exit_status\"\n",
     test.path,
   ];
 }
