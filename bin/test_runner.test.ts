@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { discoverTests, ensureTestSelection, testKind } from "./test_runner.ts";
+import { commandForTest, discoverTests, ensureTestSelection, testKind } from "./test_runner.ts";
 
 test("discovers maintained TS, Python, and Shell tests automatically", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-"));
@@ -22,7 +22,7 @@ test("discovers maintained TS, Python, and Shell tests automatically", () => {
     expect(testKind("test-shell.sh")).toBe("shell");
     expect(testKind("test_runner.ts")).toBe("bun");
     expect(discoverTests(root, "repo").map((testFile) => testFile.kind)).toEqual(["bun"]);
-    expect(discoverTests(root, "skills").map((testFile) => testFile.kind).sort()).toEqual(["bun", "python", "python", "shell"]);
+    expect(discoverTests(root, "skills").map((testFile) => testFile.kind).sort()).toEqual(["bun", "python", "shell"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -30,4 +30,10 @@ test("discovers maintained TS, Python, and Shell tests automatically", () => {
 
 test("fails closed when deliberate test selection omits every file", () => {
   expect(() => ensureTestSelection([], "repo")).toThrow("refusing to pass an empty test selection");
+});
+
+test("runs Python files through unittest discovery so files without a main guard are executed", () => {
+  expect(commandForTest({ path: "/repo/skills/example/tests/test_reclamation.py", kind: "python" })).toEqual([
+    "python3", "-m", "unittest", "discover", "-s", "/repo/skills/example/tests", "-p", "test_reclamation.py",
+  ]);
 });

@@ -40,7 +40,6 @@ export function trackedFiles(repoRoot: string = REPO_ROOT): string[] {
 
 export type WalkOptions = {
   ignoredDirectories?: Set<string>;
-  ignoredDirectoriesAtRoot?: Set<string>;
   onRejectedSymlink?: (path: string) => void;
 };
 
@@ -50,13 +49,11 @@ export function walkFiles(root: string, options: WalkOptions = {}): string[] {
   }
 
   const ignored = options.ignoredDirectories ?? new Set<string>();
-  const ignoredAtRoot = options.ignoredDirectoriesAtRoot ?? new Set<string>();
   const rootRealPath = realpathSync(root);
   const visitedDirectories = new Set<string>();
   const files: string[] = [];
   const isInsideRoot = (path: string): boolean => path === rootRealPath || path.startsWith(`${rootRealPath}${sep}`);
-  const isIgnored = (name: string, depth: number): boolean => ignored.has(name) || (depth === 0 && ignoredAtRoot.has(name));
-  const visit = (directory: string, realDirectory: string = realpathSync(directory), depth = 0): void => {
+  const visit = (directory: string, realDirectory: string = realpathSync(directory)): void => {
     if (visitedDirectories.has(realDirectory)) return;
     visitedDirectories.add(realDirectory);
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
@@ -71,8 +68,8 @@ export function walkFiles(root: string, options: WalkOptions = {}): string[] {
           const stats = statSync(path);
           if (stats.isFile()) {
             files.push(path);
-          } else if (stats.isDirectory() && !isIgnored(entry.name, depth)) {
-            visit(path, realPath, depth + 1);
+          } else if (stats.isDirectory() && !ignored.has(entry.name)) {
+            visit(path, realPath);
           } else {
             options.onRejectedSymlink?.(path);
           }
@@ -82,8 +79,8 @@ export function walkFiles(root: string, options: WalkOptions = {}): string[] {
         continue;
       }
       if (entry.isDirectory()) {
-        if (!isIgnored(entry.name, depth)) {
-          visit(path, realpathSync(path), depth + 1);
+        if (!ignored.has(entry.name)) {
+          visit(path, realpathSync(path));
         }
         continue;
       }

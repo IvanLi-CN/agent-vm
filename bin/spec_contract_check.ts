@@ -143,7 +143,7 @@ export function check(path: string, root: string = REPO_ROOT): string[] {
 }
 
 type ParsedArgs = { paths: string[]; root: string };
-const USAGE = "usage: spec_contract_check.ts --path <path> [--path <path> ...]";
+const USAGE = "usage: spec_contract_check.ts --path <path> [--path <path> ...] [--repo-root <path>]";
 
 function requiredValue(args: string[], index: number): string {
   const value = args[index + 1];

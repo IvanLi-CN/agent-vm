@@ -1,16 +1,16 @@
 #!/usr/bin/env bun
 /** Discover and run maintained TS, Python, and Shell tests without a root edit per sibling. */
 
-import { join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 import { REPO_ROOT, relativePath, walkFiles } from "./repo_util.ts";
 
 export type TestScope = "repo" | "skills";
 export type TestKind = "bun" | "python" | "shell";
 export type TestFile = { path: string; kind: TestKind };
 
-const IGNORED_DIRECTORIES = new Set([".git"]);
-const IGNORED_ROOT_DIRECTORIES = new Set([
+const IGNORED_DIRECTORIES = new Set([
   "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "coverage", "reports", "artifacts", "tmp",
+  ".git",
 ]);
 
 export function testKind(path: string): TestKind | undefined {
@@ -22,10 +22,7 @@ export function testKind(path: string): TestKind | undefined {
 }
 
 export function discoverTests(root: string = REPO_ROOT, scope: TestScope = "repo"): TestFile[] {
-  const files = walkFiles(root, {
-    ignoredDirectories: IGNORED_DIRECTORIES,
-    ignoredDirectoriesAtRoot: IGNORED_ROOT_DIRECTORIES,
-  });
+  const files = walkFiles(root, { ignoredDirectories: IGNORED_DIRECTORIES });
   return files
     .filter((path) => path !== join(root, "bin", "test_runner.ts"))
     .filter((path) => (scope === "repo" ? !path.startsWith(join(root, "skills") + "/") && !path.startsWith(join(root, "skills") + "\\") : path.startsWith(join(root, "skills") + "/") || path.startsWith(join(root, "skills") + "\\")))
@@ -44,7 +41,7 @@ export function ensureTestSelection(files: TestFile[], scope: TestScope): void {
 
 export function commandForTest(test: TestFile): string[] {
   if (test.kind === "bun") return [process.execPath, "test", test.path];
-  if (test.kind === "python") return ["python3", test.path];
+  if (test.kind === "python") return ["python3", "-m", "unittest", "discover", "-s", dirname(test.path), "-p", basename(test.path)];
   return ["bash", test.path];
 }
 
