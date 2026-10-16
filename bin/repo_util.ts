@@ -10,6 +10,21 @@ export type GitResult = {
   stderr: string;
 };
 
+const GIT_REPOSITORY_ENVIRONMENT = new Set([
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR",
+  "GIT_DIR",
+  "GIT_INDEX_FILE",
+  "GIT_NAMESPACE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_OBJECT_DIRECTORY_RELATIVE",
+  "GIT_WORK_TREE",
+]);
+
+export function gitEnvironment(environment: Record<string, string | undefined>): Record<string, string> {
+  return Object.fromEntries(Object.entries(environment).filter(([key, value]) => value !== undefined && !GIT_REPOSITORY_ENVIRONMENT.has(key))) as Record<string, string>;
+}
+
 function decode(output: Uint8Array): string {
   return new TextDecoder().decode(output);
 }
@@ -17,6 +32,7 @@ function decode(output: Uint8Array): string {
 export function runGit(args: string[], cwd: string = REPO_ROOT): GitResult {
   const result = Bun.spawnSync(["git", ...args], {
     cwd,
+    env: gitEnvironment(Bun.env),
     stdout: "pipe",
     stderr: "pipe",
   });
