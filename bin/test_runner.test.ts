@@ -181,3 +181,20 @@ test("fails closed for unsupported async Python tests", async () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("fails closed for inherited async and async-generator Python tests", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-inherited-async-"));
+  try {
+    const inherited = join(root, "test_inherited_async.py");
+    writeFileSync(inherited, "import unittest\n\nclass Base(unittest.TestCase):\n    async def test_inherited(self):\n        raise AssertionError('must be awaited')\n\nclass Derived(Base):\n    pass\n");
+    const inheritedChild = Bun.spawn(commandForTest({ path: inherited, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await inheritedChild.exited).toBe(1);
+
+    const generator = join(root, "test_async_generator.py");
+    writeFileSync(generator, "async def test_generator():\n    yield 1\n    raise AssertionError('must not run')\n");
+    const generatorChild = Bun.spawn(commandForTest({ path: generator, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await generatorChild.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
