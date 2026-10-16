@@ -2,14 +2,14 @@
 /** Discover and run maintained TS, Python, and Shell tests without a root edit per sibling. */
 
 import { basename, dirname, join, relative } from "node:path";
-import { REPO_ROOT, relativePath, walkFiles } from "./repo_util.ts";
+import { isDirectRegularFile, isPathInside, REPO_ROOT, relativePath, walkFiles } from "./repo_util.ts";
 
 export type TestScope = "repo" | "skills";
 export type TestKind = "bun" | "python" | "shell";
 export type TestFile = { path: string; kind: TestKind };
 
 const IGNORED_DIRECTORIES = new Set([
-  "node_modules", ".venv", "venv", "__pycache__", "dist", "build", "coverage", "reports", "artifacts", "tmp",
+  "node_modules", ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist", "build", "coverage", "reports", "artifacts", "tmp",
   ".git",
 ]);
 
@@ -22,7 +22,10 @@ export function testKind(path: string): TestKind | undefined {
 }
 
 export function discoverTests(root: string = REPO_ROOT, scope: TestScope = "repo"): TestFile[] {
-  const files = walkFiles(root, { ignoredDirectories: IGNORED_DIRECTORIES });
+  const files = walkFiles(root, {
+    ignoredDirectories: IGNORED_DIRECTORIES,
+    shouldIgnoreDirectory: (_, name) => name.endsWith(".egg-info"),
+  });
   return files
     .filter((path) => path !== join(root, "bin", "test_runner.ts"))
     .filter((path) => (scope === "repo" ? !path.startsWith(join(root, "skills") + "/") && !path.startsWith(join(root, "skills") + "\\") : path.startsWith(join(root, "skills") + "/") || path.startsWith(join(root, "skills") + "\\")))
@@ -46,6 +49,10 @@ export function commandForTest(test: TestFile): string[] {
 }
 
 async function runTest(test: TestFile): Promise<number> {
+  if (!isPathInside(REPO_ROOT, test.path) || !isDirectRegularFile(test.path)) {
+    console.error(`ERROR refusing to run a test outside the regular repository file boundary: ${test.path}`);
+    return 1;
+  }
   console.log(`::group::${relativePath(test.path)}`);
   const child = Bun.spawn(commandForTest(test), {
     cwd: REPO_ROOT,

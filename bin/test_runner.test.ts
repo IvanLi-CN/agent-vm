@@ -9,6 +9,8 @@ test("discovers maintained TS, Python, and Shell tests automatically", () => {
     mkdirSync(join(root, "bin"), { recursive: true });
     mkdirSync(join(root, "skills", "alpha"), { recursive: true });
     mkdirSync(join(root, "build"), { recursive: true });
+    mkdirSync(join(root, "alpha.egg-info"), { recursive: true });
+    mkdirSync(join(root, "skills", "alpha", ".pytest_cache"), { recursive: true });
     writeFileSync(join(root, "bin", "example.test.ts"), "");
     writeFileSync(join(root, "bin", "test_runner.ts"), "");
     writeFileSync(join(root, "skills", "alpha", "test_python.py"), "");
@@ -17,6 +19,8 @@ test("discovers maintained TS, Python, and Shell tests automatically", () => {
     mkdirSync(join(root, "skills", "alpha", "tmp"), { recursive: true });
     writeFileSync(join(root, "skills", "alpha", "tmp", "test_nested.py"), "");
     writeFileSync(join(root, "build", "test_generated.py"), "");
+    writeFileSync(join(root, "alpha.egg-info", "test_generated.py"), "");
+    writeFileSync(join(root, "skills", "alpha", ".pytest_cache", "test_generated.py"), "");
     expect(testKind("example.test.ts")).toBe("bun");
     expect(testKind("test_python.py")).toBe("python");
     expect(testKind("test-shell.sh")).toBe("shell");

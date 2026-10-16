@@ -3,7 +3,7 @@
 
 import { existsSync, lstatSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
-import { isPathInside, REPO_ROOT, readText } from "./repo_util.ts";
+import { isDirectRegularFile, isPathInside, REPO_ROOT, readText } from "./repo_util.ts";
 
 const TOP_LEVEL_RE = /^##\s+(.+?)\s*$/;
 const REQ_RE = /\bREQ-[A-Z0-9][A-Z0-9_-]*\b/g;
@@ -123,9 +123,9 @@ export function check(path: string, root: string = REPO_ROOT): string[] {
           errors.push(emit(relativePath, "SPEC_RELATED_ADRS_INVALID", `invalid Related ADRs entry: ${line}`));
           continue;
         }
-        const target = join(root, "docs", match[1]);
+        const target = join(rootAbsolute, "docs", match[1]);
         paths.push(`docs/${match[1]}`);
-        if (!existsSync(target)) {
+        if (!isPathInside(rootAbsolute, target) || !isDirectRegularFile(target)) {
           errors.push(emit(relativePath, "SPEC_RELATED_ADRS_INVALID", `missing ADR target: docs/${match[1]}`));
         }
       }

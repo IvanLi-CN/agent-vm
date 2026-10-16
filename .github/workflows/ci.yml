@@ -26,6 +26,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.3'
+      - name: Verify Ruby YAML support
+        run: ruby -e 'require "yaml"'
       - name: Install Skill test dependencies
         run: python3 -m pip install --disable-pip-version-check -r requirements-dev.txt
       - name: Typecheck

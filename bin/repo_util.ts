@@ -40,6 +40,7 @@ export function trackedFiles(repoRoot: string = REPO_ROOT): string[] {
 
 export type WalkOptions = {
   ignoredDirectories?: Set<string>;
+  shouldIgnoreDirectory?: (path: string, name: string) => boolean;
   onRejectedSymlink?: (path: string) => void;
 };
 
@@ -53,12 +54,14 @@ export function walkFiles(root: string, options: WalkOptions = {}): string[] {
   const visitedDirectories = new Set<string>();
   const files: string[] = [];
   const isInsideRoot = (path: string): boolean => path === rootRealPath || path.startsWith(`${rootRealPath}${sep}`);
+  const shouldIgnore = (path: string, name: string): boolean => ignored.has(name) || options.shouldIgnoreDirectory?.(path, name) === true;
   const visit = (directory: string, realDirectory: string = realpathSync(directory)): void => {
     if (visitedDirectories.has(realDirectory)) return;
     visitedDirectories.add(realDirectory);
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
       if (entry.isSymbolicLink()) {
+        if (shouldIgnore(path, entry.name)) continue;
         try {
           const realPath = realpathSync(path);
           if (!isInsideRoot(realPath)) {
@@ -68,7 +71,7 @@ export function walkFiles(root: string, options: WalkOptions = {}): string[] {
           const stats = statSync(path);
           if (stats.isFile()) {
             files.push(path);
-          } else if (stats.isDirectory() && !ignored.has(entry.name)) {
+          } else if (stats.isDirectory() && !shouldIgnore(path, entry.name)) {
             visit(path, realPath);
           } else {
             options.onRejectedSymlink?.(path);
@@ -79,7 +82,7 @@ export function walkFiles(root: string, options: WalkOptions = {}): string[] {
         continue;
       }
       if (entry.isDirectory()) {
-        if (!ignored.has(entry.name)) {
+        if (!shouldIgnore(path, entry.name)) {
           visit(path, realpathSync(path));
         }
         continue;
