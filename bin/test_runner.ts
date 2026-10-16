@@ -57,11 +57,16 @@ export function ensureTestSources(files: TestFile[]): void {
     if (source.trim().length === 0) return true;
     if (test.kind === "bun") return !/\b(?:test|it|describe)\s*\(/.test(source);
     if (test.kind === "python") return !/\b(?:unittest\.|TestCase\b|def\s+test_)/.test(source);
-    const executableSource = source
-      .split("\n")
-      .filter((line) => !/^\s*#/.test(line))
-      .join("\n");
-    return !/\b(?:test|grep|diff|cmp|assert)\b|\[\[?\s/.test(executableSource) || !/\bTESTS_RUN\s*=/.test(executableSource);
+    const hasAssertionCommand = source.split("\n").some((line) => {
+      const executableLine = line
+        .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+        .replace(/"(?:[^"\\]|\\.)*"/g, "\"\"")
+        .replace(/\s+#.*$/, "");
+      const commandBoundary = /(?:^|[;&|]\s*|\bthen\s+)(?:if\s+)?!?\s*/;
+      return new RegExp(`${commandBoundary.source}(?:test|grep|diff|cmp|assert)\\b`).test(executableLine) ||
+        new RegExp(`${commandBoundary.source}\\[\\[?\\s`).test(executableLine);
+    });
+    return !hasAssertionCommand || !/\bTESTS_RUN\s*=/.test(source);
   });
   if (invalid.length > 0) {
     throw new Error(`refusing to run test files without maintained test declarations: ${invalid.map((test) => test.path).join(", ")}`);

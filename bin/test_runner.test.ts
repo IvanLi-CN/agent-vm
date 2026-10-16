@@ -65,7 +65,7 @@ test("requires shell tests to contain an assertion and a positive count marker",
   try {
     const noOp = join(root, "test_noop.sh");
     const valid = join(root, "test_valid.sh");
-    writeFileSync(noOp, "#!/usr/bin/env bash\ntrue\nprintf 'TESTS_RUN=%s\\n' 1\n");
+    writeFileSync(noOp, "#!/usr/bin/env bash\necho 'test TESTS_RUN=1'\nprintf 'TESTS_RUN=%s\\n' 1\n");
     writeFileSync(valid, "#!/usr/bin/env bash\ntest -e /tmp\nprintf 'TESTS_RUN=%s\\n' 1\n");
     expect(() => ensureTestSources([{ path: noOp, kind: "shell" }])).toThrow("without maintained test declarations");
     expect(() => ensureTestSources([{ path: valid, kind: "shell" }])).not.toThrow();
