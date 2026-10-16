@@ -27,6 +27,7 @@ const PYTHON_TEST_RUNNER = [
   "sys.modules[spec.name] = module",
   "spec.loader.exec_module(module)",
   "suite = unittest.defaultTestLoader.loadTestsFromModule(module)",
+  "suite.addTests(unittest.FunctionTestCase(value) for name, value in vars(module).items() if name.startswith('test_') and callable(value))",
   "result = unittest.TextTestRunner(verbosity=1).run(suite)",
   "raise SystemExit(0 if result.wasSuccessful() else 1)",
 ].join("\n");
