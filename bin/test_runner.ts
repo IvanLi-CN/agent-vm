@@ -22,10 +22,19 @@ export function testKind(path: string): TestKind | undefined {
 }
 
 export function discoverTests(root: string = REPO_ROOT, scope: TestScope = "repo"): TestFile[] {
+  const skillsRoot = join(root, "skills");
+  const rejectedSymlinks: string[] = [];
   const files = walkFiles(root, {
     ignoredDirectories: IGNORED_DIRECTORIES,
-    shouldIgnoreDirectory: (_, name) => name.endsWith(".egg-info"),
+    shouldIgnoreDirectory: (path, name) => {
+      const isDirectSkill = path !== skillsRoot && dirname(path) === skillsRoot;
+      return !isDirectSkill && (IGNORED_DIRECTORIES.has(name) || name.endsWith(".egg-info"));
+    },
+    onRejectedSymlink: (path) => rejectedSymlinks.push(path),
   });
+  if (rejectedSymlinks.length > 0) {
+    throw new Error(`refusing to discover tests through rejected symlink paths: ${rejectedSymlinks.sort().join(", ")}`);
+  }
   return files
     .filter((path) => path !== join(root, "bin", "test_runner.ts"))
     .filter((path) => (scope === "repo" ? !path.startsWith(join(root, "skills") + "/") && !path.startsWith(join(root, "skills") + "\\") : path.startsWith(join(root, "skills") + "/") || path.startsWith(join(root, "skills") + "\\")))
@@ -57,7 +66,11 @@ export function ensureTestSources(files: TestFile[]): void {
 
 export function executedTestCount(kind: TestKind, output: string): number | undefined {
   if (kind === "shell") return undefined;
-  const match = /Ran\s+(\d+)\s+tests?\b/i.exec(output);
+  const summary = kind === "bun"
+    ? /^\s*Ran\s+(\d+)\s+tests?\s+across\b/gim
+    : /^\s*Ran\s+(\d+)\s+tests?\s+in\b/gim;
+  const matches = [...output.matchAll(summary)];
+  const match = matches.at(-1);
   return match ? Number(match[1]) : undefined;
 }
 

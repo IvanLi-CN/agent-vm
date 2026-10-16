@@ -54,7 +54,9 @@ export function walkFiles(root: string, options: WalkOptions = {}): string[] {
   const visitedDirectories = new Set<string>();
   const files: string[] = [];
   const isInsideRoot = (path: string): boolean => path === rootRealPath || path.startsWith(`${rootRealPath}${sep}`);
-  const shouldIgnore = (path: string, name: string): boolean => ignored.has(name) || options.shouldIgnoreDirectory?.(path, name) === true;
+  const shouldIgnore = (path: string, name: string): boolean => options.shouldIgnoreDirectory
+    ? options.shouldIgnoreDirectory(path, name)
+    : ignored.has(name);
   const visit = (directory: string, realDirectory: string = realpathSync(directory)): void => {
     if (visitedDirectories.has(realDirectory)) return;
     visitedDirectories.add(realDirectory);

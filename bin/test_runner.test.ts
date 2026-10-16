@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { commandForTest, discoverTests, ensureTestSelection, ensureTestSources, executedTestCount, testKind } from "./test_runner.ts";
 
@@ -8,6 +8,7 @@ test("discovers maintained TS, Python, and Shell tests automatically", () => {
   try {
     mkdirSync(join(root, "bin"), { recursive: true });
     mkdirSync(join(root, "skills", "alpha"), { recursive: true });
+    mkdirSync(join(root, "skills", "build"), { recursive: true });
     mkdirSync(join(root, "build"), { recursive: true });
     mkdirSync(join(root, "alpha.egg-info"), { recursive: true });
     mkdirSync(join(root, "skills", "alpha", ".pytest_cache"), { recursive: true });
@@ -16,6 +17,7 @@ test("discovers maintained TS, Python, and Shell tests automatically", () => {
     writeFileSync(join(root, "skills", "alpha", "test_python.py"), "");
     writeFileSync(join(root, "skills", "alpha", "test-shell.sh"), "");
     writeFileSync(join(root, "skills", "alpha", "test_runner.ts"), "");
+    writeFileSync(join(root, "skills", "build", "test_direct.py"), "");
     mkdirSync(join(root, "skills", "alpha", "tmp"), { recursive: true });
     writeFileSync(join(root, "skills", "alpha", "tmp", "test_nested.py"), "");
     writeFileSync(join(root, "build", "test_generated.py"), "");
@@ -26,7 +28,7 @@ test("discovers maintained TS, Python, and Shell tests automatically", () => {
     expect(testKind("test-shell.sh")).toBe("shell");
     expect(testKind("test_runner.ts")).toBe("bun");
     expect(discoverTests(root, "repo").map((testFile) => testFile.kind)).toEqual(["bun"]);
-    expect(discoverTests(root, "skills").map((testFile) => testFile.kind).sort()).toEqual(["bun", "python", "shell"]);
+    expect(discoverTests(root, "skills").map((testFile) => testFile.kind).sort()).toEqual(["bun", "python", "python", "shell"]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -59,7 +61,22 @@ test("fails closed for empty and non-test source files", () => {
 });
 
 test("requires a nonzero runtime test count for Bun and Python suites", () => {
-  expect(executedTestCount("bun", "Ran 0 tests across 1 files.")).toBe(0);
+  expect(executedTestCount("bun", "Ran 0 tests across 1 files.\nRan 2 tests across 1 files.")).toBe(2);
+  expect(executedTestCount("bun", "Ran 0 tests in a comment")).toBeUndefined();
   expect(executedTestCount("python", "Ran 21 tests in 0.1s")).toBe(21);
   expect(executedTestCount("shell", "shell completed")).toBeUndefined();
+});
+
+test("executes a Python unittest suite without a main guard", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-no-main-"));
+  try {
+    const marker = join(root, "executed.txt");
+    const path = join(root, "test_no_main.py");
+    writeFileSync(path, `import unittest\nfrom pathlib import Path\n\nclass NoMainTests(unittest.TestCase):\n    def test_runs(self):\n        Path(${JSON.stringify(marker)}).write_text("ok")\n`);
+    const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await child.exited).toBe(0);
+    expect(existsSync(marker)).toBe(true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
