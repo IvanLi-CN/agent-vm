@@ -68,12 +68,15 @@ test("requires shell tests to contain a test command", () => {
     const noOp = join(root, "test_noop.sh");
     const valid = join(root, "test_valid.sh");
     const grouped = join(root, "test_grouped.sh");
+    const builtin = join(root, "test_builtin.sh");
     writeFileSync(noOp, "#!/usr/bin/env bash\necho 'test TESTS_RUN=1'\n");
     writeFileSync(valid, "#!/usr/bin/env bash\ntest -e /tmp\n");
     writeFileSync(grouped, "#!/usr/bin/env bash\n( test -e /tmp )\n");
+    writeFileSync(builtin, "#!/usr/bin/env bash\nbuiltin test -e /tmp\n");
     expect(() => ensureTestSources([{ path: noOp, kind: "shell" }])).toThrow("without maintained test declarations");
     expect(() => ensureTestSources([{ path: valid, kind: "shell" }])).not.toThrow();
     expect(() => ensureTestSources([{ path: grouped, kind: "shell" }])).not.toThrow();
+    expect(() => ensureTestSources([{ path: builtin, kind: "shell" }])).not.toThrow();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -127,6 +130,21 @@ test("reports shell counts before an explicit successful exit", async () => {
     const stderr = await new Response(child.stderr).text();
     expect(await child.exited).toBe(0);
     expect(executedTestCount("shell", `${stdout}\n${stderr}`)).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("counts explicit builtin and command shell tests", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-builtin-test-"));
+  try {
+    const path = join(root, "test_builtin.sh");
+    writeFileSync(path, "builtin test -e /tmp\ncommand test -e /tmp\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(0);
+    expect(executedTestCount("shell", `${stdout}\n${stderr}`)).toBe(2);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -237,6 +255,28 @@ test("fails closed for TestCase methods that return awaitables", async () => {
     writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def test_not_run(self):\n        async def hidden():\n            raise AssertionError('must be awaited')\n        return hidden()\n");
     const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
     expect(await child.exited).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for TestCase lifecycle hooks that return awaitables", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-testcase-hooks-"));
+  try {
+    const setupPath = join(root, "test_setup_hook.py");
+    writeFileSync(setupPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    def setUp(self):\n        async def hidden():\n            return None\n        return hidden()\n    def test_not_run(self):\n        pass\n");
+    const setupChild = Bun.spawn(commandForTest({ path: setupPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await setupChild.exited).toBe(1);
+
+    const teardownPath = join(root, "test_teardown_hook.py");
+    writeFileSync(teardownPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    def tearDown(self):\n        def hidden():\n            yield None\n        return hidden()\n    def test_runs(self):\n        pass\n");
+    const teardownChild = Bun.spawn(commandForTest({ path: teardownPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await teardownChild.exited).toBe(1);
+
+    const classPath = join(root, "test_class_hook.py");
+    writeFileSync(classPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n        async def hidden():\n            return None\n        return hidden()\n    def test_not_run(self):\n        pass\n");
+    const classChild = Bun.spawn(commandForTest({ path: classPath, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    expect(await classChild.exited).toBe(1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
