@@ -9,31 +9,30 @@ permissions:
 
 jobs:
   checks:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Record Bun version
+        run: bun --version
+      - name: Install locked Bun dependencies
+        run: bun install --frozen-lockfile
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
       - name: Install Skill test dependencies
         run: python3 -m pip install --disable-pip-version-check -r requirements-dev.txt
-      - name: Check Skill index
-        run: python3 bin/skills_index_check.py
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Run repository checks
+        run: bun run check
       - name: Run repository tests
-        run: python3 -m unittest discover -s bin -p 'test_*.py'
+        run: bun run test:repo
       - name: Run Skill tests
-        shell: bash
-        run: |
-          set -euo pipefail
-          while IFS= read -r test_file; do
-            echo "::group::$test_file"
-            case "$test_file" in
-              *.py) python3 "$test_file" ;;
-              *.sh) bash "$test_file" ;;
-            esac
-            echo "::endgroup::"
-          done < <(find skills -type f \( -name 'test_*.py' -o -name 'test-*.sh' \) | sort)
-      - name: Check public boundary
-        run: python3 bin/public_boundary_check.py
-      - name: Check public Skill coupling boundary
-        run: python3 bin/public_skill_boundary_check.py
+        run: bun run test:skills
