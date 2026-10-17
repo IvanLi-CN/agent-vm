@@ -1092,11 +1092,17 @@ function processTable(): ProcessRecord[] {
   for (const line of new TextDecoder().decode(result.stdout).split("\n")) {
     const values = line.trim().split(/\s+/);
     const numbers = values.slice(0, 3).map(Number);
-    if (numbers.length < 3 || numbers.some((value) => !Number.isInteger(value) || value <= 0)) continue;
+    const [pid, parentPid, processGroupId] = numbers;
+    if (
+      numbers.length < 3 ||
+      !Number.isInteger(pid) || pid <= 0 ||
+      !Number.isInteger(parentPid) || parentPid < 0 ||
+      !Number.isInteger(processGroupId) || processGroupId <= 0
+    ) continue;
     records.push({
-      pid: numbers[0]!,
-      parentPid: numbers[1]!,
-      processGroupId: numbers[2]!,
+      pid: pid!,
+      parentPid: parentPid!,
+      processGroupId: processGroupId!,
       state: values[3] ?? "",
     });
   }

@@ -151,13 +151,18 @@ test("requires native process ownership on POSIX and exposes the failure path", 
   expect(processOwnershipError(null)).toMatch(/Bun FFI getsid/);
 });
 
-test("rejects missing, failed, and incomplete ps process tables", () => {
+test("validates ps process tables and accepts a PPID=0 init row", () => {
   if (process.platform === "win32") return;
   const originalSpawnSync = Bun.spawnSync;
   const cases = [
-    { name: "missing", result: () => { throw new Error("ps not found"); } },
-    { name: "failed", result: () => ({ exitCode: 127, stdout: new Uint8Array(), stderr: new Uint8Array() }) },
-    { name: "incomplete", result: () => ({ exitCode: 0, stdout: new TextEncoder().encode(`${process.pid + 1} 1 1 S\n`), stderr: new Uint8Array() }) },
+    { name: "missing", result: () => { throw new Error("ps not found"); }, expected: "POSIX process ownership requires a readable ps process table" },
+    { name: "failed", result: () => ({ exitCode: 127, stdout: new Uint8Array(), stderr: new Uint8Array() }), expected: "POSIX process ownership requires a readable ps process table" },
+    { name: "incomplete", result: () => ({ exitCode: 0, stdout: new TextEncoder().encode(`${process.pid + 1} 1 1 S\n`), stderr: new Uint8Array() }), expected: "POSIX process ownership requires a readable ps process table" },
+    { name: "negative PPID", result: () => ({ exitCode: 0, stdout: new TextEncoder().encode(`${process.pid} -1 ${process.pid} S\n`), stderr: new Uint8Array() }), expected: "POSIX process ownership requires a readable ps process table" },
+    { name: "noninteger PPID", result: () => ({ exitCode: 0, stdout: new TextEncoder().encode(`${process.pid} nope ${process.pid} S\n`), stderr: new Uint8Array() }), expected: "POSIX process ownership requires a readable ps process table" },
+    { name: "noninteger PID", result: () => ({ exitCode: 0, stdout: new TextEncoder().encode(`nope 0 ${process.pid} S\n`), stderr: new Uint8Array() }), expected: "POSIX process ownership requires a readable ps process table" },
+    { name: "noninteger PGID", result: () => ({ exitCode: 0, stdout: new TextEncoder().encode(`${process.pid} 0 nope S\n`), stderr: new Uint8Array() }), expected: "POSIX process ownership requires a readable ps process table" },
+    { name: "valid init row", result: () => ({ exitCode: 0, stdout: new TextEncoder().encode(`${process.pid} 0 ${process.pid} S\n`), stderr: new Uint8Array() }), expected: undefined },
   ];
   try {
     for (const current of cases) {
@@ -166,7 +171,7 @@ test("rejects missing, failed, and incomplete ps process tables", () => {
         if (Array.isArray(command) && command[0] === "ps") return current.result() as ReturnType<typeof Bun.spawnSync>;
         return originalSpawnSync(...args);
       }) as typeof Bun.spawnSync;
-      expect(processOwnershipError({ getsid: () => process.pid, getpgid: () => process.pid }), current.name).toBe("POSIX process ownership requires a readable ps process table");
+      expect(processOwnershipError({ getsid: () => process.pid, getpgid: () => process.pid }), current.name).toBe(current.expected);
     }
   } finally {
     Bun.spawnSync = originalSpawnSync;
