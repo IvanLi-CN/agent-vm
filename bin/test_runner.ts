@@ -619,6 +619,13 @@ __agent_toolkit_stderr_replay_pid=""
 __agent_toolkit_source_pid=""
 __agent_toolkit_cleanup_done=0
 __agent_toolkit_replay_done=0
+__agent_toolkit_debug() {
+  local debug_file
+  debug_file="$(printenv AGENT_TOOLKIT_DEBUG_FILE 2>/dev/null || true)"
+  if [[ -n "$debug_file" ]]; then
+    printf '%s pid=%s pgid=%s\n' "$1" "$$" "$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')" >> "$debug_file"
+  fi
+}
 __agent_toolkit_signal_group() {
   local signal="$1" pid="$2" own_group
   [[ -n "$pid" ]] || return 0
@@ -660,17 +667,21 @@ __agent_toolkit_relay_drained() {
 }
 __agent_toolkit_wait_for_relays() {
   local attempt=0
+  __agent_toolkit_debug relay-wait-start
   while ! __agent_toolkit_relay_drained && (( attempt < 100 )); do
     sleep 0.01
     ((attempt += 1))
   done
   if ! __agent_toolkit_relay_drained; then
+    __agent_toolkit_debug relay-wait-timeout
     __agent_toolkit_stop_group "$__agent_toolkit_source_pid"
     __agent_toolkit_stop_group "$__agent_toolkit_stdout_replay_pid"
     __agent_toolkit_stop_group "$__agent_toolkit_stderr_replay_pid"
+    __agent_toolkit_debug relay-stop-done
   fi
   wait "$__agent_toolkit_stdout_replay_pid" 2>/dev/null || true
   wait "$__agent_toolkit_stderr_replay_pid" 2>/dev/null || true
+  __agent_toolkit_debug relay-wait-done
 }
 __agent_toolkit_remove_path() {
   [[ -n "$1" ]] && rm -f -- "$1"
@@ -679,6 +690,7 @@ __agent_toolkit_cleanup() {
   local status="$?"
   set +e
   set +m
+  __agent_toolkit_debug cleanup-start
   if (( __agent_toolkit_cleanup_done == 0 )); then
     __agent_toolkit_cleanup_done=1
     __agent_toolkit_stop_group "$__agent_toolkit_source_pid"
@@ -690,6 +702,7 @@ __agent_toolkit_cleanup() {
     __agent_toolkit_remove_path "$__agent_toolkit_stderr_file"
     __agent_toolkit_remove_path "$marker_file"
   fi
+  __agent_toolkit_debug cleanup-done
   exit "$status"
 }
 __agent_toolkit_forward_signal() {
@@ -978,19 +991,22 @@ __agent_toolkit_has_unusable_output_redirection() {
   return 1
 }
 `.replaceAll("\\${", "${"),
-    "readonly -f test trap __agent_toolkit_signal_group __agent_toolkit_stop_group __agent_toolkit_process_active __agent_toolkit_relay_drained __agent_toolkit_wait_for_relays __agent_toolkit_remove_path __agent_toolkit_cleanup __agent_toolkit_forward_signal __agent_toolkit_record_builtin_test __agent_toolkit_fd_is_open __agent_toolkit_fd_is_readable __agent_toolkit_read_redirection_target __agent_toolkit_resolve_redirection_value __agent_toolkit_fd_path_number __agent_toolkit_has_unquoted_input_redirection __agent_toolkit_has_unusable_output_redirection __agent_toolkit_debug_counter __agent_toolkit_disable_nested_job_control __agent_toolkit_install_debug_trap",
+    "readonly -f test trap __agent_toolkit_debug __agent_toolkit_signal_group __agent_toolkit_stop_group __agent_toolkit_process_active __agent_toolkit_relay_drained __agent_toolkit_wait_for_relays __agent_toolkit_remove_path __agent_toolkit_cleanup __agent_toolkit_forward_signal __agent_toolkit_record_builtin_test __agent_toolkit_fd_is_open __agent_toolkit_fd_is_readable __agent_toolkit_read_redirection_target __agent_toolkit_resolve_redirection_value __agent_toolkit_fd_path_number __agent_toolkit_has_unquoted_input_redirection __agent_toolkit_has_unusable_output_redirection __agent_toolkit_debug_counter __agent_toolkit_disable_nested_job_control __agent_toolkit_install_debug_trap",
     "set +e",
     "(",
     "  set -euo pipefail",
     "  set -T",
     "  set +m",
     "  __agent_toolkit_install_debug_trap \"\"",
+    "  __agent_toolkit_debug source-start",
     "  source \"$0\"",
+    "  __agent_toolkit_debug source-done",
     ") >\"$__agent_toolkit_stdout_file\" 2>\"$__agent_toolkit_stderr_file\" &",
     "__agent_toolkit_source_pid=$!",
     "set +m",
     "wait \"$__agent_toolkit_source_pid\"",
     "exit_status=$?",
+    "__agent_toolkit_debug source-wait-done",
     "__agent_toolkit_stop_group \"$__agent_toolkit_source_pid\"",
     "__agent_toolkit_wait_for_relays",
     "__agent_toolkit_replay_done=1",
@@ -998,6 +1014,7 @@ __agent_toolkit_has_unusable_output_redirection() {
     "count=$(wc -l < \"$marker_file\")",
     "if ((exit_status == 0 && count == 0)); then exit_status=1; fi",
     "if ((exit_status == 0)); then builtin printf \"TESTS_RUN=%s\\n\" \"$count\"; fi",
+    "__agent_toolkit_debug wrapper-exit",
     "exit \"$exit_status\"",
   ].join("\n");
   return [
@@ -1281,6 +1298,7 @@ export async function runTest(test: TestFile): Promise<number> {
   try {
     const spawnedChild = Bun.spawn(commandForTest(test), {
       cwd: REPO_ROOT,
+      env: { ...process.env },
       stdout: "pipe",
       stderr: "pipe",
       detached: true,
