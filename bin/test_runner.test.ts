@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { REPO_ROOT } from "./repo_util.ts";
-import { commandForTest, discoverTests, ensureTestSelection, ensureTestSources, executedTestCount, runTest, testKind } from "./test_runner.ts";
+import { commandForTest, discoverTests, ensureTestSelection, ensureTestSources, executedTestCount, processOwnershipError, runTest, testKind } from "./test_runner.ts";
 
 function isProcessAlive(pid: number): boolean {
   try {
@@ -22,6 +22,17 @@ function isProcessAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+function processGroupId(pid: number): number | undefined {
+  if (process.platform === "win32") return undefined;
+  const result = Bun.spawnSync(["ps", "-o", "pgid=", "-p", String(pid)], { stdout: "pipe", stderr: "pipe" });
+  const value = Number(new TextDecoder().decode(result.stdout).trim());
+  return result.exitCode === 0 && Number.isInteger(value) && value > 0 ? value : undefined;
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\\''")}'`;
 }
 
 function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
@@ -134,6 +145,12 @@ test("fails closed when deliberate test selection omits every file", () => {
   expect(() => ensureTestSelection([], "repo")).toThrow("refusing to pass an empty test selection");
 });
 
+test("requires native process ownership on POSIX and exposes the failure path", () => {
+  if (process.platform === "win32") return;
+  expect(processOwnershipError()).toBeUndefined();
+  expect(processOwnershipError(null)).toMatch(/Bun FFI getsid/);
+});
+
 test("runs Python files by path so files without a main guard or with hyphens are executed", () => {
   expect(commandForTest({ path: "/repo/skills/example/tests/test_reclamation.py", kind: "python" })).toEqual([
     "python3", "-c", expect.any(String), "/repo/skills/example/tests/test_reclamation.py",
@@ -178,12 +195,70 @@ test("requires shell tests to contain a test command", () => {
   }
 });
 
+test("follows shell helper sources through the preflight and run path", async () => {
+  const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-toolkit-runner-shell-source-"));
+  const outsideRoot = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-runner-shell-source-outside-"));
+  try {
+    const helper = join(root, "helper.sh");
+    const path = join(root, "test_source_helper.sh");
+    writeFileSync(helper, "builtin test -n ok\n");
+    writeFileSync(path, 'source "$(dirname "$0")/helper.sh"\n');
+    const testFile = { path, kind: "shell" as const };
+    expect(() => ensureTestSources([testFile])).not.toThrow();
+    expect(await runTestWithin(testFile)).toBe(0);
+
+    const outsideHelper = join(outsideRoot, "helper.sh");
+    const escaped = join(root, "test_source_outside.sh");
+    writeFileSync(outsideHelper, "builtin test -n outside\n");
+    writeFileSync(escaped, `source ${shellQuote(outsideHelper)}\n`);
+    expect(() => ensureTestSources([{ path: escaped, kind: "shell" }])).toThrow("without maintained test declarations");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(outsideRoot, { recursive: true, force: true });
+  }
+});
+
 test("accepts Bun parameterized test declarations", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-bun-each-"));
   try {
     const path = join(root, "test_each.test.ts");
     writeFileSync(path, "test.each([1, 2])('value', (value) => expect(value).toBeTruthy())\ntest.concurrent('concurrent', () => {})\ntest.skipIf(false).each([1])('skipped condition', () => {})\n");
     expect(() => ensureTestSources([{ path, kind: "bun" }])).not.toThrow();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("rejects focused Bun selections without rejecting inert syntax", async () => {
+  const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-toolkit-runner-focused-bun-"));
+  try {
+    const focused = join(root, "test_focused.test.ts");
+    writeFileSync(focused, [
+      'import { test as aliasedTest, describe as aliasedDescribe } from "bun:test";',
+      'import * as bunTest from "bun:test";',
+      'const template = `${aliasedTest.only("template", () => {})}`;',
+      'const regex = /test.only("inert")/;',
+      'aliasedDescribe.only("aliased suite", () => {});',
+      'bunTest.describe.only("namespace suite", () => {});',
+      'aliasedTest("omitted failure", () => { throw new Error("must be selected"); });',
+    ].join("\n"));
+    expect(await runTestWithin({ path: focused, kind: "bun" })).toBe(0);
+    expect(() => ensureTestSources([{ path: focused, kind: "bun" }])).toThrow("focused Bun test selection");
+
+    const mixed = join(root, "test_mixed_skip.test.ts");
+    writeFileSync(mixed, 'import { test } from "bun:test";\ntest("passes", () => {});\ntest.skip("skipped", () => {});\n');
+    expect(() => ensureTestSources([{ path: mixed, kind: "bun" }])).not.toThrow();
+    expect(await runTestWithin({ path: mixed, kind: "bun" })).toBe(0);
+
+    const inert = join(root, "test_inert_focus_text.test.ts");
+    writeFileSync(inert, [
+      'import { test } from "bun:test";',
+      'const text = "test.only(\\"inert\\")";',
+      '// test.only("also inert");',
+      'const regex = /describe.only("also inert")/;',
+      'test("runs", () => { expect(text).toContain("inert"); });',
+    ].join("\n"));
+    expect(() => ensureTestSources([{ path: inert, kind: "bun" }])).not.toThrow();
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -364,39 +439,49 @@ test("does not wait for background descendants holding shell output FIFOs", asyn
   }
 });
 
-test("cleans shell descendants after the source enables job control", async () => {
-  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-split-pgid-"));
-  let child: Bun.Subprocess | undefined;
+test("cleans nested shell split-PGID descendants with inherited and redirected output", async () => {
+  const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-toolkit-runner-shell-split-pgid-"));
   let descendantPid: number | undefined;
   try {
-    const path = join(root, "test_split_pgid.sh");
+    const path = join(root, "test_nested_split_pgid.sh");
     const pidFile = join(root, "split-pgid.pid");
-    const quotedPidFile = JSON.stringify(pidFile);
-    writeFileSync(path, [
-      "set -m 2>/dev/null || true",
-      "sh -c 'while :; do sleep 1; done' &",
-      `printf "%s\\n" "$!" > ${quotedPidFile}`,
-      "builtin test 1 -eq 1",
-    ].join("\n"));
-    const spawnedChild = Bun.spawn(commandForTest({ path, kind: "shell" }), {
-      cwd: root,
-      stdout: "pipe",
-      stderr: "pipe",
-      detached: true,
-    });
-    child = spawnedChild;
-    const stdout = new Response(spawnedChild.stdout).text();
-    const stderr = new Response(spawnedChild.stderr).text();
-    expect(await exitWithin(spawnedChild)).toBe(0);
-    expect(await stdout).toMatch(/TESTS_RUN=\s*1\s*$/);
-    expect(await stderr).toBe("");
-    expect(await waitForPath(pidFile)).toBe(true);
-    descendantPid = Number(readFileSync(pidFile, "utf8").trim());
-    expect(Number.isInteger(descendantPid)).toBe(true);
-    expect(await waitForProcessExit(descendantPid)).toBe(true);
+    const groupFile = join(root, "split-pgid.group");
+    const readyFile = join(root, "split-pgid.ready");
+    const releaseFile = join(root, "split-pgid.release");
+    for (const redirected of [false, true]) {
+      const nestedScript = [
+        "set -m",
+        `sh -c 'printf "%s\\n" split-output; while :; do sleep 1; done'${redirected ? " >/dev/null 2>&1" : ""} &`,
+        "child=$!",
+        `printf "%s\\n" "$child" > ${shellQuote(pidFile)}`,
+        `printf "%s\\n" "$(ps -o pgid= -p "$child" | tr -d " ")" > ${shellQuote(groupFile)}`,
+      ].join("\n");
+      writeFileSync(path, [
+        `bash -c ${shellQuote(nestedScript)} &`,
+        "wait",
+        `printf "ready\\n" > ${shellQuote(readyFile)}`,
+        `while [[ ! -f ${shellQuote(releaseFile)} ]]; do sleep 0.01; done`,
+        "builtin test 1 -eq 1",
+      ].join("\n"));
+      const result = runTestWithin({ path, kind: "shell" }, 5000);
+      expect(await waitForPath(readyFile)).toBe(true);
+      descendantPid = Number(readFileSync(pidFile, "utf8").trim());
+      const descendantGroup = Number(readFileSync(groupFile, "utf8").trim());
+      expect(Number.isInteger(descendantPid)).toBe(true);
+      expect(descendantGroup).toBe(descendantPid);
+      expect(processGroupId(descendantPid)).toBe(descendantPid);
+      expect(isProcessAlive(descendantPid)).toBe(true);
+      writeFileSync(releaseFile, "release\n");
+      expect(await result).toBe(0);
+      expect(await waitForProcessExit(descendantPid)).toBe(true);
+      descendantPid = undefined;
+      rmSync(pidFile, { force: true });
+      rmSync(groupFile, { force: true });
+      rmSync(readyFile, { force: true });
+      rmSync(releaseFile, { force: true });
+    }
   } finally {
     if (descendantPid !== undefined && isProcessAlive(descendantPid)) signalProcessGroup(descendantPid, "SIGKILL");
-    if (child !== undefined && isProcessAlive(child.pid)) signalProcessGroup(child.pid, "SIGKILL");
     rmSync(root, { recursive: true, force: true });
   }
 });
@@ -435,6 +520,75 @@ test("bounds Bun and Python output drains when leaders exit with inherited pipes
     const pythonPid = Number(readFileSync(pythonPidFile, "utf8").trim());
     descendants.push(pythonPid);
     expect(await waitForProcessExit(pythonPid)).toBe(true);
+  } finally {
+    for (const pid of descendants) {
+      if (isProcessAlive(pid)) signalProcessGroup(pid, "SIGKILL");
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("cleans Bun and Python descendants that create independent process groups", async () => {
+  const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-toolkit-runner-split-pgid-"));
+  const descendants: number[] = [];
+  try {
+    const cases = [
+      {
+        kind: "bun" as const,
+        path: join(root, "test_bun_split_pgid.test.ts"),
+        pidFile: join(root, "bun-split-pgid.pid"),
+        releaseFile: join(root, "bun-split-pgid.release"),
+        source: (pidFile: string, releaseFile: string) => {
+          const command = [
+            "set -m",
+            "sh -c 'while :; do sleep 1; done' &",
+            "child=$!",
+            `printf "%s\\n" "$child" > ${shellQuote(pidFile)}`,
+            `while [[ ! -f ${shellQuote(releaseFile)} ]]; do sleep 0.01; done`,
+          ].join("\n");
+          return [
+            'import { test } from "bun:test";',
+            'import { existsSync } from "node:fs";',
+            `Bun.spawn(["bash", "-c", ${JSON.stringify(command)}], { stdout: "ignore", stderr: "ignore" });`,
+            'test("runs", () => {});',
+            `while (!existsSync(${JSON.stringify(releaseFile)})) await Bun.sleep(10);`,
+          ].join("\n");
+        },
+      },
+      {
+        kind: "python" as const,
+        path: join(root, "test_python_split_pgid.py"),
+        pidFile: join(root, "python-split-pgid.pid"),
+        releaseFile: join(root, "python-split-pgid.release"),
+        source: (pidFile: string, releaseFile: string) => [
+          "import pathlib",
+          "import subprocess",
+          "import time",
+          "import unittest",
+          'child = subprocess.Popen(["sh", "-c", "while :; do sleep 1; done"], preexec_fn=os.setpgrp, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)',
+          `pathlib.Path(${JSON.stringify(pidFile)}).write_text(str(child.pid))`,
+          "class Tests(unittest.TestCase):",
+          "    def test_runs(self):",
+          "        pass",
+          `while not pathlib.Path(${JSON.stringify(releaseFile)}).exists(): time.sleep(0.01)`,
+        ].join("\n").replace("import pathlib\n", "import os\nimport pathlib\n"),
+      },
+    ];
+    for (const testCase of cases) {
+      writeFileSync(testCase.path, testCase.source(testCase.pidFile, testCase.releaseFile));
+      const testFile = { path: testCase.path, kind: testCase.kind };
+      ensureTestSources([testFile]);
+      const result = runTestWithin(testFile, 5000);
+      expect(await waitForPath(testCase.pidFile)).toBe(true);
+      const descendantPid = Number(readFileSync(testCase.pidFile, "utf8").trim());
+      descendants.push(descendantPid);
+      expect(Number.isInteger(descendantPid)).toBe(true);
+      expect(processGroupId(descendantPid)).toBe(descendantPid);
+      expect(isProcessAlive(descendantPid)).toBe(true);
+      writeFileSync(testCase.releaseFile, "release\n");
+      expect(await result).toBe(0);
+      expect(await waitForProcessExit(descendantPid)).toBe(true);
+    }
   } finally {
     for (const pid of descendants) {
       if (isProcessAlive(pid)) signalProcessGroup(pid, "SIGKILL");
@@ -518,7 +672,7 @@ test("forwards SIGINT and SIGTERM to shell test process groups", async () => {
   }
 });
 
-test("cleans shell relay processes and paths across setup failures", async () => {
+test("cleans shell relay processes and paths across setup failures", { timeout: 10_000 }, async () => {
   const failureCases = [
     { name: "first-mktemp", failMktempAt: 1, failMkfifo: false, expectedCatCount: 0 },
     { name: "second-mktemp", failMktempAt: 2, failMkfifo: false, expectedCatCount: 0 },
@@ -846,6 +1000,21 @@ test("executes a hyphenated Python unittest file", async () => {
     const stderr = await new Response(child.stderr).text();
     expect(await child.exited).toBe(0);
     expect(executedTestCount("python", `${stdout}\n${stderr}`)).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("preflights and runs Python load_tests suites imported from a sibling module", async () => {
+  const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-toolkit-runner-python-load-tests-"));
+  try {
+    const imported = join(root, "imported_cases.py");
+    const path = join(root, "test_imported_load_tests.py");
+    writeFileSync(imported, "import unittest\n\nclass ImportedCase(unittest.TestCase):\n    def test_imported(self):\n        pass\n");
+    writeFileSync(path, "from imported_cases import ImportedCase\n\ndef load_tests(loader, tests, pattern):\n    return loader.loadTestsFromTestCase(ImportedCase)\n");
+    const testFile = { path, kind: "python" as const };
+    expect(() => ensureTestSources([testFile])).not.toThrow();
+    expect(await runTestWithin(testFile)).toBe(0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

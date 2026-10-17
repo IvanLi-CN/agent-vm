@@ -1,7 +1,10 @@
 #!/usr/bin/env bun
 /** Discover and run maintained TS, Python, and Shell tests without a root edit per sibling. */
 
-import { dirname, join, relative } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
+import { realpathSync } from "node:fs";
+import { dlopen } from "bun:ffi";
+import * as ts from "typescript";
 import { isDirectRegularFile, isPathInside, readText, REPO_ROOT, relativePath, walkFiles } from "./repo_util.ts";
 
 export type TestScope = "repo" | "skills";
@@ -482,21 +485,124 @@ export function ensureTestSelection(files: TestFile[], scope: TestScope): void {
   }
 }
 
+function bunPropertyChain(expression: ts.Expression): string[] | undefined {
+  const parts: string[] = [];
+  let current = expression;
+  while (true) {
+    if (ts.isParenthesizedExpression(current) || ts.isAsExpression(current) || ts.isTypeAssertionExpression(current) || ts.isNonNullExpression(current) || ts.isSatisfiesExpression(current)) {
+      current = current.expression;
+    } else if (ts.isPropertyAccessExpression(current)) {
+      parts.unshift(current.name.text);
+      current = current.expression;
+    } else if (ts.isElementAccessExpression(current) && current.argumentExpression && ts.isStringLiteralLike(current.argumentExpression)) {
+      parts.unshift(current.argumentExpression.text);
+      current = current.expression;
+    } else if (ts.isIdentifier(current)) {
+      parts.unshift(current.text);
+      return parts;
+    } else {
+      return undefined;
+    }
+  }
+}
+
+function hasBunFocusedSelection(file: string, source: string): boolean {
+  const extension = file.toLowerCase().split(".").pop();
+  const scriptKind = extension === "tsx" ? ts.ScriptKind.TSX : extension === "jsx" ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
+  const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKind);
+  const directNames = new Set(["test", "it", "describe"]);
+  const namespaceNames = new Set<string>();
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !ts.isStringLiteralLike(statement.moduleSpecifier) || statement.moduleSpecifier.text !== "bun:test" || !statement.importClause) continue;
+    if (statement.importClause.namedBindings && ts.isNamespaceImport(statement.importClause.namedBindings)) {
+      namespaceNames.add(statement.importClause.namedBindings.name.text);
+    } else if (statement.importClause.namedBindings && ts.isNamedImports(statement.importClause.namedBindings)) {
+      for (const element of statement.importClause.namedBindings.elements) {
+        const importedName = element.propertyName?.text ?? element.name.text;
+        if (directNames.has(importedName)) directNames.add(element.name.text);
+      }
+    }
+  }
+  let focused = false;
+  const visit = (node: ts.Node): void => {
+    if (focused) return;
+    if (ts.isCallExpression(node)) {
+      const chain = bunPropertyChain(node.expression);
+      if (chain?.includes("only")) {
+        const root = chain[0];
+        const namespaceCall = root !== undefined && namespaceNames.has(root) && [chain[1], chain[2]].some((part) => part === "test" || part === "it" || part === "describe");
+        const directCall = root !== undefined && directNames.has(root);
+        if (namespaceCall || directCall) {
+          focused = true;
+          return;
+        }
+      }
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return focused;
+}
+
+function shellSourceCandidates(file: string, source: string): string[] {
+  const candidates: string[] = [];
+  const sourcePattern = /(?:^|[;&|(){}\n]\s*)(?:source|\.)\s+(?:"?\$\(\s*dirname\s+["']?\$0["']?\s*\)([^"'\n]*)"?|(["'])([^"']+)\2|([^\s;&|(){}]+))/g;
+  for (const match of source.matchAll(sourcePattern)) {
+    const dirnameSuffix = match[1];
+    const directSpecifier = match[3] ?? match[4];
+    if (dirnameSuffix !== undefined) {
+      if (dirnameSuffix.includes("$") || dirnameSuffix.includes("`") || dirnameSuffix.includes("\\")) continue;
+      candidates.push(resolve(dirname(file), dirnameSuffix.replace(/^[/\\]+/, "")));
+    } else if (directSpecifier !== undefined && !directSpecifier.includes("$") && !directSpecifier.includes("`")) {
+      candidates.push(resolve(dirname(file), directSpecifier));
+    }
+  }
+  return [...new Set(candidates)];
+}
+
+function shellInspectionRoot(file: string): string {
+  const resolvedFile = resolve(file);
+  return isPathInside(REPO_ROOT, resolvedFile) ? REPO_ROOT : dirname(resolvedFile);
+}
+
+function isAllowedShellSourceCandidate(file: string, candidate: string): boolean {
+  if (!isDirectRegularFile(candidate)) return false;
+  try {
+    return isPathInside(realpathSync(shellInspectionRoot(file)), realpathSync(candidate));
+  } catch {
+    return false;
+  }
+}
+
+function shellHasMaintainedTest(file: string, source: string, visited = new Set<string>()): boolean {
+  const key = resolve(file);
+  if (visited.has(key)) return false;
+  visited.add(key);
+  const hasTestCommand = source.split("\n").some((line) => {
+    const executableLine = line
+      .replace(/'(?:[^'\\]|\\.)*'/g, "''")
+      .replace(/"(?:[^"\\]|\\.)*"/g, '""')
+      .replace(/\s+#.*$/, "");
+    const commandBoundary = /(?:^|[;&|(){}]\s*|\b(?:then|do)\s+)(?:if\s+)?!?\s*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|(){}]+\s*)*/;
+    return new RegExp(`${commandBoundary.source}(?:(?:builtin|command)(?:\\s+(?:--|-p))*\\s+)?(?:["']?test["']?)(?:\\s|$|[;&|(){}])`).test(executableLine);
+  });
+  if (hasTestCommand) return true;
+  for (const candidate of shellSourceCandidates(file, source)) {
+    if (isAllowedShellSourceCandidate(file, candidate) && shellHasMaintainedTest(candidate, readText(candidate), visited)) return true;
+  }
+  return false;
+}
+
 export function ensureTestSources(files: TestFile[]): void {
   const invalid = files.filter((test) => {
     const source = readText(test.path);
     if (source.trim().length === 0) return true;
-    if (test.kind === "bun") return !/\b(?:test|it|describe)(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\(/.test(source);
-    if (test.kind === "python") return !/\b(?:unittest\.|TestCase\b|def\s+test_)/.test(source);
-    const hasTestCommand = source.split("\n").some((line) => {
-      const executableLine = line
-        .replace(/'(?:[^'\\]|\\.)*'/g, "''")
-        .replace(/"(?:[^"\\]|\\.)*"/g, "\"\"")
-        .replace(/\s+#.*$/, "");
-      const commandBoundary = /(?:^|[;&|(){}]\s*|\b(?:then|do)\s+)(?:if\s+)?!?\s*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|(){}]+\s*)*/;
-      return new RegExp(`${commandBoundary.source}(?:(?:builtin|command)(?:\\s+(?:--|-p))*\\s+)?(?:["']?test["']?)(?:\\s|$|[;&|(){}])`).test(executableLine);
-    });
-    return !hasTestCommand;
+    if (test.kind === "bun") {
+      if (hasBunFocusedSelection(test.path, source)) throw new Error(`refusing focused Bun test selection: ${test.path}`);
+      return !/\b(?:test|it|describe)(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\(/.test(source);
+    }
+    if (test.kind === "python") return !/\b(?:unittest\.|TestCase\b|def\s+test_|def\s+load_tests\s*\()/m.test(source);
+    return !shellHasMaintainedTest(test.path, source);
   });
   if (invalid.length > 0) {
     throw new Error(`refusing to run test files without maintained test declarations: ${invalid.map((test) => test.path).join(", ")}`);
@@ -537,18 +643,26 @@ __agent_toolkit_source_pid=""
 __agent_toolkit_cleanup_done=0
 __agent_toolkit_replay_done=0
 __agent_toolkit_signal_group() {
-  local signal="$1" pid="$2"
+  local signal="$1" pid="$2" own_group
   [[ -n "$pid" ]] || return 0
+  own_group="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')"
+  if [[ -n "$own_group" && "$own_group" == "$pid" ]]; then
+    builtin kill "-$signal" "$pid" 2>/dev/null || true
+    return 0
+  fi
   if ! builtin kill "-$signal" "-$pid" 2>/dev/null; then
     builtin kill "-$signal" "$pid" 2>/dev/null || true
   fi
 }
 __agent_toolkit_stop_group() {
-  local pid="$1" attempt=0
+  local pid="$1" attempt=0 own_group target
   [[ -n "$pid" ]] || return 0
+  own_group="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')"
+  target="-$pid"
+  [[ -n "$own_group" && "$own_group" == "$pid" ]] && target="$pid"
   __agent_toolkit_signal_group TERM "$pid"
   while (( attempt < 50 )); do
-    builtin kill -0 "-$pid" 2>/dev/null || return 0
+    builtin kill -0 "$target" 2>/dev/null || return 0
     sleep 0.01
     ((attempt += 1))
   done
@@ -559,34 +673,6 @@ __agent_toolkit_process_active() {
   [[ -n "$pid" ]] || return 1
   state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')"
   [[ -n "$state" && "$state" != Z* ]]
-}
-__agent_toolkit_kill_owned_session_groups() {
-  local session_id signal group
-  session_id="$(__agent_toolkit_session_id)"
-  [[ "$session_id" == "$$" ]] || return 0
-  for signal in TERM KILL; do
-    while read -r group; do
-      [[ -n "$group" && "$group" != "$$" ]] || continue
-      builtin kill "-$signal" "-$group" 2>/dev/null || true
-    done < <(__agent_toolkit_session_groups "$session_id")
-    [[ "$signal" == TERM ]] && sleep 0.05
-  done
-}
-__agent_toolkit_session_id() {
-  local session_id
-  session_id="$(ps -o sess= -p "$$" 2>/dev/null | tr -d ' ')" || session_id=""
-  if [[ -z "$session_id" || "$session_id" == 0 ]]; then
-    session_id="$(ps -o sid= -p "$$" 2>/dev/null | tr -d ' ')" || session_id=""
-  fi
-  printf '%s' "$session_id"
-}
-__agent_toolkit_session_groups() {
-  local session_id="$1" table
-  table="$(ps -axo pid=,sess=,pgid= 2>/dev/null)" || table=""
-  if [[ -z "$table" ]]; then
-    table="$(ps -axo pid=,sid=,pgid= 2>/dev/null)" || table=""
-  fi
-  awk -v session="$session_id" '$2 == session {print $3}' <<<"$table" | sort -u
 }
 __agent_toolkit_relay_drained() {
   ! __agent_toolkit_process_active "$__agent_toolkit_stdout_replay_pid" &&
@@ -599,7 +685,6 @@ __agent_toolkit_wait_for_relays() {
     ((attempt += 1))
   done
   if ! __agent_toolkit_relay_drained; then
-    __agent_toolkit_kill_owned_session_groups
     __agent_toolkit_stop_group "$__agent_toolkit_source_pid"
     __agent_toolkit_stop_group "$__agent_toolkit_stdout_replay_pid"
     __agent_toolkit_stop_group "$__agent_toolkit_stderr_replay_pid"
@@ -620,7 +705,6 @@ __agent_toolkit_cleanup() {
     if (( __agent_toolkit_replay_done == 0 )); then
       __agent_toolkit_stop_group "$__agent_toolkit_stdout_replay_pid"
       __agent_toolkit_stop_group "$__agent_toolkit_stderr_replay_pid"
-      __agent_toolkit_kill_owned_session_groups
     fi
     __agent_toolkit_remove_path "$__agent_toolkit_stdout_file"
     __agent_toolkit_remove_path "$__agent_toolkit_stderr_file"
@@ -633,7 +717,6 @@ __agent_toolkit_forward_signal() {
   __agent_toolkit_stop_group "$__agent_toolkit_source_pid"
   __agent_toolkit_stop_group "$__agent_toolkit_stdout_replay_pid"
   __agent_toolkit_stop_group "$__agent_toolkit_stderr_replay_pid"
-  __agent_toolkit_kill_owned_session_groups
   exit "$status"
 }
 trap '__agent_toolkit_cleanup' EXIT
@@ -915,7 +998,7 @@ __agent_toolkit_has_unusable_output_redirection() {
   return 1
 }
 `.replaceAll("\\${", "${"),
-    "readonly -f test trap __agent_toolkit_signal_group __agent_toolkit_stop_group __agent_toolkit_process_active __agent_toolkit_kill_owned_session_groups __agent_toolkit_session_id __agent_toolkit_session_groups __agent_toolkit_relay_drained __agent_toolkit_wait_for_relays __agent_toolkit_remove_path __agent_toolkit_cleanup __agent_toolkit_forward_signal __agent_toolkit_record_builtin_test __agent_toolkit_fd_is_open __agent_toolkit_fd_is_readable __agent_toolkit_read_redirection_target __agent_toolkit_resolve_redirection_value __agent_toolkit_fd_path_number __agent_toolkit_has_unquoted_input_redirection __agent_toolkit_has_unusable_output_redirection __agent_toolkit_debug_counter __agent_toolkit_disable_nested_job_control __agent_toolkit_install_debug_trap",
+    "readonly -f test trap __agent_toolkit_signal_group __agent_toolkit_stop_group __agent_toolkit_process_active __agent_toolkit_relay_drained __agent_toolkit_wait_for_relays __agent_toolkit_remove_path __agent_toolkit_cleanup __agent_toolkit_forward_signal __agent_toolkit_record_builtin_test __agent_toolkit_fd_is_open __agent_toolkit_fd_is_readable __agent_toolkit_read_redirection_target __agent_toolkit_resolve_redirection_value __agent_toolkit_fd_path_number __agent_toolkit_has_unquoted_input_redirection __agent_toolkit_has_unusable_output_redirection __agent_toolkit_debug_counter __agent_toolkit_disable_nested_job_control __agent_toolkit_install_debug_trap",
     "set +e",
     "(",
     "  set -euo pipefail",
@@ -965,50 +1048,116 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
-type ProcessIdentity = { pid: number; sessionId: number; processGroupId: number };
+type ProcessRecord = { pid: number; parentPid: number; processGroupId: number; state: string };
+type ProcessIdentity = ProcessRecord & { sessionId: number };
+type ProcessOwnership = { rootPid: number; sessionId?: number };
+
+type PosixProcessLibrary = { getsid: (pid: number) => number; getpgid: (pid: number) => number };
+
+const POSIX_PROCESS_LIBRARY = process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6";
+let posixProcessLibrary: PosixProcessLibrary | null | undefined;
+
+function loadPosixProcessLibrary(): PosixProcessLibrary | undefined {
+  if (process.platform === "win32") return undefined;
+  if (posixProcessLibrary !== undefined) return posixProcessLibrary ?? undefined;
+  try {
+    const handle = dlopen(POSIX_PROCESS_LIBRARY, {
+      getsid: { args: ["i32"], returns: "i32" },
+      getpgid: { args: ["i32"], returns: "i32" },
+    });
+    posixProcessLibrary = { getsid: handle.symbols.getsid, getpgid: handle.symbols.getpgid };
+  } catch {
+    posixProcessLibrary = null;
+  }
+  return posixProcessLibrary ?? undefined;
+}
+
+function nativeProcessSessionId(pid: number): number | undefined {
+  const library = loadPosixProcessLibrary();
+  if (library === undefined) return undefined;
+  try {
+    const sessionId = library.getsid(pid);
+    return Number.isInteger(sessionId) && sessionId > 0 ? sessionId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function nativeProcessGroupId(pid: number): number | undefined {
+  const library = loadPosixProcessLibrary();
+  if (library === undefined) return undefined;
+  try {
+    const processGroupId = library.getpgid(pid);
+    return Number.isInteger(processGroupId) && processGroupId > 0 ? processGroupId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function processOwnershipError(library: PosixProcessLibrary | null | undefined = loadPosixProcessLibrary()): string | undefined {
+  if (process.platform === "win32" || library != null) return undefined;
+  return "POSIX process ownership requires Bun FFI getsid support";
+}
+
+function processTable(): ProcessRecord[] {
+  if (process.platform === "win32") return [];
+  const result = Bun.spawnSync(["ps", "-axo", "pid=,ppid=,pgid=,stat="], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (result.exitCode !== 0) return [];
+  const records: ProcessRecord[] = [];
+  for (const line of new TextDecoder().decode(result.stdout).split("\n")) {
+    const values = line.trim().split(/\s+/);
+    const numbers = values.slice(0, 3).map(Number);
+    if (numbers.length < 3 || numbers.some((value) => !Number.isInteger(value) || value <= 0)) continue;
+    records.push({
+      pid: numbers[0]!,
+      parentPid: numbers[1]!,
+      processGroupId: numbers[2]!,
+      state: values[3] ?? "",
+    });
+  }
+  return records;
+}
 
 function processIdentity(pid: number): ProcessIdentity | undefined {
-  if (process.platform === "win32") return undefined;
-  for (const sessionField of ["sess", "sid"]) {
-    const result = Bun.spawnSync(["ps", "-o", `pid=,${sessionField}=,pgid=`, "-p", String(pid)], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    if (result.exitCode !== 0) continue;
-    const fields = new TextDecoder().decode(result.stdout).trim().split(/\s+/).map(Number);
-    if (fields.length >= 3 && fields.every((value) => Number.isInteger(value) && value > 0)) {
-      return { pid: fields[0]!, sessionId: fields[1]!, processGroupId: fields[2]! };
-    }
-  }
-  return undefined;
+  const sessionId = nativeProcessSessionId(pid);
+  if (sessionId === undefined) return undefined;
+  const record = processTable().find((candidate) => candidate.pid === pid);
+  if (record !== undefined) return { ...record, sessionId };
+  const processGroupId = nativeProcessGroupId(pid);
+  return processGroupId === undefined ? undefined : { pid, parentPid: 0, processGroupId, state: "", sessionId };
 }
 
 function processSessionMembers(sessionId: number): ProcessIdentity[] {
-  if (process.platform === "win32") return [];
-  for (const sessionField of ["sess", "sid"]) {
-    const result = Bun.spawnSync(["ps", "-axo", `pid=,${sessionField}=,pgid=`], {
-      stdout: "pipe",
-      stderr: "pipe",
-    });
-    if (result.exitCode !== 0) continue;
-    return new TextDecoder().decode(result.stdout)
-      .split("\n")
-      .map((line) => line.trim().split(/\s+/).map(Number))
-      .filter((fields) => fields.length >= 3 && fields.every((value) => Number.isInteger(value) && value > 0))
-      .map(([pid, memberSessionId, processGroupId]) => ({ pid: pid!, sessionId: memberSessionId!, processGroupId: processGroupId! }))
-      .filter((member) => member.sessionId === sessionId);
-  }
-  return [];
+  if (loadPosixProcessLibrary() === undefined) return [];
+  return processTable().flatMap((record) => {
+    const memberSessionId = nativeProcessSessionId(record.pid);
+    return memberSessionId === sessionId ? [{ ...record, sessionId: memberSessionId }] : [];
+  });
+}
+
+function createProcessOwnership(rootPid: number): ProcessOwnership {
+  const identity = processIdentity(rootPid);
+  const sessionId = identity?.sessionId;
+  const ownership: ProcessOwnership = {
+    rootPid,
+    ...(sessionId !== undefined ? { sessionId } : {}),
+  };
+  return ownership;
 }
 
 function signalProcessSession(sessionId: number, signal: NodeJS.Signals): void {
   if (process.platform === "win32") return;
-  const runner = processIdentity(process.pid);
-  if (runner?.sessionId === sessionId) return;
+  const runnerSessionId = processIdentity(process.pid)?.sessionId;
+  if (runnerSessionId === undefined || runnerSessionId === sessionId) return;
   const members = processSessionMembers(sessionId);
-  const runnerGroup = runner?.processGroupId;
-  const groups = new Set(members.map((member) => member.processGroupId));
-  for (const group of groups) {
+  if (members.length === 0) return;
+  const runner = processIdentity(process.pid);
+  if (runner === undefined) return;
+  const runnerGroup = runner.processGroupId;
+  for (const group of new Set(members.map((member) => member.processGroupId))) {
     if (group === runnerGroup) continue;
     try {
       process.kill(-group, signal);
@@ -1026,13 +1175,15 @@ function signalProcessSession(sessionId: number, signal: NodeJS.Signals): void {
   }
 }
 
-function signalOwnedProcess(pid: number, sessionId: number | undefined, signal: NodeJS.Signals): void {
-  const runnerSessionId = processIdentity(process.pid)?.sessionId;
-  if (sessionId !== undefined && sessionId !== runnerSessionId) {
-    signalProcessSession(sessionId, signal);
+function signalOwnedProcess(ownership: ProcessOwnership, signal: NodeJS.Signals): void {
+  if (process.platform === "win32") {
+    signalProcessGroup(ownership.rootPid, signal);
+    return;
   }
-  if (sessionId === undefined || sessionId !== runnerSessionId) {
-    signalProcessGroup(pid, signal);
+  if (ownership.sessionId !== undefined) {
+    const runnerSessionId = processIdentity(process.pid)?.sessionId;
+    if (runnerSessionId === undefined || ownership.sessionId === runnerSessionId) return;
+    signalProcessSession(ownership.sessionId, signal);
   }
 }
 
@@ -1091,11 +1242,11 @@ async function collectedOutput(capture: OutputCapture): Promise<string> {
   }
 }
 
-async function drainProcessOutput(child: Bun.Subprocess, sessionId: number | undefined, captures: OutputCapture[]): Promise<[string, string]> {
+async function drainProcessOutput(ownership: ProcessOwnership, captures: OutputCapture[]): Promise<[string, string]> {
   if (!(await outputSettled(captures, OUTPUT_DRAIN_DEADLINE_MS))) {
-    signalOwnedProcess(child.pid, sessionId, "SIGTERM");
+    signalOwnedProcess(ownership, "SIGTERM");
     if (!(await outputSettled(captures, OUTPUT_TERM_GRACE_MS))) {
-      signalOwnedProcess(child.pid, sessionId, "SIGKILL");
+      signalOwnedProcess(ownership, "SIGKILL");
       if (!(await outputSettled(captures, OUTPUT_KILL_GRACE_MS))) {
         await Promise.all(captures.map((capture) => capture.cancel()));
       }
@@ -1104,24 +1255,39 @@ async function drainProcessOutput(child: Bun.Subprocess, sessionId: number | und
   return [await collectedOutput(captures[0]!), await collectedOutput(captures[1]!)];
 }
 
+async function waitForChildExit(child: Bun.Subprocess): Promise<number> {
+  return await child.exited;
+}
+
+async function cleanupOwnedProcess(ownership: ProcessOwnership): Promise<void> {
+  signalOwnedProcess(ownership, "SIGTERM");
+  await Bun.sleep(50);
+  signalOwnedProcess(ownership, "SIGKILL");
+}
+
 export async function runTest(test: TestFile): Promise<number> {
   if (!isPathInside(REPO_ROOT, test.path) || !isDirectRegularFile(test.path)) {
     console.error(`ERROR refusing to run a test outside the regular repository file boundary: ${test.path}`);
     return 1;
   }
+  const ownershipError = processOwnershipError();
+  if (ownershipError !== undefined) {
+    console.error(`ERROR refusing to run test without narrow process ownership: ${ownershipError}`);
+    return 1;
+  }
   console.log(`::group::${relativePath(test.path)}`);
   let child: Bun.Subprocess | undefined;
-  let childSessionId: number | undefined;
+  let ownership: ProcessOwnership | undefined;
   let pendingSignal: NodeJS.Signals | undefined;
   let escalationTimer: ReturnType<typeof setTimeout> | undefined;
   const forward = (signal: NodeJS.Signals) => {
-    if (child === undefined) {
+    if (child === undefined || ownership === undefined) {
       pendingSignal ??= signal;
       return;
     }
     const target = child;
-    signalOwnedProcess(target.pid, childSessionId, signal);
-    escalationTimer ??= setTimeout(() => signalOwnedProcess(target.pid, childSessionId, "SIGKILL"), 1000);
+    signalOwnedProcess(ownership, signal);
+    escalationTimer ??= setTimeout(() => signalOwnedProcess(ownership!, "SIGKILL"), 1000);
   };
   const forwardInterrupt = () => forward("SIGINT");
   const forwardTermination = () => forward("SIGTERM");
@@ -1139,22 +1305,30 @@ export async function runTest(test: TestFile): Promise<number> {
       detached: true,
     });
     child = spawnedChild;
-    const identity = processIdentity(spawnedChild.pid);
-    childSessionId = identity?.sessionId;
+    ownership = createProcessOwnership(spawnedChild.pid);
+    if (process.platform !== "win32" && ownership.sessionId === undefined) {
+      signalProcessGroup(spawnedChild.pid, "SIGKILL");
+      await spawnedChild.exited;
+      childExited = true;
+      console.error("ERROR refusing to run test because native getsid could not identify the detached child session");
+      return 1;
+    }
     if (pendingSignal !== undefined) {
       const signal = pendingSignal;
       pendingSignal = undefined;
       forward(signal);
     }
     const captures = [captureProcessOutput(spawnedChild.stdout), captureProcessOutput(spawnedChild.stderr)];
-    exitCode = await spawnedChild.exited;
+    exitCode = await waitForChildExit(spawnedChild);
     childExited = true;
-    [out, err] = await drainProcessOutput(spawnedChild, childSessionId, captures);
+    [out, err] = await drainProcessOutput(ownership, captures);
+    await cleanupOwnedProcess(ownership);
     spawnedChild.unref();
   } finally {
     if (escalationTimer !== undefined) clearTimeout(escalationTimer);
     if (child !== undefined && !childExited) {
-      signalOwnedProcess(child.pid, childSessionId, "SIGKILL");
+      if (ownership !== undefined) signalOwnedProcess(ownership, "SIGKILL");
+      else signalProcessGroup(child.pid, "SIGKILL");
       child.unref();
     }
     process.off("SIGINT", forwardInterrupt);
