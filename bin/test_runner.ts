@@ -1055,6 +1055,8 @@ type ProcessOwnership = { rootPid: number; sessionId?: number };
 type PosixProcessLibrary = { getsid: (pid: number) => number; getpgid: (pid: number) => number };
 
 const POSIX_PROCESS_LIBRARY = process.platform === "darwin" ? "libSystem.B.dylib" : "libc.so.6";
+const PROCESS_OWNERSHIP_PROBE_ATTEMPTS = 20;
+const PROCESS_OWNERSHIP_PROBE_DELAY_MS = 5;
 let posixProcessLibrary: PosixProcessLibrary | null | undefined;
 
 function loadPosixProcessLibrary(): PosixProcessLibrary | undefined {
@@ -1138,14 +1140,13 @@ function processSessionMembers(sessionId: number): ProcessIdentity[] {
   });
 }
 
-function createProcessOwnership(rootPid: number): ProcessOwnership {
-  const identity = processIdentity(rootPid);
-  const sessionId = identity?.sessionId;
-  const ownership: ProcessOwnership = {
-    rootPid,
-    ...(sessionId !== undefined ? { sessionId } : {}),
-  };
-  return ownership;
+async function createProcessOwnership(rootPid: number): Promise<ProcessOwnership> {
+  for (let attempt = 0; attempt < PROCESS_OWNERSHIP_PROBE_ATTEMPTS; attempt += 1) {
+    const identity = processIdentity(rootPid);
+    if (identity !== undefined) return { rootPid, sessionId: identity.sessionId };
+    if (attempt + 1 < PROCESS_OWNERSHIP_PROBE_ATTEMPTS) await Bun.sleep(PROCESS_OWNERSHIP_PROBE_DELAY_MS);
+  }
+  return { rootPid };
 }
 
 function signalProcessSession(sessionId: number, signal: NodeJS.Signals): void {
@@ -1305,7 +1306,7 @@ export async function runTest(test: TestFile): Promise<number> {
       detached: true,
     });
     child = spawnedChild;
-    ownership = createProcessOwnership(spawnedChild.pid);
+    ownership = await createProcessOwnership(spawnedChild.pid);
     if (process.platform !== "win32" && ownership.sessionId === undefined) {
       signalProcessGroup(spawnedChild.pid, "SIGKILL");
       await spawnedChild.exited;
