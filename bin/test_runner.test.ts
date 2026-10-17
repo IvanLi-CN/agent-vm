@@ -312,7 +312,8 @@ test("does not wait for background descendants holding shell output FIFOs", asyn
     const pidFile = join(root, "background.pid");
     const quotedPidFile = JSON.stringify(pidFile);
     writeFileSync(path, [
-      `sh -c 'printf "%s\\n" "$$" > ${quotedPidFile}; while :; do sleep 1; done' &`,
+      "sh -c 'while :; do sleep 1; done' &",
+      `printf "%s\\n" "$!" > ${quotedPidFile}`,
       "printf 'shell stdout\\n'",
       "printf 'shell stderr\\n' >&2",
       "builtin test 1 -eq 1 > /dev/fd/1",
