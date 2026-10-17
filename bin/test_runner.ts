@@ -646,6 +646,7 @@ __agent_toolkit_stop_group() {
     ((attempt += 1))
   done
   __agent_toolkit_signal_group KILL "$pid"
+  builtin kill -KILL "$pid" 2>/dev/null || true
 }
 __agent_toolkit_process_active() {
   local pid="$1" state
