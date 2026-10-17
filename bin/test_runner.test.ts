@@ -444,9 +444,6 @@ test("does not wait for background descendants holding shell output FIFOs", asyn
 
 test("cleans nested shell split-PGID descendants with inherited and redirected output", async () => {
   const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-toolkit-runner-shell-split-pgid-"));
-  const debugFile = join(root, "shell-debug.log");
-  const previousDebugFile = process.env.AGENT_TOOLKIT_DEBUG_FILE;
-  process.env.AGENT_TOOLKIT_DEBUG_FILE = debugFile;
   let descendantPid: number | undefined;
   try {
     const path = join(root, "test_nested_split_pgid.sh");
@@ -471,7 +468,6 @@ test("cleans nested shell split-PGID descendants with inherited and redirected o
       ].join("\n"));
       const result = runTestWithin({ path, kind: "shell" }, 5000);
       const ready = await waitForPath(readyFile);
-      if (!ready && existsSync(debugFile)) process.stderr.write(readFileSync(debugFile, "utf8"));
       expect(ready).toBe(true);
       descendantPid = Number(readFileSync(pidFile, "utf8").trim());
       const descendantGroup = Number(readFileSync(groupFile, "utf8").trim());
@@ -480,12 +476,7 @@ test("cleans nested shell split-PGID descendants with inherited and redirected o
       expect(processGroupId(descendantPid)).toBe(descendantPid);
       expect(isProcessAlive(descendantPid)).toBe(true);
       writeFileSync(releaseFile, "release\n");
-      try {
-        expect(await result).toBe(0);
-      } catch (error) {
-        if (existsSync(debugFile)) process.stderr.write(readFileSync(debugFile, "utf8"));
-        throw error;
-      }
+      expect(await result).toBe(0);
       expect(await waitForProcessExit(descendantPid)).toBe(true);
       descendantPid = undefined;
       rmSync(pidFile, { force: true });
@@ -495,8 +486,6 @@ test("cleans nested shell split-PGID descendants with inherited and redirected o
     }
   } finally {
     if (descendantPid !== undefined && isProcessAlive(descendantPid)) signalProcessGroup(descendantPid, "SIGKILL");
-    if (previousDebugFile === undefined) delete process.env.AGENT_TOOLKIT_DEBUG_FILE;
-    else process.env.AGENT_TOOLKIT_DEBUG_FILE = previousDebugFile;
     rmSync(root, { recursive: true, force: true });
   }
 });
