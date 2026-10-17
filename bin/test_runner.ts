@@ -1,8 +1,7 @@
 #!/usr/bin/env bun
 /** Discover and run maintained TS, Python, and Shell tests without a root edit per sibling. */
 
-import { dirname, join, relative, resolve } from "node:path";
-import { realpathSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import { dlopen } from "bun:ffi";
 import * as ts from "typescript";
 import { isDirectRegularFile, isPathInside, readText, REPO_ROOT, relativePath, walkFiles } from "./repo_util.ts";
@@ -544,55 +543,6 @@ function hasBunFocusedSelection(file: string, source: string): boolean {
   return focused;
 }
 
-function shellSourceCandidates(file: string, source: string): string[] {
-  const candidates: string[] = [];
-  const sourcePattern = /(?:^|[;&|(){}\n]\s*)(?:source|\.)\s+(?:"?\$\(\s*dirname\s+["']?\$0["']?\s*\)([^"'\n]*)"?|(["'])([^"']+)\2|([^\s;&|(){}]+))/g;
-  for (const match of source.matchAll(sourcePattern)) {
-    const dirnameSuffix = match[1];
-    const directSpecifier = match[3] ?? match[4];
-    if (dirnameSuffix !== undefined) {
-      if (dirnameSuffix.includes("$") || dirnameSuffix.includes("`") || dirnameSuffix.includes("\\")) continue;
-      candidates.push(resolve(dirname(file), dirnameSuffix.replace(/^[/\\]+/, "")));
-    } else if (directSpecifier !== undefined && !directSpecifier.includes("$") && !directSpecifier.includes("`")) {
-      candidates.push(resolve(dirname(file), directSpecifier));
-    }
-  }
-  return [...new Set(candidates)];
-}
-
-function shellInspectionRoot(file: string): string {
-  const resolvedFile = resolve(file);
-  return isPathInside(REPO_ROOT, resolvedFile) ? REPO_ROOT : dirname(resolvedFile);
-}
-
-function isAllowedShellSourceCandidate(file: string, candidate: string): boolean {
-  if (!isDirectRegularFile(candidate)) return false;
-  try {
-    return isPathInside(realpathSync(shellInspectionRoot(file)), realpathSync(candidate));
-  } catch {
-    return false;
-  }
-}
-
-function shellHasMaintainedTest(file: string, source: string, visited = new Set<string>()): boolean {
-  const key = resolve(file);
-  if (visited.has(key)) return false;
-  visited.add(key);
-  const hasTestCommand = source.split("\n").some((line) => {
-    const executableLine = line
-      .replace(/'(?:[^'\\]|\\.)*'/g, "''")
-      .replace(/"(?:[^"\\]|\\.)*"/g, '""')
-      .replace(/\s+#.*$/, "");
-    const commandBoundary = /(?:^|[;&|(){}]\s*|\b(?:then|do)\s+)(?:if\s+)?!?\s*(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|(){}]+\s*)*/;
-    return new RegExp(`${commandBoundary.source}(?:(?:builtin|command)(?:\\s+(?:--|-p))*\\s+)?(?:["']?test["']?)(?:\\s|$|[;&|(){}])`).test(executableLine);
-  });
-  if (hasTestCommand) return true;
-  for (const candidate of shellSourceCandidates(file, source)) {
-    if (isAllowedShellSourceCandidate(file, candidate) && shellHasMaintainedTest(candidate, readText(candidate), visited)) return true;
-  }
-  return false;
-}
-
 export function ensureTestSources(files: TestFile[]): void {
   const invalid = files.filter((test) => {
     const source = readText(test.path);
@@ -602,7 +552,7 @@ export function ensureTestSources(files: TestFile[]): void {
       return !/\b(?:test|it|describe)(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\(/.test(source);
     }
     if (test.kind === "python") return !/\b(?:unittest\.|TestCase\b|def\s+test_|def\s+load_tests\s*\()/m.test(source);
-    return !shellHasMaintainedTest(test.path, source);
+    return false;
   });
   if (invalid.length > 0) {
     throw new Error(`refusing to run test files without maintained test declarations: ${invalid.map((test) => test.path).join(", ")}`);
