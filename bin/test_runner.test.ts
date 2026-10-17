@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { commandForTest, discoverTests, ensureTestSelection, ensureTestSources, executedTestCount, testKind } from "./test_runner.ts";
+import { REPO_ROOT } from "./repo_util.ts";
+import { commandForTest, discoverTests, ensureTestSelection, ensureTestSources, executedTestCount, runTest, testKind } from "./test_runner.ts";
 
 function isProcessAlive(pid: number): boolean {
   try {
@@ -70,6 +71,30 @@ async function exitWithin(child: Bun.Subprocess, timeoutMs = 2000): Promise<numb
     throw new Error(`child did not exit within ${timeoutMs}ms`);
   }
   return result.code;
+}
+
+async function runTestWithin(testFile: { path: string; kind: "bun" | "python" | "shell" }, timeoutMs = 3000): Promise<number> {
+  const originalStdoutWrite = process.stdout.write;
+  const originalStderrWrite = process.stderr.write;
+  const originalLog = console.log;
+  const originalError = console.error;
+  process.stdout.write = (() => true) as typeof process.stdout.write;
+  process.stderr.write = (() => true) as typeof process.stderr.write;
+  console.log = () => {};
+  console.error = () => {};
+  try {
+    const result = await Promise.race([
+      runTest(testFile).then((code) => ({ code, timedOut: false as const })),
+      Bun.sleep(timeoutMs).then(() => ({ code: -1, timedOut: true as const })),
+    ]);
+    if (result.timedOut) throw new Error(`runTest did not finish within ${timeoutMs}ms`);
+    return result.code;
+  } finally {
+    process.stdout.write = originalStdoutWrite;
+    process.stderr.write = originalStderrWrite;
+    console.log = originalLog;
+    console.error = originalError;
+  }
 }
 
 test("discovers maintained TS, Python, and Shell tests automatically", () => {
@@ -337,6 +362,127 @@ test("does not wait for background descendants holding shell output FIFOs", asyn
   }
 });
 
+test("cleans shell descendants after the source enables job control", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-split-pgid-"));
+  let child: Bun.Subprocess | undefined;
+  let descendantPid: number | undefined;
+  try {
+    const path = join(root, "test_split_pgid.sh");
+    const pidFile = join(root, "split-pgid.pid");
+    const quotedPidFile = JSON.stringify(pidFile);
+    writeFileSync(path, [
+      "set -m 2>/dev/null || true",
+      "sh -c 'while :; do sleep 1; done' &",
+      `printf "%s\\n" "$!" > ${quotedPidFile}`,
+      "builtin test 1 -eq 1",
+    ].join("\n"));
+    const spawnedChild = Bun.spawn(commandForTest({ path, kind: "shell" }), {
+      cwd: root,
+      stdout: "pipe",
+      stderr: "pipe",
+      detached: true,
+    });
+    child = spawnedChild;
+    const stdout = new Response(spawnedChild.stdout).text();
+    const stderr = new Response(spawnedChild.stderr).text();
+    expect(await exitWithin(spawnedChild)).toBe(0);
+    expect(await stdout).toMatch(/TESTS_RUN=\s*1\s*$/);
+    expect(await stderr).toBe("");
+    expect(await waitForPath(pidFile)).toBe(true);
+    descendantPid = Number(readFileSync(pidFile, "utf8").trim());
+    expect(Number.isInteger(descendantPid)).toBe(true);
+    expect(await waitForProcessExit(descendantPid)).toBe(true);
+  } finally {
+    if (descendantPid !== undefined && isProcessAlive(descendantPid)) signalProcessGroup(descendantPid, "SIGKILL");
+    if (child !== undefined && isProcessAlive(child.pid)) signalProcessGroup(child.pid, "SIGKILL");
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("bounds Bun and Python output drains when leaders exit with inherited pipes", async () => {
+  const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-toolkit-runner-pipe-hang-"));
+  const descendants: number[] = [];
+  try {
+    const bunPath = join(root, "test_bun_pipe_hang.test.ts");
+    const bunPidFile = join(root, "bun-descendant.pid");
+    writeFileSync(bunPath, [
+      'import { test } from "bun:test";',
+      'import { writeFileSync } from "node:fs";',
+      `const child = Bun.spawn(["sh", "-c", "while :; do sleep 1; done"], { stdout: "inherit", stderr: "inherit" });`,
+      `writeFileSync(${JSON.stringify(bunPidFile)}, String(child.pid));`,
+      'test("runs", () => {});',
+    ].join("\n"));
+    expect(await runTestWithin({ path: bunPath, kind: "bun" })).toBe(0);
+    expect(await waitForPath(bunPidFile)).toBe(true);
+    const bunPid = Number(readFileSync(bunPidFile, "utf8").trim());
+    descendants.push(bunPid);
+    expect(await waitForProcessExit(bunPid)).toBe(true);
+
+    const pythonPath = join(root, "test_python_pipe_hang.py");
+    const pythonPidFile = join(root, "python-descendant.pid");
+    writeFileSync(pythonPath, [
+      "import pathlib",
+      "import subprocess",
+      `child = subprocess.Popen(["sh", "-c", "while :; do sleep 1; done"])`,
+      `pathlib.Path(${JSON.stringify(pythonPidFile)}).write_text(str(child.pid))`,
+      "def test_runs():",
+      "    pass",
+    ].join("\n"));
+    expect(await runTestWithin({ path: pythonPath, kind: "python" })).toBe(0);
+    expect(await waitForPath(pythonPidFile)).toBe(true);
+    const pythonPid = Number(readFileSync(pythonPidFile, "utf8").trim());
+    descendants.push(pythonPid);
+    expect(await waitForProcessExit(pythonPid)).toBe(true);
+  } finally {
+    for (const pid of descendants) {
+      if (isProcessAlive(pid)) signalProcessGroup(pid, "SIGKILL");
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("fails closed for all-skipped Bun and Python suites", async () => {
+  const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-toolkit-runner-all-skipped-"));
+  try {
+    const bunPath = join(root, "test_bun_all_skipped.test.ts");
+    writeFileSync(bunPath, 'import { test } from "bun:test";\ntest.skip("skipped", () => {});\n');
+    expect(await runTestWithin({ path: bunPath, kind: "bun" })).toBe(1);
+
+    const mixedBunPath = join(root, "test_bun_mixed_skip.test.ts");
+    writeFileSync(mixedBunPath, 'import { test } from "bun:test";\ntest("runs", () => {});\ntest.skip("skipped", () => {});\n');
+    expect(await runTestWithin({ path: mixedBunPath, kind: "bun" })).toBe(0);
+
+    const pythonPath = join(root, "test_python_all_skipped.py");
+    writeFileSync(pythonPath, "import unittest\n\nclass Tests(unittest.TestCase):\n    @unittest.skip('covered elsewhere')\n    def test_skipped(self):\n        pass\n");
+    expect(await runTestWithin({ path: pythonPath, kind: "python" })).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("queues a signal delivered during spawn until the child is assigned", async () => {
+  const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-toolkit-runner-spawn-signal-"));
+  const originalSpawn = Bun.spawn;
+  let injected = false;
+  try {
+    const path = join(root, "test_spawn_signal.test.ts");
+    writeFileSync(path, 'import { test } from "bun:test";\ntest("runs", () => {});\nawait Bun.sleep(3000);\n');
+    Bun.spawn = ((...args: Parameters<typeof Bun.spawn>) => {
+      const child = originalSpawn(...args);
+      if (!injected) {
+        injected = true;
+        const listener = process.listeners("SIGTERM").at(-1);
+        if (typeof listener === "function") listener("SIGTERM");
+      }
+      return child;
+    }) as typeof Bun.spawn;
+    expect(await runTestWithin({ path, kind: "bun" })).toBe(143);
+  } finally {
+    Bun.spawn = originalSpawn;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("forwards SIGINT and SIGTERM to shell test process groups", async () => {
   const cases: Array<[NodeJS.Signals, number]> = [["SIGINT", 130], ["SIGTERM", 143]];
   for (const [signal, expectedExitCode] of cases) {
@@ -384,7 +530,9 @@ test("cleans shell relay processes and paths across setup failures", async () =>
       const tools = join(root, "tools");
       mkdirSync(tools);
       const stateFile = join(root, "mktemp.state");
-      const catPidFile = join(root, "cat.pids");
+      const catPidDirectory = join(root, "cat-pids");
+      mkdirSync(catPidDirectory);
+      const handshakePath = join(root, "relay-ready.fifo");
       const testPath = join(root, "test_setup_failure.sh");
       const mktempPath = join(tools, "mktemp");
       const mkfifoPath = join(tools, "mkfifo");
@@ -397,12 +545,10 @@ test("cleans shell relay processes and paths across setup failures", async () =>
         "next=$((count + 1))",
         "if [[ \"$AGENT_TOOLKIT_FAIL_MKTEMP_AT\" != 0 && \"$next\" == \"$AGENT_TOOLKIT_FAIL_MKTEMP_AT\" ]]; then",
         "  if [[ \"$next\" == 3 ]]; then",
-        "    attempt=0",
-        "    while (( attempt < 100 )); do",
-        "      if [[ -f \"$AGENT_TOOLKIT_CAT_PID_FILE\" ]] && (( $(/usr/bin/wc -l < \"$AGENT_TOOLKIT_CAT_PID_FILE\") >= 2 )); then break; fi",
-        "      sleep 0.01",
-        "      ((attempt += 1))",
-        "    done",
+        "    exec 3< \"$AGENT_TOOLKIT_HANDSHAKE_FIFO\"",
+        "    IFS= read -r <&3",
+        "    IFS= read -r <&3",
+        "    exec 3<&-",
         "  fi",
         "  exit 1",
         "fi",
@@ -414,13 +560,16 @@ test("cleans shell relay processes and paths across setup failures", async () =>
       ].join("\n"));
       writeFileSync(mkfifoPath, [
         "#!/usr/bin/env bash",
+        "if [[ -n \"$AGENT_TOOLKIT_HANDSHAKE_FIFO\" ]]; then /usr/bin/mkfifo \"$AGENT_TOOLKIT_HANDSHAKE_FIFO\"; fi",
         "if [[ \"$AGENT_TOOLKIT_FAIL_MKFIFO\" == 1 ]]; then exit 1; fi",
         "exec /usr/bin/mkfifo \"$@\"",
         "",
       ].join("\n"));
       writeFileSync(catPath, [
         "#!/usr/bin/env bash",
-        "printf '%s\\n' \"$$\" >> \"$AGENT_TOOLKIT_CAT_PID_FILE\"",
+        "fifo=\"${@: -1}\"",
+        "printf '%s\\n' \"$$\" > \"$AGENT_TOOLKIT_CAT_PID_DIR/$(basename \"$fifo\").pid\"",
+        "if [[ -n \"$AGENT_TOOLKIT_HANDSHAKE_FIFO\" ]]; then printf 'ready\\n' > \"$AGENT_TOOLKIT_HANDSHAKE_FIFO\"; fi",
         "exec /bin/cat \"$@\"",
         "",
       ].join("\n"));
@@ -437,7 +586,8 @@ test("cleans shell relay processes and paths across setup failures", async () =>
           ...Bun.env,
           AGENT_TOOLKIT_FAIL_MKFIFO: failureCase.failMkfifo ? "1" : "0",
           AGENT_TOOLKIT_FAIL_MKTEMP_AT: String(failureCase.failMktempAt),
-          AGENT_TOOLKIT_CAT_PID_FILE: catPidFile,
+          AGENT_TOOLKIT_CAT_PID_DIR: catPidDirectory,
+          AGENT_TOOLKIT_HANDSHAKE_FIFO: failureCase.name === "marker-mktemp" ? handshakePath : "",
           AGENT_TOOLKIT_MKTEMP_STATE: stateFile,
           AGENT_TOOLKIT_TMP_ROOT: root,
           PATH: `${tools}:/usr/bin:/bin:/usr/sbin:/sbin`,
@@ -450,9 +600,9 @@ test("cleans shell relay processes and paths across setup failures", async () =>
       expect(await exitWithin(spawnedChild)).toBe(1);
       expect(await stdout).toBe("");
       expect(await stderr).toBe("");
-      const catPids = existsSync(catPidFile)
-        ? readFileSync(catPidFile, "utf8").trim().split(/\s+/).filter(Boolean).map(Number)
-        : [];
+      const catPids = readdirSync(catPidDirectory)
+        .filter((entry) => entry.endsWith(".pid"))
+        .map((entry) => Number(readFileSync(join(catPidDirectory, entry), "utf8").trim()));
       expect(catPids).toHaveLength(failureCase.expectedCatCount);
       for (const pid of catPids) expect(await waitForProcessExit(pid)).toBe(true);
       expect(readdirSync(root).filter((entry) => entry.startsWith("tmp.agent-toolkit-"))).toEqual([]);
@@ -984,7 +1134,10 @@ test("preserves skipped Python test metadata on guarded methods", async () => {
     const path = join(root, "test_skipped_method_metadata.py");
     writeFileSync(path, "import unittest\n\nclass Tests(unittest.TestCase):\n    def setUp(self):\n        raise AssertionError('skipped setup must not run')\n    @unittest.skip('covered elsewhere')\n    def test_runs(self):\n        pass\n");
     const child = Bun.spawn(commandForTest({ path, kind: "python" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
-    expect(await child.exited).toBe(0);
+    const stderr = new Response(child.stderr).text();
+    expect(await child.exited).toBe(1);
+    expect(await stderr).toContain("skipped=1");
+    expect(await stderr).not.toContain("skipped setup must not run");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

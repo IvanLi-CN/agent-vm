@@ -434,6 +434,10 @@ const PYTHON_TEST_RUNNER = [
   "    guard_test_cases(suite)",
   "result = unittest.TextTestRunner(verbosity=1).run(suite)",
   "if result.testsRun == 0:",
+  "    print('ERROR no Python tests executed', file=sys.stderr)",
+  "    raise SystemExit(1)",
+  "if result.testsRun == len(result.skipped):",
+  "    print('ERROR no non-skipped Python tests executed', file=sys.stderr)",
   "    raise SystemExit(1)",
   "if unsupported_results:",
   "    raise SystemExit(1)",
@@ -510,6 +514,13 @@ export function executedTestCount(kind: TestKind, output: string): number | unde
   return Number(matches[0]?.[1]);
 }
 
+function hasExecutedTests(kind: TestKind, output: string, count: number | undefined): boolean {
+  if (count === undefined || count === 0) return false;
+  if (kind !== "bun") return true;
+  const passSummaries = [...output.matchAll(/^\s*(\d+)\s+pass(?:es)?\s*$/gim)];
+  return passSummaries.length === 1 && Number(passSummaries[0]?.[1]) > 0;
+}
+
 export function commandForTest(test: TestFile): string[] {
   if (test.kind === "bun") return [process.execPath, "test", test.path];
   if (test.kind === "python") return ["python3", "-c", PYTHON_TEST_RUNNER, test.path];
@@ -543,6 +554,59 @@ __agent_toolkit_stop_group() {
   done
   __agent_toolkit_signal_group KILL "$pid"
 }
+__agent_toolkit_process_active() {
+  local pid="$1" state
+  [[ -n "$pid" ]] || return 1
+  state="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')"
+  [[ -n "$state" && "$state" != Z* ]]
+}
+__agent_toolkit_kill_owned_session_groups() {
+  local session_id signal group
+  session_id="$(__agent_toolkit_session_id)"
+  [[ "$session_id" == "$$" ]] || return 0
+  for signal in TERM KILL; do
+    while read -r group; do
+      [[ -n "$group" && "$group" != "$$" ]] || continue
+      builtin kill "-$signal" "-$group" 2>/dev/null || true
+    done < <(__agent_toolkit_session_groups "$session_id")
+    [[ "$signal" == TERM ]] && sleep 0.05
+  done
+}
+__agent_toolkit_session_id() {
+  local session_id
+  session_id="$(ps -o sess= -p "$$" 2>/dev/null | tr -d ' ')" || session_id=""
+  if [[ -z "$session_id" || "$session_id" == 0 ]]; then
+    session_id="$(ps -o sid= -p "$$" 2>/dev/null | tr -d ' ')" || session_id=""
+  fi
+  printf '%s' "$session_id"
+}
+__agent_toolkit_session_groups() {
+  local session_id="$1" table
+  table="$(ps -axo pid=,sess=,pgid= 2>/dev/null)" || table=""
+  if [[ -z "$table" ]]; then
+    table="$(ps -axo pid=,sid=,pgid= 2>/dev/null)" || table=""
+  fi
+  awk -v session="$session_id" '$2 == session {print $3}' <<<"$table" | sort -u
+}
+__agent_toolkit_relay_drained() {
+  ! __agent_toolkit_process_active "$__agent_toolkit_stdout_replay_pid" &&
+    ! __agent_toolkit_process_active "$__agent_toolkit_stderr_replay_pid"
+}
+__agent_toolkit_wait_for_relays() {
+  local attempt=0
+  while ! __agent_toolkit_relay_drained && (( attempt < 100 )); do
+    sleep 0.01
+    ((attempt += 1))
+  done
+  if ! __agent_toolkit_relay_drained; then
+    __agent_toolkit_kill_owned_session_groups
+    __agent_toolkit_stop_group "$__agent_toolkit_source_pid"
+    __agent_toolkit_stop_group "$__agent_toolkit_stdout_replay_pid"
+    __agent_toolkit_stop_group "$__agent_toolkit_stderr_replay_pid"
+  fi
+  wait "$__agent_toolkit_stdout_replay_pid" 2>/dev/null || true
+  wait "$__agent_toolkit_stderr_replay_pid" 2>/dev/null || true
+}
 __agent_toolkit_remove_path() {
   [[ -n "$1" ]] && rm -f -- "$1"
 }
@@ -556,6 +620,7 @@ __agent_toolkit_cleanup() {
     if (( __agent_toolkit_replay_done == 0 )); then
       __agent_toolkit_stop_group "$__agent_toolkit_stdout_replay_pid"
       __agent_toolkit_stop_group "$__agent_toolkit_stderr_replay_pid"
+      __agent_toolkit_kill_owned_session_groups
     fi
     __agent_toolkit_remove_path "$__agent_toolkit_stdout_file"
     __agent_toolkit_remove_path "$__agent_toolkit_stderr_file"
@@ -568,6 +633,7 @@ __agent_toolkit_forward_signal() {
   __agent_toolkit_stop_group "$__agent_toolkit_source_pid"
   __agent_toolkit_stop_group "$__agent_toolkit_stdout_replay_pid"
   __agent_toolkit_stop_group "$__agent_toolkit_stderr_replay_pid"
+  __agent_toolkit_kill_owned_session_groups
   exit "$status"
 }
 trap '__agent_toolkit_cleanup' EXIT
@@ -642,7 +708,8 @@ trap '__agent_toolkit_forward_signal SIGTERM 143' TERM
     "  return 1",
     "}",
     "__agent_toolkit_debug_counter() { local command=\"$1\"; command=\"\${command//\\\"test\\\"/test}\"; command=\"\${command//\\'test\\'/test}\"; if [[ \"$command\" =~ ^([A-Za-z_][A-Za-z0-9_]*=[^[:space:];|(){}]+[[:space:]]+)*(builtin|command)([[:space:]]+(-p|--))*[[:space:]]+test([[:space:]]|$) ]] && [[ -z \"$__agent_toolkit_inside_test\" ]] && ! __agent_toolkit_has_unquoted_input_redirection \"$command\" && ! __agent_toolkit_has_unusable_output_redirection \"$command\"; then __agent_toolkit_record_builtin_test; fi; }",
-    "__agent_toolkit_install_debug_trap() { local action=\"$1\"; if [[ \"$action\" == \"-\" ]]; then action=\"\"; fi; if [[ -n \"$action\" ]]; then builtin trap \"__agent_toolkit_debug_counter \\\"\\$BASH_COMMAND\\\"; $action\" DEBUG; else builtin trap '__agent_toolkit_debug_counter \"$BASH_COMMAND\"' DEBUG; fi; }",
+    "__agent_toolkit_disable_nested_job_control() { builtin set +m; }",
+    "__agent_toolkit_install_debug_trap() { local action=\"$1\"; if [[ \"$action\" == \"-\" ]]; then action=\"\"; fi; if [[ -n \"$action\" ]]; then builtin trap \"__agent_toolkit_debug_counter \\\"\\$BASH_COMMAND\\\"; __agent_toolkit_disable_nested_job_control; $action\" DEBUG; else builtin trap '__agent_toolkit_debug_counter \"$BASH_COMMAND\"; __agent_toolkit_disable_nested_job_control' DEBUG; fi; }",
     "trap() { if (( $# == 2 )) && [[ \"$2\" == \"DEBUG\" && \"$1\" != \"-p\" ]]; then __agent_toolkit_install_debug_trap \"$1\"; else builtin trap \"$@\"; fi; }",
     String.raw`__agent_toolkit_read_redirection_target() {
   local agentText="$1" agentQuote="" agentChar agentTarget="" agentQuoted="" agentExpandable=1
@@ -848,7 +915,7 @@ __agent_toolkit_has_unusable_output_redirection() {
   return 1
 }
 `.replaceAll("\\${", "${"),
-    "readonly -f test trap __agent_toolkit_signal_group __agent_toolkit_stop_group __agent_toolkit_remove_path __agent_toolkit_cleanup __agent_toolkit_forward_signal __agent_toolkit_record_builtin_test __agent_toolkit_fd_is_open __agent_toolkit_fd_is_readable __agent_toolkit_read_redirection_target __agent_toolkit_resolve_redirection_value __agent_toolkit_fd_path_number __agent_toolkit_has_unquoted_input_redirection __agent_toolkit_has_unusable_output_redirection __agent_toolkit_debug_counter __agent_toolkit_install_debug_trap",
+    "readonly -f test trap __agent_toolkit_signal_group __agent_toolkit_stop_group __agent_toolkit_process_active __agent_toolkit_kill_owned_session_groups __agent_toolkit_session_id __agent_toolkit_session_groups __agent_toolkit_relay_drained __agent_toolkit_wait_for_relays __agent_toolkit_remove_path __agent_toolkit_cleanup __agent_toolkit_forward_signal __agent_toolkit_record_builtin_test __agent_toolkit_fd_is_open __agent_toolkit_fd_is_readable __agent_toolkit_read_redirection_target __agent_toolkit_resolve_redirection_value __agent_toolkit_fd_path_number __agent_toolkit_has_unquoted_input_redirection __agent_toolkit_has_unusable_output_redirection __agent_toolkit_debug_counter __agent_toolkit_disable_nested_job_control __agent_toolkit_install_debug_trap",
     "set +e",
     "(",
     "  set -euo pipefail",
@@ -862,8 +929,7 @@ __agent_toolkit_has_unusable_output_redirection() {
     "wait \"$__agent_toolkit_source_pid\"",
     "exit_status=$?",
     "__agent_toolkit_stop_group \"$__agent_toolkit_source_pid\"",
-    "wait \"$__agent_toolkit_stdout_replay_pid\"",
-    "wait \"$__agent_toolkit_stderr_replay_pid\"",
+    "__agent_toolkit_wait_for_relays",
     "__agent_toolkit_replay_done=1",
     "set -e",
     "count=$(wc -l < \"$marker_file\")",
@@ -899,43 +965,206 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
-async function runTest(test: TestFile): Promise<number> {
+type ProcessIdentity = { pid: number; sessionId: number; processGroupId: number };
+
+function processIdentity(pid: number): ProcessIdentity | undefined {
+  if (process.platform === "win32") return undefined;
+  for (const sessionField of ["sess", "sid"]) {
+    const result = Bun.spawnSync(["ps", "-o", `pid=,${sessionField}=,pgid=`, "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (result.exitCode !== 0) continue;
+    const fields = new TextDecoder().decode(result.stdout).trim().split(/\s+/).map(Number);
+    if (fields.length >= 3 && fields.every((value) => Number.isInteger(value) && value > 0)) {
+      return { pid: fields[0]!, sessionId: fields[1]!, processGroupId: fields[2]! };
+    }
+  }
+  return undefined;
+}
+
+function processSessionMembers(sessionId: number): ProcessIdentity[] {
+  if (process.platform === "win32") return [];
+  for (const sessionField of ["sess", "sid"]) {
+    const result = Bun.spawnSync(["ps", "-axo", `pid=,${sessionField}=,pgid=`], {
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (result.exitCode !== 0) continue;
+    return new TextDecoder().decode(result.stdout)
+      .split("\n")
+      .map((line) => line.trim().split(/\s+/).map(Number))
+      .filter((fields) => fields.length >= 3 && fields.every((value) => Number.isInteger(value) && value > 0))
+      .map(([pid, memberSessionId, processGroupId]) => ({ pid: pid!, sessionId: memberSessionId!, processGroupId: processGroupId! }))
+      .filter((member) => member.sessionId === sessionId);
+  }
+  return [];
+}
+
+function signalProcessSession(sessionId: number, signal: NodeJS.Signals): void {
+  if (process.platform === "win32") return;
+  const runner = processIdentity(process.pid);
+  if (runner?.sessionId === sessionId) return;
+  const members = processSessionMembers(sessionId);
+  const runnerGroup = runner?.processGroupId;
+  const groups = new Set(members.map((member) => member.processGroupId));
+  for (const group of groups) {
+    if (group === runnerGroup) continue;
+    try {
+      process.kill(-group, signal);
+    } catch {
+      // The group may have exited between enumeration and signaling.
+    }
+  }
+  for (const member of members) {
+    if (member.pid === process.pid || member.processGroupId === runnerGroup) continue;
+    try {
+      process.kill(member.pid, signal);
+    } catch {
+      // The process may have exited between enumeration and signaling.
+    }
+  }
+}
+
+function signalOwnedProcess(pid: number, sessionId: number | undefined, signal: NodeJS.Signals): void {
+  const runnerSessionId = processIdentity(process.pid)?.sessionId;
+  if (sessionId !== undefined && sessionId !== runnerSessionId) {
+    signalProcessSession(sessionId, signal);
+  }
+  if (sessionId === undefined || sessionId !== runnerSessionId) {
+    signalProcessGroup(pid, signal);
+  }
+}
+
+const OUTPUT_DRAIN_DEADLINE_MS = 250;
+const OUTPUT_TERM_GRACE_MS = 250;
+const OUTPUT_KILL_GRACE_MS = 250;
+
+type OutputCapture = {
+  promise: Promise<string>;
+  cancel: () => Promise<void>;
+  snapshot: () => string;
+};
+
+function captureProcessOutput(stream: ReadableStream<Uint8Array<ArrayBuffer>>): OutputCapture {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let output = "";
+  const promise = (async () => {
+    try {
+      while (true) {
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        output += decoder.decode(chunk.value, { stream: true });
+      }
+      output += decoder.decode();
+      return output;
+    } finally {
+      reader.releaseLock();
+    }
+  })();
+  return {
+    promise,
+    cancel: async () => {
+      try {
+        await reader.cancel();
+      } catch {
+        // The reader may already have released its lock after EOF.
+      }
+    },
+    snapshot: () => output,
+  };
+}
+
+async function outputSettled(captures: OutputCapture[], timeoutMs: number): Promise<boolean> {
+  return Promise.race([
+    Promise.all(captures.map((capture) => capture.promise)).then(() => true, () => true),
+    Bun.sleep(timeoutMs).then(() => false),
+  ]);
+}
+
+async function collectedOutput(capture: OutputCapture): Promise<string> {
+  try {
+    return await capture.promise;
+  } catch {
+    return capture.snapshot();
+  }
+}
+
+async function drainProcessOutput(child: Bun.Subprocess, sessionId: number | undefined, captures: OutputCapture[]): Promise<[string, string]> {
+  if (!(await outputSettled(captures, OUTPUT_DRAIN_DEADLINE_MS))) {
+    signalOwnedProcess(child.pid, sessionId, "SIGTERM");
+    if (!(await outputSettled(captures, OUTPUT_TERM_GRACE_MS))) {
+      signalOwnedProcess(child.pid, sessionId, "SIGKILL");
+      if (!(await outputSettled(captures, OUTPUT_KILL_GRACE_MS))) {
+        await Promise.all(captures.map((capture) => capture.cancel()));
+      }
+    }
+  }
+  return [await collectedOutput(captures[0]!), await collectedOutput(captures[1]!)];
+}
+
+export async function runTest(test: TestFile): Promise<number> {
   if (!isPathInside(REPO_ROOT, test.path) || !isDirectRegularFile(test.path)) {
     console.error(`ERROR refusing to run a test outside the regular repository file boundary: ${test.path}`);
     return 1;
   }
   console.log(`::group::${relativePath(test.path)}`);
-  const child = Bun.spawn(commandForTest(test), {
-    cwd: REPO_ROOT,
-    stdout: "pipe",
-    stderr: "pipe",
-    detached: true,
-  });
-  const stdout = new Response(child.stdout).text();
-  const stderr = new Response(child.stderr).text();
+  let child: Bun.Subprocess | undefined;
+  let childSessionId: number | undefined;
+  let pendingSignal: NodeJS.Signals | undefined;
   let escalationTimer: ReturnType<typeof setTimeout> | undefined;
   const forward = (signal: NodeJS.Signals) => {
-    signalProcessGroup(child.pid, signal);
-    escalationTimer ??= setTimeout(() => signalProcessGroup(child.pid, "SIGKILL"), 1000);
+    if (child === undefined) {
+      pendingSignal ??= signal;
+      return;
+    }
+    const target = child;
+    signalOwnedProcess(target.pid, childSessionId, signal);
+    escalationTimer ??= setTimeout(() => signalOwnedProcess(target.pid, childSessionId, "SIGKILL"), 1000);
   };
   const forwardInterrupt = () => forward("SIGINT");
   const forwardTermination = () => forward("SIGTERM");
   process.on("SIGINT", forwardInterrupt);
   process.on("SIGTERM", forwardTermination);
   let exitCode: number;
+  let childExited = false;
+  let out = "";
+  let err = "";
   try {
-    exitCode = await child.exited;
+    const spawnedChild = Bun.spawn(commandForTest(test), {
+      cwd: REPO_ROOT,
+      stdout: "pipe",
+      stderr: "pipe",
+      detached: true,
+    });
+    child = spawnedChild;
+    const identity = processIdentity(spawnedChild.pid);
+    childSessionId = identity?.sessionId;
+    if (pendingSignal !== undefined) {
+      const signal = pendingSignal;
+      pendingSignal = undefined;
+      forward(signal);
+    }
+    const captures = [captureProcessOutput(spawnedChild.stdout), captureProcessOutput(spawnedChild.stderr)];
+    exitCode = await spawnedChild.exited;
+    childExited = true;
+    [out, err] = await drainProcessOutput(spawnedChild, childSessionId, captures);
+    spawnedChild.unref();
   } finally {
     if (escalationTimer !== undefined) clearTimeout(escalationTimer);
+    if (child !== undefined && !childExited) {
+      signalOwnedProcess(child.pid, childSessionId, "SIGKILL");
+      child.unref();
+    }
     process.off("SIGINT", forwardInterrupt);
     process.off("SIGTERM", forwardTermination);
   }
-  const [out, err] = await Promise.all([stdout, stderr]);
   process.stdout.write(out);
   process.stderr.write(err);
   console.log("::endgroup::");
   const count = executedTestCount(test.kind, `${out}\n${err}`);
-  if (exitCode === 0 && (count === undefined || count === 0)) {
+  if (exitCode === 0 && !hasExecutedTests(test.kind, `${out}\n${err}`, count)) {
     console.error(`ERROR test command reported zero executed tests: ${test.path}`);
     return 1;
   }
