@@ -1,7 +1,76 @@
 import { expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { commandForTest, discoverTests, ensureTestSelection, ensureTestSources, executedTestCount, testKind } from "./test_runner.ts";
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    if (process.platform !== "win32") {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        const state = stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
+        if (state === "Z") return false;
+      } catch {
+        // macOS does not expose Linux's /proc process state.
+      }
+    }
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+  if (process.platform === "win32") {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // The child may have exited before test cleanup.
+    }
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // The child may have exited before test cleanup.
+    }
+  }
+}
+
+async function waitForProcessExit(pid: number, timeoutMs = 1500): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isProcessAlive(pid)) return true;
+    await Bun.sleep(10);
+  }
+  return !isProcessAlive(pid);
+}
+
+async function waitForPath(path: string, timeoutMs = 1500): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await Bun.sleep(10);
+  }
+  return existsSync(path);
+}
+
+async function exitWithin(child: Bun.Subprocess, timeoutMs = 2000): Promise<number> {
+  const result = await Promise.race([
+    child.exited.then((code) => ({ code, timedOut: false as const })),
+    Bun.sleep(timeoutMs).then(() => ({ code: -1, timedOut: true as const })),
+  ]);
+  if (result.timedOut) {
+    signalProcessGroup(child.pid, "SIGKILL");
+    await child.exited;
+    throw new Error(`child did not exit within ${timeoutMs}ms`);
+  }
+  return result.code;
+}
 
 test("discovers maintained TS, Python, and Shell tests automatically", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-"));
@@ -231,6 +300,165 @@ test("replays shell stdout and stderr after regularizing descriptors", async () 
     expect(stderr).toBe("shell stderr\n");
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("does not wait for background descendants holding shell output FIFOs", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-background-descendant-"));
+  let child: Bun.Subprocess | undefined;
+  let descendantPid: number | undefined;
+  try {
+    const path = join(root, "test_background_descendant.sh");
+    const pidFile = join(root, "background.pid");
+    const quotedPidFile = JSON.stringify(pidFile);
+    writeFileSync(path, [
+      `sh -c 'printf "%s\\n" "$$" > ${quotedPidFile}; while :; do sleep 1; done' &`,
+      "printf 'shell stdout\\n'",
+      "printf 'shell stderr\\n' >&2",
+      "builtin test 1 -eq 1 > /dev/fd/1",
+    ].join("\n"));
+    const spawnedChild = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe", detached: true });
+    child = spawnedChild;
+    const stdout = new Response(spawnedChild.stdout).text();
+    const stderr = new Response(spawnedChild.stderr).text();
+    expect(await exitWithin(spawnedChild)).toBe(0);
+    expect(await stdout).toContain("shell stdout\n");
+    expect(await stdout).toMatch(/TESTS_RUN=\s*1\s*$/);
+    expect(await stderr).toBe("shell stderr\n");
+    expect(await waitForPath(pidFile)).toBe(true);
+    descendantPid = Number(readFileSync(pidFile, "utf8").trim());
+    expect(Number.isInteger(descendantPid)).toBe(true);
+    expect(await waitForProcessExit(descendantPid)).toBe(true);
+  } finally {
+    if (descendantPid !== undefined && isProcessAlive(descendantPid)) signalProcessGroup(descendantPid, "SIGKILL");
+    if (child !== undefined && isProcessAlive(child.pid)) signalProcessGroup(child.pid, "SIGKILL");
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("forwards SIGINT and SIGTERM to shell test process groups", async () => {
+  const cases: Array<[NodeJS.Signals, number]> = [["SIGINT", 130], ["SIGTERM", 143]];
+  for (const [signal, expectedExitCode] of cases) {
+    const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", `agent-toolkit-discovery-shell-signal-${signal.toLowerCase()}-`));
+    let child: Bun.Subprocess | undefined;
+    let sourcePid: number | undefined;
+    try {
+      const path = join(root, "test_signal.sh");
+      const pidFile = join(root, "source.pid");
+      const quotedPidFile = JSON.stringify(pidFile);
+      writeFileSync(path, [
+        `sh -c 'printf "%s\\n" "$$" > ${quotedPidFile}; while :; do sleep 1; done' &`,
+        "wait",
+      ].join("\n"));
+      const spawnedChild = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe", detached: true });
+      child = spawnedChild;
+      const stdout = new Response(spawnedChild.stdout).text();
+      const stderr = new Response(spawnedChild.stderr).text();
+      expect(await waitForPath(pidFile)).toBe(true);
+      sourcePid = Number(readFileSync(pidFile, "utf8").trim());
+      process.kill(spawnedChild.pid, signal);
+      expect(await exitWithin(spawnedChild)).toBe(expectedExitCode);
+      expect(await stdout).toBe("");
+      expect(await stderr).toBe("");
+      expect(await waitForProcessExit(sourcePid)).toBe(true);
+    } finally {
+      if (sourcePid !== undefined && isProcessAlive(sourcePid)) signalProcessGroup(sourcePid, "SIGKILL");
+      if (child !== undefined && isProcessAlive(child.pid)) signalProcessGroup(child.pid, "SIGKILL");
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("cleans shell relay processes and paths across setup failures", async () => {
+  const failureCases = [
+    { name: "first-mktemp", failMktempAt: 1, failMkfifo: false, expectedCatCount: 0 },
+    { name: "second-mktemp", failMktempAt: 2, failMkfifo: false, expectedCatCount: 0 },
+    { name: "mkfifo", failMktempAt: 0, failMkfifo: true, expectedCatCount: 0 },
+    { name: "marker-mktemp", failMktempAt: 3, failMkfifo: false, expectedCatCount: 2 },
+  ];
+  for (const failureCase of failureCases) {
+    const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", `agent-toolkit-discovery-shell-setup-${failureCase.name}-`));
+    let child: Bun.Subprocess | undefined;
+    try {
+      const tools = join(root, "tools");
+      mkdirSync(tools);
+      const stateFile = join(root, "mktemp.state");
+      const catPidFile = join(root, "cat.pids");
+      const testPath = join(root, "test_setup_failure.sh");
+      const mktempPath = join(tools, "mktemp");
+      const mkfifoPath = join(tools, "mkfifo");
+      const catPath = join(tools, "cat");
+      writeFileSync(mktempPath, [
+        "#!/usr/bin/env bash",
+        "state=\"$AGENT_TOOLKIT_MKTEMP_STATE\"",
+        "count=0",
+        "if [[ -f \"$state\" ]]; then IFS= read -r count < \"$state\"; fi",
+        "next=$((count + 1))",
+        "if [[ \"$AGENT_TOOLKIT_FAIL_MKTEMP_AT\" != 0 && \"$next\" == \"$AGENT_TOOLKIT_FAIL_MKTEMP_AT\" ]]; then",
+        "  if [[ \"$next\" == 3 ]]; then",
+        "    attempt=0",
+        "    while (( attempt < 100 )); do",
+        "      if [[ -f \"$AGENT_TOOLKIT_CAT_PID_FILE\" ]] && (( $(/usr/bin/wc -l < \"$AGENT_TOOLKIT_CAT_PID_FILE\") >= 2 )); then break; fi",
+        "      sleep 0.01",
+        "      ((attempt += 1))",
+        "    done",
+        "  fi",
+        "  exit 1",
+        "fi",
+        "printf '%s\\n' \"$next\" > \"$state\"",
+        "path=\"$AGENT_TOOLKIT_TMP_ROOT/tmp.agent-toolkit-$next\"",
+        "printf '%s\\n' \"$path\"",
+        ": > \"$path\"",
+        "",
+      ].join("\n"));
+      writeFileSync(mkfifoPath, [
+        "#!/usr/bin/env bash",
+        "if [[ \"$AGENT_TOOLKIT_FAIL_MKFIFO\" == 1 ]]; then exit 1; fi",
+        "exec /usr/bin/mkfifo \"$@\"",
+        "",
+      ].join("\n"));
+      writeFileSync(catPath, [
+        "#!/usr/bin/env bash",
+        "printf '%s\\n' \"$$\" >> \"$AGENT_TOOLKIT_CAT_PID_FILE\"",
+        "exec /bin/cat \"$@\"",
+        "",
+      ].join("\n"));
+      chmodSync(mktempPath, 0o755);
+      chmodSync(mkfifoPath, 0o755);
+      chmodSync(catPath, 0o755);
+      writeFileSync(testPath, "builtin test 1 -eq 1\\n");
+      const spawnedChild = Bun.spawn(commandForTest({ path: testPath, kind: "shell" }), {
+        cwd: root,
+        stdout: "pipe",
+        stderr: "pipe",
+        detached: true,
+        env: {
+          ...Bun.env,
+          AGENT_TOOLKIT_FAIL_MKFIFO: failureCase.failMkfifo ? "1" : "0",
+          AGENT_TOOLKIT_FAIL_MKTEMP_AT: String(failureCase.failMktempAt),
+          AGENT_TOOLKIT_CAT_PID_FILE: catPidFile,
+          AGENT_TOOLKIT_MKTEMP_STATE: stateFile,
+          AGENT_TOOLKIT_TMP_ROOT: root,
+          PATH: `${tools}:/usr/bin:/bin:/usr/sbin:/sbin`,
+          TMPDIR: root,
+        },
+      });
+      child = spawnedChild;
+      const stdout = new Response(spawnedChild.stdout).text();
+      const stderr = new Response(spawnedChild.stderr).text();
+      expect(await exitWithin(spawnedChild)).toBe(1);
+      expect(await stdout).toBe("");
+      expect(await stderr).toBe("");
+      const catPids = existsSync(catPidFile)
+        ? readFileSync(catPidFile, "utf8").trim().split(/\s+/).filter(Boolean).map(Number)
+        : [];
+      expect(catPids).toHaveLength(failureCase.expectedCatCount);
+      for (const pid of catPids) expect(await waitForProcessExit(pid)).toBe(true);
+      expect(readdirSync(root).filter((entry) => entry.startsWith("tmp.agent-toolkit-"))).toEqual([]);
+    } finally {
+      if (child !== undefined && isProcessAlive(child.pid)) signalProcessGroup(child.pid, "SIGKILL");
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
 

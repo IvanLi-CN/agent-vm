@@ -515,6 +515,65 @@ export function commandForTest(test: TestFile): string[] {
   if (test.kind === "python") return ["python3", "-c", PYTHON_TEST_RUNNER, test.path];
   const shellCommand = [
     "set -euo pipefail",
+    "set -m",
+    String.raw`
+__agent_toolkit_stdout_file=""
+__agent_toolkit_stderr_file=""
+marker_file=""
+__agent_toolkit_stdout_replay_pid=""
+__agent_toolkit_stderr_replay_pid=""
+__agent_toolkit_source_pid=""
+__agent_toolkit_cleanup_done=0
+__agent_toolkit_replay_done=0
+__agent_toolkit_signal_group() {
+  local signal="$1" pid="$2"
+  [[ -n "$pid" ]] || return 0
+  if ! builtin kill "-$signal" "-$pid" 2>/dev/null; then
+    builtin kill "-$signal" "$pid" 2>/dev/null || true
+  fi
+}
+__agent_toolkit_stop_group() {
+  local pid="$1" attempt=0
+  [[ -n "$pid" ]] || return 0
+  __agent_toolkit_signal_group TERM "$pid"
+  while (( attempt < 50 )); do
+    builtin kill -0 "-$pid" 2>/dev/null || return 0
+    sleep 0.01
+    ((attempt += 1))
+  done
+  __agent_toolkit_signal_group KILL "$pid"
+}
+__agent_toolkit_remove_path() {
+  [[ -n "$1" ]] && rm -f -- "$1"
+}
+__agent_toolkit_cleanup() {
+  local status="$?"
+  set +e
+  set +m
+  if (( __agent_toolkit_cleanup_done == 0 )); then
+    __agent_toolkit_cleanup_done=1
+    __agent_toolkit_stop_group "$__agent_toolkit_source_pid"
+    if (( __agent_toolkit_replay_done == 0 )); then
+      __agent_toolkit_stop_group "$__agent_toolkit_stdout_replay_pid"
+      __agent_toolkit_stop_group "$__agent_toolkit_stderr_replay_pid"
+    fi
+    __agent_toolkit_remove_path "$__agent_toolkit_stdout_file"
+    __agent_toolkit_remove_path "$__agent_toolkit_stderr_file"
+    __agent_toolkit_remove_path "$marker_file"
+  fi
+  exit "$status"
+}
+__agent_toolkit_forward_signal() {
+  local signal="$1" status="$2"
+  __agent_toolkit_stop_group "$__agent_toolkit_source_pid"
+  __agent_toolkit_stop_group "$__agent_toolkit_stdout_replay_pid"
+  __agent_toolkit_stop_group "$__agent_toolkit_stderr_replay_pid"
+  exit "$status"
+}
+trap '__agent_toolkit_cleanup' EXIT
+trap '__agent_toolkit_forward_signal SIGINT 130' INT
+trap '__agent_toolkit_forward_signal SIGTERM 143' TERM
+`.trim(),
     "__agent_toolkit_stdout_file=$(mktemp)",
     "__agent_toolkit_stderr_file=$(mktemp)",
     "rm -f -- \"$__agent_toolkit_stdout_file\" \"$__agent_toolkit_stderr_file\"",
@@ -526,8 +585,6 @@ export function commandForTest(test: TestFile): string[] {
     "marker_file=$(mktemp)",
     "readonly marker_file __agent_toolkit_stdout_file __agent_toolkit_stderr_file",
     "__agent_toolkit_inside_test=",
-    "__agent_toolkit_replay_done=0",
-    "trap '__agent_toolkit_exit_status=$?; set +e; if (( __agent_toolkit_replay_done == 0 )); then wait \"$__agent_toolkit_stdout_replay_pid\"; wait \"$__agent_toolkit_stderr_replay_pid\"; fi; rm -f -- \"$__agent_toolkit_stdout_file\" \"$__agent_toolkit_stderr_file\" \"$marker_file\"; exit \"$__agent_toolkit_exit_status\"' EXIT",
     "test() { local status; __agent_toolkit_inside_test=1; builtin test \"$@\"; status=$?; __agent_toolkit_inside_test=; builtin printf '.\\n' >> \"$marker_file\" || true; return \"$status\"; }",
     "readonly -f test",
     "__agent_toolkit_record_builtin_test() { builtin printf '.\\n' >> \"$marker_file\" || true; }",
@@ -791,15 +848,20 @@ __agent_toolkit_has_unusable_output_redirection() {
   return 1
 }
 `.replaceAll("\\${", "${"),
-    "readonly -f test trap __agent_toolkit_record_builtin_test __agent_toolkit_fd_is_open __agent_toolkit_fd_is_readable __agent_toolkit_read_redirection_target __agent_toolkit_resolve_redirection_value __agent_toolkit_fd_path_number __agent_toolkit_has_unquoted_input_redirection __agent_toolkit_has_unusable_output_redirection __agent_toolkit_debug_counter __agent_toolkit_install_debug_trap",
+    "readonly -f test trap __agent_toolkit_signal_group __agent_toolkit_stop_group __agent_toolkit_remove_path __agent_toolkit_cleanup __agent_toolkit_forward_signal __agent_toolkit_record_builtin_test __agent_toolkit_fd_is_open __agent_toolkit_fd_is_readable __agent_toolkit_read_redirection_target __agent_toolkit_resolve_redirection_value __agent_toolkit_fd_path_number __agent_toolkit_has_unquoted_input_redirection __agent_toolkit_has_unusable_output_redirection __agent_toolkit_debug_counter __agent_toolkit_install_debug_trap",
     "set +e",
     "(",
     "  set -euo pipefail",
     "  set -T",
+    "  set +m",
     "  __agent_toolkit_install_debug_trap \"\"",
     "  source \"$0\"",
-    ") >\"$__agent_toolkit_stdout_file\" 2>\"$__agent_toolkit_stderr_file\"",
+    ") >\"$__agent_toolkit_stdout_file\" 2>\"$__agent_toolkit_stderr_file\" &",
+    "__agent_toolkit_source_pid=$!",
+    "set +m",
+    "wait \"$__agent_toolkit_source_pid\"",
     "exit_status=$?",
+    "__agent_toolkit_stop_group \"$__agent_toolkit_source_pid\"",
     "wait \"$__agent_toolkit_stdout_replay_pid\"",
     "wait \"$__agent_toolkit_stderr_replay_pid\"",
     "__agent_toolkit_replay_done=1",
@@ -817,6 +879,26 @@ __agent_toolkit_has_unusable_output_redirection() {
   ];
 }
 
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
+  if (process.platform === "win32") {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // The child may have exited between the signal and cleanup.
+    }
+    return;
+  }
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      process.kill(pid, signal);
+    } catch {
+      // The child may have exited between the signal and cleanup.
+    }
+  }
+}
+
 async function runTest(test: TestFile): Promise<number> {
   if (!isPathInside(REPO_ROOT, test.path) || !isDirectRegularFile(test.path)) {
     console.error(`ERROR refusing to run a test outside the regular repository file boundary: ${test.path}`);
@@ -827,10 +909,27 @@ async function runTest(test: TestFile): Promise<number> {
     cwd: REPO_ROOT,
     stdout: "pipe",
     stderr: "pipe",
+    detached: true,
   });
   const stdout = new Response(child.stdout).text();
   const stderr = new Response(child.stderr).text();
-  const exitCode = await child.exited;
+  let escalationTimer: ReturnType<typeof setTimeout> | undefined;
+  const forward = (signal: NodeJS.Signals) => {
+    signalProcessGroup(child.pid, signal);
+    escalationTimer ??= setTimeout(() => signalProcessGroup(child.pid, "SIGKILL"), 1000);
+  };
+  const forwardInterrupt = () => forward("SIGINT");
+  const forwardTermination = () => forward("SIGTERM");
+  process.on("SIGINT", forwardInterrupt);
+  process.on("SIGTERM", forwardTermination);
+  let exitCode: number;
+  try {
+    exitCode = await child.exited;
+  } finally {
+    if (escalationTimer !== undefined) clearTimeout(escalationTimer);
+    process.off("SIGINT", forwardInterrupt);
+    process.off("SIGTERM", forwardTermination);
+  }
   const [out, err] = await Promise.all([stdout, stderr]);
   process.stdout.write(out);
   process.stderr.write(err);
