@@ -505,10 +505,7 @@ function bunPropertyChain(expression: ts.Expression): string[] | undefined {
   }
 }
 
-function hasBunFocusedSelection(file: string, source: string): boolean {
-  const extension = file.toLowerCase().split(".").pop();
-  const scriptKind = extension === "tsx" ? ts.ScriptKind.TSX : extension === "jsx" ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
-  const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKind);
+function bunDeclarationBindings(sourceFile: ts.SourceFile): { directNames: Set<string>; namespaceNames: Set<string> } {
   const directNames = new Set(["test", "it", "describe"]);
   const namespaceNames = new Set<string>();
   for (const statement of sourceFile.statements) {
@@ -522,16 +519,28 @@ function hasBunFocusedSelection(file: string, source: string): boolean {
       }
     }
   }
+  return { directNames, namespaceNames };
+}
+
+function bunCallIsDeclaration(expression: ts.Expression, directNames: Set<string>, namespaceNames: Set<string>): boolean {
+  const chain = bunPropertyChain(expression);
+  if (chain === undefined || chain[0] === undefined) return false;
+  if (directNames.has(chain[0])) return true;
+  return namespaceNames.has(chain[0]) && [chain[1], chain[2]].some((part) => part === "test" || part === "it" || part === "describe");
+}
+
+function hasBunFocusedSelection(file: string, source: string): boolean {
+  const extension = file.toLowerCase().split(".").pop();
+  const scriptKind = extension === "tsx" ? ts.ScriptKind.TSX : extension === "jsx" ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
+  const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKind);
+  const { directNames, namespaceNames } = bunDeclarationBindings(sourceFile);
   let focused = false;
   const visit = (node: ts.Node): void => {
     if (focused) return;
     if (ts.isCallExpression(node)) {
       const chain = bunPropertyChain(node.expression);
       if (chain?.includes("only")) {
-        const root = chain[0];
-        const namespaceCall = root !== undefined && namespaceNames.has(root) && [chain[1], chain[2]].some((part) => part === "test" || part === "it" || part === "describe");
-        const directCall = root !== undefined && directNames.has(root);
-        if (namespaceCall || directCall) {
+        if (bunCallIsDeclaration(node.expression, directNames, namespaceNames)) {
           focused = true;
           return;
         }
@@ -543,13 +552,31 @@ function hasBunFocusedSelection(file: string, source: string): boolean {
   return focused;
 }
 
+function hasBunTestDeclaration(file: string, source: string): boolean {
+  const extension = file.toLowerCase().split(".").pop();
+  const scriptKind = extension === "tsx" ? ts.ScriptKind.TSX : extension === "jsx" ? ts.ScriptKind.JSX : ts.ScriptKind.TS;
+  const sourceFile = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true, scriptKind);
+  const { directNames, namespaceNames } = bunDeclarationBindings(sourceFile);
+  let found = false;
+  const visit = (node: ts.Node): void => {
+    if (found) return;
+    if (ts.isCallExpression(node) && bunCallIsDeclaration(node.expression, directNames, namespaceNames)) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(node, visit);
+  };
+  visit(sourceFile);
+  return found;
+}
+
 export function ensureTestSources(files: TestFile[]): void {
   const invalid = files.filter((test) => {
     const source = readText(test.path);
     if (source.trim().length === 0) return true;
     if (test.kind === "bun") {
       if (hasBunFocusedSelection(test.path, source)) throw new Error(`refusing focused Bun test selection: ${test.path}`);
-      return !/\b(?:test|it|describe)(?:\s*\.\s*[A-Za-z_$][\w$]*)*\s*\(/.test(source);
+      return !hasBunTestDeclaration(test.path, source);
     }
     if (test.kind === "python") return !/\b(?:unittest\.|TestCase\b|def\s+test_|def\s+load_tests\s*\()/m.test(source);
     return false;
@@ -595,6 +622,7 @@ __agent_toolkit_replay_done=0
 __agent_toolkit_signal_group() {
   local signal="$1" pid="$2" own_group
   [[ -n "$pid" ]] || return 0
+  [[ "$pid" == "$$" ]] && return 0
   own_group="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')"
   if [[ -n "$own_group" && "$own_group" == "$pid" ]]; then
     builtin kill "-$signal" "$pid" 2>/dev/null || true
@@ -607,6 +635,7 @@ __agent_toolkit_signal_group() {
 __agent_toolkit_stop_group() {
   local pid="$1" attempt=0 own_group target
   [[ -n "$pid" ]] || return 0
+  [[ "$pid" == "$$" ]] && return 0
   own_group="$(ps -o pgid= -p "$$" 2>/dev/null | tr -d ' ')"
   target="-$pid"
   [[ -n "$own_group" && "$own_group" == "$pid" ]] && target="$pid"

@@ -242,6 +242,12 @@ test("rejects focused Bun selections without rejecting inert syntax", async () =
     expect(await runTestWithin({ path: focused, kind: "bun" })).toBe(0);
     expect(() => ensureTestSources([{ path: focused, kind: "bun" }])).toThrow("focused Bun test selection");
 
+    const aliased = join(root, "test_aliased.test.ts");
+    writeFileSync(aliased, 'import { test as scenario } from "bun:test";\nscenario("runs", () => {});\n');
+    const aliasedTest = { path: aliased, kind: "bun" as const };
+    expect(() => ensureTestSources([aliasedTest])).not.toThrow();
+    expect(await runTestWithin(aliasedTest)).toBe(0);
+
     const mixed = join(root, "test_mixed_skip.test.ts");
     writeFileSync(mixed, 'import { test } from "bun:test";\ntest("passes", () => {});\ntest.skip("skipped", () => {});\n');
     expect(() => ensureTestSources([{ path: mixed, kind: "bun" }])).not.toThrow();
