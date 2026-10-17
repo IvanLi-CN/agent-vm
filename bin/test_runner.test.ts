@@ -12,7 +12,9 @@ function isProcessAlive(pid: number): boolean {
         const state = stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3);
         if (state === "Z") return false;
       } catch {
-        // macOS does not expose Linux's /proc process state.
+        const result = Bun.spawnSync(["ps", "-o", "stat=", "-p", String(pid)], { stdout: "pipe", stderr: "pipe" });
+        const state = new TextDecoder().decode(result.stdout).trim();
+        if (result.exitCode !== 0 || state === "" || state.startsWith("Z")) return false;
       }
     }
     process.kill(pid, 0);
@@ -569,7 +571,7 @@ test("cleans shell relay processes and paths across setup failures", async () =>
         "#!/usr/bin/env bash",
         "fifo=\"${@: -1}\"",
         "printf '%s\\n' \"$$\" > \"$AGENT_TOOLKIT_CAT_PID_DIR/$(basename \"$fifo\").pid\"",
-        "if [[ -n \"$AGENT_TOOLKIT_HANDSHAKE_FIFO\" ]]; then printf 'ready\\n' > \"$AGENT_TOOLKIT_HANDSHAKE_FIFO\"; fi",
+        "if [[ -n \"$AGENT_TOOLKIT_HANDSHAKE_FIFO\" ]]; then exec 3>\"$AGENT_TOOLKIT_HANDSHAKE_FIFO\"; printf 'ready\\n' >&3; fi",
         "exec /bin/cat \"$@\"",
         "",
       ].join("\n"));
@@ -597,7 +599,7 @@ test("cleans shell relay processes and paths across setup failures", async () =>
       child = spawnedChild;
       const stdout = new Response(spawnedChild.stdout).text();
       const stderr = new Response(spawnedChild.stderr).text();
-      expect(await exitWithin(spawnedChild)).toBe(1);
+      expect(await exitWithin(spawnedChild, 5000)).toBe(1);
       expect(await stdout).toBe("");
       expect(await stderr).toBe("");
       const catPids = readdirSync(catPidDirectory)
