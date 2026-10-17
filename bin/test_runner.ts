@@ -521,7 +521,7 @@ export function commandForTest(test: TestFile): string[] {
     "marker_file=$(mktemp)",
     "readonly marker_file __agent_toolkit_stdout_file __agent_toolkit_stderr_file",
     "__agent_toolkit_inside_test=",
-    "trap '__agent_toolkit_exit_status=$?; set +e; cat -- \"$__agent_toolkit_stdout_file\" >&10; cat -- \"$__agent_toolkit_stderr_file\" >&11; rm -f -- \"$__agent_toolkit_stdout_file\" \"$__agent_toolkit_stderr_file\" \"$marker_file\"; exit \"$__agent_toolkit_exit_status\"' EXIT",
+    "trap '__agent_toolkit_exit_status=$?; set +e; exec 1>&10 2>&11; cat -- \"$__agent_toolkit_stdout_file\"; cat -- \"$__agent_toolkit_stderr_file\" >&2; rm -f -- \"$__agent_toolkit_stdout_file\" \"$__agent_toolkit_stderr_file\" \"$marker_file\"; exit \"$__agent_toolkit_exit_status\"' EXIT",
     "exec >\"$__agent_toolkit_stdout_file\" 2>\"$__agent_toolkit_stderr_file\"",
     "test() { local status; __agent_toolkit_inside_test=1; builtin test \"$@\"; status=$?; __agent_toolkit_inside_test=; builtin printf '.\\n' >> \"$marker_file\" || true; return \"$status\"; }",
     "readonly -f test",
