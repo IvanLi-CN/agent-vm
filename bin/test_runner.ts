@@ -515,10 +515,14 @@ export function commandForTest(test: TestFile): string[] {
   if (test.kind === "python") return ["python3", "-c", PYTHON_TEST_RUNNER, test.path];
   const shellCommand = [
     "set -euo pipefail",
+    "__agent_toolkit_stdout_file=$(mktemp)",
+    "__agent_toolkit_stderr_file=$(mktemp)",
+    "exec 10>&1 11>&2",
     "marker_file=$(mktemp)",
-    "readonly marker_file",
+    "readonly marker_file __agent_toolkit_stdout_file __agent_toolkit_stderr_file",
     "__agent_toolkit_inside_test=",
-    "trap 'rm -f -- \"$marker_file\"' EXIT",
+    "trap '__agent_toolkit_exit_status=$?; set +e; cat -- \"$__agent_toolkit_stdout_file\" >&10; cat -- \"$__agent_toolkit_stderr_file\" >&11; rm -f -- \"$__agent_toolkit_stdout_file\" \"$__agent_toolkit_stderr_file\" \"$marker_file\"; exit \"$__agent_toolkit_exit_status\"' EXIT",
+    "exec >\"$__agent_toolkit_stdout_file\" 2>\"$__agent_toolkit_stderr_file\"",
     "test() { local status; __agent_toolkit_inside_test=1; builtin test \"$@\"; status=$?; __agent_toolkit_inside_test=; builtin printf '.\\n' >> \"$marker_file\" || true; return \"$status\"; }",
     "readonly -f test",
     "__agent_toolkit_record_builtin_test() { builtin printf '.\\n' >> \"$marker_file\" || true; }",

@@ -217,6 +217,23 @@ test("counts redirections with resolved targets, descriptor moves, and heredocs"
   }
 });
 
+test("replays shell stdout and stderr after regularizing descriptors", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-output-replay-"));
+  try {
+    const path = join(root, "test_output_replay.sh");
+    writeFileSync(path, "printf 'shell stdout\n'\nprintf 'shell stderr\n' >&2\nbuiltin test 1 -eq 1 > /dev/fd/1\n");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(0);
+    expect(stdout).toContain("shell stdout\n");
+    expect(stdout).toMatch(/TESTS_RUN=\s*1\s*$/);
+    expect(stderr).toBe("shell stderr\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("rejects empty, split, and traversal redirection targets", async () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-invalid-targets-"));
   try {
