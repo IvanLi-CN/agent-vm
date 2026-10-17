@@ -151,6 +151,57 @@ test("requires native process ownership on POSIX and exposes the failure path", 
   expect(processOwnershipError(null)).toMatch(/Bun FFI getsid/);
 });
 
+test("rejects missing, failed, and incomplete ps process tables", () => {
+  if (process.platform === "win32") return;
+  const originalSpawnSync = Bun.spawnSync;
+  const cases = [
+    { name: "missing", result: () => { throw new Error("ps not found"); } },
+    { name: "failed", result: () => ({ exitCode: 127, stdout: new Uint8Array(), stderr: new Uint8Array() }) },
+    { name: "incomplete", result: () => ({ exitCode: 0, stdout: new TextEncoder().encode(`${process.pid + 1} 1 1 S\n`), stderr: new Uint8Array() }) },
+  ];
+  try {
+    for (const current of cases) {
+      Bun.spawnSync = ((...args: Parameters<typeof Bun.spawnSync>) => {
+        const command = args[0];
+        if (Array.isArray(command) && command[0] === "ps") return current.result() as ReturnType<typeof Bun.spawnSync>;
+        return originalSpawnSync(...args);
+      }) as typeof Bun.spawnSync;
+      expect(processOwnershipError({ getsid: () => process.pid, getpgid: () => process.pid }), current.name).toBe("POSIX process ownership requires a readable ps process table");
+    }
+  } finally {
+    Bun.spawnSync = originalSpawnSync;
+  }
+});
+
+test("rejects unavailable ps before spawning a target suite", async () => {
+  if (process.platform === "win32") return;
+  const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-toolkit-runner-ps-unavailable-"));
+  const originalSpawnSync = Bun.spawnSync;
+  const originalSpawn = Bun.spawn;
+  let targetSpawned = false;
+  try {
+    const path = join(root, "test_target_side_effect.sh");
+    const marker = join(root, "target-ran");
+    writeFileSync(path, `printf side-effect > ${shellQuote(marker)}\nbuiltin test 1 -eq 1\n`);
+    Bun.spawnSync = ((...args: Parameters<typeof Bun.spawnSync>) => {
+      const command = args[0];
+      if (Array.isArray(command) && command[0] === "ps") throw new Error("ps not found");
+      return originalSpawnSync(...args);
+    }) as typeof Bun.spawnSync;
+    Bun.spawn = ((...args: Parameters<typeof Bun.spawn>) => {
+      targetSpawned = true;
+      return originalSpawn(...args);
+    }) as typeof Bun.spawn;
+    expect(await runTestWithin({ path, kind: "shell" })).toBe(1);
+    expect(targetSpawned).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+  } finally {
+    Bun.spawnSync = originalSpawnSync;
+    Bun.spawn = originalSpawn;
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runs Python files by path so files without a main guard or with hyphens are executed", () => {
   expect(commandForTest({ path: "/repo/skills/example/tests/test_reclamation.py", kind: "python" })).toEqual([
     "python3", "-c", expect.any(String), "/repo/skills/example/tests/test_reclamation.py",
@@ -303,6 +354,22 @@ test("reports shell counts before an explicit successful exit", async () => {
     const stdout = await new Response(child.stdout).text();
     const stderr = await new Response(child.stderr).text();
     expect(await child.exited).toBe(0);
+    expect(executedTestCount("shell", `${stdout}\n${stderr}`)).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("separates TESTS_RUN from trailing shell output without a newline", async () => {
+  const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-toolkit-discovery-shell-trailing-output-"));
+  try {
+    const path = join(root, "test_trailing_output.sh");
+    writeFileSync(path, "builtin test 1 -eq 1\nprintf 'trailing output'");
+    const child = Bun.spawn(commandForTest({ path, kind: "shell" }), { cwd: root, stdout: "pipe", stderr: "pipe" });
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    expect(await child.exited).toBe(0);
+    expect(stdout).toMatch(/trailing output\nTESTS_RUN=\s*1\n/);
     expect(executedTestCount("shell", `${stdout}\n${stderr}`)).toBe(1);
   } finally {
     rmSync(root, { recursive: true, force: true });

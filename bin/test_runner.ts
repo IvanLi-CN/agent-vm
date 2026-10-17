@@ -991,7 +991,7 @@ __agent_toolkit_has_unusable_output_redirection() {
     "set -e",
     "count=$(wc -l < \"$marker_file\")",
     "if ((exit_status == 0 && count == 0)); then exit_status=1; fi",
-    "if ((exit_status == 0)); then builtin printf \"TESTS_RUN=%s\\n\" \"$count\"; fi",
+    "if ((exit_status == 0)); then builtin printf \"\\nTESTS_RUN=%s\\n\" \"$count\"; fi",
     "exit \"$exit_status\"",
   ].join("\n");
   return [
@@ -1071,8 +1071,14 @@ function nativeProcessGroupId(pid: number): number | undefined {
 }
 
 export function processOwnershipError(library: PosixProcessLibrary | null | undefined = loadPosixProcessLibrary()): string | undefined {
-  if (process.platform === "win32" || library != null) return undefined;
-  return "POSIX process ownership requires Bun FFI getsid support";
+  if (process.platform === "win32") return undefined;
+  if (library == null) return "POSIX process ownership requires Bun FFI getsid support";
+  try {
+    if (processTable().some((record) => record.pid === process.pid)) return undefined;
+  } catch {
+    // Unavailable process enumeration must be rejected before a test can spawn.
+  }
+  return "POSIX process ownership requires a readable ps process table";
 }
 
 function processTable(): ProcessRecord[] {
