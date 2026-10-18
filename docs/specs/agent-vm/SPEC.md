@@ -48,6 +48,10 @@ Recovery MUST preserve the state database and WAL/journals, operation and audit 
 
 Disk admission MUST account for the configured CT-local Incus pool filesystem, request cost, watermarks, and durable reservations without claiming a full physical reservation for every virtual disk. Control-plane state and VM data MUST be treated as separate logical failure domains; ENOSPC or I/O failure MUST preserve conservative state and refuse unsafe new admission without evicting an effective lease.
 
+### REQ-AGENT-VM-013 - Observability provenance
+
+Operational dashboards MUST distinguish CT filesystem capacity, transient image staging, physical Incus pool usage, guest rootfs allocation, and native admission state. They MUST NOT infer an authoritative native limit from an unset Incus project quota or draw a limit line for a missing or `-1` source. The dashboard contract MUST expose failure phase, image-unpack failures, admission state and scrape freshness so an ENOSPC boundary can be identified without host-manager access.
+
 ## Synchronization and retrieval
 
 The synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. It rejects submodules and unsafe names. Export streams a tar archive directly to the caller and does not create a server-side archive.
@@ -57,6 +61,7 @@ The synchronization helper transfers tracked, unignored worktree files to its ow
 - `VER-AGENT-VM-010` covers: `REQ-AGENT-VM-010` through the topology/provenance sections of [the operations runbook](OPERATIONS.md), the accepted [topology and recovery ADR](../../adr/0028-agent-vm-topology-recovery-boundary.md), and `bin/test_agent_vm_documentation.py`.
 - `VER-AGENT-VM-011` covers: `REQ-AGENT-VM-011` through the recovery procedure in [the operations runbook](OPERATIONS.md), the existing native reconciliation and operation-journal behavior tests, and `bin/test_agent_vm_documentation.py`.
 - `VER-AGENT-VM-012` covers: `REQ-AGENT-VM-012` through the sparse-disk and failure-domain sections in [the operations runbook](OPERATIONS.md), the existing capacity/reclamation tests, and `bin/test_agent_vm_documentation.py`.
+- `VER-AGENT-VM-013` covers: `REQ-AGENT-VM-013` through [the observability contract](contracts/observability.md), [the capacity and failure dashboard solution](../../solutions/agent-vm/observability-dashboard.md), and `bin/test_agent_vm_documentation.py`.
 
 ## Related ADRs
 
@@ -69,3 +74,4 @@ The synchronization helper transfers tracked, unignored worktree files to its ow
 - [CLI contract](contracts/cli.md)
 - [Reclamation design](RECLAMATION-DESIGN.md)
 - [Retention design](RETENTION-DESIGN.md)
+- [Observability contract](contracts/observability.md)

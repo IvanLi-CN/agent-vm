@@ -47,6 +47,8 @@ Generated SSH configuration uses the configured control address, leased port, ex
 
 Capacity responses identify their local filesystem scope, observed sources, allocation budgets, requested values and pressure threshold. Missing or contradictory measurements refuse new demand without stopping an effective lease. Manual cleanup is dry-run by default and rechecks ownership, generation and eligibility under object locks before deletion.
 
+The dashboard and metric authority rules are defined in the [observability contract](observability.md). Guest rootfs allocation, physical Incus pool usage, CT root/image staging capacity and native admission are separate measurements.
+
 ## Topology and recovery boundary
 
 The configured SSH control address is an entrypoint for the one-shot control process. It is not an identity for the underlying host, CT109 LXC, Incus host, storage system or rebuild authority. The public contract does not provide a host or CT rebuild command; see the [topology and recovery runbook](../OPERATIONS.md) for the evidence boundary and stop conditions.
