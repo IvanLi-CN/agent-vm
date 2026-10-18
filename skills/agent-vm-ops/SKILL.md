@@ -7,6 +7,8 @@ description: Maintain a configured native Incus Agent VM installation, image, ti
 
 Use this Skill only for an explicitly authorized infrastructure task. Daily and admin commands share the configured management access; `session_id` is ownership metadata, not a credential boundary. The CLI is described in [the command contract](../../docs/specs/agent-vm/contracts/cli.md); [SPEC](../../docs/specs/agent-vm/SPEC.md) owns lifecycle and capacity policy.
 
+For a control-plane rebuild or recovery, follow the [topology and recovery runbook](../../docs/specs/agent-vm/OPERATIONS.md). It separates the configured control entry from CT109, the Incus VM and any unverified underlying host; it does not authorize host maintenance or a guessed rebuild path.
+
 ## Inspect and maintain
 
 Begin with `agent-vm doctor`, `agent-vm admin status`, `agent-vm admin session list` and `ssh -G <configured-control-alias>`. The alias and address must come from the explicit operations configuration; daily VM SSH uses task connection information instead. Inspect exact candidate revision/checksums, component versions, native units, Incus project/pool/network/profile and CT-local filesystem capacity before mutation.

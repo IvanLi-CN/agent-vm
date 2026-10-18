@@ -47,6 +47,16 @@ Generated SSH configuration uses the configured control address, leased port, ex
 
 Capacity responses identify their local filesystem scope, observed sources, allocation budgets, requested values and pressure threshold. Missing or contradictory measurements refuse new demand without stopping an effective lease. Manual cleanup is dry-run by default and rechecks ownership, generation and eligibility under object locks before deletion.
 
+## Topology and recovery boundary
+
+The configured SSH control address is an entrypoint for the one-shot control process. It is not an identity for the underlying host, CT109 LXC, Incus host, storage system or rebuild authority. The public contract does not provide a host or CT rebuild command; see the [topology and recovery runbook](../OPERATIONS.md) for the evidence boundary and stop conditions.
+
+The control environment is the observed CT109 LXC and owns session-scoped Incus VMs inside that CT. A concrete private address, CT identifier and Incus identity are independent facts. Missing provenance, missing durable state, or an unverified native inventory blocks recovery rather than authorizing a guessed host operation or broad cleanup.
+
+During recovery, preserve the configured state database and WAL/journals, local operation journals, operation/audit records, generations, canonical configuration, protected connection material, native timer assets and Incus VM data. Restore matching client/control/unit revisions under drain, then inspect `agent-vm doctor`, `agent-vm admin status`, `agent-vm admin session list` and dry-run `agent-vm admin reconcile` before any apply. `admin reconcile --apply` is limited to confirmed ownership/generation and cleanup/rearm actions; `admin gc --apply` and destructive cleanup are not recovery shortcuts.
+
+A transport timeout or pending operation is uncertain. Retain the original operation ID, request and generation, inspect status/reconciliation, and never create a new operation ID or reset a generation to make the request fit. If the durable/native state cannot be matched, keep admission drained and stop. Run `agent-vm admin drain exit` only after health, state, generation, timer and CT-local capacity checks pass, then repeat `doctor` and `admin status`.
+
 ## Reclamation and retry behavior
 
 Reconciliation and garbage collection select only records that are expired, released or otherwise eligible under the configured policy. They re-read the record while holding the object lock, verify the session and generation, and remove only resources owned by that record. A failed stop, detach, proxy cleanup or metadata update leaves a retryable record and reports the failed phase; it does not silently mark the resource reusable. The same operation ID is safe to retry after a transport timeout, while a new operation ID is required for a new intent.

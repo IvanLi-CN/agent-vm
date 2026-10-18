@@ -2,6 +2,8 @@
 
 Install the matching client, one-shot control script and systemd assets from one checked-out Agent Toolkit revision. Record the revision and file checksums in protected operations records; do not create an installed-source fork.
 
+If the control environment must be rebuilt or recovered, preserve the state and VM data and follow the [topology and recovery runbook](../../../docs/specs/agent-vm/OPERATIONS.md) before replacing files. This deployment reference does not identify the host below CT109 or provide a host rebuild procedure.
+
 | Surface | Deployment input |
 | --- | --- |
 | Control script | `/opt/agent-vm-native/agent_vm_control.py` or an explicitly configured path |
