@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import unittest
 from pathlib import Path
-
-from spec_contract_check import check as check_spec
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +15,32 @@ CLI_CONTRACT = ROOT / "docs/specs/agent-vm/contracts/cli.md"
 ADR = ROOT / "docs/adr/0028-agent-vm-topology-recovery-boundary.md"
 OPS_SKILL = ROOT / "skills/agent-vm-ops/SKILL.md"
 DEPLOYMENT = ROOT / "skills/agent-vm-ops/references/deployment.md"
+OBSERVABILITY = ROOT / "docs/specs/agent-vm/contracts/observability.md"
+OBSERVABILITY_SOLUTION = ROOT / "docs/solutions/agent-vm/observability-dashboard.md"
+
+
+def check_spec(path: Path, root: Path) -> list[str]:
+    try:
+        result = subprocess.run(
+            [
+                "bun",
+                "run",
+                str(root / "bin/spec_contract_check.ts"),
+                "--path",
+                str(path),
+                "--repo-root",
+                str(root),
+            ],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        return [str(error)]
+    if result.returncode == 0:
+        return []
+    return [line for line in (result.stdout + result.stderr).splitlines() if line]
 
 
 class AgentVmDocumentationTests(unittest.TestCase):
@@ -78,6 +103,29 @@ class AgentVmDocumentationTests(unittest.TestCase):
         for document in (spec, cli_contract, adr, ops_skill, deployment):
             self.assertNotRegex(document, re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+"))
             self.assertNotRegex(document, re.compile(r"\b(?:10|172|192\.168)\.\d+\.\d+\.\d+\b"))
+
+    def test_observability_contract_separates_capacity_layers(self) -> None:
+        contract = OBSERVABILITY.read_text(encoding="utf-8")
+        solution = OBSERVABILITY_SOLUTION.read_text(encoding="utf-8")
+        for phrase in (
+            "incus_storage_pool_size_bytes",
+            "agent_vm_admission_limit",
+            "agent_vm_filesystem_available_bytes",
+            "incus_project_limit",
+            "refresh: \"auto\"",
+            "next VM",
+            "horizontal dashed line",
+            "image-unpack failures",
+            "must not multiply a `pps` query by `8`",
+            "provisioning source",
+            "grafana/dashboards/incus/incus-agent-vm.json",
+            "grafana/provisioning/dashboards/incus.yml",
+        ):
+            self.assertIn(phrase, contract)
+        self.assertIn("32 GiB", solution)
+        self.assertIn("64 GiB", solution)
+        self.assertIn("2x", solution)
+        self.assertIn("observability contract", solution)
 
 
 if __name__ == "__main__":
