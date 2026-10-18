@@ -1,10 +1,12 @@
 # Native Incus Agent VM
 
-## Scope
+## Context and Scope
 
 This topic defines a one-shot client and control process for session-owned Linux VMs on a configured Incus host. The public repository documents the lifecycle contract and ships the implementation; deployments provide their own project, image, network, address pool, storage path, state database and control address through explicit configuration.
 
 The design intentionally excludes resident brokers, HTTP APIs, polling loops, implicit keepalives, shared host workspaces, exported archives and guarantees that survive lease expiry.
+
+The deployment topology is layered: the local Codex client reaches a configured Agent VM control endpoint; the control environment runs inside the observed CT109 LXC; the control environment owns session-scoped Incus VMs; and the physical or virtual source below CT109 is outside the verified public boundary. A control endpoint is an entry path, not evidence of the underlying host or its rebuild authority. The concrete address and live inventory remain in protected deployment records.
 
 ## Session and transport
 
@@ -32,9 +34,35 @@ Disk changes require an explicit restart allowance and grow only. Memory-only li
 
 Manual garbage collection is dry-run by default and selects only stopped managed caches with no effective lease and confirmed access cleanup. The age timer and capacity admission may use different bounded selection policies, but neither can delete a valid lease, transition, resize target or unknown resource. Infrastructure operations require a separate explicit authorization and use the same configured paths and identity checks.
 
+## Requirements
+
+### REQ-AGENT-VM-010 - Layered provenance
+
+The public contract MUST distinguish the Codex client, configured control endpoint, CT109 LXC, Incus VM, and unknown underlying hosting source. It MUST NOT turn a configured address, CT identifier, or Incus identity into a claim about the next lower layer, and it MUST keep private deployment addresses and inventories outside the repository.
+
+### REQ-AGENT-VM-011 - Rebuild and recovery fencing
+
+Recovery MUST preserve the state database and WAL/journals, operation and audit records, generations, configuration, protected recovery copies, native timer assets, and Incus VM data. It MUST restore matching components under drain, reconcile durable records against native ownership and generations, and keep admission closed when state, provenance, capacity, or native identity is missing or inconsistent. It MUST NOT invent operation IDs, reset generations, replay uncertain native effects, or perform broad cleanup.
+
+### REQ-AGENT-VM-012 - Sparse disk failure boundary
+
+Disk admission MUST account for the configured CT-local Incus pool filesystem, request cost, watermarks, and durable reservations without claiming a full physical reservation for every virtual disk. Control-plane state and VM data MUST be treated as separate logical failure domains; ENOSPC or I/O failure MUST preserve conservative state and refuse unsafe new admission without evicting an effective lease.
+
 ## Synchronization and retrieval
 
 The synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. It rejects submodules and unsafe names. Export streams a tar archive directly to the caller and does not create a server-side archive.
+
+## Verification
+
+- `VER-AGENT-VM-010` covers: `REQ-AGENT-VM-010` through the topology/provenance sections of [the operations runbook](OPERATIONS.md), the accepted [topology and recovery ADR](../../adr/0028-agent-vm-topology-recovery-boundary.md), and `bin/test_agent_vm_documentation.py`.
+- `VER-AGENT-VM-011` covers: `REQ-AGENT-VM-011` through the recovery procedure in [the operations runbook](OPERATIONS.md), the existing native reconciliation and operation-journal behavior tests, and `bin/test_agent_vm_documentation.py`.
+- `VER-AGENT-VM-012` covers: `REQ-AGENT-VM-012` through the sparse-disk and failure-domain sections in [the operations runbook](OPERATIONS.md), the existing capacity/reclamation tests, and `bin/test_agent_vm_documentation.py`.
+
+## Related ADRs
+
+- [Native Incus Agent VM lifecycle](../../adr/0025-native-incus-agent-vm-lifecycle.md)
+- [Agent VM CPU and memory overselling](../../adr/0026-agent-vm-cpu-memory-overselling.md)
+- [Agent VM topology and recovery boundary](../../adr/0028-agent-vm-topology-recovery-boundary.md)
 
 ## Related material
 
