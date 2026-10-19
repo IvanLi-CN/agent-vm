@@ -389,6 +389,8 @@ def build_parser() -> argparse.ArgumentParser:
     admin_sub = admin.add_subparsers(dest="admin_command", required=True)
     admin_status = admin_sub.add_parser("status")
     add_session_option(admin_status, suppress_default=True)
+    admin_metrics = admin_sub.add_parser("metrics")
+    add_session_option(admin_metrics, suppress_default=True)
     admin_session = admin_sub.add_parser("session")
     add_session_option(admin_session, suppress_default=True)
     session_sub = admin_session.add_subparsers(dest="session_command", required=True)
@@ -565,7 +567,13 @@ def command_port(args: argparse.Namespace) -> int:
 
 
 def command_admin(args: argparse.Namespace) -> int:
-    session = session_id(args.session_id)
+    if args.admin_command == "metrics":
+        if args.session_id is not None:
+            fail("invalid_request", "admin metrics does not accept --session-id")
+        response = control_request("admin-metrics", session=None)
+        json_output(response)
+        return 0
+    session = session_id(args.session_id, required=True)
     if args.admin_command == "status":
         response = control_request("admin-status", session=session)
     elif args.admin_command == "session":

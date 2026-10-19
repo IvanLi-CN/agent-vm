@@ -247,6 +247,7 @@ class InstanceAdmissionTests(Fixture):
         request = self.request("admin-gc", operation="gc-once", apply=True)
         self.control.dispatch(request)
         self.acquire("cache"); self.call("release", "cache")
-        replay = self.control.dispatch(request)
-        self.assertEqual(replay["outcome"], "replayed")
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.control.dispatch(request)
+        self.assertEqual(failure.exception.code, "operation_unverified")
         self.assertEqual(len(self.runner.instances), 1)

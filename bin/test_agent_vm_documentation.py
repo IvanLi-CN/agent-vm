@@ -109,7 +109,7 @@ class AgentVmDocumentationTests(unittest.TestCase):
         solution = OBSERVABILITY_SOLUTION.read_text(encoding="utf-8")
         for phrase in (
             "incus_storage_pool_size_bytes",
-            "agent_vm_admission_limit",
+            "agent_vm_admission_memory_limit_bytes",
             "agent_vm_filesystem_available_bytes",
             "incus_project_limit",
             "refresh: \"auto\"",

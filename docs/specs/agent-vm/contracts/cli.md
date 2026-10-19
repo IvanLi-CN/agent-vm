@@ -27,15 +27,18 @@ The control endpoint is selected from `AGENT_VM_CONTROL_HOST` and `AGENT_VM_REMO
 | `port add NAME --guest-port N [--protocol tcp\|udp] [--host-port N]` | Create an exact native proxy mapping. |
 | `port list` / `port remove NAME` | Inspect or remove an exact mapping. |
 | `admin status` | Read-only native component and maintenance status. |
+| `admin metrics` | Read-only controller metrics snapshot for authorized scrape bridges; it includes resource allocation, CT memory, disk capacity/admission, task, warning and failure summaries; it does not create a session or mutate state. |
 | `admin drain enter\|status\|exit` | Control admission while allowing safe retrieval and release. |
 | `admin session list` | List managed session records. |
 | `admin reconcile [--apply]` / `admin gc [--apply]` | Preview by default; apply only inside an authorized operations task. |
+
+The `admin-metrics` result has stable top-level fields: `observed_at` (ISO-8601 string), `up`, `draining` and `admission_ready` (booleans), `reclaim_required` (boolean or `null` when disk capacity is unverified), `resources`, `capacity`, `disk_admission`, `ct_memory`, `instances`, `task_states`, `operations`, `pending_operations`, `image_unpack_failures`, `warnings`, `warning_counts` and `doctor`. `resources` contains `allocated`, `reserved`, `allocated_and_reserved`, `remaining`, `limits`, `ct_capacity`, `memory` and `memory_pressure`; `ct_memory` contains CT-local `capacity_bytes`, `current_bytes`, `available_bytes`, `pressure_threshold_bytes`, `pressure` and `oom_events`. `pending_operations` is a list of `{operation_id, action, session_id, generation, created_at}` records and distinguishes an uncertain journal from no recent operation. Unverified numeric or boolean observations are `null` or omitted according to the field contract; they are never converted to a healthy zero or false value.
 
 Unknown flags and command layouts must be rejected; callers should use `--help` for the installed build.
 
 ## Request and response
 
-Requests contain `protocol`, `action`, `session_id`, and mutation fields `generation` and `operation_id`. Success envelopes contain `ok`, `protocol`, `server_time`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`. Error diagnostics are JSON on stderr with a nonzero exit status. A transport timeout reports the operation ID without claiming whether the mutation completed.
+Session-scoped requests contain `protocol`, `action` and `session_id`; the sessionless read-only `admin-metrics` request omits `session_id` and `operation_id`. Mutations also contain `generation` and `operation_id`. Success envelopes contain `ok`, `protocol`, `server_time`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`. Error diagnostics are JSON on stderr with a nonzero exit status. A transport timeout reports the operation ID without claiming whether the mutation completed. A state-database failure reports `sqlite_unavailable` with `phase`, SQLite code/name, SQL operation category and `state_committed`; `null` means a commit result is unknown and the original operation remains subject to status/reconciliation.
 
 Acquire, restart and restart-capable resize use a longer bounded transport timeout. No command implicitly renews a lease. Retry an uncertain mutation only with the original operation ID and generation after inspecting status or reconciliation.
 
@@ -45,7 +48,7 @@ Generated SSH configuration uses the configured control address, leased port, ex
 
 ## Capacity and cleanup
 
-Capacity responses identify their local filesystem scope, observed sources, allocation budgets, requested values and pressure threshold. Missing or contradictory measurements refuse new demand without stopping an effective lease. Manual cleanup is dry-run by default and rechecks ownership, generation and eligibility under object locks before deletion.
+Capacity responses identify their local filesystem scope, observed sources, allocation budgets, allocated and reserved values, logical remaining values and pressure observations. Missing or contradictory capacity measurements refuse new demand without stopping an effective lease. Under reservation-only memory admission, low CT `MemAvailable` is reported as pressure but does not reject a request within the logical memory ceiling. Manual cleanup is dry-run by default and rechecks ownership, generation and eligibility under object locks before deletion.
 
 The dashboard and metric authority rules are defined in the [observability contract](observability.md). Guest rootfs allocation, physical Incus pool usage, CT root/image staging capacity and native admission are separate measurements.
 
@@ -55,7 +58,7 @@ The configured SSH control address is an entrypoint for the one-shot control pro
 
 The control environment is the observed CT109 LXC and owns session-scoped Incus VMs inside that CT. A concrete private address, CT identifier and Incus identity are independent facts. Missing provenance, missing durable state, or an unverified native inventory blocks recovery rather than authorizing a guessed host operation or broad cleanup.
 
-During recovery, preserve the configured state database and WAL/journals, local operation journals, operation/audit records, generations, canonical configuration, protected connection material, native timer assets and Incus VM data. Restore matching client/control/unit revisions under drain, then inspect `agent-vm doctor`, `agent-vm admin status`, `agent-vm admin session list` and dry-run `agent-vm admin reconcile` before any apply. `admin reconcile --apply` is limited to confirmed ownership/generation and cleanup/rearm actions; `admin gc --apply` and destructive cleanup are not recovery shortcuts.
+During recovery, preserve the configured state database and WAL/journals, local operation journals, operation/audit records, generations, canonical configuration, protected connection material, native timer assets and Incus VM data. Restore matching client/control/unit revisions under drain, then inspect `agent-vm doctor`, `agent-vm admin status`, `agent-vm admin session list` and dry-run `agent-vm admin reconcile` before any apply. `admin reconcile --apply` is limited to confirmed ownership/generation and cleanup/rearm actions, plus repairing malformed or inconsistent nonzero resource/reservation records for an `absent` task after native instance and port absence are confirmed; `admin gc --apply` and destructive cleanup are not recovery shortcuts.
 
 A transport timeout or pending operation is uncertain. Retain the original operation ID, request and generation, inspect status/reconciliation, and never create a new operation ID or reset a generation to make the request fit. If the durable/native state cannot be matched, keep admission drained and stop. Run `agent-vm admin drain exit` only after health, state, generation, timer and CT-local capacity checks pass, then repeat `doctor` and `admin status`.
 
@@ -67,10 +70,10 @@ Acquire and restart are bounded operations that may return an uncertain outcome 
 
 ## Resource and live-memory rules
 
-CPU, memory and disk requests are parsed into canonical units before admission. Admission accounts for configured budgets, overcommit ratios, observed host pressure and all effective reservations. A request is rejected when measurements are missing or contradictory, or when the requested value exceeds the configured policy; an existing effective lease remains available for retrieval and release.
+CPU, memory and disk requests are parsed into canonical units before admission. Admission accounts for configured budgets, overcommit ratios and all effective reservations. A request is rejected when capacity measurements are missing or contradictory, when the requested value exceeds the configured logical policy, when disk admission fails, or while draining; memory pressure is reported separately and does not alter logical remaining memory. An existing effective lease remains available for retrieval and release.
 
 `resize --live` is limited to a supported memory-only change. CPU, disk and unsupported live changes fail without falling back to a restart. `--allow-restart` is required for restart-capable changes and uses the longer bounded timeout. A live resize records the requested and observed values in the response so callers can distinguish a pending reconciliation from a completed change.
 
 ## Output and admission
 
-Human-readable status is for operators; automation consumes the JSON envelope and checks `protocol`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`. Diagnostics are written to stderr and never mixed into an archive stream from `export`. Admission drain blocks new acquisition and restart work while permitting status, retrieval and release, and exits only after the control process has durably recorded the new admission state.
+Human-readable status is for operators; automation consumes the JSON envelope and checks `protocol`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`. Diagnostics are written to stderr and never mixed into an archive stream from `export`. Admission drain blocks new acquisition and restart admission while permitting status, retrieval and release, and exits only after the control process has durably recorded the new admission state. A restart that has crossed the short admission fence before drain may finish; the native stop/start work does not hold the global admission lock.

@@ -23,7 +23,7 @@ Disk admission is intentionally sparse and oversold: it measures the configured 
 ## Consequences
 
 - Operators have an executable recovery boundary without a speculative PVE, hypervisor, CT-host, or storage procedure.
-- The existing `admin status`, `admin session list`, `admin reconcile`, and drain commands remain the only public control surfaces for reconciliation and admission; no new deployment tool or host inventory is added.
+- The existing `admin status`, `admin metrics`, `admin session list`, `admin reconcile`, and drain commands remain the public control surfaces for reconciliation, read-only observation and admission; no new deployment tool or host inventory is added.
 - A deployment that lacks authoritative CT/rebuild provenance or durable state cannot be declared recovered. The correct handoff is an explicit blocker with the evidence required to continue.
 - Public documentation can describe verified roles and failure handling without publishing a private address, personal path, credential, or live production inventory.
 
@@ -32,4 +32,4 @@ Disk admission is intentionally sparse and oversold: it measures the configured 
 - [Native Incus Agent VM specification](../specs/agent-vm/SPEC.md)
 - [Agent VM topology and recovery runbook](../specs/agent-vm/OPERATIONS.md)
 - [Native Incus Agent VM lifecycle](0025-native-incus-agent-vm-lifecycle.md)
-- [Agent VM CPU and memory overselling](0026-agent-vm-cpu-memory-overselling.md)
+- [Agent VM memory reservation-only admission](0029-agent-vm-memory-reservation-only-admission.md)

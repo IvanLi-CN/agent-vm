@@ -11,6 +11,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -68,11 +69,14 @@ class NativeCommands(CONTROL.CommandRunner):
         self.forwards = []
         self.failure = None
         self.on_start = None
+        self.on_version = None
+        self.on_list_instances = None
         self.image_available = True
         self.image_type = "virtual-machine"
         self.on_wait = None
         self.proxy_allowed = True
         self.project_limits = {}
+        self.storage_source = None
         self.on_config_set = None
 
     def run(self, argv, *, input_data=None, timeout=30, check=True):
@@ -82,7 +86,9 @@ class NativeCommands(CONTROL.CommandRunner):
             raise CONTROL.ControlError("command_failed", "injected native failure")
         body = b""
         if args[0] in {"conntrack", "ss", "systemctl"}: pass
-        elif args[:2] == ["incus", "version"]: body = b"7.5.1"
+        elif args[:2] == ["incus", "version"]:
+            if self.on_version: self.on_version()
+            body = b"7.5.1"
         elif args[:3] == ["incus", "--project", "agents"] or args[:2] == ["incus", "query"]:
             command = args[1:] if args[1] == "query" else args[3:]
             verb = command[0]
@@ -93,6 +99,8 @@ class NativeCommands(CONTROL.CommandRunner):
                 project = parse_qs(urlparse(command[1]).query).get("project", ["agents"])[0]
                 if path == "/1.0/projects": value = [{"name": "agents"}, {"name": "default"}]
                 elif path == "/1.0/projects/agents": value = {"config": {**self.project_limits, "restricted.devices.proxy": "allow" if self.proxy_allowed else "block"}}
+                elif path == "/1.0/storage-pools/agents": value = {"name": "agents", "driver": "dir",
+                                                                       "config": {"source": self.storage_source}}
                 elif path == "/1.0/network-acls/agent-vm-isolation": value = json.loads((ROOT / "skills/agent-vm-ops/assets/network-acl.json").read_text())
                 elif path.startswith("/1.0/images/"):
                     if not self.image_available:
@@ -109,7 +117,9 @@ class NativeCommands(CONTROL.CommandRunner):
                     value = {"status": item["status"], "network": {"eth0": {"addresses": [{"family": "inet", "address": item["expanded_devices"]["eth0"].get("ipv4.address")} ]}}} if path.endswith("/state") else item
                 else: raise AssertionError(path)
                 body = json.dumps(value).encode()
-            elif verb == "list": body = json.dumps(list(self.instances.values())).encode()
+            elif verb == "list":
+                if self.on_list_instances: self.on_list_instances()
+                body = json.dumps(list(self.instances.values())).encode()
             elif verb == "init":
                 image, name = command[1:3]
                 if name in self.instances: raise AssertionError("duplicate init")
@@ -213,6 +223,71 @@ class NativeTimerTests(unittest.TestCase):
                 self.assertIs(error.exception, self.failure)
                 self.assertEqual(self.runner.run.call_count, 2)
 
+    def test_expiry_active_requires_the_timer_to_target_its_service(self):
+        expires_at = "2026-10-04T12:34:56+00:00"
+        path = self.root / self.unit
+        content = (
+            "[Timer]\n"
+            "OnCalendar=2026-10-04 12:34:56 UTC\n"
+            "Persistent=yes\n"
+            f"Unit=agent-vm-native-expire@{self.systemd.instance_name(self.task, 1)}.service\n"
+        )
+        path.write_text(content)
+        self.runner.run.return_value = subprocess.CompletedProcess(
+            [], 0,
+            f"ActiveState=active\nFragmentPath={path}\nUnitFileState=enabled\n".encode(),
+            b"",
+        )
+        self.assertTrue(self.systemd.expiry_active(self.task, 1, expires_at))
+        path.write_text(content.replace("Unit=agent-vm-native-expire@", "Unit=other-service@"))
+        self.assertFalse(self.systemd.expiry_active(self.task, 1, expires_at))
+
+    def test_service_asset_requires_loaded_fragment_and_exec_contract(self):
+        unit = "agent-vm-native-reconcile.service"
+        path = self.root / unit
+        path.write_text(
+            "[Service]\n"
+            "ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile\n"
+        )
+        self.runner.run.return_value = subprocess.CompletedProcess(
+            [], 0, f"LoadState=loaded\nFragmentPath={path}\n".encode(), b""
+        )
+        self.assertTrue(self.systemd.service_asset_active(
+            unit,
+            ("ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile",),
+        ))
+        path.write_text("[Service]\n")
+        self.assertFalse(self.systemd.service_asset_active(
+            unit,
+            ("ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile",),
+        ))
+
+    def test_service_asset_validates_template_with_systemd_cat(self):
+        unit = "agent-vm-native-expire@.service"
+        path = self.root / unit
+        required = "ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-expire %i"
+        path.write_text(f"[Service]\n{required}\n")
+        self.runner.run.return_value = subprocess.CompletedProcess(
+            [], 0, f"# {path}\n[Service]\n{required}\n".encode(), b""
+        )
+        self.assertTrue(self.systemd.service_asset_active(unit, (required,)))
+
+    def test_enabled_unit_active_requires_active_enabled_unit(self):
+        self.runner.run.return_value = subprocess.CompletedProcess(
+            [], 0, b"ActiveState=active\nUnitFileState=disabled\n", b""
+        )
+        self.assertFalse(self.systemd.enabled_unit_active("agent-vm-native-reconcile.service"))
+        self.runner.run.return_value = subprocess.CompletedProcess(
+            [], 0, b"ActiveState=active\nUnitFileState=enabled\n", b""
+        )
+        self.assertTrue(self.systemd.enabled_unit_active("agent-vm-native-reconcile.service"))
+
+    def test_enabled_service_ready_accepts_completed_oneshot_service(self):
+        self.runner.run.return_value = subprocess.CompletedProcess(
+            [], 0, b"LoadState=loaded\nUnitFileState=enabled\n", b""
+        )
+        self.assertTrue(self.systemd.enabled_service_ready("agent-vm-native-reconcile.service"))
+
 
 class Fixture(unittest.TestCase):
     def setUp(self):
@@ -229,6 +304,7 @@ class Fixture(unittest.TestCase):
                        "cpu_budget": 4, "memory_budget_mib": 16384, "required_guest_tools": ["python3", "sshd", "rsync", "docker"],
                        "state_db": str(self.root / "state.sqlite3"), "timer_dir": str(self.root / "systemd")}
         self.runner = NativeCommands()
+        self.runner.storage_source = self.config["storage_path"]
         self.store = CONTROL.StateStore(Path(self.config["state_db"]))
         self.addCleanup(self.store.close)
         self.systemd = CONTROL.SystemdManager(self.runner, self.config, enabled=False)
@@ -253,7 +329,9 @@ class Fixture(unittest.TestCase):
     def request(self, action, session="thread-a", operation=None, **fields):
         self.counter += 1
         task = self.store.get_task(session_id=session)
-        value = {"protocol": CONTROL.PROTOCOL_VERSION, "action": action, "session_id": session}
+        value = {"protocol": CONTROL.PROTOCOL_VERSION, "action": action}
+        if action != "admin-metrics":
+            value["session_id"] = session
         if action == "port-list": value["generation"] = task["generation"]
         if action in self.control.WRITE_ACTIONS:
             value.update(operation_id=operation or f"op-{self.counter}", generation=task["generation"] if task else 0)
@@ -539,6 +617,50 @@ class LifecycleTests(Fixture):
 
         self.assertEqual(failure.exception.code, "task_not_active")
 
+    def test_restart_serializes_drain_with_native_stop_start(self):
+        self.acquire()
+        attempted = threading.Event()
+        drained = threading.Event()
+        events = []
+
+        def enter_drain():
+            attempted.set()
+            self.control.dispatch({
+                "protocol": CONTROL.PROTOCOL_VERSION,
+                "action": "drain-enter",
+                "generation": 0,
+                "operation_id": "restart-drain-race",
+            })
+            events.append("drain")
+            drained.set()
+
+        original_stop = self.control._stop_instance
+        original_start = self.control._start_instance
+
+        def stop(task):
+            events.append("stop")
+            thread = threading.Thread(target=enter_drain)
+            thread.start()
+            self.assertTrue(attempted.wait(1))
+            thread.join(1)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(drained.is_set())
+            original_stop(task)
+            self._drain_thread = thread
+
+        def start(task):
+            events.append("start")
+            original_start(task)
+
+        with mock.patch.object(self.control, "_stop_instance", side_effect=stop), \
+             mock.patch.object(self.control, "_start_instance", side_effect=start):
+            self.call("restart")
+
+        self._drain_thread.join(1)
+        self.assertTrue(drained.is_set())
+        self.assertLess(events.index("drain"), events.index("start"))
+        self.call("drain-exit")
+
     def test_readiness_wait_cannot_extend_or_outlive_lease(self):
         def expire(name, condition):
             self.now += dt.timedelta(minutes=31)
@@ -584,6 +706,36 @@ class LifecycleTests(Fixture):
         with mock.patch.object(self.control.incus, 'query', side_effect=drift):
             self.error('network_unverified', self.acquire)
         self.assertEqual(self.runner.instances, {})
+
+    def test_malformed_isolation_acl_is_structured(self):
+        query = self.control.incus.query
+
+        def malformed(path, **kwargs):
+            value = query(path, **kwargs)
+            if path.startswith('/1.0/network-acls/'):
+                value['egress'] = ["malformed"]
+            return value
+
+        with mock.patch.object(self.control.incus, 'query', side_effect=malformed):
+            self.error('network_unverified', self.acquire)
+        self.assertEqual(self.runner.instances, {})
+
+    def test_malformed_native_device_inventory_is_structured(self):
+        active = self.acquire()
+        self.runner.instances[active["instance_name"]]["devices"]["eth0"] = "malformed"
+        task = self.store.get_task(task_id=active["task_id"])
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.control._ownership(task)
+        self.assertEqual(failure.exception.code, "ownership_mismatch")
+
+    def test_malformed_native_proxy_listen_is_structured(self):
+        self.runner.proxy_inventory = [{
+            "name": "foreign-proxy",
+            "expanded_devices": {"proxy": {"type": "proxy", "listen": 20001}},
+        }]
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.control._native_ports()
+        self.assertEqual(failure.exception.code, "port_inventory_unverified")
 
     def test_early_old_timer_rearms_recorded_deadline(self):
         first = self.acquire()
@@ -711,6 +863,24 @@ class LifecycleTests(Fixture):
         self.control.dispatch({"protocol": CONTROL.PROTOCOL_VERSION, "action": "timer-expire", "task_id": first["task_id"], "generation": 1})
         self.assertEqual(self.call("status")["state"], "cached")
 
+    def test_stale_expiry_error_cannot_overwrite_new_generation(self):
+        first = self.acquire()
+        task = self.store.get_task(task_id=first["task_id"])
+        self.now = CONTROL.parse_time(first["lease_expires_at"])
+
+        def switch_generation_then_fail(_task):
+            self.store.update_task(task["task_id"], generation=2, state="active",
+                                   lease_expires_at=CONTROL.iso_time(self.now + dt.timedelta(minutes=10)),
+                                   last_error=None)
+            raise CONTROL.ControlError("cleanup_failed", "stale cleanup failure")
+
+        with mock.patch.object(self.control, "_cleanup_task", side_effect=switch_generation_then_fail):
+            self.control._expire_preempt({"task_id": task["task_id"], "generation": task["generation"]})
+        latest = self.store.get_task(task_id=task["task_id"])
+        self.assertEqual(latest["generation"], 2)
+        self.assertEqual(latest["state"], "active")
+        self.assertIsNone(latest["last_error"])
+
     def test_cleanup_does_not_stop_after_durable_generation_changes(self):
         first = self.acquire()
         task = self.store.get_task(task_id=first["task_id"])
@@ -774,8 +944,8 @@ class LifecycleTests(Fixture):
 
     def test_port_range_inventory_and_exact_collision(self):
         self.acquire()
-        self.runner.proxy_inventory = [{"expanded_devices": {"proxy": {"type": "proxy", "listen": "tcp:0.0.0.0:20001-20003"}}}]
-        self.runner.forwards = [{"ports": [{"listen_port": "20004,20005-20006"}]}]
+        self.runner.proxy_inventory = [{"name": "foreign-proxy", "expanded_devices": {"proxy": {"type": "proxy", "listen": "tcp:0.0.0.0:20001-20003"}}}]
+        self.runner.forwards = [{"config": {}, "ports": [{"listen_port": "20004,20005-20006"}]}]
         mapping = self.call("port-add", name="web", vm_port=8080)
         self.assertEqual(mapping["host_port"], 20007)
         self.error("port_busy", self.call, "port-add", name="other", vm_port=9000, host_port=20002)
@@ -1005,6 +1175,22 @@ class IncusWaitTests(unittest.TestCase):
         )
         self.runner.run.assert_not_called()
 
+    def test_instance_list_rejects_malformed_entries(self):
+        for body in (b"[null]", b"[{}]", b'[{"name":""}]'):
+            with self.subTest(body=body):
+                self.runner.run.return_value = subprocess.CompletedProcess([], 0, body, b"")
+                with self.assertRaises(CONTROL.ControlError) as failure:
+                    self.client.list_instances()
+                self.assertEqual(failure.exception.code, "incus_invalid_output")
+
+    def test_instance_info_rejects_malformed_status(self):
+        for body in (b"{}", b'{"status":null}', b'{"status":7}'):
+            with self.subTest(body=body):
+                self.runner.run.return_value = subprocess.CompletedProcess([], 0, body, b"")
+                with self.assertRaises(CONTROL.ControlError) as failure:
+                    self.client.instance_info("vm")
+                self.assertEqual(failure.exception.code, "incus_invalid_output")
+
 
 class ReclaimTests(Fixture):
     def test_manual_gc_previews_and_deletes_all_eligible_caches(self):
@@ -1039,7 +1225,7 @@ class ReclaimTests(Fixture):
 
     def test_capacity_metrics_and_ram_limits_fail_closed(self):
         with mock.patch.object(CONTROL.shutil, "disk_usage", side_effect=OSError("unavailable CT path")):
-            self.error("capacity_unverified", self.acquire)
+            self.error("resource_unverified", self.acquire)
         self.assertEqual(self.runner.instances, {})
         self.config["cpu_overcommit_ratio"] = 1
         self.acquire("one"); self.acquire("two")
@@ -1051,18 +1237,37 @@ class ReclaimTests(Fixture):
             with self.subTest(total=total, free=free), mock.patch.object(
                 CONTROL.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(total, total-free, free)
             ):
-                self.error("capacity_unverified", self.acquire)
+                self.error("resource_unverified", self.acquire)
         self.assertEqual(self.runner.instances, {})
 
     def test_capacity_measures_only_ct_pool_and_invokes_no_commands(self):
         with mock.patch.object(CONTROL.shutil, "disk_usage", return_value=shutil._ntuple_diskusage(100*GIB, 20*GIB, 80*GIB)) as measure:
             facts = self.control._ensure_capacity_verified()
         measure.assert_called_once_with(self.config["storage_path"])
-        self.assertEqual(self.runner.calls, [])
+        self.assertTrue(any(args[:2] == ["incus", "query"] and "/1.0/storage-pools/agents" in args[2]
+                            for args, _, _ in self.runner.calls))
         self.assertEqual(facts["scope"], "ct-filesystem")
         self.assertEqual(len(facts["layers"]), 1)
         self.assertEqual(facts["layers"][0]["free"], 80*GIB)
         self.assertEqual(self.acquire()["state"], "active")
+
+    def test_capacity_rejects_incus_pool_source_drift(self):
+        self.runner.storage_source = str(self.root / "different-pool")
+        with mock.patch.object(CONTROL.shutil, "disk_usage") as measure:
+            self.error("resource_unverified", self.control._ensure_capacity_verified)
+        measure.assert_not_called()
+
+    def test_capacity_rejects_non_directory_incus_pool(self):
+        original = self.runner.run
+
+        def non_dir(args, **kwargs):
+            result = original(args, **kwargs)
+            if args[:2] == ["incus", "query"] and "/1.0/storage-pools/agents" in args[2]:
+                result.stdout = json.dumps({"name": "agents", "driver": "lvm", "config": {"source": ""}}).encode()
+            return result
+
+        with mock.patch.object(self.runner, "run", side_effect=non_dir):
+            self.error("resource_unverified", self.control._ensure_capacity_verified)
 
     def test_config_rejects_removed_external_probe_field(self):
         path = self.root / "legacy-config.json"
@@ -1099,6 +1304,22 @@ class ReclaimTests(Fixture):
 
 
 class NativeCliTests(unittest.TestCase):
+    def test_admin_metrics_is_read_only_and_does_not_require_a_session(self):
+        args = CLI.build_parser().parse_args(["admin", "metrics"])
+        for environment in ({}, {"AGENT_VM_SESSION_ID": "inherited-session"}):
+            with self.subTest(environment=environment), \
+                 mock.patch.dict(os.environ, environment, clear=False), \
+                 mock.patch.object(CLI, "control_request", return_value={}) as request, \
+                 mock.patch.object(CLI, "json_output"):
+                self.assertEqual(CLI.command_admin(args), 0)
+            request.assert_called_once_with("admin-metrics", session=None)
+
+    def test_admin_metrics_rejects_explicit_session(self):
+        args = CLI.build_parser().parse_args(["admin", "metrics", "--session-id", "explicit"])
+        with self.assertRaises(CLI.CliError) as failure:
+            CLI.command_admin(args)
+        self.assertEqual(failure.exception.code, "invalid_request")
+
     def test_management_timeout_is_action_specific_and_stderr_is_streamed(self):
         for action, fields, expected in (
             ("acquire", {}, 600),
@@ -1157,7 +1378,7 @@ class NativeCliTests(unittest.TestCase):
     def test_contract_commands_are_available_and_resize_requires_resources(self):
         parser = CLI.build_parser()
         for value in (["sync", "--name", "Task_1"], ["resize", "--disk", "40GiB"], ["ssh-info", "--format", "ssh-config"],
-                      ["admin", "drain", "enter"], ["admin", "session", "list"], ["admin", "gc"], ["version"], ["help"]):
+                      ["admin", "drain", "enter"], ["admin", "session", "list"], ["admin", "metrics"], ["admin", "gc"], ["version"], ["help"]):
             parser.parse_args(value)
 
 

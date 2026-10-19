@@ -10,7 +10,7 @@ The deployment topology is layered: the local Codex client reaches a configured 
 
 ## Session and transport
 
-Every request carries a generic `session_id`. The CLI selects it from explicit `--session-id` first and `AGENT_VM_SESSION_ID` second. A missing value returns `missing_session` before any remote write. Session identity is ownership metadata and is not an authentication mechanism. The client sends one versioned JSON request over the configured SSH control path and emits one JSON response; diagnostics go to stderr.
+Session-scoped requests carry a `session_id`; the sessionless read-only `admin-metrics` request omits it and rejects both `session_id` and `operation_id`. The CLI selects a session from explicit `--session-id` first and `AGENT_VM_SESSION_ID` second for session-scoped actions. A missing value returns `missing_session` before any remote write. Session identity is ownership metadata and is not an authentication mechanism. The client sends one versioned JSON request over the configured SSH control path and emits one JSON response; diagnostics go to stderr.
 
 Protocol 4 is required by both client and control. Mutations include an operation ID and lease generation. The control persists requests and outcomes, rejects incompatible or conflicting retries, and never replays an uncertain native mutation automatically.
 
@@ -26,7 +26,7 @@ The deployment configuration supplies the control address and host port range. P
 
 ## Capacity and resizing
 
-Capacity observations are limited to the configured Incus pool filesystem and visible control-environment CPU and memory boundaries. External storage probes and infrastructure-manager inspection are unsupported. CPU and memory allocation ceilings use separately configurable overselling ratios; stopped caches consume disk only. New demand is refused when local measurements are missing, invalid or below the configured pressure threshold. Existing lease queries, retrieval, renewal and release remain available during pressure.
+Capacity observations are limited to the configured Incus pool filesystem and visible control-environment CPU and memory boundaries. External storage probes and infrastructure-manager inspection are unsupported. CPU and memory allocation ceilings use separately configurable overselling ratios; stopped caches consume disk only. New demand is refused when capacity measurements are missing or invalid, when the logical reservation ceiling is exceeded, when disk admission fails, or while draining. Low CT memory headroom is an observation and warning under reservation-only memory admission; it does not reduce logical remaining memory or reject a request within the configured ceiling. Existing lease queries, retrieval, renewal and release remain available during pressure.
 
 Disk changes require an explicit restart allowance and grow only. Memory-only live changes require a running owned guest, unchanged boot identity and native acknowledgement. The old reservation remains until verification succeeds. A single bounded convergence retry is allowed for the documented native balloon timeout; no polling loop or third attempt exists. Partial native changes retain conservative reservations and a structured recovery state.
 
@@ -66,8 +66,8 @@ The synchronization helper transfers tracked, unignored worktree files to its ow
 ## Related ADRs
 
 - [Native Incus Agent VM lifecycle](../../adr/0025-native-incus-agent-vm-lifecycle.md)
-- [Agent VM CPU and memory overselling](../../adr/0026-agent-vm-cpu-memory-overselling.md)
 - [Agent VM topology and recovery boundary](../../adr/0028-agent-vm-topology-recovery-boundary.md)
+- [Agent VM memory reservation-only admission](../../adr/0029-agent-vm-memory-reservation-only-admission.md)
 
 ## Related material
 

@@ -58,7 +58,7 @@ Use [the observability contract](../../specs/agent-vm/contracts/observability.md
 
 ## Current memory lines
 
-The current CT-visible memory limit is `32768 MiB` (`32 GiB`). The declared deployment policy is a fixed `2x` memory target, so the dashboard renders a separate `65536 MiB` (`64 GiB`) policy line. The 64 GiB line is an explicit policy threshold, not proof that the controller exports a live limit; the native value must come from `agent_vm_admission_limit` when that metric is available. The repository's generic configuration example has its own defaults and must not be used as evidence for the deployment policy.
+The deployment's CT-visible memory capacity is `32768 MiB` (`32 GiB`) and its configured logical memory budget is also `32768 MiB` with a `2x` `memory_overcommit_ratio`, producing one authoritative logical limit of `65536 MiB` (`64 GiB`). The dashboard must not derive these values from PVE UI working-set values, a project quota of `-1`, or a pressure sample. The repository's generic configuration example has its own defaults and must not be used as evidence for this deployment policy.
 
 The capacity view must show the actual CPU and memory walls separately from policy targets, and must show physical pool available bytes separately from guest rootfs allocation. The answer to “how large can the next VM be?” comes from native `allocated`, `reserved`, `remaining` and `limit` metrics across CPU, memory and disk, together with the controller's readiness and reclaim state. Pool free bytes alone are only physical headroom, not a complete admission result.
 
@@ -73,6 +73,7 @@ The dashboard is considered complete only when its source is versioned in the ow
 - Admission ready, reclaim-required and draining state.
 - Operation success/failure by phase, image-unpack failures, warnings, uptime, scrape freshness and task-state counts.
 - Horizontal dashed lines for every available authoritative limit, with no invented line for `-1` or missing values.
+- CT-visible memory capacity (`32 GiB`) and logical memory reservation limit (`64 GiB`) are separate lines; pressure and OOM are observations and do not move the logical line.
 
 # Guardrails / Reuse notes
 

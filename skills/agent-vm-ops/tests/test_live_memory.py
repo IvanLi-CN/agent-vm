@@ -98,17 +98,27 @@ class LiveMemoryTests(Fixture):
         self.assertTrue(self.call("resize", memory_mib=2048, live_memory=True)["applied"])
         self.error("project_instance_limits_conflict", self.call, "resize", memory_mib=4096, live_memory=True)
 
-    def test_growth_keeps_pressure_and_allocation_guards_before_native_effects(self):
+    def test_growth_uses_logical_allocation_guard_even_under_pressure(self):
         first = self.acquire()
         before = len(self.runner.calls)
         self.resources.memory.return_value["available_bytes"] = 0
-        self.error("memory_pressure", self.call, "resize", memory_mib=8192, live_memory=True)
-        self.assertEqual(self.changes(before), [])
+        result = self.call("resize", memory_mib=8192, live_memory=True)
+        self.assertEqual(result["resources"]["memory_mib"], 8192)
+        self.assertTrue(self.call("status")["admission"]["memory_pressure"])
         self.resources.memory.return_value["available_bytes"] = 24*GIB
         self.config.update(memory_budget_mib=4096, memory_overcommit_ratio=1)
-        self.error("resource_insufficient", self.call, "resize", memory_mib=8192, live_memory=True)
-        self.assertEqual(self.changes(before), [])
-        self.assertEqual(self.call("status")["lease_expires_at"], first["lease_expires_at"])
+        self.error("resource_insufficient", self.call, "resize", memory_mib=12288, live_memory=True)
+        self.assertGreaterEqual(len(self.changes(before)), 1)
+        self.assertEqual(self.call("status")["resources"]["memory_mib"], 8192)
+
+    def test_restart_growth_uses_logical_allocation_guard_even_under_pressure(self):
+        self.acquire()
+        self.resources.memory.return_value["available_bytes"] = 0
+        result = self.call("resize", memory_mib=8192, allow_restart=True)
+        self.assertTrue(result["applied"])
+        self.assertTrue(self.call("status")["admission"]["memory_pressure"])
+        self.config.update(memory_budget_mib=4096, memory_overcommit_ratio=1)
+        self.error("resource_insufficient", self.call, "resize", memory_mib=12288, allow_restart=True)
 
     def test_growth_reserves_maximum_then_commits_only_after_native_ack(self):
         self.acquire()
@@ -149,7 +159,7 @@ class LiveMemoryTests(Fixture):
         self.assertEqual(status["last_error"]["error"]["code"], "command_timeout")
         self.assertFalse(any(change[0] in {"start", "stop", "delete"} for change in self.changes(before)))
         calls = len(self.runner.calls)
-        self.error("resize_partial", self.control.dispatch, request)
+        self.error("operation_incomplete", self.control.dispatch, request)
         self.assertEqual(len(self.runner.calls), calls)  # failed ID replay has no native effects
         self.error("resize_incomplete", self.call, "resize", memory_mib=2048, live_memory=True)
         self.runner.on_config_set = None

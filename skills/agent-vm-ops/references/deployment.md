@@ -12,7 +12,7 @@ If the control environment must be rebuilt or recovered, preserve the state and 
 | Native units | systemd assets copied atomically into the configured unit directory |
 | Local client | installed executable and protected session state under the operator's chosen XDG paths |
 
-The deployment supplies the control alias, Incus project/profile/image, network ACL, control address, guest address pool, host port range, storage path, state database and timer directory through the example configuration. Placeholder values must be replaced before installation; missing or invalid values fail closed.
+The deployment supplies the control alias, Incus project/profile/image, network ACL, control address, guest address pool, host port range, storage path, state database and timer directory through a copied or derived configuration. `config.json.example` is a generic schema/template, not deployment evidence; for the locked deployment policy the installed configuration must set `memory_budget_mib=32768` and `memory_overcommit_ratio=2`. Placeholder values must be replaced before installation; missing or invalid values fail closed.
 
 The control entrypoint and every bundled systemd unit read the same canonical path, `/etc/agent-vm-native/config.json`. Deployment selects the project, image, network, address pool, port range, storage, state database and ACL by installing a protected JSON at that path; alternate runtime config paths are intentionally unsupported so one-shot requests and expiry/reconciliation timers cannot select different state stores.
 
@@ -24,7 +24,7 @@ Protocol upgrades enter drain, converge pending operations without replay, repla
 
 ## Observability boundary
 
-The dashboard and its provisioning source are deployment-owned. Use the [public observability contract](../../../docs/specs/agent-vm/contracts/observability.md) for metric semantics, but keep the Grafana JSON, Prometheus scrape target, collector path and datasource identity in the deployment repository. The one-shot controller is not a resident HTTP metrics service; add only an explicitly authorized read-only scrape bridge or textfile collector. Do not treat a Grafana database export or an Incus project limit of `-1` as an authoritative native admission metric.
+The dashboard and its provisioning source are deployment-owned. Use the [public observability contract](../../../docs/specs/agent-vm/contracts/observability.md) for metric semantics, but keep the Grafana JSON, Prometheus scrape target, collector path and datasource identity in the deployment repository. The one-shot controller is not a resident HTTP metrics service; add only an explicitly authorized read-only scrape bridge or textfile collector that invokes `admin-metrics` and exposes freshness/up failure semantics. Verify the deployment configuration's 32768-MiB memory base and 2x ratio before publishing a 65536-MiB logical limit. Do not treat a Grafana database export or an Incus project limit of `-1` as an authoritative native admission metric.
 
 ## Runtime maintenance boundary
 

@@ -16,14 +16,40 @@ The dashboard must distinguish control-environment capacity, physical Incus pool
 
 ## Native metric families
 
-The deployment-facing collector must expose the following stable metric families. Resource values use the unit encoded in the metric name: CPU is vCPU, memory and disk are bytes, and VM slots are a count.
+The deployment-facing collector must expose the following stable metric families. Each family has one unit; the resource dimension is encoded in the metric name rather than a label. CPU is vCPU, memory and disk are bytes, and VM slots are a count.
 
 | Metric | Type | Required labels or values |
 | --- | --- | --- |
-| `agent_vm_admission_allocated` | gauge | `resource=cpu|memory|disk|instances` |
-| `agent_vm_admission_reserved` | gauge | `resource=cpu|memory|disk|instances` |
-| `agent_vm_admission_remaining` | gauge | `resource=cpu|memory|disk|instances` |
-| `agent_vm_admission_limit` | gauge | `resource=cpu|memory|disk|instances`; absent when the limit is unverified |
+| `agent_vm_admission_cpu_allocated_vcpu` | gauge | allocated CPU vCPU |
+| `agent_vm_admission_cpu_reserved_vcpu` | gauge | reserved CPU vCPU |
+| `agent_vm_admission_cpu_allocated_and_reserved_vcpu` | gauge | allocated plus reserved CPU vCPU |
+| `agent_vm_admission_cpu_remaining_vcpu` | gauge | logical CPU headroom in vCPU |
+| `agent_vm_admission_cpu_limit_vcpu` | gauge | logical CPU limit; absent when unverified |
+| `agent_vm_admission_cpu_capacity_vcpu` | gauge | CT-visible CPU capacity before overcommit |
+| `agent_vm_admission_memory_allocated_bytes` | gauge | allocated memory bytes |
+| `agent_vm_admission_memory_reserved_bytes` | gauge | reserved memory bytes |
+| `agent_vm_admission_memory_allocated_and_reserved_bytes` | gauge | allocated plus reserved memory bytes |
+| `agent_vm_admission_memory_remaining_bytes` | gauge | logical memory headroom in bytes |
+| `agent_vm_admission_memory_limit_bytes` | gauge | logical memory limit; absent when unverified |
+| `agent_vm_admission_memory_capacity_bytes` | gauge | CT-visible memory capacity before overcommit |
+| `agent_vm_admission_disk_allocated_bytes` | gauge | allocated physical-admission disk bytes |
+| `agent_vm_admission_disk_reserved_bytes` | gauge | reserved physical-admission disk bytes |
+| `agent_vm_admission_disk_allocated_and_reserved_bytes` | gauge | allocated plus reserved physical-admission disk bytes |
+| `agent_vm_admission_disk_remaining_bytes` | gauge | physical disk headroom in bytes |
+| `agent_vm_admission_disk_limit_bytes` | gauge | physical disk limit; absent when unverified |
+| `agent_vm_admission_disk_capacity_bytes` | gauge | physical disk capacity before admission |
+| `agent_vm_admission_instances_allocated_count` | gauge | allocated VM slot count |
+| `agent_vm_admission_instances_reserved_count` | gauge | reserved VM slot count |
+| `agent_vm_admission_instances_allocated_and_reserved_count` | gauge | allocated plus reserved VM slot count |
+| `agent_vm_admission_instances_remaining_count` | gauge | remaining VM slot count; absent without an authoritative limit |
+| `agent_vm_admission_instances_limit_count` | gauge | VM slot limit; absent when unverified |
+| `agent_vm_admission_instances_capacity_count` | gauge | authoritative VM slot capacity when exposed |
+| `agent_vm_memory_current_bytes` | gauge | CT-local cgroup `memory.current`; absent when unavailable |
+| `agent_vm_memory_available_bytes` | gauge | CT-local verified LXCfs/cgroup available memory |
+| `agent_vm_memory_pressure_threshold_bytes` | gauge | CT-local pressure observation threshold |
+| `agent_vm_memory_pressure` | gauge | `0` or `1`; observation only, never a logical admission limit |
+| `agent_vm_memory_oom_events_total` | counter | CT-local cgroup OOM event kind |
+| `agent_vm_scrape_timestamp_seconds` | gauge | collector observation timestamp |
 | `agent_vm_admission_ready` | gauge | `0` or `1` |
 | `agent_vm_admission_reclaim_required` | gauge | `0` or `1` |
 | `agent_vm_admission_draining` | gauge | `0` or `1` |
@@ -36,7 +62,13 @@ The deployment-facing collector must expose the following stable metric families
 | `agent_vm_warnings_total` | counter | stable warning `code` |
 | `agent_vm_up` | gauge | `0` or `1` |
 
-The one-shot controller remains the source of truth for native state and must not be replaced with a resident HTTP broker solely to serve these metrics. The deployment must provide an authorized, read-only scrape bridge or textfile collector that preserves the controller's failure and freshness semantics. Until that bridge exists, a Grafana query for these families is not a working panel.
+The one-shot controller remains the source of truth for native state and must not be replaced with a resident HTTP broker solely to serve these metrics. The deployment must provide an authorized, read-only scrape bridge or textfile collector that preserves the controller's failure and freshness semantics. `agent_vm_admission_memory_limit_bytes` is the logical reservation ceiling (for the deployment, 65536 MiB = 68719476736 bytes), while `agent_vm_admission_memory_capacity_bytes` is the CT-visible capacity (32768 MiB = 34359738368 bytes). The controller JSON uses `memory_mib`; the Prometheus bridge must convert that field to bytes before emitting the memory families. `agent_vm_memory_pressure` is a runtime observation and must not be used to reduce `agent_vm_admission_memory_remaining_bytes`. Until that bridge exists, a Grafana query for these families is not a working panel.
+
+The `admin-metrics` JSON is the bridge input contract: `observed_at` is the freshness timestamp, `up` is the controller read success flag, `resources` is the logical admission object, `ct_memory` is the CT-local runtime observation, and `pending_operations` lists journal entries whose native outcome remains uncertain. A collector must expose `agent_vm_up=0` and freshness failure when the action cannot be read or parsed; it must not emit `agent_vm_memory_pressure=0` when `ct_memory.pressure` is `null`. The bridge must preserve `null` or absent limits and observations instead of coercing them to zero.
+
+When `admin-metrics.reclaim_required` is `null`, the collector must omit `agent_vm_admission_reclaim_required` for that scrape; `null` means disk admission is unverified, not that reclamation is unnecessary.
+
+The `admin-metrics` response keeps disk domains separate: `disk_admission.guest_allocation` reports sparse guest virtual-disk sizes, while `disk_admission.physical_admission` reports CT filesystem used/reserved/headroom against its low watermark. Consumers must map native disk admission metrics from the physical domain and must not compare sparse guest allocation totals with physical capacity. VM-slot admission is under `instances.admission`; its limit and remaining values are null when Incus exposes no authoritative slot limit, including `-1`.
 
 ## Dashboard contract
 
@@ -66,4 +98,4 @@ Verify the dashboard JSON has `refresh: "auto"`, a reload leaves Grafana's refre
 
 - [Native Agent VM specification](../SPEC.md)
 - [Agent VM operations runbook](../OPERATIONS.md)
-- [Agent VM capacity and overselling ADR](../../adr/0026-agent-vm-cpu-memory-overselling.md)
+- [Agent VM memory reservation-only admission ADR](../../adr/0029-agent-vm-memory-reservation-only-admission.md)
