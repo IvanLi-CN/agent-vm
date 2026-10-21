@@ -25,7 +25,7 @@ jobs:
         run: bun install --frozen-lockfile
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: '3.15.0'
       - uses: ruby/setup-ruby@v1
         with:
           ruby-version: '3.3'

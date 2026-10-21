@@ -1,4 +1,4 @@
 httpx>=0.27,<1
 openai>=1,<2
-Pillow>=10,<12
+Pillow==13.0.0
 PyYAML>=6,<7
