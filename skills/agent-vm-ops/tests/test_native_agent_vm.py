@@ -1072,6 +1072,50 @@ class LifecycleTests(Fixture):
         self.error("invalid_request", self.call, "admin-reconcile", apply="false")
         self.assertEqual(len(self.runner.calls), before)
 
+    def test_reconcile_reuses_native_inventory_for_absent_tasks(self):
+        for index in range(3):
+            task = self.control._base_task(f"reconcile-{index}", index + 1)
+            task.update(
+                state="absent",
+                resources_json=json.dumps({"cpu": 0, "memory_mib": 0, "disk_gib": 0}),
+                resource_reservation_json="{}",
+                reservation_bytes=0,
+            )
+            self.store.put_task(task)
+
+        self.runner.calls.clear()
+        result = self.call("admin-reconcile")
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(len(result["actions"]), 3)
+        list_calls = [
+            args for args, _, _ in self.runner.calls
+            if args[:4] == ["incus", "--project", "agents", "list"]
+        ]
+        self.assertEqual(len(list_calls), 1)
+
+    def test_reconcile_refreshes_inventory_before_absent_repair(self):
+        task = self.control._base_task("reconcile-repair", 1)
+        task.update(
+            state="absent",
+            resources_json=json.dumps({"cpu": 1, "memory_mib": 1, "disk_gib": 1}),
+            resource_reservation_json="{}",
+            reservation_bytes=0,
+        )
+        self.store.put_task(task)
+        listings = [0]
+
+        def inject_native_instance():
+            listings[0] += 1
+            if listings[0] == 2:
+                self.runner.instances[task["instance_name"]] = {"name": task["instance_name"]}
+
+        self.runner.on_list_instances = inject_native_instance
+        result = self.call("admin-reconcile", apply=True)
+        self.assertEqual(result["actions"][0]["error"]["code"], "resource_unverified")
+        self.assertEqual(listings[0], 2)
+        current = self.store.get_task(task_id=task["task_id"])
+        self.assertEqual(current["resources_json"], task["resources_json"])
+
     def test_port_range_inventory_and_exact_collision(self):
         self.acquire()
         self.runner.proxy_inventory = [{"name": "foreign-proxy", "expanded_devices": {"proxy": {"type": "proxy", "listen": "tcp:0.0.0.0:20001-20003"}}}]

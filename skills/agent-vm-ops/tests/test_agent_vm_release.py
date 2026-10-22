@@ -20,7 +20,8 @@ import agent_vm_release as RELEASE  # noqa: E402
 
 class FakeTransport:
     def __init__(self, *, fail_health_once=False, pending=False, drain_enter=True, unknown_state=False,
-                 malformed_health=False, malformed_reconcile=False, malformed_rollback=False):
+                 malformed_health=False, malformed_reconcile=False, malformed_rollback=False,
+                 fail_activation=False):
         self.calls = []
         self.fail_health_once = fail_health_once
         self.pending = pending
@@ -29,11 +30,14 @@ class FakeTransport:
         self.malformed_health = malformed_health
         self.malformed_reconcile = malformed_reconcile
         self.malformed_rollback = malformed_rollback
+        self.fail_activation = fail_activation
         self.health_checks = 0
 
     def wrapper(self, host, wrapper_path, action, transaction_id, release_id, payload=None):
         self.calls.append(("wrapper", action, transaction_id, release_id, payload is not None))
         if action == "activate":
+            if self.fail_activation:
+                return {"ok": False, "error": {"code": "activation_failed", "message": "injected"}}
             return {"ok": True, "result": {"activated": True, "release_id": release_id}}
         if action == "rollback":
             if self.malformed_rollback:
@@ -187,6 +191,15 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "convergence_timeout")
         actions = [item[1] for item in transport.calls]
         self.assertNotIn("activate", actions)
+        self.assertNotIn("drain-exit", actions)
+
+    def test_activation_failure_keeps_current_release_drained(self):
+        transport = FakeTransport(fail_activation=True)
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            self.publisher(transport).publish(timeout=5, poll=1, transaction_id="tx-activation-failure")
+        self.assertEqual(failure.exception.code, "activation_failed")
+        actions = [item[1] for item in transport.calls]
+        self.assertNotIn("rollback", actions)
         self.assertNotIn("drain-exit", actions)
 
     def test_activation_requires_confirmed_drain(self):

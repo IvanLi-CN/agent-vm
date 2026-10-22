@@ -4957,6 +4957,16 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
         if not isinstance(apply, bool):
             raise ControlError("invalid_request", "reconcile apply must be a JSON boolean")
         actions = []
+        native_instance_names: set[str] | None = None
+
+        def absent_native_instance_names() -> set[str]:
+            nonlocal native_instance_names
+            if native_instance_names is None:
+                native_instance_names = {
+                    native["name"] for native in self.incus.list_instances()
+                }
+            return native_instance_names
+
         for snapshot in self.store.list_tasks():
             snapshot_generation = snapshot.get("generation")
             if isinstance(snapshot_generation, bool) or not isinstance(snapshot_generation, int):
@@ -4980,7 +4990,7 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                         )
                     if task["state"] == "absent":
                         item["action"] = "verify-absent-resources"
-                        native_exists = any(native.get("name") == task["instance_name"] for native in self.incus.list_instances())
+                        native_exists = task["instance_name"] in absent_native_instance_names()
                         if native_exists:
                             raise ControlError("resource_unverified", "absent task still has a native instance")
                         if self.store.get_ports(task["task_id"]):
