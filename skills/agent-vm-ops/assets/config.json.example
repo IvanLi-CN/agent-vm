@@ -29,6 +29,7 @@
   ],
   "state_db": "/var/lib/agent-vm-native/state.sqlite3",
   "timer_dir": "/etc/systemd/system",
+  "release_fence_path": "/run/agent-vm-native/release-activation.fence",
   "cpu_budget": 15,
   "memory_budget_mib": 12288,
   "cpu_overcommit_ratio": 4,

@@ -17,7 +17,7 @@ import hashlib
 import json
 import os
 import ipaddress
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import selectors
 import shlex
@@ -36,8 +36,37 @@ import uuid
 from urllib.parse import quote, urlencode
 
 
+try:
+    from release_manifest import (
+        ACTION_NAMES,
+        LEGACY_RELEASE_ID,
+        ManifestError,
+        check_compatibility,
+        legacy_manifest,
+        load_runtime_manifest,
+        manifest_metadata,
+        verify_runtime_bundle,
+    )
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from release_manifest import (
+        ACTION_NAMES,
+        LEGACY_RELEASE_ID,
+        ManifestError,
+        check_compatibility,
+        legacy_manifest,
+        load_runtime_manifest,
+        manifest_metadata,
+        verify_runtime_bundle,
+    )
+
+
 PROTOCOL_VERSION = 4
+SCHEMA_VERSION = 1
+SEMANTIC_REVISION = 1
 MEMORY_SETTLE_SECONDS = 45
+TRANSITIONAL_ADMISSION_WAIT_SECONDS = 30
+TRANSITIONAL_ADMISSION_POLL_SECONDS = 0.25
 GUEST_READINESS_BUDGET_SECONDS = 300
 GUEST_READINESS_DIAGNOSTIC_SECONDS = 120
 DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS = 5
@@ -45,6 +74,8 @@ DIAGNOSTIC_LOG_LIMIT = 8192
 DIAGNOSTIC_LOG_TRUNCATION_MARKER = "\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
 DEFAULT_CONFIG_PATH = Path("/etc/agent-vm-native/config.json")
 DEFAULT_TIMER_DIR = Path("/etc/systemd/system")
+DEFAULT_RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
+DEFAULT_RELEASE_MANIFEST_PATH = Path(__file__).resolve().with_name("release-manifest.json")
 REQUIRED_ENVIRONMENT_FIELDS = (
     "project",
     "profile",
@@ -69,6 +100,17 @@ PORT_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{0,30}$")
 TASK_TIMER_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,47}-g[0-9]+$")
 RESOURCE_KEYS = frozenset(("cpu", "memory_mib", "disk_gib"))
 TASK_STATES = frozenset(("absent", "cached", "preparing", "active", "closing", "deleting", "failed"))
+
+
+def runtime_artifact_paths(config: Mapping[str, Any], manifest_path: Path, manifest: Mapping[str, Any]) -> dict[str, Path]:
+    return {
+        item["path"]: (
+            DEFAULT_TIMER_DIR / Path(item["path"]).name
+            if item["role"] == "unit"
+            else manifest_path.parent / Path(*PurePosixPath(item["path"]).parts)
+        )
+        for item in manifest["artifacts"]
+    }
 
 
 def parse_resource_mapping(raw: str | None, label: str, *, allow_empty: bool) -> dict[str, int]:
@@ -308,6 +350,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         "resize_cost_bytes": 1024**3,
         "required_guest_tools": ["python3", "sshd", "rsync", "docker", "growpart"],
         "timer_dir": str(DEFAULT_TIMER_DIR),
+        "release_fence_path": str(DEFAULT_RELEASE_FENCE_PATH),
     }
     config.update(raw)
     missing = [field for field in REQUIRED_ENVIRONMENT_FIELDS if field not in raw or raw[field] in (None, "")]
@@ -354,6 +397,11 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
     config["storage_path"] = require_nonempty_string(config["storage_path"], "storage_path")
     config["state_db"] = require_nonempty_string(config["state_db"], "state_db")
     config["timer_dir"] = require_nonempty_string(config["timer_dir"], "timer_dir")
+    config["release_fence_path"] = require_nonempty_string(config["release_fence_path"], "release_fence_path")
+    if not config["release_fence_path"].startswith("/"):
+        raise ControlError("config_invalid", "release_fence_path must be absolute")
+    if Path(config["release_fence_path"]) != DEFAULT_RELEASE_FENCE_PATH:
+        raise ControlError("config_invalid", "release_fence_path must use the fixed activation fence")
     return config
 
 
@@ -1280,6 +1328,7 @@ class SystemdManager:
         self.config = config
         self.enabled = enabled
         self.timer_dir = Path(str(config["timer_dir"]))
+        self.static_unit_dir = DEFAULT_TIMER_DIR
 
     @staticmethod
     def timer_unit(task_id: str, generation: int) -> str:
@@ -1365,7 +1414,7 @@ class SystemdManager:
     def service_asset_active(self, unit: str, required_lines: Sequence[str]) -> bool:
         if not self.enabled:
             return True
-        path = self.timer_dir / unit
+        path = self.static_unit_dir / unit
         if path.is_symlink() or not path.is_file():
             return False
         try:
@@ -1525,6 +1574,20 @@ class Control:
     ACTIVE_STATES = {"preparing", "active"}
     TRANSITION_STATES = {"preparing", "closing", "deleting"}
 
+    @classmethod
+    def _is_write_action(cls, action: str, request: Mapping[str, Any] | None = None) -> bool:
+        # A dry-run reconciliation is an observation used by release health
+        # checks.  Applying reconciliation remains a journaled write.
+        if (
+            action == "admin-reconcile"
+            and request is not None
+            and request.get("apply", False) is False
+            and "operation_id" not in request
+            and "generation" not in request
+        ):
+            return False
+        return action in cls.WRITE_ACTIONS
+
     def __init__(
         self,
         config: Mapping[str, Any],
@@ -1537,6 +1600,37 @@ class Control:
     ):
         self.config = dict(config)
         self.runner = runner or CommandRunner()
+        configured_manifest = self.config.get("release_manifest_path")
+        self.release_manifest_path = Path(str(configured_manifest)) if configured_manifest else DEFAULT_RELEASE_MANIFEST_PATH
+        self.release_fence_path = Path(str(self.config.get("release_fence_path", DEFAULT_RELEASE_FENCE_PATH)))
+        self.release_manifest: dict[str, Any] | None = None
+        self.release_manifest_present = False
+        self.release_artifacts_verified = True
+        self.release_manifest_error: ControlError | None = None
+        self.release_warnings: list[dict[str, Any]] = []
+        try:
+            (
+                self.release_manifest,
+                self.release_manifest_present,
+                self.release_artifacts_verified,
+                self.release_warnings,
+            ) = load_runtime_manifest(self.release_manifest_path)
+        except ManifestError as exc:
+            self.release_manifest_error = ControlError(exc.code, exc.message, exc.detail)
+        if self.release_manifest_error is None and self.release_manifest is not None:
+            try:
+                verify_runtime_bundle(
+                    self.release_manifest,
+                    runtime_artifact_paths(self.config, self.release_manifest_path, self.release_manifest),
+                )
+            except ManifestError as exc:
+                self.release_artifacts_verified = False
+                self.release_manifest_error = ControlError(exc.code, exc.message, exc.detail)
+        if self.release_manifest_error is not None and store is None:
+            # Do not open SQLite/WAL or create the state directory for an
+            # invalid installed release.  Tests may inject a store to inspect
+            # the preflight error without changing this production boundary.
+            raise self.release_manifest_error
         self.store = store or StateStore(Path(str(self.config["state_db"])))
         self.incus = IncusClient(self.runner, self.config)
         self.systemd = systemd or SystemdManager(self.runner, self.config)
@@ -1570,6 +1664,77 @@ class Control:
 
     def now(self) -> dt.datetime:
         return self.clock().astimezone(dt.timezone.utc)
+
+    def _release_metadata(self) -> dict[str, Any]:
+        return manifest_metadata(
+            self.release_manifest,
+            present=self.release_manifest_present,
+            verified=self.release_artifacts_verified,
+            legacy=self.release_manifest is None,
+        )
+
+    @staticmethod
+    def _response_compatibility() -> dict[str, int]:
+        return {"schema": SCHEMA_VERSION, "semantic_revision": SEMANTIC_REVISION}
+
+    def _release_activation_fenced(self) -> bool:
+        try:
+            info = self.release_fence_path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError as exc:
+            raise ControlError("release_fence_unverified", "release activation fence cannot be inspected") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or (
+            self.release_fence_path == DEFAULT_RELEASE_FENCE_PATH
+            and (info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600)
+        ):
+            raise ControlError("release_fence_unverified", "release activation fence is not a regular file")
+        return True
+
+    @staticmethod
+    def _merge_warnings(*groups: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        seen: set[tuple[Any, Any, Any]] = set()
+        for group in groups:
+            for item in group:
+                value = dict(item)
+                identity = (value.get("code"), value.get("action"), value.get("message"))
+                if identity not in seen:
+                    seen.add(identity)
+                    result.append(value)
+        return result
+
+    def _preflight_release(self, request: Mapping[str, Any]) -> list[dict[str, Any]]:
+        """Check release identity and compatibility before locks/journals/effects."""
+        if self.release_manifest_error is not None:
+            raise self.release_manifest_error
+        if request.get("protocol") != PROTOCOL_VERSION:
+            raise ControlError("protocol_mismatch", f"protocol must be {PROTOCOL_VERSION}")
+        action = request.get("action")
+        if not isinstance(action, str) or not action:
+            raise ControlError("invalid_request", "action must be a non-empty string")
+        if action not in ACTION_NAMES:
+            raise ControlError("unknown_action", f"unknown action: {action}")
+        manifest = self.release_manifest or legacy_manifest()
+        if self.release_manifest is not None:
+            try:
+                verify_runtime_bundle(
+                    self.release_manifest,
+                    runtime_artifact_paths(self.config, self.release_manifest_path, self.release_manifest),
+                )
+            except ManifestError as exc:
+                raise ControlError(exc.code, exc.message, exc.detail) from exc
+        try:
+            warnings = check_compatibility(manifest, action, request.get("compatibility"))
+        except ManifestError as exc:
+            raise ControlError(exc.code, exc.message, exc.detail) from exc
+        if self.release_manifest is None:
+            warnings.append({
+                "code": "legacy_control_release",
+                "action": action,
+                "message": "control release manifest is absent; using legacy protocol-4 compatibility",
+            })
+        return self._merge_warnings(self.release_warnings, warnings)
 
     @contextmanager
     def _object_lock(self, identity: str, *, blocking: bool = True):
@@ -1610,6 +1775,7 @@ class Control:
         if not isinstance(request, Mapping):
             raise ControlError("invalid_request", "request must be an object")
         action = request.get("action")
+        compatibility_warnings = self._preflight_release(request)
         # Resolve timer ownership from the durable record, never from a guessed
         # resource name. The same object lock serializes native operations.
         session = request.get("session_id")
@@ -1625,11 +1791,11 @@ class Control:
                 # durable state. Native cleanup must not race a slow acquire,
                 # restart, resize, or proxy mutation.
                 self._expire_preempt(request)
-            if action in self.WRITE_ACTIONS:
+            if self._is_write_action(action, request):
                 op = require_nonempty_string(request.get("operation_id"), "operation_id", SESSION_ID_RE)
                 with self._object_lock("operation:" + op):
-                    return self._dispatch_locked(request)
-            return self._dispatch_locked(request)
+                    return self._dispatch_locked(request, compatibility_warnings)
+            return self._dispatch_locked(request, compatibility_warnings)
 
     def _annotate_state_error(
         self,
@@ -2174,7 +2340,11 @@ class Control:
                         raise ControlError("operation_unverified", "reconciled native instance still exists",
                                            {"operation_id": operation_id})
 
-    def _dispatch_locked(self, request: Mapping[str, Any]) -> dict[str, Any]:
+    def _dispatch_locked(
+        self,
+        request: Mapping[str, Any],
+        compatibility_warnings: Iterable[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
         if not isinstance(request, Mapping):
             raise ControlError("invalid_request", "request must be an object")
         if request.get("protocol") != PROTOCOL_VERSION:
@@ -2191,7 +2361,8 @@ class Control:
         ):
             raise ControlError("invalid_request", "admin-metrics is sessionless and read-only")
         operation_id = request.get("operation_id")
-        if action in self.WRITE_ACTIONS:
+        is_write = self._is_write_action(action, request)
+        if is_write:
             operation_id = require_nonempty_string(operation_id, "operation_id", SESSION_ID_RE)
             digest = hashlib.sha256(json.dumps(dict(request), sort_keys=True).encode()).hexdigest()
             cached = self.store.operation(operation_id)
@@ -2209,6 +2380,13 @@ class Control:
                 response.pop("_request_digest", None)
                 response["server_time"] = iso_time(self.now())
                 response["outcome"] = "replayed"
+                cached_warnings = response.get("warnings", [])
+                response["warnings"] = self._merge_warnings(
+                    cached_warnings if isinstance(cached_warnings, list) else [],
+                    compatibility_warnings,
+                )
+                response.setdefault("response", self._response_compatibility())
+                response["release"] = self._release_metadata()
                 if session_id:
                     task = self.store.get_task(session_id=session_id)
                     response["current_state"] = self._state_summary(task) if task else None
@@ -2222,10 +2400,10 @@ class Control:
                 self.store.record_operation(operation_id, action, session_id, request["generation"],
                                             {"outcome": "pending", "_request_digest": digest})
         try:
-            result = self._dispatch_action(action, dict(request), session_id)
+            result = self._dispatch_action(action, dict(request), session_id, compatibility_warnings)
         except ControlError as exc:
             try:
-                if operation_id and action in self.WRITE_ACTIONS:
+                if operation_id and is_write:
                     # A committed renew must remain replayable even if rearming its
                     # native timer failed after the atomic deadline/journal commit.
                     saved = self.store.operation(operation_id)
@@ -2235,7 +2413,7 @@ class Control:
                     elif saved.get("outcome") == "pending" and not self._operation_outcome_uncertain(action, exc):
                         self.store.record_operation(operation_id, action, session_id, request.get("generation"),
                                                     {"outcome": "error", "error": exc.as_dict(), "_request_digest": digest})
-                if session_id is not None or action in self.WRITE_ACTIONS:
+                if session_id is not None or is_write:
                     self.store.audit(
                         action,
                         "error",
@@ -2256,9 +2434,12 @@ class Control:
             "operation_id": operation_id,
             "outcome": "success",
             "result": result,
+            "response": self._response_compatibility(),
+            "release": self._release_metadata(),
+            "warnings": self._merge_warnings(compatibility_warnings),
         }
         try:
-            if operation_id is not None and action in self.WRITE_ACTIONS and action != "renew":
+            if operation_id is not None and is_write and action != "renew":
                 self.store.record_operation(
                     operation_id,
                     action,
@@ -2266,7 +2447,7 @@ class Control:
                     request.get("generation"),
                     {**response, "_request_digest": digest},
                 )
-            if session_id is not None or action in self.WRITE_ACTIONS:
+            if session_id is not None or is_write:
                 self.store.audit(
                     action,
                     "ok",
@@ -2279,13 +2460,18 @@ class Control:
         return response
 
     def _dispatch_action(
-        self, action: str, request: dict[str, Any], session_id: str | None
+        self,
+        action: str,
+        request: dict[str, Any],
+        session_id: str | None,
+        compatibility_warnings: Iterable[Mapping[str, Any]] = (),
     ) -> dict[str, Any]:
+        if action == "renew":
+            return self.renew(request, session_id, compatibility_warnings)
         handlers: dict[str, Callable[..., dict[str, Any]]] = {
             "doctor": self.doctor,
             "status": self.status,
             "acquire": self.acquire,
-            "renew": self.renew,
             "release": self.release,
             "destroy": self.destroy,
             "restart": self.restart,
@@ -2960,6 +3146,42 @@ class Control:
                 record["resources_json"] = json.dumps(dict(resources), sort_keys=True)
             self.store.put_task(record)
             return record
+
+    def _reserve_resources_with_transition_wait(
+        self,
+        task: Mapping[str, Any],
+        resources: Mapping[str, int],
+        *,
+        admission_epoch: str | None = None,
+    ) -> dict[str, Any]:
+        """Wait for an unrelated native cleanup to leave the admission fence.
+
+        Lease expiry cleanup is deliberately outside the global admission lock
+        while it performs native Incus work. A new acquire may therefore observe
+        a short-lived transitional instance even though the durable state is
+        healthy. Keep the same operation pending during that narrow window;
+        every other unverified condition still fails closed immediately.
+        """
+        started = time.monotonic()
+        attempts = 0
+        while True:
+            try:
+                return self._reserve_resources(task, resources, admission_epoch=admission_epoch)
+            except ControlError as exc:
+                if (exc.code != "resource_unverified"
+                        or exc.message != "transitional native instance blocks admission"):
+                    raise
+                elapsed = time.monotonic() - started
+                remaining = TRANSITIONAL_ADMISSION_WAIT_SECONDS - elapsed
+                if remaining <= 0:
+                    detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
+                    detail.update({
+                        "admission_wait_seconds": round(max(0.0, elapsed), 3),
+                        "admission_retry_count": attempts,
+                    })
+                    raise ControlError(exc.code, exc.message, detail) from exc
+                attempts += 1
+                time.sleep(min(TRANSITIONAL_ADMISSION_POLL_SECONDS, remaining))
 
     def _reserve_native(self, task: Mapping[str, Any], cost: int, *, inventory: set[int] | None = None,
                         ssh_port: int | None = None) -> dict[str, Any]:
@@ -3884,6 +4106,8 @@ class Control:
         return {"ready": not issues, "issues": issues, "incus_version": version, "capacity": capacity,
                 "resources": resources, "instances": instance_policy, "default_admission": admission,
                 "admission_ready": not issues and admission["ready"],
+                "release": self._release_metadata(),
+                "release_warnings": self._merge_warnings(self.release_warnings),
                 "config": {key: self.config[key] for key in ("project", "profile", "image_fingerprint", "network", "pool", "host_address")}}
 
 
@@ -3948,7 +4172,7 @@ class Control:
         # The deadline/timer exists before either starting the guest or exposing NAT.
         task["lease_expires_at"] = iso_time(self.now() + dt.timedelta(seconds=self.config["initial_lease_seconds"]))
         reserved = {key: max(old[key], resources[key]) for key in old} if cached else resources
-        task = self._reserve_resources(task, reserved, admission_epoch=admission_epoch)
+        task = self._reserve_resources_with_transition_wait(task, reserved, admission_epoch=admission_epoch)
         completed = []
         phase = "reservation"
         stage_timings: dict[str, Any] = {}
@@ -4028,7 +4252,12 @@ class Control:
             raise ControlError(exc.code, exc.message, detail) from exc
 
 
-    def renew(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
+    def renew(
+        self,
+        request: Mapping[str, Any],
+        session_id: str | None,
+        compatibility_warnings: Iterable[Mapping[str, Any]] = (),
+    ) -> dict[str, Any]:
         assert session_id is not None
         with self._global_lock(), self.store.transaction():
             task = self._task_for_session(session_id)
@@ -4042,6 +4271,9 @@ class Control:
             response = {"ok": True, "protocol": PROTOCOL_VERSION, "server_time": iso_time(self.now()),
                         "action": "renew", "session_id": session_id, "generation": request["generation"],
                         "operation_id": request["operation_id"], "outcome": "success", "result": result,
+                        "response": self._response_compatibility(),
+                        "release": self._release_metadata(),
+                        "warnings": self._merge_warnings(compatibility_warnings),
                         "_request_digest": hashlib.sha256(json.dumps(dict(request), sort_keys=True).encode()).hexdigest()}
             self.store.record_operation(request["operation_id"], "renew", session_id, request["generation"], response)
         self._schedule_expiry(task)
@@ -4604,6 +4836,8 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
                 "warnings": warnings,
                 "warning_counts": audit["warnings"],
                 "doctor": {"ready": doctor.get("ready"), "issues": doctor.get("issues", [])},
+                "release": self._release_metadata(),
+                "release_warnings": self._merge_warnings(self.release_warnings),
             }
 
 
@@ -4703,6 +4937,11 @@ print(json.dumps({'virtual_bytes': size, 'filesystem_before': before, 'filesyste
             # run. Commit the exit only after reacquiring admission.lock and
             # rechecking the fence, with the same order as acquire.
             with self._admission_lock():
+                if self._release_activation_fenced():
+                    raise ControlError(
+                        "release_activation_in_progress",
+                        "drain exit is blocked while release activation is fenced",
+                    )
                 if self.store.get_meta("draining") == "1":
                     with self._global_lock():
                         self.store.set_meta("admission_epoch", uuid.uuid4().hex)

@@ -1124,6 +1124,25 @@ class AdmissionTests(Fixture):
 
 
 class CreationTests(Fixture):
+    def test_acquire_waits_for_unrelated_native_cleanup_transition(self):
+        original_guard = self.control._running_inventory_guard
+        calls = []
+
+        def guard():
+            calls.append(True)
+            if len(calls) == 1:
+                raise CONTROL.ControlError(
+                    "resource_unverified",
+                    "transitional native instance blocks admission",
+                )
+            return original_guard()
+
+        with mock.patch.object(self.control, "_running_inventory_guard", side_effect=guard):
+            result = self.acquire("transition")
+
+        self.assertEqual(result["state"], "active")
+        self.assertEqual(len(calls), 2)
+
     def test_memory_pressure_does_not_block_cached_resume_with_logical_headroom(self):
         first = self.acquire("cache")
         self.call("release", "cache")

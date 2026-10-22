@@ -8,6 +8,8 @@ Global `--session-id <id>` selects the ownership identity and is accepted before
 
 The control endpoint is selected from `AGENT_VM_CONTROL_HOST` and `AGENT_VM_REMOTE_CONTROL`, with deployment-safe defaults only for the executable name and remote path. The operations control process reads a JSON file whose environment-specific fields are required: project, profile, image, network, ACL, pool, control address, port range, guest address range, storage path, state database and timer directory. Missing or invalid values fail closed with `config_missing` or `config_invalid`.
 
+Control-plane publication, update, and rollback are operator-owned deployment actions. The public `agent-vm` CLI has no `update` command and does not install remote files, modify deployment configuration, or acquire Incus/PVE authority.
+
 ## Commands
 
 | Command | Contract |
@@ -38,9 +40,17 @@ Unknown flags and command layouts must be rejected; callers should use `--help` 
 
 ## Request and response
 
-Session-scoped requests contain `protocol`, `action` and `session_id`; the sessionless read-only `admin-metrics` request omits `session_id` and `operation_id`. Mutations also contain `generation` and `operation_id`. Success envelopes contain `ok`, `protocol`, `server_time`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`. Error diagnostics are JSON on stderr with a nonzero exit status. A transport timeout reports the operation ID without claiming whether the mutation completed. A state-database failure reports `sqlite_unavailable` with `phase`, SQLite code/name, SQL operation category and `state_committed`; `null` means a commit result is unknown and the original operation remains subject to status/reconciliation.
+Session-scoped requests contain `protocol`, `action` and `session_id`; the sessionless read-only `admin-metrics` request omits `session_id` and `operation_id`. Mutations also contain `generation` and `operation_id`. Success envelopes contain `ok`, `protocol`, `server_time`, `action`, `session_id`, `generation`, `operation_id`, `outcome`, `result`, and the action's `response` schema/semantic metadata, and MAY contain a structured `warnings` array. A legacy control response that omits this metadata is accepted only with a structured compatibility warning. Error diagnostics are JSON on stderr with a nonzero exit status. A transport timeout reports the operation ID without claiming whether the mutation completed. A state-database failure reports `sqlite_unavailable` with `phase`, SQLite code/name, SQL operation category and `state_committed`; `null` means a commit result is unknown and the original operation remains subject to status/reconciliation.
 
-Acquire, restart and restart-capable resize use a longer bounded transport timeout. No command implicitly renews a lease. Retry an uncertain mutation only with the original operation ID and generation after inspecting status or reconciliation.
+## Control-plane compatibility
+
+The release manifest is the authority for control-plane release identity, artifact checksums, protocol, and per-action request/response/semantic compatibility in each direction. A compatible action MAY run across different release revisions and MUST surface a structured compatibility warning. The client and control process MUST reject incompatible protocol, schema, semantic behavior, unknown action, or unverified artifact before any state or native effect; compatibility is never inferred from JSON parseability alone.
+
+The complete manifest shape, wrapper action allowlist, publisher order, rollback limit, and private deployment boundary are defined in the [control-plane release contract](release.md). The public client only reads its local sidecar and has no update, publish, install, or rollback command.
+
+Compatible evolution keeps protocol 4. A breaking protocol or semantic change may require a coordinated release and an explicit client update. The remote control release is published and health-checked before the local client release is changed, so an older client can continue using compatible actions while the new client is not allowed to assume unsupported remote actions.
+
+Acquire, restart and restart-capable resize use a longer bounded transport timeout. Acquire may spend a separate bounded wait for an unrelated native lease-expiry cleanup to leave its transitional state; this wait keeps the same operation ID and does not create a second intent. No command implicitly renews a lease. Retry an uncertain mutation only with the original operation ID and generation after inspecting status or reconciliation.
 
 ## SSH and ports
 
@@ -59,6 +69,8 @@ The configured SSH control address is an entrypoint for the one-shot control pro
 The control environment is the observed CT109 LXC and owns session-scoped Incus VMs inside that CT. A concrete private address, CT identifier and Incus identity are independent facts. Missing provenance, missing durable state, or an unverified native inventory blocks recovery rather than authorizing a guessed host operation or broad cleanup.
 
 During recovery, preserve the configured state database and WAL/journals, local operation journals, operation/audit records, generations, canonical configuration, protected connection material, native timer assets and Incus VM data. Restore matching client/control/unit revisions under drain, then inspect `agent-vm doctor`, `agent-vm admin status`, `agent-vm admin session list` and dry-run `agent-vm admin reconcile` before any apply. `admin reconcile --apply` is limited to confirmed ownership/generation and cleanup/rearm actions, plus repairing malformed or inconsistent nonzero resource/reservation records for an `absent` task after native instance and port absence are confirmed; `admin gc --apply` and destructive cleanup are not recovery shortcuts.
+
+Remote control-script or unit publication enters drain before activation. Drain blocks new acquisition and restart admission but permits status, retrieval, release, and expiry/reconciliation/cache-cleanup timers; it does not force-kill in-flight operations. Publication waits for pending operations and task transitions to converge, atomically activates verified artifacts, and checks health, reconciliation, and timers before `admin drain exit`. A pre-activation failure leaves the current release untouched; post-activation health failure permits one bounded rollback to the previous verified release, while failed rollback keeps admission drained.
 
 A transport timeout or pending operation is uncertain. Retain the original operation ID, request and generation, inspect status/reconciliation, and never create a new operation ID or reset a generation to make the request fit. If the durable/native state cannot be matched, keep admission drained and stop. Run `agent-vm admin drain exit` only after health, state, generation, timer and CT-local capacity checks pass, then repeat `doctor` and `admin status`.
 

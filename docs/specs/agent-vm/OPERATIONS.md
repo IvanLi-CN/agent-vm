@@ -35,7 +35,7 @@ Do not rotate, compact, convert, or rewrite pending operation records or generat
 
 1. If the control endpoint is unavailable, stop at the provenance boundary and obtain the owner-authorized CT/rebuild evidence. Do not try another address, enter CT109 through an assumed host, or use a guessed infrastructure API.
 2. When the intended control environment is available, keep admission drained before touching the installed client, one-shot control script, configuration, or native units. If the drain state cannot be proven, keep the control service stopped and treat admission as closed.
-3. Restore one matching client/control revision and the canonical configuration atomically, with protected ownership and mode. Restore the existing state database and journals in place; do not initialize a new empty database beside the old one and do not downgrade the protocol to make old records fit.
+3. Restore one approved release manifest's client/control/unit artifacts and the canonical configuration atomically, with protected ownership and mode. Restore the existing state database and journals in place; do not initialize a new empty database beside the old one and do not downgrade the protocol to make old records fit.
 4. Restore or verify the native expiry/reconciliation units and their timer directory. Do not claim recovery from a unit file alone: the state database, native instances, mappings, and generation metadata must still be reconciled.
 5. Run read-only health and inventory checks: `agent-vm doctor`, `agent-vm admin status`, `agent-vm admin session list`, and `agent-vm admin reconcile`. The last command is a dry-run unless `--apply` is explicitly supplied.
 
@@ -53,7 +53,7 @@ The local client journal and the control `operations` table are the identity rec
 
 Admission may be restored only after all of the following are observed in the intended control environment:
 
-- The matching client/control revision, canonical configuration, database/journals, ownership/modes, and native units are present and readable.
+- The approved release manifest, compatible client/control artifacts, canonical configuration, database/journals, ownership/modes, and native units are present and readable.
 - `doctor` reports component health, the control database is writable, the configured CT-local Incus pool filesystem can be measured, and the image/project/network/ACL policy is verified.
 - Every task and port record is either reconciled to a confirmed native state or remains explicitly blocked; no pending operation, generation mismatch, unknown resource, partial resize, or cleanup transition is being silently ignored.
 - Required timers and expiry/reconciliation behavior are verified for the restored generations, with no guessed host or storage provenance substituted for missing evidence.
@@ -65,6 +65,14 @@ Only then may an authorized operator run `agent-vm admin drain exit` and immedia
 If the state database, operation journal, generation records, protected configuration, or authoritative native inventory is missing, corrupt, or inconsistent, stop the control plane and preserve the remaining data. Do not guess ownership, reset generations, create a fresh state database, reacquire sessions, delete caches, or clean mappings globally.
 
 The minimum evidence needed to continue is an owner-authorized mapping between the control entry and CT109, the matching state/config backups, the installed revision/checksums, the intended Incus project/pool, and a native inventory that can prove task ownership and generations. Without that evidence, the physical/virtual host source and rebuild path remain blockers; the correct outcome is an incident report, not cleanup or admission.
+
+## Control-plane publication and compatibility
+
+Publication is a manual operator-owned action through the configured control SSH entry. The release manifest covers the local client, one-shot control script, systemd assets, source revision, exact checksums, protocol, and per-operation request/response/semantic compatibility. It excludes configuration, credentials, connection material, state databases and WAL/journals, locks, Incus VM data, and guest images.
+
+Stage and verify the manifest, ownership, modes, syntax, checksums, and unit contents before entering drain. Drain blocks new acquisition and restart admission, leaves status/retrieval/release and expiry/reconciliation/cache-cleanup timers available, and does not force-kill in-flight processes. Wait for pending operations and task transitions to converge, activate the verified release atomically, and validate health, reconciliation, and timers before reopening admission.
+
+An older client may continue using an action only when the manifest declares that action compatible; the response carries a structured compatibility warning. Unknown actions, incompatible protocol/schema/semantics, or unverified artifacts fail before side effects. Publish and health-check the remote release before changing the local client. A pre-activation failure leaves the current release untouched; a post-activation health failure permits one bounded rollback to the previous verified release. Failed rollback keeps admission drained and never rewrites state, generations, or uncertain operations.
 
 ## Sparse disk and failure domains
 
@@ -86,3 +94,4 @@ No part of this contract prevents all ENOSPC conditions or provides a recovery g
 - [Agent VM CLI contract](contracts/cli.md)
 - [Native deployment boundary](../../skills/agent-vm-ops/references/deployment.md)
 - [Agent VM topology and recovery boundary](../../adr/0028-agent-vm-topology-recovery-boundary.md)
+- [Agent VM control-plane update boundary](../../adr/0030-agent-vm-control-plane-update-boundary.md)

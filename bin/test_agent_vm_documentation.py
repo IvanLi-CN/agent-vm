@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = ROOT / "docs/specs/agent-vm/SPEC.md"
 RUNBOOK = ROOT / "docs/specs/agent-vm/OPERATIONS.md"
 CLI_CONTRACT = ROOT / "docs/specs/agent-vm/contracts/cli.md"
+RELEASE_CONTRACT = ROOT / "docs/specs/agent-vm/contracts/release.md"
 ADR = ROOT / "docs/adr/0028-agent-vm-topology-recovery-boundary.md"
 OPS_SKILL = ROOT / "skills/agent-vm-ops/SKILL.md"
 DEPLOYMENT = ROOT / "skills/agent-vm-ops/references/deployment.md"
@@ -91,6 +92,7 @@ class AgentVmDocumentationTests(unittest.TestCase):
     def test_contract_links_are_present_and_public_values_stay_redacted(self) -> None:
         spec = SPEC.read_text(encoding="utf-8")
         cli_contract = CLI_CONTRACT.read_text(encoding="utf-8")
+        release_contract = RELEASE_CONTRACT.read_text(encoding="utf-8")
         adr = ADR.read_text(encoding="utf-8")
         ops_skill = OPS_SKILL.read_text(encoding="utf-8")
         deployment = DEPLOYMENT.read_text(encoding="utf-8")
@@ -99,8 +101,24 @@ class AgentVmDocumentationTests(unittest.TestCase):
         self.assertIn("0028-agent-vm-topology-recovery-boundary.md", spec)
         self.assertIn("../../docs/specs/agent-vm/OPERATIONS.md", ops_skill)
         self.assertIn("../../../docs/specs/agent-vm/OPERATIONS.md", deployment)
+        self.assertIn("contracts/release.md", spec)
+        self.assertIn("release contract", cli_contract)
+        for phrase in (
+            "release-manifest.json",
+            "legacy-protocol-4",
+            "client_to_control",
+            "control_to_client",
+            "stage",
+            "verify",
+            "activate",
+            "rollback",
+            "daemon-reload",
+            "does not stop or disable",
+            "state database",
+        ):
+            self.assertIn(phrase, release_contract)
         self.assertIn("protected operator records", adr)
-        for document in (spec, cli_contract, adr, ops_skill, deployment):
+        for document in (spec, cli_contract, release_contract, adr, ops_skill, deployment):
             self.assertNotRegex(document, re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+"))
             self.assertNotRegex(document, re.compile(r"\b(?:10|172|192\.168)\.\d+\.\d+\.\d+\b"))
 
