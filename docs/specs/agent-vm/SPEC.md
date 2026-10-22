@@ -50,7 +50,7 @@ Disk admission MUST account for the configured CT-local Incus pool filesystem, r
 
 ### REQ-AGENT-VM-013 - Observability provenance
 
-Operational dashboards MUST distinguish CT filesystem capacity, transient image staging, physical Incus pool usage, guest rootfs allocation, and native admission state. They MUST NOT infer an authoritative native limit from an unset Incus project quota or draw a limit line for a missing or `-1` source. The dashboard contract MUST expose failure phase, image-unpack failures, admission state and scrape freshness so an ENOSPC boundary can be identified without host-manager access.
+Operational dashboards MUST distinguish CT filesystem capacity, transient image staging, physical Incus pool usage, guest rootfs allocation, and native admission state. They MUST NOT infer an authoritative native limit from an unset Incus project quota or draw a limit line for a missing or `-1` source. The dashboard contract MUST expose failure phase, image-unpack failures, admission state and scrape freshness so an ENOSPC boundary can be identified without host-manager access. The public repository MUST ship a sanitized, parameterized dashboard baseline and validation path; deployment-specific rendered files, datasource identities, controller jobs and collector paths remain deployment-owned.
 
 ## Synchronization and retrieval
 

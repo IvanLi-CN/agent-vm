@@ -1,0 +1,11 @@
+{
+  "dashboard_uid": "${AGENT_VM_DASHBOARD_UID}",
+  "dashboard_title": "Agent VM / Incus",
+  "grafana_org_id": 1,
+  "provider_name": "agent-vm-observability",
+  "dashboard_folder": "${GRAFANA_DASHBOARD_FOLDER}",
+  "prometheus_datasource_uid": "${PROMETHEUS_DATASOURCE_UID}",
+  "controller_job": "${AGENT_VM_CONTROLLER_JOB}",
+  "dashboard_path": "${GRAFANA_DASHBOARD_PATH}",
+  "dashboard_filename": "agent-vm-observability.json"
+}

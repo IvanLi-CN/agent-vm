@@ -31,9 +31,9 @@ The `incus-agent-vm` dashboard must explain why VM creation can fail even when a
 
 Incus pool metrics and guest filesystem metrics describe different layers. Image unpacking uses the CT-local staging path before final instance storage is allocated, while the native controller keeps admission reservations and state in a separate control boundary. A dashboard that uses only Incus project or guest metrics cannot explain either failure domain or the native limit.
 
-The current public `agent-toolkit` checkout owns the native controller and its public contracts, but it does not own the `incus-agent-vm` Grafana provisioning JSON or a Prometheus scrape bridge for native controller metrics. Updating a Grafana database copy would therefore be temporary and would not be a repository implementation.
+The public `agent-toolkit` checkout owns the native controller, its public contracts, and a parameterized Grafana baseline under `skills/agent-vm/references/observability/`. Updating a Grafana database copy is still temporary, but the public template plus renderer is a repository implementation that can be instantiated by each deployment.
 
-The deployment source was located in the operator-owned `obs` stack. Its dashboard path is `grafana/dashboards/incus/incus-agent-vm.json`, and its provisioning provider is `grafana/provisioning/dashboards/incus.yml`; the Grafana service mounts both paths read-only. The recovered dashboard snapshot is useful as the starting point for the owning deployment repository, but it must not be copied into this public repository. If that snapshot is untracked, version it in the owning repository before applying the dashboard changes.
+The deployment source was located in the operator-owned `obs` stack. Its dashboard path is `grafana/dashboards/incus/incus-agent-vm.json`, and its provisioning provider is `grafana/provisioning/dashboards/incus.yml`; the Grafana service mounts both paths read-only. The recovered dashboard snapshot is useful as deployment evidence and as the visual baseline for the public template, but the deployment instance must remain in the owning repository. If that snapshot is untracked, version it in the owning repository before applying dashboard changes.
 
 # Resolution
 
@@ -49,22 +49,22 @@ Use [the observability contract](../../specs/agent-vm/contracts/observability.md
 
 ## Deployment implementation
 
-1. In the owning deployment repository, first import and version the recovered `incus-agent-vm.json` and `incus.yml` source files. Record their checksum and source revision in the deployment maintenance record; do not edit the Grafana database copy.
+1. In the owning deployment repository, copy [the public observability config example](../../../skills/agent-vm/references/observability/observability.config.json.example), fill its deployment-owned values, and render the public dashboard/provisioning bundle with `render_observability_dashboard.ts`.
 2. Add the native read-only scrape bridge or textfile collector and expose the metric families in the observability contract. Do not add a resident HTTP broker to the one-shot controller solely for dashboard access.
 3. Add CT root and `/var/lib/incus/images` filesystem series to the Prometheus target. Do not derive them from `incus_project_limit`, guest rootfs size or pool free space.
-4. Update the provisioned dashboard JSON: enable automatic refresh by default, add the capacity/admission row, rename the existing guest disk panel to `Guest rootfs allocation`, add physical pool and staging panels, add failure/state panels, and remove `* 8` from packet-per-second queries.
+4. Run `validate_observability_dashboard.ts` against the rendered files, then review the generated diff. Deployment-specific panels may be added in the owning repository when their data authority is documented.
 5. Configure horizontal dashed limit lines only from authoritative metrics or explicit policy thresholds. Do not draw a line for a missing or `-1` Incus project limit.
 6. Reload provisioning and verify the dashboard through Grafana. Confirm that the dashboard metadata remains provisioned, every panel returns fresh data, and an image-unpack failure can be distinguished from pool exhaustion, CT-root exhaustion and guest-level ENOSPC.
 
 ## Current memory lines
 
-The deployment's CT-visible memory capacity is `32768 MiB` (`32 GiB`) and its configured logical memory budget is also `32768 MiB` with a `2x` `memory_overcommit_ratio`, producing one authoritative logical limit of `65536 MiB` (`64 GiB`). The dashboard must not derive these values from PVE UI working-set values, a project quota of `-1`, or a pressure sample. The repository's generic configuration example has its own defaults and must not be used as evidence for this deployment policy.
+The current deployment's CT-visible memory capacity is `32768 MiB` (`32 GiB`) and its configured logical memory budget is also `32768 MiB` with a `2x` `memory_overcommit_ratio`, producing one authoritative logical limit of `65536 MiB` (`64 GiB`). The public template deliberately labels these series as `CT capacity` and `logical limit` and reads their values from the authoritative metrics; it must not bake this deployment policy into a reusable asset. The dashboard must not derive these values from PVE UI working-set values, a project quota of `-1`, or a pressure sample.
 
 The capacity view must show the actual CPU and memory walls separately from policy targets, and must show physical pool available bytes separately from guest rootfs allocation. The answer to “how large can the next VM be?” comes from native `allocated`, `reserved`, `remaining` and `limit` metrics across CPU, memory and disk, together with the controller's readiness and reclaim state. Pool free bytes alone are only physical headroom, not a complete admission result.
 
 ## Acceptance
 
-The dashboard is considered complete only when its source is versioned in the owning provisioning repository and the following are observable without host-manager access:
+The reusable dashboard path is considered complete when the public template renders and passes validation. A deployment is complete only when its rendered source is versioned in the owning provisioning repository and the following are observable without host-manager access:
 
 - CT root and image-staging used/available bytes.
 - Physical pool total/used/free bytes.
@@ -73,7 +73,7 @@ The dashboard is considered complete only when its source is versioned in the ow
 - Admission ready, reclaim-required and draining state.
 - Operation success/failure by phase, image-unpack failures, warnings, uptime, scrape freshness and task-state counts.
 - Horizontal dashed lines for every available authoritative limit, with no invented line for `-1` or missing values.
-- CT-visible memory capacity (`32 GiB`) and logical memory reservation limit (`64 GiB`) are separate lines; pressure and OOM are observations and do not move the logical line.
+- CT-visible memory capacity and logical memory reservation limit are separate metric-backed lines; pressure and OOM are observations and do not move the logical line.
 
 # Guardrails / Reuse notes
 
@@ -82,7 +82,7 @@ The dashboard is considered complete only when its source is versioned in the ow
 - Do not label guest rootfs allocation as physical disk usage.
 - Do not infer CT root or image-staging capacity from Incus pool capacity.
 - Do not multiply packet-per-second queries by `8`.
-- Keep deployment addresses, credentials, dashboard datasource identity and collector paths in the deployment repository or protected operator records.
+- Keep deployment addresses, credentials, dashboard datasource identity, controller job, rendered dashboard, and collector paths in the deployment repository or protected operator records. Keep only placeholders and generic defaults in the public bundle.
 
 # References
 

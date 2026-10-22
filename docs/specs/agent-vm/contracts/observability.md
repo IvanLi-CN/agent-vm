@@ -84,15 +84,17 @@ The top network TX/RX packets-per-second queries must use packet rates directly.
 
 ## Provisioning boundary
 
-The Grafana database is not a source of truth for this dashboard. The JSON, provisioning file, Prometheus scrape configuration and any collector configuration belong in the deployment repository that owns the `incus-agent-vm` dashboard. This public repository documents the metric and panel contract but does not contain deployment addresses, credentials, or a consumer-specific Grafana export.
+The Grafana database is not a source of truth for this dashboard. This public repository owns a sanitized, parameterized dashboard baseline and file-provider template under [`skills/agent-vm/references/observability`](../../../skills/agent-vm/references/observability/README.md), together with the renderer and validator. It does not contain deployment addresses, credentials, a real datasource identity, a real controller job, collector paths, or a consumer-specific rendered export.
 
-The deployment source has been located in the operator-owned `obs` stack: `grafana/dashboards/incus/incus-agent-vm.json` is loaded by `grafana/provisioning/dashboards/incus.yml`, and the Grafana service mounts both paths read-only. A recovered runtime copy may be copied back into that owning deployment checkout for versioning and review, but it must not be copied into this public repository. Treat an untracked runtime copy as a recovery artifact until its owner, checksum and source revision are recorded.
+The deployment repository renders that baseline with its explicit values and owns the resulting JSON, provisioning file, Prometheus scrape configuration and collector configuration. The renderer must replace the Grafana organization ID, Prometheus datasource UID, controller job, Dashboard UID/title/folder, and container-visible dashboard path before writing output. The generated dashboard keeps native controller queries behind a hidden `controller_job` variable, reads CPU capacity from `agent_vm_admission_cpu_capacity_vcpu`, and derives memory/disk limit lines only from authoritative metric families.
+
+The deployment source has been located in the operator-owned `obs` stack: `grafana/dashboards/incus/incus-agent-vm.json` is loaded by `grafana/provisioning/dashboards/incus.yml`, and the Grafana service mounts both paths read-only. A recovered runtime copy may be copied back into that owning deployment checkout for versioning and review. It must not replace the public template or be copied into this public repository as a deployment export. Treat an untracked runtime copy as a recovery artifact until its owner, checksum and source revision are recorded.
 
 An implementation is complete only when the provisioning source contains the dashboard changes, the scrape target exposes the native families above, Grafana loads the provisioned dashboard, and queries for CT root, image staging, physical pool, guest allocation and native admission all return fresh data.
 
 ## Verification
 
-Verify the dashboard JSON has `refresh: "auto"`, a reload leaves Grafana's refresh control at `Auto selected`, the physical and guest disk panels have distinct titles, packet-rate expressions contain no `* 8`, and every limit line is backed by a metric or explicit policy threshold. Query each metric family through the configured Prometheus datasource and verify that missing or `-1` limits do not render as zero or as an invented line.
+Run the public validator against the rendered JSON and provisioning file before deployment. Then verify the dashboard JSON has `refresh: "auto"`, a reload leaves Grafana's refresh control at `Auto selected`, the physical and guest disk panels have distinct titles, packet-rate expressions contain no `* 8`, and every limit line is backed by a metric or explicit policy threshold. Query each metric family through the configured Prometheus datasource and verify that missing or `-1` limits do not render as zero or as an invented line.
 
 ## References
 
