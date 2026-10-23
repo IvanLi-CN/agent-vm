@@ -128,7 +128,7 @@ class AgentVmDocumentationTests(unittest.TestCase):
         ops_skill = OPS_SKILL.read_text(encoding="utf-8")
         for phrase in (
             "## Guest environment readiness",
-            "`acquire` confirms guest startup and network readiness only",
+            "`acquire` confirms guest startup and network readiness, then performs the mandatory bounded guest root-filesystem post-check before exposing SSH",
             "prepare only missing prerequisites",
             "a missing `psql` client does not imply a PostgreSQL server",
             "exact `not_run` items",
@@ -136,6 +136,29 @@ class AgentVmDocumentationTests(unittest.TestCase):
         ):
             self.assertIn(phrase, agent_skill)
         self.assertIn("Keep project-specific toolchains out of the generic image", ops_skill)
+
+    def test_guest_root_growth_contract_is_explicit(self) -> None:
+        runbook = RUNBOOK.read_text(encoding="utf-8")
+        cli_contract = CLI_CONTRACT.read_text(encoding="utf-8")
+        for phrase in (
+            "separate fail-closed boundary after the virtual disk mutation",
+            "Before changing the guest, record capability and topology evidence",
+            "direct partition-backed ext4 or xfs root",
+            "already at least 95% of the requested virtual capacity is an idempotent success",
+            "one bounded partition-reread and settle retry",
+            "bounded attempt/retry chain",
+            "process-group cleanup evidence on command timeout",
+        ):
+            self.assertIn(phrase, runbook)
+        for phrase in (
+            "guest_filesystem",
+            "guest_resize_unverified",
+            "including when a bounded retry confirms that a prior mutation completed",
+            "no active lease or exposed SSH mapping",
+            "inspectable and retryable",
+            "process-group cleanup evidence on command timeout",
+        ):
+            self.assertIn(phrase, cli_contract)
 
     def test_observability_contract_separates_capacity_layers(self) -> None:
         contract = OBSERVABILITY.read_text(encoding="utf-8")

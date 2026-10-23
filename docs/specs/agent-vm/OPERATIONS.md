@@ -86,6 +86,10 @@ An ENOSPC or I/O failure in the control-state filesystem is more fundamental: op
 
 Guest-level ENOSPC is a separate observation: a guest command may fail while the control plane and CT pool remain healthy. Preserve the command error and lease state, and use normal retrieval/release rules; do not report guest ENOSPC as proof that the CT filesystem or underlying host is full.
 
+Guest root growth is a separate fail-closed boundary after the virtual disk mutation. Before changing the guest, record capability and topology evidence and require a direct partition-backed ext4 or xfs root; a root filesystem already at least 95% of the requested virtual capacity is an idempotent success. Only a classified busy or stale-partition failure may receive one bounded partition-reread and settle retry. Bound guest command diagnostics to retained stdout prefixes and stderr tails, then preserve the original guest phase, command, return code, truncation flags when present, process-group cleanup evidence on command timeout, capacity evidence, and bounded attempt/retry chain in the structured error.
+
+If acquire cannot verify guest root growth, it must not retain an active lease or SSH mapping. Cleanup leaves the record in the normal retryable cached or cleanup transition with `acquire_partial` details; inspect the guest and durable state before retrying the same operation.
+
 No part of this contract prevents all ENOSPC conditions or provides a recovery guarantee for an expired lease. It defines the safe admission and stop behavior when capacity or provenance cannot be verified.
 
 ## Related contracts
