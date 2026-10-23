@@ -50,7 +50,7 @@ The complete manifest shape, wrapper action allowlist, publisher order, rollback
 
 Compatible evolution keeps protocol 4. A breaking protocol or semantic change may require a coordinated release and an explicit client update. The remote control release is published and health-checked before the local client release is changed, so an older client can continue using compatible actions while the new client is not allowed to assume unsupported remote actions.
 
-Acquire, restart and restart-capable resize use a longer bounded transport timeout. Acquire may spend a separate bounded wait for an unrelated native lease-expiry cleanup to leave its transitional state; this wait keeps the same operation ID and does not create a second intent. No command implicitly renews a lease. Retry an uncertain mutation only with the original operation ID and generation after inspecting status or reconciliation.
+Acquire, restart and restart-capable resize use a longer bounded transport timeout. Acquire may spend up to 30 seconds waiting for an unrelated native lease-expiry cleanup to leave its transitional state; only `resource_unverified` with the exact message `transitional native instance blocks admission` is retried, while all other `resource_unverified` errors fail closed immediately. This wait preserves protocol, generation and operation ID and does not create a second intent. No command implicitly renews a lease. Retry an uncertain mutation only with the original operation ID and generation after inspecting status or reconciliation.
 
 ## SSH and ports
 

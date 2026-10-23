@@ -67,6 +67,7 @@ SEMANTIC_REVISION = 1
 MEMORY_SETTLE_SECONDS = 45
 TRANSITIONAL_ADMISSION_WAIT_SECONDS = 30
 TRANSITIONAL_ADMISSION_POLL_SECONDS = 0.25
+TRANSITIONAL_ADMISSION_ERROR_MESSAGE = "transitional native instance blocks admission"
 GUEST_READINESS_BUDGET_SECONDS = 300
 GUEST_READINESS_DIAGNOSTIC_SECONDS = 120
 DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS = 5
@@ -2911,13 +2912,13 @@ class Control:
             if stopped:
                 if record is not None and record["state"] not in {"absent", "cached"}:
                     if record["state"] != "active":
-                        raise ControlError("resource_unverified", "transitional native instance blocks admission")
+                        raise ControlError("resource_unverified", TRANSITIONAL_ADMISSION_ERROR_MESSAGE)
                     self._verify_native_allocation(record)
                 continue
             if record is None or record["state"] in {"absent", "cached"}:
                 raise ControlError("resource_unverified", "unaccounted running native instance blocks admission")
             if record["state"] != "active":
-                raise ControlError("resource_unverified", "transitional native instance blocks admission")
+                raise ControlError("resource_unverified", TRANSITIONAL_ADMISSION_ERROR_MESSAGE)
             self._verify_native_allocation(record)
 
     def _resource_diagnostics(
@@ -3169,7 +3170,7 @@ class Control:
                 return self._reserve_resources(task, resources, admission_epoch=admission_epoch)
             except ControlError as exc:
                 if (exc.code != "resource_unverified"
-                        or exc.message != "transitional native instance blocks admission"):
+                        or exc.message != TRANSITIONAL_ADMISSION_ERROR_MESSAGE):
                     raise
                 elapsed = time.monotonic() - started
                 remaining = TRANSITIONAL_ADMISSION_WAIT_SECONDS - elapsed

@@ -1133,15 +1133,62 @@ class CreationTests(Fixture):
             if len(calls) == 1:
                 raise CONTROL.ControlError(
                     "resource_unverified",
-                    "transitional native instance blocks admission",
+                    CONTROL.TRANSITIONAL_ADMISSION_ERROR_MESSAGE,
                 )
             return original_guard()
 
-        with mock.patch.object(self.control, "_running_inventory_guard", side_effect=guard):
-            result = self.acquire("transition")
+        request = self.request("acquire", "transition", operation="transition-acquire", public_key=KEY)
+        with mock.patch.object(self.control, "_running_inventory_guard", side_effect=guard), \
+             mock.patch.object(CONTROL.time, "sleep") as sleep:
+            response = self.control.dispatch(request)
 
+        result = response["result"]
         self.assertEqual(result["state"], "active")
         self.assertEqual(len(calls), 2)
+        self.assertEqual(response["operation_id"], request["operation_id"])
+        self.assertEqual(response["generation"], request["generation"])
+        journal = self.store.operation(request["operation_id"])
+        self.assertEqual(journal["operation_id"], request["operation_id"])
+        self.assertEqual(journal["generation"], request["generation"])
+        self.assertEqual(journal["result"]["generation"], result["generation"])
+        sleep.assert_called_once_with(CONTROL.TRANSITIONAL_ADMISSION_POLL_SECONDS)
+
+    def test_other_resource_unverified_errors_fail_closed_without_wait(self):
+        task = self.control._base_task("unverified", 1)
+        resources = {"cpu": 2, "memory_mib": 4096, "disk_gib": 20}
+        failure = CONTROL.ControlError("resource_unverified", "disk admission state is not verified")
+        with mock.patch.object(self.control, "_reserve_resources", side_effect=failure) as reserve, \
+             mock.patch.object(CONTROL.time, "sleep") as sleep:
+            with self.assertRaises(CONTROL.ControlError) as raised:
+                self.control._reserve_resources_with_transition_wait(
+                    task, resources, admission_epoch="admission-epoch"
+                )
+
+        self.assertIs(raised.exception, failure)
+        reserve.assert_called_once_with(task, resources, admission_epoch="admission-epoch")
+        sleep.assert_not_called()
+
+    def test_transitional_admission_wait_is_bounded(self):
+        task = self.control._base_task("timeout", 1)
+        resources = {"cpu": 2, "memory_mib": 4096, "disk_gib": 20}
+        failure = CONTROL.ControlError(
+            "resource_unverified",
+            CONTROL.TRANSITIONAL_ADMISSION_ERROR_MESSAGE,
+            {"task_id": task["task_id"]},
+        )
+        with mock.patch.object(self.control, "_reserve_resources", side_effect=failure) as reserve, \
+             mock.patch.object(CONTROL.time, "monotonic", side_effect=[0.0, 0.1, 30.0]), \
+             mock.patch.object(CONTROL.time, "sleep") as sleep:
+            with self.assertRaises(CONTROL.ControlError) as raised:
+                self.control._reserve_resources_with_transition_wait(task, resources)
+
+        self.assertEqual(raised.exception.code, "resource_unverified")
+        self.assertEqual(raised.exception.message, CONTROL.TRANSITIONAL_ADMISSION_ERROR_MESSAGE)
+        self.assertEqual(raised.exception.detail["task_id"], task["task_id"])
+        self.assertEqual(raised.exception.detail["admission_retry_count"], 1)
+        self.assertEqual(raised.exception.detail["admission_wait_seconds"], 30.0)
+        self.assertEqual(reserve.call_count, 2)
+        sleep.assert_called_once_with(CONTROL.TRANSITIONAL_ADMISSION_POLL_SECONDS)
 
     def test_memory_pressure_does_not_block_cached_resume_with_logical_headroom(self):
         first = self.acquire("cache")
