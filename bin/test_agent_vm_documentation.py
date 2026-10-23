@@ -15,6 +15,7 @@ CLI_CONTRACT = ROOT / "docs/specs/agent-vm/contracts/cli.md"
 RELEASE_CONTRACT = ROOT / "docs/specs/agent-vm/contracts/release.md"
 ADR = ROOT / "docs/adr/0028-agent-vm-topology-recovery-boundary.md"
 OPS_SKILL = ROOT / "skills/agent-vm-ops/SKILL.md"
+AGENT_SKILL = ROOT / "skills/agent-vm/SKILL.md"
 DEPLOYMENT = ROOT / "skills/agent-vm-ops/references/deployment.md"
 OBSERVABILITY = ROOT / "docs/specs/agent-vm/contracts/observability.md"
 OBSERVABILITY_SOLUTION = ROOT / "docs/solutions/agent-vm/observability-dashboard.md"
@@ -121,6 +122,20 @@ class AgentVmDocumentationTests(unittest.TestCase):
         for document in (spec, cli_contract, release_contract, adr, ops_skill, deployment):
             self.assertNotRegex(document, re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+"))
             self.assertNotRegex(document, re.compile(r"\b(?:10|172|192\.168)\.\d+\.\d+\.\d+\b"))
+
+    def test_guest_environment_readiness_is_scoped(self) -> None:
+        agent_skill = AGENT_SKILL.read_text(encoding="utf-8")
+        ops_skill = OPS_SKILL.read_text(encoding="utf-8")
+        for phrase in (
+            "## Guest environment readiness",
+            "`acquire` confirms guest startup and network readiness only",
+            "prepare only missing prerequisites",
+            "a missing `psql` client does not imply a PostgreSQL server",
+            "exact `not_run` items",
+            "never claim the full suite ran",
+        ):
+            self.assertIn(phrase, agent_skill)
+        self.assertIn("Keep project-specific toolchains out of the generic image", ops_skill)
 
     def test_observability_contract_separates_capacity_layers(self) -> None:
         contract = OBSERVABILITY.read_text(encoding="utf-8")

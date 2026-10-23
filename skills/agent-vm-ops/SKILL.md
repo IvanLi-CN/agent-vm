@@ -25,7 +25,7 @@ Client/control use protocol 4. It adds explicit live memory-only adjustment; inc
 
 ## Images and exact cleanup
 
-Prepare a Debian 13 image with OpenSSH, Python, rsync, Docker/Compose and growpart, verify guest startup and pin the accepted fingerprint. VM image pinning does not restrict a project's container images. Keep non-ephemeral instances and `boot.autostart=false`.
+Prepare a Debian 13 image with OpenSSH, Python, rsync, Docker/Compose and growpart, verify guest startup and pin the accepted fingerprint. Keep project-specific toolchains out of the generic image; maintain and verify image capabilities separately. VM image pinning does not restrict a project's container images. Keep non-ephemeral instances and `boot.autostart=false`.
 
 Inspect `agent-vm admin reconcile` and `agent-vm admin gc` dry-runs first. Use `--apply` only within the maintenance task's exact scope. Recheck managed identity, lease generation, state and native resources before deleting anything. Manual GC selects all stopped, no-valid-lease managed caches with confirmed access cleanup, regardless of age. Apply only the authorized scope after reviewing the preview. The native age timer independently selects caches idle at least 24 hours; admission-triggered disk reclaim selects eligible caches oldest first and stops when enough space exists. There is no minimum cache retention time. Never target valid leases, transitional objects, a current resize target, unknown resources or revocation backups. Do not flush conntrack globally.
 

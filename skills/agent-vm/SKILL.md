@@ -17,6 +17,10 @@ The first lease lasts 30 minutes. Explicit `agent-vm renew` adds 15 minutes up t
 
 Use `agent-vm ssh` for normal root SSH and `agent-vm exec -- <argv>` for commands. For shell syntax call a shell explicitly, for example `agent-vm exec -- sh -lc 'cd /workspace && make test'`. Guest root, ordinary files, background processes and the project's own Docker/Compose workflow are available. This does not authorize CT/PVE maintenance, Incus socket use or management of other sessions.
 
+## Guest environment readiness
+
+`acquire` confirms guest startup and network readiness only. Before validation, inspect the selected test command and project CI/configuration for required tools and services. Check installed versions, then prepare only missing prerequisites using a project-pinned, idempotent setup or the VM image. Do not install tools merely because a manifest exists, guess floating versions, or start services not required by the selected checks. Treat clients and services separately; a missing `psql` client does not imply a PostgreSQL server. Guest preparation stays inside the leased VM and does not authorize host, CT, Incus, or image maintenance. If a prerequisite has no deterministic setup path, run independent checks and report the exact `not_run` items; never claim the full suite ran.
+
 ## Retain and renew
 
 Keep this session's VM while the current task is likely to use it again, including reuse of build caches. Finishing one validation, waiting for CI/review/owner feedback, publishing a PR or reaching a readiness handoff does not alone end that need. When handing back a retained VM, state its expected follow-up use and server deadline.
