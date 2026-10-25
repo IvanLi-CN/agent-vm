@@ -19,8 +19,11 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-      - name: Record Bun version
-        run: bun --version
+      - name: Record validation runtimes
+        run: |
+          bun --version
+          git --version
+          uname -s
       - name: Install locked Bun dependencies
         run: bun install --frozen-lockfile
       - uses: actions/setup-python@v5
