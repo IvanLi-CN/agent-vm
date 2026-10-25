@@ -46,8 +46,10 @@ func TestEscapedDescendantIsDetectedAndCleaned(t *testing.T) {
 	}
 	pidPath := filepath.Join(t.TempDir(), "pid")
 	runner := NewRunner()
-	command := "/bin/sh -c 'echo $$ > \"$1\"; sleep 30' sh '" + pidPath + "'"
-	_, err := runner.Run(context.Background(), []string{"/bin/sh", "-c", "setsid " + command + " & exit 0"}, nil)
+	command := `setsid /bin/sh -c 'echo $$ > "$1"; sleep 30' sh "$1" &
+while [ ! -s "$1" ]; do sleep 0.01; done
+exit 0`
+	_, err := runner.Run(context.Background(), []string{"/bin/sh", "-c", command, "sh", pidPath}, nil)
 	if err == nil || !strings.Contains(err.Error(), "child processes") {
 		t.Fatalf("Run error = %v, want escaped child failure", err)
 	}
