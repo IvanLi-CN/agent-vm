@@ -52,11 +52,15 @@ func TestEscapedDescendantIsDetectedAndCleaned(t *testing.T) {
 		t.Fatalf("Run error = %v, want escaped child failure", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
+	var lastPID int
+	var lastStat []byte
 	for time.Now().Before(deadline) {
 		raw, readErr := os.ReadFile(pidPath)
 		if readErr == nil {
 			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(raw)))
 			if parseErr == nil {
+				lastPID = pid
+				lastStat, _ = os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 				if _, statErr := os.Stat("/proc/" + strconv.Itoa(pid)); os.IsNotExist(statErr) {
 					return
 				}
@@ -64,5 +68,5 @@ func TestEscapedDescendantIsDetectedAndCleaned(t *testing.T) {
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("escaped descendant still exists after runner cleanup")
+	t.Fatalf("escaped descendant still exists after runner cleanup: pid=%d stat=%q", lastPID, lastStat)
 }
