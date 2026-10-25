@@ -4,13 +4,13 @@
 
 This topic defines a one-shot client and control process for session-owned Linux VMs on a configured Incus host. The public repository documents the lifecycle contract and ships the implementation; deployments provide their own project, image, network, address pool, storage path, state database and control address through explicit configuration.
 
-The design intentionally excludes resident brokers, HTTP APIs, polling loops, implicit keepalives, shared host workspaces, exported archives and guarantees that survive lease expiry.
+The design excludes public brokers, arbitrary HTTP gateways, polling by the client, implicit keepalives, shared host workspaces, exported archives and guarantees that survive lease expiry. The control environment includes one protected Go resident service; its internal UDS API and scheduler are implementation boundaries, not a new public client surface.
 
 The deployment topology is layered: the local Codex client reaches a configured Agent VM control endpoint; the control environment runs inside the observed CT109 LXC; the control environment owns session-scoped Incus VMs; and the physical or virtual source below CT109 is outside the verified public boundary. A control endpoint is an entry path, not evidence of the underlying host or its rebuild authority. The concrete address and live inventory remain in protected deployment records.
 
 ## Session and transport
 
-Session-scoped requests carry a `session_id`; the sessionless read-only `admin-metrics` request omits it and rejects both `session_id` and `operation_id`. The CLI selects a session from explicit `--session-id` first and `AGENT_VM_SESSION_ID` second for session-scoped actions. A missing value returns `missing_session` before any remote write. Session identity is ownership metadata and is not an authentication mechanism. The client sends one versioned JSON request over the configured SSH control path and emits one JSON response; diagnostics go to stderr.
+Session-scoped requests carry a `session_id`; the sessionless read-only `admin-metrics` request omits it and rejects both `session_id` and `operation_id`. The CLI selects a session from explicit `--session-id` first and `AGENT_VM_SESSION_ID` second for session-scoped actions. A missing value returns `missing_session` before any remote write. Session identity is ownership metadata and is not an authentication mechanism. The client sends one versioned JSON request over the configured control path and emits one JSON response; diagnostics go to stderr. Format-1 client views use the legacy Bun control entry. Format-2 client views select the fixed `legacy-bun` or `go-request` transport; `go-request` retains SSH as a compatibility adapter while the remote Go request process sends the same body over the protected control UDS.
 
 Protocol 4 is required by both client and control. Mutations include an operation ID and lease generation. The control persists requests and outcomes, rejects incompatible or conflicting retries, and never replays an uncertain native mutation automatically.
 
@@ -36,9 +36,9 @@ Manual garbage collection is dry-run by default and selects only stopped managed
 
 ## Control-plane releases and compatibility
 
-The control environment remains the sole authority for Incus operations, durable lifecycle state, lease generations, capacity admission, native mappings, and systemd maintenance. The local `agent-vm` CLI is a versioned SSH request client; publication, update, and rollback are operator-owned deployment actions and are not public CLI lifecycle commands. Unattended control-plane updates are disabled by default.
+The Go control service remains the sole authority for Incus operations, durable lifecycle state, lease generations, capacity admission, native mappings, observation snapshots and maintenance. Its in-process scheduler owns lease expiry, startup compensation, bounded retries and cache age-GC; systemd starts and restarts the service but is not the durable scheduler. The local `agent-vm` CLI remains a versioned request client; publication, update and rollback are operator-owned deployment actions and are not public CLI lifecycle commands. Unattended control-plane updates are disabled by default.
 
-A control-plane release is a logical compatibility unit containing the local client, the remote one-shot control script, systemd unit assets, and a release manifest. The manifest records the selected source revision, exact artifact checksums, protocol, and per-operation request/response/semantic compatibility in each supported direction. Deployment configuration, credentials, connection material, state database and WAL/journals, locks, Incus VM data, and guest images are outside the release.
+A control-plane release is a logical compatibility unit containing the local client, the legacy bridge or Go control binary, systemd unit assets, and a release manifest. Format 1 describes the Bun one-shot release; format 2 also records the Go target/toolchain, fixed transport enum and retired legacy units. Both formats record exact artifact checksums, protocol, and per-operation request/response/semantic compatibility in each supported direction. Deployment configuration, credentials, connection material, state database and WAL/journals, locks, Incus VM data, and guest images are outside the release.
 
 Compatible operations may continue across different release revisions with a structured warning. Compatibility is not inferred from parseability: an unsupported action, incompatible schema or semantic change, invalid checksum, or incompatible protocol MUST fail before any durable or native effect. A compatible evolution preserves the established protocol contract; a breaking evolution may require a new protocol and an explicit client update.
 
@@ -66,7 +66,7 @@ Operational dashboards MUST distinguish CT filesystem capacity, transient image 
 
 ### REQ-AGENT-VM-014 - Control-plane update authority
 
-Control-plane publication, update, and rollback MUST remain operator-owned deployment actions. The public `agent-vm` CLI MUST remain a lifecycle/request client and MUST NOT acquire Incus/PVE authority, expose a public self-update command, or become a second control plane. The remote one-shot control process MUST remain the canonical execution artifact for both SSH requests and systemd maintenance.
+Control-plane publication, update, and rollback MUST remain operator-owned deployment actions. The public `agent-vm` CLI MUST remain a lifecycle/request client and MUST NOT acquire Incus/PVE authority, expose a public self-update command, or become a second control plane. The Go `serve` process MUST remain the sole live control authority; the legacy Bun control process is permitted only as a verified compatibility release or forwarding bridge and MUST NOT run concurrently against live state.
 
 ### REQ-AGENT-VM-015 - Method-level compatibility
 
@@ -117,6 +117,7 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 - [Agent VM control-plane update boundary](../../adr/0030-agent-vm-control-plane-update-boundary.md)
 - [Agent VM CPU startup pressure for overcommit](../../adr/0032-agent-vm-cpu-startup-pressure-for-overcommit.md)
 - [Agent VM capacity and inventory observability](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)
+- [Agent VM Go resident control runtime](../../adr/0037-agent-vm-go-control-runtime.md)
 
 ## Related material
 

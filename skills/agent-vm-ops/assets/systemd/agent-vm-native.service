@@ -1,0 +1,20 @@
+[Unit]
+Description=Agent VM native Go control service
+After=incus.service
+Wants=incus.service
+
+[Service]
+Type=simple
+ExecStart=/opt/agent-vm-native/bin/agent-vm-control serve --config /etc/agent-vm-native/config.json --manifest /opt/agent-vm-native/release-manifest.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateTmp=yes
+UMask=0077
+RuntimeDirectory=agent-vm-native
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

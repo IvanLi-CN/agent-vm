@@ -19,9 +19,13 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
       - name: Record validation runtimes
         run: |
           bun --version
+          go version
           git --version
           uname -s
       - name: Install locked Bun dependencies
@@ -38,9 +42,22 @@ jobs:
         run: python3 -m pip install --disable-pip-version-check -r requirements-dev.txt
       - name: Typecheck
         run: bun run typecheck
+      - name: Go control vet
+        run: go -C skills/agent-vm-ops/control vet ./...
+      - name: Build Go control targets
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          build_root="$(mktemp -d)"
+          trap 'rm -rf "$build_root"' EXIT
+          bun run skills/agent-vm-ops/scripts/build_go_control.ts --source-revision "$GITHUB_SHA" --target linux/amd64 --output "$build_root/amd64/agent-vm-control"
+          bun run skills/agent-vm-ops/scripts/build_go_control.ts --source-revision "$GITHUB_SHA" --target linux/arm64 --output "$build_root/arm64/agent-vm-control"
       - name: Run repository checks
         run: bun run check
       - name: Run repository tests
         run: bun run test:repo
       - name: Run Skill tests
         run: bun run test:skills
+      - name: Run Linux race tests
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: skills/agent-vm-ops/control
+        run: go test -race -count=1 ./...

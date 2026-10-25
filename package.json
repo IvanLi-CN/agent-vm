@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "bun node_modules/typescript/bin/tsc --noEmit",
-    "check": "bun run typecheck && bun run bin/spec_contract_check.ts --path docs/specs/project-foundation/SPEC.md && bun run bin/skills_index_check.ts && bun run bin/public_boundary_check.ts && bun run bin/public_skill_boundary_check.ts && bun run bin/public_tool_boundary_check.ts && bun run bin/foundation_contract_check.ts",
+    "check": "bun run typecheck && bun run bin/spec_contract_check.ts --path docs/specs/project-foundation/SPEC.md && bun run bin/skills_index_check.ts && bun run bin/public_boundary_check.ts && bun run bin/public_skill_boundary_check.ts && bun run bin/public_tool_boundary_check.ts && bun run bin/foundation_contract_check.ts && go -C skills/agent-vm-ops/control vet ./...",
     "test:repo": "bun run bin/test_runner.ts --scope repo",
     "test:skills": "bun run bin/test_runner.ts --scope skills"
   },

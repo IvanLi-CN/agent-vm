@@ -34,10 +34,11 @@ export function loadRelease(path: string): [Data, Data[]] {
   if (!info.isFile() || info.isSymbolicLink()) fail("release_metadata_invalid", "release sidecar is not a regular file");
   let raw;
   try { raw = readJson(path); } catch { fail("release_metadata_invalid", "release sidecar is not valid UTF-8 JSON"); }
-  if (!shape(raw, ["format", "release_id", "source_revision", "protocol", "client_artifact", "client_dependencies", "client_view"]) || raw.format !== 1 || typeof raw.source_revision !== "string" || !/^[0-9a-f]{40}$/.test(raw.source_revision) || raw.release_id !== raw.source_revision) fail("release_metadata_invalid", "release sidecar has an invalid shape or identity");
+  if (!shape(raw, ["format", "release_id", "source_revision", "protocol", "client_artifact", "client_dependencies", "client_view"]) || ![1, 2].includes(raw.format) || typeof raw.source_revision !== "string" || !/^[0-9a-f]{40}$/.test(raw.source_revision) || raw.release_id !== raw.source_revision) fail("release_metadata_invalid", "release sidecar has an invalid shape or identity");
   if (raw.protocol !== PROTOCOL) fail("protocol_unsupported", "release sidecar protocol must be 4");
   const v = raw.client_view;
-  if (!shape(v, ["release_id", "source_revision", "protocol", "actions"]) || v.release_id !== raw.release_id || v.source_revision !== raw.source_revision || v.protocol !== PROTOCOL || !shape(v.actions, ACTIONS)) fail("release_metadata_invalid", "client_view identity or fixed action set differs");
+  const viewKeys = raw.format === 2 ? ["release_id", "source_revision", "protocol", "transport", "actions"] : ["release_id", "source_revision", "protocol", "actions"];
+  if (!shape(v, viewKeys) || v.release_id !== raw.release_id || v.source_revision !== raw.source_revision || v.protocol !== PROTOCOL || raw.format === 2 && !["legacy-bun", "go-request"].includes(v.transport) || !shape(v.actions, ACTIONS)) fail("release_metadata_invalid", "client_view identity, transport or fixed action set differs");
   for (const action of ACTIONS) {
     const s = v.actions[action];
     if (!shape(s, ["request", "response", "client_to_control", "control_to_client"])) fail("release_metadata_invalid", "client_view action has an invalid shape");
@@ -50,7 +51,7 @@ export function loadRelease(path: string): [Data, Data[]] {
     if (matches.length !== 1) fail("release_metadata_invalid", "client dependency is missing or duplicated");
     verifyArtifact(path, matches[0], name, "support", mode);
   }
-  return [{ release_id: raw.release_id, source_revision: raw.source_revision, protocol: PROTOCOL, manifest_present: true, artifacts_verified: true, actions: v.actions }, []];
+  return [{ release_id: raw.release_id, source_revision: raw.source_revision, protocol: PROTOCOL, manifest_present: true, artifacts_verified: true, transport: raw.format === 2 ? v.transport : "legacy-bun", actions: v.actions }, []];
 }
 function verifyArtifact(path: string, a: any, name: string, role: string, mode: number): void {
   if (!shape(a, ["name", "path", "role", "sha256", "mode"]) || a.role !== role || a.name !== name || a.path !== name || typeof a.sha256 !== "string" || !/^[0-9a-f]{64}$/.test(a.sha256) || a.mode !== mode) fail("release_metadata_invalid", `artifact must identify ${name} with its fixed role and mode`);

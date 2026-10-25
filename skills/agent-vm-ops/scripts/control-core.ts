@@ -24,7 +24,7 @@ export class ControlCore {
   release_manifest_path: string; release_fence_path: string;
   release_manifest: Data | null = null; release_manifest_present = false; release_artifacts_verified = true;
   release_manifest_error: ControlError | null = null; release_warnings: Data[] = [];
-  lock_path: string; admission_lock_path: string;
+  lock_path: string; authority_lock_path: string; admission_lock_path: string;
   constructor(config: Data, { runner, store, systemd, clock = () => new Date(), resources }: { runner?: CommandRunner; store?: StateStore; systemd?: SystemdManager; clock?: () => Date; resources?: Data } = {}) {
     this.config = { ...config }; this.runner = runner ?? new CommandRunner(); this.clock = clock;
     this.release_manifest_path = config.release_manifest_path ?? join(import.meta.dir, "release-manifest.json");
@@ -39,7 +39,7 @@ export class ControlCore {
     }
     this.store = store ?? new StateStore(config.state_db); this.incus = new IncusClient(this.runner, config);
     this.systemd = systemd ?? new SystemdManager(this.runner, config); this.resources = resources ?? new CTResources();
-    this.lock_path = join(dirname(config.state_db), "control.lock"); this.admission_lock_path = join(dirname(config.state_db), "admission.lock");
+    this.lock_path = join(dirname(config.state_db), "control.lock"); this.authority_lock_path = join(dirname(config.state_db), "authority.lock"); this.admission_lock_path = join(dirname(config.state_db), "admission.lock");
   }
   static _is_write_action(action: string, request?: Data): boolean {
     if (action === "admin-reconcile" && request && (request.apply ?? false) === false && !("operation_id" in request) && !("generation" in request)) return false;
@@ -47,6 +47,7 @@ export class ControlCore {
   }
   _is_write_action(action: string, request?: Data): boolean { return ControlCore._is_write_action(action, request); }
   _global_lock<T>(fn: () => Promise<T> | T): Promise<T> { return with_lock(this.lock_path, fn); }
+  _authority_lock<T>(fn: () => Promise<T> | T): Promise<T> { return with_lock(this.authority_lock_path, fn, true, false, true); }
   _admission_lock<T>(fn: () => Promise<T> | T): Promise<T> { return with_lock(this.admission_lock_path, fn); }
   _object_lock<T>(identity: string, fn: () => Promise<T> | T, blocking: boolean | Data = true): Promise<T> { return with_lock(object_lock_path(dirname(this.store.path), identity), fn, typeof blocking === "object" ? blocking.blocking !== false : blocking); }
   _native_lock<T>(task: Data, fn: () => Promise<T> | T): Promise<T> { return with_lock(object_lock_path(dirname(this.store.path), "native:" + task.session_id), fn, true, true); }
@@ -73,18 +74,20 @@ export class ControlCore {
     return this._merge_warnings(this.release_warnings, warnings);
   }
   async dispatch(request: any): Promise<Data> {
-    if (!is_record(request)) throw new ControlError("invalid_request", "request must be an object");
-    const warnings = this._preflight_release(request), action = request.action;
-    let session = request.session_id ?? null;
-    if (action === "timer-expire") session = this.store.get_task({ task_id: String(request.task_id) })?.session_id ?? "missing-timer";
-    const identity = ControlCore.SESSION_ACTIONS.has(action) || action === "timer-expire" ? "session:" + String(session) : "admin";
-    return this._object_lock(identity, async () => {
-      if (action === "timer-expire") await this._expire_preempt(request);
-      if (this._is_write_action(action, request)) {
-        const operation = require_string(request.operation_id, "operation_id", SESSION_ID_RE);
-        return this._object_lock("operation:" + operation, () => this._dispatch_locked(request, warnings));
-      }
-      return this._dispatch_locked(request, warnings);
+    return this._authority_lock(async () => {
+      if (!is_record(request)) throw new ControlError("invalid_request", "request must be an object");
+      const warnings = this._preflight_release(request), action = request.action;
+      let session = request.session_id ?? null;
+      if (action === "timer-expire") session = this.store.get_task({ task_id: String(request.task_id) })?.session_id ?? "missing-timer";
+      const identity = ControlCore.SESSION_ACTIONS.has(action) || action === "timer-expire" ? "session:" + String(session) : "admin";
+      return this._object_lock(identity, async () => {
+        if (action === "timer-expire") await this._expire_preempt(request);
+        if (this._is_write_action(action, request)) {
+          const operation = require_string(request.operation_id, "operation_id", SESSION_ID_RE);
+          return this._object_lock("operation:" + operation, () => this._dispatch_locked(request, warnings));
+        }
+        return this._dispatch_locked(request, warnings);
+      });
     });
   }
   _annotate_state_error(error: ControlError, { action, operation_id }: Data): ControlError {

@@ -20,14 +20,17 @@ import { toArrayBuffer } from "bun:ffi";
 function native_errno(): number { const address = libc()[process.platform === "linux" ? "__errno_location" : "__error"](); return new Int32Array(toArrayBuffer(address, 0, 4))[0]; }
 
 const lockContext = new AsyncLocalStorage<Set<string>>();
-export async function with_lock<T>(path: string, callback: () => Promise<T> | T, blocking = true, reentrant = false): Promise<T> {
+export async function with_lock<T>(path: string, callback: () => Promise<T> | T, blocking = true, reentrant = false, shared = false): Promise<T> {
   const held = lockContext.getStore();
   if (reentrant && held?.has(path)) return callback();
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   const fd = openSync(path, constants.O_RDWR | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
   try {
     for (;;) {
-      if (libc().flock(fd, 2 | 4) === 0) break;
+      // Always probe with LOCK_NB so the caller controls retry behavior and
+      // can return object_busy without blocking the event loop.
+      const lockFlags = (shared ? 1 : 2) | 4;
+      if (libc().flock(fd, lockFlags) === 0) break;
       const code = native_errno();
       if (code !== 11 && code !== 35) throw new ControlError("lock_unavailable", "native lock cannot be verified", { errno: code });
       if (!blocking) throw new ControlError("object_busy", "resource is being changed");

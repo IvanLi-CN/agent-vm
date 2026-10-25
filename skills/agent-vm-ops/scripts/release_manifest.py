@@ -15,6 +15,7 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import stat
+import struct
 import subprocess
 from typing import Any, Mapping
 
@@ -121,6 +122,40 @@ FIXED_ARTIFACTS = frozenset({
     ("unit:agent-vm-native-age-gc.timer", "systemd/agent-vm-native-age-gc.timer", "unit", 0o644),
     ("unit:agent-vm-native-expire@.service", "systemd/agent-vm-native-expire@.service", "unit", 0o644),
     ("unit:agent-vm-native-reconcile.service", "systemd/agent-vm-native-reconcile.service", "unit", 0o644),
+})
+
+# Format 2 is the immutable Go control publication.  It deliberately lives
+# beside the format-1 validator so Python release tooling can inspect either
+# supported client view without importing or executing candidate artifacts.
+GO_MANIFEST_FORMAT = 2
+GO_TOOLCHAIN = "go1.27.3"
+GO_TARGETS = ("linux/amd64", "linux/arm64")
+GO_CLIENT_TRANSPORTS = ("legacy-bun", "go-request")
+GO_RETIRED_UNITS = (
+    "agent-vm-native-age-gc.service",
+    "agent-vm-native-age-gc.timer",
+    "agent-vm-native-expire@.service",
+    "agent-vm-native-reconcile.service",
+)
+GO_UNIT_EXEC_START = {
+    "agent-vm-native.service":
+        "ExecStart=/opt/agent-vm-native/bin/agent-vm-control serve --config /etc/agent-vm-native/config.json",
+}
+GO_UNIT_CONTENT_SHA256 = {
+    "agent-vm-native.service": "1cb0aa101a8ccbc2fbb8ab9e5c8d02fbf89b7c70e3c041d8d3daf5ba27fa68f1",
+}
+GO_FIXED_ARTIFACTS = frozenset({
+    ("agent_vm.ts", "agent_vm.ts", "client", 0o755),
+    ("byte-fs.ts", "byte-fs.ts", "support", 0o644),
+    ("client-io.ts", "client-io.ts", "support", 0o644),
+    ("client-release.ts", "client-release.ts", "support", 0o644),
+    ("client.ts", "client.ts", "support", 0o644),
+    ("guest-source.ts", "guest-source.ts", "support", 0o644),
+    ("sync-native.ts", "sync-native.ts", "support", 0o644),
+    ("sync_worktree.ts", "sync_worktree.ts", "support", 0o755),
+    ("agent_vm_control_bridge.ts", "agent_vm_control_bridge.ts", "control", 0o755),
+    ("agent-vm-control", "bin/agent-vm-control", "control", 0o755),
+    ("unit:agent-vm-native.service", "systemd/agent-vm-native.service", "unit", 0o644),
 })
 
 
@@ -439,6 +474,130 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     return result
 
 
+def _validate_go_actions(value: Any) -> dict[str, dict[str, Any]]:
+    raw_actions = _require_mapping(value, "actions")
+    if set(raw_actions) != set(ACTION_NAMES):
+        raise _error(
+            "manifest_action_set_invalid",
+            "Go manifest action set differs from the fixed control surface",
+            {"expected": list(ACTION_NAMES), "actual": sorted(raw_actions)},
+        )
+    actions: dict[str, dict[str, Any]] = {}
+    expected = {"request", "response", "client_to_control", "control_to_client"}
+    for action, raw_spec in raw_actions.items():
+        action_name = _require_string(action, "action", re.compile(r"^[a-z][a-z0-9-]{0,63}$"))
+        spec = _require_mapping(raw_spec, f"actions.{action_name}")
+        if set(spec) != expected:
+            raise _error("manifest_invalid", f"actions.{action_name} has an unexpected shape")
+        request = _schema(spec["request"], f"actions.{action_name}.request")
+        response = _schema(spec["response"], f"actions.{action_name}.response")
+        c2c = _window(spec["client_to_control"], f"actions.{action_name}.client_to_control")
+        c2l = _window(spec["control_to_client"], f"actions.{action_name}.control_to_client")
+        if not c2c["schema_min"] <= request["schema"] <= c2c["schema_max"] or not c2c["semantic_min"] <= request["semantic_revision"] <= c2c["semantic_max"]:
+            raise _error("manifest_invalid", f"actions.{action_name} request is outside its declared window")
+        if not c2l["schema_min"] <= response["schema"] <= c2l["schema_max"] or not c2l["semantic_min"] <= response["semantic_revision"] <= c2l["semantic_max"]:
+            raise _error("manifest_invalid", f"actions.{action_name} response is outside its declared window")
+        actions[action_name] = {
+            "request": request,
+            "response": response,
+            "client_to_control": c2c,
+            "control_to_client": c2l,
+        }
+    return actions
+
+
+def _go_artifact(value: Any, index: int) -> dict[str, Any]:
+    item = _require_mapping(value, f"artifacts[{index}]")
+    if set(item) != {"name", "path", "role", "sha256", "mode"}:
+        raise _error("manifest_invalid", f"artifacts[{index}] has an unexpected shape")
+    name = _require_string(item["name"], f"artifacts[{index}].name", re.compile(r"^[A-Za-z0-9_.:@-]{1,120}$"))
+    path = _safe_relative_path(item["path"], f"artifacts[{index}].path")
+    role = _require_string(item["role"], f"artifacts[{index}].role", re.compile(r"^(client|control|support|unit)$"))
+    digest = _require_string(item["sha256"], f"artifacts[{index}].sha256", SHA256_RE)
+    mode = _require_int(item["mode"], f"artifacts[{index}].mode", 0, 0o777)
+    return {"name": name, "path": path, "role": role, "sha256": digest, "mode": mode}
+
+
+def validate_go_manifest(value: Any) -> dict[str, Any]:
+    """Validate a format-2 Go control manifest without running its artifacts."""
+    root = _require_mapping(value, "manifest")
+    required = {"format", "release_id", "source_revision", "protocol", "target", "toolchain", "artifacts", "actions", "client_view", "retired_units"}
+    if set(root) != required:
+        raise _error("manifest_invalid", "Go manifest has an unexpected shape", {"fields": sorted(set(root) ^ required)})
+    if _require_int(root["format"], "format", 1) != GO_MANIFEST_FORMAT:
+        raise _error("manifest_format_unsupported", "manifest format must be 2")
+    source_revision = _require_string(root["source_revision"], "source_revision", SOURCE_REVISION_RE)
+    if root["release_id"] != source_revision or _require_int(root["protocol"], "protocol", 1) != PROTOCOL_VERSION:
+        raise _error("manifest_invalid", "Go manifest identity or protocol is invalid")
+
+    target = _require_mapping(root["target"], "target")
+    if set(target) != {"os", "arch"} or target["os"] != "linux" or target["arch"] not in {"amd64", "arm64"}:
+        raise _error("manifest_invalid", "target must be linux/amd64 or linux/arm64")
+    toolchain = _require_mapping(root["toolchain"], "toolchain")
+    if set(toolchain) != {"go", "cgo_enabled"} or toolchain["go"] != GO_TOOLCHAIN or toolchain["cgo_enabled"] is not False:
+        raise _error("manifest_invalid", "Go toolchain declaration is invalid")
+    retired_units = root["retired_units"]
+    if retired_units != list(GO_RETIRED_UNITS):
+        raise _error("manifest_invalid", "retired unit set differs from the fixed transition set")
+
+    raw_artifacts = root["artifacts"]
+    if not isinstance(raw_artifacts, list) or len(raw_artifacts) != len(GO_FIXED_ARTIFACTS):
+        raise _error("manifest_artifact_set_invalid", "Go artifact set is incomplete")
+    artifacts = [_go_artifact(item, index) for index, item in enumerate(raw_artifacts)]
+    actual = {(item["name"], item["path"], item["role"], item["mode"]) for item in artifacts}
+    if actual != GO_FIXED_ARTIFACTS:
+        raise _error("manifest_artifact_set_invalid", "Go artifact set differs from the fixed release allowlist", {"expected": sorted(GO_FIXED_ARTIFACTS), "actual": sorted(actual)})
+    if len({item["name"] for item in artifacts}) != len(artifacts) or len({item["path"] for item in artifacts}) != len(artifacts):
+        raise _error("manifest_invalid", "Go artifact names and paths must be unique")
+
+    actions = _validate_go_actions(root["actions"])
+    client_view = _require_mapping(root["client_view"], "client_view")
+    if set(client_view) != {"release_id", "source_revision", "protocol", "transport", "actions"}:
+        raise _error("manifest_invalid", "Go client_view has an unexpected shape")
+    transport = client_view["transport"]
+    if client_view["release_id"] != source_revision or client_view["source_revision"] != source_revision or _require_int(client_view["protocol"], "client_view.protocol", 1) != PROTOCOL_VERSION or transport not in GO_CLIENT_TRANSPORTS:
+        raise _error("manifest_invalid", "Go client_view identity or transport is invalid")
+    if json.dumps(client_view["actions"], sort_keys=True, separators=(",", ":")) != json.dumps(actions, sort_keys=True, separators=(",", ":")):
+        raise _error("manifest_invalid", "Go client_view actions differ from manifest actions")
+    return {
+        "format": GO_MANIFEST_FORMAT,
+        "release_id": source_revision,
+        "source_revision": source_revision,
+        "protocol": PROTOCOL_VERSION,
+        "target": {"os": "linux", "arch": target["arch"]},
+        "toolchain": {"go": GO_TOOLCHAIN, "cgo_enabled": False},
+        "artifacts": artifacts,
+        "actions": actions,
+        "client_view": {"release_id": source_revision, "source_revision": source_revision, "protocol": PROTOCOL_VERSION, "transport": transport, "actions": actions},
+        "retired_units": list(GO_RETIRED_UNITS),
+    }
+
+
+def build_go_manifest(
+    source_revision: str,
+    artifacts: list[Mapping[str, Any]],
+    *,
+    target: Mapping[str, str] | None = None,
+    transport: str = "go-request",
+    operations: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    revision = _require_string(source_revision, "source_revision", SOURCE_REVISION_RE)
+    selected_target = dict(target or {"os": "linux", "arch": "amd64"})
+    actions = {key: dict(value) for key, value in (operations or default_operations()).items()}
+    return validate_go_manifest({
+        "format": GO_MANIFEST_FORMAT,
+        "release_id": revision,
+        "source_revision": revision,
+        "protocol": PROTOCOL_VERSION,
+        "target": selected_target,
+        "toolchain": {"go": GO_TOOLCHAIN, "cgo_enabled": False},
+        "artifacts": [dict(item) for item in artifacts],
+        "actions": actions,
+        "client_view": {"release_id": revision, "source_revision": revision, "protocol": PROTOCOL_VERSION, "transport": transport, "actions": actions},
+        "retired_units": list(GO_RETIRED_UNITS),
+    })
+
+
 def load_manifest(path: Path) -> dict[str, Any]:
     try:
         info = path.lstat()
@@ -452,6 +611,32 @@ def load_manifest(path: Path) -> dict[str, Any]:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise _error("manifest_invalid", "release manifest is not valid UTF-8 JSON") from exc
+    return validate_manifest(value)
+
+
+def load_release_manifest(path: Path) -> dict[str, Any]:
+    """Load either supported release format; legacy callers keep load_manifest."""
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise _error("manifest_unverified", "release manifest is not a regular file")
+        with path.open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+    except FileNotFoundError as exc:
+        raise _error("manifest_missing", "release manifest is missing") from exc
+    except ManifestError:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _error("manifest_invalid", "release manifest is not valid UTF-8 JSON") from exc
+    if isinstance(value, Mapping) and value.get("format") == GO_MANIFEST_FORMAT:
+        return validate_go_manifest(value)
+    return validate_manifest(value)
+
+
+def validate_release_manifest(value: Any) -> dict[str, Any]:
+    """Validate either supported release format without executing artifacts."""
+    if isinstance(value, Mapping) and value.get("format") == GO_MANIFEST_FORMAT:
+        return validate_go_manifest(value)
     return validate_manifest(value)
 
 
@@ -508,6 +693,40 @@ def verify_bundle(root: Path, manifest: Mapping[str, Any] | None = None) -> dict
     return checked
 
 
+def verify_go_bundle(root: Path, manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Verify format-2 Go artifacts without executing the candidate binary."""
+    root = root.resolve()
+    if not root.is_dir():
+        raise _error("bundle_invalid", "bundle root is not a directory")
+    checked = validate_go_manifest(manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME))
+    for item in checked["artifacts"]:
+        artifact = _resolve_regular(root, item["path"])
+        _verify_artifact_file(artifact, item)
+        if item["path"] == "bin/agent-vm-control":
+            _verify_elf_target(artifact, checked["target"])
+    return checked
+
+
+def _verify_elf_target(path: Path, target: Mapping[str, Any]) -> None:
+    """Validate the static candidate's ELF class and machine without running it."""
+    try:
+        header = path.read_bytes()[:64]
+    except OSError as exc:
+        raise _error("artifact_unverified", "Go control binary cannot be read") from exc
+    if len(header) < 20 or header[:4] != b"\x7fELF":
+        raise _error("binary_format_mismatch", "Go control artifact is not an ELF executable")
+    if header[4] != 2 or header[5] != 1:
+        raise _error("binary_format_mismatch", "Go control artifact must be little-endian ELF64")
+    machine = struct.unpack_from("<H", header, 18)[0]
+    expected = {"amd64": 62, "arm64": 183}[target["arch"]]
+    if machine != expected:
+        raise _error(
+            "binary_arch_mismatch",
+            "Go control artifact architecture does not match the manifest target",
+            {"expected": target["arch"], "machine": machine},
+        )
+
+
 def _verify_artifact_file(path: Path, item: Mapping[str, Any]) -> None:
     try:
         info = path.lstat()
@@ -539,7 +758,7 @@ def verify_runtime_bundle(manifest: Mapping[str, Any], artifact_paths: Mapping[s
 def verify_client_sidecar(root: Path, manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Verify the derived client-only sidecar without making it an artifact."""
     root = root.resolve()
-    checked = validate_manifest(manifest if manifest is not None else load_manifest(root / MANIFEST_NAME))
+    checked = validate_release_manifest(manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME))
     sidecar_path = _resolve_regular(root, CLIENT_SIDECAR_NAME)
     try:
         with sidecar_path.open("r", encoding="utf-8") as handle:
