@@ -545,6 +545,22 @@ export async function grow_guest_root(
       return lines[0]!;
     }
 
+    function topology_types(
+      result: NativeResult,
+      phase: string,
+      command: string[],
+      expected: "part" | "disk",
+    ): string[] {
+      const lines = nonempty_lines(result.stdout);
+      if (lines.length !== 1 || lines[0] !== expected) {
+        throw new GuestFailure(phase, command, {
+          ...result_evidence(result),
+          cause: "invalid_topology",
+        });
+      }
+      return lines;
+    }
+
     async function number_from(
       command: string[],
       phase: string,
@@ -675,47 +691,40 @@ export async function grow_guest_root(
       );
       if (
         parent_lines.length !== 1 ||
-        parent_lines[0]!.includes("/")
+        !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(parent_lines[0] ?? "")
       ) {
         throw new GuestFailure("topology-check", parent_command, {
-          cause: "ambiguous_root_disk",
+          cause: parent_lines.length === 1 ? "invalid_parent_name" : "ambiguous_root_disk",
         });
       }
 
       const disk = `/dev/${parent_lines[0]!}`;
-      const source_type_command = [
-        "lsblk", "-n", "-o", "TYPE", source,
-      ];
-      if (
-        one_line(
-          await run(source_type_command, "topology-type"),
-          "topology-type",
-          source_type_command,
-        ) !== "part"
-      ) {
-        throw new GuestFailure(
-          "topology-check",
-          source_type_command,
-          { cause: "root_is_not_partition" },
-        );
+      const expected_source = disk +
+        (/[0-9]$/.test(parent_lines[0]!) ? "p" : "") + number;
+      if (source !== expected_source) {
+        throw new GuestFailure("topology-check", parent_command, {
+          cause: "root_partition_mismatch",
+        });
       }
+      const source_type_command = [
+        "lsblk", "-n", "--nodeps", "-o", "TYPE", source,
+      ];
+      topology_types(
+        await run(source_type_command, "topology-type"),
+        "topology-type",
+        source_type_command,
+        "part",
+      );
 
       const disk_type_command = [
-        "lsblk", "-n", "-o", "TYPE", disk,
+        "lsblk", "-n", "--nodeps", "-o", "TYPE", disk,
       ];
-      if (
-        one_line(
-          await run(disk_type_command, "topology-type"),
-          "topology-type",
-          disk_type_command,
-        ) !== "disk"
-      ) {
-        throw new GuestFailure(
-          "topology-check",
-          disk_type_command,
-          { cause: "parent_is_not_disk" },
-        );
-      }
+      topology_types(
+        await run(disk_type_command, "topology-type"),
+        "topology-type",
+        disk_type_command,
+        "disk",
+      );
 
       const filesystem_tool =
         fstype === "ext4" ? "resize2fs" : "xfs_growfs";

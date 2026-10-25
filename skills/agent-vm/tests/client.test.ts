@@ -170,3 +170,59 @@ test("lifecycle and admin commands retain action/generation/operation scope with
   await dispatch(parseArgs(["admin", "metrics"]), f.client); expect(f.requests.at(-1)).not.toHaveProperty("session_id"); expect(f.requests.at(-1)).not.toHaveProperty("operation_id");
   await expect(dispatch(selected(["admin", "metrics"]), f.client)).rejects.toMatchObject({ code: "invalid_request" });
 });
+
+test("local recovery state is locked, monotonic and cleanup-only safe", () => {
+  const f = fixture();
+  f.state("explicit", 7);
+  expect(f.client.saveState("explicit", {
+    session_id: "explicit", task_id: "avm-abc", generation: 7,
+    private_key: f.key(), cleanup_only: false,
+  })).toBe(true);
+  expect(f.client.saveState("explicit", {
+    session_id: "explicit", task_id: "avm-abc", generation: 7,
+    private_key: f.key(), cleanup_only: true,
+  })).toBe(false);
+  expect(f.client.generation("explicit")).toBe(7);
+  expect(() => f.client.generation("explicit", false)).not.toThrow();
+  expect(f.client.saveState("explicit", {
+    session_id: "explicit", task_id: "avm-def", generation: 8,
+    private_key: f.key(), cleanup_only: true,
+  })).toBe(true);
+  expect(() => f.client.generation("explicit")).toThrow("cleanup-only");
+  expect(f.client.generation("explicit", true)).toBe(8);
+  expect(f.client.saveState("explicit", {
+    session_id: "explicit", task_id: "avm-abc", generation: 8,
+    private_key: f.key(), cleanup_only: false,
+  })).toBe(false);
+});
+
+test("recovery state requires an exact committed or partial operation proof", async () => {
+  const f = fixture();
+  const key = f.key();
+  const active = { session_id: "explicit", task_id: "avm-abc", generation: 8, state: "active", effective_lease: true, recovery_operation_id: "acquire-op" };
+  expect(f.client.persistRecoveryState("explicit", key, active, "acquire-op", 7)).toBe(true);
+  expect(f.client.state("explicit")).toMatchObject({ generation: 8, cleanup_only: false });
+
+  const partial = { session_id: "explicit", task_id: "avm-abc", generation: 9, state: "cached", effective_lease: false, partial_operation_id: "partial-op" };
+  expect(f.client.persistRecoveryState("explicit", key, partial, "partial-op", 8)).toBe(true);
+  expect(f.client.state("explicit")).toMatchObject({ generation: 9, cleanup_only: true });
+  expect(f.client.persistRecoveryState("explicit", key, { ...partial, task_id: "avm-other" }, "partial-op", 9)).toBe(false);
+
+  const commandCount = f.commands.length;
+  await expect(f.client.sshInfo("explicit")).rejects.toMatchObject({ code: "lease_unavailable" });
+  expect(f.commands).toHaveLength(commandCount);
+
+  f.handler = request => result(response(request, {
+    result: { ...partial, generation: 10, partial_operation_id: "remote-op" },
+  }));
+  expect(await f.client.recoverAcquireState("explicit", key, "remote-op", 9)).toBe(true);
+  expect(f.requests.at(-1)).toMatchObject({ action: "status", operation_id: "remote-op" });
+  expect(f.client.state("explicit")).toMatchObject({ generation: 10, cleanup_only: true });
+
+  f.handler = request => result(response(request, {
+    operation_id: "different-op",
+    result: { ...partial, generation: 11, partial_operation_id: "remote-op" },
+  }));
+  expect(await f.client.recoverAcquireState("explicit", key, "remote-op", 10)).toBe(false);
+  expect(f.client.state("explicit")).toMatchObject({ generation: 10, cleanup_only: true });
+});

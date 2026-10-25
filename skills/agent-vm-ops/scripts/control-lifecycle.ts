@@ -2,9 +2,9 @@ import { ResourceControl } from "./control-resources.ts";
 import { guest_source } from "./guest-root-growth.ts";
 import {
   ControlError, PROTOCOL_VERSION, GUEST_READINESS_BUDGET_SECONDS, MEMORY_SETTLE_SECONDS,
-  PORT_NAME_RE, RESOURCE_KEYS, type Data, type Integer, require_nonempty_string, require_int,
+  PORT_NAME_RE, RESOURCE_KEYS, SESSION_ID_RE, type Data, type Integer, require_nonempty_string, require_string, require_int,
   canonical_json, parse_json, digest, iso_time, parse_time, is_record, resource_mapping,
-  add, mul, floor_div, compare, integer, narrow,
+  add, sub, mul, floor_div, compare, integer, narrow,
 } from "./control-types.ts";
 
 const equal = (a: any, b: any): boolean => canonical_json(a ?? null) === canonical_json(b ?? null);
@@ -201,10 +201,46 @@ function valid_capacity_report(value: any, disk_gib: Integer): value is Data {
 }
 
 export class LifecycleControl extends ResourceControl {
-  async status(_request: Data, session_id: string | null): Promise<Data> {
+  async status(request: Data, session_id: string | null): Promise<Data> {
     const task = await this._global_lock(() => this.store.get_task({ session_id: session_id! }));
     const result = task ? await this._runtime_summary(task) :
       { state: "absent", generation: 0, effective_lease: false, native_status: "absent", guest_available: false };
+    const operation_id = request.operation_id === undefined
+      ? null : require_string(request.operation_id, "operation_id", SESSION_ID_RE);
+    if (operation_id !== null && task !== null) {
+      let operation: Data | null = null;
+      try { operation = this.store.operation(operation_id); } catch { operation = null; }
+      const operation_result = is_record(operation?.result) ? operation.result : null;
+      const request_generation = operation?.generation;
+      const operation_generation = operation_result?.generation;
+      const current_generation = task.generation;
+      const previous_generation = typeof current_generation === "number" || typeof current_generation === "bigint"
+        ? sub(current_generation, 1) : null;
+      const generation_matches = (value: any): boolean =>
+        equal(value, current_generation) || previous_generation !== null && equal(value, previous_generation);
+      if (
+        operation?.outcome === "success" && operation.action === "acquire" &&
+        operation.operation_id === operation_id && operation.session_id === session_id &&
+        operation_result?.session_id === session_id && operation_result.task_id === task.task_id &&
+        generation_matches(request_generation) && equal(operation_generation, current_generation)
+      ) result.recovery_operation_id = operation_id;
+      else if (operation?.outcome === "pending") {
+        const pending = this._pending_acquire_operations_for_task(task).filter(item => item.operation_id === operation_id);
+        if (pending.length === 1 && generation_matches(pending[0].generation) &&
+          pending[0].task_id === task.task_id && equal(pending[0].task_generation, current_generation))
+          result.partial_operation_id = operation_id;
+      } else {
+        let last_error: Data | null = null;
+        try { const value = parse_json(task.last_error); if (is_record(value)) last_error = value; } catch {}
+        if (last_error !== null && (
+          last_error.operation_id === operation_id && last_error.task_id === task.task_id &&
+          equal(last_error.task_generation, current_generation) ||
+          Array.isArray(last_error.pending_acquire_operation_ids) &&
+          last_error.pending_acquire_operation_ids.includes(operation_id) &&
+          last_error.task_id === task.task_id && equal(last_error.task_generation, current_generation)
+        )) result.partial_operation_id = operation_id;
+      }
+    }
     const admission = await this._resource_diagnostics();
     admission.instances = await this._instance_diagnostics();
     return { ...result, admission };
@@ -213,7 +249,13 @@ export class LifecycleControl extends ResourceControl {
   async acquire(request: Data, session_id: string | null): Promise<Data> {
     const existing = this.store.get_task({ session_id: session_id! });
     if (existing?.state === "active") {
-      this._check_generation(existing, request); this._require_active(existing);
+      let pending_acquires = this._pending_acquire_operations_for_task(existing);
+      try { this._check_generation(existing, request); }
+      catch (error) {
+        if (!(error instanceof ControlError) || error.code !== "generation_mismatch" ||
+          this._pending_acquire_retry_item(String(request.operation_id), session_id!, request, existing) === null) throw error;
+      }
+      this._require_active(existing, true);
       await this._ownership(existing);
       const resources = this._durable_resources(existing, "resources_json", { allow_empty: false });
       const target = this._requested_resources(request, resources, { active_reuse: true });
@@ -221,7 +263,21 @@ export class LifecycleControl extends ResourceControl {
         throw new ControlError("resource_config_mismatch", "active lease configuration differs; use resize explicitly", {
           current: resources, requested: target, differences: Object.keys(resources).filter(key => !equal(resources[key], target[key])),
         });
-      return this._runtime_summary(existing);
+      const current_operation_id = String(request.operation_id);
+      this._verify_pending_acquire_resources(
+        pending_acquires.filter(item => item.operation_id !== current_operation_id),
+        resources,
+      );
+      this._bind_pending_acquire_operation(request, existing, target);
+      pending_acquires = this._pending_acquire_operations_for_task(existing);
+      this._verify_pending_acquire_resources(pending_acquires, resources);
+      const result = await this._runtime_summary(existing);
+      if (pending_acquires.length) {
+        await this._global_lock(() => this.store.transaction(() => {
+          for (const pending of pending_acquires) this._complete_pending_acquire_operation(pending, existing, result);
+        }));
+      }
+      return result;
     }
     if (existing && !["absent", "cached"].includes(existing.state))
       throw new ControlError("task_transition", "session slot is not available until reconciliation completes");
@@ -268,6 +324,7 @@ export class LifecycleControl extends ResourceControl {
     const completed: string[] = [], stage_timings: Data = {};
     let phase = "reservation", readiness: Data | null = null;
     try {
+      this._bind_pending_acquire_operation(request, task, resources);
       phase = "expiry-timer";
       await this._schedule_expiry(task);
       const reclaimed = await this._reclaim_capacity(cost, task.task_id);
@@ -341,7 +398,7 @@ export class LifecycleControl extends ResourceControl {
       try {
         cleanup.result = await this._release_task(this.store.get_task({ task_id: task.task_id })!, {
           require_native_init_absence_retry: uncertain, native_init_cleanup_verified: verified,
-          protect_native_init_residue: phase === "native-init", recover_pending_acquire: false,
+          protect_native_init_residue: phase === "native-init", recover_pending_acquire: true,
         });
         cleanup.ok = true;
       } catch (error) {
@@ -351,6 +408,7 @@ export class LifecycleControl extends ResourceControl {
       const detail = detail_of(exc);
       Object.assign(detail, {
         phase: detail.phase ?? phase, operation_phase: phase, completed, requested: resources, cleanup,
+        operation_id: request.operation_id, task_id: task.task_id, task_generation: task.generation,
       });
       if (uncertain) {
         const cleanup_detail = is_record(cleanup.error?.detail) ? cleanup.error.detail : null;
@@ -395,7 +453,9 @@ export class LifecycleControl extends ResourceControl {
   }
 
   async release(request: Data, session_id: string | null): Promise<Data> {
-    const task = this._task_for_session(session_id!);
+    const task = this.store.get_task({ session_id: session_id! });
+    if (!task) throw new ControlError("task_missing", "no VM lease exists for this session");
+    this._validate_task_state(task);
     this._check_generation(task, request);
     return this._release_task(task);
   }
@@ -413,21 +473,54 @@ export class LifecycleControl extends ResourceControl {
       if (!current || compare(current.generation, task.generation) !== 0)
         throw new ControlError("generation_mismatch", "cleanup generation changed");
       task = current;
-      if (["cached", "absent"].includes(task.state) && requested_state !== "closing") return this._state_summary(task);
+      let pending_acquires_to_cancel: Data[] = [];
+      const cancellation_marker = this._pending_acquire_cancellation_marker(task, true);
+      if (recover_pending_acquire && cancellation_marker !== null) {
+        pending_acquires_to_cancel = this._pending_acquire_cancellation_operations(task);
+      } else if (recover_pending_acquire &&
+        (requested_state === "active" || requested_state === "preparing" ||
+          ["cached", "absent"].includes(task.state))) {
+        pending_acquires_to_cancel = this._pending_acquire_operations_for_task(task);
+      }
+      if (["cached", "absent"].includes(task.state) && requested_state !== "closing") {
+        if (pending_acquires_to_cancel.length) {
+          task = await this._global_lock(() => this.store.transaction(() => {
+            this._cancel_pending_acquire_operations(pending_acquires_to_cancel, task);
+            return this.store.update_task(task.task_id, {
+              last_error: this._pending_acquire_cancellation_error(task, pending_acquires_to_cancel),
+            });
+          }));
+        }
+        return this._state_summary(task);
+      }
       const expiry = parse_time(task.lease_expires_at);
       const inactive = parse_time(task.inactive_since) ??
         new Date(Math.min(this.now().getTime(), (expiry ?? this.now()).getTime()));
       task = await this._global_lock(() => this.store.transaction(() => this.store.update_task(task.task_id, {
         state: "closing", lease_expires_at: null, inactive_since: iso_time(inactive),
         cleanup_after: iso_time(after(inactive, this.config.cache_seconds)),
+        ...(pending_acquires_to_cancel.length ? { last_error: this._pending_acquire_cancellation_error(task, pending_acquires_to_cancel) } : {}),
       })));
       const [errors, completed] = await this._cleanup_task(task);
       if (errors.length) {
-        this.store.update_task(task.task_id, { last_error: canonical_json({ errors, completed }) });
+        const detail: Data = { errors, completed };
+        if (pending_acquires_to_cancel.length) {
+          detail.pending_acquire_cancellation = true;
+          detail.pending_acquire_operation_ids = pending_acquires_to_cancel.map(item => item.operation_id);
+          detail.task_id = task.task_id; detail.task_generation = task.generation;
+        }
+        this.store.update_task(task.task_id, { last_error: canonical_json(detail) });
         await this.systemd.retry_cleanup(task.task_id, task.generation);
         throw new ControlError("cleanup_incomplete", "entry/port reservations remain closed until reconciliation succeeds", errors);
       }
       const defer = async (message: string, detail: Data): Promise<never> => {
+        if (pending_acquires_to_cancel.length) {
+          detail = {
+            ...detail, pending_acquire_cancellation: true,
+            pending_acquire_operation_ids: pending_acquires_to_cancel.map(item => item.operation_id),
+            task_id: task.task_id, task_generation: task.generation,
+          };
+        }
         this.store.update_task(task.task_id, { last_error: canonical_json(detail) });
         await this.systemd.retry_cleanup(task.task_id, task.generation);
         throw new ControlError("cleanup_incomplete", message, detail);
@@ -441,7 +534,10 @@ export class LifecycleControl extends ResourceControl {
       }
       let absent = !instances.some(item => item.name === task.instance_name);
       let pending_acquire: Data | null;
-      try { pending_acquire = recover_pending_acquire ? this._pending_native_init_for_task(task) : null; }
+      try {
+        pending_acquire = recover_pending_acquire && cancellation_marker === null && pending_acquires_to_cancel.length === 0
+          ? this._pending_native_init_for_task(task) : null;
+      }
       catch (exc) {
         if (!(exc instanceof ControlError)) throw exc;
         return defer("pending native initialization cannot be verified; delayed reconciliation is required",
@@ -495,6 +591,7 @@ export class LifecycleControl extends ResourceControl {
           native_init_absence_checks: absence_checks, native_init_cleanup_verified: cleanup_verified,
         }));
       let recovered_operation: [string, Data] | null = null;
+      const recovery_operation_id = pending_acquire?.operation_id ?? null;
       if (absent && pending_acquire !== null && stable_absence && absence_verified) {
         try { recovered_operation = this._recovered_native_init_operation(task, pending_acquire); }
         catch (exc) {
@@ -513,13 +610,31 @@ export class LifecycleControl extends ResourceControl {
         try { resources = resource_mapping(task.resources_json, "resources", { allow_empty: false }); }
         catch { throw new ControlError("resource_unverified", "absent task resources cannot be verified"); }
       } else resources = await this._native_resources(task);
+      let retained_error: string | null = null;
+      if (pending_acquires_to_cancel.length) {
+        retained_error = this._pending_acquire_cancellation_error(task, pending_acquires_to_cancel);
+      } else if (recovery_operation_id !== null) {
+        let previous: Data = {};
+        try { const value = parse_json(task.last_error); if (is_record(value)) previous = value; } catch {}
+        retained_error = canonical_json({
+          ...previous,
+          code: previous.code ?? "acquire_partial",
+          phase: previous.phase ?? "cleanup",
+          operation_id: recovery_operation_id,
+          task_id: task.task_id,
+          task_generation: task.generation,
+          outcome_verified: true,
+        });
+      }
       task = await this._global_lock(() => this.store.transaction(() => {
         for (const port of this.store.get_ports(task.task_id))
           this.store.remove_port(task.task_id, port.port_name, port.protocol);
         if (recovered_operation !== null)
           this.store.record_operation(recovered_operation[0], "acquire", task.session_id, task.generation, recovered_operation[1]);
+        if (pending_acquires_to_cancel.length)
+          this._cancel_pending_acquire_operations(pending_acquires_to_cancel, task);
         return this.store.update_task(task.task_id, {
-          state: absent ? "absent" : "cached", ssh_host_port: null, reservation_bytes: 0, last_error: null,
+          state: absent ? "absent" : "cached", ssh_host_port: null, reservation_bytes: 0, last_error: retained_error,
           previous_generation: null, resource_reservation_json: "{}", resources_json: canonical_json(resources),
           vm_ip: absent ? null : task.vm_ip,
         });
@@ -533,12 +648,11 @@ export class LifecycleControl extends ResourceControl {
     if (!task) throw new ControlError("task_missing", "no owned instance exists");
     this._validate_task_state(task); this._check_generation(task, request);
     if (task.state === "absent") return this._state_summary(task);
-    if (task.state === "deleting") throw new ControlError("task_transition", "deletion requires reconciliation");
-    if (task.state !== "cached") {
+    if (!["cached", "deleting"].includes(task.state)) {
       await this._release_task(task);
       task = this.store.get_task({ task_id: task.task_id })!;
     }
-    if (task.state === "cached") await this._delete_cache(task);
+    if (["cached", "deleting"].includes(task.state)) await this._delete_cache(task);
     return this._state_summary(this.store.get_task({ task_id: task.task_id })!);
   }
 

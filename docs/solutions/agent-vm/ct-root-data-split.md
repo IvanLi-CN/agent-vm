@@ -95,7 +95,7 @@ Use the configured SSH control alias that resolves directly to the CT. Do not us
 The installed native entrypoint is normally:
 
 ```text
-/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py
+/usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts
 ```
 
 The entrypoint speaks protocol 4 JSON over stdin. The `agent-vm` client is an operator-side executable and is not required to exist inside the CT.
@@ -104,7 +104,7 @@ Read-only health check:
 
 ```bash
 printf '%s\n' '{"protocol":4,"action":"doctor"}' |
-  ssh <ct-control-alias> /usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py
+  ssh <ct-control-alias> /usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts
 ```
 
 When a stopped instance is shown by Incus but its durable record is still `active` with no effective lease, use this bounded sequence:
@@ -113,7 +113,7 @@ When a stopped instance is shown by Incus but its durable record is still `activ
 operation_id="reconcile-preview-$(date +%s)"
 printf '%s\n' \
   "{\"protocol\":4,\"action\":\"admin-reconcile\",\"generation\":0,\"operation_id\":\"$operation_id\",\"apply\":false}" |
-  ssh <ct-control-alias> /usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py
+  ssh <ct-control-alias> /usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts
 ```
 
 After reviewing that the action is only `close-incomplete-or-expired` for the intended task, apply the reconciliation with a new operation ID. Then preview `admin-gc` with `generation: 0`; apply GC only when the candidate is a stopped managed cache with no effective lease and the candidate list contains only the authorized task.
@@ -124,7 +124,7 @@ Apply the reviewed reconciliation:
 operation_id="reconcile-apply-$(date +%s)"
 printf '%s\n' \
   "{\"protocol\":4,\"action\":\"admin-reconcile\",\"generation\":0,\"operation_id\":\"$operation_id\",\"apply\":true}" |
-  ssh <ct-control-alias> /usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py
+  ssh <ct-control-alias> /usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts
 ```
 
 Preview and, only after reviewing the exact candidate, apply garbage collection:
@@ -133,12 +133,12 @@ Preview and, only after reviewing the exact candidate, apply garbage collection:
 operation_id="gc-preview-$(date +%s)"
 printf '%s\n' \
   "{\"protocol\":4,\"action\":\"admin-gc\",\"generation\":0,\"operation_id\":\"$operation_id\",\"apply\":false}" |
-  ssh <ct-control-alias> /usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py
+  ssh <ct-control-alias> /usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts
 
 operation_id="gc-apply-$(date +%s)"
 printf '%s\n' \
   "{\"protocol\":4,\"action\":\"admin-gc\",\"generation\":0,\"operation_id\":\"$operation_id\",\"apply\":true}" |
-  ssh <ct-control-alias> /usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py
+  ssh <ct-control-alias> /usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts
 ```
 
 The final command deletes only the candidates returned by the immediately preceding preview after the controller rechecks ownership, generation, stopped state and access cleanup.
@@ -149,7 +149,7 @@ After recovery, verify `doctor` reports `ready: true`, `admission_ready: true`, 
 ssh <ct-control-alias> systemctl enable agent-vm-native-reconcile.service
 ssh <ct-control-alias> systemctl enable --now agent-vm-native-age-gc.timer
 ssh <ct-control-alias> /bin/sh -c \
-  "printf '%s\\n' '{\"protocol\":4,\"action\":\"doctor\"}' | /usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py"
+  "printf '%s\\n' '{\"protocol\":4,\"action\":\"doctor\"}' | /usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts"
 ssh <ct-control-alias> findmnt -T /var/lib/incus/storage-pools/<pool>
 ssh <ct-control-alias> findmnt -T /var/lib/incus/images
 ssh <ct-control-alias> df -h / /var/lib/incus/images /var/lib/incus/storage-pools/<pool>

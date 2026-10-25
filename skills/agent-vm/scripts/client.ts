@@ -5,6 +5,7 @@ import { isIPv4 } from "node:net";
 import { randomUUID } from "node:crypto";
 import { Data, fail, record, integer, json, parseJson, equal, sha256, readJson, durable, fsyncDir, privateDir, Runner, runBounded, shellJoin, inherited } from "./client-io.ts";
 import { PROTOCOL, capability, loadRelease, responseMetadata } from "./client-release.ts";
+import { nativeCapabilities } from "./sync-native.ts";
 
 export const STDOUT_LIMIT = 2 * 1024 * 1024, STDERR_LIMIT = 64 * 1024;
 export const timeoutSeconds = (action: string, fields: Data = {}): number => ["acquire", "restart"].includes(action) || action === "resize" && fields.allow_restart === true ? 600 : 240;
@@ -50,11 +51,83 @@ export class Client {
     if (!record(v)) fail("local_state_invalid", "local session state is not an object");
     return v;
   }
-  saveState(session: string, state: Data): void { privateDir(this.sessionDir(session)); durable(join(this.sessionDir(session), "state.json"), json(state) + "\n"); }
-  generation(session: string): number | bigint {
-    const n = this.state(session).generation;
+  private stateWriteAllowed(session: string, current: any, candidate: Data): boolean {
+    if (!record(candidate) || candidate.session_id !== session ||
+      typeof candidate.task_id !== "string" || !/^avm-[a-z0-9-]+$/.test(candidate.task_id) ||
+      !integer(candidate.generation) || candidate.generation < 1 ||
+      "cleanup_only" in candidate && typeof candidate.cleanup_only !== "boolean") return false;
+    if (current === null) return true;
+    if (!record(current) || current.session_id !== session || !integer(current.generation) || current.generation < 1 ||
+      typeof current.task_id !== "string" || !/^avm-[a-z0-9-]+$/.test(current.task_id)) return false;
+    if (current.generation > candidate.generation) return false;
+    if (equal(current.generation, candidate.generation)) {
+      if (current.task_id !== candidate.task_id) return false;
+      if (current.cleanup_only === false && candidate.cleanup_only === true) return false;
+    }
+    return true;
+  }
+  saveState(session: string, state: Data): boolean {
+    const directory = this.sessionDir(session);
+    privateDir(directory);
+    const lockPath = join(directory, ".state.lock");
+    const native = nativeCapabilities();
+    let fd = -1;
+    let locked = false;
+    try {
+      fd = openSync(lockPath, C.O_RDWR | C.O_CREAT | C.O_NOFOLLOW, 0o600);
+      fchmodSync(fd, 0o600);
+      locked = native.lock(fd);
+      if (!locked) return false;
+      let current: any = null;
+      try { current = readJson(join(directory, "state.json")); }
+      catch (error: any) { if (error.code !== "ENOENT") return false; }
+      if (!this.stateWriteAllowed(session, current, state)) return false;
+      durable(join(directory, "state.json"), json(state) + "\n");
+      return true;
+    } catch {
+      return false;
+    } finally {
+      if (locked) native.unlock(fd);
+      if (fd !== -1) closeSync(fd);
+      native.close();
+    }
+  }
+  generation(session: string, allowCleanupOnly = false): number | bigint {
+    const state = this.state(session);
+    if (state.cleanup_only === true && !allowCleanupOnly)
+      fail("lease_unavailable", "local recovery state is cleanup-only; release or destroy the session first");
+    const n = state.generation;
     if (!integer(n) || n < 1) fail("local_state_invalid", "local session state has no valid generation");
     return n;
+  }
+  persistRecoveryState(session: string, privateKey: string, result: any, operationId: string, expectedGeneration: number | bigint): boolean {
+    if (!record(result) || result.session_id !== session || result.state === "absent" ||
+      !integer(expectedGeneration) || expectedGeneration < 0 ||
+      typeof result.task_id !== "string" || !/^avm-[a-z0-9-]+$/.test(result.task_id) ||
+      !integer(result.generation) || result.generation < 1) return false;
+    const committed = result.recovery_operation_id === operationId;
+    const lastError = record(result.last_error) ? result.last_error : null;
+    const matchingError = lastError?.operation_id === operationId &&
+      lastError.task_id === result.task_id && equal(lastError.task_generation, result.generation);
+    const cancellation = Array.isArray(lastError?.pending_acquire_operation_ids) &&
+      lastError.task_id === result.task_id && equal(lastError.task_generation, result.generation) &&
+      lastError.pending_acquire_operation_ids.includes(operationId);
+    if (!committed && result.partial_operation_id !== operationId && !matchingError && !cancellation) return false;
+    const nextGeneration = typeof expectedGeneration === "bigint" ? expectedGeneration + 1n : expectedGeneration + 1;
+    if (!equal(result.generation, expectedGeneration) && !equal(result.generation, nextGeneration)) return false;
+    return this.saveState(session, {
+      session_id: session, task_id: result.task_id, generation: result.generation,
+      private_key: privateKey,
+      cleanup_only: !(committed && result.state === "active" && result.effective_lease === true),
+    });
+  }
+  async recoverAcquireState(session: string, privateKey: string, operationId: string, expectedGeneration: number | bigint): Promise<boolean> {
+    try {
+      const response = await this.request("status", { session, fields: { operation_id: operationId } });
+      return this.persistRecoveryState(session, privateKey, response.result, operationId, expectedGeneration);
+    } catch {
+      return false;
+    }
   }
   async reuse(path: string, request: Data): Promise<Data> {
     for (let attempt = 0; attempt < 50; attempt++) {
@@ -104,7 +177,7 @@ export class Client {
     try { response = parseJson(new TextDecoder("utf-8", { fatal: true }).decode(result.stdout)); } catch { fail("invalid_remote_response", "control did not return JSON", detail); }
     if (!record(response) || response.protocol !== PROTOCOL || response.action !== action || (response.session_id ?? null) !== session) fail("protocol_mismatch", "response protocol or request identity differs");
     if ("generation" in request && !equal(response.generation, request.generation)) fail("protocol_mismatch", "response generation differs");
-    if (write && response.operation_id !== request.operation_id) fail("protocol_mismatch", "operation identity differs");
+    if ("operation_id" in request && response.operation_id !== request.operation_id) fail("protocol_mismatch", "operation identity differs");
     responseMetadata(response, request, warnings);
     if (op) this.finalize(op, request, { outcome: "success", response });
     return response;
@@ -130,7 +203,9 @@ export class Client {
     return [config, hosts];
   }
   async sshInfo(session: string): Promise<[Data, Data, string]> {
-    const response = await this.request("ssh-info", { session }), info = response.result, state = this.state(session);
+    const state = this.state(session);
+    if (state.cleanup_only === true) fail("lease_unavailable", "local recovery state is cleanup-only; release or destroy the session first");
+    const response = await this.request("ssh-info", { session }), info = response.result;
     if (!equal(state.task_id, info.task_id) || !equal(state.generation, info.generation)) fail("generation_mismatch", "connection material belongs to another lease; acquire the current lease first");
     if (typeof state.private_key !== "string") fail("key_missing", "private key is missing");
     try { if (!lstatSync(state.private_key).isFile()) throw 0; } catch { fail("key_missing", "private key is missing"); }

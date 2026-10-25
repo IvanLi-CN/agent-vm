@@ -175,10 +175,10 @@ function fixture(config: FixtureOptions = {}) {
             return result(`${config.filesystem_type ?? "ext4"}\n`);
           case `lsblk -n -o PKNAME ${SOURCE}`:
             return result(config.parent_output ?? "sda\n");
-          case `lsblk -n -o TYPE ${SOURCE}`:
+          case `lsblk -n --nodeps -o TYPE ${SOURCE}`:
             return result(`${config.source_type ?? "part"}\n`);
-          case `lsblk -n -o TYPE ${DISK}`:
-            return result(`${config.parent_type ?? "disk"}\n`);
+          case `lsblk -n --nodeps -o TYPE ${DISK}`:
+            return result(config.parent_type ?? "disk\n");
           case `blockdev --getsize64 ${DISK}`:
             return result(`${state.disk}\n`);
           case `blockdev --getsize64 ${SOURCE}`:
@@ -475,14 +475,20 @@ describe("grow_guest_root", () => {
     {
       name: "non-partition root type",
       config: { source_type: "lvm" },
-      phase: "topology-check",
-      cause: "root_is_not_partition",
+      phase: "topology-type",
+      cause: "invalid_topology",
     },
     {
       name: "non-disk parent",
       config: { parent_type: "crypt" },
-      phase: "topology-check",
-      cause: "parent_is_not_disk",
+      phase: "topology-type",
+      cause: "invalid_topology",
+    },
+    {
+      name: "unknown parent child type",
+      config: { parent_type: "disk\npart\ncrypt\n" },
+      phase: "topology-type",
+      cause: "invalid_topology",
     },
     {
       name: "multiple root sources",

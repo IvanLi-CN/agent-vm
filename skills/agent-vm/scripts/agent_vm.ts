@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 /** Protocol-4 request client. Control effects belong to the canonical Bun controller. */
 import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { resolve, join } from "node:path";
 import { Client, inherited, sessionId } from "./client.ts";
 import { CliError, Data, fail, integer, json, readJson, shellJoin } from "./client-io.ts";
@@ -71,24 +72,37 @@ export async function dispatch(args: Args, client = new Client(), native = inher
   if (cmd === "version") { const [release, warnings] = loadRelease(client.sidecar); return { version: VERSION, protocol: PROTOCOL, release, warnings }; }
   if (cmd === "admin metrics") { if (o["session-id"] !== undefined) fail("invalid_request", "admin metrics does not accept --session-id"); return client.request("admin-metrics", { session: null }); }
   const session = sessionId(o["session-id"], !["doctor", "admin metrics"].includes(cmd), client.env);
-  const mutate = async (action: string, fields: Data = {}, generation?: number | bigint): Promise<Data> => client.request(action, { session, generation: generation ?? (["acquire", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"].includes(action) ? 0 : client.generation(session!)), write: true, operationId: o["operation-id"], fields });
+  const mutate = async (action: string, fields: Data = {}, generation?: number | bigint, operationId?: string): Promise<Data> => client.request(action, { session, generation: generation ?? (["acquire", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"].includes(action) ? 0 : client.generation(session!)), write: true, operationId: operationId ?? o["operation-id"], fields });
   const resources = (): Data => ({ ...(o.cpu === undefined ? {} : { cpu: o.cpu }), ...(o.memory === undefined ? {} : { memory_mib: parseSize(o.memory, true) }), ...(o.disk === undefined ? {} : { disk_gib: parseSize(o.disk, false) }) });
   if (["doctor", "status"].includes(cmd)) return client.request(cmd, { session });
   if (cmd === "acquire") {
     const [key, publicKey] = await client.key(session!);
+    const acquireOperationId = o["operation-id"] || randomUUID();
     let generation = (await client.request("status", { session })).result.generation;
     if (!integer(generation) || generation < 0) fail("invalid_remote_response", "status has no valid generation");
     if (o["operation-id"]) {
       try { generation = readJson(client.operationPath(session!, o["operation-id"])).request.generation; }
       catch (e: any) { if (e.code !== "ENOENT") fail("local_journal_invalid", "operation journal is unreadable"); }
     }
-    const response = await mutate(cmd, { public_key: publicKey, ...resources(), ...(o["ssh-host-port"] === undefined ? {} : { ssh_host_port: o["ssh-host-port"] }) }, generation);
+    let response: Data;
+    try {
+      response = await mutate(cmd, { public_key: publicKey, ...resources(), ...(o["ssh-host-port"] === undefined ? {} : { ssh_host_port: o["ssh-host-port"] }) }, generation, acquireOperationId);
+    } catch (error) {
+      await client.recoverAcquireState(session!, key, acquireOperationId, generation);
+      throw error;
+    }
     const current = "current_state" in response ? response.current_state : response.result;
-    if (!current?.effective_lease) fail("lease_unavailable", "replayed allocation no longer has an active lease; inspect status");
-    client.saveState(session!, { session_id: session, task_id: current.task_id, generation: current.generation, private_key: key });
+    if (!current?.effective_lease) {
+      const recovered = await client.recoverAcquireState(session!, key, acquireOperationId, generation);
+      if (!recovered) client.persistRecoveryState(session!, key, current, acquireOperationId, generation);
+      fail("lease_unavailable", "replayed allocation no longer has an active lease; inspect status");
+    }
+    if (!client.saveState(session!, { session_id: session, task_id: current.task_id, generation: current.generation, private_key: key, cleanup_only: false }))
+      fail("local_state_conflict", "successful acquire response conflicts with newer local session state");
     return response;
   }
-  if (["renew", "release", "destroy", "restart"].includes(cmd)) return mutate(cmd);
+  if (["renew", "release", "destroy", "restart"].includes(cmd))
+    return mutate(cmd, {}, cmd === "release" || cmd === "destroy" ? client.generation(session!, true) : undefined);
   if (cmd === "resize") {
     if (o.live && (o.memory === undefined || o.cpu !== undefined || o.disk !== undefined)) fail("invalid_request", "--live requires only --memory; CPU/disk changes use --allow-restart");
     return mutate(cmd, { allow_restart: !!o["allow-restart"], live_memory: !!o.live, ...resources() });

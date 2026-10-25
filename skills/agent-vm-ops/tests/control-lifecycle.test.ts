@@ -753,6 +753,21 @@ scenario("foreign ownership and failed deletion retain durable ownership", async
   expect(f.runner.instances[cached.instance_name]).toBeUndefined();
 });
 
+scenario("destroy retries a deleting cache with the same operation", async f => {
+  const cached = await cache(f, "cache");
+  const request = f.request("destroy", { session: "cache", operation: "destroy-cache" });
+  f.runner.failure = async argv => argv[3] === "delete";
+  await expect_error("command_failed", () => f.control.dispatch(request));
+  expect(task(f, "cache").state).toBe("deleting");
+  expect(f.store.operation("destroy-cache")?.outcome).toBe("pending");
+
+  f.runner.failure = null;
+  await f.control.dispatch(request);
+  expect(task(f, "cache").state).toBe("absent");
+  expect(f.store.operation("destroy-cache")?.outcome).toBe("success");
+  expect(f.runner.instances[cached.instance_name]).toBeUndefined();
+});
+
 scenario("unconfirmed native deletion never frees durable ownership", async f => {
   const cached = await cache(f, "cache");
   f.runner.on_run = async argv => {
@@ -824,7 +839,7 @@ scenario("operation digest includes request identity and pending replay has no e
     next.dispatch(f.request("port-add", {
       operation: request.operation_id, name: "web", vm_port: 8080,
     })));
-  expect(f.runner.calls).toHaveLength(before);
+  expect(changes(f, before)).toEqual([]);
   expect(f.store.operation(request.operation_id)).toEqual(saved);
 });
 
@@ -857,4 +872,140 @@ scenario("renewal committed before a lost response replays after controller rest
   await expect_error("operation_conflict", () =>
     next.dispatch(f.request("renew", { operation: request.operation_id })));
   expect(task(f).lease_expires_at).toBe(committed);
+});
+
+scenario("status proves committed and pending acquire recovery identities", async f => {
+  const active = await f.acquire();
+  const committed = f.request("status");
+  committed.operation_id = "op-1";
+  const committed_result = (await f.control.dispatch(committed)).result;
+  expect(committed_result.recovery_operation_id).toBe("op-1");
+
+  const pending_request = f.request("acquire", {
+    operation: "pending-status",
+    generation: active.generation,
+  });
+  f.store.record_operation(
+    pending_request.operation_id,
+    "acquire",
+    "thread-a",
+    active.generation,
+    {
+      outcome: "pending",
+      _request_digest: exact_digest(pending_request),
+      task_id: active.task_id,
+      task_generation: active.generation,
+      acquire_resources: active.resources,
+    },
+  );
+  const pending_status = f.request("status");
+  pending_status.operation_id = "pending-status";
+  expect((await f.control.dispatch(pending_status)).result.partial_operation_id)
+    .toBe("pending-status");
+});
+
+scenario("active acquire converges matching old pending operations and preserves conflicts", async f => {
+  const active = await f.acquire();
+  const old_request = f.request("acquire", {
+    operation: "old-acquire",
+    generation: 0,
+  });
+  f.store.record_operation(
+    old_request.operation_id,
+    "acquire",
+    "thread-a",
+    0,
+    {
+      outcome: "pending",
+      _request_digest: exact_digest(old_request),
+      acquire_resources: active.resources,
+    },
+  );
+
+  const before = f.runner.calls.length;
+  const reused = await f.acquire();
+  expect(reused.effective_lease).toBe(true);
+  expect(changes(f, before)).toEqual([]);
+  expect(f.store.operation("old-acquire")?.outcome).toBe("success");
+
+  const conflicting = f.request("acquire", {
+    operation: "conflicting-acquire",
+    generation: active.generation,
+  });
+  f.store.record_operation(
+    conflicting.operation_id,
+    "acquire",
+    "thread-a",
+    active.generation,
+    {
+      outcome: "pending",
+      _request_digest: exact_digest(conflicting),
+      task_id: active.task_id,
+      task_generation: active.generation,
+      acquire_resources: { cpu: 8, memory_mib: 4096, disk_gib: 20 },
+    },
+  );
+  await expect_error("operation_conflict", () => f.acquire());
+  expect(f.store.operation("conflicting-acquire")?.outcome).toBe("pending");
+  await f.call("release");
+  expect(f.store.operation("conflicting-acquire")?.error.code).toBe("lease_released");
+});
+
+scenario("release and expiry cancel every matching pending acquire and retain the marker", async f => {
+  const active = await f.acquire();
+  for (const operation of ["pending-one", "pending-two"]) {
+    const request = f.request("acquire", {
+      operation,
+      generation: active.generation,
+    });
+    f.store.record_operation(
+      operation,
+      "acquire",
+      "thread-a",
+      active.generation,
+      {
+        outcome: "pending",
+        _request_digest: exact_digest(request),
+        task_id: active.task_id,
+        task_generation: active.generation,
+        acquire_resources: active.resources,
+      },
+    );
+  }
+
+  const released = await f.call("release");
+  expect(released.state).toBe("cached");
+  expect(parse_json(task(f).last_error)).toMatchObject({
+    pending_acquire_cancellation: true,
+    pending_acquire_operation_ids: ["pending-one", "pending-two"],
+  });
+  expect(f.store.operation("pending-one")?.error.code).toBe("lease_released");
+  expect(f.store.operation("pending-two")?.error.code).toBe("lease_released");
+
+  const next = await f.acquire();
+  const pending = f.request("acquire", {
+    operation: "expiry-pending",
+    generation: next.generation,
+  });
+  f.store.record_operation(
+    pending.operation_id,
+    "acquire",
+    "thread-a",
+    next.generation,
+    {
+      outcome: "pending",
+      _request_digest: exact_digest(pending),
+      task_id: next.task_id,
+      task_generation: next.generation,
+      acquire_resources: next.resources,
+    },
+  );
+  f.advance(1800);
+  await timer(f, next);
+  expect(task(f).state).toBe("cached");
+  expect(f.store.operation("expiry-pending")?.error.code).toBe("lease_released");
+  expect(parse_json(task(f).last_error)).toMatchObject({
+    pending_acquire_cancellation: true,
+    pending_acquire_operation_ids: ["expiry-pending"],
+  });
 });

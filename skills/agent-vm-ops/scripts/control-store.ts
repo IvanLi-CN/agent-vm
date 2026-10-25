@@ -1091,13 +1091,17 @@ export class StateStore {
         continue;
       }
 
-      pending.push({
+      const item: Data = {
         operation_id: row.operation_id,
         action: row.action,
         session_id: row.session_id,
         generation: row.generation,
         created_at: row.created_at,
-      });
+      };
+      for (const key of ["task_id", "task_generation", "acquire_resources"]) {
+        if (Object.hasOwn(response, key)) item[key] = response[key];
+      }
+      pending.push(item);
     }
 
     return pending;

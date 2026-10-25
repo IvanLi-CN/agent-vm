@@ -349,7 +349,7 @@ export class ResourceControl extends ControlCore {
 
   async _eligible_cache(snapshot: Data): Promise<Data> {
     const task = this.store.get_task({ task_id: snapshot.task_id });
-    if (!task || task.state !== "cached" || !task.inactive_since)
+    if (!task || !["cached", "deleting"].includes(task.state) || !task.inactive_since)
       throw new ControlError("cache_ineligible", "not an eligible stopped cache");
     if (compare(task.generation, snapshot.generation) !== 0 || task.session_id !== snapshot.session_id)
       throw new ControlError("cache_ineligible", "cache ownership or generation changed");
@@ -1011,12 +1011,14 @@ export class ResourceControl extends ControlCore {
     catch { throw new ControlError("resource_unverified", `task ${field} cannot be verified`); }
   }
 
-  _require_active(task: Data | null): void {
+  _require_active(task: Data | null, allow_pending_acquire = false): void {
     if (!task || task.state !== "active")
       throw new ControlError("task_not_active", "the VM lease is not active");
     const expiry = parse_time(task.lease_expires_at);
     if (!expiry || expiry <= this.now())
       throw new ControlError("lease_expired", "the VM lease has expired");
+    if (!allow_pending_acquire && this._pending_acquire_for_task(task) !== null)
+      throw new ControlError("lease_unavailable", "the VM lease has an unresolved acquire operation; release or retry that operation first");
   }
 
   async _native_resources(task: Data): Promise<Data> {
