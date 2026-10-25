@@ -5,7 +5,7 @@ description: Use a session-owned Incus Linux VM for code execution, Docker/Compo
 
 # Agent VM
 
-Use the installed `agent-vm` CLI. Read [the command contract](../../docs/specs/agent-vm/contracts/cli.md) for command details; the bundled client source is [scripts/agent_vm.py](scripts/agent_vm.py). If the CLI, session identity, protocol or native service is missing, report the exact failure. Do not install infrastructure, revive a retired backend or use local Docker without the owner's explicit authorization.
+Use the installed `agent-vm` CLI. Read [the command contract](../../docs/specs/agent-vm/contracts/cli.md) for command details; the direct Bun client source is [scripts/agent_vm.ts](scripts/agent_vm.ts). A source-linked consumer can run `bun <skill-dir>/scripts/agent_vm.ts`; retain its sibling modules. The local client requires installed Bun with `bun:ffi` and `Bun.build`, OpenSSH and Git; sync additionally requires rsync. If the CLI, runtime, session identity, protocol or native service is missing, report the exact failure. Do not install infrastructure, revive a retired backend or use local Docker without the owner's explicit authorization.
 
 ## Start and work
 
@@ -29,7 +29,7 @@ While actively progressing or tracking the task, use explicit `agent-vm renew` b
 
 ## Source, ports and capacity
 
-Use `agent-vm sync --name <safe-name>` or `python3 <loaded-skill-dir>/scripts/sync_worktree.py --name <safe-name>` from the Git worktree. The helper writes only `/workspace/worktrees/<name>/src`; keep results beside `src`. It selects tracked/unignored files, replaces only its own source directory, excludes `.git` and rejects submodules before writes. For submodules or other data use explicit native upload/download or trusted SSH/rsync. Normal SSH is not limited to the helper path.
+Use `agent-vm sync --name <safe-name>` or `bun <loaded-skill-dir>/scripts/sync_worktree.ts --name <safe-name>` from the Git worktree. The helper writes source content only to `/workspace/worktrees/<name>/src`, with private transaction metadata and staging beside it; keep results beside `src`. It selects tracked/unignored files, preserves Git byte paths, symlinks and modes, replaces only its own source directory, excludes `.git` and rejects submodules before writes. The managed Linux guest must already provide Bun with `bun:ffi`, libc `flock`/`renameat2`, rsync and GNU `timeout`; the helper checks prerequisites before staging, runs one bounded guest action and retains recovery material after an uncertain commit. Unsupported local worktree-root byte paths fail explicitly. For submodules or other data use explicit native upload/download or trusted SSH/rsync. Normal SSH is not limited to the helper path.
 
 Native clients use `agent-vm ssh-info --format ssh-config`, saved with mode 0600, then `ssh -F <config> agent-vm` (or rsync with that configuration). Keep host checking enabled and consume the returned port/key settings; do not assemble permanent ports or gateway routes. Delete temporary configuration when finished.
 
