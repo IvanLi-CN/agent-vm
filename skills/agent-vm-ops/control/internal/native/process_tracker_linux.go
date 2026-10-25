@@ -87,6 +87,24 @@ func (tracker *processTracker) Live() (int, error) {
 	return live, nil
 }
 
+func (tracker *processTracker) Present() (int, error) {
+	present := 0
+	for pid, item := range tracker.tracked {
+		current, err := readProcess(pid)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if current.start != item.start {
+			return 0, fmt.Errorf("tracked process identity changed for pid %d", pid)
+		}
+		present++
+	}
+	return present, nil
+}
+
 func (tracker *processTracker) Kill() error {
 	var first error
 	for pid, item := range tracker.tracked {

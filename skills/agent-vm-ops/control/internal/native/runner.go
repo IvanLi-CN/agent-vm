@@ -197,17 +197,17 @@ func cleanupTracked(tracker *processTracker, root int) error {
 		if err := tracker.Kill(); err != nil && first == nil {
 			first = err
 		}
-		live, err := tracker.Live()
+		if err := tracker.Reap(); err != nil && first == nil {
+			first = err
+		}
+		present, err := tracker.Present()
 		if err != nil {
 			if first == nil {
 				first = err
 			}
 			break
 		}
-		if live == 0 {
-			if err := tracker.Reap(); err != nil && first == nil {
-				first = err
-			}
+		if present == 0 {
 			return first
 		}
 		time.Sleep(50 * time.Millisecond)
@@ -215,9 +215,9 @@ func cleanupTracked(tracker *processTracker, root int) error {
 	if err := tracker.Reap(); err != nil && first == nil {
 		first = err
 	}
-	if live, err := tracker.Live(); err != nil && first == nil {
+	if present, err := tracker.Present(); err != nil && first == nil {
 		first = err
-	} else if err == nil && live > 0 && first == nil {
+	} else if err == nil && present > 0 && first == nil {
 		first = errors.New("tracked native descendants remain after cleanup")
 	}
 	return first
