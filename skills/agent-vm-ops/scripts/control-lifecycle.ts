@@ -284,11 +284,6 @@ export class LifecycleControl extends ResourceControl {
     const expected = existing?.generation ?? 0;
     if (compare(request.generation, expected) !== 0)
       throw new ControlError("generation_mismatch", "acquire requires the latest observed generation", { current_generation: expected });
-    const admission_epoch = await this._admission_lock(() => {
-      if (this.store.get_meta("draining") === "1") throw new ControlError("draining", "new leases are refused");
-      return this.store.get_meta("admission_epoch") || "initial";
-    });
-    await this._network_guard();
     const public_key = require_nonempty_string(request.public_key, "public_key");
     const key_match = /^ssh-ed25519 [A-Za-z0-9+/=]+(?: [^\r\n]*)?$/.exec(public_key);
     if (!key_match || key_match[0] !== public_key)
@@ -305,6 +300,11 @@ export class LifecycleControl extends ResourceControl {
         );
       }
     }
+    const admission_epoch = await this._admission_lock(() => {
+      if (this.store.get_meta("draining") === "1") throw new ControlError("draining", "new leases are refused");
+      return this.store.get_meta("admission_epoch") || "initial";
+    });
+    await this._network_guard();
     if (!cached) await this._image_guard();
     if (cached) {
       await this._verify_network_device(existing);
