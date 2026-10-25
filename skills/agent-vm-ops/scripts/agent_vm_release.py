@@ -32,6 +32,7 @@ try:
         MANIFEST_NAME,
         CLIENT_SIDECAR_NAME,
         PROTOCOL_VERSION,
+        SUPPORT_ARTIFACT_NAMES,
         UNIT_EXEC_START,
         UNIT_CONTENT_SHA256,
         ManifestError,
@@ -42,6 +43,7 @@ try:
         sha256_file,
         verify_client_sidecar,
         verify_bundle,
+        verify_typescript_syntax,
     )
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -49,6 +51,7 @@ except ModuleNotFoundError:
         MANIFEST_NAME,
         CLIENT_SIDECAR_NAME,
         PROTOCOL_VERSION,
+        SUPPORT_ARTIFACT_NAMES,
         UNIT_EXEC_START,
         UNIT_CONTENT_SHA256,
         ManifestError,
@@ -59,6 +62,7 @@ except ModuleNotFoundError:
         sha256_file,
         verify_client_sidecar,
         verify_bundle,
+        verify_typescript_syntax,
     )
 
 
@@ -74,7 +78,7 @@ DEFAULT_TIMEOUT_SECONDS = 300
 DEFAULT_POLL_SECONDS = 1.0
 MAX_TIMEOUT_SECONDS = 300
 MAX_POLL_SECONDS = 1.0
-CANONICAL_REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.py"
+CANONICAL_REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.ts"
 CANONICAL_REMOTE_WRAPPER = "/usr/local/sbin/agent-vm-release-wrapper"
 CONTROL_TRANSITION_STATES = {"preparing", "closing", "deleting", "failed"}
 KNOWN_TASK_STATES = {"absent", "cached", "preparing", "active", "closing", "deleting", "failed"}
@@ -88,8 +92,11 @@ RECONCILE_ACTIONS = {
 }
 SOURCE_ARTIFACTS = (
     ("agent_vm.py", "skills/agent-vm/scripts/agent_vm.py", "client", 0o755),
-    ("agent_vm_control.py", "skills/agent-vm-ops/scripts/agent_vm_control.py", "control", 0o755),
-    ("release_manifest.py", "skills/agent-vm-ops/scripts/release_manifest.py", "support", 0o644),
+    ("agent_vm_control.ts", "skills/agent-vm-ops/scripts/agent_vm_control.ts", "control", 0o755),
+    *(
+        (name, f"skills/agent-vm-ops/scripts/{name}", "support", 0o644)
+        for name in sorted(SUPPORT_ARTIFACT_NAMES)
+    ),
     ("systemd/agent-vm-native-age-gc.service", "skills/agent-vm-ops/assets/systemd/agent-vm-native-age-gc.service", "unit", 0o644),
     ("systemd/agent-vm-native-age-gc.timer", "skills/agent-vm-ops/assets/systemd/agent-vm-native-age-gc.timer", "unit", 0o644),
     ("systemd/agent-vm-native-expire@.service", "skills/agent-vm-ops/assets/systemd/agent-vm-native-expire@.service", "unit", 0o644),
@@ -266,6 +273,8 @@ def _verify_python_syntax(root: Path, manifest: Mapping[str, Any]) -> None:
     for artifact in manifest["artifacts"]:
         if artifact["role"] not in {"client", "control", "support"}:
             continue
+        if PurePosixPath(artifact["path"]).suffix != ".py":
+            continue
         path = root / Path(*PurePosixPath(artifact["path"]).parts)
         try:
             compile(path.read_text(encoding="utf-8"), str(path), "exec")
@@ -316,6 +325,7 @@ def _open_bundle(bundle: Path) -> tuple[tempfile.TemporaryDirectory[str], Path, 
         _reject_bundle_extras(root, manifest)
         _verify_fixed_artifact_set(manifest)
         _verify_python_syntax(root, manifest)
+        verify_typescript_syntax(root, manifest)
         _verify_unit_contents(root, manifest)
         return temporary, root, manifest
     except ManifestError as exc:
@@ -593,7 +603,7 @@ class SSHTransport:
         return self._run(host, command, payload)
 
     def control(self, host: str, remote_control: str, request: Mapping[str, Any]) -> Mapping[str, Any]:
-        response = self._run(host, ["python3", remote_control], json.dumps(dict(request), sort_keys=True).encode())
+        response = self._run(host, ["bun", remote_control], json.dumps(dict(request), sort_keys=True).encode())
         if response.get("ok") is False:
             error = response.get("error")
             if isinstance(error, dict):

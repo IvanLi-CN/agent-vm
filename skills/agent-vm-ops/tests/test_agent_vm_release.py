@@ -88,6 +88,11 @@ class ReleasePublisherTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.bundle = self.root / "bundle.tar"
         RELEASE.build_release(ROOT, self.bundle, "e" * 40)
+        # Transaction tests isolate the syntax subprocess; dedicated manifest
+        # tests exercise its command, failure handling, and real transpilation.
+        syntax_patch = mock.patch.object(RELEASE, "verify_typescript_syntax")
+        self.typescript_check = syntax_patch.start()
+        self.addCleanup(syntax_patch.stop)
 
     _DEFAULT_CLIENT_TARGET = object()
 
@@ -164,6 +169,53 @@ class ReleasePublisherTests(unittest.TestCase):
         with mock.patch.object(transport, "_run", return_value={}) as run:
             transport.wrapper("staging-control", RELEASE.CANONICAL_REMOTE_WRAPPER, "status", "tx", "e" * 40)
         run.assert_called_once_with("staging-control", [RELEASE.CANONICAL_REMOTE_WRAPPER, "status"], None)
+
+    def test_ssh_control_uses_bun_and_the_typescript_controller(self):
+        transport = RELEASE.SSHTransport()
+        request = {"protocol": 4, "action": "drain-status"}
+        response = {"ok": True, "result": {"draining": True}}
+        with mock.patch.object(transport, "_run", return_value=response) as run:
+            self.assertEqual(
+                transport.control("staging-control", RELEASE.CANONICAL_REMOTE_CONTROL, request),
+                response,
+            )
+        run.assert_called_once_with(
+            "staging-control",
+            ["bun", "/opt/agent-vm-native/agent_vm_control.ts"],
+            json.dumps(request, sort_keys=True).encode(),
+        )
+
+    def test_bundle_verification_checks_typescript_and_fails_closed(self):
+        self.assertTrue(RELEASE.verify_release(self.bundle)["verified"])
+        self.typescript_check.assert_called_once()
+        manifest = self.typescript_check.call_args.args[1]
+        self.assertIn(
+            ("control", "agent_vm_control.ts"),
+            {(item["role"], item["path"]) for item in manifest["artifacts"]},
+        )
+        self.typescript_check.side_effect = RELEASE.ManifestError(
+            "typescript_syntax_invalid", "injected syntax failure",
+        )
+        transport = FakeTransport()
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            self.publisher(transport).publish(timeout=5, poll=1, transaction_id="tx-invalid-ts")
+        self.assertEqual(failure.exception.code, "typescript_syntax_invalid")
+        self.assertEqual(transport.calls, [])
+
+    def test_python_syntax_check_only_compiles_python_files(self):
+        python = self.root / "candidate.py"
+        typescript = self.root / "candidate.ts"
+        python.write_text("raise RuntimeError('must not execute')\n", encoding="utf-8")
+        typescript.write_text("export const value: number = 1;\n", encoding="utf-8")
+        manifest = {"artifacts": [
+            {"role": "client", "path": python.name},
+            {"role": "control", "path": typescript.name},
+        ]}
+        RELEASE._verify_python_syntax(self.root, manifest)
+        python.write_text("def broken(:\n", encoding="utf-8")
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            RELEASE._verify_python_syntax(self.root, manifest)
+        self.assertEqual(failure.exception.code, "python_syntax_invalid")
 
     def test_health_rejects_malformed_boolean_values(self):
         transport = FakeTransport(malformed_health=True)

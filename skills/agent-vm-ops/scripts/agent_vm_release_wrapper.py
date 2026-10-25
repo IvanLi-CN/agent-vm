@@ -30,7 +30,9 @@ from typing import Any, Mapping
 
 try:
     from release_manifest import (
+        BUN_PATH,
         MANIFEST_NAME,
+        SUPPORT_ARTIFACT_NAMES,
         UNIT_CONTENT_SHA256,
         UNIT_EXEC_START,
         ManifestError,
@@ -38,11 +40,14 @@ try:
         sha256_file,
         verify_client_sidecar,
         verify_bundle,
+        verify_typescript_syntax,
     )
 except ModuleNotFoundError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from release_manifest import (
+        BUN_PATH,
         MANIFEST_NAME,
+        SUPPORT_ARTIFACT_NAMES,
         UNIT_CONTENT_SHA256,
         UNIT_EXEC_START,
         ManifestError,
@@ -50,11 +55,13 @@ except ModuleNotFoundError:
         sha256_file,
         verify_client_sidecar,
         verify_bundle,
+        verify_typescript_syntax,
     )
 
 
 DEFAULT_CONFIG_PATH = Path("/etc/agent-vm-native/release-wrapper.json")
-CANONICAL_CONTROL_PATH = Path("/opt/agent-vm-native/agent_vm_control.py")
+CANONICAL_CONTROL_PATH = Path("/opt/agent-vm-native/agent_vm_control.ts")
+RETIRED_CONTROL_NAME = "agent_vm_control.py"
 CANONICAL_UNIT_DIR = Path("/etc/systemd/system")
 RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -65,14 +72,14 @@ FORBIDDEN_CONFIG_NAMES = {"config.json", "state.sqlite3", "control.lock", "admis
 FIXED_UNIT_NAMES = tuple(sorted(set(UNIT_EXEC_START) | {"agent-vm-native-age-gc.timer"}))
 FIXED_ARTIFACTS = {
     ("client", "agent_vm.py"),
-    ("control", "agent_vm_control.py"),
-    ("support", "release_manifest.py"),
+    ("control", "agent_vm_control.ts"),
+    *{("support", name) for name in SUPPORT_ARTIFACT_NAMES},
     *{("unit", "systemd/" + name) for name in FIXED_UNIT_NAMES},
 }
 FIXED_ARTIFACT_MODES = {
     ("client", "agent_vm.py"): 0o755,
-    ("control", "agent_vm_control.py"): 0o755,
-    ("support", "release_manifest.py"): 0o644,
+    ("control", "agent_vm_control.ts"): 0o755,
+    **{("support", name): 0o644 for name in SUPPORT_ARTIFACT_NAMES},
     **{("unit", "systemd/" + name): 0o644 for name in FIXED_UNIT_NAMES},
 }
 
@@ -487,12 +494,21 @@ def _verify_python_syntax(root: Path, manifest: Mapping[str, Any]) -> None:
     for item in manifest["artifacts"]:
         if item["role"] not in {"client", "control", "support"}:
             continue
+        if PurePosixPath(item["path"]).suffix != ".py":
+            continue
         path = root / Path(*PurePosixPath(item["path"]).parts)
         try:
             source = path.read_text(encoding="utf-8")
             compile(source, str(path), "exec")
         except (OSError, UnicodeError, SyntaxError) as exc:
             _fail("python_syntax_invalid", f"Python artifact cannot be compiled: {item['path']}")
+
+
+def _verify_typescript_syntax(root: Path, manifest: Mapping[str, Any]) -> None:
+    try:
+        verify_typescript_syntax(root, manifest, bun_path=BUN_PATH)
+    except ManifestError as exc:
+        _fail(exc.code, exc.message, exc.detail)
 
 
 def _verify_transaction(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
@@ -508,6 +524,7 @@ def _verify_transaction(config: Mapping[str, Any], transaction_id: str, release_
     _reject_transaction_extras(root, manifest)
     _verify_fixed_artifacts(config, manifest)
     _verify_python_syntax(root, manifest)
+    _verify_typescript_syntax(root, manifest)
     _verify_unit_contents(root, manifest)
     owner_uid = int(config["owner_uid"])
     _require_owned_regular(root / MANIFEST_NAME, owner_uid, 0o644)
@@ -588,6 +605,7 @@ def _verify_retained_release(config: Mapping[str, Any], target: Path) -> dict[st
     _reject_transaction_extras(target, manifest)
     _verify_fixed_artifacts(config, manifest)
     _verify_python_syntax(target, manifest)
+    _verify_typescript_syntax(target, manifest)
     _verify_unit_contents(target, manifest)
     owner_uid = int(config["owner_uid"])
     _require_owned_regular(target / MANIFEST_NAME, owner_uid, 0o644)
@@ -641,8 +659,9 @@ def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
 def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
     targets = (
         Path(config["control_path"]),
+        Path(config["control_path"]).with_name(RETIRED_CONTROL_NAME),
         Path(config["control_path"]).with_name("agent_vm.py"),
-        Path(config["control_path"]).with_name("release_manifest.py"),
+        *(Path(config["control_path"]).with_name(name) for name in sorted(SUPPORT_ARTIFACT_NAMES)),
         Path(config["control_path"]).with_name(MANIFEST_NAME),
         Path(config["control_path"]).with_name("client-release.json"),
     ) + tuple(Path(config["unit_dir"]) / name for name in config["unit_names"])
@@ -728,7 +747,7 @@ def _ensure_drained(config: Mapping[str, Any]) -> None:
         return
     try:
         process = subprocess.run(
-            ["/usr/bin/python3", str(config["control_path"])],
+            [BUN_PATH, str(config["control_path"])],
             input=json.dumps({"protocol": 4, "action": "drain-status"}).encode(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -763,11 +782,14 @@ def _daemon_reload() -> None:
 
 def _install_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
     owner_uid = int(config["owner_uid"])
-    support_installed = False
+    support_paths = {item["path"] for item in manifest["artifacts"] if item["role"] == "support"}
+    if support_paths != SUPPORT_ARTIFACT_NAMES:
+        _fail("activation_unverified", "support artifact paths differ from the fixed module set")
+    support_installed: set[str] = set()
     for item in manifest["artifacts"]:
         source = release_root / Path(*PurePosixPath(item["path"]).parts)
         if item["role"] == "control":
-            if Path(item["path"]).name != "agent_vm_control.py":
+            if item["path"] != "agent_vm_control.ts":
                 _fail("activation_unverified", "control artifact name is not fixed")
             _copy_atomic(source, Path(config["control_path"]), owner_uid, item["mode"])
         elif item["role"] == "client":
@@ -780,18 +802,28 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
                 _fail("activation_unverified", f"unit target is not fixed: {name}")
             _copy_atomic(source, Path(config["unit_dir"]) / name, owner_uid, item["mode"])
         elif item["role"] == "support":
-            if Path(item["path"]).name != "release_manifest.py":
-                _fail("activation_unverified", "support artifact name is not fixed")
-            _copy_atomic(source, Path(config["control_path"]).with_name("release_manifest.py"), owner_uid, item["mode"])
-            support_installed = True
-    if not support_installed:
-        _fail("activation_unverified", "release manifest support module is missing")
+            if item["path"] not in SUPPORT_ARTIFACT_NAMES:
+                _fail("activation_unverified", "support artifact path is not fixed")
+            _copy_atomic(source, Path(config["control_path"]).with_name(item["path"]), owner_uid, item["mode"])
+            support_installed.add(item["path"])
+    if support_installed != SUPPORT_ARTIFACT_NAMES:
+        _fail("activation_unverified", "fixed support modules are missing")
     manifest_source = release_root / MANIFEST_NAME
     _require_owned_regular(manifest_source, owner_uid, 0o644)
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
     client_sidecar = release_root / "client-release.json"
     _require_owned_regular(client_sidecar, owner_uid, 0o644)
     _copy_atomic(client_sidecar, Path(config["control_path"]).with_name("client-release.json"), owner_uid, 0o644)
+    # This exact predecessor is snapshotted before activation, so failure can
+    # restore it. It is never executed or retained as a second control plane.
+    retired = Path(config["control_path"]).with_name(RETIRED_CONTROL_NAME)
+    if retired.exists() or retired.is_symlink():
+        _require_owned_regular(retired, owner_uid, 0o755)
+        try:
+            retired.unlink()
+            _fsync_directory(retired.parent, "activation_failed")
+        except OSError as exc:
+            _fail("activation_failed", "cannot retire the replaced controller")
 
 
 def activate(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:

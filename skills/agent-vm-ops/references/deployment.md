@@ -6,7 +6,8 @@ If the control environment must be rebuilt or recovered, preserve the state and 
 
 | Surface | Deployment input |
 | --- | --- |
-| Control script | `/opt/agent-vm-native/agent_vm_control.py` |
+| Control script | `/opt/agent-vm-native/agent_vm_control.ts` and the manifest-listed sibling TS modules |
+| Control interpreter | root-owned `/usr/local/bin/bun`, also available as `bun` in the control SSH PATH |
 | Configuration | root-owned JSON at `/etc/agent-vm-native/config.json` |
 | Durable state | configured local state database and lock directory |
 | Native units | static release units copied atomically into `/etc/systemd/system`; `timer_dir` is reserved for generated per-task expiry timers |
@@ -34,7 +35,9 @@ For remote script or unit changes, enter admission drain before activation. The 
 
 Daily requests never edit Incus project policy. Keep release manifests, run records, protected recovery copies, and live infrastructure evidence outside the public repository.
 
-The generic operator sequence is `python3 skills/agent-vm-ops/scripts/agent_vm_release.py build --source-root <source> --output <bundle>`, local `verify`, then `publish --bundle <bundle> --control-host <configured-alias> --client-target <local-client-target>`. The optional legacy `--wrapper` argument, when retained by an existing invocation, must equal `/usr/local/sbin/agent-vm-release-wrapper`; the remote wrapper and control paths are otherwise fixed. `rollback` is a separate operator action bound to a transaction and release identity; its `--bundle` is the previous verified release bundle and its required `--client-target` restores the matching local client before drain exit. The remote control path is fixed at `/opt/agent-vm-native/agent_vm_control.py`; no caller override is accepted. The wrapper's fixed command set is the only remote activation interface; the public `agent-vm` client remains unchanged.
+The active runtime contains only the TS controller and its declared support artifacts. Activation snapshots and removes a legacy `agent_vm_control.py` only when it is present at the former fixed target; a failed activation restores its prior bytes, owner and mode with the other fixed targets. Unrelated operator files and retained release directories are not cleanup targets. The transport/interpreter transition requires coordinated operator installation of the matching Bun runtime, wrapper, control artifacts and current client; a historical Python-only control path is not a fallback for the fixed Bun invocation.
+
+The generic operator sequence is `python3 skills/agent-vm-ops/scripts/agent_vm_release.py build --source-root <source> --output <bundle>`, local `verify`, then `publish --bundle <bundle> --control-host <configured-alias> --client-target <local-client-target>`. The optional legacy `--wrapper` argument, when retained by an existing invocation, must equal `/usr/local/sbin/agent-vm-release-wrapper`; the remote wrapper and control paths are otherwise fixed. `rollback` is a separate operator action bound to a transaction and release identity; its `--bundle` is the previous verified release bundle and its required `--client-target` restores the matching local client before drain exit. The remote control path is fixed at `/opt/agent-vm-native/agent_vm_control.ts`; no publisher override is accepted. The current Python client invokes it with `bun` through SSH, preserving protocol 4, bounded stdin/stdout/stderr and action-specific timeouts. The wrapper's fixed command set is the only remote activation interface.
 
 ## Observability boundary
 

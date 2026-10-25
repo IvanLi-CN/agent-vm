@@ -21,6 +21,7 @@
   "resize_cost_bytes": 1073741824,
   "storage_path": "<incus-pool-filesystem-path>",
   "required_guest_tools": [
+    "bun",
     "python3",
     "sshd",
     "rsync",
