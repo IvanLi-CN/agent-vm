@@ -90,6 +90,7 @@ The reusable dashboard path is considered complete when the public template rend
 - CT-visible memory capacity and logical memory reservation limit are separate metric-backed lines; pressure and OOM are observations and do not move the logical line.
 - CPU PSI `some.avg10`, `full.avg10`, the 50 percent startup threshold and `startup_blocked` are visible separately from logical CPU remaining; the pressure lines do not move the logical line.
 - The two dashboards use automatic refresh and remain visibly separate after a reload; the inventory table does not retain stale task rows after a successful scrape.
+- The two read-only actions use independent sampling lanes; a slow or failed inventory action does not erase the last valid capacity families, and a failed inventory scrape removes or invalidates task rows instead of silently retaining stale series. Source-specific health and observation timestamps remain distinguishable from aggregate `up=0`.
 
 # Guardrails / Reuse notes
 

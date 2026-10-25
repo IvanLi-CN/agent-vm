@@ -210,6 +210,34 @@ class AgentVmDocumentationTests(unittest.TestCase):
         self.assertIn("status: superseded", superseded_cpu_adr)
         self.assertIn("superseded_by: 0032-agent-vm-cpu-startup-pressure-for-overcommit.md", superseded_cpu_adr)
 
+    def test_observability_sampling_lanes_are_independent(self) -> None:
+        spec = SPEC.read_text(encoding="utf-8")
+        contract = OBSERVABILITY.read_text(encoding="utf-8")
+        solution = OBSERVABILITY_SOLUTION.read_text(encoding="utf-8")
+        for phrase in (
+            "independent observation lanes",
+            "pending or failed inventory read",
+            "latest valid capacity metric families",
+            "retained source snapshot",
+            "original observation timestamp",
+        ):
+            self.assertIn(phrase, spec)
+        for phrase in (
+            "independent sampling lanes",
+            "slow or unavailable `admin-status` call",
+            "erase capacity families",
+            "remove or invalidate task rows",
+            "Source-specific timestamps and health diagnostics",
+        ):
+            self.assertIn(phrase, contract)
+        for phrase in (
+            "independent sampling lanes",
+            "does not erase the last valid capacity families",
+            "removes or invalidates task rows",
+            "aggregate `up=0`",
+        ):
+            self.assertIn(phrase, solution)
+
 
 if __name__ == "__main__":
     unittest.main()

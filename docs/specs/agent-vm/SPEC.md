@@ -90,6 +90,8 @@ The read-only observation contract MUST distinguish logical reservation composit
 
 The deployment observation surface MUST provide separate capacity/admission and inventory/operations views. The capacity view MUST show allocated, reserved, allocated-and-reserved, remaining, limit and CT-visible capacity where authoritative, plus task-state counts and explicit snapshot estimates for logical and currently startable default-VM slots. The inventory view MUST cover all managed task states, use bounded fields, remove stale rows, and avoid raw errors, credentials and deployment paths. A missing or `-1` native slot limit MUST remain absent; a derived slot estimate MUST NOT be labelled as an authoritative slot limit.
 
+The deployment scrape bridge MUST schedule `admin-metrics` and `admin-status` as independent observation lanes. A pending or failed inventory read MUST NOT remove the latest valid capacity metric families, and a pending or failed capacity read MUST NOT retain task rows from an unsuccessful inventory scrape. A retained source snapshot MUST keep its original observation timestamp and expose source-specific health or freshness failure; the bridge MUST NOT replace unavailable values with fabricated zeroes.
+
 ## Synchronization and retrieval
 
 The TypeScript/Bun synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. Git selection, manifests and native filesystem access preserve byte paths, symlink targets, modes and hashes; unsupported local root-path representation fails explicitly. It rejects submodules, symlink parents, reserved ownership filenames and unsafe names before transfer. The guest transaction is an in-memory Bun action guarded by the managed image's runtime/native prerequisites and an external execution deadline; missing Bun or atomic capability fails closed. Native locks, exclusive preparation, baseline identity comparison, fsync and atomic directory exchange preserve the current source and adjacent results across conflicts and failures. An uncertain commit keeps its source marker and precise recovery record and returns exit 75 rather than an inferred rollback. The [CLI contract](contracts/cli.md#source-synchronization-transaction) defines execution bounds, ownership and recovery. Export streams a tar archive directly to the caller and does not create a server-side archive.
@@ -113,7 +115,6 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 - [Agent VM topology and recovery boundary](../../adr/0028-agent-vm-topology-recovery-boundary.md)
 - [Agent VM memory reservation-only admission](../../adr/0029-agent-vm-memory-reservation-only-admission.md)
 - [Agent VM control-plane update boundary](../../adr/0030-agent-vm-control-plane-update-boundary.md)
-- [Agent VM CPU startup pressure boundary](../../adr/0031-agent-vm-cpu-startup-pressure-boundary.md)
 - [Agent VM CPU startup pressure for overcommit](../../adr/0032-agent-vm-cpu-startup-pressure-for-overcommit.md)
 - [Agent VM capacity and inventory observability](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)
 
