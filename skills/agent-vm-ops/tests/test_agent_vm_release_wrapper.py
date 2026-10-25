@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -34,7 +35,7 @@ class WrapperTests(unittest.TestCase):
             "staging_root": str(self.root / "staging"),
             "current_link": str(self.root / "current"),
             "previous_link": str(self.root / "previous"),
-            "control_path": str(self.root / "installed" / "agent_vm_control.py"),
+            "control_path": str(self.root / "installed" / "agent_vm_control.ts"),
             "unit_dir": str(self.root / "units"),
             "state_root": str(self.root / "wrapper-state"),
             "owner_uid": uid,
@@ -55,6 +56,83 @@ class WrapperTests(unittest.TestCase):
         self.drain_patch = mock.patch.object(WRAPPER, "_ensure_drained")
         self.drain_patch.start()
         self.addCleanup(self.drain_patch.stop)
+        syntax_patch = mock.patch.object(WRAPPER, "verify_typescript_syntax")
+        self.typescript_check = syntax_patch.start()
+        self.addCleanup(syntax_patch.stop)
+
+    def test_drain_verification_uses_fixed_bun_controller(self):
+        self.drain_patch.stop()
+        response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ) as run:
+            WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/local/bin/bun", str(self.loaded["control_path"])],
+        )
+        self.assertEqual(
+            json.loads(run.call_args.kwargs["input"]),
+            {"protocol": 4, "action": "drain-status"},
+        )
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+    def test_python_syntax_check_only_compiles_python_files(self):
+        python = self.root / "candidate.py"
+        typescript = self.root / "candidate.ts"
+        python.write_text("raise RuntimeError('must not execute')\n", encoding="utf-8")
+        typescript.write_text("export const value: number = 1;\n", encoding="utf-8")
+        manifest = {"artifacts": [
+            {"role": "support", "path": python.name},
+            {"role": "control", "path": typescript.name},
+        ]}
+        WRAPPER._verify_python_syntax(self.root, manifest)
+        python.write_text("def broken(:\n", encoding="utf-8")
+        with self.assertRaises(WRAPPER.WrapperError) as failure:
+            WRAPPER._verify_python_syntax(self.root, manifest)
+        self.assertEqual(failure.exception.code, "python_syntax_invalid")
+
+    def test_transaction_and_retained_release_reject_typescript_syntax_failure(self):
+        WRAPPER.stage(self.loaded, "tx-invalid-ts", "b" * 40, self.payload)
+        self.typescript_check.side_effect = WRAPPER.ManifestError(
+            "typescript_syntax_invalid", "injected syntax failure",
+        )
+        with self.assertRaises(WRAPPER.WrapperError) as failure:
+            WRAPPER.verify_transaction(self.loaded, "tx-invalid-ts", "b" * 40)
+        self.assertEqual(failure.exception.code, "typescript_syntax_invalid")
+        staged = Path(self.loaded["staging_root"]) / "tx-invalid-ts"
+        self.assertFalse((staged / ".verified.json").exists())
+        with self.assertRaises(WRAPPER.WrapperError) as retained_failure:
+            WRAPPER._verify_retained_release(self.loaded, staged)
+        self.assertEqual(retained_failure.exception.code, "typescript_syntax_invalid")
+        self.assertEqual(self.typescript_check.call_count, 2)
+        self.assertFalse(Path(self.loaded["control_path"]).exists())
+
+    def test_support_targets_reject_every_non_allowlisted_path_before_copying(self):
+        paths = (
+            "other.ts",
+            "agent_vm_control.ts",
+            "nested/control-types.ts",
+            "./control-types.ts",
+            "../control-types.ts",
+            "/control-types.ts",
+            "nested/release_manifest.py",
+            "control-types.ts/extra",
+            "nested\\control-types.ts",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                manifest = {"artifacts": [
+                    {"role": "support", "path": name, "mode": 0o644}
+                    for name in sorted(WRAPPER.SUPPORT_ARTIFACT_NAMES)
+                ]}
+                manifest["artifacts"].append({"role": "support", "path": path, "mode": 0o644})
+                with mock.patch.object(WRAPPER, "_copy_atomic") as copy:
+                    with self.assertRaises(WRAPPER.WrapperError) as failure:
+                        WRAPPER._install_release_files(self.loaded, self.root, manifest)
+                self.assertEqual(failure.exception.code, "activation_unverified")
+                copy.assert_not_called()
 
     def test_unsafe_archive_members_are_rejected(self):
         output = io.BytesIO()
@@ -69,7 +147,7 @@ class WrapperTests(unittest.TestCase):
     def test_manifest_failure_removes_temporary_staging(self):
         output = io.BytesIO()
         with tarfile.open(fileobj=output, mode="w") as archive:
-            member = tarfile.TarInfo("agent_vm.py")
+            member = tarfile.TarInfo("agent_vm.ts")
             member.mode = 0o755
             member.size = 7
             archive.addfile(member, io.BytesIO(b"client\n"))
@@ -139,12 +217,58 @@ class WrapperTests(unittest.TestCase):
         self.assertTrue(activated["activated"])
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, "b" * 40)
         self.assertTrue(Path(self.loaded["control_path"]).is_file())
-        self.assertTrue(Path(self.loaded["control_path"]).with_name("agent_vm.py").is_file())
+        self.assertTrue(Path(self.loaded["control_path"]).with_name("agent_vm.ts").is_file())
         self.assertTrue(Path(self.loaded["control_path"]).with_name("release_manifest.py").is_file())
         self.assertTrue(Path(self.loaded["control_path"]).with_name("release-manifest.json").is_file())
         self.assertTrue(Path(self.loaded["control_path"]).with_name("client-release.json").is_file())
+        for name in WRAPPER.SUPPORT_ARTIFACT_NAMES:
+            with self.subTest(support=name):
+                installed = Path(self.loaded["control_path"]).with_name(name)
+                source_scripts = ROOT / "skills/agent-vm/scripts" if name in WRAPPER.CLIENT_PACKAGE_MODES else SCRIPTS
+                self.assertEqual(installed.read_bytes(), (source_scripts / name).read_bytes())
+                self.assertEqual(stat.S_IMODE(installed.stat().st_mode), WRAPPER.SUPPORT_ARTIFACT_MODES[name])
+                self.assertEqual(installed.stat().st_uid, os.getuid())
+                self.assertIn(installed, WRAPPER._activation_targets(self.loaded))
         self.assertEqual(run.call_args.args[0], ["systemctl", "daemon-reload"])
         self.assertFalse(any("stop" in arg or "disable" in arg for arg in run.call_args.args[0]))
+
+    def test_activation_retires_only_the_exact_replaced_python_entrypoints(self):
+        installed = Path(self.loaded["control_path"]).parent
+        installed.mkdir(parents=True)
+        retired = installed / WRAPPER.RETIRED_CONTROL_NAME
+        retired.write_bytes(b"old controller\n")
+        retired.chmod(0o755)
+        retired_client = installed / WRAPPER.RETIRED_CLIENT_NAME
+        retired_client.write_bytes(b"old client\n")
+        retired_client.chmod(0o755)
+        unrelated = installed / "operator-owned.py"
+        unrelated.write_bytes(b"untouched\n")
+        WRAPPER.stage(self.loaded, "tx-retire", "b" * 40, self.payload)
+        with mock.patch.object(WRAPPER, "_daemon_reload"):
+            WRAPPER.activate(self.loaded, "tx-retire", "b" * 40)
+        self.assertFalse(retired.exists())
+        self.assertFalse(retired_client.exists())
+        self.assertEqual(unrelated.read_bytes(), b"untouched\n")
+        self.assertTrue(Path(self.loaded["control_path"]).exists())
+
+    def test_failed_activation_restores_retired_entrypoint_bytes_and_mode(self):
+        installed = Path(self.loaded["control_path"]).parent
+        installed.mkdir(parents=True)
+        retired = installed / WRAPPER.RETIRED_CONTROL_NAME
+        retired.write_bytes(b"old controller\n")
+        retired.chmod(0o755)
+        retired_client = installed / WRAPPER.RETIRED_CLIENT_NAME
+        retired_client.write_bytes(b"old client\n")
+        retired_client.chmod(0o755)
+        WRAPPER.stage(self.loaded, "tx-retire-fail", "b" * 40, self.payload)
+        with mock.patch.object(WRAPPER, "_daemon_reload", side_effect=WRAPPER.WrapperError("injected", "reload failed")):
+            with self.assertRaises(WRAPPER.WrapperError):
+                WRAPPER.activate(self.loaded, "tx-retire-fail", "b" * 40)
+        self.assertEqual(retired.read_bytes(), b"old controller\n")
+        self.assertEqual(stat.S_IMODE(retired.stat().st_mode), 0o755)
+        self.assertEqual(retired_client.read_bytes(), b"old client\n")
+        self.assertEqual(stat.S_IMODE(retired_client.stat().st_mode), 0o755)
+        self.assertFalse(Path(self.loaded["control_path"]).exists())
 
     def test_activation_failure_restores_fixed_targets_and_pointers(self):
         WRAPPER.stage(self.loaded, "tx-failure", "b" * 40, self.payload)
@@ -159,8 +283,48 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "activation_failed")
         self.assertFalse(Path(self.loaded["current_link"]).exists())
         self.assertFalse(Path(self.loaded["control_path"]).exists())
-        self.assertFalse(Path(self.loaded["control_path"]).with_name("agent_vm.py").exists())
+        self.assertFalse(Path(self.loaded["control_path"]).with_name("agent_vm.ts").exists())
         self.assertFalse(Path(self.loaded["control_path"]).with_name("client-release.json").exists())
+        for name in WRAPPER.SUPPORT_ARTIFACT_NAMES:
+            self.assertFalse(Path(self.loaded["control_path"]).with_name(name).exists())
+
+    def test_package_install_and_restore_do_not_touch_unowned_temporary_symlinks(self):
+        source = self.root / "source.ts"
+        source.write_bytes(b"new")
+        target = self.root / "client.ts"
+        adjacent = self.root / "operator-file"
+        adjacent.write_bytes(b"keep")
+        for suffix in ("release-tmp", "restore-tmp"):
+            (self.root / (".client.ts." + suffix)).symlink_to(adjacent)
+        WRAPPER._copy_atomic(source, target, os.getuid(), 0o644)
+        self.assertEqual(target.read_bytes(), b"new")
+        WRAPPER._restore_targets({target: (b"old", 0o600, os.getuid())})
+        self.assertEqual(target.read_bytes(), b"old")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertEqual(adjacent.read_bytes(), b"keep")
+        for suffix in ("release-tmp", "restore-tmp"):
+            self.assertTrue((self.root / (".client.ts." + suffix)).is_symlink())
+
+    def test_activation_failure_restores_existing_support_bytes_modes_and_owners(self):
+        installed = Path(self.loaded["control_path"]).parent
+        installed.mkdir(parents=True)
+        for index, name in enumerate(sorted(WRAPPER.SUPPORT_ARTIFACT_NAMES)):
+            if index % 2 == 0:
+                path = installed / name
+                path.write_bytes(f"previous:{name}\n".encode())
+                path.chmod(0o600)
+        before = WRAPPER._snapshot_targets(self.loaded)
+        WRAPPER.stage(self.loaded, "tx-support-restore", "b" * 40, self.payload)
+        with mock.patch.object(
+            WRAPPER, "_daemon_reload",
+            side_effect=[WRAPPER.WrapperError("activation_failed", "injected"), None],
+        ):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER.activate(self.loaded, "tx-support-restore", "b" * 40)
+        self.assertEqual(failure.exception.code, "activation_failed")
+        self.assertEqual(WRAPPER._snapshot_targets(self.loaded), before)
+        self.assertFalse(Path(self.loaded["current_link"]).exists())
+        self.assertFalse(Path(self.loaded["fence_path"]).exists())
 
     def test_activation_rejects_a_modified_retained_release(self):
         first = self.root / "retained-first.tar"
@@ -183,15 +347,46 @@ class WrapperTests(unittest.TestCase):
         second = self.root / "second.tar"
         RELEASE.build_release(ROOT, first, "c" * 40)
         RELEASE.build_release(ROOT, second, "d" * 40)
+        # Give every support artifact distinct bytes in the newer release so
+        # rollback must actually restore the retained modules.
+        newer = self.root / "newer-support"
+        WRAPPER.safe_extract_archive(second.read_bytes(), newer)
+        manifest_path = newer / "release-manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        previous_support = {}
+        for item in manifest["artifacts"]:
+            if item["role"] != "support":
+                continue
+            path = newer / item["path"]
+            previous_support[item["path"]] = path.read_bytes()
+            comment = b"\n# newer release\n" if path.suffix == ".py" else b"\n// newer release\n"
+            path.write_bytes(path.read_bytes() + comment)
+            item["sha256"] = RELEASE.sha256_file(path)
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        sidecar_path = newer / "client-release.json"
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar["client_dependencies"] = [
+            item for item in manifest["artifacts"] if item["path"] in RELEASE.CLIENT_DEPENDENCY_MODES
+        ]
+        sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
+        RELEASE._create_archive(newer, second)
         with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
             WRAPPER.stage(self.loaded, "tx-first", "c" * 40, first.read_bytes())
             WRAPPER.activate(self.loaded, "tx-first", "c" * 40)
             WRAPPER.stage(self.loaded, "tx-second", "d" * 40, second.read_bytes())
             WRAPPER.activate(self.loaded, "tx-second", "d" * 40)
+            for name, content in previous_support.items():
+                self.assertNotEqual(
+                    Path(self.loaded["control_path"]).with_name(name).read_bytes(), content,
+                )
             result = WRAPPER.rollback(self.loaded, "tx-second", "d" * 40)
         self.assertTrue(result["rolled_back"])
         self.assertEqual(result["release_id"], "c" * 40)
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, "c" * 40)
+        for name, content in previous_support.items():
+            self.assertEqual(
+                Path(self.loaded["control_path"]).with_name(name).read_bytes(), content,
+            )
         with self.assertRaises(WRAPPER.WrapperError) as failure:
             WRAPPER.rollback(self.loaded, "tx-second", "d" * 40)
         self.assertEqual(failure.exception.code, "rollback_already_attempted")

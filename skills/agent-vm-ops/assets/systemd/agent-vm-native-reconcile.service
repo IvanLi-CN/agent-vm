@@ -5,7 +5,7 @@ Wants=incus.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile
+ExecStart=/usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts --timer-reconcile
 NoNewPrivileges=yes
 PrivateTmp=yes
 

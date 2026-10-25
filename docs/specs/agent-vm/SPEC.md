@@ -92,7 +92,7 @@ The deployment observation surface MUST provide separate capacity/admission and 
 
 ## Synchronization and retrieval
 
-The synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. It rejects submodules and unsafe names. Export streams a tar archive directly to the caller and does not create a server-side archive.
+The TypeScript/Bun synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. Git selection, manifests and native filesystem access preserve byte paths, symlink targets, modes and hashes; unsupported local root-path representation fails explicitly. It rejects submodules, symlink parents, reserved ownership filenames and unsafe names before transfer. The guest transaction is an in-memory Bun action guarded by the managed image's runtime/native prerequisites and an external execution deadline; missing Bun or atomic capability fails closed. Native locks, exclusive preparation, baseline identity comparison, fsync and atomic directory exchange preserve the current source and adjacent results across conflicts and failures. An uncertain commit keeps its source marker and precise recovery record and returns exit 75 rather than an inferred rollback. The [CLI contract](contracts/cli.md#source-synchronization-transaction) defines execution bounds, ownership and recovery. Export streams a tar archive directly to the caller and does not create a server-side archive.
 
 ## Verification
 
