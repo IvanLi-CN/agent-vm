@@ -20,6 +20,12 @@ export function window(v: any): Data {
 const within = (s: Data, w: Data): boolean => s.schema >= w.schema_min && s.schema <= w.schema_max && s.semantic_revision >= w.semantic_min && s.semantic_revision <= w.semantic_max;
 export function loadRelease(path: string): [Data, Data[]] {
   if (!isAbsolute(path) || path.split("/").some(p => p === "." || p === "..") || path.includes("\0")) fail("release_metadata_invalid", "release sidecar path must be absolute and canonical");
+  for (const directory of new Set([dirname(path), import.meta.dir])) {
+    try {
+      lstatSync(join(directory, ".agent-vm-client-install.json"));
+      fail("local_client_install_pending", "complete-package installation or recovery is pending; retain its recovery material");
+    } catch (e: any) { if (e.code !== "ENOENT") throw e; }
+  }
   let info;
   try { info = lstatSync(path); } catch (e: any) {
     if (e.code === "ENOENT") return [{ release_id: LEGACY, source_revision: null, protocol: PROTOCOL, manifest_present: false, artifacts_verified: true, actions: {} }, [warning("legacy_compatibility", "release sidecar is absent; using legacy protocol-4 compatibility")]];

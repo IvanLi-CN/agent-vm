@@ -117,12 +117,25 @@ test("sidecar shape, complete actions, exact client artifact, checksum and mode 
   const dependencies = CLIENT_DEPENDENCIES.map(([name, mode]) => { writeFileSync(join(f.root, name), name, { mode }); return { name, path: name, role: "support", mode, sha256: sha256(name) }; });
   const sidecar = { format: 1, protocol: 4, release_id: "a".repeat(40), source_revision: "a".repeat(40), client_artifact: { name: "agent_vm.ts", path: "agent_vm.ts", role: "client", mode: 0o755, sha256: sha256("client") }, client_dependencies: dependencies, client_view: { release_id: "a".repeat(40), source_revision: "a".repeat(40), protocol: 4, actions: Object.fromEntries(ACTIONS.map(a => [a, { request: schema, response: schema, client_to_control: window, control_to_client: window }])) } };
   writeFileSync(path, json(sidecar)); expect(loadRelease(path)[0].artifacts_verified).toBe(true);
-  for (const change of [(v: any) => { delete v.client_view.actions.status; }, (v: any) => { v.client_artifact.path = "../agent_vm.ts"; }, (v: any) => { v.client_artifact.sha256 = "0".repeat(64); }, (v: any) => { v.client_view.actions.status.request.schema = 2; }]) {
+  for (const change of [(v: any) => { delete v.client_view.actions.status; }, (v: any) => { v.client_artifact.path = "../agent_vm.ts"; }, (v: any) => { v.client_artifact.sha256 = "0".repeat(64); }, (v: any) => { v.client_view.actions.status.request.schema = 2; },
+    (v: any) => { delete v.client_dependencies; v.client_artifact.name = v.client_artifact.path = "agent_vm.py"; },
+    (v: any) => { v.client_dependencies.pop(); }, (v: any) => { v.client_dependencies[0] = v.client_dependencies[1]; },
+    (v: any) => { v.client_dependencies[0].path = "../escape.ts"; }, (v: any) => { v.client_dependencies[0].mode = 0o777; },
+    (v: any) => { v.client_dependencies[0].sha256 = "0".repeat(64); }]) {
     const copy = structuredClone(sidecar); change(copy); writeFileSync(path, json(copy)); f.client.sidecar = path;
     await expect(f.client.request("status", { session: "s" })).rejects.toBeInstanceOf(CliError); expect(f.commands).toHaveLength(0);
   }
   writeFileSync(path, json(sidecar)); chmodSync(client, 0o644); expect(() => loadRelease(path)).toThrow("mode differs"); chmodSync(client, 0o755);
   writeFileSync(join(f.root, "guest-source.ts"), "tampered"); expect(() => loadRelease(path)).toThrow("checksum differs");
+});
+
+test("pending complete-package installation fails before legacy fallback, SSH or journal writes", async () => {
+  const f = fixture();
+  f.client.sidecar = join(f.root, "client-release.json");
+  writeFileSync(join(f.root, ".agent-vm-client-install.json"), "{}", { mode: 0o600 });
+  await expect(f.client.request("acquire", { session: "s", write: true })).rejects.toMatchObject({ code: "local_client_install_pending" });
+  expect(f.commands).toEqual([]);
+  expect(readdirSync(f.root)).toEqual([".agent-vm-client-install.json"]);
 });
 
 test("generation-bound SSH material is strict, private, atomic and rejects stale identity", async () => {

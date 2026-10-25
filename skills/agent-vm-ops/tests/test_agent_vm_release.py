@@ -99,7 +99,7 @@ class ReleasePublisherTests(unittest.TestCase):
     def publisher(self, transport, *, client_target=_DEFAULT_CLIENT_TARGET, clock=None):
         elapsed = [0.0]
         if client_target is self._DEFAULT_CLIENT_TARGET:
-            client_target = self.root / "client" / "agent_vm.py"
+            client_target = self.root / "client" / "agent_vm.ts"
         return RELEASE.ReleasePublisher(
             bundle=self.bundle,
             control_host="staging-control",
@@ -112,7 +112,7 @@ class ReleasePublisherTests(unittest.TestCase):
 
     def test_publish_is_remote_first_and_exits_drain_after_local_client(self):
         transport = FakeTransport()
-        target = self.root / "client" / "agent_vm.py"
+        target = self.root / "client" / "agent_vm.ts"
         result = self.publisher(transport, client_target=target).publish(timeout=5, poll=1, transaction_id="tx-publish")
         self.assertTrue(result["published"])
         self.assertTrue(target.is_file())
@@ -121,6 +121,77 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(actions[:3], ["stage", "verify", "drain-enter"])
         self.assertLess(actions.index("drain-enter"), actions.index("activate"))
         self.assertEqual(actions[-1], "drain-exit")
+
+    def test_build_and_install_use_all_bun_files_and_never_python_client_paths(self):
+        from release_manifest import verify_typescript_syntax
+        temporary, root, manifest = RELEASE._open_bundle(self.bundle)
+        try:
+            verify_typescript_syntax(root, manifest)
+            self.assertFalse((root / "agent_vm.py").exists())
+            self.assertFalse((root / "sync_worktree.py").exists())
+            sidecar = json.loads((root / "client-release.json").read_text())
+            self.assertEqual({item["path"] for item in sidecar["client_dependencies"]}, set(RELEASE.CLIENT_DEPENDENCY_MODES))
+            target = self.root / "complete" / "agent_vm.ts"
+            publisher = self.publisher(FakeTransport(), client_target=target)
+            publisher._install_local_client(manifest)
+            for name, mode in RELEASE.LOCAL_PACKAGE_MODES.items():
+                self.assertEqual((target.parent / name).read_bytes(), (root / name).read_bytes())
+                self.assertEqual((target.parent / name).stat().st_mode & 0o7777, mode)
+            RELEASE._client_selfcheck(target.parent, manifest["release_id"])
+            self.assertFalse((target.parent / "agent_vm.py").exists())
+            self.assertFalse((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
+            marker = target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME
+            marker.write_text("{}")
+            for arguments in ([str(target), "version"], [str(target.parent / "sync_worktree.ts"), "--name", "demo"]):
+                process = RELEASE.subprocess.run(
+                    [RELEASE.shutil.which("bun"), "--no-macros", *arguments],
+                    stdout=RELEASE.subprocess.PIPE, stderr=RELEASE.subprocess.PIPE,
+                    timeout=30, cwd="/", env={"PATH": os.environ["PATH"], "AGENT_VM_RELEASE_MANIFEST": str(self.root / "absent.json")},
+                )
+                self.assertEqual(process.returncode, 2, process.stderr.decode())
+                self.assertIn(b"recovery is pending", process.stderr)
+            marker.unlink()
+            # Both public entrypoints reject the former Python-only sidecar,
+            # even when direct sync would otherwise select a separate CLI.
+            del sidecar["client_dependencies"]
+            sidecar["client_artifact"].update(name="agent_vm.py", path="agent_vm.py")
+            (target.parent / "client-release.json").write_text(json.dumps(sidecar))
+            for arguments in ([str(target), "version"], [str(target.parent / "sync_worktree.ts"), "--name", "demo"]):
+                process = RELEASE.subprocess.run(
+                    [RELEASE.shutil.which("bun"), "--no-macros", *arguments],
+                    stdout=RELEASE.subprocess.PIPE, stderr=RELEASE.subprocess.PIPE,
+                    timeout=30, cwd="/", env={"PATH": os.environ["PATH"]},
+                )
+                self.assertEqual(process.returncode, 2, process.stderr.decode())
+                self.assertIn(b"sidecar", process.stderr)
+        finally:
+            temporary.cleanup()
+
+    def test_retired_python_target_and_python_only_install_are_rejected_without_fallback(self):
+        manifest = RELEASE.build_release(ROOT, self.bundle, "e" * 40)
+        directory = self.root / "legacy"
+        directory.mkdir()
+        old = directory / "agent_vm.py"
+        old.write_bytes(b"raise RuntimeError('must never execute')\n")
+        old.chmod(0o755)
+        for target in (old, directory / "agent_vm.ts"):
+            with self.subTest(target=target.name):
+                with self.assertRaises(RELEASE.ReleaseError) as failure:
+                    self.publisher(FakeTransport(), client_target=target)._install_local_client(manifest)
+                self.assertEqual(failure.exception.code, "local_client_target_invalid")
+                self.assertFalse((directory / "agent_vm.ts").exists())
+                self.assertTrue(old.read_bytes().startswith(b"raise RuntimeError"))
+
+    def test_atomic_package_write_does_not_follow_or_remove_unowned_temporary_symlinks(self):
+        adjacent = self.root / "operator-owned"
+        adjacent.write_bytes(b"keep")
+        target = self.root / "client.ts"
+        old_temporary = self.root / ".client.ts.tmp"
+        old_temporary.symlink_to(adjacent)
+        RELEASE._write_atomic(target, b"verified", 0o644)
+        self.assertEqual(target.read_bytes(), b"verified")
+        self.assertEqual(adjacent.read_bytes(), b"keep")
+        self.assertTrue(old_temporary.is_symlink())
 
     def test_publish_requires_local_client_target_before_remote_mutation(self):
         transport = FakeTransport()
@@ -136,7 +207,7 @@ class ReleasePublisherTests(unittest.TestCase):
                 control_host="staging-control",
                 wrapper_path="/usr/local/sbin/agent-vm-release-wrapper",
                 remote_control="/tmp/other-control.py",
-                client_target=self.root / "client" / "agent_vm.py",
+                client_target=self.root / "client" / "agent_vm.ts",
             )
         self.assertEqual(failure.exception.code, "remote_control_invalid")
         with self.assertRaises(RELEASE.ReleaseError) as wrapper_failure:
@@ -144,7 +215,7 @@ class ReleasePublisherTests(unittest.TestCase):
                 bundle=self.bundle,
                 control_host="staging-control",
                 wrapper_path="/tmp/other-wrapper",
-                client_target=self.root / "client" / "agent_vm.py",
+                client_target=self.root / "client" / "agent_vm.ts",
             )
         self.assertEqual(wrapper_failure.exception.code, "wrapper_path_invalid")
 
@@ -153,7 +224,7 @@ class ReleasePublisherTests(unittest.TestCase):
             "publish",
             "--bundle", str(self.bundle),
             "--control-host", "staging-control",
-            "--client-target", str(self.root / "client" / "agent_vm.py"),
+            "--client-target", str(self.root / "client" / "agent_vm.ts"),
         ]
         self.assertEqual(
             RELEASE.build_parser().parse_args(common).wrapper,
@@ -270,7 +341,7 @@ class ReleasePublisherTests(unittest.TestCase):
 
     def test_post_activation_health_failure_attempts_one_rollback(self):
         transport = FakeTransport(fail_health_once=True)
-        target = self.root / "client" / "agent_vm.py"
+        target = self.root / "client" / "agent_vm.ts"
         result = self.publisher(transport, client_target=target).publish(timeout=5, poll=1, transaction_id="tx-rollback")
         self.assertTrue(result["rolled_back"])
         actions = [item[1] for item in transport.calls]
@@ -287,7 +358,7 @@ class ReleasePublisherTests(unittest.TestCase):
 
     def test_local_client_failure_keeps_remote_release_drained_without_rollback(self):
         transport = FakeTransport()
-        publisher = self.publisher(transport, client_target=self.root / "client" / "agent_vm.py")
+        publisher = self.publisher(transport, client_target=self.root / "client" / "agent_vm.ts")
         publisher._install_local_client = lambda manifest: (_ for _ in ()).throw(RELEASE.ReleaseError("local_client_selfcheck_failed", "injected"))
         result = publisher.publish(timeout=5, poll=1, transaction_id="tx-local-failure")
         self.assertFalse(result["published"])
@@ -299,7 +370,7 @@ class ReleasePublisherTests(unittest.TestCase):
     def test_manual_rollback_installs_the_supplied_previous_client_before_drain_exit(self):
         previous_bundle = self.root / "previous.tar"
         RELEASE.build_release(ROOT, previous_bundle, "c" * 40)
-        target = self.root / "client" / "agent_vm.py"
+        target = self.root / "client" / "agent_vm.ts"
         self.publisher(FakeTransport(), client_target=target).publish(timeout=5, poll=1, transaction_id="tx-current")
         transport = FakeTransport()
         result = RELEASE.ReleasePublisher(
@@ -315,224 +386,244 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(sidecar["release_id"], "c" * 40)
         self.assertEqual([item[1] for item in transport.calls][-1], "drain-exit")
 
-    def test_local_client_recovery_marker_restores_the_previous_pair(self):
-        target = self.root / "recover" / "agent_vm.py"
-        target.parent.mkdir(parents=True)
-        sidecar = target.with_name("client-release.json")
-        backup_client = RELEASE._local_backup_path(target)
-        backup_sidecar = RELEASE._local_backup_path(sidecar)
-        target.write_bytes(b"old-client")
-        target.chmod(0o755)
-        sidecar.write_bytes(b"old-sidecar")
-        sidecar.chmod(0o644)
-        old_client_digest = RELEASE.sha256_file(target)
-        old_sidecar_digest = RELEASE.sha256_file(sidecar)
-        os.replace(target, backup_client)
-        os.replace(sidecar, backup_sidecar)
-        target.write_bytes(b"new-client")
-        target.chmod(0o755)
-        staged_dir = target.parent / "agent-vm-client-crash"
-        staged_dir.mkdir()
-        record = {
-            "format": 1,
-            "phase": "installing",
-            "client_path": str(target),
-            "sidecar_path": str(sidecar),
-            "backup_client": str(backup_client),
-            "backup_sidecar": str(backup_sidecar),
-            "staged_dir": str(staged_dir),
-            "previous": {
-                "client": {"exists": True, "sha256": old_client_digest, "mode": 0o755},
-                "sidecar": {"exists": True, "sha256": old_sidecar_digest, "mode": 0o644},
-            },
-            "target": {
-                "client": {"exists": True, "sha256": hashlib.sha256(b"new-client").hexdigest(), "mode": 0o755},
-                "sidecar": {"exists": True, "sha256": hashlib.sha256(b"new-sidecar").hexdigest(), "mode": 0o644},
-            },
-            "installed": {
-                "client": {"exists": True, "sha256": hashlib.sha256(b"new-client").hexdigest(), "mode": 0o755},
-                "sidecar": {"exists": False},
-            },
-        }
-        RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
-        RELEASE._recover_local_client_install(target, sidecar)
-        self.assertEqual(target.read_bytes(), b"old-client")
-        self.assertEqual(sidecar.read_bytes(), b"old-sidecar")
+    def package_record(self, *, phase="installing", absent=False):
+        directory = self.root / "recovery"
+        directory.mkdir(exist_ok=True)
+        staging = directory / "agent-vm-client-crash"
+        staging.mkdir()
+        record = {"format": 2, "phase": phase, "client_path": str(directory / "agent_vm.ts"),
+                  "staged_dir": str(staging), "previous": {}, "target": {}}
+        for name, mode in RELEASE.LOCAL_PACKAGE_MODES.items():
+            old, new = ("old:" + name).encode(), ("new:" + name).encode()
+            staged = staging / name
+            staged.write_bytes(new)
+            staged.chmod(mode)
+            record["target"][name] = {"exists": True, "sha256": hashlib.sha256(new).hexdigest(), "mode": mode}
+            record["previous"][name] = {"exists": False}
+            if not absent:
+                destination = directory / name
+                destination.write_bytes(old)
+                destination.chmod(mode)
+                record["previous"][name] = {"exists": True, "sha256": hashlib.sha256(old).hexdigest(), "mode": mode}
+        RELEASE._write_json(directory / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
+        return directory, staging, record
+
+    def move_package_file(self, directory, staging, name):
+        destination = directory / name
+        if destination.exists():
+            os.replace(destination, RELEASE._local_backup_path(destination))
+        os.replace(staging / name, destination)
+
+    def recover(self, directory):
+        RELEASE._recover_local_client_install(directory / "agent_vm.ts", directory / "client-release.json")
+
+    def test_recovery_restores_complete_package_at_every_install_boundary(self):
+        # Include power loss after backup rename but before candidate rename.
+        for boundary in range(len(RELEASE.LOCAL_PACKAGE_MODES) * 2 + 1):
+            with self.subTest(boundary=boundary):
+                directory, staging, record = self.package_record()
+                mutations = 0
+                for name in RELEASE.LOCAL_PACKAGE_MODES:
+                    if mutations == boundary:
+                        break
+                    os.replace(directory / name, RELEASE._local_backup_path(directory / name))
+                    mutations += 1
+                    if mutations == boundary:
+                        break
+                    os.replace(staging / name, directory / name)
+                    mutations += 1
+                (directory / "operator-results").write_bytes(b"keep")
+                self.recover(directory)
+                self.recover(directory)  # repeated recovery is harmless
+                for name, mode in RELEASE.LOCAL_PACKAGE_MODES.items():
+                    self.assertEqual((directory / name).read_bytes(), ("old:" + name).encode())
+                    self.assertEqual((directory / name).stat().st_mode & 0o777, mode)
+                self.assertEqual((directory / "operator-results").read_bytes(), b"keep")
+                self.assertFalse(staging.exists())
+                self.assertFalse((directory / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
+                import shutil
+                shutil.rmtree(directory)
+
+    def test_recovery_removes_only_first_install_package_files(self):
+        directory, staging, _ = self.package_record(absent=True)
+        for name in RELEASE.LOCAL_PACKAGE_MODES:
+            self.move_package_file(directory, staging, name)
+        (directory / "unowned").write_bytes(b"keep")
+        self.recover(directory)
+        self.assertEqual({p.name for p in directory.iterdir()}, {"unowned"})
+
+    def test_completed_package_recovery_verifies_and_cleans_backups(self):
+        directory, staging, record = self.package_record(phase="complete")
+        for name in RELEASE.LOCAL_PACKAGE_MODES:
+            self.move_package_file(directory, staging, name)
+        # A crash during backup cleanup must not roll back a committed package.
+        RELEASE._local_backup_path(directory / "agent_vm.ts").unlink()
+        self.recover(directory)
+        for name in RELEASE.LOCAL_PACKAGE_MODES:
+            self.assertEqual((directory / name).read_bytes(), ("new:" + name).encode())
+            self.assertFalse(RELEASE._local_backup_path(directory / name).exists())
+        self.assertFalse((directory / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
+
+    def test_foreign_replacement_or_corrupt_backup_blocks_all_recovery_writes(self):
+        for corrupt in ("backup", "destination", "staging"):
+            with self.subTest(corrupt=corrupt):
+                directory, staging, _ = self.package_record()
+                for name in RELEASE.LOCAL_PACKAGE_MODES:
+                    self.move_package_file(directory, staging, name)
+                selected = list(RELEASE.LOCAL_PACKAGE_MODES)[-1]
+                path = (RELEASE._local_backup_path(directory / selected) if corrupt == "backup"
+                        else staging / selected if corrupt == "staging" else directory / selected)
+                path.write_bytes(b"foreign")
+                path.chmod(RELEASE.LOCAL_PACKAGE_MODES[selected])
+                before = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}
+                with self.assertRaises(RELEASE.ReleaseError) as failure:
+                    self.recover(directory)
+                self.assertEqual(failure.exception.code, "local_client_recovery_failed")
+                self.assertEqual({p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}, before)
+                self.assertTrue(path.exists())
+                import shutil
+                shutil.rmtree(directory)
+
+    def test_unknown_staging_content_and_partial_or_legacy_markers_fail_closed(self):
+        for fault in ("foreign-stage", "partial-package", "legacy-marker", "redirect-stage", "symlink"):
+            with self.subTest(fault=fault):
+                directory, staging, record = self.package_record()
+                if fault == "foreign-stage":
+                    (staging / "operator-file").write_bytes(b"keep")
+                elif fault == "partial-package":
+                    del record["target"]["guest-source.ts"]
+                elif fault == "legacy-marker":
+                    record["format"] = 1
+                elif fault == "redirect-stage":
+                    record["staged_dir"] = str(self.root / "operator-stage")
+                else:
+                    (staging / "client.ts").unlink()
+                    (staging / "client.ts").symlink_to(directory / "client.ts")
+                RELEASE._write_json(directory / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
+                before = {name: (directory / name).read_bytes() for name in RELEASE.LOCAL_PACKAGE_MODES}
+                with self.assertRaises(RELEASE.ReleaseError) as failure:
+                    self.recover(directory)
+                self.assertEqual(failure.exception.code, "local_client_recovery_failed")
+                self.assertEqual(before, {name: (directory / name).read_bytes() for name in RELEASE.LOCAL_PACKAGE_MODES})
+                self.assertTrue(staging.exists())
+                import shutil
+                shutil.rmtree(directory)
+
+    def test_actual_install_failure_restores_all_previous_modules(self):
+        target = self.root / "installed" / "agent_vm.ts"
+        publisher = self.publisher(FakeTransport(), client_target=target)
+        temporary, root, manifest = RELEASE._open_bundle(self.bundle)
+        try:
+            publisher._install_local_client(manifest)
+            before = {name: (target.parent / name).read_bytes() for name in RELEASE.LOCAL_PACKAGE_MODES}
+            (target.parent / "results").write_bytes(b"keep")
+            original = os.replace
+            failed = False
+            def interrupted(source, destination):
+                nonlocal failed
+                result = original(source, destination)
+                if Path(destination) == target.parent / "guest-source.ts" and not failed:
+                    failed = True
+                    raise OSError("injected failure after module rename")
+                return result
+            with mock.patch.object(RELEASE.os, "replace", side_effect=interrupted):
+                with self.assertRaises(RELEASE.ReleaseError):
+                    publisher._install_local_client(manifest)
+            self.assertTrue(failed)
+            self.assertEqual(before, {name: (target.parent / name).read_bytes() for name in RELEASE.LOCAL_PACKAGE_MODES})
+            self.assertEqual((target.parent / "results").read_bytes(), b"keep")
+            self.assertFalse((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
+        finally:
+            temporary.cleanup()
+
+    def test_preexisting_backup_is_preserved_before_install_mutation(self):
+        target = self.root / "preexisting" / "agent_vm.ts"
+        target.parent.mkdir()
+        backup = RELEASE._local_backup_path(target.parent / "sync_worktree.ts")
+        backup.write_bytes(b"operator backup")
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            self.publisher(FakeTransport(), client_target=target)._install_local_client(RELEASE.build_release(ROOT, self.bundle, "e" * 40))
+        self.assertEqual(failure.exception.code, "local_client_target_invalid")
+        self.assertEqual(backup.read_bytes(), b"operator backup")
+        self.assertFalse(target.exists())
+
+    def test_failure_after_exclusive_backup_creation_restores_the_package(self):
+        target = self.root / "backup-boundary" / "agent_vm.ts"
+        publisher = self.publisher(FakeTransport(), client_target=target)
+        manifest = RELEASE.build_release(ROOT, self.bundle, "e" * 40)
+        publisher._install_local_client(manifest)
+        before = {name: (target.parent / name).read_bytes() for name in RELEASE.LOCAL_PACKAGE_MODES}
+        original = os.link
+        def interrupted(source, destination, **options):
+            original(source, destination, **options)
+            raise OSError("injected failure after exclusive backup creation")
+        with mock.patch.object(RELEASE.os, "link", side_effect=interrupted):
+            with self.assertRaises(RELEASE.ReleaseError):
+                publisher._install_local_client(manifest)
+        self.assertEqual(before, {name: (target.parent / name).read_bytes() for name in RELEASE.LOCAL_PACKAGE_MODES})
         self.assertFalse((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
-        self.assertFalse(staged_dir.exists())
 
-    def test_preexisting_local_backup_is_rejected_and_preserved(self):
-        target = self.root / "preexisting-backup" / "agent_vm.py"
-        target.parent.mkdir(parents=True)
-        sidecar = target.with_name("client-release.json")
-        target.write_bytes(b"old-client")
-        target.chmod(0o755)
-        backup = RELEASE._local_backup_path(target)
-        backup.write_bytes(b"operator-backup")
-        backup.chmod(0o755)
-        staged_dir = target.parent / "agent-vm-client-preexisting"
-        staged_dir.mkdir()
-        record = {
-            "format": 1,
-            "phase": "installing",
-            "client_path": str(target),
-            "sidecar_path": str(sidecar),
-            "backup_client": str(backup),
-            "backup_sidecar": str(RELEASE._local_backup_path(sidecar)),
-            "staged_dir": str(staged_dir),
-            "previous": {
-                "client": {"exists": True, "sha256": RELEASE.sha256_file(target), "mode": 0o755},
-                "sidecar": {"exists": False},
-            },
-            "target": {
-                "client": {"exists": True, "sha256": "1" * 64, "mode": 0o755},
-                "sidecar": {"exists": True, "sha256": "2" * 64, "mode": 0o644},
-            },
-            "installed": {"client": {"exists": False}, "sidecar": {"exists": False}},
-        }
-        RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
-        with self.assertRaises(RELEASE.ReleaseError) as failure:
-            RELEASE._recover_local_client_install(target, sidecar)
+    def test_backup_created_after_preflight_is_preserved_without_overwriting_it(self):
+        target = self.root / "backup-race" / "agent_vm.ts"
+        publisher = self.publisher(FakeTransport(), client_target=target)
+        manifest = RELEASE.build_release(ROOT, self.bundle, "e" * 40)
+        publisher._install_local_client(manifest)
+        before = {name: (target.parent / name).read_bytes() for name in RELEASE.LOCAL_PACKAGE_MODES}
+        original = os.link
+        def foreign(source, destination, **options):
+            Path(destination).write_bytes(b"operator backup")
+            original(source, destination, **options)
+        with mock.patch.object(RELEASE.os, "link", side_effect=foreign):
+            with self.assertRaises(RELEASE.ReleaseError) as failure:
+                publisher._install_local_client(manifest)
         self.assertEqual(failure.exception.code, "local_client_recovery_failed")
-        self.assertEqual(backup.read_bytes(), b"operator-backup")
+        self.assertEqual(RELEASE._local_backup_path(target).read_bytes(), b"operator backup")
+        self.assertEqual(before, {name: (target.parent / name).read_bytes() for name in RELEASE.LOCAL_PACKAGE_MODES})
         self.assertTrue((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
 
-    def test_external_local_target_replacement_is_preserved_during_recovery(self):
-        target = self.root / "external-replacement" / "agent_vm.py"
-        target.parent.mkdir(parents=True)
-        sidecar = target.with_name("client-release.json")
-        target.write_bytes(b"old-client")
-        target.chmod(0o755)
-        old_digest = RELEASE.sha256_file(target)
-        backup = RELEASE._local_backup_path(target)
-        os.replace(target, backup)
-        target.write_bytes(b"external-replacement")
-        target.chmod(0o755)
-        staged_dir = target.parent / "agent-vm-client-external"
-        staged_dir.mkdir()
-        record = {
-            "format": 1,
-            "phase": "installing",
-            "client_path": str(target),
-            "sidecar_path": str(sidecar),
-            "backup_client": str(backup),
-            "backup_sidecar": str(RELEASE._local_backup_path(sidecar)),
-            "staged_dir": str(staged_dir),
-            "previous": {
-                "client": {"exists": True, "sha256": old_digest, "mode": 0o755},
-                "sidecar": {"exists": False},
-            },
-            "target": {
-                "client": {"exists": True, "sha256": "1" * 64, "mode": 0o755},
-                "sidecar": {"exists": True, "sha256": "2" * 64, "mode": 0o644},
-            },
-            "installed": {
-                "client": {"exists": True, "sha256": "1" * 64, "mode": 0o755},
-                "sidecar": {"exists": False},
-            },
-        }
-        RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
-        with self.assertRaises(RELEASE.ReleaseError) as failure:
-            RELEASE._recover_local_client_install(target, sidecar)
-        self.assertEqual(failure.exception.code, "local_client_recovery_failed")
-        self.assertEqual(target.read_bytes(), b"external-replacement")
-        self.assertEqual(backup.read_bytes(), b"old-client")
+    def test_installed_integrity_failure_restores_the_entire_previous_package(self):
+        target = self.root / "integrity" / "agent_vm.ts"
+        publisher = self.publisher(FakeTransport(), client_target=target)
+        temporary, root, manifest = RELEASE._open_bundle(self.bundle)
+        try:
+            publisher._install_local_client(manifest)
+            before = {name: (target.parent / name).read_bytes() for name in RELEASE.LOCAL_PACKAGE_MODES}
+            with mock.patch.object(RELEASE, "verify_client_sidecar", side_effect=RELEASE.ManifestError("artifact_checksum_mismatch", "injected")):
+                with self.assertRaises(RELEASE.ReleaseError) as failure:
+                    RELEASE._install_client_package(root, target, manifest["release_id"])
+            self.assertEqual(failure.exception.code, "local_client_install_failed")
+            self.assertEqual(before, {name: (target.parent / name).read_bytes() for name in RELEASE.LOCAL_PACKAGE_MODES})
+            self.assertFalse((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
+        finally:
+            temporary.cleanup()
 
-    def test_completed_local_client_marker_is_verified_before_cleanup(self):
-        target = self.root / "complete" / "agent_vm.py"
-        target.parent.mkdir(parents=True)
-        sidecar = target.with_name("client-release.json")
-        target.write_bytes(b"installed-client")
-        target.chmod(0o755)
-        sidecar.write_bytes(b"installed-sidecar")
-        sidecar.chmod(0o644)
-        staged_dir = target.parent / "agent-vm-client-complete"
-        staged_dir.mkdir()
-        record = {
-            "format": 1,
-            "phase": "complete",
-            "client_path": str(target),
-            "sidecar_path": str(sidecar),
-            "backup_client": str(RELEASE._local_backup_path(target)),
-            "backup_sidecar": str(RELEASE._local_backup_path(sidecar)),
-            "staged_dir": str(staged_dir),
-        }
-        RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
-        with self.assertRaises(RELEASE.ReleaseError) as failure:
-            RELEASE._recover_local_client_install(target, sidecar)
-        self.assertEqual(failure.exception.code, "local_client_recovery_failed")
-        self.assertTrue((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
-        self.assertTrue(staged_dir.exists())
+    def test_selfcheck_requires_bun_and_does_not_execute_python(self):
+        temporary, root, manifest = RELEASE._open_bundle(self.bundle)
+        try:
+            publisher = self.publisher(FakeTransport())
+            with mock.patch.object(RELEASE.shutil, "which", return_value=None):
+                with self.assertRaises(RELEASE.ReleaseError) as failure:
+                    publisher._install_local_client(manifest)
+            self.assertEqual(failure.exception.code, "local_client_selfcheck_failed")
+            self.assertFalse(publisher.client_target.exists())
+            self.assertFalse((publisher.client_target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
+        finally:
+            temporary.cleanup()
 
-    def test_corrupt_local_backup_is_rejected_and_retained(self):
-        target = self.root / "corrupt" / "agent_vm.py"
-        target.parent.mkdir(parents=True)
-        sidecar = target.with_name("client-release.json")
-        target.write_bytes(b"old-client")
-        target.chmod(0o755)
-        sidecar.write_bytes(b"old-sidecar")
-        sidecar.chmod(0o644)
-        backup_client = RELEASE._local_backup_path(target)
-        backup_sidecar = RELEASE._local_backup_path(sidecar)
-        os.replace(target, backup_client)
-        os.replace(sidecar, backup_sidecar)
-        backup_client.write_bytes(b"tampered")
-        staged_dir = target.parent / "agent-vm-client-corrupt"
-        staged_dir.mkdir()
-        record = {
-            "format": 1,
-            "phase": "installing",
-            "client_path": str(target),
-            "sidecar_path": str(sidecar),
-            "backup_client": str(backup_client),
-            "backup_sidecar": str(backup_sidecar),
-            "staged_dir": str(staged_dir),
-            "previous": {
-                "client": {"exists": True, "sha256": RELEASE.sha256_file(target) if target.exists() else "0" * 64, "mode": 0o755},
-                "sidecar": {"exists": True, "sha256": RELEASE.sha256_file(backup_sidecar), "mode": 0o644},
-            },
-            "target": {
-                "client": {"exists": True, "sha256": "1" * 64, "mode": 0o755},
-                "sidecar": {"exists": True, "sha256": "2" * 64, "mode": 0o644},
-            },
-            "installed": {"client": {"exists": False}, "sidecar": {"exists": False}},
-        }
-        RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
-        with self.assertRaises(RELEASE.ReleaseError) as failure:
-            RELEASE._recover_local_client_install(target, sidecar)
-        self.assertEqual(failure.exception.code, "local_client_recovery_failed")
-        self.assertTrue(backup_client.exists())
-        self.assertTrue((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
-
-    def test_unexpected_local_staging_entries_are_not_recursively_deleted(self):
-        target = self.root / "staging-boundary" / "agent_vm.py"
-        target.parent.mkdir(parents=True)
-        sidecar = target.with_name("client-release.json")
-        staged_dir = target.parent / "agent-vm-client-unrelated"
-        staged_dir.mkdir()
-        protected = staged_dir / "unrelated.txt"
-        protected.write_text("keep", encoding="utf-8")
-        record = {
-            "format": 1,
-            "phase": "installing",
-            "client_path": str(target),
-            "sidecar_path": str(sidecar),
-            "backup_client": str(RELEASE._local_backup_path(target)),
-            "backup_sidecar": str(RELEASE._local_backup_path(sidecar)),
-            "staged_dir": str(staged_dir),
-            "previous": {"client": {"exists": False}, "sidecar": {"exists": False}},
-            "target": {
-                "client": {"exists": True, "sha256": "1" * 64, "mode": 0o755},
-                "sidecar": {"exists": True, "sha256": "2" * 64, "mode": 0o644},
-            },
-            "installed": {"client": {"exists": False}, "sidecar": {"exists": False}},
-        }
-        RELEASE._write_json(target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME, record, 0o600)
-        with self.assertRaises(RELEASE.ReleaseError) as failure:
-            RELEASE._recover_local_client_install(target, sidecar)
-        self.assertEqual(failure.exception.code, "local_client_recovery_failed")
-        self.assertTrue(protected.exists())
-        self.assertTrue(staged_dir.exists())
+    def test_local_install_lock_refuses_a_second_publisher(self):
+        import fcntl
+        target = self.root / "locked" / "agent_vm.ts"
+        target.parent.mkdir()
+        descriptor = os.open(target.parent / ".agent-vm-client-install.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            manifest = RELEASE.build_release(ROOT, self.bundle, "e" * 40)
+            with self.assertRaises(RELEASE.ReleaseError) as failure:
+                self.publisher(FakeTransport(), client_target=target)._install_local_client(manifest)
+            self.assertEqual(failure.exception.code, "local_client_install_busy")
+            self.assertFalse(target.exists())
+        finally:
+            os.close(descriptor)
 
 
 if __name__ == "__main__":

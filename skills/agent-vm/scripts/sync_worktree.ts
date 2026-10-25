@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { CliError, Data, decodePath, encodePath, exclusive, fileHash, json, parseJson, Runner, runBounded, shellJoin } from "./client-io.ts";
 import { Manifest, OWNER, validName } from "./guest-source.ts";
 import { lstatBytes, readlinkBytes } from "./byte-fs.ts";
+import { loadRelease } from "./client-release.ts";
 
 export class SyncFailure extends Error { constructor(message: string, public code = 1) { super(message); } }
 const splitNul = (b: Buffer): Buffer[] => { const result: Buffer[] = []; let start = 0; for (let i = 0; i < b.length; i++) if (b[i] === 0) { if (i > start) result.push(b.subarray(start, i)); start = i + 1; } if (start < b.length) throw new SyncFailure("Git file listing is not NUL terminated"); return result; };
@@ -114,6 +115,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     const options: Record<string, string> = {};
     while (argv.length) { const key = argv.shift()!; if (!["--name", "--cli", "--session-id"].includes(key) || !argv.length) throw new SyncFailure("usage: sync_worktree.ts --name NAME [--cli PATH] [--session-id ID]", 2); options[key] = argv.shift()!; }
     const cli = options["--cli"];
+    loadRelease(process.env.AGENT_VM_RELEASE_MANIFEST || join(import.meta.dir, "client-release.json"));
     const result = await sync(options["--name"], { cli: cli ? cli.endsWith(".ts") ? [process.execPath, cli] : [cli] : undefined, sessionId: options["--session-id"] });
     console.log(json(result)); return 0;
   } catch (e) { console.error(e instanceof Error ? e.message : String(e)); return e instanceof SyncFailure ? e.code : e instanceof CliError ? e.exitCode : 1; }

@@ -55,7 +55,7 @@ class ManifestContractTests(unittest.TestCase):
         self.assertEqual(set(checked["actions"]), set(MANIFEST.ACTION_NAMES))
         self.assertEqual(MANIFEST.verify_bundle(self.root)["source_revision"], "a" * 40)
 
-    def test_fixed_artifact_set_contains_the_complete_bun_controller(self):
+    def test_fixed_artifact_set_contains_the_complete_bun_controller_and_client(self):
         support_names = {
             "release_manifest.py",
             "control-types.ts",
@@ -68,11 +68,12 @@ class ManifestContractTests(unittest.TestCase):
             "control-lifecycle.ts",
             "release-manifest.ts",
             "guest-root-growth.ts",
+            *MANIFEST.CLIENT_DEPENDENCY_MODES,
         }
         expected = {
-            ("agent_vm.py", "agent_vm.py", "client", 0o755),
+            ("agent_vm.ts", "agent_vm.ts", "client", 0o755),
             ("agent_vm_control.ts", "agent_vm_control.ts", "control", 0o755),
-            *{(name, name, "support", 0o644) for name in support_names},
+            *{(name, name, "support", MANIFEST.CLIENT_DEPENDENCY_MODES.get(name, 0o644)) for name in support_names},
             *{
                 ("unit:" + name, "systemd/" + name, "unit", 0o644)
                 for name in (
@@ -84,7 +85,7 @@ class ManifestContractTests(unittest.TestCase):
             },
         }
         self.assertEqual(MANIFEST.FIXED_ARTIFACTS, expected)
-        for name in support_names | {"agent_vm_control.ts"}:
+        for name in support_names | {"agent_vm_control.ts", "agent_vm.ts"}:
             with self.subTest(missing=name):
                 incomplete = copy.deepcopy(self.manifest)
                 incomplete["artifacts"] = [
@@ -93,6 +94,78 @@ class ManifestContractTests(unittest.TestCase):
                 with self.assertRaises(MANIFEST.ManifestError) as failure:
                     MANIFEST.validate_manifest(incomplete)
                 self.assertEqual(failure.exception.code, "manifest_artifact_set_invalid")
+
+    @unittest.skipUnless(shutil.which("bun"), "Bun executable is not installed")
+    def test_python_controller_and_client_verify_the_same_complete_package(self):
+        sidecar = {
+            "format": 1, "release_id": self.manifest["release_id"],
+            "source_revision": self.manifest["source_revision"], "protocol": 4,
+            "client_artifact": next(item for item in self.manifest["artifacts"] if item["role"] == "client"),
+            "client_dependencies": [item for item in self.manifest["artifacts"] if item["path"] in MANIFEST.CLIENT_DEPENDENCY_MODES],
+            "client_view": self.manifest["client_view"],
+        }
+        path = self.root / MANIFEST.CLIENT_SIDECAR_NAME
+        script = """
+import * as M from './skills/agent-vm-ops/scripts/release-manifest.ts';
+import {loadRelease} from './skills/agent-vm/scripts/client-release.ts';
+const {root, manifest, fixed} = await Bun.stdin.json();
+if (JSON.stringify([...M.FIXED_ARTIFACTS].sort()) !== JSON.stringify(fixed.sort())) throw Error('artifact policies differ');
+const checks = [() => M.verify_client_sidecar(root, manifest), () => loadRelease(root + '/client-release.json')];
+console.log(JSON.stringify(checks.map(check => {try {check(); return true;} catch {return false;}})));
+"""
+        def check(value, accepted):
+            path.write_text(json.dumps(value), encoding="utf-8")
+            if accepted:
+                MANIFEST.verify_client_sidecar(self.root, self.manifest)
+            else:
+                with self.assertRaises(MANIFEST.ManifestError):
+                    MANIFEST.verify_client_sidecar(self.root, self.manifest)
+            process = subprocess.run(
+                [shutil.which("bun"), "--no-macros", "--eval", script],
+                input=json.dumps({"root": str(self.root), "manifest": self.manifest,
+                                  "fixed": list(MANIFEST.FIXED_ARTIFACTS)}).encode(),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, cwd=ROOT,
+            )
+            self.assertEqual(process.returncode, 0, process.stderr.decode())
+            self.assertEqual(json.loads(process.stdout), [accepted, accepted])
+
+        check(sidecar, True)
+        for mutate in (
+            lambda v: v.pop("client_dependencies"),
+            lambda v: v["client_dependencies"].pop(),
+            lambda v: v["client_dependencies"].append(v["client_dependencies"][0]),
+            lambda v: v["client_dependencies"][0].update(path="../escape.ts"),
+            lambda v: v["client_dependencies"][0].update(mode=0o777),
+            lambda v: v["client_dependencies"][0].update(mode=float(v["client_dependencies"][0]["mode"])),
+            lambda v: v["client_dependencies"][0].update(sha256="0" * 64),
+            lambda v: v.update(format=True),
+            lambda v: v["client_view"]["actions"]["status"]["request"].update(schema=True),
+            lambda v: v["client_artifact"].update(name="agent_vm.py", path="agent_vm.py"),
+        ):
+            value = copy.deepcopy(sidecar)
+            mutate(value)
+            check(value, False)
+        # Every imported dependency is verified against actual bytes, fixed mode
+        # and file type by all three consumers, not merely compared to metadata.
+        for name, mode in MANIFEST.CLIENT_PACKAGE_MODES.items():
+            with self.subTest(artifact=name):
+                artifact = self.root / name
+                content = artifact.read_bytes()
+                artifact.write_bytes(content + b"tampered")
+                check(sidecar, False)
+                artifact.write_bytes(content)
+                artifact.chmod(0o600)
+                check(sidecar, False)
+                artifact.chmod(mode)
+                artifact.unlink()
+                artifact.symlink_to(path)
+                check(sidecar, False)
+                artifact.unlink()
+                check(sidecar, False)
+                artifact.write_bytes(content)
+                artifact.chmod(mode)
+        check(sidecar, True)
+
 
     def test_systemd_assets_match_frozen_bun_policy_and_typescript_constants(self):
         expected_hashes = {
@@ -136,7 +209,7 @@ class ManifestContractTests(unittest.TestCase):
         candidate = self.root / "candidate.ts"
         candidate.write_text(source, encoding="utf-8")
         manifest = {"artifacts": [
-            {"role": "client", "path": "missing.py"},
+            {"role": "support", "path": "release_manifest.py"},
             {"role": "control", "path": candidate.name},
         ]}
         with mock.patch.dict(os.environ, {"BUN_OPTIONS": "--preload=/untrusted.ts"}):
@@ -162,7 +235,7 @@ class ManifestContractTests(unittest.TestCase):
         )
 
     def test_typescript_syntax_checks_every_control_and_support_module(self):
-        paths = ["agent_vm_control.ts", *MANIFEST.TYPESCRIPT_SUPPORT_ARTIFACT_NAMES]
+        paths = ["agent_vm_control.ts", "agent_vm.ts", *MANIFEST.TYPESCRIPT_SUPPORT_ARTIFACT_NAMES]
         artifacts = []
         expected_sources = []
         for index, name in enumerate(paths):
@@ -243,12 +316,12 @@ class ManifestContractTests(unittest.TestCase):
         outside = self.root.parent / (self.root.name + "-outside")
         outside.mkdir()
         self.addCleanup(lambda: outside.rmdir())
-        external_client = outside / "agent_vm.py"
+        external_client = outside / "agent_vm.ts"
         external_client.write_bytes(b"client\n")
         external_client.chmod(0o755)
         self.addCleanup(external_client.unlink)
         value = copy.deepcopy(self.manifest)
-        value["artifacts"][0]["path"] = "nested/agent_vm.py"
+        value["artifacts"][0]["path"] = "nested/agent_vm.ts"
         (self.root / "nested").symlink_to(outside, target_is_directory=True)
         with self.assertRaises(MANIFEST.ManifestError) as failure:
             MANIFEST.verify_bundle(self.root, value)

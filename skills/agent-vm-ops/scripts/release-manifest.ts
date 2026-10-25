@@ -40,6 +40,10 @@ export const RELEASE_ID_RE = SOURCE_REVISION_RE;
 export const LEGACY_RELEASE_ID = "legacy-protocol-4";
 export const MANIFEST_NAME = "release-manifest.json";
 export const CLIENT_SIDECAR_NAME = "client-release.json";
+export const CLIENT_DEPENDENCY_NAMES = new Set([
+  "byte-fs.ts", "client-io.ts", "client-release.ts", "client.ts",
+  "guest-source.ts", "sync-native.ts", "sync_worktree.ts",
+]);
 
 export const ACTION_NAMES: readonly string[] = Object.freeze([
   "acquire",
@@ -102,7 +106,14 @@ export type ArtifactTuple = readonly [
 export const FIXED_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze(
   (
     [
-      ["agent_vm.py", "agent_vm.py", "client", 0o755],
+      ["agent_vm.ts", "agent_vm.ts", "client", 0o755],
+      ["sync_worktree.ts", "sync_worktree.ts", "support", 0o755],
+      ["byte-fs.ts", "byte-fs.ts", "support", 0o644],
+      ["client-io.ts", "client-io.ts", "support", 0o644],
+      ["client-release.ts", "client-release.ts", "support", 0o644],
+      ["client.ts", "client.ts", "support", 0o644],
+      ["guest-source.ts", "guest-source.ts", "support", 0o644],
+      ["sync-native.ts", "sync-native.ts", "support", 0o644],
       ["agent_vm_control.ts", "agent_vm_control.ts", "control", 0o755],
       ["release_manifest.py", "release_manifest.py", "support", 0o644],
       ["control-types.ts", "control-types.ts", "support", 0o644],
@@ -1030,6 +1041,9 @@ export function verify_client_sidecar(
     );
   }
   const sidecar = value as Mapping;
+  // Sidecars bind executable bytes and modes. Do not inherit the historical
+  // Python boolean/number equality used by compatibility-view comparisons.
+  const same = (left: unknown, right: unknown) => canonical_json(left) === canonical_json(right);
   if (
     !_same_keys(sidecar, [
       "format",
@@ -1037,6 +1051,7 @@ export function verify_client_sidecar(
       "source_revision",
       "protocol",
       "client_artifact",
+      "client_dependencies",
       "client_view",
     ])
   ) {
@@ -1046,10 +1061,10 @@ export function verify_client_sidecar(
     );
   }
   if (
-    !_json_equal(sidecar.format, checked.format) ||
-    !_json_equal(sidecar.release_id, checked.release_id) ||
-    !_json_equal(sidecar.source_revision, checked.source_revision) ||
-    !_json_equal(sidecar.protocol, checked.protocol)
+    !same(sidecar.format, checked.format) ||
+    !same(sidecar.release_id, checked.release_id) ||
+    !same(sidecar.source_revision, checked.source_revision) ||
+    !same(sidecar.protocol, checked.protocol)
   ) {
     throw _error(
       "client_sidecar_invalid",
@@ -1061,18 +1076,28 @@ export function verify_client_sidecar(
   );
   if (
     client_artifacts.length !== 1 ||
-    !_json_equal(sidecar.client_artifact, client_artifacts[0])
+    !same(sidecar.client_artifact, client_artifacts[0])
   ) {
     throw _error(
       "client_sidecar_invalid",
       "client sidecar artifact does not match manifest",
     );
   }
-  if (!_json_equal(sidecar.client_view, checked.client_view)) {
+  if (!same(sidecar.client_view, checked.client_view)) {
     throw _error(
       "client_sidecar_invalid",
       "client sidecar view does not match manifest",
     );
+  }
+  const dependencies = checked.artifacts.filter(item => CLIENT_DEPENDENCY_NAMES.has(item.path));
+  const declared = sidecar.client_dependencies;
+  if (!Array.isArray(declared) || declared.length !== dependencies.length ||
+      !same([...declared].sort((a, b) => String(a?.path).localeCompare(String(b?.path))),
+        [...dependencies].sort((a, b) => a.path.localeCompare(b.path)))) {
+    throw _error("client_sidecar_invalid", "client sidecar dependencies do not match the complete package");
+  }
+  for (const item of [client_artifacts[0], ...dependencies]) {
+    _verify_artifact_file(_resolve_regular(resolved_root, item.path), item);
   }
   return checked;
 }
