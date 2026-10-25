@@ -331,6 +331,26 @@ scenario("release is lazy and reacquire advances generation while retaining size
   expect(resumed.ports.map((p: Data) => p.port_name)).toEqual(["ssh"]);
 });
 
+scenario("cached resume rejects a different pinned image before native effects", async f => {
+  const cached = await cache(f, "cache");
+  const cached_image_fingerprint = "b".repeat(64);
+  f.store.update_task(cached.task_id, { image_fingerprint: cached_image_fingerprint });
+  f.runner.failure = async argv => argv[1] === "query";
+  const before = f.runner.calls.length;
+
+  const error = await expect_error("cache_stale", () => f.acquire({ session: "cache" }));
+
+  expect(error.detail).toMatchObject({
+    cached_image_fingerprint,
+    current_image_fingerprint: f.config.image_fingerprint,
+  });
+  expect(error.detail.outcome_verified).toBe(true);
+  expect(f.runner.calls.slice(before)).toEqual([]);
+  expect(task(f, "cache").state).toBe("cached");
+  expect(instance(f, "cache").status).toBe("Stopped");
+  expect(f.store.get_ports(cached.task_id)).toEqual([]);
+});
+
 scenario("failed cached resume preserves cache age", async f => {
   const cached = await cache(f, "cache");
   f.advance(3600);
