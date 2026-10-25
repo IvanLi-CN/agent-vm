@@ -31,6 +31,24 @@ def load(name, relative):
     return module
 
 
+def wait_until(predicate, *, timeout=3.0, interval=0.02):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(min(interval, max(0.0, deadline - time.monotonic())))
+    return bool(predicate())
+
+
+def process_is_zombie(pid):
+    try:
+        state = (Path("/proc") / str(pid) / "stat").read_text()
+    except FileNotFoundError:
+        return True
+    close_paren = state.rfind(")")
+    return close_paren >= 0 and state[close_paren + 2 :].split()[0] == "Z"
+
+
 CONTROL = load("native_control", "skills/agent-vm-ops/scripts/agent_vm_control.py")
 CLI = load("native_cli", "skills/agent-vm/scripts/agent_vm.py")
 import release_manifest as MANIFEST  # noqa: E402
@@ -382,6 +400,17 @@ class Fixture(unittest.TestCase):
         self.resources.cpu.return_value = 16
         self.resources.memory.return_value = {"scope": "ct-memory", "sources": ["lxcfs"], "limit_bytes": 32*GIB,
                                               "available_bytes": 24*GIB, "threshold_bytes": (32*GIB+9)//10}
+        self.resources.cpu_pressure.return_value = {
+            "scope": "ct-cpu-pressure",
+            "sources": ["cgroupfs"],
+            "mountpoint": "/sys/fs/cgroup",
+            "mount_root": "/",
+            "filesystem": "cgroup2",
+            "cgroup_path": "/",
+            "metric": "/sys/fs/cgroup/cpu.pressure",
+            "some": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0.0},
+            "full": {"avg10": 0.0, "avg60": 0.0, "avg300": 0.0, "total": 0.0},
+        }
         self.control = CONTROL.Control(self.config, runner=self.runner, store=self.store, systemd=self.systemd,
                                        resources=self.resources, clock=lambda: self.now)
         self.config = self.control.config
@@ -841,8 +870,22 @@ class LifecycleTests(Fixture):
                 self.call("port-add", name="web", vm_port=8080)
 
         self.assertEqual(failure.exception.code, "task_not_active")
+        self.assertEqual(failure.exception.detail["operation_phase"], "port-add")
+        self.assertTrue(failure.exception.detail["outcome_verified"])
         task = self.store.get_task(session_id="thread-a")
         self.assertIsNone(self.store.get_port(task["task_id"], "web", "tcp"))
+
+    def test_port_remove_failure_keeps_closing_state_and_marks_outcome_uncertain(self):
+        self.acquire()
+        self.call("port-add", name="web", vm_port=8080)
+        task = self.store.get_task(session_id="thread-a")
+        failure = CONTROL.ControlError("conntrack_unverified", "matching flows remain")
+        with mock.patch.object(self.control, "_conntrack_delete", side_effect=failure):
+            with self.assertRaises(CONTROL.ControlError) as raised:
+                self.call("port-remove", name="web")
+        self.assertEqual(raised.exception.detail["operation_phase"], "port-remove")
+        self.assertFalse(raised.exception.detail["outcome_verified"])
+        self.assertEqual(self.store.get_port(task["task_id"], "web", "tcp")["state"], "closing")
 
     def test_existing_port_retry_cannot_reopen_mapping_after_expiry_preemption(self):
         self.acquire()
@@ -859,6 +902,7 @@ class LifecycleTests(Fixture):
                 self.call("port-add", name="web", vm_port=8080)
 
         self.assertEqual(failure.exception.code, "task_not_active")
+        self.assertTrue(failure.exception.detail["outcome_verified"])
         self.assertIsNone(self.store.get_port(task["task_id"], "web", "tcp"))
         self.assertNotIn("agent-vm-" + task["task_id"] + "-web-tcp", self.runner.instances[task["instance_name"]]["devices"])
 
@@ -1358,6 +1402,269 @@ class LifecycleTests(Fixture):
         self.assertEqual(failure["stderr"], "resize2fs: transient guest failure")
         self.assertEqual(failure["guest_capacity"]["disk_bytes"], 20 * GIB)
 
+    def test_native_init_timeout_keeps_absence_pending_for_delayed_reconciliation(self):
+        task = self.control._base_task("thread-a", 1)
+        task.update(
+            state="preparing",
+            lease_expires_at=CONTROL.iso_time(self.now + dt.timedelta(minutes=10)),
+            resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            resource_reservation_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            reservation_bytes=4 * GIB,
+        )
+        self.store.put_task(task)
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])), \
+             mock.patch.object(self.control.incus, "list_instances", return_value=[]):
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                self.control._release_task(
+                    task,
+                    require_native_init_absence_retry=True,
+                    native_init_cleanup_verified=True,
+                )
+        self.assertEqual(failure.exception.code, "cleanup_incomplete")
+        pending = self.store.get_task(task_id=task["task_id"])
+        self.assertEqual(pending["state"], "closing")
+        self.assertEqual(pending["reservation_bytes"], 4 * GIB)
+        self.assertTrue(json.loads(pending["last_error"])["native_init_absence_retry"])
+
+        self.now += dt.timedelta(seconds=CONTROL.NATIVE_INIT_ABSENCE_RETRY_SECONDS)
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])), \
+             mock.patch.object(self.control.incus, "list_instances", return_value=[]):
+            self.control._release_task(pending)
+        self.assertEqual(self.store.get_task(task_id=task["task_id"])["state"], "absent")
+
+    def test_native_init_timeout_reconciles_through_public_admin_action(self):
+        timeout = CONTROL.ControlError(
+            "command_timeout",
+            "native init timed out",
+            {
+                "reaped": True,
+                "pipes_drained": True,
+                "process_group_killed": True,
+                "process_group_cleanup_error": None,
+            },
+        )
+        with mock.patch.object(self.control.incus, "init", side_effect=timeout):
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                self.acquire()
+        self.assertEqual(failure.exception.code, "command_timeout")
+        task = self.store.get_task(session_id="thread-a")
+        self.assertEqual(task["state"], "closing")
+        self.assertGreater(task["reservation_bytes"], 0)
+        record = json.loads(task["last_error"])
+        self.assertTrue(record["native_init_absence_retry"])
+        self.assertTrue(record["native_init_cleanup_verified"])
+
+        self.now += dt.timedelta(seconds=CONTROL.NATIVE_INIT_ABSENCE_RETRY_SECONDS)
+        result = self.call("admin-reconcile", apply=True)
+        self.assertFalse(result["dry_run"])
+        self.assertEqual(self.store.get_task(session_id="thread-a")["state"], "absent")
+        self.assertEqual(self.store.operation("op-1")["outcome"], "error")
+
+    def test_deterministic_native_init_failure_releases_reservation(self):
+        failure = CONTROL.ControlError("command_failed", "image unpack failed")
+        with mock.patch.object(self.control.incus, "init", side_effect=failure):
+            with self.assertRaises(CONTROL.ControlError) as error:
+                self.acquire()
+        self.assertEqual(error.exception.code, "command_failed")
+        task = self.store.get_task(session_id="thread-a")
+        self.assertEqual(task["state"], "absent")
+        self.assertEqual(task["reservation_bytes"], 0)
+        self.assertFalse(json.loads(task["last_error"])["native_init_absence_retry"])
+        self.assertEqual(self.store.operation("op-1")["outcome"], "error")
+
+    def test_native_init_cleanup_failure_keeps_reservation_pending(self):
+        failure = CONTROL.ControlError(
+            "command_failed",
+            "native init cleanup could not be verified",
+            {
+                "process_group_killed": False,
+                "process_group_cleanup_error": "process_owner_boundary_unavailable",
+            },
+        )
+        with mock.patch.object(self.control.incus, "init", side_effect=failure):
+            with self.assertRaises(CONTROL.ControlError) as error:
+                self.acquire()
+        self.assertEqual(error.exception.code, "command_failed")
+        task = self.store.get_task(session_id="thread-a")
+        self.assertEqual(task["state"], "closing")
+        self.assertGreater(task["reservation_bytes"], 0)
+        self.assertTrue(json.loads(task["last_error"])["native_init_absence_retry"])
+        self.assertEqual(self.store.operation("op-1")["outcome"], "pending")
+
+    def test_native_init_failure_with_residual_instance_is_never_cached(self):
+        failure = CONTROL.ControlError("command_failed", "image unpack failed")
+
+        def init_with_residue(_image, name, metadata):
+            self.runner.instances[name] = {
+                "name": name,
+                "status": "Stopped",
+                "config": dict(metadata),
+                "devices": {},
+                "expanded_devices": {
+                    "eth0": {"type": "nic", "network": "agentsbr0"},
+                    "root": {"type": "disk", "size": "20GiB"},
+                },
+            }
+            raise failure
+
+        with mock.patch.object(self.control.incus, "init", side_effect=init_with_residue):
+            with self.assertRaises(CONTROL.ControlError) as error:
+                self.acquire()
+        self.assertEqual(error.exception.code, "command_failed")
+        task = self.store.get_task(session_id="thread-a")
+        self.assertEqual(task["state"], "absent")
+        self.assertEqual(task["reservation_bytes"], 0)
+        self.assertNotIn(task["instance_name"], self.runner.instances)
+        self.assertEqual(self.store.operation("op-1")["outcome"], "error")
+
+    def test_native_init_cleanup_failure_never_caches_visible_instance(self):
+        task = self.control._base_task("thread-a", 1)
+        task.update(
+            state="preparing",
+            lease_expires_at=CONTROL.iso_time(self.now + dt.timedelta(minutes=10)),
+            resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            resource_reservation_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            reservation_bytes=4 * GIB,
+        )
+        self.store.put_task(task)
+        self.runner.instances[task["instance_name"]] = {
+            "name": task["instance_name"],
+            "status": "Stopped",
+            "config": {
+                "user.agent-vm.managed": "native-v1",
+                "user.agent-vm.task": task["task_id"],
+                "user.agent-vm.session": task["session_id"],
+                "user.agent-vm.generation": str(task["generation"]),
+            },
+            "devices": {},
+            "expanded_devices": {"root": {"type": "disk", "size": "20GiB"}},
+        }
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])), \
+             mock.patch.object(self.systemd, "retry_cleanup") as retry_cleanup:
+            with self.assertRaises(CONTROL.ControlError) as error:
+                self.control._release_task(
+                    task,
+                    require_native_init_absence_retry=True,
+                    native_init_cleanup_verified=False,
+                )
+        self.assertEqual(error.exception.code, "cleanup_incomplete")
+        current = self.store.get_task(task_id=task["task_id"])
+        self.assertEqual(current["state"], "closing")
+        self.assertEqual(current["reservation_bytes"], 4 * GIB)
+        self.assertEqual(self.runner.instances[task["instance_name"]]["status"], "Stopped")
+        retry_cleanup.assert_called_once()
+
+    def test_verified_native_init_cleanup_deletes_visible_instance_before_absence_retry(self):
+        task = self.control._base_task("thread-a", 1)
+        task.update(
+            state="preparing",
+            lease_expires_at=CONTROL.iso_time(self.now + dt.timedelta(minutes=10)),
+            resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            resource_reservation_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            reservation_bytes=4 * GIB,
+        )
+        self.store.put_task(task)
+        self.runner.instances[task["instance_name"]] = {
+            "name": task["instance_name"],
+            "status": "Stopped",
+            "config": {
+                "user.agent-vm.managed": "native-v1",
+                "user.agent-vm.task": task["task_id"],
+                "user.agent-vm.session": task["session_id"],
+                "user.agent-vm.generation": str(task["generation"]),
+            },
+            "devices": {},
+            "expanded_devices": {"root": {"type": "disk", "size": "20GiB"}},
+        }
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])):
+            with self.assertRaises(CONTROL.ControlError) as error:
+                self.control._release_task(
+                    task,
+                    require_native_init_absence_retry=True,
+                    native_init_cleanup_verified=True,
+                )
+        self.assertEqual(error.exception.code, "cleanup_incomplete")
+        self.assertNotIn(task["instance_name"], self.runner.instances)
+        current = self.store.get_task(task_id=task["task_id"])
+        self.assertEqual(current["state"], "closing")
+        self.assertEqual(current["reservation_bytes"], 4 * GIB)
+
+    def test_native_inventory_failure_keeps_expiry_retryable(self):
+        task = self.control._base_task("thread-a", 1)
+        task.update(
+            state="preparing",
+            lease_expires_at=CONTROL.iso_time(self.now + dt.timedelta(minutes=10)),
+            resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            resource_reservation_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            reservation_bytes=4 * GIB,
+        )
+        self.store.put_task(task)
+        with mock.patch.object(
+            self.control.incus,
+            "list_instances",
+            side_effect=[[], CONTROL.ControlError("command_failed", "inventory unavailable")],
+        ), mock.patch.object(self.systemd, "remove_expiry") as remove_expiry, mock.patch.object(
+            self.systemd, "retry_cleanup"
+        ) as retry_cleanup:
+            with self.assertRaises(CONTROL.ControlError) as error:
+                self.control._release_task(task)
+        self.assertEqual(error.exception.code, "cleanup_incomplete")
+        remove_expiry.assert_not_called()
+        retry_cleanup.assert_called_once()
+        self.assertEqual(self.store.get_task(task_id=task["task_id"])["state"], "closing")
+
+    def test_pending_native_init_recovery_waits_for_stable_absence(self):
+        task = self.control._base_task("thread-a", 1)
+        task.update(
+            state="preparing",
+            lease_expires_at=CONTROL.iso_time(self.now + dt.timedelta(minutes=10)),
+            resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            resource_reservation_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            reservation_bytes=4 * GIB,
+        )
+        self.store.put_task(task)
+        self.store.record_operation(
+            "pending-acquire", "acquire", "thread-a", 1,
+            {"outcome": "pending", "_request_digest": "digest"},
+        )
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])), \
+             mock.patch.object(self.control.incus, "list_instances", return_value=[]):
+            with self.assertRaises(CONTROL.ControlError):
+                self.control._release_task(task)
+        pending = self.store.get_task(task_id=task["task_id"])
+        self.assertEqual(pending["state"], "closing")
+        self.assertEqual(json.loads(pending["last_error"])["native_init_absence_checks"], 1)
+
+        self.now += dt.timedelta(seconds=CONTROL.NATIVE_INIT_ABSENCE_RETRY_SECONDS)
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])), \
+             mock.patch.object(self.control.incus, "list_instances", return_value=[]):
+            self.control._release_task(pending)
+        self.assertEqual(self.store.get_task(task_id=task["task_id"])["state"], "absent")
+        self.assertEqual(self.store.operation("pending-acquire")["outcome"], "error")
+
+    def test_malformed_native_init_retry_timestamp_is_repaired(self):
+        task = self.control._base_task("thread-a", 1)
+        task.update(
+            state="closing",
+            lease_expires_at=None,
+            resources_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            resource_reservation_json=json.dumps({"cpu": 2, "memory_mib": 4096, "disk_gib": 20}),
+            reservation_bytes=4 * GIB,
+            last_error=json.dumps({
+                "native_init_absence_retry": True,
+                "native_init_absence_retry_after": None,
+                "native_init_cleanup_verified": True,
+            }),
+        )
+        self.store.put_task(task)
+        with mock.patch.object(self.control, "_cleanup_task", return_value=([], [])), \
+             mock.patch.object(self.control.incus, "list_instances", return_value=[]):
+            with self.assertRaises(CONTROL.ControlError):
+                self.control._release_task(task)
+        repaired = json.loads(self.store.get_task(task_id=task["task_id"])["last_error"])
+        self.assertIsInstance(repaired["native_init_absence_retry_after"], str)
+        self.assertEqual(repaired["native_init_absence_checks"], 1)
+
     def test_resize_guest_growth_failure_is_structured_and_closed(self):
         self.acquire()
         self.runner.guest_growth_results = [self.guest_growth_failure(disk_gib=40)]
@@ -1754,6 +2061,46 @@ class LifecycleTests(Fixture):
         self.assertEqual(completed["guest_filesystem"]["virtual_bytes"], 40 * GIB)
         self.assertNotIn("last_error", completed)
 
+    def test_slow_start_diagnostic_uses_verified_current_cgroup_pressure_path(self):
+        self.acquire()
+        task = self.store.get_task(session_id="thread-a")
+        observation = dict(self.resources.cpu_pressure.return_value)
+        observation.update({
+            "cgroup_path": "/system.slice/agent-vm",
+            "metric": "/sys/fs/cgroup/system.slice/agent-vm/cpu.pressure",
+        })
+        with mock.patch.object(self.resources, "cpu_pressure", return_value=observation), \
+             mock.patch.object(self.control.incus, "instance_info", return_value={"status": "Running", "pid": 1}), \
+             mock.patch.object(self.control.incus, "instance_log", return_value=""):
+            diagnostic = self.control._emit_slow_start_diagnostic(
+                task,
+                phase="agent",
+                started_monotonic=0.0,
+                readiness={},
+            )
+
+        self.assertEqual(diagnostic["cpu_psi"]["cgroup_path"], "/system.slice/agent-vm")
+        self.assertEqual(
+            diagnostic["cpu_psi"]["metric"],
+            "/sys/fs/cgroup/system.slice/agent-vm/cpu.pressure",
+        )
+
+    def test_cpu_pressure_observation_rejects_malformed_payload(self):
+        base = self.resources.cpu_pressure.return_value
+        mutations = (
+            ("missing-full", lambda value: value.pop("full")),
+            ("full-exceeds-some", lambda value: value["full"].update(avg10=1.0)),
+            ("non-finite", lambda value: value["some"].update(avg10=float("nan"))),
+        )
+        for name, mutate in mutations:
+            with self.subTest(name=name):
+                observation = json.loads(json.dumps(base))
+                mutate(observation)
+                with mock.patch.object(self.resources, "cpu_pressure", return_value=observation):
+                    result = self.control._cpu_pressure_observation()
+                self.assertFalse(result["verified"])
+                self.assertEqual(result["error"]["code"], "resource_unverified")
+
 
 class GuestRootGrowthScriptTests(unittest.TestCase):
     def execute_script(
@@ -1773,6 +2120,8 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         timeout_command=None,
         command_timeout=None,
         killpg_error=False,
+        escaped_child_pid_path=None,
+        root_exits_before_timeout=False,
         source_output="/dev/sda2\n",
         partition_marker_exists=True,
         udevadm_available=False,
@@ -1876,12 +2225,32 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
                 "sys.stdout.flush(); sys.stderr.flush(); sys.exit(" + str(returncode) + ")"
             )
             if timeout:
-                helper = helper.replace("import sys;", "import sys, time;").replace(
-                    "; sys.exit(" + str(returncode),
-                    "; time.sleep(10); sys.exit(" + str(returncode),
-                )
+                if escaped_child_pid_path is None:
+                    helper = helper.replace("import sys;", "import sys, time;").replace(
+                        "; sys.exit(" + str(returncode),
+                        "; time.sleep(10); sys.exit(" + str(returncode),
+                    )
+                else:
+                    helper = (
+                        "import os, subprocess, sys, time; "
+                        "child=subprocess.Popen([sys.executable, '-c', "
+                        "\"import os,sys,time; os.setsid(); "
+                        "open(sys.argv[1], 'w').write('ready'); time.sleep(10)\", "
+                        "sys.argv[2]], close_fds=False); "
+                        "open(sys.argv[1], 'w').write(str(child.pid))\n"
+                        "while not os.path.exists(sys.argv[2]):\n"
+                        "    time.sleep(0.01)\n"
+                        "sys.stdout.buffer.write(" + repr(output) + "); "
+                        "sys.stderr.buffer.write(" + repr(error) + "); "
+                        "sys.stdout.flush(); sys.stderr.flush(); "
+                        + ("time.sleep(0.15); sys.exit(" if root_exits_before_timeout else "time.sleep(10); sys.exit(")
+                        + str(returncode) + ")"
+                    )
+            process_command = [os.sys.executable, "-c", helper]
+            if escaped_child_pid_path is not None:
+                process_command.extend([escaped_child_pid_path, escaped_child_pid_path + ".ready"])
             process = real_popen(
-                [os.sys.executable, "-c", helper],
+                process_command,
                 stdout=kwargs.get("stdout"),
                 stderr=kwargs.get("stderr"),
                 start_new_session=True,
@@ -2117,7 +2486,7 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
 
     def test_guest_root_growth_script_preserves_timeout_evidence(self):
         command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
-        exit_code, stdout, stderr, _ = self.execute_script(timeout_command=command, command_timeout=0.05)
+        exit_code, stdout, stderr, _ = self.execute_script(timeout_command=command, command_timeout=0.2)
 
         self.assertEqual(exit_code, 1)
         self.assertEqual(stdout, "")
@@ -2128,13 +2497,13 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertEqual(error["stderr"], "partial stderr")
         self.assertFalse(error["stdout_truncated"])
         self.assertFalse(error["stderr_truncated"])
-        self.assertEqual(error["process_group_killed"], Path("/proc").is_dir())
+        self.assertTrue(error["process_group_killed"])
 
     def test_guest_root_growth_script_falls_back_when_group_kill_is_denied(self):
         command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
         exit_code, stdout, stderr, _ = self.execute_script(
             timeout_command=command,
-            command_timeout=0.05,
+            command_timeout=1.0,
             killpg_error=True,
         )
 
@@ -2143,6 +2512,47 @@ class GuestRootGrowthScriptTests(unittest.TestCase):
         self.assertEqual(error["cause"], "command_timeout")
         self.assertTrue(error["process_group_cleanup_error"].startswith("PermissionError"))
         self.assertEqual(error["process_group_killed"], Path("/proc").is_dir())
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_guest_root_growth_script_kills_setsid_descendant_outside_process_group(self):
+        command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "child.pid"
+            exit_code, stdout, stderr, _ = self.execute_script(
+                timeout_command=command,
+                command_timeout=1.0,
+                escaped_child_pid_path=str(pid_path),
+            )
+
+            self.assertEqual(exit_code, 1)
+            error = json.loads(stderr)["error"]
+            self.assertEqual(error["cause"], "command_timeout")
+            if not wait_until(pid_path.exists):
+                self.fail("guest growth setsid child did not publish its pid")
+            child_pid = int(pid_path.read_text())
+            if not wait_until(lambda: process_is_zombie(child_pid)):
+                self.fail("guest growth setsid descendant remained alive after timeout")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_guest_root_growth_script_kills_setsid_descendant_after_leader_exit(self):
+        command = ["findmnt", "-n", "-o", "SOURCE", "-T", "/"]
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "child.pid"
+            exit_code, _, stderr, _ = self.execute_script(
+                timeout_command=command,
+                command_timeout=1.0,
+                escaped_child_pid_path=str(pid_path),
+                root_exits_before_timeout=True,
+            )
+
+            self.assertEqual(exit_code, 1)
+            error = json.loads(stderr)["error"]
+            self.assertEqual(error["cause"], "command_timeout")
+            if not wait_until(pid_path.exists):
+                self.fail("guest growth setsid child did not publish its pid")
+            child_pid = int(pid_path.read_text())
+            if not wait_until(lambda: process_is_zombie(child_pid)):
+                self.fail("guest growth setsid descendant remained alive after leader exit")
 
     def test_guest_root_growth_script_bounds_command_output(self):
         exit_code, stdout, stderr, _ = self.execute_script(source_output="/dev/sda2\n" + "x" * 20000 + "\n")
@@ -2205,6 +2615,19 @@ class CommandRunnerTests(unittest.TestCase):
         self.assertEqual(len(result.stdout), 128)
         self.assertTrue(result.stdout_truncated)
 
+    def test_bounded_runner_nonzero_preserves_output_truncation(self):
+        code = (
+            "import sys; sys.stdout.write('o' * 1000000); "
+            "sys.stderr.write('e' * 1000000); sys.exit(3)"
+        )
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            CONTROL.CommandRunner().run_bounded(
+                [os.sys.executable, "-c", code], timeout=5, stdout_limit=128, stderr_limit=128
+            )
+        self.assertEqual(failure.exception.code, "command_failed")
+        self.assertTrue(failure.exception.detail["stdout_truncated"])
+        self.assertTrue(failure.exception.detail["stderr_truncated"])
+
     def test_bounded_runner_limits_stderr_and_kills_on_timeout(self):
         flood = "import sys; sys.stderr.write('e' * 1000000)"
         result = CONTROL.CommandRunner().run_bounded(
@@ -2217,7 +2640,10 @@ class CommandRunnerTests(unittest.TestCase):
             with self.assertRaises(CONTROL.ControlError) as failure:
                 CONTROL.CommandRunner().run_bounded([os.sys.executable, "-c", sleeper], timeout=0.05)
         killpg.assert_called_once()
-        members.assert_called_once()
+        if Path("/proc").is_dir():
+            members.assert_called_once()
+        else:
+            members.assert_not_called()
         self.assertEqual(failure.exception.code, "command_timeout")
         self.assertTrue(failure.exception.detail["reaped"])
         self.assertTrue(failure.exception.detail["process_group_killed"])
@@ -2250,10 +2676,32 @@ class CommandRunnerTests(unittest.TestCase):
                 CONTROL.CommandRunner().run_bounded([os.sys.executable, "-c", sleeper], timeout=0.05)
         self.assertTrue(failure.exception.detail["reaped"])
         self.assertFalse(failure.exception.detail["process_group_killed"])
-        self.assertEqual(
-            failure.exception.detail["process_group_cleanup_error"],
-            "PermissionError:process_group_inspection_failed",
-        )
+        cleanup_error = failure.exception.detail["process_group_cleanup_error"]
+        if Path("/proc").is_dir():
+            self.assertTrue(cleanup_error.startswith("PermissionError:process_group_inspection_failed"))
+        else:
+            self.assertEqual(cleanup_error, "PermissionError")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_bounded_runner_refuses_tree_cleanup_without_leader_identity(self):
+        sleeper = "import time; time.sleep(10)"
+        with mock.patch.object(CONTROL.CommandRunner, "_process_identity", return_value=None), \
+             mock.patch.object(
+                 CONTROL.CommandRunner,
+                 "_kill_process_group_members",
+                 side_effect=AssertionError("unverified tree must not be signalled"),
+             ) as group_cleanup, \
+             mock.patch.object(
+                 CONTROL.CommandRunner,
+                 "_kill_verified_process_group_members",
+                 side_effect=AssertionError("unverified group must not be signalled"),
+             ) as verified_group_cleanup:
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                CONTROL.CommandRunner().run_bounded([os.sys.executable, "-c", sleeper], timeout=0.05)
+        self.assertEqual(failure.exception.code, "command_timeout")
+        self.assertIn("process_identity_unverified", failure.exception.detail["process_group_cleanup_error"])
+        group_cleanup.assert_not_called()
+        verified_group_cleanup.assert_not_called()
 
     @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
     def test_bounded_runner_kills_descendants_holding_pipes(self):
@@ -2262,31 +2710,69 @@ class CommandRunnerTests(unittest.TestCase):
             code = (
                 "import subprocess,sys,time; "
                 "child=subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'], close_fds=False); "
-                "open(sys.argv[1], 'w').write(str(child.pid)); "
+                "open(sys.argv[1], 'w').write(str(child.pid))\n"
                 "time.sleep(10)"
             )
             with self.assertRaises(CONTROL.ControlError):
                 CONTROL.CommandRunner().run_bounded(
                     [os.sys.executable, "-c", code, str(pid_path)], timeout=0.2
                 )
-            for _ in range(20):
-                if pid_path.exists():
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(pid_path.exists):
                 self.fail("diagnostic child did not publish its pid")
             child_pid = int(pid_path.read_text())
-            for _ in range(20):
-                try:
-                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
-                    close_paren = state.rfind(")")
-                    if state[close_paren + 2 :].split()[0] == "Z":
-                        break
-                except FileNotFoundError:
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(lambda: process_is_zombie(child_pid)):
                 self.fail("diagnostic descendant remained alive after timeout")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_bounded_runner_kills_setsid_descendant_outside_process_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "child.pid"
+            ready_path = Path(directory) / "child.ready"
+            code = (
+                "import os,subprocess,sys,time; "
+                "child=subprocess.Popen([sys.executable, '-c', "
+                "\"import os,sys,time; os.setsid(); open(sys.argv[1], 'w').write('ready'); time.sleep(10)\", "
+                "sys.argv[2]], close_fds=False); "
+                "open(sys.argv[1], 'w').write(str(child.pid))\n"
+                "while not os.path.exists(sys.argv[2]):\n"
+                "    time.sleep(0.01)\n"
+                "time.sleep(10)"
+            )
+            with self.assertRaises(CONTROL.ControlError):
+                CONTROL.CommandRunner().run_bounded(
+                    [os.sys.executable, "-c", code, str(pid_path), str(ready_path)], timeout=1.0
+                )
+            if not wait_until(pid_path.exists):
+                self.fail("setsid diagnostic child did not publish its pid")
+            child_pid = int(pid_path.read_text())
+            if not wait_until(lambda: process_is_zombie(child_pid)):
+                self.fail("setsid diagnostic descendant remained alive after timeout")
+
+    @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
+    def test_bounded_runner_kills_setsid_descendant_after_leader_exit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pid_path = Path(directory) / "child.pid"
+            ready_path = Path(directory) / "child.ready"
+            code = (
+                "import os,subprocess,sys,time; "
+                "child=subprocess.Popen([sys.executable, '-c', "
+                "\"import os,sys,time; os.setsid(); open(sys.argv[1], 'w').write('ready'); time.sleep(10)\", "
+                "sys.argv[2]], close_fds=False); "
+                "open(sys.argv[1], 'w').write(str(child.pid))\n"
+                "while not os.path.exists(sys.argv[2]):\n"
+                "    time.sleep(0.01)\n"
+                "sys.stdout.flush(); sys.stderr.flush(); time.sleep(0.15); sys.exit(0)"
+            )
+            with self.assertRaises(CONTROL.ControlError) as failure:
+                CONTROL.CommandRunner().run_bounded(
+                    [os.sys.executable, "-c", code, str(pid_path), str(ready_path)], timeout=1.0
+                )
+            self.assertEqual(failure.exception.code, "command_timeout")
+            if not wait_until(pid_path.exists):
+                self.fail("setsid diagnostic child did not publish its pid")
+            child_pid = int(pid_path.read_text())
+            if not wait_until(lambda: process_is_zombie(child_pid)):
+                self.fail("setsid diagnostic descendant remained alive after leader exit")
 
     @unittest.skipUnless(Path("/proc").is_dir(), "requires Linux /proc")
     def test_bounded_runner_fallback_kills_descendants_when_group_signal_fails(self):
@@ -2301,7 +2787,7 @@ class CommandRunnerTests(unittest.TestCase):
             with mock.patch.object(CONTROL.os, "killpg", side_effect=PermissionError("denied")):
                 with self.assertRaises(CONTROL.ControlError) as failure:
                     CONTROL.CommandRunner().run_bounded(
-                        [os.sys.executable, "-c", code, str(pid_path)], timeout=0.2
+                        [os.sys.executable, "-c", code, str(pid_path)], timeout=1.0
                     )
             self.assertTrue(failure.exception.detail["process_group_killed"])
             # A constrained CI runner may deny signalling a transient process
@@ -2311,30 +2797,17 @@ class CommandRunnerTests(unittest.TestCase):
                 failure.exception.detail["process_group_cleanup_error"],
                 (None, "PermissionError"),
             )
-            for _ in range(20):
-                if pid_path.exists():
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(pid_path.exists):
                 self.fail("diagnostic fallback child did not publish its pid")
             child_pid = int(pid_path.read_text())
-            for _ in range(20):
-                try:
-                    state = (Path("/proc") / str(child_pid) / "stat").read_text()
-                    close_paren = state.rfind(")")
-                    if state[close_paren + 2 :].split()[0] == "Z":
-                        break
-                except FileNotFoundError:
-                    break
-                time.sleep(0.01)
-            else:
+            if not wait_until(lambda: process_is_zombie(child_pid)):
                 self.fail("diagnostic fallback descendant remained alive after timeout")
 
 
 class IncusWaitTests(unittest.TestCase):
     def setUp(self):
         self.runner = mock.Mock(spec=CONTROL.CommandRunner)
-        self.config = {"project": "agents"}
+        self.config = {"project": "agents", "profile": "agent-vm"}
         self.client = CONTROL.IncusClient(self.runner, self.config)
 
     def test_native_timeout_is_distinguished_from_explicit_failure(self):
@@ -2356,6 +2829,33 @@ class IncusWaitTests(unittest.TestCase):
         self.runner.run.side_effect = CONTROL.ControlError("command_timeout", "wait transport timed out")
         with self.assertRaises(CONTROL.GuestWaitTimeout):
             self.client.wait("vm", "agent", 1)
+
+    def test_native_init_uses_a_long_bounded_timeout_for_image_unpack(self):
+        self.runner.run_bounded.return_value = subprocess.CompletedProcess([], 0, b"", b"")
+
+        self.client.init("a" * 64, "vm", {"user.agent-vm.managed": "native-v1"})
+
+        self.runner.run_bounded.assert_called_once_with(
+            [
+                "incus",
+                "--project",
+                "agents",
+                "init",
+                "a" * 64,
+                "vm",
+                "--vm",
+                "--profile",
+                "agent-vm",
+                "--config",
+                "boot.autostart=false",
+                "--config",
+                "user.agent-vm.managed=native-v1",
+            ],
+            timeout=CONTROL.NATIVE_INIT_TIMEOUT_SECONDS,
+            stdout_limit=CONTROL.DIAGNOSTIC_LOG_LIMIT,
+            stderr_limit=4000,
+            check=True,
+        )
 
     def test_bounded_exec_uses_process_group_safe_runner(self):
         self.runner.run_bounded.return_value = subprocess.CompletedProcess([], 0, b"ok", b"")
@@ -2418,6 +2918,22 @@ class IncusWaitTests(unittest.TestCase):
 
 
 class ReclaimTests(Fixture):
+    def test_failed_native_reclaim_delete_keeps_acquire_operation_pending(self):
+        cached = self.acquire("cached")
+        self.call("release", "cached")
+        self.runner.free = 10 * GIB
+        self.runner.failure = lambda args: args[3:4] == ["delete"]
+        request = self.request("acquire", "new", operation="reclaim-delete-uncertain", public_key=KEY)
+
+        with self.assertRaises(CONTROL.ControlError) as failure:
+            self.control.dispatch(request)
+
+        self.assertEqual(failure.exception.code, "reclaim_failed")
+        self.assertEqual(failure.exception.detail["detail"]["operation_phase"], "cache-delete")
+        self.assertFalse(failure.exception.detail["outcome_verified"])
+        self.assertEqual(self.store.operation(request["operation_id"])["outcome"], "pending")
+        self.assertEqual(self.store.get_task(task_id=cached["task_id"])["state"], "deleting")
+
     def test_manual_gc_previews_and_deletes_all_eligible_caches(self):
         old = self.acquire("old")
         self.call("release", "old")
@@ -2554,12 +3070,16 @@ class NativeCliTests(unittest.TestCase):
             ("status", {}, 240),
         ):
             response = {"ok": True, "protocol": CLI.PROTOCOL_VERSION, "action": action,
-                        "session_id": "thread", "server_time": "2026-10-04T00:00:00+00:00", "result": {}}
+                        "session_id": "thread", "outcome": "success",
+                        "server_time": "2026-10-04T00:00:00+00:00", "result": {}}
             process = subprocess.CompletedProcess([], 0, json.dumps(response).encode(), b"")
             with self.subTest(action=action, fields=fields), mock.patch.object(CLI.subprocess, "run", return_value=process) as run:
                 CLI.control_request(action, session="thread", fields=fields)
                 self.assertEqual(run.call_args.kwargs["timeout"], expected)
-                self.assertIsNone(run.call_args.kwargs["stderr"])
+                self.assertNotEqual(run.call_args.kwargs["stdout"], subprocess.PIPE)
+                self.assertNotEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
+                self.assertTrue(hasattr(run.call_args.kwargs["stdout"], "fileno"))
+                self.assertTrue(hasattr(run.call_args.kwargs["stderr"], "fileno"))
 
     def test_exec_argv_and_online_tar_are_safely_quoted(self):
         parser = CLI.build_parser()

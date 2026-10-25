@@ -34,6 +34,7 @@
   "memory_budget_mib": 12288,
   "cpu_overcommit_ratio": 4,
   "memory_overcommit_ratio": 4,
+  "cpu_startup_pressure_full_avg10_percent": 20,
   "disk_low_bytes": 10737418240,
   "disk_target_bytes": 21474836480
 }

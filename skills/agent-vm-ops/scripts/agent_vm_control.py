@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from contextlib import ExitStack, contextmanager, nullcontext
+import ctypes
 import datetime as dt
 from decimal import Decimal
 import fcntl
 import hashlib
 import json
+import math
 import os
 import ipaddress
 from pathlib import Path, PurePosixPath
@@ -65,12 +67,15 @@ PROTOCOL_VERSION = 4
 SCHEMA_VERSION = 1
 SEMANTIC_REVISION = 1
 MEMORY_SETTLE_SECONDS = 45
+CPU_STARTUP_PRESSURE_FULL_AVG10_PERCENT = 20.0
 TRANSITIONAL_ADMISSION_WAIT_SECONDS = 30
 TRANSITIONAL_ADMISSION_POLL_SECONDS = 0.25
 TRANSITIONAL_ADMISSION_ERROR_MESSAGE = "transitional native instance blocks admission"
 GUEST_READINESS_BUDGET_SECONDS = 300
 GUEST_READINESS_DIAGNOSTIC_SECONDS = 120
 DIAGNOSTIC_COMMAND_TIMEOUT_SECONDS = 5
+NATIVE_INIT_TIMEOUT_SECONDS = 300
+NATIVE_INIT_ABSENCE_RETRY_SECONDS = 2
 DIAGNOSTIC_LOG_LIMIT = 8192
 DIAGNOSTIC_LOG_TRUNCATION_MARKER = "\n[TRUNCATED BY DIAGNOSTIC LIMIT]"
 DEFAULT_CONFIG_PATH = Path("/etc/agent-vm-native/config.json")
@@ -104,7 +109,7 @@ TASK_STATES = frozenset(("absent", "cached", "preparing", "active", "closing", "
 
 
 GUEST_ROOT_GROWTH_SCRIPT = r"""
-import json, os, re, selectors, shutil, signal, subprocess, sys, time
+import ctypes, json, os, re, selectors, shutil, signal, subprocess, sys, time
 
 TARGET_BYTES = int(sys.argv[1]) * 1024**3
 MINIMUM_FILESYSTEM_RATIO = 95
@@ -191,7 +196,8 @@ class GuestFailure(Exception):
     def __init__(self, phase, command=None, returncode=None, stdout="", stderr="",
                  *, cause=None, transient=False, retry_of=None,
                  stdout_truncated=False, stderr_truncated=False,
-                 process_group_killed=None, process_group_cleanup_error=None):
+                 process_group_killed=None, process_group_cleanup_error=None,
+                 reaped=None, pipes_drained=None):
         super().__init__(phase)
         self.phase = phase
         self.command = list(command or [])
@@ -205,6 +211,8 @@ class GuestFailure(Exception):
         self.stderr_truncated = stderr_truncated
         self.process_group_killed = process_group_killed
         self.process_group_cleanup_error = process_group_cleanup_error
+        self.reaped = reaped
+        self.pipes_drained = pipes_drained
 
     def as_dict(self, *, report=False, stdout_limit=None, stderr_limit=None):
         value = {
@@ -225,6 +233,10 @@ class GuestFailure(Exception):
         if self.process_group_killed is not None:
             value["process_group_killed"] = self.process_group_killed
             value["process_group_cleanup_error"] = self.process_group_cleanup_error
+        if self.reaped is not None:
+            value["reaped"] = self.reaped
+        if self.pipes_drained is not None:
+            value["pipes_drained"] = self.pipes_drained
         if not report:
             return value
         return compact_failure(
@@ -272,15 +284,17 @@ def run(command, phase, *, check=True):
             else:
                 retain_stderr(chunk)
 
-    def drain_until(selector, deadline):
+    def drain_until(selector, deadline, track_process_tree=None):
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return False
-            read_ready(selector, selector.select(min(0.25, remaining)))
+            if track_process_tree is not None:
+                track_process_tree()
+            read_ready(selector, selector.select(min(0.1, remaining)))
         return True
 
-    def process_group_members(pgid):
+    def process_group_identities(pgid):
         members = []
         complete = True
         try:
@@ -296,35 +310,259 @@ def run(command, phase, *, check=True):
                         raw_stat = handle.read()
                     close_paren = raw_stat.rfind(")")
                     fields = raw_stat[close_paren + 2:].split()
-                    if close_paren < 0 or len(fields) < 3:
+                    if close_paren < 0 or len(fields) < 20:
                         raise ValueError("invalid process stat")
                     if fields[0] != "Z" and int(fields[2]) == pgid:
-                        members.append(int(entry.name))
+                        members.append((int(entry.name), int(fields[19])))
                 except FileNotFoundError:
                     continue
                 except (OSError, ValueError):
                     complete = False
         return members, complete, None
 
-    def kill_process_group_members(pgid):
-        cleanup_error = None
-        for _ in range(3):
-            members, complete, inspection_error = process_group_members(pgid)
+    def process_group_members(pgid):
+        identities, complete, inspection_error = process_group_identities(pgid)
+        return [pid for pid, _ in identities], complete, inspection_error
+
+    def process_group_members_unchanged(pgid, tracked):
+        members, complete, inspection_error = process_group_identities(pgid)
+        if not complete:
+            return False, inspection_error or "process_group_inspection_failed"
+        if any(tracked.get(pid) != starttime for pid, starttime in members):
+            return False, "process_group_identity_unverified"
+        for _ in range(5):
+            if not members:
+                return True, None
+            killed, cleanup_error = kill_process_identities(members)
+            if not killed:
+                return False, cleanup_error
+            members, complete, inspection_error = process_group_identities(pgid)
             if not complete:
                 return False, inspection_error or "process_group_inspection_failed"
+            if any(tracked.get(pid) != starttime for pid, starttime in members):
+                return False, "process_group_identity_unverified"
+        return (not members), "process_group_members_remain" if members else None
+
+    def process_tree_members(root_pid):
+        parents = {}
+        complete = True
+        try:
+            entries = os.scandir("/proc")
+        except OSError:
+            return [], False
+        with entries:
+            for entry in entries:
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    with open(os.path.join(entry.path, "stat"), encoding="utf-8") as handle:
+                        raw_stat = handle.read()
+                    close_paren = raw_stat.rfind(")")
+                    fields = raw_stat[close_paren + 2:].split()
+                    if close_paren < 0 or len(fields) < 20:
+                        raise ValueError("invalid process stat")
+                    if fields[0] != "Z":
+                        parents[int(entry.name)] = (int(fields[1]), int(fields[19]))
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError):
+                    complete = False
+        if root_pid not in parents:
+            return [], complete
+        members = {root_pid}
+        frontier = [root_pid]
+        while frontier:
+            parent = frontier.pop()
+            for pid, (ppid, _) in parents.items():
+                if ppid == parent and pid not in members:
+                    members.add(pid)
+                    frontier.append(pid)
+        return sorted((pid, parents[pid][1]) for pid in members), complete
+
+    def live_processes(identities):
+        live = []
+        complete = True
+        for pid, starttime in identities:
+            try:
+                with open(os.path.join("/proc", str(pid), "stat"), encoding="utf-8") as handle:
+                    raw_stat = handle.read()
+                close_paren = raw_stat.rfind(")")
+                fields = raw_stat[close_paren + 2:].split()
+                if close_paren < 0 or len(fields) < 20:
+                    raise ValueError("invalid process stat")
+                if int(fields[19]) != starttime:
+                    complete = False
+                    continue
+                if fields[0] != "Z":
+                    live.append((pid, starttime))
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                complete = False
+        return live, complete
+
+    def process_identity(pid):
+        try:
+            with open(os.path.join("/proc", str(pid), "stat"), encoding="utf-8") as handle:
+                raw_stat = handle.read()
+            close_paren = raw_stat.rfind(")")
+            fields = raw_stat[close_paren + 2:].split()
+            if close_paren < 0 or len(fields) < 20 or fields[0] == "Z":
+                return None
+            return pid, int(fields[19])
+        except (FileNotFoundError, OSError, ValueError):
+            return None
+
+    def enable_child_subreaper():
+        if not os.path.isdir("/proc"):
+            return False
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            prctl = libc.prctl
+            prctl.argtypes = [ctypes.c_int, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong]
+            prctl.restype = ctypes.c_int
+            return prctl(36, 1, 0, 0, 0) == 0
+        except (AttributeError, OSError, TypeError):
+            return False
+
+    def discover_owned_processes(owner_pid, baseline, tracked):
+        members, complete = process_tree_members(owner_pid)
+        if not complete:
+            return [], False, "process_owner_tree_inspection_failed"
+        for pid, starttime in members:
+            if pid == owner_pid:
+                continue
+            baseline_starttime = baseline.get(pid)
+            if baseline_starttime is not None:
+                if baseline_starttime != starttime:
+                    return [], False, "process_owner_identity_unverified"
+                continue
+            previous = tracked.get(pid)
+            if previous is not None and previous != starttime:
+                return [], False, "process_owner_identity_unverified"
+            tracked[pid] = starttime
+        return sorted(tracked.items()), True, None
+
+    def kill_owned_processes(owner_pid, baseline, tracked):
+        cleanup_error = None
+        for _ in range(5):
+            identities, complete, discovery_error = discover_owned_processes(owner_pid, baseline, tracked)
+            if not complete:
+                return False, discovery_error
+            live, live_complete = live_processes(identities)
+            if not live_complete:
+                return False, "process_owner_identity_unverified"
+            if not live:
+                return True, cleanup_error
+            killed, cleanup_error = kill_process_identities(live)
+            if not killed:
+                return False, cleanup_error
+        identities, complete, discovery_error = discover_owned_processes(owner_pid, baseline, tracked)
+        if not complete:
+            return False, discovery_error
+        live, live_complete = live_processes(identities)
+        if live_complete and not live:
+            return True, cleanup_error
+        return False, cleanup_error or "process_owner_members_remain"
+
+    def open_verified_pidfd(identity):
+        opener = getattr(os, "pidfd_open", None)
+        if opener is None:
+            return None, "pidfd_unavailable"
+        pid, _ = identity
+        try:
+            pidfd = opener(pid)
+        except ProcessLookupError:
+            return None, None
+        except OSError as error:
+            return None, type(error).__name__
+        current, complete = live_processes([identity])
+        if not complete:
+            os.close(pidfd)
+            return None, "process_identity_unverified"
+        if not current:
+            os.close(pidfd)
+            return None, None
+        return pidfd, None
+
+    def kill_process_identities(identities):
+        sender = getattr(signal, "pidfd_send_signal", None)
+        if sender is None:
+            return False, "pidfd_signal_unavailable"
+        cleanup_error = None
+        deadline = time.monotonic() + 0.25
+        while True:
+            members, complete = live_processes(identities)
+            if not complete:
+                return False, "process_identity_unverified"
             if not members:
                 return True, cleanup_error
-            for pid in members:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
+            for identity in members:
+                pidfd, open_error = open_verified_pidfd(identity)
+                if pidfd is None:
+                    if open_error is not None:
+                        return False, open_error
                     continue
+                try:
+                    sender(pidfd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 except OSError as error:
                     cleanup_error = type(error).__name__
+                finally:
+                    os.close(pidfd)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+        members, complete = live_processes(identities)
+        if complete and not members:
+            return True, cleanup_error
+        return False, cleanup_error or "process_members_remain"
+
+    def kill_process_group_members(pgid, *, required_identity=None):
+        if not os.path.isdir("/proc"):
+            return False, "process_group_identity_unavailable"
+        identities, complete, inspection_error = process_group_identities(pgid)
+        if not complete:
+            return False, inspection_error or "process_group_inspection_failed"
+        cleanup_error = None
+        known = {pid: starttime for pid, starttime in identities}
+        for attempt in range(5):
+            if attempt:
+                identities, complete, inspection_error = process_group_identities(pgid)
+                if not complete:
+                    return False, inspection_error or "process_group_inspection_failed"
+            if not identities:
+                return True, cleanup_error
+            if any(known.get(pid) != starttime for pid, starttime in identities):
+                return False, "process_group_identity_unverified"
+            if attempt == 0 and required_identity is not None and required_identity not in identities:
+                return False, "process_group_identity_unverified"
+            killed, cleanup_error = kill_process_identities(identities)
+            if not killed:
+                return False, cleanup_error
         members, complete, inspection_error = process_group_members(pgid)
         if complete and not members:
             return True, cleanup_error
         return False, cleanup_error or inspection_error or "process_group_members_remain"
+
+    procfs_available = os.path.isdir("/proc")
+    owner_pid = os.getpid()
+    owner_baseline = {}
+    tracked_owned_members = {}
+    owner_tracking_enabled = False
+    owner_tracking_error = None
+    if procfs_available:
+        owner_tracking_enabled = enable_child_subreaper()
+        if not owner_tracking_enabled:
+            owner_tracking_error = "process_owner_boundary_unavailable"
+        else:
+            baseline_members, baseline_complete = process_tree_members(owner_pid)
+            if not baseline_complete:
+                owner_tracking_enabled = False
+                owner_tracking_error = "process_owner_tree_inspection_failed"
+            else:
+                owner_baseline = dict(baseline_members)
 
     process = None
     selector = selectors.DefaultSelector()
@@ -338,42 +576,169 @@ def run(command, phase, *, check=True):
             )
         except FileNotFoundError:
             raise GuestFailure(phase, command, cause="command_missing")
+        tracked_group_members = {}
+        tracked_group_valid = False
+        leader_identity = process_identity(process.pid) if procfs_available else None
+
+        # Keep detached descendants in the one-shot guest process's owner tree.
+        def track_process_tree():
+            nonlocal leader_identity, tracked_group_valid
+            nonlocal owner_tracking_enabled, owner_tracking_error
+            if not procfs_available:
+                return
+            if owner_tracking_enabled:
+                _, owner_complete, discovery_error = discover_owned_processes(
+                    owner_pid, owner_baseline, tracked_owned_members
+                )
+                if not owner_complete:
+                    owner_tracking_enabled = False
+                    owner_tracking_error = discovery_error
+            if leader_identity is None and process.poll() is None:
+                leader_identity = process_identity(process.pid)
+            group_members, group_complete, _ = process_group_identities(process.pid)
+            if not group_complete or not group_members:
+                return
+            if leader_identity is None:
+                return
+            for pid, starttime in group_members:
+                previous = tracked_group_members.get(pid)
+                if previous is not None and previous != starttime:
+                    tracked_group_valid = False
+                    return
+                tracked_group_members[pid] = starttime
+            tracked_group_valid = True
+
+        track_process_tree()
         for stream, name in ((process.stdout, "stdout"), (process.stderr, "stderr")):
             if stream is not None:
                 selector.register(stream, selectors.EVENT_READ, name)
         deadline = time.monotonic() + COMMAND_TIMEOUT
-        if not drain_until(selector, deadline):
+        if not drain_until(selector, deadline, track_process_tree):
             raise subprocess.TimeoutExpired(command, COMMAND_TIMEOUT)
         remaining = max(0, deadline - time.monotonic())
         try:
             returncode = process.wait(timeout=remaining)
+            if procfs_available:
+                if not owner_tracking_enabled:
+                    raise GuestFailure(
+                        phase,
+                        command,
+                        returncode,
+                        cause="command_cleanup_failed",
+                        process_group_killed=False,
+                        process_group_cleanup_error=owner_tracking_error or "process_owner_boundary_unavailable",
+                    )
+                owned_members, owner_complete, discovery_error = discover_owned_processes(
+                    owner_pid, owner_baseline, tracked_owned_members
+                )
+                if not owner_complete:
+                    raise GuestFailure(
+                        phase,
+                        command,
+                        returncode,
+                        cause="command_cleanup_failed",
+                        process_group_killed=False,
+                        process_group_cleanup_error=discovery_error or "process_owner_tree_inspection_failed",
+                    )
+                owned_live, live_complete = live_processes(owned_members)
+                if not live_complete:
+                    raise GuestFailure(
+                        phase,
+                        command,
+                        returncode,
+                        cause="command_cleanup_failed",
+                        process_group_killed=False,
+                        process_group_cleanup_error="process_owner_identity_unverified",
+                    )
+                if owned_live:
+                    owner_killed, owner_cleanup_error = kill_owned_processes(
+                        owner_pid, owner_baseline, tracked_owned_members
+                    )
+                    raise GuestFailure(
+                        phase,
+                        command,
+                        returncode,
+                        cause="command_cleanup_failed",
+                        process_group_killed=owner_killed,
+                        process_group_cleanup_error=owner_cleanup_error or "process_owner_members_remain",
+                    )
         except subprocess.TimeoutExpired:
             raise
     except subprocess.TimeoutExpired as error:
         process_group_killed = False
         process_group_cleanup_error = None
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-            process_group_killed, fallback_error = kill_process_group_members(process.pid)
-            if fallback_error:
-                process_group_cleanup_error = fallback_error
-        except ProcessLookupError:
-            process_group_killed = True
-        except (AttributeError, PermissionError, OSError) as group_error:
-            process_group_cleanup_error = type(group_error).__name__
-            process_group_killed, fallback_error = kill_process_group_members(process.pid)
-            if fallback_error:
-                process_group_cleanup_error += ":" + fallback_error
-            if process is not None:
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
+        root_identity = leader_identity if os.path.isdir("/proc") else None
+        root_live = []
+        root_verified = not os.path.isdir("/proc")
+        root_identity_missing = leader_identity is not None and os.path.isdir("/proc")
+        if root_identity is not None:
+            root_live, root_identity_complete = live_processes([root_identity])
+            root_verified = bool(root_live)
+            root_identity_missing = root_identity_complete and not root_live
+        elif leader_identity is not None and os.path.isdir("/proc"):
+            root_live, root_identity_complete = live_processes([leader_identity])
+            root_identity_missing = root_identity_complete and not root_live
+        if root_verified:
+            try:
+                if os.path.isdir("/proc"):
+                    os.killpg(process.pid, 0)
+                    process_group_killed, fallback_error = kill_process_group_members(
+                        process.pid, required_identity=leader_identity
+                    )
+                    if fallback_error:
+                        process_group_cleanup_error = fallback_error
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process_group_killed = True
+            except ProcessLookupError:
+                if os.path.isdir("/proc"):
+                    process_group_killed, fallback_error = kill_process_group_members(
+                        process.pid, required_identity=leader_identity
+                    )
+                    if fallback_error:
+                        process_group_cleanup_error = fallback_error
+                else:
+                    process_group_killed = True
+            except (AttributeError, PermissionError, OSError) as group_error:
+                process_group_cleanup_error = type(group_error).__name__
+                if os.path.isdir("/proc"):
+                    process_group_killed, fallback_error = kill_process_group_members(
+                        process.pid, required_identity=leader_identity
+                    )
+                    if fallback_error:
+                        process_group_cleanup_error += ":" + fallback_error
+                else:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+        elif root_identity_missing and tracked_group_valid:
+            process_group_killed, process_group_cleanup_error = process_group_members_unchanged(
+                process.pid, tracked_group_members
+            )
+        else:
+            process_group_cleanup_error = "process_identity_unverified"
+        if procfs_available:
+            if owner_tracking_enabled:
+                owner_killed, owner_cleanup_error = kill_owned_processes(
+                    owner_pid, owner_baseline, tracked_owned_members
+                )
+            else:
+                owner_killed = False
+                owner_cleanup_error = owner_tracking_error or "process_owner_boundary_unavailable"
+            if not owner_killed:
+                process_group_killed = False
+                process_group_cleanup_error = (
+                    f"{process_group_cleanup_error}:{owner_cleanup_error}"
+                    if process_group_cleanup_error else owner_cleanup_error
+                )
+        reaped = False
         try:
             process.wait(timeout=2)
+            reaped = True
         except (subprocess.TimeoutExpired, ChildProcessError):
             pass
-        drain_until(selector, time.monotonic() + 1)
+        pipes_drained = drain_until(selector, time.monotonic() + 1)
         raise GuestFailure(
             phase,
             command,
@@ -384,6 +749,8 @@ def run(command, phase, *, check=True):
             stderr_truncated=stderr_truncated,
             process_group_killed=process_group_killed,
             process_group_cleanup_error=process_group_cleanup_error,
+            reaped=reaped,
+            pipes_drained=pipes_drained,
         ) from error
     except FileNotFoundError:
         raise GuestFailure(phase, command, cause="command_missing")
@@ -766,6 +1133,75 @@ def overcommit_ratio(value: Any, name: str) -> Decimal:
     return ratio
 
 
+def percentage(value: Any, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ControlError("config_invalid", f"{name} must be a finite percentage between zero and 100")
+    try:
+        number = Decimal(str(value))
+        if not number.is_finite() or number < 0 or number > 100:
+            raise ValueError()
+    except (ValueError, ArithmeticError) as exc:
+        raise ControlError("config_invalid", f"{name} must be a finite percentage between zero and 100") from exc
+    return float(number)
+
+
+def parse_cpu_psi(raw: str) -> dict[str, dict[str, float]]:
+    result: dict[str, dict[str, float]] = {}
+    for line in raw.splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if fields[0] not in {"some", "full"}:
+            raise ValueError("unknown CPU PSI line")
+        if fields[0] in result:
+            raise ValueError("duplicate CPU PSI line")
+        values: dict[str, float] = {}
+        for field in fields[1:]:
+            name, separator, value = field.partition("=")
+            if not separator or name in values:
+                raise ValueError("invalid CPU PSI field")
+            if name == "total" and re.fullmatch(r"[0-9]+", value) is None:
+                raise ValueError("invalid CPU PSI total")
+            try:
+                number = float(value)
+            except ValueError as exc:
+                raise ValueError("invalid CPU PSI value") from exc
+            if not math.isfinite(number) or number < 0 or (name.startswith("avg") and number > 100):
+                raise ValueError("CPU PSI value is out of range")
+            values[name] = number
+        if "avg10" not in values:
+            raise ValueError("CPU PSI avg10 is missing")
+        result[fields[0]] = values
+    return normalize_cpu_psi(result)
+
+
+def normalize_cpu_psi(value: Any) -> dict[str, dict[str, float]]:
+    if not isinstance(value, Mapping) or any(scope not in value for scope in ("some", "full")):
+        raise ValueError("CPU PSI data is missing")
+    required = {"avg10", "avg60", "avg300", "total"}
+    result: dict[str, dict[str, float]] = {}
+    for scope in ("some", "full"):
+        values = value[scope]
+        if not isinstance(values, Mapping) or set(values) != required:
+            raise ValueError("CPU PSI fields are incomplete")
+        normalized: dict[str, float] = {}
+        for name in required:
+            number = values[name]
+            if isinstance(number, bool):
+                raise ValueError("CPU PSI value is invalid")
+            try:
+                number = float(number)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("CPU PSI value is invalid") from exc
+            if not math.isfinite(number) or number < 0 or (name.startswith("avg") and number > 100):
+                raise ValueError("CPU PSI value is out of range")
+            normalized[name] = number
+        result[scope] = normalized
+    if any(result["full"][name] > result["some"][name] for name in required):
+        raise ValueError("CPU PSI full pressure exceeds some pressure")
+    return result
+
+
 class CTResources:
     """Read only the container's visible boundary, never ancestor host data."""
 
@@ -790,13 +1226,81 @@ class CTResources:
 
     def cpu(self) -> int:
         capacity = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else (os.cpu_count() or 0)
-        fields = self._read("/sys/fs/cgroup/cpu.max").split()
-        if len(fields) != 2:
-            raise ControlError("resource_unverified", "invalid CT CPU quota")
-        period = self._unsigned(fields[1], "cpu.max period", positive=True)
-        if fields[0] != "max":
-            capacity = min(capacity, self._unsigned(fields[0], "cpu.max quota", positive=True) // period)
+        _cgroup_path, cgroup_paths = self._cgroup_metric_paths("cpu.max")
+        for cpu_max_path in cgroup_paths:
+            fields = self._read(cpu_max_path).split()
+            if len(fields) != 2:
+                raise ControlError("resource_unverified", "invalid CT CPU quota")
+            period = self._unsigned(fields[1], "cpu.max period", positive=True)
+            if fields[0] != "max":
+                capacity = min(capacity, self._unsigned(fields[0], "cpu.max quota", positive=True) // period)
         return capacity
+
+    def _verify_cgroup2_mount(self) -> None:
+        matches = []
+        for line in self._read("/proc/self/mountinfo").splitlines():
+            before, separator, after = line.partition(" - ")
+            if not separator:
+                continue
+            left, right = before.split(), after.split()
+            if len(left) >= 5 and right and left[3] == "/" and left[4] == "/sys/fs/cgroup":
+                matches.append((right[0], left[3]))
+        if matches != [("cgroup2", "/")]:
+            raise ControlError(
+                "resource_unverified",
+                "CT cgroup v2 mount cannot be verified",
+                {"metric": "/proc/self/mountinfo", "mountpoint": "/sys/fs/cgroup"},
+            )
+
+    def current_cgroup_path(self) -> str:
+        lines = [line for line in self._read("/proc/self/cgroup").splitlines() if line.strip()]
+        if len(lines) != 1:
+            raise ControlError("resource_unverified", "CT cgroup path cannot be verified",
+                               {"metric": "/proc/self/cgroup"})
+        fields = lines[0].split(":", 2)
+        if len(fields) != 3 or fields[0] != "0" or fields[1] != "":
+            raise ControlError("resource_unverified", "CT cgroup path is not unified",
+                               {"metric": "/proc/self/cgroup"})
+        path = fields[2]
+        if path != "/" and (
+            re.fullmatch(r"/[^\x00/]+(?:/[^\x00/]+)*", path) is None
+            or any(part in {".", ".."} for part in path.split("/"))
+        ):
+            raise ControlError("resource_unverified", "CT cgroup path is invalid",
+                               {"metric": "/proc/self/cgroup"})
+        return path
+
+    def _cgroup_metric_path(self, metric: str) -> tuple[str, str]:
+        cgroup_path, paths = self._cgroup_metric_paths(metric)
+        return cgroup_path, paths[0]
+
+    def _cgroup_metric_paths(self, metric: str) -> tuple[str, list[str]]:
+        self._verify_cgroup2_mount()
+        cgroup_path = self.current_cgroup_path()
+        components = [] if cgroup_path == "/" else cgroup_path.strip("/").split("/")
+        paths = []
+        for depth in range(len(components), -1, -1):
+            ancestor = "/" + "/".join(components[:depth]) if depth else ""
+            paths.append("/sys/fs/cgroup" + ancestor + "/" + metric)
+        return cgroup_path, paths
+
+    def cpu_pressure(self) -> dict[str, Any]:
+        cgroup_path, pressure_path = self._cgroup_metric_path("cpu.pressure")
+        try:
+            values = parse_cpu_psi(self._read(pressure_path))
+        except ValueError as exc:
+            raise ControlError("resource_unverified", "CT CPU pressure metric is invalid",
+                               {"metric": pressure_path}) from exc
+        return {
+            "scope": "ct-cpu-pressure",
+            "sources": ["cgroupfs"],
+            "mountpoint": "/sys/fs/cgroup",
+            "mount_root": "/",
+            "filesystem": "cgroup2",
+            "cgroup_path": cgroup_path,
+            "metric": pressure_path,
+            **values,
+        }
 
     def _lxcfs_meminfo(self) -> dict[str, int] | None:
         # Verify the mount before reading meminfo: an unvirtualized proc view
@@ -900,11 +1404,13 @@ def iso_time(value: dt.datetime | None = None) -> str:
 def parse_time(value: str | None) -> dt.datetime | None:
     if not value:
         return None
+    if not isinstance(value, str):
+        raise ControlError("invalid_time", "timestamp must be a string")
     try:
         return dt.datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(
             dt.timezone.utc
         )
-    except ValueError as exc:
+    except (AttributeError, TypeError, ValueError) as exc:
         raise ControlError("invalid_time", f"invalid timestamp: {value}") from exc
 
 
@@ -952,6 +1458,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         "memory_budget_mib": 0,
         "cpu_overcommit_ratio": 4,
         "memory_overcommit_ratio": 4,
+        "cpu_startup_pressure_full_avg10_percent": CPU_STARTUP_PRESSURE_FULL_AVG10_PERCENT,
         "create_cost_bytes": 4 * 1024**3,
         "resume_cost_bytes": 1024**3,
         "resize_cost_bytes": 1024**3,
@@ -979,6 +1486,10 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
         config[field] = require_int(config[field], field, 0)
     for field in ("cpu_overcommit_ratio", "memory_overcommit_ratio"):
         overcommit_ratio(config[field], field)
+    config["cpu_startup_pressure_full_avg10_percent"] = percentage(
+        config["cpu_startup_pressure_full_avg10_percent"],
+        "cpu_startup_pressure_full_avg10_percent",
+    )
     config["host_address"] = require_nonempty_string(config["host_address"], "host_address")
     config["vm_ip_start"] = require_nonempty_string(config["vm_ip_start"], "vm_ip_start")
     config["vm_ip_end"] = require_nonempty_string(config["vm_ip_end"], "vm_ip_end")
@@ -1014,6 +1525,95 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
 
 class CommandRunner:
     """Small subprocess boundary that never invokes a shell implicitly."""
+
+    _PR_SET_CHILD_SUBREAPER = 36
+
+    @staticmethod
+    def _process_identity(pid: int) -> tuple[int, int] | None:
+        try:
+            raw_stat = (Path("/proc") / str(pid) / "stat").read_text()
+            close_paren = raw_stat.rfind(")")
+            fields = raw_stat[close_paren + 2 :].split()
+            if close_paren < 0 or len(fields) < 20 or fields[0] == "Z":
+                return None
+            return pid, int(fields[19])
+        except (FileNotFoundError, OSError, ValueError):
+            return None
+
+    @classmethod
+    def _enable_child_subreaper(cls) -> bool:
+        if not Path("/proc").is_dir():
+            return False
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            prctl = libc.prctl
+            prctl.argtypes = [
+                ctypes.c_int,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+                ctypes.c_ulong,
+            ]
+            prctl.restype = ctypes.c_int
+            return prctl(cls._PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+        except (AttributeError, OSError, TypeError):
+            return False
+
+    @classmethod
+    def _discover_owned_processes(
+        cls,
+        owner_pid: int,
+        baseline: Mapping[int, int],
+        tracked: dict[int, int],
+    ) -> tuple[list[tuple[int, int]], bool, str | None]:
+        members, complete = cls._process_tree_members(owner_pid)
+        if not complete:
+            return [], False, "process_owner_tree_inspection_failed"
+        for pid, starttime in members:
+            if pid == owner_pid:
+                continue
+            baseline_starttime = baseline.get(pid)
+            if baseline_starttime is not None:
+                if baseline_starttime != starttime:
+                    return [], False, "process_owner_identity_unverified"
+                continue
+            previous = tracked.get(pid)
+            if previous is not None and previous != starttime:
+                return [], False, "process_owner_identity_unverified"
+            tracked[pid] = starttime
+        return sorted(tracked.items()), True, None
+
+    @classmethod
+    def _kill_owned_processes(
+        cls,
+        owner_pid: int,
+        baseline: Mapping[int, int],
+        tracked: dict[int, int],
+    ) -> tuple[bool, str | None]:
+        cleanup_error = None
+        for _ in range(5):
+            identities, complete, discovery_error = cls._discover_owned_processes(
+                owner_pid, baseline, tracked
+            )
+            if not complete:
+                return False, discovery_error
+            live, live_complete = cls._live_processes(identities)
+            if not live_complete:
+                return False, "process_owner_identity_unverified"
+            if not live:
+                return True, cleanup_error
+            killed, cleanup_error = cls._kill_process_identities(live)
+            if not killed:
+                return False, cleanup_error
+        identities, complete, discovery_error = cls._discover_owned_processes(
+            owner_pid, baseline, tracked
+        )
+        if not complete:
+            return False, discovery_error
+        live, live_complete = cls._live_processes(identities)
+        if live_complete and not live:
+            return True, cleanup_error
+        return False, cleanup_error or "process_owner_members_remain"
 
     def run(
         self,
@@ -1055,8 +1655,8 @@ class CommandRunner:
         return result
 
     @staticmethod
-    def _process_group_members(pgid: int) -> tuple[list[int], bool]:
-        members: list[int] = []
+    def _process_group_identities(pgid: int) -> tuple[list[tuple[int, int]], bool]:
+        members: list[tuple[int, int]] = []
         try:
             entries = list(Path("/proc").iterdir())
         except OSError:
@@ -1069,10 +1669,10 @@ class CommandRunner:
                 raw_stat = (entry / "stat").read_text()
                 close_paren = raw_stat.rfind(")")
                 fields = raw_stat[close_paren + 2 :].split()
-                if close_paren < 0 or len(fields) < 3:
+                if close_paren < 0 or len(fields) < 20:
                     raise ValueError("invalid process stat")
                 if fields[0] != "Z" and int(fields[2]) == pgid:
-                    members.append(int(entry.name))
+                    members.append((int(entry.name), int(fields[19])))
             except FileNotFoundError:
                 continue
             except (OSError, ValueError):
@@ -1080,25 +1680,180 @@ class CommandRunner:
         return members, complete
 
     @classmethod
-    def _kill_process_group_members(cls, pgid: int) -> tuple[bool, str | None]:
+    def _process_group_members(cls, pgid: int) -> tuple[list[int], bool]:
+        identities, complete = cls._process_group_identities(pgid)
+        return [pid for pid, _ in identities], complete
+
+    @staticmethod
+    def _process_tree_members(root_pid: int) -> tuple[list[tuple[int, int]], bool]:
+        parents: dict[int, tuple[int, int]] = {}
+        try:
+            entries = list(Path("/proc").iterdir())
+        except OSError:
+            return [], False
+        complete = True
+        for entry in entries:
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw_stat = (entry / "stat").read_text()
+                close_paren = raw_stat.rfind(")")
+                fields = raw_stat[close_paren + 2 :].split()
+                if close_paren < 0 or len(fields) < 20:
+                    raise ValueError("invalid process stat")
+                if fields[0] != "Z":
+                    parents[int(entry.name)] = (int(fields[1]), int(fields[19]))
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                complete = False
+        if root_pid not in parents:
+            return [], complete
+        members = {root_pid}
+        frontier = [root_pid]
+        while frontier:
+            parent = frontier.pop()
+            for pid, (ppid, _) in parents.items():
+                if ppid == parent and pid not in members:
+                    members.add(pid)
+                    frontier.append(pid)
+        return sorted((pid, parents[pid][1]) for pid in members), complete
+
+    @staticmethod
+    def _live_processes(identities: Sequence[tuple[int, int]]) -> tuple[list[tuple[int, int]], bool]:
+        live: list[tuple[int, int]] = []
+        complete = True
+        for pid, starttime in identities:
+            try:
+                raw_stat = (Path("/proc") / str(pid) / "stat").read_text()
+                close_paren = raw_stat.rfind(")")
+                fields = raw_stat[close_paren + 2 :].split()
+                if close_paren < 0 or len(fields) < 20:
+                    raise ValueError("invalid process stat")
+                if int(fields[19]) != starttime:
+                    complete = False
+                    continue
+                if fields[0] != "Z":
+                    live.append((pid, starttime))
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                complete = False
+        return live, complete
+
+    @classmethod
+    def _open_verified_pidfd(cls, identity: tuple[int, int]) -> tuple[int | None, str | None]:
+        opener = getattr(os, "pidfd_open", None)
+        if opener is None:
+            return None, "pidfd_unavailable"
+        pid, _ = identity
+        try:
+            pidfd = opener(pid)
+        except ProcessLookupError:
+            return None, None
+        except OSError as error:
+            return None, type(error).__name__
+        current, complete = cls._live_processes([identity])
+        if not complete:
+            os.close(pidfd)
+            return None, "process_identity_unverified"
+        if not current:
+            os.close(pidfd)
+            return None, None
+        return pidfd, None
+
+    @classmethod
+    def _kill_process_identities(
+        cls, identities: Sequence[tuple[int, int]]
+    ) -> tuple[bool, str | None]:
+        sender = getattr(signal, "pidfd_send_signal", None)
+        if sender is None:
+            return False, "pidfd_signal_unavailable"
         cleanup_error = None
-        for _ in range(3):
-            members, complete = cls._process_group_members(pgid)
+        deadline = time.monotonic() + 0.25
+        while True:
+            members, complete = cls._live_processes(identities)
             if not complete:
-                return False, "process_group_inspection_failed"
+                return False, "process_identity_unverified"
             if not members:
                 return True, cleanup_error
-            for pid in members:
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                except ProcessLookupError:
+            for identity in members:
+                pidfd, open_error = cls._open_verified_pidfd(identity)
+                if pidfd is None:
+                    if open_error is not None:
+                        return False, open_error
                     continue
+                try:
+                    sender(pidfd, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 except OSError as error:
                     cleanup_error = type(error).__name__
+                finally:
+                    os.close(pidfd)
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(min(0.01, max(0, deadline - time.monotonic())))
+        members, complete = cls._live_processes(identities)
+        if complete and not members:
+            return True, cleanup_error
+        return False, cleanup_error or "process_members_remain"
+
+    @classmethod
+    def _kill_process_group_members(
+        cls,
+        pgid: int,
+        *,
+        required_identity: tuple[int, int] | None = None,
+    ) -> tuple[bool, str | None]:
+        if not Path("/proc").is_dir():
+            return False, "process_group_identity_unavailable"
+        identities, complete = cls._process_group_identities(pgid)
+        if not complete:
+            return False, "process_group_inspection_failed"
+        cleanup_error = None
+        known = {pid: starttime for pid, starttime in identities}
+        for attempt in range(5):
+            if attempt:
+                identities, complete = cls._process_group_identities(pgid)
+                if not complete:
+                    return False, "process_group_inspection_failed"
+            if not identities:
+                return True, cleanup_error
+            if any(known.get(pid) != starttime for pid, starttime in identities):
+                return False, "process_group_identity_unverified"
+            if attempt == 0 and required_identity is not None and required_identity not in identities:
+                return False, "process_group_identity_unverified"
+            killed, cleanup_error = cls._kill_process_identities(identities)
+            if not killed:
+                return False, cleanup_error
         members, complete = cls._process_group_members(pgid)
         if complete and not members:
             return True, cleanup_error
         return False, cleanup_error or "process_group_members_remain"
+
+    @classmethod
+    def _kill_verified_process_group_members(
+        cls, pgid: int, tracked: Mapping[int, int]
+    ) -> tuple[bool, str | None]:
+        members, complete = cls._process_group_identities(pgid)
+        if not complete:
+            return False, "process_group_inspection_failed"
+        if any(tracked.get(pid) != starttime for pid, starttime in members):
+            return False, "process_group_identity_unverified"
+        cleanup_error = None
+        for _ in range(5):
+            if not members:
+                return True, cleanup_error
+            killed, cleanup_error = cls._kill_process_identities(members)
+            if not killed:
+                return False, cleanup_error
+            members, complete = cls._process_group_identities(pgid)
+            if not complete:
+                return False, "process_group_inspection_failed"
+            if any(tracked.get(pid) != starttime for pid, starttime in members):
+                return False, "process_group_identity_unverified"
+        return (not members), "process_group_members_remain" if members else None
 
     def run_bounded(
         self,
@@ -1110,6 +1865,23 @@ class CommandRunner:
         check: bool = True,
     ) -> subprocess.CompletedProcess[bytes]:
         """Run a command while draining pipes but retaining bounded output."""
+        procfs_available = Path("/proc").is_dir()
+        owner_pid = os.getpid()
+        owner_baseline: dict[int, int] = {}
+        tracked_owned_members: dict[int, int] = {}
+        owner_tracking_enabled = False
+        owner_tracking_error: str | None = None
+        if procfs_available:
+            owner_tracking_enabled = self._enable_child_subreaper()
+            if not owner_tracking_enabled:
+                owner_tracking_error = "process_owner_boundary_unavailable"
+            else:
+                baseline_members, baseline_complete = self._process_tree_members(owner_pid)
+                if not baseline_complete:
+                    owner_tracking_enabled = False
+                    owner_tracking_error = "process_owner_tree_inspection_failed"
+                else:
+                    owner_baseline = dict(baseline_members)
         try:
             process = subprocess.Popen(
                 list(argv),
@@ -1129,6 +1901,43 @@ class CommandRunner:
         for stream, name in streams:
             if stream is not None:
                 selector.register(stream, selectors.EVENT_READ, name)
+
+        tracked_group_members: dict[int, int] = {}
+        tracked_group_valid = False
+        leader_identity: tuple[int, int] | None = None
+        if procfs_available:
+            leader_identity = self._process_identity(process.pid)
+
+        # The subreaper owner tree is the containment boundary for descendants
+        # that leave the original process group or outlive the command leader.
+        def track_process_tree() -> None:
+            nonlocal leader_identity, tracked_group_valid
+            nonlocal owner_tracking_enabled, owner_tracking_error
+            if not procfs_available:
+                return
+            if owner_tracking_enabled:
+                _, owner_complete, discovery_error = self._discover_owned_processes(
+                    owner_pid, owner_baseline, tracked_owned_members
+                )
+                if not owner_complete:
+                    owner_tracking_enabled = False
+                    owner_tracking_error = discovery_error
+            if leader_identity is None and process.poll() is None:
+                leader_identity = self._process_identity(process.pid)
+            group_members, group_complete = self._process_group_identities(process.pid)
+            if not group_complete or not group_members:
+                return
+            if leader_identity is None:
+                return
+            for pid, starttime in group_members:
+                previous = tracked_group_members.get(pid)
+                if previous is not None and previous != starttime:
+                    tracked_group_valid = False
+                    return
+                tracked_group_members[pid] = starttime
+            tracked_group_valid = True
+
+        track_process_tree()
 
         def retain_stdout(chunk: bytes) -> None:
             nonlocal stdout_truncated
@@ -1166,7 +1975,8 @@ class CommandRunner:
                 remaining = timeout - (time.monotonic() - started)
                 if remaining <= 0:
                     raise subprocess.TimeoutExpired(argv[0], timeout)
-                events = selector.select(remaining)
+                track_process_tree()
+                events = selector.select(min(0.1, remaining))
                 if not events:
                     continue
                 read_ready(events)
@@ -1174,31 +1984,128 @@ class CommandRunner:
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(argv[0], timeout)
             returncode = process.wait(timeout=remaining)
+            if procfs_available:
+                if not owner_tracking_enabled:
+                    raise ControlError(
+                        "command_failed",
+                        f"command ownership could not be verified: {argv[0]}",
+                        {
+                            "returncode": returncode,
+                            "process_group_killed": False,
+                            "process_group_cleanup_error": owner_tracking_error or "process_owner_boundary_unavailable",
+                        },
+                    )
+                owned_members, owner_complete, discovery_error = self._discover_owned_processes(
+                    owner_pid, owner_baseline, tracked_owned_members
+                )
+                if not owner_complete:
+                    raise ControlError(
+                        "command_failed",
+                        f"command ownership could not be verified: {argv[0]}",
+                        {
+                            "returncode": returncode,
+                            "process_group_killed": False,
+                            "process_group_cleanup_error": discovery_error or "process_owner_tree_inspection_failed",
+                        },
+                    )
+                owned_live, live_complete = self._live_processes(owned_members)
+                if not live_complete:
+                    raise ControlError(
+                        "command_failed",
+                        f"command ownership could not be verified: {argv[0]}",
+                        {
+                            "returncode": returncode,
+                            "process_group_killed": False,
+                            "process_group_cleanup_error": "process_owner_identity_unverified",
+                        },
+                    )
+                if owned_live:
+                    owner_killed, owner_cleanup_error = self._kill_owned_processes(
+                        owner_pid, owner_baseline, tracked_owned_members
+                    )
+                    raise ControlError(
+                        "command_failed",
+                        f"command left child processes behind: {argv[0]}",
+                        {
+                            "returncode": returncode,
+                            "process_group_killed": owner_killed,
+                            "process_group_cleanup_error": owner_cleanup_error or "process_owner_members_remain",
+                        },
+                    )
         except subprocess.TimeoutExpired as exc:
             reaped = False
             process_group_killed = False
             process_group_cleanup_error = None
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-                process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
-                if fallback_error:
-                    process_group_cleanup_error = fallback_error
-            except ProcessLookupError:
-                # The leader and its process group are already gone.
-                process_group_killed = True
-            except OSError as group_error:
-                process_group_cleanup_error = type(group_error).__name__
-                process_group_killed, fallback_error = self._kill_process_group_members(process.pid)
-                if fallback_error:
-                    process_group_cleanup_error += ":" + fallback_error
+            root_identity = leader_identity if Path("/proc").is_dir() else None
+            root_live: list[tuple[int, int]] = []
+            root_verified = not Path("/proc").is_dir()
+            root_identity_missing = leader_identity is not None and Path("/proc").is_dir()
+            if root_identity is not None:
+                root_live, root_identity_complete = self._live_processes([root_identity])
+                root_verified = bool(root_live)
+                root_identity_missing = root_identity_complete and not root_live
+            elif leader_identity is not None and Path("/proc").is_dir():
+                root_live, root_identity_complete = self._live_processes([leader_identity])
+                root_identity_missing = root_identity_complete and not root_live
+            if root_verified:
                 try:
-                    process.kill()
+                    if Path("/proc").is_dir():
+                        os.killpg(process.pid, 0)
+                        process_group_killed, fallback_error = self._kill_process_group_members(
+                            process.pid, required_identity=leader_identity
+                        )
+                        if fallback_error:
+                            process_group_cleanup_error = fallback_error
+                    else:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process_group_killed = True
                 except ProcessLookupError:
-                    pass
+                    if Path("/proc").is_dir():
+                        process_group_killed, fallback_error = self._kill_process_group_members(
+                            process.pid, required_identity=leader_identity
+                        )
+                        if fallback_error:
+                            process_group_cleanup_error = fallback_error
+                    else:
+                        process_group_killed = True
+                except OSError as group_error:
+                    process_group_cleanup_error = type(group_error).__name__
+                    if Path("/proc").is_dir():
+                        process_group_killed, fallback_error = self._kill_process_group_members(
+                            process.pid, required_identity=leader_identity
+                        )
+                        if fallback_error:
+                            process_group_cleanup_error += ":" + fallback_error
+                    else:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+            elif root_identity_missing and tracked_group_valid:
+                process_group_killed, process_group_cleanup_error = self._kill_verified_process_group_members(
+                    process.pid, tracked_group_members
+                )
+            else:
+                process_group_cleanup_error = "process_identity_unverified"
+            if procfs_available:
+                if owner_tracking_enabled:
+                    owner_killed, owner_cleanup_error = self._kill_owned_processes(
+                        owner_pid, owner_baseline, tracked_owned_members
+                    )
+                else:
+                    owner_killed = False
+                    owner_cleanup_error = owner_tracking_error or "process_owner_boundary_unavailable"
+                if not owner_killed:
+                    process_group_killed = False
+                    process_group_cleanup_error = (
+                        f"{process_group_cleanup_error}:{owner_cleanup_error}"
+                        if process_group_cleanup_error else owner_cleanup_error
+                    )
+            pipes_drained = False
             try:
                 process.wait(timeout=1)
                 reaped = True
-            except subprocess.TimeoutExpired:
+            except (subprocess.TimeoutExpired, ChildProcessError):
                 pass
             drain_deadline = time.monotonic() + 1
             while selector.get_map() and time.monotonic() < drain_deadline:
@@ -1206,6 +2113,7 @@ class CommandRunner:
                 if not events:
                     break
                 read_ready(events)
+            pipes_drained = not selector.get_map()
             raise ControlError(
                 "command_timeout",
                 f"command timed out: {argv[0]}",
@@ -1215,6 +2123,7 @@ class CommandRunner:
                     "stdout_truncated": stdout_truncated,
                     "stderr_truncated": stderr_truncated,
                     "reaped": reaped,
+                    "pipes_drained": pipes_drained,
                     "process_group_killed": process_group_killed,
                     "process_group_cleanup_error": process_group_cleanup_error,
                 },
@@ -1234,6 +2143,8 @@ class CommandRunner:
             detail = {
                 "returncode": returncode,
                 "stderr": result.stderr.decode("utf-8", "replace").strip()[-4000:],
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
             }
             raise ControlError(
                 "command_failed",
@@ -1259,10 +2170,20 @@ class IncusClient:
         input_data: bytes | str | None = None,
         timeout: float = 60,
         check: bool = True,
+        bounded: bool = False,
     ) -> subprocess.CompletedProcess[bytes]:
-        return self.runner.run(
-            self.prefix + list(args), input_data=input_data, timeout=timeout, check=check
-        )
+        command = self.prefix + list(args)
+        if bounded:
+            if input_data is not None:
+                raise ControlError("invalid_request", "bounded Incus commands do not accept stdin")
+            return self.runner.run_bounded(
+                command,
+                timeout=timeout,
+                stdout_limit=DIAGNOSTIC_LOG_LIMIT,
+                stderr_limit=4000,
+                check=check,
+            )
+        return self.runner.run(command, input_data=input_data, timeout=timeout, check=check)
 
     def json(self, args: Sequence[str], *, timeout: float = 60) -> Any:
         result = self.call([*args, "--format", "json"], timeout=timeout)
@@ -1309,7 +2230,9 @@ class IncusClient:
                 "--config",
                 "boot.autostart=false",
                 *[part for key, value in (metadata or {}).items() for part in ("--config", f"{key}={value}")],
-            ]
+            ],
+            timeout=NATIVE_INIT_TIMEOUT_SECONDS,
+            bounded=True,
         )
 
     def start(self, name: str) -> None:
@@ -2479,12 +3402,158 @@ class Control:
         return ControlError(error.code, error.message, detail)
 
     @staticmethod
+    def _native_init_absence_retry_record(task: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        raw_error = task.get("last_error")
+        if not isinstance(raw_error, str) or not raw_error:
+            return None
+        try:
+            error = json.loads(raw_error)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(error, Mapping) or error.get("native_init_absence_retry") is not True:
+            return None
+        return error
+
+    @classmethod
+    def _native_init_absence_retry_pending(cls, task: Mapping[str, Any]) -> bool:
+        return cls._native_init_absence_retry_record(task) is not None
+
+    def _native_init_absence_retry_ready(self, task: Mapping[str, Any]) -> bool:
+        record = self._native_init_absence_retry_record(task)
+        if record is None:
+            return False
+        try:
+            retry_after = parse_time(record.get("native_init_absence_retry_after"))
+        except (AttributeError, ControlError, TypeError, ValueError):
+            return False
+        if retry_after is None:
+            return False
+        return retry_after <= self.now()
+
+    def _native_init_retry_after(self, task: Mapping[str, Any]) -> str:
+        record = self._native_init_absence_retry_record(task) or {}
+        try:
+            retry_after = parse_time(record.get("native_init_absence_retry_after"))
+        except (AttributeError, ControlError, TypeError, ValueError):
+            retry_after = None
+        if retry_after is None or retry_after <= self.now():
+            retry_after = self.now() + dt.timedelta(seconds=NATIVE_INIT_ABSENCE_RETRY_SECONDS)
+        return iso_time(retry_after)
+
+    @staticmethod
+    def _native_init_absence_checks(task: Mapping[str, Any]) -> int:
+        record = Control._native_init_absence_retry_record(task) or {}
+        value = record.get("native_init_absence_checks", 0)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return 0
+        return value
+
+    @staticmethod
+    def _native_init_cleanup_verified(task: Mapping[str, Any]) -> bool | None:
+        record = Control._native_init_absence_retry_record(task) or {}
+        value = record.get("native_init_cleanup_verified")
+        return value if isinstance(value, bool) else None
+
+    def _pending_native_init_for_task(self, task: Mapping[str, Any]) -> Mapping[str, Any] | None:
+        try:
+            pending = self.store.pending_operations()
+        except ControlError as exc:
+            raise ControlError(
+                "operation_unverified",
+                "pending acquire operations cannot be verified",
+                {"task_id": task["task_id"], "cause": exc.as_dict()},
+            ) from exc
+        matches = [
+            item for item in pending
+            if item.get("action") == "acquire"
+            and item.get("session_id") == task.get("session_id")
+            and item.get("generation") in {
+                task.get("generation"),
+                task.get("generation") - 1
+                if isinstance(task.get("generation"), int) and not isinstance(task.get("generation"), bool)
+                else None,
+            }
+        ]
+        if len(matches) > 1:
+            raise ControlError(
+                "operation_unverified",
+                "multiple pending native initialization operations match the task",
+                {"task_id": task["task_id"]},
+            )
+        return matches[0] if matches else None
+
+    def _recovered_native_init_operation(
+        self,
+        task: Mapping[str, Any],
+        pending: Mapping[str, Any],
+    ) -> tuple[str, dict[str, Any]]:
+        operation_id = pending.get("operation_id")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ControlError("operation_unverified", "pending acquire operation ID is invalid")
+        record = self.store.operation(operation_id)
+        digest = record.get("_request_digest") if isinstance(record, Mapping) else None
+        if not isinstance(digest, str) or not digest:
+            raise ControlError(
+                "operation_unverified",
+                "pending acquire request digest is invalid",
+                {"operation_id": operation_id},
+            )
+        retry_record = self._native_init_absence_retry_record(task) or {}
+        original = retry_record.get("error")
+        if isinstance(original, Mapping) and isinstance(original.get("code"), str) and original.get("code"):
+            code = original["code"]
+            message = original.get("message")
+            detail = original.get("detail")
+            if not isinstance(message, str) or not message:
+                message = "native initialization did not complete"
+            recovered_detail = dict(detail) if isinstance(detail, Mapping) else {}
+        else:
+            code = "acquire_partial"
+            message = "native initialization did not complete"
+            recovered_detail = {}
+        recovered_detail.update({
+            "phase": "native-init",
+            "operation_phase": "native-init",
+            "native_init_recovered_absent": True,
+            "outcome_verified": True,
+        })
+        return operation_id, {
+            "outcome": "error",
+            "error": {"code": code, "message": message, "detail": recovered_detail},
+            "_request_digest": digest,
+        }
+
+    @staticmethod
+    def _native_init_timeout_cleanup_verified(error: ControlError) -> bool | None:
+        detail = error.detail if isinstance(error.detail, Mapping) else {}
+        cleanup_fields = (
+            "process_group_killed",
+            "process_group_cleanup_error",
+            "reaped",
+            "pipes_drained",
+        )
+        if not any(key in detail for key in cleanup_fields):
+            return True
+        required = ("process_group_killed",)
+        if error.code == "command_timeout":
+            required += ("reaped", "pipes_drained")
+        return all(detail.get(key) is True for key in required) and not detail.get("process_group_cleanup_error")
+
+    @staticmethod
     def _operation_outcome_uncertain(action: str, error: ControlError) -> bool:
         """Keep a journal pending only when a native effect may have occurred."""
         detail = error.detail if isinstance(error.detail, Mapping) else {}
         if error.code == "sqlite_unavailable" and detail.get("state_committed") is not False:
             return True
+        if detail.get("native_init_absence_retry") is True:
+            return True
         cleanup = detail.get("cleanup")
+        if isinstance(cleanup, Mapping) and cleanup.get("ok") is False:
+            return True
+        if detail.get("native_init_absence_retry") is False:
+            return False
+        if isinstance(detail.get("outcome_verified"), bool):
+            return not detail["outcome_verified"]
         cleanup_result = cleanup.get("result") if isinstance(cleanup, Mapping) else None
         if (isinstance(cleanup, Mapping) and cleanup.get("ok")
                 and isinstance(cleanup_result, Mapping)
@@ -2495,7 +3564,7 @@ class Control:
         phases = {str(detail.get(key)) for key in ("phase", "operation_phase") if detail.get(key) is not None}
         native_phases = {
             "native-generation", "native-init", "native-config", "native-stop", "native-start",
-            "guest-readiness", "guest-post-check", "access-exposure",
+            "guest-readiness", "guest-post-check", "access-exposure", "port-add", "port-remove", "cache-delete",
         }
         return bool(phases & native_phases)
 
@@ -3058,6 +4127,19 @@ class Control:
             result = self._dispatch_action(action, dict(request), session_id, compatibility_warnings)
         except ControlError as exc:
             try:
+                outcome_uncertain = self._operation_outcome_uncertain(action, exc)
+                if not outcome_uncertain and action in {"release", "destroy"} and session_id is not None:
+                    try:
+                        current_task = self.store.get_task(session_id=session_id)
+                    except ControlError:
+                        outcome_uncertain = True
+                    else:
+                        outcome_uncertain = bool(
+                            current_task and current_task.get("state") in {"closing", "deleting"}
+                        )
+                detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
+                detail.setdefault("outcome_verified", not outcome_uncertain)
+                exc = ControlError(exc.code, exc.message, detail)
                 if operation_id and is_write:
                     # A committed renew must remain replayable even if rearming its
                     # native timer failed after the atomic deadline/journal commit.
@@ -3078,7 +4160,7 @@ class Control:
                     )
             except ControlError as state_error:
                 raise self._annotate_state_error(state_error, action=action, operation_id=operation_id) from state_error
-            raise
+            raise exc
         response = {
             "ok": True,
             "protocol": PROTOCOL_VERSION,
@@ -3423,8 +4505,12 @@ class Control:
             if any(item.get("name") == task["instance_name"] for item in self.incus.list_instances()):
                 raise ControlError("cleanup_incomplete", "native deletion is not confirmed")
         except ControlError as exc:
-            self.store.update_task(task["task_id"], last_error=json.dumps(exc.as_dict()))
-            raise
+            detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
+            detail["operation_phase"] = "cache-delete"
+            detail["outcome_verified"] = False
+            annotated = ControlError(exc.code, exc.message, detail)
+            self.store.update_task(task["task_id"], last_error=json.dumps(annotated.as_dict()))
+            raise annotated from exc
         with self._global_lock():
             self.store.update_task(task["task_id"], state="absent", vm_ip=None, ssh_host_port=None,
                                    lease_expires_at=None, inactive_since=None, cleanup_after=None,
@@ -3452,7 +4538,10 @@ class Control:
                 reclaimed.append(task["task_id"])
             except ControlError as exc:
                 if exc.code == "object_busy" or exc.code == "cache_ineligible": continue
-                raise ControlError("reclaim_failed", "exact cache reclamation failed", exc.as_dict()) from exc
+                detail = dict(exc.as_dict())
+                detail["operation_phase"] = "cache-delete"
+                detail["outcome_verified"] = False
+                raise ControlError("reclaim_failed", "exact cache reclamation failed", detail) from exc
         facts = self._storage_headroom(request_cost)
         with self._global_lock():
             if not self._space_sufficient(facts, request_cost, "low", exclude_task_id):
@@ -3487,6 +4576,141 @@ class Control:
         return {"base": base, "ratios": {key: float(value) for key, value in ratios.items()},
                 "limits": {key: int(Decimal(base[key]) * ratios[key]) for key in base},
                 "ct_capacity": capacity, "memory": {**memory, "observed_at": iso_time(self.now())}}
+
+    def _cpu_pressure_observation(self) -> dict[str, Any]:
+        try:
+            observation = self.resources.cpu_pressure()
+        except ControlError as exc:
+            return {"verified": False, "error": exc.as_dict()}
+        except AttributeError:
+            return {"verified": False, "error": {
+                "code": "resource_unverified",
+                "message": "CT CPU pressure observation is unavailable",
+            }}
+        if not isinstance(observation, Mapping):
+            return {"verified": False, "error": {
+                "code": "resource_unverified",
+                "message": "CT CPU pressure observation is not an object",
+            }}
+        sources = observation.get("sources")
+        if (observation.get("scope") != "ct-cpu-pressure"
+                or sources != ["cgroupfs"]
+                or observation.get("mountpoint") != "/sys/fs/cgroup"
+                or observation.get("mount_root") != "/"
+                or observation.get("filesystem") != "cgroup2"):
+            return {"verified": False, "error": {
+                "code": "resource_unverified",
+                "message": "CT CPU pressure observation is not CT-local",
+            }}
+        cgroup_path = observation.get("cgroup_path")
+        if (not isinstance(cgroup_path, str)
+                or (cgroup_path != "/" and (
+                    re.fullmatch(r"/[^\x00/]+(?:/[^\x00/]+)*", cgroup_path) is None
+                    or any(part in {".", ".."} for part in cgroup_path.split("/"))
+                ))):
+            return {"verified": False, "error": {
+                "code": "resource_unverified",
+                "message": "CT CPU pressure cgroup path is invalid",
+            }}
+        expected_metric = "/sys/fs/cgroup" + ("" if cgroup_path == "/" else cgroup_path) + "/cpu.pressure"
+        if observation.get("metric") != expected_metric:
+            return {"verified": False, "error": {
+                "code": "resource_unverified",
+                "message": "CT CPU pressure metric path is not current-cgroup local",
+            }}
+        try:
+            psi = normalize_cpu_psi(observation)
+        except ValueError:
+            return {"verified": False, "error": {
+                "code": "resource_unverified",
+                "message": "CT CPU pressure observation is malformed",
+            }}
+        result = dict(observation)
+        result.update(psi)
+        result.update({"verified": True, "observed_at": iso_time(self.now())})
+        return result
+
+    def _cpu_startup_pressure_diagnostics(
+        self,
+        *,
+        allocated_cpu: int,
+        requested_cpu: int,
+        capacity_cpu: int,
+        observation: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        observation = observation if observation is not None else self._cpu_pressure_observation()
+        threshold = percentage(
+            self.config.get(
+                "cpu_startup_pressure_full_avg10_percent",
+                CPU_STARTUP_PRESSURE_FULL_AVG10_PERCENT,
+            ),
+            "cpu_startup_pressure_full_avg10_percent",
+        )
+        detail: dict[str, Any] = {
+            "threshold_full_avg10_percent": threshold,
+            "allocated_cpu": allocated_cpu,
+            "requested_cpu": requested_cpu,
+            "projected_cpu": allocated_cpu + requested_cpu,
+            "ct_capacity_cpu": capacity_cpu,
+            "physically_oversubscribed": allocated_cpu + requested_cpu > capacity_cpu,
+            "startup_blocked": False,
+        }
+        if not observation.get("verified"):
+            detail.update({"verified": False, "error": observation.get("error")})
+            return detail
+        try:
+            full = observation["full"]
+            some = observation["some"]
+            values = {}
+            for name in ("avg10", "avg60", "avg300", "total"):
+                full_value = float(full[name])
+                some_value = float(some[name])
+                if (not math.isfinite(full_value) or not math.isfinite(some_value)
+                        or full_value > some_value):
+                    raise ValueError()
+                values[name] = (full_value, some_value)
+        except (KeyError, TypeError, ValueError) as exc:
+            detail.update({
+                "verified": False,
+                "error": {
+                    "code": "resource_unverified",
+                    "message": "CT CPU pressure observation is incomplete",
+                },
+            })
+            return detail
+        detail.update({
+            "verified": True,
+            "full_avg10_percent": values["avg10"][0],
+            "some_avg10_percent": values["avg10"][1],
+        })
+        detail["startup_blocked"] = detail["physically_oversubscribed"] and values["avg10"][0] >= threshold
+        return detail
+
+    def _enforce_cpu_startup_pressure(
+        self,
+        *,
+        allocated_cpu: int,
+        requested_cpu: int,
+        capacity_cpu: int,
+    ) -> dict[str, Any]:
+        detail = self._cpu_startup_pressure_diagnostics(
+            allocated_cpu=allocated_cpu,
+            requested_cpu=requested_cpu,
+            capacity_cpu=capacity_cpu,
+        )
+        if not detail["verified"]:
+            raise ControlError(
+                "resource_unverified",
+                "CT CPU pressure observation is not verified",
+                detail,
+            )
+        if detail["startup_blocked"]:
+            raise ControlError(
+                "resource_pressure",
+                "CPU scheduler pressure blocks VM startup",
+                detail,
+            )
+        return detail
 
     def _allocation_breakdown(self, exclude_task_id: str | None = None) -> dict[str, dict[str, int]]:
         totals = {key: {name: 0 for name in ("allocated", "reserved", "allocated_and_reserved")}
@@ -3587,6 +4811,7 @@ class Control:
             memory = self.resources.memory()
         except ControlError as exc:
             memory_error = exc
+        cpu_pressure = self._cpu_pressure_observation()
         policy = None
         try:
             if memory_error is not None:
@@ -3614,6 +4839,7 @@ class Control:
                     "allocated_and_reserved": allocated_and_reserved,
                     "remaining": {key: policy["limits"][key] - allocated_and_reserved[key] for key in allocated_and_reserved},
                     "memory_pressure": policy["memory"]["available_bytes"] < policy["memory"]["threshold_bytes"],
+                    "cpu_pressure": cpu_pressure,
                     "disk_admission": disk}
         except ControlError as exc:
             result = {
@@ -3625,6 +4851,7 @@ class Control:
                 "ct_capacity": None,
                 "memory": None if memory is None else {**memory, "observed_at": iso_time(self.now())},
                 "memory_pressure": None,
+                "cpu_pressure": cpu_pressure,
                 "allocated": None,
                 "reserved": None,
                 "allocated_and_reserved": None,
@@ -3741,6 +4968,21 @@ class Control:
         warnings = []
         if resources.get("memory_pressure"):
             warnings.append({"code": "memory_pressure", "memory": resources.get("memory")})
+        cpu_startup_pressure = None
+        if resources.get("verified"):
+            cpu_startup_pressure = self._cpu_startup_pressure_diagnostics(
+                allocated_cpu=resources["allocated_and_reserved"]["cpu"],
+                requested_cpu=requested["cpu"],
+                capacity_cpu=resources["ct_capacity"]["cpu"],
+                observation=resources.get("cpu_pressure"),
+            )
+            if cpu_startup_pressure["startup_blocked"]:
+                reasons.append({"code": "resource_pressure", "message": "CPU scheduler pressure blocks VM startup",
+                                "detail": cpu_startup_pressure})
+            elif not cpu_startup_pressure["verified"]:
+                reasons.append({"code": "resource_unverified",
+                                "message": "CT CPU pressure observation is not verified",
+                                "detail": cpu_startup_pressure})
         if not instances.get("verified"):
             reasons.append(instances["error"])
         elif not instances["policy_compliant"] and not any(reason["code"] == "project_instance_limits_conflict" for reason in reasons):
@@ -3756,11 +4998,14 @@ class Control:
                 reasons.append({"code": "disk_reclaim_required", "message": "default creation needs capacity reclamation"})
         return {"requested": requested, "request_cost_bytes": self.config["create_cost_bytes"],
                 "ready": not reasons, "reasons": reasons, "reclaim_required": reclaim_required,
-                "observations": {"memory_pressure": resources.get("memory_pressure")},
+                "observations": {"memory_pressure": resources.get("memory_pressure"),
+                                 "cpu_startup_pressure": cpu_startup_pressure},
                 "warnings": warnings}
 
     def _reserve_resources(self, task: Mapping[str, Any], resources: Mapping[str, int],
                            *, memory_reduction: bool = False,
+                           startup_required: bool = True,
+                           startup_cpu: int | None = None,
                            admission_epoch: str | None = None) -> dict[str, Any]:
         # Only a verified, memory-only reduction may bypass new-demand gates.
         # Its old allocation stays reserved until native completion is verified.
@@ -3796,6 +5041,12 @@ class Control:
                 raise ControlError("resource_insufficient", "allocation ceiling exceeded: " + ", ".join(exceeded),
                                    {"dimensions": exceeded, "requested": dict(resources), "other_allocated": totals,
                                     "projected": projected, "base": policy["base"], "limits": policy["limits"]})
+            if policy and startup_required:
+                self._enforce_cpu_startup_pressure(
+                    allocated_cpu=totals["cpu"],
+                    requested_cpu=resources["cpu"] if startup_cpu is None else startup_cpu,
+                    capacity_cpu=policy["ct_capacity"]["cpu"],
+                )
             record = dict(task, resource_reservation_json=json.dumps(dict(resources), sort_keys=True))
             if not record.get("resources_json"):
                 record["resources_json"] = json.dumps(dict(resources), sort_keys=True)
@@ -3807,6 +5058,7 @@ class Control:
         task: Mapping[str, Any],
         resources: Mapping[str, int],
         *,
+        startup_cpu: int | None = None,
         admission_epoch: str | None = None,
     ) -> dict[str, Any]:
         """Wait for an unrelated native cleanup to leave the admission fence.
@@ -3821,7 +5073,12 @@ class Control:
         attempts = 0
         while True:
             try:
-                return self._reserve_resources(task, resources, admission_epoch=admission_epoch)
+                return self._reserve_resources(
+                    task,
+                    resources,
+                    startup_cpu=startup_cpu,
+                    admission_epoch=admission_epoch,
+                )
             except ControlError as exc:
                 if (exc.code != "resource_unverified"
                         or exc.message != TRANSITIONAL_ADMISSION_ERROR_MESSAGE):
@@ -4146,7 +5403,7 @@ class Control:
         if isinstance(error, ControlError):
             detail["code"] = error.code
             if error.code == "command_timeout" and isinstance(error.detail, Mapping):
-                for key in ("reaped", "process_group_killed", "process_group_cleanup_error"):
+                for key in ("reaped", "pipes_drained", "process_group_killed", "process_group_cleanup_error"):
                     if key in error.detail:
                         detail[key] = error.detail[key]
         return detail
@@ -4162,24 +5419,7 @@ class Control:
 
     @staticmethod
     def _parse_cpu_psi(raw: str) -> dict[str, dict[str, float]]:
-        result: dict[str, dict[str, float]] = {}
-        for line in raw.splitlines():
-            fields = line.split()
-            if not fields or fields[0] not in {"some", "full"}:
-                continue
-            values: dict[str, float] = {}
-            for field in fields[1:]:
-                name, separator, value = field.partition("=")
-                if separator:
-                    try:
-                        values[name] = float(value)
-                    except ValueError:
-                        continue
-            if values:
-                result[fields[0]] = values
-        if not result:
-            raise ValueError("CPU PSI data is missing")
-        return result
+        return parse_cpu_psi(raw)
 
     @staticmethod
     def _redact_startup_log(raw: str) -> dict[str, Any]:
@@ -4291,7 +5531,19 @@ class Control:
         except Exception as error:
             errors.append({"source": "native_status", **self._diagnostic_error(error)})
         try:
-            payload["cpu_psi"] = self._parse_cpu_psi(Path("/proc/pressure/cpu").read_text())
+            observation = self._cpu_pressure_observation()
+            if observation.get("verified"):
+                payload["cpu_psi"] = observation
+            else:
+                error = observation.get("error")
+                if isinstance(error, Mapping):
+                    errors.append({
+                        "source": "cpu_psi",
+                        "type": "ControlError",
+                        "code": error.get("code", "resource_unverified"),
+                    })
+                else:
+                    errors.append({"source": "cpu_psi", "type": "ResourceObservationError"})
         except Exception as error:
             errors.append({"source": "cpu_psi", **self._diagnostic_error(error)})
         try:
@@ -4849,7 +6101,12 @@ class Control:
         # The deadline/timer exists before either starting the guest or exposing NAT.
         task["lease_expires_at"] = iso_time(self.now() + dt.timedelta(seconds=self.config["initial_lease_seconds"]))
         reserved = {key: max(old[key], resources[key]) for key in old} if cached else resources
-        task = self._reserve_resources_with_transition_wait(task, reserved, admission_epoch=admission_epoch)
+        task = self._reserve_resources_with_transition_wait(
+            task,
+            reserved,
+            startup_cpu=resources["cpu"],
+            admission_epoch=admission_epoch,
+        )
         completed = []
         phase = "reservation"
         stage_timings: dict[str, Any] = {}
@@ -4913,8 +6170,22 @@ class Control:
                     "readiness": readiness, "stage_timings": stage_timings}
         except ControlError as exc:
             cleanup = {"ok": False, "error": {"code": "not_attempted", "message": "cleanup was not attempted"}}
+            native_init_cleanup_verified = (
+                self._native_init_timeout_cleanup_verified(exc)
+                if phase == "native-init"
+                else None
+            )
+            native_init_uncertain = phase == "native-init" and (
+                exc.code == "command_timeout" or native_init_cleanup_verified is False
+            )
             try:
-                cleanup["result"] = self._release_task(self.store.get_task(task_id=task["task_id"]))
+                cleanup["result"] = self._release_task(
+                    self.store.get_task(task_id=task["task_id"]),
+                    require_native_init_absence_retry=native_init_uncertain,
+                    native_init_cleanup_verified=native_init_cleanup_verified,
+                    protect_native_init_residue=phase == "native-init",
+                    recover_pending_acquire=False,
+                )
                 cleanup["ok"] = True
             except ControlError as cleanup_error:
                 cleanup = {"ok": False, "error": cleanup_error.as_dict()}
@@ -4922,6 +6193,26 @@ class Control:
             failure_phase = detail.get("phase", phase)
             detail.update({"phase": failure_phase, "operation_phase": phase, "completed": completed,
                            "requested": resources, "cleanup": cleanup})
+            if native_init_uncertain:
+                detail["native_init_absence_retry"] = True
+                detail["native_init_cleanup_verified"] = native_init_cleanup_verified
+                cleanup_error = cleanup.get("error") if isinstance(cleanup, Mapping) else None
+                cleanup_detail = cleanup_error.get("detail") if isinstance(cleanup_error, Mapping) else None
+                detail["native_init_absence_retry_after"] = (
+                    cleanup_detail.get("native_init_absence_retry_after")
+                    if isinstance(cleanup_detail, Mapping)
+                    and cleanup_detail.get("native_init_absence_retry_after")
+                    else iso_time(self.now() + dt.timedelta(seconds=NATIVE_INIT_ABSENCE_RETRY_SECONDS))
+                )
+                if isinstance(cleanup_detail, Mapping):
+                    detail["native_init_absence_checks"] = cleanup_detail.get(
+                        "native_init_absence_checks", 1
+                    )
+                    detail["native_init_cleanup_verified"] = cleanup_detail.get(
+                        "native_init_cleanup_verified", native_init_cleanup_verified
+                    )
+            elif phase == "native-init":
+                detail["native_init_absence_retry"] = False
             if readiness is not None:
                 detail["readiness"] = readiness
             error = {"code": "acquire_partial", **detail, "error": exc.as_dict()}
@@ -4963,7 +6254,17 @@ class Control:
         self._check_generation(task, request)
         return self._release_task(task)
 
-    def _release_task(self, task: Mapping[str, Any]) -> dict[str, Any]:
+    def _release_task(
+        self,
+        task: Mapping[str, Any],
+        *,
+        require_native_init_absence_retry: bool = False,
+        native_init_cleanup_verified: bool | None = None,
+        # A failed native init may leave a stopped, partially unpacked guest.
+        # Never turn that residue into a reusable cache entry.
+        protect_native_init_residue: bool = False,
+        recover_pending_acquire: bool = True,
+    ) -> dict[str, Any]:
         requested_state = task.get("state")
         with self._object_lock("cleanup:" + str(task["session_id"])):
             current = self.store.get_task(task_id=task["task_id"])
@@ -4984,8 +6285,144 @@ class Control:
                 # Reuse the native expiry oneshot's bounded Restart=on-failure path.
                 self.systemd.retry_cleanup(task["task_id"], task["generation"])
                 raise ControlError("cleanup_incomplete", "entry/port reservations remain closed until reconciliation succeeds", errors)
+            try:
+                instances = self.incus.list_instances()
+            except ControlError as exc:
+                detail = {"native_absence": "unverified", "cause": exc.as_dict()}
+                self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                self.systemd.retry_cleanup(task["task_id"], task["generation"])
+                raise ControlError(
+                    "cleanup_incomplete",
+                    "native absence cannot be verified; delayed reconciliation is required",
+                    detail,
+                ) from exc
+            absent = not any(item.get("name") == task["instance_name"] for item in instances)
+            try:
+                pending_acquire = (
+                    self._pending_native_init_for_task(task)
+                    if recover_pending_acquire
+                    else None
+                )
+            except ControlError as exc:
+                detail = {"native_absence": "unverified", "cause": exc.as_dict()}
+                self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                self.systemd.retry_cleanup(task["task_id"], task["generation"])
+                raise ControlError(
+                    "cleanup_incomplete",
+                    "pending native initialization cannot be verified; delayed reconciliation is required",
+                    detail,
+                ) from exc
+            delayed_absence = self._native_init_absence_retry_pending(task)
+            retry_required = require_native_init_absence_retry or delayed_absence or pending_acquire is not None
+            retry_ready = self._native_init_absence_retry_ready(task)
+            cleanup_verified = (
+                native_init_cleanup_verified
+                if native_init_cleanup_verified is not None
+                else self._native_init_cleanup_verified(task)
+            )
+            native_init_retry_required = (
+                require_native_init_absence_retry
+                or delayed_absence
+                or (protect_native_init_residue and not absent)
+            )
+            if native_init_retry_required and not absent:
+                if cleanup_verified is True:
+                    try:
+                        with self._native_lock(task):
+                            current = self._cleanup_current(task)
+                            if current is None:
+                                raise ControlError("generation_mismatch", "cleanup generation changed")
+                            self._ownership(current)
+                            self.incus.delete(current["instance_name"])
+                            if any(
+                                item.get("name") == current["instance_name"]
+                                for item in self.incus.list_instances()
+                            ):
+                                raise ControlError(
+                                    "cleanup_incomplete",
+                                    "uncertain native init instance deletion is not confirmed",
+                                )
+                        absent = True
+                    except ControlError as exc:
+                        detail = {
+                            "native_init_absence_retry": True,
+                            "outcome_verified": False,
+                            "native_absence": "present",
+                            "native_init_cleanup_verified": cleanup_verified,
+                            "cause": exc.as_dict(),
+                        }
+                        prior = self._native_init_absence_retry_record(task) or {}
+                        if isinstance(prior.get("error"), Mapping):
+                            detail["error"] = prior["error"]
+                        self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                        self.systemd.retry_cleanup(task["task_id"], task["generation"])
+                        raise ControlError(
+                            "cleanup_incomplete",
+                            "uncertain native init instance cannot be removed; delayed reconciliation is required",
+                            detail,
+                        ) from exc
+                else:
+                    detail = {
+                        "native_init_absence_retry": True,
+                        "outcome_verified": False,
+                        "native_absence": "present",
+                        "native_init_cleanup_verified": cleanup_verified,
+                    }
+                    prior = self._native_init_absence_retry_record(task) or {}
+                    if isinstance(prior.get("error"), Mapping):
+                        detail["error"] = prior["error"]
+                    self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                    self.systemd.retry_cleanup(task["task_id"], task["generation"])
+                    raise ControlError(
+                        "cleanup_incomplete",
+                        "native init cleanup is unverified; delayed reconciliation is required",
+                        detail,
+                    )
+            absence_checks = self._native_init_absence_checks(task)
+            if absent and retry_required:
+                absence_checks += 1
+            stable_absence = retry_ready and absence_checks >= 2
+            absence_verified = cleanup_verified is True or (
+                cleanup_verified is None and pending_acquire is not None and stable_absence
+            )
+            if absent and retry_required and not (stable_absence and absence_verified):
+                retry_after = self._native_init_retry_after(task)
+                detail = {
+                    "native_init_absence_retry": True,
+                    "outcome_verified": False,
+                    "native_absence": "pending",
+                    "native_init_absence_retry_after": retry_after,
+                    "native_init_absence_checks": absence_checks,
+                    "native_init_cleanup_verified": cleanup_verified,
+                }
+                prior = self._native_init_absence_retry_record(task) or {}
+                if isinstance(prior.get("error"), Mapping):
+                    detail["error"] = prior["error"]
+                self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                self.systemd.retry_cleanup(task["task_id"], task["generation"])
+                raise ControlError(
+                    "cleanup_incomplete",
+                    "native init result remains unresolved; delayed reconciliation is required",
+                    detail,
+                )
+            recovered_operation = None
+            if absent and pending_acquire is not None and stable_absence and absence_verified:
+                try:
+                    recovered_operation = self._recovered_native_init_operation(task, pending_acquire)
+                except ControlError as exc:
+                    detail = {
+                        "native_absence": "verified",
+                        "outcome_verified": False,
+                        "cause": exc.as_dict(),
+                    }
+                    self.store.update_task(task["task_id"], last_error=json.dumps(detail))
+                    self.systemd.retry_cleanup(task["task_id"], task["generation"])
+                    raise ControlError(
+                        "cleanup_incomplete",
+                        "native init operation cannot be finalized; delayed reconciliation is required",
+                        detail,
+                    ) from exc
             self.systemd.remove_expiry(task["task_id"], task["generation"])
-            absent = not any(item.get("name") == task["instance_name"] for item in self.incus.list_instances())
             if not absent and task.get("previous_generation") is not None:
                 self._ownership(task)
                 self.incus.config_set(task["instance_name"], "user.agent-vm.generation", str(task["generation"]))
@@ -4999,6 +6436,15 @@ class Control:
             with self._global_lock(), self.store.transaction():
                 for port in self.store.get_ports(task["task_id"]):
                     self.store.remove_port(task["task_id"], port["port_name"], port["protocol"])
+                if recovered_operation is not None:
+                    operation_id, operation = recovered_operation
+                    self.store.record_operation(
+                        operation_id,
+                        "acquire",
+                        task["session_id"],
+                        task["generation"],
+                        operation,
+                    )
                 task = self.store.update_task(task["task_id"], state="absent" if absent else "cached",
                                              ssh_host_port=None, reservation_bytes=0, last_error=None, previous_generation=None, resource_reservation_json='{}',
                                              resources_json=json.dumps(resources),
@@ -5041,6 +6487,11 @@ class Control:
                     raise ControlError("draining", "restart work is refused while draining")
                 self._ownership(task)
                 self._verify_native_allocation(task)
+                self._enforce_cpu_startup_pressure(
+                    allocated_cpu=self._allocation_totals()["cpu"],
+                    requested_cpu=0,
+                    capacity_cpu=self.resources.cpu(),
+                )
                 self._network_guard()
                 self._verify_network_device(task)
                 self._require_window(task)
@@ -5122,7 +6573,7 @@ class Control:
         reclaimed = []
         if needs_restart:
             reserved = {key: max(old[key], target[key], previous_reservation.get(key, 0)) for key in old}
-            self._reserve_resources(task, reserved)
+            self._reserve_resources(task, reserved, startup_cpu=target["cpu"])
             try:
                 reclaimed = self._reclaim_capacity(cost, task["task_id"])
                 self._reserve_native(task, cost)
@@ -5214,7 +6665,12 @@ class Control:
         if target == old:
             return {"applied": False, "mode": "live-memory", "plan": "unchanged", **self._state_summary(task)}
         reserved = {key: max(old[key], target[key]) for key in old}
-        self._reserve_resources(task, reserved, memory_reduction=target["memory_mib"] < old["memory_mib"])
+        self._reserve_resources(
+            task,
+            reserved,
+            memory_reduction=target["memory_mib"] < old["memory_mib"],
+            startup_required=False,
+        )
         completed = []
         try:
             # Recheck expiry's lock-independent fence immediately before the native
@@ -5257,7 +6713,7 @@ class Control:
                 if (self._durable_resources(current, "resource_reservation_json", allow_empty=True) != reserved
                         or self._native_resources(task) != old or self._guest_boot_id(task) != before):
                     raise ControlError("resize_unverified", "native rollback or guest continuity is unverified after balloon timeout")
-                self._reserve_resources(task, reserved, memory_reduction=target["memory_mib"] < old["memory_mib"])
+                self._reserve_resources(task, reserved, memory_reduction=target["memory_mib"] < old["memory_mib"], startup_required=False)
                 # Large balloons keep converging after Incus's five-second
                 # check. One bounded settle interval precedes the only retry.
                 # Expiry can still preempt this object and withdraw access.
@@ -5269,7 +6725,7 @@ class Control:
                 if (self._durable_resources(current, "resource_reservation_json", allow_empty=True) != reserved
                         or self._native_resources(task) != old or self._guest_boot_id(task) != before):
                     raise ControlError("resize_unverified", "native rollback, reservation or guest continuity changed during balloon settlement")
-                self._reserve_resources(task, reserved, memory_reduction=True)
+                self._reserve_resources(task, reserved, memory_reduction=True, startup_required=False)
                 apply_memory()
             completed.append("native_memory_update")
             if self._native_resources(task) != target:
@@ -5378,6 +6834,8 @@ class Control:
                     or not isinstance(current["transient"], bool)
                     or not isinstance(current["stdout_truncated"], bool)
                     or not isinstance(current["stderr_truncated"], bool)
+                    or ("reaped" in current and not isinstance(current["reaped"], bool))
+                    or ("pipes_drained" in current and not isinstance(current["pipes_drained"], bool))
                     or ("process_group_killed" in current and not isinstance(current["process_group_killed"], bool))
                     or (
                         "process_group_cleanup_error" in current
@@ -5388,7 +6846,9 @@ class Control:
                     or (
                         current.get("cause") == "command_timeout"
                         and (
-                            not isinstance(current.get("process_group_killed"), bool)
+                            not isinstance(current.get("reaped"), bool)
+                            or not isinstance(current.get("pipes_drained"), bool)
+                            or not isinstance(current.get("process_group_killed"), bool)
                             or "process_group_cleanup_error" not in current
                         )
                     )
@@ -5420,13 +6880,15 @@ class Control:
         def matches_guest_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
             return all(candidate.get(key) == reference.get(key) for key in (
                 "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient", "cause",
-                "stdout_truncated", "stderr_truncated", "process_group_killed", "process_group_cleanup_error",
+                "stdout_truncated", "stderr_truncated", "reaped", "pipes_drained",
+                "process_group_killed", "process_group_cleanup_error",
             ))
 
         def same_guest_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
             return all(candidate.get(key) == reference.get(key) for key in (
                 "phase", "command", "returncode", "stdout", "stderr", "transient", "cause", "retry_of",
-                "stdout_truncated", "stderr_truncated", "process_group_killed", "process_group_cleanup_error",
+                "stdout_truncated", "stderr_truncated", "reaped", "pipes_drained",
+                "process_group_killed", "process_group_cleanup_error",
             ))
 
         def valid_guest_attempts(attempts: Any) -> bool:
@@ -5521,7 +6983,7 @@ class Control:
             }
             for key in (
                 "transient", "retry_of", "cause", "stdout_truncated", "stderr_truncated",
-                "process_group_killed", "process_group_cleanup_error",
+                "reaped", "pipes_drained", "process_group_killed", "process_group_cleanup_error",
             ):
                 if key in guest_error:
                     detail[key] = guest_error[key]
@@ -5607,6 +7069,8 @@ class Control:
                         or not isinstance(current["transient"], bool)
                         or not isinstance(current["stdout_truncated"], bool)
                         or not isinstance(current["stderr_truncated"], bool)
+                        or ("reaped" in current and not isinstance(current["reaped"], bool))
+                        or ("pipes_drained" in current and not isinstance(current["pipes_drained"], bool))
                         or ("process_group_killed" in current and not isinstance(current["process_group_killed"], bool))
                         or (
                             "process_group_cleanup_error" in current
@@ -5617,7 +7081,9 @@ class Control:
                         or (
                             current.get("cause") == "command_timeout"
                             and (
-                                not isinstance(current.get("process_group_killed"), bool)
+                                not isinstance(current.get("reaped"), bool)
+                                or not isinstance(current.get("pipes_drained"), bool)
+                                or not isinstance(current.get("process_group_killed"), bool)
                                 or "process_group_cleanup_error" not in current
                             )
                         )
@@ -5647,7 +7113,7 @@ class Control:
             def matches_failure(reference: Mapping[str, Any], candidate: Mapping[str, Any]) -> bool:
                 return all(candidate.get(key) == reference.get(key) for key in (
                     "phase", "command", "returncode", "stdout", "stderr", "capacity", "transient", "cause",
-                    "stdout_truncated", "stderr_truncated",
+                    "stdout_truncated", "stderr_truncated", "reaped", "pipes_drained",
                 ))
 
             attempt_records = capacity["attempts"]
@@ -5815,7 +7281,8 @@ class Control:
                     self._check_generation(current, request)
                     self._require_active(current)
                 return self.store.get_port(task["task_id"], name, protocol)
-            except ControlError:
+            except ControlError as exc:
+                cleanup_verified = False
                 current = self.store.get_task(task_id=task["task_id"])
                 same_generation = bool(
                     current
@@ -5842,11 +7309,15 @@ class Control:
                                     self._conntrack_delete(cleanup_port, task)
                                     if current_port:
                                         self.store.remove_port(task["task_id"], name, protocol)
+                                    cleanup_verified = True
                     except ControlError:
                         current_port = self.store.get_port(task["task_id"], name, protocol)
                         if current_port and int(current_port["generation"]) == int(existing["generation"]):
                             self.store.update_port(task["task_id"], name, protocol, state="closing")
-                raise
+                detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
+                detail.setdefault("operation_phase", "port-add")
+                detail["outcome_verified"] = cleanup_verified
+                raise ControlError(exc.code, exc.message, detail) from exc
         inventory = self._port_inventory()
         with self._global_lock(), self.store.transaction():
             self._require_active(self.store.get_task(task_id=task["task_id"]))
@@ -5861,7 +7332,8 @@ class Control:
                 self._require_active(current)
                 self.store.update_port(task["task_id"], name, protocol, state="active")
             return self.store.get_port(task["task_id"], name, protocol)
-        except ControlError:
+        except ControlError as exc:
+            cleanup_verified = False
             try:
                 with self._native_lock(task):
                     current = self.store.get_task(task_id=task["task_id"])
@@ -5871,11 +7343,15 @@ class Control:
                         current_port = self.store.get_port(task["task_id"], name, protocol)
                         if current_port and int(current_port["generation"]) == int(port["generation"]):
                             self.store.remove_port(task["task_id"], name, protocol)
+                        cleanup_verified = True
             except ControlError:
                 current_port = self.store.get_port(task["task_id"], name, protocol)
                 if current_port and int(current_port["generation"]) == int(port["generation"]):
                     self.store.update_port(task["task_id"], name, protocol, state="closing")
-            raise
+            detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
+            detail.setdefault("operation_phase", "port-add")
+            detail["outcome_verified"] = cleanup_verified
+            raise ControlError(exc.code, exc.message, detail) from exc
 
 
     def port_list(self, request: Mapping[str, Any], session_id: str | None) -> dict[str, Any]:
@@ -5896,10 +7372,16 @@ class Control:
         port = self.store.get_port(task["task_id"], name, protocol)
         if port:
             self.store.update_port(task["task_id"], name, protocol, state="closing")
-            with self._native_lock(task):
-                self._remove_proxy(task, port)
-                self._conntrack_delete(port, task)
-                self.store.remove_port(task["task_id"], name, protocol)
+            try:
+                with self._native_lock(task):
+                    self._remove_proxy(task, port)
+                    self._conntrack_delete(port, task)
+                    self.store.remove_port(task["task_id"], name, protocol)
+            except ControlError as exc:
+                detail = dict(exc.detail) if isinstance(exc.detail, Mapping) else {}
+                detail.setdefault("operation_phase", "port-remove")
+                detail["outcome_verified"] = False
+                raise ControlError(exc.code, exc.message, detail) from exc
         return {"task_id": task["task_id"], "name": name, "protocol": protocol, "removed": True}
 
 
@@ -5931,6 +7413,14 @@ class Control:
                 "resources": resources,
                 "capacity": doctor.get("capacity"),
                 "disk_admission": disk_admission,
+                "ct_cpu": {
+                    "capacity_vcpu": (resources.get("ct_capacity") or {}).get("cpu")
+                    if isinstance(resources, Mapping) else None,
+                    "pressure": resources.get("cpu_pressure") if isinstance(resources, Mapping) else None,
+                    "startup_pressure": doctor.get("default_admission", {}).get("observations", {}).get(
+                        "cpu_startup_pressure"
+                    ),
+                },
                 "ct_memory": {
                     "capacity_bytes": memory.get("limit_bytes"),
                     "current_bytes": memory.get("current_bytes"),
@@ -6291,28 +7781,35 @@ def parse_timer_args(argv: Sequence[str]) -> dict[str, Any] | None:
 
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
+    request: dict[str, Any] | None = None
     try:
-        config = load_config()
         request = parse_timer_args(argv)
         if request is None:
             if argv:
                 raise ControlError("invalid_request", "unknown command-line arguments")
             request = request_from_stdin()
+        config = load_config()
         control = Control(config)
         response = control.dispatch(request)
         sys.stdout.write(json.dumps(response, sort_keys=True) + "\n")
         return 0
     except ControlError as exc:
-        sys.stderr.write(json.dumps({"ok": False, "error": exc.as_dict()}, sort_keys=True) + "\n")
+        envelope: dict[str, Any] = {"ok": False, "protocol": PROTOCOL_VERSION}
+        if request is not None:
+            for key in ("action", "session_id", "generation", "operation_id"):
+                if key in request:
+                    envelope[key] = request[key]
+        envelope["error"] = exc.as_dict()
+        sys.stderr.write(json.dumps(envelope, sort_keys=True) + "\n")
         return 2
     except Exception as exc:
-        sys.stderr.write(
-            json.dumps(
-                {"ok": False, "error": {"code": "internal_error", "message": type(exc).__name__}},
-                sort_keys=True,
-            )
-            + "\n"
-        )
+        envelope = {"ok": False, "protocol": PROTOCOL_VERSION}
+        if request is not None:
+            for key in ("action", "session_id", "generation", "operation_id"):
+                if key in request:
+                    envelope[key] = request[key]
+        envelope["error"] = {"code": "internal_error", "message": type(exc).__name__}
+        sys.stderr.write(json.dumps(envelope, sort_keys=True) + "\n")
         return 3
 
 

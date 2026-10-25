@@ -5,7 +5,7 @@ import json
 import unittest
 from unittest import mock
 
-from test_native_agent_vm import CONTROL, CLI, Fixture, GIB
+from test_native_agent_vm import CONTROL, CLI, Fixture, GIB, KEY
 
 
 class LiveMemoryTests(Fixture):
@@ -110,6 +110,19 @@ class LiveMemoryTests(Fixture):
         self.error("resource_insufficient", self.call, "resize", memory_mib=12288, live_memory=True)
         self.assertGreaterEqual(len(self.changes(before)), 1)
         self.assertEqual(self.call("status")["resources"]["memory_mib"], 8192)
+
+    def test_live_memory_growth_does_not_reapply_startup_pressure_gate(self):
+        self.config.update(cpu_budget=15, cpu_overcommit_ratio=2)
+        first = self.call("acquire", public_key=KEY, cpu=16)
+        self.call("acquire", "other", public_key=KEY, cpu=14)
+        self.resources.cpu_pressure.return_value["some"]["avg10"] = 55.12
+        self.resources.cpu_pressure.return_value["full"]["avg10"] = 45.67
+
+        result = self.call("resize", memory_mib=8192, live_memory=True)
+
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["resources"]["memory_mib"], 8192)
+        self.assertEqual(self.runner.instances[first["instance_name"]]["config"]["limits.memory"], "8192MiB")
 
     def test_restart_growth_uses_logical_allocation_guard_even_under_pressure(self):
         self.acquire()

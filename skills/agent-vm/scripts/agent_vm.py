@@ -15,10 +15,12 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shlex
 import subprocess
 import sys
-import tempfile
+import threading
+import time
 from typing import Any, Mapping, Sequence
 import uuid
 
@@ -28,6 +30,8 @@ VERSION = "0.4.0-native"
 REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.py"
 DEFAULT_CONTROL_TIMEOUT_SECONDS = 240
 LONG_CONTROL_TIMEOUT_SECONDS = 600
+REMOTE_STDOUT_LIMIT_BYTES = 2 * 1024 * 1024
+REMOTE_STDERR_LIMIT_BYTES = 64 * 1024
 SESSION_ENV = "AGENT_VM_SESSION_ID"
 CONTROL_HOST_ENV = "AGENT_VM_CONTROL_HOST"
 REMOTE_CONTROL_ENV = "AGENT_VM_REMOTE_CONTROL"
@@ -428,10 +432,18 @@ def _append_warning(warnings: list[dict[str, Any]], item: dict[str, Any]) -> Non
 
 
 def _finalize_local_operation(path: Path, request: Mapping[str, Any], response: Mapping[str, Any]) -> None:
+    _write_local_operation(path, request, {"outcome": "success", "response": dict(response)})
+
+
+def _finalize_local_error(path: Path, request: Mapping[str, Any], error: Mapping[str, Any]) -> None:
+    _write_local_operation(path, request, {"outcome": "error", "error": dict(error)})
+
+
+def _write_local_operation(path: Path, request: Mapping[str, Any], result: Mapping[str, Any]) -> None:
     temporary = path.with_name("." + path.name + ".tmp")
     try:
         with temporary.open("w", encoding="utf-8") as handle:
-            json.dump({"request": dict(request), "outcome": "success", "response": dict(response)}, handle, sort_keys=True)
+            json.dump({"request": dict(request), **dict(result)}, handle, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fchmod(handle.fileno(), 0o600)
@@ -450,9 +462,179 @@ def _finalize_local_operation(path: Path, request: Mapping[str, Any], response: 
             pass
         fail(
             "local_journal_update_failed",
-            "remote operation succeeded but the local operation journal could not be finalized",
+            "remote operation outcome is known but the local operation journal could not be finalized",
             {"operation_id": request.get("operation_id")},
         )
+
+
+def _reuse_local_operation(path: Path, request: Mapping[str, Any], *, wait_for_writer: bool = False) -> dict[str, Any]:
+    attempts = 50 if wait_for_writer else 1
+    for attempt in range(attempts):
+        try:
+            old = json.loads(path.read_text())
+        except (ValueError, OSError):
+            if attempt + 1 == attempts:
+                fail("local_journal_invalid", "operation journal is unreadable")
+            time.sleep(0.01)
+            continue
+        old_request = old.get("request") if isinstance(old, dict) else None
+        if not isinstance(old_request, dict):
+            fail("local_journal_invalid", "operation journal request is invalid")
+        current_intent = {key: value for key, value in request.items() if key != "compatibility"}
+        old_intent = {key: value for key, value in old_request.items() if key != "compatibility"}
+        if old_intent != current_intent:
+            fail("operation_conflict", "operation ID already describes another request")
+        # Replay the exact request recorded before the client sidecar changed.
+        return dict(old_request)
+    fail("local_journal_invalid", "operation journal is unreadable")
+
+
+def _json_value_matches(actual: Any, expected: Any) -> bool:
+    return type(actual) is type(expected) and actual == expected
+
+
+def _parse_remote_error(raw: bytes | None, *, request: Mapping[str, Any]) -> dict[str, Any] | None:
+    if not raw:
+        return None
+    try:
+        lines = raw.decode("utf-8", "replace").splitlines()
+    except Exception:
+        return None
+    matches: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            payload = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("ok") is not False or not _json_value_matches(payload.get("protocol"), PROTOCOL_VERSION):
+            continue
+        # A write journal may be finalized only from an error envelope emitted
+        # for this exact request.  SSH/wrapper diagnostics are not outcomes.
+        identity = ("action", "session_id", "generation", "operation_id")
+        if any(key not in payload or not _json_value_matches(payload[key], request[key]) for key in identity if key in request):
+            continue
+        error = payload.get("error")
+        if not isinstance(error, dict):
+            continue
+        code = error.get("code")
+        message = error.get("message")
+        if isinstance(code, str) and code and isinstance(message, str) and message:
+            matches.append(error)
+    return matches[0] if len(matches) == 1 else None
+
+
+_DETERMINISTIC_REMOTE_ERROR_CODES = frozenset({
+    # Release and compatibility preflight happens before the control process
+    # opens the state store or performs a native effect.
+    "artifact_checksum_mismatch",
+    "artifact_missing",
+    "artifact_mode_mismatch",
+    "artifact_path_invalid",
+    "artifact_unverified",
+    "bundle_invalid",
+    "cache_ineligible",
+    "config_invalid",
+    "config_missing",
+    "compatibility_action_mismatch",
+    "compatibility_invalid",
+    "capacity_insufficient",
+    "client_sidecar_invalid",
+    "draining",
+    "generation_mismatch",
+    "invalid_request",
+    "manifest_action_unsupported",
+    "manifest_format_unsupported",
+    "manifest_invalid",
+    "manifest_missing",
+    "manifest_path_invalid",
+    "manifest_self_reference",
+    "manifest_unverified",
+    "operation_conflict",
+    "protocol_mismatch",
+    "protocol_unsupported",
+    "request_schema_incompatible",
+    "request_semantic_incompatible",
+    "response_schema_incompatible",
+    "response_semantic_incompatible",
+    "resource_insufficient",
+    "resource_pressure",
+    "resource_budget_invalid",
+    "resource_unverified",
+    "lease_window_short",
+    "task_missing",
+    "task_not_active",
+    "unknown_action",
+})
+
+
+def _remote_error_outcome_uncertain(error: Mapping[str, Any], *, action: str | None = None) -> bool:
+    code = error.get("code")
+    if code == "sqlite_unavailable":
+        detail = error.get("detail")
+        return not isinstance(detail, Mapping) or detail.get("state_committed") is not False
+    detail = error.get("detail")
+    if isinstance(detail, Mapping) and isinstance(detail.get("outcome_verified"), bool):
+        return not detail["outcome_verified"]
+    if code in {"acquire_partial", "resize_partial", "restart_partial", "cleanup_incomplete", "operation_unverified"}:
+        return True
+    if isinstance(detail, Mapping) and any(
+        isinstance(detail.get(key), str)
+        and detail.get(key) in {
+            "native-generation", "native-init", "native-config", "native-stop", "native-start",
+            "guest-readiness", "guest-post-check", "access-exposure", "port-add", "port-remove", "cache-delete",
+        }
+        for key in ("phase", "operation_phase")
+    ):
+        return True
+    if action == "port-add" and code in {"generation_mismatch", "task_not_active"}:
+        # Older protocol-4 controllers do not report the native phase. Keep
+        # the conservative classification because a proxy may already exist.
+        return True
+    if code in _DETERMINISTIC_REMOTE_ERROR_CODES:
+        return False
+    return True
+
+
+def _drain_bounded_stream(fd: int, limit: int, output: list[bytes], truncated: list[bool],
+                          stop_event: threading.Event | None = None,
+                          eof: list[bool] | None = None) -> None:
+    retained = bytearray()
+    try:
+        try:
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    break
+                ready, _, _ = select.select([fd], [], [], 0.1)
+                if not ready:
+                    continue
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    if eof is not None:
+                        eof[0] = True
+                    break
+                remaining = limit + 1 - len(retained)
+                if remaining > 0:
+                    retained.extend(chunk[:remaining])
+                if len(retained) > limit:
+                    truncated[0] = True
+        except OSError:
+            # The reader owns the descriptor; cancellation is handled by the
+            # bounded select loop so a late reader cannot close a reused fd.
+            pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    output.append(bytes(retained))
+
+
+def _bounded_process_output(value: Any, limit: int) -> tuple[bytes, bool]:
+    if not isinstance(value, bytes):
+        return b"", False
+    return value[:limit + 1], len(value) > limit
 
 
 def control_request(action: str, *, session: str | None, generation: int | None = None,
@@ -471,54 +653,179 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         directory = local_session_dir(session) / "operations"
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         op_path = directory / (hashlib.sha256(request["operation_id"].encode()).hexdigest() + ".json")
-        if op_path.exists():
-            try: old = json.loads(op_path.read_text())
-            except (ValueError, OSError): fail("local_journal_invalid", "operation journal is unreadable")
-            old_request = old.get("request") if isinstance(old, dict) else None
-            if not isinstance(old_request, dict):
-                fail("local_journal_invalid", "operation journal request is invalid")
-            current_intent = {key: value for key, value in request.items() if key != "compatibility"}
-            old_intent = {key: value for key, value in old_request.items() if key != "compatibility"}
-            if old_intent != current_intent:
-                fail("operation_conflict", "operation ID already describes another request")
-            # Replay the exact request recorded before the client sidecar changed.
-            # The compatibility warning is still added to the returned envelope.
-            request = dict(old_request)
-        else:
+        try:
             with op_path.open("x", encoding="utf-8") as handle:
                 os.fchmod(handle.fileno(), 0o600)
                 json.dump({"request": request, "outcome": "pending"}, handle, sort_keys=True)
                 handle.flush()
                 os.fsync(handle.fileno())
+        except FileExistsError:
+            # Another client may have created the journal just before us.  The
+            # bounded retry also avoids reading its file between create and fsync.
+            request = _reuse_local_operation(op_path, request, wait_for_writer=True)
     try:
         control_host = os.environ.get(CONTROL_HOST_ENV, DEFAULT_CONTROL_HOST)
         remote_control = os.environ.get(REMOTE_CONTROL_ENV, DEFAULT_REMOTE_CONTROL)
-        process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
-                                  shlex.join(["python3", remote_control])],
-                                 input=json.dumps(request, sort_keys=True).encode(), stdout=subprocess.PIPE,
-                                 stderr=None, check=False, timeout=control_timeout(action, fields))
+        stdout_read, stdout_write = os.pipe()
+        stderr_read, stderr_write = os.pipe()
+        stdout_sink = os.fdopen(stdout_write, "wb")
+        stderr_sink = os.fdopen(stderr_write, "wb")
+        stdout_output: list[bytes] = []
+        stderr_output: list[bytes] = []
+        stdout_truncated_flag = [False]
+        stderr_truncated_flag = [False]
+        stdout_eof = [False]
+        stderr_eof = [False]
+        stream_stop = threading.Event()
+        stdout_reader = threading.Thread(
+            target=_drain_bounded_stream,
+            args=(stdout_read, REMOTE_STDOUT_LIMIT_BYTES, stdout_output, stdout_truncated_flag, stream_stop, stdout_eof),
+            daemon=True,
+        )
+        stderr_reader = threading.Thread(
+            target=_drain_bounded_stream,
+            args=(stderr_read, REMOTE_STDERR_LIMIT_BYTES, stderr_output, stderr_truncated_flag, stream_stop, stderr_eof),
+            daemon=True,
+        )
+        stdout_reader.start()
+        stderr_reader.start()
+        process = None
+        remote_timeout = False
+        stream_cleanup_verified = True
+        stream_cleanup_error = None
+        request_timeout = control_timeout(action, fields)
+        request_started = time.monotonic()
+        try:
+            try:
+                process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
+                                          shlex.join(["python3", remote_control])],
+                                         input=json.dumps(request, sort_keys=True).encode(), stdout=stdout_sink,
+                                         stderr=stderr_sink, check=False, timeout=request_timeout)
+            except subprocess.TimeoutExpired:
+                remote_timeout = True
+                raise
+        finally:
+            stdout_sink.close()
+            stderr_sink.close()
+            if remote_timeout:
+                stream_stop.set()
+                stdout_reader.join(timeout=1)
+                stderr_reader.join(timeout=1)
+                if stdout_reader.is_alive() or stderr_reader.is_alive():
+                    stream_cleanup_verified = False
+                    stream_cleanup_error = "reader_join_timeout"
+                elif not stdout_eof[0] or not stderr_eof[0]:
+                    stream_cleanup_verified = False
+                    stream_cleanup_error = "reader_cancelled_before_eof"
+            else:
+                reader_deadline = request_started + request_timeout
+                for reader in (stdout_reader, stderr_reader):
+                    reader.join(timeout=max(0.0, reader_deadline - time.monotonic()))
+                    if reader.is_alive():
+                        stream_stop.set()
+                        reader.join(timeout=0.2)
+                    if reader.is_alive():
+                        stream_cleanup_verified = False
+                        stream_cleanup_error = "reader_join_timeout"
+                if not stdout_eof[0] or not stderr_eof[0]:
+                    stream_cleanup_verified = False
+                    stream_cleanup_error = stream_cleanup_error or "reader_cancelled_before_eof"
+        stdout = stdout_output[0] if stdout_output else b""
+        stderr = stderr_output[0] if stderr_output else b""
+        if process is not None:
+            mocked_stdout, mocked_stdout_truncated = _bounded_process_output(process.stdout, REMOTE_STDOUT_LIMIT_BYTES)
+            mocked_stderr, mocked_stderr_truncated = _bounded_process_output(process.stderr, REMOTE_STDERR_LIMIT_BYTES)
+            if isinstance(process.stdout, bytes):
+                stdout = mocked_stdout
+                stdout_truncated_flag[0] = stdout_truncated_flag[0] or mocked_stdout_truncated
+            if isinstance(process.stderr, bytes):
+                stderr = mocked_stderr
+                stderr_truncated_flag[0] = stderr_truncated_flag[0] or mocked_stderr_truncated
     except FileNotFoundError: fail("command_missing", "ssh is not installed")
     except subprocess.TimeoutExpired:
+        detail = {
+            "operation_id": request.get("operation_id"),
+            "stream_cleanup_verified": stream_cleanup_verified,
+        }
+        if stream_cleanup_error is not None:
+            detail["stream_cleanup_error"] = stream_cleanup_error
         fail("remote_timeout", "control outcome is uncertain; retry the same operation ID",
-             {"operation_id": request.get("operation_id")})
-    if process.stderr:
-        sys.stderr.buffer.write(process.stderr)
+             detail)
+    stdout_truncated = stdout_truncated_flag[0]
+    stderr_truncated = stderr_truncated_flag[0]
+    stderr = stderr[:REMOTE_STDERR_LIMIT_BYTES]
+    if stderr:
+        sys.stderr.buffer.write(stderr)
         sys.stderr.flush()
+    if not stream_cleanup_verified:
+        detail = {
+            "operation_id": request.get("operation_id"),
+            "stream_cleanup_verified": False,
+        }
+        if stream_cleanup_error is not None:
+            detail["stream_cleanup_error"] = stream_cleanup_error
+        exit_code = process.returncode if process is not None and process.returncode else 1
+        fail("remote_failed", "control response stream cleanup is not verified", detail, exit_code)
     if process.returncode:
-        fail("remote_failed", "remote request failed; retry only with its original operation ID",
+        if stdout_truncated or stderr_truncated or not stream_cleanup_verified:
+            detail = {
+                "operation_id": request.get("operation_id"),
+                "stdout_truncated": stdout_truncated,
+                "stderr_truncated": stderr_truncated,
+                "stdout_limit_bytes": REMOTE_STDOUT_LIMIT_BYTES,
+                "stderr_limit_bytes": REMOTE_STDERR_LIMIT_BYTES,
+                "stream_cleanup_verified": stream_cleanup_verified,
+            }
+            if stream_cleanup_error is not None:
+                detail["stream_cleanup_error"] = stream_cleanup_error
+            fail("remote_failed", "remote request output was truncated or stream cleanup is not verified",
+                 detail, process.returncode)
+        remote_error = _parse_remote_error(stderr, request=request)
+        if remote_error is not None:
+            if op_path is not None and not _remote_error_outcome_uncertain(remote_error, action=action):
+                _finalize_local_error(op_path, request, remote_error)
+            fail(
+                str(remote_error["code"]),
+                str(remote_error["message"]),
+                remote_error.get("detail"),
+                process.returncode,
+            )
+        fail("remote_failed", "remote request failed; control outcome is not verified",
              {"operation_id": request.get("operation_id")}, process.returncode)
-    try: response = json.loads(process.stdout)
-    except (ValueError, UnicodeDecodeError): fail("invalid_remote_response", "control did not return JSON")
+    if stdout_truncated:
+        fail("invalid_remote_response", "control response exceeded the bounded stdout limit",
+             {"stdout_truncated": True, "stdout_limit_bytes": REMOTE_STDOUT_LIMIT_BYTES})
+    try: response = json.loads(stdout)
+    except (ValueError, UnicodeDecodeError):
+        detail = {"stream_cleanup_verified": stream_cleanup_verified}
+        if stream_cleanup_error is not None:
+            detail["stream_cleanup_error"] = stream_cleanup_error
+        fail("invalid_remote_response", "control did not return JSON", detail)
     if not isinstance(response, dict) or response.get("protocol") != PROTOCOL_VERSION or response.get("action") != action or response.get("session_id") != session:
         fail("protocol_mismatch", "response protocol or request identity differs")
-    if not response.get("ok") or not isinstance(response.get("result"), dict) or not isinstance(response.get("server_time"), str):
-        fail("invalid_remote_response", "invalid control response envelope")
-    if write and response.get("operation_id") != request["operation_id"]:
-        fail("protocol_mismatch", "operation identity differs")
-    warnings = _validate_response_warnings(response.get("warnings"), action)
+    if "generation" in request and not _json_value_matches(response.get("generation"), request["generation"]):
+        fail("protocol_mismatch", "response generation differs")
     compatibility = request.get("compatibility")
     if not isinstance(compatibility, dict):
         fail("protocol_mismatch", "request compatibility capability is missing")
+    warnings = _validate_response_warnings(response.get("warnings"), action)
+    legacy_outcome = compatibility.get("legacy") is True and "outcome" not in response
+    if legacy_outcome:
+        response["outcome"] = "success"
+        _append_warning(
+            warnings,
+            _client_warning(
+                "legacy_response_outcome",
+                "control response omitted outcome; accepted as legacy protocol-4 success",
+                action,
+            ),
+        )
+    elif not isinstance(response.get("outcome"), str) or response["outcome"] not in {"success", "replayed"}:
+        fail("invalid_remote_response", "control response outcome is missing or invalid")
+    if response.get("ok") is not True or not isinstance(response.get("result"), dict) or not isinstance(response.get("server_time"), str):
+        fail("invalid_remote_response", "invalid control response envelope")
+    if write and response.get("operation_id") != request["operation_id"]:
+        fail("protocol_mismatch", "operation identity differs")
     response_warning = _validate_response_compatibility(
         response.get("response"), action, compatibility.get("accepted_response")
     )

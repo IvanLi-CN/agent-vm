@@ -93,7 +93,10 @@ class ReclamationTests(Fixture):
         self.assertEqual(errors[0]["error"]["code"], "command_failed")
         record = self.store.get_task(task_id=cached["task_id"])
         self.assertEqual(record["state"], "deleting")
-        self.assertEqual(json.loads(record["last_error"])["code"], "command_failed")
+        last_error = json.loads(record["last_error"])
+        self.assertEqual(last_error["code"], "command_failed")
+        self.assertEqual(last_error["detail"]["operation_phase"], "cache-delete")
+        self.assertFalse(last_error["detail"]["outcome_verified"])
         self.assertIn(cached["instance_name"], self.runner.instances)
         self.runner.failure = None
         self.call("admin-reconcile", apply=True)

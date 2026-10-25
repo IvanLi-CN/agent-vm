@@ -7,6 +7,8 @@ import json
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -69,7 +71,9 @@ class SessionContractTests(unittest.TestCase):
         request = json.loads(run.call_args.kwargs["input"])
         self.assertEqual(request["compatibility"]["release_id"], CLI.LEGACY_RELEASE_ID)
         self.assertTrue(request["compatibility"]["legacy"])
+        self.assertEqual(result["outcome"], "success")
         self.assertTrue(any(item["code"] == "legacy_compatibility" for item in result["warnings"]))
+        self.assertTrue(any(item["code"] == "legacy_response_outcome" for item in result["warnings"]))
         self.assertTrue(any(item["code"] == "legacy_control_release" for item in result["warnings"]))
 
     def test_replay_reuses_journaled_capability_after_sidecar_change(self):
@@ -95,6 +99,7 @@ class SessionContractTests(unittest.TestCase):
             "action": "drain-enter",
             "session_id": session,
             "operation_id": operation_id,
+            "outcome": "success",
             "server_time": "2026-10-22T00:00:00+00:00",
             "result": {"draining": True},
             "release": {"release_id": "b" * 40, "source_revision": "b" * 40, "protocol": CLI.PROTOCOL_VERSION},
@@ -239,6 +244,7 @@ class SessionContractTests(unittest.TestCase):
             "protocol": CLI.PROTOCOL_VERSION,
             "action": "status",
             "session_id": "thread",
+            "outcome": "success",
             "server_time": "2026-10-22T00:00:00+00:00",
             "result": {},
             "warnings": "not-an-array",
@@ -248,12 +254,363 @@ class SessionContractTests(unittest.TestCase):
                 CLI.control_request("status", session="thread")
         self.assertEqual(failure.exception.code, "invalid_remote_response")
 
+    def test_structured_remote_failure_preserves_control_error(self):
+        error = {
+            "ok": False,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "thread",
+            "generation": 0,
+            "operation_id": "pressure",
+            "error": {
+                "code": "resource_pressure",
+                "message": "CPU scheduler pressure blocks VM startup",
+                "detail": {"projected_cpu": 18, "ct_capacity_cpu": 16},
+            },
+        }
+        stderr = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI.sys, "stderr", stderr), \
+             mock.patch.object(
+                 CLI.subprocess,
+                 "run",
+                 return_value=subprocess.CompletedProcess([], 2, b"", (json.dumps(error) + "\n").encode()),
+             ):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id="pressure")
+            self.assertEqual(failure.exception.code, "resource_pressure")
+            self.assertEqual(failure.exception.detail["projected_cpu"], 18)
+            journal = Path(directory) / "operations" / (hashlib.sha256(b"pressure").hexdigest() + ".json")
+            saved = json.loads(journal.read_text(encoding="utf-8"))
+            self.assertEqual(saved["outcome"], "error")
+            self.assertEqual(saved["error"]["code"], "resource_pressure")
+
+    def test_unknown_structured_remote_failure_keeps_journal_pending(self):
+        error = {
+            "ok": False,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "thread",
+            "generation": 0,
+            "operation_id": "unknown",
+            "error": {
+                "code": "internal_error",
+                "message": "control process failed unexpectedly",
+                "detail": {"phase": "unknown"},
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 [], 2, b"", (json.dumps(error) + "\n").encode()
+             )):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id="unknown")
+            self.assertEqual(failure.exception.code, "internal_error")
+            journal = Path(directory) / "operations" / (hashlib.sha256(b"unknown").hexdigest() + ".json")
+            self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["outcome"], "pending")
+
+    def test_unrelated_stderr_json_cannot_finalize_write_journal(self):
+        error = {
+            "ok": False,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "other-thread",
+            "generation": 0,
+            "operation_id": "other-operation",
+            "error": {"code": "resource_pressure", "message": "wrong request"},
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 [], 2, b"", (json.dumps(error) + "\n").encode()
+             )):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id="local")
+            self.assertEqual(failure.exception.code, "remote_failed")
+            journal = Path(directory) / "operations" / (hashlib.sha256(b"local").hexdigest() + ".json")
+            self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["outcome"], "pending")
+
+    def test_duplicate_matching_remote_errors_keep_journal_pending(self):
+        error = {
+            "ok": False,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "thread",
+            "generation": 0,
+            "operation_id": "duplicate",
+            "error": {"code": "resource_pressure", "message": "duplicate envelope"},
+        }
+        stderr = ((json.dumps(error) + "\n") * 2).encode()
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess([], 2, b"", stderr)):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id="duplicate")
+            self.assertEqual(failure.exception.code, "remote_failed")
+            journal = Path(directory) / "operations" / (hashlib.sha256(b"duplicate").hexdigest() + ".json")
+            self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["outcome"], "pending")
+
+    def test_remote_error_generation_type_mismatch_is_not_an_outcome(self):
+        error = {
+            "ok": False,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "thread",
+            "generation": True,
+            "operation_id": "typed",
+            "error": {"code": "resource_pressure", "message": "wrong generation type"},
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 [], 2, b"", (json.dumps(error) + "\n").encode()
+             )):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id="typed")
+            self.assertEqual(failure.exception.code, "remote_failed")
+
+    def test_oversized_remote_stderr_keeps_mutation_pending(self):
+        stderr = b"x" * (CLI.REMOTE_STDERR_LIMIT_BYTES + 1)
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess([], 255, b"", stderr)):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id="oversized")
+            self.assertEqual(failure.exception.code, "remote_failed")
+            self.assertTrue(failure.exception.detail["stderr_truncated"])
+            journal = Path(directory) / "operations" / (hashlib.sha256(b"oversized").hexdigest() + ".json")
+            self.assertEqual(json.loads(journal.read_text(encoding="utf-8"))["outcome"], "pending")
+
+    def test_oversized_remote_stdout_is_rejected_without_parsing(self):
+        response = b"{" + b"x" * CLI.REMOTE_STDOUT_LIMIT_BYTES
+        with mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, response, b"")):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("status", session="thread")
+        self.assertEqual(failure.exception.code, "invalid_remote_response")
+        self.assertTrue(failure.exception.detail["stdout_truncated"])
+
+    def test_remote_streams_are_drained_and_hard_capped(self):
+        def run(*_args, **kwargs):
+            kwargs["stdout"].write(b"x" * (CLI.REMOTE_STDOUT_LIMIT_BYTES + 1))
+            kwargs["stderr"].write(b"y" * (CLI.REMOTE_STDERR_LIMIT_BYTES + 1))
+            return subprocess.CompletedProcess([], 255, None, None)
+
+        with mock.patch.object(CLI.subprocess, "run", side_effect=run):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("status", session="thread")
+        self.assertEqual(failure.exception.code, "remote_failed")
+        self.assertTrue(failure.exception.detail["stdout_truncated"])
+        self.assertTrue(failure.exception.detail["stderr_truncated"])
+
+    def test_normal_completion_bounds_inherited_stream_reader_cleanup(self):
+        response = {
+            "ok": True,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "status",
+            "session_id": "thread",
+            "outcome": "success",
+            "server_time": "2026-10-22T00:00:00+00:00",
+            "result": {},
+        }
+        release_readers = threading.Event()
+
+        def run(*_args, **kwargs):
+            kwargs["stdout"].write(json.dumps(response).encode())
+            return subprocess.CompletedProcess([], 0, None, None)
+
+        def block_reader(*_args):
+            release_readers.wait(10)
+
+        try:
+            with mock.patch.object(CLI, "control_timeout", return_value=0.1), \
+                 mock.patch.object(CLI, "_drain_bounded_stream", side_effect=block_reader), \
+                 mock.patch.object(CLI.subprocess, "run", side_effect=run):
+                started = time.monotonic()
+                with self.assertRaises(CLI.CliError) as failure:
+                    CLI.control_request("status", session="thread")
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.0)
+            self.assertEqual(failure.exception.code, "remote_failed")
+            self.assertFalse(failure.exception.detail["stream_cleanup_verified"])
+            self.assertEqual(failure.exception.detail["stream_cleanup_error"], "reader_join_timeout")
+        finally:
+            release_readers.set()
+
+    def test_remote_timeout_bounds_stream_reader_cleanup(self):
+        with mock.patch.object(
+            CLI.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(["ssh"], 1),
+        ):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("status", session="thread")
+        self.assertEqual(failure.exception.code, "remote_timeout")
+        self.assertIn(failure.exception.detail["stream_cleanup_verified"], (True, False))
+        if not failure.exception.detail["stream_cleanup_verified"]:
+            self.assertIn(
+                failure.exception.detail.get("stream_cleanup_error"),
+                {"reader_cancelled_before_eof", "reader_join_timeout"},
+            )
+
+    def test_remote_error_classification_rejects_unhashable_detail_values(self):
+        self.assertTrue(CLI._remote_error_outcome_uncertain(
+            {"code": "command_failed", "detail": {"phase": []}}, action="status"
+        ))
+        self.assertTrue(CLI._remote_error_outcome_uncertain(
+            {"code": "command_failed", "detail": {"operation_phase": {}}}, action="status"
+        ))
+
+    def test_remote_response_rejects_unhashable_outcome(self):
+        for outcome in ([], {}):
+            with self.subTest(outcome=outcome):
+                response = {
+                    "ok": True,
+                    "protocol": CLI.PROTOCOL_VERSION,
+                    "action": "status",
+                    "session_id": "thread",
+                    "outcome": outcome,
+                    "server_time": "2026-10-22T00:00:00+00:00",
+                    "result": {},
+                }
+                with mock.patch.object(
+                    CLI.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(
+                        [], 0, (json.dumps(response) + "\n").encode(), b""
+                    ),
+                ):
+                    with self.assertRaises(CLI.CliError) as failure:
+                        CLI.control_request("status", session="thread")
+                self.assertEqual(failure.exception.code, "invalid_remote_response")
+
+    def test_pre_native_errors_are_deterministic_but_port_add_generation_is_uncertain(self):
+        for code in (
+            "resource_unverified",
+            "capacity_insufficient",
+            "lease_window_short",
+            "artifact_checksum_mismatch",
+            "manifest_invalid",
+            "request_schema_incompatible",
+            "response_semantic_incompatible",
+        ):
+            with self.subTest(code=code):
+                self.assertFalse(CLI._remote_error_outcome_uncertain({"code": code}, action="acquire"))
+        self.assertTrue(CLI._remote_error_outcome_uncertain({"code": "generation_mismatch"}, action="port-add"))
+        self.assertFalse(CLI._remote_error_outcome_uncertain(
+            {"code": "generation_mismatch", "detail": {"outcome_verified": True}}, action="port-add"
+        ))
+        self.assertTrue(CLI._remote_error_outcome_uncertain(
+            {"code": "generation_mismatch", "detail": {"operation_phase": "port-add"}},
+            action="port-add",
+        ))
+        self.assertTrue(CLI._remote_error_outcome_uncertain(
+            {"code": "command_failed", "detail": {"operation_phase": "cache-delete"}},
+            action="admin-gc",
+        ))
+        self.assertTrue(CLI._remote_error_outcome_uncertain(
+            {"code": "image_unavailable", "detail": {"outcome_verified": False}}, action="acquire"
+        ))
+        self.assertFalse(CLI._remote_error_outcome_uncertain(
+            {"code": "image_unavailable", "detail": {"outcome_verified": True}}, action="acquire"
+        ))
+        self.assertFalse(CLI._remote_error_outcome_uncertain(
+            {"code": "acquire_partial", "detail": {"phase": "guest-readiness", "outcome_verified": True}},
+            action="acquire",
+        ))
+
+    def test_preflight_failure_finalizes_write_journal(self):
+        error = {
+            "ok": False,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "thread",
+            "generation": 0,
+            "operation_id": "preflight",
+            "error": {
+                "code": "request_schema_incompatible",
+                "message": "request schema is outside the control compatibility window",
+            },
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 [], 2, b"", (json.dumps(error) + "\n").encode()
+             )):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id="preflight")
+            journal = Path(directory) / "operations" / (hashlib.sha256(b"preflight").hexdigest() + ".json")
+            saved = json.loads(journal.read_text(encoding="utf-8"))
+        self.assertEqual(failure.exception.code, "request_schema_incompatible")
+        self.assertEqual(saved["outcome"], "error")
+        self.assertEqual(saved["error"]["code"], "request_schema_incompatible")
+
+    def test_existing_operation_journal_replays_after_exclusive_create_race(self):
+        operation_id = "exclusive-race"
+        metadata = {
+            "manifest_present": False,
+            "actions": {},
+        }
+        request = {
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "thread",
+            "generation": 0,
+            "operation_id": operation_id,
+            "compatibility": CLI.client_capability("acquire", metadata),
+        }
+        response = {
+            "ok": True,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "acquire",
+            "session_id": "thread",
+            "generation": 0,
+            "operation_id": operation_id,
+            "outcome": "success",
+            "server_time": "2026-10-22T00:00:00+00:00",
+            "result": {},
+        }
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(CLI, "local_session_dir", return_value=Path(directory)), \
+             mock.patch.object(CLI, "load_client_release_metadata", return_value=(metadata, [])), \
+             mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 [], 0, (json.dumps(response) + "\n").encode(), b""
+             )):
+            operations = Path(directory) / "operations"
+            operations.mkdir()
+            journal = operations / (hashlib.sha256(operation_id.encode()).hexdigest() + ".json")
+            journal.write_text(json.dumps({"request": request, "outcome": "pending"}), encoding="utf-8")
+            result = CLI.control_request("acquire", session="thread", generation=0, write=True, operation_id=operation_id)
+            saved = json.loads(journal.read_text(encoding="utf-8"))
+        self.assertEqual(result["outcome"], "success")
+        self.assertEqual(saved["outcome"], "success")
+
+    def test_success_response_must_match_request_generation(self):
+        response = {
+            "ok": True,
+            "protocol": CLI.PROTOCOL_VERSION,
+            "action": "status",
+            "session_id": "thread",
+            "outcome": "success",
+            "generation": 1,
+            "server_time": "2026-10-22T00:00:00+00:00",
+            "result": {},
+        }
+        with mock.patch.object(CLI.subprocess, "run", return_value=subprocess.CompletedProcess(
+            [], 0, json.dumps(response).encode(), b""
+        )):
+            with self.assertRaises(CLI.CliError) as failure:
+                CLI.control_request("status", session="thread", generation=0)
+        self.assertEqual(failure.exception.code, "protocol_mismatch")
+
     def test_incompatible_remote_response_is_rejected_before_return(self):
         response = {
             "ok": True,
             "protocol": CLI.PROTOCOL_VERSION,
             "action": "status",
             "session_id": "thread",
+            "outcome": "success",
             "server_time": "2026-10-22T00:00:00+00:00",
             "result": {},
             "response": {"schema": 2, "semantic_revision": 1},
