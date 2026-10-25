@@ -19,6 +19,9 @@ AGENT_SKILL = ROOT / "skills/agent-vm/SKILL.md"
 DEPLOYMENT = ROOT / "skills/agent-vm-ops/references/deployment.md"
 OBSERVABILITY = ROOT / "docs/specs/agent-vm/contracts/observability.md"
 OBSERVABILITY_SOLUTION = ROOT / "docs/solutions/agent-vm/observability-dashboard.md"
+CPU_PRESSURE_ADR = ROOT / "docs/adr/0032-agent-vm-cpu-startup-pressure-for-overcommit.md"
+OBSERVABILITY_ADR = ROOT / "docs/adr/0033-agent-vm-capacity-and-inventory-observability.md"
+SUPERSEDED_CPU_ADR = ROOT / "docs/adr/0031-agent-vm-cpu-startup-pressure-boundary.md"
 
 
 def check_spec(path: Path, root: Path) -> list[str]:
@@ -182,6 +185,30 @@ class AgentVmDocumentationTests(unittest.TestCase):
         self.assertIn("64 GiB", solution)
         self.assertIn("2x", solution)
         self.assertIn("observability contract", solution)
+
+    def test_cpu_policy_and_split_observability_contract_are_traceable(self) -> None:
+        spec = SPEC.read_text(encoding="utf-8")
+        operations = RUNBOOK.read_text(encoding="utf-8")
+        cli_contract = CLI_CONTRACT.read_text(encoding="utf-8")
+        contract = OBSERVABILITY.read_text(encoding="utf-8")
+        cpu_adr = CPU_PRESSURE_ADR.read_text(encoding="utf-8")
+        observability_adr = OBSERVABILITY_ADR.read_text(encoding="utf-8")
+        superseded_cpu_adr = SUPERSEDED_CPU_ADR.read_text(encoding="utf-8")
+        for document in (spec, operations, cli_contract, contract, cpu_adr):
+            self.assertIn("50", document)
+        for phrase in (
+            "Agent VM / Capacity & Admission",
+            "Agent VM / Inventory & Operations",
+            "admin-metrics",
+            "admin-status",
+            "agent_vm_admission_default_vm_logical_slots",
+            "agent_vm_admission_default_vm_startable_slots",
+            "agent_vm_task_info",
+            "snapshot estimate",
+        ):
+            self.assertIn(phrase, contract + observability_adr)
+        self.assertIn("status: superseded", superseded_cpu_adr)
+        self.assertIn("superseded_by: 0032-agent-vm-cpu-startup-pressure-for-overcommit.md", superseded_cpu_adr)
 
 
 if __name__ == "__main__":

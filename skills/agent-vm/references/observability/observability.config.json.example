@@ -1,11 +1,14 @@
 {
   "dashboard_uid": "${AGENT_VM_DASHBOARD_UID}",
-  "dashboard_title": "Agent VM / Incus",
+  "dashboard_title": "Agent VM / Capacity & Admission",
+  "inventory_dashboard_uid": "${AGENT_VM_INVENTORY_DASHBOARD_UID}",
+  "inventory_dashboard_title": "Agent VM / Inventory & Operations",
   "grafana_org_id": 1,
   "provider_name": "agent-vm-observability",
   "dashboard_folder": "${GRAFANA_DASHBOARD_FOLDER}",
   "prometheus_datasource_uid": "${PROMETHEUS_DATASOURCE_UID}",
   "controller_job": "${AGENT_VM_CONTROLLER_JOB}",
   "dashboard_path": "${GRAFANA_DASHBOARD_PATH}",
-  "dashboard_filename": "agent-vm-observability.json"
+  "dashboard_filename": "agent-vm-observability.json",
+  "inventory_dashboard_filename": "agent-vm-observability-inventory.json"
 }

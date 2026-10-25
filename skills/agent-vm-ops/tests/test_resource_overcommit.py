@@ -15,6 +15,23 @@ from test_native_agent_vm import CONTROL, CLI, Fixture, GIB, KEY
 
 
 class SQLiteStateTests(unittest.TestCase):
+    def test_state_epoch_does_not_advance_for_a_successful_noop_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = CONTROL.StateStore(Path(directory) / "state.sqlite3")
+            try:
+                before = store.get_meta("state_epoch")
+                with store.transaction():
+                    pass
+                self.assertEqual(store.get_meta("state_epoch"), before)
+                with store.transaction():
+                    store.set_meta("epoch-marker", "changed")
+                changed = store.get_meta("state_epoch")
+                self.assertNotEqual(changed, before)
+                store.set_meta("epoch-marker", "changed")
+                self.assertEqual(store.get_meta("state_epoch"), changed)
+            finally:
+                store.close()
+
     def test_corrupt_database_initialization_is_structured(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.sqlite3"
@@ -493,11 +510,12 @@ class AdmissionTests(Fixture):
         result = self.call("admin-metrics")
         self.assertEqual(CONTROL.parse_time(result["observed_at"]), self.now)
         self.assertTrue({
-            "observed_at", "up", "draining", "admission_ready", "reclaim_required", "resources",
-            "capacity", "disk_admission", "ct_cpu", "ct_memory", "instances", "task_states", "operations",
+            "observation_epoch", "observed_at", "up", "draining", "admission_ready", "reclaim_required", "resources",
+            "capacity", "disk_admission", "default_admission", "ct_cpu", "ct_memory", "instances", "task_states", "operations",
             "pending_operations", "image_unpack_failures", "warnings", "warning_counts", "doctor",
         }.issubset(result))
         self.assertTrue(result["up"])
+        self.assertTrue(result["observation_epoch"])
         self.assertTrue(result["admission_ready"])
         self.assertTrue(result["ct_memory"]["pressure"])
         self.assertEqual(result["ct_memory"]["capacity_bytes"], 32 * GIB)
@@ -512,12 +530,116 @@ class AdmissionTests(Fixture):
         self.assertEqual(result["resources"]["allocated_and_reserved"]["memory_mib"], 4096)
         self.assertEqual(result["resources"]["limits"]["memory_mib"], 65536)
         self.assertEqual(result["resources"]["remaining"]["memory_mib"], 61440)
+        self.assertEqual(result["default_admission"]["requested"], {"cpu": 2, "memory_mib": 4096, "disk_gib": 20})
+        self.assertIn("request_cost_bytes", result["default_admission"])
+        self.assertIn("reasons", result["default_admission"])
         self.assertIn("layers", result["capacity"])
         self.assertTrue(result["disk_admission"]["verified"])
         self.assertIn("physical_admission", result["disk_admission"])
         self.assertIn("admission", result["instances"])
         self.assertEqual(result["task_states"]["active"], 1)
         self.assertEqual(self.store.list_tasks(), before)
+
+    def test_admin_metrics_reports_native_probe_failure_as_down(self):
+        def fail_version_probe():
+            raise CONTROL.ControlError("command_failed", "incus is unavailable")
+
+        self.runner.on_version = fail_version_probe
+        result = self.call("admin-metrics")
+
+        self.assertFalse(result["up"])
+        self.assertFalse(result["doctor"]["ready"])
+        self.assertIn("command_failed", result["doctor"]["issues"])
+
+    def test_admin_metrics_timestamp_is_start_of_final_probe_window(self):
+        started_at = self.now
+        original_doctor = self.control.doctor
+
+        def slow_doctor(request, session_id):
+            self.now += dt.timedelta(seconds=30)
+            return original_doctor(request, session_id)
+
+        with mock.patch.object(self.control, "doctor", side_effect=slow_doctor):
+            result = self.call("admin-metrics")
+
+        self.assertEqual(CONTROL.parse_time(result["observed_at"]), started_at)
+        self.assertEqual(self.now, started_at + dt.timedelta(seconds=30))
+
+    def test_admin_metrics_does_not_hold_store_lock_during_native_probe(self):
+        probe_started = threading.Event()
+        probe_release = threading.Event()
+        result_holder = {}
+        error_holder = []
+        original_doctor = self.control.doctor
+
+        def slow_doctor(request, session_id):
+            probe_started.set()
+            if not probe_release.wait(timeout=2):
+                raise AssertionError("test probe release timed out")
+            return original_doctor(request, session_id)
+
+        def run_metrics():
+            try:
+                result_holder["value"] = self.call("admin-metrics")
+            except BaseException as error:
+                error_holder.append(error)
+
+        with mock.patch.object(self.control, "doctor", side_effect=slow_doctor):
+            thread = threading.Thread(target=run_metrics)
+            thread.start()
+            self.assertTrue(probe_started.wait(timeout=2))
+            acquired = self.store._lock.acquire(blocking=False)
+            if acquired:
+                self.store._lock.release()
+            probe_release.set()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertFalse(error_holder)
+        self.assertTrue(acquired)
+        self.assertTrue(result_holder["value"]["observation_consistent"])
+
+    def test_admin_metrics_retries_when_durable_state_changes_during_probe(self):
+        calls = 0
+        original_doctor = self.control.doctor
+
+        def doctor_with_state_change(request, session_id):
+            nonlocal calls
+            calls += 1
+            result = original_doctor(request, session_id)
+            if calls == 1:
+                self.store.set_meta("test-observation-marker", "changed")
+            return result
+
+        with mock.patch.object(self.control, "doctor", side_effect=doctor_with_state_change):
+            result = self.call("admin-metrics")
+
+        self.assertEqual(calls, 2)
+        self.assertTrue(result["observation_consistent"])
+        self.assertEqual(result["observation_attempts"], 2)
+
+    def test_admin_metrics_disk_fallback_uses_the_final_state_snapshot(self):
+        original_doctor = self.control.doctor
+        original_disk_diagnostics = self.control._disk_admission_diagnostics
+        fallback_tasks = []
+
+        def doctor_without_embedded_disk(request, session_id):
+            result = original_doctor(request, session_id)
+            result["resources"] = dict(result["resources"])
+            result["resources"]["disk_admission"] = None
+            return result
+
+        def disk_diagnostics(capacity, *, tasks=None):
+            fallback_tasks.append(tasks)
+            return original_disk_diagnostics(capacity, tasks=tasks)
+
+        with mock.patch.object(self.control, "doctor", side_effect=doctor_without_embedded_disk), \
+             mock.patch.object(self.control, "_disk_admission_diagnostics", side_effect=disk_diagnostics):
+            result = self.call("admin-metrics")
+
+        self.assertTrue(result["observation_consistent"])
+        self.assertGreaterEqual(len(fallback_tasks), 1)
+        self.assertIsNotNone(fallback_tasks[-1])
 
     def test_admin_metrics_reports_pending_operation_journals(self):
         request = self.request("acquire", operation="metrics-pending", public_key=KEY)
@@ -804,6 +926,38 @@ class AdmissionTests(Fixture):
 
         self.runner.on_version = probe_lock
         self.control.admin_status(self.request("admin-status"), None)
+
+    def test_admin_status_redacts_raw_task_error_details(self):
+        active = self.acquire()
+        self.store.update_task(
+            active["task_id"],
+            last_error=json.dumps({
+                "code": "command_failed",
+                "phase": "guest-exec",
+                "message": "private command output",
+                "detail": {"stderr": "private stderr", "operation_phase": "guest-exec"},
+            }),
+        )
+
+        result = self.control.admin_status(self.request("admin-status"), None)
+        task = next(item for item in result["tasks"] if item["task_id"] == active["task_id"])
+        self.assertEqual(task["last_error"], {"code": "command_failed", "phase": "guest-exec"})
+        self.assertNotIn("message", task["last_error"])
+        self.assertNotIn("detail", task["last_error"])
+
+    def test_admin_status_redacts_guest_error_details(self):
+        active = self.acquire()
+        failure = CONTROL.ControlError(
+            "guest_probe_failed",
+            "private guest probe output",
+            {"phase": "guest-exec", "stderr": "private stderr", "message": "private message"},
+        )
+        with mock.patch.object(self.control.incus, "instance_info", side_effect=failure):
+            result = self.control.admin_status(self.request("admin-status"), None)
+        task = next(item for item in result["tasks"] if item["task_id"] == active["task_id"])
+        self.assertEqual(task["guest_error"], {"code": "guest_probe_failed", "phase": "guest-exec"})
+        self.assertNotIn("stderr", task["guest_error"])
+        self.assertNotIn("message", task["guest_error"])
 
     def test_drain_exit_keeps_admission_closed_with_pending_operation(self):
         self.store.set_meta("draining", "1")

@@ -691,7 +691,11 @@ class ReleasePublisher:
     def _healthy(metrics: Mapping[str, Any], doctor: Mapping[str, Any]) -> bool:
         if not isinstance(metrics, Mapping) or not isinstance(doctor, Mapping):
             return False
-        if metrics.get("up") is not True or metrics.get("draining") is not True:
+        if (
+            metrics.get("up") is not True
+            or metrics.get("draining") is not True
+            or metrics.get("observation_consistent") is not True
+        ):
             return False
         pending = metrics.get("pending_operations")
         task_states = metrics.get("task_states")
@@ -738,6 +742,16 @@ class ReleasePublisher:
             states = last.get("task_states")
             if last.get("draining") is not True:
                 _fail("drain_unverified", "admission drain was not confirmed during convergence", {"draining": last.get("draining")})
+            if last.get("observation_consistent") is not True:
+                _fail(
+                    "observation_unverified",
+                    "control returned an inconsistent metrics snapshot during convergence",
+                    {
+                        "observation_consistent": last.get("observation_consistent"),
+                        "observation_attempts": last.get("observation_attempts"),
+                        "observation_epoch": last.get("observation_epoch"),
+                    },
+                )
             if isinstance(states, Mapping) and any(state not in KNOWN_TASK_STATES for state in states):
                 _fail("state_unverified", "control returned an unknown task state during convergence", {"task_states": states})
             converged = False
@@ -964,6 +978,7 @@ class ReleasePublisher:
         try:
             self._health(manifest)
         except ReleaseError as health_error:
+            rollback_manifest = legacy_manifest()
             try:
                 rollback_result = self._wrapper("rollback", transaction, manifest["release_id"])
                 self._verify_automatic_rollback(transaction, manifest["release_id"], rollback_result)
@@ -971,14 +986,14 @@ class ReleasePublisher:
                 # retained previous release.  Validate that peer through the
                 # explicit protocol-4 legacy contract, not the failed bundle's
                 # release-specific action window.
-                self._health(legacy_manifest())
+                self._health(rollback_manifest)
             except ReleaseError as rollback_error:
                 raise ReleaseError("rollback_failed", "remote health failed and the single rollback did not restore verified health", {
                     "health_error": health_error.as_dict(),
                     "rollback_error": rollback_error.as_dict(),
                     "draining": True,
                 }) from rollback_error
-            self._control(manifest, "drain-exit", session=session, write=True)
+            self._control(rollback_manifest, "drain-exit", session=session, write=True)
             return {
                 "published": False,
                 "rolled_back": True,

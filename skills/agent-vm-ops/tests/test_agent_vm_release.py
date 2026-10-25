@@ -20,17 +20,20 @@ import agent_vm_release as RELEASE  # noqa: E402
 
 class FakeTransport:
     def __init__(self, *, fail_health_once=False, pending=False, drain_enter=True, unknown_state=False,
-                 malformed_health=False, malformed_reconcile=False, malformed_rollback=False,
-                 fail_activation=False):
+                 observation_consistent=True, malformed_health=False, malformed_reconcile=False, malformed_rollback=False,
+                 fail_activation=False, require_legacy_drain_exit=False):
         self.calls = []
         self.fail_health_once = fail_health_once
         self.pending = pending
         self.drain_enter = drain_enter
         self.unknown_state = unknown_state
+        self.observation_consistent = observation_consistent
         self.malformed_health = malformed_health
         self.malformed_reconcile = malformed_reconcile
         self.malformed_rollback = malformed_rollback
         self.fail_activation = fail_activation
+        self.require_legacy_drain_exit = require_legacy_drain_exit
+        self.control_release_ids = []
         self.health_checks = 0
 
     def wrapper(self, host, wrapper_path, action, transaction_id, release_id, payload=None):
@@ -57,10 +60,15 @@ class FakeTransport:
     def control(self, host, remote_control, request):
         self.calls.append(("control", request["action"], request.get("operation_id")))
         action = request["action"]
+        compatibility = request.get("compatibility", {})
+        self.control_release_ids.append((action, compatibility.get("release_id")))
+        if action == "drain-exit" and self.require_legacy_drain_exit and compatibility.get("release_id") != "0" * 40:
+            return {"ok": False, "error": {"code": "compatibility_rejected", "message": "legacy manifest required"}}
         if action == "admin-metrics":
             result = {
                 "up": True,
                 "draining": True,
+                "observation_consistent": self.observation_consistent,
                 "pending_operations": [{"operation_id": "pending"}] if self.pending else [],
                 "task_states": {"unknown": 1} if self.unknown_state else {"active": 1},
             }
@@ -174,6 +182,15 @@ class ReleasePublisherTests(unittest.TestCase):
             publisher._health(manifest)
         self.assertEqual(failure.exception.code, "remote_health_failed")
 
+    def test_health_rejects_inconsistent_metrics_snapshot(self):
+        transport = FakeTransport(observation_consistent=False)
+        publisher = self.publisher(transport)
+        temporary, _, manifest = RELEASE._open_bundle(self.bundle)
+        temporary.cleanup()
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            publisher._health(manifest)
+        self.assertEqual(failure.exception.code, "remote_health_failed")
+
     def test_health_rejects_malformed_reconcile_result(self):
         transport = FakeTransport(malformed_reconcile=True)
         publisher = self.publisher(transport)
@@ -216,8 +233,15 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "state_unverified")
         self.assertNotIn("activate", [item[1] for item in transport.calls])
 
+    def test_convergence_rejects_inconsistent_metrics_snapshot(self):
+        transport = FakeTransport(observation_consistent=False)
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            self.publisher(transport).publish(timeout=5, poll=1, transaction_id="tx-inconsistent")
+        self.assertEqual(failure.exception.code, "observation_unverified")
+        self.assertNotIn("activate", [item[1] for item in transport.calls])
+
     def test_post_activation_health_failure_attempts_one_rollback(self):
-        transport = FakeTransport(fail_health_once=True)
+        transport = FakeTransport(fail_health_once=True, require_legacy_drain_exit=True)
         target = self.root / "client" / "agent_vm.py"
         result = self.publisher(transport, client_target=target).publish(timeout=5, poll=1, transaction_id="tx-rollback")
         self.assertTrue(result["rolled_back"])
@@ -225,6 +249,7 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertIn("rollback", actions)
         self.assertIn("status", actions)
         self.assertEqual(actions[-1], "drain-exit")
+        self.assertEqual(transport.control_release_ids[-1], ("drain-exit", "0" * 40))
 
     def test_post_activation_health_failure_rejects_unverified_rollback(self):
         transport = FakeTransport(fail_health_once=True, malformed_rollback=True)
