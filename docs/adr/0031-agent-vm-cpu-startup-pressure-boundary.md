@@ -1,6 +1,7 @@
 ---
-status: accepted
+status: superseded
 supersedes: 0026-agent-vm-cpu-memory-overselling.md (CPU startup scheduling boundary only)
+superseded_by: 0032-agent-vm-cpu-startup-pressure-for-overcommit.md
 ---
 
 # Agent VM CPU startup pressure boundary
@@ -13,7 +14,7 @@ Logical CPU overcommit answers whether a request fits the configured reservation
 
 The controller observes CT-local CPU PSI separately from logical CPU allocation. It accepts the signal only after verifying the cgroup v2 mount root, the single unified `/proc/self/cgroup` entry, and `cpu.pressure` beneath that current cgroup path. Before `acquire`, cached resume, restart-capable resize, or explicit restart changes native boot state, it compares projected CPU allocation with CT-visible CPU capacity. When projected allocation is above that capacity and `full.avg10` is at least `cpu_startup_pressure_full_avg10_percent`, the operation fails before native start with `resource_pressure` and includes the threshold, observed PSI, projected CPU, and CT capacity. A missing, malformed, contradictory, or non-CT-local PSI observation fails startup admission with `resource_unverified`.
 
-The default startup-pressure threshold is 20 percent and is configurable in the deployment configuration. This is a schedulability guard, not a CPU allocation ceiling. It does not change logical remaining CPU, stop an effective lease, or block read, renewal, retrieval, release, or live memory-only resize. Restart checks occur before the existing guest is stopped. Missing or malformed PSI is reported as an observation failure and is never coerced to zero.
+The former default startup-pressure threshold was 20 percent and was configurable in the deployment configuration. This is a schedulability guard, not a CPU allocation ceiling. It does not change logical remaining CPU, stop an effective lease, or block read, renewal, retrieval, release, or live memory-only resize. Restart checks occur before the existing guest is stopped. Missing or malformed PSI is reported as an observation failure and is never coerced to zero. The approved overcommit deployment policy supersedes this threshold choice; see [the successor ADR](0032-agent-vm-cpu-startup-pressure-for-overcommit.md).
 
 ## Consequences
 
