@@ -229,40 +229,23 @@ test.skipIf(!LINUX)("an independent expiry closes access while another real cont
   }
 }, 20000);
 
-test("current Python client transports protocol requests to an actual Bun controller", async () => {
+test("Bun client transports protocol requests to an actual Bun controller", async () => {
   const f = new Fixture();
   const script = worker(f);
-  const python = join(f.root, "transport.py");
-  const client = new URL("../../agent-vm/scripts/agent_vm.py", import.meta.url).pathname;
-  writeFileSync(python, `
-import importlib.util, json, os, shlex, subprocess, sys
-from pathlib import Path
-from unittest import mock
-spec=importlib.util.spec_from_file_location("client",sys.argv[1]); client=importlib.util.module_from_spec(spec); spec.loader.exec_module(client)
-native_run=subprocess.run
-def transport(argv, **kwargs):
-    assert argv[0]=="ssh"
-    assert shlex.split(argv[-1])==["bun","/opt/agent-vm-native/agent_vm_control.ts"]
-    assert kwargs["timeout"]==240
-    return native_run(sys.argv[2:], **kwargs)
-with mock.patch.object(client,"DEFAULT_RELEASE_MANIFEST",Path(sys.argv[3]).parent/"absent.json"), mock.patch.object(client.subprocess,"run",side_effect=transport):
-    response=client.control_request("status",session="transport-smoke")
-assert response["ok"] and response["result"]["state"]=="absent",response
-try:
-    with mock.patch.object(client.subprocess,"run",side_effect=transport):
-        client.control_request("unknown",session="transport-smoke")
-except client.CliError as error:
-    assert error.code=="unknown_action",error.code
-else:
-    raise AssertionError("controller error was not propagated")
-print("python-to-bun transport: success + structured error")
-`);
-  try {
-    const child = Bun.spawn(["python3", python, client, process.execPath, script, join(f.root, "config.json")], {
-      stdout: "pipe", stderr: "pipe", env: { ...process.env, NOW: f.now.toISOString() },
+  const { Client } = await import("../../agent-vm/scripts/client.ts");
+  const { runBounded } = await import("../../agent-vm/scripts/client-io.ts");
+  const client = new Client({ ...process.env, AGENT_VM_RELEASE_MANIFEST: join(f.root, "absent.json") }, async (argv, options) => {
+    expect(argv[0]).toBe("ssh");
+    expect(argv.at(-1)).toBe("bun /opt/agent-vm-native/agent_vm_control.ts");
+    expect(options?.timeoutMs).toBe(240000);
+    return runBounded([process.execPath, script, join(f.root, "config.json")], {
+      ...options, env: { ...process.env, NOW: f.now.toISOString() },
     });
-    const [stdout, stderr, status] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
-    expect(status, stderr).toBe(0);
-    expect(stdout).toContain("python-to-bun transport: success + structured error");
+  }, () => {});
+  try {
+    const response = await client.request("status", { session: "transport-smoke" });
+    expect(response.ok).toBe(true);
+    expect(response.result.state).toBe("absent");
+    await expect(client.request("unknown", { session: "transport-smoke" })).rejects.toMatchObject({ code: "unknown_action" });
   } finally { f.close(); }
 });

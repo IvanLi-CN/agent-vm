@@ -147,7 +147,7 @@ class WrapperTests(unittest.TestCase):
     def test_manifest_failure_removes_temporary_staging(self):
         output = io.BytesIO()
         with tarfile.open(fileobj=output, mode="w") as archive:
-            member = tarfile.TarInfo("agent_vm.py")
+            member = tarfile.TarInfo("agent_vm.ts")
             member.mode = 0o755
             member.size = 7
             archive.addfile(member, io.BytesIO(b"client\n"))
@@ -217,47 +217,57 @@ class WrapperTests(unittest.TestCase):
         self.assertTrue(activated["activated"])
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, "b" * 40)
         self.assertTrue(Path(self.loaded["control_path"]).is_file())
-        self.assertTrue(Path(self.loaded["control_path"]).with_name("agent_vm.py").is_file())
+        self.assertTrue(Path(self.loaded["control_path"]).with_name("agent_vm.ts").is_file())
         self.assertTrue(Path(self.loaded["control_path"]).with_name("release_manifest.py").is_file())
         self.assertTrue(Path(self.loaded["control_path"]).with_name("release-manifest.json").is_file())
         self.assertTrue(Path(self.loaded["control_path"]).with_name("client-release.json").is_file())
         for name in WRAPPER.SUPPORT_ARTIFACT_NAMES:
             with self.subTest(support=name):
                 installed = Path(self.loaded["control_path"]).with_name(name)
-                self.assertEqual(installed.read_bytes(), (SCRIPTS / name).read_bytes())
-                self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o644)
+                source_scripts = ROOT / "skills/agent-vm/scripts" if name in WRAPPER.CLIENT_PACKAGE_MODES else SCRIPTS
+                self.assertEqual(installed.read_bytes(), (source_scripts / name).read_bytes())
+                self.assertEqual(stat.S_IMODE(installed.stat().st_mode), WRAPPER.SUPPORT_ARTIFACT_MODES[name])
                 self.assertEqual(installed.stat().st_uid, os.getuid())
                 self.assertIn(installed, WRAPPER._activation_targets(self.loaded))
         self.assertEqual(run.call_args.args[0], ["systemctl", "daemon-reload"])
         self.assertFalse(any("stop" in arg or "disable" in arg for arg in run.call_args.args[0]))
 
-    def test_activation_retires_only_the_exact_replaced_controller(self):
+    def test_activation_retires_only_the_exact_replaced_python_entrypoints(self):
         installed = Path(self.loaded["control_path"]).parent
         installed.mkdir(parents=True)
         retired = installed / WRAPPER.RETIRED_CONTROL_NAME
         retired.write_bytes(b"old controller\n")
         retired.chmod(0o755)
+        retired_client = installed / WRAPPER.RETIRED_CLIENT_NAME
+        retired_client.write_bytes(b"old client\n")
+        retired_client.chmod(0o755)
         unrelated = installed / "operator-owned.py"
         unrelated.write_bytes(b"untouched\n")
         WRAPPER.stage(self.loaded, "tx-retire", "b" * 40, self.payload)
         with mock.patch.object(WRAPPER, "_daemon_reload"):
             WRAPPER.activate(self.loaded, "tx-retire", "b" * 40)
         self.assertFalse(retired.exists())
+        self.assertFalse(retired_client.exists())
         self.assertEqual(unrelated.read_bytes(), b"untouched\n")
         self.assertTrue(Path(self.loaded["control_path"]).exists())
 
-    def test_failed_activation_restores_retired_controller_bytes_and_mode(self):
+    def test_failed_activation_restores_retired_entrypoint_bytes_and_mode(self):
         installed = Path(self.loaded["control_path"]).parent
         installed.mkdir(parents=True)
         retired = installed / WRAPPER.RETIRED_CONTROL_NAME
         retired.write_bytes(b"old controller\n")
         retired.chmod(0o755)
+        retired_client = installed / WRAPPER.RETIRED_CLIENT_NAME
+        retired_client.write_bytes(b"old client\n")
+        retired_client.chmod(0o755)
         WRAPPER.stage(self.loaded, "tx-retire-fail", "b" * 40, self.payload)
         with mock.patch.object(WRAPPER, "_daemon_reload", side_effect=WRAPPER.WrapperError("injected", "reload failed")):
             with self.assertRaises(WRAPPER.WrapperError):
                 WRAPPER.activate(self.loaded, "tx-retire-fail", "b" * 40)
         self.assertEqual(retired.read_bytes(), b"old controller\n")
         self.assertEqual(stat.S_IMODE(retired.stat().st_mode), 0o755)
+        self.assertEqual(retired_client.read_bytes(), b"old client\n")
+        self.assertEqual(stat.S_IMODE(retired_client.stat().st_mode), 0o755)
         self.assertFalse(Path(self.loaded["control_path"]).exists())
 
     def test_activation_failure_restores_fixed_targets_and_pointers(self):
@@ -273,10 +283,27 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "activation_failed")
         self.assertFalse(Path(self.loaded["current_link"]).exists())
         self.assertFalse(Path(self.loaded["control_path"]).exists())
-        self.assertFalse(Path(self.loaded["control_path"]).with_name("agent_vm.py").exists())
+        self.assertFalse(Path(self.loaded["control_path"]).with_name("agent_vm.ts").exists())
         self.assertFalse(Path(self.loaded["control_path"]).with_name("client-release.json").exists())
         for name in WRAPPER.SUPPORT_ARTIFACT_NAMES:
             self.assertFalse(Path(self.loaded["control_path"]).with_name(name).exists())
+
+    def test_package_install_and_restore_do_not_touch_unowned_temporary_symlinks(self):
+        source = self.root / "source.ts"
+        source.write_bytes(b"new")
+        target = self.root / "client.ts"
+        adjacent = self.root / "operator-file"
+        adjacent.write_bytes(b"keep")
+        for suffix in ("release-tmp", "restore-tmp"):
+            (self.root / (".client.ts." + suffix)).symlink_to(adjacent)
+        WRAPPER._copy_atomic(source, target, os.getuid(), 0o644)
+        self.assertEqual(target.read_bytes(), b"new")
+        WRAPPER._restore_targets({target: (b"old", 0o600, os.getuid())})
+        self.assertEqual(target.read_bytes(), b"old")
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertEqual(adjacent.read_bytes(), b"keep")
+        for suffix in ("release-tmp", "restore-tmp"):
+            self.assertTrue((self.root / (".client.ts." + suffix)).is_symlink())
 
     def test_activation_failure_restores_existing_support_bytes_modes_and_owners(self):
         installed = Path(self.loaded["control_path"]).parent
@@ -336,6 +363,12 @@ class WrapperTests(unittest.TestCase):
             path.write_bytes(path.read_bytes() + comment)
             item["sha256"] = RELEASE.sha256_file(path)
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        sidecar_path = newer / "client-release.json"
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar["client_dependencies"] = [
+            item for item in manifest["artifacts"] if item["path"] in RELEASE.CLIENT_DEPENDENCY_MODES
+        ]
+        sidecar_path.write_text(json.dumps(sidecar), encoding="utf-8")
         RELEASE._create_archive(newer, second)
         with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
             WRAPPER.stage(self.loaded, "tx-first", "c" * 40, first.read_bytes())

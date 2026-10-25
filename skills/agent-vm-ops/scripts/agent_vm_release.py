@@ -33,6 +33,9 @@ try:
         CLIENT_SIDECAR_NAME,
         PROTOCOL_VERSION,
         SUPPORT_ARTIFACT_NAMES,
+        SUPPORT_ARTIFACT_MODES,
+        CLIENT_PACKAGE_MODES,
+        CLIENT_DEPENDENCY_MODES,
         UNIT_EXEC_START,
         UNIT_CONTENT_SHA256,
         ManifestError,
@@ -52,6 +55,9 @@ except ModuleNotFoundError:
         CLIENT_SIDECAR_NAME,
         PROTOCOL_VERSION,
         SUPPORT_ARTIFACT_NAMES,
+        SUPPORT_ARTIFACT_MODES,
+        CLIENT_PACKAGE_MODES,
+        CLIENT_DEPENDENCY_MODES,
         UNIT_EXEC_START,
         UNIT_CONTENT_SHA256,
         ManifestError,
@@ -91,10 +97,10 @@ RECONCILE_ACTIONS = {
     "stop-unexpected-running-cache",
 }
 SOURCE_ARTIFACTS = (
-    ("agent_vm.py", "skills/agent-vm/scripts/agent_vm.py", "client", 0o755),
+    ("agent_vm.ts", "skills/agent-vm/scripts/agent_vm.ts", "client", 0o755),
     ("agent_vm_control.ts", "skills/agent-vm-ops/scripts/agent_vm_control.ts", "control", 0o755),
     *(
-        (name, f"skills/agent-vm-ops/scripts/{name}", "support", 0o644)
+        (name, f"skills/{'agent-vm' if name in CLIENT_DEPENDENCY_MODES else 'agent-vm-ops'}/scripts/{name}", "support", SUPPORT_ARTIFACT_MODES[name])
         for name in sorted(SUPPORT_ARTIFACT_NAMES)
     ),
     ("systemd/agent-vm-native-age-gc.service", "skills/agent-vm-ops/assets/systemd/agent-vm-native-age-gc.service", "unit", 0o644),
@@ -156,9 +162,10 @@ def _read_regular(path: Path) -> bytes:
 
 def _write_atomic(path: Path, data: bytes, mode: int) -> None:
     path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    temporary = path.with_name("." + path.name + ".tmp")
+    descriptor, name = tempfile.mkstemp(prefix="." + path.name + ".", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
     try:
-        with temporary.open("wb") as handle:
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(data)
             handle.flush()
             os.fchmod(handle.fileno(), mode)
@@ -242,6 +249,7 @@ def build_release(source_root: Path, output: Path, source_revision: str | None =
             "source_revision": manifest["source_revision"],
             "protocol": manifest["protocol"],
             "client_artifact": client_artifact,
+            "client_dependencies": [item for item in artifacts if item["path"] in CLIENT_DEPENDENCY_MODES],
             "client_view": manifest["client_view"],
         })
         _create_archive(root, output)
@@ -396,11 +404,13 @@ def _remove_local_staging(path: Path) -> None:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         _fail("local_client_recovery_failed", "local client staging path is not a directory")
     try:
-        allowed = {"agent_vm.py", CLIENT_SIDECAR_NAME}
-        for child in path.iterdir():
+        allowed = set(LOCAL_PACKAGE_MODES)
+        children = list(path.iterdir())
+        for child in children:
             child_info = child.lstat()
             if child.name not in allowed or stat.S_ISLNK(child_info.st_mode) or not stat.S_ISREG(child_info.st_mode):
                 _fail("local_client_recovery_failed", "local client staging directory contains an unexpected entry")
+        for child in children:
             child.unlink()
         path.rmdir()
     except OSError:
@@ -418,136 +428,208 @@ def _verify_local_install_file(path: Path, *, digest: str, mode: int, label: str
         _fail("local_client_recovery_failed", f"completed local client file does not match its recovery marker: {label}")
 
 
+LOCAL_PACKAGE_MODES = {**CLIENT_PACKAGE_MODES, CLIENT_SIDECAR_NAME: 0o644}
+
+
+def _present(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _validate_local_staging(path: Path) -> None:
+    if not _present(path):
+        return
+    if path.is_symlink() or not path.is_dir():
+        _fail("local_client_recovery_failed", "local client staging path is not a real directory")
+    for child in path.iterdir():
+        if child.name not in LOCAL_PACKAGE_MODES or child.is_symlink() or not child.is_file():
+            _fail("local_client_recovery_failed", "local client staging directory contains an unexpected entry")
+
+
 def _recover_local_client_install(client_path: Path, sidecar_path: Path) -> None:
-    record_path = client_path.parent / LOCAL_INSTALL_RECORD_NAME
-    if not record_path.exists() and not record_path.is_symlink():
+    directory = client_path.parent
+    if client_path.name != "agent_vm.ts" or sidecar_path != directory / CLIENT_SIDECAR_NAME:
+        _fail("local_client_recovery_failed", "recovery requires the fixed Bun package paths")
+    record_path = directory / LOCAL_INSTALL_RECORD_NAME
+    if not _present(record_path):
         return
     try:
         info = record_path.lstat()
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            _fail("local_client_recovery_failed", "local client recovery marker is not a regular file")
-        if stat.S_IMODE(info.st_mode) != 0o600:
-            _fail("local_client_recovery_failed", "local client recovery marker has an unsafe mode")
-        with record_path.open("r", encoding="utf-8") as handle:
-            record = json.load(handle)
-    except ReleaseError:
-        raise
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            _fail("local_client_recovery_failed", "local client recovery marker is not a private regular file")
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
         _fail("local_client_recovery_failed", "local client recovery marker is unreadable")
-    if not isinstance(record, dict) or record.get("format") != 1:
-        _fail("local_client_recovery_failed", "local client recovery marker is invalid")
-    backup_client = _local_backup_path(client_path)
-    backup_sidecar = _local_backup_path(sidecar_path)
-    staged_dir = Path(str(record.get("staged_dir", "")))
-    expected_paths = {
-        "client_path": str(client_path),
-        "sidecar_path": str(sidecar_path),
-        "backup_client": str(backup_client),
-        "backup_sidecar": str(backup_sidecar),
-    }
-    if any(record.get(key) != value for key, value in expected_paths.items()):
-        _fail("local_client_recovery_failed", "local client recovery marker targets an unexpected path")
-    if staged_dir.parent != client_path.parent or not staged_dir.name.startswith("agent-vm-client-"):
-        _fail("local_client_recovery_failed", "local client recovery marker has an unsafe staging path")
+    if (not isinstance(record, dict) or type(record.get("format")) is not int or record.get("format") != 2
+            or set(record) != {"format", "phase", "client_path", "staged_dir", "previous", "target"}
+            or record["client_path"] != str(client_path)
+            or record["phase"] not in {"installing", "complete"}):
+        _fail("local_client_recovery_failed", "invalid complete-package recovery marker; retain it for inspection")
+    staging = Path(str(record["staged_dir"]))
+    if staging.parent != directory or not staging.name.startswith("agent-vm-client-"):
+        _fail("local_client_recovery_failed", "unsafe local client staging path")
+    _validate_local_staging(staging)
 
-    def validate_file_state(value: Any, key: str, *, allow_absent: bool, label: str) -> dict[str, Any]:
-        if not isinstance(value, dict) or not isinstance(value.get("exists"), bool):
-            _fail("local_client_recovery_failed", f"local client recovery marker has invalid {label} state")
-        if not value["exists"]:
-            if not allow_absent or set(value) != {"exists"}:
-                _fail("local_client_recovery_failed", f"local client recovery marker has invalid {label} state")
-            return {"exists": False}
-        if (
-            set(value) != {"exists", "sha256", "mode"}
-            or not isinstance(value.get("sha256"), str)
-            or re.fullmatch(r"[0-9a-f]{64}", value["sha256"]) is None
-            or isinstance(value.get("mode"), bool)
-            or not isinstance(value.get("mode"), int)
-            or value["mode"] not in {0o755, 0o644}
-        ):
-            _fail("local_client_recovery_failed", f"local client recovery marker has invalid {label} state")
-        return dict(value)
+    def states(value: Any, absent: bool) -> dict[str, Any]:
+        if not isinstance(value, dict) or set(value) != set(LOCAL_PACKAGE_MODES):
+            _fail("local_client_recovery_failed", "recovery marker must describe the entire client package")
+        for name, mode in LOCAL_PACKAGE_MODES.items():
+            state = value[name]
+            if not isinstance(state, dict) or not isinstance(state.get("exists"), bool):
+                _fail("local_client_recovery_failed", "invalid package file state")
+            if state["exists"] is False:
+                if not absent or set(state) != {"exists"}:
+                    _fail("local_client_recovery_failed", "invalid absent package file state")
+            elif (set(state) != {"exists", "sha256", "mode"} or type(state["mode"]) is not int
+                  or state["mode"] != mode or not isinstance(state["sha256"], str)
+                  or re.fullmatch(r"[0-9a-f]{64}", state["sha256"]) is None):
+                _fail("local_client_recovery_failed", "invalid package hash or fixed mode")
+        return value
 
-    phase = record.get("phase")
-    if phase == "complete":
-        installed = record.get("installed")
-        if not isinstance(installed, dict) or set(installed) != {"client", "sidecar"}:
-            _fail("local_client_recovery_failed", "completed local client recovery marker has no installed file state")
-        for destination, key, mode in (
-            (client_path, "client", 0o755),
-            (sidecar_path, "sidecar", 0o644),
-        ):
-            state = installed.get(key)
-            state = validate_file_state(state, key, allow_absent=False, label="installed")
-            if state["mode"] != mode:
-                _fail("local_client_recovery_failed", "completed local client recovery marker has invalid installed state")
-            _verify_local_install_file(destination, digest=state["sha256"], mode=mode, label=key)
-        for backup in (backup_client, backup_sidecar):
-            if backup.exists() or backup.is_symlink():
-                _fail("local_client_recovery_failed", f"completed local client marker has an unexpected backup: {backup.name}")
-        _remove_local_staging(staged_dir)
-        try:
-            record_path.unlink()
-        except OSError:
-            _fail("local_client_recovery_failed", "cannot remove completed local client recovery marker")
-        return
-    if phase != "installing":
-        _fail("local_client_recovery_failed", "local client recovery marker has an unknown phase")
-    previous = record.get("previous")
-    if not isinstance(previous, dict):
-        _fail("local_client_recovery_failed", "local client recovery marker has no previous state")
-    target = record.get("target")
-    installed = record.get("installed")
-    if not isinstance(target, dict) or set(target) != {"client", "sidecar"}:
-        _fail("local_client_recovery_failed", "local client recovery marker has no target state")
-    if not isinstance(installed, dict) or set(installed) != {"client", "sidecar"}:
-        _fail("local_client_recovery_failed", "local client recovery marker has no installed state")
-    for destination, backup, key in (
-        (client_path, backup_client, "client"),
-        (sidecar_path, backup_sidecar, "sidecar"),
-    ):
-        state = previous.get(key)
-        state = validate_file_state(state, key, allow_absent=True, label="previous")
-        target_state = validate_file_state(target.get(key), key, allow_absent=False, label="target")
-        installed_state = validate_file_state(installed.get(key), key, allow_absent=True, label="installed")
-        if installed_state["exists"] and installed_state != target_state:
-            _fail("local_client_recovery_failed", "local client recovery marker has inconsistent installed state")
-        destination_present = destination.exists() or destination.is_symlink()
-        backup_present = backup.exists() or backup.is_symlink()
-        if state["exists"]:
-            if backup_present:
-                _verify_local_install_file(backup, digest=state["sha256"], mode=state["mode"], label=f"backup {key}")
-                if destination_present:
-                    _verify_local_install_file(
-                        destination,
-                        digest=target_state["sha256"],
-                        mode=target_state["mode"],
-                        label=f"installed {key}",
-                    )
-                    _remove_local_path(destination)
+    previous, target = states(record["previous"], True), states(record["target"], False)
+    if _present(staging):
+        for child in staging.iterdir():
+            state = target[child.name]
+            _verify_local_install_file(child, digest=state["sha256"], mode=state["mode"], label="staging " + child.name)
+    complete = record["phase"] == "complete"
+    # Validate EVERY path before restoring/deleting ANY path. Recovery itself is
+    # repeatable after a crash between individual atomic renames.
+    for name in LOCAL_PACKAGE_MODES:
+        destination = directory / name
+        backup = _local_backup_path(destination)
+        old, new = previous[name], target[name]
+        if complete:
+            _verify_local_install_file(destination, digest=new["sha256"], mode=new["mode"], label=name)
+        elif _present(backup):
+            if not old["exists"]:
+                _fail("local_client_recovery_failed", "unexpected backup for an absent previous file")
+            if _present(destination):
                 try:
-                    os.replace(backup, destination)
-                    _fsync_directory(destination.parent)
-                except OSError:
-                    _fail("local_client_recovery_failed", f"cannot restore previous local client file: {destination.name}")
-            else:
-                _verify_local_install_file(destination, digest=state["sha256"], mode=state["mode"], label=key)
-        else:
-            if backup_present:
-                _fail("local_client_recovery_failed", f"local client recovery marker has an unexpected backup: {backup.name}")
-            if destination_present:
-                _verify_local_install_file(
-                    destination,
-                    digest=target_state["sha256"],
-                    mode=target_state["mode"],
-                    label=f"installed {key}",
-                )
-                _remove_local_path(destination)
-    _remove_local_staging(staged_dir)
+                    _verify_local_install_file(destination, digest=new["sha256"], mode=new["mode"], label=name)
+                except ReleaseError:
+                    # Exclusive backup creation precedes target replacement.
+                    # A crash in between leaves the verified old file at both.
+                    _verify_local_install_file(destination, digest=old["sha256"], mode=old["mode"], label=name)
+        elif old["exists"]:
+            _verify_local_install_file(destination, digest=old["sha256"], mode=old["mode"], label=name)
+        elif _present(destination):
+            _verify_local_install_file(destination, digest=new["sha256"], mode=new["mode"], label=name)
+        if _present(backup):
+            if not old["exists"]:
+                _fail("local_client_recovery_failed", "unexpected package backup")
+            _verify_local_install_file(backup, digest=old["sha256"], mode=old["mode"], label="backup " + name)
+
+    # Sidecar is last during installation; during recovery restore it last too.
+    # A mixed package cannot pass the old or new sidecar dependency hashes.
+    for name in LOCAL_PACKAGE_MODES:
+        destination, backup = directory / name, _local_backup_path(directory / name)
+        if complete:
+            if _present(backup):
+                backup.unlink()
+        elif _present(backup):
+            os.replace(backup, destination)
+        elif not previous[name]["exists"] and _present(destination):
+            destination.unlink()
+        _fsync_directory(directory)
+    _remove_local_staging(staging)
+    _fsync_directory(directory)
+    record_path.unlink()
+    _fsync_directory(directory)
+
+
+def _client_selfcheck(directory: Path, release_id: str) -> None:
+    bun = shutil.which("bun")
+    if bun is None:
+        _fail("local_client_selfcheck_failed", "Bun is required to self-check the complete client package")
     try:
-        record_path.unlink()
-    except OSError:
-        _fail("local_client_recovery_failed", "cannot remove local client recovery marker")
+        process = subprocess.run(
+            [bun, "--no-macros", str(directory / "agent_vm.ts"), "version"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=30,
+            cwd="/", env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")},
+        )
+        value = json.loads(process.stdout)
+        if (process.returncode != 0 or value.get("protocol") != PROTOCOL_VERSION
+                or value.get("release", {}).get("release_id") != release_id
+                or value.get("release", {}).get("artifacts_verified") is not True
+                or value.get("warnings") != []):
+            raise ValueError("client did not verify the expected complete package")
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, AttributeError):
+        _fail("local_client_selfcheck_failed", "Bun client package self-check failed")
+
+
+def _install_client_package(root: Path, client_path: Path, release_id: str) -> None:
+    directory = client_path.parent
+    directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+    # The lock is a fixed private regular file, never a caller-supplied pathname.
+    import fcntl
+    descriptor = os.open(directory / ".agent-vm-client-install.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            _fail("local_client_target_invalid", "local package lock is not a private regular file")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            _fail("local_client_install_busy", "another publisher owns this local client package")
+        _recover_local_client_install(client_path, directory / CLIENT_SIDECAR_NAME)
+        if _present(directory / "agent_vm.py"):
+            _fail("local_client_target_invalid", "retired Python client target requires explicit operator migration")
+        previous = {}
+        for name, mode in LOCAL_PACKAGE_MODES.items():
+            destination, backup = directory / name, _local_backup_path(directory / name)
+            if _present(backup):
+                _fail("local_client_target_invalid", "preexisting package backup is retained: " + backup.name)
+            if _present(destination):
+                info = destination.lstat()
+                if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != mode:
+                    _fail("local_client_target_invalid", "existing package file has invalid type or fixed mode: " + name)
+                previous[name] = {"exists": True, "sha256": sha256_file(destination), "mode": mode}
+            else:
+                previous[name] = {"exists": False}
+        staging = Path(tempfile.mkdtemp(prefix="agent-vm-client-", dir=directory))
+        marker = directory / LOCAL_INSTALL_RECORD_NAME
+        recorded = False
+        try:
+            for name, mode in LOCAL_PACKAGE_MODES.items():
+                _write_atomic(staging / name, _read_regular(root / name), mode)
+            _client_selfcheck(staging, release_id)
+            target = {name: {"exists": True, "sha256": sha256_file(staging / name), "mode": mode}
+                      for name, mode in LOCAL_PACKAGE_MODES.items()}
+            record = {"format": 2, "phase": "installing", "client_path": str(client_path),
+                      "staged_dir": str(staging), "previous": previous, "target": target}
+            _write_json(marker, record, 0o600)
+            recorded = True
+            for name in LOCAL_PACKAGE_MODES:
+                destination = directory / name
+                if previous[name]["exists"]:
+                    _verify_local_install_file(destination, digest=previous[name]["sha256"], mode=previous[name]["mode"], label=name)
+                    # link() is exclusive: a backup appearing after preflight
+                    # must never be overwritten. Keep the active old file until
+                    # the staged candidate replaces it atomically.
+                    os.link(destination, _local_backup_path(destination), follow_symlinks=False)
+                    _fsync_directory(directory)
+                elif _present(destination):
+                    _fail("local_client_install_failed", "package target changed during installation: " + name)
+                os.replace(staging / name, destination)
+                _fsync_directory(directory)
+            # Readers fail closed while the complete-package recovery marker
+            # exists. Verify installed bytes here without bypassing that fence.
+            verify_client_sidecar(directory, load_manifest(root / MANIFEST_NAME))
+            record["phase"] = "complete"
+            _write_json(marker, record, 0o600)
+        except (OSError, ReleaseError, ManifestError) as exc:
+            if recorded:
+                _recover_local_client_install(client_path, directory / CLIENT_SIDECAR_NAME)
+            if isinstance(exc, ManifestError):
+                _fail("local_client_install_failed", "installed Bun package failed integrity verification", exc.as_dict())
+            raise
+        finally:
+            # Unverified recovery material is intentionally retained.
+            if not recorded:
+                _remove_local_staging(staging)
+                _fsync_directory(directory)
+        _recover_local_client_install(client_path, directory / CLIENT_SIDECAR_NAME)
+    finally:
+        os.close(descriptor)
 
 
 class ReleaseTransport(Protocol):
@@ -821,127 +903,21 @@ class ReleasePublisher:
     def _install_local_client(self, manifest: Mapping[str, Any]) -> None:
         if self.client_target is None:
             _fail("local_client_target_missing", "publish requires an explicit local client target")
-        temporary, root, _ = _open_bundle(self.bundle)
+        target = self.client_target.absolute()
+        if target.name == "agent_vm.ts":
+            client_path = target
+        elif target.suffix in {".py", ".ts"} or target.is_file() or target.is_symlink():
+            _fail("local_client_target_invalid", "client target must be a package directory or agent_vm.ts")
+        else:
+            client_path = target / "agent_vm.ts"
+        temporary, root, checked = _open_bundle(self.bundle)
         try:
-            target = self.client_target
-            if target.exists() and target.is_dir():
-                client_path = target / "agent_vm.py"
-            elif target.name == "agent_vm.py" or target.suffix == ".py":
-                client_path = target
-            else:
-                client_path = target / "agent_vm.py"
-            sidecar_path = client_path.with_name(CLIENT_SIDECAR_NAME)
-            client_path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-            _recover_local_client_install(client_path, sidecar_path)
-            source_client = root / "agent_vm.py"
-            source_manifest = root / CLIENT_SIDECAR_NAME
-            staged_dir: Path | None = Path(tempfile.mkdtemp(prefix="agent-vm-client-", dir=str(client_path.parent)))
-            assert staged_dir is not None
-            staged_client = staged_dir / "agent_vm.py"
-            staged_manifest = staged_dir / CLIENT_SIDECAR_NAME
-            shutil.copy2(source_client, staged_client)
-            shutil.copy2(source_manifest, staged_manifest)
-            os.chmod(staged_client, 0o755)
-            os.chmod(staged_manifest, 0o644)
-            try:
-                check = subprocess.run(
-                    [sys.executable, str(staged_client), "version"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                    timeout=30,
-                )
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                _fail("local_client_selfcheck_failed", "new local client could not be self-checked")
-            if check.returncode != 0:
-                _fail("local_client_selfcheck_failed", "new local client self-check failed", check.stderr.decode("utf-8", "replace")[-2000:])
-            previous: dict[str, dict[str, Any]] = {}
-            for destination, key in ((client_path, "client"), (sidecar_path, "sidecar")):
-                if destination.exists() or destination.is_symlink():
-                    try:
-                        info = destination.lstat()
-                    except OSError:
-                        _fail("local_client_target_invalid", f"cannot inspect local client target: {destination.name}")
-                    if stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                        _fail("local_client_target_invalid", f"local client target is not a regular file: {destination.name}")
-                    previous[key] = {"exists": True, "sha256": sha256_file(destination), "mode": stat.S_IMODE(info.st_mode)}
-                else:
-                    previous[key] = {"exists": False}
-            target_states = {
-                "client": {"exists": True, "sha256": sha256_file(staged_client), "mode": 0o755},
-                "sidecar": {"exists": True, "sha256": sha256_file(staged_manifest), "mode": 0o644},
-            }
-            record_path = client_path.parent / LOCAL_INSTALL_RECORD_NAME
-            record: dict[str, Any] = {
-                "format": 1,
-                "phase": "installing",
-                "client_path": str(client_path),
-                "sidecar_path": str(sidecar_path),
-                "backup_client": str(_local_backup_path(client_path)),
-                "backup_sidecar": str(_local_backup_path(sidecar_path)),
-                "staged_dir": str(staged_dir),
-                "previous": previous,
-                "target": target_states,
-                "installed": {"client": {"exists": False}, "sidecar": {"exists": False}},
-            }
-            _write_json(record_path, record, 0o600)
-            record_written = True
-            backups: list[tuple[Path, Path]] = []
-            installed_destinations: list[Path] = []
-            installed = [(staged_client, client_path, "client"), (staged_manifest, sidecar_path, "sidecar")]
-            install_succeeded = False
-            try:
-                for source, destination, key in installed:
-                    if destination.exists() or destination.is_symlink():
-                        if destination.is_symlink() or not destination.is_file():
-                            _fail("local_client_target_invalid", f"local client target is not a regular file: {destination.name}")
-                        backup = destination.with_name("." + destination.name + ".previous")
-                        if backup.exists() or backup.is_symlink():
-                            _fail("local_client_target_invalid", f"local client backup already exists: {backup.name}")
-                        os.replace(destination, backup)
-                        _fsync_directory(destination.parent)
-                        backups.append((backup, destination))
-                    os.replace(source, destination)
-                    _fsync_directory(destination.parent)
-                    installed_destinations.append(destination)
-                    record["installed"][key] = dict(target_states[key])
-                    _write_json(record_path, record, 0o600)
-                record["phase"] = "complete"
-                _write_json(record_path, record, 0o600)
-                install_succeeded = True
-            except (OSError, ReleaseError) as exc:
-                if record_written:
-                    try:
-                        _recover_local_client_install(client_path, sidecar_path)
-                    except ReleaseError as recovery_error:
-                        _fail("local_client_recovery_failed", "local client installation could not be safely recovered", {
-                            "install_error": str(exc),
-                            "recovery_error": recovery_error.as_dict(),
-                        })
-                if isinstance(exc, OSError):
-                    _fail("local_client_install_failed", "local client files could not be installed")
-                raise
-            finally:
-                if install_succeeded:
-                    for backup, _ in backups:
-                        try:
-                            backup.unlink()
-                            _fsync_directory(backup.parent)
-                        except OSError:
-                            pass
-                    shutil.rmtree(staged_dir, ignore_errors=True)
-                    try:
-                        record_path.unlink()
-                        _fsync_directory(record_path.parent)
-                    except OSError:
-                        pass
-            if install_succeeded:
-                staged_dir = None
-        except OSError as exc:
-            _fail("local_client_install_failed", "local client files could not be installed")
+            if checked != manifest:
+                _fail("bundle_invalid", "bundle changed before local package installation")
+            _install_client_package(root, client_path, manifest["release_id"])
+        except OSError:
+            _fail("local_client_install_failed", "local client package could not be installed")
         finally:
-            if staged_dir is not None:
-                shutil.rmtree(staged_dir, ignore_errors=True)
             temporary.cleanup()
 
     def publish(self, *, timeout: float = DEFAULT_TIMEOUT_SECONDS, poll: float = DEFAULT_POLL_SECONDS, transaction_id: str | None = None) -> dict[str, Any]:

@@ -1549,6 +1549,9 @@ describe("release-manifest: identity, integrity and compatibility", () => {
         client_artifact: manifest.artifacts.find(
           (item) => item.role === "client",
         )!,
+        client_dependencies: manifest.artifacts.filter(
+          (item) => Manifest.CLIENT_DEPENDENCY_NAMES.has(item.path),
+        ),
         client_view: manifest.client_view,
       };
       const path = join(root, Manifest.CLIENT_SIDECAR_NAME);

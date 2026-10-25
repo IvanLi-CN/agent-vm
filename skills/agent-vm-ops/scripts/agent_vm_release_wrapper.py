@@ -33,6 +33,8 @@ try:
         BUN_PATH,
         MANIFEST_NAME,
         SUPPORT_ARTIFACT_NAMES,
+        SUPPORT_ARTIFACT_MODES,
+        CLIENT_PACKAGE_MODES,
         UNIT_CONTENT_SHA256,
         UNIT_EXEC_START,
         ManifestError,
@@ -48,6 +50,8 @@ except ModuleNotFoundError:
         BUN_PATH,
         MANIFEST_NAME,
         SUPPORT_ARTIFACT_NAMES,
+        SUPPORT_ARTIFACT_MODES,
+        CLIENT_PACKAGE_MODES,
         UNIT_CONTENT_SHA256,
         UNIT_EXEC_START,
         ManifestError,
@@ -62,6 +66,7 @@ except ModuleNotFoundError:
 DEFAULT_CONFIG_PATH = Path("/etc/agent-vm-native/release-wrapper.json")
 CANONICAL_CONTROL_PATH = Path("/opt/agent-vm-native/agent_vm_control.ts")
 RETIRED_CONTROL_NAME = "agent_vm_control.py"
+RETIRED_CLIENT_NAME = "agent_vm.py"
 CANONICAL_UNIT_DIR = Path("/etc/systemd/system")
 RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
@@ -71,15 +76,15 @@ MAX_FILE_BYTES = 64 * 1024 * 1024
 FORBIDDEN_CONFIG_NAMES = {"config.json", "state.sqlite3", "control.lock", "admission.lock"}
 FIXED_UNIT_NAMES = tuple(sorted(set(UNIT_EXEC_START) | {"agent-vm-native-age-gc.timer"}))
 FIXED_ARTIFACTS = {
-    ("client", "agent_vm.py"),
+    ("client", "agent_vm.ts"),
     ("control", "agent_vm_control.ts"),
     *{("support", name) for name in SUPPORT_ARTIFACT_NAMES},
     *{("unit", "systemd/" + name) for name in FIXED_UNIT_NAMES},
 }
 FIXED_ARTIFACT_MODES = {
-    ("client", "agent_vm.py"): 0o755,
+    ("client", "agent_vm.ts"): 0o755,
     ("control", "agent_vm_control.ts"): 0o755,
-    **{("support", name): 0o644 for name in SUPPORT_ARTIFACT_NAMES},
+    **{("support", name): mode for name, mode in SUPPORT_ARTIFACT_MODES.items()},
     **{("unit", "systemd/" + name): 0o644 for name in FIXED_UNIT_NAMES},
 }
 
@@ -636,9 +641,10 @@ def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
             _fail("activation_unverified", f"cannot inspect activation target: {target.name}")
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             _fail("activation_unverified", f"activation target is not a regular file: {target.name}")
-    temporary = target.with_name("." + target.name + ".release-tmp")
+    descriptor, name = tempfile.mkstemp(prefix="." + target.name + ".", suffix=".release-tmp", dir=target.parent)
+    temporary = Path(name)
     try:
-        with source.open("rb") as source_handle, temporary.open("wb") as target_handle:
+        with os.fdopen(descriptor, "wb") as target_handle, source.open("rb") as source_handle:
             shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
             target_handle.flush()
             os.fchmod(target_handle.fileno(), mode)
@@ -660,7 +666,8 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
     targets = (
         Path(config["control_path"]),
         Path(config["control_path"]).with_name(RETIRED_CONTROL_NAME),
-        Path(config["control_path"]).with_name("agent_vm.py"),
+        Path(config["control_path"]).with_name(RETIRED_CLIENT_NAME),
+        Path(config["control_path"]).with_name("agent_vm.ts"),
         *(Path(config["control_path"]).with_name(name) for name in sorted(SUPPORT_ARTIFACT_NAMES)),
         Path(config["control_path"]).with_name(MANIFEST_NAME),
         Path(config["control_path"]).with_name("client-release.json"),
@@ -695,10 +702,12 @@ def _restore_targets(snapshot: Mapping[Path, tuple[bytes, int, int] | None]) -> 
                 _fail("activation_restore_failed", f"cannot remove a partially installed target: {target.name}")
             continue
         data, mode, owner_uid = saved
-        temporary = target.with_name("." + target.name + ".restore-tmp")
+        temporary = None
         try:
             target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-            with temporary.open("wb") as handle:
+            descriptor, name = tempfile.mkstemp(prefix="." + target.name + ".", suffix=".restore-tmp", dir=target.parent)
+            temporary = Path(name)
+            with os.fdopen(descriptor, "wb") as handle:
                 handle.write(data)
                 handle.flush()
                 os.fchmod(handle.fileno(), mode)
@@ -709,7 +718,7 @@ def _restore_targets(snapshot: Mapping[Path, tuple[bytes, int, int] | None]) -> 
             _fsync_directory(target.parent, "activation_restore_failed")
         except OSError as exc:
             try:
-                if temporary.exists():
+                if temporary is not None and temporary.exists():
                     temporary.unlink()
             except OSError:
                 pass
@@ -793,9 +802,9 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
                 _fail("activation_unverified", "control artifact name is not fixed")
             _copy_atomic(source, Path(config["control_path"]), owner_uid, item["mode"])
         elif item["role"] == "client":
-            if Path(item["path"]).name != "agent_vm.py":
+            if item["path"] != "agent_vm.ts":
                 _fail("activation_unverified", "client artifact name is not fixed")
-            _copy_atomic(source, Path(config["control_path"]).with_name("agent_vm.py"), owner_uid, item["mode"])
+            _copy_atomic(source, Path(config["control_path"]).with_name("agent_vm.ts"), owner_uid, item["mode"])
         elif item["role"] == "unit":
             name = Path(item["path"]).name
             if name not in config["unit_names"]:
@@ -816,14 +825,15 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
     _copy_atomic(client_sidecar, Path(config["control_path"]).with_name("client-release.json"), owner_uid, 0o644)
     # This exact predecessor is snapshotted before activation, so failure can
     # restore it. It is never executed or retained as a second control plane.
-    retired = Path(config["control_path"]).with_name(RETIRED_CONTROL_NAME)
-    if retired.exists() or retired.is_symlink():
-        _require_owned_regular(retired, owner_uid, 0o755)
-        try:
-            retired.unlink()
-            _fsync_directory(retired.parent, "activation_failed")
-        except OSError as exc:
-            _fail("activation_failed", "cannot retire the replaced controller")
+    for name in (RETIRED_CONTROL_NAME, RETIRED_CLIENT_NAME):
+        retired = Path(config["control_path"]).with_name(name)
+        if retired.exists() or retired.is_symlink():
+            _require_owned_regular(retired, owner_uid, 0o755)
+            try:
+                retired.unlink()
+                _fsync_directory(retired.parent, "activation_failed")
+            except OSError:
+                _fail("activation_failed", "cannot retire the exact replaced executable")
 
 
 def activate(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:

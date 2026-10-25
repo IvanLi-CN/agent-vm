@@ -28,6 +28,16 @@ LEGACY_RELEASE_ID = "legacy-protocol-4"
 MANIFEST_NAME = "release-manifest.json"
 CLIENT_SIDECAR_NAME = "client-release.json"
 BUN_PATH = "/usr/local/bin/bun"
+CLIENT_DEPENDENCY_MODES = {
+    "byte-fs.ts": 0o644,
+    "client-io.ts": 0o644,
+    "client-release.ts": 0o644,
+    "client.ts": 0o644,
+    "guest-source.ts": 0o644,
+    "sync-native.ts": 0o644,
+    "sync_worktree.ts": 0o755,
+}
+CLIENT_PACKAGE_MODES = {"agent_vm.ts": 0o755, **CLIENT_DEPENDENCY_MODES}
 TYPESCRIPT_SUPPORT_ARTIFACT_NAMES = (
     "control-types.ts",
     "control-store.ts",
@@ -39,11 +49,13 @@ TYPESCRIPT_SUPPORT_ARTIFACT_NAMES = (
     "control-lifecycle.ts",
     "release-manifest.ts",
     "guest-root-growth.ts",
+    *CLIENT_DEPENDENCY_MODES,
 )
 SUPPORT_ARTIFACT_NAMES = frozenset({
     "release_manifest.py",
     *TYPESCRIPT_SUPPORT_ARTIFACT_NAMES,
 })
+SUPPORT_ARTIFACT_MODES = {name: CLIENT_DEPENDENCY_MODES.get(name, 0o644) for name in SUPPORT_ARTIFACT_NAMES}
 
 # Only this trusted program is evaluated. Candidate source is stdin data;
 # transformSync parses it without importing modules or running its output.
@@ -102,9 +114,9 @@ UNIT_CONTENT_SHA256 = {
 }
 
 FIXED_ARTIFACTS = frozenset({
-    ("agent_vm.py", "agent_vm.py", "client", 0o755),
+    ("agent_vm.ts", "agent_vm.ts", "client", 0o755),
     ("agent_vm_control.ts", "agent_vm_control.ts", "control", 0o755),
-    *{(name, name, "support", 0o644) for name in SUPPORT_ARTIFACT_NAMES},
+    *{(name, name, "support", mode) for name, mode in SUPPORT_ARTIFACT_MODES.items()},
     ("unit:agent-vm-native-age-gc.service", "systemd/agent-vm-native-age-gc.service", "unit", 0o644),
     ("unit:agent-vm-native-age-gc.timer", "systemd/agent-vm-native-age-gc.timer", "unit", 0o644),
     ("unit:agent-vm-native-expire@.service", "systemd/agent-vm-native-expire@.service", "unit", 0o644),
@@ -536,15 +548,27 @@ def verify_client_sidecar(root: Path, manifest: Mapping[str, Any] | None = None)
         raise _error("client_sidecar_invalid", "client sidecar is not valid UTF-8 JSON") from exc
     if not isinstance(value, Mapping):
         raise _error("client_sidecar_invalid", "client sidecar root must be an object")
-    expected_keys = {"format", "release_id", "source_revision", "protocol", "client_artifact", "client_view"}
+    expected_keys = {"format", "release_id", "source_revision", "protocol", "client_artifact", "client_dependencies", "client_view"}
     if set(value) != expected_keys:
         raise _error("client_sidecar_invalid", "client sidecar has an unexpected shape")
-    if value["format"] != checked["format"] or value["release_id"] != checked["release_id"] or value["source_revision"] != checked["source_revision"] or value["protocol"] != checked["protocol"]:
+    def same_json(left: Any, right: Any) -> bool:
+        # Python equality alone accepts True == 1 and 493.0 == 493. The Bun
+        # readers preserve JSON numeric token types; publication must agree.
+        return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+    if type(value["format"]) is not int or type(value["protocol"]) is not int or value["format"] != checked["format"] or value["release_id"] != checked["release_id"] or value["source_revision"] != checked["source_revision"] or value["protocol"] != checked["protocol"]:
         raise _error("client_sidecar_invalid", "client sidecar identity does not match manifest")
     client_artifacts = [item for item in checked["artifacts"] if item["role"] == "client"]
-    if len(client_artifacts) != 1 or value["client_artifact"] != client_artifacts[0]:
+    if len(client_artifacts) != 1 or not same_json(value["client_artifact"], client_artifacts[0]):
         raise _error("client_sidecar_invalid", "client sidecar artifact does not match manifest")
-    if value["client_view"] != checked["client_view"]:
+    expected_dependencies = [item for item in checked["artifacts"] if item["path"] in CLIENT_DEPENDENCY_MODES]
+    dependencies = value["client_dependencies"]
+    if (not isinstance(dependencies, list) or len(dependencies) != len(CLIENT_DEPENDENCY_MODES)
+            or not same_json(sorted(dependencies, key=lambda item: str(item.get("path", "")) if isinstance(item, dict) else ""),
+                             sorted(expected_dependencies, key=lambda item: item["path"]))):
+        raise _error("client_sidecar_invalid", "client sidecar dependencies do not match the complete package")
+    for item in [client_artifacts[0], *expected_dependencies]:
+        _verify_artifact_file(_resolve_regular(root, item["path"]), item)
+    if not same_json(value["client_view"], checked["client_view"]):
         raise _error("client_sidecar_invalid", "client sidecar view does not match manifest")
     return checked
 
