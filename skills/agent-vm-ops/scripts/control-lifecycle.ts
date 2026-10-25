@@ -294,6 +294,17 @@ export class LifecycleControl extends ResourceControl {
     if (!key_match || key_match[0] !== public_key)
       throw new ControlError("invalid_request", "acquire requires a single ed25519 public key");
     const cached = existing?.state === "cached";
+    if (cached) {
+      const cached_image_fingerprint = String(existing.image_fingerprint ?? "");
+      const current_image_fingerprint = String(this.config.image_fingerprint);
+      if (cached_image_fingerprint !== current_image_fingerprint) {
+        throw new ControlError(
+          "cache_stale",
+          "cached VM was created from a different pinned image",
+          { cached_image_fingerprint, current_image_fingerprint },
+        );
+      }
+    }
     if (!cached) await this._image_guard();
     if (cached) {
       await this._verify_network_device(existing);
