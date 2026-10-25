@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Release-manifest parsing and compatibility checks for Agent VM releases.
 
-This module is the operations-side authority for the release contract.  It is
-deliberately standard-library-only so the control process, publisher, and
-wrapper can use the same validation rules without a third-party runtime.
+This standard-library-only module supplies the Python release tools with the
+same artifact and unit policy as release-manifest.ts. TypeScript syntax checks
+require the fixed, trusted Bun executable and never execute candidate modules.
 """
 
 from __future__ import annotations
@@ -13,7 +13,9 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import stat
+import subprocess
 from typing import Any, Mapping
 
 
@@ -25,6 +27,30 @@ RELEASE_ID_RE = SOURCE_REVISION_RE
 LEGACY_RELEASE_ID = "legacy-protocol-4"
 MANIFEST_NAME = "release-manifest.json"
 CLIENT_SIDECAR_NAME = "client-release.json"
+BUN_PATH = "/usr/local/bin/bun"
+TYPESCRIPT_SUPPORT_ARTIFACT_NAMES = (
+    "control-types.ts",
+    "control-store.ts",
+    "control-native.ts",
+    "control-core.ts",
+    "control-observation.ts",
+    "control-resources.ts",
+    "control-systemd.ts",
+    "control-lifecycle.ts",
+    "release-manifest.ts",
+    "guest-root-growth.ts",
+)
+SUPPORT_ARTIFACT_NAMES = frozenset({
+    "release_manifest.py",
+    *TYPESCRIPT_SUPPORT_ARTIFACT_NAMES,
+})
+
+# Only this trusted program is evaluated. Candidate source is stdin data;
+# transformSync parses it without importing modules or running its output.
+TYPESCRIPT_SYNTAX_CHECK = (
+    "const source = await Bun.stdin.text();\n"
+    'new Bun.Transpiler({loader: "ts", target: "bun"}).transformSync(source);\n'
+)
 
 # Keep this list in sync with the one-shot control dispatch table.  The list is
 # intentionally explicit: JSON parseability must never make a new action
@@ -57,11 +83,11 @@ ACTION_NAMES = (
 
 UNIT_EXEC_START = {
     "agent-vm-native-age-gc.service":
-        "ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-age-gc",
+        "ExecStart=/usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts --timer-age-gc",
     "agent-vm-native-expire@.service":
-        "ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-expire %i",
+        "ExecStart=/usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts --timer-expire %i",
     "agent-vm-native-reconcile.service":
-        "ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-reconcile",
+        "ExecStart=/usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts --timer-reconcile",
 }
 
 # Unit files are deployment policy, not caller-provided configuration.  The
@@ -69,16 +95,16 @@ UNIT_EXEC_START = {
 # manifest checksum so a modified manifest cannot authorize new scheduling or
 # control commands.
 UNIT_CONTENT_SHA256 = {
-    "agent-vm-native-age-gc.service": "fc666a1e2d408b68718b50e203f61d71c6d1f950d0acd0e0135a4f9f0afad3ec",
+    "agent-vm-native-age-gc.service": "6a6387459c3f4b5f888fc7d4fe6d49cf571ff4eabd3a96edde72a05d37588460",
     "agent-vm-native-age-gc.timer": "4eb1c7b012fc3251ef4427c56b8c1b0236deff28762cc4293278f56d02c4cb4b",
-    "agent-vm-native-expire@.service": "b8d3c6428b4c1ba9b5e2bea788fa8734b4967f530293f98cd9c7ad415a0c1a1c",
-    "agent-vm-native-reconcile.service": "5951d2304d16c46da75895d266727a715169f66190d379eadcc42b11dc9512ef",
+    "agent-vm-native-expire@.service": "e0cfb3c7eaf4aaadcfe5e296a0698f0cb235c4bbecd22275ad5c6826d7cbd3e2",
+    "agent-vm-native-reconcile.service": "76ac0a8e730ffdfa4c0fe0b0c0cd6ad75dd11e627b747e843ded9fae5fd8ddc8",
 }
 
 FIXED_ARTIFACTS = frozenset({
     ("agent_vm.py", "agent_vm.py", "client", 0o755),
-    ("agent_vm_control.py", "agent_vm_control.py", "control", 0o755),
-    ("release_manifest.py", "release_manifest.py", "support", 0o644),
+    ("agent_vm_control.ts", "agent_vm_control.ts", "control", 0o755),
+    *{(name, name, "support", 0o644) for name in SUPPORT_ARTIFACT_NAMES},
     ("unit:agent-vm-native-age-gc.service", "systemd/agent-vm-native-age-gc.service", "unit", 0o644),
     ("unit:agent-vm-native-age-gc.timer", "systemd/agent-vm-native-age-gc.timer", "unit", 0o644),
     ("unit:agent-vm-native-expire@.service", "systemd/agent-vm-native-expire@.service", "unit", 0o644),
@@ -104,6 +130,50 @@ class ManifestError(Exception):
 
 def _error(code: str, message: str, detail: Any = None) -> ManifestError:
     return ManifestError(code, message, detail)
+
+
+def verify_typescript_syntax(root: Path, manifest: Mapping[str, Any], *, bun_path: str | None = None) -> None:
+    """Parse candidate TypeScript as data; the protected wrapper fixes bun_path."""
+    executable = bun_path or shutil.which("bun")
+    if executable is None:
+        raise _error("typescript_syntax_unverified", "Bun is required to verify TypeScript syntax")
+    for item in manifest["artifacts"]:
+        if item["role"] not in {"client", "control", "support"}:
+            continue
+        relative = PurePosixPath(item["path"])
+        if relative.suffix != ".ts":
+            continue
+        path = root / Path(*relative.parts)
+        try:
+            source = path.read_text(encoding="utf-8").encode("utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise _error(
+                "typescript_syntax_invalid",
+                f"TypeScript artifact cannot be read: {item['path']}",
+            ) from exc
+        try:
+            process = subprocess.run(
+                [executable, "--no-macros", "--eval", TYPESCRIPT_SYNTAX_CHECK],
+                input=source,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+                cwd="/",
+                # Do not inherit preloads, runtime options, or candidate config.
+                env={"PATH": "/usr/local/bin:/usr/bin:/bin"},
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise _error(
+                "typescript_syntax_unverified",
+                "fixed Bun transpiler could not verify TypeScript syntax",
+                {"path": item["path"]},
+            ) from exc
+        if process.returncode != 0:
+            raise _error(
+                "typescript_syntax_invalid",
+                f"TypeScript artifact cannot be transpiled: {item['path']}",
+            )
 
 
 def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:

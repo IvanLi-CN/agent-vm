@@ -27,7 +27,7 @@ import uuid
 
 PROTOCOL_VERSION = 4
 VERSION = "0.4.0-native"
-REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.py"
+REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.ts"
 DEFAULT_CONTROL_TIMEOUT_SECONDS = 240
 LONG_CONTROL_TIMEOUT_SECONDS = 600
 REMOTE_STDOUT_LIMIT_BYTES = 2 * 1024 * 1024
@@ -36,7 +36,7 @@ SESSION_ENV = "AGENT_VM_SESSION_ID"
 CONTROL_HOST_ENV = "AGENT_VM_CONTROL_HOST"
 REMOTE_CONTROL_ENV = "AGENT_VM_REMOTE_CONTROL"
 DEFAULT_CONTROL_HOST = "agent-vm-host"
-DEFAULT_REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.py"
+DEFAULT_REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.ts"
 RELEASE_MANIFEST_ENV = "AGENT_VM_RELEASE_MANIFEST"
 CLIENT_SIDECAR_NAME = "client-release.json"
 DEFAULT_RELEASE_MANIFEST = Path(__file__).resolve().with_name(CLIENT_SIDECAR_NAME)
@@ -698,7 +698,7 @@ def control_request(action: str, *, session: str | None, generation: int | None 
         try:
             try:
                 process = subprocess.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", control_host,
-                                          shlex.join(["python3", remote_control])],
+                                          shlex.join(["bun", remote_control])],
                                          input=json.dumps(request, sort_keys=True).encode(), stdout=stdout_sink,
                                          stderr=stderr_sink, check=False, timeout=request_timeout)
             except subprocess.TimeoutExpired:

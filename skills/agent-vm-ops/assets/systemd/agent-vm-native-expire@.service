@@ -6,7 +6,7 @@ StartLimitBurst=3
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/python3 /opt/agent-vm-native/agent_vm_control.py --timer-expire %i
+ExecStart=/usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts --timer-expire %i
 NoNewPrivileges=yes
 PrivateTmp=yes
 Restart=on-failure
