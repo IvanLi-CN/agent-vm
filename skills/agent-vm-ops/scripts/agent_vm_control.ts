@@ -36,6 +36,7 @@ export * from "./control-native.ts";
 export * from "./control-store.ts";
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
+const MAX_METRICS_OBSERVATION_ATTEMPTS = 3;
 
 function equal(left: unknown, right: unknown): boolean {
   return canonical_json(left ?? null) === canonical_json(right ?? null);
@@ -82,76 +83,113 @@ export class Control extends LifecycleControl {
     request: Data,
     session_id: string | null,
   ): Promise<Data> {
-    const doctor = await this.doctor(request, session_id);
+    let final: Data | null = null;
 
-    return this._global_lock(async () => {
-      const tasks = this.store.list_tasks();
-      const task_states: Record<string, Integer> = Object.create(null);
+    for (let attempt = 1; attempt <= MAX_METRICS_OBSERVATION_ATTEMPTS; attempt += 1) {
+      const observed_at = iso_time(this.now());
+      const before = await this._global_lock(() => this.store.state_epoch());
+      const doctor = await this.doctor(request, session_id);
 
-      for (const task of tasks) {
-        const state = String(task.state);
-        task_states[state] = add(task_states[state] ?? 0, 1);
-      }
+      const sampled = await this._global_lock(async () => {
+        const tasks = this.store.list_tasks();
+        const task_states: Record<string, Integer> = Object.create(null);
 
-      const resources = Object.hasOwn(doctor, "resources")
-        ? doctor.resources
-        : {};
-      const resource_fields = is_record(resources) ? resources : {};
-      const memory = is_record(resource_fields.memory)
-        ? resource_fields.memory
-        : {};
-      const ct_capacity = is_record(resource_fields.ct_capacity)
-        ? resource_fields.ct_capacity
-        : {};
-      const admission = doctor.default_admission ?? {};
-      const observations = admission.observations ?? {};
-      const warnings = [...(admission.warnings ?? [])];
-      const audit = this.store.audit_summary();
+        for (const task of tasks) {
+          const state = String(task.state);
+          task_states[state] = add(task_states[state] ?? 0, 1);
+        }
 
-      let disk_admission = resource_fields.disk_admission;
-      if (!is_record(disk_admission)) {
-        disk_admission = await this._disk_admission_diagnostics(
-          doctor.capacity ?? null,
-        );
-      }
+        const resources = Object.hasOwn(doctor, "resources")
+          ? doctor.resources
+          : {};
+        const resource_fields = is_record(resources) ? resources : {};
+        const memory = is_record(resource_fields.memory)
+          ? resource_fields.memory
+          : {};
+        const ct_capacity = is_record(resource_fields.ct_capacity)
+          ? resource_fields.ct_capacity
+          : {};
+        const admission = doctor.default_admission ?? {};
+        const observations = admission.observations ?? {};
+        const warnings = [...(admission.warnings ?? [])];
+        const audit = this.store.audit_summary();
 
-      return {
-        observed_at: iso_time(this.now()),
-        up: true,
-        draining: this.store.get_meta("draining") === "1",
-        admission_ready: Boolean(doctor.admission_ready),
-        reclaim_required: admission.reclaim_required ?? null,
-        resources,
-        capacity: doctor.capacity ?? null,
-        disk_admission,
-        ct_cpu: {
-          capacity_vcpu: ct_capacity.cpu ?? null,
-          pressure: resource_fields.cpu_pressure ?? null,
-          startup_pressure: observations.cpu_startup_pressure ?? null,
-        },
-        ct_memory: {
-          capacity_bytes: memory.limit_bytes ?? null,
-          current_bytes: memory.current_bytes ?? null,
-          available_bytes: memory.available_bytes ?? null,
-          pressure_threshold_bytes: memory.threshold_bytes ?? null,
-          pressure: resource_fields.memory_pressure ?? null,
-          oom_events: memory.oom_events ?? null,
-        },
-        instances: doctor.instances ?? null,
-        task_states,
-        operations: audit.operations,
-        pending_operations: this.store.pending_operations(),
-        image_unpack_failures: audit.image_unpack_failures,
-        warnings,
-        warning_counts: audit.warnings,
-        doctor: {
-          ready: doctor.ready ?? null,
-          issues: doctor.issues ?? [],
-        },
-        release: this._release_metadata(),
-        release_warnings: this._merge_warnings(this.release_warnings),
+        let disk_admission = resource_fields.disk_admission;
+        if (!is_record(disk_admission)) {
+          disk_admission = await this._disk_admission_diagnostics(
+            doctor.capacity ?? null,
+          );
+        }
+
+        const after = this.store.state_epoch();
+        return {
+          after,
+          metrics: {
+            up: true,
+            draining: this.store.get_meta("draining") === "1",
+            admission_ready: Boolean(doctor.admission_ready),
+            reclaim_required: admission.reclaim_required ?? null,
+            resources,
+            capacity: doctor.capacity ?? null,
+            disk_admission,
+            default_admission: doctor.default_admission ?? null,
+            ct_cpu: {
+              capacity_vcpu: ct_capacity.cpu ?? null,
+              pressure: resource_fields.cpu_pressure ?? null,
+              startup_pressure: observations.cpu_startup_pressure ?? null,
+            },
+            ct_memory: {
+              capacity_bytes: memory.limit_bytes ?? null,
+              current_bytes: memory.current_bytes ?? null,
+              available_bytes: memory.available_bytes ?? null,
+              pressure_threshold_bytes: memory.threshold_bytes ?? null,
+              pressure: resource_fields.memory_pressure ?? null,
+              oom_events: memory.oom_events ?? null,
+            },
+            instances: doctor.instances ?? null,
+            task_states,
+            operations: audit.operations,
+            pending_operations: this.store.pending_operations(),
+            image_unpack_failures: audit.image_unpack_failures,
+            warnings,
+            warning_counts: audit.warnings,
+            doctor: {
+              ready: doctor.ready ?? null,
+              issues: doctor.issues ?? [],
+            },
+            release: this._release_metadata(),
+            release_warnings: this._merge_warnings(this.release_warnings),
+          },
+        };
+      });
+
+      const observation_consistent = equal(before, sampled.after);
+      final = {
+        ...sampled.metrics,
+        observed_at,
+        observation_epoch: sampled.after,
+        observation_consistent,
+        observation_attempts: attempt,
       };
-    });
+      if (observation_consistent) break;
+    }
+
+    if (final === null) {
+      throw new ControlError(
+        "observation_unverified",
+        "metrics observation did not produce a sample",
+      );
+    }
+    if (final.observation_consistent !== true) {
+      final.warnings = [
+        ...(Array.isArray(final.warnings) ? final.warnings : []),
+        {
+          code: "observation_inconsistent",
+          message: "durable state changed while collecting metrics",
+        },
+      ];
+    }
+    return final;
   }
 
   async drain_status(

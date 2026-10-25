@@ -156,17 +156,70 @@ scenario("legacy numeric protocol equality does not coerce string or boolean ide
 scenario("missing guest Bun blocks disk action and SSH exposure without a Python fallback", async f => {
   f.config.required_guest_tools = ["sshd", "docker"]; // Old explicit config still requires Bun.
   f.runner.on_run = argv => {
-    if (argv.includes("exec") && argv.at(-1)?.includes("command -v")) {
+    if (argv.includes("exec") && argv.at(-1)?.includes("missing_tool=")) {
       expect(argv.at(-1)).toContain("for tool in bun ");
-      throw new ControlError("command_failed", "guest Bun missing");
+      return command_result({
+        returncode: 1,
+        stdout: "missing_tool=bun\nmissing_compose=true\n",
+      });
     }
   };
-  await expect_error("command_failed", () => f.acquire());
+  const error = await expect_error("command_failed", () => f.acquire());
+  expect(error.detail.stdout).toContain("missing_tool=bun");
+  expect(error.detail.stdout).toContain("missing_compose=true");
   expect(f.runner.calls.some(([argv]) => argv.includes("exec") && argv.includes("bun"))).toBe(false);
   expect(f.runner.calls.some(([argv]) => argv.includes("authorized_keys"))).toBe(false);
   expect(f.store.get_ports(task(f).task_id)).toEqual([]);
   expect(instance(f).status).toBe("Stopped");
   expect(task(f).state).toBe("cached");
+});
+
+scenario("admin metrics reports a stable durable observation window", async f => {
+  const result = await f.call("admin-metrics", { session: null });
+
+  expect(result.observation_consistent).toBe(true);
+  expect(result.observation_attempts).toBe(1);
+  expect(result.observation_epoch).toBe("initial");
+  expect(result.default_admission).not.toBeNull();
+  expect(result.warnings).not.toContainEqual({
+    code: "observation_inconsistent",
+    message: "durable state changed while collecting metrics",
+  });
+});
+
+scenario("admin metrics retries when durable state changes during native sampling", async f => {
+  let probes = 0;
+  f.resources.on_memory = async () => {
+    probes += 1;
+    if (probes === 1) f.store.set_meta("observation-race", "1");
+    return f.resources.memory_value;
+  };
+
+  const result = await f.call("admin-metrics", { session: null });
+
+  expect(probes).toBeGreaterThanOrEqual(2);
+  expect(result.observation_consistent).toBe(true);
+  expect(result.observation_attempts).toBe(2);
+  expect(result.observation_epoch).toBe(f.store.state_epoch());
+});
+
+scenario("admin metrics bounds an unstable observation and reports a warning", async f => {
+  let probes = 0;
+  f.resources.on_memory = async () => {
+    probes += 1;
+    f.store.set_meta(`observation-race-${probes}`, "1");
+    return f.resources.memory_value;
+  };
+
+  const result = await f.call("admin-metrics", { session: null });
+
+  expect(probes).toBeGreaterThanOrEqual(3);
+  expect(result.observation_consistent).toBe(false);
+  expect(result.observation_attempts).toBe(3);
+  expect(result.warnings).toContainEqual({
+    code: "observation_inconsistent",
+    message: "durable state changed while collecting metrics",
+  });
 });
 
 scenario("activation fence prevents drain exit and leaves admission closed", async f => {

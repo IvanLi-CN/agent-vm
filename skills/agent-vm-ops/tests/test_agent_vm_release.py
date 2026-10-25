@@ -20,7 +20,7 @@ import agent_vm_release as RELEASE  # noqa: E402
 
 class FakeTransport:
     def __init__(self, *, fail_health_once=False, pending=False, drain_enter=True, unknown_state=False,
-                 observation_consistent=True, malformed_health=False, malformed_reconcile=False, malformed_rollback=False,
+                 observation_consistent=True, legacy_metrics=False, malformed_health=False, malformed_reconcile=False, malformed_rollback=False,
                  fail_activation=False, require_legacy_drain_exit=False):
         self.calls = []
         self.fail_health_once = fail_health_once
@@ -28,6 +28,7 @@ class FakeTransport:
         self.drain_enter = drain_enter
         self.unknown_state = unknown_state
         self.observation_consistent = observation_consistent
+        self.legacy_metrics = legacy_metrics
         self.malformed_health = malformed_health
         self.malformed_reconcile = malformed_reconcile
         self.malformed_rollback = malformed_rollback
@@ -68,10 +69,11 @@ class FakeTransport:
             result = {
                 "up": True,
                 "draining": True,
-                "observation_consistent": self.observation_consistent,
                 "pending_operations": [{"operation_id": "pending"}] if self.pending else [],
                 "task_states": {"unknown": 1} if self.unknown_state else {"active": 1},
             }
+            if not self.legacy_metrics:
+                result["observation_consistent"] = self.observation_consistent
             if self.malformed_health:
                 result["up"] = "true"
             return {"ok": True, "result": result}
@@ -362,6 +364,32 @@ class ReleasePublisherTests(unittest.TestCase):
             self.publisher(transport).publish(timeout=5, poll=1, transaction_id="tx-inconsistent")
         self.assertEqual(failure.exception.code, "observation_unverified")
         self.assertNotIn("activate", [item[1] for item in transport.calls])
+
+    def test_convergence_accepts_legacy_metrics_before_activation(self):
+        transport = FakeTransport(legacy_metrics=True)
+        publisher = self.publisher(transport)
+        temporary, _, manifest = RELEASE._open_bundle(self.bundle)
+        try:
+            result = publisher._wait_for_convergence(manifest, timeout=5, poll=1)
+        finally:
+            temporary.cleanup()
+        self.assertEqual(result["pending_operations"], [])
+        self.assertNotIn("activate", [item[1] for item in transport.calls])
+
+    def test_health_requires_observation_for_candidates_but_allows_legacy_rollback(self):
+        transport = FakeTransport(legacy_metrics=True)
+        publisher = self.publisher(transport)
+        temporary, _, manifest = RELEASE._open_bundle(self.bundle)
+        try:
+            with self.assertRaises(RELEASE.ReleaseError) as failure:
+                publisher._health(manifest)
+            self.assertEqual(failure.exception.code, "remote_health_failed")
+            publisher._health(
+                RELEASE.legacy_manifest(),
+                allow_legacy_observation=True,
+            )
+        finally:
+            temporary.cleanup()
 
     def test_post_activation_health_failure_attempts_one_rollback(self):
         transport = FakeTransport(fail_health_once=True, require_legacy_drain_exit=True)

@@ -1530,10 +1530,11 @@ export class ResourceControl extends ControlCore {
 
   async _verify_guest_tools(instance_name: string): Promise<void> {
     const tools = [...new Set(["bun", ...this.config.required_guest_tools.map(String)])];
-    const script = "set -eu; for tool in " + tools.map(shell_quote).join(" ") +
-      '; do command -v "$tool" >/dev/null; done; ' +
-      "if docker compose version >/dev/null 2>&1; then :; " +
-      "elif command -v docker-compose >/dev/null 2>&1; then :; else exit 1; fi";
+    const script = "set -u; missing=0; for tool in " + tools.map(shell_quote).join(" ") +
+      '; do if command -v "$tool" >/dev/null 2>&1; then :; else printf \'missing_tool=%s\\n\' "$tool"; missing=1; fi; done; ' +
+      "if docker compose version >/dev/null 2>&1; then printf 'compose=docker-compose-plugin\\n'; " +
+      "elif command -v docker-compose >/dev/null 2>&1; then printf 'compose=docker-compose-standalone\\n'; " +
+      "else printf 'missing_compose=true\\n'; missing=1; fi; exit \"$missing\"";
     await this.incus.exec(instance_name, ["sh", "-lc", script]);
   }
 

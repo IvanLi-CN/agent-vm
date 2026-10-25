@@ -1,4 +1,5 @@
 import { Database, SQLiteError, type SQLQueryBindings } from "bun:sqlite";
+import { randomUUID } from "node:crypto";
 import { chmodSync, lstatSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import {
@@ -41,6 +42,7 @@ const MAX_SAFE_INTEGER = BigInt(Number.MAX_SAFE_INTEGER);
 const MIN_SAFE_INTEGER = BigInt(Number.MIN_SAFE_INTEGER);
 const MAX_SQLITE_INTEGER = (1n << 63n) - 1n;
 const MIN_SQLITE_INTEGER = -(1n << 63n);
+const STATE_EPOCH_KEY = "state_epoch";
 
 const TASK_FIELDS = [
   "task_id",
@@ -377,6 +379,7 @@ export class StateStore {
   connection!: Database;
   depth = 0;
   _unusable = false;
+  private transaction_mutated = false;
 
   constructor(path: string) {
     this.path = path;
@@ -494,8 +497,85 @@ export class StateStore {
     // Conversion failures are application errors, not SQLite failures.
     const values = bindings(args);
     sqlite_call(() => {
-      this.connection.query(sql).run(...values);
+      const result = this.connection.query(sql).run(...values);
+      if (this.depth > 0 && result.changes > 0) {
+        this.transaction_mutated = true;
+      }
     });
+  }
+
+  private _state_epoch_value(value: string | null): string {
+    if (value === null) return "initial";
+    const text = value.trim();
+    if (/^[0-9a-f]{32}$/.test(text)) return text;
+    if (/^(?:0|[1-9][0-9]*)$/.test(text)) {
+      if (text.length > 19) {
+        throw new ControlError(
+          "state_unverified",
+          "state database epoch is out of range",
+          { key: STATE_EPOCH_KEY },
+        );
+      }
+      if (BigInt(text) > MAX_SQLITE_INTEGER) {
+        throw new ControlError(
+          "state_unverified",
+          "state database epoch is out of range",
+          { key: STATE_EPOCH_KEY },
+        );
+      }
+      return text;
+    }
+    throw new ControlError(
+      "state_unverified",
+      "state database epoch is invalid",
+      { key: STATE_EPOCH_KEY },
+    );
+  }
+
+  private _advance_state_epoch(): void {
+    const next = randomUUID().replaceAll("-", "");
+    this._run(
+      "INSERT INTO meta(key, value) VALUES (?, ?) " +
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      [STATE_EPOCH_KEY, next],
+    );
+  }
+
+  private _rollback_application(error: unknown): never {
+    let rollback_error: unknown = undefined;
+    try {
+      this._rollback();
+    } catch (failure) {
+      if (!is_sqlite_error(failure)) throw failure;
+      rollback_error = failure;
+      this._unusable = true;
+    }
+
+    if (is_sqlite_error(error)) {
+      const failure = StateStore._sqlite_failure(error, {
+        phase: "write",
+        sql_operation: "write",
+        state_committed: rollback_error === undefined ? false : null,
+        rollback_error,
+      });
+      throw failure;
+    }
+
+    if (rollback_error !== undefined) {
+      const failure = StateStore._sqlite_failure(rollback_error, {
+        phase: "rollback",
+        sql_operation: "write",
+        state_committed: null,
+      });
+      failure.detail.original_error = {
+        type: error_type(error),
+        message: error_message(error),
+      };
+      failure.cause = error;
+      throw failure;
+    }
+
+    throw error;
   }
 
   private _commit(): void {
@@ -552,6 +632,7 @@ export class StateStore {
           state_committed: false,
         });
       }
+      this.transaction_mutated = false;
     }
 
     this.depth += 1;
@@ -588,57 +669,41 @@ export class StateStore {
           });
         }
 
-        if (outer) {
-          try {
-            this._rollback();
-          } catch (rollback_error) {
-            if (!is_sqlite_error(rollback_error)) throw rollback_error;
-
-            this._unusable = true;
-            const failure = StateStore._sqlite_failure(rollback_error, {
-              phase: "rollback",
-              sql_operation: "write",
-              state_committed: null,
-            });
-            failure.detail.original_error = {
-              type: error_type(error),
-              message: error_message(error),
-            };
-            failure.cause = error;
-            throw failure;
-          }
-        }
-
+        if (outer) this._rollback_application(error);
         throw error;
       }
 
       if (outer) {
         try {
+          if (this.transaction_mutated) this._advance_state_epoch();
           this._commit();
         } catch (error) {
-          if (!is_sqlite_error(error)) throw error;
+          if (is_sqlite_error(error)) {
+            let rollback_error: unknown = undefined;
+            try {
+              this._rollback();
+            } catch (rollback_failure) {
+              if (!is_sqlite_error(rollback_failure)) throw rollback_failure;
+              rollback_error = rollback_failure;
+              this._unusable = true;
+            }
 
-          let rollback_error: unknown = undefined;
-          try {
-            this._rollback();
-          } catch (rollback_failure) {
-            if (!is_sqlite_error(rollback_failure)) throw rollback_failure;
-            rollback_error = rollback_failure;
-            this._unusable = true;
+            throw StateStore._sqlite_failure(error, {
+              phase: "commit",
+              sql_operation: "write",
+              state_committed: null,
+              rollback_error,
+            });
           }
-
-          throw StateStore._sqlite_failure(error, {
-            phase: "commit",
-            sql_operation: "write",
-            state_committed: null,
-            rollback_error,
-          });
+          if (this.connection.inTransaction) this._rollback_application(error);
+          throw error;
         }
       }
 
       return result;
     } finally {
       this.depth -= 1;
+      if (outer) this.transaction_mutated = false;
     }
   }
 
@@ -732,6 +797,23 @@ export class StateStore {
             reservation_bytes=excluded.reservation_bytes,
             previous_generation=excluded.previous_generation,
             resource_reservation_json=excluded.resource_reservation_json
+        WHERE
+            tasks.session_id IS NOT excluded.session_id OR
+            tasks.generation IS NOT excluded.generation OR
+            tasks.state IS NOT excluded.state OR
+            tasks.instance_name IS NOT excluded.instance_name OR
+            tasks.vm_ip IS NOT excluded.vm_ip OR
+            tasks.ssh_host_port IS NOT excluded.ssh_host_port OR
+            tasks.lease_expires_at IS NOT excluded.lease_expires_at OR
+            tasks.inactive_since IS NOT excluded.inactive_since OR
+            tasks.cleanup_after IS NOT excluded.cleanup_after OR
+            tasks.updated_at IS NOT excluded.updated_at OR
+            tasks.last_error IS NOT excluded.last_error OR
+            tasks.image_fingerprint IS NOT excluded.image_fingerprint OR
+            tasks.resources_json IS NOT excluded.resources_json OR
+            tasks.reservation_bytes IS NOT excluded.reservation_bytes OR
+            tasks.previous_generation IS NOT excluded.previous_generation OR
+            tasks.resource_reservation_json IS NOT excluded.resource_reservation_json
         `,
         values,
       );
@@ -747,16 +829,28 @@ export class StateStore {
       return task;
     }
 
-    const updates: Data = { ...changes, updated_at: iso_time() };
-    const assignments = Object.keys(updates)
-      .map((key) => `${key} = ?`)
-      .join(", ");
+    const change_keys = Object.keys(changes);
+    const change_values = Object.values(changes);
+    const update_values = [...change_values, iso_time()];
+    const assignments = [
+      ...change_keys.map((key) => `${key} = ?`),
+      "updated_at = ?",
+    ].join(", ");
+    const changed = change_keys
+      .map((key) => `${key} IS NOT ?`)
+      .join(" OR ");
+
+    const task_update = [
+      ...update_values,
+      task_id,
+      ...change_values,
+    ];
 
     this.transaction(() => {
-      this._run(`UPDATE tasks SET ${assignments} WHERE task_id = ?`, [
-        ...Object.values(updates),
-        task_id,
-      ]);
+      this._run(
+        `UPDATE tasks SET ${assignments} WHERE task_id = ? AND (${changed})`,
+        task_update,
+      );
     });
 
     const task = this.get_task({ task_id });
@@ -801,6 +895,12 @@ export class StateStore {
             vm_port=excluded.vm_port,
             device_name=excluded.device_name,
             state=excluded.state
+        WHERE
+            ports.generation IS NOT excluded.generation OR
+            ports.host_port IS NOT excluded.host_port OR
+            ports.vm_port IS NOT excluded.vm_port OR
+            ports.device_name IS NOT excluded.device_name OR
+            ports.state IS NOT excluded.state
         `,
         PORT_FIELDS.map((field) => get(port, field)),
       );
@@ -815,15 +915,20 @@ export class StateStore {
   ): void {
     if (Object.keys(changes).length === 0) return;
 
-    const assignments = Object.keys(changes)
+    const update_values = Object.values(changes);
+    const update_keys = Object.keys(changes);
+    const assignments = update_keys
       .map((key) => `${key} = ?`)
       .join(", ");
+    const changed = update_keys
+      .map((key) => `${key} IS NOT ?`)
+      .join(" OR ");
 
     this.transaction(() => {
       this._run(
         `UPDATE ports SET ${assignments}
-         WHERE task_id = ? AND port_name = ? AND protocol = ?`,
-        [...Object.values(changes), task_id, port_name, protocol],
+         WHERE task_id = ? AND port_name = ? AND protocol = ? AND (${changed})`,
+        [...update_values, task_id, port_name, protocol, ...update_values],
       );
     });
   }
@@ -1112,11 +1217,16 @@ export class StateStore {
     return row === null ? null : python_string(row.value);
   }
 
+  state_epoch(): string {
+    return this._state_epoch_value(this.get_meta(STATE_EPOCH_KEY));
+  }
+
   set_meta(key: string, value: string): void {
     this.transaction(() => {
       this._run(
         "INSERT INTO meta(key, value) VALUES (?, ?) " +
-          "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+          "ON CONFLICT(key) DO UPDATE SET value=excluded.value " +
+          "WHERE meta.value IS NOT excluded.value",
         [key, value],
       );
     });
