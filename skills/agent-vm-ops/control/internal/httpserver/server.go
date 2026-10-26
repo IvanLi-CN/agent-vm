@@ -15,9 +15,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/lifecycle"
-	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/observe"
-	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/protocol"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/observe"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 )
 
 const (

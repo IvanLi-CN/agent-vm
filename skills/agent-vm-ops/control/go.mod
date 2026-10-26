@@ -1,4 +1,4 @@
-module github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control
+module github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control
 
 go 1.27.3
 

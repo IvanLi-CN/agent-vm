@@ -318,7 +318,7 @@ Gin 依赖集中在 `httpapi`；CLI HTTP 适配、protocol codec 和业务服务
 实施时需要同批修改以下合同表面，而非在本文中先宣告它们完成：
 
 - Agent VM 的 Spec、CLI/observability/release contracts、IMPLEMENTATION 证据以及两个 Skill 的运行与部署说明。
-- [语言与 runtime ADR](../adr/0028-language-and-runtime-policy.md)、[foundation Spec](../specs/project-foundation/SPEC.md)、[GLOSSARY](../../GLOSSARY.md)、根 AGENTS/README：为 Go 控制进程划定明确例外，保留客户端与 guest 的 Bun 边界。
+- [Agent VM Spec](../specs/agent-vm/SPEC.md)、根 [AGENTS](../../AGENTS.md) 和 [README](../../README.md)：为 Go 控制进程划定明确例外，保留客户端与 guest 的 Bun 边界。
 - 根 test runner、foundation consistency check、package scripts 和 CI：接入真实 Go tests、依赖前提和 Linux native 验证，不关闭现有 gate。
 - 发布 manifest、固定 wrapper、publisher、client sidecar 及 unit assets：一起验证格式、目标集合与切换顺序。
 

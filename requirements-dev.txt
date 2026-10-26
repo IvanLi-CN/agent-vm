@@ -1,4 +1,1 @@
-httpx>=0.27,<1
-openai>=1,<2
-Pillow==13.0.0
-PyYAML>=6,<7
+# The Agent VM Python tests use only the standard library.

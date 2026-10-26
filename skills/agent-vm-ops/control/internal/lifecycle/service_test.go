@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/config"
-	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/native"
-	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/observe"
-	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/protocol"
-	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/state"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/observe"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
 type staticCPUObserver struct {

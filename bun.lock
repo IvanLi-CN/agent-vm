@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "agent-toolkit",
+      "name": "agent-vm",
       "devDependencies": {
         "bun-types": "^1.4.3",
         "typescript": "^5.9.0",

@@ -31,7 +31,7 @@ The `incus-agent-vm` dashboard must explain why container creation can fail even
 
 Incus pool metrics and guest filesystem metrics describe different layers. Image unpacking uses the CT-local staging path before final instance storage is allocated, while the native controller keeps admission reservations and state in a separate control boundary. A dashboard that uses only Incus project or guest metrics cannot explain either failure domain or the native limit.
 
-The public `agent-toolkit` checkout owns the native controller, its public contracts, and a parameterized Grafana baseline under `skills/agent-vm/references/observability/`. Updating a Grafana database copy is still temporary, but the public template plus renderer is a repository implementation that can be instantiated by each deployment.
+This `agent-vm` checkout owns the native controller, its public contracts, and a parameterized Grafana baseline under `skills/agent-vm/references/observability/`. Updating a Grafana database copy is still temporary, but the public template plus renderer is a repository implementation that can be instantiated by each deployment.
 
 The dashboard also lacked a clear CPU startup-admission explanation: logical CPU reservation, CT-visible CPU capacity and CT-local PSI were shown as if they were one limit. The approved overcommit policy keeps the logical ceiling independent and uses `full.avg10 >= 50%` only when projected CPU is above CT-visible capacity. The `some.avg10` and `full.avg10` series are pressure observations, not CPU usage or allocation counts.
 
