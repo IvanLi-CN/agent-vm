@@ -1,4 +1,7 @@
 import { expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { build_go_manifest, GO_FIXED_ARTIFACTS, validate_go_manifest } from "../scripts/go-release-manifest.ts";
 
 const artifacts = GO_FIXED_ARTIFACTS.map(([name, path, role, mode]) => ({ name, path, role, mode, sha256: "a".repeat(64) }));
@@ -39,4 +42,33 @@ test("format-2 manifest rejects malformed action schemas and compatibility windo
   };
   inverted.client_view.actions.status = inverted.actions.status;
   expect(() => validate_go_manifest(inverted)).toThrow("inverted");
+});
+
+test("format-2 release archive excludes host metadata members", () => {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-go-release-test-"));
+  const output = join(temporaryRoot, "release.tar");
+  try {
+    const result = Bun.spawnSync(
+      [
+        process.execPath,
+        "scripts/build_go_release.ts",
+        "--source-revision",
+        "a".repeat(40),
+        "--target",
+        "linux/amd64",
+        "--output",
+        output,
+      ],
+      { cwd: new URL("../", import.meta.url).pathname, stdout: "pipe", stderr: "pipe" },
+    );
+    expect(result.exitCode).toBe(0);
+    const listing = Bun.spawnSync(["tar", "-tf", output], { stdout: "pipe", stderr: "pipe" });
+    expect(listing.exitCode).toBe(0);
+    const members = new TextDecoder().decode(listing.stdout).trim().split("\n").filter(Boolean);
+    expect(members.some((member) => member.split("/").some((part) => part.startsWith("._")))).toBe(false);
+    expect(members).toContain("release-manifest.json");
+    expect(readFileSync(output).byteLength).toBeGreaterThan(0);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
 });

@@ -116,7 +116,13 @@ try {
   const members = ["release-manifest.json", "client-release.json", ...artifacts.map((item) => item.path)];
   const tar = Bun.spawnSync(
     ["tar", "-cf", temporaryArchive, "-C", temporaryRoot, "--no-recursion", ...members],
-    { stdout: "pipe", stderr: "pipe" },
+    {
+      stdout: "pipe",
+      stderr: "pipe",
+      // macOS tar otherwise emits AppleDouble `._*` members for source
+      // extended attributes, which are outside the signed artifact set.
+      env: { ...process.env, COPYFILE_DISABLE: "1" },
+    },
   );
   if (tar.exitCode !== 0) {
     rmSync(temporaryArchive, { force: true });
