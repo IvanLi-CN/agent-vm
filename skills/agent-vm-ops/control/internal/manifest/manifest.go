@@ -46,6 +46,35 @@ type artifactSpec struct {
 	mode int64
 }
 
+type Schema struct {
+	Schema           int64
+	SemanticRevision int64
+}
+
+type CompatibilityWindow struct {
+	SchemaMin   int64
+	SchemaMax   int64
+	SemanticMin int64
+	SemanticMax int64
+}
+
+type ActionMetadata struct {
+	Request        Schema
+	Response       Schema
+	RequestWindow  CompatibilityWindow
+	ResponseWindow CompatibilityWindow
+}
+
+type Metadata struct {
+	ReleaseID         string
+	SourceRevision    string
+	Protocol          int64
+	Transport         string
+	Actions           map[string]ActionMetadata
+	ManifestPresent   bool
+	ArtifactsVerified bool
+}
+
 var fixedArtifacts = []artifactSpec{
 	{name: "agent_vm.ts", path: "agent_vm.ts", role: "client", mode: 0o755},
 	{name: "byte-fs.ts", path: "byte-fs.ts", role: "support", mode: 0o644},
@@ -68,42 +97,129 @@ var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
 // declarations, artifact bytes, modes, and the target ELF header. An empty
 // path is reserved for development runs without an installed release bundle.
 func Load(path string) error {
+	_, err := LoadMetadata(path)
+	return err
+}
+
+func LoadMetadata(path string) (Metadata, error) {
 	if path == "" {
-		return nil
+		return Metadata{}, nil
 	}
+	root, directory, err := readRoot(path)
+	if err != nil {
+		return Metadata{}, err
+	}
+	if err := validate(root, directory); err != nil {
+		return Metadata{}, err
+	}
+	metadata, err := metadataFromRoot(root)
+	if err != nil {
+		return Metadata{}, err
+	}
+	metadata.ManifestPresent = true
+	metadata.ArtifactsVerified = true
+	return metadata, nil
+}
+
+func readRoot(path string) (map[string]any, string, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return fmt.Errorf("manifest_missing: %w", err)
+		return nil, "", fmt.Errorf("manifest_missing: %w", err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("manifest_invalid: manifest is not a regular file")
+		return nil, "", fmt.Errorf("manifest_invalid: manifest is not a regular file")
 	}
 	file, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("manifest_missing: %w", err)
+		return nil, "", fmt.Errorf("manifest_missing: %w", err)
 	}
 	defer file.Close()
 	data, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
 	if err != nil {
-		return fmt.Errorf("manifest_invalid: %w", err)
+		return nil, "", fmt.Errorf("manifest_invalid: %w", err)
 	}
 	if len(data) > maxBytes {
-		return fmt.Errorf("manifest_invalid: manifest exceeds the size limit")
+		return nil, "", fmt.Errorf("manifest_invalid: manifest exceeds the size limit")
 	}
 	var root map[string]any
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.UseNumber()
 	if err := decoder.Decode(&root); err != nil {
-		return fmt.Errorf("manifest_invalid: %w", err)
+		return nil, "", fmt.Errorf("manifest_invalid: %w", err)
 	}
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
-		return fmt.Errorf("manifest_invalid: trailing JSON")
+		return nil, "", fmt.Errorf("manifest_invalid: trailing JSON")
 	}
 	if root == nil {
-		return fmt.Errorf("manifest_invalid: manifest root must be an object")
+		return nil, "", fmt.Errorf("manifest_invalid: manifest root must be an object")
 	}
-	return validate(root, filepath.Dir(path))
+	return root, filepath.Dir(path), nil
+}
+
+func metadataFromRoot(root map[string]any) (Metadata, error) {
+	releaseID, releaseOK := root["release_id"].(string)
+	sourceRevision, sourceOK := root["source_revision"].(string)
+	view, viewOK := root["client_view"].(map[string]any)
+	transport, transportOK := view["transport"].(string)
+	rawActions, actionsOK := root["actions"].(map[string]any)
+	if !releaseOK || !sourceOK || !viewOK || !transportOK || !actionsOK {
+		return Metadata{}, fmt.Errorf("manifest_invalid: compatibility metadata is incomplete")
+	}
+	actions := make(map[string]ActionMetadata, len(rawActions))
+	for action, raw := range rawActions {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			return Metadata{}, fmt.Errorf("manifest_invalid: action metadata is invalid: %s", action)
+		}
+		request, err := metadataSchema(item["request"])
+		if err != nil {
+			return Metadata{}, fmt.Errorf("manifest_invalid: %s request: %w", action, err)
+		}
+		response, err := metadataSchema(item["response"])
+		if err != nil {
+			return Metadata{}, fmt.Errorf("manifest_invalid: %s response: %w", action, err)
+		}
+		requestWindow, err := metadataWindow(item["client_to_control"])
+		if err != nil {
+			return Metadata{}, fmt.Errorf("manifest_invalid: %s client_to_control: %w", action, err)
+		}
+		responseWindow, err := metadataWindow(item["control_to_client"])
+		if err != nil {
+			return Metadata{}, fmt.Errorf("manifest_invalid: %s control_to_client: %w", action, err)
+		}
+		actions[action] = ActionMetadata{Request: request, Response: response, RequestWindow: requestWindow, ResponseWindow: responseWindow}
+	}
+	return Metadata{ReleaseID: releaseID, SourceRevision: sourceRevision, Protocol: Protocol, Transport: transport, Actions: actions}, nil
+}
+
+func metadataSchema(value any) (Schema, error) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return Schema{}, fmt.Errorf("schema is not an object")
+	}
+	schema, schemaOK := integerValue(object["schema"])
+	semantic, semanticOK := integerValue(object["semantic_revision"])
+	if !schemaOK || !semanticOK {
+		return Schema{}, fmt.Errorf("schema values are invalid")
+	}
+	return Schema{Schema: schema, SemanticRevision: semantic}, nil
+}
+
+func metadataWindow(value any) (CompatibilityWindow, error) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return CompatibilityWindow{}, fmt.Errorf("window is not an object")
+	}
+	values := make(map[string]int64, 4)
+	for _, key := range []string{"schema_min", "schema_max", "semantic_min", "semantic_max"} {
+		parsed, valid := integerValue(object[key])
+		if !valid {
+			return CompatibilityWindow{}, fmt.Errorf("window value is invalid")
+		}
+		values[key] = parsed
+	}
+	return CompatibilityWindow{SchemaMin: values["schema_min"], SchemaMax: values["schema_max"], SemanticMin: values["semantic_min"], SemanticMax: values["semantic_max"]}, nil
 }
 
 func validate(root map[string]any, directory string) error {

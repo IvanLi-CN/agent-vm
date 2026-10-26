@@ -137,7 +137,7 @@ func writeError(c *gin.Context, err error, request protocol.Request) {
 	status := http.StatusInternalServerError
 	exitCode := 2
 	switch control.Code {
-	case "invalid_request", "protocol_mismatch", "unknown_action", "missing_session", "cache_stale", "request_too_large", "config_invalid", "unsupported_action", "resource_config_mismatch":
+	case "invalid_request", "protocol_mismatch", "unknown_action", "missing_session", "cache_stale", "request_too_large", "config_invalid", "unsupported_action", "resource_config_mismatch", "compatibility_action_mismatch", "compatibility_invalid", "request_schema_incompatible", "request_semantic_incompatible", "response_schema_incompatible", "response_semantic_incompatible":
 		status = http.StatusBadRequest
 		if control.Code == "request_too_large" {
 			status = http.StatusRequestEntityTooLarge

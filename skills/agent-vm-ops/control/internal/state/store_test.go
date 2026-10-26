@@ -6,8 +6,10 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestExistingSchemaLifecycleAndOpaqueEpoch(t *testing.T) {
@@ -98,6 +100,45 @@ func TestMissingDatabaseFailsClosed(t *testing.T) {
 	_, err := Open(filepath.Join(t.TempDir(), "missing.sqlite3"), false)
 	if err == nil {
 		t.Fatal("missing database unexpectedly opened")
+	}
+}
+
+func TestLeaseConditionsPreserveSubSecondPrecision(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	base := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	lease := base.Add(1500 * time.Millisecond)
+	task := Task{TaskID: "subsecond", SessionID: "subsecond", Generation: 1, State: "active", InstanceName: "agent-vm-subsecond", CreatedAt: base.Format(time.RFC3339Nano), UpdatedAt: base.Format(time.RFC3339Nano), ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: `{"cpu":0,"memory_mib":0,"disk_gib":0}`, ResourceReservationJSON: `{}`, LeaseExpiresAt: stringPointer(lease.Format(time.RFC3339Nano))}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	activeAfter := base.Add(1600 * time.Millisecond)
+	changed, err := store.UpdateTaskIf(ctx, task.TaskID, TaskCondition{LeaseActiveAfter: &activeAfter}, map[string]any{"state": "closing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("lease was treated as active after its fractional deadline")
+	}
+	expiredAt := base.Add(1400 * time.Millisecond)
+	changed, err = store.UpdateTaskIf(ctx, task.TaskID, TaskCondition{LeaseExpiredAt: &expiredAt}, map[string]any{"state": "closing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("lease was treated as expired before its fractional deadline")
+	}
+	expiredAt = base.Add(1600 * time.Millisecond)
+	changed, err = store.UpdateTaskIf(ctx, task.TaskID, TaskCondition{LeaseExpiredAt: &expiredAt}, map[string]any{"state": "closing"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("lease was not treated as expired after its fractional deadline")
 	}
 }
 

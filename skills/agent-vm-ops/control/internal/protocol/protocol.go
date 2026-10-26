@@ -58,6 +58,37 @@ func AsError(err error) *Error {
 
 type Request map[string]any
 
+type Schema struct {
+	Schema           int64
+	SemanticRevision int64
+}
+
+type CompatibilityWindow struct {
+	SchemaMin   int64
+	SchemaMax   int64
+	SemanticMin int64
+	SemanticMax int64
+}
+
+type ActionCompatibility struct {
+	Request        Schema
+	Response       Schema
+	RequestWindow  CompatibilityWindow
+	ResponseWindow CompatibilityWindow
+}
+
+// ReleaseMetadata is the validated, immutable compatibility view of the
+// installed control release. It deliberately contains no filesystem paths.
+type ReleaseMetadata struct {
+	ReleaseID         string
+	SourceRevision    string
+	Protocol          int64
+	Transport         string
+	ManifestPresent   bool
+	ArtifactsVerified bool
+	Actions           map[string]ActionCompatibility
+}
+
 func Decode(data []byte) (Request, error) {
 	value, err := DecodeValue(data)
 	if err != nil {
@@ -111,6 +142,112 @@ func ValidateRequest(request Request) *Error {
 		}
 	}
 	return nil
+}
+
+func ValidateCompatibility(request Request, release *ReleaseMetadata) ([]any, *Error) {
+	if release == nil {
+		return nil, nil
+	}
+	action, _ := request["action"].(string)
+	local, ok := release.Actions[action]
+	if !ok {
+		return nil, NewError("compatibility_invalid", "action is not declared in the control release", map[string]any{"action": action})
+	}
+	raw, present := request["compatibility"]
+	if !present || raw == nil {
+		return []any{compatibilityWarning("legacy_compatibility", "peer omitted release capability; using legacy protocol-4 compatibility", action)}, nil
+	}
+	peer, ok := raw.(map[string]any)
+	if !ok {
+		return nil, NewError("compatibility_invalid", "compatibility must be an object", map[string]any{"action": action})
+	}
+	peerProtocol, ok := integer(peer["protocol"])
+	if !ok || peerProtocol != release.Protocol {
+		return nil, NewError("protocol_mismatch", "peer protocol is not supported", map[string]any{"expected": release.Protocol, "actual": peer["protocol"]})
+	}
+	if peerAction, ok := peer["action"].(string); !ok || peerAction != action {
+		return nil, NewError("compatibility_action_mismatch", "peer capability action does not match request action", map[string]any{"action": action})
+	}
+	peerRequest, control := decodeSchema(peer["request"], "compatibility.request")
+	if control != nil {
+		return nil, control
+	}
+	acceptedResponse, control := decodeWindow(peer["accepted_response"], "compatibility.accepted_response")
+	if control != nil {
+		return nil, control
+	}
+	if !within(peerRequest, local.RequestWindow) {
+		if peerRequest.Schema < local.RequestWindow.SchemaMin || peerRequest.Schema > local.RequestWindow.SchemaMax {
+			return nil, NewError("request_schema_incompatible", "request schema is outside the control compatibility window", map[string]any{"action": action})
+		}
+		return nil, NewError("request_semantic_incompatible", "request semantic revision is outside the control compatibility window", map[string]any{"action": action})
+	}
+	if !within(local.Response, acceptedResponse) {
+		if local.Response.Schema < acceptedResponse.SchemaMin || local.Response.Schema > acceptedResponse.SchemaMax {
+			return nil, NewError("response_schema_incompatible", "control response schema is not accepted by the client", map[string]any{"action": action})
+		}
+		return nil, NewError("response_semantic_incompatible", "control response semantic revision is not accepted by the client", map[string]any{"action": action})
+	}
+	releaseID, ok := peer["release_id"].(string)
+	if !ok || releaseID == "" || (releaseID != "legacy-protocol-4" && !revisionPattern.MatchString(releaseID)) {
+		return nil, NewError("compatibility_invalid", "compatibility.release_id must be a Git revision or legacy-protocol-4", map[string]any{"action": action})
+	}
+	if legacy, exists := peer["legacy"]; exists {
+		if _, ok := legacy.(bool); !ok {
+			return nil, NewError("compatibility_invalid", "compatibility.legacy must be a boolean", map[string]any{"action": action})
+		}
+	}
+	if releaseID == release.ReleaseID {
+		return nil, nil
+	}
+	return []any{map[string]any{
+		"code":    "compatible_release",
+		"message": "peer release differs but the requested operation is explicitly compatible",
+		"action":  action,
+		"detail":  map[string]any{"peer_release": releaseID, "control_release": release.ReleaseID},
+	}}, nil
+}
+
+var revisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+func compatibilityWarning(code, message, action string) map[string]any {
+	return map[string]any{"code": code, "message": message, "action": action}
+}
+
+func decodeSchema(value any, label string) (Schema, *Error) {
+	object, ok := value.(map[string]any)
+	if !ok || len(object) != 2 {
+		return Schema{}, NewError("compatibility_invalid", label+" must declare schema and semantic_revision", nil)
+	}
+	schema, schemaOK := integer(object["schema"])
+	semantic, semanticOK := integer(object["semantic_revision"])
+	if !schemaOK || !semanticOK || schema < 1 || semantic < 1 {
+		return Schema{}, NewError("compatibility_invalid", label+" is invalid", nil)
+	}
+	return Schema{Schema: schema, SemanticRevision: semantic}, nil
+}
+
+func decodeWindow(value any, label string) (CompatibilityWindow, *Error) {
+	object, ok := value.(map[string]any)
+	if !ok || len(object) != 4 {
+		return CompatibilityWindow{}, NewError("compatibility_invalid", label+" must declare schema and semantic min/max", nil)
+	}
+	values := make(map[string]int64, 4)
+	for _, key := range []string{"schema_min", "schema_max", "semantic_min", "semantic_max"} {
+		parsed, valid := integer(object[key])
+		if !valid || parsed < 1 {
+			return CompatibilityWindow{}, NewError("compatibility_invalid", label+" is invalid", nil)
+		}
+		values[key] = parsed
+	}
+	if values["schema_min"] > values["schema_max"] || values["semantic_min"] > values["semantic_max"] {
+		return CompatibilityWindow{}, NewError("compatibility_invalid", label+" has inverted bounds", nil)
+	}
+	return CompatibilityWindow{SchemaMin: values["schema_min"], SchemaMax: values["schema_max"], SemanticMin: values["semantic_min"], SemanticMax: values["semantic_max"]}, nil
+}
+
+func within(value Schema, window CompatibilityWindow) bool {
+	return value.Schema >= window.SchemaMin && value.Schema <= window.SchemaMax && value.SemanticRevision >= window.SemanticMin && value.SemanticRevision <= window.SemanticMax
 }
 
 func integer(value any) (int64, bool) {
@@ -337,12 +474,37 @@ func quote(value string) string {
 }
 
 func Success(request Request, result any) map[string]any {
-	return map[string]any{
+	return SuccessWithRelease(request, result, nil, nil)
+}
+
+func SuccessWithRelease(request Request, result any, release *ReleaseMetadata, warnings []any) map[string]any {
+	if warnings == nil {
+		warnings = []any{}
+	}
+	response := map[string]any{
 		"ok": true, "protocol": Version, "action": request["action"],
 		"session_id": request["session_id"], "generation": request["generation"],
 		"operation_id": request["operation_id"], "outcome": "success", "server_time": time.Now().UTC().Format(time.RFC3339Nano), "result": result,
 		"response": map[string]any{"schema": 1, "semantic_revision": 1},
-		"warnings": []any{},
+		"warnings": warnings,
+	}
+	if release != nil {
+		response["release"] = ReleaseEnvelope(release)
+	}
+	return response
+}
+
+func ReleaseEnvelope(release *ReleaseMetadata) map[string]any {
+	if release == nil {
+		return nil
+	}
+	return map[string]any{
+		"release_id":         release.ReleaseID,
+		"source_revision":    release.SourceRevision,
+		"protocol":           release.Protocol,
+		"transport":          release.Transport,
+		"manifest_present":   release.ManifestPresent,
+		"artifacts_verified": release.ArtifactsVerified,
 	}
 }
 

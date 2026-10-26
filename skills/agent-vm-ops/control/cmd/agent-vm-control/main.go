@@ -88,7 +88,8 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := manifest.Load(*manifestPath); err != nil {
+	release, err := manifest.LoadMetadata(*manifestPath)
+	if err != nil {
 		return err
 	}
 	// Establish exclusive control ownership before opening SQLite. The legacy
@@ -109,7 +110,30 @@ func serve(args []string) error {
 	if cfg.MetricsDir != "" {
 		snapshots = observe.NewSnapshotStore(cfg.MetricsDir)
 	}
-	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver()})
+	var releaseMetadata *protocol.ReleaseMetadata
+	if release.ReleaseID != "" {
+		actions := make(map[string]protocol.ActionCompatibility, len(release.Actions))
+		for action, item := range release.Actions {
+			actions[action] = protocol.ActionCompatibility{
+				Request:  protocol.Schema{Schema: item.Request.Schema, SemanticRevision: item.Request.SemanticRevision},
+				Response: protocol.Schema{Schema: item.Response.Schema, SemanticRevision: item.Response.SemanticRevision},
+				RequestWindow: protocol.CompatibilityWindow{
+					SchemaMin: item.RequestWindow.SchemaMin, SchemaMax: item.RequestWindow.SchemaMax,
+					SemanticMin: item.RequestWindow.SemanticMin, SemanticMax: item.RequestWindow.SemanticMax,
+				},
+				ResponseWindow: protocol.CompatibilityWindow{
+					SchemaMin: item.ResponseWindow.SchemaMin, SchemaMax: item.ResponseWindow.SchemaMax,
+					SemanticMin: item.ResponseWindow.SemanticMin, SemanticMax: item.ResponseWindow.SemanticMax,
+				},
+			}
+		}
+		releaseMetadata = &protocol.ReleaseMetadata{
+			ReleaseID: release.ReleaseID, SourceRevision: release.SourceRevision, Protocol: release.Protocol,
+			Transport: release.Transport, ManifestPresent: release.ManifestPresent, ArtifactsVerified: release.ArtifactsVerified,
+			Actions: actions,
+		}
+	}
+	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver(), Release: releaseMetadata})
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	schedulerInstance := scheduler.New(service)
