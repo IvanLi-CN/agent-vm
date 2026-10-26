@@ -103,7 +103,7 @@ flowchart TB
         end
         db[("SQLite · durable state")]
         worker["Go native-worker<br/>每命令独立进程，回收命令树"]
-        incus["Incus CLI → managed VMs"]
+        incus["Incus CLI → managed LXC containers"]
         snapshots["原子 textfile snapshots<br/>各来源独立 freshness"]
         request <-->|"HTTP/1.1 over UDS<br/>POST /internal/v1/control"| dispatch
         control -->|"唯一写入路径"| db

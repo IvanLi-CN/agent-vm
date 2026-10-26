@@ -4189,7 +4189,7 @@
         "type": "prometheus",
         "uid": "__PROMETHEUS_UID__"
       },
-      "description": "Default request policy used for the VM slot estimates. This is not the memory or disk already allocated to any task.",
+      "description": "Default request policy used for the managed-container slot estimates. This is not the memory or disk already allocated to any task.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4368,7 +4368,7 @@
           "refId": "B"
         }
       ],
-      "title": "Default VM slots",
+      "title": "Default managed-container slots",
       "type": "stat"
     },
     {
@@ -4582,7 +4582,7 @@
         "type": "prometheus",
         "uid": "__PROMETHEUS_UID__"
       },
-      "description": "VM slot admission composition. A missing line means Incus did not expose an authoritative slot limit.",
+      "description": "Managed-container slot admission composition. A missing line means Incus did not expose an authoritative slot limit.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4682,7 +4682,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "expr": "agent_vm_admission_instances_remaining_count{job=\"$controller_job\"}",
-          "legendFormat": "VM slots remaining",
+          "legendFormat": "Managed-container slots remaining",
           "refId": "D"
         },
         {
@@ -4691,7 +4691,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "expr": "agent_vm_admission_instances_limit_count{job=\"$controller_job\"}",
-          "legendFormat": "VM slots limit",
+          "legendFormat": "Managed-container slots limit",
           "refId": "E"
         },
         {
@@ -4700,11 +4700,11 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "expr": "agent_vm_admission_instances_capacity_count{job=\"$controller_job\"}",
-          "legendFormat": "VM slots capacity",
+          "legendFormat": "Managed-container slots capacity",
           "refId": "F"
         }
       ],
-      "title": "VM slot admission",
+      "title": "Managed-container slot admission",
       "type": "timeseries"
     },
     {

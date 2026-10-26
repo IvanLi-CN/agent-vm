@@ -15,7 +15,7 @@ export const REQUIRED_PANEL_TITLES = [
   "Admission headroom",
   "Policy and task snapshot",
   "Disk admission",
-  "VM slot admission",
+  "Managed-container slot admission",
   "Control filesystem capacity",
   "Admission state",
 ];

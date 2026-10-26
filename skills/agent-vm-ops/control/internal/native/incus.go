@@ -116,7 +116,9 @@ func wrapCommandError(result Result, err error) error {
 }
 
 func (c *IncusClient) Init(ctx context.Context, image, name string) error {
-	args := []string{"init", image, name, "--vm"}
+	// Agent sessions are Incus system containers. The outer control
+	// environment may itself be nested, but it must not require KVM/QEMU.
+	args := []string{"init", image, name}
 	if c.Profile != "" {
 		args = append(args, "--profile", c.Profile)
 	}
