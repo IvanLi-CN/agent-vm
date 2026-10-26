@@ -4,7 +4,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
+	"regexp"
+	"sort"
+	"strings"
 )
 
 type Config struct {
@@ -19,6 +24,10 @@ type Config struct {
 	Pool                      string `json:"pool"`
 	HostAddress               string `json:"host_address"`
 	StoragePath               string `json:"storage_path"`
+	VMIPStart                 string `json:"vm_ip_start"`
+	VMIPEnd                   string `json:"vm_ip_end"`
+	GatewayIP                 string `json:"gateway_ip"`
+	TimerDir                  string `json:"timer_dir"`
 	CPUBudget                 int64  `json:"cpu_budget"`
 	MemoryBudgetMiB           int64  `json:"memory_budget_mib"`
 	DiskBudgetGiB             int64  `json:"disk_budget_gib"`
@@ -52,6 +61,7 @@ func Defaults() Config {
 		ActivationTimeoutSeconds: 300,
 		ReleaseFencePath:         "/run/agent-vm-native/release-activation.fence",
 		MetricsDir:               "/run/agent-vm-native/metrics",
+		TimerDir:                 "/run/agent-vm-native/timers",
 	}
 }
 
@@ -62,9 +72,29 @@ func Load(path string) (Config, error) {
 		return value, fmt.Errorf("config_missing: %w", err)
 	}
 	defer file.Close()
+	var raw map[string]json.RawMessage
 	decoder := json.NewDecoder(file)
-	decoder.UseNumber()
-	if err := decoder.Decode(&value); err != nil {
+	if err := decoder.Decode(&raw); err != nil {
+		return value, fmt.Errorf("config_invalid: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return value, errors.New("config_invalid: trailing JSON")
+	}
+	missing := []string{}
+	for _, key := range requiredFields {
+		entry, exists := raw[key]
+		if !exists || len(entry) == 0 || string(entry) == "null" || string(entry) == `""` {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		return value, fmt.Errorf("config_missing: required environment configuration is missing: %s", strings.Join(missing, ", "))
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return value, fmt.Errorf("config_invalid: %w", err)
+	}
+	if err := json.Unmarshal(encoded, &value); err != nil {
 		return value, fmt.Errorf("config_invalid: %w", err)
 	}
 	if err := value.Validate(); err != nil {
@@ -74,11 +104,45 @@ func Load(path string) (Config, error) {
 }
 
 func (c Config) Validate() error {
-	if c.StateDB == "" {
-		return errors.New("config_missing: state_db")
+	missing := []string{}
+	for key, value := range map[string]string{
+		"state_db": c.StateDB, "image_alias": c.ImageAlias, "image_fingerprint": c.ImageFingerprint,
+		"project": c.Project, "profile": c.Profile, "network": c.Network, "network_acl": c.NetworkACL,
+		"pool": c.Pool, "host_address": c.HostAddress, "storage_path": c.StoragePath,
+		"vm_ip_start": c.VMIPStart, "vm_ip_end": c.VMIPEnd, "gateway_ip": c.GatewayIP, "timer_dir": c.TimerDir,
+	} {
+		if value == "" {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return fmt.Errorf("config_missing: required environment configuration is missing: %s", strings.Join(missing, ", "))
 	}
 	if c.Socket == "" {
 		return errors.New("config_invalid: socket")
+	}
+	if c.ReleaseFencePath == "" {
+		return errors.New("config_invalid: release_fence_path")
+	}
+	if c.ReleaseFencePath != "/run/agent-vm-native/release-activation.fence" {
+		return errors.New("config_invalid: release_fence_path must use the fixed activation fence")
+	}
+	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(c.ImageFingerprint) {
+		return errors.New("config_invalid: image_fingerprint must be a 64-character lowercase hex fingerprint")
+	}
+	if !regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`).MatchString(c.NetworkACL) {
+		return errors.New("config_invalid: network_acl")
+	}
+	for key, value := range map[string]string{"host_address": c.HostAddress, "vm_ip_start": c.VMIPStart, "vm_ip_end": c.VMIPEnd, "gateway_ip": c.GatewayIP} {
+		if parsed := net.ParseIP(value); parsed == nil || parsed.To4() == nil {
+			return fmt.Errorf("config_invalid: %s must be an IPv4 address", key)
+		}
+	}
+	start := ipNumber(c.VMIPStart)
+	end := ipNumber(c.VMIPEnd)
+	if start > end {
+		return errors.New("config_invalid: vm_ip_start must not exceed vm_ip_end")
 	}
 	if c.InitialLeaseSeconds <= 0 || c.RenewSeconds <= 0 || c.MaxLeaseSeconds <= 0 || c.CacheSeconds <= 0 {
 		return errors.New("config_invalid: lease and cache durations must be positive")
@@ -89,14 +153,24 @@ func (c Config) Validate() error {
 	if c.SweepSeconds <= 0 || c.WorkerTimeoutSeconds <= 0 || c.DrainTimeoutSeconds <= 0 || c.ActivationTimeoutSeconds <= 0 {
 		return errors.New("config_invalid: scheduler and timeout values must be positive")
 	}
-	if c.PortStart != 0 && (c.PortStart < 1024 || c.PortStart > 65535) {
+	if c.PortStart < 1024 || c.PortStart > 65535 {
 		return errors.New("config_invalid: port_start")
 	}
-	if c.PortEnd != 0 && (c.PortEnd < c.PortStart || c.PortEnd > 65535) {
+	if c.PortEnd < c.PortStart || c.PortEnd > 65535 {
 		return errors.New("config_invalid: port_end")
 	}
 	if c.CPUBudget < 0 || c.MemoryBudgetMiB < 0 || c.DiskBudgetGiB < 0 || c.InstanceLimit < 0 || c.CPUStartupPressurePercent < 0 || c.CPUStartupPressurePercent > 100 {
 		return errors.New("config_invalid: admission limits")
 	}
 	return nil
+}
+
+var requiredFields = []string{"project", "profile", "image_alias", "image_fingerprint", "network", "network_acl", "pool", "host_address", "port_start", "port_end", "vm_ip_start", "vm_ip_end", "gateway_ip", "storage_path", "state_db", "timer_dir"}
+
+func ipNumber(value string) uint32 {
+	parsed := net.ParseIP(value).To4()
+	if parsed == nil {
+		return 0
+	}
+	return uint32(parsed[0])<<24 | uint32(parsed[1])<<16 | uint32(parsed[2])<<8 | uint32(parsed[3])
 }

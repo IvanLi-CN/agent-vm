@@ -53,6 +53,7 @@ type Service struct {
 	Snapshots *observe.SnapshotStore
 
 	mu          sync.RWMutex
+	controlMu   sync.Mutex
 	admissionMu sync.Mutex
 	resident    bool
 	ready       bool
@@ -110,11 +111,8 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if write && request["generation"] == nil {
 		return nil, protocol.NewError("invalid_request", "write request requires generation", nil)
 	}
-	if existing, err := s.replay(ctx, request, write); err != nil {
-		return nil, err
-	} else if existing != nil {
-		return existing, nil
-	}
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
 	if write {
 		operationID := stringValue(request["operation_id"])
 		digest, err := protocol.Digest(request)
@@ -124,8 +122,12 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		pending := map[string]any{"outcome": "pending", "_request_digest": digest}
 		generation := intValue(request["generation"])
 		session := optionalString(request["session_id"])
-		if err := s.Store.RecordOperation(ctx, operationID, action, session, generationPointer(generation, request["generation"] != nil), pending); err != nil {
+		existing, err := s.Store.ClaimOperation(ctx, operationID, action, session, generationPointer(generation, request["generation"] != nil), pending)
+		if err != nil {
 			return nil, s.sqliteError(err)
+		}
+		if existing != nil {
+			return s.replayRecord(request, existing)
 		}
 	}
 	result, err := s.dispatchAction(ctx, action, request)
@@ -176,6 +178,11 @@ func (s *Service) replay(ctx context.Context, request protocol.Request, write bo
 	if record == nil {
 		return nil, nil
 	}
+	return s.replayRecord(request, record)
+}
+
+func (s *Service) replayRecord(request protocol.Request, record *state.Operation) (map[string]any, error) {
+	op := stringValue(request["operation_id"])
 	digest, err := protocol.Digest(request)
 	if err != nil {
 		return nil, protocol.NewError("invalid_request", "request cannot be canonicalized", nil)
@@ -201,6 +208,28 @@ func (s *Service) replay(ctx context.Context, request protocol.Request, write bo
 	replayed["outcome"] = "replayed"
 	replayed["server_time"] = nowString(s.Clock())
 	return replayed, nil
+}
+
+// StartupReconcile performs the fail-closed recovery pass before admission is
+// marked ready. Pending journal intents are evidence of an uncertain native
+// outcome and must remain visible for explicit inspection or cleanup.
+func (s *Service) StartupReconcile(ctx context.Context) error {
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	if _, err := s.Store.StateEpoch(ctx); err != nil {
+		return s.sqliteError(err)
+	}
+	if _, err := s.reconcile(ctx, true); err != nil {
+		return err
+	}
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if len(pending) > 0 {
+		return protocol.NewError("startup_reconcile_required", "pending operations require explicit recovery before admission", map[string]any{"count": len(pending)})
+	}
+	return nil
 }
 
 func (s *Service) recordError(ctx context.Context, request protocol.Request, cause error) error {
@@ -275,6 +304,9 @@ func (s *Service) status(ctx context.Context, session string) (map[string]any, e
 }
 
 func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[string]any, error) {
+	if s.resident && !s.Ready() {
+		return nil, protocol.NewError("startup_reconcile_required", "control service is not ready for admission", nil)
+	}
 	if draining, err := s.isDraining(ctx); err != nil {
 		return nil, s.sqliteError(err)
 	} else if draining {
@@ -401,8 +433,13 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	if !deadline.After(s.Clock()) {
 		return s.failTask(ctx, task, "lease-expiry", errors.New("lease expired during preparation"))
 	}
-	if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateActive, "lease_expires_at": nowString(deadline), "inactive_since": nil, "cleanup_after": nil, "updated_at": nowString(now), "resource_reservation_json": "{}", "reservation_bytes": int64(0)}); err != nil {
+	commitNow := s.Clock()
+	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{statePreparing}, LeaseActiveAfter: &commitNow}, map[string]any{"state": stateActive, "lease_expires_at": nowString(deadline), "inactive_since": nil, "cleanup_after": nil, "updated_at": nowString(commitNow), "resource_reservation_json": "{}", "reservation_bytes": int64(0)})
+	if err != nil {
 		return nil, s.sqliteError(err)
+	}
+	if !updated {
+		return nil, protocol.NewError("lease_expired", "lease changed before acquire could commit", map[string]any{"outcome_verified": false})
 	}
 	task.State, task.LeaseExpiresAt, task.ResourceReservationJSON = stateActive, stringPointer(nowString(deadline)), "{}"
 	return s.summary(ctx, task)
@@ -514,12 +551,20 @@ func (s *Service) release(ctx context.Context, request protocol.Request, destroy
 		updates["inactive_since"] = inactive
 		updates["cleanup_after"] = nowString(s.Clock().Add(time.Duration(s.Config.CacheSeconds) * time.Second))
 	}
-	if err := s.Store.UpdateTask(ctx, task.TaskID, updates); err != nil {
+	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{task.State}}, updates)
+	if err != nil {
 		return nil, s.sqliteError(err)
 	}
+	if !updated {
+		return nil, protocol.NewError("cleanup_incomplete", "session changed before cleanup could be committed", map[string]any{"outcome_verified": false})
+	}
 	if destroy {
-		if err := s.Store.DeleteTask(ctx, task.TaskID); err != nil {
+		deleted, err := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateAbsent}})
+		if err != nil {
 			return nil, s.sqliteError(err)
+		}
+		if !deleted {
+			return nil, protocol.NewError("cleanup_incomplete", "session changed before task deletion could be committed", map[string]any{"outcome_verified": false})
 		}
 	}
 	return s.status(ctx, task.SessionID)
@@ -556,6 +601,13 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 	if err != nil {
 		return nil, err
 	}
+	draining, err := s.isDraining(ctx)
+	if err != nil {
+		return nil, s.sqliteError(err)
+	}
+	if draining && (!requestBool(request, "live_memory") || request["memory_mib"] == nil || request["cpu"] != nil || request["disk_gib"] != nil) {
+		return nil, protocol.NewError("draining", "only live memory-only resize is allowed while draining", nil)
+	}
 	if !effective(task, s.Clock()) {
 		return nil, protocol.NewError("lease_expired", "session lease is not effective", nil)
 	}
@@ -570,6 +622,9 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 	}
 	if requestBool(request, "live_memory") && (request["cpu"] != nil || request["disk_gib"] != nil) {
 		return nil, protocol.NewError("invalid_request", "live resize requires memory only", nil)
+	}
+	if requestBool(request, "live_memory") && request["memory_mib"] == nil {
+		return nil, protocol.NewError("invalid_request", "live resize requires memory_mib", nil)
 	}
 	if requestBool(request, "allow_restart") && s.Guest != nil {
 		if result, restartErr := s.restart(ctx, request); restartErr != nil {
@@ -823,26 +878,36 @@ func (s *Service) reconcile(ctx context.Context, apply bool) (map[string]any, er
 		return nil, s.sqliteError(err)
 	}
 	actions := make([]any, 0)
+	var firstErr error
 	for _, task := range tasks {
 		if (task.State == stateActive || task.State == statePreparing) && !effective(&task, s.Clock()) {
 			action := map[string]any{"task_id": task.TaskID, "generation": task.Generation, "action": "close-incomplete-or-expired"}
 			actions = append(actions, action)
 			if apply {
 				request := protocol.Request{"protocol": protocol.Version, "action": "timer-expire", "task_id": task.TaskID, "generation": task.Generation}
-				_, _ = s.expire(ctx, request)
+				if _, expireErr := s.expire(ctx, request); expireErr != nil && firstErr == nil {
+					firstErr = expireErr
+				}
 			}
 		}
 		if task.State == stateClosing && apply {
-			_, _ = s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false)
+			if _, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil && firstErr == nil {
+				firstErr = releaseErr
+			}
 		}
 		if task.State == stateFailed && apply {
-			_, _ = s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false)
+			if _, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil && firstErr == nil {
+				firstErr = releaseErr
+			}
 		}
 		if task.State == stateDeleting && apply {
-			_, _ = s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, true)
+			if _, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, true); releaseErr != nil && firstErr == nil {
+				firstErr = releaseErr
+			}
 		}
 	}
-	return map[string]any{"dry_run": !apply, "actions": actions}, nil
+	result := map[string]any{"dry_run": !apply, "actions": actions}
+	return result, firstErr
 }
 
 func (s *Service) gc(ctx context.Context, apply bool) (map[string]any, error) {
@@ -1280,6 +1345,10 @@ func (s *Service) failTask(ctx context.Context, task *state.Task, phase string, 
 	return nil, protocol.NewError("native_failed", "native lifecycle action failed", detail)
 }
 func (s *Service) sqliteError(err error) error {
+	var epochErr *state.StateEpochError
+	if errors.As(err, &epochErr) {
+		return protocol.NewError("state_unverified", "state database epoch is not trustworthy", map[string]any{"key": "state_epoch", "cause": err.Error()})
+	}
 	return protocol.NewError("sqlite_unavailable", "state database operation failed", map[string]any{"cause": err.Error(), "state_committed": nil})
 }
 

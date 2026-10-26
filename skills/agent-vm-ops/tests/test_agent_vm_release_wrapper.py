@@ -73,6 +73,22 @@ class WrapperTests(unittest.TestCase):
             run.call_args.args[0],
             ["/usr/local/bin/bun", str(self.loaded["control_path"])],
         )
+
+    def test_drain_verification_uses_fixed_go_request_after_cutover(self):
+        self.drain_patch.stop()
+        sidecar = Path(self.loaded["control_path"]).with_name("client-release.json")
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"format": 2, "client_view": {"transport": "go-request"}}), encoding="utf-8")
+        response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ) as run:
+            WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(
+            run.call_args.args[0],
+            [str(WRAPPER.GO_CONTROL_PATH), "request", "--socket", str(WRAPPER.GO_CONTROL_SOCKET), "--timeout", "30s"],
+        )
         self.assertEqual(
             json.loads(run.call_args.kwargs["input"]),
             {"protocol": 4, "action": "drain-status"},

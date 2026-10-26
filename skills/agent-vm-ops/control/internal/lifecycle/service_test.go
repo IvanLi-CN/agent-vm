@@ -3,6 +3,7 @@ package lifecycle
 import (
 	"context"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -105,5 +106,66 @@ func TestAdmissionAndLeaseTransitionsRemainDurable(t *testing.T) {
 	}
 	if result["result"].(map[string]any)["state"] != stateCached {
 		t.Fatalf("expired cleanup result = %#v", result)
+	}
+}
+
+func TestConcurrentOperationRetryDoesNotDuplicateLifecycleMutation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, config.Defaults(), Options{})
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "concurrent", "generation": int64(0), "operation_id": "same-operation"}
+	responses := make(chan map[string]any, 2)
+	errors := make(chan error, 2)
+	var group sync.WaitGroup
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			response, dispatchErr := service.Dispatch(context.Background(), request)
+			responses <- response
+			errors <- dispatchErr
+		}()
+	}
+	group.Wait()
+	close(responses)
+	close(errors)
+	successes, replays := 0, 0
+	for response := range responses {
+		if response == nil {
+			continue
+		}
+		switch response["outcome"] {
+		case "success":
+			successes++
+		case "replayed":
+			replays++
+		}
+	}
+	for dispatchErr := range errors {
+		if dispatchErr != nil {
+			t.Fatalf("concurrent dispatch error = %v", dispatchErr)
+		}
+	}
+	if successes != 1 || replays != 1 {
+		t.Fatalf("successes=%d replays=%d", successes, replays)
+	}
+}
+
+func TestResidentServiceRefusesAdmissionBeforeStartupReconcile(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, config.Defaults(), Options{Resident: true})
+	_, err = service.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "before-ready", "generation": int64(0), "operation_id": "before-ready"})
+	if control := protocol.AsError(err); control.Code != "startup_reconcile_required" {
+		t.Fatalf("not-ready error = %#v", control)
+	}
+	if service.Ready() {
+		t.Fatal("service became ready before startup reconciliation")
 	}
 }

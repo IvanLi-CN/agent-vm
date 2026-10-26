@@ -11,7 +11,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -78,6 +80,17 @@ CREATE TABLE IF NOT EXISTS audit (
 );`
 
 const missingDBCode = "database_missing"
+
+var stateEpochHex = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+type StateEpochError struct {
+	Value  string
+	Reason string
+}
+
+func (err *StateEpochError) Error() string {
+	return fmt.Sprintf("state_unverified: state database epoch %s", err.Reason)
+}
 
 type Task struct {
 	TaskID                  string
@@ -188,6 +201,9 @@ func Open(path string, allowCreate bool) (*Store, error) {
 	} else if err := store.checkReadable(context.Background()); err != nil {
 		store.Close()
 		return nil, err
+	} else if err := store.ensureStateEpoch(context.Background()); err != nil {
+		store.Close()
+		return nil, err
 	}
 	return store, nil
 }
@@ -236,14 +252,33 @@ func (s *Store) initialize(ctx context.Context) error {
 
 func (s *Store) checkReadable(ctx context.Context) error {
 	return s.withRead(ctx, func(conn *sql.Conn) error {
-		var value int
-		if err := conn.QueryRowContext(ctx, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tasks'").Scan(&value); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return fmt.Errorf("database schema missing: %s", s.path)
+		for _, table := range []string{"meta", "tasks", "ports", "operations", "audit"} {
+			var value int
+			if err := conn.QueryRowContext(ctx, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&value); err != nil {
+				if errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("database schema missing table %s: %s", table, s.path)
+				}
+				return fmt.Errorf("database check: %w", err)
 			}
-			return fmt.Errorf("database check: %w", err)
 		}
 		return nil
+	})
+}
+
+func (s *Store) ensureStateEpoch(ctx context.Context) error {
+	return s.withWrite(ctx, func(tx *Tx) error {
+		var value string
+		err := tx.conn.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = 'state_epoch'").Scan(&value)
+		if errors.Is(err, sql.ErrNoRows) {
+			if _, err := tx.exec("INSERT INTO meta(key, value) VALUES('state_epoch', 'initial')"); err != nil {
+				return fmt.Errorf("initialize legacy state epoch: %w", err)
+			}
+			// Adding the compatibility sentinel is schema repair, not a business
+			// mutation and must not rotate the observation epoch.
+			tx.changed = false
+			return nil
+		}
+		return err
 	})
 }
 
@@ -321,7 +356,25 @@ func (tx *Tx) exec(query string, args ...any) (sql.Result, error) {
 func (s *Store) StateEpoch(ctx context.Context) (string, error) {
 	var value string
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
-		return conn.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = 'state_epoch'").Scan(&value)
+		err := conn.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = 'state_epoch'").Scan(&value)
+		if errors.Is(err, sql.ErrNoRows) {
+			value = "initial"
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		value = strings.TrimSpace(value)
+		if value == "initial" || stateEpochHex.MatchString(value) {
+			return nil
+		}
+		if value == "0" || (value != "" && value[0] != '0') {
+			if parsed, parseErr := strconv.ParseUint(value, 10, 63); parseErr == nil && parsed <= uint64(^uint64(0)>>1) {
+				return nil
+			}
+			return &StateEpochError{Value: value, Reason: "is out of range"}
+		}
+		return &StateEpochError{Value: value, Reason: "is invalid"}
 	})
 	return value, err
 }
@@ -553,28 +606,79 @@ func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
 	return s.withWrite(ctx, func(tx *Tx) error { _, err := tx.exec("DELETE FROM tasks WHERE task_id = ?", taskID); return err })
 }
 
+func (s *Store) DeleteTaskIf(ctx context.Context, taskID string, condition TaskCondition) (bool, error) {
+	deleted := false
+	err := s.withWrite(ctx, func(tx *Tx) error {
+		where := []string{"task_id = ?"}
+		args := []any{taskID}
+		if condition.Generation != nil {
+			where = append(where, "generation = ?")
+			args = append(args, *condition.Generation)
+		}
+		if len(condition.States) > 0 {
+			placeholders := make([]string, len(condition.States))
+			for index, value := range condition.States {
+				placeholders[index] = "?"
+				args = append(args, value)
+			}
+			where = append(where, "state IN ("+strings.Join(placeholders, ", ")+")")
+		}
+		var exists int
+		if err := tx.conn.QueryRowContext(ctx, "SELECT 1 FROM tasks WHERE "+strings.Join(where, " AND "), args...).Scan(&exists); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			return err
+		}
+		result, err := tx.exec("DELETE FROM tasks WHERE task_id = ?", taskID)
+		if err != nil {
+			return err
+		}
+		rows, rowsErr := result.RowsAffected()
+		deleted = rowsErr == nil && rows > 0
+		return rowsErr
+	})
+	return deleted, err
+}
+
 func (s *Store) GetOperation(ctx context.Context, operationID string) (*Operation, error) {
 	var value *Operation
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
-		var result Operation
-		var session sql.NullString
-		var generation sql.NullInt64
-		var raw string
-		err := conn.QueryRowContext(ctx, "SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE operation_id = ?", operationID).Scan(&result.OperationID, &result.Action, &session, &generation, &raw, &result.CreatedAt)
+		result, err := scanOperation(ctx, conn, operationID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		result.SessionID, result.Generation = nullableString(session), nullableInt(generation)
-		if err := json.Unmarshal([]byte(raw), &result.Response); err != nil {
-			return fmt.Errorf("operation JSON: %w", err)
-		}
-		value = &result
+		value = result
 		return nil
 	})
 	return value, err
+}
+
+// ClaimOperation atomically inserts the pending journal intent or returns the
+// already durable record. This is the database fence for retries that race or
+// arrive after a service restart.
+func (s *Store) ClaimOperation(ctx context.Context, operationID, action string, sessionID *string, generation *int64, response map[string]any) (*Operation, error) {
+	raw, err := json.Marshal(response)
+	if err != nil {
+		return nil, err
+	}
+	var existing *Operation
+	err = s.withWrite(ctx, func(tx *Tx) error {
+		current, scanErr := scanOperation(ctx, tx.conn, operationID)
+		if scanErr == nil {
+			existing = current
+			return nil
+		}
+		if !errors.Is(scanErr, sql.ErrNoRows) {
+			return scanErr
+		}
+		_, insertErr := tx.exec("INSERT INTO operations(operation_id, action, session_id, generation, response_json, created_at) VALUES(?, ?, ?, ?, ?, ?)", operationID, action, nullableStringArg(sessionID), nullableIntArg(generation), string(raw), time.Now().UTC().Format(time.RFC3339Nano))
+		return insertErr
+	})
+	return existing, err
 }
 
 func (s *Store) RecordOperation(ctx context.Context, operationID, action string, sessionID *string, generation *int64, response map[string]any) error {
@@ -583,9 +687,38 @@ func (s *Store) RecordOperation(ctx context.Context, operationID, action string,
 		return err
 	}
 	return s.withWrite(ctx, func(tx *Tx) error {
-		_, err := tx.exec("INSERT INTO operations(operation_id, action, session_id, generation, response_json, created_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO UPDATE SET action = excluded.action, session_id = excluded.session_id, generation = excluded.generation, response_json = excluded.response_json", operationID, action, nullableStringArg(sessionID), nullableIntArg(generation), string(raw), time.Now().UTC().Format(time.RFC3339))
-		return err
+		result, err := tx.exec("UPDATE operations SET action = ?, session_id = ?, generation = ?, response_json = ? WHERE operation_id = ? AND json_extract(response_json, '$.outcome') = 'pending'", action, nullableStringArg(sessionID), nullableIntArg(generation), string(raw), operationID)
+		if err != nil {
+			return err
+		}
+		if rows, rowsErr := result.RowsAffected(); rowsErr == nil && rows > 0 {
+			return nil
+		}
+		result, err = tx.exec("INSERT INTO operations(operation_id, action, session_id, generation, response_json, created_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO NOTHING", operationID, action, nullableStringArg(sessionID), nullableIntArg(generation), string(raw), time.Now().UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return err
+		}
+		if rows, rowsErr := result.RowsAffected(); rowsErr == nil && rows == 0 {
+			return errors.New("operation journal is already finalized")
+		}
+		return nil
 	})
+}
+
+func scanOperation(ctx context.Context, conn *sql.Conn, operationID string) (*Operation, error) {
+	var result Operation
+	var session sql.NullString
+	var generation sql.NullInt64
+	var raw string
+	err := conn.QueryRowContext(ctx, "SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE operation_id = ?", operationID).Scan(&result.OperationID, &result.Action, &session, &generation, &raw, &result.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	result.SessionID, result.Generation = nullableString(session), nullableInt(generation)
+	if err := json.Unmarshal([]byte(raw), &result.Response); err != nil {
+		return nil, fmt.Errorf("operation JSON: %w", err)
+	}
+	return &result, nil
 }
 
 func (s *Store) PendingOperations(ctx context.Context) ([]Operation, error) {

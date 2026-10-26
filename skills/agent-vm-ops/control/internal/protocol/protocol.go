@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf16"
 )
 
@@ -339,7 +340,7 @@ func Success(request Request, result any) map[string]any {
 	return map[string]any{
 		"ok": true, "protocol": Version, "action": request["action"],
 		"session_id": request["session_id"], "generation": request["generation"],
-		"operation_id": request["operation_id"], "outcome": "success", "result": result,
+		"operation_id": request["operation_id"], "outcome": "success", "server_time": time.Now().UTC().Format(time.RFC3339Nano), "result": result,
 		"response": map[string]any{"schema": 1, "semantic_revision": 1},
 		"warnings": []any{},
 	}

@@ -1,6 +1,9 @@
 package protocol
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestCanonicalBaselineDigests(t *testing.T) {
 	cases := []struct {
@@ -61,5 +64,12 @@ func TestValidateRequestRejectsFractionalGeneration(t *testing.T) {
 	}
 	if control := ValidateRequest(request); control == nil || control.Code != "invalid_request" {
 		t.Fatalf("validation = %#v", control)
+	}
+}
+
+func TestSuccessIncludesServerTimeForFormatTwoClients(t *testing.T) {
+	response := Success(Request{"protocol": Version, "action": "status", "session_id": "s"}, map[string]any{})
+	if value, ok := response["server_time"].(string); !ok || strings.TrimSpace(value) == "" {
+		t.Fatalf("server_time = %#v", response["server_time"])
 	}
 }

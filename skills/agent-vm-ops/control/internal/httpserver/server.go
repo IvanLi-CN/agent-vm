@@ -64,7 +64,7 @@ func (s *Server) Handler() http.Handler {
 	router.Use(gin.Recovery(), func(c *gin.Context) {
 		if conn, ok := c.Request.Context().Value(peerContextKey{}).(*peerConn); ok {
 			uid := os.Getuid()
-			if uid != 0 && conn.uid != uid && conn.uid != 0 {
+			if (uid == 0 && conn.uid != 0) || (uid != 0 && conn.uid != uid) {
 				c.AbortWithStatusJSON(http.StatusForbidden, map[string]any{"ok": false, "error": map[string]any{"code": "peer_unauthorized", "message": "Unix peer credentials are not authorized"}})
 				return
 			}
@@ -133,6 +133,8 @@ func writeError(c *gin.Context, err error, request protocol.Request) {
 		status = http.StatusBadRequest
 	case "draining", "operation_conflict", "operation_incomplete":
 		status = http.StatusConflict
+	case "startup_reconcile_required", "state_unverified":
+		status = http.StatusServiceUnavailable
 	}
 	if request == nil {
 		c.JSON(status, map[string]any{"ok": false, "protocol": protocol.Version, "error": control})
@@ -149,12 +151,12 @@ func Serve(ctx context.Context, socket string, service *lifecycle.Service, snaps
 	if err != nil {
 		return fmt.Errorf("listen on control socket: %w", err)
 	}
-	if err := os.Chmod(socket, 0o660); err != nil {
+	if err := os.Chmod(socket, 0o600); err != nil {
 		_ = listener.Close()
 		return err
 	}
 	wrapped := &peerListener{Listener: listener}
-	server := &http.Server{Handler: New(service, snapshots...).Handler(), ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 240 * time.Second, ReadTimeout: 240 * time.Second, MaxHeaderBytes: maxHeaderBytes, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+	server := &http.Server{Handler: New(service, snapshots...).Handler(), ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 600 * time.Second, ReadTimeout: 600 * time.Second, MaxHeaderBytes: maxHeaderBytes, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 		if peer, ok := conn.(*peerConn); ok {
 			return context.WithValue(ctx, peerContextKey{}, peer)
 		}
@@ -175,7 +177,11 @@ func prepareSocket(path string) error {
 	if path == "" {
 		return errors.New("control socket path is empty")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+	parent := filepath.Dir(path)
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return err
+	}
+	if err := os.Chmod(parent, 0o700); err != nil {
 		return err
 	}
 	info, err := os.Lstat(path)
@@ -197,7 +203,7 @@ func Request(ctx context.Context, socket string, body []byte) ([]byte, int, erro
 		return dial.DialContext(ctx, "unix", socket)
 	}}
 	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: 240 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	client := &http.Client{Transport: transport, Timeout: contextTimeout(ctx), CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://unix/internal/v1/control", bytesReader(body))
 	if err != nil {
 		return nil, 0, err
@@ -216,6 +222,18 @@ func Request(ctx context.Context, socket string, body []byte) ([]byte, int, erro
 		return nil, response.StatusCode, errors.New("control response exceeds the limit")
 	}
 	return payload, response.StatusCode, nil
+}
+
+func contextTimeout(ctx context.Context) time.Duration {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return time.Nanosecond
+	}
+	return remaining
 }
 
 func bytesReader(value []byte) io.Reader { return &byteReader{value: value} }
