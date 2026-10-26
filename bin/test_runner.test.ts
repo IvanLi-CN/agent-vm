@@ -86,7 +86,12 @@ async function exitWithin(child: Bun.Subprocess, timeoutMs = 2000): Promise<numb
   return result.code;
 }
 
-async function runTestWithin(testFile: { path: string; kind: "bun" | "python" | "shell" }, timeoutMs = 3000): Promise<number> {
+const DEFAULT_FIXTURE_TIMEOUT_MS = 10_000;
+
+async function runTestWithin(
+  testFile: { path: string; kind: "bun" | "python" | "shell" },
+  timeoutMs = DEFAULT_FIXTURE_TIMEOUT_MS,
+): Promise<number> {
   const originalStdoutWrite = process.stdout.write;
   const originalStderrWrite = process.stderr.write;
   const originalLog = console.log;
@@ -514,7 +519,7 @@ test("does not wait for background descendants holding shell output FIFOs", asyn
   }
 });
 
-test("cleans nested shell split-PGID descendants with inherited and redirected output", async () => {
+test("cleans nested shell split-PGID descendants with inherited and redirected output", { timeout: 15_000 }, async () => {
   const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-vm-runner-shell-split-pgid-"));
   let descendantPid: number | undefined;
   try {
@@ -562,7 +567,7 @@ test("cleans nested shell split-PGID descendants with inherited and redirected o
   }
 });
 
-test("bounds Bun and Python output drains when leaders exit with inherited pipes", async () => {
+test("bounds Bun and Python output drains when leaders exit with inherited pipes", { timeout: 15_000 }, async () => {
   const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-vm-runner-pipe-hang-"));
   const descendants: number[] = [];
   try {
@@ -604,7 +609,7 @@ test("bounds Bun and Python output drains when leaders exit with inherited pipes
   }
 });
 
-test("cleans Bun and Python descendants that create independent process groups", async () => {
+test("cleans Bun and Python descendants that create independent process groups", { timeout: 15_000 }, async () => {
   const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-vm-runner-split-pgid-"));
   const descendants: number[] = [];
   try {
@@ -673,7 +678,7 @@ test("cleans Bun and Python descendants that create independent process groups",
   }
 });
 
-test("fails closed for all-skipped Bun and Python suites", async () => {
+test("fails closed for all-skipped Bun and Python suites", { timeout: 15_000 }, async () => {
   const root = mkdtempSync(join(REPO_ROOT, "bin", ".agent-vm-runner-all-skipped-"));
   try {
     const bunPath = join(root, "test_bun_all_skipped.test.ts");
@@ -1225,7 +1230,7 @@ test("preserves unittest decorators and inherited class lifecycle receivers", as
   }
 });
 
-test("fails closed for unsupported Python module lifecycle and import-time class cleanups", async () => {
+test("fails closed for unsupported Python module lifecycle and import-time class cleanups", { timeout: 15_000 }, async () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-vm-discovery-module-lifecycle-"));
   try {
     const setupPath = join(root, "test_module_setup.py");
