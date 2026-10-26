@@ -2,6 +2,7 @@ package native
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -33,6 +34,19 @@ func TestRunnerUsesTheProtocolOutputSplit(t *testing.T) {
 	}
 	if got := runner.stderrLimit(); got != 64*1024 {
 		t.Fatalf("stderr limit = %d", got)
+	}
+}
+
+func TestCommandErrorRetainsBoundedDiagnostics(t *testing.T) {
+	result := Result{Code: 17, Stdout: []byte("out"), Stderr: []byte("err"), StdoutTruncated: true}
+	wrapped := wrapCommandError(result, errors.New("incus failed"))
+	var commandErr *CommandError
+	if !errors.As(wrapped, &commandErr) {
+		t.Fatalf("wrapped error = %v", wrapped)
+	}
+	detail := commandErr.Diagnostic()
+	if detail["exit_code"] != 17 || detail["stdout"] != "out" || detail["stderr"] != "err" || detail["stdout_truncated"] != true {
+		t.Fatalf("diagnostic = %#v", detail)
 	}
 }
 

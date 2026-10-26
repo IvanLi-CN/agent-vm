@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	sqlite "modernc.org/sqlite"
+
 	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/observe"
@@ -51,6 +53,7 @@ type Service struct {
 	Guest     native.Guest
 	Clock     func() time.Time
 	Snapshots *observe.SnapshotStore
+	CPU       CPUObserver
 
 	mu          sync.RWMutex
 	controlMu   sync.Mutex
@@ -66,6 +69,11 @@ type Options struct {
 	Resident  bool
 	Snapshots *observe.SnapshotStore
 	Wake      func()
+	CPU       CPUObserver
+}
+
+type CPUObserver interface {
+	Observe(context.Context) (observe.CPUObservation, error)
 }
 
 func New(store *state.Store, cfg config.Config, options Options) *Service {
@@ -73,7 +81,7 @@ func New(store *state.Store, cfg config.Config, options Options) *Service {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, resident: options.Resident, ready: false, wake: options.Wake}
+	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, resident: options.Resident, ready: false, wake: options.Wake}
 }
 
 func (s *Service) MarkReady()  { s.mu.Lock(); s.ready = true; s.mu.Unlock() }
@@ -373,7 +381,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		task.ReservationBytes = 0
 		task.LeaseExpiresAt = stringPointer(nowString(deadline))
 	}
-	if err := s.checkAdmission(ctx, resources, task.TaskID); err != nil {
+	if err := s.checkAdmission(ctx, resources, task.TaskID, true); err != nil {
 		return nil, err
 	}
 	if created {
@@ -583,6 +591,13 @@ func (s *Service) restart(ctx context.Context, request protocol.Request) (map[st
 	if !effective(task, s.Clock()) {
 		return nil, protocol.NewError("lease_expired", "session lease is not effective", nil)
 	}
+	resources := map[string]int64{}
+	if err := json.Unmarshal([]byte(task.ResourcesJSON), &resources); err != nil {
+		return nil, protocol.NewError("resource_unverified", "task resources cannot be verified before restart", nil)
+	}
+	if err := s.checkAdmission(ctx, resources, task.TaskID, true); err != nil {
+		return nil, err
+	}
 	if s.Guest != nil {
 		workerCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 		defer cancel()
@@ -617,7 +632,7 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 	if err != nil {
 		return nil, err
 	}
-	if err := s.checkAdmission(ctx, target, task.TaskID); err != nil {
+	if err := s.checkAdmission(ctx, target, task.TaskID, false); err != nil {
 		return nil, err
 	}
 	if requestBool(request, "live_memory") && (request["cpu"] != nil || request["disk_gib"] != nil) {
@@ -638,22 +653,27 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 		defer cancel()
 		if request["cpu"] != nil {
 			if err := s.Guest.ConfigSet(workerCtx, task.InstanceName, "limits.cpu", strconv.FormatInt(target["cpu"], 10)); err != nil {
-				return nil, protocol.NewError("resize_partial", "native CPU resize failed", map[string]any{"phase": "native-config", "cause": err.Error(), "outcome_verified": false})
+				return nil, protocol.NewError("resize_partial", "native CPU resize failed", nativePhaseDetail("native-config", err))
 			}
 		}
 		if request["memory_mib"] != nil {
 			if err := s.Guest.ConfigSet(workerCtx, task.InstanceName, "limits.memory", strconv.FormatInt(target["memory_mib"], 10)+"MiB"); err != nil {
-				return nil, protocol.NewError("resize_partial", "native memory resize failed", map[string]any{"phase": "native-config", "cause": err.Error(), "outcome_verified": false})
+				return nil, protocol.NewError("resize_partial", "native memory resize failed", nativePhaseDetail("native-config", err))
 			}
 		}
 		if request["disk_gib"] != nil {
 			if err := s.Guest.DeviceSet(workerCtx, task.InstanceName, "root", "size", strconv.FormatInt(target["disk_gib"], 10)+"GiB"); err != nil {
-				return nil, protocol.NewError("resize_partial", "native disk resize failed", map[string]any{"phase": "native-config", "cause": err.Error(), "outcome_verified": false})
+				return nil, protocol.NewError("resize_partial", "native disk resize failed", nativePhaseDetail("native-config", err))
 			}
 		}
 	}
-	if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"resources_json": mustJSON(target), "updated_at": nowString(s.Clock())}); err != nil {
+	commitNow := s.Clock()
+	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow}, map[string]any{"resources_json": mustJSON(target), "updated_at": nowString(commitNow)})
+	if err != nil {
 		return nil, s.sqliteError(err)
+	}
+	if !updated {
+		return nil, protocol.NewError("resize_partial", "lease or generation changed after native resize", map[string]any{"phase": "durable-fence", "outcome_verified": false})
 	}
 	task.ResourcesJSON = mustJSON(target)
 	return map[string]any{"applied": true, "completed": []any{"durable_resources"}, "resources": target, "state": task.State, "generation": task.Generation}, nil
@@ -709,11 +729,27 @@ func (s *Service) portAdd(ctx context.Context, request protocol.Request) (map[st
 		})
 		cancel()
 		if err != nil {
-			return nil, protocol.NewError("mapping_unverified", "native proxy creation failed", map[string]any{"cause": err.Error(), "outcome_verified": false})
+			return nil, protocol.NewError("mapping_unverified", "native proxy creation failed", nativePhaseDetail("port-add", err))
 		}
 	}
-	if err := s.Store.UpsertPort(ctx, state.Port{TaskID: value.TaskID, Generation: value.Generation, PortName: value.PortName, Protocol: value.Protocol, HostPort: value.HostPort, VMPort: value.VMPort, DeviceName: value.DeviceName, State: "active", CreatedAt: value.CreatedAt}); err != nil {
+	commitNow := s.Clock()
+	active, err := s.Store.UpsertPortIf(ctx, state.Port{TaskID: value.TaskID, Generation: value.Generation, PortName: value.PortName, Protocol: value.Protocol, HostPort: value.HostPort, VMPort: value.VMPort, DeviceName: value.DeviceName, State: "active", CreatedAt: value.CreatedAt}, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow})
+	if err != nil {
 		return nil, s.sqliteError(err)
+	}
+	if !active {
+		if s.Guest != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+			cleanupErr := s.Guest.DeviceRemove(cleanupCtx, task.InstanceName, value.DeviceName)
+			cleanupCancel()
+			if cleanupErr != nil {
+				return nil, protocol.NewError("cleanup_incomplete", "native proxy cleanup after lease fence failed", nativePhaseDetail("port-add-cleanup", cleanupErr))
+			}
+		}
+		if deleteErr := s.Store.DeletePort(ctx, value.TaskID, value.PortName, value.Protocol); deleteErr != nil {
+			return nil, s.sqliteError(deleteErr)
+		}
+		return nil, protocol.NewError("lease_expired", "lease or generation changed after native proxy creation", map[string]any{"phase": "durable-fence", "outcome_verified": true})
 	}
 	value.State = "active"
 	return map[string]any{"task_id": value.TaskID, "generation": value.Generation, "port_name": value.PortName, "protocol": value.Protocol, "host_port": value.HostPort, "vm_port": value.VMPort, "device_name": value.DeviceName, "state": value.State, "created_at": value.CreatedAt}, nil
@@ -846,26 +882,74 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			if !consistent {
 				warnings = append(warnings, map[string]any{"code": "observation_inconsistent", "message": "durable state changed while collecting metrics"})
 			}
+			var cpuObservation *observe.CPUObservation
+			var cpuObservationErr error
+			if s.CPU != nil {
+				value, observeErr := s.CPU.Observe(ctx)
+				if observeErr != nil {
+					cpuObservationErr = observeErr
+				} else {
+					cpuObservation = &value
+				}
+			} else if s.resident {
+				cpuObservationErr = errors.New("CPU observer is not configured")
+			}
+			if cpuObservationErr != nil {
+				warnings = append(warnings, map[string]any{"code": "resource_unverified", "message": "CT CPU pressure observation is not verified", "detail": map[string]any{"cause": cpuObservationErr.Error()}})
+			}
 			draining, _ := s.isDraining(ctx)
 			limits := map[string]any{}
 			remaining := map[string]any{}
 			if s.Config.CPUBudget > 0 {
-				limits["cpu"] = s.Config.CPUBudget
-				remaining["cpu"] = s.Config.CPUBudget - allocated["cpu"] - reserved["cpu"]
+				limit, limitErr := config.LogicalLimit(s.Config.CPUBudget, s.Config.CPUOvercommitRatio)
+				if limitErr != nil {
+					return nil, protocol.NewError("config_invalid", "CPU admission ratio is invalid", map[string]any{"cause": limitErr.Error()})
+				}
+				limits["cpu"] = limit
+				remaining["cpu"] = limit - allocated["cpu"] - reserved["cpu"]
 			}
 			if s.Config.MemoryBudgetMiB > 0 {
-				limits["memory_mib"] = s.Config.MemoryBudgetMiB
-				remaining["memory_mib"] = s.Config.MemoryBudgetMiB - allocated["memory_mib"] - reserved["memory_mib"]
+				limit, limitErr := config.LogicalLimit(s.Config.MemoryBudgetMiB, s.Config.MemoryOvercommitRatio)
+				if limitErr != nil {
+					return nil, protocol.NewError("config_invalid", "memory admission ratio is invalid", map[string]any{"cause": limitErr.Error()})
+				}
+				limits["memory_mib"] = limit
+				remaining["memory_mib"] = limit - allocated["memory_mib"] - reserved["memory_mib"]
 			}
 			if s.Config.DiskBudgetGiB > 0 {
 				limits["disk_gib"] = s.Config.DiskBudgetGiB
 				remaining["disk_gib"] = s.Config.DiskBudgetGiB - allocated["disk_gib"] - reserved["disk_gib"]
 			}
+			resourcesValue := map[string]any{"allocated": allocated, "reserved": reserved, "allocated_and_reserved": addResourceMaps(allocated, reserved), "limits": limits, "remaining": remaining, "policy": map[string]any{"cpu_overcommit_ratio": s.Config.CPUOvercommitRatio, "memory_overcommit_ratio": s.Config.MemoryOvercommitRatio, "cpu_startup_pressure_full_avg10_percent": s.Config.CPUStartupPressureFullAvg10Percent}}
+			ctCPU := map[string]any{"capacity_vcpu": nil, "pressure": nil, "startup_pressure": nil}
+			defaultReasons := []any{}
+			if !s.Ready() {
+				defaultReasons = append(defaultReasons, map[string]any{"code": "startup_reconcile_required", "message": "control service is not ready for admission"})
+			}
+			if cpuObservation != nil {
+				pressure := cpuObservation.Pressure()
+				startupPressure := s.startupPressureDetail(*cpuObservation, allocated["cpu"], 2)
+				resourcesValue["ct_capacity"] = map[string]any{"cpu": cpuObservation.Capacity}
+				resourcesValue["cpu_pressure"] = pressure
+				ctCPU["capacity_vcpu"] = cpuObservation.Capacity
+				ctCPU["pressure"] = pressure
+				ctCPU["startup_pressure"] = startupPressure
+				if startupPressure["startup_blocked"] == true {
+					defaultReasons = append(defaultReasons, map[string]any{"code": "resource_pressure", "message": "CPU scheduler pressure blocks VM startup", "detail": startupPressure})
+				}
+			} else {
+				resourcesValue["ct_capacity"] = map[string]any{"cpu": nil}
+				resourcesValue["cpu_pressure"] = nil
+				if cpuObservationErr != nil {
+					defaultReasons = append(defaultReasons, map[string]any{"code": "resource_unverified", "message": "CT CPU pressure observation is not verified"})
+				}
+			}
 			return map[string]any{
 				"observation_epoch": epoch, "observation_consistent": consistent, "observation_attempts": attempt,
 				"observed_at": start, "up": true, "draining": draining, "admission_ready": s.Ready(),
-				"resources":   map[string]any{"allocated": allocated, "reserved": reserved, "allocated_and_reserved": addResourceMaps(allocated, reserved), "limits": limits, "remaining": remaining},
-				"task_states": states, "instances": len(tasks), "warnings": warnings, "warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent)},
+				"resources": resourcesValue, "ct_cpu": ctCPU,
+				"default_admission": map[string]any{"requested": map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "ready": s.Ready(), "reasons": defaultReasons},
+				"task_states":       states, "instances": len(tasks), "warnings": warnings, "warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil)},
 			}, nil
 		}
 	}
@@ -1279,7 +1363,7 @@ func guestIPv4(value map[string]any) string {
 	return ""
 }
 
-func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64, excludeTaskID string) error {
+func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64, excludeTaskID string, startup bool) error {
 	tasks, err := s.Store.ListTasks(ctx)
 	if err != nil {
 		return s.sqliteError(err)
@@ -1304,13 +1388,61 @@ func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64
 	if s.Config.InstanceLimit > 0 && instances >= s.Config.InstanceLimit {
 		return protocol.NewError("resource_insufficient", "configured VM slot capacity is exhausted", map[string]any{"instances": instances, "limit": s.Config.InstanceLimit})
 	}
-	limits := map[string]int64{"cpu": s.Config.CPUBudget, "memory_mib": s.Config.MemoryBudgetMiB, "disk_gib": s.Config.DiskBudgetGiB}
+	cpuLimit, cpuErr := config.LogicalLimit(s.Config.CPUBudget, s.Config.CPUOvercommitRatio)
+	if cpuErr != nil {
+		return protocol.NewError("config_invalid", "CPU admission ratio is invalid", map[string]any{"cause": cpuErr.Error()})
+	}
+	memoryLimit, memoryErr := config.LogicalLimit(s.Config.MemoryBudgetMiB, s.Config.MemoryOvercommitRatio)
+	if memoryErr != nil {
+		return protocol.NewError("config_invalid", "memory admission ratio is invalid", map[string]any{"cause": memoryErr.Error()})
+	}
+	limits := map[string]int64{"cpu": cpuLimit, "memory_mib": memoryLimit, "disk_gib": s.Config.DiskBudgetGiB}
 	for _, key := range resourceKeys {
 		if limits[key] > 0 && used[key]+requested[key] > limits[key] {
 			return protocol.NewError("resource_insufficient", "requested resources exceed the configured admission budget", map[string]any{"resource": key, "used": used[key], "requested": requested[key], "limit": limits[key]})
 		}
 	}
+	if startup {
+		if err := s.checkStartupPressure(ctx, used["cpu"], requested["cpu"]); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+func (s *Service) checkStartupPressure(ctx context.Context, allocatedCPU, requestedCPU int64) error {
+	if s.CPU == nil {
+		if !s.resident {
+			return nil
+		}
+		return protocol.NewError("resource_unverified", "CT CPU pressure observation is unavailable", map[string]any{"verified": false})
+	}
+	observation, err := s.CPU.Observe(ctx)
+	if err != nil {
+		return protocol.NewError("resource_unverified", "CT CPU pressure observation is not verified", map[string]any{"verified": false, "cause": err.Error()})
+	}
+	detail := s.startupPressureDetail(observation, allocatedCPU, requestedCPU)
+	if detail["startup_blocked"] == true {
+		return protocol.NewError("resource_pressure", "CPU scheduler pressure blocks VM startup", detail)
+	}
+	return nil
+}
+
+func (s *Service) startupPressureDetail(observation observe.CPUObservation, allocatedCPU, requestedCPU int64) map[string]any {
+	projectedCPU := allocatedCPU + requestedCPU
+	return map[string]any{
+		"verified":                     true,
+		"threshold_full_avg10_percent": s.Config.CPUStartupPressureFullAvg10Percent,
+		"allocated_cpu":                allocatedCPU,
+		"requested_cpu":                requestedCPU,
+		"projected_cpu":                projectedCPU,
+		"ct_capacity_cpu":              observation.Capacity,
+		"physically_oversubscribed":    projectedCPU > observation.Capacity,
+		"full_avg10_percent":           observation.Full.Avg10,
+		"some_avg10_percent":           observation.Some.Avg10,
+		"cpu_pressure":                 observation.Map(),
+		"startup_blocked":              projectedCPU > observation.Capacity && observation.Full.Avg10 >= s.Config.CPUStartupPressureFullAvg10Percent,
+	}
 }
 
 func addResourceMaps(left, right map[string]int64) map[string]int64 {
@@ -1340,16 +1472,47 @@ func requestHasResourceFields(request protocol.Request) bool {
 }
 
 func (s *Service) failTask(ctx context.Context, task *state.Task, phase string, err error) (map[string]any, error) {
-	detail := map[string]any{"phase": phase, "cause": err.Error(), "outcome_verified": false}
+	detail := nativePhaseDetail(phase, err)
 	_ = s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())})
 	return nil, protocol.NewError("native_failed", "native lifecycle action failed", detail)
 }
+
+func nativePhaseDetail(phase string, err error) map[string]any {
+	detail := map[string]any{"phase": phase, "cause": err.Error(), "outcome_verified": false}
+	var commandErr *native.CommandError
+	if errors.As(err, &commandErr) {
+		for key, value := range commandErr.Diagnostic() {
+			detail[key] = value
+		}
+	}
+	return detail
+}
+
 func (s *Service) sqliteError(err error) error {
 	var epochErr *state.StateEpochError
 	if errors.As(err, &epochErr) {
 		return protocol.NewError("state_unverified", "state database epoch is not trustworthy", map[string]any{"key": "state_epoch", "cause": err.Error()})
 	}
-	return protocol.NewError("sqlite_unavailable", "state database operation failed", map[string]any{"cause": err.Error(), "state_committed": nil})
+	detail := map[string]any{"cause": err.Error(), "phase": "unknown", "sql_operation": "unknown", "state_committed": nil}
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		detail["sqlite_code"] = sqliteErr.Code()
+		if name, ok := sqlite.ErrorCodeString[sqliteErr.Code()]; ok {
+			detail["sqlite_name"] = name
+		} else {
+			detail["sqlite_name"] = fmt.Sprintf("SQLITE_%d", sqliteErr.Code())
+		}
+	}
+	var transactionErr *state.TransactionError
+	if errors.As(err, &transactionErr) {
+		detail["phase"] = transactionErr.Phase
+		detail["sql_operation"] = transactionErr.SQLOperation
+		detail["state_committed"] = transactionErr.StateCommitted
+		if transactionErr.RollbackError != nil {
+			detail["rollback_error"] = transactionErr.RollbackError.Error()
+		}
+	}
+	return protocol.NewError("sqlite_unavailable", "state database operation failed", detail)
 }
 
 func requestedResources(request protocol.Request) (map[string]int64, error) {

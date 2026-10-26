@@ -139,7 +139,7 @@ GO_RETIRED_UNITS = (
 )
 GO_UNIT_EXEC_START = {
     "agent-vm-native.service":
-        "ExecStart=/opt/agent-vm-native/bin/agent-vm-control serve --config /etc/agent-vm-native/config.json",
+        "ExecStart=/opt/agent-vm-native/bin/agent-vm-control serve --config /etc/agent-vm-native/config.json --manifest /opt/agent-vm-native/release-manifest.json",
 }
 GO_UNIT_CONTENT_SHA256 = {
     "agent-vm-native.service": "447f9c09e9378919673708944a45c06d8498308d5613849ff6497103dd1577bb",

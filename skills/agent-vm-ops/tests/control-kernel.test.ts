@@ -733,6 +733,15 @@ describe("control-store: legacy schema and durable transaction behavior", () => 
     });
   });
 
+  test("accepts the Go bootstrap state epoch sentinel", async () => {
+    await withStore((store) => {
+      store.connection
+        .query("UPDATE meta SET value = ? WHERE key = ?")
+        .run("initial", "state_epoch");
+      expect(store.state_epoch()).toBe("initial");
+    });
+  });
+
   test("rolls back all nested task, port, journal and audit writes", async () => {
     await withStore((store) => {
       const original = new ControlError("native_failed", "native failed");

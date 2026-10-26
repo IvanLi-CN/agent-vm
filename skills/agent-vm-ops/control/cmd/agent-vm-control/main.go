@@ -27,8 +27,26 @@ import (
 
 var version = "agent-vm-control/dev"
 
+const installedManifestPath = "/opt/agent-vm-native/release-manifest.json"
+
+type exitError struct {
+	code    int
+	cause   error
+	emitted bool
+}
+
+func (err *exitError) Error() string { return err.cause.Error() }
+func (err *exitError) Unwrap() error { return err.cause }
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		var processExit *exitError
+		if errors.As(err, &processExit) {
+			if !processExit.emitted {
+				fmt.Fprintln(os.Stderr, err)
+			}
+			os.Exit(processExit.code)
+		}
 		if control, ok := err.(*protocol.Error); ok {
 			_ = json.NewEncoder(os.Stderr).Encode(map[string]any{"ok": false, "protocol": protocol.Version, "error": control})
 		} else {
@@ -59,9 +77,12 @@ func serve(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "/etc/agent-vm-native/config.json", "configuration path")
-	manifestPath := flags.String("manifest", "", "validated release manifest path")
+	manifestPath := flags.String("manifest", installedManifestPath, "validated release manifest path")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if *manifestPath != installedManifestPath {
+		return errors.New("manifest_invalid: serve requires the fixed installed release manifest path")
 	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -88,7 +109,7 @@ func serve(args []string) error {
 	if cfg.MetricsDir != "" {
 		snapshots = observe.NewSnapshotStore(cfg.MetricsDir)
 	}
-	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots})
+	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver()})
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	schedulerInstance := scheduler.New(service)
@@ -115,20 +136,30 @@ func request(args []string) error {
 		return err
 	}
 	if len(body) > 2*1024*1024 {
-		return protocol.NewError("request_too_large", "request body exceeds the limit", nil)
+		control := protocol.NewError("request_too_large", "request body exceeds the limit", nil)
+		payload, _ := json.Marshal(map[string]any{"ok": false, "protocol": protocol.Version, "error": control})
+		_, _ = os.Stderr.Write(append(payload, '\n'))
+		return &exitError{code: 2, cause: control, emitted: true}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
-	response, status, err := httpserver.Request(ctx, *socket, body)
+	response, status, exitCode, err := httpserver.RequestWithExitCode(ctx, *socket, body)
 	if err != nil {
-		return err
+		return &exitError{code: 3, cause: err}
+	}
+	if exitCode != 0 {
+		_, _ = os.Stderr.Write(response)
+		if len(response) == 0 || response[len(response)-1] != '\n' {
+			_, _ = os.Stderr.Write([]byte("\n"))
+		}
+		return &exitError{code: exitCode, cause: fmt.Errorf("control request returned HTTP %d", status), emitted: true}
 	}
 	_, _ = os.Stdout.Write(response)
 	if len(response) == 0 || response[len(response)-1] != '\n' {
 		_, _ = os.Stdout.Write([]byte("\n"))
 	}
 	if status >= 400 {
-		return fmt.Errorf("control request returned HTTP %d", status)
+		return &exitError{code: 3, cause: fmt.Errorf("successful control response returned HTTP %d", status)}
 	}
 	return nil
 }

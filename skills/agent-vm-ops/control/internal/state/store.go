@@ -92,6 +92,28 @@ func (err *StateEpochError) Error() string {
 	return fmt.Sprintf("state_unverified: state database epoch %s", err.Reason)
 }
 
+// TransactionError preserves the point at which a SQLite mutation failed.
+// A nil StateCommitted means that the commit result cannot be established and
+// callers must keep the operation pending for reconciliation.
+type TransactionError struct {
+	Phase          string
+	SQLOperation   string
+	StateCommitted *bool
+	RollbackError  error
+	Cause          error
+}
+
+func (err *TransactionError) Error() string {
+	if err.Cause == nil {
+		return fmt.Sprintf("sqlite %s failed", err.Phase)
+	}
+	return fmt.Sprintf("sqlite %s failed: %v", err.Phase, err.Cause)
+}
+
+func (err *TransactionError) Unwrap() error { return err.Cause }
+
+func committed(value bool) *bool { return &value }
+
 type Task struct {
 	TaskID                  string
 	SessionID               string
@@ -312,29 +334,37 @@ func (s *Store) withRead(ctx context.Context, fn func(*sql.Conn) error) error {
 func (s *Store) withWrite(ctx context.Context, fn func(*Tx) error) error {
 	conn, err := s.write.Conn(ctx)
 	if err != nil {
-		return err
+		return &TransactionError{Phase: "connection", SQLOperation: "write", StateCommitted: committed(false), Cause: err}
 	}
 	tx := &Tx{conn: conn}
 	defer conn.Close()
 	if err := configure(conn, ctx); err != nil {
-		return err
+		return &TransactionError{Phase: "connection", SQLOperation: "configure", StateCommitted: committed(false), Cause: err}
 	}
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-		return err
+		return &TransactionError{Phase: "begin", SQLOperation: "write", StateCommitted: committed(false), Cause: err}
 	}
 	if err := fn(tx); err != nil {
-		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-		return err
+		_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
+		stateCommitted := committed(false)
+		if rollbackErr != nil {
+			stateCommitted = nil
+		}
+		return &TransactionError{Phase: "write", SQLOperation: "write", StateCommitted: stateCommitted, RollbackError: rollbackErr, Cause: err}
 	}
 	if tx.changed {
 		if _, err := tx.conn.ExecContext(ctx, "INSERT INTO meta(key, value) VALUES('state_epoch', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", newEpoch()); err != nil {
-			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-			return err
+			_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
+			stateCommitted := committed(false)
+			if rollbackErr != nil {
+				stateCommitted = nil
+			}
+			return &TransactionError{Phase: "commit", SQLOperation: "state_epoch", StateCommitted: stateCommitted, RollbackError: rollbackErr, Cause: err}
 		}
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
-		return err
+		_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
+		return &TransactionError{Phase: "commit", SQLOperation: "commit", StateCommitted: nil, RollbackError: rollbackErr, Cause: err}
 	}
 	tx.closed = true
 	return nil
@@ -770,9 +800,59 @@ func (s *Store) ListPorts(ctx context.Context, taskID string) ([]Port, error) {
 
 func (s *Store) UpsertPort(ctx context.Context, value Port) error {
 	return s.withWrite(ctx, func(tx *Tx) error {
-		_, err := tx.exec("INSERT INTO ports(task_id, generation, port_name, protocol, host_port, vm_port, device_name, state, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(task_id, port_name, protocol) DO UPDATE SET generation = excluded.generation, host_port = excluded.host_port, vm_port = excluded.vm_port, device_name = excluded.device_name, state = excluded.state WHERE generation IS NOT excluded.generation OR host_port IS NOT excluded.host_port OR vm_port IS NOT excluded.vm_port OR device_name IS NOT excluded.device_name OR state IS NOT excluded.state", value.TaskID, value.Generation, value.PortName, value.Protocol, value.HostPort, value.VMPort, value.DeviceName, value.State, value.CreatedAt)
-		return err
+		return upsertPortTx(tx, value)
 	})
+}
+
+// UpsertPortIf applies the native mapping only while the task's generation,
+// lifecycle state and lease are still valid in the same write transaction.
+func (s *Store) UpsertPortIf(ctx context.Context, value Port, condition TaskCondition) (bool, error) {
+	matched := false
+	err := s.withWrite(ctx, func(tx *Tx) error {
+		var err error
+		matched, err = taskConditionMatches(ctx, tx, value.TaskID, condition)
+		if err != nil || !matched {
+			return err
+		}
+		return upsertPortTx(tx, value)
+	})
+	return matched, err
+}
+
+func upsertPortTx(tx *Tx, value Port) error {
+	_, err := tx.exec("INSERT INTO ports(task_id, generation, port_name, protocol, host_port, vm_port, device_name, state, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(task_id, port_name, protocol) DO UPDATE SET generation = excluded.generation, host_port = excluded.host_port, vm_port = excluded.vm_port, device_name = excluded.device_name, state = excluded.state WHERE generation IS NOT excluded.generation OR host_port IS NOT excluded.host_port OR vm_port IS NOT excluded.vm_port OR device_name IS NOT excluded.device_name OR state IS NOT excluded.state", value.TaskID, value.Generation, value.PortName, value.Protocol, value.HostPort, value.VMPort, value.DeviceName, value.State, value.CreatedAt)
+	return err
+}
+
+func taskConditionMatches(ctx context.Context, tx *Tx, taskID string, condition TaskCondition) (bool, error) {
+	where := []string{"task_id = ?"}
+	args := []any{taskID}
+	if condition.Generation != nil {
+		where = append(where, "generation = ?")
+		args = append(args, *condition.Generation)
+	}
+	if len(condition.States) > 0 {
+		placeholders := make([]string, len(condition.States))
+		for index, value := range condition.States {
+			placeholders[index] = "?"
+			args = append(args, value)
+		}
+		where = append(where, "state IN ("+strings.Join(placeholders, ", ")+")")
+	}
+	if condition.LeaseActiveAfter != nil {
+		where = append(where, "datetime(lease_expires_at) > datetime(?)")
+		args = append(args, condition.LeaseActiveAfter.UTC().Format(time.RFC3339Nano))
+	}
+	if condition.LeaseExpiredAt != nil {
+		where = append(where, "(lease_expires_at IS NULL OR datetime(lease_expires_at) <= datetime(?))")
+		args = append(args, condition.LeaseExpiredAt.UTC().Format(time.RFC3339Nano))
+	}
+	var exists int
+	err := tx.conn.QueryRowContext(ctx, "SELECT 1 FROM tasks WHERE "+strings.Join(where, " AND "), args...).Scan(&exists)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (s *Store) DeletePort(ctx context.Context, taskID, name, protocol string) error {
