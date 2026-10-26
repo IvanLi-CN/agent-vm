@@ -103,6 +103,12 @@ class WrapperTests(unittest.TestCase):
             WRAPPER._systemctl("disable", "agent-vm-native-age-gc.service", allow_missing=True)
             WRAPPER._systemctl("enable", "agent-vm-native-age-gc.service", allow_missing=True)
 
+        missing_template = subprocess.CompletedProcess(
+            [], 1, b"", b"Failed to stop agent-vm-native-expire@.service: Unit name is missing the instance name\n",
+        )
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=missing_template):
+            WRAPPER._systemctl("stop", "agent-vm-native-expire@.service", allow_missing=True)
+
         failed = subprocess.CompletedProcess([], 1, b"", b"Failed to disable unit: permission denied\n")
         with mock.patch.object(WRAPPER.subprocess, "run", return_value=failed):
             with self.assertRaises(WRAPPER.WrapperError) as failure:
