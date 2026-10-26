@@ -570,11 +570,11 @@ func (s *Store) updateTask(ctx context.Context, taskID string, condition *TaskCo
 				where = append(where, "state IN ("+strings.Join(placeholders, ", ")+")")
 			}
 			if condition.LeaseActiveAfter != nil {
-				where = append(where, "datetime(lease_expires_at) > datetime(?)")
+				where = append(where, "julianday(lease_expires_at) > julianday(?)")
 				args = append(args, condition.LeaseActiveAfter.UTC().Format(time.RFC3339Nano))
 			}
 			if condition.LeaseExpiredAt != nil {
-				where = append(where, "(lease_expires_at IS NULL OR datetime(lease_expires_at) <= datetime(?))")
+				where = append(where, "(lease_expires_at IS NULL OR julianday(lease_expires_at) <= julianday(?))")
 				args = append(args, condition.LeaseExpiredAt.UTC().Format(time.RFC3339Nano))
 			}
 			var exists int
@@ -840,11 +840,11 @@ func taskConditionMatches(ctx context.Context, tx *Tx, taskID string, condition 
 		where = append(where, "state IN ("+strings.Join(placeholders, ", ")+")")
 	}
 	if condition.LeaseActiveAfter != nil {
-		where = append(where, "datetime(lease_expires_at) > datetime(?)")
+		where = append(where, "julianday(lease_expires_at) > julianday(?)")
 		args = append(args, condition.LeaseActiveAfter.UTC().Format(time.RFC3339Nano))
 	}
 	if condition.LeaseExpiredAt != nil {
-		where = append(where, "(lease_expires_at IS NULL OR datetime(lease_expires_at) <= datetime(?))")
+		where = append(where, "(lease_expires_at IS NULL OR julianday(lease_expires_at) <= julianday(?))")
 		args = append(args, condition.LeaseExpiredAt.UTC().Format(time.RFC3339Nano))
 	}
 	var exists int

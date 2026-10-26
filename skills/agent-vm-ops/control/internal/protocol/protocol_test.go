@@ -67,6 +67,51 @@ func TestValidateRequestRejectsFractionalGeneration(t *testing.T) {
 	}
 }
 
+func testRelease() *ReleaseMetadata {
+	actions := make(map[string]ActionCompatibility, len(Actions))
+	for action := range Actions {
+		actions[action] = ActionCompatibility{
+			Request:        Schema{Schema: 1, SemanticRevision: 1},
+			Response:       Schema{Schema: 1, SemanticRevision: 1},
+			RequestWindow:  CompatibilityWindow{SchemaMin: 1, SchemaMax: 1, SemanticMin: 1, SemanticMax: 1},
+			ResponseWindow: CompatibilityWindow{SchemaMin: 1, SchemaMax: 1, SemanticMin: 1, SemanticMax: 1},
+		}
+	}
+	return &ReleaseMetadata{ReleaseID: strings.Repeat("a", 40), SourceRevision: strings.Repeat("a", 40), Protocol: Version, Transport: "go-request", ManifestPresent: true, ArtifactsVerified: true, Actions: actions}
+}
+
+func TestValidateCompatibilityRejectsBeforeDispatchWindow(t *testing.T) {
+	release := testRelease()
+	request := Request{
+		"protocol": Version, "action": "acquire",
+		"compatibility": map[string]any{
+			"release_id": strings.Repeat("b", 40), "protocol": Version, "action": "acquire",
+			"request":           map[string]any{"schema": 2, "semantic_revision": 1},
+			"accepted_response": map[string]any{"schema_min": 1, "schema_max": 1, "semantic_min": 1, "semantic_max": 1},
+		},
+	}
+	warnings, control := ValidateCompatibility(request, release)
+	if warnings != nil || control == nil || control.Code != "request_schema_incompatible" {
+		t.Fatalf("warnings=%#v control=%#v", warnings, control)
+	}
+}
+
+func TestValidateCompatibilityReturnsReleaseWarning(t *testing.T) {
+	release := testRelease()
+	request := Request{
+		"protocol": Version, "action": "status",
+		"compatibility": map[string]any{
+			"release_id": strings.Repeat("b", 40), "protocol": Version, "action": "status",
+			"request":           map[string]any{"schema": 1, "semantic_revision": 1},
+			"accepted_response": map[string]any{"schema_min": 1, "schema_max": 1, "semantic_min": 1, "semantic_max": 1},
+		},
+	}
+	warnings, control := ValidateCompatibility(request, release)
+	if control != nil || len(warnings) != 1 || warnings[0].(map[string]any)["code"] != "compatible_release" {
+		t.Fatalf("warnings=%#v control=%#v", warnings, control)
+	}
+}
+
 func TestSuccessIncludesServerTimeForFormatTwoClients(t *testing.T) {
 	response := Success(Request{"protocol": Version, "action": "status", "session_id": "s"}, map[string]any{})
 	if value, ok := response["server_time"].(string); !ok || strings.TrimSpace(value) == "" {

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -16,6 +17,7 @@ SCRIPTS = ROOT / "skills/agent-vm-ops/scripts"
 if str(SCRIPTS) not in os.sys.path:
     os.sys.path.insert(0, str(SCRIPTS))
 import agent_vm_release as RELEASE  # noqa: E402
+import release_manifest as MANIFEST  # noqa: E402
 
 
 class FakeTransport:
@@ -119,6 +121,54 @@ class ReleasePublisherTests(unittest.TestCase):
             sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
             monotonic=clock or (lambda: elapsed[0]),
         )
+
+    def go_bundle(self, release_id: str) -> Path:
+        extracted = self.root / "go-candidate"
+        client_root = ROOT / "skills/agent-vm/scripts"
+        ops_root = ROOT / "skills/agent-vm-ops"
+        artifacts = []
+        for name, relative, role, mode in sorted(MANIFEST.GO_FIXED_ARTIFACTS):
+            path = extracted / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if relative == "bin/agent-vm-control":
+                path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42)
+            elif relative == "systemd/agent-vm-native.service":
+                path.write_bytes((ops_root / "assets/systemd/agent-vm-native.service").read_bytes())
+            elif relative == "agent_vm_control_bridge.ts":
+                path.write_bytes((ops_root / "scripts/agent_vm_control_bridge.ts").read_bytes())
+            else:
+                path.write_bytes((client_root / relative).read_bytes())
+            path.chmod(mode)
+            artifacts.append({"name": name, "path": relative, "role": role, "sha256": MANIFEST.sha256_file(path), "mode": mode})
+        manifest = MANIFEST.build_go_manifest(release_id, artifacts)
+        (extracted / "release-manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+        client_artifact = next(item for item in artifacts if item["role"] == "client")
+        (extracted / "client-release.json").write_text(json.dumps({
+            "format": 2,
+            "release_id": release_id,
+            "source_revision": release_id,
+            "protocol": 4,
+            "client_artifact": client_artifact,
+            "client_dependencies": [item for item in artifacts if item["path"] in MANIFEST.CLIENT_DEPENDENCY_MODES],
+            "client_view": manifest["client_view"],
+        }, sort_keys=True) + "\n", encoding="utf-8")
+        bundle = self.root / "go-bundle.tar"
+        with tarfile.open(bundle, mode="w") as archive:
+            for path in sorted(extracted.rglob("*")):
+                if path.is_file():
+                    archive.add(path, arcname=path.relative_to(extracted).as_posix(), recursive=False)
+        return bundle
+
+    def test_open_bundle_verifies_format_two_go_release(self):
+        bundle = self.go_bundle("f" * 40)
+        temporary, root, manifest = RELEASE._open_bundle(bundle)
+        try:
+            self.assertEqual(manifest["format"], 2)
+            self.assertEqual(manifest["client_view"]["transport"], "go-request")
+            self.assertTrue((root / "bin/agent-vm-control").is_file())
+            self.assertTrue(RELEASE.verify_release(bundle)["verified"])
+        finally:
+            temporary.cleanup()
 
     def test_publish_is_remote_first_and_exits_drain_after_local_client(self):
         transport = FakeTransport()

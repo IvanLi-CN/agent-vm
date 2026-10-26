@@ -54,6 +54,7 @@ type Service struct {
 	Clock     func() time.Time
 	Snapshots *observe.SnapshotStore
 	CPU       CPUObserver
+	Release   *protocol.ReleaseMetadata
 
 	mu          sync.RWMutex
 	controlMu   sync.Mutex
@@ -70,6 +71,7 @@ type Options struct {
 	Snapshots *observe.SnapshotStore
 	Wake      func()
 	CPU       CPUObserver
+	Release   *protocol.ReleaseMetadata
 }
 
 type CPUObserver interface {
@@ -81,7 +83,7 @@ func New(store *state.Store, cfg config.Config, options Options) *Service {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, resident: options.Resident, ready: false, wake: options.Wake}
+	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Release: options.Release, resident: options.Resident, ready: false, wake: options.Wake}
 }
 
 func (s *Service) MarkReady()  { s.mu.Lock(); s.ready = true; s.mu.Unlock() }
@@ -104,6 +106,10 @@ func (s *Service) wakeScheduler() {
 func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[string]any, error) {
 	if err := protocol.ValidateRequest(request); err != nil {
 		return nil, err
+	}
+	warnings, compatibilityErr := protocol.ValidateCompatibility(request, s.Release)
+	if compatibilityErr != nil {
+		return nil, compatibilityErr
 	}
 	action, _ := request["action"].(string)
 	if sessionActions[action] && request["session_id"] == nil {
@@ -135,7 +141,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 			return nil, s.sqliteError(err)
 		}
 		if existing != nil {
-			return s.replayRecord(request, existing)
+			return s.replayRecord(request, existing, warnings)
 		}
 	}
 	result, err := s.dispatchAction(ctx, action, request)
@@ -145,7 +151,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		}
 		return nil, err
 	}
-	response := protocol.Success(request, result)
+	response := protocol.SuccessWithRelease(request, result, s.Release, warnings)
 	if write {
 		operationID := stringValue(request["operation_id"])
 		digest, _ := protocol.Digest(request)
@@ -189,7 +195,7 @@ func (s *Service) replay(ctx context.Context, request protocol.Request, write bo
 	return s.replayRecord(request, record)
 }
 
-func (s *Service) replayRecord(request protocol.Request, record *state.Operation) (map[string]any, error) {
+func (s *Service) replayRecord(request protocol.Request, record *state.Operation, warningGroups ...[]any) (map[string]any, error) {
 	op := stringValue(request["operation_id"])
 	digest, err := protocol.Digest(request)
 	if err != nil {
@@ -215,7 +221,33 @@ func (s *Service) replayRecord(request protocol.Request, record *state.Operation
 	delete(replayed, "_request_digest")
 	replayed["outcome"] = "replayed"
 	replayed["server_time"] = nowString(s.Clock())
+	if s.Release != nil {
+		replayed["release"] = protocol.ReleaseEnvelope(s.Release)
+		if len(warningGroups) > 0 {
+			storedWarnings, _ := replayed["warnings"].([]any)
+			for _, incoming := range warningGroups[0] {
+				if !hasWarning(storedWarnings, incoming) {
+					storedWarnings = append(storedWarnings, incoming)
+				}
+			}
+			replayed["warnings"] = storedWarnings
+		}
+	}
 	return replayed, nil
+}
+
+func hasWarning(existing []any, candidate any) bool {
+	want, ok := candidate.(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, value := range existing {
+		item, ok := value.(map[string]any)
+		if ok && stringValue(item["code"]) == stringValue(want["code"]) && stringValue(item["message"]) == stringValue(want["message"]) && stringValue(item["action"]) == stringValue(want["action"]) {
+			return true
+		}
+	}
+	return false
 }
 
 // StartupReconcile performs the fail-closed recovery pass before admission is
@@ -1004,7 +1036,7 @@ func (s *Service) gc(ctx context.Context, apply bool) (map[string]any, error) {
 		if task.State != stateCached || task.CleanupAfter == nil {
 			continue
 		}
-		deadline, parseErr := time.Parse(time.RFC3339, *task.CleanupAfter)
+		deadline, parseErr := time.Parse(time.RFC3339Nano, *task.CleanupAfter)
 		if parseErr != nil || deadline.After(s.Clock()) {
 			continue
 		}
@@ -1540,12 +1572,12 @@ func taskID(session string) string {
 }
 func effective(task *state.Task, now time.Time) bool {
 	return task != nil && task.State == stateActive && task.LeaseExpiresAt != nil && func() bool {
-		parsed, err := time.Parse(time.RFC3339, *task.LeaseExpiresAt)
+		parsed, err := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
 		return err == nil && parsed.After(now)
 	}()
 }
 func nowString(value time.Time) string {
-	text := value.UTC().Format("2006-01-02T15:04:05Z07:00")
+	text := value.UTC().Format(time.RFC3339Nano)
 	if strings.HasSuffix(text, "Z") {
 		text = strings.TrimSuffix(text, "Z") + "+00:00"
 	}

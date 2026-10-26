@@ -80,6 +80,21 @@ func TestLoadVerifiesCompleteGoBundle(t *testing.T) {
 	}
 }
 
+func TestLoadMetadataReturnsActionCompatibility(t *testing.T) {
+	manifestPath, _ := validManifest(t)
+	metadata, err := LoadMetadata(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.ReleaseID != strings.Repeat("a", 40) || metadata.Transport != "go-request" || !metadata.ManifestPresent || !metadata.ArtifactsVerified {
+		t.Fatalf("metadata identity = %#v", metadata)
+	}
+	status, ok := metadata.Actions["status"]
+	if !ok || status.Request.Schema != 1 || status.ResponseWindow.SemanticMax != 1 {
+		t.Fatalf("status metadata = %#v", status)
+	}
+}
+
 func TestLoadRejectsChangedArtifactBytes(t *testing.T) {
 	manifestPath, artifactPath := validManifest(t)
 	if err := os.WriteFile(artifactPath, []byte("tampered"), 0o644); err != nil {
