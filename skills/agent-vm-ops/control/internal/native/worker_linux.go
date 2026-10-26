@@ -36,24 +36,26 @@ func WorkerAlive(identity WorkerIdentity) (bool, error) {
 }
 
 func KillWorker(identity WorkerIdentity) error {
-	alive, err := WorkerAlive(identity)
-	if err != nil || !alive {
-		return err
-	}
 	fd, err := unix.PidfdOpen(identity.PID, 0)
-	if err != nil && !errors.Is(err, unix.ESRCH) {
+	if errors.Is(err, unix.ESRCH) {
+		return nil
+	}
+	if err != nil {
 		return fmt.Errorf("open native worker pidfd: %w", err)
 	}
-	if fd >= 0 {
-		defer unix.Close(fd)
+	defer unix.Close(fd)
+	current, err := workerIdentity(identity.PID)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
 	}
-	if err := unix.Kill(-identity.PID, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
-		return fmt.Errorf("kill native worker group: %w", err)
+	if err != nil {
+		return fmt.Errorf("recheck native worker identity: %w", err)
 	}
-	if fd >= 0 {
-		if err := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
-			return fmt.Errorf("kill native worker: %w", err)
-		}
+	if current.StartTime != identity.StartTime {
+		return fmt.Errorf("native worker identity changed for pid %d", identity.PID)
+	}
+	if err := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
+		return fmt.Errorf("kill native worker: %w", err)
 	}
 	return nil
 }

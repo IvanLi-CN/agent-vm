@@ -2,9 +2,18 @@
 
 package native
 
+import "os/exec"
+
 type processTracker struct{}
 
 func newProcessTracker() (*processTracker, error) { return &processTracker{}, nil }
+func startTrackedCommand(command *exec.Cmd, tracker *processTracker) (bool, error) {
+	if err := command.Start(); err != nil {
+		return false, err
+	}
+	tracker.Register(command.Process.Pid)
+	return true, tracker.Discover(command.Process.Pid)
+}
 func (tracker *processTracker) Identity(root int) (WorkerIdentity, error) {
 	return workerIdentity(root)
 }

@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -311,6 +312,15 @@ class ReleasePublisherTests(unittest.TestCase):
             None,
             timeout=RELEASE.ACTIVATION_TIMEOUT_SECONDS,
         )
+
+    def test_default_ssh_transport_honors_activation_budget(self):
+        transport = RELEASE.SSHTransport()
+        completed = subprocess.CompletedProcess(
+            args=["ssh"], returncode=0, stdout=b"{}", stderr=b"",
+        )
+        with mock.patch.object(RELEASE.subprocess, "run", return_value=completed) as run:
+            transport.wrapper("staging-control", RELEASE.CANONICAL_REMOTE_WRAPPER, "activate", "tx", "e" * 40)
+        self.assertEqual(run.call_args.kwargs["timeout"], RELEASE.ACTIVATION_TIMEOUT_SECONDS)
 
     def test_ssh_control_uses_bun_and_the_typescript_controller(self):
         transport = RELEASE.SSHTransport()

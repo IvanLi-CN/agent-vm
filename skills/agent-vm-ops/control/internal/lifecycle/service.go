@@ -60,6 +60,8 @@ type Service struct {
 	lockMu      sync.Mutex
 	actionLocks map[string]*sync.Mutex
 	maintenance sync.Mutex
+	activeMu    sync.Mutex
+	activeOps   map[string]struct{}
 	admissionMu sync.Mutex
 	resident    bool
 	ready       bool
@@ -85,7 +87,7 @@ func New(store *state.Store, cfg config.Config, options Options) *Service {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Release: options.Release, resident: options.Resident, ready: false, wake: options.Wake, actionLocks: make(map[string]*sync.Mutex)}
+	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Release: options.Release, resident: options.Resident, ready: false, wake: options.Wake, actionLocks: make(map[string]*sync.Mutex), activeOps: make(map[string]struct{})}
 }
 
 func (s *Service) MarkReady()  { s.mu.Lock(); s.ready = true; s.mu.Unlock() }
@@ -141,6 +143,27 @@ func (s *Service) withSessionLock(session string, fn func() (map[string]any, err
 	return fn()
 }
 
+func (s *Service) markOperationActive(operationID string) func() {
+	if operationID == "" {
+		return func() {}
+	}
+	s.activeMu.Lock()
+	s.activeOps[operationID] = struct{}{}
+	s.activeMu.Unlock()
+	return func() {
+		s.activeMu.Lock()
+		delete(s.activeOps, operationID)
+		s.activeMu.Unlock()
+	}
+}
+
+func (s *Service) operationActive(operationID string) bool {
+	s.activeMu.Lock()
+	_, active := s.activeOps[operationID]
+	s.activeMu.Unlock()
+	return active
+}
+
 func (s *Service) WorkerStarted(ctx context.Context, operationID string, identity native.WorkerIdentity) error {
 	return s.recordWorker(ctx, operationID, map[string]any{
 		"pid":        identity.PID,
@@ -180,6 +203,9 @@ func (s *Service) recordWorker(ctx context.Context, operationID string, worker m
 
 func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.Operation) error {
 	for _, operation := range pending {
+		if s.operationActive(operation.OperationID) {
+			continue
+		}
 		worker, ok := operation.Response["worker"].(map[string]any)
 		if !ok || stringValue(worker["state"]) != "running" {
 			continue
@@ -217,6 +243,12 @@ func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.O
 func (s *Service) recoverPending(ctx context.Context, pending []state.Operation) error {
 	var firstErr error
 	for _, operation := range pending {
+		if s.operationActive(operation.OperationID) {
+			continue
+		}
+		if _, hasWorker := operation.Response["worker"]; hasWorker {
+			continue
+		}
 		if !recoverableOperation(operation.Action) || recoveryAttempts(operation.Response) > 0 {
 			continue
 		}
@@ -237,8 +269,16 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 			}
 			continue
 		}
+		if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
+			if recordErr := s.recordError(ctx, request, compatibilityErr); recordErr != nil && firstErr == nil {
+				firstErr = s.sqliteError(recordErr)
+			}
+			continue
+		}
+		finishActive := s.markOperationActive(operation.OperationID)
 		recoveryCtx := native.WithWorkerRecorder(ctx, operation.OperationID, s)
 		result, dispatchErr := s.dispatchAction(recoveryCtx, operation.Action, request)
+		finishActive()
 		if dispatchErr != nil {
 			if uncertain(dispatchErr) {
 				if firstErr == nil {
@@ -269,7 +309,7 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 
 func recoverableOperation(action string) bool {
 	switch action {
-	case "acquire", "renew", "release", "destroy", "restart", "resize", "port-add", "port-remove", "drain-enter", "drain-exit":
+	case "drain-enter", "drain-exit":
 		return true
 	default:
 		return false
@@ -321,13 +361,17 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		pending := map[string]any{"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request)}
 		generation := intValue(request["generation"])
 		session := optionalString(request["session_id"])
+		finishActive := s.markOperationActive(operationID)
 		existing, err := s.Store.ClaimOperation(ctx, operationID, action, session, generationPointer(generation, request["generation"] != nil), pending)
 		if err != nil {
+			finishActive()
 			return nil, s.sqliteError(err)
 		}
 		if existing != nil {
+			finishActive()
 			return s.replayRecord(request, existing, warnings)
 		}
+		defer finishActive()
 		ctx = native.WithWorkerRecorder(ctx, operationID, s)
 	}
 	result, err := s.dispatchAction(ctx, action, request)
@@ -848,6 +892,8 @@ func (s *Service) restart(ctx context.Context, request protocol.Request) (map[st
 }
 
 func (s *Service) resize(ctx context.Context, request protocol.Request) (map[string]any, error) {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
 	task, err := s.task(ctx, request)
 	if err != nil {
 		return nil, err
@@ -916,6 +962,8 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 }
 
 func (s *Service) portAdd(ctx context.Context, request protocol.Request) (map[string]any, error) {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
 	task, err := s.task(ctx, request)
 	if err != nil {
 		return nil, err
@@ -1004,6 +1052,8 @@ func (s *Service) portList(ctx context.Context, request protocol.Request) (map[s
 }
 
 func (s *Service) portRemove(ctx context.Context, request protocol.Request) (map[string]any, error) {
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
 	task, err := s.task(ctx, request)
 	if err != nil {
 		return nil, err

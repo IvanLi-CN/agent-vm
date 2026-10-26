@@ -23,11 +23,12 @@ func closePIDFD(fd int) {
 }
 
 func killProcess(pid, pidfd int) {
-	// Kill the controlled process group first. A pidfd identifies only the
-	// leader; using it first leaves shell children alive with inherited pipes.
-	_ = unix.Kill(-pid, unix.SIGKILL)
 	if pidfd >= 0 {
 		_ = unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0)
+		return
 	}
+	// Kernels without pidfd support retain the process-group fallback. On
+	// supported kernels, cleanupTracked handles descendants with identity checks.
+	_ = unix.Kill(-pid, unix.SIGKILL)
 	_ = unix.Kill(pid, unix.SIGKILL)
 }

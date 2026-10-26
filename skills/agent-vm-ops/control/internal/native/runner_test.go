@@ -86,19 +86,26 @@ func TestRunnerAllowsIndependentCommandsToOverlap(t *testing.T) {
 func TestRunnerDurablyExposesWorkerIdentityToRecorder(t *testing.T) {
 	recorder := &testWorkerRecorder{}
 	ctx := WithWorkerRecorder(context.Background(), "operation", recorder)
-	if _, err := NewRunner().Run(ctx, []string{"/bin/echo", "worker"}, nil); err != nil {
-		t.Fatal(err)
+	for range 50 {
+		if _, err := NewRunner().Run(ctx, []string{"/bin/echo", "worker"}, nil); err != nil {
+			t.Fatal(err)
+		}
 	}
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
-	if len(recorder.started) != 1 || len(recorder.finished) != 1 || recorder.finished[0] != nil {
+	if len(recorder.started) != 50 || len(recorder.finished) != 50 {
 		t.Fatalf("worker callbacks = %#v", recorder)
 	}
-	if recorder.started[0].PID <= 0 {
-		t.Fatalf("worker identity = %#v", recorder.started[0])
-	}
-	if runtime.GOOS == "linux" && recorder.started[0].StartTime == "" {
-		t.Fatalf("Linux worker identity lacks start time: %#v", recorder.started[0])
+	for index, identity := range recorder.started {
+		if identity.PID <= 0 {
+			t.Fatalf("worker identity[%d] = %#v", index, identity)
+		}
+		if runtime.GOOS == "linux" && identity.StartTime == "" {
+			t.Fatalf("Linux worker identity[%d] lacks start time: %#v", index, identity)
+		}
+		if recorder.finished[index] != nil {
+			t.Fatalf("worker finish[%d] = %v", index, recorder.finished[index])
+		}
 	}
 }
 

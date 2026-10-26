@@ -295,6 +295,72 @@ func TestStartupReconcileRecoversOneSavedPendingOperation(t *testing.T) {
 	}
 }
 
+func TestReconcileDoesNotKillAnActivePendingWorker(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	operationID := "active-worker"
+	if err := store.RecordOperation(context.Background(), operationID, "release", stringPointer("active-session"), nil, map[string]any{
+		"outcome": "pending",
+		"worker":  map[string]any{"pid": int64(999999), "start_time": "1", "state": "running"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	finish := service.markOperationActive(operationID)
+	defer finish()
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.reconcilePendingWorkers(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := operation.Response["worker"].(map[string]any)
+	if worker["state"] != "running" {
+		t.Fatalf("active worker was reconciled: %#v", operation.Response)
+	}
+}
+
+func TestStartupReconcileLeavesUnsafePendingAcquireBlocked(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "unsafe", "generation": int64(0), "operation_id": "unsafe-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "unsafe-acquire", "acquire", stringPointer("unsafe"), &generation, map[string]any{
+		"outcome":         "pending",
+		"_request_digest": digest,
+		"_request":        map[string]any(request),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Resident: true})
+	err = service.StartupReconcile(context.Background())
+	if control := protocol.AsError(err); control.Code != "startup_reconcile_required" {
+		t.Fatalf("startup error = %#v", control)
+	}
+	operation, err := store.GetOperation(context.Background(), "unsafe-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Response["outcome"] != "pending" || operation.Response["_recovery_attempts"] != nil {
+		t.Fatalf("unsafe acquire was recovered: %#v", operation.Response)
+	}
+}
+
 func TestStartupPressureRefusesBeforeDurableAcquire(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

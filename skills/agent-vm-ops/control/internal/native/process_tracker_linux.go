@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,7 @@ type processTracker struct {
 }
 
 var activeNativeRoots sync.Map
+var nativeProcessTreeMu sync.Mutex
 
 func registerNativeRoot(pid int)   { activeNativeRoots.Store(pid, struct{}{}) }
 func unregisterNativeRoot(pid int) { activeNativeRoots.Delete(pid) }
@@ -64,6 +66,16 @@ func (tracker *processTracker) Register(root int) {
 	registerNativeRoot(root)
 }
 
+func startTrackedCommand(command *exec.Cmd, tracker *processTracker) (bool, error) {
+	nativeProcessTreeMu.Lock()
+	defer nativeProcessTreeMu.Unlock()
+	if err := command.Start(); err != nil {
+		return false, err
+	}
+	tracker.Register(command.Process.Pid)
+	return true, tracker.discover(command.Process.Pid)
+}
+
 func newProcessTracker() (*processTracker, error) {
 	owner := os.Getpid()
 	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
@@ -77,6 +89,12 @@ func newProcessTracker() (*processTracker, error) {
 }
 
 func (tracker *processTracker) Discover(root int) error {
+	nativeProcessTreeMu.Lock()
+	defer nativeProcessTreeMu.Unlock()
+	return tracker.discover(root)
+}
+
+func (tracker *processTracker) discover(root int) error {
 	if tracker.root == 0 {
 		tracker.root = root
 	}

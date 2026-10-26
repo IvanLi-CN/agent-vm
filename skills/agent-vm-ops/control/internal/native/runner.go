@@ -65,27 +65,39 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	command.Stdout = stdoutWriter
 	command.Stderr = stderrWriter
 	started := time.Now()
-	if err := command.Start(); err != nil {
+	startedCommand, trackingErr := startTrackedCommand(command, tracker)
+	if !startedCommand {
 		_ = stdoutReader.Close()
 		_ = stdoutWriter.Close()
 		_ = stderrReader.Close()
 		_ = stderrWriter.Close()
-		return Result{}, fmt.Errorf("start %s: %w", argv[0], err)
+		return Result{}, fmt.Errorf("start %s: %w", argv[0], trackingErr)
 	}
-	tracker.Register(command.Process.Pid)
 	// The child owns the duplicated write ends. Closing the parent's copies is
 	// required so successful commands can reach EOF, while a detached child
 	// cannot keep the parent-side descriptor alive indefinitely.
 	_ = stdoutWriter.Close()
 	_ = stderrWriter.Close()
-	trackingErr := tracker.Discover(command.Process.Pid)
 	stdoutDone := make(chan struct{})
 	stderrDone := make(chan struct{})
 	go drain(stdoutReader, stdout, stdoutDone)
 	go drain(stderrReader, stderr, stderrDone)
 	pidfd := openPIDFD(command.Process.Pid)
-	wait := make(chan error, 1)
-	go func() { wait <- command.Wait() }()
+	if trackingErr != nil {
+		killProcess(command.Process.Pid, pidfd)
+		cleanupErr := cleanupTracked(tracker, command.Process.Pid)
+		_ = stdoutReader.Close()
+		_ = stderrReader.Close()
+		_ = command.Wait()
+		<-stdoutDone
+		<-stderrDone
+		closePIDFD(pidfd)
+		_ = tracker.Reap()
+		if cleanupErr != nil {
+			return Result{}, fmt.Errorf("track native worker: %w; cleanup: %v", trackingErr, cleanupErr)
+		}
+		return Result{}, fmt.Errorf("track native worker: %w", trackingErr)
+	}
 	binding := workerBindingFromContext(ctx)
 	var identity WorkerIdentity
 	if binding.recorder != nil {
@@ -96,7 +108,7 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 			_ = cleanupTracked(tracker, command.Process.Pid)
 			_ = stdoutReader.Close()
 			_ = stderrReader.Close()
-			<-wait
+			_ = command.Wait()
 			<-stdoutDone
 			<-stderrDone
 			closePIDFD(pidfd)
@@ -104,6 +116,8 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 			return Result{}, fmt.Errorf("identify native worker: %w", identityErr)
 		}
 	}
+	wait := make(chan error, 1)
+	go func() { wait <- command.Wait() }()
 	workerStarted := false
 	defer func() {
 		if !workerStarted || binding.recorder == nil {

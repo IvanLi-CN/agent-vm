@@ -690,7 +690,7 @@ class SSHTransport:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
-                timeout=self.timeout if timeout is None else min(self.timeout, timeout),
+                timeout=self.timeout if timeout is None else timeout,
             )
         except FileNotFoundError:
             _fail("command_missing", "ssh is not installed")
