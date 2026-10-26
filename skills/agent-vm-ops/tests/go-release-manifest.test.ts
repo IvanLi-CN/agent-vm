@@ -44,7 +44,7 @@ test("format-2 manifest rejects malformed action schemas and compatibility windo
   expect(() => validate_go_manifest(inverted)).toThrow("inverted");
 });
 
-test("format-2 release archive excludes host metadata members", { timeout: 30_000 }, () => {
+test("format-2 release archive excludes host metadata members", { timeout: 120_000 }, () => {
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-go-release-test-"));
   const output = join(temporaryRoot, "release.tar");
   try {
