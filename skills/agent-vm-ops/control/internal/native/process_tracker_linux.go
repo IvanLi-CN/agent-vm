@@ -276,7 +276,7 @@ func readProcess(pid int) (trackedProcess, error) {
 		return trackedProcess{}, fmt.Errorf("invalid parent for pid %d: %w", pid, err)
 	}
 	group, err := strconv.Atoi(fields[2])
-	if err != nil || group <= 0 {
+	if err != nil {
 		return trackedProcess{}, fmt.Errorf("invalid process group for pid %d", pid)
 	}
 	return trackedProcess{pid: pid, start: fields[19], parent: parent, group: group, state: fields[0][0]}, nil
