@@ -2,11 +2,11 @@
 
 ## Context and Scope
 
-This topic defines a one-shot client and control process for session-owned Linux VMs on a configured Incus host. The public repository documents the lifecycle contract and ships the implementation; deployments provide their own project, image, network, address pool, storage path, state database and control address through explicit configuration.
+This topic defines a one-shot client and control process for session-owned Linux containers on a configured Incus host. The public repository documents the lifecycle contract and ships the implementation; deployments provide their own project, container image, network, address pool, storage path, state database and control address through explicit configuration.
 
 The design excludes public brokers, arbitrary HTTP gateways, polling by the client, implicit keepalives, shared host workspaces, exported archives and guarantees that survive lease expiry. The control environment includes one protected Go resident service; its internal UDS API and scheduler are implementation boundaries, not a new public client surface.
 
-The deployment topology is layered: the local Codex client reaches a configured Agent VM control endpoint; the control environment runs inside the observed CT109 LXC; the control environment owns session-scoped Incus VMs; and the physical or virtual source below CT109 is outside the verified public boundary. A control endpoint is an entry path, not evidence of the underlying host or its rebuild authority. The concrete address and live inventory remain in protected deployment records.
+The deployment topology is layered: the local Codex client reaches a configured Agent VM control endpoint; the control environment runs inside the observed CT109 LXC; the control environment owns session-scoped Incus system containers; and the physical or virtual source below CT109 is outside the verified public boundary. A control endpoint is an entry path, not evidence of the underlying host or its rebuild authority. The concrete address and live inventory remain in protected deployment records.
 
 ## Session and transport
 
@@ -16,7 +16,7 @@ Protocol 4 is required by both client and control. Mutations include an operatio
 
 ## Lifecycle
 
-Each session owns at most one VM slot, including preparing, stopping, deleting and cached states. Every task records the pinned image fingerprint used to create its guest. Acquire creates or reuses a stopped cache only when that fingerprint still matches the current pinned image; a stale cache returns `cache_stale` before native effects, and an operator must explicitly destroy it before a new acquire creates a guest from the current image. Acquire records a new generation and waits for guest agent and IPv4 readiness within one bounded monotonic budget. If an unrelated lease-expiry cleanup briefly exposes a transitional native instance, acquire waits within a separate bounded 30-second admission-convergence budget, polling no more often than every 250 milliseconds, and keeps the same operation pending; only that exact transitional condition is retryable and all other unverified state fails closed. Lease expiry and release revoke access, remove only owned mappings and stop the guest before making the slot reusable. A stopped disk may remain as a disposable cache; no recovery guarantee is made.
+Each session owns at most one managed-container slot, including preparing, stopping, deleting and cached states. Every task records the pinned container-image fingerprint used to create its guest. Acquire creates or reuses a stopped cache only when that fingerprint still matches the current pinned image; a stale cache returns `cache_stale` before native effects, and an operator must explicitly destroy it before a new acquire creates a guest from the current image. Acquire records a new generation and waits for the container to be running and IPv4-ready within one bounded monotonic budget. If an unrelated lease-expiry cleanup briefly exposes a transitional native instance, acquire waits within a separate bounded 30-second admission-convergence budget, polling no more often than every 250 milliseconds, and keeps the same operation pending; only that exact transitional condition is retryable and all other unverified state fails closed. Lease expiry and release revoke access, remove only owned mappings and stop the guest before making the slot reusable. A stopped container root filesystem may remain as a disposable cache; no recovery guarantee is made.
 
 Renewal is explicit and bounded. Acquire, status, SSH, execution and transfer do not renew a lease. A changed generation or expired lease rejects late readiness and native results. Durable state, locks and timers make repeated requests idempotent without hiding partial cleanup.
 
@@ -28,7 +28,7 @@ The deployment configuration supplies the control address and host port range. P
 
 Capacity observations are limited to the configured Incus pool filesystem and visible control-environment CPU and memory boundaries. External storage probes and infrastructure-manager inspection are unsupported. CPU and memory allocation ceilings use separately configurable overselling ratios; stopped caches consume disk only. New demand is refused when capacity measurements are missing or invalid, when the logical reservation ceiling is exceeded, when disk admission fails, while draining, or when a new native boot would run during verified severe CT-local CPU scheduler pressure. The approved overcommit deployment profile sets `cpu_startup_pressure_full_avg10_percent` to `50`; the CPU startup guard applies only when projected CPU allocation exceeds CT-visible CPU capacity and verified `full.avg10` reaches that threshold. It does not change the logical CPU ceiling or stop an effective lease. Low CT memory headroom is an observation and warning under reservation-only memory admission; it does not reduce logical remaining memory or reject a request within the configured ceiling. Existing lease queries, retrieval, renewal and release remain available during pressure.
 
-Disk changes require an explicit restart allowance and grow only. Guest root growth is an independent post-check: it diagnoses required capabilities and direct ext4/xfs topology before mutation, treats a filesystem already at least 95% of the requested virtual capacity as an idempotent success, and permits only one bounded partition-reread/settle retry for a classified transient failure. The old reservation remains until both virtual and guest filesystem capacity are verified. A single bounded convergence retry is allowed for the documented native balloon timeout; no polling loop or third attempt exists. Partial native or guest growth changes retain conservative reservations and a structured recovery state.
+Rootfs allocation changes require an explicit restart allowance and grow only. Container rootfs growth is an independent post-check: it verifies the Incus root device and the container-visible rootfs capacity against the requested allocation, treats a rootfs already at least 95% of the requested capacity as an idempotent success, and fails closed when the selected storage/profile cannot expose that evidence. The old reservation remains until both the Incus root device and container rootfs capacity are verified. A single bounded convergence retry is allowed for the documented native balloon timeout; no polling loop or third attempt exists. Partial native or rootfs growth changes retain conservative reservations and a structured recovery state.
 
 ## Reclamation and operations
 
@@ -38,7 +38,7 @@ Manual garbage collection is dry-run by default and selects only stopped managed
 
 The Go control service remains the sole authority for Incus operations, durable lifecycle state, lease generations, capacity admission, native mappings, observation snapshots and maintenance. Its in-process scheduler owns lease expiry, startup compensation, bounded retries and cache age-GC; systemd starts and restarts the service but is not the durable scheduler. The local `agent-vm` CLI remains a versioned request client; publication, update and rollback are operator-owned deployment actions and are not public CLI lifecycle commands. Unattended control-plane updates are disabled by default.
 
-A control-plane release is a logical compatibility unit containing the local client, the legacy bridge or Go control binary, systemd unit assets, and a release manifest. Format 1 describes the Bun one-shot release; format 2 also records the Go target/toolchain, fixed transport enum and retired legacy units. Both formats record exact artifact checksums, protocol, and per-operation request/response/semantic compatibility in each supported direction. Deployment configuration, credentials, connection material, state database and WAL/journals, locks, Incus VM data, and guest images are outside the release.
+A control-plane release is a logical compatibility unit containing the local client, the legacy bridge or Go control binary, systemd unit assets, and a release manifest. Format 1 describes the Bun one-shot release; format 2 also records the Go target/toolchain, fixed transport enum and retired legacy units. Both formats record exact artifact checksums, protocol, and per-operation request/response/semantic compatibility in each supported direction. Deployment configuration, credentials, connection material, state database and WAL/journals, locks, Incus container data, and guest images are outside the release.
 
 Compatible operations may continue across different release revisions with a structured warning. Compatibility is not inferred from parseability: an unsupported action, incompatible schema or semantic change, invalid checksum, or incompatible protocol MUST fail before any durable or native effect. A compatible evolution preserves the established protocol contract; a breaking evolution may require a new protocol and an explicit client update.
 
@@ -50,15 +50,15 @@ Remote publication MUST enter admission drain before activation, block new acqui
 
 ### REQ-AGENT-VM-010 - Layered provenance
 
-The public contract MUST distinguish the Codex client, configured control endpoint, CT109 LXC, Incus VM, and unknown underlying hosting source. It MUST NOT turn a configured address, CT identifier, or Incus identity into a claim about the next lower layer, and it MUST keep private deployment addresses and inventories outside the repository.
+The public contract MUST distinguish the Codex client, configured control endpoint, CT109 LXC, Incus system container, and unknown underlying hosting source. It MUST NOT turn a configured address, CT identifier, or Incus identity into a claim about the next lower layer, and it MUST keep private deployment addresses and inventories outside the repository.
 
 ### REQ-AGENT-VM-011 - Rebuild and recovery fencing
 
-Recovery MUST preserve the state database and WAL/journals, operation and audit records, generations, configuration, protected recovery copies, native timer assets, and Incus VM data. It MUST restore matching components under drain, reconcile durable records against native ownership and generations, and keep admission closed when state, provenance, capacity, or native identity is missing or inconsistent. It MUST NOT invent operation IDs, reset generations, replay uncertain native effects, or perform broad cleanup.
+Recovery MUST preserve the state database and WAL/journals, operation and audit records, generations, configuration, protected recovery copies, native timer assets, and Incus container data. It MUST restore matching components under drain, reconcile durable records against native ownership and generations, and keep admission closed when state, provenance, capacity, or native identity is missing or inconsistent. It MUST NOT invent operation IDs, reset generations, replay uncertain native effects, or perform broad cleanup.
 
 ### REQ-AGENT-VM-012 - Sparse disk failure boundary
 
-Disk admission MUST account for the configured CT-local Incus pool filesystem, request cost, watermarks, and durable reservations without claiming a full physical reservation for every virtual disk. Control-plane state and VM data MUST be treated as separate logical failure domains; ENOSPC or I/O failure MUST preserve conservative state and refuse unsafe new admission without evicting an effective lease.
+Disk admission MUST account for the configured CT-local Incus pool filesystem, request cost, watermarks, and durable reservations without claiming a full physical reservation for every configured container rootfs limit. Control-plane state and container data MUST be treated as separate logical failure domains; ENOSPC or I/O failure MUST preserve conservative state and refuse unsafe new admission without evicting an effective lease.
 
 ### REQ-AGENT-VM-013 - Observability provenance
 
@@ -78,7 +78,7 @@ Publication MUST stage and verify an explicit release before drain, enter drain 
 
 ### REQ-AGENT-VM-017 - Release scope and permission boundary
 
-A control-plane release MUST contain the local client, remote control script, systemd assets, release metadata, and exact artifact checksums, while excluding deployment configuration, credentials, connection material, state databases, locks, Incus VM data, and guest images. Publication MUST use the configured control entry with operator-only or narrowly scoped root-owned deployment authority and MUST NOT add PVE, host, guest, extra SSH, HTTP, or gateway access. Unattended control-plane updates MUST remain disabled by default.
+A control-plane release MUST contain the local client, remote control script, systemd assets, release metadata, and exact artifact checksums, while excluding deployment configuration, credentials, connection material, state databases, locks, Incus container data, and guest images. Publication MUST use the configured control entry with operator-only or narrowly scoped root-owned deployment authority and MUST NOT add PVE, host, guest, extra SSH, HTTP, or gateway access. Unattended control-plane updates MUST remain disabled by default.
 
 ### REQ-AGENT-VM-018 - CPU startup pressure boundary
 
@@ -88,7 +88,7 @@ The controller MUST observe CT-local CPU PSI separately from logical CPU reserva
 
 The read-only observation contract MUST distinguish logical reservation composition, CT-visible capacity, runtime pressure, physical disk headroom, native admission state and per-task lifecycle state. It MUST expose `some.avg10`, `full.avg10`, the configured startup threshold and startup-blocked state without treating PSI as CPU utilization or logical remaining capacity. The approved overcommit deployment profile MUST configure a 50 percent full-pressure threshold while retaining the compound projected-capacity gate.
 
-The deployment observation surface MUST provide separate capacity/admission and inventory/operations views. The capacity view MUST show allocated, reserved, allocated-and-reserved, remaining, limit and CT-visible capacity where authoritative, plus task-state counts and explicit snapshot estimates for logical and currently startable default-VM slots. The inventory view MUST cover all managed task states, use bounded fields, remove stale rows, and avoid raw errors, credentials and deployment paths. A missing or `-1` native slot limit MUST remain absent; a derived slot estimate MUST NOT be labelled as an authoritative slot limit.
+The deployment observation surface MUST provide separate capacity/admission and inventory/operations views. The capacity view MUST show allocated, reserved, allocated-and-reserved, remaining, limit and CT-visible capacity where authoritative, plus task-state counts and explicit snapshot estimates for logical and currently startable default-container slots. The inventory view MUST cover all managed task states, use bounded fields, remove stale rows, and avoid raw errors, credentials and deployment paths. A missing or `-1` native slot limit MUST remain absent; a derived slot estimate MUST NOT be labelled as an authoritative slot limit.
 
 The deployment scrape bridge MUST schedule `admin-metrics` and `admin-status` as independent observation lanes. A pending or failed inventory read MUST NOT remove the latest valid capacity metric families, and a pending or failed capacity read MUST NOT retain task rows from an unsuccessful inventory scrape. A retained source snapshot MUST keep its original observation timestamp and expose source-specific health or freshness failure; the bridge MUST NOT replace unavailable values with fabricated zeroes.
 
@@ -111,13 +111,13 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 
 ## Related ADRs
 
-- [Native Incus Agent VM lifecycle](../../adr/0025-native-incus-agent-vm-lifecycle.md)
 - [Agent VM topology and recovery boundary](../../adr/0028-agent-vm-topology-recovery-boundary.md)
 - [Agent VM memory reservation-only admission](../../adr/0029-agent-vm-memory-reservation-only-admission.md)
 - [Agent VM control-plane update boundary](../../adr/0030-agent-vm-control-plane-update-boundary.md)
 - [Agent VM CPU startup pressure for overcommit](../../adr/0032-agent-vm-cpu-startup-pressure-for-overcommit.md)
 - [Agent VM capacity and inventory observability](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)
 - [Agent VM Go resident control runtime](../../adr/0037-agent-vm-go-control-runtime.md)
+- [Native Incus Agent container lifecycle](../../adr/0038-native-incus-agent-container-lifecycle.md)
 
 ## Related material
 

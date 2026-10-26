@@ -257,7 +257,7 @@ export class NativeCommands extends CommandRunner {
   proxy_inventory: Data[] = [];
   forwards: Data[] = [];
   image_available = true;
-  image_type = "virtual-machine";
+  image_type = "container";
   proxy_allowed = true;
   project_limits: Data = {};
   storage_source: string | null = null;

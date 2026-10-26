@@ -2,7 +2,7 @@
 
 Install the matching client, Go control service, compatibility bridge and systemd assets from one checked-out Agent Toolkit revision. Record the revision and file checksums in protected operations records; do not create an installed-source fork.
 
-If the control environment must be rebuilt or recovered, preserve the state and VM data and follow the [topology and recovery runbook](../../../docs/specs/agent-vm/OPERATIONS.md) before replacing files. This deployment reference does not identify the host below CT109 or provide a host rebuild procedure.
+If the control environment must be rebuilt or recovered, preserve the state and container data and follow the [topology and recovery runbook](../../../docs/specs/agent-vm/OPERATIONS.md) before replacing files. This deployment reference does not identify the host below CT109 or provide a host rebuild procedure.
 
 | Surface | Deployment input |
 | --- | --- |
@@ -24,7 +24,7 @@ Prepare and verify the pinned guest image separately. Confirm fresh guests gener
 
 ## Control-plane publication
 
-A control-plane release is a logical compatibility unit containing the local client, the Go control service or legacy bridge, systemd assets, release metadata, and exact artifact checksums. It excludes deployment configuration, credentials, connection material, state databases and WAL/journals, locks, Incus VM data, and guest images. The release manifest declares protocol, source revision, artifact integrity, target/toolchain where applicable, and per-operation request/response/semantic compatibility in each supported direction.
+A control-plane release is a logical compatibility unit containing the local client, the Go control service or legacy bridge, systemd assets, release metadata, and exact artifact checksums. It excludes deployment configuration, credentials, connection material, state databases and WAL/journals, locks, Incus container data, and guest images. The release manifest declares protocol, source revision, artifact integrity, target/toolchain where applicable, and per-operation request/response/semantic compatibility in each supported direction.
 
 The public manifest, wrapper, publisher, and failure-state contract is [the Agent VM control-plane release contract](../../../docs/specs/agent-vm/contracts/release.md). Use the repository scripts only with owner-provided deployment inputs; do not put those inputs in the repository.
 

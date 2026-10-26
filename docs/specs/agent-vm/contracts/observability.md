@@ -1,6 +1,6 @@
 # Agent VM Observability Contract
 
-The dashboard must distinguish control-environment capacity, physical Incus pool capacity, guest allocation, and native admission. A healthy Incus daemon or a guest root filesystem quota is not evidence that the CT root filesystem can unpack an image or that native admission has room for another VM.
+The dashboard must distinguish control-environment capacity, physical Incus pool capacity, guest allocation, and native admission. A healthy Incus daemon or a guest root filesystem quota is not evidence that the CT root filesystem can unpack an image or that native admission has room for another managed container.
 
 ## Authority layers
 
@@ -9,14 +9,14 @@ The dashboard must distinguish control-environment capacity, physical Incus pool
 | Incus pool physical capacity | `incus_storage_pool_size_bytes`, `incus_storage_pool_used_bytes`, and the corresponding available series | Physical bytes consumed by the configured Incus pool. |
 | Guest rootfs allocation | `incus_filesystem_size_bytes` and related per-instance filesystem series | Guest allocation/quota. Label this as guest rootfs allocation; do not call it physical disk usage. |
 | CT root and image staging | A deployment-owned read-only filesystem probe for `/` and `/var/lib/incus/images` through the configured CT control entry | Control-state and transient image-unpack capacity. Incus project metrics cannot provide this boundary. |
-| Native admission | Native controller admission metrics | Allocated, reserved, remaining and limit values for CPU, memory, disk and VM slots. |
+| Native admission | Native controller admission metrics | Allocated, reserved, remaining and limit values for CPU, memory, disk and managed-container slots. |
 | Controller state | Native controller health, task-state and operation metrics | Readiness, draining, reclaim state, failures and cleanup backlog. |
 
 `incus_project_limit` is not an admission source when the relevant project values are `-1`. The dashboard must omit the corresponding limit line instead of drawing a guessed threshold. Project-level process limits and unrelated restrictions remain separate.
 
 ## Native metric families
 
-The deployment-facing collector must expose the following stable metric families. Each family has one unit; the resource dimension is encoded in the metric name rather than a label. CPU is vCPU, memory and disk are bytes, and VM slots are a count.
+The deployment-facing collector must expose the following stable metric families. Each family has one unit; the resource dimension is encoded in the metric name rather than a label. CPU is vCPU, memory and disk are bytes, and managed-container slots are a count. The `vm` segment in existing metric identifiers is a compatibility name for the Agent VM product and must not be interpreted as a requirement for Incus VMs.
 
 | Metric | Type | Required labels or values |
 | --- | --- | --- |
@@ -42,16 +42,16 @@ The deployment-facing collector must expose the following stable metric families
 | `agent_vm_admission_disk_remaining_bytes` | gauge | physical disk headroom in bytes |
 | `agent_vm_admission_disk_limit_bytes` | gauge | physical disk limit; absent when unverified |
 | `agent_vm_admission_disk_capacity_bytes` | gauge | physical disk capacity before admission |
-| `agent_vm_admission_instances_allocated_count` | gauge | allocated VM slot count |
-| `agent_vm_admission_instances_reserved_count` | gauge | reserved VM slot count |
-| `agent_vm_admission_instances_allocated_and_reserved_count` | gauge | allocated plus reserved VM slot count |
-| `agent_vm_admission_instances_remaining_count` | gauge | remaining VM slot count; absent without an authoritative limit |
-| `agent_vm_admission_instances_limit_count` | gauge | VM slot limit; absent when unverified |
-| `agent_vm_admission_instances_capacity_count` | gauge | authoritative VM slot capacity when exposed |
-| `agent_vm_admission_default_request_cpu_vcpu` | gauge | policy default VM request CPU |
-| `agent_vm_admission_default_request_memory_bytes` | gauge | policy default VM request memory |
-| `agent_vm_admission_default_request_disk_bytes` | gauge | policy default VM virtual disk size |
-| `agent_vm_admission_default_request_physical_cost_bytes` | gauge | policy default VM physical admission cost |
+| `agent_vm_admission_instances_allocated_count` | gauge | allocated managed-container slot count |
+| `agent_vm_admission_instances_reserved_count` | gauge | reserved managed-container slot count |
+| `agent_vm_admission_instances_allocated_and_reserved_count` | gauge | allocated plus reserved managed-container slot count |
+| `agent_vm_admission_instances_remaining_count` | gauge | remaining managed-container slot count; absent without an authoritative limit |
+| `agent_vm_admission_instances_limit_count` | gauge | managed-container slot limit; absent when unverified |
+| `agent_vm_admission_instances_capacity_count` | gauge | authoritative managed-container capacity when exposed |
+| `agent_vm_admission_default_request_cpu_vcpu` | gauge | policy default managed-container CPU request |
+| `agent_vm_admission_default_request_memory_bytes` | gauge | policy default managed-container memory request |
+| `agent_vm_admission_default_request_disk_bytes` | gauge | policy default container rootfs allocation limit |
+| `agent_vm_admission_default_request_physical_cost_bytes` | gauge | policy default container physical admission cost |
 | `agent_vm_admission_default_vm_logical_slots` | gauge | derived snapshot estimate; absent when inputs are unverified |
 | `agent_vm_admission_default_vm_startable_slots` | gauge | derived snapshot estimate with current startup gates; absent when inputs are unverified |
 | `agent_vm_memory_current_bytes` | gauge | CT-local cgroup `memory.current`; absent when unavailable |
@@ -72,7 +72,7 @@ The deployment-facing collector must expose the following stable metric families
 | `agent_vm_task_info` | gauge | bounded labels for task ID, instance/session identity, state, native status, guest availability and effective lease |
 | `agent_vm_task_cpu_vcpu` | gauge | requested task CPU, labelled by bounded task ID and state |
 | `agent_vm_task_memory_bytes` | gauge | requested task memory, labelled by bounded task ID and state |
-| `agent_vm_task_disk_bytes` | gauge | requested task virtual disk, labelled by bounded task ID and state |
+| `agent_vm_task_disk_bytes` | gauge | requested task container rootfs allocation, labelled by bounded task ID and state |
 | `agent_vm_task_lease_expires_at_seconds` | gauge | lease deadline, labelled by bounded task ID and state |
 | `agent_vm_task_ssh_mapping` | gauge | bounded task-to-SSH mapping metadata, without credentials, labelled by task ID and state |
 | `agent_vm_task_last_error_info` | gauge | stable error `code` and `phase`, without raw message text, labelled by task ID and state |
@@ -92,9 +92,9 @@ For the approved overcommit deployment profile, `agent_vm_cpu_startup_pressure_t
 
 When `admin-metrics.reclaim_required` is `null`, the collector must omit `agent_vm_admission_reclaim_required` for that scrape; `null` means disk admission is unverified, not that reclamation is unnecessary.
 
-The `admin-metrics` response keeps disk domains separate: `disk_admission.guest_allocation` reports sparse guest virtual-disk sizes, while `disk_admission.physical_admission` reports CT filesystem used/reserved/headroom against its low watermark. Consumers must map native disk admission metrics from the physical domain and must not compare sparse guest allocation totals with physical capacity. VM-slot admission is under `instances.admission`; its limit and remaining values are null when Incus exposes no authoritative slot limit, including `-1`.
+The `admin-metrics` response keeps disk domains separate: `disk_admission.guest_allocation` reports sparse managed-container rootfs allocation sizes, while `disk_admission.physical_admission` reports CT filesystem used/reserved/headroom against its low watermark. Consumers must map native disk admission metrics from the physical domain and must not compare sparse rootfs allocation totals with physical capacity. Managed-container slot admission is under `instances.admission`; its limit and remaining values are null when Incus exposes no authoritative slot limit, including `-1`.
 
-The default-request and slot-estimate families are derived bridge observations, not controller limits. The bridge reads the policy default request and physical cost from the controller/operations contract and calculates `logical_vm_slots` as the minimum of the verified logical CPU, logical memory and physical disk headroom ratios, rounded down. It calculates `startable_vm_slots` from the same snapshot after applying CT-visible CPU capacity and the configured CPU startup-pressure gate. It omits both estimates when an input is missing, contradictory or unverified. It must never emit a fabricated zero as a substitute for an unavailable estimate.
+The default-request and slot-estimate families are derived bridge observations, not controller limits. The bridge reads the policy default request and physical cost from the controller/operations contract and calculates the compatibility field `logical_vm_slots` as the minimum of the verified logical CPU, logical memory and physical disk headroom ratios, rounded down. It calculates the compatibility field `startable_vm_slots` from the same snapshot after applying CT-visible CPU capacity and the configured CPU startup-pressure gate. It omits both estimates when an input is missing, contradictory or unverified. It must never emit a fabricated zero as a substitute for an unavailable estimate.
 
 ## Dashboard contract
 
@@ -106,11 +106,11 @@ The provisioned dashboards enable automatic refresh by default with `refresh: "a
 
 The deployment renders two views. `Agent VM / Capacity & Admission` is the aggregate capacity view; `Agent VM / Inventory & Operations` is the per-task table and lifecycle view. The first uses `admin-metrics`; the second uses `admin-status`. Both are read-only and must expose scrape failure and freshness rather than silently retaining stale task rows.
 
-The capacity dashboard contains CT root available/used, image-staging available/used, physical pool total/used/free, and native admission allocated/reserved/remaining/limit. It includes the policy default request/cost, observed task-state counts and the logical/startable default-VM snapshot estimates. The existing guest rootfs panel is renamed to `Guest rootfs allocation`; a separate physical pool panel prevents quota totals from being mistaken for real disk usage. The capacity view must answer both whether an actual wall is being approached and what resource headroom remains for the next VM.
+The capacity dashboard contains CT root available/used, image-staging available/used, physical pool total/used/free, and native admission allocated/reserved/remaining/limit. It includes the policy default request/cost, observed task-state counts and the logical/startable default-container snapshot estimates. The existing guest rootfs panel is renamed to `Guest rootfs allocation`; a separate physical pool panel prevents quota totals from being mistaken for real disk usage. The capacity view must answer both whether an actual wall is being approached and what resource headroom remains for the next managed container.
 
 The CPU capacity view shows logical reservation composition, CT-visible CPU capacity, `some.avg10`, `full.avg10`, the configured startup threshold and startup-blocked state. The memory view shows logical reservation composition and CT-visible capacity separately from `memory.current`, `MemAvailable`, pressure and OOM. The inventory dashboard shows active, preparing, closing, deleting, failed, cached and absent tasks with state filters; cached rows are collapsed by default and no native slot limit is invented when Incus exposes `-1`. Its table renders requested CPU as vCPU, requested RAM and disk as GiB, and lease expiry as Unix seconds rather than ambiguous raw byte counts.
 
-Every chart with an authoritative limit renders that limit as a horizontal dashed line. This includes pool total, configured low/target watermarks, native CPU/memory/disk/VM-slot limits, and guest warning/critical thresholds where the policy defines them. A line is not rendered when the source is missing, unverified or `-1`.
+Every chart with an authoritative limit renders that limit as a horizontal dashed line. This includes pool total, configured low/target watermarks, native CPU/memory/disk/managed-container-slot limits, and guest warning/critical thresholds where the policy defines them. A line is not rendered when the source is missing, unverified or `-1`.
 
 The dashboards include readiness and failure panels for admission state, reclaim-required and draining flags, operation outcomes by phase, image-unpack failures, warnings, uptime and scrape freshness, plus current task states and pending/failed cleanup counts. These panels are required to explain an image-unpack failure when the pool still has free space. Inventory resource columns are joined by the composite `task_id|state` key, so a lifecycle transition cannot combine task metadata from different state snapshots.
 

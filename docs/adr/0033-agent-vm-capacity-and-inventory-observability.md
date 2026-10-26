@@ -6,9 +6,9 @@ status: accepted
 
 ## Context
 
-One dashboard cannot make aggregate admission, CT runtime pressure, and per-task lifecycle state equally readable. Aggregate metrics answer whether the next request fits the logical and physical gates; task state answers which managed VM records consume those reservations and whether a failure or transition is blocking progress. Mixing them produces charts that look full without explaining the composition.
+One dashboard cannot make aggregate admission, CT runtime pressure, and per-task lifecycle state equally readable. Aggregate metrics answer whether the next request fits the logical and physical gates; task state answers which managed-container records consume those reservations and whether a failure or transition is blocking progress. Mixing them produces charts that look full without explaining the composition.
 
-Incus does not provide an authoritative VM-slot limit for every deployment. A dashboard must not invent one from an unset or `-1` project quota. It may provide a bounded snapshot estimate for the configured default VM request, but the estimate must be labelled as derived and must not be presented as a native slot limit.
+Incus does not provide an authoritative managed-container slot limit for every deployment. A dashboard must not invent one from an unset or `-1` project quota. It may provide a bounded snapshot estimate for the configured default container request, but the estimate must be labelled as derived and must not be presented as a native slot limit.
 
 ## Decision
 
@@ -19,10 +19,10 @@ The deployment provides two dashboards backed by the same authorized read-only o
 
 The capacity dashboard shows, for CPU, memory and disk, `allocated`, `reserved`, `allocated_and_reserved`, logical `remaining`, and logical `limit` where authoritative. It also shows CT-visible capacity, current runtime observations, pressure, OOM and startup blocking separately. The CPU view includes `some.avg10`, `full.avg10`, the configured startup threshold, and the `startup_blocked` state; pressure is not folded into logical remaining.
 
-The capacity dashboard shows observed task-state counts and two derived default-VM estimates:
+The capacity dashboard shows observed task-state counts and two derived default-container estimates:
 
-- `logical default VM slots` is the minimum of the verified logical CPU, logical memory and physical disk headroom divided by the default request/cost, rounded down.
-- `current startable default VM slots` applies the current CT-visible CPU capacity and startup-pressure gate to the same snapshot.
+- `logical default-container slots` is the minimum of the verified logical CPU, logical memory and physical disk headroom divided by the default request/cost, rounded down.
+- `current startable default-container slots` applies the current CT-visible CPU capacity and startup-pressure gate to the same snapshot.
 
 Both values are snapshot estimates. They are omitted when required inputs are unverified, and they are never called `safe max`, `available VM limit`, or an Incus slot limit. The default request and physical admission cost are read from the controller/bridge input, not hardcoded in a public dashboard.
 

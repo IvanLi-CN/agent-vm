@@ -261,7 +261,7 @@ export class ResourceControl extends ControlCore {
     }
     if (!active_reuse && compare(target.disk_gib, base.disk_gib) < 0)
       throw new ControlError(
-        "resize_not_growth", "virtual disk cannot shrink",
+        "resize_not_growth", "managed container rootfs allocation cannot shrink",
         { current: { ...base }, requested: target },
       );
     return target;
@@ -559,7 +559,7 @@ export class ResourceControl extends ControlCore {
     if (!detail.verified)
       throw new ControlError("resource_unverified", "CT CPU pressure observation is not verified", detail);
     if (detail.startup_blocked)
-      throw new ControlError("resource_pressure", "CPU scheduler pressure blocks VM startup", detail);
+      throw new ControlError("resource_pressure", "CPU scheduler pressure blocks managed-container startup", detail);
     return detail;
   }
 
@@ -756,7 +756,7 @@ export class ResourceControl extends ControlCore {
   }
 
   _instance_count_limits(config: Data): Data {
-    return Object.fromEntries(["limits.instances", "limits.virtual-machines"]
+    return Object.fromEntries(["limits.instances"]
       .filter(key => config[key] != null && config[key] !== "" && config[key] !== "-1" &&
         !(typeof config[key] === "number" && config[key] === -1) && config[key] !== -1n)
       .map(key => [key, config[key]]));
@@ -834,7 +834,7 @@ export class ResourceControl extends ControlCore {
       });
       if (cpu_startup_pressure.startup_blocked)
         reasons.push({
-          code: "resource_pressure", message: "CPU scheduler pressure blocks VM startup",
+          code: "resource_pressure", message: "CPU scheduler pressure blocks managed-container startup",
           detail: cpu_startup_pressure,
         });
       else if (!cpu_startup_pressure.verified)
@@ -1281,7 +1281,7 @@ export class ResourceControl extends ControlCore {
       const candidate = int_to_ipv4(value);
       if (!used.has(candidate)) return candidate;
     }
-    throw new ControlError("vm_ip_exhausted", "no VM private IP is available");
+    throw new ControlError("vm_ip_exhausted", "no managed-container private IP is available");
   }
 
   _is_guest_wait_timeout(error: ControlError): boolean {
@@ -1343,17 +1343,15 @@ export class ResourceControl extends ControlCore {
     return { text: redacted, truncated };
   }
 
-  async _qemu_schedstat(pid: any): Promise<Data> {
+  async _managed_init_schedstat(pid: any): Promise<Data> {
     if (!(typeof pid === "bigint" || typeof pid === "number" && Number.isSafeInteger(pid)) ||
       compare(pid, 2) < 0)
-      throw new TypeError("Incus did not report a valid QEMU pid");
-    const cmdline = (await this._read_text(`/proc/${pid}/cmdline`)).toLowerCase();
-    if (!cmdline.includes("qemu")) throw new TypeError("reported process is not QEMU");
+      throw new TypeError("Incus did not report a valid managed-container init pid");
     const fields = words(await this._read_text(`/proc/${pid}/schedstat`));
     if (fields.length < 2 || fields.slice(0, 2).some(field => !/^[0-9]+$/.test(field)))
-      throw new TypeError("QEMU schedstat is invalid");
+      throw new TypeError("managed-container init schedstat is invalid");
     return {
-    pid,
+      pid,
       runtime_seconds: Number(BigInt(fields[0]!)) / 1_000_000_000,
       runqueue_wait_seconds: Number(BigInt(fields[1]!)) / 1_000_000_000,
     };
@@ -1369,7 +1367,7 @@ export class ResourceControl extends ControlCore {
       phase, elapsed_seconds: elapsed(started_monotonic),
       budget_seconds: GUEST_READINESS_BUDGET_SECONDS,
       stage_timings: { ...(readiness.stage_timings ?? {}) }, readiness: { ...readiness },
-      native_status: {}, cpu_psi: {}, qemu_schedstat: {}, startup_log: {},
+      native_status: {}, cpu_psi: {}, managed_init_schedstat: {}, startup_log: {},
     };
     try {
       const info = await this.incus.instance_info(task.instance_name, {
@@ -1378,8 +1376,8 @@ export class ResourceControl extends ControlCore {
       payload.native_status = Object.fromEntries(
         ["status", "pid", "processes"].filter(key => key in info).map(key => [key, info[key]]),
       );
-      try { payload.qemu_schedstat = await this._qemu_schedstat(info.pid); }
-      catch (error) { errors.push({ source: "qemu_schedstat", ...this._diagnostic_error(error) }); }
+      try { payload.managed_init_schedstat = await this._managed_init_schedstat(info.pid); }
+      catch (error) { errors.push({ source: "managed_init_schedstat", ...this._diagnostic_error(error) }); }
     } catch (error) {
       errors.push({ source: "native_status", ...this._diagnostic_error(error) });
     }
@@ -1820,10 +1818,10 @@ export class ResourceControl extends ControlCore {
     try { image = await this.incus.query("/1.0/images/" + quote(fingerprint)); }
     catch (error) {
       if (!(error instanceof ControlError)) throw error;
-      throw new ControlError("image_unavailable", "pinned VM image is unavailable", error.as_dict());
+      throw new ControlError("image_unavailable", "pinned container image is unavailable", error.as_dict());
     }
-    if (!is_record(image) || image.fingerprint !== fingerprint || image.type !== "virtual-machine")
-      throw new ControlError("image_unverified", "pinned image identity or VM type does not match");
+    if (!is_record(image) || image.fingerprint !== fingerprint || image.type !== "container")
+      throw new ControlError("image_unverified", "pinned image identity or container type does not match");
   }
 
   async doctor(_request: Data, _session_id: string | null): Promise<Data> {

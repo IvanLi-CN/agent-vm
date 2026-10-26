@@ -17,7 +17,7 @@ related_specs:
 
 # Context
 
-The `incus-agent-vm` dashboard must explain why VM creation can fail even when an Incus data pool appears to have free space. It needs to show the CT root filesystem, transient image-unpack staging, physical pool usage, guest rootfs allocation, native admission and cleanup failures as separate facts.
+The `incus-agent-vm` dashboard must explain why container creation can fail even when an Incus data pool appears to have free space. It needs to show the CT root filesystem, transient image-unpack staging, physical pool usage, guest rootfs allocation, native admission and cleanup failures as separate facts.
 
 # Symptoms
 
@@ -48,7 +48,7 @@ Use [the observability contract](../../specs/agent-vm/contracts/observability.md
 - Guest rootfs allocation and quota.
 - Native CPU, memory, disk and VM-slot allocation, reservation, remaining and limit.
 - Admission readiness, reclaim-required, draining, operation failures, image-unpack failures, warnings and task states.
-- Logical and currently startable default-VM snapshot estimates, with their request/cost inputs and explicit non-authoritative wording.
+- Logical and currently startable default-container snapshot estimates, with their request/cost inputs and explicit non-authoritative wording.
 
 The rendered deployment is split into two dashboards:
 
@@ -70,9 +70,9 @@ The first reads `admin-metrics`; the second reads `admin-status`. A read-only br
 
 The current deployment's CT-visible memory capacity is `32768 MiB` (`32 GiB`) and its configured logical memory budget is also `32768 MiB` with a `2x` `memory_overcommit_ratio`, producing one authoritative logical limit of `65536 MiB` (`64 GiB`). The public template deliberately labels these series as `CT capacity` and `logical limit` and reads their values from the authoritative metrics; it must not bake this deployment policy into a reusable asset. The dashboard must not derive these values from PVE UI working-set values, a project quota of `-1`, or a pressure sample.
 
-The capacity view must show the actual CPU and memory walls separately from policy targets, and must show physical pool available bytes separately from guest rootfs allocation. The answer to “how large can the next VM be?” comes from native `allocated`, `reserved`, `remaining` and `limit` metrics across CPU, memory and disk, together with the controller's readiness and reclaim state. Pool free bytes alone are only physical headroom, not a complete admission result.
+The capacity view must show the actual CPU and memory walls separately from policy targets, and must show physical pool available bytes separately from guest rootfs allocation. The answer to “how large can the next managed container be?” comes from native `allocated`, `reserved`, `remaining` and `limit` metrics across CPU, memory and disk, together with the controller's readiness and reclaim state. Pool free bytes alone are only physical headroom, not a complete admission result.
 
-The capacity view must also show the policy default VM request/cost, observed task-state counts, logical default-VM slots and currently startable default-VM slots. The two slot values are bounded snapshot estimates: calculate the logical estimate from the minimum verified CPU, memory and physical-disk headroom ratios, then apply current CT-visible CPU capacity and the 50 percent startup-pressure policy for the startable estimate. Omit them when inputs are unverified. Never label them as a native or safe maximum.
+The capacity view must also show the policy default-container request/cost, observed task-state counts, logical default-container slots and currently startable default-container slots. The two slot values are bounded snapshot estimates: calculate the logical estimate from the minimum verified CPU, memory and physical-disk headroom ratios, then apply current CT-visible CPU capacity and the 50 percent startup-pressure policy for the startable estimate. Omit them when inputs are unverified. Never label them as a native or safe maximum.
 
 The inventory view must show active, preparing, closing, deleting, failed, cached and absent records, with active/transitional rows first, failed cleanup next and cached/absent rows collapsed by default. Keep task ID, instance/session identity, state, native status, guest availability, requested resources, effective lease, expiry, SSH mapping and structured last-error code/phase. Render requested CPU as vCPU, requested RAM and disk as GiB, and lease expiry as Unix seconds so the table does not present raw byte counts as ambiguous short values. Do not expose raw error messages, credentials or deployment paths.
 
@@ -83,7 +83,7 @@ The reusable dashboard path is considered complete when the public template rend
 - CT root and image-staging used/available bytes.
 - Physical pool total/used/free bytes.
 - Guest rootfs allocation shown separately from physical usage.
-- Allocated, reserved, remaining and limit values for CPU, memory, disk and VM slots.
+- Allocated, reserved, remaining and limit values for CPU, memory, disk and managed-container slots.
 - Admission ready, reclaim-required and draining state.
 - Operation success/failure by phase, image-unpack failures, warnings, uptime, scrape freshness and task-state counts.
 - Horizontal dashed lines for every available authoritative limit, with no invented line for `-1` or missing values.
@@ -98,8 +98,8 @@ The reusable dashboard path is considered complete when the public template rend
 - Do not use Incus project quota metrics as native admission limits when the values are `-1`.
 - Do not label guest rootfs allocation as physical disk usage.
 - Do not infer CT root or image-staging capacity from Incus pool capacity.
-- Do not treat CPU PSI as CPU utilization, logical reservation usage or a native VM-slot limit.
-- Do not call a derived default-VM slot estimate a safe maximum or authoritative Incus capacity.
+- Do not treat CPU PSI as CPU utilization, logical reservation usage or a native managed-container-slot limit.
+- Do not call a derived default-container slot estimate a safe maximum or authoritative Incus capacity.
 - Do not multiply packet-per-second queries by `8`.
 - Keep deployment addresses, credentials, dashboard datasource identity, controller job, rendered dashboard, and collector paths in the deployment repository or protected operator records. Keep only placeholders and generic defaults in the public bundle.
 

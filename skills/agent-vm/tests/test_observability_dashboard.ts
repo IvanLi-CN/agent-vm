@@ -67,7 +67,7 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(String(stateOrderTarget?.expr)).toContain('"state_order", "4", "state", "^deleting$"');
   expect(String(stateOrderTarget?.expr)).toContain('"state_order", "5", "state", "^cached$"');
   expect(String(stateOrderTarget?.expr)).toContain('"state_order", "6", "state", "^absent$"');
-  for (const title of ["Disk admission", "VM slot admission", "Control filesystem capacity"]) {
+  for (const title of ["Disk admission", "Managed-container slot admission", "Control filesystem capacity"]) {
     const panel = panels.find((candidate) => candidate.title === title) as Record<string, any> | undefined;
     expect(panel?.fieldConfig?.defaults?.custom?.spanNulls).toBe(false);
   }

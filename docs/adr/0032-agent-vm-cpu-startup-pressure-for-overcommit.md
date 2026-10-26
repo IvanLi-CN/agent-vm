@@ -7,7 +7,7 @@ supersedes: 0031-agent-vm-cpu-startup-pressure-boundary.md
 
 ## Context
 
-The Agent VM deployment deliberately oversells CPU. Logical reservation answers whether a request fits the configured policy ceiling; CT-local CPU pressure answers whether a new QEMU process is likely to obtain enough scheduler time to become ready. Treating those observations as the same limit makes the deployment reject valid oversubscribed requests too early, while ignoring scheduler pressure makes readiness failures opaque.
+The Agent VM deployment deliberately oversells CPU. Logical reservation answers whether a request fits the configured policy ceiling; CT-local CPU pressure answers whether a new managed-container init process is likely to obtain enough scheduler time to become ready. Treating those observations as the same limit makes the deployment reject valid oversubscribed requests too early, while ignoring scheduler pressure makes readiness failures opaque.
 
 The previous startup guard used a `full.avg10` threshold of 20 percent. That threshold is too restrictive for a deployment whose policy accepts CPU contention and does not promise uninterrupted CPU service to guests. The logical CPU ceiling remains an independent admission boundary.
 

@@ -58,7 +58,7 @@ class AgentVmDocumentationTests(unittest.TestCase):
             "Codex client",
             "Agent VM control endpoint",
             "CT109 LXC",
-            "Incus VM inside CT109",
+            "Incus container inside CT109",
             "Underlying hosting source",
             "not proof of the underlying host",
             "Unknown underlying hosting source",
@@ -84,7 +84,7 @@ class AgentVmDocumentationTests(unittest.TestCase):
     def test_disk_contract_separates_sparse_capacity_from_control_state(self) -> None:
         runbook = RUNBOOK.read_text(encoding="utf-8")
         for phrase in (
-            "does not reserve the full requested virtual disk",
+            "does not reserve the full requested rootfs allocation",
             "configured CT-local Incus pool filesystem",
             "separate logical failure domains",
             "ENOSPC",
@@ -144,11 +144,11 @@ class AgentVmDocumentationTests(unittest.TestCase):
         runbook = RUNBOOK.read_text(encoding="utf-8")
         cli_contract = CLI_CONTRACT.read_text(encoding="utf-8")
         for phrase in (
-            "separate fail-closed boundary after the virtual disk mutation",
+            "separate fail-closed boundary after the container rootfs mutation",
             "Before changing the guest, record capability and topology evidence",
-            "direct partition-backed ext4 or xfs root",
-            "already at least 95% of the requested virtual capacity is an idempotent success",
-            "one bounded partition-reread and settle retry",
+            "Incus storage/profile path that can enforce and verify the requested rootfs limit",
+            "already at least 95% of the requested rootfs capacity is an idempotent success",
+            "one bounded reread and settle retry",
             "bounded attempt/retry chain",
             "process-group cleanup evidence on command timeout",
         ):
@@ -156,7 +156,8 @@ class AgentVmDocumentationTests(unittest.TestCase):
         for phrase in (
             "guest_filesystem",
             "guest_resize_unverified",
-            "including when a bounded retry confirms that a prior mutation completed",
+            "configured rootfs capacity",
+            "storage/topology evidence",
             "no active lease or exposed SSH mapping",
             "inspectable and retryable",
             "process-group cleanup evidence on command timeout",
@@ -172,7 +173,7 @@ class AgentVmDocumentationTests(unittest.TestCase):
             "agent_vm_filesystem_available_bytes",
             "incus_project_limit",
             "refresh: \"auto\"",
-            "next VM",
+            "next managed container",
             "horizontal dashed line",
             "image-unpack failures",
             "must not multiply a `pps` query by `8`",

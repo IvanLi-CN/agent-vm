@@ -1386,7 +1386,7 @@ func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64
 		}
 	}
 	if s.Config.InstanceLimit > 0 && instances >= s.Config.InstanceLimit {
-		return protocol.NewError("resource_insufficient", "configured VM slot capacity is exhausted", map[string]any{"instances": instances, "limit": s.Config.InstanceLimit})
+		return protocol.NewError("resource_insufficient", "configured managed-container slot capacity is exhausted", map[string]any{"instances": instances, "limit": s.Config.InstanceLimit})
 	}
 	cpuLimit, cpuErr := config.LogicalLimit(s.Config.CPUBudget, s.Config.CPUOvercommitRatio)
 	if cpuErr != nil {

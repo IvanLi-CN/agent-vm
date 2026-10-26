@@ -16,7 +16,7 @@ related_specs:
 
 # Context
 
-Use this procedure when an Agent VM control environment stores its Incus directory pool below the same filesystem as the CT root filesystem, and growth of VM data can exhaust the filesystem needed by SQLite, systemd, Incus and the native controller.
+Use this procedure when an Agent VM control environment stores its Incus directory pool below the same filesystem as the CT root filesystem, and growth of container data can exhaust the filesystem needed by SQLite, systemd, Incus and the native controller.
 
 The goal is to keep the existing CT and existing Incus pool identity while moving the CT system files to a small system volume and retaining the old root volume as a data volume. Incus image staging must also be moved off the small system volume because image unpacking uses its global `images` directory before the final pool volume is created. This is a one-time infrastructure migration; routine Agent VM maintenance must not require PVE host access.
 
@@ -155,7 +155,7 @@ ssh <ct-control-alias> findmnt -T /var/lib/incus/images
 ssh <ct-control-alias> df -h / /var/lib/incus/images /var/lib/incus/storage-pools/<pool>
 ```
 
-For a bounded end-to-end check, use a unique test session through the protocol 4 control entrypoint, confirm that `acquire` reaches `guest_available: true`, then issue `release` with the returned generation and preview/apply `admin-gc` only for that test task. This tests image unpacking, VM creation, proxy setup and cleanup; a read-only pool health check does not.
+For a bounded end-to-end check, use a unique test session through the protocol 4 control entrypoint, confirm that `acquire` reaches `guest_available: true`, then issue `release` with the returned generation and preview/apply `admin-gc` only for that test task. This tests image unpacking, container creation, proxy setup and cleanup; a read-only pool health check does not.
 
 ## Temporary migration residue
 

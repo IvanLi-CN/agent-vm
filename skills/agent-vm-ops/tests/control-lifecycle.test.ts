@@ -144,6 +144,18 @@ scenario("malformed requests fail before native effects or allocation", async f 
   expect(f.store.operation(request.operation_id)).toBeNull();
 });
 
+scenario("native initialization uses an Incus container without KVM", async f => {
+  await f.control.incus.init("images:debian/13", "container-check");
+
+  const init = f.runner.calls.find(([argv]) => argv[3] === "init");
+  expect(init?.[0]).toEqual([
+    "incus", "--project", "agents", "init", "images:debian/13",
+    "container-check", "--profile", "agent-vm",
+    "--config", "boot.autostart=false",
+  ]);
+  expect(init?.[0]).not.toContain("--vm");
+});
+
 scenario("legacy numeric protocol equality does not coerce string or boolean identity", async f => {
   expect((await f.control.dispatch(parse_json('{"protocol":4.0,"action":"status","session_id":"thread-a"}'))).result.state).toBe("absent");
   const calls = f.runner.calls.length;
@@ -265,16 +277,20 @@ for (const [label, error, deferred] of [
 
 scenario("pre-native project guards do not consume or reclaim cache", async f => {
   const cached = await cache(f, "cache");
-  for (const key of ["limits.instances", "limits.virtual-machines"]) {
-    f.runner.project_limits = { [key]: "8" };
-    const before = f.runner.calls.length;
-    await expect_error("project_instance_limits_conflict", () =>
-      f.acquire({ session: `blocked-${key}` }));
-    expect(changes(f, before)).toEqual([]);
-    expect(f.store.get_task({ session_id: `blocked-${key}` })).toBeNull();
-    expect(task(f, "cache")).toEqual(cached);
-    expect(instance(f, "cache").status).toBe("Stopped");
-  }
+  f.runner.project_limits = { "limits.instances": "8" };
+  const before = f.runner.calls.length;
+  await expect_error("project_instance_limits_conflict", () =>
+    f.acquire({ session: "blocked-limits.instances" }));
+  expect(changes(f, before)).toEqual([]);
+  expect(f.store.get_task({ session_id: "blocked-limits.instances" })).toBeNull();
+  expect(task(f, "cache")).toEqual(cached);
+  expect(instance(f, "cache").status).toBe("Stopped");
+
+  // A VM-only quota is unrelated to the container pool and must not block it.
+  f.runner.project_limits = { "limits.virtual-machines": "8" };
+  const allowed = await f.acquire({ session: "allowed-vm-quota" });
+  expect(allowed.state).toBe("active");
+  await f.call("release", { session: "allowed-vm-quota" });
 });
 
 scenario("active reuse preserves allocation and deadline without implicit restart", async f => {

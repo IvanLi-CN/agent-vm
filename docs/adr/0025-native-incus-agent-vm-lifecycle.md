@@ -1,10 +1,11 @@
 ---
-status: accepted
+status: superseded
+superseded_by: 0038-native-incus-agent-container-lifecycle.md
 ---
 
-# Native Incus Agent VM lifecycle
+# Native Incus Agent VM lifecycle (historical)
 
-Agent execution uses one Incus VM per generic session identity, with root SSH through native proxy NAT and explicit leases. The deployment supplies the control host, Incus project, profile, image, network, ACL, address pool and local storage through configuration; the public implementation contains no environment inventory.
+This historical decision used one Incus VM per generic session identity. It is superseded by [the native Incus Agent container lifecycle](0038-native-incus-agent-container-lifecycle.md), which uses an Incus system container and does not require KVM or QEMU. The SSH, proxy NAT and lease rules below remain relevant where they do not depend on the old instance type.
 
 Lifecycle enforcement uses one-shot control actions and persistent native timers. Lease end closes owned NAT mappings and exact conntrack flows before stopping the guest, then retains its disk as a disposable stopped cache. Age-based and capacity-triggered cleanup can reclaim an eligible cache, while effective leases are protected.
 

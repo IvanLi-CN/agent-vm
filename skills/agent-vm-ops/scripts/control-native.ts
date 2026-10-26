@@ -217,7 +217,7 @@ export class IncusClient {
     if (!is_record(value)) throw new ControlError("incus_invalid_output", "Incus config output is not an object"); return value;
   }
   async init(image: string, name: string, metadata: Data = {}): Promise<void> {
-    await this.call(["init", image, name, "--vm", "--profile", String(this.config.profile), "--config", "boot.autostart=false", ...Object.entries(metadata).flatMap(([key, value]) => ["--config", `${key}=${value}`])], { timeout: 300, bounded: true });
+    await this.call(["init", image, name, "--profile", String(this.config.profile), "--config", "boot.autostart=false", ...Object.entries(metadata).flatMap(([key, value]) => ["--config", `${key}=${value}`])], { timeout: 300, bounded: true });
   }
   async start(name: string): Promise<void> { await this.call(["start", name], { timeout: 120 }); }
   async stop(name: string, force: boolean | Data = true): Promise<void> { await this.call(["stop", name, ...((typeof force === "object" ? force.force : force) ? ["--force"] : [])], { timeout: 8 }); }
