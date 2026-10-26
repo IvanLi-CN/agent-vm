@@ -142,7 +142,7 @@ GO_UNIT_EXEC_START = {
         "ExecStart=/opt/agent-vm-native/bin/agent-vm-control serve --config /etc/agent-vm-native/config.json",
 }
 GO_UNIT_CONTENT_SHA256 = {
-    "agent-vm-native.service": "1cb0aa101a8ccbc2fbb8ab9e5c8d02fbf89b7c70e3c041d8d3daf5ba27fa68f1",
+    "agent-vm-native.service": "447f9c09e9378919673708944a45c06d8498308d5613849ff6497103dd1577bb",
 }
 GO_FIXED_ARTIFACTS = frozenset({
     ("agent_vm.ts", "agent_vm.ts", "client", 0o755),

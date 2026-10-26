@@ -26,6 +26,16 @@ func TestLimitedBufferReportsTheWholeInputWhenTruncated(t *testing.T) {
 	}
 }
 
+func TestRunnerUsesTheProtocolOutputSplit(t *testing.T) {
+	runner := NewRunner()
+	if got := runner.stdoutLimit(); got != 2*1024*1024 {
+		t.Fatalf("stdout limit = %d", got)
+	}
+	if got := runner.stderrLimit(); got != 64*1024 {
+		t.Fatalf("stderr limit = %d", got)
+	}
+}
+
 func TestTimeoutKillsTheWholeProcessGroupAndBoundsPipeCleanup(t *testing.T) {
 	runner := NewRunner()
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)

@@ -27,7 +27,7 @@ func (scheduler *Scheduler) Wake() {
 }
 
 func (scheduler *Scheduler) Run(ctx context.Context) error {
-	if _, err := scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true}); err != nil {
+	if err := scheduler.Service.StartupReconcile(ctx); err != nil {
 		return err
 	}
 	scheduler.Service.MarkReady()

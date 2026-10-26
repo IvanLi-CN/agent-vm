@@ -2,7 +2,11 @@ package state
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -94,6 +98,101 @@ func TestMissingDatabaseFailsClosed(t *testing.T) {
 	_, err := Open(filepath.Join(t.TempDir(), "missing.sqlite3"), false)
 	if err == nil {
 		t.Fatal("missing database unexpectedly opened")
+	}
+}
+
+func TestLegacyBaselineGetsInitialEpochOnReadOnlyOpen(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("..", "..", "..", "tests", "fixtures", "control-baseline.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "legacy.sqlite3")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(string(fixture)); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	epoch, err := store.StateEpoch(context.Background())
+	if err != nil || epoch != "initial" {
+		t.Fatalf("legacy epoch = %q, err=%v", epoch, err)
+	}
+}
+
+func TestStateEpochRejectsMalformedValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "epoch.sqlite3")
+	store, err := OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE meta SET value = 'not-an-epoch' WHERE key = 'state_epoch'"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = Open(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	_, err = store.StateEpoch(context.Background())
+	var epochErr *StateEpochError
+	if !errors.As(err, &epochErr) {
+		t.Fatalf("epoch error = %v", err)
+	}
+}
+
+func TestClaimOperationIsAtomicAcrossConcurrentRetries(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "operations.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	pending := map[string]any{"outcome": "pending", "_request_digest": "digest"}
+	var group sync.WaitGroup
+	var mu sync.Mutex
+	claims := 0
+	seenExisting := 0
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			existing, claimErr := store.ClaimOperation(context.Background(), "same", "acquire", stringPointer("session"), intPointer(0), pending)
+			if claimErr != nil {
+				t.Errorf("claim: %v", claimErr)
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if existing == nil {
+				claims++
+			} else {
+				seenExisting++
+			}
+		}()
+	}
+	group.Wait()
+	if claims != 1 || seenExisting != 1 {
+		t.Fatalf("claims=%d existing=%d", claims, seenExisting)
 	}
 }
 

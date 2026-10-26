@@ -23,10 +23,14 @@ type Result struct {
 
 type Runner struct {
 	OutputLimit int
+	StdoutLimit int
+	StderrLimit int
 	mu          sync.Mutex
 }
 
-func NewRunner() *Runner { return &Runner{OutputLimit: 64 * 1024} }
+func NewRunner() *Runner {
+	return &Runner{OutputLimit: 64 * 1024, StdoutLimit: 2 * 1024 * 1024, StderrLimit: 64 * 1024}
+}
 
 func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (Result, error) {
 	if r == nil {
@@ -50,8 +54,8 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (Result, 
 	command := exec.Command(argv[0], argv[1:]...)
 	configureCommand(command)
 	command.Stdin = bytes.NewReader(input)
-	stdout := &limitedBuffer{limit: r.limit()}
-	stderr := &limitedBuffer{limit: r.limit()}
+	stdout := &limitedBuffer{limit: r.stdoutLimit()}
+	stderr := &limitedBuffer{limit: r.stderrLimit()}
 	stdoutReader, stdoutWriter, err := os.Pipe()
 	if err != nil {
 		return Result{}, fmt.Errorf("prepare stdout pipe: %w", err)
@@ -223,11 +227,27 @@ func cleanupTracked(tracker *processTracker, root int) error {
 	return first
 }
 
-func (r *Runner) limit() int {
-	if r == nil || r.OutputLimit <= 0 {
+func (r *Runner) stdoutLimit() int {
+	if r == nil {
+		return 2 * 1024 * 1024
+	}
+	if r.StdoutLimit > 0 {
+		return r.StdoutLimit
+	}
+	return 2 * 1024 * 1024
+}
+
+func (r *Runner) stderrLimit() int {
+	if r == nil {
 		return 64 * 1024
 	}
-	return r.OutputLimit
+	if r.StderrLimit > 0 {
+		return r.StderrLimit
+	}
+	if r.OutputLimit > 0 {
+		return r.OutputLimit
+	}
+	return 64 * 1024
 }
 
 type limitedBuffer struct {

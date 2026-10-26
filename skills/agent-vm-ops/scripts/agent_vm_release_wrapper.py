@@ -82,6 +82,7 @@ RETIRED_CLIENT_NAME = "agent_vm.py"
 CANONICAL_UNIT_DIR = Path("/etc/systemd/system")
 RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
 GO_CONTROL_PATH = Path("/opt/agent-vm-native/bin/agent-vm-control")
+GO_CONTROL_SOCKET = Path("/run/agent-vm-native/control.sock")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -829,9 +830,19 @@ def _restore_activation_state(
 def _ensure_drained(config: Mapping[str, Any]) -> None:
     if not config["require_drained"]:
         return
+    command = [BUN_PATH, str(config["control_path"])]
+    sidecar = Path(config["control_path"]).with_name("client-release.json")
+    if sidecar.is_file():
+        try:
+            metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            _fail("drain_unverified", "installed client release metadata is invalid")
+        view = metadata.get("client_view") if isinstance(metadata, Mapping) else None
+        if isinstance(metadata, Mapping) and metadata.get("format") == GO_MANIFEST_FORMAT and isinstance(view, Mapping) and view.get("transport") == "go-request":
+            command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
     try:
         process = subprocess.run(
-            [BUN_PATH, str(config["control_path"])],
+            command,
             input=json.dumps({"protocol": 4, "action": "drain-status"}).encode(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -1092,10 +1103,26 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         failure = raw_failure if isinstance(raw_failure, WrapperError) else WrapperError(
             raw_failure.code, raw_failure.message, raw_failure.detail,
         )
+        restored = True
+        try:
+            _restore_activation_state(
+                config,
+                current_link,
+                previous_link,
+                old_current,
+                old_previous,
+                target_snapshot,
+            )
+        except WrapperError as restore_error:
+            restored = False
+            failure = WrapperError(
+                "activation_restore_failed",
+                "activation failed and the previous release could not be fully restored",
+                {"activation_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
+            )
         if runtime_switch_attempted:
             try:
-                _daemon_reload()
-                if old_current is None:
+                if not restored or old_current is None:
                     _systemctl("stop", "agent-vm-native.service", allow_missing=True)
                 else:
                     old_manifest = load_release_manifest(old_current / MANIFEST_NAME)
@@ -1109,21 +1136,6 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                     "activation failed and the previous runtime could not be restored",
                     {"activation_error": failure.as_dict(), "runtime_error": getattr(runtime_error, "as_dict", lambda: {"message": str(runtime_error)})()},
                 )
-        try:
-            _restore_activation_state(
-                config,
-                current_link,
-                previous_link,
-                old_current,
-                old_previous,
-                target_snapshot,
-            )
-        except WrapperError as restore_error:
-            failure = WrapperError(
-                "activation_restore_failed",
-                "activation failed and the previous release could not be fully restored",
-                {"activation_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
-            )
         try:
             _write_json(activation_path, {
                 **record,

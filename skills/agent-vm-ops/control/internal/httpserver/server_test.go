@@ -52,6 +52,20 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	socketInfo, statErr := os.Stat(socket)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if socketInfo.Mode().Perm() != 0o600 {
+		t.Fatalf("socket mode = %v", socketInfo.Mode().Perm())
+	}
+	parentInfo, statErr := os.Stat(root)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if parentInfo.Mode().Perm() != 0o700 {
+		t.Fatalf("socket parent mode = %v", parentInfo.Mode().Perm())
+	}
 
 	body, status, err := Request(context.Background(), socket, []byte(`{"protocol":4,"action":"status","session_id":"http-test"}`))
 	if err != nil {
