@@ -81,11 +81,43 @@ function artifact(value: unknown, index: number): GoArtifact {
   return { name: item.name, path: item.path, role: item.role, sha256: item.sha256, mode: item.mode };
 }
 
+function schema(value: unknown, label: string): { schema: number; semantic_revision: number } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) error(`${label} must be an object`);
+  const item = value as Data;
+  if (Object.keys(item).sort().join(",") !== "schema,semantic_revision") error(`${label} has an unexpected shape`);
+  if (!Number.isInteger(item.schema) || item.schema < 1 || !Number.isInteger(item.semantic_revision) || item.semantic_revision < 1) error(`${label} is invalid`);
+  return { schema: item.schema as number, semantic_revision: item.semantic_revision as number };
+}
+
+function window(value: unknown, label: string): { schema_min: number; schema_max: number; semantic_min: number; semantic_max: number } {
+  if (!value || typeof value !== "object" || Array.isArray(value)) error(`${label} must be an object`);
+  const item = value as Data;
+  if (Object.keys(item).sort().join(",") !== "schema_max,schema_min,semantic_max,semantic_min") error(`${label} has an unexpected shape`);
+  if (!["schema_min", "schema_max", "semantic_min", "semantic_max"].every((key) => Number.isInteger(item[key]) && (item[key] as number) >= 1)) error(`${label} is invalid`);
+  const result = { schema_min: item.schema_min as number, schema_max: item.schema_max as number, semantic_min: item.semantic_min as number, semantic_max: item.semantic_max as number };
+  if (result.schema_min > result.schema_max || result.semantic_min > result.semantic_max) error(`${label} has an inverted compatibility window`);
+  return result;
+}
+
 function operationMap(value: unknown): Record<string, OperationSpec> {
   if (!value || typeof value !== "object" || Array.isArray(value)) error("actions must be an object");
   const object = value as Record<string, unknown>;
   if (Object.keys(object).sort().join(",") !== [...ACTION_NAMES].sort().join(",")) error("actions differ from the protocol-4 control surface");
-  return structuredClone(object) as Record<string, OperationSpec>;
+  const actions: Record<string, OperationSpec> = {};
+  for (const action of ACTION_NAMES) {
+    const raw = object[action];
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) error(`actions.${action} must be an object`);
+    const item = raw as Data;
+    if (Object.keys(item).sort().join(",") !== "client_to_control,control_to_client,request,response") error(`actions.${action} has an unexpected shape`);
+    const request = schema(item.request, `actions.${action}.request`);
+    const response = schema(item.response, `actions.${action}.response`);
+    const clientToControl = window(item.client_to_control, `actions.${action}.client_to_control`);
+    const controlToClient = window(item.control_to_client, `actions.${action}.control_to_client`);
+    if (request.schema < clientToControl.schema_min || request.schema > clientToControl.schema_max || request.semantic_revision < clientToControl.semantic_min || request.semantic_revision > clientToControl.semantic_max) error(`actions.${action} request is outside its declared window`);
+    if (response.schema < controlToClient.schema_min || response.schema > controlToClient.schema_max || response.semantic_revision < controlToClient.semantic_min || response.semantic_revision > controlToClient.semantic_max) error(`actions.${action} response is outside its declared window`);
+    actions[action] = { request, response, client_to_control: clientToControl, control_to_client: controlToClient };
+  }
+  return actions;
 }
 
 function target(value: unknown): GoReleaseManifest["target"] {

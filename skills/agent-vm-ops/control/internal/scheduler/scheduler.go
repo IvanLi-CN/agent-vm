@@ -27,10 +27,9 @@ func (scheduler *Scheduler) Wake() {
 }
 
 func (scheduler *Scheduler) Run(ctx context.Context) error {
-	if err := scheduler.Service.StartupReconcile(ctx); err != nil {
-		return err
+	if err := scheduler.Service.StartupReconcile(ctx); err == nil {
+		scheduler.Service.MarkReady()
 	}
-	scheduler.Service.MarkReady()
 	go scheduler.sampleLoop(ctx, "admin-metrics", "capacity", 10*time.Second)
 	go scheduler.sampleLoop(ctx, "admin-status", "inventory", 30*time.Second)
 	go scheduler.sampleLoop(ctx, "doctor", "health", 15*time.Second)
@@ -43,10 +42,25 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			if !scheduler.Service.Ready() {
+				if err := scheduler.Service.StartupReconcile(ctx); err == nil {
+					scheduler.Service.MarkReady()
+				}
+				continue
+			}
 			_, _ = scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true})
 		case <-ageTicker.C:
+			if !scheduler.Service.Ready() {
+				continue
+			}
 			_, _ = scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-age-gc", "apply": true})
 		case <-scheduler.wake:
+			if !scheduler.Service.Ready() {
+				if err := scheduler.Service.StartupReconcile(ctx); err == nil {
+					scheduler.Service.MarkReady()
+				}
+				continue
+			}
 			_, _ = scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true})
 		}
 	}

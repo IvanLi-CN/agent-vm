@@ -90,10 +90,11 @@ except ModuleNotFoundError:
 
 
 SOURCE_REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
-DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_TIMEOUT_SECONDS = 8100
 DEFAULT_POLL_SECONDS = 1.0
-MAX_TIMEOUT_SECONDS = 300
+MAX_TIMEOUT_SECONDS = 8100
 MAX_POLL_SECONDS = 1.0
+ACTIVATION_TIMEOUT_SECONDS = 300
 CANONICAL_REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.ts"
 CANONICAL_REMOTE_WRAPPER = "/usr/local/sbin/agent-vm-release-wrapper"
 CONTROL_TRANSITION_STATES = {"preparing", "closing", "deleting", "failed"}
@@ -681,7 +682,7 @@ class SSHTransport:
             _fail("remote_response_invalid", f"{label} response is not an object")
         return value
 
-    def _run(self, host: str, command: list[str], payload: bytes | None) -> Mapping[str, Any]:
+    def _run(self, host: str, command: list[str], payload: bytes | None, *, timeout: float | None = None) -> Mapping[str, Any]:
         try:
             process = subprocess.run(
                 ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", host, shlex.join(command)],
@@ -689,7 +690,7 @@ class SSHTransport:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=False,
-                timeout=self.timeout,
+                timeout=self.timeout if timeout is None else min(self.timeout, timeout),
             )
         except FileNotFoundError:
             _fail("command_missing", "ssh is not installed")
@@ -701,6 +702,8 @@ class SSHTransport:
         command = [wrapper_path, action]
         if action != "status":
             command.extend(["--transaction-id", transaction_id, "--release-id", release_id])
+        if action == "activate":
+            return self._run(host, command, payload, timeout=ACTIVATION_TIMEOUT_SECONDS)
         return self._run(host, command, payload)
 
     def control(self, host: str, remote_control: str, request: Mapping[str, Any]) -> Mapping[str, Any]:

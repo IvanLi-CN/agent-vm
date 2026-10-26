@@ -555,35 +555,13 @@ func (s *Store) updateTask(ctx context.Context, taskID string, condition *TaskCo
 		}
 		changed = updateChanged
 		if condition != nil {
-			where := []string{"task_id = ?"}
-			args := []any{taskID}
-			if condition.Generation != nil {
-				where = append(where, "generation = ?")
-				args = append(args, *condition.Generation)
+			matched, matchErr := taskConditionMatches(ctx, tx, taskID, *condition)
+			if matchErr != nil {
+				return matchErr
 			}
-			if len(condition.States) > 0 {
-				placeholders := make([]string, len(condition.States))
-				for index, state := range condition.States {
-					placeholders[index] = "?"
-					args = append(args, state)
-				}
-				where = append(where, "state IN ("+strings.Join(placeholders, ", ")+")")
-			}
-			if condition.LeaseActiveAfter != nil {
-				where = append(where, "julianday(lease_expires_at) > julianday(?)")
-				args = append(args, condition.LeaseActiveAfter.UTC().Format(time.RFC3339Nano))
-			}
-			if condition.LeaseExpiredAt != nil {
-				where = append(where, "(lease_expires_at IS NULL OR julianday(lease_expires_at) <= julianday(?))")
-				args = append(args, condition.LeaseExpiredAt.UTC().Format(time.RFC3339Nano))
-			}
-			var exists int
-			if err := tx.conn.QueryRowContext(ctx, "SELECT 1 FROM tasks WHERE "+strings.Join(where, " AND "), args...).Scan(&exists); err != nil {
-				if errors.Is(err, sql.ErrNoRows) {
-					changed = false
-					return nil
-				}
-				return err
+			if !matched {
+				changed = false
+				return nil
 			}
 		}
 		if !changed {
@@ -639,26 +617,12 @@ func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
 func (s *Store) DeleteTaskIf(ctx context.Context, taskID string, condition TaskCondition) (bool, error) {
 	deleted := false
 	err := s.withWrite(ctx, func(tx *Tx) error {
-		where := []string{"task_id = ?"}
-		args := []any{taskID}
-		if condition.Generation != nil {
-			where = append(where, "generation = ?")
-			args = append(args, *condition.Generation)
-		}
-		if len(condition.States) > 0 {
-			placeholders := make([]string, len(condition.States))
-			for index, value := range condition.States {
-				placeholders[index] = "?"
-				args = append(args, value)
-			}
-			where = append(where, "state IN ("+strings.Join(placeholders, ", ")+")")
-		}
-		var exists int
-		if err := tx.conn.QueryRowContext(ctx, "SELECT 1 FROM tasks WHERE "+strings.Join(where, " AND "), args...).Scan(&exists); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return nil
-			}
+		matched, err := taskConditionMatches(ctx, tx, taskID, condition)
+		if err != nil {
 			return err
+		}
+		if !matched {
+			return nil
 		}
 		result, err := tx.exec("DELETE FROM tasks WHERE task_id = ?", taskID)
 		if err != nil {
@@ -735,6 +699,64 @@ func (s *Store) RecordOperation(ctx context.Context, operationID, action string,
 	})
 }
 
+// UpdateOperationResponse mutates a pending operation in the same write
+// transaction used by the operation journal. It is used for worker identity
+// and bounded restart recovery metadata without introducing a second state
+// store or changing the existing operations table.
+func (s *Store) UpdateOperationResponse(ctx context.Context, operationID string, update func(map[string]any) error) error {
+	return s.withWrite(ctx, func(tx *Tx) error {
+		operation, err := scanOperation(ctx, tx.conn, operationID)
+		if err != nil {
+			return err
+		}
+		outcome, _ := operation.Response["outcome"].(string)
+		if outcome != "pending" {
+			return errors.New("operation journal is already finalized")
+		}
+		if err := update(operation.Response); err != nil {
+			return err
+		}
+		raw, err := json.Marshal(operation.Response)
+		if err != nil {
+			return err
+		}
+		result, err := tx.exec("UPDATE operations SET response_json = ? WHERE operation_id = ? AND json_extract(response_json, '$.outcome') = 'pending'", string(raw), operationID)
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return errors.New("operation journal is already finalized")
+		}
+		return nil
+	})
+}
+
+func (s *Store) RecordOperationWorker(ctx context.Context, operationID string, worker map[string]any) error {
+	return s.UpdateOperationResponse(ctx, operationID, func(response map[string]any) error {
+		response["worker"] = worker
+		return nil
+	})
+}
+
+func (s *Store) MarkOperationRecoveryAttempt(ctx context.Context, operationID string) error {
+	return s.UpdateOperationResponse(ctx, operationID, func(response map[string]any) error {
+		attempts := int64(0)
+		if value, ok := response["_recovery_attempts"].(json.Number); ok {
+			attempts, _ = value.Int64()
+		} else if value, ok := response["_recovery_attempts"].(int64); ok {
+			attempts = value
+		} else if value, ok := response["_recovery_attempts"].(float64); ok {
+			attempts = int64(value)
+		}
+		response["_recovery_attempts"] = attempts + 1
+		return nil
+	})
+}
+
 func scanOperation(ctx context.Context, conn *sql.Conn, operationID string) (*Operation, error) {
 	var result Operation
 	var session sql.NullString
@@ -745,10 +767,16 @@ func scanOperation(ctx context.Context, conn *sql.Conn, operationID string) (*Op
 		return nil, err
 	}
 	result.SessionID, result.Generation = nullableString(session), nullableInt(generation)
-	if err := json.Unmarshal([]byte(raw), &result.Response); err != nil {
+	if err := decodeOperationJSON(raw, &result.Response); err != nil {
 		return nil, fmt.Errorf("operation JSON: %w", err)
 	}
 	return &result, nil
+}
+
+func decodeOperationJSON(raw string, target *map[string]any) error {
+	decoder := json.NewDecoder(strings.NewReader(raw))
+	decoder.UseNumber()
+	return decoder.Decode(target)
 }
 
 func (s *Store) PendingOperations(ctx context.Context) ([]Operation, error) {
@@ -768,7 +796,7 @@ func (s *Store) PendingOperations(ctx context.Context) ([]Operation, error) {
 				return err
 			}
 			value.SessionID, value.Generation = nullableString(session), nullableInt(generation)
-			if err := json.Unmarshal([]byte(raw), &value.Response); err != nil {
+			if err := decodeOperationJSON(raw, &value.Response); err != nil {
 				return err
 			}
 			values = append(values, value)
@@ -825,34 +853,53 @@ func upsertPortTx(tx *Tx, value Port) error {
 }
 
 func taskConditionMatches(ctx context.Context, tx *Tx, taskID string, condition TaskCondition) (bool, error) {
-	where := []string{"task_id = ?"}
-	args := []any{taskID}
-	if condition.Generation != nil {
-		where = append(where, "generation = ?")
-		args = append(args, *condition.Generation)
-	}
-	if len(condition.States) > 0 {
-		placeholders := make([]string, len(condition.States))
-		for index, value := range condition.States {
-			placeholders[index] = "?"
-			args = append(args, value)
-		}
-		where = append(where, "state IN ("+strings.Join(placeholders, ", ")+")")
-	}
-	if condition.LeaseActiveAfter != nil {
-		where = append(where, "julianday(lease_expires_at) > julianday(?)")
-		args = append(args, condition.LeaseActiveAfter.UTC().Format(time.RFC3339Nano))
-	}
-	if condition.LeaseExpiredAt != nil {
-		where = append(where, "(lease_expires_at IS NULL OR julianday(lease_expires_at) <= julianday(?))")
-		args = append(args, condition.LeaseExpiredAt.UTC().Format(time.RFC3339Nano))
-	}
-	var exists int
-	err := tx.conn.QueryRowContext(ctx, "SELECT 1 FROM tasks WHERE "+strings.Join(where, " AND "), args...).Scan(&exists)
+	var generation int64
+	var state string
+	var lease sql.NullString
+	err := tx.conn.QueryRowContext(ctx, "SELECT generation, state, lease_expires_at FROM tasks WHERE task_id = ?", taskID).Scan(&generation, &state, &lease)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
-	return err == nil, err
+	if err != nil {
+		return false, err
+	}
+	if condition.Generation != nil && generation != *condition.Generation {
+		return false, nil
+	}
+	if len(condition.States) > 0 {
+		matchedState := false
+		for _, candidate := range condition.States {
+			if state == candidate {
+				matchedState = true
+				break
+			}
+		}
+		if !matchedState {
+			return false, nil
+		}
+	}
+	if condition.LeaseActiveAfter != nil {
+		if !lease.Valid {
+			return false, nil
+		}
+		expires, parseErr := time.Parse(time.RFC3339Nano, lease.String)
+		if parseErr != nil {
+			return false, fmt.Errorf("invalid lease timestamp: %w", parseErr)
+		}
+		if !expires.After(*condition.LeaseActiveAfter) {
+			return false, nil
+		}
+	}
+	if condition.LeaseExpiredAt != nil && lease.Valid {
+		expires, parseErr := time.Parse(time.RFC3339Nano, lease.String)
+		if parseErr != nil {
+			return false, fmt.Errorf("invalid lease timestamp: %w", parseErr)
+		}
+		if expires.After(*condition.LeaseExpiredAt) {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func (s *Store) DeletePort(ctx context.Context, taskID, name, protocol string) error {

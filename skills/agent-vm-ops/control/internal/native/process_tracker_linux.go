@@ -8,6 +8,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -24,6 +25,43 @@ type processTracker struct {
 	root     int
 	baseline map[int]trackedProcess
 	tracked  map[int]trackedProcess
+}
+
+var activeNativeRoots sync.Map
+
+func registerNativeRoot(pid int)   { activeNativeRoots.Store(pid, struct{}{}) }
+func unregisterNativeRoot(pid int) { activeNativeRoots.Delete(pid) }
+
+func underOtherNativeRoot(all map[int]trackedProcess, pid, ownRoot int) bool {
+	seen := map[int]struct{}{}
+	for current := pid; ; {
+		if current != ownRoot {
+			if _, active := activeNativeRoots.Load(current); active {
+				return true
+			}
+		}
+		if _, exists := seen[current]; exists {
+			return false
+		}
+		seen[current] = struct{}{}
+		item, exists := all[current]
+		if !exists || item.parent <= 0 || item.parent == current {
+			return false
+		}
+		current = item.parent
+	}
+}
+
+func (tracker *processTracker) Identity(root int) (WorkerIdentity, error) {
+	if root <= 0 {
+		return WorkerIdentity{}, fmt.Errorf("invalid native process pid %d", root)
+	}
+	return workerIdentity(root)
+}
+
+func (tracker *processTracker) Register(root int) {
+	tracker.root = root
+	registerNativeRoot(root)
 }
 
 func newProcessTracker() (*processTracker, error) {
@@ -48,7 +86,7 @@ func (tracker *processTracker) Discover(root int) error {
 	}
 	related := descendants(all, root)
 	for pid, item := range descendants(all, tracker.owner) {
-		if pid != tracker.owner {
+		if pid != tracker.owner && !underOtherNativeRoot(all, pid, tracker.root) {
 			related[pid] = item
 		}
 	}
@@ -175,7 +213,11 @@ func (tracker *processTracker) Reap() error {
 	return first
 }
 
-func (tracker *processTracker) Close() {}
+func (tracker *processTracker) Close() {
+	if tracker.root != 0 {
+		unregisterNativeRoot(tracker.root)
+	}
+}
 
 func readProcessTree(root int) (map[int]trackedProcess, error) {
 	all, err := readProcessTable()

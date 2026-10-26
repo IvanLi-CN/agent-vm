@@ -8,9 +8,30 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+type testWorkerRecorder struct {
+	mu       sync.Mutex
+	started  []WorkerIdentity
+	finished []error
+}
+
+func (recorder *testWorkerRecorder) WorkerStarted(_ context.Context, _ string, identity WorkerIdentity) error {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	recorder.started = append(recorder.started, identity)
+	return nil
+}
+
+func (recorder *testWorkerRecorder) WorkerFinished(_ context.Context, _ string, _ WorkerIdentity, err error) error {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	recorder.finished = append(recorder.finished, err)
+	return nil
+}
 
 func TestLimitedBufferReportsTheWholeInputWhenTruncated(t *testing.T) {
 	buffer := &limitedBuffer{limit: 3}
@@ -34,6 +55,50 @@ func TestRunnerUsesTheProtocolOutputSplit(t *testing.T) {
 	}
 	if got := runner.stderrLimit(); got != 64*1024 {
 		t.Fatalf("stderr limit = %d", got)
+	}
+}
+
+func TestRunnerAllowsIndependentCommandsToOverlap(t *testing.T) {
+	runner := NewRunner()
+	started := time.Now()
+	var group sync.WaitGroup
+	errors := make(chan error, 2)
+	for range 2 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			_, err := runner.Run(context.Background(), []string{"/bin/sh", "-c", "sleep 0.25"}, nil)
+			errors <- err
+		}()
+	}
+	group.Wait()
+	close(errors)
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if elapsed := time.Since(started); elapsed > 450*time.Millisecond {
+		t.Fatalf("independent native commands were serialized: %s", elapsed)
+	}
+}
+
+func TestRunnerDurablyExposesWorkerIdentityToRecorder(t *testing.T) {
+	recorder := &testWorkerRecorder{}
+	ctx := WithWorkerRecorder(context.Background(), "operation", recorder)
+	if _, err := NewRunner().Run(ctx, []string{"/bin/echo", "worker"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.started) != 1 || len(recorder.finished) != 1 || recorder.finished[0] != nil {
+		t.Fatalf("worker callbacks = %#v", recorder)
+	}
+	if recorder.started[0].PID <= 0 {
+		t.Fatalf("worker identity = %#v", recorder.started[0])
+	}
+	if runtime.GOOS == "linux" && recorder.started[0].StartTime == "" {
+		t.Fatalf("Linux worker identity lacks start time: %#v", recorder.started[0])
 	}
 }
 

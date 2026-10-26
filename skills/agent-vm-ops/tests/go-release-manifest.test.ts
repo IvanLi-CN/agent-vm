@@ -17,3 +17,26 @@ test("format-2 manifest rejects a candidate artifact or unknown transport before
   expect(() => validate_go_manifest({ ...manifest, client_view: { ...manifest.client_view, transport: "shell" } })).toThrow("transport");
   expect(() => validate_go_manifest({ ...manifest, artifacts: [{ ...manifest.artifacts[0], path: "../candidate" }, ...manifest.artifacts.slice(1)] })).toThrow();
 });
+
+test("format-2 manifest rejects malformed action schemas and compatibility windows", () => {
+  const manifest = build_go_manifest("a".repeat(40), artifacts);
+  const malformed = structuredClone(manifest);
+  malformed.actions.status = {
+    ...malformed.actions.status,
+    request: { schema: 2, semantic_revision: 1 },
+  };
+  malformed.client_view.actions.status = malformed.actions.status;
+  expect(() => validate_go_manifest(malformed)).toThrow("request is outside");
+
+  const inverted = structuredClone(manifest);
+  inverted.actions.status = {
+    ...inverted.actions.status,
+    control_to_client: {
+      ...inverted.actions.status.control_to_client,
+      schema_min: 2,
+      schema_max: 1,
+    },
+  };
+  inverted.client_view.actions.status = inverted.actions.status;
+  expect(() => validate_go_manifest(inverted)).toThrow("inverted");
+});

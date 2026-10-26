@@ -57,7 +57,9 @@ type Service struct {
 	Release   *protocol.ReleaseMetadata
 
 	mu          sync.RWMutex
-	controlMu   sync.Mutex
+	lockMu      sync.Mutex
+	actionLocks map[string]*sync.Mutex
+	maintenance sync.Mutex
 	admissionMu sync.Mutex
 	resident    bool
 	ready       bool
@@ -83,7 +85,7 @@ func New(store *state.Store, cfg config.Config, options Options) *Service {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Release: options.Release, resident: options.Resident, ready: false, wake: options.Wake}
+	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Release: options.Release, resident: options.Resident, ready: false, wake: options.Wake, actionLocks: make(map[string]*sync.Mutex)}
 }
 
 func (s *Service) MarkReady()  { s.mu.Lock(); s.ready = true; s.mu.Unlock() }
@@ -101,6 +103,189 @@ func (s *Service) wakeScheduler() {
 	if wake != nil {
 		wake()
 	}
+}
+
+func (s *Service) lockAction(action string, request protocol.Request) func() {
+	if action == "admin-reconcile" || action == "timer-reconcile" || action == "admin-gc" || action == "timer-age-gc" {
+		s.maintenance.Lock()
+		return s.maintenance.Unlock
+	}
+	key := ""
+	if session := stringValue(request["session_id"]); session != "" {
+		key = "session:" + session
+	} else if taskID := stringValue(request["task_id"]); taskID != "" {
+		key = "task:" + taskID
+	} else if action == "drain-enter" || action == "drain-exit" {
+		key = "drain"
+	}
+	if key == "" {
+		return func() {}
+	}
+	s.lockMu.Lock()
+	lock, exists := s.actionLocks[key]
+	if !exists {
+		lock = &sync.Mutex{}
+		s.actionLocks[key] = lock
+	}
+	s.lockMu.Unlock()
+	lock.Lock()
+	return lock.Unlock
+}
+
+func (s *Service) withSessionLock(session string, fn func() (map[string]any, error)) (map[string]any, error) {
+	if session == "" {
+		return fn()
+	}
+	unlock := s.lockAction("session", protocol.Request{"session_id": session})
+	defer unlock()
+	return fn()
+}
+
+func (s *Service) WorkerStarted(ctx context.Context, operationID string, identity native.WorkerIdentity) error {
+	return s.recordWorker(ctx, operationID, map[string]any{
+		"pid":        identity.PID,
+		"start_time": identity.StartTime,
+		"state":      "running",
+		"started_at": nowString(s.Clock()),
+	})
+}
+
+func (s *Service) WorkerFinished(ctx context.Context, operationID string, identity native.WorkerIdentity, runErr error) error {
+	worker := map[string]any{
+		"pid":         identity.PID,
+		"start_time":  identity.StartTime,
+		"state":       "finished",
+		"finished_at": nowString(s.Clock()),
+	}
+	if runErr != nil {
+		message := runErr.Error()
+		if len(message) > 2048 {
+			message = message[:2048]
+		}
+		worker["error"] = message
+	}
+	return s.recordWorker(ctx, operationID, worker)
+}
+
+func (s *Service) recordWorker(ctx context.Context, operationID string, worker map[string]any) error {
+	if operationID == "" {
+		return nil
+	}
+	// A worker must remain journaled even when its action context has timed out.
+	// The bounded background context only covers this small durable update.
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	return s.Store.RecordOperationWorker(persistCtx, operationID, worker)
+}
+
+func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.Operation) error {
+	for _, operation := range pending {
+		worker, ok := operation.Response["worker"].(map[string]any)
+		if !ok || stringValue(worker["state"]) != "running" {
+			continue
+		}
+		pid, valid := protocol.Integer(worker["pid"])
+		startTime, hasStartTime := worker["start_time"].(string)
+		if !valid || pid <= 0 || !hasStartTime || startTime == "" {
+			return protocol.NewError("state_unverified", "pending operation has an invalid native worker identity", map[string]any{"operation_id": operation.OperationID})
+		}
+		identity := native.WorkerIdentity{PID: int(pid), StartTime: startTime}
+		alive, err := native.WorkerAlive(identity)
+		if err != nil {
+			return protocol.NewError("state_unverified", "pending native worker identity could not be verified", map[string]any{"operation_id": operation.OperationID, "cause": err.Error()})
+		}
+		if alive {
+			if err := native.KillWorker(identity); err != nil {
+				return protocol.NewError("state_unverified", "pending native worker could not be stopped safely", map[string]any{"operation_id": operation.OperationID, "cause": err.Error()})
+			}
+			worker["state"] = "orphaned"
+			worker["observed_at"] = nowString(s.Clock())
+			if err := s.recordWorker(ctx, operation.OperationID, worker); err != nil {
+				return s.sqliteError(err)
+			}
+			return protocol.NewError("startup_reconcile_required", "an orphaned native worker was stopped; retry reconciliation before admission", map[string]any{"operation_id": operation.OperationID})
+		}
+		worker["state"] = "exited"
+		worker["observed_at"] = nowString(s.Clock())
+		if err := s.recordWorker(ctx, operation.OperationID, worker); err != nil {
+			return s.sqliteError(err)
+		}
+	}
+	return nil
+}
+
+func (s *Service) recoverPending(ctx context.Context, pending []state.Operation) error {
+	var firstErr error
+	for _, operation := range pending {
+		if !recoverableOperation(operation.Action) || recoveryAttempts(operation.Response) > 0 {
+			continue
+		}
+		rawRequest, ok := operation.Response["_request"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if err := s.Store.MarkOperationRecoveryAttempt(ctx, operation.OperationID); err != nil {
+			if firstErr == nil {
+				firstErr = s.sqliteError(err)
+			}
+			continue
+		}
+		request := protocol.Request(rawRequest)
+		if err := protocol.ValidateRequest(request); err != nil {
+			if recordErr := s.recordError(ctx, request, protocol.NewError("operation_unverified", "saved pending request is invalid", map[string]any{"cause": err.Error()})); recordErr != nil && firstErr == nil {
+				firstErr = s.sqliteError(recordErr)
+			}
+			continue
+		}
+		recoveryCtx := native.WithWorkerRecorder(ctx, operation.OperationID, s)
+		result, dispatchErr := s.dispatchAction(recoveryCtx, operation.Action, request)
+		if dispatchErr != nil {
+			if uncertain(dispatchErr) {
+				if firstErr == nil {
+					firstErr = protocol.NewError("startup_reconcile_required", "pending operation recovery remains uncertain", map[string]any{"operation_id": operation.OperationID, "cause": dispatchErr.Error()})
+				}
+				continue
+			}
+			if recordErr := s.recordError(ctx, request, dispatchErr); recordErr != nil && firstErr == nil {
+				firstErr = s.sqliteError(recordErr)
+			}
+			continue
+		}
+		response := protocol.SuccessWithRelease(request, result, s.Release, nil)
+		responseDigest, digestErr := protocol.Digest(request)
+		if digestErr != nil {
+			if firstErr == nil {
+				firstErr = protocol.NewError("state_unverified", "recovered request cannot be canonicalized", map[string]any{"operation_id": operation.OperationID})
+			}
+			continue
+		}
+		response["_request_digest"] = responseDigest
+		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil && firstErr == nil {
+			firstErr = s.sqliteError(err)
+		}
+	}
+	return firstErr
+}
+
+func recoverableOperation(action string) bool {
+	switch action {
+	case "acquire", "renew", "release", "destroy", "restart", "resize", "port-add", "port-remove", "drain-enter", "drain-exit":
+		return true
+	default:
+		return false
+	}
+}
+
+func recoveryAttempts(response map[string]any) int64 {
+	value, ok := response["_recovery_attempts"]
+	if !ok {
+		return 0
+	}
+	parsed, valid := protocol.Integer(value)
+	if !valid || parsed < 0 {
+		return 1
+	}
+	return parsed
 }
 
 func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[string]any, error) {
@@ -125,15 +310,15 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if write && request["generation"] == nil {
 		return nil, protocol.NewError("invalid_request", "write request requires generation", nil)
 	}
-	s.controlMu.Lock()
-	defer s.controlMu.Unlock()
+	unlock := s.lockAction(action, request)
+	defer unlock()
 	if write {
 		operationID := stringValue(request["operation_id"])
 		digest, err := protocol.Digest(request)
 		if err != nil {
 			return nil, protocol.NewError("invalid_request", "request cannot be canonicalized", nil)
 		}
-		pending := map[string]any{"outcome": "pending", "_request_digest": digest}
+		pending := map[string]any{"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request)}
 		generation := intValue(request["generation"])
 		session := optionalString(request["session_id"])
 		existing, err := s.Store.ClaimOperation(ctx, operationID, action, session, generationPointer(generation, request["generation"] != nil), pending)
@@ -143,6 +328,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		if existing != nil {
 			return s.replayRecord(request, existing, warnings)
 		}
+		ctx = native.WithWorkerRecorder(ctx, operationID, s)
 	}
 	result, err := s.dispatchAction(ctx, action, request)
 	if err != nil {
@@ -254,8 +440,8 @@ func hasWarning(existing []any, candidate any) bool {
 // marked ready. Pending journal intents are evidence of an uncertain native
 // outcome and must remain visible for explicit inspection or cleanup.
 func (s *Service) StartupReconcile(ctx context.Context) error {
-	s.controlMu.Lock()
-	defer s.controlMu.Unlock()
+	s.maintenance.Lock()
+	defer s.maintenance.Unlock()
 	if _, err := s.Store.StateEpoch(ctx); err != nil {
 		return s.sqliteError(err)
 	}
@@ -267,7 +453,19 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 		return s.sqliteError(err)
 	}
 	if len(pending) > 0 {
-		return protocol.NewError("startup_reconcile_required", "pending operations require explicit recovery before admission", map[string]any{"count": len(pending)})
+		if err := s.reconcilePendingWorkers(ctx, pending); err != nil {
+			return err
+		}
+		if err := s.recoverPending(ctx, pending); err != nil {
+			return err
+		}
+		pending, err = s.Store.PendingOperations(ctx)
+		if err != nil {
+			return s.sqliteError(err)
+		}
+	}
+	if len(pending) > 0 {
+		return protocol.NewError("startup_reconcile_required", "pending operations require explicit recovery before admission", map[string]any{"count": len(pending), "admission_ready": false})
 	}
 	return nil
 }
@@ -292,9 +490,9 @@ func (s *Service) dispatchAction(ctx context.Context, action string, request pro
 	case "renew":
 		return s.renew(ctx, request)
 	case "release":
-		return s.release(ctx, request, false)
+		return s.releaseUnlocked(ctx, request, false)
 	case "destroy":
-		return s.release(ctx, request, true)
+		return s.releaseUnlocked(ctx, request, true)
 	case "restart":
 		return s.restart(ctx, request)
 	case "resize":
@@ -513,6 +711,12 @@ func (s *Service) renew(ctx context.Context, request protocol.Request) (map[stri
 }
 
 func (s *Service) release(ctx context.Context, request protocol.Request, destroy bool) (map[string]any, error) {
+	return s.withSessionLock(stringValue(request["session_id"]), func() (map[string]any, error) {
+		return s.releaseUnlocked(ctx, request, destroy)
+	})
+}
+
+func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request, destroy bool) (map[string]any, error) {
 	task, err := s.task(ctx, request)
 	if err != nil {
 		return nil, err
@@ -989,6 +1193,18 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 }
 
 func (s *Service) reconcile(ctx context.Context, apply bool) (map[string]any, error) {
+	if apply {
+		pending, pendingErr := s.Store.PendingOperations(ctx)
+		if pendingErr != nil {
+			return nil, s.sqliteError(pendingErr)
+		}
+		if err := s.reconcilePendingWorkers(ctx, pending); err != nil {
+			return nil, err
+		}
+		if err := s.recoverPending(ctx, pending); err != nil {
+			return nil, err
+		}
+	}
 	tasks, err := s.Store.ListTasks(ctx)
 	if err != nil {
 		return nil, s.sqliteError(err)
@@ -1032,6 +1248,7 @@ func (s *Service) gc(ctx context.Context, apply bool) (map[string]any, error) {
 		return nil, s.sqliteError(err)
 	}
 	candidates := make([]any, 0)
+	var firstErr error
 	for _, task := range tasks {
 		if task.State != stateCached || task.CleanupAfter == nil {
 			continue
@@ -1044,12 +1261,18 @@ func (s *Service) gc(ctx context.Context, apply bool) (map[string]any, error) {
 		if apply {
 			gcNow := s.Clock()
 			updated, updateErr := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateCached}, LeaseExpiredAt: &gcNow}, map[string]any{"state": stateDeleting, "updated_at": nowString(gcNow)})
-			if updateErr == nil && updated {
-				_, _ = s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, true)
+			if updateErr != nil {
+				if firstErr == nil {
+					firstErr = s.sqliteError(updateErr)
+				}
+			} else if updated {
+				if _, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, true); releaseErr != nil && firstErr == nil {
+					firstErr = releaseErr
+				}
 			}
 		}
 	}
-	return map[string]any{"dry_run": !apply, "selection": "age", "minimum_idle_seconds": s.Config.CacheSeconds, "candidates": candidates}, nil
+	return map[string]any{"dry_run": !apply, "selection": "age", "minimum_idle_seconds": s.Config.CacheSeconds, "candidates": candidates}, firstErr
 }
 
 func (s *Service) expire(ctx context.Context, request protocol.Request) (map[string]any, error) {
@@ -1505,7 +1728,12 @@ func requestHasResourceFields(request protocol.Request) bool {
 
 func (s *Service) failTask(ctx context.Context, task *state.Task, phase string, err error) (map[string]any, error) {
 	detail := nativePhaseDetail(phase, err)
-	_ = s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())})
+	if stateErr := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
+		detail["state_persisted"] = false
+		detail["state_error"] = stateErr.Error()
+		return nil, protocol.NewError("state_unverified", "native failure could not be durably recorded", detail)
+	}
+	detail["state_persisted"] = true
 	return nil, protocol.NewError("native_failed", "native lifecycle action failed", detail)
 }
 

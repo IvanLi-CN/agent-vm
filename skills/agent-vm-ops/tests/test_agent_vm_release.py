@@ -301,6 +301,17 @@ class ReleasePublisherTests(unittest.TestCase):
             transport.wrapper("staging-control", RELEASE.CANONICAL_REMOTE_WRAPPER, "status", "tx", "e" * 40)
         run.assert_called_once_with("staging-control", [RELEASE.CANONICAL_REMOTE_WRAPPER, "status"], None)
 
+    def test_ssh_activation_wrapper_has_a_separate_three_hundred_second_budget(self):
+        transport = RELEASE.SSHTransport(timeout=900)
+        with mock.patch.object(transport, "_run", return_value={}) as run:
+            transport.wrapper("staging-control", RELEASE.CANONICAL_REMOTE_WRAPPER, "activate", "tx", "e" * 40)
+        run.assert_called_once_with(
+            "staging-control",
+            [RELEASE.CANONICAL_REMOTE_WRAPPER, "activate", "--transaction-id", "tx", "--release-id", "e" * 40],
+            None,
+            timeout=RELEASE.ACTIVATION_TIMEOUT_SECONDS,
+        )
+
     def test_ssh_control_uses_bun_and_the_typescript_controller(self):
         transport = RELEASE.SSHTransport()
         request = {"protocol": 4, "action": "drain-status"}

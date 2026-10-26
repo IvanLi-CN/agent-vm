@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -25,19 +24,16 @@ type Runner struct {
 	OutputLimit int
 	StdoutLimit int
 	StderrLimit int
-	mu          sync.Mutex
 }
 
 func NewRunner() *Runner {
 	return &Runner{OutputLimit: 64 * 1024, StdoutLimit: 2 * 1024 * 1024, StderrLimit: 64 * 1024}
 }
 
-func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (Result, error) {
+func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result Result, runErr error) {
 	if r == nil {
 		r = NewRunner()
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	if len(argv) == 0 || argv[0] == "" {
 		return Result{}, errors.New("invalid native command")
 	}
@@ -76,6 +72,7 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (Result, 
 		_ = stderrWriter.Close()
 		return Result{}, fmt.Errorf("start %s: %w", argv[0], err)
 	}
+	tracker.Register(command.Process.Pid)
 	// The child owns the duplicated write ends. Closing the parent's copies is
 	// required so successful commands can reach EOF, while a detached child
 	// cannot keep the parent-side descriptor alive indefinitely.
@@ -89,6 +86,52 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (Result, 
 	pidfd := openPIDFD(command.Process.Pid)
 	wait := make(chan error, 1)
 	go func() { wait <- command.Wait() }()
+	binding := workerBindingFromContext(ctx)
+	var identity WorkerIdentity
+	if binding.recorder != nil {
+		var identityErr error
+		identity, identityErr = tracker.Identity(command.Process.Pid)
+		if identityErr != nil {
+			killProcess(command.Process.Pid, pidfd)
+			_ = cleanupTracked(tracker, command.Process.Pid)
+			_ = stdoutReader.Close()
+			_ = stderrReader.Close()
+			<-wait
+			<-stdoutDone
+			<-stderrDone
+			closePIDFD(pidfd)
+			_ = tracker.Reap()
+			return Result{}, fmt.Errorf("identify native worker: %w", identityErr)
+		}
+	}
+	workerStarted := false
+	defer func() {
+		if !workerStarted || binding.recorder == nil {
+			return
+		}
+		if err := binding.recorder.WorkerFinished(ctx, binding.operationID, identity, runErr); err != nil {
+			if runErr == nil {
+				runErr = fmt.Errorf("record native worker completion: %w", err)
+			} else {
+				runErr = errors.Join(runErr, fmt.Errorf("record native worker completion: %w", err))
+			}
+		}
+	}()
+	if binding.recorder != nil {
+		if err := binding.recorder.WorkerStarted(ctx, binding.operationID, identity); err != nil {
+			killProcess(command.Process.Pid, pidfd)
+			_ = cleanupTracked(tracker, command.Process.Pid)
+			_ = stdoutReader.Close()
+			_ = stderrReader.Close()
+			<-wait
+			<-stdoutDone
+			<-stderrDone
+			closePIDFD(pidfd)
+			_ = tracker.Reap()
+			return Result{}, fmt.Errorf("record native worker start: %w", err)
+		}
+		workerStarted = true
+	}
 	var waitErr error
 	select {
 	case waitErr = <-wait:
@@ -160,7 +203,7 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (Result, 
 	if reapErr := tracker.Reap(); trackingErr == nil {
 		trackingErr = reapErr
 	}
-	result := Result{Code: exitCode(waitErr), Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), StdoutTruncated: stdout.Truncated, StderrTruncated: stderr.Truncated}
+	result = Result{Code: exitCode(waitErr), Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), StdoutTruncated: stdout.Truncated, StderrTruncated: stderr.Truncated}
 	if trackingErr != nil {
 		return result, trackingErr
 	}

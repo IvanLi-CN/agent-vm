@@ -258,6 +258,43 @@ func TestResidentServiceRefusesAdmissionBeforeStartupReconcile(t *testing.T) {
 	}
 }
 
+func TestStartupReconcileRecoversOneSavedPendingOperation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	request := protocol.Request{
+		"protocol":     protocol.Version,
+		"action":       "drain-enter",
+		"generation":   int64(0),
+		"operation_id": "recover-drain",
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "recover-drain", "drain-enter", nil, &generation, map[string]any{
+		"outcome":         "pending",
+		"_request_digest": digest,
+		"_request":        map[string]any(request),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Resident: true})
+	if err := service.StartupReconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), "recover-drain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "success" {
+		t.Fatalf("recovered operation = %#v", operation)
+	}
+}
+
 func TestStartupPressureRefusesBeforeDurableAcquire(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
