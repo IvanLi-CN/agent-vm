@@ -86,6 +86,7 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	defer tracker.Close()
 	command := exec.Command(argv[0], argv[1:]...)
 	configureCommand(command)
+	tracker.configureCommand(command)
 	command.Stdin = bytes.NewReader(input)
 	stdout := &limitedBuffer{limit: r.stdoutLimit()}
 	stderr := &limitedBuffer{limit: r.stderrLimit()}

@@ -7,9 +7,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -23,10 +25,12 @@ type trackedProcess struct {
 }
 
 type processTracker struct {
-	owner    int
-	root     int
-	baseline map[int]trackedProcess
-	tracked  map[int]trackedProcess
+	owner      int
+	root       int
+	baseline   map[int]trackedProcess
+	tracked    map[int]trackedProcess
+	cgroupPath string
+	cgroupFD   int
 }
 
 var nativeProcessTreeMu sync.Mutex
@@ -48,6 +52,10 @@ func startTrackedCommand(command *exec.Cmd, tracker *processTracker) (bool, erro
 	if err := command.Start(); err != nil {
 		return false, err
 	}
+	if tracker.cgroupFD >= 0 {
+		_ = unix.Close(tracker.cgroupFD)
+		tracker.cgroupFD = -1
+	}
 	tracker.Register(command.Process.Pid)
 	return true, tracker.discover(command.Process.Pid)
 }
@@ -61,7 +69,51 @@ func newProcessTracker() (*processTracker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("snapshot native process tree: %w", err)
 	}
-	return &processTracker{owner: owner, baseline: baseline, tracked: make(map[int]trackedProcess)}, nil
+	tracker := &processTracker{owner: owner, baseline: baseline, tracked: make(map[int]trackedProcess), cgroupFD: -1}
+	tracker.prepareCgroup()
+	return tracker, nil
+}
+
+func (tracker *processTracker) prepareCgroup() {
+	content, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return
+	}
+	var relative string
+	for _, line := range strings.Split(string(content), "\n") {
+		if strings.HasPrefix(line, "0::") {
+			relative = strings.TrimSpace(strings.TrimPrefix(line, "0::"))
+			break
+		}
+	}
+	if relative == "" || !strings.HasPrefix(relative, "/") {
+		return
+	}
+	parent := filepath.Join("/sys/fs/cgroup", filepath.FromSlash(relative))
+	path, err := os.MkdirTemp(parent, "agent-vm-native-")
+	if err != nil {
+		return
+	}
+	fd, err := unix.Open(path, unix.O_PATH|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		_ = os.Remove(path)
+		return
+	}
+	tracker.cgroupPath = path
+	tracker.cgroupFD = fd
+}
+
+func (tracker *processTracker) configureCommand(command *exec.Cmd) {
+	if tracker.cgroupFD < 0 {
+		return
+	}
+	attributes := command.SysProcAttr
+	if attributes == nil {
+		attributes = &syscall.SysProcAttr{}
+	}
+	attributes.UseCgroupFD = true
+	attributes.CgroupFD = tracker.cgroupFD
+	command.SysProcAttr = attributes
 }
 
 func (tracker *processTracker) Discover(root int) error {
@@ -79,6 +131,13 @@ func (tracker *processTracker) discover(root int) error {
 		return fmt.Errorf("inspect native process tree: %w", err)
 	}
 	related := descendants(all, root)
+	cgroupProcesses, err := tracker.cgroupProcesses()
+	if err != nil {
+		return fmt.Errorf("inspect native cgroup: %w", err)
+	}
+	for pid, item := range cgroupProcesses {
+		related[pid] = item
+	}
 	// A detached descendant is only owned after this tracker has observed it
 	// while it was attached to the command tree. Do not scan every child of the
 	// subreaper: a concurrent command may have reparented descendants there.
@@ -102,6 +161,32 @@ func (tracker *processTracker) discover(root int) error {
 		tracker.tracked[pid] = item
 	}
 	return nil
+}
+
+func (tracker *processTracker) cgroupProcesses() (map[int]trackedProcess, error) {
+	if tracker.cgroupPath == "" {
+		return nil, nil
+	}
+	content, err := os.ReadFile(filepath.Join(tracker.cgroupPath, "cgroup.procs"))
+	if err != nil {
+		return nil, err
+	}
+	processes := make(map[int]trackedProcess)
+	for _, line := range strings.Split(string(content), "\n") {
+		pid, err := strconv.Atoi(strings.TrimSpace(line))
+		if err != nil || pid <= 0 {
+			continue
+		}
+		process, err := readProcess(pid)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read process %d: %w", pid, err)
+		}
+		processes[pid] = process
+	}
+	return processes, nil
 }
 
 func (tracker *processTracker) Live() (int, error) {
@@ -225,6 +310,14 @@ func (tracker *processTracker) Reap() error {
 }
 
 func (tracker *processTracker) Close() {
+	if tracker.cgroupFD >= 0 {
+		_ = unix.Close(tracker.cgroupFD)
+		tracker.cgroupFD = -1
+	}
+	if tracker.cgroupPath != "" {
+		_ = os.Remove(tracker.cgroupPath)
+		tracker.cgroupPath = ""
+	}
 }
 
 func readProcessTree(root int) (map[int]trackedProcess, error) {

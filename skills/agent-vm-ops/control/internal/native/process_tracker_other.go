@@ -17,10 +17,11 @@ func startTrackedCommand(command *exec.Cmd, tracker *processTracker) (bool, erro
 func (tracker *processTracker) Identity(root int) (WorkerIdentity, error) {
 	return workerIdentity(root)
 }
-func (*processTracker) Register(_ int)        {}
-func (*processTracker) Discover(_ int) error  { return nil }
-func (*processTracker) Live() (int, error)    { return 0, nil }
-func (*processTracker) Present() (int, error) { return 0, nil }
-func (*processTracker) Kill() error           { return nil }
-func (*processTracker) Reap() error           { return nil }
-func (*processTracker) Close()                {}
+func (*processTracker) configureCommand(_ *exec.Cmd) {}
+func (*processTracker) Register(_ int)               {}
+func (*processTracker) Discover(_ int) error         { return nil }
+func (*processTracker) Live() (int, error)           { return 0, nil }
+func (*processTracker) Present() (int, error)        { return 0, nil }
+func (*processTracker) Kill() error                  { return nil }
+func (*processTracker) Reap() error                  { return nil }
+func (*processTracker) Close()                       {}
