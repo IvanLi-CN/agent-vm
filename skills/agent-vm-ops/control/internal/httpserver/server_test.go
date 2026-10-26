@@ -81,6 +81,18 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 	if control["ok"] != true || control["action"] != "status" {
 		t.Fatalf("control response = %#v", control)
 	}
+	_, successStatus, successExit, err := RequestWithExitCode(context.Background(), socket, []byte(`{"protocol":4,"action":"status","session_id":"http-test"}`))
+	if err != nil || successStatus != http.StatusOK || successExit != 0 {
+		t.Fatalf("validated success status=%d exit=%d err=%v", successStatus, successExit, err)
+	}
+	invalid, invalidStatus, invalidExit, err := RequestWithExitCode(context.Background(), socket, []byte(`{"protocol":4,"action":"unknown","session_id":"http-test"}`))
+	if err != nil || invalidStatus != http.StatusBadRequest || invalidExit != 2 {
+		t.Fatalf("validated error status=%d exit=%d err=%v", invalidStatus, invalidExit, err)
+	}
+	var invalidEnvelope map[string]any
+	if err := json.Unmarshal(invalid, &invalidEnvelope); err != nil || invalidEnvelope["ok"] != false {
+		t.Fatalf("validated error envelope=%s err=%v", invalid, err)
+	}
 
 	client := &http.Client{Transport: &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		var dialer net.Dialer

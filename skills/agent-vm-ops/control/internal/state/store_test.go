@@ -196,5 +196,29 @@ func TestClaimOperationIsAtomicAcrossConcurrentRetries(t *testing.T) {
 	}
 }
 
+func TestTransactionErrorRetainsRollbackPhaseAndCommitState(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "transaction.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	transactionErr := store.withWrite(context.Background(), func(tx *Tx) error {
+		if _, err := tx.exec("INSERT INTO meta(key, value) VALUES('transaction-test', '1')"); err != nil {
+			return err
+		}
+		return errors.New("synthetic callback failure")
+	})
+	var typed *TransactionError
+	if !errors.As(transactionErr, &typed) {
+		t.Fatalf("transaction error = %v", transactionErr)
+	}
+	if typed.Phase != "write" || typed.SQLOperation != "write" || typed.StateCommitted == nil || *typed.StateCommitted {
+		t.Fatalf("transaction metadata = %#v", typed)
+	}
+	if _, found, err := store.Meta(context.Background(), "transaction-test"); err != nil || found {
+		t.Fatalf("rolled back metadata found=%v err=%v", found, err)
+	}
+}
+
 func stringPointer(value string) *string { return &value }
 func intPointer(value int64) *int64      { return &value }

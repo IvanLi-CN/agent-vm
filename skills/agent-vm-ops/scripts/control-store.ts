@@ -507,6 +507,7 @@ export class StateStore {
   private _state_epoch_value(value: string | null): string {
     if (value === null) return "initial";
     const text = value.trim();
+    if (text === "initial") return "initial";
     if (/^[0-9a-f]{32}$/.test(text)) return text;
     if (/^(?:0|[1-9][0-9]*)$/.test(text)) {
       if (text.length > 19) {

@@ -3,6 +3,7 @@ package native
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -36,6 +37,33 @@ type ClientOptions struct {
 	Pool    string
 }
 
+// CommandError carries the bounded result of a failed Incus invocation. The
+// lifecycle layer can retain this diagnostic without widening the native
+// command output limits or exposing an unbounded subprocess buffer.
+type CommandError struct {
+	Result Result
+	Cause  error
+}
+
+func (err *CommandError) Error() string {
+	if err.Cause == nil {
+		return "incus command failed"
+	}
+	return err.Cause.Error()
+}
+
+func (err *CommandError) Unwrap() error { return err.Cause }
+
+func (err *CommandError) Diagnostic() map[string]any {
+	return map[string]any{
+		"exit_code":        err.Result.Code,
+		"stdout":           string(err.Result.Stdout),
+		"stderr":           string(err.Result.Stderr),
+		"stdout_truncated": err.Result.StdoutTruncated,
+		"stderr_truncated": err.Result.StderrTruncated,
+	}
+}
+
 func NewIncusClient(runner *Runner, project string, options ...ClientOptions) *IncusClient {
 	if runner == nil {
 		runner = NewRunner()
@@ -56,19 +84,35 @@ func (c *IncusClient) command(ctx context.Context, args ...string) (Result, erro
 	return c.Runner.Run(ctx, argv, nil)
 }
 
+func (c *IncusClient) run(ctx context.Context, args ...string) error {
+	result, err := c.command(ctx, args...)
+	return wrapCommandError(result, err)
+}
+
 func (c *IncusClient) json(ctx context.Context, args ...string) (map[string]any, error) {
 	result, err := c.command(ctx, append(args, "--format", "json")...)
 	if err != nil {
-		return nil, err
+		return nil, wrapCommandError(result, err)
 	}
 	if result.StdoutTruncated {
-		return nil, fmt.Errorf("incus output exceeded diagnostic limit")
+		return nil, wrapCommandError(result, fmt.Errorf("incus output exceeded diagnostic limit"))
 	}
 	var value map[string]any
 	if err := json.Unmarshal(result.Stdout, &value); err != nil {
-		return nil, fmt.Errorf("invalid incus JSON: %w", err)
+		return nil, wrapCommandError(result, fmt.Errorf("invalid incus JSON: %w", err))
 	}
 	return value, nil
+}
+
+func wrapCommandError(result Result, err error) error {
+	if err == nil {
+		return nil
+	}
+	var commandErr *CommandError
+	if errors.As(err, &commandErr) {
+		return err
+	}
+	return &CommandError{Result: result, Cause: err}
 }
 
 func (c *IncusClient) Init(ctx context.Context, image, name string) error {
@@ -83,13 +127,11 @@ func (c *IncusClient) Init(ctx context.Context, image, name string) error {
 		args = append(args, "--storage", c.Pool)
 	}
 	args = append(args, "--config", "boot.autostart=false")
-	_, err := c.command(ctx, args...)
-	return err
+	return c.run(ctx, args...)
 }
 
 func (c *IncusClient) ConfigSet(ctx context.Context, name, key, value string) error {
-	_, err := c.command(ctx, "config", "set", name, key+"="+value)
-	return err
+	return c.run(ctx, "config", "set", name, key+"="+value)
 }
 
 func (c *IncusClient) DeviceSet(ctx context.Context, name, device, key, value string) error {
@@ -103,8 +145,7 @@ func (c *IncusClient) DeviceSet(ctx context.Context, name, device, key, value st
 			action = "set"
 		}
 	}
-	_, err = c.command(ctx, "config", "device", action, name, device, key+"="+value)
-	return err
+	return c.run(ctx, "config", "device", action, name, device, key+"="+value)
 }
 
 func (c *IncusClient) DeviceAdd(ctx context.Context, name, device, deviceType string, properties map[string]string) error {
@@ -118,26 +159,21 @@ func (c *IncusClient) DeviceAdd(ctx context.Context, name, device, deviceType st
 		value := properties[key]
 		args = append(args, key+"="+value)
 	}
-	_, err := c.command(ctx, args...)
-	return err
+	return c.run(ctx, args...)
 }
 
 func (c *IncusClient) DeviceRemove(ctx context.Context, name, device string) error {
-	_, err := c.command(ctx, "config", "device", "remove", name, device)
-	return err
+	return c.run(ctx, "config", "device", "remove", name, device)
 }
 
 func (c *IncusClient) Start(ctx context.Context, name string) error {
-	_, err := c.command(ctx, "start", name)
-	return err
+	return c.run(ctx, "start", name)
 }
 func (c *IncusClient) Stop(ctx context.Context, name string) error {
-	_, err := c.command(ctx, "stop", name, "--force")
-	return err
+	return c.run(ctx, "stop", name, "--force")
 }
 func (c *IncusClient) Delete(ctx context.Context, name string) error {
-	_, err := c.command(ctx, "delete", name, "--force")
-	return err
+	return c.run(ctx, "delete", name, "--force")
 }
 
 func (c *IncusClient) Status(ctx context.Context, name string) (map[string]any, error) {
@@ -156,7 +192,8 @@ func (c *IncusClient) Exec(ctx context.Context, name string, argv []string, inpu
 		full = append(full, "--project", c.Project)
 	}
 	full = append(full, args...)
-	return c.Runner.Run(ctx, full, input)
+	result, err := c.Runner.Run(ctx, full, input)
+	return result, wrapCommandError(result, err)
 }
 
 func ParseStatus(value map[string]any) (string, error) {

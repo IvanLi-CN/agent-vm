@@ -2,15 +2,26 @@ package lifecycle
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/config"
+	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/observe"
 	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/state"
 )
+
+type staticCPUObserver struct {
+	observation observe.CPUObservation
+	err         error
+}
+
+func (observer staticCPUObserver) Observe(context.Context) (observe.CPUObservation, error) {
+	return observer.observation, observer.err
+}
 
 func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
@@ -76,6 +87,7 @@ func TestAdmissionAndLeaseTransitionsRemainDurable(t *testing.T) {
 	cfg := config.Defaults()
 	cfg.StateDB = store.Path()
 	cfg.MemoryBudgetMiB = 4096
+	cfg.MemoryOvercommitRatio = json.Number("1")
 	service := New(store, cfg, Options{Clock: func() time.Time { return now }})
 	ctx := context.Background()
 	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "first", "generation": int64(0), "operation_id": "acquire-first"})
@@ -167,5 +179,29 @@ func TestResidentServiceRefusesAdmissionBeforeStartupReconcile(t *testing.T) {
 	}
 	if service.Ready() {
 		t.Fatal("service became ready before startup reconciliation")
+	}
+}
+
+func TestStartupPressureRefusesBeforeDurableAcquire(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.ImageFingerprint = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	service := New(store, cfg, Options{CPU: staticCPUObserver{observation: observe.CPUObservation{
+		Capacity: 1,
+		Full:     observe.PSIValues{Avg10: 20},
+		Some:     observe.PSIValues{Avg10: 20},
+	}}})
+	_, err = service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "acquire", "session_id": "pressure", "generation": int64(0), "operation_id": "acquire-pressure",
+	})
+	if control := protocol.AsError(err); control.Code != "resource_pressure" {
+		t.Fatalf("pressure error = %#v", control)
+	}
+	if task, getErr := store.GetTask(context.Background(), map[string]any{"session_id": "pressure"}); getErr != nil || task != nil {
+		t.Fatalf("pressure acquire left task: task=%#v err=%v", task, getErr)
 	}
 }
