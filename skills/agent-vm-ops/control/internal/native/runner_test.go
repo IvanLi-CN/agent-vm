@@ -143,12 +143,21 @@ func TestEscapedDescendantIsDetectedAndCleaned(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux process ownership boundary required")
 	}
+	tracker, err := newProcessTracker()
+	if err != nil {
+		t.Skipf("Linux process ownership boundary unavailable: %v", err)
+	}
+	delegated := tracker.hasOwnershipBoundary()
+	tracker.Close()
+	if !delegated {
+		t.Skip("Linux cgroup delegation required for escaped descendant ownership")
+	}
 	pidPath := filepath.Join(t.TempDir(), "pid")
 	runner := NewRunner()
 	command := `setsid /bin/sh -c 'echo $$ > "$1"; sleep 30' sh "$1" &
 while [ ! -s "$1" ]; do sleep 0.01; done
 exit 0`
-	_, err := runner.Run(context.Background(), []string{"/bin/sh", "-c", command, "sh", pidPath}, nil)
+	_, err = runner.Run(context.Background(), []string{"/bin/sh", "-c", command, "sh", pidPath}, nil)
 	if err == nil || !strings.Contains(err.Error(), "child processes") {
 		t.Fatalf("Run error = %v, want escaped child failure", err)
 	}

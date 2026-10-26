@@ -116,6 +116,10 @@ func (tracker *processTracker) configureCommand(command *exec.Cmd) {
 	command.SysProcAttr = attributes
 }
 
+func (tracker *processTracker) hasOwnershipBoundary() bool {
+	return tracker.cgroupPath != ""
+}
+
 func (tracker *processTracker) Discover(root int) error {
 	nativeProcessTreeMu.Lock()
 	defer nativeProcessTreeMu.Unlock()
