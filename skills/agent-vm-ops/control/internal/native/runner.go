@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,6 +25,42 @@ type Runner struct {
 	OutputLimit int
 	StdoutLimit int
 	StderrLimit int
+}
+
+func monitorProcessTree(tracker *processTracker, root int) func() error {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var once sync.Once
+	var mu sync.Mutex
+	var firstErr error
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				if err := tracker.Discover(root); err != nil {
+					mu.Lock()
+					if firstErr == nil {
+						firstErr = err
+					}
+					mu.Unlock()
+				}
+			}
+		}
+	}()
+	return func() error {
+		once.Do(func() {
+			close(stop)
+			<-done
+		})
+		mu.Lock()
+		defer mu.Unlock()
+		return firstErr
+	}
 }
 
 func NewRunner() *Runner {
@@ -73,6 +110,8 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 		_ = stderrWriter.Close()
 		return Result{}, fmt.Errorf("start %s: %w", argv[0], trackingErr)
 	}
+	stopMonitor := monitorProcessTree(tracker, command.Process.Pid)
+	defer func() { _ = stopMonitor() }()
 	// The child owns the duplicated write ends. Closing the parent's copies is
 	// required so successful commands can reach EOF, while a detached child
 	// cannot keep the parent-side descriptor alive indefinitely.
@@ -84,6 +123,9 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	go drain(stderrReader, stderr, stderrDone)
 	pidfd := openPIDFD(command.Process.Pid)
 	if trackingErr != nil {
+		if monitorErr := stopMonitor(); monitorErr != nil && trackingErr == nil {
+			trackingErr = monitorErr
+		}
 		killProcess(command.Process.Pid, pidfd)
 		cleanupErr := cleanupTracked(tracker, command.Process.Pid)
 		_ = stdoutReader.Close()
@@ -104,6 +146,9 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 		var identityErr error
 		identity, identityErr = tracker.Identity(command.Process.Pid)
 		if identityErr != nil {
+			if monitorErr := stopMonitor(); monitorErr != nil && trackingErr == nil {
+				trackingErr = monitorErr
+			}
 			killProcess(command.Process.Pid, pidfd)
 			_ = cleanupTracked(tracker, command.Process.Pid)
 			_ = stdoutReader.Close()
@@ -133,6 +178,9 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	}()
 	if binding.recorder != nil {
 		if err := binding.recorder.WorkerStarted(ctx, binding.operationID, identity); err != nil {
+			if monitorErr := stopMonitor(); monitorErr != nil && trackingErr == nil {
+				trackingErr = monitorErr
+			}
 			killProcess(command.Process.Pid, pidfd)
 			_ = cleanupTracked(tracker, command.Process.Pid)
 			_ = stdoutReader.Close()
@@ -149,6 +197,9 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	var waitErr error
 	select {
 	case waitErr = <-wait:
+		if monitorErr := stopMonitor(); monitorErr != nil && trackingErr == nil {
+			trackingErr = monitorErr
+		}
 		if trackingErr == nil {
 			trackingErr = tracker.Discover(command.Process.Pid)
 		}
@@ -171,6 +222,9 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 			_ = stderrReader.Close()
 		}
 	case <-ctx.Done():
+		if monitorErr := stopMonitor(); monitorErr != nil && trackingErr == nil {
+			trackingErr = monitorErr
+		}
 		if trackingErr == nil {
 			trackingErr = tracker.Discover(command.Process.Pid)
 		}
@@ -210,6 +264,9 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 		return Result{Code: exitCode(waitErr), Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), StdoutTruncated: stdout.Truncated, StderrTruncated: stderr.Truncated}, fmt.Errorf("native command timeout after %s: %w", time.Since(started).Round(time.Millisecond), ctx.Err())
 	}
 	closePIDFD(pidfd)
+	if monitorErr := stopMonitor(); monitorErr != nil && trackingErr == nil {
+		trackingErr = monitorErr
+	}
 	_ = stdoutReader.Close()
 	_ = stderrReader.Close()
 	<-stdoutDone

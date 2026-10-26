@@ -18,6 +18,7 @@ type trackedProcess struct {
 	pid    int
 	start  string
 	parent int
+	group  int
 	state  byte
 }
 
@@ -28,31 +29,7 @@ type processTracker struct {
 	tracked  map[int]trackedProcess
 }
 
-var activeNativeRoots sync.Map
 var nativeProcessTreeMu sync.Mutex
-
-func registerNativeRoot(pid int)   { activeNativeRoots.Store(pid, struct{}{}) }
-func unregisterNativeRoot(pid int) { activeNativeRoots.Delete(pid) }
-
-func underOtherNativeRoot(all map[int]trackedProcess, pid, ownRoot int) bool {
-	seen := map[int]struct{}{}
-	for current := pid; ; {
-		if current != ownRoot {
-			if _, active := activeNativeRoots.Load(current); active {
-				return true
-			}
-		}
-		if _, exists := seen[current]; exists {
-			return false
-		}
-		seen[current] = struct{}{}
-		item, exists := all[current]
-		if !exists || item.parent <= 0 || item.parent == current {
-			return false
-		}
-		current = item.parent
-	}
-}
 
 func (tracker *processTracker) Identity(root int) (WorkerIdentity, error) {
 	if root <= 0 {
@@ -63,7 +40,6 @@ func (tracker *processTracker) Identity(root int) (WorkerIdentity, error) {
 
 func (tracker *processTracker) Register(root int) {
 	tracker.root = root
-	registerNativeRoot(root)
 }
 
 func startTrackedCommand(command *exec.Cmd, tracker *processTracker) (bool, error) {
@@ -103,9 +79,14 @@ func (tracker *processTracker) discover(root int) error {
 		return fmt.Errorf("inspect native process tree: %w", err)
 	}
 	related := descendants(all, root)
-	for pid, item := range descendants(all, tracker.owner) {
-		if pid != tracker.owner && !underOtherNativeRoot(all, pid, tracker.root) {
-			related[pid] = item
+	// A detached descendant is only owned after this tracker has observed it
+	// while it was attached to the command tree. Do not scan every child of the
+	// subreaper: a concurrent command may have reparented descendants there.
+	for pid := range tracker.tracked {
+		if _, present := all[pid]; present {
+			for child, item := range descendants(all, pid) {
+				related[child] = item
+			}
 		}
 	}
 	for pid, item := range related {
@@ -164,25 +145,9 @@ func (tracker *processTracker) Present() (int, error) {
 func (tracker *processTracker) Kill() error {
 	var first error
 	for pid, item := range tracker.tracked {
-		current, err := readProcess(pid)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			if first == nil {
-				first = err
-			}
-			continue
-		}
-		if current.start != item.start {
-			if first == nil {
-				first = fmt.Errorf("tracked process identity changed for pid %d", pid)
-			}
-			continue
-		}
-		if current.state == 'Z' {
-			continue
-		}
+		// Open the pidfd before inspecting /proc again. The pidfd pins the
+		// process identity; a PID reuse between read and open must not be
+		// signalled.
 		fd, openErr := unix.PidfdOpen(pid, 0)
 		if openErr != nil {
 			if errors.Is(openErr, unix.ESRCH) {
@@ -191,6 +156,29 @@ func (tracker *processTracker) Kill() error {
 			if first == nil {
 				first = fmt.Errorf("open pidfd for %d: %w", pid, openErr)
 			}
+			continue
+		}
+		current, err := readProcess(pid)
+		if errors.Is(err, os.ErrNotExist) {
+			_ = unix.Close(fd)
+			continue
+		}
+		if err != nil {
+			_ = unix.Close(fd)
+			if first == nil {
+				first = err
+			}
+			continue
+		}
+		if current.start != item.start {
+			_ = unix.Close(fd)
+			if first == nil {
+				first = fmt.Errorf("tracked process identity changed for pid %d", pid)
+			}
+			continue
+		}
+		if current.state == 'Z' {
+			_ = unix.Close(fd)
 			continue
 		}
 		signalErr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
@@ -205,6 +193,11 @@ func (tracker *processTracker) Kill() error {
 func (tracker *processTracker) Reap() error {
 	var first error
 	for pid, item := range tracker.tracked {
+		if pid == tracker.root {
+			// exec.Cmd.Wait owns the command root. Reaping it here races with
+			// Wait and can make a successful command look like an ECHILD.
+			continue
+		}
 		current, err := readProcess(pid)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -232,9 +225,6 @@ func (tracker *processTracker) Reap() error {
 }
 
 func (tracker *processTracker) Close() {
-	if tracker.root != 0 {
-		unregisterNativeRoot(tracker.root)
-	}
 }
 
 func readProcessTree(root int) (map[int]trackedProcess, error) {
@@ -285,7 +275,11 @@ func readProcess(pid int) (trackedProcess, error) {
 	if err != nil {
 		return trackedProcess{}, fmt.Errorf("invalid parent for pid %d: %w", pid, err)
 	}
-	return trackedProcess{pid: pid, start: fields[19], parent: parent, state: fields[0][0]}, nil
+	group, err := strconv.Atoi(fields[2])
+	if err != nil || group <= 0 {
+		return trackedProcess{}, fmt.Errorf("invalid process group for pid %d", pid)
+	}
+	return trackedProcess{pid: pid, start: fields[19], parent: parent, group: group, state: fields[0][0]}, nil
 }
 
 func descendants(all map[int]trackedProcess, root int) map[int]trackedProcess {

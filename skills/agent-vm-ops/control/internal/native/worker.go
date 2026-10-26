@@ -6,8 +6,9 @@ import "context"
 // never sufficient for recovery because it can be reused after a daemon
 // restart; Linux also records the process start time from /proc.
 type WorkerIdentity struct {
-	PID       int    `json:"pid"`
-	StartTime string `json:"start_time"`
+	PID          int    `json:"pid"`
+	StartTime    string `json:"start_time"`
+	ProcessGroup int    `json:"process_group,omitempty"`
 }
 
 // WorkerRecorder binds a native command to the operation journal. The

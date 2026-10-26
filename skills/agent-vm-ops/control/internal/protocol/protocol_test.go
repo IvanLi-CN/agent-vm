@@ -57,6 +57,60 @@ func TestCanonicalNumbersKeepIntegerAndFractionalIdentity(t *testing.T) {
 	}
 }
 
+func TestCanonicalJSONPreservesEscapedUnpairedSurrogates(t *testing.T) {
+	value, err := DecodeValue([]byte(`{"pair":"\ud800\udc00","surrogate":"\ud800"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := CanonicalJSON(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if canonical != `{"pair": "\ud800\udc00", "surrogate": "\ud800"}` {
+		t.Fatalf("canonical = %s", canonical)
+	}
+}
+
+func TestCanonicalJSONMatchesLegacyCorpus(t *testing.T) {
+	cases := []struct {
+		source    string
+		digest    string
+		canonical string
+	}{
+		{`{"z":1,"a":{"b":true,"a":null},"items":[3,2,1]}`, "4289537ed976b87787b53020ff034601bd8e529ca6144b32f92babff2d198f43", `{"a": {"a": null, "b": true}, "items": [3, 2, 1], "z": 1}`},
+		{`{"generation":9007199254740993,"negative":-9223372036854775809}`, "352bee174a457e8cd06bc1ea993dc15c0d1739d48691c1f561ac46009d137dc6", `{"generation": 9007199254740993, "negative": -9223372036854775809}`},
+		{`{"value":1}`, "e1d70a18cc129fcc812ebbe309bc5197df6ffa2228c77a4a7b98653ec5605354", `{"value": 1}`},
+		{`{"value":1.0}`, "1f5a54566322afe41ae853c8344fb4fbd68226c1fe1cea2fbd08eeb6533fc5f9", `{"value": 1.0}`},
+		{`{"value":1e0}`, "1f5a54566322afe41ae853c8344fb4fbd68226c1fe1cea2fbd08eeb6533fc5f9", `{"value": 1.0}`},
+		{`{"value":-0.0}`, "f2d5cc6fe0d5157446bc8c339543a44d451dadb801a457d9f1ba07bab385a1a3", `{"value": -0.0}`},
+		{`{"floats":[0.0001,0.00001,1e-7,1e15,1e16,1e23,1.2345678901234567,5e-324,1.7976931348623157e308]}`, "a95cab8f414b68e1264fd77515373e68c593945318b71d2351bc04d8589ba9d4", `{"floats": [0.0001, 1e-05, 1e-07, 1000000000000000.0, 1e+16, 1e+23, 1.2345678901234567, 5e-324, 1.7976931348623157e+308]}`},
+		{`{"floats":[9007199254740993.0,NaN,Infinity,-Infinity]}`, "128c9469ddc871cc9ccc18b54d1608b433f9ba2307c854f2cb3b2f2872ba3b5e", `{"floats": [9007199254740992.0, NaN, Infinity, -Infinity]}`},
+		{`{"\u5fc3\u7fbd":"\u732b \ud83d\udc08","\u00e9":"e\u0301","\ue000":1,"\ud800\udc00":2}`, "e85c97e1973d06033305438d42970bf3e0bb2b7915efc916c7982c8dbf01df37", `{"\u00e9": "e\u0301", "\u5fc3\u7fbd": "\u732b \ud83d\udc08", "\ue000": 1, "\ud800\udc00": 2}`},
+		{`{"escape":"\b\t\n\f\r\"\\/\u007f","surrogate":"\ud800"}`, "3862bfb95011ad98358d3d4f4d9d5f5002da78cd41f5660df5c3738690b3aac3", `{"escape": "\b\t\n\f\r\"\\/\u007f", "surrogate": "\ud800"}`},
+		{`{"__proto__":{"polluted":true},"constructor":"literal"}`, "760943ec7649b963a493e8e2a2b365ee66fbbfcf231fadfd4c1ba490d3da3da4", `{"__proto__": {"polluted": true}, "constructor": "literal"}`},
+	}
+	for _, testCase := range cases {
+		value, err := DecodeValue([]byte(testCase.source))
+		if err != nil {
+			t.Fatalf("decode %s: %v", testCase.source, err)
+		}
+		canonical, err := CanonicalJSON(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if canonical != testCase.canonical {
+			t.Fatalf("canonical = %s, want %s", canonical, testCase.canonical)
+		}
+		digest, err := Digest(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if digest != testCase.digest {
+			t.Fatalf("digest = %s, want %s", digest, testCase.digest)
+		}
+	}
+}
+
 func TestValidateRequestRejectsFractionalGeneration(t *testing.T) {
 	request, err := Decode([]byte(`{"protocol":4,"action":"status","session_id":"s","generation":1.0}`))
 	if err != nil {
@@ -64,6 +118,13 @@ func TestValidateRequestRejectsFractionalGeneration(t *testing.T) {
 	}
 	if control := ValidateRequest(request); control == nil || control.Code != "invalid_request" {
 		t.Fatalf("validation = %#v", control)
+	}
+}
+
+func TestValidateRequestRejectsMalformedOperationID(t *testing.T) {
+	request := Request{"protocol": Version, "action": "drain-enter", "generation": int64(0), "operation_id": ""}
+	if control := ValidateRequest(request); control == nil || control.Code != "invalid_request" {
+		t.Fatalf("malformed operation id control = %#v", control)
 	}
 }
 

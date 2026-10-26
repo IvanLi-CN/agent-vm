@@ -83,6 +83,7 @@ CANONICAL_UNIT_DIR = Path("/etc/systemd/system")
 RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
 GO_CONTROL_PATH = Path("/opt/agent-vm-native/bin/agent-vm-control")
 GO_CONTROL_SOCKET = Path("/run/agent-vm-native/control.sock")
+LEGACY_EXPIRY_TIMER_RE = re.compile(r"^agent-vm-native-expire-[A-Za-z0-9_.:-]+\.timer$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -738,6 +739,7 @@ def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
 
 
 def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
+    go_bundle_root = _go_control_target(config).parent
     targets = (
         Path(config["control_path"]),
         _go_control_target(config),
@@ -747,7 +749,9 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
         *(Path(config["control_path"]).with_name(name) for name in sorted(SUPPORT_ARTIFACT_NAMES)),
         Path(config["control_path"]).with_name(MANIFEST_NAME),
         Path(config["control_path"]).with_name("client-release.json"),
-    ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], "agent-vm-native.service"))
+    ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], "agent-vm-native.service")) + (
+        go_bundle_root / "systemd" / "agent-vm-native.service",
+    )
     return tuple(dict.fromkeys(targets))
 
 
@@ -891,10 +895,35 @@ def _systemctl(action: str, unit: str, *, allow_missing: bool = False) -> None:
         _fail("activation_failed", f"systemd {action} failed: {unit}")
 
 
+def _legacy_expiry_timers() -> tuple[str, ...]:
+    """Return only fixed-shape generation expiry timers owned by legacy control."""
+    try:
+        process = subprocess.run(
+            ["systemctl", "list-unit-files", "--no-legend", "--no-pager", "agent-vm-native-expire-*.timer"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _fail("activation_failed", "systemd legacy expiry timer inventory could not be verified")
+    if process.returncode not in (0, 1):
+        _fail("activation_failed", "systemd legacy expiry timer inventory failed")
+    units: set[str] = set()
+    for line in process.stdout.decode("utf-8", errors="strict").splitlines():
+        fields = line.split()
+        name = fields[0] if fields else ""
+        if LEGACY_EXPIRY_TIMER_RE.fullmatch(name):
+            units.add(name)
+    return tuple(sorted(units))
+
+
 def _activate_go_runtime() -> None:
-    """Stop legacy triggers, start Go, and verify that it is active."""
-    for unit in GO_RETIRED_UNITS:
+    """Retire legacy triggers, enable Go, and verify that it is active."""
+    for unit in (*GO_RETIRED_UNITS, *_legacy_expiry_timers()):
         _systemctl("stop", unit, allow_missing=True)
+        _systemctl("disable", unit, allow_missing=True)
+    _systemctl("enable", "agent-vm-native.service")
     _systemctl("restart", "agent-vm-native.service")
     _systemctl("is-active", "agent-vm-native.service")
 
@@ -902,8 +931,14 @@ def _activate_go_runtime() -> None:
 def _activate_legacy_runtime() -> None:
     """Restore only the fixed legacy reconciliation triggers for rollback."""
     _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+    _systemctl("disable", "agent-vm-native.service", allow_missing=True)
     _systemctl("start", "agent-vm-native-reconcile.service", allow_missing=True)
+    _systemctl("enable", "agent-vm-native-reconcile.service", allow_missing=True)
     _systemctl("start", "agent-vm-native-age-gc.timer", allow_missing=True)
+    _systemctl("enable", "agent-vm-native-age-gc.timer", allow_missing=True)
+    for unit in _legacy_expiry_timers():
+        _systemctl("start", unit, allow_missing=True)
+        _systemctl("enable", unit, allow_missing=True)
 
 
 def _install_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
@@ -959,6 +994,7 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
 def _install_go_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
     """Install the format-2 client, forwarding bridge, binary, and one unit."""
     owner_uid = int(config["owner_uid"])
+    go_bundle_root = _go_control_target(config).parent
     expected_support = {path for _, path, role, _ in GO_FIXED_ARTIFACTS if role == "support"}
     installed_support: set[str] = set()
     installed_controls: set[str] = set()
@@ -986,6 +1022,7 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
             if item["path"] != "systemd/agent-vm-native.service":
                 _fail("activation_unverified", "Go unit artifact path is not fixed")
             _copy_atomic(source, Path(config["unit_dir"]) / "agent-vm-native.service", owner_uid, item["mode"])
+            _copy_atomic(source, go_bundle_root / item["path"], owner_uid, item["mode"])
     if installed_support != expected_support or installed_controls != {"agent_vm_control_bridge.ts", "bin/agent-vm-control"}:
         _fail("activation_unverified", "fixed Go control artifacts are missing")
     for name in GO_RETIRED_UNITS:

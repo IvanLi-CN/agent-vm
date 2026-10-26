@@ -27,15 +27,19 @@ func (scheduler *Scheduler) Wake() {
 }
 
 func (scheduler *Scheduler) Run(ctx context.Context) error {
+	return scheduler.run(ctx, time.Second, 15*time.Minute)
+}
+
+func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInterval time.Duration) error {
 	if err := scheduler.Service.StartupReconcile(ctx); err == nil {
 		scheduler.Service.MarkReady()
 	}
 	go scheduler.sampleLoop(ctx, "admin-metrics", "capacity", 10*time.Second)
 	go scheduler.sampleLoop(ctx, "admin-status", "inventory", 30*time.Second)
 	go scheduler.sampleLoop(ctx, "doctor", "health", 15*time.Second)
-	ticker := time.NewTicker(time.Second)
+	ticker := time.NewTicker(reconcileInterval)
 	defer ticker.Stop()
-	ageTicker := time.NewTicker(15 * time.Minute)
+	ageTicker := time.NewTicker(ageInterval)
 	defer ageTicker.Stop()
 	for {
 		select {

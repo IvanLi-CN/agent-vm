@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 type Guest interface {
@@ -21,6 +22,13 @@ type Guest interface {
 	Status(context.Context, string) (map[string]any, error)
 	Config(context.Context, string) (map[string]any, error)
 	Exec(context.Context, string, []string, []byte) (Result, error)
+}
+
+// HealthProbe is the optional bounded native availability check used by
+// operator-facing metrics. Keeping it separate preserves lightweight test and
+// fixture Guest implementations without weakening the real Incus client.
+type HealthProbe interface {
+	Probe(context.Context) error
 }
 
 type IncusClient struct {
@@ -43,6 +51,23 @@ type ClientOptions struct {
 type CommandError struct {
 	Result Result
 	Cause  error
+}
+
+// IsNotFound reports only an Incus command failure whose diagnostics identify
+// a missing instance. Callers use this to finalize a durable destroy intent;
+// unrelated ownership or transport failures remain unverified.
+func IsNotFound(err error) bool {
+	var commandErr *CommandError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	diagnostic := strings.ToLower(string(commandErr.Result.Stderr) + " " + commandErr.Error())
+	for _, marker := range []string{"not found", "does not exist", "404"} {
+		if strings.Contains(diagnostic, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func (err *CommandError) Error() string {
@@ -176,6 +201,10 @@ func (c *IncusClient) Stop(ctx context.Context, name string) error {
 }
 func (c *IncusClient) Delete(ctx context.Context, name string) error {
 	return c.run(ctx, "delete", name, "--force")
+}
+
+func (c *IncusClient) Probe(ctx context.Context) error {
+	return c.run(ctx, "version")
 }
 
 func (c *IncusClient) Status(ctx context.Context, name string) (map[string]any, error) {

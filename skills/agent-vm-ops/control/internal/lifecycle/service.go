@@ -61,7 +61,7 @@ type Service struct {
 	actionLocks map[string]*sync.Mutex
 	maintenance sync.Mutex
 	activeMu    sync.Mutex
-	activeOps   map[string]struct{}
+	activeOps   map[string]int
 	admissionMu sync.Mutex
 	resident    bool
 	ready       bool
@@ -87,7 +87,7 @@ func New(store *state.Store, cfg config.Config, options Options) *Service {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Release: options.Release, resident: options.Resident, ready: false, wake: options.Wake, actionLocks: make(map[string]*sync.Mutex), activeOps: make(map[string]struct{})}
+	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Release: options.Release, resident: options.Resident, ready: false, wake: options.Wake, actionLocks: make(map[string]*sync.Mutex), activeOps: make(map[string]int)}
 }
 
 func (s *Service) MarkReady()  { s.mu.Lock(); s.ready = true; s.mu.Unlock() }
@@ -148,12 +148,19 @@ func (s *Service) markOperationActive(operationID string) func() {
 		return func() {}
 	}
 	s.activeMu.Lock()
-	s.activeOps[operationID] = struct{}{}
+	s.activeOps[operationID]++
 	s.activeMu.Unlock()
+	var once sync.Once
 	return func() {
-		s.activeMu.Lock()
-		delete(s.activeOps, operationID)
-		s.activeMu.Unlock()
+		once.Do(func() {
+			s.activeMu.Lock()
+			if count := s.activeOps[operationID]; count <= 1 {
+				delete(s.activeOps, operationID)
+			} else {
+				s.activeOps[operationID] = count - 1
+			}
+			s.activeMu.Unlock()
+		})
 	}
 }
 
@@ -166,19 +173,21 @@ func (s *Service) operationActive(operationID string) bool {
 
 func (s *Service) WorkerStarted(ctx context.Context, operationID string, identity native.WorkerIdentity) error {
 	return s.recordWorker(ctx, operationID, map[string]any{
-		"pid":        identity.PID,
-		"start_time": identity.StartTime,
-		"state":      "running",
-		"started_at": nowString(s.Clock()),
+		"pid":           identity.PID,
+		"start_time":    identity.StartTime,
+		"process_group": identity.ProcessGroup,
+		"state":         "running",
+		"started_at":    nowString(s.Clock()),
 	})
 }
 
 func (s *Service) WorkerFinished(ctx context.Context, operationID string, identity native.WorkerIdentity, runErr error) error {
 	worker := map[string]any{
-		"pid":         identity.PID,
-		"start_time":  identity.StartTime,
-		"state":       "finished",
-		"finished_at": nowString(s.Clock()),
+		"pid":           identity.PID,
+		"start_time":    identity.StartTime,
+		"process_group": identity.ProcessGroup,
+		"state":         "finished",
+		"finished_at":   nowString(s.Clock()),
 	}
 	if runErr != nil {
 		message := runErr.Error()
@@ -215,7 +224,8 @@ func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.O
 		if !valid || pid <= 0 || !hasStartTime || startTime == "" {
 			return protocol.NewError("state_unverified", "pending operation has an invalid native worker identity", map[string]any{"operation_id": operation.OperationID})
 		}
-		identity := native.WorkerIdentity{PID: int(pid), StartTime: startTime}
+		processGroup, _ := protocol.Integer(worker["process_group"])
+		identity := native.WorkerIdentity{PID: int(pid), StartTime: startTime, ProcessGroup: int(processGroup)}
 		alive, err := native.WorkerAlive(identity)
 		if err != nil {
 			return protocol.NewError("state_unverified", "pending native worker identity could not be verified", map[string]any{"operation_id": operation.OperationID, "cause": err.Error()})
@@ -316,6 +326,15 @@ func recoverableOperation(action string) bool {
 	}
 }
 
+func operationHasNativeEffect(action string) bool {
+	switch action {
+	case "acquire", "release", "destroy", "restart", "resize", "port-add", "port-remove", "admin-reconcile", "admin-gc":
+		return true
+	default:
+		return false
+	}
+}
+
 func recoveryAttempts(response map[string]any) int64 {
 	value, ok := response["_recovery_attempts"]
 	if !ok {
@@ -359,6 +378,12 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 			return nil, protocol.NewError("invalid_request", "request cannot be canonicalized", nil)
 		}
 		pending := map[string]any{"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request)}
+		// Persist the native-effect barrier before invoking Incus. A crash in the
+		// window before WorkerStarted must remain fail-closed and must not become a
+		// replayable operation.
+		if operationHasNativeEffect(action) {
+			pending["worker"] = map[string]any{"state": "starting", "prepared_at": nowString(s.Clock())}
+		}
 		generation := intValue(request["generation"])
 		session := optionalString(request["session_id"])
 		finishActive := s.markOperationActive(operationID)
@@ -511,6 +536,65 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 	if len(pending) > 0 {
 		return protocol.NewError("startup_reconcile_required", "pending operations require explicit recovery before admission", map[string]any{"count": len(pending), "admission_ready": false})
 	}
+	return s.verifyResidentNativeState(ctx)
+}
+
+// verifyResidentNativeState prevents a durable active or cached task from
+// becoming admission-visible when its Incus identity or state cannot be
+// verified after a process restart. Transitional states are handled by the
+// reconciliation pass above and are intentionally not probed twice here.
+func (s *Service) verifyResidentNativeState(ctx context.Context) error {
+	if s.Guest == nil {
+		return nil
+	}
+	tasks, err := s.Store.ListTasks(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	for index := range tasks {
+		task := &tasks[index]
+		if task.State != stateActive && task.State != stateCached {
+			continue
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+		var verifyErr error
+		if task.State == stateActive {
+			verifyErr = s.verifyActiveGuest(checkCtx, task)
+		} else {
+			verifyErr = s.verifyCachedGuest(checkCtx, task)
+		}
+		cancel()
+		if verifyErr != nil {
+			control := protocol.AsError(verifyErr)
+			return protocol.NewError("startup_reconcile_required", "durable task/native state requires explicit reconciliation", map[string]any{
+				"task_id":          task.TaskID,
+				"session_id":       task.SessionID,
+				"generation":       task.Generation,
+				"state":            task.State,
+				"native_code":      control.Code,
+				"native_message":   control.Message,
+				"outcome_verified": false,
+			})
+		}
+	}
+	return nil
+}
+
+func (s *Service) verifyActiveGuest(ctx context.Context, task *state.Task) error {
+	if _, err := s.verifyOwnership(ctx, task); err != nil {
+		return err
+	}
+	status, err := s.Guest.Status(ctx, task.InstanceName)
+	if err != nil {
+		return protocol.NewError("native_unavailable", "active guest status could not be verified", map[string]any{"cause": err.Error(), "outcome_verified": false})
+	}
+	stateValue, parseErr := native.ParseStatus(status)
+	if parseErr != nil {
+		return protocol.NewError("state_unverified", "active guest status is malformed", map[string]any{"cause": parseErr.Error(), "outcome_verified": false})
+	}
+	if !strings.EqualFold(stateValue, "running") {
+		return protocol.NewError("state_unverified", "durable active task has a non-running guest", map[string]any{"status": stateValue, "outcome_verified": false})
+	}
 	return nil
 }
 
@@ -601,12 +685,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		return nil, err
 	}
 	s.admissionMu.Lock()
-	locked := true
-	defer func() {
-		if locked {
-			s.admissionMu.Unlock()
-		}
-	}()
+	defer s.admissionMu.Unlock()
 	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": session})
 	if err != nil {
 		return nil, s.sqliteError(err)
@@ -659,14 +738,17 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		return nil, err
 	}
 	if created {
+		nextGeneration, generationErr := s.Store.NextGeneration(ctx, session)
+		if generationErr != nil {
+			return nil, s.sqliteError(generationErr)
+		}
+		task.Generation = nextGeneration
 		if err := s.Store.InsertTask(ctx, *task); err != nil {
 			return nil, s.sqliteError(err)
 		}
 	} else if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"generation": task.Generation, "state": task.State, "resources_json": task.ResourcesJSON, "resource_reservation_json": task.ResourceReservationJSON, "reservation_bytes": int64(0), "lease_expires_at": task.LeaseExpiresAt, "updated_at": nowString(now), "last_error": nil, "image_fingerprint": s.Config.ImageFingerprint, "previous_generation": task.PreviousGeneration}); err != nil {
 		return nil, s.sqliteError(err)
 	}
-	locked = false
-	s.admissionMu.Unlock()
 	if s.Guest != nil {
 		nativeCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 		defer cancel()
@@ -773,7 +855,7 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	}
 	if task.State == stateActive || task.State == statePreparing || task.State == stateFailed || (destroy && task.State == stateCached) {
 		targetState := stateClosing
-		if destroy && task.State == stateCached {
+		if destroy {
 			targetState = stateDeleting
 		}
 		updated, updateErr := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{task.State}}, map[string]any{"state": targetState, "lease_expires_at": nil, "updated_at": nowString(s.Clock())})
@@ -788,9 +870,16 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		return nil, protocol.NewError("task_transition", "session is already in a non-retryable lifecycle state", map[string]any{"state": task.State})
 	}
 	cleanupErrors := make([]string, 0)
+	nativePresent := s.Guest != nil
 	if s.Guest != nil {
 		if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr != nil {
-			return nil, protocol.NewError("cleanup_incomplete", "native ownership could not be verified before cleanup", map[string]any{"cause": ownershipErr.Error(), "outcome_verified": false})
+			control := protocol.AsError(ownershipErr)
+			detail, _ := control.Detail.(map[string]any)
+			missing, _ := detail["native_missing"].(bool)
+			if !(destroy && task.State == stateDeleting && missing) {
+				return nil, protocol.NewError("cleanup_incomplete", "native ownership could not be verified before cleanup", map[string]any{"cause": ownershipErr.Error(), "outcome_verified": false})
+			}
+			nativePresent = false
 		}
 	}
 	ports, listErr := s.Store.ListPorts(ctx, task.TaskID)
@@ -798,7 +887,7 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		return nil, s.sqliteError(listErr)
 	}
 	for _, port := range ports {
-		if s.Guest != nil {
+		if nativePresent {
 			workerCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 			removeErr := s.removePortDevice(workerCtx, task, port)
 			cancel()
@@ -811,7 +900,7 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 			cleanupErrors = append(cleanupErrors, port.DeviceName+": "+removeErr.Error())
 		}
 	}
-	if s.Guest != nil {
+	if nativePresent {
 		workerCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 		defer cancel()
 		if err := s.Guest.Stop(workerCtx, task.InstanceName); err != nil {
@@ -923,6 +1012,16 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 	if requestBool(request, "live_memory") && request["memory_mib"] == nil {
 		return nil, protocol.NewError("invalid_request", "live resize requires memory_mib", nil)
 	}
+	reservationJSON := mustJSON(target)
+	reservationNow := s.Clock()
+	reserved, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &reservationNow}, map[string]any{"resource_reservation_json": reservationJSON, "updated_at": nowString(reservationNow)})
+	if err != nil {
+		return nil, s.sqliteError(err)
+	}
+	if !reserved {
+		return nil, protocol.NewError("lease_expired", "lease or generation changed before resize reservation", map[string]any{"outcome_verified": true})
+	}
+	task.ResourceReservationJSON = reservationJSON
 	if requestBool(request, "allow_restart") && s.Guest != nil {
 		if result, restartErr := s.restart(ctx, request); restartErr != nil {
 			return nil, restartErr
@@ -950,7 +1049,7 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 		}
 	}
 	commitNow := s.Clock()
-	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow}, map[string]any{"resources_json": mustJSON(target), "updated_at": nowString(commitNow)})
+	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow}, map[string]any{"resources_json": mustJSON(target), "resource_reservation_json": "{}", "updated_at": nowString(commitNow)})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
@@ -985,6 +1084,20 @@ func (s *Service) portAdd(ctx context.Context, request protocol.Request) (map[st
 	vmPort := intValue(request["vm_port"])
 	if vmPort < 1 || vmPort > 65535 {
 		return nil, protocol.NewError("invalid_request", "vm_port must be between 1 and 65535", nil)
+	}
+	ports, err := s.Store.ListPorts(ctx, task.TaskID)
+	if err != nil {
+		return nil, s.sqliteError(err)
+	}
+	requestedHostPort := intValue(request["host_port"])
+	for _, existing := range ports {
+		if existing.PortName != name || existing.Protocol != protocolName {
+			continue
+		}
+		if existing.State == "active" && existing.Generation == task.Generation && existing.VMPort == vmPort && (requestedHostPort == 0 || requestedHostPort == existing.HostPort) {
+			return map[string]any{"task_id": existing.TaskID, "generation": existing.Generation, "port_name": existing.PortName, "protocol": existing.Protocol, "host_port": existing.HostPort, "vm_port": existing.VMPort, "device_name": existing.DeviceName, "state": existing.State, "created_at": existing.CreatedAt}, nil
+		}
+		return nil, protocol.NewError("operation_conflict", "a port with this name and protocol already exists", map[string]any{"port_name": name, "protocol": protocolName, "state": existing.State, "generation": existing.Generation})
 	}
 	hostPort := intValue(request["host_port"])
 	if hostPort == 0 {
@@ -1183,6 +1296,22 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			if cpuObservationErr != nil {
 				warnings = append(warnings, map[string]any{"code": "resource_unverified", "message": "CT CPU pressure observation is not verified", "detail": map[string]any{"cause": cpuObservationErr.Error()}})
 			}
+			nativeUp := true
+			var nativeProbeErr error
+			if s.Guest != nil {
+				probe, probeOK := s.Guest.(native.HealthProbe)
+				if !probeOK {
+					nativeProbeErr = errors.New("native guest does not expose a health probe")
+				} else {
+					probeCtx, probeCancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+					nativeProbeErr = probe.Probe(probeCtx)
+					probeCancel()
+				}
+			}
+			if nativeProbeErr != nil {
+				nativeUp = false
+				warnings = append(warnings, map[string]any{"code": "native_unavailable", "message": "Incus native availability could not be verified", "detail": map[string]any{"cause": nativeProbeErr.Error()}})
+			}
 			draining, _ := s.isDraining(ctx)
 			limits := map[string]any{}
 			remaining := map[string]any{}
@@ -1212,6 +1341,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			if !s.Ready() {
 				defaultReasons = append(defaultReasons, map[string]any{"code": "startup_reconcile_required", "message": "control service is not ready for admission"})
 			}
+			if !nativeUp {
+				defaultReasons = append(defaultReasons, map[string]any{"code": "native_unavailable", "message": "Incus native availability is not verified"})
+			}
 			if cpuObservation != nil {
 				pressure := cpuObservation.Pressure()
 				startupPressure := s.startupPressureDetail(*cpuObservation, allocated["cpu"], 2)
@@ -1232,10 +1364,10 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			return map[string]any{
 				"observation_epoch": epoch, "observation_consistent": consistent, "observation_attempts": attempt,
-				"observed_at": start, "up": true, "draining": draining, "admission_ready": s.Ready(),
+				"observed_at": start, "up": nativeUp, "draining": draining, "admission_ready": s.Ready(),
 				"resources": resourcesValue, "ct_cpu": ctCPU,
 				"default_admission": map[string]any{"requested": map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "ready": s.Ready(), "reasons": defaultReasons},
-				"task_states":       states, "instances": len(tasks), "warnings": warnings, "warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil)},
+				"task_states":       states, "instances": len(tasks), "warnings": warnings, "warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil), "native_unavailable": boolInt(!nativeUp)},
 			}, nil
 		}
 	}
@@ -1408,11 +1540,13 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 	}
 	resources := map[string]any{}
 	_ = json.Unmarshal([]byte(task.ResourcesJSON), &resources)
+	reservation := map[string]any{}
+	_ = json.Unmarshal([]byte(task.ResourceReservationJSON), &reservation)
 	ports, err := s.Store.ListPorts(ctx, task.TaskID)
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	return map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": map[string]any{}, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock())}, nil
+	return map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock())}, nil
 }
 
 func (s *Service) isDraining(ctx context.Context) (bool, error) {
@@ -1437,7 +1571,11 @@ func (s *Service) setOwnership(ctx context.Context, task *state.Task) error {
 func (s *Service) verifyOwnership(ctx context.Context, task *state.Task) (map[string]any, error) {
 	info, err := s.Guest.Config(ctx, task.InstanceName)
 	if err != nil {
-		return nil, protocol.NewError("ownership_mismatch", "native instance configuration could not be read", map[string]any{"cause": err.Error(), "outcome_verified": false})
+		detail := map[string]any{"cause": err.Error(), "outcome_verified": false}
+		if native.IsNotFound(err) {
+			detail["native_missing"] = true
+		}
+		return nil, protocol.NewError("ownership_mismatch", "native instance configuration could not be read", detail)
 	}
 	config, configOK := info["config"].(map[string]any)
 	devices, devicesOK := info["devices"].(map[string]any)
@@ -1576,7 +1714,7 @@ func (s *Service) nextPort(ctx context.Context, protocolName string) (int64, err
 			return 0, s.sqliteError(listErr)
 		}
 		for _, port := range ports {
-			if port.Protocol == protocolName && port.State == "active" {
+			if port.Protocol == protocolName && port.State != "deleted" {
 				occupied[port.HostPort] = struct{}{}
 			}
 		}

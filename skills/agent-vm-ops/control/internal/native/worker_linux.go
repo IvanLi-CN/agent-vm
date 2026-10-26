@@ -15,7 +15,7 @@ func workerIdentity(pid int) (WorkerIdentity, error) {
 	if err != nil {
 		return WorkerIdentity{}, err
 	}
-	return WorkerIdentity{PID: process.pid, StartTime: process.start}, nil
+	return WorkerIdentity{PID: process.pid, StartTime: process.start, ProcessGroup: process.group}, nil
 }
 
 func WorkerAlive(identity WorkerIdentity) (bool, error) {
@@ -24,6 +24,18 @@ func WorkerAlive(identity WorkerIdentity) (bool, error) {
 	}
 	process, err := readProcess(identity.PID)
 	if errors.Is(err, os.ErrNotExist) {
+		if identity.ProcessGroup <= 0 {
+			return false, nil
+		}
+		all, tableErr := readProcessTable()
+		if tableErr != nil {
+			return false, tableErr
+		}
+		for _, candidate := range all {
+			if candidate.group == identity.ProcessGroup && candidate.state != 'Z' {
+				return true, nil
+			}
+		}
 		return false, nil
 	}
 	if err != nil {
@@ -32,12 +44,37 @@ func WorkerAlive(identity WorkerIdentity) (bool, error) {
 	if process.start != identity.StartTime {
 		return false, fmt.Errorf("native worker identity changed for pid %d", identity.PID)
 	}
-	return process.state != 'Z', nil
+	if identity.ProcessGroup > 0 && process.group != identity.ProcessGroup {
+		return false, fmt.Errorf("native worker process group changed for pid %d", identity.PID)
+	}
+	if process.state != 'Z' {
+		return true, nil
+	}
+	if identity.ProcessGroup <= 0 {
+		return false, nil
+	}
+	all, err := readProcessTable()
+	if err != nil {
+		return false, err
+	}
+	for _, candidate := range all {
+		if candidate.group == identity.ProcessGroup && candidate.state != 'Z' {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func KillWorker(identity WorkerIdentity) error {
 	fd, err := unix.PidfdOpen(identity.PID, 0)
 	if errors.Is(err, unix.ESRCH) {
+		alive, aliveErr := WorkerAlive(identity)
+		if aliveErr != nil {
+			return aliveErr
+		}
+		if alive {
+			return fmt.Errorf("native worker root exited while its process group remains; manual reconciliation required")
+		}
 		return nil
 	}
 	if err != nil {
@@ -54,8 +91,16 @@ func KillWorker(identity WorkerIdentity) error {
 	if current.StartTime != identity.StartTime {
 		return fmt.Errorf("native worker identity changed for pid %d", identity.PID)
 	}
+	if identity.ProcessGroup > 0 && current.ProcessGroup != identity.ProcessGroup {
+		return fmt.Errorf("native worker process group changed for pid %d", identity.PID)
+	}
 	if err := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0); err != nil && !errors.Is(err, unix.ESRCH) {
 		return fmt.Errorf("kill native worker: %w", err)
+	}
+	if current.ProcessGroup > 0 && current.ProcessGroup == current.PID {
+		if err := unix.Kill(-current.ProcessGroup, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+			return fmt.Errorf("kill native worker process group: %w", err)
+		}
 	}
 	return nil
 }

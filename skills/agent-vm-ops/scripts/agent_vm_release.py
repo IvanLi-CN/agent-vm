@@ -633,7 +633,7 @@ def _install_client_package(root: Path, client_path: Path, release_id: str) -> N
                 _fsync_directory(directory)
             # Readers fail closed while the complete-package recovery marker
             # exists. Verify installed bytes here without bypassing that fence.
-            verify_client_sidecar(directory, load_manifest(root / MANIFEST_NAME))
+            verify_client_sidecar(directory, load_release_manifest(root / MANIFEST_NAME))
             record["phase"] = "complete"
             _write_json(marker, record, 0o600)
         except (OSError, ReleaseError, ManifestError) as exc:

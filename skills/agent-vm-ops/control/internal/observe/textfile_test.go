@@ -26,8 +26,11 @@ func TestSnapshotStorePublishesIndependentJSONAndTextfileSources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(inventory), `agent_vm_source_up{source="inventory"} 0`) {
+	if !strings.Contains(string(inventory), "agent_vm_inventory_up 0") {
 		t.Fatalf("inventory metrics = %s", inventory)
+	}
+	if strings.Contains(string(inventory), "agent_vm_scrape_timestamp_seconds") {
+		t.Fatalf("inventory metrics reused an unscoped family = %s", inventory)
 	}
 	if capacityMetrics, err := os.ReadFile(filepath.Join(store.Directory, "capacity.prom")); err != nil || !strings.Contains(string(capacityMetrics), "agent_vm_admission_memory_allocated_bytes 4194304") {
 		t.Fatalf("capacity admission metrics = %s err=%v", capacityMetrics, err)

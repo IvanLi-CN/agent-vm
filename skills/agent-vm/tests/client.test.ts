@@ -89,6 +89,7 @@ test("duplicate errors, huge diagnostics, timeout and lost streams never finaliz
   const f = fixture();
   for (const [i, handler] of [
     (r: any) => { const err = json({ ...r, ok: false, error: { code: "draining", message: "drain" } }); return result("", 2, err + "\n" + err); },
+    (r: any) => { const err = json({ ...r, ok: false, error: { code: "draining", message: "drain" } }); return result(err, 2, err); },
     () => result("", 255, "x", { stderrTruncated: true }),
     () => result("", 0, "", { timedOut: true, streamCleanupVerified: false }),
     () => result("", 0, "", { streamCleanupVerified: false }),

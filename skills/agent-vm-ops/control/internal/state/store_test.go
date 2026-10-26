@@ -237,6 +237,37 @@ func TestClaimOperationIsAtomicAcrossConcurrentRetries(t *testing.T) {
 	}
 }
 
+func TestGenerationTombstoneAdvancesAfterTaskDeletion(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "generations.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	task := Task{TaskID: "avm-generation", SessionID: "generation-session", Generation: 7, State: "absent", InstanceName: "agent-vm-generation", CreatedAt: "now", UpdatedAt: "now", ImageFingerprint: "image", ResourcesJSON: "{}", ResourceReservationJSON: "{}"}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	deleted, err := store.DeleteTaskIf(ctx, task.TaskID, TaskCondition{Generation: &task.Generation, States: []string{"absent"}})
+	if err != nil || !deleted {
+		t.Fatalf("delete task = %v, err=%v", deleted, err)
+	}
+	next, err := store.NextGeneration(ctx, task.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != 8 {
+		t.Fatalf("next generation = %d, want 8", next)
+	}
+	next, err = store.NextGeneration(ctx, task.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != 9 {
+		t.Fatalf("second next generation = %d, want 9", next)
+	}
+}
+
 func TestTransactionErrorRetainsRollbackPhaseAndCommitState(t *testing.T) {
 	store, err := OpenForTest(filepath.Join(t.TempDir(), "transaction.sqlite3"))
 	if err != nil {

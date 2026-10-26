@@ -440,6 +440,41 @@ func (s *Store) SetMeta(ctx context.Context, key, value string) error {
 	})
 }
 
+func generationMetaKey(sessionID string) string {
+	return "generation_tombstone:" + hex.EncodeToString([]byte(sessionID))
+}
+
+// NextGeneration returns a generation strictly greater than the last durable
+// generation for a session, including generations whose task row was deleted.
+// The meta row is updated in the same writer transaction that allocates it.
+func (s *Store) NextGeneration(ctx context.Context, sessionID string) (int64, error) {
+	if sessionID == "" {
+		return 0, errors.New("session id is empty")
+	}
+	key := generationMetaKey(sessionID)
+	next := int64(1)
+	err := s.withWrite(ctx, func(tx *Tx) error {
+		var raw string
+		err := tx.conn.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = ?", key).Scan(&raw)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err == nil {
+			current, parseErr := strconv.ParseInt(raw, 10, 64)
+			if parseErr != nil || current < 0 {
+				return fmt.Errorf("invalid generation tombstone for %s", sessionID)
+			}
+			if current == int64(^uint64(0)>>1) {
+				return errors.New("generation exhausted")
+			}
+			next = current + 1
+		}
+		_, err = tx.exec("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, strconv.FormatInt(next, 10))
+		return err
+	})
+	return next, err
+}
+
 func (s *Store) GetTask(ctx context.Context, lookup map[string]any) (*Task, error) {
 	where, arg, ok := "", any(nil), false
 	if value, exists := lookup["task_id"].(string); exists {
@@ -610,13 +645,42 @@ func sameSQLValue(left, right any) bool {
 	return fmt.Sprint(left) == fmt.Sprint(right)
 }
 
+func recordGenerationTombstone(ctx context.Context, tx *Tx, sessionID string, generation int64) error {
+	key := generationMetaKey(sessionID)
+	_, err := tx.exec("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = CASE WHEN CAST(meta.value AS INTEGER) < CAST(excluded.value AS INTEGER) THEN excluded.value ELSE meta.value END", key, strconv.FormatInt(generation, 10))
+	return err
+}
+
 func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
-	return s.withWrite(ctx, func(tx *Tx) error { _, err := tx.exec("DELETE FROM tasks WHERE task_id = ?", taskID); return err })
+	return s.withWrite(ctx, func(tx *Tx) error {
+		var sessionID string
+		var generation int64
+		err := tx.conn.QueryRowContext(ctx, "SELECT session_id, generation FROM tasks WHERE task_id = ?", taskID).Scan(&sessionID, &generation)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := tx.exec("DELETE FROM tasks WHERE task_id = ?", taskID); err != nil {
+			return err
+		}
+		return recordGenerationTombstone(ctx, tx, sessionID, generation)
+	})
 }
 
 func (s *Store) DeleteTaskIf(ctx context.Context, taskID string, condition TaskCondition) (bool, error) {
 	deleted := false
 	err := s.withWrite(ctx, func(tx *Tx) error {
+		var sessionID string
+		var generation int64
+		err := tx.conn.QueryRowContext(ctx, "SELECT session_id, generation FROM tasks WHERE task_id = ?", taskID).Scan(&sessionID, &generation)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 		matched, err := taskConditionMatches(ctx, tx, taskID, condition)
 		if err != nil {
 			return err
@@ -630,7 +694,13 @@ func (s *Store) DeleteTaskIf(ctx context.Context, taskID string, condition TaskC
 		}
 		rows, rowsErr := result.RowsAffected()
 		deleted = rowsErr == nil && rows > 0
-		return rowsErr
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if !deleted {
+			return nil
+		}
+		return recordGenerationTombstone(ctx, tx, sessionID, generation)
 	})
 	return deleted, err
 }

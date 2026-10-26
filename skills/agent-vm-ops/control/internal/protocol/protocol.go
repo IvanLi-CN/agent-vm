@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"math"
 	"regexp"
 	"sort"
@@ -16,6 +15,7 @@ import (
 	"strings"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 )
 
 const Version = 4
@@ -102,17 +102,305 @@ func Decode(data []byte) (Request, error) {
 }
 
 func DecodeValue(data []byte) (any, error) {
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.UseNumber()
-	var value any
-	if err := decoder.Decode(&value); err != nil {
+	parser := jsonParser{data: data}
+	value, err := parser.value()
+	if err != nil {
 		return nil, NewError("invalid_request", "request is not valid JSON", map[string]any{"cause": err.Error()})
 	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
+	parser.space()
+	if parser.position != len(data) {
 		return nil, NewError("invalid_request", "request contains trailing JSON", nil)
 	}
 	return value, nil
+}
+
+// jsonParser keeps lone UTF-16 surrogate code units in a private invalid UTF-8
+// representation. The legacy protocol hashes the escaped code unit, while
+// encoding/json replaces it with U+FFFD before a digest can be calculated.
+type jsonParser struct {
+	data     []byte
+	position int
+}
+
+func (parser *jsonParser) space() {
+	for parser.position < len(parser.data) {
+		switch parser.data[parser.position] {
+		case ' ', '\t', '\r', '\n':
+			parser.position++
+		default:
+			return
+		}
+	}
+}
+
+func (parser *jsonParser) value() (any, error) {
+	parser.space()
+	if parser.position >= len(parser.data) {
+		return nil, errors.New("missing JSON value")
+	}
+	switch parser.data[parser.position] {
+	case '"':
+		return parser.string()
+	case '{':
+		return parser.object()
+	case '[':
+		return parser.array()
+	case 't':
+		return parser.literal("true", true)
+	case 'f':
+		return parser.literal("false", false)
+	case 'n':
+		return parser.literal("null", nil)
+	case 'N':
+		return parser.numberLiteral("NaN")
+	case 'I':
+		return parser.numberLiteral("Infinity")
+	case '-':
+		if bytes.HasPrefix(parser.data[parser.position:], []byte("-Infinity")) {
+			return parser.numberLiteral("-Infinity")
+		}
+		return parser.number()
+	default:
+		return parser.number()
+	}
+}
+
+func (parser *jsonParser) literal(raw string, value any) (any, error) {
+	if !bytes.HasPrefix(parser.data[parser.position:], []byte(raw)) {
+		return nil, fmt.Errorf("invalid literal at byte %d", parser.position)
+	}
+	parser.position += len(raw)
+	return value, nil
+}
+
+func (parser *jsonParser) object() (map[string]any, error) {
+	parser.position++
+	result := make(map[string]any)
+	parser.space()
+	if parser.consume('}') {
+		return result, nil
+	}
+	for {
+		parser.space()
+		if parser.position >= len(parser.data) || parser.data[parser.position] != '"' {
+			return nil, fmt.Errorf("object key must be a string at byte %d", parser.position)
+		}
+		key, err := parser.string()
+		if err != nil {
+			return nil, err
+		}
+		parser.space()
+		if !parser.consume(':') {
+			return nil, fmt.Errorf("object key is missing a colon at byte %d", parser.position)
+		}
+		value, err := parser.value()
+		if err != nil {
+			return nil, err
+		}
+		result[key] = value
+		parser.space()
+		if parser.consume('}') {
+			return result, nil
+		}
+		if !parser.consume(',') {
+			return nil, fmt.Errorf("object is missing a separator at byte %d", parser.position)
+		}
+	}
+}
+
+func (parser *jsonParser) array() ([]any, error) {
+	parser.position++
+	result := make([]any, 0)
+	parser.space()
+	if parser.consume(']') {
+		return result, nil
+	}
+	for {
+		value, err := parser.value()
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, value)
+		parser.space()
+		if parser.consume(']') {
+			return result, nil
+		}
+		if !parser.consume(',') {
+			return nil, fmt.Errorf("array is missing a separator at byte %d", parser.position)
+		}
+	}
+}
+
+func (parser *jsonParser) consume(want byte) bool {
+	if parser.position < len(parser.data) && parser.data[parser.position] == want {
+		parser.position++
+		return true
+	}
+	return false
+}
+
+func (parser *jsonParser) number() (json.Number, error) {
+	start := parser.position
+	if parser.consume('-') && parser.position >= len(parser.data) {
+		return "", errors.New("number is missing digits")
+	}
+	if parser.position < len(parser.data) && parser.data[parser.position] == '0' {
+		parser.position++
+	} else {
+		if parser.position >= len(parser.data) || parser.data[parser.position] < '1' || parser.data[parser.position] > '9' {
+			return "", fmt.Errorf("invalid number at byte %d", start)
+		}
+		for parser.position < len(parser.data) && parser.data[parser.position] >= '0' && parser.data[parser.position] <= '9' {
+			parser.position++
+		}
+	}
+	if parser.consume('.') {
+		fractionStart := parser.position
+		for parser.position < len(parser.data) && parser.data[parser.position] >= '0' && parser.data[parser.position] <= '9' {
+			parser.position++
+		}
+		if parser.position == fractionStart {
+			return "", fmt.Errorf("number fraction is missing digits at byte %d", parser.position)
+		}
+	}
+	if parser.position < len(parser.data) && (parser.data[parser.position] == 'e' || parser.data[parser.position] == 'E') {
+		parser.position++
+		if parser.position < len(parser.data) && (parser.data[parser.position] == '+' || parser.data[parser.position] == '-') {
+			parser.position++
+		}
+		exponentStart := parser.position
+		for parser.position < len(parser.data) && parser.data[parser.position] >= '0' && parser.data[parser.position] <= '9' {
+			parser.position++
+		}
+		if parser.position == exponentStart {
+			return "", fmt.Errorf("number exponent is missing digits at byte %d", parser.position)
+		}
+	}
+	return json.Number(parser.data[start:parser.position]), nil
+}
+
+func (parser *jsonParser) numberLiteral(raw string) (json.Number, error) {
+	if !bytes.HasPrefix(parser.data[parser.position:], []byte(raw)) {
+		return "", fmt.Errorf("invalid number at byte %d", parser.position)
+	}
+	parser.position += len(raw)
+	return json.Number(raw), nil
+}
+
+func (parser *jsonParser) string() (string, error) {
+	if !parser.consume('"') {
+		return "", fmt.Errorf("string must start with a quote at byte %d", parser.position)
+	}
+	var result strings.Builder
+	for parser.position < len(parser.data) {
+		value := parser.data[parser.position]
+		parser.position++
+		switch value {
+		case '"':
+			return result.String(), nil
+		case '\\':
+			if parser.position >= len(parser.data) {
+				return "", errors.New("string escape is incomplete")
+			}
+			escape := parser.data[parser.position]
+			parser.position++
+			switch escape {
+			case '"', '\\', '/':
+				result.WriteByte(escape)
+			case 'b':
+				result.WriteByte('\b')
+			case 'f':
+				result.WriteByte('\f')
+			case 'n':
+				result.WriteByte('\n')
+			case 'r':
+				result.WriteByte('\r')
+			case 't':
+				result.WriteByte('\t')
+			case 'u':
+				code, err := parser.unicodeUnit()
+				if err != nil {
+					return "", err
+				}
+				if code >= 0xd800 && code <= 0xdbff && parser.hasUnicodeEscape() {
+					low, lowErr := parser.peekUnicodeUnit()
+					if lowErr == nil && low >= 0xdc00 && low <= 0xdfff {
+						parser.position += 6
+						result.WriteRune(rune(0x10000 + (uint32(code)-0xd800)*0x400 + (uint32(low) - 0xdc00)))
+						continue
+					}
+				}
+				writeUTF16CodeUnit(&result, code)
+			default:
+				return "", fmt.Errorf("invalid string escape at byte %d", parser.position-1)
+			}
+		case 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f:
+			return "", fmt.Errorf("unescaped control character at byte %d", parser.position-1)
+		default:
+			parser.position--
+			runeValue, size := utf8.DecodeRune(parser.data[parser.position:])
+			if runeValue == utf8.RuneError && size == 1 {
+				return "", fmt.Errorf("invalid UTF-8 in string at byte %d", parser.position)
+			}
+			result.Write(parser.data[parser.position : parser.position+size])
+			parser.position += size
+		}
+	}
+	return "", errors.New("unterminated string")
+}
+
+func (parser *jsonParser) unicodeUnit() (uint16, error) {
+	if parser.position+4 > len(parser.data) {
+		return 0, errors.New("unicode escape is incomplete")
+	}
+	var value uint16
+	for index := 0; index < 4; index++ {
+		digit, ok := hexDigit(parser.data[parser.position+index])
+		if !ok {
+			return 0, fmt.Errorf("invalid unicode escape at byte %d", parser.position+index)
+		}
+		value = value<<4 | uint16(digit)
+	}
+	parser.position += 4
+	return value, nil
+}
+
+func (parser *jsonParser) hasUnicodeEscape() bool {
+	return parser.position+6 <= len(parser.data) && parser.data[parser.position] == '\\' && parser.data[parser.position+1] == 'u'
+}
+
+func (parser *jsonParser) peekUnicodeUnit() (uint16, error) {
+	if !parser.hasUnicodeEscape() {
+		return 0, errors.New("unicode escape is absent")
+	}
+	position := parser.position
+	parser.position += 2
+	value, err := parser.unicodeUnit()
+	parser.position = position
+	return value, err
+}
+
+func hexDigit(value byte) (byte, bool) {
+	switch {
+	case value >= '0' && value <= '9':
+		return value - '0', true
+	case value >= 'a' && value <= 'f':
+		return value - 'a' + 10, true
+	case value >= 'A' && value <= 'F':
+		return value - 'A' + 10, true
+	default:
+		return 0, false
+	}
+}
+
+func writeUTF16CodeUnit(out *strings.Builder, value uint16) {
+	if value >= 0xd800 && value <= 0xdfff {
+		out.WriteByte(0xe0 | byte(value>>12))
+		out.WriteByte(0x80 | byte((value>>6)&0x3f))
+		out.WriteByte(0x80 | byte(value&0x3f))
+		return
+	}
+	out.WriteRune(rune(value))
 }
 
 func Encode(value any) ([]byte, error) {
@@ -134,6 +422,11 @@ func ValidateRequest(request Request) *Error {
 	if session, exists := request["session_id"]; exists {
 		if value, ok := session.(string); !ok || !SessionIDPattern.MatchString(value) {
 			return NewError("invalid_request", "session_id contains unsupported characters", nil)
+		}
+	}
+	if operation, exists := request["operation_id"]; exists {
+		if value, ok := operation.(string); !ok || !SessionIDPattern.MatchString(value) {
+			return NewError("invalid_request", "operation_id contains unsupported characters", nil)
 		}
 	}
 	if _, exists := request["generation"]; exists {
@@ -443,7 +736,18 @@ func signAndTwoDigits(value int) string {
 func quote(value string) string {
 	var out strings.Builder
 	out.WriteByte('"')
-	for _, r := range value {
+	for index := 0; index < len(value); {
+		if code, ok := encodedSurrogate(value[index:]); ok {
+			fmt.Fprintf(&out, `\u%04x`, code)
+			index += 3
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(value[index:])
+		if r == utf8.RuneError && size == 1 && value[index] >= 0x80 {
+			out.WriteString(`\ufffd`)
+			index++
+			continue
+		}
 		switch r {
 		case '"':
 			out.WriteString(`\"`)
@@ -468,9 +772,18 @@ func quote(value string) string {
 				out.WriteRune(r)
 			}
 		}
+		index += size
 	}
 	out.WriteByte('"')
 	return out.String()
+}
+
+func encodedSurrogate(value string) (uint16, bool) {
+	if len(value) < 3 || value[0] != 0xed || value[1] < 0xa0 || value[1] > 0xbf || value[2] < 0x80 || value[2] > 0xbf {
+		return 0, false
+	}
+	code := uint16(value[0]&0x0f)<<12 | uint16(value[1]&0x3f)<<6 | uint16(value[2]&0x3f)
+	return code, code >= 0xd800 && code <= 0xdfff
 }
 
 func Success(request Request, result any) map[string]any {

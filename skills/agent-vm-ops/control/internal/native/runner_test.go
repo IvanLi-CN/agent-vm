@@ -103,6 +103,9 @@ func TestRunnerDurablyExposesWorkerIdentityToRecorder(t *testing.T) {
 		if runtime.GOOS == "linux" && identity.StartTime == "" {
 			t.Fatalf("Linux worker identity[%d] lacks start time: %#v", index, identity)
 		}
+		if runtime.GOOS == "linux" && identity.ProcessGroup != identity.PID {
+			t.Fatalf("Linux worker identity[%d] process group = %#v, want an isolated group", index, identity)
+		}
 		if recorder.finished[index] != nil {
 			t.Fatalf("worker finish[%d] = %v", index, recorder.finished[index])
 		}

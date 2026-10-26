@@ -173,7 +173,9 @@ export class Client {
     if (!result.streamCleanupVerified) fail("remote_failed", "control response stream cleanup is not verified", detail, result.code || 1);
     if (result.code) {
       if (result.stdoutTruncated || result.stderrTruncated) fail("remote_failed", "remote request output was truncated", { ...detail, stdout_truncated: result.stdoutTruncated, stderr_truncated: result.stderrTruncated, stdout_limit_bytes: STDOUT_LIMIT, stderr_limit_bytes: STDERR_LIMIT }, result.code);
-      const error = remoteError(result.stderr, request) ?? remoteError(result.stdout, request);
+      const errorMatches = [remoteError(result.stderr, request), remoteError(result.stdout, request)].filter((value): value is Data => value !== null);
+      if (errorMatches.length > 1) fail("invalid_remote_response", "control returned multiple matching error envelopes", { operation_id: request.operation_id ?? null }, result.code);
+      const error = errorMatches[0];
       if (error) { if (op && !uncertain(error, action)) this.finalize(op, request, { outcome: "error", error }); fail(error.code, error.message, error.detail, result.code); }
       fail("remote_failed", "remote request failed; control outcome is not verified", { operation_id: request.operation_id ?? null }, result.code);
     }

@@ -3,12 +3,14 @@ package lifecycle
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/config"
+	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/observe"
 	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-toolkit/skills/agent-vm-ops/control/internal/state"
@@ -17,6 +19,37 @@ import (
 type staticCPUObserver struct {
 	observation observe.CPUObservation
 	err         error
+}
+
+type startupGuest struct {
+	status    string
+	config    map[string]any
+	configErr error
+}
+
+func (guest *startupGuest) Init(context.Context, string, string) error              { return nil }
+func (guest *startupGuest) ConfigSet(context.Context, string, string, string) error { return nil }
+func (guest *startupGuest) DeviceSet(context.Context, string, string, string, string) error {
+	return nil
+}
+func (guest *startupGuest) DeviceAdd(context.Context, string, string, string, map[string]string) error {
+	return nil
+}
+func (guest *startupGuest) DeviceRemove(context.Context, string, string) error { return nil }
+func (guest *startupGuest) Start(context.Context, string) error                { return nil }
+func (guest *startupGuest) Stop(context.Context, string) error                 { return nil }
+func (guest *startupGuest) Delete(context.Context, string) error               { return nil }
+func (guest *startupGuest) Status(context.Context, string) (map[string]any, error) {
+	return map[string]any{"status": guest.status}, nil
+}
+func (guest *startupGuest) Config(context.Context, string) (map[string]any, error) {
+	if guest.configErr != nil {
+		return nil, guest.configErr
+	}
+	return guest.config, nil
+}
+func (guest *startupGuest) Exec(context.Context, string, []string, []byte) (native.Result, error) {
+	return native.Result{}, errors.New("startup guest exec is not used")
 }
 
 func (observer staticCPUObserver) Observe(context.Context) (observe.CPUObservation, error) {
@@ -163,6 +196,86 @@ func TestConcurrentOperationRetryDoesNotDuplicateLifecycleMutation(t *testing.T)
 	}
 	if successes != 1 || replays != 1 {
 		t.Fatalf("successes=%d replays=%d", successes, replays)
+	}
+}
+
+func TestActiveOperationReferenceCountSurvivesConcurrentReplay(t *testing.T) {
+	service := New(nil, config.Defaults(), Options{})
+	finishFirst := service.markOperationActive("same-operation")
+	finishSecond := service.markOperationActive("same-operation")
+	finishFirst()
+	if !service.operationActive("same-operation") {
+		t.Fatal("operation was cleared while another request still owned it")
+	}
+	finishSecond()
+	if service.operationActive("same-operation") {
+		t.Fatal("operation remained active after all owners finished")
+	}
+}
+
+func TestDestroyedSessionCannotReuseOldGeneration(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "generation-reuse.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.PortStart, cfg.PortEnd = 22000, 22010
+	service := New(store, cfg, Options{})
+	ctx := context.Background()
+	acquire := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "generation-reuse", "generation": int64(0), "operation_id": "acquire-old"}
+	response, err := service.Dispatch(ctx, acquire)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := response["result"].(map[string]any)["generation"]
+	if generation != int64(1) {
+		t.Fatalf("first generation = %#v", generation)
+	}
+	if _, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": "generation-reuse", "generation": int64(1), "operation_id": "destroy-old"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "generation-reuse", "generation": int64(0), "operation_id": "acquire-new"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response["result"].(map[string]any)["generation"] != int64(2) {
+		t.Fatalf("reacquired generation = %#v", response)
+	}
+	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "renew", "session_id": "generation-reuse", "generation": int64(1), "operation_id": "stale-renew"})
+	if control := protocol.AsError(err); control.Code != "generation_mismatch" {
+		t.Fatalf("stale generation error = %#v", err)
+	}
+}
+
+func TestPortNameConflictDoesNotOverwriteExistingMapping(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "port-conflict.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.PortStart, cfg.PortEnd = 22000, 22010
+	service := New(store, cfg, Options{})
+	ctx := context.Background()
+	if _, err := service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "port-session", "generation": int64(0), "operation_id": "port-acquire"}); err != nil {
+		t.Fatal(err)
+	}
+	base := protocol.Request{"protocol": protocol.Version, "action": "port-add", "session_id": "port-session", "generation": int64(1), "name": "web", "vm_port": int64(8080), "operation_id": "port-add-one"}
+	if _, err := service.Dispatch(ctx, base); err != nil {
+		t.Fatal(err)
+	}
+	conflict := protocol.Request{"protocol": protocol.Version, "action": "port-add", "session_id": "port-session", "generation": int64(1), "name": "web", "vm_port": int64(9090), "operation_id": "port-add-two"}
+	if _, err := service.Dispatch(ctx, conflict); protocol.AsError(err).Code != "operation_conflict" {
+		t.Fatalf("port conflict error = %#v", err)
+	}
+	task, err := store.GetTask(ctx, map[string]any{"session_id": "port-session"})
+	if err != nil || task == nil {
+		t.Fatalf("port task = %#v err=%v", task, err)
+	}
+	ports, err := store.ListPorts(ctx, task.TaskID)
+	if err != nil || len(ports) != 1 || ports[0].VMPort != 8080 {
+		t.Fatalf("existing port was overwritten: ports=%#v err=%v", ports, err)
 	}
 }
 
@@ -358,6 +471,74 @@ func TestStartupReconcileLeavesUnsafePendingAcquireBlocked(t *testing.T) {
 	}
 	if operation.Response["outcome"] != "pending" || operation.Response["_recovery_attempts"] != nil {
 		t.Fatalf("unsafe acquire was recovered: %#v", operation.Response)
+	}
+}
+
+func TestStartupReconcileVerifiesDurableActiveGuest(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "active-task", SessionID: "active-session", Generation: 1, State: stateActive,
+		InstanceName: "agent-active", LeaseExpiresAt: stringPointer(now.Add(time.Hour).Format(time.RFC3339Nano)),
+		CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status: "Running",
+		config: map[string]any{
+			"config":           map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "active-task", "user.agent-vm.session": "active-session", "user.agent-vm.generation": "1"},
+			"devices":          map[string]any{},
+			"expanded_devices": map[string]any{},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true, Clock: func() time.Time { return now }})
+	if err := service.StartupReconcile(context.Background()); err != nil {
+		t.Fatalf("startup reconcile = %v", err)
+	}
+	guest.status = "Stopped"
+	service = New(store, config.Defaults(), Options{Guest: guest, Resident: true, Clock: func() time.Time { return now }})
+	if control := protocol.AsError(service.StartupReconcile(context.Background())); control.Code != "startup_reconcile_required" {
+		t.Fatalf("stopped active guest error = %#v", control)
+	}
+}
+
+func TestDestroyFinalizesWhenIncusConfirmsTheInstanceIsMissing(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "destroy-state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "destroy-task", SessionID: "destroy-session", Generation: 1, State: stateActive,
+		InstanceName: "agent-destroy", LeaseExpiresAt: stringPointer(now.Add(time.Hour).Format(time.RFC3339Nano)),
+		CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Stderr: []byte("instance not found")}, Cause: errors.New("incus query failed")}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
+	response, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "destroy", "session_id": "destroy-session", "generation": int64(1), "operation_id": "destroy-missing",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := response["result"].(map[string]any)
+	if result["state"] != stateAbsent {
+		t.Fatalf("destroy response = %#v", response)
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": "destroy-session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task != nil {
+		t.Fatalf("destroy left task = %#v", task)
 	}
 }
 

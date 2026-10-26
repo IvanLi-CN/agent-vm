@@ -115,24 +115,35 @@ func snapshotMetrics(source string, value any) map[string]string {
 		}
 	}
 	result := map[string]string{
-		"agent_vm_source_up":                  fmt.Sprintf("agent_vm_source_up{source=%s} %d", strconv.Quote(source), up),
-		"agent_vm_source_observed_at_seconds": fmt.Sprintf("agent_vm_source_observed_at_seconds{source=%s} %d", strconv.Quote(source), observed),
-		"agent_vm_scrape_timestamp_seconds":   fmt.Sprintf("agent_vm_scrape_timestamp_seconds %d", observed),
+		"agent_vm_" + source + "_up":                       fmt.Sprintf("agent_vm_%s_up %d", source, up),
+		"agent_vm_" + source + "_observed_at_seconds":      fmt.Sprintf("agent_vm_%s_observed_at_seconds %d", source, observed),
+		"agent_vm_" + source + "_scrape_timestamp_seconds": fmt.Sprintf("agent_vm_%s_scrape_timestamp_seconds %d", source, observed),
 	}
 	if source == "capacity" {
-		result["agent_vm_up"] = fmt.Sprintf("agent_vm_up %d", up)
 		result["agent_vm_admission_ready"] = fmt.Sprintf("agent_vm_admission_ready %d", boolNumber(object["admission_ready"], false))
 		result["agent_vm_admission_draining"] = fmt.Sprintf("agent_vm_admission_draining %d", boolNumber(object["draining"], false))
 		result["agent_vm_observation_consistent"] = fmt.Sprintf("agent_vm_observation_consistent %d", boolNumber(object["observation_consistent"], false))
-		if resources, ok := object["resources"].(map[string]any); ok {
+		if resources, ok := objectMap(object["resources"]); ok {
 			addResourceMetric(result, "cpu", "cpu", resources, "vcpu", 1)
 			addResourceMetric(result, "memory", "memory_mib", resources, "bytes", 1024*1024)
 			addResourceMetric(result, "disk", "disk_gib", resources, "bytes", 1024*1024*1024)
 		}
 	}
 	if source == "inventory" {
-		result["agent_vm_inventory_up"] = fmt.Sprintf("agent_vm_inventory_up %d", up)
-		if states, ok := object["task_states"].(map[string]any); ok {
+		states, _ := objectMap(object["task_states"])
+		if len(states) == 0 {
+			if tasks, ok := object["tasks"].([]any); ok {
+				states = make(map[string]any)
+				for _, item := range tasks {
+					if task, ok := objectMap(item); ok {
+						if state, ok := task["state"].(string); ok {
+							states[state] = numericValue(states[state]) + 1
+						}
+					}
+				}
+			}
+		}
+		if len(states) > 0 {
 			for state, count := range states {
 				result["agent_vm_task_states"] += fmt.Sprintf("agent_vm_task_states{state=%s} %s\n", strconv.Quote(state), number(count))
 			}
@@ -147,7 +158,7 @@ func snapshotMetrics(source string, value any) map[string]string {
 
 func addResourceMetric(result map[string]string, dimension, inputKey string, resources map[string]any, suffix string, multiplier float64) {
 	for _, kind := range []string{"allocated", "reserved", "allocated_and_reserved", "remaining", "limits"} {
-		values, ok := resources[kind].(map[string]any)
+		values, ok := objectMap(resources[kind])
 		if !ok {
 			continue
 		}
@@ -161,6 +172,28 @@ func addResourceMetric(result map[string]string, dimension, inputKey string, res
 		}
 		result[name] = fmt.Sprintf("%s %s", name, numberWithMultiplier(value, multiplier))
 	}
+}
+
+func objectMap(value any) (map[string]any, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		return typed, true
+	case map[string]int64:
+		result := make(map[string]any, len(typed))
+		for key, item := range typed {
+			result[key] = item
+		}
+		return result, true
+	default:
+		return nil, false
+	}
+}
+
+func numericValue(value any) float64 {
+	if parsed, ok := numeric(value); ok {
+		return parsed
+	}
+	return 0
 }
 
 func number(value any) string { return numberWithMultiplier(value, 1) }
