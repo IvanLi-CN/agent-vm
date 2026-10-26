@@ -891,7 +891,12 @@ def _systemctl(action: str, unit: str, *, allow_missing: bool = False) -> None:
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         _fail("activation_failed", f"systemd {action} could not be verified: {unit}")
-    if process.returncode != 0 and not (allow_missing and process.returncode == 5):
+    missing_unit = process.returncode == 5 or (
+        action in {"disable", "enable"}
+        and process.returncode == 1
+        and b"does not exist" in process.stderr.lower()
+    )
+    if process.returncode != 0 and not (allow_missing and missing_unit):
         _fail("activation_failed", f"systemd {action} failed: {unit}")
 
 

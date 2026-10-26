@@ -95,6 +95,20 @@ class WrapperTests(unittest.TestCase):
         )
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
+    def test_missing_legacy_enable_and_disable_are_allowed_but_other_failures_are_not(self):
+        missing = subprocess.CompletedProcess(
+            [], 1, b"", b"Failed to disable unit: Unit agent-vm-native-age-gc.service does not exist\n",
+        )
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=missing):
+            WRAPPER._systemctl("disable", "agent-vm-native-age-gc.service", allow_missing=True)
+            WRAPPER._systemctl("enable", "agent-vm-native-age-gc.service", allow_missing=True)
+
+        failed = subprocess.CompletedProcess([], 1, b"", b"Failed to disable unit: permission denied\n")
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=failed):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._systemctl("disable", "agent-vm-native-age-gc.service", allow_missing=True)
+        self.assertEqual(failure.exception.code, "activation_failed")
+
     def test_python_syntax_check_only_compiles_python_files(self):
         python = self.root / "candidate.py"
         typescript = self.root / "candidate.ts"
