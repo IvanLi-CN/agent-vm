@@ -153,11 +153,17 @@ PRODUCT_UNIT_CONTENT_SHA256 = {
     "agent-vm-web.service": "50eecb2b8dd88f0532b4546fb5555e069f3ef557e9228d45ff84e56e6a356d0d",
 }
 HISTORICAL_GO_UNIT_CONTENT_SHA256 = {
-    "agent-vm-native.service": "447f9c09e9378919673708944a45c06d8498308d5613849ff6497103dd1577bb",
+    "agent-vm-native.service": (
+        "834cd02f2afbc10d463d79375e8a1aa9d1e2e94157bfaed96476295744817cc6",
+        "447f9c09e9378919673708944a45c06d8498308d5613849ff6497103dd1577bb",
+    ),
 }
 HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256 = {
     "agent-vm-native.service": HISTORICAL_GO_UNIT_CONTENT_SHA256["agent-vm-native.service"],
-    "agent-vm-web.service": "f7dd481311850d4d1349000b920867208fb43a5b9da16a4f4f617e6f15d28b7b",
+    "agent-vm-web.service": (
+        "50eecb2b8dd88f0532b4546fb5555e069f3ef557e9228d45ff84e56e6a356d0d",
+        "f7dd481311850d4d1349000b920867208fb43a5b9da16a4f4f617e6f15d28b7b",
+    ),
 }
 GO_FIXED_ARTIFACTS = frozenset({
     ("agent_vm.ts", "agent_vm.ts", "client", 0o755),

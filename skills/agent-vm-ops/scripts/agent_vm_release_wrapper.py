@@ -532,7 +532,7 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_hist
                 _fail("unit_unverified", f"unit cannot be read: {name}")
             accepted_hashes = {expected_hashes[name]}
             if allow_historical_content and name in historical_hashes:
-                accepted_hashes.add(historical_hashes[name])
+                accepted_hashes.update(historical_hashes[name])
             if sha256_file(path) not in accepted_hashes:
                 _fail("unit_unverified", f"unit bytes differ from the fixed product policy: {name}")
             if expected_units[name] not in content or "ExecStart=" not in content:
@@ -554,7 +554,7 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_hist
                 _fail("unit_unverified", f"unit cannot be read: {name}")
             accepted_hashes = {GO_UNIT_CONTENT_SHA256[name]}
             if allow_historical_content and name in HISTORICAL_GO_UNIT_CONTENT_SHA256:
-                accepted_hashes.add(HISTORICAL_GO_UNIT_CONTENT_SHA256[name])
+                accepted_hashes.update(HISTORICAL_GO_UNIT_CONTENT_SHA256[name])
             if sha256_file(path) not in accepted_hashes:
                 _fail("unit_unverified", f"unit bytes differ from the fixed Go policy: {name}")
             if GO_UNIT_EXEC_START[name] not in content or "ExecStart=" not in content:
