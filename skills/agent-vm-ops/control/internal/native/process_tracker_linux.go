@@ -205,6 +205,9 @@ func (tracker *processTracker) discoverWithRead(root int, readTable func() (map[
 					return fmt.Errorf("process identity changed for pid %d", pid)
 				}
 				related[pid] = current
+				for child, item := range descendants(refreshed, pid) {
+					related[child] = item
+				}
 			}
 			rootPresent = false
 			rootExited = true

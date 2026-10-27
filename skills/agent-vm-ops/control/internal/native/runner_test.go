@@ -24,6 +24,11 @@ type blockingWorkerRecorder struct {
 	err error
 }
 
+type failingStartRecorder struct {
+	testWorkerRecorder
+	err error
+}
+
 func (recorder *testWorkerRecorder) WorkerStarted(_ context.Context, _ string, identity WorkerIdentity) error {
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
@@ -39,6 +44,10 @@ func (recorder *testWorkerRecorder) WorkerFinished(_ context.Context, _ string, 
 }
 
 func (recorder *blockingWorkerRecorder) WorkerStartAllowed(context.Context, string) error {
+	return recorder.err
+}
+
+func (recorder *failingStartRecorder) WorkerStarted(context.Context, string, WorkerIdentity) error {
 	return recorder.err
 }
 
@@ -170,6 +179,20 @@ func TestRunnerAppliesWorkerStartGuardBeforeSpawn(t *testing.T) {
 	}
 	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
 		t.Fatalf("worker start guard allowed command side effect: stat error = %v", statErr)
+	}
+}
+
+func TestRunnerRecordsCleanupAfterWorkerStartCallbackFailure(t *testing.T) {
+	recorder := &failingStartRecorder{err: errors.New("worker identity journal unavailable")}
+	ctx := WithWorkerRecorder(context.Background(), "operation", recorder)
+	_, err := NewRunner().Run(ctx, []string{"/bin/echo", "worker"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "record native worker start") {
+		t.Fatalf("Run() error = %v, want worker-start callback failure", err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.finished) != 1 || recorder.finished[0] != nil {
+		t.Fatalf("worker finish callbacks = %#v, want one confirmed cleanup", recorder.finished)
 	}
 }
 

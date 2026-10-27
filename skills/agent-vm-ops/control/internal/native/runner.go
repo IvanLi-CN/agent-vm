@@ -184,11 +184,12 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	}()
 	if binding.recorder != nil {
 		if err := binding.recorder.WorkerStarted(ctx, binding.operationID, identity); err != nil {
+			startErr := err
 			if monitorErr := stopMonitor(); monitorErr != nil && trackingErr == nil {
 				trackingErr = monitorErr
 			}
 			killProcess(command.Process.Pid, pidfd)
-			_ = cleanupTracked(tracker, command.Process.Pid)
+			cleanupErr := cleanupTracked(tracker, command.Process.Pid)
 			_ = stdoutReader.Close()
 			_ = stderrReader.Close()
 			<-wait
@@ -196,7 +197,16 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 			<-stderrDone
 			closePIDFD(pidfd)
 			_ = tracker.Reap()
-			return Result{}, fmt.Errorf("record native worker start: %w", err)
+			finishErr := cleanupErr
+			if cleanupErr == nil {
+				finishErr = binding.recorder.WorkerFinished(ctx, binding.operationID, identity, nil)
+			} else {
+				finishErr = binding.recorder.WorkerFinished(ctx, binding.operationID, identity, errors.Join(startErr, cleanupErr))
+			}
+			if finishErr != nil {
+				startErr = errors.Join(startErr, fmt.Errorf("record native worker cleanup: %w", finishErr))
+			}
+			return Result{}, fmt.Errorf("record native worker start: %w", startErr)
 		}
 		workerStarted = true
 	}

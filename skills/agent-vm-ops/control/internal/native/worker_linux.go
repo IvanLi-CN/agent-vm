@@ -69,9 +69,15 @@ type workerKillOps struct {
 	readIdentity func(int) (WorkerIdentity, error)
 	workerAlive  func(WorkerIdentity) (bool, error)
 	sendSignal   func(int) error
-	killGroup    func(WorkerIdentity) error
+	killGroup    func(WorkerIdentity, *workerGroupCleanup) error
 	groupAlive   func(int) (bool, error)
 	sleep        func(time.Duration)
+}
+
+type workerGroupCleanup struct {
+	rootPIDFD    int
+	rootSignaled bool
+	members      map[int]trackedProcess
 }
 
 func workerRootExited(identity WorkerIdentity, workerAlive func(WorkerIdentity) (bool, error)) error {
@@ -127,15 +133,16 @@ func killWorkerWith(identity WorkerIdentity, ops workerKillOps) error {
 	if current.ProcessGroup != identity.ProcessGroup {
 		return fmt.Errorf("native worker process group changed for pid %d", identity.PID)
 	}
-	if err := ops.sendSignal(fd); err != nil {
-		if errors.Is(err, unix.ESRCH) {
-			return workerRootExited(identity, ops.workerAlive)
-		}
-		return fmt.Errorf("kill native worker: %w", err)
-	}
 	if current.ProcessGroup == current.PID {
-		if err := ops.killGroup(current); err != nil && !errors.Is(err, unix.ESRCH) {
+		cleanup := &workerGroupCleanup{rootPIDFD: fd, members: make(map[int]trackedProcess)}
+		if err := ops.killGroup(current, cleanup); err != nil && !errors.Is(err, unix.ESRCH) {
 			return fmt.Errorf("kill native worker process group: %w", err)
+		}
+		if !cleanup.rootSignaled {
+			if err := ops.sendSignal(fd); err != nil && !errors.Is(err, unix.ESRCH) {
+				return fmt.Errorf("kill native worker: %w", err)
+			}
+			cleanup.rootSignaled = true
 		}
 		if ops.groupAlive != nil {
 			for attempt := 0; attempt < 10; attempt++ {
@@ -149,7 +156,7 @@ func killWorkerWith(identity WorkerIdentity, ops workerKillOps) error {
 				if attempt == 9 {
 					break
 				}
-				if err := ops.killGroup(current); err != nil && !errors.Is(err, unix.ESRCH) {
+				if err := ops.killGroup(current, cleanup); err != nil && !errors.Is(err, unix.ESRCH) {
 					return fmt.Errorf("retry native worker process-group cleanup: %w", err)
 				}
 				if ops.sleep != nil {
@@ -158,46 +165,93 @@ func killWorkerWith(identity WorkerIdentity, ops workerKillOps) error {
 			}
 			return errors.New("native worker process group remains after cleanup")
 		}
+		return nil
+	}
+	if err := ops.sendSignal(fd); err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return workerRootExited(identity, ops.workerAlive)
+		}
+		return fmt.Errorf("kill native worker: %w", err)
 	}
 	return nil
 }
 
-// killProcessGroup uses pidfds for each member after anchoring the group to
-// the original root identity. A numeric PGID is not sufficient after the root
-// exits because the same PID can later become an unrelated process group.
-func killProcessGroup(identity WorkerIdentity) error {
+// killProcessGroup uses pidfds for each member while the original root pidfd
+// anchors the group. The root is signalled last so it cannot disappear before
+// the first member scan. Once it is gone, retries only admit descendants of
+// already verified members; a reused numeric PGID is never enough to claim a
+// new process.
+func killProcessGroup(identity WorkerIdentity, cleanup *workerGroupCleanup) error {
+	if cleanup == nil {
+		return errors.New("native worker group cleanup state is missing")
+	}
+	if cleanup.members == nil {
+		cleanup.members = make(map[int]trackedProcess)
+	}
 	all, err := readProcessTable()
 	if err != nil {
 		return err
 	}
-	root, ok := all[identity.PID]
-	if !ok {
-		return workerRootExited(identity, WorkerAlive)
+	root, rootPresent := all[identity.PID]
+	if rootPresent {
+		if root.start != identity.StartTime {
+			return fmt.Errorf("native worker identity changed for pid %d", identity.PID)
+		}
+		if root.group != identity.ProcessGroup {
+			return fmt.Errorf("native worker process group changed for pid %d", identity.PID)
+		}
+	} else if !cleanup.rootSignaled {
+		// The root pidfd still anchors the original process even if the root
+		// was reaped before this scan. The original PGID cannot be reused
+		// without the root PID reappearing, which was ruled out above.
+		for pid, item := range all {
+			if item.group == identity.ProcessGroup && item.state != 'Z' {
+				cleanup.members[pid] = item
+			}
+		}
+		cleanup.rootSignaled = true
 	}
-	if root.start != identity.StartTime {
-		return fmt.Errorf("native worker identity changed for pid %d", identity.PID)
-	}
-	if root.group != identity.ProcessGroup {
-		return fmt.Errorf("native worker process group changed for pid %d", identity.PID)
-	}
-	present, err := workerRootPresent(identity)
-	if err != nil {
-		return err
-	}
-	if !present {
-		return nil
+	if rootPresent {
+		for pid, item := range all {
+			if pid != identity.PID && item.group == identity.ProcessGroup && item.state != 'Z' {
+				cleanup.members[pid] = item
+			}
+		}
+	} else {
+		// A root-less retry may only add a child whose current parent is an
+		// already verified member. This keeps a reused numeric PGID from
+		// becoming an ownership claim after the root has exited.
+		for pid, item := range all {
+			if item.group != identity.ProcessGroup || item.state == 'Z' {
+				continue
+			}
+			if _, known := cleanup.members[pid]; known {
+				continue
+			}
+			parent, parentPresent := all[item.parent]
+			knownParent, known := cleanup.members[item.parent]
+			if parentPresent && known && parent.start == knownParent.start && parent.group == identity.ProcessGroup {
+				cleanup.members[pid] = item
+			}
+		}
 	}
 	var first error
-	for pid, item := range all {
-		if item.group != identity.ProcessGroup || item.state == 'Z' {
+	for pid, item := range cleanup.members {
+		current, currentPresent := all[pid]
+		if !currentPresent {
 			continue
 		}
-		present, err := workerRootPresent(identity)
-		if err != nil {
-			return err
+		if current.start != item.start {
+			if first == nil {
+				first = fmt.Errorf("process-group member identity changed for pid %d", pid)
+			}
+			continue
 		}
-		if !present {
-			return nil
+		if current.group != identity.ProcessGroup {
+			if first == nil {
+				first = fmt.Errorf("process-group member group changed for pid %d", pid)
+			}
+			continue
 		}
 		fd, openErr := unix.PidfdOpen(pid, 0)
 		if errors.Is(openErr, unix.ESRCH) {
@@ -234,22 +288,18 @@ func killProcessGroup(identity WorkerIdentity) error {
 			first = fmt.Errorf("kill process-group member %d: %w", pid, signalErr)
 		}
 	}
+	if rootPresent && !cleanup.rootSignaled {
+		if cleanup.rootPIDFD < 0 {
+			return errors.New("native worker root pidfd is missing")
+		}
+		signalErr := unix.PidfdSendSignal(cleanup.rootPIDFD, unix.SIGKILL, nil, 0)
+		if signalErr != nil && !errors.Is(signalErr, unix.ESRCH) {
+			if first == nil {
+				first = fmt.Errorf("kill native worker root: %w", signalErr)
+			}
+		} else {
+			cleanup.rootSignaled = true
+		}
+	}
 	return first
-}
-
-func workerRootPresent(identity WorkerIdentity) (bool, error) {
-	current, err := readProcess(identity.PID)
-	if processGone(err) {
-		return false, workerRootExited(identity, WorkerAlive)
-	}
-	if err != nil {
-		return false, err
-	}
-	if current.start != identity.StartTime {
-		return false, fmt.Errorf("native worker identity changed for pid %d", identity.PID)
-	}
-	if current.group != identity.ProcessGroup {
-		return false, fmt.Errorf("native worker process group changed for pid %d", identity.PID)
-	}
-	return true, nil
 }

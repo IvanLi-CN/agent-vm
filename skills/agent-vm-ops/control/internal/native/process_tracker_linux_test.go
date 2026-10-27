@@ -259,6 +259,7 @@ func TestProcessTrackerRetainsObservedDescendantAfterRootReparent(t *testing.T) 
 	}
 	refreshed := map[int]trackedProcess{
 		200: {pid: 200, start: "detached-child", parent: 1, group: 200, state: 'S'},
+		201: {pid: 201, start: "detached-grandchild", parent: 200, group: 201, state: 'S'},
 	}
 	empty := map[int]trackedProcess{}
 	snapshot := 0
@@ -281,6 +282,9 @@ func TestProcessTrackerRetainsObservedDescendantAfterRootReparent(t *testing.T) 
 	}
 	if item, ok := tracker.tracked[200]; !ok || item.start != "detached-child" {
 		t.Fatalf("tracked detached descendant = %#v, want observed identity", tracker.tracked)
+	}
+	if item, ok := tracker.tracked[201]; !ok || item.start != "detached-grandchild" {
+		t.Fatalf("tracked reparented descendant = %#v, want current descendant identity", tracker.tracked)
 	}
 }
 
@@ -395,7 +399,7 @@ func TestKillWorkerReconcilesIdentityExitAfterPidfdOpen(t *testing.T) {
 					sent = true
 					return nil
 				},
-				killGroup: func(WorkerIdentity) error {
+				killGroup: func(WorkerIdentity, *workerGroupCleanup) error {
 					t.Fatal("killGroup called before worker identity was verified")
 					return nil
 				},
@@ -422,9 +426,9 @@ func TestKillWorkerReconcilesIdentityExitAfterPidfdOpen(t *testing.T) {
 	}
 }
 
-func TestKillWorkerDoesNotSignalReusedGroupAfterRootPidfdExit(t *testing.T) {
+func TestKillWorkerAnchorsGroupBeforeRootSignal(t *testing.T) {
 	identity := WorkerIdentity{PID: 123, StartTime: "1", ProcessGroup: 123}
-	groupKilled := false
+	events := make([]string, 0, 2)
 	err := killWorkerWith(identity, workerKillOps{
 		openPIDFD:  func(int) (int, error) { return 42, nil },
 		closePIDFD: func(int) error { return nil },
@@ -432,17 +436,20 @@ func TestKillWorkerDoesNotSignalReusedGroupAfterRootPidfdExit(t *testing.T) {
 			return identity, nil
 		},
 		workerAlive: func(WorkerIdentity) (bool, error) { return false, nil },
-		sendSignal:  func(int) error { return unix.ESRCH },
-		killGroup: func(WorkerIdentity) error {
-			groupKilled = true
+		sendSignal: func(int) error {
+			events = append(events, "root")
+			return nil
+		},
+		killGroup: func(WorkerIdentity, *workerGroupCleanup) error {
+			events = append(events, "group")
 			return nil
 		},
 	})
 	if err != nil {
 		t.Fatalf("killWorkerWith() error = %v, want nil", err)
 	}
-	if groupKilled {
-		t.Fatal("killWorkerWith() signalled a numeric group after the pidfd target exited")
+	if strings.Join(events, ",") != "group,root" {
+		t.Fatalf("kill order = %v, want group,root", events)
 	}
 }
 
@@ -458,7 +465,7 @@ func TestKillWorkerConfirmsProcessGroupGoneAfterMemberScan(t *testing.T) {
 		},
 		workerAlive: func(WorkerIdentity) (bool, error) { return true, nil },
 		sendSignal:  func(int) error { return nil },
-		killGroup: func(WorkerIdentity) error {
+		killGroup: func(WorkerIdentity, *workerGroupCleanup) error {
 			killGroupCalls++
 			return nil
 		},

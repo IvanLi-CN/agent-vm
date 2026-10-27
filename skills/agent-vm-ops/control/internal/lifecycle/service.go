@@ -173,13 +173,13 @@ func (s *Service) operationActive(operationID string) bool {
 }
 
 func (s *Service) WorkerStarted(ctx context.Context, operationID string, identity native.WorkerIdentity) error {
-	return s.recordWorkerCallback(ctx, operationID, map[string]any{
+	return s.updateWorker(ctx, operationID, map[string]any{
 		"pid":           identity.PID,
 		"start_time":    identity.StartTime,
 		"process_group": identity.ProcessGroup,
 		"state":         "running",
 		"started_at":    nowString(s.Clock()),
-	})
+	}, workerCallbackStarted)
 }
 
 func (s *Service) WorkerFinished(ctx context.Context, operationID string, identity native.WorkerIdentity, runErr error) error {
@@ -204,7 +204,7 @@ func (s *Service) WorkerFinished(ctx context.Context, operationID string, identi
 		}
 		worker["error"] = message
 	}
-	return s.recordWorkerCallback(ctx, operationID, worker)
+	return s.updateWorker(ctx, operationID, worker, workerCallbackFinished)
 }
 
 var errUnresolvedWorker = errors.New("native worker ownership remains unresolved")
@@ -217,26 +217,49 @@ func (s *Service) WorkerStartAllowed(ctx context.Context, operationID string) er
 	if err != nil {
 		return err
 	}
-	if operation == nil {
+	if operation == nil || stringValue(operation.Response["outcome"]) != "pending" {
+		return errUnresolvedWorker
+	}
+	if unresolved, err := s.pendingWorkerUnresolved(ctx, operation.SessionID, operationID); err != nil {
+		return err
+	} else if unresolved {
+		return errUnresolvedWorker
+	}
+	previous, _ := operation.Response["worker"].(map[string]any)
+	if stringValue(previous["state"]) == "running" || (stringValue(previous["state"]) == "starting" && boolValue(previous["start_attempted"])) {
+		return errUnresolvedWorker
+	}
+	if stringValue(previous["state"]) != "starting" {
 		return nil
 	}
-	if previous, ok := operation.Response["worker"].(map[string]any); ok && stringValue(previous["state"]) == "running" {
-		if _, uncertain := previous["error"]; uncertain {
-			return errUnresolvedWorker
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
+		worker, ok := response["worker"].(map[string]any)
+		if !ok || stringValue(worker["state"]) != "starting" || boolValue(worker["start_attempted"]) {
+			if workerNeedsReconciliation(worker, true) {
+				return errUnresolvedWorker
+			}
+			return nil
 		}
-	}
-	return nil
-}
-
-func (s *Service) recordWorkerCallback(ctx context.Context, operationID string, worker map[string]any) error {
-	return s.updateWorker(ctx, operationID, worker, true)
+		worker["start_attempted"] = true
+		return nil
+	})
 }
 
 func (s *Service) recordWorkerState(ctx context.Context, operationID string, worker map[string]any) error {
-	return s.updateWorker(ctx, operationID, worker, false)
+	return s.updateWorker(ctx, operationID, worker, workerCallbackState)
 }
 
-func (s *Service) updateWorker(ctx context.Context, operationID string, worker map[string]any, rejectUnresolved bool) error {
+type workerCallbackKind uint8
+
+const (
+	workerCallbackStarted workerCallbackKind = iota
+	workerCallbackFinished
+	workerCallbackState
+)
+
+func (s *Service) updateWorker(ctx context.Context, operationID string, worker map[string]any, callback workerCallbackKind) error {
 	if operationID == "" {
 		return nil
 	}
@@ -245,11 +268,11 @@ func (s *Service) updateWorker(ctx context.Context, operationID string, worker m
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
-		if rejectUnresolved {
+		if callback != workerCallbackState {
 			if previous, ok := response["worker"].(map[string]any); ok && stringValue(previous["state"]) == "running" {
-				if _, uncertain := previous["error"]; uncertain {
-					// Once native ownership is uncertain, later successful commands in
-					// the same operation must not start without a durable identity.
+				if callback == workerCallbackStarted || !workerIdentityMatches(previous, worker) {
+					// A callback for a new worker must never overwrite an older
+					// identity that has not been reconciled.
 					return errUnresolvedWorker
 				}
 			}
@@ -259,13 +282,62 @@ func (s *Service) updateWorker(ctx context.Context, operationID string, worker m
 	})
 }
 
+func (s *Service) pendingWorkerUnresolved(ctx context.Context, sessionID *string, currentOperationID string) (bool, error) {
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, operation := range pending {
+		if !sameWorkerScope(sessionID, operation.SessionID) {
+			continue
+		}
+		current := operation.OperationID == currentOperationID
+		if worker, ok := operation.Response["worker"].(map[string]any); ok && workerNeedsReconciliation(worker, current) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func sameWorkerScope(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func workerNeedsReconciliation(worker map[string]any, current bool) bool {
+	if worker == nil {
+		return false
+	}
+	stateValue := stringValue(worker["state"])
+	if stateValue == "running" {
+		return true
+	}
+	return stateValue == "starting" && (!current || boolValue(worker["start_attempted"]))
+}
+
+func workerIdentityMatches(previous, current map[string]any) bool {
+	previousPID, previousPIDOK := protocol.Integer(previous["pid"])
+	currentPID, currentPIDOK := protocol.Integer(current["pid"])
+	previousGroup, previousGroupOK := protocol.Integer(previous["process_group"])
+	currentGroup, currentGroupOK := protocol.Integer(current["process_group"])
+	return previousPIDOK && currentPIDOK && previousGroupOK && currentGroupOK && previousPID == currentPID && previousGroup == currentGroup && stringValue(previous["start_time"]) == stringValue(current["start_time"])
+}
+
 func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.Operation) error {
 	for _, operation := range pending {
 		if s.operationActive(operation.OperationID) {
 			continue
 		}
 		worker, ok := operation.Response["worker"].(map[string]any)
-		if !ok || stringValue(worker["state"]) != "running" {
+		if !ok {
+			continue
+		}
+		if stringValue(worker["state"]) == "starting" && boolValue(worker["start_attempted"]) {
+			return protocol.NewError("state_unverified", "pending native worker start has no durable identity", map[string]any{"operation_id": operation.OperationID})
+		}
+		if stringValue(worker["state"]) != "running" {
 			continue
 		}
 		pid, valid := protocol.Integer(worker["pid"])
@@ -1045,6 +1117,13 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 			missing, _ := detail["native_missing"].(bool)
 			if !(destroy && task.State == stateDeleting && missing) {
 				return nil, protocol.NewError("cleanup_incomplete", "native ownership could not be verified before cleanup", map[string]any{"cause": ownershipErr.Error(), "outcome_verified": false})
+			}
+			unresolved, workerErr := s.pendingWorkerUnresolved(ctx, optionalString(request["session_id"]), stringValue(request["operation_id"]))
+			if workerErr != nil {
+				return nil, protocol.NewError("cleanup_incomplete", "native worker ownership could not be checked before finalizing a missing instance", map[string]any{"cause": workerErr.Error(), "outcome_verified": false})
+			}
+			if unresolved {
+				return nil, protocol.NewError("cleanup_incomplete", "native worker ownership remains unresolved while the instance is missing", map[string]any{"outcome_verified": false})
 			}
 			nativePresent = false
 		}
@@ -2453,6 +2532,10 @@ func generationPointer(value int64, present bool) *int64 {
 func requestBool(request protocol.Request, key string) bool {
 	value, ok := request[key].(bool)
 	return ok && value
+}
+func boolValue(value any) bool {
+	parsed, _ := value.(bool)
+	return parsed
 }
 func boolString(value bool) string {
 	if value {
