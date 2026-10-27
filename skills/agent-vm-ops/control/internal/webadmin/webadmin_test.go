@@ -125,7 +125,11 @@ func TestPageBoundsContinuesWhenCursorAnchorDisappears(t *testing.T) {
 }
 
 func TestOverviewMarksStaleSourcesAndBlocksUnsafeAdmission(t *testing.T) {
-	authority, _, _ := testAuthority(t)
+	authority, store, _ := testAuthority(t)
+	updatedAt := "2026-10-27T00:00:00Z"
+	if err := store.InsertTask(context.Background(), state.Task{TaskID: "durable-active", SessionID: "session", Generation: 1, State: "active", InstanceName: "agent-vm-durable-active", CreatedAt: updatedAt, UpdatedAt: updatedAt, ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: "{}", ResourceReservationJSON: "{}"}); err != nil {
+		t.Fatal(err)
+	}
 	metrics := map[string]any{
 		"observed_at":       time.Now().UTC().Format(time.RFC3339Nano),
 		"up":                false,
@@ -149,12 +153,12 @@ func TestOverviewMarksStaleSourcesAndBlocksUnsafeAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	counts := value["task_counts"].(map[string]any)
-	if counts["active"] != int64(0) {
-		t.Fatalf("stale task counts = %#v", counts)
+	if counts["active"] != int64(1) {
+		t.Fatalf("durable task counts = %#v", counts)
 	}
 	sources := value["sources"].([]any)
 	durable := sources[0].(map[string]any)
-	if durable["state"] != "stale" || durable["safe_code"] != "observation_stale" {
+	if durable["state"] != "available" || durable["safe_code"] != nil {
 		t.Fatalf("durable source = %#v", durable)
 	}
 }

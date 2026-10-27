@@ -284,13 +284,31 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 			admissionReady = false
 		}
 	}
+	stateNames := []string{"active", "preparing", "cached", "closing", "deleting", "failed", "absent"}
 	states := map[string]any{}
-	for _, name := range []string{"active", "preparing", "cached", "closing", "deleting", "failed", "absent"} {
-		if fresh {
+	durableObservedAt := observedAt
+	if fresh {
+		for _, name := range stateNames {
 			states[name] = int64Value(metricsMapValue(metrics, "task_states", name))
-		} else {
-			states[name] = int64(0)
 		}
+	} else {
+		tasks, listErr := authority.Store.ListTasks(ctx)
+		if listErr != nil {
+			return nil, listErr
+		}
+		counts := make(map[string]int64, len(stateNames))
+		for _, name := range stateNames {
+			counts[name] = 0
+		}
+		for _, task := range tasks {
+			if _, ok := counts[task.State]; ok {
+				counts[task.State]++
+			}
+		}
+		for _, name := range stateNames {
+			states[name] = counts[name]
+		}
+		durableObservedAt = now.Format(time.RFC3339Nano)
 	}
 	durableState := "available"
 	nativeSafeCode := any(nil)
@@ -299,7 +317,6 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 		nativeUnavailable = true
 	}
 	if !fresh {
-		durableState = "stale"
 		nativeSafeCode = "observation_stale"
 	} else if nativeUnavailable {
 		nativeSafeCode = "native_unavailable"
@@ -312,12 +329,7 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 		"pressure":         pressure,
 		"task_counts":      states,
 		"sources": []any{
-			map[string]any{"name": "durable_state", "state": durableState, "observed_at": observedAt, "stale_after_seconds": 60, "safe_code": func() any {
-				if fresh {
-					return nil
-				}
-				return "observation_stale"
-			}()},
+			map[string]any{"name": "durable_state", "state": durableState, "observed_at": durableObservedAt, "stale_after_seconds": 60, "safe_code": nil},
 			map[string]any{"name": "native", "state": sourceStateWithFreshness(metrics["up"], fresh), "observed_at": observedAt, "stale_after_seconds": 60, "safe_code": nativeSafeCode},
 		},
 	}, nil

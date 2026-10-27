@@ -11,6 +11,7 @@ import { DefinitionList, PageIntro, QueryError } from "../components/PagePrimiti
 
 type ImageAction = "default" | "delete" | "retire";
 type ImportSubmission = { request: ImageImportRequest; content?: File | { metadata: File; rootfs: File } };
+const importRejectedCodes = new Set(["invalid_request", "source_not_allowed", "permission_denied", "stale_target", "operation_conflict", "not_found", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch"]);
 
 export function ImagesPage() {
   const { t, i18n } = useTranslation();
@@ -43,15 +44,27 @@ export function ImagesPage() {
   const importMutation = useMutation({
     mutationFn: async ({ request, content }: ImportSubmission) => {
       const operation = await startImageImport(request);
-      return content ? uploadImageImportContent(operation.operation_id, content) : operation;
+      return content && operation.status === "awaiting_upload" ? uploadImageImportContent(operation.operation_id, content) : operation;
     },
     onSuccess: (operation) => {
+      if (operation.status === "failed") {
+        setImportMessage(t(`errors.${operation.error?.code ?? "generic"}`, { defaultValue: t("errors.generic") }));
+        setPendingImport(null);
+        return;
+      }
+      if (operation.status === "outcome_unknown") {
+        setImportMessage(t("errors.authority_unavailable"));
+        return;
+      }
       setImportMessage(`${t("images.importStarted")} · ${operation.operation_id}`);
       setPendingImport(null);
       setReason("");
       void client.invalidateQueries({ queryKey: ["operations"] });
     },
-    onError: (error) => setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")),
+    onError: (error) => {
+      if (error instanceof ManagementRequestError && importRejectedCodes.has(error.code)) setPendingImport(null);
+      setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
+    },
   });
   const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!, operationId ?? undefined), onSuccess: () => { setAction(null); setPreview(null); setOperationId(null); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")) });
 
