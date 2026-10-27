@@ -3,6 +3,7 @@ package webadmin
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -226,6 +227,50 @@ func TestPrivateStagingRejectsSymlink(t *testing.T) {
 	if _, err := stageReader(link, strings.NewReader("data"), 4, 8); err == nil || !strings.HasPrefix(err.Error(), "authority_unavailable:") {
 		t.Fatalf("symlink staging was accepted: %v", err)
 	}
+}
+
+func TestStagingCapacityChecksOnlyUnreadBytes(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "staging")
+	reader := &chunkReader{value: []byte("123456"), chunk: 2}
+	var remaining []int64
+	value, err := stageReaderWithCapacity(root, reader, 6, 0, func(unread int64) error {
+		remaining = append(remaining, unread)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decreased := false
+	for _, unread := range remaining[1:] {
+		if unread < remaining[0] {
+			decreased = true
+			break
+		}
+	}
+	if string(value) != "123456" || len(remaining) < 2 || remaining[0] != 6 || !decreased {
+		t.Fatalf("staging value=%q capacity checks=%v", value, remaining)
+	}
+}
+
+type chunkReader struct {
+	value []byte
+	chunk int
+}
+
+func (reader *chunkReader) Read(buffer []byte) (int, error) {
+	if len(reader.value) == 0 {
+		return 0, io.EOF
+	}
+	count := reader.chunk
+	if count > len(reader.value) {
+		count = len(reader.value)
+	}
+	if count > len(buffer) {
+		count = len(buffer)
+	}
+	copy(buffer, reader.value[:count])
+	reader.value = reader.value[count:]
+	return count, nil
 }
 
 func TestImportSourceRequiresExactWireVariant(t *testing.T) {

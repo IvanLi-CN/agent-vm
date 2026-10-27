@@ -34,6 +34,7 @@ export function ImagesPage() {
   const [rootfsFile, setRootfsFile] = useState<File | null>(null);
   const [reason, setReason] = useState("");
   const [importMessage, setImportMessage] = useState("");
+  const [importOperationId, setImportOperationId] = useState<string | null>(null);
   const [action, setAction] = useState<ImageAction | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
   const [operationId, setOperationId] = useState<string | null>(null);
@@ -46,6 +47,7 @@ export function ImagesPage() {
     },
     onSuccess: (operation) => {
       setImportMessage(`${t("images.importStarted")} · ${operation.operation_id}`);
+      setImportOperationId(null);
       setReason("");
       void client.invalidateQueries({ queryKey: ["operations"] });
     },
@@ -57,7 +59,8 @@ export function ImagesPage() {
     const targetVersion = query.data?.catalog_version;
     if (!reason.trim()) { setImportMessage(t("dialog.reasonRequired")); return; }
     if (!targetVersion) { setImportMessage(t("images.targetUnavailable")); return; }
-    const operation_id = createOperationId();
+    const operation_id = importOperationId ?? createOperationId();
+    setImportOperationId(operation_id);
     if (sourceKind === "trusted_remote") {
       const request: ImageImportRequest = { operation_id, reason: reason.trim(), target_version: targetVersion, version_label: versionLabel, source: { kind: "trusted_remote", source_id: sourceId, expected_fingerprint: expectedFingerprint } };
       importMutation.mutate({ request });

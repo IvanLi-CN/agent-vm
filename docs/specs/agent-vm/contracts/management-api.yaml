@@ -1383,6 +1383,14 @@ components:
             - precondition_required
             - authority_unavailable
             - rate_limited
+            - sqlite_unavailable
+            - lease_expired
+            - task_not_active
+            - draining
+            - mapping_unverified
+            - cleanup_incomplete
+            - resource_unverified
+            - startup_reconcile_required
             - internal_error
         phase:
           oneOf:

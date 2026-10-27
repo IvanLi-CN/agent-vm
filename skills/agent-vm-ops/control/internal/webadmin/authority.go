@@ -74,6 +74,7 @@ func NewAuthority(options AuthorityOptions) (*Authority, error) {
 		Management:     options.Management,
 		Lifecycle:      options.Lifecycle,
 		Store:          options.Store,
+		Snapshots:      options.Snapshots,
 		ProductVersion: options.ProductVersion,
 		Clock:          options.Clock,
 		confirmations:  newConfirmationStore(),
@@ -214,33 +215,42 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	if err != nil {
 		return nil, err
 	}
-	now := stringValue(metrics["observed_at"])
-	if now == "" {
-		now = authority.Clock().UTC().Format(time.RFC3339Nano)
+	now := authority.Clock().UTC()
+	observedAt := stringValue(metrics["observed_at"])
+	observedTime, parseErr := time.Parse(time.RFC3339Nano, observedAt)
+	fresh := observedAt != "" && parseErr == nil && !observedTime.After(now.Add(5*time.Second)) && now.Sub(observedTime) <= 60*time.Second
+	if observedAt == "" {
+		observedAt = now.Format(time.RFC3339Nano)
 	}
 	resources, _ := metrics["resources"].(map[string]any)
 	remaining, _ := resources["remaining"].(map[string]any)
 	ctCPU, _ := metrics["ct_cpu"].(map[string]any)
 	startupBlocked := nestedBool(metrics, "ct_cpu", "startup_pressure", "startup_blocked")
 	capacity := map[string]any{
-		"logical_cpu_remaining_vcpu": observedNumber(numberValue(remaining["cpu"]), now),
-		"ct_cpu_capacity_vcpu":       observedNumber(numberValue(ctCPU["capacity_vcpu"]), now),
-		"logical_memory_remaining":   observedBytes(decimalBytes(numberValue(remaining["memory_mib"]), 1024*1024), now),
-		"ct_memory_available":        observedBytes(nil, now),
+		"logical_cpu_remaining_vcpu": observedNumber(numberValue(remaining["cpu"]), observedAt, fresh),
+		"ct_cpu_capacity_vcpu":       observedNumber(numberValue(ctCPU["capacity_vcpu"]), observedAt, fresh),
+		"logical_memory_remaining":   observedBytes(decimalBytes(numberValue(remaining["memory_mib"]), 1024*1024), observedAt, fresh),
+		"ct_memory_available":        observedBytes(nil, observedAt, fresh),
 		// The logical admission budget is not physical disk telemetry. Keep the
 		// physical field unverified until the native snapshot supplies it.
-		"physical_disk_available": observedBytes(nil, now),
+		"physical_disk_available": observedBytes(nil, observedAt, fresh),
 	}
 	pressure := map[string]any{
-		"cpu_some_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "some", "avg10"), now),
-		"cpu_full_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "full", "avg10"), now),
-		"cpu_startup_pressure_threshold_percent": observedNumber(nestedNumber(resources, "policy", "cpu_startup_pressure_full_avg10_percent"), now),
-		"cpu_startup_blocked":                    observedBoolean(startupBlocked, now),
-		"memory_pressure":                        observedBoolean(nil, now),
+		"cpu_some_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "some", "avg10"), observedAt, fresh),
+		"cpu_full_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "full", "avg10"), observedAt, fresh),
+		"cpu_startup_pressure_threshold_percent": observedNumber(nestedNumber(resources, "policy", "cpu_startup_pressure_full_avg10_percent"), observedAt, fresh),
+		"cpu_startup_blocked":                    observedBoolean(startupBlocked, observedAt, fresh),
+		"memory_pressure":                        observedBoolean(nil, observedAt, fresh),
 	}
-	admissionReady, _ := metrics["admission_ready"].(bool)
-	draining, _ := metrics["draining"].(bool)
+	var admissionReady, draining any
+	if fresh {
+		admissionReady, _ = metrics["admission_ready"].(bool)
+		draining, _ = metrics["draining"].(bool)
+	}
 	reasons := []string{}
+	if !fresh {
+		reasons = append(reasons, "observation_stale")
+	}
 	if defaultAdmission, ok := metrics["default_admission"].(map[string]any); ok {
 		if rawReasons, ok := defaultAdmission["reasons"].([]any); ok {
 			for _, rawReason := range rawReasons {
@@ -256,14 +266,14 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	}
 	return map[string]any{
 		"resource_version": epoch,
-		"observed_at":      now,
+		"observed_at":      observedAt,
 		"admission":        map[string]any{"ready": admissionReady, "draining": draining, "reasons": reasons},
 		"capacity":         capacity,
 		"pressure":         pressure,
 		"task_counts":      states,
 		"sources": []any{
-			map[string]any{"name": "durable_state", "state": "available", "observed_at": now, "stale_after_seconds": 60, "safe_code": nil},
-			map[string]any{"name": "native", "state": sourceState(metrics["up"]), "observed_at": now, "stale_after_seconds": 60, "safe_code": nil},
+			map[string]any{"name": "durable_state", "state": "available", "observed_at": observedAt, "stale_after_seconds": 60, "safe_code": nil},
+			map[string]any{"name": "native", "state": sourceStateWithFreshness(metrics["up"], fresh), "observed_at": observedAt, "stale_after_seconds": 60, "safe_code": nil},
 		},
 	}, nil
 }
@@ -286,7 +296,11 @@ func (authority *Authority) listVMs(writer http.ResponseWriter, request *http.Re
 		}
 		filtered = append(filtered, task)
 	}
-	start, limit, err := pageBounds(request.URL.Query(), len(filtered))
+	keys := make([]string, len(filtered))
+	for index := range filtered {
+		keys[index] = filtered[index].TaskID
+	}
+	start, limit, err := pageBounds(request.URL.Query(), keys)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
@@ -301,7 +315,7 @@ func (authority *Authority) listVMs(writer http.ResponseWriter, request *http.Re
 		}
 		items = append(items, item)
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(start, limit, end < len(filtered), end)})
+	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(limit, end < len(filtered), pageKey(keys, end))})
 }
 
 func (authority *Authority) getVM(writer http.ResponseWriter, request *http.Request, taskID string) {
@@ -354,7 +368,13 @@ func (authority *Authority) vmValue(ctx context.Context, task *state.Task) (map[
 	}
 	allowed := []string{}
 	if task.State == "active" {
-		allowed = []string{"restart", "resize", "release", "destroy", "port_add", "port_remove"}
+		allowed = []string{"restart", "resize", "release", "destroy", "port_add"}
+		for _, port := range ports {
+			if port.PortName != "ssh" {
+				allowed = append(allowed, "port_remove")
+				break
+			}
+		}
 	} else if task.State == "preparing" || task.State == "cached" || task.State == "closing" || task.State == "failed" {
 		allowed = []string{"release", "destroy"}
 	}
@@ -387,7 +407,11 @@ func (authority *Authority) listImages(writer http.ResponseWriter, request *http
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
 	}
-	start, limit, err := pageBounds(request.URL.Query(), len(images))
+	keys := make([]string, len(images))
+	for index := range images {
+		keys[index] = imagePageKey(images[index])
+	}
+	start, limit, err := pageBounds(request.URL.Query(), keys)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
@@ -411,7 +435,7 @@ func (authority *Authority) listImages(writer http.ResponseWriter, request *http
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(start, limit, end < len(images), end), "default_fingerprint": defaultValue, "selection_version": selectionVersion, "catalog_version": catalogVersion})
+	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(limit, end < len(images), pageKey(keys, end)), "default_fingerprint": defaultValue, "selection_version": selectionVersion, "catalog_version": catalogVersion})
 }
 
 func (authority *Authority) getImage(writer http.ResponseWriter, request *http.Request, fingerprint string) {
@@ -453,7 +477,11 @@ func (authority *Authority) listOperations(writer http.ResponseWriter, request *
 		}
 		filtered = append(filtered, value)
 	}
-	start, limit, err := pageBounds(query, len(filtered))
+	keys := make([]string, len(filtered))
+	for index := range filtered {
+		keys[index] = filtered[index].CreatedAt + "\x00" + filtered[index].OperationID
+	}
+	start, limit, err := pageBounds(query, keys)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
@@ -463,7 +491,7 @@ func (authority *Authority) listOperations(writer http.ResponseWriter, request *
 	for index := start; index < end; index++ {
 		items = append(items, operationValue(filtered[index]))
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(start, limit, end < len(filtered), end)})
+	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(limit, end < len(filtered), pageKey(keys, end))})
 }
 
 func (authority *Authority) getOperation(writer http.ResponseWriter, request *http.Request, operationID string) {
@@ -503,7 +531,11 @@ func (authority *Authority) listAudit(writer http.ResponseWriter, request *http.
 		}
 		filtered = append(filtered, value)
 	}
-	start, limit, err := pageBounds(query, len(filtered))
+	keys := make([]string, len(filtered))
+	for index := range filtered {
+		keys[index] = filtered[index].OccurredAt + "\x00" + filtered[index].EventID
+	}
+	start, limit, err := pageBounds(query, keys)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
@@ -513,7 +545,7 @@ func (authority *Authority) listAudit(writer http.ResponseWriter, request *http.
 	for index := start; index < end; index++ {
 		items = append(items, auditValue(filtered[index]))
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(start, limit, end < len(filtered), end)})
+	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(limit, end < len(filtered), pageKey(keys, end))})
 }
 
 func (authority *Authority) getSystem(writer http.ResponseWriter, request *http.Request) {
@@ -863,12 +895,13 @@ func (authority *Authority) stageUpload(request *http.Request, source management
 		if err != nil || mediaType != "application/octet-stream" {
 			return nil, nil, errors.New("invalid_request: unified uploads require application/octet-stream")
 		}
-		value, err := stageReaderWithCapacity(authority.Config.Upload.StagingPath, request.Body, source.ExpectedSize, authority.Config.Upload.MaxBytes, func() error { return authority.Management.CheckStagingCapacity(source.ExpectedSize) })
+		value, err := stageReaderWithCapacity(authority.Config.Upload.StagingPath, request.Body, source.ExpectedSize, authority.Config.Upload.MaxBytes, func(remaining int64) error { return authority.Management.CheckStagingCapacity(remaining) })
 		return value, nil, err
 	}
 	if source.Metadata.ExpectedSize > math.MaxInt64-source.Rootfs.ExpectedSize || authority.Config.Upload.MaxBytes > 0 && source.Metadata.ExpectedSize+source.Rootfs.ExpectedSize > authority.Config.Upload.MaxBytes {
 		return nil, nil, errors.New("upload_too_large: declared image exceeds the configured limit")
 	}
+	declaredSize := source.Metadata.ExpectedSize + source.Rootfs.ExpectedSize
 	mediaType, params, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
 	if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" {
 		return nil, nil, errors.New("invalid_request: split uploads require multipart/form-data")
@@ -876,6 +909,7 @@ func (authority *Authority) stageUpload(request *http.Request, source management
 	reader := multipart.NewReader(request.Body, params["boundary"])
 	var metadata, rootfs []byte
 	seen := map[string]bool{}
+	consumed := int64(0)
 	for {
 		part, nextErr := reader.NextPart()
 		if errors.Is(nextErr, io.EOF) {
@@ -893,11 +927,22 @@ func (authority *Authority) stageUpload(request *http.Request, source management
 		if name == "rootfs" {
 			expected = source.Rootfs.ExpectedSize
 		}
-		value, readErr := stageReaderWithCapacity(authority.Config.Upload.StagingPath, part, expected, authority.Config.Upload.MaxBytes, func() error { return authority.Management.CheckStagingCapacity(expected) })
+		value, readErr := stageReaderWithCapacity(authority.Config.Upload.StagingPath, part, expected, authority.Config.Upload.MaxBytes, func(remaining int64) error {
+			written := expected - remaining
+			if written < 0 {
+				written = 0
+			}
+			totalRemaining := declaredSize - consumed - written
+			if totalRemaining <= 0 {
+				return nil
+			}
+			return authority.Management.CheckStagingCapacity(totalRemaining)
+		})
 		part.Close()
 		if readErr != nil {
 			return nil, nil, readErr
 		}
+		consumed += int64(len(value))
 		if name == "metadata" {
 			metadata = value
 		} else {
@@ -914,7 +959,7 @@ func stageReader(stagingPath string, reader io.Reader, expected, maximum int64) 
 	return stageReaderWithCapacity(stagingPath, reader, expected, maximum, nil)
 }
 
-func stageReaderWithCapacity(stagingPath string, reader io.Reader, expected, maximum int64, capacity func() error) ([]byte, error) {
+func stageReaderWithCapacity(stagingPath string, reader io.Reader, expected, maximum int64, capacity func(int64) error) ([]byte, error) {
 	if expected < 0 || maximum > 0 && expected > maximum {
 		return nil, errors.New("upload_too_large: declared image exceeds the configured limit")
 	}
@@ -942,12 +987,12 @@ func stageReaderWithCapacity(stagingPath string, reader io.Reader, expected, max
 	defer os.Remove(name)
 	_ = file.Chmod(0o600)
 	if capacity != nil {
-		if err := capacity(); err != nil {
+		if err := capacity(expected); err != nil {
 			_ = file.Close()
 			return nil, err
 		}
 	}
-	count, copyErr := io.Copy(file, io.LimitReader(capacityReader{reader: reader, check: capacity}, expected+1))
+	count, copyErr := io.Copy(file, io.LimitReader(&capacityReader{reader: reader, expected: expected, check: capacity}, expected+1))
 	if closeErr := file.Close(); copyErr == nil {
 		copyErr = closeErr
 	}
@@ -971,17 +1016,24 @@ func stageReaderWithCapacity(stagingPath string, reader io.Reader, expected, max
 }
 
 type capacityReader struct {
-	reader io.Reader
-	check  func() error
+	reader   io.Reader
+	expected int64
+	read     int64
+	check    func(int64) error
 }
 
-func (reader capacityReader) Read(buffer []byte) (int, error) {
+func (reader *capacityReader) Read(buffer []byte) (int, error) {
 	if reader.check != nil {
-		if err := reader.check(); err != nil {
-			return 0, err
+		remaining := reader.expected - reader.read
+		if remaining > 0 {
+			if err := reader.check(remaining); err != nil {
+				return 0, err
+			}
 		}
 	}
-	return reader.reader.Read(buffer)
+	count, err := reader.reader.Read(buffer)
+	reader.read += int64(count)
+	return count, err
 }
 
 func (authority *Authority) previewDefaultImage(writer http.ResponseWriter, request *http.Request, actor string) {
@@ -1081,7 +1133,9 @@ func (authority *Authority) submitDefaultImage(writer http.ResponseWriter, reque
 			return
 		}
 	}
-	operation, err := authority.Management.SelectDefault(request.Context(), payload.OperationID, actor, payload.Reason, payload.Fingerprint, payload.TargetVersion)
+	operationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	operation, err := authority.Management.SelectDefault(operationCtx, payload.OperationID, actor, payload.Reason, payload.Fingerprint, payload.TargetVersion)
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "native_mutation", payload.OperationID))
 		return
@@ -1637,7 +1691,7 @@ func validateConfirmationToken(value string) error {
 	return nil
 }
 
-func pageBounds(query url.Values, length int) (int, int, error) {
+func pageBounds(query url.Values, keys []string) (int, int, error) {
 	limit := 25
 	if value := query.Get("limit"); value != "" {
 		parsed, err := strconv.Atoi(value)
@@ -1652,8 +1706,20 @@ func pageBounds(query url.Values, length int) (int, int, error) {
 		if err != nil {
 			return 0, 0, errors.New("cursor is invalid")
 		}
-		start, err = strconv.Atoi(string(raw))
-		if err != nil || start < 0 || start > length {
+		var cursor struct {
+			Key string `json:"key"`
+		}
+		if err := json.Unmarshal(raw, &cursor); err != nil || cursor.Key == "" {
+			return 0, 0, errors.New("cursor is invalid")
+		}
+		start = -1
+		for index, key := range keys {
+			if key == cursor.Key {
+				start = index + 1
+				break
+			}
+		}
+		if start < 0 {
 			return 0, 0, errors.New("cursor is invalid")
 		}
 	}
@@ -1726,12 +1792,24 @@ func auditBounds(query url.Values) (*time.Time, *time.Time, error) {
 	return from, to, nil
 }
 
-func pageValue(start, limit int, more bool, next int) map[string]any {
+func pageValue(limit int, more bool, nextKey string) map[string]any {
 	var cursor any
-	if more {
-		cursor = base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(next)))
+	if more && nextKey != "" {
+		value, _ := json.Marshal(map[string]string{"key": nextKey})
+		cursor = base64.RawURLEncoding.EncodeToString(value)
 	}
 	return map[string]any{"limit": limit, "next_cursor": cursor}
+}
+
+func pageKey(keys []string, end int) string {
+	if end <= 0 || end > len(keys) {
+		return ""
+	}
+	return keys[end-1]
+}
+
+func imagePageKey(image state.ManagedImage) string {
+	return image.CreatedAt + "\x00" + image.Fingerprint
 }
 
 func imageValue(image state.ManagedImage) map[string]any {
@@ -1868,23 +1946,32 @@ func emptyReferences() map[string]any {
 	return map[string]any{"default": 0, "active": 0, "cached": 0, "pending_creation": 0, "verification": 0}
 }
 
-func observedNumber(value any, observedAt string) map[string]any {
+func observedNumber(value any, observedAt string, fresh bool) map[string]any {
 	if value == nil {
 		return map[string]any{"state": "unverified", "value": nil, "observed_at": nil}
+	}
+	if !fresh {
+		return map[string]any{"state": "stale", "value": nil, "observed_at": observedAt}
 	}
 	return map[string]any{"state": "available", "value": value, "observed_at": observedAt}
 }
 
-func observedBytes(value any, observedAt string) map[string]any {
+func observedBytes(value any, observedAt string, fresh bool) map[string]any {
 	if value == nil {
 		return map[string]any{"state": "unverified", "value_bytes": nil, "observed_at": nil}
+	}
+	if !fresh {
+		return map[string]any{"state": "stale", "value_bytes": nil, "observed_at": observedAt}
 	}
 	return map[string]any{"state": "available", "value_bytes": value, "observed_at": observedAt}
 }
 
-func observedBoolean(value any, observedAt string) map[string]any {
+func observedBoolean(value any, observedAt string, fresh bool) map[string]any {
 	if value == nil {
 		return map[string]any{"state": "unverified", "value": nil, "observed_at": nil}
+	}
+	if !fresh {
+		return map[string]any{"state": "stale", "value": nil, "observed_at": observedAt}
 	}
 	return map[string]any{"state": "available", "value": value, "observed_at": observedAt}
 }
@@ -1996,6 +2083,13 @@ func sourceState(value any) string {
 		return "available"
 	}
 	return "failed"
+}
+
+func sourceStateWithFreshness(value any, fresh bool) string {
+	if !fresh {
+		return "stale"
+	}
+	return sourceState(value)
 }
 
 func minInt(a, b int) int {

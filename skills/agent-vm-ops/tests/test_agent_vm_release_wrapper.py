@@ -177,10 +177,16 @@ class WrapperTests(unittest.TestCase):
         with sqlite3.connect(database_path) as database:
             database.executescript("""
                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE tasks (task_id TEXT, session_id TEXT, generation INTEGER, state TEXT, updated_at TEXT, image_fingerprint TEXT);
-                CREATE TABLE ports (task_id TEXT, generation INTEGER, port_name TEXT, protocol TEXT, host_port INTEGER, vm_port INTEGER, state TEXT);
-                CREATE TABLE operations (operation_id TEXT, action TEXT, response_json TEXT, created_at TEXT);
-                CREATE TABLE audit (id INTEGER, action TEXT, outcome TEXT, created_at TEXT);
+                CREATE TABLE tasks (task_id TEXT, session_id TEXT, generation INTEGER, state TEXT, instance_name TEXT,
+                    vm_ip TEXT, ssh_host_port INTEGER, lease_expires_at TEXT, inactive_since TEXT, cleanup_after TEXT,
+                    created_at TEXT, updated_at TEXT, last_error TEXT, image_fingerprint TEXT, resources_json TEXT,
+                    reservation_bytes INTEGER, previous_generation INTEGER, resource_reservation_json TEXT);
+                CREATE TABLE ports (task_id TEXT, generation INTEGER, port_name TEXT, protocol TEXT, host_port INTEGER,
+                    vm_port INTEGER, device_name TEXT, state TEXT, created_at TEXT);
+                CREATE TABLE operations (operation_id TEXT, action TEXT, session_id TEXT, generation INTEGER,
+                    response_json TEXT, created_at TEXT);
+                CREATE TABLE audit (id INTEGER, action TEXT, task_id TEXT, session_id TEXT, generation INTEGER,
+                    outcome TEXT, detail_json TEXT, created_at TEXT);
             """)
         with mock.patch.object(WRAPPER, "STATE_DB_PATH", database_path):
             self.assertEqual(WRAPPER._read_live_state_capabilities(), [MANIFEST.STATE_CAPABILITY_MARKERS[0]])

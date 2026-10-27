@@ -991,10 +991,18 @@ def _read_live_state_capabilities() -> list[str]:
 def _validate_legacy_state_schema(database: sqlite3.Connection) -> None:
     required = {
         "meta": {"key", "value"},
-        "tasks": {"task_id", "session_id", "generation", "state", "updated_at", "image_fingerprint"},
-        "ports": {"task_id", "generation", "port_name", "protocol", "host_port", "vm_port", "state"},
-        "operations": {"operation_id", "action", "response_json", "created_at"},
-        "audit": {"id", "action", "outcome", "created_at"},
+        "tasks": {
+            "task_id", "session_id", "generation", "state", "instance_name", "vm_ip",
+            "ssh_host_port", "lease_expires_at", "inactive_since", "cleanup_after", "created_at",
+            "updated_at", "last_error", "image_fingerprint", "resources_json", "reservation_bytes",
+            "previous_generation", "resource_reservation_json",
+        },
+        "ports": {
+            "task_id", "generation", "port_name", "protocol", "host_port", "vm_port",
+            "device_name", "state", "created_at",
+        },
+        "operations": {"operation_id", "action", "session_id", "generation", "response_json", "created_at"},
+        "audit": {"id", "action", "task_id", "session_id", "generation", "outcome", "detail_json", "created_at"},
     }
     for table, columns in required.items():
         row = database.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()

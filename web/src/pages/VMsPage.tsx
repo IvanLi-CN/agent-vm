@@ -50,9 +50,9 @@ export function VMsPage() {
     const initial = nextAction === "resize"
       ? { cpu_vcpu: selected.resources.cpu_vcpu ?? 2, memory_bytes: selected.resources.memory_bytes ?? "4294967296", disk_bytes: selected.resources.disk_bytes ?? "21474836480", live: false, allow_restart: false }
       : nextAction === "port_add"
-        ? { port_name: "http", protocol: "tcp", host_port: 0, guest_port: 8080 }
+        ? { port_name: "http", protocol: "tcp", host_port: null, guest_port: 8080 }
         : nextAction === "port_remove"
-          ? { port_name: selected.port_mappings[0]?.name ?? "http", protocol: selected.port_mappings[0]?.protocol ?? "tcp" }
+          ? { port_name: selected.port_mappings.find((port) => port.name !== "ssh")?.name ?? "http", protocol: selected.port_mappings.find((port) => port.name !== "ssh")?.protocol ?? "tcp" }
           : {};
     setParameters(initial);
     try {
