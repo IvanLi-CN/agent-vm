@@ -193,10 +193,10 @@ required check 名称保持时仍需审查 `.github/quality-gates.json` 的声�
 
 ## Follow-ups
 
-产品事实已集中到 [PRODUCT.md](../../PRODUCT.md)，视觉方向种子保存在 [DESIGN.md](../../DESIGN.md)，页面任务与后续构建约束保存在 [Web 界面简报](../../.impeccable/surfaces/web.md)。用户选择“代码优先”作为后续默认流程，并选定“检修工作台：清单与受控操作并列”方向；具体视觉参数尚未实现或验证。
+产品事实已集中到 [PRODUCT.md](../../PRODUCT.md)，视觉方向与实施基线保存在 [DESIGN.md](../../DESIGN.md)，页面任务与构建约束保存在 [Web 界面简报](../../.impeccable/surfaces/web.md)。用户选定“检修工作台：清单与受控操作并列”方向；具体视觉参数尚未从已实现界面验证。
 
 已确认的技术基线为 React/Vite/shadcn/ui、同产品版本内嵌静态资源、独立受限 Web 进程与专用管理 UDS。数据更新先以有界轮询消费快照和操作状态；现有快照各自独立刷新，保留来源健康与时间戳，不让浏览器轮询触发 native 采样。
 
-需要在实施设计中验证的技术条件：外部认证具体接入方式与可信代理范围、镜像验证的隔离策略、受管引用与 schema 迁移、管理员操作和既有 protocol 4 journal 的兼容、native 不确定结果恢复、完整包安装与回滚。部署参数保留在受保护的部署配置中。
+管理 API、Forward Auth、隔离验证、图像引用、持久操作与状态能力回退规则见 [管理台合同](../specs/agent-vm/contracts/management-api.md) 和 [OpenAPI](../specs/agent-vm/contracts/management-api.yaml)。具体代理 UID、外部 Origin、管理员主体、允许来源、上传限额和 staging 余量仍是受保护配置中的部署输入。
 
-产品选择与整体架构已由用户确认。基础文档完成后停在用户审阅点，待用户检查并明确开始后再进入实际实现任务；本研究不自动生成新的 topic Spec、开发计划、PR 或现网变更。
+产品选择与整体架构已由用户确认。该备忘录记录研究与架构依据；新增管理行为以 Agent VM Spec 和管理台合同为准。文档本身不证明功能已实现，也不授权真实身份提供方接入、生产镜像操作或现网部署。
