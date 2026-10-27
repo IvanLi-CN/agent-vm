@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -115,7 +116,25 @@ func (c *IncusClient) run(ctx context.Context, args ...string) error {
 }
 
 func (c *IncusClient) json(ctx context.Context, args ...string) (map[string]any, error) {
-	result, err := c.command(ctx, append(args, "--format", "json")...)
+	var result Result
+	var err error
+	if len(args) > 0 && args[0] == "query" {
+		if len(args) != 2 {
+			return nil, fmt.Errorf("invalid Incus query arguments")
+		}
+		endpoint, parseErr := url.Parse(args[1])
+		if parseErr != nil {
+			return nil, fmt.Errorf("invalid Incus query path: %w", parseErr)
+		}
+		if c.Project != "" {
+			query := endpoint.Query()
+			query.Set("project", c.Project)
+			endpoint.RawQuery = query.Encode()
+		}
+		result, err = c.Runner.Run(ctx, []string{"incus", "query", endpoint.String()}, nil)
+	} else {
+		result, err = c.command(ctx, append(args, "--format", "json")...)
+	}
 	if err != nil {
 		return nil, wrapCommandError(result, err)
 	}
