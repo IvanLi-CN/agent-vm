@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
@@ -108,6 +109,37 @@ func TestImageImportRejectsInsufficientStagingCapacityBeforeClaimingOperation(t 
 	}
 	if backend.imports != 0 {
 		t.Fatalf("backend imports = %d", backend.imports)
+	}
+}
+
+func TestImageImportUploadStreamFailureIsDurable(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, Options{UploadMaxBytes: 1024, Backend: &fakeImageBackend{}})
+	request := ImportRequest{
+		OperationID: "import-stream-failure", Actor: "admin", Reason: "test interrupted upload", TargetVersion: "image-catalog:revision-1", VersionLabel: "2026.02",
+		Source: ImportSource{Kind: "local_upload", Format: "unified", ExpectedSHA256: strings.Repeat("b", 64), ExpectedSize: 3},
+	}
+	operation, err := service.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err = service.FailImageImportUpload(context.Background(), operation.OperationID, context.Canceled)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Status != "failed" || operation.Phase != "upload" || operation.Error["code"] != "internal_error" {
+		t.Fatalf("operation = %#v", operation)
+	}
+	audit, err := service.ListAudit(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audit) < 2 {
+		t.Fatalf("audit = %#v", audit)
 	}
 }
 
@@ -296,6 +328,28 @@ func TestUncertainVMActionRemainsOutcomeUnknown(t *testing.T) {
 	}
 }
 
+func TestProtocolUncertainVMActionRemainsOutcomeUnknown(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	updatedAt := "2026-10-27T00:00:00Z"
+	lease := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	if err := store.InsertTask(context.Background(), state.Task{TaskID: "task-protocol-unknown", SessionID: "session-protocol-unknown", Generation: 1, State: "active", InstanceName: "agent-vm-task-protocol-unknown", LeaseExpiresAt: &lease, CreatedAt: updatedAt, UpdatedAt: updatedAt, ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: "{}", ResourceReservationJSON: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeActionBackend{err: protocol.NewError("restart_partial", "guest stop failed", map[string]any{"outcome_verified": false})}
+	service := New(store, Options{Actions: backend})
+	operation, err := service.ExecuteVMAction(context.Background(), VMActionRequest{OperationID: "restart-protocol-unknown", Actor: "admin", Reason: "repair", TaskID: "task-protocol-unknown", TargetVersion: "vm:task-protocol-unknown:" + updatedAt, Action: "restart", ExpectedGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Status != "outcome_unknown" {
+		t.Fatalf("operation = %#v", operation)
+	}
+}
+
 func TestMaintenanceChecksCurrentSystemVersionBeforeClaim(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -313,6 +367,23 @@ func TestMaintenanceChecksCurrentSystemVersionBeforeClaim(t *testing.T) {
 	}
 	if operation != nil {
 		t.Fatalf("stale maintenance was claimed: %#v", operation)
+	}
+}
+
+func TestMaintenanceDoesNotBecomeStaleFromItsOwnJournalWrites(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	backend := &fakeActionBackend{}
+	service := New(store, Options{Actions: backend, CurrentSystemVersion: func(context.Context) (string, error) { return "system:initial", nil }})
+	operation, err := service.ExecuteMaintenance(context.Background(), MaintenanceRequest{OperationID: "maintenance-valid", Actor: "admin", Reason: "reconcile", TargetVersion: "system:initial", Action: "reconcile"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Status != "succeeded" {
+		t.Fatalf("operation = %#v", operation)
 	}
 }
 

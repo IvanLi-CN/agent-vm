@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
@@ -22,9 +23,11 @@ import (
 var fingerprintPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 type Service struct {
-	Store   *state.Store
-	Clock   func() time.Time
-	Options Options
+	Store         *state.Store
+	Clock         func() time.Time
+	Options       Options
+	vmActionMu    sync.Mutex
+	maintenanceMu sync.Mutex
 }
 
 type Options struct {
@@ -335,9 +338,6 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 		}
 		declaredSize = request.Source.Metadata.ExpectedSize + request.Source.Rootfs.ExpectedSize
 	}
-	if err := s.checkStagingCapacity(declaredSize); err != nil {
-		return nil, err
-	}
 	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "awaiting_upload", "image_import", "running")
 	if err != nil {
 		return nil, err
@@ -346,6 +346,9 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 		return running, nil
 	}
 	operation = running
+	if err := s.checkStagingCapacity(declaredSize); err != nil {
+		return s.failImport(ctx, operation, "upload", safeCode(strings.SplitN(err.Error(), ":", 2)[0]), err.Error(), false)
+	}
 	if request.Source.Format == "unified" {
 		if len(rootfs) != 0 || int64(len(metadata)) != request.Source.ExpectedSize {
 			return s.failImport(ctx, operation, "upload", "invalid_request", "uploaded bytes do not match the declared size", false)
@@ -373,6 +376,33 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 		return s.finishOperation(ctx, operation, "reconciliation", status, nil, safeError(err))
 	}
 	return s.finishImport(ctx, operation, request, artifact)
+}
+
+// FailImageImportUpload durably closes an upload operation when the HTTP
+// stream fails before the bytes can reach the image verifier.
+func (s *Service) FailImageImportUpload(ctx context.Context, operationID string, err error) (*state.ManagementOperation, error) {
+	operation, getErr := s.Store.GetManagementOperation(ctx, operationID)
+	if getErr != nil || operation == nil {
+		return operation, getErr
+	}
+	if operation.Status != "awaiting_upload" {
+		return operation, nil
+	}
+	running, claimed, transitionErr := s.Store.TransitionManagementOperation(ctx, operationID, "awaiting_upload", "upload", "running")
+	if transitionErr != nil {
+		return nil, transitionErr
+	}
+	if !claimed {
+		return running, nil
+	}
+	code := "internal_error"
+	if err != nil {
+		message := err.Error()
+		if index := strings.IndexByte(message, ':'); index > 0 {
+			code = safeCode(message[:index])
+		}
+	}
+	return s.failImport(ctx, running, "upload", code, "upload stream failed", false)
 }
 
 func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) (*state.ManagementOperation, error) {
@@ -651,6 +681,8 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 }
 
 func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) (*state.ManagementOperation, error) {
+	s.vmActionMu.Lock()
+	defer s.vmActionMu.Unlock()
 	actionRequest := map[string]any{"action": request.Action, "task_id": request.TaskID, "target_version": request.TargetVersion, "generation": request.ExpectedGeneration, "parameters": request.Parameters, "actor": request.Actor, "reason": request.Reason, "target_kind": "vm", "target_id": request.TaskID}
 	digest, digestErr := protocol.Digest(protocol.Request(actionRequest))
 	if digestErr != nil {
@@ -731,6 +763,8 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 }
 
 func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceRequest) (*state.ManagementOperation, error) {
+	s.maintenanceMu.Lock()
+	defer s.maintenanceMu.Unlock()
 	actionRequest := map[string]any{"action": request.Action, "target_version": request.TargetVersion, "parameters": request.Parameters, "actor": request.Actor, "reason": request.Reason, "target_kind": "system", "target_id": "system"}
 	digest, digestErr := protocol.Digest(protocol.Request(actionRequest))
 	if digestErr != nil {
@@ -772,13 +806,6 @@ func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceReq
 		return running, nil
 	}
 	operation = running
-	latestVersion, versionErr := s.Options.CurrentSystemVersion(ctx)
-	if versionErr != nil {
-		return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, map[string]any{"code": "authority_unavailable", "retryable": true})
-	}
-	if latestVersion != request.TargetVersion {
-		return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, map[string]any{"code": "stale_target"})
-	}
 	result, actionErr := s.Options.Actions.ExecuteMaintenance(ctx, request.OperationID, request.Action, request.Parameters)
 	if actionErr != nil {
 		status := "failed"

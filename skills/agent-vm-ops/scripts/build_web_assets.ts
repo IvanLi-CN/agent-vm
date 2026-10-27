@@ -26,7 +26,7 @@ const staticRoot = join(generatedRoot, "static");
 const generatedSource = join(generatedRoot, "assets_release.go");
 
 function run(command: string[], cwd = repositoryRoot): void {
-  const result = Bun.spawnSync(command, { cwd, stdout: "pipe", stderr: "pipe" });
+  const result = Bun.spawnSync(command, { cwd, env: { ...process.env, VITE_MANAGEMENT_API: "real" }, stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
 }
 

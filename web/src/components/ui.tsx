@@ -1,4 +1,4 @@
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
+import { forwardRef, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from "react";
 import { Check, ChevronDown, Copy, LoaderCircle } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -36,9 +36,9 @@ export function Input(props: InputHTMLAttributes<HTMLInputElement>) {
   return <input className="form-control" {...props} />;
 }
 
-export function Textarea(props: TextareaHTMLAttributes<HTMLTextAreaElement>) {
-  return <textarea className="form-control form-textarea" {...props} />;
-}
+export const Textarea = forwardRef<HTMLTextAreaElement, TextareaHTMLAttributes<HTMLTextAreaElement>>(function Textarea(props, ref) {
+  return <textarea ref={ref} className="form-control form-textarea" {...props} />;
+});
 
 export function Select({ children, ...props }: SelectHTMLAttributes<HTMLSelectElement>) {
   return <span className="select-wrap"><select className="form-control" {...props}>{children}</select><ChevronDown className="select-icon" aria-hidden="true" /></span>;

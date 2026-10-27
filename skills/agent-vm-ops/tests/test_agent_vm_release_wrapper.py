@@ -153,7 +153,7 @@ class WrapperTests(unittest.TestCase):
             WRAPPER._ensure_drained(self.loaded, target)
         read_capabilities.assert_called_once_with()
 
-    def test_legacy_product_rollback_accepts_the_complete_management_state(self):
+    def test_legacy_product_rollback_rejects_management_state(self):
         self.drain_patch.stop()
         response = json.dumps({
             "ok": True,
@@ -167,7 +167,9 @@ class WrapperTests(unittest.TestCase):
             WRAPPER.subprocess, "run",
             return_value=subprocess.CompletedProcess([], 0, response, b""),
         ):
-            WRAPPER._ensure_drained(self.loaded, target)
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._ensure_drained(self.loaded, target)
+        self.assertEqual(failure.exception.code, "state_compatibility_mismatch")
 
     def test_legacy_product_runtime_stops_the_web_unit(self):
         with mock.patch.object(

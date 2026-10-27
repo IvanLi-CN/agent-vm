@@ -4,9 +4,10 @@ import type { ActionPreview, AuditEvent, ImageImportRequest, ManagedImage, Manag
 const useRealApi = import.meta.env.VITE_MANAGEMENT_API === "real";
 
 type RealRequestOptions = { contentType?: string | null };
-type ManagementSession = { csrf_token: string };
+type ManagementSession = { csrf_token: string; expires_at?: string };
 
 let csrfToken: string | null = null;
+let csrfExpiresAt = 0;
 let sessionPromise: Promise<string> | null = null;
 
 export function createOperationId(): string {
@@ -32,12 +33,14 @@ async function requestJSON<T>(path: string, init: RequestInit | undefined, optio
 }
 
 async function ensureSession(): Promise<string> {
-  if (csrfToken) return csrfToken;
+  if (csrfToken && Date.now() < csrfExpiresAt - 5_000) return csrfToken;
+  csrfToken = null;
   if (!sessionPromise) {
     sessionPromise = requestJSON<ManagementSession>("/session", undefined)
       .then((session) => {
         if (!session.csrf_token) throw new Error("authentication_required");
         csrfToken = session.csrf_token;
+        csrfExpiresAt = session.expires_at ? Date.parse(session.expires_at) : Date.now() + 14 * 60_000;
         return session.csrf_token;
       })
       .finally(() => {
@@ -80,11 +83,11 @@ export async function getVM(taskId: string): Promise<ManagedVM> {
   return useRealApi ? realRequest<ManagedVM>(`/vms/${encodeURIComponent(taskId)}`) : delay(mockState.vms.find((vm) => vm.task_id === taskId) ?? mockState.vms[0]);
 }
 
-export async function listImages(query = ""): Promise<{ items: ManagedImage[]; page: { limit: number; next_cursor: string | null }; default_fingerprint: string | null; selection_version: string }> {
+export async function listImages(query = ""): Promise<{ items: ManagedImage[]; page: { limit: number; next_cursor: string | null }; default_fingerprint: string | null; selection_version: string; catalog_version: string }> {
   if (useRealApi) return realRequest(`/images?limit=25${query ? `&q=${encodeURIComponent(query)}` : ""}`);
   const normalized = query.toLowerCase();
   const items = mockState.images.filter((image) => !normalized || `${image.version_label} ${image.fingerprint}`.toLowerCase().includes(normalized));
-  return delay({ items, page: { limit: 25, next_cursor: null }, default_fingerprint: mockState.images.find((image) => image.is_default)?.fingerprint ?? null, selection_version: "image-selection:revision-12" });
+  return delay({ items, page: { limit: 25, next_cursor: null }, default_fingerprint: mockState.images.find((image) => image.is_default)?.fingerprint ?? null, selection_version: "image-selection:revision-12", catalog_version: "image-catalog:revision-12" });
 }
 
 export async function listOperations(status = "all"): Promise<{ items: Operation[]; page: { limit: number; next_cursor: string | null } }> {
@@ -100,17 +103,17 @@ export async function getSystem(): Promise<SystemStatus> {
   return useRealApi ? realRequest<SystemStatus>("/system") : delay(mockState.system);
 }
 
-export async function previewVMAction(taskId: string, action: string, current?: Pick<ManagedVM, "generation" | "resource_version">): Promise<ActionPreview> {
+export async function previewVMAction(taskId: string, action: string, current?: Pick<ManagedVM, "generation" | "resource_version">, parameters: Record<string, unknown> = {}): Promise<ActionPreview> {
   if (useRealApi) {
     const target = current ?? await getVM(taskId);
-    return realRequest(`/vms/${encodeURIComponent(taskId)}/actions/preview`, { method: "POST", body: JSON.stringify({ action, expected_generation: target.generation, target_version: target.resource_version, parameters: {} }) });
+    return realRequest(`/vms/${encodeURIComponent(taskId)}/actions/preview`, { method: "POST", body: JSON.stringify({ action, expected_generation: target.generation, target_version: target.resource_version, parameters }) });
   }
   const vm = mockState.vms.find((candidate) => candidate.task_id === taskId) ?? mockState.vms[0];
   return delay({ target_version: vm.resource_version, confirmation_token: `synthetic-confirmation-${createOperationId()}`, expires_at: "2026-01-15T10:25:00Z", impact: { summary_code: vm.lease.state === "effective" ? "effective_lease_affected" : "no_active_lease", affected_session_count: vm.lease.state === "effective" ? 1 : 0, affected_image_references: vm.image.fingerprint === mockState.images[0].fingerprint ? mockState.images[0].references : { default: 0, active: 0, cached: 0, pending_creation: 0, verification: 0 }, changes: [{ code: action === "destroy" ? "session_access_revoked" : "native_action", count: 1, value: null }] } });
 }
 
-export async function submitVMAction(taskId: string, action: string, reason: string, preview: ActionPreview, expectedGeneration: string): Promise<Operation> {
-  if (useRealApi) return realRequest(`/vms/${encodeURIComponent(taskId)}/actions`, { method: "POST", body: JSON.stringify({ operation_id: createOperationId(), reason, target_version: preview.target_version, action, expected_generation: expectedGeneration, parameters: {}, confirmation_token: preview.confirmation_token }) });
+export async function submitVMAction(taskId: string, action: string, reason: string, preview: ActionPreview, expectedGeneration: string, parameters: Record<string, unknown> = {}): Promise<Operation> {
+  if (useRealApi) return realRequest(`/vms/${encodeURIComponent(taskId)}/actions`, { method: "POST", body: JSON.stringify({ operation_id: createOperationId(), reason, target_version: preview.target_version, action, expected_generation: expectedGeneration, parameters, confirmation_token: preview.confirmation_token }) });
   return createMockOperation(action as Operation["action"], { kind: "vm", id: taskId }, reason);
 }
 
@@ -134,7 +137,8 @@ export async function previewImageAction(fingerprint: string, action: "default" 
   if (useRealApi) {
     const targetVersion = currentResourceVersion ?? (await realRequest<ManagedImage>(`/images/${encodeURIComponent(fingerprint)}`)).resource_version;
     const path = action === "default" ? "/images/default/preview" : `/images/${fingerprint}/${action === "delete" ? "delete" : "retire"}/preview`;
-    return realRequest(path, { method: "POST", body: JSON.stringify({ fingerprint, target_version: targetVersion }) });
+    const body = action === "default" ? { fingerprint, target_version: targetVersion } : { target_version: targetVersion };
+    return realRequest(path, { method: "POST", body: JSON.stringify(body) });
   }
   const image = mockState.images.find((candidate) => candidate.fingerprint === fingerprint) ?? mockState.images[0];
   return delay({ target_version: image.resource_version, confirmation_token: `synthetic-confirmation-${createOperationId()}`, expires_at: "2026-01-15T10:25:00Z", impact: { summary_code: action === "delete" && image.references.active + image.references.cached > 0 ? "image_referenced" : "image_change_preview", affected_session_count: image.references.active, affected_image_references: image.references, changes: [{ code: action === "default" ? "new_sessions_use_image" : action === "retire" ? "new_selection_blocked" : "image_removed", count: null, value: image.version_label }] } });
@@ -143,7 +147,10 @@ export async function previewImageAction(fingerprint: string, action: "default" 
 export async function submitImageAction(fingerprint: string, action: "default" | "delete" | "retire", reason: string, preview: ActionPreview): Promise<Operation> {
   if (useRealApi) {
     const path = action === "default" ? "/images/default" : `/images/${fingerprint}/${action === "delete" ? "delete" : "retire"}`;
-    return realRequest(path, { method: "POST", body: JSON.stringify({ operation_id: createOperationId(), reason, target_version: preview.target_version, fingerprint, confirmation_token: preview.confirmation_token }) });
+    const body = action === "default"
+      ? { operation_id: createOperationId(), reason, target_version: preview.target_version, fingerprint, confirmation_token: preview.confirmation_token }
+      : { operation_id: createOperationId(), reason, target_version: preview.target_version, confirmation_token: preview.confirmation_token };
+    return realRequest(path, { method: "POST", body: JSON.stringify(body) });
   }
   return createMockOperation(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", { kind: "image", id: fingerprint }, reason);
 }

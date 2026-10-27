@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -49,6 +50,7 @@ type Authority struct {
 	ProductVersion string
 	Clock          func() time.Time
 	confirmations  *confirmationStore
+	uploadMu       sync.Mutex
 }
 
 func NewAuthority(options AuthorityOptions) (*Authority, error) {
@@ -206,7 +208,9 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 		"ct_cpu_capacity_vcpu":       observedNumber(numberValue(ctCPU["capacity_vcpu"]), now),
 		"logical_memory_remaining":   observedBytes(decimalBytes(numberValue(remaining["memory_mib"]), 1024*1024), now),
 		"ct_memory_available":        observedBytes(nil, now),
-		"physical_disk_available":    observedBytes(decimalBytes(numberValue(remaining["disk_gib"]), 1024*1024*1024), now),
+		// The logical admission budget is not physical disk telemetry. Keep the
+		// physical field unverified until the native snapshot supplies it.
+		"physical_disk_available": observedBytes(nil, now),
 	}
 	pressure := map[string]any{
 		"cpu_some_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "some", "avg10"), now),
@@ -383,7 +387,12 @@ func (authority *Authority) listImages(writer http.ResponseWriter, request *http
 	if exists {
 		defaultValue = defaultFingerprint
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(start, limit, end < len(images), end), "default_fingerprint": defaultValue, "selection_version": selectionVersion})
+	catalogVersion, err := authority.Management.ImageCatalogVersion(request.Context())
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "internal", ""))
+		return
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(start, limit, end < len(images), end), "default_fingerprint": defaultValue, "selection_version": selectionVersion, "catalog_version": catalogVersion})
 }
 
 func (authority *Authority) getImage(writer http.ResponseWriter, request *http.Request, fingerprint string) {
@@ -531,7 +540,7 @@ func (authority *Authority) getSystem(writer http.ResponseWriter, request *http.
 	now := authority.Clock().UTC().Format(time.RFC3339Nano)
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"product_version":    authority.ProductVersion,
-		"resource_version":   epoch,
+		"resource_version":   "system:" + epoch,
 		"state_capabilities": stateCapabilities,
 		"maintenance":        map[string]any{"draining": draining, "reconciliation_pending": reconciliation, "garbage_collection_pending": garbage},
 		"components": []any{
@@ -743,7 +752,9 @@ func (authority *Authority) startImageImport(writer http.ResponseWriter, request
 		return
 	}
 	if source.Kind == "trusted_remote" && operation.Status == "queued" {
-		operation, err = authority.Management.ProcessTrustedImport(request.Context(), operation.OperationID)
+		operationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		operation, err = authority.Management.ProcessTrustedImport(operationCtx, operation.OperationID)
 		if err != nil {
 			writeProblem(writer, problemFromError(err, "image_import", payload.OperationID))
 			return
@@ -753,6 +764,8 @@ func (authority *Authority) startImageImport(writer http.ResponseWriter, request
 }
 
 func (authority *Authority) uploadImageImport(writer http.ResponseWriter, request *http.Request, operationID, actor string) {
+	authority.uploadMu.Lock()
+	defer authority.uploadMu.Unlock()
 	if !authority.Config.Upload.Enabled {
 		writeProblem(writer, newAPIError("permission_denied", "local image uploads are disabled", http.StatusForbidden, "authorization", false, operationID))
 		return
@@ -793,10 +806,13 @@ func (authority *Authority) uploadImageImport(writer http.ResponseWriter, reques
 	}
 	metadata, rootfs, err := authority.stageUpload(request, source)
 	if err != nil {
+		_, _ = authority.Management.FailImageImportUpload(context.Background(), operationID, err)
 		writeProblem(writer, problemFromError(err, "upload", operationID))
 		return
 	}
-	result, err := authority.Management.UploadImageImport(request.Context(), operationID, metadata, rootfs)
+	operationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	result, err := authority.Management.UploadImageImport(operationCtx, operationID, metadata, rootfs)
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "image_import", operationID))
 		return

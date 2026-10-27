@@ -951,9 +951,10 @@ def _validate_state_compatibility(manifest: Mapping[str, Any], capabilities: Any
             _fail("state_compatibility_unverified", "target product manifest state compatibility is unreadable")
         supported = set(readable) & set(writable)
     elif manifest.get("format") == LEGACY_PRODUCT_MANIFEST_FORMAT:
-        # Format 3 predates the declaration field but its Go controller already
-        # implements the complete management state schema.
-        supported = set(STATE_CAPABILITY_MARKERS)
+        # Format 3 predates the management schema and can preserve only the
+        # legacy core state. It must never be allowed to activate over a
+        # database containing newer management capabilities.
+        supported = {STATE_CAPABILITY_MARKERS[0]}
     else:
         supported = {STATE_CAPABILITY_MARKERS[0]}
     for capability in capabilities:
@@ -973,6 +974,10 @@ def _read_live_state_capabilities() -> list[str]:
             rows = database.execute(
                 "SELECT name, version FROM state_capabilities ORDER BY name, version",
             ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower() and STATE_CAPABILITY_MARKERS:
+            return [STATE_CAPABILITY_MARKERS[0]]
+        _fail("state_compatibility_unverified", "live state capabilities could not be read")
     except (OSError, sqlite3.Error):
         _fail("state_compatibility_unverified", "live state capabilities could not be read")
     return [f"{name}@{version}" for name, version in rows]
@@ -1479,6 +1484,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                     _systemctl("stop", "agent-vm-native.service", allow_missing=True)
                 else:
                     old_manifest = load_release_manifest(old_current / MANIFEST_NAME)
+                    _validate_state_compatibility(old_manifest, _read_live_state_capabilities())
                     if _is_product_manifest(old_manifest):
                         snapshot = record.get("web_unit_enabled")
                         _activate_product_runtime(

@@ -48,10 +48,10 @@ export function ImagesPage() {
     },
     onError: (error) => setImportMessage(error instanceof Error ? error.message : t("errors.generic")),
   });
-  const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!), onSuccess: () => { setAction(null); setPreview(null); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); } });
+  const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!), onSuccess: () => { setAction(null); setPreview(null); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => setImportMessage(error instanceof Error ? error.message : t("errors.generic")) });
 
   const startImport = () => {
-    const targetVersion = query.data?.selection_version;
+    const targetVersion = query.data?.catalog_version;
     if (!reason.trim()) { setImportMessage(t("dialog.reasonRequired")); return; }
     if (!targetVersion) { setImportMessage(t("images.targetUnavailable")); return; }
     const operation_id = createOperationId();
@@ -76,7 +76,14 @@ export function ImagesPage() {
   const openAction = async (nextAction: ImageAction) => {
     if (!selected) return;
     setAction(nextAction);
-    setPreview(await previewImageAction(selected.fingerprint, nextAction, selected.resource_version));
+    const targetVersion = nextAction === "default" ? query.data?.selection_version : selected.resource_version;
+    if (!targetVersion) return;
+    try {
+      setPreview(await previewImageAction(selected.fingerprint, nextAction, targetVersion));
+    } catch (error) {
+      setAction(null);
+      setImportMessage(error instanceof Error ? error.message : t("errors.generic"));
+    }
   };
 
   return <div className="page-stack" data-testid="images-page">

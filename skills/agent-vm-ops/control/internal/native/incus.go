@@ -336,16 +336,30 @@ func (c *IncusClient) VerifyImage(ctx context.Context, fingerprint string, requi
 			returnErr = &UncertainError{Cause: errors.Join(returnErr, cleanupErr)}
 		}
 	}()
-	if err := c.InitVerification(ctx, fingerprint, name); err != nil {
+	verifyCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := c.InitVerification(verifyCtx, fingerprint, name); err != nil {
 		return ImageVerification{}, &UncertainError{Cause: err}
 	}
-	if err := c.Start(ctx, name); err != nil {
+	for _, limit := range []struct{ key, value string }{
+		{key: "limits.cpu", value: "1"},
+		{key: "limits.memory", value: "512MiB"},
+		{key: "limits.processes", value: "256"},
+	} {
+		if err := c.ConfigSet(verifyCtx, name, limit.key, limit.value); err != nil {
+			return ImageVerification{}, &UncertainError{Cause: err}
+		}
+	}
+	if err := c.DeviceSet(verifyCtx, name, "root", "size", "8GiB"); err != nil {
+		return ImageVerification{}, &UncertainError{Cause: err}
+	}
+	if err := c.Start(verifyCtx, name); err != nil {
 		return ImageVerification{}, &UncertainError{Cause: err}
 	}
 	tools := uniqueVerificationTools(requiredTools)
 	probeArgs := []string{"sh", "-c", verificationScript, "agent-vm-image-check"}
 	probeArgs = append(probeArgs, tools...)
-	result, err := c.Exec(ctx, name, probeArgs, nil)
+	result, err := c.Exec(verifyCtx, name, probeArgs, nil)
 	if err != nil {
 		return ImageVerification{}, &UncertainError{Cause: err}
 	}

@@ -60,5 +60,6 @@
     "next_cursor": null
   },
   "default_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-  "selection_version": "image-selection:revision-12"
+  "selection_version": "image-selection:revision-12",
+  "catalog_version": "image-catalog:revision-12"
 }
