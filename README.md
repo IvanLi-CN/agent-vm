@@ -49,6 +49,12 @@ environment. This design does not require KVM or `/dev/kvm`.
 - `docs/adr/` contains the accepted lifecycle, transport, recovery and runtime
   decisions.
 
+## Management console design
+
+The built-in Web management console is a design target and has not been implemented. Its scope covers managed images and existing Agent session VMs, with controlled maintenance and audit.
+
+Read [PRODUCT.md](PRODUCT.md) for confirmed product boundaries, [DESIGN.md](DESIGN.md) for the pre-implementation design seed, and the [Web surface brief](.impeccable/surfaces/web.md) for task flows and the selected workbench layout. The [decision memo](docs/proposals/agent-vm-web-console.md) records the source investigation and architecture rationale. Implementation is pending owner review of these documents.
+
 ## Local validation
 
 ```bash
