@@ -158,6 +158,19 @@ GO_FIXED_ARTIFACTS = frozenset({
     ("unit:agent-vm-native.service", "systemd/agent-vm-native.service", "unit", 0o644),
 })
 
+# Format 3 is the product identity.  The protocol-4 release_id field is not
+# published in this format; readers derive that compatibility identity from
+# source_revision when talking to older protocol peers.
+PRODUCT_MANIFEST_FORMAT = 3
+PRODUCT_BUN_TOOLCHAIN = "1.4.4"
+PRODUCT_GO_TOOLCHAIN = "go1.27.3"
+SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$")
+PRODUCT_CLIENT_ARTIFACTS = frozenset({
+    ("agent_vm.ts", "agent_vm.ts", "client", 0o755),
+    *( (name, name, "support", mode) for name, mode in CLIENT_DEPENDENCY_MODES.items() ),
+})
+PRODUCT_LINUX_ARTIFACTS = GO_FIXED_ARTIFACTS
+
 
 class ManifestError(Exception):
     """A fail-closed manifest or artifact validation error."""
@@ -573,6 +586,67 @@ def validate_go_manifest(value: Any) -> dict[str, Any]:
     }
 
 
+def validate_product_manifest(value: Any) -> dict[str, Any]:
+    """Validate the SemVer product manifest without executing its artifacts."""
+    root = _require_mapping(value, "manifest")
+    required = {"format", "version", "source_revision", "protocol", "target", "toolchain", "artifacts", "actions", "client_view"}
+    if set(root) != required:
+        raise _error("manifest_invalid", "product manifest has an unexpected shape", {"fields": sorted(set(root) ^ required)})
+    if _require_int(root["format"], "format", 1) != PRODUCT_MANIFEST_FORMAT:
+        raise _error("manifest_format_unsupported", "manifest format must be 3")
+    version = _require_string(root["version"], "version")
+    if SEMVER_RE.fullmatch(version) is None:
+        raise _error("manifest_invalid", "product version must be valid SemVer 2.0.0")
+    source_revision = _require_string(root["source_revision"], "source_revision", SOURCE_REVISION_RE)
+    if _require_int(root["protocol"], "protocol", 1) != PROTOCOL_VERSION:
+        raise _error("protocol_unsupported", f"manifest protocol must be {PROTOCOL_VERSION}")
+    target = _require_mapping(root["target"], "target")
+    if set(target) != {"os", "arch"} or not ((target["os"] == "source" and target["arch"] == "any") or (target["os"] == "linux" and target["arch"] in {"amd64", "arm64"})):
+        raise _error("manifest_invalid", "target must be source/any or linux/amd64 or linux/arm64")
+    toolchain = _require_mapping(root["toolchain"], "toolchain")
+    if set(toolchain) != {"bun", "go", "cgo_enabled"} or toolchain["bun"] != PRODUCT_BUN_TOOLCHAIN or toolchain["go"] != PRODUCT_GO_TOOLCHAIN or toolchain["cgo_enabled"] is not False:
+        raise _error("manifest_invalid", "product toolchain declaration is invalid")
+
+    raw_artifacts = root["artifacts"]
+    expected_artifacts = PRODUCT_CLIENT_ARTIFACTS if target["os"] == "source" else PRODUCT_LINUX_ARTIFACTS
+    if not isinstance(raw_artifacts, list) or len(raw_artifacts) != len(expected_artifacts):
+        raise _error("manifest_artifact_set_invalid", "product artifact set is incomplete")
+    artifacts: list[dict[str, Any]] = []
+    names: set[str] = set()
+    paths: set[str] = set()
+    for index, raw in enumerate(raw_artifacts):
+        item = _go_artifact(raw, index)
+        if item["path"] in {MANIFEST_NAME, CLIENT_SIDECAR_NAME} or item["name"] in names or item["path"] in paths:
+            raise _error("manifest_invalid", "product artifact names and paths must be unique and cannot self-reference")
+        names.add(item["name"])
+        paths.add(item["path"])
+        artifacts.append(item)
+    actual_shape = {(item["name"], item["path"], item["role"], item["mode"]) for item in artifacts}
+    if actual_shape != expected_artifacts:
+        raise _error("manifest_artifact_set_invalid", "product artifact set differs from the fixed target allowlist", {"expected": sorted(expected_artifacts), "actual": sorted(actual_shape)})
+
+    actions = _validate_go_actions(root["actions"])
+    client_view = _require_mapping(root["client_view"], "client_view")
+    if set(client_view) != {"version", "source_revision", "protocol", "transport", "actions"}:
+        raise _error("manifest_invalid", "product client_view has an unexpected shape")
+    transport = client_view["transport"]
+    if client_view["version"] != version or client_view["source_revision"] != source_revision or _require_int(client_view["protocol"], "client_view.protocol", 1) != PROTOCOL_VERSION or transport not in GO_CLIENT_TRANSPORTS:
+        raise _error("manifest_invalid", "product client_view identity or transport is invalid")
+    if json.dumps(client_view["actions"], sort_keys=True, separators=(",", ":")) != json.dumps(actions, sort_keys=True, separators=(",", ":")):
+        raise _error("manifest_invalid", "product client_view actions differ from manifest actions")
+    return {
+        "format": PRODUCT_MANIFEST_FORMAT,
+        "version": version,
+        "source_revision": source_revision,
+        "protocol": PROTOCOL_VERSION,
+        "target": {"os": target["os"], "arch": target["arch"]},
+        "toolchain": {"bun": PRODUCT_BUN_TOOLCHAIN, "go": PRODUCT_GO_TOOLCHAIN, "cgo_enabled": False},
+        "artifacts": artifacts,
+        "actions": actions,
+        "client_view": {"version": version, "source_revision": source_revision, "protocol": PROTOCOL_VERSION, "transport": transport, "actions": actions},
+    }
+
+
 def build_go_manifest(
     source_revision: str,
     artifacts: list[Mapping[str, Any]],
@@ -628,6 +702,8 @@ def load_release_manifest(path: Path) -> dict[str, Any]:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise _error("manifest_invalid", "release manifest is not valid UTF-8 JSON") from exc
+    if isinstance(value, Mapping) and value.get("format") == PRODUCT_MANIFEST_FORMAT:
+        return validate_product_manifest(value)
     if isinstance(value, Mapping) and value.get("format") == GO_MANIFEST_FORMAT:
         return validate_go_manifest(value)
     return validate_manifest(value)
@@ -635,6 +711,8 @@ def load_release_manifest(path: Path) -> dict[str, Any]:
 
 def validate_release_manifest(value: Any) -> dict[str, Any]:
     """Validate either supported release format without executing artifacts."""
+    if isinstance(value, Mapping) and value.get("format") == PRODUCT_MANIFEST_FORMAT:
+        return validate_product_manifest(value)
     if isinstance(value, Mapping) and value.get("format") == GO_MANIFEST_FORMAT:
         return validate_go_manifest(value)
     return validate_manifest(value)
@@ -687,7 +765,10 @@ def verify_bundle(root: Path, manifest: Mapping[str, Any] | None = None) -> dict
     root = root.resolve()
     if not root.is_dir():
         raise _error("bundle_invalid", "bundle root is not a directory")
-    checked = validate_manifest(manifest if manifest is not None else load_manifest(root / MANIFEST_NAME))
+    candidate = manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME)
+    if candidate.get("format") == PRODUCT_MANIFEST_FORMAT:
+        return verify_product_bundle(root, candidate)
+    checked = validate_manifest(candidate)
     for item in checked["artifacts"]:
         _verify_artifact_file(_resolve_regular(root, item["path"]), item)
     return checked
@@ -699,6 +780,20 @@ def verify_go_bundle(root: Path, manifest: Mapping[str, Any] | None = None) -> d
     if not root.is_dir():
         raise _error("bundle_invalid", "bundle root is not a directory")
     checked = validate_go_manifest(manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME))
+    for item in checked["artifacts"]:
+        artifact = _resolve_regular(root, item["path"])
+        _verify_artifact_file(artifact, item)
+        if item["path"] == "bin/agent-vm-control":
+            _verify_elf_target(artifact, checked["target"])
+    return checked
+
+
+def verify_product_bundle(root: Path, manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Verify format-3 artifact bytes, modes, and target ELF headers."""
+    root = root.resolve()
+    if not root.is_dir():
+        raise _error("bundle_invalid", "bundle root is not a directory")
+    checked = validate_product_manifest(manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME))
     for item in checked["artifacts"]:
         artifact = _resolve_regular(root, item["path"])
         _verify_artifact_file(artifact, item)
@@ -746,7 +841,7 @@ def _verify_artifact_file(path: Path, item: Mapping[str, Any]) -> None:
 
 def verify_runtime_bundle(manifest: Mapping[str, Any], artifact_paths: Mapping[str, Path]) -> dict[str, Any]:
     """Verify installed artifacts whose runtime paths differ from bundle paths."""
-    checked = validate_manifest(manifest)
+    checked = validate_release_manifest(manifest)
     for item in checked["artifacts"]:
         path = artifact_paths.get(item["path"])
         if path is None:
@@ -767,13 +862,32 @@ def verify_client_sidecar(root: Path, manifest: Mapping[str, Any] | None = None)
         raise _error("client_sidecar_invalid", "client sidecar is not valid UTF-8 JSON") from exc
     if not isinstance(value, Mapping):
         raise _error("client_sidecar_invalid", "client sidecar root must be an object")
-    expected_keys = {"format", "release_id", "source_revision", "protocol", "client_artifact", "client_dependencies", "client_view"}
+    expected_keys = ({"format", "version", "source_revision", "protocol", "client_artifact", "client_dependencies", "client_view"}
+                     if checked["format"] == PRODUCT_MANIFEST_FORMAT
+                     else {"format", "release_id", "source_revision", "protocol", "client_artifact", "client_dependencies", "client_view"})
     if set(value) != expected_keys:
         raise _error("client_sidecar_invalid", "client sidecar has an unexpected shape")
     def same_json(left: Any, right: Any) -> bool:
         # Python equality alone accepts True == 1 and 493.0 == 493. The Bun
         # readers preserve JSON numeric token types; publication must agree.
         return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
+    if checked["format"] == PRODUCT_MANIFEST_FORMAT:
+        if type(value["format"]) is not int or type(value["protocol"]) is not int or value["format"] != PRODUCT_MANIFEST_FORMAT or value["version"] != checked["version"] or value["source_revision"] != checked["source_revision"] or value["protocol"] != checked["protocol"]:
+            raise _error("client_sidecar_invalid", "format-3 client sidecar identity does not match manifest")
+        client_artifacts = [item for item in checked["artifacts"] if item["role"] == "client"]
+        if len(client_artifacts) != 1 or not same_json(value["client_artifact"], client_artifacts[0]):
+            raise _error("client_sidecar_invalid", "client sidecar artifact does not match manifest")
+        expected_dependencies = [item for item in checked["artifacts"] if item["path"] in CLIENT_DEPENDENCY_MODES]
+        dependencies = value["client_dependencies"]
+        if (not isinstance(dependencies, list) or len(dependencies) != len(CLIENT_DEPENDENCY_MODES)
+                or not same_json(sorted(dependencies, key=lambda item: str(item.get("path", "")) if isinstance(item, dict) else ""),
+                                 sorted(expected_dependencies, key=lambda item: item["path"]))):
+            raise _error("client_sidecar_invalid", "client sidecar dependencies do not match the complete package")
+        if not same_json(value["client_view"], checked["client_view"]):
+            raise _error("client_sidecar_invalid", "client sidecar view does not match manifest")
+        for item in [client_artifacts[0], *expected_dependencies]:
+            _verify_artifact_file(_resolve_regular(root, item["path"]), item)
+        return checked
     if type(value["format"]) is not int or type(value["protocol"]) is not int or value["format"] != checked["format"] or value["release_id"] != checked["release_id"] or value["source_revision"] != checked["source_revision"] or value["protocol"] != checked["protocol"]:
         raise _error("client_sidecar_invalid", "client sidecar identity does not match manifest")
     client_artifacts = [item for item in checked["artifacts"] if item["role"] == "client"]
@@ -793,7 +907,7 @@ def verify_client_sidecar(root: Path, manifest: Mapping[str, Any] | None = None)
 
 
 def compatibility_for(manifest: Mapping[str, Any], action: str) -> dict[str, Any]:
-    checked = validate_manifest(manifest)
+    checked = validate_release_manifest(manifest)
     if action not in checked["actions"]:
         raise _error("unknown_action", f"action is not declared in the release manifest: {action}")
     spec = checked["actions"][action]
@@ -841,7 +955,8 @@ def check_compatibility(
     peer: Mapping[str, Any] | None,
 ) -> list[dict[str, Any]]:
     """Validate a peer capability before any journal or native side effect."""
-    checked = validate_manifest(manifest)
+    checked = validate_release_manifest(manifest)
+    local_release = checked["source_revision"] if checked["format"] == PRODUCT_MANIFEST_FORMAT else checked["release_id"]
     local = compatibility_for(checked, action)
     if peer is None:
         return [warning("legacy_compatibility", action, "peer omitted release capability; using legacy protocol-4 compatibility")]
@@ -870,9 +985,9 @@ def check_compatibility(
         raise _error("compatibility_invalid", "compatibility.release_id must be a string")
     if peer_release != LEGACY_RELEASE_ID and RELEASE_ID_RE.fullmatch(peer_release) is None:
         raise _error("compatibility_invalid", "compatibility.release_id must be a Git revision or legacy-protocol-4")
-    if peer_release == checked["release_id"]:
+    if peer_release == local_release:
         return []
-    return [warning("compatible_release", action, "peer release differs but the requested operation is explicitly compatible", {"peer_release": peer_release, "control_release": checked["release_id"]})]
+    return [warning("compatible_release", action, "peer release differs but the requested operation is explicitly compatible", {"peer_release": peer_release, "control_release": local_release})]
 
 
 def manifest_metadata(manifest: Mapping[str, Any] | None, *, present: bool, verified: bool, legacy: bool = False) -> dict[str, Any]:
@@ -884,7 +999,16 @@ def manifest_metadata(manifest: Mapping[str, Any] | None, *, present: bool, veri
             "manifest_present": present,
             "artifacts_verified": verified,
         }
-    checked = validate_manifest(manifest)
+    checked = validate_release_manifest(manifest)
+    if checked["format"] == PRODUCT_MANIFEST_FORMAT:
+        return {
+            "release_id": checked["source_revision"],
+            "source_revision": checked["source_revision"],
+            "version": checked["version"],
+            "protocol": checked["protocol"],
+            "manifest_present": present,
+            "artifacts_verified": verified,
+        }
     return {
         "release_id": checked["release_id"],
         "source_revision": checked["source_revision"],
@@ -904,5 +1028,5 @@ def load_runtime_manifest(path: Path) -> tuple[dict[str, Any] | None, bool, bool
         raise _error("manifest_unverified", "release manifest cannot be inspected") from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise _error("manifest_unverified", "release manifest is not a regular file")
-    manifest = load_manifest(path)
+    manifest = load_release_manifest(path)
     return manifest, True, True, []

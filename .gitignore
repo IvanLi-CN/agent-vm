@@ -32,3 +32,4 @@ coverage/
 reports/
 artifacts/
 tmp/
+release-state/

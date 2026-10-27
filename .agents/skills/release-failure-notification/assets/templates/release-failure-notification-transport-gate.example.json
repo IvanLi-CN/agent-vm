@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "transport_selection": {
+    "selection_required_before_rollout": true,
+    "accepted_selection_evidence": [
+      "checked-in-project-contract",
+      "explicit-owner-decision"
+    ],
+    "required_record": [
+      "selection_evidence",
+      "transport_owner",
+      "configuration_owner",
+      "required_secrets"
+    ],
+    "when_unselected": "block-rollout",
+    "implicit_external_notifier": "forbidden",
+    "missing_selected_configuration": "fail"
+  }
+}

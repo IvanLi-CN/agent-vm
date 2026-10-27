@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "kind": "version-impact-record",
+  "usage": {
+    "scope": "optional-compatibility-governance",
+    "required_for_manual_release": false,
+    "per_pr_release_evidence": false,
+    "target_selection": "out-of-scope"
+  },
+  "change": {
+    "description": "<change description>",
+    "affected_contracts": ["public-api", "persistent-state"]
+  },
+  "classification": {
+    "allowed_impacts": ["patch", "minor", "major"],
+    "planned": {"impact": "patch", "reasoning": "<planned compatibility rationale>", "evidence": []},
+    "current": {"impact": "patch", "scope_drift": {"detected": false, "description": "<none or describe drift>"}, "reasoning": "<current compatibility rationale>", "evidence": []},
+    "verified": {"impact": "patch", "reasoning": "<verified compatibility rationale>", "evidence": []}
+  },
+  "compatibility_evidence": {
+    "public_api": {"change": "<none, compatible, or breaking>", "supported_consumer_range": "<supported range>", "evidence": []},
+    "persistent_state": {"applicable": false, "state_description": "<state or not applicable>", "source_program_compatibility_range": "<evaluated range>", "evidence": []}
+  }
+}

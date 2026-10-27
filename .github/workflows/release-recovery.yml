@@ -1,0 +1,67 @@
+name: Release recovery
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: recover or abandon a previously claimed reservation
+        required: true
+        type: choice
+        options: [recover, abandon]
+      reservation:
+        description: exact SemVer reservation identity
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  # queue: max; recovery shares the product release namespace and is non-preemptive.
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  recovery:
+    name: Release recovery
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Install locked Bun dependencies
+        run: bun install --frozen-lockfile
+      - name: Retrieve reservation state from a prior release run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESERVATION: ${{ inputs.reservation }}
+        run: |
+          set -eu
+          if [ "${{ inputs.operation }}" != "recover" ]; then
+            exit 0
+          fi
+          mkdir -p .recovery
+          found=""
+          for run_id in $(gh run list --workflow Release --limit 50 --json databaseId --jq '.[].databaseId'); do
+            run_root=".recovery/${run_id}"
+            mkdir -p "$run_root"
+            gh run download "$run_id" --name "release-state-${run_id}" --dir "$run_root" || true
+            candidate="$(find "$run_root" -type f -name "${RESERVATION}.jsonl" -print -quit)"
+            if [ -n "$candidate" ]; then
+              mkdir -p release-state
+              cp -R "$(dirname "$candidate")/." release-state/
+              found="$candidate"
+              break
+            fi
+          done
+          if [ -z "$found" ]; then
+            echo "no local release-state artifact found; recovery will use the authoritative GitHub state ref" >&2
+          fi
+      - name: Apply recovery operation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun run skills/agent-vm-ops/scripts/release.ts --operation "${{ inputs.operation }}" --reservation "${{ inputs.reservation }}"

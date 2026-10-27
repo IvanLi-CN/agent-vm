@@ -128,7 +128,7 @@ func serve(args []string) error {
 			}
 		}
 		releaseMetadata = &protocol.ReleaseMetadata{
-			ReleaseID: release.ReleaseID, SourceRevision: release.SourceRevision, Protocol: release.Protocol,
+			Version: release.Version, ReleaseID: release.ReleaseID, SourceRevision: release.SourceRevision, Protocol: release.Protocol,
 			Transport: release.Transport, ManifestPresent: release.ManifestPresent, ArtifactsVerified: release.ArtifactsVerified,
 			Actions: actions,
 		}

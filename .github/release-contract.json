@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "product": {
+    "name": "agent-vm",
+    "versioning": "semver-2.0.0",
+    "first_public_version": "1.0.0",
+    "components": ["client", "control-service", "compatibility-bridge", "systemd-assets"],
+    "shared_product_version": true,
+    "protocol_version": 4,
+    "manifest_format": 3,
+    "legacy_read_formats": [1, 2],
+    "legacy_write_formats": [],
+    "source_identity": "source_revision",
+    "protocol_compatibility_identity": "source_revision"
+  },
+  "release_entrypoint": {
+    "mode": "manual",
+    "workflow": "Release",
+    "input": "target",
+    "allowed_symbolic_targets": ["patch", "minor", "major"],
+    "explicit_targets_allow_prerelease": true,
+    "requires_trusted_final_baseline": true,
+    "first_release_requires": "1.0.0",
+    "source": "validated-main-head",
+    "automatic_pr_on_merge": false
+  },
+  "identity_and_recovery": {
+    "claim_before_freeze": true,
+    "state": "append-only",
+    "recovery_operations": ["recover", "abandon"],
+    "recovery_reuses_identity": true,
+    "recovery_may_reselect_version": false,
+    "recovery_may_reselect_source": false,
+    "artifact_overwrite": false,
+    "publish_completion": "github-release-and-versioned-assets-verified"
+  },
+  "toolchain": {
+    "bun": "1.4.4",
+    "go": "go1.27.3",
+    "cgo_enabled": false,
+    "targets": ["linux/amd64", "linux/arm64"]
+  },
+  "deployment_boundary": {
+    "automatic_deploy": false,
+    "native_install_validation": "conditional-on-incus-systemd-deployment-boundary",
+    "this_change_runs_native_install": false
+  },
+  "platform_preconditions": {
+    "protected_main_required": true,
+    "required_main_check": "Main gate",
+    "status": "audit-required"
+  }
+}

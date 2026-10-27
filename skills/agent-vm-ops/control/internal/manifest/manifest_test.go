@@ -73,6 +73,57 @@ func validManifest(t *testing.T) (string, string) {
 	return manifestPath, filepath.Join(root, "byte-fs.ts")
 }
 
+func validProductManifest(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	artifacts := make([]any, 0, len(fixedArtifacts))
+	for _, expected := range fixedArtifacts {
+		path := filepath.Join(root, filepath.FromSlash(expected.path))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		data := []byte("product-artifact:" + expected.path)
+		if expected.path == "bin/agent-vm-control" {
+			data = make([]byte, 20)
+			copy(data, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+			machine := uint16(62)
+			if runtime.GOARCH == "arm64" {
+				machine = 183
+			}
+			binary.LittleEndian.PutUint16(data[18:], machine)
+		}
+		if err := os.WriteFile(path, data, os.FileMode(expected.mode)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, os.FileMode(expected.mode)); err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(data)
+		artifacts = append(artifacts, map[string]any{"name": expected.name, "path": expected.path, "role": expected.role, "sha256": hex.EncodeToString(digest[:]), "mode": expected.mode})
+	}
+	actions := make(map[string]any, len(actionNames))
+	for _, action := range actionNames {
+		actions[action] = operationSpec()
+	}
+	rootValue := map[string]any{
+		"format": 3, "version": "1.0.0", "source_revision": strings.Repeat("b", 40), "protocol": 4,
+		"target":      map[string]any{"os": "linux", "arch": runtime.GOARCH},
+		"toolchain":   map[string]any{"bun": "1.4.4", "go": GoToolchain, "cgo_enabled": false},
+		"artifacts":   artifacts,
+		"actions":     actions,
+		"client_view": map[string]any{"version": "1.0.0", "source_revision": strings.Repeat("b", 40), "protocol": 4, "transport": "go-request", "actions": actions},
+	}
+	manifestPath := filepath.Join(root, "release-manifest.json")
+	encoded, err := json.Marshal(rootValue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, append(encoded, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return manifestPath
+}
+
 func TestLoadVerifiesCompleteGoBundle(t *testing.T) {
 	manifestPath, _ := validManifest(t)
 	if err := Load(manifestPath); err != nil {
@@ -102,5 +153,15 @@ func TestLoadRejectsChangedArtifactBytes(t *testing.T) {
 	}
 	if err := Load(manifestPath); err == nil || !strings.Contains(err.Error(), "artifact_checksum_mismatch") {
 		t.Fatalf("tampered manifest error = %v", err)
+	}
+}
+
+func TestLoadVerifiesProductManifest(t *testing.T) {
+	metadata, err := LoadMetadata(validProductManifest(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Version != "1.0.0" || metadata.ReleaseID != strings.Repeat("b", 40) || metadata.SourceRevision != strings.Repeat("b", 40) {
+		t.Fatalf("product metadata identity = %#v", metadata)
 	}
 }
