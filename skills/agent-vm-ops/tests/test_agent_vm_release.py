@@ -24,7 +24,8 @@ import release_manifest as MANIFEST  # noqa: E402
 class FakeTransport:
     def __init__(self, *, fail_health_once=False, pending=False, drain_enter=True, unknown_state=False,
                  observation_consistent=True, legacy_metrics=False, malformed_health=False, malformed_reconcile=False, malformed_rollback=False,
-                 fail_activation=False, require_legacy_drain_exit=False):
+                 fail_activation=False, require_legacy_drain_exit=False, missing_pending_operations=False,
+                 fail_health_persistent=False):
         self.calls = []
         self.fail_health_once = fail_health_once
         self.pending = pending
@@ -37,6 +38,8 @@ class FakeTransport:
         self.malformed_rollback = malformed_rollback
         self.fail_activation = fail_activation
         self.require_legacy_drain_exit = require_legacy_drain_exit
+        self.missing_pending_operations = missing_pending_operations
+        self.fail_health_persistent = fail_health_persistent
         self.control_release_ids = []
         self.health_checks = 0
 
@@ -47,6 +50,8 @@ class FakeTransport:
                 return {"ok": False, "error": {"code": "activation_failed", "message": "injected"}}
             return {"ok": True, "result": {"activated": True, "release_id": release_id}}
         if action == "rollback":
+            self.fail_health_persistent = False
+            self.fail_health_once = False
             if self.malformed_rollback:
                 return {"ok": True, "result": {"rolled_back": True, "release_id": release_id,
                                                   "previous_release_id": release_id}}
@@ -72,9 +77,10 @@ class FakeTransport:
             result = {
                 "up": True,
                 "draining": True,
-                "pending_operations": [{"operation_id": "pending"}] if self.pending else [],
                 "task_states": {"unknown": 1} if self.unknown_state else {"active": 1},
             }
+            if not self.missing_pending_operations:
+                result["pending_operations"] = [{"operation_id": "pending"}] if self.pending else []
             if not self.legacy_metrics:
                 result["observation_consistent"] = self.observation_consistent
             if self.malformed_health:
@@ -82,7 +88,7 @@ class FakeTransport:
             return {"ok": True, "result": result}
         if action == "doctor":
             self.health_checks += 1
-            ready = not self.fail_health_once or self.health_checks > 1
+            ready = not self.fail_health_persistent and (not self.fail_health_once or self.health_checks > 1)
             result = {"ready": ready, "issues": [] if ready else ["injected"]}
             if self.malformed_health:
                 result["ready"] = "true"
@@ -447,6 +453,17 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(result["pending_operations"], [])
         self.assertNotIn("activate", [item[1] for item in transport.calls])
 
+    def test_convergence_accepts_legacy_metrics_without_pending_operations(self):
+        transport = FakeTransport(missing_pending_operations=True)
+        publisher = self.publisher(transport)
+        temporary, _, manifest = RELEASE._open_bundle(self.bundle)
+        try:
+            result = publisher._wait_for_convergence(manifest, timeout=5, poll=1)
+        finally:
+            temporary.cleanup()
+        self.assertNotIn("pending_operations", result)
+        self.assertNotIn("activate", [item[1] for item in transport.calls])
+
     def test_health_requires_observation_for_candidates_but_allows_legacy_rollback(self):
         transport = FakeTransport(legacy_metrics=True)
         publisher = self.publisher(transport)
@@ -462,8 +479,22 @@ class ReleasePublisherTests(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_publish_waits_for_candidate_startup_readiness(self):
+        transport = FakeTransport(fail_health_once=True)
+        result = self.publisher(transport).publish(timeout=5, poll=1, transaction_id="tx-startup-wait")
+        self.assertTrue(result["published"])
+
+    def test_legacy_rollback_health_allows_missing_pending_operations(self):
+        transport = FakeTransport(legacy_metrics=True, missing_pending_operations=True)
+        publisher = self.publisher(transport)
+        temporary, _, _ = RELEASE._open_bundle(self.bundle)
+        try:
+            publisher._wait_for_health(RELEASE.legacy_manifest(), allow_legacy_observation=True)
+        finally:
+            temporary.cleanup()
+
     def test_post_activation_health_failure_attempts_one_rollback(self):
-        transport = FakeTransport(fail_health_once=True, require_legacy_drain_exit=True)
+        transport = FakeTransport(fail_health_persistent=True, require_legacy_drain_exit=True)
         target = self.root / "client" / "agent_vm.ts"
         result = self.publisher(transport, client_target=target).publish(timeout=5, poll=1, transaction_id="tx-rollback")
         self.assertTrue(result["rolled_back"])
@@ -474,7 +505,7 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(transport.control_release_ids[-1], ("drain-exit", "0" * 40))
 
     def test_post_activation_health_failure_rejects_unverified_rollback(self):
-        transport = FakeTransport(fail_health_once=True, malformed_rollback=True)
+        transport = FakeTransport(fail_health_persistent=True, malformed_rollback=True)
         with self.assertRaises(RELEASE.ReleaseError) as failure:
             self.publisher(transport).publish(timeout=5, poll=1, transaction_id="tx-bad-rollback")
         self.assertEqual(failure.exception.code, "rollback_failed")

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -531,6 +532,9 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 		if err := s.recoverPending(ctx, pending); err != nil {
 			return err
 		}
+		if err := s.reconcileOrphanedAcquireOperations(ctx, pending); err != nil {
+			return err
+		}
 		pending, err = s.Store.PendingOperations(ctx)
 		if err != nil {
 			return s.sqliteError(err)
@@ -540,6 +544,85 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 		return protocol.NewError("startup_reconcile_required", "pending operations require explicit recovery before admission", map[string]any{"count": len(pending), "admission_ready": false})
 	}
 	return s.verifyResidentNativeState(ctx)
+}
+
+// reconcileOrphanedAcquireOperations closes the narrow crash window where a
+// native acquire was journaled but the durable task was never committed. The
+// native identity must be explicitly verified missing before the operation can
+// be finalized; every other result remains fail-closed for operator recovery.
+func (s *Service) reconcileOrphanedAcquireOperations(ctx context.Context, pending []state.Operation) error {
+	if s.Guest == nil {
+		return protocol.NewError("startup_reconcile_required", "pending acquire operations cannot be reconciled without native access", map[string]any{"admission_ready": false})
+	}
+	for _, operation := range pending {
+		if operation.Action != "acquire" || operation.SessionID == nil || operation.Generation == nil {
+			continue
+		}
+		task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
+		if err != nil {
+			return s.sqliteError(err)
+		}
+		if task != nil && task.State != stateAbsent && task.State != stateCached {
+			continue
+		}
+		digest := stringValue(operation.Response["_request_digest"])
+		if digest == "" {
+			return protocol.NewError("startup_reconcile_required", "orphaned acquire operation is missing its request digest", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+		}
+		if task != nil && task.State == stateCached {
+			if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr != nil {
+				return protocol.NewError("startup_reconcile_required", "cached task ownership could not be verified while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": ownershipErr.Error()})
+			}
+			statusCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+			status, statusErr := s.Guest.Status(statusCtx, task.InstanceName)
+			cancel()
+			if statusErr != nil {
+				return protocol.NewError("startup_reconcile_required", "cached task status could not be verified while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": statusErr.Error()})
+			}
+			stateValue, parseErr := native.ParseStatus(status)
+			if parseErr != nil || !strings.EqualFold(stateValue, "stopped") {
+				if parseErr != nil {
+					return protocol.NewError("startup_reconcile_required", "cached task status is malformed while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": parseErr.Error()})
+				}
+				return protocol.NewError("startup_reconcile_required", "cached task is not stopped while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "status": stateValue})
+			}
+			response := map[string]any{
+				"outcome": "error",
+				"error": protocol.NewError("lease_released", "the lease was released before the acquire operation was acknowledged", map[string]any{
+					"task_id": task.TaskID, "task_generation": task.Generation, "outcome_verified": true,
+				}),
+				"_request_digest": digest,
+			}
+			if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+				return s.sqliteError(err)
+			}
+			continue
+		}
+		instanceName := "agent-vm-" + taskID(*operation.SessionID)
+		if task != nil && task.InstanceName != "" {
+			instanceName = task.InstanceName
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+		_, configErr := s.Guest.Config(checkCtx, instanceName)
+		cancel()
+		if configErr == nil {
+			return protocol.NewError("startup_reconcile_required", "orphaned acquire still has a native instance without durable task state", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false})
+		}
+		if !native.IsNotFound(configErr) {
+			return protocol.NewError("startup_reconcile_required", "orphaned acquire native outcome could not be verified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": configErr.Error()})
+		}
+		response := map[string]any{
+			"outcome": "error",
+			"error": protocol.NewError("acquire_partial", "native initialization did not complete", map[string]any{
+				"phase": "native-init", "operation_phase": "native-init", "native_init_recovered_absent": true, "outcome_verified": true,
+			}),
+			"_request_digest": digest,
+		}
+		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+			return s.sqliteError(err)
+		}
+	}
+	return nil
 }
 
 // verifyResidentNativeState prevents a durable active or cached task from
@@ -667,7 +750,14 @@ func (s *Service) status(ctx context.Context, session string) (map[string]any, e
 		return nil, s.sqliteError(err)
 	}
 	if task == nil {
-		return map[string]any{"state": stateAbsent, "session_id": session, "effective_lease": false}, nil
+		return map[string]any{
+			"state":           stateAbsent,
+			"session_id":      session,
+			"generation":      int64(0),
+			"effective_lease": false,
+			"native_status":   stateAbsent,
+			"guest_available": false,
+		}, nil
 	}
 	return s.summary(ctx, task)
 }
@@ -755,6 +845,16 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	if s.Guest != nil {
 		nativeCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 		defer cancel()
+		if task.VMIP == nil {
+			ip, allocationErr := s.allocateGuestIP(nativeCtx, task.InstanceName)
+			if allocationErr != nil {
+				return s.failTask(ctx, task, "native-network", allocationErr)
+			}
+			task.VMIP = &ip
+			if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"vm_ip": ip, "updated_at": nowString(s.Clock())}); err != nil {
+				return nil, s.sqliteError(err)
+			}
+		}
 		if created {
 			if err := s.Guest.Init(nativeCtx, s.Config.ImageAlias, task.InstanceName); err != nil {
 				return s.failTask(ctx, task, "native-init", err)
@@ -762,6 +862,9 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		}
 		if err := s.setOwnership(nativeCtx, task); err != nil {
 			return s.failTask(ctx, task, "native-ownership", err)
+		}
+		if err := s.configureNetwork(nativeCtx, task); err != nil {
+			return s.failTask(ctx, task, "native-network", err)
 		}
 		if err := s.Guest.ConfigSet(nativeCtx, task.InstanceName, "limits.cpu", strconv.FormatInt(resources["cpu"], 10)); err != nil {
 			return s.failTask(ctx, task, "native-config", err)
@@ -775,23 +878,15 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if err := s.Guest.Start(nativeCtx, task.InstanceName); err != nil {
 			return s.failTask(ctx, task, "native-start", err)
 		}
-		status, statusErr := s.Guest.Status(nativeCtx, task.InstanceName)
-		if statusErr != nil {
-			return s.failTask(ctx, task, "guest-readiness", statusErr)
+		ip, readinessErr := waitForGuestReady(nativeCtx, s.Guest, task.InstanceName)
+		if readinessErr != nil {
+			return s.failTask(ctx, task, "guest-readiness", readinessErr)
 		}
-		if value, parseErr := native.ParseStatus(status); parseErr != nil || !strings.EqualFold(value, "running") {
-			if parseErr != nil {
-				return s.failTask(ctx, task, "guest-readiness", parseErr)
-			}
-			return s.failTask(ctx, task, "guest-readiness", fmt.Errorf("guest status is %s", value))
+		if ip != *task.VMIP {
+			return s.failTask(ctx, task, "guest-readiness", protocol.NewError("guest_ip_mismatch", "guest IPv4 address does not match the allocated fixed address", map[string]any{"expected": *task.VMIP, "actual": ip}))
 		}
-		if ip := guestIPv4(status); ip != "" {
-			task.VMIP = &ip
-			if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"vm_ip": ip, "updated_at": nowString(s.Clock())}); err != nil {
-				return nil, s.sqliteError(err)
-			}
-		} else {
-			return s.failTask(ctx, task, "guest-readiness", errors.New("guest did not report an IPv4 address"))
+		if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"vm_ip": ip, "updated_at": nowString(s.Clock())}); err != nil {
+			return nil, s.sqliteError(err)
 		}
 		if err := s.exposeSSH(ctx, task, request, nativeCtx); err != nil {
 			return s.failTask(ctx, task, "access-exposure", err)
@@ -849,6 +944,11 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	task, err := s.task(ctx, request)
 	if err != nil {
 		return nil, err
+	}
+	if destroy {
+		if err := s.cancelPendingAcquireOperations(ctx, task); err != nil {
+			return nil, err
+		}
 	}
 	if task.State == stateAbsent {
 		if err := s.cancelPendingAcquireOperations(ctx, task); err != nil {
@@ -912,8 +1012,18 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	if nativePresent {
 		workerCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 		defer cancel()
-		if err := s.Guest.Stop(workerCtx, task.InstanceName); err != nil {
-			return nil, protocol.NewError("cleanup_incomplete", "guest stop did not complete", map[string]any{"cause": err.Error(), "outcome_verified": false})
+		nativeState, statusErr := s.Guest.Status(workerCtx, task.InstanceName)
+		if statusErr != nil {
+			return nil, protocol.NewError("cleanup_incomplete", "guest status could not be verified before cleanup", map[string]any{"cause": statusErr.Error(), "outcome_verified": false})
+		}
+		stateValue, parseErr := native.ParseStatus(nativeState)
+		if parseErr != nil {
+			return nil, protocol.NewError("cleanup_incomplete", "guest status is malformed before cleanup", map[string]any{"cause": parseErr.Error(), "outcome_verified": false})
+		}
+		if !strings.EqualFold(stateValue, "stopped") {
+			if err := s.Guest.Stop(workerCtx, task.InstanceName); err != nil {
+				return nil, protocol.NewError("cleanup_incomplete", "guest stop did not complete", map[string]any{"cause": err.Error(), "outcome_verified": false})
+			}
 		}
 		if destroy {
 			if err := s.Guest.Delete(workerCtx, task.InstanceName); err != nil {
@@ -1363,6 +1473,32 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			if !consistent {
 				warnings = append(warnings, map[string]any{"code": "observation_inconsistent", "message": "durable state changed while collecting metrics"})
 			}
+			pending, pendingErr := s.Store.PendingOperations(ctx)
+			if pendingErr != nil {
+				return nil, s.sqliteError(pendingErr)
+			}
+			pendingOperations := make([]any, 0, len(pending))
+			for _, operation := range pending {
+				item := map[string]any{
+					"operation_id": operation.OperationID,
+					"action":       operation.Action,
+					"session_id":   nil,
+					"generation":   nil,
+					"created_at":   operation.CreatedAt,
+				}
+				if operation.SessionID != nil {
+					item["session_id"] = *operation.SessionID
+				}
+				if operation.Generation != nil {
+					item["generation"] = *operation.Generation
+				}
+				for _, key := range []string{"task_id", "task_generation", "acquire_resources"} {
+					if value, ok := operation.Response[key]; ok {
+						item[key] = value
+					}
+				}
+				pendingOperations = append(pendingOperations, item)
+			}
 			var cpuObservation *observe.CPUObservation
 			var cpuObservationErr error
 			if s.CPU != nil {
@@ -1449,7 +1585,8 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				"observed_at": start, "up": nativeUp, "draining": draining, "admission_ready": s.Ready(),
 				"resources": resourcesValue, "ct_cpu": ctCPU,
 				"default_admission": map[string]any{"requested": map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "ready": s.Ready(), "reasons": defaultReasons},
-				"task_states":       states, "instances": len(tasks), "warnings": warnings, "warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil), "native_unavailable": boolInt(!nativeUp)},
+				"task_states":       states, "pending_operations": pendingOperations, "instances": len(tasks), "warnings": warnings,
+				"warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil), "native_unavailable": boolInt(!nativeUp)},
 			}, nil
 		}
 	}
@@ -1487,23 +1624,60 @@ func (s *Service) reconcile(ctx context.Context, apply bool) (map[string]any, er
 			}
 		}
 		if task.State == stateClosing && apply {
-			if _, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil && firstErr == nil {
-				firstErr = releaseErr
+			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil {
+				if firstErr == nil {
+					firstErr = releaseErr
+				}
+			} else if finalizeErr := s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, "release", result); finalizeErr != nil && firstErr == nil {
+				firstErr = finalizeErr
 			}
 		}
 		if task.State == stateFailed && apply {
-			if _, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil && firstErr == nil {
-				firstErr = releaseErr
+			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil {
+				if firstErr == nil {
+					firstErr = releaseErr
+				}
+			} else if finalizeErr := s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, "release", result); finalizeErr != nil && firstErr == nil {
+				firstErr = finalizeErr
 			}
 		}
 		if task.State == stateDeleting && apply {
-			if _, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, true); releaseErr != nil && firstErr == nil {
-				firstErr = releaseErr
+			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, true); releaseErr != nil {
+				if firstErr == nil {
+					firstErr = releaseErr
+				}
+			} else if finalizeErr := s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, "destroy", result); finalizeErr != nil && firstErr == nil {
+				firstErr = finalizeErr
 			}
 		}
 	}
 	result := map[string]any{"dry_run": !apply, "actions": actions}
 	return result, firstErr
+}
+
+func (s *Service) finalizePendingCleanup(ctx context.Context, session string, generation int64, action string, result map[string]any) error {
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	for _, operation := range pending {
+		if operation.Action != action || operation.SessionID == nil || *operation.SessionID != session || operation.Generation == nil || *operation.Generation != generation {
+			continue
+		}
+		rawRequest, ok := operation.Response["_request"].(map[string]any)
+		if !ok {
+			return protocol.NewError("operation_unverified", "pending cleanup request is missing", map[string]any{"operation_id": operation.OperationID})
+		}
+		request := protocol.Request(rawRequest)
+		response := protocol.SuccessWithRelease(request, result, s.Release, nil)
+		if digest, ok := operation.Response["_request_digest"]; ok {
+			response["_request_digest"] = digest
+		}
+		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+			return s.sqliteError(err)
+		}
+	}
+	return nil
 }
 
 func (s *Service) gc(ctx context.Context, apply bool) (map[string]any, error) {
@@ -1572,7 +1746,7 @@ func (s *Service) doctor(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	return map[string]any{"up": true, "ready": s.Ready(), "draining": draining, "state_epoch": epoch, "transport": "http-over-uds"}, nil
+	return map[string]any{"up": true, "ready": s.Ready(), "issues": []any{}, "draining": draining, "state_epoch": epoch, "transport": "http-over-uds"}, nil
 }
 
 func (s *Service) sshInfo(ctx context.Context, request protocol.Request) (map[string]any, error) {
@@ -1645,6 +1819,95 @@ func (s *Service) setOwnership(ctx context.Context, task *state.Task) error {
 	} {
 		if err := s.Guest.ConfigSet(ctx, task.InstanceName, key, value); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) allocateGuestIP(ctx context.Context, ownName string) (string, error) {
+	start := net.ParseIP(s.Config.VMIPStart).To4()
+	end := net.ParseIP(s.Config.VMIPEnd).To4()
+	if start == nil || end == nil {
+		return "", protocol.NewError("config_invalid", "managed guest IPv4 range is unavailable", nil)
+	}
+	startValue := uint32(start[0])<<24 | uint32(start[1])<<16 | uint32(start[2])<<8 | uint32(start[3])
+	endValue := uint32(end[0])<<24 | uint32(end[1])<<16 | uint32(end[2])<<8 | uint32(end[3])
+	if startValue > endValue {
+		return "", protocol.NewError("config_invalid", "managed guest IPv4 range is invalid", nil)
+	}
+	used := make(map[string]struct{})
+	tasks, err := s.Store.ListTasks(ctx)
+	if err != nil {
+		return "", s.sqliteError(err)
+	}
+	for _, task := range tasks {
+		if task.InstanceName == ownName || task.State == stateAbsent || task.VMIP == nil {
+			continue
+		}
+		used[*task.VMIP] = struct{}{}
+	}
+	if inventory, ok := s.Guest.(native.NetworkInventory); ok {
+		addresses, inventoryErr := inventory.NetworkIPs(ctx)
+		if inventoryErr != nil {
+			return "", protocol.NewError("vm_ip_unverified", "native network address inventory is unavailable", map[string]any{"cause": inventoryErr.Error(), "outcome_verified": false})
+		}
+		for address := range addresses {
+			used[address] = struct{}{}
+		}
+	}
+	for value := startValue; ; value++ {
+		candidate := net.IPv4(byte(value>>24), byte(value>>16), byte(value>>8), byte(value)).String()
+		if _, occupied := used[candidate]; !occupied {
+			return candidate, nil
+		}
+		if value == endValue {
+			break
+		}
+	}
+	return "", protocol.NewError("vm_ip_exhausted", "no managed-container private IP is available", nil)
+}
+
+func (s *Service) configureNetwork(ctx context.Context, task *state.Task) error {
+	if task == nil || task.VMIP == nil {
+		return protocol.NewError("mapping_unverified", "managed guest IPv4 address is unavailable", map[string]any{"outcome_verified": false})
+	}
+	properties := []struct{ key, value string }{
+		{"ipv4.address", *task.VMIP},
+		{"security.mac_filtering", "true"},
+		{"security.ipv4_filtering", "true"},
+		{"security.ipv6_filtering", "true"},
+		{"security.port_isolation", "true"},
+		{"security.acls", s.Config.NetworkACL},
+		{"security.acls.default.ingress.action", "allow"},
+		{"security.acls.default.egress.action", "allow"},
+	}
+	for _, property := range properties {
+		if err := s.Guest.DeviceSet(ctx, task.InstanceName, "eth0", property.key, property.value); err != nil {
+			return err
+		}
+	}
+	info, err := s.Guest.Config(ctx, task.InstanceName)
+	if err != nil {
+		return protocol.NewError("network_unverified", "managed guest network configuration could not be verified", map[string]any{"cause": err.Error(), "outcome_verified": false})
+	}
+	expanded, ok := info["expanded_devices"].(map[string]any)
+	if !ok {
+		return protocol.NewError("network_unverified", "managed guest network devices are unavailable", map[string]any{"outcome_verified": false})
+	}
+	eth0, ok := expanded["eth0"].(map[string]any)
+	if !ok {
+		return protocol.NewError("network_unverified", "managed guest eth0 device is unavailable", map[string]any{"outcome_verified": false})
+	}
+	expected := map[string]string{
+		"type": "nic", "network": s.Config.Network, "ipv4.address": *task.VMIP,
+		"security.mac_filtering": "true", "security.ipv4_filtering": "true",
+		"security.ipv6_filtering": "true", "security.port_isolation": "true",
+		"security.acls":                        s.Config.NetworkACL,
+		"security.acls.default.ingress.action": "allow", "security.acls.default.egress.action": "allow",
+	}
+	for key, expectedValue := range expected {
+		if eth0[key] != expectedValue {
+			return protocol.NewError("network_unverified", "managed guest network isolation differs from configuration", map[string]any{"field": key, "expected": expectedValue, "actual": eth0[key], "outcome_verified": true})
 		}
 	}
 	return nil
@@ -1886,6 +2149,37 @@ func guestIPv4(value map[string]any) string {
 		}
 	}
 	return ""
+}
+
+const guestReadinessPollInterval = 250 * time.Millisecond
+
+func waitForGuestReady(ctx context.Context, guest native.Guest, name string) (string, error) {
+	if guest == nil {
+		return "", errors.New("guest client is unavailable")
+	}
+	ticker := time.NewTicker(guestReadinessPollInterval)
+	defer ticker.Stop()
+	for {
+		status, err := guest.Status(ctx, name)
+		if err != nil {
+			return "", err
+		}
+		value, parseErr := native.ParseStatus(status)
+		if parseErr != nil {
+			return "", parseErr
+		}
+		if !strings.EqualFold(value, "running") {
+			return "", fmt.Errorf("guest status is %s", value)
+		}
+		if ip := guestIPv4(status); ip != "" {
+			return ip, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("guest did not report an IPv4 address: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64, excludeTaskID string, startup bool) error {

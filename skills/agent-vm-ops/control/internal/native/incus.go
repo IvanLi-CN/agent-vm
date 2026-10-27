@@ -32,6 +32,12 @@ type HealthProbe interface {
 	Probe(context.Context) error
 }
 
+// NetworkInventory exposes addresses already claimed by Incus so lifecycle
+// admission can allocate a fixed address without racing unrelated instances.
+type NetworkInventory interface {
+	NetworkIPs(context.Context) (map[string]struct{}, error)
+}
+
 type IncusClient struct {
 	Runner  *Runner
 	Project string
@@ -226,12 +232,80 @@ func (c *IncusClient) Probe(ctx context.Context) error {
 	return c.run(ctx, "version")
 }
 
+func (c *IncusClient) NetworkIPs(ctx context.Context) (map[string]struct{}, error) {
+	used := make(map[string]struct{})
+	instances, err := c.queryList(ctx, "/1.0/instances?recursion=2", c.Project)
+	if err != nil {
+		return nil, err
+	}
+	for _, raw := range instances {
+		instance, ok := raw.(map[string]any)
+		if !ok {
+			return nil, errors.New("incus instance inventory is malformed")
+		}
+		devices, ok := instance["expanded_devices"].(map[string]any)
+		if !ok {
+			return nil, errors.New("incus instance network inventory is unavailable")
+		}
+		for _, rawDevice := range devices {
+			device, ok := rawDevice.(map[string]any)
+			if !ok {
+				return nil, errors.New("incus instance network device is malformed")
+			}
+			network, _ := device["network"].(string)
+			address, _ := device["ipv4.address"].(string)
+			if network == c.Network && address != "" {
+				used[address] = struct{}{}
+			}
+		}
+	}
+	leases, err := c.queryList(ctx, "/1.0/networks/"+url.PathEscape(c.Network)+"/leases", "default")
+	if err != nil {
+		return nil, err
+	}
+	for _, raw := range leases {
+		lease, ok := raw.(map[string]any)
+		if !ok {
+			return nil, errors.New("incus network lease inventory is malformed")
+		}
+		address, _ := lease["address"].(string)
+		if address != "" {
+			used[address] = struct{}{}
+		}
+	}
+	return used, nil
+}
+
 func (c *IncusClient) Status(ctx context.Context, name string) (map[string]any, error) {
 	return c.json(ctx, "query", "/1.0/instances/"+name+"/state")
 }
 
 func (c *IncusClient) Config(ctx context.Context, name string) (map[string]any, error) {
 	return c.json(ctx, "query", "/1.0/instances/"+name)
+}
+
+func (c *IncusClient) queryList(ctx context.Context, path, project string) ([]any, error) {
+	endpoint, err := url.Parse(path)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Incus query path: %w", err)
+	}
+	query := endpoint.Query()
+	if project != "" {
+		query.Set("project", project)
+	}
+	endpoint.RawQuery = query.Encode()
+	result, runErr := c.Runner.Run(ctx, []string{"incus", "query", endpoint.String()}, nil)
+	if runErr != nil {
+		return nil, wrapCommandError(result, runErr)
+	}
+	if result.StdoutTruncated {
+		return nil, wrapCommandError(result, errors.New("incus output exceeded diagnostic limit"))
+	}
+	var value []any
+	if err := json.Unmarshal(result.Stdout, &value); err != nil {
+		return nil, wrapCommandError(result, fmt.Errorf("invalid Incus JSON: %w", err))
+	}
+	return value, nil
 }
 
 func (c *IncusClient) Exec(ctx context.Context, name string, argv []string, input []byte) (Result, error) {

@@ -821,6 +821,8 @@ class ReleasePublisher:
             return False
         pending = metrics.get("pending_operations")
         task_states = metrics.get("task_states")
+        if "pending_operations" not in metrics and allow_legacy_observation:
+            pending = []
         if not isinstance(pending, list) or any(not isinstance(item, Mapping) for item in pending):
             return False
         if pending != [] or not isinstance(task_states, Mapping):
@@ -835,6 +837,26 @@ class ReleasePublisher:
                 return False
         issues = doctor.get("issues")
         return doctor.get("ready") is True and isinstance(issues, list) and not issues
+
+    def _wait_for_health(
+        self,
+        manifest: Mapping[str, Any],
+        *,
+        allow_legacy_observation: bool = False,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        deadline = self.monotonic() + ACTIVATION_TIMEOUT_SECONDS
+        while True:
+            try:
+                return self._health(manifest, allow_legacy_observation=allow_legacy_observation)
+            except ReleaseError as error:
+                detail = error.detail if isinstance(error.detail, Mapping) else {}
+                doctor = detail.get("doctor") if isinstance(detail, Mapping) else None
+                if error.code != "remote_health_failed" or not isinstance(doctor, Mapping) or doctor.get("ready") is not False:
+                    raise
+                remaining = deadline - self.monotonic()
+                if remaining <= 0:
+                    raise
+                self.sleep(min(DEFAULT_POLL_SECONDS, remaining))
 
     @staticmethod
     def _reconcile_healthy(value: Mapping[str, Any]) -> bool:
@@ -882,6 +904,18 @@ class ReleasePublisher:
                 _fail("state_unverified", "control returned an unknown task state during convergence", {"task_states": states})
             converged = False
             if pending == [] and isinstance(states, Mapping):
+                converged = all(
+                    not isinstance(states.get(state, 0), bool)
+                    and isinstance(states.get(state, 0), int)
+                    and states.get(state, 0) >= 0
+                    and states.get(state, 0) == 0
+                    for state in CONTROL_TRANSITION_STATES
+                )
+            elif "pending_operations" not in last and isinstance(states, Mapping):
+                # Older active releases do not expose the pending-operation
+                # list. Keep the drain and transition checks here; the
+                # candidate's drain-exit handler rechecks pending operations
+                # before admission can reopen.
                 converged = all(
                     not isinstance(states.get(state, 0), bool)
                     and isinstance(states.get(state, 0), int)
@@ -1005,7 +1039,7 @@ class ReleasePublisher:
         if activation.get("activated") is not True:
             _fail("activation_unverified", "remote wrapper did not confirm activation")
         try:
-            self._health(manifest)
+            self._wait_for_health(manifest)
         except ReleaseError as health_error:
             rollback_manifest = legacy_manifest()
             try:
@@ -1015,7 +1049,7 @@ class ReleasePublisher:
                 # retained previous release.  Validate that peer through the
                 # explicit protocol-4 legacy contract, not the failed bundle's
                 # release-specific action window.
-                self._health(rollback_manifest, allow_legacy_observation=True)
+                self._wait_for_health(rollback_manifest, allow_legacy_observation=True)
             except ReleaseError as rollback_error:
                 raise ReleaseError("rollback_failed", "remote health failed and the single rollback did not restore verified health", {
                     "health_error": health_error.as_dict(),
@@ -1072,7 +1106,7 @@ class ReleasePublisher:
                 "remote rollback record does not identify the requested active release",
                 {"expected": release_id, "actual": result.get("previous_release_id")},
             )
-        self._health(manifest)
+        self._wait_for_health(manifest)
         try:
             self._install_local_client(manifest)
         except ReleaseError as local_error:

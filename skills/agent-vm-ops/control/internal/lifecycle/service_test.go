@@ -22,14 +22,20 @@ type staticCPUObserver struct {
 }
 
 type startupGuest struct {
-	status    string
-	config    map[string]any
-	configErr error
+	status      string
+	statuses    []map[string]any
+	statusCalls int
+	config      map[string]any
+	configErr   error
+	stopErr     error
+	deviceSets  []string
 }
 
 func (guest *startupGuest) Init(context.Context, string, string) error              { return nil }
 func (guest *startupGuest) ConfigSet(context.Context, string, string, string) error { return nil }
-func (guest *startupGuest) DeviceSet(context.Context, string, string, string, string) error {
+
+func (guest *startupGuest) DeviceSet(_ context.Context, _ string, device, key, value string) error {
+	guest.deviceSets = append(guest.deviceSets, device+":"+key+"="+value)
 	return nil
 }
 func (guest *startupGuest) DeviceAdd(context.Context, string, string, string, map[string]string) error {
@@ -37,9 +43,17 @@ func (guest *startupGuest) DeviceAdd(context.Context, string, string, string, ma
 }
 func (guest *startupGuest) DeviceRemove(context.Context, string, string) error { return nil }
 func (guest *startupGuest) Start(context.Context, string) error                { return nil }
-func (guest *startupGuest) Stop(context.Context, string) error                 { return nil }
+func (guest *startupGuest) Stop(context.Context, string) error                 { return guest.stopErr }
 func (guest *startupGuest) Delete(context.Context, string) error               { return nil }
 func (guest *startupGuest) Status(context.Context, string) (map[string]any, error) {
+	if len(guest.statuses) > 0 {
+		index := guest.statusCalls
+		if index >= len(guest.statuses) {
+			index = len(guest.statuses) - 1
+		}
+		guest.statusCalls++
+		return guest.statuses[index], nil
+	}
 	return map[string]any{"status": guest.status}, nil
 }
 func (guest *startupGuest) Config(context.Context, string) (map[string]any, error) {
@@ -107,6 +121,121 @@ func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
 	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "blocked", "generation": int64(0), "operation_id": "blocked"})
 	if control := protocol.AsError(err); control.Code != "draining" {
 		t.Fatalf("drain error = %#v", control)
+	}
+}
+
+func TestAbsentStatusMatchesClientContract(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	service := New(store, cfg, Options{})
+	response, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol":   protocol.Version,
+		"action":     "status",
+		"session_id": "new-session",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := response["result"].(map[string]any)
+	if result["state"] != stateAbsent || result["generation"] != int64(0) ||
+		result["effective_lease"] != false || result["native_status"] != stateAbsent ||
+		result["guest_available"] != false {
+		t.Fatalf("absent status = %#v", result)
+	}
+}
+
+func TestWaitForGuestReadyPollsUntilIPv4IsVisible(t *testing.T) {
+	guest := &startupGuest{statuses: []map[string]any{
+		{"status": "Running", "network": map[string]any{"eth0": map[string]any{"addresses": []any{}}}},
+		{"status": "Running", "network": map[string]any{"eth0": map[string]any{"addresses": []any{
+			map[string]any{"family": "inet", "address": "10.250.19.20"},
+		}}}},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ip, err := waitForGuestReady(ctx, guest, "agent-ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ip != "10.250.19.20" || guest.statusCalls != 2 {
+		t.Fatalf("ip=%q status_calls=%d", ip, guest.statusCalls)
+	}
+}
+
+func TestConfigureNetworkMatchesManagedContainerContract(t *testing.T) {
+	guest := &startupGuest{config: map[string]any{"expanded_devices": map[string]any{
+		"eth0": map[string]any{
+			"type": "nic", "network": "agentsbr0", "ipv4.address": "10.250.19.20",
+			"security.mac_filtering": "true", "security.ipv4_filtering": "true",
+			"security.ipv6_filtering": "true", "security.port_isolation": "true",
+			"security.acls":                        "agent-vm-acl",
+			"security.acls.default.ingress.action": "allow",
+			"security.acls.default.egress.action":  "allow",
+		},
+	}}}
+	cfg := config.Defaults()
+	cfg.Network = "agentsbr0"
+	cfg.NetworkACL = "agent-vm-acl"
+	service := &Service{Config: cfg, Guest: guest}
+	if err := service.configureNetwork(context.Background(), &state.Task{InstanceName: "agent-ready", VMIP: stringPointer("10.250.19.20")}); err != nil {
+		t.Fatal(err)
+	}
+	if len(guest.deviceSets) != 8 || guest.deviceSets[0] != "eth0:ipv4.address=10.250.19.20" {
+		t.Fatalf("device sets = %#v", guest.deviceSets)
+	}
+}
+
+func TestAdminMetricsIncludesPendingOperations(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	service := New(store, cfg, Options{})
+	response, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version,
+		"action":   "admin-metrics",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := response["result"].(map[string]any)
+	pending, ok := result["pending_operations"].([]any)
+	if !ok || len(pending) != 0 {
+		t.Fatalf("pending operations = %#v", result["pending_operations"])
+	}
+}
+
+func TestDoctorIncludesIssueListForHealthContract(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	service := New(store, cfg, Options{})
+	response, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version,
+		"action":   "doctor",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := response["result"].(map[string]any)
+	issues, ok := result["issues"].([]any)
+	if !ok || len(issues) != 0 {
+		t.Fatalf("doctor issues = %#v", result["issues"])
 	}
 }
 
@@ -567,6 +696,131 @@ func TestStartupReconcileLeavesUnsafePendingAcquireBlocked(t *testing.T) {
 	}
 }
 
+func TestStartupReconcileFinalizesOrphanedAcquireWhenNativeIsMissing(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "orphaned-acquire.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := "orphaned-acquire-session"
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(0), "operation_id": "orphaned-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "orphaned-acquire", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Stderr: []byte("instance not found")}, Cause: errors.New("incus query failed")}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), "orphaned-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("orphaned acquire = %#v", operation)
+	}
+	control, ok := operation.Response["error"].(map[string]any)
+	if !ok || control["code"] != "acquire_partial" {
+		t.Fatalf("orphaned acquire error = %#v", operation.Response["error"])
+	}
+	detail, ok := control["detail"].(map[string]any)
+	if !ok || detail["native_init_recovered_absent"] != true || detail["outcome_verified"] != true {
+		t.Fatalf("orphaned acquire detail = %#v", control["detail"])
+	}
+	if operation.Response["_request_digest"] != digest {
+		t.Fatalf("orphaned acquire digest = %#v, want %q", operation.Response["_request_digest"], digest)
+	}
+}
+
+func TestStartupReconcileLeavesOrphanedAcquireWithNativeInstanceBlocked(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "orphaned-acquire-present.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := "orphaned-acquire-present-session"
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(0), "operation_id": "orphaned-acquire-present"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "orphaned-acquire-present", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{config: map[string]any{"config": map[string]any{}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if control := protocol.AsError(service.StartupReconcile(context.Background())); control.Code != "startup_reconcile_required" {
+		t.Fatalf("startup error = %#v", control)
+	}
+	operation, err := store.GetOperation(context.Background(), "orphaned-acquire-present")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Response["outcome"] != "pending" {
+		t.Fatalf("orphaned acquire with native instance was finalized: %#v", operation.Response)
+	}
+}
+
+func TestStartupReconcileCancelsAcquireForCachedStoppedTask(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "cached-pending-acquire.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	session := "cached-pending-acquire-session"
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "cached-pending-task", SessionID: session, Generation: 2, State: stateCached,
+		InstanceName: "agent-cached-pending", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(1), "operation_id": "cached-pending-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(1)
+	if err := store.RecordOperation(context.Background(), "cached-pending-acquire", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status: "Stopped",
+		config: map[string]any{
+			"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "cached-pending-task", "user.agent-vm.session": session, "user.agent-vm.generation": "2"},
+			"devices": map[string]any{}, "expanded_devices": map[string]any{},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), "cached-pending-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("cached pending acquire = %#v", operation)
+	}
+	control, ok := operation.Response["error"].(map[string]any)
+	if !ok || control["code"] != "lease_released" {
+		t.Fatalf("cached pending acquire error = %#v", operation.Response["error"])
+	}
+}
+
 func TestStartupReconcileVerifiesDurableActiveGuest(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-state.sqlite3"))
 	if err != nil {
@@ -632,6 +886,92 @@ func TestDestroyFinalizesWhenIncusConfirmsTheInstanceIsMissing(t *testing.T) {
 	}
 	if task != nil {
 		t.Fatalf("destroy left task = %#v", task)
+	}
+}
+
+func TestDestroySkipsStopForStoppedGuest(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "stopped-destroy.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "stopped-destroy-task", SessionID: "stopped-destroy-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-stopped-destroy", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status:  "Stopped",
+		stopErr: errors.New("stop must not be called for a stopped guest"),
+		config: map[string]any{
+			"config":           map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "stopped-destroy-task", "user.agent-vm.session": "stopped-destroy-session", "user.agent-vm.generation": "1"},
+			"devices":          map[string]any{},
+			"expanded_devices": map[string]any{},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
+	response, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "destroy", "session_id": "stopped-destroy-session", "generation": int64(1), "operation_id": "destroy-stopped",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response["result"].(map[string]any)["state"] != stateAbsent {
+		t.Fatalf("destroy response = %#v", response)
+	}
+}
+
+func TestReconcileFinalizesPendingDestroyAfterCleanup(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "pending-destroy.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	session := "pending-destroy-session"
+	generation := int64(1)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "pending-destroy-task", SessionID: session, Generation: generation, State: stateDeleting,
+		InstanceName: "agent-pending-destroy", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":0,"memory_mib":0,"disk_gib":0}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := map[string]any{
+		"protocol": protocol.Version, "action": "destroy", "session_id": session,
+		"generation": generation, "operation_id": "destroy-pending",
+	}
+	if err := store.RecordOperation(context.Background(), "destroy-pending", "destroy", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request": request, "_request_digest": "digest",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status: "Stopped",
+		config: map[string]any{
+			"config":           map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "pending-destroy-task", "user.agent-vm.session": session, "user.agent-vm.generation": "1"},
+			"devices":          map[string]any{},
+			"expanded_devices": map[string]any{},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
+	if _, err := service.reconcile(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if task, err := store.GetTask(context.Background(), map[string]any{"session_id": session}); err != nil {
+		t.Fatal(err)
+	} else if task != nil {
+		t.Fatalf("reconciled task = %#v", task)
+	}
+	operation, err := store.GetOperation(context.Background(), "destroy-pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Response["outcome"] != "success" {
+		t.Fatalf("reconciled operation = %#v", operation.Response)
 	}
 }
 
