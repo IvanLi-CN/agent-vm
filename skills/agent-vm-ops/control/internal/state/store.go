@@ -113,6 +113,8 @@ func (err *TransactionError) Error() string {
 
 func (err *TransactionError) Unwrap() error { return err.Cause }
 
+func (err *TransactionError) Uncertain() bool { return err.StateCommitted == nil }
+
 func committed(value bool) *bool { return &value }
 
 type Task struct {

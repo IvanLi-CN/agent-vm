@@ -157,9 +157,31 @@ func (s *Service) Capabilities(ctx context.Context) ([]state.ManagementCapabilit
 	return s.Store.Capabilities(ctx)
 }
 
+func (s *Service) existingOperation(ctx context.Context, operationID, digest string) (*state.ManagementOperation, error) {
+	if operationID == "" {
+		return nil, nil
+	}
+	existing, err := s.Store.GetManagementOperation(ctx, operationID)
+	if err != nil || existing == nil {
+		return existing, err
+	}
+	if stringValue(existing.Request["_request_digest"]) != digest {
+		return nil, errors.New("operation_conflict: operation ID belongs to a different request")
+	}
+	return existing, nil
+}
+
 func (s *Service) StartImageImport(ctx context.Context, request ImportRequest) (*state.ManagementOperation, error) {
 	if err := s.ValidateImport(request); err != nil {
 		return nil, err
+	}
+	requestMap := importRequestMap(request)
+	digest, err := protocol.Digest(protocol.Request(requestMap))
+	if err != nil {
+		return nil, errors.New("invalid_request: import request cannot be canonicalized")
+	}
+	if existing, err := s.existingOperation(ctx, request.OperationID, digest); err != nil || existing != nil {
+		return existing, err
 	}
 	catalogVersion, err := s.Store.ImageCatalogVersion(ctx)
 	if err != nil {
@@ -167,11 +189,6 @@ func (s *Service) StartImageImport(ctx context.Context, request ImportRequest) (
 	}
 	if request.TargetVersion != catalogVersion {
 		return nil, fmt.Errorf("stale_target: expected %s, current %s", request.TargetVersion, catalogVersion)
-	}
-	requestMap := importRequestMap(request)
-	digest, err := protocol.Digest(protocol.Request(requestMap))
-	if err != nil {
-		return nil, errors.New("invalid_request: import request cannot be canonicalized")
 	}
 	operation := state.ManagementOperation{
 		OperationID: request.OperationID,
@@ -295,6 +312,9 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 		return nil, errors.New("invalid_request: operation is not an image import")
 	}
 	if operation.Status != "awaiting_upload" {
+		if operation.Status == "running" || operation.Status == "succeeded" || operation.Status == "failed" || operation.Status == "outcome_unknown" {
+			return operation, nil
+		}
 		return nil, errors.New("operation_conflict: image upload has already been received")
 	}
 	request, err := importRequestFromOperation(operation)
@@ -322,9 +342,21 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 	if s.Options.Backend == nil {
 		return s.failImport(ctx, operation, "image_import", "internal_error", "no image backend is configured", true)
 	}
+	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "awaiting_upload", "image_import", "running")
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return running, nil
+	}
+	operation = running
 	artifact, err := s.Options.Backend.ImportLocal(ctx, request.Source.Format, metadata, rootfs)
 	if err != nil {
-		return s.failImport(ctx, operation, "image_import", "internal_error", err.Error(), true)
+		status := "failed"
+		if isUncertain(err) {
+			status = "outcome_unknown"
+		}
+		return s.finishOperation(ctx, operation, "reconciliation", status, nil, safeError(err))
 	}
 	return s.finishImport(ctx, operation, request, artifact)
 }
@@ -337,7 +369,13 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 	if operation == nil {
 		return nil, errors.New("not_found: import operation does not exist")
 	}
-	if operation.Action != "image_import" || operation.Status != "queued" {
+	if operation.Action != "image_import" {
+		return nil, errors.New("invalid_request: operation is not an image import")
+	}
+	if operation.Status != "queued" {
+		if operation.Status == "running" || operation.Status == "succeeded" || operation.Status == "failed" || operation.Status == "outcome_unknown" {
+			return operation, nil
+		}
 		return nil, errors.New("operation_conflict: import is not queued")
 	}
 	request, err := importRequestFromOperation(operation)
@@ -347,9 +385,21 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 	if s.Options.Backend == nil {
 		return s.failImport(ctx, operation, "image_import", "internal_error", "no image backend is configured", true)
 	}
+	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "queued", "image_import", "running")
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return running, nil
+	}
+	operation = running
 	artifact, err := s.Options.Backend.ImportTrusted(ctx, request.Source.SourceID, request.Source.ExpectedFingerprint)
 	if err != nil {
-		return s.failImport(ctx, operation, "image_import", "internal_error", err.Error(), true)
+		status := "failed"
+		if isUncertain(err) {
+			status = "outcome_unknown"
+		}
+		return s.finishOperation(ctx, operation, "reconciliation", status, nil, safeError(err))
 	}
 	return s.finishImport(ctx, operation, request, artifact)
 }
@@ -379,15 +429,14 @@ func (s *Service) finishImport(ctx context.Context, operation *state.ManagementO
 	}
 	integrity := "passed"
 	suitability := "passed"
-	if len(findings) > 0 {
-		integrity = "failed"
-		suitability = "failed"
-		for _, finding := range findings {
-			if finding != "fingerprint_mismatch" {
-				integrity = "passed"
-				break
-			}
+	for _, finding := range findings {
+		if finding == "fingerprint_mismatch" {
+			integrity = "failed"
+		} else {
+			suitability = "failed"
 		}
+	}
+	if len(findings) > 0 {
 		return s.failImportWithImage(ctx, operation, request, artifact, integrity, suitability, findings)
 	}
 	image := state.ManagedImage{
@@ -409,7 +458,8 @@ func (s *Service) failImportWithImage(ctx context.Context, operation *state.Mana
 }
 
 func (s *Service) failImport(ctx context.Context, operation *state.ManagementOperation, phase, code, message string, retryable bool) (*state.ManagementOperation, error) {
-	return s.finishOperation(ctx, operation, phase, "failed", nil, map[string]any{"code": code, "message": message, "retryable": retryable})
+	_ = message
+	return s.finishOperation(ctx, operation, phase, "failed", nil, map[string]any{"code": safeCode(code), "retryable": retryable})
 }
 
 func (s *Service) finishOperation(ctx context.Context, operation *state.ManagementOperation, phase, status string, result, failure map[string]any) (*state.ManagementOperation, error) {
@@ -424,8 +474,8 @@ func (s *Service) finishOperation(ctx context.Context, operation *state.Manageme
 	if err != nil {
 		return nil, err
 	}
-	outcome := "succeeded"
-	if status != "succeeded" {
+	outcome := status
+	if outcome != "succeeded" && outcome != "outcome_unknown" {
 		outcome = "failed"
 	}
 	if auditErr := s.audit(ctx, *updated, outcome, phase, failure); auditErr != nil {
@@ -484,11 +534,22 @@ func (s *Service) DeleteImage(ctx context.Context, operationID, actor, reason, f
 			}
 		}
 		if err := s.Store.DeleteManagedImage(ctx, fingerprint); err != nil {
-			return nil, err
+			return nil, nativeStateUncertainError{cause: err}
 		}
 		return map[string]any{"fingerprint": fingerprint, "state": "deleted"}, nil
 	})
 }
+
+type nativeStateUncertainError struct {
+	cause error
+}
+
+func (err nativeStateUncertainError) Error() string {
+	return "native image deletion completed but catalog state is uncertain"
+}
+
+func (err nativeStateUncertainError) Unwrap() error   { return err.cause }
+func (err nativeStateUncertainError) Uncertain() bool { return true }
 
 func (s *Service) requireImageVersion(ctx context.Context, fingerprint, expected string) error {
 	if expected == "" {
@@ -530,12 +591,25 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 	}
 	result, mutateErr := mutate()
 	if mutateErr != nil {
-		return s.finishOperation(ctx, &operation, "reference_check", "failed", nil, safeError(mutateErr))
+		status := "failed"
+		phase := "reference_check"
+		if isUncertain(mutateErr) {
+			status, phase = "outcome_unknown", "reconciliation"
+		}
+		return s.finishOperation(ctx, &operation, phase, status, nil, safeError(mutateErr))
 	}
 	return s.finishOperation(ctx, &operation, "completed", "succeeded", result, nil)
 }
 
 func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) (*state.ManagementOperation, error) {
+	actionRequest := map[string]any{"action": request.Action, "task_id": request.TaskID, "target_version": request.TargetVersion, "generation": request.ExpectedGeneration, "parameters": request.Parameters, "actor": request.Actor, "reason": request.Reason, "target_kind": "vm", "target_id": request.TaskID}
+	digest, digestErr := protocol.Digest(protocol.Request(actionRequest))
+	if digestErr != nil {
+		return nil, errors.New("invalid_request: action request cannot be canonicalized")
+	}
+	if existing, err := s.existingOperation(ctx, request.OperationID, digest); err != nil || existing != nil {
+		return existing, err
+	}
 	if s.Options.Actions == nil {
 		return nil, errors.New("authority_unavailable: action backend is not configured")
 	}
@@ -556,7 +630,7 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	if !contains([]string{"restart", "resize", "release", "destroy", "port_add", "port_remove"}, request.Action) {
 		return nil, errors.New("unsupported_action: VM action is not allowed")
 	}
-	operation, err := s.claimAction(ctx, request.OperationID, request.Actor, request.Reason, request.Action, "vm", request.TaskID, map[string]any{"target_version": request.TargetVersion, "generation": request.ExpectedGeneration, "parameters": request.Parameters})
+	operation, err := s.claimAction(ctx, request.OperationID, request.Actor, request.Reason, request.Action, "vm", request.TaskID, actionRequest)
 	if err != nil || operation != nil && operation.Status != "queued" {
 		return operation, err
 	}
@@ -578,13 +652,24 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 }
 
 func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceRequest) (*state.ManagementOperation, error) {
+	actionRequest := map[string]any{"action": request.Action, "target_version": request.TargetVersion, "parameters": request.Parameters, "actor": request.Actor, "reason": request.Reason, "target_kind": "system", "target_id": "system"}
+	digest, digestErr := protocol.Digest(protocol.Request(actionRequest))
+	if digestErr != nil {
+		return nil, errors.New("invalid_request: maintenance request cannot be canonicalized")
+	}
+	if existing, err := s.existingOperation(ctx, request.OperationID, digest); err != nil || existing != nil {
+		return existing, err
+	}
 	if s.Options.Actions == nil {
 		return nil, errors.New("authority_unavailable: action backend is not configured")
+	}
+	if request.TargetVersion == "" {
+		return nil, errors.New("invalid_request: target_version is required")
 	}
 	if !contains([]string{"drain_enter", "drain_exit", "reconcile", "gc"}, request.Action) {
 		return nil, errors.New("unsupported_action: maintenance action is not allowed")
 	}
-	operation, err := s.claimAction(ctx, request.OperationID, request.Actor, request.Reason, request.Action, "system", "system", map[string]any{"target_version": request.TargetVersion, "parameters": request.Parameters})
+	operation, err := s.claimAction(ctx, request.OperationID, request.Actor, request.Reason, request.Action, "system", "system", actionRequest)
 	if err != nil || operation != nil && operation.Status != "queued" {
 		return operation, err
 	}
@@ -610,6 +695,7 @@ func (s *Service) claimAction(ctx context.Context, operationID, actor, reason, a
 		return nil, errors.New("invalid_request: operation, actor and reason are required")
 	}
 	request["actor"], request["reason"] = actor, reason
+	request["action"], request["target_kind"], request["target_id"] = action, targetKind, targetID
 	digest, _ := protocol.Digest(protocol.Request(request))
 	operation := state.ManagementOperation{OperationID: operationID, Action: action, TargetKind: targetKind, TargetID: targetID, Actor: actor, Reason: reason, Phase: "native_action", Status: "queued", Request: map[string]any{"_request_digest": digest, "request": request}}
 	existing, err := s.Store.ClaimManagementOperation(ctx, operation)
@@ -704,6 +790,9 @@ func digestBytes(value []byte) string {
 }
 
 func safeError(err error) map[string]any {
+	if isUncertain(err) {
+		return map[string]any{"code": "internal_error", "retryable": true}
+	}
 	var referenceErr *state.ImageReferenceError
 	if errors.As(err, &referenceErr) {
 		code := "image_referenced"
@@ -714,9 +803,16 @@ func safeError(err error) map[string]any {
 	}
 	message := err.Error()
 	if index := strings.IndexByte(message, ':'); index > 0 {
-		return map[string]any{"code": message[:index], "message": strings.TrimSpace(message[index+1:])}
+		return map[string]any{"code": safeCode(message[:index])}
 	}
-	return map[string]any{"code": "internal_error", "message": message}
+	return map[string]any{"code": "internal_error"}
+}
+
+func safeCode(code string) string {
+	if contains([]string{"invalid_request", "source_not_allowed", "stale_target", "unsupported_action", "not_found", "image_not_applicable", "fingerprint_mismatch", "upload_too_large", "staging_capacity_low", "default_image_required", "image_referenced", "authority_unavailable", "operation_conflict", "internal_error"}, code) {
+		return code
+	}
+	return "internal_error"
 }
 
 type uncertainError interface{ Uncertain() bool }

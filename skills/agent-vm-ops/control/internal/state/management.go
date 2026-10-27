@@ -200,16 +200,42 @@ func (s *Store) SeedLegacyImage(ctx context.Context, fingerprint string) error {
 	unlock := s.LockImageSelection()
 	defer unlock()
 	return s.withWrite(ctx, func(tx *Tx) error {
-		var exists int
-		err := tx.conn.QueryRowContext(ctx, "SELECT 1 FROM managed_images WHERE fingerprint = ?", fingerprint).Scan(&exists)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		fingerprints := []string{fingerprint}
+		rows, err := tx.conn.QueryContext(ctx, "SELECT DISTINCT image_fingerprint FROM tasks")
+		if err != nil {
 			return err
 		}
-		if errors.Is(err, sql.ErrNoRows) {
-			now := time.Now().UTC().Format(time.RFC3339Nano)
-			if _, err := tx.exec(`INSERT INTO managed_images(fingerprint, version_label, architecture, instance_type, source_kind, source_id, state, integrity, suitability, findings_json, is_default, default_compatibility, revision, created_at, updated_at)
-VALUES(?, ?, ?, 'container', 'legacy_config', NULL, 'available', 'legacy_unverified', 'not_assessed', '[]', 0, 'legacy_unverified', 1, ?, ?)`, fingerprint, "legacy-default", "x86_64", now, now); err != nil {
+		for rows.Next() {
+			var candidate string
+			if err := rows.Scan(&candidate); err != nil {
+				rows.Close()
 				return err
+			}
+			if imageFingerprintPattern.MatchString(candidate) && candidate != fingerprint {
+				fingerprints = append(fingerprints, candidate)
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		for _, candidate := range fingerprints {
+			var exists int
+			err := tx.conn.QueryRowContext(ctx, "SELECT 1 FROM managed_images WHERE fingerprint = ?", candidate).Scan(&exists)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
+			if errors.Is(err, sql.ErrNoRows) {
+				now := time.Now().UTC().Format(time.RFC3339Nano)
+				label := "legacy-history"
+				if candidate == fingerprint {
+					label = "legacy-default"
+				}
+				if _, err := tx.exec(`INSERT INTO managed_images(fingerprint, version_label, architecture, instance_type, source_kind, source_id, state, integrity, suitability, findings_json, is_default, default_compatibility, revision, created_at, updated_at)
+VALUES(?, ?, ?, 'container', 'legacy_config', NULL, 'available', 'legacy_unverified', 'not_assessed', '[]', 0, 'legacy_unverified', 1, ?, ?)`, candidate, label, "x86_64", now, now); err != nil {
+					return err
+				}
 			}
 		}
 		var current string
@@ -442,7 +468,10 @@ func (s *Store) SelectManagedImage(ctx context.Context, fingerprint, expectedVer
 			return fmt.Errorf("invalid management selection revision: %w", err)
 		}
 		currentVersion := "image-selection:revision-" + currentRevision
-		if expectedVersion != "" && expectedVersion != currentVersion {
+		if expectedVersion == "" {
+			return errors.New("invalid_request: selection target_version is required")
+		}
+		if expectedVersion != currentVersion {
 			return fmt.Errorf("stale_target: expected %s, current %s", expectedVersion, currentVersion)
 		}
 		var stateValue, integrity, suitability string
@@ -560,6 +589,8 @@ func (s *Store) AddImageReference(ctx context.Context, fingerprint, kind, refere
 	if kind != "pending_creation" && kind != "verification" {
 		return errors.New("unsupported image reference kind")
 	}
+	unlock := s.LockImageSelection()
+	defer unlock()
 	return s.withWrite(ctx, func(tx *Tx) error {
 		_, err := tx.exec("INSERT OR IGNORE INTO image_references(fingerprint, reference_kind, reference_id, created_at) VALUES(?, ?, ?, ?)", fingerprint, kind, referenceID, time.Now().UTC().Format(time.RFC3339Nano))
 		return err
@@ -567,10 +598,35 @@ func (s *Store) AddImageReference(ctx context.Context, fingerprint, kind, refere
 }
 
 func (s *Store) RemoveImageReference(ctx context.Context, fingerprint, kind, referenceID string) error {
+	unlock := s.LockImageSelection()
+	defer unlock()
 	return s.withWrite(ctx, func(tx *Tx) error {
 		_, err := tx.exec("DELETE FROM image_references WHERE fingerprint = ? AND reference_kind = ? AND reference_id = ?", fingerprint, kind, referenceID)
 		return err
 	})
+}
+
+func (s *Store) TransitionManagementOperation(ctx context.Context, operationID, expectedStatus, phase, status string) (*ManagementOperation, bool, error) {
+	var value *ManagementOperation
+	claimed := false
+	err := s.withWrite(ctx, func(tx *Tx) error {
+		current, err := scanManagementOperation(ctx, tx.conn, operationID)
+		if err != nil {
+			return err
+		}
+		value = current
+		if current.Status != expectedStatus {
+			return nil
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := tx.exec("UPDATE management_operations SET phase = ?, status = ?, updated_at = ? WHERE operation_id = ? AND status = ?", phase, status, now, operationID, expectedStatus); err != nil {
+			return err
+		}
+		value.Phase, value.Status, value.UpdatedAt = phase, status, now
+		claimed = true
+		return nil
+	})
+	return value, claimed, err
 }
 
 func (s *Store) Capabilities(ctx context.Context) ([]ManagementCapability, error) {

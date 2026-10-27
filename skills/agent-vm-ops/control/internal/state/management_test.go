@@ -56,6 +56,29 @@ func TestManagementMigrationIsAdditiveAndSeedsLegacyDefault(t *testing.T) {
 	}
 }
 
+func TestLegacySeedBackfillsHistoricalTaskImages(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	historical, configured := strings.Repeat("f", 64), strings.Repeat("a", 64)
+	if err := store.InsertTask(ctx, Task{TaskID: "historical-task", SessionID: "historical-session", Generation: 2, State: "cached", InstanceName: "agent-vm-historical", CreatedAt: "now", UpdatedAt: "now", ImageFingerprint: historical, ResourcesJSON: "{}", ResourceReservationJSON: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SeedLegacyImage(ctx, configured); err != nil {
+		t.Fatal(err)
+	}
+	image, err := store.GetManagedImage(ctx, historical)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image == nil || image.SourceKind != "legacy_config" || image.Integrity != "legacy_unverified" || image.References.Cached != 1 {
+		t.Fatalf("historical image = %#v", image)
+	}
+}
+
 func TestDefaultSwitchLeavesExistingTaskImageBindingUntouched(t *testing.T) {
 	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

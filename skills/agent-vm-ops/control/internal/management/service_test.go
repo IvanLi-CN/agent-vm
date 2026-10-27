@@ -106,6 +106,59 @@ func TestImageImportRejectsInsufficientStagingCapacityBeforeClaimingOperation(t 
 	}
 }
 
+func TestExistingImportOperationWinsBeforeAStaleCatalogCheck(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, Options{UploadMaxBytes: 1024, Backend: &fakeImageBackend{}})
+	request := ImportRequest{
+		OperationID: "import-replay", Actor: "admin", Reason: "replay import", TargetVersion: "image-catalog:revision-1", VersionLabel: "2026.02",
+		Source: ImportSource{Kind: "local_upload", Format: "unified", ExpectedSHA256: strings.Repeat("b", 64), ExpectedSize: 3},
+	}
+	first, err := service.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertManagedImage(context.Background(), state.ManagedImage{Fingerprint: strings.Repeat("c", 64), Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
+		t.Fatal(err)
+	}
+	replay, err := service.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replay.OperationID != first.OperationID || replay.Status != "awaiting_upload" {
+		t.Fatalf("replayed operation = %#v", replay)
+	}
+}
+
+func TestIntegrityFailureRemainsIndependentFromSuitabilityFailure(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	backend := &fakeImageBackend{artifact: ImageArtifact{Fingerprint: strings.Repeat("b", 64), Architecture: "x86_64", InstanceType: "vm", Runtime: true, SyncTool: true, GuestReady: true}}
+	service := New(store, Options{TrustedImageSourceIDs: []string{"approved"}, Backend: backend})
+	request := ImportRequest{OperationID: "trusted-mismatch", Actor: "admin", Reason: "check image", TargetVersion: "image-catalog:revision-1", VersionLabel: "bad", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: strings.Repeat("a", 64)}}
+	operation, err := service.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operation, err = service.ProcessTrustedImport(context.Background(), operation.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	image, err := store.GetManagedImage(context.Background(), strings.Repeat("b", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image == nil || image.Integrity != "failed" || image.Suitability != "failed" {
+		t.Fatalf("verification = %#v", image)
+	}
+}
+
 func TestUnsuitableImageIsPersistedAsFailedAndCannotBecomeDefault(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
