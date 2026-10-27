@@ -212,6 +212,21 @@ class WrapperTests(unittest.TestCase):
         commands = [call.args[0] for call in process.call_args_list]
         self.assertNotIn(["systemctl", "start", "agent-vm-web.service"], commands)
 
+    def test_product_runtime_uses_the_activation_snapshot_after_web_was_disabled(self):
+        def run(command, **kwargs):
+            if command == ["systemctl", "is-enabled", "--quiet", "agent-vm-web.service"]:
+                return subprocess.CompletedProcess(command, 1, b"", b"")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with mock.patch.object(WRAPPER.subprocess, "run", side_effect=run) as process:
+            WRAPPER._activate_product_runtime(
+                {"format": MANIFEST.PRODUCT_MANIFEST_FORMAT},
+                web_was_enabled=True,
+            )
+        commands = [call.args[0] for call in process.call_args_list]
+        self.assertNotIn(["systemctl", "is-enabled", "--quiet", "agent-vm-web.service"], commands)
+        self.assertIn(["systemctl", "start", "agent-vm-web.service"], commands)
+
     def test_missing_legacy_enable_and_disable_are_allowed_but_other_failures_are_not(self):
         missing = subprocess.CompletedProcess(
             [], 1, b"", b"Failed to disable unit: Unit agent-vm-native-age-gc.service does not exist\n",

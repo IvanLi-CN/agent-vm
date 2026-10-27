@@ -1076,9 +1076,14 @@ def _activate_go_runtime(*, web_enabled: bool = False) -> None:
     _systemctl("is-active", "agent-vm-native.service")
 
 
-def _activate_product_runtime(manifest: Mapping[str, Any]) -> None:
+def _activate_product_runtime(
+    manifest: Mapping[str, Any],
+    *,
+    web_was_enabled: bool | None = None,
+) -> None:
     web_enabled = manifest.get("format") == PRODUCT_MANIFEST_FORMAT
-    web_was_enabled = _unit_is_enabled("agent-vm-web.service") if web_enabled else False
+    if web_enabled and web_was_enabled is None:
+        web_was_enabled = _unit_is_enabled("agent-vm-web.service")
     _activate_go_runtime(web_enabled=web_enabled)
     if web_was_enabled:
         # Requires=agent-vm-native.service stops Web during native restart.
@@ -1339,6 +1344,9 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _verify_retained_release(config, old_current)
     if old_previous is not None:
         _verify_retained_release(config, old_previous)
+    web_unit_enabled = None
+    if _is_product_manifest(candidate_manifest) or _is_go_manifest(candidate_manifest):
+        web_unit_enabled = _unit_is_enabled("agent-vm-web.service")
     _mkdir_private(release_root, 0o755)
     release_dir = release_root / release_id
     if release_dir.exists():
@@ -1372,6 +1380,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         "activated": False,
         "activation_phase": "prepared",
         "rollback_attempts": 0,
+        "web_unit_enabled": web_unit_enabled,
     }
     _write_json(activation_path, record)
     runtime_switch_attempted = False
@@ -1392,7 +1401,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _write_json(activation_path, record)
         if _is_product_manifest(manifest):
             runtime_switch_attempted = True
-            _activate_product_runtime(manifest)
+            _activate_product_runtime(manifest, web_was_enabled=web_unit_enabled)
             record["activation_phase"] = "runtime-switched"
             _write_json(activation_path, record)
         elif _is_go_manifest(manifest):
@@ -1431,7 +1440,11 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 else:
                     old_manifest = load_release_manifest(old_current / MANIFEST_NAME)
                     if _is_product_manifest(old_manifest):
-                        _activate_product_runtime(old_manifest)
+                        snapshot = record.get("web_unit_enabled")
+                        _activate_product_runtime(
+                            old_manifest,
+                            web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
+                        )
                     elif _is_go_manifest(old_manifest):
                         _activate_go_runtime()
                     else:
