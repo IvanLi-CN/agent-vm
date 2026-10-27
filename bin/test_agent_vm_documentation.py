@@ -17,6 +17,9 @@ ADR = ROOT / "docs/adr/0028-agent-vm-topology-recovery-boundary.md"
 OPS_SKILL = ROOT / "skills/agent-vm-ops/SKILL.md"
 AGENT_SKILL = ROOT / "skills/agent-vm/SKILL.md"
 DEPLOYMENT = ROOT / "skills/agent-vm-ops/references/deployment.md"
+INITIALIZATION = ROOT / "skills/agent-vm-ops/references/initialization.md"
+INITIALIZATION_SCRIPT = ROOT / "skills/agent-vm-ops/scripts/agent_vm_incus_init.ts"
+INCUS_INITIALIZATION_ADR = ROOT / "docs/adr/0041-agent-vm-incus-project-initialization.md"
 OBSERVABILITY = ROOT / "docs/specs/agent-vm/contracts/observability.md"
 OBSERVABILITY_SOLUTION = ROOT / "docs/solutions/agent-vm/observability-dashboard.md"
 CPU_PRESSURE_ADR = ROOT / "docs/adr/0032-agent-vm-cpu-startup-pressure-for-overcommit.md"
@@ -100,11 +103,26 @@ class AgentVmDocumentationTests(unittest.TestCase):
         adr = ADR.read_text(encoding="utf-8")
         ops_skill = OPS_SKILL.read_text(encoding="utf-8")
         deployment = DEPLOYMENT.read_text(encoding="utf-8")
+        initialization = INITIALIZATION.read_text(encoding="utf-8")
+        incus_initialization_adr = INCUS_INITIALIZATION_ADR.read_text(encoding="utf-8")
         self.assertIn("OPERATIONS.md", spec)
         self.assertIn("../OPERATIONS.md", cli_contract)
         self.assertIn("0028-agent-vm-topology-recovery-boundary.md", spec)
         self.assertIn("../../docs/specs/agent-vm/OPERATIONS.md", ops_skill)
         self.assertIn("../../../docs/specs/agent-vm/OPERATIONS.md", deployment)
+        self.assertIn("references/initialization.md", ops_skill)
+        self.assertIn("initialization reference", deployment)
+        self.assertTrue(INITIALIZATION_SCRIPT.is_file())
+        for phrase in (
+            "limits.processes",
+            "limits.instances",
+            "read-only preview",
+            "--apply",
+            "never deletes or restarts an instance",
+            "stable JSON API paths",
+        ):
+            self.assertIn(phrase, initialization)
+            self.assertIn(phrase, incus_initialization_adr + initialization)
         self.assertIn("contracts/release.md", spec)
         self.assertIn("release contract", cli_contract)
         for phrase in (
@@ -122,7 +140,7 @@ class AgentVmDocumentationTests(unittest.TestCase):
         ):
             self.assertIn(phrase, release_contract)
         self.assertIn("protected operator records", adr)
-        for document in (spec, cli_contract, release_contract, adr, ops_skill, deployment):
+        for document in (spec, cli_contract, release_contract, adr, ops_skill, deployment, initialization, incus_initialization_adr):
             self.assertNotRegex(document, re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+"))
             self.assertNotRegex(document, re.compile(r"\b(?:10|172|192\.168)\.\d+\.\d+\.\d+\b"))
 
