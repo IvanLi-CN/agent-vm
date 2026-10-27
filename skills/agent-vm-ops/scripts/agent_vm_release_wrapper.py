@@ -499,6 +499,17 @@ def _require_owned_regular(path: Path, owner_uid: int, mode: int | None = None) 
         _fail("artifact_mode_mismatch", f"artifact mode differs: {path.name}", {"expected": mode, "actual": stat.S_IMODE(info.st_mode)})
 
 
+def _require_owned_regular_modes(path: Path, owner_uid: int, modes: tuple[int, ...]) -> None:
+    """Validate a fixed cleanup target against a small historical mode set."""
+    _require_owned_regular(path, owner_uid)
+    try:
+        actual = stat.S_IMODE(path.lstat().st_mode)
+    except OSError:
+        _fail("artifact_unverified", f"artifact cannot be inspected: {path.name}")
+    if actual not in modes:
+        _fail("artifact_mode_mismatch", f"artifact mode differs: {path.name}", {"expected": list(modes), "actual": actual})
+
+
 def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
     if _is_product_manifest(manifest):
         expected_units = PRODUCT_UNIT_EXEC_START if manifest["format"] == PRODUCT_MANIFEST_FORMAT else {"agent-vm-native.service": PRODUCT_UNIT_EXEC_START["agent-vm-native.service"]}
@@ -1212,7 +1223,10 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
             bundle_root / "web-assets.manifest.json",
         ):
             if target.exists() or target.is_symlink():
-                _require_owned_regular(target, owner_uid, 0o644)
+                if target.name == "agent-vm-web.json.example":
+                    _require_owned_regular_modes(target, owner_uid, (0o640, 0o644))
+                else:
+                    _require_owned_regular(target, owner_uid, 0o644)
                 try:
                     target.unlink()
                     _fsync_directory(target.parent, "activation_failed")
@@ -1291,7 +1305,10 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
         go_bundle_root / "web-assets.manifest.json",
     ):
         if target.exists() or target.is_symlink():
-            _require_owned_regular(target, owner_uid, 0o644)
+            if target.name == "agent-vm-web.json.example":
+                _require_owned_regular_modes(target, owner_uid, (0o640, 0o644))
+            else:
+                _require_owned_regular(target, owner_uid, 0o644)
             try:
                 target.unlink()
                 _fsync_directory(target.parent, "activation_failed")
