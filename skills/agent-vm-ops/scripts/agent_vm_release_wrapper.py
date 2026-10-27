@@ -42,6 +42,8 @@ try:
         GO_MANIFEST_FORMAT,
         GO_RETIRED_UNITS,
         GO_UNIT_CONTENT_SHA256,
+        HISTORICAL_GO_UNIT_CONTENT_SHA256,
+        HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
         GO_UNIT_EXEC_START,
         LEGACY_PRODUCT_MANIFEST_FORMAT,
         PRODUCT_MANIFEST_FORMAT,
@@ -73,6 +75,8 @@ except ModuleNotFoundError:
         GO_MANIFEST_FORMAT,
         GO_RETIRED_UNITS,
         GO_UNIT_CONTENT_SHA256,
+        HISTORICAL_GO_UNIT_CONTENT_SHA256,
+        HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
         GO_UNIT_EXEC_START,
         LEGACY_PRODUCT_MANIFEST_FORMAT,
         PRODUCT_MANIFEST_FORMAT,
@@ -510,10 +514,11 @@ def _require_owned_regular_modes(path: Path, owner_uid: int, modes: tuple[int, .
         _fail("artifact_mode_mismatch", f"artifact mode differs: {path.name}", {"expected": list(modes), "actual": actual})
 
 
-def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
+def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_historical_content: bool = False) -> None:
     if _is_product_manifest(manifest):
         expected_units = PRODUCT_UNIT_EXEC_START if manifest["format"] == PRODUCT_MANIFEST_FORMAT else {"agent-vm-native.service": PRODUCT_UNIT_EXEC_START["agent-vm-native.service"]}
         expected_hashes = PRODUCT_UNIT_CONTENT_SHA256
+        historical_hashes = HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256
         for item in manifest["artifacts"]:
             if item["role"] != "unit":
                 continue
@@ -525,7 +530,10 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 _fail("unit_unverified", f"unit cannot be read: {name}")
-            if sha256_file(path) != expected_hashes[name]:
+            accepted_hashes = {expected_hashes[name]}
+            if allow_historical_content and name in historical_hashes:
+                accepted_hashes.add(historical_hashes[name])
+            if sha256_file(path) not in accepted_hashes:
                 _fail("unit_unverified", f"unit bytes differ from the fixed product policy: {name}")
             if expected_units[name] not in content or "ExecStart=" not in content:
                 _fail("unit_unverified", f"unit does not contain its fixed ExecStart: {name}")
@@ -544,7 +552,10 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 _fail("unit_unverified", f"unit cannot be read: {name}")
-            if sha256_file(path) != GO_UNIT_CONTENT_SHA256[name]:
+            accepted_hashes = {GO_UNIT_CONTENT_SHA256[name]}
+            if allow_historical_content and name in HISTORICAL_GO_UNIT_CONTENT_SHA256:
+                accepted_hashes.add(HISTORICAL_GO_UNIT_CONTENT_SHA256[name])
+            if sha256_file(path) not in accepted_hashes:
                 _fail("unit_unverified", f"unit bytes differ from the fixed Go policy: {name}")
             if GO_UNIT_EXEC_START[name] not in content or "ExecStart=" not in content:
                 _fail("unit_unverified", f"unit does not contain its fixed ExecStart: {name}")
@@ -586,7 +597,12 @@ def _reject_transaction_extras(root: Path, manifest: Mapping[str, Any]) -> None:
             _fail("artifact_unverified", "transaction contains an unallowlisted file", {"path": path.relative_to(root).as_posix()})
 
 
-def _verify_fixed_artifacts(config: Mapping[str, Any], manifest: Mapping[str, Any]) -> None:
+def _verify_fixed_artifacts(
+    config: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    allow_historical_web_config_mode: bool = False,
+) -> None:
     declared = {(item["role"], item["path"]) for item in manifest["artifacts"]}
     if _is_product_manifest(manifest):
         expected_values = PRODUCT_LINUX_ARTIFACTS if manifest["format"] == PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_LEGACY_ARTIFACTS
@@ -595,7 +611,14 @@ def _verify_fixed_artifacts(config: Mapping[str, Any], manifest: Mapping[str, An
             _fail("artifact_unverified", "manifest artifact set differs from the fixed product release allowlist", {"expected": sorted(expected), "actual": sorted(declared)})
         expected_modes = {(role, path): mode for _, path, role, mode in expected_values}
         for item in manifest["artifacts"]:
-            if item["mode"] != expected_modes[(item["role"], item["path"])]:
+            expected_mode = expected_modes[(item["role"], item["path"])]
+            historical_mode = (
+                allow_historical_web_config_mode
+                and manifest["format"] == PRODUCT_MANIFEST_FORMAT
+                and item["path"] == "config/agent-vm-web.json.example"
+                and item["mode"] == 0o644
+            )
+            if item["mode"] != expected_mode and not historical_mode:
                 _fail("artifact_mode_mismatch", f"fixed product release artifact mode differs: {item['path']}")
         return
     if _is_go_manifest(manifest):
@@ -746,22 +769,22 @@ def _current_target(link: Path, release_root: Path | None = None) -> Path | None
 def _verify_retained_release(config: Mapping[str, Any], target: Path) -> dict[str, Any]:
     """Re-verify a release before using it as an activation or rollback target."""
     try:
-        manifest = load_release_manifest(target / MANIFEST_NAME)
+        manifest = load_release_manifest(target / MANIFEST_NAME, allow_historical_web_config_mode=True)
         if _is_go_manifest(manifest):
             verify_go_bundle(target, manifest)
         elif _is_product_manifest(manifest):
             from release_manifest import verify_product_bundle
-            verify_product_bundle(target, manifest)
+            verify_product_bundle(target, manifest, allow_historical_web_config_mode=True)
         else:
             verify_bundle(target, manifest)
         verify_client_sidecar(target, manifest)
     except ManifestError as exc:
         _fail("activation_unverified", "retained release cannot be verified", exc.as_dict())
     _reject_transaction_extras(target, manifest)
-    _verify_fixed_artifacts(config, manifest)
+    _verify_fixed_artifacts(config, manifest, allow_historical_web_config_mode=True)
     _verify_python_syntax(target, manifest)
     _verify_typescript_syntax(target, manifest)
-    _verify_unit_contents(target, manifest)
+    _verify_unit_contents(target, manifest, allow_historical_content=True)
     owner_uid = int(config["owner_uid"])
     _require_owned_regular(target / MANIFEST_NAME, owner_uid, 0o644)
     _require_owned_regular(target / "client-release.json", owner_uid, 0o644)
