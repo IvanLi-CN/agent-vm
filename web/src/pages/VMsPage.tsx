@@ -74,7 +74,11 @@ export function VMsPage() {
 
   const resetPage = () => { setCursor(undefined); setCursorStack([]); };
   const nextPage = () => { const next = vmQuery.data?.page.next_cursor; if (!next) return; setCursorStack((stack) => [...stack, cursor ?? ""]); setCursor(next); };
-  const previousPage = () => setCursorStack((stack) => { const next = [...stack]; setCursor(next.pop() || undefined); return next; });
+  const previousPage = () => {
+    const previous = cursorStack[cursorStack.length - 1];
+    setCursorStack((stack) => stack.slice(0, -1));
+    setCursor(previous || undefined);
+  };
 
   return <div className="page-stack" data-testid="vms-page">
     <PageIntro title={t("vms.title")} description={t("vms.subtitle")} onRefresh={() => void vmQuery.refetch()} refreshing={vmQuery.isFetching} />

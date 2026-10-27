@@ -88,7 +88,11 @@ export function ImagesPage() {
   };
 
   const nextPage = () => { const next = query.data?.page.next_cursor; if (!next) return; setCursorStack((stack) => [...stack, cursor ?? ""]); setCursor(next); };
-  const previousPage = () => setCursorStack((stack) => { const next = [...stack]; setCursor(next.pop() || undefined); return next; });
+  const previousPage = () => {
+    const previous = cursorStack[cursorStack.length - 1];
+    setCursorStack((stack) => stack.slice(0, -1));
+    setCursor(previous || undefined);
+  };
 
   const openAction = async (nextAction: ImageAction) => {
     if (!selected) return;
