@@ -1,0 +1,75 @@
+import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
+import { Check, ChevronDown, Copy, LoaderCircle } from "lucide-react";
+import { useState } from "react";
+import { useTranslation } from "react-i18next";
+import { stateLabel, stateTone } from "../app/format";
+
+type Tone = "neutral" | "success" | "warning" | "danger";
+
+export function Button({ variant = "secondary", tone = "neutral", icon, children, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "secondary" | "ghost" | "danger"; tone?: Tone; icon?: ReactNode }) {
+  return <button className={`ui-button ui-button-${variant} ui-button-${tone}`} {...props}>{icon ? <span className="button-icon" aria-hidden="true">{icon}</span> : null}<span>{children}</span></button>;
+}
+
+export function IconButton({ label, children, className, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { label: string }) {
+  return <button className={`icon-button ${className ?? ""}`} aria-label={label} title={label} {...props}>{children}</button>;
+}
+
+export function Panel({ as: Tag = "section", className = "", children, ...props }: { as?: "section" | "div"; className?: string; children: ReactNode } & React.HTMLAttributes<HTMLElement>) {
+  return <Tag className={`panel ${className}`} {...props}>{children}</Tag>;
+}
+
+export function PanelHeader({ title, description, action }: { title: ReactNode; description?: ReactNode; action?: ReactNode }) {
+  return <div className="panel-header"><div><h2>{title}</h2>{description ? <p>{description}</p> : null}</div>{action ? <div className="panel-action">{action}</div> : null}</div>;
+}
+
+export function Badge({ tone = "neutral", children }: { tone?: Tone; children: ReactNode }) {
+  return <span className={`status-badge status-${tone}`}>{children}</span>;
+}
+
+export function StatusBadge({ state }: { state: string }) {
+  const { i18n } = useTranslation();
+  const label = stateLabel(state, i18n.language === "zh-CN" ? "zh-CN" : "en");
+  return <Badge tone={stateTone(state)}>{label}</Badge>;
+}
+
+export function Input(props: InputHTMLAttributes<HTMLInputElement>) {
+  return <input className="form-control" {...props} />;
+}
+
+export function Textarea(props: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  return <textarea className="form-control form-textarea" {...props} />;
+}
+
+export function Select({ children, ...props }: SelectHTMLAttributes<HTMLSelectElement>) {
+  return <span className="select-wrap"><select className="form-control" {...props}>{children}</select><ChevronDown className="select-icon" aria-hidden="true" /></span>;
+}
+
+export function ProgressBar({ value, tone = "accent" }: { value: number; tone?: "accent" | "success" | "danger" }) {
+  return <div className="progress-track" aria-label={`${Math.round(value)}%`}><span className={`progress-fill progress-${tone}`} style={{ width: `${Math.max(0, Math.min(value, 100))}%` }} /></div>;
+}
+
+export function Divider() {
+  return <div className="divider" role="separator" />;
+}
+
+export function SectionHeader({ title, description, action }: { title: ReactNode; description?: ReactNode; action?: ReactNode }) {
+  return <div className="section-header"><div><h2>{title}</h2>{description ? <p>{description}</p> : null}</div>{action ? <div>{action}</div> : null}</div>;
+}
+
+export function EmptyState({ title, description }: { title: ReactNode; description?: ReactNode }) {
+  return <div className="empty-state"><div className="empty-mark" aria-hidden="true">—</div><strong>{title}</strong>{description ? <p>{description}</p> : null}</div>;
+}
+
+export function CopyButton({ value }: { value: string }) {
+  const { t } = useTranslation();
+  const [copied, setCopied] = useState(false);
+  return <IconButton label={copied ? t("common.copied") : t("common.copy")} onClick={() => { void navigator.clipboard?.writeText(value); setCopied(true); window.setTimeout(() => setCopied(false), 1200); }}>{copied ? <Check /> : <Copy />}</IconButton>;
+}
+
+export function LoadingRows({ rows = 3 }: { rows?: number }) {
+  return <div className="loading-rows" aria-label="Loading">{Array.from({ length: rows }, (_, index) => <div className="loading-row" key={index}><span /><span /><span /></div>)}</div>;
+}
+
+export function Spinner() {
+  return <LoaderCircle className="spinner" aria-label="Loading" />;
+}
