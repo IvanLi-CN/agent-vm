@@ -116,9 +116,8 @@ def _go_control_target(config: Mapping[str, Any]) -> Path:
 
 
 def _go_bridge_target(config: Mapping[str, Any]) -> Path:
-    # The compatibility entrypoint keeps the historical control filename so
-    # old SSH clients reach the new UDS request adapter unchanged.
-    return Path(config["control_path"])
+    configured = Path(config["control_path"])
+    return configured.with_name("agent_vm_control_bridge.ts")
 
 
 class WrapperError(Exception):
@@ -1002,7 +1001,7 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
 def _install_go_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
     """Install the format-2 client, forwarding bridge, binary, and one unit."""
     owner_uid = int(config["owner_uid"])
-    go_bundle_root = _go_control_target(config).parent
+    go_bundle_root = Path(config["control_path"]).parent
     expected_support = {path for _, path, role, _ in GO_FIXED_ARTIFACTS if role == "support"}
     installed_support: set[str] = set()
     installed_controls: set[str] = set()
@@ -1020,6 +1019,12 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
         elif item["role"] == "control":
             if item["path"] == "agent_vm_control_bridge.ts":
                 _copy_atomic(source, _go_bridge_target(config), owner_uid, item["mode"])
+                # Keep the historical filename for the SSH compatibility
+                # bridge while retaining the manifest's explicit artifact
+                # path for Go's installed-release verification.
+                legacy_target = Path(config["control_path"])
+                if legacy_target != _go_bridge_target(config):
+                    _copy_atomic(source, legacy_target, owner_uid, item["mode"])
                 installed_controls.add(item["path"])
             elif item["path"] == "bin/agent-vm-control":
                 _copy_atomic(source, _go_control_target(config), owner_uid, item["mode"])

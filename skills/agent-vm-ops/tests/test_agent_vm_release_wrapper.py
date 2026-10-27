@@ -302,6 +302,14 @@ class WrapperTests(unittest.TestCase):
             b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42,
         )
         self.assertEqual(Path(self.loaded["control_path"]).read_bytes(), (ROOT / "skills/agent-vm-ops/scripts/agent_vm_control_bridge.ts").read_bytes())
+        self.assertEqual(
+            (Path(self.loaded["control_path"]).parent / "agent_vm_control_bridge.ts").read_bytes(),
+            (ROOT / "skills/agent-vm-ops/scripts/agent_vm_control_bridge.ts").read_bytes(),
+        )
+        self.assertEqual(
+            (Path(self.loaded["control_path"]).parent / "systemd" / "agent-vm-native.service").read_bytes(),
+            (ROOT / "skills/agent-vm-ops/assets/systemd/agent-vm-native.service").read_bytes(),
+        )
         self.assertTrue((unit_dir / "agent-vm-native.service").is_file())
         for name in MANIFEST.GO_RETIRED_UNITS:
             self.assertFalse((unit_dir / name).exists())
