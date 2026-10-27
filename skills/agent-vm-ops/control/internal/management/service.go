@@ -488,8 +488,11 @@ func (s *Service) finishImport(ctx context.Context, operation *state.ManagementO
 }
 
 func (s *Service) failImportWithImage(ctx context.Context, operation *state.ManagementOperation, request ImportRequest, artifact ImageArtifact, integrity, suitability string, findings []string) (*state.ManagementOperation, error) {
-	if fingerprintPattern.MatchString(artifact.Fingerprint) {
-		_ = s.Store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Architecture: artifact.Architecture, InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID), State: "failed", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none"})
+	if !fingerprintPattern.MatchString(artifact.Fingerprint) {
+		return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
+	}
+	if err := s.Store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Architecture: artifact.Architecture, InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID), State: "failed", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none"}); err != nil {
+		return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
 	}
 	return s.finishOperation(ctx, operation, "completed", "failed", nil, map[string]any{"code": "image_not_applicable", "phase": "suitability_check", "findings": findings})
 }
@@ -732,6 +735,13 @@ func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceReq
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+	latestVersion, versionErr := s.Options.CurrentSystemVersion(ctx)
+	if versionErr != nil {
+		return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, map[string]any{"code": "authority_unavailable", "retryable": true})
+	}
+	if latestVersion != request.TargetVersion {
+		return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, map[string]any{"code": "stale_target"})
 	}
 	result, actionErr := s.Options.Actions.ExecuteMaintenance(ctx, request.OperationID, request.Action, request.Parameters)
 	if actionErr != nil {
