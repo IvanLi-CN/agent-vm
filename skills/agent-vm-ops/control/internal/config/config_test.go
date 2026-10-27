@@ -105,3 +105,30 @@ func TestLoadPreservesCanonicalAdmissionFields(t *testing.T) {
 		t.Fatalf("loaded admission policy = %#v", loaded)
 	}
 }
+
+func TestManagementConfigRequiresSeparateAuthenticatedBoundaries(t *testing.T) {
+	value := validConfig()
+	value.Management = ManagementConfig{
+		Enabled: true, ExternalOrigin: "https://console.example",
+		ForwardAuth:          ForwardAuthConfig{SocketPath: "/run/agent-vm-native/proxy.sock", PeerUID: 1001, IdentityHeader: "X-Forwarded-User"},
+		AllowedAdminSubjects: []string{"admin@example"}, WebUID: 1002,
+		SessionTTLSeconds: 900,
+		Authority:         ManagementAuthorityConfig{SocketPath: "/run/agent-vm-native/authority.sock", ExpectedWebUID: 1002},
+	}
+	if err := value.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	value.Management.Authority.SocketPath = value.Socket
+	if err := value.Validate(); err == nil || !strings.Contains(err.Error(), "distinct from the control socket") {
+		t.Fatalf("shared control socket error = %v", err)
+	}
+	value = validConfig()
+	value.Management = ManagementConfig{
+		Enabled: true, ExternalOrigin: "https://console.example", ForwardAuth: ForwardAuthConfig{SocketPath: "/run/proxy.sock", PeerUID: 1001, IdentityHeader: "X-Forwarded-User"},
+		AllowedAdminSubjects: []string{"admin@example"}, WebUID: 1002, Authority: ManagementAuthorityConfig{SocketPath: "/run/authority.sock", ExpectedWebUID: 1002},
+		Upload: ManagementUploadConfig{Enabled: true, MaxBytes: 1024, StagingPath: "/", MinimumFreeBytes: 512},
+	}
+	if err := value.Validate(); err == nil || !strings.Contains(err.Error(), "private directory") {
+		t.Fatalf("root staging error = %v", err)
+	}
+}

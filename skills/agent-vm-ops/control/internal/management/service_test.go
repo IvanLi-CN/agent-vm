@@ -316,6 +316,37 @@ func TestMaintenanceChecksCurrentSystemVersionBeforeClaim(t *testing.T) {
 	}
 }
 
+func TestRecoverPendingOperationsDoesNotReplayTrustedImports(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	backend := &fakeImageBackend{artifact: ImageArtifact{Fingerprint: strings.Repeat("a", 64), Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}}
+	service := New(store, Options{TrustedImageSourceIDs: []string{"approved"}, Backend: backend})
+	request := ImportRequest{OperationID: "trusted-recovery", Actor: "admin", Reason: "recover image", TargetVersion: "image-catalog:revision-1", VersionLabel: "2026.03", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: strings.Repeat("a", 64)}}
+	operation, err := service.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Status != "queued" {
+		t.Fatalf("queued operation = %#v", operation)
+	}
+	if _, claimed, err := store.TransitionManagementOperation(context.Background(), operation.OperationID, "queued", "image_import", "running"); err != nil || !claimed {
+		t.Fatalf("simulate interrupted import: claimed=%v err=%v", claimed, err)
+	}
+	if err := service.RecoverPendingOperations(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := service.GetOperation(context.Background(), operation.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.Status != "outcome_unknown" || backend.imports != 0 {
+		t.Fatalf("recovered=%#v backend imports=%d", recovered, backend.imports)
+	}
+}
+
 type uncertainActionError struct{}
 
 func (uncertainActionError) Error() string   { return "native result is uncertain" }

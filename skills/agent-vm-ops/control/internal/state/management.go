@@ -333,8 +333,9 @@ FROM managed_images i`
 			args = append(args, filter.Architecture)
 		}
 		if filter.Query != "" {
-			conditions = append(conditions, "(i.fingerprint LIKE ? OR COALESCE(i.version_label, '') LIKE ?)")
-			like := "%" + filter.Query + "%"
+			conditions = append(conditions, "(i.fingerprint LIKE ? ESCAPE '\\' OR COALESCE(i.version_label, '') LIKE ? ESCAPE '\\')")
+			literal := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(filter.Query)
+			like := "%" + literal + "%"
 			args = append(args, like, like)
 		}
 		if len(conditions) > 0 {
@@ -756,6 +757,29 @@ func (s *Store) ListManagementOperations(ctx context.Context, limit int) ([]Mana
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
 		rows, err := conn.QueryContext(ctx, `SELECT operation_id, action, target_kind, target_id, actor, reason, phase, status, request_json, result_json, error_json, created_at, updated_at
 FROM management_operations ORDER BY created_at DESC, operation_id DESC LIMIT ?`, limit)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			value, err := scanManagementOperationRow(rows)
+			if err != nil {
+				return err
+			}
+			values = append(values, *value)
+		}
+		return rows.Err()
+	})
+	return values, err
+}
+
+// ListAllManagementOperations is reserved for resident recovery. Public API
+// reads stay bounded; startup recovery must inspect every durable operation.
+func (s *Store) ListAllManagementOperations(ctx context.Context) ([]ManagementOperation, error) {
+	values := []ManagementOperation{}
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, `SELECT operation_id, action, target_kind, target_id, actor, reason, phase, status, request_json, result_json, error_json, created_at, updated_at
+FROM management_operations ORDER BY created_at DESC, operation_id DESC`)
 		if err != nil {
 			return err
 		}
