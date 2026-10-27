@@ -30,9 +30,13 @@ function run(command: string[], cwd = repositoryRoot): void {
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
 }
 
+function compareDeterministically(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function collectFiles(root: string, current = root): string[] {
   const files: string[] = [];
-  for (const entry of readdirSync(current, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
+  for (const entry of readdirSync(current, { withFileTypes: true }).sort((left, right) => compareDeterministically(left.name, right.name))) {
     const absolute = join(current, entry.name);
     const info = lstatSync(absolute);
     if (info.isSymbolicLink()) throw new Error(`Web dist contains a symbolic link: ${relative(root, absolute)}`);
@@ -40,7 +44,7 @@ function collectFiles(root: string, current = root): string[] {
     else if (info.isFile()) files.push(absolute);
     else throw new Error(`Web dist contains an unsupported entry: ${relative(root, absolute)}`);
   }
-  return files.sort((left, right) => relative(root, left).split(sep).join("/").localeCompare(relative(root, right).split(sep).join("/")));
+  return files.sort((left, right) => compareDeterministically(relative(root, left).split(sep).join("/"), relative(root, right).split(sep).join("/")));
 }
 
 function quote(value: string): string {

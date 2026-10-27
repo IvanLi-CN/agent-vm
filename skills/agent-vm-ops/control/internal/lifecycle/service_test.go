@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -405,6 +406,36 @@ func TestPortNameConflictDoesNotOverwriteExistingMapping(t *testing.T) {
 	ports, err := store.ListPorts(ctx, task.TaskID)
 	if err != nil || len(ports) != 1 || ports[0].VMPort != 8080 {
 		t.Fatalf("existing port was overwritten: ports=%#v err=%v", ports, err)
+	}
+}
+
+func TestDrainStatusIncludesStateCapabilities(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, config.Defaults(), Options{})
+	response, err := service.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "drain-status"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, ok := response["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("drain status result = %#v", response["result"])
+	}
+	capabilities, ok := result["state_capabilities"].([]string)
+	if !ok {
+		t.Fatalf("state capabilities = %#v", result["state_capabilities"])
+	}
+	expected := []string{
+		"legacy-agent-vm-core@1",
+		"managed-image-catalog@1",
+		"management-operation-audit@1",
+		"session-image-binding@1",
+	}
+	if !reflect.DeepEqual(capabilities, expected) {
+		t.Fatalf("state capabilities = %#v, want %#v", capabilities, expected)
 	}
 }
 

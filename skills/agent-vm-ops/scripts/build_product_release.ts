@@ -62,6 +62,10 @@ function digest(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
+function compareDeterministically(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 function sourcePath(relative: string, binaryPath: string): string {
   if (relative === "agent_vm_control_bridge.ts") return join(import.meta.dir, relative);
 	if (relative.startsWith("systemd/")) return join(operationsRoot, "assets", relative);
@@ -122,7 +126,7 @@ try {
   }
 
   const artifacts: Artifact[] = [];
-  for (const [name, relative, role, mode] of [...packageFiles(rawTarget as "client" | "linux/amd64" | "linux/arm64", binaryPath)].sort((left, right) => left[1].localeCompare(right[1]))) {
+  for (const [name, relative, role, mode] of [...packageFiles(rawTarget as "client" | "linux/amd64" | "linux/arm64", binaryPath)].sort((left, right) => compareDeterministically(left[1], right[1]))) {
     const destination = join(temporaryRoot, relative);
     mkdirSync(dirname(destination), { recursive: true, mode: 0o750 });
     const source = sourcePath(relative, binaryPath);

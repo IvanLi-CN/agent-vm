@@ -44,6 +44,7 @@ try:
         GO_UNIT_EXEC_START,
         LEGACY_PRODUCT_MANIFEST_FORMAT,
         PRODUCT_MANIFEST_FORMAT,
+        STATE_CAPABILITY_MARKERS,
         PRODUCT_CLIENT_ARTIFACTS,
         PRODUCT_LINUX_ARTIFACTS,
         PRODUCT_LINUX_LEGACY_ARTIFACTS,
@@ -74,6 +75,7 @@ except ModuleNotFoundError:
         GO_UNIT_EXEC_START,
         LEGACY_PRODUCT_MANIFEST_FORMAT,
         PRODUCT_MANIFEST_FORMAT,
+        STATE_CAPABILITY_MARKERS,
         PRODUCT_CLIENT_ARTIFACTS,
         PRODUCT_LINUX_ARTIFACTS,
         PRODUCT_LINUX_LEGACY_ARTIFACTS,
@@ -893,7 +895,37 @@ def _restore_activation_state(
     _daemon_reload()
 
 
-def _ensure_drained(config: Mapping[str, Any]) -> None:
+def _validate_state_compatibility(manifest: Mapping[str, Any], capabilities: Any) -> None:
+    if not isinstance(capabilities, list) or not capabilities or not all(isinstance(item, str) and item for item in capabilities):
+        _fail("state_compatibility_unverified", "control response did not provide readable state capabilities")
+    if len(set(capabilities)) != len(capabilities):
+        _fail("state_compatibility_unverified", "control response did not provide readable state capabilities")
+    if manifest.get("format") == PRODUCT_MANIFEST_FORMAT:
+        compatibility = manifest.get("state_compatibility")
+        if not isinstance(compatibility, Mapping):
+            _fail("state_compatibility_unverified", "target product manifest has no state compatibility declaration")
+        readable = compatibility.get("reads")
+        writable = compatibility.get("writes")
+        if (
+            not isinstance(readable, list)
+            or not isinstance(writable, list)
+            or not all(isinstance(item, str) and item for item in readable)
+            or not all(isinstance(item, str) and item for item in writable)
+        ):
+            _fail("state_compatibility_unverified", "target product manifest state compatibility is unreadable")
+        supported = set(readable) & set(writable)
+    else:
+        supported = {STATE_CAPABILITY_MARKERS[0]}
+    for capability in capabilities:
+        if capability not in supported:
+            _fail(
+                "state_compatibility_mismatch",
+                "target release cannot preserve a database capability",
+                {"capability": capability, "release_format": manifest.get("format")},
+            )
+
+
+def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any] | None = None) -> None:
     if not config["require_drained"]:
         return
     command = [BUN_PATH, str(config["control_path"])]
@@ -930,6 +962,8 @@ def _ensure_drained(config: Mapping[str, Any]) -> None:
         _fail("drain_unverified", "drain status result is invalid")
     if result.get("draining") is not True:
         _fail("drain_required", "release activation requires admission drain")
+    if target_manifest is not None:
+        _validate_state_compatibility(target_manifest, result.get("state_capabilities"))
 
 
 def _daemon_reload() -> None:
@@ -1004,6 +1038,11 @@ def _activate_product_runtime(manifest: Mapping[str, Any]) -> None:
         # The Web unit is operator-enabled after its real config is installed.
         # try-restart preserves that choice while refreshing an active service.
         _systemctl("try-restart", "agent-vm-web.service", allow_missing=True)
+    else:
+        # A legacy product has no Web entry point. Stop and disable any Web
+        # unit left by a newer product before the old control plane resumes.
+        _systemctl("stop", "agent-vm-web.service", allow_missing=True)
+        _systemctl("disable", "agent-vm-web.service", allow_missing=True)
 
 
 def _activate_legacy_runtime() -> None:
@@ -1120,6 +1159,20 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
                 _fsync_directory(retired.parent, "activation_failed")
             except OSError:
                 _fail("activation_failed", f"cannot retire the exact old unit: {name}")
+    if manifest["format"] == LEGACY_PRODUCT_MANIFEST_FORMAT:
+        for target in (
+            Path(config["unit_dir"]) / "agent-vm-web.service",
+            bundle_root / "systemd" / "agent-vm-web.service",
+            bundle_root / "config" / "agent-vm-web.json.example",
+            bundle_root / "web-assets.manifest.json",
+        ):
+            if target.exists() or target.is_symlink():
+                _require_owned_regular(target, owner_uid, 0o644)
+                try:
+                    target.unlink()
+                    _fsync_directory(target.parent, "activation_failed")
+                except OSError:
+                    _fail("activation_failed", f"cannot retire the exact Web artifact: {target.name}")
     manifest_source = release_root / MANIFEST_NAME
     _require_owned_regular(manifest_source, owner_uid, 0o644)
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
@@ -1213,11 +1266,15 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
     verified = _verify_transaction(config, transaction_id, release_id)
-    _ensure_drained(config)
+    staged = _transaction_dir(config, transaction_id)
+    try:
+        candidate_manifest = load_release_manifest(staged / MANIFEST_NAME)
+    except ManifestError as exc:
+        _fail(exc.code, exc.message, exc.detail)
+    _ensure_drained(config, candidate_manifest)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
     if activation_path.exists() or activation_path.is_symlink():
         _fail("transaction_exists", "activation record already exists for this transaction")
-    staged = _transaction_dir(config, transaction_id)
     release_root = Path(config["release_root"])
     current_link = Path(config["current_link"])
     previous_link = Path(config["previous_link"])
@@ -1427,7 +1484,7 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
         if actual_previous is not None and actual_previous.name not in allowed_previous:
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
-    _ensure_drained(config)
+    _ensure_drained(config, previous_manifest)
     target_snapshot = _snapshot_targets(config)
     record["rollback_attempts"] = 1
     record["rollback_started"] = True

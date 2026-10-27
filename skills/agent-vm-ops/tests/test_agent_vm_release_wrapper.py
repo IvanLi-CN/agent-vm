@@ -95,6 +95,53 @@ class WrapperTests(unittest.TestCase):
         )
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
+    def test_drain_verification_checks_target_state_compatibility(self):
+        self.drain_patch.stop()
+        response = json.dumps({
+            "ok": True,
+            "result": {
+                "draining": True,
+                "state_capabilities": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+            },
+        }).encode()
+        target = {
+            "format": MANIFEST.PRODUCT_MANIFEST_FORMAT,
+            "state_compatibility": {
+                "reads": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+                "writes": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+            },
+        }
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ):
+            WRAPPER._ensure_drained(self.loaded, target)
+
+        incompatible = {
+            **target,
+            "state_compatibility": {
+                "reads": [MANIFEST.STATE_CAPABILITY_MARKERS[0]],
+                "writes": [MANIFEST.STATE_CAPABILITY_MARKERS[0]],
+            },
+        }
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._ensure_drained(self.loaded, incompatible)
+        self.assertEqual(failure.exception.code, "state_compatibility_mismatch")
+
+    def test_legacy_product_runtime_stops_the_web_unit(self):
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ) as run:
+            WRAPPER._activate_product_runtime({"format": MANIFEST.LEGACY_PRODUCT_MANIFEST_FORMAT})
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["systemctl", "stop", "agent-vm-web.service"], commands)
+        self.assertIn(["systemctl", "disable", "agent-vm-web.service"], commands)
+
     def test_missing_legacy_enable_and_disable_are_allowed_but_other_failures_are_not(self):
         missing = subprocess.CompletedProcess(
             [], 1, b"", b"Failed to disable unit: Unit agent-vm-native-age-gc.service does not exist\n",
