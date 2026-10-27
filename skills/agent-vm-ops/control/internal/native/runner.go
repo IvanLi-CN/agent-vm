@@ -211,6 +211,11 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 				trackingErr = errors.New("native command left child processes behind")
 			}
 		}
+		if trackingErr == nil {
+			if groupErr := confirmGroupCleanup(cleanupOperations{groupAlive: tracker.groupAlive}); groupErr != nil {
+				trackingErr = groupErr
+			}
+		}
 		if trackingErr != nil {
 			killProcess(command.Process.Pid, pidfd)
 			if cleanupErr := cleanupTracked(tracker, command.Process.Pid); cleanupErr != nil {

@@ -594,12 +594,20 @@ func TestWorkerFinishedKeepsFailedWorkerReconciliable(t *testing.T) {
 	if err := service.WorkerFinished(context.Background(), operationID, identity, errors.New("native cleanup remained uncertain")); err != nil {
 		t.Fatal(err)
 	}
+	later := native.WorkerIdentity{PID: 456, StartTime: "later", ProcessGroup: 456}
+	if err := service.WorkerStarted(context.Background(), operationID, later); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.WorkerFinished(context.Background(), operationID, later, nil); err != nil {
+		t.Fatal(err)
+	}
 	operation, err := store.GetOperation(context.Background(), operationID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	worker, ok := operation.Response["worker"].(map[string]any)
-	if !ok || worker["state"] != "running" {
+	pid, validPID := protocol.Integer(worker["pid"])
+	if !ok || worker["state"] != "running" || !validPID || pid != 123 {
 		t.Fatalf("failed worker state = %#v, want running", operation.Response)
 	}
 	if worker["error"] != "native cleanup remained uncertain" {

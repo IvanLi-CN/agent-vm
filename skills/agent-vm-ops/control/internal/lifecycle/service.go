@@ -215,7 +215,17 @@ func (s *Service) recordWorker(ctx context.Context, operationID string, worker m
 	// The bounded background context only covers this small durable update.
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
-	return s.Store.RecordOperationWorker(persistCtx, operationID, worker)
+	return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
+		if previous, ok := response["worker"].(map[string]any); ok && stringValue(previous["state"]) == "running" {
+			if _, uncertain := previous["error"]; uncertain {
+				// Once native ownership is uncertain, later successful commands in
+				// the same operation must not erase the identity awaiting repair.
+				return nil
+			}
+		}
+		response["worker"] = worker
+		return nil
+	})
 }
 
 func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.Operation) error {
@@ -1012,14 +1022,15 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 			cancel()
 			if removeErr != nil {
 				cleanupErrors = append(cleanupErrors, port.DeviceName+": "+removeErr.Error())
-				continue
+				break
 			}
 		}
 		if removeErr := s.Store.DeletePort(ctx, task.TaskID, port.PortName, port.Protocol); removeErr != nil {
 			cleanupErrors = append(cleanupErrors, port.DeviceName+": "+removeErr.Error())
+			break
 		}
 	}
-	if nativePresent {
+	if len(cleanupErrors) == 0 && nativePresent {
 		workerCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 		defer cancel()
 		nativeState, statusErr := s.Guest.Status(workerCtx, task.InstanceName)
