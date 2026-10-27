@@ -57,9 +57,28 @@ func workerGroupAlive(group int, readTable func() (map[int]trackedProcess, error
 		sawZombie = true
 	}
 	if sawZombie {
-		// Zombies have no executable ownership left. A subreaper may still
-		// need to reap them, but they must not keep a completed worker alive.
-		return false, nil
+		// Refresh once before treating a zombie-only snapshot as gone. If the
+		// refresh is empty, the kernel probe below closes the enumeration gap;
+		// if it still contains only zombies, no executable ownership remains.
+		refreshed, refreshErr := readTable()
+		if refreshErr != nil {
+			return false, refreshErr
+		}
+		sawZombie = false
+		for _, candidate := range refreshed {
+			if candidate.group != group {
+				continue
+			}
+			if candidate.state != 'Z' {
+				return true, nil
+			}
+			sawZombie = true
+		}
+		if sawZombie {
+			// Zombies have no executable ownership left. A subreaper may still
+			// need to reap them, but they must not keep a completed worker alive.
+			return false, nil
+		}
 	}
 	// A procfs table is a point-in-time enumeration: a surviving member can
 	// fork after enumeration and exit before its stat file is read. The kernel

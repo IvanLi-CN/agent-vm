@@ -603,6 +603,39 @@ func TestWorkerGroupAliveTreatsOnlyZombiesAsGone(t *testing.T) {
 	}
 }
 
+func TestWorkerGroupAliveRefreshesZombieSnapshotBeforeKernelProbe(t *testing.T) {
+	command := exec.Command("sleep", "30")
+	configureCommand(command)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+	}()
+	group, err := unix.Getpgid(command.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := 0
+	alive, err := workerGroupAlive(group, func() (map[int]trackedProcess, error) {
+		calls++
+		if calls == 1 {
+			return map[int]trackedProcess{456: {pid: 456, group: group, state: 'Z'}}, nil
+		}
+		return map[int]trackedProcess{}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !alive {
+		t.Fatal("workerGroupAlive() missed a live kernel process group after a zombie snapshot")
+	}
+	if calls != 2 {
+		t.Fatalf("workerGroupAlive() read table %d times, want zombie refresh", calls)
+	}
+}
+
 func signalTestProcess(pid int, start string) error {
 	if pid <= 0 || start == "" {
 		return nil
