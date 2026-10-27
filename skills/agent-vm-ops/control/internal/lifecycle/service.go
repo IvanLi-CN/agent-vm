@@ -1606,7 +1606,7 @@ func (s *Service) doctor(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	return map[string]any{"up": true, "ready": s.Ready(), "draining": draining, "state_epoch": epoch, "transport": "http-over-uds"}, nil
+	return map[string]any{"up": true, "ready": s.Ready(), "issues": []any{}, "draining": draining, "state_epoch": epoch, "transport": "http-over-uds"}, nil
 }
 
 func (s *Service) sshInfo(ctx context.Context, request protocol.Request) (map[string]any, error) {

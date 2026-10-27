@@ -160,6 +160,30 @@ func TestAdminMetricsIncludesPendingOperations(t *testing.T) {
 	}
 }
 
+func TestDoctorIncludesIssueListForHealthContract(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	service := New(store, cfg, Options{})
+	response, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version,
+		"action":   "doctor",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := response["result"].(map[string]any)
+	issues, ok := result["issues"].([]any)
+	if !ok || len(issues) != 0 {
+		t.Fatalf("doctor issues = %#v", result["issues"])
+	}
+}
+
 func TestAdmissionAndLeaseTransitionsRemainDurable(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
