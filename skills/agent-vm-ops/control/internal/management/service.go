@@ -33,6 +33,7 @@ type Options struct {
 	UploadMaxBytes         int64
 	UploadMinimumFreeBytes int64
 	AvailableStagingBytes  func() (int64, error)
+	CurrentSystemVersion   func(context.Context) (string, error)
 	Clock                  func() time.Time
 	Backend                ImageBackend
 	Actions                ActionBackend
@@ -56,6 +57,12 @@ type ImageArtifact struct {
 type ActionBackend interface {
 	ExecuteVMAction(context.Context, string, string, string, int64, map[string]any) (map[string]any, error)
 	ExecuteMaintenance(context.Context, string, string, map[string]any) (map[string]any, error)
+}
+
+// VMActionGuard lets the native adapter re-check ownership immediately before
+// execution without making the browser-independent authority depend on it.
+type VMActionGuard interface {
+	ValidateVMAction(context.Context, state.Task, string, map[string]any) error
 }
 
 type ImportPart struct {
@@ -204,7 +211,7 @@ func (s *Service) StartImageImport(ctx context.Context, request ImportRequest) (
 	if request.Source.Kind == "trusted_remote" {
 		operation.Phase, operation.Status = "queued", "queued"
 	}
-	existing, err := s.Store.ClaimManagementOperation(ctx, operation)
+	existing, err := s.Store.ClaimManagementOperationWithAudit(ctx, operation, s.auditValue(operation, "accepted", operation.Phase, nil))
 	if err != nil {
 		return nil, err
 	}
@@ -213,9 +220,6 @@ func (s *Service) StartImageImport(ctx context.Context, request ImportRequest) (
 			return nil, errors.New("operation_conflict: operation ID belongs to a different request")
 		}
 		return existing, nil
-	}
-	if err := s.audit(ctx, operation, "accepted", operation.Phase, nil); err != nil {
-		return nil, err
 	}
 	return &operation, nil
 }
@@ -404,6 +408,39 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 	return s.finishImport(ctx, operation, request, artifact)
 }
 
+// RecoverOperation turns an interrupted native operation into a deterministic
+// recovery path. Trusted imports can be safely requeued; operations that need
+// native result reconciliation remain explicitly unknown for the administrator.
+func (s *Service) RecoverOperation(ctx context.Context, operationID string) (*state.ManagementOperation, error) {
+	operation, err := s.Store.GetManagementOperation(ctx, operationID)
+	if err != nil {
+		return nil, err
+	}
+	if operation == nil {
+		return nil, errors.New("not_found: management operation does not exist")
+	}
+	if operation.Status != "running" {
+		return operation, nil
+	}
+	if operation.Action == "image_import" {
+		request, requestErr := importRequestFromOperation(operation)
+		if requestErr != nil {
+			return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
+		}
+		if request.Source.Kind == "trusted_remote" {
+			queued, claimed, transitionErr := s.Store.TransitionManagementOperation(ctx, operationID, "running", "recovery", "queued")
+			if transitionErr != nil {
+				return nil, transitionErr
+			}
+			if !claimed {
+				return queued, nil
+			}
+			return s.ProcessTrustedImport(ctx, operationID)
+		}
+	}
+	return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
+}
+
 func (s *Service) finishImport(ctx context.Context, operation *state.ManagementOperation, request ImportRequest, artifact ImageArtifact) (*state.ManagementOperation, error) {
 	findings := []string{}
 	if artifact.Fingerprint != request.Source.ExpectedFingerprint && request.Source.Kind == "trusted_remote" {
@@ -445,7 +482,7 @@ func (s *Service) finishImport(ctx context.Context, operation *state.ManagementO
 		State: "available", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none",
 	}
 	if err := s.Store.InsertManagedImage(ctx, image); err != nil {
-		return s.failImport(ctx, operation, "image_import", "internal_error", err.Error(), true)
+		return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
 	}
 	return s.finishOperation(ctx, operation, "completed", "succeeded", map[string]any{"fingerprint": artifact.Fingerprint, "state": "available"}, nil)
 }
@@ -463,25 +500,11 @@ func (s *Service) failImport(ctx context.Context, operation *state.ManagementOpe
 }
 
 func (s *Service) finishOperation(ctx context.Context, operation *state.ManagementOperation, phase, status string, result, failure map[string]any) (*state.ManagementOperation, error) {
-	now := s.Clock().UTC().Format(time.RFC3339Nano)
-	if err := s.Store.UpdateManagementOperation(ctx, operation.OperationID, func(value *state.ManagementOperation) error {
-		value.Phase, value.Status, value.Result, value.Error, value.UpdatedAt = phase, status, result, failure, now
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-	updated, err := s.Store.GetManagementOperation(ctx, operation.OperationID)
-	if err != nil {
-		return nil, err
-	}
 	outcome := status
 	if outcome != "succeeded" && outcome != "outcome_unknown" {
 		outcome = "failed"
 	}
-	if auditErr := s.audit(ctx, *updated, outcome, phase, failure); auditErr != nil {
-		return nil, auditErr
-	}
-	return updated, nil
+	return s.Store.FinishManagementOperation(ctx, operation.OperationID, phase, status, result, failure, s.auditValue(*operation, outcome, phase, failure))
 }
 
 func (s *Service) SelectDefault(ctx context.Context, operationID, actor, reason, fingerprint, targetVersion string) (*state.ManagementOperation, error) {
@@ -528,10 +551,11 @@ func (s *Service) DeleteImage(ctx context.Context, operationID, actor, reason, f
 		if image.References.Total() > 0 {
 			return nil, fmt.Errorf("image_referenced: image has %d references", image.References.Total())
 		}
-		if s.Options.Backend != nil {
-			if err := s.Options.Backend.DeleteImage(ctx, fingerprint); err != nil {
-				return nil, err
-			}
+		if s.Options.Backend == nil {
+			return nil, errors.New("authority_unavailable: image backend is not configured")
+		}
+		if err := s.Options.Backend.DeleteImage(ctx, fingerprint); err != nil {
+			return nil, err
 		}
 		if err := s.Store.DeleteManagedImage(ctx, fingerprint); err != nil {
 			return nil, nativeStateUncertainError{cause: err}
@@ -576,7 +600,7 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 	req := map[string]any{"action": action, "target_id": targetID, "target_version": targetVersion, "actor": actor, "reason": reason}
 	digest, _ := protocol.Digest(protocol.Request(req))
 	operation := state.ManagementOperation{OperationID: operationID, Action: action, TargetKind: "image", TargetID: targetID, Actor: actor, Reason: reason, Phase: "reference_check", Status: "queued", Request: map[string]any{"_request_digest": digest, "request": req}}
-	existing, err := s.Store.ClaimManagementOperation(ctx, operation)
+	existing, err := s.Store.ClaimManagementOperationWithAudit(ctx, operation, s.auditValue(operation, "accepted", operation.Phase, nil))
 	if err != nil {
 		return nil, err
 	}
@@ -585,9 +609,6 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 			return nil, errors.New("operation_conflict: operation ID belongs to a different request")
 		}
 		return existing, nil
-	}
-	if err := s.audit(ctx, operation, "accepted", operation.Phase, nil); err != nil {
-		return nil, err
 	}
 	result, mutateErr := mutate()
 	if mutateErr != nil {
@@ -630,6 +651,14 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	if !contains([]string{"restart", "resize", "release", "destroy", "port_add", "port_remove"}, request.Action) {
 		return nil, errors.New("unsupported_action: VM action is not allowed")
 	}
+	if err := validateVMActionFence(task, request.Action, s.Clock()); err != nil {
+		return nil, err
+	}
+	if guard, ok := s.Options.Actions.(VMActionGuard); ok {
+		if err := guard.ValidateVMAction(ctx, *task, request.Action, request.Parameters); err != nil {
+			return nil, err
+		}
+	}
 	operation, err := s.claimAction(ctx, request.OperationID, request.Actor, request.Reason, request.Action, "vm", request.TaskID, actionRequest)
 	if err != nil || operation != nil && operation.Status != "queued" {
 		return operation, err
@@ -639,6 +668,21 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 		return nil
 	}); err != nil {
 		return nil, err
+	}
+	latest, err := s.Store.GetTask(ctx, map[string]any{"task_id": request.TaskID})
+	if err != nil {
+		return nil, err
+	}
+	if latest == nil || latest.Generation != request.ExpectedGeneration || latest.UpdatedAt != task.UpdatedAt {
+		return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, map[string]any{"code": "stale_target"})
+	}
+	if err := validateVMActionFence(latest, request.Action, s.Clock()); err != nil {
+		return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, safeError(err))
+	}
+	if guard, ok := s.Options.Actions.(VMActionGuard); ok {
+		if err := guard.ValidateVMAction(ctx, *latest, request.Action, request.Parameters); err != nil {
+			return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, safeError(err))
+		}
 	}
 	result, actionErr := s.Options.Actions.ExecuteVMAction(ctx, request.OperationID, request.Action, request.TaskID, request.ExpectedGeneration, request.Parameters)
 	if actionErr != nil {
@@ -669,6 +713,16 @@ func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceReq
 	if !contains([]string{"drain_enter", "drain_exit", "reconcile", "gc"}, request.Action) {
 		return nil, errors.New("unsupported_action: maintenance action is not allowed")
 	}
+	if s.Options.CurrentSystemVersion == nil {
+		return nil, errors.New("authority_unavailable: current system version is not configured")
+	}
+	currentVersion, versionErr := s.Options.CurrentSystemVersion(ctx)
+	if versionErr != nil {
+		return nil, errors.New("authority_unavailable: current system version could not be read")
+	}
+	if request.TargetVersion != currentVersion {
+		return nil, fmt.Errorf("stale_target: expected %s, current %s", request.TargetVersion, currentVersion)
+	}
 	operation, err := s.claimAction(ctx, request.OperationID, request.Actor, request.Reason, request.Action, "system", "system", actionRequest)
 	if err != nil || operation != nil && operation.Status != "queued" {
 		return operation, err
@@ -698,7 +752,7 @@ func (s *Service) claimAction(ctx context.Context, operationID, actor, reason, a
 	request["action"], request["target_kind"], request["target_id"] = action, targetKind, targetID
 	digest, _ := protocol.Digest(protocol.Request(request))
 	operation := state.ManagementOperation{OperationID: operationID, Action: action, TargetKind: targetKind, TargetID: targetID, Actor: actor, Reason: reason, Phase: "native_action", Status: "queued", Request: map[string]any{"_request_digest": digest, "request": request}}
-	existing, err := s.Store.ClaimManagementOperation(ctx, operation)
+	existing, err := s.Store.ClaimManagementOperationWithAudit(ctx, operation, s.auditValue(operation, "accepted", operation.Phase, nil))
 	if err != nil {
 		return nil, err
 	}
@@ -708,14 +762,28 @@ func (s *Service) claimAction(ctx context.Context, operationID, actor, reason, a
 		}
 		return existing, nil
 	}
-	if err := s.audit(ctx, operation, "accepted", operation.Phase, nil); err != nil {
-		return nil, err
-	}
 	return &operation, nil
 }
 
-func (s *Service) audit(ctx context.Context, operation state.ManagementOperation, outcome, phase string, detail map[string]any) error {
-	return s.Store.RecordManagementAudit(ctx, state.ManagementAudit{EventID: auditEventID(operation.OperationID, phase, outcome), OperationID: stringPointer(operation.OperationID), Action: operation.Action, Actor: operation.Actor, Reason: operation.Reason, Target: map[string]any{"kind": operation.TargetKind, "id": operation.TargetID}, Outcome: outcome, Phase: phase, Detail: detail, OccurredAt: s.Clock().UTC().Format(time.RFC3339Nano)})
+func (s *Service) auditValue(operation state.ManagementOperation, outcome, phase string, detail map[string]any) state.ManagementAudit {
+	return state.ManagementAudit{EventID: auditEventID(operation.OperationID, phase, outcome), OperationID: stringPointer(operation.OperationID), Action: operation.Action, Actor: operation.Actor, Reason: operation.Reason, Target: map[string]any{"kind": operation.TargetKind, "id": operation.TargetID}, Outcome: outcome, Phase: phase, Detail: detail, OccurredAt: s.Clock().UTC().Format(time.RFC3339Nano)}
+}
+
+func validateVMActionFence(task *state.Task, action string, now time.Time) error {
+	if task == nil || task.State == "absent" {
+		return errors.New("stale_target: VM is not available")
+	}
+	if action == "release" || action == "destroy" {
+		return nil
+	}
+	if task.State != "active" || task.LeaseExpiresAt == nil {
+		return errors.New("stale_target: VM lease is not active")
+	}
+	lease, err := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
+	if err != nil || !lease.After(now.UTC()) {
+		return errors.New("stale_target: VM lease has expired")
+	}
+	return nil
 }
 
 func auditEventID(operationID, phase, outcome string) string {

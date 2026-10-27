@@ -484,7 +484,7 @@ func (s *Store) SelectManagedImage(ctx context.Context, fingerprint, expectedVer
 		if stateValue != "available" || integrity != "passed" || suitability != "passed" {
 			return errors.New("image_not_applicable: image is not fully verified")
 		}
-		if _, err := tx.exec("UPDATE managed_images SET is_default = 0, updated_at = ? WHERE is_default = 1", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := tx.exec("UPDATE managed_images SET is_default = 0, revision = revision + 1, updated_at = ? WHERE is_default = 1", time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
 		newNumber := currentNumber + 1
@@ -678,6 +678,45 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`, value.OperationID, value.A
 	return existing, err
 }
 
+func (s *Store) ClaimManagementOperationWithAudit(ctx context.Context, value ManagementOperation, audit ManagementAudit) (*ManagementOperation, error) {
+	request, err := json.Marshal(value.Request)
+	if err != nil {
+		return nil, err
+	}
+	target, err := json.Marshal(audit.Target)
+	if err != nil {
+		return nil, err
+	}
+	detail, err := jsonNullable(audit.Detail)
+	if err != nil {
+		return nil, err
+	}
+	var existing *ManagementOperation
+	err = s.withWrite(ctx, func(tx *Tx) error {
+		current, scanErr := scanManagementOperation(ctx, tx.conn, value.OperationID)
+		if scanErr == nil {
+			existing = current
+			return nil
+		}
+		if !errors.Is(scanErr, sql.ErrNoRows) {
+			return scanErr
+		}
+		now := value.CreatedAt
+		if now == "" {
+			now = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+		if value.UpdatedAt == "" {
+			value.UpdatedAt = now
+		}
+		if _, err := tx.exec(`INSERT INTO management_operations(operation_id, action, target_kind, target_id, actor, reason, phase, status, request_json, result_json, error_json, created_at, updated_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`, value.OperationID, value.Action, value.TargetKind, value.TargetID, value.Actor, value.Reason, value.Phase, value.Status, string(request), now, value.UpdatedAt); err != nil {
+			return err
+		}
+		return recordManagementAuditTx(tx, audit, string(target), detail, now)
+	})
+	return existing, err
+}
+
 func (s *Store) GetManagementOperation(ctx context.Context, operationID string) (*ManagementOperation, error) {
 	var value *ManagementOperation
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
@@ -746,6 +785,46 @@ func (s *Store) UpdateManagementOperation(ctx context.Context, operationID strin
 	})
 }
 
+func (s *Store) FinishManagementOperation(ctx context.Context, operationID, phase, status string, result, failure map[string]any, audit ManagementAudit) (*ManagementOperation, error) {
+	target, err := json.Marshal(audit.Target)
+	if err != nil {
+		return nil, err
+	}
+	detail, err := jsonNullable(audit.Detail)
+	if err != nil {
+		return nil, err
+	}
+	err = s.withWrite(ctx, func(tx *Tx) error {
+		value, err := scanManagementOperation(ctx, tx.conn, operationID)
+		if err != nil {
+			return err
+		}
+		if value.Status == "succeeded" || value.Status == "failed" || value.Status == "outcome_unknown" {
+			return errors.New("management operation is already finalized")
+		}
+		resultJSON, err := jsonNullable(result)
+		if err != nil {
+			return err
+		}
+		errorJSON, err := jsonNullable(failure)
+		if err != nil {
+			return err
+		}
+		now := audit.OccurredAt
+		if now == "" {
+			now = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+		if _, err := tx.exec("UPDATE management_operations SET phase = ?, status = ?, result_json = ?, error_json = ?, updated_at = ? WHERE operation_id = ?", phase, status, resultJSON, errorJSON, now, operationID); err != nil {
+			return err
+		}
+		return recordManagementAuditTx(tx, audit, string(target), detail, now)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.GetManagementOperation(ctx, operationID)
+}
+
 func scanManagementOperation(ctx context.Context, conn *sql.Conn, operationID string) (*ManagementOperation, error) {
 	return scanManagementOperationRow(conn.QueryRowContext(ctx, `SELECT operation_id, action, target_kind, target_id, actor, reason, phase, status, request_json, result_json, error_json, created_at, updated_at FROM management_operations WHERE operation_id = ?`, operationID))
 }
@@ -783,10 +862,14 @@ func (s *Store) RecordManagementAudit(ctx context.Context, value ManagementAudit
 		now = time.Now().UTC().Format(time.RFC3339Nano)
 	}
 	return s.withWrite(ctx, func(tx *Tx) error {
-		_, err := tx.exec(`INSERT OR IGNORE INTO management_audit(event_id, operation_id, action, actor, reason, target_json, outcome, phase, detail_json, occurred_at)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, value.EventID, nullableStringArg(value.OperationID), value.Action, value.Actor, value.Reason, string(target), value.Outcome, value.Phase, detail, now)
-		return err
+		return recordManagementAuditTx(tx, value, string(target), detail, now)
 	})
+}
+
+func recordManagementAuditTx(tx *Tx, value ManagementAudit, target string, detail any, occurredAt string) error {
+	_, err := tx.exec(`INSERT OR IGNORE INTO management_audit(event_id, operation_id, action, actor, reason, target_json, outcome, phase, detail_json, occurred_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, value.EventID, nullableStringArg(value.OperationID), value.Action, value.Actor, value.Reason, target, value.Outcome, value.Phase, detail, occurredAt)
+	return err
 }
 
 func (s *Store) ListManagementAudit(ctx context.Context, limit int) ([]ManagementAudit, error) {
@@ -804,16 +887,19 @@ FROM management_audit ORDER BY occurred_at DESC, event_id DESC LIMIT ?`, limit)
 		for rows.Next() {
 			var value ManagementAudit
 			var operationID sql.NullString
-			var target, detail string
+			var target, detail sql.NullString
 			if err := rows.Scan(&value.EventID, &operationID, &value.Action, &value.Actor, &value.Reason, &target, &value.Outcome, &value.Phase, &detail, &value.OccurredAt); err != nil {
 				return err
 			}
 			value.OperationID = nullableString(operationID)
-			if err := json.Unmarshal([]byte(target), &value.Target); err != nil {
+			if !target.Valid {
+				return errors.New("management audit target is null")
+			}
+			if err := json.Unmarshal([]byte(target.String), &value.Target); err != nil {
 				return err
 			}
-			if detail != "" {
-				if err := json.Unmarshal([]byte(detail), &value.Detail); err != nil {
+			if detail.Valid && detail.String != "" {
+				if err := json.Unmarshal([]byte(detail.String), &value.Detail); err != nil {
 					return err
 				}
 			}

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
@@ -204,6 +205,38 @@ func TestUnsuitableImageIsPersistedAsFailedAndCannotBecomeDefault(t *testing.T) 
 	}
 }
 
+func TestDeleteImageFailsClosedWithoutNativeBackend(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	legacy := strings.Repeat("a", 64)
+	imageFingerprint := strings.Repeat("b", 64)
+	if err := store.SeedLegacyImage(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: imageFingerprint, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, Options{})
+	operation, err := service.DeleteImage(ctx, "delete-without-backend", "admin", "remove image", imageFingerprint, "image:"+imageFingerprint+":revision-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Status != "failed" || operation.Error["code"] != "authority_unavailable" {
+		t.Fatalf("operation = %#v", operation)
+	}
+	image, err := store.GetManagedImage(ctx, imageFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image == nil {
+		t.Fatal("catalog image was removed without native deletion")
+	}
+}
+
 func TestVMActionOperationIsIdempotentAndRejectsStaleGeneration(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -211,8 +244,9 @@ func TestVMActionOperationIsIdempotentAndRejectsStaleGeneration(t *testing.T) {
 	}
 	defer store.Close()
 	updatedAt := "2026-10-27T00:00:00Z"
+	lease := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
 	fingerprint := strings.Repeat("a", 64)
-	if err := store.InsertTask(context.Background(), state.Task{TaskID: "task-1", SessionID: "session-1", Generation: 4, State: "active", InstanceName: "agent-vm-task-1", CreatedAt: updatedAt, UpdatedAt: updatedAt, ImageFingerprint: fingerprint, ResourcesJSON: "{}", ResourceReservationJSON: "{}"}); err != nil {
+	if err := store.InsertTask(context.Background(), state.Task{TaskID: "task-1", SessionID: "session-1", Generation: 4, State: "active", InstanceName: "agent-vm-task-1", LeaseExpiresAt: &lease, CreatedAt: updatedAt, UpdatedAt: updatedAt, ImageFingerprint: fingerprint, ResourcesJSON: "{}", ResourceReservationJSON: "{}"}); err != nil {
 		t.Fatal(err)
 	}
 	backend := &fakeActionBackend{}
@@ -243,7 +277,8 @@ func TestUncertainVMActionRemainsOutcomeUnknown(t *testing.T) {
 	}
 	defer store.Close()
 	updatedAt := "2026-10-27T00:00:00Z"
-	if err := store.InsertTask(context.Background(), state.Task{TaskID: "task-2", SessionID: "session-2", Generation: 1, State: "active", InstanceName: "agent-vm-task-2", CreatedAt: updatedAt, UpdatedAt: updatedAt, ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: "{}", ResourceReservationJSON: "{}"}); err != nil {
+	lease := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	if err := store.InsertTask(context.Background(), state.Task{TaskID: "task-2", SessionID: "session-2", Generation: 1, State: "active", InstanceName: "agent-vm-task-2", LeaseExpiresAt: &lease, CreatedAt: updatedAt, UpdatedAt: updatedAt, ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: "{}", ResourceReservationJSON: "{}"}); err != nil {
 		t.Fatal(err)
 	}
 	backend := &fakeActionBackend{err: uncertainActionError{}}
@@ -254,6 +289,26 @@ func TestUncertainVMActionRemainsOutcomeUnknown(t *testing.T) {
 	}
 	if operation.Status != "outcome_unknown" {
 		t.Fatalf("operation = %#v", operation)
+	}
+}
+
+func TestMaintenanceChecksCurrentSystemVersionBeforeClaim(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, Options{Actions: &fakeActionBackend{}, CurrentSystemVersion: func(context.Context) (string, error) { return "system:revision-2", nil }})
+	request := MaintenanceRequest{OperationID: "maintenance-stale", Actor: "admin", Reason: "reconcile", TargetVersion: "system:revision-1", Action: "reconcile"}
+	if _, err := service.ExecuteMaintenance(context.Background(), request); err == nil || !strings.HasPrefix(err.Error(), "stale_target:") {
+		t.Fatalf("maintenance error = %v", err)
+	}
+	operation, err := store.GetManagementOperation(context.Background(), request.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation != nil {
+		t.Fatalf("stale maintenance was claimed: %#v", operation)
 	}
 }
 

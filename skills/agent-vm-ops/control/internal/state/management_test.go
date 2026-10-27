@@ -119,8 +119,27 @@ func TestDefaultSwitchLeavesExistingTaskImageBindingUntouched(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if oldImage.References.Cached != 1 || oldImage.IsDefault {
-		t.Fatalf("old image references = %#v default=%v", oldImage.References, oldImage.IsDefault)
+	if oldImage.References.Cached != 1 || oldImage.IsDefault || oldImage.Revision < 2 {
+		t.Fatalf("old image references = %#v default=%v revision=%d", oldImage.References, oldImage.IsDefault, oldImage.Revision)
+	}
+}
+
+func TestManagementAuditListAcceptsNullDetail(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.RecordManagementAudit(ctx, ManagementAudit{EventID: "audit-null-detail", Action: "test", Actor: "admin", Reason: "verify", Target: map[string]any{"kind": "test", "id": "one"}, Outcome: "accepted", Phase: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	audits, err := store.ListManagementAudit(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) != 1 || audits[0].Detail != nil {
+		t.Fatalf("audits = %#v", audits)
 	}
 }
 
