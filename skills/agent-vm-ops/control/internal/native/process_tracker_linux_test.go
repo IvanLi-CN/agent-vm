@@ -5,6 +5,7 @@ package native
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -85,8 +86,12 @@ func TestProcessTrackerFindsReparentedGroupMemberWithoutCgroup(t *testing.T) {
 		tracked:  make(map[int]trackedProcess),
 		cgroupFD: -1,
 	}
-	command := exec.Command("/bin/sh", "-c", "sleep 30 & child=$!; echo $child; exit 0")
+	command := exec.Command("/bin/sh", "-c", "sleep 30 & child=$!; echo $child; read _; exit 0")
 	configureCommand(command)
+	stdin, err := command.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -94,15 +99,19 @@ func TestProcessTrackerFindsReparentedGroupMemberWithoutCgroup(t *testing.T) {
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
+	defer stdin.Close()
 	defer stdout.Close()
 	tracker.Register(command.Process.Pid)
 	childPID := 0
+	childStart := ""
+	cleaned := false
 	defer func() {
-		if tracker.rootGroup > 0 {
-			_ = unix.Kill(-tracker.rootGroup, unix.SIGKILL)
-		}
-		if childPID > 0 {
-			_ = unix.Kill(childPID, unix.SIGKILL)
+		if !cleaned {
+			_ = tracker.Kill()
+			_ = signalTestProcess(command.Process.Pid, tracker.rootStart)
+			if childPID > 0 {
+				_ = signalTestProcess(childPID, childStart)
+			}
 		}
 		_ = command.Wait()
 		if childPID > 0 {
@@ -116,6 +125,18 @@ func TestProcessTrackerFindsReparentedGroupMemberWithoutCgroup(t *testing.T) {
 	}
 	childPID, err = strconv.Atoi(strings.TrimSpace(scanner.Text()))
 	if err != nil {
+		t.Fatal(err)
+	}
+	if child, err := workerIdentity(childPID); err == nil {
+		childStart = child.StartTime
+	}
+	if err := tracker.Discover(command.Process.Pid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stdin.Write([]byte("\n")); err != nil {
+		t.Fatal(err)
+	}
+	if err := stdin.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := command.Wait(); err != nil {
@@ -134,6 +155,38 @@ func TestProcessTrackerFindsReparentedGroupMemberWithoutCgroup(t *testing.T) {
 	if err := cleanupTracked(tracker, command.Process.Pid); err != nil {
 		t.Fatal(err)
 	}
+	cleaned = true
+}
+
+func TestProcessTrackerRejectsUnobservedReusedProcessGroup(t *testing.T) {
+	tracker := &processTracker{
+		root:      100,
+		rootStart: "root-start",
+		rootGroup: 100,
+		baseline:  make(map[int]trackedProcess),
+		tracked:   make(map[int]trackedProcess),
+	}
+	first := map[int]trackedProcess{
+		100: {pid: 100, start: "root-start", parent: 1, group: 100, state: 'S'},
+		200: {pid: 200, start: "old-child", parent: 100, group: 100, state: 'S'},
+	}
+	second := map[int]trackedProcess{
+		300: {pid: 300, start: "new-child", parent: 1, group: 100, state: 'S'},
+	}
+	snapshot := 0
+	readTable := func() (map[int]trackedProcess, error) {
+		snapshot++
+		if snapshot == 1 {
+			return first, nil
+		}
+		return second, nil
+	}
+	if err := tracker.discoverWith(100, readTable); err != nil {
+		t.Fatalf("initial discover() error = %v", err)
+	}
+	if err := tracker.discoverWith(100, readTable); err == nil || !strings.Contains(err.Error(), "group membership unavailable") {
+		t.Fatalf("reused group discover() error = %v, want group membership failure", err)
+	}
 }
 
 func TestWorkerAliveDetectsSurvivingProcessGroupAfterRootExit(t *testing.T) {
@@ -150,22 +203,20 @@ func TestWorkerAliveDetectsSurvivingProcessGroupAfterRootExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stdout.Close()
-	processGroup := command.Process.Pid
-	if group, groupErr := unix.Getpgid(command.Process.Pid); groupErr == nil {
-		processGroup = group
-	}
 	childPID := 0
+	childStart := ""
+	identity := WorkerIdentity{}
 	defer func() {
-		_ = unix.Kill(-processGroup, unix.SIGKILL)
+		_ = signalTestProcess(identity.PID, identity.StartTime)
 		if childPID > 0 {
-			_ = unix.Kill(childPID, unix.SIGKILL)
+			_ = signalTestProcess(childPID, childStart)
 		}
 		_ = command.Wait()
 		if childPID > 0 {
 			_, _ = unix.Wait4(childPID, nil, 0, nil)
 		}
 	}()
-	identity, err := workerIdentity(command.Process.Pid)
+	identity, err = workerIdentity(command.Process.Pid)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +228,10 @@ func TestWorkerAliveDetectsSurvivingProcessGroupAfterRootExit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Kill(identity.PID, unix.SIGKILL); err != nil {
+	if child, err := workerIdentity(childPID); err == nil {
+		childStart = child.StartTime
+	}
+	if err := signalTestProcess(identity.PID, identity.StartTime); err != nil {
 		t.Fatal(err)
 	}
 	_ = command.Wait()
@@ -191,7 +245,7 @@ func TestWorkerAliveDetectsSurvivingProcessGroupAfterRootExit(t *testing.T) {
 	if err := KillWorker(identity); err == nil || !strings.Contains(err.Error(), "process group remains") {
 		t.Fatalf("KillWorker() error = %v, want process-group safety error", err)
 	}
-	if err := unix.Kill(-identity.ProcessGroup, unix.SIGKILL); err != nil && !errors.Is(err, unix.ESRCH) {
+	if err := signalTestProcess(childPID, childStart); err != nil && !processGone(err) {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(2 * time.Second)
@@ -289,4 +343,48 @@ func TestWorkerGroupAlivePropagatesProcessTableErrors(t *testing.T) {
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("workerGroupAlive() error = %v, want %v", err, sentinel)
 	}
+}
+
+func TestWorkerGroupAliveUsesKernelGroupPresence(t *testing.T) {
+	command := exec.Command("sleep", "30")
+	configureCommand(command)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+	}()
+	group, err := unix.Getpgid(command.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alive, err := workerGroupAlive(group, func() (map[int]trackedProcess, error) {
+		return map[int]trackedProcess{}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !alive {
+		t.Fatal("workerGroupAlive() missed a process group hidden by the synthetic empty snapshot")
+	}
+}
+
+func signalTestProcess(pid int, start string) error {
+	if pid <= 0 || start == "" {
+		return nil
+	}
+	fd, err := unix.PidfdOpen(pid, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	current, err := workerIdentity(pid)
+	if err != nil {
+		return err
+	}
+	if current.StartTime != start {
+		return fmt.Errorf("test process identity changed for pid %d", pid)
+	}
+	return unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
 }

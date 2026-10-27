@@ -50,6 +50,15 @@ func workerGroupAlive(group int, readTable func() (map[int]trackedProcess, error
 			return true, nil
 		}
 	}
+	// A procfs table is a point-in-time enumeration: a surviving member can
+	// fork after enumeration and exit before its stat file is read. The kernel
+	// process-group probe closes that false-empty window. If the group exists
+	// but only exposes zombies, stay conservative and require reconciliation.
+	if err := unix.Kill(-group, 0); err == nil || errors.Is(err, unix.EPERM) {
+		return true, nil
+	} else if !errors.Is(err, unix.ESRCH) {
+		return false, err
+	}
 	return false, nil
 }
 

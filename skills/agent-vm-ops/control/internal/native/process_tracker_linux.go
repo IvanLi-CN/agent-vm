@@ -25,14 +25,15 @@ type trackedProcess struct {
 }
 
 type processTracker struct {
-	owner      int
-	root       int
-	rootGroup  int
-	rootStart  string
-	baseline   map[int]trackedProcess
-	tracked    map[int]trackedProcess
-	cgroupPath string
-	cgroupFD   int
+	owner        int
+	root         int
+	rootGroup    int
+	rootStart    string
+	baseline     map[int]trackedProcess
+	tracked      map[int]trackedProcess
+	groupMembers map[int]trackedProcess
+	cgroupPath   string
+	cgroupFD     int
 }
 
 var nativeProcessTreeMu sync.Mutex
@@ -78,7 +79,13 @@ func newProcessTracker() (*processTracker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("snapshot native process tree: %w", err)
 	}
-	tracker := &processTracker{owner: owner, baseline: baseline, tracked: make(map[int]trackedProcess), cgroupFD: -1}
+	tracker := &processTracker{
+		owner:        owner,
+		baseline:     baseline,
+		tracked:      make(map[int]trackedProcess),
+		groupMembers: make(map[int]trackedProcess),
+		cgroupFD:     -1,
+	}
 	tracker.prepareCgroup()
 	return tracker, nil
 }
@@ -139,11 +146,16 @@ func (tracker *processTracker) discover(root int) error {
 	if tracker.root == 0 {
 		tracker.root = root
 	}
-	all, err := readProcessTable()
+	return tracker.discoverWith(root, readProcessTable)
+}
+
+func (tracker *processTracker) discoverWith(root int, readTable func() (map[int]trackedProcess, error)) error {
+	all, err := readTable()
 	if err != nil {
 		return fmt.Errorf("inspect native process tree: %w", err)
 	}
-	if rootProcess, present := all[root]; present {
+	rootProcess, rootPresent := all[root]
+	if rootPresent {
 		if tracker.rootStart == "" {
 			tracker.rootStart = rootProcess.start
 		}
@@ -165,21 +177,39 @@ func (tracker *processTracker) discover(root int) error {
 	// Without a delegated cgroup, a descendant can outlive the root and be
 	// reparented to the subreaper before the next process-table snapshot. The
 	// isolated process group remains the ownership boundary in that case.
+	var currentGroup map[int]trackedProcess
 	if !tracker.hasOwnershipBoundary() && tracker.rootGroup > 0 {
-		groupMembers := make(map[int]trackedProcess)
+		if tracker.groupMembers == nil {
+			tracker.groupMembers = make(map[int]trackedProcess)
+		}
+		currentGroup = make(map[int]trackedProcess)
 		for pid, item := range all {
 			if item.group == tracker.rootGroup {
-				groupMembers[pid] = item
+				currentGroup[pid] = item
 			}
 		}
-		if _, rootPresent := all[root]; !rootPresent && tracker.rootStart == "" && len(groupMembers) > 0 {
-			return errors.New("native process root identity unavailable while its process group remains")
-		}
-		for pid, item := range groupMembers {
-			if pid == root && tracker.rootStart != "" && item.start != tracker.rootStart {
-				return fmt.Errorf("native process identity changed for pid %d", root)
+		if rootPresent {
+			for pid, item := range currentGroup {
+				if previous, ok := tracker.groupMembers[pid]; ok && previous.start != item.start {
+					return fmt.Errorf("native process identity changed for pid %d", pid)
+				}
+				tracker.groupMembers[pid] = item
+				related[pid] = item
 			}
-			related[pid] = item
+		} else {
+			if tracker.rootStart == "" && len(currentGroup) > 0 {
+				return errors.New("native process root identity unavailable while its process group remains")
+			}
+			for pid, item := range currentGroup {
+				previous, ok := tracker.groupMembers[pid]
+				if !ok {
+					continue
+				}
+				if previous.start != item.start {
+					return fmt.Errorf("native process identity changed for pid %d", pid)
+				}
+				related[pid] = item
+			}
 		}
 	}
 	// A detached descendant is only owned after this tracker has observed it
@@ -189,6 +219,17 @@ func (tracker *processTracker) discover(root int) error {
 		if _, present := all[pid]; present {
 			for child, item := range descendants(all, pid) {
 				related[child] = item
+			}
+		}
+	}
+	if !tracker.hasOwnershipBoundary() && tracker.rootGroup > 0 && !rootPresent {
+		for pid, item := range currentGroup {
+			owned, ok := related[pid]
+			if !ok {
+				return fmt.Errorf("native process group membership unavailable for pid %d", pid)
+			}
+			if owned.start != item.start {
+				return fmt.Errorf("native process identity changed for pid %d", pid)
 			}
 		}
 	}
