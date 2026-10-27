@@ -447,6 +447,60 @@ func TestStartupReconcileRetriesFinishedAdminMaintenanceWorker(t *testing.T) {
 	}
 }
 
+func TestReleaseCancelsPendingAcquireForCachedTask(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "cached-acquire-recovery.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "cached-task", SessionID: "cached-session", Generation: 8, State: stateCached,
+		InstanceName: "agent-cached", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{
+		"protocol":     protocol.Version,
+		"action":       "acquire",
+		"session_id":   "cached-session",
+		"generation":   int64(8),
+		"operation_id": "pending-cached-acquire",
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(8)
+	if err := store.RecordOperation(context.Background(), "pending-cached-acquire", "acquire", stringPointer("cached-session"), &generation, map[string]any{
+		"outcome":         "pending",
+		"_request_digest": digest,
+		"_request":        map[string]any(request),
+		"worker":          map[string]any{"state": "starting"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Resident: true, Clock: func() time.Time { return now }})
+	if _, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "release", "session_id": "cached-session",
+		"generation": int64(8), "operation_id": "release-cached-acquire",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), "pending-cached-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("cancelled acquire = %#v", operation)
+	}
+	control, ok := operation.Response["error"].(map[string]any)
+	if !ok || control["code"] != "lease_released" {
+		t.Fatalf("cancelled acquire error = %#v", operation.Response["error"])
+	}
+}
+
 func TestReconcileDoesNotKillAnActivePendingWorker(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

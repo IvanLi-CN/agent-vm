@@ -851,9 +851,15 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		return nil, err
 	}
 	if task.State == stateAbsent {
+		if err := s.cancelPendingAcquireOperations(ctx, task); err != nil {
+			return nil, err
+		}
 		return s.summary(ctx, task)
 	}
 	if task.State == stateCached && !destroy {
+		if err := s.cancelPendingAcquireOperations(ctx, task); err != nil {
+			return nil, err
+		}
 		return s.summary(ctx, task)
 	}
 	if task.State == stateActive || task.State == statePreparing || task.State == stateFailed || (destroy && task.State == stateCached) {
@@ -948,6 +954,79 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		}
 	}
 	return s.status(ctx, task.SessionID)
+}
+
+func (s *Service) pendingAcquireOperations(ctx context.Context, task *state.Task) ([]state.Operation, error) {
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return nil, s.sqliteError(err)
+	}
+	var previousGeneration *int64
+	if task.Generation > 0 {
+		value := task.Generation - 1
+		previousGeneration = &value
+	}
+	result := make([]state.Operation, 0)
+	for _, operation := range pending {
+		if operation.Action != "acquire" || operation.SessionID == nil || *operation.SessionID != task.SessionID || operation.Generation == nil {
+			continue
+		}
+		if *operation.Generation == task.Generation || previousGeneration != nil && *operation.Generation == *previousGeneration {
+			result = append(result, operation)
+		}
+	}
+	return result, nil
+}
+
+func (s *Service) cancelPendingAcquireOperations(ctx context.Context, task *state.Task) error {
+	pending, err := s.pendingAcquireOperations(ctx, task)
+	if err != nil || len(pending) == 0 {
+		return err
+	}
+	for _, operation := range pending {
+		digest := stringValue(operation.Response["_request_digest"])
+		if digest == "" {
+			return protocol.NewError("operation_unverified", "pending acquire operation cannot be finalized", map[string]any{"operation_id": operation.OperationID})
+		}
+		response := map[string]any{
+			"outcome": "error",
+			"error": protocol.NewError("lease_released", "the lease was released before the acquire operation was acknowledged", map[string]any{
+				"task_id": task.TaskID, "task_generation": task.Generation, "outcome_verified": true,
+			}),
+			"_request_digest": digest,
+		}
+		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+			return s.sqliteError(err)
+		}
+	}
+	marker := map[string]any{
+		"pending_acquire_cancellation":  true,
+		"pending_acquire_operation_ids": operationIDs(pending),
+		"task_id":                       task.TaskID,
+		"task_generation":               task.Generation,
+	}
+	if task.LastError != nil {
+		var previous map[string]any
+		if json.Unmarshal([]byte(*task.LastError), &previous) == nil {
+			for key, value := range previous {
+				if _, exists := marker[key]; !exists {
+					marker[key] = value
+				}
+			}
+		}
+	}
+	if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"last_error": mustJSON(marker), "updated_at": nowString(s.Clock())}); err != nil {
+		return s.sqliteError(err)
+	}
+	return nil
+}
+
+func operationIDs(operations []state.Operation) []string {
+	ids := make([]string, 0, len(operations))
+	for _, operation := range operations {
+		ids = append(ids, operation.OperationID)
+	}
+	return ids
 }
 
 func (s *Service) restart(ctx context.Context, request protocol.Request) (map[string]any, error) {
