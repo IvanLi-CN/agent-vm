@@ -717,6 +717,56 @@ func TestStartupReconcileLeavesOrphanedAcquireWithNativeInstanceBlocked(t *testi
 	}
 }
 
+func TestStartupReconcileCancelsAcquireForCachedStoppedTask(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "cached-pending-acquire.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	session := "cached-pending-acquire-session"
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "cached-pending-task", SessionID: session, Generation: 2, State: stateCached,
+		InstanceName: "agent-cached-pending", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(1), "operation_id": "cached-pending-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(1)
+	if err := store.RecordOperation(context.Background(), "cached-pending-acquire", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status: "Stopped",
+		config: map[string]any{
+			"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "cached-pending-task", "user.agent-vm.session": session, "user.agent-vm.generation": "2"},
+			"devices": map[string]any{}, "expanded_devices": map[string]any{},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), "cached-pending-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("cached pending acquire = %#v", operation)
+	}
+	control, ok := operation.Response["error"].(map[string]any)
+	if !ok || control["code"] != "lease_released" {
+		t.Fatalf("cached pending acquire error = %#v", operation.Response["error"])
+	}
+}
+
 func TestStartupReconcileVerifiesDurableActiveGuest(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-state.sqlite3"))
 	if err != nil {

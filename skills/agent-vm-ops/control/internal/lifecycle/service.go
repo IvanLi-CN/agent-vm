@@ -561,15 +561,48 @@ func (s *Service) reconcileOrphanedAcquireOperations(ctx context.Context, pendin
 		if err != nil {
 			return s.sqliteError(err)
 		}
-		if task != nil {
+		if task != nil && task.State != stateAbsent && task.State != stateCached {
 			continue
 		}
 		digest := stringValue(operation.Response["_request_digest"])
 		if digest == "" {
 			return protocol.NewError("startup_reconcile_required", "orphaned acquire operation is missing its request digest", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
 		}
+		if task != nil && task.State == stateCached {
+			if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr != nil {
+				return protocol.NewError("startup_reconcile_required", "cached task ownership could not be verified while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": ownershipErr.Error()})
+			}
+			statusCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+			status, statusErr := s.Guest.Status(statusCtx, task.InstanceName)
+			cancel()
+			if statusErr != nil {
+				return protocol.NewError("startup_reconcile_required", "cached task status could not be verified while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": statusErr.Error()})
+			}
+			stateValue, parseErr := native.ParseStatus(status)
+			if parseErr != nil || !strings.EqualFold(stateValue, "stopped") {
+				if parseErr != nil {
+					return protocol.NewError("startup_reconcile_required", "cached task status is malformed while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": parseErr.Error()})
+				}
+				return protocol.NewError("startup_reconcile_required", "cached task is not stopped while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "status": stateValue})
+			}
+			response := map[string]any{
+				"outcome": "error",
+				"error": protocol.NewError("lease_released", "the lease was released before the acquire operation was acknowledged", map[string]any{
+					"task_id": task.TaskID, "task_generation": task.Generation, "outcome_verified": true,
+				}),
+				"_request_digest": digest,
+			}
+			if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+				return s.sqliteError(err)
+			}
+			continue
+		}
+		instanceName := "agent-vm-" + taskID(*operation.SessionID)
+		if task != nil && task.InstanceName != "" {
+			instanceName = task.InstanceName
+		}
 		checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
-		_, configErr := s.Guest.Config(checkCtx, "agent-vm-"+taskID(*operation.SessionID))
+		_, configErr := s.Guest.Config(checkCtx, instanceName)
 		cancel()
 		if configErr == nil {
 			return protocol.NewError("startup_reconcile_required", "orphaned acquire still has a native instance without durable task state", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false})
