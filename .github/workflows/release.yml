@@ -15,6 +15,7 @@ permissions:
   pull-requests: read
 
 concurrency:
+  # queue: max; release runs are serialized without canceling an active run.
   group: release
   cancel-in-progress: false
 

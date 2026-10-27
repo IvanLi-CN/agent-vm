@@ -91,6 +91,8 @@ function packageFiles(target: "client" | "linux/amd64" | "linux/arm64", binaryPa
 }
 
 try {
+  const status = commandOutput(["git", "status", "--porcelain=v1", "--untracked-files=all"]);
+  if (status) throw new Error("refusing to build a release package from a dirty worktree");
   const head = commandOutput(["git", "rev-parse", "HEAD"]);
   if (head !== revision) throw new Error(`source revision is not the checked-out commit: expected ${revision}, got ${head}`);
   commandOutput(["git", "cat-file", "-e", `${revision}^{commit}`]);

@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "topics": {
+    "manual-version-release-delivery": {
+      "status": "implemented",
+      "surface": ".github/release-contract.json and skills/agent-vm-ops/scripts/release.ts",
+      "policy_package": null
+    },
+    "semver-change-governance": {
+      "status": "implemented",
+      "surface": ".agents/skills/semver-change-governance and skills/agent-vm-ops/scripts/semver.ts",
+      "policy_package": "semver-change-governance"
+    },
+    "quality-gates": {
+      "status": "implemented",
+      "surface": ".agents/skills/quality-gates and .github/quality-gates.json",
+      "policy_package": "quality-gates"
+    },
+    "github-actions-scheduling": {
+      "status": "implemented",
+      "surface": ".github/workflows and .github/quality-gates.json",
+      "policy_package": null
+    },
+    "release-failure-notification": {
+      "status": "implemented",
+      "surface": ".agents/skills/release-failure-notification and .github/release-failure-notification.json",
+      "policy_package": "release-failure-notification"
+    }
+  },
+  "enablement": {
+    "platform_rules": "not-enabled",
+    "notification_transport": "unselected",
+    "formal_release": "not-run",
+    "deployment": "separate-operation"
+  }
+}

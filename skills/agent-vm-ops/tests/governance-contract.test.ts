@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const root = resolve(import.meta.dir, "../../..");
@@ -15,8 +15,21 @@ test("the five project topics have locked local surfaces", () => {
   const quality = json(".github/quality-gates.json");
   expect(quality.required_checks).toEqual(["PR gate (ubuntu-latest)", "PR gate (macos-latest)"]);
   expect(quality.queue_policy.required_pull_request_events).toEqual(["opened", "synchronize", "reopened", "ready_for_review"]);
+  expect(quality.queue_policy.queue).toBe("max");
   expect(json(".github/release-contract.json").product.manifest_format).toBe(3);
   expect(json(".github/release-failure-notification.json").transport_selection.status).toBe("unselected");
+  const topics = json(".github/topic-contract.json").topics;
+  expect(Object.keys(topics).sort()).toEqual([
+    "github-actions-scheduling",
+    "manual-version-release-delivery",
+    "quality-gates",
+    "release-failure-notification",
+    "semver-change-governance",
+  ]);
+  for (const topic of Object.values(topics) as Array<{ status: string; surface: string }>) {
+    expect(topic.status).toBe("implemented");
+    expect(topic.surface.length).toBeGreaterThan(0);
+  }
 });
 
 test("PR scheduling is exact, non-preemptive, and separate from Main", () => {
@@ -32,6 +45,7 @@ test("PR scheduling is exact, non-preemptive, and separate from Main", () => {
   expect(main).toContain("branches: [main]");
   expect(main).toContain("name: Main gate");
   expect(main).toContain("group: main");
+  expect(main).toContain("max-parallel: 1");
 });
 
 test("notification routing is metadata-only and fail-closed before transport selection", () => {
@@ -41,7 +55,10 @@ test("notification routing is metadata-only and fail-closed before transport sel
     env: {
       ...process.env,
       FAILED_REPOSITORY: "IvanLi-CN/agent-vm",
-      FAILED_WORKFLOW: "Notification smoke",
+      FAILED_WORKFLOW: "CI (PR)",
+      FAILED_EVENT: "pull_request",
+      FAILED_REF: "refs/pull/123/merge",
+      FAILED_HEAD_BRANCH: "feature/example",
       FAILED_RUN_ID: "123",
       FAILED_RUN_ATTEMPT: "1",
       FAILED_HEAD_SHA: "a".repeat(40),
@@ -53,6 +70,17 @@ test("notification routing is metadata-only and fail-closed before transport sel
   });
   expect(result.exitCode).toBe(78);
   expect(new TextDecoder().decode(result.stdout)).toContain('"reason":"transport_unselected"');
+  expect(new TextDecoder().decode(result.stdout)).toContain('"event":"pull_request"');
+  expect(new TextDecoder().decode(result.stdout)).toContain('"ref":"refs/pull/123/merge"');
   expect(read(".github/workflows/notify-failed-workflow.yml")).toContain("ref: ${{ github.event.repository.default_branch }}");
   expect(read(".github/workflows/notify-failed-release.yml")).toContain("workflows: [Release]");
+  const notification = json(".github/release-failure-notification.json");
+  expect(notification.workflow_inventory["Notification smoke"].class).toBe("excluded");
+  expect(notification.workflow_inventory["Notify failed workflow"].class).toBe("excluded");
+  expect(notification.workflow_inventory["Notify failed release"].class).toBe("excluded");
+  const workflowNames = readdirSync(resolve(root, ".github/workflows"))
+    .filter((name) => name.endsWith(".yml"))
+    .map((name) => read(`.github/workflows/${name}`).match(/^name: (.+)$/m)?.[1])
+    .filter((name): name is string => Boolean(name));
+  expect(new Set(workflowNames)).toEqual(new Set(Object.keys(notification.workflow_inventory)));
 });

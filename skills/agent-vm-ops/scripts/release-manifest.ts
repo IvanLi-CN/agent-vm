@@ -1411,6 +1411,31 @@ export function load_runtime_manifest(
 export const PRODUCT_MANIFEST_FORMAT = 3;
 export const PRODUCT_TOOLCHAIN = Object.freeze({ bun: "1.4.4", go: "go1.27.3", cgo_enabled: false });
 
+const PRODUCT_CLIENT_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
+  ["agent_vm.ts", "agent_vm.ts", "client", 0o755],
+  ["byte-fs.ts", "byte-fs.ts", "support", 0o644],
+  ["client-io.ts", "client-io.ts", "support", 0o644],
+  ["client-release.ts", "client-release.ts", "support", 0o644],
+  ["client.ts", "client.ts", "support", 0o644],
+  ["guest-source.ts", "guest-source.ts", "support", 0o644],
+  ["sync-native.ts", "sync-native.ts", "support", 0o644],
+  ["sync_worktree.ts", "sync_worktree.ts", "support", 0o755],
+]);
+
+const PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
+  ["agent_vm.ts", "agent_vm.ts", "client", 0o755],
+  ["byte-fs.ts", "byte-fs.ts", "support", 0o644],
+  ["client-io.ts", "client-io.ts", "support", 0o644],
+  ["client-release.ts", "client-release.ts", "support", 0o644],
+  ["client.ts", "client.ts", "support", 0o644],
+  ["guest-source.ts", "guest-source.ts", "support", 0o644],
+  ["sync-native.ts", "sync-native.ts", "support", 0o644],
+  ["sync_worktree.ts", "sync_worktree.ts", "support", 0o755],
+  ["agent_vm_control_bridge.ts", "agent_vm_control_bridge.ts", "control", 0o755],
+  ["agent-vm-control", "bin/agent-vm-control", "control", 0o755],
+  ["unit:agent-vm-native.service", "systemd/agent-vm-native.service", "unit", 0o644],
+]);
+
 export type ProductTarget =
   | { os: "source"; arch: "any" }
   | { os: "linux"; arch: "amd64" | "arm64" };
@@ -1449,11 +1474,11 @@ function _product_target(value: unknown): ProductTarget {
   throw _product_error("manifest_invalid", "target must be source/any or linux/amd64|arm64");
 }
 
-function _product_artifacts(value: unknown): Artifact[] {
+function _product_artifacts(value: unknown, target: ProductTarget): Artifact[] {
   if (!Array.isArray(value) || value.length === 0) throw _product_error("manifest_invalid", "artifacts must be a non-empty list");
   const names = new Set<string>();
   const paths = new Set<string>();
-  return value.map((raw, index) => {
+  const artifacts = value.map((raw, index) => {
     const item = _require_mapping(raw, `artifacts[${index}]`);
     if (!_same_keys(item, ["name", "path", "role", "sha256", "mode"])) throw _product_error("manifest_invalid", `artifacts[${index}] has an unexpected shape`);
     const name = _require_string(item.name, `artifacts[${index}].name`, /^[A-Za-z0-9_.:@-]{1,120}$/);
@@ -1465,6 +1490,11 @@ function _product_artifacts(value: unknown): Artifact[] {
     names.add(name); paths.add(path);
     return { name, path, role, sha256, mode };
   });
+  const expected = target.os === "source" ? PRODUCT_CLIENT_ARTIFACTS : PRODUCT_LINUX_ARTIFACTS;
+  const actualShape = artifacts.map(({ name, path, role, mode }) => canonical_json([name, path, role, mode])).sort();
+  const expectedShape = expected.map((item) => canonical_json(item)).sort();
+  if (actualShape.length !== expectedShape.length || actualShape.some((item, index) => item !== expectedShape[index])) throw _product_error("manifest_artifact_set_invalid", "product artifact set differs from the fixed target allowlist");
+  return artifacts;
 }
 
 function _product_actions(value: unknown): Record<string, OperationSpec> {
@@ -1519,7 +1549,7 @@ export function validate_product_manifest(value: unknown): ProductManifest {
   const toolchain = _require_mapping(root.toolchain, "toolchain");
   if (!_same_keys(toolchain, ["bun", "cgo_enabled", "go"]) || toolchain.bun !== PRODUCT_TOOLCHAIN.bun || toolchain.go !== PRODUCT_TOOLCHAIN.go || toolchain.cgo_enabled !== false) throw _product_error("manifest_invalid", "toolchain does not match the fixed release toolchain");
   if (Number(_require_int(root.protocol, "protocol", 1)) !== PROTOCOL_VERSION) throw _product_error("protocol_unsupported", `manifest protocol must be ${PROTOCOL_VERSION}`);
-  const artifacts = _product_artifacts(root.artifacts);
+  const artifacts = _product_artifacts(root.artifacts, target);
   const actions = _product_actions(root.actions);
   const view = _require_mapping(root.client_view, "client_view");
   if (!_same_keys(view, ["actions", "protocol", "source_revision", "transport", "version"]) || view.version !== version || view.source_revision !== source_revision || Number(view.protocol) !== PROTOCOL_VERSION || (view.transport !== "legacy-bun" && view.transport !== "go-request") || !_json_equal(view.actions, actions)) throw _product_error("manifest_invalid", "client_view does not match product manifest");

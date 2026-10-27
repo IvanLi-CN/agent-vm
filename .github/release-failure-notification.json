@@ -14,11 +14,20 @@
     "CI (PR)": "generic",
     "CI (Main)": "generic",
     "Release": "release-specific",
-    "Release recovery": "generic",
-    "Notification smoke": "generic"
+    "Release recovery": "generic"
   },
-  "expected_failure_context": ["repository", "workflow", "run_id", "attempt", "head_sha", "actor", "run_url", "conclusion"],
-  "release_context": ["version", "source_revision", "reservation", "recovery_stage"],
+  "excluded_workflows": ["Notification smoke", "Notify failed workflow", "Notify failed release"],
+  "workflow_inventory": {
+    "CI (PR)": {"class": "generic", "sidecar": "Notify failed workflow", "events": ["pull_request", "merge_group"], "ref_prefixes": ["refs/pull/", "refs/heads/"]},
+    "CI (Main)": {"class": "generic", "sidecar": "Notify failed workflow", "events": ["push"], "ref_prefixes": ["refs/heads/"]},
+    "Release": {"class": "release-specific", "sidecar": "Notify failed release", "events": ["workflow_dispatch"], "ref_prefixes": ["refs/heads/"]},
+    "Release recovery": {"class": "generic", "sidecar": "Notify failed workflow", "events": ["workflow_dispatch"], "ref_prefixes": ["refs/heads/"]},
+    "Notification smoke": {"class": "excluded", "sidecar": null},
+    "Notify failed workflow": {"class": "excluded", "sidecar": null},
+    "Notify failed release": {"class": "excluded", "sidecar": null}
+  },
+  "expected_failure_context": ["repository", "workflow", "event", "ref", "head_branch", "pull_request", "run_id", "attempt", "head_sha", "actor", "run_url", "rerun_url", "rerun_guidance", "conclusion"],
+  "release_context": ["version", "tag", "source_revision", "reservation", "recovery_stage", "artifacts", "recovery_command"],
   "delivery": {
     "only_failure": true,
     "idempotency_key": "repository:workflow:run_id:attempt",

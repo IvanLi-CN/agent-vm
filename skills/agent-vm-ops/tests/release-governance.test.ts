@@ -9,8 +9,12 @@ import { assertPlatformPreconditions, successfulMainGate } from "../scripts/rele
 
 const identity = (overrides: Partial<ReleaseIdentity> = {}): ReleaseIdentity => ({
   version: "1.0.0",
+  target: "1.0.0",
   source_revision: "a".repeat(40),
+  base_source: "none",
   dispatch_sha: "a".repeat(40),
+  workflow_run: "123",
+  maintainer: "maintainer",
   main_gate: "check-1",
   source_pr: "42",
   source_pr_head: "b".repeat(40),
@@ -26,6 +30,12 @@ test("SemVer target resolution requires a trusted baseline", () => {
   if (resolveReleaseTarget("minor", ["1.0.0"]) !== "1.1.0") throw new Error("minor target did not advance the minor");
   if (compareSemVer("1.0.0+build.1", "1.0.0+build.2") !== 0) throw new Error("build metadata changed precedence");
   if (parseSemVer("1.0.0-rc.1").prerelease.join(".") !== "rc.1") throw new Error("pre-release was not parsed");
+  let occupiedError = false;
+  try { resolveReleaseTarget("1.0.1", ["1.0.0"], ["1.0.0", "1.0.1+existing"]); } catch { occupiedError = true; }
+  if (!occupiedError) throw new Error("occupied explicit target was reused");
+  let prereleaseRegression = false;
+  try { resolveReleaseTarget("1.1.0-rc.1", ["1.0.0"], ["1.0.0", "1.1.0-rc.2"]); } catch { prereleaseRegression = true; }
+  if (!prereleaseRegression) throw new Error("pre-release precedence regression was accepted");
   let symbolicError = false;
   try { resolveReleaseTarget("major", []); } catch { symbolicError = true; }
   if (!symbolicError) throw new Error("symbolic target without a final baseline was accepted");
@@ -40,6 +50,9 @@ test("release reservation is append-only and identity-bound", () => {
     if (store.claim(source).stage !== "claimed") throw new Error("idempotent claim did not return the original event");
     const artifacts = { "agent-vm-1.0.0-client.tar": "d".repeat(64) };
     store.transition(source, "prepared", { artifacts, assets: artifacts });
+    let frozenError = false;
+    try { store.transition(source, "draft", { artifacts: { ...artifacts, other: "e".repeat(64) }, assets: { ...artifacts, other: "/tmp/other" }, tag: "v1.0.0" }); } catch { frozenError = true; }
+    if (!frozenError) throw new Error("release transition changed frozen artifacts");
     store.transition(source, "draft", { artifacts, assets: artifacts, tag: "v1.0.0" });
     if (store.current("1.0.0").stage !== "draft") throw new Error("draft stage was not appended");
     let conflict = false;
@@ -78,7 +91,7 @@ test("GitHub state refs are append-only and preserve the original identity", asy
         return { object: { sha } };
       }
       const commitRead = args.find((item) => /\/git\/commits\/[0-9a-z-]+$/.test(item));
-      if (commitRead && !args.includes("--method")) return { commit: { message: commits.get(commitRead.split("/git/commits/")[1]) } };
+      if (commitRead && !args.includes("--method")) return { message: commits.get(commitRead.split("/git/commits/")[1]) };
       if (args.some((item) => item.endsWith("/git/blobs"))) return { sha: `blob-${++sequence}` };
       if (args.some((item) => item.endsWith("/git/trees"))) return { sha: `tree-${++sequence}` };
       if (args.some((item) => item.endsWith("/git/commits"))) {

@@ -66,15 +66,6 @@ export function assertPlatformPreconditions(root = repositoryRoot): void {
   if (audit.status !== "aligned") throw new Error(`live platform audit is ${audit.status}: ${audit.reasons.join("; ")}`);
 }
 
-function releaseVersions(value: unknown): string[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((item: any) => {
-    if (!item || item.draft === true || item.prerelease === true || typeof item.tag_name !== "string") return [];
-    const version = item.tag_name.replace(/^v/, "");
-    try { parseSemVer(version); return [version]; } catch { return []; }
-  });
-}
-
 export function successfulMainGate(value: unknown): { id: string } {
   if (!Array.isArray(value)) throw new Error("GitHub check-runs response is invalid");
   const checks = value.filter((item: any) => item?.name === "Main gate" || /^Main gate \(.+\)$/.test(item?.name ?? ""));
@@ -93,8 +84,11 @@ function mergedSourcePull(value: unknown, source: string): { number: string; hea
 
 function frozenDetails(event: ReleaseEvent): { artifacts: Record<string, string>; assets: Record<string, string> } {
   const detail = event.detail;
-  if (!detail || typeof detail.artifacts !== "object" || typeof detail.assets !== "object" || !detail.artifacts || !detail.assets) throw new Error("release reservation has no frozen artifact details");
-  return { artifacts: detail.artifacts as Record<string, string>, assets: detail.assets as Record<string, string> };
+  if (!detail || typeof detail.artifacts !== "object" || typeof detail.assets !== "object" || !detail.artifacts || !detail.assets || Array.isArray(detail.artifacts) || Array.isArray(detail.assets)) throw new Error("release reservation has no frozen artifact details");
+  const artifacts = detail.artifacts as Record<string, unknown>;
+  const assets = detail.assets as Record<string, unknown>;
+  if (!Object.keys(artifacts).length || Object.keys(artifacts).length !== Object.keys(assets).length || Object.keys(artifacts).some((name) => typeof artifacts[name] !== "string" || !/^[0-9a-f]{64}$/.test(artifacts[name] as string) || typeof assets[name] !== "string" || !(assets[name] as string))) throw new Error("release reservation frozen artifact details are invalid");
+  return { artifacts: artifacts as Record<string, string>, assets: assets as Record<string, string> };
 }
 
 async function verifyDownloaded(adapter: GhGithubAdapter, tag: string, digests: Record<string, string>): Promise<void> {
@@ -111,12 +105,48 @@ async function verifyDownloaded(adapter: GhGithubAdapter, tag: string, digests: 
   }
 }
 
-function verifyReleaseView(value: unknown, tag: string, expectedDraft: boolean, assets: Record<string, string>): void {
+function verifyReleaseView(value: unknown, tag: string, expectedDraft: boolean, assets: Record<string, string>): any {
   if (!value || typeof value !== "object") throw new Error("GitHub release response is invalid");
-  const release = value as { tagName?: unknown; isDraft?: unknown; assets?: unknown };
+  const release = value as { tagName?: unknown; isDraft?: unknown; isPrerelease?: unknown; immutable?: unknown; assets?: unknown };
   if (release.tagName !== tag || release.isDraft !== expectedDraft || !Array.isArray(release.assets)) throw new Error("GitHub release identity or draft state is invalid");
+  if (!expectedDraft && (release.isPrerelease === true || release.immutable !== true)) throw new Error("published GitHub release is not immutable or is a prerelease");
   const names = new Set(release.assets.flatMap((item: any) => typeof item?.name === "string" ? [item.name] : []));
   for (const name of Object.keys(assets)) if (!names.has(name)) throw new Error(`GitHub release is missing asset: ${name}`);
+  return release;
+}
+
+async function verifyPublishedRelease(adapter: GhGithubAdapter, tag: string, source: string, assets: Record<string, string>, artifacts: Record<string, string>): Promise<any> {
+  const release = verifyReleaseView(await adapter.viewRelease(tag), tag, false, assets);
+  const tagSource = await adapter.tagCommit(tag);
+  if (tagSource !== source) throw new Error(`Git tag ${tag} points to ${tagSource}, expected ${source}`);
+  await verifyDownloaded(adapter, tag, artifacts);
+  return release;
+}
+
+async function assertTagIsAbsentOrBound(adapter: GhGithubAdapter, tag: string, source: string): Promise<void> {
+  try {
+    const existing = await adapter.tagCommit(tag);
+    if (existing !== source) throw new Error(`Git tag ${tag} already points to ${existing}, expected ${source}`);
+  } catch (error) {
+    if (!/404|not found/i.test(String(error))) throw error;
+  }
+}
+
+async function trustedCompletedEvents(adapter: GhGithubAdapter, store: MirroredReleaseStateStore): Promise<ReleaseEvent[]> {
+  const events = await store.completedEvents();
+  for (const event of events) {
+    const { artifacts, assets } = frozenDetails(event);
+    const publication = event.detail?.publication;
+    if (!publication || typeof publication !== "object" || (publication as any).source_revision !== event.identity.source_revision || (publication as any).tag !== `v${event.identity.version}` || (publication as any).immutable !== true) {
+      throw new Error(`completed release record is not fully verified: ${event.identity.version}`);
+    }
+    await verifyPublishedRelease(adapter, String((publication as any).tag), event.identity.source_revision, assets, artifacts);
+  }
+  return events;
+}
+
+function latestFinalEvent(events: readonly ReleaseEvent[]): ReleaseEvent | undefined {
+  return events.filter((event) => parseSemVer(event.identity.version).prerelease.length === 0).sort((left, right) => parseSemVer(left.identity.version).major - parseSemVer(right.identity.version).major || parseSemVer(left.identity.version).minor - parseSemVer(right.identity.version).minor || parseSemVer(left.identity.version).patch - parseSemVer(right.identity.version).patch).at(-1);
 }
 
 function stateStore(adapter: GhGithubAdapter): MirroredReleaseStateStore {
@@ -127,6 +157,9 @@ async function release(): Promise<void> {
   if (!target) throw new Error("--target is required for a manual release");
   assertPlatformPreconditions();
   const adapter = new GhGithubAdapter();
+  const store = stateStore(adapter);
+  const completed = await trustedCompletedEvents(adapter, store);
+  const reserved = await store.reservedVersions();
   const source = await adapter.mainHead();
   if (process.env.GITHUB_SHA && process.env.GITHUB_SHA !== source) throw new Error("GitHub dispatch ref moved after source preflight");
   const gate = successfulMainGate(await adapter.commitChecks(source));
@@ -135,11 +168,20 @@ async function release(): Promise<void> {
   if (verification.commit?.verification?.verified !== true) throw new Error("source commit signature is not verified");
   const policyFiles = [".github/quality-gates.json", ".github/release-contract.json", ".github/release-failure-notification.json"];
   const policyText = policyFiles.map((path) => readFileSync(join(repositoryRoot, path), "utf8")).join("\n");
-  const version = resolveReleaseTarget(target, releaseVersions(await adapter.releases()));
+  const baseline = latestFinalEvent(completed);
+  if (baseline) {
+    const comparison = await adapter.compare(baseline.identity.source_revision, source);
+    if (comparison.status !== "ahead") throw new Error("validated main head is not a descendant of the trusted release baseline");
+  }
+  const version = resolveReleaseTarget(target, completed.map((event) => event.identity.version), reserved);
   const identity: ReleaseIdentity = {
     version,
+    target,
     source_revision: source,
+    base_source: baseline?.identity.source_revision ?? "none",
     dispatch_sha: process.env.GITHUB_SHA ?? source,
+    workflow_run: process.env.GITHUB_RUN_ID ?? "local",
+    maintainer: process.env.GITHUB_ACTOR ?? "unknown",
     main_gate: gate.id,
     source_pr: sourcePull.number,
     source_pr_head: sourcePull.head,
@@ -147,7 +189,6 @@ async function release(): Promise<void> {
     policy_revision: policyRevision(policyText),
     artifacts: {},
   };
-  const store = stateStore(adapter);
   const claimed = await store.claim(identity);
   if (claimed.stage !== "claimed") throw new Error(`release reservation already progressed to ${claimed.stage}; use recovery`);
   const artifactRoot = join(stateRoot, "artifacts", version);
@@ -169,15 +210,17 @@ async function release(): Promise<void> {
   const completeDigests = { ...digests, SHA256SUMS: sha256(sumsPath) };
   const prepared = await store.transition(identity, "prepared", { artifacts: completeDigests, assets: completeAssets });
   const tag = `v${version}`;
+  await assertTagIsAbsentOrBound(adapter, tag, source);
   await adapter.createDraft(tag, source, Object.values(completeAssets), `Agent VM ${version}`, `Product release ${version} from ${source}.`);
+  if (await adapter.tagCommit(tag) !== source) throw new Error(`Git tag ${tag} does not point to the release source`);
   const draft = await store.transition(identity, "draft", { artifacts: completeDigests, assets: completeAssets, tag });
   verifyReleaseView(await adapter.viewRelease(tag), tag, true, completeAssets);
   await verifyDownloaded(adapter, tag, completeDigests);
   await adapter.publish(tag);
-  verifyReleaseView(await adapter.viewRelease(tag), tag, false, completeAssets);
-  await verifyDownloaded(adapter, tag, completeDigests);
-  const published = await store.transition(identity, "published", { artifacts: completeDigests, assets: completeAssets, tag });
-  await store.transition(identity, "completed", { artifacts: completeDigests, assets: completeAssets, tag });
+  const publishedView = await verifyPublishedRelease(adapter, tag, source, completeAssets, completeDigests);
+  const publication = { release_id: String(publishedView.releaseId ?? "unknown"), tag, source_revision: source, immutable: true };
+  const published = await store.transition(identity, "published", { artifacts: completeDigests, assets: completeAssets, tag, publication });
+  await store.transition(identity, "completed", { artifacts: completeDigests, assets: completeAssets, tag, publication });
   console.log(JSON.stringify({ stage: "completed", version, source_revision: source, reservation: version, events: [prepared.stage, draft.stage, published.stage, "completed"] }));
 }
 
@@ -185,22 +228,55 @@ async function recover(): Promise<void> {
   const version = requireOption("--reservation");
   const adapter = new GhGithubAdapter();
   const store = stateStore(adapter);
-  const current = await store.current(version);
-  const { artifacts, assets } = frozenDetails(current);
+  let current = await store.current(version);
+  if (current.stage === "completed") {
+    const { artifacts, assets } = frozenDetails(current);
+    await verifyPublishedRelease(adapter, String(current.detail?.tag ?? `v${version}`), current.identity.source_revision, assets, artifacts);
+    console.log(JSON.stringify({ stage: "completed", version, recovered: true, idempotent: true }));
+    return;
+  }
+  if (current.stage === "abandoned" || current.stage === "claimed") throw new Error(`reservation at ${current.stage} cannot be recovered without frozen assets`);
+
+  const frozen = frozenDetails(current);
+  const { artifacts, assets } = frozen;
   const tag = String(current.detail?.tag ?? `v${version}`);
-  if (current.stage === "draft") {
-    assertPlatformPreconditions();
+  if (current.stage === "prepared") {
+    let existing: any | null = null;
+    try {
+      existing = await adapter.viewRelease(tag);
+    } catch (error) {
+      if (!/404|not found/i.test(String(error))) throw error;
+      /* the draft may not have been created before interruption */
+    }
+    if (!existing) {
+      assertPlatformPreconditions();
+      for (const path of Object.values(assets)) if (!existsSync(path)) throw new Error(`recovery is missing frozen asset: ${path}`);
+      await assertTagIsAbsentOrBound(adapter, tag, current.identity.source_revision);
+      await adapter.createDraft(tag, current.identity.source_revision, Object.values(assets), `Agent VM ${version}`, `Recovered product release ${version} from ${current.identity.source_revision}.`);
+    }
+    if (await adapter.tagCommit(tag) !== current.identity.source_revision) throw new Error(`Git tag ${tag} does not point to the reserved source`);
     verifyReleaseView(await adapter.viewRelease(tag), tag, true, assets);
     await verifyDownloaded(adapter, tag, artifacts);
-    await adapter.publish(tag);
-    verifyReleaseView(await adapter.viewRelease(tag), tag, false, assets);
-    await verifyDownloaded(adapter, tag, artifacts);
-    await store.transition(current.identity, "published", { artifacts, assets, tag, recovered: true });
-    await store.transition(current.identity, "completed", { artifacts, assets, tag, recovered: true });
-  } else if (current.stage === "published") {
-    await store.transition(current.identity, "completed", { artifacts, assets, tag, recovered: true });
-  } else {
-    throw new Error(`reservation at ${current.stage} requires the original frozen assets; recovery will not rebuild them`);
+    current = await store.transition(current.identity, "draft", { artifacts, assets, tag, recovered: true });
+  }
+
+  if (current.stage === "draft") {
+    const view = await adapter.viewRelease(tag) as { isDraft?: boolean };
+    if (view.isDraft === true) {
+      verifyReleaseView(view, tag, true, assets);
+      assertPlatformPreconditions();
+      await adapter.publish(tag);
+    } else {
+      verifyReleaseView(view, tag, false, assets);
+    }
+    const publishedView = await verifyPublishedRelease(adapter, tag, current.identity.source_revision, assets, artifacts);
+    const publication = { release_id: String(publishedView.releaseId ?? "unknown"), tag, source_revision: current.identity.source_revision, immutable: true };
+    current = await store.transition(current.identity, "published", { artifacts, assets, tag, publication, recovered: true });
+  }
+  if (current.stage === "published") {
+    const publishedView = await verifyPublishedRelease(adapter, tag, current.identity.source_revision, assets, artifacts);
+    const publication = { release_id: String(publishedView.releaseId ?? "unknown"), tag, source_revision: current.identity.source_revision, immutable: true };
+    await store.transition(current.identity, "completed", { artifacts, assets, tag, publication, recovered: true });
   }
   console.log(JSON.stringify({ stage: "completed", version, recovered: true }));
 }

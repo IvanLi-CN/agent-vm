@@ -165,6 +165,11 @@ PRODUCT_MANIFEST_FORMAT = 3
 PRODUCT_BUN_TOOLCHAIN = "1.4.4"
 PRODUCT_GO_TOOLCHAIN = "go1.27.3"
 SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$")
+PRODUCT_CLIENT_ARTIFACTS = frozenset({
+    ("agent_vm.ts", "agent_vm.ts", "client", 0o755),
+    *( (name, name, "support", mode) for name, mode in CLIENT_DEPENDENCY_MODES.items() ),
+})
+PRODUCT_LINUX_ARTIFACTS = GO_FIXED_ARTIFACTS
 
 
 class ManifestError(Exception):
@@ -603,8 +608,9 @@ def validate_product_manifest(value: Any) -> dict[str, Any]:
         raise _error("manifest_invalid", "product toolchain declaration is invalid")
 
     raw_artifacts = root["artifacts"]
-    if not isinstance(raw_artifacts, list) or not raw_artifacts:
-        raise _error("manifest_invalid", "product artifacts must be a non-empty list")
+    expected_artifacts = PRODUCT_CLIENT_ARTIFACTS if target["os"] == "source" else PRODUCT_LINUX_ARTIFACTS
+    if not isinstance(raw_artifacts, list) or len(raw_artifacts) != len(expected_artifacts):
+        raise _error("manifest_artifact_set_invalid", "product artifact set is incomplete")
     artifacts: list[dict[str, Any]] = []
     names: set[str] = set()
     paths: set[str] = set()
@@ -615,6 +621,9 @@ def validate_product_manifest(value: Any) -> dict[str, Any]:
         names.add(item["name"])
         paths.add(item["path"])
         artifacts.append(item)
+    actual_shape = {(item["name"], item["path"], item["role"], item["mode"]) for item in artifacts}
+    if actual_shape != expected_artifacts:
+        raise _error("manifest_artifact_set_invalid", "product artifact set differs from the fixed target allowlist", {"expected": sorted(expected_artifacts), "actual": sorted(actual_shape)})
 
     actions = _validate_go_actions(root["actions"])
     client_view = _require_mapping(root["client_view"], "client_view")

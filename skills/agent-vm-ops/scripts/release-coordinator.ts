@@ -11,8 +11,12 @@ export type ReleaseStage = "claimed" | "prepared" | "draft" | "published" | "com
 
 export interface ReleaseIdentity {
   version: string;
+  target: string;
   source_revision: string;
+  base_source: string;
   dispatch_sha: string;
+  workflow_run: string;
+  maintainer: string;
   main_gate: string;
   source_pr: string;
   source_pr_head: string;
@@ -66,6 +70,7 @@ function validateIdentity(identity: ReleaseIdentity): void {
   }
   if (!identity.signed_commit) throw new Error("release source commit is not signed");
   if (!/^[0-9a-f]{40}$/.test(identity.source_revision)) throw new Error("release source revision is invalid");
+  if (identity.base_source !== "none" && !/^[0-9a-f]{40}$/.test(identity.base_source)) throw new Error("release base source is invalid");
   if (!/^[0-9a-f]{40}$/.test(identity.dispatch_sha)) throw new Error("release dispatch SHA is invalid");
   if (!/^[0-9a-f]{64}$/.test(identity.policy_revision)) throw new Error("release policy revision is invalid");
   if (Object.values(identity.artifacts).some((value) => !/^[0-9a-f]{64}$/.test(value))) throw new Error("release artifact digests are invalid");
@@ -73,8 +78,31 @@ function validateIdentity(identity: ReleaseIdentity): void {
 
 function artifactDetails(detail: Record<string, unknown>): Record<string, string> {
   const artifacts = detail.artifacts;
+  const assets = detail.assets;
   if (!artifacts || typeof artifacts !== "object" || Array.isArray(artifacts) || Object.keys(artifacts).length === 0 || Object.values(artifacts).some((value) => typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value))) throw new Error("release transition requires frozen artifact digests");
+  if (!assets || typeof assets !== "object" || Array.isArray(assets) || Object.keys(assets).length !== Object.keys(artifacts).length || Object.keys(assets).some((name) => typeof (assets as Record<string, unknown>)[name] !== "string" || !((assets as Record<string, unknown>)[name] as string))) throw new Error("release transition requires frozen asset bindings");
   return artifacts as Record<string, string>;
+}
+
+function frozenDetails(detail: Record<string, unknown> | undefined): { artifacts: Record<string, string>; assets: Record<string, string> } | null {
+  if (!detail || typeof detail.artifacts !== "object" || !detail.artifacts || Array.isArray(detail.artifacts) || typeof detail.assets !== "object" || !detail.assets || Array.isArray(detail.assets)) return null;
+  return { artifacts: detail.artifacts as Record<string, string>, assets: detail.assets as Record<string, string> };
+}
+
+function assertFrozenDetailsEqual(left: Record<string, unknown> | undefined, right: Record<string, unknown> | undefined): void {
+  if (!right) return;
+  const existing = frozenDetails(left);
+  const candidate = frozenDetails(right);
+  if (!existing || !candidate) return;
+  const comparable = (value: { artifacts: Record<string, string>; assets: Record<string, string> }) => canonical({ artifacts: value.artifacts, asset_names: Object.keys(value.assets).sort() });
+  if (comparable(existing) !== comparable(candidate)) throw new Error("release transition cannot change frozen artifact digests or asset bindings");
+}
+
+function comparableTransitionDetail(detail: Record<string, unknown> | undefined): string {
+  if (!detail) return "";
+  const frozen = frozenDetails(detail);
+  if (!frozen) return canonical(detail);
+  return canonical({ ...detail, assets: Object.keys(frozen.assets).sort() });
 }
 
 export class ReleaseStateStore {
@@ -148,6 +176,8 @@ export class ReleaseStateStore {
     if (!nextStages[current.stage].includes(stage)) throw new Error(`release transition is invalid: ${current.stage} -> ${stage}`);
     if (stage === "prepared") artifactDetails(detail);
     if ((stage === "draft" || stage === "published" || stage === "completed") && !current.detail?.artifacts) artifactDetails(detail);
+    if (stage !== "abandoned" && current.detail?.artifacts) artifactDetails(detail);
+    assertFrozenDetailsEqual(current.detail, detail);
     const event: ReleaseEvent = { stage, identity, at: new Date().toISOString(), ...(Object.keys(detail).length ? { detail } : {}) };
     const descriptor = openSync(path, "a", 0o640);
     try { writeSync(descriptor, `${JSON.stringify(event)}\n`); } finally { closeSync(descriptor); }
@@ -214,8 +244,8 @@ export class GithubReleaseStateStore {
       const reference = await this.adapter.json<{ object?: { sha?: string } }>(["api", `repos/${this.adapter.repository}/git/ref/tags/${ref}`]);
       const sha = reference.object?.sha;
       if (!sha) throw new Error("release state ref has no commit SHA");
-      const commit = await this.adapter.json<{ commit?: { message?: string } }>(["api", `repos/${this.adapter.repository}/git/commits/${sha}`]);
-      return { event: this.hydrate(eventFromCommit(commit.commit?.message)), sha };
+      const commit = await this.adapter.json<{ message?: string }>(["api", `repos/${this.adapter.repository}/git/commits/${sha}`]);
+      return { event: this.hydrate(eventFromCommit(commit.message)), sha };
     } catch (error) {
       if (/404|not found/i.test(String(error))) return null;
       throw error;
@@ -276,6 +306,24 @@ export class GithubReleaseStateStore {
     return events.at(-1)!.value;
   }
 
+  private async versions(stage: ReleaseStage): Promise<string[]> {
+    const prefix = `release-state/${stage}/`;
+    const refs = await this.adapter.json<Array<{ ref?: string }>>(["api", `repos/${this.adapter.repository}/git/matching-refs/tags/${prefix}`]);
+    return refs.flatMap((item) => {
+      const ref = item.ref ?? "";
+      return ref.startsWith(`refs/tags/${prefix}`) ? [ref.slice(`refs/tags/${prefix}`.length)] : [];
+    });
+  }
+
+  async reservedVersions(): Promise<string[]> {
+    return this.versions("claimed");
+  }
+
+  async completedEvents(): Promise<ReleaseEvent[]> {
+    const versions = await this.versions("completed");
+    return Promise.all(versions.map(async (version) => (await this.read("completed", version))!.event));
+  }
+
   async transition(identity: ReleaseIdentity, stage: Exclude<ReleaseStage, "claimed">, detail: Record<string, unknown> = {}): Promise<ReleaseEvent> {
     validateIdentity(identity);
     const current = await this.currentWithSha(identity.version);
@@ -283,10 +331,14 @@ export class GithubReleaseStateStore {
     if (!nextStages[current.event.stage].includes(stage)) throw new Error(`release transition is invalid: ${current.event.stage} -> ${stage}`);
     if (stage === "prepared") artifactDetails(detail);
     if ((stage === "draft" || stage === "published" || stage === "completed") && !current.event.detail?.artifacts) artifactDetails(detail);
+    if (stage !== "abandoned" && current.event.detail?.artifacts) artifactDetails(detail);
+    assertFrozenDetailsEqual(current.event.detail, detail);
     const event: ReleaseEvent = { stage, identity, at: new Date().toISOString(), ...(Object.keys(detail).length ? { detail } : {}) };
     const existing = await this.read(stage, identity.version);
     if (existing) {
-      if (identityKey(existing.event.identity) !== identityKey(identity) || canonical(existing.event.detail) !== canonical(event.detail)) throw new Error("release state transition conflicts with an existing ref");
+      if (identityKey(existing.event.identity) !== identityKey(identity)) throw new Error("release state transition conflicts with an existing identity");
+      assertFrozenDetailsEqual(existing.event.detail, event.detail);
+      if (comparableTransitionDetail(existing.event.detail) !== comparableTransitionDetail(event.detail)) throw new Error("release state transition conflicts with an existing ref");
       return existing.event;
     }
     try {
@@ -296,6 +348,7 @@ export class GithubReleaseStateStore {
       if (!/422|already exists|reference/i.test(String(error))) throw error;
       const winner = await this.read(stage, identity.version);
       if (!winner || identityKey(winner.event.identity) !== identityKey(identity)) throw new Error("release state transition conflicted");
+      assertFrozenDetailsEqual(winner.event.detail, event.detail);
       return winner.event;
     }
   }
@@ -319,17 +372,25 @@ export class MirroredReleaseStateStore {
 
   async claim(identity: ReleaseIdentity): Promise<ReleaseEvent> {
     const event = await this.primary.claim(identity);
-    this.mirror.claim(identity);
+    try { this.mirror.claim(identity); } catch { /* remote state is authoritative; mirror is best-effort */ }
     return event;
   }
 
   async current(version: string): Promise<ReleaseEvent> {
-    try { return this.mirror.current(version); } catch { return this.primary.current(version); }
+    return this.primary.current(version);
+  }
+
+  async reservedVersions(): Promise<string[]> {
+    return this.primary.reservedVersions();
+  }
+
+  async completedEvents(): Promise<ReleaseEvent[]> {
+    return this.primary.completedEvents();
   }
 
   async transition(identity: ReleaseIdentity, stage: Exclude<ReleaseStage, "claimed">, detail: Record<string, unknown> = {}): Promise<ReleaseEvent> {
     const event = await this.primary.transition(identity, stage, detail);
-    this.mirror.transition(identity, stage, detail);
+    try { this.mirror.transition(identity, stage, detail); } catch { /* remote state is authoritative; mirror is best-effort */ }
     return event;
   }
 
@@ -386,12 +447,34 @@ export class GhGithubAdapter implements GithubCommand {
     return this.json<unknown[]>(["api", `repos/${this.repository}/releases?per_page=100`]);
   }
 
+  async tagCommit(tag: string): Promise<string> {
+    const ref = await this.json<{ object?: { sha?: string; type?: string } }>(["api", `repos/${this.repository}/git/ref/tags/${tag}`]);
+    const object = ref.object;
+    if (!object?.sha) throw new Error(`Git tag has no object: ${tag}`);
+    if (object.type === "commit" || !object.type) return object.sha;
+    const annotated = await this.json<{ object?: { sha?: string; type?: string } }>(["api", `repos/${this.repository}/git/tags/${object.sha}`]);
+    if (annotated.object?.type !== "commit" || !annotated.object.sha) throw new Error(`Git tag does not resolve to a commit: ${tag}`);
+    return annotated.object.sha;
+  }
+
+  async compare(base: string, head: string): Promise<{ status?: string; ahead_by?: number; behind_by?: number }> {
+    return this.json(["api", `repos/${this.repository}/compare/${base}...${head}`]);
+  }
+
   async createDraft(tag: string, target: string, assets: readonly string[], title: string, notes: string): Promise<void> {
     await this.run(["release", "create", tag, ...assets, "--draft", "--target", target, "--title", title, "--notes", notes]);
   }
 
   async viewRelease(tag: string): Promise<unknown> {
-    return this.json<unknown>(["release", "view", tag, "--json", "tagName,isDraft,isPrerelease,assets"]);
+    const release = await this.json<any>(["api", `repos/${this.repository}/releases/tags/${tag}`]);
+    return {
+      tagName: release.tag_name,
+      isDraft: release.draft,
+      isPrerelease: release.prerelease,
+      immutable: release.immutable,
+      releaseId: release.id,
+      assets: Array.isArray(release.assets) ? release.assets.map((asset: any) => ({ name: asset.name, size: asset.size, digest: asset.digest })) : [],
+    };
   }
 
   async downloadRelease(tag: string, directory: string): Promise<void> {

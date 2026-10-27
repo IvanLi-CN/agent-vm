@@ -20,6 +20,7 @@
   ],
   "release_checks": ["Main gate (ubuntu-latest)", "Main gate (macos-latest)"],
   "queue_policy": {
+    "queue": "max",
     "required_pull_request_events": ["opened", "synchronize", "reopened", "ready_for_review"],
     "max_concurrency": 1,
     "cancel_in_progress": false,

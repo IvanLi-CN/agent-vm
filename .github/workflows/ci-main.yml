@@ -8,6 +8,7 @@ permissions:
   contents: read
 
 concurrency:
+  # queue: max; Main has its own non-preemptive namespace.
   group: main
   cancel-in-progress: false
 
@@ -16,6 +17,7 @@ jobs:
     name: Main gate
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}

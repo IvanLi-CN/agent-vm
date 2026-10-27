@@ -76,23 +76,35 @@ export function isFinal(value: SemVer | string): boolean {
 
 export type ReleaseTarget = "patch" | "minor" | "major" | string;
 
-export function resolveReleaseTarget(target: ReleaseTarget, completedFinalVersions: readonly string[]): string {
+export function resolveReleaseTarget(
+  target: ReleaseTarget,
+  completedFinalVersions: readonly string[],
+  occupiedVersions: readonly string[] = completedFinalVersions,
+): string {
   const parsedFinal = completedFinalVersions.filter(isFinal).map(parseSemVer);
   const baseline = parsedFinal.sort((a, b) => compareSemVer(a, b)).at(-1);
   if (target === "patch" || target === "minor" || target === "major") {
     if (!baseline) throw new Error("symbolic target requires a trusted completed final baseline");
-    if (target === "patch") return `${baseline.major}.${baseline.minor}.${baseline.patch + 1}`;
-    if (target === "minor") return `${baseline.major}.${baseline.minor + 1}.0`;
-    return `${baseline.major + 1}.0.0`;
+    const candidate = target === "patch"
+      ? `${baseline.major}.${baseline.minor}.${baseline.patch + 1}`
+      : target === "minor"
+        ? `${baseline.major}.${baseline.minor + 1}.0`
+        : `${baseline.major + 1}.0.0`;
+    if (occupiedVersions.some((item) => compareSemVer(item, candidate) === 0)) {
+      throw new Error(`symbolic target resolves to an occupied SemVer: ${candidate}`);
+    }
+    return candidate;
   }
   const explicit = parseSemVer(target);
   if (!baseline) {
     if (formatSemVer(explicit) !== "1.0.0") throw new Error("the first public release must be exactly 1.0.0");
+    if (occupiedVersions.some((item) => compareSemVer(item, explicit) === 0)) throw new Error("explicit target is already occupied");
     return formatSemVer(explicit);
   }
   if (compareSemVer(explicit, baseline) <= 0) throw new Error("explicit target must be greater than the trusted final baseline");
-  const samePrecedence = parsedFinal.some((item) => compareSemVer(item, explicit) === 0);
-  if (samePrecedence) throw new Error("target has the same SemVer precedence as an existing final release");
+  if (occupiedVersions.some((item) => compareSemVer(item, explicit) >= 0)) {
+    throw new Error("explicit target is not greater than every occupied SemVer");
+  }
   return formatSemVer(explicit);
 }
 

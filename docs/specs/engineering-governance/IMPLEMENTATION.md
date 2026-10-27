@@ -6,7 +6,7 @@
 
 - Implementation：仓库侧治理候选已实施；平台保护、通知 transport 和正式发版仍未启用。
 - Lifecycle：active。
-- Catalog note：五项 Topic 的仓库 Policy、合同、执行工具和验证入口已进入当前候选；本 PR 不合并 main、不创建正式 tag/Release、不部署现网。
+- Catalog note：五项 Topic 的项目合同、执行工具和验证入口已进入当前候选；其中 Style Playbook 提供的三个可安装 Policy 已锁定，另外两个 Topic 由仓库合同承载；本 PR 不合并 main、不创建正式 tag/Release、不部署现网。
 
 ## 已核验的仓库与平台事实
 
@@ -21,13 +21,13 @@
 - 新增统一产品包构建、format 3 跨语言校验、GitHub `release-state/<stage>/<version>` 只创建 ref、append-only reservation/recovery 协调器和 `gh` adapter；平台保护与 immutable Release 仍是启用前置条件。
 - 现有 webhook 不被当作通知 transport；项目合同明确 transport `unselected`，失败 sidecar 在 selection gate 阶段 fail-closed。
 - GitHub Release immutability、main ruleset、required checks、签名提交和真实通知配置没有在本 PR 修改；`platform-audit.ts` 只读报告当前 `unavailable/blocked` 差距，合同状态保留为 `audit-required`。
-- 三个目标 Policy package 与 `skills-lock.json` 已安装并锁定，quality-gates 本地审计通过。
+- 三个可安装 Policy package 与 `skills-lock.json` 已安装并锁定，quality-gates 本地审计通过；Style Playbook 仓库没有 `manual-version-release-delivery` 或 `github-actions-scheduling` 安装包，因此二者不伪造 lock 记录，分别由发布合同和 Actions workflow 合同承载，映射见 `.github/topic-contract.json`。
 
 ## Implementation Coverage
 
 | 需求 | 已有基础 | 尚缺的目标覆盖 |
 | --- | --- | --- |
-| REQ-ENG-001、REQ-ENG-022 | 五项 Topic Policy、lock、quality contract、release contract 和 notification contract。 | 真实实施 commit 的采用记录；平台规则与通知 transport 仍未启用。 |
+| REQ-ENG-001、REQ-ENG-022 | 五项 Topic 合同、三个可安装 Policy 的 lock、quality contract、release contract 和 notification contract。 | 真实实施 commit 的采用记录；平台规则与通知 transport 仍未启用。 |
 | REQ-ENG-002、REQ-ENG-003 | SemVer Policy、版本影响模板、公开合同记录。 | 日常 API/state 变更的实际审阅证据；不把 target 绑定到影响分类。 |
 | REQ-ENG-004 | SQLite、generation、operation journal 原有边界保持；旧状态读取路径保留。 | 同 minor/跨 minor/major 的历史状态 fixture 与升级证据。 |
 | REQ-ENG-005、REQ-ENG-006 | `.github/quality-gates.json`、PR/Main gate、合同测试。 | 平台 required checks/ruleset 对齐；本 PR 只做只读审计。 |
@@ -52,7 +52,7 @@
 | `github-actions-scheduling` | 所有实际工作流的 events、namespaces、非抢占 concurrency、合同测试。 | live run history 和重跑/跨阶段证据。 |
 | `release-failure-notification` | Policy、notification contract、两个 sidecars、metadata helper、selection gate。 | transport 选择、配置和真实 smoke；当前不发送通知。 |
 
-三个项目 Policy 的安装写入范围为 `.agents/skills/semver-change-governance/`、`.agents/skills/quality-gates/`、`.agents/skills/release-failure-notification/` 及 CLI 管理的 `skills-lock.json`；已在当前候选写入并通过本地 lock/package 校验。
+三个项目 Policy 的安装写入范围为 `.agents/skills/semver-change-governance/`、`.agents/skills/quality-gates/`、`.agents/skills/release-failure-notification/` 及 CLI 管理的 `skills-lock.json`；已在当前候选写入并通过本地 lock/package 校验。`manual-version-release-delivery` 与 `github-actions-scheduling` 在上游 Style Playbook 中不存在可安装 skill，分别通过 `.github/release-contract.json`、`.github/topic-contract.json` 和 `.github/workflows/` 实施，不添加虚假 lock 项。
 
 ## 工作流设计映射
 

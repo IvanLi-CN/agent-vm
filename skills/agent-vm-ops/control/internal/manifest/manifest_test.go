@@ -76,25 +76,41 @@ func validManifest(t *testing.T) (string, string) {
 func validProductManifest(t *testing.T) string {
 	t.Helper()
 	root := t.TempDir()
-	path := filepath.Join(root, "agent_vm.ts")
-	data := []byte("#!/usr/bin/env bun\n")
-	if err := os.WriteFile(path, data, 0o755); err != nil {
-		t.Fatal(err)
+	artifacts := make([]any, 0, len(fixedArtifacts))
+	for _, expected := range fixedArtifacts {
+		path := filepath.Join(root, filepath.FromSlash(expected.path))
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		data := []byte("product-artifact:" + expected.path)
+		if expected.path == "bin/agent-vm-control" {
+			data = make([]byte, 20)
+			copy(data, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
+			machine := uint16(62)
+			if runtime.GOARCH == "arm64" {
+				machine = 183
+			}
+			binary.LittleEndian.PutUint16(data[18:], machine)
+		}
+		if err := os.WriteFile(path, data, os.FileMode(expected.mode)); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, os.FileMode(expected.mode)); err != nil {
+			t.Fatal(err)
+		}
+		digest := sha256.Sum256(data)
+		artifacts = append(artifacts, map[string]any{"name": expected.name, "path": expected.path, "role": expected.role, "sha256": hex.EncodeToString(digest[:]), "mode": expected.mode})
 	}
-	if err := os.Chmod(path, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	digest := sha256.Sum256(data)
 	actions := make(map[string]any, len(actionNames))
 	for _, action := range actionNames {
 		actions[action] = operationSpec()
 	}
 	rootValue := map[string]any{
 		"format": 3, "version": "1.0.0", "source_revision": strings.Repeat("b", 40), "protocol": 4,
-		"target": map[string]any{"os": "linux", "arch": runtime.GOARCH},
-		"toolchain": map[string]any{"bun": "1.4.4", "go": GoToolchain, "cgo_enabled": false},
-		"artifacts": []any{map[string]any{"name": "agent_vm.ts", "path": "agent_vm.ts", "role": "client", "sha256": hex.EncodeToString(digest[:]), "mode": 0o755}},
-		"actions": actions,
+		"target":      map[string]any{"os": "linux", "arch": runtime.GOARCH},
+		"toolchain":   map[string]any{"bun": "1.4.4", "go": GoToolchain, "cgo_enabled": false},
+		"artifacts":   artifacts,
+		"actions":     actions,
 		"client_view": map[string]any{"version": "1.0.0", "source_revision": strings.Repeat("b", 40), "protocol": 4, "transport": "go-request", "actions": actions},
 	}
 	manifestPath := filepath.Join(root, "release-manifest.json")

@@ -413,11 +413,16 @@ func validateProductToolchain(value any) error {
 
 func validateProductArtifacts(value any) ([]checkedArtifact, error) {
 	values, ok := value.([]any)
-	if !ok || len(values) == 0 {
-		return nil, fmt.Errorf("manifest_invalid: product artifacts must be a non-empty list")
+	if !ok || len(values) != len(fixedArtifacts) {
+		return nil, fmt.Errorf("manifest_artifact_set_invalid: product artifact set is incomplete")
+	}
+	expected := make(map[string]artifactSpec, len(fixedArtifacts))
+	for _, artifact := range fixedArtifacts {
+		expected[artifact.name+"\x00"+artifact.path] = artifact
 	}
 	seenNames := make(map[string]bool, len(values))
 	seenPaths := make(map[string]bool, len(values))
+	seen := make(map[string]bool, len(values))
 	result := make([]checkedArtifact, 0, len(values))
 	for index, raw := range values {
 		item, ok := raw.(map[string]any)
@@ -433,12 +438,18 @@ func validateProductArtifacts(value any) ([]checkedArtifact, error) {
 		if !nameOK || !artifactNamePattern.MatchString(name) || !pathOK || !safeRelativePath(path) || path == "release-manifest.json" || path == "client-release.json" || !roleOK || !validRole || !shaOK || !digestPattern.MatchString(sha) || !modeOK || mode < 0 || mode > 0o777 {
 			return nil, fmt.Errorf("manifest_invalid: artifacts[%d] values are invalid", index)
 		}
-		if seenNames[name] || seenPaths[path] {
+		key := name + "\x00" + path
+		want, exists := expected[key]
+		if seenNames[name] || seenPaths[path] || seen[key] || !exists || want.role != role || want.mode != mode {
 			return nil, fmt.Errorf("manifest_artifact_set_invalid: duplicate product artifact %s", name)
 		}
 		seenNames[name] = true
 		seenPaths[path] = true
-		result = append(result, checkedArtifact{artifactSpec: artifactSpec{name: name, path: path, role: role, mode: mode}, sha256: sha})
+		seen[key] = true
+		result = append(result, checkedArtifact{artifactSpec: want, sha256: sha})
+	}
+	if len(seen) != len(expected) {
+		return nil, fmt.Errorf("manifest_artifact_set_invalid: product artifact set differs from the fixed allowlist")
 	}
 	return result, nil
 }

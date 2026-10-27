@@ -18,6 +18,7 @@ permissions:
   actions: read
 
 concurrency:
+  # queue: max; recovery shares the product release namespace and is non-preemptive.
   group: release
   cancel-in-progress: false
 
@@ -40,6 +41,9 @@ jobs:
           RESERVATION: ${{ inputs.reservation }}
         run: |
           set -eu
+          if [ "${{ inputs.operation }}" != "recover" ]; then
+            exit 0
+          fi
           mkdir -p .recovery
           found=""
           for run_id in $(gh run list --workflow Release --limit 50 --json databaseId --jq '.[].databaseId'); do
@@ -55,8 +59,7 @@ jobs:
             fi
           done
           if [ -z "$found" ]; then
-            echo "no release-state artifact contains the requested reservation" >&2
-            exit 1
+            echo "no local release-state artifact found; recovery will use the authoritative GitHub state ref" >&2
           fi
       - name: Apply recovery operation
         env:

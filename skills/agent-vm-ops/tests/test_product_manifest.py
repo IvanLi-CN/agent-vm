@@ -23,10 +23,13 @@ class ProductManifestTests(unittest.TestCase):
     def test_format_3_manifest_is_python_consumable(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-vm-product-python-") as raw_root:
             root = Path(raw_root)
-            payload = root / "agent_vm.ts"
-            payload.write_text("#!/usr/bin/env bun\n", encoding="utf-8")
-            payload.chmod(0o755)
-            digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+            specs = [("agent_vm.ts", "client", 0o755), ("byte-fs.ts", "support", 0o644), ("client-io.ts", "support", 0o644), ("client-release.ts", "support", 0o644), ("client.ts", "support", 0o644), ("guest-source.ts", "support", 0o644), ("sync-native.ts", "support", 0o644), ("sync_worktree.ts", "support", 0o755)]
+            artifacts = []
+            for name, role, mode in specs:
+                payload = root / name
+                payload.write_text("#!/usr/bin/env bun\n" if name == "agent_vm.ts" else f"// {name}\n", encoding="utf-8")
+                payload.chmod(mode)
+                artifacts.append({"name": name, "path": name, "role": role, "sha256": hashlib.sha256(payload.read_bytes()).hexdigest(), "mode": mode})
             actions = default_operations()
             manifest = {
                 "format": PRODUCT_MANIFEST_FORMAT,
@@ -35,7 +38,7 @@ class ProductManifestTests(unittest.TestCase):
                 "protocol": 4,
                 "target": {"os": "source", "arch": "any"},
                 "toolchain": {"bun": "1.4.4", "go": "go1.27.3", "cgo_enabled": False},
-                "artifacts": [{"name": "agent_vm.ts", "path": "agent_vm.ts", "role": "client", "sha256": digest, "mode": 0o755}],
+                "artifacts": artifacts,
                 "actions": actions,
                 "client_view": {"version": "1.0.0", "source_revision": "a" * 40, "protocol": 4, "transport": "legacy-bun", "actions": actions},
             }
