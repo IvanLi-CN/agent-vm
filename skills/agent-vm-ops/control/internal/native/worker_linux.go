@@ -82,6 +82,13 @@ func KillWorker(identity WorkerIdentity) error {
 	defer unix.Close(fd)
 	current, err := workerIdentity(identity.PID)
 	if processGone(err) {
+		alive, aliveErr := WorkerAlive(identity)
+		if aliveErr != nil {
+			return aliveErr
+		}
+		if alive {
+			return fmt.Errorf("native worker root exited while its process group remains; manual reconciliation required")
+		}
 		return nil
 	}
 	if err != nil {

@@ -333,6 +333,10 @@ func readProcessTree(root int) (map[int]trackedProcess, error) {
 }
 
 func readProcessTable() (map[int]trackedProcess, error) {
+	return readProcessTableWith(os.ReadFile)
+}
+
+func readProcessTableWith(readFile func(string) ([]byte, error)) (map[int]trackedProcess, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, err
@@ -343,7 +347,7 @@ func readProcessTable() (map[int]trackedProcess, error) {
 		if parseErr != nil || pid <= 0 {
 			continue
 		}
-		item, statErr := readProcess(pid)
+		item, statErr := readProcessWith(readFile, pid)
 		if processGone(statErr) {
 			continue
 		}
@@ -360,7 +364,11 @@ func processGone(err error) bool {
 }
 
 func readProcess(pid int) (trackedProcess, error) {
-	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	return readProcessWith(os.ReadFile, pid)
+}
+
+func readProcessWith(readFile func(string) ([]byte, error), pid int) (trackedProcess, error) {
+	raw, err := readFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
 		return trackedProcess{}, err
 	}
