@@ -286,12 +286,15 @@ func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.O
 			if err := native.KillWorker(identity); err != nil {
 				return protocol.NewError("state_unverified", "pending native worker could not be stopped safely", map[string]any{"operation_id": operation.OperationID, "cause": err.Error()})
 			}
-			worker["state"] = "orphaned"
+			// KillWorker returns only after the root process group has been
+			// confirmed absent. Keep the operation pending for recovery, but do
+			// not leave a dead worker in a state reconciliation will skip forever.
+			worker["state"] = "exited"
 			worker["observed_at"] = nowString(s.Clock())
 			if err := s.recordWorkerState(ctx, operation.OperationID, worker); err != nil {
 				return s.sqliteError(err)
 			}
-			return protocol.NewError("startup_reconcile_required", "an orphaned native worker was stopped; retry reconciliation before admission", map[string]any{"operation_id": operation.OperationID})
+			return protocol.NewError("startup_reconcile_required", "a pending native worker was stopped; retry reconciliation before admission", map[string]any{"operation_id": operation.OperationID})
 		}
 		worker["state"] = "exited"
 		worker["observed_at"] = nowString(s.Clock())

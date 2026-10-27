@@ -5,6 +5,7 @@ package native
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -69,6 +70,8 @@ type workerKillOps struct {
 	workerAlive  func(WorkerIdentity) (bool, error)
 	sendSignal   func(int) error
 	killGroup    func(WorkerIdentity) error
+	groupAlive   func(int) (bool, error)
+	sleep        func(time.Duration)
 }
 
 func workerRootExited(identity WorkerIdentity, workerAlive func(WorkerIdentity) (bool, error)) error {
@@ -92,6 +95,10 @@ func KillWorker(identity WorkerIdentity) error {
 			return unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
 		},
 		killGroup: killProcessGroup,
+		groupAlive: func(group int) (bool, error) {
+			return workerGroupAlive(group, readProcessTable)
+		},
+		sleep: time.Sleep,
 	})
 }
 
@@ -130,6 +137,27 @@ func killWorkerWith(identity WorkerIdentity, ops workerKillOps) error {
 		if err := ops.killGroup(current); err != nil && !errors.Is(err, unix.ESRCH) {
 			return fmt.Errorf("kill native worker process group: %w", err)
 		}
+		if ops.groupAlive != nil {
+			for attempt := 0; attempt < 10; attempt++ {
+				alive, aliveErr := ops.groupAlive(current.ProcessGroup)
+				if aliveErr != nil {
+					return fmt.Errorf("inspect native worker process group after cleanup: %w", aliveErr)
+				}
+				if !alive {
+					return nil
+				}
+				if attempt == 9 {
+					break
+				}
+				if err := ops.killGroup(current); err != nil && !errors.Is(err, unix.ESRCH) {
+					return fmt.Errorf("retry native worker process-group cleanup: %w", err)
+				}
+				if ops.sleep != nil {
+					ops.sleep(10 * time.Millisecond)
+				}
+			}
+			return errors.New("native worker process group remains after cleanup")
+		}
 	}
 	return nil
 }
@@ -152,10 +180,24 @@ func killProcessGroup(identity WorkerIdentity) error {
 	if root.group != identity.ProcessGroup {
 		return fmt.Errorf("native worker process group changed for pid %d", identity.PID)
 	}
+	present, err := workerRootPresent(identity)
+	if err != nil {
+		return err
+	}
+	if !present {
+		return nil
+	}
 	var first error
 	for pid, item := range all {
 		if item.group != identity.ProcessGroup || item.state == 'Z' {
 			continue
+		}
+		present, err := workerRootPresent(identity)
+		if err != nil {
+			return err
+		}
+		if !present {
+			return nil
 		}
 		fd, openErr := unix.PidfdOpen(pid, 0)
 		if errors.Is(openErr, unix.ESRCH) {
@@ -193,4 +235,21 @@ func killProcessGroup(identity WorkerIdentity) error {
 		}
 	}
 	return first
+}
+
+func workerRootPresent(identity WorkerIdentity) (bool, error) {
+	current, err := readProcess(identity.PID)
+	if processGone(err) {
+		return false, workerRootExited(identity, WorkerAlive)
+	}
+	if err != nil {
+		return false, err
+	}
+	if current.start != identity.StartTime {
+		return false, fmt.Errorf("native worker identity changed for pid %d", identity.PID)
+	}
+	if current.group != identity.ProcessGroup {
+		return false, fmt.Errorf("native worker process group changed for pid %d", identity.PID)
+	}
+	return true, nil
 }

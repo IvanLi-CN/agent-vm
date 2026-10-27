@@ -186,6 +186,7 @@ func (tracker *processTracker) discoverWithRead(root int, readTable func() (map[
 	if !tracker.hasOwnershipBoundary() && tracker.rootGroup > 0 && rootPresent {
 		latestRoot, rootErr := readRoot(root)
 		if processGone(rootErr) {
+			observedBeforeRootExit := related
 			refreshed, refreshErr := readTable()
 			if refreshErr != nil {
 				return fmt.Errorf("inspect native process tree after root exit: %w", refreshErr)
@@ -195,6 +196,16 @@ func (tracker *processTracker) discoverWithRead(root int, readTable func() (map[
 			}
 			all = refreshed
 			related = descendants(all, root)
+			for pid, observed := range observedBeforeRootExit {
+				current, stillPresent := refreshed[pid]
+				if !stillPresent {
+					continue
+				}
+				if current.start != observed.start {
+					return fmt.Errorf("process identity changed for pid %d", pid)
+				}
+				related[pid] = current
+			}
 			rootPresent = false
 			rootExited = true
 		} else if rootErr != nil {

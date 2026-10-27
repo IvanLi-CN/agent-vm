@@ -243,6 +243,47 @@ func TestProcessTrackerAcceptsReapedRootWithEmptyGroup(t *testing.T) {
 	}
 }
 
+func TestProcessTrackerRetainsObservedDescendantAfterRootReparent(t *testing.T) {
+	group := 1 << 30
+	tracker := &processTracker{
+		root:         100,
+		rootStart:    "root-start",
+		rootGroup:    group,
+		baseline:     make(map[int]trackedProcess),
+		tracked:      make(map[int]trackedProcess),
+		groupMembers: make(map[int]trackedProcess),
+	}
+	first := map[int]trackedProcess{
+		100: {pid: 100, start: "root-start", parent: 1, group: group, state: 'S'},
+		200: {pid: 200, start: "detached-child", parent: 100, group: 200, state: 'S'},
+	}
+	refreshed := map[int]trackedProcess{
+		200: {pid: 200, start: "detached-child", parent: 1, group: 200, state: 'S'},
+	}
+	empty := map[int]trackedProcess{}
+	snapshot := 0
+	readTable := func() (map[int]trackedProcess, error) {
+		snapshot++
+		switch snapshot {
+		case 1:
+			return first, nil
+		case 2:
+			return refreshed, nil
+		default:
+			return empty, nil
+		}
+	}
+	readRoot := func(int) (trackedProcess, error) {
+		return trackedProcess{}, &os.PathError{Op: "read", Path: "/proc/100/stat", Err: unix.ESRCH}
+	}
+	if err := tracker.discoverWithRead(100, readTable, readRoot); err != nil {
+		t.Fatalf("reparented descendant discover() error = %v", err)
+	}
+	if item, ok := tracker.tracked[200]; !ok || item.start != "detached-child" {
+		t.Fatalf("tracked detached descendant = %#v, want observed identity", tracker.tracked)
+	}
+}
+
 func TestWorkerAliveDetectsSurvivingProcessGroupAfterRootExit(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux worker identity required")
@@ -402,6 +443,36 @@ func TestKillWorkerDoesNotSignalReusedGroupAfterRootPidfdExit(t *testing.T) {
 	}
 	if groupKilled {
 		t.Fatal("killWorkerWith() signalled a numeric group after the pidfd target exited")
+	}
+}
+
+func TestKillWorkerConfirmsProcessGroupGoneAfterMemberScan(t *testing.T) {
+	identity := WorkerIdentity{PID: 123, StartTime: "1", ProcessGroup: 123}
+	groupChecks := 0
+	killGroupCalls := 0
+	err := killWorkerWith(identity, workerKillOps{
+		openPIDFD:  func(int) (int, error) { return 42, nil },
+		closePIDFD: func(int) error { return nil },
+		readIdentity: func(int) (WorkerIdentity, error) {
+			return identity, nil
+		},
+		workerAlive: func(WorkerIdentity) (bool, error) { return true, nil },
+		sendSignal:  func(int) error { return nil },
+		killGroup: func(WorkerIdentity) error {
+			killGroupCalls++
+			return nil
+		},
+		groupAlive: func(int) (bool, error) {
+			groupChecks++
+			return groupChecks == 1, nil
+		},
+		sleep: func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatalf("killWorkerWith() error = %v, want nil", err)
+	}
+	if killGroupCalls != 2 || groupChecks != 2 {
+		t.Fatalf("group cleanup calls = kill:%d check:%d, want 2 each", killGroupCalls, groupChecks)
 	}
 }
 
