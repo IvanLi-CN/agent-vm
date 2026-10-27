@@ -1531,23 +1531,60 @@ func (s *Service) reconcile(ctx context.Context, apply bool) (map[string]any, er
 			}
 		}
 		if task.State == stateClosing && apply {
-			if _, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil && firstErr == nil {
-				firstErr = releaseErr
+			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil {
+				if firstErr == nil {
+					firstErr = releaseErr
+				}
+			} else if finalizeErr := s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, "release", result); finalizeErr != nil && firstErr == nil {
+				firstErr = finalizeErr
 			}
 		}
 		if task.State == stateFailed && apply {
-			if _, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil && firstErr == nil {
-				firstErr = releaseErr
+			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil {
+				if firstErr == nil {
+					firstErr = releaseErr
+				}
+			} else if finalizeErr := s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, "release", result); finalizeErr != nil && firstErr == nil {
+				firstErr = finalizeErr
 			}
 		}
 		if task.State == stateDeleting && apply {
-			if _, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, true); releaseErr != nil && firstErr == nil {
-				firstErr = releaseErr
+			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, true); releaseErr != nil {
+				if firstErr == nil {
+					firstErr = releaseErr
+				}
+			} else if finalizeErr := s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, "destroy", result); finalizeErr != nil && firstErr == nil {
+				firstErr = finalizeErr
 			}
 		}
 	}
 	result := map[string]any{"dry_run": !apply, "actions": actions}
 	return result, firstErr
+}
+
+func (s *Service) finalizePendingCleanup(ctx context.Context, session string, generation int64, action string, result map[string]any) error {
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	for _, operation := range pending {
+		if operation.Action != action || operation.SessionID == nil || *operation.SessionID != session || operation.Generation == nil || *operation.Generation != generation {
+			continue
+		}
+		rawRequest, ok := operation.Response["_request"].(map[string]any)
+		if !ok {
+			return protocol.NewError("operation_unverified", "pending cleanup request is missing", map[string]any{"operation_id": operation.OperationID})
+		}
+		request := protocol.Request(rawRequest)
+		response := protocol.SuccessWithRelease(request, result, s.Release, nil)
+		if digest, ok := operation.Response["_request_digest"]; ok {
+			response["_request_digest"] = digest
+		}
+		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+			return s.sqliteError(err)
+		}
+	}
+	return nil
 }
 
 func (s *Service) gc(ctx context.Context, apply bool) (map[string]any, error) {

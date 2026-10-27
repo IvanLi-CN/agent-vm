@@ -745,6 +745,57 @@ func TestDestroySkipsStopForStoppedGuest(t *testing.T) {
 	}
 }
 
+func TestReconcileFinalizesPendingDestroyAfterCleanup(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "pending-destroy.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	session := "pending-destroy-session"
+	generation := int64(1)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "pending-destroy-task", SessionID: session, Generation: generation, State: stateDeleting,
+		InstanceName: "agent-pending-destroy", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":0,"memory_mib":0,"disk_gib":0}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := map[string]any{
+		"protocol": protocol.Version, "action": "destroy", "session_id": session,
+		"generation": generation, "operation_id": "destroy-pending",
+	}
+	if err := store.RecordOperation(context.Background(), "destroy-pending", "destroy", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request": request, "_request_digest": "digest",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status: "Stopped",
+		config: map[string]any{
+			"config":           map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "pending-destroy-task", "user.agent-vm.session": session, "user.agent-vm.generation": "1"},
+			"devices":          map[string]any{},
+			"expanded_devices": map[string]any{},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
+	if _, err := service.reconcile(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	if task, err := store.GetTask(context.Background(), map[string]any{"session_id": session}); err != nil {
+		t.Fatal(err)
+	} else if task != nil {
+		t.Fatalf("reconciled task = %#v", task)
+	}
+	operation, err := store.GetOperation(context.Background(), "destroy-pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Response["outcome"] != "success" {
+		t.Fatalf("reconciled operation = %#v", operation.Response)
+	}
+}
+
 func TestStartupPressureRefusesBeforeDurableAcquire(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
