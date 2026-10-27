@@ -110,6 +110,32 @@ func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
 	}
 }
 
+func TestAbsentStatusMatchesClientContract(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	service := New(store, cfg, Options{})
+	response, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol":   protocol.Version,
+		"action":     "status",
+		"session_id": "new-session",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := response["result"].(map[string]any)
+	if result["state"] != stateAbsent || result["generation"] != int64(0) ||
+		result["effective_lease"] != false || result["native_status"] != stateAbsent ||
+		result["guest_available"] != false {
+		t.Fatalf("absent status = %#v", result)
+	}
+}
+
 func TestAdmissionAndLeaseTransitionsRemainDurable(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

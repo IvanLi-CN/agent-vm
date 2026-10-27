@@ -667,7 +667,14 @@ func (s *Service) status(ctx context.Context, session string) (map[string]any, e
 		return nil, s.sqliteError(err)
 	}
 	if task == nil {
-		return map[string]any{"state": stateAbsent, "session_id": session, "effective_lease": false}, nil
+		return map[string]any{
+			"state":           stateAbsent,
+			"session_id":      session,
+			"generation":      int64(0),
+			"effective_lease": false,
+			"native_status":   stateAbsent,
+			"guest_available": false,
+		}, nil
 	}
 	return s.summary(ctx, task)
 }
