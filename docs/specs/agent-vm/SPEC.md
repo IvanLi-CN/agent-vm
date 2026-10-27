@@ -20,6 +20,8 @@ Each session owns at most one managed-container slot, including preparing, stopp
 
 Renewal is explicit and bounded. Acquire, status, SSH, execution and transfer do not renew a lease. A changed generation or expired lease rejects late readiness and native results. Durable state, locks and timers make repeated requests idempotent without hiding partial cleanup.
 
+Native process observation is race-tolerant: when a tracked process exits between `/proc` enumeration and identity reads, the controller treats it as gone and continues the normal bounded cleanup path. Other process-table read errors remain failures.
+
 ## Access and isolation
 
 The deployment configuration supplies the control address and host port range. Proxy NAT uses the configured host address, leased port and fixed guest address. SSH keeps host-key verification enabled with explicit identity and known-host files. The managed Incus project must allow the required proxy devices, and the configured ACL must prove peer and host isolation before admission. Exact conntrack entries are removed during mapping cleanup.
