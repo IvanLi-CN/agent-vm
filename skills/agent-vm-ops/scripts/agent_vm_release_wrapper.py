@@ -20,6 +20,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -99,6 +100,7 @@ CANONICAL_UNIT_DIR = Path("/etc/systemd/system")
 RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
 GO_CONTROL_PATH = Path("/opt/agent-vm-native/bin/agent-vm-control")
 GO_CONTROL_SOCKET = Path("/run/agent-vm-native/control.sock")
+STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
 LEGACY_EXPIRY_TIMER_RE = re.compile(r"^agent-vm-native-expire-[A-Za-z0-9_.:-]+\.timer$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -925,6 +927,19 @@ def _validate_state_compatibility(manifest: Mapping[str, Any], capabilities: Any
             )
 
 
+def _read_live_state_capabilities() -> list[str]:
+    """Read the fixed state registry when an older controller omits it in drain-status."""
+    uri = f"file:{STATE_DB_PATH}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=30) as database:
+            rows = database.execute(
+                "SELECT name, version FROM state_capabilities ORDER BY name, version",
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        _fail("state_compatibility_unverified", "live state capabilities could not be read")
+    return [f"{name}@{version}" for name, version in rows]
+
+
 def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any] | None = None) -> None:
     if not config["require_drained"]:
         return
@@ -963,7 +978,10 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
     if result.get("draining") is not True:
         _fail("drain_required", "release activation requires admission drain")
     if target_manifest is not None:
-        _validate_state_compatibility(target_manifest, result.get("state_capabilities"))
+        capabilities = result.get("state_capabilities")
+        if capabilities is None:
+            capabilities = _read_live_state_capabilities()
+        _validate_state_compatibility(target_manifest, capabilities)
 
 
 def _daemon_reload() -> None:
@@ -1022,8 +1040,15 @@ def _legacy_expiry_timers() -> tuple[str, ...]:
     return tuple(sorted(units))
 
 
-def _activate_go_runtime() -> None:
+def _deactivate_web_runtime() -> None:
+    _systemctl("stop", "agent-vm-web.service", allow_missing=True)
+    _systemctl("disable", "agent-vm-web.service", allow_missing=True)
+
+
+def _activate_go_runtime(*, web_enabled: bool = False) -> None:
     """Retire legacy triggers, enable Go, and verify that it is active."""
+    if not web_enabled:
+        _deactivate_web_runtime()
     for unit in (*GO_RETIRED_UNITS, *_legacy_expiry_timers()):
         _systemctl("stop", unit, allow_missing=True)
         _systemctl("disable", unit, allow_missing=True)
@@ -1033,16 +1058,12 @@ def _activate_go_runtime() -> None:
 
 
 def _activate_product_runtime(manifest: Mapping[str, Any]) -> None:
-    _activate_go_runtime()
-    if manifest.get("format") == PRODUCT_MANIFEST_FORMAT:
+    web_enabled = manifest.get("format") == PRODUCT_MANIFEST_FORMAT
+    _activate_go_runtime(web_enabled=web_enabled)
+    if web_enabled:
         # The Web unit is operator-enabled after its real config is installed.
         # try-restart preserves that choice while refreshing an active service.
         _systemctl("try-restart", "agent-vm-web.service", allow_missing=True)
-    else:
-        # A legacy product has no Web entry point. Stop and disable any Web
-        # unit left by a newer product before the old control plane resumes.
-        _systemctl("stop", "agent-vm-web.service", allow_missing=True)
-        _systemctl("disable", "agent-vm-web.service", allow_missing=True)
 
 
 def _activate_legacy_runtime() -> None:
@@ -1239,6 +1260,19 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
                 _fsync_directory(retired.parent, "activation_failed")
             except OSError:
                 _fail("activation_failed", f"cannot retire the exact old unit: {name}")
+    for target in (
+        Path(config["unit_dir"]) / "agent-vm-web.service",
+        go_bundle_root / "systemd" / "agent-vm-web.service",
+        go_bundle_root / "config" / "agent-vm-web.json.example",
+        go_bundle_root / "web-assets.manifest.json",
+    ):
+        if target.exists() or target.is_symlink():
+            _require_owned_regular(target, owner_uid, 0o644)
+            try:
+                target.unlink()
+                _fsync_directory(target.parent, "activation_failed")
+            except OSError:
+                _fail("activation_failed", f"cannot retire the exact Web artifact: {target.name}")
     manifest_source = release_root / MANIFEST_NAME
     _require_owned_regular(manifest_source, owner_uid, 0o644)
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)

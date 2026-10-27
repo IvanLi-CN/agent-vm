@@ -132,12 +132,43 @@ class WrapperTests(unittest.TestCase):
                 WRAPPER._ensure_drained(self.loaded, incompatible)
         self.assertEqual(failure.exception.code, "state_compatibility_mismatch")
 
+    def test_drain_verification_reads_fixed_state_db_for_old_controller(self):
+        self.drain_patch.stop()
+        response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
+        target = {
+            "format": MANIFEST.PRODUCT_MANIFEST_FORMAT,
+            "state_compatibility": {
+                "reads": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+                "writes": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+            },
+        }
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ), mock.patch.object(
+            WRAPPER,
+            "_read_live_state_capabilities",
+            return_value=list(MANIFEST.STATE_CAPABILITY_MARKERS),
+        ) as read_capabilities:
+            WRAPPER._ensure_drained(self.loaded, target)
+        read_capabilities.assert_called_once_with()
+
     def test_legacy_product_runtime_stops_the_web_unit(self):
         with mock.patch.object(
             WRAPPER.subprocess, "run",
             return_value=subprocess.CompletedProcess([], 0, b"", b""),
         ) as run:
             WRAPPER._activate_product_runtime({"format": MANIFEST.LEGACY_PRODUCT_MANIFEST_FORMAT})
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["systemctl", "stop", "agent-vm-web.service"], commands)
+        self.assertIn(["systemctl", "disable", "agent-vm-web.service"], commands)
+
+    def test_go_runtime_stops_the_web_unit_before_old_control_plane(self):
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ) as run:
+            WRAPPER._activate_go_runtime()
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn(["systemctl", "stop", "agent-vm-web.service"], commands)
         self.assertIn(["systemctl", "disable", "agent-vm-web.service"], commands)
