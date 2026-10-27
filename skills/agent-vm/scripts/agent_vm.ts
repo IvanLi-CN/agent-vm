@@ -78,7 +78,8 @@ export async function dispatch(args: Args, client = new Client(), native = inher
   if (cmd === "acquire") {
     const [key, publicKey] = await client.key(session!);
     const acquireOperationId = o["operation-id"] || randomUUID();
-    let generation = (await client.request("status", { session })).result.generation;
+    const status = (await client.request("status", { session })).result;
+    let generation = status.state === "absent" ? 0 : status.generation;
     if (!integer(generation) || generation < 0) fail("invalid_remote_response", "status has no valid generation");
     if (o["operation-id"]) {
       try { generation = readJson(client.operationPath(session!, o["operation-id"])).request.generation; }
