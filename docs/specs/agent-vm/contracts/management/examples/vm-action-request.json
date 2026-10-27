@@ -1,0 +1,9 @@
+{
+  "operation_id": "50e8400e-ccf8-4c7b-8d1d-14f66c7fb124",
+  "reason": "Restore service after a confirmed guest-side fault",
+  "target_version": "vm:task_example_01:revision-9",
+  "action": "restart",
+  "expected_generation": "42",
+  "parameters": {},
+  "confirmation_token": "synthetic-confirmation-token-not-valid-for-use"
+}

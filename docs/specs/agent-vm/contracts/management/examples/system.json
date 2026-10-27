@@ -1,0 +1,44 @@
+{
+  "product_version": "0.0.0+synthetic",
+  "resource_version": "system:revision-4",
+  "state_capabilities": [
+    "legacy-agent-vm-core@1",
+    "managed-image-catalog@1",
+    "management-operation-audit@1",
+    "session-image-binding@1"
+  ],
+  "maintenance": {
+    "draining": false,
+    "reconciliation_pending": 0,
+    "garbage_collection_pending": 0
+  },
+  "components": [
+    {
+      "name": "web",
+      "state": "ready",
+      "version": "0.0.0+synthetic",
+      "observed_at": "2026-01-15T10:20:30Z"
+    },
+    {
+      "name": "authority",
+      "state": "ready",
+      "version": "0.0.0+synthetic",
+      "observed_at": "2026-01-15T10:20:30Z"
+    },
+    {
+      "name": "observer",
+      "state": "degraded",
+      "version": null,
+      "observed_at": "2026-01-15T10:00:00Z"
+    }
+  ],
+  "sources": [
+    {
+      "name": "health",
+      "state": "available",
+      "observed_at": "2026-01-15T10:20:30Z",
+      "stale_after_seconds": 30,
+      "safe_code": null
+    }
+  ]
+}

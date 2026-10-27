@@ -1,0 +1,16 @@
+{
+  "operation_id": "50e8400e-ccf8-4c7b-8d1d-14f66c7fb125",
+  "action": "image_import",
+  "status": "running",
+  "phase": "suitability_check",
+  "target": {
+    "kind": "image_catalog",
+    "id": "image-catalog"
+  },
+  "actor": "admin@example.invalid",
+  "reason": "Evaluate the next approved session image",
+  "created_at": "2026-01-15T09:55:00Z",
+  "updated_at": "2026-01-15T10:05:00Z",
+  "result": null,
+  "error": null
+}

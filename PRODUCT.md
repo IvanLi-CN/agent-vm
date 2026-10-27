@@ -41,6 +41,8 @@ Agent VM 管理台以会话归属、租约、generation、容量准入和 operat
 - 全局观察容量、准入、运行压力、排空、任务状态和各数据来源的新鲜度。
 - 管理已有 Agent 会话 VM，提供详情、重启、扩容、释放租约并停止、销毁与必要的端口维护；不提供管理员手动创建 VM。
 - 导入配置过的可信 Incus 镜像源或本地镜像包，对完整性与 Agent VM 适用性分别校验，管理不可变版本、默认选择、引用和安全删除。
+- 管理台首版包含概览、VM、镜像、操作与审计、系统五个页面；首个认证后的页面为概览。
+- 管理台界面支持简体中文 `zh-CN` 和英文 `en`，选择优先级为已保存选择、浏览器偏好、英文回退。
 - 默认镜像只影响新会话。已有 VM 和缓存继续绑定原镜像；旧会话换镜像需要明确销毁并重建。
 - 支持维护者干预有效租约中的 VM，但必须展示受影响会话、填写原因、二次确认并记录审计。后端始终重新校验当前状态与权限。
 - 镜像长任务与 VM 操作可以查询结果和恢复不确定状态。浏览器断开或请求超时不自动取消、重做或判定 native 操作失败。
@@ -59,15 +61,17 @@ Agent VM 管理台以会话归属、租约、generation、容量准入和 operat
 
 从 VM 制作镜像、自动构建镜像流水线、任意 Incus 实例接管、通用网络/存储管理、宿主机/PVE 管理、独立 start/stop/pause、快照/克隆/迁移、Web terminal 和自动控制面部署。
 
-### 保持未决的事项
+### 部署输入
 
-实际部署身份与入口参数、镜像允许来源及上传限额、验证隔离策略、具体状态迁移与兼容措施需要在实施中依据真实条件确定。产品界面的默认语言、多语言范围和具体设备支持承诺尚未单独确认，设计文档须明确其建议属性，不可宣称已有验证或承诺。
+实际代理 UID、Origin、管理员主体、镜像来源 ID、上传大小、staging 磁盘余量和隔离验证资源均由部署明确配置；缺少必要认证或资源限制配置时管理入口保持关闭。这些是启用输入，不构成产品行为分支。
+
+1440、1024 和 390 CSS px 是首版布局验证视口，不代表额外的设备或浏览器支持承诺。浅色视觉方向和所列字体、色值、尺寸见 `DESIGN.md`；它们是当前实施基线，仍须通过实际界面检查，不代表已经实现的设计 token。
 
 ## Brand Commitments
 
 产品名保留 `Agent VM`。VM、镜像、会话、租约与发布使用 [GLOSSARY.md](GLOSSARY.md) 的语义；不能以含糊文案隐藏访问撤销、数据丢失或工作负载中断。
 
-已选择的界面方向与待审阅的视觉约束见 [DESIGN.md](DESIGN.md)。尚无用户确认的 Logo、具体配色、字体或从实现提取的设计系统。前轮交互方案图只展示信息结构与示例状态，不构成已实现或已批准的视觉资产。
+已选择的“检修工作台”方向及其实施视觉基线见 [DESIGN.md](DESIGN.md)。Logo 未定义，实际组件、字体加载与视觉 token 尚未从实现中提取。前轮交互方案图只展示信息结构与示例状态，不构成已实现的产品界面。
 
 ## Evidence on Hand
 
@@ -75,7 +79,7 @@ Agent VM 管理台以会话归属、租约、generation、容量准入和 operat
 - [管理台研究备忘录](docs/proposals/agent-vm-web-console.md)：已确认范围、推荐技术与源码调查。
 - [ADR 0041](docs/adr/0041-agent-vm-session-pinned-image-identity.md)：会话固定不可变镜像身份的目标行为。
 - [ADR 0042](docs/adr/0042-agent-vm-web-management-boundary.md)：内置管理台的交付与权限边界。
-- [现行 Agent VM Spec](docs/specs/agent-vm/SPEC.md) 与 [CLI 合同](docs/specs/agent-vm/contracts/cli.md)：当前行为合同，尚未因目标设计而自动改变。
+- [现行 Agent VM Spec](docs/specs/agent-vm/SPEC.md)、[CLI 合同](docs/specs/agent-vm/contracts/cli.md) 与 [管理台合同](docs/specs/agent-vm/contracts/management-api.md)：现有协议 4 与新增浏览器 API、镜像迁移及回退边界。
 - [观测合同](docs/specs/agent-vm/contracts/observability.md)：资源、压力、准入、来源健康与新鲜度。
 
 目前没有产品内置 Web 组件、已实现设计 token、正式截图或真实浏览器验收。公开文档不得包含部署地址、凭据、真实清单、状态库或消费方渲染的观测文件，也不得把示例数据当成现网证明。
