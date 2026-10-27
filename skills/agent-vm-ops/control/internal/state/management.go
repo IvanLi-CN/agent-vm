@@ -818,6 +818,9 @@ func (s *Store) FinishManagementOperation(ctx context.Context, operationID, phas
 		if value.Status == "succeeded" || value.Status == "failed" || value.Status == "outcome_unknown" {
 			return errors.New("management operation is already finalized")
 		}
+		if value.Status != "running" {
+			return errors.New("management operation is not owned for execution")
+		}
 		resultJSON, err := jsonNullable(result)
 		if err != nil {
 			return err
