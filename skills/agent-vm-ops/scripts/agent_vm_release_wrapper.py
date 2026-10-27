@@ -1045,6 +1045,21 @@ def _deactivate_web_runtime() -> None:
     _systemctl("disable", "agent-vm-web.service", allow_missing=True)
 
 
+def _unit_is_enabled(unit: str) -> bool:
+    """Capture whether a unit was enabled before a dependency restart."""
+    try:
+        process = subprocess.run(
+            ["systemctl", "is-enabled", "--quiet", unit],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _fail("activation_failed", f"systemd enabled-state check could not be verified: {unit}")
+    return process.returncode == 0
+
+
 def _activate_go_runtime(*, web_enabled: bool = False) -> None:
     """Retire legacy triggers, enable Go, and verify that it is active."""
     if not web_enabled:
@@ -1059,11 +1074,11 @@ def _activate_go_runtime(*, web_enabled: bool = False) -> None:
 
 def _activate_product_runtime(manifest: Mapping[str, Any]) -> None:
     web_enabled = manifest.get("format") == PRODUCT_MANIFEST_FORMAT
+    web_was_enabled = _unit_is_enabled("agent-vm-web.service") if web_enabled else False
     _activate_go_runtime(web_enabled=web_enabled)
-    if web_enabled:
-        # The Web unit is operator-enabled after its real config is installed.
-        # try-restart preserves that choice while refreshing an active service.
-        _systemctl("try-restart", "agent-vm-web.service", allow_missing=True)
+    if web_was_enabled:
+        # Requires=agent-vm-native.service stops Web during native restart.
+        _systemctl("start", "agent-vm-web.service", allow_missing=True)
 
 
 def _activate_legacy_runtime() -> None:
