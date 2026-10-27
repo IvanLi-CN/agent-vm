@@ -248,6 +248,9 @@ func TestWorkerAliveDetectsSurvivingProcessGroupAfterRootExit(t *testing.T) {
 	if err := signalTestProcess(childPID, childStart); err != nil && !processGone(err) {
 		t.Fatal(err)
 	}
+	if _, err := unix.Wait4(childPID, nil, 0, nil); err != nil && !errors.Is(err, unix.ECHILD) {
+		t.Fatal(err)
+	}
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		alive, err = WorkerAlive(identity)
