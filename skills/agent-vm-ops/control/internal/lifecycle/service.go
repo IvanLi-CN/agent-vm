@@ -864,23 +864,13 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if err := s.Guest.Start(nativeCtx, task.InstanceName); err != nil {
 			return s.failTask(ctx, task, "native-start", err)
 		}
-		status, statusErr := s.Guest.Status(nativeCtx, task.InstanceName)
-		if statusErr != nil {
-			return s.failTask(ctx, task, "guest-readiness", statusErr)
+		ip, readinessErr := waitForGuestReady(nativeCtx, s.Guest, task.InstanceName)
+		if readinessErr != nil {
+			return s.failTask(ctx, task, "guest-readiness", readinessErr)
 		}
-		if value, parseErr := native.ParseStatus(status); parseErr != nil || !strings.EqualFold(value, "running") {
-			if parseErr != nil {
-				return s.failTask(ctx, task, "guest-readiness", parseErr)
-			}
-			return s.failTask(ctx, task, "guest-readiness", fmt.Errorf("guest status is %s", value))
-		}
-		if ip := guestIPv4(status); ip != "" {
-			task.VMIP = &ip
-			if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"vm_ip": ip, "updated_at": nowString(s.Clock())}); err != nil {
-				return nil, s.sqliteError(err)
-			}
-		} else {
-			return s.failTask(ctx, task, "guest-readiness", errors.New("guest did not report an IPv4 address"))
+		task.VMIP = &ip
+		if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"vm_ip": ip, "updated_at": nowString(s.Clock())}); err != nil {
+			return nil, s.sqliteError(err)
 		}
 		if err := s.exposeSSH(ctx, task, request, nativeCtx); err != nil {
 			return s.failTask(ctx, task, "access-exposure", err)
@@ -2054,6 +2044,37 @@ func guestIPv4(value map[string]any) string {
 		}
 	}
 	return ""
+}
+
+const guestReadinessPollInterval = 250 * time.Millisecond
+
+func waitForGuestReady(ctx context.Context, guest native.Guest, name string) (string, error) {
+	if guest == nil {
+		return "", errors.New("guest client is unavailable")
+	}
+	ticker := time.NewTicker(guestReadinessPollInterval)
+	defer ticker.Stop()
+	for {
+		status, err := guest.Status(ctx, name)
+		if err != nil {
+			return "", err
+		}
+		value, parseErr := native.ParseStatus(status)
+		if parseErr != nil {
+			return "", parseErr
+		}
+		if !strings.EqualFold(value, "running") {
+			return "", fmt.Errorf("guest status is %s", value)
+		}
+		if ip := guestIPv4(status); ip != "" {
+			return ip, nil
+		}
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("guest did not report an IPv4 address: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64, excludeTaskID string, startup bool) error {

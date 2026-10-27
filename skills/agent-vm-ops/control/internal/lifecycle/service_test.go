@@ -22,10 +22,12 @@ type staticCPUObserver struct {
 }
 
 type startupGuest struct {
-	status    string
-	config    map[string]any
-	configErr error
-	stopErr   error
+	status      string
+	statuses    []map[string]any
+	statusCalls int
+	config      map[string]any
+	configErr   error
+	stopErr     error
 }
 
 func (guest *startupGuest) Init(context.Context, string, string) error              { return nil }
@@ -41,6 +43,14 @@ func (guest *startupGuest) Start(context.Context, string) error                {
 func (guest *startupGuest) Stop(context.Context, string) error                 { return guest.stopErr }
 func (guest *startupGuest) Delete(context.Context, string) error               { return nil }
 func (guest *startupGuest) Status(context.Context, string) (map[string]any, error) {
+	if len(guest.statuses) > 0 {
+		index := guest.statusCalls
+		if index >= len(guest.statuses) {
+			index = len(guest.statuses) - 1
+		}
+		guest.statusCalls++
+		return guest.statuses[index], nil
+	}
 	return map[string]any{"status": guest.status}, nil
 }
 func (guest *startupGuest) Config(context.Context, string) (map[string]any, error) {
@@ -134,6 +144,24 @@ func TestAbsentStatusMatchesClientContract(t *testing.T) {
 		result["effective_lease"] != false || result["native_status"] != stateAbsent ||
 		result["guest_available"] != false {
 		t.Fatalf("absent status = %#v", result)
+	}
+}
+
+func TestWaitForGuestReadyPollsUntilIPv4IsVisible(t *testing.T) {
+	guest := &startupGuest{statuses: []map[string]any{
+		{"status": "Running", "network": map[string]any{"eth0": map[string]any{"addresses": []any{}}}},
+		{"status": "Running", "network": map[string]any{"eth0": map[string]any{"addresses": []any{
+			map[string]any{"family": "inet", "address": "10.250.19.20"},
+		}}}},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ip, err := waitForGuestReady(ctx, guest, "agent-ready")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ip != "10.250.19.20" || guest.statusCalls != 2 {
+		t.Fatalf("ip=%q status_calls=%d", ip, guest.statusCalls)
 	}
 }
 
