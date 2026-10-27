@@ -136,6 +136,13 @@ func (tracker *processTracker) hasOwnershipBoundary() bool {
 	return tracker.cgroupPath != ""
 }
 
+func (tracker *processTracker) groupAlive() (bool, error) {
+	if tracker.rootGroup <= 0 {
+		return false, nil
+	}
+	return workerGroupAlive(tracker.rootGroup, readProcessTable)
+}
+
 func (tracker *processTracker) Discover(root int) error {
 	nativeProcessTreeMu.Lock()
 	defer nativeProcessTreeMu.Unlock()

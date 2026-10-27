@@ -90,6 +90,41 @@ func TestCleanupTrackedPerformsFinalDiscovery(t *testing.T) {
 	}
 }
 
+func TestCleanupTrackedConfirmsProcessGroupAfterEmptyObservation(t *testing.T) {
+	groupCalls := 0
+	if err := cleanupTrackedWith(42, cleanupOperations{
+		discover: func(int) error { return nil },
+		kill:     func() error { return nil },
+		reap:     func() error { return nil },
+		present:  func() (int, error) { return 0, nil },
+		groupAlive: func() (bool, error) {
+			groupCalls++
+			return groupCalls == 1, nil
+		},
+		sleep: func(time.Duration) {},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if groupCalls < 2 {
+		t.Fatalf("group cleanup checks = %d, want a retry after the group remained", groupCalls)
+	}
+}
+
+func TestCleanupTrackedFailsClosedOnProcessGroupObservationError(t *testing.T) {
+	sentinel := errors.New("synthetic process-group observation failure")
+	err := cleanupTrackedWith(42, cleanupOperations{
+		discover:   func(int) error { return nil },
+		kill:       func() error { return nil },
+		reap:       func() error { return nil },
+		present:    func() (int, error) { return 0, nil },
+		groupAlive: func() (bool, error) { return false, sentinel },
+		sleep:      func(time.Duration) {},
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("cleanupTrackedWith() error = %v, want %v", err, sentinel)
+	}
+}
+
 func TestRunnerAllowsIndependentCommandsToOverlap(t *testing.T) {
 	runner := NewRunner()
 	started := time.Now()

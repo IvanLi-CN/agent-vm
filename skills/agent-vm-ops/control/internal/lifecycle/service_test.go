@@ -576,6 +576,37 @@ func TestStartupReconcileRetriesFinishedAdminMaintenanceWorker(t *testing.T) {
 	}
 }
 
+func TestWorkerFinishedKeepsFailedWorkerReconciliable(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "failed-worker.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	operationID := "failed-worker"
+	if err := store.RecordOperation(context.Background(), operationID, "release", stringPointer("failed-worker-session"), nil, map[string]any{
+		"outcome": "pending",
+		"worker":  map[string]any{"state": "starting"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	identity := native.WorkerIdentity{PID: 123, StartTime: "start", ProcessGroup: 123}
+	if err := service.WorkerFinished(context.Background(), operationID, identity, errors.New("native cleanup remained uncertain")); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	if !ok || worker["state"] != "running" {
+		t.Fatalf("failed worker state = %#v, want running", operation.Response)
+	}
+	if worker["error"] != "native cleanup remained uncertain" {
+		t.Fatalf("failed worker error = %#v", worker["error"])
+	}
+}
+
 func TestReleaseCancelsPendingAcquireForCachedTask(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "cached-acquire-recovery.sqlite3"))
 	if err != nil {

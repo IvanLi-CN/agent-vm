@@ -183,11 +183,18 @@ func (s *Service) WorkerStarted(ctx context.Context, operationID string, identit
 }
 
 func (s *Service) WorkerFinished(ctx context.Context, operationID string, identity native.WorkerIdentity, runErr error) error {
+	workerState := "finished"
+	if runErr != nil {
+		// A native error can mean cleanup or ownership observation remained
+		// uncertain. Keep the worker reconciliable instead of making a pending
+		// operation look safely finished.
+		workerState = "running"
+	}
 	worker := map[string]any{
 		"pid":           identity.PID,
 		"start_time":    identity.StartTime,
 		"process_group": identity.ProcessGroup,
-		"state":         "finished",
+		"state":         workerState,
 		"finished_at":   nowString(s.Clock()),
 	}
 	if runErr != nil {

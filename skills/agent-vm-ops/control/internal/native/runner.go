@@ -309,21 +309,25 @@ func waitForPipes(stdoutDone, stderrDone <-chan struct{}, timeout time.Duration)
 
 func cleanupTracked(tracker *processTracker, root int) error {
 	return cleanupTrackedWith(root, cleanupOperations{
-		discover: tracker.Discover,
-		kill:     tracker.Kill,
-		reap:     tracker.Reap,
-		present:  tracker.Present,
-		sleep:    time.Sleep,
+		discover:   tracker.Discover,
+		kill:       tracker.Kill,
+		reap:       tracker.Reap,
+		present:    tracker.Present,
+		groupAlive: tracker.groupAlive,
+		sleep:      time.Sleep,
 	})
 }
 
 type cleanupOperations struct {
-	discover func(int) error
-	kill     func() error
-	reap     func() error
-	present  func() (int, error)
-	sleep    func(time.Duration)
+	discover   func(int) error
+	kill       func() error
+	reap       func() error
+	present    func() (int, error)
+	groupAlive func() (bool, error)
+	sleep      func(time.Duration)
 }
+
+var errTrackedProcessGroupRemains = errors.New("tracked native process group remains after cleanup")
 
 func cleanupTrackedWith(root int, operations cleanupOperations) error {
 	var first error
@@ -359,7 +363,16 @@ func cleanupTrackedWith(root int, operations cleanupOperations) error {
 				continue
 			}
 			if present == 0 {
-				return first
+				groupErr := confirmGroupCleanup(operations)
+				if groupErr == nil {
+					return first
+				}
+				if !errors.Is(groupErr, errTrackedProcessGroupRemains) {
+					if first == nil {
+						first = groupErr
+					}
+					continue
+				}
 			}
 		}
 		operations.sleep(50 * time.Millisecond)
@@ -367,12 +380,32 @@ func cleanupTrackedWith(root int, operations cleanupOperations) error {
 	if err := operations.reap(); err != nil && first == nil {
 		first = err
 	}
-	if present, err := operations.present(); err != nil && first == nil {
+	if present, err := operations.present(); err != nil {
+		if first == nil {
+			first = err
+		}
+	} else if present > 0 {
+		if first == nil {
+			first = errors.New("tracked native descendants remain after cleanup")
+		}
+	} else if err := confirmGroupCleanup(operations); err != nil && first == nil {
 		first = err
-	} else if err == nil && present > 0 && first == nil {
-		first = errors.New("tracked native descendants remain after cleanup")
 	}
 	return first
+}
+
+func confirmGroupCleanup(operations cleanupOperations) error {
+	if operations.groupAlive == nil {
+		return nil
+	}
+	alive, err := operations.groupAlive()
+	if err != nil {
+		return fmt.Errorf("inspect native process group after cleanup: %w", err)
+	}
+	if alive {
+		return errTrackedProcessGroupRemains
+	}
+	return nil
 }
 
 func (r *Runner) stdoutLimit() int {
