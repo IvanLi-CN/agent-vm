@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "transport_selection": {
+    "status": "unselected",
+    "selection_evidence": null,
+    "transport_owner": null,
+    "configuration_owner": null,
+    "required_secrets": [],
+    "when_unselected": "block-rollout",
+    "missing_selected_configuration": "fail",
+    "implicit_external_notifier": "forbidden"
+  },
+  "workflow_classes": {
+    "CI (PR)": "generic",
+    "CI (Main)": "generic",
+    "Release": "release-specific",
+    "Release recovery": "generic",
+    "Notification smoke": "generic"
+  },
+  "expected_failure_context": ["repository", "workflow", "run_id", "attempt", "head_sha", "actor", "run_url", "conclusion"],
+  "release_context": ["version", "source_revision", "reservation", "recovery_stage"],
+  "delivery": {
+    "only_failure": true,
+    "idempotency_key": "repository:workflow:run_id:attempt",
+    "trusted_source": "default-branch-workflow-helper",
+    "send_without_transport": false
+  }
+}

@@ -1,0 +1,68 @@
+name: CI (Main)
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: main
+  cancel-in-progress: false
+
+jobs:
+  main-gate:
+    name: Main gate
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.3'
+          cache-dependency-path: skills/agent-vm-ops/control/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Record validation runtimes
+        run: |
+          bun --version
+          go version
+          python3 --version
+          git --version
+          uname -s
+      - name: Install locked Bun dependencies
+        run: bun install --frozen-lockfile
+      - name: Typecheck
+        run: bun run typecheck
+      - name: Go control tests
+        working-directory: skills/agent-vm-ops/control
+        run: go test -count=1 ./...
+      - name: Go control vet
+        run: go -C skills/agent-vm-ops/control vet ./...
+      - name: Run repository checks
+        run: bun run check
+      - name: Run repository tests
+        run: bun run test:repo
+      - name: Run Skill tests
+        run: bun run test:skills
+      - name: Build product packages
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          build_root="$(mktemp -d)"
+          trap 'rm -rf "$build_root"' EXIT
+          version="0.0.0-ci.${GITHUB_RUN_ID}"
+          bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target client --output "$build_root/client.tar"
+          bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target linux/amd64 --output "$build_root/amd64.tar"
+          bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target linux/arm64 --output "$build_root/arm64.tar"
+      - name: Run Linux race tests
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: skills/agent-vm-ops/control
+        run: go test -race -count=1 ./...

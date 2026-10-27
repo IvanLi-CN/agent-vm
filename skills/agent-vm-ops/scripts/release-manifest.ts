@@ -31,6 +31,7 @@ import {
   type Data,
   type Integer,
 } from "./control-types.ts";
+import { parseSemVer } from "./semver.ts";
 
 export const MANIFEST_FORMAT = 1;
 export const PROTOCOL_VERSION = 4;
@@ -966,7 +967,7 @@ function _verify_artifact_file(path: string, item: Artifact): void {
 export function verify_bundle(
   root: string,
   manifest: unknown = null,
-): ReleaseManifest {
+): ReleaseManifest | ProductManifest {
   let resolved_root: string;
   try {
     resolved_root = _resolve_root(root);
@@ -977,11 +978,13 @@ export function verify_bundle(
     if (error instanceof ManifestError) throw error;
     throw _error("bundle_invalid", "bundle root is not a directory");
   }
-  const checked = validate_manifest(
-    manifest == null
-      ? load_manifest(join(resolved_root, MANIFEST_NAME))
-      : manifest,
-  );
+  const candidate = manifest == null
+    ? _read_json(join(resolved_root, MANIFEST_NAME))
+    : manifest;
+  if (is_product_manifest(candidate)) {
+    return verify_product_bundle(resolved_root, candidate);
+  }
+  const checked = validate_manifest(candidate);
   for (const item of checked.artifacts) {
     _verify_artifact_file(
       _resolve_regular(resolved_root, item.path),
@@ -994,7 +997,23 @@ export function verify_bundle(
 export function verify_runtime_bundle(
   manifest: unknown,
   artifact_paths: Readonly<Record<string, string | null | undefined>>,
-): ReleaseManifest {
+): ReleaseManifest | ProductManifest {
+  if (is_product_manifest(manifest)) {
+    const checked = validate_product_manifest(manifest);
+    for (const item of checked.artifacts) {
+      const path = Object.hasOwn(artifact_paths, item.path)
+        ? artifact_paths[item.path]
+        : undefined;
+      if (path == null) {
+        throw _error(
+          "artifact_missing",
+          `runtime artifact path is not configured: ${item.path}`,
+        );
+      }
+      _verify_artifact_file(path, item);
+    }
+    return checked;
+  }
   const checked = validate_manifest(manifest);
   for (const item of checked.artifacts) {
     const path = Object.hasOwn(artifact_paths, item.path)
@@ -1113,7 +1132,9 @@ export function compatibility_for(
   client_to_control: CompatibilityWindow;
   control_to_client: CompatibilityWindow;
 } {
-  const checked = validate_manifest(manifest);
+  const checked = is_product_manifest(manifest)
+    ? validate_product_manifest(manifest)
+    : validate_manifest(manifest);
   if (!Object.hasOwn(checked.actions, action)) {
     throw _error(
       "unknown_action",
@@ -1172,7 +1193,12 @@ export function check_compatibility(
   action: string,
   peer: unknown,
 ): Data[] {
-  const checked = validate_manifest(manifest);
+  const checked = is_product_manifest(manifest)
+    ? validate_product_manifest(manifest)
+    : validate_manifest(manifest);
+  const local_release = is_product_manifest(checked)
+    ? checked.source_revision
+    : checked.release_id;
   const local = compatibility_for(checked, action);
   if (peer == null) {
     return [
@@ -1270,7 +1296,7 @@ export function check_compatibility(
       "compatibility.release_id must be a Git revision or legacy-protocol-4",
     );
   }
-  if (peer_release === checked.release_id) {
+  if (peer_release === local_release) {
     return [];
   }
   return [
@@ -1280,7 +1306,7 @@ export function check_compatibility(
       "peer release differs but the requested operation is explicitly compatible",
       {
         peer_release,
-        control_release: checked.release_id,
+        control_release: local_release,
       },
     ),
   ];
@@ -1304,6 +1330,17 @@ export function manifest_metadata(
       artifacts_verified: verified,
     };
   }
+  if (is_product_manifest(manifest)) {
+    const checked = validate_product_manifest(manifest);
+    return {
+      release_id: checked.source_revision,
+      source_revision: checked.source_revision,
+      version: checked.version,
+      protocol: checked.protocol,
+      manifest_present: present,
+      artifacts_verified: verified,
+    };
+  }
   const checked = validate_manifest(manifest);
   return {
     release_id: checked.release_id,
@@ -1317,7 +1354,7 @@ export function manifest_metadata(
 export function load_runtime_manifest(
   path: string,
 ): [
-  manifest: ReleaseManifest | null,
+  manifest: ReleaseManifest | ProductManifest | null,
   present: boolean,
   verified: boolean,
   warnings: Data[],
@@ -1351,5 +1388,163 @@ export function load_runtime_manifest(
       "release manifest is not a regular file",
     );
   }
-  return [load_manifest(path), true, true, []];
+  let candidate: unknown;
+  try {
+    candidate = _read_json(path);
+  } catch (error) {
+    if (error instanceof ManifestError) throw error;
+    throw _error(
+      "manifest_invalid",
+      "release manifest is not valid UTF-8 JSON",
+    );
+  }
+  const manifest = is_product_manifest(candidate)
+    ? validate_product_manifest(candidate)
+    : validate_manifest(candidate);
+  return [manifest, true, true, []];
+}
+
+// Format 3 is the production manifest.  It deliberately does not reuse the
+// legacy `release_id` field: protocol 4 still receives a SHA-derived release
+// identity through the compatibility adapter, while product identity is the
+// SemVer `version` below.
+export const PRODUCT_MANIFEST_FORMAT = 3;
+export const PRODUCT_TOOLCHAIN = Object.freeze({ bun: "1.4.4", go: "go1.27.3", cgo_enabled: false });
+
+export type ProductTarget =
+  | { os: "source"; arch: "any" }
+  | { os: "linux"; arch: "amd64" | "arm64" };
+
+export interface ProductManifest {
+  format: 3;
+  version: string;
+  source_revision: string;
+  target: ProductTarget;
+  toolchain: { bun: string; go: string; cgo_enabled: false };
+  protocol: 4;
+  artifacts: Artifact[];
+  actions: Record<string, OperationSpec>;
+  client_view: {
+    version: string;
+    source_revision: string;
+    protocol: 4;
+    transport: "legacy-bun" | "go-request";
+    actions: Record<string, OperationSpec>;
+  };
+}
+
+export function is_product_manifest(value: unknown): value is ProductManifest {
+  return is_record(value) && value.format === PRODUCT_MANIFEST_FORMAT;
+}
+
+function _product_error(code: string, message: string, detail: unknown = null): ManifestError {
+  return new ManifestError(code, message, detail);
+}
+
+function _product_target(value: unknown): ProductTarget {
+  const target = _require_mapping(value, "target");
+  if (!_same_keys(target, ["os", "arch"])) throw _product_error("manifest_invalid", "target has an unexpected shape");
+  if (target.os === "source" && target.arch === "any") return { os: "source", arch: "any" };
+  if (target.os === "linux" && (target.arch === "amd64" || target.arch === "arm64")) return { os: "linux", arch: target.arch };
+  throw _product_error("manifest_invalid", "target must be source/any or linux/amd64|arm64");
+}
+
+function _product_artifacts(value: unknown): Artifact[] {
+  if (!Array.isArray(value) || value.length === 0) throw _product_error("manifest_invalid", "artifacts must be a non-empty list");
+  const names = new Set<string>();
+  const paths = new Set<string>();
+  return value.map((raw, index) => {
+    const item = _require_mapping(raw, `artifacts[${index}]`);
+    if (!_same_keys(item, ["name", "path", "role", "sha256", "mode"])) throw _product_error("manifest_invalid", `artifacts[${index}] has an unexpected shape`);
+    const name = _require_string(item.name, `artifacts[${index}].name`, /^[A-Za-z0-9_.:@-]{1,120}$/);
+    const path = _safe_relative_path(item.path, `artifacts[${index}].path`);
+    const role = _require_string(item.role, `artifacts[${index}].role`, /^(client|control|support|unit)$/) as ArtifactRole;
+    const sha256 = _require_string(item.sha256, `artifacts[${index}].sha256`, SHA256_RE);
+    const mode = Number(_require_int(item.mode, `artifacts[${index}].mode`, 0, 0o777));
+    if (path === MANIFEST_NAME || path === CLIENT_SIDECAR_NAME || names.has(name) || paths.has(path)) throw _product_error("manifest_invalid", "product artifact names and paths must be unique and cannot self-reference");
+    names.add(name); paths.add(path);
+    return { name, path, role, sha256, mode };
+  });
+}
+
+function _product_actions(value: unknown): Record<string, OperationSpec> {
+  const raw = _require_mapping(value, "actions");
+  if (!_same_keys(raw, ACTION_NAMES)) throw _product_error("manifest_action_set_invalid", "product action set differs from protocol 4");
+  const actions: Record<string, OperationSpec> = {};
+  for (const action of ACTION_NAMES) {
+    const spec = _require_mapping(raw[action], `actions.${action}`);
+    if (!_same_keys(spec, ["request", "response", "client_to_control", "control_to_client"])) throw _product_error("manifest_invalid", `actions.${action} has an unexpected shape`);
+    const request = _schema(spec.request, `actions.${action}.request`);
+    const response = _schema(spec.response, `actions.${action}.response`);
+    const client_to_control = _window(spec.client_to_control, `actions.${action}.client_to_control`);
+    const control_to_client = _window(spec.control_to_client, `actions.${action}.control_to_client`);
+    if (request.schema < client_to_control.schema_min || request.schema > client_to_control.schema_max || request.semantic_revision < client_to_control.semantic_min || request.semantic_revision > client_to_control.semantic_max || response.schema < control_to_client.schema_min || response.schema > control_to_client.schema_max || response.semantic_revision < control_to_client.semantic_min || response.semantic_revision > control_to_client.semantic_max) throw _product_error("manifest_invalid", `actions.${action} is outside its compatibility window`);
+    actions[action] = { request, response, client_to_control, control_to_client };
+  }
+  return actions;
+}
+
+export function build_product_manifest(
+  version: string,
+  source_revision: string,
+  artifacts: readonly Artifact[],
+  options: { target?: ProductTarget; transport?: "legacy-bun" | "go-request"; operations?: Record<string, OperationSpec> } = {},
+): ProductManifest {
+  parseSemVer(version);
+  if (!_fullmatch(SOURCE_REVISION_RE, source_revision)) throw _product_error("manifest_invalid", "source_revision must be a Git revision");
+  const actions = options.operations ?? default_operations();
+  const transport = options.transport ?? "go-request";
+  return validate_product_manifest({
+    format: PRODUCT_MANIFEST_FORMAT,
+    version,
+    source_revision,
+    target: options.target ?? { os: "source", arch: "any" },
+    toolchain: PRODUCT_TOOLCHAIN,
+    protocol: PROTOCOL_VERSION,
+    artifacts: artifacts.map((item) => ({ ...item })),
+    actions,
+    client_view: { version, source_revision, protocol: PROTOCOL_VERSION, transport, actions },
+  });
+}
+
+export function validate_product_manifest(value: unknown): ProductManifest {
+  const root = _require_mapping(value, "manifest");
+  const required = ["actions", "artifacts", "client_view", "format", "protocol", "source_revision", "target", "toolchain", "version"];
+  if (!_same_keys(root, required)) throw _product_error("manifest_invalid", "product manifest has an unexpected shape");
+  if (Number(_require_int(root.format, "format", 1)) !== PRODUCT_MANIFEST_FORMAT) throw _product_error("manifest_format_unsupported", "manifest format must be 3");
+  const version = _require_string(root.version, "version");
+  try { parseSemVer(version); } catch { throw _product_error("manifest_invalid", "version must be valid SemVer 2.0.0"); }
+  const source_revision = _require_string(root.source_revision, "source_revision", SOURCE_REVISION_RE);
+  const target = _product_target(root.target);
+  const toolchain = _require_mapping(root.toolchain, "toolchain");
+  if (!_same_keys(toolchain, ["bun", "cgo_enabled", "go"]) || toolchain.bun !== PRODUCT_TOOLCHAIN.bun || toolchain.go !== PRODUCT_TOOLCHAIN.go || toolchain.cgo_enabled !== false) throw _product_error("manifest_invalid", "toolchain does not match the fixed release toolchain");
+  if (Number(_require_int(root.protocol, "protocol", 1)) !== PROTOCOL_VERSION) throw _product_error("protocol_unsupported", `manifest protocol must be ${PROTOCOL_VERSION}`);
+  const artifacts = _product_artifacts(root.artifacts);
+  const actions = _product_actions(root.actions);
+  const view = _require_mapping(root.client_view, "client_view");
+  if (!_same_keys(view, ["actions", "protocol", "source_revision", "transport", "version"]) || view.version !== version || view.source_revision !== source_revision || Number(view.protocol) !== PROTOCOL_VERSION || (view.transport !== "legacy-bun" && view.transport !== "go-request") || !_json_equal(view.actions, actions)) throw _product_error("manifest_invalid", "client_view does not match product manifest");
+  return { format: 3, version, source_revision, target, toolchain: { bun: PRODUCT_TOOLCHAIN.bun, go: PRODUCT_TOOLCHAIN.go, cgo_enabled: false }, protocol: 4, artifacts, actions, client_view: { version, source_revision, protocol: 4, transport: view.transport, actions } };
+}
+
+function _verify_product_elf(path: string, target: ProductTarget): void {
+  if (target.os !== "linux") return;
+  const bytes = readFileSync(path);
+  if (bytes.length < 20 || bytes[0] !== 0x7f || bytes[1] !== 0x45 || bytes[2] !== 0x4c || bytes[3] !== 0x46 || bytes[4] !== 2 || bytes[5] !== 1) throw _product_error("binary_format_mismatch", "Go control artifact must be little-endian ELF64");
+  const machine = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint16(18, true);
+  const expected = target.arch === "amd64" ? 62 : 183;
+  if (machine !== expected) throw _product_error("binary_arch_mismatch", "Go control artifact architecture does not match the manifest target");
+}
+
+export function verify_product_bundle(root: string, manifest: unknown): ProductManifest {
+  const checked = validate_product_manifest(manifest);
+  for (const item of checked.artifacts) {
+    const path = join(root, ...item.path.split("/"));
+    let info: ReturnType<typeof lstatSync>;
+    try { info = lstatSync(path); } catch { throw _product_error("artifact_missing", `artifact is missing: ${item.path}`); }
+    if (!info.isFile() || info.isSymbolicLink()) throw _product_error("artifact_unverified", `artifact is not a regular file: ${item.path}`);
+    if ((info.mode & 0o7777) !== item.mode) throw _product_error("artifact_mode_mismatch", `artifact mode differs: ${item.path}`);
+    if (sha256_file(path) !== item.sha256) throw _product_error("artifact_checksum_mismatch", `artifact checksum differs: ${item.path}`);
+    if (item.path === "bin/agent-vm-control") _verify_product_elf(path, checked.target);
+  }
+  return checked;
 }

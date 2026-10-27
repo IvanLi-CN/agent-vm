@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: patch, minor, major, or an explicit SemVer target
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+  checks: read
+  pull-requests: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Install locked Bun dependencies
+        run: bun install --frozen-lockfile
+      - name: Resolve, claim, build, verify, and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun run skills/agent-vm-ops/scripts/release.ts --target "${{ inputs.target }}"
+      - name: Preserve release state for recovery
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-state-${{ github.run_id }}
+          path: release-state/
+          if-no-files-found: ignore

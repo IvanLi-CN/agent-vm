@@ -19,10 +19,11 @@ import (
 )
 
 const (
-	Format      = 2
-	Protocol    = 4
-	GoToolchain = "go1.27.3"
-	maxBytes    = 2 * 1024 * 1024
+	Format        = 2
+	ProductFormat = 3
+	Protocol      = 4
+	GoToolchain   = "go1.27.3"
+	maxBytes      = 2 * 1024 * 1024
 )
 
 var actionNames = []string{
@@ -66,6 +67,7 @@ type ActionMetadata struct {
 }
 
 type Metadata struct {
+	Version           string
 	ReleaseID         string
 	SourceRevision    string
 	Protocol          int64
@@ -92,6 +94,7 @@ var fixedArtifacts = []artifactSpec{
 var artifactNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.:@-]{1,120}$`)
 var revisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 var digestPattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+var semverPattern = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$`)
 
 // Load validates format-2 identity, compatibility metadata, fixed artifact
 // declarations, artifact bytes, modes, and the target ELF header. An empty
@@ -109,8 +112,15 @@ func LoadMetadata(path string) (Metadata, error) {
 	if err != nil {
 		return Metadata{}, err
 	}
-	if err := validate(root, directory); err != nil {
-		return Metadata{}, err
+	format, _ := integerValue(root["format"])
+	var validateErr error
+	if format == ProductFormat {
+		validateErr = validateProduct(root, directory)
+	} else {
+		validateErr = validate(root, directory)
+	}
+	if validateErr != nil {
+		return Metadata{}, validateErr
 	}
 	metadata, err := metadataFromRoot(root)
 	if err != nil {
@@ -158,8 +168,14 @@ func readRoot(path string) (map[string]any, string, error) {
 }
 
 func metadataFromRoot(root map[string]any) (Metadata, error) {
+	format, _ := integerValue(root["format"])
 	releaseID, releaseOK := root["release_id"].(string)
 	sourceRevision, sourceOK := root["source_revision"].(string)
+	version, _ := root["version"].(string)
+	if format == ProductFormat {
+		releaseID = sourceRevision
+		releaseOK = sourceOK
+	}
 	view, viewOK := root["client_view"].(map[string]any)
 	transport, transportOK := view["transport"].(string)
 	rawActions, actionsOK := root["actions"].(map[string]any)
@@ -190,7 +206,7 @@ func metadataFromRoot(root map[string]any) (Metadata, error) {
 		}
 		actions[action] = ActionMetadata{Request: request, Response: response, RequestWindow: requestWindow, ResponseWindow: responseWindow}
 	}
-	return Metadata{ReleaseID: releaseID, SourceRevision: sourceRevision, Protocol: Protocol, Transport: transport, Actions: actions}, nil
+	return Metadata{Version: version, ReleaseID: releaseID, SourceRevision: sourceRevision, Protocol: Protocol, Transport: transport, Actions: actions}, nil
 }
 
 func metadataSchema(value any) (Schema, error) {
@@ -298,6 +314,133 @@ func validate(root map[string]any, directory string) error {
 		}
 	}
 	return nil
+}
+
+func validateProduct(root map[string]any, directory string) error {
+	if !sameKeys(root, []string{"actions", "artifacts", "client_view", "format", "protocol", "source_revision", "target", "toolchain", "version"}) {
+		return fmt.Errorf("manifest_invalid: product manifest shape is incomplete or contains extra fields")
+	}
+	if value, ok := integerValue(root["format"]); !ok || value != ProductFormat {
+		return fmt.Errorf("manifest_format_unsupported: manifest format must be %d", ProductFormat)
+	}
+	if value, ok := integerValue(root["protocol"]); !ok || value != Protocol {
+		return fmt.Errorf("manifest_protocol_mismatch: manifest protocol must be %d", Protocol)
+	}
+	version, ok := root["version"].(string)
+	if !ok || !semverPattern.MatchString(version) {
+		return fmt.Errorf("manifest_invalid: product version must be valid SemVer 2.0.0")
+	}
+	source, ok := root["source_revision"].(string)
+	if !ok || !revisionPattern.MatchString(source) {
+		return fmt.Errorf("manifest_invalid: source revision is invalid")
+	}
+	if err := validateProductTarget(root["target"]); err != nil {
+		return err
+	}
+	if err := validateProductToolchain(root["toolchain"]); err != nil {
+		return err
+	}
+	if err := validateOperationMap(root["actions"], "actions"); err != nil {
+		return err
+	}
+	view, ok := root["client_view"].(map[string]any)
+	if !ok || !sameKeys(view, []string{"actions", "protocol", "source_revision", "transport", "version"}) {
+		return fmt.Errorf("manifest_invalid: product client_view shape is invalid")
+	}
+	if view["version"] != version || view["source_revision"] != source {
+		return fmt.Errorf("manifest_invalid: product client_view identity differs from manifest")
+	}
+	if value, ok := integerValue(view["protocol"]); !ok || value != Protocol {
+		return fmt.Errorf("manifest_invalid: product client_view protocol differs from manifest")
+	}
+	transport, ok := view["transport"].(string)
+	if !ok || (transport != "legacy-bun" && transport != "go-request") {
+		return fmt.Errorf("manifest_invalid: product client_view transport is unsupported")
+	}
+	if err := validateOperationMap(view["actions"], "client_view.actions"); err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(view["actions"], root["actions"]) {
+		return fmt.Errorf("manifest_invalid: product client_view actions differ from manifest actions")
+	}
+	artifacts, err := validateProductArtifacts(root["artifacts"])
+	if err != nil {
+		return err
+	}
+	for _, artifact := range artifacts {
+		path := filepath.Join(directory, filepath.FromSlash(artifact.path))
+		info, err := os.Lstat(path)
+		if err != nil {
+			return fmt.Errorf("artifact_missing: %s: %w", artifact.path, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("artifact_unverified: artifact is not a regular file: %s", artifact.path)
+		}
+		if int64(info.Mode().Perm()) != artifact.mode {
+			return fmt.Errorf("artifact_mode_mismatch: artifact mode differs: %s", artifact.path)
+		}
+		digest, err := fileDigest(path)
+		if err != nil {
+			return fmt.Errorf("artifact_unverified: cannot read %s: %w", artifact.path, err)
+		}
+		if digest != artifact.sha256 {
+			return fmt.Errorf("artifact_checksum_mismatch: artifact checksum differs: %s", artifact.path)
+		}
+		if artifact.path == "bin/agent-vm-control" {
+			if err := verifyELF(path); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateProductTarget(value any) error {
+	object, ok := value.(map[string]any)
+	if !ok || !sameKeys(object, []string{"arch", "os"}) || object["os"] != "linux" || object["arch"] != runtime.GOARCH {
+		return fmt.Errorf("manifest_target_mismatch: product target does not match this binary")
+	}
+	return nil
+}
+
+func validateProductToolchain(value any) error {
+	object, ok := value.(map[string]any)
+	if !ok || !sameKeys(object, []string{"bun", "cgo_enabled", "go"}) || object["bun"] != "1.4.4" || object["go"] != GoToolchain || object["cgo_enabled"] != false {
+		return fmt.Errorf("manifest_toolchain_mismatch: product toolchain declaration is invalid")
+	}
+	return nil
+}
+
+func validateProductArtifacts(value any) ([]checkedArtifact, error) {
+	values, ok := value.([]any)
+	if !ok || len(values) == 0 {
+		return nil, fmt.Errorf("manifest_invalid: product artifacts must be a non-empty list")
+	}
+	seenNames := make(map[string]bool, len(values))
+	seenPaths := make(map[string]bool, len(values))
+	result := make([]checkedArtifact, 0, len(values))
+	for index, raw := range values {
+		item, ok := raw.(map[string]any)
+		if !ok || !sameKeys(item, []string{"mode", "name", "path", "role", "sha256"}) {
+			return nil, fmt.Errorf("manifest_invalid: artifacts[%d] shape is invalid", index)
+		}
+		name, nameOK := item["name"].(string)
+		path, pathOK := item["path"].(string)
+		role, roleOK := item["role"].(string)
+		sha, shaOK := item["sha256"].(string)
+		mode, modeOK := integerValue(item["mode"])
+		validRole := role == "client" || role == "control" || role == "support" || role == "unit"
+		if !nameOK || !artifactNamePattern.MatchString(name) || !pathOK || !safeRelativePath(path) || path == "release-manifest.json" || path == "client-release.json" || !roleOK || !validRole || !shaOK || !digestPattern.MatchString(sha) || !modeOK || mode < 0 || mode > 0o777 {
+			return nil, fmt.Errorf("manifest_invalid: artifacts[%d] values are invalid", index)
+		}
+		if seenNames[name] || seenPaths[path] {
+			return nil, fmt.Errorf("manifest_artifact_set_invalid: duplicate product artifact %s", name)
+		}
+		seenNames[name] = true
+		seenPaths[path] = true
+		result = append(result, checkedArtifact{artifactSpec: artifactSpec{name: name, path: path, role: role, mode: mode}, sha256: sha})
+	}
+	return result, nil
 }
 
 type checkedArtifact struct {

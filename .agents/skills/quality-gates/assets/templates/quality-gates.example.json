@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "policy": {
+    "baseline_policy": "explicit-waiver-required",
+    "require_signed_commits": true,
+    "branch_protection": {
+      "protected_branches": [
+        "<default-branch>"
+      ],
+      "require_pull_request": true,
+      "disallow_direct_pushes": true
+    }
+  },
+  "required_checks": [
+    "Label Gate"
+  ],
+  "informational_checks": [],
+  "waivers": [],
+  "expected_pr_workflows": [
+    {
+      "workflow": "Label Gate",
+      "jobs": [
+        "Label Gate"
+      ]
+    }
+  ]
+}

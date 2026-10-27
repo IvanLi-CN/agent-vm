@@ -1,0 +1,30 @@
+name: Notification smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Notification smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 1
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Prove the selection gate is fail-closed
+        env:
+          FAILED_CONCLUSION: failure
+          FAILED_WORKFLOW: Notification smoke
+          FAILED_REPOSITORY: ${{ github.repository }}
+          FAILED_RUN_ID: ${{ github.run_id }}
+          FAILED_RUN_ATTEMPT: ${{ github.run_attempt }}
+          FAILED_HEAD_SHA: ${{ github.sha }}
+          FAILED_ACTOR: ${{ github.actor }}
+        run: bun run skills/agent-vm-ops/scripts/failure-notification.ts --class generic

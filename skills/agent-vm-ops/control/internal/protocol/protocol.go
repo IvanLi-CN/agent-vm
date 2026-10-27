@@ -80,6 +80,7 @@ type ActionCompatibility struct {
 // ReleaseMetadata is the validated, immutable compatibility view of the
 // installed control release. It deliberately contains no filesystem paths.
 type ReleaseMetadata struct {
+	Version           string
 	ReleaseID         string
 	SourceRevision    string
 	Protocol          int64
@@ -811,7 +812,7 @@ func ReleaseEnvelope(release *ReleaseMetadata) map[string]any {
 	if release == nil {
 		return nil
 	}
-	return map[string]any{
+	result := map[string]any{
 		"release_id":         release.ReleaseID,
 		"source_revision":    release.SourceRevision,
 		"protocol":           release.Protocol,
@@ -819,6 +820,10 @@ func ReleaseEnvelope(release *ReleaseMetadata) map[string]any {
 		"manifest_present":   release.ManifestPresent,
 		"artifacts_verified": release.ArtifactsVerified,
 	}
+	if release.Version != "" {
+		result["version"] = release.Version
+	}
+	return result
 }
 
 func ErrorEnvelope(request Request, err error) map[string]any {

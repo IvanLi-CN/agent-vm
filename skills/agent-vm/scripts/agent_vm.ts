@@ -68,8 +68,8 @@ export function parseSize(value: string, memory: boolean): number | bigint {
 export async function dispatch(args: Args, client = new Client(), native = inherited): Promise<Data | string | number> {
   const { command: cmd, options: o, positional: pos, rest } = args;
   if (cmd === "help") return HELP;
-  if (cmd === "short-version") return `agent-vm ${VERSION}\n`;
-  if (cmd === "version") { const [release, warnings] = loadRelease(client.sidecar); return { version: VERSION, protocol: PROTOCOL, release, warnings }; }
+  if (cmd === "short-version") { const [release] = loadRelease(client.sidecar); return `agent-vm ${release.version ?? VERSION}\n`; }
+  if (cmd === "version") { const [release, warnings] = loadRelease(client.sidecar); return { version: release.version ?? VERSION, protocol: PROTOCOL, release, warnings }; }
   if (cmd === "admin metrics") { if (o["session-id"] !== undefined) fail("invalid_request", "admin metrics does not accept --session-id"); return client.request("admin-metrics", { session: null }); }
   const session = sessionId(o["session-id"], !["doctor", "admin metrics"].includes(cmd), client.env);
   const mutate = async (action: string, fields: Data = {}, generation?: number | bigint, operationId?: string): Promise<Data> => client.request(action, { session, generation: generation ?? (["acquire", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"].includes(action) ? 0 : client.generation(session!)), write: true, operationId: operationId ?? o["operation-id"], fields });

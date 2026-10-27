@@ -5,6 +5,8 @@
   "scripts": {
     "typecheck": "bun node_modules/typescript/bin/tsc --noEmit",
     "check": "bun run typecheck && python3 bin/test_agent_vm_documentation.py && go -C skills/agent-vm-ops/control vet ./...",
+    "test:policy-audit": "python3 .agents/skills/quality-gates/assets/scripts/check_quality_gates.py --repo-root . --declaration .github/quality-gates.json --allow-unchecked-branch-protection",
+    "test:platform-audit": "bun test skills/agent-vm-ops/tests/platform-audit.test.ts",
     "test:repo": "bun run bin/test_runner.ts --scope repo",
     "test:skills": "bun run bin/test_runner.ts --scope skills"
   },

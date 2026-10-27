@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "quality-gates": {
+      "source": "IvanLi-CN/style-playbook-skills",
+      "sourceType": "github",
+      "skillPath": "skills/policies/quality-gates/SKILL.md",
+      "computedHash": "9d30b7d455e8079ff194291a944b865f3cd2e60ac604279f2b9bad0ef6d2ef00"
+    },
+    "release-failure-notification": {
+      "source": "IvanLi-CN/style-playbook-skills",
+      "sourceType": "github",
+      "skillPath": "skills/policies/release-failure-notification/SKILL.md",
+      "computedHash": "4c29595f70b73ed28ea46c7ed044c10ad945b5f2cf9125ec2a7f590be1be7d55"
+    },
+    "semver-change-governance": {
+      "source": "IvanLi-CN/style-playbook-skills",
+      "sourceType": "github",
+      "skillPath": "skills/policies/semver-change-governance/SKILL.md",
+      "computedHash": "89af26a1b68102c2476fea0290ed0b07a6931d0a7525ade57e53f798a1ad4455"
+    }
+  }
+}
