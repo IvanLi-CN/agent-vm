@@ -531,6 +531,9 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 		if err := s.recoverPending(ctx, pending); err != nil {
 			return err
 		}
+		if err := s.reconcileOrphanedAcquireOperations(ctx, pending); err != nil {
+			return err
+		}
 		pending, err = s.Store.PendingOperations(ctx)
 		if err != nil {
 			return s.sqliteError(err)
@@ -540,6 +543,52 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 		return protocol.NewError("startup_reconcile_required", "pending operations require explicit recovery before admission", map[string]any{"count": len(pending), "admission_ready": false})
 	}
 	return s.verifyResidentNativeState(ctx)
+}
+
+// reconcileOrphanedAcquireOperations closes the narrow crash window where a
+// native acquire was journaled but the durable task was never committed. The
+// native identity must be explicitly verified missing before the operation can
+// be finalized; every other result remains fail-closed for operator recovery.
+func (s *Service) reconcileOrphanedAcquireOperations(ctx context.Context, pending []state.Operation) error {
+	if s.Guest == nil {
+		return protocol.NewError("startup_reconcile_required", "pending acquire operations cannot be reconciled without native access", map[string]any{"admission_ready": false})
+	}
+	for _, operation := range pending {
+		if operation.Action != "acquire" || operation.SessionID == nil || operation.Generation == nil {
+			continue
+		}
+		task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
+		if err != nil {
+			return s.sqliteError(err)
+		}
+		if task != nil {
+			continue
+		}
+		digest := stringValue(operation.Response["_request_digest"])
+		if digest == "" {
+			return protocol.NewError("startup_reconcile_required", "orphaned acquire operation is missing its request digest", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+		_, configErr := s.Guest.Config(checkCtx, "agent-vm-"+taskID(*operation.SessionID))
+		cancel()
+		if configErr == nil {
+			return protocol.NewError("startup_reconcile_required", "orphaned acquire still has a native instance without durable task state", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false})
+		}
+		if !native.IsNotFound(configErr) {
+			return protocol.NewError("startup_reconcile_required", "orphaned acquire native outcome could not be verified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": configErr.Error()})
+		}
+		response := map[string]any{
+			"outcome": "error",
+			"error": protocol.NewError("acquire_partial", "native initialization did not complete", map[string]any{
+				"phase": "native-init", "operation_phase": "native-init", "native_init_recovered_absent": true, "outcome_verified": true,
+			}),
+			"_request_digest": digest,
+		}
+		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+			return s.sqliteError(err)
+		}
+	}
+	return nil
 }
 
 // verifyResidentNativeState prevents a durable active or cached task from
@@ -856,6 +905,11 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	task, err := s.task(ctx, request)
 	if err != nil {
 		return nil, err
+	}
+	if destroy {
+		if err := s.cancelPendingAcquireOperations(ctx, task); err != nil {
+			return nil, err
+		}
 	}
 	if task.State == stateAbsent {
 		if err := s.cancelPendingAcquireOperations(ctx, task); err != nil {

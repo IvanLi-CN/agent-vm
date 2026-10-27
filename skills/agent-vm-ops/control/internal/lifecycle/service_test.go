@@ -642,6 +642,81 @@ func TestStartupReconcileLeavesUnsafePendingAcquireBlocked(t *testing.T) {
 	}
 }
 
+func TestStartupReconcileFinalizesOrphanedAcquireWhenNativeIsMissing(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "orphaned-acquire.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := "orphaned-acquire-session"
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(0), "operation_id": "orphaned-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "orphaned-acquire", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Stderr: []byte("instance not found")}, Cause: errors.New("incus query failed")}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), "orphaned-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("orphaned acquire = %#v", operation)
+	}
+	control, ok := operation.Response["error"].(map[string]any)
+	if !ok || control["code"] != "acquire_partial" {
+		t.Fatalf("orphaned acquire error = %#v", operation.Response["error"])
+	}
+	detail, ok := control["detail"].(map[string]any)
+	if !ok || detail["native_init_recovered_absent"] != true || detail["outcome_verified"] != true {
+		t.Fatalf("orphaned acquire detail = %#v", control["detail"])
+	}
+	if operation.Response["_request_digest"] != digest {
+		t.Fatalf("orphaned acquire digest = %#v, want %q", operation.Response["_request_digest"], digest)
+	}
+}
+
+func TestStartupReconcileLeavesOrphanedAcquireWithNativeInstanceBlocked(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "orphaned-acquire-present.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := "orphaned-acquire-present-session"
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(0), "operation_id": "orphaned-acquire-present"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "orphaned-acquire-present", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{config: map[string]any{"config": map[string]any{}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if control := protocol.AsError(service.StartupReconcile(context.Background())); control.Code != "startup_reconcile_required" {
+		t.Fatalf("startup error = %#v", control)
+	}
+	operation, err := store.GetOperation(context.Background(), "orphaned-acquire-present")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Response["outcome"] != "pending" {
+		t.Fatalf("orphaned acquire with native instance was finalized: %#v", operation.Response)
+	}
+}
+
 func TestStartupReconcileVerifiesDurableActiveGuest(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-state.sqlite3"))
 	if err != nil {
