@@ -836,7 +836,7 @@ def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
 
 
 def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
-    go_bundle_root = _go_control_target(config).parent
+    bundle_root = Path(config["control_path"]).parent
     targets = (
         Path(config["control_path"]),
         _go_control_target(config),
@@ -847,10 +847,10 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
         Path(config["control_path"]).with_name(MANIFEST_NAME),
         Path(config["control_path"]).with_name("client-release.json"),
     ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], "agent-vm-native.service", "agent-vm-web.service")) + (
-        go_bundle_root / "systemd" / "agent-vm-native.service",
-        go_bundle_root / "systemd" / "agent-vm-web.service",
-        go_bundle_root / "config" / "agent-vm-web.json.example",
-        go_bundle_root / "web-assets.manifest.json",
+        bundle_root / "systemd" / "agent-vm-native.service",
+        bundle_root / "systemd" / "agent-vm-web.service",
+        bundle_root / "config" / "agent-vm-web.json.example",
+        bundle_root / "web-assets.manifest.json",
     )
     return tuple(dict.fromkeys(targets))
 
@@ -1193,7 +1193,7 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
 def _install_product_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
     """Install the complete format-4 product without replacing live Web config."""
     owner_uid = int(config["owner_uid"])
-    bundle_root = _go_control_target(config).parent
+    bundle_root = Path(config["control_path"]).parent
     expected_values = PRODUCT_LINUX_ARTIFACTS if manifest["format"] == PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_LEGACY_ARTIFACTS
     expected_support = {path for _, path, role, _ in expected_values if role == "support"}
     installed_support: set[str] = set()
