@@ -54,6 +54,24 @@ void i18n.use(initReactI18next).init({ resources, lng: resolveLocale(), fallback
 
 i18n.addResource("zh-CN", "translation", "vms.selectedTarget", "已选择");
 i18n.addResource("en", "translation", "vms.selectedTarget", "Selected");
+i18n.addResource("zh-CN", "translation", "images.expectedMetadataSha", "预期 metadata SHA-256");
+i18n.addResource("zh-CN", "translation", "images.expectedRootfsSha", "预期 rootfs SHA-256");
+i18n.addResource("zh-CN", "translation", "images.packageFile", "unified 镜像包");
+i18n.addResource("zh-CN", "translation", "images.metadataFile", "metadata 文件");
+i18n.addResource("zh-CN", "translation", "images.rootfsFile", "rootfs 文件");
+i18n.addResource("zh-CN", "translation", "images.chooseFile", "选择文件");
+i18n.addResource("zh-CN", "translation", "images.fileRequired", "请先选择完整的镜像文件。");
+i18n.addResource("zh-CN", "translation", "images.expectedShaRequired", "请填写预期 SHA-256。");
+i18n.addResource("zh-CN", "translation", "images.targetUnavailable", "镜像目录版本不可用，请刷新后重试。");
+i18n.addResource("en", "translation", "images.expectedMetadataSha", "Expected metadata SHA-256");
+i18n.addResource("en", "translation", "images.expectedRootfsSha", "Expected rootfs SHA-256");
+i18n.addResource("en", "translation", "images.packageFile", "Unified image package");
+i18n.addResource("en", "translation", "images.metadataFile", "Metadata file");
+i18n.addResource("en", "translation", "images.rootfsFile", "Rootfs file");
+i18n.addResource("en", "translation", "images.chooseFile", "Choose a file");
+i18n.addResource("en", "translation", "images.fileRequired", "Select the complete image content first.");
+i18n.addResource("en", "translation", "images.expectedShaRequired", "Enter the expected SHA-256.");
+i18n.addResource("en", "translation", "images.targetUnavailable", "The image catalog version is unavailable. Refresh and try again.");
 
 export async function changeLocale(locale: Locale): Promise<void> {
   if (typeof window !== "undefined") window.localStorage.setItem("agent-vm-locale", locale);

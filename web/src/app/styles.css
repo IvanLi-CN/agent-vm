@@ -328,6 +328,13 @@ svg { flex: none; }
 @media (max-width: 560px) {
   body { font-size: 14px; }
   h1 { font-size: 20px; line-height: 26px; }
+  .ui-button { min-height: 44px; }
+  .icon-button { width: 44px; height: 44px; }
+  .form-control { min-height: 44px; }
+  .select-icon { top: 15px; }
+  .language-toggle button { min-height: 44px; }
+  .import-mode button, .tabs-row button { min-height: 44px; }
+  .file-input { min-height: 44px; }
   .topbar { height: 48px; }
   .page-stack { gap: 16px; padding: 20px 16px 36px; }
   .page-intro { display: block; }

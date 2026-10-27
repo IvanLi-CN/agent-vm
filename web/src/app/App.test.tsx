@@ -30,4 +30,17 @@ describe("management console workflow", () => {
     await user.click(screen.getByRole("button", { name: "EN" }));
     expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
   });
+
+  it("moves focus into a controlled action and returns it to the trigger", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/vms");
+    renderApp();
+    expect(await screen.findByTestId("vms-page")).toBeInTheDocument();
+    const trigger = screen.getByRole("button", { name: /释放租约|release lease/i });
+    await user.click(trigger);
+    const reason = await screen.findByRole("textbox", { name: /原因|reason/i });
+    expect(reason).toHaveFocus();
+    await user.click(screen.getByRole("button", { name: /取消|cancel/i }));
+    expect(trigger).toHaveFocus();
+  });
 });
