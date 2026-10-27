@@ -777,7 +777,7 @@ def _verify_retained_release(config: Mapping[str, Any], target: Path) -> dict[st
             verify_product_bundle(target, manifest, allow_historical_web_config_mode=True)
         else:
             verify_bundle(target, manifest)
-        verify_client_sidecar(target, manifest)
+        verify_client_sidecar(target, manifest, allow_historical_web_config_mode=True)
     except ManifestError as exc:
         _fail("activation_unverified", "retained release cannot be verified", exc.as_dict())
     _reject_transaction_extras(target, manifest)

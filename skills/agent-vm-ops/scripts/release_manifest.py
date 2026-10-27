@@ -907,10 +907,22 @@ def verify_runtime_bundle(manifest: Mapping[str, Any], artifact_paths: Mapping[s
     return checked
 
 
-def verify_client_sidecar(root: Path, manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def verify_client_sidecar(
+    root: Path,
+    manifest: Mapping[str, Any] | None = None,
+    *,
+    allow_historical_web_config_mode: bool = False,
+) -> dict[str, Any]:
     """Verify the derived client-only sidecar without making it an artifact."""
     root = root.resolve()
-    checked = validate_release_manifest(manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME))
+    candidate = manifest if manifest is not None else load_release_manifest(
+        root / MANIFEST_NAME,
+        allow_historical_web_config_mode=allow_historical_web_config_mode,
+    )
+    if isinstance(candidate, Mapping) and candidate.get("format") in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
+        checked = validate_product_manifest(candidate, allow_historical_web_config_mode=allow_historical_web_config_mode)
+    else:
+        checked = validate_release_manifest(candidate)
     sidecar_path = _resolve_regular(root, CLIENT_SIDECAR_NAME)
     try:
         with sidecar_path.open("r", encoding="utf-8") as handle:
