@@ -256,7 +256,7 @@ func TestDeleteImageFailsClosedWithoutNativeBackend(t *testing.T) {
 	if err := store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: imageFingerprint, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
 		t.Fatal(err)
 	}
-	service := New(store, Options{})
+	service := New(store, Options{TrustedImageSourceIDs: []string{"approved"}})
 	operation, err := service.DeleteImage(ctx, "delete-without-backend", "admin", "remove image", imageFingerprint, "image:"+imageFingerprint+":revision-1")
 	if err != nil {
 		t.Fatal(err)
@@ -415,6 +415,43 @@ func TestRecoverPendingOperationsDoesNotReplayTrustedImports(t *testing.T) {
 	}
 	if recovered == nil || recovered.Status != "outcome_unknown" || backend.imports != 0 {
 		t.Fatalf("recovered=%#v backend imports=%d", recovered, backend.imports)
+	}
+}
+
+func TestFinishOperationPersistsAfterExecutionContextExpires(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, Options{TrustedImageSourceIDs: []string{"approved"}})
+	request := ImportRequest{
+		OperationID: "finalize-after-timeout", Actor: "admin", Reason: "record timeout", TargetVersion: "image-catalog:revision-1", VersionLabel: "2026.04",
+		Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: strings.Repeat("a", 64)},
+	}
+	operation, err := service.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, claimed, err := store.TransitionManagementOperation(context.Background(), operation.OperationID, "queued", "image_import", "running")
+	if err != nil || !claimed {
+		t.Fatalf("claim operation: claimed=%v err=%v", claimed, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	finished, err := service.finishOperation(ctx, running, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished == nil || finished.Status != "outcome_unknown" {
+		t.Fatalf("finished operation = %#v", finished)
+	}
+	audits, err := service.ListAudit(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(audits) == 0 || audits[0].OperationID == nil || *audits[0].OperationID != request.OperationID {
+		t.Fatalf("audits = %#v", audits)
 	}
 }
 

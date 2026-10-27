@@ -34,7 +34,7 @@ export function ImagesPage() {
   const [rootfsFile, setRootfsFile] = useState<File | null>(null);
   const [reason, setReason] = useState("");
   const [importMessage, setImportMessage] = useState("");
-  const [importOperationId, setImportOperationId] = useState<string | null>(null);
+  const [pendingImport, setPendingImport] = useState<ImportSubmission | null>(null);
   const [action, setAction] = useState<ImageAction | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
   const [operationId, setOperationId] = useState<string | null>(null);
@@ -47,7 +47,7 @@ export function ImagesPage() {
     },
     onSuccess: (operation) => {
       setImportMessage(`${t("images.importStarted")} · ${operation.operation_id}`);
-      setImportOperationId(null);
+      setPendingImport(null);
       setReason("");
       void client.invalidateQueries({ queryKey: ["operations"] });
     },
@@ -55,28 +55,36 @@ export function ImagesPage() {
   });
   const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!, operationId ?? undefined), onSuccess: () => { setAction(null); setPreview(null); setOperationId(null); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")) });
 
+  const submitImport = (submission: ImportSubmission) => {
+    setPendingImport(submission);
+    importMutation.mutate(submission);
+  };
+
   const startImport = () => {
+    if (pendingImport) {
+      importMutation.mutate(pendingImport);
+      return;
+    }
     const targetVersion = query.data?.catalog_version;
     if (!reason.trim()) { setImportMessage(t("dialog.reasonRequired")); return; }
     if (!targetVersion) { setImportMessage(t("images.targetUnavailable")); return; }
-    const operation_id = importOperationId ?? createOperationId();
-    setImportOperationId(operation_id);
+    const operation_id = createOperationId();
     if (sourceKind === "trusted_remote") {
       const request: ImageImportRequest = { operation_id, reason: reason.trim(), target_version: targetVersion, version_label: versionLabel, source: { kind: "trusted_remote", source_id: sourceId, expected_fingerprint: expectedFingerprint } };
-      importMutation.mutate({ request });
+      submitImport({ request });
       return;
     }
     if (format === "unified") {
       if (!uploadFile) { setImportMessage(t("images.fileRequired")); return; }
       if (!expectedSha.trim()) { setImportMessage(t("images.expectedShaRequired")); return; }
       const request: ImageImportRequest = { operation_id, reason: reason.trim(), target_version: targetVersion, version_label: versionLabel, source: { kind: "local_upload", format: "unified", expected_sha256: expectedSha.trim(), expected_size_bytes: String(uploadFile.size) } };
-      importMutation.mutate({ request, content: uploadFile });
+      submitImport({ request, content: uploadFile });
       return;
     }
     if (!metadataFile || !rootfsFile) { setImportMessage(t("images.fileRequired")); return; }
     if (!expectedMetadataSha.trim() || !expectedRootfsSha.trim()) { setImportMessage(t("images.expectedShaRequired")); return; }
     const request: ImageImportRequest = { operation_id, reason: reason.trim(), target_version: targetVersion, version_label: versionLabel, source: { kind: "local_upload", format: "split", metadata: { expected_sha256: expectedMetadataSha.trim(), expected_size_bytes: String(metadataFile.size) }, rootfs: { expected_sha256: expectedRootfsSha.trim(), expected_size_bytes: String(rootfsFile.size) } } };
-    importMutation.mutate({ request, content: { metadata: metadataFile, rootfs: rootfsFile } });
+    submitImport({ request, content: { metadata: metadataFile, rootfs: rootfsFile } });
   };
 
   const nextPage = () => { const next = query.data?.page.next_cursor; if (!next) return; setCursorStack((stack) => [...stack, cursor ?? ""]); setCursor(next); };

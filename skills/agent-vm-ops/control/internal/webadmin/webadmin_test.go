@@ -2,10 +2,12 @@ package webadmin
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -90,6 +92,70 @@ func TestAuthorityListsImagesOnlyForAuthorizedPeer(t *testing.T) {
 	}
 	if payload.Page["next_cursor"] != nil {
 		t.Fatalf("unexpected next cursor: %#v", payload.Page)
+	}
+}
+
+func TestPageBoundsContinuesWhenCursorAnchorDisappears(t *testing.T) {
+	query := url.Values{"limit": []string{"1"}}
+	encoded, err := json.Marshal(map[string]string{"key": "task-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	query.Set("cursor", base64.RawURLEncoding.EncodeToString(encoded))
+	start, limit, err := pageBounds(query, []string{"task-2", "task-3"}, pageAfterAscending)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if start != 0 || limit != 1 {
+		t.Fatalf("page bounds = start %d limit %d", start, limit)
+	}
+
+	encoded, err = json.Marshal(map[string]string{"key": "2026-10-27T00:00:00Z\x00aaaa"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	query.Set("cursor", base64.RawURLEncoding.EncodeToString(encoded))
+	start, _, err = pageBounds(query, []string{"2026-10-26T00:00:00Z\x00bbbb", "2026-10-25T00:00:00Z\x00cccc"}, pageAfterImage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if start != 0 {
+		t.Fatalf("image page start = %d", start)
+	}
+}
+
+func TestOverviewMarksStaleSourcesAndBlocksUnsafeAdmission(t *testing.T) {
+	authority, _, _ := testAuthority(t)
+	metrics := map[string]any{
+		"observed_at":       time.Now().UTC().Format(time.RFC3339Nano),
+		"up":                false,
+		"admission_ready":   true,
+		"draining":          false,
+		"task_states":       map[string]any{"active": float64(4)},
+		"default_admission": map[string]any{"ready": true, "reasons": []any{}},
+	}
+	value, err := authority.overview(metrics, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := value["admission"].(map[string]any)
+	if admission["ready"] != false {
+		t.Fatalf("admission = %#v", admission)
+	}
+
+	metrics["observed_at"] = time.Now().UTC().Add(-2 * time.Minute).Format(time.RFC3339Nano)
+	value, err = authority.overview(metrics, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	counts := value["task_counts"].(map[string]any)
+	if counts["active"] != int64(0) {
+		t.Fatalf("stale task counts = %#v", counts)
+	}
+	sources := value["sources"].([]any)
+	durable := sources[0].(map[string]any)
+	if durable["state"] != "stale" || durable["safe_code"] != "observation_stale" {
+		t.Fatalf("durable source = %#v", durable)
 	}
 }
 

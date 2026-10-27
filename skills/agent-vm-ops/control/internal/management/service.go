@@ -30,6 +30,8 @@ type Service struct {
 	maintenanceMu sync.Mutex
 }
 
+const operationFinalizeTimeout = 30 * time.Second
+
 type Options struct {
 	TrustedImageSourceIDs  []string
 	SupportedArchitectures []string
@@ -570,7 +572,9 @@ func (s *Service) finishOperation(ctx context.Context, operation *state.Manageme
 	if outcome != "succeeded" && outcome != "outcome_unknown" {
 		outcome = "failed"
 	}
-	return s.Store.FinishManagementOperation(ctx, operation.OperationID, phase, status, result, failure, s.auditValue(*operation, outcome, phase, failure))
+	finalizeCtx, cancel := context.WithTimeout(context.Background(), operationFinalizeTimeout)
+	defer cancel()
+	return s.Store.FinishManagementOperation(finalizeCtx, operation.OperationID, phase, status, result, failure, s.auditValue(*operation, outcome, phase, failure))
 }
 
 func (s *Service) SelectDefault(ctx context.Context, operationID, actor, reason, fingerprint, targetVersion string) (*state.ManagementOperation, error) {

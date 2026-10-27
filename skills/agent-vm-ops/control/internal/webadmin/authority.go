@@ -243,26 +243,66 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 		"memory_pressure":                        observedBoolean(nil, observedAt, fresh),
 	}
 	var admissionReady, draining any
+	admissionBlocked := false
 	if fresh {
 		admissionReady, _ = metrics["admission_ready"].(bool)
 		draining, _ = metrics["draining"].(bool)
+		if value, ok := draining.(bool); ok && value {
+			admissionBlocked = true
+		}
 	}
 	reasons := []string{}
 	if !fresh {
 		reasons = append(reasons, "observation_stale")
 	}
 	if defaultAdmission, ok := metrics["default_admission"].(map[string]any); ok {
+		if ready, ok := defaultAdmission["ready"].(bool); ok && !ready {
+			admissionBlocked = true
+		}
 		if rawReasons, ok := defaultAdmission["reasons"].([]any); ok {
 			for _, rawReason := range rawReasons {
 				if reason, ok := rawReason.(map[string]any); ok && stringValue(reason["code"]) != "" {
-					reasons = append(reasons, stringValue(reason["code"]))
+					code := stringValue(reason["code"])
+					reasons = append(reasons, code)
+					switch code {
+					case "native_unavailable", "resource_pressure", "resource_unverified", "startup_reconcile_required":
+						admissionBlocked = true
+					}
 				}
 			}
 		}
 	}
+	if fresh {
+		nativeUp, nativeOK := metrics["up"].(bool)
+		if !nativeOK || !nativeUp {
+			admissionBlocked = true
+			if !containsString(reasons, "native_unavailable") {
+				reasons = append(reasons, "native_unavailable")
+			}
+		}
+		if admissionBlocked {
+			admissionReady = false
+		}
+	}
 	states := map[string]any{}
 	for _, name := range []string{"active", "preparing", "cached", "closing", "deleting", "failed", "absent"} {
-		states[name] = int64Value(metricsMapValue(metrics, "task_states", name))
+		if fresh {
+			states[name] = int64Value(metricsMapValue(metrics, "task_states", name))
+		} else {
+			states[name] = int64(0)
+		}
+	}
+	durableState := "available"
+	nativeSafeCode := any(nil)
+	nativeUnavailable := false
+	if native, ok := metrics["up"].(bool); !ok || !native {
+		nativeUnavailable = true
+	}
+	if !fresh {
+		durableState = "stale"
+		nativeSafeCode = "observation_stale"
+	} else if nativeUnavailable {
+		nativeSafeCode = "native_unavailable"
 	}
 	return map[string]any{
 		"resource_version": epoch,
@@ -272,8 +312,13 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 		"pressure":         pressure,
 		"task_counts":      states,
 		"sources": []any{
-			map[string]any{"name": "durable_state", "state": "available", "observed_at": observedAt, "stale_after_seconds": 60, "safe_code": nil},
-			map[string]any{"name": "native", "state": sourceStateWithFreshness(metrics["up"], fresh), "observed_at": observedAt, "stale_after_seconds": 60, "safe_code": nil},
+			map[string]any{"name": "durable_state", "state": durableState, "observed_at": observedAt, "stale_after_seconds": 60, "safe_code": func() any {
+				if fresh {
+					return nil
+				}
+				return "observation_stale"
+			}()},
+			map[string]any{"name": "native", "state": sourceStateWithFreshness(metrics["up"], fresh), "observed_at": observedAt, "stale_after_seconds": 60, "safe_code": nativeSafeCode},
 		},
 	}, nil
 }
@@ -300,7 +345,7 @@ func (authority *Authority) listVMs(writer http.ResponseWriter, request *http.Re
 	for index := range filtered {
 		keys[index] = filtered[index].TaskID
 	}
-	start, limit, err := pageBounds(request.URL.Query(), keys)
+	start, limit, err := pageBounds(request.URL.Query(), keys, pageAfterAscending)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
@@ -411,7 +456,7 @@ func (authority *Authority) listImages(writer http.ResponseWriter, request *http
 	for index := range images {
 		keys[index] = imagePageKey(images[index])
 	}
-	start, limit, err := pageBounds(request.URL.Query(), keys)
+	start, limit, err := pageBounds(request.URL.Query(), keys, pageAfterImage)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
@@ -481,7 +526,7 @@ func (authority *Authority) listOperations(writer http.ResponseWriter, request *
 	for index := range filtered {
 		keys[index] = filtered[index].CreatedAt + "\x00" + filtered[index].OperationID
 	}
-	start, limit, err := pageBounds(query, keys)
+	start, limit, err := pageBounds(query, keys, pageAfterDescendingPair)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
@@ -535,7 +580,7 @@ func (authority *Authority) listAudit(writer http.ResponseWriter, request *http.
 	for index := range filtered {
 		keys[index] = filtered[index].OccurredAt + "\x00" + filtered[index].EventID
 	}
-	start, limit, err := pageBounds(query, keys)
+	start, limit, err := pageBounds(query, keys, pageAfterDescendingPair)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
@@ -1691,7 +1736,9 @@ func validateConfirmationToken(value string) error {
 	return nil
 }
 
-func pageBounds(query url.Values, keys []string) (int, int, error) {
+type pageAfter func(key, cursor string) bool
+
+func pageBounds(query url.Values, keys []string, after pageAfter) (int, int, error) {
 	limit := 25
 	if value := query.Get("limit"); value != "" {
 		parsed, err := strconv.Atoi(value)
@@ -1712,18 +1759,47 @@ func pageBounds(query url.Values, keys []string) (int, int, error) {
 		if err := json.Unmarshal(raw, &cursor); err != nil || cursor.Key == "" {
 			return 0, 0, errors.New("cursor is invalid")
 		}
-		start = -1
 		for index, key := range keys {
-			if key == cursor.Key {
-				start = index + 1
+			if after(key, cursor.Key) {
+				start = index
 				break
 			}
 		}
-		if start < 0 {
-			return 0, 0, errors.New("cursor is invalid")
+		if start == 0 && len(keys) > 0 && !after(keys[0], cursor.Key) {
+			start = len(keys)
 		}
 	}
 	return start, limit, nil
+}
+
+func pageAfterAscending(key, cursor string) bool {
+	return key > cursor
+}
+
+func pageAfterImage(key, cursor string) bool {
+	keyCreated, keyFingerprint := pageKeyParts(key)
+	cursorCreated, cursorFingerprint := pageKeyParts(cursor)
+	if keyCreated != cursorCreated {
+		return keyCreated < cursorCreated
+	}
+	return keyFingerprint > cursorFingerprint
+}
+
+func pageAfterDescendingPair(key, cursor string) bool {
+	keyCreated, keyID := pageKeyParts(key)
+	cursorCreated, cursorID := pageKeyParts(cursor)
+	if keyCreated != cursorCreated {
+		return keyCreated < cursorCreated
+	}
+	return keyID < cursorID
+}
+
+func pageKeyParts(value string) (string, string) {
+	created, id, found := strings.Cut(value, "\x00")
+	if !found {
+		return value, ""
+	}
+	return created, id
 }
 
 func validateVMQuery(query url.Values) error {
