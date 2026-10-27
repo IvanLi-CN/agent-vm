@@ -46,15 +46,25 @@ func workerGroupAlive(group int, readTable func() (map[int]trackedProcess, error
 	if err != nil {
 		return false, err
 	}
+	sawZombie := false
 	for _, candidate := range all {
-		if candidate.group == group && candidate.state != 'Z' {
+		if candidate.group != group {
+			continue
+		}
+		if candidate.state != 'Z' {
 			return true, nil
 		}
+		sawZombie = true
+	}
+	if sawZombie {
+		// Zombies have no executable ownership left. A subreaper may still
+		// need to reap them, but they must not keep a completed worker alive.
+		return false, nil
 	}
 	// A procfs table is a point-in-time enumeration: a surviving member can
 	// fork after enumeration and exit before its stat file is read. The kernel
-	// process-group probe closes that false-empty window. If the group exists
-	// but only exposes zombies, stay conservative and require reconciliation.
+	// process-group probe closes that false-empty window when procfs has no
+	// group members at all.
 	if err := unix.Kill(-group, 0); err == nil || errors.Is(err, unix.EPERM) {
 		return true, nil
 	} else if !errors.Is(err, unix.ESRCH) {
@@ -78,6 +88,14 @@ type workerGroupCleanup struct {
 	rootPIDFD    int
 	rootSignaled bool
 	members      map[int]trackedProcess
+}
+
+type processGroupKillOps struct {
+	readTable   func() (map[int]trackedProcess, error)
+	openPIDFD   func(int) (int, error)
+	closePIDFD  func(int) error
+	readProcess func(int) (trackedProcess, error)
+	sendSignal  func(int) error
 }
 
 func workerRootExited(identity WorkerIdentity, workerAlive func(WorkerIdentity) (bool, error)) error {
@@ -182,13 +200,28 @@ func killWorkerWith(identity WorkerIdentity, ops workerKillOps) error {
 // already verified members; a reused numeric PGID is never enough to claim a
 // new process.
 func killProcessGroup(identity WorkerIdentity, cleanup *workerGroupCleanup) error {
+	return killProcessGroupWith(identity, cleanup, processGroupKillOps{
+		readTable:   readProcessTable,
+		openPIDFD:   func(pid int) (int, error) { return unix.PidfdOpen(pid, 0) },
+		closePIDFD:  unix.Close,
+		readProcess: readProcess,
+		sendSignal: func(fd int) error {
+			return unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
+		},
+	})
+}
+
+func killProcessGroupWith(identity WorkerIdentity, cleanup *workerGroupCleanup, ops processGroupKillOps) error {
 	if cleanup == nil {
 		return errors.New("native worker group cleanup state is missing")
+	}
+	if ops.readTable == nil || ops.openPIDFD == nil || ops.closePIDFD == nil || ops.readProcess == nil || ops.sendSignal == nil {
+		return errors.New("native worker group cleanup operations are incomplete")
 	}
 	if cleanup.members == nil {
 		cleanup.members = make(map[int]trackedProcess)
 	}
-	all, err := readProcessTable()
+	all, err := ops.readTable()
 	if err != nil {
 		return err
 	}
@@ -201,15 +234,11 @@ func killProcessGroup(identity WorkerIdentity, cleanup *workerGroupCleanup) erro
 			return fmt.Errorf("native worker process group changed for pid %d", identity.PID)
 		}
 	} else if !cleanup.rootSignaled {
-		// The root pidfd still anchors the original process even if the root
-		// was reaped before this scan. The original PGID cannot be reused
-		// without the root PID reappearing, which was ruled out above.
-		for pid, item := range all {
-			if item.group == identity.ProcessGroup && item.state != 'Z' {
-				cleanup.members[pid] = item
-			}
-		}
-		cleanup.rootSignaled = true
+		// Do not claim members from a root-less first scan. A new process group
+		// can reuse the numeric PGID after the original leader exits, even while
+		// the original root pidfd remains open. The caller will signal that
+		// pidfd and fail closed if any unanchored group member remains.
+		return nil
 	}
 	if rootPresent {
 		for pid, item := range all {
@@ -253,7 +282,7 @@ func killProcessGroup(identity WorkerIdentity, cleanup *workerGroupCleanup) erro
 			}
 			continue
 		}
-		fd, openErr := unix.PidfdOpen(pid, 0)
+		fd, openErr := ops.openPIDFD(pid)
 		if errors.Is(openErr, unix.ESRCH) {
 			continue
 		}
@@ -263,27 +292,27 @@ func killProcessGroup(identity WorkerIdentity, cleanup *workerGroupCleanup) erro
 			}
 			continue
 		}
-		current, readErr := readProcess(pid)
+		current, readErr := ops.readProcess(pid)
 		if processGone(readErr) {
-			_ = unix.Close(fd)
+			_ = ops.closePIDFD(fd)
 			continue
 		}
 		if readErr != nil {
-			_ = unix.Close(fd)
+			_ = ops.closePIDFD(fd)
 			if first == nil {
 				first = fmt.Errorf("recheck process-group member %d: %w", pid, readErr)
 			}
 			continue
 		}
 		if current.start != item.start || current.group != identity.ProcessGroup {
-			_ = unix.Close(fd)
+			_ = ops.closePIDFD(fd)
 			if first == nil {
 				first = fmt.Errorf("process-group member identity changed for pid %d", pid)
 			}
 			continue
 		}
-		signalErr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
-		_ = unix.Close(fd)
+		signalErr := ops.sendSignal(fd)
+		_ = ops.closePIDFD(fd)
 		if signalErr != nil && !errors.Is(signalErr, unix.ESRCH) && first == nil {
 			first = fmt.Errorf("kill process-group member %d: %w", pid, signalErr)
 		}
@@ -292,7 +321,7 @@ func killProcessGroup(identity WorkerIdentity, cleanup *workerGroupCleanup) erro
 		if cleanup.rootPIDFD < 0 {
 			return errors.New("native worker root pidfd is missing")
 		}
-		signalErr := unix.PidfdSendSignal(cleanup.rootPIDFD, unix.SIGKILL, nil, 0)
+		signalErr := ops.sendSignal(cleanup.rootPIDFD)
 		if signalErr != nil && !errors.Is(signalErr, unix.ESRCH) {
 			if first == nil {
 				first = fmt.Errorf("kill native worker root: %w", signalErr)

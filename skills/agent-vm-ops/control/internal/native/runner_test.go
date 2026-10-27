@@ -29,6 +29,12 @@ type failingStartRecorder struct {
 	err error
 }
 
+type startFailureRecorder struct {
+	testWorkerRecorder
+	mu       sync.Mutex
+	failures []error
+}
+
 func (recorder *testWorkerRecorder) WorkerStarted(_ context.Context, _ string, identity WorkerIdentity) error {
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
@@ -49,6 +55,17 @@ func (recorder *blockingWorkerRecorder) WorkerStartAllowed(context.Context, stri
 
 func (recorder *failingStartRecorder) WorkerStarted(context.Context, string, WorkerIdentity) error {
 	return recorder.err
+}
+
+func (recorder *startFailureRecorder) WorkerStartAllowed(context.Context, string) error {
+	return nil
+}
+
+func (recorder *startFailureRecorder) WorkerStartFailed(_ context.Context, _ string, err error) error {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	recorder.failures = append(recorder.failures, err)
+	return nil
 }
 
 func TestLimitedBufferReportsTheWholeInputWhenTruncated(t *testing.T) {
@@ -188,6 +205,35 @@ func TestRunnerRecordsCleanupAfterWorkerStartCallbackFailure(t *testing.T) {
 	_, err := NewRunner().Run(ctx, []string{"/bin/echo", "worker"}, nil)
 	if err == nil || !strings.Contains(err.Error(), "record native worker start") {
 		t.Fatalf("Run() error = %v, want worker-start callback failure", err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.finished) != 1 || recorder.finished[0] != nil {
+		t.Fatalf("worker finish callbacks = %#v, want one confirmed cleanup", recorder.finished)
+	}
+}
+
+func TestRunnerRecordsConfirmedStartFailure(t *testing.T) {
+	recorder := &startFailureRecorder{}
+	ctx := WithWorkerRecorder(context.Background(), "operation", recorder)
+	missing := filepath.Join(t.TempDir(), "missing-native-command")
+	_, err := NewRunner().Run(ctx, []string{missing}, nil)
+	if err == nil || !strings.Contains(err.Error(), "start "+missing) {
+		t.Fatalf("Run() error = %v, want native start failure", err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.failures) != 1 || recorder.failures[0] == nil {
+		t.Fatalf("worker start failure callbacks = %#v, want one recorded failure", recorder.failures)
+	}
+}
+
+func TestRunnerRecordsFinishedWorkerWhenCommandFails(t *testing.T) {
+	recorder := &testWorkerRecorder{}
+	ctx := WithWorkerRecorder(context.Background(), "operation", recorder)
+	result, err := NewRunner().Run(ctx, []string{"/bin/sh", "-c", "exit 17"}, nil)
+	if err == nil || result.Code != 17 {
+		t.Fatalf("Run() result = %#v, error = %v, want command exit 17", result, err)
 	}
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()

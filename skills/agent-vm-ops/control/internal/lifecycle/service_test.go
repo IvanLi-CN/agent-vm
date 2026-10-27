@@ -649,6 +649,70 @@ func TestWorkerStartGateRecordsAdmissionAndRejectsRetry(t *testing.T) {
 	}
 }
 
+func TestWorkerStartGateRearmsCompletedWorker(t *testing.T) {
+	for _, stateValue := range []string{"finished", "exited"} {
+		t.Run(stateValue, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "worker-rearm.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			operationID := "worker-rearm-" + stateValue
+			if err := store.RecordOperation(context.Background(), operationID, "release", stringPointer("worker-rearm-session"), nil, map[string]any{
+				"outcome": "pending",
+				"worker":  map[string]any{"state": stateValue},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			service := New(store, config.Defaults(), Options{})
+			if err := service.WorkerStartAllowed(context.Background(), operationID); err != nil {
+				t.Fatalf("worker admission from %s = %v", stateValue, err)
+			}
+			operation, err := store.GetOperation(context.Background(), operationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker := operation.Response["worker"].(map[string]any)
+			if worker["state"] != "starting" || !boolValue(worker["start_attempted"]) {
+				t.Fatalf("worker admission from %s = %#v, want durable starting marker", stateValue, worker)
+			}
+			if err := service.WorkerStartAllowed(context.Background(), operationID); !errors.Is(err, errUnresolvedWorker) {
+				t.Fatalf("worker retry from %s = %v, want unresolved-worker error", stateValue, err)
+			}
+		})
+	}
+}
+
+func TestWorkerStartFailedClearsAdmissionBarrier(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "worker-start-failed.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	operationID := "worker-start-failed"
+	if err := store.RecordOperation(context.Background(), operationID, "release", stringPointer("worker-start-failed-session"), nil, map[string]any{
+		"outcome": "pending",
+		"worker":  map[string]any{"state": "starting", "start_attempted": true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	if err := service.WorkerStartFailed(context.Background(), operationID, errors.New("exec unavailable")); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := operation.Response["worker"].(map[string]any)
+	if worker["state"] != "exited" || worker["error"] != "exec unavailable" {
+		t.Fatalf("failed worker state = %#v, want exited with cause", worker)
+	}
+	if err := service.WorkerStartAllowed(context.Background(), operationID); err != nil {
+		t.Fatalf("worker retry after confirmed start failure = %v", err)
+	}
+}
+
 func TestWorkerFinishedCannotReplaceUnresolvedIdentity(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "worker-identity.sqlite3"))
 	if err != nil {
@@ -715,6 +779,53 @@ func TestDestroyMissingInstanceDoesNotFinalizeUnresolvedWorker(t *testing.T) {
 	}
 	if task == nil || task.State != stateDeleting {
 		t.Fatalf("destroy task = %#v, want retained deleting task", task)
+	}
+}
+
+func TestDestroyPreservesPendingAcquireWithAttemptedWorker(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "destroy-pending-worker.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	session := "destroy-pending-worker-session"
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "destroy-pending-worker-task", SessionID: session, Generation: 1, State: stateActive,
+		InstanceName: "agent-destroy-pending-worker", LeaseExpiresAt: stringPointer(now.Add(time.Hour).Format(time.RFC3339Nano)),
+		CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(1)
+	if err := store.RecordOperation(context.Background(), "destroy-pending-acquire", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome":         "pending",
+		"_request_digest": "digest",
+		"worker":          map[string]any{"state": "starting", "start_attempted": true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	_, err = service.releaseUnlocked(context.Background(), protocol.Request{
+		"session_id": session, "generation": int64(1), "operation_id": "destroy-pending-operation",
+	}, true)
+	control := protocol.AsError(err)
+	if control.Code != "cleanup_incomplete" || !strings.Contains(control.Message, "pending acquire operation") {
+		t.Fatalf("destroy error = %#v, want unresolved pending acquire", control)
+	}
+	operation, err := store.GetOperation(context.Background(), "destroy-pending-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "pending" {
+		t.Fatalf("pending acquire was finalized: %#v", operation)
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": session})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil || task.State != stateActive {
+		t.Fatalf("task state after blocked destroy = %#v, want active", task)
 	}
 }
 

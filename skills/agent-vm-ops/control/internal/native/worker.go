@@ -25,6 +25,12 @@ type WorkerStartGuard interface {
 	WorkerStartAllowed(context.Context, string) error
 }
 
+// WorkerStartFailureRecorder clears a pre-spawn admission barrier after the
+// runner has confirmed that no native process was created.
+type WorkerStartFailureRecorder interface {
+	WorkerStartFailed(context.Context, string, error) error
+}
+
 type workerContextKey struct{}
 
 type workerBinding struct {

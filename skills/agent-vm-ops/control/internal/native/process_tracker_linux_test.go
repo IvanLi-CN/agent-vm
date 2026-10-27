@@ -364,6 +364,37 @@ func TestWorkerAliveDetectsSurvivingProcessGroupAfterRootExit(t *testing.T) {
 	t.Fatal("process group remained alive after cleanup")
 }
 
+func TestKillWorkerCleansRootAndLiveGroupMember(t *testing.T) {
+	command := exec.Command("/bin/sh", "-c", "sleep 30 & wait")
+	configureCommand(command)
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := false
+	defer func() {
+		if !waited {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	}()
+	identity, err := workerIdentity(command.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := KillWorker(identity); err != nil {
+		t.Fatalf("KillWorker() error = %v, want nil", err)
+	}
+	_ = command.Wait()
+	waited = true
+	alive, err := WorkerAlive(identity)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alive {
+		t.Fatal("KillWorker() left the process group alive")
+	}
+}
+
 func TestKillWorkerReconcilesIdentityExitAfterPidfdOpen(t *testing.T) {
 	identity := WorkerIdentity{PID: 123, StartTime: "1", ProcessGroup: 123}
 	sentinel := errors.New("synthetic worker identity read failure")
@@ -453,6 +484,37 @@ func TestKillWorkerAnchorsGroupBeforeRootSignal(t *testing.T) {
 	}
 }
 
+func TestKillProcessGroupDoesNotClaimUnanchoredMembers(t *testing.T) {
+	identity := WorkerIdentity{PID: 123, StartTime: "root", ProcessGroup: 123}
+	cleanup := &workerGroupCleanup{rootPIDFD: 42, members: make(map[int]trackedProcess)}
+	err := killProcessGroupWith(identity, cleanup, processGroupKillOps{
+		readTable: func() (map[int]trackedProcess, error) {
+			return map[int]trackedProcess{
+				456: {pid: 456, start: "unanchored", parent: 1, group: 123, state: 'S'},
+			}, nil
+		},
+		openPIDFD: func(int) (int, error) {
+			t.Fatal("root-less first scan opened an unanchored member pidfd")
+			return -1, nil
+		},
+		closePIDFD: func(int) error { return nil },
+		readProcess: func(int) (trackedProcess, error) {
+			t.Fatal("root-less first scan re-read an unanchored member")
+			return trackedProcess{}, nil
+		},
+		sendSignal: func(int) error {
+			t.Fatal("root-less first scan signalled an unanchored member")
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("killProcessGroupWith() error = %v, want nil", err)
+	}
+	if cleanup.rootSignaled || len(cleanup.members) != 0 {
+		t.Fatalf("root-less cleanup state = %#v, want no claimed members or root signal", cleanup)
+	}
+}
+
 func TestKillWorkerConfirmsProcessGroupGoneAfterMemberScan(t *testing.T) {
 	identity := WorkerIdentity{PID: 123, StartTime: "1", ProcessGroup: 123}
 	groupChecks := 0
@@ -526,6 +588,18 @@ func TestWorkerGroupAliveUsesKernelGroupPresence(t *testing.T) {
 	}
 	if !alive {
 		t.Fatal("workerGroupAlive() missed a process group hidden by the synthetic empty snapshot")
+	}
+}
+
+func TestWorkerGroupAliveTreatsOnlyZombiesAsGone(t *testing.T) {
+	alive, err := workerGroupAlive(123, func() (map[int]trackedProcess, error) {
+		return map[int]trackedProcess{456: {pid: 456, group: 123, state: 'Z'}}, nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if alive {
+		t.Fatal("workerGroupAlive() treated a zombie-only group as live")
 	}
 }
 
