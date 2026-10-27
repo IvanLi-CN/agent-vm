@@ -20,6 +20,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -42,6 +43,14 @@ try:
         GO_RETIRED_UNITS,
         GO_UNIT_CONTENT_SHA256,
         GO_UNIT_EXEC_START,
+        LEGACY_PRODUCT_MANIFEST_FORMAT,
+        PRODUCT_MANIFEST_FORMAT,
+        STATE_CAPABILITY_MARKERS,
+        PRODUCT_CLIENT_ARTIFACTS,
+        PRODUCT_LINUX_ARTIFACTS,
+        PRODUCT_LINUX_LEGACY_ARTIFACTS,
+        PRODUCT_UNIT_CONTENT_SHA256,
+        PRODUCT_UNIT_EXEC_START,
         ManifestError,
         load_release_manifest,
         sha256_file,
@@ -65,6 +74,14 @@ except ModuleNotFoundError:
         GO_RETIRED_UNITS,
         GO_UNIT_CONTENT_SHA256,
         GO_UNIT_EXEC_START,
+        LEGACY_PRODUCT_MANIFEST_FORMAT,
+        PRODUCT_MANIFEST_FORMAT,
+        STATE_CAPABILITY_MARKERS,
+        PRODUCT_CLIENT_ARTIFACTS,
+        PRODUCT_LINUX_ARTIFACTS,
+        PRODUCT_LINUX_LEGACY_ARTIFACTS,
+        PRODUCT_UNIT_CONTENT_SHA256,
+        PRODUCT_UNIT_EXEC_START,
         ManifestError,
         load_release_manifest,
         sha256_file,
@@ -83,6 +100,7 @@ CANONICAL_UNIT_DIR = Path("/etc/systemd/system")
 RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
 GO_CONTROL_PATH = Path("/opt/agent-vm-native/bin/agent-vm-control")
 GO_CONTROL_SOCKET = Path("/run/agent-vm-native/control.sock")
+STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
 LEGACY_EXPIRY_TIMER_RE = re.compile(r"^agent-vm-native-expire-[A-Za-z0-9_.:-]+\.timer$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -90,6 +108,7 @@ MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_FILE_BYTES = 64 * 1024 * 1024
 FORBIDDEN_CONFIG_NAMES = {"config.json", "state.sqlite3", "control.lock", "authority.lock", "admission.lock"}
 FIXED_UNIT_NAMES = tuple(sorted(set(UNIT_EXEC_START) | {"agent-vm-native-age-gc.timer"}))
+PRODUCT_UNIT_NAMES = ("agent-vm-native.service", "agent-vm-web.service")
 FIXED_ARTIFACTS = {
     ("client", "agent_vm.ts"),
     ("control", "agent_vm_control.ts"),
@@ -106,6 +125,14 @@ FIXED_ARTIFACT_MODES = {
 
 def _is_go_manifest(manifest: Mapping[str, Any]) -> bool:
     return manifest.get("format") == GO_MANIFEST_FORMAT
+
+
+def _is_product_manifest(manifest: Mapping[str, Any]) -> bool:
+    return manifest.get("format") in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}
+
+
+def _manifest_release_id(manifest: Mapping[str, Any]) -> str:
+    return str(manifest["source_revision"] if _is_product_manifest(manifest) else manifest["release_id"])
 
 
 def _go_control_target(config: Mapping[str, Any]) -> Path:
@@ -473,6 +500,27 @@ def _require_owned_regular(path: Path, owner_uid: int, mode: int | None = None) 
 
 
 def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
+    if _is_product_manifest(manifest):
+        expected_units = PRODUCT_UNIT_EXEC_START if manifest["format"] == PRODUCT_MANIFEST_FORMAT else {"agent-vm-native.service": PRODUCT_UNIT_EXEC_START["agent-vm-native.service"]}
+        expected_hashes = PRODUCT_UNIT_CONTENT_SHA256
+        for item in manifest["artifacts"]:
+            if item["role"] != "unit":
+                continue
+            name = Path(item["path"]).name
+            if name not in expected_units:
+                _fail("unit_unverified", f"product unit is not in the fixed allowlist: {name}")
+            path = root / Path(*PurePosixPath(item["path"]).parts)
+            try:
+                content = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError):
+                _fail("unit_unverified", f"unit cannot be read: {name}")
+            if sha256_file(path) != expected_hashes[name]:
+                _fail("unit_unverified", f"unit bytes differ from the fixed product policy: {name}")
+            if expected_units[name] not in content or "ExecStart=" not in content:
+                _fail("unit_unverified", f"unit does not contain its fixed ExecStart: {name}")
+            if any(token in content for token in ("systemctl stop", "systemctl disable", "ExecStop=", "ssh ", "curl ", "wget ")):
+                _fail("unit_unverified", f"unit contains a forbidden control path: {name}")
+        return
     if _is_go_manifest(manifest):
         for item in manifest["artifacts"]:
             if item["role"] != "unit":
@@ -529,6 +577,16 @@ def _reject_transaction_extras(root: Path, manifest: Mapping[str, Any]) -> None:
 
 def _verify_fixed_artifacts(config: Mapping[str, Any], manifest: Mapping[str, Any]) -> None:
     declared = {(item["role"], item["path"]) for item in manifest["artifacts"]}
+    if _is_product_manifest(manifest):
+        expected_values = PRODUCT_LINUX_ARTIFACTS if manifest["format"] == PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_LEGACY_ARTIFACTS
+        expected = {(role, path) for _, path, role, _ in expected_values}
+        if declared != expected:
+            _fail("artifact_unverified", "manifest artifact set differs from the fixed product release allowlist", {"expected": sorted(expected), "actual": sorted(declared)})
+        expected_modes = {(role, path): mode for _, path, role, mode in expected_values}
+        for item in manifest["artifacts"]:
+            if item["mode"] != expected_modes[(item["role"], item["path"])]:
+                _fail("artifact_mode_mismatch", f"fixed product release artifact mode differs: {item['path']}")
+        return
     if _is_go_manifest(manifest):
         expected = {(role, path) for _, path, role, _ in GO_FIXED_ARTIFACTS}
         if declared != expected:
@@ -593,6 +651,9 @@ def _verify_transaction(config: Mapping[str, Any], transaction_id: str, release_
         manifest = load_release_manifest(root / MANIFEST_NAME)
         if _is_go_manifest(manifest):
             verify_go_bundle(root, manifest)
+        elif _is_product_manifest(manifest):
+            from release_manifest import verify_product_bundle
+            verify_product_bundle(root, manifest)
         else:
             verify_bundle(root, manifest)
         verify_client_sidecar(root, manifest)
@@ -611,7 +672,7 @@ def _verify_transaction(config: Mapping[str, Any], transaction_id: str, release_
         _require_owned_regular(path, owner_uid, item["mode"])
     checked = {
         "transaction_id": transaction_id,
-        "release_id": manifest["release_id"],
+        "release_id": _manifest_release_id(manifest),
         "manifest_sha256": sha256_file(root / MANIFEST_NAME),
         "verified": True,
     }
@@ -637,7 +698,7 @@ def stage(config: Mapping[str, Any], transaction_id: str, release_id: str, paylo
         try:
             safe_extract_archive(payload, temporary)
             manifest = load_release_manifest(temporary / MANIFEST_NAME)
-            if manifest["release_id"] != release_id:
+            if _manifest_release_id(manifest) != release_id:
                 _fail("release_mismatch", "staged manifest does not match requested release")
             _write_json(temporary / ".wrapper-state.json", {"transaction_id": transaction_id, "release_id": release_id, "staged": True})
             os.replace(temporary, destination)
@@ -677,6 +738,9 @@ def _verify_retained_release(config: Mapping[str, Any], target: Path) -> dict[st
         manifest = load_release_manifest(target / MANIFEST_NAME)
         if _is_go_manifest(manifest):
             verify_go_bundle(target, manifest)
+        elif _is_product_manifest(manifest):
+            from release_manifest import verify_product_bundle
+            verify_product_bundle(target, manifest)
         else:
             verify_bundle(target, manifest)
         verify_client_sidecar(target, manifest)
@@ -748,8 +812,11 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
         *(Path(config["control_path"]).with_name(name) for name in sorted(SUPPORT_ARTIFACT_NAMES)),
         Path(config["control_path"]).with_name(MANIFEST_NAME),
         Path(config["control_path"]).with_name("client-release.json"),
-    ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], "agent-vm-native.service")) + (
+    ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], "agent-vm-native.service", "agent-vm-web.service")) + (
         go_bundle_root / "systemd" / "agent-vm-native.service",
+        go_bundle_root / "systemd" / "agent-vm-web.service",
+        go_bundle_root / "config" / "agent-vm-web.json.example",
+        go_bundle_root / "web-assets.manifest.json",
     )
     return tuple(dict.fromkeys(targets))
 
@@ -830,7 +897,54 @@ def _restore_activation_state(
     _daemon_reload()
 
 
-def _ensure_drained(config: Mapping[str, Any]) -> None:
+def _validate_state_compatibility(manifest: Mapping[str, Any], capabilities: Any) -> None:
+    if not isinstance(capabilities, list) or not capabilities or not all(isinstance(item, str) and item for item in capabilities):
+        _fail("state_compatibility_unverified", "control response did not provide readable state capabilities")
+    if len(set(capabilities)) != len(capabilities):
+        _fail("state_compatibility_unverified", "control response did not provide readable state capabilities")
+    if manifest.get("format") == PRODUCT_MANIFEST_FORMAT:
+        compatibility = manifest.get("state_compatibility")
+        if not isinstance(compatibility, Mapping):
+            _fail("state_compatibility_unverified", "target product manifest has no state compatibility declaration")
+        readable = compatibility.get("reads")
+        writable = compatibility.get("writes")
+        if (
+            not isinstance(readable, list)
+            or not isinstance(writable, list)
+            or not all(isinstance(item, str) and item for item in readable)
+            or not all(isinstance(item, str) and item for item in writable)
+        ):
+            _fail("state_compatibility_unverified", "target product manifest state compatibility is unreadable")
+        supported = set(readable) & set(writable)
+    elif manifest.get("format") == LEGACY_PRODUCT_MANIFEST_FORMAT:
+        # Format 3 predates the declaration field but its Go controller already
+        # implements the complete management state schema.
+        supported = set(STATE_CAPABILITY_MARKERS)
+    else:
+        supported = {STATE_CAPABILITY_MARKERS[0]}
+    for capability in capabilities:
+        if capability not in supported:
+            _fail(
+                "state_compatibility_mismatch",
+                "target release cannot preserve a database capability",
+                {"capability": capability, "release_format": manifest.get("format")},
+            )
+
+
+def _read_live_state_capabilities() -> list[str]:
+    """Read the fixed state registry when an older controller omits it in drain-status."""
+    uri = f"file:{STATE_DB_PATH}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=30) as database:
+            rows = database.execute(
+                "SELECT name, version FROM state_capabilities ORDER BY name, version",
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        _fail("state_compatibility_unverified", "live state capabilities could not be read")
+    return [f"{name}@{version}" for name, version in rows]
+
+
+def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any] | None = None) -> None:
     if not config["require_drained"]:
         return
     command = [BUN_PATH, str(config["control_path"])]
@@ -841,7 +955,7 @@ def _ensure_drained(config: Mapping[str, Any]) -> None:
         except (OSError, UnicodeError, json.JSONDecodeError):
             _fail("drain_unverified", "installed client release metadata is invalid")
         view = metadata.get("client_view") if isinstance(metadata, Mapping) else None
-        if isinstance(metadata, Mapping) and metadata.get("format") == GO_MANIFEST_FORMAT and isinstance(view, Mapping) and view.get("transport") == "go-request":
+        if isinstance(metadata, Mapping) and metadata.get("format") in {GO_MANIFEST_FORMAT, LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT} and isinstance(view, Mapping) and view.get("transport") == "go-request":
             command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
     try:
         process = subprocess.run(
@@ -867,6 +981,11 @@ def _ensure_drained(config: Mapping[str, Any]) -> None:
         _fail("drain_unverified", "drain status result is invalid")
     if result.get("draining") is not True:
         _fail("drain_required", "release activation requires admission drain")
+    if target_manifest is not None:
+        capabilities = result.get("state_capabilities")
+        if capabilities is None:
+            capabilities = _read_live_state_capabilities()
+        _validate_state_compatibility(target_manifest, capabilities)
 
 
 def _daemon_reload() -> None:
@@ -925,14 +1044,50 @@ def _legacy_expiry_timers() -> tuple[str, ...]:
     return tuple(sorted(units))
 
 
-def _activate_go_runtime() -> None:
+def _deactivate_web_runtime() -> None:
+    _systemctl("stop", "agent-vm-web.service", allow_missing=True)
+    _systemctl("disable", "agent-vm-web.service", allow_missing=True)
+
+
+def _unit_is_enabled(unit: str) -> bool:
+    """Capture whether a unit was enabled before a dependency restart."""
+    try:
+        process = subprocess.run(
+            ["systemctl", "is-enabled", "--quiet", unit],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _fail("activation_failed", f"systemd enabled-state check could not be verified: {unit}")
+    return process.returncode == 0
+
+
+def _activate_go_runtime(*, web_enabled: bool = False) -> None:
     """Retire legacy triggers, enable Go, and verify that it is active."""
+    if not web_enabled:
+        _deactivate_web_runtime()
     for unit in (*GO_RETIRED_UNITS, *_legacy_expiry_timers()):
         _systemctl("stop", unit, allow_missing=True)
         _systemctl("disable", unit, allow_missing=True)
     _systemctl("enable", "agent-vm-native.service")
     _systemctl("restart", "agent-vm-native.service")
     _systemctl("is-active", "agent-vm-native.service")
+
+
+def _activate_product_runtime(
+    manifest: Mapping[str, Any],
+    *,
+    web_was_enabled: bool | None = None,
+) -> None:
+    web_enabled = manifest.get("format") == PRODUCT_MANIFEST_FORMAT
+    if web_enabled and web_was_enabled is None:
+        web_was_enabled = _unit_is_enabled("agent-vm-web.service")
+    _activate_go_runtime(web_enabled=web_enabled)
+    if web_was_enabled:
+        # Requires=agent-vm-native.service stops Web during native restart.
+        _systemctl("start", "agent-vm-web.service", allow_missing=True)
 
 
 def _activate_legacy_runtime() -> None:
@@ -949,6 +1104,9 @@ def _activate_legacy_runtime() -> None:
 
 
 def _install_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
+    if _is_product_manifest(manifest):
+        _install_product_release_files(config, release_root, manifest)
+        return
     if _is_go_manifest(manifest):
         _install_go_release_files(config, release_root, manifest)
         return
@@ -987,6 +1145,85 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
     _copy_atomic(client_sidecar, Path(config["control_path"]).with_name("client-release.json"), owner_uid, 0o644)
     # This exact predecessor is snapshotted before activation, so failure can
     # restore it. It is never executed or retained as a second control plane.
+    for name in (RETIRED_CONTROL_NAME, RETIRED_CLIENT_NAME):
+        retired = Path(config["control_path"]).with_name(name)
+        if retired.exists() or retired.is_symlink():
+            _require_owned_regular(retired, owner_uid, 0o755)
+            try:
+                retired.unlink()
+                _fsync_directory(retired.parent, "activation_failed")
+            except OSError:
+                _fail("activation_failed", "cannot retire the exact replaced executable")
+
+
+def _install_product_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
+    """Install the complete format-4 product without replacing live Web config."""
+    owner_uid = int(config["owner_uid"])
+    bundle_root = _go_control_target(config).parent
+    expected_values = PRODUCT_LINUX_ARTIFACTS if manifest["format"] == PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_LEGACY_ARTIFACTS
+    expected_support = {path for _, path, role, _ in expected_values if role == "support"}
+    installed_support: set[str] = set()
+    installed_controls: set[str] = set()
+    for item in manifest["artifacts"]:
+        source = release_root / Path(*PurePosixPath(item["path"]).parts)
+        if item["role"] == "client":
+            if item["path"] != "agent_vm.ts":
+                _fail("activation_unverified", "product client artifact name is not fixed")
+            _copy_atomic(source, Path(config["control_path"]).with_name("agent_vm.ts"), owner_uid, item["mode"])
+        elif item["role"] == "support":
+            if item["path"] in {"web-assets.manifest.json", "config/agent-vm-web.json.example"}:
+                _copy_atomic(source, bundle_root / item["path"], owner_uid, item["mode"])
+            elif item["path"] in {path for _, path, role, _ in PRODUCT_CLIENT_ARTIFACTS if role == "support"}:
+                _copy_atomic(source, Path(config["control_path"]).with_name(item["path"]), owner_uid, item["mode"])
+            else:
+                _fail("activation_unverified", "product support artifact path is not fixed")
+            installed_support.add(item["path"])
+        elif item["role"] == "control":
+            if item["path"] == "agent_vm_control_bridge.ts":
+                _copy_atomic(source, _go_bridge_target(config), owner_uid, item["mode"])
+            elif item["path"] == "bin/agent-vm-control":
+                _copy_atomic(source, _go_control_target(config), owner_uid, item["mode"])
+            else:
+                _fail("activation_unverified", "product control artifact path is not fixed")
+            installed_controls.add(item["path"])
+        elif item["role"] == "unit":
+            if item["path"] not in {"systemd/agent-vm-native.service", "systemd/agent-vm-web.service"}:
+                _fail("activation_unverified", "product unit artifact path is not fixed")
+            name = Path(item["path"]).name
+            _copy_atomic(source, Path(config["unit_dir"]) / name, owner_uid, item["mode"])
+            _copy_atomic(source, bundle_root / item["path"], owner_uid, item["mode"])
+    expected_client_support = {path for _, path, role, _ in PRODUCT_CLIENT_ARTIFACTS if role == "support"}
+    if installed_support != expected_support or not expected_client_support.issubset(installed_support) or installed_controls != {"agent_vm_control_bridge.ts", "bin/agent-vm-control"}:
+        _fail("activation_unverified", "fixed product control artifacts are missing")
+    for name in GO_RETIRED_UNITS:
+        retired = Path(config["unit_dir"]) / name
+        if retired.exists() or retired.is_symlink():
+            _require_owned_regular(retired, owner_uid, 0o644)
+            try:
+                retired.unlink()
+                _fsync_directory(retired.parent, "activation_failed")
+            except OSError:
+                _fail("activation_failed", f"cannot retire the exact old unit: {name}")
+    if manifest["format"] == LEGACY_PRODUCT_MANIFEST_FORMAT:
+        for target in (
+            Path(config["unit_dir"]) / "agent-vm-web.service",
+            bundle_root / "systemd" / "agent-vm-web.service",
+            bundle_root / "config" / "agent-vm-web.json.example",
+            bundle_root / "web-assets.manifest.json",
+        ):
+            if target.exists() or target.is_symlink():
+                _require_owned_regular(target, owner_uid, 0o644)
+                try:
+                    target.unlink()
+                    _fsync_directory(target.parent, "activation_failed")
+                except OSError:
+                    _fail("activation_failed", f"cannot retire the exact Web artifact: {target.name}")
+    manifest_source = release_root / MANIFEST_NAME
+    _require_owned_regular(manifest_source, owner_uid, 0o644)
+    _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
+    client_sidecar = release_root / "client-release.json"
+    _require_owned_regular(client_sidecar, owner_uid, 0o644)
+    _copy_atomic(client_sidecar, Path(config["control_path"]).with_name("client-release.json"), owner_uid, 0o644)
     for name in (RETIRED_CONTROL_NAME, RETIRED_CLIENT_NAME):
         retired = Path(config["control_path"]).with_name(name)
         if retired.exists() or retired.is_symlink():
@@ -1047,6 +1284,19 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
                 _fsync_directory(retired.parent, "activation_failed")
             except OSError:
                 _fail("activation_failed", f"cannot retire the exact old unit: {name}")
+    for target in (
+        Path(config["unit_dir"]) / "agent-vm-web.service",
+        go_bundle_root / "systemd" / "agent-vm-web.service",
+        go_bundle_root / "config" / "agent-vm-web.json.example",
+        go_bundle_root / "web-assets.manifest.json",
+    ):
+        if target.exists() or target.is_symlink():
+            _require_owned_regular(target, owner_uid, 0o644)
+            try:
+                target.unlink()
+                _fsync_directory(target.parent, "activation_failed")
+            except OSError:
+                _fail("activation_failed", f"cannot retire the exact Web artifact: {target.name}")
     manifest_source = release_root / MANIFEST_NAME
     _require_owned_regular(manifest_source, owner_uid, 0o644)
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
@@ -1074,11 +1324,15 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
     verified = _verify_transaction(config, transaction_id, release_id)
-    _ensure_drained(config)
+    staged = _transaction_dir(config, transaction_id)
+    try:
+        candidate_manifest = load_release_manifest(staged / MANIFEST_NAME)
+    except ManifestError as exc:
+        _fail(exc.code, exc.message, exc.detail)
+    _ensure_drained(config, candidate_manifest)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
     if activation_path.exists() or activation_path.is_symlink():
         _fail("transaction_exists", "activation record already exists for this transaction")
-    staged = _transaction_dir(config, transaction_id)
     release_root = Path(config["release_root"])
     current_link = Path(config["current_link"])
     previous_link = Path(config["previous_link"])
@@ -1090,6 +1344,9 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _verify_retained_release(config, old_current)
     if old_previous is not None:
         _verify_retained_release(config, old_previous)
+    web_unit_enabled = None
+    if _is_product_manifest(candidate_manifest) or _is_go_manifest(candidate_manifest):
+        web_unit_enabled = _unit_is_enabled("agent-vm-web.service")
     _mkdir_private(release_root, 0o755)
     release_dir = release_root / release_id
     if release_dir.exists():
@@ -1123,6 +1380,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         "activated": False,
         "activation_phase": "prepared",
         "rollback_attempts": 0,
+        "web_unit_enabled": web_unit_enabled,
     }
     _write_json(activation_path, record)
     runtime_switch_attempted = False
@@ -1141,7 +1399,12 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _daemon_reload()
         record["activation_phase"] = "daemon-reloaded"
         _write_json(activation_path, record)
-        if _is_go_manifest(manifest):
+        if _is_product_manifest(manifest):
+            runtime_switch_attempted = True
+            _activate_product_runtime(manifest, web_was_enabled=web_unit_enabled)
+            record["activation_phase"] = "runtime-switched"
+            _write_json(activation_path, record)
+        elif _is_go_manifest(manifest):
             runtime_switch_attempted = True
             _activate_go_runtime()
             record["activation_phase"] = "runtime-switched"
@@ -1176,7 +1439,13 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                     _systemctl("stop", "agent-vm-native.service", allow_missing=True)
                 else:
                     old_manifest = load_release_manifest(old_current / MANIFEST_NAME)
-                    if _is_go_manifest(old_manifest):
+                    if _is_product_manifest(old_manifest):
+                        snapshot = record.get("web_unit_enabled")
+                        _activate_product_runtime(
+                            old_manifest,
+                            web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
+                        )
+                    elif _is_go_manifest(old_manifest):
                         _activate_go_runtime()
                     else:
                         _activate_legacy_runtime()
@@ -1281,7 +1550,7 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
         if actual_previous is not None and actual_previous.name not in allowed_previous:
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
-    _ensure_drained(config)
+    _ensure_drained(config, previous_manifest)
     target_snapshot = _snapshot_targets(config)
     record["rollback_attempts"] = 1
     record["rollback_started"] = True
@@ -1300,7 +1569,9 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 Path(config["release_root"]) / old_previous_id if old_previous_id is not None else None,
             )
         _daemon_reload()
-        if _is_go_manifest(previous_manifest):
+        if _is_product_manifest(previous_manifest):
+            _activate_product_runtime(previous_manifest)
+        elif _is_go_manifest(previous_manifest):
             _activate_go_runtime()
         else:
             _activate_legacy_runtime()

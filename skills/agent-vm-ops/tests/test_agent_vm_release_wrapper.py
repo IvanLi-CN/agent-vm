@@ -95,6 +95,138 @@ class WrapperTests(unittest.TestCase):
         )
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
+    def test_drain_verification_checks_target_state_compatibility(self):
+        self.drain_patch.stop()
+        response = json.dumps({
+            "ok": True,
+            "result": {
+                "draining": True,
+                "state_capabilities": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+            },
+        }).encode()
+        target = {
+            "format": MANIFEST.PRODUCT_MANIFEST_FORMAT,
+            "state_compatibility": {
+                "reads": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+                "writes": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+            },
+        }
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ):
+            WRAPPER._ensure_drained(self.loaded, target)
+
+        incompatible = {
+            **target,
+            "state_compatibility": {
+                "reads": [MANIFEST.STATE_CAPABILITY_MARKERS[0]],
+                "writes": [MANIFEST.STATE_CAPABILITY_MARKERS[0]],
+            },
+        }
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._ensure_drained(self.loaded, incompatible)
+        self.assertEqual(failure.exception.code, "state_compatibility_mismatch")
+
+    def test_drain_verification_reads_fixed_state_db_for_old_controller(self):
+        self.drain_patch.stop()
+        response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
+        target = {
+            "format": MANIFEST.PRODUCT_MANIFEST_FORMAT,
+            "state_compatibility": {
+                "reads": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+                "writes": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+            },
+        }
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ), mock.patch.object(
+            WRAPPER,
+            "_read_live_state_capabilities",
+            return_value=list(MANIFEST.STATE_CAPABILITY_MARKERS),
+        ) as read_capabilities:
+            WRAPPER._ensure_drained(self.loaded, target)
+        read_capabilities.assert_called_once_with()
+
+    def test_legacy_product_rollback_accepts_the_complete_management_state(self):
+        self.drain_patch.stop()
+        response = json.dumps({
+            "ok": True,
+            "result": {
+                "draining": True,
+                "state_capabilities": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+            },
+        }).encode()
+        target = {"format": MANIFEST.LEGACY_PRODUCT_MANIFEST_FORMAT}
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ):
+            WRAPPER._ensure_drained(self.loaded, target)
+
+    def test_legacy_product_runtime_stops_the_web_unit(self):
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ) as run:
+            WRAPPER._activate_product_runtime({"format": MANIFEST.LEGACY_PRODUCT_MANIFEST_FORMAT})
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["systemctl", "stop", "agent-vm-web.service"], commands)
+        self.assertIn(["systemctl", "disable", "agent-vm-web.service"], commands)
+
+    def test_go_runtime_stops_the_web_unit_before_old_control_plane(self):
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ) as run:
+            WRAPPER._activate_go_runtime()
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["systemctl", "stop", "agent-vm-web.service"], commands)
+        self.assertIn(["systemctl", "disable", "agent-vm-web.service"], commands)
+
+    def test_product_runtime_restores_an_enabled_web_unit_after_native_restart(self):
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ) as run:
+            WRAPPER._activate_product_runtime({"format": MANIFEST.PRODUCT_MANIFEST_FORMAT})
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["systemctl", "is-enabled", "--quiet", "agent-vm-web.service"], commands)
+        native_restart = commands.index(["systemctl", "restart", "agent-vm-native.service"])
+        web_start = commands.index(["systemctl", "start", "agent-vm-web.service"])
+        self.assertLess(native_restart, web_start)
+
+    def test_product_runtime_does_not_start_a_disabled_web_unit(self):
+        def run(command, **kwargs):
+            if command == ["systemctl", "is-enabled", "--quiet", "agent-vm-web.service"]:
+                return subprocess.CompletedProcess(command, 1, b"", b"")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with mock.patch.object(WRAPPER.subprocess, "run", side_effect=run) as process:
+            WRAPPER._activate_product_runtime({"format": MANIFEST.PRODUCT_MANIFEST_FORMAT})
+        commands = [call.args[0] for call in process.call_args_list]
+        self.assertNotIn(["systemctl", "start", "agent-vm-web.service"], commands)
+
+    def test_product_runtime_uses_the_activation_snapshot_after_web_was_disabled(self):
+        def run(command, **kwargs):
+            if command == ["systemctl", "is-enabled", "--quiet", "agent-vm-web.service"]:
+                return subprocess.CompletedProcess(command, 1, b"", b"")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with mock.patch.object(WRAPPER.subprocess, "run", side_effect=run) as process:
+            WRAPPER._activate_product_runtime(
+                {"format": MANIFEST.PRODUCT_MANIFEST_FORMAT},
+                web_was_enabled=True,
+            )
+        commands = [call.args[0] for call in process.call_args_list]
+        self.assertNotIn(["systemctl", "is-enabled", "--quiet", "agent-vm-web.service"], commands)
+        self.assertIn(["systemctl", "start", "agent-vm-web.service"], commands)
+
     def test_missing_legacy_enable_and_disable_are_allowed_but_other_failures_are_not(self):
         missing = subprocess.CompletedProcess(
             [], 1, b"", b"Failed to disable unit: Unit agent-vm-native-age-gc.service does not exist\n",

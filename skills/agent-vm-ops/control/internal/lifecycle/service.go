@@ -1429,7 +1429,15 @@ func (s *Service) drainStatus(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	return map[string]any{"draining": draining, "ready": s.Ready()}, nil
+	capabilities, err := s.Store.Capabilities(ctx)
+	if err != nil {
+		return nil, s.sqliteError(err)
+	}
+	stateCapabilities := make([]string, 0, len(capabilities))
+	for _, capability := range capabilities {
+		stateCapabilities = append(stateCapabilities, capability.Name+"@"+strconv.FormatInt(capability.Version, 10))
+	}
+	return map[string]any{"draining": draining, "ready": s.Ready(), "state_capabilities": stateCapabilities}, nil
 }
 
 func (s *Service) adminStatus(ctx context.Context) (map[string]any, error) {

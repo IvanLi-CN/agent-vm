@@ -4,7 +4,8 @@ import { Data, fail, record, integer, readJson, fileHash } from "./client-io.ts"
 
 export const PROTOCOL = 4;
 export const VERSION = "dev";
-export const PRODUCT_FORMAT = 3;
+export const LEGACY_PRODUCT_FORMAT = 3;
+export const PRODUCT_FORMAT = 4;
 export const LEGACY = "legacy-protocol-4";
 export const ACTIONS = ["acquire", "admin-gc", "admin-metrics", "admin-reconcile", "admin-session-list", "admin-status", "destroy", "doctor", "drain-enter", "drain-exit", "drain-status", "port-add", "port-list", "port-remove", "release", "renew", "resize", "restart", "ssh-info", "status", "timer-age-gc", "timer-expire", "timer-reconcile"];
 export const CLIENT_DEPENDENCIES: ReadonlyArray<readonly [string, number]> = [["byte-fs.ts", 0o644], ["client-io.ts", 0o644], ["client-release.ts", 0o644], ["client.ts", 0o644], ["guest-source.ts", 0o644], ["sync-native.ts", 0o644], ["sync_worktree.ts", 0o755]];
@@ -40,12 +41,12 @@ export function loadRelease(path: string): [Data, Data[]] {
   if (!info.isFile() || info.isSymbolicLink()) fail("release_metadata_invalid", "release sidecar is not a regular file");
   let raw;
   try { raw = readJson(path); } catch { fail("release_metadata_invalid", "release sidecar is not valid UTF-8 JSON"); }
-  if (record(raw) && raw.format === PRODUCT_FORMAT) {
-    if (!shape(raw, ["format", "version", "source_revision", "protocol", "client_artifact", "client_dependencies", "client_view"]) || typeof raw.source_revision !== "string" || !/^[0-9a-f]{40}$/.test(raw.source_revision)) fail("release_metadata_invalid", "format-3 sidecar has an invalid shape or identity");
+  if (record(raw) && [LEGACY_PRODUCT_FORMAT, PRODUCT_FORMAT].includes(raw.format)) {
+    if (!shape(raw, ["format", "version", "source_revision", "protocol", "client_artifact", "client_dependencies", "client_view"]) || typeof raw.source_revision !== "string" || !/^[0-9a-f]{40}$/.test(raw.source_revision)) fail("release_metadata_invalid", "product sidecar has an invalid shape or identity");
     const version = productVersion(raw.version);
     if (raw.protocol !== PROTOCOL) fail("protocol_unsupported", "release sidecar protocol must be 4");
     const v = raw.client_view;
-    if (!shape(v, ["version", "source_revision", "protocol", "transport", "actions"]) || v.version !== version || v.source_revision !== raw.source_revision || v.protocol !== PROTOCOL || !["legacy-bun", "go-request"].includes(v.transport) || !shape(v.actions, ACTIONS)) fail("release_metadata_invalid", "format-3 client view identity, transport or fixed action set differs");
+    if (!shape(v, ["version", "source_revision", "protocol", "transport", "actions"]) || v.version !== version || v.source_revision !== raw.source_revision || v.protocol !== PROTOCOL || !["legacy-bun", "go-request"].includes(v.transport) || !shape(v.actions, ACTIONS)) fail("release_metadata_invalid", "product client view identity, transport or fixed action set differs");
     for (const action of ACTIONS) {
       const s = v.actions[action];
       if (!shape(s, ["request", "response", "client_to_control", "control_to_client"])) fail("release_metadata_invalid", "client_view action has an invalid shape");

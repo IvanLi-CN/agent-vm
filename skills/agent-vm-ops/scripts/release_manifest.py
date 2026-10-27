@@ -144,6 +144,14 @@ GO_UNIT_EXEC_START = {
 GO_UNIT_CONTENT_SHA256 = {
     "agent-vm-native.service": "447f9c09e9378919673708944a45c06d8498308d5613849ff6497103dd1577bb",
 }
+PRODUCT_UNIT_EXEC_START = {
+    "agent-vm-native.service": GO_UNIT_EXEC_START["agent-vm-native.service"],
+    "agent-vm-web.service": "ExecStart=/opt/agent-vm-native/bin/agent-vm-control web --config /etc/agent-vm-native/web.json",
+}
+PRODUCT_UNIT_CONTENT_SHA256 = {
+    "agent-vm-native.service": GO_UNIT_CONTENT_SHA256["agent-vm-native.service"],
+    "agent-vm-web.service": "f7dd481311850d4d1349000b920867208fb43a5b9da16a4f4f617e6f15d28b7b",
+}
 GO_FIXED_ARTIFACTS = frozenset({
     ("agent_vm.ts", "agent_vm.ts", "client", 0o755),
     ("byte-fs.ts", "byte-fs.ts", "support", 0o644),
@@ -158,10 +166,16 @@ GO_FIXED_ARTIFACTS = frozenset({
     ("unit:agent-vm-native.service", "systemd/agent-vm-native.service", "unit", 0o644),
 })
 
-# Format 3 is the product identity.  The protocol-4 release_id field is not
-# published in this format; readers derive that compatibility identity from
-# source_revision when talking to older protocol peers.
-PRODUCT_MANIFEST_FORMAT = 3
+# Format 3 remains a read-only product format. Format 4 adds the management
+# Web package and the state capability declaration.
+LEGACY_PRODUCT_MANIFEST_FORMAT = 3
+PRODUCT_MANIFEST_FORMAT = 4
+STATE_CAPABILITY_MARKERS = (
+    "legacy-agent-vm-core@1",
+    "managed-image-catalog@1",
+    "management-operation-audit@1",
+    "session-image-binding@1",
+)
 PRODUCT_BUN_TOOLCHAIN = "1.4.4"
 PRODUCT_GO_TOOLCHAIN = "go1.27.3"
 SEMVER_RE = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$")
@@ -169,7 +183,13 @@ PRODUCT_CLIENT_ARTIFACTS = frozenset({
     ("agent_vm.ts", "agent_vm.ts", "client", 0o755),
     *( (name, name, "support", mode) for name, mode in CLIENT_DEPENDENCY_MODES.items() ),
 })
-PRODUCT_LINUX_ARTIFACTS = GO_FIXED_ARTIFACTS
+PRODUCT_LINUX_LEGACY_ARTIFACTS = GO_FIXED_ARTIFACTS
+PRODUCT_LINUX_ARTIFACTS = frozenset({
+    *PRODUCT_LINUX_LEGACY_ARTIFACTS,
+    ("unit:agent-vm-web.service", "systemd/agent-vm-web.service", "unit", 0o644),
+    ("web-config-example", "config/agent-vm-web.json.example", "support", 0o644),
+    ("web-assets-manifest", "web-assets.manifest.json", "support", 0o644),
+})
 
 
 class ManifestError(Exception):
@@ -589,11 +609,14 @@ def validate_go_manifest(value: Any) -> dict[str, Any]:
 def validate_product_manifest(value: Any) -> dict[str, Any]:
     """Validate the SemVer product manifest without executing its artifacts."""
     root = _require_mapping(value, "manifest")
+    format_value = _require_int(root.get("format"), "format", 1)
+    if format_value not in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
+        raise _error("manifest_format_unsupported", "manifest format must be 3 or 4")
     required = {"format", "version", "source_revision", "protocol", "target", "toolchain", "artifacts", "actions", "client_view"}
+    if format_value == PRODUCT_MANIFEST_FORMAT:
+        required.add("state_compatibility")
     if set(root) != required:
         raise _error("manifest_invalid", "product manifest has an unexpected shape", {"fields": sorted(set(root) ^ required)})
-    if _require_int(root["format"], "format", 1) != PRODUCT_MANIFEST_FORMAT:
-        raise _error("manifest_format_unsupported", "manifest format must be 3")
     version = _require_string(root["version"], "version")
     if SEMVER_RE.fullmatch(version) is None:
         raise _error("manifest_invalid", "product version must be valid SemVer 2.0.0")
@@ -608,7 +631,7 @@ def validate_product_manifest(value: Any) -> dict[str, Any]:
         raise _error("manifest_invalid", "product toolchain declaration is invalid")
 
     raw_artifacts = root["artifacts"]
-    expected_artifacts = PRODUCT_CLIENT_ARTIFACTS if target["os"] == "source" else PRODUCT_LINUX_ARTIFACTS
+    expected_artifacts = PRODUCT_CLIENT_ARTIFACTS if target["os"] == "source" else (PRODUCT_LINUX_LEGACY_ARTIFACTS if format_value == LEGACY_PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_ARTIFACTS)
     if not isinstance(raw_artifacts, list) or len(raw_artifacts) != len(expected_artifacts):
         raise _error("manifest_artifact_set_invalid", "product artifact set is incomplete")
     artifacts: list[dict[str, Any]] = []
@@ -634,8 +657,8 @@ def validate_product_manifest(value: Any) -> dict[str, Any]:
         raise _error("manifest_invalid", "product client_view identity or transport is invalid")
     if json.dumps(client_view["actions"], sort_keys=True, separators=(",", ":")) != json.dumps(actions, sort_keys=True, separators=(",", ":")):
         raise _error("manifest_invalid", "product client_view actions differ from manifest actions")
-    return {
-        "format": PRODUCT_MANIFEST_FORMAT,
+    result = {
+        "format": format_value,
         "version": version,
         "source_revision": source_revision,
         "protocol": PROTOCOL_VERSION,
@@ -645,6 +668,15 @@ def validate_product_manifest(value: Any) -> dict[str, Any]:
         "actions": actions,
         "client_view": {"version": version, "source_revision": source_revision, "protocol": PROTOCOL_VERSION, "transport": transport, "actions": actions},
     }
+    if format_value == PRODUCT_MANIFEST_FORMAT:
+        compatibility = _require_mapping(root["state_compatibility"], "state_compatibility")
+        if set(compatibility) != {"reads", "writes"}:
+            raise _error("manifest_state_compatibility_invalid", "state_compatibility has an unexpected shape")
+        for key in ("reads", "writes"):
+            if compatibility[key] != list(STATE_CAPABILITY_MARKERS):
+                raise _error("manifest_state_compatibility_invalid", f"state_compatibility.{key} must declare all state capability markers in order")
+        result["state_compatibility"] = {"reads": list(STATE_CAPABILITY_MARKERS), "writes": list(STATE_CAPABILITY_MARKERS)}
+    return result
 
 
 def build_go_manifest(
@@ -702,7 +734,7 @@ def load_release_manifest(path: Path) -> dict[str, Any]:
         raise
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise _error("manifest_invalid", "release manifest is not valid UTF-8 JSON") from exc
-    if isinstance(value, Mapping) and value.get("format") == PRODUCT_MANIFEST_FORMAT:
+    if isinstance(value, Mapping) and value.get("format") in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
         return validate_product_manifest(value)
     if isinstance(value, Mapping) and value.get("format") == GO_MANIFEST_FORMAT:
         return validate_go_manifest(value)
@@ -711,7 +743,7 @@ def load_release_manifest(path: Path) -> dict[str, Any]:
 
 def validate_release_manifest(value: Any) -> dict[str, Any]:
     """Validate either supported release format without executing artifacts."""
-    if isinstance(value, Mapping) and value.get("format") == PRODUCT_MANIFEST_FORMAT:
+    if isinstance(value, Mapping) and value.get("format") in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
         return validate_product_manifest(value)
     if isinstance(value, Mapping) and value.get("format") == GO_MANIFEST_FORMAT:
         return validate_go_manifest(value)
@@ -766,7 +798,7 @@ def verify_bundle(root: Path, manifest: Mapping[str, Any] | None = None) -> dict
     if not root.is_dir():
         raise _error("bundle_invalid", "bundle root is not a directory")
     candidate = manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME)
-    if candidate.get("format") == PRODUCT_MANIFEST_FORMAT:
+    if candidate.get("format") in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
         return verify_product_bundle(root, candidate)
     checked = validate_manifest(candidate)
     for item in checked["artifacts"]:
@@ -863,7 +895,7 @@ def verify_client_sidecar(root: Path, manifest: Mapping[str, Any] | None = None)
     if not isinstance(value, Mapping):
         raise _error("client_sidecar_invalid", "client sidecar root must be an object")
     expected_keys = ({"format", "version", "source_revision", "protocol", "client_artifact", "client_dependencies", "client_view"}
-                     if checked["format"] == PRODUCT_MANIFEST_FORMAT
+                     if checked["format"] in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}
                      else {"format", "release_id", "source_revision", "protocol", "client_artifact", "client_dependencies", "client_view"})
     if set(value) != expected_keys:
         raise _error("client_sidecar_invalid", "client sidecar has an unexpected shape")
@@ -871,9 +903,9 @@ def verify_client_sidecar(root: Path, manifest: Mapping[str, Any] | None = None)
         # Python equality alone accepts True == 1 and 493.0 == 493. The Bun
         # readers preserve JSON numeric token types; publication must agree.
         return json.dumps(left, sort_keys=True) == json.dumps(right, sort_keys=True)
-    if checked["format"] == PRODUCT_MANIFEST_FORMAT:
-        if type(value["format"]) is not int or type(value["protocol"]) is not int or value["format"] != PRODUCT_MANIFEST_FORMAT or value["version"] != checked["version"] or value["source_revision"] != checked["source_revision"] or value["protocol"] != checked["protocol"]:
-            raise _error("client_sidecar_invalid", "format-3 client sidecar identity does not match manifest")
+    if checked["format"] in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
+        if type(value["format"]) is not int or type(value["protocol"]) is not int or value["format"] != checked["format"] or value["version"] != checked["version"] or value["source_revision"] != checked["source_revision"] or value["protocol"] != checked["protocol"]:
+            raise _error("client_sidecar_invalid", "product client sidecar identity does not match manifest")
         client_artifacts = [item for item in checked["artifacts"] if item["role"] == "client"]
         if len(client_artifacts) != 1 or not same_json(value["client_artifact"], client_artifacts[0]):
             raise _error("client_sidecar_invalid", "client sidecar artifact does not match manifest")
@@ -956,7 +988,7 @@ def check_compatibility(
 ) -> list[dict[str, Any]]:
     """Validate a peer capability before any journal or native side effect."""
     checked = validate_release_manifest(manifest)
-    local_release = checked["source_revision"] if checked["format"] == PRODUCT_MANIFEST_FORMAT else checked["release_id"]
+    local_release = checked["source_revision"] if checked["format"] in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT} else checked["release_id"]
     local = compatibility_for(checked, action)
     if peer is None:
         return [warning("legacy_compatibility", action, "peer omitted release capability; using legacy protocol-4 compatibility")]
@@ -1000,7 +1032,7 @@ def manifest_metadata(manifest: Mapping[str, Any] | None, *, present: bool, veri
             "artifacts_verified": verified,
         }
     checked = validate_release_manifest(manifest)
-    if checked["format"] == PRODUCT_MANIFEST_FORMAT:
+    if checked["format"] in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
         return {
             "release_id": checked["source_revision"],
             "source_revision": checked["source_revision"],

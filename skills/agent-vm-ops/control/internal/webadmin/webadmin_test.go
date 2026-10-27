@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
@@ -131,6 +132,66 @@ func TestWebSessionAndWriteBoundary(t *testing.T) {
 	server.Handler().ServeHTTP(wrongRecorder, wrongPeer)
 	if wrongRecorder.Code != http.StatusForbidden {
 		t.Fatalf("wrong peer status = %d, body = %s", wrongRecorder.Code, wrongRecorder.Body.String())
+	}
+}
+
+func TestWebServesAuthenticatedAssetsAndDeepLinks(t *testing.T) {
+	cfg := testManagementConfig(t)
+	assets := fstest.MapFS{
+		"index.html":        &fstest.MapFile{Data: []byte("<!doctype html>")},
+		"assets/app.js":     &fstest.MapFile{Data: []byte("console.log('ok')")},
+		"assets/app.css":    &fstest.MapFile{Data: []byte("body{}")},
+		"assets/font.woff2": &fstest.MapFile{Data: []byte("font")},
+	}
+	server, err := NewWebServer(cfg, NewAuthorityClient(cfg.Authority.SocketPath), assets)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/console/tasks/one", nil)
+	request = request.WithContext(WithPeerUID(request.Context(), cfg.ForwardAuth.PeerUID))
+	request.Header.Set(cfg.ForwardAuth.IdentityHeader, "admin@example")
+	request.Header.Set("Accept", "text/html")
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || recorder.Body.String() != "<!doctype html>" || recorder.Header().Get("Cache-Control") != "no-cache" {
+		t.Fatalf("deep link response = %d %q headers=%v", recorder.Code, recorder.Body.String(), recorder.Header())
+	}
+
+	assetRequest := httptest.NewRequest(http.MethodGet, "/assets/app.js", nil)
+	assetRequest = assetRequest.WithContext(WithPeerUID(assetRequest.Context(), cfg.ForwardAuth.PeerUID))
+	assetRequest.Header.Set(cfg.ForwardAuth.IdentityHeader, "admin@example")
+	assetRecorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(assetRecorder, assetRequest)
+	if assetRecorder.Code != http.StatusOK || assetRecorder.Body.String() != "console.log('ok')" || assetRecorder.Header().Get("Cache-Control") != "public, max-age=31536000, immutable" {
+		t.Fatalf("asset response = %d %q headers=%v", assetRecorder.Code, assetRecorder.Body.String(), assetRecorder.Header())
+	}
+
+	missing := httptest.NewRequest(http.MethodGet, "/assets/missing.js", nil)
+	missing = missing.WithContext(WithPeerUID(missing.Context(), cfg.ForwardAuth.PeerUID))
+	missing.Header.Set(cfg.ForwardAuth.IdentityHeader, "admin@example")
+	missingRecorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(missingRecorder, missing)
+	if missingRecorder.Code != http.StatusNotFound {
+		t.Fatalf("missing asset status = %d, body = %s", missingRecorder.Code, missingRecorder.Body.String())
+	}
+}
+
+func TestWebRejectsAPIPathsFromStaticFallback(t *testing.T) {
+	cfg := testManagementConfig(t)
+	server, err := NewWebServer(cfg, NewAuthorityClient(cfg.Authority.SocketPath), fstest.MapFS{
+		"index.html": &fstest.MapFile{Data: []byte("index")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/unknown", nil)
+	request = request.WithContext(WithPeerUID(request.Context(), cfg.ForwardAuth.PeerUID))
+	request.Header.Set(cfg.ForwardAuth.IdentityHeader, "admin@example")
+	request.AddCookie(&http.Cookie{Name: managementSessionCookie, Value: "missing"})
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code == http.StatusOK || strings.Contains(recorder.Body.String(), "index") {
+		t.Fatalf("API path fell through to static assets: %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 

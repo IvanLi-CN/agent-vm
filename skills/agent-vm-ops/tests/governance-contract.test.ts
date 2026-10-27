@@ -16,7 +16,7 @@ test("the five project topics have locked local surfaces", () => {
   expect(quality.required_checks).toEqual(["PR gate (ubuntu-latest)", "PR gate (macos-latest)"]);
   expect(quality.queue_policy.required_pull_request_events).toEqual(["opened", "synchronize", "reopened", "ready_for_review"]);
   expect(quality.queue_policy.queue).toBe("max");
-  expect(json(".github/release-contract.json").product.manifest_format).toBe(3);
+  expect(json(".github/release-contract.json").product.manifest_format).toBe(4);
   expect(json(".github/release-failure-notification.json").transport_selection.status).toBe("unselected");
   const topics = json(".github/topic-contract.json").topics;
   expect(Object.keys(topics).sort()).toEqual([
