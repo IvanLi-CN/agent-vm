@@ -328,6 +328,14 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 	if request.Source.Kind != "local_upload" {
 		return nil, errors.New("invalid_request: trusted imports do not accept upload content")
 	}
+	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "awaiting_upload", "image_import", "running")
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return running, nil
+	}
+	operation = running
 	if request.Source.Format == "unified" {
 		if len(rootfs) != 0 || int64(len(metadata)) != request.Source.ExpectedSize {
 			return s.failImport(ctx, operation, "upload", "invalid_request", "uploaded bytes do not match the declared size", false)
@@ -346,14 +354,6 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 	if s.Options.Backend == nil {
 		return s.failImport(ctx, operation, "image_import", "internal_error", "no image backend is configured", true)
 	}
-	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "awaiting_upload", "image_import", "running")
-	if err != nil {
-		return nil, err
-	}
-	if !claimed {
-		return running, nil
-	}
-	operation = running
 	artifact, err := s.Options.Backend.ImportLocal(ctx, request.Source.Format, metadata, rootfs)
 	if err != nil {
 		status := "failed"
@@ -611,12 +611,23 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 		if stringValue(existing.Request["_request_digest"]) != digest {
 			return nil, errors.New("operation_conflict: operation ID belongs to a different request")
 		}
-		return existing, nil
+		if existing.Status != "queued" {
+			return existing, nil
+		}
+		operation = *existing
 	}
+	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "queued", "native_mutation", "running")
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return running, nil
+	}
+	operation = *running
 	result, mutateErr := mutate()
 	if mutateErr != nil {
 		status := "failed"
-		phase := "reference_check"
+		phase := "native_mutation"
 		if isUncertain(mutateErr) {
 			status, phase = "outcome_unknown", "reconciliation"
 		}
@@ -631,8 +642,10 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	if digestErr != nil {
 		return nil, errors.New("invalid_request: action request cannot be canonicalized")
 	}
-	if existing, err := s.existingOperation(ctx, request.OperationID, digest); err != nil || existing != nil {
-		return existing, err
+	if existing, err := s.existingOperation(ctx, request.OperationID, digest); err != nil {
+		return nil, err
+	} else if existing != nil && existing.Status != "queued" {
+		return existing, nil
 	}
 	if s.Options.Actions == nil {
 		return nil, errors.New("authority_unavailable: action backend is not configured")
@@ -657,21 +670,25 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	if err := validateVMActionFence(task, request.Action, s.Clock()); err != nil {
 		return nil, err
 	}
-	if guard, ok := s.Options.Actions.(VMActionGuard); ok {
-		if err := guard.ValidateVMAction(ctx, *task, request.Action, request.Parameters); err != nil {
-			return nil, err
-		}
+	guard, ok := s.Options.Actions.(VMActionGuard)
+	if !ok {
+		return nil, errors.New("authority_unavailable: VM ownership cannot be verified")
 	}
-	operation, err := s.claimAction(ctx, request.OperationID, request.Actor, request.Reason, request.Action, "vm", request.TaskID, actionRequest)
-	if err != nil || operation != nil && operation.Status != "queued" {
-		return operation, err
-	}
-	if err := s.Store.UpdateManagementOperation(ctx, request.OperationID, func(value *state.ManagementOperation) error {
-		value.Phase, value.Status, value.UpdatedAt = "native_action", "running", s.Clock().UTC().Format(time.RFC3339Nano)
-		return nil
-	}); err != nil {
+	if err := guard.ValidateVMAction(ctx, *task, request.Action, request.Parameters); err != nil {
 		return nil, err
 	}
+	operation, err := s.claimAction(ctx, request.OperationID, request.Actor, request.Reason, request.Action, "vm", request.TaskID, actionRequest)
+	if err != nil {
+		return nil, err
+	}
+	running, claimed, err := s.Store.TransitionManagementOperation(ctx, request.OperationID, "queued", "native_action", "running")
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return running, nil
+	}
+	operation = running
 	latest, err := s.Store.GetTask(ctx, map[string]any{"task_id": request.TaskID})
 	if err != nil {
 		return nil, err
@@ -682,10 +699,8 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	if err := validateVMActionFence(latest, request.Action, s.Clock()); err != nil {
 		return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, safeError(err))
 	}
-	if guard, ok := s.Options.Actions.(VMActionGuard); ok {
-		if err := guard.ValidateVMAction(ctx, *latest, request.Action, request.Parameters); err != nil {
-			return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, safeError(err))
-		}
+	if err := guard.ValidateVMAction(ctx, *latest, request.Action, request.Parameters); err != nil {
+		return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, safeError(err))
 	}
 	result, actionErr := s.Options.Actions.ExecuteVMAction(ctx, request.OperationID, request.Action, request.TaskID, request.ExpectedGeneration, request.Parameters)
 	if actionErr != nil {
@@ -704,8 +719,10 @@ func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceReq
 	if digestErr != nil {
 		return nil, errors.New("invalid_request: maintenance request cannot be canonicalized")
 	}
-	if existing, err := s.existingOperation(ctx, request.OperationID, digest); err != nil || existing != nil {
-		return existing, err
+	if existing, err := s.existingOperation(ctx, request.OperationID, digest); err != nil {
+		return nil, err
+	} else if existing != nil && existing.Status != "queued" {
+		return existing, nil
 	}
 	if s.Options.Actions == nil {
 		return nil, errors.New("authority_unavailable: action backend is not configured")
@@ -727,15 +744,17 @@ func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceReq
 		return nil, fmt.Errorf("stale_target: expected %s, current %s", request.TargetVersion, currentVersion)
 	}
 	operation, err := s.claimAction(ctx, request.OperationID, request.Actor, request.Reason, request.Action, "system", "system", actionRequest)
-	if err != nil || operation != nil && operation.Status != "queued" {
-		return operation, err
-	}
-	if err := s.Store.UpdateManagementOperation(ctx, request.OperationID, func(value *state.ManagementOperation) error {
-		value.Phase, value.Status, value.UpdatedAt = "native_action", "running", s.Clock().UTC().Format(time.RFC3339Nano)
-		return nil
-	}); err != nil {
+	if err != nil {
 		return nil, err
 	}
+	running, claimed, err := s.Store.TransitionManagementOperation(ctx, request.OperationID, "queued", "native_action", "running")
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return running, nil
+	}
+	operation = running
 	latestVersion, versionErr := s.Options.CurrentSystemVersion(ctx)
 	if versionErr != nil {
 		return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, map[string]any{"code": "authority_unavailable", "retryable": true})
@@ -870,6 +889,10 @@ func digestBytes(value []byte) string {
 func safeError(err error) map[string]any {
 	if isUncertain(err) {
 		return map[string]any{"code": "internal_error", "retryable": true}
+	}
+	var transactionErr *state.TransactionError
+	if errors.As(err, &transactionErr) && transactionErr.Cause != nil {
+		err = transactionErr.Cause
 	}
 	var referenceErr *state.ImageReferenceError
 	if errors.As(err, &referenceErr) {

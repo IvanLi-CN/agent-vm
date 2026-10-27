@@ -45,6 +45,10 @@ func (backend *fakeActionBackend) ExecuteMaintenance(context.Context, string, st
 	return map[string]any{"state": "changed"}, backend.err
 }
 
+func (backend *fakeActionBackend) ValidateVMAction(context.Context, state.Task, string, map[string]any) error {
+	return nil
+}
+
 func TestImageImportRejectsBadDigestAndRecordsFailedOperation(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
