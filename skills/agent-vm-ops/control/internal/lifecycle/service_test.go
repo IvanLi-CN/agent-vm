@@ -1145,6 +1145,14 @@ func TestReconcileLeavesUncertainNativeInitAbsenceBlocked(t *testing.T) {
 			}
 			return nil
 		}},
+		{name: "present-owned", configure: func(_ *state.Store, guest *startupGuest, task state.Task) error {
+			guest.configErr = nil
+			guest.config = map[string]any{
+				"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": task.SessionID, "user.agent-vm.generation": "1"},
+				"devices": map[string]any{}, "expanded_devices": map[string]any{},
+			}
+			return nil
+		}},
 		{name: "unavailable", configure: func(_ *state.Store, guest *startupGuest, _ state.Task) error {
 			guest.configErr = errors.New("incus unavailable")
 			return nil
@@ -1214,6 +1222,80 @@ func TestReconcileLeavesUncertainNativeInitAbsenceBlocked(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestReconcileBindsGenerationZeroAcquireAfterTombstone(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-init-generation-tombstone.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	task := insertNativeInitRecoveryTask(t, store, now)
+	lastError := mustJSON(map[string]any{"phase": "native-init", "operation_id": "native-init-tombstone-acquire", "cause": "incus init failed", "outcome_verified": false})
+	if err := store.UpdateTask(context.Background(), task.TaskID, map[string]any{"generation": int64(3), "previous_generation": nil, "last_error": lastError}); err != nil {
+		t.Fatal(err)
+	}
+	task.Generation = 3
+	request := recordPendingLifecycleOperation(t, store, "acquire", task.SessionID, 0, "native-init-tombstone-acquire", true)
+	service := New(store, config.Defaults(), Options{Guest: nativeInitMissingGuest(), Clock: func() time.Time { return now }})
+	if _, err := service.reconcile(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := store.GetTask(context.Background(), map[string]any{"session_id": task.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.State != stateAbsent || recovered.Generation != 3 {
+		t.Fatalf("recovered task = %#v", recovered)
+	}
+	operation, err := store.GetOperation(context.Background(), request["operation_id"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] == "pending" {
+		t.Fatalf("generation-zero operation remained pending: %#v", operation)
+	}
+}
+
+func TestAcquireReusesVerifiedAbsentTaskWithNextGeneration(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "absent-task-reuse.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	task := state.Task{
+		TaskID: "absent-reuse-task", SessionID: "absent-reuse-session", Generation: 3, State: stateAbsent,
+		InstanceName: "agent-absent-reuse", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}",
+	}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	response, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "acquire", "session_id": task.SessionID, "generation": int64(0), "operation_id": "absent-reuse-acquire",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := response["result"].(map[string]any)
+	if result["state"] != stateActive || result["generation"] != int64(4) {
+		t.Fatalf("reused absent task = %#v", result)
+	}
+	if _, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "destroy", "session_id": task.SessionID, "generation": int64(4), "operation_id": "absent-reuse-destroy",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := store.GetTask(context.Background(), map[string]any{"session_id": task.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != nil {
+		t.Fatalf("destroy left reused task = %#v", remaining)
 	}
 }
 

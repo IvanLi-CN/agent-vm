@@ -786,6 +786,26 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	now := s.Clock()
 	deadline := now.Add(time.Duration(s.Config.InitialLeaseSeconds) * time.Second)
 	created := false
+	if task != nil && task.State == stateAbsent {
+		if generation != 0 {
+			return nil, protocol.NewError("generation_mismatch", "a new acquisition from an absent session must start at generation 0", map[string]any{"expected": int64(0), "actual": generation})
+		}
+		ports, portErr := s.Store.ListPorts(ctx, task.TaskID)
+		if portErr != nil {
+			return nil, s.sqliteError(portErr)
+		}
+		if len(ports) != 0 || task.VMIP != nil || task.SSHHostPort != nil || task.LeaseExpiresAt != nil || task.ReservationBytes != 0 || !taskHasZeroResources(task) {
+			return nil, protocol.NewError("task_transition", "absent session retains durable state and cannot be reused", map[string]any{"state": task.State, "outcome_verified": false})
+		}
+		deleted, deleteErr := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateAbsent}})
+		if deleteErr != nil {
+			return nil, s.sqliteError(deleteErr)
+		}
+		if !deleted {
+			return nil, protocol.NewError("task_transition", "absent session changed before reuse", map[string]any{"outcome_verified": false})
+		}
+		task = nil
+	}
 	if task == nil {
 		created = true
 		lease := nowString(deadline)
@@ -857,7 +877,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		}
 		if created {
 			if err := s.Guest.Init(nativeCtx, s.Config.ImageAlias, task.InstanceName); err != nil {
-				return s.failTask(ctx, task, "native-init", err)
+				return s.failTaskForOperation(ctx, task, "native-init", err, stringValue(request["operation_id"]))
 			}
 		}
 		if err := s.setOwnership(nativeCtx, task); err != nil {
@@ -953,6 +973,16 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	if task.State == stateAbsent {
 		if err := s.cancelPendingAcquireOperations(ctx, task); err != nil {
 			return nil, err
+		}
+		if destroy {
+			deleted, deleteErr := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateAbsent}})
+			if deleteErr != nil {
+				return nil, s.sqliteError(deleteErr)
+			}
+			if !deleted {
+				return nil, protocol.NewError("cleanup_incomplete", "session changed before absent task deletion could be committed", map[string]any{"outcome_verified": false})
+			}
+			return s.status(ctx, task.SessionID)
 		}
 		return s.summary(ctx, task)
 	}
@@ -2284,6 +2314,33 @@ func sameResources(left, right map[string]int64) bool {
 	return true
 }
 
+func taskHasZeroResources(task *state.Task) bool {
+	if task == nil {
+		return false
+	}
+	resources := map[string]int64{}
+	if err := json.Unmarshal([]byte(task.ResourcesJSON), &resources); err != nil {
+		return false
+	}
+	for _, key := range resourceKeys {
+		if resources[key] != 0 {
+			return false
+		}
+	}
+	reservation := map[string]int64{}
+	if strings.TrimSpace(task.ResourceReservationJSON) != "" && strings.TrimSpace(task.ResourceReservationJSON) != "{}" {
+		if err := json.Unmarshal([]byte(task.ResourceReservationJSON), &reservation); err != nil {
+			return false
+		}
+		for _, key := range resourceKeys {
+			if reservation[key] != 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func requestHasResourceFields(request protocol.Request) bool {
 	for _, key := range resourceKeys {
 		if _, exists := request[key]; exists {
@@ -2294,7 +2351,18 @@ func requestHasResourceFields(request protocol.Request) bool {
 }
 
 func (s *Service) failTask(ctx context.Context, task *state.Task, phase string, err error) (map[string]any, error) {
+	return s.failTaskWithDetail(ctx, task, nativePhaseDetail(phase, err))
+}
+
+func (s *Service) failTaskForOperation(ctx context.Context, task *state.Task, phase string, err error, operationID string) (map[string]any, error) {
 	detail := nativePhaseDetail(phase, err)
+	if operationID != "" {
+		detail["operation_id"] = operationID
+	}
+	return s.failTaskWithDetail(ctx, task, detail)
+}
+
+func (s *Service) failTaskWithDetail(ctx context.Context, task *state.Task, detail map[string]any) (map[string]any, error) {
 	if stateErr := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
 		detail["state_persisted"] = false
 		detail["state_error"] = stateErr.Error()

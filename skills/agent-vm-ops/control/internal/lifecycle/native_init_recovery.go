@@ -38,14 +38,18 @@ func (s *Service) reconcileVerifiedNativeInitAbsence(ctx context.Context, candid
 			return nil, nativeInitRecoveryBlocked("native-init recovery evidence changed before verification", map[string]any{"task_id": current.TaskID})
 		}
 
-		pending, err := s.verifiedNativeInitPendingOperations(ctx, current)
+		pending, err := s.verifiedNativeInitPendingOperations(ctx, current, failure)
 		if err != nil {
 			return nil, err
 		}
 		if s.Guest == nil {
 			return nil, nativeInitRecoveryBlocked("native-init absence cannot be verified without native access", map[string]any{"task_id": current.TaskID})
 		}
-		if _, ownershipErr := s.verifyOwnership(ctx, current); ownershipErr != nil {
+		if _, ownershipErr := s.verifyOwnership(ctx, current); ownershipErr == nil {
+			return nil, nativeInitRecoveryBlocked("native-init recovery found a present managed instance", map[string]any{
+				"task_id": current.TaskID, "native_present": true, "outcome_verified": true,
+			})
+		} else {
 			control := protocol.AsError(ownershipErr)
 			detail := map[string]any{"task_id": current.TaskID, "cause": ownershipErr.Error()}
 			if nativeDetail, ok := control.Detail.(map[string]any); ok {
@@ -153,7 +157,7 @@ func nativeInitFailureRecord(lastError *string) (map[string]any, bool) {
 	return value, true
 }
 
-func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task *state.Task) ([]state.Operation, error) {
+func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task *state.Task, failure map[string]any) ([]state.Operation, error) {
 	pending, err := s.Store.PendingOperations(ctx)
 	if err != nil {
 		return nil, s.sqliteError(err)
@@ -166,7 +170,7 @@ func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task 
 			continue
 		}
 		detail := map[string]any{"operation_id": operation.OperationID, "task_id": task.TaskID}
-		if operation.Generation == nil || (*operation.Generation != task.Generation && (task.Generation <= 0 || *operation.Generation != previousGeneration)) {
+		if operation.Generation == nil || !nativeInitOperationGenerationMatches(operation, task, failure, previousGeneration) {
 			return nil, nativeInitOperationBlocked("pending operation generation is outside the recovery window", detail)
 		}
 		switch operation.Action {
@@ -211,6 +215,22 @@ func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task 
 		return nil, nativeInitOperationBlocked("native-init recovery has no matching pending journal", map[string]any{"task_id": task.TaskID})
 	}
 	return matched, nil
+}
+
+func nativeInitOperationGenerationMatches(operation state.Operation, task *state.Task, failure map[string]any, previousGeneration int64) bool {
+	if operation.Generation == nil {
+		return false
+	}
+	if *operation.Generation == task.Generation || task.Generation > 0 && *operation.Generation == previousGeneration {
+		return true
+	}
+	// A newly allocated task can follow a deleted task whose generation
+	// tombstone is greater than one, while the public acquire request still
+	// starts at generation zero. Bind that exceptional window to the exact
+	// operation recorded in the native-init failure; never infer it from the
+	// session alone.
+	return operation.Action == "acquire" && *operation.Generation == 0 && task.Generation > 1 &&
+		stringValue(failure["operation_id"]) == operation.OperationID
 }
 
 func nativeInitRecoveryDetail(previous map[string]any, task *state.Task, operationIDs []string) map[string]any {

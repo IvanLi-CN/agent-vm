@@ -2,6 +2,7 @@ package native
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -75,5 +76,28 @@ func TestIncusQueryUsesProjectQueryParameter(t *testing.T) {
 	want := []string{"query", "/1.0/instances/instance-check?project=agents"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("incus argv = %#v, want %#v", got, want)
+	}
+}
+
+func TestIsNotFoundRequiresInstanceSpecificDiagnostic(t *testing.T) {
+	tests := []struct {
+		name   string
+		stderr string
+		want   bool
+	}{
+		{name: "instance missing", stderr: "Error: Instance not found", want: true},
+		{name: "container missing", stderr: "Error: container alpha does not exist", want: true},
+		{name: "no such instance", stderr: "Error: no such instance", want: true},
+		{name: "project missing", stderr: "Error: project not found", want: false},
+		{name: "remote missing", stderr: "Error: remote endpoint does not exist", want: false},
+		{name: "generic 404", stderr: "HTTP 404 Not Found", want: false},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := &CommandError{Result: Result{Stderr: []byte(testCase.stderr)}, Cause: errors.New("incus command failed")}
+			if got := IsNotFound(err); got != testCase.want {
+				t.Fatalf("IsNotFound(%q) = %v, want %v", testCase.stderr, got, testCase.want)
+			}
+		})
 	}
 }

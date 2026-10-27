@@ -139,6 +139,24 @@ func TestTimeoutKillsTheWholeProcessGroupAndBoundsPipeCleanup(t *testing.T) {
 	}
 }
 
+func TestTimeoutDoesNotRecordWorkerAsFinished(t *testing.T) {
+	recorder := &testWorkerRecorder{}
+	ctx, cancel := context.WithTimeout(WithWorkerRecorder(context.Background(), "timeout-operation", recorder), 50*time.Millisecond)
+	defer cancel()
+	_, err := NewRunner().Run(ctx, []string{"/bin/sh", "-c", "sleep 30 & wait"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "timeout") {
+		t.Fatalf("Run error = %v, want a timeout", err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.started) != 1 {
+		t.Fatalf("worker starts = %#v, want one", recorder.started)
+	}
+	if len(recorder.finished) != 0 {
+		t.Fatalf("timed-out worker was recorded finished: %#v", recorder.finished)
+	}
+}
+
 func TestEscapedDescendantIsDetectedAndCleaned(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux process ownership boundary required")

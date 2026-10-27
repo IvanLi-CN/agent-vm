@@ -165,8 +165,9 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	wait := make(chan error, 1)
 	go func() { wait <- command.Wait() }()
 	workerStarted := false
+	workerFinished := false
 	defer func() {
-		if !workerStarted || binding.recorder == nil {
+		if !workerStarted || !workerFinished || binding.recorder == nil {
 			return
 		}
 		if err := binding.recorder.WorkerFinished(ctx, binding.operationID, identity, runErr); err != nil {
@@ -274,6 +275,9 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	<-stderrDone
 	if reapErr := tracker.Reap(); trackingErr == nil {
 		trackingErr = reapErr
+	}
+	if trackingErr == nil {
+		workerFinished = true
 	}
 	result = Result{Code: exitCode(waitErr), Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), StdoutTruncated: stdout.Truncated, StderrTruncated: stderr.Truncated}
 	if trackingErr != nil {
