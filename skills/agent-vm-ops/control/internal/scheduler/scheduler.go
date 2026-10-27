@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
@@ -33,6 +34,8 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInterval time.Duration) error {
 	if err := scheduler.Service.StartupReconcile(ctx); err == nil {
 		scheduler.Service.MarkReady()
+	} else {
+		slog.Warn("startup reconcile failed", "error", err)
 	}
 	go scheduler.sampleLoop(ctx, "admin-metrics", "capacity", 10*time.Second)
 	go scheduler.sampleLoop(ctx, "admin-status", "inventory", 30*time.Second)
@@ -49,6 +52,8 @@ func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInter
 			if !scheduler.Service.Ready() {
 				if err := scheduler.Service.StartupReconcile(ctx); err == nil {
 					scheduler.Service.MarkReady()
+				} else {
+					slog.Warn("startup reconcile failed", "error", err)
 				}
 				continue
 			}
@@ -62,6 +67,8 @@ func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInter
 			if !scheduler.Service.Ready() {
 				if err := scheduler.Service.StartupReconcile(ctx); err == nil {
 					scheduler.Service.MarkReady()
+				} else {
+					slog.Warn("startup reconcile failed", "error", err)
 				}
 				continue
 			}
