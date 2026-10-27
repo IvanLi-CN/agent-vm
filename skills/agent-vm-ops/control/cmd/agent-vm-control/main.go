@@ -155,6 +155,7 @@ func serve(args []string) error {
 		}
 	}
 	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver(), Release: releaseMetadata})
+	imageBackend := management.NewIncusImageBackend(guest, cfg.Management.Upload.StagingPath, cfg.RequiredGuestTools)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	managementOptions := management.Options{
@@ -169,6 +170,7 @@ func serve(args []string) error {
 			return "system:" + epoch, nil
 		},
 		Clock:   time.Now,
+		Backend: imageBackend,
 		Actions: &webadmin.LifecycleActions{Service: service, Store: store},
 	}
 	if cfg.Management.Upload.Enabled {

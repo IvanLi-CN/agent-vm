@@ -42,6 +42,8 @@ try:
         GO_MANIFEST_FORMAT,
         GO_RETIRED_UNITS,
         GO_UNIT_CONTENT_SHA256,
+        HISTORICAL_GO_UNIT_CONTENT_SHA256,
+        HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
         GO_UNIT_EXEC_START,
         LEGACY_PRODUCT_MANIFEST_FORMAT,
         PRODUCT_MANIFEST_FORMAT,
@@ -73,6 +75,8 @@ except ModuleNotFoundError:
         GO_MANIFEST_FORMAT,
         GO_RETIRED_UNITS,
         GO_UNIT_CONTENT_SHA256,
+        HISTORICAL_GO_UNIT_CONTENT_SHA256,
+        HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
         GO_UNIT_EXEC_START,
         LEGACY_PRODUCT_MANIFEST_FORMAT,
         PRODUCT_MANIFEST_FORMAT,
@@ -499,10 +503,22 @@ def _require_owned_regular(path: Path, owner_uid: int, mode: int | None = None) 
         _fail("artifact_mode_mismatch", f"artifact mode differs: {path.name}", {"expected": mode, "actual": stat.S_IMODE(info.st_mode)})
 
 
-def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
+def _require_owned_regular_modes(path: Path, owner_uid: int, modes: tuple[int, ...]) -> None:
+    """Validate a fixed cleanup target against a small historical mode set."""
+    _require_owned_regular(path, owner_uid)
+    try:
+        actual = stat.S_IMODE(path.lstat().st_mode)
+    except OSError:
+        _fail("artifact_unverified", f"artifact cannot be inspected: {path.name}")
+    if actual not in modes:
+        _fail("artifact_mode_mismatch", f"artifact mode differs: {path.name}", {"expected": list(modes), "actual": actual})
+
+
+def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_historical_content: bool = False) -> None:
     if _is_product_manifest(manifest):
         expected_units = PRODUCT_UNIT_EXEC_START if manifest["format"] == PRODUCT_MANIFEST_FORMAT else {"agent-vm-native.service": PRODUCT_UNIT_EXEC_START["agent-vm-native.service"]}
         expected_hashes = PRODUCT_UNIT_CONTENT_SHA256
+        historical_hashes = HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256
         for item in manifest["artifacts"]:
             if item["role"] != "unit":
                 continue
@@ -514,7 +530,10 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 _fail("unit_unverified", f"unit cannot be read: {name}")
-            if sha256_file(path) != expected_hashes[name]:
+            accepted_hashes = {expected_hashes[name]}
+            if allow_historical_content and name in historical_hashes:
+                accepted_hashes.update(historical_hashes[name])
+            if sha256_file(path) not in accepted_hashes:
                 _fail("unit_unverified", f"unit bytes differ from the fixed product policy: {name}")
             if expected_units[name] not in content or "ExecStart=" not in content:
                 _fail("unit_unverified", f"unit does not contain its fixed ExecStart: {name}")
@@ -533,7 +552,10 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 _fail("unit_unverified", f"unit cannot be read: {name}")
-            if sha256_file(path) != GO_UNIT_CONTENT_SHA256[name]:
+            accepted_hashes = {GO_UNIT_CONTENT_SHA256[name]}
+            if allow_historical_content and name in HISTORICAL_GO_UNIT_CONTENT_SHA256:
+                accepted_hashes.update(HISTORICAL_GO_UNIT_CONTENT_SHA256[name])
+            if sha256_file(path) not in accepted_hashes:
                 _fail("unit_unverified", f"unit bytes differ from the fixed Go policy: {name}")
             if GO_UNIT_EXEC_START[name] not in content or "ExecStart=" not in content:
                 _fail("unit_unverified", f"unit does not contain its fixed ExecStart: {name}")
@@ -575,7 +597,12 @@ def _reject_transaction_extras(root: Path, manifest: Mapping[str, Any]) -> None:
             _fail("artifact_unverified", "transaction contains an unallowlisted file", {"path": path.relative_to(root).as_posix()})
 
 
-def _verify_fixed_artifacts(config: Mapping[str, Any], manifest: Mapping[str, Any]) -> None:
+def _verify_fixed_artifacts(
+    config: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    allow_historical_web_config_mode: bool = False,
+) -> None:
     declared = {(item["role"], item["path"]) for item in manifest["artifacts"]}
     if _is_product_manifest(manifest):
         expected_values = PRODUCT_LINUX_ARTIFACTS if manifest["format"] == PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_LEGACY_ARTIFACTS
@@ -584,7 +611,14 @@ def _verify_fixed_artifacts(config: Mapping[str, Any], manifest: Mapping[str, An
             _fail("artifact_unverified", "manifest artifact set differs from the fixed product release allowlist", {"expected": sorted(expected), "actual": sorted(declared)})
         expected_modes = {(role, path): mode for _, path, role, mode in expected_values}
         for item in manifest["artifacts"]:
-            if item["mode"] != expected_modes[(item["role"], item["path"])]:
+            expected_mode = expected_modes[(item["role"], item["path"])]
+            historical_mode = (
+                allow_historical_web_config_mode
+                and manifest["format"] == PRODUCT_MANIFEST_FORMAT
+                and item["path"] == "config/agent-vm-web.json.example"
+                and item["mode"] == 0o644
+            )
+            if item["mode"] != expected_mode and not historical_mode:
                 _fail("artifact_mode_mismatch", f"fixed product release artifact mode differs: {item['path']}")
         return
     if _is_go_manifest(manifest):
@@ -735,22 +769,22 @@ def _current_target(link: Path, release_root: Path | None = None) -> Path | None
 def _verify_retained_release(config: Mapping[str, Any], target: Path) -> dict[str, Any]:
     """Re-verify a release before using it as an activation or rollback target."""
     try:
-        manifest = load_release_manifest(target / MANIFEST_NAME)
+        manifest = load_release_manifest(target / MANIFEST_NAME, allow_historical_web_config_mode=True)
         if _is_go_manifest(manifest):
             verify_go_bundle(target, manifest)
         elif _is_product_manifest(manifest):
             from release_manifest import verify_product_bundle
-            verify_product_bundle(target, manifest)
+            verify_product_bundle(target, manifest, allow_historical_web_config_mode=True)
         else:
             verify_bundle(target, manifest)
-        verify_client_sidecar(target, manifest)
+        verify_client_sidecar(target, manifest, allow_historical_web_config_mode=True)
     except ManifestError as exc:
         _fail("activation_unverified", "retained release cannot be verified", exc.as_dict())
     _reject_transaction_extras(target, manifest)
-    _verify_fixed_artifacts(config, manifest)
+    _verify_fixed_artifacts(config, manifest, allow_historical_web_config_mode=True)
     _verify_python_syntax(target, manifest)
     _verify_typescript_syntax(target, manifest)
-    _verify_unit_contents(target, manifest)
+    _verify_unit_contents(target, manifest, allow_historical_content=True)
     owner_uid = int(config["owner_uid"])
     _require_owned_regular(target / MANIFEST_NAME, owner_uid, 0o644)
     _require_owned_regular(target / "client-release.json", owner_uid, 0o644)
@@ -802,7 +836,7 @@ def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
 
 
 def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
-    go_bundle_root = _go_control_target(config).parent
+    bundle_root = Path(config["control_path"]).parent
     targets = (
         Path(config["control_path"]),
         _go_control_target(config),
@@ -813,10 +847,10 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
         Path(config["control_path"]).with_name(MANIFEST_NAME),
         Path(config["control_path"]).with_name("client-release.json"),
     ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], "agent-vm-native.service", "agent-vm-web.service")) + (
-        go_bundle_root / "systemd" / "agent-vm-native.service",
-        go_bundle_root / "systemd" / "agent-vm-web.service",
-        go_bundle_root / "config" / "agent-vm-web.json.example",
-        go_bundle_root / "web-assets.manifest.json",
+        bundle_root / "systemd" / "agent-vm-native.service",
+        bundle_root / "systemd" / "agent-vm-web.service",
+        bundle_root / "config" / "agent-vm-web.json.example",
+        bundle_root / "web-assets.manifest.json",
     )
     return tuple(dict.fromkeys(targets))
 
@@ -1159,7 +1193,7 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
 def _install_product_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
     """Install the complete format-4 product without replacing live Web config."""
     owner_uid = int(config["owner_uid"])
-    bundle_root = _go_control_target(config).parent
+    bundle_root = Path(config["control_path"]).parent
     expected_values = PRODUCT_LINUX_ARTIFACTS if manifest["format"] == PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_LEGACY_ARTIFACTS
     expected_support = {path for _, path, role, _ in expected_values if role == "support"}
     installed_support: set[str] = set()
@@ -1212,7 +1246,10 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
             bundle_root / "web-assets.manifest.json",
         ):
             if target.exists() or target.is_symlink():
-                _require_owned_regular(target, owner_uid, 0o644)
+                if target.name == "agent-vm-web.json.example":
+                    _require_owned_regular_modes(target, owner_uid, (0o640, 0o644))
+                else:
+                    _require_owned_regular(target, owner_uid, 0o644)
                 try:
                     target.unlink()
                     _fsync_directory(target.parent, "activation_failed")
@@ -1291,7 +1328,10 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
         go_bundle_root / "web-assets.manifest.json",
     ):
         if target.exists() or target.is_symlink():
-            _require_owned_regular(target, owner_uid, 0o644)
+            if target.name == "agent-vm-web.json.example":
+                _require_owned_regular_modes(target, owner_uid, (0o640, 0o644))
+            else:
+                _require_owned_regular(target, owner_uid, 0o644)
             try:
                 target.unlink()
                 _fsync_directory(target.parent, "activation_failed")

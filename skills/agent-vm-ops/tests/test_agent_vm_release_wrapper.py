@@ -227,6 +227,13 @@ class WrapperTests(unittest.TestCase):
         self.assertNotIn(["systemctl", "is-enabled", "--quiet", "agent-vm-web.service"], commands)
         self.assertIn(["systemctl", "start", "agent-vm-web.service"], commands)
 
+    def test_product_bundle_targets_use_the_control_bundle_root(self):
+        targets = WRAPPER._activation_targets(self.loaded)
+        bundle_root = Path(self.loaded["control_path"]).parent
+        self.assertIn(bundle_root / "config" / "agent-vm-web.json.example", targets)
+        self.assertIn(bundle_root / "systemd" / "agent-vm-web.service", targets)
+        self.assertNotIn(bundle_root / "bin" / "config" / "agent-vm-web.json.example", targets)
+
     def test_missing_legacy_enable_and_disable_are_allowed_but_other_failures_are_not(self):
         missing = subprocess.CompletedProcess(
             [], 1, b"", b"Failed to disable unit: Unit agent-vm-native-age-gc.service does not exist\n",

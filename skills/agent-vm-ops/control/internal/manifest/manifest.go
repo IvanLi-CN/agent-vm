@@ -103,7 +103,7 @@ var productLegacyArtifacts = []artifactSpec{
 
 var productArtifacts = append(append([]artifactSpec(nil), productLegacyArtifacts...),
 	artifactSpec{name: "unit:agent-vm-web.service", path: "systemd/agent-vm-web.service", role: "unit", mode: 0o644},
-	artifactSpec{name: "web-config-example", path: "config/agent-vm-web.json.example", role: "support", mode: 0o644},
+	artifactSpec{name: "web-config-example", path: "config/agent-vm-web.json.example", role: "support", mode: 0o640},
 	artifactSpec{name: "web-assets-manifest", path: "web-assets.manifest.json", role: "support", mode: 0o644},
 )
 

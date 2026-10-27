@@ -142,7 +142,7 @@ GO_UNIT_EXEC_START = {
         "ExecStart=/opt/agent-vm-native/bin/agent-vm-control serve --config /etc/agent-vm-native/config.json --manifest /opt/agent-vm-native/release-manifest.json",
 }
 GO_UNIT_CONTENT_SHA256 = {
-    "agent-vm-native.service": "447f9c09e9378919673708944a45c06d8498308d5613849ff6497103dd1577bb",
+    "agent-vm-native.service": "834cd02f2afbc10d463d79375e8a1aa9d1e2e94157bfaed96476295744817cc6",
 }
 PRODUCT_UNIT_EXEC_START = {
     "agent-vm-native.service": GO_UNIT_EXEC_START["agent-vm-native.service"],
@@ -150,7 +150,21 @@ PRODUCT_UNIT_EXEC_START = {
 }
 PRODUCT_UNIT_CONTENT_SHA256 = {
     "agent-vm-native.service": GO_UNIT_CONTENT_SHA256["agent-vm-native.service"],
-    "agent-vm-web.service": "f7dd481311850d4d1349000b920867208fb43a5b9da16a4f4f617e6f15d28b7b",
+    "agent-vm-web.service": "50eecb2b8dd88f0532b4546fb5555e069f3ef557e9228d45ff84e56e6a356d0d",
+}
+HISTORICAL_GO_UNIT_CONTENT_SHA256 = {
+    "agent-vm-native.service": (
+        "b2a51821a26ce6b54f8cd7e1244896de27b08892ec239400b38ed36bfcad44d4",
+        "834cd02f2afbc10d463d79375e8a1aa9d1e2e94157bfaed96476295744817cc6",
+        "447f9c09e9378919673708944a45c06d8498308d5613849ff6497103dd1577bb",
+    ),
+}
+HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256 = {
+    "agent-vm-native.service": HISTORICAL_GO_UNIT_CONTENT_SHA256["agent-vm-native.service"],
+    "agent-vm-web.service": (
+        "50eecb2b8dd88f0532b4546fb5555e069f3ef557e9228d45ff84e56e6a356d0d",
+        "f7dd481311850d4d1349000b920867208fb43a5b9da16a4f4f617e6f15d28b7b",
+    ),
 }
 GO_FIXED_ARTIFACTS = frozenset({
     ("agent_vm.ts", "agent_vm.ts", "client", 0o755),
@@ -187,7 +201,7 @@ PRODUCT_LINUX_LEGACY_ARTIFACTS = GO_FIXED_ARTIFACTS
 PRODUCT_LINUX_ARTIFACTS = frozenset({
     *PRODUCT_LINUX_LEGACY_ARTIFACTS,
     ("unit:agent-vm-web.service", "systemd/agent-vm-web.service", "unit", 0o644),
-    ("web-config-example", "config/agent-vm-web.json.example", "support", 0o644),
+    ("web-config-example", "config/agent-vm-web.json.example", "support", 0o640),
     ("web-assets-manifest", "web-assets.manifest.json", "support", 0o644),
 })
 
@@ -606,7 +620,7 @@ def validate_go_manifest(value: Any) -> dict[str, Any]:
     }
 
 
-def validate_product_manifest(value: Any) -> dict[str, Any]:
+def validate_product_manifest(value: Any, *, allow_historical_web_config_mode: bool = False) -> dict[str, Any]:
     """Validate the SemVer product manifest without executing its artifacts."""
     root = _require_mapping(value, "manifest")
     format_value = _require_int(root.get("format"), "format", 1)
@@ -645,7 +659,17 @@ def validate_product_manifest(value: Any) -> dict[str, Any]:
         paths.add(item["path"])
         artifacts.append(item)
     actual_shape = {(item["name"], item["path"], item["role"], item["mode"]) for item in artifacts}
-    if actual_shape != expected_artifacts:
+    accepted_shapes = {frozenset(expected_artifacts)}
+    if (
+        allow_historical_web_config_mode
+        and format_value == PRODUCT_MANIFEST_FORMAT
+        and target["os"] == "linux"
+    ):
+        accepted_shapes.add(frozenset({
+            *expected_artifacts,
+            ("web-config-example", "config/agent-vm-web.json.example", "support", 0o644),
+        } - {("web-config-example", "config/agent-vm-web.json.example", "support", 0o640)}))
+    if frozenset(actual_shape) not in accepted_shapes:
         raise _error("manifest_artifact_set_invalid", "product artifact set differs from the fixed target allowlist", {"expected": sorted(expected_artifacts), "actual": sorted(actual_shape)})
 
     actions = _validate_go_actions(root["actions"])
@@ -720,7 +744,7 @@ def load_manifest(path: Path) -> dict[str, Any]:
     return validate_manifest(value)
 
 
-def load_release_manifest(path: Path) -> dict[str, Any]:
+def load_release_manifest(path: Path, *, allow_historical_web_config_mode: bool = False) -> dict[str, Any]:
     """Load either supported release format; legacy callers keep load_manifest."""
     try:
         info = path.lstat()
@@ -735,7 +759,7 @@ def load_release_manifest(path: Path) -> dict[str, Any]:
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise _error("manifest_invalid", "release manifest is not valid UTF-8 JSON") from exc
     if isinstance(value, Mapping) and value.get("format") in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
-        return validate_product_manifest(value)
+        return validate_product_manifest(value, allow_historical_web_config_mode=allow_historical_web_config_mode)
     if isinstance(value, Mapping) and value.get("format") == GO_MANIFEST_FORMAT:
         return validate_go_manifest(value)
     return validate_manifest(value)
@@ -820,12 +844,20 @@ def verify_go_bundle(root: Path, manifest: Mapping[str, Any] | None = None) -> d
     return checked
 
 
-def verify_product_bundle(root: Path, manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """Verify format-3 artifact bytes, modes, and target ELF headers."""
+def verify_product_bundle(
+    root: Path,
+    manifest: Mapping[str, Any] | None = None,
+    *,
+    allow_historical_web_config_mode: bool = False,
+) -> dict[str, Any]:
+    """Verify product artifact bytes, modes, and target ELF headers."""
     root = root.resolve()
     if not root.is_dir():
         raise _error("bundle_invalid", "bundle root is not a directory")
-    checked = validate_product_manifest(manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME))
+    checked = validate_product_manifest(
+        manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME),
+        allow_historical_web_config_mode=allow_historical_web_config_mode,
+    )
     for item in checked["artifacts"]:
         artifact = _resolve_regular(root, item["path"])
         _verify_artifact_file(artifact, item)
@@ -882,10 +914,22 @@ def verify_runtime_bundle(manifest: Mapping[str, Any], artifact_paths: Mapping[s
     return checked
 
 
-def verify_client_sidecar(root: Path, manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def verify_client_sidecar(
+    root: Path,
+    manifest: Mapping[str, Any] | None = None,
+    *,
+    allow_historical_web_config_mode: bool = False,
+) -> dict[str, Any]:
     """Verify the derived client-only sidecar without making it an artifact."""
     root = root.resolve()
-    checked = validate_release_manifest(manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME))
+    candidate = manifest if manifest is not None else load_release_manifest(
+        root / MANIFEST_NAME,
+        allow_historical_web_config_mode=allow_historical_web_config_mode,
+    )
+    if isinstance(candidate, Mapping) and candidate.get("format") in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
+        checked = validate_product_manifest(candidate, allow_historical_web_config_mode=allow_historical_web_config_mode)
+    else:
+        checked = validate_release_manifest(candidate)
     sidecar_path = _resolve_regular(root, CLIENT_SIDECAR_NAME)
     try:
         with sidecar_path.open("r", encoding="utf-8") as handle:

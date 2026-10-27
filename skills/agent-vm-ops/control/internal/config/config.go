@@ -18,6 +18,11 @@ import (
 
 const defaultManagementSessionTTLSeconds int64 = 900
 
+var (
+	guestToolPattern          = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
+	trustedImageSourcePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
+)
+
 type ForwardAuthConfig struct {
 	SocketPath     string `json:"socket_path"`
 	PeerUID        int    `json:"peer_uid"`
@@ -63,6 +68,7 @@ type Config struct {
 	Pool                               string           `json:"pool"`
 	HostAddress                        string           `json:"host_address"`
 	StoragePath                        string           `json:"storage_path"`
+	RequiredGuestTools                 []string         `json:"required_guest_tools"`
 	VMIPStart                          string           `json:"vm_ip_start"`
 	VMIPEnd                            string           `json:"vm_ip_end"`
 	GatewayIP                          string           `json:"gateway_ip"`
@@ -111,6 +117,7 @@ func Defaults() Config {
 		ReleaseFencePath:                   "/run/agent-vm-native/release-activation.fence",
 		MetricsDir:                         "/run/agent-vm-native/metrics",
 		TimerDir:                           "/run/agent-vm-native/timers",
+		RequiredGuestTools:                 []string{"bun", "python3", "sshd", "rsync", "docker", "growpart"},
 		Management: ManagementConfig{
 			SessionTTLSeconds: defaultManagementSessionTTLSeconds,
 			ForwardAuth:       ForwardAuthConfig{IdentityHeader: "X-Forwarded-User"},
@@ -262,6 +269,9 @@ func (c Config) Validate() error {
 			return errors.New("config_invalid: management.forward_auth.socket_path must be distinct from the authority socket")
 		}
 	}
+	if err := validateGuestTools(c.RequiredGuestTools); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -309,6 +319,11 @@ func (c ManagementConfig) Validate(webOnly bool) error {
 	if err := validateUniqueIDs("management.trusted_image_source_ids", c.TrustedImageSourceIDs, false); err != nil {
 		return err
 	}
+	for _, sourceID := range c.TrustedImageSourceIDs {
+		if !trustedImageSourcePattern.MatchString(sourceID) {
+			return errors.New("config_invalid: management.trusted_image_source_ids contains an invalid Incus remote name")
+		}
+	}
 	if c.Upload.Enabled {
 		if c.Upload.MaxBytes <= 0 {
 			return errors.New("config_invalid: management.upload.max_bytes must be positive when uploads are enabled")
@@ -342,6 +357,20 @@ func validateUniqueIDs(name string, values []string, requireNonEmpty bool) error
 		}
 		if _, exists := seen[value]; exists {
 			return fmt.Errorf("config_invalid: %s contains duplicate values", name)
+		}
+		seen[value] = struct{}{}
+	}
+	return nil
+}
+
+func validateGuestTools(values []string) error {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if !guestToolPattern.MatchString(value) {
+			return errors.New("config_invalid: required_guest_tools contains an invalid command name")
+		}
+		if _, exists := seen[value]; exists {
+			return errors.New("config_invalid: required_guest_tools contains duplicate values")
 		}
 		seen[value] = struct{}{}
 	}

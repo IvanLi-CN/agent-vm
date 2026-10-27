@@ -132,3 +132,25 @@ func TestManagementConfigRequiresSeparateAuthenticatedBoundaries(t *testing.T) {
 		t.Fatalf("root staging error = %v", err)
 	}
 }
+
+func TestManagementConfigRejectsUnsafeIncusRemoteNames(t *testing.T) {
+	value := validConfig()
+	value.Management = ManagementConfig{
+		Enabled: true, ExternalOrigin: "https://console.example",
+		ForwardAuth:          ForwardAuthConfig{SocketPath: "/run/proxy.sock", PeerUID: 1001, IdentityHeader: "X-Forwarded-User"},
+		AllowedAdminSubjects: []string{"admin@example"}, WebUID: 1002,
+		TrustedImageSourceIDs: []string{"approved/remote"},
+		Authority:             ManagementAuthorityConfig{SocketPath: "/run/authority.sock", ExpectedWebUID: 1002},
+	}
+	if err := value.Validate(); err == nil || !strings.Contains(err.Error(), "invalid Incus remote name") {
+		t.Fatalf("unsafe remote error = %v", err)
+	}
+}
+
+func TestConfigRejectsUnsafeRequiredGuestTools(t *testing.T) {
+	value := validConfig()
+	value.RequiredGuestTools = []string{"bun;id"}
+	if err := value.Validate(); err == nil || !strings.Contains(err.Error(), "required_guest_tools") {
+		t.Fatalf("unsafe guest tool error = %v", err)
+	}
+}

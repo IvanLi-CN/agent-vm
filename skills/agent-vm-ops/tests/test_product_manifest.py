@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import sys
 import tempfile
@@ -85,6 +86,21 @@ class ProductManifestTests(unittest.TestCase):
             self.assertEqual(verify_product_bundle(root, manifest), manifest)
             self.assertIn("systemd/agent-vm-web.service", {item["path"] for item in manifest["artifacts"]})
             self.assertIn("web-assets.manifest.json", {item["path"] for item in manifest["artifacts"]})
+
+            historical = copy.deepcopy(manifest)
+            historical_web = next(item for item in historical["artifacts"] if item["path"] == "config/agent-vm-web.json.example")
+            historical_web["mode"] = 0o644
+            (root / historical_web["path"]).chmod(0o644)
+            with self.assertRaises(Exception):
+                validate_product_manifest(historical)
+            self.assertEqual(
+                validate_product_manifest(historical, allow_historical_web_config_mode=True),
+                historical,
+            )
+            self.assertEqual(
+                verify_product_bundle(root, historical, allow_historical_web_config_mode=True),
+                historical,
+            )
 
 
 if __name__ == "__main__":
