@@ -6,10 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 )
+
+var missingInstanceDiagnostic = regexp.MustCompile(`\b(?:instance|container|virtual machine)(?:\s+(?:"[^"]+"|'[^']+'|[A-Za-z0-9_.:@/-]+))?\s+(?:not found|does not exist)\b`)
 
 type Guest interface {
 	Init(context.Context, string, string) error
@@ -74,8 +77,7 @@ func IsNotFound(err error) bool {
 		if strings.Contains(line, "no such instance") || strings.Contains(line, "no such container") {
 			return true
 		}
-		hasInstance := strings.Contains(line, "instance") || strings.Contains(line, "container") || strings.Contains(line, "virtual machine")
-		if hasInstance && (strings.Contains(line, "not found") || strings.Contains(line, "does not exist")) {
+		if missingInstanceDiagnostic.MatchString(line) {
 			return true
 		}
 	}

@@ -1023,6 +1023,10 @@ func recordPendingLifecycleOperation(t *testing.T, store *state.Store, action, s
 		}
 		response["_request"] = map[string]any(request)
 		response["_request_digest"] = digest
+		response["worker"] = map[string]any{
+			"pid": 1234, "start_time": "1", "process_group": 1234,
+			"state": "finished", "finished_at": "2026-10-27T00:00:00Z",
+		}
 	}
 	if err := store.RecordOperation(context.Background(), operationID, action, stringPointer(session), &generation, response); err != nil {
 		t.Fatal(err)
@@ -1129,6 +1133,90 @@ func TestReconcileRecoversVerifiedNativeInitAbsence(t *testing.T) {
 	}
 }
 
+func TestNativeInitRecoveryRequiresVerifiedExitedWorkers(t *testing.T) {
+	cases := []struct {
+		name   string
+		worker map[string]any
+	}{
+		{name: "missing", worker: nil},
+		{name: "starting", worker: map[string]any{"state": "starting"}},
+		{name: "running", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "running"}},
+		{name: "orphaned", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "orphaned", "observed_at": "2026-10-27T00:00:00Z"}},
+		{name: "timed-out", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "finished", "finished_at": "2026-10-27T00:00:00Z", "timed_out": true}},
+		{name: "malformed", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "finished"}},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-init-worker.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+			task := insertNativeInitRecoveryTask(t, store, now)
+			recordPendingLifecycleOperation(t, store, "acquire", task.SessionID, 0, "native-init-worker-"+testCase.name, true)
+			if err := store.UpdateOperationResponse(context.Background(), "native-init-worker-"+testCase.name, func(response map[string]any) error {
+				if testCase.worker == nil {
+					delete(response, "worker")
+				} else {
+					response["worker"] = testCase.worker
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			service := New(store, config.Defaults(), Options{Guest: nativeInitMissingGuest(), Clock: func() time.Time { return now }})
+			recovered, err := service.reconcileVerifiedNativeInitAbsence(context.Background(), task, "")
+			if !recovered || err == nil {
+				t.Fatalf("worker state unexpectedly recovered: recovered=%v err=%v", recovered, err)
+			}
+			current, err := store.GetTask(context.Background(), map[string]any{"session_id": task.SessionID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if current == nil || current.State != stateFailed || current.ReservationBytes != task.ReservationBytes {
+				t.Fatalf("blocked task changed = %#v", current)
+			}
+			pending, err := store.PendingOperations(context.Background())
+			if err != nil || len(pending) != 1 {
+				t.Fatalf("blocked operations = %#v, err=%v", pending, err)
+			}
+		})
+	}
+}
+
+func TestAdminReconcileExcludesItsOwnPendingJournalFromNativeInitProof(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-init-admin-journal.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	task := insertNativeInitRecoveryTask(t, store, now)
+	recordPendingLifecycleOperation(t, store, "acquire", task.SessionID, 0, "native-init-admin-acquire", true)
+	service := New(store, config.Defaults(), Options{Guest: nativeInitMissingGuest(), Clock: func() time.Time { return now }})
+	response, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "admin-reconcile", "session_id": task.SessionID,
+		"generation": int64(0), "operation_id": "native-init-admin-reconcile", "apply": true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response["outcome"] != "success" {
+		t.Fatalf("admin reconcile response = %#v", response)
+	}
+	recovered, err := store.GetTask(context.Background(), map[string]any{"session_id": task.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.State != stateAbsent {
+		t.Fatalf("admin reconcile task = %#v", recovered)
+	}
+	if pending, err := store.PendingOperations(context.Background()); err != nil || len(pending) != 0 {
+		t.Fatalf("admin reconcile journals = %#v, err=%v", pending, err)
+	}
+}
+
 func TestReconcileLeavesUncertainNativeInitAbsenceBlocked(t *testing.T) {
 	cases := []struct {
 		name        string
@@ -1225,6 +1313,39 @@ func TestReconcileLeavesUncertainNativeInitAbsenceBlocked(t *testing.T) {
 	}
 }
 
+func TestNativeInitRecoveryRequiresJournalRequestGeneration(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-init-missing-generation.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	task := insertNativeInitRecoveryTask(t, store, now)
+	request := map[string]any{
+		"protocol": protocol.Version, "action": "acquire", "session_id": task.SessionID,
+		"operation_id": "native-init-missing-generation", "generation": int64(0),
+	}
+	digest, err := protocol.Digest(protocol.Request(request))
+	if err != nil {
+		t.Fatal(err)
+	}
+	delete(request, "generation")
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "native-init-missing-generation", "acquire", stringPointer(task.SessionID), &generation, map[string]any{
+		"outcome": "pending", "_request": request, "_request_digest": digest,
+		"worker": map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "finished", "finished_at": "2026-10-27T00:00:00Z"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Guest: nativeInitMissingGuest(), Clock: func() time.Time { return now }})
+	if recovered, err := service.reconcileVerifiedNativeInitAbsence(context.Background(), task, ""); !recovered || err == nil {
+		t.Fatalf("missing generation unexpectedly recovered: recovered=%v err=%v", recovered, err)
+	}
+	if pending, err := store.PendingOperations(context.Background()); err != nil || len(pending) != 1 {
+		t.Fatalf("missing generation journals = %#v, err=%v", pending, err)
+	}
+}
+
 func TestReconcileBindsGenerationZeroAcquireAfterTombstone(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-init-generation-tombstone.sqlite3"))
 	if err != nil {
@@ -1266,9 +1387,10 @@ func TestAcquireReusesVerifiedAbsentTaskWithNextGeneration(t *testing.T) {
 	}
 	defer store.Close()
 	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	recoveryMarker := mustJSON(map[string]any{"phase": "native-init", "native_init_recovered_absent": true, "outcome_verified": true})
 	task := state.Task{
 		TaskID: "absent-reuse-task", SessionID: "absent-reuse-session", Generation: 3, State: stateAbsent,
-		InstanceName: "agent-absent-reuse", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		InstanceName: "agent-absent-reuse", CreatedAt: nowString(now), UpdatedAt: nowString(now), LastError: &recoveryMarker,
 		ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}",
 	}
 	if err := store.InsertTask(context.Background(), task); err != nil {
@@ -1296,6 +1418,79 @@ func TestAcquireReusesVerifiedAbsentTaskWithNextGeneration(t *testing.T) {
 	}
 	if remaining != nil {
 		t.Fatalf("destroy left reused task = %#v", remaining)
+	}
+}
+
+func TestAcquireLeavesAbsentTaskWithResidualCleanupMetadataBlocked(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "absent-task-residual.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	inactive := nowString(now)
+	task := state.Task{
+		TaskID: "absent-residual-task", SessionID: "absent-residual-session", Generation: 1, State: stateAbsent,
+		InstanceName: "agent-absent-residual", InactiveSince: &inactive, CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}",
+	}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Guest: nativeInitMissingGuest(), Clock: func() time.Time { return now }})
+	_, dispatchErr := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "acquire", "session_id": task.SessionID,
+		"generation": int64(0), "operation_id": "absent-residual-acquire",
+	})
+	if dispatchErr == nil || protocol.AsError(dispatchErr).Code != "task_transition" {
+		t.Fatalf("residual acquire error = %#v", dispatchErr)
+	}
+	current, err := store.GetTask(context.Background(), map[string]any{"session_id": task.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current == nil || current.State != stateAbsent || current.InactiveSince == nil {
+		t.Fatalf("residual absent task changed = %#v", current)
+	}
+}
+
+func TestDestroyLeavesAbsentTaskWithOtherPendingJournalBlocked(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "absent-task-pending.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	task := state.Task{
+		TaskID: "absent-pending-task", SessionID: "absent-pending-session", Generation: 1, State: stateAbsent,
+		InstanceName: "agent-absent-pending", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}",
+	}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	recordPendingLifecycleOperation(t, store, "release", task.SessionID, task.Generation, "absent-pending-release", true)
+	service := New(store, config.Defaults(), Options{Guest: nativeInitMissingGuest(), Clock: func() time.Time { return now }})
+	_, dispatchErr := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "destroy", "session_id": task.SessionID,
+		"generation": task.Generation, "operation_id": "absent-pending-destroy",
+	})
+	if dispatchErr == nil || protocol.AsError(dispatchErr).Code != "task_transition" {
+		t.Fatalf("pending destroy error = %#v", dispatchErr)
+	}
+	current, err := store.GetTask(context.Background(), map[string]any{"session_id": task.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current == nil || current.State != stateAbsent {
+		t.Fatalf("pending absent task changed = %#v", current)
+	}
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 2 || pending[0].OperationID != "absent-pending-release" || pending[1].OperationID != "absent-pending-destroy" {
+		t.Fatalf("pending journals = %#v", pending)
 	}
 }
 

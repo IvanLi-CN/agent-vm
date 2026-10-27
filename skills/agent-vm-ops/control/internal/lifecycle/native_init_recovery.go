@@ -3,7 +3,9 @@ package lifecycle
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
+	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
@@ -12,7 +14,7 @@ import (
 // reconcileVerifiedNativeInitAbsence handles only the durable residue of an
 // acquire that failed before an owned native instance existed. The caller
 // must keep ordinary failed/closing cleanup available for every other phase.
-func (s *Service) reconcileVerifiedNativeInitAbsence(ctx context.Context, candidate state.Task) (bool, error) {
+func (s *Service) reconcileVerifiedNativeInitAbsence(ctx context.Context, candidate state.Task, excludedOperationID string) (bool, error) {
 	if candidate.State != stateFailed && candidate.State != stateClosing {
 		return false, nil
 	}
@@ -38,7 +40,7 @@ func (s *Service) reconcileVerifiedNativeInitAbsence(ctx context.Context, candid
 			return nil, nativeInitRecoveryBlocked("native-init recovery evidence changed before verification", map[string]any{"task_id": current.TaskID})
 		}
 
-		pending, err := s.verifiedNativeInitPendingOperations(ctx, current, failure)
+		pending, err := s.verifiedNativeInitPendingOperations(ctx, current, failure, excludedOperationID)
 		if err != nil {
 			return nil, err
 		}
@@ -157,7 +159,7 @@ func nativeInitFailureRecord(lastError *string) (map[string]any, bool) {
 	return value, true
 }
 
-func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task *state.Task, failure map[string]any) ([]state.Operation, error) {
+func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task *state.Task, failure map[string]any, excludedOperationID string) ([]state.Operation, error) {
 	pending, err := s.Store.PendingOperations(ctx)
 	if err != nil {
 		return nil, s.sqliteError(err)
@@ -167,6 +169,9 @@ func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task 
 	acquireCount := 0
 	for _, operation := range pending {
 		if operation.SessionID == nil || *operation.SessionID != task.SessionID {
+			continue
+		}
+		if excludedOperationID != "" && operation.OperationID == excludedOperationID {
 			continue
 		}
 		detail := map[string]any{"operation_id": operation.OperationID, "task_id": task.TaskID}
@@ -181,6 +186,9 @@ func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task 
 		if operation.Action == "acquire" {
 			acquireCount++
 		}
+		if err := verifyNativeInitWorker(operation); err != nil {
+			return nil, nativeInitOperationBlocked(err.Error(), detail)
+		}
 		requestValue, ok := operation.Response["_request"].(map[string]any)
 		if !ok {
 			return nil, nativeInitOperationBlocked("pending operation request is missing", detail)
@@ -193,10 +201,12 @@ func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task 
 		if validationErr := protocol.ValidateRequest(request); validationErr != nil {
 			return nil, nativeInitOperationBlocked("pending operation request is invalid", map[string]any{"operation_id": operation.OperationID, "cause": validationErr.Error()})
 		}
-		if stringValue(request["operation_id"]) != operation.OperationID ||
+		requestGeneration, generationPresent := request["generation"]
+		parsedGeneration, generationValid := protocol.Integer(requestGeneration)
+		if !generationPresent || !generationValid || stringValue(request["operation_id"]) != operation.OperationID ||
 			stringValue(request["action"]) != operation.Action ||
 			stringValue(request["session_id"]) != task.SessionID ||
-			intValue(request["generation"]) != *operation.Generation {
+			parsedGeneration != *operation.Generation {
 			return nil, nativeInitOperationBlocked("pending operation identity does not match its journal", detail)
 		}
 		if requestTaskID := stringValue(request["task_id"]); requestTaskID != "" && requestTaskID != task.TaskID {
@@ -215,6 +225,50 @@ func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task 
 		return nil, nativeInitOperationBlocked("native-init recovery has no matching pending journal", map[string]any{"task_id": task.TaskID})
 	}
 	return matched, nil
+}
+
+func verifyNativeInitWorker(operation state.Operation) error {
+	value, ok := operation.Response["worker"]
+	worker, workerOK := value.(map[string]any)
+	if !ok || !workerOK {
+		return errors.New("pending native worker observation is missing")
+	}
+	pid, pidOK := protocol.Integer(worker["pid"])
+	startTime, startOK := worker["start_time"].(string)
+	if !pidOK || pid <= 0 || !startOK || strings.TrimSpace(startTime) == "" {
+		return errors.New("pending native worker identity is incomplete")
+	}
+	if processGroup, present := worker["process_group"]; present {
+		group, valid := protocol.Integer(processGroup)
+		if !valid || group < 0 {
+			return errors.New("pending native worker process group is malformed")
+		}
+	}
+	if timedOut, present := worker["timed_out"]; present && timedOut == true {
+		return errors.New("pending native worker timed out before terminal observation")
+	}
+	switch stringValue(worker["state"]) {
+	case "finished":
+		if !validWorkerTimestamp(worker["finished_at"]) {
+			return errors.New("pending native worker completion is not durably observed")
+		}
+	case "exited":
+		if !validWorkerTimestamp(worker["observed_at"]) {
+			return errors.New("pending native worker exit is not durably observed")
+		}
+	default:
+		return errors.New("pending native worker has not reached a verified terminal state")
+	}
+	return nil
+}
+
+func validWorkerTimestamp(value any) bool {
+	text, ok := value.(string)
+	if !ok || strings.TrimSpace(text) == "" {
+		return false
+	}
+	_, err := time.Parse(time.RFC3339Nano, text)
+	return err == nil
 }
 
 func nativeInitOperationGenerationMatches(operation state.Operation, task *state.Task, failure map[string]any, previousGeneration int64) bool {

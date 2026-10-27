@@ -89,6 +89,7 @@ func TestIsNotFoundRequiresInstanceSpecificDiagnostic(t *testing.T) {
 		{name: "container missing", stderr: "Error: container alpha does not exist", want: true},
 		{name: "no such instance", stderr: "Error: no such instance", want: true},
 		{name: "project missing", stderr: "Error: project not found", want: false},
+		{name: "project diagnostic mentions instance", stderr: "Error: query instance: project not found", want: false},
 		{name: "remote missing", stderr: "Error: remote endpoint does not exist", want: false},
 		{name: "generic 404", stderr: "HTTP 404 Not Found", want: false},
 	}
