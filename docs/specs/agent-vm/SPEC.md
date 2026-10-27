@@ -20,6 +20,8 @@ Each session owns at most one managed-container slot, including preparing, stopp
 
 When native initialization fails before an owned instance is created, reconciliation may recover the durable task only in the verified absence case: the task is in `failed` or `closing`, its recorded phase is exactly `native-init`, the session lock reread keeps the same generation, Incus authoritatively reports the managed instance missing, no durable port mappings remain, and at least one pending journal exists for that session in the current or immediately previous generation. Every such pending journal must be an allowed `acquire`, `release` or `destroy` request whose stored request and digest match. Reconciliation finalizes those journals first and then conditionally changes the task to `absent`, clearing reservations, addresses, ports, leases and cleanup mappings without changing the generation. A present, foreign, unavailable or malformed native identity, remaining port, missing journal, missing or mismatched journal identity, unknown pending action, or generation race remains blocked and retains the durable evidence.
 
+Process-tree observation treats Linux `ENOENT` or `ESRCH` for a process that exits during `/proc` inspection as an observed exit race; any other process-table or ownership-read error remains unverified and fails closed.
+
 Renewal is explicit and bounded. Acquire, status, SSH, execution and transfer do not renew a lease. A changed generation or expired lease rejects late readiness and native results. Durable state, locks and timers make repeated requests idempotent without hiding partial cleanup.
 
 ## Access and isolation
