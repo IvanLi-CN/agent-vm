@@ -916,6 +916,10 @@ def _validate_state_compatibility(manifest: Mapping[str, Any], capabilities: Any
         ):
             _fail("state_compatibility_unverified", "target product manifest state compatibility is unreadable")
         supported = set(readable) & set(writable)
+    elif manifest.get("format") == LEGACY_PRODUCT_MANIFEST_FORMAT:
+        # Format 3 predates the declaration field but its Go controller already
+        # implements the complete management state schema.
+        supported = set(STATE_CAPABILITY_MARKERS)
     else:
         supported = {STATE_CAPABILITY_MARKERS[0]}
     for capability in capabilities:

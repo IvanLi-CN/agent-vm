@@ -153,6 +153,22 @@ class WrapperTests(unittest.TestCase):
             WRAPPER._ensure_drained(self.loaded, target)
         read_capabilities.assert_called_once_with()
 
+    def test_legacy_product_rollback_accepts_the_complete_management_state(self):
+        self.drain_patch.stop()
+        response = json.dumps({
+            "ok": True,
+            "result": {
+                "draining": True,
+                "state_capabilities": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+            },
+        }).encode()
+        target = {"format": MANIFEST.LEGACY_PRODUCT_MANIFEST_FORMAT}
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ):
+            WRAPPER._ensure_drained(self.loaded, target)
+
     def test_legacy_product_runtime_stops_the_web_unit(self):
         with mock.patch.object(
             WRAPPER.subprocess, "run",
