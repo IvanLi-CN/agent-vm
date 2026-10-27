@@ -375,6 +375,17 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	}
 	unlock := s.lockAction(action, request)
 	defer unlock()
+	if expectedVersion := stringValue(request["management_target_version"]); expectedVersion != "" {
+		if action == "port-add" || action == "port-remove" || action == "restart" || action == "resize" || action == "release" || action == "destroy" {
+			task, taskErr := s.Store.GetTask(ctx, map[string]any{"session_id": stringValue(request["session_id"])})
+			if taskErr != nil {
+				return nil, s.sqliteError(taskErr)
+			}
+			if task == nil || "vm:"+task.TaskID+":"+task.UpdatedAt != expectedVersion {
+				return nil, protocol.NewError("stale_target", "VM resource version changed", nil)
+			}
+		}
+	}
 	if write {
 		operationID := stringValue(request["operation_id"])
 		digest, err := protocol.Digest(request)
@@ -875,11 +886,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 			}
 		}
 		if created {
-			imageReference := s.Config.ImageAlias
-			if task.ImageFingerprint != s.Config.ImageFingerprint {
-				imageReference = task.ImageFingerprint
-			}
-			if err := s.Guest.Init(nativeCtx, imageReference, task.InstanceName); err != nil {
+			if err := s.Guest.Init(nativeCtx, task.ImageFingerprint, task.InstanceName); err != nil {
 				return s.failTask(ctx, task, "native-init", err)
 			}
 		}
@@ -1364,6 +1371,14 @@ func (s *Service) portAdd(ctx context.Context, request protocol.Request) (map[st
 		return nil, protocol.NewError("lease_expired", "lease or generation changed after native proxy creation", map[string]any{"phase": "durable-fence", "outcome_verified": true})
 	}
 	value.State = "active"
+	versionNow := s.Clock()
+	updated, updateErr := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &versionNow}, map[string]any{"updated_at": nowString(versionNow)})
+	if updateErr != nil {
+		return nil, s.sqliteError(updateErr)
+	}
+	if !updated {
+		return nil, protocol.NewError("mapping_unverified", "VM version changed after port creation", map[string]any{"outcome_verified": false})
+	}
 	return map[string]any{"task_id": value.TaskID, "generation": value.Generation, "port_name": value.PortName, "protocol": value.Protocol, "host_port": value.HostPort, "vm_port": value.VMPort, "device_name": value.DeviceName, "state": value.State, "created_at": value.CreatedAt}, nil
 }
 
@@ -1410,6 +1425,14 @@ func (s *Service) portRemove(ctx context.Context, request protocol.Request) (map
 	}
 	if err := s.Store.DeletePort(ctx, task.TaskID, name, protocolName); err != nil {
 		return nil, s.sqliteError(err)
+	}
+	versionNow := s.Clock()
+	updated, updateErr := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &versionNow}, map[string]any{"updated_at": nowString(versionNow)})
+	if updateErr != nil {
+		return nil, s.sqliteError(updateErr)
+	}
+	if !updated {
+		return nil, protocol.NewError("mapping_unverified", "VM version changed after port removal", map[string]any{"outcome_verified": false})
 	}
 	return map[string]any{"task_id": task.TaskID, "name": name, "protocol": protocolName, "removed": true}, nil
 }

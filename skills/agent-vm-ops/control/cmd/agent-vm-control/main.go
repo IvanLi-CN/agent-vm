@@ -184,7 +184,7 @@ func serve(args []string) error {
 	}
 	if cfg.Management.Enabled {
 		authority, authorityErr := webadmin.NewAuthority(webadmin.AuthorityOptions{
-			Config: cfg.Management, Management: managementService, Lifecycle: service, Store: store, ProductVersion: release.Version,
+			Config: cfg.Management, Management: managementService, Lifecycle: service, Store: store, Snapshots: snapshots, ProductVersion: release.Version,
 		})
 		if authorityErr != nil {
 			return authorityErr

@@ -62,6 +62,13 @@ type ActionBackend interface {
 	ExecuteMaintenance(context.Context, string, string, map[string]any) (map[string]any, error)
 }
 
+// VersionedVMActionBackend performs the target-version check inside the
+// lifecycle session lock, closing the gap between browser validation and the
+// native action when CLI activity races with a management request.
+type VersionedVMActionBackend interface {
+	ExecuteVMActionWithVersion(context.Context, string, string, string, int64, string, map[string]any) (map[string]any, error)
+}
+
 // VMActionGuard lets the native adapter re-check ownership immediately before
 // execution without making the browser-independent authority depend on it.
 type VMActionGuard interface {
@@ -159,8 +166,16 @@ func (s *Service) ListOperations(ctx context.Context, limit int) ([]state.Manage
 	return s.Store.ListManagementOperations(ctx, limit)
 }
 
+func (s *Service) ListAllOperations(ctx context.Context) ([]state.ManagementOperation, error) {
+	return s.Store.ListAllManagementOperations(ctx)
+}
+
 func (s *Service) ListAudit(ctx context.Context, limit int) ([]state.ManagementAudit, error) {
 	return s.Store.ListManagementAudit(ctx, limit)
+}
+
+func (s *Service) ListAllAudit(ctx context.Context) ([]state.ManagementAudit, error) {
+	return s.Store.ListAllManagementAudit(ctx)
 }
 
 func (s *Service) Capabilities(ctx context.Context) ([]state.ManagementCapability, error) {
@@ -306,6 +321,10 @@ func (s *Service) checkStagingCapacity(size int64) error {
 	}
 	return nil
 }
+
+// CheckStagingCapacity lets the upload boundary reserve the staging budget
+// immediately before it starts reading an HTTP body.
+func (s *Service) CheckStagingCapacity(size int64) error { return s.checkStagingCapacity(size) }
 
 func (s *Service) UploadImageImport(ctx context.Context, operationID string, metadata, rootfs []byte) (*state.ManagementOperation, error) {
 	operation, err := s.Store.GetManagementOperation(ctx, operationID)
@@ -751,7 +770,13 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	if err := validateVMActionFence(latest, request.Action, s.Clock()); err != nil {
 		return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, safeError(err))
 	}
-	result, actionErr := s.Options.Actions.ExecuteVMAction(ctx, request.OperationID, request.Action, request.TaskID, request.ExpectedGeneration, request.Parameters)
+	var result map[string]any
+	var actionErr error
+	if versioned, ok := s.Options.Actions.(VersionedVMActionBackend); ok {
+		result, actionErr = versioned.ExecuteVMActionWithVersion(ctx, request.OperationID, request.Action, request.TaskID, request.ExpectedGeneration, request.TargetVersion, request.Parameters)
+	} else {
+		result, actionErr = s.Options.Actions.ExecuteVMAction(ctx, request.OperationID, request.Action, request.TaskID, request.ExpectedGeneration, request.Parameters)
+	}
 	if actionErr != nil {
 		status := "failed"
 		if isUncertain(actionErr) {
@@ -954,7 +979,7 @@ func safeError(err error) map[string]any {
 }
 
 func safeCode(code string) string {
-	if contains([]string{"authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "authority_unavailable", "rate_limited", "internal_error"}, code) {
+	if contains([]string{"authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "authority_unavailable", "rate_limited", "sqlite_unavailable", "internal_error"}, code) {
 		return code
 	}
 	return "internal_error"

@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 import stat
 import subprocess
 import tarfile
@@ -170,6 +171,28 @@ class WrapperTests(unittest.TestCase):
             with self.assertRaises(WRAPPER.WrapperError) as failure:
                 WRAPPER._ensure_drained(self.loaded, target)
         self.assertEqual(failure.exception.code, "state_compatibility_mismatch")
+
+    def test_missing_capability_table_requires_a_valid_protocol4_schema(self):
+        database_path = self.root / "legacy.sqlite3"
+        with sqlite3.connect(database_path) as database:
+            database.executescript("""
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE tasks (task_id TEXT, session_id TEXT, generation INTEGER, state TEXT, updated_at TEXT, image_fingerprint TEXT);
+                CREATE TABLE ports (task_id TEXT, generation INTEGER, port_name TEXT, protocol TEXT, host_port INTEGER, vm_port INTEGER, state TEXT);
+                CREATE TABLE operations (operation_id TEXT, action TEXT, response_json TEXT, created_at TEXT);
+                CREATE TABLE audit (id INTEGER, action TEXT, outcome TEXT, created_at TEXT);
+            """)
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", database_path):
+            self.assertEqual(WRAPPER._read_live_state_capabilities(), [MANIFEST.STATE_CAPABILITY_MARKERS[0]])
+
+    def test_missing_capability_table_rejects_an_empty_database(self):
+        database_path = self.root / "empty.sqlite3"
+        with sqlite3.connect(database_path):
+            pass
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", database_path):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._read_live_state_capabilities()
+        self.assertEqual(failure.exception.code, "state_compatibility_unverified")
 
     def test_legacy_product_runtime_stops_the_web_unit(self):
         with mock.patch.object(

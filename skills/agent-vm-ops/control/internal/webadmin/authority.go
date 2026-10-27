@@ -25,6 +25,7 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/management"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/observe"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
@@ -38,6 +39,7 @@ type AuthorityOptions struct {
 	Management     *management.Service
 	Lifecycle      *lifecycle.Service
 	Store          *state.Store
+	Snapshots      *observe.SnapshotStore
 	ProductVersion string
 	Clock          func() time.Time
 }
@@ -47,6 +49,7 @@ type Authority struct {
 	Management     *management.Service
 	Lifecycle      *lifecycle.Service
 	Store          *state.Store
+	Snapshots      *observe.SnapshotStore
 	ProductVersion string
 	Clock          func() time.Time
 	confirmations  *confirmationStore
@@ -175,12 +178,25 @@ func (authority *Authority) getOverview(writer http.ResponseWriter, request *htt
 		writeProblem(writer, problemFromError(errors.New("authority_unavailable: lifecycle service is not configured"), "internal", ""))
 		return
 	}
-	response, err := authority.Lifecycle.Dispatch(request.Context(), protocol.Request{"protocol": protocol.Version, "action": "admin-metrics"})
+	if authority.Snapshots == nil {
+		writeProblem(writer, problemFromError(errors.New("observation_unavailable: capacity snapshot is not configured"), "internal", ""))
+		return
+	}
+	raw, err := authority.Snapshots.Read("capacity")
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "request_validation", ""))
 		return
 	}
-	metrics, ok := response["result"].(map[string]any)
+	var envelope map[string]any
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		writeProblem(writer, problemFromError(errors.New("invalid_state: capacity snapshot is invalid"), "internal", ""))
+		return
+	}
+	metrics, ok := envelope["result"].(map[string]any)
+	if !ok {
+		metrics = envelope
+		ok = true
+	}
 	if !ok {
 		writeProblem(writer, newAPIError("invalid_state", "metrics response is invalid", http.StatusInternalServerError, "internal", true, ""))
 		return
@@ -198,7 +214,10 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	if err != nil {
 		return nil, err
 	}
-	now := authority.Clock().UTC().Format(time.RFC3339Nano)
+	now := stringValue(metrics["observed_at"])
+	if now == "" {
+		now = authority.Clock().UTC().Format(time.RFC3339Nano)
+	}
 	resources, _ := metrics["resources"].(map[string]any)
 	remaining, _ := resources["remaining"].(map[string]any)
 	ctCPU, _ := metrics["ct_cpu"].(map[string]any)
@@ -417,7 +436,7 @@ func (authority *Authority) listOperations(writer http.ResponseWriter, request *
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	values, err := authority.Management.ListOperations(request.Context(), 100)
+	values, err := authority.Management.ListAllOperations(request.Context())
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
@@ -470,7 +489,7 @@ func (authority *Authority) listAudit(writer http.ResponseWriter, request *http.
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	values, err := authority.Management.ListAudit(request.Context(), 100)
+	values, err := authority.Management.ListAllAudit(request.Context())
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
@@ -633,7 +652,9 @@ func (authority *Authority) submitVMAction(writer http.ResponseWriter, request *
 		writeJSON(writer, http.StatusAccepted, operationValue(*existing))
 		return
 	}
-	operation, err := authority.Management.ExecuteVMAction(request.Context(), management.VMActionRequest{OperationID: payload.OperationID, Actor: actor, Reason: payload.Reason, TaskID: taskID, TargetVersion: payload.TargetVersion, Action: payload.Action, ExpectedGeneration: generation, Parameters: parameters})
+	operationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	operation, err := authority.Management.ExecuteVMAction(operationCtx, management.VMActionRequest{OperationID: payload.OperationID, Actor: actor, Reason: payload.Reason, TaskID: taskID, TargetVersion: payload.TargetVersion, Action: payload.Action, ExpectedGeneration: generation, Parameters: parameters})
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "native_action", payload.OperationID))
 		return
@@ -804,6 +825,19 @@ func (authority *Authority) uploadImageImport(writer http.ResponseWriter, reques
 		writeProblem(writer, invalidRequest("trusted imports do not accept upload content"))
 		return
 	}
+	declaredSize := source.ExpectedSize
+	if source.Format == "split" {
+		if source.Metadata.ExpectedSize > math.MaxInt64-source.Rootfs.ExpectedSize {
+			writeProblem(writer, invalidRequest("declared image size overflows"))
+			return
+		}
+		declaredSize = source.Metadata.ExpectedSize + source.Rootfs.ExpectedSize
+	}
+	if err := authority.Management.CheckStagingCapacity(declaredSize); err != nil {
+		_, _ = authority.Management.FailImageImportUpload(context.Background(), operationID, err)
+		writeProblem(writer, problemFromError(err, "upload", operationID))
+		return
+	}
 	metadata, rootfs, err := authority.stageUpload(request, source)
 	if err != nil {
 		_, _ = authority.Management.FailImageImportUpload(context.Background(), operationID, err)
@@ -829,7 +863,7 @@ func (authority *Authority) stageUpload(request *http.Request, source management
 		if err != nil || mediaType != "application/octet-stream" {
 			return nil, nil, errors.New("invalid_request: unified uploads require application/octet-stream")
 		}
-		value, err := stageReader(authority.Config.Upload.StagingPath, request.Body, source.ExpectedSize, authority.Config.Upload.MaxBytes)
+		value, err := stageReaderWithCapacity(authority.Config.Upload.StagingPath, request.Body, source.ExpectedSize, authority.Config.Upload.MaxBytes, func() error { return authority.Management.CheckStagingCapacity(source.ExpectedSize) })
 		return value, nil, err
 	}
 	if source.Metadata.ExpectedSize > math.MaxInt64-source.Rootfs.ExpectedSize || authority.Config.Upload.MaxBytes > 0 && source.Metadata.ExpectedSize+source.Rootfs.ExpectedSize > authority.Config.Upload.MaxBytes {
@@ -859,7 +893,7 @@ func (authority *Authority) stageUpload(request *http.Request, source management
 		if name == "rootfs" {
 			expected = source.Rootfs.ExpectedSize
 		}
-		value, readErr := stageReader(authority.Config.Upload.StagingPath, part, expected, authority.Config.Upload.MaxBytes)
+		value, readErr := stageReaderWithCapacity(authority.Config.Upload.StagingPath, part, expected, authority.Config.Upload.MaxBytes, func() error { return authority.Management.CheckStagingCapacity(expected) })
 		part.Close()
 		if readErr != nil {
 			return nil, nil, readErr
@@ -877,6 +911,10 @@ func (authority *Authority) stageUpload(request *http.Request, source management
 }
 
 func stageReader(stagingPath string, reader io.Reader, expected, maximum int64) ([]byte, error) {
+	return stageReaderWithCapacity(stagingPath, reader, expected, maximum, nil)
+}
+
+func stageReaderWithCapacity(stagingPath string, reader io.Reader, expected, maximum int64, capacity func() error) ([]byte, error) {
 	if expected < 0 || maximum > 0 && expected > maximum {
 		return nil, errors.New("upload_too_large: declared image exceeds the configured limit")
 	}
@@ -903,11 +941,20 @@ func stageReader(stagingPath string, reader io.Reader, expected, maximum int64) 
 	name := file.Name()
 	defer os.Remove(name)
 	_ = file.Chmod(0o600)
-	count, copyErr := io.Copy(file, io.LimitReader(reader, expected+1))
+	if capacity != nil {
+		if err := capacity(); err != nil {
+			_ = file.Close()
+			return nil, err
+		}
+	}
+	count, copyErr := io.Copy(file, io.LimitReader(capacityReader{reader: reader, check: capacity}, expected+1))
 	if closeErr := file.Close(); copyErr == nil {
 		copyErr = closeErr
 	}
 	if copyErr != nil {
+		if strings.HasPrefix(copyErr.Error(), "staging_capacity_low:") {
+			return nil, copyErr
+		}
 		return nil, errors.New("invalid_request: upload stream could not be read")
 	}
 	if count != expected {
@@ -921,6 +968,20 @@ func stageReader(stagingPath string, reader io.Reader, expected, maximum int64) 
 		return nil, errors.New("authority_unavailable: upload staging could not be read")
 	}
 	return value, nil
+}
+
+type capacityReader struct {
+	reader io.Reader
+	check  func() error
+}
+
+func (reader capacityReader) Read(buffer []byte) (int, error) {
+	if reader.check != nil {
+		if err := reader.check(); err != nil {
+			return 0, err
+		}
+	}
+	return reader.reader.Read(buffer)
 }
 
 func (authority *Authority) previewDefaultImage(writer http.ResponseWriter, request *http.Request, actor string) {
@@ -1116,10 +1177,12 @@ func (authority *Authority) submitImageMutation(writer http.ResponseWriter, requ
 		}
 	}
 	var operation *state.ManagementOperation
+	operationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
 	if action == "image_retire" {
-		operation, err = authority.Management.RetireImage(request.Context(), payload.OperationID, actor, payload.Reason, fingerprint, payload.TargetVersion)
+		operation, err = authority.Management.RetireImage(operationCtx, payload.OperationID, actor, payload.Reason, fingerprint, payload.TargetVersion)
 	} else {
-		operation, err = authority.Management.DeleteImage(request.Context(), payload.OperationID, actor, payload.Reason, fingerprint, payload.TargetVersion)
+		operation, err = authority.Management.DeleteImage(operationCtx, payload.OperationID, actor, payload.Reason, fingerprint, payload.TargetVersion)
 	}
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "native_mutation", payload.OperationID))
@@ -1212,7 +1275,9 @@ func (authority *Authority) submitMaintenance(writer http.ResponseWriter, reques
 			return
 		}
 	}
-	operation, err := authority.Management.ExecuteMaintenance(request.Context(), management.MaintenanceRequest{OperationID: payload.OperationID, Actor: actor, Reason: payload.Reason, TargetVersion: payload.TargetVersion, Action: payload.Action, Parameters: parameters})
+	operationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	operation, err := authority.Management.ExecuteMaintenance(operationCtx, management.MaintenanceRequest{OperationID: payload.OperationID, Actor: actor, Reason: payload.Reason, TargetVersion: payload.TargetVersion, Action: payload.Action, Parameters: parameters})
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "native_action", payload.OperationID))
 		return

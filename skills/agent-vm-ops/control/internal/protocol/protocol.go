@@ -57,7 +57,7 @@ func (e *Error) Uncertain() bool {
 		}
 	}
 	switch e.Code {
-	case "restart_partial", "resize_partial", "cleanup_incomplete", "mapping_unverified", "network_unverified", "native_unavailable", "state_unverified", "operation_unverified", "startup_reconcile_required":
+	case "restart_partial", "resize_partial", "cleanup_incomplete", "mapping_unverified", "network_unverified", "native_unavailable", "state_unverified", "operation_unverified", "startup_reconcile_required", "sqlite_unavailable":
 		return true
 	default:
 		return false

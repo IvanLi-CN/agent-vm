@@ -953,6 +953,44 @@ FROM management_audit ORDER BY occurred_at DESC, event_id DESC LIMIT ?`, limit)
 	return values, err
 }
 
+// ListAllManagementAudit is used by the API boundary before applying its
+// filters and bounded cursor page. It prevents a recent-record LIMIT from
+// hiding older records that match an actor, target, or date filter.
+func (s *Store) ListAllManagementAudit(ctx context.Context) ([]ManagementAudit, error) {
+	values := make([]ManagementAudit, 0)
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, `SELECT event_id, operation_id, action, actor, reason, target_json, outcome, phase, detail_json, occurred_at
+FROM management_audit ORDER BY occurred_at DESC, event_id DESC`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var value ManagementAudit
+			var operationID sql.NullString
+			var target, detail sql.NullString
+			if err := rows.Scan(&value.EventID, &operationID, &value.Action, &value.Actor, &value.Reason, &target, &value.Outcome, &value.Phase, &detail, &value.OccurredAt); err != nil {
+				return err
+			}
+			value.OperationID = nullableString(operationID)
+			if !target.Valid {
+				return errors.New("management audit target is null")
+			}
+			if err := json.Unmarshal([]byte(target.String), &value.Target); err != nil {
+				return err
+			}
+			if detail.Valid && detail.String != "" {
+				if err := json.Unmarshal([]byte(detail.String), &value.Detail); err != nil {
+					return err
+				}
+			}
+			values = append(values, value)
+		}
+		return rows.Err()
+	})
+	return values, err
+}
+
 func jsonNullable(value map[string]any) (any, error) {
 	if value == nil {
 		return nil, nil

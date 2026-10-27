@@ -18,6 +18,7 @@ type LifecycleActions struct {
 }
 
 var _ management.ActionBackend = (*LifecycleActions)(nil)
+var _ management.VersionedVMActionBackend = (*LifecycleActions)(nil)
 var _ management.VMActionGuard = (*LifecycleActions)(nil)
 
 func (actions *LifecycleActions) ValidateVMAction(ctx context.Context, task state.Task, action string, parameters map[string]any) error {
@@ -28,6 +29,10 @@ func (actions *LifecycleActions) ValidateVMAction(ctx context.Context, task stat
 }
 
 func (actions *LifecycleActions) ExecuteVMAction(ctx context.Context, operationID, action, taskID string, generation int64, parameters map[string]any) (map[string]any, error) {
+	return actions.ExecuteVMActionWithVersion(ctx, operationID, action, taskID, generation, "", parameters)
+}
+
+func (actions *LifecycleActions) ExecuteVMActionWithVersion(ctx context.Context, operationID, action, taskID string, generation int64, targetVersion string, parameters map[string]any) (map[string]any, error) {
 	if actions == nil || actions.Service == nil || actions.Store == nil {
 		return nil, errors.New("authority_unavailable: lifecycle service is not configured")
 	}
@@ -48,6 +53,9 @@ func (actions *LifecycleActions) ExecuteVMAction(ctx context.Context, operationI
 		"operation_id": operationID,
 		"session_id":   task.SessionID,
 		"generation":   generation,
+	}
+	if targetVersion != "" {
+		request["management_target_version"] = targetVersion
 	}
 	for key, value := range parameters {
 		request[key] = value

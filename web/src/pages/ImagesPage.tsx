@@ -1,9 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, FileUp, Trash2 } from "lucide-react";
+import { Check, ChevronLeft, ChevronRight, FileUp, Trash2 } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { actionLabel, formatDateTime, shortFingerprint } from "../app/format";
-import { createOperationId, listImages, previewImageAction, startImageImport, submitImageAction, uploadImageImportContent } from "../app/api";
+import { ManagementRequestError, createOperationId, listImages, previewImageAction, startImageImport, submitImageAction, uploadImageImportContent } from "../app/api";
 import type { ActionPreview, ImageImportRequest, Locale, ManagedImage } from "../app/types";
 import { ActionDialog } from "../components/ActionDialog";
 import { CopyButton, EmptyState, Input, Panel, PanelHeader, Select, StatusBadge, Button } from "../components/ui";
@@ -17,6 +17,8 @@ export function ImagesPage() {
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const client = useQueryClient();
   const [search, setSearch] = useState("");
+  const [cursor, setCursor] = useState<string | undefined>();
+  const [cursorStack, setCursorStack] = useState<string[]>([]);
   const [selectedFingerprint, setSelectedFingerprint] = useState<string | null>(null);
   const [sourceKind, setSourceKind] = useState<"trusted_remote" | "local_upload">("trusted_remote");
   const [format, setFormat] = useState<"unified" | "split">("unified");
@@ -34,7 +36,8 @@ export function ImagesPage() {
   const [importMessage, setImportMessage] = useState("");
   const [action, setAction] = useState<ImageAction | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
-  const query = useQuery({ queryKey: ["images", search], queryFn: () => listImages(search), refetchInterval: 10_000, refetchIntervalInBackground: false });
+  const [operationId, setOperationId] = useState<string | null>(null);
+  const query = useQuery({ queryKey: ["images", search, cursor], queryFn: () => listImages(search, cursor), refetchInterval: 10_000, refetchIntervalInBackground: false });
   const selected = query.data?.items.find((image) => image.fingerprint === selectedFingerprint) ?? query.data?.items[0] ?? null;
   const importMutation = useMutation({
     mutationFn: async ({ request, content }: ImportSubmission) => {
@@ -46,9 +49,9 @@ export function ImagesPage() {
       setReason("");
       void client.invalidateQueries({ queryKey: ["operations"] });
     },
-    onError: (error) => setImportMessage(error instanceof Error ? error.message : t("errors.generic")),
+    onError: (error) => setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")),
   });
-  const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!), onSuccess: () => { setAction(null); setPreview(null); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => setImportMessage(error instanceof Error ? error.message : t("errors.generic")) });
+  const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!, operationId ?? undefined), onSuccess: () => { setAction(null); setPreview(null); setOperationId(null); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")) });
 
   const startImport = () => {
     const targetVersion = query.data?.catalog_version;
@@ -73,16 +76,20 @@ export function ImagesPage() {
     importMutation.mutate({ request, content: { metadata: metadataFile, rootfs: rootfsFile } });
   };
 
+  const nextPage = () => { const next = query.data?.page.next_cursor; if (!next) return; setCursorStack((stack) => [...stack, cursor ?? ""]); setCursor(next); };
+  const previousPage = () => setCursorStack((stack) => { const next = [...stack]; setCursor(next.pop() || undefined); return next; });
+
   const openAction = async (nextAction: ImageAction) => {
     if (!selected) return;
     setAction(nextAction);
+    setOperationId(createOperationId());
     const targetVersion = nextAction === "default" ? query.data?.selection_version : selected.resource_version;
     if (!targetVersion) return;
     try {
       setPreview(await previewImageAction(selected.fingerprint, nextAction, targetVersion));
     } catch (error) {
       setAction(null);
-      setImportMessage(error instanceof Error ? error.message : t("errors.generic"));
+      setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
     }
   };
 
@@ -91,14 +98,14 @@ export function ImagesPage() {
     <div className="split-layout images-layout">
       <Panel className="list-panel">
         <PanelHeader title={t("images.listTitle")} description={t("images.count", { count: query.data?.items.length ?? 0 })} />
-        <div className="image-search"><Input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={t("common.search")} /></div>
+        <div className="image-search"><Input value={search} onChange={(event) => { setSearch(event.target.value); setCursor(undefined); setCursorStack([]); }} placeholder={t("common.search")} /></div>
         {query.isPending ? <div className="loading-rows"><span /><span /><span /></div> : query.isError ? <QueryError onRetry={() => void query.refetch()} /> : <div className="resource-list" role="listbox" aria-label={t("images.listTitle")}>
           {query.data.items.map((image) => <button className={`resource-row image-row ${selected?.fingerprint === image.fingerprint ? "is-selected" : ""}`} key={image.fingerprint} role="option" aria-selected={selected?.fingerprint === image.fingerprint} onClick={() => setSelectedFingerprint(image.fingerprint)}>
             <div className="resource-main"><strong>{image.version_label}</strong><span className="mono">{shortFingerprint(image.fingerprint)}</span></div>
             <div className="resource-summary"><StatusBadge state={image.state} />{image.is_default ? <span className="default-label">{t("images.default")}</span> : null}</div>
             <div className="resource-meta"><span>{image.architecture}</span><span>{image.source.kind === "legacy_config" ? t("images.legacy") : image.source.kind}</span></div>
           </button>)}
-        </div>}
+        </div>}<div className="pagination"><span>{query.data?.items.length ?? 0}</span><div><Button variant="ghost" aria-label={t("common.previous")} disabled={!cursorStack.length} onClick={previousPage} icon={<ChevronLeft />} /><Button variant="ghost" aria-label={t("common.next")} disabled={!query.data?.page.next_cursor} onClick={nextPage} icon={<ChevronRight />} /></div></div>
       </Panel>
       <ImageDetail image={selected} locale={locale} onAction={openAction} />
     </div>
@@ -130,7 +137,7 @@ export function ImagesPage() {
       </div>
       <div className="import-footer"><span className={importMessage.includes("created") || importMessage.includes("已创建") ? "success-copy" : "field-error"}>{importMessage}</span><Button variant="primary" icon={<FileUp />} disabled={importMutation.isPending} onClick={startImport}>{importMutation.isPending ? t("common.loading") : t("images.startImport")}</Button></div>
     </Panel>
-    {action && preview && selected ? <ActionDialog preview={preview} actionLabel={actionLabel(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", locale)} target={`${selected.version_label} · ${shortFingerprint(selected.fingerprint)}`} dangerous={action === "delete" || action === "retire"} busy={actionMutation.isPending} onCancel={() => { setAction(null); setPreview(null); }} onConfirm={(actionReason) => actionMutation.mutate({ reason: actionReason })} /> : null}
+    {action && preview && selected ? <ActionDialog preview={preview} actionLabel={actionLabel(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", locale)} target={`${selected.version_label} · ${shortFingerprint(selected.fingerprint)}`} dangerous={action === "delete" || action === "retire"} busy={actionMutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null); }} onConfirm={(actionReason) => actionMutation.mutate({ reason: actionReason })} /> : null}
   </div>;
 }
 

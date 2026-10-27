@@ -44,6 +44,8 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Typecheck
         run: bun run typecheck
+      - name: Web tests
+        run: bun run test:web
       - name: Go control tests
         working-directory: skills/agent-vm-ops/control
         run: go test -count=1 ./...

@@ -976,11 +976,33 @@ def _read_live_state_capabilities() -> list[str]:
             ).fetchall()
     except sqlite3.OperationalError as exc:
         if "no such table" in str(exc).lower() and STATE_CAPABILITY_MARKERS:
+            try:
+                with sqlite3.connect(uri, uri=True, timeout=30) as database:
+                    _validate_legacy_state_schema(database)
+            except (OSError, sqlite3.Error):
+                _fail("state_compatibility_unverified", "live state schema could not be validated")
             return [STATE_CAPABILITY_MARKERS[0]]
         _fail("state_compatibility_unverified", "live state capabilities could not be read")
     except (OSError, sqlite3.Error):
         _fail("state_compatibility_unverified", "live state capabilities could not be read")
     return [f"{name}@{version}" for name, version in rows]
+
+
+def _validate_legacy_state_schema(database: sqlite3.Connection) -> None:
+    required = {
+        "meta": {"key", "value"},
+        "tasks": {"task_id", "session_id", "generation", "state", "updated_at", "image_fingerprint"},
+        "ports": {"task_id", "generation", "port_name", "protocol", "host_port", "vm_port", "state"},
+        "operations": {"operation_id", "action", "response_json", "created_at"},
+        "audit": {"id", "action", "outcome", "created_at"},
+    }
+    for table, columns in required.items():
+        row = database.execute("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone()
+        if row is None:
+            _fail("state_compatibility_unverified", "live state schema is incomplete")
+        present = {str(item[1]) for item in database.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not columns.issubset(present):
+            _fail("state_compatibility_unverified", "live state schema is incomplete")
 
 
 def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any] | None = None) -> None:
@@ -1462,29 +1484,48 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             raw_failure.code, raw_failure.message, raw_failure.detail,
         )
         restored = True
-        try:
-            _restore_activation_state(
-                config,
-                current_link,
-                previous_link,
-                old_current,
-                old_previous,
-                target_snapshot,
-            )
-        except WrapperError as restore_error:
+        old_manifest = None
+        old_compatibility_error = None
+        if old_current is not None:
+            try:
+                old_manifest = load_release_manifest(old_current / MANIFEST_NAME)
+                _validate_state_compatibility(old_manifest, _read_live_state_capabilities())
+            except (WrapperError, ManifestError) as compatibility_error:
+                old_compatibility_error = compatibility_error
+        if old_compatibility_error is not None:
             restored = False
             failure = WrapperError(
-                "activation_restore_failed",
-                "activation failed and the previous release could not be fully restored",
-                {"activation_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
+                "activation_restore_blocked",
+                "the previous release cannot read the migrated state; the compatible candidate remains selected",
+                {"activation_error": failure.as_dict(), "compatibility_error": getattr(old_compatibility_error, "as_dict", lambda: {"message": str(old_compatibility_error)})()},
             )
+            try:
+                _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+            except WrapperError:
+                pass
+        else:
+            try:
+                _restore_activation_state(
+                    config,
+                    current_link,
+                    previous_link,
+                    old_current,
+                    old_previous,
+                    target_snapshot,
+                )
+            except WrapperError as restore_error:
+                restored = False
+                failure = WrapperError(
+                    "activation_restore_failed",
+                    "activation failed and the previous release could not be fully restored",
+                    {"activation_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
+                )
         if runtime_switch_attempted:
             try:
                 if not restored or old_current is None:
                     _systemctl("stop", "agent-vm-native.service", allow_missing=True)
                 else:
-                    old_manifest = load_release_manifest(old_current / MANIFEST_NAME)
-                    _validate_state_compatibility(old_manifest, _read_live_state_capabilities())
+                    assert old_manifest is not None
                     if _is_product_manifest(old_manifest):
                         snapshot = record.get("web_unit_enabled")
                         _activate_product_runtime(
