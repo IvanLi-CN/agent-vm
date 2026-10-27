@@ -182,7 +182,7 @@ func (tracker *processTracker) cgroupProcesses() (map[int]trackedProcess, error)
 			continue
 		}
 		process, err := readProcess(pid)
-		if errors.Is(err, os.ErrNotExist) {
+		if processGone(err) {
 			continue
 		}
 		if err != nil {
@@ -197,7 +197,7 @@ func (tracker *processTracker) Live() (int, error) {
 	live := 0
 	for pid, item := range tracker.tracked {
 		current, err := readProcess(pid)
-		if errors.Is(err, os.ErrNotExist) {
+		if processGone(err) {
 			continue
 		}
 		if err != nil {
@@ -217,7 +217,7 @@ func (tracker *processTracker) Present() (int, error) {
 	present := 0
 	for pid, item := range tracker.tracked {
 		current, err := readProcess(pid)
-		if errors.Is(err, os.ErrNotExist) {
+		if processGone(err) {
 			continue
 		}
 		if err != nil {
@@ -248,7 +248,7 @@ func (tracker *processTracker) Kill() error {
 			continue
 		}
 		current, err := readProcess(pid)
-		if errors.Is(err, os.ErrNotExist) {
+		if processGone(err) {
 			_ = unix.Close(fd)
 			continue
 		}
@@ -288,7 +288,7 @@ func (tracker *processTracker) Reap() error {
 			continue
 		}
 		current, err := readProcess(pid)
-		if errors.Is(err, os.ErrNotExist) {
+		if processGone(err) {
 			continue
 		}
 		if err != nil {
@@ -344,7 +344,7 @@ func readProcessTable() (map[int]trackedProcess, error) {
 			continue
 		}
 		item, statErr := readProcess(pid)
-		if errors.Is(statErr, os.ErrNotExist) {
+		if processGone(statErr) {
 			continue
 		}
 		if statErr != nil {
@@ -353,6 +353,10 @@ func readProcessTable() (map[int]trackedProcess, error) {
 		result[pid] = item
 	}
 	return result, nil
+}
+
+func processGone(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH)
 }
 
 func readProcess(pid int) (trackedProcess, error) {

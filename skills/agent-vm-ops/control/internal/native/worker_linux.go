@@ -5,7 +5,6 @@ package native
 import (
 	"errors"
 	"fmt"
-	"os"
 
 	"golang.org/x/sys/unix"
 )
@@ -23,7 +22,7 @@ func WorkerAlive(identity WorkerIdentity) (bool, error) {
 		return false, errors.New("invalid native worker identity")
 	}
 	process, err := readProcess(identity.PID)
-	if errors.Is(err, os.ErrNotExist) {
+	if processGone(err) {
 		if identity.ProcessGroup <= 0 {
 			return false, nil
 		}
@@ -82,7 +81,7 @@ func KillWorker(identity WorkerIdentity) error {
 	}
 	defer unix.Close(fd)
 	current, err := workerIdentity(identity.PID)
-	if errors.Is(err, os.ErrNotExist) {
+	if processGone(err) {
 		return nil
 	}
 	if err != nil {
