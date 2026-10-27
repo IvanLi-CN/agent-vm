@@ -428,6 +428,20 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	return response, nil
 }
 
+// ValidateManagementVMAction re-checks native ownership immediately before a
+// browser-authorized action is delegated. Management remains responsible for
+// the API target and lease checks; lifecycle remains responsible for ownership.
+func (s *Service) ValidateManagementVMAction(ctx context.Context, task state.Task, action string, _ map[string]any) error {
+	if task.TaskID == "" {
+		return protocol.NewError("not_found", "VM does not exist", nil)
+	}
+	if s.Guest == nil {
+		return nil
+	}
+	_, err := s.verifyOwnership(ctx, &task)
+	return err
+}
+
 func (s *Service) publishSnapshot(action string, response map[string]any) error {
 	source := map[string]string{"admin-metrics": "capacity", "admin-status": "inventory", "doctor": "health"}[action]
 	if source == "" {

@@ -328,6 +328,16 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 	if request.Source.Kind != "local_upload" {
 		return nil, errors.New("invalid_request: trusted imports do not accept upload content")
 	}
+	declaredSize := request.Source.ExpectedSize
+	if request.Source.Format == "split" {
+		if request.Source.Metadata.ExpectedSize > math.MaxInt64-request.Source.Rootfs.ExpectedSize {
+			return nil, errors.New("upload_too_large: declared image size overflows")
+		}
+		declaredSize = request.Source.Metadata.ExpectedSize + request.Source.Rootfs.ExpectedSize
+	}
+	if err := s.checkStagingCapacity(declaredSize); err != nil {
+		return nil, err
+	}
 	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "awaiting_upload", "image_import", "running")
 	if err != nil {
 		return nil, err
@@ -423,6 +433,26 @@ func (s *Service) RecoverOperation(ctx context.Context, operationID string) (*st
 		return operation, nil
 	}
 	return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
+}
+
+// RecoverPendingOperations closes only operations that were already running
+// when the resident authority stopped. Queued trusted imports remain queued;
+// replaying them would make a restart an implicit native side effect.
+func (s *Service) RecoverPendingOperations(ctx context.Context) error {
+	operations, err := s.Store.ListAllManagementOperations(ctx)
+	if err != nil {
+		return err
+	}
+	var firstErr error
+	for _, operation := range operations {
+		if operation.Status != "running" {
+			continue
+		}
+		if _, recoverErr := s.RecoverOperation(ctx, operation.OperationID); recoverErr != nil && firstErr == nil {
+			firstErr = recoverErr
+		}
+	}
+	return firstErr
 }
 
 func (s *Service) finishImport(ctx context.Context, operation *state.ManagementOperation, request ImportRequest, artifact ImageArtifact) (*state.ManagementOperation, error) {
