@@ -25,6 +25,7 @@ type startupGuest struct {
 	status    string
 	config    map[string]any
 	configErr error
+	stopErr   error
 }
 
 func (guest *startupGuest) Init(context.Context, string, string) error              { return nil }
@@ -37,7 +38,7 @@ func (guest *startupGuest) DeviceAdd(context.Context, string, string, string, ma
 }
 func (guest *startupGuest) DeviceRemove(context.Context, string, string) error { return nil }
 func (guest *startupGuest) Start(context.Context, string) error                { return nil }
-func (guest *startupGuest) Stop(context.Context, string) error                 { return nil }
+func (guest *startupGuest) Stop(context.Context, string) error                 { return guest.stopErr }
 func (guest *startupGuest) Delete(context.Context, string) error               { return nil }
 func (guest *startupGuest) Status(context.Context, string) (map[string]any, error) {
 	return map[string]any{"status": guest.status}, nil
@@ -706,6 +707,41 @@ func TestDestroyFinalizesWhenIncusConfirmsTheInstanceIsMissing(t *testing.T) {
 	}
 	if task != nil {
 		t.Fatalf("destroy left task = %#v", task)
+	}
+}
+
+func TestDestroySkipsStopForStoppedGuest(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "stopped-destroy.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "stopped-destroy-task", SessionID: "stopped-destroy-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-stopped-destroy", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status:  "Stopped",
+		stopErr: errors.New("stop must not be called for a stopped guest"),
+		config: map[string]any{
+			"config":           map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "stopped-destroy-task", "user.agent-vm.session": "stopped-destroy-session", "user.agent-vm.generation": "1"},
+			"devices":          map[string]any{},
+			"expanded_devices": map[string]any{},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
+	response, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "destroy", "session_id": "stopped-destroy-session", "generation": int64(1), "operation_id": "destroy-stopped",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response["result"].(map[string]any)["state"] != stateAbsent {
+		t.Fatalf("destroy response = %#v", response)
 	}
 }
 

@@ -919,8 +919,18 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	if nativePresent {
 		workerCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 		defer cancel()
-		if err := s.Guest.Stop(workerCtx, task.InstanceName); err != nil {
-			return nil, protocol.NewError("cleanup_incomplete", "guest stop did not complete", map[string]any{"cause": err.Error(), "outcome_verified": false})
+		nativeState, statusErr := s.Guest.Status(workerCtx, task.InstanceName)
+		if statusErr != nil {
+			return nil, protocol.NewError("cleanup_incomplete", "guest status could not be verified before cleanup", map[string]any{"cause": statusErr.Error(), "outcome_verified": false})
+		}
+		stateValue, parseErr := native.ParseStatus(nativeState)
+		if parseErr != nil {
+			return nil, protocol.NewError("cleanup_incomplete", "guest status is malformed before cleanup", map[string]any{"cause": parseErr.Error(), "outcome_verified": false})
+		}
+		if !strings.EqualFold(stateValue, "stopped") {
+			if err := s.Guest.Stop(workerCtx, task.InstanceName); err != nil {
+				return nil, protocol.NewError("cleanup_incomplete", "guest stop did not complete", map[string]any{"cause": err.Error(), "outcome_verified": false})
+			}
 		}
 		if destroy {
 			if err := s.Guest.Delete(workerCtx, task.InstanceName); err != nil {
