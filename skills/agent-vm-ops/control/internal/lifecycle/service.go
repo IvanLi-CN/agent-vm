@@ -256,8 +256,11 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 		if s.operationActive(operation.OperationID) {
 			continue
 		}
-		if _, hasWorker := operation.Response["worker"]; hasWorker {
-			continue
+		if workerValue, hasWorker := operation.Response["worker"]; hasWorker {
+			worker, validWorker := workerValue.(map[string]any)
+			if !validWorker || stringValue(worker["state"]) != "finished" || !recoverableOperation(operation.Action) {
+				continue
+			}
 		}
 		if !recoverableOperation(operation.Action) || recoveryAttempts(operation.Response) > 0 {
 			continue
@@ -319,7 +322,7 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 
 func recoverableOperation(action string) bool {
 	switch action {
-	case "drain-enter", "drain-exit":
+	case "drain-enter", "drain-exit", "admin-reconcile", "admin-gc":
 		return true
 	default:
 		return false

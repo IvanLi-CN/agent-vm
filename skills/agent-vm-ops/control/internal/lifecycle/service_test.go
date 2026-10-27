@@ -408,6 +408,45 @@ func TestStartupReconcileRecoversOneSavedPendingOperation(t *testing.T) {
 	}
 }
 
+func TestStartupReconcileRetriesFinishedAdminMaintenanceWorker(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "maintenance-recovery.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	request := protocol.Request{
+		"protocol":     protocol.Version,
+		"action":       "admin-reconcile",
+		"apply":        true,
+		"generation":   int64(0),
+		"operation_id": "recover-admin-reconcile",
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "recover-admin-reconcile", "admin-reconcile", nil, &generation, map[string]any{
+		"outcome":         "pending",
+		"_request_digest": digest,
+		"_request":        map[string]any(request),
+		"worker":          map[string]any{"state": "finished", "error": "native command failed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Resident: true})
+	if err := service.StartupReconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), "recover-admin-reconcile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "success" {
+		t.Fatalf("recovered maintenance operation = %#v", operation)
+	}
+}
+
 func TestReconcileDoesNotKillAnActivePendingWorker(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
