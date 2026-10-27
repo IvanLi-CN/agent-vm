@@ -179,9 +179,6 @@ func (s *Service) existingOperation(ctx context.Context, operationID, digest str
 }
 
 func (s *Service) StartImageImport(ctx context.Context, request ImportRequest) (*state.ManagementOperation, error) {
-	if err := s.ValidateImport(request); err != nil {
-		return nil, err
-	}
 	requestMap := importRequestMap(request)
 	digest, err := protocol.Digest(protocol.Request(requestMap))
 	if err != nil {
@@ -189,6 +186,9 @@ func (s *Service) StartImageImport(ctx context.Context, request ImportRequest) (
 	}
 	if existing, err := s.existingOperation(ctx, request.OperationID, digest); err != nil || existing != nil {
 		return existing, err
+	}
+	if err := s.ValidateImport(request); err != nil {
+		return nil, err
 	}
 	catalogVersion, err := s.Store.ImageCatalogVersion(ctx)
 	if err != nil {
@@ -409,8 +409,8 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 }
 
 // RecoverOperation turns an interrupted native operation into a deterministic
-// recovery path. Trusted imports can be safely requeued; operations that need
-// native result reconciliation remain explicitly unknown for the administrator.
+// recovery path. Running native work is never replayed automatically because
+// the previous executor may still be alive or its result may be uncertain.
 func (s *Service) RecoverOperation(ctx context.Context, operationID string) (*state.ManagementOperation, error) {
 	operation, err := s.Store.GetManagementOperation(ctx, operationID)
 	if err != nil {
@@ -421,22 +421,6 @@ func (s *Service) RecoverOperation(ctx context.Context, operationID string) (*st
 	}
 	if operation.Status != "running" {
 		return operation, nil
-	}
-	if operation.Action == "image_import" {
-		request, requestErr := importRequestFromOperation(operation)
-		if requestErr != nil {
-			return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
-		}
-		if request.Source.Kind == "trusted_remote" {
-			queued, claimed, transitionErr := s.Store.TransitionManagementOperation(ctx, operationID, "running", "recovery", "queued")
-			if transitionErr != nil {
-				return nil, transitionErr
-			}
-			if !claimed {
-				return queued, nil
-			}
-			return s.ProcessTrustedImport(ctx, operationID)
-		}
 	}
 	return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
 }
@@ -702,6 +686,9 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	if err := guard.ValidateVMAction(ctx, *latest, request.Action, request.Parameters); err != nil {
 		return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, safeError(err))
 	}
+	if err := validateVMActionFence(latest, request.Action, s.Clock()); err != nil {
+		return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, safeError(err))
+	}
 	result, actionErr := s.Options.Actions.ExecuteVMAction(ctx, request.OperationID, request.Action, request.TaskID, request.ExpectedGeneration, request.Parameters)
 	if actionErr != nil {
 		status := "failed"
@@ -910,7 +897,7 @@ func safeError(err error) map[string]any {
 }
 
 func safeCode(code string) string {
-	if contains([]string{"invalid_request", "source_not_allowed", "stale_target", "unsupported_action", "not_found", "image_not_applicable", "fingerprint_mismatch", "upload_too_large", "staging_capacity_low", "default_image_required", "image_referenced", "authority_unavailable", "operation_conflict", "internal_error"}, code) {
+	if contains([]string{"authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "authority_unavailable", "rate_limited", "internal_error"}, code) {
 		return code
 	}
 	return "internal_error"

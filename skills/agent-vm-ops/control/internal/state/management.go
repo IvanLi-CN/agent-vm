@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS managed_images (
   updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS managed_images_one_default ON managed_images(is_default) WHERE is_default = 1;
+CREATE TABLE IF NOT EXISTS managed_image_tombstones (
+  fingerprint TEXT PRIMARY KEY,
+  deleted_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS image_references (
   fingerprint TEXT NOT NULL,
   reference_kind TEXT NOT NULL,
@@ -221,8 +225,16 @@ func (s *Store) SeedLegacyImage(ctx context.Context, fingerprint string) error {
 		}
 		rows.Close()
 		for _, candidate := range fingerprints {
+			var tombstone int
+			err := tx.conn.QueryRowContext(ctx, "SELECT 1 FROM managed_image_tombstones WHERE fingerprint = ?", candidate).Scan(&tombstone)
+			if err == nil {
+				continue
+			}
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
+			}
 			var exists int
-			err := tx.conn.QueryRowContext(ctx, "SELECT 1 FROM managed_images WHERE fingerprint = ?", candidate).Scan(&exists)
+			err = tx.conn.QueryRowContext(ctx, "SELECT 1 FROM managed_images WHERE fingerprint = ?", candidate).Scan(&exists)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return err
 			}
@@ -553,6 +565,10 @@ func (s *Store) DeleteManagedImage(ctx context.Context, fingerprint string) erro
 		}
 		if counts.Total() > 0 {
 			return &ImageReferenceError{Counts: counts}
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := tx.exec("INSERT OR IGNORE INTO managed_image_tombstones(fingerprint, deleted_at) VALUES(?, ?)", fingerprint, now); err != nil {
+			return err
 		}
 		result, err := tx.exec("DELETE FROM managed_images WHERE fingerprint = ?", fingerprint)
 		if err != nil {

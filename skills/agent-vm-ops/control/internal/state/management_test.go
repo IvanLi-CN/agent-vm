@@ -257,6 +257,42 @@ func TestDeleteManagedImageRechecksEveryReferenceClass(t *testing.T) {
 	}
 }
 
+func TestDeletedLegacyImageIsNotReseededOnRestart(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	legacy, replacement := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	if err := store.SeedLegacyImage(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertManagedImage(ctx, ManagedImage{Fingerprint: replacement, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
+		t.Fatal(err)
+	}
+	selection, err := store.ImageSelectionVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SelectManagedImage(ctx, replacement, selection); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteManagedImage(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SeedLegacyImage(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	image, err := store.GetManagedImage(ctx, legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image != nil {
+		t.Fatalf("deleted legacy image was reseeded: %#v", image)
+	}
+}
+
 func testStringPointer(value string) *string { return &value }
 
 func openLegacyFixture(path string) (*sql.DB, error) {
