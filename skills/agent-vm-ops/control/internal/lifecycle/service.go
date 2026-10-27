@@ -225,7 +225,10 @@ func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.O
 		if !valid || pid <= 0 || !hasStartTime || startTime == "" {
 			return protocol.NewError("state_unverified", "pending operation has an invalid native worker identity", map[string]any{"operation_id": operation.OperationID})
 		}
-		processGroup, _ := protocol.Integer(worker["process_group"])
+		processGroup, validProcessGroup := protocol.Integer(worker["process_group"])
+		if !validProcessGroup || processGroup <= 0 {
+			return protocol.NewError("state_unverified", "pending operation has an invalid native worker identity", map[string]any{"operation_id": operation.OperationID})
+		}
 		identity := native.WorkerIdentity{PID: int(pid), StartTime: startTime, ProcessGroup: int(processGroup)}
 		alive, err := native.WorkerAlive(identity)
 		if err != nil {

@@ -27,6 +27,7 @@ type trackedProcess struct {
 type processTracker struct {
 	owner      int
 	root       int
+	rootGroup  int
 	baseline   map[int]trackedProcess
 	tracked    map[int]trackedProcess
 	cgroupPath string
@@ -44,6 +45,12 @@ func (tracker *processTracker) Identity(root int) (WorkerIdentity, error) {
 
 func (tracker *processTracker) Register(root int) {
 	tracker.root = root
+	// Commands are started with Setpgid, so the PID is the expected process
+	// group even if the root exits before Getpgid can observe it.
+	tracker.rootGroup = root
+	if group, err := unix.Getpgid(root); err == nil {
+		tracker.rootGroup = group
+	}
 }
 
 func startTrackedCommand(command *exec.Cmd, tracker *processTracker) (bool, error) {
@@ -134,6 +141,14 @@ func (tracker *processTracker) discover(root int) error {
 	if err != nil {
 		return fmt.Errorf("inspect native process tree: %w", err)
 	}
+	if rootProcess, present := all[root]; present {
+		if tracker.rootGroup == 0 {
+			tracker.rootGroup = rootProcess.group
+		}
+		if tracker.rootGroup != rootProcess.group {
+			return fmt.Errorf("native process group changed for pid %d", root)
+		}
+	}
 	related := descendants(all, root)
 	cgroupProcesses, err := tracker.cgroupProcesses()
 	if err != nil {
@@ -141,6 +156,16 @@ func (tracker *processTracker) discover(root int) error {
 	}
 	for pid, item := range cgroupProcesses {
 		related[pid] = item
+	}
+	// Without a delegated cgroup, a descendant can outlive the root and be
+	// reparented to the subreaper before the next process-table snapshot. The
+	// isolated process group remains the ownership boundary in that case.
+	if !tracker.hasOwnershipBoundary() && tracker.rootGroup > 0 {
+		for pid, item := range all {
+			if item.group == tracker.rootGroup {
+				related[pid] = item
+			}
+		}
 	}
 	// A detached descendant is only owned after this tracker has observed it
 	// while it was attached to the command tree. Do not scan every child of the

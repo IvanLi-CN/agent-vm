@@ -663,6 +663,37 @@ func TestReconcileDoesNotKillAnActivePendingWorker(t *testing.T) {
 	}
 }
 
+func TestReconcileRejectsPendingWorkerWithoutProcessGroup(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "missing-process-group.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	operationID := "missing-process-group"
+	if err := store.RecordOperation(context.Background(), operationID, "release", stringPointer("missing-group-session"), nil, map[string]any{
+		"outcome": "pending",
+		"worker":  map[string]any{"pid": int64(999999), "start_time": "1", "state": "running"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.reconcilePendingWorkers(context.Background(), pending); err == nil || protocol.AsError(err).Code != "state_unverified" {
+		t.Fatalf("reconcile error = %v, want state_unverified", err)
+	}
+	operation, err := store.GetOperation(context.Background(), operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker := operation.Response["worker"].(map[string]any)
+	if worker["state"] != "running" {
+		t.Fatalf("unverified worker was finalized: %#v", operation.Response)
+	}
+}
+
 func TestStartupReconcileLeavesUnsafePendingAcquireBlocked(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

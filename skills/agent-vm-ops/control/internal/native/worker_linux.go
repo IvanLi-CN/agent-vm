@@ -18,14 +18,11 @@ func workerIdentity(pid int) (WorkerIdentity, error) {
 }
 
 func WorkerAlive(identity WorkerIdentity) (bool, error) {
-	if identity.PID <= 0 || identity.StartTime == "" {
+	if identity.PID <= 0 || identity.StartTime == "" || identity.ProcessGroup <= 0 {
 		return false, errors.New("invalid native worker identity")
 	}
 	process, err := readProcess(identity.PID)
 	if processGone(err) {
-		if identity.ProcessGroup <= 0 {
-			return false, nil
-		}
 		all, tableErr := readProcessTable()
 		if tableErr != nil {
 			return false, tableErr
@@ -49,9 +46,6 @@ func WorkerAlive(identity WorkerIdentity) (bool, error) {
 	if process.state != 'Z' {
 		return true, nil
 	}
-	if identity.ProcessGroup <= 0 {
-		return false, nil
-	}
 	all, err := readProcessTable()
 	if err != nil {
 		return false, err
@@ -65,6 +59,9 @@ func WorkerAlive(identity WorkerIdentity) (bool, error) {
 }
 
 func KillWorker(identity WorkerIdentity) error {
+	if identity.PID <= 0 || identity.StartTime == "" || identity.ProcessGroup <= 0 {
+		return errors.New("invalid native worker identity")
+	}
 	fd, err := unix.PidfdOpen(identity.PID, 0)
 	if errors.Is(err, unix.ESRCH) {
 		alive, aliveErr := WorkerAlive(identity)
