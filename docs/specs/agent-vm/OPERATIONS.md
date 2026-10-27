@@ -49,6 +49,12 @@ The local client journal and the control `operations` table are the identity rec
 - Apply `agent-vm admin reconcile --apply` only for records whose ownership, generation, lease state, and native cleanup/rearm action are all confirmed by the dry-run. Reconciliation may verify and repair an `absent` record with malformed or inconsistent nonzero resource/reservation state after confirming that its native instance and ports are absent; it may also close incomplete cleanup or rearm the current generation. It must not manufacture a generation or reopen a stale mapping.
 - Keep an effective lease available for status, retrieval, renewal, and release according to the existing contract. An effective lease with a stopped or unverified guest is unavailable; do not infer OOM or restart it automatically.
 
+### Verified native-init absence recovery
+
+`admin reconcile --apply` has one narrow recovery exception for a task left in `failed` or `closing` by native initialization. The controller rereads the task while holding the session lock and requires the same generation and an exact `phase: native-init` record. At least one pending operation for that session must be present in the current or immediately previous generation. It then validates every pending operation for that session: only `acquire`, `release` and `destroy` are allowed, and each must retain its original request, operation identity and matching canonical request digest.
+
+The native check must authoritatively confirm that the managed instance is missing. The check must not be replaced by an unavailable query, malformed response, foreign ownership, or an inference from a removed quota. The durable port table must already be empty; remaining mappings are a stop condition and are never broadly deleted. After all checks pass, the controller finalizes the allowed terminal journal outcomes, then conditionally updates the same task to `absent` and clears its resource reservation, private address, SSH port, lease, cache timer and previous-generation marker. Repeating reconciliation is idempotent. Any missing identity, unknown pending action, remaining port, native uncertainty or generation race preserves the task, journals and reservations for explicit recovery.
+
 ### Reopen admission
 
 Admission may be restored only after all of the following are observed in the intended control environment:
@@ -109,3 +115,4 @@ The inventory view covers active, preparing, closing, deleting, failed, cached a
 - [Native deployment boundary](../../skills/agent-vm-ops/references/deployment.md)
 - [Agent VM topology and recovery boundary](../../adr/0028-agent-vm-topology-recovery-boundary.md)
 - [Agent VM control-plane update boundary](../../adr/0030-agent-vm-control-plane-update-boundary.md)
+- [Verified native-init absence recovery](../../adr/0042-agent-vm-verified-native-init-absence-recovery.md)

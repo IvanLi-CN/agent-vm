@@ -18,6 +18,8 @@ Protocol 4 is required by both client and control. Mutations include an operatio
 
 Each session owns at most one managed-container slot, including preparing, stopping, deleting and cached states. Every task records the pinned container-image fingerprint used to create its guest. Acquire creates or reuses a stopped cache only when that fingerprint still matches the current pinned image; a stale cache returns `cache_stale` before native effects, and an operator must explicitly destroy it before a new acquire creates a guest from the current image. Acquire records a new generation and waits for the container to be running and IPv4-ready within one bounded monotonic budget. If an unrelated lease-expiry cleanup briefly exposes a transitional native instance, acquire waits within a separate bounded 30-second admission-convergence budget, polling no more often than every 250 milliseconds, and keeps the same operation pending; only that exact transitional condition is retryable and all other unverified state fails closed. Lease expiry and release revoke access, remove only owned mappings and stop the guest before making the slot reusable. A stopped container root filesystem may remain as a disposable cache; no recovery guarantee is made.
 
+When native initialization fails before an owned instance is created, reconciliation may recover the durable task only in the verified absence case: the task is in `failed` or `closing`, its recorded phase is exactly `native-init`, the session lock reread keeps the same generation, Incus authoritatively reports the managed instance missing, no durable port mappings remain, and at least one pending journal exists for that session in the current or immediately previous generation. Every such pending journal must be an allowed `acquire`, `release` or `destroy` request whose stored request and digest match. Reconciliation finalizes those journals first and then conditionally changes the task to `absent`, clearing reservations, addresses, ports, leases and cleanup mappings without changing the generation. A present, foreign, unavailable or malformed native identity, remaining port, missing journal, missing or mismatched journal identity, unknown pending action, or generation race remains blocked and retains the durable evidence.
+
 Renewal is explicit and bounded. Acquire, status, SSH, execution and transfer do not renew a lease. A changed generation or expired lease rejects late readiness and native results. Durable state, locks and timers make repeated requests idempotent without hiding partial cleanup.
 
 ## Access and isolation
@@ -99,7 +101,7 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 ## Verification
 
 - `VER-AGENT-VM-010` covers: `REQ-AGENT-VM-010` through the topology/provenance sections of [the operations runbook](OPERATIONS.md), the accepted [topology and recovery ADR](../../adr/0028-agent-vm-topology-recovery-boundary.md), and `bin/test_agent_vm_documentation.py`.
-- `VER-AGENT-VM-011` covers: `REQ-AGENT-VM-011` through the recovery procedure in [the operations runbook](OPERATIONS.md), the existing native reconciliation and operation-journal behavior tests, and `bin/test_agent_vm_documentation.py`.
+- `VER-AGENT-VM-011` covers: `REQ-AGENT-VM-011` through the recovery procedure in [the operations runbook](OPERATIONS.md), [the verified native-init absence recovery ADR](../../adr/0042-agent-vm-verified-native-init-absence-recovery.md), the existing native reconciliation and operation-journal behavior tests, and `bin/test_agent_vm_documentation.py`.
 - `VER-AGENT-VM-012` covers: `REQ-AGENT-VM-012` through the sparse-disk and failure-domain sections in [the operations runbook](OPERATIONS.md), the existing capacity/reclamation tests, and `bin/test_agent_vm_documentation.py`.
 - `VER-AGENT-VM-013` covers: `REQ-AGENT-VM-013` through [the observability contract](contracts/observability.md), [the capacity and failure dashboard solution](../../solutions/agent-vm/observability-dashboard.md), and `bin/test_agent_vm_documentation.py`.
 - `VER-AGENT-VM-014` covers: `REQ-AGENT-VM-014` through [the control-plane update ADR](../../adr/0030-agent-vm-control-plane-update-boundary.md), [the CLI contract](contracts/cli.md), [the deployment boundary](../../skills/agent-vm-ops/references/deployment.md), and the public boundary checks.
@@ -118,6 +120,7 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 - [Agent VM capacity and inventory observability](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)
 - [Agent VM Go resident control runtime](../../adr/0037-agent-vm-go-control-runtime.md)
 - [Native Incus Agent container lifecycle](../../adr/0038-native-incus-agent-container-lifecycle.md)
+- [Verified native-init absence recovery](../../adr/0042-agent-vm-verified-native-init-absence-recovery.md)
 
 ## Related material
 

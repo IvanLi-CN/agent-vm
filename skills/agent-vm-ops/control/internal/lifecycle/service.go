@@ -1623,16 +1623,19 @@ func (s *Service) reconcile(ctx context.Context, apply bool) (map[string]any, er
 				}
 			}
 		}
-		if task.State == stateClosing && apply {
-			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil {
-				if firstErr == nil {
-					firstErr = releaseErr
+		if (task.State == stateClosing || task.State == stateFailed) && apply {
+			recovered, recoveryErr := s.reconcileVerifiedNativeInitAbsence(ctx, task)
+			if recovered {
+				action := map[string]any{"task_id": task.TaskID, "generation": task.Generation, "action": "close-incomplete-or-expired"}
+				if recoveryErr != nil {
+					action["error"] = protocol.AsError(recoveryErr)
+					if firstErr == nil {
+						firstErr = recoveryErr
+					}
 				}
-			} else if finalizeErr := s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, "release", result); finalizeErr != nil && firstErr == nil {
-				firstErr = finalizeErr
+				actions = append(actions, action)
+				continue
 			}
-		}
-		if task.State == stateFailed && apply {
 			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil {
 				if firstErr == nil {
 					firstErr = releaseErr
