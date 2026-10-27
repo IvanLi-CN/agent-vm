@@ -9,6 +9,8 @@ __pycache__/
 .venv/
 venv/
 dist/
+skills/agent-vm-ops/control/internal/webassets/static/
+skills/agent-vm-ops/control/internal/webassets/assets_release.go
 build/
 *.egg-info/
 

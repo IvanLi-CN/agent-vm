@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -25,6 +26,7 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/scheduler"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/webadmin"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/webassets"
 	"golang.org/x/sys/unix"
 )
 
@@ -111,6 +113,17 @@ func serve(args []string) error {
 	defer store.Close()
 	if err := store.SeedLegacyImage(context.Background(), cfg.ImageFingerprint); err != nil {
 		return fmt.Errorf("initialize managed image catalog: %w", err)
+	}
+	capabilities, err := store.Capabilities(context.Background())
+	if err != nil {
+		return fmt.Errorf("read state capabilities: %w", err)
+	}
+	capabilityNames := make([]string, 0, len(capabilities))
+	for _, capability := range capabilities {
+		capabilityNames = append(capabilityNames, capability.Name+"@"+strconv.FormatInt(capability.Version, 10))
+	}
+	if err := manifest.ValidateStateCapabilities(release, capabilityNames); err != nil {
+		return err
 	}
 	runner := native.NewRunner()
 	guest := native.NewIncusClient(runner, cfg.Project, native.ClientOptions{Profile: cfg.Profile, Network: cfg.Network, Pool: cfg.Pool})
@@ -208,6 +221,9 @@ func web(args []string) error {
 	}
 	if os.Geteuid() == 0 || os.Geteuid() != cfg.Management.WebUID {
 		return errors.New("permission_denied: Web must run as the configured non-root service UID")
+	}
+	if err := webassets.Verify(); err != nil {
+		return err
 	}
 	server, err := webadmin.NewWebServer(cfg.Management, webadmin.NewAuthorityClient(cfg.Management.Authority.SocketPath))
 	if err != nil {

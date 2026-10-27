@@ -19,11 +19,13 @@ import { tmpdir } from "node:os";
 
 import {
   build_product_manifest,
+  PRODUCT_LINUX_ARTIFACTS,
+  PRODUCT_MANIFEST_FORMAT,
+  verify_client_sidecar,
   verify_product_bundle,
   type Artifact,
   type ProductTarget,
 } from "./product-manifest.ts";
-import { GO_FIXED_ARTIFACTS } from "./go-release-manifest.ts";
 import { CLIENT_DEPENDENCIES } from "../../agent-vm/scripts/client-release.ts";
 
 const usage = "usage: build_product_release.ts --version <semver> --source-revision <40-hex> --target <client|linux/amd64|linux/arm64> --output <absolute-path>";
@@ -62,7 +64,9 @@ function digest(path: string): string {
 
 function sourcePath(relative: string, binaryPath: string): string {
   if (relative === "agent_vm_control_bridge.ts") return join(import.meta.dir, relative);
-  if (relative === "systemd/agent-vm-native.service") return join(operationsRoot, "assets", relative);
+	if (relative.startsWith("systemd/")) return join(operationsRoot, "assets", relative);
+	if (relative === "config/agent-vm-web.json.example") return join(operationsRoot, "assets", "web.json.example");
+	if (relative === "web-assets.manifest.json") return webAssetsManifestPath;
   if (relative === "bin/agent-vm-control") return binaryPath;
   return join(clientRoot, relative);
 }
@@ -76,6 +80,7 @@ function buildBinary(target: string, binaryPath: string): void {
     "--source-revision", revision,
     "--target", target,
     "--output", binaryPath,
+    "--with-web-assets",
   ], { stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr));
 }
@@ -87,8 +92,10 @@ function packageFiles(target: "client" | "linux/amd64" | "linux/arm64", binaryPa
       ...CLIENT_DEPENDENCIES.map(([name, mode]) => [name, name, "support", mode] as const),
     ];
   }
-  return [...GO_FIXED_ARTIFACTS];
+  return [...PRODUCT_LINUX_ARTIFACTS];
 }
+
+let webAssetsManifestPath = "";
 
 try {
   const status = commandOutput(["git", "status", "--porcelain=v1", "--untracked-files=all"]);
@@ -101,7 +108,18 @@ try {
     ? { os: "source", arch: "any" }
     : { os: "linux", arch: targetMatch![2] }) as ProductTarget;
   const binaryPath = join(temporaryRoot, "bin/agent-vm-control");
-  if (rawTarget !== "client") buildBinary(rawTarget, binaryPath);
+  if (rawTarget !== "client") {
+    webAssetsManifestPath = join(temporaryRoot, "web-assets.manifest.json");
+    const assetBuild = Bun.spawnSync([
+      process.execPath,
+      join(import.meta.dir, "build_web_assets.ts"),
+      "--version", version,
+      "--source-revision", revision,
+      "--manifest-output", webAssetsManifestPath,
+    ], { stdout: "pipe", stderr: "pipe" });
+    if (assetBuild.exitCode !== 0) throw new Error(new TextDecoder().decode(assetBuild.stderr));
+    buildBinary(rawTarget, binaryPath);
+  }
 
   const artifacts: Artifact[] = [];
   for (const [name, relative, role, mode] of [...packageFiles(rawTarget as "client" | "linux/amd64" | "linux/arm64", binaryPath)].sort((left, right) => left[1].localeCompare(right[1]))) {
@@ -121,7 +139,7 @@ try {
   const clientArtifact = artifacts.find((item) => item.role === "client");
   if (!clientArtifact) throw new Error("product manifest has no client artifact");
   const sidecar = {
-    format: 3,
+    format: PRODUCT_MANIFEST_FORMAT,
     version,
     source_revision: revision,
     protocol: 4,
@@ -131,6 +149,7 @@ try {
   };
   writeFileSync(join(temporaryRoot, "client-release.json"), `${JSON.stringify(sidecar, null, 2)}\n`, { mode: 0o644 });
   verify_product_bundle(temporaryRoot, manifest);
+  verify_client_sidecar(temporaryRoot, manifest);
 
   mkdirSync(dirname(output), { recursive: true, mode: 0o750 });
   const temporaryArchive = `${output}.tmp-${process.pid}`;
@@ -147,7 +166,7 @@ try {
   }
   chmodSync(temporaryArchive, 0o644);
   renameSync(temporaryArchive, output);
-  console.log(JSON.stringify({ output, target: rawTarget, version, source_revision: revision, artifact_count: artifacts.length, format: 3, cgo_enabled: false }));
+  console.log(JSON.stringify({ output, target: rawTarget, version, source_revision: revision, artifact_count: artifacts.length, format: PRODUCT_MANIFEST_FORMAT, cgo_enabled: false, web_assets: rawTarget !== "client" }));
 } finally {
   rmSync(temporaryRoot, { recursive: true, force: true });
 }

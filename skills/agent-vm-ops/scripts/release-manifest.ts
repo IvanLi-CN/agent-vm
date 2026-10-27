@@ -1033,13 +1033,12 @@ export function verify_runtime_bundle(
 export function verify_client_sidecar(
   root: string,
   manifest: unknown = null,
-): ReleaseManifest {
+): ReleaseManifest | ProductManifest {
   const resolved_root = _resolve_root(root);
-  const checked = validate_manifest(
-    manifest == null
-      ? load_manifest(join(resolved_root, MANIFEST_NAME))
-      : manifest,
-  );
+  const candidate = manifest == null ? load_manifest(join(resolved_root, MANIFEST_NAME)) : manifest;
+  const checked = is_product_manifest(candidate)
+    ? validate_product_manifest(candidate)
+    : validate_manifest(candidate);
   const sidecar_path = _resolve_regular(
     resolved_root,
     CLIENT_SIDECAR_NAME,
@@ -1063,28 +1062,19 @@ export function verify_client_sidecar(
   // Sidecars bind executable bytes and modes. Do not inherit the historical
   // Python boolean/number equality used by compatibility-view comparisons.
   const same = (left: unknown, right: unknown) => canonical_json(left) === canonical_json(right);
-  if (
-    !_same_keys(sidecar, [
-      "format",
-      "release_id",
-      "source_revision",
-      "protocol",
-      "client_artifact",
-      "client_dependencies",
-      "client_view",
-    ])
-  ) {
+  const productSidecar = is_product_manifest(checked);
+  const expectedSidecarKeys = productSidecar
+    ? ["client_artifact", "client_dependencies", "client_view", "format", "protocol", "source_revision", "version"]
+    : ["client_artifact", "client_dependencies", "client_view", "format", "protocol", "release_id", "source_revision"];
+  if (!_same_keys(sidecar, expectedSidecarKeys)) {
     throw _error(
       "client_sidecar_invalid",
       "client sidecar has an unexpected shape",
     );
   }
-  if (
-    !same(sidecar.format, checked.format) ||
-    !same(sidecar.release_id, checked.release_id) ||
-    !same(sidecar.source_revision, checked.source_revision) ||
-    !same(sidecar.protocol, checked.protocol)
-  ) {
+  if (productSidecar
+    ? !same(sidecar.format, checked.format) || !same(sidecar.version, checked.version) || !same(sidecar.source_revision, checked.source_revision) || !same(sidecar.protocol, checked.protocol)
+    : !same(sidecar.format, checked.format) || !same(sidecar.release_id, checked.release_id) || !same(sidecar.source_revision, checked.source_revision) || !same(sidecar.protocol, checked.protocol)) {
     throw _error(
       "client_sidecar_invalid",
       "client sidecar identity does not match manifest",
@@ -1404,12 +1394,17 @@ export function load_runtime_manifest(
   return [manifest, true, true, []];
 }
 
-// Format 3 is the production manifest.  It deliberately does not reuse the
-// legacy `release_id` field: protocol 4 still receives a SHA-derived release
-// identity through the compatibility adapter, while product identity is the
-// SemVer `version` below.
-export const PRODUCT_MANIFEST_FORMAT = 3;
+// Format 3 is retained as a read-only product format. Format 4 adds the
+// management Web package and the state capability declaration.
+export const LEGACY_PRODUCT_MANIFEST_FORMAT = 3;
+export const PRODUCT_MANIFEST_FORMAT = 4;
 export const PRODUCT_TOOLCHAIN = Object.freeze({ bun: "1.4.4", go: "go1.27.3", cgo_enabled: false });
+export const STATE_CAPABILITY_MARKERS = Object.freeze([
+  "legacy-agent-vm-core@1",
+  "managed-image-catalog@1",
+  "management-operation-audit@1",
+  "session-image-binding@1",
+]);
 
 const PRODUCT_CLIENT_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["agent_vm.ts", "agent_vm.ts", "client", 0o755],
@@ -1422,7 +1417,7 @@ const PRODUCT_CLIENT_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["sync_worktree.ts", "sync_worktree.ts", "support", 0o755],
 ]);
 
-const PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
+export const PRODUCT_LINUX_LEGACY_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["agent_vm.ts", "agent_vm.ts", "client", 0o755],
   ["byte-fs.ts", "byte-fs.ts", "support", 0o644],
   ["client-io.ts", "client-io.ts", "support", 0o644],
@@ -1436,12 +1431,19 @@ const PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["unit:agent-vm-native.service", "systemd/agent-vm-native.service", "unit", 0o644],
 ]);
 
+export const PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
+  ...PRODUCT_LINUX_LEGACY_ARTIFACTS,
+  ["unit:agent-vm-web.service", "systemd/agent-vm-web.service", "unit", 0o644],
+  ["web-config-example", "config/agent-vm-web.json.example", "support", 0o644],
+  ["web-assets-manifest", "web-assets.manifest.json", "support", 0o644],
+]);
+
 export type ProductTarget =
   | { os: "source"; arch: "any" }
   | { os: "linux"; arch: "amd64" | "arm64" };
 
 export interface ProductManifest {
-  format: 3;
+  format: 3 | 4;
   version: string;
   source_revision: string;
   target: ProductTarget;
@@ -1456,10 +1458,14 @@ export interface ProductManifest {
     transport: "legacy-bun" | "go-request";
     actions: Record<string, OperationSpec>;
   };
+  state_compatibility?: {
+    reads: string[];
+    writes: string[];
+  };
 }
 
 export function is_product_manifest(value: unknown): value is ProductManifest {
-  return is_record(value) && value.format === PRODUCT_MANIFEST_FORMAT;
+  return is_record(value) && (value.format === LEGACY_PRODUCT_MANIFEST_FORMAT || value.format === PRODUCT_MANIFEST_FORMAT);
 }
 
 function _product_error(code: string, message: string, detail: unknown = null): ManifestError {
@@ -1474,7 +1480,7 @@ function _product_target(value: unknown): ProductTarget {
   throw _product_error("manifest_invalid", "target must be source/any or linux/amd64|arm64");
 }
 
-function _product_artifacts(value: unknown, target: ProductTarget): Artifact[] {
+function _product_artifacts(value: unknown, target: ProductTarget, format: 3 | 4): Artifact[] {
   if (!Array.isArray(value) || value.length === 0) throw _product_error("manifest_invalid", "artifacts must be a non-empty list");
   const names = new Set<string>();
   const paths = new Set<string>();
@@ -1490,7 +1496,9 @@ function _product_artifacts(value: unknown, target: ProductTarget): Artifact[] {
     names.add(name); paths.add(path);
     return { name, path, role, sha256, mode };
   });
-  const expected = target.os === "source" ? PRODUCT_CLIENT_ARTIFACTS : PRODUCT_LINUX_ARTIFACTS;
+  const expected = target.os === "source"
+    ? PRODUCT_CLIENT_ARTIFACTS
+    : format === LEGACY_PRODUCT_MANIFEST_FORMAT ? PRODUCT_LINUX_LEGACY_ARTIFACTS : PRODUCT_LINUX_ARTIFACTS;
   const actualShape = artifacts.map(({ name, path, role, mode }) => canonical_json([name, path, role, mode])).sort();
   const expectedShape = expected.map((item) => canonical_json(item)).sort();
   if (actualShape.length !== expectedShape.length || actualShape.some((item, index) => item !== expectedShape[index])) throw _product_error("manifest_artifact_set_invalid", "product artifact set differs from the fixed target allowlist");
@@ -1534,14 +1542,18 @@ export function build_product_manifest(
     artifacts: artifacts.map((item) => ({ ...item })),
     actions,
     client_view: { version, source_revision, protocol: PROTOCOL_VERSION, transport, actions },
+    state_compatibility: { reads: [...STATE_CAPABILITY_MARKERS], writes: [...STATE_CAPABILITY_MARKERS] },
   });
 }
 
 export function validate_product_manifest(value: unknown): ProductManifest {
   const root = _require_mapping(value, "manifest");
-  const required = ["actions", "artifacts", "client_view", "format", "protocol", "source_revision", "target", "toolchain", "version"];
+  const format = Number(_require_int(root.format, "format", 1)) as 3 | 4;
+  if (format !== LEGACY_PRODUCT_MANIFEST_FORMAT && format !== PRODUCT_MANIFEST_FORMAT) throw _product_error("manifest_format_unsupported", "manifest format must be 3 or 4");
+  const required = format === PRODUCT_MANIFEST_FORMAT
+    ? ["actions", "artifacts", "client_view", "format", "protocol", "source_revision", "state_compatibility", "target", "toolchain", "version"]
+    : ["actions", "artifacts", "client_view", "format", "protocol", "source_revision", "target", "toolchain", "version"];
   if (!_same_keys(root, required)) throw _product_error("manifest_invalid", "product manifest has an unexpected shape");
-  if (Number(_require_int(root.format, "format", 1)) !== PRODUCT_MANIFEST_FORMAT) throw _product_error("manifest_format_unsupported", "manifest format must be 3");
   const version = _require_string(root.version, "version");
   try { parseSemVer(version); } catch { throw _product_error("manifest_invalid", "version must be valid SemVer 2.0.0"); }
   const source_revision = _require_string(root.source_revision, "source_revision", SOURCE_REVISION_RE);
@@ -1549,11 +1561,21 @@ export function validate_product_manifest(value: unknown): ProductManifest {
   const toolchain = _require_mapping(root.toolchain, "toolchain");
   if (!_same_keys(toolchain, ["bun", "cgo_enabled", "go"]) || toolchain.bun !== PRODUCT_TOOLCHAIN.bun || toolchain.go !== PRODUCT_TOOLCHAIN.go || toolchain.cgo_enabled !== false) throw _product_error("manifest_invalid", "toolchain does not match the fixed release toolchain");
   if (Number(_require_int(root.protocol, "protocol", 1)) !== PROTOCOL_VERSION) throw _product_error("protocol_unsupported", `manifest protocol must be ${PROTOCOL_VERSION}`);
-  const artifacts = _product_artifacts(root.artifacts, target);
+  const artifacts = _product_artifacts(root.artifacts, target, format);
   const actions = _product_actions(root.actions);
   const view = _require_mapping(root.client_view, "client_view");
   if (!_same_keys(view, ["actions", "protocol", "source_revision", "transport", "version"]) || view.version !== version || view.source_revision !== source_revision || Number(view.protocol) !== PROTOCOL_VERSION || (view.transport !== "legacy-bun" && view.transport !== "go-request") || !_json_equal(view.actions, actions)) throw _product_error("manifest_invalid", "client_view does not match product manifest");
-  return { format: 3, version, source_revision, target, toolchain: { bun: PRODUCT_TOOLCHAIN.bun, go: PRODUCT_TOOLCHAIN.go, cgo_enabled: false }, protocol: 4, artifacts, actions, client_view: { version, source_revision, protocol: 4, transport: view.transport, actions } };
+  const result: ProductManifest = { format, version, source_revision, target, toolchain: { bun: PRODUCT_TOOLCHAIN.bun, go: PRODUCT_TOOLCHAIN.go, cgo_enabled: false }, protocol: 4, artifacts, actions, client_view: { version, source_revision, protocol: 4, transport: view.transport, actions } };
+  if (format === PRODUCT_MANIFEST_FORMAT) {
+    const compatibility = _require_mapping(root.state_compatibility, "state_compatibility");
+    if (!_same_keys(compatibility, ["reads", "writes"])) throw _product_error("manifest_invalid", "state_compatibility has an unexpected shape");
+    for (const key of ["reads", "writes"] as const) {
+      const values = compatibility[key];
+      if (!Array.isArray(values) || values.length !== STATE_CAPABILITY_MARKERS.length || values.some((item) => typeof item !== "string") || values.join("\0") !== [...STATE_CAPABILITY_MARKERS].join("\0")) throw _product_error("manifest_state_compatibility_invalid", `state_compatibility.${key} must declare all state capability markers in order`);
+    }
+    result.state_compatibility = { reads: [...STATE_CAPABILITY_MARKERS], writes: [...STATE_CAPABILITY_MARKERS] };
+  }
+  return result;
 }
 
 function _verify_product_elf(path: string, target: ProductTarget): void {

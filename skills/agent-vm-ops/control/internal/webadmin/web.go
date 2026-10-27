@@ -6,8 +6,11 @@ import (
 	"encoding/base64"
 	"errors"
 	"io"
+	"io/fs"
+	"mime"
 	"net"
 	"net/http"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/webassets"
 )
 
 const (
@@ -82,6 +86,7 @@ func (response *clientResponse) Close() error {
 type WebServer struct {
 	Config config.ManagementConfig
 	Client *AuthorityClient
+	Assets fs.FS
 	Clock  func() time.Time
 
 	sessionsMu sync.Mutex
@@ -94,7 +99,7 @@ type webSession struct {
 	ExpiresAt time.Time
 }
 
-func NewWebServer(cfg config.ManagementConfig, client *AuthorityClient) (*WebServer, error) {
+func NewWebServer(cfg config.ManagementConfig, client *AuthorityClient, assets ...fs.FS) (*WebServer, error) {
 	if !cfg.Enabled {
 		return nil, errors.New("management_disabled: Web management is disabled")
 	}
@@ -109,7 +114,14 @@ func NewWebServer(cfg config.ManagementConfig, client *AuthorityClient) (*WebSer
 		ttl = 900
 	}
 	cfg.SessionTTLSeconds = ttl
-	return &WebServer{Config: cfg, Client: client, Clock: time.Now, sessions: make(map[string]webSession)}, nil
+	var assetFS fs.FS = webassets.Files
+	if len(assets) > 1 {
+		return nil, errors.New("web assets must be provided at most once")
+	}
+	if len(assets) == 1 {
+		assetFS = assets[0]
+	}
+	return &WebServer{Config: cfg, Client: client, Assets: assetFS, Clock: time.Now, sessions: make(map[string]webSession)}, nil
 }
 
 func (server *WebServer) Handler() http.Handler {
@@ -119,9 +131,14 @@ func (server *WebServer) Handler() http.Handler {
 		writeProblem(c.Writer, newAPIError("internal_error", "internal management server failure", http.StatusInternalServerError, "internal", true, ""))
 		c.Abort()
 	}))
-	router.Any("/api/v1/*path", func(c *gin.Context) {
+	apiHandler := func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
 		server.handle(c.Writer, c.Request)
+	}
+	router.Any("/api/v1", apiHandler)
+	router.Any("/api/v1/*path", apiHandler)
+	router.NoRoute(func(c *gin.Context) {
+		server.serveStatic(c.Writer, c.Request)
 	})
 	return router
 }
@@ -165,6 +182,80 @@ func (server *WebServer) handle(writer http.ResponseWriter, request *http.Reques
 		return
 	}
 	server.proxy(writer, request, path, subject)
+}
+
+func (server *WebServer) serveStatic(writer http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet && request.Method != http.MethodHead {
+		writeProblem(writer, newAPIError("invalid_request", "method is not supported", http.StatusMethodNotAllowed, "request_validation", false, ""))
+		return
+	}
+	if _, err := server.authenticatedSubject(request); err != nil {
+		writeProblem(writer, err)
+		return
+	}
+	if server.Assets == nil {
+		writeProblem(writer, newAPIError("internal_error", "Web assets are unavailable", http.StatusInternalServerError, "internal", true, ""))
+		return
+	}
+	name, valid := staticAssetName(request.URL.Path)
+	if !valid {
+		writeProblem(writer, newAPIError("not_found", "Web asset was not found", http.StatusNotFound, "request_validation", false, ""))
+		return
+	}
+	data, found := readStaticAsset(server.Assets, name)
+	if !found && name != "index.html" && staticDeepLink(request, name) {
+		name = "index.html"
+		data, found = readStaticAsset(server.Assets, name)
+	}
+	if !found {
+		writeProblem(writer, newAPIError("not_found", "Web asset was not found", http.StatusNotFound, "request_validation", false, ""))
+		return
+	}
+	contentType := mime.TypeByExtension(path.Ext(name))
+	if contentType == "" {
+		contentType = "application/octet-stream"
+	}
+	if strings.HasPrefix(contentType, "text/") || contentType == "application/javascript" || contentType == "application/json" {
+		contentType += "; charset=utf-8"
+	}
+	writer.Header().Set("Content-Type", contentType)
+	writer.Header().Set("X-Content-Type-Options", "nosniff")
+	if name == "index.html" || !strings.HasPrefix(name, "assets/") {
+		writer.Header().Set("Cache-Control", "no-cache")
+	} else {
+		writer.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	}
+	writer.WriteHeader(http.StatusOK)
+	if request.Method != http.MethodHead {
+		_, _ = writer.Write(data)
+	}
+}
+
+func staticAssetName(raw string) (string, bool) {
+	if raw == "" || strings.ContainsRune(raw, '\x00') || strings.Contains(raw, "\\") {
+		return "", false
+	}
+	name := strings.TrimPrefix(raw, "/")
+	if name == "" {
+		return "index.html", true
+	}
+	clean := path.Clean(name)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || strings.HasPrefix(clean, "/") {
+		return "", false
+	}
+	return clean, true
+}
+
+func readStaticAsset(files fs.FS, name string) ([]byte, bool) {
+	data, err := fs.ReadFile(files, name)
+	return data, err == nil
+}
+
+func staticDeepLink(request *http.Request, name string) bool {
+	if strings.Contains(path.Base(name), ".") {
+		return false
+	}
+	return strings.Contains(request.Header.Get("Accept"), "text/html") || request.Header.Get("Accept") == ""
 }
 
 func (server *WebServer) authenticatedSubject(request *http.Request) (string, *APIError) {

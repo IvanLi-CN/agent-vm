@@ -1,0 +1,26 @@
+[Unit]
+Description=Agent VM management Web service
+Requires=agent-vm-native.service
+After=agent-vm-native.service
+
+[Service]
+Type=simple
+User=agent-vm-web
+Group=agent-vm-web
+ExecStart=/opt/agent-vm-native/bin/agent-vm-control web --config /etc/agent-vm-native/web.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX
+UMask=0077
+RuntimeDirectory=agent-vm-web
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target
