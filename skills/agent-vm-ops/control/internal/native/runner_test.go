@@ -58,6 +58,38 @@ func TestRunnerUsesTheProtocolOutputSplit(t *testing.T) {
 	}
 }
 
+func TestCleanupTrackedPerformsFinalDiscovery(t *testing.T) {
+	discoverCalls := 0
+	presentCalls := 0
+	if err := cleanupTrackedWith(42, cleanupOperations{
+		discover: func(root int) error {
+			if root != 42 {
+				t.Fatalf("cleanup root = %d, want 42", root)
+			}
+			discoverCalls++
+			return nil
+		},
+		kill: func() error { return nil },
+		reap: func() error { return nil },
+		present: func() (int, error) {
+			presentCalls++
+			if presentCalls == 1 {
+				return 0, nil
+			}
+			if presentCalls == 2 {
+				return 1, nil
+			}
+			return 0, nil
+		},
+		sleep: func(time.Duration) {},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if discoverCalls < 4 || presentCalls < 4 {
+		t.Fatalf("cleanup scans = discover:%d present:%d, want a final rescan after the first empty observation", discoverCalls, presentCalls)
+	}
+}
+
 func TestRunnerAllowsIndependentCommandsToOverlap(t *testing.T) {
 	runner := NewRunner()
 	started := time.Now()

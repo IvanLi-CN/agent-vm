@@ -20,7 +20,7 @@ Each session owns at most one managed-container slot, including preparing, stopp
 
 Renewal is explicit and bounded. Acquire, status, SSH, execution and transfer do not renew a lease. A changed generation or expired lease rejects late readiness and native results. Durable state, locks and timers make repeated requests idempotent without hiding partial cleanup.
 
-Native process observation is race-tolerant: when a tracked process exits between `/proc` enumeration and identity reads, the controller treats it as gone and continues the normal bounded cleanup path. Linux worker identities without a process-group ID remain unverified and keep reconciliation blocked. When a worker root disappears, cleanup must still inspect its process group before declaring the worker gone; without delegated cgroup tracking, the isolated process group is also the ownership boundary for reparented descendants. Other process-table read errors remain failures.
+Native process observation is race-tolerant: when a tracked process exits between `/proc` enumeration and identity reads, the controller treats it as gone and continues the normal bounded cleanup path. Linux worker identities without a process-group ID remain unverified and keep reconciliation blocked. Process-group discovery remains fenced by the worker PID start time, and bounded cleanup performs a final observation after an empty scan. When a worker root disappears, cleanup must still inspect its process group before declaring the worker gone; without delegated cgroup tracking, the isolated process group is also the ownership boundary for reparented descendants. Other process-table read errors remain failures.
 
 ## Access and isolation
 

@@ -308,18 +308,36 @@ func waitForPipes(stdoutDone, stderrDone <-chan struct{}, timeout time.Duration)
 }
 
 func cleanupTracked(tracker *processTracker, root int) error {
+	return cleanupTrackedWith(root, cleanupOperations{
+		discover: tracker.Discover,
+		kill:     tracker.Kill,
+		reap:     tracker.Reap,
+		present:  tracker.Present,
+		sleep:    time.Sleep,
+	})
+}
+
+type cleanupOperations struct {
+	discover func(int) error
+	kill     func() error
+	reap     func() error
+	present  func() (int, error)
+	sleep    func(time.Duration)
+}
+
+func cleanupTrackedWith(root int, operations cleanupOperations) error {
 	var first error
 	for attempt := 0; attempt < 10; attempt++ {
-		if err := tracker.Discover(root); err != nil && first == nil {
+		if err := operations.discover(root); err != nil && first == nil {
 			first = err
 		}
-		if err := tracker.Kill(); err != nil && first == nil {
+		if err := operations.kill(); err != nil && first == nil {
 			first = err
 		}
-		if err := tracker.Reap(); err != nil && first == nil {
+		if err := operations.reap(); err != nil && first == nil {
 			first = err
 		}
-		present, err := tracker.Present()
+		present, err := operations.present()
 		if err != nil {
 			if first == nil {
 				first = err
@@ -327,14 +345,29 @@ func cleanupTracked(tracker *processTracker, root int) error {
 			break
 		}
 		if present == 0 {
-			return first
+			if err := operations.discover(root); err != nil {
+				if first == nil {
+					first = err
+				}
+				continue
+			}
+			present, err = operations.present()
+			if err != nil {
+				if first == nil {
+					first = err
+				}
+				continue
+			}
+			if present == 0 {
+				return first
+			}
 		}
-		time.Sleep(50 * time.Millisecond)
+		operations.sleep(50 * time.Millisecond)
 	}
-	if err := tracker.Reap(); err != nil && first == nil {
+	if err := operations.reap(); err != nil && first == nil {
 		first = err
 	}
-	if present, err := tracker.Present(); err != nil && first == nil {
+	if present, err := operations.present(); err != nil && first == nil {
 		first = err
 	} else if err == nil && present > 0 && first == nil {
 		first = errors.New("tracked native descendants remain after cleanup")

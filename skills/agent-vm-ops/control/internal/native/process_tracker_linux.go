@@ -28,6 +28,7 @@ type processTracker struct {
 	owner      int
 	root       int
 	rootGroup  int
+	rootStart  string
 	baseline   map[int]trackedProcess
 	tracked    map[int]trackedProcess
 	cgroupPath string
@@ -46,10 +47,11 @@ func (tracker *processTracker) Identity(root int) (WorkerIdentity, error) {
 func (tracker *processTracker) Register(root int) {
 	tracker.root = root
 	// Commands are started with Setpgid, so the PID is the expected process
-	// group even if the root exits before Getpgid can observe it.
+	// group even if the root exits before procfs identity can be observed.
 	tracker.rootGroup = root
-	if group, err := unix.Getpgid(root); err == nil {
-		tracker.rootGroup = group
+	if process, err := readProcess(root); err == nil {
+		tracker.rootStart = process.start
+		tracker.rootGroup = process.group
 	}
 }
 
@@ -142,8 +144,11 @@ func (tracker *processTracker) discover(root int) error {
 		return fmt.Errorf("inspect native process tree: %w", err)
 	}
 	if rootProcess, present := all[root]; present {
-		if tracker.rootGroup == 0 {
-			tracker.rootGroup = rootProcess.group
+		if tracker.rootStart == "" {
+			tracker.rootStart = rootProcess.start
+		}
+		if tracker.rootStart != rootProcess.start {
+			return fmt.Errorf("native process identity changed for pid %d", root)
 		}
 		if tracker.rootGroup != rootProcess.group {
 			return fmt.Errorf("native process group changed for pid %d", root)
@@ -161,10 +166,20 @@ func (tracker *processTracker) discover(root int) error {
 	// reparented to the subreaper before the next process-table snapshot. The
 	// isolated process group remains the ownership boundary in that case.
 	if !tracker.hasOwnershipBoundary() && tracker.rootGroup > 0 {
+		groupMembers := make(map[int]trackedProcess)
 		for pid, item := range all {
 			if item.group == tracker.rootGroup {
-				related[pid] = item
+				groupMembers[pid] = item
 			}
+		}
+		if _, rootPresent := all[root]; !rootPresent && tracker.rootStart == "" && len(groupMembers) > 0 {
+			return errors.New("native process root identity unavailable while its process group remains")
+		}
+		for pid, item := range groupMembers {
+			if pid == root && tracker.rootStart != "" && item.start != tracker.rootStart {
+				return fmt.Errorf("native process identity changed for pid %d", root)
+			}
+			related[pid] = item
 		}
 	}
 	// A detached descendant is only owned after this tracker has observed it
