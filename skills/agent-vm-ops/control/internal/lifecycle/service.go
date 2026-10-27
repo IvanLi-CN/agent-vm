@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -844,6 +845,16 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	if s.Guest != nil {
 		nativeCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 		defer cancel()
+		if task.VMIP == nil {
+			ip, allocationErr := s.allocateGuestIP(nativeCtx, task.InstanceName)
+			if allocationErr != nil {
+				return s.failTask(ctx, task, "native-network", allocationErr)
+			}
+			task.VMIP = &ip
+			if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"vm_ip": ip, "updated_at": nowString(s.Clock())}); err != nil {
+				return nil, s.sqliteError(err)
+			}
+		}
 		if created {
 			if err := s.Guest.Init(nativeCtx, s.Config.ImageAlias, task.InstanceName); err != nil {
 				return s.failTask(ctx, task, "native-init", err)
@@ -851,6 +862,9 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		}
 		if err := s.setOwnership(nativeCtx, task); err != nil {
 			return s.failTask(ctx, task, "native-ownership", err)
+		}
+		if err := s.configureNetwork(nativeCtx, task); err != nil {
+			return s.failTask(ctx, task, "native-network", err)
 		}
 		if err := s.Guest.ConfigSet(nativeCtx, task.InstanceName, "limits.cpu", strconv.FormatInt(resources["cpu"], 10)); err != nil {
 			return s.failTask(ctx, task, "native-config", err)
@@ -868,7 +882,9 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if readinessErr != nil {
 			return s.failTask(ctx, task, "guest-readiness", readinessErr)
 		}
-		task.VMIP = &ip
+		if ip != *task.VMIP {
+			return s.failTask(ctx, task, "guest-readiness", protocol.NewError("guest_ip_mismatch", "guest IPv4 address does not match the allocated fixed address", map[string]any{"expected": *task.VMIP, "actual": ip}))
+		}
 		if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"vm_ip": ip, "updated_at": nowString(s.Clock())}); err != nil {
 			return nil, s.sqliteError(err)
 		}
@@ -1803,6 +1819,95 @@ func (s *Service) setOwnership(ctx context.Context, task *state.Task) error {
 	} {
 		if err := s.Guest.ConfigSet(ctx, task.InstanceName, key, value); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) allocateGuestIP(ctx context.Context, ownName string) (string, error) {
+	start := net.ParseIP(s.Config.VMIPStart).To4()
+	end := net.ParseIP(s.Config.VMIPEnd).To4()
+	if start == nil || end == nil {
+		return "", protocol.NewError("config_invalid", "managed guest IPv4 range is unavailable", nil)
+	}
+	startValue := uint32(start[0])<<24 | uint32(start[1])<<16 | uint32(start[2])<<8 | uint32(start[3])
+	endValue := uint32(end[0])<<24 | uint32(end[1])<<16 | uint32(end[2])<<8 | uint32(end[3])
+	if startValue > endValue {
+		return "", protocol.NewError("config_invalid", "managed guest IPv4 range is invalid", nil)
+	}
+	used := make(map[string]struct{})
+	tasks, err := s.Store.ListTasks(ctx)
+	if err != nil {
+		return "", s.sqliteError(err)
+	}
+	for _, task := range tasks {
+		if task.InstanceName == ownName || task.State == stateAbsent || task.VMIP == nil {
+			continue
+		}
+		used[*task.VMIP] = struct{}{}
+	}
+	if inventory, ok := s.Guest.(native.NetworkInventory); ok {
+		addresses, inventoryErr := inventory.NetworkIPs(ctx)
+		if inventoryErr != nil {
+			return "", protocol.NewError("vm_ip_unverified", "native network address inventory is unavailable", map[string]any{"cause": inventoryErr.Error(), "outcome_verified": false})
+		}
+		for address := range addresses {
+			used[address] = struct{}{}
+		}
+	}
+	for value := startValue; ; value++ {
+		candidate := net.IPv4(byte(value>>24), byte(value>>16), byte(value>>8), byte(value)).String()
+		if _, occupied := used[candidate]; !occupied {
+			return candidate, nil
+		}
+		if value == endValue {
+			break
+		}
+	}
+	return "", protocol.NewError("vm_ip_exhausted", "no managed-container private IP is available", nil)
+}
+
+func (s *Service) configureNetwork(ctx context.Context, task *state.Task) error {
+	if task == nil || task.VMIP == nil {
+		return protocol.NewError("mapping_unverified", "managed guest IPv4 address is unavailable", map[string]any{"outcome_verified": false})
+	}
+	properties := []struct{ key, value string }{
+		{"ipv4.address", *task.VMIP},
+		{"security.mac_filtering", "true"},
+		{"security.ipv4_filtering", "true"},
+		{"security.ipv6_filtering", "true"},
+		{"security.port_isolation", "true"},
+		{"security.acls", s.Config.NetworkACL},
+		{"security.acls.default.ingress.action", "allow"},
+		{"security.acls.default.egress.action", "allow"},
+	}
+	for _, property := range properties {
+		if err := s.Guest.DeviceSet(ctx, task.InstanceName, "eth0", property.key, property.value); err != nil {
+			return err
+		}
+	}
+	info, err := s.Guest.Config(ctx, task.InstanceName)
+	if err != nil {
+		return protocol.NewError("network_unverified", "managed guest network configuration could not be verified", map[string]any{"cause": err.Error(), "outcome_verified": false})
+	}
+	expanded, ok := info["expanded_devices"].(map[string]any)
+	if !ok {
+		return protocol.NewError("network_unverified", "managed guest network devices are unavailable", map[string]any{"outcome_verified": false})
+	}
+	eth0, ok := expanded["eth0"].(map[string]any)
+	if !ok {
+		return protocol.NewError("network_unverified", "managed guest eth0 device is unavailable", map[string]any{"outcome_verified": false})
+	}
+	expected := map[string]string{
+		"type": "nic", "network": s.Config.Network, "ipv4.address": *task.VMIP,
+		"security.mac_filtering": "true", "security.ipv4_filtering": "true",
+		"security.ipv6_filtering": "true", "security.port_isolation": "true",
+		"security.acls":                        s.Config.NetworkACL,
+		"security.acls.default.ingress.action": "allow", "security.acls.default.egress.action": "allow",
+	}
+	for key, expectedValue := range expected {
+		if eth0[key] != expectedValue {
+			return protocol.NewError("network_unverified", "managed guest network isolation differs from configuration", map[string]any{"field": key, "expected": expectedValue, "actual": eth0[key], "outcome_verified": true})
 		}
 	}
 	return nil

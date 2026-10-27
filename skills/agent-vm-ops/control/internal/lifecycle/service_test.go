@@ -28,11 +28,14 @@ type startupGuest struct {
 	config      map[string]any
 	configErr   error
 	stopErr     error
+	deviceSets  []string
 }
 
 func (guest *startupGuest) Init(context.Context, string, string) error              { return nil }
 func (guest *startupGuest) ConfigSet(context.Context, string, string, string) error { return nil }
-func (guest *startupGuest) DeviceSet(context.Context, string, string, string, string) error {
+
+func (guest *startupGuest) DeviceSet(_ context.Context, _ string, device, key, value string) error {
+	guest.deviceSets = append(guest.deviceSets, device+":"+key+"="+value)
 	return nil
 }
 func (guest *startupGuest) DeviceAdd(context.Context, string, string, string, map[string]string) error {
@@ -162,6 +165,29 @@ func TestWaitForGuestReadyPollsUntilIPv4IsVisible(t *testing.T) {
 	}
 	if ip != "10.250.19.20" || guest.statusCalls != 2 {
 		t.Fatalf("ip=%q status_calls=%d", ip, guest.statusCalls)
+	}
+}
+
+func TestConfigureNetworkMatchesManagedContainerContract(t *testing.T) {
+	guest := &startupGuest{config: map[string]any{"expanded_devices": map[string]any{
+		"eth0": map[string]any{
+			"type": "nic", "network": "agentsbr0", "ipv4.address": "10.250.19.20",
+			"security.mac_filtering": "true", "security.ipv4_filtering": "true",
+			"security.ipv6_filtering": "true", "security.port_isolation": "true",
+			"security.acls":                        "agent-vm-acl",
+			"security.acls.default.ingress.action": "allow",
+			"security.acls.default.egress.action":  "allow",
+		},
+	}}}
+	cfg := config.Defaults()
+	cfg.Network = "agentsbr0"
+	cfg.NetworkACL = "agent-vm-acl"
+	service := &Service{Config: cfg, Guest: guest}
+	if err := service.configureNetwork(context.Background(), &state.Task{InstanceName: "agent-ready", VMIP: stringPointer("10.250.19.20")}); err != nil {
+		t.Fatal(err)
+	}
+	if len(guest.deviceSets) != 8 || guest.deviceSets[0] != "eth0:ipv4.address=10.250.19.20" {
+		t.Fatalf("device sets = %#v", guest.deviceSets)
 	}
 }
 
