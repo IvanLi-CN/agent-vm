@@ -13,7 +13,7 @@ TimeoutStopSec=30s
 NoNewPrivileges=yes
 PrivateTmp=yes
 Group=agent-vm-web
-UMask=0077
+UMask=0027
 RuntimeDirectory=agent-vm-native
 RuntimeDirectoryMode=0750
 
