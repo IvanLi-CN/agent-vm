@@ -1370,6 +1370,32 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			if !consistent {
 				warnings = append(warnings, map[string]any{"code": "observation_inconsistent", "message": "durable state changed while collecting metrics"})
 			}
+			pending, pendingErr := s.Store.PendingOperations(ctx)
+			if pendingErr != nil {
+				return nil, s.sqliteError(pendingErr)
+			}
+			pendingOperations := make([]any, 0, len(pending))
+			for _, operation := range pending {
+				item := map[string]any{
+					"operation_id": operation.OperationID,
+					"action":       operation.Action,
+					"session_id":   nil,
+					"generation":   nil,
+					"created_at":   operation.CreatedAt,
+				}
+				if operation.SessionID != nil {
+					item["session_id"] = *operation.SessionID
+				}
+				if operation.Generation != nil {
+					item["generation"] = *operation.Generation
+				}
+				for _, key := range []string{"task_id", "task_generation", "acquire_resources"} {
+					if value, ok := operation.Response[key]; ok {
+						item[key] = value
+					}
+				}
+				pendingOperations = append(pendingOperations, item)
+			}
 			var cpuObservation *observe.CPUObservation
 			var cpuObservationErr error
 			if s.CPU != nil {
@@ -1456,7 +1482,8 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				"observed_at": start, "up": nativeUp, "draining": draining, "admission_ready": s.Ready(),
 				"resources": resourcesValue, "ct_cpu": ctCPU,
 				"default_admission": map[string]any{"requested": map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "ready": s.Ready(), "reasons": defaultReasons},
-				"task_states":       states, "instances": len(tasks), "warnings": warnings, "warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil), "native_unavailable": boolInt(!nativeUp)},
+				"task_states":       states, "pending_operations": pendingOperations, "instances": len(tasks), "warnings": warnings,
+				"warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil), "native_unavailable": boolInt(!nativeUp)},
 			}, nil
 		}
 	}
