@@ -27,7 +27,7 @@ export function VMsPage() {
   const vmQuery = useQuery({ queryKey: ["vms", q, state, leaseState], queryFn: () => listVMs({ q, state, leaseState }), refetchInterval: 10_000, refetchIntervalInBackground: false });
   const selected = vmQuery.data?.items.find((vm) => vm.task_id === selectedId) ?? vmQuery.data?.items[0] ?? null;
   useEffect(() => { if (selected && selected.task_id !== selectedId) setSelectedId(selected.task_id); }, [selected, selectedId]);
-  const submitMutation = useMutation({ mutationFn: ({ reason }: { reason: string }) => submitVMAction(selected?.task_id ?? "", action ?? "restart", reason, preview!, selected?.generation ?? ""), onSuccess: () => { setAction(null); setPreview(null); setActionError(null); void queryClient.invalidateQueries({ queryKey: ["operations"] }); } });
+  const submitMutation = useMutation({ mutationFn: ({ reason }: { reason: string }) => submitVMAction(selected?.task_id ?? "", action ?? "restart", reason, preview!, selected?.generation ?? ""), onSuccess: () => { setAction(null); setPreview(null); setActionError(null); void queryClient.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => setActionError(error instanceof Error ? error.message : "internal_error") });
 
   const openAction = async (nextAction: string) => {
     if (!selected) return;
