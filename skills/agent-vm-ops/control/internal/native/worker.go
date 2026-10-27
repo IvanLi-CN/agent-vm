@@ -19,6 +19,12 @@ type WorkerRecorder interface {
 	WorkerFinished(context.Context, string, WorkerIdentity, error) error
 }
 
+// WorkerStartGuard can refuse a native start before the process exists when
+// the operation already has unresolved worker ownership.
+type WorkerStartGuard interface {
+	WorkerStartAllowed(context.Context, string) error
+}
+
 type workerContextKey struct{}
 
 type workerBinding struct {

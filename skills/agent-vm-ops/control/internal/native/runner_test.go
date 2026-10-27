@@ -19,6 +19,11 @@ type testWorkerRecorder struct {
 	finished []error
 }
 
+type blockingWorkerRecorder struct {
+	testWorkerRecorder
+	err error
+}
+
 func (recorder *testWorkerRecorder) WorkerStarted(_ context.Context, _ string, identity WorkerIdentity) error {
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
@@ -31,6 +36,10 @@ func (recorder *testWorkerRecorder) WorkerFinished(_ context.Context, _ string, 
 	defer recorder.mu.Unlock()
 	recorder.finished = append(recorder.finished, err)
 	return nil
+}
+
+func (recorder *blockingWorkerRecorder) WorkerStartAllowed(context.Context, string) error {
+	return recorder.err
 }
 
 func TestLimitedBufferReportsTheWholeInputWhenTruncated(t *testing.T) {
@@ -147,6 +156,20 @@ func TestRunnerAllowsIndependentCommandsToOverlap(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 450*time.Millisecond {
 		t.Fatalf("independent native commands were serialized: %s", elapsed)
+	}
+}
+
+func TestRunnerAppliesWorkerStartGuardBeforeSpawn(t *testing.T) {
+	sentinel := errors.New("worker start blocked")
+	marker := filepath.Join(t.TempDir(), "spawned")
+	recorder := &blockingWorkerRecorder{err: sentinel}
+	ctx := WithWorkerRecorder(context.Background(), "operation", recorder)
+	_, err := NewRunner().Run(ctx, []string{"/bin/sh", "-c", "echo spawned > \"$1\"", "sh", marker}, nil)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Run() error = %v, want %v", err, sentinel)
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("worker start guard allowed command side effect: stat error = %v", statErr)
 	}
 }
 

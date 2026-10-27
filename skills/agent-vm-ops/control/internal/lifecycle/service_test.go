@@ -595,11 +595,14 @@ func TestWorkerFinishedKeepsFailedWorkerReconciliable(t *testing.T) {
 		t.Fatal(err)
 	}
 	later := native.WorkerIdentity{PID: 456, StartTime: "later", ProcessGroup: 456}
-	if err := service.WorkerStarted(context.Background(), operationID, later); err != nil {
-		t.Fatal(err)
+	if err := service.WorkerStartAllowed(context.Background(), operationID); !errors.Is(err, errUnresolvedWorker) {
+		t.Fatalf("later worker gate error = %v, want unresolved-worker error", err)
 	}
-	if err := service.WorkerFinished(context.Background(), operationID, later, nil); err != nil {
-		t.Fatal(err)
+	if err := service.WorkerStarted(context.Background(), operationID, later); !errors.Is(err, errUnresolvedWorker) {
+		t.Fatalf("later worker start error = %v, want unresolved-worker error", err)
+	}
+	if err := service.WorkerFinished(context.Background(), operationID, later, nil); !errors.Is(err, errUnresolvedWorker) {
+		t.Fatalf("later worker finish error = %v, want unresolved-worker error", err)
 	}
 	operation, err := store.GetOperation(context.Background(), operationID)
 	if err != nil {
@@ -612,6 +615,86 @@ func TestWorkerFinishedKeepsFailedWorkerReconciliable(t *testing.T) {
 	}
 	if worker["error"] != "native cleanup remained uncertain" {
 		t.Fatalf("failed worker error = %#v", worker["error"])
+	}
+}
+
+func TestReconcilePersistsVerifiedExitedWorker(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "exited-worker.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	operationID := "exited-worker"
+	if err := store.RecordOperation(context.Background(), operationID, "admin-reconcile", nil, nil, map[string]any{
+		"outcome": "pending",
+		"worker": map[string]any{
+			"pid":           int64(999999999),
+			"start_time":    "missing",
+			"process_group": int64(999999999),
+			"state":         "running",
+			"error":         "native cleanup remained uncertain",
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.reconcilePendingWorkers(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	if !ok || worker["state"] != "exited" {
+		t.Fatalf("reconciled worker = %#v, want persisted exited state", operation.Response)
+	}
+}
+
+func TestRecoverPendingRetriesVerifiedExitedMaintenanceWorker(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "exited-maintenance.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	request := protocol.Request{
+		"protocol":     protocol.Version,
+		"action":       "admin-reconcile",
+		"apply":        true,
+		"generation":   int64(0),
+		"operation_id": "recover-exited-maintenance",
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "recover-exited-maintenance", "admin-reconcile", nil, &generation, map[string]any{
+		"outcome":         "pending",
+		"_request_digest": digest,
+		"_request":        map[string]any(request),
+		"worker":          map[string]any{"state": "exited", "error": "native command failed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.recoverPending(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), "recover-exited-maintenance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "success" {
+		t.Fatalf("recovered exited maintenance operation = %#v", operation)
 	}
 }
 

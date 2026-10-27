@@ -68,7 +68,7 @@ type workerKillOps struct {
 	readIdentity func(int) (WorkerIdentity, error)
 	workerAlive  func(WorkerIdentity) (bool, error)
 	sendSignal   func(int) error
-	killGroup    func(int) error
+	killGroup    func(WorkerIdentity) error
 }
 
 func workerRootExited(identity WorkerIdentity, workerAlive func(WorkerIdentity) (bool, error)) error {
@@ -91,9 +91,7 @@ func KillWorker(identity WorkerIdentity) error {
 		sendSignal: func(fd int) error {
 			return unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
 		},
-		killGroup: func(group int) error {
-			return unix.Kill(-group, unix.SIGKILL)
-		},
+		killGroup: killProcessGroup,
 	})
 }
 
@@ -122,13 +120,77 @@ func killWorkerWith(identity WorkerIdentity, ops workerKillOps) error {
 	if current.ProcessGroup != identity.ProcessGroup {
 		return fmt.Errorf("native worker process group changed for pid %d", identity.PID)
 	}
-	if err := ops.sendSignal(fd); err != nil && !errors.Is(err, unix.ESRCH) {
+	if err := ops.sendSignal(fd); err != nil {
+		if errors.Is(err, unix.ESRCH) {
+			return workerRootExited(identity, ops.workerAlive)
+		}
 		return fmt.Errorf("kill native worker: %w", err)
 	}
 	if current.ProcessGroup == current.PID {
-		if err := ops.killGroup(current.ProcessGroup); err != nil && !errors.Is(err, unix.ESRCH) {
+		if err := ops.killGroup(current); err != nil && !errors.Is(err, unix.ESRCH) {
 			return fmt.Errorf("kill native worker process group: %w", err)
 		}
 	}
 	return nil
+}
+
+// killProcessGroup uses pidfds for each member after anchoring the group to
+// the original root identity. A numeric PGID is not sufficient after the root
+// exits because the same PID can later become an unrelated process group.
+func killProcessGroup(identity WorkerIdentity) error {
+	all, err := readProcessTable()
+	if err != nil {
+		return err
+	}
+	root, ok := all[identity.PID]
+	if !ok {
+		return workerRootExited(identity, WorkerAlive)
+	}
+	if root.start != identity.StartTime {
+		return fmt.Errorf("native worker identity changed for pid %d", identity.PID)
+	}
+	if root.group != identity.ProcessGroup {
+		return fmt.Errorf("native worker process group changed for pid %d", identity.PID)
+	}
+	var first error
+	for pid, item := range all {
+		if item.group != identity.ProcessGroup || item.state == 'Z' {
+			continue
+		}
+		fd, openErr := unix.PidfdOpen(pid, 0)
+		if errors.Is(openErr, unix.ESRCH) {
+			continue
+		}
+		if openErr != nil {
+			if first == nil {
+				first = fmt.Errorf("open pidfd for process-group member %d: %w", pid, openErr)
+			}
+			continue
+		}
+		current, readErr := readProcess(pid)
+		if processGone(readErr) {
+			_ = unix.Close(fd)
+			continue
+		}
+		if readErr != nil {
+			_ = unix.Close(fd)
+			if first == nil {
+				first = fmt.Errorf("recheck process-group member %d: %w", pid, readErr)
+			}
+			continue
+		}
+		if current.start != item.start || current.group != identity.ProcessGroup {
+			_ = unix.Close(fd)
+			if first == nil {
+				first = fmt.Errorf("process-group member identity changed for pid %d", pid)
+			}
+			continue
+		}
+		signalErr := unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
+		_ = unix.Close(fd)
+		if signalErr != nil && !errors.Is(signalErr, unix.ESRCH) && first == nil {
+			first = fmt.Errorf("kill process-group member %d: %w", pid, signalErr)
+		}
+	}
+	return first
 }

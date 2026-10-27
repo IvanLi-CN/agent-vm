@@ -173,7 +173,7 @@ func (s *Service) operationActive(operationID string) bool {
 }
 
 func (s *Service) WorkerStarted(ctx context.Context, operationID string, identity native.WorkerIdentity) error {
-	return s.recordWorker(ctx, operationID, map[string]any{
+	return s.recordWorkerCallback(ctx, operationID, map[string]any{
 		"pid":           identity.PID,
 		"start_time":    identity.StartTime,
 		"process_group": identity.ProcessGroup,
@@ -204,10 +204,39 @@ func (s *Service) WorkerFinished(ctx context.Context, operationID string, identi
 		}
 		worker["error"] = message
 	}
-	return s.recordWorker(ctx, operationID, worker)
+	return s.recordWorkerCallback(ctx, operationID, worker)
 }
 
-func (s *Service) recordWorker(ctx context.Context, operationID string, worker map[string]any) error {
+var errUnresolvedWorker = errors.New("native worker ownership remains unresolved")
+
+func (s *Service) WorkerStartAllowed(ctx context.Context, operationID string) error {
+	if operationID == "" {
+		return nil
+	}
+	operation, err := s.Store.GetOperation(ctx, operationID)
+	if err != nil {
+		return err
+	}
+	if operation == nil {
+		return nil
+	}
+	if previous, ok := operation.Response["worker"].(map[string]any); ok && stringValue(previous["state"]) == "running" {
+		if _, uncertain := previous["error"]; uncertain {
+			return errUnresolvedWorker
+		}
+	}
+	return nil
+}
+
+func (s *Service) recordWorkerCallback(ctx context.Context, operationID string, worker map[string]any) error {
+	return s.updateWorker(ctx, operationID, worker, true)
+}
+
+func (s *Service) recordWorkerState(ctx context.Context, operationID string, worker map[string]any) error {
+	return s.updateWorker(ctx, operationID, worker, false)
+}
+
+func (s *Service) updateWorker(ctx context.Context, operationID string, worker map[string]any, rejectUnresolved bool) error {
 	if operationID == "" {
 		return nil
 	}
@@ -216,11 +245,13 @@ func (s *Service) recordWorker(ctx context.Context, operationID string, worker m
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
 	return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
-		if previous, ok := response["worker"].(map[string]any); ok && stringValue(previous["state"]) == "running" {
-			if _, uncertain := previous["error"]; uncertain {
-				// Once native ownership is uncertain, later successful commands in
-				// the same operation must not erase the identity awaiting repair.
-				return nil
+		if rejectUnresolved {
+			if previous, ok := response["worker"].(map[string]any); ok && stringValue(previous["state"]) == "running" {
+				if _, uncertain := previous["error"]; uncertain {
+					// Once native ownership is uncertain, later successful commands in
+					// the same operation must not start without a durable identity.
+					return errUnresolvedWorker
+				}
 			}
 		}
 		response["worker"] = worker
@@ -257,14 +288,14 @@ func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.O
 			}
 			worker["state"] = "orphaned"
 			worker["observed_at"] = nowString(s.Clock())
-			if err := s.recordWorker(ctx, operation.OperationID, worker); err != nil {
+			if err := s.recordWorkerState(ctx, operation.OperationID, worker); err != nil {
 				return s.sqliteError(err)
 			}
 			return protocol.NewError("startup_reconcile_required", "an orphaned native worker was stopped; retry reconciliation before admission", map[string]any{"operation_id": operation.OperationID})
 		}
 		worker["state"] = "exited"
 		worker["observed_at"] = nowString(s.Clock())
-		if err := s.recordWorker(ctx, operation.OperationID, worker); err != nil {
+		if err := s.recordWorkerState(ctx, operation.OperationID, worker); err != nil {
 			return s.sqliteError(err)
 		}
 	}
@@ -279,7 +310,11 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 		}
 		if workerValue, hasWorker := operation.Response["worker"]; hasWorker {
 			worker, validWorker := workerValue.(map[string]any)
-			if !validWorker || stringValue(worker["state"]) != "finished" || !recoverableOperation(operation.Action) {
+			stateValue := ""
+			if validWorker {
+				stateValue = stringValue(worker["state"])
+			}
+			if !validWorker || (stateValue != "finished" && stateValue != "exited") || !recoverableOperation(operation.Action) {
 				continue
 			}
 		}

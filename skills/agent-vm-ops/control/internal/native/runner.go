@@ -87,6 +87,12 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	command := exec.Command(argv[0], argv[1:]...)
 	configureCommand(command)
 	tracker.configureCommand(command)
+	binding := workerBindingFromContext(ctx)
+	if guard, ok := binding.recorder.(WorkerStartGuard); ok {
+		if err := guard.WorkerStartAllowed(ctx, binding.operationID); err != nil {
+			return Result{}, fmt.Errorf("native worker start blocked: %w", err)
+		}
+	}
 	command.Stdin = bytes.NewReader(input)
 	stdout := &limitedBuffer{limit: r.stdoutLimit()}
 	stderr := &limitedBuffer{limit: r.stderrLimit()}
@@ -141,7 +147,6 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 		}
 		return Result{}, fmt.Errorf("track native worker: %w", trackingErr)
 	}
-	binding := workerBindingFromContext(ctx)
 	var identity WorkerIdentity
 	if binding.recorder != nil {
 		var identityErr error

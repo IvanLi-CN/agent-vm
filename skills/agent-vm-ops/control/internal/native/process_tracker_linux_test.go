@@ -213,6 +213,36 @@ func TestProcessTrackerRechecksRootBeforeGroupClaim(t *testing.T) {
 	}
 }
 
+func TestProcessTrackerAcceptsReapedRootWithEmptyGroup(t *testing.T) {
+	group := 1 << 30
+	tracker := &processTracker{
+		root:         100,
+		rootStart:    "root-start",
+		rootGroup:    group,
+		baseline:     make(map[int]trackedProcess),
+		tracked:      make(map[int]trackedProcess),
+		groupMembers: make(map[int]trackedProcess),
+	}
+	first := map[int]trackedProcess{
+		100: {pid: 100, start: "root-start", parent: 1, group: group, state: 'S'},
+	}
+	empty := map[int]trackedProcess{}
+	snapshot := 0
+	readTable := func() (map[int]trackedProcess, error) {
+		snapshot++
+		if snapshot == 1 {
+			return first, nil
+		}
+		return empty, nil
+	}
+	readRoot := func(int) (trackedProcess, error) {
+		return trackedProcess{}, &os.PathError{Op: "read", Path: "/proc/100/stat", Err: unix.ESRCH}
+	}
+	if err := tracker.discoverWithRead(100, readTable, readRoot); err != nil {
+		t.Fatalf("reaped root discover() error = %v", err)
+	}
+}
+
 func TestWorkerAliveDetectsSurvivingProcessGroupAfterRootExit(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux worker identity required")
@@ -324,7 +354,7 @@ func TestKillWorkerReconcilesIdentityExitAfterPidfdOpen(t *testing.T) {
 					sent = true
 					return nil
 				},
-				killGroup: func(int) error {
+				killGroup: func(WorkerIdentity) error {
 					t.Fatal("killGroup called before worker identity was verified")
 					return nil
 				},
@@ -348,6 +378,30 @@ func TestKillWorkerReconcilesIdentityExitAfterPidfdOpen(t *testing.T) {
 				t.Fatal("killWorkerWith() signalled before worker identity was verified")
 			}
 		})
+	}
+}
+
+func TestKillWorkerDoesNotSignalReusedGroupAfterRootPidfdExit(t *testing.T) {
+	identity := WorkerIdentity{PID: 123, StartTime: "1", ProcessGroup: 123}
+	groupKilled := false
+	err := killWorkerWith(identity, workerKillOps{
+		openPIDFD:  func(int) (int, error) { return 42, nil },
+		closePIDFD: func(int) error { return nil },
+		readIdentity: func(int) (WorkerIdentity, error) {
+			return identity, nil
+		},
+		workerAlive: func(WorkerIdentity) (bool, error) { return false, nil },
+		sendSignal:  func(int) error { return unix.ESRCH },
+		killGroup: func(WorkerIdentity) error {
+			groupKilled = true
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("killWorkerWith() error = %v, want nil", err)
+	}
+	if groupKilled {
+		t.Fatal("killWorkerWith() signalled a numeric group after the pidfd target exited")
 	}
 }
 

@@ -178,6 +178,36 @@ func (tracker *processTracker) discoverWithRead(root int, readTable func() (map[
 		}
 	}
 	related := descendants(all, root)
+	rootExited := false
+	// A root can disappear between the table snapshot and the identity
+	// recheck. Refresh the table and continue through the root-absent path so a
+	// normally reaped root with an empty group is not reported as a tracking
+	// failure.
+	if !tracker.hasOwnershipBoundary() && tracker.rootGroup > 0 && rootPresent {
+		latestRoot, rootErr := readRoot(root)
+		if processGone(rootErr) {
+			refreshed, refreshErr := readTable()
+			if refreshErr != nil {
+				return fmt.Errorf("inspect native process tree after root exit: %w", refreshErr)
+			}
+			if _, reused := refreshed[root]; reused {
+				return fmt.Errorf("native process identity changed for pid %d", root)
+			}
+			all = refreshed
+			related = descendants(all, root)
+			rootPresent = false
+			rootExited = true
+		} else if rootErr != nil {
+			return fmt.Errorf("recheck native process root: %w", rootErr)
+		} else {
+			if latestRoot.start != rootProcess.start {
+				return fmt.Errorf("native process identity changed for pid %d", root)
+			}
+			if latestRoot.group != rootProcess.group {
+				return fmt.Errorf("native process group changed for pid %d", root)
+			}
+		}
+	}
 	cgroupProcesses, err := tracker.cgroupProcesses()
 	if err != nil {
 		return fmt.Errorf("inspect native cgroup: %w", err)
@@ -200,19 +230,6 @@ func (tracker *processTracker) discoverWithRead(root int, readTable func() (map[
 			}
 		}
 		if rootPresent {
-			latestRoot, rootErr := readRoot(root)
-			if processGone(rootErr) {
-				return errors.New("native process root exited while its process group was observed")
-			}
-			if rootErr != nil {
-				return fmt.Errorf("recheck native process root: %w", rootErr)
-			}
-			if latestRoot.start != rootProcess.start {
-				return fmt.Errorf("native process identity changed for pid %d", root)
-			}
-			if latestRoot.group != rootProcess.group {
-				return fmt.Errorf("native process group changed for pid %d", root)
-			}
 			for pid, item := range currentGroup {
 				if previous, ok := tracker.groupMembers[pid]; ok && previous.start != item.start {
 					return fmt.Errorf("native process identity changed for pid %d", pid)
@@ -221,6 +238,15 @@ func (tracker *processTracker) discoverWithRead(root int, readTable func() (map[
 				related[pid] = item
 			}
 		} else {
+			if rootExited && len(currentGroup) == 0 {
+				alive, groupErr := workerGroupAlive(tracker.rootGroup, readTable)
+				if groupErr != nil {
+					return fmt.Errorf("inspect native process group after root exit: %w", groupErr)
+				}
+				if alive {
+					return errors.New("native process group remains after root exit")
+				}
+			}
 			if tracker.rootStart == "" && len(currentGroup) > 0 {
 				return errors.New("native process root identity unavailable while its process group remains")
 			}
