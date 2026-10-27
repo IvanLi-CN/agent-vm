@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -112,6 +113,8 @@ func (err *TransactionError) Error() string {
 
 func (err *TransactionError) Unwrap() error { return err.Cause }
 
+func (err *TransactionError) Uncertain() bool { return err.StateCommitted == nil }
+
 func committed(value bool) *bool { return &value }
 
 type Task struct {
@@ -157,10 +160,11 @@ type Operation struct {
 }
 
 type Store struct {
-	path      string
-	write     *sql.DB
-	reads     [2]*sql.DB
-	readIndex atomic.Uint32
+	path             string
+	write            *sql.DB
+	reads            [2]*sql.DB
+	readIndex        atomic.Uint32
+	imageSelectionMu sync.Mutex
 }
 
 type Tx struct {
@@ -227,12 +231,24 @@ func Open(path string, allowCreate bool) (*Store, error) {
 		store.Close()
 		return nil, err
 	}
+	if err := store.EnsureManagementSchema(context.Background()); err != nil {
+		store.Close()
+		return nil, fmt.Errorf("management state migration: %w", err)
+	}
 	return store, nil
 }
 
 func OpenForTest(path string) (*Store, error) { return Open(path, true) }
 
 func (s *Store) Path() string { return s.path }
+
+// LockImageSelection serializes default-image changes with lifecycle admission
+// in the resident authority. The lock is deliberately owned by Store so both
+// the management and lifecycle packages use the same boundary.
+func (s *Store) LockImageSelection() func() {
+	s.imageSelectionMu.Lock()
+	return s.imageSelectionMu.Unlock
+}
 
 func (s *Store) Close() error {
 	var first error
@@ -552,7 +568,13 @@ func nullableInt(value sql.NullInt64) *int64 {
 func (s *Store) InsertTask(ctx context.Context, task Task) error {
 	return s.withWrite(ctx, func(tx *Tx) error {
 		_, err := tx.exec("INSERT INTO tasks(task_id, session_id, generation, state, instance_name, vm_ip, ssh_host_port, lease_expires_at, inactive_since, cleanup_after, created_at, updated_at, last_error, image_fingerprint, resources_json, reservation_bytes, previous_generation, resource_reservation_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", task.TaskID, task.SessionID, task.Generation, task.State, task.InstanceName, nullableStringArg(task.VMIP), nullableIntArg(task.SSHHostPort), nullableStringArg(task.LeaseExpiresAt), nullableStringArg(task.InactiveSince), nullableStringArg(task.CleanupAfter), task.CreatedAt, task.UpdatedAt, nullableStringArg(task.LastError), task.ImageFingerprint, task.ResourcesJSON, task.ReservationBytes, nullableIntArg(task.PreviousGeneration), task.ResourceReservationJSON)
-		return err
+		if err != nil {
+			return err
+		}
+		if task.State == "preparing" {
+			return syncPendingImageReferenceTx(tx, task.TaskID, task.ImageFingerprint, true)
+		}
+		return nil
 	})
 }
 
@@ -610,9 +632,33 @@ func (s *Store) updateTask(ctx context.Context, taskID string, condition *TaskCo
 		}
 		args = append(args, taskID)
 		_, err = tx.exec("UPDATE tasks SET "+strings.Join(sets, ", ")+" WHERE task_id = ?", args...)
-		return err
+		if err != nil {
+			return err
+		}
+		if stateValue, ok := updates["state"].(string); ok {
+			fingerprint := ""
+			if value, ok := updates["image_fingerprint"].(string); ok {
+				fingerprint = value
+			} else {
+				if queryErr := tx.conn.QueryRowContext(context.Background(), "SELECT image_fingerprint FROM tasks WHERE task_id = ?", taskID).Scan(&fingerprint); queryErr != nil && !errors.Is(queryErr, sql.ErrNoRows) {
+					return queryErr
+				}
+			}
+			return syncPendingImageReferenceTx(tx, taskID, fingerprint, stateValue == "preparing")
+		}
+		return nil
 	})
 	return changed, err
+}
+
+func syncPendingImageReferenceTx(tx *Tx, taskID, fingerprint string, pending bool) error {
+	if pending {
+		_, err := tx.exec(`INSERT OR IGNORE INTO image_references(fingerprint, reference_kind, reference_id, created_at)
+SELECT ?, 'pending_creation', ?, ? WHERE EXISTS (SELECT 1 FROM managed_images WHERE fingerprint = ?)`, fingerprint, taskID, time.Now().UTC().Format(time.RFC3339Nano), fingerprint)
+		return err
+	}
+	_, err := tx.exec("DELETE FROM image_references WHERE reference_kind = 'pending_creation' AND reference_id = ?", taskID)
+	return err
 }
 
 func taskUpdatesChanged(ctx context.Context, tx *Tx, taskID string, keys []string, updates map[string]any) (bool, error) {

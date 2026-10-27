@@ -773,6 +773,14 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	}
 	session := stringValue(request["session_id"])
 	generation := intValue(request["generation"])
+	unlockImageSelection := s.Store.LockImageSelection()
+	defer unlockImageSelection()
+	selectedFingerprint := s.Config.ImageFingerprint
+	if managedFingerprint, found, selectionErr := s.Store.CurrentDefaultImage(ctx); selectionErr != nil {
+		return nil, s.sqliteError(selectionErr)
+	} else if found {
+		selectedFingerprint = managedFingerprint
+	}
 	resources, err := requestedResources(request)
 	if err != nil {
 		return nil, err
@@ -789,7 +797,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	if task == nil {
 		created = true
 		lease := nowString(deadline)
-		task = &state.Task{TaskID: taskID(session), SessionID: session, Generation: 1, State: statePreparing, InstanceName: "agent-vm-" + taskID(session), CreatedAt: nowString(now), UpdatedAt: nowString(now), ImageFingerprint: s.Config.ImageFingerprint, ResourcesJSON: mustJSON(resources), ResourceReservationJSON: mustJSON(resources), LeaseExpiresAt: &lease}
+		task = &state.Task{TaskID: taskID(session), SessionID: session, Generation: 1, State: statePreparing, InstanceName: "agent-vm-" + taskID(session), CreatedAt: nowString(now), UpdatedAt: nowString(now), ImageFingerprint: selectedFingerprint, ResourcesJSON: mustJSON(resources), ResourceReservationJSON: mustJSON(resources), LeaseExpiresAt: &lease}
 		if generation != 0 {
 			return nil, protocol.NewError("generation_mismatch", "new session must start at generation 0", nil)
 		}
@@ -810,8 +818,8 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if task.State != stateCached {
 			return nil, protocol.NewError("task_transition", "session slot is not available until reconciliation completes", map[string]any{"state": task.State})
 		}
-		if task.State == stateCached && s.Config.ImageFingerprint != "" && task.ImageFingerprint != s.Config.ImageFingerprint {
-			return nil, protocol.NewError("cache_stale", "cached image fingerprint differs from the configured image", map[string]any{"recorded": task.ImageFingerprint, "configured": s.Config.ImageFingerprint})
+		if task.State == stateCached && selectedFingerprint != "" && task.ImageFingerprint != selectedFingerprint {
+			return nil, protocol.NewError("cache_stale", "cached image fingerprint differs from the selected image", map[string]any{"recorded": task.ImageFingerprint, "configured": selectedFingerprint})
 		}
 		if s.Guest != nil {
 			if err := s.verifyCachedGuest(ctx, task); err != nil {
@@ -839,7 +847,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if err := s.Store.InsertTask(ctx, *task); err != nil {
 			return nil, s.sqliteError(err)
 		}
-	} else if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"generation": task.Generation, "state": task.State, "resources_json": task.ResourcesJSON, "resource_reservation_json": task.ResourceReservationJSON, "reservation_bytes": int64(0), "lease_expires_at": task.LeaseExpiresAt, "updated_at": nowString(now), "last_error": nil, "image_fingerprint": s.Config.ImageFingerprint, "previous_generation": task.PreviousGeneration}); err != nil {
+	} else if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"generation": task.Generation, "state": task.State, "resources_json": task.ResourcesJSON, "resource_reservation_json": task.ResourceReservationJSON, "reservation_bytes": int64(0), "lease_expires_at": task.LeaseExpiresAt, "updated_at": nowString(now), "last_error": nil, "image_fingerprint": selectedFingerprint, "previous_generation": task.PreviousGeneration}); err != nil {
 		return nil, s.sqliteError(err)
 	}
 	if s.Guest != nil {
@@ -856,7 +864,11 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 			}
 		}
 		if created {
-			if err := s.Guest.Init(nativeCtx, s.Config.ImageAlias, task.InstanceName); err != nil {
+			imageReference := s.Config.ImageAlias
+			if task.ImageFingerprint != s.Config.ImageFingerprint {
+				imageReference = task.ImageFingerprint
+			}
+			if err := s.Guest.Init(nativeCtx, imageReference, task.InstanceName); err != nil {
 				return s.failTask(ctx, task, "native-init", err)
 			}
 		}

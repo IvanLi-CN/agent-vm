@@ -104,6 +104,9 @@ func serve(args []string) error {
 		return err
 	}
 	defer store.Close()
+	if err := store.SeedLegacyImage(context.Background(), cfg.ImageFingerprint); err != nil {
+		return fmt.Errorf("initialize managed image catalog: %w", err)
+	}
 	runner := native.NewRunner()
 	guest := native.NewIncusClient(runner, cfg.Project, native.ClientOptions{Profile: cfg.Profile, Network: cfg.Network, Pool: cfg.Pool})
 	var snapshots *observe.SnapshotStore
