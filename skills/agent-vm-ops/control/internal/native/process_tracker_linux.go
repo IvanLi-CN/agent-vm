@@ -157,6 +157,10 @@ func (tracker *processTracker) discover(root int) error {
 }
 
 func (tracker *processTracker) discoverWith(root int, readTable func() (map[int]trackedProcess, error)) error {
+	return tracker.discoverWithRead(root, readTable, readProcess)
+}
+
+func (tracker *processTracker) discoverWithRead(root int, readTable func() (map[int]trackedProcess, error), readRoot func(int) (trackedProcess, error)) error {
 	all, err := readTable()
 	if err != nil {
 		return fmt.Errorf("inspect native process tree: %w", err)
@@ -196,6 +200,19 @@ func (tracker *processTracker) discoverWith(root int, readTable func() (map[int]
 			}
 		}
 		if rootPresent {
+			latestRoot, rootErr := readRoot(root)
+			if processGone(rootErr) {
+				return errors.New("native process root exited while its process group was observed")
+			}
+			if rootErr != nil {
+				return fmt.Errorf("recheck native process root: %w", rootErr)
+			}
+			if latestRoot.start != rootProcess.start {
+				return fmt.Errorf("native process identity changed for pid %d", root)
+			}
+			if latestRoot.group != rootProcess.group {
+				return fmt.Errorf("native process group changed for pid %d", root)
+			}
 			for pid, item := range currentGroup {
 				if previous, ok := tracker.groupMembers[pid]; ok && previous.start != item.start {
 					return fmt.Errorf("native process identity changed for pid %d", pid)

@@ -181,11 +181,35 @@ func TestProcessTrackerRejectsUnobservedReusedProcessGroup(t *testing.T) {
 		}
 		return second, nil
 	}
-	if err := tracker.discoverWith(100, readTable); err != nil {
+	readRoot := func(pid int) (trackedProcess, error) {
+		return first[pid], nil
+	}
+	if err := tracker.discoverWithRead(100, readTable, readRoot); err != nil {
 		t.Fatalf("initial discover() error = %v", err)
 	}
-	if err := tracker.discoverWith(100, readTable); err == nil || !strings.Contains(err.Error(), "group membership unavailable") {
+	if err := tracker.discoverWithRead(100, readTable, readRoot); err == nil || !strings.Contains(err.Error(), "group membership unavailable") {
 		t.Fatalf("reused group discover() error = %v, want group membership failure", err)
+	}
+}
+
+func TestProcessTrackerRechecksRootBeforeGroupClaim(t *testing.T) {
+	tracker := &processTracker{
+		root:      100,
+		rootStart: "old-root",
+		rootGroup: 100,
+		baseline:  make(map[int]trackedProcess),
+		tracked:   make(map[int]trackedProcess),
+	}
+	table := map[int]trackedProcess{
+		100: {pid: 100, start: "old-root", parent: 1, group: 100, state: 'S'},
+		200: {pid: 200, start: "new-child", parent: 1, group: 100, state: 'S'},
+	}
+	readTable := func() (map[int]trackedProcess, error) { return table, nil }
+	readRoot := func(int) (trackedProcess, error) {
+		return trackedProcess{pid: 100, start: "new-root", parent: 1, group: 100, state: 'S'}, nil
+	}
+	if err := tracker.discoverWithRead(100, readTable, readRoot); err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("inconsistent root discover() error = %v, want identity failure", err)
 	}
 }
 
