@@ -177,7 +177,7 @@ Topic 不提供默认 transport、地址或 reusable notifier；reference、现�
 
 `1.0` 起的新生产路径必须只输出含独立 `version` 与 `source_revision` 的 SemVer manifest format 3，客户端 sidecar、Go metadata 和版本输出必须一致；开发源码不得冒充公开发布版本。
 旧 SHA manifest 只能用于明确迁移和必要回退读取，不得长期双格式生产或把历史 SHA 记录伪装为正式 SemVer。
-协议 4 需要的旧 `release_id` 必须由兼容适配边界按 `source_revision` 的原 SHA 语义生成，不得用它分配产品版本。
+协议 4 需要的旧 `release_id` 必须按 `source_revision` 的原 SHA 语义写入 format-3 manifest 并由兼容适配边界复用，不得用它分配产品版本。
 迁移必须保留数据库、generation、operation journal 以及必要恢复记录；新部署必须按版本和 digest 选择产物。
 
 ### REQ-ENG-022 — 应用完成的证据

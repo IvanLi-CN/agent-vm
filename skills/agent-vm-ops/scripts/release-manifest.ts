@@ -1404,10 +1404,9 @@ export function load_runtime_manifest(
   return [manifest, true, true, []];
 }
 
-// Format 3 is the production manifest.  It deliberately does not reuse the
-// legacy `release_id` field: protocol 4 still receives a SHA-derived release
-// identity through the compatibility adapter, while product identity is the
-// SemVer `version` below.
+// Format 3 is the production manifest.  It carries the SHA-derived
+// `release_id` required by the deployment boundary while product identity
+// remains the SemVer `version` below.
 export const PRODUCT_MANIFEST_FORMAT = 3;
 export const PRODUCT_TOOLCHAIN = Object.freeze({ bun: "1.4.4", go: "go1.27.3", cgo_enabled: false });
 
@@ -1443,6 +1442,7 @@ export type ProductTarget =
 export interface ProductManifest {
   format: 3;
   version: string;
+  release_id: string;
   source_revision: string;
   target: ProductTarget;
   toolchain: { bun: string; go: string; cgo_enabled: false };
@@ -1527,6 +1527,7 @@ export function build_product_manifest(
   return validate_product_manifest({
     format: PRODUCT_MANIFEST_FORMAT,
     version,
+    release_id: source_revision,
     source_revision,
     target: options.target ?? { os: "source", arch: "any" },
     toolchain: PRODUCT_TOOLCHAIN,
@@ -1539,12 +1540,14 @@ export function build_product_manifest(
 
 export function validate_product_manifest(value: unknown): ProductManifest {
   const root = _require_mapping(value, "manifest");
-  const required = ["actions", "artifacts", "client_view", "format", "protocol", "source_revision", "target", "toolchain", "version"];
+  const required = ["actions", "artifacts", "client_view", "format", "protocol", "release_id", "source_revision", "target", "toolchain", "version"];
   if (!_same_keys(root, required)) throw _product_error("manifest_invalid", "product manifest has an unexpected shape");
   if (Number(_require_int(root.format, "format", 1)) !== PRODUCT_MANIFEST_FORMAT) throw _product_error("manifest_format_unsupported", "manifest format must be 3");
   const version = _require_string(root.version, "version");
   try { parseSemVer(version); } catch { throw _product_error("manifest_invalid", "version must be valid SemVer 2.0.0"); }
+  const release_id = _require_string(root.release_id, "release_id", SOURCE_REVISION_RE);
   const source_revision = _require_string(root.source_revision, "source_revision", SOURCE_REVISION_RE);
+  if (release_id !== source_revision) throw _product_error("manifest_invalid", "release_id must equal source_revision");
   const target = _product_target(root.target);
   const toolchain = _require_mapping(root.toolchain, "toolchain");
   if (!_same_keys(toolchain, ["bun", "cgo_enabled", "go"]) || toolchain.bun !== PRODUCT_TOOLCHAIN.bun || toolchain.go !== PRODUCT_TOOLCHAIN.go || toolchain.cgo_enabled !== false) throw _product_error("manifest_invalid", "toolchain does not match the fixed release toolchain");
@@ -1553,7 +1556,7 @@ export function validate_product_manifest(value: unknown): ProductManifest {
   const actions = _product_actions(root.actions);
   const view = _require_mapping(root.client_view, "client_view");
   if (!_same_keys(view, ["actions", "protocol", "source_revision", "transport", "version"]) || view.version !== version || view.source_revision !== source_revision || Number(view.protocol) !== PROTOCOL_VERSION || (view.transport !== "legacy-bun" && view.transport !== "go-request") || !_json_equal(view.actions, actions)) throw _product_error("manifest_invalid", "client_view does not match product manifest");
-  return { format: 3, version, source_revision, target, toolchain: { bun: PRODUCT_TOOLCHAIN.bun, go: PRODUCT_TOOLCHAIN.go, cgo_enabled: false }, protocol: 4, artifacts, actions, client_view: { version, source_revision, protocol: 4, transport: view.transport, actions } };
+  return { format: 3, version, release_id, source_revision, target, toolchain: { bun: PRODUCT_TOOLCHAIN.bun, go: PRODUCT_TOOLCHAIN.go, cgo_enabled: false }, protocol: 4, artifacts, actions, client_view: { version, source_revision, protocol: 4, transport: view.transport, actions } };
 }
 
 function _verify_product_elf(path: string, target: ProductTarget): void {
