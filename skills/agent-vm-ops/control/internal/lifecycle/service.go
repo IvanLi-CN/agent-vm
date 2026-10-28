@@ -1152,6 +1152,14 @@ func (s *Service) reconcileLegacyCachedStarts(ctx context.Context, operation *st
 		if candidate.SessionID == nil || *candidate.SessionID != session {
 			continue
 		}
+		// An older acquire stays pending, but cannot change whether this
+		// generation's legacy acquire advanced the durable task generation.
+		if candidate.Action == "acquire" && candidate.Generation != nil && *candidate.Generation < generation && !s.operationActive(candidate.OperationID) {
+			worker, ok := candidate.Response["worker"].(map[string]any)
+			if ok && stringValue(worker["state"]) == "finished" && !workerOwnershipUnresolved(worker) {
+				continue
+			}
+		}
 		if candidate.Action != "acquire" || candidate.Generation == nil || *candidate.Generation != generation || s.operationActive(candidate.OperationID) {
 			return nil
 		}

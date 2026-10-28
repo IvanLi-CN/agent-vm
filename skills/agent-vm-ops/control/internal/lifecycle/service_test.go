@@ -2654,6 +2654,56 @@ func TestStartupRecoversLegacyPreTransitionCachedAcquires(t *testing.T) {
 	}
 }
 
+func TestLegacyPreTransitionAcquiresLeaveOlderGenerationPending(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now()
+	session := "legacy-pretransition"
+	generation := int64(14)
+	task := state.Task{TaskID: "legacy-pretransition-task", SessionID: session, Generation: generation, State: stateCached, InstanceName: "legacy-pretransition-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"legacy-pretransition-one", "legacy-pretransition-two"} {
+		req := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": id}
+		digest, err := protocol.Digest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordOperation(ctx, id, "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "starting"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	olderGeneration := generation - 2
+	olderRequest := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": olderGeneration, "operation_id": "older-pending"}
+	olderDigest, err := protocol.Digest(olderRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "older-pending", "acquire", &session, &olderGeneration, map[string]any{"outcome": "pending", "_request": map[string]any(olderRequest), "_request_digest": olderDigest, "worker": map[string]any{"state": "finished"}}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": "14"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(ctx); err == nil {
+		t.Fatal("older uncertain acquire must keep admission blocked")
+	}
+	older, err := store.GetOperation(ctx, "older-pending")
+	if err != nil || older.Response["outcome"] != "pending" {
+		t.Fatalf("older operation = %#v, error = %v", older, err)
+	}
+	for _, id := range []string{"legacy-pretransition-one", "legacy-pretransition-two"} {
+		op, err := store.GetOperation(ctx, id)
+		if err != nil || op.Response["outcome"] != "error" {
+			t.Fatalf("op=%#v,error=%v", op, err)
+		}
+	}
+}
+
 func TestLegacyCachedStartRecoveryRefusesUnsafeEvidence(t *testing.T) {
 	for _, mode := range []string{"generation", "ownership", "reservation", "other-worker", "active"} {
 		t.Run(mode, func(t *testing.T) {
