@@ -578,6 +578,62 @@ func TestDirectReleaseCannotCrossReleaseActivationDrain(t *testing.T) {
 	}
 }
 
+func TestTimerExpireCannotCrossReleaseActivationDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "timer-expire-fence.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	lease := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	if err := store.InsertTask(ctx, state.Task{TaskID: "timer-expire-task", SessionID: "timer-expire-session", Generation: 1, State: "active", InstanceName: "agent-vm-timer-expire", LeaseExpiresAt: &lease, CreatedAt: "2026-10-28T00:00:00Z", UpdatedAt: "2026-10-28T00:00:00Z", ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: "{}", ResourceReservationJSON: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(ctx, "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(ctx, "drain_owner", "release-tx-expire"); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-expire", "task_id": "timer-expire-task", "generation": int64(1)})
+	if err == nil || protocol.AsError(err).Code != "draining" {
+		t.Fatalf("timer expire error = %v", err)
+	}
+	task, err := store.GetTask(ctx, map[string]any{"task_id": "timer-expire-task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil || task.State != stateActive {
+		t.Fatalf("timer expire changed task = %#v", task)
+	}
+}
+
+func TestTimerReconcileContinuesReleaseCleanupDuringDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "timer-drain.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, config.Defaults(), Options{})
+	if _, err := service.drain(context.Background(), true, protocol.Request{"session_id": "release-owner"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := service.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response["outcome"] != "success" {
+		t.Fatalf("timer reconcile = %#v", response)
+	}
+	if _, err := service.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "admin-metrics"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true}); protocol.AsError(err).Code != "draining" {
+		t.Fatalf("sealed timer reconcile error = %v", err)
+	}
+}
+
 func TestIncompatibleCapabilityIsRejectedBeforeJournalClaim(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -1590,6 +1646,42 @@ func TestReconcileFinalizesPendingDestroyAfterAbsentCommit(t *testing.T) {
 		t.Fatalf("reconciled task = %#v", task)
 	}
 	operation, err := store.GetOperation(ctx, "destroy-absent-pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Response["outcome"] != "success" {
+		t.Fatalf("reconciled operation = %#v", operation.Response)
+	}
+}
+
+func TestReconcileFinalizesPendingDestroyWithoutTaskRow(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "pending-no-task-destroy.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session := "pending-no-task-destroy-session"
+	generation := int64(1)
+	request := map[string]any{
+		"protocol": protocol.Version, "action": "destroy", "session_id": session,
+		"generation": generation, "operation_id": "destroy-no-task-pending",
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "destroy-no-task-pending", "destroy", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request": request, "_request_digest": digest,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Stderr: []byte("Error: Instance not found")}, Cause: errors.New("incus instance missing")}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	if _, err := service.reconcile(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(ctx, "destroy-no-task-pending")
 	if err != nil {
 		t.Fatal(err)
 	}

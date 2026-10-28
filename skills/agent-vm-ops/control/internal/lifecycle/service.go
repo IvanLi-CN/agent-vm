@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	sqlite "modernc.org/sqlite"
@@ -63,6 +64,7 @@ type Service struct {
 	maintenance sync.Mutex
 	activeMu    sync.Mutex
 	activeOps   map[string]int
+	timerOps    uint64
 	admissionMu sync.Mutex
 	resident    bool
 	ready       bool
@@ -121,7 +123,7 @@ func (s *Service) wakeScheduler() {
 
 func (s *Service) lockAction(action string, request protocol.Request) func() {
 	var unlocks []func()
-	if releaseSensitiveAction(action, request) || action == "drain-enter" || action == "drain-exit" {
+	if releaseSensitiveAction(action, request) || action == "drain-enter" || action == "drain-exit" || action == "admin-metrics" {
 		// Drain ownership is a process-wide release boundary. It must not be
 		// serialized only by the caller's session lock: a release
 		// transaction and a native management action must observe one durable
@@ -518,7 +520,7 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 
 func recoverableOperation(action string) bool {
 	switch action {
-	case "drain-enter", "drain-exit", "admin-reconcile", "admin-gc":
+	case "drain-enter", "drain-exit", "admin-reconcile", "admin-gc", "timer-reconcile", "timer-age-gc":
 		return true
 	default:
 		return false
@@ -527,7 +529,7 @@ func recoverableOperation(action string) bool {
 
 func operationHasNativeEffect(action string) bool {
 	switch action {
-	case "acquire", "release", "destroy", "restart", "resize", "port-add", "port-remove", "admin-reconcile", "admin-gc":
+	case "acquire", "release", "destroy", "restart", "resize", "port-add", "port-remove", "admin-reconcile", "admin-gc", "timer-reconcile", "timer-age-gc":
 		return true
 	default:
 		return false
@@ -536,7 +538,7 @@ func operationHasNativeEffect(action string) bool {
 
 func releaseSensitiveAction(action string, request protocol.Request) bool {
 	switch action {
-	case "release", "destroy", "restart", "resize", "port-add", "port-remove":
+	case "acquire", "renew", "release", "destroy", "restart", "resize", "port-add", "port-remove", "timer-expire":
 		return true
 	case "admin-reconcile", "timer-reconcile":
 		return requestBool(request, "apply")
@@ -545,6 +547,19 @@ func releaseSensitiveAction(action string, request protocol.Request) bool {
 	default:
 		return false
 	}
+}
+
+func isReleaseCleanupAction(action string) bool {
+	switch action {
+	case "timer-reconcile", "timer-age-gc":
+		return true
+	default:
+		return false
+	}
+}
+
+func isJournaledTimerAction(action string, request protocol.Request) bool {
+	return (action == "timer-reconcile" || action == "timer-age-gc") && requestBool(request, "apply")
 }
 
 func recoveryAttempts(response map[string]any) int64 {
@@ -568,13 +583,22 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		return nil, compatibilityErr
 	}
 	action, _ := request["action"].(string)
+	if isJournaledTimerAction(action, request) {
+		request = cloneMap(request)
+		if request["operation_id"] == nil {
+			request["operation_id"] = fmt.Sprintf("timer-%s-%d", strings.TrimPrefix(action, "timer-"), atomic.AddUint64(&s.timerOps, 1))
+		}
+		if request["generation"] == nil {
+			request["generation"] = int64(0)
+		}
+	}
 	if sessionActions[action] && request["session_id"] == nil {
 		return nil, protocol.NewError("missing_session", "session_id is required for this action", nil)
 	}
 	if action == "admin-metrics" && (request["session_id"] != nil || request["operation_id"] != nil) {
 		return nil, protocol.NewError("invalid_request", "admin-metrics is sessionless and read-only", nil)
 	}
-	write := writeActions[action] && !(action == "admin-reconcile" && requestBool(request, "apply") == false && request["operation_id"] == nil)
+	write := (writeActions[action] || isJournaledTimerAction(action, request)) && !(action == "admin-reconcile" && requestBool(request, "apply") == false && request["operation_id"] == nil)
 	if write && request["operation_id"] == nil {
 		return nil, protocol.NewError("invalid_request", "write request requires operation_id", nil)
 	}
@@ -588,7 +612,11 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		if drainErr != nil {
 			return nil, s.sqliteError(drainErr)
 		}
-		if releaseDrain {
+		sealed, sealedErr := s.releaseDrainSealed(ctx)
+		if sealedErr != nil {
+			return nil, s.sqliteError(sealedErr)
+		}
+		if releaseDrain && (sealed || !isReleaseCleanupAction(action)) {
 			return nil, protocol.NewError("draining", "native session actions are refused while a release activation fence is owned", nil)
 		}
 	}
@@ -620,7 +648,11 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		defer finishActive()
 		ctx = native.WithWorkerRecorder(ctx, operationID, s)
 	}
-	result, err := s.dispatchAction(ctx, action, request)
+	dispatchCtx := ctx
+	if isReleaseCleanupAction(action) {
+		dispatchCtx = withInternalCleanup(ctx)
+	}
+	result, err := s.dispatchAction(dispatchCtx, action, request)
 	if err != nil {
 		if write && !uncertain(err) {
 			_ = s.recordError(ctx, request, err)
@@ -1734,6 +1766,9 @@ func (s *Service) drain(ctx context.Context, value bool, request protocol.Reques
 	if !value {
 		_ = s.Store.SetMeta(ctx, "drain_owner", "")
 	}
+	if err := s.Store.SetMeta(ctx, "drain_sealed", "0"); err != nil {
+		return nil, s.sqliteError(err)
+	}
 	return map[string]any{"draining": value}, nil
 }
 
@@ -1895,6 +1930,15 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				warnings = append(warnings, map[string]any{"code": "native_unavailable", "message": "Incus native availability could not be verified", "detail": map[string]any{"cause": nativeProbeErr.Error()}})
 			}
 			draining, _ := s.isDraining(ctx)
+			if consistent && len(pendingOperations) == 0 && states[stateClosing] == 0 && states[stateDeleting] == 0 && states[stateFailed] == 0 {
+				if releaseDrain, drainErr := s.releaseDrainOwned(ctx); drainErr != nil {
+					return nil, s.sqliteError(drainErr)
+				} else if releaseDrain {
+					if err := s.Store.SetMeta(ctx, "drain_sealed", "1"); err != nil {
+						return nil, s.sqliteError(err)
+					}
+				}
+			}
 			limits := map[string]any{}
 			remaining := map[string]any{}
 			if s.Config.CPUBudget > 0 {
@@ -2048,7 +2092,8 @@ func (s *Service) reconcilePendingAbsentDestroy(ctx context.Context, pending []s
 		if err != nil {
 			return s.sqliteError(err)
 		}
-		if task == nil || task.State != stateAbsent {
+		rowExists := task != nil
+		if task != nil && task.State != stateAbsent {
 			continue
 		}
 		rawRequest, ok := operation.Response["_request"].(map[string]any)
@@ -2062,7 +2107,7 @@ func (s *Service) reconcilePendingAbsentDestroy(ctx context.Context, pending []s
 		if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
 			return protocol.NewError("startup_reconcile_required", "pending absent destroy request is incompatible", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": compatibilityErr.Error()})
 		}
-		if !operationIdentityMatches(&operation, request) || stringValue(request["operation_id"]) != operation.OperationID || intValue(request["generation"]) != task.Generation {
+		if !operationIdentityMatches(&operation, request) || stringValue(request["operation_id"]) != operation.OperationID || intValue(request["generation"]) != *operation.Generation {
 			return protocol.NewError("startup_reconcile_required", "pending absent destroy identity does not match its journal or task", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
 		}
 		digest := stringValue(operation.Response["_request_digest"])
@@ -2075,6 +2120,9 @@ func (s *Service) reconcilePendingAbsentDestroy(ctx context.Context, pending []s
 		} else if unresolved {
 			return protocol.NewError("startup_reconcile_required", "pending absent destroy worker ownership remains unresolved", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
 		}
+		if !rowExists {
+			task = &state.Task{TaskID: taskID(*operation.SessionID), SessionID: *operation.SessionID, Generation: *operation.Generation, State: stateAbsent, InstanceName: "agent-vm-" + taskID(*operation.SessionID), ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}"}
+		}
 		if s.Guest != nil {
 			if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr == nil {
 				return protocol.NewError("startup_reconcile_required", "pending absent destroy still has a native instance", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": true})
@@ -2086,17 +2134,23 @@ func (s *Service) reconcilePendingAbsentDestroy(ctx context.Context, pending []s
 				}
 			}
 		}
-		response, summaryErr := s.summary(ctx, task)
-		if summaryErr != nil {
-			return summaryErr
+		response := map[string]any{"state": stateAbsent, "session_id": *operation.SessionID, "effective_lease": false}
+		if rowExists {
+			var summaryErr error
+			response, summaryErr = s.summary(ctx, task)
+			if summaryErr != nil {
+				return summaryErr
+			}
 		}
 		terminal := protocol.SuccessWithRelease(request, response, s.Release, nil)
 		terminal["_request_digest"] = digest
+		if rowExists {
+			if err := s.deleteDestroyedTask(ctx, request, operation.Generation); err != nil {
+				return err
+			}
+		}
 		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, terminal); err != nil {
 			return s.sqliteError(err)
-		}
-		if err := s.deleteDestroyedTask(ctx, request, operation.Generation); err != nil {
-			return err
 		}
 	}
 	return nil
@@ -2355,6 +2409,11 @@ func (s *Service) releaseDrainOwned(ctx context.Context) (bool, error) {
 	}
 	owner, found, err := s.Store.Meta(ctx, "drain_owner")
 	return found && strings.HasPrefix(owner, "release-"), err
+}
+
+func (s *Service) releaseDrainSealed(ctx context.Context) (bool, error) {
+	value, found, err := s.Store.Meta(ctx, "drain_sealed")
+	return found && value == "1", err
 }
 
 // IsDraining exposes the durable admission fence to the browser-independent
