@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -19,23 +20,45 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
+func missingInstanceError() error {
+	err := exec.Command("false").Run()
+	return &native.CommandError{Result: native.Result{Code: 1, Stderr: []byte("instance not found")}, Cause: err}
+}
+
 type staticCPUObserver struct {
 	observation observe.CPUObservation
 	err         error
 }
 
 type startupGuest struct {
+	initErr     error
 	status      string
 	statuses    []map[string]any
 	statusCalls int
+	deleteCalls int
 	config      map[string]any
 	configErr   error
 	stopErr     error
 	deviceSets  []string
 }
 
-func (guest *startupGuest) Init(context.Context, string, string) error              { return nil }
-func (guest *startupGuest) ConfigSet(context.Context, string, string, string) error { return nil }
+func (guest *startupGuest) Init(_ context.Context, _, _ string, ownership map[string]string) error {
+	if guest.config != nil {
+		config := guest.config["config"].(map[string]any)
+		for key, value := range ownership {
+			config[key] = value
+		}
+	}
+	return guest.initErr
+}
+func (guest *startupGuest) ConfigSet(_ context.Context, _ string, key, value string) error {
+	if guest.config != nil {
+		if config, ok := guest.config["config"].(map[string]any); ok {
+			config[key] = value
+		}
+	}
+	return nil
+}
 
 func (guest *startupGuest) DeviceSet(_ context.Context, _ string, device, key, value string) error {
 	guest.deviceSets = append(guest.deviceSets, device+":"+key+"="+value)
@@ -47,14 +70,14 @@ func (guest *startupGuest) DeviceAdd(context.Context, string, string, string, ma
 func (guest *startupGuest) DeviceRemove(context.Context, string, string) error { return nil }
 func (guest *startupGuest) Start(context.Context, string) error                { return nil }
 func (guest *startupGuest) Stop(context.Context, string) error                 { return guest.stopErr }
-func (guest *startupGuest) Delete(context.Context, string) error               { return nil }
+func (guest *startupGuest) Delete(context.Context, string) error               { guest.deleteCalls++; return nil }
 func (guest *startupGuest) Status(context.Context, string) (map[string]any, error) {
+	index := guest.statusCalls
+	guest.statusCalls++
 	if len(guest.statuses) > 0 {
-		index := guest.statusCalls
 		if index >= len(guest.statuses) {
 			index = len(guest.statuses) - 1
 		}
-		guest.statusCalls++
 		return guest.statuses[index], nil
 	}
 	return map[string]any{"status": guest.status}, nil
@@ -854,7 +877,7 @@ func TestStartupReconcileRetriesFinishedAdminMaintenanceWorker(t *testing.T) {
 		"outcome":         "pending",
 		"_request_digest": digest,
 		"_request":        map[string]any(request),
-		"worker":          map[string]any{"state": "finished", "error": "native command failed"},
+		"worker":          map[string]any{"state": "finished"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1096,7 +1119,7 @@ func TestDestroyMissingInstanceDoesNotFinalizeUnresolvedWorker(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Stderr: []byte("instance not found")}, Cause: errors.New("incus query failed")}}
+	guest := &startupGuest{configErr: missingInstanceError()}
 	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
 	_, err = service.releaseUnlocked(context.Background(), protocol.Request{
 		"session_id": "destroy-unresolved-session", "generation": int64(1), "operation_id": "destroy-unresolved-operation",
@@ -1405,11 +1428,11 @@ func TestStartupReconcileFinalizesOrphanedAcquireWhenNativeIsMissing(t *testing.
 	}
 	generation := int64(0)
 	if err := store.RecordOperation(context.Background(), "orphaned-acquire", "acquire", stringPointer(session), &generation, map[string]any{
-		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request),
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request), "worker": map[string]any{"state": "exited"},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Stderr: []byte("instance not found")}, Cause: errors.New("incus query failed")}}
+	guest := &startupGuest{configErr: missingInstanceError()}
 	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
 	if err := service.StartupReconcile(context.Background()); err != nil {
 		t.Fatal(err)
@@ -1488,7 +1511,7 @@ func TestStartupReconcileCancelsAcquireForCachedStoppedTask(t *testing.T) {
 	}
 	generation := int64(1)
 	if err := store.RecordOperation(context.Background(), "cached-pending-acquire", "acquire", stringPointer(session), &generation, map[string]any{
-		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request),
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request), "worker": map[string]any{"state": "exited"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1563,7 +1586,7 @@ func TestDestroyFinalizesWhenIncusConfirmsTheInstanceIsMissing(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Stderr: []byte("instance not found")}, Cause: errors.New("incus query failed")}}
+	guest := &startupGuest{configErr: missingInstanceError()}
 	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
 	response, err := service.Dispatch(context.Background(), protocol.Request{
 		"protocol": protocol.Version, "action": "destroy", "session_id": "destroy-session", "generation": int64(1), "operation_id": "destroy-missing",
@@ -1700,11 +1723,11 @@ func TestReconcileFinalizesPendingDestroyAfterAbsentCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.RecordOperation(ctx, "destroy-absent-pending", "destroy", stringPointer(session), &generation, map[string]any{
-		"outcome": "pending", "_request": request, "_request_digest": digest,
+		"outcome": "pending", "_request": request, "_request_digest": digest, "worker": map[string]any{"state": "exited", "start_attempted": false},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Stderr: []byte("Error: Instance not found")}, Cause: errors.New("incus instance missing")}}
+	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Code: 1, Stderr: []byte("Error: Instance not found")}, Cause: exec.Command("false").Run()}}
 	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
 	if _, err := service.reconcile(ctx, true); err != nil {
 		t.Fatal(err)
@@ -1732,6 +1755,9 @@ func TestReconcileFinalizesPendingDestroyWithoutTaskRow(t *testing.T) {
 	ctx := context.Background()
 	session := "pending-no-task-destroy-session"
 	generation := int64(1)
+	if allocated, err := store.NextGeneration(ctx, session); err != nil || allocated != generation {
+		t.Fatalf("allocated generation = %d, error = %v", allocated, err)
+	}
 	request := map[string]any{
 		"protocol": protocol.Version, "action": "destroy", "session_id": session,
 		"generation": generation, "operation_id": "destroy-no-task-pending",
@@ -1741,11 +1767,11 @@ func TestReconcileFinalizesPendingDestroyWithoutTaskRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.RecordOperation(ctx, "destroy-no-task-pending", "destroy", stringPointer(session), &generation, map[string]any{
-		"outcome": "pending", "_request": request, "_request_digest": digest,
+		"outcome": "pending", "_request": request, "_request_digest": digest, "worker": map[string]any{"state": "exited", "start_attempted": false},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Stderr: []byte("Error: Instance not found")}, Cause: errors.New("incus instance missing")}}
+	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Code: 1, Stderr: []byte("Error: Instance not found")}, Cause: exec.Command("false").Run()}}
 	service := New(store, config.Defaults(), Options{Guest: guest})
 	if _, err := service.reconcile(ctx, true); err != nil {
 		t.Fatal(err)
@@ -1756,6 +1782,93 @@ func TestReconcileFinalizesPendingDestroyWithoutTaskRow(t *testing.T) {
 	}
 	if operation.Response["outcome"] != "success" {
 		t.Fatalf("reconciled operation = %#v", operation.Response)
+	}
+}
+
+func TestPendingAbsentDestroyRemainsPendingWithoutSafeEvidence(t *testing.T) {
+	for _, mode := range []string{"no-native", "no-worker", "starting", "finished-no-identity", "partial-identity", "other-worker", "active", "session-locked", "generation", "missing-tombstone", "stale-tombstone"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			session, generation, operationID := "absent-destroy-"+mode, int64(1), "destroy-"+mode
+			now := nowString(time.Now())
+			task := state.Task{TaskID: "task-" + mode, SessionID: session, Generation: generation, State: stateAbsent, InstanceName: "instance-" + mode, CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{"cpu":0,"memory_mib":0,"disk_gib":0}`, ResourceReservationJSON: `{}`}
+			if mode == "generation" {
+				task.Generation++
+			}
+			if mode == "stale-tombstone" {
+				for range 2 {
+					if _, err := store.NextGeneration(ctx, session); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if mode != "missing-tombstone" && mode != "stale-tombstone" {
+				if err := store.InsertTask(ctx, task); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": session, "generation": generation, "operation_id": operationID}
+			digest, err := protocol.Digest(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": map[string]any{"state": "exited", "start_attempted": false}}
+			if mode == "no-worker" {
+				delete(response, "worker")
+			}
+			if mode == "starting" {
+				response["worker"] = map[string]any{"state": "starting"}
+			}
+			if mode == "finished-no-identity" {
+				response["worker"] = map[string]any{"state": "finished"}
+			}
+			if mode == "partial-identity" {
+				response["worker"] = map[string]any{"state": "exited", "start_attempted": false, "pid": "invalid"}
+			}
+			if err := store.RecordOperation(ctx, operationID, "destroy", &session, &generation, response); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "other-worker" {
+				if err := store.RecordOperation(ctx, "other-acquire", "acquire", &session, &generation, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "finished"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var guest native.Guest = &startupGuest{configErr: missingInstanceError()}
+			if mode == "no-native" {
+				guest = nil
+			}
+			service := New(store, config.Defaults(), Options{Guest: guest})
+			if mode == "active" {
+				done := service.markOperationActive(operationID)
+				defer done()
+			}
+			if mode == "session-locked" {
+				unlock := service.lockAction("session", protocol.Request{"session_id": session})
+				defer unlock()
+			}
+			pending, err := store.PendingOperations(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = service.reconcilePendingAbsentDestroy(ctx, pending)
+			if mode != "session-locked" && err == nil {
+				t.Fatal("unsafe destroy was accepted")
+			}
+			operation, err := store.GetOperation(ctx, operationID)
+			if err != nil || operation == nil || operation.Response["outcome"] != "pending" {
+				t.Fatalf("operation = %#v, err = %v", operation, err)
+			}
+			current, err := store.GetTask(ctx, map[string]any{"session_id": session})
+			noTask := mode == "missing-tombstone" || mode == "stale-tombstone"
+			if err != nil || (noTask && current != nil) || (!noTask && (current == nil || current.State != stateAbsent || current.Generation != task.Generation)) {
+				t.Fatalf("task = %#v, err = %v", current, err)
+			}
+		})
 	}
 }
 
@@ -1780,5 +1893,1367 @@ func TestStartupPressureRefusesBeforeDurableAcquire(t *testing.T) {
 	}
 	if task, getErr := store.GetTask(context.Background(), map[string]any{"session_id": "pressure"}); getErr != nil || task != nil {
 		t.Fatalf("pressure acquire left task: task=%#v err=%v", task, getErr)
+	}
+}
+
+// A command can create the instance and still return an uncertain result.
+func TestAcquireInitUncertainResultCanReconcileOwnedInstance(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.VMIPStart = "10.0.0.10"
+	cfg.VMIPEnd = "10.0.0.20"
+	guest := &startupGuest{initErr: errors.New("inspect native process tree: read /proc/123/stat: no such process"), status: "Stopped", config: map[string]any{"config": map[string]any{}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, cfg, Options{Guest: guest})
+	_, err = service.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "init-uncertain", "generation": int64(0), "operation_id": "init-uncertain-acquire"})
+	if protocol.AsError(err).Code != "native_failed" {
+		t.Fatalf("acquire error = %v", err)
+	}
+	if err := service.recordWorkerState(context.Background(), "init-uncertain-acquire", map[string]any{"state": "exited"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.reconcile(context.Background(), true); err != nil {
+		t.Fatalf("reconcile after uncertain init = %v", err)
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": "init-uncertain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil || task.State != stateCached || task.ResourceReservationJSON != "{}" {
+		t.Fatalf("reconciled task = %#v", task)
+	}
+}
+
+func TestAcquireFailedBeforeNativeCreationReclaimsReservation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.VMIPStart = "10.0.0.10"
+	cfg.VMIPEnd = "10.0.0.20"
+	guest := &startupGuest{initErr: errors.New("init failed"), configErr: missingInstanceError()}
+	service := New(store, cfg, Options{Guest: guest})
+	_, err = service.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "init-absent", "generation": int64(0), "operation_id": "init-absent-acquire"})
+	if protocol.AsError(err).Code != "native_failed" {
+		t.Fatalf("acquire error = %v", err)
+	}
+	// The fake does not run a native worker; model a worker verified exited.
+	if err := service.recordWorkerState(context.Background(), "init-absent-acquire", map[string]any{"state": "exited"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.reconcile(context.Background(), true); err != nil {
+		t.Fatalf("reconcile after absent init = %v", err)
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": "init-absent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task != nil {
+		t.Fatalf("missing instance retained task and reservation: %#v", task)
+	}
+}
+
+func TestFailedInitCleanupRefusesMismatchedOwnership(t *testing.T) {
+	for _, field := range []string{"user.agent-vm.task", "user.agent-vm.session", "user.agent-vm.generation", "user.agent-vm.managed"} {
+		t.Run(field, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			cfg := config.Defaults()
+			cfg.VMIPStart = "10.0.0.10"
+			cfg.VMIPEnd = "10.0.0.20"
+			guest := &startupGuest{initErr: errors.New("uncertain init"), status: "Stopped", config: map[string]any{"config": map[string]any{}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+			service := New(store, cfg, Options{Guest: guest})
+			ctx := context.Background()
+			_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "mismatch", "generation": int64(0), "operation_id": "mismatch-acquire"})
+			if protocol.AsError(err).Code != "native_failed" {
+				t.Fatalf("acquire: %v", err)
+			}
+			if err := service.recordWorkerState(ctx, "mismatch-acquire", map[string]any{"state": "exited"}); err != nil {
+				t.Fatal(err)
+			}
+			guest.config["config"].(map[string]any)[field] = "other"
+			if _, err := service.reconcile(ctx, true); protocol.AsError(err).Code != "cleanup_incomplete" {
+				t.Fatalf("reconcile error = %v", err)
+			}
+			task, err := store.GetTask(ctx, map[string]any{"session_id": "mismatch"})
+			if err != nil || task == nil || task.ResourceReservationJSON == "{}" {
+				t.Fatalf("task = %#v, error = %v", task, err)
+			}
+		})
+	}
+}
+
+func TestFailedInitMissingInstanceKeepsUnresolvedWorkerReservation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.VMIPStart = "10.0.0.10"
+	cfg.VMIPEnd = "10.0.0.20"
+	guest := &startupGuest{initErr: errors.New("uncertain init"), configErr: missingInstanceError()}
+	service := New(store, cfg, Options{Guest: guest})
+	ctx := context.Background()
+	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "unresolved", "generation": int64(0), "operation_id": "unresolved-acquire"})
+	if protocol.AsError(err).Code != "native_failed" {
+		t.Fatalf("acquire: %v", err)
+	}
+	if err := service.recordWorkerState(ctx, "unresolved-acquire", map[string]any{"state": "starting", "start_attempted": true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.reconcile(ctx, true); err == nil {
+		t.Fatal("unresolved worker allowed cleanup")
+	}
+	task, err := store.GetTask(ctx, map[string]any{"session_id": "unresolved"})
+	if err != nil || task == nil || task.ResourceReservationJSON == "{}" {
+		t.Fatalf("task = %#v, error = %v", task, err)
+	}
+}
+
+func TestReconcileRejectsLegacyFailedFinishedWorkerWithoutIdentity(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := "legacy-worker"
+	if err := store.RecordOperation(context.Background(), "legacy-worker-op", "acquire", &session, nil, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "finished", "error": "inspect native process tree: read /proc/123/stat: no such process"}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.reconcilePendingWorkers(context.Background(), pending); err == nil || protocol.AsError(err).Code != "state_unverified" {
+		t.Fatalf("reconcile error = %v, want unverified legacy identity", err)
+	}
+}
+
+func TestStartupDoesNotFinalizeActiveOrphanedAcquire(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := "active-orphan"
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(0), "operation_id": "active-orphan-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "active-orphan-acquire", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request), "worker": map[string]any{"state": "starting"}}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{configErr: missingInstanceError()}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	finish := service.markOperationActive("active-orphan-acquire")
+	defer finish()
+	if err := service.StartupReconcile(context.Background()); err == nil {
+		t.Fatal("startup admitted while acquire active")
+	}
+	op, err := store.GetOperation(context.Background(), "active-orphan-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if op.Response["outcome"] != "pending" {
+		t.Fatalf("active operation finalized: %#v", op.Response)
+	}
+}
+
+func TestReconcileVerifiesLegacyFailedFinishedWorker(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := "legacy-worker-verified"
+	operationID := "legacy-worker-verified-op"
+	if err := store.RecordOperation(context.Background(), operationID, "acquire", &session, nil, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "finished", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "error": "inspect native process tree"}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.reconcilePendingWorkers(context.Background(), pending); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(context.Background(), operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if worker := operation.Response["worker"].(map[string]any); worker["state"] != "exited" {
+		t.Fatalf("worker = %#v, want verified exited", worker)
+	}
+}
+
+func TestReleaseDoesNotTouchOwnedGuestWithUnresolvedAcquireWorker(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	session := "pending-owned"
+	generation := int64(1)
+	if err := store.InsertTask(context.Background(), state.Task{TaskID: "pending-owned-task", SessionID: session, Generation: generation, State: stateFailed, InstanceName: "pending-owned-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), "pending-owned-acquire", "acquire", &session, &generation, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "starting", "start_attempted": true}}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "pending-owned-task", "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	_, err = service.releaseUnlocked(context.Background(), protocol.Request{"session_id": session, "generation": generation}, false)
+	if protocol.AsError(err).Code != "cleanup_incomplete" {
+		t.Fatalf("release error = %v", err)
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": session})
+	if err != nil || task == nil || task.ResourceReservationJSON == "{}" || guest.statusCalls != 0 {
+		t.Fatalf("task = %#v, status calls = %d, error = %v", task, guest.statusCalls, err)
+	}
+}
+
+func TestWorkerRecoveryRereadsJournalAfterSessionLock(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := "stale-worker"
+	operationID := "stale-worker-op"
+	generation := int64(1)
+	if err := store.RecordOperation(context.Background(), operationID, "acquire", &session, &generation, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "running"}}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), operationID, "acquire", &session, &generation, map[string]any{"outcome": "success"}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	if err := service.reconcilePendingWorkers(context.Background(), pending); err != nil {
+		t.Fatalf("stale pending snapshot triggered worker recovery: %v", err)
+	}
+	op, err := store.GetOperation(context.Background(), operationID)
+	if err != nil || op.Response["outcome"] != "success" {
+		t.Fatalf("operation = %#v, error = %v", op, err)
+	}
+}
+
+func TestStartupKeepsStaleAcquirePendingForCachedGeneration(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	session := "stale-cached"
+	generation := int64(0)
+	if err := store.InsertTask(context.Background(), state.Task{TaskID: "stale-cached-task", SessionID: session, Generation: 3, State: stateCached, InstanceName: "stale-cached-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": "stale-cached-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), "stale-cached-acquire", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request), "worker": map[string]any{"state": "exited"}}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "stale-cached-task", "user.agent-vm.session": session, "user.agent-vm.generation": "3"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(context.Background()); err == nil {
+		t.Fatal("stale acquire was silently finalized")
+	}
+	op, err := store.GetOperation(context.Background(), "stale-cached-acquire")
+	if err != nil || op.Response["outcome"] != "pending" {
+		t.Fatalf("operation = %#v, error = %v", op, err)
+	}
+}
+
+func TestStartupRecoversOwnedFailedInitWithVerifiedLegacyWorker(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	session := "startup-init"
+	generation := int64(0)
+	lastError := `{"phase":"native-init","cause":"inspect native process tree: read /proc/123/stat: no such process"}`
+	if err := store.InsertTask(context.Background(), state.Task{TaskID: "startup-init-task", SessionID: session, Generation: 1, State: stateClosing, InstanceName: "startup-init-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), LastError: &lastError, ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": "startup-init-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), "startup-init-acquire", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request), "worker": map[string]any{"state": "finished", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "error": "inspect native process tree"}}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "startup-init-task", "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(context.Background()); err != nil {
+		t.Fatalf("startup = %v", err)
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": session})
+	if err != nil || task == nil || task.State != stateCached || task.ResourceReservationJSON != "{}" {
+		t.Fatalf("task = %#v, error = %v", task, err)
+	}
+	op, err := store.GetOperation(context.Background(), "startup-init-acquire")
+	if err != nil || op.Response["outcome"] != "error" {
+		t.Fatalf("operation = %#v, error = %v", op, err)
+	}
+}
+
+func TestAcquireBindsJournalToRecreatedTaskGeneration(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session := "recreated-session"
+	for i := 0; i < 2; i++ {
+		if _, err := store.NextGeneration(ctx, session); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := config.Defaults()
+	cfg.VMIPStart = "10.0.0.10"
+	cfg.VMIPEnd = "10.0.0.20"
+	guest := &startupGuest{initErr: errors.New("uncertain init"), status: "Stopped", config: map[string]any{"config": map[string]any{}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, cfg, Options{Guest: guest})
+	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(0), "operation_id": "recreated-acquire"})
+	if protocol.AsError(err).Code != "native_failed" {
+		t.Fatalf("acquire = %v", err)
+	}
+	task, err := store.GetTask(ctx, map[string]any{"session_id": session})
+	if err != nil || task == nil || task.Generation != 3 {
+		t.Fatalf("task = %#v, error = %v", task, err)
+	}
+	operation, err := store.GetOperation(ctx, "recreated-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation, ok := protocol.Integer(operation.Response["_task_generation"])
+	if !ok || generation != task.Generation || operation.Response["_task_id"] != task.TaskID {
+		t.Fatalf("operation missing task binding: %#v", operation.Response)
+	}
+	if err := service.recordWorkerState(ctx, "recreated-acquire", map[string]any{"state": "exited"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup recovery = %v", err)
+	}
+	operation, err = store.GetOperation(ctx, "recreated-acquire")
+	if err != nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("recovered operation = %#v, error = %v", operation, err)
+	}
+}
+
+func TestStartupKeepsReservationForPreviousGeneration(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	previous := int64(1)
+	session := "previous-generation"
+	lastError := `{"phase":"native-ownership"}`
+	if err := store.InsertTask(context.Background(), state.Task{TaskID: "previous-task", SessionID: session, Generation: 2, PreviousGeneration: &previous, State: stateClosing, InstanceName: "previous-instance", LastError: &lastError, CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "previous-task", "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(context.Background()); err == nil {
+		t.Fatal("startup accepted a stale native generation")
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": session})
+	if err != nil || task == nil || task.State != stateClosing || task.ResourceReservationJSON == "{}" {
+		t.Fatalf("task = %#v, error = %v", task, err)
+	}
+}
+
+func TestWorkerRecoverySkipsBusySession(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := "busy-session"
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), "busy-op", "acquire", &session, &generation, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "starting", "start_attempted": true}}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	unlock := service.lockAction("session", protocol.Request{"session_id": session})
+	defer unlock()
+	if err := service.reconcilePendingWorkers(context.Background(), pending); err != nil {
+		t.Fatalf("busy session should be skipped: %v", err)
+	}
+	op, err := store.GetOperation(context.Background(), "busy-op")
+	if err != nil || op.Response["outcome"] != "pending" {
+		t.Fatalf("operation = %#v, error = %v", op, err)
+	}
+}
+
+func TestReconcileClosingTaskHonorsPendingDestroy(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	session := "closing-destroy"
+	generation := int64(1)
+	if err := store.InsertTask(context.Background(), state.Task{TaskID: "closing-destroy-task", SessionID: session, Generation: generation, State: stateClosing, InstanceName: "closing-destroy-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(context.Background(), "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(context.Background(), "drain_owner", "release-recovery-test"); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": session, "generation": generation, "operation_id": "closing-destroy-op"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), "closing-destroy-op", "destroy", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": map[string]any{"state": "finished"}}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "closing-destroy-task", "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	if _, err := service.reconcile(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": session})
+	if err != nil || task != nil || guest.deleteCalls != 1 {
+		t.Fatalf("destroy should remove task and instance: %#v, calls=%d, %v", task, guest.deleteCalls, err)
+	}
+	op, err := store.GetOperation(context.Background(), "closing-destroy-op")
+	if err != nil || op.Response["outcome"] != "success" {
+		t.Fatalf("destroy operation: %#v, %v", op, err)
+	}
+}
+
+func TestStartupReconcilesClosingDuringReleaseDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := nowString(time.Now())
+	session := "closing-release-drain"
+	task := state.Task{TaskID: "closing-task", SessionID: session, Generation: 1, State: stateClosing, InstanceName: "closing-instance", CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(ctx, "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(ctx, "drain_owner", "release-recovery-test"); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.GetTask(ctx, map[string]any{"session_id": session})
+	if err != nil || current == nil || current.State != stateCached || current.LeaseExpiresAt != nil {
+		t.Fatalf("task=%#v, error=%v", current, err)
+	}
+	if guest.deleteCalls != 0 {
+		t.Fatal("release cleanup deleted the instance")
+	}
+}
+
+func TestReconcileClosingRefusesUnverifiedDestroy(t *testing.T) {
+	for _, mode := range []string{"bad-digest", "worker-running", "wrong-request", "incompatible"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			now := time.Now()
+			session := "unsafe-destroy"
+			generation := int64(1)
+			if err := store.InsertTask(context.Background(), state.Task{TaskID: "unsafe-task", SessionID: session, Generation: generation, State: stateClosing, InstanceName: "unsafe-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2}`, ResourceReservationJSON: `{"cpu":2}`}); err != nil {
+				t.Fatal(err)
+			}
+			request := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": session, "generation": generation, "operation_id": "unsafe-op"}
+			digest, err := protocol.Digest(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker := map[string]any{"state": "finished"}
+			if mode == "bad-digest" {
+				digest = "invalid"
+			}
+			if mode == "worker-running" {
+				worker["state"] = "starting"
+				worker["start_attempted"] = true
+			}
+			if mode == "wrong-request" {
+				request["session_id"] = "other"
+				digest, err = protocol.Digest(request)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			var release *protocol.ReleaseMetadata
+			if mode == "incompatible" {
+				request["compatibility"] = map[string]any{
+					"release_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "protocol": protocol.Version, "action": "destroy",
+					"request":           map[string]any{"schema": int64(2), "semantic_revision": int64(1)},
+					"accepted_response": map[string]any{"schema_min": int64(1), "schema_max": int64(1), "semantic_min": int64(1), "semantic_max": int64(1)},
+				}
+				digest, err = protocol.Digest(request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				release = &protocol.ReleaseMetadata{ReleaseID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Protocol: protocol.Version, Actions: map[string]protocol.ActionCompatibility{
+					"destroy": {Request: protocol.Schema{Schema: 1, SemanticRevision: 1}, Response: protocol.Schema{Schema: 1, SemanticRevision: 1}, RequestWindow: protocol.CompatibilityWindow{SchemaMin: 1, SchemaMax: 1, SemanticMin: 1, SemanticMax: 1}},
+				}}
+			}
+			if err := store.RecordOperation(context.Background(), "unsafe-op", "destroy", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": worker}); err != nil {
+				t.Fatal(err)
+			}
+			guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "unsafe-task", "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+			service := New(store, config.Defaults(), Options{Guest: guest, Release: release})
+			if _, err := service.reconcile(context.Background(), true); err == nil {
+				t.Fatal("unverified destroy was accepted")
+			}
+			task, err := store.GetTask(context.Background(), map[string]any{"session_id": session})
+			if err != nil || task == nil || task.State != stateClosing || task.ResourceReservationJSON == "{}" || guest.statusCalls != 0 {
+				t.Fatalf("task=%#v, calls=%d, error=%v", task, guest.statusCalls, err)
+			}
+		})
+	}
+}
+
+func TestReconcileClosingDestroyRejectsUnmarkedInstance(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	session := "unmarked-destroy"
+	generation := int64(1)
+	if err := store.InsertTask(context.Background(), state.Task{TaskID: "unmarked-task", SessionID: session, Generation: generation, State: stateClosing, InstanceName: "unmarked-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2}`, ResourceReservationJSON: `{"cpu":2}`}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": session, "generation": generation, "operation_id": "unmarked-op"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), "unmarked-op", "destroy", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": map[string]any{"state": "finished"}}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	if _, err := service.reconcile(context.Background(), true); protocol.AsError(err).Code != "cleanup_incomplete" {
+		t.Fatalf("reconcile error=%v", err)
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": session})
+	if err != nil || task == nil || task.State != stateDeleting || task.ResourceReservationJSON == "{}" || guest.deleteCalls != 0 {
+		t.Fatalf("task=%#v, delete calls=%d, error=%v", task, guest.deleteCalls, err)
+	}
+	op, err := store.GetOperation(context.Background(), "unmarked-op")
+	if err != nil || op.Response["outcome"] != "pending" {
+		t.Fatalf("operation=%#v, error=%v", op, err)
+	}
+}
+
+func TestNotReadyAcquireIsRecordedAsDefinitiveError(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, config.Defaults(), Options{Resident: true})
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "not-ready-session", "generation": int64(0), "operation_id": "not-ready-acquire"}
+	_, err = service.Dispatch(context.Background(), request)
+	if protocol.AsError(err).Code != "startup_reconcile_required" {
+		t.Fatalf("acquire error = %v", err)
+	}
+	op, err := store.GetOperation(context.Background(), "not-ready-acquire")
+	if err != nil || op == nil || op.Response["outcome"] != "error" {
+		t.Fatalf("rejected acquire left pending: %#v, %v", op, err)
+	}
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending = %#v, error = %v", pending, err)
+	}
+}
+
+func TestStartupRecoversExplicitlyUnattemptedAcquire(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := "pre-start-session"
+	generation := int64(0)
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": "pre-start-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), "pre-start-acquire", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": map[string]any{"state": "starting", "start_attempted": false}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Guest: &startupGuest{configErr: missingInstanceError()}, Resident: true})
+	if err := service.StartupReconcile(context.Background()); err != nil {
+		t.Fatalf("startup: %v", err)
+	}
+	op, err := store.GetOperation(context.Background(), "pre-start-acquire")
+	if err != nil || op == nil || op.Response["outcome"] != "error" {
+		t.Fatalf("operation=%#v, error=%v", op, err)
+	}
+}
+
+func TestWorkerRecoveryDoesNotAssumeLegacyOrContradictoryStartWasSafe(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		worker map[string]any
+		active bool
+	}{
+		{"legacy", map[string]any{"state": "starting"}, false},
+		{"identity-present", map[string]any{"state": "starting", "start_attempted": false, "pid": int64(12)}, false},
+		{"active", map[string]any{"state": "starting", "start_attempted": false}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			session := "start-" + tc.name
+			generation := int64(0)
+			if err := store.RecordOperation(context.Background(), tc.name, "acquire", &session, &generation, map[string]any{"outcome": "pending", "worker": tc.worker}); err != nil {
+				t.Fatal(err)
+			}
+			service := New(store, config.Defaults(), Options{})
+			if tc.active {
+				done := service.markOperationActive(tc.name)
+				defer done()
+			}
+			pending, err := store.PendingOperations(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.reconcilePendingWorkers(context.Background(), pending); err != nil {
+				t.Fatal(err)
+			}
+			op, err := store.GetOperation(context.Background(), tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if worker := op.Response["worker"].(map[string]any); worker["state"] != "starting" {
+				t.Fatalf("unexpected worker recovery: %#v", worker)
+			}
+		})
+	}
+}
+
+func TestStartupReconcilesIndependentCachedAcquireDespiteUnownedTask(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	ctx := context.Background()
+	closing := state.Task{TaskID: "blocked-task", SessionID: "blocked-session", Generation: 1, State: stateClosing, InstanceName: "blocked-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2}`, ResourceReservationJSON: `{"cpu":2}`}
+	cached := state.Task{TaskID: "independent-task", SessionID: "independent-session", Generation: 1, State: stateCached, InstanceName: "independent-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	for _, task := range []state.Task{closing, cached} {
+		if err := store.InsertTask(ctx, task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": cached.SessionID, "generation": int64(0), "operation_id": "independent-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(ctx, "independent-acquire", "acquire", &cached.SessionID, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": map[string]any{"state": "exited"}}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &perInstanceGuest{startupGuest: startupGuest{status: "Stopped"}, configs: map[string]map[string]any{
+		"blocked-instance":     {"config": map[string]any{}, "devices": map[string]any{}, "expanded_devices": map[string]any{}},
+		"independent-instance": {"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": cached.TaskID, "user.agent-vm.session": cached.SessionID, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}},
+	}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(ctx); err == nil {
+		t.Fatal("unowned task should keep service unready")
+	}
+	op, err := store.GetOperation(ctx, "independent-acquire")
+	if err != nil || op.Response["outcome"] != "error" {
+		t.Fatalf("independent operation=%#v, error=%v", op, err)
+	}
+	task, err := store.GetTask(ctx, map[string]any{"session_id": closing.SessionID})
+	if err != nil || task == nil || task.State != stateClosing {
+		t.Fatalf("unowned task=%#v, error=%v", task, err)
+	}
+}
+
+type perInstanceGuest struct {
+	startupGuest
+	configs map[string]map[string]any
+}
+
+func (guest *perInstanceGuest) Config(_ context.Context, name string) (map[string]any, error) {
+	v, ok := guest.configs[name]
+	if !ok {
+		return nil, errors.New("unknown instance")
+	}
+	return v, nil
+}
+
+func TestOrphanAcquireRefusesUnverifiedWorkerOrRequest(t *testing.T) {
+	for _, mode := range []string{"missing-worker", "bad-digest", "wrong-session"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			session := "orphan-" + mode
+			generation := int64(0)
+			request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": mode}
+			digest, err := protocol.Digest(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker := any(map[string]any{"state": "exited"})
+			if mode == "missing-worker" {
+				worker = nil
+			}
+			if mode == "bad-digest" {
+				digest = "invalid"
+			}
+			if mode == "wrong-session" {
+				request["session_id"] = "other"
+				digest, err = protocol.Digest(request)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.RecordOperation(ctx, mode, "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": worker}); err != nil {
+				t.Fatal(err)
+			}
+			service := New(store, config.Defaults(), Options{Guest: &startupGuest{configErr: missingInstanceError()}, Resident: true})
+			if err := service.StartupReconcile(ctx); err == nil {
+				t.Fatal("unverified operation was finalized")
+			}
+			op, err := store.GetOperation(ctx, mode)
+			if err != nil || op.Response["outcome"] != "pending" {
+				t.Fatalf("operation=%#v, error=%v", op, err)
+			}
+		})
+	}
+}
+
+func TestOrphanRecoveryContinuesAfterStaleGeneration(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now()
+	configs := map[string]map[string]any{}
+	for _, item := range []struct {
+		session    string
+		taskGen    int64
+		requestGen int64
+	}{{"stale", 5, 1}, {"valid", 2, 1}} {
+		task := state.Task{TaskID: item.session + "-task", SessionID: item.session, Generation: item.taskGen, State: stateCached, InstanceName: item.session + "-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+		if err := store.InsertTask(ctx, task); err != nil {
+			t.Fatal(err)
+		}
+		req := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": item.session, "generation": item.requestGen, "operation_id": item.session + "-op"}
+		digest, err := protocol.Digest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordOperation(ctx, item.session+"-op", "acquire", &item.session, &item.requestGen, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "exited"}}); err != nil {
+			t.Fatal(err)
+		}
+		configs[task.InstanceName] = map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": task.SessionID, "user.agent-vm.generation": fmt.Sprint(task.Generation)}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}
+	}
+	guest := &perInstanceGuest{startupGuest: startupGuest{status: "Stopped"}, configs: configs}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(ctx); err == nil {
+		t.Fatal("stale generation must keep admission blocked")
+	}
+	for _, check := range []struct{ id, want string }{{"stale-op", "pending"}, {"valid-op", "error"}} {
+		op, err := store.GetOperation(ctx, check.id)
+		if err != nil || op.Response["outcome"] != check.want {
+			t.Fatalf("operation=%#v, error=%v", op, err)
+		}
+	}
+}
+
+func TestReconcileClosingDestroyFinalizesVerifiedMissingInstance(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now()
+	session := "closing-missing"
+	generation := int64(1)
+	if err := store.InsertTask(ctx, state.Task{TaskID: "closing-missing-task", SessionID: session, Generation: generation, State: stateClosing, InstanceName: "closing-missing-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2}`, ResourceReservationJSON: `{"cpu":2}`}); err != nil {
+		t.Fatal(err)
+	}
+	req := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": session, "generation": generation, "operation_id": "closing-missing-op"}
+	digest, err := protocol.Digest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "closing-missing-op", "destroy", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "exited"}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Guest: &startupGuest{configErr: missingInstanceError()}})
+	if _, err := service.reconcile(ctx, true); err != nil {
+		t.Fatalf("reconcile=%v", err)
+	}
+	task, err := store.GetTask(ctx, map[string]any{"session_id": session})
+	if err != nil || task != nil {
+		t.Fatalf("task=%#v, error=%v", task, err)
+	}
+	op, err := store.GetOperation(ctx, "closing-missing-op")
+	if err != nil || op.Response["outcome"] != "success" {
+		t.Fatalf("op=%#v, error=%v", op, err)
+	}
+}
+
+func TestStartupRecoversLegacyPreTransitionCachedAcquires(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now()
+	session := "legacy-pretransition"
+	generation := int64(14)
+	task := state.Task{TaskID: "legacy-pretransition-task", SessionID: session, Generation: generation, State: stateCached, InstanceName: "legacy-pretransition-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"legacy-pretransition-one", "legacy-pretransition-two"} {
+		req := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": id}
+		digest, err := protocol.Digest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordOperation(ctx, id, "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "starting"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": "14"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup: %v", err)
+	}
+	for _, id := range []string{"legacy-pretransition-one", "legacy-pretransition-two"} {
+		op, err := store.GetOperation(ctx, id)
+		if err != nil || op.Response["outcome"] != "error" {
+			t.Fatalf("op=%#v,error=%v", op, err)
+		}
+	}
+}
+
+func TestLegacyPreTransitionAcquiresLeaveOlderGenerationPending(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now()
+	session := "legacy-pretransition"
+	generation := int64(14)
+	task := state.Task{TaskID: "legacy-pretransition-task", SessionID: session, Generation: generation, State: stateCached, InstanceName: "legacy-pretransition-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"legacy-pretransition-one", "legacy-pretransition-two"} {
+		req := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": id}
+		digest, err := protocol.Digest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordOperation(ctx, id, "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "starting"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	olderGeneration := generation - 2
+	olderRequest := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": olderGeneration, "operation_id": "older-pending"}
+	olderDigest, err := protocol.Digest(olderRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "older-pending", "acquire", &session, &olderGeneration, map[string]any{"outcome": "pending", "_request": map[string]any(olderRequest), "_request_digest": olderDigest, "worker": map[string]any{"state": "finished"}}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": "14"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(ctx); err == nil {
+		t.Fatal("older uncertain acquire must keep admission blocked")
+	}
+	older, err := store.GetOperation(ctx, "older-pending")
+	if err != nil || older.Response["outcome"] != "pending" {
+		t.Fatalf("older operation = %#v, error = %v", older, err)
+	}
+	for _, id := range []string{"legacy-pretransition-one", "legacy-pretransition-two"} {
+		op, err := store.GetOperation(ctx, id)
+		if err != nil || op.Response["outcome"] != "error" {
+			t.Fatalf("op=%#v,error=%v", op, err)
+		}
+	}
+}
+
+func TestLegacyCachedStartRecoveryRefusesUnsafeEvidence(t *testing.T) {
+	for _, mode := range []string{"generation", "ownership", "reservation", "other-worker", "active"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			now := time.Now()
+			session := "legacy-unsafe-" + mode
+			generation := int64(2)
+			taskGen := generation
+			if mode == "generation" {
+				taskGen++
+			}
+			task := state.Task{TaskID: "legacy-unsafe-task", SessionID: session, Generation: taskGen, State: stateCached, InstanceName: "legacy-unsafe-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+			if mode == "reservation" {
+				task.ResourceReservationJSON = `{"cpu":2}`
+			}
+			if err := store.InsertTask(ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			req := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": "legacy-unsafe-op"}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.RecordOperation(ctx, "legacy-unsafe-op", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "starting"}}); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "other-worker" {
+				if err := store.RecordOperation(ctx, "other-op", "restart", &session, &generation, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "starting", "start_attempted": true}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			nativeTask := task.TaskID
+			if mode == "ownership" {
+				nativeTask = "other"
+			}
+			guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": nativeTask, "user.agent-vm.session": session, "user.agent-vm.generation": fmt.Sprint(taskGen)}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+			service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+			if mode == "active" {
+				finish := service.markOperationActive("legacy-unsafe-op")
+				defer finish()
+			}
+			if err := service.StartupReconcile(ctx); err == nil {
+				t.Fatal("unsafe legacy acquire was finalized")
+			}
+			op, err := store.GetOperation(ctx, "legacy-unsafe-op")
+			if err != nil || op.Response["outcome"] != "pending" {
+				t.Fatalf("op=%#v,error=%v", op, err)
+			}
+		})
+	}
+}
+
+func TestStartupRetriesPreviouslyBlockedMaintenanceAfterTasksClear(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	generation := int64(0)
+	req := protocol.Request{"protocol": protocol.Version, "action": "admin-reconcile", "apply": true, "generation": generation, "operation_id": "previously-blocked-maintenance"}
+	digest, err := protocol.Digest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "previously-blocked-maintenance", "admin-reconcile", nil, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "_recovery_attempts": int64(2), "worker": map[string]any{"state": "finished", "pid": int64(1 << 30), "start_time": "1", "process_group": int64(1 << 30)}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Resident: true, Guest: &startupGuest{}})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup=%v", err)
+	}
+	op, err := store.GetOperation(ctx, "previously-blocked-maintenance")
+	if err != nil || op.Response["outcome"] != "success" {
+		t.Fatalf("operation=%#v,error=%v", op, err)
+	}
+}
+
+func TestStartupRetriesMultipleBlockedMaintenanceOperationsOnce(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	generation := int64(0)
+	for _, id := range []string{"maintenance-a", "maintenance-b", "maintenance-c"} {
+		req := protocol.Request{"protocol": protocol.Version, "action": "admin-reconcile", "apply": true, "generation": generation, "operation_id": id}
+		digest, err := protocol.Digest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordOperation(ctx, id, "admin-reconcile", nil, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "_recovery_attempts": int64(2), "worker": map[string]any{"state": "finished", "pid": int64(1 << 30), "start_time": "1", "process_group": int64(1 << 30)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(store, config.Defaults(), Options{Guest: &startupGuest{}, Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup=%v", err)
+	}
+	for _, id := range []string{"maintenance-a", "maintenance-b", "maintenance-c"} {
+		op, err := store.GetOperation(ctx, id)
+		if err != nil || op.Response["outcome"] != "success" {
+			t.Fatalf("operation=%#v,error=%v", op, err)
+		}
+	}
+}
+
+func TestMaintenanceRetryRequiresVerifiedEvidence(t *testing.T) {
+	for _, mode := range []string{"transitional-task", "invalid-digest", "missing-worker-identity", "already-retried"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			generation := int64(0)
+			req := protocol.Request{"protocol": protocol.Version, "action": "admin-reconcile", "apply": true, "generation": generation, "operation_id": "blocked-maintenance"}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker := map[string]any{"state": "finished", "pid": int64(1 << 30), "start_time": "1", "process_group": int64(1 << 30)}
+			response := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "_recovery_attempts": int64(2), "worker": worker}
+			if mode == "invalid-digest" {
+				response["_request_digest"] = "invalid"
+			}
+			if mode == "missing-worker-identity" {
+				delete(worker, "process_group")
+			}
+			if mode == "already-retried" {
+				response["_recovery_after_clear_attempted"] = true
+			}
+			if err := store.RecordOperation(ctx, "blocked-maintenance", "admin-reconcile", nil, &generation, response); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "transitional-task" {
+				now := time.Now()
+				if err := store.InsertTask(ctx, state.Task{TaskID: "blocked-task", SessionID: "blocked-session", Generation: 1, State: stateClosing, InstanceName: "blocked-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			service := New(store, config.Defaults(), Options{Guest: &startupGuest{config: map[string]any{"config": map[string]any{}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}, Resident: true})
+			if err := service.StartupReconcile(ctx); err == nil {
+				t.Fatal("unverified maintenance was finalized")
+			}
+			op, err := store.GetOperation(ctx, "blocked-maintenance")
+			if err != nil || op.Response["outcome"] != "pending" {
+				t.Fatalf("op=%#v,error=%v", op, err)
+			}
+		})
+	}
+}
+
+func TestStartupRecoversLegacyNeverAllocatedAcquire(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session := "legacy-never-allocated"
+	generation := int64(0)
+	req := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": "legacy-never-allocated-op"}
+	digest, err := protocol.Digest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "legacy-never-allocated-op", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "starting"}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Guest: &startupGuest{configErr: missingInstanceError()}, Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup=%v", err)
+	}
+	op, err := store.GetOperation(ctx, "legacy-never-allocated-op")
+	if err != nil || op.Response["outcome"] != "error" {
+		t.Fatalf("operation=%#v, error=%v", op, err)
+	}
+}
+
+func TestLegacyNeverAllocatedRecoveryRequiresTombstoneAndNativeAbsence(t *testing.T) {
+	for _, mode := range []string{"tombstone", "native-present", "native-error", "other-pending"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			session := "never-allocated-" + mode
+			generation := int64(0)
+			if mode == "tombstone" {
+				if _, err := store.NextGeneration(ctx, session); err != nil {
+					t.Fatal(err)
+				}
+			}
+			req := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": "never-allocated-op"}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.RecordOperation(ctx, "never-allocated-op", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "starting"}}); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "other-pending" {
+				if err := store.RecordOperation(ctx, "other-op", "restart", &session, &generation, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "starting"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			guest := &startupGuest{configErr: missingInstanceError()}
+			if mode == "native-present" {
+				guest.configErr = nil
+				guest.config = map[string]any{}
+			}
+			if mode == "native-error" {
+				guest.configErr = errors.New("transport failed")
+			}
+			service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+			if err := service.StartupReconcile(ctx); err == nil {
+				t.Fatal("unsafe pending operation finalized")
+			}
+			op, err := store.GetOperation(ctx, "never-allocated-op")
+			if err != nil || op.Response["outcome"] != "pending" {
+				t.Fatalf("op=%#v,error=%v", op, err)
+			}
+		})
+	}
+}
+
+type quiescentStartupGuest struct {
+	*startupGuest
+	quiescenceErr error
+}
+
+func (guest *quiescentStartupGuest) VerifyRecoveryQuiescence(context.Context) error {
+	return guest.quiescenceErr
+}
+
+func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
+	for _, action := range []string{"acquire", "resize", "restart"} {
+		t.Run(action, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			session, generation := "superseded-"+action, int64(1)
+			taskGeneration := generation
+			if action == "acquire" {
+				taskGeneration = 3
+			}
+			now := nowString(time.Now())
+			task := state.Task{TaskID: "superseded-task", SessionID: session, Generation: taskGeneration, State: stateCached, InstanceName: "superseded-instance", CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+			if err := store.InsertTask(ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			req := protocol.Request{"protocol": protocol.Version, "action": action, "session_id": session, "generation": generation, "operation_id": "original"}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker := map[string]any{"state": "finished", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "finished_at": nowString(time.Now())}
+			if err := store.RecordOperation(ctx, "original", action, &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": worker}); err != nil {
+				t.Fatal(err)
+			}
+			laterAction, laterGeneration := "release", taskGeneration
+			result := map[string]any{"task_id": task.TaskID, "session_id": session, "generation": taskGeneration, "state": stateCached, "effective_lease": false}
+			if action == "acquire" {
+				laterAction, laterGeneration = "acquire", int64(2)
+				result["state"], result["effective_lease"] = stateActive, true
+			}
+			laterReq := protocol.Request{"protocol": protocol.Version, "action": laterAction, "session_id": session, "generation": laterGeneration, "operation_id": "later"}
+			later := protocol.SuccessWithRelease(laterReq, result, nil, nil)
+			laterDigest, err := protocol.Digest(laterReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			later["_request_digest"] = laterDigest
+			if err := store.RecordOperation(ctx, "later", laterAction, &session, &laterGeneration, later); err != nil {
+				t.Fatal(err)
+			}
+			guest := &quiescentStartupGuest{startupGuest: &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": fmt.Sprint(taskGeneration)}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}}
+			service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+			if err := service.StartupReconcile(ctx); err != nil {
+				t.Fatalf("startup: %v", err)
+			}
+			original, err := store.GetOperation(ctx, "original")
+			if err != nil || original == nil || original.Response["outcome"] != "error" || original.Response["_request"] == nil || original.Response["worker"] == nil {
+				t.Fatalf("original = %#v, error = %v", original, err)
+			}
+			_, err = service.replayRecord(req, original)
+			if control := protocol.AsError(err); control.Code != "operation_outcome_unknown" {
+				t.Fatalf("replay = %#v", control)
+			}
+			detail, _ := protocol.AsError(err).Detail.(map[string]any)
+			if detail["outcome_verified"] != false || detail["lease_state_verified"] != true {
+				t.Fatalf("detail = %#v", detail)
+			}
+			metrics, err := service.adminMetrics(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			unknown, ok := metrics["historical_unknown_operations"].([]any)
+			if !ok || len(unknown) != 1 || unknown[0].(map[string]any)["operation_id"] != "original" {
+				t.Fatalf("historical unknown operations = %#v", metrics["historical_unknown_operations"])
+			}
+		})
+	}
+}
+
+func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
+	for _, mode := range []string{"native-busy", "worker-missing", "no-witness", "wrong-session", "wrong-task", "missing-lease", "unverified-cache", "other-pending", "active", "late-worker", "bad-witness-digest", "bound-task-mismatch"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			session, generation := "superseded-negative-"+mode, int64(1)
+			now := nowString(time.Now())
+			task := state.Task{TaskID: "task", SessionID: session, Generation: generation, State: stateCached, InstanceName: "instance", CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+			if err := store.InsertTask(ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			req := protocol.Request{"protocol": protocol.Version, "action": "restart", "session_id": session, "generation": generation, "operation_id": "original"}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker := map[string]any{"state": "exited", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "finished_at": nowString(time.Now())}
+			if mode == "worker-missing" {
+				delete(worker, "process_group")
+			}
+			if mode == "late-worker" {
+				worker["finished_at"] = nowString(time.Now().Add(time.Hour))
+			}
+			originalResponse := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": worker}
+			if mode == "bound-task-mismatch" {
+				originalResponse["_task_id"] = "different"
+			}
+			if err := store.RecordOperation(ctx, "original", "restart", &session, &generation, originalResponse); err != nil {
+				t.Fatal(err)
+			}
+			if mode != "no-witness" {
+				laterReq := protocol.Request{"protocol": protocol.Version, "action": "release", "session_id": session, "generation": generation, "operation_id": "later"}
+				result := map[string]any{"task_id": task.TaskID, "session_id": session, "generation": generation, "state": stateCached, "effective_lease": false}
+				if mode == "wrong-session" {
+					result["session_id"] = "different"
+				}
+				if mode == "wrong-task" {
+					result["task_id"] = "different"
+				}
+				if mode == "missing-lease" {
+					delete(result, "effective_lease")
+				}
+				later := protocol.SuccessWithRelease(laterReq, result, nil, nil)
+				laterDigest, err := protocol.Digest(laterReq)
+				if err != nil {
+					t.Fatal(err)
+				}
+				later["_request_digest"] = laterDigest
+				if mode == "bad-witness-digest" {
+					later["_request_digest"] = "invalid"
+				}
+				if err := store.RecordOperation(ctx, "later", "release", &session, &generation, later); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if mode == "other-pending" {
+				if err := store.RecordOperation(ctx, "other", "destroy", &session, &generation, map[string]any{"outcome": "pending"}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			nativeTask := task.TaskID
+			if mode == "unverified-cache" {
+				nativeTask = "different"
+			}
+			guest := &quiescentStartupGuest{startupGuest: &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": nativeTask, "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}}
+			if mode == "native-busy" {
+				guest.quiescenceErr = errors.New("native work remains")
+			}
+			service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+			if mode == "active" {
+				finish := service.markOperationActive("original")
+				defer finish()
+			}
+			pending, err := store.PendingOperations(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.reconcileSupersededOperations(ctx, pending); (err != nil) != (mode == "native-busy") {
+				t.Fatalf("reconciliation error = %v", err)
+			}
+			original, err := store.GetOperation(ctx, "original")
+			if err != nil || original == nil || original.Response["outcome"] != "pending" {
+				t.Fatalf("original = %#v, error = %v", original, err)
+			}
+		})
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -18,11 +19,10 @@ import (
 	"time"
 )
 
-var missingInstanceDiagnostic = regexp.MustCompile(`\b(?:instance|container|virtual machine)(?:\s+(?:"[^"]+"|'[^']+'|[A-Za-z0-9_.:@/-]+))?\s+(?:not found|does not exist)\b`)
 var missingImageDiagnostic = regexp.MustCompile(`\bimage(?:\s+(?:"[^"]+"|'[^']+'|[A-Za-z0-9_.:@/-]+))?\s+(?:not found|does not exist)\b`)
 
 type Guest interface {
-	Init(context.Context, string, string) error
+	Init(context.Context, string, string, map[string]string) error
 	ConfigSet(context.Context, string, string, string) error
 	DeviceSet(context.Context, string, string, string, string) error
 	DeviceAdd(context.Context, string, string, string, map[string]string) error
@@ -104,21 +104,21 @@ type CommandError struct {
 // IsNotFound reports only an Incus command failure whose diagnostics identify
 // a missing instance. Callers use this to finalize a durable destroy intent;
 // unrelated ownership or transport failures remain unverified.
-func IsNotFound(err error) bool {
+func IsNotFound(err error, instance, project string) bool {
 	var commandErr *CommandError
-	if !errors.As(err, &commandErr) {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &commandErr) || !errors.As(commandErr.Cause, &exitErr) || commandErr.Result.Code <= 0 || commandErr.Result.StdoutTruncated || commandErr.Result.StderrTruncated {
 		return false
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || commandErr.Result.StdoutTruncated || commandErr.Result.StderrTruncated {
+	diagnostic := strings.ToLower(strings.TrimSpace(string(commandErr.Result.Stderr)))
+	if diagnostic == "instance not found" || diagnostic == "error: instance not found" {
+		return true
+	}
+	if instance == "" || project == "" {
 		return false
 	}
-	diagnostic := strings.ToLower(string(commandErr.Result.Stderr) + " " + commandErr.Error())
-	for _, line := range strings.Split(diagnostic, "\n") {
-		if strings.Contains(line, "no such instance") || strings.Contains(line, "no such container") || missingInstanceDiagnostic.MatchString(line) {
-			return true
-		}
-	}
-	return false
+	contextual := fmt.Sprintf("error: failed to fetch instance %q in projectname %q: instance not found", instance, project)
+	return diagnostic == strings.ToLower(contextual)
 }
 
 // IsImageNotFound is the image-specific counterpart used by idempotent
@@ -229,7 +229,7 @@ func wrapCommandError(result Result, err error) error {
 	return &CommandError{Result: result, Cause: err}
 }
 
-func (c *IncusClient) Init(ctx context.Context, image, name string) error {
+func (c *IncusClient) Init(ctx context.Context, image, name string, ownership map[string]string) error {
 	// Agent sessions are Incus system containers. The outer control
 	// environment may itself be nested, but it must not require KVM/QEMU.
 	args := []string{"init", image, name}
@@ -243,6 +243,14 @@ func (c *IncusClient) Init(ctx context.Context, image, name string) error {
 		args = append(args, "--storage", c.Pool)
 	}
 	args = append(args, "--config", "boot.autostart=false")
+	keys := make([]string, 0, len(ownership))
+	for key := range ownership {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		args = append(args, "--config", key+"="+ownership[key])
+	}
 	return c.run(ctx, args...)
 }
 
@@ -451,7 +459,7 @@ func (c *IncusClient) VerifyImage(ctx context.Context, fingerprint string, requi
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		err := c.Delete(cleanupCtx, name)
-		if err != nil && IsNotFound(err) {
+		if err != nil && IsNotFound(err, name, c.Project) {
 			return nil
 		}
 		return err
