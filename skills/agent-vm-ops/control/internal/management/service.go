@@ -44,9 +44,24 @@ type Options struct {
 	AvailableStagingBytes      func() (int64, error)
 	AvailableImageStorageBytes func() (int64, error)
 	CurrentSystemVersion       func(context.Context) (string, error)
+	IsDraining                 func(context.Context) (bool, error)
 	Clock                      func() time.Time
 	Backend                    ImageBackend
 	Actions                    ActionBackend
+}
+
+func (s *Service) rejectNewManagementAction(ctx context.Context) error {
+	if s.Options.IsDraining == nil {
+		return nil
+	}
+	draining, err := s.Options.IsDraining(ctx)
+	if err != nil {
+		return errors.New("authority_unavailable: drain state could not be verified")
+	}
+	if draining {
+		return errors.New("draining: new management action is refused while the control plane is draining")
+	}
+	return nil
 }
 
 type ImageBackend interface {
@@ -162,6 +177,15 @@ func (s *Service) ListImages(ctx context.Context, filter state.ImageFilter) ([]s
 	return images, version, err
 }
 
+func (s *Service) ListImagesPage(ctx context.Context, filter state.ImageFilter) ([]state.ManagedImage, bool, string, error) {
+	images, more, err := s.Store.ListManagedImagesPage(ctx, filter)
+	if err != nil {
+		return nil, false, "", err
+	}
+	version, err := s.Store.ImageSelectionVersion(ctx)
+	return images, more, version, err
+}
+
 func (s *Service) ImageCatalogVersion(ctx context.Context) (string, error) {
 	return s.Store.ImageCatalogVersion(ctx)
 }
@@ -227,6 +251,9 @@ func (s *Service) StartImageImport(ctx context.Context, request ImportRequest) (
 	}
 	if existing, err := s.existingOperation(ctx, request.OperationID, digest); err != nil || existing != nil {
 		return existing, err
+	}
+	if err := s.rejectNewManagementAction(ctx); err != nil {
+		return nil, err
 	}
 	if err := s.ValidateImport(request); err != nil {
 		return nil, err
@@ -866,6 +893,9 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 	if operationID == "" || actor == "" || strings.TrimSpace(reason) == "" {
 		return nil, errors.New("invalid_request: operation, actor and reason are required")
 	}
+	if err := s.rejectNewManagementAction(ctx); err != nil {
+		return nil, err
+	}
 	req := map[string]any{"action": action, "target_id": targetID, "target_version": targetVersion, "actor": actor, "reason": reason}
 	digest, _ := protocol.Digest(protocol.Request(req))
 	operation := state.ManagementOperation{OperationID: operationID, Action: action, TargetKind: "image", TargetID: targetID, Actor: actor, Reason: reason, Phase: "reference_check", Status: "queued", Request: map[string]any{"_request_digest": digest, "request": req}}
@@ -914,6 +944,11 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 		return nil, err
 	} else if existing != nil && existing.Status != "queued" {
 		return existing, nil
+	}
+	if request.Action != "release" && request.Action != "destroy" {
+		if err := s.rejectNewManagementAction(ctx); err != nil {
+			return nil, err
+		}
 	}
 	if s.Options.Actions == nil {
 		return nil, errors.New("authority_unavailable: action backend is not configured")

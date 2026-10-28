@@ -341,39 +341,34 @@ func (authority *Authority) listVMs(writer http.ResponseWriter, request *http.Re
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	tasks, err := authority.Store.ListTasks(request.Context())
-	if err != nil {
-		writeProblem(writer, problemFromError(err, "internal", ""))
-		return
-	}
-	filtered := make([]state.Task, 0, len(tasks))
-	states := request.URL.Query()["state"]
-	for _, task := range tasks {
-		if !matchesAny(states, task.State) || (request.URL.Query().Get("session_id") != "" && request.URL.Query().Get("session_id") != task.SessionID) || (request.URL.Query().Get("image_fingerprint") != "" && request.URL.Query().Get("image_fingerprint") != task.ImageFingerprint) || !matchesLease(request.URL.Query().Get("lease_state"), task, authority.Clock()) || !strings.Contains(strings.ToLower(task.TaskID+" "+task.SessionID+" "+task.InstanceName), strings.ToLower(request.URL.Query().Get("q"))) {
-			continue
-		}
-		filtered = append(filtered, task)
-	}
-	keys := make([]string, len(filtered))
-	for index := range filtered {
-		keys[index] = filtered[index].TaskID
-	}
-	start, limit, err := pageBounds(request.URL.Query(), keys, pageAfterAscending)
+	query := request.URL.Query()
+	limit, cursor, err := pageRequest(query)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	end := minInt(start+limit, len(filtered))
-	items := make([]any, 0, end-start)
-	for index := start; index < end; index++ {
-		item, itemErr := authority.vmValue(request.Context(), &filtered[index])
+	tasks, more, err := authority.Store.ListTasksPage(request.Context(), state.TaskPageFilter{
+		States: query["state"], SessionID: query.Get("session_id"), ImageFingerprint: query.Get("image_fingerprint"), Query: query.Get("q"),
+		LeaseState: query.Get("lease_state"), LeaseNow: authority.Clock().UTC().Format(time.RFC3339Nano), AfterTaskID: cursor, Limit: limit,
+	})
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "internal", ""))
+		return
+	}
+	items := make([]any, 0, len(tasks))
+	for index := range tasks {
+		item, itemErr := authority.vmValue(request.Context(), &tasks[index])
 		if itemErr != nil {
 			writeProblem(writer, problemFromError(itemErr, "internal", ""))
 			return
 		}
 		items = append(items, item)
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(limit, end < len(filtered), pageKey(keys, end))})
+	nextKey := ""
+	if len(tasks) > 0 {
+		nextKey = tasks[len(tasks)-1].TaskID
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(limit, more, nextKey)})
 }
 
 func (authority *Authority) getVM(writer http.ResponseWriter, request *http.Request, taskID string) {
@@ -460,24 +455,21 @@ func (authority *Authority) listImages(writer http.ResponseWriter, request *http
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	images, selectionVersion, err := authority.Management.ListImages(request.Context(), state.ImageFilter{State: request.URL.Query().Get("state"), Architecture: request.URL.Query().Get("architecture"), Query: request.URL.Query().Get("q")})
-	if err != nil {
-		writeProblem(writer, problemFromError(err, "internal", ""))
-		return
-	}
-	keys := make([]string, len(images))
-	for index := range images {
-		keys[index] = imagePageKey(images[index])
-	}
-	start, limit, err := pageBounds(request.URL.Query(), keys, pageAfterImage)
+	query := request.URL.Query()
+	limit, cursor, err := pageRequest(query)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	end := minInt(start+limit, len(images))
-	items := make([]any, 0, end-start)
-	for index := start; index < end; index++ {
-		items = append(items, imageValue(images[index]))
+	createdAt, fingerprint := pageKeyParts(cursor)
+	images, more, selectionVersion, err := authority.Management.ListImagesPage(request.Context(), state.ImageFilter{State: query.Get("state"), Architecture: query.Get("architecture"), Query: query.Get("q"), AfterCreatedAt: createdAt, AfterFingerprint: fingerprint, Limit: limit})
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "internal", ""))
+		return
+	}
+	items := make([]any, 0, len(images))
+	for _, image := range images {
+		items = append(items, imageValue(image))
 	}
 	defaultFingerprint, exists, err := authority.Store.CurrentDefaultImage(request.Context())
 	if err != nil {
@@ -493,7 +485,11 @@ func (authority *Authority) listImages(writer http.ResponseWriter, request *http
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(limit, end < len(images), pageKey(keys, end)), "default_fingerprint": defaultValue, "selection_version": selectionVersion, "catalog_version": catalogVersion})
+	nextKey := ""
+	if len(images) > 0 {
+		nextKey = imagePageKey(images[len(images)-1])
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(limit, more, nextKey), "default_fingerprint": defaultValue, "selection_version": selectionVersion, "catalog_version": catalogVersion})
 }
 
 func (authority *Authority) getImage(writer http.ResponseWriter, request *http.Request, fingerprint string) {
@@ -931,7 +927,13 @@ func (authority *Authority) uploadImageImport(writer http.ResponseWriter, reques
 	}
 	staged, err := authority.stageUpload(request, source)
 	if err != nil {
-		_, _ = authority.Management.FailImageImportUpload(context.Background(), operationID, err)
+		// A capacity probe can fail after the stream has begun. Keep the
+		// operation awaiting content so the administrator can retry once the
+		// staging reserve recovers; malformed or interrupted streams remain
+		// durably failed as before.
+		if !strings.HasPrefix(err.Error(), "staging_capacity_low:") {
+			_, _ = authority.Management.FailImageImportUpload(context.Background(), operationID, err)
+		}
 		writeProblem(writer, problemFromError(err, "upload", operationID))
 		return
 	}
@@ -1920,6 +1922,9 @@ func pageKeyParts(value string) (string, string) {
 }
 
 func validateVMQuery(query url.Values) error {
+	if err := rejectUnknownQueryKeys(query, map[string]bool{"q": true, "session_id": true, "image_fingerprint": true, "state": true, "lease_state": true, "limit": true, "cursor": true}); err != nil {
+		return err
+	}
 	if len(query.Get("q")) > 200 {
 		return errors.New("q must not exceed 200 characters")
 	}
@@ -1941,6 +1946,9 @@ func validateVMQuery(query url.Values) error {
 }
 
 func validateImageQuery(query url.Values) error {
+	if err := rejectUnknownQueryKeys(query, map[string]bool{"q": true, "state": true, "architecture": true, "limit": true, "cursor": true}); err != nil {
+		return err
+	}
 	if len(query.Get("q")) > 200 {
 		return errors.New("q must not exceed 200 characters")
 	}
@@ -1954,6 +1962,9 @@ func validateImageQuery(query url.Values) error {
 }
 
 func validateOperationQuery(query url.Values) error {
+	if err := rejectUnknownQueryKeys(query, map[string]bool{"q": true, "status": true, "action": true, "actor": true, "target_id": true, "limit": true, "cursor": true}); err != nil {
+		return err
+	}
 	if len(query.Get("q")) > 200 {
 		return errors.New("q must not exceed 200 characters")
 	}
@@ -1966,7 +1977,19 @@ func validateOperationQuery(query url.Values) error {
 	return nil
 }
 
+func rejectUnknownQueryKeys(query url.Values, allowed map[string]bool) error {
+	for key := range query {
+		if !allowed[key] {
+			return errors.New("unknown query parameter: " + key)
+		}
+	}
+	return nil
+}
+
 func auditBounds(query url.Values) (*time.Time, *time.Time, error) {
+	if err := rejectUnknownQueryKeys(query, map[string]bool{"from": true, "to": true, "actor": true, "action": true, "operation_id": true, "target_id": true, "limit": true, "cursor": true}); err != nil {
+		return nil, nil, err
+	}
 	var from, to *time.Time
 	for key, target := range map[string]**time.Time{"from": &from, "to": &to} {
 		value := query.Get(key)

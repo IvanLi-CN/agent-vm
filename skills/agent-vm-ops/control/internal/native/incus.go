@@ -18,6 +18,9 @@ import (
 	"time"
 )
 
+var missingInstanceDiagnostic = regexp.MustCompile(`\b(?:instance|container|virtual machine)(?:\s+(?:"[^"]+"|'[^']+'|[A-Za-z0-9_.:@/-]+))?\s+(?:not found|does not exist)\b`)
+var missingImageDiagnostic = regexp.MustCompile(`\bimage(?:\s+(?:"[^"]+"|'[^']+'|[A-Za-z0-9_.:@/-]+))?\s+(?:not found|does not exist)\b`)
+
 type Guest interface {
 	Init(context.Context, string, string) error
 	ConfigSet(context.Context, string, string, string) error
@@ -99,16 +102,43 @@ type CommandError struct {
 }
 
 // IsNotFound reports only an Incus command failure whose diagnostics identify
-// a missing instance. Callers use this to finalize a durable destroy intent;
-// unrelated ownership or transport failures remain unverified.
+// a missing instance or container. Generic 404/not-found diagnostics are not
+// sufficient because a remote, project, or endpoint failure must remain
+// fail-closed for lifecycle recovery.
 func IsNotFound(err error) bool {
 	var commandErr *CommandError
 	if !errors.As(err, &commandErr) {
 		return false
 	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || commandErr.Result.StdoutTruncated || commandErr.Result.StderrTruncated {
+		return false
+	}
 	diagnostic := strings.ToLower(string(commandErr.Result.Stderr) + " " + commandErr.Error())
-	for _, marker := range []string{"not found", "does not exist", "404"} {
-		if strings.Contains(diagnostic, marker) {
+	for _, line := range strings.Split(diagnostic, "\n") {
+		if strings.Contains(line, "no such instance") || strings.Contains(line, "no such container") {
+			return true
+		}
+		if missingInstanceDiagnostic.MatchString(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsImageNotFound is the image-specific counterpart used by idempotent
+// catalog deletion. A generic project, remote, endpoint or HTTP 404 remains
+// an uncertain native result.
+func IsImageNotFound(err error) bool {
+	var commandErr *CommandError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || commandErr.Result.StdoutTruncated || commandErr.Result.StderrTruncated {
+		return false
+	}
+	diagnostic := strings.ToLower(string(commandErr.Result.Stderr) + " " + commandErr.Error())
+	for _, line := range strings.Split(diagnostic, "\n") {
+		if strings.Contains(line, "no such image") || missingImageDiagnostic.MatchString(line) {
 			return true
 		}
 	}
@@ -405,7 +435,7 @@ func (c *IncusClient) DeleteImage(ctx context.Context, fingerprint string) error
 		return errors.New("invalid image fingerprint")
 	}
 	if err := c.run(ctx, "image", "delete", "local:"+fingerprint); err != nil {
-		if IsNotFound(err) {
+		if IsImageNotFound(err) {
 			return nil
 		}
 		return &UncertainError{Cause: err}

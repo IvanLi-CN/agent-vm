@@ -1834,6 +1834,10 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			if pendingErr != nil {
 				return nil, s.sqliteError(pendingErr)
 			}
+			managementPending, managementPendingErr := s.Store.PendingManagementOperations(ctx)
+			if managementPendingErr != nil {
+				return nil, s.sqliteError(managementPendingErr)
+			}
 			pendingOperations := make([]any, 0, len(pending))
 			for _, operation := range pending {
 				item := map[string]any{
@@ -1855,6 +1859,15 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 					}
 				}
 				pendingOperations = append(pendingOperations, item)
+			}
+			for _, operation := range managementPending {
+				pendingOperations = append(pendingOperations, map[string]any{
+					"operation_id": operation.OperationID,
+					"action":       operation.Action,
+					"target_id":    operation.TargetID,
+					"created_at":   operation.CreatedAt,
+					"management":   true,
+				})
 			}
 			var cpuObservation *observe.CPUObservation
 			var cpuObservationErr error
@@ -2176,6 +2189,12 @@ func (s *Service) task(ctx context.Context, request protocol.Request) (*state.Ta
 	if request["generation"] != nil && intValue(request["generation"]) != task.Generation {
 		return nil, protocol.NewError("generation_mismatch", "task generation does not match request", map[string]any{"expected": task.Generation, "actual": intValue(request["generation"])})
 	}
+	if expectedVersion := stringValue(request["management_target_version"]); expectedVersion != "" {
+		currentVersion := "vm:" + task.TaskID + ":" + task.UpdatedAt
+		if expectedVersion != currentVersion {
+			return nil, protocol.NewError("stale_target", "VM resource version changed", map[string]any{"expected": currentVersion, "actual": expectedVersion})
+		}
+	}
 	return task, nil
 }
 
@@ -2197,6 +2216,13 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 func (s *Service) isDraining(ctx context.Context) (bool, error) {
 	value, exists, err := s.Store.Meta(ctx, "draining")
 	return exists && value == "1", err
+}
+
+// IsDraining exposes the durable admission fence to the browser-independent
+// management authority so new high-risk operations cannot enter during a
+// control-plane publication drain.
+func (s *Service) IsDraining(ctx context.Context) (bool, error) {
+	return s.isDraining(ctx)
 }
 
 func (s *Service) setOwnership(ctx context.Context, task *state.Task) error {

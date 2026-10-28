@@ -175,6 +175,9 @@ func serve(args []string) error {
 			}
 			return "system:" + epoch, nil
 		},
+		IsDraining: func(ctx context.Context) (bool, error) {
+			return service.IsDraining(ctx)
+		},
 		Clock:   time.Now,
 		Backend: imageBackend,
 		Actions: &webadmin.LifecycleActions{Service: service, Store: store},

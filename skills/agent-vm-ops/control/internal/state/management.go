@@ -112,9 +112,12 @@ type ManagedImage struct {
 }
 
 type ImageFilter struct {
-	State        string
-	Architecture string
-	Query        string
+	State            string
+	Architecture     string
+	Query            string
+	AfterCreatedAt   string
+	AfterFingerprint string
+	Limit            int
 }
 
 type ManagementCapability struct {
@@ -387,6 +390,76 @@ FROM managed_images i`
 		return rows.Err()
 	})
 	return values, err
+}
+
+// ListManagedImagesPage applies management image filters in SQLite and reads
+// at most limit+1 rows to determine whether another page exists.
+func (s *Store) ListManagedImagesPage(ctx context.Context, filter ImageFilter) ([]ManagedImage, bool, error) {
+	limit := filter.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	conditions := []string{}
+	args := []any{}
+	if filter.State != "" {
+		conditions = append(conditions, "i.state = ?")
+		args = append(args, filter.State)
+	}
+	if filter.Architecture != "" {
+		conditions = append(conditions, "i.architecture = ?")
+		args = append(args, filter.Architecture)
+	}
+	if filter.Query != "" {
+		conditions = append(conditions, "(i.fingerprint LIKE ? ESCAPE '\\' OR COALESCE(i.version_label, '') LIKE ? ESCAPE '\\')")
+		literal := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(filter.Query)
+		like := "%" + literal + "%"
+		args = append(args, like, like)
+	}
+	if filter.AfterCreatedAt != "" || filter.AfterFingerprint != "" {
+		conditions = append(conditions, "(i.created_at < ? OR (i.created_at = ? AND i.fingerprint > ?))")
+		args = append(args, filter.AfterCreatedAt, filter.AfterCreatedAt, filter.AfterFingerprint)
+	}
+	query := `SELECT i.fingerprint, i.version_label, i.architecture, i.instance_type, i.source_kind, i.source_id,
+i.state, i.integrity, i.suitability, i.findings_json, i.is_default, i.default_compatibility, i.revision, i.created_at, i.updated_at,
+(SELECT COUNT(*) FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state = 'active'),
+(SELECT COUNT(*) FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state = 'cached'),
+(SELECT COUNT(*) FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state IN ('closing', 'deleting', 'failed')),
+(SELECT COUNT(*) FROM (
+ SELECT t.task_id AS reference_id FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state = 'preparing'
+ UNION
+ SELECT r.reference_id FROM image_references r WHERE r.fingerprint = i.fingerprint AND r.reference_kind = 'pending_creation'
+)),
+(SELECT COUNT(*) FROM image_references r WHERE r.fingerprint = i.fingerprint AND r.reference_kind = 'verification')
+FROM managed_images i`
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY i.created_at DESC, i.fingerprint LIMIT ?"
+	args = append(args, limit+1)
+	values := make([]ManagedImage, 0, limit)
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			value, err := scanManagedImage(rows)
+			if err != nil {
+				return err
+			}
+			values = append(values, *value)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	hasMore := len(values) > limit
+	if hasMore {
+		values = values[:limit]
+	}
+	return values, hasMore, nil
 }
 
 func (s *Store) GetManagedImage(ctx context.Context, fingerprint string) (*ManagedImage, error) {
@@ -912,6 +985,36 @@ func (s *Store) ListAllManagementOperations(ctx context.Context) ([]ManagementOp
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
 		rows, err := conn.QueryContext(ctx, `SELECT operation_id, action, target_kind, target_id, actor, reason, phase, status, request_json, result_json, error_json, created_at, updated_at
 FROM management_operations ORDER BY created_at DESC, operation_id DESC`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			value, err := scanManagementOperationRow(rows)
+			if err != nil {
+				return err
+			}
+			values = append(values, *value)
+		}
+		return rows.Err()
+	})
+	return values, err
+}
+
+// PendingManagementOperations returns the bounded summaries needed by the
+// release drain convergence check. It is intentionally tolerant of a legacy
+// database that has not activated the management schema yet.
+func (s *Store) PendingManagementOperations(ctx context.Context) ([]ManagementOperation, error) {
+	values := []ManagementOperation{}
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		var table string
+		if err := conn.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'management_operations'").Scan(&table); errors.Is(err, sql.ErrNoRows) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		rows, err := conn.QueryContext(ctx, `SELECT operation_id, action, target_kind, target_id, actor, reason, phase, status, request_json, result_json, error_json, created_at, updated_at
+FROM management_operations WHERE status IN ('queued', 'running', 'reconciling') ORDER BY created_at, operation_id LIMIT 1001`)
 		if err != nil {
 			return err
 		}
