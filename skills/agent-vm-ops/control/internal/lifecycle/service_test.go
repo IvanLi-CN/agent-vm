@@ -685,7 +685,8 @@ func TestStartupReconcileRetriesTimerBeforeNativeStart(t *testing.T) {
 	}
 	if err := store.RecordOperation(ctx, "timer-prestart-recovery", "timer-reconcile", nil, &generation, map[string]any{
 		"outcome": "pending", "_request": request, "_request_digest": digest,
-		"worker": map[string]any{"state": "starting", "prepared_at": "2026-10-28T00:00:00+00:00"},
+		"_recovery_attempts": int64(1),
+		"worker":             map[string]any{"state": "starting", "prepared_at": "2026-10-28T00:00:00+00:00"},
 	}); err != nil {
 		t.Fatal(err)
 	}

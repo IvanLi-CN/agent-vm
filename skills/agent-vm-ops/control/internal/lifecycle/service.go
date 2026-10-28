@@ -465,17 +465,19 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 		if s.operationActive(operation.OperationID) {
 			continue
 		}
+		preStartTimer := false
 		if workerValue, hasWorker := operation.Response["worker"]; hasWorker {
 			worker, validWorker := workerValue.(map[string]any)
 			stateValue := ""
 			if validWorker {
 				stateValue = stringValue(worker["state"])
+				preStartTimer = recoverableBeforeNativeStart(operation.Action, worker)
 			}
-			if !validWorker || !recoverableOperation(operation.Action) || (stateValue != "finished" && stateValue != "exited" && !recoverableBeforeNativeStart(operation.Action, worker)) {
+			if !validWorker || !recoverableOperation(operation.Action) || (stateValue != "finished" && stateValue != "exited" && !preStartTimer) {
 				continue
 			}
 		}
-		if !recoverableOperation(operation.Action) || recoveryAttempts(operation.Response) > 0 {
+		if !recoverableOperation(operation.Action) || recoveryAttempts(operation.Response) > 0 && !preStartTimer {
 			continue
 		}
 		rawRequest, ok := operation.Response["_request"].(map[string]any)
