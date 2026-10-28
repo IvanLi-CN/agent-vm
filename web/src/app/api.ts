@@ -212,6 +212,8 @@ export async function previewImageAction(fingerprint: string, action: "default" 
   const state = getMockState();
   const image = state.images.find((candidate) => candidate.fingerprint === fingerprint) ?? state.images[0];
   if (!image) throw new ManagementRequestError("not_found");
+  if (action === "default" && (image.state === "retired" || image.verification.suitability !== "passed")) throw new ManagementRequestError("image_not_applicable", "precondition");
+  if (action === "retire" && image.is_default) throw new ManagementRequestError("default_image_required", "precondition");
   return delay({ target_version: image.resource_version, confirmation_token: `synthetic-confirmation-${createOperationId()}`, expires_at: "2026-01-15T10:25:00Z", impact: { summary_code: action === "delete" && image.references.active + image.references.cached > 0 ? "image_referenced" : "image_change_preview", affected_session_count: image.references.active, affected_image_references: image.references, changes: [{ code: action === "default" ? "new_sessions_use_image" : action === "retire" ? "new_selection_blocked" : "image_removed", count: null, value: image.version_label }] } });
 }
 
@@ -224,6 +226,13 @@ export async function submitImageAction(fingerprint: string, action: "default" |
     return realRequest(path, { method: "POST", body: JSON.stringify(body) });
   }
   assertMockMutationAllowed();
+  const state = getMockState();
+  const image = state.images.find((candidate) => candidate.fingerprint === fingerprint);
+  if (!image) throw new ManagementRequestError("not_found", "precondition");
+  if (action === "default" && (image.state === "retired" || image.verification.suitability !== "passed")) throw new ManagementRequestError("image_not_applicable", "precondition");
+  if (action === "retire" && image.is_default) throw new ManagementRequestError("default_image_required", "precondition");
+  if (action === "delete" && image.is_default) throw new ManagementRequestError("default_image_required", "precondition");
+  if (action === "delete" && image.references.active + image.references.cached + image.references.releasing + image.references.pending_creation + image.references.verification > 0) throw new ManagementRequestError("image_referenced", "precondition");
   return createMockOperation(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", { kind: "image", id: fingerprint }, reason, undefined, operationId, { action, fingerprint, reason, targetVersion: preview.target_version, confirmationToken: preview.confirmation_token });
 }
 
@@ -270,8 +279,26 @@ function createMockOperation(action: Operation["action"], target: Operation["tar
   if (finalStatus === "succeeded") {
     if (target.kind === "vm") {
       const vm = state.vms.find((candidate) => candidate.task_id === target.id);
-      if (vm && action === "destroy") { adjustTaskCount(state, vm.state, "absent"); vm.state = "absent"; vm.native_state = "absent"; vm.guest_availability = "unavailable"; vm.lease = { state: "absent", expires_at: null }; }
-      if (vm && action === "release") { adjustTaskCount(state, vm.state, "cached"); vm.state = "cached"; vm.native_state = "stopped"; vm.guest_availability = "unavailable"; vm.lease = { state: "absent", expires_at: null }; }
+      if (vm && action === "destroy") {
+        const previousState = vm.state;
+        adjustTaskCount(state, previousState, "absent");
+        adjustImageReferenceForVm(state, vm, previousState, "absent", operationId);
+        adjustCapacityForVmTransition(state, vm, previousState, "absent");
+        vm.state = "absent";
+        vm.native_state = "absent";
+        vm.guest_availability = "unavailable";
+        vm.lease = { state: "absent", expires_at: null };
+      }
+      if (vm && action === "release") {
+        const previousState = vm.state;
+        adjustTaskCount(state, previousState, "cached");
+        adjustImageReferenceForVm(state, vm, previousState, "cached", operationId);
+        adjustCapacityForVmTransition(state, vm, previousState, "cached");
+        vm.state = "cached";
+        vm.native_state = "stopped";
+        vm.guest_availability = "unavailable";
+        vm.lease = { state: "absent", expires_at: null };
+      }
       if (vm && action === "restart") { vm.native_state = "running"; vm.guest_availability = "ready"; }
       if (vm && action === "resize") {
         const nextResources = { ...vm.resources, cpu_vcpu: typeof effectParameters.cpu_vcpu === "number" ? effectParameters.cpu_vcpu : vm.resources.cpu_vcpu, memory_bytes: typeof effectParameters.memory_bytes === "string" ? effectParameters.memory_bytes : vm.resources.memory_bytes, disk_bytes: typeof effectParameters.disk_bytes === "string" ? effectParameters.disk_bytes : vm.resources.disk_bytes };
@@ -292,6 +319,23 @@ function createMockOperation(action: Operation["action"], target: Operation["tar
       });
       state.image_selection_version = advanceMockVersion(state.image_selection_version, operationId);
       operation.result = { ...operation.result, default_fingerprint: target.id };
+    }
+    if (target.kind === "image" && action === "image_retire") {
+      const image = state.images.find((candidate) => candidate.fingerprint === target.id);
+      if (image) {
+        image.state = "retired";
+        image.resource_version = advanceMockVersion(image.resource_version, operationId);
+        state.image_catalog_version = advanceMockVersion(state.image_catalog_version, operationId);
+        operation.result = { ...operation.result, image_fingerprint: image.fingerprint };
+      }
+    }
+    if (target.kind === "image" && action === "image_delete") {
+      const imageIndex = state.images.findIndex((candidate) => candidate.fingerprint === target.id);
+      if (imageIndex >= 0) {
+        const [deleted] = state.images.splice(imageIndex, 1);
+        state.image_catalog_version = advanceMockVersion(state.image_catalog_version, operationId);
+        operation.result = { ...operation.result, image_fingerprint: deleted.fingerprint };
+      }
     }
     if (target.kind === "image_catalog" && action === "image_import" && isImageImportRequest(effectParameters)) {
       const imported = applyImageImportEffect(state, effectParameters as unknown as ImageImportRequest, operationId);
@@ -318,6 +362,63 @@ type VMResources = ManagedVM["resources"];
 
 function advanceMockVersion(value: string, operationId: string): string {
   return `${value}:demo-${operationId.slice(0, 8)}`;
+}
+
+type ImageReferenceKey = keyof ManagedImage["references"];
+
+function imageReferenceKeyForVmState(state: ManagedVM["state"]): ImageReferenceKey | null {
+  if (state === "active") return "active";
+  if (state === "cached") return "cached";
+  if (state === "preparing") return "pending_creation";
+  if (state === "closing" || state === "deleting" || state === "failed") return "releasing";
+  return null;
+}
+
+function adjustImageReferenceForVm(state: ReturnType<typeof getMockState>, vm: ManagedVM, from: ManagedVM["state"], to: ManagedVM["state"], operationId: string): void {
+  const image = state.images.find((candidate) => candidate.fingerprint === vm.image.fingerprint);
+  const fromKey = imageReferenceKeyForVmState(from);
+  const toKey = imageReferenceKeyForVmState(to);
+  if (!image || fromKey === toKey) return;
+  const references = { ...image.references };
+  if (fromKey) references[fromKey] = Math.max(0, references[fromKey] - 1);
+  if (toKey) references[toKey] += 1;
+  image.references = references;
+  image.resource_version = advanceMockVersion(image.resource_version, operationId);
+  state.image_catalog_version = advanceMockVersion(state.image_catalog_version, operationId);
+}
+
+type CapacityContribution = { cpu: number; memory: bigint; disk: bigint };
+
+function capacityContribution(vm: ManagedVM, state: ManagedVM["state"]): CapacityContribution {
+  const cpu = typeof vm.resources.cpu_vcpu === "number" ? vm.resources.cpu_vcpu : 0;
+  const memory = parseBytes(vm.resources.memory_bytes);
+  const disk = parseBytes(vm.resources.disk_bytes);
+  if (state === "absent") return { cpu: 0, memory: 0n, disk: 0n };
+  if (state === "cached") return { cpu: 0, memory: 0n, disk };
+  return { cpu, memory, disk };
+}
+
+function parseBytes(value: string | null): bigint {
+  if (value === null) return 0n;
+  try {
+    return BigInt(value);
+  } catch {
+    return 0n;
+  }
+}
+
+function adjustCapacityForVmTransition(state: ReturnType<typeof getMockState>, vm: ManagedVM, from: ManagedVM["state"], to: ManagedVM["state"]): void {
+  const previous = capacityContribution(vm, from);
+  const next = capacityContribution(vm, to);
+  const cpuDelta = previous.cpu - next.cpu;
+  if (state.overview.capacity.logical_cpu_remaining_vcpu.state === "available" && state.overview.capacity.logical_cpu_remaining_vcpu.value !== null) {
+    state.overview.capacity.logical_cpu_remaining_vcpu = { ...state.overview.capacity.logical_cpu_remaining_vcpu, value: Math.max(0, state.overview.capacity.logical_cpu_remaining_vcpu.value + cpuDelta), observed_at: state.overview.observed_at };
+  }
+  const memoryDelta = previous.memory - next.memory;
+  const diskDelta = previous.disk - next.disk;
+  state.overview.capacity.logical_memory_remaining = adjustObservedBytes(state.overview.capacity.logical_memory_remaining, -memoryDelta, state.overview.observed_at);
+  state.overview.capacity.ct_memory_available = adjustObservedBytes(state.overview.capacity.ct_memory_available, -memoryDelta, state.overview.observed_at);
+  state.overview.capacity.physical_disk_available = adjustObservedBytes(state.overview.capacity.physical_disk_available, -diskDelta, state.overview.observed_at);
 }
 
 function adjustCapacityForResize(state: ReturnType<typeof getMockState>, previous: VMResources, next: VMResources): void {

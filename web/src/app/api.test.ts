@@ -52,12 +52,38 @@ describe("mock image uploads", () => {
     const beforeActive = mockState.overview.task_counts.active;
     const beforeCached = mockState.overview.task_counts.cached;
     const vm = mockState.vms[0];
+    const image = mockState.images.find((candidate) => candidate.fingerprint === vm.image.fingerprint)!;
+    const beforeImageActive = image.references.active;
+    const beforeImageCached = image.references.cached;
+    const beforeCpu = mockState.overview.capacity.logical_cpu_remaining_vcpu.value!;
+    const beforeMemory = BigInt(mockState.overview.capacity.logical_memory_remaining.value_bytes!);
     const release = await submitVMAction(vm.task_id, "release", "Align aggregate state", { ...previewFor(vm.resource_version), impact: { summary_code: "effective_lease_affected", affected_session_count: 1, affected_image_references: mockState.images[0].references, changes: [] } }, vm.generation);
 
     expect(release.status).toBe("succeeded");
     expect(mockState.overview.task_counts.active).toBe(beforeActive - 1);
     expect(mockState.overview.task_counts.cached).toBe(beforeCached + 1);
     expect(vm.state).toBe("cached");
+    expect(image.references.active).toBe(Math.max(0, beforeImageActive - 1));
+    expect(image.references.cached).toBe(beforeImageCached + 1);
+    expect(mockState.overview.capacity.logical_cpu_remaining_vcpu.value).toBe(beforeCpu + vm.resources.cpu_vcpu!);
+    expect(mockState.overview.capacity.logical_memory_remaining.value_bytes).toBe((beforeMemory + BigInt(vm.resources.memory_bytes!)).toString());
+
+    const destroy = await submitVMAction(vm.task_id, "destroy", "Remove the cached demo VM", previewFor(vm.resource_version), vm.generation, {}, "synthetic-destroy-operation");
+    expect(destroy.status).toBe("succeeded");
+    expect(vm.state).toBe("absent");
+    expect(image.references.cached).toBe(beforeImageCached);
+    expect(mockState.overview.capacity.physical_disk_available.value_bytes).toBeNull();
+
+    const activeVm = mockState.vms[1];
+    const activeImage = mockState.images.find((candidate) => candidate.fingerprint === activeVm.image.fingerprint)!;
+    const activeCpu = mockState.overview.capacity.logical_cpu_remaining_vcpu.value!;
+    const activeMemory = BigInt(mockState.overview.capacity.logical_memory_remaining.value_bytes!);
+    const activeImageRefs = activeImage.references.active;
+    await submitVMAction(activeVm.task_id, "destroy", "Remove the active demo VM", previewFor(activeVm.resource_version), activeVm.generation, {}, "synthetic-destroy-active-operation");
+    expect(activeVm.state).toBe("absent");
+    expect(activeImage.references.active).toBe(Math.max(0, activeImageRefs - 1));
+    expect(mockState.overview.capacity.logical_cpu_remaining_vcpu.value).toBe(activeCpu + activeVm.resources.cpu_vcpu!);
+    expect(mockState.overview.capacity.logical_memory_remaining.value_bytes).toBe((activeMemory + BigInt(activeVm.resources.memory_bytes!)).toString());
   });
 
   it("keeps default image references and selection version aligned", async () => {
@@ -73,6 +99,23 @@ describe("mock image uploads", () => {
     expect(previousDefault.references.default).toBe(0);
     expect(mockState.image_selection_version).not.toBe(beforeVersion);
     expect(operation.result?.default_fingerprint).toBe(nextDefault.fingerprint);
+  });
+
+  it("applies image lifecycle effects and blocks retired default selection", async () => {
+    const retired = mockState.images.find((image) => image.state === "retired")!;
+    await expect(submitImageAction(retired.fingerprint, "default", "Do not select a retired image", previewFor(retired.resource_version), "synthetic-retired-default")).rejects.toMatchObject({ code: "image_not_applicable" });
+
+    const candidate = mockState.images.find((image) => !image.is_default && image.state === "available")!;
+    const beforeCatalogVersion = mockState.image_catalog_version;
+    const retire = await submitImageAction(candidate.fingerprint, "retire", "Retire the demo image", previewFor(candidate.resource_version), "synthetic-image-retire");
+    expect(retire.status).toBe("succeeded");
+    expect(candidate.state).toBe("retired");
+    expect(mockState.image_catalog_version).not.toBe(beforeCatalogVersion);
+
+    const deleted = await submitImageAction(retired.fingerprint, "delete", "Delete the retired demo image", previewFor(retired.resource_version), "synthetic-image-delete");
+    expect(deleted.status).toBe("succeeded");
+    expect(mockState.images.some((image) => image.fingerprint === retired.fingerprint)).toBe(false);
+    expect(deleted.result?.image_fingerprint).toBe(retired.fingerprint);
   });
 
   it("updates available capacity when a VM is resized", async () => {
