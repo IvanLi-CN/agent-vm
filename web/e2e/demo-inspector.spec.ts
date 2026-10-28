@@ -60,7 +60,11 @@ test("covers route pages, denied reads, keyboard controls and clipboard failure"
 
   await page.goto("?demo=normal&d_persona=viewer");
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
-  await expect(page.getByText("The request did not complete").first()).toBeVisible();
+  await expect(page.getByTestId("overview-page")).toBeVisible();
+  await page.getByRole("button", { name: "VMs" }).click();
+  await expect(page.getByTestId("vms-page")).toBeVisible();
+  await page.getByRole("button", { name: "Release lease" }).click();
+  await expect(page.getByText("The simulated identity is not allowed to perform this action.")).toBeVisible();
 
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async () => { throw new Error("permission denied"); } } });
@@ -68,4 +72,13 @@ test("covers route pages, denied reads, keyboard controls and clipboard failure"
   await page.goto("?demo=normal");
   await page.getByRole("button", { name: "Copy share link" }).click();
   await expect(page.getByText("Copy failed")).toBeVisible();
+});
+
+test("refreshes a conflict deep link with an inspectable unknown outcome", async ({ page }) => {
+  await page.goto("/demo/operations?demo=conflict&d_persona=admin");
+  await expect(page.getByTestId("operations-page")).toBeVisible();
+  await expect(page.getByText("Outcome unknown").nth(1)).toBeVisible();
+  await page.reload();
+  await expect(page.getByTestId("operations-page")).toBeVisible();
+  await expect(page.getByText("Outcome unknown").nth(1)).toBeVisible();
 });

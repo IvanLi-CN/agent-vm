@@ -34,6 +34,7 @@ describe("mock image uploads", () => {
     const retry = await submitVMAction("task_example_01", "restart", "retry-safe action", preview, "42", {}, operationId);
 
     expect(retry).toBe(first);
+    await expect(submitVMAction("task_example_01", "restart", "retry-safe action", { ...preview, target_version: "vm:task_example_01:revision-10" }, "42", {}, operationId)).rejects.toMatchObject({ code: "operation_conflict" });
     await expect(submitVMAction("task_aurora_02", "restart", "different target", preview, "18", {}, operationId)).rejects.toBeInstanceOf(ManagementRequestError);
     expect(mockState.operations.filter((item) => item.operation_id === operationId)).toHaveLength(1);
   });

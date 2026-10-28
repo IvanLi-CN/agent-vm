@@ -28,7 +28,15 @@ let csrfExpiresAt = 0;
 let sessionPromise: Promise<string> | null = null;
 
 export function createOperationId(): string {
-  return typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `synthetic-${Date.now()}`;
+  const cryptoApi = typeof globalThis !== "undefined" ? globalThis.crypto : undefined;
+  if (cryptoApi && typeof cryptoApi.randomUUID === "function") return cryptoApi.randomUUID();
+  const bytes = new Uint8Array(16);
+  if (cryptoApi && typeof cryptoApi.getRandomValues === "function") cryptoApi.getRandomValues(bytes);
+  else for (let index = 0; index < bytes.length; index += 1) bytes[index] = Math.floor(Math.random() * 256);
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 async function requestJSON<T>(path: string, init: RequestInit | undefined, options: RealRequestOptions = {}): Promise<T> {
@@ -90,7 +98,7 @@ function delay<T>(value: T): Promise<T> {
 function mockStateForRequest(): typeof mockState {
   if (isDemoRuntime()) {
     const mutationError = demoMutationError();
-    if (mutationError) throw new ManagementRequestError(mutationError);
+    if (mutationError === "network_unavailable") throw new ManagementRequestError(mutationError);
   }
   return getMockState();
 }
@@ -163,13 +171,13 @@ export async function previewVMAction(taskId: string, action: string, current?: 
 export async function submitVMAction(taskId: string, action: string, reason: string, preview: ActionPreview, expectedGeneration: string, parameters: Record<string, unknown> = {}, operationId = createOperationId()): Promise<Operation> {
   if (useRealApi) return realRequest(`/vms/${encodeURIComponent(taskId)}/actions`, { method: "POST", body: JSON.stringify({ operation_id: operationId, reason, target_version: preview.target_version, action, expected_generation: expectedGeneration, parameters, confirmation_token: preview.confirmation_token }) });
   assertMockMutationAllowed();
-  return createMockOperation(action as Operation["action"], { kind: "vm", id: taskId }, reason, undefined, operationId);
+    return createMockOperation(action as Operation["action"], { kind: "vm", id: taskId }, reason, undefined, operationId, { action, taskId, reason, expectedGeneration, targetVersion: preview.target_version, confirmationToken: preview.confirmation_token, parameters });
 }
 
 export async function startImageImport(request: ImageImportRequest): Promise<Operation> {
   if (useRealApi) return realRequest("/images/imports", { method: "POST", body: JSON.stringify(request) });
   assertMockMutationAllowed();
-  return createMockOperation("image_import", { kind: "image_catalog", id: "image-catalog" }, request.reason, request.source.kind === "local_upload" ? "awaiting_upload" : "running", request.operation_id);
+  return createMockOperation("image_import", { kind: "image_catalog", id: "image-catalog" }, request.reason, request.source.kind === "local_upload" ? "awaiting_upload" : "running", request.operation_id, request);
 }
 
 export async function uploadImageImportContent(operationId: string, content: File | { metadata: File; rootfs: File }): Promise<Operation> {
@@ -210,7 +218,7 @@ export async function submitImageAction(fingerprint: string, action: "default" |
     return realRequest(path, { method: "POST", body: JSON.stringify(body) });
   }
   assertMockMutationAllowed();
-  return createMockOperation(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", { kind: "image", id: fingerprint }, reason, undefined, operationId);
+  return createMockOperation(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", { kind: "image", id: fingerprint }, reason, undefined, operationId, { action, fingerprint, reason, targetVersion: preview.target_version, confirmationToken: preview.confirmation_token });
 }
 
 export async function previewMaintenance(action: "drain_enter" | "reconcile" | "gc", currentResourceVersion?: string): Promise<ActionPreview> {
@@ -227,16 +235,22 @@ export async function previewMaintenance(action: "drain_enter" | "reconcile" | "
 export async function submitMaintenance(action: "drain_enter" | "reconcile" | "gc", reason: string, preview: ActionPreview, operationId = createOperationId()): Promise<Operation> {
   if (useRealApi) return realRequest("/system/maintenance", { method: "POST", body: JSON.stringify({ operation_id: operationId, reason, target_version: preview.target_version, action, confirmation_token: preview.confirmation_token, parameters: { apply: true } }) });
   assertMockMutationAllowed();
-  return createMockOperation(action, { kind: "system", id: "system" }, reason, undefined, operationId);
+  return createMockOperation(action, { kind: "system", id: "system" }, reason, undefined, operationId, { action, reason, targetVersion: preview.target_version, confirmationToken: preview.confirmation_token });
 }
 
-function createMockOperation(action: Operation["action"], target: Operation["target"], reason: string, status?: Operation["status"], operationId = createOperationId()): Operation {
+const mockOperationFingerprints = new WeakMap<object, Map<string, string>>();
+
+function createMockOperation(action: Operation["action"], target: Operation["target"], reason: string, status?: Operation["status"], operationId = createOperationId(), requestPayload: unknown = { action, target, reason, status }): Operation {
   const state = getMockState();
+  const fingerprint = JSON.stringify(requestPayload);
+  const fingerprints = mockOperationFingerprints.get(state) ?? new Map<string, string>();
+  mockOperationFingerprints.set(state, fingerprints);
   const existing = state.operations.find((candidate) => candidate.operation_id === operationId);
   if (existing) {
-    if (existing.action !== action || existing.target.kind !== target.kind || existing.target.id !== target.id || existing.reason !== reason) throw new ManagementRequestError("operation_conflict", "queued", operationId);
+    if (fingerprints.get(operationId) !== fingerprint || existing.action !== action || existing.target.kind !== target.kind || existing.target.id !== target.id || existing.reason !== reason) throw new ManagementRequestError("operation_conflict", "queued", operationId);
     return existing;
   }
+  fingerprints.set(operationId, fingerprint);
   const outcome = isDemoRuntime() ? demoForcedOutcome() : "succeeded";
   const finalStatus = status === "running" || status === "awaiting_upload" ? status : status === "queued" && !isDemoRuntime() ? status : outcome;
   const operation: Operation = { operation_id: operationId, action, status: finalStatus, phase: finalStatus === "awaiting_upload" ? "awaiting_upload" : finalStatus === "running" ? "suitability_check" : finalStatus === "succeeded" ? "completed" : finalStatus === "failed" ? "reference_check" : "native_action", target, actor: "admin@example.invalid", reason, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), result: finalStatus === "succeeded" ? { effect: "simulated_effect", affected_session_count: target.kind === "vm" ? 1 : 0 } : null, error: finalStatus === "failed" ? { code: "stale_target", phase: "precondition", retryable: false } : finalStatus === "outcome_unknown" ? { code: "authority_unavailable", phase: "native_action", retryable: true } : null };
