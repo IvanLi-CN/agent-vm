@@ -32,12 +32,25 @@ type staticCPUObserver struct {
 
 type capacityGuest struct {
 	*startupGuest
-	capacity    native.StorageCapacity
-	capacityErr error
-	probeErr    error
+	capacity        native.StorageCapacity
+	capacityErr     error
+	probeErr        error
+	capacityEntered chan struct{}
+	capacityRelease <-chan struct{}
+	capacityMu      sync.Mutex
+	capacityCalls   int
 }
 
 func (guest *capacityGuest) StoragePoolCapacity(context.Context) (native.StorageCapacity, error) {
+	guest.capacityMu.Lock()
+	guest.capacityCalls++
+	guest.capacityMu.Unlock()
+	if guest.capacityEntered != nil {
+		guest.capacityEntered <- struct{}{}
+	}
+	if guest.capacityRelease != nil {
+		<-guest.capacityRelease
+	}
 	return guest.capacity, guest.capacityErr
 }
 
@@ -414,7 +427,7 @@ func TestAdmissionRejectsLowPhysicalStorageWithoutTouchingEffectiveLease(t *test
 		t.Fatalf("low storage error = %#v", err)
 	}
 	stored, err := store.GetTask(ctx, map[string]any{"task_id": active.TaskID})
-	if err != nil || stored == nil || stored.State != stateActive || stored.LeaseExpiresAt == nil {
+	if err != nil || stored == nil || stored.State != stateActive || stored.LeaseExpiresAt == nil || *stored.LeaseExpiresAt != lease {
 		t.Fatalf("effective lease changed after rejection: task=%#v err=%v", stored, err)
 	}
 }
@@ -449,6 +462,7 @@ func TestAdmissionRejectsMalformedLogicalResources(t *testing.T) {
 		reservations string
 	}{
 		{name: "incomplete resources", resources: `{"cpu":2,"memory_mib":4096}`, reservations: `{}`},
+		{name: "reservation does not mask incomplete resources", resources: `{"cpu":2,"memory_mib":4096}`, reservations: `{"cpu":4,"memory_mib":8192,"disk_gib":20}`},
 		{name: "negative reservation", resources: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, reservations: `{"cpu":-1,"memory_mib":4096,"disk_gib":20}`},
 		{name: "resource sum overflow", resources: `{"cpu":9223372036854775807,"memory_mib":4096,"disk_gib":20}`, reservations: `{}`},
 	}
@@ -472,21 +486,102 @@ func TestAdmissionRejectsMalformedLogicalResources(t *testing.T) {
 	}
 }
 
-func TestAdminMetricsRejectsMalformedLogicalResources(t *testing.T) {
+func TestAdmissionCountsOriginalResourcesWhenResizeReservationIsPending(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	task := state.Task{TaskID: "malformed-metrics-task", SessionID: "malformed-metrics-session", State: stateActive, InstanceName: "malformed-metrics-instance", ResourcesJSON: `{"cpu":2,"memory_mib":4096}`, ResourceReservationJSON: `{}`}
-	if err := store.InsertTask(context.Background(), task); err != nil {
+	cfg := config.Defaults()
+	cfg.CPUBudget = 5
+	cfg.CPUOvercommitRatio = json.Number("1")
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "pending-resize-task", SessionID: "pending-resize-session", State: stateActive,
+		InstanceName: "pending-resize-instance", ResourcesJSON: `{"cpu":4,"memory_mib":4096,"disk_gib":20}`,
+		ResourceReservationJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	service := New(store, config.Defaults(), Options{})
+	service := New(store, cfg, Options{})
+	err = service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_insufficient" {
+		t.Fatalf("pending resize admission error = %#v", err)
+	}
+}
+
+func TestAdminMetricsRejectsMalformedLogicalResources(t *testing.T) {
+	cases := []struct {
+		name         string
+		resources    string
+		reservations string
+	}{
+		{name: "incomplete resources", resources: `{"cpu":2,"memory_mib":4096}`, reservations: `{}`},
+		{name: "negative reservation", resources: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, reservations: `{"cpu":-1,"memory_mib":4096,"disk_gib":20}`},
+		{name: "incomplete reservation", resources: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, reservations: `{"cpu":4,"memory_mib":8192}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			task := state.Task{TaskID: "malformed-metrics-task", SessionID: "malformed-metrics-session", State: stateActive, InstanceName: "malformed-metrics-instance", ResourcesJSON: tc.resources, ResourceReservationJSON: tc.reservations}
+			if err := store.InsertTask(context.Background(), task); err != nil {
+				t.Fatal(err)
+			}
+			service := New(store, config.Defaults(), Options{})
+			service.MarkReady()
+			_, err = service.adminMetrics(context.Background())
+			if control := protocol.AsError(err); control == nil || control.Code != "resource_unverified" {
+				t.Fatalf("malformed metrics error = %#v", err)
+			}
+		})
+	}
+}
+
+func TestAdminMetricsRejectsDefaultProjectionOverflow(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.CPUBudget = maxInt64Value
+	cfg.CPUOvercommitRatio = json.Number("1")
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "projection-overflow-task", SessionID: "projection-overflow-session", State: stateActive,
+		InstanceName: "projection-overflow-instance", ResourcesJSON: `{"cpu":9223372036854775807,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, cfg, Options{})
 	service.MarkReady()
-	_, err = service.adminMetrics(context.Background())
-	if control := protocol.AsError(err); control == nil || control.Code != "resource_unverified" {
-		t.Fatalf("malformed metrics error = %#v", err)
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := metrics["default_admission"].(map[string]any)
+	if admission["ready"] != false {
+		t.Fatalf("overflow default admission = %#v", admission)
+	}
+	reasons := admission["reasons"].([]any)
+	found := false
+	for _, raw := range reasons {
+		if reason, ok := raw.(map[string]any); ok && reason["code"] == "resource_unverified" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("overflow default admission reasons = %#v", reasons)
+	}
+}
+
+func TestStartupPressureDetailRejectsProjectionOverflow(t *testing.T) {
+	service := New(nil, config.Defaults(), Options{})
+	detail := service.startupPressureDetail(observe.CPUObservation{Capacity: 8}, maxInt64Value, 2)
+	if detail["verified"] != false || detail["projected_cpu"] != nil || detail["startup_blocked"] != false {
+		t.Fatalf("overflow startup pressure detail = %#v", detail)
 	}
 }
 
@@ -526,23 +621,38 @@ func TestConcurrentPhysicalReservationsSerialize(t *testing.T) {
 
 	cfg := config.Defaults()
 	cfg.StateDB = store.Path()
-	guest := &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024}}
+	capacityEntered := make(chan struct{}, 2)
+	capacityRelease := make(chan struct{})
+	guest := &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024}, capacityEntered: capacityEntered, capacityRelease: capacityRelease}
 	service := New(store, cfg, Options{Guest: guest, Resident: true})
 	service.MarkReady()
-	start := make(chan struct{})
 	type reservationResult struct {
 		release func()
 		err     error
 	}
 	results := make(chan reservationResult, 2)
-	for range 2 {
-		go func() {
-			<-start
-			release, reserveErr := service.ReservePhysicalStorage(context.Background(), 75*1024*1024*1024)
-			results <- reservationResult{release: release, err: reserveErr}
-		}()
+	go func() {
+		release, reserveErr := service.ReservePhysicalStorage(context.Background(), 75*1024*1024*1024)
+		results <- reservationResult{release: release, err: reserveErr}
+	}()
+	select {
+	case <-capacityEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first reservation did not reach capacity probe")
 	}
-	close(start)
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		release, reserveErr := service.ReservePhysicalStorage(context.Background(), 75*1024*1024*1024)
+		results <- reservationResult{release: release, err: reserveErr}
+	}()
+	<-secondStarted
+	select {
+	case <-capacityEntered:
+		t.Fatal("second reservation entered the capacity probe before the first released the admission lock")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(capacityRelease)
 	first, second := <-results, <-results
 	successes := 0
 	for _, result := range []reservationResult{first, second} {

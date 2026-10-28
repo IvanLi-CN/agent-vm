@@ -2629,15 +2629,25 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			defaultRequested := map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}
 			logicalExceeded := []string{}
+			logicalUnverified := []string{}
 			for _, key := range resourceKeys {
 				limit, hasLimit := limits[key]
 				if !hasLimit {
 					continue
 				}
 				limitValue, ok := limit.(int64)
-				if ok && allocatedAndReserved[key]+defaultRequested[key] > limitValue {
+				if !ok {
+					continue
+				}
+				projected, sumOK := addInt64(allocatedAndReserved[key], defaultRequested[key])
+				if !sumOK {
+					logicalUnverified = append(logicalUnverified, key)
+				} else if projected > limitValue {
 					logicalExceeded = append(logicalExceeded, key)
 				}
+			}
+			if len(logicalUnverified) > 0 {
+				defaultReasons = append(defaultReasons, map[string]any{"code": "resource_unverified", "message": "default admission resource projection exceeds supported range", "detail": map[string]any{"dimensions": logicalUnverified, "verified": false}})
 			}
 			if len(logicalExceeded) > 0 {
 				defaultReasons = append(defaultReasons, map[string]any{"code": "resource_insufficient", "dimensions": logicalExceeded, "requested": defaultRequested, "remaining": remaining})
@@ -2653,7 +2663,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				ctCPU["capacity_vcpu"] = cpuObservation.Capacity
 				ctCPU["pressure"] = pressure
 				ctCPU["startup_pressure"] = startupPressure
-				if startupPressure["startup_blocked"] == true {
+				if startupPressure["verified"] != true {
+					defaultReasons = append(defaultReasons, map[string]any{"code": "resource_unverified", "message": "CPU startup resource projection is not verified", "detail": startupPressure})
+				} else if startupPressure["startup_blocked"] == true {
 					defaultReasons = append(defaultReasons, map[string]any{"code": "resource_pressure", "message": "CPU scheduler pressure blocks VM startup", "detail": startupPressure})
 				}
 			} else {
@@ -3895,8 +3907,11 @@ func (s *Service) admissionStorageCost(ctx context.Context, excludeTaskID string
 			return 0, s.sqliteError(err)
 		}
 		if current != nil {
-			resources := map[string]int64{}
-			if json.Unmarshal([]byte(current.ResourcesJSON), &resources) == nil && requested["disk_gib"] > resources["disk_gib"] {
+			resources, resourceErr := decodeResourceMap(current.ResourcesJSON, "current task resources", false)
+			if resourceErr != nil {
+				return 0, protocol.NewError("resource_unverified", "current task resources cannot be verified", map[string]any{"task_id": current.TaskID, "verified": false})
+			}
+			if requested["disk_gib"] > resources["disk_gib"] {
 				return s.Config.ResizeCostBytes, nil
 			}
 		}
@@ -3911,8 +3926,8 @@ func (s *Service) admissionStorageCost(ctx context.Context, excludeTaskID string
 	}
 	if task != nil && task.State == stateCached {
 		cost := s.Config.ResumeCostBytes
-		resources := map[string]int64{}
-		if err := json.Unmarshal([]byte(task.ResourcesJSON), &resources); err != nil {
+		resources, resourceErr := decodeResourceMap(task.ResourcesJSON, "cached task resources", false)
+		if resourceErr != nil {
 			return 0, protocol.NewError("resource_unverified", "cached task resources are malformed", map[string]any{"verified": false})
 		}
 		if requested["disk_gib"] > resources["disk_gib"] {
@@ -3944,19 +3959,20 @@ func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64
 			return protocol.NewError("resource_unverified", "task state cannot be verified", map[string]any{"task_id": task.TaskID, "state": task.State, "verified": false})
 		}
 		instances++
-		rawResources := task.ResourcesJSON
-		if strings.TrimSpace(task.ResourceReservationJSON) != "" && strings.TrimSpace(task.ResourceReservationJSON) != "{}" {
-			rawResources = task.ResourceReservationJSON
-		}
-		resources, resourceErr := decodeResourceMap(rawResources, "task admission resources", false)
+		resources, resourceErr := decodeResourceMap(task.ResourcesJSON, "task admission resources", false)
 		if resourceErr != nil {
 			return protocol.NewError("resource_unverified", "durable task resources cannot be verified", map[string]any{"task_id": task.TaskID, "verified": false})
 		}
+		reservation, reservationErr := decodeResourceMap(task.ResourceReservationJSON, "task admission reservation", true)
+		if reservationErr != nil {
+			return protocol.NewError("resource_unverified", "durable task reservation cannot be verified", map[string]any{"task_id": task.TaskID, "verified": false})
+		}
 		for _, key := range resourceKeys {
-			if used[key] > maxInt64Value-resources[key] {
+			accounted := maxInt64(resources[key], reservation[key])
+			if used[key] > maxInt64Value-accounted {
 				return protocol.NewError("resource_unverified", "durable task resources exceed supported range", map[string]any{"task_id": task.TaskID, "resource": key, "verified": false})
 			}
-			used[key] += resources[key]
+			used[key] += accounted
 		}
 	}
 	if s.Config.InstanceLimit > 0 && instances >= s.Config.InstanceLimit {
@@ -4013,6 +4029,9 @@ func (s *Service) checkStartupPressure(ctx context.Context, allocatedCPU, reques
 		return protocol.NewError("resource_unverified", "CT CPU pressure observation is not verified", map[string]any{"verified": false, "cause": err.Error()})
 	}
 	detail := s.startupPressureDetail(observation, allocatedCPU, requestedCPU)
+	if detail["verified"] != true {
+		return protocol.NewError("resource_unverified", "CPU startup resource projection is not verified", detail)
+	}
 	if detail["startup_blocked"] == true {
 		return protocol.NewError("resource_pressure", "CPU scheduler pressure blocks VM startup", detail)
 	}
@@ -4020,20 +4039,27 @@ func (s *Service) checkStartupPressure(ctx context.Context, allocatedCPU, reques
 }
 
 func (s *Service) startupPressureDetail(observation observe.CPUObservation, allocatedCPU, requestedCPU int64) map[string]any {
-	projectedCPU := allocatedCPU + requestedCPU
-	return map[string]any{
-		"verified":                     true,
+	projectedCPU, projectedOK := addInt64(allocatedCPU, requestedCPU)
+	detail := map[string]any{
+		"verified":                     projectedOK,
 		"threshold_full_avg10_percent": s.Config.CPUStartupPressureFullAvg10Percent,
 		"allocated_cpu":                allocatedCPU,
 		"requested_cpu":                requestedCPU,
-		"projected_cpu":                projectedCPU,
 		"ct_capacity_cpu":              observation.Capacity,
-		"physically_oversubscribed":    projectedCPU > observation.Capacity,
 		"full_avg10_percent":           observation.Full.Avg10,
 		"some_avg10_percent":           observation.Some.Avg10,
 		"cpu_pressure":                 observation.Map(),
-		"startup_blocked":              projectedCPU > observation.Capacity && observation.Full.Avg10 >= s.Config.CPUStartupPressureFullAvg10Percent,
 	}
+	if !projectedOK {
+		detail["projected_cpu"] = nil
+		detail["physically_oversubscribed"] = nil
+		detail["startup_blocked"] = false
+		return detail
+	}
+	detail["projected_cpu"] = projectedCPU
+	detail["physically_oversubscribed"] = projectedCPU > observation.Capacity
+	detail["startup_blocked"] = projectedCPU > observation.Capacity && observation.Full.Avg10 >= s.Config.CPUStartupPressureFullAvg10Percent
+	return detail
 }
 
 func decodeResourceMap(raw, label string, allowEmpty bool) (map[string]int64, error) {
