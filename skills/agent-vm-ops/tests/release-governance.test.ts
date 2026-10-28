@@ -91,7 +91,7 @@ test("GitHub state refs are append-only and preserve the original identity", asy
   let sequence = 0;
   const fake = {
     repository: "IvanLi-CN/agent-vm",
-    async json(args: readonly string[]): Promise<any> {
+    async json(args: readonly string[], input?: string): Promise<any> {
       const refEndpoint = args.find((item) => item.includes("/git/ref/tags/"));
       if (refEndpoint && !args.includes("--method")) {
         const ref = refEndpoint.split("/git/ref/tags/")[1];
@@ -102,7 +102,15 @@ test("GitHub state refs are append-only and preserve the original identity", asy
       const commitRead = args.find((item) => /\/git\/commits\/[0-9a-z-]+$/.test(item));
       if (commitRead && !args.includes("--method")) return { message: commits.get(commitRead.split("/git/commits/")[1]) };
       if (args.some((item) => item.endsWith("/git/blobs"))) return { sha: `blob-${++sequence}` };
-      if (args.some((item) => item.endsWith("/git/trees"))) return { sha: `tree-${++sequence}` };
+      if (args.some((item) => item.endsWith("/git/trees"))) {
+        if (!args.includes("--input") || input === undefined) throw new Error("tree JSON request body is missing");
+        const body = JSON.parse(input) as { tree?: Array<Record<string, string>> };
+        const entries = body.tree ?? [];
+        if (entries.length !== 1 || entries[0]?.path !== "record.json" || entries[0]?.mode !== "100644" || entries[0]?.type !== "blob" || !entries[0]?.sha) {
+          throw new Error("tree payload is not a valid GitHub tree entry");
+        }
+        return { sha: `tree-${++sequence}` };
+      }
       if (args.some((item) => item.endsWith("/git/commits"))) {
         const sha = `commit-${++sequence}`;
         commits.set(sha, args.find((item) => item.startsWith("message="))!.slice("message=".length));
