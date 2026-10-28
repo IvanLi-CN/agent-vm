@@ -2450,20 +2450,37 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			if task.State != stateActive && task.State != statePreparing && task.State != stateCached && task.State != stateClosing && task.State != stateDeleting && task.State != stateFailed && task.State != stateAbsent {
 				unknownTaskStates = append(unknownTaskStates, task.State)
+				continue
 			}
-			resources := map[string]int64{}
-			_ = json.Unmarshal([]byte(task.ResourcesJSON), &resources)
+			if task.State == stateCached || task.State == stateAbsent {
+				continue
+			}
+			resources, resourceErr := decodeResourceMap(task.ResourcesJSON, "task resources", false)
+			if resourceErr != nil {
+				return nil, protocol.NewError("resource_unverified", "durable task resources are malformed", map[string]any{"task_id": task.TaskID, "verified": false})
+			}
 			if task.State == stateActive {
 				for _, key := range resourceKeys {
-					allocated[key] += resources[key]
+					var sumOK bool
+					allocated[key], sumOK = addInt64(allocated[key], resources[key])
+					if !sumOK {
+						return nil, protocol.NewError("resource_unverified", "durable allocated resources exceed supported range", map[string]any{"task_id": task.TaskID, "resource": key, "verified": false})
+					}
 				}
 			}
-			reservation := map[string]int64{}
-			_ = json.Unmarshal([]byte(task.ResourceReservationJSON), &reservation)
+			reservation, reservationErr := decodeResourceMap(task.ResourceReservationJSON, "task reservation", true)
+			if reservationErr != nil {
+				return nil, protocol.NewError("resource_unverified", "durable task reservation is malformed", map[string]any{"task_id": task.TaskID, "verified": false})
+			}
 			for _, key := range resourceKeys {
-				reserved[key] += reservation[key]
-				if task.State != stateCached && task.State != stateAbsent {
-					allocatedAndReserved[key] += maxInt64(resources[key], reservation[key])
+				var sumOK bool
+				reserved[key], sumOK = addInt64(reserved[key], reservation[key])
+				if !sumOK {
+					return nil, protocol.NewError("resource_unverified", "durable reserved resources exceed supported range", map[string]any{"task_id": task.TaskID, "resource": key, "verified": false})
+				}
+				allocatedAndReserved[key], sumOK = addInt64(allocatedAndReserved[key], maxInt64(resources[key], reservation[key]))
+				if !sumOK {
+					return nil, protocol.NewError("resource_unverified", "durable admission resources exceed supported range", map[string]any{"task_id": task.TaskID, "resource": key, "verified": false})
 				}
 			}
 		}
@@ -3927,13 +3944,18 @@ func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64
 			return protocol.NewError("resource_unverified", "task state cannot be verified", map[string]any{"task_id": task.TaskID, "state": task.State, "verified": false})
 		}
 		instances++
-		resources := map[string]int64{}
-		if task.ResourceReservationJSON != "" && task.ResourceReservationJSON != "{}" {
-			_ = json.Unmarshal([]byte(task.ResourceReservationJSON), &resources)
-		} else {
-			_ = json.Unmarshal([]byte(task.ResourcesJSON), &resources)
+		rawResources := task.ResourcesJSON
+		if strings.TrimSpace(task.ResourceReservationJSON) != "" && strings.TrimSpace(task.ResourceReservationJSON) != "{}" {
+			rawResources = task.ResourceReservationJSON
+		}
+		resources, resourceErr := decodeResourceMap(rawResources, "task admission resources", false)
+		if resourceErr != nil {
+			return protocol.NewError("resource_unverified", "durable task resources cannot be verified", map[string]any{"task_id": task.TaskID, "verified": false})
 		}
 		for _, key := range resourceKeys {
+			if used[key] > maxInt64Value-resources[key] {
+				return protocol.NewError("resource_unverified", "durable task resources exceed supported range", map[string]any{"task_id": task.TaskID, "resource": key, "verified": false})
+			}
 			used[key] += resources[key]
 		}
 	}
@@ -3950,6 +3972,9 @@ func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64
 	}
 	limits := map[string]int64{"cpu": cpuLimit, "memory_mib": memoryLimit, "disk_gib": s.Config.DiskBudgetGiB}
 	for _, key := range resourceKeys {
+		if used[key] > maxInt64Value-requested[key] {
+			return protocol.NewError("resource_unverified", "requested resources exceed supported range", map[string]any{"resource": key, "verified": false})
+		}
 		if limits[key] > 0 && used[key]+requested[key] > limits[key] {
 			return protocol.NewError("resource_insufficient", "requested resources exceed the configured admission budget", map[string]any{"resource": key, "used": used[key], "requested": requested[key], "limit": limits[key]})
 		}
@@ -4011,12 +4036,24 @@ func (s *Service) startupPressureDetail(observation observe.CPUObservation, allo
 	}
 }
 
-func addResourceMaps(left, right map[string]int64) map[string]int64 {
-	result := map[string]int64{}
-	for _, key := range resourceKeys {
-		result[key] = left[key] + right[key]
+func decodeResourceMap(raw, label string, allowEmpty bool) (map[string]int64, error) {
+	if allowEmpty && (strings.TrimSpace(raw) == "" || strings.TrimSpace(raw) == "{}") {
+		return map[string]int64{}, nil
 	}
-	return result
+	result := map[string]int64{}
+	if err := json.Unmarshal([]byte(raw), &result); err != nil || result == nil {
+		return nil, fmt.Errorf("%s is not a JSON object", label)
+	}
+	if len(result) != len(resourceKeys) {
+		return nil, fmt.Errorf("%s is incomplete", label)
+	}
+	for _, key := range resourceKeys {
+		value, ok := result[key]
+		if !ok || value < 0 {
+			return nil, fmt.Errorf("%s has an invalid %s value", label, key)
+		}
+	}
+	return result, nil
 }
 
 func sameResources(left, right map[string]int64) bool {

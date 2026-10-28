@@ -442,6 +442,54 @@ func TestAdmissionRejectsIncompleteDurableDiskReservation(t *testing.T) {
 	}
 }
 
+func TestAdmissionRejectsMalformedLogicalResources(t *testing.T) {
+	cases := []struct {
+		name         string
+		resources    string
+		reservations string
+	}{
+		{name: "incomplete resources", resources: `{"cpu":2,"memory_mib":4096}`, reservations: `{}`},
+		{name: "negative reservation", resources: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, reservations: `{"cpu":-1,"memory_mib":4096,"disk_gib":20}`},
+		{name: "resource sum overflow", resources: `{"cpu":9223372036854775807,"memory_mib":4096,"disk_gib":20}`, reservations: `{}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			task := state.Task{TaskID: "malformed-logical-task", SessionID: "malformed-logical-session", State: stateActive, InstanceName: "malformed-logical-instance", ResourcesJSON: tc.resources, ResourceReservationJSON: tc.reservations}
+			if err := store.InsertTask(context.Background(), task); err != nil {
+				t.Fatal(err)
+			}
+			service := New(store, config.Defaults(), Options{})
+			err = service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
+			if control := protocol.AsError(err); control == nil || control.Code != "resource_unverified" {
+				t.Fatalf("malformed logical resource error = %#v", err)
+			}
+		})
+	}
+}
+
+func TestAdminMetricsRejectsMalformedLogicalResources(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	task := state.Task{TaskID: "malformed-metrics-task", SessionID: "malformed-metrics-session", State: stateActive, InstanceName: "malformed-metrics-instance", ResourcesJSON: `{"cpu":2,"memory_mib":4096}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	service.MarkReady()
+	_, err = service.adminMetrics(context.Background())
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_unverified" {
+		t.Fatalf("malformed metrics error = %#v", err)
+	}
+}
+
 func TestExternalPhysicalReservationSharesLifecycleAdmission(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -466,6 +514,49 @@ func TestExternalPhysicalReservationSharesLifecycleAdmission(t *testing.T) {
 	err = service.checkAdmission(ctx, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
 	if control := protocol.AsError(err); control == nil || control.Code != "resource_insufficient" {
 		t.Fatalf("shared physical reservation error = %#v", err)
+	}
+}
+
+func TestConcurrentPhysicalReservationsSerialize(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	guest := &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024}}
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
+	service.MarkReady()
+	start := make(chan struct{})
+	type reservationResult struct {
+		release func()
+		err     error
+	}
+	results := make(chan reservationResult, 2)
+	for range 2 {
+		go func() {
+			<-start
+			release, reserveErr := service.ReservePhysicalStorage(context.Background(), 75*1024*1024*1024)
+			results <- reservationResult{release: release, err: reserveErr}
+		}()
+	}
+	close(start)
+	first, second := <-results, <-results
+	successes := 0
+	for _, result := range []reservationResult{first, second} {
+		if result.err == nil {
+			successes++
+			result.release()
+			continue
+		}
+		if control := protocol.AsError(result.err); control == nil || control.Code != "resource_insufficient" {
+			t.Fatalf("concurrent reservation error = %#v", result.err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent reservation successes = %d, want 1", successes)
 	}
 }
 
