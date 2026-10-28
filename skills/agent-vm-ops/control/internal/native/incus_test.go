@@ -2,7 +2,6 @@ package native
 
 import (
 	"context"
-	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -314,8 +313,9 @@ func TestImageVerificationScriptReportsMissingToolsAsUnsuitable(t *testing.T) {
 }
 
 func TestIsNotFoundRejectsUnrelatedOrUncertainFailures(t *testing.T) {
+	exitErr := exec.Command("false").Run()
 	for _, diagnostic := range []string{"project not found", "server returned 404", "transport error: route does not exist"} {
-		err := &CommandError{Result: Result{Stderr: []byte(diagnostic)}, Cause: errors.New("command failed")}
+		err := &CommandError{Result: Result{Code: 1, Stderr: []byte(diagnostic)}, Cause: exitErr}
 		if IsNotFound(err, "missing", "agents") {
 			t.Errorf("unrelated failure %q classified as missing instance", diagnostic)
 		}
@@ -323,6 +323,14 @@ func TestIsNotFoundRejectsUnrelatedOrUncertainFailures(t *testing.T) {
 	err := &CommandError{Result: Result{Stderr: []byte("instance not found")}, Cause: context.DeadlineExceeded}
 	if IsNotFound(err, "missing", "agents") {
 		t.Fatal("timed-out query classified as missing instance")
+	}
+	for _, result := range []Result{
+		{Code: 1, Stderr: []byte("instance not found"), StdoutTruncated: true},
+		{Code: 1, Stderr: []byte("instance not found"), StderrTruncated: true},
+	} {
+		if IsNotFound(&CommandError{Result: result, Cause: exitErr}, "missing", "agents") {
+			t.Fatal("truncated diagnostic classified as missing instance")
+		}
 	}
 }
 
