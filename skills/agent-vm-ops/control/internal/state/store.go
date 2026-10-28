@@ -1194,29 +1194,77 @@ func (s *Store) AuditSummary(ctx context.Context) (AuditSummary, error) {
 					detail = nil
 				}
 			}
-			code := auditCode(detail)
-			if code == "" {
-				code = "unknown"
-			}
-			phase := auditPhase(detail)
-			if phase == "" {
-				phase = "unknown"
-			}
-			result.Operations[action+"|"+outcome+"|"+phase]++
-			for _, warning := range auditWarnings(detail) {
-				result.Warnings[warning]++
-			}
-			if outcome == "error" && (code == "memory_pressure" || code == "resource_unverified" || code == "capacity_insufficient") {
-				result.Warnings[code]++
-			}
-			lower := strings.ToLower(raw.String)
-			if outcome == "error" && strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs")) {
-				result.ImageUnpackFailures[phase+"|"+code]++
-			}
+			addAuditSummary(&result, action, outcome, auditPhase(detail), detail, raw.String)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		var managementTable string
+		if err := conn.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'management_audit'").Scan(&managementTable); errors.Is(err, sql.ErrNoRows) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		managementRows, err := conn.QueryContext(ctx, "SELECT action, outcome, phase, detail_json FROM management_audit")
+		if err != nil {
+			return err
+		}
+		defer managementRows.Close()
+		for managementRows.Next() {
+			var action, outcome, phase string
+			var raw sql.NullString
+			if err := managementRows.Scan(&action, &outcome, &phase, &raw); err != nil {
+				return err
+			}
+			var detail any
+			if raw.Valid && raw.String != "" {
+				decoder := json.NewDecoder(strings.NewReader(raw.String))
+				decoder.UseNumber()
+				if err := decoder.Decode(&detail); err != nil {
+					detail = nil
+				}
+			}
+			addAuditSummary(&result, action, outcome, phase, detail, raw.String)
+		}
+		return managementRows.Err()
 	})
 	return result, err
+}
+
+func addAuditSummary(result *AuditSummary, action, outcome, phase string, detail any, raw string) {
+	code := auditCode(detail)
+	if code == "" {
+		code = "unknown"
+	}
+	phase = strings.TrimSpace(phase)
+	if phase == "" {
+		phase = "unknown"
+	}
+	outcome = normalizeAuditOutcome(outcome)
+	result.Operations[action+"|"+outcome+"|"+phase]++
+	for _, warning := range auditWarnings(detail) {
+		result.Warnings[warning]++
+	}
+	if outcome == "error" && (code == "memory_pressure" || code == "resource_unverified" || code == "capacity_insufficient") {
+		result.Warnings[code]++
+	}
+	lower := strings.ToLower(raw)
+	if outcome == "error" && (strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs") || action == "image_import") || action == "image_import" && (phase == "image_import" || phase == "reconciliation")) {
+		result.ImageUnpackFailures[phase+"|"+code]++
+	}
+}
+
+func normalizeAuditOutcome(outcome string) string {
+	switch outcome {
+	case "succeeded":
+		return "success"
+	case "failed":
+		return "error"
+	case "outcome_unknown":
+		return "unknown"
+	default:
+		return outcome
+	}
 }
 
 func auditCode(value any) string {

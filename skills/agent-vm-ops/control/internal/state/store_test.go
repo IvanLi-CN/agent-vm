@@ -113,14 +113,23 @@ func TestAuditSummaryAggregatesStableObservabilityLabels(t *testing.T) {
 	if err := store.Audit(ctx, "acquire", "task", "session", "success", intPointer(1), map[string]any{"phase": "dispatch"}); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.EnsureManagementSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordManagementAudit(ctx, ManagementAudit{
+		EventID: "management-image-unpack-failure", Action: "image_import", Outcome: "failed", Phase: "image_import",
+		Target: map[string]any{"kind": "image_catalog"}, Detail: map[string]any{"code": "internal_error", "message": "image rootfs unpack failed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	summary, err := store.AuditSummary(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Operations["acquire|error|native-unpack"] != 1 || summary.Operations["acquire|success|dispatch"] != 1 {
+	if summary.Operations["acquire|error|native-unpack"] != 1 || summary.Operations["acquire|success|dispatch"] != 1 || summary.Operations["image_import|error|image_import"] != 1 {
 		t.Fatalf("operation summary = %#v", summary.Operations)
 	}
-	if summary.ImageUnpackFailures["native-unpack|image_unpack_failed"] != 1 || summary.Warnings["capacity_insufficient"] != 1 {
+	if summary.ImageUnpackFailures["native-unpack|image_unpack_failed"] != 1 || summary.ImageUnpackFailures["image_import|internal_error"] != 1 || summary.Warnings["capacity_insufficient"] != 1 {
 		t.Fatalf("failure summary = %#v warnings=%#v", summary.ImageUnpackFailures, summary.Warnings)
 	}
 }

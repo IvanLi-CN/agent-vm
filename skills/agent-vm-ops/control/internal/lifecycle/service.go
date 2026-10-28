@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -185,6 +186,13 @@ func (s *Service) SetWake(wake func()) {
 func (s *Service) ReservePhysicalStorage(ctx context.Context, size int64) (func(), error) {
 	if size < 0 {
 		return nil, protocol.NewError("invalid_request", "physical storage reservation must not be negative", nil)
+	}
+	unlockDrain := s.lockNamedAction("drain")
+	defer unlockDrain()
+	if draining, err := s.isDraining(ctx); err != nil {
+		return nil, s.sqliteError(err)
+	} else if draining {
+		return nil, protocol.NewError("draining", "physical storage reservation is refused while draining", nil)
 	}
 	s.admissionMu.Lock()
 	defer s.admissionMu.Unlock()
@@ -2825,7 +2833,10 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			if cpuObservation != nil {
 				pressure := cpuObservation.Pressure()
-				startupPressure := s.startupPressureDetail(*cpuObservation, allocatedAndReserved["cpu"], 2)
+				startupPressure := map[string]any{"verified": false, "startup_blocked": nil, "reason": "task state cannot be verified"}
+				if len(unknownTaskStates) == 0 {
+					startupPressure = s.startupPressureDetail(*cpuObservation, allocatedAndReserved["cpu"], 2)
+				}
 				resourcesValue["ct_capacity"] = map[string]any{"cpu": cpuObservation.Capacity}
 				resourcesValue["cpu_pressure"] = pressure
 				ctCPU["capacity_vcpu"] = cpuObservation.Capacity
@@ -4128,6 +4139,23 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 	if err != nil {
 		return false, s.sqliteError(err)
 	}
+	sort.SliceStable(tasks, func(left, right int) bool {
+		leftSince, rightSince := "", ""
+		if tasks[left].InactiveSince != nil {
+			leftSince = *tasks[left].InactiveSince
+		}
+		if tasks[right].InactiveSince != nil {
+			rightSince = *tasks[right].InactiveSince
+		}
+		if leftSince == "" || rightSince == "" {
+			if leftSince != rightSince {
+				return leftSince != ""
+			}
+		} else if leftSince != rightSince {
+			return leftSince < rightSince
+		}
+		return tasks[left].TaskID < tasks[right].TaskID
+	})
 	for _, task := range tasks {
 		if task.TaskID == excludeTaskID || task.State != stateCached {
 			continue
@@ -4146,7 +4174,7 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 			unlockSession()
 			return false, s.sqliteError(currentErr)
 		}
-		if current == nil || current.TaskID != task.TaskID || current.Generation != task.Generation || current.State != stateCached {
+		if current == nil || current.TaskID != task.TaskID || current.Generation != task.Generation || current.State != stateCached || current.LeaseExpiresAt != nil || current.ReservationBytes != 0 || current.ResourceReservationJSON != "{}" {
 			unlockSession()
 			continue
 		}
@@ -4245,6 +4273,11 @@ func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64
 		}
 		if err := probe.Probe(ctx); err != nil {
 			return protocol.NewError("resource_unverified", "Incus native availability could not be verified", map[string]any{"verified": false, "cause": err.Error()})
+		}
+	}
+	if s.resident && s.Memory != nil {
+		if _, err := s.Memory.Observe(ctx); err != nil {
+			return protocol.NewError("resource_unverified", "CT memory observation is not verified", map[string]any{"verified": false, "cause": err.Error()})
 		}
 	}
 	tasks, err := s.Store.ListTasks(ctx)

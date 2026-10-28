@@ -867,6 +867,27 @@ func TestExternalPhysicalReservationPreservesManagementFreeSpaceFloor(t *testing
 	}
 }
 
+func TestExternalPhysicalReservationRefusesAdmissionDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.SetMeta(context.Background(), "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100, FreeBytes: 90}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	_, err = service.ReservePhysicalStorage(context.Background(), 1)
+	control := protocol.AsError(err)
+	if control == nil || control.Code != "draining" {
+		t.Fatalf("draining reservation error = %#v", err)
+	}
+	if guest.capacityCalls != 0 {
+		t.Fatalf("draining reservation probed capacity %d times", guest.capacityCalls)
+	}
+}
+
 func TestCachedResumeWithDiskGrowthChargesBothPhysicalCosts(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -960,6 +981,54 @@ func TestReclaimCachedCapacitySkipsIneligibleGuest(t *testing.T) {
 	}
 	if reclaimed || guest.deleteCalls != 0 {
 		t.Fatalf("ineligible cache reclaimed=%v delete_calls=%d", reclaimed, guest.deleteCalls)
+	}
+}
+
+func TestReclaimCachedCapacityUsesOldestCacheFirst(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	oldest := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	newer := oldest.Add(time.Hour)
+	for _, task := range []state.Task{
+		{TaskID: "z-old-cache", SessionID: "z-old-session", Generation: 1, State: stateCached, InstanceName: "agent-z-old-cache", CreatedAt: nowString(oldest), UpdatedAt: nowString(oldest), InactiveSince: stringPointer(nowString(oldest)), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`},
+		{TaskID: "a-new-cache", SessionID: "a-new-session", Generation: 1, State: stateCached, InstanceName: "agent-a-new-cache", CreatedAt: nowString(newer), UpdatedAt: nowString(newer), InactiveSince: stringPointer(nowString(newer)), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`},
+	} {
+		if err := store.InsertTask(context.Background(), task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	guest := &capacityGuest{startupGuest: &startupGuest{
+		status: "Stopped",
+		config: map[string]any{
+			"config": map[string]any{
+				"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "z-old-cache",
+				"user.agent-vm.session": "z-old-session", "user.agent-vm.generation": "1",
+			},
+			"devices": map[string]any{}, "expanded_devices": map[string]any{},
+		},
+	}, capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 10 * gib}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	guest.capacityFunc = func() native.StorageCapacity {
+		if guest.deleteCalls > 0 {
+			return native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 60 * gib}
+		}
+		return guest.capacity
+	}
+	service.admissionMu.Lock()
+	reclaimed, reclaimErr := service.reclaimCachedCapacity(context.Background(), 1, "", 0)
+	service.admissionMu.Unlock()
+	if reclaimErr != nil || !reclaimed {
+		t.Fatalf("oldest cache reclaim = %v, err=%v", reclaimed, reclaimErr)
+	}
+	if task, err := store.GetTask(context.Background(), map[string]any{"task_id": "z-old-cache"}); err != nil || task != nil {
+		t.Fatalf("oldest cache task = %#v err=%v", task, err)
+	}
+	if task, err := store.GetTask(context.Background(), map[string]any{"task_id": "a-new-cache"}); err != nil || task == nil {
+		t.Fatalf("newer cache task = %#v err=%v", task, err)
 	}
 }
 
@@ -1111,6 +1180,23 @@ func TestAdminMetricsFailsAdmissionReadinessWhenResidentMemoryIsUnverified(t *te
 	}
 	if !found {
 		t.Fatalf("unverified resident memory reasons = %#v", metrics["default_admission"])
+	}
+}
+
+func TestAdmissionFailsClosedWhenConfiguredMemoryObservationFails(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, config.Defaults(), Options{
+		Memory:   staticMemoryObserver{err: errors.New("memory probe unavailable")},
+		Resident: true,
+	})
+	err = service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
+	control := protocol.AsError(err)
+	if control == nil || control.Code != "resource_unverified" {
+		t.Fatalf("memory observation admission error = %#v", err)
 	}
 }
 
@@ -1395,7 +1481,7 @@ func TestAdminMetricsMatchesAdmissionForUnknownState(t *testing.T) {
 	if err := store.InsertTask(context.Background(), task); err != nil {
 		t.Fatal(err)
 	}
-	service := New(store, cfg, Options{Guest: &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024}}})
+	service := New(store, cfg, Options{Guest: &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024}}, CPU: staticCPUObserver{observation: observe.CPUObservation{Capacity: 8}}})
 	service.MarkReady()
 	metrics, err := service.adminMetrics(context.Background())
 	if err != nil {
@@ -1415,6 +1501,10 @@ func TestAdminMetricsMatchesAdmissionForUnknownState(t *testing.T) {
 	resources := metrics["resources"].(map[string]any)
 	if remaining, ok := resources["remaining"].(map[string]any); !ok || len(remaining) != 0 {
 		t.Fatalf("unknown state resource remaining = %#v", resources["remaining"])
+	}
+	startupPressure := metrics["ct_cpu"].(map[string]any)["startup_pressure"].(map[string]any)
+	if startupPressure["verified"] != false || startupPressure["startup_blocked"] != nil {
+		t.Fatalf("unknown state startup pressure = %#v", startupPressure)
 	}
 	if control := protocol.AsError(service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)); control == nil || control.Code != "resource_unverified" {
 		t.Fatalf("unknown state admission error = %#v", control)
