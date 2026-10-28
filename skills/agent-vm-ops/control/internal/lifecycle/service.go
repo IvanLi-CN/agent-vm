@@ -173,21 +173,28 @@ func (s *Service) operationActive(operationID string) bool {
 }
 
 func (s *Service) WorkerStarted(ctx context.Context, operationID string, identity native.WorkerIdentity) error {
-	return s.recordWorker(ctx, operationID, map[string]any{
+	return s.updateWorker(ctx, operationID, map[string]any{
 		"pid":           identity.PID,
 		"start_time":    identity.StartTime,
 		"process_group": identity.ProcessGroup,
 		"state":         "running",
 		"started_at":    nowString(s.Clock()),
-	})
+	}, workerCallbackStarted)
 }
 
 func (s *Service) WorkerFinished(ctx context.Context, operationID string, identity native.WorkerIdentity, runErr error) error {
+	workerState := "finished"
+	if runErr != nil {
+		// A native error can mean cleanup or ownership observation remained
+		// uncertain. Keep the worker reconciliable instead of making a pending
+		// operation look safely finished.
+		workerState = "running"
+	}
 	worker := map[string]any{
 		"pid":           identity.PID,
 		"start_time":    identity.StartTime,
 		"process_group": identity.ProcessGroup,
-		"state":         "finished",
+		"state":         workerState,
 		"finished_at":   nowString(s.Clock()),
 	}
 	if runErr != nil {
@@ -197,10 +204,80 @@ func (s *Service) WorkerFinished(ctx context.Context, operationID string, identi
 		}
 		worker["error"] = message
 	}
-	return s.recordWorker(ctx, operationID, worker)
+	return s.updateWorker(ctx, operationID, worker, workerCallbackFinished)
 }
 
-func (s *Service) recordWorker(ctx context.Context, operationID string, worker map[string]any) error {
+// WorkerStartFailed records a start attempt that was proven not to create a
+// native process. This clears the pre-spawn barrier without inventing a
+// process identity, so a later reconciliation can retry the operation.
+func (s *Service) WorkerStartFailed(ctx context.Context, operationID string, startErr error) error {
+	worker := map[string]any{
+		"state":           "exited",
+		"start_attempted": true,
+		"finished_at":     nowString(s.Clock()),
+	}
+	if startErr != nil {
+		message := startErr.Error()
+		if len(message) > 2048 {
+			message = message[:2048]
+		}
+		worker["error"] = message
+	}
+	return s.updateWorker(ctx, operationID, worker, workerCallbackStartFailed)
+}
+
+var errUnresolvedWorker = errors.New("native worker ownership remains unresolved")
+
+func (s *Service) WorkerStartAllowed(ctx context.Context, operationID string) error {
+	if operationID == "" {
+		return nil
+	}
+	operation, err := s.Store.GetOperation(ctx, operationID)
+	if err != nil {
+		return err
+	}
+	if operation == nil || stringValue(operation.Response["outcome"]) != "pending" {
+		return errUnresolvedWorker
+	}
+	if unresolved, err := s.pendingWorkerUnresolved(ctx, operation.SessionID, operationID, native.WorkerRecoveryCoordinator(ctx)); err != nil {
+		return err
+	} else if unresolved {
+		return errUnresolvedWorker
+	}
+	previous, _ := operation.Response["worker"].(map[string]any)
+	if workerNeedsReconciliation(previous, true) {
+		return errUnresolvedWorker
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+	defer cancel()
+	return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
+		worker, _ := response["worker"].(map[string]any)
+		if workerNeedsReconciliation(worker, true) {
+			return errUnresolvedWorker
+		}
+		response["worker"] = map[string]any{
+			"state":           "starting",
+			"start_attempted": true,
+			"prepared_at":     nowString(s.Clock()),
+		}
+		return nil
+	})
+}
+
+func (s *Service) recordWorkerState(ctx context.Context, operationID string, worker map[string]any) error {
+	return s.updateWorker(ctx, operationID, worker, workerCallbackState)
+}
+
+type workerCallbackKind uint8
+
+const (
+	workerCallbackStarted workerCallbackKind = iota
+	workerCallbackFinished
+	workerCallbackStartFailed
+	workerCallbackState
+)
+
+func (s *Service) updateWorker(ctx context.Context, operationID string, worker map[string]any, callback workerCallbackKind) error {
 	if operationID == "" {
 		return nil
 	}
@@ -208,7 +285,76 @@ func (s *Service) recordWorker(ctx context.Context, operationID string, worker m
 	// The bounded background context only covers this small durable update.
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
-	return s.Store.RecordOperationWorker(persistCtx, operationID, worker)
+	return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
+		if callback != workerCallbackState {
+			if previous, ok := response["worker"].(map[string]any); ok && stringValue(previous["state"]) == "running" {
+				if callback == workerCallbackStarted || callback == workerCallbackStartFailed || !workerIdentityMatches(previous, worker) {
+					// A callback for a new worker must never overwrite an older
+					// identity that has not been reconciled.
+					return errUnresolvedWorker
+				}
+			}
+		}
+		response["worker"] = worker
+		return nil
+	})
+}
+
+func (s *Service) pendingWorkerUnresolved(ctx context.Context, sessionID *string, currentOperationID, recoveryCoordinatorID string) (bool, error) {
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, operation := range pending {
+		if !sameWorkerScope(sessionID, operation.SessionID) {
+			continue
+		}
+		current := operation.OperationID == currentOperationID
+		if worker, ok := operation.Response["worker"].(map[string]any); ok && workerNeedsReconciliation(worker, current) {
+			if operation.OperationID == recoveryCoordinatorID && workerStartPrepared(worker) {
+				continue
+			}
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func workerStartPrepared(worker map[string]any) bool {
+	return worker != nil && stringValue(worker["state"]) == "starting" && !boolValue(worker["start_attempted"])
+}
+
+func sameWorkerScope(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func workerNeedsReconciliation(worker map[string]any, current bool) bool {
+	if worker == nil {
+		return false
+	}
+	if workerOwnershipUnresolved(worker) {
+		return true
+	}
+	return stringValue(worker["state"]) == "starting" && !current
+}
+
+func workerOwnershipUnresolved(worker map[string]any) bool {
+	if worker == nil {
+		return false
+	}
+	stateValue := stringValue(worker["state"])
+	return stateValue == "running" || stateValue == "starting" && boolValue(worker["start_attempted"])
+}
+
+func workerIdentityMatches(previous, current map[string]any) bool {
+	previousPID, previousPIDOK := protocol.Integer(previous["pid"])
+	currentPID, currentPIDOK := protocol.Integer(current["pid"])
+	previousGroup, previousGroupOK := protocol.Integer(previous["process_group"])
+	currentGroup, currentGroupOK := protocol.Integer(current["process_group"])
+	return previousPIDOK && currentPIDOK && previousGroupOK && currentGroupOK && previousPID == currentPID && previousGroup == currentGroup && stringValue(previous["start_time"]) == stringValue(current["start_time"])
 }
 
 func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.Operation) error {
@@ -217,7 +363,13 @@ func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.O
 			continue
 		}
 		worker, ok := operation.Response["worker"].(map[string]any)
-		if !ok || stringValue(worker["state"]) != "running" {
+		if !ok {
+			continue
+		}
+		if stringValue(worker["state"]) == "starting" && boolValue(worker["start_attempted"]) {
+			return protocol.NewError("state_unverified", "pending native worker start has no durable identity", map[string]any{"operation_id": operation.OperationID})
+		}
+		if stringValue(worker["state"]) != "running" {
 			continue
 		}
 		pid, valid := protocol.Integer(worker["pid"])
@@ -225,7 +377,10 @@ func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.O
 		if !valid || pid <= 0 || !hasStartTime || startTime == "" {
 			return protocol.NewError("state_unverified", "pending operation has an invalid native worker identity", map[string]any{"operation_id": operation.OperationID})
 		}
-		processGroup, _ := protocol.Integer(worker["process_group"])
+		processGroup, validProcessGroup := protocol.Integer(worker["process_group"])
+		if !validProcessGroup || processGroup <= 0 {
+			return protocol.NewError("state_unverified", "pending operation has an invalid native worker identity", map[string]any{"operation_id": operation.OperationID})
+		}
 		identity := native.WorkerIdentity{PID: int(pid), StartTime: startTime, ProcessGroup: int(processGroup)}
 		alive, err := native.WorkerAlive(identity)
 		if err != nil {
@@ -235,16 +390,19 @@ func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.O
 			if err := native.KillWorker(identity); err != nil {
 				return protocol.NewError("state_unverified", "pending native worker could not be stopped safely", map[string]any{"operation_id": operation.OperationID, "cause": err.Error()})
 			}
-			worker["state"] = "orphaned"
+			// KillWorker returns only after the root process group has been
+			// confirmed absent. Keep the operation pending for recovery, but do
+			// not leave a dead worker in a state reconciliation will skip forever.
+			worker["state"] = "exited"
 			worker["observed_at"] = nowString(s.Clock())
-			if err := s.recordWorker(ctx, operation.OperationID, worker); err != nil {
+			if err := s.recordWorkerState(ctx, operation.OperationID, worker); err != nil {
 				return s.sqliteError(err)
 			}
-			return protocol.NewError("startup_reconcile_required", "an orphaned native worker was stopped; retry reconciliation before admission", map[string]any{"operation_id": operation.OperationID})
+			return protocol.NewError("startup_reconcile_required", "a pending native worker was stopped; retry reconciliation before admission", map[string]any{"operation_id": operation.OperationID})
 		}
 		worker["state"] = "exited"
 		worker["observed_at"] = nowString(s.Clock())
-		if err := s.recordWorker(ctx, operation.OperationID, worker); err != nil {
+		if err := s.recordWorkerState(ctx, operation.OperationID, worker); err != nil {
 			return s.sqliteError(err)
 		}
 	}
@@ -259,7 +417,11 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 		}
 		if workerValue, hasWorker := operation.Response["worker"]; hasWorker {
 			worker, validWorker := workerValue.(map[string]any)
-			if !validWorker || stringValue(worker["state"]) != "finished" || !recoverableOperation(operation.Action) {
+			stateValue := ""
+			if validWorker {
+				stateValue = stringValue(worker["state"])
+			}
+			if !validWorker || (stateValue != "finished" && stateValue != "exited") || !recoverableOperation(operation.Action) {
 				continue
 			}
 		}
@@ -291,6 +453,9 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 		}
 		finishActive := s.markOperationActive(operation.OperationID)
 		recoveryCtx := native.WithWorkerRecorder(ctx, operation.OperationID, s)
+		if coordinatorID := native.WorkerOperationID(ctx); coordinatorID != "" && coordinatorID != operation.OperationID {
+			recoveryCtx = native.WithWorkerRecovery(recoveryCtx, coordinatorID)
+		}
 		result, dispatchErr := s.dispatchAction(recoveryCtx, operation.Action, request)
 		finishActive()
 		if dispatchErr != nil {
@@ -1018,6 +1183,13 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 			if !(destroy && task.State == stateDeleting && missing) {
 				return nil, protocol.NewError("cleanup_incomplete", "native ownership could not be verified before cleanup", map[string]any{"cause": ownershipErr.Error(), "outcome_verified": false})
 			}
+			unresolved, workerErr := s.pendingWorkerUnresolved(ctx, optionalString(request["session_id"]), stringValue(request["operation_id"]), native.WorkerRecoveryCoordinator(ctx))
+			if workerErr != nil {
+				return nil, protocol.NewError("cleanup_incomplete", "native worker ownership could not be checked before finalizing a missing instance", map[string]any{"cause": workerErr.Error(), "outcome_verified": false})
+			}
+			if unresolved {
+				return nil, protocol.NewError("cleanup_incomplete", "native worker ownership remains unresolved while the instance is missing", map[string]any{"outcome_verified": false})
+			}
 			nativePresent = false
 		}
 	}
@@ -1032,14 +1204,15 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 			cancel()
 			if removeErr != nil {
 				cleanupErrors = append(cleanupErrors, port.DeviceName+": "+removeErr.Error())
-				continue
+				break
 			}
 		}
 		if removeErr := s.Store.DeletePort(ctx, task.TaskID, port.PortName, port.Protocol); removeErr != nil {
 			cleanupErrors = append(cleanupErrors, port.DeviceName+": "+removeErr.Error())
+			break
 		}
 	}
-	if nativePresent {
+	if len(cleanupErrors) == 0 && nativePresent {
 		workerCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 		defer cancel()
 		nativeState, statusErr := s.Guest.Status(workerCtx, task.InstanceName)
@@ -1122,6 +1295,13 @@ func (s *Service) cancelPendingAcquireOperations(ctx context.Context, task *stat
 	pending, err := s.pendingAcquireOperations(ctx, task)
 	if err != nil || len(pending) == 0 {
 		return err
+	}
+	for _, operation := range pending {
+		if worker, ok := operation.Response["worker"].(map[string]any); ok && workerOwnershipUnresolved(worker) {
+			return protocol.NewError("cleanup_incomplete", "pending acquire operation has unresolved native worker ownership", map[string]any{
+				"operation_id": operation.OperationID, "outcome_verified": false,
+			})
+		}
 	}
 	for _, operation := range pending {
 		digest := stringValue(operation.Response["_request_digest"])
@@ -2448,6 +2628,10 @@ func generationPointer(value int64, present bool) *int64 {
 func requestBool(request protocol.Request, key string) bool {
 	value, ok := request[key].(bool)
 	return ok && value
+}
+func boolValue(value any) bool {
+	parsed, _ := value.(bool)
+	return parsed
 }
 func boolString(value bool) string {
 	if value {

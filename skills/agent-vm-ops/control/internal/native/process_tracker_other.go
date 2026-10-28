@@ -19,6 +19,7 @@ func (tracker *processTracker) Identity(root int) (WorkerIdentity, error) {
 }
 func (*processTracker) configureCommand(_ *exec.Cmd) {}
 func (*processTracker) hasOwnershipBoundary() bool   { return false }
+func (*processTracker) groupAlive() (bool, error)    { return false, nil }
 func (*processTracker) Register(_ int)               {}
 func (*processTracker) Discover(_ int) error         { return nil }
 func (*processTracker) Live() (int, error)           { return 0, nil }
