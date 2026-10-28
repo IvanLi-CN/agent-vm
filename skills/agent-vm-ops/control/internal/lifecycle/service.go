@@ -736,12 +736,22 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 	if _, err := s.Store.StateEpoch(ctx); err != nil {
 		return s.sqliteError(err)
 	}
-	if _, err := s.reconcile(ctx, true); err != nil {
-		return err
+	_, reconcileErr := s.reconcile(ctx, true)
+	if reconcileErr != nil && protocol.AsError(reconcileErr).Code != "cleanup_incomplete" {
+		return reconcileErr
 	}
 	pending, err := s.Store.PendingOperations(ctx)
 	if err != nil {
 		return s.sqliteError(err)
+	}
+	if reconcileErr != nil {
+		unresolved, workerErr := s.pendingWorkerUnresolved(ctx, nil, "", native.WorkerRecoveryCoordinator(ctx))
+		if workerErr != nil {
+			return s.sqliteError(workerErr)
+		}
+		if unresolved {
+			return reconcileErr
+		}
 	}
 	if len(pending) > 0 {
 		if err := s.reconcilePendingWorkers(ctx, pending); err != nil {
@@ -751,12 +761,20 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 			return err
 		}
 		if err := s.reconcileOrphanedAcquireOperations(ctx, pending); err != nil {
-			return err
+			if protocol.AsError(err).Code != "startup_reconcile_required" {
+				return err
+			}
+			if reconcileErr == nil {
+				reconcileErr = err
+			}
 		}
 		pending, err = s.Store.PendingOperations(ctx)
 		if err != nil {
 			return s.sqliteError(err)
 		}
+	}
+	if reconcileErr != nil {
+		return reconcileErr
 	}
 	if len(pending) > 0 {
 		return protocol.NewError("startup_reconcile_required", "pending operations require explicit recovery before admission", map[string]any{"count": len(pending), "admission_ready": false})
@@ -772,6 +790,7 @@ func (s *Service) reconcileOrphanedAcquireOperations(ctx context.Context, pendin
 	if s.Guest == nil {
 		return protocol.NewError("startup_reconcile_required", "pending acquire operations cannot be reconciled without native access", map[string]any{"admission_ready": false})
 	}
+	var firstErr error
 	for _, operation := range pending {
 		if operation.Action != "acquire" || operation.SessionID == nil || operation.Generation == nil {
 			continue
@@ -783,11 +802,16 @@ func (s *Service) reconcileOrphanedAcquireOperations(ctx context.Context, pendin
 		err := s.reconcileOrphanedAcquire(ctx, operation.OperationID)
 		unlock()
 		if err != nil {
-			return err
+			if protocol.AsError(err).Code != "startup_reconcile_required" {
+				return err
+			}
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 
-	return nil
+	return firstErr
 }
 
 // The session lock prevents an acquire from starting between the journal and native checks.
@@ -800,6 +824,10 @@ func (s *Service) reconcileOrphanedAcquire(ctx context.Context, operationID stri
 		return nil
 	}
 	if s.operationActive(operation.OperationID) {
+		return nil
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	if !ok || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
 		return nil
 	}
 	unresolved, workerErr := s.pendingWorkerUnresolved(ctx, operation.SessionID, "", native.WorkerRecoveryCoordinator(ctx))
@@ -819,6 +847,15 @@ func (s *Service) reconcileOrphanedAcquire(ctx context.Context, operationID stri
 	digest := stringValue(operation.Response["_request_digest"])
 	if digest == "" {
 		return protocol.NewError("startup_reconcile_required", "orphaned acquire operation is missing its request digest", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	saved, valid := operation.Response["_request"].(map[string]any)
+	if !valid {
+		return protocol.NewError("startup_reconcile_required", "orphaned acquire request is missing", map[string]any{"operation_id": operation.OperationID})
+	}
+	request := protocol.Request(saved)
+	computed, digestErr := protocol.Digest(request)
+	if protocol.ValidateRequest(request) != nil || digestErr != nil || digest != computed || stringValue(request["action"]) != "acquire" || stringValue(request["operation_id"]) != operation.OperationID || stringValue(request["session_id"]) != *operation.SessionID || intValue(request["generation"]) != *operation.Generation {
+		return protocol.NewError("startup_reconcile_required", "orphaned acquire request identity is inconsistent", map[string]any{"operation_id": operation.OperationID})
 	}
 	if task != nil && task.State == stateCached {
 		if !acquireOperationMatchesTask(*operation, task) {
