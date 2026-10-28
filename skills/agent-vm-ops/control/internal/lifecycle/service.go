@@ -2897,22 +2897,13 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				physical := diskAdmission["physical_admission"].(map[string]any)
 				capacityObservation = map[string]any{"verified": true, "total_bytes": physical["capacity_bytes"], "used_bytes": physical["allocated_bytes"], "free_bytes": physical["free_bytes"], "low_watermark_bytes": physical["low_watermark_bytes"], "target_watermark_bytes": physical["target_watermark_bytes"]}
 			}
-			warningCounts := make(map[string]int64, len(auditSummary.Warnings)+3)
+			warningCounts := make(map[string]int64, len(auditSummary.Warnings))
 			for code, count := range auditSummary.Warnings {
 				warningCounts[code] = count
 			}
-			if !consistent {
-				warningCounts["observation_inconsistent"]++
-			}
-			if cpuObservationErr != nil || diskErr != nil || memoryObservationErr != nil {
-				warningCounts["resource_unverified"]++
-			}
-			if !nativeUp {
-				warningCounts["native_unavailable"]++
-			}
-			if memoryObservationValue != nil && memoryObservationValue.AvailableBytes < memoryObservationValue.ThresholdBytes {
-				warningCounts["memory_pressure"]++
-			}
+			// warning_counts is the durable counter source for the *_total
+			// Prometheus family. Instantaneous observation warnings remain in
+			// warnings and must not change a counter on every scrape.
 			operationMetrics := map[string]any{"pending": len(pendingOperations), "historical_unknown": len(unknownOperations)}
 			for key, count := range auditSummary.Operations {
 				operationMetrics[key] = count
@@ -4123,10 +4114,18 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 			continue
 		}
 		cleanupRequest := protocol.Request{"session_id": task.SessionID, "generation": task.Generation}
-		// The caller holds admissionMu. The release path takes the cached
-		// session lock, while release/reconcile never acquire admissionMu, so
-		// this lock order cannot cycle and keeps native deletion serialized.
-		if _, releaseErr := s.release(withInternalCleanup(ctx), cleanupRequest, true); releaseErr != nil {
+		// The caller holds admissionMu, while acquire holds a session lock before
+		// waiting for admissionMu. Never wait for another session lock here: a
+		// concurrent acquire for this cached session could otherwise deadlock the
+		// admission mutex. A busy cached session is skipped and can be reclaimed by
+		// a later admission attempt after its owner releases the lock.
+		unlockSession, locked := s.trySessionLock(task.SessionID)
+		if !locked {
+			continue
+		}
+		_, releaseErr := s.releaseUnlocked(withInternalCleanup(ctx), cleanupRequest, true)
+		unlockSession()
+		if releaseErr != nil {
 			return false, releaseErr
 		}
 		admission, admissionErr := s.diskAdmission(ctx, excludeTaskID)

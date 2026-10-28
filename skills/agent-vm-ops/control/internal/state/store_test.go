@@ -104,7 +104,8 @@ func TestAuditSummaryAggregatesStableObservabilityLabels(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 	if err := store.Audit(ctx, "acquire", "task", "session", "error", intPointer(1), map[string]any{
-		"code": "image_unpack_failed", "phase": "native-unpack", "message": "image rootfs unpack failed",
+		"code": "image_unpack_failed", "phase": "dispatch", "message": "image rootfs unpack failed",
+		"detail":   map[string]any{"phase": "native-unpack"},
 		"warnings": []map[string]any{{"code": "capacity_insufficient"}},
 	}); err != nil {
 		t.Fatal(err)

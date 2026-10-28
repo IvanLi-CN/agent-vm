@@ -1194,11 +1194,11 @@ func (s *Store) AuditSummary(ctx context.Context) (AuditSummary, error) {
 					detail = nil
 				}
 			}
-			code := auditString(detail, "code")
+			code := auditCode(detail)
 			if code == "" {
 				code = "unknown"
 			}
-			phase := auditString(detail, "phase", "operation_phase")
+			phase := auditPhase(detail)
 			if phase == "" {
 				phase = "unknown"
 			}
@@ -1219,36 +1219,64 @@ func (s *Store) AuditSummary(ctx context.Context) (AuditSummary, error) {
 	return result, err
 }
 
-func auditString(value any, keys ...string) string {
-	wanted := make(map[string]struct{}, len(keys))
-	for _, key := range keys {
-		wanted[key] = struct{}{}
-	}
-	var found string
-	var visit func(any)
-	visit = func(current any) {
-		if found != "" {
-			return
-		}
-		switch typed := current.(type) {
-		case map[string]any:
-			for key, item := range typed {
-				if _, ok := wanted[key]; ok {
-					if text, ok := item.(string); ok && text != "" {
-						found = text
-						return
+func auditCode(value any) string {
+	return auditField(value, "code", false)
+}
+
+func auditPhase(value any) string {
+	// Error details carry the operation's concrete phase below the outer
+	// dispatch audit record. Prefer that nested phase, then use the outer
+	// operation_phase/phase fields, and keep the traversal deterministic.
+	return auditField(value, "phase", true)
+}
+
+func auditField(value any, wanted string, nestedFirst bool) string {
+	var visit func(any) string
+	visit = func(current any) string {
+		typed, ok := current.(map[string]any)
+		if !ok {
+			if values, ok := current.([]any); ok {
+				for _, item := range values {
+					if found := visit(item); found != "" {
+						return found
 					}
 				}
-				visit(item)
 			}
-		case []any:
-			for _, item := range typed {
-				visit(item)
+			return ""
+		}
+		if !nestedFirst {
+			if text, ok := typed[wanted].(string); ok && text != "" {
+				return text
 			}
 		}
+		for _, key := range []string{"detail", "error", "cause"} {
+			if found := visit(typed[key]); found != "" {
+				return found
+			}
+		}
+		if nestedFirst {
+			for _, key := range []string{"operation_phase", "phase"} {
+				if text, ok := typed[key].(string); ok && text != "" {
+					return text
+				}
+			}
+		}
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if key == wanted || key == "detail" || key == "error" || key == "cause" || key == "operation_phase" || key == "phase" {
+				continue
+			}
+			if found := visit(typed[key]); found != "" {
+				return found
+			}
+		}
+		return ""
 	}
-	visit(value)
-	return found
+	return visit(value)
 }
 
 func auditWarnings(value any) []string {

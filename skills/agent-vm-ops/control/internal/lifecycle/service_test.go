@@ -921,6 +921,12 @@ func TestAdminMetricsDefaultAdmissionReflectsDrainAndStructuredUnknowns(t *testi
 	if metrics["admission_ready"] != false {
 		t.Fatalf("admission_ready = %#v", metrics["admission_ready"])
 	}
+	if warningCounts, ok := metrics["warning_counts"].(map[string]int64); !ok || len(warningCounts) != 0 {
+		t.Fatalf("transient warning counts = %#v", metrics["warning_counts"])
+	}
+	if warnings, ok := metrics["warnings"].([]any); !ok || len(warnings) == 0 {
+		t.Fatalf("transient warnings = %#v", metrics["warnings"])
+	}
 	if metrics["reclaim_required"] != nil {
 		t.Fatalf("unmeasured reclaim_required = %#v", metrics["reclaim_required"])
 	}
@@ -1086,6 +1092,37 @@ func TestAdmissionReclaimsCachedCapacityBeforeRejectingPhysicalSpace(t *testing.
 	}
 	if task, err := store.GetTask(context.Background(), map[string]any{"task_id": "reclaimable-cache"}); err != nil || task != nil {
 		t.Fatalf("reclaimed task = %#v err=%v", task, err)
+	}
+}
+
+func TestReclaimCachedCapacitySkipsBusySession(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "busy-cache", SessionID: "busy-cache-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-busy-cache", CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	unlockSession, locked := service.trySessionLock("busy-cache-session")
+	if !locked {
+		t.Fatal("failed to acquire busy session lock")
+	}
+	defer unlockSession()
+
+	service.admissionMu.Lock()
+	reclaimed, reclaimErr := service.reclaimCachedCapacity(context.Background(), 1, "", 0)
+	service.admissionMu.Unlock()
+	if reclaimErr != nil {
+		t.Fatal(reclaimErr)
+	}
+	if reclaimed {
+		t.Fatal("busy cached session was reclaimed")
 	}
 }
 
