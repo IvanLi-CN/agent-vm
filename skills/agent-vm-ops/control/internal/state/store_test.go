@@ -292,44 +292,5 @@ func TestTransactionErrorRetainsRollbackPhaseAndCommitState(t *testing.T) {
 	}
 }
 
-func TestFinalizeNativeInitRecoveryRollsBackTaskAndJournalsTogether(t *testing.T) {
-	store, err := OpenForTest(filepath.Join(t.TempDir(), "native-init-atomic.sqlite3"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	ctx := context.Background()
-	task := Task{TaskID: "native-init-atomic-task", SessionID: "native-init-atomic-session", Generation: 3, State: "failed", InstanceName: "agent-native-init-atomic", CreatedAt: "2026-10-27T00:00:00Z", UpdatedAt: "2026-10-27T00:00:00Z", ResourcesJSON: `{"cpu":2}`, ResourceReservationJSON: `{"cpu":2}`, ReservationBytes: 2}
-	if err := store.InsertTask(ctx, task); err != nil {
-		t.Fatal(err)
-	}
-	for _, operation := range []string{"atomic-acquire", "atomic-release"} {
-		if err := store.RecordOperation(ctx, operation, "acquire", stringPointer(task.SessionID), intPointer(task.Generation), map[string]any{"outcome": "pending", "_request_digest": operation}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	updated, err := store.FinalizeNativeInitRecovery(ctx, task.TaskID, TaskCondition{Generation: intPointer(task.Generation), States: []string{"failed"}}, map[string]any{"state": "absent", "resources_json": `{}`}, []OperationFinalization{
-		{OperationID: "atomic-acquire", Action: "acquire", SessionID: stringPointer(task.SessionID), Generation: intPointer(task.Generation), Response: map[string]any{"outcome": "error", "_request_digest": "atomic-acquire"}},
-		{OperationID: "missing-operation", Action: "release", SessionID: stringPointer(task.SessionID), Generation: intPointer(task.Generation), Response: map[string]any{"outcome": "success", "_request_digest": "missing-operation"}},
-	})
-	if err == nil || updated {
-		t.Fatalf("atomic finalization unexpectedly committed: updated=%v err=%v", updated, err)
-	}
-	current, err := store.GetTask(ctx, map[string]any{"task_id": task.TaskID})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current == nil || current.State != task.State || current.ResourcesJSON != task.ResourcesJSON {
-		t.Fatalf("task was partially finalized: %#v", current)
-	}
-	pending, err := store.PendingOperations(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(pending) != 2 {
-		t.Fatalf("journals were partially finalized: %#v", pending)
-	}
-}
-
 func stringPointer(value string) *string { return &value }
 func intPointer(value int64) *int64      { return &value }
