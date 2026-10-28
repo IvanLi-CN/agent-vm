@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -322,6 +323,72 @@ func TestDeletedLegacyImageIsNotReseededOnRestart(t *testing.T) {
 }
 
 func testStringPointer(value string) *string { return &value }
+
+func TestManagementHistoryPagesFilterInSQLite(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	for index := 0; index < 3; index++ {
+		created := time.Date(2026, 10, 27, 0, 0, index, 0, time.UTC).Format(time.RFC3339Nano)
+		operationID := "page-op-" + string(rune('a'+index))
+		operation := ManagementOperation{OperationID: operationID, Action: "restart", TargetKind: "vm", TargetID: "target-" + string(rune('a'+index)), Actor: "admin", Reason: "page test", Phase: "native_action", Status: "succeeded", Request: map[string]any{}, CreatedAt: created, UpdatedAt: created}
+		audit := ManagementAudit{EventID: "page-event-" + string(rune('a'+index)), OperationID: &operationID, Action: operation.Action, Actor: operation.Actor, Reason: operation.Reason, Target: map[string]any{"id": operation.TargetID}, Outcome: "succeeded", Phase: operation.Phase, OccurredAt: created}
+		if _, err := store.ClaimManagementOperationWithAudit(ctx, operation, audit); err != nil {
+			t.Fatal(err)
+		}
+	}
+	first, more, err := store.ListManagementOperationsPage(ctx, ManagementOperationFilter{TargetID: "target-a", Limit: 1})
+	if err != nil || len(first) != 1 || more {
+		t.Fatalf("filtered operation page = %#v more=%v err=%v", first, more, err)
+	}
+	page, more, err := store.ListManagementOperationsPage(ctx, ManagementOperationFilter{Limit: 2})
+	if err != nil || len(page) != 2 || !more {
+		t.Fatalf("operation page = %#v more=%v err=%v", page, more, err)
+	}
+	next, more, err := store.ListManagementOperationsPage(ctx, ManagementOperationFilter{AfterCreatedAt: page[len(page)-1].CreatedAt, AfterOperationID: page[len(page)-1].OperationID, Limit: 2})
+	if err != nil || len(next) != 1 || more || next[0].OperationID == page[0].OperationID || next[0].OperationID == page[1].OperationID {
+		t.Fatalf("operation cursor page = %#v more=%v err=%v", next, more, err)
+	}
+	auditPage, more, err := store.ListManagementAuditPage(ctx, ManagementAuditFilter{TargetID: "target-b", Limit: 2})
+	if err != nil || len(auditPage) != 1 || more || auditPage[0].Target["id"] != "target-b" {
+		t.Fatalf("filtered audit page = %#v more=%v err=%v", auditPage, more, err)
+	}
+}
+
+func TestCachedImageUsableRequiresVerifiedAvailableCatalogState(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	legacy := strings.Repeat("a", 64)
+	if err := store.SeedLegacyImage(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	usable, err := store.CachedImageUsable(ctx, legacy)
+	if err != nil || usable {
+		t.Fatalf("legacy image usable=%v err=%v", usable, err)
+	}
+	verified := strings.Repeat("b", 64)
+	if err := store.InsertManagedImage(ctx, ManagedImage{Fingerprint: verified, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
+		t.Fatal(err)
+	}
+	usable, err = store.CachedImageUsable(ctx, verified)
+	if err != nil || !usable {
+		t.Fatalf("verified image usable=%v err=%v", usable, err)
+	}
+	if err := store.RetireManagedImage(ctx, verified); err != nil {
+		t.Fatal(err)
+	}
+	usable, err = store.CachedImageUsable(ctx, verified)
+	if err != nil || usable {
+		t.Fatalf("retired image usable=%v err=%v", usable, err)
+	}
+}
 
 func openLegacyFixture(path string) (*sql.DB, error) {
 	fixture, err := os.ReadFile(filepath.Join("..", "..", "..", "tests", "fixtures", "control-baseline.sql"))

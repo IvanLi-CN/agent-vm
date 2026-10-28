@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -517,38 +518,37 @@ func (authority *Authority) listOperations(writer http.ResponseWriter, request *
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	values, err := authority.Management.ListAllOperations(request.Context())
-	if err != nil {
-		writeProblem(writer, problemFromError(err, "internal", ""))
-		return
-	}
 	query := request.URL.Query()
-	filtered := make([]state.ManagementOperation, 0, len(values))
-	search := strings.ToLower(query.Get("q"))
-	for _, value := range values {
-		if query.Get("status") != "" && operationStatus(value) != query.Get("status") || query.Get("action") != "" && value.Action != query.Get("action") || query.Get("actor") != "" && value.Actor != query.Get("actor") || query.Get("target_id") != "" && value.TargetID != query.Get("target_id") {
-			continue
-		}
-		if search != "" && !strings.Contains(strings.ToLower(value.Action+" "+value.Status+" "+value.TargetID+" "+value.Actor+" "+value.Reason), search) {
-			continue
-		}
-		filtered = append(filtered, value)
-	}
-	keys := make([]string, len(filtered))
-	for index := range filtered {
-		keys[index] = filtered[index].CreatedAt + "\x00" + filtered[index].OperationID
-	}
-	start, limit, err := pageBounds(query, keys, pageAfterDescendingPair)
+	limit, cursor, err := pageRequest(query)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	end := minInt(start+limit, len(filtered))
-	items := make([]any, 0, end-start)
-	for index := start; index < end; index++ {
-		items = append(items, operationValue(filtered[index]))
+	status := query.Get("status")
+	phase := ""
+	if status == "reconciling" {
+		status = "running"
+		phase = "reconciliation"
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(limit, end < len(filtered), pageKey(keys, end))})
+	createdAt, operationID := pageKeyParts(cursor)
+	values, more, err := authority.Management.ListOperationsPage(request.Context(), state.ManagementOperationFilter{
+		Status: status, Phase: phase, Action: query.Get("action"), Actor: query.Get("actor"), TargetID: query.Get("target_id"), Query: query.Get("q"),
+		AfterCreatedAt: createdAt, AfterOperationID: operationID, Limit: limit,
+	})
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "internal", ""))
+		return
+	}
+	items := make([]any, 0, len(values))
+	for _, value := range values {
+		items = append(items, operationValue(value))
+	}
+	nextKey := ""
+	if len(values) > 0 {
+		last := values[len(values)-1]
+		nextKey = last.CreatedAt + "\x00" + last.OperationID
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(limit, more, nextKey)})
 }
 
 func (authority *Authority) getOperation(writer http.ResponseWriter, request *http.Request, operationID string) {
@@ -574,35 +574,38 @@ func (authority *Authority) listAudit(writer http.ResponseWriter, request *http.
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	values, err := authority.Management.ListAllAudit(request.Context())
-	if err != nil {
-		writeProblem(writer, problemFromError(err, "internal", ""))
-		return
-	}
 	query := request.URL.Query()
-	filtered := make([]state.ManagementAudit, 0, len(values))
-	for _, value := range values {
-		occurred, parseErr := time.Parse(time.RFC3339Nano, value.OccurredAt)
-		if parseErr != nil || from != nil && occurred.Before(*from) || to != nil && !occurred.Before(*to) || query.Get("actor") != "" && value.Actor != query.Get("actor") || query.Get("action") != "" && value.Action != query.Get("action") || query.Get("operation_id") != "" && (value.OperationID == nil || *value.OperationID != query.Get("operation_id")) || query.Get("target_id") != "" && stringValue(value.Target["id"]) != query.Get("target_id") {
-			continue
-		}
-		filtered = append(filtered, value)
-	}
-	keys := make([]string, len(filtered))
-	for index := range filtered {
-		keys[index] = filtered[index].OccurredAt + "\x00" + filtered[index].EventID
-	}
-	start, limit, err := pageBounds(query, keys, pageAfterDescendingPair)
+	limit, cursor, err := pageRequest(query)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	end := minInt(start+limit, len(filtered))
-	items := make([]any, 0, end-start)
-	for index := start; index < end; index++ {
-		items = append(items, auditValue(filtered[index]))
+	occurredAt, eventID := pageKeyParts(cursor)
+	fromValue, toValue := "", ""
+	if from != nil {
+		fromValue = from.UTC().Format(time.RFC3339Nano)
 	}
-	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(limit, end < len(filtered), pageKey(keys, end))})
+	if to != nil {
+		toValue = to.UTC().Format(time.RFC3339Nano)
+	}
+	values, more, err := authority.Management.ListAuditPage(request.Context(), state.ManagementAuditFilter{
+		From: fromValue, To: toValue, Actor: query.Get("actor"), Action: query.Get("action"), OperationID: query.Get("operation_id"), TargetID: query.Get("target_id"),
+		AfterOccurredAt: occurredAt, AfterEventID: eventID, Limit: limit,
+	})
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "internal", ""))
+		return
+	}
+	items := make([]any, 0, len(values))
+	for _, value := range values {
+		items = append(items, auditValue(value))
+	}
+	nextKey := ""
+	if len(values) > 0 {
+		last := values[len(values)-1]
+		nextKey = last.OccurredAt + "\x00" + last.EventID
+	}
+	writeJSON(writer, http.StatusOK, map[string]any{"items": items, "page": pageValue(limit, more, nextKey)})
 }
 
 func (authority *Authority) getSystem(writer http.ResponseWriter, request *http.Request) {
@@ -1064,7 +1067,7 @@ func stageReaderFileWithCapacity(stagingPath string, reader io.Reader, expected,
 		}
 		info, err = os.Lstat(stagingPath)
 	}
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 || !ownedByCurrentUser(info) {
 		return "", errors.New("authority_unavailable: upload staging is unavailable")
 	}
 	file, err := os.CreateTemp(stagingPath, ".agent-vm-upload-*")
@@ -1112,6 +1115,54 @@ func stageReaderFileWithCapacity(stagingPath string, reader io.Reader, expected,
 	// Ownership transfers to the caller after a complete write.
 	cleanup = false
 	return name, nil
+}
+
+func ownedByCurrentUser(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && uint64(stat.Uid) == uint64(os.Getuid())
+}
+
+// CleanupUploadStaging removes only stale files created by the upload path.
+// It is intentionally strict about ownership and file type so startup recovery
+// cannot delete an attacker-controlled path.
+func CleanupUploadStaging(stagingPath string) error {
+	if stagingPath == "" {
+		return nil
+	}
+	if !filepath.IsAbs(stagingPath) {
+		return errors.New("upload staging path is not absolute")
+	}
+	info, err := os.Lstat(stagingPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 || !ownedByCurrentUser(info) {
+		return errors.New("upload staging path is not a private directory owned by the service")
+	}
+	entries, err := os.ReadDir(stagingPath)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), ".agent-vm-upload-") {
+			continue
+		}
+		path := filepath.Join(stagingPath, entry.Name())
+		entryInfo, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if entryInfo.Mode()&os.ModeSymlink != 0 || !entryInfo.Mode().IsRegular() || entryInfo.Mode().Perm()&0o077 != 0 || !ownedByCurrentUser(entryInfo) {
+			return errors.New("upload staging contains an unsafe stale entry")
+		}
+		if err := os.Remove(path); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type capacityReader struct {
@@ -1792,34 +1843,46 @@ func validateConfirmationToken(value string) error {
 
 type pageAfter func(key, cursor string) bool
 
-func pageBounds(query url.Values, keys []string, after pageAfter) (int, int, error) {
+func pageRequest(query url.Values) (int, string, error) {
 	limit := 25
 	if value := query.Get("limit"); value != "" {
 		parsed, err := strconv.Atoi(value)
 		if err != nil || parsed < 1 || parsed > 100 {
-			return 0, 0, errors.New("limit must be between 1 and 100")
+			return 0, "", errors.New("limit must be between 1 and 100")
 		}
 		limit = parsed
 	}
+	value := query.Get("cursor")
+	if value == "" {
+		return limit, "", nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil {
+		return 0, "", errors.New("cursor is invalid")
+	}
+	var cursor struct {
+		Key string `json:"key"`
+	}
+	if err := json.Unmarshal(raw, &cursor); err != nil || cursor.Key == "" {
+		return 0, "", errors.New("cursor is invalid")
+	}
+	return limit, cursor.Key, nil
+}
+
+func pageBounds(query url.Values, keys []string, after pageAfter) (int, int, error) {
+	limit, cursorKey, err := pageRequest(query)
+	if err != nil {
+		return 0, 0, err
+	}
 	start := 0
-	if value := query.Get("cursor"); value != "" {
-		raw, err := base64.RawURLEncoding.DecodeString(value)
-		if err != nil {
-			return 0, 0, errors.New("cursor is invalid")
-		}
-		var cursor struct {
-			Key string `json:"key"`
-		}
-		if err := json.Unmarshal(raw, &cursor); err != nil || cursor.Key == "" {
-			return 0, 0, errors.New("cursor is invalid")
-		}
+	if cursorKey != "" {
 		for index, key := range keys {
-			if after(key, cursor.Key) {
+			if after(key, cursorKey) {
 				start = index
 				break
 			}
 		}
-		if start == 0 && len(keys) > 0 && !after(keys[0], cursor.Key) {
+		if start == 0 && len(keys) > 0 && !after(keys[0], cursorKey) {
 			start = len(keys)
 		}
 	}

@@ -2,8 +2,10 @@ package management
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,6 +17,23 @@ type fakeImageBackend struct {
 	artifact ImageArtifact
 	imports  int
 	deletes  int
+}
+
+type blockingImageBackend struct {
+	fakeImageBackend
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (backend *blockingImageBackend) ImportTrusted(ctx context.Context, sourceID, fingerprint string) (ImageArtifact, error) {
+	backend.once.Do(func() { close(backend.entered) })
+	select {
+	case <-backend.release:
+		return backend.artifact, nil
+	case <-ctx.Done():
+		return ImageArtifact{}, ctx.Err()
+	}
 }
 
 func (backend *fakeImageBackend) ImportTrusted(context.Context, string, string) (ImageArtifact, error) {
@@ -195,6 +214,47 @@ func TestTrustedImportCapacityFailureDoesNotClaimOrImport(t *testing.T) {
 	}
 	if completed.Status != "succeeded" || backend.imports != 1 {
 		t.Fatalf("completed operation = %#v, backend imports = %d", completed, backend.imports)
+	}
+}
+
+func TestConcurrentTrustedImportsReserveImageStorage(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	fingerprint := strings.Repeat("a", 64)
+	backend := &blockingImageBackend{fakeImageBackend: fakeImageBackend{artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}}, entered: make(chan struct{}), release: make(chan struct{})}
+	service := New(store, Options{TrustedImageSourceIDs: []string{"approved"}, UploadMinimumFreeBytes: 512, AvailableImageStorageBytes: func() (int64, error) { return 513, nil }, Backend: backend})
+	requests := []ImportRequest{
+		{OperationID: "trusted-concurrent-a", Actor: "admin", Reason: "concurrent import", TargetVersion: "image-catalog:revision-1", VersionLabel: "a", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}},
+		{OperationID: "trusted-concurrent-b", Actor: "admin", Reason: "concurrent import", TargetVersion: "image-catalog:revision-1", VersionLabel: "b", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}},
+	}
+	for _, request := range requests {
+		if _, err := service.StartImageImport(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		operation, err := service.ProcessTrustedImport(context.Background(), requests[0].OperationID)
+		if err == nil && operation.Status != "succeeded" {
+			err = fmt.Errorf("first operation = %#v", operation)
+		}
+		firstDone <- err
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first import did not reach native backend")
+	}
+	second, err := service.ProcessTrustedImport(context.Background(), requests[1].OperationID)
+	if err == nil || !strings.HasPrefix(err.Error(), "staging_capacity_low:") || second.Status != "queued" {
+		t.Fatalf("second import result=%#v err=%v", second, err)
+	}
+	close(backend.release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
 	}
 }
 

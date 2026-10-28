@@ -127,6 +127,39 @@ func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
 	}
 }
 
+func TestCachedAcquireRejectsRetiredPinnedImage(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	legacy := strings.Repeat("a", 64)
+	pinned := strings.Repeat("b", 64)
+	if err := store.SeedLegacyImage(ctx, legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: pinned, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
+		t.Fatal(err)
+	}
+	lease := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	if err := store.InsertTask(ctx, state.Task{TaskID: taskID("retired-cache"), SessionID: "retired-cache", Generation: 1, State: stateCached, InstanceName: "agent-vm-retired-cache", CreatedAt: "2026-10-27T00:00:00Z", UpdatedAt: "2026-10-27T00:00:00Z", ImageFingerprint: pinned, ResourcesJSON: `{"cpu":1,"memory_mib":128,"disk_gib":1}`, ResourceReservationJSON: `{"cpu":1,"memory_mib":128,"disk_gib":1}`, LeaseExpiresAt: &lease}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RetireManagedImage(ctx, pinned); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.ImageFingerprint = legacy
+	service := New(store, cfg, Options{})
+	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "retired-cache", "generation": int64(1), "operation_id": "acquire-retired-cache"})
+	control := protocol.AsError(err)
+	if control == nil || control.Code != "cache_stale" {
+		t.Fatalf("retired cache acquire error = %#v", err)
+	}
+}
+
 func TestAbsentStatusMatchesClientContract(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

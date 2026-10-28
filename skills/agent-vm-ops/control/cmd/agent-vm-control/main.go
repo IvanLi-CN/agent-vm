@@ -111,6 +111,9 @@ func serve(args []string) error {
 		return err
 	}
 	defer store.Close()
+	if err := webadmin.CleanupUploadStaging(cfg.Management.Upload.StagingPath); err != nil {
+		return fmt.Errorf("clean upload staging: %w", err)
+	}
 	if err := store.SeedLegacyImage(context.Background(), cfg.ImageFingerprint); err != nil {
 		return fmt.Errorf("initialize managed image catalog: %w", err)
 	}
@@ -163,7 +166,7 @@ func serve(args []string) error {
 		UploadMaxBytes:         cfg.Management.Upload.MaxBytes,
 		UploadMinimumFreeBytes: cfg.Management.Upload.MinimumFreeBytes,
 		AvailableImageStorageBytes: func() (int64, error) {
-			return availableStagingBytes(cfg.StoragePath)
+			return guest.StoragePoolAvailableBytes(context.Background())
 		},
 		CurrentSystemVersion: func(ctx context.Context) (string, error) {
 			epoch, err := store.StateEpoch(ctx)

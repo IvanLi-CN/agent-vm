@@ -25,11 +25,13 @@ import (
 var fingerprintPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
 type Service struct {
-	Store         *state.Store
-	Clock         func() time.Time
-	Options       Options
-	vmActionMu    sync.Mutex
-	maintenanceMu sync.Mutex
+	Store                *state.Store
+	Clock                func() time.Time
+	Options              Options
+	vmActionMu           sync.Mutex
+	maintenanceMu        sync.Mutex
+	imageStorageMu       sync.Mutex
+	imageStorageReserved int64
 }
 
 const operationFinalizeTimeout = 30 * time.Second
@@ -179,12 +181,20 @@ func (s *Service) ListOperations(ctx context.Context, limit int) ([]state.Manage
 	return s.Store.ListManagementOperations(ctx, limit)
 }
 
+func (s *Service) ListOperationsPage(ctx context.Context, filter state.ManagementOperationFilter) ([]state.ManagementOperation, bool, error) {
+	return s.Store.ListManagementOperationsPage(ctx, filter)
+}
+
 func (s *Service) ListAllOperations(ctx context.Context) ([]state.ManagementOperation, error) {
 	return s.Store.ListAllManagementOperations(ctx)
 }
 
 func (s *Service) ListAudit(ctx context.Context, limit int) ([]state.ManagementAudit, error) {
 	return s.Store.ListManagementAudit(ctx, limit)
+}
+
+func (s *Service) ListAuditPage(ctx context.Context, filter state.ManagementAuditFilter) ([]state.ManagementAudit, bool, error) {
+	return s.Store.ListManagementAuditPage(ctx, filter)
 }
 
 func (s *Service) ListAllAudit(ctx context.Context) ([]state.ManagementAudit, error) {
@@ -332,6 +342,43 @@ func (s *Service) checkImageStorageCapacity(size int64) error {
 	return s.checkCapacity(size, s.Options.AvailableImageStorageBytes, "image storage")
 }
 
+// reserveImageStorage serializes image-pool admission and accounts for
+// imports that have passed the capacity probe but have not finished writing.
+// The returned release function is idempotent and must be called after native
+// import (or when the operation claim is lost).
+func (s *Service) reserveImageStorage(size int64, required bool) (func(), error) {
+	if size < 0 {
+		return nil, errors.New("invalid_request: image size must not be negative")
+	}
+	if s.Options.AvailableImageStorageBytes == nil || s.Options.UploadMinimumFreeBytes <= 0 {
+		if required {
+			return nil, errors.New("capacity_unverified: image storage capacity is not configured")
+		}
+		return func() {}, nil
+	}
+	s.imageStorageMu.Lock()
+	defer s.imageStorageMu.Unlock()
+	available, err := s.Options.AvailableImageStorageBytes()
+	if err != nil {
+		return nil, errors.New("staging_capacity_low: image storage capacity could not be verified")
+	}
+	if available < 0 || size > math.MaxInt64-s.Options.UploadMinimumFreeBytes || s.imageStorageReserved > math.MaxInt64-size-s.Options.UploadMinimumFreeBytes || available < s.imageStorageReserved+size+s.Options.UploadMinimumFreeBytes {
+		return nil, errors.New("staging_capacity_low: image storage reserve is insufficient")
+	}
+	s.imageStorageReserved += size
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.imageStorageMu.Lock()
+			s.imageStorageReserved -= size
+			if s.imageStorageReserved < 0 {
+				s.imageStorageReserved = 0
+			}
+			s.imageStorageMu.Unlock()
+		})
+	}, nil
+}
+
 func (s *Service) checkCapacity(size int64, availableBytes func() (int64, error), resource string) error {
 	if availableBytes == nil || s.Options.UploadMinimumFreeBytes <= 0 {
 		return nil
@@ -350,58 +397,65 @@ func (s *Service) checkCapacity(size int64, availableBytes func() (int64, error)
 // immediately before it starts reading an HTTP body.
 func (s *Service) CheckStagingCapacity(size int64) error { return s.checkStagingCapacity(size) }
 
-func (s *Service) beginLocalImageUpload(ctx context.Context, operationID string) (*state.ManagementOperation, *ImportRequest, error) {
+func (s *Service) beginLocalImageUpload(ctx context.Context, operationID string) (*state.ManagementOperation, *ImportRequest, func(), error) {
 	operation, err := s.Store.GetManagementOperation(ctx, operationID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if operation == nil {
-		return nil, nil, errors.New("not_found: import operation does not exist")
+		return nil, nil, nil, errors.New("not_found: import operation does not exist")
 	}
 	if operation.Action != "image_import" {
-		return nil, nil, errors.New("invalid_request: operation is not an image import")
+		return nil, nil, nil, errors.New("invalid_request: operation is not an image import")
 	}
 	if operation.Status != "awaiting_upload" {
 		if operation.Status == "running" || operation.Status == "succeeded" || operation.Status == "failed" || operation.Status == "outcome_unknown" {
-			return operation, nil, nil
+			return operation, nil, nil, nil
 		}
-		return nil, nil, errors.New("operation_conflict: image upload has already been received")
+		return nil, nil, nil, errors.New("operation_conflict: image upload has already been received")
 	}
 	request, err := importRequestFromOperation(operation)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if request.Source.Kind != "local_upload" {
-		return nil, nil, errors.New("invalid_request: trusted imports do not accept upload content")
+		return nil, nil, nil, errors.New("invalid_request: trusted imports do not accept upload content")
 	}
 	declaredSize := request.Source.ExpectedSize
 	if request.Source.Format == "split" {
 		if request.Source.Metadata.ExpectedSize > math.MaxInt64-request.Source.Rootfs.ExpectedSize {
-			return nil, nil, errors.New("upload_too_large: declared image size overflows")
+			return nil, nil, nil, errors.New("upload_too_large: declared image size overflows")
 		}
 		declaredSize = request.Source.Metadata.ExpectedSize + request.Source.Rootfs.ExpectedSize
 	}
 	if err := s.checkStagingCapacity(declaredSize); err != nil {
-		return operation, nil, err
+		return operation, nil, nil, err
+	}
+	release, err := s.reserveImageStorage(declaredSize, false)
+	if err != nil {
+		return operation, nil, nil, err
 	}
 	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "awaiting_upload", "image_import", "running")
 	if err != nil {
-		return nil, nil, err
+		release()
+		return nil, nil, nil, err
 	}
 	if !claimed {
-		return running, nil, nil
+		release()
+		return running, nil, nil, nil
 	}
-	return running, &request, nil
+	return running, &request, release, nil
 }
 
 func (s *Service) UploadImageImport(ctx context.Context, operationID string, metadata, rootfs []byte) (*state.ManagementOperation, error) {
-	operation, request, err := s.beginLocalImageUpload(ctx, operationID)
+	operation, request, release, err := s.beginLocalImageUpload(ctx, operationID)
 	if err != nil {
 		return operation, err
 	}
 	if request == nil {
 		return operation, nil
 	}
+	defer release()
 	if request.Source.Format == "unified" {
 		if len(rootfs) != 0 || int64(len(metadata)) != request.Source.ExpectedSize {
 			return s.failImport(ctx, operation, "upload", "invalid_request", "uploaded bytes do not match the declared size", false)
@@ -432,13 +486,14 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 }
 
 func (s *Service) UploadImageImportFiles(ctx context.Context, operationID, metadataPath, rootfsPath string) (*state.ManagementOperation, error) {
-	operation, request, err := s.beginLocalImageUpload(ctx, operationID)
+	operation, request, release, err := s.beginLocalImageUpload(ctx, operationID)
 	if err != nil {
 		return operation, err
 	}
 	if request == nil {
 		return operation, nil
 	}
+	defer release()
 	if request.Source.Format == "unified" {
 		if rootfsPath != "" {
 			return s.failImport(ctx, operation, "upload", "invalid_request", "unified image import cannot include a rootfs", false)
@@ -587,17 +642,21 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 	if size <= 0 {
 		return operation, errors.New("capacity_unverified: trusted image size could not be verified")
 	}
-	if err := s.checkImageStorageCapacity(size); err != nil {
+	release, err := s.reserveImageStorage(size, true)
+	if err != nil {
 		return operation, err
 	}
 	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "queued", "image_import", "running")
 	if err != nil {
+		release()
 		return nil, err
 	}
 	if !claimed {
+		release()
 		return running, nil
 	}
 	operation = running
+	defer release()
 	artifact, err := s.Options.Backend.ImportTrusted(ctx, request.Source.SourceID, request.Source.ExpectedFingerprint)
 	if err != nil {
 		status := "failed"

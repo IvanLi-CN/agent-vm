@@ -322,6 +322,30 @@ func TestStagingCapacityChecksOnlyUnreadBytes(t *testing.T) {
 	}
 }
 
+func TestCleanupUploadStagingRemovesOnlyOwnedStaleFiles(t *testing.T) {
+	staging := filepath.Join(t.TempDir(), "staging")
+	if err := os.Mkdir(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(staging, ".agent-vm-upload-stale")
+	keep := filepath.Join(staging, "keep-me")
+	if err := os.WriteFile(stale, []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keep, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanupUploadStaging(staging); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("stale upload still exists: %v", err)
+	}
+	if value, err := os.ReadFile(keep); err != nil || string(value) != "keep" {
+		t.Fatalf("unrelated file changed: %q err=%v", value, err)
+	}
+}
+
 type chunkReader struct {
 	value []byte
 	chunk int

@@ -151,6 +151,34 @@ type ManagementAudit struct {
 	OccurredAt  string
 }
 
+// ManagementOperationFilter describes a bounded, database-backed operation
+// history page. Cursor fields use the same descending (created_at, id) order
+// exposed by the management API.
+type ManagementOperationFilter struct {
+	Status           string
+	Phase            string
+	Action           string
+	Actor            string
+	TargetID         string
+	Query            string
+	AfterCreatedAt   string
+	AfterOperationID string
+	Limit            int
+}
+
+// ManagementAuditFilter describes a bounded, database-backed audit page.
+type ManagementAuditFilter struct {
+	From            string
+	To              string
+	Actor           string
+	Action          string
+	OperationID     string
+	TargetID        string
+	AfterOccurredAt string
+	AfterEventID    string
+	Limit           int
+}
+
 type ImageReferenceError struct {
 	Counts  ImageReferenceCounts
 	Default bool
@@ -386,6 +414,36 @@ FROM managed_images i WHERE i.fingerprint = ?`, fingerprint)
 		return err
 	})
 	return value, err
+}
+
+// CachedImageUsable verifies the catalog state before a cached guest can be
+// resumed. Older unit fixtures may not have the management schema yet; those
+// stores retain the legacy behaviour while production stores always create the
+// catalog during startup.
+func (s *Store) CachedImageUsable(ctx context.Context, fingerprint string) (bool, error) {
+	usable := false
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		var table string
+		err := conn.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'managed_images'").Scan(&table)
+		if errors.Is(err, sql.ErrNoRows) {
+			usable = true
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var stateValue, integrity, suitability string
+		err = conn.QueryRowContext(ctx, "SELECT state, integrity, suitability FROM managed_images WHERE fingerprint = ?", fingerprint).Scan(&stateValue, &integrity, &suitability)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		usable = stateValue == "available" && integrity == "passed" && suitability == "passed"
+		return nil
+	})
+	return usable, err
 }
 
 func scanManagedImage(row scanner) (*ManagedImage, error) {
@@ -777,6 +835,76 @@ FROM management_operations ORDER BY created_at DESC, operation_id DESC LIMIT ?`,
 	return values, err
 }
 
+// ListManagementOperationsPage applies all public-history filters in SQLite
+// and reads at most limit+1 rows to determine whether another page exists.
+func (s *Store) ListManagementOperationsPage(ctx context.Context, filter ManagementOperationFilter) ([]ManagementOperation, bool, error) {
+	limit := filter.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	conditions := []string{}
+	args := []any{}
+	if filter.Status != "" {
+		conditions = append(conditions, "status = ?")
+		args = append(args, filter.Status)
+	}
+	if filter.Phase != "" {
+		conditions = append(conditions, "phase = ?")
+		args = append(args, filter.Phase)
+	}
+	if filter.Action != "" {
+		conditions = append(conditions, "action = ?")
+		args = append(args, filter.Action)
+	}
+	if filter.Actor != "" {
+		conditions = append(conditions, "actor = ?")
+		args = append(args, filter.Actor)
+	}
+	if filter.TargetID != "" {
+		conditions = append(conditions, "target_id = ?")
+		args = append(args, filter.TargetID)
+	}
+	if filter.Query != "" {
+		conditions = append(conditions, "instr(lower(action || ' ' || status || ' ' || target_id || ' ' || actor || ' ' || reason), lower(?)) > 0")
+		args = append(args, filter.Query)
+	}
+	if filter.AfterCreatedAt != "" || filter.AfterOperationID != "" {
+		conditions = append(conditions, "(created_at < ? OR (created_at = ? AND operation_id < ?))")
+		args = append(args, filter.AfterCreatedAt, filter.AfterCreatedAt, filter.AfterOperationID)
+	}
+	query := `SELECT operation_id, action, target_kind, target_id, actor, reason, phase, status, request_json, result_json, error_json, created_at, updated_at
+FROM management_operations`
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY created_at DESC, operation_id DESC LIMIT ?"
+	args = append(args, limit+1)
+	values := make([]ManagementOperation, 0, limit)
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			value, err := scanManagementOperationRow(rows)
+			if err != nil {
+				return err
+			}
+			values = append(values, *value)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	hasMore := len(values) > limit
+	if hasMore {
+		values = values[:limit]
+	}
+	return values, hasMore, nil
+}
+
 // ListAllManagementOperations is reserved for resident recovery. Public API
 // reads stay bounded; startup recovery must inspect every durable operation.
 func (s *Store) ListAllManagementOperations(ctx context.Context) ([]ManagementOperation, error) {
@@ -955,6 +1083,98 @@ FROM management_audit ORDER BY occurred_at DESC, event_id DESC LIMIT ?`, limit)
 		return rows.Err()
 	})
 	return values, err
+}
+
+// ListManagementAuditPage applies all public audit filters in SQLite and
+// reads at most limit+1 rows to determine whether another page exists.
+func (s *Store) ListManagementAuditPage(ctx context.Context, filter ManagementAuditFilter) ([]ManagementAudit, bool, error) {
+	limit := filter.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	conditions := []string{}
+	args := []any{}
+	if filter.From != "" {
+		conditions = append(conditions, "occurred_at >= ?")
+		args = append(args, filter.From)
+	}
+	if filter.To != "" {
+		conditions = append(conditions, "occurred_at < ?")
+		args = append(args, filter.To)
+	}
+	if filter.Actor != "" {
+		conditions = append(conditions, "actor = ?")
+		args = append(args, filter.Actor)
+	}
+	if filter.Action != "" {
+		conditions = append(conditions, "action = ?")
+		args = append(args, filter.Action)
+	}
+	if filter.OperationID != "" {
+		conditions = append(conditions, "operation_id = ?")
+		args = append(args, filter.OperationID)
+	}
+	if filter.TargetID != "" {
+		conditions = append(conditions, "json_extract(target_json, '$.id') = ?")
+		args = append(args, filter.TargetID)
+	}
+	if filter.AfterOccurredAt != "" || filter.AfterEventID != "" {
+		conditions = append(conditions, "(occurred_at < ? OR (occurred_at = ? AND event_id < ?))")
+		args = append(args, filter.AfterOccurredAt, filter.AfterOccurredAt, filter.AfterEventID)
+	}
+	query := `SELECT event_id, operation_id, action, actor, reason, target_json, outcome, phase, detail_json, occurred_at
+FROM management_audit`
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY occurred_at DESC, event_id DESC LIMIT ?"
+	args = append(args, limit+1)
+	values := make([]ManagementAudit, 0, limit)
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			value, err := scanManagementAuditRow(rows)
+			if err != nil {
+				return err
+			}
+			values = append(values, value)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	hasMore := len(values) > limit
+	if hasMore {
+		values = values[:limit]
+	}
+	return values, hasMore, nil
+}
+
+func scanManagementAuditRow(row scanner) (ManagementAudit, error) {
+	var value ManagementAudit
+	var operationID sql.NullString
+	var target, detail sql.NullString
+	if err := row.Scan(&value.EventID, &operationID, &value.Action, &value.Actor, &value.Reason, &target, &value.Outcome, &value.Phase, &detail, &value.OccurredAt); err != nil {
+		return ManagementAudit{}, err
+	}
+	value.OperationID = nullableString(operationID)
+	if !target.Valid {
+		return ManagementAudit{}, errors.New("management audit target is null")
+	}
+	if err := json.Unmarshal([]byte(target.String), &value.Target); err != nil {
+		return ManagementAudit{}, err
+	}
+	if detail.Valid && detail.String != "" {
+		if err := json.Unmarshal([]byte(detail.String), &value.Detail); err != nil {
+			return ManagementAudit{}, err
+		}
+	}
+	return value, nil
 }
 
 // ListAllManagementAudit is used by the API boundary before applying its

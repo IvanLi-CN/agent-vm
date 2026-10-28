@@ -1008,6 +1008,14 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if task.State != stateCached {
 			return nil, protocol.NewError("task_transition", "session slot is not available until reconciliation completes", map[string]any{"state": task.State})
 		}
+		if usable, imageErr := s.Store.CachedImageUsable(ctx, task.ImageFingerprint); imageErr != nil {
+			return nil, s.sqliteError(imageErr)
+		} else if !usable {
+			return nil, protocol.NewError("cache_stale", "cached image is no longer verified", map[string]any{
+				"cached_image_fingerprint": task.ImageFingerprint,
+				"outcome_verified":         true,
+			})
+		}
 		if s.Guest != nil {
 			if err := s.verifyCachedGuest(ctx, task); err != nil {
 				return nil, err

@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -263,6 +264,52 @@ func (c *IncusClient) QueryRemoteImageSize(ctx context.Context, sourceID, finger
 		return 0, errors.New("Incus remote image response has no usable size")
 	}
 	return info.SizeBytes, nil
+}
+
+// StoragePoolAvailableBytes reads the Incus pool resource endpoint instead of
+// the control host filesystem. Image imports and VM disks may use a different
+// backing filesystem, so host statfs is not a safe admission signal.
+func (c *IncusClient) StoragePoolAvailableBytes(ctx context.Context) (int64, error) {
+	if c == nil || c.Pool == "" {
+		return 0, errors.New("storage pool is not configured")
+	}
+	value, err := c.json(ctx, "query", "/1.0/storage-pools/"+url.PathEscape(c.Pool)+"/resources")
+	if err != nil {
+		return 0, err
+	}
+	for _, candidate := range []map[string]any{value, nestedMap(value, "space"), nestedMap(value, "resources")} {
+		for _, key := range []string{"space_available", "available_bytes", "available"} {
+			if bytes, ok := integerValue(candidate[key]); ok && bytes >= 0 {
+				return bytes, nil
+			}
+		}
+	}
+	return 0, errors.New("incus storage pool response has no available capacity")
+}
+
+func nestedMap(value map[string]any, key string) map[string]any {
+	if nested, ok := value[key].(map[string]any); ok {
+		return nested
+	}
+	return nil
+}
+
+func integerValue(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		if typed < 0 || typed > float64(^uint64(0)>>1) || typed != float64(int64(typed)) {
+			return 0, false
+		}
+		return int64(typed), true
+	case json.Number:
+		parsed, err := typed.Int64()
+		return parsed, err == nil
+	case string:
+		parsed, err := strconv.ParseInt(typed, 10, 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func (c *IncusClient) ImportImage(ctx context.Context, stagingPath, format string, metadata, rootfs []byte) (string, error) {
@@ -617,7 +664,7 @@ func validatePrivateStagingDirectory(path string) error {
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 || !ownedByCurrentUser(info) {
 		return errors.New("image staging path is not a private directory")
 	}
 	return nil
@@ -638,10 +685,15 @@ func validatePrivateStagedFile(stagingPath, path string) error {
 	if err != nil {
 		return err
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || !ownedByCurrentUser(info) {
 		return errors.New("image staging file is not private")
 	}
 	return nil
+}
+
+func ownedByCurrentUser(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && uint64(stat.Uid) == uint64(os.Getuid())
 }
 
 func writePrivateImageFile(path string, data []byte) error {

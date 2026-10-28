@@ -147,6 +147,31 @@ printf '{"fingerprint":"%s","architecture":"x86_64","type":"container","size":40
 	}
 }
 
+func TestIncusStoragePoolAvailableBytesUsesPoolResources(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "incus-argv")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$INCUS_ARGV_LOG\"\nprintf '%s\\n' '{\"space\":{\"space_available\":8192}}'\n"
+	if err := os.WriteFile(filepath.Join(binDir, "incus"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("INCUS_ARGV_LOG", logPath)
+	client := NewIncusClient(NewRunner(), "agents", ClientOptions{Pool: "managed-pool"})
+	available, err := client.StoragePoolAvailableBytes(context.Background())
+	if err != nil || available != 8192 {
+		t.Fatalf("available=%d err=%v", available, err)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	want := []string{"query", "/1.0/storage-pools/managed-pool/resources?project=agents"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("incus argv = %#v, want %#v", got, want)
+	}
+}
+
 func TestIncusVerificationInitDisablesProfilesAndNetwork(t *testing.T) {
 	binDir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "incus-argv")
