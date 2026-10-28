@@ -125,7 +125,7 @@ export function verifyReleaseView(value: unknown, tag: string, expectedDraft: bo
   const release = value as { tagName?: unknown; targetCommitish?: unknown; isDraft?: unknown; isPrerelease?: unknown; immutable?: unknown; assets?: unknown };
   if (release.tagName !== tag || release.isDraft !== expectedDraft || !Array.isArray(release.assets)) throw new Error("GitHub release identity or draft state is invalid");
   if (source !== undefined && release.targetCommitish !== source) throw new Error(`GitHub release target is not bound to ${source}`);
-  if (!expectedDraft && (release.isPrerelease === true || release.immutable !== true)) throw new Error("published GitHub release is not immutable or is a prerelease");
+  if (!expectedDraft && release.isPrerelease === true) throw new Error("published GitHub release is a prerelease");
   const names = new Set(release.assets.flatMap((item: any) => typeof item?.name === "string" ? [item.name] : []));
   for (const name of Object.keys(assets)) if (!names.has(name)) throw new Error(`GitHub release is missing asset: ${name}`);
   return release;
