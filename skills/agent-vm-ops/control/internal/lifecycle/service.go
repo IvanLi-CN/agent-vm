@@ -2245,18 +2245,18 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 	if err != nil {
 		return nil, err
 	}
+	if requestBool(request, "live_memory") && (request["cpu"] != nil || request["disk_gib"] != nil) {
+		return nil, protocol.NewError("invalid_request", "live resize requires memory only", nil)
+	}
+	if requestBool(request, "live_memory") && request["memory_mib"] == nil {
+		return nil, protocol.NewError("invalid_request", "live resize requires memory_mib", nil)
+	}
 	if err := s.checkAdmission(ctx, target, task.TaskID, false); err != nil {
 		return nil, err
 	}
 	reservationBytes, err := s.admissionStorageCost(ctx, task.TaskID, target, false)
 	if err != nil {
 		return nil, err
-	}
-	if requestBool(request, "live_memory") && (request["cpu"] != nil || request["disk_gib"] != nil) {
-		return nil, protocol.NewError("invalid_request", "live resize requires memory only", nil)
-	}
-	if requestBool(request, "live_memory") && request["memory_mib"] == nil {
-		return nil, protocol.NewError("invalid_request", "live resize requires memory_mib", nil)
 	}
 	reservationJSON := mustJSON(target)
 	reservationNow := s.Clock()
@@ -2905,7 +2905,14 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 					defaultReasons = append(defaultReasons, map[string]any{"code": "resource_insufficient", "dimensions": []string{"instances"}, "requested": 1, "remaining": instanceRemaining})
 				}
 			}
-			instances := map[string]any{"verified": len(unknownTaskStates) == 0, "source": "durable_state", "native_verified": false, "total": len(tasks), "limits": map[string]any{}, "admission": map[string]any{"allocated": admissionInstances - states[statePreparing], "reserved": states[statePreparing], "allocated_and_reserved": admissionInstances, "remaining": instanceRemaining, "limit": instanceLimit, "capacity": nil}}
+			instanceAdmission := map[string]any{"allocated": admissionInstances - states[statePreparing], "reserved": states[statePreparing], "allocated_and_reserved": admissionInstances, "remaining": instanceRemaining, "limit": instanceLimit, "capacity": nil}
+			if len(unknownTaskStates) > 0 {
+				instanceAdmission["allocated"] = nil
+				instanceAdmission["reserved"] = nil
+				instanceAdmission["allocated_and_reserved"] = nil
+				instanceAdmission["remaining"] = nil
+			}
+			instances := map[string]any{"verified": len(unknownTaskStates) == 0, "source": "durable_state", "native_verified": false, "total": len(tasks), "limits": map[string]any{}, "admission": instanceAdmission}
 			defaultReady := consistent && len(defaultReasons) == 0
 			admissionReady := s.Ready() && nativeUp && defaultReady
 			doctorIssues := []any{}
@@ -4171,6 +4178,7 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 		}
 		return tasks[left].TaskID < tasks[right].TaskID
 	})
+	reclaimedAny := false
 	for _, task := range tasks {
 		if task.TaskID == excludeTaskID || task.State != stateCached {
 			continue
@@ -4210,6 +4218,7 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 		if releaseErr != nil {
 			return false, releaseErr
 		}
+		reclaimedAny = true
 		admission, admissionErr := s.diskAdmission(ctx, excludeTaskID)
 		if admissionErr != nil {
 			return false, admissionErr
@@ -4225,7 +4234,26 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 			return true, nil
 		}
 	}
-	return false, nil
+	// Reclamation aims for the target watermark while candidates remain, but
+	// admission after the candidate set is exhausted only requires the low
+	// watermark (plus any caller-specific minimum). This mirrors the legacy
+	// controller's reclaim contract and lets a successful low-floor reclaim
+	// satisfy the current request without claiming that the target was reached.
+	if !reclaimedAny {
+		return false, nil
+	}
+	admission, admissionErr := s.diskAdmission(ctx, excludeTaskID)
+	if admissionErr != nil {
+		return false, admissionErr
+	}
+	sufficient, sufficientErr := s.diskAdmissionSufficientWithFloor(ctx, admission, requestCost, excludeTaskID, minimumFreeBytes)
+	if sufficientErr != nil {
+		if protocol.AsError(sufficientErr).Code == "resource_insufficient" {
+			return false, nil
+		}
+		return false, sufficientErr
+	}
+	return sufficient, nil
 }
 
 func (s *Service) admissionStorageCost(ctx context.Context, excludeTaskID string, requested map[string]int64, startup bool) (int64, error) {

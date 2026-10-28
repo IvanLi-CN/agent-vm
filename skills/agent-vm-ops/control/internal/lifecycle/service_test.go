@@ -639,6 +639,57 @@ func TestFailedDiskResizeRetainsPhysicalCostReservation(t *testing.T) {
 	}
 }
 
+func TestInvalidLiveResizeDoesNotReclaimCachedCapacity(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 29, 0, 0, 0, 0, time.UTC)
+	lease := now.Add(time.Hour).Format(time.RFC3339Nano)
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "invalid-live-task", SessionID: "invalid-live-session", Generation: 1, State: stateActive,
+		InstanceName: "agent-invalid-live", LeaseExpiresAt: &lease, CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "invalid-live-cache", SessionID: "invalid-live-cache-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-invalid-live-cache", InactiveSince: stringPointer(nowString(now)), CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const gib = int64(1024 * 1024 * 1024)
+	cfg := config.Defaults()
+	cfg.DiskLowBytes = 20 * gib
+	cfg.DiskTargetBytes = 30 * gib
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{
+			status: "Stopped",
+			config: map[string]any{
+				"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "invalid-live-cache", "user.agent-vm.session": "invalid-live-cache-session", "user.agent-vm.generation": "1"},
+				"devices": map[string]any{}, "expanded_devices": map[string]any{},
+			},
+		},
+		capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 10 * gib},
+	}
+	service := New(store, cfg, Options{Guest: guest, Resident: true, Clock: func() time.Time { return now }})
+	_, err = service.resize(ctx, protocol.Request{"session_id": "invalid-live-session", "generation": int64(1), "live_memory": true, "memory_mib": int64(8192), "disk_gib": int64(30)})
+	control := protocol.AsError(err)
+	if control == nil || control.Code != "invalid_request" {
+		t.Fatalf("invalid live resize error = %#v", control)
+	}
+	if guest.deleteCalls != 0 {
+		t.Fatalf("invalid live resize reclaimed %d cached guests", guest.deleteCalls)
+	}
+	if task, getErr := store.GetTask(ctx, map[string]any{"task_id": "invalid-live-cache"}); getErr != nil || task == nil {
+		t.Fatalf("invalid live resize cache = %#v err=%v", task, getErr)
+	}
+}
+
 func TestSuccessfulDiskResizeClearsPhysicalCostReservation(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -1327,11 +1378,14 @@ func TestReclaimCachedCapacityReachesTargetWatermark(t *testing.T) {
 	if reclaimErr != nil {
 		t.Fatal(reclaimErr)
 	}
-	if reclaimed {
-		t.Fatalf("reclaim reported target watermark reached at low-watermark headroom")
+	if !reclaimed {
+		t.Fatalf("reclaim did not report low-watermark admission after candidate exhaustion")
 	}
 	if guest.deleteCalls != 1 {
 		t.Fatalf("cached delete calls = %d", guest.deleteCalls)
+	}
+	if guest.capacityCalls < 2 {
+		t.Fatalf("reclaim stopped before checking the target watermark: capacity calls = %d", guest.capacityCalls)
 	}
 }
 
@@ -1544,8 +1598,10 @@ func TestAdminMetricsMatchesAdmissionForUnknownState(t *testing.T) {
 		t.Fatalf("unknown state instance verification = %#v", metrics["instances"])
 	}
 	instances := metrics["instances"].(map[string]any)["admission"].(map[string]any)
-	if instances["allocated_and_reserved"] != int64(1) {
-		t.Fatalf("unknown state instance admission = %#v", instances)
+	for _, key := range []string{"allocated", "reserved", "allocated_and_reserved", "remaining"} {
+		if instances[key] != nil {
+			t.Fatalf("unknown state instance %s = %#v", key, instances[key])
+		}
 	}
 	resources := metrics["resources"].(map[string]any)
 	for _, key := range []string{"allocated", "reserved", "allocated_and_reserved"} {

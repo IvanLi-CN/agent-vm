@@ -144,6 +144,35 @@ func TestSnapshotMetricsPreserveMemoryOOMEvidenceAndSlotEstimates(t *testing.T) 
 	}
 }
 
+func TestSnapshotMetricsOmitUnverifiedInstanceTotals(t *testing.T) {
+	metrics := snapshotMetrics("capacity", map[string]any{
+		"up": true,
+		"instances": map[string]any{
+			"verified": false,
+			"admission": map[string]any{
+				"allocated":              nil,
+				"reserved":               nil,
+				"allocated_and_reserved": nil,
+				"remaining":              nil,
+				"limit":                  int64(10),
+			},
+		},
+	})
+	for _, metric := range []string{
+		"agent_vm_admission_instances_allocated_count",
+		"agent_vm_admission_instances_reserved_count",
+		"agent_vm_admission_instances_allocated_and_reserved_count",
+		"agent_vm_admission_instances_remaining_count",
+	} {
+		if _, exists := metrics[metric]; exists {
+			t.Fatalf("unverified instance metric %s = %q", metric, metrics[metric])
+		}
+	}
+	if metrics["agent_vm_admission_instances_limit_count"] != "agent_vm_admission_instances_limit_count 10" {
+		t.Fatalf("authoritative instance limit = %q", metrics["agent_vm_admission_instances_limit_count"])
+	}
+}
+
 func TestSnapshotMetricsOmitSlotEstimatesForUnverifiedRemaining(t *testing.T) {
 	metrics := snapshotMetrics("capacity", map[string]any{
 		"up":        true,

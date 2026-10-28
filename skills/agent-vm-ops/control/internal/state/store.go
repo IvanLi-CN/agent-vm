@@ -178,11 +178,14 @@ type AuditSummary struct {
 }
 
 type Store struct {
-	path             string
-	write            *sql.DB
-	reads            [2]*sql.DB
-	readIndex        atomic.Uint32
-	imageSelectionMu sync.Mutex
+	path              string
+	write             *sql.DB
+	reads             [2]*sql.DB
+	readIndex         atomic.Uint32
+	imageSelectionMu  sync.Mutex
+	auditSummaryMu    sync.Mutex
+	auditSummary      AuditSummary
+	auditSummaryReady bool
 }
 
 type Tx struct {
@@ -1162,13 +1165,34 @@ func (s *Store) Audit(ctx context.Context, action, taskID, sessionID, outcome st
 	if err != nil {
 		return err
 	}
-	return s.withWrite(ctx, func(tx *Tx) error {
+	s.auditSummaryMu.Lock()
+	defer s.auditSummaryMu.Unlock()
+	err = s.withWrite(ctx, func(tx *Tx) error {
 		_, err := tx.exec("INSERT INTO audit(action, task_id, session_id, generation, outcome, detail_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)", action, nullableStringArg(stringPointerIfNonEmpty(taskID)), nullableStringArg(stringPointerIfNonEmpty(sessionID)), nullableIntArg(generation), outcome, string(raw), time.Now().UTC().Format(time.RFC3339))
 		return err
 	})
+	if err != nil {
+		s.auditSummaryReady = false
+		return err
+	}
+	if s.auditSummaryReady {
+		var parsed any
+		decoder := json.NewDecoder(strings.NewReader(string(raw)))
+		decoder.UseNumber()
+		if decodeErr := decoder.Decode(&parsed); decodeErr != nil {
+			parsed = nil
+		}
+		addAuditSummary(&s.auditSummary, action, outcome, auditPhase(parsed), parsed, string(raw))
+	}
+	return nil
 }
 
 func (s *Store) AuditSummary(ctx context.Context) (AuditSummary, error) {
+	s.auditSummaryMu.Lock()
+	defer s.auditSummaryMu.Unlock()
+	if s.auditSummaryReady {
+		return cloneAuditSummary(s.auditSummary), nil
+	}
 	result := AuditSummary{
 		Operations:          map[string]int64{},
 		ImageUnpackFailures: map[string]int64{},
@@ -1228,7 +1252,31 @@ func (s *Store) AuditSummary(ctx context.Context) (AuditSummary, error) {
 		}
 		return managementRows.Err()
 	})
-	return result, err
+	if err != nil {
+		s.auditSummaryReady = false
+		return AuditSummary{}, err
+	}
+	s.auditSummary = cloneAuditSummary(result)
+	s.auditSummaryReady = true
+	return cloneAuditSummary(result), nil
+}
+
+func cloneAuditSummary(summary AuditSummary) AuditSummary {
+	clone := AuditSummary{
+		Operations:          make(map[string]int64, len(summary.Operations)),
+		ImageUnpackFailures: make(map[string]int64, len(summary.ImageUnpackFailures)),
+		Warnings:            make(map[string]int64, len(summary.Warnings)),
+	}
+	for key, value := range summary.Operations {
+		clone.Operations[key] = value
+	}
+	for key, value := range summary.ImageUnpackFailures {
+		clone.ImageUnpackFailures[key] = value
+	}
+	for key, value := range summary.Warnings {
+		clone.Warnings[key] = value
+	}
+	return clone
 }
 
 func addAuditSummary(result *AuditSummary, action, outcome, phase string, detail any, raw string) {

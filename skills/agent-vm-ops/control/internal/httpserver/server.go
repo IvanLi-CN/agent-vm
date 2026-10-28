@@ -144,7 +144,7 @@ func writeError(c *gin.Context, err error, request protocol.Request) {
 		}
 	case "draining", "operation_conflict", "operation_incomplete", "generation_mismatch", "lease_expired", "task_missing", "task_not_active", "task_transition", "cache_ineligible", "resource_insufficient":
 		status = http.StatusConflict
-	case "startup_reconcile_required", "state_unverified", "sqlite_unavailable", "observation_unavailable", "resource_unverified", "resource_pressure", "mapping_unverified", "ownership_mismatch", "guest_host_key_missing":
+	case "startup_reconcile_required", "state_unverified", "sqlite_unavailable", "observation_unavailable", "resource_unverified", "resource_pressure", "mapping_unverified", "ownership_mismatch", "guest_host_key_missing", "watermarks_unreachable":
 		status = http.StatusServiceUnavailable
 	case "internal_error":
 		exitCode = 3
