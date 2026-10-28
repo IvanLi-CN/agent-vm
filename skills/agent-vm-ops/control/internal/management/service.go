@@ -9,7 +9,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -33,21 +35,30 @@ type Service struct {
 const operationFinalizeTimeout = 30 * time.Second
 
 type Options struct {
-	TrustedImageSourceIDs  []string
-	SupportedArchitectures []string
-	UploadMaxBytes         int64
-	UploadMinimumFreeBytes int64
-	AvailableStagingBytes  func() (int64, error)
-	CurrentSystemVersion   func(context.Context) (string, error)
-	Clock                  func() time.Time
-	Backend                ImageBackend
-	Actions                ActionBackend
+	TrustedImageSourceIDs      []string
+	SupportedArchitectures     []string
+	UploadMaxBytes             int64
+	UploadMinimumFreeBytes     int64
+	AvailableStagingBytes      func() (int64, error)
+	AvailableImageStorageBytes func() (int64, error)
+	CurrentSystemVersion       func(context.Context) (string, error)
+	Clock                      func() time.Time
+	Backend                    ImageBackend
+	Actions                    ActionBackend
 }
 
 type ImageBackend interface {
 	ImportTrusted(context.Context, string, string) (ImageArtifact, error)
 	ImportLocal(context.Context, string, []byte, []byte) (ImageArtifact, error)
 	DeleteImage(context.Context, string) error
+}
+
+type TrustedImportSizer interface {
+	TrustedImportSize(context.Context, string, string) (int64, error)
+}
+
+type LocalFileImageBackend interface {
+	ImportLocalFiles(context.Context, string, string, string) (ImageArtifact, error)
 }
 
 type ImageArtifact struct {
@@ -311,15 +322,26 @@ func validatePart(expectedSHA string, expectedSize, maximum int64) error {
 }
 
 func (s *Service) checkStagingCapacity(size int64) error {
-	if s.Options.AvailableStagingBytes == nil || s.Options.UploadMinimumFreeBytes <= 0 {
+	return s.checkCapacity(size, s.Options.AvailableStagingBytes, "staging")
+}
+
+func (s *Service) checkImageStorageCapacity(size int64) error {
+	if s.Options.AvailableImageStorageBytes == nil || s.Options.UploadMinimumFreeBytes <= 0 {
+		return errors.New("capacity_unverified: image storage capacity is not configured")
+	}
+	return s.checkCapacity(size, s.Options.AvailableImageStorageBytes, "image storage")
+}
+
+func (s *Service) checkCapacity(size int64, availableBytes func() (int64, error), resource string) error {
+	if availableBytes == nil || s.Options.UploadMinimumFreeBytes <= 0 {
 		return nil
 	}
-	available, err := s.Options.AvailableStagingBytes()
+	available, err := availableBytes()
 	if err != nil {
-		return errors.New("staging_capacity_low: staging capacity could not be verified")
+		return fmt.Errorf("staging_capacity_low: %s capacity could not be verified", resource)
 	}
 	if available < 0 || size > math.MaxInt64-s.Options.UploadMinimumFreeBytes || available < size+s.Options.UploadMinimumFreeBytes {
-		return errors.New("staging_capacity_low: staging reserve is insufficient")
+		return fmt.Errorf("staging_capacity_low: %s reserve is insufficient", resource)
 	}
 	return nil
 }
@@ -328,47 +350,57 @@ func (s *Service) checkStagingCapacity(size int64) error {
 // immediately before it starts reading an HTTP body.
 func (s *Service) CheckStagingCapacity(size int64) error { return s.checkStagingCapacity(size) }
 
-func (s *Service) UploadImageImport(ctx context.Context, operationID string, metadata, rootfs []byte) (*state.ManagementOperation, error) {
+func (s *Service) beginLocalImageUpload(ctx context.Context, operationID string) (*state.ManagementOperation, *ImportRequest, error) {
 	operation, err := s.Store.GetManagementOperation(ctx, operationID)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if operation == nil {
-		return nil, errors.New("not_found: import operation does not exist")
+		return nil, nil, errors.New("not_found: import operation does not exist")
 	}
 	if operation.Action != "image_import" {
-		return nil, errors.New("invalid_request: operation is not an image import")
+		return nil, nil, errors.New("invalid_request: operation is not an image import")
 	}
 	if operation.Status != "awaiting_upload" {
 		if operation.Status == "running" || operation.Status == "succeeded" || operation.Status == "failed" || operation.Status == "outcome_unknown" {
-			return operation, nil
+			return operation, nil, nil
 		}
-		return nil, errors.New("operation_conflict: image upload has already been received")
+		return nil, nil, errors.New("operation_conflict: image upload has already been received")
 	}
 	request, err := importRequestFromOperation(operation)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if request.Source.Kind != "local_upload" {
-		return nil, errors.New("invalid_request: trusted imports do not accept upload content")
+		return nil, nil, errors.New("invalid_request: trusted imports do not accept upload content")
 	}
 	declaredSize := request.Source.ExpectedSize
 	if request.Source.Format == "split" {
 		if request.Source.Metadata.ExpectedSize > math.MaxInt64-request.Source.Rootfs.ExpectedSize {
-			return nil, errors.New("upload_too_large: declared image size overflows")
+			return nil, nil, errors.New("upload_too_large: declared image size overflows")
 		}
 		declaredSize = request.Source.Metadata.ExpectedSize + request.Source.Rootfs.ExpectedSize
 	}
+	if err := s.checkStagingCapacity(declaredSize); err != nil {
+		return operation, nil, err
+	}
 	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "awaiting_upload", "image_import", "running")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !claimed {
-		return running, nil
+		return running, nil, nil
 	}
-	operation = running
-	if err := s.checkStagingCapacity(declaredSize); err != nil {
-		return s.failImport(ctx, operation, "upload", safeCode(strings.SplitN(err.Error(), ":", 2)[0]), err.Error(), false)
+	return running, &request, nil
+}
+
+func (s *Service) UploadImageImport(ctx context.Context, operationID string, metadata, rootfs []byte) (*state.ManagementOperation, error) {
+	operation, request, err := s.beginLocalImageUpload(ctx, operationID)
+	if err != nil {
+		return operation, err
+	}
+	if request == nil {
+		return operation, nil
 	}
 	if request.Source.Format == "unified" {
 		if len(rootfs) != 0 || int64(len(metadata)) != request.Source.ExpectedSize {
@@ -396,7 +428,101 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 		}
 		return s.finishOperation(ctx, operation, "reconciliation", status, nil, safeError(err))
 	}
-	return s.finishImport(ctx, operation, request, artifact)
+	return s.finishImport(ctx, operation, *request, artifact)
+}
+
+func (s *Service) UploadImageImportFiles(ctx context.Context, operationID, metadataPath, rootfsPath string) (*state.ManagementOperation, error) {
+	operation, request, err := s.beginLocalImageUpload(ctx, operationID)
+	if err != nil {
+		return operation, err
+	}
+	if request == nil {
+		return operation, nil
+	}
+	if request.Source.Format == "unified" {
+		if rootfsPath != "" {
+			return s.failImport(ctx, operation, "upload", "invalid_request", "unified image import cannot include a rootfs", false)
+		}
+		if err := validateImportFile(metadataPath, request.Source.ExpectedSize, request.Source.ExpectedSHA256); err != nil {
+			code := "invalid_request"
+			phase := "upload"
+			if strings.Contains(err.Error(), "fingerprint_mismatch") {
+				code = "fingerprint_mismatch"
+				phase = "integrity_check"
+			}
+			return s.failImport(ctx, operation, phase, code, "uploaded bytes failed validation", false)
+		}
+	} else {
+		if err := validateImportFile(metadataPath, request.Source.Metadata.ExpectedSize, request.Source.Metadata.ExpectedSHA256); err != nil {
+			code := "invalid_request"
+			phase := "upload"
+			if strings.Contains(err.Error(), "fingerprint_mismatch") {
+				code = "fingerprint_mismatch"
+				phase = "integrity_check"
+			}
+			return s.failImport(ctx, operation, phase, code, "uploaded metadata failed validation", false)
+		}
+		if err := validateImportFile(rootfsPath, request.Source.Rootfs.ExpectedSize, request.Source.Rootfs.ExpectedSHA256); err != nil {
+			code := "invalid_request"
+			phase := "upload"
+			if strings.Contains(err.Error(), "fingerprint_mismatch") {
+				code = "fingerprint_mismatch"
+				phase = "integrity_check"
+			}
+			return s.failImport(ctx, operation, phase, code, "uploaded rootfs failed validation", false)
+		}
+	}
+	if s.Options.Backend == nil {
+		return s.failImport(ctx, operation, "image_import", "internal_error", "no image backend is configured", true)
+	}
+	var artifact ImageArtifact
+	if backend, ok := s.Options.Backend.(LocalFileImageBackend); ok {
+		artifact, err = backend.ImportLocalFiles(ctx, request.Source.Format, metadataPath, rootfsPath)
+	} else {
+		metadata, readErr := os.ReadFile(metadataPath)
+		if readErr != nil {
+			return s.failImport(ctx, operation, "image_import", "internal_error", "staged metadata could not be read", true)
+		}
+		rootfs := []byte(nil)
+		if rootfsPath != "" {
+			rootfs, readErr = os.ReadFile(rootfsPath)
+			if readErr != nil {
+				return s.failImport(ctx, operation, "image_import", "internal_error", "staged rootfs could not be read", true)
+			}
+		}
+		artifact, err = s.Options.Backend.ImportLocal(ctx, request.Source.Format, metadata, rootfs)
+	}
+	if err != nil {
+		status := "failed"
+		if isUncertain(err) {
+			status = "outcome_unknown"
+		}
+		return s.finishOperation(ctx, operation, "reconciliation", status, nil, safeError(err))
+	}
+	return s.finishImport(ctx, operation, *request, artifact)
+}
+
+func validateImportFile(path string, expectedSize int64, expectedDigest string) error {
+	if path == "" {
+		return errors.New("invalid_request: staged upload file is missing")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return errors.New("invalid_request: staged upload file is unavailable")
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() != expectedSize {
+		return errors.New("invalid_request: uploaded bytes do not match the declared size")
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return errors.New("invalid_request: staged upload file could not be read")
+	}
+	if hex.EncodeToString(hash.Sum(nil)) != expectedDigest {
+		return errors.New("fingerprint_mismatch: uploaded bytes do not match the declared digest")
+	}
+	return nil
 }
 
 // FailImageImportUpload durably closes an upload operation when the HTTP
@@ -449,6 +575,20 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 	}
 	if s.Options.Backend == nil {
 		return s.failImport(ctx, operation, "image_import", "internal_error", "no image backend is configured", true)
+	}
+	sizer, ok := s.Options.Backend.(TrustedImportSizer)
+	if !ok {
+		return operation, errors.New("capacity_unverified: trusted image size could not be verified")
+	}
+	size, err := sizer.TrustedImportSize(ctx, request.Source.SourceID, request.Source.ExpectedFingerprint)
+	if err != nil {
+		return operation, errors.New("capacity_unverified: trusted image size could not be verified")
+	}
+	if size <= 0 {
+		return operation, errors.New("capacity_unverified: trusted image size could not be verified")
+	}
+	if err := s.checkImageStorageCapacity(size); err != nil {
+		return operation, err
 	}
 	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "queued", "image_import", "running")
 	if err != nil {

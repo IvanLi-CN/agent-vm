@@ -48,6 +48,7 @@ type ImageInfo struct {
 	Fingerprint  string
 	Architecture string
 	InstanceType string
+	SizeBytes    int64
 	Properties   map[string]string
 }
 
@@ -243,6 +244,27 @@ func (c *IncusClient) CopyImage(ctx context.Context, sourceID, fingerprint strin
 	return nil
 }
 
+func (c *IncusClient) QueryRemoteImageSize(ctx context.Context, sourceID, fingerprint string) (int64, error) {
+	if !incusRemotePattern.MatchString(sourceID) {
+		return 0, errors.New("invalid image source ID")
+	}
+	if !imageFingerprintPattern.MatchString(fingerprint) {
+		return 0, errors.New("invalid image fingerprint")
+	}
+	value, err := c.json(ctx, "image", "info", sourceID+":"+fingerprint)
+	if err != nil {
+		return 0, err
+	}
+	info, err := parseImageInfo(value)
+	if err != nil {
+		return 0, err
+	}
+	if info.Fingerprint != fingerprint || info.SizeBytes <= 0 {
+		return 0, errors.New("Incus remote image response has no usable size")
+	}
+	return info.SizeBytes, nil
+}
+
 func (c *IncusClient) ImportImage(ctx context.Context, stagingPath, format string, metadata, rootfs []byte) (string, error) {
 	if format != "unified" && format != "split" {
 		return "", errors.New("invalid image format")
@@ -272,6 +294,40 @@ func (c *IncusClient) ImportImage(ctx context.Context, stagingPath, format strin
 		if err := writePrivateImageFile(rootfsPath, rootfs); err != nil {
 			return "", err
 		}
+		args = append(args, rootfsPath)
+	}
+	args = append(args, "local:")
+	result, err := c.command(ctx, args...)
+	if err != nil {
+		return "", &UncertainError{Cause: wrapCommandError(result, err)}
+	}
+	fingerprint, err := importedFingerprint(result.Stdout)
+	if err != nil {
+		return "", &UncertainError{Cause: err}
+	}
+	return fingerprint, nil
+}
+
+func (c *IncusClient) ImportImageFiles(ctx context.Context, stagingPath, format, metadataPath, rootfsPath string) (string, error) {
+	if format != "unified" && format != "split" {
+		return "", errors.New("invalid image format")
+	}
+	if format == "unified" && rootfsPath != "" {
+		return "", errors.New("unified image import cannot include a rootfs")
+	}
+	if format == "split" && rootfsPath == "" {
+		return "", errors.New("split image import requires a rootfs")
+	}
+	if err := validatePrivateStagedFile(stagingPath, metadataPath); err != nil {
+		return "", err
+	}
+	if format == "split" {
+		if err := validatePrivateStagedFile(stagingPath, rootfsPath); err != nil {
+			return "", err
+		}
+	}
+	args := []string{"image", "import", metadataPath}
+	if format == "split" {
 		args = append(args, rootfsPath)
 	}
 	args = append(args, "local:")
@@ -547,17 +603,45 @@ if [ "$missing" = true ]; then guest_ready=false; fi
 printf 'guest_ready=%s\n' "$guest_ready"`
 
 func createImageStagingDirectory(path string) (string, error) {
+	if err := validatePrivateStagingDirectory(path); err != nil {
+		return "", err
+	}
+	return os.MkdirTemp(path, ".agent-vm-image-import-")
+}
+
+func validatePrivateStagingDirectory(path string) error {
 	if path == "" || !filepath.IsAbs(path) {
-		return "", errors.New("image staging path is not configured")
+		return errors.New("image staging path is not configured")
 	}
 	info, err := os.Lstat(path)
 	if err != nil {
-		return "", err
+		return err
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
-		return "", errors.New("image staging path is not a private directory")
+		return errors.New("image staging path is not a private directory")
 	}
-	return os.MkdirTemp(path, ".agent-vm-image-import-")
+	return nil
+}
+
+func validatePrivateStagedFile(stagingPath, path string) error {
+	if err := validatePrivateStagingDirectory(stagingPath); err != nil {
+		return err
+	}
+	if path == "" || !filepath.IsAbs(path) {
+		return errors.New("image staging file is not configured")
+	}
+	relative, err := filepath.Rel(stagingPath, path)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return errors.New("image staging file is outside the private staging directory")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("image staging file is not private")
+	}
+	return nil
 }
 
 func writePrivateImageFile(path string, data []byte) error {
@@ -604,7 +688,25 @@ func parseImageInfo(value map[string]any) (ImageInfo, error) {
 			properties[key] = property
 		}
 	}
-	return ImageInfo{Fingerprint: fingerprint, Architecture: architecture, InstanceType: instanceType, Properties: properties}, nil
+	sizeBytes := int64(0)
+	if raw, ok := value["size"]; ok {
+		switch parsed := raw.(type) {
+		case float64:
+			if parsed < 0 || parsed > float64(^uint64(0)>>1) || parsed != float64(int64(parsed)) {
+				return ImageInfo{}, errors.New("Incus image response has an invalid size")
+			}
+			sizeBytes = int64(parsed)
+		case string:
+			value, err := strconv.ParseInt(parsed, 10, 64)
+			if err != nil || value < 0 {
+				return ImageInfo{}, errors.New("Incus image response has an invalid size")
+			}
+			sizeBytes = value
+		default:
+			return ImageInfo{}, errors.New("Incus image response has an invalid size")
+		}
+	}
+	return ImageInfo{Fingerprint: fingerprint, Architecture: architecture, InstanceType: instanceType, SizeBytes: sizeBytes, Properties: properties}, nil
 }
 
 func verificationInstanceName() (string, error) {

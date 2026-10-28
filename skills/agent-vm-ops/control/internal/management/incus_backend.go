@@ -10,7 +10,9 @@ import (
 
 type incusImageClient interface {
 	CopyImage(context.Context, string, string) error
+	QueryRemoteImageSize(context.Context, string, string) (int64, error)
 	ImportImage(context.Context, string, string, []byte, []byte) (string, error)
+	ImportImageFiles(context.Context, string, string, string, string) (string, error)
 	QueryImage(context.Context, string) (native.ImageInfo, error)
 	DeleteImage(context.Context, string) error
 	VerifyImage(context.Context, string, []string) (native.ImageVerification, error)
@@ -39,11 +41,33 @@ func (backend *IncusImageBackend) ImportTrusted(ctx context.Context, sourceID, e
 	return backend.artifact(ctx, expectedFingerprint)
 }
 
+func (backend *IncusImageBackend) TrustedImportSize(ctx context.Context, sourceID, expectedFingerprint string) (int64, error) {
+	if backend == nil || backend.Client == nil {
+		return 0, errors.New("authority_unavailable: image backend is not configured")
+	}
+	size, err := backend.Client.QueryRemoteImageSize(ctx, sourceID, expectedFingerprint)
+	if err != nil {
+		return 0, uncertainBackendError(err)
+	}
+	return size, nil
+}
+
 func (backend *IncusImageBackend) ImportLocal(ctx context.Context, format string, metadata, rootfs []byte) (ImageArtifact, error) {
 	if backend == nil || backend.Client == nil {
 		return ImageArtifact{}, errors.New("authority_unavailable: image backend is not configured")
 	}
 	fingerprint, err := backend.Client.ImportImage(ctx, backend.StagingPath, format, metadata, rootfs)
+	if err != nil {
+		return ImageArtifact{}, err
+	}
+	return backend.artifact(ctx, fingerprint)
+}
+
+func (backend *IncusImageBackend) ImportLocalFiles(ctx context.Context, format, metadataPath, rootfsPath string) (ImageArtifact, error) {
+	if backend == nil || backend.Client == nil {
+		return ImageArtifact{}, errors.New("authority_unavailable: image backend is not configured")
+	}
+	fingerprint, err := backend.Client.ImportImageFiles(ctx, backend.StagingPath, format, metadataPath, rootfsPath)
 	if err != nil {
 		return ImageArtifact{}, err
 	}

@@ -340,6 +340,9 @@ func (c ManagementConfig) Validate(webOnly bool) error {
 	} else if c.Upload.MaxBytes < 0 || c.Upload.MinimumFreeBytes < 0 {
 		return errors.New("config_invalid: management.upload limits must not be negative")
 	}
+	if len(c.TrustedImageSourceIDs) > 0 && c.Upload.MinimumFreeBytes <= 0 {
+		return errors.New("config_invalid: management.upload.minimum_free_bytes must be positive when trusted image sources are configured")
+	}
 	if webOnly && c.Authority.SocketPath == "" {
 		return errors.New("config_missing: management.authority.socket_path")
 	}

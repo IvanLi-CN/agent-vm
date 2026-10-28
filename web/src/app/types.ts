@@ -74,6 +74,7 @@ export interface ImageReferenceCounts {
   default: number;
   active: number;
   cached: number;
+  releasing: number;
   pending_creation: number;
   verification: number;
 }

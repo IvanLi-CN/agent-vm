@@ -83,12 +83,13 @@ type ImageReferenceCounts struct {
 	Default         int `json:"default"`
 	Active          int `json:"active"`
 	Cached          int `json:"cached"`
+	Releasing       int `json:"releasing"`
 	PendingCreation int `json:"pending_creation"`
 	Verification    int `json:"verification"`
 }
 
 func (c ImageReferenceCounts) Total() int {
-	return c.Default + c.Active + c.Cached + c.PendingCreation + c.Verification
+	return c.Default + c.Active + c.Cached + c.Releasing + c.PendingCreation + c.Verification
 }
 
 type ManagedImage struct {
@@ -315,6 +316,7 @@ func (s *Store) ListManagedImages(ctx context.Context, filter ImageFilter) ([]Ma
 i.state, i.integrity, i.suitability, i.findings_json, i.is_default, i.default_compatibility, i.revision, i.created_at, i.updated_at,
 (SELECT COUNT(*) FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state = 'active'),
 (SELECT COUNT(*) FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state = 'cached'),
+(SELECT COUNT(*) FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state IN ('closing', 'deleting', 'failed')),
 (SELECT COUNT(*) FROM (
  SELECT t.task_id AS reference_id FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state = 'preparing'
  UNION
@@ -366,6 +368,7 @@ func (s *Store) GetManagedImage(ctx context.Context, fingerprint string) (*Manag
 i.state, i.integrity, i.suitability, i.findings_json, i.is_default, i.default_compatibility, i.revision, i.created_at, i.updated_at,
 (SELECT COUNT(*) FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state = 'active'),
 (SELECT COUNT(*) FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state = 'cached'),
+(SELECT COUNT(*) FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state IN ('closing', 'deleting', 'failed')),
 (SELECT COUNT(*) FROM (
  SELECT t.task_id AS reference_id FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state = 'preparing'
  UNION
@@ -390,10 +393,10 @@ func scanManagedImage(row scanner) (*ManagedImage, error) {
 	var label, sourceID sql.NullString
 	var findings string
 	var isDefault int
-	var active, cached, pending, verification int
+	var active, cached, releasing, pending, verification int
 	if err := row.Scan(&value.Fingerprint, &label, &value.Architecture, &value.InstanceType, &value.SourceKind, &sourceID,
 		&value.State, &value.Integrity, &value.Suitability, &findings, &isDefault, &value.DefaultCompatibility, &value.Revision, &value.CreatedAt, &value.UpdatedAt,
-		&active, &cached, &pending, &verification); err != nil {
+		&active, &cached, &releasing, &pending, &verification); err != nil {
 		return nil, err
 	}
 	value.VersionLabel = nullableString(label)
@@ -402,7 +405,7 @@ func scanManagedImage(row scanner) (*ManagedImage, error) {
 	if err := json.Unmarshal([]byte(findings), &value.Findings); err != nil {
 		return nil, fmt.Errorf("managed image findings: %w", err)
 	}
-	value.References = ImageReferenceCounts{Default: isDefault, Active: active, Cached: cached, PendingCreation: pending, Verification: verification}
+	value.References = ImageReferenceCounts{Default: isDefault, Active: active, Cached: cached, Releasing: releasing, PendingCreation: pending, Verification: verification}
 	return &value, nil
 }
 
@@ -556,12 +559,13 @@ func (s *Store) DeleteManagedImage(ctx context.Context, fingerprint string) erro
 		if err := tx.conn.QueryRowContext(ctx, `SELECT
 (SELECT COUNT(*) FROM tasks WHERE image_fingerprint = ? AND state = 'active'),
 (SELECT COUNT(*) FROM tasks WHERE image_fingerprint = ? AND state = 'cached'),
+(SELECT COUNT(*) FROM tasks WHERE image_fingerprint = ? AND state IN ('closing', 'deleting', 'failed')),
 (SELECT COUNT(*) FROM (
  SELECT task_id AS reference_id FROM tasks WHERE image_fingerprint = ? AND state = 'preparing'
  UNION
  SELECT reference_id FROM image_references WHERE fingerprint = ? AND reference_kind = 'pending_creation'
 )),
-			(SELECT COUNT(*) FROM image_references WHERE fingerprint = ? AND reference_kind = 'verification')`, fingerprint, fingerprint, fingerprint, fingerprint, fingerprint).Scan(&counts.Active, &counts.Cached, &counts.PendingCreation, &counts.Verification); err != nil {
+			(SELECT COUNT(*) FROM image_references WHERE fingerprint = ? AND reference_kind = 'verification')`, fingerprint, fingerprint, fingerprint, fingerprint, fingerprint, fingerprint).Scan(&counts.Active, &counts.Cached, &counts.Releasing, &counts.PendingCreation, &counts.Verification); err != nil {
 			return err
 		}
 		if counts.Total() > 0 {

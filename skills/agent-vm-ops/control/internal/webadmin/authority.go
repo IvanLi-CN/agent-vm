@@ -923,19 +923,19 @@ func (authority *Authority) uploadImageImport(writer http.ResponseWriter, reques
 		declaredSize = source.Metadata.ExpectedSize + source.Rootfs.ExpectedSize
 	}
 	if err := authority.Management.CheckStagingCapacity(declaredSize); err != nil {
-		_, _ = authority.Management.FailImageImportUpload(context.Background(), operationID, err)
 		writeProblem(writer, problemFromError(err, "upload", operationID))
 		return
 	}
-	metadata, rootfs, err := authority.stageUpload(request, source)
+	staged, err := authority.stageUpload(request, source)
 	if err != nil {
 		_, _ = authority.Management.FailImageImportUpload(context.Background(), operationID, err)
 		writeProblem(writer, problemFromError(err, "upload", operationID))
 		return
 	}
+	defer staged.cleanup()
 	operationCtx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	result, err := authority.Management.UploadImageImport(operationCtx, operationID, metadata, rootfs)
+	result, err := authority.Management.UploadImageImportFiles(operationCtx, operationID, staged.metadataPath, staged.rootfsPath)
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "image_import", operationID))
 		return
@@ -943,28 +943,43 @@ func (authority *Authority) uploadImageImport(writer http.ResponseWriter, reques
 	writeJSON(writer, http.StatusAccepted, operationValue(*result))
 }
 
-func (authority *Authority) stageUpload(request *http.Request, source management.ImportSource) ([]byte, []byte, error) {
+type stagedUpload struct {
+	metadataPath string
+	rootfsPath   string
+	cleanup      func()
+}
+
+func (authority *Authority) stageUpload(request *http.Request, source management.ImportSource) (*stagedUpload, error) {
 	if request.Body == nil {
-		return nil, nil, errors.New("invalid_request: upload body is required")
+		return nil, errors.New("invalid_request: upload body is required")
 	}
 	if source.Format == "unified" {
 		mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
 		if err != nil || mediaType != "application/octet-stream" {
-			return nil, nil, errors.New("invalid_request: unified uploads require application/octet-stream")
+			return nil, errors.New("invalid_request: unified uploads require application/octet-stream")
 		}
-		value, err := stageReaderWithCapacity(authority.Config.Upload.StagingPath, request.Body, source.ExpectedSize, authority.Config.Upload.MaxBytes, func(remaining int64) error { return authority.Management.CheckStagingCapacity(remaining) })
-		return value, nil, err
+		path, err := stageReaderFileWithCapacity(authority.Config.Upload.StagingPath, request.Body, source.ExpectedSize, authority.Config.Upload.MaxBytes, func(remaining int64) error { return authority.Management.CheckStagingCapacity(remaining) })
+		if err != nil {
+			return nil, err
+		}
+		return &stagedUpload{metadataPath: path, cleanup: func() { _ = os.Remove(path) }}, nil
 	}
 	if source.Metadata.ExpectedSize > math.MaxInt64-source.Rootfs.ExpectedSize || authority.Config.Upload.MaxBytes > 0 && source.Metadata.ExpectedSize+source.Rootfs.ExpectedSize > authority.Config.Upload.MaxBytes {
-		return nil, nil, errors.New("upload_too_large: declared image exceeds the configured limit")
+		return nil, errors.New("upload_too_large: declared image exceeds the configured limit")
 	}
 	declaredSize := source.Metadata.ExpectedSize + source.Rootfs.ExpectedSize
 	mediaType, params, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
 	if err != nil || mediaType != "multipart/form-data" || params["boundary"] == "" {
-		return nil, nil, errors.New("invalid_request: split uploads require multipart/form-data")
+		return nil, errors.New("invalid_request: split uploads require multipart/form-data")
 	}
 	reader := multipart.NewReader(request.Body, params["boundary"])
-	var metadata, rootfs []byte
+	paths := make([]string, 0, 2)
+	pathByName := map[string]string{}
+	cleanup := func() {
+		for _, path := range paths {
+			_ = os.Remove(path)
+		}
+	}
 	seen := map[string]bool{}
 	consumed := int64(0)
 	for {
@@ -973,18 +988,21 @@ func (authority *Authority) stageUpload(request *http.Request, source management
 			break
 		}
 		if nextErr != nil {
-			return nil, nil, errors.New("invalid_request: multipart upload is malformed")
+			cleanup()
+			return nil, errors.New("invalid_request: multipart upload is malformed")
 		}
 		name := part.FormName()
 		if name != "metadata" && name != "rootfs" || seen[name] {
-			return nil, nil, errors.New("invalid_request: multipart upload must contain exactly metadata and rootfs")
+			part.Close()
+			cleanup()
+			return nil, errors.New("invalid_request: multipart upload must contain exactly metadata and rootfs")
 		}
 		seen[name] = true
 		expected := source.Metadata.ExpectedSize
 		if name == "rootfs" {
 			expected = source.Rootfs.ExpectedSize
 		}
-		value, readErr := stageReaderWithCapacity(authority.Config.Upload.StagingPath, part, expected, authority.Config.Upload.MaxBytes, func(remaining int64) error {
+		path, readErr := stageReaderFileWithCapacity(authority.Config.Upload.StagingPath, part, expected, authority.Config.Upload.MaxBytes, func(remaining int64) error {
 			written := expected - remaining
 			if written < 0 {
 				written = 0
@@ -997,19 +1015,19 @@ func (authority *Authority) stageUpload(request *http.Request, source management
 		})
 		part.Close()
 		if readErr != nil {
-			return nil, nil, readErr
+			cleanup()
+			return nil, readErr
 		}
-		consumed += int64(len(value))
-		if name == "metadata" {
-			metadata = value
-		} else {
-			rootfs = value
-		}
+		paths = append(paths, path)
+		pathByName[name] = path
+		consumed += expected
 	}
 	if !seen["metadata"] || !seen["rootfs"] {
-		return nil, nil, errors.New("invalid_request: multipart upload must contain exactly metadata and rootfs")
+		cleanup()
+		return nil, errors.New("invalid_request: multipart upload must contain exactly metadata and rootfs")
 	}
-	return metadata, rootfs, nil
+	metadataPath, rootfsPath := pathByName["metadata"], pathByName["rootfs"]
+	return &stagedUpload{metadataPath: metadataPath, rootfsPath: rootfsPath, cleanup: cleanup}, nil
 }
 
 func stageReader(stagingPath string, reader io.Reader, expected, maximum int64) ([]byte, error) {
@@ -1017,59 +1035,83 @@ func stageReader(stagingPath string, reader io.Reader, expected, maximum int64) 
 }
 
 func stageReaderWithCapacity(stagingPath string, reader io.Reader, expected, maximum int64, capacity func(int64) error) ([]byte, error) {
-	if expected < 0 || maximum > 0 && expected > maximum {
-		return nil, errors.New("upload_too_large: declared image exceeds the configured limit")
-	}
-	if expected == math.MaxInt64 {
-		return nil, errors.New("upload_too_large: declared image exceeds the configured limit")
-	}
-	if stagingPath == "" || !filepath.IsAbs(stagingPath) {
-		return nil, errors.New("authority_unavailable: upload staging is not configured")
-	}
-	info, err := os.Lstat(stagingPath)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := os.MkdirAll(stagingPath, 0o700); err != nil {
-			return nil, errors.New("authority_unavailable: upload staging is unavailable")
-		}
-		info, err = os.Lstat(stagingPath)
-	}
-	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
-		return nil, errors.New("authority_unavailable: upload staging is unavailable")
-	}
-	file, err := os.CreateTemp(stagingPath, ".agent-vm-upload-*")
+	path, err := stageReaderFileWithCapacity(stagingPath, reader, expected, maximum, capacity)
 	if err != nil {
-		return nil, errors.New("authority_unavailable: upload staging is unavailable")
+		return nil, err
 	}
-	name := file.Name()
-	defer os.Remove(name)
-	_ = file.Chmod(0o600)
-	if capacity != nil {
-		if err := capacity(expected); err != nil {
-			_ = file.Close()
-			return nil, err
-		}
-	}
-	count, copyErr := io.Copy(file, io.LimitReader(&capacityReader{reader: reader, expected: expected, check: capacity}, expected+1))
-	if closeErr := file.Close(); copyErr == nil {
-		copyErr = closeErr
-	}
-	if copyErr != nil {
-		if strings.HasPrefix(copyErr.Error(), "staging_capacity_low:") {
-			return nil, copyErr
-		}
-		return nil, errors.New("invalid_request: upload stream could not be read")
-	}
-	if count != expected {
-		if count > expected {
-			return nil, errors.New("upload_too_large: uploaded bytes exceed the declared size")
-		}
-		return nil, errors.New("invalid_request: uploaded bytes do not match the declared size")
-	}
-	value, err := os.ReadFile(name)
+	defer os.Remove(path)
+	value, err := os.ReadFile(path)
 	if err != nil {
 		return nil, errors.New("authority_unavailable: upload staging could not be read")
 	}
 	return value, nil
+}
+
+func stageReaderFileWithCapacity(stagingPath string, reader io.Reader, expected, maximum int64, capacity func(int64) error) (name string, err error) {
+	if expected < 0 || maximum > 0 && expected > maximum {
+		return "", errors.New("upload_too_large: declared image exceeds the configured limit")
+	}
+	if expected == math.MaxInt64 {
+		return "", errors.New("upload_too_large: declared image exceeds the configured limit")
+	}
+	if stagingPath == "" || !filepath.IsAbs(stagingPath) {
+		return "", errors.New("authority_unavailable: upload staging is not configured")
+	}
+	info, err := os.Lstat(stagingPath)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.MkdirAll(stagingPath, 0o700); err != nil {
+			return "", errors.New("authority_unavailable: upload staging is unavailable")
+		}
+		info, err = os.Lstat(stagingPath)
+	}
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return "", errors.New("authority_unavailable: upload staging is unavailable")
+	}
+	file, err := os.CreateTemp(stagingPath, ".agent-vm-upload-*")
+	if err != nil {
+		return "", errors.New("authority_unavailable: upload staging is unavailable")
+	}
+	name = file.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(name)
+		}
+	}()
+	_ = file.Chmod(0o600)
+	if capacity != nil {
+		if err := capacity(expected); err != nil {
+			_ = file.Close()
+			return "", err
+		}
+	}
+	count, copyErr := io.Copy(file, io.LimitReader(&capacityReader{reader: reader, expected: expected, check: capacity}, expected+1))
+	var syncErr, closeErr error
+	if copyErr == nil {
+		syncErr = file.Sync()
+	}
+	closeErr = file.Close()
+	if syncErr != nil {
+		return "", errors.New("authority_unavailable: upload staging could not be finalized")
+	}
+	if copyErr == nil {
+		copyErr = closeErr
+	}
+	if copyErr != nil {
+		if strings.HasPrefix(copyErr.Error(), "staging_capacity_low:") {
+			return "", copyErr
+		}
+		return "", errors.New("invalid_request: upload stream could not be read")
+	}
+	if count != expected {
+		if count > expected {
+			return "", errors.New("upload_too_large: uploaded bytes exceed the declared size")
+		}
+		return "", errors.New("invalid_request: uploaded bytes do not match the declared size")
+	}
+	// Ownership transfers to the caller after a complete write.
+	cleanup = false
+	return name, nil
 }
 
 type capacityReader struct {
@@ -1905,7 +1947,7 @@ func imageValue(image state.ManagedImage) map[string]any {
 		"fingerprint": image.Fingerprint, "resource_version": "image:" + image.Fingerprint + ":revision-" + strconv.FormatInt(image.Revision, 10), "version_label": image.VersionLabel,
 		"architecture": image.Architecture, "instance_type": image.InstanceType, "source": map[string]any{"kind": image.SourceKind, "source_id": image.SourceID}, "state": image.State,
 		"verification": map[string]any{"integrity": image.Integrity, "suitability": image.Suitability, "findings": safeFindings(image.Findings)}, "is_default": image.IsDefault, "default_compatibility": image.DefaultCompatibility,
-		"references": map[string]any{"default": image.References.Default, "active": image.References.Active, "cached": image.References.Cached, "pending_creation": image.References.PendingCreation, "verification": image.References.Verification}, "created_at": image.CreatedAt,
+		"references": map[string]any{"default": image.References.Default, "active": image.References.Active, "cached": image.References.Cached, "releasing": image.References.Releasing, "pending_creation": image.References.PendingCreation, "verification": image.References.Verification}, "created_at": image.CreatedAt,
 	}
 }
 
@@ -2027,11 +2069,11 @@ func vmImpact(task *state.Task, action string) map[string]any {
 }
 
 func imageImpact(image state.ManagedImage, action string) map[string]any {
-	return map[string]any{"summary_code": action, "affected_session_count": image.References.Active, "affected_image_references": map[string]any{"default": image.References.Default, "active": image.References.Active, "cached": image.References.Cached, "pending_creation": image.References.PendingCreation, "verification": image.References.Verification}, "changes": []any{map[string]any{"code": action, "count": image.References.Total(), "value": image.Fingerprint}}}
+	return map[string]any{"summary_code": action, "affected_session_count": image.References.Active, "affected_image_references": map[string]any{"default": image.References.Default, "active": image.References.Active, "cached": image.References.Cached, "releasing": image.References.Releasing, "pending_creation": image.References.PendingCreation, "verification": image.References.Verification}, "changes": []any{map[string]any{"code": action, "count": image.References.Total(), "value": image.Fingerprint}}}
 }
 
 func emptyReferences() map[string]any {
-	return map[string]any{"default": 0, "active": 0, "cached": 0, "pending_creation": 0, "verification": 0}
+	return map[string]any{"default": 0, "active": 0, "cached": 0, "releasing": 0, "pending_creation": 0, "verification": 0}
 }
 
 func observedNumber(value any, observedAt string, fresh bool) map[string]any {

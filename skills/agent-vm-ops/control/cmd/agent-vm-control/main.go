@@ -162,6 +162,9 @@ func serve(args []string) error {
 		TrustedImageSourceIDs:  cfg.Management.TrustedImageSourceIDs,
 		UploadMaxBytes:         cfg.Management.Upload.MaxBytes,
 		UploadMinimumFreeBytes: cfg.Management.Upload.MinimumFreeBytes,
+		AvailableImageStorageBytes: func() (int64, error) {
+			return availableStagingBytes(cfg.StoragePath)
+		},
 		CurrentSystemVersion: func(ctx context.Context) (string, error) {
 			epoch, err := store.StateEpoch(ctx)
 			if err != nil {

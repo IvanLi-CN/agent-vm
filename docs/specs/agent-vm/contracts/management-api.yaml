@@ -1012,11 +1012,12 @@ components:
     ImageReferenceCounts:
       type: object
       additionalProperties: false
-      required: [default, active, cached, pending_creation, verification]
+      required: [default, active, cached, releasing, pending_creation, verification]
       properties:
         default: { type: integer, minimum: 0 }
         active: { type: integer, minimum: 0 }
         cached: { type: integer, minimum: 0 }
+        releasing: { type: integer, minimum: 0, description: Tasks in closing, deleting or failed cleanup states that still pin the image. }
         pending_creation: { type: integer, minimum: 0 }
         verification: { type: integer, minimum: 0 }
     ManagedImage:

@@ -15,6 +15,7 @@ type fakeIncusImageClient struct {
 	imported     string
 	info         native.ImageInfo
 	verification native.ImageVerification
+	remoteSize   int64
 	queryErr     error
 	verifyErr    error
 }
@@ -24,8 +25,18 @@ func (client *fakeIncusImageClient) CopyImage(_ context.Context, sourceID, finge
 	return nil
 }
 
+func (client *fakeIncusImageClient) QueryRemoteImageSize(_ context.Context, sourceID, fingerprint string) (int64, error) {
+	client.calls = append(client.calls, "size:"+sourceID+":"+fingerprint)
+	return client.remoteSize, nil
+}
+
 func (client *fakeIncusImageClient) ImportImage(_ context.Context, stagingPath, format string, metadata, rootfs []byte) (string, error) {
 	client.calls = append(client.calls, "import:"+stagingPath+":"+format+":"+string(metadata)+":"+string(rootfs))
+	return client.imported, nil
+}
+
+func (client *fakeIncusImageClient) ImportImageFiles(_ context.Context, stagingPath, format, metadataPath, rootfsPath string) (string, error) {
+	client.calls = append(client.calls, "import-files:"+stagingPath+":"+format+":"+metadataPath+":"+rootfsPath)
 	return client.imported, nil
 }
 
@@ -69,6 +80,19 @@ func TestIncusImageBackendImportsTrustedImageAndMapsVerification(t *testing.T) {
 	wantCalls := []string{"copy:approved:" + fingerprint, "query:" + fingerprint, "verify:" + fingerprint + ":python3"}
 	if !reflect.DeepEqual(client.calls, wantCalls) {
 		t.Fatalf("backend calls = %#v, want %#v", client.calls, wantCalls)
+	}
+}
+
+func TestIncusImageBackendChecksTrustedImageSize(t *testing.T) {
+	fingerprint := strings.Repeat("a", 64)
+	client := &fakeIncusImageClient{remoteSize: 4096}
+	backend := NewIncusImageBackend(client, "/var/lib/agent-vm-native/staging", nil)
+	size, err := backend.TrustedImportSize(context.Background(), "approved", fingerprint)
+	if err != nil || size != 4096 {
+		t.Fatalf("trusted image size = %d, err=%v", size, err)
+	}
+	if !reflect.DeepEqual(client.calls, []string{"size:approved:" + fingerprint}) {
+		t.Fatalf("backend calls = %#v", client.calls)
 	}
 }
 

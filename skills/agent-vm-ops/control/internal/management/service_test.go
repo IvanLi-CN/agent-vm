@@ -22,6 +22,10 @@ func (backend *fakeImageBackend) ImportTrusted(context.Context, string, string) 
 	return backend.artifact, nil
 }
 
+func (backend *fakeImageBackend) TrustedImportSize(context.Context, string, string) (int64, error) {
+	return 1, nil
+}
+
 func (backend *fakeImageBackend) ImportLocal(context.Context, string, []byte, []byte) (ImageArtifact, error) {
 	backend.imports++
 	return backend.artifact, nil
@@ -112,6 +116,88 @@ func TestImageImportRejectsInsufficientStagingCapacityBeforeClaimingOperation(t 
 	}
 }
 
+func TestImageImportUploadCapacityFailureLeavesOperationRetryable(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	content := []byte("abc")
+	available := int64(4096)
+	backend := &fakeImageBackend{artifact: ImageArtifact{Fingerprint: strings.Repeat("a", 64), Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}}
+	service := New(store, Options{
+		UploadMaxBytes:         1024,
+		UploadMinimumFreeBytes: 512,
+		AvailableStagingBytes:  func() (int64, error) { return available, nil },
+		Backend:                backend,
+	})
+	request := ImportRequest{
+		OperationID: "import-retryable-capacity", Actor: "admin", Reason: "retry upload after capacity recovery", TargetVersion: "image-catalog:revision-1", VersionLabel: "2026.02",
+		Source: ImportSource{Kind: "local_upload", Format: "unified", ExpectedSHA256: digestBytes(content), ExpectedSize: int64(len(content))},
+	}
+	operation, err := service.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	available = 3
+	blocked, err := service.UploadImageImport(context.Background(), operation.OperationID, content, nil)
+	if err == nil || !strings.HasPrefix(err.Error(), "staging_capacity_low:") {
+		t.Fatalf("capacity error = %v", err)
+	}
+	if blocked.Status != "awaiting_upload" {
+		t.Fatalf("operation became terminal after capacity failure: %#v", blocked)
+	}
+	available = 4096
+	completed, err := service.UploadImageImport(context.Background(), operation.OperationID, content, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != "succeeded" || backend.imports != 1 {
+		t.Fatalf("completed operation = %#v, backend imports = %d", completed, backend.imports)
+	}
+}
+
+func TestTrustedImportCapacityFailureDoesNotClaimOrImport(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	fingerprint := strings.Repeat("a", 64)
+	available := int64(4096)
+	backend := &fakeImageBackend{artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}}
+	service := New(store, Options{
+		TrustedImageSourceIDs:      []string{"approved"},
+		UploadMinimumFreeBytes:     512,
+		AvailableImageStorageBytes: func() (int64, error) { return available, nil },
+		Backend:                    backend,
+	})
+	request := ImportRequest{
+		OperationID: "trusted-retryable-capacity", Actor: "admin", Reason: "retry trusted import after capacity recovery", TargetVersion: "image-catalog:revision-1", VersionLabel: "2026.02",
+		Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint},
+	}
+	operation, err := service.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	available = 1
+	queued, err := service.ProcessTrustedImport(context.Background(), operation.OperationID)
+	if err == nil || !strings.HasPrefix(err.Error(), "staging_capacity_low:") {
+		t.Fatalf("capacity error = %v", err)
+	}
+	if queued.Status != "queued" || backend.imports != 0 {
+		t.Fatalf("operation was claimed or imported after capacity failure: %#v, imports=%d", queued, backend.imports)
+	}
+	available = 4096
+	completed, err := service.ProcessTrustedImport(context.Background(), operation.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completed.Status != "succeeded" || backend.imports != 1 {
+		t.Fatalf("completed operation = %#v, backend imports = %d", completed, backend.imports)
+	}
+}
+
 func TestImageImportUploadStreamFailureIsDurable(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -177,7 +263,7 @@ func TestIntegrityFailureRemainsIndependentFromSuitabilityFailure(t *testing.T) 
 	}
 	defer store.Close()
 	backend := &fakeImageBackend{artifact: ImageArtifact{Fingerprint: strings.Repeat("b", 64), Architecture: "x86_64", InstanceType: "vm", Runtime: true, SyncTool: true, GuestReady: true}}
-	service := New(store, Options{TrustedImageSourceIDs: []string{"approved"}, Backend: backend})
+	service := New(store, Options{TrustedImageSourceIDs: []string{"approved"}, UploadMinimumFreeBytes: 512, AvailableImageStorageBytes: func() (int64, error) { return 4096, nil }, Backend: backend})
 	request := ImportRequest{OperationID: "trusted-mismatch", Actor: "admin", Reason: "check image", TargetVersion: "image-catalog:revision-1", VersionLabel: "bad", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: strings.Repeat("a", 64)}}
 	operation, err := service.StartImageImport(context.Background(), request)
 	if err != nil {

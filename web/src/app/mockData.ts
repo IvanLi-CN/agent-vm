@@ -51,9 +51,9 @@ export const vms: ManagedVM[] = [
 ];
 
 export const images: ManagedImage[] = [
-  { fingerprint: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", resource_version: "image:bbbb:revision-3", version_label: "legacy-default", architecture: "x86_64", instance_type: "container", source: { kind: "legacy_config", source_id: null }, state: "available", verification: { integrity: "legacy_unverified", suitability: "not_assessed", findings: [] }, is_default: true, default_compatibility: "legacy_unverified", references: { default: 1, active: 1, cached: 1, pending_creation: 0, verification: 0 }, created_at: "2025-10-01T00:00:00Z" },
-  { fingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", resource_version: "image:aaaa:revision-1", version_label: "2026.01", architecture: "x86_64", instance_type: "container", source: { kind: "local_upload", source_id: null }, state: "available", verification: { integrity: "passed", suitability: "passed", findings: [] }, is_default: false, default_compatibility: "none", references: { default: 0, active: 0, cached: 0, pending_creation: 0, verification: 0 }, created_at: "2026-01-15T09:55:00Z" },
-  { fingerprint: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", resource_version: "image:cccc:revision-2", version_label: "2025.12-maintenance", architecture: "x86_64", instance_type: "container", source: { kind: "trusted_remote", source_id: "ubuntu-staging" }, state: "retired", verification: { integrity: "passed", suitability: "passed", findings: [] }, is_default: false, default_compatibility: "none", references: { default: 0, active: 0, cached: 0, pending_creation: 0, verification: 0 }, created_at: "2025-12-16T08:30:00Z" },
+  { fingerprint: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", resource_version: "image:bbbb:revision-3", version_label: "legacy-default", architecture: "x86_64", instance_type: "container", source: { kind: "legacy_config", source_id: null }, state: "available", verification: { integrity: "legacy_unverified", suitability: "not_assessed", findings: [] }, is_default: true, default_compatibility: "legacy_unverified", references: { default: 1, active: 1, cached: 1, releasing: 0, pending_creation: 0, verification: 0 }, created_at: "2025-10-01T00:00:00Z" },
+  { fingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", resource_version: "image:aaaa:revision-1", version_label: "2026.01", architecture: "x86_64", instance_type: "container", source: { kind: "local_upload", source_id: null }, state: "available", verification: { integrity: "passed", suitability: "passed", findings: [] }, is_default: false, default_compatibility: "none", references: { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 }, created_at: "2026-01-15T09:55:00Z" },
+  { fingerprint: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", resource_version: "image:cccc:revision-2", version_label: "2025.12-maintenance", architecture: "x86_64", instance_type: "container", source: { kind: "trusted_remote", source_id: "ubuntu-staging" }, state: "retired", verification: { integrity: "passed", suitability: "passed", findings: [] }, is_default: false, default_compatibility: "none", references: { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 }, created_at: "2025-12-16T08:30:00Z" },
 ];
 
 export const operations: Operation[] = [
@@ -82,6 +82,6 @@ export const system: SystemStatus = {
   sources: [{ name: "health", state: "available", observed_at: "2026-01-15T10:20:30Z", stale_after_seconds: 30, safe_code: null }],
 };
 
-export const emptyReferences: ImageReferenceCounts = { default: 0, active: 0, cached: 0, pending_creation: 0, verification: 0 };
+export const emptyReferences: ImageReferenceCounts = { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 };
 
 export const mockState = { overview, vms, images, operations, audits, system };

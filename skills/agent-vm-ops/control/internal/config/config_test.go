@@ -147,6 +147,24 @@ func TestManagementConfigRejectsUnsafeIncusRemoteNames(t *testing.T) {
 	}
 }
 
+func TestManagementConfigRequiresPoolReserveForTrustedImages(t *testing.T) {
+	value := validConfig()
+	value.Management = ManagementConfig{
+		Enabled: true, ExternalOrigin: "https://console.example",
+		ForwardAuth:          ForwardAuthConfig{SocketPath: "/run/proxy.sock", PeerUID: 1001, IdentityHeader: "X-Forwarded-User"},
+		AllowedAdminSubjects: []string{"admin@example"}, WebUID: 1002,
+		TrustedImageSourceIDs: []string{"approved"},
+		Authority:             ManagementAuthorityConfig{SocketPath: "/run/authority.sock", ExpectedWebUID: 1002},
+	}
+	if err := value.Validate(); err == nil || !strings.Contains(err.Error(), "minimum_free_bytes") {
+		t.Fatalf("missing trusted image reserve error = %v", err)
+	}
+	value.Management.Upload.MinimumFreeBytes = 512
+	if err := value.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestConfigRejectsUnsafeRequiredGuestTools(t *testing.T) {
 	value := validConfig()
 	value.RequiredGuestTools = []string{"bun;id"}

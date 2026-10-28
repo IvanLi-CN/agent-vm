@@ -214,6 +214,34 @@ func TestPreparingTaskReferenceIsCountedOnceAndClearedOnActivation(t *testing.T)
 	}
 }
 
+func TestCleanupTaskStatesRemainImageReferences(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	fingerprint := strings.Repeat("f", 64)
+	if err := store.InsertManagedImage(ctx, ManagedImage{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, taskState := range []string{"closing", "deleting", "failed"} {
+		if err := store.InsertTask(ctx, Task{TaskID: "task-" + taskState, SessionID: "session-" + taskState, Generation: 1, State: taskState, InstanceName: "agent-vm-" + taskState, CreatedAt: "now", UpdatedAt: "now", ImageFingerprint: fingerprint, ResourcesJSON: "{}", ResourceReservationJSON: "{}"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	image, err := store.GetManagedImage(ctx, fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image.References.Releasing != 3 || image.References.Total() != 3 {
+		t.Fatalf("cleanup references = %#v", image.References)
+	}
+	if err := store.DeleteManagedImage(ctx, fingerprint); err == nil {
+		t.Fatal("cleanup references did not block deletion")
+	}
+}
+
 func TestDeleteManagedImageRechecksEveryReferenceClass(t *testing.T) {
 	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

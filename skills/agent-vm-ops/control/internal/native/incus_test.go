@@ -113,6 +113,40 @@ printf '{"fingerprint":"%s","architecture":"x86_64","type":"container","properti
 	}
 }
 
+func TestIncusRemoteImageSizeUsesConfiguredSourceAndFingerprint(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "incus-argv")
+	fingerprint := strings.Repeat("e", 64)
+	script := `#!/bin/sh
+printf '%s\n' "$@" > "$INCUS_ARGV_LOG"
+printf '{"fingerprint":"%s","architecture":"x86_64","type":"container","size":4096}\n' "$INCUS_IMAGE_FINGERPRINT"
+`
+	if err := os.WriteFile(filepath.Join(binDir, "incus"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("INCUS_ARGV_LOG", logPath)
+	t.Setenv("INCUS_IMAGE_FINGERPRINT", fingerprint)
+
+	client := NewIncusClient(NewRunner(), "agents")
+	size, err := client.QueryRemoteImageSize(context.Background(), "approved", fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != 4096 {
+		t.Fatalf("remote image size = %d, want 4096", size)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	want := []string{"--project", "agents", "image", "info", "approved:" + fingerprint, "--format", "json"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("incus argv = %#v, want %#v", got, want)
+	}
+}
+
 func TestIncusVerificationInitDisablesProfilesAndNetwork(t *testing.T) {
 	binDir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "incus-argv")
