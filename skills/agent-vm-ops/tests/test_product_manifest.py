@@ -36,6 +36,7 @@ class ProductManifestTests(unittest.TestCase):
             manifest = {
                 "format": PRODUCT_MANIFEST_FORMAT,
                 "version": "1.0.0",
+                "release_id": "a" * 40,
                 "source_revision": "a" * 40,
                 "protocol": 4,
                 "target": {"os": "source", "arch": "any"},

@@ -47,7 +47,10 @@ func (s *Service) reconcileVerifiedNativeInitAbsence(ctx context.Context, candid
 		if s.Guest == nil {
 			return nil, nativeInitRecoveryBlocked("native-init absence cannot be verified without native access", map[string]any{"task_id": current.TaskID})
 		}
-		if _, ownershipErr := s.verifyOwnership(ctx, current); ownershipErr == nil {
+		ownershipCtx, ownershipCancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+		_, ownershipErr := s.verifyOwnership(ownershipCtx, current)
+		ownershipCancel()
+		if ownershipErr == nil {
 			return nil, nativeInitRecoveryBlocked("native-init recovery found a present managed instance", map[string]any{
 				"task_id": current.TaskID, "native_present": true, "outcome_verified": true,
 			})
@@ -211,10 +214,13 @@ func (s *Service) reconcilePendingAbsentDestroy(ctx context.Context, pending []s
 		if strings.TrimSpace(digest) == "" || digestErr != nil || digest != calculated {
 			return nativeInitOperationBlocked("pending absent destroy request digest does not match", detail)
 		}
-		if err := verifyNativeInitWorker(operation); err != nil {
+		if err := verifyAbsentDestroyWorker(operation); err != nil {
 			return nativeInitOperationBlocked(err.Error(), detail)
 		}
-		if err := s.verifyAbsentTask(ctx, task, operation.OperationID, false); err != nil {
+		absenceCtx, absenceCancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+		verifyErr := s.verifyAbsentTask(absenceCtx, task, operation.OperationID, true)
+		absenceCancel()
+		if err := verifyErr; err != nil {
 			return err
 		}
 		result, summaryErr := s.summary(ctx, task)
@@ -311,21 +317,41 @@ func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task 
 }
 
 func verifyNativeInitWorker(operation state.Operation) error {
-	value, ok := operation.Response["worker"]
+	value := operation.Response["worker"]
 	worker, workerOK := value.(map[string]any)
-	if !ok || !workerOK {
+	if !workerOK {
 		return errors.New("pending native worker observation is missing")
+	}
+	if preSpawn, present := worker["pre_spawn"]; present {
+		confirmed, valid := preSpawn.(bool)
+		if !valid || !confirmed {
+			return errors.New("pending native worker pre-spawn marker is malformed")
+		}
+		if stringValue(worker["state"]) != "exited" || !strictBool(worker, "start_attempted", true) || !validWorkerTimestamp(worker["finished_at"]) {
+			return errors.New("pending native worker pre-spawn observation is incomplete")
+		}
+		for _, key := range []string{"pid", "start_time", "process_group", "observed_at"} {
+			if _, present := worker[key]; present {
+				return errors.New("pending native worker pre-spawn observation contains an identity")
+			}
+		}
+		if timedOutValue, present := worker["timed_out"]; present {
+			timedOut, valid := timedOutValue.(bool)
+			if !valid || timedOut {
+				return errors.New("pending native worker timeout marker is malformed")
+			}
+		}
+		return nil
 	}
 	pid, pidOK := protocol.Integer(worker["pid"])
 	startTime, startOK := worker["start_time"].(string)
 	if !pidOK || pid <= 0 || !startOK || strings.TrimSpace(startTime) == "" {
 		return errors.New("pending native worker identity is incomplete")
 	}
-	if processGroup, present := worker["process_group"]; present {
-		group, valid := protocol.Integer(processGroup)
-		if !valid || group < 0 {
-			return errors.New("pending native worker process group is malformed")
-		}
+	processGroup, present := worker["process_group"]
+	group, valid := protocol.Integer(processGroup)
+	if !present || !valid || group <= 0 {
+		return errors.New("pending native worker process group is incomplete")
 	}
 	if timedOutValue, present := worker["timed_out"]; present {
 		timedOut, valid := timedOutValue.(bool)
@@ -349,6 +375,33 @@ func verifyNativeInitWorker(operation state.Operation) error {
 		return errors.New("pending native worker has not reached a verified terminal state")
 	}
 	return nil
+}
+
+func verifyAbsentDestroyWorker(operation state.Operation) error {
+	value := operation.Response["worker"]
+	worker, workerOK := value.(map[string]any)
+	if !workerOK {
+		return errors.New("pending absent destroy worker observation is missing")
+	}
+	if workerStartPrepared(worker) {
+		preparedAt, present := worker["prepared_at"]
+		if !present || !validWorkerTimestamp(preparedAt) {
+			return errors.New("pending absent destroy preparation marker is incomplete")
+		}
+		if attempted, present := worker["start_attempted"]; present {
+			value, valid := attempted.(bool)
+			if !valid || value {
+				return errors.New("pending absent destroy preparation marker is malformed")
+			}
+		}
+		return nil
+	}
+	return verifyNativeInitWorker(operation)
+}
+
+func strictBool(worker map[string]any, key string, want bool) bool {
+	value, ok := worker[key]
+	return ok && value == want
 }
 
 func validWorkerTimestamp(value any) bool {

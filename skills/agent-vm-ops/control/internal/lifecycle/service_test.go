@@ -30,12 +30,14 @@ type startupGuest struct {
 	statusCalls int
 	config      map[string]any
 	configErr   error
+	configWait  bool
+	initErr     error
 	configHook  func()
 	stopErr     error
 	deviceSets  []string
 }
 
-func (guest *startupGuest) Init(context.Context, string, string) error              { return nil }
+func (guest *startupGuest) Init(context.Context, string, string) error              { return guest.initErr }
 func (guest *startupGuest) ConfigSet(context.Context, string, string, string) error { return nil }
 
 func (guest *startupGuest) DeviceSet(_ context.Context, _ string, device, key, value string) error {
@@ -60,7 +62,11 @@ func (guest *startupGuest) Status(context.Context, string) (map[string]any, erro
 	}
 	return map[string]any{"status": guest.status}, nil
 }
-func (guest *startupGuest) Config(context.Context, string) (map[string]any, error) {
+func (guest *startupGuest) Config(ctx context.Context, _ string) (map[string]any, error) {
+	if guest.configWait {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if guest.configHook != nil {
 		hook := guest.configHook
 		guest.configHook = nil
@@ -886,7 +892,7 @@ func TestWorkerStartFailedClearsAdmissionBarrier(t *testing.T) {
 		t.Fatal(err)
 	}
 	worker := operation.Response["worker"].(map[string]any)
-	if worker["state"] != "exited" || worker["error"] != "exec unavailable" {
+	if worker["state"] != "exited" || worker["pre_spawn"] != true || worker["error"] != "exec unavailable" {
 		t.Fatalf("failed worker state = %#v, want exited with cause", worker)
 	}
 	if err := service.WorkerStartAllowed(context.Background(), operationID); err != nil {
@@ -1493,8 +1499,13 @@ func TestReconcileFinalizesPendingDestroyAfterCleanup(t *testing.T) {
 		"protocol": protocol.Version, "action": "destroy", "session_id": session,
 		"generation": generation, "operation_id": "destroy-pending",
 	}
+	digest, err := protocol.Digest(protocol.Request(request))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := store.RecordOperation(context.Background(), "destroy-pending", "destroy", stringPointer(session), &generation, map[string]any{
-		"outcome": "pending", "_request": request, "_request_digest": "digest",
+		"outcome": "pending", "_request": request, "_request_digest": digest,
+		"worker": map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "finished", "finished_at": "2026-10-27T00:00:00Z"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1521,6 +1532,57 @@ func TestReconcileFinalizesPendingDestroyAfterCleanup(t *testing.T) {
 	}
 	if operation.Response["outcome"] != "success" {
 		t.Fatalf("reconciled operation = %#v", operation.Response)
+	}
+}
+
+func TestReconcileDoesNotFinalizeForeignPendingCleanupRequest(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "foreign-pending-destroy.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	cleanupSession := "cleanup-owner"
+	foreignSession := "foreign-owner"
+	generation := int64(1)
+	for _, task := range []state.Task{
+		{TaskID: "cleanup-owner-task", SessionID: cleanupSession, Generation: generation, State: stateDeleting, InstanceName: "agent-cleanup-owner", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}"},
+		{TaskID: "foreign-owner-task", SessionID: foreignSession, Generation: generation, State: stateAbsent, InstanceName: "agent-foreign-owner", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}"},
+	} {
+		if err := store.InsertTask(context.Background(), task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": foreignSession, "generation": generation, "operation_id": "foreign-pending-destroy"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), request["operation_id"].(string), "destroy", stringPointer(cleanupSession), &generation, map[string]any{
+		"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest,
+		"worker": map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "finished", "finished_at": "2026-10-27T00:00:00Z"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	if _, err := service.reconcile(context.Background(), true); err == nil {
+		t.Fatal("foreign cleanup request was finalized")
+	}
+	for _, session := range []string{cleanupSession, foreignSession} {
+		task, err := store.GetTask(context.Background(), map[string]any{"session_id": session})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if task == nil {
+			t.Fatalf("session %s was deleted", session)
+		}
+	}
+	operation, err := store.GetOperation(context.Background(), request["operation_id"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "pending" {
+		t.Fatalf("foreign cleanup journal = %#v", operation)
 	}
 }
 
@@ -1665,6 +1727,55 @@ func TestReconcileRecoversVerifiedNativeInitAbsence(t *testing.T) {
 	}
 }
 
+func TestAcquireFailurePathReconcilesVerifiedPreSpawnNativeAbsence(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-init-acquire-failure.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	missing := &native.CommandError{Result: native.Result{Stderr: []byte("instance not found")}, Cause: errors.New("incus init failed before process spawn")}
+	guest := &startupGuest{initErr: missing, configErr: missing}
+	cfg := config.Defaults()
+	cfg.VMIPStart = "10.250.19.20"
+	cfg.VMIPEnd = "10.250.19.30"
+	service := New(store, cfg, Options{Guest: guest, Clock: func() time.Time { return now }})
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "acquire", "session_id": "native-init-acquire-failure",
+		"generation": int64(0), "operation_id": "native-init-acquire-failure",
+	}
+	if _, dispatchErr := service.Dispatch(context.Background(), request); protocol.AsError(dispatchErr).Code != "native_failed" {
+		t.Fatalf("acquire failure = %#v", dispatchErr)
+	}
+	operation, err := store.GetOperation(context.Background(), request["operation_id"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "pending" {
+		t.Fatalf("acquire operation after native failure = %#v", operation)
+	}
+	if err := service.WorkerStartFailed(context.Background(), request["operation_id"].(string), missing); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.reconcile(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": request["session_id"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil || task.State != stateAbsent || task.ReservationBytes != 0 || task.VMIP != nil {
+		t.Fatalf("acquire failure recovery task = %#v", task)
+	}
+	operation, err = store.GetOperation(context.Background(), request["operation_id"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("acquire failure recovery operation = %#v", operation)
+	}
+}
+
 func TestDestroyReplayDoesNotDeleteForConflictingOrStaleIdentity(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "destroy-replay.sqlite3"))
 	if err != nil {
@@ -1732,7 +1843,8 @@ func TestReconcileFinalizesPendingAbsentDestroyAfterRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := recordPendingLifecycleOperation(t, store, "destroy", task.SessionID, task.Generation, "absent-destroy-operation", true)
-	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	guest := nativeInitMissingGuest()
+	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
 	if _, err := service.reconcile(context.Background(), true); err != nil {
 		t.Fatal(err)
 	}
@@ -1749,6 +1861,48 @@ func TestReconcileFinalizesPendingAbsentDestroyAfterRestart(t *testing.T) {
 	}
 	if operation == nil || operation.Response["outcome"] != "success" {
 		t.Fatalf("destroy journal was not finalized = %#v", operation)
+	}
+}
+
+func TestReconcileConsumesPreparedAbsentDestroyWithoutNativeWorker(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "prepared-absent-destroy.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	task := state.Task{TaskID: "prepared-absent-destroy-task", SessionID: "prepared-absent-destroy-session", Generation: 4, State: stateAbsent, InstanceName: "agent-prepared-absent-destroy", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}"}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": task.SessionID, "generation": task.Generation, "operation_id": "prepared-absent-destroy"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), request["operation_id"].(string), "destroy", stringPointer(task.SessionID), &task.Generation, map[string]any{
+		"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest,
+		"worker": map[string]any{"state": "starting", "prepared_at": "2026-10-27T00:00:00Z"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Guest: nativeInitMissingGuest(), Clock: func() time.Time { return now }})
+	if _, err := service.reconcile(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := store.GetTask(context.Background(), map[string]any{"session_id": task.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != nil {
+		t.Fatalf("prepared absent destroy left task = %#v", remaining)
+	}
+	operation, err := store.GetOperation(context.Background(), request["operation_id"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "success" {
+		t.Fatalf("prepared absent destroy journal = %#v", operation)
 	}
 }
 
@@ -1797,6 +1951,8 @@ func TestNativeInitRecoveryRequiresVerifiedExitedWorkers(t *testing.T) {
 		{name: "starting", worker: map[string]any{"state": "starting"}},
 		{name: "running", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "running"}},
 		{name: "orphaned", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "orphaned", "observed_at": "2026-10-27T00:00:00Z"}},
+		{name: "missing-process-group", worker: map[string]any{"pid": int64(1234), "start_time": "1", "state": "finished", "finished_at": "2026-10-27T00:00:00Z"}},
+		{name: "zero-process-group", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(0), "state": "finished", "finished_at": "2026-10-27T00:00:00Z"}},
 		{name: "timed-out", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "finished", "finished_at": "2026-10-27T00:00:00Z", "timed_out": true}},
 		{name: "timed-out-string", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "finished", "finished_at": "2026-10-27T00:00:00Z", "timed_out": "true"}},
 		{name: "timed-out-number", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "finished", "finished_at": "2026-10-27T00:00:00Z", "timed_out": int64(1)}},
@@ -1842,6 +1998,73 @@ func TestNativeInitRecoveryRequiresVerifiedExitedWorkers(t *testing.T) {
 	}
 }
 
+func TestNativeInitRecoveryAcceptsVerifiedPreSpawnFailure(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-init-pre-spawn.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	task := insertNativeInitRecoveryTask(t, store, now)
+	request := recordPendingLifecycleOperation(t, store, "acquire", task.SessionID, 0, "native-init-pre-spawn", true)
+	if err := store.UpdateOperationResponse(context.Background(), request["operation_id"].(string), func(response map[string]any) error {
+		response["worker"] = map[string]any{
+			"state": "exited", "start_attempted": true, "pre_spawn": true,
+			"finished_at": "2026-10-27T00:00:00Z",
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Guest: nativeInitMissingGuest(), Clock: func() time.Time { return now }})
+	if _, err := service.reconcile(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := store.GetTask(context.Background(), map[string]any{"session_id": task.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.State != stateAbsent || recovered.ReservationBytes != 0 {
+		t.Fatalf("pre-spawn recovery task = %#v", recovered)
+	}
+	operation, err := store.GetOperation(context.Background(), request["operation_id"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("pre-spawn operation = %#v", operation)
+	}
+}
+
+func TestNativeInitRecoveryBoundsNativeAbsenceQuery(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-init-timeout.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	task := insertNativeInitRecoveryTask(t, store, now)
+	recordPendingLifecycleOperation(t, store, "acquire", task.SessionID, 0, "native-init-timeout", true)
+	cfg := config.Defaults()
+	cfg.WorkerTimeoutSeconds = 1
+	service := New(store, cfg, Options{Guest: &startupGuest{configWait: true}, Clock: func() time.Time { return now }})
+	started := time.Now()
+	recovered, err := service.reconcileVerifiedNativeInitAbsence(context.Background(), task, "")
+	if !recovered || err == nil {
+		t.Fatalf("timed-out native query = recovered=%v err=%v", recovered, err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("native absence query exceeded bounded timeout: %s", elapsed)
+	}
+	current, err := store.GetTask(context.Background(), map[string]any{"session_id": task.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current == nil || current.State != stateFailed || current.ReservationBytes != task.ReservationBytes {
+		t.Fatalf("timed-out native query changed task = %#v", current)
+	}
+}
+
 func TestAdminReconcileExcludesItsOwnPendingJournalFromNativeInitProof(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-init-admin-journal.sqlite3"))
 	if err != nil {
@@ -1871,6 +2094,53 @@ func TestAdminReconcileExcludesItsOwnPendingJournalFromNativeInitProof(t *testin
 	}
 	if pending, err := store.PendingOperations(context.Background()); err != nil || len(pending) != 0 {
 		t.Fatalf("admin reconcile journals = %#v, err=%v", pending, err)
+	}
+}
+
+func TestReconcileRetriesInterruptedAdminReconcileBeforeNativeInitProof(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-init-admin-retry.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	task := insertNativeInitRecoveryTask(t, store, now)
+	recordPendingLifecycleOperation(t, store, "acquire", task.SessionID, 0, "native-init-admin-retry-acquire", true)
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "admin-reconcile", "session_id": task.SessionID,
+		"generation": int64(0), "operation_id": "native-init-admin-retry", "apply": true,
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(context.Background(), request["operation_id"].(string), "admin-reconcile", stringPointer(task.SessionID), &generation, map[string]any{
+		"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest,
+		"_recovery_attempts": int64(1), "worker": map[string]any{"state": "finished"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Guest: nativeInitMissingGuest(), Clock: func() time.Time { return now }})
+	if _, err := service.reconcile(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := store.GetTask(context.Background(), map[string]any{"session_id": task.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.State != stateAbsent {
+		t.Fatalf("reconciled task = %#v", recovered)
+	}
+	operation, err := store.GetOperation(context.Background(), request["operation_id"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "success" {
+		t.Fatalf("reconciled maintenance operation = %#v", operation)
+	}
+	if pending, err := store.PendingOperations(context.Background()); err != nil || len(pending) != 0 {
+		t.Fatalf("pending journals after retry = %#v, err=%v", pending, err)
 	}
 }
 

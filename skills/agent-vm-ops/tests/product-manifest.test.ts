@@ -24,6 +24,7 @@ test("format-4 manifest fixes product identity, source, toolchain, state and act
     const manifest = build_product_manifest("1.0.0", "a".repeat(40), artifacts, { target: { os: "source", arch: "any" }, transport: "legacy-bun", operations: default_operations() });
     expect(manifest.format).toBe(4);
     expect(manifest.version).toBe("1.0.0");
+    expect(manifest.release_id).toBe("a".repeat(40));
     expect(manifest.source_revision).toBe("a".repeat(40));
     expect(manifest.client_view.version).toBe("1.0.0");
     expect(manifest.state_compatibility?.reads).toEqual([

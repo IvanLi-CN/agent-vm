@@ -1445,6 +1445,7 @@ export type ProductTarget =
 export interface ProductManifest {
   format: 3 | 4;
   version: string;
+  release_id: string;
   source_revision: string;
   target: ProductTarget;
   toolchain: { bun: string; go: string; cgo_enabled: false };
@@ -1535,6 +1536,7 @@ export function build_product_manifest(
   return validate_product_manifest({
     format: PRODUCT_MANIFEST_FORMAT,
     version,
+    release_id: source_revision,
     source_revision,
     target: options.target ?? { os: "source", arch: "any" },
     toolchain: PRODUCT_TOOLCHAIN,
@@ -1551,12 +1553,14 @@ export function validate_product_manifest(value: unknown): ProductManifest {
   const format = Number(_require_int(root.format, "format", 1)) as 3 | 4;
   if (format !== LEGACY_PRODUCT_MANIFEST_FORMAT && format !== PRODUCT_MANIFEST_FORMAT) throw _product_error("manifest_format_unsupported", "manifest format must be 3 or 4");
   const required = format === PRODUCT_MANIFEST_FORMAT
-    ? ["actions", "artifacts", "client_view", "format", "protocol", "source_revision", "state_compatibility", "target", "toolchain", "version"]
-    : ["actions", "artifacts", "client_view", "format", "protocol", "source_revision", "target", "toolchain", "version"];
+    ? ["actions", "artifacts", "client_view", "format", "protocol", "release_id", "source_revision", "state_compatibility", "target", "toolchain", "version"]
+    : ["actions", "artifacts", "client_view", "format", "protocol", "release_id", "source_revision", "target", "toolchain", "version"];
   if (!_same_keys(root, required)) throw _product_error("manifest_invalid", "product manifest has an unexpected shape");
   const version = _require_string(root.version, "version");
   try { parseSemVer(version); } catch { throw _product_error("manifest_invalid", "version must be valid SemVer 2.0.0"); }
+  const release_id = _require_string(root.release_id, "release_id", SOURCE_REVISION_RE);
   const source_revision = _require_string(root.source_revision, "source_revision", SOURCE_REVISION_RE);
+  if (release_id !== source_revision) throw _product_error("manifest_invalid", "release_id must equal source_revision");
   const target = _product_target(root.target);
   const toolchain = _require_mapping(root.toolchain, "toolchain");
   if (!_same_keys(toolchain, ["bun", "cgo_enabled", "go"]) || toolchain.bun !== PRODUCT_TOOLCHAIN.bun || toolchain.go !== PRODUCT_TOOLCHAIN.go || toolchain.cgo_enabled !== false) throw _product_error("manifest_invalid", "toolchain does not match the fixed release toolchain");
@@ -1565,7 +1569,7 @@ export function validate_product_manifest(value: unknown): ProductManifest {
   const actions = _product_actions(root.actions);
   const view = _require_mapping(root.client_view, "client_view");
   if (!_same_keys(view, ["actions", "protocol", "source_revision", "transport", "version"]) || view.version !== version || view.source_revision !== source_revision || Number(view.protocol) !== PROTOCOL_VERSION || (view.transport !== "legacy-bun" && view.transport !== "go-request") || !_json_equal(view.actions, actions)) throw _product_error("manifest_invalid", "client_view does not match product manifest");
-  const result: ProductManifest = { format, version, source_revision, target, toolchain: { bun: PRODUCT_TOOLCHAIN.bun, go: PRODUCT_TOOLCHAIN.go, cgo_enabled: false }, protocol: 4, artifacts, actions, client_view: { version, source_revision, protocol: 4, transport: view.transport, actions } };
+  const result: ProductManifest = { format, version, release_id, source_revision, target, toolchain: { bun: PRODUCT_TOOLCHAIN.bun, go: PRODUCT_TOOLCHAIN.go, cgo_enabled: false }, protocol: 4, artifacts, actions, client_view: { version, source_revision, protocol: 4, transport: view.transport, actions } };
   if (format === PRODUCT_MANIFEST_FORMAT) {
     const compatibility = _require_mapping(root.state_compatibility, "state_compatibility");
     if (!_same_keys(compatibility, ["reads", "writes"])) throw _product_error("manifest_invalid", "state_compatibility has an unexpected shape");

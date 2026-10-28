@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 
 import { compareSemVer, parseSemVer, resolveReleaseTarget } from "../scripts/semver.ts";
 import { GhGithubAdapter, GithubReleaseStateStore, ReleaseStateStore, type ReleaseIdentity } from "../scripts/release-coordinator.ts";
-import { assertContractPreconditions, assertWorkflowPlatformAttestation, successfulMainGate, verifyReleaseView } from "../scripts/release.ts";
+import { assertContractPreconditions, assertWorkflowPlatformAttestation, releaseBuilderCommand, successfulMainGate, verifyReleaseView } from "../scripts/release.ts";
 
 const identity = (overrides: Partial<ReleaseIdentity> = {}): ReleaseIdentity => ({
   version: "1.0.0",
@@ -39,6 +39,14 @@ test("SemVer target resolution requires a trusted baseline", () => {
   let symbolicError = false;
   try { resolveReleaseTarget("major", []); } catch { symbolicError = true; }
   if (!symbolicError) throw new Error("symbolic target without a final baseline was accepted");
+});
+
+test("release assets select the fixed native Go builder", () => {
+  const source = "a".repeat(40);
+  const client = releaseBuilderCommand("1.0.3", source, "client", "/tmp/client.tar");
+  const native = releaseBuilderCommand("1.0.3", source, "linux/amd64", "/tmp/native.tar");
+  if (!client.some((value) => value.endsWith("build_product_release.ts")) || !client.includes("--version")) throw new Error("client assets did not select the product builder");
+  if (!native.some((value) => value.endsWith("build_go_release.ts")) || native.includes("--version")) throw new Error("native assets did not select the Go builder");
 });
 
 test("release reservation is append-only and identity-bound", () => {

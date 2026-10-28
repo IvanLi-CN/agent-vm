@@ -626,7 +626,7 @@ def validate_product_manifest(value: Any, *, allow_historical_web_config_mode: b
     format_value = _require_int(root.get("format"), "format", 1)
     if format_value not in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
         raise _error("manifest_format_unsupported", "manifest format must be 3 or 4")
-    required = {"format", "version", "source_revision", "protocol", "target", "toolchain", "artifacts", "actions", "client_view"}
+    required = {"format", "version", "release_id", "source_revision", "protocol", "target", "toolchain", "artifacts", "actions", "client_view"}
     if format_value == PRODUCT_MANIFEST_FORMAT:
         required.add("state_compatibility")
     if set(root) != required:
@@ -634,7 +634,10 @@ def validate_product_manifest(value: Any, *, allow_historical_web_config_mode: b
     version = _require_string(root["version"], "version")
     if SEMVER_RE.fullmatch(version) is None:
         raise _error("manifest_invalid", "product version must be valid SemVer 2.0.0")
+    release_id = _require_string(root["release_id"], "release_id", RELEASE_ID_RE)
     source_revision = _require_string(root["source_revision"], "source_revision", SOURCE_REVISION_RE)
+    if release_id != source_revision:
+        raise _error("manifest_invalid", "release_id must equal source_revision")
     if _require_int(root["protocol"], "protocol", 1) != PROTOCOL_VERSION:
         raise _error("protocol_unsupported", f"manifest protocol must be {PROTOCOL_VERSION}")
     target = _require_mapping(root["target"], "target")
@@ -684,6 +687,7 @@ def validate_product_manifest(value: Any, *, allow_historical_web_config_mode: b
     result = {
         "format": format_value,
         "version": version,
+        "release_id": release_id,
         "source_revision": source_revision,
         "protocol": PROTOCOL_VERSION,
         "target": {"os": target["os"], "arch": target["arch"]},
