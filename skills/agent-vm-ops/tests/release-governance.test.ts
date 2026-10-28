@@ -150,4 +150,5 @@ test("draft release lookup accepts an untagged draft only when its target is bou
   let wrongSourceRejected = false;
   try { verifyReleaseView(view, "v1.0.0", true, { package: "/tmp/package" }, "e".repeat(40)); } catch { wrongSourceRejected = true; }
   if (!wrongSourceRejected) throw new Error("draft release target binding was not enforced");
+  verifyReleaseView({ tagName: "v1.0.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: false, assets: [{ name: "package" }] }, "v1.0.0", false, { package: "/tmp/package" }, source);
 });
