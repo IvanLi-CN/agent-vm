@@ -1969,6 +1969,7 @@ func TestReconcileRetriesInterruptedAdminReconcileBeforeNativeInitProof(t *testi
 	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
 	task := insertNativeInitRecoveryTask(t, store, now)
 	recordPendingLifecycleOperation(t, store, "acquire", task.SessionID, 0, "native-init-admin-retry-acquire", true)
+	recordPendingLifecycleOperation(t, store, "destroy", task.SessionID, task.Generation, "native-init-admin-retry-destroy", true)
 	request := protocol.Request{
 		"protocol": protocol.Version, "action": "admin-reconcile", "session_id": task.SessionID,
 		"generation": int64(0), "operation_id": "native-init-admin-retry", "apply": true,
@@ -1992,7 +1993,7 @@ func TestReconcileRetriesInterruptedAdminReconcileBeforeNativeInitProof(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovered == nil || recovered.State != stateAbsent {
+	if recovered != nil {
 		t.Fatalf("reconciled task = %#v", recovered)
 	}
 	operation, err := store.GetOperation(context.Background(), request["operation_id"].(string))
