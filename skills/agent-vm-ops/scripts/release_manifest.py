@@ -158,9 +158,9 @@ GO_FIXED_ARTIFACTS = frozenset({
     ("unit:agent-vm-native.service", "systemd/agent-vm-native.service", "unit", 0o644),
 })
 
-# Format 3 is the product identity.  The protocol-4 release_id field is not
-# published in this format; readers derive that compatibility identity from
-# source_revision when talking to older protocol peers.
+# Format 3 is the product identity.  The manifest carries the SHA-derived
+# release_id required by the deployment boundary; product identity remains the
+# SemVer version.
 PRODUCT_MANIFEST_FORMAT = 3
 PRODUCT_BUN_TOOLCHAIN = "1.4.4"
 PRODUCT_GO_TOOLCHAIN = "go1.27.3"
@@ -589,7 +589,7 @@ def validate_go_manifest(value: Any) -> dict[str, Any]:
 def validate_product_manifest(value: Any) -> dict[str, Any]:
     """Validate the SemVer product manifest without executing its artifacts."""
     root = _require_mapping(value, "manifest")
-    required = {"format", "version", "source_revision", "protocol", "target", "toolchain", "artifacts", "actions", "client_view"}
+    required = {"format", "version", "release_id", "source_revision", "protocol", "target", "toolchain", "artifacts", "actions", "client_view"}
     if set(root) != required:
         raise _error("manifest_invalid", "product manifest has an unexpected shape", {"fields": sorted(set(root) ^ required)})
     if _require_int(root["format"], "format", 1) != PRODUCT_MANIFEST_FORMAT:
@@ -597,7 +597,10 @@ def validate_product_manifest(value: Any) -> dict[str, Any]:
     version = _require_string(root["version"], "version")
     if SEMVER_RE.fullmatch(version) is None:
         raise _error("manifest_invalid", "product version must be valid SemVer 2.0.0")
+    release_id = _require_string(root["release_id"], "release_id", RELEASE_ID_RE)
     source_revision = _require_string(root["source_revision"], "source_revision", SOURCE_REVISION_RE)
+    if release_id != source_revision:
+        raise _error("manifest_invalid", "release_id must equal source_revision")
     if _require_int(root["protocol"], "protocol", 1) != PROTOCOL_VERSION:
         raise _error("protocol_unsupported", f"manifest protocol must be {PROTOCOL_VERSION}")
     target = _require_mapping(root["target"], "target")
@@ -637,6 +640,7 @@ def validate_product_manifest(value: Any) -> dict[str, Any]:
     return {
         "format": PRODUCT_MANIFEST_FORMAT,
         "version": version,
+        "release_id": release_id,
         "source_revision": source_revision,
         "protocol": PROTOCOL_VERSION,
         "target": {"os": target["os"], "arch": target["arch"]},

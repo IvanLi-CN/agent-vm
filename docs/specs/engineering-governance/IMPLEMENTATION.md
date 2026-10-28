@@ -17,7 +17,7 @@
 - 现有检查包含 Ubuntu/macOS、Bun 类型检查、仓库检查、两套 Bun 测试、Go tests/vet、Linux amd64/arm64 构建和 Ubuntu race 检查。
 - `main` 当时未启用分支保护或 ruleset，无平台强制 required checks 或签名提交要求；基线提交本身的有效签名不能代替分支政策。
 - `0.4.0-native` 没有正式发布记录，不是产品版本基线；新生产构建器要求 SemVer，首版只能是 `1.0.0`。
-- format 3 将产品 `version` 与源码 `source_revision` 分开；协议 4 的兼容适配仍从源码 SHA 生成旧 `release_id`，旧格式 1/2 只读。
+- format 3 将产品 `version` 与源码 `source_revision` 分开，并显式携带同一 SHA 的 `release_id` 供部署边界和协议兼容复用；旧格式 1/2 只读。
 - 新增统一产品包构建、format 3 跨语言校验、GitHub `release-state/<stage>/<version>` 只创建 ref、append-only reservation/recovery 协调器和 `gh` adapter；平台保护与 immutable Release 仍是启用前置条件。
 - 现有 webhook 不被当作通知 transport；项目合同明确 transport `unselected`，失败 sidecar 在 selection gate 阶段 fail-closed。
 - GitHub Release immutability、main ruleset、required checks、签名提交和真实通知配置没有在本 PR 修改；`platform-audit.ts` 只读报告当前 `unavailable/blocked` 差距，合同状态保留为 `audit-required`。
