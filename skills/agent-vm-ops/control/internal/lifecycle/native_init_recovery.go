@@ -152,7 +152,7 @@ func (s *Service) reconcileVerifiedNativeInitAbsence(ctx context.Context, candid
 			return nil, nativeInitRecoveryBlocked("native-init recovery task changed before commit", map[string]any{"task_id": current.TaskID})
 		}
 		if destroyRequest != nil {
-			if err := s.deleteDestroyedTask(ctx, destroyRequest, destroyGeneration); err != nil {
+			if err := s.deleteDestroyedTask(ctx, destroyRequest, destroyGeneration, excludedOperationID); err != nil {
 				return nil, err
 			}
 		}

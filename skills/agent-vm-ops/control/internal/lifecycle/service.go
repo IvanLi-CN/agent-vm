@@ -1369,7 +1369,7 @@ func (s *Service) verifyAbsentTask(ctx context.Context, task *state.Task, exclud
 // deleteDestroyedTask runs only after the destroy journal is terminal. It is
 // intentionally separate from releaseUnlocked so a crash cannot delete the
 // task while its operation is still pending.
-func (s *Service) deleteDestroyedTask(ctx context.Context, request protocol.Request, expectedGeneration *int64) error {
+func (s *Service) deleteDestroyedTask(ctx context.Context, request protocol.Request, expectedGeneration *int64, excludedOperationIDs ...string) error {
 	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": stringValue(request["session_id"])})
 	if err != nil {
 		return s.sqliteError(err)
@@ -1380,7 +1380,11 @@ func (s *Service) deleteDestroyedTask(ctx context.Context, request protocol.Requ
 	if expectedGeneration != nil && task.Generation != *expectedGeneration {
 		return nil
 	}
-	if err := s.verifyAbsentTask(ctx, task, "", false); err != nil {
+	excludedOperationID := ""
+	if len(excludedOperationIDs) > 0 {
+		excludedOperationID = excludedOperationIDs[0]
+	}
+	if err := s.verifyAbsentTask(ctx, task, excludedOperationID, false); err != nil {
 		return err
 	}
 	conditionGeneration := task.Generation
