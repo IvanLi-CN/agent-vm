@@ -84,12 +84,12 @@ func TestIncusQueryUsesProjectQueryParameter(t *testing.T) {
 func TestIsNotFoundRejectsUnrelatedOrUncertainFailures(t *testing.T) {
 	for _, diagnostic := range []string{"project not found", "server returned 404", "transport error: route does not exist"} {
 		err := &CommandError{Result: Result{Stderr: []byte(diagnostic)}, Cause: errors.New("command failed")}
-		if IsNotFound(err) {
+		if IsNotFound(err, "missing", "agents") {
 			t.Errorf("unrelated failure %q classified as missing instance", diagnostic)
 		}
 	}
 	err := &CommandError{Result: Result{Stderr: []byte("instance not found")}, Cause: context.DeadlineExceeded}
-	if IsNotFound(err) {
+	if IsNotFound(err, "missing", "agents") {
 		t.Fatal("timed-out query classified as missing instance")
 	}
 }
@@ -101,7 +101,23 @@ func TestIncusConfigClassifiesConfirmedMissingInstance(t *testing.T) {
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	_, err := NewIncusClient(NewRunner(), "agents").Config(context.Background(), "missing")
-	if !IsNotFound(err) {
+	if !IsNotFound(err, "missing", "agents") {
 		t.Fatalf("config error = %v, want confirmed instance missing", err)
+	}
+}
+
+func TestIncusConfigRecognizesContextualMissingInstance(t *testing.T) {
+	binDir := t.TempDir()
+	script := "#!/bin/sh\necho 'Error: Failed to fetch instance \"missing\" in projectName \"agents\": Instance not found' >&2\nexit 1\n"
+	if err := os.WriteFile(filepath.Join(binDir, "incus"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	_, err := NewIncusClient(NewRunner(), "agents").Config(context.Background(), "missing")
+	if !IsNotFound(err, "missing", "agents") {
+		t.Fatalf("contextual not-found not recognized: %v", err)
+	}
+	if IsNotFound(err, "other", "agents") || IsNotFound(err, "missing", "other") {
+		t.Fatal("unrelated instance or project classified as absent")
 	}
 }

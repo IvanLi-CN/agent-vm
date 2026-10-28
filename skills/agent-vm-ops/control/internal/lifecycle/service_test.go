@@ -1958,7 +1958,7 @@ func TestReconcileClosingDestroyRejectsUnmarkedInstance(t *testing.T) {
 		t.Fatalf("reconcile error=%v", err)
 	}
 	task, err := store.GetTask(context.Background(), map[string]any{"session_id": session})
-	if err != nil || task == nil || task.State != stateClosing || guest.deleteCalls != 0 {
+	if err != nil || task == nil || task.State != stateDeleting || task.ResourceReservationJSON == "{}" || guest.deleteCalls != 0 {
 		t.Fatalf("task=%#v, delete calls=%d, error=%v", task, guest.deleteCalls, err)
 	}
 	op, err := store.GetOperation(context.Background(), "unmarked-op")
@@ -2197,5 +2197,40 @@ func TestOrphanRecoveryContinuesAfterStaleGeneration(t *testing.T) {
 		if err != nil || op.Response["outcome"] != check.want {
 			t.Fatalf("operation=%#v, error=%v", op, err)
 		}
+	}
+}
+
+func TestReconcileClosingDestroyFinalizesVerifiedMissingInstance(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now()
+	session := "closing-missing"
+	generation := int64(1)
+	if err := store.InsertTask(ctx, state.Task{TaskID: "closing-missing-task", SessionID: session, Generation: generation, State: stateClosing, InstanceName: "closing-missing-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2}`, ResourceReservationJSON: `{"cpu":2}`}); err != nil {
+		t.Fatal(err)
+	}
+	req := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": session, "generation": generation, "operation_id": "closing-missing-op"}
+	digest, err := protocol.Digest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "closing-missing-op", "destroy", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "exited"}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Guest: &startupGuest{configErr: missingInstanceError()}})
+	if _, err := service.reconcile(ctx, true); err != nil {
+		t.Fatalf("reconcile=%v", err)
+	}
+	task, err := store.GetTask(ctx, map[string]any{"session_id": session})
+	if err != nil || task != nil {
+		t.Fatalf("task=%#v, error=%v", task, err)
+	}
+	op, err := store.GetOperation(ctx, "closing-missing-op")
+	if err != nil || op.Response["outcome"] != "success" {
+		t.Fatalf("op=%#v, error=%v", op, err)
 	}
 }

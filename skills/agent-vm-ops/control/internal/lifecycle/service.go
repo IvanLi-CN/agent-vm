@@ -899,7 +899,7 @@ func (s *Service) reconcileOrphanedAcquire(ctx context.Context, operationID stri
 	if configErr == nil {
 		return protocol.NewError("startup_reconcile_required", "orphaned acquire still has a native instance without durable task state", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false})
 	}
-	if !native.IsNotFound(configErr) {
+	if !native.IsNotFound(configErr, instanceName, s.Config.Project) {
 		return protocol.NewError("startup_reconcile_required", "orphaned acquire native outcome could not be verified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": configErr.Error()})
 	}
 	response := map[string]any{
@@ -1263,7 +1263,7 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		}
 		return s.summary(ctx, task)
 	}
-	if task.State == stateActive || task.State == statePreparing || task.State == stateFailed || (destroy && task.State == stateCached) {
+	if task.State == stateActive || task.State == statePreparing || task.State == stateFailed || (destroy && (task.State == stateCached || task.State == stateClosing)) {
 		targetState := stateClosing
 		if destroy {
 			targetState = stateDeleting
@@ -2321,7 +2321,7 @@ func (s *Service) verifyOwnership(ctx context.Context, task *state.Task) (map[st
 	info, err := s.Guest.Config(ctx, task.InstanceName)
 	if err != nil {
 		detail := map[string]any{"cause": err.Error(), "outcome_verified": false}
-		if native.IsNotFound(err) {
+		if native.IsNotFound(err, task.InstanceName, s.Config.Project) {
 			detail["native_missing"] = true
 		}
 		return nil, protocol.NewError("ownership_mismatch", "native instance configuration could not be read", detail)
