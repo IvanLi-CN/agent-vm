@@ -1758,7 +1758,7 @@ func normalizeMaintenanceParameters(action string, parameters map[string]any) (m
 	if parameters == nil {
 		parameters = map[string]any{}
 	}
-	if action != "drain_enter" && action != "drain_exit" && action != "reconcile" && action != "gc" {
+	if action != "drain_enter" && action != "reconcile" && action != "gc" {
 		return nil, errors.New("maintenance action is not supported")
 	}
 	for key := range parameters {
@@ -1991,7 +1991,7 @@ func validateOperationQuery(query url.Values) error {
 	if value := query.Get("status"); value != "" && !containsString([]string{"awaiting_upload", "queued", "running", "reconciling", "succeeded", "failed", "outcome_unknown"}, value) {
 		return errors.New("status is invalid")
 	}
-	if value := query.Get("action"); value != "" && !containsString([]string{"restart", "resize", "release", "destroy", "port_add", "port_remove", "image_import", "default_image_select", "image_retire", "image_delete", "drain_enter", "drain_exit", "reconcile", "gc"}, value) {
+	if value := query.Get("action"); value != "" && !containsString([]string{"restart", "resize", "release", "destroy", "port_add", "port_remove", "image_import", "default_image_select", "image_retire", "image_delete", "drain_enter", "reconcile", "gc"}, value) {
 		return errors.New("action is invalid")
 	}
 	return nil
@@ -2135,8 +2135,18 @@ func safeOperationError(value map[string]any, operationID, fallbackPhase string)
 	phase = normalizePhase(phase)
 	retryable, _ := value["retryable"].(bool)
 	result := map[string]any{"code": code, "phase": phase, "retryable": retryable, "operation_id": operationID}
+	safeFields := map[string]any{}
 	if refs, ok := value["references"]; ok {
-		result["safe_fields"] = map[string]any{"affected_references": refs}
+		safeFields["affected_references"] = refs
+	}
+	if fingerprint, ok := value["imported_fingerprint"].(string); ok && managementFingerprintPattern.MatchString(fingerprint) {
+		safeFields["imported_fingerprint"] = fingerprint
+	}
+	if cleanup, ok := value["cleanup"].(string); ok && containsString([]string{"verified", "unverified", "blocked_catalog_unverified", "backend_unavailable"}, cleanup) {
+		safeFields["cleanup"] = cleanup
+	}
+	if len(safeFields) > 0 {
+		result["safe_fields"] = safeFields
 	}
 	return result
 }

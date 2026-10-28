@@ -82,25 +82,27 @@ func (backend *IncusImageBackend) DeleteImage(ctx context.Context, fingerprint s
 }
 
 func (backend *IncusImageBackend) artifact(ctx context.Context, fingerprint string) (ImageArtifact, error) {
+	partial := ImageArtifact{Fingerprint: fingerprint}
 	info, err := backend.Client.QueryImage(ctx, fingerprint)
 	if err != nil {
-		return ImageArtifact{}, uncertainBackendError(err)
+		return partial, uncertainBackendError(err)
 	}
 	if info.Fingerprint != fingerprint {
-		return ImageArtifact{}, fmt.Errorf("image fingerprint changed during import")
+		return partial, fmt.Errorf("image fingerprint changed during import")
 	}
 	verification, err := backend.Client.VerifyImage(ctx, fingerprint, backend.RequiredTools)
 	if err != nil {
-		return ImageArtifact{}, uncertainBackendError(err)
+		return partial, uncertainBackendError(err)
 	}
-	return ImageArtifact{
+	partial = ImageArtifact{
 		Fingerprint:  info.Fingerprint,
 		Architecture: info.Architecture,
 		InstanceType: info.InstanceType,
 		Runtime:      verification.Runtime,
 		SyncTool:     verification.SyncTool,
 		GuestReady:   verification.GuestReady,
-	}, nil
+	}
+	return partial, nil
 }
 
 func uncertainBackendError(err error) error {

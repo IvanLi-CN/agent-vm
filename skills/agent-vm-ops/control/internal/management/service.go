@@ -503,11 +503,7 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 	}
 	artifact, err := s.Options.Backend.ImportLocal(ctx, request.Source.Format, metadata, rootfs)
 	if err != nil {
-		status := "failed"
-		if isUncertain(err) {
-			status = "outcome_unknown"
-		}
-		return s.finishOperation(ctx, operation, "reconciliation", status, nil, safeError(err))
+		return s.finishBackendImportFailure(ctx, operation, artifact, err)
 	}
 	return s.finishImport(ctx, operation, *request, artifact)
 }
@@ -575,11 +571,7 @@ func (s *Service) UploadImageImportFiles(ctx context.Context, operationID, metad
 		artifact, err = s.Options.Backend.ImportLocal(ctx, request.Source.Format, metadata, rootfs)
 	}
 	if err != nil {
-		status := "failed"
-		if isUncertain(err) {
-			status = "outcome_unknown"
-		}
-		return s.finishOperation(ctx, operation, "reconciliation", status, nil, safeError(err))
+		return s.finishBackendImportFailure(ctx, operation, artifact, err)
 	}
 	return s.finishImport(ctx, operation, *request, artifact)
 }
@@ -686,13 +678,37 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 	defer release()
 	artifact, err := s.Options.Backend.ImportTrusted(ctx, request.Source.SourceID, request.Source.ExpectedFingerprint)
 	if err != nil {
-		status := "failed"
-		if isUncertain(err) {
-			status = "outcome_unknown"
-		}
-		return s.finishOperation(ctx, operation, "reconciliation", status, nil, safeError(err))
+		return s.finishBackendImportFailure(ctx, operation, artifact, err)
 	}
 	return s.finishImport(ctx, operation, request, artifact)
+}
+
+// finishBackendImportFailure preserves a fingerprint returned by a native
+// importer even when post-import inspection fails. The authority attempts one
+// bounded cleanup, and the durable error records enough safe evidence to find
+// an untracked native image when cleanup cannot be verified.
+func (s *Service) finishBackendImportFailure(ctx context.Context, operation *state.ManagementOperation, artifact ImageArtifact, importErr error) (*state.ManagementOperation, error) {
+	detail := safeError(importErr)
+	status := "failed"
+	if isUncertain(importErr) {
+		status = "outcome_unknown"
+	}
+	if fingerprintPattern.MatchString(artifact.Fingerprint) {
+		detail["imported_fingerprint"] = artifact.Fingerprint
+		if s.Options.Backend != nil {
+			if cleanupErr := s.Options.Backend.DeleteImage(ctx, artifact.Fingerprint); cleanupErr == nil {
+				detail["cleanup"] = "verified"
+				status = "failed"
+			} else {
+				detail["cleanup"] = "unverified"
+				status = "outcome_unknown"
+			}
+		} else {
+			detail["cleanup"] = "backend_unavailable"
+			status = "outcome_unknown"
+		}
+	}
+	return s.finishOperation(ctx, operation, "reconciliation", status, nil, detail)
 }
 
 // RecoverOperation turns an interrupted native operation into a deterministic

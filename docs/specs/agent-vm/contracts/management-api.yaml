@@ -1580,10 +1580,10 @@ components:
             $ref: "#/components/schemas/SourceFreshness"
     MaintenanceAction:
       type: string
-      enum: [drain_enter, drain_exit, reconcile, gc]
+      enum: [drain_enter, reconcile, gc]
     ManagementAction:
       type: string
-      enum: [restart, resize, release, destroy, port_add, port_remove, image_import, default_image_select, image_retire, image_delete, drain_enter, drain_exit, reconcile, gc]
+      enum: [restart, resize, release, destroy, port_add, port_remove, image_import, default_image_select, image_retire, image_delete, drain_enter, reconcile, gc]
     OperationPhase:
       type: string
       enum: [queued, awaiting_upload, upload, integrity_check, image_import, suitability_check, reference_check, native_action, reconciliation, cleanup, completed]

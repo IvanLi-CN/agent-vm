@@ -180,7 +180,7 @@ export async function submitImageAction(fingerprint: string, action: "default" |
   return createMockOperation(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", { kind: "image", id: fingerprint }, reason);
 }
 
-export async function previewMaintenance(action: "drain_enter" | "drain_exit" | "reconcile" | "gc", currentResourceVersion?: string): Promise<ActionPreview> {
+export async function previewMaintenance(action: "drain_enter" | "reconcile" | "gc", currentResourceVersion?: string): Promise<ActionPreview> {
   if (useRealApi) {
     const targetVersion = currentResourceVersion ?? (await getSystem()).resource_version;
     return realRequest("/system/maintenance/preview", { method: "POST", body: JSON.stringify({ action, target_version: targetVersion, parameters: { apply: true } }) });
@@ -188,7 +188,7 @@ export async function previewMaintenance(action: "drain_enter" | "drain_exit" | 
   return delay({ target_version: mockState.system.resource_version, confirmation_token: `synthetic-confirmation-${createOperationId()}`, expires_at: "2026-01-15T10:25:00Z", impact: { summary_code: "maintenance_preview", affected_session_count: action === "drain_enter" ? mockState.overview.task_counts.active : 0, affected_image_references: { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 }, changes: [{ code: action, count: null, value: null }] } });
 }
 
-export async function submitMaintenance(action: "drain_enter" | "drain_exit" | "reconcile" | "gc", reason: string, preview: ActionPreview, operationId = createOperationId()): Promise<Operation> {
+export async function submitMaintenance(action: "drain_enter" | "reconcile" | "gc", reason: string, preview: ActionPreview, operationId = createOperationId()): Promise<Operation> {
   if (useRealApi) return realRequest("/system/maintenance", { method: "POST", body: JSON.stringify({ operation_id: operationId, reason, target_version: preview.target_version, action, confirmation_token: preview.confirmation_token, parameters: { apply: true } }) });
   return createMockOperation(action, { kind: "system", id: "system" }, reason);
 }

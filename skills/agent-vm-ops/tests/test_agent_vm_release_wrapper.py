@@ -91,10 +91,29 @@ class WrapperTests(unittest.TestCase):
             [str(WRAPPER.GO_CONTROL_PATH), "request", "--socket", str(WRAPPER.GO_CONTROL_SOCKET), "--timeout", "30s"],
         )
         self.assertEqual(
-            json.loads(run.call_args.kwargs["input"]),
+            json.loads(run.call_args_list[0].kwargs["input"]),
             {"protocol": 4, "action": "drain-status"},
         )
+        self.assertEqual(
+            json.loads(run.call_args_list[1].kwargs["input"]),
+            {"protocol": 4, "action": "admin-metrics"},
+        )
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
+
+    def test_drain_verification_rejects_inflight_management_operations(self):
+        self.drain_patch.stop()
+        responses = [
+            json.dumps({"ok": True, "result": {"draining": True}}).encode(),
+            json.dumps({"ok": True, "result": {"pending_operations": [{"operation_id": "running"}]}}).encode(),
+        ]
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            side_effect=[subprocess.CompletedProcess([], 0, response, b"") for response in responses],
+        ):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(failure.exception.code, "drain_unverified")
 
     def test_drain_verification_checks_target_state_compatibility(self):
         self.drain_patch.stop()

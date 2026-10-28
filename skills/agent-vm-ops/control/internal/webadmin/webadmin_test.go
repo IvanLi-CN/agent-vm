@@ -70,6 +70,26 @@ func TestAuthorityRejectsUntrustedPeer(t *testing.T) {
 	}
 }
 
+func TestSafeOperationErrorPreservesImportRecoveryEvidence(t *testing.T) {
+	fingerprint := strings.Repeat("b", 64)
+	value := safeOperationError(map[string]any{
+		"code": "internal_error", "phase": "reconciliation", "retryable": true,
+		"imported_fingerprint": fingerprint, "cleanup": "unverified",
+	}, "operation-1", "reconciliation")
+	fields, ok := value["safe_fields"].(map[string]any)
+	if !ok || fields["imported_fingerprint"] != fingerprint || fields["cleanup"] != "unverified" {
+		t.Fatalf("recovery evidence = %#v", value)
+	}
+	if strings.Contains(jsonString(value), "catalog_error") {
+		t.Fatalf("internal catalog diagnostic leaked: %#v", value)
+	}
+}
+
+func jsonString(value any) string {
+	raw, _ := json.Marshal(value)
+	return string(raw)
+}
+
 func TestAuthorityListsImagesOnlyForAuthorizedPeer(t *testing.T) {
 	authority, _, cfg := testAuthority(t)
 	request := httptest.NewRequest(http.MethodGet, "/internal/v1/management/images?limit=1", nil)

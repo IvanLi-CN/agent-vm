@@ -133,8 +133,19 @@ func TestIncusImageBackendMarksPostImportReadFailuresUncertain(t *testing.T) {
 	fingerprint := strings.Repeat("f", 64)
 	client := &fakeIncusImageClient{queryErr: errors.New("image query failed")}
 	backend := NewIncusImageBackend(client, "/var/lib/agent-vm-native/staging", nil)
-	if _, err := backend.ImportTrusted(context.Background(), "approved", fingerprint); err == nil || !isUncertain(err) {
+	artifact, err := backend.ImportTrusted(context.Background(), "approved", fingerprint)
+	if err == nil || !isUncertain(err) {
 		t.Fatalf("query failure uncertainty = %v", err)
+	}
+	if artifact.Fingerprint != fingerprint {
+		t.Fatalf("query failure lost imported fingerprint: %#v", artifact)
+	}
+
+	client = &fakeIncusImageClient{info: native.ImageInfo{Fingerprint: fingerprint}, verifyErr: errors.New("verification failed")}
+	backend = NewIncusImageBackend(client, "/var/lib/agent-vm-native/staging", nil)
+	artifact, err = backend.ImportTrusted(context.Background(), "approved", fingerprint)
+	if err == nil || !isUncertain(err) || artifact.Fingerprint != fingerprint {
+		t.Fatalf("verification failure artifact=%#v err=%v", artifact, err)
 	}
 }
 

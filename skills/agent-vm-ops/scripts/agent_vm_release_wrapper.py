@@ -1026,26 +1026,40 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
         view = metadata.get("client_view") if isinstance(metadata, Mapping) else None
         if isinstance(metadata, Mapping) and metadata.get("format") in {GO_MANIFEST_FORMAT, LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT} and isinstance(view, Mapping) and view.get("transport") == "go-request":
             command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
-    try:
-        process = subprocess.run(
-            command,
-            input=json.dumps({"protocol": 4, "action": "drain-status"}).encode(),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        _fail("drain_unverified", "cannot verify admission drain")
-    if process.returncode != 0:
-        _fail("drain_unverified", "current control process did not verify admission drain")
-    try:
-        response = json.loads(process.stdout)
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        _fail("drain_unverified", "drain status response is invalid")
-    if not isinstance(response, dict) or response.get("ok") is not True:
-        _fail("drain_unverified", "drain status response was not successful")
-    result = response.get("result")
+    def control_result(action: str, *, allow_legacy_unknown: bool = False) -> Mapping[str, Any] | None:
+        try:
+            process = subprocess.run(
+                command,
+                input=json.dumps({"protocol": 4, "action": action}).encode(),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            _fail("drain_unverified", "current control process could not verify release state")
+        try:
+            response = json.loads(process.stdout)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            _fail("drain_unverified", "control response is invalid")
+        if not isinstance(response, dict):
+            _fail("drain_unverified", "control response is invalid")
+        if response.get("ok") is not True:
+            error = response.get("error")
+            code = error.get("code") if isinstance(error, Mapping) else None
+            if allow_legacy_unknown and code in {"unknown_action", "unsupported_action"}:
+                return None
+            _fail("drain_unverified", "control response was not successful")
+        if process.returncode != 0:
+            _fail("drain_unverified", "current control process did not verify release state")
+        result = response.get("result")
+        if not isinstance(result, Mapping):
+            _fail("drain_unverified", "control response result is invalid")
+        return result
+
+    result = control_result("drain-status")
+    if result is None:
+        _fail("drain_unverified", "drain status response is unavailable")
     if not isinstance(result, Mapping):
         _fail("drain_unverified", "drain status result is invalid")
     if result.get("draining") is not True:
@@ -1055,6 +1069,19 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
         if capabilities is None:
             capabilities = _read_live_state_capabilities()
         _validate_state_compatibility(target_manifest, capabilities)
+
+    # A wrapper activation is a second, independent fence around the
+    # publisher's convergence loop. Newer authorities expose active
+    # management operations; older protocol-4 controllers may not know this
+    # read-only action, in which case the publisher's legacy task checks remain
+    # the available contract.
+    metrics = control_result("admin-metrics", allow_legacy_unknown=True)
+    if metrics is not None and "pending_operations" in metrics:
+        pending = metrics["pending_operations"]
+        if not isinstance(pending, list):
+            _fail("drain_unverified", "control returned an invalid pending-operation list")
+        if pending:
+            _fail("drain_unverified", "release activation requires management operations to converge", {"pending_operations": pending[:100]})
 
 
 def _daemon_reload() -> None:

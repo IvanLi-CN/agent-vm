@@ -45,7 +45,7 @@ export function stateLabel(state: string, locale: Locale): string {
 
 export function actionLabel(action: string, locale: Locale): string {
   const labels: Record<string, [string, string]> = {
-    restart: ["重启", "Restart"], resize: ["扩容", "Resize"], release: ["释放租约", "Release lease"], destroy: ["销毁", "Destroy"], port_add: ["添加端口", "Add port"], port_remove: ["移除端口", "Remove port"], image_import: ["导入镜像", "Import image"], default_image_select: ["切换默认镜像", "Select default image"], image_retire: ["退役镜像", "Retire image"], image_delete: ["删除镜像", "Delete image"], drain_enter: ["进入排空", "Enter drain"], drain_exit: ["退出排空", "Exit drain"], reconcile: ["恢复核对", "Reconcile"], gc: ["回收缓存", "Garbage collect"],
+    restart: ["重启", "Restart"], resize: ["扩容", "Resize"], release: ["释放租约", "Release lease"], destroy: ["销毁", "Destroy"], port_add: ["添加端口", "Add port"], port_remove: ["移除端口", "Remove port"], image_import: ["导入镜像", "Import image"], default_image_select: ["切换默认镜像", "Select default image"], image_retire: ["退役镜像", "Retire image"], image_delete: ["删除镜像", "Delete image"], drain_enter: ["进入排空", "Enter drain"], reconcile: ["恢复核对", "Reconcile"], gc: ["回收缓存", "Garbage collect"],
   };
   return labels[action]?.[locale === "zh-CN" ? 0 : 1] ?? action;
 }

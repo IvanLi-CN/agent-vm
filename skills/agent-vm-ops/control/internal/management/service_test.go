@@ -26,6 +26,11 @@ type blockingImageBackend struct {
 	once    sync.Once
 }
 
+type partialImageBackend struct {
+	fakeImageBackend
+	err error
+}
+
 func (backend *blockingImageBackend) ImportTrusted(ctx context.Context, sourceID, fingerprint string) (ImageArtifact, error) {
 	backend.once.Do(func() { close(backend.entered) })
 	select {
@@ -53,6 +58,11 @@ func (backend *fakeImageBackend) ImportLocal(context.Context, string, []byte, []
 func (backend *fakeImageBackend) DeleteImage(context.Context, string) error {
 	backend.deletes++
 	return nil
+}
+
+func (backend *partialImageBackend) ImportLocal(context.Context, string, []byte, []byte) (ImageArtifact, error) {
+	backend.imports++
+	return backend.artifact, backend.err
 }
 
 type fakeActionBackend struct {
@@ -321,6 +331,33 @@ func TestImageImportUploadStreamFailureIsDurable(t *testing.T) {
 	}
 	if len(audit) < 2 {
 		t.Fatalf("audit = %#v", audit)
+	}
+}
+
+func TestLocalImportReadFailureRecordsFingerprintAndCleanup(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	fingerprint := strings.Repeat("d", 64)
+	backend := &partialImageBackend{fakeImageBackend: fakeImageBackend{artifact: ImageArtifact{Fingerprint: fingerprint}}, err: uncertainActionError{}}
+	service := New(store, Options{UploadMaxBytes: 1024, Backend: backend})
+	content := []byte("abc")
+	request := ImportRequest{OperationID: "local-read-failure", Actor: "admin", Reason: "record cleanup evidence", TargetVersion: "image-catalog:revision-1", VersionLabel: "2026.05", Source: ImportSource{Kind: "local_upload", Format: "unified", ExpectedSHA256: digestBytes(content), ExpectedSize: int64(len(content))}}
+	operation, err := service.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished, err := service.UploadImageImport(context.Background(), operation.OperationID, content, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished.Status != "failed" || backend.imports != 1 || backend.deletes != 1 {
+		t.Fatalf("finished=%#v imports=%d deletes=%d", finished, backend.imports, backend.deletes)
+	}
+	if finished.Error["imported_fingerprint"] != fingerprint || finished.Error["cleanup"] != "verified" {
+		t.Fatalf("cleanup evidence = %#v", finished.Error)
 	}
 }
 

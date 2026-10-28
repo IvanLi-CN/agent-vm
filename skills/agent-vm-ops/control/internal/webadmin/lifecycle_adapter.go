@@ -74,7 +74,7 @@ func (actions *LifecycleActions) ExecuteMaintenance(ctx context.Context, operati
 	if actions == nil || actions.Service == nil {
 		return nil, errors.New("authority_unavailable: lifecycle service is not configured")
 	}
-	protocolAction := map[string]string{"drain_enter": "drain-enter", "drain_exit": "drain-exit", "reconcile": "admin-reconcile", "gc": "admin-gc"}[action]
+	protocolAction := map[string]string{"drain_enter": "drain-enter", "reconcile": "admin-reconcile", "gc": "admin-gc"}[action]
 	if protocolAction == "" {
 		return nil, errors.New("unsupported_action: maintenance action is not allowed")
 	}

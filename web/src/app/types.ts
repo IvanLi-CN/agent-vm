@@ -100,7 +100,7 @@ export interface ManagedImage {
 
 export type OperationStatus = "awaiting_upload" | "queued" | "running" | "reconciling" | "succeeded" | "failed" | "outcome_unknown";
 export type OperationPhase = "queued" | "awaiting_upload" | "upload" | "integrity_check" | "image_import" | "suitability_check" | "reference_check" | "native_action" | "reconciliation" | "cleanup" | "completed";
-export type ManagementAction = "restart" | "resize" | "release" | "destroy" | "port_add" | "port_remove" | "image_import" | "default_image_select" | "image_retire" | "image_delete" | "drain_enter" | "drain_exit" | "reconcile" | "gc";
+export type ManagementAction = "restart" | "resize" | "release" | "destroy" | "port_add" | "port_remove" | "image_import" | "default_image_select" | "image_retire" | "image_delete" | "drain_enter" | "reconcile" | "gc";
 
 export interface SafeError {
   code: string;
