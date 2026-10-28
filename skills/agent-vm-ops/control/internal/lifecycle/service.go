@@ -1938,12 +1938,8 @@ func (s *Service) reconcile(ctx context.Context, apply bool) (map[string]any, er
 			}
 		}
 		if task.State == stateClosing && apply {
-			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil {
-				if firstErr == nil {
-					firstErr = releaseErr
-				}
-			} else if finalizeErr := s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, "release", result); finalizeErr != nil && firstErr == nil {
-				firstErr = finalizeErr
+			if cleanupErr := s.reconcileClosing(ctx, &task); cleanupErr != nil && firstErr == nil {
+				firstErr = cleanupErr
 			}
 		}
 		if task.State == stateFailed && apply {
@@ -1967,6 +1963,45 @@ func (s *Service) reconcile(ctx context.Context, apply bool) (map[string]any, er
 	}
 	result := map[string]any{"dry_run": !apply, "actions": actions}
 	return result, firstErr
+}
+
+// A pending destroy remains authoritative even if earlier recovery left the task closing.
+func (s *Service) reconcileClosing(ctx context.Context, task *state.Task) error {
+	unlock := s.lockAction("session", protocol.Request{"session_id": task.SessionID})
+	defer unlock()
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	request := protocol.Request{"session_id": task.SessionID, "generation": task.Generation}
+	action := "release"
+	for _, op := range pending {
+		if op.Action != "destroy" || op.SessionID == nil || *op.SessionID != task.SessionID || op.Generation == nil || *op.Generation != task.Generation {
+			continue
+		}
+		if action == "destroy" || s.operationActive(op.OperationID) {
+			return protocol.NewError("operation_unverified", "pending destroy is active or ambiguous", nil)
+		}
+		worker, ok := op.Response["worker"].(map[string]any)
+		if !ok || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
+			return protocol.NewError("operation_unverified", "pending destroy worker is unresolved", nil)
+		}
+		saved, ok := op.Response["_request"].(map[string]any)
+		if !ok {
+			return protocol.NewError("operation_unverified", "pending destroy request is missing", nil)
+		}
+		request = protocol.Request(saved)
+		digest, digestErr := protocol.Digest(request)
+		if protocol.ValidateRequest(request) != nil || digestErr != nil || digest != stringValue(op.Response["_request_digest"]) || stringValue(request["action"]) != "destroy" || stringValue(request["session_id"]) != task.SessionID || intValue(request["generation"]) != task.Generation || stringValue(request["operation_id"]) != op.OperationID {
+			return protocol.NewError("operation_unverified", "pending destroy identity is inconsistent", nil)
+		}
+		action = "destroy"
+	}
+	result, err := s.releaseUnlocked(ctx, request, action == "destroy")
+	if err != nil {
+		return err
+	}
+	return s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, action, result)
 }
 
 func (s *Service) finalizePendingCleanup(ctx context.Context, session string, generation int64, action string, result map[string]any) error {

@@ -34,6 +34,7 @@ type startupGuest struct {
 	status      string
 	statuses    []map[string]any
 	statusCalls int
+	deleteCalls int
 	config      map[string]any
 	configErr   error
 	stopErr     error
@@ -68,7 +69,7 @@ func (guest *startupGuest) DeviceAdd(context.Context, string, string, string, ma
 func (guest *startupGuest) DeviceRemove(context.Context, string, string) error { return nil }
 func (guest *startupGuest) Start(context.Context, string) error                { return nil }
 func (guest *startupGuest) Stop(context.Context, string) error                 { return guest.stopErr }
-func (guest *startupGuest) Delete(context.Context, string) error               { return nil }
+func (guest *startupGuest) Delete(context.Context, string) error               { guest.deleteCalls++; return nil }
 func (guest *startupGuest) Status(context.Context, string) (map[string]any, error) {
 	index := guest.statusCalls
 	guest.statusCalls++
@@ -1843,5 +1844,125 @@ func TestWorkerRecoverySkipsBusySession(t *testing.T) {
 	op, err := store.GetOperation(context.Background(), "busy-op")
 	if err != nil || op.Response["outcome"] != "pending" {
 		t.Fatalf("operation = %#v, error = %v", op, err)
+	}
+}
+
+func TestReconcileClosingTaskHonorsPendingDestroy(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	session := "closing-destroy"
+	generation := int64(1)
+	if err := store.InsertTask(context.Background(), state.Task{TaskID: "closing-destroy-task", SessionID: session, Generation: generation, State: stateClosing, InstanceName: "closing-destroy-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": session, "generation": generation, "operation_id": "closing-destroy-op"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), "closing-destroy-op", "destroy", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": map[string]any{"state": "finished"}}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "closing-destroy-task", "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	if _, err := service.reconcile(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": session})
+	if err != nil || task != nil || guest.deleteCalls != 1 {
+		t.Fatalf("destroy should remove task and instance: %#v, calls=%d, %v", task, guest.deleteCalls, err)
+	}
+	op, err := store.GetOperation(context.Background(), "closing-destroy-op")
+	if err != nil || op.Response["outcome"] != "success" {
+		t.Fatalf("destroy operation: %#v, %v", op, err)
+	}
+}
+
+func TestReconcileClosingRefusesUnverifiedDestroy(t *testing.T) {
+	for _, mode := range []string{"bad-digest", "worker-running", "wrong-request"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			now := time.Now()
+			session := "unsafe-destroy"
+			generation := int64(1)
+			if err := store.InsertTask(context.Background(), state.Task{TaskID: "unsafe-task", SessionID: session, Generation: generation, State: stateClosing, InstanceName: "unsafe-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2}`, ResourceReservationJSON: `{"cpu":2}`}); err != nil {
+				t.Fatal(err)
+			}
+			request := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": session, "generation": generation, "operation_id": "unsafe-op"}
+			digest, err := protocol.Digest(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker := map[string]any{"state": "finished"}
+			if mode == "bad-digest" {
+				digest = "invalid"
+			}
+			if mode == "worker-running" {
+				worker["state"] = "starting"
+				worker["start_attempted"] = true
+			}
+			if mode == "wrong-request" {
+				request["session_id"] = "other"
+				digest, err = protocol.Digest(request)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := store.RecordOperation(context.Background(), "unsafe-op", "destroy", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": worker}); err != nil {
+				t.Fatal(err)
+			}
+			guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "unsafe-task", "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+			service := New(store, config.Defaults(), Options{Guest: guest})
+			if _, err := service.reconcile(context.Background(), true); err == nil {
+				t.Fatal("unverified destroy was accepted")
+			}
+			task, err := store.GetTask(context.Background(), map[string]any{"session_id": session})
+			if err != nil || task == nil || task.State != stateClosing || task.ResourceReservationJSON == "{}" || guest.statusCalls != 0 {
+				t.Fatalf("task=%#v, calls=%d, error=%v", task, guest.statusCalls, err)
+			}
+		})
+	}
+}
+
+func TestReconcileClosingDestroyRejectsUnmarkedInstance(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Now()
+	session := "unmarked-destroy"
+	generation := int64(1)
+	if err := store.InsertTask(context.Background(), state.Task{TaskID: "unmarked-task", SessionID: session, Generation: generation, State: stateClosing, InstanceName: "unmarked-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2}`, ResourceReservationJSON: `{"cpu":2}`}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": session, "generation": generation, "operation_id": "unmarked-op"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), "unmarked-op", "destroy", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": map[string]any{"state": "finished"}}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	if _, err := service.reconcile(context.Background(), true); protocol.AsError(err).Code != "cleanup_incomplete" {
+		t.Fatalf("reconcile error=%v", err)
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": session})
+	if err != nil || task == nil || task.State != stateClosing || guest.deleteCalls != 0 {
+		t.Fatalf("task=%#v, delete calls=%d, error=%v", task, guest.deleteCalls, err)
+	}
+	op, err := store.GetOperation(context.Background(), "unmarked-op")
+	if err != nil || op.Response["outcome"] != "pending" {
+		t.Fatalf("operation=%#v, error=%v", op, err)
 	}
 }
