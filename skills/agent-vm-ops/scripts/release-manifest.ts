@@ -1565,6 +1565,9 @@ export function validate_product_manifest(value: unknown): ProductManifest {
   const source_revision = _require_string(root.source_revision, "source_revision", SOURCE_REVISION_RE);
   if (release_id !== source_revision) throw _product_error("manifest_invalid", "release_id must equal source_revision");
   const target = _product_target(root.target);
+  if (format === PRODUCT_MANIFEST_FORMAT && target.os === "source") {
+    throw _product_error("manifest_target_format_mismatch", "format 4 management packages must target a Linux control plane");
+  }
   const toolchain = _require_mapping(root.toolchain, "toolchain");
   if (!_same_keys(toolchain, ["bun", "cgo_enabled", "go"]) || toolchain.bun !== PRODUCT_TOOLCHAIN.bun || toolchain.go !== PRODUCT_TOOLCHAIN.go || toolchain.cgo_enabled !== false) throw _product_error("manifest_invalid", "toolchain does not match the fixed release toolchain");
   if (Number(_require_int(root.protocol, "protocol", 1)) !== PROTOCOL_VERSION) throw _product_error("protocol_unsupported", `manifest protocol must be ${PROTOCOL_VERSION}`);

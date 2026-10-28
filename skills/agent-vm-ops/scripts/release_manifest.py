@@ -643,6 +643,8 @@ def validate_product_manifest(value: Any, *, allow_historical_web_config_mode: b
     target = _require_mapping(root["target"], "target")
     if set(target) != {"os", "arch"} or not ((target["os"] == "source" and target["arch"] == "any") or (target["os"] == "linux" and target["arch"] in {"amd64", "arm64"})):
         raise _error("manifest_invalid", "target must be source/any or linux/amd64 or linux/arm64")
+    if format_value == PRODUCT_MANIFEST_FORMAT and target["os"] == "source":
+        raise _error("manifest_target_format_mismatch", "format 4 management packages must target a Linux control plane")
     toolchain = _require_mapping(root["toolchain"], "toolchain")
     if set(toolchain) != {"bun", "go", "cgo_enabled"} or toolchain["bun"] != PRODUCT_BUN_TOOLCHAIN or toolchain["go"] != PRODUCT_GO_TOOLCHAIN or toolchain["cgo_enabled"] is not False:
         raise _error("manifest_invalid", "product toolchain declaration is invalid")
