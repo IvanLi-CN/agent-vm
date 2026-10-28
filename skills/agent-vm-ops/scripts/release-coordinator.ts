@@ -260,10 +260,9 @@ export class GithubReleaseStateStore {
     ]);
     const treeArgs = [
       "api", "--method", "POST", `repos/${this.adapter.repository}/git/trees`,
-      "--field", "tree[][path]=record.json", "--field", "tree[][mode]=100644",
-      "--field", "tree[][type]=blob", "--field", `tree[][sha]=${blob.sha}`,
+      "--input", "-",
     ];
-    const tree = await this.adapter.json<{ sha: string }>(treeArgs);
+    const tree = await this.adapter.json<{ sha: string }>(treeArgs, `${JSON.stringify({ tree: [{ path: "record.json", mode: "100644", type: "blob", sha: blob.sha }] })}\n`);
     const commitArgs = [
       "api", "--method", "POST", `repos/${this.adapter.repository}/git/commits`,
       "--raw-field", `message=${stateCommitMessage(record)}`, "--raw-field", `tree=${tree.sha}`,
@@ -287,7 +286,8 @@ export class GithubReleaseStateStore {
     } catch (error) {
       if (!/422|already exists|reference/i.test(String(error))) throw error;
       const winner = await this.read("claimed", identity.version);
-      if (!winner || identityKey(winner.event.identity) !== identityKey(identity)) throw new Error("release version claim conflicted");
+      if (!winner) throw error;
+      if (identityKey(winner.event.identity) !== identityKey(identity)) throw new Error("release version claim conflicted");
       return winner.event;
     }
   }
@@ -347,7 +347,8 @@ export class GithubReleaseStateStore {
     } catch (error) {
       if (!/422|already exists|reference/i.test(String(error))) throw error;
       const winner = await this.read(stage, identity.version);
-      if (!winner || identityKey(winner.event.identity) !== identityKey(identity)) throw new Error("release state transition conflicted");
+      if (!winner) throw error;
+      if (identityKey(winner.event.identity) !== identityKey(identity)) throw new Error("release state transition conflicted");
       assertFrozenDetailsEqual(winner.event.detail, event.detail);
       return winner.event;
     }
@@ -408,7 +409,7 @@ export class MirroredReleaseStateStore {
 }
 
 export interface GithubCommand {
-  run(args: readonly string[]): Promise<string>;
+  run(args: readonly string[], input?: string): Promise<string>;
 }
 
 export class GhGithubAdapter implements GithubCommand {
@@ -419,14 +420,18 @@ export class GhGithubAdapter implements GithubCommand {
     this.repository = repository;
   }
 
-  async run(args: readonly string[]): Promise<string> {
-    const result = Bun.spawnSync(["gh", ...args], { stdout: "pipe", stderr: "pipe" });
+  async run(args: readonly string[], input?: string): Promise<string> {
+    const result = Bun.spawnSync(["gh", ...args], {
+      stdin: input === undefined ? "ignore" : new Blob([input]),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr).trim() || "gh command failed");
     return new TextDecoder().decode(result.stdout).trim();
   }
 
-  async json<T>(args: readonly string[]): Promise<T> {
-    return JSON.parse(await this.run(args)) as T;
+  async json<T>(args: readonly string[], input?: string): Promise<T> {
+    return JSON.parse(await this.run(args, input)) as T;
   }
 
   async mainHead(): Promise<string> {
@@ -466,9 +471,18 @@ export class GhGithubAdapter implements GithubCommand {
   }
 
   async viewRelease(tag: string): Promise<unknown> {
-    const release = await this.json<any>(["api", `repos/${this.repository}/releases/tags/${tag}`]);
+    let release: any;
+    try {
+      release = await this.json<any>(["api", `repos/${this.repository}/releases/tags/${tag}`]);
+    } catch (error) {
+      if (!/404|not found/i.test(String(error))) throw error;
+      const releases = await this.json<any[]>(["api", `repos/${this.repository}/releases?per_page=100`]);
+      release = releases.find((candidate) => candidate?.tag_name === tag);
+      if (!release) throw error;
+    }
     return {
       tagName: release.tag_name,
+      targetCommitish: release.target_commitish,
       isDraft: release.draft,
       isPrerelease: release.prerelease,
       immutable: release.immutable,

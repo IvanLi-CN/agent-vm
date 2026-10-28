@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { compareSemVer, parseSemVer, resolveReleaseTarget } from "../scripts/semver.ts";
-import { GithubReleaseStateStore, ReleaseStateStore, type GhGithubAdapter, type ReleaseIdentity } from "../scripts/release-coordinator.ts";
-import { assertContractPreconditions, successfulMainGate } from "../scripts/release.ts";
+import { GhGithubAdapter, GithubReleaseStateStore, ReleaseStateStore, type ReleaseIdentity } from "../scripts/release-coordinator.ts";
+import { assertContractPreconditions, assertWorkflowPlatformAttestation, successfulMainGate, verifyReleaseView } from "../scripts/release.ts";
 
 const identity = (overrides: Partial<ReleaseIdentity> = {}): ReleaseIdentity => ({
   version: "1.0.0",
@@ -74,6 +74,10 @@ test("release preflight is fail-closed and accepts every Main gate matrix job", 
     );
   } catch (error) { blocked = String(error).includes("audit-required"); }
   if (!blocked) throw new Error("release preflight did not block the unenabled platform contract");
+  let unprotectedError = false;
+  try { assertWorkflowPlatformAttestation("refs/heads/main", "false"); } catch { unprotectedError = true; }
+  if (!unprotectedError) throw new Error("workflow preflight accepted an unprotected ref");
+  assertWorkflowPlatformAttestation("refs/heads/main", "true");
   const gate = successfulMainGate([
     { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2 },
     { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1 },
@@ -87,7 +91,7 @@ test("GitHub state refs are append-only and preserve the original identity", asy
   let sequence = 0;
   const fake = {
     repository: "IvanLi-CN/agent-vm",
-    async json(args: readonly string[]): Promise<any> {
+    async json(args: readonly string[], input?: string): Promise<any> {
       const refEndpoint = args.find((item) => item.includes("/git/ref/tags/"));
       if (refEndpoint && !args.includes("--method")) {
         const ref = refEndpoint.split("/git/ref/tags/")[1];
@@ -98,7 +102,15 @@ test("GitHub state refs are append-only and preserve the original identity", asy
       const commitRead = args.find((item) => /\/git\/commits\/[0-9a-z-]+$/.test(item));
       if (commitRead && !args.includes("--method")) return { message: commits.get(commitRead.split("/git/commits/")[1]) };
       if (args.some((item) => item.endsWith("/git/blobs"))) return { sha: `blob-${++sequence}` };
-      if (args.some((item) => item.endsWith("/git/trees"))) return { sha: `tree-${++sequence}` };
+      if (args.some((item) => item.endsWith("/git/trees"))) {
+        if (!args.includes("--input") || input === undefined) throw new Error("tree JSON request body is missing");
+        const body = JSON.parse(input) as { tree?: Array<Record<string, string>> };
+        const entries = body.tree ?? [];
+        if (entries.length !== 1 || entries[0]?.path !== "record.json" || entries[0]?.mode !== "100644" || entries[0]?.type !== "blob" || !entries[0]?.sha) {
+          throw new Error("tree payload is not a valid GitHub tree entry");
+        }
+        return { sha: `tree-${++sequence}` };
+      }
       if (args.some((item) => item.endsWith("/git/commits"))) {
         const sha = `commit-${++sequence}`;
         commits.set(sha, args.find((item) => item.startsWith("message="))!.slice("message=".length));
@@ -123,4 +135,20 @@ test("GitHub state refs are append-only and preserve the original identity", asy
   let conflict = false;
   try { await remote.claim(identity({ source_revision: "e".repeat(40) })); } catch { conflict = true; }
   if (!conflict || refs.size !== 2) throw new Error("remote state ref conflict was not fail-closed");
+});
+
+test("draft release lookup accepts an untagged draft only when its target is bound", async () => {
+  const source = "a".repeat(40);
+  const adapter = new (class extends GhGithubAdapter {
+    async json<T>(args: readonly string[]): Promise<T> {
+      if (args.some((item) => item.includes("/releases/tags/"))) throw new Error("HTTP 404 Not Found");
+      return [{ tag_name: "v1.0.0", target_commitish: source, draft: true, assets: [{ name: "package" }] }] as T;
+    }
+  })("IvanLi-CN/agent-vm");
+  const view = await adapter.viewRelease("v1.0.0");
+  verifyReleaseView(view, "v1.0.0", true, { package: "/tmp/package" }, source);
+  let wrongSourceRejected = false;
+  try { verifyReleaseView(view, "v1.0.0", true, { package: "/tmp/package" }, "e".repeat(40)); } catch { wrongSourceRejected = true; }
+  if (!wrongSourceRejected) throw new Error("draft release target binding was not enforced");
+  verifyReleaseView({ tagName: "v1.0.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: false, assets: [{ name: "package" }] }, "v1.0.0", false, { package: "/tmp/package" }, source);
 });

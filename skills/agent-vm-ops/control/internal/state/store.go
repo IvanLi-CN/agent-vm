@@ -113,8 +113,6 @@ func (err *TransactionError) Error() string {
 
 func (err *TransactionError) Unwrap() error { return err.Cause }
 
-func (err *TransactionError) Uncertain() bool { return err.StateCommitted == nil }
-
 func committed(value bool) *bool { return &value }
 
 type Task struct {
@@ -159,6 +157,17 @@ type Operation struct {
 	CreatedAt   string
 }
 
+// OperationFinalization is the terminal replacement for one pending journal
+// row. It is committed together with the guarded task transition used by
+// native-init absence recovery.
+type OperationFinalization struct {
+	OperationID string
+	Action      string
+	SessionID   *string
+	Generation  *int64
+	Response    map[string]any
+}
+
 type Store struct {
 	path             string
 	write            *sql.DB
@@ -171,6 +180,13 @@ type Tx struct {
 	conn    *sql.Conn
 	changed bool
 	closed  bool
+}
+
+// LockImageSelection serializes default-image changes with lifecycle
+// admission so a new task observes one coherent selection revision.
+func (s *Store) LockImageSelection() func() {
+	s.imageSelectionMu.Lock()
+	return s.imageSelectionMu.Unlock
 }
 
 // TaskCondition describes the durable facts that must still hold when a
@@ -224,6 +240,10 @@ func Open(path string, allowCreate bool) (*Store, error) {
 			store.Close()
 			return nil, err
 		}
+		if err := store.EnsureManagementSchema(context.Background()); err != nil {
+			store.Close()
+			return nil, err
+		}
 	} else if err := store.checkReadable(context.Background()); err != nil {
 		store.Close()
 		return nil, err
@@ -231,24 +251,12 @@ func Open(path string, allowCreate bool) (*Store, error) {
 		store.Close()
 		return nil, err
 	}
-	if err := store.EnsureManagementSchema(context.Background()); err != nil {
-		store.Close()
-		return nil, fmt.Errorf("management state migration: %w", err)
-	}
 	return store, nil
 }
 
 func OpenForTest(path string) (*Store, error) { return Open(path, true) }
 
 func (s *Store) Path() string { return s.path }
-
-// LockImageSelection serializes default-image changes with lifecycle admission
-// in the resident authority. The lock is deliberately owned by Store so both
-// the management and lifecycle packages use the same boundary.
-func (s *Store) LockImageSelection() func() {
-	s.imageSelectionMu.Lock()
-	return s.imageSelectionMu.Unlock
-}
 
 func (s *Store) Close() error {
 	var first error
@@ -568,13 +576,7 @@ func nullableInt(value sql.NullInt64) *int64 {
 func (s *Store) InsertTask(ctx context.Context, task Task) error {
 	return s.withWrite(ctx, func(tx *Tx) error {
 		_, err := tx.exec("INSERT INTO tasks(task_id, session_id, generation, state, instance_name, vm_ip, ssh_host_port, lease_expires_at, inactive_since, cleanup_after, created_at, updated_at, last_error, image_fingerprint, resources_json, reservation_bytes, previous_generation, resource_reservation_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", task.TaskID, task.SessionID, task.Generation, task.State, task.InstanceName, nullableStringArg(task.VMIP), nullableIntArg(task.SSHHostPort), nullableStringArg(task.LeaseExpiresAt), nullableStringArg(task.InactiveSince), nullableStringArg(task.CleanupAfter), task.CreatedAt, task.UpdatedAt, nullableStringArg(task.LastError), task.ImageFingerprint, task.ResourcesJSON, task.ReservationBytes, nullableIntArg(task.PreviousGeneration), task.ResourceReservationJSON)
-		if err != nil {
-			return err
-		}
-		if task.State == "preparing" {
-			return syncPendingImageReferenceTx(tx, task.TaskID, task.ImageFingerprint, true)
-		}
-		return nil
+		return err
 	})
 }
 
@@ -591,20 +593,15 @@ func (s *Store) UpdateTaskIf(ctx context.Context, taskID string, condition TaskC
 }
 
 func (s *Store) updateTask(ctx context.Context, taskID string, condition *TaskCondition, updates map[string]any) (bool, error) {
-	allowed := map[string]bool{"generation": true, "state": true, "vm_ip": true, "ssh_host_port": true, "lease_expires_at": true, "inactive_since": true, "cleanup_after": true, "updated_at": true, "last_error": true, "resources_json": true, "reservation_bytes": true, "previous_generation": true, "resource_reservation_json": true, "image_fingerprint": true}
-	keys := make([]string, 0, len(updates))
-	for key := range updates {
-		if !allowed[key] {
-			return false, fmt.Errorf("unsupported task update: %s", key)
-		}
-		keys = append(keys, key)
+	keys, err := taskUpdateKeys(updates)
+	if err != nil {
+		return false, err
 	}
-	sort.Strings(keys)
 	if len(keys) == 0 {
 		return false, nil
 	}
 	changed := false
-	err := s.withWrite(ctx, func(tx *Tx) error {
+	err = s.withWrite(ctx, func(tx *Tx) error {
 		var updateChanged bool
 		updateChanged, err := taskUpdatesChanged(ctx, tx, taskID, keys, updates)
 		if err != nil {
@@ -632,33 +629,107 @@ func (s *Store) updateTask(ctx context.Context, taskID string, condition *TaskCo
 		}
 		args = append(args, taskID)
 		_, err = tx.exec("UPDATE tasks SET "+strings.Join(sets, ", ")+" WHERE task_id = ?", args...)
-		if err != nil {
-			return err
-		}
-		if stateValue, ok := updates["state"].(string); ok {
-			fingerprint := ""
-			if value, ok := updates["image_fingerprint"].(string); ok {
-				fingerprint = value
-			} else {
-				if queryErr := tx.conn.QueryRowContext(context.Background(), "SELECT image_fingerprint FROM tasks WHERE task_id = ?", taskID).Scan(&fingerprint); queryErr != nil && !errors.Is(queryErr, sql.ErrNoRows) {
-					return queryErr
-				}
-			}
-			return syncPendingImageReferenceTx(tx, taskID, fingerprint, stateValue == "preparing")
-		}
-		return nil
+		return err
 	})
 	return changed, err
 }
 
-func syncPendingImageReferenceTx(tx *Tx, taskID, fingerprint string, pending bool) error {
-	if pending {
-		_, err := tx.exec(`INSERT OR IGNORE INTO image_references(fingerprint, reference_kind, reference_id, created_at)
-SELECT ?, 'pending_creation', ?, ? WHERE EXISTS (SELECT 1 FROM managed_images WHERE fingerprint = ?)`, fingerprint, taskID, time.Now().UTC().Format(time.RFC3339Nano), fingerprint)
-		return err
+func taskUpdateKeys(updates map[string]any) ([]string, error) {
+	allowed := map[string]bool{"generation": true, "state": true, "vm_ip": true, "ssh_host_port": true, "lease_expires_at": true, "inactive_since": true, "cleanup_after": true, "updated_at": true, "last_error": true, "resources_json": true, "reservation_bytes": true, "previous_generation": true, "resource_reservation_json": true, "image_fingerprint": true}
+	keys := make([]string, 0, len(updates))
+	for key := range updates {
+		if !allowed[key] {
+			return nil, fmt.Errorf("unsupported task update: %s", key)
+		}
+		keys = append(keys, key)
 	}
-	_, err := tx.exec("DELETE FROM image_references WHERE reference_kind = 'pending_creation' AND reference_id = ?", taskID)
-	return err
+	sort.Strings(keys)
+	return keys, nil
+}
+
+// FinalizeNativeInitRecovery atomically replaces every verified pending
+// lifecycle journal and transitions the same task to absent. A malformed or
+// concurrently changed journal rolls back all terminal outcomes and leaves
+// the original task and journals pending for explicit recovery.
+func (s *Store) FinalizeNativeInitRecovery(ctx context.Context, taskID string, condition TaskCondition, updates map[string]any, operations []OperationFinalization) (bool, error) {
+	keys, err := taskUpdateKeys(updates)
+	if err != nil {
+		return false, err
+	}
+	if len(keys) == 0 {
+		return false, errors.New("native-init recovery task update is empty")
+	}
+	if len(operations) == 0 {
+		return false, errors.New("native-init recovery has no operation finalizations")
+	}
+	encoded := make([]string, len(operations))
+	seen := make(map[string]struct{}, len(operations))
+	for index, operation := range operations {
+		if operation.OperationID == "" || operation.Action == "" {
+			return false, errors.New("native-init recovery operation identity is incomplete")
+		}
+		if _, exists := seen[operation.OperationID]; exists {
+			return false, fmt.Errorf("duplicate native-init recovery operation: %s", operation.OperationID)
+		}
+		seen[operation.OperationID] = struct{}{}
+		raw, marshalErr := json.Marshal(operation.Response)
+		if marshalErr != nil {
+			return false, marshalErr
+		}
+		encoded[index] = string(raw)
+	}
+
+	changed := false
+	err = s.withWrite(ctx, func(tx *Tx) error {
+		updateChanged, updateErr := taskUpdatesChanged(ctx, tx, taskID, keys, updates)
+		if updateErr != nil {
+			return updateErr
+		}
+		if !updateChanged {
+			return nil
+		}
+		matched, matchErr := taskConditionMatches(ctx, tx, taskID, condition)
+		if matchErr != nil {
+			return matchErr
+		}
+		if !matched {
+			return nil
+		}
+		for index, operation := range operations {
+			result, updateErr := tx.exec("UPDATE operations SET action = ?, session_id = ?, generation = ?, response_json = ? WHERE operation_id = ? AND action = ? AND (session_id = ? OR (session_id IS NULL AND ? IS NULL)) AND (generation = ? OR (generation IS NULL AND ? IS NULL)) AND json_extract(response_json, '$.outcome') = 'pending'", operation.Action, nullableStringArg(operation.SessionID), nullableIntArg(operation.Generation), encoded[index], operation.OperationID, operation.Action, nullableStringArg(operation.SessionID), nullableStringArg(operation.SessionID), nullableIntArg(operation.Generation), nullableIntArg(operation.Generation))
+			if updateErr != nil {
+				return updateErr
+			}
+			rows, rowsErr := result.RowsAffected()
+			if rowsErr != nil {
+				return rowsErr
+			}
+			if rows != 1 {
+				return fmt.Errorf("native-init recovery operation is no longer pending or its identity changed: %s", operation.OperationID)
+			}
+		}
+		args := make([]any, 0, len(keys)+1)
+		sets := make([]string, 0, len(keys))
+		for _, key := range keys {
+			sets = append(sets, key+" = ?")
+			args = append(args, updates[key])
+		}
+		args = append(args, taskID)
+		result, updateErr := tx.exec("UPDATE tasks SET "+strings.Join(sets, ", ")+" WHERE task_id = ?", args...)
+		if updateErr != nil {
+			return updateErr
+		}
+		rows, rowsErr := result.RowsAffected()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if rows != 1 {
+			return errors.New("native-init recovery task disappeared before commit")
+		}
+		changed = true
+		return nil
+	})
+	return changed, err
 }
 
 func taskUpdatesChanged(ctx context.Context, tx *Tx, taskID string, keys []string, updates map[string]any) (bool, error) {

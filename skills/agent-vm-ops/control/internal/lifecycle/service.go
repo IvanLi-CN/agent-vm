@@ -540,17 +540,6 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	}
 	unlock := s.lockAction(action, request)
 	defer unlock()
-	if expectedVersion := stringValue(request["management_target_version"]); expectedVersion != "" {
-		if action == "port-add" || action == "port-remove" || action == "restart" || action == "resize" || action == "release" || action == "destroy" {
-			task, taskErr := s.Store.GetTask(ctx, map[string]any{"session_id": stringValue(request["session_id"])})
-			if taskErr != nil {
-				return nil, s.sqliteError(taskErr)
-			}
-			if task == nil || "vm:"+task.TaskID+":"+task.UpdatedAt != expectedVersion {
-				return nil, protocol.NewError("stale_target", "VM resource version changed", nil)
-			}
-		}
-	}
 	if write {
 		operationID := stringValue(request["operation_id"])
 		digest, err := protocol.Digest(request)
@@ -574,7 +563,16 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		}
 		if existing != nil {
 			finishActive()
-			return s.replayRecord(request, existing, warnings)
+			replayed, replayErr := s.replayRecord(request, existing, warnings)
+			if replayErr != nil {
+				return nil, replayErr
+			}
+			if action == "destroy" && stringValue(existing.Response["outcome"]) == "success" {
+				if err := s.deleteDestroyedTask(ctx, request, existing.Generation); err != nil {
+					return nil, err
+				}
+			}
+			return replayed, nil
 		}
 		defer finishActive()
 		ctx = native.WithWorkerRecorder(ctx, operationID, s)
@@ -594,6 +592,11 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		if err := s.Store.RecordOperation(ctx, operationID, stringValue(request["action"]), optionalString(request["session_id"]), generationPointer(intValue(request["generation"]), request["generation"] != nil), response); err != nil {
 			return nil, s.sqliteError(err)
 		}
+		if action == "destroy" {
+			if err := s.deleteDestroyedTask(ctx, request, generationPointer(intValue(request["generation"]), request["generation"] != nil)); err != nil {
+				return nil, err
+			}
+		}
 	}
 	if s.Snapshots != nil {
 		_ = s.publishSnapshot(action, response)
@@ -602,20 +605,6 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		s.wakeScheduler()
 	}
 	return response, nil
-}
-
-// ValidateManagementVMAction re-checks native ownership immediately before a
-// browser-authorized action is delegated. Management remains responsible for
-// the API target and lease checks; lifecycle remains responsible for ownership.
-func (s *Service) ValidateManagementVMAction(ctx context.Context, task state.Task, action string, _ map[string]any) error {
-	if task.TaskID == "" {
-		return protocol.NewError("not_found", "VM does not exist", nil)
-	}
-	if s.Guest == nil {
-		return nil
-	}
-	_, err := s.verifyOwnership(ctx, &task)
-	return err
 }
 
 func (s *Service) publishSnapshot(action string, response map[string]any) error {
@@ -646,6 +635,9 @@ func (s *Service) replay(ctx context.Context, request protocol.Request, write bo
 
 func (s *Service) replayRecord(request protocol.Request, record *state.Operation, warningGroups ...[]any) (map[string]any, error) {
 	op := stringValue(request["operation_id"])
+	if !operationIdentityMatches(record, request) {
+		return nil, protocol.NewError("operation_conflict", "operation ID belongs to a different lifecycle identity", map[string]any{"operation_id": op})
+	}
 	digest, err := protocol.Digest(request)
 	if err != nil {
 		return nil, protocol.NewError("invalid_request", "request cannot be canonicalized", nil)
@@ -683,6 +675,22 @@ func (s *Service) replayRecord(request protocol.Request, record *state.Operation
 		}
 	}
 	return replayed, nil
+}
+
+func operationIdentityMatches(record *state.Operation, request protocol.Request) bool {
+	if record == nil || record.Action != stringValue(request["action"]) {
+		return false
+	}
+	expectedSession := optionalString(request["session_id"])
+	if (record.SessionID == nil) != (expectedSession == nil) || record.SessionID != nil && *record.SessionID != *expectedSession {
+		return false
+	}
+	_, generationPresent := request["generation"]
+	expectedGeneration := generationPointer(intValue(request["generation"]), generationPresent)
+	if (record.Generation == nil) != (expectedGeneration == nil) || record.Generation != nil && *record.Generation != *expectedGeneration {
+		return false
+	}
+	return true
 }
 
 func hasWarning(existing []any, candidate any) bool {
@@ -874,6 +882,20 @@ func (s *Service) verifyActiveGuest(ctx context.Context, task *state.Task) error
 	return nil
 }
 
+// ValidateManagementVMAction re-checks native ownership immediately before a
+// browser-authorized action is delegated. Management remains responsible for
+// the API target and lease checks; lifecycle remains responsible for ownership.
+func (s *Service) ValidateManagementVMAction(ctx context.Context, task state.Task, _ string, _ map[string]any) error {
+	if task.TaskID == "" {
+		return protocol.NewError("not_found", "VM does not exist", nil)
+	}
+	if s.Guest == nil {
+		return nil
+	}
+	_, err := s.verifyOwnership(ctx, &task)
+	return err
+}
+
 func (s *Service) recordError(ctx context.Context, request protocol.Request, cause error) error {
 	op := stringValue(request["operation_id"])
 	if op == "" {
@@ -920,7 +942,7 @@ func (s *Service) dispatchAction(ctx context.Context, action string, request pro
 	case "admin-metrics":
 		return s.adminMetrics(ctx)
 	case "admin-reconcile", "timer-reconcile":
-		return s.reconcile(ctx, requestBool(request, "apply"))
+		return s.reconcile(ctx, requestBool(request, "apply"), stringValue(request["operation_id"]))
 	case "admin-gc", "timer-age-gc":
 		return s.gc(ctx, requestBool(request, "apply"))
 	case "timer-expire":
@@ -984,6 +1006,26 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	now := s.Clock()
 	deadline := now.Add(time.Duration(s.Config.InitialLeaseSeconds) * time.Second)
 	created := false
+	if task != nil && task.State == stateAbsent {
+		if generation != 0 && generation != task.Generation {
+			return nil, protocol.NewError("generation_mismatch", "an absent session acquire must use generation 0 or the current absent generation", map[string]any{"expected": int64(0), "current": task.Generation, "actual": generation})
+		}
+		if err := s.verifyAbsentTask(ctx, task, stringValue(request["operation_id"]), true); err != nil {
+			return nil, err
+		}
+		deleted, deleteErr := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateAbsent}})
+		if deleteErr != nil {
+			return nil, s.sqliteError(deleteErr)
+		}
+		if !deleted {
+			return nil, protocol.NewError("task_transition", "absent session changed before reuse", map[string]any{"outcome_verified": false})
+		}
+		task = nil
+		// The accepted current absent generation is a compatibility token for
+		// older clients. The newly allocated task still gets the next durable
+		// generation from the tombstone.
+		generation = 0
+	}
 	if task == nil {
 		created = true
 		lease := nowString(deadline)
@@ -1060,7 +1102,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		}
 		if created {
 			if err := s.Guest.Init(nativeCtx, task.ImageFingerprint, task.InstanceName); err != nil {
-				return s.failTask(ctx, task, "native-init", err)
+				return s.failTaskForOperation(ctx, task, "native-init", err, stringValue(request["operation_id"]))
 			}
 		}
 		if err := s.setOwnership(nativeCtx, task); err != nil {
@@ -1156,6 +1198,15 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	if task.State == stateAbsent {
 		if err := s.cancelPendingAcquireOperations(ctx, task); err != nil {
 			return nil, err
+		}
+		if task.TaskID == "" {
+			return s.status(ctx, task.SessionID)
+		}
+		if destroy {
+			if err := s.verifyAbsentTask(ctx, task, stringValue(request["operation_id"]), true); err != nil {
+				return nil, err
+			}
+			return s.status(ctx, task.SessionID)
 		}
 		return s.summary(ctx, task)
 	}
@@ -1253,6 +1304,9 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	if destroy {
 		updates["inactive_since"] = nil
 		updates["cleanup_after"] = nil
+		updates["vm_ip"] = nil
+		updates["ssh_host_port"] = nil
+		updates["previous_generation"] = nil
 	} else {
 		inactive := nowString(s.Clock())
 		updates["inactive_since"] = inactive
@@ -1265,16 +1319,93 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	if !updated {
 		return nil, protocol.NewError("cleanup_incomplete", "session changed before cleanup could be committed", map[string]any{"outcome_verified": false})
 	}
-	if destroy {
-		deleted, err := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateAbsent}})
-		if err != nil {
-			return nil, s.sqliteError(err)
-		}
-		if !deleted {
-			return nil, protocol.NewError("cleanup_incomplete", "session changed before task deletion could be committed", map[string]any{"outcome_verified": false})
+	return s.status(ctx, task.SessionID)
+}
+
+// verifyAbsentTask is the shared fence for reusing or removing a durable
+// absent row. The current operation is excluded because Dispatch journals it
+// before entering the lifecycle action; every other pending journal remains a
+// stop condition. Native verification is required at the admission boundary,
+// while post-terminal destroy deletion relies on the native check already made
+// by the cleanup action and rechecks the durable fence only.
+func (s *Service) verifyAbsentTask(ctx context.Context, task *state.Task, excludedOperationID string, verifyNative bool) error {
+	if task == nil || task.TaskID == "" || task.State != stateAbsent {
+		return protocol.NewError("task_transition", "absent session does not have a verifiable durable row", map[string]any{"outcome_verified": false})
+	}
+	if task.VMIP != nil || task.SSHHostPort != nil || task.LeaseExpiresAt != nil || task.InactiveSince != nil || task.CleanupAfter != nil || task.ReservationBytes != 0 || task.PreviousGeneration != nil || !taskHasZeroResources(task) {
+		return protocol.NewError("task_transition", "absent session retains durable state and cannot be reused or removed", map[string]any{"state": task.State, "outcome_verified": false})
+	}
+	ports, err := s.Store.ListPorts(ctx, task.TaskID)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if len(ports) != 0 {
+		return protocol.NewError("task_transition", "absent session retains durable port mappings", map[string]any{"state": task.State, "port_count": len(ports), "outcome_verified": false})
+	}
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	for _, operation := range pending {
+		if operation.SessionID != nil && *operation.SessionID == task.SessionID && operation.OperationID != excludedOperationID {
+			return protocol.NewError("task_transition", "absent session retains a pending operation journal", map[string]any{"state": task.State, "operation_id": operation.OperationID, "outcome_verified": false})
 		}
 	}
-	return s.status(ctx, task.SessionID)
+	if !verifyNative {
+		return nil
+	}
+	if s.Guest == nil {
+		if evidence, matched := nativeInitFailureRecord(task.LastError); matched && evidence["native_init_recovered_absent"] == true && evidence["outcome_verified"] == true {
+			return nil
+		}
+		return protocol.NewError("task_transition", "absent session native absence cannot be verified", map[string]any{"state": task.State, "outcome_verified": false})
+	}
+	if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr == nil {
+		return protocol.NewError("task_transition", "absent session has a present native instance", map[string]any{"state": task.State, "native_present": true, "outcome_verified": true})
+	} else {
+		control := protocol.AsError(ownershipErr)
+		detail := map[string]any{"state": task.State, "cause": ownershipErr.Error(), "outcome_verified": false}
+		if nativeDetail, ok := control.Detail.(map[string]any); ok {
+			for key, value := range nativeDetail {
+				detail[key] = value
+			}
+		}
+		if detail["native_missing"] != true {
+			return protocol.NewError("task_transition", "absent session native absence is not verified", detail)
+		}
+	}
+	return nil
+}
+
+// deleteDestroyedTask runs only after the destroy journal is terminal. It is
+// intentionally separate from releaseUnlocked so a crash cannot delete the
+// task while its operation is still pending.
+func (s *Service) deleteDestroyedTask(ctx context.Context, request protocol.Request, expectedGeneration *int64) error {
+	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": stringValue(request["session_id"])})
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if task == nil {
+		return nil
+	}
+	if expectedGeneration != nil && task.Generation != *expectedGeneration {
+		return nil
+	}
+	if err := s.verifyAbsentTask(ctx, task, "", false); err != nil {
+		return err
+	}
+	conditionGeneration := task.Generation
+	if expectedGeneration != nil {
+		conditionGeneration = *expectedGeneration
+	}
+	deleted, err := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &conditionGeneration, States: []string{stateAbsent}})
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if !deleted {
+		return protocol.NewError("cleanup_incomplete", "session changed before terminal destroy deletion could be committed", map[string]any{"outcome_verified": false})
+	}
+	return nil
 }
 
 func (s *Service) pendingAcquireOperations(ctx context.Context, task *state.Task) ([]state.Operation, error) {
@@ -1559,14 +1690,6 @@ func (s *Service) portAdd(ctx context.Context, request protocol.Request) (map[st
 		return nil, protocol.NewError("lease_expired", "lease or generation changed after native proxy creation", map[string]any{"phase": "durable-fence", "outcome_verified": true})
 	}
 	value.State = "active"
-	versionNow := s.Clock()
-	updated, updateErr := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &versionNow}, map[string]any{"updated_at": nowString(versionNow)})
-	if updateErr != nil {
-		return nil, s.sqliteError(updateErr)
-	}
-	if !updated {
-		return nil, protocol.NewError("mapping_unverified", "VM version changed after port creation", map[string]any{"outcome_verified": false})
-	}
 	return map[string]any{"task_id": value.TaskID, "generation": value.Generation, "port_name": value.PortName, "protocol": value.Protocol, "host_port": value.HostPort, "vm_port": value.VMPort, "device_name": value.DeviceName, "state": value.State, "created_at": value.CreatedAt}, nil
 }
 
@@ -1613,14 +1736,6 @@ func (s *Service) portRemove(ctx context.Context, request protocol.Request) (map
 	}
 	if err := s.Store.DeletePort(ctx, task.TaskID, name, protocolName); err != nil {
 		return nil, s.sqliteError(err)
-	}
-	versionNow := s.Clock()
-	updated, updateErr := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &versionNow}, map[string]any{"updated_at": nowString(versionNow)})
-	if updateErr != nil {
-		return nil, s.sqliteError(updateErr)
-	}
-	if !updated {
-		return nil, protocol.NewError("mapping_unverified", "VM version changed after port removal", map[string]any{"outcome_verified": false})
 	}
 	return map[string]any{"task_id": task.TaskID, "name": name, "protocol": protocolName, "removed": true}, nil
 }
@@ -1835,7 +1950,11 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 	return nil, protocol.NewError("observation_unavailable", "metrics observation did not converge", nil)
 }
 
-func (s *Service) reconcile(ctx context.Context, apply bool) (map[string]any, error) {
+func (s *Service) reconcile(ctx context.Context, apply bool, excludedOperationIDs ...string) (map[string]any, error) {
+	excludedOperationID := ""
+	if len(excludedOperationIDs) > 0 {
+		excludedOperationID = excludedOperationIDs[0]
+	}
 	if apply {
 		pending, pendingErr := s.Store.PendingOperations(ctx)
 		if pendingErr != nil {
@@ -1843,6 +1962,17 @@ func (s *Service) reconcile(ctx context.Context, apply bool) (map[string]any, er
 		}
 		if err := s.reconcilePendingWorkers(ctx, pending); err != nil {
 			return nil, err
+		}
+		pending, pendingErr = s.Store.PendingOperations(ctx)
+		if pendingErr != nil {
+			return nil, s.sqliteError(pendingErr)
+		}
+		if err := s.reconcilePendingAbsentDestroy(ctx, pending); err != nil {
+			return nil, err
+		}
+		pending, pendingErr = s.Store.PendingOperations(ctx)
+		if pendingErr != nil {
+			return nil, s.sqliteError(pendingErr)
 		}
 		if err := s.recoverPending(ctx, pending); err != nil {
 			return nil, err
@@ -1865,16 +1995,19 @@ func (s *Service) reconcile(ctx context.Context, apply bool) (map[string]any, er
 				}
 			}
 		}
-		if task.State == stateClosing && apply {
-			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil {
-				if firstErr == nil {
-					firstErr = releaseErr
+		if (task.State == stateClosing || task.State == stateFailed) && apply {
+			recovered, recoveryErr := s.reconcileVerifiedNativeInitAbsence(ctx, task, excludedOperationID)
+			if recovered {
+				action := map[string]any{"task_id": task.TaskID, "generation": task.Generation, "action": "close-incomplete-or-expired"}
+				if recoveryErr != nil {
+					action["error"] = protocol.AsError(recoveryErr)
+					if firstErr == nil {
+						firstErr = recoveryErr
+					}
 				}
-			} else if finalizeErr := s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, "release", result); finalizeErr != nil && firstErr == nil {
-				firstErr = finalizeErr
+				actions = append(actions, action)
+				continue
 			}
-		}
-		if task.State == stateFailed && apply {
 			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil {
 				if firstErr == nil {
 					firstErr = releaseErr
@@ -1902,6 +2035,8 @@ func (s *Service) finalizePendingCleanup(ctx context.Context, session string, ge
 	if err != nil {
 		return s.sqliteError(err)
 	}
+	var deleteRequest protocol.Request
+	finalized := false
 	for _, operation := range pending {
 		if operation.Action != action || operation.SessionID == nil || *operation.SessionID != session || operation.Generation == nil || *operation.Generation != generation {
 			continue
@@ -1911,12 +2046,19 @@ func (s *Service) finalizePendingCleanup(ctx context.Context, session string, ge
 			return protocol.NewError("operation_unverified", "pending cleanup request is missing", map[string]any{"operation_id": operation.OperationID})
 		}
 		request := protocol.Request(rawRequest)
+		deleteRequest = request
 		response := protocol.SuccessWithRelease(request, result, s.Release, nil)
 		if digest, ok := operation.Response["_request_digest"]; ok {
 			response["_request_digest"] = digest
 		}
 		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
 			return s.sqliteError(err)
+		}
+		finalized = true
+	}
+	if action == "destroy" && finalized {
+		if err := s.deleteDestroyedTask(ctx, deleteRequest, generationPointer(generation, true)); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1946,8 +2088,13 @@ func (s *Service) gc(ctx context.Context, apply bool) (map[string]any, error) {
 					firstErr = s.sqliteError(updateErr)
 				}
 			} else if updated {
-				if _, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, true); releaseErr != nil && firstErr == nil {
-					firstErr = releaseErr
+				cleanupRequest := protocol.Request{"session_id": task.SessionID, "generation": task.Generation}
+				if _, releaseErr := s.release(ctx, cleanupRequest, true); releaseErr != nil {
+					if firstErr == nil {
+						firstErr = releaseErr
+					}
+				} else if deleteErr := s.deleteDestroyedTask(ctx, cleanupRequest, &task.Generation); deleteErr != nil && firstErr == nil {
+					firstErr = deleteErr
 				}
 			}
 		}
@@ -2523,6 +2670,10 @@ func sameResources(left, right map[string]int64) bool {
 	return true
 }
 
+func taskHasZeroResources(task *state.Task) bool {
+	return task != nil && task.ResourcesJSON == mustJSON(zeroResources()) && task.ResourceReservationJSON == "{}"
+}
+
 func requestHasResourceFields(request protocol.Request) bool {
 	for _, key := range resourceKeys {
 		if _, exists := request[key]; exists {
@@ -2533,7 +2684,18 @@ func requestHasResourceFields(request protocol.Request) bool {
 }
 
 func (s *Service) failTask(ctx context.Context, task *state.Task, phase string, err error) (map[string]any, error) {
+	return s.failTaskWithDetail(ctx, task, nativePhaseDetail(phase, err))
+}
+
+func (s *Service) failTaskForOperation(ctx context.Context, task *state.Task, phase string, err error, operationID string) (map[string]any, error) {
 	detail := nativePhaseDetail(phase, err)
+	if operationID != "" {
+		detail["operation_id"] = operationID
+	}
+	return s.failTaskWithDetail(ctx, task, detail)
+}
+
+func (s *Service) failTaskWithDetail(ctx context.Context, task *state.Task, detail map[string]any) (map[string]any, error) {
 	if stateErr := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
 		detail["state_persisted"] = false
 		detail["state_error"] = stateErr.Error()
