@@ -177,6 +177,9 @@ func serve(args []string) error {
 		AvailableImageStorageBytes: func() (int64, error) {
 			return guest.StoragePoolAvailableBytes(context.Background())
 		},
+		ReserveImageStorage: func(size int64) (func(), error) {
+			return service.ReservePhysicalStorage(context.Background(), size)
+		},
 		CurrentSystemVersion: func(ctx context.Context) (string, error) {
 			epoch, err := store.StateEpoch(ctx)
 			if err != nil {

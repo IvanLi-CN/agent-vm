@@ -415,6 +415,58 @@ func TestAdmissionRejectsLowPhysicalStorageWithoutTouchingEffectiveLease(t *test
 	}
 }
 
+func TestExternalPhysicalReservationSharesLifecycleAdmission(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024},
+	}
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
+	service.MarkReady()
+	release, err := service.ReservePhysicalStorage(ctx, 75*1024*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	err = service.checkAdmission(ctx, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_insufficient" {
+		t.Fatalf("shared physical reservation error = %#v", err)
+	}
+}
+
+func TestCachedResumeWithDiskGrowthChargesBothPhysicalCosts(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.ResumeCostBytes = 10
+	cfg.ResizeCostBytes = 7
+	service := New(store, cfg, Options{})
+	task := state.Task{TaskID: "cached-cost-task", SessionID: "cached-cost-session", State: stateCached, ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	cost, err := service.admissionStorageCost(context.Background(), task.TaskID, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 30}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cost != 17 {
+		t.Fatalf("cached resume cost = %d, want 17", cost)
+	}
+}
+
 func TestAdminMetricsDefaultAdmissionReflectsDrainAndStructuredUnknowns(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

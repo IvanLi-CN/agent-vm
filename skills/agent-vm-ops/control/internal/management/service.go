@@ -44,6 +44,7 @@ type Options struct {
 	UploadMinimumFreeBytes     int64
 	AvailableStagingBytes      func() (int64, error)
 	AvailableImageStorageBytes func() (int64, error)
+	ReserveImageStorage        func(int64) (func(), error)
 	CurrentSystemVersion       func(context.Context) (string, error)
 	IsDraining                 func(context.Context) (bool, error)
 	Clock                      func() time.Time
@@ -377,6 +378,9 @@ func (s *Service) checkImageStorageCapacity(size int64) error {
 func (s *Service) reserveImageStorage(size int64, required bool) (func(), error) {
 	if size < 0 {
 		return nil, errors.New("invalid_request: image size must not be negative")
+	}
+	if s.Options.ReserveImageStorage != nil {
+		return s.Options.ReserveImageStorage(size)
 	}
 	if s.Options.AvailableImageStorageBytes == nil || s.Options.UploadMinimumFreeBytes <= 0 {
 		if required {

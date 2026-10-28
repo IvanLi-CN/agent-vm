@@ -77,16 +77,18 @@ type Service struct {
 	CPU       CPUObserver
 	Release   *protocol.ReleaseMetadata
 
-	mu          sync.RWMutex
-	lockMu      sync.Mutex
-	actionLocks map[string]*sync.Mutex
-	maintenance sync.Mutex
-	activeMu    sync.Mutex
-	activeOps   map[string]int
-	admissionMu sync.Mutex
-	resident    bool
-	ready       bool
-	wake        func()
+	mu              sync.RWMutex
+	lockMu          sync.Mutex
+	actionLocks     map[string]*sync.Mutex
+	maintenance     sync.Mutex
+	activeMu        sync.Mutex
+	activeOps       map[string]int
+	admissionMu     sync.Mutex
+	storageMu       sync.Mutex
+	storageReserved int64
+	resident        bool
+	ready           bool
+	wake            func()
 }
 
 type internalCleanupContextKey struct{}
@@ -128,6 +130,49 @@ func (s *Service) SetWake(wake func()) {
 	s.mu.Lock()
 	s.wake = wake
 	s.mu.Unlock()
+}
+
+// ReservePhysicalStorage serializes an external pool consumer, such as an
+// image import, with lifecycle admission. The reservation remains in the
+// physical admission snapshot until the returned release function is called.
+func (s *Service) ReservePhysicalStorage(ctx context.Context, size int64) (func(), error) {
+	if size < 0 {
+		return nil, protocol.NewError("invalid_request", "physical storage reservation must not be negative", nil)
+	}
+	s.admissionMu.Lock()
+	defer s.admissionMu.Unlock()
+	admission, err := s.diskAdmission(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.diskAdmissionSufficient(ctx, admission, size, ""); err != nil {
+		return nil, err
+	}
+	s.storageMu.Lock()
+	if size > maxInt64Value-s.storageReserved {
+		s.storageMu.Unlock()
+		return nil, protocol.NewError("resource_unverified", "physical storage reservation exceeds supported range", map[string]any{"verified": false})
+	}
+	s.storageReserved += size
+	s.storageMu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.storageMu.Lock()
+			if s.storageReserved >= size {
+				s.storageReserved -= size
+			} else {
+				s.storageReserved = 0
+			}
+			s.storageMu.Unlock()
+		})
+	}, nil
+}
+
+func (s *Service) externalStorageReserved() int64 {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+	return s.storageReserved
 }
 
 func (s *Service) wakeScheduler() {
@@ -3655,6 +3700,10 @@ func (s *Service) requiresPhysicalDiskAdmission() bool {
 }
 
 func (s *Service) diskAdmission(ctx context.Context, excludeTaskID string) (map[string]any, error) {
+	return s.diskAdmissionWithExternalReservation(ctx, excludeTaskID, s.externalStorageReserved())
+}
+
+func (s *Service) diskAdmissionWithExternalReservation(ctx context.Context, excludeTaskID string, externalReserved int64) (map[string]any, error) {
 	if s.Guest == nil {
 		return nil, protocol.NewError("resource_unverified", "Incus storage pool capacity is unavailable", map[string]any{"verified": false})
 	}
@@ -3668,6 +3717,9 @@ func (s *Service) diskAdmission(ctx context.Context, excludeTaskID string) (map[
 	}
 	if capacity.TotalBytes <= 0 || capacity.FreeBytes < 0 || capacity.FreeBytes > capacity.TotalBytes {
 		return nil, protocol.NewError("resource_unverified", "Incus storage pool capacity is invalid", map[string]any{"verified": false})
+	}
+	if externalReserved < 0 {
+		return nil, protocol.NewError("resource_unverified", "external physical storage reservation is malformed", map[string]any{"verified": false})
 	}
 	low := maxInt64(s.Config.DiskLowBytes, percentageOf(capacity.TotalBytes, 15))
 	target := maxInt64(s.Config.DiskTargetBytes, percentageOf(capacity.TotalBytes, 25))
@@ -3729,16 +3781,20 @@ func (s *Service) diskAdmission(ctx context.Context, excludeTaskID string) (map[
 		}
 	}
 	used := capacity.TotalBytes - capacity.FreeBytes
+	reserved, sumOK := addInt64(durableReserved, externalReserved)
+	if !sumOK {
+		return nil, protocol.NewError("resource_unverified", "physical disk reservations exceed supported range", map[string]any{"verified": false})
+	}
 	freeAfterLow := int64(0)
 	if capacity.FreeBytes > low {
 		freeAfterLow = capacity.FreeBytes - low
-		if durableReserved < freeAfterLow {
-			freeAfterLow -= durableReserved
+		if reserved < freeAfterLow {
+			freeAfterLow -= reserved
 		} else {
 			freeAfterLow = 0
 		}
 	}
-	allocatedAndReserved, sumOK := addInt64(used, durableReserved)
+	allocatedAndReserved, sumOK := addInt64(used, reserved)
 	if !sumOK {
 		return nil, protocol.NewError("resource_unverified", "physical disk admission exceeds supported range", map[string]any{"verified": false})
 	}
@@ -3746,10 +3802,10 @@ func (s *Service) diskAdmission(ctx context.Context, excludeTaskID string) (map[
 		"verified":         true,
 		"guest_allocation": map[string]any{"allocated_bytes": guestAllocated, "reserved_bytes": guestReserved, "allocated_and_reserved_bytes": guestAllocatedAndReserved},
 		"physical_admission": map[string]any{
-			"allocated_bytes": used, "reserved_bytes": durableReserved, "allocated_and_reserved_bytes": allocatedAndReserved,
+			"allocated_bytes": used, "reserved_bytes": reserved, "allocated_and_reserved_bytes": allocatedAndReserved,
 			"remaining_bytes": freeAfterLow, "limit_bytes": capacity.TotalBytes - low, "capacity_bytes": capacity.TotalBytes,
 			"free_bytes": capacity.FreeBytes, "low_watermark_bytes": low, "target_watermark_bytes": target,
-			"durable_reserved_bytes": durableReserved,
+			"durable_reserved_bytes": durableReserved, "external_reserved_bytes": externalReserved,
 		},
 	}, nil
 }
@@ -3764,7 +3820,10 @@ func (s *Service) diskAdmissionSufficient(_ context.Context, admission map[strin
 	}
 	free, freeOK := physical["free_bytes"].(int64)
 	low, lowOK := physical["low_watermark_bytes"].(int64)
-	reserved, reservedOK := physical["durable_reserved_bytes"].(int64)
+	reserved, reservedOK := physical["reserved_bytes"].(int64)
+	if !reservedOK {
+		reserved, reservedOK = physical["durable_reserved_bytes"].(int64)
+	}
 	if !freeOK || !lowOK || !reservedOK || requestCost < 0 {
 		return false, protocol.NewError("resource_unverified", "physical disk admission observation is malformed", map[string]any{"verified": false})
 	}
@@ -3806,7 +3865,18 @@ func (s *Service) admissionStorageCost(ctx context.Context, excludeTaskID string
 		return 0, s.sqliteError(err)
 	}
 	if task != nil && task.State == stateCached {
-		return s.Config.ResumeCostBytes, nil
+		cost := s.Config.ResumeCostBytes
+		resources := map[string]int64{}
+		if err := json.Unmarshal([]byte(task.ResourcesJSON), &resources); err != nil {
+			return 0, protocol.NewError("resource_unverified", "cached task resources are malformed", map[string]any{"verified": false})
+		}
+		if requested["disk_gib"] > resources["disk_gib"] {
+			if cost > maxInt64Value-s.Config.ResizeCostBytes {
+				return 0, protocol.NewError("config_invalid", "resume and resize physical costs exceed supported range", nil)
+			}
+			cost += s.Config.ResizeCostBytes
+		}
+		return cost, nil
 	}
 	if task != nil && (task.State == stateActive || task.State == statePreparing) {
 		return 0, nil
