@@ -72,6 +72,9 @@ func IsNotFound(err error) bool {
 	if !errors.As(err, &commandErr) {
 		return false
 	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || commandErr.Result.StdoutTruncated || commandErr.Result.StderrTruncated {
+		return false
+	}
 	diagnostic := strings.ToLower(string(commandErr.Result.Stderr) + " " + commandErr.Error())
 	for _, line := range strings.Split(diagnostic, "\n") {
 		if strings.Contains(line, "no such instance") || strings.Contains(line, "no such container") {

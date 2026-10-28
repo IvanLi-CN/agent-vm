@@ -874,7 +874,7 @@ func TestDestroyFinalizesWhenIncusConfirmsTheInstanceIsMissing(t *testing.T) {
 		TaskID: "destroy-task", SessionID: "destroy-session", Generation: 1, State: stateActive,
 		InstanceName: "agent-destroy", VMIP: &vmIP, SSHHostPort: &sshHostPort, PreviousGeneration: &previousGeneration,
 		LeaseExpiresAt: stringPointer(now.Add(time.Hour).Format(time.RFC3339Nano)),
-		CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+		CreatedAt:      nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1044,6 +1044,8 @@ func nativeInitMissingGuest() *startupGuest {
 	}}
 }
 
+func intPointer(value int64) *int64 { return &value }
+
 func TestReconcileRecoversVerifiedNativeInitAbsence(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-init-recovery.sqlite3"))
 	if err != nil {
@@ -1075,24 +1077,11 @@ func TestReconcileRecoversVerifiedNativeInitAbsence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovered == nil || recovered.State != stateAbsent || recovered.Generation != task.Generation {
+	if recovered != nil {
 		t.Fatalf("recovered task = %#v", recovered)
-	}
-	if recovered.VMIP != nil || recovered.SSHHostPort != nil || recovered.LeaseExpiresAt != nil || recovered.InactiveSince != nil || recovered.CleanupAfter != nil || recovered.ReservationBytes != 0 || recovered.PreviousGeneration != nil {
-		t.Fatalf("recovered task retained resources = %#v", recovered)
-	}
-	if recovered.ResourcesJSON != mustJSON(zeroResources()) || recovered.ResourceReservationJSON != "{}" {
-		t.Fatalf("recovered resource state = resources=%s reservation=%s", recovered.ResourcesJSON, recovered.ResourceReservationJSON)
 	}
 	if ports, err := store.ListPorts(context.Background(), task.TaskID); err != nil || len(ports) != 0 {
 		t.Fatalf("recovered ports = %#v, err=%v", ports, err)
-	}
-	lastError := map[string]any{}
-	if err := json.Unmarshal([]byte(*recovered.LastError), &lastError); err != nil {
-		t.Fatal(err)
-	}
-	if lastError["native_init_recovered_absent"] != true || lastError["outcome_verified"] != true {
-		t.Fatalf("recovery marker = %#v", lastError)
 	}
 
 	for _, operationID := range []string{"native-init-acquire", "native-init-release", "native-init-destroy"} {
@@ -1132,8 +1121,131 @@ func TestReconcileRecoversVerifiedNativeInitAbsence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if again == nil || again.State != stateAbsent || again.Generation != task.Generation {
+	if again != nil {
 		t.Fatalf("idempotent recovery task = %#v", again)
+	}
+}
+
+func TestDestroyReplayDoesNotDeleteForConflictingOrStaleIdentity(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "destroy-replay.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	zero := mustJSON(zeroResources())
+	for _, task := range []state.Task{
+		{TaskID: "replay-target-task", SessionID: "replay-target", Generation: 1, State: stateAbsent, InstanceName: "agent-replay-target", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: zero, ResourceReservationJSON: "{}"},
+		{TaskID: "stale-target-task", SessionID: "stale-target", Generation: 2, State: stateAbsent, InstanceName: "agent-stale-target", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: zero, ResourceReservationJSON: "{}"},
+	} {
+		if err := store.InsertTask(context.Background(), task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	conflictingOriginal := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": "different-session", "generation": int64(1), "operation_id": "shared-destroy"}
+	conflictingDigest, err := protocol.Digest(conflictingOriginal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), "shared-destroy", "destroy", stringPointer("different-session"), intPointer(1), map[string]any{"outcome": "success", "_request_digest": conflictingDigest}); err != nil {
+		t.Fatal(err)
+	}
+	staleOriginal := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": "stale-target", "generation": int64(1), "operation_id": "stale-destroy"}
+	staleDigest, err := protocol.Digest(staleOriginal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), "stale-destroy", "destroy", stringPointer("stale-target"), intPointer(1), map[string]any{"outcome": "success", "_request_digest": staleDigest}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	if _, err := service.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": "replay-target", "generation": int64(1), "operation_id": "shared-destroy"}); err == nil || protocol.AsError(err).Code != "operation_conflict" {
+		t.Fatalf("conflicting replay error = %#v", err)
+	}
+	if task, err := store.GetTask(context.Background(), map[string]any{"session_id": "replay-target"}); err != nil || task == nil {
+		t.Fatalf("conflicting replay deleted target: task=%#v err=%v", task, err)
+	}
+	replayed, err := service.Dispatch(context.Background(), staleOriginal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed["outcome"] != "replayed" {
+		t.Fatalf("stale replay = %#v", replayed)
+	}
+	staleTask, err := store.GetTask(context.Background(), map[string]any{"session_id": "stale-target"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if staleTask == nil || staleTask.Generation != 2 {
+		t.Fatalf("stale replay changed newer task = %#v", staleTask)
+	}
+}
+
+func TestReconcileFinalizesPendingAbsentDestroyAfterRestart(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "absent-destroy-reconcile.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	task := state.Task{TaskID: "absent-destroy-task", SessionID: "absent-destroy-session", Generation: 4, State: stateAbsent, InstanceName: "agent-absent-destroy", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}"}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	request := recordPendingLifecycleOperation(t, store, "destroy", task.SessionID, task.Generation, "absent-destroy-operation", true)
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	if _, err := service.reconcile(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	remaining, err := store.GetTask(context.Background(), map[string]any{"session_id": task.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if remaining != nil {
+		t.Fatalf("reconciled absent task remains = %#v", remaining)
+	}
+	operation, err := store.GetOperation(context.Background(), request["operation_id"].(string))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "success" {
+		t.Fatalf("destroy journal was not finalized = %#v", operation)
+	}
+}
+
+func TestNativeInitRecoveryBlocksJournalSessionMismatch(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "native-init-mismatch.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	task := insertNativeInitRecoveryTask(t, store, now)
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": task.SessionID, "generation": int64(0), "operation_id": "native-init-mismatch"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), request["operation_id"].(string), "acquire", stringPointer("foreign-session"), intPointer(0), map[string]any{
+		"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest,
+		"worker": map[string]any{"pid": 1234, "start_time": "1", "process_group": 1234, "state": "finished", "finished_at": "2026-10-27T00:00:00Z"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Guest: nativeInitMissingGuest(), Clock: func() time.Time { return now }})
+	if _, err := service.reconcile(context.Background(), true); err == nil || protocol.AsError(err).Code != "operation_unverified" {
+		t.Fatalf("mismatched journal recovery error = %#v", err)
+	}
+	current, err := store.GetTask(context.Background(), map[string]any{"session_id": task.SessionID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current == nil || current.State != stateFailed || current.ReservationBytes != task.ReservationBytes {
+		t.Fatalf("mismatched journal changed task = %#v", current)
+	}
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil || len(pending) != 1 {
+		t.Fatalf("mismatched journal pending = %#v err=%v", pending, err)
 	}
 }
 
@@ -1147,6 +1259,8 @@ func TestNativeInitRecoveryRequiresVerifiedExitedWorkers(t *testing.T) {
 		{name: "running", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "running"}},
 		{name: "orphaned", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "orphaned", "observed_at": "2026-10-27T00:00:00Z"}},
 		{name: "timed-out", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "finished", "finished_at": "2026-10-27T00:00:00Z", "timed_out": true}},
+		{name: "timed-out-string", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "finished", "finished_at": "2026-10-27T00:00:00Z", "timed_out": "true"}},
+		{name: "timed-out-number", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "finished", "finished_at": "2026-10-27T00:00:00Z", "timed_out": int64(1)}},
 		{name: "malformed", worker: map[string]any{"pid": int64(1234), "start_time": "1", "process_group": int64(1234), "state": "finished"}},
 	}
 	for _, testCase := range cases {
@@ -1422,6 +1536,35 @@ func TestAcquireReusesVerifiedAbsentTaskWithNextGeneration(t *testing.T) {
 	}
 	if remaining != nil {
 		t.Fatalf("destroy left reused task = %#v", remaining)
+	}
+}
+
+func TestAcquireReusesVerifiedAbsentTaskWithCurrentGeneration(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "absent-task-current-generation.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	recoveryMarker := mustJSON(map[string]any{"phase": "native-init", "native_init_recovered_absent": true, "outcome_verified": true})
+	task := state.Task{
+		TaskID: "absent-current-task", SessionID: "absent-current-session", Generation: 7, State: stateAbsent,
+		InstanceName: "agent-absent-current", CreatedAt: nowString(now), UpdatedAt: nowString(now), LastError: &recoveryMarker,
+		ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}",
+	}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	response, err := service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "acquire", "session_id": task.SessionID, "generation": task.Generation, "operation_id": "absent-current-acquire",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := response["result"].(map[string]any)
+	if result["state"] != stateActive || result["generation"] != int64(8) {
+		t.Fatalf("current-generation absent reuse = %#v", result)
 	}
 }
 

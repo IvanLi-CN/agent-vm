@@ -102,20 +102,30 @@ func (s *Service) reconcileVerifiedNativeInitAbsence(ctx context.Context, candid
 			})
 		}
 
-		// Journal finalization is deliberately complete before the conditional
-		// task update. If the task commit fails, the durable terminal outcomes
-		// remain evidence for explicit inspection instead of being replayed.
+		finalizations := make([]state.OperationFinalization, 0, len(pending))
+		var destroyRequest protocol.Request
+		var destroyGeneration *int64
 		for _, operation := range pending {
 			response, responseErr := nativeInitRecoveryOperation(operation, recoveredDetail, recoveryResult, s.Release)
 			if responseErr != nil {
 				return nil, responseErr
 			}
-			if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
-				return nil, s.sqliteError(err)
+			finalizations = append(finalizations, state.OperationFinalization{
+				OperationID: operation.OperationID,
+				Action:      operation.Action,
+				SessionID:   operation.SessionID,
+				Generation:  operation.Generation,
+				Response:    response,
+			})
+			if operation.Action == "destroy" {
+				if rawRequest, ok := operation.Response["_request"].(map[string]any); ok {
+					destroyRequest = protocol.Request(rawRequest)
+					destroyGeneration = operation.Generation
+				}
 			}
 		}
 
-		updated, err := s.Store.UpdateTaskIf(ctx, current.TaskID, state.TaskCondition{
+		updated, err := s.Store.FinalizeNativeInitRecovery(ctx, current.TaskID, state.TaskCondition{
 			Generation: &current.Generation,
 			States:     []string{stateFailed, stateClosing},
 		}, map[string]any{
@@ -131,12 +141,17 @@ func (s *Service) reconcileVerifiedNativeInitAbsence(ctx context.Context, candid
 			"previous_generation":       nil,
 			"last_error":                recoveredLastError,
 			"updated_at":                nowString(s.Clock()),
-		})
+		}, finalizations)
 		if err != nil {
 			return nil, s.sqliteError(err)
 		}
 		if !updated {
 			return nil, nativeInitRecoveryBlocked("native-init recovery task changed before commit", map[string]any{"task_id": current.TaskID})
+		}
+		if destroyRequest != nil {
+			if err := s.deleteDestroyedTask(ctx, destroyRequest, destroyGeneration); err != nil {
+				return nil, err
+			}
 		}
 		return nil, nil
 	})
@@ -159,6 +174,65 @@ func nativeInitFailureRecord(lastError *string) (map[string]any, bool) {
 	return value, true
 }
 
+// reconcilePendingAbsentDestroy closes the restart window where a destroy
+// journal was claimed after the task had already become absent but before the
+// terminal journal outcome and task-row deletion were both observed. It only
+// consumes a journal whose complete request, worker observation and durable
+// absence fence still match; otherwise the pending evidence remains visible.
+func (s *Service) reconcilePendingAbsentDestroy(ctx context.Context, pending []state.Operation) error {
+	for _, operation := range pending {
+		if operation.Action != "destroy" || operation.SessionID == nil || operation.Generation == nil {
+			continue
+		}
+		task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
+		if err != nil {
+			return s.sqliteError(err)
+		}
+		if task == nil || task.State != stateAbsent {
+			continue
+		}
+		detail := map[string]any{"operation_id": operation.OperationID, "task_id": task.TaskID}
+		rawRequest, ok := operation.Response["_request"].(map[string]any)
+		if !ok {
+			return nativeInitOperationBlocked("pending absent destroy request is missing", detail)
+		}
+		request := protocol.Request(rawRequest)
+		if validationErr := protocol.ValidateRequest(request); validationErr != nil {
+			return nativeInitOperationBlocked("pending absent destroy request is invalid", map[string]any{"operation_id": operation.OperationID, "cause": validationErr.Error()})
+		}
+		if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
+			return nativeInitOperationBlocked("pending absent destroy request is incompatible", map[string]any{"operation_id": operation.OperationID, "cause": compatibilityErr.Error()})
+		}
+		if !operationIdentityMatches(&operation, request) || stringValue(request["operation_id"]) != operation.OperationID || *operation.Generation != task.Generation {
+			return nativeInitOperationBlocked("pending absent destroy identity does not match its journal or task", detail)
+		}
+		digest := stringValue(operation.Response["_request_digest"])
+		calculated, digestErr := protocol.Digest(request)
+		if strings.TrimSpace(digest) == "" || digestErr != nil || digest != calculated {
+			return nativeInitOperationBlocked("pending absent destroy request digest does not match", detail)
+		}
+		if err := verifyNativeInitWorker(operation); err != nil {
+			return nativeInitOperationBlocked(err.Error(), detail)
+		}
+		if err := s.verifyAbsentTask(ctx, task, operation.OperationID, false); err != nil {
+			return err
+		}
+		result, summaryErr := s.summary(ctx, task)
+		if summaryErr != nil {
+			return summaryErr
+		}
+		response := protocol.SuccessWithRelease(request, result, s.Release, nil)
+		response["_request_digest"] = digest
+		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+			return s.sqliteError(err)
+		}
+		if err := s.deleteDestroyedTask(ctx, request, operation.Generation); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task *state.Task, failure map[string]any, excludedOperationID string) ([]state.Operation, error) {
 	pending, err := s.Store.PendingOperations(ctx)
 	if err != nil {
@@ -168,13 +242,23 @@ func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task 
 	matched := make([]state.Operation, 0)
 	acquireCount := 0
 	for _, operation := range pending {
-		if operation.SessionID == nil || *operation.SessionID != task.SessionID {
-			continue
-		}
 		if excludedOperationID != "" && operation.OperationID == excludedOperationID {
 			continue
 		}
 		detail := map[string]any{"operation_id": operation.OperationID, "task_id": task.TaskID}
+		requestValue, requestOK := operation.Response["_request"].(map[string]any)
+		requestSession := ""
+		if requestOK {
+			requestSession = stringValue(requestValue["session_id"])
+		}
+		journalSessionMatches := operation.SessionID != nil && *operation.SessionID == task.SessionID
+		requestSessionMatches := requestOK && requestSession == task.SessionID
+		if !journalSessionMatches && !requestSessionMatches {
+			continue
+		}
+		if !requestOK {
+			return nil, nativeInitOperationBlocked("pending operation request is missing", detail)
+		}
 		if operation.Generation == nil || !nativeInitOperationGenerationMatches(operation, task, failure, previousGeneration) {
 			return nil, nativeInitOperationBlocked("pending operation generation is outside the recovery window", detail)
 		}
@@ -188,10 +272,6 @@ func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task 
 		}
 		if err := verifyNativeInitWorker(operation); err != nil {
 			return nil, nativeInitOperationBlocked(err.Error(), detail)
-		}
-		requestValue, ok := operation.Response["_request"].(map[string]any)
-		if !ok {
-			return nil, nativeInitOperationBlocked("pending operation request is missing", detail)
 		}
 		digest := stringValue(operation.Response["_request_digest"])
 		if strings.TrimSpace(digest) == "" {
@@ -211,6 +291,9 @@ func (s *Service) verifiedNativeInitPendingOperations(ctx context.Context, task 
 		}
 		if requestTaskID := stringValue(request["task_id"]); requestTaskID != "" && requestTaskID != task.TaskID {
 			return nil, nativeInitOperationBlocked("pending operation task identity does not match", detail)
+		}
+		if operation.SessionID == nil || *operation.SessionID != task.SessionID {
+			return nil, nativeInitOperationBlocked("pending operation journal session identity does not match", detail)
 		}
 		calculated, digestErr := protocol.Digest(request)
 		if digestErr != nil || calculated != digest {
@@ -244,8 +327,14 @@ func verifyNativeInitWorker(operation state.Operation) error {
 			return errors.New("pending native worker process group is malformed")
 		}
 	}
-	if timedOut, present := worker["timed_out"]; present && timedOut == true {
-		return errors.New("pending native worker timed out before terminal observation")
+	if timedOutValue, present := worker["timed_out"]; present {
+		timedOut, valid := timedOutValue.(bool)
+		if !valid {
+			return errors.New("pending native worker timeout marker is malformed")
+		}
+		if timedOut {
+			return errors.New("pending native worker timed out before terminal observation")
+		}
 	}
 	switch stringValue(worker["state"]) {
 	case "finished":

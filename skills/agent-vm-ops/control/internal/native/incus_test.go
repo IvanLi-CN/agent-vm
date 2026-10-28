@@ -101,4 +101,31 @@ func TestIsNotFoundRequiresInstanceSpecificDiagnostic(t *testing.T) {
 			}
 		})
 	}
+	for _, testCase := range []struct {
+		name string
+		err  error
+	}{
+		{name: "deadline", err: context.DeadlineExceeded},
+		{name: "canceled", err: context.Canceled},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			err := &CommandError{Result: Result{Stderr: []byte("instance not found")}, Cause: testCase.err}
+			if IsNotFound(err) {
+				t.Fatalf("IsNotFound accepted %s", testCase.name)
+			}
+		})
+	}
+	for _, testCase := range []struct {
+		name   string
+		result Result
+	}{
+		{name: "stdout truncated", result: Result{Stdout: []byte("instance not found"), StdoutTruncated: true}},
+		{name: "stderr truncated", result: Result{Stderr: []byte("instance not found"), StderrTruncated: true}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			if IsNotFound(&CommandError{Result: testCase.result, Cause: errors.New("incus command failed")}) {
+				t.Fatalf("IsNotFound accepted truncated diagnostic")
+			}
+		})
+	}
 }

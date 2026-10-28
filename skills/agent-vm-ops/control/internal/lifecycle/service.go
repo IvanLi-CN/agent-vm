@@ -398,12 +398,16 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		}
 		if existing != nil {
 			finishActive()
+			replayed, replayErr := s.replayRecord(request, existing, warnings)
+			if replayErr != nil {
+				return nil, replayErr
+			}
 			if action == "destroy" && stringValue(existing.Response["outcome"]) == "success" {
-				if err := s.deleteDestroyedTask(ctx, request); err != nil {
+				if err := s.deleteDestroyedTask(ctx, request, existing.Generation); err != nil {
 					return nil, err
 				}
 			}
-			return s.replayRecord(request, existing, warnings)
+			return replayed, nil
 		}
 		defer finishActive()
 		ctx = native.WithWorkerRecorder(ctx, operationID, s)
@@ -424,7 +428,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 			return nil, s.sqliteError(err)
 		}
 		if action == "destroy" {
-			if err := s.deleteDestroyedTask(ctx, request); err != nil {
+			if err := s.deleteDestroyedTask(ctx, request, generationPointer(intValue(request["generation"]), request["generation"] != nil)); err != nil {
 				return nil, err
 			}
 		}
@@ -466,6 +470,9 @@ func (s *Service) replay(ctx context.Context, request protocol.Request, write bo
 
 func (s *Service) replayRecord(request protocol.Request, record *state.Operation, warningGroups ...[]any) (map[string]any, error) {
 	op := stringValue(request["operation_id"])
+	if !operationIdentityMatches(record, request) {
+		return nil, protocol.NewError("operation_conflict", "operation ID belongs to a different lifecycle identity", map[string]any{"operation_id": op})
+	}
 	digest, err := protocol.Digest(request)
 	if err != nil {
 		return nil, protocol.NewError("invalid_request", "request cannot be canonicalized", nil)
@@ -503,6 +510,22 @@ func (s *Service) replayRecord(request protocol.Request, record *state.Operation
 		}
 	}
 	return replayed, nil
+}
+
+func operationIdentityMatches(record *state.Operation, request protocol.Request) bool {
+	if record == nil || record.Action != stringValue(request["action"]) {
+		return false
+	}
+	expectedSession := optionalString(request["session_id"])
+	if (record.SessionID == nil) != (expectedSession == nil) || record.SessionID != nil && *record.SessionID != *expectedSession {
+		return false
+	}
+	_, generationPresent := request["generation"]
+	expectedGeneration := generationPointer(intValue(request["generation"]), generationPresent)
+	if (record.Generation == nil) != (expectedGeneration == nil) || record.Generation != nil && *record.Generation != *expectedGeneration {
+		return false
+	}
+	return true
 }
 
 func hasWarning(existing []any, candidate any) bool {
@@ -797,8 +820,8 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	deadline := now.Add(time.Duration(s.Config.InitialLeaseSeconds) * time.Second)
 	created := false
 	if task != nil && task.State == stateAbsent {
-		if generation != 0 {
-			return nil, protocol.NewError("generation_mismatch", "a new acquisition from an absent session must start at generation 0", map[string]any{"expected": int64(0), "actual": generation})
+		if generation != 0 && generation != task.Generation {
+			return nil, protocol.NewError("generation_mismatch", "an absent session acquire must use generation 0 or the current absent generation", map[string]any{"expected": int64(0), "current": task.Generation, "actual": generation})
 		}
 		if err := s.verifyAbsentTask(ctx, task, stringValue(request["operation_id"]), true); err != nil {
 			return nil, err
@@ -811,6 +834,10 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 			return nil, protocol.NewError("task_transition", "absent session changed before reuse", map[string]any{"outcome_verified": false})
 		}
 		task = nil
+		// The accepted current absent generation is a compatibility token for
+		// older clients. The newly allocated task still gets the next durable
+		// generation from the tombstone.
+		generation = 0
 	}
 	if task == nil {
 		created = true
@@ -1153,7 +1180,7 @@ func (s *Service) verifyAbsentTask(ctx context.Context, task *state.Task, exclud
 // deleteDestroyedTask runs only after the destroy journal is terminal. It is
 // intentionally separate from releaseUnlocked so a crash cannot delete the
 // task while its operation is still pending.
-func (s *Service) deleteDestroyedTask(ctx context.Context, request protocol.Request) error {
+func (s *Service) deleteDestroyedTask(ctx context.Context, request protocol.Request, expectedGeneration *int64) error {
 	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": stringValue(request["session_id"])})
 	if err != nil {
 		return s.sqliteError(err)
@@ -1161,10 +1188,17 @@ func (s *Service) deleteDestroyedTask(ctx context.Context, request protocol.Requ
 	if task == nil {
 		return nil
 	}
+	if expectedGeneration != nil && task.Generation != *expectedGeneration {
+		return nil
+	}
 	if err := s.verifyAbsentTask(ctx, task, "", false); err != nil {
 		return err
 	}
-	deleted, err := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateAbsent}})
+	conditionGeneration := task.Generation
+	if expectedGeneration != nil {
+		conditionGeneration = *expectedGeneration
+	}
+	deleted, err := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &conditionGeneration, States: []string{stateAbsent}})
 	if err != nil {
 		return s.sqliteError(err)
 	}
@@ -1714,6 +1748,17 @@ func (s *Service) reconcile(ctx context.Context, apply bool, excludedOperationID
 		if err := s.reconcilePendingWorkers(ctx, pending); err != nil {
 			return nil, err
 		}
+		pending, pendingErr = s.Store.PendingOperations(ctx)
+		if pendingErr != nil {
+			return nil, s.sqliteError(pendingErr)
+		}
+		if err := s.reconcilePendingAbsentDestroy(ctx, pending); err != nil {
+			return nil, err
+		}
+		pending, pendingErr = s.Store.PendingOperations(ctx)
+		if pendingErr != nil {
+			return nil, s.sqliteError(pendingErr)
+		}
 		if err := s.recoverPending(ctx, pending); err != nil {
 			return nil, err
 		}
@@ -1797,7 +1842,7 @@ func (s *Service) finalizePendingCleanup(ctx context.Context, session string, ge
 		finalized = true
 	}
 	if action == "destroy" && finalized {
-		if err := s.deleteDestroyedTask(ctx, deleteRequest); err != nil {
+		if err := s.deleteDestroyedTask(ctx, deleteRequest, generationPointer(generation, true)); err != nil {
 			return err
 		}
 	}
@@ -1833,7 +1878,7 @@ func (s *Service) gc(ctx context.Context, apply bool) (map[string]any, error) {
 					if firstErr == nil {
 						firstErr = releaseErr
 					}
-				} else if deleteErr := s.deleteDestroyedTask(ctx, cleanupRequest); deleteErr != nil && firstErr == nil {
+				} else if deleteErr := s.deleteDestroyedTask(ctx, cleanupRequest, &task.Generation); deleteErr != nil && firstErr == nil {
 					firstErr = deleteErr
 				}
 			}
