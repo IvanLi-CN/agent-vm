@@ -19,6 +19,22 @@ type testWorkerRecorder struct {
 	finished []error
 }
 
+type blockingWorkerRecorder struct {
+	testWorkerRecorder
+	err error
+}
+
+type failingStartRecorder struct {
+	testWorkerRecorder
+	err error
+}
+
+type startFailureRecorder struct {
+	testWorkerRecorder
+	mu       sync.Mutex
+	failures []error
+}
+
 func (recorder *testWorkerRecorder) WorkerStarted(_ context.Context, _ string, identity WorkerIdentity) error {
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
@@ -30,6 +46,25 @@ func (recorder *testWorkerRecorder) WorkerFinished(_ context.Context, _ string, 
 	recorder.mu.Lock()
 	defer recorder.mu.Unlock()
 	recorder.finished = append(recorder.finished, err)
+	return nil
+}
+
+func (recorder *blockingWorkerRecorder) WorkerStartAllowed(context.Context, string) error {
+	return recorder.err
+}
+
+func (recorder *failingStartRecorder) WorkerStarted(context.Context, string, WorkerIdentity) error {
+	return recorder.err
+}
+
+func (recorder *startFailureRecorder) WorkerStartAllowed(context.Context, string) error {
+	return nil
+}
+
+func (recorder *startFailureRecorder) WorkerStartFailed(_ context.Context, _ string, err error) error {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	recorder.failures = append(recorder.failures, err)
 	return nil
 }
 
@@ -58,6 +93,73 @@ func TestRunnerUsesTheProtocolOutputSplit(t *testing.T) {
 	}
 }
 
+func TestCleanupTrackedPerformsFinalDiscovery(t *testing.T) {
+	discoverCalls := 0
+	presentCalls := 0
+	if err := cleanupTrackedWith(42, cleanupOperations{
+		discover: func(root int) error {
+			if root != 42 {
+				t.Fatalf("cleanup root = %d, want 42", root)
+			}
+			discoverCalls++
+			return nil
+		},
+		kill: func() error { return nil },
+		reap: func() error { return nil },
+		present: func() (int, error) {
+			presentCalls++
+			if presentCalls == 1 {
+				return 0, nil
+			}
+			if presentCalls == 2 {
+				return 1, nil
+			}
+			return 0, nil
+		},
+		sleep: func(time.Duration) {},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if discoverCalls < 4 || presentCalls < 4 {
+		t.Fatalf("cleanup scans = discover:%d present:%d, want a final rescan after the first empty observation", discoverCalls, presentCalls)
+	}
+}
+
+func TestCleanupTrackedConfirmsProcessGroupAfterEmptyObservation(t *testing.T) {
+	groupCalls := 0
+	if err := cleanupTrackedWith(42, cleanupOperations{
+		discover: func(int) error { return nil },
+		kill:     func() error { return nil },
+		reap:     func() error { return nil },
+		present:  func() (int, error) { return 0, nil },
+		groupAlive: func() (bool, error) {
+			groupCalls++
+			return groupCalls == 1, nil
+		},
+		sleep: func(time.Duration) {},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if groupCalls < 2 {
+		t.Fatalf("group cleanup checks = %d, want a retry after the group remained", groupCalls)
+	}
+}
+
+func TestCleanupTrackedFailsClosedOnProcessGroupObservationError(t *testing.T) {
+	sentinel := errors.New("synthetic process-group observation failure")
+	err := cleanupTrackedWith(42, cleanupOperations{
+		discover:   func(int) error { return nil },
+		kill:       func() error { return nil },
+		reap:       func() error { return nil },
+		present:    func() (int, error) { return 0, nil },
+		groupAlive: func() (bool, error) { return false, sentinel },
+		sleep:      func(time.Duration) {},
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("cleanupTrackedWith() error = %v, want %v", err, sentinel)
+	}
+}
+
 func TestRunnerAllowsIndependentCommandsToOverlap(t *testing.T) {
 	runner := NewRunner()
 	started := time.Now()
@@ -80,6 +182,63 @@ func TestRunnerAllowsIndependentCommandsToOverlap(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 450*time.Millisecond {
 		t.Fatalf("independent native commands were serialized: %s", elapsed)
+	}
+}
+
+func TestRunnerAppliesWorkerStartGuardBeforeSpawn(t *testing.T) {
+	sentinel := errors.New("worker start blocked")
+	marker := filepath.Join(t.TempDir(), "spawned")
+	recorder := &blockingWorkerRecorder{err: sentinel}
+	ctx := WithWorkerRecorder(context.Background(), "operation", recorder)
+	_, err := NewRunner().Run(ctx, []string{"/bin/sh", "-c", "echo spawned > \"$1\"", "sh", marker}, nil)
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Run() error = %v, want %v", err, sentinel)
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("worker start guard allowed command side effect: stat error = %v", statErr)
+	}
+}
+
+func TestRunnerRecordsCleanupAfterWorkerStartCallbackFailure(t *testing.T) {
+	recorder := &failingStartRecorder{err: errors.New("worker identity journal unavailable")}
+	ctx := WithWorkerRecorder(context.Background(), "operation", recorder)
+	_, err := NewRunner().Run(ctx, []string{"/bin/echo", "worker"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "record native worker start") {
+		t.Fatalf("Run() error = %v, want worker-start callback failure", err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.finished) != 1 || recorder.finished[0] != nil {
+		t.Fatalf("worker finish callbacks = %#v, want one confirmed cleanup", recorder.finished)
+	}
+}
+
+func TestRunnerRecordsConfirmedStartFailure(t *testing.T) {
+	recorder := &startFailureRecorder{}
+	ctx := WithWorkerRecorder(context.Background(), "operation", recorder)
+	missing := filepath.Join(t.TempDir(), "missing-native-command")
+	_, err := NewRunner().Run(ctx, []string{missing}, nil)
+	if err == nil || !strings.Contains(err.Error(), "start "+missing) {
+		t.Fatalf("Run() error = %v, want native start failure", err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.failures) != 1 || recorder.failures[0] == nil {
+		t.Fatalf("worker start failure callbacks = %#v, want one recorded failure", recorder.failures)
+	}
+}
+
+func TestRunnerRecordsFinishedWorkerWhenCommandFails(t *testing.T) {
+	recorder := &testWorkerRecorder{}
+	ctx := WithWorkerRecorder(context.Background(), "operation", recorder)
+	result, err := NewRunner().Run(ctx, []string{"/bin/sh", "-c", "exit 17"}, nil)
+	if err == nil || result.Code != 17 {
+		t.Fatalf("Run() result = %#v, error = %v, want command exit 17", result, err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.finished) != 1 || recorder.finished[0] != nil {
+		t.Fatalf("worker finish callbacks = %#v, want one confirmed cleanup", recorder.finished)
 	}
 }
 

@@ -25,12 +25,15 @@ type trackedProcess struct {
 }
 
 type processTracker struct {
-	owner      int
-	root       int
-	baseline   map[int]trackedProcess
-	tracked    map[int]trackedProcess
-	cgroupPath string
-	cgroupFD   int
+	owner        int
+	root         int
+	rootGroup    int
+	rootStart    string
+	baseline     map[int]trackedProcess
+	tracked      map[int]trackedProcess
+	groupMembers map[int]trackedProcess
+	cgroupPath   string
+	cgroupFD     int
 }
 
 var nativeProcessTreeMu sync.Mutex
@@ -44,6 +47,13 @@ func (tracker *processTracker) Identity(root int) (WorkerIdentity, error) {
 
 func (tracker *processTracker) Register(root int) {
 	tracker.root = root
+	// Commands are started with Setpgid, so the PID is the expected process
+	// group even if the root exits before procfs identity can be observed.
+	tracker.rootGroup = root
+	if process, err := readProcess(root); err == nil {
+		tracker.rootStart = process.start
+		tracker.rootGroup = process.group
+	}
 }
 
 func startTrackedCommand(command *exec.Cmd, tracker *processTracker) (bool, error) {
@@ -69,7 +79,13 @@ func newProcessTracker() (*processTracker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("snapshot native process tree: %w", err)
 	}
-	tracker := &processTracker{owner: owner, baseline: baseline, tracked: make(map[int]trackedProcess), cgroupFD: -1}
+	tracker := &processTracker{
+		owner:        owner,
+		baseline:     baseline,
+		tracked:      make(map[int]trackedProcess),
+		groupMembers: make(map[int]trackedProcess),
+		cgroupFD:     -1,
+	}
 	tracker.prepareCgroup()
 	return tracker, nil
 }
@@ -120,6 +136,13 @@ func (tracker *processTracker) hasOwnershipBoundary() bool {
 	return tracker.cgroupPath != ""
 }
 
+func (tracker *processTracker) groupAlive() (bool, error) {
+	if tracker.rootGroup <= 0 {
+		return false, nil
+	}
+	return workerGroupAlive(tracker.rootGroup, readProcessTable)
+}
+
 func (tracker *processTracker) Discover(root int) error {
 	nativeProcessTreeMu.Lock()
 	defer nativeProcessTreeMu.Unlock()
@@ -130,17 +153,128 @@ func (tracker *processTracker) discover(root int) error {
 	if tracker.root == 0 {
 		tracker.root = root
 	}
-	all, err := readProcessTable()
+	return tracker.discoverWith(root, readProcessTable)
+}
+
+func (tracker *processTracker) discoverWith(root int, readTable func() (map[int]trackedProcess, error)) error {
+	return tracker.discoverWithRead(root, readTable, readProcess)
+}
+
+func (tracker *processTracker) discoverWithRead(root int, readTable func() (map[int]trackedProcess, error), readRoot func(int) (trackedProcess, error)) error {
+	all, err := readTable()
 	if err != nil {
 		return fmt.Errorf("inspect native process tree: %w", err)
 	}
+	rootProcess, rootPresent := all[root]
+	if rootPresent {
+		if tracker.rootStart == "" {
+			tracker.rootStart = rootProcess.start
+		}
+		if tracker.rootStart != rootProcess.start {
+			return fmt.Errorf("native process identity changed for pid %d", root)
+		}
+		if tracker.rootGroup != rootProcess.group {
+			return fmt.Errorf("native process group changed for pid %d", root)
+		}
+	}
 	related := descendants(all, root)
+	rootExited := false
+	// A root can disappear between the table snapshot and the identity
+	// recheck. Refresh the table and continue through the root-absent path so a
+	// normally reaped root with an empty group is not reported as a tracking
+	// failure.
+	if !tracker.hasOwnershipBoundary() && tracker.rootGroup > 0 && rootPresent {
+		latestRoot, rootErr := readRoot(root)
+		if processGone(rootErr) {
+			observedBeforeRootExit := related
+			refreshed, refreshErr := readTable()
+			if refreshErr != nil {
+				return fmt.Errorf("inspect native process tree after root exit: %w", refreshErr)
+			}
+			if _, reused := refreshed[root]; reused {
+				return fmt.Errorf("native process identity changed for pid %d", root)
+			}
+			all = refreshed
+			related = descendants(all, root)
+			for pid, observed := range observedBeforeRootExit {
+				current, stillPresent := refreshed[pid]
+				if !stillPresent {
+					continue
+				}
+				if current.start != observed.start {
+					return fmt.Errorf("process identity changed for pid %d", pid)
+				}
+				related[pid] = current
+				for child, item := range descendants(refreshed, pid) {
+					related[child] = item
+				}
+			}
+			rootPresent = false
+			rootExited = true
+		} else if rootErr != nil {
+			return fmt.Errorf("recheck native process root: %w", rootErr)
+		} else {
+			if latestRoot.start != rootProcess.start {
+				return fmt.Errorf("native process identity changed for pid %d", root)
+			}
+			if latestRoot.group != rootProcess.group {
+				return fmt.Errorf("native process group changed for pid %d", root)
+			}
+		}
+	}
 	cgroupProcesses, err := tracker.cgroupProcesses()
 	if err != nil {
 		return fmt.Errorf("inspect native cgroup: %w", err)
 	}
 	for pid, item := range cgroupProcesses {
 		related[pid] = item
+	}
+	// Without a delegated cgroup, a descendant can outlive the root and be
+	// reparented to the subreaper before the next process-table snapshot. The
+	// isolated process group remains the ownership boundary in that case.
+	var currentGroup map[int]trackedProcess
+	if !tracker.hasOwnershipBoundary() && tracker.rootGroup > 0 {
+		if tracker.groupMembers == nil {
+			tracker.groupMembers = make(map[int]trackedProcess)
+		}
+		currentGroup = make(map[int]trackedProcess)
+		for pid, item := range all {
+			if item.group == tracker.rootGroup {
+				currentGroup[pid] = item
+			}
+		}
+		if rootPresent {
+			for pid, item := range currentGroup {
+				if previous, ok := tracker.groupMembers[pid]; ok && previous.start != item.start {
+					return fmt.Errorf("native process identity changed for pid %d", pid)
+				}
+				tracker.groupMembers[pid] = item
+				related[pid] = item
+			}
+		} else {
+			if rootExited && len(currentGroup) == 0 {
+				alive, groupErr := workerGroupAlive(tracker.rootGroup, readTable)
+				if groupErr != nil {
+					return fmt.Errorf("inspect native process group after root exit: %w", groupErr)
+				}
+				if alive {
+					return errors.New("native process group remains after root exit")
+				}
+			}
+			if tracker.rootStart == "" && len(currentGroup) > 0 {
+				return errors.New("native process root identity unavailable while its process group remains")
+			}
+			for pid, item := range currentGroup {
+				previous, ok := tracker.groupMembers[pid]
+				if !ok {
+					continue
+				}
+				if previous.start != item.start {
+					return fmt.Errorf("native process identity changed for pid %d", pid)
+				}
+				related[pid] = item
+			}
+		}
 	}
 	// A detached descendant is only owned after this tracker has observed it
 	// while it was attached to the command tree. Do not scan every child of the
@@ -149,6 +283,17 @@ func (tracker *processTracker) discover(root int) error {
 		if _, present := all[pid]; present {
 			for child, item := range descendants(all, pid) {
 				related[child] = item
+			}
+		}
+	}
+	if !tracker.hasOwnershipBoundary() && tracker.rootGroup > 0 && !rootPresent {
+		for pid, item := range currentGroup {
+			owned, ok := related[pid]
+			if !ok {
+				return fmt.Errorf("native process group membership unavailable for pid %d", pid)
+			}
+			if owned.start != item.start {
+				return fmt.Errorf("native process identity changed for pid %d", pid)
 			}
 		}
 	}
@@ -182,7 +327,7 @@ func (tracker *processTracker) cgroupProcesses() (map[int]trackedProcess, error)
 			continue
 		}
 		process, err := readProcess(pid)
-		if errors.Is(err, os.ErrNotExist) {
+		if processGone(err) {
 			continue
 		}
 		if err != nil {
@@ -197,7 +342,7 @@ func (tracker *processTracker) Live() (int, error) {
 	live := 0
 	for pid, item := range tracker.tracked {
 		current, err := readProcess(pid)
-		if errors.Is(err, os.ErrNotExist) {
+		if processGone(err) {
 			continue
 		}
 		if err != nil {
@@ -217,7 +362,7 @@ func (tracker *processTracker) Present() (int, error) {
 	present := 0
 	for pid, item := range tracker.tracked {
 		current, err := readProcess(pid)
-		if errors.Is(err, os.ErrNotExist) {
+		if processGone(err) {
 			continue
 		}
 		if err != nil {
@@ -248,7 +393,7 @@ func (tracker *processTracker) Kill() error {
 			continue
 		}
 		current, err := readProcess(pid)
-		if errors.Is(err, os.ErrNotExist) {
+		if processGone(err) {
 			_ = unix.Close(fd)
 			continue
 		}
@@ -288,7 +433,7 @@ func (tracker *processTracker) Reap() error {
 			continue
 		}
 		current, err := readProcess(pid)
-		if errors.Is(err, os.ErrNotExist) {
+		if processGone(err) {
 			continue
 		}
 		if err != nil {
@@ -333,6 +478,10 @@ func readProcessTree(root int) (map[int]trackedProcess, error) {
 }
 
 func readProcessTable() (map[int]trackedProcess, error) {
+	return readProcessTableWith(os.ReadFile)
+}
+
+func readProcessTableWith(readFile func(string) ([]byte, error)) (map[int]trackedProcess, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, err
@@ -343,8 +492,8 @@ func readProcessTable() (map[int]trackedProcess, error) {
 		if parseErr != nil || pid <= 0 {
 			continue
 		}
-		item, statErr := readProcess(pid)
-		if errors.Is(statErr, os.ErrNotExist) {
+		item, statErr := readProcessWith(readFile, pid)
+		if processGone(statErr) {
 			continue
 		}
 		if statErr != nil {
@@ -355,8 +504,16 @@ func readProcessTable() (map[int]trackedProcess, error) {
 	return result, nil
 }
 
+func processGone(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ESRCH)
+}
+
 func readProcess(pid int) (trackedProcess, error) {
-	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	return readProcessWith(os.ReadFile, pid)
+}
+
+func readProcessWith(readFile func(string) ([]byte, error), pid int) (trackedProcess, error) {
+	raw, err := readFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
 		return trackedProcess{}, err
 	}
