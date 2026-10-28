@@ -456,6 +456,10 @@ func TestAdminMetricsDefaultAdmissionReflectsDrainAndStructuredUnknowns(t *testi
 	if _, ok := metrics["instances"].(map[string]any); !ok {
 		t.Fatalf("instances = %#v", metrics["instances"])
 	}
+	doctor, ok := metrics["doctor"].(map[string]any)
+	if !ok || doctor["ready"] != true {
+		t.Fatalf("doctor = %#v", metrics["doctor"])
+	}
 }
 
 func TestAdminMetricsPreservesPhysicalCapacityAndAdmissionCost(t *testing.T) {

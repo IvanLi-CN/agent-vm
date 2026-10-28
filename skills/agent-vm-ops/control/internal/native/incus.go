@@ -402,9 +402,15 @@ func (c *IncusClient) StoragePoolCapacity(ctx context.Context) (StorageCapacity,
 	if stat.Bsize <= 0 || stat.Blocks == 0 || stat.Bavail < 0 {
 		return StorageCapacity{}, errors.New("invalid storage pool filesystem capacity")
 	}
-	blockSize := uint64(stat.Bsize)
-	total, free := uint64(stat.Blocks)*blockSize, uint64(stat.Bavail)*blockSize
+	return storageCapacityFromBlocks(uint64(stat.Blocks), uint64(stat.Bavail), uint64(stat.Bsize))
+}
+
+func storageCapacityFromBlocks(blocks, availableBlocks, blockSize uint64) (StorageCapacity, error) {
 	maxInt64 := uint64(^uint64(0) >> 1)
+	if blocks == 0 || blockSize == 0 || availableBlocks > blocks || blocks > ^uint64(0)/blockSize || availableBlocks > ^uint64(0)/blockSize {
+		return StorageCapacity{}, errors.New("storage pool filesystem capacity exceeds supported range")
+	}
+	total, free := blocks*blockSize, availableBlocks*blockSize
 	if total == 0 || free > total || total > maxInt64 || free > maxInt64 {
 		return StorageCapacity{}, errors.New("storage pool filesystem capacity exceeds supported range")
 	}

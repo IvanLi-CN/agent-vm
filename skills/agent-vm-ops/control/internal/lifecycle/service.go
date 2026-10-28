@@ -2623,6 +2623,17 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			instances := map[string]any{"verified": true, "source": "durable_state", "native_verified": false, "total": len(tasks), "limits": map[string]any{}, "admission": map[string]any{"allocated": admissionInstances - states[statePreparing], "reserved": states[statePreparing], "allocated_and_reserved": admissionInstances, "remaining": instanceRemaining, "limit": instanceLimit, "capacity": nil}}
 			defaultReady := len(defaultReasons) == 0
 			admissionReady := s.Ready() && nativeUp && defaultReady
+			doctorIssues := []any{}
+			if !s.Ready() {
+				doctorIssues = append(doctorIssues, map[string]any{"code": "startup_reconcile_required", "message": "control service is not ready"})
+			}
+			if !nativeUp {
+				doctorIssues = append(doctorIssues, map[string]any{"code": "native_unavailable", "message": "Incus native availability is not verified"})
+			}
+			if diskErr != nil && s.requiresPhysicalDiskAdmission() {
+				control := protocol.AsError(diskErr)
+				doctorIssues = append(doctorIssues, map[string]any{"code": control.Code, "message": control.Message, "detail": control.Detail})
+			}
 			capacityObservation := any(nil)
 			if diskErr == nil {
 				physical := diskAdmission["physical_admission"].(map[string]any)
@@ -2635,7 +2646,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				"reclaim_required": reclaimRequired, "disk_admission": diskAdmission,
 				"default_admission": map[string]any{"requested": defaultRequested, "request_cost_bytes": s.Config.CreateCostBytes, "ready": defaultReady, "reasons": defaultReasons, "reclaim_required": reclaimRequired},
 				"ct_memory":         map[string]any{"capacity_bytes": memoryObservation["limit_bytes"], "current_bytes": memoryObservation["current_bytes"], "available_bytes": memoryObservation["available_bytes"], "pressure_threshold_bytes": memoryObservation["threshold_bytes"], "pressure": memoryObservation["pressure"], "oom_events": memoryObservation["oom_events"]},
-				"task_states":       states, "pending_operations": pendingOperations, "historical_unknown_operations": unknownOperations, "instances": instances, "operations": map[string]any{"pending": len(pendingOperations), "historical_unknown": len(unknownOperations)}, "image_unpack_failures": nil, "warnings": warnings,
+				"task_states":       states, "pending_operations": pendingOperations, "historical_unknown_operations": unknownOperations, "instances": instances, "operations": map[string]any{"pending": len(pendingOperations), "historical_unknown": len(unknownOperations)}, "image_unpack_failures": nil, "doctor": map[string]any{"ready": len(doctorIssues) == 0, "issues": doctorIssues}, "warnings": warnings,
 				"warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil || diskErr != nil), "native_unavailable": boolInt(!nativeUp)},
 			}, nil
 		}
