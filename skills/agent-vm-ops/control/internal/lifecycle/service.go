@@ -79,18 +79,21 @@ type Service struct {
 	Memory    MemoryObserver
 	Release   *protocol.ReleaseMetadata
 
-	mu              sync.RWMutex
-	lockMu          sync.Mutex
-	actionLocks     map[string]*sync.Mutex
-	maintenance     sync.Mutex
-	activeMu        sync.Mutex
-	activeOps       map[string]int
-	admissionMu     sync.Mutex
-	storageMu       sync.Mutex
-	storageReserved int64
-	resident        bool
-	ready           bool
-	wake            func()
+	mu                sync.RWMutex
+	lockMu            sync.Mutex
+	actionLocks       map[string]*sync.Mutex
+	maintenance       sync.Mutex
+	activeMu          sync.Mutex
+	activeOps         map[string]int
+	admissionMu       sync.Mutex
+	storageMu         sync.Mutex
+	storageReserved   int64
+	auditSummaryMu    sync.RWMutex
+	auditSummaryEpoch string
+	auditSummaryCache state.AuditSummary
+	resident          bool
+	ready             bool
+	wake              func()
 }
 
 type internalCleanupContextKey struct{}
@@ -129,6 +132,43 @@ func New(store *state.Store, cfg config.Config, options Options) *Service {
 		clock = time.Now
 	}
 	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Memory: options.Memory, Release: options.Release, resident: options.Resident, ready: false, wake: options.Wake, actionLocks: make(map[string]*sync.Mutex), activeOps: make(map[string]int)}
+}
+
+func (s *Service) auditSummary(ctx context.Context, epoch string) (state.AuditSummary, error) {
+	s.auditSummaryMu.RLock()
+	if epoch != "" && epoch == s.auditSummaryEpoch {
+		cached := cloneAuditSummary(s.auditSummaryCache)
+		s.auditSummaryMu.RUnlock()
+		return cached, nil
+	}
+	s.auditSummaryMu.RUnlock()
+	summary, err := s.Store.AuditSummary(ctx)
+	if err != nil {
+		return state.AuditSummary{}, err
+	}
+	s.auditSummaryMu.Lock()
+	s.auditSummaryEpoch = epoch
+	s.auditSummaryCache = cloneAuditSummary(summary)
+	s.auditSummaryMu.Unlock()
+	return summary, nil
+}
+
+func cloneAuditSummary(summary state.AuditSummary) state.AuditSummary {
+	clone := state.AuditSummary{
+		Operations:          make(map[string]int64, len(summary.Operations)),
+		ImageUnpackFailures: make(map[string]int64, len(summary.ImageUnpackFailures)),
+		Warnings:            make(map[string]int64, len(summary.Warnings)),
+	}
+	for key, value := range summary.Operations {
+		clone.Operations[key] = value
+	}
+	for key, value := range summary.ImageUnpackFailures {
+		clone.ImageUnpackFailures[key] = value
+	}
+	for key, value := range summary.Warnings {
+		clone.Warnings[key] = value
+	}
+	return clone
 }
 
 func (s *Service) MarkReady()  { s.mu.Lock(); s.ready = true; s.mu.Unlock() }
@@ -2579,7 +2619,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			if managementPendingErr != nil {
 				return nil, s.sqliteError(managementPendingErr)
 			}
-			auditSummary, auditSummaryErr := s.Store.AuditSummary(ctx)
+			auditSummary, auditSummaryErr := s.auditSummary(ctx, epoch)
 			if auditSummaryErr != nil {
 				return nil, s.sqliteError(auditSummaryErr)
 			}
@@ -4083,19 +4123,24 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 			continue
 		}
 		cleanupRequest := protocol.Request{"session_id": task.SessionID, "generation": task.Generation}
-		// The caller holds admissionMu. Calling release would acquire the
-		// cached session lock after that mutex, while a concurrent session
-		// action can hold the session lock and wait for admissionMu. Use the
-		// unlocked cleanup path; its durable generation/state fences still
-		// make a concurrent session action fail closed.
-		if _, releaseErr := s.releaseUnlocked(withInternalCleanup(ctx), cleanupRequest, true); releaseErr != nil {
-			continue
+		// The caller holds admissionMu. The release path takes the cached
+		// session lock, while release/reconcile never acquire admissionMu, so
+		// this lock order cannot cycle and keeps native deletion serialized.
+		if _, releaseErr := s.release(withInternalCleanup(ctx), cleanupRequest, true); releaseErr != nil {
+			return false, releaseErr
 		}
 		admission, admissionErr := s.diskAdmission(ctx, excludeTaskID)
 		if admissionErr != nil {
 			return false, admissionErr
 		}
-		if sufficient, sufficientErr := s.diskAdmissionSufficientWithFloor(ctx, admission, requestCost, excludeTaskID, minimumFreeBytes); sufficientErr == nil && sufficient {
+		sufficient, sufficientErr := s.diskAdmissionSufficientWithFloor(ctx, admission, requestCost, excludeTaskID, minimumFreeBytes)
+		if sufficientErr != nil {
+			if protocol.AsError(sufficientErr).Code != "resource_insufficient" {
+				return false, sufficientErr
+			}
+			continue
+		}
+		if sufficient {
 			return true, nil
 		}
 	}
