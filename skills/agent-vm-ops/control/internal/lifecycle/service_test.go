@@ -649,6 +649,16 @@ func TestFailedDiskResizeRetainsPhysicalCostReservation(t *testing.T) {
 	if reservationErr != nil || task.ReservationBytes != 7*gib || reservation["cpu"] != 3 || reservation["memory_mib"] != 4096 || reservation["disk_gib"] != 30 {
 		t.Fatalf("follow-up CPU resize reservation = %#v", task)
 	}
+	if _, err := service.resize(ctx, protocol.Request{"session_id": "failed-disk-resize-session", "generation": int64(1), "disk_gib": int64(31)}); err != nil {
+		t.Fatalf("retry disk resize = %#v", err)
+	}
+	task, err = store.GetTask(ctx, map[string]any{"task_id": "failed-disk-resize-task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
+		t.Fatalf("successful retry disk resize reservation = %#v", task)
+	}
 }
 
 func TestInvalidLiveResizeDoesNotReclaimCachedCapacity(t *testing.T) {

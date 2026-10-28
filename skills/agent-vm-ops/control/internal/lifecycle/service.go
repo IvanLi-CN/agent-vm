@@ -2268,12 +2268,28 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 		if reservationErr != nil {
 			return nil, protocol.NewError("resource_unverified", "existing resize reservation cannot be verified", map[string]any{"task_id": task.TaskID, "verified": false})
 		}
-		for key, value := range reservation {
-			commitReservation[key] = value
+		pending := map[string]bool{}
+		for _, key := range resourceKeys {
+			if reservation[key] != current[key] {
+				pending[key] = true
+			}
 		}
 		for _, key := range resourceKeys {
 			if _, requestedDimension := request[key]; requestedDimension {
+				delete(pending, key)
+			}
+		}
+		if len(pending) == 0 && task.ReservationBytes > 0 && request["disk_gib"] == nil {
+			for _, key := range resourceKeys {
+				pending[key] = true
+			}
+		}
+		if len(pending) > 0 {
+			for _, key := range resourceKeys {
 				commitReservation[key] = target[key]
+			}
+			for key := range pending {
+				commitReservation[key] = reservation[key]
 			}
 		}
 	}
