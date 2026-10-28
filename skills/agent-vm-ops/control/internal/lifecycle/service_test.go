@@ -670,6 +670,38 @@ func TestTimerOperationsDoNotWakeSchedulerOrReplayAcrossServices(t *testing.T) {
 	}
 }
 
+func TestStartupReconcileRetriesTimerBeforeNativeStart(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "timer-prestart-recovery.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	request := map[string]any{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true, "generation": int64(0), "operation_id": "timer-prestart-recovery"}
+	generation := int64(0)
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "timer-prestart-recovery", "timer-reconcile", nil, &generation, map[string]any{
+		"outcome": "pending", "_request": request, "_request_digest": digest,
+		"worker": map[string]any{"state": "starting", "prepared_at": "2026-10-28T00:00:00+00:00"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(ctx, "timer-prestart-recovery")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "success" {
+		t.Fatalf("recovered timer operation = %#v", operation)
+	}
+}
+
 func TestIncompatibleCapabilityIsRejectedBeforeJournalClaim(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

@@ -471,7 +471,7 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 			if validWorker {
 				stateValue = stringValue(worker["state"])
 			}
-			if !validWorker || (stateValue != "finished" && stateValue != "exited") || !recoverableOperation(operation.Action) {
+			if !validWorker || !recoverableOperation(operation.Action) || (stateValue != "finished" && stateValue != "exited" && !recoverableBeforeNativeStart(operation.Action, worker)) {
 				continue
 			}
 		}
@@ -543,6 +543,13 @@ func recoverableOperation(action string) bool {
 	default:
 		return false
 	}
+}
+
+func recoverableBeforeNativeStart(action string, worker map[string]any) bool {
+	if action != "timer-reconcile" && action != "timer-age-gc" {
+		return false
+	}
+	return stringValue(worker["state"]) == "starting" && !boolValue(worker["start_attempted"])
 }
 
 func operationHasNativeEffect(action string) bool {
