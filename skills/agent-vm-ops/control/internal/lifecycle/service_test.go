@@ -892,6 +892,77 @@ func TestCachedResumeWithDiskGrowthChargesBothPhysicalCosts(t *testing.T) {
 	}
 }
 
+func TestCachedReleaseRetainsResourcesForResumeCostClassification(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.ResumeCostBytes = 10
+	cfg.ResizeCostBytes = 7
+	service := New(store, cfg, Options{})
+	task := state.Task{TaskID: "release-cache-task", SessionID: "release-cache-session", Generation: 1, State: stateActive, ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.releaseUnlocked(context.Background(), protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); err != nil {
+		t.Fatal(err)
+	}
+	cached, err := store.GetTask(context.Background(), map[string]any{"task_id": task.TaskID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached == nil || cached.ResourcesJSON != task.ResourcesJSON {
+		t.Fatalf("cached resources = %#v, want %s", cached, task.ResourcesJSON)
+	}
+	sameSize, err := service.admissionStorageCost(context.Background(), task.TaskID, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sameSize != cfg.ResumeCostBytes {
+		t.Fatalf("same-size cached resume cost = %d, want %d", sameSize, cfg.ResumeCostBytes)
+	}
+}
+
+func TestReclaimCachedCapacitySkipsIneligibleGuest(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "running-cache", SessionID: "running-cache-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-running-cache", CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{startupGuest: &startupGuest{
+		status: "Running",
+		config: map[string]any{
+			"config": map[string]any{
+				"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "running-cache",
+				"user.agent-vm.session": "running-cache-session", "user.agent-vm.generation": "1",
+			},
+			"devices": map[string]any{}, "expanded_devices": map[string]any{},
+		},
+	}, capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 10 * gib}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	service.admissionMu.Lock()
+	reclaimed, reclaimErr := service.reclaimCachedCapacity(context.Background(), 1, "", 0)
+	service.admissionMu.Unlock()
+	if reclaimErr != nil {
+		t.Fatal(reclaimErr)
+	}
+	if reclaimed || guest.deleteCalls != 0 {
+		t.Fatalf("ineligible cache reclaimed=%v delete_calls=%d", reclaimed, guest.deleteCalls)
+	}
+}
+
 func TestAdminMetricsDefaultAdmissionReflectsDrainAndStructuredUnknowns(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -1006,6 +1077,40 @@ func TestAdminMetricsPublishesVerifiedMemoryObservation(t *testing.T) {
 	}
 	if memory["pressure"] != true || memory["oom_events"].(map[string]int64)["oom"] != 2 {
 		t.Fatalf("ct memory pressure = %#v", memory)
+	}
+}
+
+func TestAdminMetricsFailsAdmissionReadinessWhenResidentMemoryIsUnverified(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024},
+	}
+	service := New(store, config.Defaults(), Options{
+		Guest:    guest,
+		CPU:      staticCPUObserver{observation: observe.CPUObservation{Capacity: 8}},
+		Resident: true,
+	})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics["admission_ready"] != false || metrics["default_admission"].(map[string]any)["ready"] != false {
+		t.Fatalf("unverified resident memory readiness = %#v", metrics)
+	}
+	found := false
+	for _, raw := range metrics["default_admission"].(map[string]any)["reasons"].([]any) {
+		if reason, ok := raw.(map[string]any); ok && reason["code"] == "resource_unverified" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unverified resident memory reasons = %#v", metrics["default_admission"])
 	}
 }
 
@@ -1306,6 +1411,10 @@ func TestAdminMetricsMatchesAdmissionForUnknownState(t *testing.T) {
 	instances := metrics["instances"].(map[string]any)["admission"].(map[string]any)
 	if instances["allocated_and_reserved"] != int64(1) {
 		t.Fatalf("unknown state instance admission = %#v", instances)
+	}
+	resources := metrics["resources"].(map[string]any)
+	if remaining, ok := resources["remaining"].(map[string]any); !ok || len(remaining) != 0 {
+		t.Fatalf("unknown state resource remaining = %#v", resources["remaining"])
 	}
 	if control := protocol.AsError(service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)); control == nil || control.Code != "resource_unverified" {
 		t.Fatalf("unknown state admission error = %#v", control)

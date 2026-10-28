@@ -2048,7 +2048,14 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	if destroy {
 		stateValue = stateAbsent
 	}
-	updates := map[string]any{"state": stateValue, "updated_at": nowString(s.Clock()), "resources_json": mustJSON(zeroResources()), "resource_reservation_json": "{}", "reservation_bytes": int64(0)}
+	resourcesJSON := mustJSON(zeroResources())
+	if !destroy {
+		// Cached tasks retain their last requested resources so a same-size
+		// resume is not misclassified as a disk growth operation. Cached tasks
+		// are excluded from active logical and physical allocation totals.
+		resourcesJSON = task.ResourcesJSON
+	}
+	updates := map[string]any{"state": stateValue, "updated_at": nowString(s.Clock()), "resources_json": resourcesJSON, "resource_reservation_json": "{}", "reservation_bytes": int64(0)}
 	if destroy {
 		updates["inactive_since"] = nil
 		updates["cleanup_after"] = nil
@@ -2755,6 +2762,12 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				limits["disk_gib"] = s.Config.DiskBudgetGiB
 				remaining["disk_gib"] = s.Config.DiskBudgetGiB - allocatedAndReserved["disk_gib"]
 			}
+			if len(unknownTaskStates) > 0 {
+				// The known-state totals are incomplete. Keep authoritative limits,
+				// but omit derived headroom so bridges cannot turn a partial view into
+				// a positive slot estimate.
+				remaining = map[string]any{}
+			}
 			memoryObservation := map[string]any{"limit_bytes": nil, "current_bytes": nil, "available_bytes": nil, "threshold_bytes": nil, "pressure": nil, "oom_events": nil}
 			if memoryObservationValue != nil {
 				memoryObservation["limit_bytes"] = memoryObservationValue.LimitBytes
@@ -2778,6 +2791,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			if !nativeUp {
 				defaultReasons = append(defaultReasons, map[string]any{"code": "native_unavailable", "message": "Incus native availability is not verified"})
+			}
+			if s.resident && memoryObservationErr != nil {
+				defaultReasons = append(defaultReasons, map[string]any{"code": "resource_unverified", "message": "CT memory observation is not verified"})
 			}
 			defaultRequested := map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}
 			logicalExceeded := []string{}
@@ -2887,6 +2903,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			if !nativeUp {
 				doctorIssues = append(doctorIssues, map[string]any{"code": "native_unavailable", "message": "Incus native availability is not verified"})
+			}
+			if s.resident && memoryObservationErr != nil {
+				doctorIssues = append(doctorIssues, map[string]any{"code": "resource_unverified", "message": "CT memory observation is not verified"})
 			}
 			if diskErr != nil && s.requiresPhysicalDiskAdmission() {
 				control := protocol.AsError(diskErr)
@@ -4113,7 +4132,6 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 		if task.TaskID == excludeTaskID || task.State != stateCached {
 			continue
 		}
-		cleanupRequest := protocol.Request{"session_id": task.SessionID, "generation": task.Generation}
 		// The caller holds admissionMu, while acquire holds a session lock before
 		// waiting for admissionMu. Never wait for another session lock here: a
 		// concurrent acquire for this cached session could otherwise deadlock the
@@ -4123,6 +4141,27 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 		if !locked {
 			continue
 		}
+		current, currentErr := s.Store.GetTask(ctx, map[string]any{"session_id": task.SessionID})
+		if currentErr != nil {
+			unlockSession()
+			return false, s.sqliteError(currentErr)
+		}
+		if current == nil || current.TaskID != task.TaskID || current.Generation != task.Generation || current.State != stateCached {
+			unlockSession()
+			continue
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+		cacheErr := s.verifyCachedGuest(checkCtx, current)
+		cancel()
+		if cacheErr != nil {
+			unlockSession()
+			control := protocol.AsError(cacheErr)
+			if control.Code == "cache_ineligible" {
+				continue
+			}
+			return false, cacheErr
+		}
+		cleanupRequest := protocol.Request{"session_id": current.SessionID, "generation": current.Generation}
 		_, releaseErr := s.releaseUnlocked(withInternalCleanup(ctx), cleanupRequest, true)
 		unlockSession()
 		if releaseErr != nil {

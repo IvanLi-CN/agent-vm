@@ -107,7 +107,7 @@ func TestSnapshotMetricsPreserveMemoryOOMEvidenceAndSlotEstimates(t *testing.T) 
 		"resources": map[string]any{
 			"allocated":              map[string]any{"cpu": true, "memory_mib": int64(4)},
 			"allocated_and_reserved": map[string]any{"cpu": int64(3)},
-			"remaining":              map[string]any{"cpu": int64(6), "memory_mib": int64(10), "disk_gib": int64(40)},
+			"remaining":              map[string]any{"cpu": int64(6), "memory_mib": int64(10)},
 		},
 		"default_admission": map[string]any{
 			"requested":          map[string]any{"cpu": int64(2), "memory_mib": int64(4), "disk_gib": int64(20)},
@@ -141,6 +141,22 @@ func TestSnapshotMetricsPreserveMemoryOOMEvidenceAndSlotEstimates(t *testing.T) 
 	}
 	if strings.Contains(text, "agent_vm_admission_cpu_allocated_vcpu") {
 		t.Fatalf("boolean resource was coerced into a numeric metric: %s", text)
+	}
+}
+
+func TestSnapshotMetricsOmitSlotEstimatesForUnverifiedRemaining(t *testing.T) {
+	metrics := snapshotMetrics("capacity", map[string]any{
+		"up":        true,
+		"resources": map[string]any{"remaining": map[string]any{}},
+		"default_admission": map[string]any{
+			"requested":          map[string]any{"cpu": int64(2), "memory_mib": int64(4), "disk_gib": int64(20)},
+			"request_cost_bytes": int64(40),
+		},
+		"disk_admission": map[string]any{"physical_admission": map[string]any{"remaining_bytes": int64(80)}},
+	})
+	text := strings.Join(metricsAsSortedLines(metrics), "\n")
+	if strings.Contains(text, "agent_vm_admission_default_vm_logical_slots") || strings.Contains(text, "agent_vm_admission_default_vm_startable_slots") {
+		t.Fatalf("unverified slot estimates were published: %s", text)
 	}
 }
 

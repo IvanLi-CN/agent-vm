@@ -312,13 +312,24 @@ func addDefaultSlotMetrics(result map[string]string, object map[string]any) {
 	physical, physicalOK := objectMap(diskAdmission["physical_admission"])
 	cpuRemaining, cpuRemainingOK := integerValue(remaining["cpu"])
 	memoryRemaining, memoryRemainingOK := integerValue(remaining["memory_mib"])
-	diskRemaining, diskRemainingOK := integerValue(remaining["disk_gib"])
 	physicalRemaining, physicalRemainingOK := integerValue(physical["remaining_bytes"])
-	diskRequest, diskRequestOK := integerValue(requested["disk_gib"])
-	if !resourcesOK || !remainingOK || !diskOK || !physicalOK || !cpuRemainingOK || !memoryRemainingOK || !diskRemainingOK || !diskRequestOK || !physicalRemainingOK {
+	if !resourcesOK || !remainingOK || !diskOK || !physicalOK || !cpuRemainingOK || !memoryRemainingOK || !physicalRemainingOK {
 		return
 	}
-	logicalSlots := minSlots(slotRatio(cpuRemaining, cpuRequest), slotRatio(memoryRemaining, memoryRequest), slotRatio(diskRemaining, diskRequest), slotRatio(physicalRemaining, physicalCost))
+	ratios := []int64{slotRatio(cpuRemaining, cpuRequest), slotRatio(memoryRemaining, memoryRequest), slotRatio(physicalRemaining, physicalCost)}
+	if rawDiskRemaining, hasLogicalDiskBudget := remaining["disk_gib"]; hasLogicalDiskBudget {
+		diskRemaining, diskRemainingOK := integerValue(rawDiskRemaining)
+		diskRequest, diskRequestOK := integerValue(requested["disk_gib"])
+		if !diskRemainingOK || !diskRequestOK {
+			return
+		}
+		ratio := slotRatio(diskRemaining, diskRequest)
+		if ratio < 0 {
+			return
+		}
+		ratios = append(ratios, ratio)
+	}
+	logicalSlots := minSlots(ratios...)
 	if logicalSlots < 0 {
 		return
 	}
