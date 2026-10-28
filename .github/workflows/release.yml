@@ -35,6 +35,7 @@ jobs:
       - name: Resolve, claim, build, verify, and publish
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_REF_PROTECTED: ${{ github.ref_protected }}
         run: bun run skills/agent-vm-ops/scripts/release.ts --target "${{ inputs.target }}"
       - name: Preserve release state for recovery
         if: always()

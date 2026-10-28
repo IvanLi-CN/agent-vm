@@ -64,4 +64,5 @@ jobs:
       - name: Apply recovery operation
         env:
           GH_TOKEN: ${{ github.token }}
+          RELEASE_REF_PROTECTED: ${{ github.ref_protected }}
         run: bun run skills/agent-vm-ops/scripts/release.ts --operation "${{ inputs.operation }}" --reservation "${{ inputs.reservation }}"

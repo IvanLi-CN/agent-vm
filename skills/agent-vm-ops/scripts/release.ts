@@ -60,10 +60,21 @@ export function assertContractPreconditions(quality: any, release: any): void {
   }
 }
 
+export function assertWorkflowPlatformAttestation(ref: string | undefined, refProtected: string | undefined): void {
+  if (ref !== "refs/heads/main" || refProtected !== "true") {
+    throw new Error(`GitHub Actions release ref is not protected main: ${JSON.stringify({ ref, refProtected })}`);
+  }
+}
+
 export function assertPlatformPreconditions(root = repositoryRoot): void {
   const quality = JSON.parse(readFileSync(join(root, ".github/quality-gates.json"), "utf8"));
   const release = JSON.parse(readFileSync(join(root, ".github/release-contract.json"), "utf8"));
   assertContractPreconditions(quality, release);
+  if (process.env.GITHUB_ACTIONS === "true") {
+    // The Actions token cannot read administrator-only protection endpoints.
+    assertWorkflowPlatformAttestation(process.env.GITHUB_REF, process.env.RELEASE_REF_PROTECTED);
+    return;
+  }
   const repository = process.env.GITHUB_REPOSITORY;
   if (!repository) throw new Error("GITHUB_REPOSITORY is required for the live platform preflight");
   const audit = auditRepository(repository);
