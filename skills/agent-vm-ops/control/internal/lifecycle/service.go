@@ -1830,9 +1830,13 @@ func (s *Service) drainStatus(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	stateCapabilities := make([]string, 0, len(capabilities))
-	for _, capability := range capabilities {
-		stateCapabilities = append(stateCapabilities, capability.Name+"@"+strconv.FormatInt(capability.Version, 10))
+	var stateCapabilities any
+	if capabilities != nil {
+		values := make([]string, 0, len(capabilities))
+		for _, capability := range capabilities {
+			values = append(values, capability.Name+"@"+strconv.FormatInt(capability.Version, 10))
+		}
+		stateCapabilities = values
 	}
 	return map[string]any{"draining": draining, "ready": s.Ready(), "state_capabilities": stateCapabilities}, nil
 }

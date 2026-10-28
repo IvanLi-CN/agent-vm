@@ -695,20 +695,36 @@ func (s *Service) finishBackendImportFailure(ctx context.Context, operation *sta
 	}
 	if fingerprintPattern.MatchString(artifact.Fingerprint) {
 		detail["imported_fingerprint"] = artifact.Fingerprint
-		if s.Options.Backend != nil {
-			if cleanupErr := s.Options.Backend.DeleteImage(ctx, artifact.Fingerprint); cleanupErr == nil {
-				detail["cleanup"] = "verified"
-				status = "failed"
-			} else {
-				detail["cleanup"] = "unverified"
-				status = "outcome_unknown"
-			}
+		cleanup := s.cleanupImportedImage(ctx, artifact.Fingerprint)
+		detail["cleanup"] = cleanup
+		if cleanup == "verified" {
+			status = "failed"
 		} else {
-			detail["cleanup"] = "backend_unavailable"
 			status = "outcome_unknown"
 		}
 	}
 	return s.finishOperation(ctx, operation, "reconciliation", status, nil, detail)
+}
+
+func (s *Service) cleanupImportedImage(ctx context.Context, fingerprint string) string {
+	image, err := s.Store.GetManagedImage(ctx, fingerprint)
+	if err != nil {
+		return "blocked_catalog_unverified"
+	}
+	if image != nil {
+		// A catalog record may be the default or carry active/cached/pending
+		// references. Never delete the native image behind that record from a
+		// best-effort import recovery path; the normal delete action performs
+		// the durable reference check and can be retried by an operator.
+		return "blocked_catalog_unverified"
+	}
+	if s.Options.Backend == nil {
+		return "backend_unavailable"
+	}
+	if err := s.Options.Backend.DeleteImage(ctx, fingerprint); err != nil {
+		return "unverified"
+	}
+	return "verified"
 }
 
 // RecoverOperation turns an interrupted native operation into a deterministic
@@ -1030,15 +1046,7 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	if err != nil {
 		return nil, err
 	}
-	var running *state.ManagementOperation
-	var claimed bool
-	var transitionErr error
-	if request.Action == "release" || request.Action == "destroy" {
-		running, claimed, transitionErr = s.Store.TransitionManagementOperation(ctx, request.OperationID, "queued", "native_action", "running")
-	} else {
-		running, claimed, transitionErr = s.Store.TransitionManagementOperationUnlessDraining(ctx, request.OperationID, "queued", "native_action", "running")
-	}
-	err = transitionErr
+	running, claimed, err := s.Store.TransitionManagementOperationUnlessReleaseDraining(ctx, request.OperationID, "queued", "native_action", "running")
 	if err != nil {
 		return nil, err
 	}

@@ -57,6 +57,33 @@ func TestManagementMigrationIsAdditiveAndSeedsLegacyDefault(t *testing.T) {
 	}
 }
 
+func TestLegacyReadsFallbackBeforeManagementMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.sqlite3")
+	db, err := openLegacyFixture(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+
+	store, err := Open(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	fingerprint, found, err := store.CurrentDefaultImage(context.Background())
+	if err != nil || found || fingerprint != "" {
+		t.Fatalf("legacy default = %q found=%v err=%v", fingerprint, found, err)
+	}
+	capabilities, err := store.Capabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capabilities != nil {
+		t.Fatalf("legacy capabilities = %#v, want nil compatibility marker", capabilities)
+	}
+}
+
 func TestLegacySeedBackfillsHistoricalTaskImages(t *testing.T) {
 	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

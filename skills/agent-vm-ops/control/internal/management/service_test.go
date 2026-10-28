@@ -363,6 +363,47 @@ func TestLocalImportReadFailureRecordsFingerprintAndCleanup(t *testing.T) {
 	}
 }
 
+func TestImportFailureDoesNotDeleteCatalogedFingerprint(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	fingerprint := strings.Repeat("e", 64)
+	if err := store.SeedLegacyImage(ctx, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeImageBackend{}
+	service := New(store, Options{TrustedImageSourceIDs: []string{"approved"}, Backend: backend})
+	operation, err := service.StartImageImport(ctx, ImportRequest{
+		OperationID: "trusted-import-cataloged", Actor: "admin", Reason: "preserve cataloged image", TargetVersion: "image-catalog:revision-1", VersionLabel: "2026.06",
+		Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, claimed, err := store.TransitionManagementOperation(ctx, operation.OperationID, "queued", "image_import", "running")
+	if err != nil || !claimed {
+		t.Fatalf("claim trusted import = %#v claimed=%v err=%v", running, claimed, err)
+	}
+	operation = running
+	finished, err := service.finishBackendImportFailure(ctx, operation, ImageArtifact{Fingerprint: fingerprint}, uncertainActionError{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished.Status != "outcome_unknown" || finished.Error["cleanup"] != "blocked_catalog_unverified" || backend.deletes != 0 {
+		t.Fatalf("finished=%#v deletes=%d", finished, backend.deletes)
+	}
+	image, err := store.GetManagedImage(ctx, fingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if image == nil || !image.IsDefault {
+		t.Fatalf("catalog image = %#v", image)
+	}
+}
+
 func TestExistingImportOperationWinsBeforeAStaleCatalogCheck(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -634,6 +675,42 @@ func TestMaintenanceCannotCrossReleaseActivationDrain(t *testing.T) {
 	}
 	if queued == nil || queued.Status != "queued" {
 		t.Fatalf("fenced operation = %#v, want queued", queued)
+	}
+}
+
+func TestVMActionCannotCrossReleaseActivationDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.SetMeta(ctx, "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(ctx, "drain_owner", "release-tx-456"); err != nil {
+		t.Fatal(err)
+	}
+	updatedAt := "2026-10-28T00:00:00Z"
+	lease := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	if err := store.InsertTask(ctx, state.Task{TaskID: "release-fence-task", SessionID: "release-fence-session", Generation: 3, State: "active", InstanceName: "agent-vm-release-fence", LeaseExpiresAt: &lease, CreatedAt: updatedAt, UpdatedAt: updatedAt, ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: "{}", ResourceReservationJSON: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeActionBackend{}
+	service := New(store, Options{Actions: backend})
+	_, err = service.ExecuteVMAction(ctx, VMActionRequest{OperationID: "release-fence-vm", Actor: "admin", Reason: "release fence", TaskID: "release-fence-task", TargetVersion: "vm:release-fence-task:" + updatedAt, Action: "release", ExpectedGeneration: 3})
+	if err == nil || !strings.Contains(err.Error(), "draining: release activation fence") {
+		t.Fatalf("VM action fence error = %v", err)
+	}
+	if backend.vmCalls != 0 {
+		t.Fatalf("VM backend was invoked: %#v", backend)
+	}
+	queued, err := store.GetManagementOperation(ctx, "release-fence-vm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued == nil || queued.Status != "queued" {
+		t.Fatalf("fenced VM operation = %#v, want queued", queued)
 	}
 }
 

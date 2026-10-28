@@ -301,6 +301,13 @@ func (s *Store) CurrentDefaultImage(ctx context.Context) (string, bool, error) {
 		}
 		return err
 	})
+	if isMissingManagementTable(err, "managed_images") {
+		// Format-2/3 controllers may read a legacy database before the
+		// management migration has created its additive tables. The lifecycle
+		// path already has the configured image fallback, so absence is a
+		// valid compatibility result rather than a SQLite failure.
+		return "", false, nil
+	}
 	return fingerprint, fingerprint != "" && err == nil, err
 }
 
@@ -869,7 +876,21 @@ func (s *Store) Capabilities(ctx context.Context) ([]ManagementCapability, error
 		}
 		return rows.Err()
 	})
+	if isMissingManagementTable(err, "state_capabilities") {
+		// drain-status serializes nil as JSON null. The release wrapper then
+		// validates the legacy core schema directly and supplies the explicit
+		// legacy-agent-vm-core@1 capability marker.
+		return nil, nil
+	}
 	return values, err
+}
+
+func isMissingManagementTable(err error, table string) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "no such table: "+strings.ToLower(table))
 }
 
 func (s *Store) ClaimManagementOperation(ctx context.Context, value ManagementOperation) (*ManagementOperation, error) {
