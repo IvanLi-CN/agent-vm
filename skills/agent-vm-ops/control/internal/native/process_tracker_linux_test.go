@@ -73,6 +73,26 @@ func TestReadProcessTableAllowsKernelThreads(t *testing.T) {
 	}
 }
 
+func TestProcessMissingRecognizesProcExitRaces(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "enoent", err: os.ErrNotExist, want: true},
+		{name: "esrch", err: unix.ESRCH, want: true},
+		{name: "wrapped esrch", err: fmt.Errorf("proc scan: %w", unix.ESRCH), want: true},
+		{name: "other", err: errors.New("permission denied"), want: false},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := processGone(test.err); got != test.want {
+				t.Fatalf("processGone(%v) = %v, want %v", test.err, got, test.want)
+			}
+		})
+	}
+}
+
 func TestProcessTrackerFindsReparentedGroupMemberWithoutCgroup(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux process group tracking required")
@@ -479,7 +499,6 @@ func TestKillWorkerReconcilesIdentityExitAfterPidfdOpen(t *testing.T) {
 		})
 	}
 }
-
 func TestKillWorkerAnchorsGroupBeforeRootSignal(t *testing.T) {
 	identity := WorkerIdentity{PID: 123, StartTime: "1", ProcessGroup: 123}
 	events := make([]string, 0, 2)

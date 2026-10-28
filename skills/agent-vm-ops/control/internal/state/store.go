@@ -156,6 +156,17 @@ type Operation struct {
 	CreatedAt   string
 }
 
+// OperationFinalization is the terminal replacement for one pending journal
+// row. It is committed together with the guarded task transition used by
+// native-init absence recovery.
+type OperationFinalization struct {
+	OperationID string
+	Action      string
+	SessionID   *string
+	Generation  *int64
+	Response    map[string]any
+}
+
 type Store struct {
 	path      string
 	write     *sql.DB
@@ -569,20 +580,15 @@ func (s *Store) UpdateTaskIf(ctx context.Context, taskID string, condition TaskC
 }
 
 func (s *Store) updateTask(ctx context.Context, taskID string, condition *TaskCondition, updates map[string]any) (bool, error) {
-	allowed := map[string]bool{"generation": true, "state": true, "vm_ip": true, "ssh_host_port": true, "lease_expires_at": true, "inactive_since": true, "cleanup_after": true, "updated_at": true, "last_error": true, "resources_json": true, "reservation_bytes": true, "previous_generation": true, "resource_reservation_json": true, "image_fingerprint": true}
-	keys := make([]string, 0, len(updates))
-	for key := range updates {
-		if !allowed[key] {
-			return false, fmt.Errorf("unsupported task update: %s", key)
-		}
-		keys = append(keys, key)
+	keys, err := taskUpdateKeys(updates)
+	if err != nil {
+		return false, err
 	}
-	sort.Strings(keys)
 	if len(keys) == 0 {
 		return false, nil
 	}
 	changed := false
-	err := s.withWrite(ctx, func(tx *Tx) error {
+	err = s.withWrite(ctx, func(tx *Tx) error {
 		var updateChanged bool
 		updateChanged, err := taskUpdatesChanged(ctx, tx, taskID, keys, updates)
 		if err != nil {
@@ -611,6 +617,104 @@ func (s *Store) updateTask(ctx context.Context, taskID string, condition *TaskCo
 		args = append(args, taskID)
 		_, err = tx.exec("UPDATE tasks SET "+strings.Join(sets, ", ")+" WHERE task_id = ?", args...)
 		return err
+	})
+	return changed, err
+}
+
+func taskUpdateKeys(updates map[string]any) ([]string, error) {
+	allowed := map[string]bool{"generation": true, "state": true, "vm_ip": true, "ssh_host_port": true, "lease_expires_at": true, "inactive_since": true, "cleanup_after": true, "updated_at": true, "last_error": true, "resources_json": true, "reservation_bytes": true, "previous_generation": true, "resource_reservation_json": true, "image_fingerprint": true}
+	keys := make([]string, 0, len(updates))
+	for key := range updates {
+		if !allowed[key] {
+			return nil, fmt.Errorf("unsupported task update: %s", key)
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys, nil
+}
+
+// FinalizeNativeInitRecovery atomically replaces every verified pending
+// lifecycle journal and transitions the same task to absent. A malformed or
+// concurrently changed journal rolls back all terminal outcomes and leaves
+// the original task and journals pending for explicit recovery.
+func (s *Store) FinalizeNativeInitRecovery(ctx context.Context, taskID string, condition TaskCondition, updates map[string]any, operations []OperationFinalization) (bool, error) {
+	keys, err := taskUpdateKeys(updates)
+	if err != nil {
+		return false, err
+	}
+	if len(keys) == 0 {
+		return false, errors.New("native-init recovery task update is empty")
+	}
+	if len(operations) == 0 {
+		return false, errors.New("native-init recovery has no operation finalizations")
+	}
+	encoded := make([]string, len(operations))
+	seen := make(map[string]struct{}, len(operations))
+	for index, operation := range operations {
+		if operation.OperationID == "" || operation.Action == "" {
+			return false, errors.New("native-init recovery operation identity is incomplete")
+		}
+		if _, exists := seen[operation.OperationID]; exists {
+			return false, fmt.Errorf("duplicate native-init recovery operation: %s", operation.OperationID)
+		}
+		seen[operation.OperationID] = struct{}{}
+		raw, marshalErr := json.Marshal(operation.Response)
+		if marshalErr != nil {
+			return false, marshalErr
+		}
+		encoded[index] = string(raw)
+	}
+
+	changed := false
+	err = s.withWrite(ctx, func(tx *Tx) error {
+		updateChanged, updateErr := taskUpdatesChanged(ctx, tx, taskID, keys, updates)
+		if updateErr != nil {
+			return updateErr
+		}
+		if !updateChanged {
+			return nil
+		}
+		matched, matchErr := taskConditionMatches(ctx, tx, taskID, condition)
+		if matchErr != nil {
+			return matchErr
+		}
+		if !matched {
+			return nil
+		}
+		for index, operation := range operations {
+			result, updateErr := tx.exec("UPDATE operations SET action = ?, session_id = ?, generation = ?, response_json = ? WHERE operation_id = ? AND action = ? AND (session_id = ? OR (session_id IS NULL AND ? IS NULL)) AND (generation = ? OR (generation IS NULL AND ? IS NULL)) AND json_extract(response_json, '$.outcome') = 'pending'", operation.Action, nullableStringArg(operation.SessionID), nullableIntArg(operation.Generation), encoded[index], operation.OperationID, operation.Action, nullableStringArg(operation.SessionID), nullableStringArg(operation.SessionID), nullableIntArg(operation.Generation), nullableIntArg(operation.Generation))
+			if updateErr != nil {
+				return updateErr
+			}
+			rows, rowsErr := result.RowsAffected()
+			if rowsErr != nil {
+				return rowsErr
+			}
+			if rows != 1 {
+				return fmt.Errorf("native-init recovery operation is no longer pending or its identity changed: %s", operation.OperationID)
+			}
+		}
+		args := make([]any, 0, len(keys)+1)
+		sets := make([]string, 0, len(keys))
+		for _, key := range keys {
+			sets = append(sets, key+" = ?")
+			args = append(args, updates[key])
+		}
+		args = append(args, taskID)
+		result, updateErr := tx.exec("UPDATE tasks SET "+strings.Join(sets, ", ")+" WHERE task_id = ?", args...)
+		if updateErr != nil {
+			return updateErr
+		}
+		rows, rowsErr := result.RowsAffected()
+		if rowsErr != nil {
+			return rowsErr
+		}
+		if rows != 1 {
+			return errors.New("native-init recovery task disappeared before commit")
+		}
+		changed = true
+		return nil
 	})
 	return changed, err
 }
