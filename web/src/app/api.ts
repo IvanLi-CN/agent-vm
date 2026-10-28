@@ -92,7 +92,7 @@ async function realRequest<T>(path: string, init?: RequestInit, options: RealReq
 }
 
 function delay<T>(value: T): Promise<T> {
-  return new Promise((resolve) => window.setTimeout(() => resolve(value), 120));
+  return new Promise((resolve) => globalThis.setTimeout(() => resolve(value), 120));
 }
 
 function mockStateForRequest(): typeof mockState {
