@@ -1,0 +1,23 @@
+{
+  "items": [
+    {
+      "event_id": "50e8400e-ccf8-4c7b-8d1d-14f66c7fb126",
+      "operation_id": "50e8400e-ccf8-4c7b-8d1d-14f66c7fb124",
+      "action": "restart",
+      "actor": "admin@example.invalid",
+      "reason": "Restore service after a confirmed guest-side fault",
+      "target": {
+        "kind": "vm",
+        "id": "task_example_01"
+      },
+      "outcome": "accepted",
+      "phase": "queued",
+      "occurred_at": "2026-01-15T10:10:00Z",
+      "safe_code": null
+    }
+  ],
+  "page": {
+    "limit": 25,
+    "next_cursor": null
+  }
+}

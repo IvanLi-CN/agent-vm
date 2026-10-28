@@ -63,7 +63,7 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 	if statErr != nil {
 		t.Fatal(statErr)
 	}
-	if parentInfo.Mode().Perm() != 0o700 {
+	if parentInfo.Mode().Perm() != 0o750 {
 		t.Fatalf("socket parent mode = %v", parentInfo.Mode().Perm())
 	}
 

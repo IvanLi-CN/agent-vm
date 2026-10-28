@@ -49,6 +49,12 @@ environment. This design does not require KVM or `/dev/kvm`.
 - `docs/adr/` contains the accepted lifecycle, transport, recovery and runtime
   decisions.
 
+## Management console design
+
+The built-in Web management console is a product target and has not been implemented. Its scope covers managed images and existing Agent session VMs, with controlled maintenance and audit. The approved first-release contract fixes five pages, `zh-CN`/`en` localization, the authenticated same-origin `/api/v1` boundary, image migration, and package rollback compatibility.
+
+Read [PRODUCT.md](PRODUCT.md) for product boundaries, [DESIGN.md](DESIGN.md) for the selected workbench baseline, and the [Web surface brief](.impeccable/surfaces/web.md) for task flows. The [management contract](docs/specs/agent-vm/contracts/management-api.md), [OpenAPI document](docs/specs/agent-vm/contracts/management-api.yaml), and its synthetic examples define the shared frontend/backend API and state-compatibility boundary. The [decision memo](docs/proposals/agent-vm-web-console.md) records the source investigation and architecture rationale.
+
 ## Local validation
 
 ```bash

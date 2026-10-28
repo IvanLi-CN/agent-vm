@@ -1,0 +1,25 @@
+{
+  "management": {
+    "enabled": false,
+    "external_origin": "https://<management-origin>",
+    "forward_auth": {
+      "socket_path": "/run/agent-vm-web/forward-auth.sock",
+      "peer_uid": 0,
+      "identity_header": "X-Forwarded-User"
+    },
+    "allowed_admin_subjects": [],
+    "web_uid": 0,
+    "authority": {
+      "socket_path": "/run/agent-vm-native/management.sock",
+      "expected_web_uid": 0
+    },
+    "session_ttl_seconds": 900,
+    "trusted_image_source_ids": [],
+    "upload": {
+      "enabled": false,
+      "max_bytes": 0,
+      "staging_path": "",
+      "minimum_free_bytes": 0
+    }
+  }
+}

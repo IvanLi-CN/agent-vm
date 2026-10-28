@@ -1,0 +1,12 @@
+{
+  "operation_id": "50e8400e-ccf8-4c7b-8d1d-14f66c7fb123",
+  "reason": "Evaluate the next approved session image",
+  "target_version": "image-catalog:revision-12",
+  "version_label": "2026.02",
+  "source": {
+    "kind": "local_upload",
+    "format": "unified",
+    "expected_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "expected_size_bytes": "524288000"
+  }
+}

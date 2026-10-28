@@ -1,0 +1,14 @@
+{
+  "error": {
+    "code": "stale_target",
+    "phase": "precondition",
+    "retryable": false,
+    "operation_id": null,
+    "safe_fields": {
+      "current_target_version": "vm:task_example_01:revision-10",
+      "maximum_upload_bytes": null,
+      "affected_session_count": null,
+      "retry_after_seconds": null
+    }
+  }
+}

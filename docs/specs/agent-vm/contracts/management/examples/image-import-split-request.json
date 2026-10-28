@@ -1,0 +1,18 @@
+{
+  "operation_id": "50e8400e-ccf8-4c7b-8d1d-14f66c7fb127",
+  "reason": "Verify the next approved split session image",
+  "target_version": "image-catalog:revision-12",
+  "version_label": "2026.02-split",
+  "source": {
+    "kind": "local_upload",
+    "format": "split",
+    "metadata": {
+      "expected_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "expected_size_bytes": "4096"
+    },
+    "rootfs": {
+      "expected_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "expected_size_bytes": "524283904"
+    }
+  }
+}

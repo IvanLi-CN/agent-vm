@@ -1,0 +1,88 @@
+{
+  "resource_version": "overview:synthetic-17",
+  "observed_at": "2026-01-15T10:20:30Z",
+  "admission": {
+    "ready": true,
+    "draining": false,
+    "reasons": []
+  },
+  "capacity": {
+    "logical_cpu_remaining_vcpu": {
+      "state": "available",
+      "value": 6,
+      "observed_at": "2026-01-15T10:20:28Z"
+    },
+    "ct_cpu_capacity_vcpu": {
+      "state": "available",
+      "value": 16,
+      "observed_at": "2026-01-15T10:20:28Z"
+    },
+    "logical_memory_remaining": {
+      "state": "available",
+      "value_bytes": "8589934592",
+      "observed_at": "2026-01-15T10:20:28Z"
+    },
+    "ct_memory_available": {
+      "state": "available",
+      "value_bytes": "17179869184",
+      "observed_at": "2026-01-15T10:20:28Z"
+    },
+    "physical_disk_available": {
+      "state": "stale",
+      "value_bytes": null,
+      "observed_at": "2026-01-15T10:00:00Z"
+    }
+  },
+  "pressure": {
+    "cpu_some_avg10": {
+      "state": "available",
+      "value": 0.2,
+      "observed_at": "2026-01-15T10:20:28Z"
+    },
+    "cpu_full_avg10": {
+      "state": "unverified",
+      "value": null,
+      "observed_at": null
+    },
+    "cpu_startup_pressure_threshold_percent": {
+      "state": "available",
+      "value": 50,
+      "observed_at": "2026-01-15T10:20:28Z"
+    },
+    "cpu_startup_blocked": {
+      "state": "unverified",
+      "value": null,
+      "observed_at": null
+    },
+    "memory_pressure": {
+      "state": "available",
+      "value": false,
+      "observed_at": "2026-01-15T10:20:28Z"
+    }
+  },
+  "task_counts": {
+    "active": 4,
+    "preparing": 0,
+    "cached": 2,
+    "closing": 0,
+    "deleting": 0,
+    "failed": 1,
+    "absent": 0
+  },
+  "sources": [
+    {
+      "name": "capacity",
+      "state": "stale",
+      "observed_at": "2026-01-15T10:00:00Z",
+      "stale_after_seconds": 600,
+      "safe_code": "observation_stale"
+    },
+    {
+      "name": "inventory",
+      "state": "available",
+      "observed_at": "2026-01-15T10:20:29Z",
+      "stale_after_seconds": 30,
+      "safe_code": null
+    }
+  ]
+}
