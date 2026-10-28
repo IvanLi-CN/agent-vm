@@ -543,6 +543,41 @@ func TestAdmissionRejectsLowPhysicalStorageWithoutTouchingEffectiveLease(t *test
 	}
 }
 
+func TestUnreachableWatermarksFinalizeAcquireOperation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "unreachable-watermarks-operation.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.DiskLowBytes = 90 * gib
+	cfg.DiskTargetBytes = 80 * gib
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 90 * gib},
+	}
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
+	service.MarkReady()
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "acquire", "session_id": "unreachable-watermarks", "generation": int64(0), "operation_id": "unreachable-watermarks-acquire",
+	}
+	_, err = service.Dispatch(context.Background(), request)
+	if control := protocol.AsError(err); control == nil || control.Code != "watermarks_unreachable" {
+		t.Fatalf("unreachable watermark error = %#v", err)
+	}
+	operation, err := store.GetOperation(context.Background(), "unreachable-watermarks-acquire")
+	if err != nil || operation == nil || stringValue(operation.Response["outcome"]) != "error" {
+		t.Fatalf("unreachable watermark operation = %#v err=%v", operation, err)
+	}
+	if pending, err := store.PendingOperations(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if len(pending) != 0 {
+		t.Fatalf("unreachable watermark left pending operations = %#v", pending)
+	}
+}
+
 func TestAdmissionRejectsIncompleteDurableDiskReservation(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
