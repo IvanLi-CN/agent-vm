@@ -34,6 +34,13 @@ type Service struct {
 	imageImportMu        sync.Mutex
 	imageStorageMu       sync.Mutex
 	imageStorageReserved int64
+	trustedImportLocksMu sync.Mutex
+	trustedImportLocks   map[string]*trustedImportLock
+}
+
+type trustedImportLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 const operationFinalizeTimeout = 30 * time.Second
@@ -158,7 +165,37 @@ func New(store *state.Store, options Options) *Service {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{Store: store, Clock: clock, Options: options}
+	return &Service{Store: store, Clock: clock, Options: options, trustedImportLocks: make(map[string]*trustedImportLock)}
+}
+
+// lockTrustedImport serializes the preflight, storage reservation and durable
+// claim for one trusted import operation. A retry racing the original request
+// must not reserve capacity or reclaim caches before it observes the claimed
+// operation. Different operation IDs remain independent and can proceed in
+// parallel.
+func (s *Service) lockTrustedImport(operationID string) func() {
+	s.trustedImportLocksMu.Lock()
+	if s.trustedImportLocks == nil {
+		s.trustedImportLocks = make(map[string]*trustedImportLock)
+	}
+	lock := s.trustedImportLocks[operationID]
+	if lock == nil {
+		lock = &trustedImportLock{}
+		s.trustedImportLocks[operationID] = lock
+	}
+	lock.refs++
+	s.trustedImportLocksMu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		s.trustedImportLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 && s.trustedImportLocks[operationID] == lock {
+			delete(s.trustedImportLocks, operationID)
+		}
+		s.trustedImportLocksMu.Unlock()
+	}
 }
 
 func (s *Service) Initialize(ctx context.Context, legacyFingerprint string) error {
@@ -637,6 +674,8 @@ func (s *Service) FailImageImportUpload(ctx context.Context, operationID string,
 }
 
 func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) (*state.ManagementOperation, error) {
+	unlock := s.lockTrustedImport(operationID)
+	defer unlock()
 	operation, err := s.Store.GetManagementOperation(ctx, operationID)
 	if err != nil {
 		return nil, err

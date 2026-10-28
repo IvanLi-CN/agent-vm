@@ -308,6 +308,73 @@ func TestConcurrentTrustedImportsReserveImageStorage(t *testing.T) {
 	}
 }
 
+func TestConcurrentTrustedImportRetriesSerializeByOperation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "trusted-import-retry.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	fingerprint := strings.Repeat("a", 64)
+	backend := &blockingImageBackend{
+		fakeImageBackend: fakeImageBackend{artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}},
+		entered:          make(chan struct{}), release: make(chan struct{}),
+	}
+	service := New(store, Options{
+		TrustedImageSourceIDs:      []string{"approved"},
+		UploadMinimumFreeBytes:     512,
+		AvailableImageStorageBytes: func() (int64, error) { return 513, nil },
+		Backend:                    backend,
+	})
+	request := ImportRequest{OperationID: "trusted-retry", Actor: "admin", Reason: "retry race", TargetVersion: "image-catalog:revision-1", VersionLabel: "a", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}}
+	if _, err := service.StartImageImport(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		operation, processErr := service.ProcessTrustedImport(context.Background(), request.OperationID)
+		if processErr == nil && operation.Status != "succeeded" {
+			processErr = fmt.Errorf("first operation = %#v", operation)
+		}
+		firstDone <- processErr
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first import did not reach native backend")
+	}
+	secondDone := make(chan struct {
+		operation *state.ManagementOperation
+		err       error
+	}, 1)
+	go func() {
+		operation, processErr := service.ProcessTrustedImport(context.Background(), request.OperationID)
+		secondDone <- struct {
+			operation *state.ManagementOperation
+			err       error
+		}{operation: operation, err: processErr}
+	}()
+	select {
+	case result := <-secondDone:
+		t.Fatalf("retry returned before original import completed: operation=%#v err=%v", result.operation, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(backend.release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-secondDone:
+		if result.err != nil || result.operation == nil || result.operation.Status != "succeeded" {
+			t.Fatalf("serialized retry result = operation:%#v err:%v", result.operation, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serialized retry did not observe the completed operation")
+	}
+	if backend.imports != 1 {
+		t.Fatalf("serialized retry imported %d times, want 1", backend.imports)
+	}
+}
+
 func TestTrustedImportUsesSharedReservationCallbackUntilCompletion(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

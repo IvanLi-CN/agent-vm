@@ -1737,11 +1737,13 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	now := s.Clock()
 	deadline := now.Add(time.Duration(s.Config.InitialLeaseSeconds) * time.Second)
 	created := false
-	appliedResources := map[string]int64{}
+	appliedResources := zeroResources()
+	preparationPhase := "acquire-preparing"
 	if task == nil {
 		created = true
 		lease := nowString(deadline)
 		task = &state.Task{TaskID: taskID(session), SessionID: session, Generation: 1, State: statePreparing, InstanceName: "agent-vm-" + taskID(session), CreatedAt: nowString(now), UpdatedAt: nowString(now), ImageFingerprint: selectedFingerprint, ResourcesJSON: mustJSON(resources), ResourceReservationJSON: mustJSON(resources), LeaseExpiresAt: &lease}
+		task.LastError = stringPointer(mustJSON(map[string]any{"phase": preparationPhase, "applied_resources": appliedResources}))
 		if generation != 0 {
 			return nil, protocol.NewError("generation_mismatch", "new session must start at generation 0", nil)
 		}
@@ -1781,6 +1783,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		}
 		previousGeneration := task.Generation
 		task.PreviousGeneration = &previousGeneration
+		preparationPhase = "resume-preparing"
 		task.Generation++
 		task.State = statePreparing
 		task.ResourcesJSON = mustJSON(resources)
@@ -1788,7 +1791,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		task.ReservationBytes = 0
 		task.LeaseExpiresAt = stringPointer(nowString(deadline))
 		appliedResources = cloneResourceMap(cachedResources)
-		resumeMarker := mustJSON(map[string]any{"phase": "resume-preparing", "previous_resources": cachedResources, "applied_resources": appliedResources})
+		resumeMarker := mustJSON(map[string]any{"phase": preparationPhase, "previous_resources": cachedResources, "applied_resources": appliedResources})
 		task.LastError = stringPointer(resumeMarker)
 	}
 	if err := s.checkAdmission(ctx, resources, task.TaskID, true); err != nil {
@@ -1849,29 +1852,23 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if err := s.Guest.ConfigSet(nativeCtx, task.InstanceName, "limits.cpu", strconv.FormatInt(resources["cpu"], 10)); err != nil {
 			return s.failTask(ctx, task, "native-config", err)
 		}
-		if !created {
-			appliedResources["cpu"] = resources["cpu"]
-			if err := s.persistResumeProgress(ctx, task, appliedResources); err != nil {
-				return nil, err
-			}
+		appliedResources["cpu"] = resources["cpu"]
+		if err := s.persistPreparationProgress(ctx, task, preparationPhase, appliedResources); err != nil {
+			return nil, err
 		}
 		if err := s.Guest.ConfigSet(nativeCtx, task.InstanceName, "limits.memory", strconv.FormatInt(resources["memory_mib"], 10)+"MiB"); err != nil {
 			return s.failTask(ctx, task, "native-config", err)
 		}
-		if !created {
-			appliedResources["memory_mib"] = resources["memory_mib"]
-			if err := s.persistResumeProgress(ctx, task, appliedResources); err != nil {
-				return nil, err
-			}
+		appliedResources["memory_mib"] = resources["memory_mib"]
+		if err := s.persistPreparationProgress(ctx, task, preparationPhase, appliedResources); err != nil {
+			return nil, err
 		}
 		if err := s.Guest.DeviceSet(nativeCtx, task.InstanceName, "root", "size", strconv.FormatInt(resources["disk_gib"], 10)+"GiB"); err != nil {
 			return s.failTask(ctx, task, "native-config", err)
 		}
-		if !created {
-			appliedResources["disk_gib"] = resources["disk_gib"]
-			if err := s.persistResumeProgress(ctx, task, appliedResources); err != nil {
-				return nil, err
-			}
+		appliedResources["disk_gib"] = resources["disk_gib"]
+		if err := s.persistPreparationProgress(ctx, task, preparationPhase, appliedResources); err != nil {
+			return nil, err
 		}
 		if err := s.Guest.Start(nativeCtx, task.InstanceName); err != nil {
 			return s.failTask(ctx, task, "native-start", err)
@@ -2088,7 +2085,7 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		// is not misclassified as a disk growth operation. Cached tasks are
 		// excluded from active logical and physical allocation totals.
 		resourcesJSON = task.ResourcesJSON
-		if applied, ok := resumeAppliedResources(task); ok {
+		if applied, ok := preparationAppliedResources(task); ok {
 			// A failed resume may have applied only a prefix of the requested
 			// native dimensions. Retain the last durably recorded applied map so
 			// the next resume still charges any dimension that was not applied.
@@ -4669,7 +4666,7 @@ func requestHasResourceFields(request protocol.Request) bool {
 func (s *Service) failTask(ctx context.Context, task *state.Task, phase string, err error) (map[string]any, error) {
 	detail := nativePhaseDetail(phase, err)
 	resourcesJSON := task.ResourcesJSON
-	if applied, ok := resumeAppliedResources(task); ok {
+	if applied, ok := preparationAppliedResources(task); ok {
 		resourcesJSON = mustJSON(applied)
 		detail["applied_resources"] = applied
 		task.ResourcesJSON = resourcesJSON
@@ -4686,7 +4683,7 @@ func (s *Service) failTask(ctx context.Context, task *state.Task, phase string, 
 func (s *Service) failTaskForOperation(ctx context.Context, task *state.Task, phase string, err error, operationID string) (map[string]any, error) {
 	detail := nativePhaseDetail(phase, err)
 	resourcesJSON := task.ResourcesJSON
-	if applied, ok := resumeAppliedResources(task); ok {
+	if applied, ok := preparationAppliedResources(task); ok {
 		resourcesJSON = mustJSON(applied)
 		detail["applied_resources"] = applied
 		task.ResourcesJSON = resourcesJSON
@@ -4703,15 +4700,27 @@ func (s *Service) failTaskForOperation(ctx context.Context, task *state.Task, ph
 	return nil, protocol.NewError("native_failed", "native lifecycle action failed", detail)
 }
 
-func (s *Service) persistResumeProgress(ctx context.Context, task *state.Task, applied map[string]int64) error {
-	if task == nil || task.PreviousGeneration == nil {
+func (s *Service) persistPreparationProgress(ctx context.Context, task *state.Task, phase string, applied map[string]int64) error {
+	if task == nil || (phase != "acquire-preparing" && phase != "resume-preparing") {
 		return nil
 	}
 	marker := mustJSON(map[string]any{
-		"phase":              "resume-preparing",
-		"previous_resources": applied,
-		"applied_resources":  applied,
+		"phase":             phase,
+		"applied_resources": applied,
 	})
+	if phase == "resume-preparing" {
+		var previous map[string]int64
+		if task.LastError != nil {
+			var existing map[string]any
+			if json.Unmarshal([]byte(*task.LastError), &existing) == nil {
+				encoded, _ := json.Marshal(existing["previous_resources"])
+				_ = json.Unmarshal(encoded, &previous)
+			}
+		}
+		if previous != nil {
+			marker = mustJSON(map[string]any{"phase": phase, "previous_resources": previous, "applied_resources": applied})
+		}
+	}
 	task.LastError = stringPointer(marker)
 	if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"last_error": marker, "updated_at": nowString(s.Clock())}); err != nil {
 		return s.sqliteError(err)
@@ -4719,8 +4728,8 @@ func (s *Service) persistResumeProgress(ctx context.Context, task *state.Task, a
 	return nil
 }
 
-func resumeAppliedResources(task *state.Task) (map[string]int64, bool) {
-	if task == nil || task.PreviousGeneration == nil || task.LastError == nil {
+func preparationAppliedResources(task *state.Task) (map[string]int64, bool) {
+	if task == nil || task.LastError == nil {
 		return nil, false
 	}
 	var detail map[string]any
@@ -4758,7 +4767,35 @@ func nativePhaseDetail(phase string, err error) map[string]any {
 			detail[key] = value
 		}
 	}
+	if lifecycleImageUnpackFailure(err) {
+		detail["code"] = "image_unpack_failed"
+		detail["failure_class"] = "image_unpack"
+	}
 	return detail
+}
+
+func lifecycleImageUnpackFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if lifecycleImageUnpackText(err.Error()) {
+		return true
+	}
+	var commandErr *native.CommandError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	for _, key := range []string{"stderr", "stdout"} {
+		if text, ok := commandErr.Diagnostic()[key].(string); ok && lifecycleImageUnpackText(text) {
+			return true
+		}
+	}
+	return false
+}
+
+func lifecycleImageUnpackText(value string) bool {
+	lower := strings.ToLower(value)
+	return strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs"))
 }
 
 func (s *Service) sqliteError(err error) error {

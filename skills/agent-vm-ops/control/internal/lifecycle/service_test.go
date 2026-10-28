@@ -1075,6 +1075,59 @@ func TestFailedCachedResumeRetainsLastAppliedResourcesForRetryCost(t *testing.T)
 	}
 }
 
+func TestFailedInitialAcquireRetainsLastAppliedResourcesForRetryCost(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "failed-initial-acquire.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	cfg := config.Defaults()
+	cfg.Network = ""
+	cfg.NetworkACL = ""
+	cfg.VMIPStart = "10.0.0.10"
+	cfg.VMIPEnd = "10.0.0.20"
+	guest := &startupGuest{
+		status:              "Stopped",
+		deviceSetErr:        errors.New("disk resize unavailable"),
+		deviceSetFailDevice: "root",
+		config: map[string]any{
+			"config":  map[string]any{},
+			"devices": map[string]any{},
+			"expanded_devices": map[string]any{"eth0": map[string]any{
+				"type": "nic", "network": "", "ipv4.address": "10.0.0.10",
+				"security.mac_filtering": "true", "security.ipv4_filtering": "true",
+				"security.ipv6_filtering": "true", "security.port_isolation": "true",
+				"security.acls": "", "security.acls.default.ingress.action": "allow",
+				"security.acls.default.egress.action": "allow",
+			}},
+		},
+	}
+	service := New(store, cfg, Options{Guest: guest})
+	_, err = service.acquire(ctx, protocol.Request{"session_id": "failed-initial", "generation": int64(0), "disk_gib": int64(40)})
+	if protocol.AsError(err).Code != "native_failed" {
+		t.Fatalf("failed initial acquire error = %#v", err)
+	}
+	if _, err := service.reconcile(ctx, true); err != nil {
+		t.Fatalf("failed initial acquire cleanup = %v", err)
+	}
+	cached, err := store.GetTask(ctx, map[string]any{"session_id": "failed-initial"})
+	if err != nil || cached == nil || cached.State != stateCached {
+		t.Fatalf("cached failed initial acquire task = %#v err=%v", cached, err)
+	}
+	resources, resourceErr := decodeResourceMap(cached.ResourcesJSON, "cached failed initial acquire resources", false)
+	if resourceErr != nil || !sameResources(resources, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 0}) {
+		t.Fatalf("cached failed initial acquire resources = %s err=%v", cached.ResourcesJSON, resourceErr)
+	}
+	cost, err := service.admissionStorageCost(ctx, cached.TaskID, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 40}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cost != cfg.ResumeCostBytes+cfg.ResizeCostBytes {
+		t.Fatalf("retry physical cost = %d, want %d", cost, cfg.ResumeCostBytes+cfg.ResizeCostBytes)
+	}
+}
+
 func TestCachedReleaseRetainsResourcesForResumeCostClassification(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -3517,6 +3570,35 @@ func TestAcquireInitUncertainResultCanReconcileOwnedInstance(t *testing.T) {
 	}
 	if task == nil || task.State != stateCached || task.ResourceReservationJSON != "{}" {
 		t.Fatalf("reconciled task = %#v", task)
+	}
+}
+
+func TestLifecycleImageUnpackFailureIsCountedForUnknownOutcome(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "lifecycle-image-unpack-audit.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.VMIPStart = "10.0.0.10"
+	cfg.VMIPEnd = "10.0.0.20"
+	guest := &startupGuest{initErr: &native.CommandError{
+		Cause:  errors.New("exit status 1"),
+		Result: native.Result{Code: 1, Stderr: []byte("Error: failed to unpack image rootfs")},
+	}}
+	service := New(store, cfg, Options{Guest: guest})
+	_, err = service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "acquire", "session_id": "unpack-audit", "generation": int64(0), "operation_id": "unpack-audit-acquire",
+	})
+	if protocol.AsError(err).Code != "native_failed" {
+		t.Fatalf("lifecycle image unpack error = %#v", err)
+	}
+	summary, err := store.AuditSummary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ImageUnpackFailures["native-init|image_unpack_failed"] != 1 {
+		t.Fatalf("lifecycle image unpack summary = %#v", summary.ImageUnpackFailures)
 	}
 }
 

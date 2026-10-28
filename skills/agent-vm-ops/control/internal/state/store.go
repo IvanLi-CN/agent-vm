@@ -1297,6 +1297,9 @@ func addAuditSummary(result *AuditSummary, action, outcome, phase string, detail
 		result.Warnings[code]++
 	}
 	structuredUnpack := code == "image_unpack_failed" || auditField(detail, "failure_class", false) == "image_unpack"
+	if structuredUnpack {
+		code = "image_unpack_failed"
+	}
 	lower := strings.ToLower(raw)
 	legacyUnpack := strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs"))
 	if (outcome == "error" || outcome == "unknown") && (structuredUnpack || (outcome == "error" && legacyUnpack)) {
