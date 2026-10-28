@@ -67,6 +67,17 @@ func NewRunner() *Runner {
 	return &Runner{OutputLimit: 64 * 1024, StdoutLimit: 2 * 1024 * 1024, StderrLimit: 64 * 1024}
 }
 
+func recordWorkerStartFailure(ctx context.Context, binding workerBinding, startErr error) error {
+	recorder, ok := binding.recorder.(WorkerStartFailureRecorder)
+	if !ok {
+		return nil
+	}
+	if err := recorder.WorkerStartFailed(ctx, binding.operationID, startErr); err != nil {
+		return fmt.Errorf("record native worker start failure: %w", err)
+	}
+	return nil
+}
+
 func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result Result, runErr error) {
 	if r == nil {
 		r = NewRunner()
@@ -87,18 +98,32 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	command := exec.Command(argv[0], argv[1:]...)
 	configureCommand(command)
 	tracker.configureCommand(command)
+	binding := workerBindingFromContext(ctx)
+	if guard, ok := binding.recorder.(WorkerStartGuard); ok {
+		if err := guard.WorkerStartAllowed(ctx, binding.operationID); err != nil {
+			return Result{}, fmt.Errorf("native worker start blocked: %w", err)
+		}
+	}
 	command.Stdin = bytes.NewReader(input)
 	stdout := &limitedBuffer{limit: r.stdoutLimit()}
 	stderr := &limitedBuffer{limit: r.stderrLimit()}
 	stdoutReader, stdoutWriter, err := os.Pipe()
 	if err != nil {
-		return Result{}, fmt.Errorf("prepare stdout pipe: %w", err)
+		startErr := fmt.Errorf("prepare stdout pipe: %w", err)
+		if recordErr := recordWorkerStartFailure(ctx, binding, startErr); recordErr != nil {
+			startErr = errors.Join(startErr, recordErr)
+		}
+		return Result{}, startErr
 	}
 	stderrReader, stderrWriter, err := os.Pipe()
 	if err != nil {
 		_ = stdoutReader.Close()
 		_ = stdoutWriter.Close()
-		return Result{}, fmt.Errorf("prepare stderr pipe: %w", err)
+		startErr := fmt.Errorf("prepare stderr pipe: %w", err)
+		if recordErr := recordWorkerStartFailure(ctx, binding, startErr); recordErr != nil {
+			startErr = errors.Join(startErr, recordErr)
+		}
+		return Result{}, startErr
 	}
 	command.Stdout = stdoutWriter
 	command.Stderr = stderrWriter
@@ -109,7 +134,11 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 		_ = stdoutWriter.Close()
 		_ = stderrReader.Close()
 		_ = stderrWriter.Close()
-		return Result{}, fmt.Errorf("start %s: %w", argv[0], trackingErr)
+		startErr := fmt.Errorf("start %s: %w", argv[0], trackingErr)
+		if recordErr := recordWorkerStartFailure(ctx, binding, startErr); recordErr != nil {
+			startErr = errors.Join(startErr, recordErr)
+		}
+		return Result{}, startErr
 	}
 	stopMonitor := monitorProcessTree(tracker, command.Process.Pid)
 	defer func() { _ = stopMonitor() }()
@@ -128,10 +157,10 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 			trackingErr = monitorErr
 		}
 		killProcess(command.Process.Pid, pidfd)
-		cleanupErr := cleanupTracked(tracker, command.Process.Pid)
 		_ = stdoutReader.Close()
 		_ = stderrReader.Close()
 		_ = command.Wait()
+		cleanupErr := cleanupTracked(tracker, command.Process.Pid)
 		<-stdoutDone
 		<-stderrDone
 		closePIDFD(pidfd)
@@ -139,9 +168,12 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 		if cleanupErr != nil {
 			return Result{}, fmt.Errorf("track native worker: %w; cleanup: %v", trackingErr, cleanupErr)
 		}
-		return Result{}, fmt.Errorf("track native worker: %w", trackingErr)
+		startErr := fmt.Errorf("track native worker: %w", trackingErr)
+		if recordErr := recordWorkerStartFailure(ctx, binding, startErr); recordErr != nil {
+			startErr = errors.Join(startErr, recordErr)
+		}
+		return Result{}, startErr
 	}
-	binding := workerBindingFromContext(ctx)
 	var identity WorkerIdentity
 	if binding.recorder != nil {
 		var identityErr error
@@ -151,26 +183,32 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 				trackingErr = monitorErr
 			}
 			killProcess(command.Process.Pid, pidfd)
-			_ = cleanupTracked(tracker, command.Process.Pid)
 			_ = stdoutReader.Close()
 			_ = stderrReader.Close()
 			_ = command.Wait()
+			cleanupErr := cleanupTracked(tracker, command.Process.Pid)
 			<-stdoutDone
 			<-stderrDone
 			closePIDFD(pidfd)
 			_ = tracker.Reap()
-			return Result{}, fmt.Errorf("identify native worker: %w", identityErr)
+			startErr := fmt.Errorf("identify native worker: %w", identityErr)
+			if cleanupErr == nil {
+				if recordErr := recordWorkerStartFailure(ctx, binding, startErr); recordErr != nil {
+					startErr = errors.Join(startErr, recordErr)
+				}
+			}
+			return Result{}, startErr
 		}
 	}
 	wait := make(chan error, 1)
 	go func() { wait <- command.Wait() }()
 	workerStarted := false
-	workerFinished := false
+	var workerCleanupErr error
 	defer func() {
-		if !workerStarted || !workerFinished || binding.recorder == nil {
+		if !workerStarted || binding.recorder == nil {
 			return
 		}
-		if err := binding.recorder.WorkerFinished(ctx, binding.operationID, identity, runErr); err != nil {
+		if err := binding.recorder.WorkerFinished(ctx, binding.operationID, identity, workerCleanupErr); err != nil {
 			if runErr == nil {
 				runErr = fmt.Errorf("record native worker completion: %w", err)
 			} else {
@@ -180,11 +218,12 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	}()
 	if binding.recorder != nil {
 		if err := binding.recorder.WorkerStarted(ctx, binding.operationID, identity); err != nil {
+			startErr := err
 			if monitorErr := stopMonitor(); monitorErr != nil && trackingErr == nil {
 				trackingErr = monitorErr
 			}
 			killProcess(command.Process.Pid, pidfd)
-			_ = cleanupTracked(tracker, command.Process.Pid)
+			cleanupErr := cleanupTracked(tracker, command.Process.Pid)
 			_ = stdoutReader.Close()
 			_ = stderrReader.Close()
 			<-wait
@@ -192,7 +231,16 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 			<-stderrDone
 			closePIDFD(pidfd)
 			_ = tracker.Reap()
-			return Result{}, fmt.Errorf("record native worker start: %w", err)
+			finishErr := cleanupErr
+			if cleanupErr == nil {
+				finishErr = binding.recorder.WorkerFinished(ctx, binding.operationID, identity, nil)
+			} else {
+				finishErr = binding.recorder.WorkerFinished(ctx, binding.operationID, identity, errors.Join(startErr, cleanupErr))
+			}
+			if finishErr != nil {
+				startErr = errors.Join(startErr, fmt.Errorf("record native worker cleanup: %w", finishErr))
+			}
+			return Result{}, fmt.Errorf("record native worker start: %w", startErr)
 		}
 		workerStarted = true
 	}
@@ -212,12 +260,26 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 				trackingErr = errors.New("native command left child processes behind")
 			}
 		}
+		if trackingErr == nil {
+			// A tracked descendant can be a confirmed zombie after the command
+			// root has been reaped. Reap it before using kernel group presence as
+			// the final live-process check.
+			if reapErr := tracker.Reap(); reapErr != nil {
+				trackingErr = reapErr
+			}
+		}
+		if trackingErr == nil {
+			if groupErr := confirmGroupCleanup(cleanupOperations{groupAlive: tracker.groupAlive}); groupErr != nil {
+				trackingErr = groupErr
+			}
+		}
 		if trackingErr != nil {
 			killProcess(command.Process.Pid, pidfd)
 			if cleanupErr := cleanupTracked(tracker, command.Process.Pid); cleanupErr != nil {
 				trackingErr = fmt.Errorf("%w: %v", trackingErr, cleanupErr)
 			}
 		}
+		workerCleanupErr = trackingErr
 		pipesDrained := waitForPipes(stdoutDone, stderrDone, time.Second)
 		if !pipesDrained {
 			_ = stdoutReader.Close()
@@ -243,7 +305,9 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 			_ = stdoutReader.Close()
 			_ = stderrReader.Close()
 			killProcess(command.Process.Pid, pidfd)
-			_ = cleanupTracked(tracker, command.Process.Pid)
+			if cleanupErr := cleanupTracked(tracker, command.Process.Pid); trackingErr == nil && cleanupErr != nil {
+				trackingErr = cleanupErr
+			}
 			select {
 			case waitErr = <-wait:
 			case <-time.After(250 * time.Millisecond):
@@ -256,7 +320,13 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 		<-stdoutDone
 		<-stderrDone
 		closePIDFD(pidfd)
-		_ = tracker.Reap()
+		if reapErr := tracker.Reap(); trackingErr == nil {
+			trackingErr = reapErr
+		}
+		workerCleanupErr = trackingErr
+		if workerCleanupErr == nil {
+			workerCleanupErr = ctx.Err()
+		}
 		if !waited {
 			return Result{Code: exitCode(waitErr), Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), StdoutTruncated: stdout.Truncated, StderrTruncated: stderr.Truncated}, fmt.Errorf("native command timeout after %s: %w; %v", time.Since(started).Round(time.Millisecond), ctx.Err(), waitErr)
 		}
@@ -276,9 +346,7 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	if reapErr := tracker.Reap(); trackingErr == nil {
 		trackingErr = reapErr
 	}
-	if trackingErr == nil {
-		workerFinished = true
-	}
+	workerCleanupErr = trackingErr
 	result = Result{Code: exitCode(waitErr), Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), StdoutTruncated: stdout.Truncated, StderrTruncated: stderr.Truncated}
 	if trackingErr != nil {
 		return result, trackingErr
@@ -312,18 +380,40 @@ func waitForPipes(stdoutDone, stderrDone <-chan struct{}, timeout time.Duration)
 }
 
 func cleanupTracked(tracker *processTracker, root int) error {
+	return cleanupTrackedWith(root, cleanupOperations{
+		discover:   tracker.Discover,
+		kill:       tracker.Kill,
+		reap:       tracker.Reap,
+		present:    tracker.Present,
+		groupAlive: tracker.groupAlive,
+		sleep:      time.Sleep,
+	})
+}
+
+type cleanupOperations struct {
+	discover   func(int) error
+	kill       func() error
+	reap       func() error
+	present    func() (int, error)
+	groupAlive func() (bool, error)
+	sleep      func(time.Duration)
+}
+
+var errTrackedProcessGroupRemains = errors.New("tracked native process group remains after cleanup")
+
+func cleanupTrackedWith(root int, operations cleanupOperations) error {
 	var first error
 	for attempt := 0; attempt < 10; attempt++ {
-		if err := tracker.Discover(root); err != nil && first == nil {
+		if err := operations.discover(root); err != nil && first == nil {
 			first = err
 		}
-		if err := tracker.Kill(); err != nil && first == nil {
+		if err := operations.kill(); err != nil && first == nil {
 			first = err
 		}
-		if err := tracker.Reap(); err != nil && first == nil {
+		if err := operations.reap(); err != nil && first == nil {
 			first = err
 		}
-		present, err := tracker.Present()
+		present, err := operations.present()
 		if err != nil {
 			if first == nil {
 				first = err
@@ -331,19 +421,63 @@ func cleanupTracked(tracker *processTracker, root int) error {
 			break
 		}
 		if present == 0 {
-			return first
+			if err := operations.discover(root); err != nil {
+				if first == nil {
+					first = err
+				}
+				continue
+			}
+			present, err = operations.present()
+			if err != nil {
+				if first == nil {
+					first = err
+				}
+				continue
+			}
+			if present == 0 {
+				groupErr := confirmGroupCleanup(operations)
+				if groupErr == nil {
+					return first
+				}
+				if !errors.Is(groupErr, errTrackedProcessGroupRemains) {
+					if first == nil {
+						first = groupErr
+					}
+					continue
+				}
+			}
 		}
-		time.Sleep(50 * time.Millisecond)
+		operations.sleep(50 * time.Millisecond)
 	}
-	if err := tracker.Reap(); err != nil && first == nil {
+	if err := operations.reap(); err != nil && first == nil {
 		first = err
 	}
-	if present, err := tracker.Present(); err != nil && first == nil {
+	if present, err := operations.present(); err != nil {
+		if first == nil {
+			first = err
+		}
+	} else if present > 0 {
+		if first == nil {
+			first = errors.New("tracked native descendants remain after cleanup")
+		}
+	} else if err := confirmGroupCleanup(operations); err != nil && first == nil {
 		first = err
-	} else if err == nil && present > 0 && first == nil {
-		first = errors.New("tracked native descendants remain after cleanup")
 	}
 	return first
+}
+
+func confirmGroupCleanup(operations cleanupOperations) error {
+	if operations.groupAlive == nil {
+		return nil
+	}
+	alive, err := operations.groupAlive()
+	if err != nil {
+		return fmt.Errorf("inspect native process group after cleanup: %w", err)
+	}
+	if alive {
+		return errTrackedProcessGroupRemains
+	}
+	return nil
 }
 
 func (r *Runner) stdoutLimit() int {

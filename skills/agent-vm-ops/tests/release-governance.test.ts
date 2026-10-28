@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 
 import { compareSemVer, parseSemVer, resolveReleaseTarget } from "../scripts/semver.ts";
 import { GithubReleaseStateStore, ReleaseStateStore, type GhGithubAdapter, type ReleaseIdentity } from "../scripts/release-coordinator.ts";
-import { assertPlatformPreconditions, successfulMainGate } from "../scripts/release.ts";
+import { assertContractPreconditions, successfulMainGate } from "../scripts/release.ts";
 
 const identity = (overrides: Partial<ReleaseIdentity> = {}): ReleaseIdentity => ({
   version: "1.0.0",
@@ -67,7 +67,12 @@ test("release reservation is append-only and identity-bound", () => {
 
 test("release preflight is fail-closed and accepts every Main gate matrix job", () => {
   let blocked = false;
-  try { assertPlatformPreconditions(); } catch (error) { blocked = String(error).includes("audit-required"); }
+  try {
+    assertContractPreconditions(
+      { platform_alignment: { status: "audit-required" } },
+      { platform_preconditions: { status: "audit-required" } },
+    );
+  } catch (error) { blocked = String(error).includes("audit-required"); }
   if (!blocked) throw new Error("release preflight did not block the unenabled platform contract");
   const gate = successfulMainGate([
     { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2 },
