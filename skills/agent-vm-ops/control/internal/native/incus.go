@@ -6,13 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os/exec"
 	"sort"
 	"strconv"
 	"strings"
 )
 
 type Guest interface {
-	Init(context.Context, string, string) error
+	Init(context.Context, string, string, map[string]string) error
 	ConfigSet(context.Context, string, string, string) error
 	DeviceSet(context.Context, string, string, string, string) error
 	DeviceAdd(context.Context, string, string, string, map[string]string) error
@@ -65,16 +66,12 @@ type CommandError struct {
 // unrelated ownership or transport failures remain unverified.
 func IsNotFound(err error) bool {
 	var commandErr *CommandError
-	if !errors.As(err, &commandErr) {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &commandErr) || !errors.As(commandErr.Cause, &exitErr) || commandErr.Result.Code <= 0 || commandErr.Result.StderrTruncated {
 		return false
 	}
-	diagnostic := strings.ToLower(string(commandErr.Result.Stderr) + " " + commandErr.Error())
-	for _, marker := range []string{"not found", "does not exist", "404"} {
-		if strings.Contains(diagnostic, marker) {
-			return true
-		}
-	}
-	return false
+	diagnostic := strings.ToLower(strings.TrimSpace(string(commandErr.Result.Stderr)))
+	return diagnostic == "instance not found" || diagnostic == "error: instance not found"
 }
 
 func (err *CommandError) Error() string {
@@ -165,7 +162,7 @@ func wrapCommandError(result Result, err error) error {
 	return &CommandError{Result: result, Cause: err}
 }
 
-func (c *IncusClient) Init(ctx context.Context, image, name string) error {
+func (c *IncusClient) Init(ctx context.Context, image, name string, ownership map[string]string) error {
 	// Agent sessions are Incus system containers. The outer control
 	// environment may itself be nested, but it must not require KVM/QEMU.
 	args := []string{"init", image, name}
@@ -179,6 +176,14 @@ func (c *IncusClient) Init(ctx context.Context, image, name string) error {
 		args = append(args, "--storage", c.Pool)
 	}
 	args = append(args, "--config", "boot.autostart=false")
+	keys := make([]string, 0, len(ownership))
+	for key := range ownership {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		args = append(args, "--config", key+"="+ownership[key])
+	}
 	return c.run(ctx, args...)
 }
 
