@@ -500,7 +500,7 @@ FROM managed_images i WHERE i.fingerprint = ?`, fingerprint)
 // resumed. Older unit fixtures and legacy protocol-4 stores may not have the
 // management schema yet; those stores retain the legacy behaviour until a
 // management-capable release performs its additive migration during startup.
-func (s *Store) CachedImageUsable(ctx context.Context, fingerprint string) (bool, error) {
+func (s *Store) CachedImageUsable(ctx context.Context, fingerprint string, allowLegacy bool) (bool, error) {
 	usable := false
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
 		var table string
@@ -520,7 +520,7 @@ func (s *Store) CachedImageUsable(ctx context.Context, fingerprint string) (bool
 		if err != nil {
 			return err
 		}
-		usable = stateValue == "available" && ((integrity == "passed" && suitability == "passed") || (integrity == "legacy_unverified" && suitability == "not_assessed" && compatibility == "legacy_unverified" && sourceKind == "legacy_config"))
+		usable = stateValue == "available" && ((integrity == "passed" && suitability == "passed") || (allowLegacy && integrity == "legacy_unverified" && suitability == "not_assessed" && compatibility == "legacy_unverified" && sourceKind == "legacy_config"))
 		return nil
 	})
 	return usable, err
