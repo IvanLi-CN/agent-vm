@@ -1768,7 +1768,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if resourceErr != nil {
 			return nil, protocol.NewError("resource_unverified", "cached task resources cannot be verified", map[string]any{"task_id": task.TaskID, "verified": false})
 		}
-		if usable, imageErr := s.Store.CachedImageUsable(ctx, task.ImageFingerprint); imageErr != nil {
+		if usable, imageErr := s.Store.CachedImageUsable(ctx, task.ImageFingerprint, !s.Config.Management.Enabled); imageErr != nil {
 			return nil, s.sqliteError(imageErr)
 		} else if !usable {
 			return nil, protocol.NewError("cache_stale", "cached image is no longer verified", map[string]any{

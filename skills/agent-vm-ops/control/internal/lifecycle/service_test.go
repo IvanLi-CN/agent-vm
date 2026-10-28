@@ -332,6 +332,38 @@ func TestReleaseMayTakeOverBrowserDrainBeforeActivation(t *testing.T) {
 	}
 }
 
+func TestCachedAcquireReusesLegacyDefaultAfterMigration(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.ImageFingerprint = strings.Repeat("a", 64)
+	if err := store.SeedLegacyImage(ctx, cfg.ImageFingerprint); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, cfg, Options{})
+	req := func(action, op string, generation int64) protocol.Request {
+		return protocol.Request{"protocol": protocol.Version, "action": action, "session_id": "legacy-cache", "generation": generation, "operation_id": op}
+	}
+	if _, err := service.Dispatch(ctx, req("acquire", "legacy-first", 0)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.Dispatch(ctx, req("release", "legacy-release", 1)); err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Dispatch(ctx, req("acquire", "legacy-resume", 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["result"].(map[string]any)["state"] != stateActive {
+		t.Fatalf("reacquire = %#v", result)
+	}
+}
+
 func TestCachedAcquireRejectsRetiredPinnedImage(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

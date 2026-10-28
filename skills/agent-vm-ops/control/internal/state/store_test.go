@@ -191,7 +191,7 @@ func TestCreateOpenDefersManagementMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	usable, err := store.CachedImageUsable(context.Background(), strings.Repeat("a", 64))
+	usable, err := store.CachedImageUsable(context.Background(), strings.Repeat("a", 64), false)
 	if err != nil || !usable {
 		t.Fatalf("legacy cache compatibility = %v, err=%v", usable, err)
 	}
