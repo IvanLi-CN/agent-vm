@@ -700,6 +700,13 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 // an untracked native image when cleanup cannot be verified.
 func (s *Service) finishBackendImportFailure(ctx context.Context, operation *state.ManagementOperation, artifact ImageArtifact, importErr error) (*state.ManagementOperation, error) {
 	detail := safeError(importErr)
+	if isImageUnpackFailure(importErr) {
+		// Native command failures are deliberately reduced to safe fields before
+		// they enter the durable journal. Preserve the operational classification
+		// without persisting the native command's potentially sensitive message.
+		detail["code"] = "image_unpack_failed"
+		detail["failure_class"] = "image_unpack"
+	}
 	status := "failed"
 	if isUncertain(importErr) {
 		status = "outcome_unknown"
@@ -715,6 +722,14 @@ func (s *Service) finishBackendImportFailure(ctx context.Context, operation *sta
 		}
 	}
 	return s.finishOperation(ctx, operation, "reconciliation", status, nil, detail)
+}
+
+func isImageUnpackFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs"))
 }
 
 func (s *Service) cleanupImportedImage(ctx context.Context, fingerprint string) string {
@@ -1310,7 +1325,7 @@ func safeError(err error) map[string]any {
 }
 
 func safeCode(code string) string {
-	if contains([]string{"authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "authority_unavailable", "rate_limited", "sqlite_unavailable", "internal_error"}, code) {
+	if contains([]string{"authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "authority_unavailable", "rate_limited", "sqlite_unavailable", "internal_error", "resource_insufficient", "watermarks_unreachable"}, code) {
 		return code
 	}
 	return "internal_error"

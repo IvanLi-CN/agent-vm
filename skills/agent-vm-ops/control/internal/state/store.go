@@ -1296,8 +1296,10 @@ func addAuditSummary(result *AuditSummary, action, outcome, phase string, detail
 	if outcome == "error" && (code == "memory_pressure" || code == "resource_unverified" || code == "capacity_insufficient") {
 		result.Warnings[code]++
 	}
+	structuredUnpack := code == "image_unpack_failed" || auditField(detail, "failure_class", false) == "image_unpack"
 	lower := strings.ToLower(raw)
-	if outcome == "error" && strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs")) {
+	legacyUnpack := strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs"))
+	if (outcome == "error" || outcome == "unknown") && (structuredUnpack || (outcome == "error" && legacyUnpack)) {
 		result.ImageUnpackFailures[phase+"|"+code]++
 	}
 }

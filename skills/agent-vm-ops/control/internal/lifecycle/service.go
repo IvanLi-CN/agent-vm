@@ -2258,6 +2258,33 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 	if err != nil {
 		return nil, err
 	}
+	previousReservationJSON := task.ResourceReservationJSON
+	commitReservation := map[string]int64{}
+	if previousReservationJSON != "" && previousReservationJSON != "{}" {
+		// Keep unresolved dimensions from an earlier partial resize. A later
+		// CPU or memory success must not erase a physical reservation held for
+		// a disk resize whose native outcome is still unresolved.
+		reservation, reservationErr := decodeResourceMap(previousReservationJSON, "task resize reservation", true)
+		if reservationErr != nil {
+			return nil, protocol.NewError("resource_unverified", "existing resize reservation cannot be verified", map[string]any{"task_id": task.TaskID, "verified": false})
+		}
+		for key, value := range reservation {
+			commitReservation[key] = value
+		}
+		for _, key := range resourceKeys {
+			if _, requestedDimension := request[key]; requestedDimension {
+				commitReservation[key] = target[key]
+			}
+		}
+	}
+	commitReservationJSON := "{}"
+	if len(commitReservation) > 0 {
+		commitReservationJSON = mustJSON(commitReservation)
+	}
+	commitReservationBytes := int64(0)
+	if request["disk_gib"] == nil {
+		commitReservationBytes = task.ReservationBytes
+	}
 	reservationJSON := mustJSON(target)
 	reservationNow := s.Clock()
 	reserved, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &reservationNow}, map[string]any{"resource_reservation_json": reservationJSON, "reservation_bytes": reservationBytes, "updated_at": nowString(reservationNow)})
@@ -2295,7 +2322,7 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 		}
 	}
 	commitNow := s.Clock()
-	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow}, map[string]any{"resources_json": mustJSON(target), "resource_reservation_json": "{}", "reservation_bytes": int64(0), "updated_at": nowString(commitNow)})
+	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow}, map[string]any{"resources_json": mustJSON(target), "resource_reservation_json": commitReservationJSON, "reservation_bytes": commitReservationBytes, "updated_at": nowString(commitNow)})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}

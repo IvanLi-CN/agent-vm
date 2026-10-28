@@ -50,11 +50,11 @@ func problemFromError(cause error, phase, operationID string) *APIError {
 		status = http.StatusBadRequest
 	case "not_found":
 		status = http.StatusNotFound
-	case "stale_target", "operation_conflict", "precondition_required", "image_referenced", "default_image_required", "fingerprint_mismatch", "image_not_applicable", "lease_expired", "task_not_active", "draining", "mapping_unverified", "cleanup_incomplete", "admission_denied":
+	case "stale_target", "operation_conflict", "precondition_required", "image_referenced", "default_image_required", "fingerprint_mismatch", "image_not_applicable", "lease_expired", "task_not_active", "draining", "mapping_unverified", "cleanup_incomplete", "admission_denied", "resource_insufficient":
 		status = http.StatusConflict
 	case "upload_too_large":
 		status = http.StatusRequestEntityTooLarge
-	case "authority_unavailable", "staging_capacity_low", "capacity_unverified", "resource_unverified", "startup_reconcile_required", "sqlite_unavailable":
+	case "authority_unavailable", "staging_capacity_low", "capacity_unverified", "resource_unverified", "startup_reconcile_required", "sqlite_unavailable", "watermarks_unreachable":
 		status = http.StatusServiceUnavailable
 		retryable = true
 	case "rate_limited":
@@ -86,7 +86,7 @@ func safeErrorCode(cause error) string {
 
 func safeCode(value string) string {
 	switch value {
-	case "authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "authority_unavailable", "rate_limited", "sqlite_unavailable", "internal_error", "lease_expired", "task_not_active", "draining", "mapping_unverified", "cleanup_incomplete", "resource_unverified", "startup_reconcile_required":
+	case "authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "authority_unavailable", "rate_limited", "sqlite_unavailable", "internal_error", "lease_expired", "task_not_active", "draining", "mapping_unverified", "cleanup_incomplete", "resource_unverified", "startup_reconcile_required", "resource_insufficient", "watermarks_unreachable":
 		return value
 	default:
 		return "internal_error"
@@ -143,6 +143,8 @@ func publicErrorMessage(code string) string {
 		"default_image_required":     "the default image cannot be removed",
 		"capacity_unverified":        "capacity could not be verified",
 		"admission_denied":           "the requested operation is not admitted",
+		"resource_insufficient":      "the requested resources are insufficient",
+		"watermarks_unreachable":     "configured storage watermarks could not be reached",
 		"precondition_required":      "the operation requires a fresh confirmation",
 		"authority_unavailable":      "management authority is unavailable",
 		"lease_expired":              "the VM lease is no longer effective",
