@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 
 import { compareSemVer, parseSemVer, resolveReleaseTarget } from "../scripts/semver.ts";
 import { GithubReleaseStateStore, ReleaseStateStore, type GhGithubAdapter, type ReleaseIdentity } from "../scripts/release-coordinator.ts";
-import { assertContractPreconditions, successfulMainGate } from "../scripts/release.ts";
+import { assertContractPreconditions, assertWorkflowPlatformAttestation, successfulMainGate } from "../scripts/release.ts";
 
 const identity = (overrides: Partial<ReleaseIdentity> = {}): ReleaseIdentity => ({
   version: "1.0.0",
@@ -74,6 +74,10 @@ test("release preflight is fail-closed and accepts every Main gate matrix job", 
     );
   } catch (error) { blocked = String(error).includes("audit-required"); }
   if (!blocked) throw new Error("release preflight did not block the unenabled platform contract");
+  let unprotectedError = false;
+  try { assertWorkflowPlatformAttestation("refs/heads/main", "false"); } catch { unprotectedError = true; }
+  if (!unprotectedError) throw new Error("workflow preflight accepted an unprotected ref");
+  assertWorkflowPlatformAttestation("refs/heads/main", "true");
   const gate = successfulMainGate([
     { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2 },
     { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1 },
