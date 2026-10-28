@@ -74,6 +74,7 @@ class ProductManifestTests(unittest.TestCase):
             manifest = {
                 "format": PRODUCT_MANIFEST_FORMAT,
                 "version": "1.0.0",
+                "release_id": "b" * 40,
                 "source_revision": "b" * 40,
                 "protocol": 4,
                 "target": {"os": "linux", "arch": "amd64"},
