@@ -229,11 +229,7 @@ func (s *Service) WorkerStartFailed(ctx context.Context, operationID string, sta
 	worker := map[string]any{
 		"state":           "exited",
 		"start_attempted": true,
-		// This marker is emitted only after Runner has proved that exec did not
-		// create a native process. It is deliberately distinct from an exited
-		// worker identity, which must retain PID/start-time/process-group proof.
-		"pre_spawn":   true,
-		"finished_at": nowString(s.Clock()),
+		"finished_at":     nowString(s.Clock()),
 	}
 	if startErr != nil {
 		message := startErr.Error()
@@ -444,7 +440,7 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 				continue
 			}
 		}
-		if !recoverableOperation(operation.Action) || recoveryAttempts(operation.Response) > recoveryAttemptLimit(operation.Action) {
+		if !recoverableOperation(operation.Action) || recoveryAttempts(operation.Response) > 0 {
 			continue
 		}
 		rawRequest, ok := operation.Response["_request"].(map[string]any)
@@ -503,18 +499,6 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 		}
 	}
 	return firstErr
-}
-
-func recoveryAttemptLimit(action string) int64 {
-	// A maintenance reconcile may have been interrupted after its first
-	// recovery attempt by an older controller. Allow one bounded retry so the
-	// current controller can exclude that operation from its own reconciliation
-	// proof and finish the durable journal. Lifecycle effects keep the original
-	// single-attempt fail-closed rule.
-	if action == "admin-reconcile" {
-		return 1
-	}
-	return 0
 }
 
 func recoverableOperation(action string) bool {
@@ -616,16 +600,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		}
 		if existing != nil {
 			finishActive()
-			replayed, replayErr := s.replayRecord(request, existing, warnings)
-			if replayErr != nil {
-				return nil, replayErr
-			}
-			if action == "destroy" && stringValue(existing.Response["outcome"]) == "success" {
-				if err := s.deleteDestroyedTask(ctx, request, existing.Generation); err != nil {
-					return nil, err
-				}
-			}
-			return replayed, nil
+			return s.replayRecord(request, existing, warnings)
 		}
 		defer finishActive()
 		ctx = native.WithWorkerRecorder(ctx, operationID, s)
@@ -644,11 +619,6 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		response["_request_digest"] = digest
 		if err := s.Store.RecordOperation(ctx, operationID, stringValue(request["action"]), optionalString(request["session_id"]), generationPointer(intValue(request["generation"]), request["generation"] != nil), response); err != nil {
 			return nil, s.sqliteError(err)
-		}
-		if action == "destroy" {
-			if err := s.deleteDestroyedTask(ctx, request, generationPointer(intValue(request["generation"]), request["generation"] != nil)); err != nil {
-				return nil, err
-			}
 		}
 	}
 	if s.Snapshots != nil {
@@ -995,7 +965,7 @@ func (s *Service) dispatchAction(ctx context.Context, action string, request pro
 	case "admin-metrics":
 		return s.adminMetrics(ctx)
 	case "admin-reconcile", "timer-reconcile":
-		return s.reconcile(ctx, requestBool(request, "apply"), stringValue(request["operation_id"]))
+		return s.reconcile(ctx, requestBool(request, "apply"))
 	case "admin-gc", "timer-age-gc":
 		return s.gc(ctx, requestBool(request, "apply"))
 	case "timer-expire":
@@ -1059,26 +1029,6 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	now := s.Clock()
 	deadline := now.Add(time.Duration(s.Config.InitialLeaseSeconds) * time.Second)
 	created := false
-	if task != nil && task.State == stateAbsent {
-		if generation != 0 && generation != task.Generation {
-			return nil, protocol.NewError("generation_mismatch", "an absent session acquire must use generation 0 or the current absent generation", map[string]any{"expected": int64(0), "current": task.Generation, "actual": generation})
-		}
-		if err := s.verifyAbsentTask(ctx, task, stringValue(request["operation_id"]), true); err != nil {
-			return nil, err
-		}
-		deleted, deleteErr := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateAbsent}})
-		if deleteErr != nil {
-			return nil, s.sqliteError(deleteErr)
-		}
-		if !deleted {
-			return nil, protocol.NewError("task_transition", "absent session changed before reuse", map[string]any{"outcome_verified": false})
-		}
-		task = nil
-		// The accepted current absent generation is a compatibility token for
-		// older clients. The newly allocated task still gets the next durable
-		// generation from the tombstone.
-		generation = 0
-	}
 	if task == nil {
 		created = true
 		lease := nowString(deadline)
@@ -1259,15 +1209,6 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		if err := s.cancelPendingAcquireOperations(ctx, task); err != nil {
 			return nil, err
 		}
-		if task.TaskID == "" {
-			return s.status(ctx, task.SessionID)
-		}
-		if destroy {
-			if err := s.verifyAbsentTask(ctx, task, stringValue(request["operation_id"]), true); err != nil {
-				return nil, err
-			}
-			return s.status(ctx, task.SessionID)
-		}
 		return s.summary(ctx, task)
 	}
 	if task.State == stateCached && !destroy {
@@ -1364,9 +1305,6 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	if destroy {
 		updates["inactive_since"] = nil
 		updates["cleanup_after"] = nil
-		updates["vm_ip"] = nil
-		updates["ssh_host_port"] = nil
-		updates["previous_generation"] = nil
 	} else {
 		inactive := nowString(s.Clock())
 		updates["inactive_since"] = inactive
@@ -1379,93 +1317,16 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	if !updated {
 		return nil, protocol.NewError("cleanup_incomplete", "session changed before cleanup could be committed", map[string]any{"outcome_verified": false})
 	}
+	if destroy {
+		deleted, err := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateAbsent}})
+		if err != nil {
+			return nil, s.sqliteError(err)
+		}
+		if !deleted {
+			return nil, protocol.NewError("cleanup_incomplete", "session changed before task deletion could be committed", map[string]any{"outcome_verified": false})
+		}
+	}
 	return s.status(ctx, task.SessionID)
-}
-
-// verifyAbsentTask is the shared fence for reusing or removing a durable
-// absent row. The current operation is excluded because Dispatch journals it
-// before entering the lifecycle action; every other pending journal remains a
-// stop condition. Native verification is required at the admission boundary,
-// while post-terminal destroy deletion relies on the native check already made
-// by the cleanup action and rechecks the durable fence only.
-func (s *Service) verifyAbsentTask(ctx context.Context, task *state.Task, excludedOperationID string, verifyNative bool) error {
-	if task == nil || task.TaskID == "" || task.State != stateAbsent {
-		return protocol.NewError("task_transition", "absent session does not have a verifiable durable row", map[string]any{"outcome_verified": false})
-	}
-	if task.VMIP != nil || task.SSHHostPort != nil || task.LeaseExpiresAt != nil || task.InactiveSince != nil || task.CleanupAfter != nil || task.ReservationBytes != 0 || task.PreviousGeneration != nil || !taskHasZeroResources(task) {
-		return protocol.NewError("task_transition", "absent session retains durable state and cannot be reused or removed", map[string]any{"state": task.State, "outcome_verified": false})
-	}
-	ports, err := s.Store.ListPorts(ctx, task.TaskID)
-	if err != nil {
-		return s.sqliteError(err)
-	}
-	if len(ports) != 0 {
-		return protocol.NewError("task_transition", "absent session retains durable port mappings", map[string]any{"state": task.State, "port_count": len(ports), "outcome_verified": false})
-	}
-	pending, err := s.Store.PendingOperations(ctx)
-	if err != nil {
-		return s.sqliteError(err)
-	}
-	for _, operation := range pending {
-		if operation.SessionID != nil && *operation.SessionID == task.SessionID && operation.OperationID != excludedOperationID {
-			return protocol.NewError("task_transition", "absent session retains a pending operation journal", map[string]any{"state": task.State, "operation_id": operation.OperationID, "outcome_verified": false})
-		}
-	}
-	if !verifyNative {
-		return nil
-	}
-	if s.Guest == nil {
-		if evidence, matched := nativeInitFailureRecord(task.LastError); matched && evidence["native_init_recovered_absent"] == true && evidence["outcome_verified"] == true {
-			return nil
-		}
-		return protocol.NewError("task_transition", "absent session native absence cannot be verified", map[string]any{"state": task.State, "outcome_verified": false})
-	}
-	if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr == nil {
-		return protocol.NewError("task_transition", "absent session has a present native instance", map[string]any{"state": task.State, "native_present": true, "outcome_verified": true})
-	} else {
-		control := protocol.AsError(ownershipErr)
-		detail := map[string]any{"state": task.State, "cause": ownershipErr.Error(), "outcome_verified": false}
-		if nativeDetail, ok := control.Detail.(map[string]any); ok {
-			for key, value := range nativeDetail {
-				detail[key] = value
-			}
-		}
-		if detail["native_missing"] != true {
-			return protocol.NewError("task_transition", "absent session native absence is not verified", detail)
-		}
-	}
-	return nil
-}
-
-// deleteDestroyedTask runs only after the destroy journal is terminal. It is
-// intentionally separate from releaseUnlocked so a crash cannot delete the
-// task while its operation is still pending.
-func (s *Service) deleteDestroyedTask(ctx context.Context, request protocol.Request, expectedGeneration *int64) error {
-	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": stringValue(request["session_id"])})
-	if err != nil {
-		return s.sqliteError(err)
-	}
-	if task == nil {
-		return nil
-	}
-	if expectedGeneration != nil && task.Generation != *expectedGeneration {
-		return nil
-	}
-	if err := s.verifyAbsentTask(ctx, task, "", false); err != nil {
-		return err
-	}
-	conditionGeneration := task.Generation
-	if expectedGeneration != nil {
-		conditionGeneration = *expectedGeneration
-	}
-	deleted, err := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &conditionGeneration, States: []string{stateAbsent}})
-	if err != nil {
-		return s.sqliteError(err)
-	}
-	if !deleted {
-		return protocol.NewError("cleanup_incomplete", "session changed before terminal destroy deletion could be committed", map[string]any{"outcome_verified": false})
-	}
-	return nil
 }
 
 func (s *Service) pendingAcquireOperations(ctx context.Context, task *state.Task) ([]state.Operation, error) {
@@ -2081,46 +1942,14 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 	return nil, protocol.NewError("observation_unavailable", "metrics observation did not converge", nil)
 }
 
-func (s *Service) reconcile(ctx context.Context, apply bool, excludedOperationIDs ...string) (map[string]any, error) {
-	excludedOperationID := ""
-	if len(excludedOperationIDs) > 0 {
-		excludedOperationID = excludedOperationIDs[0]
-	}
+func (s *Service) reconcile(ctx context.Context, apply bool, _ ...string) (map[string]any, error) {
 	if apply {
 		pending, pendingErr := s.Store.PendingOperations(ctx)
 		if pendingErr != nil {
 			return nil, s.sqliteError(pendingErr)
 		}
-		maintenance := make([]state.Operation, 0)
-		for _, operation := range pending {
-			if operation.Action == "admin-reconcile" && operation.OperationID != excludedOperationID {
-				maintenance = append(maintenance, operation)
-			}
-		}
-		// Recover an interrupted maintenance coordinator before checking
-		// lifecycle journals. Its operation ID is excluded by the nested
-		// reconciliation, so a legacy pending coordinator cannot be mistaken for
-		// native-init evidence for the task it was repairing.
-		if err := s.recoverPending(ctx, maintenance); err != nil {
-			return nil, err
-		}
-		pending, pendingErr = s.Store.PendingOperations(ctx)
-		if pendingErr != nil {
-			return nil, s.sqliteError(pendingErr)
-		}
 		if err := s.reconcilePendingWorkers(ctx, pending); err != nil {
 			return nil, err
-		}
-		pending, pendingErr = s.Store.PendingOperations(ctx)
-		if pendingErr != nil {
-			return nil, s.sqliteError(pendingErr)
-		}
-		if err := s.reconcilePendingAbsentDestroy(ctx, pending); err != nil {
-			return nil, err
-		}
-		pending, pendingErr = s.Store.PendingOperations(ctx)
-		if pendingErr != nil {
-			return nil, s.sqliteError(pendingErr)
 		}
 		if err := s.recoverPending(ctx, pending); err != nil {
 			return nil, err
@@ -2144,18 +1973,6 @@ func (s *Service) reconcile(ctx context.Context, apply bool, excludedOperationID
 			}
 		}
 		if (task.State == stateClosing || task.State == stateFailed) && apply {
-			recovered, recoveryErr := s.reconcileVerifiedNativeInitAbsence(ctx, task, excludedOperationID)
-			if recovered {
-				action := map[string]any{"task_id": task.TaskID, "generation": task.Generation, "action": "close-incomplete-or-expired"}
-				if recoveryErr != nil {
-					action["error"] = protocol.AsError(recoveryErr)
-					if firstErr == nil {
-						firstErr = recoveryErr
-					}
-				}
-				actions = append(actions, action)
-				continue
-			}
 			cleanupRequest, cleanupOperationID, requestErr := s.pendingCleanupRequest(ctx, task.SessionID, task.Generation, "release")
 			if requestErr != nil {
 				if firstErr == nil {
@@ -2200,18 +2017,14 @@ func (s *Service) reconcile(ctx context.Context, apply bool, excludedOperationID
 	return result, firstErr
 }
 
-// pendingCleanupRequest validates the original cleanup intent before allowing
-// reconciliation to touch native state. A pending worker preparation marker is
-// safe to rearm; an attempted, malformed or identity-bearing unresolved worker
-// remains fail-closed until its ownership is reconciled.
 func (s *Service) pendingCleanupRequest(ctx context.Context, session string, generation int64, action string) (protocol.Request, string, error) {
 	pending, err := s.Store.PendingOperations(ctx)
 	if err != nil {
 		return nil, "", s.sqliteError(err)
 	}
-	matched := make([]state.Operation, 0, 1)
-	requests := make([]protocol.Request, 0, 1)
-	for _, operation := range pending {
+	var matched *state.Operation
+	for index := range pending {
+		operation := &pending[index]
 		if operation.Action != action || operation.SessionID == nil || *operation.SessionID != session || operation.Generation == nil || *operation.Generation != generation {
 			continue
 		}
@@ -2226,36 +2039,62 @@ func (s *Service) pendingCleanupRequest(ctx context.Context, session string, gen
 		if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
 			return nil, "", protocol.NewError("operation_unverified", "pending cleanup request is incompatible", map[string]any{"operation_id": operation.OperationID, "cause": compatibilityErr.Error()})
 		}
-		requestGeneration, generationPresent := request["generation"]
-		parsedGeneration, generationValid := protocol.Integer(requestGeneration)
-		if !generationPresent || !generationValid || stringValue(request["operation_id"]) != operation.OperationID || stringValue(request["action"]) != action || stringValue(request["session_id"]) != session || parsedGeneration != generation || !operationIdentityMatches(&operation, request) {
+		generationValue, generationOK := protocol.Integer(request["generation"])
+		if !generationOK || stringValue(request["operation_id"]) != operation.OperationID || stringValue(request["action"]) != action || stringValue(request["session_id"]) != session || generationValue != generation || !operationIdentityMatches(operation, request) {
 			return nil, "", protocol.NewError("operation_unverified", "pending cleanup request identity does not match its journal", map[string]any{"operation_id": operation.OperationID})
 		}
 		digest := stringValue(operation.Response["_request_digest"])
 		calculated, digestErr := protocol.Digest(request)
-		if strings.TrimSpace(digest) == "" || digestErr != nil || digest != calculated {
+		if digest == "" || digestErr != nil || digest != calculated {
 			return nil, "", protocol.NewError("operation_unverified", "pending cleanup request digest does not match", map[string]any{"operation_id": operation.OperationID})
 		}
-		workerValue, workerOK := operation.Response["worker"]
-		worker, workerMapOK := workerValue.(map[string]any)
-		if !workerOK || !workerMapOK {
-			return nil, "", protocol.NewError("operation_unverified", "pending cleanup worker evidence is missing", map[string]any{"operation_id": operation.OperationID})
-		}
-		if !workerStartPrepared(worker) {
-			if workerErr := verifyNativeInitWorker(operation); workerErr != nil {
-				return nil, "", protocol.NewError("operation_unverified", "pending cleanup worker evidence is not terminal or verifiable", map[string]any{"operation_id": operation.OperationID, "cause": workerErr.Error()})
+		if workerValue, exists := operation.Response["worker"]; exists {
+			worker, workerOK := workerValue.(map[string]any)
+			if !workerOK || workerOwnershipUnresolved(worker) {
+				return nil, "", protocol.NewError("operation_unverified", "pending cleanup worker evidence is not terminal or verifiable", map[string]any{"operation_id": operation.OperationID})
 			}
 		}
-		matched = append(matched, operation)
-		requests = append(requests, request)
+		if matched != nil {
+			return nil, "", protocol.NewError("operation_unverified", "multiple pending cleanup journals match the same lifecycle generation", map[string]any{"session_id": session, "generation": generation, "action": action})
+		}
+		matched = operation
 	}
-	if len(matched) == 0 {
+	if matched == nil {
 		return protocol.Request{"protocol": protocol.Version, "action": action, "session_id": session, "generation": generation}, "", nil
 	}
-	if len(matched) != 1 {
-		return nil, "", protocol.NewError("operation_unverified", "multiple pending cleanup journals match the same lifecycle generation", map[string]any{"session_id": session, "generation": generation, "action": action, "count": len(matched)})
+	return protocol.Request(matched.Response["_request"].(map[string]any)), matched.OperationID, nil
+}
+
+func (s *Service) deleteDestroyedTask(ctx context.Context, request protocol.Request, expectedGeneration *int64) error {
+	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": stringValue(request["session_id"])})
+	if err != nil {
+		return s.sqliteError(err)
 	}
-	return requests[0], matched[0].OperationID, nil
+	if task == nil || task.State != stateAbsent {
+		return nil
+	}
+	if expectedGeneration != nil && task.Generation != *expectedGeneration {
+		return nil
+	}
+	ports, err := s.Store.ListPorts(ctx, task.TaskID)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if len(ports) != 0 {
+		return protocol.NewError("cleanup_incomplete", "session retains durable port mappings", map[string]any{"outcome_verified": false})
+	}
+	conditionGeneration := task.Generation
+	if expectedGeneration != nil {
+		conditionGeneration = *expectedGeneration
+	}
+	deleted, err := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &conditionGeneration, States: []string{stateAbsent}})
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if !deleted {
+		return protocol.NewError("cleanup_incomplete", "session changed before terminal destroy deletion could be committed", map[string]any{"outcome_verified": false})
+	}
+	return nil
 }
 
 func (s *Service) finalizePendingCleanup(ctx context.Context, session string, generation int64, action string, result map[string]any) error {
@@ -2263,8 +2102,6 @@ func (s *Service) finalizePendingCleanup(ctx context.Context, session string, ge
 	if err != nil {
 		return s.sqliteError(err)
 	}
-	var deleteRequest protocol.Request
-	finalized := false
 	for _, operation := range pending {
 		if operation.Action != action || operation.SessionID == nil || *operation.SessionID != session || operation.Generation == nil || *operation.Generation != generation {
 			continue
@@ -2274,36 +2111,12 @@ func (s *Service) finalizePendingCleanup(ctx context.Context, session string, ge
 			return protocol.NewError("operation_unverified", "pending cleanup request is missing", map[string]any{"operation_id": operation.OperationID})
 		}
 		request := protocol.Request(rawRequest)
-		if validationErr := protocol.ValidateRequest(request); validationErr != nil {
-			return protocol.NewError("operation_unverified", "pending cleanup request is invalid", map[string]any{"operation_id": operation.OperationID, "cause": validationErr.Error()})
-		}
-		if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
-			return protocol.NewError("operation_unverified", "pending cleanup request is incompatible", map[string]any{"operation_id": operation.OperationID, "cause": compatibilityErr.Error()})
-		}
-		requestGeneration, generationPresent := request["generation"]
-		parsedGeneration, generationValid := protocol.Integer(requestGeneration)
-		if !generationPresent || !generationValid || stringValue(request["operation_id"]) != operation.OperationID || stringValue(request["action"]) != action || stringValue(request["session_id"]) != session || parsedGeneration != generation || !operationIdentityMatches(&operation, request) {
-			return protocol.NewError("operation_unverified", "pending cleanup request identity does not match its journal", map[string]any{"operation_id": operation.OperationID})
-		}
-		digest := stringValue(operation.Response["_request_digest"])
-		calculated, digestErr := protocol.Digest(request)
-		if strings.TrimSpace(digest) == "" || digestErr != nil || digest != calculated {
-			return protocol.NewError("operation_unverified", "pending cleanup request digest does not match", map[string]any{"operation_id": operation.OperationID})
-		}
-		if workerErr := verifyNativeInitWorker(operation); workerErr != nil {
-			return protocol.NewError("operation_unverified", "pending cleanup worker evidence is not terminal or verifiable", map[string]any{"operation_id": operation.OperationID, "cause": workerErr.Error()})
-		}
-		deleteRequest = request
 		response := protocol.SuccessWithRelease(request, result, s.Release, nil)
-		response["_request_digest"] = digest
+		if digest, ok := operation.Response["_request_digest"]; ok {
+			response["_request_digest"] = digest
+		}
 		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
 			return s.sqliteError(err)
-		}
-		finalized = true
-	}
-	if action == "destroy" && finalized {
-		if err := s.deleteDestroyedTask(ctx, deleteRequest, generationPointer(generation, true)); err != nil {
-			return err
 		}
 	}
 	return nil
@@ -2937,10 +2750,6 @@ func sameResources(left, right map[string]int64) bool {
 	return true
 }
 
-func taskHasZeroResources(task *state.Task) bool {
-	return task != nil && task.ResourcesJSON == mustJSON(zeroResources()) && task.ResourceReservationJSON == "{}"
-}
-
 func requestHasResourceFields(request protocol.Request) bool {
 	for _, key := range resourceKeys {
 		if _, exists := request[key]; exists {
@@ -2951,7 +2760,14 @@ func requestHasResourceFields(request protocol.Request) bool {
 }
 
 func (s *Service) failTask(ctx context.Context, task *state.Task, phase string, err error) (map[string]any, error) {
-	return s.failTaskWithDetail(ctx, task, nativePhaseDetail(phase, err))
+	detail := nativePhaseDetail(phase, err)
+	if stateErr := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
+		detail["state_persisted"] = false
+		detail["state_error"] = stateErr.Error()
+		return nil, protocol.NewError("state_unverified", "native failure could not be durably recorded", detail)
+	}
+	detail["state_persisted"] = true
+	return nil, protocol.NewError("native_failed", "native lifecycle action failed", detail)
 }
 
 func (s *Service) failTaskForOperation(ctx context.Context, task *state.Task, phase string, err error, operationID string) (map[string]any, error) {
@@ -2959,10 +2775,6 @@ func (s *Service) failTaskForOperation(ctx context.Context, task *state.Task, ph
 	if operationID != "" {
 		detail["operation_id"] = operationID
 	}
-	return s.failTaskWithDetail(ctx, task, detail)
-}
-
-func (s *Service) failTaskWithDetail(ctx context.Context, task *state.Task, detail map[string]any) (map[string]any, error) {
 	if stateErr := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
 		detail["state_persisted"] = false
 		detail["state_error"] = stateErr.Error()

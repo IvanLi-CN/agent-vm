@@ -102,9 +102,8 @@ type CommandError struct {
 }
 
 // IsNotFound reports only an Incus command failure whose diagnostics identify
-// a missing instance or container. Generic 404/not-found diagnostics are not
-// sufficient because a remote, project, or endpoint failure must remain
-// fail-closed for lifecycle recovery.
+// a missing instance. Callers use this to finalize a durable destroy intent;
+// unrelated ownership or transport failures remain unverified.
 func IsNotFound(err error) bool {
 	var commandErr *CommandError
 	if !errors.As(err, &commandErr) {
@@ -115,10 +114,7 @@ func IsNotFound(err error) bool {
 	}
 	diagnostic := strings.ToLower(string(commandErr.Result.Stderr) + " " + commandErr.Error())
 	for _, line := range strings.Split(diagnostic, "\n") {
-		if strings.Contains(line, "no such instance") || strings.Contains(line, "no such container") {
-			return true
-		}
-		if missingInstanceDiagnostic.MatchString(line) {
+		if strings.Contains(line, "no such instance") || strings.Contains(line, "no such container") || missingInstanceDiagnostic.MatchString(line) {
 			return true
 		}
 	}

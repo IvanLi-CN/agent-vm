@@ -130,7 +130,6 @@ func TestIncusQueryUsesProjectQueryParameter(t *testing.T) {
 		t.Fatalf("incus argv = %#v, want %#v", got, want)
 	}
 }
-
 func TestIncusImageQueryUsesProjectAndParsesIdentity(t *testing.T) {
 	binDir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "incus-argv")

@@ -324,8 +324,8 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 			trackingErr = reapErr
 		}
 		workerCleanupErr = trackingErr
-		if workerCleanupErr == nil {
-			workerCleanupErr = ctx.Err()
+		if !waited && workerCleanupErr == nil {
+			workerCleanupErr = waitErr
 		}
 		if !waited {
 			return Result{Code: exitCode(waitErr), Stdout: stdout.Bytes(), Stderr: stderr.Bytes(), StdoutTruncated: stdout.Truncated, StderrTruncated: stderr.Truncated}, fmt.Errorf("native command timeout after %s: %w; %v", time.Since(started).Round(time.Millisecond), ctx.Err(), waitErr)
