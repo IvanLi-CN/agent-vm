@@ -80,6 +80,7 @@ func (guest *startupGuest) Init(_ context.Context, _, _ string, ownership map[st
 	}
 	return guest.initErr
 }
+func (guest *startupGuest) Probe(context.Context) error { return nil }
 func (guest *startupGuest) ConfigSet(_ context.Context, _ string, key, value string) error {
 	if guest.configSetErr != nil {
 		return guest.configSetErr
@@ -570,6 +571,50 @@ func TestFailedDiskResizeRetainsPhysicalCostReservation(t *testing.T) {
 	}
 	if control := protocol.AsError(service.checkAdmission(ctx, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)); control == nil || control.Code != "resource_insufficient" {
 		t.Fatalf("failed disk resize follow-up admission = %#v", control)
+	}
+}
+
+func TestSuccessfulDiskResizeClearsPhysicalCostReservation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 29, 0, 0, 0, 0, time.UTC)
+	lease := now.Add(time.Hour).Format(time.RFC3339Nano)
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "successful-disk-resize-task", SessionID: "successful-disk-resize-session", Generation: 1, State: stateActive,
+		InstanceName: "successful-disk-resize-instance", LeaseExpiresAt: &lease, CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const gib = int64(1024 * 1024 * 1024)
+	cfg := config.Defaults()
+	cfg.DiskLowBytes = 200 * gib
+	cfg.DiskTargetBytes = 300 * gib
+	cfg.ResizeCostBytes = 7 * gib
+	guest := &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 1024 * gib, FreeBytes: 210 * gib}}
+	service := New(store, cfg, Options{Guest: guest, Resident: true, Clock: func() time.Time { return now }})
+	service.MarkReady()
+	if _, err := service.resize(ctx, protocol.Request{"session_id": "successful-disk-resize-session", "generation": int64(1), "disk_gib": int64(30)}); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.GetTask(ctx, map[string]any{"task_id": "successful-disk-resize-task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
+		t.Fatalf("successful disk resize reservation = %#v", task)
+	}
+	disk, err := service.diskAdmission(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical := disk["physical_admission"].(map[string]any)
+	if physical["reserved_bytes"] != int64(0) {
+		t.Fatalf("successful disk resize physical reservation = %#v", physical)
 	}
 }
 
@@ -1079,6 +1124,21 @@ func TestStatusKeepsGuestAvailabilityUnknownWhenNativeStatusIsUnverified(t *test
 	}
 	if result["native_status"] != "unverified" || result["guest_available"] != nil {
 		t.Fatalf("unverified status = %#v", result)
+	}
+	if result["resources"] != nil || result["resource_reservation"] != nil {
+		t.Fatalf("unverified durable resources were fabricated = %#v", result)
+	}
+	resourceState, ok := result["resource_state"].(map[string]any)
+	if !ok || resourceState["verified"] != false {
+		t.Fatalf("unverified durable resource state = %#v", result)
+	}
+	admin, err := service.adminStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminTask := admin["tasks"].([]any)[0].(map[string]any)
+	if adminTask["resources"] != nil || adminTask["resource_reservation"] != nil || adminTask["resource_state"] == nil {
+		t.Fatalf("admin status fabricated durable resources = %#v", adminTask)
 	}
 }
 

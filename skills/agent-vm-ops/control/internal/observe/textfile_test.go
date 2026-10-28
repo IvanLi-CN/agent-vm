@@ -9,7 +9,7 @@ import (
 
 func TestSnapshotStorePublishesIndependentJSONAndTextfileSources(t *testing.T) {
 	store := NewSnapshotStore(t.TempDir())
-	if err := store.Publish("capacity", map[string]any{"up": true, "admission_ready": true, "observed_at": "2026-10-26T00:00:00+00:00", "resources": map[string]any{"allocated": map[string]any{"memory_mib": int64(4), "disk_gib": int64(2)}, "reserved": map[string]any{"memory_mib": int64(2), "disk_gib": int64(1)}, "allocated_and_reserved": map[string]any{"memory_mib": int64(6), "disk_gib": int64(3)}, "remaining": map[string]any{"memory_mib": int64(10), "disk_gib": int64(7)}, "limits": map[string]any{"memory_mib": int64(16), "disk_gib": int64(10)}}, "ct_cpu": map[string]any{"startup_pressure": map[string]any{"verified": false, "startup_blocked": nil, "threshold_full_avg10_percent": int64(50)}}, "disk_admission": map[string]any{"physical_admission": map[string]any{"allocated_bytes": int64(100), "reserved_bytes": int64(20), "allocated_and_reserved_bytes": int64(120), "remaining_bytes": int64(80), "limit_bytes": int64(180), "capacity_bytes": int64(200)}}}); err != nil {
+	if err := store.Publish("capacity", map[string]any{"up": true, "admission_ready": true, "observed_at": "2026-10-26T00:00:00+00:00", "resources": map[string]any{"allocated": map[string]any{"memory_mib": int64(4), "disk_gib": int64(2)}, "reserved": map[string]any{"memory_mib": int64(2), "disk_gib": int64(1)}, "allocated_and_reserved": map[string]any{"memory_mib": int64(6), "disk_gib": int64(3)}, "remaining": map[string]any{"memory_mib": int64(10), "disk_gib": int64(7)}, "limits": map[string]any{"memory_mib": int64(16), "disk_gib": int64(10)}}, "ct_cpu": map[string]any{"startup_pressure": map[string]any{"verified": false, "startup_blocked": nil, "threshold_full_avg10_percent": int64(50)}}, "disk_admission": map[string]any{"physical_admission": map[string]any{"allocated_bytes": int64(100), "reserved_bytes": int64(20), "allocated_and_reserved_bytes": int64(120), "remaining_bytes": int64(80), "limit_bytes": int64(180), "capacity_bytes": int64(200), "low_watermark_bytes": int64(40), "target_watermark_bytes": int64(60)}}}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.Publish("inventory", map[string]any{"up": true, "tasks": []map[string]any{{
@@ -72,6 +72,8 @@ func TestSnapshotStorePublishesIndependentJSONAndTextfileSources(t *testing.T) {
 		"agent_vm_admission_disk_remaining_bytes 80",
 		"agent_vm_admission_disk_limit_bytes 180",
 		"agent_vm_admission_disk_capacity_bytes 200",
+		"agent_vm_admission_disk_low_watermark_bytes 40",
+		"agent_vm_admission_disk_target_watermark_bytes 60",
 	} {
 		if !strings.Contains(string(capacityText), metric) {
 			t.Fatalf("capacity metrics missing %q: %s", metric, capacityText)

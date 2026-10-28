@@ -2166,7 +2166,7 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 		}
 	}
 	commitNow := s.Clock()
-	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow}, map[string]any{"resources_json": mustJSON(target), "resource_reservation_json": "{}", "updated_at": nowString(commitNow)})
+	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow}, map[string]any{"resources_json": mustJSON(target), "resource_reservation_json": "{}", "reservation_bytes": int64(0), "updated_at": nowString(commitNow)})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
@@ -3284,15 +3284,41 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 		}
 		return map[string]any{"state": stateAbsent, "session_id": session, "effective_lease": false, "native_status": stateAbsent, "guest_available": false}, nil
 	}
-	resources := map[string]any{}
-	_ = json.Unmarshal([]byte(task.ResourcesJSON), &resources)
-	reservation := map[string]any{}
-	_ = json.Unmarshal([]byte(task.ResourceReservationJSON), &reservation)
+	var resources any
+	var reservation any
+	resourceState := any(nil)
+	if _, resourceErr := decodeResourceMap(task.ResourcesJSON, "task resources", false); resourceErr != nil {
+		resourceState = map[string]any{"verified": false, "error": map[string]any{"code": "resource_unverified", "message": "task resource state cannot be verified"}}
+		resources = nil
+		reservation = nil
+	} else if _, reservationErr := decodeResourceMap(task.ResourceReservationJSON, "task reservation", true); reservationErr != nil {
+		resourceState = map[string]any{"verified": false, "error": map[string]any{"code": "resource_unverified", "message": "task resource reservation cannot be verified"}}
+		resources = nil
+		reservation = nil
+	} else {
+		resourceMap := map[string]any{}
+		reservationMap := map[string]any{}
+		if err := json.Unmarshal([]byte(task.ResourcesJSON), &resourceMap); err != nil {
+			resources = nil
+			resourceState = map[string]any{"verified": false, "error": map[string]any{"code": "resource_unverified", "message": "task resource state cannot be decoded"}}
+		} else {
+			resources = resourceMap
+		}
+		if err := json.Unmarshal([]byte(task.ResourceReservationJSON), &reservationMap); err != nil {
+			reservation = nil
+			resourceState = map[string]any{"verified": false, "error": map[string]any{"code": "resource_unverified", "message": "task resource reservation cannot be decoded"}}
+		} else {
+			reservation = reservationMap
+		}
+	}
 	ports, err := s.Store.ListPorts(ctx, task.TaskID)
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
 	result := map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": nil}
+	if resourceState != nil {
+		result["resource_state"] = resourceState
+	}
 	if s.Guest == nil {
 		return result, nil
 	}
@@ -3963,6 +3989,15 @@ func (s *Service) admissionStorageCost(ctx context.Context, excludeTaskID string
 }
 
 func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64, excludeTaskID string, startup bool) error {
+	if s.Guest != nil {
+		probe, ok := s.Guest.(native.HealthProbe)
+		if !ok {
+			return protocol.NewError("resource_unverified", "Incus native availability is not verified", map[string]any{"verified": false})
+		}
+		if err := probe.Probe(ctx); err != nil {
+			return protocol.NewError("resource_unverified", "Incus native availability could not be verified", map[string]any{"verified": false, "cause": err.Error()})
+		}
+	}
 	tasks, err := s.Store.ListTasks(ctx)
 	if err != nil {
 		return s.sqliteError(err)

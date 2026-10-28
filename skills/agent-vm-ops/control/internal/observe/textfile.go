@@ -242,6 +242,8 @@ func addPhysicalDiskMetric(result map[string]string, physical map[string]any) {
 		name := "agent_vm_admission_disk_" + kind + "_bytes"
 		addMetric(result, name, value, 1)
 	}
+	addMetric(result, "agent_vm_admission_disk_low_watermark_bytes", physical["low_watermark_bytes"], 1)
+	addMetric(result, "agent_vm_admission_disk_target_watermark_bytes", physical["target_watermark_bytes"], 1)
 }
 
 func addInstanceMetric(result map[string]string, kind string, value any) {
