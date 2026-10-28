@@ -168,8 +168,8 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 - [Agent VM Go resident control runtime](../../adr/0037-agent-vm-go-control-runtime.md)
 - [Native Incus Agent container lifecycle](../../adr/0038-native-incus-agent-container-lifecycle.md)
 - [Agent VM session-pinned image identity](../../adr/0041-agent-vm-session-pinned-image-identity.md)
-- [Agent VM Web management boundary](../../adr/0042-agent-vm-web-management-boundary.md)
 - [Verified native-init absence recovery](../../adr/0042-agent-vm-verified-native-init-absence-recovery.md)
+- [Agent VM Web management boundary](../../adr/0042-agent-vm-web-management-boundary.md)
 
 ## Related material
 
