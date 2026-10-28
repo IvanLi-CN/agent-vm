@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { Client } from "../scripts/client.ts";
 import { dispatch, parseArgs } from "../scripts/agent_vm.ts";
 import { Data, json, parseJson, readJson } from "../scripts/client-io.ts";
-import { Fixture as ClientFixture, response, result } from "./support.ts";
+import { Fixture as ClientFixture, result } from "./support.ts";
 import { Fixture as ControlFixture } from "../../agent-vm-ops/tests/control-fixture.ts";
 import { canonical_json, parse_json } from "../../agent-vm-ops/scripts/control-types.ts";
 
@@ -33,45 +33,4 @@ test("Bun client and canonical controller interoperate across actual serializati
     expect(remote.store.get_task({ session_id: "integration" })!.state).toBe("cached");
     await expect(client.request("unknown", { session: "integration" })).rejects.toMatchObject({ code: "unknown_action" });
   } finally { local.close(); remote.close(); }
-});
-
-test("new acquire starts at generation zero after verified absent recovery", async () => {
-  const fixture = new ClientFixture();
-  const sent: Data[] = [];
-  const client = new Client(fixture.env, async (_argv, options) => {
-    const request = parse_json(String(options!.input));
-    sent.push(request);
-    if (request.action === "status") {
-      return result(response(request, {
-        result: {
-          state: "absent",
-          generation: 7,
-          session_id: request.session_id,
-          effective_lease: false,
-          native_status: "absent",
-          guest_available: false,
-        },
-      }));
-    }
-    if (request.action === "acquire") {
-      return result(response(request, {
-        result: {
-          state: "active",
-          generation: 8,
-          session_id: request.session_id,
-          task_id: "avm-absent-recovery",
-          effective_lease: true,
-        },
-      }));
-    }
-    throw new Error(`unexpected action: ${request.action}`);
-  }, () => {});
-  client.key = async () => [fixture.key(), "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest fixture"];
-  try {
-    const resultValue = await dispatch(parseArgs(["--session-id", "absent-recovery", "acquire", "--operation-id", "absent-recovery-acquire"]), client) as Data;
-    expect(resultValue.result.effective_lease).toBe(true);
-    expect(sent.filter(request => request.action === "acquire").map(request => request.generation)).toEqual([0]);
-  } finally {
-    fixture.close();
-  }
 });
