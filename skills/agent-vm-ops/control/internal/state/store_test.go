@@ -122,6 +122,12 @@ func TestAuditSummaryAggregatesStableObservabilityLabels(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.RecordManagementAudit(ctx, ManagementAudit{
+		EventID: "management-image-catalog-failure", Action: "image_import", Outcome: "failed", Phase: "reconciliation",
+		Target: map[string]any{"kind": "image_catalog"}, Detail: map[string]any{"code": "internal_error", "message": "catalog persistence failed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	summary, err := store.AuditSummary(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -131,6 +137,9 @@ func TestAuditSummaryAggregatesStableObservabilityLabels(t *testing.T) {
 	}
 	if summary.ImageUnpackFailures["native-unpack|image_unpack_failed"] != 1 || summary.ImageUnpackFailures["image_import|internal_error"] != 1 || summary.Warnings["capacity_insufficient"] != 1 {
 		t.Fatalf("failure summary = %#v warnings=%#v", summary.ImageUnpackFailures, summary.Warnings)
+	}
+	if _, exists := summary.ImageUnpackFailures["reconciliation|internal_error"]; exists {
+		t.Fatalf("catalog persistence failure was misclassified as unpack failure: %#v", summary.ImageUnpackFailures)
 	}
 }
 

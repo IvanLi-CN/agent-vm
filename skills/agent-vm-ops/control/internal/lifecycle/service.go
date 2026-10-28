@@ -2772,8 +2772,11 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			if len(unknownTaskStates) > 0 {
 				// The known-state totals are incomplete. Keep authoritative limits,
-				// but omit derived headroom so bridges cannot turn a partial view into
-				// a positive slot estimate.
+				// but omit all derived resource totals and headroom so bridges cannot
+				// turn a partial view into healthy zeroes or a positive slot estimate.
+				allocated = nil
+				reserved = nil
+				allocatedAndReserved = nil
 				remaining = map[string]any{}
 			}
 			memoryObservation := map[string]any{"limit_bytes": nil, "current_bytes": nil, "available_bytes": nil, "threshold_bytes": nil, "pressure": nil, "oom_events": nil}
@@ -4098,6 +4101,14 @@ func (s *Service) diskAdmissionSufficient(ctx context.Context, admission map[str
 }
 
 func (s *Service) diskAdmissionSufficientWithFloor(_ context.Context, admission map[string]any, requestCost int64, excludeTaskID string, minimumFreeBytes int64) (bool, error) {
+	return s.diskAdmissionSufficientWithWatermark(admission, requestCost, excludeTaskID, minimumFreeBytes, false)
+}
+
+func (s *Service) diskAdmissionSufficientWithTarget(_ context.Context, admission map[string]any, requestCost int64, excludeTaskID string, minimumFreeBytes int64) (bool, error) {
+	return s.diskAdmissionSufficientWithWatermark(admission, requestCost, excludeTaskID, minimumFreeBytes, true)
+}
+
+func (s *Service) diskAdmissionSufficientWithWatermark(admission map[string]any, requestCost int64, excludeTaskID string, minimumFreeBytes int64, useTarget bool) (bool, error) {
 	if admission == nil {
 		return true, nil
 	}
@@ -4107,14 +4118,18 @@ func (s *Service) diskAdmissionSufficientWithFloor(_ context.Context, admission 
 	}
 	free, freeOK := physical["free_bytes"].(int64)
 	low, lowOK := physical["low_watermark_bytes"].(int64)
+	target, targetOK := physical["target_watermark_bytes"].(int64)
 	reserved, reservedOK := physical["reserved_bytes"].(int64)
 	if !reservedOK {
 		reserved, reservedOK = physical["durable_reserved_bytes"].(int64)
 	}
-	if !freeOK || !lowOK || !reservedOK || requestCost < 0 || minimumFreeBytes < 0 {
+	if !freeOK || !lowOK || !reservedOK || (useTarget && !targetOK) || requestCost < 0 || minimumFreeBytes < 0 {
 		return false, protocol.NewError("resource_unverified", "physical disk admission observation is malformed", map[string]any{"verified": false})
 	}
 	threshold := low
+	if useTarget && target > threshold {
+		threshold = target
+	}
 	if minimumFreeBytes > threshold {
 		threshold = minimumFreeBytes
 	}
@@ -4125,11 +4140,11 @@ func (s *Service) diskAdmissionSufficientWithFloor(_ context.Context, admission 
 		_ = excludeTaskID
 	}
 	if reserved > free || requestCost > free-reserved {
-		return false, protocol.NewError("resource_insufficient", "physical disk admission is below the configured free-space floor", map[string]any{"request_cost_bytes": requestCost, "free_bytes": free, "reserved_bytes": reserved, "low_watermark_bytes": low, "required_free_bytes": threshold})
+		return false, protocol.NewError("resource_insufficient", "physical disk admission is below the configured free-space floor", map[string]any{"request_cost_bytes": requestCost, "free_bytes": free, "reserved_bytes": reserved, "low_watermark_bytes": low, "target_watermark_bytes": target, "required_free_bytes": threshold})
 	}
 	sufficient := free-reserved-requestCost >= threshold
 	if !sufficient {
-		return false, protocol.NewError("resource_insufficient", "physical disk admission is below the configured free-space floor", map[string]any{"request_cost_bytes": requestCost, "free_bytes": free, "reserved_bytes": reserved, "low_watermark_bytes": low, "required_free_bytes": threshold})
+		return false, protocol.NewError("resource_insufficient", "physical disk admission is below the configured free-space floor", map[string]any{"request_cost_bytes": requestCost, "free_bytes": free, "reserved_bytes": reserved, "low_watermark_bytes": low, "target_watermark_bytes": target, "required_free_bytes": threshold})
 	}
 	return true, nil
 }
@@ -4199,7 +4214,7 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 		if admissionErr != nil {
 			return false, admissionErr
 		}
-		sufficient, sufficientErr := s.diskAdmissionSufficientWithFloor(ctx, admission, requestCost, excludeTaskID, minimumFreeBytes)
+		sufficient, sufficientErr := s.diskAdmissionSufficientWithTarget(ctx, admission, requestCost, excludeTaskID, minimumFreeBytes)
 		if sufficientErr != nil {
 			if protocol.AsError(sufficientErr).Code != "resource_insufficient" {
 				return false, sufficientErr

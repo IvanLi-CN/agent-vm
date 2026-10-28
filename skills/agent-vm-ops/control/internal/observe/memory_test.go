@@ -61,6 +61,25 @@ func TestLinuxMemoryObserverUsesVerifiedLXCFSForUnlimitedCgroup(t *testing.T) {
 	}
 }
 
+func TestLinuxMemoryObserverRejectsAmbiguousLXCFSMounts(t *testing.T) {
+	values := map[string]string{
+		"/sys/fs/cgroup/memory.max":     "max\n",
+		"/sys/fs/cgroup/memory.current": "1\n",
+		"/proc/self/mountinfo": "12 1 0:9 /meminfo /proc/meminfo rw - fuse.lxcfs lxcfs rw\n" +
+			"13 1 0:9 /meminfo /proc/meminfo rw - fuse.lxcfs lxcfs rw\n",
+	}
+	observer := &LinuxMemoryObserver{ReadFile: func(path string) ([]byte, error) {
+		value, ok := values[path]
+		if !ok {
+			return nil, errMissingMemoryMetric{}
+		}
+		return []byte(value), nil
+	}}
+	if _, err := observer.Observe(context.Background()); err == nil {
+		t.Fatal("ambiguous LXCfs mount unexpectedly succeeded")
+	}
+}
+
 func TestLinuxMemoryObserverRejectsContradictoryCurrent(t *testing.T) {
 	values := map[string]string{
 		"/sys/fs/cgroup/memory.max":     "10\n",

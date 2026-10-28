@@ -1286,6 +1286,55 @@ func TestAdmissionReclaimsCachedCapacityBeforeRejectingPhysicalSpace(t *testing.
 	}
 }
 
+func TestReclaimCachedCapacityReachesTargetWatermark(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "target-cache", SessionID: "target-cache-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-target-cache", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{
+			status: "Stopped",
+			config: map[string]any{
+				"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "target-cache", "user.agent-vm.session": "target-cache-session", "user.agent-vm.generation": "1"},
+				"devices": map[string]any{}, "expanded_devices": map[string]any{},
+			},
+		},
+		capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 10 * gib},
+	}
+	cfg := config.Defaults()
+	cfg.DiskLowBytes = 20 * gib
+	cfg.DiskTargetBytes = 30 * gib
+	guest.capacityFunc = func() native.StorageCapacity {
+		if guest.deleteCalls > 0 {
+			return native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 25 * gib}
+		}
+		return guest.capacity
+	}
+	service := New(store, cfg, Options{Guest: guest, Clock: func() time.Time { return now }})
+	service.admissionMu.Lock()
+	reclaimed, reclaimErr := service.reclaimCachedCapacity(context.Background(), 1, "", 0)
+	service.admissionMu.Unlock()
+	if reclaimErr != nil {
+		t.Fatal(reclaimErr)
+	}
+	if reclaimed {
+		t.Fatalf("reclaim reported target watermark reached at low-watermark headroom")
+	}
+	if guest.deleteCalls != 1 {
+		t.Fatalf("cached delete calls = %d", guest.deleteCalls)
+	}
+}
+
 func TestReclaimCachedCapacitySkipsBusySession(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -1499,6 +1548,12 @@ func TestAdminMetricsMatchesAdmissionForUnknownState(t *testing.T) {
 		t.Fatalf("unknown state instance admission = %#v", instances)
 	}
 	resources := metrics["resources"].(map[string]any)
+	for _, key := range []string{"allocated", "reserved", "allocated_and_reserved"} {
+		value, ok := resources[key].(map[string]int64)
+		if !ok || value != nil {
+			t.Fatalf("unknown state resource %s = %#v", key, resources[key])
+		}
+	}
 	if remaining, ok := resources["remaining"].(map[string]any); !ok || len(remaining) != 0 {
 		t.Fatalf("unknown state resource remaining = %#v", resources["remaining"])
 	}

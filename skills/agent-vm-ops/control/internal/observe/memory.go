@@ -172,7 +172,8 @@ func (observer *LinuxMemoryObserver) lxcfsMemory() (*lxcfsMemory, error) {
 	if err != nil {
 		return nil, nil
 	}
-	found := false
+	mountsForPath := 0
+	lxcfsMounts := 0
 	for _, line := range strings.Split(string(mounts), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) >= 10 {
@@ -183,14 +184,19 @@ func (observer *LinuxMemoryObserver) lxcfsMemory() (*lxcfsMemory, error) {
 					break
 				}
 			}
-			if separator > 5 && separator+2 < len(fields) && fields[4] == "/proc/meminfo" && fields[separator+1] == "fuse.lxcfs" {
-				found = true
-				break
+			if separator > 5 && separator+2 < len(fields) && fields[4] == "/proc/meminfo" {
+				mountsForPath++
+				if fields[separator+1] == "fuse.lxcfs" && fields[separator+2] == "lxcfs" {
+					lxcfsMounts++
+				}
 			}
 		}
 	}
-	if !found {
+	if mountsForPath == 0 {
 		return nil, nil
+	}
+	if mountsForPath != 1 || lxcfsMounts != 1 {
+		return nil, errors.New("LXCfs /proc/meminfo mount is ambiguous or has an unexpected source")
 	}
 	raw, err := observer.read(observer.meminfoPath())
 	if err != nil {

@@ -1249,7 +1249,7 @@ func addAuditSummary(result *AuditSummary, action, outcome, phase string, detail
 		result.Warnings[code]++
 	}
 	lower := strings.ToLower(raw)
-	if outcome == "error" && (strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs") || action == "image_import") || action == "image_import" && (phase == "image_import" || phase == "reconciliation")) {
+	if outcome == "error" && strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs")) {
 		result.ImageUnpackFailures[phase+"|"+code]++
 	}
 }
