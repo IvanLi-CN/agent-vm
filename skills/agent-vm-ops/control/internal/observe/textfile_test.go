@@ -3,6 +3,7 @@ package observe
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -98,4 +99,60 @@ func TestSnapshotStorePublishesIndependentJSONAndTextfileSources(t *testing.T) {
 	if _, err := store.Read("unknown"); err == nil {
 		t.Fatal("unknown snapshot source unexpectedly accepted")
 	}
+}
+
+func TestSnapshotMetricsPreserveMemoryOOMEvidenceAndSlotEstimates(t *testing.T) {
+	metrics := snapshotMetrics("capacity", map[string]any{
+		"up": true,
+		"resources": map[string]any{
+			"allocated":              map[string]any{"cpu": true, "memory_mib": int64(4)},
+			"allocated_and_reserved": map[string]any{"cpu": int64(3)},
+			"remaining":              map[string]any{"cpu": int64(6), "memory_mib": int64(10)},
+		},
+		"default_admission": map[string]any{
+			"requested":          map[string]any{"cpu": int64(2), "memory_mib": int64(4), "disk_gib": int64(20)},
+			"request_cost_bytes": int64(40),
+		},
+		"disk_admission": map[string]any{"physical_admission": map[string]any{"remaining_bytes": int64(80)}},
+		"ct_cpu": map[string]any{
+			"capacity_vcpu":    int64(8),
+			"startup_pressure": map[string]any{"verified": true, "startup_blocked": false},
+		},
+		"ct_memory": map[string]any{
+			"capacity_bytes":           int64(32),
+			"current_bytes":            int64(12),
+			"available_bytes":          int64(20),
+			"pressure_threshold_bytes": int64(4),
+			"pressure":                 false,
+			"oom_events":               map[string]any{"oom": int64(9007199254740993), "oom_kill": int64(2)},
+		},
+	})
+	text := strings.Join(metricsAsSortedLines(metrics), "\n")
+	for _, expected := range []string{
+		"agent_vm_admission_memory_capacity_bytes 32",
+		"agent_vm_memory_oom_events_total{kind=\"oom\"} 9007199254740993",
+		"agent_vm_memory_oom_events_total{kind=\"oom_kill\"} 2",
+		"agent_vm_admission_default_vm_logical_slots 2",
+		"agent_vm_admission_default_vm_startable_slots 2",
+	} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("metrics missing %q: %s", expected, text)
+		}
+	}
+	if strings.Contains(text, "agent_vm_admission_cpu_allocated_vcpu") {
+		t.Fatalf("boolean resource was coerced into a numeric metric: %s", text)
+	}
+}
+
+func metricsAsSortedLines(metrics map[string]string) []string {
+	keys := make([]string, 0, len(metrics))
+	for key := range metrics {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	lines := make([]string, 0, len(keys))
+	for _, key := range keys {
+		lines = append(lines, strings.TrimSpace(metrics[key]))
+	}
+	return lines
 }

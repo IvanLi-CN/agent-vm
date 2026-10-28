@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -151,8 +152,9 @@ func snapshotMetrics(source string, value any) map[string]string {
 			}
 			addMetric(result, "agent_vm_admission_default_request_physical_cost_bytes", defaultAdmission["request_cost_bytes"], 1)
 		}
+		addDefaultSlotMetrics(result, object)
 		if value, exists := object["reclaim_required"]; exists && value != nil {
-			addMetric(result, "agent_vm_admission_reclaim_required", value, 1)
+			addBooleanMetric(result, "agent_vm_admission_reclaim_required", value)
 		}
 		if cpu, ok := objectMap(object["ct_cpu"]); ok {
 			addMetric(result, "agent_vm_admission_cpu_capacity_vcpu", cpu["capacity_vcpu"], 1)
@@ -163,15 +165,17 @@ func snapshotMetrics(source string, value any) map[string]string {
 			if startup, ok := objectMap(cpu["startup_pressure"]); ok {
 				addMetric(result, "agent_vm_cpu_startup_pressure_threshold_percent", startup["threshold_full_avg10_percent"], 1)
 				if startup["verified"] == true {
-					addMetric(result, "agent_vm_cpu_startup_blocked", startup["startup_blocked"], 1)
+					addBooleanMetric(result, "agent_vm_cpu_startup_blocked", startup["startup_blocked"])
 				}
 			}
 		}
 		if memory, ok := objectMap(object["ct_memory"]); ok {
+			addMetric(result, "agent_vm_admission_memory_capacity_bytes", memory["capacity_bytes"], 1)
 			addMetric(result, "agent_vm_memory_current_bytes", memory["current_bytes"], 1)
 			addMetric(result, "agent_vm_memory_available_bytes", memory["available_bytes"], 1)
 			addMetric(result, "agent_vm_memory_pressure_threshold_bytes", memory["pressure_threshold_bytes"], 1)
-			addMetric(result, "agent_vm_memory_pressure", memory["pressure"], 1)
+			addBooleanMetric(result, "agent_vm_memory_pressure", memory["pressure"])
+			addOOMMetrics(result, memory["oom_events"])
 		}
 	}
 	if source == "inventory" {
@@ -218,6 +222,122 @@ func addBoolMetricIfPresent(result map[string]string, name string, object map[st
 	result[name] = fmt.Sprintf("%s %d", name, boolNumber(value, false))
 }
 
+func addBooleanMetric(result map[string]string, name string, value any) {
+	parsed, ok := value.(bool)
+	if !ok {
+		return
+	}
+	result[name] = fmt.Sprintf("%s %d", name, boolNumber(parsed, false))
+}
+
+func addOOMMetrics(result map[string]string, value any) {
+	events, ok := objectMap(value)
+	if !ok {
+		return
+	}
+	keys := make([]string, 0, len(events))
+	for key := range events {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, ok := numeric(events[key]); !ok {
+			continue
+		}
+		name := "agent_vm_memory_oom_events_total"
+		result[name] += fmt.Sprintf("%s{kind=%s} %s\n", name, strconv.Quote(key), number(events[key]))
+	}
+}
+
+func addDefaultSlotMetrics(result map[string]string, object map[string]any) {
+	defaultAdmission, ok := objectMap(object["default_admission"])
+	if !ok {
+		return
+	}
+	requested, ok := objectMap(defaultAdmission["requested"])
+	if !ok {
+		return
+	}
+	cpuRequest, cpuOK := integerValue(requested["cpu"])
+	memoryRequest, memoryOK := integerValue(requested["memory_mib"])
+	physicalCost, costOK := integerValue(defaultAdmission["request_cost_bytes"])
+	if !cpuOK || !memoryOK || !costOK || cpuRequest <= 0 || memoryRequest <= 0 || physicalCost <= 0 {
+		return
+	}
+	resources, resourcesOK := objectMap(object["resources"])
+	remaining, remainingOK := objectMap(resources["remaining"])
+	diskAdmission, diskOK := objectMap(object["disk_admission"])
+	physical, physicalOK := objectMap(diskAdmission["physical_admission"])
+	cpuRemaining, cpuRemainingOK := integerValue(remaining["cpu"])
+	memoryRemaining, memoryRemainingOK := integerValue(remaining["memory_mib"])
+	physicalRemaining, physicalRemainingOK := integerValue(physical["remaining_bytes"])
+	if !resourcesOK || !remainingOK || !diskOK || !physicalOK || !cpuRemainingOK || !memoryRemainingOK || !physicalRemainingOK {
+		return
+	}
+	logicalSlots := minSlots(slotRatio(cpuRemaining, cpuRequest), slotRatio(memoryRemaining, memoryRequest), slotRatio(physicalRemaining, physicalCost))
+	if logicalSlots < 0 {
+		return
+	}
+	addMetric(result, "agent_vm_admission_default_vm_logical_slots", logicalSlots, 1)
+
+	ctCPU, ctCPUOK := objectMap(object["ct_cpu"])
+	startup, startupOK := objectMap(ctCPU["startup_pressure"])
+	capacity, capacityOK := integerValue(ctCPU["capacity_vcpu"])
+	allocated, allocatedOK := objectMap(resources["allocated_and_reserved"])
+	allocatedCPU, allocatedCPUOK := integerValue(allocated["cpu"])
+	startupVerified, startupVerifiedOK := startup["verified"].(bool)
+	startupBlocked, startupBlockedOK := startup["startup_blocked"].(bool)
+	if !ctCPUOK || !startupOK || !capacityOK || !allocatedOK || !allocatedCPUOK || !startupVerified || !startupVerifiedOK || !startupBlockedOK {
+		return
+	}
+	ctHeadroom := capacity - allocatedCPU
+	if ctHeadroom < 0 {
+		ctHeadroom = 0
+	}
+	startableSlots := minSlots(logicalSlots, slotRatio(ctHeadroom, cpuRequest))
+	if startupBlocked {
+		startableSlots = 0
+	}
+	addMetric(result, "agent_vm_admission_default_vm_startable_slots", startableSlots, 1)
+}
+
+func integerValue(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case json.Number:
+		parsed, err := typed.Int64()
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func slotRatio(headroom, request int64) int64 {
+	if request <= 0 {
+		return -1
+	}
+	if headroom <= 0 {
+		return 0
+	}
+	return headroom / request
+}
+
+func minSlots(values ...int64) int64 {
+	if len(values) == 0 {
+		return -1
+	}
+	minimum := values[0]
+	for _, value := range values[1:] {
+		if value < minimum {
+			minimum = value
+		}
+	}
+	return minimum
+}
+
 func normalizedSnapshotObject(value any) map[string]any {
 	raw, err := json.Marshal(value)
 	if err != nil {
@@ -252,9 +372,7 @@ func addInstanceMetric(result map[string]string, kind string, value any) {
 
 func addMetric(result map[string]string, name string, value any, multiplier float64) {
 	if _, ok := numeric(value); !ok {
-		if _, isBool := value.(bool); !isBool {
-			return
-		}
+		return
 	}
 	result[name] = fmt.Sprintf("%s %s", name, numberWithMultiplier(value, multiplier))
 }
@@ -383,7 +501,7 @@ func addResourceMetric(result map[string]string, dimension, inputKey string, res
 		if kind == "limits" {
 			name = "agent_vm_admission_" + dimension + "_limit_" + suffix
 		}
-		result[name] = fmt.Sprintf("%s %s", name, numberWithMultiplier(value, multiplier))
+		addMetric(result, name, value, multiplier)
 	}
 }
 
@@ -412,6 +530,9 @@ func numericValue(value any) float64 {
 func number(value any) string { return numberWithMultiplier(value, 1) }
 
 func numberWithMultiplier(value any, multiplier float64) string {
+	if integer, ok := exactInteger(value); ok && multiplier == float64(int64(multiplier)) {
+		return integer.Mul(integer, big.NewInt(int64(multiplier))).String()
+	}
 	valueFloat, ok := numeric(value)
 	if !ok {
 		return "NaN"
@@ -419,13 +540,26 @@ func numberWithMultiplier(value any, multiplier float64) string {
 	return strconv.FormatFloat(valueFloat*multiplier, 'f', -1, 64)
 }
 
+func exactInteger(value any) (*big.Int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return big.NewInt(int64(typed)), true
+	case int64:
+		return big.NewInt(typed), true
+	case json.Number:
+		text := typed.String()
+		if strings.ContainsAny(text, ".eE") {
+			return nil, false
+		}
+		integer, ok := new(big.Int).SetString(text, 10)
+		return integer, ok
+	default:
+		return nil, false
+	}
+}
+
 func numeric(value any) (float64, bool) {
 	switch typed := value.(type) {
-	case bool:
-		if typed {
-			return 1, true
-		}
-		return 0, true
 	case int:
 		return float64(typed), true
 	case int64:

@@ -151,7 +151,24 @@ func (s *Service) ReservePhysicalStorage(ctx context.Context, size int64) (func(
 		return nil, protocol.NewError("config_invalid", "management upload minimum free bytes must not be negative", nil)
 	}
 	if _, err := s.diskAdmissionSufficientWithFloor(ctx, admission, size, "", minimumFreeBytes); err != nil {
-		return nil, err
+		control := protocol.AsError(err)
+		if control.Code == "resource_insufficient" {
+			if reclaimed, reclaimErr := s.reclaimCachedCapacity(ctx, size, "", minimumFreeBytes); reclaimErr != nil {
+				return nil, reclaimErr
+			} else if reclaimed {
+				admission, err = s.diskAdmission(ctx, "")
+				if err != nil {
+					return nil, err
+				}
+				if _, sufficientErr := s.diskAdmissionSufficientWithFloor(ctx, admission, size, "", minimumFreeBytes); sufficientErr != nil {
+					return nil, sufficientErr
+				}
+			} else {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
 	}
 	s.storageMu.Lock()
 	if size > maxInt64Value-s.storageReserved {
@@ -857,6 +874,9 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	}
 	result, err := s.dispatchAction(dispatchCtx, action, request)
 	if err != nil {
+		if s.Snapshots != nil {
+			_ = s.publishSnapshotFailure(action, err)
+		}
 		if write && !uncertain(err) {
 			_ = s.recordError(ctx, request, err)
 		}
@@ -886,6 +906,27 @@ func (s *Service) publishSnapshot(action string, response map[string]any) error 
 		return nil
 	}
 	return s.Snapshots.Publish(source, response)
+}
+
+func (s *Service) publishSnapshotFailure(action string, err error) error {
+	source := map[string]string{"admin-metrics": "capacity", "admin-status": "inventory", "doctor": "health"}[action]
+	if source == "" || s.Snapshots == nil {
+		return nil
+	}
+	control := protocol.AsError(err)
+	value := map[string]any{
+		"up":          false,
+		"observed_at": nowString(s.Clock()),
+		"error": map[string]any{
+			"code":    control.Code,
+			"message": control.Message,
+		},
+	}
+	if source == "inventory" {
+		value["tasks"] = []any{}
+		value["task_states"] = map[string]int64{}
+	}
+	return s.Snapshots.Publish(source, value)
 }
 
 func (s *Service) replay(ctx context.Context, request protocol.Request, write bool) (map[string]any, error) {
@@ -1669,6 +1710,11 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	if err := s.checkAdmission(ctx, resources, task.TaskID, true); err != nil {
 		return nil, err
 	}
+	reservationBytes, err := s.admissionStorageCost(ctx, task.TaskID, resources, true)
+	if err != nil {
+		return nil, err
+	}
+	task.ReservationBytes = reservationBytes
 	if created {
 		nextGeneration, generationErr := s.Store.NextGeneration(ctx, session)
 		if generationErr != nil {
@@ -1678,7 +1724,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if err := s.Store.InsertTask(ctx, *task); err != nil {
 			return nil, s.sqliteError(err)
 		}
-	} else if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"generation": task.Generation, "state": task.State, "resources_json": task.ResourcesJSON, "resource_reservation_json": task.ResourceReservationJSON, "reservation_bytes": int64(0), "lease_expires_at": task.LeaseExpiresAt, "updated_at": nowString(now), "last_error": nil, "image_fingerprint": task.ImageFingerprint, "previous_generation": task.PreviousGeneration}); err != nil {
+	} else if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"generation": task.Generation, "state": task.State, "resources_json": task.ResourcesJSON, "resource_reservation_json": task.ResourceReservationJSON, "reservation_bytes": reservationBytes, "lease_expires_at": task.LeaseExpiresAt, "updated_at": nowString(now), "last_error": nil, "image_fingerprint": task.ImageFingerprint, "previous_generation": task.PreviousGeneration}); err != nil {
 		return nil, s.sqliteError(err)
 	}
 	if operationID := native.WorkerOperationID(ctx); operationID != "" {
@@ -2493,12 +2539,10 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 		if err != nil {
 			return nil, s.sqliteError(err)
 		}
-		consistent := epoch == endEpoch
-		if consistent || attempt == 3 {
+		initialConsistent := epoch == endEpoch
+		consistent := initialConsistent
+		if initialConsistent || attempt == 3 {
 			warnings := []any{}
-			if !consistent {
-				warnings = append(warnings, map[string]any{"code": "observation_inconsistent", "message": "durable state changed while collecting metrics"})
-			}
 			pending, pendingErr := s.Store.PendingOperations(ctx)
 			if pendingErr != nil {
 				return nil, s.sqliteError(pendingErr)
@@ -2593,7 +2637,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			if drainErr != nil {
 				return nil, s.sqliteError(drainErr)
 			}
-			if consistent && len(pendingOperations) == 0 && states[stateClosing] == 0 && states[stateDeleting] == 0 && states[stateFailed] == 0 {
+			if initialConsistent && len(pendingOperations) == 0 && states[stateClosing] == 0 && states[stateDeleting] == 0 && states[stateFailed] == 0 {
 				if releaseDrain, drainErr := s.releaseDrainOwned(ctx); drainErr != nil {
 					return nil, s.sqliteError(drainErr)
 				} else if releaseDrain {
@@ -2712,6 +2756,18 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 					}
 				}
 			}
+			endEpoch, err = s.Store.StateEpoch(ctx)
+			if err != nil {
+				return nil, s.sqliteError(err)
+			}
+			consistent = epoch == endEpoch
+			if !consistent && attempt < 3 {
+				continue
+			}
+			if !consistent {
+				warnings = append(warnings, map[string]any{"code": "observation_inconsistent", "message": "durable state changed while collecting metrics"})
+				defaultReasons = append(defaultReasons, map[string]any{"code": "observation_inconsistent", "message": "durable state changed while collecting metrics"})
+			}
 			instanceLimit := any(nil)
 			instanceRemaining := any(nil)
 			if s.Config.InstanceLimit > 0 {
@@ -2722,11 +2778,14 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				}
 			}
 			instances := map[string]any{"verified": len(unknownTaskStates) == 0, "source": "durable_state", "native_verified": false, "total": len(tasks), "limits": map[string]any{}, "admission": map[string]any{"allocated": admissionInstances - states[statePreparing], "reserved": states[statePreparing], "allocated_and_reserved": admissionInstances, "remaining": instanceRemaining, "limit": instanceLimit, "capacity": nil}}
-			defaultReady := len(defaultReasons) == 0
+			defaultReady := consistent && len(defaultReasons) == 0
 			admissionReady := s.Ready() && nativeUp && defaultReady
 			doctorIssues := []any{}
 			if !s.Ready() {
 				doctorIssues = append(doctorIssues, map[string]any{"code": "startup_reconcile_required", "message": "control service is not ready"})
+			}
+			if !consistent {
+				doctorIssues = append(doctorIssues, map[string]any{"code": "observation_inconsistent", "message": "durable state changed while collecting metrics"})
 			}
 			if !nativeUp {
 				doctorIssues = append(doctorIssues, map[string]any{"code": "native_unavailable", "message": "Incus native availability is not verified"})
@@ -2741,7 +2800,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				capacityObservation = map[string]any{"verified": true, "total_bytes": physical["capacity_bytes"], "used_bytes": physical["allocated_bytes"], "free_bytes": physical["free_bytes"], "low_watermark_bytes": physical["low_watermark_bytes"], "target_watermark_bytes": physical["target_watermark_bytes"]}
 			}
 			return map[string]any{
-				"observation_epoch": epoch, "observation_consistent": consistent, "observation_attempts": attempt,
+				"observation_epoch": endEpoch, "observation_consistent": consistent, "observation_attempts": attempt,
 				"observed_at": start, "up": nativeUp, "draining": draining, "admission_ready": admissionReady,
 				"resources": resourcesValue, "capacity": capacityObservation, "ct_cpu": ctCPU,
 				"reclaim_required": reclaimRequired, "disk_admission": diskAdmission,
@@ -3936,6 +3995,30 @@ func (s *Service) diskAdmissionSufficientWithFloor(_ context.Context, admission 
 	return true, nil
 }
 
+func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, excludeTaskID string, minimumFreeBytes int64) (bool, error) {
+	tasks, err := s.Store.ListTasks(ctx)
+	if err != nil {
+		return false, s.sqliteError(err)
+	}
+	for _, task := range tasks {
+		if task.TaskID == excludeTaskID || task.State != stateCached {
+			continue
+		}
+		cleanupRequest := protocol.Request{"session_id": task.SessionID, "generation": task.Generation}
+		if _, releaseErr := s.release(withInternalCleanup(ctx), cleanupRequest, true); releaseErr != nil {
+			continue
+		}
+		admission, admissionErr := s.diskAdmission(ctx, excludeTaskID)
+		if admissionErr != nil {
+			return false, admissionErr
+		}
+		if sufficient, sufficientErr := s.diskAdmissionSufficientWithFloor(ctx, admission, requestCost, excludeTaskID, minimumFreeBytes); sufficientErr == nil && sufficient {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *Service) admissionStorageCost(ctx context.Context, excludeTaskID string, requested map[string]int64, startup bool) (int64, error) {
 	if !startup {
 		current, err := s.Store.GetTask(ctx, map[string]any{"task_id": excludeTaskID})
@@ -4059,6 +4142,19 @@ func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64
 			return costErr
 		}
 		if _, sufficientErr := s.diskAdmissionSufficient(ctx, diskAdmission, requestCost, excludeTaskID); sufficientErr != nil {
+			control := protocol.AsError(sufficientErr)
+			if control.Code == "resource_insufficient" {
+				if reclaimed, reclaimErr := s.reclaimCachedCapacity(ctx, requestCost, excludeTaskID, 0); reclaimErr != nil {
+					return reclaimErr
+				} else if reclaimed {
+					if startup {
+						if err := s.checkStartupPressure(ctx, used["cpu"], requested["cpu"]); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+			}
 			return sufficientErr
 		}
 	}

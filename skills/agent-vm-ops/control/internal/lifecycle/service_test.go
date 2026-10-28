@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -33,10 +34,12 @@ type staticCPUObserver struct {
 type capacityGuest struct {
 	*startupGuest
 	capacity        native.StorageCapacity
+	capacityFunc    func() native.StorageCapacity
 	capacityErr     error
 	probeErr        error
 	capacityEntered chan struct{}
 	capacityRelease <-chan struct{}
+	probeHook       func()
 	capacityMu      sync.Mutex
 	capacityCalls   int
 }
@@ -51,10 +54,18 @@ func (guest *capacityGuest) StoragePoolCapacity(context.Context) (native.Storage
 	if guest.capacityRelease != nil {
 		<-guest.capacityRelease
 	}
+	if guest.capacityFunc != nil {
+		return guest.capacityFunc(), guest.capacityErr
+	}
 	return guest.capacity, guest.capacityErr
 }
 
-func (guest *capacityGuest) Probe(context.Context) error { return guest.probeErr }
+func (guest *capacityGuest) Probe(context.Context) error {
+	if guest.probeHook != nil {
+		guest.probeHook()
+	}
+	return guest.probeErr
+}
 
 type startupGuest struct {
 	initErr      error
@@ -67,11 +78,19 @@ type startupGuest struct {
 	configErr    error
 	configSetErr error
 	deviceSetErr error
+	initEntered  chan<- struct{}
+	initRelease  <-chan struct{}
 	stopErr      error
 	deviceSets   []string
 }
 
 func (guest *startupGuest) Init(_ context.Context, _, _ string, ownership map[string]string) error {
+	if guest.initEntered != nil {
+		guest.initEntered <- struct{}{}
+	}
+	if guest.initRelease != nil {
+		<-guest.initRelease
+	}
 	if guest.config != nil {
 		config := guest.config["config"].(map[string]any)
 		for key, value := range ownership {
@@ -187,6 +206,43 @@ func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
 	if control := protocol.AsError(err); control.Code != "draining" {
 		t.Fatalf("drain error = %#v", control)
 	}
+}
+
+func TestAcquirePersistsPhysicalReservationWhilePreparing(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.VMIPStart = "10.0.0.2"
+	cfg.VMIPEnd = "10.0.0.254"
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{initEntered: entered, initRelease: release},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024},
+	}
+	service := New(store, cfg, Options{Guest: guest})
+	service.MarkReady()
+	result := make(chan error, 1)
+	go func() {
+		_, dispatchErr := service.Dispatch(context.Background(), protocol.Request{
+			"protocol": protocol.Version, "action": "acquire", "session_id": "preparing-reservation", "generation": int64(0), "operation_id": "preparing-reservation-acquire",
+		})
+		result <- dispatchErr
+	}()
+	<-entered
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": "preparing-reservation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil || task.State != statePreparing || task.ReservationBytes != cfg.CreateCostBytes {
+		t.Fatalf("preparing task reservation = %#v", task)
+	}
+	close(release)
+	<-result
 }
 
 func TestReleaseDrainExitClaimsLegacyOwnerlessFence(t *testing.T) {
@@ -947,6 +1003,145 @@ func TestAdminMetricsDefaultAdmissionMatchesPhysicalRejection(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("physical default admission reasons = %#v", reasons)
+	}
+}
+
+func TestAdmissionReclaimsCachedCapacityBeforeRejectingPhysicalSpace(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "reclaimable-cache", SessionID: "reclaimable-cache-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-reclaimable-cache", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{
+			status: "Stopped",
+			config: map[string]any{
+				"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "reclaimable-cache", "user.agent-vm.session": "reclaimable-cache-session", "user.agent-vm.generation": "1"},
+				"devices": map[string]any{}, "expanded_devices": map[string]any{},
+			},
+		},
+		capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 25 * gib},
+	}
+	cfg := config.Defaults()
+	cfg.DiskLowBytes = 20 * gib
+	cfg.DiskTargetBytes = 30 * gib
+	cfg.CreateCostBytes = 10 * gib
+	service := New(store, cfg, Options{Guest: guest, Clock: func() time.Time { return now }})
+	guest.capacityFunc = func() native.StorageCapacity {
+		if guest.deleteCalls > 0 {
+			return native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 60 * gib}
+		}
+		return guest.capacity
+	}
+	if err := service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if guest.deleteCalls != 1 {
+		t.Fatalf("cached delete calls = %d", guest.deleteCalls)
+	}
+	if task, err := store.GetTask(context.Background(), map[string]any{"task_id": "reclaimable-cache"}); err != nil || task != nil {
+		t.Fatalf("reclaimed task = %#v err=%v", task, err)
+	}
+}
+
+func TestInconsistentAdminMetricsCannotReportReady(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	calls := 0
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024},
+		probeHook: func() {
+			calls++
+			if err := store.SetMeta(context.Background(), "probe_epoch", fmt.Sprintf("%d", calls)); err != nil {
+				t.Fatalf("probe epoch = %v", err)
+			}
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls == 0 {
+		t.Fatal("native probe hook was not called")
+	}
+	if metrics["observation_consistent"] != false {
+		t.Fatalf("observation consistency = %#v", metrics["observation_consistent"])
+	}
+	if metrics["admission_ready"] != false {
+		t.Fatalf("admission ready = %#v", metrics["admission_ready"])
+	}
+	defaultAdmission := metrics["default_admission"].(map[string]any)
+	if defaultAdmission["ready"] != false {
+		t.Fatalf("default admission = %#v", defaultAdmission)
+	}
+	doctor := metrics["doctor"].(map[string]any)
+	if doctor["ready"] != false {
+		t.Fatalf("doctor = %#v", doctor)
+	}
+}
+
+func TestFailedSnapshotRefreshInvalidatesPreviousSource(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	snapshots := observe.NewSnapshotStore(filepath.Join(t.TempDir(), "metrics"))
+	service := New(store, config.Defaults(), Options{Snapshots: snapshots})
+	if err := snapshots.Publish("capacity", map[string]any{"up": true, "resources": map[string]any{"allocated": map[string]any{"cpu": int64(2)}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.publishSnapshotFailure("admin-metrics", protocol.NewError("resource_unverified", "capacity unavailable", nil)); err != nil {
+		t.Fatal(err)
+	}
+	capacity, err := snapshots.Read("capacity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(capacity), `"up":false`) {
+		t.Fatalf("failed capacity snapshot = %s", capacity)
+	}
+	capacityMetrics, err := os.ReadFile(filepath.Join(snapshots.Directory, "capacity.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(capacityMetrics), "agent_vm_capacity_up 0") || strings.Contains(string(capacityMetrics), "agent_vm_admission_cpu_allocated_vcpu") {
+		t.Fatalf("failed capacity metrics = %s", capacityMetrics)
+	}
+	if err := snapshots.Publish("inventory", map[string]any{"up": true, "tasks": []any{map[string]any{"task_id": "stale"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.publishSnapshotFailure("admin-status", protocol.NewError("sqlite_unavailable", "inventory unavailable", nil)); err != nil {
+		t.Fatal(err)
+	}
+	inventory, err := snapshots.Read("inventory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(inventory), `"tasks":[]`) {
+		t.Fatalf("failed inventory snapshot retained tasks = %s", inventory)
+	}
+	inventoryMetrics, err := os.ReadFile(filepath.Join(snapshots.Directory, "inventory.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(inventoryMetrics), "agent_vm_inventory_up 0") || strings.Contains(string(inventoryMetrics), "task_info") {
+		t.Fatalf("failed inventory metrics = %s", inventoryMetrics)
 	}
 }
 
