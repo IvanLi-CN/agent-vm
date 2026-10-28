@@ -814,6 +814,44 @@ func (s *Store) TransitionManagementOperationUnlessDraining(ctx context.Context,
 	return value, claimed, err
 }
 
+// TransitionManagementOperationUnlessReleaseDraining fences maintenance work
+// once a release transaction owns the durable admission drain. Browser-led
+// maintenance may still run during an ownerless or operation-owned drain, but
+// no reconcile/GC native effect may cross the release activation boundary
+// after the wrapper has observed convergence.
+func (s *Store) TransitionManagementOperationUnlessReleaseDraining(ctx context.Context, operationID, expectedStatus, phase, status string) (*ManagementOperation, bool, error) {
+	var value *ManagementOperation
+	claimed := false
+	err := s.withWrite(ctx, func(tx *Tx) error {
+		var draining, owner string
+		if err := tx.conn.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = 'draining'").Scan(&draining); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if err := tx.conn.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = 'drain_owner'").Scan(&owner); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if draining == "1" && strings.HasPrefix(owner, "release-") {
+			return errors.New("draining: release activation fence refuses new maintenance effects")
+		}
+		current, err := scanManagementOperation(ctx, tx.conn, operationID)
+		if err != nil {
+			return err
+		}
+		value = current
+		if current.Status != expectedStatus {
+			return nil
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := tx.exec("UPDATE management_operations SET phase = ?, status = ?, updated_at = ? WHERE operation_id = ? AND status = ?", phase, status, now, operationID, expectedStatus); err != nil {
+			return err
+		}
+		value.Phase, value.Status, value.UpdatedAt = phase, status, now
+		claimed = true
+		return nil
+	})
+	return value, claimed, err
+}
+
 func (s *Store) Capabilities(ctx context.Context) ([]ManagementCapability, error) {
 	var values []ManagementCapability
 	err := s.withRead(ctx, func(conn *sql.Conn) error {

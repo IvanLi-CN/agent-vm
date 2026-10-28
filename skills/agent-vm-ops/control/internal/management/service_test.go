@@ -66,8 +66,9 @@ func (backend *partialImageBackend) ImportLocal(context.Context, string, []byte,
 }
 
 type fakeActionBackend struct {
-	vmCalls int
-	err     error
+	vmCalls          int
+	maintenanceCalls int
+	err              error
 }
 
 func (backend *fakeActionBackend) ExecuteVMAction(context.Context, string, string, string, int64, map[string]any) (map[string]any, error) {
@@ -76,6 +77,7 @@ func (backend *fakeActionBackend) ExecuteVMAction(context.Context, string, strin
 }
 
 func (backend *fakeActionBackend) ExecuteMaintenance(context.Context, string, string, map[string]any) (map[string]any, error) {
+	backend.maintenanceCalls++
 	return map[string]any{"state": "changed"}, backend.err
 }
 
@@ -602,6 +604,36 @@ func TestMaintenanceDoesNotBecomeStaleFromItsOwnJournalWrites(t *testing.T) {
 	}
 	if operation.Status != "succeeded" {
 		t.Fatalf("operation = %#v", operation)
+	}
+}
+
+func TestMaintenanceCannotCrossReleaseActivationDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.SetMeta(context.Background(), "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(context.Background(), "drain_owner", "release-tx-123"); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeActionBackend{}
+	service := New(store, Options{Actions: backend, CurrentSystemVersion: func(context.Context) (string, error) { return "system:initial", nil }})
+	_, err = service.ExecuteMaintenance(context.Background(), MaintenanceRequest{OperationID: "maintenance-release-fence", Actor: "admin", Reason: "release fence", TargetVersion: "system:initial", Action: "reconcile"})
+	if err == nil || !strings.Contains(err.Error(), "draining: release activation fence") {
+		t.Fatalf("maintenance fence error = %v", err)
+	}
+	if backend.maintenanceCalls != 0 {
+		t.Fatalf("maintenance backend was invoked: %#v", backend)
+	}
+	queued, err := store.GetManagementOperation(context.Background(), "maintenance-release-fence")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if queued == nil || queued.Status != "queued" {
+		t.Fatalf("fenced operation = %#v, want queued", queued)
 	}
 }
 

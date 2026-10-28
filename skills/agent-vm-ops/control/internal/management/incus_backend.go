@@ -36,6 +36,14 @@ func (backend *IncusImageBackend) ImportTrusted(ctx context.Context, sourceID, e
 		return ImageArtifact{}, errors.New("authority_unavailable: image backend is not configured")
 	}
 	if err := backend.Client.CopyImage(ctx, sourceID, expectedFingerprint); err != nil {
+		// CopyImage reports native execution failures as uncertain because the
+		// daemon may have committed the image before the transport failed. Keep
+		// the trusted target fingerprint so the service can attempt bounded
+		// cleanup and expose recovery evidence. Deterministic input failures do
+		// not identify an imported artifact and remain empty.
+		if isUncertain(err) {
+			return ImageArtifact{Fingerprint: expectedFingerprint}, err
+		}
 		return ImageArtifact{}, err
 	}
 	return backend.artifact(ctx, expectedFingerprint)

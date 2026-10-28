@@ -348,7 +348,7 @@ func validateProduct(root map[string]any, directory string) error {
 	if !formatOK || (format != LegacyProductFormat && format != ProductFormat) {
 		return fmt.Errorf("manifest_format_unsupported: manifest format must be %d or %d", LegacyProductFormat, ProductFormat)
 	}
-	expectedKeys := []string{"actions", "artifacts", "client_view", "format", "protocol", "source_revision", "target", "toolchain", "version"}
+	expectedKeys := []string{"actions", "artifacts", "client_view", "format", "protocol", "release_id", "source_revision", "target", "toolchain", "version"}
 	if format == ProductFormat {
 		expectedKeys = append(expectedKeys, "state_compatibility")
 	}
@@ -363,7 +363,8 @@ func validateProduct(root map[string]any, directory string) error {
 		return fmt.Errorf("manifest_invalid: product version must be valid SemVer 2.0.0")
 	}
 	source, ok := root["source_revision"].(string)
-	if !ok || !revisionPattern.MatchString(source) {
+	releaseID, releaseOK := root["release_id"].(string)
+	if !ok || !revisionPattern.MatchString(source) || !releaseOK || releaseID != source {
 		return fmt.Errorf("manifest_invalid: source revision is invalid")
 	}
 	if err := validateProductTarget(root["target"]); err != nil {

@@ -106,7 +106,7 @@ func validProductManifest(t *testing.T) string {
 		actions[action] = operationSpec()
 	}
 	rootValue := map[string]any{
-		"format": 3, "version": "1.0.0", "source_revision": strings.Repeat("b", 40), "protocol": 4,
+		"format": 3, "version": "1.0.0", "release_id": strings.Repeat("b", 40), "source_revision": strings.Repeat("b", 40), "protocol": 4,
 		"target":      map[string]any{"os": "linux", "arch": runtime.GOARCH},
 		"toolchain":   map[string]any{"bun": "1.4.4", "go": GoToolchain, "cgo_enabled": false},
 		"artifacts":   artifacts,

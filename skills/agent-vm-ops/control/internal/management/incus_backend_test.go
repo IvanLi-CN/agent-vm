@@ -16,13 +16,14 @@ type fakeIncusImageClient struct {
 	info         native.ImageInfo
 	verification native.ImageVerification
 	remoteSize   int64
+	copyErr      error
 	queryErr     error
 	verifyErr    error
 }
 
 func (client *fakeIncusImageClient) CopyImage(_ context.Context, sourceID, fingerprint string) error {
 	client.calls = append(client.calls, "copy:"+sourceID+":"+fingerprint)
-	return nil
+	return client.copyErr
 }
 
 func (client *fakeIncusImageClient) QueryRemoteImageSize(_ context.Context, sourceID, fingerprint string) (int64, error) {
@@ -146,6 +147,16 @@ func TestIncusImageBackendMarksPostImportReadFailuresUncertain(t *testing.T) {
 	artifact, err = backend.ImportTrusted(context.Background(), "approved", fingerprint)
 	if err == nil || !isUncertain(err) || artifact.Fingerprint != fingerprint {
 		t.Fatalf("verification failure artifact=%#v err=%v", artifact, err)
+	}
+}
+
+func TestIncusImageBackendPreservesTrustedFingerprintOnUncertainCopy(t *testing.T) {
+	fingerprint := strings.Repeat("a", 64)
+	client := &fakeIncusImageClient{copyErr: &native.UncertainError{Cause: errors.New("copy timed out")}}
+	backend := NewIncusImageBackend(client, "/var/lib/agent-vm-native/staging", nil)
+	artifact, err := backend.ImportTrusted(context.Background(), "approved", fingerprint)
+	if err == nil || !isUncertain(err) || artifact.Fingerprint != fingerprint {
+		t.Fatalf("uncertain copy artifact=%#v err=%v", artifact, err)
 	}
 }
 

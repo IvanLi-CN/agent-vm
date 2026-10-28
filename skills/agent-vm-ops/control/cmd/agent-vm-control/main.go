@@ -111,22 +111,28 @@ func serve(args []string) error {
 		return err
 	}
 	defer store.Close()
-	if err := webadmin.CleanupUploadStaging(cfg.Management.Upload.StagingPath); err != nil {
-		return fmt.Errorf("clean upload staging: %w", err)
+	managementStateSupported := len(release.StateReads) > 0 && len(release.StateWrites) > 0
+	if cfg.Management.Enabled && !managementStateSupported {
+		return errors.New("management_disabled: installed release does not declare management state compatibility")
 	}
-	if err := store.SeedLegacyImage(context.Background(), cfg.ImageFingerprint); err != nil {
-		return fmt.Errorf("initialize managed image catalog: %w", err)
-	}
-	capabilities, err := store.Capabilities(context.Background())
-	if err != nil {
-		return fmt.Errorf("read state capabilities: %w", err)
-	}
-	capabilityNames := make([]string, 0, len(capabilities))
-	for _, capability := range capabilities {
-		capabilityNames = append(capabilityNames, capability.Name+"@"+strconv.FormatInt(capability.Version, 10))
-	}
-	if err := manifest.ValidateStateCapabilities(release, capabilityNames); err != nil {
-		return err
+	if managementStateSupported {
+		if err := webadmin.CleanupUploadStaging(cfg.Management.Upload.StagingPath); err != nil {
+			return fmt.Errorf("clean upload staging: %w", err)
+		}
+		if err := store.SeedLegacyImage(context.Background(), cfg.ImageFingerprint); err != nil {
+			return fmt.Errorf("initialize managed image catalog: %w", err)
+		}
+		capabilities, err := store.Capabilities(context.Background())
+		if err != nil {
+			return fmt.Errorf("read state capabilities: %w", err)
+		}
+		capabilityNames := make([]string, 0, len(capabilities))
+		for _, capability := range capabilities {
+			capabilityNames = append(capabilityNames, capability.Name+"@"+strconv.FormatInt(capability.Version, 10))
+		}
+		if err := manifest.ValidateStateCapabilities(release, capabilityNames); err != nil {
+			return err
+		}
 	}
 	runner := native.NewRunner()
 	guest := native.NewIncusClient(runner, cfg.Project, native.ClientOptions{Profile: cfg.Profile, Network: cfg.Network, Pool: cfg.Pool})
@@ -187,9 +193,12 @@ func serve(args []string) error {
 			return availableStagingBytes(cfg.Management.Upload.StagingPath)
 		}
 	}
-	managementService := management.New(store, managementOptions)
-	if err := managementService.RecoverPendingOperations(ctx); err != nil {
-		return fmt.Errorf("recover management operations: %w", err)
+	var managementService *management.Service
+	if cfg.Management.Enabled {
+		managementService = management.New(store, managementOptions)
+		if err := managementService.RecoverPendingOperations(ctx); err != nil {
+			return fmt.Errorf("recover management operations: %w", err)
+		}
 	}
 	if cfg.Management.Enabled {
 		authority, authorityErr := webadmin.NewAuthority(webadmin.AuthorityOptions{

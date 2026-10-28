@@ -39,10 +39,8 @@ function sha256(path: string): string {
 }
 
 export function releaseBuilderCommand(version: string, source: string, targetName: string, output: string): string[] {
-  const builder = targetName === "client" ? "build_product_release.ts" : "build_go_release.ts";
-  const builderArgs = targetName === "client"
-    ? ["--version", version, "--source-revision", source, "--target", targetName]
-    : ["--source-revision", source, "--target", targetName];
+  const builder = "build_product_release.ts";
+  const builderArgs = ["--version", version, "--source-revision", source, "--target", targetName];
   return [
     process.execPath,
     join(import.meta.dir, builder),

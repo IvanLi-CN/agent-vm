@@ -1417,6 +1417,11 @@ components:
               minimum: 0
             affected_references:
               $ref: "#/components/schemas/ImageReferenceCounts"
+            imported_fingerprint:
+              $ref: "#/components/schemas/Fingerprint"
+            cleanup:
+              type: string
+              enum: [verified, unverified, blocked_catalog_unverified, backend_unavailable]
             retry_after_seconds:
               type: [integer, "null"]
               minimum: 0

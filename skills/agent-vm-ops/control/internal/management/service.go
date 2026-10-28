@@ -1115,10 +1115,16 @@ func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceReq
 	if err != nil {
 		return nil, err
 	}
-	// Maintenance actions are intentionally executable while admission is
-	// drained: release drain enter/exit, reconciliation and GC are the
-	// controlled work needed to establish or verify the fence itself.
-	running, claimed, err := s.Store.TransitionManagementOperation(ctx, request.OperationID, "queued", "native_action", "running")
+	// Drain entry is itself the controlled fence. Reconcile and GC remain
+	// available during a browser/ownerless drain, but once a release owns the
+	// fence they must not cross the wrapper's final convergence observation.
+	var running *state.ManagementOperation
+	var claimed bool
+	if request.Action == "reconcile" || request.Action == "gc" {
+		running, claimed, err = s.Store.TransitionManagementOperationUnlessReleaseDraining(ctx, request.OperationID, "queued", "native_action", "running")
+	} else {
+		running, claimed, err = s.Store.TransitionManagementOperation(ctx, request.OperationID, "queued", "native_action", "running")
+	}
 	if err != nil {
 		return nil, err
 	}
