@@ -1,6 +1,7 @@
 package lifecycle
 
 import (
+	"bytes"
 	"context"
 	crand "crypto/rand"
 	"crypto/sha256"
@@ -2118,6 +2119,10 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 	if err := s.checkAdmission(ctx, target, task.TaskID, false); err != nil {
 		return nil, err
 	}
+	reservationBytes, err := s.admissionStorageCost(ctx, task.TaskID, target, false)
+	if err != nil {
+		return nil, err
+	}
 	if requestBool(request, "live_memory") && (request["cpu"] != nil || request["disk_gib"] != nil) {
 		return nil, protocol.NewError("invalid_request", "live resize requires memory only", nil)
 	}
@@ -2126,7 +2131,7 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 	}
 	reservationJSON := mustJSON(target)
 	reservationNow := s.Clock()
-	reserved, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &reservationNow}, map[string]any{"resource_reservation_json": reservationJSON, "updated_at": nowString(reservationNow)})
+	reserved, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &reservationNow}, map[string]any{"resource_reservation_json": reservationJSON, "reservation_bytes": reservationBytes, "updated_at": nowString(reservationNow)})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
@@ -2563,9 +2568,11 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			if cpuObservationErr != nil {
 				warnings = append(warnings, map[string]any{"code": "resource_unverified", "message": "CT CPU pressure observation is not verified", "detail": map[string]any{"cause": cpuObservationErr.Error()}})
 			}
-			nativeUp := true
+			nativeUp := false
 			var nativeProbeErr error
-			if s.Guest != nil {
+			if s.Guest == nil {
+				nativeProbeErr = errors.New("native guest client is unavailable")
+			} else {
 				probe, probeOK := s.Guest.(native.HealthProbe)
 				if !probeOK {
 					nativeProbeErr = errors.New("native guest does not expose a health probe")
@@ -2573,6 +2580,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 					probeCtx, probeCancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 					nativeProbeErr = probe.Probe(probeCtx)
 					probeCancel()
+					if nativeProbeErr == nil {
+						nativeUp = true
+					}
 				}
 			}
 			if nativeProbeErr != nil {
@@ -3907,13 +3917,18 @@ func (s *Service) admissionStorageCost(ctx context.Context, excludeTaskID string
 			return 0, s.sqliteError(err)
 		}
 		if current != nil {
+			if current.ReservationBytes < 0 {
+				return 0, protocol.NewError("resource_unverified", "current physical reservation cannot be verified", map[string]any{"task_id": current.TaskID, "verified": false})
+			}
 			resources, resourceErr := decodeResourceMap(current.ResourcesJSON, "current task resources", false)
 			if resourceErr != nil {
 				return 0, protocol.NewError("resource_unverified", "current task resources cannot be verified", map[string]any{"task_id": current.TaskID, "verified": false})
 			}
+			cost := int64(0)
 			if requested["disk_gib"] > resources["disk_gib"] {
-				return s.Config.ResizeCostBytes, nil
+				cost = s.Config.ResizeCostBytes
 			}
+			return maxInt64(current.ReservationBytes, cost), nil
 		}
 		return 0, nil
 	}
@@ -3925,6 +3940,9 @@ func (s *Service) admissionStorageCost(ctx context.Context, excludeTaskID string
 		return 0, s.sqliteError(err)
 	}
 	if task != nil && task.State == stateCached {
+		if task.ReservationBytes < 0 {
+			return 0, protocol.NewError("resource_unverified", "cached physical reservation cannot be verified", map[string]any{"task_id": task.TaskID, "verified": false})
+		}
 		cost := s.Config.ResumeCostBytes
 		resources, resourceErr := decodeResourceMap(task.ResourcesJSON, "cached task resources", false)
 		if resourceErr != nil {
@@ -3936,7 +3954,7 @@ func (s *Service) admissionStorageCost(ctx context.Context, excludeTaskID string
 			}
 			cost += s.Config.ResizeCostBytes
 		}
-		return cost, nil
+		return maxInt64(task.ReservationBytes, cost), nil
 	}
 	if task != nil && (task.State == stateActive || task.State == statePreparing) {
 		return 0, nil
@@ -4053,7 +4071,7 @@ func (s *Service) startupPressureDetail(observation observe.CPUObservation, allo
 	if !projectedOK {
 		detail["projected_cpu"] = nil
 		detail["physically_oversubscribed"] = nil
-		detail["startup_blocked"] = false
+		detail["startup_blocked"] = nil
 		return detail
 	}
 	detail["projected_cpu"] = projectedCPU
@@ -4066,18 +4084,24 @@ func decodeResourceMap(raw, label string, allowEmpty bool) (map[string]int64, er
 	if allowEmpty && (strings.TrimSpace(raw) == "" || strings.TrimSpace(raw) == "{}") {
 		return map[string]int64{}, nil
 	}
-	result := map[string]int64{}
-	if err := json.Unmarshal([]byte(raw), &result); err != nil || result == nil {
+	var rawResult map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &rawResult); err != nil || rawResult == nil {
 		return nil, fmt.Errorf("%s is not a JSON object", label)
 	}
-	if len(result) != len(resourceKeys) {
+	if len(rawResult) != len(resourceKeys) {
 		return nil, fmt.Errorf("%s is incomplete", label)
 	}
+	result := make(map[string]int64, len(resourceKeys))
 	for _, key := range resourceKeys {
-		value, ok := result[key]
-		if !ok || value < 0 {
+		rawValue, ok := rawResult[key]
+		if !ok || bytes.Equal(bytes.TrimSpace(rawValue), []byte("null")) {
 			return nil, fmt.Errorf("%s has an invalid %s value", label, key)
 		}
+		var value int64
+		if err := json.Unmarshal(rawValue, &value); err != nil || value < 0 {
+			return nil, fmt.Errorf("%s has an invalid %s value", label, key)
+		}
+		result[key] = value
 	}
 	return result, nil
 }

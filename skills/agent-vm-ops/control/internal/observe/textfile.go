@@ -121,9 +121,9 @@ func snapshotMetrics(source string, value any) map[string]string {
 		"agent_vm_" + source + "_scrape_timestamp_seconds": fmt.Sprintf("agent_vm_%s_scrape_timestamp_seconds %d", source, observed),
 	}
 	if source == "capacity" {
-		result["agent_vm_admission_ready"] = fmt.Sprintf("agent_vm_admission_ready %d", boolNumber(object["admission_ready"], false))
-		result["agent_vm_admission_draining"] = fmt.Sprintf("agent_vm_admission_draining %d", boolNumber(object["draining"], false))
-		result["agent_vm_observation_consistent"] = fmt.Sprintf("agent_vm_observation_consistent %d", boolNumber(object["observation_consistent"], false))
+		addBoolMetricIfPresent(result, "agent_vm_admission_ready", object, "admission_ready")
+		addBoolMetricIfPresent(result, "agent_vm_admission_draining", object, "draining")
+		addBoolMetricIfPresent(result, "agent_vm_observation_consistent", object, "observation_consistent")
 		if resources, ok := objectMap(object["resources"]); ok {
 			addResourceMetric(result, "cpu", "cpu", resources, "vcpu", 1)
 			addResourceMetric(result, "memory", "memory_mib", resources, "bytes", 1024*1024)
@@ -162,7 +162,9 @@ func snapshotMetrics(source string, value any) map[string]string {
 			}
 			if startup, ok := objectMap(cpu["startup_pressure"]); ok {
 				addMetric(result, "agent_vm_cpu_startup_pressure_threshold_percent", startup["threshold_full_avg10_percent"], 1)
-				addMetric(result, "agent_vm_cpu_startup_blocked", startup["startup_blocked"], 1)
+				if startup["verified"] == true {
+					addMetric(result, "agent_vm_cpu_startup_blocked", startup["startup_blocked"], 1)
+				}
 			}
 		}
 		if memory, ok := objectMap(object["ct_memory"]); ok {
@@ -203,9 +205,17 @@ func snapshotMetrics(source string, value any) map[string]string {
 	}
 	if source == "health" {
 		result["agent_vm_up"] = fmt.Sprintf("agent_vm_up %d", up)
-		result["agent_vm_health_ready"] = fmt.Sprintf("agent_vm_health_ready %d", boolNumber(object["ready"], false))
+		addBoolMetricIfPresent(result, "agent_vm_health_ready", object, "ready")
 	}
 	return result
+}
+
+func addBoolMetricIfPresent(result map[string]string, name string, object map[string]any, key string) {
+	value, ok := object[key].(bool)
+	if !ok {
+		return
+	}
+	result[name] = fmt.Sprintf("%s %d", name, boolNumber(value, false))
 }
 
 func normalizedSnapshotObject(value any) map[string]any {

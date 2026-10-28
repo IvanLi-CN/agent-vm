@@ -2,6 +2,7 @@ package native
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -204,6 +205,33 @@ printf '%s\n' '{"name":"agents","driver":"dir","config":{"source":"'"$INCUS_STOR
 	want := []string{"query", "/1.0/storage-pools/agents?project=default"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("incus argv = %#v, want %#v", got, want)
+	}
+}
+
+func TestIncusStoragePoolCapacityFailsClosedOnUnverifiedPool(t *testing.T) {
+	cases := []struct {
+		name        string
+		storagePath string
+		response    string
+	}{
+		{name: "missing source path", storagePath: "", response: `{"name":"agents","driver":"dir","config":{"source":""}}`},
+		{name: "wrong pool name", storagePath: "/configured", response: `{"name":"other","driver":"dir","config":{"source":"/configured"}}`},
+		{name: "wrong driver", storagePath: "/configured", response: `{"name":"agents","driver":"zfs","config":{"source":"/configured"}}`},
+		{name: "wrong source", storagePath: "/configured", response: `{"name":"agents","driver":"dir","config":{"source":"/other"}}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' '%s'\n", tc.response)
+			if err := os.WriteFile(filepath.Join(binDir, "incus"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			client := NewIncusClient(NewRunner(), "agents", ClientOptions{Pool: "agents", StoragePath: tc.storagePath})
+			if _, err := client.StoragePoolCapacity(context.Background()); err == nil {
+				t.Fatal("unverified storage pool was accepted")
+			}
+		})
 	}
 }
 
