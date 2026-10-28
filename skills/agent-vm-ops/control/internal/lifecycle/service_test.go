@@ -1966,3 +1966,95 @@ func TestReconcileClosingDestroyRejectsUnmarkedInstance(t *testing.T) {
 		t.Fatalf("operation=%#v, error=%v", op, err)
 	}
 }
+
+func TestNotReadyAcquireIsRecordedAsDefinitiveError(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, config.Defaults(), Options{Resident: true})
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "not-ready-session", "generation": int64(0), "operation_id": "not-ready-acquire"}
+	_, err = service.Dispatch(context.Background(), request)
+	if protocol.AsError(err).Code != "startup_reconcile_required" {
+		t.Fatalf("acquire error = %v", err)
+	}
+	op, err := store.GetOperation(context.Background(), "not-ready-acquire")
+	if err != nil || op == nil || op.Response["outcome"] != "error" {
+		t.Fatalf("rejected acquire left pending: %#v, %v", op, err)
+	}
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending = %#v, error = %v", pending, err)
+	}
+}
+
+func TestStartupRecoversExplicitlyUnattemptedAcquire(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	session := "pre-start-session"
+	generation := int64(0)
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": "pre-start-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(context.Background(), "pre-start-acquire", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": map[string]any{"state": "starting", "start_attempted": false}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Guest: &startupGuest{configErr: missingInstanceError()}, Resident: true})
+	if err := service.StartupReconcile(context.Background()); err != nil {
+		t.Fatalf("startup: %v", err)
+	}
+	op, err := store.GetOperation(context.Background(), "pre-start-acquire")
+	if err != nil || op == nil || op.Response["outcome"] != "error" {
+		t.Fatalf("operation=%#v, error=%v", op, err)
+	}
+}
+
+func TestWorkerRecoveryDoesNotAssumeLegacyOrContradictoryStartWasSafe(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		worker map[string]any
+		active bool
+	}{
+		{"legacy", map[string]any{"state": "starting"}, false},
+		{"identity-present", map[string]any{"state": "starting", "start_attempted": false, "pid": int64(12)}, false},
+		{"active", map[string]any{"state": "starting", "start_attempted": false}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			session := "start-" + tc.name
+			generation := int64(0)
+			if err := store.RecordOperation(context.Background(), tc.name, "acquire", &session, &generation, map[string]any{"outcome": "pending", "worker": tc.worker}); err != nil {
+				t.Fatal(err)
+			}
+			service := New(store, config.Defaults(), Options{})
+			if tc.active {
+				done := service.markOperationActive(tc.name)
+				defer done()
+			}
+			pending, err := store.PendingOperations(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.reconcilePendingWorkers(context.Background(), pending); err != nil {
+				t.Fatal(err)
+			}
+			op, err := store.GetOperation(context.Background(), tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if worker := op.Response["worker"].(map[string]any); worker["state"] != "starting" {
+				t.Fatalf("unexpected worker recovery: %#v", worker)
+			}
+		})
+	}
+}

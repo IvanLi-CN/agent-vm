@@ -406,8 +406,22 @@ func (s *Service) reconcilePendingWorker(ctx context.Context, operationID string
 	if !ok {
 		return nil
 	}
-	if stringValue(worker["state"]) == "starting" && boolValue(worker["start_attempted"]) {
-		return protocol.NewError("state_unverified", "pending native worker start has no durable identity", map[string]any{"operation_id": operation.OperationID})
+	if stringValue(worker["state"]) == "starting" {
+		attempted, explicit := worker["start_attempted"].(bool)
+		_, hasPID := worker["pid"]
+		_, hasStart := worker["start_time"]
+		_, hasGroup := worker["process_group"]
+		if explicit && !attempted && !hasPID && !hasStart && !hasGroup {
+			worker["state"] = "exited"
+			worker["observed_at"] = nowString(s.Clock())
+			if err := s.recordWorkerState(ctx, operation.OperationID, worker); err != nil {
+				return s.sqliteError(err)
+			}
+			return nil
+		}
+		if attempted {
+			return protocol.NewError("state_unverified", "pending native worker start has no durable identity", map[string]any{"operation_id": operation.OperationID})
+		}
 	}
 	if stringValue(worker["state"]) != "running" && !(stringValue(worker["state"]) == "finished" && stringValue(worker["error"]) != "") {
 		return nil
@@ -590,7 +604,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		// window before WorkerStarted must remain fail-closed and must not become a
 		// replayable operation.
 		if operationHasNativeEffect(action) {
-			pending["worker"] = map[string]any{"state": "starting", "prepared_at": nowString(s.Clock())}
+			pending["worker"] = map[string]any{"state": "starting", "start_attempted": false, "prepared_at": nowString(s.Clock())}
 		}
 		generation := intValue(request["generation"])
 		session := optionalString(request["session_id"])
@@ -1003,7 +1017,7 @@ func (s *Service) status(ctx context.Context, session string) (map[string]any, e
 
 func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[string]any, error) {
 	if s.resident && !s.Ready() {
-		return nil, protocol.NewError("startup_reconcile_required", "control service is not ready for admission", nil)
+		return nil, protocol.NewError("startup_reconcile_required", "control service is not ready for admission", map[string]any{"outcome_verified": true})
 	}
 	if draining, err := s.isDraining(ctx); err != nil {
 		return nil, s.sqliteError(err)
