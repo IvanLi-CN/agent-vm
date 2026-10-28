@@ -185,6 +185,21 @@ func (s *Service) lockNamedAction(key string) func() {
 	return lock.Unlock
 }
 
+func (s *Service) trySessionLock(session string) (func(), bool) {
+	s.lockMu.Lock()
+	key := "session:" + session
+	lock, exists := s.actionLocks[key]
+	if !exists {
+		lock = &sync.Mutex{}
+		s.actionLocks[key] = lock
+	}
+	s.lockMu.Unlock()
+	if !lock.TryLock() {
+		return nil, false
+	}
+	return lock.Unlock, true
+}
+
 func (s *Service) withSessionLock(session string, fn func() (map[string]any, error)) (map[string]any, error) {
 	if session == "" {
 		return fn()
@@ -396,7 +411,7 @@ func workerOwnershipUnresolved(worker map[string]any) bool {
 		return false
 	}
 	stateValue := stringValue(worker["state"])
-	return stateValue == "running" || stateValue == "starting" && boolValue(worker["start_attempted"])
+	return stateValue == "running" || stateValue == "starting" && boolValue(worker["start_attempted"]) || stateValue == "finished" && stringValue(worker["error"]) != ""
 }
 
 func workerIdentityMatches(previous, current map[string]any) bool {
@@ -409,59 +424,105 @@ func workerIdentityMatches(previous, current map[string]any) bool {
 
 func (s *Service) reconcilePendingWorkers(ctx context.Context, pending []state.Operation) error {
 	for _, operation := range pending {
-		if s.operationActive(operation.OperationID) {
-			continue
-		}
-		worker, ok := operation.Response["worker"].(map[string]any)
-		if !ok {
-			continue
-		}
-		if stringValue(worker["state"]) == "starting" && boolValue(worker["start_attempted"]) {
-			return protocol.NewError("state_unverified", "pending native worker start has no durable identity", map[string]any{"operation_id": operation.OperationID})
-		}
-		if stringValue(worker["state"]) != "running" {
-			continue
-		}
-		pid, valid := protocol.Integer(worker["pid"])
-		startTime, hasStartTime := worker["start_time"].(string)
-		if !valid || pid <= 0 || !hasStartTime || startTime == "" {
-			return protocol.NewError("state_unverified", "pending operation has an invalid native worker identity", map[string]any{"operation_id": operation.OperationID})
-		}
-		processGroup, validProcessGroup := protocol.Integer(worker["process_group"])
-		if !validProcessGroup || processGroup <= 0 {
-			return protocol.NewError("state_unverified", "pending operation has an invalid native worker identity", map[string]any{"operation_id": operation.OperationID})
-		}
-		identity := native.WorkerIdentity{PID: int(pid), StartTime: startTime, ProcessGroup: int(processGroup)}
-		alive, err := native.WorkerAlive(identity)
-		if err != nil {
-			return protocol.NewError("state_unverified", "pending native worker identity could not be verified", map[string]any{"operation_id": operation.OperationID, "cause": err.Error()})
-		}
-		if alive {
-			if err := native.KillWorker(identity); err != nil {
-				return protocol.NewError("state_unverified", "pending native worker could not be stopped safely", map[string]any{"operation_id": operation.OperationID, "cause": err.Error()})
+		unlock := func() {}
+		if operation.SessionID != nil {
+			var acquired bool
+			unlock, acquired = s.trySessionLock(*operation.SessionID)
+			if !acquired {
+				continue
 			}
-			// KillWorker returns only after the root process group has been
-			// confirmed absent. Keep the operation pending for recovery, but do
-			// not leave a dead worker in a state reconciliation will skip forever.
+		}
+		err := s.reconcilePendingWorker(ctx, operation.OperationID)
+		unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) reconcilePendingWorker(ctx context.Context, operationID string) error {
+	operation, err := s.Store.GetOperation(ctx, operationID)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if operation == nil || stringValue(operation.Response["outcome"]) != "pending" {
+		return nil
+	}
+	if s.operationActive(operation.OperationID) {
+		return nil
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	if stringValue(worker["state"]) == "starting" {
+		attempted, explicit := worker["start_attempted"].(bool)
+		_, hasPID := worker["pid"]
+		_, hasStart := worker["start_time"]
+		_, hasGroup := worker["process_group"]
+		if explicit && !attempted && !hasPID && !hasStart && !hasGroup {
 			worker["state"] = "exited"
 			worker["observed_at"] = nowString(s.Clock())
 			if err := s.recordWorkerState(ctx, operation.OperationID, worker); err != nil {
 				return s.sqliteError(err)
 			}
-			return protocol.NewError("startup_reconcile_required", "a pending native worker was stopped; retry reconciliation before admission", map[string]any{"operation_id": operation.OperationID})
+			return nil
 		}
+		if attempted {
+			return protocol.NewError("state_unverified", "pending native worker start has no durable identity", map[string]any{"operation_id": operation.OperationID})
+		}
+	}
+	if stringValue(worker["state"]) != "running" && !(stringValue(worker["state"]) == "finished" && stringValue(worker["error"]) != "") {
+		return nil
+	}
+	pid, valid := protocol.Integer(worker["pid"])
+	startTime, hasStartTime := worker["start_time"].(string)
+	if !valid || pid <= 0 || !hasStartTime || startTime == "" {
+		return protocol.NewError("state_unverified", "pending operation has an invalid native worker identity", map[string]any{"operation_id": operation.OperationID})
+	}
+	processGroup, validProcessGroup := protocol.Integer(worker["process_group"])
+	if !validProcessGroup || processGroup <= 0 {
+		return protocol.NewError("state_unverified", "pending operation has an invalid native worker identity", map[string]any{"operation_id": operation.OperationID})
+	}
+	identity := native.WorkerIdentity{PID: int(pid), StartTime: startTime, ProcessGroup: int(processGroup)}
+	alive, err := native.WorkerAlive(identity)
+	if err != nil {
+		return protocol.NewError("state_unverified", "pending native worker identity could not be verified", map[string]any{"operation_id": operation.OperationID, "cause": err.Error()})
+	}
+	if alive {
+		if err := native.KillWorker(identity); err != nil {
+			return protocol.NewError("state_unverified", "pending native worker could not be stopped safely", map[string]any{"operation_id": operation.OperationID, "cause": err.Error()})
+		}
+		// KillWorker returns only after the root process group has been
+		// confirmed absent. Keep the operation pending for recovery, but do
+		// not leave a dead worker in a state reconciliation will skip forever.
 		worker["state"] = "exited"
 		worker["observed_at"] = nowString(s.Clock())
 		if err := s.recordWorkerState(ctx, operation.OperationID, worker); err != nil {
 			return s.sqliteError(err)
 		}
+		return protocol.NewError("startup_reconcile_required", "a pending native worker was stopped; retry reconciliation before admission", map[string]any{"operation_id": operation.OperationID})
+	}
+	worker["state"] = "exited"
+	worker["observed_at"] = nowString(s.Clock())
+	if err := s.recordWorkerState(ctx, operation.OperationID, worker); err != nil {
+		return s.sqliteError(err)
 	}
 	return nil
 }
 
 func (s *Service) recoverPending(ctx context.Context, pending []state.Operation) error {
 	var firstErr error
-	for _, operation := range pending {
+	for _, snapshot := range pending {
+		operationPtr, err := s.Store.GetOperation(ctx, snapshot.OperationID)
+		if err != nil {
+			return s.sqliteError(err)
+		}
+		if operationPtr == nil || stringValue(operationPtr.Response["outcome"]) != "pending" {
+			continue
+		}
+		operation := *operationPtr
 		if s.operationActive(operation.OperationID) {
 			continue
 		}
@@ -477,8 +538,26 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 				continue
 			}
 		}
-		if !recoverableOperation(operation.Action) || recoveryAttempts(operation.Response) > 0 && !preStartTimer {
+		if !recoverableOperation(operation.Action) {
 			continue
+		}
+		if recoveryAttempts(operation.Response) > 0 && !preStartTimer {
+			eligible, retryErr := s.mayRetryClearedMaintenance(ctx, operation)
+			if retryErr != nil {
+				return retryErr
+			}
+			if !eligible {
+				continue
+			}
+			if err := s.Store.UpdateOperationResponse(ctx, operation.OperationID, func(response map[string]any) error {
+				if stringValue(response["outcome"]) != "pending" || boolValue(response["_recovery_after_clear_attempted"]) {
+					return errUnresolvedWorker
+				}
+				response["_recovery_after_clear_attempted"] = true
+				return nil
+			}); err != nil {
+				return s.sqliteError(err)
+			}
 		}
 		rawRequest, ok := operation.Response["_request"].(map[string]any)
 		if !ok {
@@ -536,6 +615,53 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 		}
 	}
 	return firstErr
+}
+
+// A blocked maintenance operation may receive one more attempt after all task
+// transitions have cleared and its last native worker is confirmed absent.
+func (s *Service) mayRetryClearedMaintenance(ctx context.Context, operation state.Operation) (bool, error) {
+	if operation.Action != "admin-reconcile" || boolValue(operation.Response["_recovery_after_clear_attempted"]) {
+		return false, nil
+	}
+	raw, ok := operation.Response["_request"].(map[string]any)
+	if !ok {
+		return false, nil
+	}
+	req := protocol.Request(raw)
+	digest, err := protocol.Digest(req)
+	if err != nil || protocol.ValidateRequest(req) != nil || digest != stringValue(operation.Response["_request_digest"]) || stringValue(req["action"]) != operation.Action || stringValue(req["operation_id"]) != operation.OperationID || operation.Generation == nil || intValue(req["generation"]) != *operation.Generation || optionalString(req["session_id"]) != nil && (operation.SessionID == nil || stringValue(req["session_id"]) != *operation.SessionID) {
+		return false, nil
+	}
+	if operation.SessionID != nil && stringValue(req["session_id"]) != *operation.SessionID {
+		return false, nil
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	if !ok || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
+		return false, nil
+	}
+	pid, pidOK := protocol.Integer(worker["pid"])
+	group, groupOK := protocol.Integer(worker["process_group"])
+	start := stringValue(worker["start_time"])
+	if !pidOK || !groupOK || pid <= 0 || group <= 0 || start == "" {
+		return false, nil
+	}
+	alive, err := native.WorkerAlive(native.WorkerIdentity{PID: int(pid), ProcessGroup: int(group), StartTime: start})
+	if err != nil {
+		return false, protocol.NewError("state_unverified", "pending maintenance worker could not be verified", map[string]any{"cause": err.Error()})
+	}
+	if alive {
+		return false, nil
+	}
+	tasks, err := s.Store.ListTasks(ctx)
+	if err != nil {
+		return false, s.sqliteError(err)
+	}
+	for _, task := range tasks {
+		if task.State == statePreparing || task.State == stateClosing || task.State == stateDeleting || task.State == stateFailed {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func recoverableOperation(action string) bool {
@@ -658,7 +784,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		// window before WorkerStarted must remain fail-closed and must not become a
 		// replayable operation.
 		if operationHasNativeEffect(action) {
-			pending["worker"] = map[string]any{"state": "starting", "prepared_at": nowString(s.Clock())}
+			pending["worker"] = map[string]any{"state": "starting", "start_attempted": false, "prepared_at": nowString(s.Clock())}
 		}
 		generation := intValue(request["generation"])
 		session := optionalString(request["session_id"])
@@ -813,12 +939,22 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 	if _, err := s.Store.StateEpoch(ctx); err != nil {
 		return s.sqliteError(err)
 	}
-	if _, err := s.reconcile(ctx, true); err != nil {
-		return err
+	_, reconcileErr := s.reconcile(ctx, true)
+	if reconcileErr != nil && protocol.AsError(reconcileErr).Code != "cleanup_incomplete" {
+		return reconcileErr
 	}
 	pending, err := s.Store.PendingOperations(ctx)
 	if err != nil {
 		return s.sqliteError(err)
+	}
+	if reconcileErr != nil {
+		unresolved, workerErr := s.pendingWorkerUnresolved(ctx, nil, "", native.WorkerRecoveryCoordinator(ctx))
+		if workerErr != nil {
+			return s.sqliteError(workerErr)
+		}
+		if unresolved {
+			return reconcileErr
+		}
 	}
 	if len(pending) > 0 {
 		if err := s.reconcilePendingWorkers(ctx, pending); err != nil {
@@ -827,13 +963,32 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 		if err := s.recoverPending(ctx, pending); err != nil {
 			return err
 		}
-		if err := s.reconcileOrphanedAcquireOperations(ctx, pending); err != nil {
+		pending, err = s.Store.PendingOperations(ctx)
+		if err != nil {
+			return s.sqliteError(err)
+		}
+		if err := s.reconcileSupersededOperations(ctx, pending); err != nil {
 			return err
 		}
 		pending, err = s.Store.PendingOperations(ctx)
 		if err != nil {
 			return s.sqliteError(err)
 		}
+		if err := s.reconcileOrphanedAcquireOperations(ctx, pending); err != nil {
+			if protocol.AsError(err).Code != "startup_reconcile_required" {
+				return err
+			}
+			if reconcileErr == nil {
+				reconcileErr = err
+			}
+		}
+		pending, err = s.Store.PendingOperations(ctx)
+		if err != nil {
+			return s.sqliteError(err)
+		}
+	}
+	if reconcileErr != nil {
+		return reconcileErr
 	}
 	if len(pending) > 0 {
 		return protocol.NewError("startup_reconcile_required", "pending operations require explicit recovery before admission", map[string]any{"count": len(pending), "admission_ready": false})
@@ -841,79 +996,391 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 	return s.verifyResidentNativeState(ctx)
 }
 
+// recoveryQuiescence is implemented by the native control authority only. It
+// proves that no old control child or Incus background operation remains.
+type recoveryQuiescence interface {
+	VerifyRecoveryQuiescence(context.Context) error
+}
+
+// reconcileSupersededOperations preserves the original request and worker
+// evidence while reporting an unknown historical outcome. A later serialized
+// successful operation and a verified, quiescent cached task fence the old
+// effect; the original native request is never replayed.
+func (s *Service) reconcileSupersededOperations(ctx context.Context, pending []state.Operation) error {
+	probe, ok := s.Guest.(recoveryQuiescence)
+	if !ok || native.WorkerOperationID(ctx) != "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	for _, candidate := range pending {
+		if candidate.SessionID == nil || seen[*candidate.SessionID] {
+			continue
+		}
+		session := *candidate.SessionID
+		seen[session] = true
+		unlock, acquired := s.trySessionLock(session)
+		if !acquired {
+			continue
+		}
+		err := s.reconcileSupersededSession(ctx, session, probe)
+		unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) reconcileSupersededSession(ctx context.Context, session string, probe recoveryQuiescence) error {
+	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": session})
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if task == nil || task.State != stateCached || task.LeaseExpiresAt != nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
+		return nil
+	}
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	type superseded struct {
+		operation state.Operation
+		witness   string
+	}
+	var group []superseded
+	for _, operation := range pending {
+		if operation.SessionID == nil || *operation.SessionID != session {
+			continue
+		}
+		if operation.Generation == nil || *operation.Generation > task.Generation || s.operationActive(operation.OperationID) || (operation.Action != "acquire" && operation.Action != "resize" && operation.Action != "restart") {
+			return nil
+		}
+		if taskID, exists := operation.Response["_task_id"]; exists && stringValue(taskID) != task.TaskID {
+			return nil
+		}
+		if boundGeneration, exists := operation.Response["_task_generation"]; exists {
+			value, valid := protocol.Integer(boundGeneration)
+			if !valid || value < *operation.Generation || value > task.Generation {
+				return nil
+			}
+		}
+		worker, valid := operation.Response["worker"].(map[string]any)
+		if !valid || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
+			return nil
+		}
+		pid, pidOK := protocol.Integer(worker["pid"])
+		pgid, groupOK := protocol.Integer(worker["process_group"])
+		start := stringValue(worker["start_time"])
+		if !pidOK || !groupOK || pid <= 0 || pgid <= 0 || start == "" {
+			return nil
+		}
+		alive, workerErr := native.WorkerAlive(native.WorkerIdentity{PID: int(pid), ProcessGroup: int(pgid), StartTime: start})
+		if workerErr != nil || alive {
+			return nil
+		}
+		raw, valid := operation.Response["_request"].(map[string]any)
+		if !valid {
+			return nil
+		}
+		req := protocol.Request(raw)
+		digest, digestErr := protocol.Digest(req)
+		if protocol.ValidateRequest(req) != nil || digestErr != nil || digest != stringValue(operation.Response["_request_digest"]) || stringValue(req["operation_id"]) != operation.OperationID || stringValue(req["action"]) != operation.Action || stringValue(req["session_id"]) != session || intValue(req["generation"]) != *operation.Generation {
+			return nil
+		}
+		later, err := s.Store.LaterSuccessfulSessionOperations(ctx, operation.OperationID)
+		if err != nil {
+			return s.sqliteError(err)
+		}
+		witness := ""
+		for _, completed := range later {
+			if supersedingOperationMatches(operation, completed, task) {
+				witness = completed.OperationID
+				break
+			}
+		}
+		if witness == "" {
+			return nil
+		}
+		group = append(group, superseded{operation: operation, witness: witness})
+	}
+	if len(group) == 0 {
+		return nil
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+	defer cancel()
+	if err := s.verifyCachedGuest(checkCtx, task); err != nil {
+		return nil
+	}
+	if err := probe.VerifyRecoveryQuiescence(checkCtx); err != nil {
+		return protocol.NewError("startup_reconcile_required", "historical operation quiescence could not be verified", map[string]any{"admission_ready": false, "cause": err.Error()})
+	}
+	for _, item := range group {
+		response := cloneMap(item.operation.Response)
+		response["outcome"] = "error"
+		response["error"] = protocol.NewError("operation_outcome_unknown", "the original outcome is unknown; a later operation superseded its lease", map[string]any{"outcome_verified": false, "lease_state_verified": true, "superseded_by_operation_id": item.witness})
+		if err := s.Store.RecordOperation(ctx, item.operation.OperationID, item.operation.Action, item.operation.SessionID, item.operation.Generation, response); err != nil {
+			return s.sqliteError(err)
+		}
+	}
+	return nil
+}
+
+func supersedingOperationMatches(original, completed state.Operation, task *state.Task) bool {
+	if original.Generation == nil || completed.Generation == nil || completed.SessionID == nil || *completed.SessionID != task.SessionID || *completed.Generation < *original.Generation || *completed.Generation > task.Generation {
+		return false
+	}
+	worker, workerOK := original.Response["worker"].(map[string]any)
+	created, createdErr := time.Parse(time.RFC3339Nano, original.CreatedAt)
+	finished, finishedErr := time.Parse(time.RFC3339Nano, stringValue(worker["finished_at"]))
+	laterCreated, laterErr := time.Parse(time.RFC3339Nano, completed.CreatedAt)
+	if !workerOK || createdErr != nil || finishedErr != nil || laterErr != nil || !laterCreated.After(created) || !laterCreated.After(finished) {
+		return false
+	}
+	response := completed.Response
+	digest := stringValue(response["_request_digest"])
+	digestBytes, digestErr := hex.DecodeString(digest)
+	if digestErr != nil || len(digestBytes) != sha256.Size || stringValue(response["outcome"]) != "success" || !boolValue(response["ok"]) || intValue(response["protocol"]) != protocol.Version || stringValue(response["operation_id"]) != completed.OperationID || stringValue(response["action"]) != completed.Action || stringValue(response["session_id"]) != task.SessionID || intValue(response["generation"]) != *completed.Generation {
+		return false
+	}
+	result, ok := response["result"].(map[string]any)
+	if !ok || stringValue(result["task_id"]) != task.TaskID || stringValue(result["session_id"]) != task.SessionID {
+		return false
+	}
+	resultGeneration, validGeneration := protocol.Integer(result["generation"])
+	effectiveLease, validLease := result["effective_lease"].(bool)
+	if !validGeneration || !validLease || resultGeneration < *completed.Generation || resultGeneration > task.Generation {
+		return false
+	}
+	if completed.Action == "release" && stringValue(result["state"]) == stateCached && !effectiveLease {
+		return original.Action != "acquire" || resultGeneration > *original.Generation
+	}
+	return original.Action == "acquire" && completed.Action == "acquire" && *completed.Generation > *original.Generation && resultGeneration > *original.Generation && stringValue(result["state"]) == stateActive && effectiveLease
+}
+
 // reconcileOrphanedAcquireOperations closes the narrow crash window where a
 // native acquire was journaled but the durable task was never committed. The
 // native identity must be explicitly verified missing before the operation can
 // be finalized; every other result remains fail-closed for operator recovery.
 func (s *Service) reconcileOrphanedAcquireOperations(ctx context.Context, pending []state.Operation) error {
-	if s.Guest == nil {
-		return protocol.NewError("startup_reconcile_required", "pending acquire operations cannot be reconciled without native access", map[string]any{"admission_ready": false})
-	}
+	var firstErr error
 	for _, operation := range pending {
 		if operation.Action != "acquire" || operation.SessionID == nil || operation.Generation == nil {
 			continue
 		}
-		task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
+		if s.Guest == nil {
+			return protocol.NewError("startup_reconcile_required", "pending acquire operations cannot be reconciled without native access", map[string]any{"admission_ready": false})
+		}
+		unlock, acquired := s.trySessionLock(*operation.SessionID)
+		if !acquired {
+			continue
+		}
+		err := s.reconcileOrphanedAcquire(ctx, operation.OperationID)
+		unlock()
 		if err != nil {
-			return s.sqliteError(err)
-		}
-		if task != nil && task.State != stateAbsent && task.State != stateCached {
-			continue
-		}
-		digest := stringValue(operation.Response["_request_digest"])
-		if digest == "" {
-			return protocol.NewError("startup_reconcile_required", "orphaned acquire operation is missing its request digest", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
-		}
-		if task != nil && task.State == stateCached {
-			if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr != nil {
-				return protocol.NewError("startup_reconcile_required", "cached task ownership could not be verified while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": ownershipErr.Error()})
+			if protocol.AsError(err).Code != "startup_reconcile_required" {
+				return err
 			}
-			statusCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
-			status, statusErr := s.Guest.Status(statusCtx, task.InstanceName)
-			cancel()
-			if statusErr != nil {
-				return protocol.NewError("startup_reconcile_required", "cached task status could not be verified while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": statusErr.Error()})
+			if firstErr == nil {
+				firstErr = err
 			}
-			stateValue, parseErr := native.ParseStatus(status)
-			if parseErr != nil || !strings.EqualFold(stateValue, "stopped") {
-				if parseErr != nil {
-					return protocol.NewError("startup_reconcile_required", "cached task status is malformed while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": parseErr.Error()})
-				}
-				return protocol.NewError("startup_reconcile_required", "cached task is not stopped while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "status": stateValue})
-			}
-			response := map[string]any{
-				"outcome": "error",
-				"error": protocol.NewError("lease_released", "the lease was released before the acquire operation was acknowledged", map[string]any{
-					"task_id": task.TaskID, "task_generation": task.Generation, "outcome_verified": true,
-				}),
-				"_request_digest": digest,
-			}
-			if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
-				return s.sqliteError(err)
-			}
-			continue
 		}
-		instanceName := "agent-vm-" + taskID(*operation.SessionID)
-		if task != nil && task.InstanceName != "" {
-			instanceName = task.InstanceName
+	}
+
+	return firstErr
+}
+
+// The session lock prevents an acquire from starting between the journal and native checks.
+func (s *Service) reconcileOrphanedAcquire(ctx context.Context, operationID string) error {
+	operation, err := s.Store.GetOperation(ctx, operationID)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if operation == nil || operation.Action != "acquire" || operation.SessionID == nil || operation.Generation == nil || stringValue(operation.Response["outcome"]) != "pending" {
+		return nil
+	}
+	if s.operationActive(operation.OperationID) {
+		return nil
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	if ok && stringValue(worker["state"]) == "starting" {
+		return s.reconcileLegacyCachedStarts(ctx, operation)
+	}
+	if !ok || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
+		return nil
+	}
+	unresolved, workerErr := s.pendingWorkerUnresolved(ctx, operation.SessionID, "", native.WorkerRecoveryCoordinator(ctx))
+	if workerErr != nil {
+		return s.sqliteError(workerErr)
+	}
+	if unresolved {
+		return nil
+	}
+	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if task != nil && task.State != stateAbsent && task.State != stateCached {
+		return nil
+	}
+	digest := stringValue(operation.Response["_request_digest"])
+	if digest == "" {
+		return protocol.NewError("startup_reconcile_required", "orphaned acquire operation is missing its request digest", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	saved, valid := operation.Response["_request"].(map[string]any)
+	if !valid {
+		return protocol.NewError("startup_reconcile_required", "orphaned acquire request is missing", map[string]any{"operation_id": operation.OperationID})
+	}
+	request := protocol.Request(saved)
+	computed, digestErr := protocol.Digest(request)
+	if protocol.ValidateRequest(request) != nil || digestErr != nil || digest != computed || stringValue(request["action"]) != "acquire" || stringValue(request["operation_id"]) != operation.OperationID || stringValue(request["session_id"]) != *operation.SessionID || intValue(request["generation"]) != *operation.Generation {
+		return protocol.NewError("startup_reconcile_required", "orphaned acquire request identity is inconsistent", map[string]any{"operation_id": operation.OperationID})
+	}
+	if task != nil && task.State == stateCached {
+		if !acquireOperationMatchesTask(*operation, task) {
+			return protocol.NewError("startup_reconcile_required", "pending acquire generation does not match cached task", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false})
 		}
-		checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
-		_, configErr := s.Guest.Config(checkCtx, instanceName)
+		if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr != nil {
+			return protocol.NewError("startup_reconcile_required", "cached task ownership could not be verified while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": ownershipErr.Error()})
+		}
+		statusCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+		status, statusErr := s.Guest.Status(statusCtx, task.InstanceName)
 		cancel()
-		if configErr == nil {
-			return protocol.NewError("startup_reconcile_required", "orphaned acquire still has a native instance without durable task state", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false})
+		if statusErr != nil {
+			return protocol.NewError("startup_reconcile_required", "cached task status could not be verified while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": statusErr.Error()})
 		}
-		if !native.IsNotFound(configErr) {
-			return protocol.NewError("startup_reconcile_required", "orphaned acquire native outcome could not be verified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": configErr.Error()})
+		stateValue, parseErr := native.ParseStatus(status)
+		if parseErr != nil || !strings.EqualFold(stateValue, "stopped") {
+			if parseErr != nil {
+				return protocol.NewError("startup_reconcile_required", "cached task status is malformed while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": parseErr.Error()})
+			}
+			return protocol.NewError("startup_reconcile_required", "cached task is not stopped while reconciling acquire operations", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "status": stateValue})
 		}
 		response := map[string]any{
 			"outcome": "error",
-			"error": protocol.NewError("acquire_partial", "native initialization did not complete", map[string]any{
-				"phase": "native-init", "operation_phase": "native-init", "native_init_recovered_absent": true, "outcome_verified": true,
+			"error": protocol.NewError("lease_released", "the lease was released before the acquire operation was acknowledged", map[string]any{
+				"task_id": task.TaskID, "task_generation": task.Generation, "outcome_verified": true,
 			}),
 			"_request_digest": digest,
 		}
 		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+			return s.sqliteError(err)
+		}
+		return nil
+	}
+	instanceName := "agent-vm-" + taskID(*operation.SessionID)
+	if task != nil && task.InstanceName != "" {
+		instanceName = task.InstanceName
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+	_, configErr := s.Guest.Config(checkCtx, instanceName)
+	cancel()
+	if configErr == nil {
+		return protocol.NewError("startup_reconcile_required", "orphaned acquire still has a native instance without durable task state", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false})
+	}
+	if !native.IsNotFound(configErr, instanceName, s.Config.Project) {
+		return protocol.NewError("startup_reconcile_required", "orphaned acquire native outcome could not be verified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": configErr.Error()})
+	}
+	response := map[string]any{
+		"outcome": "error",
+		"error": protocol.NewError("acquire_partial", "native initialization did not complete", map[string]any{
+			"phase": "native-init", "operation_phase": "native-init", "native_init_recovered_absent": true, "outcome_verified": true,
+		}),
+		"_request_digest": digest,
+	}
+	if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+		return s.sqliteError(err)
+	}
+	return nil
+}
+
+// Legacy acquire performs no native mutation before allocating a task generation.
+// An unchanged cached generation or an absent generation tombstone fences that phase.
+func (s *Service) reconcileLegacyCachedStarts(ctx context.Context, operation *state.Operation) error {
+	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	session, generation := *operation.SessionID, *operation.Generation
+	if task == nil {
+		if generation != 0 {
+			return nil
+		}
+		allocated, err := s.Store.HasGeneration(ctx, session)
+		if err != nil {
+			return s.sqliteError(err)
+		}
+		if allocated {
+			return nil
+		}
+	} else if task.State != stateCached || task.Generation != generation || task.LeaseExpiresAt != nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
+		return nil
+	}
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	group := make([]state.Operation, 0)
+	for _, candidate := range pending {
+		if candidate.SessionID == nil || *candidate.SessionID != session {
+			continue
+		}
+		// An older acquire stays pending, but cannot change whether this
+		// generation's legacy acquire advanced the durable task generation.
+		if candidate.Action == "acquire" && candidate.Generation != nil && *candidate.Generation < generation && !s.operationActive(candidate.OperationID) {
+			worker, ok := candidate.Response["worker"].(map[string]any)
+			if ok && stringValue(worker["state"]) == "finished" && !workerOwnershipUnresolved(worker) {
+				continue
+			}
+		}
+		if candidate.Action != "acquire" || candidate.Generation == nil || *candidate.Generation != generation || s.operationActive(candidate.OperationID) {
+			return nil
+		}
+		worker, ok := candidate.Response["worker"].(map[string]any)
+		if !ok || stringValue(worker["state"]) != "starting" {
+			return nil
+		}
+		if _, ok := worker["start_attempted"]; ok {
+			return nil
+		}
+		if _, ok := worker["pid"]; ok {
+			return nil
+		}
+		if _, ok := worker["start_time"]; ok {
+			return nil
+		}
+		if _, ok := worker["process_group"]; ok {
+			return nil
+		}
+		raw, ok := candidate.Response["_request"].(map[string]any)
+		if !ok {
+			return nil
+		}
+		req := protocol.Request(raw)
+		digest, digestErr := protocol.Digest(req)
+		if protocol.ValidateRequest(req) != nil || digestErr != nil || digest != stringValue(candidate.Response["_request_digest"]) || stringValue(req["action"]) != "acquire" || stringValue(req["operation_id"]) != candidate.OperationID || stringValue(req["session_id"]) != session || intValue(req["generation"]) != generation {
+			return nil
+		}
+		group = append(group, candidate)
+	}
+	if len(group) == 0 {
+		return nil
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+	defer cancel()
+	if task != nil {
+		if err := s.verifyCachedGuest(checkCtx, task); err != nil {
+			return protocol.NewError("startup_reconcile_required", "legacy cached acquisition could not be verified", map[string]any{"outcome_verified": false, "cause": err.Error()})
+		}
+	} else {
+		name := "agent-vm-" + taskID(session)
+		_, err := s.Guest.Config(checkCtx, name)
+		if err == nil || !native.IsNotFound(err, name, s.Config.Project) {
+			return protocol.NewError("startup_reconcile_required", "never-allocated instance absence could not be verified", map[string]any{"outcome_verified": false})
+		}
+	}
+	for _, candidate := range group {
+		response := map[string]any{"outcome": "error", "error": protocol.NewError("startup_reconcile_required", "acquire ended before allocating or advancing a task generation", map[string]any{"outcome_verified": true}), "_request_digest": candidate.Response["_request_digest"]}
+		if err := s.Store.RecordOperation(ctx, candidate.OperationID, candidate.Action, candidate.SessionID, candidate.Generation, response); err != nil {
 			return s.sqliteError(err)
 		}
 	}
@@ -1073,7 +1540,7 @@ func (s *Service) status(ctx context.Context, session string) (map[string]any, e
 
 func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[string]any, error) {
 	if s.resident && !s.Ready() {
-		return nil, protocol.NewError("startup_reconcile_required", "control service is not ready for admission", nil)
+		return nil, protocol.NewError("startup_reconcile_required", "control service is not ready for admission", map[string]any{"outcome_verified": true})
 	}
 	if draining, err := s.isDraining(ctx); err != nil {
 		return nil, s.sqliteError(err)
@@ -1164,6 +1631,15 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	} else if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"generation": task.Generation, "state": task.State, "resources_json": task.ResourcesJSON, "resource_reservation_json": task.ResourceReservationJSON, "reservation_bytes": int64(0), "lease_expires_at": task.LeaseExpiresAt, "updated_at": nowString(now), "last_error": nil, "image_fingerprint": task.ImageFingerprint, "previous_generation": task.PreviousGeneration}); err != nil {
 		return nil, s.sqliteError(err)
 	}
+	if operationID := native.WorkerOperationID(ctx); operationID != "" {
+		if err := s.Store.UpdateOperationResponse(ctx, operationID, func(response map[string]any) error {
+			response["_task_id"] = task.TaskID
+			response["_task_generation"] = task.Generation
+			return nil
+		}); err != nil {
+			return nil, s.sqliteError(err)
+		}
+	}
 	if s.Guest != nil {
 		nativeCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 		defer cancel()
@@ -1178,12 +1654,14 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 			}
 		}
 		if created {
-			if err := s.Guest.Init(nativeCtx, task.ImageFingerprint, task.InstanceName); err != nil {
+			if err := s.Guest.Init(nativeCtx, task.ImageFingerprint, task.InstanceName, ownershipConfig(task)); err != nil {
 				return s.failTaskForOperation(ctx, task, "native-init", err, stringValue(request["operation_id"]))
 			}
 		}
-		if err := s.setOwnership(nativeCtx, task); err != nil {
-			return s.failTask(ctx, task, "native-ownership", err)
+		if !created {
+			if err := s.setOwnership(nativeCtx, task); err != nil {
+				return s.failTask(ctx, task, "native-ownership", err)
+			}
 		}
 		if err := s.configureNetwork(nativeCtx, task); err != nil {
 			return s.failTask(ctx, task, "native-network", err)
@@ -1291,7 +1769,7 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		}
 		return s.summary(ctx, task)
 	}
-	if task.State == stateActive || task.State == statePreparing || task.State == stateFailed || (destroy && task.State == stateCached) {
+	if task.State == stateActive || task.State == statePreparing || task.State == stateFailed || (destroy && (task.State == stateCached || task.State == stateClosing)) {
 		targetState := stateClosing
 		if destroy {
 			targetState = stateDeleting
@@ -1307,6 +1785,13 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	} else if task.State != stateClosing && task.State != stateDeleting {
 		return nil, protocol.NewError("task_transition", "session is already in a non-retryable lifecycle state", map[string]any{"state": task.State})
 	}
+	unresolved, workerErr := s.pendingWorkerUnresolved(ctx, optionalString(request["session_id"]), stringValue(request["operation_id"]), native.WorkerRecoveryCoordinator(ctx))
+	if workerErr != nil {
+		return nil, s.sqliteError(workerErr)
+	}
+	if unresolved {
+		return nil, protocol.NewError("cleanup_incomplete", "native worker ownership remains unresolved before cleanup", map[string]any{"outcome_verified": false})
+	}
 	cleanupErrors := make([]string, 0)
 	nativePresent := s.Guest != nil
 	if s.Guest != nil {
@@ -1314,7 +1799,8 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 			control := protocol.AsError(ownershipErr)
 			detail, _ := control.Detail.(map[string]any)
 			missing, _ := detail["native_missing"].(bool)
-			if !(destroy && task.State == stateDeleting && missing) {
+			initMissing := !destroy && task.State == stateClosing && missing && failedNativeInit(task)
+			if !(missing && (destroy && task.State == stateDeleting || initMissing)) {
 				return nil, protocol.NewError("cleanup_incomplete", "native ownership could not be verified before cleanup", map[string]any{"cause": ownershipErr.Error(), "outcome_verified": false})
 			}
 			unresolved, workerErr := s.pendingWorkerUnresolved(ctx, optionalString(request["session_id"]), stringValue(request["operation_id"]), native.WorkerRecoveryCoordinator(ctx))
@@ -1323,6 +1809,20 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 			}
 			if unresolved {
 				return nil, protocol.NewError("cleanup_incomplete", "native worker ownership remains unresolved while the instance is missing", map[string]any{"outcome_verified": false})
+			}
+			if initMissing {
+				if err := s.cancelPendingAcquireOperations(ctx, task); err != nil {
+					return nil, err
+				}
+				updated, updateErr := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateClosing}}, map[string]any{"state": stateDeleting, "updated_at": nowString(s.Clock())})
+				if updateErr != nil {
+					return nil, s.sqliteError(updateErr)
+				}
+				if !updated {
+					return nil, protocol.NewError("cleanup_incomplete", "session changed before missing init cleanup", map[string]any{"outcome_verified": false})
+				}
+				task.State = stateDeleting
+				destroy = true
 			}
 			nativePresent = false
 		}
@@ -1360,6 +1860,15 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		if !strings.EqualFold(stateValue, "stopped") {
 			if err := s.Guest.Stop(workerCtx, task.InstanceName); err != nil {
 				return nil, protocol.NewError("cleanup_incomplete", "guest stop did not complete", map[string]any{"cause": err.Error(), "outcome_verified": false})
+			}
+		}
+		if !destroy && task.PreviousGeneration != nil {
+			info, verifyErr := s.verifyOwnership(workerCtx, task)
+			if verifyErr != nil {
+				return nil, protocol.NewError("cleanup_incomplete", "native ownership could not be reverified before caching", map[string]any{"cause": verifyErr.Error(), "outcome_verified": false})
+			}
+			if info["config"].(map[string]any)["user.agent-vm.generation"] != strconv.FormatInt(task.Generation, 10) {
+				return nil, protocol.NewError("cleanup_incomplete", "native generation differs from the task before caching", map[string]any{"outcome_verified": false})
 			}
 		}
 		if destroy {
@@ -1403,22 +1912,40 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	return s.status(ctx, task.SessionID)
 }
 
+func failedNativeInit(task *state.Task) bool {
+	if task.LastError == nil {
+		return false
+	}
+	var detail map[string]any
+	return json.Unmarshal([]byte(*task.LastError), &detail) == nil && detail["phase"] == "native-init"
+}
+
+// A recorded binding is authoritative. Legacy unbound operations are only
+// matched where the generation relationship is unambiguous.
+func acquireOperationMatchesTask(operation state.Operation, task *state.Task) bool {
+	if operation.Generation == nil {
+		return false
+	}
+	rawGeneration, hasGeneration := operation.Response["_task_generation"]
+	rawTask, hasTask := operation.Response["_task_id"]
+	if hasGeneration || hasTask {
+		generation, valid := protocol.Integer(rawGeneration)
+		return valid && generation == task.Generation && rawTask == task.TaskID
+	}
+	return *operation.Generation == task.Generation || task.Generation > 0 && *operation.Generation == task.Generation-1
+}
+
 func (s *Service) pendingAcquireOperations(ctx context.Context, task *state.Task) ([]state.Operation, error) {
 	pending, err := s.Store.PendingOperations(ctx)
 	if err != nil {
 		return nil, s.sqliteError(err)
-	}
-	var previousGeneration *int64
-	if task.Generation > 0 {
-		value := task.Generation - 1
-		previousGeneration = &value
 	}
 	result := make([]state.Operation, 0)
 	for _, operation := range pending {
 		if operation.Action != "acquire" || operation.SessionID == nil || *operation.SessionID != task.SessionID || operation.Generation == nil {
 			continue
 		}
-		if *operation.Generation == task.Generation || previousGeneration != nil && *operation.Generation == *previousGeneration {
+		if acquireOperationMatchesTask(operation, task) {
 			result = append(result, operation)
 		}
 	}
@@ -1925,6 +2452,21 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 					"management":   true,
 				})
 			}
+			unknown, unknownErr := s.Store.ReconciledUnknownOperations(ctx)
+			if unknownErr != nil {
+				return nil, s.sqliteError(unknownErr)
+			}
+			unknownOperations := make([]any, 0, len(unknown))
+			for _, operation := range unknown {
+				item := map[string]any{"operation_id": operation.OperationID, "action": operation.Action, "session_id": nil, "generation": nil, "created_at": operation.CreatedAt}
+				if operation.SessionID != nil {
+					item["session_id"] = *operation.SessionID
+				}
+				if operation.Generation != nil {
+					item["generation"] = *operation.Generation
+				}
+				unknownOperations = append(unknownOperations, item)
+			}
 			var cpuObservation *observe.CPUObservation
 			var cpuObservationErr error
 			if s.CPU != nil {
@@ -2020,7 +2562,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				"observed_at": start, "up": nativeUp, "draining": draining, "admission_ready": s.Ready(),
 				"resources": resourcesValue, "ct_cpu": ctCPU,
 				"default_admission": map[string]any{"requested": map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "ready": s.Ready(), "reasons": defaultReasons},
-				"task_states":       states, "pending_operations": pendingOperations, "instances": len(tasks), "warnings": warnings,
+				"task_states":       states, "pending_operations": pendingOperations, "historical_unknown_operations": unknownOperations, "instances": len(tasks), "warnings": warnings,
 				"warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil), "native_unavailable": boolInt(!nativeUp)},
 			}, nil
 		}
@@ -2061,7 +2603,12 @@ func (s *Service) reconcile(ctx context.Context, apply bool, _ ...string) (map[s
 				}
 			}
 		}
-		if (task.State == stateClosing || task.State == stateFailed) && apply {
+		if task.State == stateClosing && apply {
+			if cleanupErr := s.reconcileClosing(ctx, &task); cleanupErr != nil && firstErr == nil {
+				firstErr = cleanupErr
+			}
+		}
+		if task.State == stateFailed && apply {
 			cleanupRequest, cleanupOperationID, requestErr := s.pendingCleanupRequest(ctx, task.SessionID, task.Generation, "release")
 			if requestErr != nil {
 				if firstErr == nil {
@@ -2106,6 +2653,58 @@ func (s *Service) reconcile(ctx context.Context, apply bool, _ ...string) (map[s
 	return result, firstErr
 }
 
+// A pending destroy remains authoritative even if earlier recovery left the task closing.
+func (s *Service) reconcileClosing(ctx context.Context, task *state.Task) error {
+	unlock := s.lockAction("session", protocol.Request{"session_id": task.SessionID})
+	defer unlock()
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	request, operationID, err := s.pendingCleanupRequest(ctx, task.SessionID, task.Generation, "release")
+	if err != nil {
+		return err
+	}
+	if operationID != "" && s.operationActive(operationID) {
+		return protocol.NewError("operation_unverified", "pending release is active", nil)
+	}
+	action := "release"
+	for _, op := range pending {
+		if op.Action != "destroy" || op.SessionID == nil || *op.SessionID != task.SessionID || op.Generation == nil || *op.Generation != task.Generation {
+			continue
+		}
+		if action == "destroy" || s.operationActive(op.OperationID) {
+			return protocol.NewError("operation_unverified", "pending destroy is active or ambiguous", nil)
+		}
+		worker, ok := op.Response["worker"].(map[string]any)
+		if !ok || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
+			return protocol.NewError("operation_unverified", "pending destroy worker is unresolved", nil)
+		}
+		saved, ok := op.Response["_request"].(map[string]any)
+		if !ok {
+			return protocol.NewError("operation_unverified", "pending destroy request is missing", nil)
+		}
+		request = protocol.Request(saved)
+		digest, digestErr := protocol.Digest(request)
+		if protocol.ValidateRequest(request) != nil || digestErr != nil || digest != stringValue(op.Response["_request_digest"]) || stringValue(request["action"]) != "destroy" || stringValue(request["session_id"]) != task.SessionID || intValue(request["generation"]) != task.Generation || stringValue(request["operation_id"]) != op.OperationID {
+			return protocol.NewError("operation_unverified", "pending destroy identity is inconsistent", nil)
+		}
+		if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
+			return protocol.NewError("operation_unverified", "pending destroy request is incompatible", map[string]any{"cause": compatibilityErr.Error()})
+		}
+		action = "destroy"
+		operationID = op.OperationID
+	}
+	if operationID != "" {
+		ctx = native.WithWorkerRecorder(ctx, operationID, s)
+	}
+	result, err := s.releaseUnlocked(withInternalCleanup(ctx), request, action == "destroy")
+	if err != nil {
+		return err
+	}
+	return s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, action, result)
+}
+
 // reconcilePendingAbsentDestroy closes the crash window after native destroy
 // and durable task transition but before the terminal operation journal write.
 // The task row, request identity, digest, worker ownership and native absence
@@ -2115,72 +2714,155 @@ func (s *Service) reconcilePendingAbsentDestroy(ctx context.Context, pending []s
 		if operation.Action != "destroy" || operation.SessionID == nil || operation.Generation == nil {
 			continue
 		}
-		task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
-		if err != nil {
-			return s.sqliteError(err)
-		}
-		rowExists := task != nil
-		if task != nil && task.State != stateAbsent {
+		unlock, acquired := s.trySessionLock(*operation.SessionID)
+		if !acquired {
 			continue
 		}
-		rawRequest, ok := operation.Response["_request"].(map[string]any)
-		if !ok {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy request is missing", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
-		}
-		request := protocol.Request(rawRequest)
-		if validationErr := protocol.ValidateRequest(request); validationErr != nil {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy request is invalid", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": validationErr.Error()})
-		}
-		if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy request is incompatible", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": compatibilityErr.Error()})
-		}
-		if !operationIdentityMatches(&operation, request) || stringValue(request["operation_id"]) != operation.OperationID || intValue(request["generation"]) != *operation.Generation {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy identity does not match its journal or task", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
-		}
-		digest := stringValue(operation.Response["_request_digest"])
-		calculated, digestErr := protocol.Digest(request)
-		if digest == "" || digestErr != nil || digest != calculated {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy request digest does not match", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
-		}
-		if unresolved, workerErr := s.pendingWorkerUnresolved(ctx, operation.SessionID, operation.OperationID, ""); workerErr != nil {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy worker ownership could not be checked", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": workerErr.Error()})
-		} else if unresolved {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy worker ownership remains unresolved", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
-		}
-		if !rowExists {
-			task = &state.Task{TaskID: taskID(*operation.SessionID), SessionID: *operation.SessionID, Generation: *operation.Generation, State: stateAbsent, InstanceName: "agent-vm-" + taskID(*operation.SessionID), ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}"}
-		}
-		if s.Guest != nil {
-			if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr == nil {
-				return protocol.NewError("startup_reconcile_required", "pending absent destroy still has a native instance", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": true})
-			} else {
-				control := protocol.AsError(ownershipErr)
-				detail, _ := control.Detail.(map[string]any)
-				if detail["native_missing"] != true {
-					return protocol.NewError("startup_reconcile_required", "pending absent destroy native absence could not be verified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": ownershipErr.Error()})
-				}
-			}
-		}
-		response := map[string]any{"state": stateAbsent, "session_id": *operation.SessionID, "effective_lease": false}
-		if rowExists {
-			var summaryErr error
-			response, summaryErr = s.summary(ctx, task)
-			if summaryErr != nil {
-				return summaryErr
-			}
-		}
-		terminal := protocol.SuccessWithRelease(request, response, s.Release, nil)
-		terminal["_request_digest"] = digest
-		if rowExists {
-			if err := s.deleteDestroyedTask(ctx, request, operation.Generation); err != nil {
-				return err
-			}
-		}
-		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, terminal); err != nil {
-			return s.sqliteError(err)
+		err := s.reconcilePendingAbsentDestroyOne(ctx, operation)
+		unlock()
+		if err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func (s *Service) reconcilePendingAbsentDestroyOne(ctx context.Context, operation state.Operation) error {
+	current, err := s.Store.GetOperation(ctx, operation.OperationID)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if current == nil || stringValue(current.Response["outcome"]) != "pending" {
+		return nil
+	}
+	if current.Action != "destroy" || current.SessionID == nil || current.Generation == nil || *current.SessionID != *operation.SessionID || *current.Generation != *operation.Generation {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy identity changed during reconciliation", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	operation = *current
+	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	rowExists := task != nil
+	if task != nil && task.State != stateAbsent {
+		return nil
+	}
+	if task != nil && task.Generation != *operation.Generation {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy generation differs from task", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	if task == nil {
+		generation, exists, generationErr := s.Store.LastGeneration(ctx, *operation.SessionID)
+		if generationErr != nil {
+			return s.sqliteError(generationErr)
+		}
+		if !exists || generation != *operation.Generation {
+			return protocol.NewError("startup_reconcile_required", "pending absent destroy generation is unverified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+		}
+	}
+	if s.operationActive(operation.OperationID) {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy is still active", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	if !ok || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy worker is unverified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	if verified, verifyErr := terminalWorkerVerified(worker); verifyErr != nil || !verified {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy worker identity is unverified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	rawRequest, ok := operation.Response["_request"].(map[string]any)
+	if !ok {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy request is missing", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	request := protocol.Request(rawRequest)
+	if validationErr := protocol.ValidateRequest(request); validationErr != nil {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy request is invalid", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": validationErr.Error()})
+	}
+	if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy request is incompatible", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": compatibilityErr.Error()})
+	}
+	if !operationIdentityMatches(&operation, request) || stringValue(request["operation_id"]) != operation.OperationID || intValue(request["generation"]) != *operation.Generation {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy identity does not match its journal or task", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	digest := stringValue(operation.Response["_request_digest"])
+	calculated, digestErr := protocol.Digest(request)
+	if digest == "" || digestErr != nil || digest != calculated {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy request digest does not match", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	if unresolved, workerErr := s.pendingWorkerUnresolved(ctx, operation.SessionID, "", ""); workerErr != nil {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy worker ownership could not be checked", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": workerErr.Error()})
+	} else if unresolved {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy worker ownership remains unresolved", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	otherPending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	for _, other := range otherPending {
+		if other.OperationID == operation.OperationID || other.SessionID == nil || *other.SessionID != *operation.SessionID || !operationHasNativeEffect(other.Action) {
+			continue
+		}
+		otherWorker, ok := other.Response["worker"].(map[string]any)
+		if !ok || s.operationActive(other.OperationID) || workerOwnershipUnresolved(otherWorker) || (stringValue(otherWorker["state"]) != "finished" && stringValue(otherWorker["state"]) != "exited") {
+			return protocol.NewError("startup_reconcile_required", "same-session worker is unverified", map[string]any{"operation_id": other.OperationID, "admission_ready": false})
+		}
+		if verified, verifyErr := terminalWorkerVerified(otherWorker); verifyErr != nil || !verified {
+			return protocol.NewError("startup_reconcile_required", "same-session worker identity is unverified", map[string]any{"operation_id": other.OperationID, "admission_ready": false})
+		}
+	}
+	if !rowExists {
+		task = &state.Task{TaskID: taskID(*operation.SessionID), SessionID: *operation.SessionID, Generation: *operation.Generation, State: stateAbsent, InstanceName: "agent-vm-" + taskID(*operation.SessionID), ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}"}
+	}
+	if s.Guest == nil {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy requires native verification", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false})
+	}
+	if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr == nil {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy still has a native instance", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": true})
+	} else {
+		control := protocol.AsError(ownershipErr)
+		detail, _ := control.Detail.(map[string]any)
+		if detail["native_missing"] != true {
+			return protocol.NewError("startup_reconcile_required", "pending absent destroy native absence could not be verified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": ownershipErr.Error()})
+		}
+	}
+	response := map[string]any{"state": stateAbsent, "session_id": *operation.SessionID, "effective_lease": false}
+	if rowExists {
+		var summaryErr error
+		response, summaryErr = s.summary(ctx, task)
+		if summaryErr != nil {
+			return summaryErr
+		}
+	}
+	terminal := protocol.SuccessWithRelease(request, response, s.Release, nil)
+	terminal["_request_digest"] = digest
+	if rowExists {
+		if err := s.deleteDestroyedTask(ctx, request, operation.Generation); err != nil {
+			return err
+		}
+	}
+	if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, terminal); err != nil {
+		return s.sqliteError(err)
+	}
+	return nil
+}
+
+// terminalWorkerVerified accepts a durable pre-spawn result or a process
+// identity whose root and process group are both confirmed absent.
+func terminalWorkerVerified(worker map[string]any) (bool, error) {
+	pid, pidOK := protocol.Integer(worker["pid"])
+	group, groupOK := protocol.Integer(worker["process_group"])
+	start, startOK := worker["start_time"].(string)
+	_, attempted := worker["start_attempted"].(bool)
+	_, hasPID := worker["pid"]
+	_, hasGroup := worker["process_group"]
+	_, hasStart := worker["start_time"]
+	if !hasPID && !hasGroup && !hasStart && stringValue(worker["state"]) == "exited" && attempted {
+		return true, nil
+	}
+	if !pidOK || !groupOK || !startOK || pid <= 0 || group <= 0 || start == "" {
+		return false, nil
+	}
+	alive, err := native.WorkerAlive(native.WorkerIdentity{PID: int(pid), ProcessGroup: int(group), StartTime: start})
+	return !alive && err == nil, err
 }
 
 func (s *Service) pendingCleanupRequest(ctx context.Context, session string, generation int64, action string) (protocol.Request, string, error) {
@@ -2450,13 +3132,17 @@ func (s *Service) IsDraining(ctx context.Context) (bool, error) {
 	return s.isDraining(ctx)
 }
 
-func (s *Service) setOwnership(ctx context.Context, task *state.Task) error {
-	for key, value := range map[string]string{
+func ownershipConfig(task *state.Task) map[string]string {
+	return map[string]string{
 		"user.agent-vm.managed":    "native-v1",
 		"user.agent-vm.task":       task.TaskID,
 		"user.agent-vm.session":    task.SessionID,
 		"user.agent-vm.generation": strconv.FormatInt(task.Generation, 10),
-	} {
+	}
+}
+
+func (s *Service) setOwnership(ctx context.Context, task *state.Task) error {
+	for key, value := range ownershipConfig(task) {
 		if err := s.Guest.ConfigSet(ctx, task.InstanceName, key, value); err != nil {
 			return err
 		}
@@ -2557,7 +3243,7 @@ func (s *Service) verifyOwnership(ctx context.Context, task *state.Task) (map[st
 	info, err := s.Guest.Config(ctx, task.InstanceName)
 	if err != nil {
 		detail := map[string]any{"cause": err.Error(), "outcome_verified": false}
-		if native.IsNotFound(err) {
+		if native.IsNotFound(err, task.InstanceName, s.Config.Project) {
 			detail["native_missing"] = true
 		}
 		return nil, protocol.NewError("ownership_mismatch", "native instance configuration could not be read", detail)
