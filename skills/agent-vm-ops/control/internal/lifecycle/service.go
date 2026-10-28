@@ -2,6 +2,7 @@ package lifecycle
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -37,6 +38,24 @@ const (
 var resourceKeys = []string{"cpu", "memory_mib", "disk_gib"}
 
 var (
+	timerFallbackSequence  uint64
+	timerOperationSequence uint64
+	timerInstanceID        = newTimerInstanceID()
+)
+
+func newTimerInstanceID() string {
+	value := make([]byte, 16)
+	if _, err := crand.Read(value); err == nil {
+		return hex.EncodeToString(value)
+	}
+	return fmt.Sprintf("%x-%x", time.Now().UnixNano(), atomic.AddUint64(&timerFallbackSequence, 1))
+}
+
+func newTimerOperationID(action string) string {
+	return fmt.Sprintf("timer-%s-%s-%d", timerInstanceID, strings.TrimPrefix(action, "timer-"), atomic.AddUint64(&timerOperationSequence, 1))
+}
+
+var (
 	writeActions = map[string]bool{
 		"acquire": true, "renew": true, "release": true, "destroy": true,
 		"restart": true, "resize": true, "port-add": true, "port-remove": true,
@@ -64,7 +83,6 @@ type Service struct {
 	maintenance sync.Mutex
 	activeMu    sync.Mutex
 	activeOps   map[string]int
-	timerOps    uint64
 	admissionMu sync.Mutex
 	resident    bool
 	ready       bool
@@ -586,7 +604,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if isJournaledTimerAction(action, request) {
 		request = cloneMap(request)
 		if request["operation_id"] == nil {
-			request["operation_id"] = fmt.Sprintf("timer-%s-%d", strings.TrimPrefix(action, "timer-"), atomic.AddUint64(&s.timerOps, 1))
+			request["operation_id"] = newTimerOperationID(action)
 		}
 		if request["generation"] == nil {
 			request["generation"] = int64(0)
@@ -671,7 +689,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if s.Snapshots != nil {
 		_ = s.publishSnapshot(action, response)
 	}
-	if write {
+	if write && !isJournaledTimerAction(action, request) {
 		s.wakeScheduler()
 	}
 	return response, nil

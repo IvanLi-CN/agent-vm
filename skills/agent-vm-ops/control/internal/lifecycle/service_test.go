@@ -634,6 +634,42 @@ func TestTimerReconcileContinuesReleaseCleanupDuringDrain(t *testing.T) {
 	}
 }
 
+func TestTimerOperationsDoNotWakeSchedulerOrReplayAcrossServices(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "timer-operation-identity.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	wakeCount := 0
+	service := New(store, config.Defaults(), Options{Wake: func() { wakeCount++ }})
+	first, err := service.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondService := New(store, config.Defaults(), Options{})
+	second, err := secondService.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstID, firstOK := first["operation_id"].(string)
+	secondID, secondOK := second["operation_id"].(string)
+	if !firstOK || !secondOK || firstID == "" || secondID == "" || firstID == secondID {
+		t.Fatalf("timer operation IDs = %q and %q", firstID, secondID)
+	}
+	if wakeCount != 0 {
+		t.Fatalf("timer reconcile woke scheduler %d times", wakeCount)
+	}
+	for _, operationID := range []string{firstID, secondID} {
+		operation, getErr := store.GetOperation(context.Background(), operationID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		if operation == nil || operation.Response["outcome"] != "success" {
+			t.Fatalf("timer operation %q = %#v", operationID, operation)
+		}
+	}
+}
+
 func TestIncompatibleCapabilityIsRejectedBeforeJournalClaim(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
