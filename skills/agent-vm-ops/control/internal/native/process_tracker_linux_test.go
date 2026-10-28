@@ -365,11 +365,16 @@ func TestWorkerAliveDetectsSurvivingProcessGroupAfterRootExit(t *testing.T) {
 }
 
 func TestKillWorkerCleansRootAndLiveGroupMember(t *testing.T) {
-	command := exec.Command("/bin/sh", "-c", "sleep 30 & wait")
+	command := exec.Command("/bin/sh", "-c", "sleep 30 & child=$!; echo $child; wait")
 	configureCommand(command)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := command.Start(); err != nil {
 		t.Fatal(err)
 	}
+	defer stdout.Close()
 	waited := false
 	defer func() {
 		if !waited {
@@ -380,6 +385,21 @@ func TestKillWorkerCleansRootAndLiveGroupMember(t *testing.T) {
 	identity, err := workerIdentity(command.Process.Pid)
 	if err != nil {
 		t.Fatal(err)
+	}
+	scanner := bufio.NewScanner(stdout)
+	if !scanner.Scan() {
+		t.Fatal("worker did not report its live group member")
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(scanner.Text()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	childIdentity, err := workerIdentity(childPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childIdentity.ProcessGroup != identity.ProcessGroup {
+		t.Fatalf("child process group = %d, want root group %d", childIdentity.ProcessGroup, identity.ProcessGroup)
 	}
 	if err := KillWorker(identity); err != nil {
 		t.Fatalf("KillWorker() error = %v, want nil", err)
@@ -515,6 +535,63 @@ func TestKillProcessGroupDoesNotClaimUnanchoredMembers(t *testing.T) {
 	}
 }
 
+func TestKillProcessGroupRejectsStaleRootSnapshot(t *testing.T) {
+	identity := WorkerIdentity{PID: 123, StartTime: "root", ProcessGroup: 123}
+	for _, test := range []struct {
+		name      string
+		readRoot  func(int) (trackedProcess, error)
+		wantErr   string
+		wantNoErr bool
+	}{
+		{
+			name: "root exited after table scan",
+			readRoot: func(int) (trackedProcess, error) {
+				return trackedProcess{}, &os.PathError{Op: "read", Path: "/proc/123/stat", Err: unix.ESRCH}
+			},
+			wantNoErr: true,
+		},
+		{
+			name: "root identity changed after table scan",
+			readRoot: func(int) (trackedProcess, error) {
+				return trackedProcess{pid: 123, start: "new-root", group: 123}, nil
+			},
+			wantErr: "identity changed",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			cleanup := &workerGroupCleanup{rootPIDFD: 42, members: make(map[int]trackedProcess)}
+			err := killProcessGroupWith(identity, cleanup, processGroupKillOps{
+				readTable: func() (map[int]trackedProcess, error) {
+					return map[int]trackedProcess{
+						123: {pid: 123, start: "root", parent: 1, group: 123, state: 'S'},
+						456: {pid: 456, start: "member", parent: 123, group: 123, state: 'S'},
+					}, nil
+				},
+				openPIDFD: func(int) (int, error) {
+					t.Fatal("stale root snapshot claimed a member pidfd")
+					return -1, nil
+				},
+				closePIDFD:  func(int) error { return nil },
+				readProcess: test.readRoot,
+				sendSignal: func(int) error {
+					t.Fatal("stale root snapshot signalled a process")
+					return nil
+				},
+			})
+			if test.wantNoErr {
+				if err != nil {
+					t.Fatalf("killProcessGroupWith() error = %v, want nil", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("killProcessGroupWith() error = %v, want %q", err, test.wantErr)
+			}
+			if len(cleanup.members) != 0 || cleanup.rootSignaled {
+				t.Fatalf("stale root cleanup state = %#v, want no claimed members or root signal", cleanup)
+			}
+		})
+	}
+}
+
 func TestKillWorkerConfirmsProcessGroupGoneAfterMemberScan(t *testing.T) {
 	identity := WorkerIdentity{PID: 123, StartTime: "1", ProcessGroup: 123}
 	groupChecks := 0
@@ -592,14 +669,20 @@ func TestWorkerGroupAliveUsesKernelGroupPresence(t *testing.T) {
 }
 
 func TestWorkerGroupAliveTreatsOnlyZombiesAsGone(t *testing.T) {
-	alive, err := workerGroupAlive(123, func() (map[int]trackedProcess, error) {
-		return map[int]trackedProcess{456: {pid: 456, group: 123, state: 'Z'}}, nil
+	group := 1 << 30
+	calls := 0
+	alive, err := workerGroupAlive(group, func() (map[int]trackedProcess, error) {
+		calls++
+		return map[int]trackedProcess{456: {pid: 456, group: group, state: 'Z'}}, nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if alive {
 		t.Fatal("workerGroupAlive() treated a zombie-only group as live")
+	}
+	if calls != 2 {
+		t.Fatalf("workerGroupAlive() read table %d times, want zombie refresh", calls)
 	}
 }
 

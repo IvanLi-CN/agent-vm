@@ -57,14 +57,13 @@ func workerGroupAlive(group int, readTable func() (map[int]trackedProcess, error
 		sawZombie = true
 	}
 	if sawZombie {
-		// Refresh once before treating a zombie-only snapshot as gone. If the
-		// refresh is empty, the kernel probe below closes the enumeration gap;
-		// if it still contains only zombies, no executable ownership remains.
+		// Refresh once before treating a zombie-only snapshot as gone. The
+		// kernel probe below must still run after the refresh because both
+		// procfs snapshots can miss an active member.
 		refreshed, refreshErr := readTable()
 		if refreshErr != nil {
 			return false, refreshErr
 		}
-		sawZombie = false
 		for _, candidate := range refreshed {
 			if candidate.group != group {
 				continue
@@ -72,18 +71,12 @@ func workerGroupAlive(group int, readTable func() (map[int]trackedProcess, error
 			if candidate.state != 'Z' {
 				return true, nil
 			}
-			sawZombie = true
-		}
-		if sawZombie {
-			// Zombies have no executable ownership left. A subreaper may still
-			// need to reap them, but they must not keep a completed worker alive.
-			return false, nil
 		}
 	}
 	// A procfs table is a point-in-time enumeration: a surviving member can
 	// fork after enumeration and exit before its stat file is read. The kernel
 	// process-group probe closes that false-empty window when procfs has no
-	// group members at all.
+	// live group members after the optional zombie refresh.
 	if err := unix.Kill(-group, 0); err == nil || errors.Is(err, unix.EPERM) {
 		return true, nil
 	} else if !errors.Is(err, unix.ESRCH) {
@@ -250,6 +243,21 @@ func killProcessGroupWith(identity WorkerIdentity, cleanup *workerGroupCleanup, 
 			return fmt.Errorf("native worker identity changed for pid %d", identity.PID)
 		}
 		if root.group != identity.ProcessGroup {
+			return fmt.Errorf("native worker process group changed for pid %d", identity.PID)
+		}
+		currentRoot, rootErr := ops.readProcess(identity.PID)
+		if processGone(rootErr) {
+			// The table retained a stale root entry. Do not claim any members
+			// from a snapshot that may already contain a reused numeric PGID.
+			return nil
+		}
+		if rootErr != nil {
+			return fmt.Errorf("recheck native worker root: %w", rootErr)
+		}
+		if currentRoot.start != identity.StartTime {
+			return fmt.Errorf("native worker identity changed for pid %d", identity.PID)
+		}
+		if currentRoot.group != identity.ProcessGroup {
 			return fmt.Errorf("native worker process group changed for pid %d", identity.PID)
 		}
 	} else if !cleanup.rootSignaled {
