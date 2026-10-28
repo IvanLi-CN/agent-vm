@@ -189,6 +189,29 @@ func TestSnapshotMetricsOmitSlotEstimatesForUnverifiedRemaining(t *testing.T) {
 	}
 }
 
+func TestSnapshotMetricsOmitSlotEstimatesForInconsistentObservation(t *testing.T) {
+	metrics := snapshotMetrics("capacity", map[string]any{
+		"up":                     true,
+		"observation_consistent": false,
+		"resources": map[string]any{
+			"remaining": map[string]any{"cpu": int64(6), "memory_mib": int64(10), "disk_gib": int64(40)},
+		},
+		"default_admission": map[string]any{
+			"requested":          map[string]any{"cpu": int64(2), "memory_mib": int64(4), "disk_gib": int64(20)},
+			"request_cost_bytes": int64(40),
+		},
+		"disk_admission": map[string]any{"physical_admission": map[string]any{"remaining_bytes": int64(80)}},
+		"ct_cpu": map[string]any{
+			"capacity_vcpu":    int64(8),
+			"startup_pressure": map[string]any{"verified": true, "startup_blocked": false},
+		},
+	})
+	text := strings.Join(metricsAsSortedLines(metrics), "\n")
+	if strings.Contains(text, "agent_vm_admission_default_vm_logical_slots") || strings.Contains(text, "agent_vm_admission_default_vm_startable_slots") {
+		t.Fatalf("inconsistent slot estimates were published: %s", text)
+	}
+}
+
 func TestSnapshotMetricsExposeOperationFailureAndWarningSummaries(t *testing.T) {
 	metrics := snapshotMetrics("capacity", map[string]any{
 		"up":                    true,

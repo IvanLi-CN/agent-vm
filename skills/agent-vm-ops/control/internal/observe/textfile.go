@@ -292,6 +292,12 @@ func addSummaryMetrics(result map[string]string, name string, values map[string]
 }
 
 func addDefaultSlotMetrics(result map[string]string, object map[string]any) {
+	if rawConsistency, present := object["observation_consistent"]; present {
+		consistent, ok := rawConsistency.(bool)
+		if !ok || !consistent {
+			return
+		}
+	}
 	defaultAdmission, ok := objectMap(object["default_admission"])
 	if !ok {
 		return

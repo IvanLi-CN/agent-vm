@@ -1737,6 +1737,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	now := s.Clock()
 	deadline := now.Add(time.Duration(s.Config.InitialLeaseSeconds) * time.Second)
 	created := false
+	appliedResources := map[string]int64{}
 	if task == nil {
 		created = true
 		lease := nowString(deadline)
@@ -1761,6 +1762,10 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if task.State != stateCached {
 			return nil, protocol.NewError("task_transition", "session slot is not available until reconciliation completes", map[string]any{"state": task.State})
 		}
+		cachedResources, resourceErr := decodeResourceMap(task.ResourcesJSON, "cached task resources", false)
+		if resourceErr != nil {
+			return nil, protocol.NewError("resource_unverified", "cached task resources cannot be verified", map[string]any{"task_id": task.TaskID, "verified": false})
+		}
 		if usable, imageErr := s.Store.CachedImageUsable(ctx, task.ImageFingerprint); imageErr != nil {
 			return nil, s.sqliteError(imageErr)
 		} else if !usable {
@@ -1782,6 +1787,9 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		task.ResourceReservationJSON = mustJSON(resources)
 		task.ReservationBytes = 0
 		task.LeaseExpiresAt = stringPointer(nowString(deadline))
+		appliedResources = cloneResourceMap(cachedResources)
+		resumeMarker := mustJSON(map[string]any{"phase": "resume-preparing", "previous_resources": cachedResources, "applied_resources": appliedResources})
+		task.LastError = stringPointer(resumeMarker)
 	}
 	if err := s.checkAdmission(ctx, resources, task.TaskID, true); err != nil {
 		return nil, err
@@ -1800,7 +1808,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if err := s.Store.InsertTask(ctx, *task); err != nil {
 			return nil, s.sqliteError(err)
 		}
-	} else if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"generation": task.Generation, "state": task.State, "resources_json": task.ResourcesJSON, "resource_reservation_json": task.ResourceReservationJSON, "reservation_bytes": reservationBytes, "lease_expires_at": task.LeaseExpiresAt, "updated_at": nowString(now), "last_error": nil, "image_fingerprint": task.ImageFingerprint, "previous_generation": task.PreviousGeneration}); err != nil {
+	} else if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"generation": task.Generation, "state": task.State, "resources_json": task.ResourcesJSON, "resource_reservation_json": task.ResourceReservationJSON, "reservation_bytes": reservationBytes, "lease_expires_at": task.LeaseExpiresAt, "updated_at": nowString(now), "last_error": task.LastError, "image_fingerprint": task.ImageFingerprint, "previous_generation": task.PreviousGeneration}); err != nil {
 		return nil, s.sqliteError(err)
 	}
 	if operationID := native.WorkerOperationID(ctx); operationID != "" {
@@ -1841,11 +1849,29 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if err := s.Guest.ConfigSet(nativeCtx, task.InstanceName, "limits.cpu", strconv.FormatInt(resources["cpu"], 10)); err != nil {
 			return s.failTask(ctx, task, "native-config", err)
 		}
+		if !created {
+			appliedResources["cpu"] = resources["cpu"]
+			if err := s.persistResumeProgress(ctx, task, appliedResources); err != nil {
+				return nil, err
+			}
+		}
 		if err := s.Guest.ConfigSet(nativeCtx, task.InstanceName, "limits.memory", strconv.FormatInt(resources["memory_mib"], 10)+"MiB"); err != nil {
 			return s.failTask(ctx, task, "native-config", err)
 		}
+		if !created {
+			appliedResources["memory_mib"] = resources["memory_mib"]
+			if err := s.persistResumeProgress(ctx, task, appliedResources); err != nil {
+				return nil, err
+			}
+		}
 		if err := s.Guest.DeviceSet(nativeCtx, task.InstanceName, "root", "size", strconv.FormatInt(resources["disk_gib"], 10)+"GiB"); err != nil {
 			return s.failTask(ctx, task, "native-config", err)
+		}
+		if !created {
+			appliedResources["disk_gib"] = resources["disk_gib"]
+			if err := s.persistResumeProgress(ctx, task, appliedResources); err != nil {
+				return nil, err
+			}
 		}
 		if err := s.Guest.Start(nativeCtx, task.InstanceName); err != nil {
 			return s.failTask(ctx, task, "native-start", err)
@@ -1868,7 +1894,7 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		return s.failTask(ctx, task, "lease-expiry", errors.New("lease expired during preparation"))
 	}
 	commitNow := s.Clock()
-	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{statePreparing}, LeaseActiveAfter: &commitNow}, map[string]any{"state": stateActive, "lease_expires_at": nowString(deadline), "inactive_since": nil, "cleanup_after": nil, "updated_at": nowString(commitNow), "resource_reservation_json": "{}", "reservation_bytes": int64(0)})
+	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{statePreparing}, LeaseActiveAfter: &commitNow}, map[string]any{"state": stateActive, "lease_expires_at": nowString(deadline), "inactive_since": nil, "cleanup_after": nil, "updated_at": nowString(commitNow), "last_error": nil, "resource_reservation_json": "{}", "reservation_bytes": int64(0)})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
@@ -2058,10 +2084,16 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	}
 	resourcesJSON := mustJSON(zeroResources())
 	if !destroy {
-		// Cached tasks retain their last requested resources so a same-size
-		// resume is not misclassified as a disk growth operation. Cached tasks
-		// are excluded from active logical and physical allocation totals.
+		// Cached tasks retain their last applied resources so a same-size resume
+		// is not misclassified as a disk growth operation. Cached tasks are
+		// excluded from active logical and physical allocation totals.
 		resourcesJSON = task.ResourcesJSON
+		if applied, ok := resumeAppliedResources(task); ok {
+			// A failed resume may have applied only a prefix of the requested
+			// native dimensions. Retain the last durably recorded applied map so
+			// the next resume still charges any dimension that was not applied.
+			resourcesJSON = mustJSON(applied)
+		}
 	}
 	updates := map[string]any{"state": stateValue, "updated_at": nowString(s.Clock()), "resources_json": resourcesJSON, "resource_reservation_json": "{}", "reservation_bytes": int64(0)}
 	if destroy {
@@ -4267,11 +4299,21 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 			}
 			return false, cacheErr
 		}
-		cleanupRequest := protocol.Request{"session_id": current.SessionID, "generation": current.Generation}
-		_, releaseErr := s.releaseUnlocked(withInternalCleanup(ctx), cleanupRequest, true)
+		cleanupRequest, cleanupOperationID, cleanupRequestErr := s.claimReclaimCleanup(ctx, current)
+		if cleanupRequestErr != nil {
+			unlockSession()
+			return false, cleanupRequestErr
+		}
+		finishActive := s.markOperationActive(cleanupOperationID)
+		cleanupCtx := native.WithWorkerRecorder(withInternalCleanup(ctx), cleanupOperationID, s)
+		cleanupResult, releaseErr := s.releaseUnlocked(cleanupCtx, cleanupRequest, true)
+		finishActive()
 		unlockSession()
 		if releaseErr != nil {
 			return false, releaseErr
+		}
+		if finalizeErr := s.finalizePendingCleanup(ctx, current.SessionID, current.Generation, "destroy", cleanupResult); finalizeErr != nil {
+			return false, finalizeErr
 		}
 		reclaimedAny = true
 		admission, admissionErr := s.diskAdmission(ctx, excludeTaskID)
@@ -4309,6 +4351,50 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 		return false, sufficientErr
 	}
 	return sufficient, nil
+}
+
+// claimReclaimCleanup gives a cached session reclaimed by another admission
+// request its own destroy journal. The caller's acquire operation must not own
+// the worker identity for this different session, or a failed delete could be
+// retried without the session-scoped worker fence.
+func (s *Service) claimReclaimCleanup(ctx context.Context, task *state.Task) (protocol.Request, string, error) {
+	request, operationID, err := s.pendingCleanupRequest(ctx, task.SessionID, task.Generation, "destroy")
+	if err != nil {
+		return nil, "", err
+	}
+	if operationID != "" {
+		return request, operationID, nil
+	}
+	operationID = newTimerOperationID("reclaim-destroy")
+	request = protocol.Request{
+		"protocol":     protocol.Version,
+		"action":       "destroy",
+		"session_id":   task.SessionID,
+		"generation":   task.Generation,
+		"operation_id": operationID,
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		return nil, "", protocol.NewError("operation_unverified", "reclaim cleanup request cannot be canonicalized", map[string]any{"session_id": task.SessionID, "generation": task.Generation})
+	}
+	pending := map[string]any{
+		"outcome":          "pending",
+		"_request_digest":  digest,
+		"_request":         map[string]any(request),
+		"_task_id":         task.TaskID,
+		"_task_generation": task.Generation,
+		"worker":           map[string]any{"state": "starting", "start_attempted": false, "prepared_at": nowString(s.Clock())},
+	}
+	session := task.SessionID
+	generation := task.Generation
+	existing, err := s.Store.ClaimOperation(ctx, operationID, "destroy", &session, &generation, pending)
+	if err != nil {
+		return nil, "", s.sqliteError(err)
+	}
+	if existing != nil {
+		return nil, "", protocol.NewError("operation_unverified", "generated reclaim cleanup operation already exists", map[string]any{"operation_id": operationID})
+	}
+	return request, operationID, nil
 }
 
 func (s *Service) admissionStorageCost(ctx context.Context, excludeTaskID string, requested map[string]int64, startup bool) (int64, error) {
@@ -4582,7 +4668,13 @@ func requestHasResourceFields(request protocol.Request) bool {
 
 func (s *Service) failTask(ctx context.Context, task *state.Task, phase string, err error) (map[string]any, error) {
 	detail := nativePhaseDetail(phase, err)
-	if stateErr := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
+	resourcesJSON := task.ResourcesJSON
+	if applied, ok := resumeAppliedResources(task); ok {
+		resourcesJSON = mustJSON(applied)
+		detail["applied_resources"] = applied
+		task.ResourcesJSON = resourcesJSON
+	}
+	if stateErr := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "resources_json": resourcesJSON, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
 		detail["state_persisted"] = false
 		detail["state_error"] = stateErr.Error()
 		return nil, protocol.NewError("state_unverified", "native failure could not be durably recorded", detail)
@@ -4593,16 +4685,69 @@ func (s *Service) failTask(ctx context.Context, task *state.Task, phase string, 
 
 func (s *Service) failTaskForOperation(ctx context.Context, task *state.Task, phase string, err error, operationID string) (map[string]any, error) {
 	detail := nativePhaseDetail(phase, err)
+	resourcesJSON := task.ResourcesJSON
+	if applied, ok := resumeAppliedResources(task); ok {
+		resourcesJSON = mustJSON(applied)
+		detail["applied_resources"] = applied
+		task.ResourcesJSON = resourcesJSON
+	}
 	if operationID != "" {
 		detail["operation_id"] = operationID
 	}
-	if stateErr := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
+	if stateErr := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "resources_json": resourcesJSON, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
 		detail["state_persisted"] = false
 		detail["state_error"] = stateErr.Error()
 		return nil, protocol.NewError("state_unverified", "native failure could not be durably recorded", detail)
 	}
 	detail["state_persisted"] = true
 	return nil, protocol.NewError("native_failed", "native lifecycle action failed", detail)
+}
+
+func (s *Service) persistResumeProgress(ctx context.Context, task *state.Task, applied map[string]int64) error {
+	if task == nil || task.PreviousGeneration == nil {
+		return nil
+	}
+	marker := mustJSON(map[string]any{
+		"phase":              "resume-preparing",
+		"previous_resources": applied,
+		"applied_resources":  applied,
+	})
+	task.LastError = stringPointer(marker)
+	if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"last_error": marker, "updated_at": nowString(s.Clock())}); err != nil {
+		return s.sqliteError(err)
+	}
+	return nil
+}
+
+func resumeAppliedResources(task *state.Task) (map[string]int64, bool) {
+	if task == nil || task.PreviousGeneration == nil || task.LastError == nil {
+		return nil, false
+	}
+	var detail map[string]any
+	if json.Unmarshal([]byte(*task.LastError), &detail) != nil {
+		return nil, false
+	}
+	raw, ok := detail["applied_resources"]
+	if !ok {
+		return nil, false
+	}
+	encoded, err := json.Marshal(raw)
+	if err != nil {
+		return nil, false
+	}
+	resources, err := decodeResourceMap(string(encoded), "resume applied resources", false)
+	if err != nil {
+		return nil, false
+	}
+	return resources, true
+}
+
+func cloneResourceMap(resources map[string]int64) map[string]int64 {
+	clone := make(map[string]int64, len(resources))
+	for key, value := range resources {
+		clone[key] = value
+	}
+	return clone
 }
 
 func nativePhaseDetail(phase string, err error) map[string]any {

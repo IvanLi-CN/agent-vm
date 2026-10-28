@@ -73,20 +73,22 @@ func (guest *capacityGuest) Probe(context.Context) error {
 }
 
 type startupGuest struct {
-	initErr      error
-	status       string
-	statusErr    error
-	statuses     []map[string]any
-	statusCalls  int
-	deleteCalls  int
-	config       map[string]any
-	configErr    error
-	configSetErr error
-	deviceSetErr error
-	initEntered  chan<- struct{}
-	initRelease  <-chan struct{}
-	stopErr      error
-	deviceSets   []string
+	initErr             error
+	status              string
+	statusErr           error
+	statuses            []map[string]any
+	statusCalls         int
+	deleteCalls         int
+	config              map[string]any
+	configErr           error
+	configSetErr        error
+	deviceSetErr        error
+	deviceSetFailDevice string
+	initEntered         chan<- struct{}
+	initRelease         <-chan struct{}
+	stopErr             error
+	deleteErr           error
+	deviceSets          []string
 }
 
 func (guest *startupGuest) Init(_ context.Context, _, _ string, ownership map[string]string) error {
@@ -118,7 +120,7 @@ func (guest *startupGuest) ConfigSet(_ context.Context, _ string, key, value str
 }
 
 func (guest *startupGuest) DeviceSet(_ context.Context, _ string, device, key, value string) error {
-	if guest.deviceSetErr != nil {
+	if guest.deviceSetErr != nil && (guest.deviceSetFailDevice == "" || guest.deviceSetFailDevice == device) {
 		return guest.deviceSetErr
 	}
 	guest.deviceSets = append(guest.deviceSets, device+":"+key+"="+value)
@@ -130,7 +132,10 @@ func (guest *startupGuest) DeviceAdd(context.Context, string, string, string, ma
 func (guest *startupGuest) DeviceRemove(context.Context, string, string) error { return nil }
 func (guest *startupGuest) Start(context.Context, string) error                { return nil }
 func (guest *startupGuest) Stop(context.Context, string) error                 { return guest.stopErr }
-func (guest *startupGuest) Delete(context.Context, string) error               { guest.deleteCalls++; return nil }
+func (guest *startupGuest) Delete(context.Context, string) error {
+	guest.deleteCalls++
+	return guest.deleteErr
+}
 func (guest *startupGuest) Status(context.Context, string) (map[string]any, error) {
 	if guest.statusErr != nil {
 		return nil, guest.statusErr
@@ -1000,6 +1005,76 @@ func TestCachedResumeWithDiskGrowthChargesBothPhysicalCosts(t *testing.T) {
 	}
 }
 
+func TestFailedCachedResumeRetainsLastAppliedResourcesForRetryCost(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "failed-cached-resume.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	fingerprint := strings.Repeat("a", 64)
+	if err := store.SeedLegacyImage(ctx, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateManagedImageVerification(ctx, fingerprint, "passed", "passed", nil, "available"); err != nil {
+		t.Fatal(err)
+	}
+	session := "failed-cached-resume-session"
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "failed-cached-resume-task", SessionID: session, Generation: 1, State: stateCached,
+		InstanceName: "agent-failed-cached-resume", VMIP: stringPointer("10.0.0.10"), ImageFingerprint: fingerprint,
+		CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Network = ""
+	cfg.NetworkACL = ""
+	guest := &startupGuest{
+		status:              "Stopped",
+		deviceSetErr:        errors.New("disk resize unavailable"),
+		deviceSetFailDevice: "root",
+		config: map[string]any{
+			"config": map[string]any{
+				"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "failed-cached-resume-task",
+				"user.agent-vm.session": session, "user.agent-vm.generation": "1",
+			},
+			"devices": map[string]any{},
+			"expanded_devices": map[string]any{"eth0": map[string]any{
+				"type": "nic", "network": "", "ipv4.address": "10.0.0.10",
+				"security.mac_filtering": "true", "security.ipv4_filtering": "true",
+				"security.ipv6_filtering": "true", "security.port_isolation": "true",
+				"security.acls": "", "security.acls.default.ingress.action": "allow",
+				"security.acls.default.egress.action": "allow",
+			}},
+		},
+	}
+	service := New(store, cfg, Options{Guest: guest})
+	_, err = service.acquire(ctx, protocol.Request{"session_id": session, "generation": int64(1)})
+	if protocol.AsError(err).Code != "native_failed" {
+		t.Fatalf("failed cached resume error = %#v", err)
+	}
+	if _, err := service.reconcile(ctx, true); err != nil {
+		t.Fatalf("failed cached resume cleanup = %v", err)
+	}
+	cached, err := store.GetTask(ctx, map[string]any{"session_id": session})
+	if err != nil || cached == nil || cached.State != stateCached {
+		t.Fatalf("cached failed resume task = %#v err=%v", cached, err)
+	}
+	resources, resourceErr := decodeResourceMap(cached.ResourcesJSON, "cached failed resume resources", false)
+	if resourceErr != nil || !sameResources(resources, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}) {
+		t.Fatalf("cached failed resume resources = %s err=%v", cached.ResourcesJSON, resourceErr)
+	}
+	cost, err := service.admissionStorageCost(ctx, cached.TaskID, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 40}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cost != cfg.ResumeCostBytes+cfg.ResizeCostBytes {
+		t.Fatalf("retry physical cost = %d, want %d", cost, cfg.ResumeCostBytes+cfg.ResizeCostBytes)
+	}
+}
+
 func TestCachedReleaseRetainsResourcesForResumeCostClassification(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -1116,6 +1191,57 @@ func TestReclaimCachedCapacityUsesOldestCacheFirst(t *testing.T) {
 	}
 	if task, err := store.GetTask(context.Background(), map[string]any{"task_id": "a-new-cache"}); err != nil || task == nil {
 		t.Fatalf("newer cache task = %#v err=%v", task, err)
+	}
+}
+
+func TestReclaimCachedCapacityJournalsSessionScopedCleanup(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	session := "reclaim-journal-session"
+	generation := int64(1)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "reclaim-journal-task", SessionID: session, Generation: generation, State: stateCached,
+		InstanceName: "agent-reclaim-journal", CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{startupGuest: &startupGuest{
+		status:    "Stopped",
+		deleteErr: errors.New("delete interrupted"),
+		config: map[string]any{
+			"config": map[string]any{
+				"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "reclaim-journal-task",
+				"user.agent-vm.session": session, "user.agent-vm.generation": "1",
+			},
+			"devices": map[string]any{}, "expanded_devices": map[string]any{},
+		},
+	}, capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 10 * gib}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	service.admissionMu.Lock()
+	_, reclaimErr := service.reclaimCachedCapacity(context.Background(), 1, "", 0)
+	service.admissionMu.Unlock()
+	if reclaimErr == nil {
+		t.Fatal("reclaim unexpectedly succeeded")
+	}
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Action != "destroy" || pending[0].SessionID == nil || *pending[0].SessionID != session {
+		t.Fatalf("pending reclaim cleanup = %#v", pending)
+	}
+	request, ok := pending[0].Response["_request"].(map[string]any)
+	if !ok || request["session_id"] != session || request["operation_id"] != pending[0].OperationID {
+		t.Fatalf("reclaim cleanup request = %#v", pending[0].Response["_request"])
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"task_id": "reclaim-journal-task"})
+	if err != nil || task == nil || task.State != stateDeleting {
+		t.Fatalf("reclaim task = %#v err=%v", task, err)
 	}
 }
 
