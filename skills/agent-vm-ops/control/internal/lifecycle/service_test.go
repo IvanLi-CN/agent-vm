@@ -31,6 +31,11 @@ type staticCPUObserver struct {
 	err         error
 }
 
+type staticMemoryObserver struct {
+	observation observe.MemoryObservation
+	err         error
+}
+
 type capacityGuest struct {
 	*startupGuest
 	capacity        native.StorageCapacity
@@ -151,6 +156,10 @@ func (guest *startupGuest) Exec(context.Context, string, []string, []byte) (nati
 }
 
 func (observer staticCPUObserver) Observe(context.Context) (observe.CPUObservation, error) {
+	return observer.observation, observer.err
+}
+
+func (observer staticMemoryObserver) Observe(context.Context) (observe.MemoryObservation, error) {
 	return observer.observation, observer.err
 }
 
@@ -967,6 +976,33 @@ func TestAdminMetricsPreservesPhysicalCapacityAndAdmissionCost(t *testing.T) {
 	}
 }
 
+func TestAdminMetricsPublishesVerifiedMemoryObservation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	current := int64(3 * 1024 * 1024 * 1024)
+	service := New(store, config.Defaults(), Options{
+		Memory: staticMemoryObserver{observation: observe.MemoryObservation{
+			LimitBytes: 4 * 1024 * 1024 * 1024, AvailableBytes: 512 * 1024 * 1024,
+			CurrentBytes: &current, ThresholdBytes: 1024 * 1024 * 1024,
+			OOMEvents: map[string]int64{"oom": 2},
+		}},
+	})
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	memory := metrics["ct_memory"].(map[string]any)
+	if memory["capacity_bytes"] != int64(4*1024*1024*1024) || memory["current_bytes"] != &current || memory["available_bytes"] != int64(512*1024*1024) {
+		t.Fatalf("ct memory = %#v", memory)
+	}
+	if memory["pressure"] != true || memory["oom_events"].(map[string]int64)["oom"] != 2 {
+		t.Fatalf("ct memory pressure = %#v", memory)
+	}
+}
+
 func TestAdminMetricsDefaultAdmissionMatchesPhysicalRejection(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -1053,6 +1089,64 @@ func TestAdmissionReclaimsCachedCapacityBeforeRejectingPhysicalSpace(t *testing.
 	}
 }
 
+func TestAdmissionDoesNotReclaimCachedCapacityWhenStartupPressureRejects(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "pressure-cache", SessionID: "pressure-cache-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-pressure-cache", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{
+			status: "Stopped",
+			config: map[string]any{
+				"config": map[string]any{
+					"user.agent-vm.managed":    "native-v1",
+					"user.agent-vm.task":       "pressure-cache",
+					"user.agent-vm.session":    "pressure-cache-session",
+					"user.agent-vm.generation": "1",
+				},
+				"devices": map[string]any{}, "expanded_devices": map[string]any{},
+			},
+		},
+		capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 25 * gib},
+	}
+	guest.capacityFunc = func() native.StorageCapacity {
+		if guest.deleteCalls > 0 {
+			return native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 60 * gib}
+		}
+		return guest.capacity
+	}
+	cfg := config.Defaults()
+	cfg.DiskLowBytes = 20 * gib
+	cfg.DiskTargetBytes = 30 * gib
+	cfg.CreateCostBytes = 10 * gib
+	cfg.CPUStartupPressureFullAvg10Percent = 20
+	service := New(store, cfg, Options{
+		Guest: guest,
+		CPU:   staticCPUObserver{observation: observe.CPUObservation{Capacity: 1, Full: observe.PSIValues{Avg10: 50}}},
+		Clock: func() time.Time { return now },
+	})
+	control := protocol.AsError(service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true))
+	if control == nil || control.Code != "resource_pressure" {
+		t.Fatalf("startup pressure rejection = %#v", control)
+	}
+	if guest.deleteCalls != 0 {
+		t.Fatalf("cached delete calls = %d", guest.deleteCalls)
+	}
+	if task, err := store.GetTask(context.Background(), map[string]any{"task_id": "pressure-cache"}); err != nil || task == nil {
+		t.Fatalf("pressure cache task = %#v err=%v", task, err)
+	}
+}
+
 func TestInconsistentAdminMetricsCannotReportReady(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -1133,8 +1227,8 @@ func TestFailedSnapshotRefreshInvalidatesPreviousSource(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(inventory), `"tasks":[]`) {
-		t.Fatalf("failed inventory snapshot retained tasks = %s", inventory)
+	if strings.Contains(string(inventory), `"tasks"`) || strings.Contains(string(inventory), `"task_states"`) {
+		t.Fatalf("failed inventory snapshot retained unverifiable rows = %s", inventory)
 	}
 	inventoryMetrics, err := os.ReadFile(filepath.Join(snapshots.Directory, "inventory.prom"))
 	if err != nil {

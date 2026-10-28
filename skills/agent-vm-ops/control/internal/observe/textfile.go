@@ -153,6 +153,15 @@ func snapshotMetrics(source string, value any) map[string]string {
 			addMetric(result, "agent_vm_admission_default_request_physical_cost_bytes", defaultAdmission["request_cost_bytes"], 1)
 		}
 		addDefaultSlotMetrics(result, object)
+		if operations, ok := objectMap(object["operations"]); ok {
+			addSummaryMetrics(result, "agent_vm_operations_total", operations, []string{"action", "outcome", "phase"})
+		}
+		if failures, ok := objectMap(object["image_unpack_failures"]); ok {
+			addSummaryMetrics(result, "agent_vm_image_unpack_failures_total", failures, []string{"phase", "reason"})
+		}
+		if warnings, ok := objectMap(object["warning_counts"]); ok {
+			addSummaryMetrics(result, "agent_vm_warnings_total", warnings, []string{"code"})
+		}
 		if value, exists := object["reclaim_required"]; exists && value != nil {
 			addBooleanMetric(result, "agent_vm_admission_reclaim_required", value)
 		}
@@ -249,6 +258,39 @@ func addOOMMetrics(result map[string]string, value any) {
 	}
 }
 
+func addSummaryMetrics(result map[string]string, name string, values map[string]any, labels []string) {
+	for key, rawValue := range values {
+		_, ok := numeric(rawValue)
+		if !ok {
+			continue
+		}
+		parts := strings.Split(key, "|")
+		if len(parts) != len(labels) {
+			if len(labels) != 1 {
+				continue
+			}
+			parts = []string{key}
+		}
+		labelValues := make([]string, len(labels))
+		valid := true
+		for index, part := range parts {
+			if part == "" || strings.ContainsAny(part, "\r\n") {
+				valid = false
+				break
+			}
+			labelValues[index] = strconv.Quote(part)
+		}
+		if !valid {
+			continue
+		}
+		labelPairs := make([]string, len(labels))
+		for index, label := range labels {
+			labelPairs[index] = label + "=" + labelValues[index]
+		}
+		result[name] += fmt.Sprintf("%s{%s} %s\n", name, strings.Join(labelPairs, ","), number(rawValue))
+	}
+}
+
 func addDefaultSlotMetrics(result map[string]string, object map[string]any) {
 	defaultAdmission, ok := objectMap(object["default_admission"])
 	if !ok {
@@ -270,11 +312,13 @@ func addDefaultSlotMetrics(result map[string]string, object map[string]any) {
 	physical, physicalOK := objectMap(diskAdmission["physical_admission"])
 	cpuRemaining, cpuRemainingOK := integerValue(remaining["cpu"])
 	memoryRemaining, memoryRemainingOK := integerValue(remaining["memory_mib"])
+	diskRemaining, diskRemainingOK := integerValue(remaining["disk_gib"])
 	physicalRemaining, physicalRemainingOK := integerValue(physical["remaining_bytes"])
-	if !resourcesOK || !remainingOK || !diskOK || !physicalOK || !cpuRemainingOK || !memoryRemainingOK || !physicalRemainingOK {
+	diskRequest, diskRequestOK := integerValue(requested["disk_gib"])
+	if !resourcesOK || !remainingOK || !diskOK || !physicalOK || !cpuRemainingOK || !memoryRemainingOK || !diskRemainingOK || !diskRequestOK || !physicalRemainingOK {
 		return
 	}
-	logicalSlots := minSlots(slotRatio(cpuRemaining, cpuRequest), slotRatio(memoryRemaining, memoryRequest), slotRatio(physicalRemaining, physicalCost))
+	logicalSlots := minSlots(slotRatio(cpuRemaining, cpuRequest), slotRatio(memoryRemaining, memoryRequest), slotRatio(diskRemaining, diskRequest), slotRatio(physicalRemaining, physicalCost))
 	if logicalSlots < 0 {
 		return
 	}

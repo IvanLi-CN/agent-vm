@@ -96,6 +96,34 @@ func TestExistingSchemaLifecycleAndOpaqueEpoch(t *testing.T) {
 	}
 }
 
+func TestAuditSummaryAggregatesStableObservabilityLabels(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.Audit(ctx, "acquire", "task", "session", "error", intPointer(1), map[string]any{
+		"code": "image_unpack_failed", "phase": "native-unpack", "message": "image rootfs unpack failed",
+		"warnings": []map[string]any{{"code": "capacity_insufficient"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Audit(ctx, "acquire", "task", "session", "success", intPointer(1), map[string]any{"phase": "dispatch"}); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.AuditSummary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Operations["acquire|error|native-unpack"] != 1 || summary.Operations["acquire|success|dispatch"] != 1 {
+		t.Fatalf("operation summary = %#v", summary.Operations)
+	}
+	if summary.ImageUnpackFailures["native-unpack|image_unpack_failed"] != 1 || summary.Warnings["capacity_insufficient"] != 1 {
+		t.Fatalf("failure summary = %#v warnings=%#v", summary.ImageUnpackFailures, summary.Warnings)
+	}
+}
+
 func TestMissingDatabaseFailsClosed(t *testing.T) {
 	_, err := Open(filepath.Join(t.TempDir(), "missing.sqlite3"), false)
 	if err == nil {

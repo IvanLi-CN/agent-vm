@@ -107,7 +107,7 @@ func TestSnapshotMetricsPreserveMemoryOOMEvidenceAndSlotEstimates(t *testing.T) 
 		"resources": map[string]any{
 			"allocated":              map[string]any{"cpu": true, "memory_mib": int64(4)},
 			"allocated_and_reserved": map[string]any{"cpu": int64(3)},
-			"remaining":              map[string]any{"cpu": int64(6), "memory_mib": int64(10)},
+			"remaining":              map[string]any{"cpu": int64(6), "memory_mib": int64(10), "disk_gib": int64(40)},
 		},
 		"default_admission": map[string]any{
 			"requested":          map[string]any{"cpu": int64(2), "memory_mib": int64(4), "disk_gib": int64(20)},
@@ -141,6 +141,25 @@ func TestSnapshotMetricsPreserveMemoryOOMEvidenceAndSlotEstimates(t *testing.T) 
 	}
 	if strings.Contains(text, "agent_vm_admission_cpu_allocated_vcpu") {
 		t.Fatalf("boolean resource was coerced into a numeric metric: %s", text)
+	}
+}
+
+func TestSnapshotMetricsExposeOperationFailureAndWarningSummaries(t *testing.T) {
+	metrics := snapshotMetrics("capacity", map[string]any{
+		"up":                    true,
+		"operations":            map[string]any{"pending": int64(0), "acquire|success|dispatch": int64(4)},
+		"image_unpack_failures": map[string]any{"native-unpack|image_missing": int64(2)},
+		"warning_counts":        map[string]any{"memory_pressure": int64(3)},
+	})
+	text := strings.Join(metricsAsSortedLines(metrics), "\n")
+	for _, expected := range []string{
+		`agent_vm_operations_total{action="acquire",outcome="success",phase="dispatch"} 4`,
+		`agent_vm_image_unpack_failures_total{phase="native-unpack",reason="image_missing"} 2`,
+		`agent_vm_warnings_total{code="memory_pressure"} 3`,
+	} {
+		if !strings.Contains(text, expected) {
+			t.Fatalf("metrics missing %q: %s", expected, text)
+		}
 	}
 }
 

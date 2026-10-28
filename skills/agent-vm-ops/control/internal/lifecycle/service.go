@@ -76,6 +76,7 @@ type Service struct {
 	Clock     func() time.Time
 	Snapshots *observe.SnapshotStore
 	CPU       CPUObserver
+	Memory    MemoryObserver
 	Release   *protocol.ReleaseMetadata
 
 	mu              sync.RWMutex
@@ -110,6 +111,7 @@ type Options struct {
 	Snapshots *observe.SnapshotStore
 	Wake      func()
 	CPU       CPUObserver
+	Memory    MemoryObserver
 	Release   *protocol.ReleaseMetadata
 }
 
@@ -117,12 +119,16 @@ type CPUObserver interface {
 	Observe(context.Context) (observe.CPUObservation, error)
 }
 
+type MemoryObserver interface {
+	Observe(context.Context) (observe.MemoryObservation, error)
+}
+
 func New(store *state.Store, cfg config.Config, options Options) *Service {
 	clock := options.Clock
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Release: options.Release, resident: options.Resident, ready: false, wake: options.Wake, actionLocks: make(map[string]*sync.Mutex), activeOps: make(map[string]int)}
+	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Memory: options.Memory, Release: options.Release, resident: options.Resident, ready: false, wake: options.Wake, actionLocks: make(map[string]*sync.Mutex), activeOps: make(map[string]int)}
 }
 
 func (s *Service) MarkReady()  { s.mu.Lock(); s.ready = true; s.mu.Unlock() }
@@ -880,6 +886,13 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		if write && !uncertain(err) {
 			_ = s.recordError(ctx, request, err)
 		}
+		if write {
+			outcome := "error"
+			if uncertain(err) {
+				outcome = "unknown"
+			}
+			_ = s.recordAudit(ctx, request, outcome, err, nil)
+		}
 		return nil, err
 	}
 	response := protocol.SuccessWithRelease(request, result, s.Release, warnings)
@@ -890,6 +903,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		if err := s.Store.RecordOperation(ctx, operationID, stringValue(request["action"]), optionalString(request["session_id"]), generationPointer(intValue(request["generation"]), request["generation"] != nil), response); err != nil {
 			return nil, s.sqliteError(err)
 		}
+		_ = s.recordAudit(ctx, request, "success", nil, response)
 	}
 	if s.Snapshots != nil {
 		_ = s.publishSnapshot(action, response)
@@ -921,10 +935,6 @@ func (s *Service) publishSnapshotFailure(action string, err error) error {
 			"code":    control.Code,
 			"message": control.Message,
 		},
-	}
-	if source == "inventory" {
-		value["tasks"] = []any{}
-		value["task_states"] = map[string]int64{}
 	}
 	return s.Snapshots.Publish(source, value)
 }
@@ -1560,6 +1570,24 @@ func (s *Service) recordError(ctx context.Context, request protocol.Request, cau
 	digest, _ := protocol.Digest(request)
 	response := map[string]any{"outcome": "error", "error": control, "_request_digest": digest}
 	return s.Store.RecordOperation(ctx, op, stringValue(request["action"]), optionalString(request["session_id"]), generationPointer(intValue(request["generation"]), request["generation"] != nil), response)
+}
+
+func (s *Service) recordAudit(ctx context.Context, request protocol.Request, outcome string, cause error, response map[string]any) error {
+	detail := map[string]any{"phase": "dispatch"}
+	if cause != nil {
+		control := protocol.AsError(cause)
+		detail["code"] = control.Code
+		detail["message"] = control.Message
+		if control.Detail != nil {
+			detail["detail"] = control.Detail
+		}
+	}
+	if response != nil {
+		if warnings, ok := response["warnings"]; ok {
+			detail["warnings"] = warnings
+		}
+	}
+	return s.Store.Audit(ctx, stringValue(request["action"]), stringValue(request["task_id"]), stringValue(request["session_id"]), outcome, generationPointer(intValue(request["generation"]), request["generation"] != nil), detail)
 }
 
 func (s *Service) dispatchAction(ctx context.Context, action string, request protocol.Request) (any, error) {
@@ -2551,6 +2579,10 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			if managementPendingErr != nil {
 				return nil, s.sqliteError(managementPendingErr)
 			}
+			auditSummary, auditSummaryErr := s.Store.AuditSummary(ctx)
+			if auditSummaryErr != nil {
+				return nil, s.sqliteError(auditSummaryErr)
+			}
 			pendingOperations := make([]any, 0, len(pending))
 			for _, operation := range pending {
 				item := map[string]any{
@@ -2633,6 +2665,21 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				nativeUp = false
 				warnings = append(warnings, map[string]any{"code": "native_unavailable", "message": "Incus native availability could not be verified", "detail": map[string]any{"cause": nativeProbeErr.Error()}})
 			}
+			var memoryObservationValue *observe.MemoryObservation
+			var memoryObservationErr error
+			if s.Memory != nil {
+				value, observeErr := s.Memory.Observe(ctx)
+				if observeErr != nil {
+					memoryObservationErr = observeErr
+				} else {
+					memoryObservationValue = &value
+				}
+			} else if s.resident {
+				memoryObservationErr = errors.New("memory observer is not configured")
+			}
+			if memoryObservationErr != nil {
+				warnings = append(warnings, map[string]any{"code": "resource_unverified", "message": "CT memory observation is not verified", "detail": map[string]any{"cause": memoryObservationErr.Error()}})
+			}
 			draining, drainErr := s.isDraining(ctx)
 			if drainErr != nil {
 				return nil, s.sqliteError(drainErr)
@@ -2669,7 +2716,18 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				remaining["disk_gib"] = s.Config.DiskBudgetGiB - allocatedAndReserved["disk_gib"]
 			}
 			memoryObservation := map[string]any{"limit_bytes": nil, "current_bytes": nil, "available_bytes": nil, "threshold_bytes": nil, "pressure": nil, "oom_events": nil}
-			resourcesValue := map[string]any{"allocated": allocated, "reserved": reserved, "allocated_and_reserved": allocatedAndReserved, "limits": limits, "remaining": remaining, "policy": map[string]any{"cpu_overcommit_ratio": s.Config.CPUOvercommitRatio, "memory_overcommit_ratio": s.Config.MemoryOvercommitRatio, "cpu_startup_pressure_full_avg10_percent": s.Config.CPUStartupPressureFullAvg10Percent}, "memory": memoryObservation, "memory_pressure": nil}
+			if memoryObservationValue != nil {
+				memoryObservation["limit_bytes"] = memoryObservationValue.LimitBytes
+				memoryObservation["current_bytes"] = memoryObservationValue.CurrentBytes
+				memoryObservation["available_bytes"] = memoryObservationValue.AvailableBytes
+				memoryObservation["threshold_bytes"] = memoryObservationValue.ThresholdBytes
+				memoryObservation["pressure"] = memoryObservationValue.AvailableBytes < memoryObservationValue.ThresholdBytes
+				memoryObservation["oom_events"] = memoryObservationValue.OOMEvents
+				if memoryObservationValue.AvailableBytes < memoryObservationValue.ThresholdBytes {
+					warnings = append(warnings, map[string]any{"code": "memory_pressure", "message": "CT memory available capacity is below the pressure threshold", "detail": memoryObservationValue.Map()})
+				}
+			}
+			resourcesValue := map[string]any{"allocated": allocated, "reserved": reserved, "allocated_and_reserved": allocatedAndReserved, "limits": limits, "remaining": remaining, "policy": map[string]any{"cpu_overcommit_ratio": s.Config.CPUOvercommitRatio, "memory_overcommit_ratio": s.Config.MemoryOvercommitRatio, "cpu_startup_pressure_full_avg10_percent": s.Config.CPUStartupPressureFullAvg10Percent}, "memory": memoryObservation, "memory_pressure": memoryObservation["pressure"]}
 			ctCPU := map[string]any{"capacity_vcpu": nil, "pressure": nil, "startup_pressure": nil}
 			defaultReasons := []any{}
 			if !s.Ready() {
@@ -2799,6 +2857,26 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				physical := diskAdmission["physical_admission"].(map[string]any)
 				capacityObservation = map[string]any{"verified": true, "total_bytes": physical["capacity_bytes"], "used_bytes": physical["allocated_bytes"], "free_bytes": physical["free_bytes"], "low_watermark_bytes": physical["low_watermark_bytes"], "target_watermark_bytes": physical["target_watermark_bytes"]}
 			}
+			warningCounts := make(map[string]int64, len(auditSummary.Warnings)+3)
+			for code, count := range auditSummary.Warnings {
+				warningCounts[code] = count
+			}
+			if !consistent {
+				warningCounts["observation_inconsistent"]++
+			}
+			if cpuObservationErr != nil || diskErr != nil || memoryObservationErr != nil {
+				warningCounts["resource_unverified"]++
+			}
+			if !nativeUp {
+				warningCounts["native_unavailable"]++
+			}
+			if memoryObservationValue != nil && memoryObservationValue.AvailableBytes < memoryObservationValue.ThresholdBytes {
+				warningCounts["memory_pressure"]++
+			}
+			operationMetrics := map[string]any{"pending": len(pendingOperations), "historical_unknown": len(unknownOperations)}
+			for key, count := range auditSummary.Operations {
+				operationMetrics[key] = count
+			}
 			return map[string]any{
 				"observation_epoch": endEpoch, "observation_consistent": consistent, "observation_attempts": attempt,
 				"observed_at": start, "up": nativeUp, "draining": draining, "admission_ready": admissionReady,
@@ -2806,8 +2884,8 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				"reclaim_required": reclaimRequired, "disk_admission": diskAdmission,
 				"default_admission": map[string]any{"requested": defaultRequested, "request_cost_bytes": s.Config.CreateCostBytes, "ready": defaultReady, "reasons": defaultReasons, "reclaim_required": reclaimRequired},
 				"ct_memory":         map[string]any{"capacity_bytes": memoryObservation["limit_bytes"], "current_bytes": memoryObservation["current_bytes"], "available_bytes": memoryObservation["available_bytes"], "pressure_threshold_bytes": memoryObservation["threshold_bytes"], "pressure": memoryObservation["pressure"], "oom_events": memoryObservation["oom_events"]},
-				"task_states":       states, "pending_operations": pendingOperations, "historical_unknown_operations": unknownOperations, "instances": instances, "operations": map[string]any{"pending": len(pendingOperations), "historical_unknown": len(unknownOperations)}, "image_unpack_failures": nil, "doctor": map[string]any{"ready": len(doctorIssues) == 0, "issues": doctorIssues}, "warnings": warnings,
-				"warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil || diskErr != nil), "native_unavailable": boolInt(!nativeUp)},
+				"task_states":       states, "pending_operations": pendingOperations, "historical_unknown_operations": unknownOperations, "instances": instances, "operations": operationMetrics, "image_unpack_failures": auditSummary.ImageUnpackFailures, "doctor": map[string]any{"ready": len(doctorIssues) == 0, "issues": doctorIssues}, "warnings": warnings,
+				"warning_counts": warningCounts,
 			}, nil
 		}
 	}
@@ -4005,7 +4083,12 @@ func (s *Service) reclaimCachedCapacity(ctx context.Context, requestCost int64, 
 			continue
 		}
 		cleanupRequest := protocol.Request{"session_id": task.SessionID, "generation": task.Generation}
-		if _, releaseErr := s.release(withInternalCleanup(ctx), cleanupRequest, true); releaseErr != nil {
+		// The caller holds admissionMu. Calling release would acquire the
+		// cached session lock after that mutex, while a concurrent session
+		// action can hold the session lock and wait for admissionMu. Use the
+		// unlocked cleanup path; its durable generation/state fences still
+		// make a concurrent session action fail closed.
+		if _, releaseErr := s.releaseUnlocked(withInternalCleanup(ctx), cleanupRequest, true); releaseErr != nil {
 			continue
 		}
 		admission, admissionErr := s.diskAdmission(ctx, excludeTaskID)
@@ -4144,14 +4227,20 @@ func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64
 		if _, sufficientErr := s.diskAdmissionSufficient(ctx, diskAdmission, requestCost, excludeTaskID); sufficientErr != nil {
 			control := protocol.AsError(sufficientErr)
 			if control.Code == "resource_insufficient" {
-				if reclaimed, reclaimErr := s.reclaimCachedCapacity(ctx, requestCost, excludeTaskID, 0); reclaimErr != nil {
-					return reclaimErr
-				} else if reclaimed {
-					if startup {
+				if startup {
+					hasCached, cachedErr := s.hasCachedCapacityCandidate(ctx, excludeTaskID)
+					if cachedErr != nil {
+						return cachedErr
+					}
+					if hasCached {
 						if err := s.checkStartupPressure(ctx, used["cpu"], requested["cpu"]); err != nil {
 							return err
 						}
 					}
+				}
+				if reclaimed, reclaimErr := s.reclaimCachedCapacity(ctx, requestCost, excludeTaskID, 0); reclaimErr != nil {
+					return reclaimErr
+				} else if reclaimed {
 					return nil
 				}
 			}
@@ -4164,6 +4253,19 @@ func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64
 		}
 	}
 	return nil
+}
+
+func (s *Service) hasCachedCapacityCandidate(ctx context.Context, excludeTaskID string) (bool, error) {
+	tasks, err := s.Store.ListTasks(ctx)
+	if err != nil {
+		return false, s.sqliteError(err)
+	}
+	for _, task := range tasks {
+		if task.TaskID != excludeTaskID && task.State == stateCached {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *Service) checkStartupPressure(ctx context.Context, allocatedCPU, requestedCPU int64) error {

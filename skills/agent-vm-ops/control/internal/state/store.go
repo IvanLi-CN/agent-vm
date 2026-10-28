@@ -171,6 +171,12 @@ type Operation struct {
 	CreatedAt   string
 }
 
+type AuditSummary struct {
+	Operations          map[string]int64
+	ImageUnpackFailures map[string]int64
+	Warnings            map[string]int64
+}
+
 type Store struct {
 	path             string
 	write            *sql.DB
@@ -1160,6 +1166,119 @@ func (s *Store) Audit(ctx context.Context, action, taskID, sessionID, outcome st
 		_, err := tx.exec("INSERT INTO audit(action, task_id, session_id, generation, outcome, detail_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)", action, nullableStringArg(stringPointerIfNonEmpty(taskID)), nullableStringArg(stringPointerIfNonEmpty(sessionID)), nullableIntArg(generation), outcome, string(raw), time.Now().UTC().Format(time.RFC3339))
 		return err
 	})
+}
+
+func (s *Store) AuditSummary(ctx context.Context) (AuditSummary, error) {
+	result := AuditSummary{
+		Operations:          map[string]int64{},
+		ImageUnpackFailures: map[string]int64{},
+		Warnings:            map[string]int64{},
+	}
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, "SELECT action, outcome, detail_json FROM audit")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var action, outcome string
+			var raw sql.NullString
+			if err := rows.Scan(&action, &outcome, &raw); err != nil {
+				return err
+			}
+			var detail any
+			if raw.Valid && raw.String != "" {
+				decoder := json.NewDecoder(strings.NewReader(raw.String))
+				decoder.UseNumber()
+				if err := decoder.Decode(&detail); err != nil {
+					detail = nil
+				}
+			}
+			code := auditString(detail, "code")
+			if code == "" {
+				code = "unknown"
+			}
+			phase := auditString(detail, "phase", "operation_phase")
+			if phase == "" {
+				phase = "unknown"
+			}
+			result.Operations[action+"|"+outcome+"|"+phase]++
+			for _, warning := range auditWarnings(detail) {
+				result.Warnings[warning]++
+			}
+			if outcome == "error" && (code == "memory_pressure" || code == "resource_unverified" || code == "capacity_insufficient") {
+				result.Warnings[code]++
+			}
+			lower := strings.ToLower(raw.String)
+			if outcome == "error" && strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs")) {
+				result.ImageUnpackFailures[phase+"|"+code]++
+			}
+		}
+		return rows.Err()
+	})
+	return result, err
+}
+
+func auditString(value any, keys ...string) string {
+	wanted := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		wanted[key] = struct{}{}
+	}
+	var found string
+	var visit func(any)
+	visit = func(current any) {
+		if found != "" {
+			return
+		}
+		switch typed := current.(type) {
+		case map[string]any:
+			for key, item := range typed {
+				if _, ok := wanted[key]; ok {
+					if text, ok := item.(string); ok && text != "" {
+						found = text
+						return
+					}
+				}
+				visit(item)
+			}
+		case []any:
+			for _, item := range typed {
+				visit(item)
+			}
+		}
+	}
+	visit(value)
+	return found
+}
+
+func auditWarnings(value any) []string {
+	var result []string
+	var visit func(any)
+	visit = func(current any) {
+		switch typed := current.(type) {
+		case map[string]any:
+			for key, item := range typed {
+				if key == "warnings" {
+					if values, ok := item.([]any); ok {
+						for _, rawWarning := range values {
+							if warning, ok := rawWarning.(map[string]any); ok {
+								if code, ok := warning["code"].(string); ok && code != "" {
+									result = append(result, code)
+								}
+							}
+						}
+					}
+				}
+				visit(item)
+			}
+		case []any:
+			for _, item := range typed {
+				visit(item)
+			}
+		}
+	}
+	visit(value)
+	return result
 }
 
 func nullableStringArg(value *string) any {
