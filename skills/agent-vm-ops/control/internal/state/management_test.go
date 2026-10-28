@@ -427,6 +427,16 @@ func TestCachedImageUsableAllowsOnlyVerifiedImagesOrLegacyDefault(t *testing.T) 
 	if err != nil || !usable {
 		t.Fatalf("legacy default image usable=%v err=%v", usable, err)
 	}
+	if err := store.UpdateManagedImageVerification(ctx, legacy, "legacy_unverified", "failed", nil, "available"); err != nil {
+		t.Fatal(err)
+	}
+	usable, err = store.CachedImageUsable(ctx, legacy)
+	if err != nil || usable {
+		t.Fatalf("failed legacy image usable=%v err=%v", usable, err)
+	}
+	if err := store.UpdateManagedImageVerification(ctx, legacy, "legacy_unverified", "not_assessed", nil, "available"); err != nil {
+		t.Fatal(err)
+	}
 	verified := strings.Repeat("b", 64)
 	if err := store.InsertManagedImage(ctx, ManagedImage{Fingerprint: verified, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
 		t.Fatal(err)

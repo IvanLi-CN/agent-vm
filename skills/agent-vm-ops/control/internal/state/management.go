@@ -521,7 +521,7 @@ func (s *Store) CachedImageUsable(ctx context.Context, fingerprint string) (bool
 		if err != nil {
 			return err
 		}
-		usable = stateValue == "available" && ((integrity == "passed" && suitability == "passed") || (integrity == "legacy_unverified" && compatibility == "legacy_unverified" && isDefault == 1))
+		usable = stateValue == "available" && ((integrity == "passed" && suitability == "passed") || (integrity == "legacy_unverified" && suitability == "not_assessed" && compatibility == "legacy_unverified" && isDefault == 1))
 		return nil
 	})
 	return usable, err
