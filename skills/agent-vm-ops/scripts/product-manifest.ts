@@ -1,6 +1,7 @@
 /** Public product manifest surface; legacy formats remain in release-manifest.ts. */
 
 export {
+  LEGACY_PRODUCT_MANIFEST_FORMAT,
   PRODUCT_MANIFEST_FORMAT,
   PRODUCT_LINUX_ARTIFACTS,
   STATE_CAPABILITY_MARKERS,

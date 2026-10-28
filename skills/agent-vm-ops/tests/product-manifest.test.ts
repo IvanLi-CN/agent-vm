@@ -31,6 +31,15 @@ test("format-4 manifest fixes product identity, source, toolchain, state and act
       "legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1",
     ]);
     expect(verify_product_bundle(root, manifest)).toEqual(manifest);
+    const legacyManifest = build_product_manifest("1.0.0", "a".repeat(40), artifacts, {
+      format: 3,
+      target: { os: "source", arch: "any" },
+      transport: "legacy-bun",
+      operations: default_operations(),
+    });
+    expect(legacyManifest.format).toBe(3);
+    expect(legacyManifest.state_compatibility).toBeUndefined();
+    expect(verify_product_bundle(root, legacyManifest)).toEqual(legacyManifest);
     expect(() => build_product_manifest("1.0.0", "a".repeat(40), artifacts.slice(0, 1), { target: { os: "source", arch: "any" } })).toThrow();
     expect(() => build_product_manifest("1.0", "a".repeat(40), artifacts)).toThrow();
   } finally {

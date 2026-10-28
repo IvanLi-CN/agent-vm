@@ -1527,14 +1527,15 @@ export function build_product_manifest(
   version: string,
   source_revision: string,
   artifacts: readonly Artifact[],
-  options: { target?: ProductTarget; transport?: "legacy-bun" | "go-request"; operations?: Record<string, OperationSpec> } = {},
+  options: { format?: 3 | 4; target?: ProductTarget; transport?: "legacy-bun" | "go-request"; operations?: Record<string, OperationSpec> } = {},
 ): ProductManifest {
   parseSemVer(version);
   if (!_fullmatch(SOURCE_REVISION_RE, source_revision)) throw _product_error("manifest_invalid", "source_revision must be a Git revision");
+  const format = options.format ?? PRODUCT_MANIFEST_FORMAT;
   const actions = options.operations ?? default_operations();
   const transport = options.transport ?? "go-request";
   return validate_product_manifest({
-    format: PRODUCT_MANIFEST_FORMAT,
+    format,
     version,
     release_id: source_revision,
     source_revision,
@@ -1544,7 +1545,9 @@ export function build_product_manifest(
     artifacts: artifacts.map((item) => ({ ...item })),
     actions,
     client_view: { version, source_revision, protocol: PROTOCOL_VERSION, transport, actions },
-    state_compatibility: { reads: [...STATE_CAPABILITY_MARKERS], writes: [...STATE_CAPABILITY_MARKERS] },
+    ...(format === PRODUCT_MANIFEST_FORMAT
+      ? { state_compatibility: { reads: [...STATE_CAPABILITY_MARKERS], writes: [...STATE_CAPABILITY_MARKERS] } }
+      : {}),
   });
 }
 

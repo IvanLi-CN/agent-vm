@@ -254,10 +254,6 @@ func Open(path string, allowCreate bool) (*Store, error) {
 			store.Close()
 			return nil, err
 		}
-		if err := store.EnsureManagementSchema(context.Background()); err != nil {
-			store.Close()
-			return nil, err
-		}
 	} else if err := store.checkReadable(context.Background()); err != nil {
 		store.Close()
 		return nil, err
@@ -268,7 +264,17 @@ func Open(path string, allowCreate bool) (*Store, error) {
 	return store, nil
 }
 
-func OpenForTest(path string) (*Store, error) { return Open(path, true) }
+func OpenForTest(path string) (*Store, error) {
+	store, err := Open(path, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.EnsureManagementSchema(context.Background()); err != nil {
+		store.Close()
+		return nil, err
+	}
+	return store, nil
+}
 
 func (s *Store) Path() string { return s.path }
 

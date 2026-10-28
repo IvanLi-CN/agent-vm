@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 
 import {
   build_product_manifest,
+  LEGACY_PRODUCT_MANIFEST_FORMAT,
   PRODUCT_LINUX_ARTIFACTS,
   PRODUCT_MANIFEST_FORMAT,
   verify_client_sidecar,
@@ -136,6 +137,7 @@ try {
   }
 
   const manifest = build_product_manifest(version, revision, artifacts, {
+    format: rawTarget === "client" ? LEGACY_PRODUCT_MANIFEST_FORMAT : PRODUCT_MANIFEST_FORMAT,
     target,
     transport: rawTarget === "client" ? "legacy-bun" : "go-request",
   });
@@ -143,7 +145,7 @@ try {
   const clientArtifact = artifacts.find((item) => item.role === "client");
   if (!clientArtifact) throw new Error("product manifest has no client artifact");
   const sidecar = {
-    format: PRODUCT_MANIFEST_FORMAT,
+    format: manifest.format,
     version,
     source_revision: revision,
     protocol: 4,
@@ -170,7 +172,7 @@ try {
   }
   chmodSync(temporaryArchive, 0o644);
   renameSync(temporaryArchive, output);
-  console.log(JSON.stringify({ output, target: rawTarget, version, source_revision: revision, artifact_count: artifacts.length, format: PRODUCT_MANIFEST_FORMAT, cgo_enabled: false, web_assets: rawTarget !== "client" }));
+  console.log(JSON.stringify({ output, target: rawTarget, version, source_revision: revision, artifact_count: artifacts.length, format: manifest.format, cgo_enabled: false, web_assets: rawTarget !== "client" }));
 } finally {
   rmSync(temporaryRoot, { recursive: true, force: true });
 }

@@ -116,6 +116,9 @@ func serve(args []string) error {
 		return errors.New("management_disabled: installed release does not declare management state compatibility")
 	}
 	if managementStateSupported {
+		if err := store.EnsureManagementSchema(context.Background()); err != nil {
+			return fmt.Errorf("initialize management schema: %w", err)
+		}
 		if err := webadmin.CleanupUploadStaging(cfg.Management.Upload.StagingPath); err != nil {
 			return fmt.Errorf("clean upload staging: %w", err)
 		}

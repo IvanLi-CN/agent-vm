@@ -30,6 +30,7 @@ type Service struct {
 	Options              Options
 	vmActionMu           sync.Mutex
 	maintenanceMu        sync.Mutex
+	imageImportMu        sync.Mutex
 	imageStorageMu       sync.Mutex
 	imageStorageReserved int64
 }
@@ -501,6 +502,8 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 	if s.Options.Backend == nil {
 		return s.failImport(ctx, operation, "image_import", "internal_error", "no image backend is configured", true)
 	}
+	s.imageImportMu.Lock()
+	defer s.imageImportMu.Unlock()
 	artifact, err := s.Options.Backend.ImportLocal(ctx, request.Source.Format, metadata, rootfs)
 	if err != nil {
 		return s.finishBackendImportFailure(ctx, operation, artifact, err)
@@ -553,6 +556,8 @@ func (s *Service) UploadImageImportFiles(ctx context.Context, operationID, metad
 	if s.Options.Backend == nil {
 		return s.failImport(ctx, operation, "image_import", "internal_error", "no image backend is configured", true)
 	}
+	s.imageImportMu.Lock()
+	defer s.imageImportMu.Unlock()
 	var artifact ImageArtifact
 	if backend, ok := s.Options.Backend.(LocalFileImageBackend); ok {
 		artifact, err = backend.ImportLocalFiles(ctx, request.Source.Format, metadataPath, rootfsPath)
@@ -676,6 +681,8 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 	}
 	operation = running
 	defer release()
+	s.imageImportMu.Lock()
+	defer s.imageImportMu.Unlock()
 	artifact, err := s.Options.Backend.ImportTrusted(ctx, request.Source.SourceID, request.Source.ExpectedFingerprint)
 	if err != nil {
 		return s.finishBackendImportFailure(ctx, operation, artifact, err)
@@ -707,6 +714,8 @@ func (s *Service) finishBackendImportFailure(ctx context.Context, operation *sta
 }
 
 func (s *Service) cleanupImportedImage(ctx context.Context, fingerprint string) string {
+	unlock := s.Store.LockImageSelection()
+	defer unlock()
 	image, err := s.Store.GetManagedImage(ctx, fingerprint)
 	if err != nil {
 		return "blocked_catalog_unverified"
@@ -822,6 +831,8 @@ func (s *Service) recoverImportedCatalogFailure(ctx context.Context, operation *
 		"imported_fingerprint": artifact.Fingerprint,
 		"catalog_error":        "catalog persistence failed",
 	}
+	unlock := s.Store.LockImageSelection()
+	defer unlock()
 	if existing, err := s.Store.GetManagedImage(ctx, artifact.Fingerprint); err == nil && existing != nil {
 		return s.finishOperation(ctx, operation, "completed", "succeeded", map[string]any{"fingerprint": artifact.Fingerprint, "state": existing.State, "reused": true}, nil)
 	} else if err != nil {

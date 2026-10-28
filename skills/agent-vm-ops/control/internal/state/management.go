@@ -497,9 +497,9 @@ FROM managed_images i WHERE i.fingerprint = ?`, fingerprint)
 }
 
 // CachedImageUsable verifies the catalog state before a cached guest can be
-// resumed. Older unit fixtures may not have the management schema yet; those
-// stores retain the legacy behaviour while production stores always create the
-// catalog during startup.
+// resumed. Older unit fixtures and legacy protocol-4 stores may not have the
+// management schema yet; those stores retain the legacy behaviour until a
+// management-capable release performs its additive migration during startup.
 func (s *Store) CachedImageUsable(ctx context.Context, fingerprint string) (bool, error) {
 	usable := false
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
@@ -551,6 +551,8 @@ func (s *Store) InsertManagedImage(ctx context.Context, value ManagedImage) erro
 	if !imageFingerprintPattern.MatchString(value.Fingerprint) {
 		return errors.New("invalid image fingerprint")
 	}
+	unlock := s.LockImageSelection()
+	defer unlock()
 	findingsValue := value.Findings
 	if findingsValue == nil {
 		findingsValue = []string{}
