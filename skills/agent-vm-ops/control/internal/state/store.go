@@ -444,6 +444,12 @@ func generationMetaKey(sessionID string) string {
 	return "generation_tombstone:" + hex.EncodeToString([]byte(sessionID))
 }
 
+// HasGeneration reports whether a session has ever allocated a durable generation.
+func (s *Store) HasGeneration(ctx context.Context, sessionID string) (bool, error) {
+	_, exists, err := s.Meta(ctx, generationMetaKey(sessionID))
+	return exists, err
+}
+
 // NextGeneration returns a generation strictly greater than the last durable
 // generation for a session, including generations whose task row was deleted.
 // The meta row is updated in the same writer transaction that allocates it.

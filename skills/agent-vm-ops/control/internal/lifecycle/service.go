@@ -991,14 +991,26 @@ func (s *Service) reconcileOrphanedAcquire(ctx context.Context, operationID stri
 	return nil
 }
 
-// Legacy acquire can invoke read-only cache checks before advancing the task.
-// The unchanged cached generation proves that the native mutation phase did not begin.
+// Legacy acquire performs no native mutation before allocating a task generation.
+// An unchanged cached generation or an absent generation tombstone fences that phase.
 func (s *Service) reconcileLegacyCachedStarts(ctx context.Context, operation *state.Operation) error {
 	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
 	if err != nil {
 		return s.sqliteError(err)
 	}
-	if task == nil || task.State != stateCached || task.Generation != *operation.Generation || task.LeaseExpiresAt != nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
+	session, generation := *operation.SessionID, *operation.Generation
+	if task == nil {
+		if generation != 0 {
+			return nil
+		}
+		allocated, err := s.Store.HasGeneration(ctx, session)
+		if err != nil {
+			return s.sqliteError(err)
+		}
+		if allocated {
+			return nil
+		}
+	} else if task.State != stateCached || task.Generation != generation || task.LeaseExpiresAt != nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
 		return nil
 	}
 	pending, err := s.Store.PendingOperations(ctx)
@@ -1007,10 +1019,10 @@ func (s *Service) reconcileLegacyCachedStarts(ctx context.Context, operation *st
 	}
 	group := make([]state.Operation, 0)
 	for _, candidate := range pending {
-		if candidate.SessionID == nil || *candidate.SessionID != task.SessionID {
+		if candidate.SessionID == nil || *candidate.SessionID != session {
 			continue
 		}
-		if candidate.Action != "acquire" || candidate.Generation == nil || *candidate.Generation != task.Generation || s.operationActive(candidate.OperationID) {
+		if candidate.Action != "acquire" || candidate.Generation == nil || *candidate.Generation != generation || s.operationActive(candidate.OperationID) {
 			return nil
 		}
 		worker, ok := candidate.Response["worker"].(map[string]any)
@@ -1035,7 +1047,7 @@ func (s *Service) reconcileLegacyCachedStarts(ctx context.Context, operation *st
 		}
 		req := protocol.Request(raw)
 		digest, digestErr := protocol.Digest(req)
-		if protocol.ValidateRequest(req) != nil || digestErr != nil || digest != stringValue(candidate.Response["_request_digest"]) || stringValue(req["action"]) != "acquire" || stringValue(req["operation_id"]) != candidate.OperationID || stringValue(req["session_id"]) != task.SessionID || intValue(req["generation"]) != task.Generation {
+		if protocol.ValidateRequest(req) != nil || digestErr != nil || digest != stringValue(candidate.Response["_request_digest"]) || stringValue(req["action"]) != "acquire" || stringValue(req["operation_id"]) != candidate.OperationID || stringValue(req["session_id"]) != session || intValue(req["generation"]) != generation {
 			return nil
 		}
 		group = append(group, candidate)
@@ -1045,11 +1057,19 @@ func (s *Service) reconcileLegacyCachedStarts(ctx context.Context, operation *st
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 	defer cancel()
-	if err := s.verifyCachedGuest(checkCtx, task); err != nil {
-		return protocol.NewError("startup_reconcile_required", "legacy cached acquisition could not be verified", map[string]any{"outcome_verified": false, "cause": err.Error()})
+	if task != nil {
+		if err := s.verifyCachedGuest(checkCtx, task); err != nil {
+			return protocol.NewError("startup_reconcile_required", "legacy cached acquisition could not be verified", map[string]any{"outcome_verified": false, "cause": err.Error()})
+		}
+	} else {
+		name := "agent-vm-" + taskID(session)
+		_, err := s.Guest.Config(checkCtx, name)
+		if err == nil || !native.IsNotFound(err, name, s.Config.Project) {
+			return protocol.NewError("startup_reconcile_required", "never-allocated instance absence could not be verified", map[string]any{"outcome_verified": false})
+		}
 	}
 	for _, candidate := range group {
-		response := map[string]any{"outcome": "error", "error": protocol.NewError("startup_reconcile_required", "acquire ended before the cached task changed generation", map[string]any{"outcome_verified": true}), "_request_digest": candidate.Response["_request_digest"]}
+		response := map[string]any{"outcome": "error", "error": protocol.NewError("startup_reconcile_required", "acquire ended before allocating or advancing a task generation", map[string]any{"outcome_verified": true}), "_request_digest": candidate.Response["_request_digest"]}
 		if err := s.Store.RecordOperation(ctx, candidate.OperationID, candidate.Action, candidate.SessionID, candidate.Generation, response); err != nil {
 			return s.sqliteError(err)
 		}

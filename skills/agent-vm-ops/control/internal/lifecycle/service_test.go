@@ -2431,3 +2431,79 @@ func TestMaintenanceRetryRequiresVerifiedEvidence(t *testing.T) {
 		})
 	}
 }
+
+func TestStartupRecoversLegacyNeverAllocatedAcquire(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session := "legacy-never-allocated"
+	generation := int64(0)
+	req := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": "legacy-never-allocated-op"}
+	digest, err := protocol.Digest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "legacy-never-allocated-op", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "starting"}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Guest: &startupGuest{configErr: missingInstanceError()}, Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup=%v", err)
+	}
+	op, err := store.GetOperation(ctx, "legacy-never-allocated-op")
+	if err != nil || op.Response["outcome"] != "error" {
+		t.Fatalf("operation=%#v, error=%v", op, err)
+	}
+}
+
+func TestLegacyNeverAllocatedRecoveryRequiresTombstoneAndNativeAbsence(t *testing.T) {
+	for _, mode := range []string{"tombstone", "native-present", "native-error", "other-pending"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			session := "never-allocated-" + mode
+			generation := int64(0)
+			if mode == "tombstone" {
+				if _, err := store.NextGeneration(ctx, session); err != nil {
+					t.Fatal(err)
+				}
+			}
+			req := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": "never-allocated-op"}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.RecordOperation(ctx, "never-allocated-op", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "starting"}}); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "other-pending" {
+				if err := store.RecordOperation(ctx, "other-op", "restart", &session, &generation, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "starting"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			guest := &startupGuest{configErr: missingInstanceError()}
+			if mode == "native-present" {
+				guest.configErr = nil
+				guest.config = map[string]any{}
+			}
+			if mode == "native-error" {
+				guest.configErr = errors.New("transport failed")
+			}
+			service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+			if err := service.StartupReconcile(ctx); err == nil {
+				t.Fatal("unsafe pending operation finalized")
+			}
+			op, err := store.GetOperation(ctx, "never-allocated-op")
+			if err != nil || op.Response["outcome"] != "pending" {
+				t.Fatalf("op=%#v,error=%v", op, err)
+			}
+		})
+	}
+}
