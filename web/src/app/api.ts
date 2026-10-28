@@ -165,6 +165,7 @@ export async function previewVMAction(taskId: string, action: string, current?: 
   const state = getMockState();
   const vm = state.vms.find((candidate) => candidate.task_id === taskId) ?? state.vms[0];
   if (!vm) throw new ManagementRequestError("not_found");
+  if (current && (current.resource_version !== vm.resource_version || current.generation !== vm.generation)) throw new ManagementRequestError("stale_target", "precondition", null, { current_target_version: vm.resource_version });
   return delay(issueMockPreview(state, { kind: "vm", targetId: taskId, action, targetVersion: vm.resource_version, expectedGeneration: vm.generation, parameters }, { summary_code: vm.lease.state === "effective" ? "effective_lease_affected" : "no_active_lease", affected_session_count: vm.lease.state === "effective" ? 1 : 0, affected_image_references: vm.image.fingerprint === mockState.images[0].fingerprint ? mockState.images[0].references : { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 }, changes: [{ code: action === "destroy" ? "session_access_revoked" : "native_action", count: 1, value: null }] }));
 }
 
@@ -187,9 +188,11 @@ export async function submitVMAction(taskId: string, action: string, reason: str
 export async function startImageImport(request: ImageImportRequest): Promise<Operation> {
   if (useRealApi) return realRequest("/images/imports", { method: "POST", body: JSON.stringify(request) });
   assertMockMutationAllowed();
+  const state = getMockState();
+  const existing = state.operations.some((operation) => operation.operation_id === request.operation_id);
+  if (!existing && request.target_version !== state.image_catalog_version) throw new ManagementRequestError("stale_target", "precondition", request.operation_id, { current_target_version: state.image_catalog_version });
   const initialStatus = request.source.kind === "local_upload" ? "awaiting_upload" : undefined;
   const operation = createMockOperation("image_import", { kind: "image_catalog", id: "image-catalog" }, request.reason, initialStatus, request.operation_id, request, request as unknown as Record<string, unknown>);
-  const state = getMockState();
   const imports = mockImageImportRequests.get(state) ?? new Map<string, ImageImportRequest>();
   mockImageImportRequests.set(state, imports);
   imports.set(request.operation_id, request);
@@ -222,9 +225,10 @@ export async function previewImageAction(fingerprint: string, action: "default" 
   const state = getMockState();
   const image = state.images.find((candidate) => candidate.fingerprint === fingerprint) ?? state.images[0];
   if (!image) throw new ManagementRequestError("not_found");
+  const targetVersion = action === "default" ? state.image_selection_version : image.resource_version;
+  if (currentResourceVersion !== undefined && currentResourceVersion !== targetVersion) throw new ManagementRequestError("stale_target", "precondition", null, { current_target_version: targetVersion });
   if (action === "default" && (image.state === "retired" || image.verification.suitability !== "passed")) throw new ManagementRequestError("image_not_applicable", "precondition");
   if (action === "retire" && image.is_default) throw new ManagementRequestError("default_image_required", "precondition");
-  const targetVersion = action === "default" ? state.image_selection_version : image.resource_version;
   return delay(issueMockPreview(state, { kind: "image", targetId: fingerprint, action, targetVersion }, { summary_code: action === "delete" && image.references.active + image.references.cached > 0 ? "image_referenced" : "image_change_preview", affected_session_count: image.references.active, affected_image_references: image.references, changes: [{ code: action === "default" ? "new_sessions_use_image" : action === "retire" ? "new_selection_blocked" : "image_removed", count: null, value: image.version_label }] }));
 }
 
@@ -261,7 +265,9 @@ export async function previewMaintenance(action: "drain_enter" | "reconcile" | "
   mockStateForRequest();
   assertMockMutationAllowed();
   const state = getMockState();
-  return delay(issueMockPreview(state, { kind: "system", targetId: "system", action, targetVersion: state.system.resource_version }, { summary_code: "maintenance_preview", affected_session_count: action === "drain_enter" ? state.overview.task_counts.active : 0, affected_image_references: { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 }, changes: [{ code: action, count: null, value: null }] }));
+  const targetVersion = state.system.resource_version;
+  if (currentResourceVersion !== undefined && currentResourceVersion !== targetVersion) throw new ManagementRequestError("stale_target", "precondition", null, { current_target_version: targetVersion });
+  return delay(issueMockPreview(state, { kind: "system", targetId: "system", action, targetVersion }, { summary_code: "maintenance_preview", affected_session_count: action === "drain_enter" ? state.overview.task_counts.active : 0, affected_image_references: { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 }, changes: [{ code: action, count: null, value: null }] }));
 }
 
 export async function submitMaintenance(action: "drain_enter" | "reconcile" | "gc", reason: string, preview: ActionPreview, operationId = createOperationId()): Promise<Operation> {

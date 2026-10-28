@@ -110,7 +110,7 @@ describe("mock image uploads", () => {
 
   it("applies image lifecycle effects and blocks retired default selection", async () => {
     const retired = mockState.images.find((image) => image.state === "retired")!;
-    await expect(previewImageAction(retired.fingerprint, "default", retired.resource_version)).rejects.toMatchObject({ code: "image_not_applicable" });
+    await expect(previewImageAction(retired.fingerprint, "default", mockState.image_selection_version)).rejects.toMatchObject({ code: "image_not_applicable" });
 
     const candidate = mockState.images.find((image) => !image.is_default && image.state === "available")!;
     const beforeCatalogVersion = mockState.image_catalog_version;
@@ -146,6 +146,8 @@ describe("mock image uploads", () => {
   });
   it("rejects stale VM previews and mismatched confirmation tokens", async () => {
     const vm = mockState.vms[0];
+    await expect(previewVMAction(vm.task_id, "restart", { generation: vm.generation, resource_version: "vm:task_example_01:stale" })).rejects.toMatchObject({ code: "stale_target" });
+    await expect(previewVMAction(vm.task_id, "restart", { generation: "stale-generation", resource_version: vm.resource_version })).rejects.toMatchObject({ code: "stale_target" });
     const preview = await previewVMAction(vm.task_id, "restart", vm);
     await expect(submitVMAction(vm.task_id, "restart", "Reject a forged confirmation", { ...preview, confirmation_token: "synthetic-confirmation-forged" }, vm.generation, {}, "synthetic-forged-preview")).rejects.toMatchObject({ code: "stale_target" });
 
@@ -159,6 +161,8 @@ describe("mock image uploads", () => {
 
   it("rejects stale image and maintenance previews", async () => {
     const candidate = mockState.images.find((image) => !image.is_default && image.state === "available")!;
+    await expect(previewImageAction(candidate.fingerprint, "retire", "image:stale")).rejects.toMatchObject({ code: "stale_target" });
+    await expect(previewMaintenance("reconcile", "system:stale")).rejects.toMatchObject({ code: "stale_target" });
     const imagePreview = await previewImageAction(candidate.fingerprint, "retire", candidate.resource_version);
     await submitImageAction(candidate.fingerprint, "retire", "Advance the image resource version", imagePreview, "synthetic-advance-image");
     await expect(submitImageAction(candidate.fingerprint, "retire", "Reject an old image preview", imagePreview, "synthetic-stale-image")).rejects.toMatchObject({ code: "stale_target" });
@@ -166,5 +170,16 @@ describe("mock image uploads", () => {
     const maintenancePreview = await previewMaintenance("reconcile", mockState.system.resource_version);
     await submitMaintenance("reconcile", "Advance the maintenance resource version", maintenancePreview, "synthetic-advance-maintenance");
     await expect(submitMaintenance("reconcile", "Reject an old maintenance preview", maintenancePreview, "synthetic-stale-maintenance")).rejects.toMatchObject({ code: "stale_target" });
+  });
+
+  it("rejects stale image imports without creating an operation and preserves retries", async () => {
+    const operationCount = mockState.operations.length;
+    await expect(startImageImport({ operation_id: "synthetic-stale-import", reason: "Reject a stale catalog target", target_version: "image-catalog:stale", version_label: "2026.02", source: { kind: "trusted_remote", source_id: "ubuntu-staging", expected_fingerprint: "d".repeat(64) } })).rejects.toMatchObject({ code: "stale_target" });
+    expect(mockState.operations).toHaveLength(operationCount);
+
+    const request = { operation_id: "synthetic-import-retry", reason: "Import against the current catalog", target_version: mockState.image_catalog_version, version_label: "2026.03", source: { kind: "trusted_remote" as const, source_id: "ubuntu-staging", expected_fingerprint: "d".repeat(64) } };
+    const operation = await startImageImport(request);
+    expect(mockState.image_catalog_version).not.toBe(request.target_version);
+    expect(await startImageImport(request)).toBe(operation);
   });
 });
