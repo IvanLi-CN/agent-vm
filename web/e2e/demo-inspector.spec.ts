@@ -69,7 +69,9 @@ test("covers route pages, denied reads, keyboard controls and clipboard failure"
   await page.addInitScript(() => {
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async () => { throw new Error("permission denied"); } } });
   });
-  await page.goto("?demo=normal");
+  await page.goto("?demo=normal&token=private-value#private-fragment");
+  expect((await page.url())).not.toContain("private-value");
+  expect((await page.url())).not.toContain("private-fragment");
   await page.getByRole("button", { name: "Copy share link" }).click();
   await expect(page.getByText("Copy failed")).toBeVisible();
 });

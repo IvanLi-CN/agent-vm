@@ -60,7 +60,7 @@ jobs:
           bun run build-storybook
           bun run test:storybook:a11y
       - name: React Doctor
-        run: bun run react-doctor:web:ci
+        run: bun run react-doctor:web
       - name: Go control tests
         working-directory: skills/agent-vm-ops/control
         run: go test -count=1 ./...

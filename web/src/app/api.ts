@@ -171,13 +171,14 @@ export async function previewVMAction(taskId: string, action: string, current?: 
 export async function submitVMAction(taskId: string, action: string, reason: string, preview: ActionPreview, expectedGeneration: string, parameters: Record<string, unknown> = {}, operationId = createOperationId()): Promise<Operation> {
   if (useRealApi) return realRequest(`/vms/${encodeURIComponent(taskId)}/actions`, { method: "POST", body: JSON.stringify({ operation_id: operationId, reason, target_version: preview.target_version, action, expected_generation: expectedGeneration, parameters, confirmation_token: preview.confirmation_token }) });
   assertMockMutationAllowed();
-    return createMockOperation(action as Operation["action"], { kind: "vm", id: taskId }, reason, undefined, operationId, { action, taskId, reason, expectedGeneration, targetVersion: preview.target_version, confirmationToken: preview.confirmation_token, parameters });
+  return createMockOperation(action as Operation["action"], { kind: "vm", id: taskId }, reason, undefined, operationId, { action, taskId, reason, expectedGeneration, targetVersion: preview.target_version, confirmationToken: preview.confirmation_token, parameters }, parameters);
 }
 
 export async function startImageImport(request: ImageImportRequest): Promise<Operation> {
   if (useRealApi) return realRequest("/images/imports", { method: "POST", body: JSON.stringify(request) });
   assertMockMutationAllowed();
-  return createMockOperation("image_import", { kind: "image_catalog", id: "image-catalog" }, request.reason, request.source.kind === "local_upload" ? "awaiting_upload" : "running", request.operation_id, request);
+  const initialStatus = request.source.kind === "local_upload" ? "awaiting_upload" : undefined;
+  return createMockOperation("image_import", { kind: "image_catalog", id: "image-catalog" }, request.reason, initialStatus, request.operation_id, request);
 }
 
 export async function uploadImageImportContent(operationId: string, content: File | { metadata: File; rootfs: File }): Promise<Operation> {
@@ -240,9 +241,15 @@ export async function submitMaintenance(action: "drain_enter" | "reconcile" | "g
 
 const mockOperationFingerprints = new WeakMap<object, Map<string, string>>();
 
-function createMockOperation(action: Operation["action"], target: Operation["target"], reason: string, status?: Operation["status"], operationId = createOperationId(), requestPayload: unknown = { action, target, reason, status }): Operation {
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).sort(([left], [right]) => left.localeCompare(right)).map(([key, entry]) => [key, canonicalize(entry)]));
+  return value;
+}
+
+function createMockOperation(action: Operation["action"], target: Operation["target"], reason: string, status?: Operation["status"], operationId = createOperationId(), requestPayload: unknown = { action, target, reason, status }, effectParameters: Record<string, unknown> = {}): Operation {
   const state = getMockState();
-  const fingerprint = JSON.stringify(requestPayload);
+  const fingerprint = JSON.stringify(canonicalize(requestPayload));
   const fingerprints = mockOperationFingerprints.get(state) ?? new Map<string, string>();
   mockOperationFingerprints.set(state, fingerprints);
   const existing = state.operations.find((candidate) => candidate.operation_id === operationId);
@@ -257,9 +264,14 @@ function createMockOperation(action: Operation["action"], target: Operation["tar
   if (finalStatus === "succeeded") {
     if (target.kind === "vm") {
       const vm = state.vms.find((candidate) => candidate.task_id === target.id);
-      if (vm && action === "destroy") { vm.state = "absent"; vm.native_state = "absent"; vm.guest_availability = "unavailable"; vm.lease = { state: "absent", expires_at: null }; }
-      if (vm && action === "release") { vm.state = "cached"; vm.native_state = "stopped"; vm.guest_availability = "unavailable"; vm.lease = { state: "absent", expires_at: null }; }
+      if (vm && action === "destroy") { adjustTaskCount(state, vm.state, "absent"); vm.state = "absent"; vm.native_state = "absent"; vm.guest_availability = "unavailable"; vm.lease = { state: "absent", expires_at: null }; }
+      if (vm && action === "release") { adjustTaskCount(state, vm.state, "cached"); vm.state = "cached"; vm.native_state = "stopped"; vm.guest_availability = "unavailable"; vm.lease = { state: "absent", expires_at: null }; }
       if (vm && action === "restart") { vm.native_state = "running"; vm.guest_availability = "ready"; }
+      if (vm && action === "resize") vm.resources = { ...vm.resources, cpu_vcpu: typeof effectParameters.cpu_vcpu === "number" ? effectParameters.cpu_vcpu : vm.resources.cpu_vcpu, memory_bytes: typeof effectParameters.memory_bytes === "string" ? effectParameters.memory_bytes : vm.resources.memory_bytes, disk_bytes: typeof effectParameters.disk_bytes === "string" ? effectParameters.disk_bytes : vm.resources.disk_bytes };
+      if (vm && action === "port_add" && typeof effectParameters.port_name === "string" && typeof effectParameters.protocol === "string" && typeof effectParameters.host_port === "number" && typeof effectParameters.guest_port === "number") vm.port_mappings = [...vm.port_mappings.filter((port) => port.name !== effectParameters.port_name), { name: effectParameters.port_name, protocol: effectParameters.protocol as "tcp" | "udp", host_port: effectParameters.host_port, guest_port: effectParameters.guest_port }];
+      if (vm && action === "port_remove" && typeof effectParameters.port_name === "string") vm.port_mappings = vm.port_mappings.filter((port) => port.name !== effectParameters.port_name);
+      if (vm) vm.resource_version = `${vm.resource_version}:demo-${operationId.slice(0, 8)}`;
+      if (vm && ["destroy", "release", "resize", "port_add", "port_remove"].includes(action)) state.overview.resource_version = `${state.overview.resource_version}:demo-${operationId.slice(0, 8)}`;
     }
     if (target.kind === "image" && action === "default_image_select") state.images.forEach((image) => { image.is_default = image.fingerprint === target.id; });
     if (target.kind === "system" && action === "drain_enter") state.system.maintenance.draining = true;
@@ -270,6 +282,13 @@ function createMockOperation(action: Operation["action"], target: Operation["tar
   state.audits.unshift({ event_id: createOperationId(), operation_id: operation.operation_id, action, actor: operation.actor, reason, target, outcome: finalStatus === "queued" || finalStatus === "running" || finalStatus === "awaiting_upload" ? "accepted" : finalStatus, phase: operation.phase, occurred_at: operation.updated_at, safe_code: operation.error?.code ?? null });
   emitDemoChange();
   return operation;
+}
+
+function adjustTaskCount(state: ReturnType<typeof getMockState>, from: ManagedVM["state"], to: ManagedVM["state"]): void {
+  if (from === to) return;
+  const counts = state.overview.task_counts as Record<string, number>;
+  counts[from] = Math.max(0, (counts[from] ?? 0) - 1);
+  counts[to] = (counts[to] ?? 0) + 1;
 }
 
 function continueMockUploadOperation(operationId: string): Operation {

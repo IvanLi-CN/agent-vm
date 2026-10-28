@@ -110,7 +110,10 @@ export function isDemoRuntime(): boolean {
 }
 
 export function getDemoRuntime(): DemoRuntimeState {
-  if (!runtime) runtime = createRuntime();
+  if (!runtime) {
+    runtime = createRuntime();
+    syncShareParams(runtime, "replace");
+  }
   return runtime;
 }
 
@@ -159,7 +162,7 @@ export function demoForcedOutcome(): DemoForcedOutcome {
   return getDemoRuntime().forcedOutcome;
 }
 
-function syncShareParams(current: DemoRuntimeState): void {
+function syncShareParams(current: DemoRuntimeState, historyMode: "push" | "replace" = "push"): void {
   if (typeof window === "undefined" || !isDemoBuild) return;
   const url = new URL(window.location.href);
   url.search = "";
@@ -168,7 +171,10 @@ function syncShareParams(current: DemoRuntimeState): void {
   url.searchParams.set("d_persona", current.persona);
   url.searchParams.set("d_network", current.network);
   url.searchParams.set("d_data", current.dataMode);
-  if (url.toString() !== window.location.href) window.history.pushState({}, "", url);
+  if (url.toString() !== window.location.href) {
+    if (historyMode === "replace") window.history.replaceState({}, "", url);
+    else window.history.pushState({}, "", url);
+  }
 }
 
 function notifyRuntimeChange(): void {
