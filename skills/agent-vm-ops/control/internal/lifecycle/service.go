@@ -464,7 +464,15 @@ func (s *Service) reconcilePendingWorker(ctx context.Context, operationID string
 
 func (s *Service) recoverPending(ctx context.Context, pending []state.Operation) error {
 	var firstErr error
-	for _, operation := range pending {
+	for _, snapshot := range pending {
+		operationPtr, err := s.Store.GetOperation(ctx, snapshot.OperationID)
+		if err != nil {
+			return s.sqliteError(err)
+		}
+		if operationPtr == nil || stringValue(operationPtr.Response["outcome"]) != "pending" {
+			continue
+		}
+		operation := *operationPtr
 		if s.operationActive(operation.OperationID) {
 			continue
 		}
@@ -478,8 +486,26 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 				continue
 			}
 		}
-		if !recoverableOperation(operation.Action) || recoveryAttempts(operation.Response) > 0 {
+		if !recoverableOperation(operation.Action) {
 			continue
+		}
+		if recoveryAttempts(operation.Response) > 0 {
+			eligible, retryErr := s.mayRetryClearedMaintenance(ctx, operation)
+			if retryErr != nil {
+				return retryErr
+			}
+			if !eligible {
+				continue
+			}
+			if err := s.Store.UpdateOperationResponse(ctx, operation.OperationID, func(response map[string]any) error {
+				if stringValue(response["outcome"]) != "pending" || boolValue(response["_recovery_after_clear_attempted"]) {
+					return errUnresolvedWorker
+				}
+				response["_recovery_after_clear_attempted"] = true
+				return nil
+			}); err != nil {
+				return s.sqliteError(err)
+			}
 		}
 		rawRequest, ok := operation.Response["_request"].(map[string]any)
 		if !ok {
@@ -537,6 +563,53 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 		}
 	}
 	return firstErr
+}
+
+// A blocked maintenance operation may receive one more attempt after all task
+// transitions have cleared and its last native worker is confirmed absent.
+func (s *Service) mayRetryClearedMaintenance(ctx context.Context, operation state.Operation) (bool, error) {
+	if operation.Action != "admin-reconcile" || boolValue(operation.Response["_recovery_after_clear_attempted"]) {
+		return false, nil
+	}
+	raw, ok := operation.Response["_request"].(map[string]any)
+	if !ok {
+		return false, nil
+	}
+	req := protocol.Request(raw)
+	digest, err := protocol.Digest(req)
+	if err != nil || protocol.ValidateRequest(req) != nil || digest != stringValue(operation.Response["_request_digest"]) || stringValue(req["action"]) != operation.Action || stringValue(req["operation_id"]) != operation.OperationID || operation.Generation == nil || intValue(req["generation"]) != *operation.Generation || optionalString(req["session_id"]) != nil && (operation.SessionID == nil || stringValue(req["session_id"]) != *operation.SessionID) {
+		return false, nil
+	}
+	if operation.SessionID != nil && stringValue(req["session_id"]) != *operation.SessionID {
+		return false, nil
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	if !ok || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
+		return false, nil
+	}
+	pid, pidOK := protocol.Integer(worker["pid"])
+	group, groupOK := protocol.Integer(worker["process_group"])
+	start := stringValue(worker["start_time"])
+	if !pidOK || !groupOK || pid <= 0 || group <= 0 || start == "" {
+		return false, nil
+	}
+	alive, err := native.WorkerAlive(native.WorkerIdentity{PID: int(pid), ProcessGroup: int(group), StartTime: start})
+	if err != nil {
+		return false, protocol.NewError("state_unverified", "pending maintenance worker could not be verified", map[string]any{"cause": err.Error()})
+	}
+	if alive {
+		return false, nil
+	}
+	tasks, err := s.Store.ListTasks(ctx)
+	if err != nil {
+		return false, s.sqliteError(err)
+	}
+	for _, task := range tasks {
+		if task.State == statePreparing || task.State == stateClosing || task.State == stateDeleting || task.State == stateFailed {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func recoverableOperation(action string) bool {
@@ -827,6 +900,9 @@ func (s *Service) reconcileOrphanedAcquire(ctx context.Context, operationID stri
 		return nil
 	}
 	worker, ok := operation.Response["worker"].(map[string]any)
+	if ok && stringValue(worker["state"]) == "starting" {
+		return s.reconcileLegacyCachedStarts(ctx, operation)
+	}
 	if !ok || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
 		return nil
 	}
@@ -911,6 +987,72 @@ func (s *Service) reconcileOrphanedAcquire(ctx context.Context, operationID stri
 	}
 	if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
 		return s.sqliteError(err)
+	}
+	return nil
+}
+
+// Legacy acquire can invoke read-only cache checks before advancing the task.
+// The unchanged cached generation proves that the native mutation phase did not begin.
+func (s *Service) reconcileLegacyCachedStarts(ctx context.Context, operation *state.Operation) error {
+	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if task == nil || task.State != stateCached || task.Generation != *operation.Generation || task.LeaseExpiresAt != nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
+		return nil
+	}
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	group := make([]state.Operation, 0)
+	for _, candidate := range pending {
+		if candidate.SessionID == nil || *candidate.SessionID != task.SessionID {
+			continue
+		}
+		if candidate.Action != "acquire" || candidate.Generation == nil || *candidate.Generation != task.Generation || s.operationActive(candidate.OperationID) {
+			return nil
+		}
+		worker, ok := candidate.Response["worker"].(map[string]any)
+		if !ok || stringValue(worker["state"]) != "starting" {
+			return nil
+		}
+		if _, ok := worker["start_attempted"]; ok {
+			return nil
+		}
+		if _, ok := worker["pid"]; ok {
+			return nil
+		}
+		if _, ok := worker["start_time"]; ok {
+			return nil
+		}
+		if _, ok := worker["process_group"]; ok {
+			return nil
+		}
+		raw, ok := candidate.Response["_request"].(map[string]any)
+		if !ok {
+			return nil
+		}
+		req := protocol.Request(raw)
+		digest, digestErr := protocol.Digest(req)
+		if protocol.ValidateRequest(req) != nil || digestErr != nil || digest != stringValue(candidate.Response["_request_digest"]) || stringValue(req["action"]) != "acquire" || stringValue(req["operation_id"]) != candidate.OperationID || stringValue(req["session_id"]) != task.SessionID || intValue(req["generation"]) != task.Generation {
+			return nil
+		}
+		group = append(group, candidate)
+	}
+	if len(group) == 0 {
+		return nil
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+	defer cancel()
+	if err := s.verifyCachedGuest(checkCtx, task); err != nil {
+		return protocol.NewError("startup_reconcile_required", "legacy cached acquisition could not be verified", map[string]any{"outcome_verified": false, "cause": err.Error()})
+	}
+	for _, candidate := range group {
+		response := map[string]any{"outcome": "error", "error": protocol.NewError("startup_reconcile_required", "acquire ended before the cached task changed generation", map[string]any{"outcome_verified": true}), "_request_digest": candidate.Response["_request_digest"]}
+		if err := s.Store.RecordOperation(ctx, candidate.OperationID, candidate.Action, candidate.SessionID, candidate.Generation, response); err != nil {
+			return s.sqliteError(err)
+		}
 	}
 	return nil
 }

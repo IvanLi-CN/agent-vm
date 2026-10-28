@@ -2234,3 +2234,200 @@ func TestReconcileClosingDestroyFinalizesVerifiedMissingInstance(t *testing.T) {
 		t.Fatalf("op=%#v, error=%v", op, err)
 	}
 }
+
+func TestStartupRecoversLegacyPreTransitionCachedAcquires(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Now()
+	session := "legacy-pretransition"
+	generation := int64(14)
+	task := state.Task{TaskID: "legacy-pretransition-task", SessionID: session, Generation: generation, State: stateCached, InstanceName: "legacy-pretransition-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"legacy-pretransition-one", "legacy-pretransition-two"} {
+		req := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": id}
+		digest, err := protocol.Digest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordOperation(ctx, id, "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "starting"}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": "14"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup: %v", err)
+	}
+	for _, id := range []string{"legacy-pretransition-one", "legacy-pretransition-two"} {
+		op, err := store.GetOperation(ctx, id)
+		if err != nil || op.Response["outcome"] != "error" {
+			t.Fatalf("op=%#v,error=%v", op, err)
+		}
+	}
+}
+
+func TestLegacyCachedStartRecoveryRefusesUnsafeEvidence(t *testing.T) {
+	for _, mode := range []string{"generation", "ownership", "reservation", "other-worker", "active"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			now := time.Now()
+			session := "legacy-unsafe-" + mode
+			generation := int64(2)
+			taskGen := generation
+			if mode == "generation" {
+				taskGen++
+			}
+			task := state.Task{TaskID: "legacy-unsafe-task", SessionID: session, Generation: taskGen, State: stateCached, InstanceName: "legacy-unsafe-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+			if mode == "reservation" {
+				task.ResourceReservationJSON = `{"cpu":2}`
+			}
+			if err := store.InsertTask(ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			req := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": generation, "operation_id": "legacy-unsafe-op"}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.RecordOperation(ctx, "legacy-unsafe-op", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "starting"}}); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "other-worker" {
+				if err := store.RecordOperation(ctx, "other-op", "restart", &session, &generation, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "starting", "start_attempted": true}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			nativeTask := task.TaskID
+			if mode == "ownership" {
+				nativeTask = "other"
+			}
+			guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": nativeTask, "user.agent-vm.session": session, "user.agent-vm.generation": fmt.Sprint(taskGen)}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+			service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+			if mode == "active" {
+				finish := service.markOperationActive("legacy-unsafe-op")
+				defer finish()
+			}
+			if err := service.StartupReconcile(ctx); err == nil {
+				t.Fatal("unsafe legacy acquire was finalized")
+			}
+			op, err := store.GetOperation(ctx, "legacy-unsafe-op")
+			if err != nil || op.Response["outcome"] != "pending" {
+				t.Fatalf("op=%#v,error=%v", op, err)
+			}
+		})
+	}
+}
+
+func TestStartupRetriesPreviouslyBlockedMaintenanceAfterTasksClear(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	generation := int64(0)
+	req := protocol.Request{"protocol": protocol.Version, "action": "admin-reconcile", "apply": true, "generation": generation, "operation_id": "previously-blocked-maintenance"}
+	digest, err := protocol.Digest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "previously-blocked-maintenance", "admin-reconcile", nil, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "_recovery_attempts": int64(2), "worker": map[string]any{"state": "finished", "pid": int64(1 << 30), "start_time": "1", "process_group": int64(1 << 30)}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Resident: true, Guest: &startupGuest{}})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup=%v", err)
+	}
+	op, err := store.GetOperation(ctx, "previously-blocked-maintenance")
+	if err != nil || op.Response["outcome"] != "success" {
+		t.Fatalf("operation=%#v,error=%v", op, err)
+	}
+}
+
+func TestStartupRetriesMultipleBlockedMaintenanceOperationsOnce(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	generation := int64(0)
+	for _, id := range []string{"maintenance-a", "maintenance-b", "maintenance-c"} {
+		req := protocol.Request{"protocol": protocol.Version, "action": "admin-reconcile", "apply": true, "generation": generation, "operation_id": id}
+		digest, err := protocol.Digest(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordOperation(ctx, id, "admin-reconcile", nil, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "_recovery_attempts": int64(2), "worker": map[string]any{"state": "finished", "pid": int64(1 << 30), "start_time": "1", "process_group": int64(1 << 30)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(store, config.Defaults(), Options{Guest: &startupGuest{}, Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup=%v", err)
+	}
+	for _, id := range []string{"maintenance-a", "maintenance-b", "maintenance-c"} {
+		op, err := store.GetOperation(ctx, id)
+		if err != nil || op.Response["outcome"] != "success" {
+			t.Fatalf("operation=%#v,error=%v", op, err)
+		}
+	}
+}
+
+func TestMaintenanceRetryRequiresVerifiedEvidence(t *testing.T) {
+	for _, mode := range []string{"transitional-task", "invalid-digest", "missing-worker-identity", "already-retried"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			generation := int64(0)
+			req := protocol.Request{"protocol": protocol.Version, "action": "admin-reconcile", "apply": true, "generation": generation, "operation_id": "blocked-maintenance"}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker := map[string]any{"state": "finished", "pid": int64(1 << 30), "start_time": "1", "process_group": int64(1 << 30)}
+			response := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "_recovery_attempts": int64(2), "worker": worker}
+			if mode == "invalid-digest" {
+				response["_request_digest"] = "invalid"
+			}
+			if mode == "missing-worker-identity" {
+				delete(worker, "process_group")
+			}
+			if mode == "already-retried" {
+				response["_recovery_after_clear_attempted"] = true
+			}
+			if err := store.RecordOperation(ctx, "blocked-maintenance", "admin-reconcile", nil, &generation, response); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "transitional-task" {
+				now := time.Now()
+				if err := store.InsertTask(ctx, state.Task{TaskID: "blocked-task", SessionID: "blocked-session", Generation: 1, State: stateClosing, InstanceName: "blocked-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			service := New(store, config.Defaults(), Options{Guest: &startupGuest{config: map[string]any{"config": map[string]any{}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}, Resident: true})
+			if err := service.StartupReconcile(ctx); err == nil {
+				t.Fatal("unverified maintenance was finalized")
+			}
+			op, err := store.GetOperation(ctx, "blocked-maintenance")
+			if err != nil || op.Response["outcome"] != "pending" {
+				t.Fatalf("op=%#v,error=%v", op, err)
+			}
+		})
+	}
+}
