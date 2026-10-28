@@ -963,6 +963,17 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 		if err := s.recoverPending(ctx, pending); err != nil {
 			return err
 		}
+		pending, err = s.Store.PendingOperations(ctx)
+		if err != nil {
+			return s.sqliteError(err)
+		}
+		if err := s.reconcileSupersededOperations(ctx, pending); err != nil {
+			return err
+		}
+		pending, err = s.Store.PendingOperations(ctx)
+		if err != nil {
+			return s.sqliteError(err)
+		}
 		if err := s.reconcileOrphanedAcquireOperations(ctx, pending); err != nil {
 			if protocol.AsError(err).Code != "startup_reconcile_required" {
 				return err
@@ -983,6 +994,167 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 		return protocol.NewError("startup_reconcile_required", "pending operations require explicit recovery before admission", map[string]any{"count": len(pending), "admission_ready": false})
 	}
 	return s.verifyResidentNativeState(ctx)
+}
+
+// recoveryQuiescence is implemented by the native control authority only. It
+// proves that no old control child or Incus background operation remains.
+type recoveryQuiescence interface {
+	VerifyRecoveryQuiescence(context.Context) error
+}
+
+// reconcileSupersededOperations preserves the original request and worker
+// evidence while reporting an unknown historical outcome. A later serialized
+// successful operation and a verified, quiescent cached task fence the old
+// effect; the original native request is never replayed.
+func (s *Service) reconcileSupersededOperations(ctx context.Context, pending []state.Operation) error {
+	probe, ok := s.Guest.(recoveryQuiescence)
+	if !ok || native.WorkerOperationID(ctx) != "" {
+		return nil
+	}
+	seen := make(map[string]bool)
+	for _, candidate := range pending {
+		if candidate.SessionID == nil || seen[*candidate.SessionID] {
+			continue
+		}
+		session := *candidate.SessionID
+		seen[session] = true
+		unlock, acquired := s.trySessionLock(session)
+		if !acquired {
+			continue
+		}
+		err := s.reconcileSupersededSession(ctx, session, probe)
+		unlock()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Service) reconcileSupersededSession(ctx context.Context, session string, probe recoveryQuiescence) error {
+	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": session})
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if task == nil || task.State != stateCached || task.LeaseExpiresAt != nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
+		return nil
+	}
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	type superseded struct {
+		operation state.Operation
+		witness   string
+	}
+	var group []superseded
+	for _, operation := range pending {
+		if operation.SessionID == nil || *operation.SessionID != session {
+			continue
+		}
+		if operation.Generation == nil || *operation.Generation > task.Generation || s.operationActive(operation.OperationID) || (operation.Action != "acquire" && operation.Action != "resize" && operation.Action != "restart") {
+			return nil
+		}
+		if taskID, exists := operation.Response["_task_id"]; exists && stringValue(taskID) != task.TaskID {
+			return nil
+		}
+		if boundGeneration, exists := operation.Response["_task_generation"]; exists {
+			value, valid := protocol.Integer(boundGeneration)
+			if !valid || value < *operation.Generation || value > task.Generation {
+				return nil
+			}
+		}
+		worker, valid := operation.Response["worker"].(map[string]any)
+		if !valid || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
+			return nil
+		}
+		pid, pidOK := protocol.Integer(worker["pid"])
+		pgid, groupOK := protocol.Integer(worker["process_group"])
+		start := stringValue(worker["start_time"])
+		if !pidOK || !groupOK || pid <= 0 || pgid <= 0 || start == "" {
+			return nil
+		}
+		alive, workerErr := native.WorkerAlive(native.WorkerIdentity{PID: int(pid), ProcessGroup: int(pgid), StartTime: start})
+		if workerErr != nil || alive {
+			return nil
+		}
+		raw, valid := operation.Response["_request"].(map[string]any)
+		if !valid {
+			return nil
+		}
+		req := protocol.Request(raw)
+		digest, digestErr := protocol.Digest(req)
+		if protocol.ValidateRequest(req) != nil || digestErr != nil || digest != stringValue(operation.Response["_request_digest"]) || stringValue(req["operation_id"]) != operation.OperationID || stringValue(req["action"]) != operation.Action || stringValue(req["session_id"]) != session || intValue(req["generation"]) != *operation.Generation {
+			return nil
+		}
+		later, err := s.Store.LaterSuccessfulSessionOperations(ctx, operation.OperationID)
+		if err != nil {
+			return s.sqliteError(err)
+		}
+		witness := ""
+		for _, completed := range later {
+			if supersedingOperationMatches(operation, completed, task) {
+				witness = completed.OperationID
+				break
+			}
+		}
+		if witness == "" {
+			return nil
+		}
+		group = append(group, superseded{operation: operation, witness: witness})
+	}
+	if len(group) == 0 {
+		return nil
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+	defer cancel()
+	if err := s.verifyCachedGuest(checkCtx, task); err != nil {
+		return nil
+	}
+	if err := probe.VerifyRecoveryQuiescence(checkCtx); err != nil {
+		return protocol.NewError("startup_reconcile_required", "historical operation quiescence could not be verified", map[string]any{"admission_ready": false, "cause": err.Error()})
+	}
+	for _, item := range group {
+		response := cloneMap(item.operation.Response)
+		response["outcome"] = "error"
+		response["error"] = protocol.NewError("operation_outcome_unknown", "the original outcome is unknown; a later operation superseded its lease", map[string]any{"outcome_verified": false, "lease_state_verified": true, "superseded_by_operation_id": item.witness})
+		if err := s.Store.RecordOperation(ctx, item.operation.OperationID, item.operation.Action, item.operation.SessionID, item.operation.Generation, response); err != nil {
+			return s.sqliteError(err)
+		}
+	}
+	return nil
+}
+
+func supersedingOperationMatches(original, completed state.Operation, task *state.Task) bool {
+	if original.Generation == nil || completed.Generation == nil || completed.SessionID == nil || *completed.SessionID != task.SessionID || *completed.Generation < *original.Generation || *completed.Generation > task.Generation {
+		return false
+	}
+	worker, workerOK := original.Response["worker"].(map[string]any)
+	created, createdErr := time.Parse(time.RFC3339Nano, original.CreatedAt)
+	finished, finishedErr := time.Parse(time.RFC3339Nano, stringValue(worker["finished_at"]))
+	laterCreated, laterErr := time.Parse(time.RFC3339Nano, completed.CreatedAt)
+	if !workerOK || createdErr != nil || finishedErr != nil || laterErr != nil || !laterCreated.After(created) || !laterCreated.After(finished) {
+		return false
+	}
+	response := completed.Response
+	digest := stringValue(response["_request_digest"])
+	digestBytes, digestErr := hex.DecodeString(digest)
+	if digestErr != nil || len(digestBytes) != sha256.Size || stringValue(response["outcome"]) != "success" || !boolValue(response["ok"]) || intValue(response["protocol"]) != protocol.Version || stringValue(response["operation_id"]) != completed.OperationID || stringValue(response["action"]) != completed.Action || stringValue(response["session_id"]) != task.SessionID || intValue(response["generation"]) != *completed.Generation {
+		return false
+	}
+	result, ok := response["result"].(map[string]any)
+	if !ok || stringValue(result["task_id"]) != task.TaskID || stringValue(result["session_id"]) != task.SessionID {
+		return false
+	}
+	resultGeneration, validGeneration := protocol.Integer(result["generation"])
+	effectiveLease, validLease := result["effective_lease"].(bool)
+	if !validGeneration || !validLease || resultGeneration < *completed.Generation || resultGeneration > task.Generation {
+		return false
+	}
+	if completed.Action == "release" && stringValue(result["state"]) == stateCached && !effectiveLease {
+		return original.Action != "acquire" || resultGeneration > *original.Generation
+	}
+	return original.Action == "acquire" && completed.Action == "acquire" && *completed.Generation > *original.Generation && resultGeneration > *original.Generation && stringValue(result["state"]) == stateActive && effectiveLease
 }
 
 // reconcileOrphanedAcquireOperations closes the narrow crash window where a
@@ -2280,6 +2452,21 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 					"management":   true,
 				})
 			}
+			unknown, unknownErr := s.Store.ReconciledUnknownOperations(ctx)
+			if unknownErr != nil {
+				return nil, s.sqliteError(unknownErr)
+			}
+			unknownOperations := make([]any, 0, len(unknown))
+			for _, operation := range unknown {
+				item := map[string]any{"operation_id": operation.OperationID, "action": operation.Action, "session_id": nil, "generation": nil, "created_at": operation.CreatedAt}
+				if operation.SessionID != nil {
+					item["session_id"] = *operation.SessionID
+				}
+				if operation.Generation != nil {
+					item["generation"] = *operation.Generation
+				}
+				unknownOperations = append(unknownOperations, item)
+			}
 			var cpuObservation *observe.CPUObservation
 			var cpuObservationErr error
 			if s.CPU != nil {
@@ -2375,7 +2562,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				"observed_at": start, "up": nativeUp, "draining": draining, "admission_ready": s.Ready(),
 				"resources": resourcesValue, "ct_cpu": ctCPU,
 				"default_admission": map[string]any{"requested": map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "ready": s.Ready(), "reasons": defaultReasons},
-				"task_states":       states, "pending_operations": pendingOperations, "instances": len(tasks), "warnings": warnings,
+				"task_states":       states, "pending_operations": pendingOperations, "historical_unknown_operations": unknownOperations, "instances": len(tasks), "warnings": warnings,
 				"warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil), "native_unavailable": boolInt(!nativeUp)},
 			}, nil
 		}

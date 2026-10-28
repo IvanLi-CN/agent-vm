@@ -981,9 +981,50 @@ func decodeOperationJSON(raw string, target *map[string]any) error {
 }
 
 func (s *Store) PendingOperations(ctx context.Context) ([]Operation, error) {
+	return s.listObservedOperations(ctx, `SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending' ORDER BY created_at, operation_id`)
+}
+
+// ReconciledUnknownOperations remains observable after a superseded operation
+// stops blocking admission, without exposing its saved request or worker data.
+func (s *Store) ReconciledUnknownOperations(ctx context.Context) ([]Operation, error) {
+	return s.listObservedOperations(ctx, `SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'error' AND json_extract(response_json, '$.error.code') = 'operation_outcome_unknown' ORDER BY created_at, operation_id`)
+}
+
+func (s *Store) listObservedOperations(ctx context.Context, query string) ([]Operation, error) {
 	var values []Operation
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
-		rows, err := conn.QueryContext(ctx, "SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending' ORDER BY created_at, operation_id")
+		rows, err := conn.QueryContext(ctx, query)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var value Operation
+			var session sql.NullString
+			var generation sql.NullInt64
+			var raw string
+			if err := rows.Scan(&value.OperationID, &value.Action, &session, &generation, &raw, &value.CreatedAt); err != nil {
+				return err
+			}
+			value.SessionID, value.Generation = nullableString(session), nullableInt(generation)
+			if err := decodeOperationJSON(raw, &value.Response); err != nil {
+				return err
+			}
+			values = append(values, value)
+		}
+		return rows.Err()
+	})
+	return values, err
+}
+
+// LaterSuccessfulSessionOperations uses the journal's insertion order, not
+// wall-clock timestamps, to find completed operations serialized after an intent.
+func (s *Store) LaterSuccessfulSessionOperations(ctx context.Context, operationID string) ([]Operation, error) {
+	var values []Operation
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, `SELECT later.operation_id, later.action, later.session_id, later.generation, later.response_json, later.created_at
+			FROM operations AS original JOIN operations AS later ON later.session_id = original.session_id AND later.rowid > original.rowid
+			WHERE original.operation_id = ? AND later.action IN ('acquire', 'release') AND json_extract(later.response_json, '$.outcome') = 'success' ORDER BY later.rowid`, operationID)
 		if err != nil {
 			return err
 		}
