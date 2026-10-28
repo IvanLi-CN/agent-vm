@@ -51,15 +51,44 @@ environment. This design does not require KVM or `/dev/kvm`.
 
 ## Management console design
 
-The built-in Web management console is a product target and has not been implemented. Its scope covers managed images and existing Agent session VMs, with controlled maintenance and audit. The approved first-release contract fixes five pages, `zh-CN`/`en` localization, the authenticated same-origin `/api/v1` boundary, image migration, and package rollback compatibility.
+The built-in Web management console targets managed images and existing Agent
+session VMs, with controlled maintenance and audit. The approved first-release
+contract fixes five pages, `zh-CN`/`en` localization, the authenticated
+same-origin `/api/v1` boundary, image migration, and package rollback
+compatibility.
 
 Read [PRODUCT.md](PRODUCT.md) for product boundaries, [DESIGN.md](DESIGN.md) for the selected workbench baseline, and the [Web surface brief](.impeccable/surfaces/web.md) for task flows. The [management contract](docs/specs/agent-vm/contracts/management-api.md), [OpenAPI document](docs/specs/agent-vm/contracts/management-api.yaml), and its synthetic examples define the shared frontend/backend API and state-compatibility boundary. The [decision memo](docs/proposals/agent-vm-web-console.md) records the source investigation and architecture rationale.
+
+### Web Demo
+
+The repository also ships an independent, static-safe Demo build under
+`/demo/`. It reuses the five management pages and route suffixes but runs only
+against an in-memory model. The inspector can switch normal, capacity/data
+fault, conflict/unknown-outcome, and empty scenarios; simulated identity,
+network, and data settings are shareable as `demo`/`d_*` query parameters.
+Demo mutations never call `/api/v1`, never read upload files, and are reset on
+refresh. A failed Demo bootstrap stops before rendering the console. This is a
+review and documentation surface, not a production-management deployment.
+
+Build and preview it with:
+
+```bash
+bun run build:demo
+bun run preview:demo
+```
+
+Static hosts must serve `web/dist-demo/index.html` for `/demo/` and unknown
+`/demo/*` paths (SPA fallback). The formal build remains `bun run build:web` and
+uses the configured real management API boundary.
 
 ## Local validation
 
 ```bash
 bun install --frozen-lockfile
 bun run check
+bun run test:web
+bun run test:e2e
+bun run react-doctor:web:staged
 bun run test:repo
 bun run test:skills
 go -C skills/agent-vm-ops/control test -count=1 ./...

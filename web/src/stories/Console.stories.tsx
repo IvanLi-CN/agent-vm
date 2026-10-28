@@ -8,6 +8,7 @@ import { OverviewPage } from "../pages/OverviewPage";
 import { SystemPage } from "../pages/SystemPage";
 import { VMsPage } from "../pages/VMsPage";
 import { Shell } from "../components/Shell";
+import { DemoInspector } from "../demo/DemoInspector";
 import type { PageKey } from "../app/types";
 
 function StoryFrame({ page, children }: { page: PageKey; children: React.ReactNode }) {
@@ -24,3 +25,4 @@ export const VMInspection: Story = { render: () => <StoryFrame page="vms"><VMsPa
 export const ImageImport: Story = { render: () => <StoryFrame page="images"><ImagesPage /></StoryFrame> };
 export const OperationsAudit: Story = { render: () => <StoryFrame page="operations"><OperationsPage /></StoryFrame> };
 export const SystemMaintenance: Story = { render: () => <StoryFrame page="system"><SystemPage /></StoryFrame> };
+export const DemoInspectorPanel: Story = { render: () => <div style={{ minHeight: "720px" }}><DemoInspector /></div> };

@@ -130,6 +130,10 @@ Managed images MUST use immutable fingerprints, allowlisted source identities, b
 
 Management schema changes MUST be additive, transactional and recorded by versioned state-capability markers. Migration MUST preserve task identity, generations, leases, ports, reservations and existing protocol-4 journal state. A package may activate only when it declares support to read and write every capability marker in the state database. Packages without a capability declaration MUST be treated as supporting pre-management state only. An incompatible rollback MUST be rejected before changing active package pointers or starting the target; databases MUST NOT be downgraded or recreated to force compatibility. Protocol 4 and existing CLI request/response behavior MUST remain unchanged.
 
+### REQ-AGENT-VM-025 - Safe Web Demo boundary
+
+The repository MAY ship a static Web Demo that reuses the management console's five pages, route suffixes, and API-shaped view model, but the Demo MUST use an explicit demo build and an in-memory transport. Demo bootstrap MUST complete before console rendering and MUST fail closed without falling back to the real `/api/v1` transport. Demo reads and mutations MUST NOT call the real API, read or upload user files, access deployment credentials, or persist simulated results. Share links MAY contain only the documented `demo` and `d_*` scenario settings; reasons, file metadata, credentials, and other sensitive values MUST be excluded. The Demo MUST remain visibly synthetic and MUST NOT be treated as evidence that the authenticated production management boundary is deployed.
+
 ## Synchronization and retrieval
 
 The TypeScript/Bun synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. Git selection, manifests and native filesystem access preserve byte paths, symlink targets, modes and hashes; unsupported local root-path representation fails explicitly. It rejects submodules, symlink parents, reserved ownership filenames and unsafe names before transfer. The guest transaction is an in-memory Bun action guarded by the managed image's runtime/native prerequisites and an external execution deadline; missing Bun or atomic capability fails closed. Native locks, exclusive preparation, baseline identity comparison, fsync and atomic directory exchange preserve the current source and adjacent results across conflicts and failures. An uncertain commit keeps its source marker and precise recovery record and returns exit 75 rather than an inferred rollback. The [CLI contract](contracts/cli.md#source-synchronization-transaction) defines execution bounds, ownership and recovery. Export streams a tar archive directly to the caller and does not create a server-side archive.
@@ -151,6 +155,7 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 - `VER-AGENT-VM-022` covers: `REQ-AGENT-VM-022` through [the management contract](contracts/management-api.md), the OpenAPI operation/error schemas, and operation recovery and audit checks.
 - `VER-AGENT-VM-023` covers: `REQ-AGENT-VM-023` through [the management contract](contracts/management-api.md), [the session-pinned image ADR](../../adr/0041-agent-vm-session-pinned-image-identity.md), the CLI contract and image-reference concurrency checks.
 - `VER-AGENT-VM-024` covers: `REQ-AGENT-VM-024` through [the management contract](contracts/management-api.md), [the release contract](contracts/release.md), [the CLI contract](contracts/cli.md), and migration and package-compatibility checks.
+- `VER-AGENT-VM-025` covers: `REQ-AGENT-VM-025` through the [Web Demo decision memo](../../proposals/agent-vm-web-demo.md), the Demo runtime/API isolation tests, the page-level browser suite, the static build, and the existing management API boundary checks.
 
 ## Related ADRs
 
@@ -163,6 +168,11 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 - [Native Incus Agent container lifecycle](../../adr/0038-native-incus-agent-container-lifecycle.md)
 - [Agent VM session-pinned image identity](../../adr/0041-agent-vm-session-pinned-image-identity.md)
 - [Agent VM Web management boundary](../../adr/0042-agent-vm-web-management-boundary.md)
+
+## Visual Evidence
+
+- [Web Demo capacity scenario, desktop](assets/web-demo-capacity-desktop.png)
+- [Web Demo empty scenario, mobile 393×852 CSS px](assets/web-demo-empty-mobile.png)
 
 ## Related material
 

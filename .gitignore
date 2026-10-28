@@ -35,3 +35,6 @@ reports/
 artifacts/
 tmp/
 release-state/
+test-results/
+web/dist-demo/
+web/storybook-static/

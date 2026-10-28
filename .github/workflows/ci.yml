@@ -25,6 +25,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
@@ -48,6 +50,13 @@ jobs:
         run: bun run typecheck
       - name: Web tests
         run: bun run test:web
+      - name: Web demo browser tests
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          bunx playwright install --with-deps chromium
+          bun run test:e2e
+      - name: React Doctor
+        run: bun run react-doctor:web:ci
       - name: Go control tests
         working-directory: skills/agent-vm-ops/control
         run: go test -count=1 ./...

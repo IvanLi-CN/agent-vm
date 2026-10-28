@@ -16,6 +16,10 @@ _Avoid_：用“发布成功”同时指代 GitHub 产物发布与现网部署�
 
 **Agent VM 管理台（Management console）**：维护者对 Agent VM 受管资源进行全局观察和授权管理的操作面。
 
+**管理台演示（Web demo）**：复用管理台界面和交互、以模拟数据展示 Agent VM 管理行为的可分享体验。演示中的资源和操作不代表真实受管资源或管理操作。
+
+**演示控制面板（Demo inspector）**：用于选择和调整管理台演示场景，并查看模拟操作与分享状态的控制面。
+
 **管理 API（Management API）**：内置管理台使用的同源 `/api/v1` 浏览器合同。它独立于 CLI protocol 4、内部 control API 和部署侧观测接口。
 
 **受管 VM（Managed VM）**：由 Agent VM 根据会话归属、资源和租约规则管理的工作环境。管理台中的 VM 指已有 Agent 会话的工作环境。
