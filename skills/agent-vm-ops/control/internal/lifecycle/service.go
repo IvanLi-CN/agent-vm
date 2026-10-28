@@ -2259,7 +2259,8 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 		return nil, err
 	}
 	previousReservationJSON := task.ResourceReservationJSON
-	commitReservation := map[string]int64{}
+	previousReservation := map[string]int64{}
+	pendingReservation := map[string]bool{}
 	if previousReservationJSON != "" && previousReservationJSON != "{}" {
 		// Keep unresolved dimensions from an earlier partial resize. A later
 		// CPU or memory success must not erase a physical reservation held for
@@ -2268,40 +2269,25 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 		if reservationErr != nil {
 			return nil, protocol.NewError("resource_unverified", "existing resize reservation cannot be verified", map[string]any{"task_id": task.TaskID, "verified": false})
 		}
-		pending := map[string]bool{}
+		previousReservation = reservation
 		for _, key := range resourceKeys {
 			if reservation[key] != current[key] {
-				pending[key] = true
+				pendingReservation[key] = true
 			}
 		}
-		for _, key := range resourceKeys {
-			if _, requestedDimension := request[key]; requestedDimension {
-				delete(pending, key)
-			}
-		}
-		if len(pending) == 0 && task.ReservationBytes > 0 && request["disk_gib"] == nil {
+		if len(pendingReservation) == 0 && task.ReservationBytes > 0 && request["disk_gib"] == nil {
 			for _, key := range resourceKeys {
-				pending[key] = true
-			}
-		}
-		if len(pending) > 0 {
-			for _, key := range resourceKeys {
-				commitReservation[key] = target[key]
-			}
-			for key := range pending {
-				commitReservation[key] = reservation[key]
+				pendingReservation[key] = true
 			}
 		}
 	}
-	commitReservationJSON := "{}"
-	if len(commitReservation) > 0 {
-		commitReservationJSON = mustJSON(commitReservation)
+	reservationTarget := map[string]int64{"cpu": target["cpu"], "memory_mib": target["memory_mib"], "disk_gib": target["disk_gib"]}
+	for key := range pendingReservation {
+		if _, requestedDimension := request[key]; !requestedDimension {
+			reservationTarget[key] = previousReservation[key]
+		}
 	}
-	commitReservationBytes := int64(0)
-	if request["disk_gib"] == nil {
-		commitReservationBytes = task.ReservationBytes
-	}
-	reservationJSON := mustJSON(target)
+	reservationJSON := mustJSON(reservationTarget)
 	reservationNow := s.Clock()
 	reserved, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &reservationNow}, map[string]any{"resource_reservation_json": reservationJSON, "reservation_bytes": reservationBytes, "updated_at": nowString(reservationNow)})
 	if err != nil {
@@ -2338,6 +2324,32 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 		}
 	}
 	commitNow := s.Clock()
+	remainingReservation := map[string]bool{}
+	for key := range pendingReservation {
+		remainingReservation[key] = true
+	}
+	for _, key := range resourceKeys {
+		if _, requestedDimension := request[key]; requestedDimension {
+			delete(remainingReservation, key)
+		}
+	}
+	commitReservation := map[string]int64{}
+	if len(remainingReservation) > 0 {
+		for _, key := range resourceKeys {
+			commitReservation[key] = target[key]
+		}
+		for key := range remainingReservation {
+			commitReservation[key] = previousReservation[key]
+		}
+	}
+	commitReservationJSON := "{}"
+	if len(commitReservation) > 0 {
+		commitReservationJSON = mustJSON(commitReservation)
+	}
+	commitReservationBytes := int64(0)
+	if request["disk_gib"] == nil {
+		commitReservationBytes = task.ReservationBytes
+	}
 	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow}, map[string]any{"resources_json": mustJSON(target), "resource_reservation_json": commitReservationJSON, "reservation_bytes": commitReservationBytes, "updated_at": nowString(commitNow)})
 	if err != nil {
 		return nil, s.sqliteError(err)

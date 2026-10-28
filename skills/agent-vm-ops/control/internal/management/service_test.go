@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
@@ -452,7 +453,10 @@ func TestNativeImageUnpackFailureIsClassifiedForAudit(t *testing.T) {
 	}
 	defer store.Close()
 	content := []byte("abc")
-	backend := &partialImageBackend{err: uncertainImageUnpackError{}}
+	backend := &partialImageBackend{err: &native.UncertainError{Cause: &native.CommandError{
+		Result: native.Result{Code: 1, Stderr: []byte("Error: Unable to unpack image, run out of disk space")},
+		Cause:  errors.New("incus: exit status 1"),
+	}}}
 	service := New(store, Options{UploadMaxBytes: 1024, Backend: backend})
 	operation, err := service.StartImageImport(context.Background(), ImportRequest{
 		OperationID: "native-image-unpack-failure", Actor: "admin", Reason: "classify native failure", TargetVersion: "image-catalog:revision-1", VersionLabel: "2026.07",
@@ -903,10 +907,3 @@ type uncertainActionError struct{}
 
 func (uncertainActionError) Error() string   { return "native result is uncertain" }
 func (uncertainActionError) Uncertain() bool { return true }
-
-type uncertainImageUnpackError struct{}
-
-func (uncertainImageUnpackError) Error() string {
-	return "Unable to unpack image, run out of disk space"
-}
-func (uncertainImageUnpackError) Uncertain() bool { return true }

@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
@@ -728,7 +729,24 @@ func isImageUnpackFailure(err error) bool {
 	if err == nil {
 		return false
 	}
-	lower := strings.ToLower(err.Error())
+	if imageUnpackText(err.Error()) {
+		return true
+	}
+	var commandErr *native.CommandError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	diagnostic := commandErr.Diagnostic()
+	for _, key := range []string{"stderr", "stdout"} {
+		if text, ok := diagnostic[key].(string); ok && imageUnpackText(text) {
+			return true
+		}
+	}
+	return false
+}
+
+func imageUnpackText(value string) bool {
+	lower := strings.ToLower(value)
 	return strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs"))
 }
 
