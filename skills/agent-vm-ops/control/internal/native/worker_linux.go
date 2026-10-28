@@ -5,6 +5,7 @@ package native
 import (
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -92,6 +93,7 @@ type workerKillOps struct {
 	workerAlive  func(WorkerIdentity) (bool, error)
 	sendSignal   func(int) error
 	killGroup    func(WorkerIdentity, *workerGroupCleanup) error
+	reapGroup    func(WorkerIdentity) error
 	groupAlive   func(int) (bool, error)
 	sleep        func(time.Duration)
 }
@@ -131,6 +133,7 @@ func KillWorker(identity WorkerIdentity) error {
 			return unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0)
 		},
 		killGroup: killProcessGroup,
+		reapGroup: reapWorkerGroup,
 		groupAlive: func(group int) (bool, error) {
 			return workerGroupAlive(group, readProcessTable)
 		},
@@ -176,6 +179,11 @@ func killWorkerWith(identity WorkerIdentity, ops workerKillOps) error {
 		}
 		if ops.groupAlive != nil {
 			for attempt := 0; attempt < 10; attempt++ {
+				if ops.reapGroup != nil {
+					if err := ops.reapGroup(current); err != nil {
+						return fmt.Errorf("reap native worker process group: %w", err)
+					}
+				}
 				alive, aliveErr := ops.groupAlive(current.ProcessGroup)
 				if aliveErr != nil {
 					return fmt.Errorf("inspect native worker process group after cleanup: %w", aliveErr)
@@ -204,6 +212,49 @@ func killWorkerWith(identity WorkerIdentity, ops workerKillOps) error {
 		return fmt.Errorf("kill native worker: %w", err)
 	}
 	return nil
+}
+
+func reapWorkerGroup(identity WorkerIdentity) error {
+	// KillWorker runs from durable recovery after the runner has relinquished
+	// ownership of the command root. Reap only identity-verified zombies that
+	// have been reparented to this service; unrelated children remain untouched.
+	nativeProcessTreeMu.Lock()
+	defer nativeProcessTreeMu.Unlock()
+
+	all, err := readProcessTable()
+	if err != nil {
+		return err
+	}
+	owner := os.Getpid()
+	var first error
+	for pid, item := range all {
+		if item.group != identity.ProcessGroup || item.state != 'Z' {
+			continue
+		}
+		current, readErr := readProcess(pid)
+		if processGone(readErr) {
+			continue
+		}
+		if readErr != nil {
+			if first == nil {
+				first = fmt.Errorf("recheck zombie process %d: %w", pid, readErr)
+			}
+			continue
+		}
+		if current.start != item.start || current.group != identity.ProcessGroup {
+			if first == nil {
+				first = fmt.Errorf("process-group zombie identity changed for pid %d", pid)
+			}
+			continue
+		}
+		if current.parent != owner {
+			continue
+		}
+		if _, waitErr := unix.Wait4(pid, nil, unix.WNOHANG, nil); waitErr != nil && !errors.Is(waitErr, unix.ECHILD) && !errors.Is(waitErr, unix.ESRCH) && first == nil {
+			first = fmt.Errorf("reap process-group zombie %d: %w", pid, waitErr)
+		}
+	}
+	return first
 }
 
 // killProcessGroup uses pidfds for each member while the original root pidfd

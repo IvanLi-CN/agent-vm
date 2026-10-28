@@ -365,6 +365,10 @@ func TestWorkerAliveDetectsSurvivingProcessGroupAfterRootExit(t *testing.T) {
 }
 
 func TestKillWorkerCleansRootAndLiveGroupMember(t *testing.T) {
+	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
+		t.Skipf("Linux child subreaper unavailable: %v", err)
+	}
+	t.Cleanup(func() { _ = unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) })
 	command := exec.Command("/bin/sh", "-c", "sleep 30 & child=$!; echo $child; wait")
 	configureCommand(command)
 	stdout, err := command.StdoutPipe()
@@ -596,6 +600,7 @@ func TestKillWorkerConfirmsProcessGroupGoneAfterMemberScan(t *testing.T) {
 	identity := WorkerIdentity{PID: 123, StartTime: "1", ProcessGroup: 123}
 	groupChecks := 0
 	killGroupCalls := 0
+	reapGroupCalls := 0
 	err := killWorkerWith(identity, workerKillOps{
 		openPIDFD:  func(int) (int, error) { return 42, nil },
 		closePIDFD: func(int) error { return nil },
@@ -608,6 +613,10 @@ func TestKillWorkerConfirmsProcessGroupGoneAfterMemberScan(t *testing.T) {
 			killGroupCalls++
 			return nil
 		},
+		reapGroup: func(WorkerIdentity) error {
+			reapGroupCalls++
+			return nil
+		},
 		groupAlive: func(int) (bool, error) {
 			groupChecks++
 			return groupChecks == 1, nil
@@ -617,8 +626,8 @@ func TestKillWorkerConfirmsProcessGroupGoneAfterMemberScan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("killWorkerWith() error = %v, want nil", err)
 	}
-	if killGroupCalls != 2 || groupChecks != 2 {
-		t.Fatalf("group cleanup calls = kill:%d check:%d, want 2 each", killGroupCalls, groupChecks)
+	if killGroupCalls != 2 || reapGroupCalls != 2 || groupChecks != 2 {
+		t.Fatalf("group cleanup calls = kill:%d reap:%d check:%d, want 2 each", killGroupCalls, reapGroupCalls, groupChecks)
 	}
 }
 
