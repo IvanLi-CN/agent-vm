@@ -460,7 +460,7 @@ func TestCachedImageUsableAllowsOnlyVerifiedImagesOrLegacyDefault(t *testing.T) 
 		t.Fatal(err)
 	}
 	usable, err = store.CachedImageUsable(ctx, legacy)
-	if err != nil || usable {
+	if err != nil || !usable {
 		t.Fatalf("former legacy default usable=%v err=%v", usable, err)
 	}
 }

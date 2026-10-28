@@ -512,16 +512,15 @@ func (s *Store) CachedImageUsable(ctx context.Context, fingerprint string) (bool
 		if err != nil {
 			return err
 		}
-		var stateValue, integrity, suitability, compatibility string
-		var isDefault int
-		err = conn.QueryRowContext(ctx, "SELECT state, integrity, suitability, default_compatibility, is_default FROM managed_images WHERE fingerprint = ?", fingerprint).Scan(&stateValue, &integrity, &suitability, &compatibility, &isDefault)
+		var stateValue, integrity, suitability, compatibility, sourceKind string
+		err = conn.QueryRowContext(ctx, "SELECT state, integrity, suitability, default_compatibility, source_kind FROM managed_images WHERE fingerprint = ?", fingerprint).Scan(&stateValue, &integrity, &suitability, &compatibility, &sourceKind)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		usable = stateValue == "available" && ((integrity == "passed" && suitability == "passed") || (integrity == "legacy_unverified" && suitability == "not_assessed" && compatibility == "legacy_unverified" && isDefault == 1))
+		usable = stateValue == "available" && ((integrity == "passed" && suitability == "passed") || (integrity == "legacy_unverified" && suitability == "not_assessed" && compatibility == "legacy_unverified" && sourceKind == "legacy_config"))
 		return nil
 	})
 	return usable, err
