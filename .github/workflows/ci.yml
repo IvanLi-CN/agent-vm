@@ -52,16 +52,13 @@ jobs:
         run: bun run test:web
       - name: Web demo browser tests
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          bunx playwright install chromium
-          bun run test:e2e
+        run: bun run test:e2e
       - name: Static demo build
         if: matrix.os == 'ubuntu-latest'
         run: bun run build:demo
       - name: Storybook accessibility
         if: matrix.os == 'ubuntu-latest'
         run: |
-          bunx playwright install chromium
           bun run build-storybook
           bun run test:storybook:a11y
       - name: React Doctor

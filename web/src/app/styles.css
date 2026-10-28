@@ -317,6 +317,7 @@ svg { flex: none; }
 .demo-actions { display: flex; gap: 8px; }
 .demo-actions .ui-button { flex: 1; }
 .demo-footnote { color: var(--muted); font-size: 11px; line-height: 16px; }
+.demo-copy-error { margin: 0; color: var(--danger); font-size: 11px; line-height: 16px; }
 .demo-bubble { position: fixed; z-index: 26; right: 22px; bottom: 22px; display: grid; place-items: center; width: 44px; height: 44px; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 50%; box-shadow: 0 8px 22px rgba(19,20,22,.12); }
 .demo-bubble svg { width: 18px; height: 18px; }
 .demo-bubble.is-open { display: none; }

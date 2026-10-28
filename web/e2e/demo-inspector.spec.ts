@@ -3,6 +3,9 @@ import { expect, test } from "@playwright/test";
 test("keeps the demo isolated while a scenario and simulated action change", async ({ page }) => {
   const realRequests: string[] = [];
   page.on("request", (request) => { if (request.url().includes("/api/v1")) realRequests.push(request.url()); });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async () => undefined } });
+  });
   await page.goto("?demo=normal&d_persona=admin&d_network=online&token=must-not-share#private-fragment");
   await expect(page.getByRole("heading", { name: "Demo inspector" })).toBeVisible();
   await page.getByLabel("Scene").selectOption("capacity");
@@ -43,4 +46,26 @@ test("supports a mobile inspector drawer and fail-closed bootstrap", async ({ pa
   await expect(page.getByRole("heading", { name: "Demo could not start" })).toBeVisible();
   await expect(page.getByText("The simulated environment was not ready")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Demo inspector" })).toHaveCount(0);
+});
+
+test("covers route pages, denied reads, keyboard controls and clipboard failure", async ({ page }) => {
+  await page.goto("?demo=normal");
+  await page.getByRole("button", { name: "Images" }).click();
+  await expect(page.getByTestId("images-page")).toBeVisible();
+  await page.getByRole("button", { name: "System" }).click();
+  await expect(page.getByTestId("system-page")).toBeVisible();
+  await page.getByRole("button", { name: "Close demo inspector" }).focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("button", { name: "Open demo inspector" })).toBeVisible();
+
+  await page.goto("?demo=normal&d_persona=viewer");
+  await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
+  await expect(page.getByText("The request did not complete").first()).toBeVisible();
+
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async () => { throw new Error("permission denied"); } } });
+  });
+  await page.goto("?demo=normal");
+  await page.getByRole("button", { name: "Copy share link" }).click();
+  await expect(page.getByText("Copy failed")).toBeVisible();
 });

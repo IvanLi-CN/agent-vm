@@ -90,7 +90,7 @@ function delay<T>(value: T): Promise<T> {
 function mockStateForRequest(): typeof mockState {
   if (isDemoRuntime()) {
     const mutationError = demoMutationError();
-    if (mutationError === "network_unavailable") throw new ManagementRequestError(mutationError);
+    if (mutationError) throw new ManagementRequestError(mutationError);
   }
   return getMockState();
 }
@@ -232,6 +232,11 @@ export async function submitMaintenance(action: "drain_enter" | "reconcile" | "g
 
 function createMockOperation(action: Operation["action"], target: Operation["target"], reason: string, status?: Operation["status"], operationId = createOperationId()): Operation {
   const state = getMockState();
+  const existing = state.operations.find((candidate) => candidate.operation_id === operationId);
+  if (existing) {
+    if (existing.action !== action || existing.target.kind !== target.kind || existing.target.id !== target.id || existing.reason !== reason) throw new ManagementRequestError("operation_conflict", "queued", operationId);
+    return existing;
+  }
   const outcome = isDemoRuntime() ? demoForcedOutcome() : "succeeded";
   const finalStatus = status === "running" || status === "awaiting_upload" ? status : status === "queued" && !isDemoRuntime() ? status : outcome;
   const operation: Operation = { operation_id: operationId, action, status: finalStatus, phase: finalStatus === "awaiting_upload" ? "awaiting_upload" : finalStatus === "running" ? "suitability_check" : finalStatus === "succeeded" ? "completed" : finalStatus === "failed" ? "reference_check" : "native_action", target, actor: "admin@example.invalid", reason, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), result: finalStatus === "succeeded" ? { effect: "simulated_effect", affected_session_count: target.kind === "vm" ? 1 : 0 } : null, error: finalStatus === "failed" ? { code: "stale_target", phase: "precondition", retryable: false } : finalStatus === "outcome_unknown" ? { code: "authority_unavailable", phase: "native_action", retryable: true } : null };
@@ -257,6 +262,7 @@ function continueMockUploadOperation(operationId: string): Operation {
   const state = getMockState();
   const operation = state.operations.find((candidate) => candidate.operation_id === operationId);
   if (!operation) throw new ManagementRequestError("not_found", "awaiting_upload", operationId);
+  if (operation.action !== "image_import" || operation.target.kind !== "image_catalog" || operation.status !== "awaiting_upload") throw new ManagementRequestError("operation_conflict", "awaiting_upload", operationId);
   const outcome = isDemoRuntime() ? demoForcedOutcome() : "succeeded";
   const updatedAt = new Date().toISOString();
   operation.status = outcome;
