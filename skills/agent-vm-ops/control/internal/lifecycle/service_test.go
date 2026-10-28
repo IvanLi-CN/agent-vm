@@ -46,6 +46,7 @@ func (guest *capacityGuest) Probe(context.Context) error { return guest.probeErr
 type startupGuest struct {
 	initErr     error
 	status      string
+	statusErr   error
 	statuses    []map[string]any
 	statusCalls int
 	deleteCalls int
@@ -85,6 +86,9 @@ func (guest *startupGuest) Start(context.Context, string) error                {
 func (guest *startupGuest) Stop(context.Context, string) error                 { return guest.stopErr }
 func (guest *startupGuest) Delete(context.Context, string) error               { guest.deleteCalls++; return nil }
 func (guest *startupGuest) Status(context.Context, string) (map[string]any, error) {
+	if guest.statusErr != nil {
+		return nil, guest.statusErr
+	}
 	index := guest.statusCalls
 	guest.statusCalls++
 	if len(guest.statuses) > 0 {
@@ -442,6 +446,28 @@ func TestExternalPhysicalReservationSharesLifecycleAdmission(t *testing.T) {
 	}
 }
 
+func TestExternalPhysicalReservationPreservesManagementFreeSpaceFloor(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.Management.Upload.MinimumFreeBytes = 30 * 1024 * 1024 * 1024
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 40 * 1024 * 1024 * 1024},
+	}
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
+	service.MarkReady()
+	_, err = service.ReservePhysicalStorage(context.Background(), 20*1024*1024*1024)
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_insufficient" {
+		t.Fatalf("management free-space floor error = %#v", err)
+	}
+}
+
 func TestCachedResumeWithDiskGrowthChargesBothPhysicalCosts(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -551,6 +577,70 @@ func TestAdminMetricsPreservesPhysicalCapacityAndAdmissionCost(t *testing.T) {
 	}
 }
 
+func TestAdminMetricsMatchesAdmissionForUnknownState(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.InstanceLimit = 1
+	task := state.Task{TaskID: "unknown-state-task", SessionID: "unknown-state-session", State: "mystery", ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, cfg, Options{})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := metrics["default_admission"].(map[string]any)
+	if admission["ready"] != false {
+		t.Fatalf("unknown state default admission = %#v", admission)
+	}
+	instances := metrics["instances"].(map[string]any)["admission"].(map[string]any)
+	if instances["allocated_and_reserved"] != int64(1) {
+		t.Fatalf("unknown state instance admission = %#v", instances)
+	}
+}
+
+func TestAdminMetricsDoesNotDoubleCountResizeReservation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.CPUBudget = 6
+	cfg.CPUOvercommitRatio = json.Number("1")
+	cfg.MemoryBudgetMiB = 12288
+	cfg.MemoryOvercommitRatio = json.Number("1")
+	cfg.DiskBudgetGiB = 50
+	task := state.Task{TaskID: "resize-metrics-task", SessionID: "resize-metrics-session", State: stateActive, ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{"cpu":4,"memory_mib":8192,"disk_gib":30}`}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, cfg, Options{})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := metrics["default_admission"].(map[string]any)
+	if admission["ready"] != true {
+		t.Fatalf("resize default admission = %#v", admission)
+	}
+	resources := metrics["resources"].(map[string]any)["allocated_and_reserved"].(map[string]int64)
+	if resources["cpu"] != 4 || resources["memory_mib"] != 8192 || resources["disk_gib"] != 30 {
+		t.Fatalf("resize allocated_and_reserved = %#v", resources)
+	}
+}
+
 func TestStatusReportsCachedNativeStateAndGuestAvailability(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -593,6 +683,32 @@ func TestStatusReportsCachedNativeStateAndGuestAvailability(t *testing.T) {
 	items := admin["tasks"].([]any)
 	if len(items) != 1 || items[0].(map[string]any)["native_status"] != "Stopped" {
 		t.Fatalf("admin status = %#v", admin)
+	}
+}
+
+func TestStatusKeepsGuestAvailabilityUnknownWhenNativeStatusIsUnverified(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	task := state.Task{TaskID: "unverified-status-task", SessionID: "unverified-status-session", Generation: 1, State: stateCached, InstanceName: "unverified-status-instance", ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	guest := &perInstanceGuest{
+		startupGuest: startupGuest{statusErr: errors.New("status transport failed")},
+		configs:      map[string]map[string]any{task.InstanceName: {"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": task.SessionID, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	result, err := service.status(ctx, task.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["native_status"] != "unverified" || result["guest_available"] != nil {
+		t.Fatalf("unverified status = %#v", result)
 	}
 }
 

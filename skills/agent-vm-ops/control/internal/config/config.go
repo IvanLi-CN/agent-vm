@@ -118,6 +118,8 @@ func Defaults() Config {
 		CreateCostBytes:                    4 * 1024 * 1024 * 1024,
 		ResumeCostBytes:                    1 * 1024 * 1024 * 1024,
 		ResizeCostBytes:                    1 * 1024 * 1024 * 1024,
+		DiskLowBytes:                       10 * 1024 * 1024 * 1024,
+		DiskTargetBytes:                    20 * 1024 * 1024 * 1024,
 		SweepSeconds:                       1,
 		WorkerTimeoutSeconds:               300,
 		DrainTimeoutSeconds:                8100,

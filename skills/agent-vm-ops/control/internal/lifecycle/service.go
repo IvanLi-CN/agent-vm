@@ -145,7 +145,11 @@ func (s *Service) ReservePhysicalStorage(ctx context.Context, size int64) (func(
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.diskAdmissionSufficient(ctx, admission, size, ""); err != nil {
+	minimumFreeBytes := s.Config.Management.Upload.MinimumFreeBytes
+	if minimumFreeBytes < 0 {
+		return nil, protocol.NewError("config_invalid", "management upload minimum free bytes must not be negative", nil)
+	}
+	if _, err := s.diskAdmissionSufficientWithFloor(ctx, admission, size, "", minimumFreeBytes); err != nil {
 		return nil, err
 	}
 	s.storageMu.Lock()
@@ -2436,8 +2440,12 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 		}
 		allocated := map[string]int64{"cpu": 0, "memory_mib": 0, "disk_gib": 0}
 		reserved := map[string]int64{"cpu": 0, "memory_mib": 0, "disk_gib": 0}
+		admissionInstances := int64(0)
 		for _, task := range tasks {
 			states[task.State]++
+			if task.State != stateCached && task.State != stateAbsent {
+				admissionInstances++
+			}
 			resources := map[string]int64{}
 			_ = json.Unmarshal([]byte(task.ResourcesJSON), &resources)
 			if task.State == stateActive {
@@ -2561,13 +2569,14 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			limits := map[string]any{}
 			remaining := map[string]any{}
+			allocatedAndReserved := maxResourceMaps(allocated, reserved)
 			if s.Config.CPUBudget > 0 {
 				limit, limitErr := config.LogicalLimit(s.Config.CPUBudget, s.Config.CPUOvercommitRatio)
 				if limitErr != nil {
 					return nil, protocol.NewError("config_invalid", "CPU admission ratio is invalid", map[string]any{"cause": limitErr.Error()})
 				}
 				limits["cpu"] = limit
-				remaining["cpu"] = limit - allocated["cpu"] - reserved["cpu"]
+				remaining["cpu"] = limit - allocatedAndReserved["cpu"]
 			}
 			if s.Config.MemoryBudgetMiB > 0 {
 				limit, limitErr := config.LogicalLimit(s.Config.MemoryBudgetMiB, s.Config.MemoryOvercommitRatio)
@@ -2575,13 +2584,12 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 					return nil, protocol.NewError("config_invalid", "memory admission ratio is invalid", map[string]any{"cause": limitErr.Error()})
 				}
 				limits["memory_mib"] = limit
-				remaining["memory_mib"] = limit - allocated["memory_mib"] - reserved["memory_mib"]
+				remaining["memory_mib"] = limit - allocatedAndReserved["memory_mib"]
 			}
 			if s.Config.DiskBudgetGiB > 0 {
 				limits["disk_gib"] = s.Config.DiskBudgetGiB
-				remaining["disk_gib"] = s.Config.DiskBudgetGiB - allocated["disk_gib"] - reserved["disk_gib"]
+				remaining["disk_gib"] = s.Config.DiskBudgetGiB - allocatedAndReserved["disk_gib"]
 			}
-			allocatedAndReserved := addResourceMaps(allocated, reserved)
 			memoryObservation := map[string]any{"limit_bytes": nil, "current_bytes": nil, "available_bytes": nil, "threshold_bytes": nil, "pressure": nil, "oom_events": nil}
 			resourcesValue := map[string]any{"allocated": allocated, "reserved": reserved, "allocated_and_reserved": allocatedAndReserved, "limits": limits, "remaining": remaining, "policy": map[string]any{"cpu_overcommit_ratio": s.Config.CPUOvercommitRatio, "memory_overcommit_ratio": s.Config.MemoryOvercommitRatio, "cpu_startup_pressure_full_avg10_percent": s.Config.CPUStartupPressureFullAvg10Percent}, "memory": memoryObservation, "memory_pressure": nil}
 			ctCPU := map[string]any{"capacity_vcpu": nil, "pressure": nil, "startup_pressure": nil}
@@ -2657,7 +2665,6 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			instanceLimit := any(nil)
 			instanceRemaining := any(nil)
-			admissionInstances := states[stateActive] + states[statePreparing] + states[stateClosing] + states[stateDeleting] + states[stateFailed]
 			if s.Config.InstanceLimit > 0 {
 				instanceLimit = s.Config.InstanceLimit
 				instanceRemaining = maxInt64(0, s.Config.InstanceLimit-admissionInstances)
@@ -3236,7 +3243,7 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	result := map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": false}
+	result := map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": nil}
 	if s.Guest == nil {
 		return result, nil
 	}
@@ -3810,7 +3817,11 @@ func (s *Service) diskAdmissionWithExternalReservation(ctx context.Context, excl
 	}, nil
 }
 
-func (s *Service) diskAdmissionSufficient(_ context.Context, admission map[string]any, requestCost int64, excludeTaskID string) (bool, error) {
+func (s *Service) diskAdmissionSufficient(ctx context.Context, admission map[string]any, requestCost int64, excludeTaskID string) (bool, error) {
+	return s.diskAdmissionSufficientWithFloor(ctx, admission, requestCost, excludeTaskID, 0)
+}
+
+func (s *Service) diskAdmissionSufficientWithFloor(_ context.Context, admission map[string]any, requestCost int64, excludeTaskID string, minimumFreeBytes int64) (bool, error) {
 	if admission == nil {
 		return true, nil
 	}
@@ -3824,8 +3835,12 @@ func (s *Service) diskAdmissionSufficient(_ context.Context, admission map[strin
 	if !reservedOK {
 		reserved, reservedOK = physical["durable_reserved_bytes"].(int64)
 	}
-	if !freeOK || !lowOK || !reservedOK || requestCost < 0 {
+	if !freeOK || !lowOK || !reservedOK || requestCost < 0 || minimumFreeBytes < 0 {
 		return false, protocol.NewError("resource_unverified", "physical disk admission observation is malformed", map[string]any{"verified": false})
+	}
+	threshold := low
+	if minimumFreeBytes > threshold {
+		threshold = minimumFreeBytes
 	}
 	if excludeTaskID != "" {
 		// diskAdmission already excluded this task when its reservation was
@@ -3834,11 +3849,11 @@ func (s *Service) diskAdmissionSufficient(_ context.Context, admission map[strin
 		_ = excludeTaskID
 	}
 	if reserved > free || requestCost > free-reserved {
-		return false, protocol.NewError("resource_insufficient", "physical disk admission is below the configured low watermark", map[string]any{"request_cost_bytes": requestCost, "free_bytes": free, "reserved_bytes": reserved, "low_watermark_bytes": low})
+		return false, protocol.NewError("resource_insufficient", "physical disk admission is below the configured free-space floor", map[string]any{"request_cost_bytes": requestCost, "free_bytes": free, "reserved_bytes": reserved, "low_watermark_bytes": low, "required_free_bytes": threshold})
 	}
-	sufficient := free-reserved-requestCost >= low
+	sufficient := free-reserved-requestCost >= threshold
 	if !sufficient {
-		return false, protocol.NewError("resource_insufficient", "physical disk admission is below the configured low watermark", map[string]any{"request_cost_bytes": requestCost, "free_bytes": free, "reserved_bytes": reserved, "low_watermark_bytes": low})
+		return false, protocol.NewError("resource_insufficient", "physical disk admission is below the configured free-space floor", map[string]any{"request_cost_bytes": requestCost, "free_bytes": free, "reserved_bytes": reserved, "low_watermark_bytes": low, "required_free_bytes": threshold})
 	}
 	return true, nil
 }
@@ -3984,6 +3999,14 @@ func addResourceMaps(left, right map[string]int64) map[string]int64 {
 	result := map[string]int64{}
 	for _, key := range resourceKeys {
 		result[key] = left[key] + right[key]
+	}
+	return result
+}
+
+func maxResourceMaps(left, right map[string]int64) map[string]int64 {
+	result := map[string]int64{}
+	for _, key := range resourceKeys {
+		result[key] = maxInt64(left[key], right[key])
 	}
 	return result
 }

@@ -44,6 +44,13 @@ func TestValidateRequiresDeploymentIdentity(t *testing.T) {
 	}
 }
 
+func TestDefaultsUseSafeDiskWatermarks(t *testing.T) {
+	value := Defaults()
+	if value.DiskLowBytes != 10*1024*1024*1024 || value.DiskTargetBytes != 20*1024*1024*1024 {
+		t.Fatalf("disk watermark defaults = low:%d target:%d", value.DiskLowBytes, value.DiskTargetBytes)
+	}
+}
+
 func TestLoadRejectsMissingRawEnvironmentFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"state_db":"/tmp/state.sqlite3"}`), 0o600); err != nil {
