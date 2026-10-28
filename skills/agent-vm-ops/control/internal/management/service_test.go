@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -35,6 +36,7 @@ func (backend *blockingImageBackend) ImportTrusted(ctx context.Context, sourceID
 	backend.once.Do(func() { close(backend.entered) })
 	select {
 	case <-backend.release:
+		backend.imports++
 		return backend.artifact, nil
 	case <-ctx.Done():
 		return ImageArtifact{}, ctx.Err()
@@ -302,6 +304,86 @@ func TestConcurrentTrustedImportsReserveImageStorage(t *testing.T) {
 	close(backend.release)
 	if err := <-firstDone; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTrustedImportUsesSharedReservationCallbackUntilCompletion(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	fingerprint := strings.Repeat("a", 64)
+	backend := &blockingImageBackend{fakeImageBackend: fakeImageBackend{artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}}, entered: make(chan struct{}), release: make(chan struct{})}
+	var reservationMu sync.Mutex
+	activeReservations := 0
+	reserveCalls := 0
+	service := New(store, Options{
+		TrustedImageSourceIDs:  []string{"approved"},
+		UploadMinimumFreeBytes: 512,
+		ReserveImageStorage: func(size int64) (func(), error) {
+			reservationMu.Lock()
+			defer reservationMu.Unlock()
+			if size != 1 {
+				return nil, fmt.Errorf("unexpected reservation size %d", size)
+			}
+			reserveCalls++
+			if activeReservations != 0 {
+				return nil, errors.New("shared reservation is occupied")
+			}
+			activeReservations++
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					reservationMu.Lock()
+					activeReservations--
+					reservationMu.Unlock()
+				})
+			}, nil
+		},
+		Backend: backend,
+	})
+	requests := []ImportRequest{
+		{OperationID: "trusted-callback-a", Actor: "admin", Reason: "shared callback", TargetVersion: "image-catalog:revision-1", VersionLabel: "a", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}},
+		{OperationID: "trusted-callback-b", Actor: "admin", Reason: "shared callback", TargetVersion: "image-catalog:revision-1", VersionLabel: "b", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}},
+	}
+	for _, request := range requests {
+		if _, err := service.StartImageImport(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		operation, processErr := service.ProcessTrustedImport(context.Background(), requests[0].OperationID)
+		if processErr == nil && operation.Status != "succeeded" {
+			processErr = fmt.Errorf("first operation = %#v", operation)
+		}
+		firstDone <- processErr
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("callback-backed import did not reach native backend")
+	}
+	reservationMu.Lock()
+	active, calls := activeReservations, reserveCalls
+	reservationMu.Unlock()
+	if active != 1 || calls != 1 {
+		t.Fatalf("shared reservation state = active:%d calls:%d", active, calls)
+	}
+	second, err := service.ProcessTrustedImport(context.Background(), requests[1].OperationID)
+	if err == nil || !strings.Contains(err.Error(), "shared reservation is occupied") || second.Status != "queued" {
+		t.Fatalf("second callback-backed import = operation:%#v err:%v", second, err)
+	}
+	close(backend.release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	reservationMu.Lock()
+	active, calls = activeReservations, reserveCalls
+	reservationMu.Unlock()
+	if active != 0 || calls != 2 || backend.imports != 1 {
+		t.Fatalf("shared reservation release = active:%d calls:%d imports:%d", active, calls, backend.imports)
 	}
 }
 

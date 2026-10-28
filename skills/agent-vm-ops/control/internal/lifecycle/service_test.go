@@ -419,6 +419,29 @@ func TestAdmissionRejectsLowPhysicalStorageWithoutTouchingEffectiveLease(t *test
 	}
 }
 
+func TestAdmissionRejectsIncompleteDurableDiskReservation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	task := state.Task{TaskID: "incomplete-reservation-task", SessionID: "incomplete-reservation-session", State: stateActive, InstanceName: "incomplete-reservation-instance", ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{"cpu":4,"memory_mib":8192}`}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024}}
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
+	service.MarkReady()
+	_, err = service.diskAdmission(ctx, "")
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_unverified" {
+		t.Fatalf("incomplete disk reservation error = %#v", err)
+	}
+}
+
 func TestExternalPhysicalReservationSharesLifecycleAdmission(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -586,7 +609,7 @@ func TestAdminMetricsMatchesAdmissionForUnknownState(t *testing.T) {
 
 	cfg := config.Defaults()
 	cfg.StateDB = store.Path()
-	cfg.InstanceLimit = 1
+	cfg.InstanceLimit = 0
 	task := state.Task{TaskID: "unknown-state-task", SessionID: "unknown-state-session", State: "mystery", ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
 	if err := store.InsertTask(context.Background(), task); err != nil {
 		t.Fatal(err)
@@ -601,9 +624,15 @@ func TestAdminMetricsMatchesAdmissionForUnknownState(t *testing.T) {
 	if admission["ready"] != false {
 		t.Fatalf("unknown state default admission = %#v", admission)
 	}
+	if _, ok := metrics["instances"].(map[string]any)["verified"].(bool); !ok || metrics["instances"].(map[string]any)["verified"] != false {
+		t.Fatalf("unknown state instance verification = %#v", metrics["instances"])
+	}
 	instances := metrics["instances"].(map[string]any)["admission"].(map[string]any)
 	if instances["allocated_and_reserved"] != int64(1) {
 		t.Fatalf("unknown state instance admission = %#v", instances)
+	}
+	if control := protocol.AsError(service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)); control == nil || control.Code != "resource_unverified" {
+		t.Fatalf("unknown state admission error = %#v", control)
 	}
 }
 
@@ -638,6 +667,42 @@ func TestAdminMetricsDoesNotDoubleCountResizeReservation(t *testing.T) {
 	resources := metrics["resources"].(map[string]any)["allocated_and_reserved"].(map[string]int64)
 	if resources["cpu"] != 4 || resources["memory_mib"] != 8192 || resources["disk_gib"] != 30 {
 		t.Fatalf("resize allocated_and_reserved = %#v", resources)
+	}
+}
+
+func TestAdminMetricsSumsSeparateAllocatedAndReservedTasks(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.CPUBudget = 6
+	cfg.CPUOvercommitRatio = json.Number("1")
+	cfg.MemoryBudgetMiB = 12288
+	cfg.MemoryOvercommitRatio = json.Number("1")
+	cfg.DiskBudgetGiB = 50
+	active := state.Task{TaskID: "allocated-task", SessionID: "allocated-session", State: stateActive, InstanceName: "allocated-instance", ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`}
+	preparing := state.Task{TaskID: "reserved-task", SessionID: "reserved-session", State: statePreparing, InstanceName: "reserved-instance", ResourcesJSON: `{"cpu":3,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`}
+	for _, task := range []state.Task{active, preparing} {
+		if err := store.InsertTask(context.Background(), task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(store, cfg, Options{})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := metrics["resources"].(map[string]any)["allocated_and_reserved"].(map[string]int64)
+	if resources["cpu"] != 5 || resources["memory_mib"] != 8192 || resources["disk_gib"] != 40 {
+		t.Fatalf("separate task allocated_and_reserved = %#v", resources)
+	}
+	if metrics["default_admission"].(map[string]any)["ready"] != false {
+		t.Fatalf("separate task default admission = %#v", metrics["default_admission"])
 	}
 }
 

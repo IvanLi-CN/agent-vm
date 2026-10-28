@@ -2440,11 +2440,16 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 		}
 		allocated := map[string]int64{"cpu": 0, "memory_mib": 0, "disk_gib": 0}
 		reserved := map[string]int64{"cpu": 0, "memory_mib": 0, "disk_gib": 0}
+		allocatedAndReserved := map[string]int64{"cpu": 0, "memory_mib": 0, "disk_gib": 0}
 		admissionInstances := int64(0)
+		unknownTaskStates := []string{}
 		for _, task := range tasks {
 			states[task.State]++
 			if task.State != stateCached && task.State != stateAbsent {
 				admissionInstances++
+			}
+			if task.State != stateActive && task.State != statePreparing && task.State != stateCached && task.State != stateClosing && task.State != stateDeleting && task.State != stateFailed && task.State != stateAbsent {
+				unknownTaskStates = append(unknownTaskStates, task.State)
 			}
 			resources := map[string]int64{}
 			_ = json.Unmarshal([]byte(task.ResourcesJSON), &resources)
@@ -2457,6 +2462,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			_ = json.Unmarshal([]byte(task.ResourceReservationJSON), &reservation)
 			for _, key := range resourceKeys {
 				reserved[key] += reservation[key]
+				if task.State != stateCached && task.State != stateAbsent {
+					allocatedAndReserved[key] += maxInt64(resources[key], reservation[key])
+				}
 			}
 		}
 		endEpoch, err := s.Store.StateEpoch(ctx)
@@ -2569,7 +2577,6 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			limits := map[string]any{}
 			remaining := map[string]any{}
-			allocatedAndReserved := maxResourceMaps(allocated, reserved)
 			if s.Config.CPUBudget > 0 {
 				limit, limitErr := config.LogicalLimit(s.Config.CPUBudget, s.Config.CPUOvercommitRatio)
 				if limitErr != nil {
@@ -2617,6 +2624,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			if len(logicalExceeded) > 0 {
 				defaultReasons = append(defaultReasons, map[string]any{"code": "resource_insufficient", "dimensions": logicalExceeded, "requested": defaultRequested, "remaining": remaining})
+			}
+			if len(unknownTaskStates) > 0 {
+				defaultReasons = append(defaultReasons, map[string]any{"code": "resource_unverified", "message": "task state cannot be verified", "detail": map[string]any{"states": unknownTaskStates}})
 			}
 			if cpuObservation != nil {
 				pressure := cpuObservation.Pressure()
@@ -2672,7 +2682,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 					defaultReasons = append(defaultReasons, map[string]any{"code": "resource_insufficient", "dimensions": []string{"instances"}, "requested": 1, "remaining": instanceRemaining})
 				}
 			}
-			instances := map[string]any{"verified": true, "source": "durable_state", "native_verified": false, "total": len(tasks), "limits": map[string]any{}, "admission": map[string]any{"allocated": admissionInstances - states[statePreparing], "reserved": states[statePreparing], "allocated_and_reserved": admissionInstances, "remaining": instanceRemaining, "limit": instanceLimit, "capacity": nil}}
+			instances := map[string]any{"verified": len(unknownTaskStates) == 0, "source": "durable_state", "native_verified": false, "total": len(tasks), "limits": map[string]any{}, "admission": map[string]any{"allocated": admissionInstances - states[statePreparing], "reserved": states[statePreparing], "allocated_and_reserved": admissionInstances, "remaining": instanceRemaining, "limit": instanceLimit, "capacity": nil}}
 			defaultReady := len(defaultReasons) == 0
 			admissionReady := s.Ready() && nativeUp && defaultReady
 			doctorIssues := []any{}
@@ -3771,7 +3781,10 @@ func (s *Service) diskAdmissionWithExternalReservation(ctx context.Context, excl
 				return nil, protocol.NewError("resource_unverified", "task disk reservation is malformed", map[string]any{"task_id": task.TaskID, "verified": false})
 			}
 		}
-		reservationGiB := reservation["disk_gib"]
+		reservationGiB, reservationFieldOK := reservation["disk_gib"]
+		if task.ResourceReservationJSON != "" && task.ResourceReservationJSON != "{}" && !reservationFieldOK {
+			return nil, protocol.NewError("resource_unverified", "task disk reservation is incomplete", map[string]any{"task_id": task.TaskID, "verified": false})
+		}
 		reserved, reservationOK := multiplyGiB(reservationGiB)
 		if !reservationOK {
 			return nil, protocol.NewError("resource_unverified", "task disk reservation exceeds supported range", map[string]any{"task_id": task.TaskID, "verified": false})
@@ -3910,6 +3923,9 @@ func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64
 		if task.TaskID == excludeTaskID || task.State == stateCached || task.State == stateAbsent {
 			continue
 		}
+		if !admissionStateKnown(task.State) {
+			return protocol.NewError("resource_unverified", "task state cannot be verified", map[string]any{"task_id": task.TaskID, "state": task.State, "verified": false})
+		}
 		instances++
 		resources := map[string]int64{}
 		if task.ResourceReservationJSON != "" && task.ResourceReservationJSON != "{}" {
@@ -4003,14 +4019,6 @@ func addResourceMaps(left, right map[string]int64) map[string]int64 {
 	return result
 }
 
-func maxResourceMaps(left, right map[string]int64) map[string]int64 {
-	result := map[string]int64{}
-	for _, key := range resourceKeys {
-		result[key] = maxInt64(left[key], right[key])
-	}
-	return result
-}
-
 func sameResources(left, right map[string]int64) bool {
 	for _, key := range resourceKeys {
 		if left[key] != right[key] {
@@ -4018,6 +4026,15 @@ func sameResources(left, right map[string]int64) bool {
 		}
 	}
 	return true
+}
+
+func admissionStateKnown(stateName string) bool {
+	switch stateName {
+	case stateActive, statePreparing, stateCached, stateClosing, stateDeleting, stateFailed, stateAbsent:
+		return true
+	default:
+		return false
+	}
 }
 
 func requestHasResourceFields(request protocol.Request) bool {

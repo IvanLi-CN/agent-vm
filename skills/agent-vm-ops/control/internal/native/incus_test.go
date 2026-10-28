@@ -207,12 +207,12 @@ printf '%s\n' '{"name":"agents","driver":"dir","config":{"source":"'"$INCUS_STOR
 	}
 }
 
-func TestStorageCapacityRejectsBlockMultiplicationOverflow(t *testing.T) {
+func TestStorageCapacityRejectsInvalidBlockCountsAndMultiplicationOverflow(t *testing.T) {
 	if _, err := storageCapacityFromBlocks(^uint64(0), 1, 2); err == nil {
 		t.Fatal("overflowing total capacity was accepted")
 	}
 	if _, err := storageCapacityFromBlocks(2, ^uint64(0), 2); err == nil {
-		t.Fatal("overflowing free capacity was accepted")
+		t.Fatal("free block count greater than total was accepted")
 	}
 }
 
