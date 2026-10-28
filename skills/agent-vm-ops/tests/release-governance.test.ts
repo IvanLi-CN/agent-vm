@@ -4,8 +4,8 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { compareSemVer, parseSemVer, resolveReleaseTarget } from "../scripts/semver.ts";
-import { GithubReleaseStateStore, ReleaseStateStore, type GhGithubAdapter, type ReleaseIdentity } from "../scripts/release-coordinator.ts";
-import { assertContractPreconditions, assertWorkflowPlatformAttestation, successfulMainGate } from "../scripts/release.ts";
+import { GhGithubAdapter, GithubReleaseStateStore, ReleaseStateStore, type ReleaseIdentity } from "../scripts/release-coordinator.ts";
+import { assertContractPreconditions, assertWorkflowPlatformAttestation, successfulMainGate, verifyReleaseView } from "../scripts/release.ts";
 
 const identity = (overrides: Partial<ReleaseIdentity> = {}): ReleaseIdentity => ({
   version: "1.0.0",
@@ -135,4 +135,20 @@ test("GitHub state refs are append-only and preserve the original identity", asy
   let conflict = false;
   try { await remote.claim(identity({ source_revision: "e".repeat(40) })); } catch { conflict = true; }
   if (!conflict || refs.size !== 2) throw new Error("remote state ref conflict was not fail-closed");
+});
+
+test("draft release lookup accepts an untagged draft only when its target is bound", async () => {
+  const source = "a".repeat(40);
+  const adapter = new (class extends GhGithubAdapter {
+    async json<T>(args: readonly string[]): Promise<T> {
+      if (args.some((item) => item.includes("/releases/tags/"))) throw new Error("HTTP 404 Not Found");
+      return [{ tag_name: "v1.0.0", target_commitish: source, draft: true, assets: [{ name: "package" }] }] as T;
+    }
+  })("IvanLi-CN/agent-vm");
+  const view = await adapter.viewRelease("v1.0.0");
+  verifyReleaseView(view, "v1.0.0", true, { package: "/tmp/package" }, source);
+  let wrongSourceRejected = false;
+  try { verifyReleaseView(view, "v1.0.0", true, { package: "/tmp/package" }, "e".repeat(40)); } catch { wrongSourceRejected = true; }
+  if (!wrongSourceRejected) throw new Error("draft release target binding was not enforced");
+  verifyReleaseView({ tagName: "v1.0.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: false, assets: [{ name: "package" }] }, "v1.0.0", false, { package: "/tmp/package" }, source);
 });

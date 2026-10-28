@@ -120,18 +120,19 @@ async function verifyDownloaded(adapter: GhGithubAdapter, tag: string, digests: 
   }
 }
 
-function verifyReleaseView(value: unknown, tag: string, expectedDraft: boolean, assets: Record<string, string>): any {
+export function verifyReleaseView(value: unknown, tag: string, expectedDraft: boolean, assets: Record<string, string>, source?: string): any {
   if (!value || typeof value !== "object") throw new Error("GitHub release response is invalid");
-  const release = value as { tagName?: unknown; isDraft?: unknown; isPrerelease?: unknown; immutable?: unknown; assets?: unknown };
+  const release = value as { tagName?: unknown; targetCommitish?: unknown; isDraft?: unknown; isPrerelease?: unknown; immutable?: unknown; assets?: unknown };
   if (release.tagName !== tag || release.isDraft !== expectedDraft || !Array.isArray(release.assets)) throw new Error("GitHub release identity or draft state is invalid");
-  if (!expectedDraft && (release.isPrerelease === true || release.immutable !== true)) throw new Error("published GitHub release is not immutable or is a prerelease");
+  if (source !== undefined && release.targetCommitish !== source) throw new Error(`GitHub release target is not bound to ${source}`);
+  if (!expectedDraft && release.isPrerelease === true) throw new Error("published GitHub release is a prerelease");
   const names = new Set(release.assets.flatMap((item: any) => typeof item?.name === "string" ? [item.name] : []));
   for (const name of Object.keys(assets)) if (!names.has(name)) throw new Error(`GitHub release is missing asset: ${name}`);
   return release;
 }
 
 async function verifyPublishedRelease(adapter: GhGithubAdapter, tag: string, source: string, assets: Record<string, string>, artifacts: Record<string, string>): Promise<any> {
-  const release = verifyReleaseView(await adapter.viewRelease(tag), tag, false, assets);
+  const release = verifyReleaseView(await adapter.viewRelease(tag), tag, false, assets, source);
   const tagSource = await adapter.tagCommit(tag);
   if (tagSource !== source) throw new Error(`Git tag ${tag} points to ${tagSource}, expected ${source}`);
   await verifyDownloaded(adapter, tag, artifacts);
@@ -227,9 +228,8 @@ async function release(): Promise<void> {
   const tag = `v${version}`;
   await assertTagIsAbsentOrBound(adapter, tag, source);
   await adapter.createDraft(tag, source, Object.values(completeAssets), `Agent VM ${version}`, `Product release ${version} from ${source}.`);
-  if (await adapter.tagCommit(tag) !== source) throw new Error(`Git tag ${tag} does not point to the release source`);
   const draft = await store.transition(identity, "draft", { artifacts: completeDigests, assets: completeAssets, tag });
-  verifyReleaseView(await adapter.viewRelease(tag), tag, true, completeAssets);
+  verifyReleaseView(await adapter.viewRelease(tag), tag, true, completeAssets, source);
   await verifyDownloaded(adapter, tag, completeDigests);
   await adapter.publish(tag);
   const publishedView = await verifyPublishedRelease(adapter, tag, source, completeAssets, completeDigests);
@@ -269,8 +269,8 @@ async function recover(): Promise<void> {
       await assertTagIsAbsentOrBound(adapter, tag, current.identity.source_revision);
       await adapter.createDraft(tag, current.identity.source_revision, Object.values(assets), `Agent VM ${version}`, `Recovered product release ${version} from ${current.identity.source_revision}.`);
     }
-    if (await adapter.tagCommit(tag) !== current.identity.source_revision) throw new Error(`Git tag ${tag} does not point to the reserved source`);
-    verifyReleaseView(await adapter.viewRelease(tag), tag, true, assets);
+    await assertTagIsAbsentOrBound(adapter, tag, current.identity.source_revision);
+    verifyReleaseView(await adapter.viewRelease(tag), tag, true, assets, current.identity.source_revision);
     await verifyDownloaded(adapter, tag, artifacts);
     current = await store.transition(current.identity, "draft", { artifacts, assets, tag, recovered: true });
   }
