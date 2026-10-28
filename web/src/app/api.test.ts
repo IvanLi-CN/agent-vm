@@ -63,6 +63,8 @@ describe("mock image uploads", () => {
     expect(mockState.overview.task_counts.active).toBe(beforeActive - 1);
     expect(mockState.overview.task_counts.cached).toBe(beforeCached + 1);
     expect(vm.state).toBe("cached");
+    expect(vm.allowed_actions).toEqual(["release", "destroy"]);
+    await expect(submitVMAction(vm.task_id, "resize", "Resize a cached VM", previewFor(vm.resource_version), vm.generation, { cpu_vcpu: 8 }, "synthetic-cached-resize")).rejects.toMatchObject({ code: "action_not_allowed" });
     expect(image.references.active).toBe(Math.max(0, beforeImageActive - 1));
     expect(image.references.cached).toBe(beforeImageCached + 1);
     expect(mockState.overview.capacity.logical_cpu_remaining_vcpu.value).toBe(beforeCpu + vm.resources.cpu_vcpu!);
@@ -71,6 +73,7 @@ describe("mock image uploads", () => {
     const destroy = await submitVMAction(vm.task_id, "destroy", "Remove the cached demo VM", previewFor(vm.resource_version), vm.generation, {}, "synthetic-destroy-operation");
     expect(destroy.status).toBe("succeeded");
     expect(vm.state).toBe("absent");
+    expect(vm.allowed_actions).toEqual([]);
     expect(image.references.cached).toBe(beforeImageCached);
     expect(mockState.overview.capacity.physical_disk_available.value_bytes).toBeNull();
 
@@ -116,6 +119,8 @@ describe("mock image uploads", () => {
     expect(deleted.status).toBe("succeeded");
     expect(mockState.images.some((image) => image.fingerprint === retired.fingerprint)).toBe(false);
     expect(deleted.result?.image_fingerprint).toBe(retired.fingerprint);
+    const retriedDelete = await submitImageAction(retired.fingerprint, "delete", "Delete the retired demo image", previewFor(retired.resource_version), "synthetic-image-delete");
+    expect(retriedDelete).toBe(deleted);
   });
 
   it("updates available capacity when a VM is resized", async () => {

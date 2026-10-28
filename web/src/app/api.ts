@@ -171,7 +171,15 @@ export async function previewVMAction(taskId: string, action: string, current?: 
 export async function submitVMAction(taskId: string, action: string, reason: string, preview: ActionPreview, expectedGeneration: string, parameters: Record<string, unknown> = {}, operationId = createOperationId()): Promise<Operation> {
   if (useRealApi) return realRequest(`/vms/${encodeURIComponent(taskId)}/actions`, { method: "POST", body: JSON.stringify({ operation_id: operationId, reason, target_version: preview.target_version, action, expected_generation: expectedGeneration, parameters, confirmation_token: preview.confirmation_token }) });
   assertMockMutationAllowed();
-  return createMockOperation(action as Operation["action"], { kind: "vm", id: taskId }, reason, undefined, operationId, { action, taskId, reason, expectedGeneration, targetVersion: preview.target_version, confirmationToken: preview.confirmation_token, parameters }, parameters);
+  const state = getMockState();
+  const mockAction = action as Operation["action"];
+  const target = { kind: "vm" as const, id: taskId };
+  const requestPayload = { action, taskId, reason, expectedGeneration, targetVersion: preview.target_version, confirmationToken: preview.confirmation_token, parameters };
+  if (state.operations.some((operation) => operation.operation_id === operationId)) return createMockOperation(mockAction, target, reason, undefined, operationId, requestPayload, parameters);
+  const vm = state.vms.find((candidate) => candidate.task_id === taskId);
+  if (!vm) throw new ManagementRequestError("not_found", "precondition");
+  if (!vm.allowed_actions.includes(action as ManagedVM["allowed_actions"][number])) throw new ManagementRequestError("action_not_allowed", "precondition", operationId);
+  return createMockOperation(mockAction, target, reason, undefined, operationId, requestPayload, parameters);
 }
 
 export async function startImageImport(request: ImageImportRequest): Promise<Operation> {
@@ -227,13 +235,17 @@ export async function submitImageAction(fingerprint: string, action: "default" |
   }
   assertMockMutationAllowed();
   const state = getMockState();
+  const mockAction = action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire";
+  const target = { kind: "image" as const, id: fingerprint };
+  const requestPayload = { action, fingerprint, reason, targetVersion: preview.target_version, confirmationToken: preview.confirmation_token };
+  if (state.operations.some((operation) => operation.operation_id === operationId)) return createMockOperation(mockAction, target, reason, undefined, operationId, requestPayload);
   const image = state.images.find((candidate) => candidate.fingerprint === fingerprint);
   if (!image) throw new ManagementRequestError("not_found", "precondition");
   if (action === "default" && (image.state === "retired" || image.verification.suitability !== "passed")) throw new ManagementRequestError("image_not_applicable", "precondition");
   if (action === "retire" && image.is_default) throw new ManagementRequestError("default_image_required", "precondition");
   if (action === "delete" && image.is_default) throw new ManagementRequestError("default_image_required", "precondition");
   if (action === "delete" && image.references.active + image.references.cached + image.references.releasing + image.references.pending_creation + image.references.verification > 0) throw new ManagementRequestError("image_referenced", "precondition");
-  return createMockOperation(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", { kind: "image", id: fingerprint }, reason, undefined, operationId, { action, fingerprint, reason, targetVersion: preview.target_version, confirmationToken: preview.confirmation_token });
+  return createMockOperation(mockAction, target, reason, undefined, operationId, requestPayload);
 }
 
 export async function previewMaintenance(action: "drain_enter" | "reconcile" | "gc", currentResourceVersion?: string): Promise<ActionPreview> {
@@ -288,6 +300,7 @@ function createMockOperation(action: Operation["action"], target: Operation["tar
         vm.native_state = "absent";
         vm.guest_availability = "unavailable";
         vm.lease = { state: "absent", expires_at: null };
+        vm.allowed_actions = [];
       }
       if (vm && action === "release") {
         const previousState = vm.state;
@@ -298,6 +311,7 @@ function createMockOperation(action: Operation["action"], target: Operation["tar
         vm.native_state = "stopped";
         vm.guest_availability = "unavailable";
         vm.lease = { state: "absent", expires_at: null };
+        vm.allowed_actions = ["release", "destroy"];
       }
       if (vm && action === "restart") { vm.native_state = "running"; vm.guest_availability = "ready"; }
       if (vm && action === "resize") {
