@@ -559,6 +559,37 @@ func TestDrainStatusIncludesStateCapabilities(t *testing.T) {
 	}
 }
 
+func TestDirectReleaseCannotCrossReleaseActivationDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "release-fence.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	lease := time.Now().UTC().Add(time.Hour).Format(time.RFC3339Nano)
+	if err := store.InsertTask(ctx, state.Task{TaskID: "direct-release-task", SessionID: "direct-release-session", Generation: 1, State: "active", InstanceName: "agent-vm-direct-release", LeaseExpiresAt: &lease, CreatedAt: "2026-10-28T00:00:00Z", UpdatedAt: "2026-10-28T00:00:00Z", ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: "{}", ResourceReservationJSON: "{}"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(ctx, "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(ctx, "drain_owner", "release-tx-direct"); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "release", "session_id": "direct-release-session", "generation": int64(1), "operation_id": "direct-release-operation"})
+	if err == nil || protocol.AsError(err).Code != "draining" {
+		t.Fatalf("direct release error = %v", err)
+	}
+	task, err := store.GetTask(ctx, map[string]any{"task_id": "direct-release-task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil || task.State != "active" {
+		t.Fatalf("direct release changed task = %#v", task)
+	}
+}
+
 func TestIncompatibleCapabilityIsRejectedBeforeJournalClaim(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

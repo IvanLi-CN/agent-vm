@@ -1206,6 +1206,11 @@ func (s *Service) release(ctx context.Context, request protocol.Request, destroy
 }
 
 func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request, destroy bool) (map[string]any, error) {
+	if releaseDrain, err := s.releaseDrainOwned(ctx); err != nil {
+		return nil, s.sqliteError(err)
+	} else if releaseDrain {
+		return nil, protocol.NewError("draining", "release and destroy are refused while a release activation fence is owned", nil)
+	}
 	task, err := s.task(ctx, request)
 	if err != nil {
 		return nil, err
@@ -2408,6 +2413,15 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 func (s *Service) isDraining(ctx context.Context) (bool, error) {
 	value, exists, err := s.Store.Meta(ctx, "draining")
 	return exists && value == "1", err
+}
+
+func (s *Service) releaseDrainOwned(ctx context.Context) (bool, error) {
+	draining, err := s.isDraining(ctx)
+	if err != nil || !draining {
+		return false, err
+	}
+	owner, found, err := s.Store.Meta(ctx, "drain_owner")
+	return found && strings.HasPrefix(owner, "release-"), err
 }
 
 // IsDraining exposes the durable admission fence to the browser-independent
