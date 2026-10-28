@@ -48,6 +48,6 @@
   "platform_preconditions": {
     "protected_main_required": true,
     "required_main_check": "Main gate",
-    "status": "audit-required"
+    "status": "enabled"
   }
 }

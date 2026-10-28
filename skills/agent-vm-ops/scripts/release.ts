@@ -50,9 +50,7 @@ function runBuilder(version: string, source: string, targetName: string, output:
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr).trim() || "product package build failed");
 }
 
-export function assertPlatformPreconditions(root = repositoryRoot): void {
-  const quality = JSON.parse(readFileSync(join(root, ".github/quality-gates.json"), "utf8"));
-  const release = JSON.parse(readFileSync(join(root, ".github/release-contract.json"), "utf8"));
+export function assertContractPreconditions(quality: any, release: any): void {
   const statuses = {
     quality: quality.platform_alignment?.status,
     release: release.platform_preconditions?.status,
@@ -60,6 +58,12 @@ export function assertPlatformPreconditions(root = repositoryRoot): void {
   if (statuses.quality !== "enabled" || statuses.release !== "enabled") {
     throw new Error(`platform preconditions are not enabled: ${JSON.stringify(statuses)}`);
   }
+}
+
+export function assertPlatformPreconditions(root = repositoryRoot): void {
+  const quality = JSON.parse(readFileSync(join(root, ".github/quality-gates.json"), "utf8"));
+  const release = JSON.parse(readFileSync(join(root, ".github/release-contract.json"), "utf8"));
+  assertContractPreconditions(quality, release);
   const repository = process.env.GITHUB_REPOSITORY;
   if (!repository) throw new Error("GITHUB_REPOSITORY is required for the live platform preflight");
   const audit = auditRepository(repository);
