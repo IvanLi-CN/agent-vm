@@ -471,9 +471,18 @@ export class GhGithubAdapter implements GithubCommand {
   }
 
   async viewRelease(tag: string): Promise<unknown> {
-    const release = await this.json<any>(["api", `repos/${this.repository}/releases/tags/${tag}`]);
+    let release: any;
+    try {
+      release = await this.json<any>(["api", `repos/${this.repository}/releases/tags/${tag}`]);
+    } catch (error) {
+      if (!/404|not found/i.test(String(error))) throw error;
+      const releases = await this.json<any[]>(["api", `repos/${this.repository}/releases?per_page=100`]);
+      release = releases.find((candidate) => candidate?.tag_name === tag);
+      if (!release) throw error;
+    }
     return {
       tagName: release.tag_name,
+      targetCommitish: release.target_commitish,
       isDraft: release.draft,
       isPrerelease: release.prerelease,
       immutable: release.immutable,
