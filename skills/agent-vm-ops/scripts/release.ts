@@ -38,15 +38,21 @@ function sha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-function runBuilder(version: string, source: string, targetName: string, output: string): void {
-  const result = Bun.spawnSync([
+export function releaseBuilderCommand(version: string, source: string, targetName: string, output: string): string[] {
+  const builder = targetName === "client" ? "build_product_release.ts" : "build_go_release.ts";
+  const builderArgs = targetName === "client"
+    ? ["--version", version, "--source-revision", source, "--target", targetName]
+    : ["--source-revision", source, "--target", targetName];
+  return [
     process.execPath,
-    join(import.meta.dir, "build_product_release.ts"),
-    "--version", version,
-    "--source-revision", source,
-    "--target", targetName,
+    join(import.meta.dir, builder),
+    ...builderArgs,
     "--output", output,
-  ], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+  ];
+}
+
+function runBuilder(version: string, source: string, targetName: string, output: string): void {
+  const result = Bun.spawnSync(releaseBuilderCommand(version, source, targetName, output), { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr).trim() || "product package build failed");
 }
 
