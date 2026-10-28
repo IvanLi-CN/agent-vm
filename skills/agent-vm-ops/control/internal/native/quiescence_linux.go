@@ -24,20 +24,12 @@ func (c *IncusClient) VerifyRecoveryQuiescence(ctx context.Context) error {
 	if err != nil || result.Code != 0 || result.StdoutTruncated || result.StderrTruncated {
 		return errors.New("control service identity cannot be verified")
 	}
-	properties := make(map[string]string)
-	for _, line := range strings.Split(strings.TrimSpace(string(result.Stdout)), "\n") {
-		key, value, ok := strings.Cut(line, "=")
-		if _, exists := properties[key]; !ok || exists {
-			return errors.New("invalid control service identity")
-		}
-		properties[key] = value
-	}
-	group := properties["ControlGroup"]
-	if len(properties) != 4 || properties["MainPID"] != strconv.Itoa(os.Getpid()) || properties["KillMode"] != "control-group" || properties["Delegate"] != "no" || group != "/system.slice/agent-vm-native.service" {
-		return errors.New("control service process boundary is unverified")
+	group, err := recoveryServiceGroup(result.Stdout, os.Getpid())
+	if err != nil {
+		return err
 	}
 	current, err := os.ReadFile("/proc/self/cgroup")
-	if err != nil || strings.TrimSpace(string(current)) != "0::"+group {
+	if err != nil || !recoveryCgroupMatches(current, group) {
 		return errors.New("control process cgroup is unverified")
 	}
 	if err := checkRecoveryCgroup(filepath.Join("/sys/fs/cgroup", group), os.Getpid()); err != nil {
@@ -47,11 +39,38 @@ func (c *IncusClient) VerifyRecoveryQuiescence(ctx context.Context) error {
 	if err != nil || result.Code != 0 || result.StdoutTruncated || result.StderrTruncated {
 		return errors.New("native background operations cannot be verified")
 	}
-	var operations []json.RawMessage
-	if !strings.HasPrefix(strings.TrimSpace(string(result.Stdout)), "[") || json.Unmarshal(result.Stdout, &operations) != nil || len(operations) != 0 {
-		return errors.New("native background operations are not clear")
+	if err := recoveryOperationsClear(result.Stdout); err != nil {
+		return err
 	}
 	return checkRecoveryCgroup(filepath.Join("/sys/fs/cgroup", group), os.Getpid())
+}
+
+func recoveryServiceGroup(output []byte, self int) (string, error) {
+	properties := make(map[string]string)
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if _, exists := properties[key]; !ok || exists {
+			return "", errors.New("invalid control service identity")
+		}
+		properties[key] = value
+	}
+	group := properties["ControlGroup"]
+	if len(properties) != 4 || properties["MainPID"] != strconv.Itoa(self) || properties["KillMode"] != "control-group" || properties["Delegate"] != "no" || group != "/system.slice/agent-vm-native.service" {
+		return "", errors.New("control service process boundary is unverified")
+	}
+	return group, nil
+}
+
+func recoveryCgroupMatches(output []byte, group string) bool {
+	return strings.TrimSpace(string(output)) == "0::"+group
+}
+
+func recoveryOperationsClear(output []byte) error {
+	var operations []json.RawMessage
+	if !strings.HasPrefix(strings.TrimSpace(string(output)), "[") || json.Unmarshal(output, &operations) != nil || len(operations) != 0 {
+		return errors.New("native background operations are not clear")
+	}
+	return nil
 }
 
 func checkRecoveryCgroup(directory string, self int) error {

@@ -2689,13 +2689,16 @@ func (s *Service) reconcileClosing(ctx context.Context, task *state.Task) error 
 		if protocol.ValidateRequest(request) != nil || digestErr != nil || digest != stringValue(op.Response["_request_digest"]) || stringValue(request["action"]) != "destroy" || stringValue(request["session_id"]) != task.SessionID || intValue(request["generation"]) != task.Generation || stringValue(request["operation_id"]) != op.OperationID {
 			return protocol.NewError("operation_unverified", "pending destroy identity is inconsistent", nil)
 		}
+		if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
+			return protocol.NewError("operation_unverified", "pending destroy request is incompatible", map[string]any{"cause": compatibilityErr.Error()})
+		}
 		action = "destroy"
 		operationID = op.OperationID
 	}
 	if operationID != "" {
 		ctx = native.WithWorkerRecorder(ctx, operationID, s)
 	}
-	result, err := s.releaseUnlocked(ctx, request, action == "destroy")
+	result, err := s.releaseUnlocked(withInternalCleanup(ctx), request, action == "destroy")
 	if err != nil {
 		return err
 	}

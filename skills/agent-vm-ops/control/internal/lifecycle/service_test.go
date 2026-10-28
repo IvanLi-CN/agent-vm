@@ -2331,6 +2331,12 @@ func TestReconcileClosingTaskHonorsPendingDestroy(t *testing.T) {
 	if err := store.InsertTask(context.Background(), state.Task{TaskID: "closing-destroy-task", SessionID: session, Generation: generation, State: stateClosing, InstanceName: "closing-destroy-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`}); err != nil {
 		t.Fatal(err)
 	}
+	if err := store.SetMeta(context.Background(), "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(context.Background(), "drain_owner", "release-recovery-test"); err != nil {
+		t.Fatal(err)
+	}
 	request := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": session, "generation": generation, "operation_id": "closing-destroy-op"}
 	digest, err := protocol.Digest(request)
 	if err != nil {
@@ -2354,8 +2360,41 @@ func TestReconcileClosingTaskHonorsPendingDestroy(t *testing.T) {
 	}
 }
 
+func TestStartupReconcilesClosingDuringReleaseDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := nowString(time.Now())
+	session := "closing-release-drain"
+	task := state.Task{TaskID: "closing-task", SessionID: session, Generation: 1, State: stateClosing, InstanceName: "closing-instance", CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(ctx, "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(ctx, "drain_owner", "release-recovery-test"); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	current, err := store.GetTask(ctx, map[string]any{"session_id": session})
+	if err != nil || current == nil || current.State != stateCached || current.LeaseExpiresAt != nil {
+		t.Fatalf("task=%#v, error=%v", current, err)
+	}
+	if guest.deleteCalls != 0 {
+		t.Fatal("release cleanup deleted the instance")
+	}
+}
+
 func TestReconcileClosingRefusesUnverifiedDestroy(t *testing.T) {
-	for _, mode := range []string{"bad-digest", "worker-running", "wrong-request"} {
+	for _, mode := range []string{"bad-digest", "worker-running", "wrong-request", "incompatible"} {
 		t.Run(mode, func(t *testing.T) {
 			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 			if err != nil {
@@ -2388,11 +2427,26 @@ func TestReconcileClosingRefusesUnverifiedDestroy(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			var release *protocol.ReleaseMetadata
+			if mode == "incompatible" {
+				request["compatibility"] = map[string]any{
+					"release_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "protocol": protocol.Version, "action": "destroy",
+					"request":           map[string]any{"schema": int64(2), "semantic_revision": int64(1)},
+					"accepted_response": map[string]any{"schema_min": int64(1), "schema_max": int64(1), "semantic_min": int64(1), "semantic_max": int64(1)},
+				}
+				digest, err = protocol.Digest(request)
+				if err != nil {
+					t.Fatal(err)
+				}
+				release = &protocol.ReleaseMetadata{ReleaseID: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", Protocol: protocol.Version, Actions: map[string]protocol.ActionCompatibility{
+					"destroy": {Request: protocol.Schema{Schema: 1, SemanticRevision: 1}, Response: protocol.Schema{Schema: 1, SemanticRevision: 1}, RequestWindow: protocol.CompatibilityWindow{SchemaMin: 1, SchemaMax: 1, SemanticMin: 1, SemanticMax: 1}},
+				}}
+			}
 			if err := store.RecordOperation(context.Background(), "unsafe-op", "destroy", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": worker}); err != nil {
 				t.Fatal(err)
 			}
 			guest := &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "unsafe-task", "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}
-			service := New(store, config.Defaults(), Options{Guest: guest})
+			service := New(store, config.Defaults(), Options{Guest: guest, Release: release})
 			if _, err := service.reconcile(context.Background(), true); err == nil {
 				t.Fatal("unverified destroy was accepted")
 			}
