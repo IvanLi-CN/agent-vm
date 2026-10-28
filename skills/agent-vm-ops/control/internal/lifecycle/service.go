@@ -214,7 +214,11 @@ func (s *Service) WorkerStartFailed(ctx context.Context, operationID string, sta
 	worker := map[string]any{
 		"state":           "exited",
 		"start_attempted": true,
-		"finished_at":     nowString(s.Clock()),
+		// This marker is emitted only after Runner has proved that exec did not
+		// create a native process. It is deliberately distinct from an exited
+		// worker identity, which must retain PID/start-time/process-group proof.
+		"pre_spawn":   true,
+		"finished_at": nowString(s.Clock()),
 	}
 	if startErr != nil {
 		message := startErr.Error()
@@ -425,7 +429,7 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 				continue
 			}
 		}
-		if !recoverableOperation(operation.Action) || recoveryAttempts(operation.Response) > 0 {
+		if !recoverableOperation(operation.Action) || recoveryAttempts(operation.Response) > recoveryAttemptLimit(operation.Action) {
 			continue
 		}
 		rawRequest, ok := operation.Response["_request"].(map[string]any)
@@ -484,6 +488,18 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 		}
 	}
 	return firstErr
+}
+
+func recoveryAttemptLimit(action string) int64 {
+	// A maintenance reconcile may have been interrupted after its first
+	// recovery attempt by an older controller. Allow one bounded retry so the
+	// current controller can exclude that operation from its own reconciliation
+	// proof and finish the durable journal. Lifecycle effects keep the original
+	// single-attempt fail-closed rule.
+	if action == "admin-reconcile" {
+		return 1
+	}
+	return 0
 }
 
 func recoverableOperation(action string) bool {
@@ -1925,6 +1941,23 @@ func (s *Service) reconcile(ctx context.Context, apply bool, excludedOperationID
 		if pendingErr != nil {
 			return nil, s.sqliteError(pendingErr)
 		}
+		maintenance := make([]state.Operation, 0)
+		for _, operation := range pending {
+			if operation.Action == "admin-reconcile" && operation.OperationID != excludedOperationID {
+				maintenance = append(maintenance, operation)
+			}
+		}
+		// Recover an interrupted maintenance coordinator before checking
+		// lifecycle journals. Its operation ID is excluded by the nested
+		// reconciliation, so a legacy pending coordinator cannot be mistaken for
+		// native-init evidence for the task it was repairing.
+		if err := s.recoverPending(ctx, maintenance); err != nil {
+			return nil, err
+		}
+		pending, pendingErr = s.Store.PendingOperations(ctx)
+		if pendingErr != nil {
+			return nil, s.sqliteError(pendingErr)
+		}
 		if err := s.reconcilePendingWorkers(ctx, pending); err != nil {
 			return nil, err
 		}
@@ -1973,7 +2006,18 @@ func (s *Service) reconcile(ctx context.Context, apply bool, excludedOperationID
 				actions = append(actions, action)
 				continue
 			}
-			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); releaseErr != nil {
+			cleanupRequest, cleanupOperationID, requestErr := s.pendingCleanupRequest(ctx, task.SessionID, task.Generation, "release")
+			if requestErr != nil {
+				if firstErr == nil {
+					firstErr = requestErr
+				}
+				continue
+			}
+			cleanupCtx := ctx
+			if cleanupOperationID != "" {
+				cleanupCtx = native.WithWorkerRecorder(cleanupCtx, cleanupOperationID, s)
+			}
+			if result, releaseErr := s.release(cleanupCtx, cleanupRequest, false); releaseErr != nil {
 				if firstErr == nil {
 					firstErr = releaseErr
 				}
@@ -1982,7 +2026,18 @@ func (s *Service) reconcile(ctx context.Context, apply bool, excludedOperationID
 			}
 		}
 		if task.State == stateDeleting && apply {
-			if result, releaseErr := s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, true); releaseErr != nil {
+			cleanupRequest, cleanupOperationID, requestErr := s.pendingCleanupRequest(ctx, task.SessionID, task.Generation, "destroy")
+			if requestErr != nil {
+				if firstErr == nil {
+					firstErr = requestErr
+				}
+				continue
+			}
+			cleanupCtx := ctx
+			if cleanupOperationID != "" {
+				cleanupCtx = native.WithWorkerRecorder(cleanupCtx, cleanupOperationID, s)
+			}
+			if result, releaseErr := s.release(cleanupCtx, cleanupRequest, true); releaseErr != nil {
 				if firstErr == nil {
 					firstErr = releaseErr
 				}
@@ -1993,6 +2048,64 @@ func (s *Service) reconcile(ctx context.Context, apply bool, excludedOperationID
 	}
 	result := map[string]any{"dry_run": !apply, "actions": actions}
 	return result, firstErr
+}
+
+// pendingCleanupRequest validates the original cleanup intent before allowing
+// reconciliation to touch native state. A pending worker preparation marker is
+// safe to rearm; an attempted, malformed or identity-bearing unresolved worker
+// remains fail-closed until its ownership is reconciled.
+func (s *Service) pendingCleanupRequest(ctx context.Context, session string, generation int64, action string) (protocol.Request, string, error) {
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return nil, "", s.sqliteError(err)
+	}
+	matched := make([]state.Operation, 0, 1)
+	requests := make([]protocol.Request, 0, 1)
+	for _, operation := range pending {
+		if operation.Action != action || operation.SessionID == nil || *operation.SessionID != session || operation.Generation == nil || *operation.Generation != generation {
+			continue
+		}
+		rawRequest, ok := operation.Response["_request"].(map[string]any)
+		if !ok {
+			return nil, "", protocol.NewError("operation_unverified", "pending cleanup request is missing", map[string]any{"operation_id": operation.OperationID})
+		}
+		request := protocol.Request(rawRequest)
+		if validationErr := protocol.ValidateRequest(request); validationErr != nil {
+			return nil, "", protocol.NewError("operation_unverified", "pending cleanup request is invalid", map[string]any{"operation_id": operation.OperationID, "cause": validationErr.Error()})
+		}
+		if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
+			return nil, "", protocol.NewError("operation_unverified", "pending cleanup request is incompatible", map[string]any{"operation_id": operation.OperationID, "cause": compatibilityErr.Error()})
+		}
+		requestGeneration, generationPresent := request["generation"]
+		parsedGeneration, generationValid := protocol.Integer(requestGeneration)
+		if !generationPresent || !generationValid || stringValue(request["operation_id"]) != operation.OperationID || stringValue(request["action"]) != action || stringValue(request["session_id"]) != session || parsedGeneration != generation || !operationIdentityMatches(&operation, request) {
+			return nil, "", protocol.NewError("operation_unverified", "pending cleanup request identity does not match its journal", map[string]any{"operation_id": operation.OperationID})
+		}
+		digest := stringValue(operation.Response["_request_digest"])
+		calculated, digestErr := protocol.Digest(request)
+		if strings.TrimSpace(digest) == "" || digestErr != nil || digest != calculated {
+			return nil, "", protocol.NewError("operation_unverified", "pending cleanup request digest does not match", map[string]any{"operation_id": operation.OperationID})
+		}
+		workerValue, workerOK := operation.Response["worker"]
+		worker, workerMapOK := workerValue.(map[string]any)
+		if !workerOK || !workerMapOK {
+			return nil, "", protocol.NewError("operation_unverified", "pending cleanup worker evidence is missing", map[string]any{"operation_id": operation.OperationID})
+		}
+		if !workerStartPrepared(worker) {
+			if workerErr := verifyNativeInitWorker(operation); workerErr != nil {
+				return nil, "", protocol.NewError("operation_unverified", "pending cleanup worker evidence is not terminal or verifiable", map[string]any{"operation_id": operation.OperationID, "cause": workerErr.Error()})
+			}
+		}
+		matched = append(matched, operation)
+		requests = append(requests, request)
+	}
+	if len(matched) == 0 {
+		return protocol.Request{"protocol": protocol.Version, "action": action, "session_id": session, "generation": generation}, "", nil
+	}
+	if len(matched) != 1 {
+		return nil, "", protocol.NewError("operation_unverified", "multiple pending cleanup journals match the same lifecycle generation", map[string]any{"session_id": session, "generation": generation, "action": action, "count": len(matched)})
+	}
+	return requests[0], matched[0].OperationID, nil
 }
 
 func (s *Service) finalizePendingCleanup(ctx context.Context, session string, generation int64, action string, result map[string]any) error {
@@ -2011,11 +2124,28 @@ func (s *Service) finalizePendingCleanup(ctx context.Context, session string, ge
 			return protocol.NewError("operation_unverified", "pending cleanup request is missing", map[string]any{"operation_id": operation.OperationID})
 		}
 		request := protocol.Request(rawRequest)
+		if validationErr := protocol.ValidateRequest(request); validationErr != nil {
+			return protocol.NewError("operation_unverified", "pending cleanup request is invalid", map[string]any{"operation_id": operation.OperationID, "cause": validationErr.Error()})
+		}
+		if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
+			return protocol.NewError("operation_unverified", "pending cleanup request is incompatible", map[string]any{"operation_id": operation.OperationID, "cause": compatibilityErr.Error()})
+		}
+		requestGeneration, generationPresent := request["generation"]
+		parsedGeneration, generationValid := protocol.Integer(requestGeneration)
+		if !generationPresent || !generationValid || stringValue(request["operation_id"]) != operation.OperationID || stringValue(request["action"]) != action || stringValue(request["session_id"]) != session || parsedGeneration != generation || !operationIdentityMatches(&operation, request) {
+			return protocol.NewError("operation_unverified", "pending cleanup request identity does not match its journal", map[string]any{"operation_id": operation.OperationID})
+		}
+		digest := stringValue(operation.Response["_request_digest"])
+		calculated, digestErr := protocol.Digest(request)
+		if strings.TrimSpace(digest) == "" || digestErr != nil || digest != calculated {
+			return protocol.NewError("operation_unverified", "pending cleanup request digest does not match", map[string]any{"operation_id": operation.OperationID})
+		}
+		if workerErr := verifyNativeInitWorker(operation); workerErr != nil {
+			return protocol.NewError("operation_unverified", "pending cleanup worker evidence is not terminal or verifiable", map[string]any{"operation_id": operation.OperationID, "cause": workerErr.Error()})
+		}
 		deleteRequest = request
 		response := protocol.SuccessWithRelease(request, result, s.Release, nil)
-		if digest, ok := operation.Response["_request_digest"]; ok {
-			response["_request_digest"] = digest
-		}
+		response["_request_digest"] = digest
 		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
 			return s.sqliteError(err)
 		}
