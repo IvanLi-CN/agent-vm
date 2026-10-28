@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mockState } from "./mockData";
-import { ManagementRequestError, startImageImport, submitImageAction, submitVMAction, uploadImageImportContent } from "./api";
-import type { ActionPreview } from "./types";
+import { ManagementRequestError, previewImageAction, previewMaintenance, previewVMAction, startImageImport, submitImageAction, submitMaintenance, submitVMAction, uploadImageImportContent } from "./api";
 
 describe("mock image uploads", () => {
   let snapshot = structuredClone(mockState);
@@ -31,7 +30,7 @@ describe("mock image uploads", () => {
 
   it("returns the original operation for an identical retry and rejects a conflicting reuse", async () => {
     const operationId = "synthetic-idempotent-operation";
-    const preview = { target_version: "vm:task_example_01:revision-9", confirmation_token: "synthetic", expires_at: "2026-01-15T10:25:00Z", impact: { summary_code: "no_active_lease", affected_session_count: 0, affected_image_references: { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 }, changes: [] } };
+    const preview = await previewVMAction("task_example_01", "restart", mockState.vms[0], { alpha: 1, beta: 2 });
     const first = await submitVMAction("task_example_01", "restart", "retry-safe action", preview, "42", { alpha: 1, beta: 2 }, operationId);
     const retry = await submitVMAction("task_example_01", "restart", "retry-safe action", preview, "42", { beta: 2, alpha: 1 }, operationId);
 
@@ -57,20 +56,23 @@ describe("mock image uploads", () => {
     const beforeImageCached = image.references.cached;
     const beforeCpu = mockState.overview.capacity.logical_cpu_remaining_vcpu.value!;
     const beforeMemory = BigInt(mockState.overview.capacity.logical_memory_remaining.value_bytes!);
-    const release = await submitVMAction(vm.task_id, "release", "Align aggregate state", { ...previewFor(vm.resource_version), impact: { summary_code: "effective_lease_affected", affected_session_count: 1, affected_image_references: mockState.images[0].references, changes: [] } }, vm.generation);
+    const releasePreview = await previewVMAction(vm.task_id, "release", vm);
+    const release = await submitVMAction(vm.task_id, "release", "Align aggregate state", releasePreview, vm.generation);
 
     expect(release.status).toBe("succeeded");
     expect(mockState.overview.task_counts.active).toBe(beforeActive - 1);
     expect(mockState.overview.task_counts.cached).toBe(beforeCached + 1);
     expect(vm.state).toBe("cached");
     expect(vm.allowed_actions).toEqual(["release", "destroy"]);
-    await expect(submitVMAction(vm.task_id, "resize", "Resize a cached VM", previewFor(vm.resource_version), vm.generation, { cpu_vcpu: 8 }, "synthetic-cached-resize")).rejects.toMatchObject({ code: "action_not_allowed" });
+    const cachedResizePreview = await previewVMAction(vm.task_id, "resize", vm, { cpu_vcpu: 8 });
+    await expect(submitVMAction(vm.task_id, "resize", "Resize a cached VM", cachedResizePreview, vm.generation, { cpu_vcpu: 8 }, "synthetic-cached-resize")).rejects.toMatchObject({ code: "action_not_allowed" });
     expect(image.references.active).toBe(Math.max(0, beforeImageActive - 1));
     expect(image.references.cached).toBe(beforeImageCached + 1);
     expect(mockState.overview.capacity.logical_cpu_remaining_vcpu.value).toBe(beforeCpu + vm.resources.cpu_vcpu!);
     expect(mockState.overview.capacity.logical_memory_remaining.value_bytes).toBe((beforeMemory + BigInt(vm.resources.memory_bytes!)).toString());
 
-    const destroy = await submitVMAction(vm.task_id, "destroy", "Remove the cached demo VM", previewFor(vm.resource_version), vm.generation, {}, "synthetic-destroy-operation");
+    const destroyPreview = await previewVMAction(vm.task_id, "destroy", vm);
+    const destroy = await submitVMAction(vm.task_id, "destroy", "Remove the cached demo VM", destroyPreview, vm.generation, {}, "synthetic-destroy-operation");
     expect(destroy.status).toBe("succeeded");
     expect(vm.state).toBe("absent");
     expect(vm.allowed_actions).toEqual([]);
@@ -82,7 +84,8 @@ describe("mock image uploads", () => {
     const activeCpu = mockState.overview.capacity.logical_cpu_remaining_vcpu.value!;
     const activeMemory = BigInt(mockState.overview.capacity.logical_memory_remaining.value_bytes!);
     const activeImageRefs = activeImage.references.active;
-    await submitVMAction(activeVm.task_id, "destroy", "Remove the active demo VM", previewFor(activeVm.resource_version), activeVm.generation, {}, "synthetic-destroy-active-operation");
+    const activeDestroyPreview = await previewVMAction(activeVm.task_id, "destroy", activeVm);
+    await submitVMAction(activeVm.task_id, "destroy", "Remove the active demo VM", activeDestroyPreview, activeVm.generation, {}, "synthetic-destroy-active-operation");
     expect(activeVm.state).toBe("absent");
     expect(activeImage.references.active).toBe(Math.max(0, activeImageRefs - 1));
     expect(mockState.overview.capacity.logical_cpu_remaining_vcpu.value).toBe(activeCpu + activeVm.resources.cpu_vcpu!);
@@ -93,7 +96,8 @@ describe("mock image uploads", () => {
     const previousDefault = mockState.images.find((image) => image.is_default)!;
     const nextDefault = mockState.images.find((image) => !image.is_default)!;
     const beforeVersion = mockState.image_selection_version;
-    const operation = await submitImageAction(nextDefault.fingerprint, "default", "Select the approved image", previewFor(nextDefault.resource_version), "synthetic-default-image");
+    const defaultPreview = await previewImageAction(nextDefault.fingerprint, "default", mockState.image_selection_version);
+    const operation = await submitImageAction(nextDefault.fingerprint, "default", "Select the approved image", defaultPreview, "synthetic-default-image");
 
     expect(operation.status).toBe("succeeded");
     expect(nextDefault.is_default).toBe(true);
@@ -106,20 +110,22 @@ describe("mock image uploads", () => {
 
   it("applies image lifecycle effects and blocks retired default selection", async () => {
     const retired = mockState.images.find((image) => image.state === "retired")!;
-    await expect(submitImageAction(retired.fingerprint, "default", "Do not select a retired image", previewFor(retired.resource_version), "synthetic-retired-default")).rejects.toMatchObject({ code: "image_not_applicable" });
+    await expect(previewImageAction(retired.fingerprint, "default", retired.resource_version)).rejects.toMatchObject({ code: "image_not_applicable" });
 
     const candidate = mockState.images.find((image) => !image.is_default && image.state === "available")!;
     const beforeCatalogVersion = mockState.image_catalog_version;
-    const retire = await submitImageAction(candidate.fingerprint, "retire", "Retire the demo image", previewFor(candidate.resource_version), "synthetic-image-retire");
+    const retirePreview = await previewImageAction(candidate.fingerprint, "retire", candidate.resource_version);
+    const retire = await submitImageAction(candidate.fingerprint, "retire", "Retire the demo image", retirePreview, "synthetic-image-retire");
     expect(retire.status).toBe("succeeded");
     expect(candidate.state).toBe("retired");
     expect(mockState.image_catalog_version).not.toBe(beforeCatalogVersion);
 
-    const deleted = await submitImageAction(retired.fingerprint, "delete", "Delete the retired demo image", previewFor(retired.resource_version), "synthetic-image-delete");
+    const deletePreview = await previewImageAction(retired.fingerprint, "delete", retired.resource_version);
+    const deleted = await submitImageAction(retired.fingerprint, "delete", "Delete the retired demo image", deletePreview, "synthetic-image-delete");
     expect(deleted.status).toBe("succeeded");
     expect(mockState.images.some((image) => image.fingerprint === retired.fingerprint)).toBe(false);
     expect(deleted.result?.image_fingerprint).toBe(retired.fingerprint);
-    const retriedDelete = await submitImageAction(retired.fingerprint, "delete", "Delete the retired demo image", previewFor(retired.resource_version), "synthetic-image-delete");
+    const retriedDelete = await submitImageAction(retired.fingerprint, "delete", "Delete the retired demo image", deletePreview, "synthetic-image-delete");
     expect(retriedDelete).toBe(deleted);
   });
 
@@ -129,15 +135,36 @@ describe("mock image uploads", () => {
     const beforeMemory = BigInt(mockState.overview.capacity.logical_memory_remaining.value_bytes!);
     const beforeContainerMemory = BigInt(mockState.overview.capacity.ct_memory_available.value_bytes!);
     const nextMemory = (BigInt(vm.resources.memory_bytes!) + 1_073_741_824n).toString();
-    const operation = await submitVMAction(vm.task_id, "resize", "Increase demo resources", previewFor(vm.resource_version), vm.generation, { cpu_vcpu: vm.resources.cpu_vcpu! + 2, memory_bytes: nextMemory, disk_bytes: vm.resources.disk_bytes }, "synthetic-resize-operation");
+    const resizeParameters = { cpu_vcpu: vm.resources.cpu_vcpu! + 2, memory_bytes: nextMemory, disk_bytes: vm.resources.disk_bytes };
+    const resizePreview = await previewVMAction(vm.task_id, "resize", vm, resizeParameters);
+    const operation = await submitVMAction(vm.task_id, "resize", "Increase demo resources", resizePreview, vm.generation, resizeParameters, "synthetic-resize-operation");
 
     expect(operation.status).toBe("succeeded");
     expect(mockState.overview.capacity.logical_cpu_remaining_vcpu.value).toBe(beforeCpu - 2);
     expect(mockState.overview.capacity.logical_memory_remaining.value_bytes).toBe((beforeMemory - 1_073_741_824n).toString());
     expect(mockState.overview.capacity.ct_memory_available.value_bytes).toBe((beforeContainerMemory - 1_073_741_824n).toString());
   });
-});
+  it("rejects stale VM previews and mismatched confirmation tokens", async () => {
+    const vm = mockState.vms[0];
+    const preview = await previewVMAction(vm.task_id, "restart", vm);
+    await expect(submitVMAction(vm.task_id, "restart", "Reject a forged confirmation", { ...preview, confirmation_token: "synthetic-confirmation-forged" }, vm.generation, {}, "synthetic-forged-preview")).rejects.toMatchObject({ code: "stale_target" });
 
-function previewFor(targetVersion: string): ActionPreview {
-  return { target_version: targetVersion, confirmation_token: "synthetic", expires_at: "2026-01-15T10:25:00Z", impact: { summary_code: "no_active_lease", affected_session_count: 0, affected_image_references: { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 }, changes: [] } };
-}
+    const freshPreview = await previewVMAction(vm.task_id, "restart", vm);
+    await submitVMAction(vm.task_id, "restart", "Advance the VM resource version", freshPreview, vm.generation, {}, "synthetic-advance-vm");
+    await expect(submitVMAction(vm.task_id, "restart", "Reject an old VM preview", freshPreview, vm.generation, {}, "synthetic-stale-vm")).rejects.toMatchObject({ code: "stale_target" });
+
+    const generationPreview = await previewVMAction(vm.task_id, "restart", vm);
+    await expect(submitVMAction(vm.task_id, "restart", "Reject a mismatched generation", generationPreview, "wrong-generation", {}, "synthetic-wrong-generation")).rejects.toMatchObject({ code: "stale_target" });
+  });
+
+  it("rejects stale image and maintenance previews", async () => {
+    const candidate = mockState.images.find((image) => !image.is_default && image.state === "available")!;
+    const imagePreview = await previewImageAction(candidate.fingerprint, "retire", candidate.resource_version);
+    await submitImageAction(candidate.fingerprint, "retire", "Advance the image resource version", imagePreview, "synthetic-advance-image");
+    await expect(submitImageAction(candidate.fingerprint, "retire", "Reject an old image preview", imagePreview, "synthetic-stale-image")).rejects.toMatchObject({ code: "stale_target" });
+
+    const maintenancePreview = await previewMaintenance("reconcile", mockState.system.resource_version);
+    await submitMaintenance("reconcile", "Advance the maintenance resource version", maintenancePreview, "synthetic-advance-maintenance");
+    await expect(submitMaintenance("reconcile", "Reject an old maintenance preview", maintenancePreview, "synthetic-stale-maintenance")).rejects.toMatchObject({ code: "stale_target" });
+  });
+});
