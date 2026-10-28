@@ -867,9 +867,13 @@ func TestDestroyFinalizesWhenIncusConfirmsTheInstanceIsMissing(t *testing.T) {
 	}
 	defer store.Close()
 	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	vmIP := "10.250.19.28"
+	sshHostPort := int64(22001)
+	previousGeneration := int64(0)
 	if err := store.InsertTask(context.Background(), state.Task{
 		TaskID: "destroy-task", SessionID: "destroy-session", Generation: 1, State: stateActive,
-		InstanceName: "agent-destroy", LeaseExpiresAt: stringPointer(now.Add(time.Hour).Format(time.RFC3339Nano)),
+		InstanceName: "agent-destroy", VMIP: &vmIP, SSHHostPort: &sshHostPort, PreviousGeneration: &previousGeneration,
+		LeaseExpiresAt: stringPointer(now.Add(time.Hour).Format(time.RFC3339Nano)),
 		CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
 	}); err != nil {
 		t.Fatal(err)

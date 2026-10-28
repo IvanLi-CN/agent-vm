@@ -1077,6 +1077,9 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 	if destroy {
 		updates["inactive_since"] = nil
 		updates["cleanup_after"] = nil
+		updates["vm_ip"] = nil
+		updates["ssh_host_port"] = nil
+		updates["previous_generation"] = nil
 	} else {
 		inactive := nowString(s.Clock())
 		updates["inactive_since"] = inactive
