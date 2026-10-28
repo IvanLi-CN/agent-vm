@@ -1549,6 +1549,55 @@ func TestReconcileFinalizesPendingDestroyAfterCleanup(t *testing.T) {
 	}
 }
 
+func TestReconcileFinalizesPendingDestroyAfterAbsentCommit(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "pending-absent-destroy.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	session := "pending-absent-destroy-session"
+	generation := int64(1)
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "pending-absent-destroy-task", SessionID: session, Generation: generation, State: stateAbsent,
+		InstanceName: "agent-pending-absent-destroy", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":0,"memory_mib":0,"disk_gib":0}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := map[string]any{
+		"protocol": protocol.Version, "action": "destroy", "session_id": session,
+		"generation": generation, "operation_id": "destroy-absent-pending",
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "destroy-absent-pending", "destroy", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request": request, "_request_digest": digest,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Stderr: []byte("Error: Instance not found")}, Cause: errors.New("incus instance missing")}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
+	if _, err := service.reconcile(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if task, err := store.GetTask(ctx, map[string]any{"session_id": session}); err != nil {
+		t.Fatal(err)
+	} else if task != nil {
+		t.Fatalf("reconciled task = %#v", task)
+	}
+	operation, err := store.GetOperation(ctx, "destroy-absent-pending")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation.Response["outcome"] != "success" {
+		t.Fatalf("reconciled operation = %#v", operation.Response)
+	}
+}
+
 func TestStartupPressureRefusesBeforeDurableAcquire(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

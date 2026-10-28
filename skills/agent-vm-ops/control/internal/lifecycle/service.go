@@ -120,22 +120,37 @@ func (s *Service) wakeScheduler() {
 }
 
 func (s *Service) lockAction(action string, request protocol.Request) func() {
+	var unlocks []func()
+	if releaseSensitiveAction(action, request) || action == "drain-enter" || action == "drain-exit" {
+		// Drain ownership is a process-wide release boundary. It must not be
+		// serialized only by the caller's session lock: a release
+		// transaction and a native management action must observe one durable
+		// owner in order.
+		unlocks = append(unlocks, s.lockNamedAction("drain"))
+	}
 	if action == "admin-reconcile" || action == "timer-reconcile" || action == "admin-gc" || action == "timer-age-gc" {
 		s.maintenance.Lock()
-		return s.maintenance.Unlock
+		unlocks = append(unlocks, s.maintenance.Unlock)
 	}
 	key := ""
-	if action == "drain-enter" || action == "drain-exit" {
-		// Drain ownership is a process-wide release boundary. It must not be
-		// serialized only by the caller's session lock: a release transaction
-		// and the Web adapter use different session identities and must still
-		// observe and update one durable owner in order.
-		key = "drain"
-	} else if session := stringValue(request["session_id"]); session != "" {
-		key = "session:" + session
-	} else if taskID := stringValue(request["task_id"]); taskID != "" {
-		key = "task:" + taskID
+	if action != "drain-enter" && action != "drain-exit" && !releaseSensitiveAction(action, request) {
+		if session := stringValue(request["session_id"]); session != "" {
+			key = "session:" + session
+		} else if taskID := stringValue(request["task_id"]); taskID != "" {
+			key = "task:" + taskID
+		}
 	}
+	if key != "" {
+		unlocks = append(unlocks, s.lockNamedAction(key))
+	}
+	return func() {
+		for index := len(unlocks) - 1; index >= 0; index-- {
+			unlocks[index]()
+		}
+	}
+}
+
+func (s *Service) lockNamedAction(key string) func() {
 	if key == "" {
 		return func() {}
 	}
@@ -523,9 +538,9 @@ func releaseSensitiveAction(action string, request protocol.Request) bool {
 	switch action {
 	case "release", "destroy", "restart", "resize", "port-add", "port-remove":
 		return true
-	case "admin-reconcile":
+	case "admin-reconcile", "timer-reconcile":
 		return requestBool(request, "apply")
-	case "admin-gc":
+	case "admin-gc", "timer-age-gc":
 		return true
 	default:
 		return false
@@ -560,15 +575,6 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		return nil, protocol.NewError("invalid_request", "admin-metrics is sessionless and read-only", nil)
 	}
 	write := writeActions[action] && !(action == "admin-reconcile" && requestBool(request, "apply") == false && request["operation_id"] == nil)
-	if write && releaseSensitiveAction(action, request) && !isInternalCleanup(ctx) {
-		releaseDrain, drainErr := s.releaseDrainOwned(ctx)
-		if drainErr != nil {
-			return nil, s.sqliteError(drainErr)
-		}
-		if releaseDrain {
-			return nil, protocol.NewError("draining", "native session actions are refused while a release activation fence is owned", nil)
-		}
-	}
 	if write && request["operation_id"] == nil {
 		return nil, protocol.NewError("invalid_request", "write request requires operation_id", nil)
 	}
@@ -577,6 +583,15 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	}
 	unlock := s.lockAction(action, request)
 	defer unlock()
+	if releaseSensitiveAction(action, request) && !isInternalCleanup(ctx) {
+		releaseDrain, drainErr := s.releaseDrainOwned(ctx)
+		if drainErr != nil {
+			return nil, s.sqliteError(drainErr)
+		}
+		if releaseDrain {
+			return nil, protocol.NewError("draining", "native session actions are refused while a release activation fence is owned", nil)
+		}
+	}
 	if write {
 		operationID := stringValue(request["operation_id"])
 		digest, err := protocol.Digest(request)
@@ -1951,6 +1966,9 @@ func (s *Service) reconcile(ctx context.Context, apply bool, _ ...string) (map[s
 		if err := s.reconcilePendingWorkers(ctx, pending); err != nil {
 			return nil, err
 		}
+		if err := s.reconcilePendingAbsentDestroy(ctx, pending); err != nil {
+			return nil, err
+		}
 		if err := s.recoverPending(ctx, pending); err != nil {
 			return nil, err
 		}
@@ -2015,6 +2033,73 @@ func (s *Service) reconcile(ctx context.Context, apply bool, _ ...string) (map[s
 	}
 	result := map[string]any{"dry_run": !apply, "actions": actions}
 	return result, firstErr
+}
+
+// reconcilePendingAbsentDestroy closes the crash window after native destroy
+// and durable task transition but before the terminal operation journal write.
+// The task row, request identity, digest, worker ownership and native absence
+// must all be verified before the pending destroy is finalized.
+func (s *Service) reconcilePendingAbsentDestroy(ctx context.Context, pending []state.Operation) error {
+	for _, operation := range pending {
+		if operation.Action != "destroy" || operation.SessionID == nil || operation.Generation == nil {
+			continue
+		}
+		task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
+		if err != nil {
+			return s.sqliteError(err)
+		}
+		if task == nil || task.State != stateAbsent {
+			continue
+		}
+		rawRequest, ok := operation.Response["_request"].(map[string]any)
+		if !ok {
+			return protocol.NewError("startup_reconcile_required", "pending absent destroy request is missing", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+		}
+		request := protocol.Request(rawRequest)
+		if validationErr := protocol.ValidateRequest(request); validationErr != nil {
+			return protocol.NewError("startup_reconcile_required", "pending absent destroy request is invalid", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": validationErr.Error()})
+		}
+		if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
+			return protocol.NewError("startup_reconcile_required", "pending absent destroy request is incompatible", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": compatibilityErr.Error()})
+		}
+		if !operationIdentityMatches(&operation, request) || stringValue(request["operation_id"]) != operation.OperationID || intValue(request["generation"]) != task.Generation {
+			return protocol.NewError("startup_reconcile_required", "pending absent destroy identity does not match its journal or task", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+		}
+		digest := stringValue(operation.Response["_request_digest"])
+		calculated, digestErr := protocol.Digest(request)
+		if digest == "" || digestErr != nil || digest != calculated {
+			return protocol.NewError("startup_reconcile_required", "pending absent destroy request digest does not match", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+		}
+		if unresolved, workerErr := s.pendingWorkerUnresolved(ctx, operation.SessionID, operation.OperationID, ""); workerErr != nil {
+			return protocol.NewError("startup_reconcile_required", "pending absent destroy worker ownership could not be checked", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": workerErr.Error()})
+		} else if unresolved {
+			return protocol.NewError("startup_reconcile_required", "pending absent destroy worker ownership remains unresolved", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+		}
+		if s.Guest != nil {
+			if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr == nil {
+				return protocol.NewError("startup_reconcile_required", "pending absent destroy still has a native instance", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": true})
+			} else {
+				control := protocol.AsError(ownershipErr)
+				detail, _ := control.Detail.(map[string]any)
+				if detail["native_missing"] != true {
+					return protocol.NewError("startup_reconcile_required", "pending absent destroy native absence could not be verified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": ownershipErr.Error()})
+				}
+			}
+		}
+		response, summaryErr := s.summary(ctx, task)
+		if summaryErr != nil {
+			return summaryErr
+		}
+		terminal := protocol.SuccessWithRelease(request, response, s.Release, nil)
+		terminal["_request_digest"] = digest
+		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, terminal); err != nil {
+			return s.sqliteError(err)
+		}
+		if err := s.deleteDestroyedTask(ctx, request, operation.Generation); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) pendingCleanupRequest(ctx context.Context, session string, generation int64, action string) (protocol.Request, string, error) {
