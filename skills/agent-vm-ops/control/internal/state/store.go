@@ -483,6 +483,19 @@ func (s *Store) HasGeneration(ctx context.Context, sessionID string) (bool, erro
 	return exists, err
 }
 
+// LastGeneration returns the durable generation retained after task deletion.
+func (s *Store) LastGeneration(ctx context.Context, sessionID string) (int64, bool, error) {
+	raw, exists, err := s.Meta(ctx, generationMetaKey(sessionID))
+	if err != nil || !exists {
+		return 0, exists, err
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value <= 0 {
+		return 0, true, errors.New("invalid generation tombstone")
+	}
+	return value, true, nil
+}
+
 // NextGeneration returns a generation strictly greater than the last durable
 // generation for a session, including generations whose task row was deleted.
 // The meta row is updated in the same writer transaction that allocates it.

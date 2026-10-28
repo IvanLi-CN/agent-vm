@@ -1723,7 +1723,7 @@ func TestReconcileFinalizesPendingDestroyAfterAbsentCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.RecordOperation(ctx, "destroy-absent-pending", "destroy", stringPointer(session), &generation, map[string]any{
-		"outcome": "pending", "_request": request, "_request_digest": digest,
+		"outcome": "pending", "_request": request, "_request_digest": digest, "worker": map[string]any{"state": "exited", "start_attempted": false},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1755,6 +1755,9 @@ func TestReconcileFinalizesPendingDestroyWithoutTaskRow(t *testing.T) {
 	ctx := context.Background()
 	session := "pending-no-task-destroy-session"
 	generation := int64(1)
+	if allocated, err := store.NextGeneration(ctx, session); err != nil || allocated != generation {
+		t.Fatalf("allocated generation = %d, error = %v", allocated, err)
+	}
 	request := map[string]any{
 		"protocol": protocol.Version, "action": "destroy", "session_id": session,
 		"generation": generation, "operation_id": "destroy-no-task-pending",
@@ -1764,7 +1767,7 @@ func TestReconcileFinalizesPendingDestroyWithoutTaskRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.RecordOperation(ctx, "destroy-no-task-pending", "destroy", stringPointer(session), &generation, map[string]any{
-		"outcome": "pending", "_request": request, "_request_digest": digest,
+		"outcome": "pending", "_request": request, "_request_digest": digest, "worker": map[string]any{"state": "exited", "start_attempted": false},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1779,6 +1782,93 @@ func TestReconcileFinalizesPendingDestroyWithoutTaskRow(t *testing.T) {
 	}
 	if operation.Response["outcome"] != "success" {
 		t.Fatalf("reconciled operation = %#v", operation.Response)
+	}
+}
+
+func TestPendingAbsentDestroyRemainsPendingWithoutSafeEvidence(t *testing.T) {
+	for _, mode := range []string{"no-native", "no-worker", "starting", "finished-no-identity", "partial-identity", "other-worker", "active", "session-locked", "generation", "missing-tombstone", "stale-tombstone"} {
+		t.Run(mode, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			session, generation, operationID := "absent-destroy-"+mode, int64(1), "destroy-"+mode
+			now := nowString(time.Now())
+			task := state.Task{TaskID: "task-" + mode, SessionID: session, Generation: generation, State: stateAbsent, InstanceName: "instance-" + mode, CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{"cpu":0,"memory_mib":0,"disk_gib":0}`, ResourceReservationJSON: `{}`}
+			if mode == "generation" {
+				task.Generation++
+			}
+			if mode == "stale-tombstone" {
+				for range 2 {
+					if _, err := store.NextGeneration(ctx, session); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			if mode != "missing-tombstone" && mode != "stale-tombstone" {
+				if err := store.InsertTask(ctx, task); err != nil {
+					t.Fatal(err)
+				}
+			}
+			request := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": session, "generation": generation, "operation_id": operationID}
+			digest, err := protocol.Digest(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": map[string]any{"state": "exited", "start_attempted": false}}
+			if mode == "no-worker" {
+				delete(response, "worker")
+			}
+			if mode == "starting" {
+				response["worker"] = map[string]any{"state": "starting"}
+			}
+			if mode == "finished-no-identity" {
+				response["worker"] = map[string]any{"state": "finished"}
+			}
+			if mode == "partial-identity" {
+				response["worker"] = map[string]any{"state": "exited", "start_attempted": false, "pid": "invalid"}
+			}
+			if err := store.RecordOperation(ctx, operationID, "destroy", &session, &generation, response); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "other-worker" {
+				if err := store.RecordOperation(ctx, "other-acquire", "acquire", &session, &generation, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "finished"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var guest native.Guest = &startupGuest{configErr: missingInstanceError()}
+			if mode == "no-native" {
+				guest = nil
+			}
+			service := New(store, config.Defaults(), Options{Guest: guest})
+			if mode == "active" {
+				done := service.markOperationActive(operationID)
+				defer done()
+			}
+			if mode == "session-locked" {
+				unlock := service.lockAction("session", protocol.Request{"session_id": session})
+				defer unlock()
+			}
+			pending, err := store.PendingOperations(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = service.reconcilePendingAbsentDestroy(ctx, pending)
+			if mode != "session-locked" && err == nil {
+				t.Fatal("unsafe destroy was accepted")
+			}
+			operation, err := store.GetOperation(ctx, operationID)
+			if err != nil || operation == nil || operation.Response["outcome"] != "pending" {
+				t.Fatalf("operation = %#v, err = %v", operation, err)
+			}
+			current, err := store.GetTask(ctx, map[string]any{"session_id": session})
+			noTask := mode == "missing-tombstone" || mode == "stale-tombstone"
+			if err != nil || (noTask && current != nil) || (!noTask && (current == nil || current.State != stateAbsent || current.Generation != task.Generation)) {
+				t.Fatalf("task = %#v, err = %v", current, err)
+			}
+		})
 	}
 }
 

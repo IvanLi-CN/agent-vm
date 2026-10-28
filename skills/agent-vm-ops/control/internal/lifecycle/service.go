@@ -2524,72 +2524,155 @@ func (s *Service) reconcilePendingAbsentDestroy(ctx context.Context, pending []s
 		if operation.Action != "destroy" || operation.SessionID == nil || operation.Generation == nil {
 			continue
 		}
-		task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
-		if err != nil {
-			return s.sqliteError(err)
-		}
-		rowExists := task != nil
-		if task != nil && task.State != stateAbsent {
+		unlock, acquired := s.trySessionLock(*operation.SessionID)
+		if !acquired {
 			continue
 		}
-		rawRequest, ok := operation.Response["_request"].(map[string]any)
-		if !ok {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy request is missing", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
-		}
-		request := protocol.Request(rawRequest)
-		if validationErr := protocol.ValidateRequest(request); validationErr != nil {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy request is invalid", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": validationErr.Error()})
-		}
-		if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy request is incompatible", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": compatibilityErr.Error()})
-		}
-		if !operationIdentityMatches(&operation, request) || stringValue(request["operation_id"]) != operation.OperationID || intValue(request["generation"]) != *operation.Generation {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy identity does not match its journal or task", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
-		}
-		digest := stringValue(operation.Response["_request_digest"])
-		calculated, digestErr := protocol.Digest(request)
-		if digest == "" || digestErr != nil || digest != calculated {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy request digest does not match", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
-		}
-		if unresolved, workerErr := s.pendingWorkerUnresolved(ctx, operation.SessionID, operation.OperationID, ""); workerErr != nil {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy worker ownership could not be checked", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": workerErr.Error()})
-		} else if unresolved {
-			return protocol.NewError("startup_reconcile_required", "pending absent destroy worker ownership remains unresolved", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
-		}
-		if !rowExists {
-			task = &state.Task{TaskID: taskID(*operation.SessionID), SessionID: *operation.SessionID, Generation: *operation.Generation, State: stateAbsent, InstanceName: "agent-vm-" + taskID(*operation.SessionID), ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}"}
-		}
-		if s.Guest != nil {
-			if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr == nil {
-				return protocol.NewError("startup_reconcile_required", "pending absent destroy still has a native instance", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": true})
-			} else {
-				control := protocol.AsError(ownershipErr)
-				detail, _ := control.Detail.(map[string]any)
-				if detail["native_missing"] != true {
-					return protocol.NewError("startup_reconcile_required", "pending absent destroy native absence could not be verified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": ownershipErr.Error()})
-				}
-			}
-		}
-		response := map[string]any{"state": stateAbsent, "session_id": *operation.SessionID, "effective_lease": false}
-		if rowExists {
-			var summaryErr error
-			response, summaryErr = s.summary(ctx, task)
-			if summaryErr != nil {
-				return summaryErr
-			}
-		}
-		terminal := protocol.SuccessWithRelease(request, response, s.Release, nil)
-		terminal["_request_digest"] = digest
-		if rowExists {
-			if err := s.deleteDestroyedTask(ctx, request, operation.Generation); err != nil {
-				return err
-			}
-		}
-		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, terminal); err != nil {
-			return s.sqliteError(err)
+		err := s.reconcilePendingAbsentDestroyOne(ctx, operation)
+		unlock()
+		if err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func (s *Service) reconcilePendingAbsentDestroyOne(ctx context.Context, operation state.Operation) error {
+	current, err := s.Store.GetOperation(ctx, operation.OperationID)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if current == nil || stringValue(current.Response["outcome"]) != "pending" {
+		return nil
+	}
+	if current.Action != "destroy" || current.SessionID == nil || current.Generation == nil || *current.SessionID != *operation.SessionID || *current.Generation != *operation.Generation {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy identity changed during reconciliation", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	operation = *current
+	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	rowExists := task != nil
+	if task != nil && task.State != stateAbsent {
+		return nil
+	}
+	if task != nil && task.Generation != *operation.Generation {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy generation differs from task", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	if task == nil {
+		generation, exists, generationErr := s.Store.LastGeneration(ctx, *operation.SessionID)
+		if generationErr != nil {
+			return s.sqliteError(generationErr)
+		}
+		if !exists || generation != *operation.Generation {
+			return protocol.NewError("startup_reconcile_required", "pending absent destroy generation is unverified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+		}
+	}
+	if s.operationActive(operation.OperationID) {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy is still active", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	if !ok || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy worker is unverified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	if verified, verifyErr := terminalWorkerVerified(worker); verifyErr != nil || !verified {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy worker identity is unverified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	rawRequest, ok := operation.Response["_request"].(map[string]any)
+	if !ok {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy request is missing", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	request := protocol.Request(rawRequest)
+	if validationErr := protocol.ValidateRequest(request); validationErr != nil {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy request is invalid", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": validationErr.Error()})
+	}
+	if _, compatibilityErr := protocol.ValidateCompatibility(request, s.Release); compatibilityErr != nil {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy request is incompatible", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": compatibilityErr.Error()})
+	}
+	if !operationIdentityMatches(&operation, request) || stringValue(request["operation_id"]) != operation.OperationID || intValue(request["generation"]) != *operation.Generation {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy identity does not match its journal or task", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	digest := stringValue(operation.Response["_request_digest"])
+	calculated, digestErr := protocol.Digest(request)
+	if digest == "" || digestErr != nil || digest != calculated {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy request digest does not match", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	if unresolved, workerErr := s.pendingWorkerUnresolved(ctx, operation.SessionID, "", ""); workerErr != nil {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy worker ownership could not be checked", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "cause": workerErr.Error()})
+	} else if unresolved {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy worker ownership remains unresolved", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
+	}
+	otherPending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	for _, other := range otherPending {
+		if other.OperationID == operation.OperationID || other.SessionID == nil || *other.SessionID != *operation.SessionID || !operationHasNativeEffect(other.Action) {
+			continue
+		}
+		otherWorker, ok := other.Response["worker"].(map[string]any)
+		if !ok || s.operationActive(other.OperationID) || workerOwnershipUnresolved(otherWorker) || (stringValue(otherWorker["state"]) != "finished" && stringValue(otherWorker["state"]) != "exited") {
+			return protocol.NewError("startup_reconcile_required", "same-session worker is unverified", map[string]any{"operation_id": other.OperationID, "admission_ready": false})
+		}
+		if verified, verifyErr := terminalWorkerVerified(otherWorker); verifyErr != nil || !verified {
+			return protocol.NewError("startup_reconcile_required", "same-session worker identity is unverified", map[string]any{"operation_id": other.OperationID, "admission_ready": false})
+		}
+	}
+	if !rowExists {
+		task = &state.Task{TaskID: taskID(*operation.SessionID), SessionID: *operation.SessionID, Generation: *operation.Generation, State: stateAbsent, InstanceName: "agent-vm-" + taskID(*operation.SessionID), ResourcesJSON: mustJSON(zeroResources()), ResourceReservationJSON: "{}"}
+	}
+	if s.Guest == nil {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy requires native verification", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false})
+	}
+	if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr == nil {
+		return protocol.NewError("startup_reconcile_required", "pending absent destroy still has a native instance", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": true})
+	} else {
+		control := protocol.AsError(ownershipErr)
+		detail, _ := control.Detail.(map[string]any)
+		if detail["native_missing"] != true {
+			return protocol.NewError("startup_reconcile_required", "pending absent destroy native absence could not be verified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": ownershipErr.Error()})
+		}
+	}
+	response := map[string]any{"state": stateAbsent, "session_id": *operation.SessionID, "effective_lease": false}
+	if rowExists {
+		var summaryErr error
+		response, summaryErr = s.summary(ctx, task)
+		if summaryErr != nil {
+			return summaryErr
+		}
+	}
+	terminal := protocol.SuccessWithRelease(request, response, s.Release, nil)
+	terminal["_request_digest"] = digest
+	if rowExists {
+		if err := s.deleteDestroyedTask(ctx, request, operation.Generation); err != nil {
+			return err
+		}
+	}
+	if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, terminal); err != nil {
+		return s.sqliteError(err)
+	}
+	return nil
+}
+
+// terminalWorkerVerified accepts a durable pre-spawn result or a process
+// identity whose root and process group are both confirmed absent.
+func terminalWorkerVerified(worker map[string]any) (bool, error) {
+	pid, pidOK := protocol.Integer(worker["pid"])
+	group, groupOK := protocol.Integer(worker["process_group"])
+	start, startOK := worker["start_time"].(string)
+	_, attempted := worker["start_attempted"].(bool)
+	_, hasPID := worker["pid"]
+	_, hasGroup := worker["process_group"]
+	_, hasStart := worker["start_time"]
+	if !hasPID && !hasGroup && !hasStart && stringValue(worker["state"]) == "exited" && attempted {
+		return true, nil
+	}
+	if !pidOK || !groupOK || !startOK || pid <= 0 || group <= 0 || start == "" {
+		return false, nil
+	}
+	alive, err := native.WorkerAlive(native.WorkerIdentity{PID: int(pid), ProcessGroup: int(group), StartTime: start})
+	return !alive && err == nil, err
 }
 
 func (s *Service) pendingCleanupRequest(ctx context.Context, session string, generation int64, action string) (protocol.Request, string, error) {
