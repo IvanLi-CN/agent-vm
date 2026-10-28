@@ -2142,6 +2142,9 @@ func safeOperationError(value map[string]any, operationID, fallbackPhase string)
 	if fingerprint, ok := value["imported_fingerprint"].(string); ok && managementFingerprintPattern.MatchString(fingerprint) {
 		safeFields["imported_fingerprint"] = fingerprint
 	}
+	if fingerprint, ok := value["expected_fingerprint"].(string); ok && managementFingerprintPattern.MatchString(fingerprint) {
+		safeFields["expected_fingerprint"] = fingerprint
+	}
 	if cleanup, ok := value["cleanup"].(string); ok && containsString([]string{"verified", "unverified", "blocked_catalog_unverified", "backend_unavailable"}, cleanup) {
 		safeFields["cleanup"] = cleanup
 	}

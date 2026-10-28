@@ -743,6 +743,9 @@ func TestRecoverPendingOperationsDoesNotReplayTrustedImports(t *testing.T) {
 	if recovered == nil || recovered.Status != "outcome_unknown" || backend.imports != 0 {
 		t.Fatalf("recovered=%#v backend imports=%d", recovered, backend.imports)
 	}
+	if recovered.Error["expected_fingerprint"] != request.Source.ExpectedFingerprint || recovered.Error["cleanup"] != "unverified" {
+		t.Fatalf("recovery evidence = %#v", recovered.Error)
+	}
 }
 
 func TestFinishOperationPersistsAfterExecutionContextExpires(t *testing.T) {

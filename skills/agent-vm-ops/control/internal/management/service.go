@@ -750,7 +750,14 @@ func (s *Service) RecoverOperation(ctx context.Context, operationID string) (*st
 	if operation.Status != "running" {
 		return operation, nil
 	}
-	return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
+	failure := map[string]any{"code": "internal_error", "retryable": true}
+	if operation.Action == "image_import" {
+		if request, requestErr := importRequestFromOperation(operation); requestErr == nil && request.Source.Kind == "trusted_remote" && fingerprintPattern.MatchString(request.Source.ExpectedFingerprint) {
+			failure["expected_fingerprint"] = request.Source.ExpectedFingerprint
+			failure["cleanup"] = "unverified"
+		}
+	}
+	return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, failure)
 }
 
 // RecoverPendingOperations closes only operations that were already running

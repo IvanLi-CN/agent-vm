@@ -74,10 +74,10 @@ func TestSafeOperationErrorPreservesImportRecoveryEvidence(t *testing.T) {
 	fingerprint := strings.Repeat("b", 64)
 	value := safeOperationError(map[string]any{
 		"code": "internal_error", "phase": "reconciliation", "retryable": true,
-		"imported_fingerprint": fingerprint, "cleanup": "unverified",
+		"imported_fingerprint": fingerprint, "expected_fingerprint": fingerprint, "cleanup": "unverified",
 	}, "operation-1", "reconciliation")
 	fields, ok := value["safe_fields"].(map[string]any)
-	if !ok || fields["imported_fingerprint"] != fingerprint || fields["cleanup"] != "unverified" {
+	if !ok || fields["imported_fingerprint"] != fingerprint || fields["expected_fingerprint"] != fingerprint || fields["cleanup"] != "unverified" {
 		t.Fatalf("recovery evidence = %#v", value)
 	}
 	if strings.Contains(jsonString(value), "catalog_error") {

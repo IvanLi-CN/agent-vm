@@ -69,6 +69,17 @@ type Service struct {
 	wake        func()
 }
 
+type internalCleanupContextKey struct{}
+
+func withInternalCleanup(ctx context.Context) context.Context {
+	return context.WithValue(ctx, internalCleanupContextKey{}, true)
+}
+
+func isInternalCleanup(ctx context.Context) bool {
+	value, _ := ctx.Value(internalCleanupContextKey{}).(bool)
+	return value
+}
+
 type Options struct {
 	Guest     native.Guest
 	Clock     func() time.Time
@@ -524,6 +535,19 @@ func operationHasNativeEffect(action string) bool {
 	}
 }
 
+func releaseSensitiveAction(action string, request protocol.Request) bool {
+	switch action {
+	case "release", "destroy", "restart", "resize", "port-add", "port-remove":
+		return true
+	case "admin-reconcile":
+		return requestBool(request, "apply")
+	case "admin-gc":
+		return true
+	default:
+		return false
+	}
+}
+
 func recoveryAttempts(response map[string]any) int64 {
 	value, ok := response["_recovery_attempts"]
 	if !ok {
@@ -552,6 +576,15 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		return nil, protocol.NewError("invalid_request", "admin-metrics is sessionless and read-only", nil)
 	}
 	write := writeActions[action] && !(action == "admin-reconcile" && requestBool(request, "apply") == false && request["operation_id"] == nil)
+	if write && releaseSensitiveAction(action, request) && !isInternalCleanup(ctx) {
+		releaseDrain, drainErr := s.releaseDrainOwned(ctx)
+		if drainErr != nil {
+			return nil, s.sqliteError(drainErr)
+		}
+		if releaseDrain {
+			return nil, protocol.NewError("draining", "native session actions are refused while a release activation fence is owned", nil)
+		}
+	}
 	if write && request["operation_id"] == nil {
 		return nil, protocol.NewError("invalid_request", "write request requires operation_id", nil)
 	}
@@ -1206,10 +1239,12 @@ func (s *Service) release(ctx context.Context, request protocol.Request, destroy
 }
 
 func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request, destroy bool) (map[string]any, error) {
-	if releaseDrain, err := s.releaseDrainOwned(ctx); err != nil {
-		return nil, s.sqliteError(err)
-	} else if releaseDrain {
-		return nil, protocol.NewError("draining", "release and destroy are refused while a release activation fence is owned", nil)
+	if !isInternalCleanup(ctx) {
+		if releaseDrain, err := s.releaseDrainOwned(ctx); err != nil {
+			return nil, s.sqliteError(err)
+		} else if releaseDrain {
+			return nil, protocol.NewError("draining", "release and destroy are refused while a release activation fence is owned", nil)
+		}
 	}
 	task, err := s.task(ctx, request)
 	if err != nil {
@@ -2132,7 +2167,7 @@ func (s *Service) reconcile(ctx context.Context, apply bool, excludedOperationID
 			if cleanupOperationID != "" {
 				cleanupCtx = native.WithWorkerRecorder(cleanupCtx, cleanupOperationID, s)
 			}
-			if result, releaseErr := s.release(cleanupCtx, cleanupRequest, false); releaseErr != nil {
+			if result, releaseErr := s.release(withInternalCleanup(cleanupCtx), cleanupRequest, false); releaseErr != nil {
 				if firstErr == nil {
 					firstErr = releaseErr
 				}
@@ -2152,7 +2187,7 @@ func (s *Service) reconcile(ctx context.Context, apply bool, excludedOperationID
 			if cleanupOperationID != "" {
 				cleanupCtx = native.WithWorkerRecorder(cleanupCtx, cleanupOperationID, s)
 			}
-			if result, releaseErr := s.release(cleanupCtx, cleanupRequest, true); releaseErr != nil {
+			if result, releaseErr := s.release(withInternalCleanup(cleanupCtx), cleanupRequest, true); releaseErr != nil {
 				if firstErr == nil {
 					firstErr = releaseErr
 				}
@@ -2299,7 +2334,7 @@ func (s *Service) gc(ctx context.Context, apply bool) (map[string]any, error) {
 				}
 			} else if updated {
 				cleanupRequest := protocol.Request{"session_id": task.SessionID, "generation": task.Generation}
-				if _, releaseErr := s.release(ctx, cleanupRequest, true); releaseErr != nil {
+				if _, releaseErr := s.release(withInternalCleanup(ctx), cleanupRequest, true); releaseErr != nil {
 					if firstErr == nil {
 						firstErr = releaseErr
 					}
@@ -2333,7 +2368,7 @@ func (s *Service) expire(ctx context.Context, request protocol.Request) (map[str
 	if !marked {
 		return map[string]any{"expired": false}, nil
 	}
-	return s.release(ctx, protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false)
+	return s.release(withInternalCleanup(ctx), protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false)
 }
 
 func (s *Service) doctor(ctx context.Context) (map[string]any, error) {

@@ -1419,6 +1419,8 @@ components:
               $ref: "#/components/schemas/ImageReferenceCounts"
             imported_fingerprint:
               $ref: "#/components/schemas/Fingerprint"
+            expected_fingerprint:
+              $ref: "#/components/schemas/Fingerprint"
             cleanup:
               type: string
               enum: [verified, unverified, blocked_catalog_unverified, backend_unavailable]
