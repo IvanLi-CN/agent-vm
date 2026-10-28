@@ -84,5 +84,23 @@ export const system: SystemStatus = {
 
 export const emptyReferences: ImageReferenceCounts = { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 };
 
-export type MockState = { overview: Overview; vms: ManagedVM[]; images: ManagedImage[]; operations: Operation[]; audits: AuditEvent[]; system: SystemStatus };
-export const mockState: MockState = { overview, vms, images, operations, audits, system };
+export type MockState = {
+  overview: Overview;
+  vms: ManagedVM[];
+  images: ManagedImage[];
+  operations: Operation[];
+  audits: AuditEvent[];
+  system: SystemStatus;
+  image_selection_version: string;
+  image_catalog_version: string;
+};
+export const mockState: MockState = {
+  overview,
+  vms,
+  images,
+  operations,
+  audits,
+  system,
+  image_selection_version: "image-selection:revision-12",
+  image_catalog_version: "image-catalog:revision-12",
+};

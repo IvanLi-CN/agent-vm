@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mockState } from "./mockData";
-import { ManagementRequestError, startImageImport, submitVMAction, uploadImageImportContent } from "./api";
+import { ManagementRequestError, startImageImport, submitImageAction, submitVMAction, uploadImageImportContent } from "./api";
 import type { ActionPreview } from "./types";
 
 describe("mock image uploads", () => {
@@ -17,13 +17,14 @@ describe("mock image uploads", () => {
       reason: "Exercise the isolated upload path",
       target_version: "image-catalog:revision-12",
       version_label: "2026.02",
-      source: { kind: "local_upload", format: "unified", expected_sha256: "c".repeat(64), expected_size_bytes: "7" },
+      source: { kind: "local_upload", format: "unified", expected_sha256: "f".repeat(64), expected_size_bytes: "7" },
     });
     const unreadable = new Proxy({} as File, { get() { throw new Error("demo upload content must not be read"); } });
     const completed = await uploadImageImportContent(operation.operation_id, unreadable);
 
     expect(completed.operation_id).toBe(operation.operation_id);
     expect(completed.status).toBe("succeeded");
+    expect(mockState.images[0]).toMatchObject({ fingerprint: "f".repeat(64), version_label: "2026.02", source: { kind: "local_upload" } });
     expect(mockState.operations.filter((item) => item.operation_id === operation.operation_id)).toHaveLength(1);
     await expect(uploadImageImportContent(operation.operation_id, unreadable)).rejects.toMatchObject({ code: "operation_conflict" });
   });
@@ -41,8 +42,12 @@ describe("mock image uploads", () => {
   });
 
   it("terminalizes trusted imports and keeps VM aggregate counts aligned", async () => {
-    const imported = await startImageImport({ operation_id: "synthetic-trusted-import", reason: "Exercise trusted import", target_version: "image-catalog:revision-12", version_label: "2026.02", source: { kind: "trusted_remote", source_id: "ubuntu-staging", expected_fingerprint: "a".repeat(64) } });
+    const importedFingerprint = "e".repeat(64);
+    const imported = await startImageImport({ operation_id: "synthetic-trusted-import", reason: "Exercise trusted import", target_version: "image-catalog:revision-12", version_label: "2026.02", source: { kind: "trusted_remote", source_id: "ubuntu-staging", expected_fingerprint: importedFingerprint } });
     expect(imported.status).toBe("succeeded");
+    expect(mockState.images[0]).toMatchObject({ fingerprint: importedFingerprint, version_label: "2026.02", source: { kind: "trusted_remote", source_id: "ubuntu-staging" } });
+    expect(mockState.image_catalog_version).toContain(imported.operation_id.slice(0, 8));
+    expect(imported.result?.image_fingerprint).toBe(importedFingerprint);
 
     const beforeActive = mockState.overview.task_counts.active;
     const beforeCached = mockState.overview.task_counts.cached;
@@ -53,6 +58,35 @@ describe("mock image uploads", () => {
     expect(mockState.overview.task_counts.active).toBe(beforeActive - 1);
     expect(mockState.overview.task_counts.cached).toBe(beforeCached + 1);
     expect(vm.state).toBe("cached");
+  });
+
+  it("keeps default image references and selection version aligned", async () => {
+    const previousDefault = mockState.images.find((image) => image.is_default)!;
+    const nextDefault = mockState.images.find((image) => !image.is_default)!;
+    const beforeVersion = mockState.image_selection_version;
+    const operation = await submitImageAction(nextDefault.fingerprint, "default", "Select the approved image", previewFor(nextDefault.resource_version), "synthetic-default-image");
+
+    expect(operation.status).toBe("succeeded");
+    expect(nextDefault.is_default).toBe(true);
+    expect(nextDefault.references.default).toBe(1);
+    expect(previousDefault.is_default).toBe(false);
+    expect(previousDefault.references.default).toBe(0);
+    expect(mockState.image_selection_version).not.toBe(beforeVersion);
+    expect(operation.result?.default_fingerprint).toBe(nextDefault.fingerprint);
+  });
+
+  it("updates available capacity when a VM is resized", async () => {
+    const vm = mockState.vms[0];
+    const beforeCpu = mockState.overview.capacity.logical_cpu_remaining_vcpu.value!;
+    const beforeMemory = BigInt(mockState.overview.capacity.logical_memory_remaining.value_bytes!);
+    const beforeContainerMemory = BigInt(mockState.overview.capacity.ct_memory_available.value_bytes!);
+    const nextMemory = (BigInt(vm.resources.memory_bytes!) + 1_073_741_824n).toString();
+    const operation = await submitVMAction(vm.task_id, "resize", "Increase demo resources", previewFor(vm.resource_version), vm.generation, { cpu_vcpu: vm.resources.cpu_vcpu! + 2, memory_bytes: nextMemory, disk_bytes: vm.resources.disk_bytes }, "synthetic-resize-operation");
+
+    expect(operation.status).toBe("succeeded");
+    expect(mockState.overview.capacity.logical_cpu_remaining_vcpu.value).toBe(beforeCpu - 2);
+    expect(mockState.overview.capacity.logical_memory_remaining.value_bytes).toBe((beforeMemory - 1_073_741_824n).toString());
+    expect(mockState.overview.capacity.ct_memory_available.value_bytes).toBe((beforeContainerMemory - 1_073_741_824n).toString());
   });
 });
 

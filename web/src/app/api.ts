@@ -1,4 +1,4 @@
-import { mockState } from "./mockData";
+import { emptyReferences, mockState } from "./mockData";
 import type { ActionPreview, AuditEvent, ImageImportRequest, ManagedImage, ManagedVM, Operation, Overview, SystemStatus } from "./types";
 import { demoForcedOutcome, demoMutationError, emitDemoChange, getMockState, isDemoRuntime } from "../demo/runtime";
 
@@ -138,7 +138,7 @@ export async function listImages(query = "", cursor?: string): Promise<{ items: 
   const normalized = query.toLowerCase();
   const state = mockStateForRequest();
   const items = state.images.filter((image) => !normalized || `${image.version_label} ${image.fingerprint}`.toLowerCase().includes(normalized));
-  return delay({ items, page: { limit: 25, next_cursor: null }, default_fingerprint: state.images.find((image) => image.is_default)?.fingerprint ?? null, selection_version: "image-selection:revision-12", catalog_version: "image-catalog:revision-12" });
+  return delay({ items, page: { limit: 25, next_cursor: null }, default_fingerprint: state.images.find((image) => image.is_default)?.fingerprint ?? null, selection_version: state.image_selection_version, catalog_version: state.image_catalog_version });
 }
 
 export async function listOperations(status = "all", cursor?: string): Promise<{ items: Operation[]; page: { limit: number; next_cursor: string | null } }> {
@@ -178,7 +178,12 @@ export async function startImageImport(request: ImageImportRequest): Promise<Ope
   if (useRealApi) return realRequest("/images/imports", { method: "POST", body: JSON.stringify(request) });
   assertMockMutationAllowed();
   const initialStatus = request.source.kind === "local_upload" ? "awaiting_upload" : undefined;
-  return createMockOperation("image_import", { kind: "image_catalog", id: "image-catalog" }, request.reason, initialStatus, request.operation_id, request);
+  const operation = createMockOperation("image_import", { kind: "image_catalog", id: "image-catalog" }, request.reason, initialStatus, request.operation_id, request, request as unknown as Record<string, unknown>);
+  const state = getMockState();
+  const imports = mockImageImportRequests.get(state) ?? new Map<string, ImageImportRequest>();
+  mockImageImportRequests.set(state, imports);
+  imports.set(request.operation_id, request);
+  return operation;
 }
 
 export async function uploadImageImportContent(operationId: string, content: File | { metadata: File; rootfs: File }): Promise<Operation> {
@@ -240,6 +245,7 @@ export async function submitMaintenance(action: "drain_enter" | "reconcile" | "g
 }
 
 const mockOperationFingerprints = new WeakMap<object, Map<string, string>>();
+const mockImageImportRequests = new WeakMap<object, Map<string, ImageImportRequest>>();
 
 function canonicalize(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalize);
@@ -267,13 +273,30 @@ function createMockOperation(action: Operation["action"], target: Operation["tar
       if (vm && action === "destroy") { adjustTaskCount(state, vm.state, "absent"); vm.state = "absent"; vm.native_state = "absent"; vm.guest_availability = "unavailable"; vm.lease = { state: "absent", expires_at: null }; }
       if (vm && action === "release") { adjustTaskCount(state, vm.state, "cached"); vm.state = "cached"; vm.native_state = "stopped"; vm.guest_availability = "unavailable"; vm.lease = { state: "absent", expires_at: null }; }
       if (vm && action === "restart") { vm.native_state = "running"; vm.guest_availability = "ready"; }
-      if (vm && action === "resize") vm.resources = { ...vm.resources, cpu_vcpu: typeof effectParameters.cpu_vcpu === "number" ? effectParameters.cpu_vcpu : vm.resources.cpu_vcpu, memory_bytes: typeof effectParameters.memory_bytes === "string" ? effectParameters.memory_bytes : vm.resources.memory_bytes, disk_bytes: typeof effectParameters.disk_bytes === "string" ? effectParameters.disk_bytes : vm.resources.disk_bytes };
+      if (vm && action === "resize") {
+        const nextResources = { ...vm.resources, cpu_vcpu: typeof effectParameters.cpu_vcpu === "number" ? effectParameters.cpu_vcpu : vm.resources.cpu_vcpu, memory_bytes: typeof effectParameters.memory_bytes === "string" ? effectParameters.memory_bytes : vm.resources.memory_bytes, disk_bytes: typeof effectParameters.disk_bytes === "string" ? effectParameters.disk_bytes : vm.resources.disk_bytes };
+        adjustCapacityForResize(state, vm.resources, nextResources);
+        vm.resources = nextResources;
+      }
       if (vm && action === "port_add" && typeof effectParameters.port_name === "string" && typeof effectParameters.protocol === "string" && typeof effectParameters.host_port === "number" && typeof effectParameters.guest_port === "number") vm.port_mappings = [...vm.port_mappings.filter((port) => port.name !== effectParameters.port_name), { name: effectParameters.port_name, protocol: effectParameters.protocol as "tcp" | "udp", host_port: effectParameters.host_port, guest_port: effectParameters.guest_port }];
       if (vm && action === "port_remove" && typeof effectParameters.port_name === "string") vm.port_mappings = vm.port_mappings.filter((port) => port.name !== effectParameters.port_name);
       if (vm) vm.resource_version = `${vm.resource_version}:demo-${operationId.slice(0, 8)}`;
       if (vm && ["destroy", "release", "resize", "port_add", "port_remove"].includes(action)) state.overview.resource_version = `${state.overview.resource_version}:demo-${operationId.slice(0, 8)}`;
     }
-    if (target.kind === "image" && action === "default_image_select") state.images.forEach((image) => { image.is_default = image.fingerprint === target.id; });
+    if (target.kind === "image" && action === "default_image_select") {
+      state.images.forEach((image) => {
+        const isDefault = image.fingerprint === target.id;
+        image.is_default = isDefault;
+        image.references = { ...image.references, default: isDefault ? 1 : 0 };
+        image.resource_version = advanceMockVersion(image.resource_version, operationId);
+      });
+      state.image_selection_version = advanceMockVersion(state.image_selection_version, operationId);
+      operation.result = { ...operation.result, default_fingerprint: target.id };
+    }
+    if (target.kind === "image_catalog" && action === "image_import" && isImageImportRequest(effectParameters)) {
+      const imported = applyImageImportEffect(state, effectParameters as unknown as ImageImportRequest, operationId);
+      operation.result = { ...operation.result, image_fingerprint: imported?.fingerprint ?? null };
+    }
     if (target.kind === "system" && action === "drain_enter") state.system.maintenance.draining = true;
     if (target.kind === "system" && action === "reconcile") state.system.maintenance.reconciliation_pending = 0;
     if (target.kind === "system" && action === "gc") state.system.maintenance.garbage_collection_pending = 0;
@@ -291,6 +314,78 @@ function adjustTaskCount(state: ReturnType<typeof getMockState>, from: ManagedVM
   counts[to] = (counts[to] ?? 0) + 1;
 }
 
+type VMResources = ManagedVM["resources"];
+
+function advanceMockVersion(value: string, operationId: string): string {
+  return `${value}:demo-${operationId.slice(0, 8)}`;
+}
+
+function adjustCapacityForResize(state: ReturnType<typeof getMockState>, previous: VMResources, next: VMResources): void {
+  const cpuDelta = typeof previous.cpu_vcpu === "number" && typeof next.cpu_vcpu === "number" ? next.cpu_vcpu - previous.cpu_vcpu : null;
+  if (cpuDelta !== null && state.overview.capacity.logical_cpu_remaining_vcpu.state === "available" && state.overview.capacity.logical_cpu_remaining_vcpu.value !== null) {
+    state.overview.capacity.logical_cpu_remaining_vcpu = { ...state.overview.capacity.logical_cpu_remaining_vcpu, value: Math.max(0, state.overview.capacity.logical_cpu_remaining_vcpu.value - cpuDelta), observed_at: state.overview.observed_at };
+  }
+  const memoryDelta = byteDelta(previous.memory_bytes, next.memory_bytes);
+  if (memoryDelta !== null) {
+    state.overview.capacity.logical_memory_remaining = adjustObservedBytes(state.overview.capacity.logical_memory_remaining, memoryDelta, state.overview.observed_at);
+    state.overview.capacity.ct_memory_available = adjustObservedBytes(state.overview.capacity.ct_memory_available, memoryDelta, state.overview.observed_at);
+  }
+  const diskDelta = byteDelta(previous.disk_bytes, next.disk_bytes);
+  if (diskDelta !== null) state.overview.capacity.physical_disk_available = adjustObservedBytes(state.overview.capacity.physical_disk_available, diskDelta, state.overview.observed_at);
+}
+
+function byteDelta(previous: string | null, next: string | null): bigint | null {
+  if (previous === null || next === null) return null;
+  try {
+    return BigInt(next) - BigInt(previous);
+  } catch {
+    return null;
+  }
+}
+
+function adjustObservedBytes(observed: Overview["capacity"]["logical_memory_remaining"], delta: bigint, observedAt: string): Overview["capacity"]["logical_memory_remaining"] {
+  if (observed.state !== "available" || observed.value_bytes === null) return observed;
+  try {
+    const next = BigInt(observed.value_bytes) - delta;
+    return { ...observed, value_bytes: (next < 0n ? 0n : next).toString(), observed_at: observedAt };
+  } catch {
+    return observed;
+  }
+}
+
+function isImageImportRequest(value: Record<string, unknown>): boolean {
+  return typeof value === "object" && value !== null && "operation_id" in value && "source" in value;
+}
+
+function applyImageImportEffect(state: ReturnType<typeof getMockState>, request: ImageImportRequest, operationId: string): ManagedImage | null {
+  const fingerprint = request.source.kind === "trusted_remote"
+    ? request.source.expected_fingerprint
+    : request.source.format === "unified"
+      ? request.source.expected_sha256
+      : request.source.metadata.expected_sha256;
+  if (!fingerprint) return null;
+  const existing = state.images.find((image) => image.fingerprint === fingerprint);
+  if (existing) return existing;
+  const sourceKind = request.source.kind === "trusted_remote" ? "trusted_remote" : "local_upload";
+  const image: ManagedImage = {
+    fingerprint,
+    resource_version: `image:${fingerprint.slice(0, 4)}:${operationId.slice(0, 8)}`,
+    version_label: request.version_label ?? `import-${fingerprint.slice(0, 8)}`,
+    architecture: "x86_64",
+    instance_type: "container",
+    source: { kind: sourceKind, source_id: request.source.kind === "trusted_remote" ? request.source.source_id : null },
+    state: "available",
+    verification: { integrity: "passed", suitability: "passed", findings: [] },
+    is_default: false,
+    default_compatibility: "none",
+    references: { ...emptyReferences },
+    created_at: new Date().toISOString(),
+  };
+  state.images.unshift(image);
+  state.image_catalog_version = advanceMockVersion(state.image_catalog_version, operationId);
+  return image;
+}
+
 function continueMockUploadOperation(operationId: string): Operation {
   const state = getMockState();
   const operation = state.operations.find((candidate) => candidate.operation_id === operationId);
@@ -303,6 +398,11 @@ function continueMockUploadOperation(operationId: string): Operation {
   operation.updated_at = updatedAt;
   operation.result = outcome === "succeeded" ? { effect: "simulated_effect", affected_session_count: 0 } : null;
   operation.error = outcome === "failed" ? { code: "stale_target", phase: "precondition", retryable: false } : outcome === "outcome_unknown" ? { code: "authority_unavailable", phase: "native_action", retryable: true } : null;
+  if (outcome === "succeeded") {
+    const request = mockImageImportRequests.get(state)?.get(operationId);
+    const imported = request ? applyImageImportEffect(state, request, operationId) : null;
+    operation.result = { ...operation.result, image_fingerprint: imported?.fingerprint ?? null };
+  }
   state.audits.unshift({ event_id: createOperationId(), operation_id: operation.operation_id, action: operation.action, actor: operation.actor, reason: operation.reason, target: operation.target, outcome, phase: operation.phase, occurred_at: updatedAt, safe_code: operation.error?.code ?? null });
   emitDemoChange();
   return operation;
