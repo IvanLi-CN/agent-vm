@@ -48,6 +48,17 @@ function validDataMode(value: string | null): DemoDataMode {
   return value === "minimal" ? "minimal" : "full";
 }
 
+type DemoUrlSettings = Pick<DemoRuntimeState, "scene" | "persona" | "network" | "dataMode">;
+
+function settingsFromLocation(): DemoUrlSettings {
+  return {
+    scene: validScene(readParam("demo")),
+    persona: validPersona(readParam("d_persona")),
+    network: validNetwork(readParam("d_network")),
+    dataMode: validDataMode(readParam("d_data")),
+  };
+}
+
 export function modelForScene(scene: DemoScene, dataMode: DemoDataMode = "full"): MockState {
   const model = cloneModel();
   if (scene === "capacity") {
@@ -90,11 +101,8 @@ export function modelForScene(scene: DemoScene, dataMode: DemoDataMode = "full")
 }
 
 function createRuntime(): DemoRuntimeState {
-  const scene = validScene(readParam("demo"));
-  const persona = validPersona(readParam("d_persona"));
-  const network = validNetwork(readParam("d_network"));
-  const dataMode = validDataMode(readParam("d_data"));
-  return { scene, persona, network, dataMode, forcedOutcome: scene === "conflict" ? "outcome_unknown" : "succeeded", model: modelForScene(scene, dataMode), revision: 0, bootstrapError: readParam("d_bootstrap") === "fail" ? "demo_bootstrap_failed" : null };
+  const settings = settingsFromLocation();
+  return { ...settings, forcedOutcome: settings.scene === "conflict" ? "outcome_unknown" : "succeeded", model: modelForScene(settings.scene, settings.dataMode), revision: 0, bootstrapError: readParam("d_bootstrap") === "fail" ? "demo_bootstrap_failed" : null };
 }
 
 export function isDemoRuntime(): boolean {
@@ -113,8 +121,7 @@ export function getMockState(): MockState {
 export function emitDemoChange(): void {
   if (!isDemoBuild || !runtime) return;
   runtime = { ...runtime, revision: runtime.revision + 1 };
-  listeners.forEach((listener) => listener());
-  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("agent-vm-demo-change"));
+  notifyRuntimeChange();
 }
 
 export function setDemoControl(control: Partial<Pick<DemoRuntimeState, "scene" | "persona" | "network" | "dataMode">>): void {
@@ -127,14 +134,13 @@ export function setDemoControl(control: Partial<Pick<DemoRuntimeState, "scene" |
   };
   runtime = { ...current, ...next, forcedOutcome: next.scene === "conflict" ? "outcome_unknown" : "succeeded", model: modelForScene(next.scene, next.dataMode), revision: current.revision + 1, bootstrapError: null };
   syncShareParams(runtime);
-  listeners.forEach((listener) => listener());
-  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("agent-vm-demo-change"));
+  notifyRuntimeChange();
 }
 
 export function setDemoBootstrapError(message: string | null): void {
   const current = getDemoRuntime();
   runtime = { ...current, bootstrapError: message };
-  listeners.forEach((listener) => listener());
+  notifyRuntimeChange();
 }
 
 export function canMutateDemo(): boolean {
@@ -156,11 +162,26 @@ export function demoForcedOutcome(): DemoForcedOutcome {
 function syncShareParams(current: DemoRuntimeState): void {
   if (typeof window === "undefined" || !isDemoBuild) return;
   const url = new URL(window.location.href);
+  url.search = "";
+  url.hash = "";
   url.searchParams.set("demo", current.scene);
   url.searchParams.set("d_persona", current.persona);
   url.searchParams.set("d_network", current.network);
   url.searchParams.set("d_data", current.dataMode);
-  window.history.replaceState({}, "", url);
+  if (url.toString() !== window.location.href) window.history.pushState({}, "", url);
+}
+
+function notifyRuntimeChange(): void {
+  listeners.forEach((listener) => listener());
+  if (typeof window !== "undefined") window.dispatchEvent(new CustomEvent("agent-vm-demo-change"));
+}
+
+export function syncDemoRuntimeFromLocation(): void {
+  if (!isDemoBuild || !runtime) return;
+  const next = settingsFromLocation();
+  if (next.scene === runtime.scene && next.persona === runtime.persona && next.network === runtime.network && next.dataMode === runtime.dataMode) return;
+  runtime = { ...runtime, ...next, forcedOutcome: next.scene === "conflict" ? "outcome_unknown" : "succeeded", model: modelForScene(next.scene, next.dataMode), revision: runtime.revision + 1, bootstrapError: null };
+  notifyRuntimeChange();
 }
 
 function subscribe(listener: () => void): () => void {
@@ -181,5 +202,16 @@ export function DemoProvider({ children }: { children: ReactNode }): ReactNode {
 }
 
 export function demoShareUrl(): string {
-  return typeof window === "undefined" ? "" : window.location.href;
+  if (typeof window === "undefined" || !isDemoBuild) return "";
+  const current = getDemoRuntime();
+  const url = new URL(window.location.href);
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set("demo", current.scene);
+  url.searchParams.set("d_persona", current.persona);
+  url.searchParams.set("d_network", current.network);
+  url.searchParams.set("d_data", current.dataMode);
+  return url.toString();
 }
+
+if (typeof window !== "undefined") window.addEventListener("popstate", syncDemoRuntimeFromLocation);

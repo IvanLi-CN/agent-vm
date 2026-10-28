@@ -3,10 +3,17 @@ import { expect, test } from "@playwright/test";
 test("keeps the demo isolated while a scenario and simulated action change", async ({ page }) => {
   const realRequests: string[] = [];
   page.on("request", (request) => { if (request.url().includes("/api/v1")) realRequests.push(request.url()); });
-  await page.goto("?demo=normal&d_persona=admin&d_network=online");
+  await page.goto("?demo=normal&d_persona=admin&d_network=online&token=must-not-share#private-fragment");
   await expect(page.getByRole("heading", { name: "Demo inspector" })).toBeVisible();
   await page.getByLabel("Scene").selectOption("capacity");
   await expect(page.getByTestId("overview-page").getByText("Admission is unknown")).toBeVisible();
+  await expect(page).toHaveURL(/demo=capacity/);
+  expect((await page.url())).not.toContain("must-not-share");
+  expect((await page.url())).not.toContain("private-fragment");
+  await page.goBack();
+  await expect(page).toHaveURL(/demo=normal/);
+  await expect(page.getByLabel("Scene")).toHaveValue("normal");
+  await page.getByLabel("Scene").selectOption("capacity");
   await page.getByRole("button", { name: "VMs" }).click();
   await expect(page).toHaveURL(/\/demo\/vms\?demo=capacity/);
   await expect(page.getByTestId("vms-page")).toBeVisible();

@@ -175,7 +175,7 @@ export async function startImageImport(request: ImageImportRequest): Promise<Ope
 export async function uploadImageImportContent(operationId: string, content: File | { metadata: File; rootfs: File }): Promise<Operation> {
   if (!useRealApi) {
     assertMockMutationAllowed();
-    return createMockOperation("image_import", { kind: "image_catalog", id: "image-catalog" }, "upload image content", "running", operationId);
+    return continueMockUploadOperation(operationId);
   }
   if ("metadata" in content) {
     const form = new FormData();
@@ -249,6 +249,22 @@ function createMockOperation(action: Operation["action"], target: Operation["tar
   }
   state.operations.unshift(operation);
   state.audits.unshift({ event_id: createOperationId(), operation_id: operation.operation_id, action, actor: operation.actor, reason, target, outcome: finalStatus === "queued" || finalStatus === "running" || finalStatus === "awaiting_upload" ? "accepted" : finalStatus, phase: operation.phase, occurred_at: operation.updated_at, safe_code: operation.error?.code ?? null });
+  emitDemoChange();
+  return operation;
+}
+
+function continueMockUploadOperation(operationId: string): Operation {
+  const state = getMockState();
+  const operation = state.operations.find((candidate) => candidate.operation_id === operationId);
+  if (!operation) throw new ManagementRequestError("not_found", "awaiting_upload", operationId);
+  const outcome = isDemoRuntime() ? demoForcedOutcome() : "succeeded";
+  const updatedAt = new Date().toISOString();
+  operation.status = outcome;
+  operation.phase = outcome === "succeeded" ? "completed" : outcome === "failed" ? "reference_check" : "native_action";
+  operation.updated_at = updatedAt;
+  operation.result = outcome === "succeeded" ? { effect: "simulated_effect", affected_session_count: 0 } : null;
+  operation.error = outcome === "failed" ? { code: "stale_target", phase: "precondition", retryable: false } : outcome === "outcome_unknown" ? { code: "authority_unavailable", phase: "native_action", retryable: true } : null;
+  state.audits.unshift({ event_id: createOperationId(), operation_id: operation.operation_id, action: operation.action, actor: operation.actor, reason: operation.reason, target: operation.target, outcome, phase: operation.phase, occurred_at: updatedAt, safe_code: operation.error?.code ?? null });
   emitDemoChange();
   return operation;
 }

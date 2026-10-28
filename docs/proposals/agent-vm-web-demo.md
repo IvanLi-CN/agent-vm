@@ -10,7 +10,7 @@
 
 - [管理台产品边界](../../PRODUCT.md)和[管理 API 合同](../specs/agent-vm/contracts/management-api.md)定义了五个页面、已有会话 VM、镜像和受控维护操作；演示不扩展正式产品的权限或资源范围。
 - `web/src/app/api.ts` 使用构建环境变量在真实 API 与模块内模拟数据之间切换；Demo 构建通过显式运行时和 `/demo` 路径复用正式页面与路由后缀，并在模拟写入后更新内存模型、操作记录和审计。
-- `package.json` 锁定 React Doctor `0.9.18` 与版本化 `doctor.config.json`，提供 staged/changed 两种门禁命令；CI 在现有 PR/Main gate 中执行 changed 检查。Storybook 已配置 accessibility addon，页面级浏览器测试覆盖 Demo 隔离与响应式控制面板。
+- `package.json` 锁定 React Doctor `0.9.18` 与版本化 `doctor.config.json`，提供 staged/changed 两种门禁命令；CI 在现有 PR/Main gate 中执行 changed 检查、静态 Demo 构建和 Storybook accessibility 浏览器检查。Storybook 已配置 accessibility addon，页面级浏览器测试覆盖 Demo 隔离与响应式控制面板。
 - Style Playbook 的 `web-demo` Topic 以 `projects/octo-rill.md` 为结构化控制面板、隔离运行时和分享链接的主要参考；`projects/loadlynx.md` 与 `projects/mains-aegis.md` 支持复用正式界面、路由与安全模拟数据。Storybook 不能替代页面级演示。
 - 对 `web-demo`、`react-app`、`typescript-web`、`shadcn-ui`、`playwright-e2e`、`storybook-component-qa`、`storybook-accessibility`、`responsive-web-ui`、`ui-version-display` 和 `embedded-admin-ui` 的本地 Policy 审计均无适用 Policy closure。`quality-gates` 审计验证本地 package 和 lock 已安装；此结果不证明各 Topic 的功能实现或平台规则已对齐。
 
