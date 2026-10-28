@@ -114,12 +114,16 @@ func (s *Service) lockAction(action string, request protocol.Request) func() {
 		return s.maintenance.Unlock
 	}
 	key := ""
-	if session := stringValue(request["session_id"]); session != "" {
+	if action == "drain-enter" || action == "drain-exit" {
+		// Drain ownership is a process-wide release boundary. It must not be
+		// serialized only by the caller's session lock: a release transaction
+		// and the Web adapter use different session identities and must still
+		// observe and update one durable owner in order.
+		key = "drain"
+	} else if session := stringValue(request["session_id"]); session != "" {
 		key = "session:" + session
 	} else if taskID := stringValue(request["task_id"]); taskID != "" {
 		key = "task:" + taskID
-	} else if action == "drain-enter" || action == "drain-exit" {
-		key = "drain"
 	}
 	if key == "" {
 		return func() {}
@@ -1741,21 +1745,54 @@ func (s *Service) portRemove(ctx context.Context, request protocol.Request) (map
 }
 
 func (s *Service) drain(ctx context.Context, value bool, request protocol.Request) (map[string]any, error) {
+	draining, _, err := s.Store.Meta(ctx, "draining")
+	if err != nil {
+		return nil, s.sqliteError(err)
+	}
 	if value {
-		owner := stringValue(request["session_id"])
-		if owner == "" {
-			owner = "operation:" + stringValue(request["operation_id"])
+		incoming := stringValue(request["session_id"])
+		if incoming == "" {
+			incoming = "operation:" + stringValue(request["operation_id"])
 		}
-		if err := s.Store.SetMeta(ctx, "drain_owner", owner); err != nil {
+		owner, found, ownerErr := s.Store.Meta(ctx, "drain_owner")
+		if ownerErr != nil {
+			return nil, s.sqliteError(ownerErr)
+		}
+		if draining == "1" {
+			switch {
+			case found && owner == incoming:
+				// Idempotent retry by the current owner.
+			case !found || owner == "":
+				// A pre-management controller persisted only draining=1. A
+				// release transaction may claim that legacy, ownerless fence.
+				if !strings.HasPrefix(incoming, "release-") {
+					return map[string]any{"draining": true}, nil
+				}
+				if err := s.Store.SetMeta(ctx, "drain_owner", incoming); err != nil {
+					return nil, s.sqliteError(err)
+				}
+			case strings.HasPrefix(incoming, "release-") && strings.HasPrefix(owner, "operation:"):
+				// A release may explicitly take over a browser-entered drain;
+				// a browser or a different release may never replace an active
+				// release owner.
+				if err := s.Store.SetMeta(ctx, "drain_owner", incoming); err != nil {
+					return nil, s.sqliteError(err)
+				}
+			default:
+				return nil, protocol.NewError("operation_conflict", "admission drain is owned by another transaction", nil)
+			}
+		} else if err := s.Store.SetMeta(ctx, "drain_owner", incoming); err != nil {
 			return nil, s.sqliteError(err)
 		}
 	} else {
-		owner, found, err := s.Store.Meta(ctx, "drain_owner")
-		if err != nil {
-			return nil, s.sqliteError(err)
+		owner, found, ownerErr := s.Store.Meta(ctx, "drain_owner")
+		if ownerErr != nil {
+			return nil, s.sqliteError(ownerErr)
 		}
 		session := stringValue(request["session_id"])
-		if !found || owner == "" || session == "" || session != owner || !strings.HasPrefix(session, "release-") {
+		// The first management-aware release may inherit a drain entered by
+		// the previous protocol-4 controller, which had no owner metadata.
+		if session == "" || !strings.HasPrefix(session, "release-") || (found && owner != "" && session != owner) {
 			return nil, protocol.NewError("permission_denied", "only the active release transaction may exit admission drain", nil)
 		}
 	}

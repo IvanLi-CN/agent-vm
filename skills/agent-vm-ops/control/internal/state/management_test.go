@@ -358,6 +358,33 @@ func TestManagementHistoryPagesFilterInSQLite(t *testing.T) {
 	}
 }
 
+func TestPendingManagementOperationsExcludesQueuedWork(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	queued := ManagementOperation{OperationID: "queued-drain-test", Action: "image_import", TargetKind: "image_catalog", TargetID: "image-catalog", Actor: "admin", Reason: "retry later", Phase: "queued", Status: "queued", Request: map[string]any{}}
+	if _, err := store.ClaimManagementOperationWithAudit(ctx, queued, ManagementAudit{EventID: "queued-drain-test", OperationID: &queued.OperationID, Action: queued.Action, Actor: queued.Actor, Reason: queued.Reason, Target: map[string]any{}, Outcome: "accepted", Phase: queued.Phase, OccurredAt: time.Now().UTC().Format(time.RFC3339Nano)}); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := store.PendingManagementOperations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("queued operation was treated as in flight: %#v", pending)
+	}
+	if _, claimed, err := store.TransitionManagementOperation(ctx, queued.OperationID, "queued", "native_action", "running"); err != nil || !claimed {
+		t.Fatalf("claim running operation: claimed=%v err=%v", claimed, err)
+	}
+	pending, err = store.PendingManagementOperations(ctx)
+	if err != nil || len(pending) != 1 || pending[0].OperationID != queued.OperationID {
+		t.Fatalf("running operation pending=%#v err=%v", pending, err)
+	}
+}
+
 func TestCachedImageUsableRequiresVerifiedAvailableCatalogState(t *testing.T) {
 	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

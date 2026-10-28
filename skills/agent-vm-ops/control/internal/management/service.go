@@ -673,7 +673,7 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 	if err != nil {
 		return operation, err
 	}
-	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "queued", "image_import", "running")
+	running, claimed, err := s.Store.TransitionManagementOperationUnlessDraining(ctx, operationID, "queued", "image_import", "running")
 	if err != nil {
 		release()
 		return nil, err
@@ -813,7 +813,7 @@ func (s *Service) failImportWithImage(ctx context.Context, operation *state.Mana
 		return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
 	}
 	if err := s.Store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Architecture: artifact.Architecture, InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID), State: "failed", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none"}); err != nil {
-		return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
+		return s.recoverImportedCatalogFailure(ctx, operation, artifact, err)
 	}
 	return s.finishOperation(ctx, operation, "completed", "failed", nil, map[string]any{"code": "image_not_applicable", "phase": "suitability_check", "findings": findings})
 }
@@ -942,7 +942,7 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 		}
 		operation = *existing
 	}
-	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "queued", "native_mutation", "running")
+	running, claimed, err := s.Store.TransitionManagementOperationUnlessDraining(ctx, operationID, "queued", "native_mutation", "running")
 	if err != nil {
 		return nil, err
 	}
@@ -1014,7 +1014,15 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	if err != nil {
 		return nil, err
 	}
-	running, claimed, err := s.Store.TransitionManagementOperation(ctx, request.OperationID, "queued", "native_action", "running")
+	var running *state.ManagementOperation
+	var claimed bool
+	var transitionErr error
+	if request.Action == "release" || request.Action == "destroy" {
+		running, claimed, transitionErr = s.Store.TransitionManagementOperation(ctx, request.OperationID, "queued", "native_action", "running")
+	} else {
+		running, claimed, transitionErr = s.Store.TransitionManagementOperationUnlessDraining(ctx, request.OperationID, "queued", "native_action", "running")
+	}
+	err = transitionErr
 	if err != nil {
 		return nil, err
 	}
@@ -1091,6 +1099,9 @@ func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceReq
 	if err != nil {
 		return nil, err
 	}
+	// Maintenance actions are intentionally executable while admission is
+	// drained: release drain enter/exit, reconciliation and GC are the
+	// controlled work needed to establish or verify the fence itself.
 	running, claimed, err := s.Store.TransitionManagementOperation(ctx, request.OperationID, "queued", "native_action", "running")
 	if err != nil {
 		return nil, err

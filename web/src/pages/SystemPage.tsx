@@ -9,7 +9,7 @@ import { ActionDialog } from "../components/ActionDialog";
 import { PageIntro, QueryError } from "../components/PagePrimitives";
 import { Button, Panel, PanelHeader, StatusBadge } from "../components/ui";
 
-type MaintenanceAction = "drain_enter" | "drain_exit" | "reconcile" | "gc";
+type MaintenanceAction = "drain_enter" | "reconcile" | "gc";
 
 export function SystemPage() {
   const { t, i18n } = useTranslation();
@@ -51,7 +51,7 @@ export function SystemPage() {
     <PageIntro title={t("system.title")} description={t("system.subtitle")} onRefresh={() => void query.refetch()} refreshing={query.isFetching} />
     <div className="system-overview">
       <Panel><PanelHeader title={t("system.productVersion")} /><div className="product-version mono">{query.data.product_version}</div><div className="system-meta"><span className="mono">{query.data.resource_version}</span><span>{t("shell.synthetic")}</span></div></Panel>
-      <Panel><PanelHeader title={t("system.maintenance")} description={t("system.maintainHint")} /><MaintenanceSummary system={query.data} /><div className="maintenance-actions"><Button variant="secondary" icon={<Wrench />} onClick={() => void openAction(query.data.maintenance.draining ? "drain_exit" : "drain_enter")}>{query.data.maintenance.draining ? t("system.exitDrain") : t("system.enterDrain")}</Button><Button variant="ghost" onClick={() => void openAction("reconcile")}>{t("system.reconcile")}</Button><Button variant="ghost" onClick={() => void openAction("gc")}>{t("system.gc")}</Button></div>{actionError && !action ? <p className="field-error" role="alert">{actionError}</p> : null}</Panel>
+      <Panel><PanelHeader title={t("system.maintenance")} description={t("system.maintainHint")} /><MaintenanceSummary system={query.data} /><div className="maintenance-actions">{query.data.maintenance.draining ? <p className="maintenance-note">{t("system.releaseManaged")}</p> : <Button variant="secondary" icon={<Wrench />} onClick={() => void openAction("drain_enter")}>{t("system.enterDrain")}</Button>}<Button variant="ghost" onClick={() => void openAction("reconcile")}>{t("system.reconcile")}</Button><Button variant="ghost" onClick={() => void openAction("gc")}>{t("system.gc")}</Button></div>{actionError && !action ? <p className="field-error" role="alert">{actionError}</p> : null}</Panel>
     </div>
     <div className="system-grid">
       <Panel><PanelHeader title={t("system.components")} /><div className="component-list">{query.data.components.map((component) => <div className="component-row" key={component.name}><div><strong>{component.name}</strong><span className="mono">{component.version ?? "—"}</span></div><div><StatusBadge state={component.state} /><small>{component.observed_at ? formatDateTime(component.observed_at, locale) : "—"}</small></div></div>)}</div></Panel>

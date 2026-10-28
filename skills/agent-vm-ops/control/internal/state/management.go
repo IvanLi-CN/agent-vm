@@ -1034,9 +1034,12 @@ FROM management_operations ORDER BY created_at DESC, operation_id DESC`)
 	return values, err
 }
 
-// PendingManagementOperations returns the bounded summaries needed by the
-// release drain convergence check. It is intentionally tolerant of a legacy
-// database that has not activated the management schema yet.
+// PendingManagementOperations returns only management operations with an
+// active native effect for the release drain convergence check. Queued work
+// has not crossed the native-effect barrier and is deliberately left
+// retryable; its transition into running is fenced by the durable drain flag.
+// It is intentionally tolerant of a legacy database that has not activated
+// the management schema yet.
 func (s *Store) PendingManagementOperations(ctx context.Context) ([]ManagementOperation, error) {
 	values := []ManagementOperation{}
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
@@ -1047,7 +1050,7 @@ func (s *Store) PendingManagementOperations(ctx context.Context) ([]ManagementOp
 			return err
 		}
 		rows, err := conn.QueryContext(ctx, `SELECT operation_id, action, target_kind, target_id, actor, reason, phase, status, request_json, result_json, error_json, created_at, updated_at
-FROM management_operations WHERE status IN ('queued', 'running', 'reconciling') ORDER BY created_at, operation_id LIMIT 1001`)
+FROM management_operations WHERE status IN ('running', 'reconciling') ORDER BY created_at, operation_id LIMIT 1001`)
 		if err != nil {
 			return err
 		}

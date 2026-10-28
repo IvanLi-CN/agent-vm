@@ -217,6 +217,41 @@ func TestTrustedImportCapacityFailureDoesNotClaimOrImport(t *testing.T) {
 	}
 }
 
+func TestTrustedImportDoesNotCrossAdmissionDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	fingerprint := strings.Repeat("a", 64)
+	backend := &fakeImageBackend{artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}}
+	service := New(store, Options{
+		TrustedImageSourceIDs:      []string{"approved"},
+		UploadMinimumFreeBytes:     512,
+		AvailableImageStorageBytes: func() (int64, error) { return 4096, nil },
+		Backend:                    backend,
+	})
+	request := ImportRequest{
+		OperationID: "trusted-drain-fence", Actor: "admin", Reason: "do not import during release", TargetVersion: "image-catalog:revision-1", VersionLabel: "2026.02",
+		Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint},
+	}
+	operation, err := service.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(context.Background(), "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := service.ProcessTrustedImport(context.Background(), operation.OperationID)
+	if err == nil || !strings.Contains(err.Error(), "draining:") {
+		t.Fatalf("drain error = %v", err)
+	}
+	stored, getErr := store.GetManagementOperation(context.Background(), operation.OperationID)
+	if getErr != nil || blocked != nil || stored == nil || stored.Status != "queued" || backend.imports != 0 {
+		t.Fatalf("operation crossed drain = returned=%#v stored=%#v get_err=%v imports=%d", blocked, stored, getErr, backend.imports)
+	}
+}
+
 func TestConcurrentTrustedImportsReserveImageStorage(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

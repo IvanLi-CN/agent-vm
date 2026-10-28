@@ -133,6 +133,79 @@ func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
 	}
 }
 
+func TestReleaseDrainExitClaimsLegacyOwnerlessFence(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.SetMeta(ctx, "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	result, err := service.drain(ctx, false, protocol.Request{"session_id": "release-first-management-aware"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["draining"] != false {
+		t.Fatalf("drain result = %#v", result)
+	}
+	if value, found, err := store.Meta(ctx, "draining"); err != nil || !found || value != "0" {
+		t.Fatalf("draining metadata = %q found=%v err=%v", value, found, err)
+	}
+	if owner, found, err := store.Meta(ctx, "drain_owner"); err != nil || (found && owner != "") {
+		t.Fatalf("drain owner = %q found=%v err=%v", owner, found, err)
+	}
+}
+
+func TestDrainOwnershipCannotBeReplacedByAnotherCaller(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	service := New(store, config.Defaults(), Options{})
+	if _, err := service.drain(ctx, true, protocol.Request{"session_id": "release-owner"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.drain(ctx, true, protocol.Request{"session_id": "release-other"}); protocol.AsError(err).Code != "operation_conflict" {
+		t.Fatalf("different release owner error = %#v", err)
+	}
+	if _, err := service.drain(ctx, true, protocol.Request{"operation_id": "browser-retry"}); protocol.AsError(err).Code != "operation_conflict" {
+		t.Fatalf("browser owner error = %#v", err)
+	}
+	if owner, found, err := store.Meta(ctx, "drain_owner"); err != nil || !found || owner != "release-owner" {
+		t.Fatalf("drain owner = %q found=%v err=%v", owner, found, err)
+	}
+	if _, err := service.drain(ctx, false, protocol.Request{"session_id": "release-other"}); protocol.AsError(err).Code != "permission_denied" {
+		t.Fatalf("wrong release exit error = %#v", err)
+	}
+	if result, err := service.drain(ctx, false, protocol.Request{"session_id": "release-owner"}); err != nil || result["draining"] != false {
+		t.Fatalf("owner exit result=%#v err=%v", result, err)
+	}
+}
+
+func TestReleaseMayTakeOverBrowserDrainBeforeActivation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	service := New(store, config.Defaults(), Options{})
+	if _, err := service.drain(ctx, true, protocol.Request{"operation_id": "browser-drain"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.drain(ctx, true, protocol.Request{"session_id": "release-handoff"}); err != nil {
+		t.Fatal(err)
+	}
+	if owner, found, err := store.Meta(ctx, "drain_owner"); err != nil || !found || owner != "release-handoff" {
+		t.Fatalf("drain owner = %q found=%v err=%v", owner, found, err)
+	}
+}
+
 func TestCachedAcquireRejectsRetiredPinnedImage(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
