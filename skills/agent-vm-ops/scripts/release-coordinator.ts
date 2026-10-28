@@ -260,8 +260,7 @@ export class GithubReleaseStateStore {
     ]);
     const treeArgs = [
       "api", "--method", "POST", `repos/${this.adapter.repository}/git/trees`,
-      "--field", "tree[][path]=record.json", "--field", "tree[][mode]=100644",
-      "--field", "tree[][type]=blob", "--field", `tree[][sha]=${blob.sha}`,
+      "--field", `tree=${JSON.stringify([{ path: "record.json", mode: "100644", type: "blob", sha: blob.sha }])}`,
     ];
     const tree = await this.adapter.json<{ sha: string }>(treeArgs);
     const commitArgs = [
@@ -287,7 +286,8 @@ export class GithubReleaseStateStore {
     } catch (error) {
       if (!/422|already exists|reference/i.test(String(error))) throw error;
       const winner = await this.read("claimed", identity.version);
-      if (!winner || identityKey(winner.event.identity) !== identityKey(identity)) throw new Error("release version claim conflicted");
+      if (!winner) throw error;
+      if (identityKey(winner.event.identity) !== identityKey(identity)) throw new Error("release version claim conflicted");
       return winner.event;
     }
   }
@@ -347,7 +347,8 @@ export class GithubReleaseStateStore {
     } catch (error) {
       if (!/422|already exists|reference/i.test(String(error))) throw error;
       const winner = await this.read(stage, identity.version);
-      if (!winner || identityKey(winner.event.identity) !== identityKey(identity)) throw new Error("release state transition conflicted");
+      if (!winner) throw error;
+      if (identityKey(winner.event.identity) !== identityKey(identity)) throw new Error("release state transition conflicted");
       assertFrozenDetailsEqual(winner.event.detail, event.detail);
       return winner.event;
     }

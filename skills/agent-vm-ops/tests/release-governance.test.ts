@@ -102,7 +102,15 @@ test("GitHub state refs are append-only and preserve the original identity", asy
       const commitRead = args.find((item) => /\/git\/commits\/[0-9a-z-]+$/.test(item));
       if (commitRead && !args.includes("--method")) return { message: commits.get(commitRead.split("/git/commits/")[1]) };
       if (args.some((item) => item.endsWith("/git/blobs"))) return { sha: `blob-${++sequence}` };
-      if (args.some((item) => item.endsWith("/git/trees"))) return { sha: `tree-${++sequence}` };
+      if (args.some((item) => item.endsWith("/git/trees"))) {
+        const treeArgument = args.find((item) => item.startsWith("tree="));
+        if (!treeArgument) throw new Error("tree payload is missing");
+        const entries = JSON.parse(treeArgument.slice("tree=".length)) as Array<Record<string, string>>;
+        if (entries.length !== 1 || entries[0]?.path !== "record.json" || entries[0]?.mode !== "100644" || entries[0]?.type !== "blob" || !entries[0]?.sha) {
+          throw new Error("tree payload is not a valid GitHub tree entry");
+        }
+        return { sha: `tree-${++sequence}` };
+      }
       if (args.some((item) => item.endsWith("/git/commits"))) {
         const sha = `commit-${++sequence}`;
         commits.set(sha, args.find((item) => item.startsWith("message="))!.slice("message=".length));
