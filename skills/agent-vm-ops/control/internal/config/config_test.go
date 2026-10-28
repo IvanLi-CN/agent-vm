@@ -90,6 +90,11 @@ func TestLoadPreservesCanonicalAdmissionFields(t *testing.T) {
 	value.CPUOvercommitRatio = json.Number("1.1")
 	value.MemoryOvercommitRatio = json.Number("2")
 	value.CPUStartupPressureFullAvg10Percent = 50
+	value.CreateCostBytes = 7 * 1024 * 1024 * 1024
+	value.ResumeCostBytes = 2 * 1024 * 1024 * 1024
+	value.ResizeCostBytes = 3 * 1024 * 1024 * 1024
+	value.DiskLowBytes = 11 * 1024 * 1024 * 1024
+	value.DiskTargetBytes = 22 * 1024 * 1024 * 1024
 	data, err := json.Marshal(value)
 	if err != nil {
 		t.Fatal(err)
@@ -101,7 +106,9 @@ func TestLoadPreservesCanonicalAdmissionFields(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.CPUOvercommitRatio.String() != "1.1" || loaded.MemoryOvercommitRatio.String() != "2" || loaded.CPUStartupPressureFullAvg10Percent != 50 {
+	if loaded.CPUOvercommitRatio.String() != "1.1" || loaded.MemoryOvercommitRatio.String() != "2" || loaded.CPUStartupPressureFullAvg10Percent != 50 ||
+		loaded.CreateCostBytes != value.CreateCostBytes || loaded.ResumeCostBytes != value.ResumeCostBytes || loaded.ResizeCostBytes != value.ResizeCostBytes ||
+		loaded.DiskLowBytes != value.DiskLowBytes || loaded.DiskTargetBytes != value.DiskTargetBytes {
 		t.Fatalf("loaded admission policy = %#v", loaded)
 	}
 }

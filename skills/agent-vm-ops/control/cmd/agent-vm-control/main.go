@@ -138,7 +138,7 @@ func serve(args []string) error {
 		}
 	}
 	runner := native.NewRunner()
-	guest := native.NewIncusClient(runner, cfg.Project, native.ClientOptions{Profile: cfg.Profile, Network: cfg.Network, Pool: cfg.Pool})
+	guest := native.NewIncusClient(runner, cfg.Project, native.ClientOptions{Profile: cfg.Profile, Network: cfg.Network, Pool: cfg.Pool, StoragePath: cfg.StoragePath})
 	var snapshots *observe.SnapshotStore
 	if cfg.MetricsDir != "" {
 		snapshots = observe.NewSnapshotStore(cfg.MetricsDir)

@@ -173,6 +173,40 @@ func TestIncusStoragePoolAvailableBytesUsesPoolResources(t *testing.T) {
 	}
 }
 
+func TestIncusStoragePoolCapacityVerifiesDirectoryPoolSource(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "incus-argv")
+	script := `#!/bin/sh
+printf '%s\n' "$@" > "$INCUS_ARGV_LOG"
+printf '%s\n' '{"name":"agents","driver":"dir","config":{"source":"'"$INCUS_STORAGE_PATH"'"}}'
+`
+	if err := os.WriteFile(filepath.Join(binDir, "incus"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	storagePath := t.TempDir()
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("INCUS_ARGV_LOG", logPath)
+	t.Setenv("INCUS_STORAGE_PATH", storagePath)
+
+	client := NewIncusClient(NewRunner(), "agents", ClientOptions{Pool: "agents", StoragePath: storagePath})
+	capacity, err := client.StoragePoolCapacity(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capacity.TotalBytes <= 0 || capacity.FreeBytes <= 0 || capacity.FreeBytes > capacity.TotalBytes {
+		t.Fatalf("capacity = %#v", capacity)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	want := []string{"query", "/1.0/storage-pools/agents?project=default"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("incus argv = %#v, want %#v", got, want)
+	}
+}
+
 func TestIncusVerificationInitDisablesProfilesAndNetwork(t *testing.T) {
 	binDir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "incus-argv")

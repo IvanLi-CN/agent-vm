@@ -76,6 +76,11 @@ type Config struct {
 	CPUBudget                          int64            `json:"cpu_budget"`
 	MemoryBudgetMiB                    int64            `json:"memory_budget_mib"`
 	DiskBudgetGiB                      int64            `json:"disk_budget_gib"`
+	CreateCostBytes                    int64            `json:"create_cost_bytes"`
+	ResumeCostBytes                    int64            `json:"resume_cost_bytes"`
+	ResizeCostBytes                    int64            `json:"resize_cost_bytes"`
+	DiskLowBytes                       int64            `json:"disk_low_bytes"`
+	DiskTargetBytes                    int64            `json:"disk_target_bytes"`
 	InstanceLimit                      int64            `json:"instance_limit"`
 	CPUOvercommitRatio                 json.Number      `json:"cpu_overcommit_ratio"`
 	MemoryOvercommitRatio              json.Number      `json:"memory_overcommit_ratio"`
@@ -110,6 +115,9 @@ func Defaults() Config {
 		CPUOvercommitRatio:                 json.Number("4"),
 		MemoryOvercommitRatio:              json.Number("4"),
 		CPUStartupPressureFullAvg10Percent: 20,
+		CreateCostBytes:                    4 * 1024 * 1024 * 1024,
+		ResumeCostBytes:                    1 * 1024 * 1024 * 1024,
+		ResizeCostBytes:                    1 * 1024 * 1024 * 1024,
 		SweepSeconds:                       1,
 		WorkerTimeoutSeconds:               300,
 		DrainTimeoutSeconds:                8100,
@@ -243,7 +251,7 @@ func (c Config) Validate() error {
 	if c.PortEnd < c.PortStart || c.PortEnd > 65535 {
 		return errors.New("config_invalid: port_end")
 	}
-	if c.CPUBudget < 0 || c.MemoryBudgetMiB < 0 || c.DiskBudgetGiB < 0 || c.InstanceLimit < 0 {
+	if c.CPUBudget < 0 || c.MemoryBudgetMiB < 0 || c.DiskBudgetGiB < 0 || c.InstanceLimit < 0 || c.CreateCostBytes < 0 || c.ResumeCostBytes < 0 || c.ResizeCostBytes < 0 || c.DiskLowBytes < 0 || c.DiskTargetBytes < 0 {
 		return errors.New("config_invalid: admission limits")
 	}
 	if _, _, err := decimalRatio(c.CPUOvercommitRatio, "cpu_overcommit_ratio"); err != nil {

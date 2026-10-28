@@ -2386,6 +2386,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			return nil, s.sqliteError(err)
 		}
 		states := map[string]int64{}
+		for _, stateName := range []string{stateActive, statePreparing, stateCached, stateClosing, stateDeleting, stateFailed, stateAbsent} {
+			states[stateName] = 0
+		}
 		allocated := map[string]int64{"cpu": 0, "memory_mib": 0, "disk_gib": 0}
 		reserved := map[string]int64{"cpu": 0, "memory_mib": 0, "disk_gib": 0}
 		for _, task := range tasks {
@@ -2498,7 +2501,10 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				nativeUp = false
 				warnings = append(warnings, map[string]any{"code": "native_unavailable", "message": "Incus native availability could not be verified", "detail": map[string]any{"cause": nativeProbeErr.Error()}})
 			}
-			draining, _ := s.isDraining(ctx)
+			draining, drainErr := s.isDraining(ctx)
+			if drainErr != nil {
+				return nil, s.sqliteError(drainErr)
+			}
 			if consistent && len(pendingOperations) == 0 && states[stateClosing] == 0 && states[stateDeleting] == 0 && states[stateFailed] == 0 {
 				if releaseDrain, drainErr := s.releaseDrainOwned(ctx); drainErr != nil {
 					return nil, s.sqliteError(drainErr)
@@ -2530,18 +2536,38 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				limits["disk_gib"] = s.Config.DiskBudgetGiB
 				remaining["disk_gib"] = s.Config.DiskBudgetGiB - allocated["disk_gib"] - reserved["disk_gib"]
 			}
-			resourcesValue := map[string]any{"allocated": allocated, "reserved": reserved, "allocated_and_reserved": addResourceMaps(allocated, reserved), "limits": limits, "remaining": remaining, "policy": map[string]any{"cpu_overcommit_ratio": s.Config.CPUOvercommitRatio, "memory_overcommit_ratio": s.Config.MemoryOvercommitRatio, "cpu_startup_pressure_full_avg10_percent": s.Config.CPUStartupPressureFullAvg10Percent}}
+			allocatedAndReserved := addResourceMaps(allocated, reserved)
+			memoryObservation := map[string]any{"limit_bytes": nil, "current_bytes": nil, "available_bytes": nil, "threshold_bytes": nil, "pressure": nil, "oom_events": nil}
+			resourcesValue := map[string]any{"allocated": allocated, "reserved": reserved, "allocated_and_reserved": allocatedAndReserved, "limits": limits, "remaining": remaining, "policy": map[string]any{"cpu_overcommit_ratio": s.Config.CPUOvercommitRatio, "memory_overcommit_ratio": s.Config.MemoryOvercommitRatio, "cpu_startup_pressure_full_avg10_percent": s.Config.CPUStartupPressureFullAvg10Percent}, "memory": memoryObservation, "memory_pressure": nil}
 			ctCPU := map[string]any{"capacity_vcpu": nil, "pressure": nil, "startup_pressure": nil}
 			defaultReasons := []any{}
 			if !s.Ready() {
 				defaultReasons = append(defaultReasons, map[string]any{"code": "startup_reconcile_required", "message": "control service is not ready for admission"})
 			}
+			if draining {
+				defaultReasons = append(defaultReasons, map[string]any{"code": "draining", "message": "new leases are refused while draining"})
+			}
 			if !nativeUp {
 				defaultReasons = append(defaultReasons, map[string]any{"code": "native_unavailable", "message": "Incus native availability is not verified"})
 			}
+			defaultRequested := map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}
+			logicalExceeded := []string{}
+			for _, key := range resourceKeys {
+				limit, hasLimit := limits[key]
+				if !hasLimit {
+					continue
+				}
+				limitValue, ok := limit.(int64)
+				if ok && allocatedAndReserved[key]+defaultRequested[key] > limitValue {
+					logicalExceeded = append(logicalExceeded, key)
+				}
+			}
+			if len(logicalExceeded) > 0 {
+				defaultReasons = append(defaultReasons, map[string]any{"code": "resource_insufficient", "dimensions": logicalExceeded, "requested": defaultRequested, "remaining": remaining})
+			}
 			if cpuObservation != nil {
 				pressure := cpuObservation.Pressure()
-				startupPressure := s.startupPressureDetail(*cpuObservation, allocated["cpu"], 2)
+				startupPressure := s.startupPressureDetail(*cpuObservation, allocatedAndReserved["cpu"], 2)
 				resourcesValue["ct_capacity"] = map[string]any{"cpu": cpuObservation.Capacity}
 				resourcesValue["cpu_pressure"] = pressure
 				ctCPU["capacity_vcpu"] = cpuObservation.Capacity
@@ -2557,13 +2583,60 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 					defaultReasons = append(defaultReasons, map[string]any{"code": "resource_unverified", "message": "CT CPU pressure observation is not verified"})
 				}
 			}
+			diskAdmission, diskErr := s.diskAdmission(ctx, "")
+			var reclaimRequired any
+			if diskErr != nil {
+				control := protocol.AsError(diskErr)
+				diskAdmission = map[string]any{"verified": false, "error": map[string]any{"code": control.Code, "message": control.Message, "detail": control.Detail}}
+				if s.requiresPhysicalDiskAdmission() {
+					defaultReasons = append(defaultReasons, map[string]any{"code": control.Code, "message": control.Message, "detail": control.Detail})
+				}
+			} else {
+				diskReady, diskReadyErr := s.diskAdmissionSufficient(ctx, diskAdmission, s.Config.CreateCostBytes, "")
+				if diskReadyErr != nil {
+					control := protocol.AsError(diskReadyErr)
+					if control.Code == "resource_insufficient" {
+						reclaimRequired = true
+						if s.requiresPhysicalDiskAdmission() {
+							defaultReasons = append(defaultReasons, map[string]any{"code": "disk_reclaim_required", "message": "default creation needs capacity reclamation", "detail": control.Detail})
+						}
+					} else if s.requiresPhysicalDiskAdmission() {
+						defaultReasons = append(defaultReasons, map[string]any{"code": control.Code, "message": control.Message, "detail": control.Detail})
+					}
+				} else {
+					reclaimRequired = !diskReady
+					if !diskReady {
+						defaultReasons = append(defaultReasons, map[string]any{"code": "disk_reclaim_required", "message": "default creation needs capacity reclamation"})
+					}
+				}
+			}
+			instanceLimit := any(nil)
+			instanceRemaining := any(nil)
+			admissionInstances := states[stateActive] + states[statePreparing] + states[stateClosing] + states[stateDeleting] + states[stateFailed]
+			if s.Config.InstanceLimit > 0 {
+				instanceLimit = s.Config.InstanceLimit
+				instanceRemaining = maxInt64(0, s.Config.InstanceLimit-admissionInstances)
+				if admissionInstances >= s.Config.InstanceLimit {
+					defaultReasons = append(defaultReasons, map[string]any{"code": "resource_insufficient", "dimensions": []string{"instances"}, "requested": 1, "remaining": instanceRemaining})
+				}
+			}
+			instances := map[string]any{"verified": true, "source": "durable_state", "native_verified": false, "total": len(tasks), "limits": map[string]any{}, "admission": map[string]any{"allocated": admissionInstances - states[statePreparing], "reserved": states[statePreparing], "allocated_and_reserved": admissionInstances, "remaining": instanceRemaining, "limit": instanceLimit, "capacity": nil}}
+			defaultReady := len(defaultReasons) == 0
+			admissionReady := s.Ready() && nativeUp && defaultReady
+			capacityObservation := any(nil)
+			if diskErr == nil {
+				physical := diskAdmission["physical_admission"].(map[string]any)
+				capacityObservation = map[string]any{"verified": true, "total_bytes": physical["capacity_bytes"], "used_bytes": physical["allocated_bytes"], "free_bytes": physical["free_bytes"], "low_watermark_bytes": physical["low_watermark_bytes"], "target_watermark_bytes": physical["target_watermark_bytes"]}
+			}
 			return map[string]any{
 				"observation_epoch": epoch, "observation_consistent": consistent, "observation_attempts": attempt,
-				"observed_at": start, "up": nativeUp, "draining": draining, "admission_ready": s.Ready(),
-				"resources": resourcesValue, "ct_cpu": ctCPU,
-				"default_admission": map[string]any{"requested": map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "ready": s.Ready(), "reasons": defaultReasons},
-				"task_states":       states, "pending_operations": pendingOperations, "historical_unknown_operations": unknownOperations, "instances": len(tasks), "warnings": warnings,
-				"warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil), "native_unavailable": boolInt(!nativeUp)},
+				"observed_at": start, "up": nativeUp, "draining": draining, "admission_ready": admissionReady,
+				"resources": resourcesValue, "capacity": capacityObservation, "ct_cpu": ctCPU,
+				"reclaim_required": reclaimRequired, "disk_admission": diskAdmission,
+				"default_admission": map[string]any{"requested": defaultRequested, "request_cost_bytes": s.Config.CreateCostBytes, "ready": defaultReady, "reasons": defaultReasons, "reclaim_required": reclaimRequired},
+				"ct_memory":         map[string]any{"capacity_bytes": memoryObservation["limit_bytes"], "current_bytes": memoryObservation["current_bytes"], "available_bytes": memoryObservation["available_bytes"], "pressure_threshold_bytes": memoryObservation["threshold_bytes"], "pressure": memoryObservation["pressure"], "oom_events": memoryObservation["oom_events"]},
+				"task_states":       states, "pending_operations": pendingOperations, "historical_unknown_operations": unknownOperations, "instances": instances, "operations": map[string]any{"pending": len(pendingOperations), "historical_unknown": len(unknownOperations)}, "image_unpack_failures": nil, "warnings": warnings,
+				"warning_counts": map[string]int{"observation_inconsistent": boolInt(!consistent), "resource_unverified": boolInt(cpuObservationErr != nil || diskErr != nil), "native_unavailable": boolInt(!nativeUp)},
 			}, nil
 		}
 	}
@@ -3093,7 +3166,11 @@ func (s *Service) task(ctx context.Context, request protocol.Request) (*state.Ta
 
 func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any, error) {
 	if task == nil || task.TaskID == "" {
-		return map[string]any{"state": stateAbsent, "session_id": task.SessionID, "effective_lease": false}, nil
+		session := ""
+		if task != nil {
+			session = task.SessionID
+		}
+		return map[string]any{"state": stateAbsent, "session_id": session, "effective_lease": false, "native_status": stateAbsent, "guest_available": false}, nil
 	}
 	resources := map[string]any{}
 	_ = json.Unmarshal([]byte(task.ResourcesJSON), &resources)
@@ -3103,7 +3180,31 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	return map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock())}, nil
+	result := map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": false}
+	if s.Guest == nil {
+		return result, nil
+	}
+	if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr != nil {
+		result["guest_error"] = protocol.AsError(ownershipErr)
+		return result, nil
+	}
+	status, statusErr := s.Guest.Status(ctx, task.InstanceName)
+	if statusErr != nil {
+		result["guest_error"] = map[string]any{"code": "native_unavailable", "message": "native guest status could not be verified"}
+		return result, nil
+	}
+	nativeStatus, parseErr := native.ParseStatus(status)
+	if parseErr != nil {
+		result["guest_error"] = map[string]any{"code": "state_unverified", "message": "native guest status is malformed"}
+		return result, nil
+	}
+	result["native_status"] = nativeStatus
+	guestAvailable := result["effective_lease"] == true && strings.EqualFold(nativeStatus, "running")
+	result["guest_available"] = guestAvailable
+	if result["effective_lease"] == true && !guestAvailable {
+		result["guest_error"] = map[string]any{"code": "guest_unavailable", "message": "effective lease has no running guest; inspect before explicit restart"}
+	}
+	return result, nil
 }
 
 func (s *Service) isDraining(ctx context.Context) (bool, error) {
@@ -3508,6 +3609,200 @@ func waitForGuestReady(ctx context.Context, guest native.Guest, name string) (st
 	}
 }
 
+const bytesPerGiB int64 = 1024 * 1024 * 1024
+
+func maxInt64(left, right int64) int64 {
+	if left >= right {
+		return left
+	}
+	return right
+}
+
+const maxInt64Value int64 = 1<<63 - 1
+
+func addInt64(left, right int64) (int64, bool) {
+	if left < 0 || right < 0 || left > maxInt64Value-right {
+		return 0, false
+	}
+	return left + right, true
+}
+
+func multiplyGiB(value int64) (int64, bool) {
+	if value < 0 || value > maxInt64Value/bytesPerGiB {
+		return 0, false
+	}
+	return value * bytesPerGiB, true
+}
+
+func percentageOf(value, percentage int64) int64 {
+	whole, remainder := value/100, value%100
+	return whole*percentage + remainder*percentage/100
+}
+
+func (s *Service) requiresPhysicalDiskAdmission() bool {
+	return s.resident || s.Config.StoragePath != ""
+}
+
+func (s *Service) diskAdmission(ctx context.Context, excludeTaskID string) (map[string]any, error) {
+	if s.Guest == nil {
+		return nil, protocol.NewError("resource_unverified", "Incus storage pool capacity is unavailable", map[string]any{"verified": false})
+	}
+	probe, ok := s.Guest.(native.StoragePoolProbe)
+	if !ok {
+		return nil, protocol.NewError("resource_unverified", "Incus storage pool capacity is unavailable", map[string]any{"verified": false})
+	}
+	capacity, err := probe.StoragePoolCapacity(ctx)
+	if err != nil {
+		return nil, protocol.NewError("resource_unverified", "Incus storage pool capacity could not be verified", map[string]any{"verified": false, "cause": err.Error()})
+	}
+	if capacity.TotalBytes <= 0 || capacity.FreeBytes < 0 || capacity.FreeBytes > capacity.TotalBytes {
+		return nil, protocol.NewError("resource_unverified", "Incus storage pool capacity is invalid", map[string]any{"verified": false})
+	}
+	low := maxInt64(s.Config.DiskLowBytes, percentageOf(capacity.TotalBytes, 15))
+	target := maxInt64(s.Config.DiskTargetBytes, percentageOf(capacity.TotalBytes, 25))
+	if target >= capacity.TotalBytes || low >= target {
+		return nil, protocol.NewError("watermarks_unreachable", "configure reachable CT storage watermarks", map[string]any{"total_bytes": capacity.TotalBytes, "low_bytes": low, "target_bytes": target})
+	}
+	tasks, err := s.Store.ListTasks(ctx)
+	if err != nil {
+		return nil, s.sqliteError(err)
+	}
+	var durableReserved int64
+	var guestAllocated, guestReserved, guestAllocatedAndReserved int64
+	for _, task := range tasks {
+		if task.TaskID == excludeTaskID {
+			continue
+		}
+		if task.ReservationBytes < 0 {
+			return nil, protocol.NewError("resource_unverified", "durable disk reservation is malformed", map[string]any{"task_id": task.TaskID, "verified": false})
+		}
+		if task.ReservationBytes > 0 && durableReserved > int64(^uint64(0)>>1)-task.ReservationBytes {
+			return nil, protocol.NewError("resource_unverified", "durable disk reservation exceeds supported range", map[string]any{"verified": false})
+		}
+		durableReserved, _ = addInt64(durableReserved, task.ReservationBytes)
+		if task.State == stateAbsent || task.State == stateCached {
+			continue
+		}
+		resources := map[string]int64{}
+		if err := json.Unmarshal([]byte(task.ResourcesJSON), &resources); err != nil {
+			return nil, protocol.NewError("resource_unverified", "task disk allocation is malformed", map[string]any{"task_id": task.TaskID, "verified": false})
+		}
+		diskGiB, diskOK := resources["disk_gib"]
+		if !diskOK {
+			return nil, protocol.NewError("resource_unverified", "task disk allocation is incomplete", map[string]any{"task_id": task.TaskID, "verified": false})
+		}
+		allocation, allocationOK := multiplyGiB(diskGiB)
+		if !allocationOK {
+			return nil, protocol.NewError("resource_unverified", "task disk allocation exceeds supported range", map[string]any{"task_id": task.TaskID, "verified": false})
+		}
+		reservation := map[string]int64{}
+		if task.ResourceReservationJSON != "" && task.ResourceReservationJSON != "{}" {
+			if err := json.Unmarshal([]byte(task.ResourceReservationJSON), &reservation); err != nil {
+				return nil, protocol.NewError("resource_unverified", "task disk reservation is malformed", map[string]any{"task_id": task.TaskID, "verified": false})
+			}
+		}
+		reservationGiB := reservation["disk_gib"]
+		reserved, reservationOK := multiplyGiB(reservationGiB)
+		if !reservationOK {
+			return nil, protocol.NewError("resource_unverified", "task disk reservation exceeds supported range", map[string]any{"task_id": task.TaskID, "verified": false})
+		}
+		var sumOK bool
+		if guestAllocated, sumOK = addInt64(guestAllocated, allocation); !sumOK {
+			return nil, protocol.NewError("resource_unverified", "guest disk allocation exceeds supported range", map[string]any{"verified": false})
+		}
+		if guestReserved, sumOK = addInt64(guestReserved, reserved); !sumOK {
+			return nil, protocol.NewError("resource_unverified", "guest disk reservation exceeds supported range", map[string]any{"verified": false})
+		}
+		if guestAllocatedAndReserved, sumOK = addInt64(guestAllocatedAndReserved, maxInt64(allocation, reserved)); !sumOK {
+			return nil, protocol.NewError("resource_unverified", "guest disk admission exceeds supported range", map[string]any{"verified": false})
+		}
+	}
+	used := capacity.TotalBytes - capacity.FreeBytes
+	freeAfterLow := int64(0)
+	if capacity.FreeBytes > low {
+		freeAfterLow = capacity.FreeBytes - low
+		if durableReserved < freeAfterLow {
+			freeAfterLow -= durableReserved
+		} else {
+			freeAfterLow = 0
+		}
+	}
+	allocatedAndReserved, sumOK := addInt64(used, durableReserved)
+	if !sumOK {
+		return nil, protocol.NewError("resource_unverified", "physical disk admission exceeds supported range", map[string]any{"verified": false})
+	}
+	return map[string]any{
+		"verified":         true,
+		"guest_allocation": map[string]any{"allocated_bytes": guestAllocated, "reserved_bytes": guestReserved, "allocated_and_reserved_bytes": guestAllocatedAndReserved},
+		"physical_admission": map[string]any{
+			"allocated_bytes": used, "reserved_bytes": durableReserved, "allocated_and_reserved_bytes": allocatedAndReserved,
+			"remaining_bytes": freeAfterLow, "limit_bytes": capacity.TotalBytes - low, "capacity_bytes": capacity.TotalBytes,
+			"free_bytes": capacity.FreeBytes, "low_watermark_bytes": low, "target_watermark_bytes": target,
+			"durable_reserved_bytes": durableReserved,
+		},
+	}, nil
+}
+
+func (s *Service) diskAdmissionSufficient(_ context.Context, admission map[string]any, requestCost int64, excludeTaskID string) (bool, error) {
+	if admission == nil {
+		return true, nil
+	}
+	physical, ok := admission["physical_admission"].(map[string]any)
+	if !ok {
+		return false, protocol.NewError("resource_unverified", "physical disk admission is unavailable", map[string]any{"verified": false})
+	}
+	free, freeOK := physical["free_bytes"].(int64)
+	low, lowOK := physical["low_watermark_bytes"].(int64)
+	reserved, reservedOK := physical["durable_reserved_bytes"].(int64)
+	if !freeOK || !lowOK || !reservedOK || requestCost < 0 {
+		return false, protocol.NewError("resource_unverified", "physical disk admission observation is malformed", map[string]any{"verified": false})
+	}
+	if excludeTaskID != "" {
+		// diskAdmission already excluded this task when its reservation was
+		// calculated; retain the argument to make the exclusion explicit at the
+		// call boundary and prevent future callers from silently dropping it.
+		_ = excludeTaskID
+	}
+	if reserved > free || requestCost > free-reserved {
+		return false, protocol.NewError("resource_insufficient", "physical disk admission is below the configured low watermark", map[string]any{"request_cost_bytes": requestCost, "free_bytes": free, "reserved_bytes": reserved, "low_watermark_bytes": low})
+	}
+	sufficient := free-reserved-requestCost >= low
+	if !sufficient {
+		return false, protocol.NewError("resource_insufficient", "physical disk admission is below the configured low watermark", map[string]any{"request_cost_bytes": requestCost, "free_bytes": free, "reserved_bytes": reserved, "low_watermark_bytes": low})
+	}
+	return true, nil
+}
+
+func (s *Service) admissionStorageCost(ctx context.Context, excludeTaskID string, requested map[string]int64, startup bool) (int64, error) {
+	if !startup {
+		current, err := s.Store.GetTask(ctx, map[string]any{"task_id": excludeTaskID})
+		if err != nil {
+			return 0, s.sqliteError(err)
+		}
+		if current != nil {
+			resources := map[string]int64{}
+			if json.Unmarshal([]byte(current.ResourcesJSON), &resources) == nil && requested["disk_gib"] > resources["disk_gib"] {
+				return s.Config.ResizeCostBytes, nil
+			}
+		}
+		return 0, nil
+	}
+	if excludeTaskID == "" {
+		return s.Config.CreateCostBytes, nil
+	}
+	task, err := s.Store.GetTask(ctx, map[string]any{"task_id": excludeTaskID})
+	if err != nil {
+		return 0, s.sqliteError(err)
+	}
+	if task != nil && task.State == stateCached {
+		return s.Config.ResumeCostBytes, nil
+	}
+	if task != nil && (task.State == stateActive || task.State == statePreparing) {
+		return 0, nil
+	}
+	return s.Config.CreateCostBytes, nil
+}
+
 func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64, excludeTaskID string, startup bool) error {
 	tasks, err := s.Store.ListTasks(ctx)
 	if err != nil {
@@ -3545,6 +3840,20 @@ func (s *Service) checkAdmission(ctx context.Context, requested map[string]int64
 	for _, key := range resourceKeys {
 		if limits[key] > 0 && used[key]+requested[key] > limits[key] {
 			return protocol.NewError("resource_insufficient", "requested resources exceed the configured admission budget", map[string]any{"resource": key, "used": used[key], "requested": requested[key], "limit": limits[key]})
+		}
+	}
+	diskAdmission, diskErr := s.diskAdmission(ctx, excludeTaskID)
+	if diskErr != nil {
+		if s.requiresPhysicalDiskAdmission() {
+			return diskErr
+		}
+	} else {
+		requestCost, costErr := s.admissionStorageCost(ctx, excludeTaskID, requested, startup)
+		if costErr != nil {
+			return costErr
+		}
+		if _, sufficientErr := s.diskAdmissionSufficient(ctx, diskAdmission, requestCost, excludeTaskID); sufficientErr != nil {
+			return sufficientErr
 		}
 	}
 	if startup {

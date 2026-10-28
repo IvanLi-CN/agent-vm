@@ -30,6 +30,19 @@ type staticCPUObserver struct {
 	err         error
 }
 
+type capacityGuest struct {
+	*startupGuest
+	capacity    native.StorageCapacity
+	capacityErr error
+	probeErr    error
+}
+
+func (guest *capacityGuest) StoragePoolCapacity(context.Context) (native.StorageCapacity, error) {
+	return guest.capacity, guest.capacityErr
+}
+
+func (guest *capacityGuest) Probe(context.Context) error { return guest.probeErr }
+
 type startupGuest struct {
 	initErr     error
 	status      string
@@ -344,6 +357,186 @@ func TestAdminMetricsIncludesPendingOperations(t *testing.T) {
 	pending, ok := result["pending_operations"].([]any)
 	if !ok || len(pending) != 0 {
 		t.Fatalf("pending operations = %#v", result["pending_operations"])
+	}
+}
+
+func TestAdmissionRejectsWhenPhysicalStorageCannotBeMeasured(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	service := New(store, cfg, Options{Guest: &startupGuest{}, Resident: true})
+	service.MarkReady()
+	err = service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_unverified" {
+		t.Fatalf("unmeasured storage error = %#v", err)
+	}
+}
+
+func TestAdmissionRejectsLowPhysicalStorageWithoutTouchingEffectiveLease(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	now := time.Date(2026, 10, 29, 0, 0, 0, 0, time.UTC)
+	lease := now.Add(time.Hour).Format(time.RFC3339Nano)
+	active := state.Task{
+		TaskID: "active-task", SessionID: "active-session", Generation: 1, State: stateActive,
+		InstanceName: "active-instance", LeaseExpiresAt: &lease, CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: "{}",
+	}
+	if err := store.InsertTask(ctx, active); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 13 * 1024 * 1024 * 1024},
+	}
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.DiskLowBytes = 10 * 1024 * 1024 * 1024
+	cfg.DiskTargetBytes = 20 * 1024 * 1024 * 1024
+	service := New(store, cfg, Options{Guest: guest, Resident: true, Clock: func() time.Time { return now }})
+	service.MarkReady()
+	err = service.checkAdmission(ctx, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_insufficient" {
+		t.Fatalf("low storage error = %#v", err)
+	}
+	stored, err := store.GetTask(ctx, map[string]any{"task_id": active.TaskID})
+	if err != nil || stored == nil || stored.State != stateActive || stored.LeaseExpiresAt == nil {
+		t.Fatalf("effective lease changed after rejection: task=%#v err=%v", stored, err)
+	}
+}
+
+func TestAdminMetricsDefaultAdmissionReflectsDrainAndStructuredUnknowns(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	service := New(store, cfg, Options{})
+	service.MarkReady()
+	if _, err := service.drain(ctx, true, protocol.Request{"session_id": "test-drain"}); err != nil {
+		t.Fatal(err)
+	}
+	metrics, err := service.adminMetrics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultAdmission := metrics["default_admission"].(map[string]any)
+	if defaultAdmission["ready"] != false {
+		t.Fatalf("default admission = %#v", defaultAdmission)
+	}
+	reasons := defaultAdmission["reasons"].([]any)
+	if len(reasons) == 0 || reasons[0].(map[string]any)["code"] != "draining" {
+		t.Fatalf("default admission reasons = %#v", reasons)
+	}
+	if metrics["admission_ready"] != false {
+		t.Fatalf("admission_ready = %#v", metrics["admission_ready"])
+	}
+	if metrics["reclaim_required"] != nil {
+		t.Fatalf("unmeasured reclaim_required = %#v", metrics["reclaim_required"])
+	}
+	if _, ok := metrics["disk_admission"].(map[string]any); !ok {
+		t.Fatalf("disk_admission = %#v", metrics["disk_admission"])
+	}
+	if _, ok := metrics["ct_memory"].(map[string]any); !ok {
+		t.Fatalf("ct_memory = %#v", metrics["ct_memory"])
+	}
+	if _, ok := metrics["instances"].(map[string]any); !ok {
+		t.Fatalf("instances = %#v", metrics["instances"])
+	}
+}
+
+func TestAdminMetricsPreservesPhysicalCapacityAndAdmissionCost(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024},
+	}
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacity, ok := metrics["capacity"].(map[string]any)
+	if !ok || capacity["verified"] != true || capacity["free_bytes"] != int64(90*1024*1024*1024) {
+		t.Fatalf("capacity = %#v", metrics["capacity"])
+	}
+	admission := metrics["default_admission"].(map[string]any)
+	if admission["request_cost_bytes"] != cfg.CreateCostBytes || admission["ready"] != false {
+		t.Fatalf("default admission = %#v", admission)
+	}
+	reasons := admission["reasons"].([]any)
+	if len(reasons) == 0 || reasons[0].(map[string]any)["code"] != "resource_unverified" {
+		t.Fatalf("default admission reasons = %#v", reasons)
+	}
+	disk, ok := metrics["disk_admission"].(map[string]any)
+	if !ok || disk["verified"] != true {
+		t.Fatalf("disk admission = %#v", metrics["disk_admission"])
+	}
+}
+
+func TestStatusReportsCachedNativeStateAndGuestAvailability(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session := "cached-status"
+	task := state.Task{
+		TaskID: "cached-status-task", SessionID: session, Generation: 2, State: stateCached,
+		InstanceName: "cached-status-instance", CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()),
+		ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: "{}",
+	}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	guest := &perInstanceGuest{
+		startupGuest: startupGuest{status: "Stopped"},
+		configs: map[string]map[string]any{
+			task.InstanceName: {
+				"config": map[string]any{
+					"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID,
+					"user.agent-vm.session": task.SessionID, "user.agent-vm.generation": "2",
+				}, "devices": map[string]any{}, "expanded_devices": map[string]any{},
+			},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	result, err := service.status(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["native_status"] != "Stopped" || result["guest_available"] != false {
+		t.Fatalf("cached status = %#v", result)
+	}
+	admin, err := service.adminStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := admin["tasks"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["native_status"] != "Stopped" {
+		t.Fatalf("admin status = %#v", admin)
 	}
 }
 
