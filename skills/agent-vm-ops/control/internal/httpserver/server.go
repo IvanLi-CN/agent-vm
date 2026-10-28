@@ -199,10 +199,10 @@ func prepareSocket(path string) error {
 		return errors.New("control socket path is empty")
 	}
 	parent := filepath.Dir(path)
-	if err := os.MkdirAll(parent, 0o700); err != nil {
+	if err := os.MkdirAll(parent, 0o750); err != nil {
 		return err
 	}
-	if err := os.Chmod(parent, 0o700); err != nil {
+	if err := os.Chmod(parent, 0o750); err != nil {
 		return err
 	}
 	info, err := os.Lstat(path)

@@ -103,6 +103,25 @@ func TestMissingDatabaseFailsClosed(t *testing.T) {
 	}
 }
 
+func TestCreateOpenDefersManagementMigration(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "legacy.sqlite3"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	usable, err := store.CachedImageUsable(context.Background(), strings.Repeat("a", 64))
+	if err != nil || !usable {
+		t.Fatalf("legacy cache compatibility = %v, err=%v", usable, err)
+	}
+	capabilities, err := store.Capabilities(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if capabilities != nil {
+		t.Fatalf("management capabilities = %#v, want deferred migration", capabilities)
+	}
+}
+
 func TestLeaseConditionsPreserveSubSecondPrecision(t *testing.T) {
 	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

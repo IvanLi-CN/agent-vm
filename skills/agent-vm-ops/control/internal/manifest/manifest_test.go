@@ -106,7 +106,7 @@ func validProductManifest(t *testing.T) string {
 		actions[action] = operationSpec()
 	}
 	rootValue := map[string]any{
-		"format": 3, "version": "1.0.0", "source_revision": strings.Repeat("b", 40), "protocol": 4,
+		"format": 3, "version": "1.0.0", "release_id": strings.Repeat("b", 40), "source_revision": strings.Repeat("b", 40), "protocol": 4,
 		"target":      map[string]any{"os": "linux", "arch": runtime.GOARCH},
 		"toolchain":   map[string]any{"bun": "1.4.4", "go": GoToolchain, "cgo_enabled": false},
 		"artifacts":   artifacts,
@@ -163,5 +163,16 @@ func TestLoadVerifiesProductManifest(t *testing.T) {
 	}
 	if metadata.Version != "1.0.0" || metadata.ReleaseID != strings.Repeat("b", 40) || metadata.SourceRevision != strings.Repeat("b", 40) {
 		t.Fatalf("product metadata identity = %#v", metadata)
+	}
+}
+
+func TestValidateStateCapabilitiesFailsClosedForLegacyMetadata(t *testing.T) {
+	legacy := Metadata{ManifestPresent: true}
+	if err := ValidateStateCapabilities(legacy, []string{"legacy-agent-vm-core@1", "managed-image-catalog@1"}); err == nil || !strings.Contains(err.Error(), "managed-image-catalog@1") {
+		t.Fatalf("legacy capability mismatch = %v", err)
+	}
+	modern := Metadata{ManifestPresent: true, StateReads: append([]string(nil), stateCapabilityMarkers...), StateWrites: append([]string(nil), stateCapabilityMarkers...)}
+	if err := ValidateStateCapabilities(modern, stateCapabilityMarkers); err != nil {
+		t.Fatal(err)
 	}
 }

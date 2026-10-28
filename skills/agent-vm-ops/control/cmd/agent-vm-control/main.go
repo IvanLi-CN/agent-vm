@@ -11,18 +11,23 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/httpserver"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/management"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/manifest"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/observe"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/scheduler"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/webadmin"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/webassets"
+	"golang.org/x/sys/unix"
 )
 
 var version = "agent-vm-control/dev"
@@ -68,6 +73,8 @@ func run(args []string) error {
 		return request(args[1:])
 	case "native-worker":
 		return nativeWorker(args[1:])
+	case "web":
+		return web(args[1:])
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
@@ -104,6 +111,32 @@ func serve(args []string) error {
 		return err
 	}
 	defer store.Close()
+	managementStateSupported := len(release.StateReads) > 0 && len(release.StateWrites) > 0
+	if cfg.Management.Enabled && !managementStateSupported {
+		return errors.New("management_disabled: installed release does not declare management state compatibility")
+	}
+	if managementStateSupported {
+		if err := store.EnsureManagementSchema(context.Background()); err != nil {
+			return fmt.Errorf("initialize management schema: %w", err)
+		}
+		if err := webadmin.CleanupUploadStaging(cfg.Management.Upload.StagingPath); err != nil {
+			return fmt.Errorf("clean upload staging: %w", err)
+		}
+		if err := store.SeedLegacyImage(context.Background(), cfg.ImageFingerprint); err != nil {
+			return fmt.Errorf("initialize managed image catalog: %w", err)
+		}
+		capabilities, err := store.Capabilities(context.Background())
+		if err != nil {
+			return fmt.Errorf("read state capabilities: %w", err)
+		}
+		capabilityNames := make([]string, 0, len(capabilities))
+		for _, capability := range capabilities {
+			capabilityNames = append(capabilityNames, capability.Name+"@"+strconv.FormatInt(capability.Version, 10))
+		}
+		if err := manifest.ValidateStateCapabilities(release, capabilityNames); err != nil {
+			return err
+		}
+	}
 	runner := native.NewRunner()
 	guest := native.NewIncusClient(runner, cfg.Project, native.ClientOptions{Profile: cfg.Profile, Network: cfg.Network, Pool: cfg.Pool})
 	var snapshots *observe.SnapshotStore
@@ -134,8 +167,56 @@ func serve(args []string) error {
 		}
 	}
 	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver(), Release: releaseMetadata})
+	imageBackend := management.NewIncusImageBackend(guest, cfg.Management.Upload.StagingPath, cfg.RequiredGuestTools)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	managementOptions := management.Options{
+		TrustedImageSourceIDs:  cfg.Management.TrustedImageSourceIDs,
+		UploadMaxBytes:         cfg.Management.Upload.MaxBytes,
+		UploadMinimumFreeBytes: cfg.Management.Upload.MinimumFreeBytes,
+		AvailableImageStorageBytes: func() (int64, error) {
+			return guest.StoragePoolAvailableBytes(context.Background())
+		},
+		CurrentSystemVersion: func(ctx context.Context) (string, error) {
+			epoch, err := store.StateEpoch(ctx)
+			if err != nil {
+				return "", err
+			}
+			return "system:" + epoch, nil
+		},
+		IsDraining: func(ctx context.Context) (bool, error) {
+			return service.IsDraining(ctx)
+		},
+		Clock:   time.Now,
+		Backend: imageBackend,
+		Actions: &webadmin.LifecycleActions{Service: service, Store: store},
+	}
+	if cfg.Management.Upload.Enabled {
+		managementOptions.AvailableStagingBytes = func() (int64, error) {
+			return availableStagingBytes(cfg.Management.Upload.StagingPath)
+		}
+	}
+	var managementService *management.Service
+	if cfg.Management.Enabled {
+		managementService = management.New(store, managementOptions)
+		if err := managementService.RecoverPendingOperations(ctx); err != nil {
+			return fmt.Errorf("recover management operations: %w", err)
+		}
+	}
+	if cfg.Management.Enabled {
+		authority, authorityErr := webadmin.NewAuthority(webadmin.AuthorityOptions{
+			Config: cfg.Management, Management: managementService, Lifecycle: service, Store: store, Snapshots: snapshots, ProductVersion: release.Version,
+		})
+		if authorityErr != nil {
+			return authorityErr
+		}
+		go func() {
+			if err := authority.Serve(ctx); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Error("management authority stopped", "error", err)
+				stop()
+			}
+		}()
+	}
 	schedulerInstance := scheduler.New(service)
 	go func() {
 		if err := httpserver.Serve(ctx, cfg.Socket, service, snapshots); err != nil && !errors.Is(err, context.Canceled) {
@@ -145,6 +226,53 @@ func serve(args []string) error {
 	}()
 	slog.Info("agent vm control started", "socket", cfg.Socket, "database", cfg.StateDB)
 	return schedulerInstance.Run(ctx)
+}
+
+func web(args []string) error {
+	flags := flag.NewFlagSet("web", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	configPath := flags.String("config", "/etc/agent-vm-native/web.json", "Web configuration path")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := config.LoadWeb(*configPath)
+	if err != nil {
+		return err
+	}
+	if !cfg.Management.Enabled {
+		return errors.New("management_disabled: Web management is disabled")
+	}
+	if os.Geteuid() == 0 || os.Geteuid() != cfg.Management.WebUID {
+		return errors.New("permission_denied: Web must run as the configured non-root service UID")
+	}
+	if err := webassets.Verify(); err != nil {
+		return err
+	}
+	server, err := webadmin.NewWebServer(cfg.Management, webadmin.NewAuthorityClient(cfg.Management.Authority.SocketPath))
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	return server.Serve(ctx)
+}
+
+func availableStagingBytes(path string) (int64, error) {
+	if path == "" {
+		return 0, errors.New("staging path is empty")
+	}
+	var stat unix.Statfs_t
+	if err := unix.Statfs(path, &stat); err != nil {
+		return 0, err
+	}
+	if stat.Bavail < 0 || stat.Bsize < 0 || uint64(stat.Bavail) > uint64(^uint64(0))/uint64(stat.Bsize) {
+		return 0, errors.New("staging capacity is out of range")
+	}
+	bytes := uint64(stat.Bavail) * uint64(stat.Bsize)
+	if bytes > uint64(^uint64(0)>>1) {
+		return 0, errors.New("staging capacity exceeds int64")
+	}
+	return int64(bytes), nil
 }
 
 func request(args []string) error {

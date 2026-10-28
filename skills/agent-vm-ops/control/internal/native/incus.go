@@ -2,14 +2,24 @@ package native
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 )
+
+var missingInstanceDiagnostic = regexp.MustCompile(`\b(?:instance|container|virtual machine)(?:\s+(?:"[^"]+"|'[^']+'|[A-Za-z0-9_.:@/-]+))?\s+(?:not found|does not exist)\b`)
+var missingImageDiagnostic = regexp.MustCompile(`\bimage(?:\s+(?:"[^"]+"|'[^']+'|[A-Za-z0-9_.:@/-]+))?\s+(?:not found|does not exist)\b`)
 
 type Guest interface {
 	Init(context.Context, string, string) error
@@ -37,6 +47,37 @@ type HealthProbe interface {
 type NetworkInventory interface {
 	NetworkIPs(context.Context) (map[string]struct{}, error)
 }
+
+type ImageInfo struct {
+	Fingerprint  string
+	Architecture string
+	InstanceType string
+	SizeBytes    int64
+	Properties   map[string]string
+}
+
+type ImageVerification struct {
+	Runtime    bool
+	SyncTool   bool
+	GuestReady bool
+}
+
+// UncertainError marks a native image mutation whose effect cannot be safely
+// inferred from the command result. The management journal must reconcile it
+// instead of replaying the mutation automatically.
+type UncertainError struct {
+	Cause error
+}
+
+func (err *UncertainError) Error() string {
+	if err == nil || err.Cause == nil {
+		return "native image outcome is uncertain"
+	}
+	return err.Cause.Error()
+}
+
+func (err *UncertainError) Unwrap() error   { return err.Cause }
+func (err *UncertainError) Uncertain() bool { return true }
 
 type IncusClient struct {
 	Runner  *Runner
@@ -68,9 +109,32 @@ func IsNotFound(err error) bool {
 	if !errors.As(err, &commandErr) {
 		return false
 	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || commandErr.Result.StdoutTruncated || commandErr.Result.StderrTruncated {
+		return false
+	}
 	diagnostic := strings.ToLower(string(commandErr.Result.Stderr) + " " + commandErr.Error())
-	for _, marker := range []string{"not found", "does not exist", "404"} {
-		if strings.Contains(diagnostic, marker) {
+	for _, line := range strings.Split(diagnostic, "\n") {
+		if strings.Contains(line, "no such instance") || strings.Contains(line, "no such container") || missingInstanceDiagnostic.MatchString(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsImageNotFound is the image-specific counterpart used by idempotent
+// catalog deletion. A generic project, remote, endpoint or HTTP 404 remains
+// an uncertain native result.
+func IsImageNotFound(err error) bool {
+	var commandErr *CommandError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || commandErr.Result.StdoutTruncated || commandErr.Result.StderrTruncated {
+		return false
+	}
+	diagnostic := strings.ToLower(string(commandErr.Result.Stderr) + " " + commandErr.Error())
+	for _, line := range strings.Split(diagnostic, "\n") {
+		if strings.Contains(line, "no such image") || missingImageDiagnostic.MatchString(line) {
 			return true
 		}
 	}
@@ -180,6 +244,274 @@ func (c *IncusClient) Init(ctx context.Context, image, name string) error {
 	}
 	args = append(args, "--config", "boot.autostart=false")
 	return c.run(ctx, args...)
+}
+
+// InitVerification creates a container without profiles or network devices.
+// Image suitability checks must not inherit production mounts, credentials or
+// network access from the lifecycle profile.
+func (c *IncusClient) InitVerification(ctx context.Context, image, name string) error {
+	args := []string{"init", image, name, "--no-profiles"}
+	if c.Pool != "" {
+		args = append(args, "--storage", c.Pool)
+	}
+	args = append(args, "--config", "boot.autostart=false")
+	return c.run(ctx, args...)
+}
+
+func (c *IncusClient) CopyImage(ctx context.Context, sourceID, fingerprint string) error {
+	if !incusRemotePattern.MatchString(sourceID) {
+		return errors.New("invalid image source ID")
+	}
+	if !imageFingerprintPattern.MatchString(fingerprint) {
+		return errors.New("invalid image fingerprint")
+	}
+	if err := c.run(ctx, "image", "copy", sourceID+":"+fingerprint, "local:"); err != nil {
+		return &UncertainError{Cause: err}
+	}
+	return nil
+}
+
+func (c *IncusClient) QueryRemoteImageSize(ctx context.Context, sourceID, fingerprint string) (int64, error) {
+	if !incusRemotePattern.MatchString(sourceID) {
+		return 0, errors.New("invalid image source ID")
+	}
+	if !imageFingerprintPattern.MatchString(fingerprint) {
+		return 0, errors.New("invalid image fingerprint")
+	}
+	value, err := c.json(ctx, "image", "info", sourceID+":"+fingerprint)
+	if err != nil {
+		return 0, err
+	}
+	info, err := parseImageInfo(value)
+	if err != nil {
+		return 0, err
+	}
+	if info.Fingerprint != fingerprint || info.SizeBytes <= 0 {
+		return 0, errors.New("Incus remote image response has no usable size")
+	}
+	return info.SizeBytes, nil
+}
+
+// StoragePoolAvailableBytes reads the Incus pool resource endpoint instead of
+// the control host filesystem. Image imports and VM disks may use a different
+// backing filesystem, so host statfs is not a safe admission signal.
+func (c *IncusClient) StoragePoolAvailableBytes(ctx context.Context) (int64, error) {
+	if c == nil || c.Pool == "" {
+		return 0, errors.New("storage pool is not configured")
+	}
+	value, err := c.json(ctx, "query", "/1.0/storage-pools/"+url.PathEscape(c.Pool)+"/resources")
+	if err != nil {
+		return 0, err
+	}
+	for _, candidate := range []map[string]any{value, nestedMap(value, "space"), nestedMap(value, "resources")} {
+		for _, key := range []string{"space_available", "available_bytes", "available"} {
+			if bytes, ok := integerValue(candidate[key]); ok && bytes >= 0 {
+				return bytes, nil
+			}
+		}
+	}
+	return 0, errors.New("incus storage pool response has no available capacity")
+}
+
+func nestedMap(value map[string]any, key string) map[string]any {
+	if nested, ok := value[key].(map[string]any); ok {
+		return nested
+	}
+	return nil
+}
+
+func integerValue(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		if typed < 0 || typed > float64(^uint64(0)>>1) || typed != float64(int64(typed)) {
+			return 0, false
+		}
+		return int64(typed), true
+	case json.Number:
+		parsed, err := typed.Int64()
+		return parsed, err == nil
+	case string:
+		parsed, err := strconv.ParseInt(typed, 10, 64)
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func (c *IncusClient) ImportImage(ctx context.Context, stagingPath, format string, metadata, rootfs []byte) (string, error) {
+	if format != "unified" && format != "split" {
+		return "", errors.New("invalid image format")
+	}
+	if format == "unified" && len(rootfs) != 0 {
+		return "", errors.New("unified image import cannot include a rootfs")
+	}
+	if format == "split" && len(rootfs) == 0 {
+		return "", errors.New("split image import requires a rootfs")
+	}
+	work, err := createImageStagingDirectory(stagingPath)
+	if err != nil {
+		return "", err
+	}
+	defer os.RemoveAll(work)
+
+	metadataPath := filepath.Join(work, "metadata")
+	if format == "unified" {
+		metadataPath = filepath.Join(work, "image")
+	}
+	if err := writePrivateImageFile(metadataPath, metadata); err != nil {
+		return "", err
+	}
+	args := []string{"image", "import", metadataPath}
+	if format == "split" {
+		rootfsPath := filepath.Join(work, "rootfs")
+		if err := writePrivateImageFile(rootfsPath, rootfs); err != nil {
+			return "", err
+		}
+		args = append(args, rootfsPath)
+	}
+	args = append(args, "local:")
+	result, err := c.command(ctx, args...)
+	if err != nil {
+		return "", &UncertainError{Cause: wrapCommandError(result, err)}
+	}
+	fingerprint, err := importedFingerprint(result.Stdout)
+	if err != nil {
+		return "", &UncertainError{Cause: err}
+	}
+	return fingerprint, nil
+}
+
+func (c *IncusClient) ImportImageFiles(ctx context.Context, stagingPath, format, metadataPath, rootfsPath string) (string, error) {
+	if format != "unified" && format != "split" {
+		return "", errors.New("invalid image format")
+	}
+	if format == "unified" && rootfsPath != "" {
+		return "", errors.New("unified image import cannot include a rootfs")
+	}
+	if format == "split" && rootfsPath == "" {
+		return "", errors.New("split image import requires a rootfs")
+	}
+	if err := validatePrivateStagedFile(stagingPath, metadataPath); err != nil {
+		return "", err
+	}
+	if format == "split" {
+		if err := validatePrivateStagedFile(stagingPath, rootfsPath); err != nil {
+			return "", err
+		}
+	}
+	args := []string{"image", "import", metadataPath}
+	if format == "split" {
+		args = append(args, rootfsPath)
+	}
+	args = append(args, "local:")
+	result, err := c.command(ctx, args...)
+	if err != nil {
+		return "", &UncertainError{Cause: wrapCommandError(result, err)}
+	}
+	fingerprint, err := importedFingerprint(result.Stdout)
+	if err != nil {
+		return "", &UncertainError{Cause: err}
+	}
+	return fingerprint, nil
+}
+
+func (c *IncusClient) QueryImage(ctx context.Context, fingerprint string) (ImageInfo, error) {
+	if !imageFingerprintPattern.MatchString(fingerprint) {
+		return ImageInfo{}, errors.New("invalid image fingerprint")
+	}
+	value, err := c.json(ctx, "query", "/1.0/images/"+url.PathEscape(fingerprint))
+	if err != nil {
+		return ImageInfo{}, err
+	}
+	return parseImageInfo(value)
+}
+
+func (c *IncusClient) DeleteImage(ctx context.Context, fingerprint string) error {
+	if !imageFingerprintPattern.MatchString(fingerprint) {
+		return errors.New("invalid image fingerprint")
+	}
+	if err := c.run(ctx, "image", "delete", "local:"+fingerprint); err != nil {
+		if IsImageNotFound(err) {
+			return nil
+		}
+		return &UncertainError{Cause: err}
+	}
+	return nil
+}
+
+func (c *IncusClient) VerifyImage(ctx context.Context, fingerprint string, requiredTools []string) (verification ImageVerification, returnErr error) {
+	if !imageFingerprintPattern.MatchString(fingerprint) {
+		return ImageVerification{}, errors.New("invalid image fingerprint")
+	}
+	name, err := verificationInstanceName()
+	if err != nil {
+		return ImageVerification{}, err
+	}
+	cleanup := func() error {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		err := c.Delete(cleanupCtx, name)
+		if err != nil && IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	defer func() {
+		if cleanupErr := cleanup(); cleanupErr != nil {
+			if returnErr == nil {
+				returnErr = &UncertainError{Cause: cleanupErr}
+				return
+			}
+			returnErr = &UncertainError{Cause: errors.Join(returnErr, cleanupErr)}
+		}
+	}()
+	verifyCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := c.InitVerification(verifyCtx, fingerprint, name); err != nil {
+		return ImageVerification{}, &UncertainError{Cause: err}
+	}
+	for _, limit := range []struct{ key, value string }{
+		{key: "limits.cpu", value: "1"},
+		{key: "limits.memory", value: "512MiB"},
+		{key: "limits.processes", value: "256"},
+	} {
+		if err := c.ConfigSet(verifyCtx, name, limit.key, limit.value); err != nil {
+			return ImageVerification{}, &UncertainError{Cause: err}
+		}
+	}
+	if err := c.DeviceSet(verifyCtx, name, "root", "size", "8GiB"); err != nil {
+		return ImageVerification{}, &UncertainError{Cause: err}
+	}
+	if err := c.Start(verifyCtx, name); err != nil {
+		return ImageVerification{}, &UncertainError{Cause: err}
+	}
+	tools := uniqueVerificationTools(requiredTools)
+	probeArgs := []string{"sh", "-c", verificationScript, "agent-vm-image-check"}
+	probeArgs = append(probeArgs, tools...)
+	result, err := c.Exec(verifyCtx, name, probeArgs, nil)
+	if err != nil {
+		return ImageVerification{}, &UncertainError{Cause: err}
+	}
+	seen := map[string]bool{}
+	for _, line := range strings.Split(string(result.Stdout), "\n") {
+		key, value, found := strings.Cut(strings.TrimSpace(line), "=")
+		if !found || (value != "true" && value != "false") {
+			continue
+		}
+		seen[key] = true
+		switch key {
+		case "runtime":
+			verification.Runtime = value == "true"
+		case "sync_tool":
+			verification.SyncTool = value == "true"
+		case "guest_ready":
+			verification.GuestReady = value == "true"
+		}
+	}
+	if !seen["runtime"] || !seen["sync_tool"] || !seen["guest_ready"] {
+		return ImageVerification{}, &UncertainError{Cause: errors.New("image verification output is incomplete")}
+	}
+	return verification, nil
 }
 
 func (c *IncusClient) ConfigSet(ctx context.Context, name, key, value string) error {
@@ -318,6 +650,165 @@ func (c *IncusClient) Exec(ctx context.Context, name string, argv []string, inpu
 	full = append(full, args...)
 	result, err := c.Runner.Run(ctx, full, input)
 	return result, wrapCommandError(result, err)
+}
+
+var (
+	imageFingerprintPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+	incusRemotePattern      = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
+)
+
+const verificationScript = `set -eu
+runtime=false
+sync_tool=false
+guest_ready=true
+missing=false
+for tool in "$@"; do
+  if command -v "$tool" >/dev/null 2>&1; then
+    if [ "$tool" = "bun" ]; then runtime=true; fi
+    if [ "$tool" = "rsync" ]; then sync_tool=true; fi
+  else
+    missing=true
+  fi
+done
+printf 'runtime=%s\n' "$runtime"
+printf 'sync_tool=%s\n' "$sync_tool"
+if [ "$missing" = true ]; then guest_ready=false; fi
+printf 'guest_ready=%s\n' "$guest_ready"`
+
+func createImageStagingDirectory(path string) (string, error) {
+	if err := validatePrivateStagingDirectory(path); err != nil {
+		return "", err
+	}
+	return os.MkdirTemp(path, ".agent-vm-image-import-")
+}
+
+func validatePrivateStagingDirectory(path string) error {
+	if path == "" || !filepath.IsAbs(path) {
+		return errors.New("image staging path is not configured")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 || !ownedByCurrentUser(info) {
+		return errors.New("image staging path is not a private directory")
+	}
+	return nil
+}
+
+func validatePrivateStagedFile(stagingPath, path string) error {
+	if err := validatePrivateStagingDirectory(stagingPath); err != nil {
+		return err
+	}
+	if path == "" || !filepath.IsAbs(path) {
+		return errors.New("image staging file is not configured")
+	}
+	relative, err := filepath.Rel(stagingPath, path)
+	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
+		return errors.New("image staging file is outside the private staging directory")
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || !ownedByCurrentUser(info) {
+		return errors.New("image staging file is not private")
+	}
+	return nil
+}
+
+func ownedByCurrentUser(info os.FileInfo) bool {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	return ok && uint64(stat.Uid) == uint64(os.Getuid())
+}
+
+func writePrivateImageFile(path string, data []byte) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	if _, err := file.Write(data); err != nil {
+		return err
+	}
+	return file.Chmod(0o600)
+}
+
+func importedFingerprint(output []byte) (string, error) {
+	for _, field := range strings.Fields(string(output)) {
+		if imageFingerprintPattern.MatchString(field) {
+			return field, nil
+		}
+	}
+	return "", errors.New("Incus import did not return an image fingerprint")
+}
+
+func parseImageInfo(value map[string]any) (ImageInfo, error) {
+	fingerprint, _ := value["fingerprint"].(string)
+	if !imageFingerprintPattern.MatchString(fingerprint) {
+		return ImageInfo{}, errors.New("Incus image response has an invalid fingerprint")
+	}
+	architecture, _ := value["architecture"].(string)
+	if architecture == "" {
+		return ImageInfo{}, errors.New("Incus image response has no architecture")
+	}
+	instanceType, _ := value["type"].(string)
+	if instanceType == "" {
+		instanceType = "container"
+	}
+	properties := map[string]string{}
+	if raw, ok := value["properties"].(map[string]any); ok {
+		for key, item := range raw {
+			property, ok := item.(string)
+			if !ok {
+				return ImageInfo{}, errors.New("Incus image response has malformed properties")
+			}
+			properties[key] = property
+		}
+	}
+	sizeBytes := int64(0)
+	if raw, ok := value["size"]; ok {
+		switch parsed := raw.(type) {
+		case float64:
+			if parsed < 0 || parsed > float64(^uint64(0)>>1) || parsed != float64(int64(parsed)) {
+				return ImageInfo{}, errors.New("Incus image response has an invalid size")
+			}
+			sizeBytes = int64(parsed)
+		case string:
+			value, err := strconv.ParseInt(parsed, 10, 64)
+			if err != nil || value < 0 {
+				return ImageInfo{}, errors.New("Incus image response has an invalid size")
+			}
+			sizeBytes = value
+		default:
+			return ImageInfo{}, errors.New("Incus image response has an invalid size")
+		}
+	}
+	return ImageInfo{Fingerprint: fingerprint, Architecture: architecture, InstanceType: instanceType, SizeBytes: sizeBytes, Properties: properties}, nil
+}
+
+func verificationInstanceName() (string, error) {
+	var suffix [6]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return "", err
+	}
+	return "agent-vm-image-check-" + hex.EncodeToString(suffix[:]), nil
+}
+
+func uniqueVerificationTools(values []string) []string {
+	result := []string{"bun", "rsync"}
+	seen := map[string]struct{}{"bun": {}, "rsync": {}}
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		if _, exists := seen[value]; exists {
+			continue
+		}
+		seen[value] = struct{}{}
+		result = append(result, value)
+	}
+	return result
 }
 
 func ParseStatus(value map[string]any) (string, error) {

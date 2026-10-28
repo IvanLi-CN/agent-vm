@@ -4,7 +4,7 @@
 
 This topic defines a one-shot client and control process for session-owned Linux containers on a configured Incus host. The public repository documents the lifecycle contract and ships the implementation; deployments provide their own project, container image, network, address pool, storage path, state database and control address through explicit configuration.
 
-The design excludes public brokers, arbitrary HTTP gateways, polling by the client, implicit keepalives, shared host workspaces, exported archives and guarantees that survive lease expiry. The control environment includes one protected Go resident service; its internal UDS API and scheduler are implementation boundaries, not a new public client surface.
+The design excludes public brokers, arbitrary HTTP gateways, polling by the client, implicit keepalives, shared host workspaces, exported archives and guarantees that survive lease expiry. The control environment includes one protected Go resident service; its internal UDS API and scheduler are implementation boundaries, not a client surface. The separate built-in management console has a same-origin browser API, but it is reachable only through its configured authenticated proxy and does not expose the internal control API.
 
 The deployment topology is layered: the local Codex client reaches a configured Agent VM control endpoint; the control environment runs inside the observed CT109 LXC; the control environment owns session-scoped Incus system containers; and the physical or virtual source below CT109 is outside the verified public boundary. A control endpoint is an entry path, not evidence of the underlying host or its rebuild authority. The concrete address and live inventory remain in protected deployment records.
 
@@ -12,7 +12,7 @@ The deployment topology is layered: the local Codex client reaches a configured 
 
 Session-scoped requests carry a `session_id`; the sessionless read-only `admin-metrics` request omits it and rejects both `session_id` and `operation_id`. The CLI selects a session from explicit `--session-id` first and `AGENT_VM_SESSION_ID` second for session-scoped actions. A missing value returns `missing_session` before any remote write. Session identity is ownership metadata and is not an authentication mechanism. The client sends one versioned JSON request over the configured control path and emits one JSON response; diagnostics go to stderr. Format-1 client views use the legacy Bun control entry. Format-2 client views select the fixed `legacy-bun` or `go-request` transport; `go-request` retains SSH as a compatibility adapter while the remote Go request process sends the same body over the protected control UDS.
 
-Protocol 4 is required by both client and control. Mutations include an operation ID and lease generation. The control persists requests and outcomes, rejects incompatible or conflicting retries, and never replays an uncertain native mutation automatically.
+Protocol 4 is required by both client and control. Mutations include an operation ID and lease generation. The control persists requests and outcomes, rejects incompatible or conflicting retries, and never replays an uncertain native mutation automatically. The management console uses the independently versioned contract in [the management API](contracts/management-api.yaml); adding that API does not change CLI protocol 4.
 
 ## Lifecycle
 
@@ -40,13 +40,29 @@ Manual garbage collection is dry-run by default and selects only stopped managed
 
 The Go control service remains the sole authority for Incus operations, durable lifecycle state, lease generations, capacity admission, native mappings, observation snapshots and maintenance. Its in-process scheduler owns lease expiry, startup compensation, bounded retries and cache age-GC; systemd starts and restarts the service but is not the durable scheduler. The local `agent-vm` CLI remains a versioned request client; publication, update and rollback are operator-owned deployment actions and are not public CLI lifecycle commands. Unattended control-plane updates are disabled by default.
 
-A control-plane release is a logical compatibility unit containing the local client, the compatibility bridge or Go control binary, systemd unit assets, and a release manifest. Production format 3 records one product SemVer, exact `source_revision`, target/toolchain, artifact checksums and modes, protocol 4, and per-operation request/response/semantic compatibility in each supported direction. Formats 1 and 2 remain read-only migration and necessary rollback inputs; they are not new production output. Deployment configuration, credentials, connection material, state database and WAL/journals, locks, Incus container data, and guest images are outside the release.
+A control-plane release is a logical compatibility unit containing the local client, the compatibility bridge or Go control binary, systemd unit assets, and a release manifest. Production format 3 records one product SemVer, exact `source_revision`, target/toolchain, artifact checksums and modes, protocol 4, and per-operation request/response/semantic compatibility in each supported direction. A management-enabled package uses format 4, which adds declared durable state read/write capabilities and the embedded management assets. Formats 1 through 3 remain read-only migration and necessary rollback inputs; they are not new management-enabled production output. Deployment configuration, credentials, connection material, state database and WAL/journals, locks, Incus container data, and guest images are outside the release.
 
 Compatible operations may continue across different release revisions with a structured warning. Compatibility is not inferred from parseability: an unsupported action, incompatible schema or semantic change, invalid checksum, or incompatible protocol MUST fail before any durable or native effect. A compatible evolution preserves the established protocol contract; a breaking evolution may require a new protocol and an explicit client update.
 
+Management state uses versioned capability markers. A release may activate against a database only when it declares support to read and write every marker present. Formats 1 through 3 imply support for the pre-management state only. An incompatible package rollback is refused before pointer activation or service start; the database is never downgraded to make an older package appear compatible.
+
+## Management console and API
+
+The console manages existing Agent session VMs, managed images, capacity, operation history, audit and fixed system-maintenance actions. It has no manual VM creation, generic Incus, host/PVE, shell or Web terminal surface. Its five pages are Overview, VMs, Images, Operations & Audit, and System. The first authenticated view is Overview.
+
+The browser API is same-origin `/api/v1` and is independent of protocol 4. Forward Auth, peer-UID checks on the proxy and management UDS boundaries, a stable administrator subject allowlist, exact Origin validation and session-bound CSRF protection are mandatory. If any required authentication or resource limit configuration is incomplete, the management listener stays disabled. The [management contract](contracts/management-api.md) and [OpenAPI document](contracts/management-api.yaml) define the wire shapes and deployment inputs.
+
+The UI supports `zh-CN` and `en`. A saved preference takes priority over browser language; English is the fallback. All interface and accessible copy is localized. Identifiers, fingerprints, stable error codes and user-authored reasons remain unchanged. The API returns locale-neutral values, preserves observation freshness and represents unknown measurements as unknown rather than zero.
+
+Management mutations use a UUID operation identity, an operator reason and a resource version; VM actions also carry the exact session generation. Each action uses a preview-bound confirmation token and the control authority revalidates all preconditions before effects. The operation and audit APIs preserve actor, target, reason, phase and outcome. An uncertain result remains queryable and is never automatically replayed with a new operation identity.
+
+Image import is limited to configured trusted sources and size-bounded local Incus container packages. Integrity and Agent VM suitability are distinct checks. A selected default must be verified, except that the pre-existing configured default is preserved as a visible legacy-compatibility default until an administrator chooses a verified replacement. Existing tasks and caches retain their pinned image fingerprint. The authority serializes default selection and reference changes; the default affects new sessions only, and any default, active, cached, releasing, pending-creation or verification reference blocks deletion.
+
+The first management state migration is additive and transactional. It preserves tasks, generations, leases, ports, reservations and protocol-4 journals. The state-capability markers, legacy-default seeding, installer preflight and full-package rollback rules are defined in the [management contract](contracts/management-api.md) and [release contract](contracts/release.md).
+
 Remote control-script and unit publication MUST use the configured control SSH entry, an operator-only identity or narrowly scoped root-owned deployment wrapper, a private staging area, and atomic activation. It MUST NOT add an sshd, HTTP gateway, PVE path, or Agent VM guest permission. Remote publication is activated and verified before the local client is updated; a local-only client update does not require drain.
 
-Remote publication MUST enter admission drain before activation, block new acquisition and restart admission, keep expiry/reconciliation/cache-cleanup timers available, and allow in-flight requests to finish without force-killing them. It MUST wait for pending operations and task transitions to converge, verify health, reconciliation, and timer state, and exit drain only after successful validation. A pre-activation failure leaves the current release untouched. A post-activation health failure permits one bounded rollback to the previous verified release; an unsuccessful rollback keeps admission drained and MUST NOT rewrite state, generations, or uncertain operations. At least the current and previous verified releases MUST be retained with their manifests and checksums.
+Remote publication MUST enter admission drain before activation, block new acquisition and restart admission, keep expiry/reconciliation/cache-cleanup timers available, and allow in-flight requests to finish without force-killing them. It MUST wait for pending operations and task transitions to converge, verify health, reconciliation, and timer state, and exit drain only after successful validation through the active release transaction's release-scoped session; a browser maintenance request MUST NOT reopen admission. The first management-aware release MUST be able to claim an ownerless drain left by the previous protocol-4 controller, while a different release or browser request MUST NOT replace an active release owner. Queued management work that has not crossed the native-effect barrier remains retryable and MUST be durably fenced from starting while drain is active. A pre-activation failure leaves the current release untouched. A post-activation health failure permits one bounded rollback to the previous verified release; an unsuccessful rollback keeps admission drained and MUST NOT rewrite state, generations, or uncertain operations. At least the current and previous verified releases MUST be retained with their manifests and checksums.
 
 ## Requirements
 
@@ -94,6 +110,26 @@ The deployment observation surface MUST provide separate capacity/admission and 
 
 The deployment scrape bridge MUST schedule `admin-metrics` and `admin-status` as independent observation lanes. A pending or failed inventory read MUST NOT remove the latest valid capacity metric families, and a pending or failed capacity read MUST NOT retain task rows from an unsuccessful inventory scrape. A retained source snapshot MUST keep its original observation timestamp and expose source-specific health or freshness failure; the bridge MUST NOT replace unavailable values with fabricated zeroes.
 
+### REQ-AGENT-VM-020 - Authenticated management boundary
+
+The built-in management console MUST run as a dedicated non-root Web process and MUST call the sole Go control authority through a dedicated management UDS. The Web process MUST accept Forward Auth identity only from the configured proxy peer UID and MUST require a stable subject in the configured administrator allowlist. The authority MUST independently check the Web peer UID, administrator subject and fixed action. The browser-facing listener MUST have no public TCP bypass, direct database access, Incus credential, arbitrary command route or arbitrary internal-control forwarding. An incomplete authentication, origin, source-allowlist, upload-limit or staging-reserve configuration MUST leave management disabled.
+
+### REQ-AGENT-VM-021 - Management API and localized interface
+
+The management console MUST expose only the same-origin `/api/v1` surface defined by the OpenAPI contract. It MUST reject unknown fields and unsupported actions, use bounded cursor pagination, preserve exact byte and generation values, return structured field-whitelisted errors, and expose source freshness and unknown values without coercing them to healthy zeroes. The UI MUST support `zh-CN` and `en` with saved choice, browser-language and English-fallback priority; accessible names, confirmations and errors MUST be translated while technical identifiers and user-entered reasons remain unchanged.
+
+### REQ-AGENT-VM-022 - Managed actions and audit recovery
+
+Every management mutation MUST carry a UUID operation ID, a bounded non-empty reason and the current target version; VM actions MUST also carry the expected generation. Submission MUST use a confirmation token bound to the authenticated subject, exact target, action, parameters and target version, and the authority MUST recheck authorization and state before effects. Identical operation retries MUST resolve to the same durable operation; a conflicting reuse MUST fail. Uncertain native outcomes MUST remain queryable and MUST NOT be replayed automatically. Audit records MUST preserve actor, reason, target, phase and outcome without exposing raw command diagnostics, credentials or private paths.
+
+### REQ-AGENT-VM-023 - Managed image safety and session pinning
+
+Managed images MUST use immutable fingerprints, allowlisted source identities, bounded local package uploads, independent integrity and suitability results, and explicit reference counts. The configured legacy default MUST be preserved during migration and shown as unverified until replaced; only a fully verified image may be selected through the management API. Default selection MUST affect new sessions only. Existing tasks and caches MUST retain their exact fingerprint. Default, active, cached, releasing, pending-creation and verification references MUST block deletion, with reference checks serialized against image operations.
+
+### REQ-AGENT-VM-024 - Management state and rollback compatibility
+
+Management schema changes MUST be additive, transactional and recorded by versioned state-capability markers. Migration MUST preserve task identity, generations, leases, ports, reservations and existing protocol-4 journal state. A package may activate only when it declares support to read and write every capability marker in the state database. Packages without a capability declaration MUST be treated as supporting pre-management state only. An incompatible rollback MUST be rejected before changing active package pointers or starting the target; databases MUST NOT be downgraded or recreated to force compatibility. Protocol 4 and existing CLI request/response behavior MUST remain unchanged.
+
 ## Synchronization and retrieval
 
 The TypeScript/Bun synchronization helper transfers tracked, unignored worktree files to its own guest source directory and atomically replaces only helper-owned content. Git selection, manifests and native filesystem access preserve byte paths, symlink targets, modes and hashes; unsupported local root-path representation fails explicitly. It rejects submodules, symlink parents, reserved ownership filenames and unsafe names before transfer. The guest transaction is an in-memory Bun action guarded by the managed image's runtime/native prerequisites and an external execution deadline; missing Bun or atomic capability fails closed. Native locks, exclusive preparation, baseline identity comparison, fsync and atomic directory exchange preserve the current source and adjacent results across conflicts and failures. An uncertain commit keeps its source marker and precise recovery record and returns exit 75 rather than an inferred rollback. The [CLI contract](contracts/cli.md#source-synchronization-transaction) defines execution bounds, ownership and recovery. Export streams a tar archive directly to the caller and does not create a server-side archive.
@@ -110,6 +146,11 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 - `VER-AGENT-VM-017` covers: `REQ-AGENT-VM-017` through [the release contract](contracts/release.md), [the deployment boundary](../../skills/agent-vm-ops/references/deployment.md), [the agent-vm-ops Skill](../../skills/agent-vm-ops/SKILL.md), the public boundary checks, and release manifest permission tests.
 - `VER-AGENT-VM-018` covers: `REQ-AGENT-VM-018` through the CPU startup-pressure section of [the operations runbook](OPERATIONS.md), [the CLI contract](contracts/cli.md), [the observability contract](contracts/observability.md), and the deterministic CPU pressure admission tests.
 - `VER-AGENT-VM-019` covers: `REQ-AGENT-VM-019` through the capacity and inventory sections of [the observability contract](contracts/observability.md), [the capacity and inventory observability ADR](../../adr/0033-agent-vm-capacity-and-inventory-observability.md), [the dashboard solution](../../solutions/agent-vm/observability-dashboard.md), and the public dashboard validator.
+- `VER-AGENT-VM-020` covers: `REQ-AGENT-VM-020` through [the management contract](contracts/management-api.md), [the Web management boundary ADR](../../adr/0042-agent-vm-web-management-boundary.md), and the authentication and process-boundary checks.
+- `VER-AGENT-VM-021` covers: `REQ-AGENT-VM-021` through [the OpenAPI contract](contracts/management-api.yaml), its shared examples, [PRODUCT.md](../../../PRODUCT.md), [DESIGN.md](../../../DESIGN.md), and bilingual/API contract checks.
+- `VER-AGENT-VM-022` covers: `REQ-AGENT-VM-022` through [the management contract](contracts/management-api.md), the OpenAPI operation/error schemas, and operation recovery and audit checks.
+- `VER-AGENT-VM-023` covers: `REQ-AGENT-VM-023` through [the management contract](contracts/management-api.md), [the session-pinned image ADR](../../adr/0041-agent-vm-session-pinned-image-identity.md), the CLI contract and image-reference concurrency checks.
+- `VER-AGENT-VM-024` covers: `REQ-AGENT-VM-024` through [the management contract](contracts/management-api.md), [the release contract](contracts/release.md), [the CLI contract](contracts/cli.md), and migration and package-compatibility checks.
 
 ## Related ADRs
 
@@ -120,11 +161,15 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 - [Agent VM capacity and inventory observability](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)
 - [Agent VM Go resident control runtime](../../adr/0037-agent-vm-go-control-runtime.md)
 - [Native Incus Agent container lifecycle](../../adr/0038-native-incus-agent-container-lifecycle.md)
+- [Agent VM session-pinned image identity](../../adr/0041-agent-vm-session-pinned-image-identity.md)
+- [Agent VM Web management boundary](../../adr/0042-agent-vm-web-management-boundary.md)
 
 ## Related material
 
 - [CLI contract](contracts/cli.md)
 - [Control-plane release contract](contracts/release.md)
+- [Management API](contracts/management-api.yaml)
+- [Management implementation contract](contracts/management-api.md)
 - [Reclamation design](RECLAMATION-DESIGN.md)
 - [Retention design](RETENTION-DESIGN.md)
 - [Observability contract](contracts/observability.md)

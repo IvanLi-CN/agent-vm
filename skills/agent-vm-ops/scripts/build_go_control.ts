@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 const moduleRoot = resolve(import.meta.dir, "../control");
-const usage = "usage: build_go_control.ts --source-revision <40-hex> --target <linux/amd64|linux/arm64> --output <absolute-path> [--version <semver>]";
+const usage = "usage: build_go_control.ts --source-revision <40-hex> --target <linux/amd64|linux/arm64> --output <absolute-path> [--version <semver>] [--with-web-assets]";
 const args = process.argv.slice(2);
 const value = (name: string): string => {
   const index = args.indexOf(name);
@@ -25,6 +25,7 @@ if (version !== "dev" && !/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za
 const rawOutput = value("--output");
 if (!isAbsolute(rawOutput)) throw new Error("output must be absolute");
 const output = resolve(rawOutput);
+const withWebAssets = args.includes("--with-web-assets");
 mkdirSync(dirname(output), { recursive: true, mode: 0o750 });
 const temporary = `${output}.tmp-${process.pid}`;
 rmSync(temporary, { force: true });
@@ -34,6 +35,7 @@ const result = Bun.spawnSync(
     "build",
     "-trimpath",
     "-buildvcs=false",
+	    ...(withWebAssets ? ["-tags=releaseassets"] : []),
     `-ldflags=-X main.version=agent-vm-control/${version}`,
     "-o",
     temporary,
@@ -52,4 +54,4 @@ if (result.exitCode !== 0) {
 }
 chmodSync(temporary, 0o755);
 renameSync(temporary, output);
-console.log(JSON.stringify({ output, target, version, source_revision: revision, cgo_enabled: false }));
+console.log(JSON.stringify({ output, target, version, source_revision: revision, cgo_enabled: false, web_assets: withWebAssets }));

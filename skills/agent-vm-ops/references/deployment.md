@@ -10,11 +10,14 @@ If the control environment must be rebuilt or recovered, preserve the state and 
 | Compatibility bridge | `/opt/agent-vm-native/agent_vm_control_bridge.ts`; format-1 releases may retain the legacy Bun controller |
 | Control interpreter | Go binary for format 2; root-owned `/usr/local/bin/bun` remains required only for the format-1 Bun release and client package |
 | Configuration | root-owned JSON at `/etc/agent-vm-native/config.json` |
+| Web configuration | root-owned, `agent-vm-web`-group-readable JSON at `/etc/agent-vm-native/web.json` when management is enabled |
 | Durable state | configured local state database and lock directory |
-| Native units | `agent-vm-native.service` for format 2; format-1 timer units remain only during compatibility support |
+| Native units | `agent-vm-native.service` and the optional `agent-vm-web.service` for format 4; format-1 timer units remain only during compatibility support |
 | Local client | complete eight-file Bun package and dependency-hashed `client-release.json`; protected session state under the operator's chosen XDG paths |
 
 The deployment supplies the control alias, Incus project/profile/image, network ACL, control address, guest address pool, host port range, storage path, state database and timer directory through a copied or derived configuration. `config.json.example` is a generic schema/template, not deployment evidence; for the locked deployment policy the installed configuration must set `memory_budget_mib=32768`, `memory_overcommit_ratio=2` and `cpu_startup_pressure_full_avg10_percent=50`. The latter is a startup-schedulability threshold, not a logical CPU ceiling. Placeholder values must be replaced before installation; missing or invalid values fail closed.
+
+When management is enabled, create the dedicated `agent-vm-web` system group before starting the units. Install the Web configuration as `root:agent-vm-web` with mode `0640`, and keep the containing directory at `root:agent-vm-web` mode `0750`. The Web unit reapplies these fixed metadata permissions at startup; it does not grant the Web UID access to the primary control configuration, SQLite state or generic Incus administration. The native unit runs as root with `agent-vm-web` as its effective group so its dedicated authority socket is `root:agent-vm-web` mode `0660` inside a `root:agent-vm-web` mode `0750` runtime directory.
 
 The deployment-independent Incus project/profile baseline and its read-only-by-default initializer are documented in [the initialization reference](initialization.md). Apply it only during an explicitly authorized maintenance task with admission drain active; daily requests never edit project policy.
 

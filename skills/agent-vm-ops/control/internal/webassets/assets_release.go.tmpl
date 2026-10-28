@@ -1,0 +1,19 @@
+//go:build releaseassets
+
+package webassets
+
+import (
+	"embed"
+	"io/fs"
+)
+
+// The release builder replaces this template with a deterministic generated
+// source file and the static directory before compiling the control binary.
+// This placeholder is intentionally not valid release input.
+var embedded embed.FS
+
+var Files fs.FS
+
+func Verify() error {
+	return VerifyFS(Files, nil)
+}

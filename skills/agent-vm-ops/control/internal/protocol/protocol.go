@@ -44,6 +44,26 @@ type Error struct {
 
 func (e *Error) Error() string { return e.Code + ": " + e.Message }
 
+// Uncertain marks errors where a native side effect may have happened but the
+// durable outcome cannot be proven. Management operations must retain these
+// results as outcome_unknown instead of presenting a retryable failure.
+func (e *Error) Uncertain() bool {
+	if e == nil {
+		return false
+	}
+	if detail, ok := e.Detail.(map[string]any); ok {
+		if verified, present := detail["outcome_verified"]; present && verified == false {
+			return true
+		}
+	}
+	switch e.Code {
+	case "restart_partial", "resize_partial", "cleanup_incomplete", "mapping_unverified", "network_unverified", "native_unavailable", "state_unverified", "operation_unverified", "startup_reconcile_required", "sqlite_unavailable":
+		return true
+	default:
+		return false
+	}
+}
+
 func NewError(code, message string, detail any) *Error {
 	return &Error{Code: code, Message: message, Detail: detail}
 }

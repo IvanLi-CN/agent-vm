@@ -19,12 +19,20 @@ import (
 )
 
 const (
-	Format        = 2
-	ProductFormat = 3
-	Protocol      = 4
-	GoToolchain   = "go1.27.3"
-	maxBytes      = 2 * 1024 * 1024
+	Format              = 2
+	LegacyProductFormat = 3
+	ProductFormat       = 4
+	Protocol            = 4
+	GoToolchain         = "go1.27.3"
+	maxBytes            = 2 * 1024 * 1024
 )
+
+var stateCapabilityMarkers = []string{
+	"legacy-agent-vm-core@1",
+	"managed-image-catalog@1",
+	"management-operation-audit@1",
+	"session-image-binding@1",
+}
 
 var actionNames = []string{
 	"acquire", "admin-gc", "admin-metrics", "admin-reconcile", "admin-session-list", "admin-status",
@@ -75,9 +83,11 @@ type Metadata struct {
 	Actions           map[string]ActionMetadata
 	ManifestPresent   bool
 	ArtifactsVerified bool
+	StateReads        []string
+	StateWrites       []string
 }
 
-var fixedArtifacts = []artifactSpec{
+var productLegacyArtifacts = []artifactSpec{
 	{name: "agent_vm.ts", path: "agent_vm.ts", role: "client", mode: 0o755},
 	{name: "byte-fs.ts", path: "byte-fs.ts", role: "support", mode: 0o644},
 	{name: "client-io.ts", path: "client-io.ts", role: "support", mode: 0o644},
@@ -90,6 +100,14 @@ var fixedArtifacts = []artifactSpec{
 	{name: "agent-vm-control", path: "bin/agent-vm-control", role: "control", mode: 0o755},
 	{name: "unit:agent-vm-native.service", path: "systemd/agent-vm-native.service", role: "unit", mode: 0o644},
 }
+
+var productArtifacts = append(append([]artifactSpec(nil), productLegacyArtifacts...),
+	artifactSpec{name: "unit:agent-vm-web.service", path: "systemd/agent-vm-web.service", role: "unit", mode: 0o644},
+	artifactSpec{name: "web-config-example", path: "config/agent-vm-web.json.example", role: "support", mode: 0o640},
+	artifactSpec{name: "web-assets-manifest", path: "web-assets.manifest.json", role: "support", mode: 0o644},
+)
+
+var fixedArtifacts = productLegacyArtifacts
 
 var artifactNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.:@-]{1,120}$`)
 var revisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -114,7 +132,7 @@ func LoadMetadata(path string) (Metadata, error) {
 	}
 	format, _ := integerValue(root["format"])
 	var validateErr error
-	if format == ProductFormat {
+	if format == LegacyProductFormat || format == ProductFormat {
 		validateErr = validateProduct(root, directory)
 	} else {
 		validateErr = validate(root, directory)
@@ -172,7 +190,7 @@ func metadataFromRoot(root map[string]any) (Metadata, error) {
 	releaseID, releaseOK := root["release_id"].(string)
 	sourceRevision, sourceOK := root["source_revision"].(string)
 	version, _ := root["version"].(string)
-	if format == ProductFormat {
+	if format == LegacyProductFormat || format == ProductFormat {
 		releaseID = sourceRevision
 		releaseOK = sourceOK
 	}
@@ -206,7 +224,16 @@ func metadataFromRoot(root map[string]any) (Metadata, error) {
 		}
 		actions[action] = ActionMetadata{Request: request, Response: response, RequestWindow: requestWindow, ResponseWindow: responseWindow}
 	}
-	return Metadata{Version: version, ReleaseID: releaseID, SourceRevision: sourceRevision, Protocol: Protocol, Transport: transport, Actions: actions}, nil
+	metadata := Metadata{Version: version, ReleaseID: releaseID, SourceRevision: sourceRevision, Protocol: Protocol, Transport: transport, Actions: actions}
+	if format == ProductFormat {
+		reads, writes, err := stateCompatibility(root["state_compatibility"])
+		if err != nil {
+			return Metadata{}, err
+		}
+		metadata.StateReads = reads
+		metadata.StateWrites = writes
+	}
+	return metadata, nil
 }
 
 func metadataSchema(value any) (Schema, error) {
@@ -317,11 +344,16 @@ func validate(root map[string]any, directory string) error {
 }
 
 func validateProduct(root map[string]any, directory string) error {
-	if !sameKeys(root, []string{"actions", "artifacts", "client_view", "format", "protocol", "source_revision", "target", "toolchain", "version"}) {
-		return fmt.Errorf("manifest_invalid: product manifest shape is incomplete or contains extra fields")
+	format, formatOK := integerValue(root["format"])
+	if !formatOK || (format != LegacyProductFormat && format != ProductFormat) {
+		return fmt.Errorf("manifest_format_unsupported: manifest format must be %d or %d", LegacyProductFormat, ProductFormat)
 	}
-	if value, ok := integerValue(root["format"]); !ok || value != ProductFormat {
-		return fmt.Errorf("manifest_format_unsupported: manifest format must be %d", ProductFormat)
+	expectedKeys := []string{"actions", "artifacts", "client_view", "format", "protocol", "release_id", "source_revision", "target", "toolchain", "version"}
+	if format == ProductFormat {
+		expectedKeys = append(expectedKeys, "state_compatibility")
+	}
+	if !sameKeys(root, expectedKeys) {
+		return fmt.Errorf("manifest_invalid: product manifest shape is incomplete or contains extra fields")
 	}
 	if value, ok := integerValue(root["protocol"]); !ok || value != Protocol {
 		return fmt.Errorf("manifest_protocol_mismatch: manifest protocol must be %d", Protocol)
@@ -331,7 +363,8 @@ func validateProduct(root map[string]any, directory string) error {
 		return fmt.Errorf("manifest_invalid: product version must be valid SemVer 2.0.0")
 	}
 	source, ok := root["source_revision"].(string)
-	if !ok || !revisionPattern.MatchString(source) {
+	releaseID, releaseOK := root["release_id"].(string)
+	if !ok || !revisionPattern.MatchString(source) || !releaseOK || releaseID != source {
 		return fmt.Errorf("manifest_invalid: source revision is invalid")
 	}
 	if err := validateProductTarget(root["target"]); err != nil {
@@ -363,9 +396,14 @@ func validateProduct(root map[string]any, directory string) error {
 	if !reflect.DeepEqual(view["actions"], root["actions"]) {
 		return fmt.Errorf("manifest_invalid: product client_view actions differ from manifest actions")
 	}
-	artifacts, err := validateProductArtifacts(root["artifacts"])
+	artifacts, err := validateProductArtifacts(root["artifacts"], format)
 	if err != nil {
 		return err
+	}
+	if format == ProductFormat {
+		if _, _, err := stateCompatibility(root["state_compatibility"]); err != nil {
+			return err
+		}
 	}
 	for _, artifact := range artifacts {
 		path := filepath.Join(directory, filepath.FromSlash(artifact.path))
@@ -411,13 +449,17 @@ func validateProductToolchain(value any) error {
 	return nil
 }
 
-func validateProductArtifacts(value any) ([]checkedArtifact, error) {
+func validateProductArtifacts(value any, format int64) ([]checkedArtifact, error) {
 	values, ok := value.([]any)
-	if !ok || len(values) != len(fixedArtifacts) {
+	expectedArtifacts := productLegacyArtifacts
+	if format == ProductFormat {
+		expectedArtifacts = productArtifacts
+	}
+	if !ok || len(values) != len(expectedArtifacts) {
 		return nil, fmt.Errorf("manifest_artifact_set_invalid: product artifact set is incomplete")
 	}
-	expected := make(map[string]artifactSpec, len(fixedArtifacts))
-	for _, artifact := range fixedArtifacts {
+	expected := make(map[string]artifactSpec, len(expectedArtifacts))
+	for _, artifact := range expectedArtifacts {
 		expected[artifact.name+"\x00"+artifact.path] = artifact
 	}
 	seenNames := make(map[string]bool, len(values))
@@ -452,6 +494,72 @@ func validateProductArtifacts(value any) ([]checkedArtifact, error) {
 		return nil, fmt.Errorf("manifest_artifact_set_invalid: product artifact set differs from the fixed allowlist")
 	}
 	return result, nil
+}
+
+func stateCompatibility(value any) ([]string, []string, error) {
+	object, ok := value.(map[string]any)
+	if !ok || !sameKeys(object, []string{"reads", "writes"}) {
+		return nil, nil, fmt.Errorf("manifest_state_compatibility_invalid: state_compatibility shape is invalid")
+	}
+	parse := func(value any, label string) ([]string, error) {
+		values, ok := value.([]any)
+		if !ok || len(values) != len(stateCapabilityMarkers) {
+			return nil, fmt.Errorf("manifest_state_compatibility_invalid: %s must declare all state capability markers", label)
+		}
+		result := make([]string, len(values))
+		for index, raw := range values {
+			item, ok := raw.(string)
+			if !ok || item != stateCapabilityMarkers[index] {
+				return nil, fmt.Errorf("manifest_state_compatibility_invalid: %s must use the fixed sorted marker set", label)
+			}
+			result[index] = item
+		}
+		return result, nil
+	}
+	reads, err := parse(object["reads"], "state_compatibility.reads")
+	if err != nil {
+		return nil, nil, err
+	}
+	writes, err := parse(object["writes"], "state_compatibility.writes")
+	if err != nil {
+		return nil, nil, err
+	}
+	return reads, writes, nil
+}
+
+// ValidateStateCapabilities rejects activation when the candidate manifest
+// cannot preserve every capability already present in the migrated database.
+func ValidateStateCapabilities(metadata Metadata, capabilities []string) error {
+	if !metadata.ManifestPresent {
+		return nil
+	}
+	requiredReads := metadata.StateReads
+	requiredWrites := metadata.StateWrites
+	if len(requiredReads) == 0 {
+		requiredReads = []string{stateCapabilityMarkers[0]}
+		requiredWrites = []string{stateCapabilityMarkers[0]}
+	}
+	available := make(map[string]struct{}, len(capabilities))
+	for _, capability := range capabilities {
+		available[capability] = struct{}{}
+	}
+	readSet := make(map[string]struct{}, len(requiredReads))
+	writeSet := make(map[string]struct{}, len(requiredWrites))
+	for _, value := range requiredReads {
+		readSet[value] = struct{}{}
+	}
+	for _, value := range requiredWrites {
+		writeSet[value] = struct{}{}
+	}
+	for capability := range available {
+		if _, ok := readSet[capability]; !ok {
+			return fmt.Errorf("state_compatibility_mismatch: release cannot read database capability %s", capability)
+		}
+		if _, ok := writeSet[capability]; !ok {
+			return fmt.Errorf("state_compatibility_mismatch: release cannot write database capability %s", capability)
+		}
+	}
+	return nil
 }
 
 type checkedArtifact struct {

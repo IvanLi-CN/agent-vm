@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/big"
 	"net"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -15,42 +16,88 @@ import (
 	"strings"
 )
 
+const defaultManagementSessionTTLSeconds int64 = 900
+
+var (
+	guestToolPattern          = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
+	trustedImageSourcePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)
+)
+
+type ForwardAuthConfig struct {
+	SocketPath     string `json:"socket_path"`
+	PeerUID        int    `json:"peer_uid"`
+	IdentityHeader string `json:"identity_header"`
+}
+
+type ManagementAuthorityConfig struct {
+	SocketPath     string `json:"socket_path"`
+	ExpectedWebUID int    `json:"expected_web_uid"`
+}
+
+type ManagementUploadConfig struct {
+	Enabled          bool   `json:"enabled"`
+	MaxBytes         int64  `json:"max_bytes"`
+	StagingPath      string `json:"staging_path"`
+	MinimumFreeBytes int64  `json:"minimum_free_bytes"`
+}
+
+// ManagementConfig is deliberately shared by the authority and Web loaders.
+// The Web loader reads only this subtree, while the resident control process
+// reads it alongside the legacy control configuration.
+type ManagementConfig struct {
+	Enabled               bool                      `json:"enabled"`
+	ExternalOrigin        string                    `json:"external_origin"`
+	ForwardAuth           ForwardAuthConfig         `json:"forward_auth"`
+	AllowedAdminSubjects  []string                  `json:"allowed_admin_subjects"`
+	WebUID                int                       `json:"web_uid"`
+	SessionTTLSeconds     int64                     `json:"session_ttl_seconds"`
+	TrustedImageSourceIDs []string                  `json:"trusted_image_source_ids"`
+	Authority             ManagementAuthorityConfig `json:"authority"`
+	Upload                ManagementUploadConfig    `json:"upload"`
+}
+
 type Config struct {
-	StateDB                            string      `json:"state_db"`
-	Socket                             string      `json:"socket"`
-	ImageFingerprint                   string      `json:"image_fingerprint"`
-	ImageAlias                         string      `json:"image_alias"`
-	Project                            string      `json:"project"`
-	Profile                            string      `json:"profile"`
-	Network                            string      `json:"network"`
-	NetworkACL                         string      `json:"network_acl"`
-	Pool                               string      `json:"pool"`
-	HostAddress                        string      `json:"host_address"`
-	StoragePath                        string      `json:"storage_path"`
-	VMIPStart                          string      `json:"vm_ip_start"`
-	VMIPEnd                            string      `json:"vm_ip_end"`
-	GatewayIP                          string      `json:"gateway_ip"`
-	TimerDir                           string      `json:"timer_dir"`
-	CPUBudget                          int64       `json:"cpu_budget"`
-	MemoryBudgetMiB                    int64       `json:"memory_budget_mib"`
-	DiskBudgetGiB                      int64       `json:"disk_budget_gib"`
-	InstanceLimit                      int64       `json:"instance_limit"`
-	CPUOvercommitRatio                 json.Number `json:"cpu_overcommit_ratio"`
-	MemoryOvercommitRatio              json.Number `json:"memory_overcommit_ratio"`
-	CPUStartupPressureFullAvg10Percent float64     `json:"cpu_startup_pressure_full_avg10_percent"`
-	PortStart                          int64       `json:"port_start"`
-	PortEnd                            int64       `json:"port_end"`
-	InitialLeaseSeconds                int64       `json:"initial_lease_seconds"`
-	RenewSeconds                       int64       `json:"renew_seconds"`
-	MaxLeaseSeconds                    int64       `json:"max_lease_seconds"`
-	CacheSeconds                       int64       `json:"cache_seconds"`
-	SweepSeconds                       int64       `json:"sweep_seconds"`
-	WorkerTimeoutSeconds               int64       `json:"worker_timeout_seconds"`
-	DrainTimeoutSeconds                int64       `json:"drain_timeout_seconds"`
-	ActivationTimeoutSeconds           int64       `json:"activation_timeout_seconds"`
-	ReleaseFencePath                   string      `json:"release_fence_path"`
-	MetricsDir                         string      `json:"metrics_dir"`
-	AllowCreateDB                      bool        `json:"allow_create_db"`
+	StateDB                            string           `json:"state_db"`
+	Socket                             string           `json:"socket"`
+	ImageFingerprint                   string           `json:"image_fingerprint"`
+	ImageAlias                         string           `json:"image_alias"`
+	Project                            string           `json:"project"`
+	Profile                            string           `json:"profile"`
+	Network                            string           `json:"network"`
+	NetworkACL                         string           `json:"network_acl"`
+	Pool                               string           `json:"pool"`
+	HostAddress                        string           `json:"host_address"`
+	StoragePath                        string           `json:"storage_path"`
+	RequiredGuestTools                 []string         `json:"required_guest_tools"`
+	VMIPStart                          string           `json:"vm_ip_start"`
+	VMIPEnd                            string           `json:"vm_ip_end"`
+	GatewayIP                          string           `json:"gateway_ip"`
+	TimerDir                           string           `json:"timer_dir"`
+	CPUBudget                          int64            `json:"cpu_budget"`
+	MemoryBudgetMiB                    int64            `json:"memory_budget_mib"`
+	DiskBudgetGiB                      int64            `json:"disk_budget_gib"`
+	InstanceLimit                      int64            `json:"instance_limit"`
+	CPUOvercommitRatio                 json.Number      `json:"cpu_overcommit_ratio"`
+	MemoryOvercommitRatio              json.Number      `json:"memory_overcommit_ratio"`
+	CPUStartupPressureFullAvg10Percent float64          `json:"cpu_startup_pressure_full_avg10_percent"`
+	PortStart                          int64            `json:"port_start"`
+	PortEnd                            int64            `json:"port_end"`
+	InitialLeaseSeconds                int64            `json:"initial_lease_seconds"`
+	RenewSeconds                       int64            `json:"renew_seconds"`
+	MaxLeaseSeconds                    int64            `json:"max_lease_seconds"`
+	CacheSeconds                       int64            `json:"cache_seconds"`
+	SweepSeconds                       int64            `json:"sweep_seconds"`
+	WorkerTimeoutSeconds               int64            `json:"worker_timeout_seconds"`
+	DrainTimeoutSeconds                int64            `json:"drain_timeout_seconds"`
+	ActivationTimeoutSeconds           int64            `json:"activation_timeout_seconds"`
+	ReleaseFencePath                   string           `json:"release_fence_path"`
+	MetricsDir                         string           `json:"metrics_dir"`
+	AllowCreateDB                      bool             `json:"allow_create_db"`
+	Management                         ManagementConfig `json:"management"`
+}
+
+type WebConfig struct {
+	Management ManagementConfig `json:"management"`
 }
 
 func Defaults() Config {
@@ -70,7 +117,33 @@ func Defaults() Config {
 		ReleaseFencePath:                   "/run/agent-vm-native/release-activation.fence",
 		MetricsDir:                         "/run/agent-vm-native/metrics",
 		TimerDir:                           "/run/agent-vm-native/timers",
+		RequiredGuestTools:                 []string{"bun", "python3", "sshd", "rsync", "docker", "growpart"},
+		Management: ManagementConfig{
+			SessionTTLSeconds: defaultManagementSessionTTLSeconds,
+			ForwardAuth:       ForwardAuthConfig{IdentityHeader: "X-Forwarded-User"},
+		},
 	}
+}
+
+func LoadWeb(path string) (WebConfig, error) {
+	value := WebConfig{Management: Defaults().Management}
+	file, err := os.Open(path)
+	if err != nil {
+		return value, fmt.Errorf("config_missing: %w", err)
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&value); err != nil {
+		return value, fmt.Errorf("config_invalid: %w", err)
+	}
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return value, errors.New("config_invalid: trailing JSON")
+	}
+	if err := value.Management.Validate(true); err != nil {
+		return value, err
+	}
+	return value, nil
 }
 
 func Load(path string) (Config, error) {
@@ -181,6 +254,128 @@ func (c Config) Validate() error {
 	}
 	if math.IsNaN(c.CPUStartupPressureFullAvg10Percent) || math.IsInf(c.CPUStartupPressureFullAvg10Percent, 0) || c.CPUStartupPressureFullAvg10Percent < 0 || c.CPUStartupPressureFullAvg10Percent > 100 {
 		return errors.New("config_invalid: cpu_startup_pressure_full_avg10_percent must be between zero and 100")
+	}
+	if err := c.Management.Validate(false); err != nil {
+		return err
+	}
+	if c.Management.Enabled {
+		if c.Management.Authority.SocketPath == c.Socket {
+			return errors.New("config_invalid: management.authority.socket_path must be distinct from the control socket")
+		}
+		if c.Management.ForwardAuth.SocketPath == c.Socket {
+			return errors.New("config_invalid: management.forward_auth.socket_path must be distinct from the control socket")
+		}
+		if c.Management.ForwardAuth.SocketPath == c.Management.Authority.SocketPath {
+			return errors.New("config_invalid: management.forward_auth.socket_path must be distinct from the authority socket")
+		}
+	}
+	if err := validateGuestTools(c.RequiredGuestTools); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c ManagementConfig) Validate(webOnly bool) error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.ExternalOrigin == "" {
+		return errors.New("config_missing: management.external_origin")
+	}
+	origin, err := url.Parse(c.ExternalOrigin)
+	if err != nil || origin.Scheme != "https" || origin.Host == "" || strings.Contains(origin.Host, "*") || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
+		return errors.New("config_invalid: management.external_origin must be one HTTPS origin without a path")
+	}
+	if c.ForwardAuth.IdentityHeader != "X-Forwarded-User" {
+		return errors.New("config_invalid: management.forward_auth.identity_header is fixed to X-Forwarded-User")
+	}
+	if c.ForwardAuth.SocketPath == "" {
+		return errors.New("config_missing: management.forward_auth.socket_path")
+	}
+	if c.ForwardAuth.PeerUID <= 0 {
+		return errors.New("config_invalid: management.forward_auth.peer_uid must be a non-root UID")
+	}
+	if c.WebUID <= 0 {
+		return errors.New("config_invalid: management.web_uid must be a non-root UID")
+	}
+	if c.Authority.SocketPath == "" {
+		return errors.New("config_missing: management.authority.socket_path")
+	}
+	if c.Authority.ExpectedWebUID != c.WebUID {
+		return errors.New("config_invalid: management.authority.expected_web_uid must equal management.web_uid")
+	}
+	if c.ForwardAuth.SocketPath == c.Authority.SocketPath {
+		return errors.New("config_invalid: management.forward_auth.socket_path must be distinct from the authority socket")
+	}
+	if c.SessionTTLSeconds == 0 {
+		c.SessionTTLSeconds = defaultManagementSessionTTLSeconds
+	}
+	if c.SessionTTLSeconds < 60 || c.SessionTTLSeconds > 3600 {
+		return errors.New("config_invalid: management.session_ttl_seconds must be between 60 and 3600")
+	}
+	if err := validateUniqueIDs("management.allowed_admin_subjects", c.AllowedAdminSubjects, true); err != nil {
+		return err
+	}
+	if err := validateUniqueIDs("management.trusted_image_source_ids", c.TrustedImageSourceIDs, false); err != nil {
+		return err
+	}
+	for _, sourceID := range c.TrustedImageSourceIDs {
+		if !trustedImageSourcePattern.MatchString(sourceID) {
+			return errors.New("config_invalid: management.trusted_image_source_ids contains an invalid Incus remote name")
+		}
+	}
+	if c.Upload.Enabled {
+		if c.Upload.MaxBytes <= 0 {
+			return errors.New("config_invalid: management.upload.max_bytes must be positive when uploads are enabled")
+		}
+		if c.Upload.StagingPath == "" || !strings.HasPrefix(c.Upload.StagingPath, "/") {
+			return errors.New("config_invalid: management.upload.staging_path must be an absolute path")
+		}
+		if strings.Trim(c.Upload.StagingPath, "/") == "" {
+			return errors.New("config_invalid: management.upload.staging_path must be a private directory")
+		}
+		if c.Upload.MinimumFreeBytes <= 0 {
+			return errors.New("config_invalid: management.upload.minimum_free_bytes must be positive when uploads are enabled")
+		}
+	} else if c.Upload.MaxBytes < 0 || c.Upload.MinimumFreeBytes < 0 {
+		return errors.New("config_invalid: management.upload limits must not be negative")
+	}
+	if len(c.TrustedImageSourceIDs) > 0 && c.Upload.MinimumFreeBytes <= 0 {
+		return errors.New("config_invalid: management.upload.minimum_free_bytes must be positive when trusted image sources are configured")
+	}
+	if webOnly && c.Authority.SocketPath == "" {
+		return errors.New("config_missing: management.authority.socket_path")
+	}
+	return nil
+}
+
+func validateUniqueIDs(name string, values []string, requireNonEmpty bool) error {
+	if requireNonEmpty && len(values) == 0 {
+		return fmt.Errorf("config_missing: %s", name)
+	}
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" || value != strings.TrimSpace(value) || len(value) > 256 {
+			return fmt.Errorf("config_invalid: %s contains an empty or oversized value", name)
+		}
+		if _, exists := seen[value]; exists {
+			return fmt.Errorf("config_invalid: %s contains duplicate values", name)
+		}
+		seen[value] = struct{}{}
+	}
+	return nil
+}
+
+func validateGuestTools(values []string) error {
+	seen := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		if !guestToolPattern.MatchString(value) {
+			return errors.New("config_invalid: required_guest_tools contains an invalid command name")
+		}
+		if _, exists := seen[value]; exists {
+			return errors.New("config_invalid: required_guest_tools contains duplicate values")
+		}
+		seen[value] = struct{}{}
 	}
 	return nil
 }

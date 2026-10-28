@@ -1,0 +1,67 @@
+{
+  "items": [
+    {
+      "fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "resource_version": "image:bbbb:revision-3",
+      "version_label": "legacy-default",
+      "architecture": "x86_64",
+      "instance_type": "container",
+      "source": {
+        "kind": "legacy_config",
+        "source_id": null
+      },
+      "state": "available",
+      "verification": {
+        "integrity": "legacy_unverified",
+        "suitability": "not_assessed",
+        "findings": []
+      },
+      "is_default": true,
+      "default_compatibility": "legacy_unverified",
+      "references": {
+        "default": 1,
+        "active": 1,
+        "cached": 1,
+        "releasing": 0,
+        "pending_creation": 0,
+        "verification": 0
+      },
+      "created_at": "2025-10-01T00:00:00Z"
+    },
+    {
+      "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "resource_version": "image:aaaa:revision-1",
+      "version_label": "2026.01",
+      "architecture": "x86_64",
+      "instance_type": "container",
+      "source": {
+        "kind": "local_upload",
+        "source_id": null
+      },
+      "state": "available",
+      "verification": {
+        "integrity": "passed",
+        "suitability": "passed",
+        "findings": []
+      },
+      "is_default": false,
+      "default_compatibility": "none",
+      "references": {
+        "default": 0,
+        "active": 0,
+        "cached": 0,
+        "releasing": 0,
+        "pending_creation": 0,
+        "verification": 0
+      },
+      "created_at": "2026-01-15T09:55:00Z"
+    }
+  ],
+  "page": {
+    "limit": 25,
+    "next_cursor": null
+  },
+  "default_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "selection_version": "image-selection:revision-12",
+  "catalog_version": "image-catalog:revision-12"
+}

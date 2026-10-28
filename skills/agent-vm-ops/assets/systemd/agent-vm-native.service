@@ -12,9 +12,10 @@ TimeoutStartSec=60s
 TimeoutStopSec=30s
 NoNewPrivileges=yes
 PrivateTmp=yes
+Group=agent-vm-web
 UMask=0077
 RuntimeDirectory=agent-vm-native
-RuntimeDirectoryMode=0700
+RuntimeDirectoryMode=0750
 
 [Install]
 WantedBy=multi-user.target

@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -135,6 +136,20 @@ type Task struct {
 	ResourceReservationJSON string
 }
 
+// TaskPageFilter describes the bounded, browser-facing task inventory query.
+// Lifecycle recovery continues to use ListTasks when it must inspect the
+// complete durable set; management reads must use this cursor-bound variant.
+type TaskPageFilter struct {
+	States           []string
+	SessionID        string
+	ImageFingerprint string
+	Query            string
+	LeaseState       string
+	LeaseNow         string
+	AfterTaskID      string
+	Limit            int
+}
+
 type Port struct {
 	TaskID     string `json:"task_id"`
 	Generation int64  `json:"generation"`
@@ -157,16 +172,24 @@ type Operation struct {
 }
 
 type Store struct {
-	path      string
-	write     *sql.DB
-	reads     [2]*sql.DB
-	readIndex atomic.Uint32
+	path             string
+	write            *sql.DB
+	reads            [2]*sql.DB
+	readIndex        atomic.Uint32
+	imageSelectionMu sync.Mutex
 }
 
 type Tx struct {
 	conn    *sql.Conn
 	changed bool
 	closed  bool
+}
+
+// LockImageSelection serializes default-image changes with lifecycle
+// admission so a new task observes one coherent selection revision.
+func (s *Store) LockImageSelection() func() {
+	s.imageSelectionMu.Lock()
+	return s.imageSelectionMu.Unlock
 }
 
 // TaskCondition describes the durable facts that must still hold when a
@@ -230,7 +253,17 @@ func Open(path string, allowCreate bool) (*Store, error) {
 	return store, nil
 }
 
-func OpenForTest(path string) (*Store, error) { return Open(path, true) }
+func OpenForTest(path string) (*Store, error) {
+	store, err := Open(path, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.EnsureManagementSchema(context.Background()); err != nil {
+		store.Close()
+		return nil, err
+	}
+	return store, nil
+}
 
 func (s *Store) Path() string { return s.path }
 
@@ -518,6 +551,85 @@ func (s *Store) ListTasks(ctx context.Context) ([]Task, error) {
 		return rows.Err()
 	})
 	return tasks, err
+}
+
+// ListTasksPage applies management inventory filters in SQLite and reads at
+// most limit+1 rows to determine whether another page exists.
+func (s *Store) ListTasksPage(ctx context.Context, filter TaskPageFilter) ([]Task, bool, error) {
+	limit := filter.Limit
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	conditions := []string{}
+	args := []any{}
+	if len(filter.States) > 0 {
+		placeholders := make([]string, len(filter.States))
+		for index, value := range filter.States {
+			placeholders[index] = "?"
+			args = append(args, value)
+		}
+		conditions = append(conditions, "state IN ("+strings.Join(placeholders, ",")+")")
+	}
+	if filter.SessionID != "" {
+		conditions = append(conditions, "session_id = ?")
+		args = append(args, filter.SessionID)
+	}
+	if filter.ImageFingerprint != "" {
+		conditions = append(conditions, "image_fingerprint = ?")
+		args = append(args, filter.ImageFingerprint)
+	}
+	if filter.Query != "" {
+		conditions = append(conditions, "instr(lower(task_id || ' ' || session_id || ' ' || instance_name), lower(?)) > 0")
+		args = append(args, filter.Query)
+	}
+	if filter.LeaseState != "" {
+		switch filter.LeaseState {
+		case "effective":
+			conditions = append(conditions, "lease_expires_at IS NOT NULL AND lease_expires_at > ?")
+			args = append(args, filter.LeaseNow)
+		case "expired":
+			conditions = append(conditions, "lease_expires_at IS NOT NULL AND lease_expires_at <= ?")
+			args = append(args, filter.LeaseNow)
+		case "absent":
+			conditions = append(conditions, "lease_expires_at IS NULL")
+		case "unknown":
+			conditions = append(conditions, "lease_expires_at IS NOT NULL AND (length(lease_expires_at) < 20 OR lease_expires_at NOT LIKE '____-__-__T%')")
+		}
+	}
+	if filter.AfterTaskID != "" {
+		conditions = append(conditions, "task_id > ?")
+		args = append(args, filter.AfterTaskID)
+	}
+	query := `SELECT task_id, session_id, generation, state, instance_name, vm_ip, ssh_host_port, lease_expires_at, inactive_since, cleanup_after, created_at, updated_at, last_error, image_fingerprint, resources_json, reservation_bytes, previous_generation, resource_reservation_json FROM tasks`
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
+	}
+	query += " ORDER BY task_id LIMIT ?"
+	args = append(args, limit+1)
+	values := make([]Task, 0, limit)
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			value, err := scanTask(rows)
+			if err != nil {
+				return err
+			}
+			values = append(values, *value)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	hasMore := len(values) > limit
+	if hasMore {
+		values = values[:limit]
+	}
+	return values, hasMore, nil
 }
 
 type scanner interface{ Scan(...any) error }

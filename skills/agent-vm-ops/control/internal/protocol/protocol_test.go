@@ -29,6 +29,18 @@ func TestCanonicalBaselineDigests(t *testing.T) {
 	}
 }
 
+func TestNativeOutcomeErrorsExposeUncertainty(t *testing.T) {
+	if !NewError("restart_partial", "guest stop failed", map[string]any{"outcome_verified": false}).Uncertain() {
+		t.Fatal("restart partial error must be uncertain")
+	}
+	if !NewError("cleanup_incomplete", "cleanup did not complete", nil).Uncertain() {
+		t.Fatal("cleanup error must be uncertain")
+	}
+	if NewError("lease_expired", "lease expired", map[string]any{"outcome_verified": true}).Uncertain() {
+		t.Fatal("verified lease error must not be uncertain")
+	}
+}
+
 func TestCanonicalNumbersKeepIntegerAndFractionalIdentity(t *testing.T) {
 	integerValue, err := DecodeValue([]byte(`{"value":1}`))
 	if err != nil {

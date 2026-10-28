@@ -1,0 +1,41 @@
+{
+  "items": [
+    {
+      "task_id": "task_example_01",
+      "session_id": "session_example_01",
+      "generation": "42",
+      "resource_version": "vm:task_example_01:revision-9",
+      "state": "active",
+      "native_state": "running",
+      "guest_availability": "ready",
+      "image": {
+        "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "version_label": "2026.01"
+      },
+      "resources": {
+        "cpu_vcpu": 4,
+        "memory_bytes": "8589934592",
+        "disk_bytes": "53687091200"
+      },
+      "lease": {
+        "state": "effective",
+        "expires_at": "2026-01-15T11:20:00Z"
+      },
+      "port_mappings": [
+        {
+          "name": "preview",
+          "protocol": "tcp",
+          "host_port": 24001,
+          "guest_port": 3000
+        }
+      ],
+      "last_error": null,
+      "updated_at": "2026-01-15T10:19:00Z",
+      "allowed_actions": ["restart", "resize", "release", "destroy", "port_add", "port_remove"]
+    }
+  ],
+  "page": {
+    "limit": 25,
+    "next_cursor": null
+  }
+}
