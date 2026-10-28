@@ -412,7 +412,7 @@ func TestPendingManagementOperationsExcludesQueuedWork(t *testing.T) {
 	}
 }
 
-func TestCachedImageUsableRequiresVerifiedAvailableCatalogState(t *testing.T) {
+func TestCachedImageUsableAllowsOnlyVerifiedImagesOrLegacyDefault(t *testing.T) {
 	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
 		t.Fatal(err)
@@ -424,8 +424,8 @@ func TestCachedImageUsableRequiresVerifiedAvailableCatalogState(t *testing.T) {
 		t.Fatal(err)
 	}
 	usable, err := store.CachedImageUsable(ctx, legacy)
-	if err != nil || usable {
-		t.Fatalf("legacy image usable=%v err=%v", usable, err)
+	if err != nil || !usable {
+		t.Fatalf("legacy default image usable=%v err=%v", usable, err)
 	}
 	verified := strings.Repeat("b", 64)
 	if err := store.InsertManagedImage(ctx, ManagedImage{Fingerprint: verified, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
@@ -435,12 +435,23 @@ func TestCachedImageUsableRequiresVerifiedAvailableCatalogState(t *testing.T) {
 	if err != nil || !usable {
 		t.Fatalf("verified image usable=%v err=%v", usable, err)
 	}
-	if err := store.RetireManagedImage(ctx, verified); err != nil {
+	retired := strings.Repeat("c", 64)
+	if err := store.InsertManagedImage(ctx, ManagedImage{Fingerprint: retired, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
 		t.Fatal(err)
 	}
-	usable, err = store.CachedImageUsable(ctx, verified)
+	if err := store.RetireManagedImage(ctx, retired); err != nil {
+		t.Fatal(err)
+	}
+	usable, err = store.CachedImageUsable(ctx, retired)
 	if err != nil || usable {
 		t.Fatalf("retired image usable=%v err=%v", usable, err)
+	}
+	if _, err := store.SelectManagedImage(ctx, verified, "image-selection:revision-1"); err != nil {
+		t.Fatal(err)
+	}
+	usable, err = store.CachedImageUsable(ctx, legacy)
+	if err != nil || usable {
+		t.Fatalf("former legacy default usable=%v err=%v", usable, err)
 	}
 }
 
