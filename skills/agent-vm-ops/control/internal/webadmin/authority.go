@@ -176,6 +176,10 @@ func (authority *Authority) route(writer http.ResponseWriter, request *http.Requ
 }
 
 func (authority *Authority) getOverview(writer http.ResponseWriter, request *http.Request) {
+	if err := rejectUnknownQueryKeys(request.URL.Query(), map[string]bool{}); err != nil {
+		writeProblem(writer, invalidRequest(err.Error()))
+		return
+	}
 	if authority.Lifecycle == nil {
 		writeProblem(writer, problemFromError(errors.New("authority_unavailable: lifecycle service is not configured"), "internal", ""))
 		return
@@ -372,6 +376,10 @@ func (authority *Authority) listVMs(writer http.ResponseWriter, request *http.Re
 }
 
 func (authority *Authority) getVM(writer http.ResponseWriter, request *http.Request, taskID string) {
+	if err := rejectUnknownQueryKeys(request.URL.Query(), map[string]bool{}); err != nil {
+		writeProblem(writer, invalidRequest(err.Error()))
+		return
+	}
 	if !protocol.TaskIDPattern.MatchString(taskID) || len(taskID) > 128 {
 		writeProblem(writer, invalidRequest("task_id is invalid"))
 		return
@@ -493,6 +501,10 @@ func (authority *Authority) listImages(writer http.ResponseWriter, request *http
 }
 
 func (authority *Authority) getImage(writer http.ResponseWriter, request *http.Request, fingerprint string) {
+	if err := rejectUnknownQueryKeys(request.URL.Query(), map[string]bool{}); err != nil {
+		writeProblem(writer, invalidRequest(err.Error()))
+		return
+	}
 	if !managementFingerprintPattern.MatchString(fingerprint) {
 		writeProblem(writer, invalidRequest("fingerprint must be lowercase SHA-256"))
 		return
@@ -548,6 +560,10 @@ func (authority *Authority) listOperations(writer http.ResponseWriter, request *
 }
 
 func (authority *Authority) getOperation(writer http.ResponseWriter, request *http.Request, operationID string) {
+	if err := rejectUnknownQueryKeys(request.URL.Query(), map[string]bool{}); err != nil {
+		writeProblem(writer, invalidRequest(err.Error()))
+		return
+	}
 	if err := ensureOperationID(operationID); err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
@@ -605,6 +621,10 @@ func (authority *Authority) listAudit(writer http.ResponseWriter, request *http.
 }
 
 func (authority *Authority) getSystem(writer http.ResponseWriter, request *http.Request) {
+	if err := rejectUnknownQueryKeys(request.URL.Query(), map[string]bool{}); err != nil {
+		writeProblem(writer, invalidRequest(err.Error()))
+		return
+	}
 	epoch, err := authority.Store.StateEpoch(request.Context())
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "internal", ""))

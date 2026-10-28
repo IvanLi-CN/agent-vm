@@ -930,9 +930,9 @@ func (s *Service) dispatchAction(ctx context.Context, action string, request pro
 	case "port-remove":
 		return s.portRemove(ctx, request)
 	case "drain-enter":
-		return s.drain(ctx, true)
+		return s.drain(ctx, true, request)
 	case "drain-exit":
-		return s.drain(ctx, false)
+		return s.drain(ctx, false, request)
 	case "drain-status":
 		return s.drainStatus(ctx)
 	case "admin-status":
@@ -1740,9 +1740,30 @@ func (s *Service) portRemove(ctx context.Context, request protocol.Request) (map
 	return map[string]any{"task_id": task.TaskID, "name": name, "protocol": protocolName, "removed": true}, nil
 }
 
-func (s *Service) drain(ctx context.Context, value bool) (map[string]any, error) {
+func (s *Service) drain(ctx context.Context, value bool, request protocol.Request) (map[string]any, error) {
+	if value {
+		owner := stringValue(request["session_id"])
+		if owner == "" {
+			owner = "operation:" + stringValue(request["operation_id"])
+		}
+		if err := s.Store.SetMeta(ctx, "drain_owner", owner); err != nil {
+			return nil, s.sqliteError(err)
+		}
+	} else {
+		owner, found, err := s.Store.Meta(ctx, "drain_owner")
+		if err != nil {
+			return nil, s.sqliteError(err)
+		}
+		session := stringValue(request["session_id"])
+		if !found || owner == "" || session == "" || session != owner || !strings.HasPrefix(session, "release-") {
+			return nil, protocol.NewError("permission_denied", "only the active release transaction may exit admission drain", nil)
+		}
+	}
 	if err := s.Store.SetMeta(ctx, "draining", boolString(value)); err != nil {
 		return nil, s.sqliteError(err)
+	}
+	if !value {
+		_ = s.Store.SetMeta(ctx, "drain_owner", "")
 	}
 	return map[string]any{"draining": value}, nil
 }

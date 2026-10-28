@@ -781,6 +781,39 @@ func (s *Store) TransitionManagementOperation(ctx context.Context, operationID, 
 	return value, claimed, err
 }
 
+// TransitionManagementOperationUnlessDraining atomically checks the durable
+// admission fence before claiming an upload for native processing. A release
+// drain that wins the writer transaction prevents a later upload from
+// entering Incus after convergence has been observed.
+func (s *Store) TransitionManagementOperationUnlessDraining(ctx context.Context, operationID, expectedStatus, phase, status string) (*ManagementOperation, bool, error) {
+	var value *ManagementOperation
+	claimed := false
+	err := s.withWrite(ctx, func(tx *Tx) error {
+		var draining string
+		if err := tx.conn.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = 'draining'").Scan(&draining); err == nil && draining == "1" {
+			return errors.New("draining: new management action is refused while the control plane is draining")
+		} else if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		current, err := scanManagementOperation(ctx, tx.conn, operationID)
+		if err != nil {
+			return err
+		}
+		value = current
+		if current.Status != expectedStatus {
+			return nil
+		}
+		now := time.Now().UTC().Format(time.RFC3339Nano)
+		if _, err := tx.exec("UPDATE management_operations SET phase = ?, status = ?, updated_at = ? WHERE operation_id = ? AND status = ?", phase, status, now, operationID, expectedStatus); err != nil {
+			return err
+		}
+		value.Phase, value.Status, value.UpdatedAt = phase, status, now
+		claimed = true
+		return nil
+	})
+	return value, claimed, err
+}
+
 func (s *Store) Capabilities(ctx context.Context) ([]ManagementCapability, error) {
 	var values []ManagementCapability
 	err := s.withRead(ctx, func(conn *sql.Conn) error {

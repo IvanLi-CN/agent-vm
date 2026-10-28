@@ -462,7 +462,7 @@ func (s *Service) beginLocalImageUpload(ctx context.Context, operationID string)
 	if err != nil {
 		return operation, nil, nil, err
 	}
-	running, claimed, err := s.Store.TransitionManagementOperation(ctx, operationID, "awaiting_upload", "image_import", "running")
+	running, claimed, err := s.Store.TransitionManagementOperationUnlessDraining(ctx, operationID, "awaiting_upload", "image_import", "running")
 	if err != nil {
 		release()
 		return nil, nil, nil, err
@@ -773,9 +773,39 @@ func (s *Service) finishImport(ctx context.Context, operation *state.ManagementO
 		State: "available", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none",
 	}
 	if err := s.Store.InsertManagedImage(ctx, image); err != nil {
-		return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
+		return s.recoverImportedCatalogFailure(ctx, operation, artifact, err)
 	}
 	return s.finishOperation(ctx, operation, "completed", "succeeded", map[string]any{"fingerprint": artifact.Fingerprint, "state": "available"}, nil)
+}
+
+// recoverImportedCatalogFailure keeps a native image from becoming an
+// untracked resource when the catalog write fails after import verification.
+// A pre-existing catalog record is idempotent; otherwise the authority makes
+// one bounded cleanup attempt and retains the fingerprint in the durable
+// operation error whenever cleanup is not verified.
+func (s *Service) recoverImportedCatalogFailure(ctx context.Context, operation *state.ManagementOperation, artifact ImageArtifact, catalogErr error) (*state.ManagementOperation, error) {
+	detail := map[string]any{
+		"code":                 "internal_error",
+		"retryable":            true,
+		"imported_fingerprint": artifact.Fingerprint,
+		"catalog_error":        "catalog persistence failed",
+	}
+	if existing, err := s.Store.GetManagedImage(ctx, artifact.Fingerprint); err == nil && existing != nil {
+		return s.finishOperation(ctx, operation, "completed", "succeeded", map[string]any{"fingerprint": artifact.Fingerprint, "state": existing.State, "reused": true}, nil)
+	} else if err != nil {
+		detail["cleanup"] = "blocked_catalog_unverified"
+		return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, detail)
+	}
+	if s.Options.Backend != nil {
+		if cleanupErr := s.Options.Backend.DeleteImage(ctx, artifact.Fingerprint); cleanupErr == nil {
+			detail["cleanup"] = "verified"
+			return s.finishOperation(ctx, operation, "reconciliation", "failed", nil, detail)
+		} else {
+			detail["cleanup"] = "unverified"
+		}
+	}
+	_ = catalogErr
+	return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, detail)
 }
 
 func (s *Service) failImportWithImage(ctx context.Context, operation *state.ManagementOperation, request ImportRequest, artifact ImageArtifact, integrity, suitability string, findings []string) (*state.ManagementOperation, error) {
