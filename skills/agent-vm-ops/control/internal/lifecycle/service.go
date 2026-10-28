@@ -239,7 +239,7 @@ func (s *Service) WorkerStartAllowed(ctx context.Context, operationID string) er
 	if operation == nil || stringValue(operation.Response["outcome"]) != "pending" {
 		return errUnresolvedWorker
 	}
-	if unresolved, err := s.pendingWorkerUnresolved(ctx, operation.SessionID, operationID); err != nil {
+	if unresolved, err := s.pendingWorkerUnresolved(ctx, operation.SessionID, operationID, native.WorkerRecoveryCoordinator(ctx)); err != nil {
 		return err
 	} else if unresolved {
 		return errUnresolvedWorker
@@ -300,7 +300,7 @@ func (s *Service) updateWorker(ctx context.Context, operationID string, worker m
 	})
 }
 
-func (s *Service) pendingWorkerUnresolved(ctx context.Context, sessionID *string, currentOperationID string) (bool, error) {
+func (s *Service) pendingWorkerUnresolved(ctx context.Context, sessionID *string, currentOperationID, recoveryCoordinatorID string) (bool, error) {
 	pending, err := s.Store.PendingOperations(ctx)
 	if err != nil {
 		return false, err
@@ -311,10 +311,17 @@ func (s *Service) pendingWorkerUnresolved(ctx context.Context, sessionID *string
 		}
 		current := operation.OperationID == currentOperationID
 		if worker, ok := operation.Response["worker"].(map[string]any); ok && workerNeedsReconciliation(worker, current) {
+			if operation.OperationID == recoveryCoordinatorID && workerStartPrepared(worker) {
+				continue
+			}
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+func workerStartPrepared(worker map[string]any) bool {
+	return worker != nil && stringValue(worker["state"]) == "starting" && !boolValue(worker["start_attempted"])
 }
 
 func sameWorkerScope(left, right *string) bool {
@@ -446,6 +453,9 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 		}
 		finishActive := s.markOperationActive(operation.OperationID)
 		recoveryCtx := native.WithWorkerRecorder(ctx, operation.OperationID, s)
+		if coordinatorID := native.WorkerOperationID(ctx); coordinatorID != "" && coordinatorID != operation.OperationID {
+			recoveryCtx = native.WithWorkerRecovery(recoveryCtx, coordinatorID)
+		}
 		result, dispatchErr := s.dispatchAction(recoveryCtx, operation.Action, request)
 		finishActive()
 		if dispatchErr != nil {
@@ -1143,7 +1153,7 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 			if !(destroy && task.State == stateDeleting && missing) {
 				return nil, protocol.NewError("cleanup_incomplete", "native ownership could not be verified before cleanup", map[string]any{"cause": ownershipErr.Error(), "outcome_verified": false})
 			}
-			unresolved, workerErr := s.pendingWorkerUnresolved(ctx, optionalString(request["session_id"]), stringValue(request["operation_id"]))
+			unresolved, workerErr := s.pendingWorkerUnresolved(ctx, optionalString(request["session_id"]), stringValue(request["operation_id"]), native.WorkerRecoveryCoordinator(ctx))
 			if workerErr != nil {
 				return nil, protocol.NewError("cleanup_incomplete", "native worker ownership could not be checked before finalizing a missing instance", map[string]any{"cause": workerErr.Error(), "outcome_verified": false})
 			}

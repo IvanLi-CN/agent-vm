@@ -32,6 +32,7 @@ type WorkerStartFailureRecorder interface {
 }
 
 type workerContextKey struct{}
+type workerRecoveryContextKey struct{}
 
 type workerBinding struct {
 	operationID string
@@ -43,6 +44,28 @@ func WithWorkerRecorder(ctx context.Context, operationID string, recorder Worker
 		return ctx
 	}
 	return context.WithValue(ctx, workerContextKey{}, workerBinding{operationID: operationID, recorder: recorder})
+}
+
+// WithWorkerRecovery marks a native action that is being replayed by a
+// currently active maintenance operation. The coordinator's unattempted
+// journal barrier is intentionally ignored only for that nested recovery.
+func WithWorkerRecovery(ctx context.Context, coordinatorOperationID string) context.Context {
+	if ctx == nil || coordinatorOperationID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, workerRecoveryContextKey{}, coordinatorOperationID)
+}
+
+func WorkerOperationID(ctx context.Context) string {
+	return workerBindingFromContext(ctx).operationID
+}
+
+func WorkerRecoveryCoordinator(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	coordinator, _ := ctx.Value(workerRecoveryContextKey{}).(string)
+	return coordinator
 }
 
 func workerBindingFromContext(ctx context.Context) workerBinding {

@@ -93,7 +93,7 @@ type workerKillOps struct {
 	workerAlive  func(WorkerIdentity) (bool, error)
 	sendSignal   func(int) error
 	killGroup    func(WorkerIdentity, *workerGroupCleanup) error
-	reapGroup    func(WorkerIdentity) error
+	reapGroup    func(WorkerIdentity, *workerGroupCleanup) error
 	groupAlive   func(int) (bool, error)
 	sleep        func(time.Duration)
 }
@@ -110,6 +110,12 @@ type processGroupKillOps struct {
 	closePIDFD  func(int) error
 	readProcess func(int) (trackedProcess, error)
 	sendSignal  func(int) error
+}
+
+type processReapOps struct {
+	readProcess func(int) (trackedProcess, error)
+	wait        func(int) error
+	owner       int
 }
 
 func workerRootExited(identity WorkerIdentity, workerAlive func(WorkerIdentity) (bool, error)) error {
@@ -180,7 +186,7 @@ func killWorkerWith(identity WorkerIdentity, ops workerKillOps) error {
 		if ops.groupAlive != nil {
 			for attempt := 0; attempt < 10; attempt++ {
 				if ops.reapGroup != nil {
-					if err := ops.reapGroup(current); err != nil {
+					if err := ops.reapGroup(current, cleanup); err != nil {
 						return fmt.Errorf("reap native worker process group: %w", err)
 					}
 				}
@@ -214,24 +220,40 @@ func killWorkerWith(identity WorkerIdentity, ops workerKillOps) error {
 	return nil
 }
 
-func reapWorkerGroup(identity WorkerIdentity) error {
+func reapWorkerGroup(identity WorkerIdentity, cleanup *workerGroupCleanup) error {
 	// KillWorker runs from durable recovery after the runner has relinquished
 	// ownership of the command root. Reap only identity-verified zombies that
 	// have been reparented to this service; unrelated children remain untouched.
+	if cleanup == nil {
+		return errors.New("native worker group cleanup state is missing")
+	}
 	nativeProcessTreeMu.Lock()
 	defer nativeProcessTreeMu.Unlock()
+	return reapWorkerGroupWith(identity, cleanup, processReapOps{
+		readProcess: readProcess,
+		wait: func(pid int) error {
+			_, err := unix.Wait4(pid, nil, unix.WNOHANG, nil)
+			return err
+		},
+		owner: os.Getpid(),
+	})
+}
 
-	all, err := readProcessTable()
-	if err != nil {
-		return err
+func reapWorkerGroupWith(identity WorkerIdentity, cleanup *workerGroupCleanup, ops processReapOps) error {
+	if cleanup == nil {
+		return errors.New("native worker group cleanup state is missing")
 	}
-	owner := os.Getpid()
+	if ops.readProcess == nil || ops.wait == nil || ops.owner <= 0 {
+		return errors.New("native worker zombie reaping operations are incomplete")
+	}
+	candidates := make(map[int]trackedProcess, len(cleanup.members)+1)
+	candidates[identity.PID] = trackedProcess{pid: identity.PID, start: identity.StartTime, group: identity.ProcessGroup}
+	for pid, item := range cleanup.members {
+		candidates[pid] = item
+	}
 	var first error
-	for pid, item := range all {
-		if item.group != identity.ProcessGroup || item.state != 'Z' {
-			continue
-		}
-		current, readErr := readProcess(pid)
+	for pid, expected := range candidates {
+		current, readErr := ops.readProcess(pid)
 		if processGone(readErr) {
 			continue
 		}
@@ -241,16 +263,19 @@ func reapWorkerGroup(identity WorkerIdentity) error {
 			}
 			continue
 		}
-		if current.start != item.start || current.group != identity.ProcessGroup {
+		if current.start != expected.start || current.group != identity.ProcessGroup {
 			if first == nil {
 				first = fmt.Errorf("process-group zombie identity changed for pid %d", pid)
 			}
 			continue
 		}
-		if current.parent != owner {
+		if current.state != 'Z' {
 			continue
 		}
-		if _, waitErr := unix.Wait4(pid, nil, unix.WNOHANG, nil); waitErr != nil && !errors.Is(waitErr, unix.ECHILD) && !errors.Is(waitErr, unix.ESRCH) && first == nil {
+		if current.parent != ops.owner {
+			continue
+		}
+		if waitErr := ops.wait(pid); waitErr != nil && !errors.Is(waitErr, unix.ECHILD) && !errors.Is(waitErr, unix.ESRCH) && first == nil {
 			first = fmt.Errorf("reap process-group zombie %d: %w", pid, waitErr)
 		}
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -646,6 +647,43 @@ func TestWorkerStartGateRecordsAdmissionAndRejectsRetry(t *testing.T) {
 	}
 	if err := service.WorkerStartAllowed(context.Background(), operationID); !errors.Is(err, errUnresolvedWorker) {
 		t.Fatalf("second worker admission = %v, want unresolved-worker error", err)
+	}
+}
+
+func TestWorkerStartGateIgnoresOnlyUnattemptedRecoveryCoordinator(t *testing.T) {
+	for _, attempted := range []bool{false, true} {
+		t.Run(fmt.Sprintf("attempted=%t", attempted), func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "worker-recovery-coordinator.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			generation := int64(0)
+			coordinatorWorker := map[string]any{"state": "starting"}
+			if attempted {
+				coordinatorWorker["start_attempted"] = true
+			}
+			if err := store.RecordOperation(context.Background(), "recovery-coordinator", "admin-reconcile", nil, &generation, map[string]any{
+				"outcome": "pending", "worker": coordinatorWorker,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := store.RecordOperation(context.Background(), "recovered-operation", "admin-reconcile", nil, &generation, map[string]any{
+				"outcome": "pending", "worker": map[string]any{"state": "exited"},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			service := New(store, config.Defaults(), Options{})
+			ctx := native.WithWorkerRecovery(context.Background(), "recovery-coordinator")
+			err = service.WorkerStartAllowed(ctx, "recovered-operation")
+			if attempted {
+				if !errors.Is(err, errUnresolvedWorker) {
+					t.Fatalf("attempted coordinator gate error = %v, want unresolved-worker error", err)
+				}
+			} else if err != nil {
+				t.Fatalf("unattempted coordinator gate error = %v, want nil", err)
+			}
+		})
 	}
 }
 

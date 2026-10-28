@@ -368,7 +368,6 @@ func TestKillWorkerCleansRootAndLiveGroupMember(t *testing.T) {
 	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
 		t.Skipf("Linux child subreaper unavailable: %v", err)
 	}
-	t.Cleanup(func() { _ = unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0) })
 	command := exec.Command("/bin/sh", "-c", "sleep 30 & child=$!; echo $child; wait")
 	configureCommand(command)
 	stdout, err := command.StdoutPipe()
@@ -596,6 +595,67 @@ func TestKillProcessGroupRejectsStaleRootSnapshot(t *testing.T) {
 	}
 }
 
+func TestReapWorkerGroupUsesVerifiedIdentities(t *testing.T) {
+	identity := WorkerIdentity{PID: 100, StartTime: "root", ProcessGroup: 100}
+	cleanup := &workerGroupCleanup{
+		members: map[int]trackedProcess{
+			200: {pid: 200, start: "member", group: 100},
+		},
+	}
+	waited := make(map[int]bool)
+	err := reapWorkerGroupWith(identity, cleanup, processReapOps{
+		readProcess: func(pid int) (trackedProcess, error) {
+			switch pid {
+			case 100:
+				return trackedProcess{pid: 100, start: "root", parent: 999, group: 100, state: 'Z'}, nil
+			case 200:
+				return trackedProcess{pid: 200, start: "member", parent: 999, group: 100, state: 'Z'}, nil
+			default:
+				t.Fatalf("reaper inspected unverified pid %d", pid)
+				return trackedProcess{}, nil
+			}
+		},
+		wait: func(pid int) error {
+			waited[pid] = true
+			return nil
+		},
+		owner: 999,
+	})
+	if err != nil {
+		t.Fatalf("reapWorkerGroupWith() error = %v, want nil", err)
+	}
+	if len(waited) != 2 || !waited[100] || !waited[200] {
+		t.Fatalf("reaped identities = %#v, want root and verified member", waited)
+	}
+}
+
+func TestReapWorkerGroupRejectsReusedMemberIdentity(t *testing.T) {
+	identity := WorkerIdentity{PID: 100, StartTime: "root", ProcessGroup: 100}
+	cleanup := &workerGroupCleanup{members: map[int]trackedProcess{
+		200: {pid: 200, start: "old-member", group: 100},
+	}}
+	waited := false
+	err := reapWorkerGroupWith(identity, cleanup, processReapOps{
+		readProcess: func(pid int) (trackedProcess, error) {
+			if pid == identity.PID {
+				return trackedProcess{pid: pid, start: identity.StartTime, group: identity.ProcessGroup, state: 'S'}, nil
+			}
+			return trackedProcess{pid: pid, start: "new-member", parent: 999, group: identity.ProcessGroup, state: 'Z'}, nil
+		},
+		wait: func(int) error {
+			waited = true
+			return nil
+		},
+		owner: 999,
+	})
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("reapWorkerGroupWith() error = %v, want identity-change failure", err)
+	}
+	if waited {
+		t.Fatal("reaper waited for a reused process identity")
+	}
+}
+
 func TestKillWorkerConfirmsProcessGroupGoneAfterMemberScan(t *testing.T) {
 	identity := WorkerIdentity{PID: 123, StartTime: "1", ProcessGroup: 123}
 	groupChecks := 0
@@ -613,7 +673,7 @@ func TestKillWorkerConfirmsProcessGroupGoneAfterMemberScan(t *testing.T) {
 			killGroupCalls++
 			return nil
 		},
-		reapGroup: func(WorkerIdentity) error {
+		reapGroup: func(WorkerIdentity, *workerGroupCleanup) error {
 			reapGroupCalls++
 			return nil
 		},

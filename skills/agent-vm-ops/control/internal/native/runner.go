@@ -157,10 +157,10 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 			trackingErr = monitorErr
 		}
 		killProcess(command.Process.Pid, pidfd)
-		cleanupErr := cleanupTracked(tracker, command.Process.Pid)
 		_ = stdoutReader.Close()
 		_ = stderrReader.Close()
 		_ = command.Wait()
+		cleanupErr := cleanupTracked(tracker, command.Process.Pid)
 		<-stdoutDone
 		<-stderrDone
 		closePIDFD(pidfd)
@@ -183,10 +183,10 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 				trackingErr = monitorErr
 			}
 			killProcess(command.Process.Pid, pidfd)
-			cleanupErr := cleanupTracked(tracker, command.Process.Pid)
 			_ = stdoutReader.Close()
 			_ = stderrReader.Close()
 			_ = command.Wait()
+			cleanupErr := cleanupTracked(tracker, command.Process.Pid)
 			<-stdoutDone
 			<-stderrDone
 			closePIDFD(pidfd)
