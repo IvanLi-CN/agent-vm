@@ -77,9 +77,7 @@ class WrapperTests(unittest.TestCase):
 
     def test_drain_verification_uses_fixed_go_request_after_cutover(self):
         self.drain_patch.stop()
-        sidecar = Path(self.loaded["control_path"]).with_name("client-release.json")
-        sidecar.parent.mkdir(parents=True, exist_ok=True)
-        sidecar.write_text(json.dumps({"format": 2, "client_view": {"transport": "go-request"}}), encoding="utf-8")
+        self._install_go_payload("go-request")
         response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
         with mock.patch.object(
             WRAPPER.subprocess, "run",
@@ -102,9 +100,7 @@ class WrapperTests(unittest.TestCase):
 
     def test_drain_verification_uses_fixed_go_request_for_https_metadata(self):
         self.drain_patch.stop()
-        sidecar = Path(self.loaded["control_path"]).with_name("client-release.json")
-        sidecar.parent.mkdir(parents=True, exist_ok=True)
-        sidecar.write_text(json.dumps({"format": 2, "client_view": {"transport": "https"}}), encoding="utf-8")
+        self._install_go_payload("https")
         response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
         with mock.patch.object(
             WRAPPER.subprocess, "run",
@@ -115,6 +111,17 @@ class WrapperTests(unittest.TestCase):
             run.call_args.args[0],
             [str(WRAPPER.GO_CONTROL_PATH), "request", "--socket", str(WRAPPER.GO_CONTROL_SOCKET), "--timeout", "30s"],
         )
+
+    def test_drain_verification_rejects_malformed_present_sidecar(self):
+        self.drain_patch.stop()
+        sidecar = Path(self.loaded["control_path"]).with_name("client-release.json")
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"format": 2, "client_view": {"transport": "https"}}), encoding="utf-8")
+        with mock.patch.object(WRAPPER.subprocess, "run") as run:
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(failure.exception.code, "drain_unverified")
+        run.assert_not_called()
 
     def test_drain_verification_rejects_inflight_management_operations(self):
         self.drain_patch.stop()
@@ -442,7 +449,11 @@ class WrapperTests(unittest.TestCase):
                     archive.add(path, arcname=path.relative_to(extracted).as_posix(), recursive=False)
         return output.getvalue()
 
-    def _go_payload(self, release_id):
+    def _install_go_payload(self, transport):
+        payload = self._go_payload("c" * 40, transport=transport)
+        WRAPPER.safe_extract_archive(payload, Path(self.loaded["control_path"]).parent)
+
+    def _go_payload(self, release_id, *, transport="go-request"):
         extracted = self.root / "go-candidate"
         client_root = ROOT / "skills/agent-vm/scripts"
         ops_root = ROOT / "skills/agent-vm-ops"
@@ -467,7 +478,7 @@ class WrapperTests(unittest.TestCase):
                 "sha256": MANIFEST.sha256_file(path),
                 "mode": mode,
             })
-        manifest = MANIFEST.build_go_manifest(release_id, artifacts)
+        manifest = MANIFEST.build_go_manifest(release_id, artifacts, transport=transport)
         (extracted / "release-manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
         client_artifact = next(item for item in artifacts if item["role"] == "client")
         sidecar = {

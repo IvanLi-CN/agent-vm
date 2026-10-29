@@ -1018,14 +1018,27 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
         return
     command = [BUN_PATH, str(config["control_path"])]
     sidecar = Path(config["control_path"]).with_name("client-release.json")
-    if sidecar.is_file():
+    if sidecar.exists() or sidecar.is_symlink():
         try:
-            metadata = json.loads(sidecar.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            _fail("drain_unverified", "installed client release metadata is invalid")
-        view = metadata.get("client_view") if isinstance(metadata, Mapping) else None
-        if isinstance(metadata, Mapping) and metadata.get("format") in {GO_MANIFEST_FORMAT, LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT} and isinstance(view, Mapping) and view.get("transport") in {"go-request", "https"}:
-            command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
+            installed_root = sidecar.parent
+            installed_manifest = load_release_manifest(
+                installed_root / MANIFEST_NAME,
+                allow_historical_web_config_mode=True,
+            )
+            checked = verify_client_sidecar(
+                installed_root,
+                installed_manifest,
+                allow_historical_web_config_mode=True,
+            )
+        except ManifestError as exc:
+            _fail("drain_unverified", "installed client release metadata is invalid", exc.as_dict())
+        if checked.get("format") in {GO_MANIFEST_FORMAT, LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
+            view = checked.get("client_view")
+            transport = view.get("transport") if isinstance(view, Mapping) else None
+            if transport not in {"legacy-bun", "go-request", "https"}:
+                _fail("drain_unverified", "installed client release transport is invalid")
+            if transport in {"go-request", "https"}:
+                command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
     def control_result(action: str, *, allow_legacy_unknown: bool = False) -> Mapping[str, Any] | None:
         try:
             process = subprocess.run(
