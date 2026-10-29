@@ -1753,12 +1753,20 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         )
         if not target_is_native and old_is_native:
             runtime_switch_attempted = True
+            record["activation_phase"] = "runtime-switching"
+            _write_json(activation_path, record)
             _deactivate_native_runtime()
             predecessor_runtime_stopped = True
+            record["activation_phase"] = "predecessor-stopped"
+            _write_json(activation_path, record)
         elif target_is_native and old_runtime_manifest is not None and not old_is_native:
             runtime_switch_attempted = True
+            record["activation_phase"] = "runtime-switching"
+            _write_json(activation_path, record)
             _deactivate_legacy_runtime()
             predecessor_runtime_stopped = True
+            record["activation_phase"] = "predecessor-stopped"
+            _write_json(activation_path, record)
         _install_release_files(config, release_dir, manifest)
         record["activation_phase"] = "files-installed"
         _write_json(activation_path, record)
@@ -1885,6 +1893,8 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     record = _read_json(activation_path, "rollback_unavailable")
     interrupted_phases = {
         "prepared",
+        "runtime-switching",
+        "predecessor-stopped",
         "files-installed",
         "previous-pointer-updated",
         "current-pointer-updated",
@@ -1949,7 +1959,13 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
         if actual_previous is not None and actual_previous.name not in allowed_previous:
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
-    _ensure_drained(config, previous_manifest)
+    # The activation record is written only after the original activation has
+    # drained the control plane. An interrupted activation or rollback may
+    # have already stopped that authority, so asking it to drain again would
+    # make recovery impossible; the release fence and retained pointers are
+    # the recovery proof for this bounded retry.
+    if not interrupted and not recovering_in_progress:
+        _ensure_drained(config, previous_manifest)
     target_snapshot = _snapshot_targets(config)
     record["rollback_attempts"] = 1
     record["rollback_started"] = True
@@ -1990,6 +2006,7 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         else:
             _activate_legacy_runtime(native_already_stopped=predecessor_runtime_stopped)
     except WrapperError as failure:
+        restore_succeeded = False
         try:
             _restore_activation_state(
                 config,
@@ -1999,13 +2016,27 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 actual_previous,
                 target_snapshot,
             )
+            restore_succeeded = True
         except WrapperError as restore_error:
             failure = WrapperError(
                 "activation_restore_failed",
                 "rollback failed and the previous release could not be fully restored",
                 {"rollback_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
             )
-        if runtime_switch_attempted:
+        if not restore_succeeded:
+            shutdown_errors = []
+            for deactivate in (_deactivate_native_runtime, _deactivate_legacy_runtime):
+                try:
+                    deactivate()
+                except WrapperError as shutdown_error:
+                    shutdown_errors.append(shutdown_error.as_dict())
+            if shutdown_errors:
+                failure = WrapperError(
+                    "activation_restore_failed",
+                    "rollback failed and the authorities could not be stopped safely",
+                    {"rollback_error": failure.as_dict(), "shutdown_errors": shutdown_errors},
+                )
+        elif runtime_switch_attempted:
             try:
                 if active_manifest is None:
                     _systemctl("stop", "agent-vm-native.service", allow_missing=True)

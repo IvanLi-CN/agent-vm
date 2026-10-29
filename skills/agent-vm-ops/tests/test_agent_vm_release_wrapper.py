@@ -763,6 +763,70 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(record["rollback_state"], "failed")
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, second_release_id)
 
+    def test_interrupted_handoff_can_rollback_without_the_stopped_authority(self):
+        self.loaded["require_drained"] = False
+        native_release_id = "a" * 40
+        legacy_release_id = "b" * 40
+        native_payload = self._go_payload(native_release_id, transport="https")
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            WRAPPER.stage(self.loaded, "tx-native", native_release_id, native_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-native", native_release_id)
+            WRAPPER.activate(self.loaded, "tx-native", native_release_id)
+            WRAPPER.stage(self.loaded, "tx-interrupted", legacy_release_id, self.payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-interrupted", legacy_release_id)
+            with mock.patch.object(WRAPPER, "_deactivate_native_runtime", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    WRAPPER.activate(self.loaded, "tx-interrupted", legacy_release_id)
+
+            with mock.patch.object(
+                WRAPPER, "_ensure_drained", side_effect=AssertionError("interrupted rollback must not drain"),
+            ), mock.patch.object(WRAPPER, "_activate_go_runtime"):
+                result = WRAPPER.rollback(self.loaded, "tx-interrupted", legacy_release_id)
+
+        self.assertTrue(result["rolled_back"])
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, native_release_id)
+
+    def test_rollback_restore_failure_keeps_all_authorities_stopped(self):
+        self.loaded["require_drained"] = False
+        first_release_id = "a" * 40
+        second_release_id = "b" * 40
+        first_payload = self._go_payload(first_release_id, transport="https")
+        second_payload = self._go_payload(second_release_id, transport="https")
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            WRAPPER.stage(self.loaded, "tx-first-native", first_release_id, first_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-first-native", first_release_id)
+            WRAPPER.activate(self.loaded, "tx-first-native", first_release_id)
+            WRAPPER.stage(self.loaded, "tx-second-native", second_release_id, second_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-second-native", second_release_id)
+            WRAPPER.activate(self.loaded, "tx-second-native", second_release_id)
+
+            with mock.patch.object(
+                WRAPPER,
+                "_activate_go_runtime",
+                side_effect=WRAPPER.WrapperError("activation_failed", "injected runtime failure"),
+            ) as activate_go, mock.patch.object(
+                WRAPPER,
+                "_restore_activation_state",
+                side_effect=WRAPPER.WrapperError("activation_restore_failed", "injected restore failure"),
+            ), mock.patch.object(WRAPPER, "_deactivate_native_runtime") as stop_native, mock.patch.object(
+                WRAPPER, "_deactivate_legacy_runtime",
+            ) as stop_legacy:
+                with self.assertRaises(WRAPPER.WrapperError) as failure:
+                    WRAPPER.rollback(self.loaded, "tx-second-native", second_release_id)
+
+        self.assertEqual(failure.exception.code, "activation_restore_failed")
+        activate_go.assert_called_once_with()
+        stop_native.assert_called_once_with()
+        stop_legacy.assert_called_once_with()
+
     def test_cross_format_rollback_to_native_hands_off_legacy_before_cleanup(self):
         self.loaded["require_drained"] = False
         native_release_id = "a" * 40
