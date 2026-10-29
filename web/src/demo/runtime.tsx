@@ -8,6 +8,11 @@ export type DemoDataMode = "full" | "minimal";
 export type DemoForcedOutcome = "succeeded" | "failed" | "outcome_unknown";
 export type DemoInspectorLayout = "left" | "right" | "floating" | "minimized";
 
+export interface DemoInspectorPosition {
+  left: number;
+  top: number;
+}
+
 export interface DemoRuntimeState {
   scene: DemoScene;
   persona: DemoPersona;
@@ -23,6 +28,7 @@ const listeners = new Set<() => void>();
 let runtime: DemoRuntimeState | null = null;
 
 const inspectorLayoutStorageKey = "agent-vm:demo-inspector-layout";
+const inspectorPositionStorageKey = "agent-vm:demo-inspector-position";
 
 const isDemoBuild = import.meta.env.MODE === "demo";
 
@@ -130,6 +136,28 @@ export function saveDemoInspectorLayout(layout: DemoInspectorLayout): void {
     window.localStorage.setItem(inspectorLayoutStorageKey, layout);
   } catch {
     // Local layout persistence is best-effort and must not affect the demo runtime.
+  }
+}
+
+export function getDemoInspectorPosition(): DemoInspectorPosition | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const stored = window.localStorage.getItem(inspectorPositionStorageKey);
+    if (!stored) return null;
+    const parsed = JSON.parse(stored) as { left?: unknown; top?: unknown };
+    if (typeof parsed.left !== "number" || !Number.isFinite(parsed.left) || typeof parsed.top !== "number" || !Number.isFinite(parsed.top)) return null;
+    return { left: parsed.left, top: parsed.top };
+  } catch {
+    return null;
+  }
+}
+
+export function saveDemoInspectorPosition(position: DemoInspectorPosition): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(inspectorPositionStorageKey, JSON.stringify(position));
+  } catch {
+    // Local position persistence is best-effort and must not affect the demo runtime.
   }
 }
 

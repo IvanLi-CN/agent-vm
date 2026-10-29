@@ -31,6 +31,19 @@ test("supports left, right, floating and minimized inspector positions", async (
   await page.getByRole("menuitemradio", { name: "Floating" }).click();
   await expect(runtime).toHaveClass(/demo-runtime--floating/);
   await expect(page.locator(".demo-inspector")).toHaveCSS("position", "fixed");
+  const inspector = page.locator(".demo-inspector");
+  const dragHandle = page.locator(".demo-inspector-drag-handle");
+  const beforeDrag = await inspector.boundingBox();
+  const dragBox = await dragHandle.boundingBox();
+  if (!beforeDrag || !dragBox) throw new Error("Floating inspector is not measurable");
+  await page.mouse.move(dragBox.x + dragBox.width / 2, dragBox.y + dragBox.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(dragBox.x + dragBox.width / 2 - 120, dragBox.y + dragBox.height / 2 + 60);
+  await page.mouse.up();
+  const afterDrag = await inspector.boundingBox();
+  if (!afterDrag) throw new Error("Floating inspector disappeared after drag");
+  expect(afterDrag.x).toBeLessThan(beforeDrag.x - 50);
+  expect(afterDrag.y).toBeGreaterThan(beforeDrag.y + 20);
 
   await positionButton.click();
   await page.getByRole("menuitemradio", { name: "Minimize" }).click();
