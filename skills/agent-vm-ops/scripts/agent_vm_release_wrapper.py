@@ -534,7 +534,26 @@ def _require_owned_regular_modes(path: Path, owner_uid: int, modes: tuple[int, .
         _fail("artifact_mode_mismatch", f"artifact mode differs: {path.name}", {"expected": list(modes), "actual": actual})
 
 
-def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_historical_content: bool = False) -> None:
+def _artifact_runtime_path(
+    root: Path,
+    artifact: Mapping[str, Any],
+    artifact_paths: Mapping[str, Path] | None = None,
+) -> Path:
+    if artifact_paths is not None:
+        path = artifact_paths.get(str(artifact["path"]))
+        if path is None:
+            _fail("artifact_unverified", f"runtime artifact path is not configured: {artifact['path']}")
+        return path
+    return root / Path(*PurePosixPath(str(artifact["path"])).parts)
+
+
+def _verify_unit_contents(
+    root: Path,
+    manifest: Mapping[str, Any],
+    *,
+    allow_historical_content: bool = False,
+    artifact_paths: Mapping[str, Path] | None = None,
+) -> None:
     if _is_product_manifest(manifest):
         expected_units = PRODUCT_UNIT_EXEC_START if manifest["format"] == PRODUCT_MANIFEST_FORMAT else {"agent-vm-native.service": PRODUCT_UNIT_EXEC_START["agent-vm-native.service"]}
         expected_hashes = PRODUCT_UNIT_CONTENT_SHA256
@@ -545,7 +564,7 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_hist
             name = Path(item["path"]).name
             if name not in expected_units:
                 _fail("unit_unverified", f"product unit is not in the fixed allowlist: {name}")
-            path = root / Path(*PurePosixPath(item["path"]).parts)
+            path = _artifact_runtime_path(root, item, artifact_paths)
             try:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
@@ -567,7 +586,7 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_hist
             name = Path(item["path"]).name
             if name not in GO_UNIT_EXEC_START:
                 _fail("unit_unverified", f"Go unit is not in the fixed allowlist: {name}")
-            path = root / Path(*PurePosixPath(item["path"]).parts)
+            path = _artifact_runtime_path(root, item, artifact_paths)
             try:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
@@ -588,7 +607,7 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_hist
         name = Path(item["path"]).name
         if name not in UNIT_EXEC_START and name != "agent-vm-native-age-gc.timer":
             _fail("unit_unverified", f"unit is not in the fixed allowlist: {name}")
-        path = root / Path(*PurePosixPath(item["path"]).parts)
+        path = _artifact_runtime_path(root, item, artifact_paths)
         try:
             content = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
@@ -1033,6 +1052,55 @@ def _validate_legacy_state_schema(database: sqlite3.Connection) -> None:
             _fail("state_compatibility_unverified", "live state schema is incomplete")
 
 
+def _verify_installed_release(
+    config: Mapping[str, Any],
+    installed_root: Path,
+    manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Verify the split runtime layout before using its control authority."""
+    runtime_paths: Mapping[str, Path] | None = None
+    if _is_go_manifest(manifest):
+        verify_go_bundle(installed_root, manifest)
+    elif _is_product_manifest(manifest):
+        target = manifest.get("target")
+        if not isinstance(target, Mapping) or target.get("os") != "linux":
+            _fail("drain_unverified", "installed product release is not a native Linux package")
+        from release_manifest import verify_product_bundle
+        verify_product_bundle(
+            installed_root,
+            manifest,
+            allow_historical_web_config_mode=True,
+        )
+    else:
+        runtime_paths = _legacy_runtime_artifact_paths(config, installed_root, manifest)
+        verify_runtime_bundle(manifest, runtime_paths)
+    checked = verify_client_sidecar(
+        installed_root,
+        manifest,
+        allow_historical_web_config_mode=True,
+    )
+    _reject_transaction_extras(installed_root, checked)
+    _verify_fixed_artifacts(config, checked, allow_historical_web_config_mode=True)
+    _verify_python_syntax(installed_root, checked)
+    _verify_typescript_syntax(installed_root, checked)
+    _verify_unit_contents(
+        installed_root,
+        checked,
+        allow_historical_content=True,
+        artifact_paths=runtime_paths,
+    )
+    owner_uid = int(config["owner_uid"])
+    _require_owned_regular(installed_root / MANIFEST_NAME, owner_uid, 0o644)
+    _require_owned_regular(installed_root / "client-release.json", owner_uid, 0o644)
+    for item in checked["artifacts"]:
+        _require_owned_regular(
+            _artifact_runtime_path(installed_root, item, runtime_paths),
+            owner_uid,
+            item["mode"],
+        )
+    return checked
+
+
 def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any] | None = None) -> None:
     if not config["require_drained"]:
         return
@@ -1046,27 +1114,13 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
                 installed_root / MANIFEST_NAME,
                 allow_historical_web_config_mode=True,
             )
-            if _is_go_manifest(installed_manifest):
-                verify_go_bundle(installed_root, installed_manifest)
-            elif _is_product_manifest(installed_manifest):
-                from release_manifest import verify_product_bundle
-                verify_product_bundle(
-                    installed_root,
-                    installed_manifest,
-                    allow_historical_web_config_mode=True,
-                )
-            else:
-                verify_runtime_bundle(
-                    installed_manifest,
-                    _legacy_runtime_artifact_paths(config, installed_root, installed_manifest),
-                )
-            checked = verify_client_sidecar(
-                installed_root,
-                installed_manifest,
-                allow_historical_web_config_mode=True,
-            )
+            checked = _verify_installed_release(config, installed_root, installed_manifest)
         except ManifestError as exc:
             _fail("drain_unverified", "installed client release metadata is invalid", exc.as_dict())
+        except WrapperError as exc:
+            if exc.code == "drain_unverified":
+                raise
+            _fail("drain_unverified", "installed client release integrity is not verified", exc.as_dict())
         if checked.get("format") in {GO_MANIFEST_FORMAT, LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
             view = checked.get("client_view")
             transport = view.get("transport") if isinstance(view, Mapping) else None

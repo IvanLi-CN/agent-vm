@@ -92,6 +92,45 @@ class WrapperTests(unittest.TestCase):
             ["/usr/local/bin/bun", str(self.loaded["control_path"])],
         )
 
+    def test_drain_verification_rejects_source_product_layout(self):
+        self.drain_patch.stop()
+        installed_root = Path(self.loaded["control_path"]).parent
+        installed_root.mkdir(parents=True, exist_ok=True)
+        revision = "d" * 40
+        artifacts = [
+            {"name": name, "path": path, "role": role, "sha256": "0" * 64, "mode": mode}
+            for name, path, role, mode in sorted(MANIFEST.PRODUCT_CLIENT_ARTIFACTS, key=lambda item: item[1])
+        ]
+        actions = MANIFEST.default_operations()
+        manifest = {
+            "format": MANIFEST.LEGACY_PRODUCT_MANIFEST_FORMAT,
+            "version": "1.0.0",
+            "release_id": revision,
+            "source_revision": revision,
+            "protocol": 4,
+            "target": {"os": "source", "arch": "any"},
+            "toolchain": {"bun": "1.4.4", "go": "go1.27.3", "cgo_enabled": False},
+            "artifacts": artifacts,
+            "actions": actions,
+            "client_view": {"version": "1.0.0", "source_revision": revision, "protocol": 4, "transport": "legacy-bun", "actions": actions},
+        }
+        (installed_root / MANIFEST.MANIFEST_NAME).write_text(json.dumps(manifest), encoding="utf-8")
+        client_artifact = next(item for item in artifacts if item["role"] == "client")
+        (installed_root / "client-release.json").write_text(json.dumps({
+            "format": manifest["format"],
+            "version": manifest["version"],
+            "source_revision": revision,
+            "protocol": 4,
+            "client_artifact": client_artifact,
+            "client_dependencies": [item for item in artifacts if item["role"] == "support"],
+            "client_view": manifest["client_view"],
+        }), encoding="utf-8")
+        with mock.patch.object(WRAPPER.subprocess, "run") as run:
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(failure.exception.code, "drain_unverified")
+        run.assert_not_called()
+
     def test_drain_verification_uses_fixed_go_request_after_cutover(self):
         self.drain_patch.stop()
         self._install_go_payload("go-request")
