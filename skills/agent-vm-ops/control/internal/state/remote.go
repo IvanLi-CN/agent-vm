@@ -495,6 +495,9 @@ func (r *remoteBackend) request(ctx context.Context, statements []remoteStatemen
 	if err := decoder.Decode(&result); err != nil {
 		return remoteResponse{}, fmt.Errorf("decode rqlite response: %w", err)
 	}
+	if len(result.Results) != len(statements) {
+		return result, fmt.Errorf("rqlite response returned %d results for %d statements", len(result.Results), len(statements))
+	}
 	for index, item := range result.Results {
 		if message := remoteResultError(item); message != "" {
 			return result, &remoteStatementError{Index: index, Message: message}
