@@ -53,11 +53,17 @@ class GoManifestContractTests(unittest.TestCase):
         self.assertEqual(checked["client_view"]["transport"], "go-request")
         self.assertEqual(checked["retired_units"], list(MANIFEST.GO_RETIRED_UNITS))
 
-    def test_format_two_https_transport_round_trips_through_python(self) -> None:
-        manifest = MANIFEST.build_go_manifest("b" * 40, self.manifest["artifacts"], transport="https")
-        checked = MANIFEST.verify_go_bundle(self.root, manifest)
-        self.assertEqual(checked["client_view"]["transport"], "https")
+    def test_format_two_https_transport_validates_but_build_and_verify_fail_closed(self) -> None:
+        manifest = copy.deepcopy(self.manifest)
+        manifest["client_view"]["transport"] = "https"
+        self.assertEqual(MANIFEST.validate_go_manifest(manifest), manifest)
         self.assertEqual(MANIFEST.validate_release_manifest(manifest), manifest)
+        with self.assertRaises(MANIFEST.ManifestError) as builder_failure:
+            MANIFEST.build_go_manifest("b" * 40, self.manifest["artifacts"], transport="https")
+        self.assertEqual(builder_failure.exception.code, "manifest_transport_unavailable")
+        with self.assertRaises(MANIFEST.ManifestError) as verify_failure:
+            MANIFEST.verify_go_bundle(self.root, manifest)
+        self.assertEqual(verify_failure.exception.code, "manifest_transport_unavailable")
 
     def test_native_linux_rejects_legacy_bun_transport(self) -> None:
         with self.assertRaises(MANIFEST.ManifestError):

@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { build_go_manifest, GO_FIXED_ARTIFACTS, validate_go_manifest } from "../scripts/go-release-manifest.ts";
+import { build_go_manifest, GO_FIXED_ARTIFACTS, validate_go_manifest, verify_go_bundle } from "../scripts/go-release-manifest.ts";
 
 const artifacts = GO_FIXED_ARTIFACTS.map(([name, path, role, mode]) => ({ name, path, role, mode, sha256: "a".repeat(64) }));
 
@@ -15,10 +15,19 @@ test("format-2 manifest fixes the Go target, toolchain, transport enum and retir
   expect(validate_go_manifest(manifest)).toEqual(manifest);
 });
 
-test("format-2 manifest emits and validates the direct HTTPS transport", () => {
-  const manifest = build_go_manifest("a".repeat(40), artifacts, { transport: "https" });
-  expect(manifest.client_view.transport).toBe("https");
-  expect(validate_go_manifest(manifest)).toEqual(manifest);
+test("format-2 validation accepts HTTPS while builders and bundle verification fail closed", () => {
+  const manifest = build_go_manifest("a".repeat(40), artifacts);
+  const httpsManifest = structuredClone(manifest);
+  httpsManifest.client_view.transport = "https";
+  expect(validate_go_manifest(httpsManifest)).toEqual(httpsManifest);
+  expect(() => build_go_manifest("a".repeat(40), artifacts, { transport: "https" })).toThrow("validation-only");
+
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-go-manifest-https-"));
+  try {
+    expect(() => verify_go_bundle(temporaryRoot, httpsManifest)).toThrow("validation-only");
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
 });
 
 test("format-2 manifest rejects the legacy Bun transport for native Linux artifacts", () => {
@@ -69,8 +78,6 @@ test("format-2 release archive excludes host metadata members", { timeout: 120_0
         "a".repeat(40),
         "--target",
         "linux/amd64",
-        "--transport",
-        "https",
         "--output",
         output,
       ],
@@ -83,8 +90,35 @@ test("format-2 release archive excludes host metadata members", { timeout: 120_0
     expect(members.some((member) => member.split("/").some((part) => part.startsWith("._")))).toBe(false);
     expect(members).toContain("release-manifest.json");
     const manifest = JSON.parse(new TextDecoder().decode(Bun.spawnSync(["tar", "-xOf", output, "release-manifest.json"], { stdout: "pipe", stderr: "pipe" }).stdout));
-    expect(manifest.client_view.transport).toBe("https");
+    expect(manifest.client_view.transport).toBe("go-request");
     expect(readFileSync(output).byteLength).toBeGreaterThan(0);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("format-2 release CLI rejects HTTPS before creating an archive", () => {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-go-release-https-test-"));
+  const output = join(temporaryRoot, "release.tar");
+  try {
+    const result = Bun.spawnSync(
+      [
+        process.execPath,
+        "scripts/build_go_release.ts",
+        "--source-revision",
+        "a".repeat(40),
+        "--target",
+        "linux/amd64",
+        "--transport",
+        "https",
+        "--output",
+        output,
+      ],
+      { cwd: new URL("../", import.meta.url).pathname, stdout: "pipe", stderr: "pipe" },
+    );
+    expect(result.exitCode).not.toBe(0);
+    expect(new TextDecoder().decode(result.stderr)).toContain("validation-only");
+    expect(existsSync(output)).toBe(false);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }

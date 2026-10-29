@@ -63,6 +63,9 @@ export interface GoReleaseManifest {
 
 export class GoManifestError extends ControlError {}
 
+const HTTPS_TRANSPORT_UNAVAILABLE =
+  "https transport is validation-only until bundled client HTTPS support is integrated";
+
 const error = (message: string, detail?: unknown): never => {
   throw new GoManifestError("manifest_invalid", message, detail);
 };
@@ -144,6 +147,9 @@ export function build_go_manifest(sourceRevision: string, artifacts: readonly Go
   const transport = options.transport ?? "go-request";
   if (!CLIENT_TRANSPORTS.includes(transport)) error("client transport is unsupported");
   if (transport === "legacy-bun") error("native Linux releases require go-request or https transport");
+  if (transport === "https") {
+    throw new GoManifestError("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE);
+  }
   return validate_go_manifest({
     format: GO_MANIFEST_FORMAT,
     release_id: revisionValue,
@@ -184,6 +190,9 @@ export function validate_go_manifest(value: unknown): GoReleaseManifest {
 
 export function verify_go_bundle(root: string, manifest: unknown): GoReleaseManifest {
   const checked = validate_go_manifest(manifest);
+  if (checked.client_view.transport === "https") {
+    throw new GoManifestError("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE);
+  }
   for (const item of checked.artifacts) {
     const path = join(root, ...posix.normalize(item.path).split("/"));
     let info;

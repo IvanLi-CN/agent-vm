@@ -131,6 +131,7 @@ GO_MANIFEST_FORMAT = 2
 GO_TOOLCHAIN = "go1.27.3"
 GO_TARGETS = ("linux/amd64", "linux/arm64")
 GO_CLIENT_TRANSPORTS = ("legacy-bun", "go-request", "https")
+HTTPS_TRANSPORT_UNAVAILABLE = "https transport is validation-only until bundled client HTTPS support is integrated"
 GO_RETIRED_UNITS = (
     "agent-vm-native-age-gc.service",
     "agent-vm-native-age-gc.timer",
@@ -721,6 +722,8 @@ def build_go_manifest(
     selected_target = dict(target or {"os": "linux", "arch": "amd64"})
     if selected_target.get("os") == "linux" and transport == "legacy-bun":
         raise _error("manifest_transport_target_mismatch", "new Linux Go releases require go-request or https transport")
+    if transport == "https":
+        raise _error("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE)
     actions = {key: dict(value) for key, value in (operations or default_operations()).items()}
     return validate_go_manifest({
         "format": GO_MANIFEST_FORMAT,
@@ -844,6 +847,8 @@ def verify_go_bundle(root: Path, manifest: Mapping[str, Any] | None = None) -> d
     if not root.is_dir():
         raise _error("bundle_invalid", "bundle root is not a directory")
     checked = validate_go_manifest(manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME))
+    if checked["client_view"]["transport"] == "https":
+        raise _error("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE)
     for item in checked["artifacts"]:
         artifact = _resolve_regular(root, item["path"])
         _verify_artifact_file(artifact, item)
@@ -866,6 +871,8 @@ def verify_product_bundle(
         manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME),
         allow_historical_web_config_mode=allow_historical_web_config_mode,
     )
+    if checked["client_view"]["transport"] == "https":
+        raise _error("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE)
     for item in checked["artifacts"]:
         artifact = _resolve_regular(root, item["path"])
         _verify_artifact_file(artifact, item)

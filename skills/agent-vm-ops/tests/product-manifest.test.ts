@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -29,14 +29,16 @@ test("format-3 client manifest fixes product identity, source and action windows
     expect(manifest.client_view.version).toBe("1.0.0");
     expect(manifest.state_compatibility).toBeUndefined();
     expect(verify_product_bundle(root, manifest)).toEqual(manifest);
-    const httpsManifest = build_product_manifest("1.0.0", "a".repeat(40), artifacts, {
+    const httpsManifest = structuredClone(manifest);
+    httpsManifest.client_view.transport = "https";
+    expect(validate_product_manifest(httpsManifest)).toEqual(httpsManifest);
+    expect(() => build_product_manifest("1.0.0", "a".repeat(40), artifacts, {
       format: 3,
       target: { os: "source", arch: "any" },
       transport: "https",
       operations: default_operations(),
-    });
-    expect(httpsManifest.client_view.transport).toBe("https");
-    expect(verify_product_bundle(root, httpsManifest)).toEqual(httpsManifest);
+    })).toThrow("validation-only");
+    expect(() => verify_product_bundle(root, httpsManifest)).toThrow("validation-only");
     expect(() => build_product_manifest("1.0.0", "a".repeat(40), artifacts.slice(0, 1), { target: { os: "source", arch: "any" } })).toThrow();
     expect(() => build_product_manifest("1.0", "a".repeat(40), artifacts)).toThrow();
   } finally {
@@ -66,15 +68,19 @@ test("format-4 management manifest requires the Linux product target", () => {
     const manifest = build_product_manifest("1.0.0", "b".repeat(40), artifacts, {
       format: 4,
       target: { os: "linux", arch: "amd64" },
-      transport: "https",
+      transport: "go-request",
       operations: default_operations(),
     });
     expect(manifest.format).toBe(4);
-    expect(manifest.client_view.transport).toBe("https");
+    expect(manifest.client_view.transport).toBe("go-request");
     expect(manifest.state_compatibility?.reads).toEqual([
       "legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1",
     ]);
     expect(verify_product_bundle(root, manifest)).toEqual(manifest);
+    const httpsManifest = structuredClone(manifest);
+    httpsManifest.client_view.transport = "https";
+    expect(validate_product_manifest(httpsManifest)).toEqual(httpsManifest);
+    expect(() => verify_product_bundle(root, httpsManifest)).toThrow("validation-only");
     const historical = structuredClone(manifest);
     historical.client_view.transport = "legacy-bun";
     expect(validate_product_manifest(historical)).toEqual(historical);
@@ -92,5 +98,34 @@ test("format-4 management manifest requires the Linux product target", () => {
     })).toThrow();
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("product release CLI rejects HTTPS before creating an archive", () => {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-product-release-https-test-"));
+  const output = join(temporaryRoot, "release.tar");
+  try {
+    const result = Bun.spawnSync(
+      [
+        process.execPath,
+        "scripts/build_product_release.ts",
+        "--version",
+        "1.0.0",
+        "--source-revision",
+        "a".repeat(40),
+        "--target",
+        "linux/amd64",
+        "--transport",
+        "https",
+        "--output",
+        output,
+      ],
+      { cwd: new URL("../", import.meta.url).pathname, stdout: "pipe", stderr: "pipe" },
+    );
+    expect(result.exitCode).not.toBe(0);
+    expect(new TextDecoder().decode(result.stderr)).toContain("validation-only");
+    expect(existsSync(output)).toBe(false);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
   }
 });

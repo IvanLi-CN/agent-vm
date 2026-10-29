@@ -74,6 +74,9 @@ export const ACTION_NAMES: readonly string[] = Object.freeze([
 
 const ACTION_SET: ReadonlySet<string> = new Set(ACTION_NAMES);
 
+const HTTPS_TRANSPORT_UNAVAILABLE =
+  "https transport is validation-only until bundled client HTTPS support is integrated";
+
 export const CLIENT_TRANSPORTS = Object.freeze([
   "legacy-bun",
   "go-request",
@@ -1543,6 +1546,7 @@ export function build_product_manifest(
   const transport = options.transport ?? "go-request";
   const target = options.target ?? { os: "source", arch: "any" };
   if (target.os === "linux" && transport === "legacy-bun") throw _product_error("manifest_transport_target_mismatch", "new Linux product releases require go-request or https transport");
+  if (transport === "https") throw _product_error("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE);
   return validate_product_manifest({
     format,
     version,
@@ -1608,6 +1612,7 @@ function _verify_product_elf(path: string, target: ProductTarget): void {
 
 export function verify_product_bundle(root: string, manifest: unknown): ProductManifest {
   const checked = validate_product_manifest(manifest);
+  if (checked.client_view.transport === "https") throw _product_error("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE);
   for (const item of checked.artifacts) {
     const path = join(root, ...item.path.split("/"));
     let info: ReturnType<typeof lstatSync>;

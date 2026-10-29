@@ -49,6 +49,7 @@ const defaultTransport: ClientTransport = rawTarget === "client" ? "legacy-bun" 
 const rawTransport = args.includes("--transport") ? value("--transport") : defaultTransport;
 if (!CLIENT_TRANSPORTS.includes(rawTransport as ClientTransport)) throw new Error("transport must be legacy-bun, go-request, or https");
 if (rawTarget !== "client" && rawTransport === "legacy-bun") throw new Error("Linux product releases require go-request or https transport");
+if (rawTransport === "https") throw new Error("https transport is validation-only until bundled client HTTPS support is integrated");
 const transport = rawTransport as ClientTransport;
 const rawOutput = value("--output");
 if (!isAbsolute(rawOutput)) throw new Error("output must be absolute");

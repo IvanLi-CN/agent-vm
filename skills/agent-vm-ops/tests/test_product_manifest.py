@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT / "skills/agent-vm-ops/scripts"))
 
 from release_manifest import (  # noqa: E402
     LEGACY_PRODUCT_MANIFEST_FORMAT,
+    ManifestError,
     PRODUCT_LINUX_ARTIFACTS,
     PRODUCT_MANIFEST_FORMAT,
     default_operations,
@@ -52,7 +53,9 @@ class ProductManifestTests(unittest.TestCase):
             https_client = copy.deepcopy(manifest)
             https_client["client_view"]["transport"] = "https"
             self.assertEqual(validate_product_manifest(https_client), https_client)
-            self.assertEqual(verify_product_bundle(root, https_client), https_client)
+            with self.assertRaises(ManifestError) as failure:
+                verify_product_bundle(root, https_client)
+            self.assertEqual(failure.exception.code, "manifest_transport_unavailable")
             malformed = dict(manifest)
             malformed["version"] = "0.1"
             with self.assertRaises(Exception):
@@ -95,7 +98,9 @@ class ProductManifestTests(unittest.TestCase):
                 "state_compatibility": {"reads": ["legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1"], "writes": ["legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1"]},
             }
             self.assertEqual(validate_product_manifest(manifest), manifest)
-            self.assertEqual(verify_product_bundle(root, manifest), manifest)
+            with self.assertRaises(ManifestError) as failure:
+                verify_product_bundle(root, manifest)
+            self.assertEqual(failure.exception.code, "manifest_transport_unavailable")
             self.assertEqual(manifest["client_view"]["transport"], "https")
             self.assertIn("systemd/agent-vm-web.service", {item["path"] for item in manifest["artifacts"]})
             self.assertIn("web-assets.manifest.json", {item["path"] for item in manifest["artifacts"]})
@@ -104,7 +109,7 @@ class ProductManifestTests(unittest.TestCase):
             legacy["client_view"]["transport"] = "legacy-bun"
             self.assertEqual(validate_product_manifest(legacy), legacy)
 
-            historical = copy.deepcopy(manifest)
+            historical = copy.deepcopy(legacy)
             historical_web = next(item for item in historical["artifacts"] if item["path"] == "config/agent-vm-web.json.example")
             historical_web["mode"] = 0o644
             (root / historical_web["path"]).chmod(0o644)
