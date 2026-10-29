@@ -6,7 +6,7 @@ The Token API is the same-origin `/api/v1/tokens` surface used by an authenticat
 
 The authenticated principal is the exact case-sensitive `(issuer, subject)` pair produced by OIDC. Email, display name, group membership and a browser-provided identity header are not ownership keys. Every Token has one owner pair, an explicit set of session IDs, a bounded scope set, creation time, expiry and revocation state.
 
-An ordinary user may list, create, rotate or revoke only Tokens owned by the current pair and may bind a new Token only to sessions owned by that pair. A guessed `token_id`, `session_id` or filter never broadens that scope. An administrator may inspect or revoke another user's Token only through an explicit administrator capability; cross-owner revocation requires a reason, a preview-bound confirmation token and an audit event. The administrator cannot turn an ordinary Token into an administrator Token by changing its scope.
+An ordinary user may list, create or revoke only Tokens owned by the current pair and may bind a new Token only to sessions owned by that pair. A guessed `token_id`, `session_id` or filter never broadens that scope. An administrator may inspect or revoke another user's Token only through an explicit administrator capability; cross-owner revocation requires a reason, a preview-bound confirmation token and an audit event. The administrator cannot turn an ordinary Token into an administrator Token by changing its scope, and `agent:observe_admin` may be requested only by a principal with the matching administrator observation capability.
 
 Historical protocol-4 records or Tokens without a verified owner remain inaccessible to ordinary users. A migration or administrator ownership-mapping operation must bind the exact legacy record to one explicit `(issuer, subject)` pair before it can be used. The service must reject automatic email matching, first-login claims and ambiguous mappings.
 
@@ -21,23 +21,24 @@ All browser mutations require the opaque browser session cookie, the session-bou
 | `POST /api/v1/tokens/{token_id}/revoke` | Revoke a Token idempotently. | The owner may revoke its own Token; an administrator revoking another owner must supply reason, current version and confirmation. |
 | `GET /api/v1/tokens/{token_id}` | Read one Token's metadata. | Return only if the current pair owns it, unless the caller has the explicit administrator read capability. |
 
-The create request contains:
+The create request contains an operation ID for durable idempotency:
 
 ```json
 {
+  "operation_id": "50e8400e-ccf8-4c7b-8d1d-14f66c7fb126",
   "session_ids": ["session_example_01"],
   "scopes": ["agent:read", "agent:operate"],
   "expires_at": "2026-02-01T00:00:00Z"
 }
 ```
 
-The response contains a `token_id`, owner `(issuer, subject)`, session IDs, scopes, expiry and a `token` field only on successful creation. The plaintext value is high entropy, opaque and shown once; a later read, audit event, operation record or log contains only the Token ID and safe metadata. The service must apply a configured maximum lifetime and reject an empty scope or session set.
+The response contains a `token_id`, owner `(issuer, subject)`, session IDs, scopes, expiry and a `token` field only on successful creation. The plaintext value is high entropy, opaque and shown once; a later read, audit event, operation record or log contains only the Token ID and safe metadata. The service must apply a configured maximum lifetime, reject an empty scope or session set, and reject an `agent:observe_admin` request unless the current principal has that administrator capability.
 
 The revoke request contains an operation ID and bounded reason. For cross-owner administration it also contains the current `target_version` and a single-use confirmation token bound to the administrator, exact Token ID and current metadata. Reusing an operation ID with a different canonical request returns `operation_conflict`; repeating the same request returns the existing outcome.
 
 ## Storage and request checks
 
-The service stores only a versioned validation digest, owner pair, allowed session IDs, scopes, timestamps and revocation state. It rechecks expiry, revocation, owner and scope on every Agent API request. Token creation, rotation and revocation are durable operations in the shared state journal; a response timeout is unknown and does not authorize a new Token or a guessed retry.
+The service stores only a versioned validation digest, owner pair, allowed session IDs, scopes, timestamps and revocation state. It rechecks expiry, revocation, owner and scope on every Agent API request. Token creation and revocation are durable operations in the shared state journal; a response timeout is unknown and does not authorize a new Token or a guessed retry.
 
 Token values never appear in URLs, query strings, browser local storage, static assets, operation reasons, audit payloads, native command arguments or unredacted logs. The Agent API receives the value only in the HTTPS `Authorization` header, and the service redacts that header before logging or forwarding any diagnostic.
 

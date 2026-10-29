@@ -17,7 +17,7 @@ Agent VM 的 Go 服务已经是唯一的 Incus、生命周期、scheduler 和持
 
 Caddy 是唯一项目专用的外部入口。它负责 TLS、固定路径和活动槽位转发，只连接已验证的活动 Unix socket；它不执行用户登录、不接受或注入身份头、不实现资源授权，也不提供任意路径代理。服务端不接受浏览器提供的 `X-Forwarded-User` 或其他代理身份头。
 
-浏览器认证使用第三方 OIDC 的 Authorization Code Flow + PKCE。服务端在共享状态中记录一次性 `state`、`nonce`、受保护的 code verifier、回调 URI、过期时间和消费状态；回调验证 issuer、subject、audience、签名、有效期、state、nonce、TLS 和 redirect URI。稳定身份严格是大小写敏感的 `(issuer, subject)`，不使用邮箱、显示名或 group claim。OIDC 结果只建立主体，不自动授予管理员能力。
+浏览器认证使用第三方 OIDC 的 Authorization Code Flow + PKCE。服务端在共享状态中记录一次性 `state`、`nonce`、受保护的 code verifier、回调 URI、过期时间和消费状态，并绑定短时 `Secure`、`HttpOnly`、`SameSite=Lax` login-binding cookie 的摘要；回调必须同时匹配两者，并在创建会话前清除 cookie。回调验证 issuer、subject、audience、签名、有效期、state、nonce、TLS 和 redirect URI。服务端和 Caddy 访问日志省略回调 query string 和 `Referer`，应用日志不保留 code、state、nonce 或 verifier。稳定身份严格是大小写敏感的 `(issuer, subject)`，不使用邮箱、显示名或 group claim。OIDC 结果只建立主体，不自动授予管理员能力。
 
 角色和能力映射按完整 `(issuer, subject)` 持久化。普通用户的浏览器会话和 Agent Token 只能访问自己拥有的 session；管理员敏感操作仍需显式 capability、非空有界 reason、预览、一次性 confirmation token、当前 resource version/generation 和审计。审计保存主体二元组及 operation 的阶段和结果，不保存 Token、授权码或原始 native 诊断。
 

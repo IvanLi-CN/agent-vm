@@ -53,7 +53,7 @@ Caddy 只将下列固定路径转发到活动槽位，并清除不在允许集�
 | `/agent/v1/control` | Agent API | `Authorization: Bearer <opaque-token>`；不接受浏览器 Cookie |
 | 静态资源和健康检查 | 活动发布包的固定清单 | 不承载资源授权；不得暴露任意本机路径或调试路由 |
 
-OIDC 登录使用 Authorization Code Flow + PKCE。服务端为每次登录生成一次性 `state`、`nonce` 和 code verifier 事务，并把回调 URI、目标客户端、过期时间和消费状态绑定到事务；跨槽位时事务存于共享状态，code verifier 受保护存储。回调必须精确匹配未过期且未消费的 `state`，校验授权码交换的 TLS、redirect URI、ID Token 签名和 discovery issuer，且检查 `iss` 精确等于配置的 issuer、`aud` 包含本客户端 ID、`exp` 有效以及 `nonce` 与事务一致。OIDC 提供方不可用、验证失败或事务重复消费时登录失败，不伪造身份。
+OIDC 登录使用 Authorization Code Flow + PKCE。服务端为每次登录生成一次性 `state`、`nonce` 和 code verifier 事务，并把回调 URI、目标客户端、过期时间和消费状态绑定到事务；跨槽位时事务存于共享状态，code verifier 受保护存储。启动响应同时设置短时、不可读、`Secure`、`HttpOnly`、`SameSite=Lax` 的 login-binding cookie，事务只保存其摘要；回调必须同时匹配该 cookie、未过期且未消费的 `state`，成功后清除 cookie，再创建浏览器会话。服务端和项目 Caddy 的访问日志必须省略 OIDC 回调 query string 和 `Referer`，应用日志只能记录脱敏的事件 ID、issuer 和阶段，不得记录 code、state、nonce 或 verifier。回调还必须校验授权码交换的 TLS、redirect URI、ID Token 签名和 discovery issuer，且检查 `iss` 精确等于配置的 issuer、`aud` 包含本客户端 ID、`exp` 有效以及 `nonce` 与事务一致。OIDC 提供方不可用、验证失败或事务重复消费时登录失败，不伪造身份。
 
 服务把稳定用户身份表示为大小写敏感的 `(issuer, subject)` 二元组。`issuer` 必须是经过配置和 discovery 校验的完整标识；`subject` 使用 OIDC `sub`，不使用邮箱、名称、group 或未经验证的代理头。角色和能力映射按完整二元组解析并持久化；登录不自动获得管理员权限。历史数据无法根据该二元组确定归属时，普通用户不能领取资源，必须由管理员对明确的旧记录和新 `(issuer, subject)` 做一次有原因、有确认、有审计的显式映射；不能用相似邮箱或“第一个登录者”猜测归属。
 
@@ -79,9 +79,9 @@ Agent API 是 `POST /agent/v1/control`。它接收原有 protocol-4 JSON body，
 
 ## 状态、迁移和原子并发
 
-现有 SQLite 是迁移前的单一权威，保留 schema、protocol 4、generation、`state_epoch`、operation journal 和 unknown-outcome 语义。迁移到 rqlite 采用保守的一次性切换：先 drain 并阻止新的 native admission，生成一致的 SQLite 备份和导出，验证 schema/capability/行数/摘要，再以 rqlite 的事务请求导入；验证失败时保持 SQLite 未修改并恢复旧服务，不做双写、实时双主或反向猜测同步。
+现有 SQLite 是迁移前的单一权威，保留 schema、protocol 4、generation、`state_epoch`、operation journal 和 unknown-outcome 语义。迁移到 rqlite 采用保守的一次性切换：先进入 state-write fence，drain 并拒绝新的浏览器/API/Agent durable mutation，暂停 scheduler、reconciliation 和 timer 的 durable writes；允许已在途请求和 native worker 完成，或先把结果以原 operation ID 记录为 pending/unknown。所有在途 state transaction 收敛后关闭全部 SQLite 写入者，记录最终 `state_epoch`，在 fence 内生成一致的 SQLite 备份和导出，验证 schema/capability/行数/摘要，再以 rqlite 的事务请求导入；验证失败时保持 SQLite 未修改并恢复旧服务，不做双写、实时双主或反向猜测同步。
 
-rqlite 成为权威后，所有跨行状态变化使用 `POST /db/execute?transaction` 的单请求事务，不能在 SQL 中自行发送 `BEGIN`、`COMMIT`、`ROLLBACK` 或把多条关键写入拆成独立 HTTP 请求。关键授权、ownership、lease、generation、operation journal、Token 撤销和状态能力读取使用 linearizable consistency；只读观测只有在明确可接受新鲜度时才能使用较弱一致性，并保留 freshness。服务不直接读取 rqlite 节点的 SQLite 文件。
+rqlite 成为权威后，所有跨行状态变化使用 `POST /db/execute?transaction` 的单请求事务，不能在 SQL 中自行发送 `BEGIN`、`COMMIT`、`ROLLBACK` 或把多条关键写入拆成独立 HTTP 请求。关键授权、ownership、lease、generation、operation journal、Token 撤销、状态能力和 `state_epoch` 读取使用 linearizable consistency；native observation 前后的 epoch 比较也必须使用 linearizable consistency，只有观测值本身在明确可接受新鲜度时才能使用较弱一致性，并保留 freshness。服务不直接读取 rqlite 节点的 SQLite 文件。
 
 每个写操作以 `(operation_id, request_digest, issuer, subject, session_id, generation)` 识别。同一 operation ID 的相同请求在事务中幂等，冲突请求拒绝。需要同时更新资源、引用、resource version 和 journal 的路径必须在一个事务内完成，使用条件更新/唯一约束确保 compare-and-act 原子性；不得以“先读取再独立更新”替代。蓝绿服务使用同一套本机锁路径和锁顺序：同一 session 串行，共享容量准入使用全局锁和状态复核，不冲突的 session 才能并行。
 
