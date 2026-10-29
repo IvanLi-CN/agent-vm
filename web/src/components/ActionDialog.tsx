@@ -1,26 +1,44 @@
 import { AlertTriangle, ArrowRight, ShieldCheck } from "lucide-react";
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import type { ActionPreview } from "../app/types";
 import { formatDateTime } from "../app/format";
+import { AUDIT_REASON_MAX_LENGTH } from "../app/validation";
 import { Button, Textarea } from "./ui";
 
-export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm, dangerous = false, busy = false, error, confirmationText, returnFocusTarget, children }: { preview: ActionPreview; actionLabel: string; target: string; onCancel: () => void; onConfirm: (reason: string) => void; dangerous?: boolean; busy?: boolean; error?: string | null; confirmationText?: ReactNode; returnFocusTarget?: HTMLElement | null; children?: ReactNode }) {
+type ActionDialogProps = {
+  preview: ActionPreview;
+  actionLabel: string;
+  target: string;
+  onCancel: () => void;
+  onConfirm: (reason: string) => void;
+  dangerous?: boolean;
+  busy?: boolean;
+  error?: string | null;
+  confirmationText?: ReactNode;
+  returnFocusTarget?: HTMLElement | null;
+  children?: ReactNode;
+};
+
+export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm, dangerous = false, busy = false, error, confirmationText, returnFocusTarget, children }: ActionDialogProps) {
   const { t, i18n } = useTranslation();
   const locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const [reason, setReason] = useState("");
+  const [reasonError, setReasonError] = useState<string | null>(null);
   const reasonRef = useRef<HTMLTextAreaElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(returnFocusTarget ?? (typeof document === "undefined" ? null : document.activeElement as HTMLElement));
+
   useLayoutEffect(() => {
     reasonRef.current?.focus();
     return () => {
       const targetElement = returnFocusRef.current;
-      if (!targetElement) return;
+      if (!targetElement || !targetElement.isConnected) return;
       targetElement.focus();
       if (document.activeElement !== targetElement) window.setTimeout(() => targetElement.focus(), 0);
     };
   }, []);
+
   useLayoutEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
@@ -83,5 +101,29 @@ export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm
       }
     };
   }, [busy, onCancel]);
-  return <dialog ref={dialogRef} open className="dialog-backdrop" aria-modal="true" aria-labelledby="action-dialog-title" onCancel={(event) => { event.preventDefault(); if (!busy) onCancel(); }}><div className="action-dialog"><div className="dialog-heading"><div className={`dialog-icon ${dangerous ? "danger" : ""}`} aria-hidden="true">{dangerous ? <AlertTriangle /> : <ShieldCheck />}</div><div><h2 id="action-dialog-title">{t("vms.actionConfirm", { action: actionLabel })}</h2><p>{target}</p></div></div><div className="dialog-target-row"><span>{t("dialog.preview")}</span><span className="mono">{preview.target_version}</span></div><div className="impact-grid"><div><span>{t("dialog.impactSessions")}</span><strong>{preview.impact.affected_session_count}</strong></div><div><span>{t("dialog.impactRefs")}</span><strong>{Object.values(preview.impact.affected_image_references).reduce((total, value) => total + value, 0)}</strong></div></div><div className="dialog-changes"><span>{t("dialog.changes")}</span>{preview.impact.changes.map((change) => <div key={change.code}><span className="change-code">{change.code}</span><span>{change.value ?? change.count ?? t("dialog.noImpact")}</span></div>)}</div>{children}{error ? <p className="field-error" role="alert">{error}</p> : null}<p className="dialog-expiry">{t("dialog.expires", { time: formatDateTime(preview.expires_at, locale) })}</p><label className="field-label" htmlFor="action-reason">{t("common.reason")} <span>({t("common.optional")})</span></label><Textarea ref={reasonRef} id="action-reason" value={reason} onChange={(event) => setReason(event.target.value)} placeholder={t("common.reasonPlaceholder")} rows={3} /><p className="dialog-warning">{confirmationText ?? t("vms.actionConfirmText")}</p><div className="dialog-actions"><Button variant="ghost" disabled={busy} onClick={onCancel}>{t("common.cancel")}</Button><Button variant={dangerous ? "danger" : "primary"} disabled={busy} onClick={() => onConfirm(reason.trim())} icon={busy ? <ShieldCheck /> : <ArrowRight />}>{busy ? t("common.loading") : t("dialog.submit")}</Button></div></div></dialog>;
+
+  const submit = () => {
+    if (reason.length > AUDIT_REASON_MAX_LENGTH) {
+      setReasonError(t("common.reasonTooLong"));
+      return;
+    }
+    onConfirm(reason);
+  };
+
+  return <dialog ref={dialogRef} open className="dialog-backdrop" aria-modal="true" aria-labelledby="action-dialog-title" onCancel={(event) => { event.preventDefault(); if (!busy) onCancel(); }}>
+    <div className="action-dialog">
+      <div className="dialog-heading"><div className={`dialog-icon ${dangerous ? "danger" : ""}`} aria-hidden="true">{dangerous ? <AlertTriangle /> : <ShieldCheck />}</div><div><h2 id="action-dialog-title">{t("vms.actionConfirm", { action: actionLabel })}</h2><p>{target}</p></div></div>
+      <div className="dialog-target-row"><span>{t("dialog.preview")}</span><span className="mono">{preview.target_version}</span></div>
+      <div className="impact-grid"><div><span>{t("dialog.impactSessions")}</span><strong>{preview.impact.affected_session_count}</strong></div><div><span>{t("dialog.impactRefs")}</span><strong>{Object.values(preview.impact.affected_image_references).reduce((total, value) => total + value, 0)}</strong></div></div>
+      <div className="dialog-changes"><span>{t("dialog.changes")}</span>{preview.impact.changes.map((change) => <div key={change.code}><span className="change-code">{change.code}</span><span>{change.value ?? change.count ?? t("dialog.noImpact")}</span></div>)}</div>
+      {children}
+      {error ? <p className="field-error" role="alert">{error}</p> : null}
+      <p className="dialog-expiry">{t("dialog.expires", { time: formatDateTime(preview.expires_at, locale) })}</p>
+      <label className="field-label" htmlFor="action-reason">{t("common.reason")} <span>({t("common.optional")})</span></label>
+      <Textarea ref={reasonRef} id="action-reason" value={reason} maxLength={AUDIT_REASON_MAX_LENGTH} aria-invalid={reasonError ? "true" : undefined} aria-describedby={reasonError ? "action-reason-error" : undefined} onChange={(event) => { setReason(event.target.value); setReasonError(event.target.value.length > AUDIT_REASON_MAX_LENGTH ? t("common.reasonTooLong") : null); }} placeholder={t("common.reasonPlaceholder")} rows={3} />
+      {reasonError ? <p id="action-reason-error" className="field-error" role="alert">{reasonError}</p> : null}
+      <p className="dialog-warning">{confirmationText ?? t("vms.actionConfirmText")}</p>
+      <div className="dialog-actions"><Button variant="ghost" disabled={busy} onClick={onCancel}>{t("common.cancel")}</Button><Button variant={dangerous ? "danger" : "primary"} disabled={busy} onClick={submit} icon={busy ? <ShieldCheck /> : <ArrowRight />}>{busy ? t("common.loading") : t("dialog.submit")}</Button></div>
+    </div>
+  </dialog>;
 }

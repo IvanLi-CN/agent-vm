@@ -1,5 +1,6 @@
 import { mockState } from "./mockData";
 import type { ActionPreview, AgentToken, AuditEvent, ImageImportRequest, ManagedImage, ManagedVM, ManagementSession, Operation, Overview, SystemStatus, TokenCreateResult, TokenPage, TokenRevokePreview, TokenScope } from "./types";
+import { optionalAuditReason } from "./validation";
 
 const useRealApi = import.meta.env.VITE_MANAGEMENT_API === "real";
 
@@ -181,9 +182,10 @@ export async function getOperation(operationId: string): Promise<Operation> {
 }
 
 export async function createAgentToken(scopes: TokenScope[], expiresAt: string, reason?: string, operationId = createOperationId()): Promise<TokenCreateResult> {
-  const body = { operation_id: operationId, scopes, expires_at: expiresAt, ...(reason?.trim() ? { reason: reason.trim() } : {}) };
+  const providedReason = optionalAuditReason(reason);
+  const body = { operation_id: operationId, scopes, expires_at: expiresAt, ...(providedReason !== undefined ? { reason: providedReason } : {}) };
   if (useRealApi) return realRequest<TokenCreateResult>("/tokens", { method: "POST", body: JSON.stringify(body) });
-  const request = JSON.stringify({ scopes: [...scopes].sort(), expires_at: expiresAt, reason: reason?.trim() || null });
+  const request = JSON.stringify({ scopes: [...scopes].sort(), expires_at: expiresAt, reason: providedReason ?? null });
   const previous = mockTokenCreates.get(operationId);
   if (previous) {
     if (previous.request !== request) throw new ManagementRequestError("operation_conflict", "precondition", operationId);
@@ -195,7 +197,7 @@ export async function createAgentToken(scopes: TokenScope[], expiresAt: string, 
   mockState.tokens.unshift(storedMetadata);
   mockTokenCreates.set(operationId, { metadata: cloneTokenMetadata(storedMetadata), request });
   const plaintext = `${createOperationId().replaceAll("-", "")}${createOperationId().replaceAll("-", "")}`;
-  const operation = createMockOperation("token_create", { kind: "token", id: tokenId }, reason?.trim() || null, "succeeded", operationId);
+  const operation = createMockOperation("token_create", { kind: "token", id: tokenId }, providedReason ?? null, "succeeded", operationId);
   operation.result = { token_metadata: cloneTokenMetadata(storedMetadata), plaintext_disclosure: "returned" };
   createMockAudit(operation);
   return delay({ operation_id: operationId, token: plaintext, metadata: cloneTokenMetadata(storedMetadata), plaintext_disclosure: "returned" });
@@ -212,10 +214,10 @@ export async function previewTokenRevocation(tokenId: string, targetVersion: str
 }
 
 export async function submitTokenRevocation(tokenId: string, reason: string | undefined, preview: TokenRevokePreview, operationId = createOperationId()): Promise<Operation> {
-  const normalizedReason = reason?.trim() ?? "";
-  const body = { operation_id: operationId, target_version: preview.target_version, confirmation_token: preview.confirmation_token, ...(normalizedReason ? { reason: normalizedReason } : {}) };
+  const providedReason = optionalAuditReason(reason);
+  const body = { operation_id: operationId, target_version: preview.target_version, confirmation_token: preview.confirmation_token, ...(providedReason !== undefined ? { reason: providedReason } : {}) };
   if (useRealApi) return realRequest<Operation>(`/tokens/${encodeURIComponent(tokenId)}/revoke`, { method: "POST", body: JSON.stringify(body) });
-  const request = JSON.stringify({ token_id: tokenId, target_version: preview.target_version, confirmation_token: preview.confirmation_token, reason: normalizedReason || null });
+  const request = JSON.stringify({ token_id: tokenId, target_version: preview.target_version, confirmation_token: preview.confirmation_token, reason: providedReason ?? null });
   const previous = mockTokenRevocations.get(operationId);
   if (previous) {
     if (previous.request !== request) throw new ManagementRequestError("operation_conflict", "precondition", operationId);
@@ -229,7 +231,7 @@ export async function submitTokenRevocation(tokenId: string, reason: string | un
     token.revoked_at = new Date().toISOString();
     token.resource_version = `${token.resource_version}:revoked`;
   }
-  const operation = createMockOperation("token_revoke", { kind: "token", id: tokenId }, normalizedReason || null, "succeeded", operationId);
+  const operation = createMockOperation("token_revoke", { kind: "token", id: tokenId }, providedReason ?? null, "succeeded", operationId);
   mockTokenRevocations.set(operationId, { operation, request });
   mockTokenRevocationPreviews.delete(preview.confirmation_token);
   createMockAudit(operation);
@@ -259,7 +261,8 @@ export async function previewVMAction(taskId: string, action: string, current?: 
 }
 
 export async function submitVMAction(taskId: string, action: string, reason: string, preview: ActionPreview, expectedGeneration: string, parameters: Record<string, unknown> = {}, operationId = createOperationId()): Promise<Operation> {
-  if (useRealApi) return realRequest(`/vms/${encodeURIComponent(taskId)}/actions`, { method: "POST", body: JSON.stringify({ operation_id: operationId, ...(reason.trim() ? { reason: reason.trim() } : {}), target_version: preview.target_version, action, expected_generation: expectedGeneration, parameters, confirmation_token: preview.confirmation_token }) });
+  const providedReason = optionalAuditReason(reason);
+  if (useRealApi) return realRequest(`/vms/${encodeURIComponent(taskId)}/actions`, { method: "POST", body: JSON.stringify({ operation_id: operationId, ...(providedReason !== undefined ? { reason: providedReason } : {}), target_version: preview.target_version, action, expected_generation: expectedGeneration, parameters, confirmation_token: preview.confirmation_token }) });
   return createMockOperation(action as Operation["action"], { kind: "vm", id: taskId }, reason, "queued", operationId);
 }
 
@@ -291,11 +294,12 @@ export async function previewImageAction(fingerprint: string, action: "default" 
 }
 
 export async function submitImageAction(fingerprint: string, action: "default" | "delete" | "retire", reason: string, preview: ActionPreview, operationId = createOperationId()): Promise<Operation> {
+  const providedReason = optionalAuditReason(reason);
   if (useRealApi) {
     const path = action === "default" ? "/images/default" : `/images/${fingerprint}/${action === "delete" ? "delete" : "retire"}`;
     const body = action === "default"
-      ? { operation_id: operationId, ...(reason.trim() ? { reason: reason.trim() } : {}), target_version: preview.target_version, fingerprint, confirmation_token: preview.confirmation_token }
-      : { operation_id: operationId, ...(reason.trim() ? { reason: reason.trim() } : {}), target_version: preview.target_version, confirmation_token: preview.confirmation_token };
+      ? { operation_id: operationId, ...(providedReason !== undefined ? { reason: providedReason } : {}), target_version: preview.target_version, fingerprint, confirmation_token: preview.confirmation_token }
+      : { operation_id: operationId, ...(providedReason !== undefined ? { reason: providedReason } : {}), target_version: preview.target_version, confirmation_token: preview.confirmation_token };
     return realRequest(path, { method: "POST", body: JSON.stringify(body) });
   }
   return createMockOperation(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", { kind: "image", id: fingerprint }, reason, "succeeded", operationId);
@@ -310,12 +314,13 @@ export async function previewMaintenance(action: "drain_enter" | "reconcile" | "
 }
 
 export async function submitMaintenance(action: "drain_enter" | "reconcile" | "gc", reason: string, preview: ActionPreview, operationId = createOperationId()): Promise<Operation> {
-  if (useRealApi) return realRequest("/system/maintenance", { method: "POST", body: JSON.stringify({ operation_id: operationId, ...(reason.trim() ? { reason: reason.trim() } : {}), target_version: preview.target_version, action, confirmation_token: preview.confirmation_token, parameters: { apply: true } }) });
+  const providedReason = optionalAuditReason(reason);
+  if (useRealApi) return realRequest("/system/maintenance", { method: "POST", body: JSON.stringify({ operation_id: operationId, ...(providedReason !== undefined ? { reason: providedReason } : {}), target_version: preview.target_version, action, confirmation_token: preview.confirmation_token, parameters: { apply: true } }) });
   return createMockOperation(action, { kind: "system", id: "system" }, reason, "succeeded", operationId);
 }
 
 function createMockOperation(action: Operation["action"], target: Operation["target"], reason: string | null | undefined, status: Operation["status"] = "queued", operationId = createOperationId()): Operation {
-  const operation: Operation = { operation_id: operationId, action, status, phase: status === "awaiting_upload" ? "awaiting_upload" : status === "running" ? "suitability_check" : status === "succeeded" ? "completed" : "queued", target, actor: { issuer: mockState.session.issuer, subject: mockState.session.subject, role: "administrator" }, reason: reason?.trim() || null, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), result: null, error: null };
+  const operation: Operation = { operation_id: operationId, action, status, phase: status === "awaiting_upload" ? "awaiting_upload" : status === "running" ? "suitability_check" : status === "succeeded" ? "completed" : "queued", target, actor: { issuer: mockState.session.issuer, subject: mockState.session.subject, role: "administrator" }, reason: optionalAuditReason(reason) ?? null, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), result: null, error: null };
   mockState.operations.unshift(operation);
   return operation;
 }

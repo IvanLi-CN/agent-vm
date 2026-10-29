@@ -44,6 +44,26 @@ describe("management console workflow", () => {
     expect(trigger).toHaveFocus();
   });
 
+  it("serializes maintenance and Token confirmation dialogs", async () => {
+    const user = userEvent.setup();
+    window.history.replaceState({}, "", "/system");
+    renderApp();
+    expect(await screen.findByTestId("token-management")).toBeInTheDocument();
+
+    const revokeTrigger = (await screen.findAllByRole("button", { name: /撤销|revoke/i }))[0];
+    await user.click(revokeTrigger);
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /进入排空|enter drain/i, hidden: true })).toBeDisabled();
+    expect(screen.getByRole("button", { name: /恢复核对|reconcile/i, hidden: true })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: /取消|cancel/i }));
+
+    const drainButton = screen.getByRole("button", { name: /进入排空|enter drain/i });
+    await user.click(drainButton);
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /撤销|revoke/i, hidden: true }).every((button) => button.hasAttribute("disabled"))).toBe(true);
+    await user.click(screen.getByRole("button", { name: /取消|cancel/i }));
+  });
+
   it("creates a machine token and only exposes its plaintext until dismissed", async () => {
     const user = userEvent.setup();
     window.history.replaceState({}, "", "/system");
