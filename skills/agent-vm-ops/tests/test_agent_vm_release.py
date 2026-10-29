@@ -25,7 +25,7 @@ class FakeTransport:
     def __init__(self, *, fail_health_once=False, pending=False, drain_enter=True, unknown_state=False,
                  observation_consistent=True, legacy_metrics=False, malformed_health=False, malformed_reconcile=False, malformed_rollback=False,
                  fail_activation=False, require_legacy_drain_exit=False, missing_pending_operations=False,
-                 fail_health_persistent=False, supports_release_session_id=True):
+                 fail_health_persistent=False):
         self.calls = []
         self.fail_health_once = fail_health_once
         self.pending = pending
@@ -40,12 +40,11 @@ class FakeTransport:
         self.require_legacy_drain_exit = require_legacy_drain_exit
         self.missing_pending_operations = missing_pending_operations
         self.fail_health_persistent = fail_health_persistent
-        self.supports_release_session_id = supports_release_session_id
         self.control_release_ids = []
         self.health_checks = 0
 
-    def wrapper(self, host, wrapper_path, action, transaction_id, release_id, payload=None, session_id=None):
-        self.calls.append(("wrapper", action, transaction_id, release_id, payload is not None, session_id))
+    def wrapper(self, host, wrapper_path, action, transaction_id, release_id, payload=None):
+        self.calls.append(("wrapper", action, transaction_id, release_id, payload is not None))
         if action == "activate":
             if self.fail_activation:
                 return {"ok": False, "error": {"code": "activation_failed", "message": "injected"}}
@@ -60,8 +59,7 @@ class FakeTransport:
                                               "previous_release_id": release_id}}
         if action == "status":
             return {"ok": True, "result": {"current_release_id": "c" * 40,
-                                              "previous_release_id": release_id,
-                                              **({"supports_release_session_id": True} if self.supports_release_session_id else {})}}
+                                              "previous_release_id": release_id}}
         if action == "stage":
             return {"ok": True, "result": {"staged": True}}
         if action == "verify":
@@ -117,7 +115,7 @@ class ReleasePublisherTests(unittest.TestCase):
 
     _DEFAULT_CLIENT_TARGET = object()
 
-    def publisher(self, transport, *, client_target=_DEFAULT_CLIENT_TARGET, clock=None, session_id=None):
+    def publisher(self, transport, *, client_target=_DEFAULT_CLIENT_TARGET, clock=None):
         elapsed = [0.0]
         if client_target is self._DEFAULT_CLIENT_TARGET:
             client_target = self.root / "client" / "agent_vm.ts"
@@ -126,7 +124,6 @@ class ReleasePublisherTests(unittest.TestCase):
             control_host="staging-control",
             wrapper_path="/usr/local/sbin/agent-vm-release-wrapper",
             client_target=client_target,
-            session_id=session_id,
             transport=transport,
             sleep=lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds),
             monotonic=clock or (lambda: elapsed[0]),
@@ -191,57 +188,6 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(actions[:3], ["stage", "verify", "drain-enter"])
         self.assertLess(actions.index("drain-enter"), actions.index("activate"))
         self.assertEqual(actions[-1], "drain-exit")
-
-    def test_publish_default_session_uses_the_legacy_wrapper_cli_shape(self):
-        transport = FakeTransport()
-        self.publisher(transport, client_target=self.root / "client" / "agent_vm.ts").publish(
-            timeout=5, poll=1, transaction_id="tx-legacy-wrapper"
-        )
-        activation = next(call for call in transport.calls if call[:2] == ("wrapper", "activate"))
-        self.assertIsNone(activation[-1])
-
-    def test_publish_rejects_a_custom_session_before_drain_with_an_old_wrapper(self):
-        transport = FakeTransport(supports_release_session_id=False)
-        with self.assertRaises(RELEASE.ReleaseError) as failure:
-            self.publisher(
-                transport,
-                client_target=self.root / "client" / "agent_vm.ts",
-                session_id="release-custom/@blue",
-            ).publish(timeout=5, poll=1, transaction_id="tx-old-wrapper")
-        self.assertEqual(failure.exception.code, "wrapper_capability_missing")
-        self.assertNotIn(("control", "drain-enter", mock.ANY), transport.calls)
-
-    def test_publish_passes_a_custom_session_to_a_capable_wrapper(self):
-        transport = FakeTransport()
-        self.publisher(
-            transport,
-            client_target=self.root / "client" / "agent_vm.ts",
-            session_id="release-custom/@blue",
-        ).publish(timeout=5, poll=1, transaction_id="tx-capable-wrapper")
-        activation = next(call for call in transport.calls if call[:2] == ("wrapper", "activate"))
-        self.assertEqual(activation[-1], "release-custom/@blue")
-
-    def test_publish_rejects_an_invalid_release_session_before_drain(self):
-        transport = FakeTransport()
-        with self.assertRaises(RELEASE.ReleaseError) as failure:
-            self.publisher(
-                transport,
-                client_target=self.root / "client" / "agent_vm.ts",
-                session_id="browser-session",
-            ).publish(timeout=5, poll=1, transaction_id="tx-invalid-session")
-        self.assertEqual(failure.exception.code, "invalid_request")
-        self.assertNotIn(("control", "drain-enter", mock.ANY), transport.calls)
-
-    def test_publish_rejects_an_empty_explicit_session_before_drain(self):
-        transport = FakeTransport()
-        with self.assertRaises(RELEASE.ReleaseError) as failure:
-            self.publisher(
-                transport,
-                client_target=self.root / "client" / "agent_vm.ts",
-                session_id="",
-            ).publish(timeout=5, poll=1, transaction_id="tx-empty-session")
-        self.assertEqual(failure.exception.code, "invalid_request")
-        self.assertNotIn(("control", "drain-enter", mock.ANY), transport.calls)
 
     def test_build_and_install_use_all_bun_files_and_never_python_client_paths(self):
         from release_manifest import verify_typescript_syntax
@@ -594,22 +540,6 @@ class ReleasePublisherTests(unittest.TestCase):
         sidecar = json.loads((target.parent / "client-release.json").read_text(encoding="utf-8"))
         self.assertEqual(sidecar["release_id"], "c" * 40)
         self.assertEqual([item[1] for item in transport.calls][-1], "drain-exit")
-
-    def test_manual_rollback_rejects_an_empty_explicit_session_before_drain(self):
-        previous_bundle = self.root / "previous-empty-session.tar"
-        RELEASE.build_release(ROOT, previous_bundle, "c" * 40)
-        transport = FakeTransport()
-        with self.assertRaises(RELEASE.ReleaseError) as failure:
-            RELEASE.ReleasePublisher(
-                bundle=previous_bundle,
-                control_host="staging-control",
-                wrapper_path="/usr/local/sbin/agent-vm-release-wrapper",
-                client_target=self.root / "client" / "agent_vm.ts",
-                transport=transport,
-                session_id="",
-            ).rollback(transaction_id="tx-current", release_id="e" * 40)
-        self.assertEqual(failure.exception.code, "invalid_request")
-        self.assertNotIn(("control", "drain-enter", mock.ANY), transport.calls)
 
     def package_record(self, *, phase="installing", absent=False):
         directory = self.root / "recovery"

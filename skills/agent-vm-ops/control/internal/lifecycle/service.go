@@ -10,8 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -2264,19 +2262,7 @@ func (s *Service) portRemove(ctx context.Context, request protocol.Request) (map
 	return map[string]any{"task_id": task.TaskID, "name": name, "protocol": protocolName, "removed": true}, nil
 }
 
-func (s *Service) acquireReleaseAdmissionLock() (*native.AuthorityLock, error) {
-	return native.AcquireLock(filepath.Join(filepath.Dir(s.Store.Path()), "admission.lock"), true, true)
-}
-
 func (s *Service) drain(ctx context.Context, value bool, request protocol.Request) (map[string]any, error) {
-	lock, lockErr := s.acquireReleaseAdmissionLock()
-	if lockErr != nil {
-		if errors.Is(lockErr, native.ErrLockBusy) {
-			return nil, protocol.NewError("release_activation_in_progress", "admission drain is blocked while release activation is fenced", nil)
-		}
-		return nil, protocol.NewError("release_fence_unverified", "shared admission lock cannot be verified", nil)
-	}
-	defer lock.Close()
 	draining, _, err := s.Store.Meta(ctx, "draining")
 	if err != nil {
 		return nil, s.sqliteError(err)
@@ -2317,13 +2303,6 @@ func (s *Service) drain(ctx context.Context, value bool, request protocol.Reques
 			return nil, s.sqliteError(err)
 		}
 	} else {
-		fenced, fenceErr := s.releaseActivationFenced()
-		if fenceErr != nil {
-			return nil, protocol.NewError("release_fence_unverified", "release activation fence cannot be inspected", nil)
-		}
-		if fenced {
-			return nil, protocol.NewError("release_activation_in_progress", "drain exit is blocked while release activation is fenced", nil)
-		}
 		owner, found, ownerErr := s.Store.Meta(ctx, "drain_owner")
 		if ownerErr != nil {
 			return nil, s.sqliteError(ownerErr)
@@ -2345,35 +2324,6 @@ func (s *Service) drain(ctx context.Context, value bool, request protocol.Reques
 		return nil, s.sqliteError(err)
 	}
 	return map[string]any{"draining": value}, nil
-}
-
-// releaseActivationFenced checks both the historical service-owned fence and
-// the persistent wrapper fence. Lstat deliberately rejects symlinks; a fence
-// that cannot be proven to be a private regular file fails closed.
-func (s *Service) releaseActivationFenced() (bool, error) {
-	paths := []string{s.Config.ReleaseFencePath, config.PersistentReleaseFencePath}
-	seen := make(map[string]struct{}, len(paths))
-	for _, path := range paths {
-		if path == "" {
-			continue
-		}
-		if _, ok := seen[path]; ok {
-			continue
-		}
-		seen[path] = struct{}{}
-		info, err := os.Lstat(path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return false, err
-		}
-		if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-			return false, errors.New("release activation fence is not a private regular file")
-		}
-		return true, nil
-	}
-	return false, nil
 }
 
 func (s *Service) drainStatus(ctx context.Context) (map[string]any, error) {

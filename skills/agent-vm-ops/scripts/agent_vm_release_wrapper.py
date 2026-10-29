@@ -59,7 +59,6 @@ try:
         verify_client_sidecar,
         verify_bundle,
         verify_go_bundle,
-        verify_runtime_bundle,
         verify_typescript_syntax,
     )
 except ModuleNotFoundError:
@@ -93,7 +92,6 @@ except ModuleNotFoundError:
         verify_client_sidecar,
         verify_bundle,
         verify_go_bundle,
-        verify_runtime_bundle,
         verify_typescript_syntax,
     )
 
@@ -104,26 +102,17 @@ RETIRED_CONTROL_NAME = "agent_vm_control.py"
 RETIRED_CLIENT_NAME = "agent_vm.py"
 CANONICAL_UNIT_DIR = Path("/etc/systemd/system")
 RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
-PERSISTENT_RELEASE_FENCE_PATH = Path("/run/agent-vm-release/release-activation.fence")
 GO_CONTROL_PATH = Path("/opt/agent-vm-native/bin/agent-vm-control")
 GO_CONTROL_SOCKET = Path("/run/agent-vm-native/control.sock")
 STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
 LEGACY_EXPIRY_TIMER_RE = re.compile(r"^agent-vm-native-expire-[A-Za-z0-9_.:-]+\.timer$")
-LEGACY_EXPIRY_SERVICE_RE = re.compile(r"^agent-vm-native-expire@[A-Za-z0-9_.:-]+\.service$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
-RELEASE_SESSION_ALLOWED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:@/-")
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_FILE_BYTES = 64 * 1024 * 1024
-
-_ACTIVATION_FENCE_DEPTH: dict[tuple[str, str, str], int] = {}
 FORBIDDEN_CONFIG_NAMES = {"config.json", "state.sqlite3", "control.lock", "authority.lock", "admission.lock"}
 FIXED_UNIT_NAMES = tuple(sorted(set(UNIT_EXEC_START) | {"agent-vm-native-age-gc.timer"}))
 PRODUCT_UNIT_NAMES = ("agent-vm-native.service", "agent-vm-web.service")
-GO_SUPPORT_ARTIFACT_NAMES = frozenset(
-    path for _, path, role, _ in GO_FIXED_ARTIFACTS if role == "support"
-)
-LEGACY_ONLY_SUPPORT_NAMES = tuple(sorted(SUPPORT_ARTIFACT_NAMES - GO_SUPPORT_ARTIFACT_NAMES))
 FIXED_ARTIFACTS = {
     ("client", "agent_vm.ts"),
     ("control", "agent_vm_control.ts"),
@@ -144,36 +133,6 @@ def _is_go_manifest(manifest: Mapping[str, Any]) -> bool:
 
 def _is_product_manifest(manifest: Mapping[str, Any]) -> bool:
     return manifest.get("format") in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}
-
-
-def _legacy_runtime_artifact_paths(
-    config: Mapping[str, Any],
-    installed_root: Path,
-    manifest: Mapping[str, Any],
-) -> dict[str, Path]:
-    """Map format-1 bundle paths to their split installed runtime paths."""
-    paths: dict[str, Path] = {}
-    for artifact in manifest["artifacts"]:
-        relative = str(artifact["path"])
-        if artifact["role"] == "unit":
-            paths[relative] = Path(config["unit_dir"]) / Path(relative).name
-        elif relative == "agent_vm_control.ts":
-            paths[relative] = Path(config["control_path"])
-        else:
-            paths[relative] = installed_root / Path(*PurePosixPath(relative).parts)
-    return paths
-
-
-def _native_runtime_artifact_paths(
-    config: Mapping[str, Any],
-    manifest: Mapping[str, Any],
-) -> dict[str, Path]:
-    """Map native unit artifacts to the active systemd installation."""
-    return {
-        str(artifact["path"]): Path(config["unit_dir"]) / Path(str(artifact["path"])).name
-        for artifact in manifest["artifacts"]
-        if artifact["role"] == "unit"
-    }
 
 
 def _manifest_release_id(manifest: Mapping[str, Any]) -> str:
@@ -216,19 +175,6 @@ def _safe_id(value: Any, label: str) -> str:
     return value
 
 
-def _release_drain_owner(transaction_id: str, session_id: str | None = None) -> str:
-    """Resolve the exact release owner used by drain-enter and recovery."""
-    owner = "release-" + transaction_id if session_id is None else session_id
-    if (
-        not isinstance(owner, str)
-        or not owner.startswith("release-")
-        or not 1 <= len(owner) <= 160
-        or any(character not in RELEASE_SESSION_ALLOWED for character in owner)
-    ):
-        _fail("invalid_request", "release drain owner is invalid")
-    return owner
-
-
 def _release_id(value: Any) -> str:
     if not isinstance(value, str) or RELEASE_ID_RE.fullmatch(value) is None:
         _fail("invalid_request", "release_id must be a 40-character lowercase Git revision")
@@ -263,64 +209,6 @@ def _require_root_owned_path(path: Path, label: str, *, regular: bool = False, a
             _fail("wrapper_config_invalid", f"{label} is not root-owned and private")
         if current == path and regular and not stat.S_ISREG(info.st_mode):
             _fail("wrapper_config_invalid", f"{label} is not a regular file")
-
-
-def _require_directory_chain(path: Path, code: str, label: str) -> None:
-    """Reject untrusted, writable, symlinked, or non-directory path boundaries."""
-    current = path
-    visited: set[Path] = set()
-    allowed_owners = {0, os.geteuid()}
-    while True:
-        try:
-            info = current.lstat()
-        except FileNotFoundError:
-            parent = current.parent
-            if parent == current:
-                return
-            current = parent
-            continue
-        except OSError:
-            _fail(code, f"cannot inspect {label}")
-        if stat.S_ISLNK(info.st_mode):
-            # macOS exposes /var as a root-owned link to /private/var. It is
-            # safe to traverse only this fixed platform boundary; activation
-            # directories themselves must never be symlinked.
-            try:
-                resolved = current.resolve(strict=True)
-            except OSError:
-                _fail(code, f"{label} contains an unresolved symlink")
-            if current != Path("/var") or resolved != Path("/private/var") or info.st_uid not in allowed_owners:
-                _fail(code, f"{label} contains a symlink")
-            if resolved in visited:
-                _fail(code, f"{label} contains a symlink cycle")
-            visited.add(resolved)
-            current = resolved
-            continue
-        if not stat.S_ISDIR(info.st_mode):
-            _fail(code, f"{label} is not a directory")
-        mode = stat.S_IMODE(info.st_mode)
-        sticky_shared = info.st_uid == 0 and mode & 0o1000 and mode & 0o022
-        if info.st_uid not in allowed_owners or (mode & 0o022 and not sticky_shared):
-            _fail(code, f"{label} is not owned and private")
-        if current == current.parent:
-            return
-        current = current.parent
-
-
-def _activation_parent_dirs(config: Mapping[str, Any]) -> tuple[Path, ...]:
-    bundle_root = Path(config["control_path"]).parent
-    return tuple(dict.fromkeys((
-        bundle_root,
-        bundle_root / "bin",
-        bundle_root / "config",
-        bundle_root / "systemd",
-        Path(config["unit_dir"]),
-    )))
-
-
-def _require_activation_parent_dirs(config: Mapping[str, Any], code: str) -> None:
-    for path in _activation_parent_dirs(config):
-        _require_directory_chain(path, code, f"activation parent directory: {path}")
 
 
 def _paths_overlap(left: Path, right: Path) -> bool:
@@ -393,7 +281,6 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
                 _fail("wrapper_config_invalid", "wrapper paths must not overlap", {"left": str(left), "right": str(right)})
     for key, configured_path in ((key, config[key]) for key in config if isinstance(config[key], Path)):
         _require_root_owned_path(configured_path, key, allow_symlink=key in {"current_link", "previous_link"})
-    _require_activation_parent_dirs(config, "wrapper_config_invalid")
     return config
 
 
@@ -426,37 +313,6 @@ def _release_lock(config: Mapping[str, Any]):
             fcntl.flock(descriptor, fcntl.LOCK_EX)
         except OSError as exc:
             _fail("wrapper_lock_unavailable", "cannot acquire the release transaction lock")
-        yield
-    finally:
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-
-
-@contextmanager
-def _admission_lock():
-    """Share the controller's admission lock across Bun, Go, and the wrapper."""
-    lock_path = STATE_DB_PATH.parent / "admission.lock"
-    try:
-        _require_root_owned_path(lock_path.parent, "admission lock directory")
-        descriptor = os.open(
-            lock_path,
-            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-    except OSError:
-        _fail("wrapper_lock_unavailable", "cannot open the shared admission lock")
-    try:
-        try:
-            os.fchmod(descriptor, 0o600)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-        except OSError:
-            _fail("wrapper_lock_unavailable", "cannot acquire the shared admission lock")
         yield
     finally:
         try:
@@ -558,19 +414,12 @@ def _fsync_tree(root: Path) -> None:
         _fail("activation_failed", "cannot persist copied release files")
 
 
-def _activation_fence_paths(config: Mapping[str, Any]) -> tuple[Path, ...]:
-    primary = Path(config.get("fence_path", RELEASE_FENCE_PATH))
-    if primary == RELEASE_FENCE_PATH:
-        persistent = PERSISTENT_RELEASE_FENCE_PATH
-    else:
-        persistent = primary.with_name("." + primary.name + ".persistent")
-    return tuple(dict.fromkeys((primary, persistent)))
-
-
-def _write_activation_fence(path: Path, transaction_id: str, release_id: str) -> bool:
-    """Create or verify one fence and report whether this call created it."""
-    _mkdir_private(path.parent, 0o750)
-    if path in {RELEASE_FENCE_PATH, PERSISTENT_RELEASE_FENCE_PATH}:
+@contextmanager
+def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id: str):
+    """Keep control-plane drain exit fenced for the whole activation window."""
+    path = Path(config.get("fence_path", RELEASE_FENCE_PATH))
+    _mkdir_private(path.parent, 0o755)
+    if path == RELEASE_FENCE_PATH:
         _require_root_owned_path(path.parent, "release activation fence directory")
     try:
         info = path.lstat()
@@ -579,7 +428,7 @@ def _write_activation_fence(path: Path, transaction_id: str, release_id: str) ->
     except OSError:
         _fail("release_fence_unverified", "release activation fence cannot be inspected")
     if info is not None:
-        if (path in {RELEASE_FENCE_PATH, PERSISTENT_RELEASE_FENCE_PATH} and info.st_uid != 0) or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        if (path == RELEASE_FENCE_PATH and info.st_uid != 0) or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
             _fail("release_fence_unverified", "release activation fence is not a private regular file")
         existing = _read_json(path, "release_fence_unverified")
         if (
@@ -588,175 +437,30 @@ def _write_activation_fence(path: Path, transaction_id: str, release_id: str) ->
             or existing.get("release_id") != release_id
         ):
             _fail("release_activation_in_progress", "another release activation fence is active")
-        return False
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = None
-    created = False
+    else:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump({"format": 1, "transaction_id": transaction_id, "release_id": release_id}, handle, sort_keys=True)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            _fsync_directory(path.parent)
+        except FileExistsError:
+            _fail("release_activation_in_progress", "another release activation fence is active")
+        except OSError:
+            _fail("release_fence_unavailable", "release activation fence cannot be created")
     try:
-        descriptor = os.open(path, flags, 0o600)
-        created = True
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            descriptor = None
-            json.dump({"format": 1, "transaction_id": transaction_id, "release_id": release_id}, handle, sort_keys=True)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        _fsync_directory(path.parent)
-    except FileExistsError:
-        _fail("release_activation_in_progress", "another release activation fence is active")
-    except (OSError, WrapperError) as failure:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        if created:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        if isinstance(failure, WrapperError):
-            raise
-        _fail("release_fence_unavailable", "release activation fence cannot be created")
-    except BaseException:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
-        if created:
-            try:
-                path.unlink()
-            except OSError:
-                pass
-        raise
-    return True
-
-
-def _clear_activation_fence(path: Path, transaction_id: str, release_id: str) -> None:
-    """Remove only the fence owned by this activation transaction."""
-    try:
-        info = path.lstat()
-    except FileNotFoundError:
-        return
-    except OSError:
-        _fail("release_fence_cleanup_failed", "release activation fence could not be inspected")
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
-        _fail("release_fence_cleanup_failed", "release activation fence is not a private regular file")
-    existing = _read_json(path, "release_fence_cleanup_failed")
-    if (
-        existing.get("format") != 1
-        or existing.get("transaction_id") != transaction_id
-        or existing.get("release_id") != release_id
-    ):
-        _fail("release_fence_cleanup_failed", "release activation fence ownership changed")
-    try:
-        path.unlink()
-        _fsync_directory(path.parent)
-    except OSError:
-        _fail("release_fence_cleanup_failed", "release activation fence could not be cleared")
-
-
-class _ActivationFenceHandle:
-    """Callable fence refresh hook with explicit failure cleanup policy."""
-
-    def __init__(self, refresh):
-        self._refresh = refresh
-        self._preserve_failure = False
-        self._cleanup_failure = False
-
-    def __call__(self) -> None:
-        self._refresh()
-
-    def preserve_on_failure(self) -> None:
-        self._preserve_failure = True
-        self._cleanup_failure = False
-
-    def allow_failure_cleanup(self) -> None:
-        if not self._preserve_failure:
-            self._cleanup_failure = True
-
-    @property
-    def cleanup_on_failure(self) -> bool:
-        return self._cleanup_failure
-
-
-def _preserve_activation_fence(refresh_fence) -> None:
-    preserve = getattr(refresh_fence, "preserve_on_failure", None)
-    if callable(preserve):
-        preserve()
-
-
-@contextmanager
-def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id: str):
-    """Keep control-plane drain exit fenced for the whole activation window."""
-    paths = _activation_fence_paths(config)
-    entries: list[tuple[Path, tuple[str, str, str], bool, bool]] = []
-    try:
-        for path in paths:
-            created = _write_activation_fence(path, transaction_id, release_id)
-            key = (str(path), transaction_id, release_id)
-            previous_depth = _ACTIVATION_FENCE_DEPTH.get(key, 0)
-            _ACTIVATION_FENCE_DEPTH[key] = previous_depth + 1
-            entries.append((path, key, created, previous_depth == 0))
-    except BaseException as failure:
-        cleanup_errors: list[dict[str, Any]] = []
-        for path, key, created, outermost in reversed(entries):
-            if _ACTIVATION_FENCE_DEPTH.get(key, 0) <= 1:
-                _ACTIVATION_FENCE_DEPTH.pop(key, None)
-            else:
-                _ACTIVATION_FENCE_DEPTH[key] -= 1
-            if not created or not outermost:
-                continue
-            try:
-                _clear_activation_fence(path, transaction_id, release_id)
-            except WrapperError as cleanup_error:
-                cleanup_errors.append(cleanup_error.as_dict())
-        if cleanup_errors:
-            initial_error = (
-                failure.as_dict()
-                if isinstance(failure, WrapperError)
-                else {"code": "activation_interrupted", "message": type(failure).__name__}
-            )
-            raise WrapperError(
-                "release_fence_cleanup_failed",
-                "release activation fence initialization failed and could not be fully cleaned up",
-                {"initial_error": initial_error, "cleanup_errors": cleanup_errors},
-            ) from failure
-        raise
-
-    def refresh() -> None:
-        # systemd may remove the service-owned primary directory when the
-        # native authority is stopped. Recreate both fence paths before any
-        # predecessor or candidate authority can be started again.
-        for path in paths:
-            _write_activation_fence(path, transaction_id, release_id)
-
-    fence_handle = _ActivationFenceHandle(refresh)
-    completed = False
-    failure: BaseException | None = None
-    try:
-        yield fence_handle
-        completed = True
-    except BaseException as error:
-        failure = error
-        raise
+        yield
     finally:
-        for path, key, created, outermost in reversed(entries):
-            final_depth = _ACTIVATION_FENCE_DEPTH.get(key, 0)
-            if final_depth <= 1:
-                _ACTIVATION_FENCE_DEPTH.pop(key, None)
-            else:
-                _ACTIVATION_FENCE_DEPTH[key] -= 1
-                continue
-            if not outermost or (not created and not completed):
-                continue
-            if failure is not None and not fence_handle.cleanup_on_failure:
-                continue
-            try:
-                _clear_activation_fence(path, transaction_id, release_id)
-            except WrapperError:
-                raise
+        try:
+            path.unlink()
+            _fsync_directory(path.parent)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            _fail("release_fence_cleanup_failed", "release activation fence could not be cleared")
 
 
 def _write_json(path: Path, value: Mapping[str, Any], mode: int = 0o600) -> None:
@@ -810,25 +514,7 @@ def _require_owned_regular_modes(path: Path, owner_uid: int, modes: tuple[int, .
         _fail("artifact_mode_mismatch", f"artifact mode differs: {path.name}", {"expected": list(modes), "actual": actual})
 
 
-def _artifact_runtime_path(
-    root: Path,
-    artifact: Mapping[str, Any],
-    artifact_paths: Mapping[str, Path] | None = None,
-) -> Path:
-    if artifact_paths is not None:
-        path = artifact_paths.get(str(artifact["path"]))
-        if path is not None:
-            return path
-    return root / Path(*PurePosixPath(str(artifact["path"])).parts)
-
-
-def _verify_unit_contents(
-    root: Path,
-    manifest: Mapping[str, Any],
-    *,
-    allow_historical_content: bool = False,
-    artifact_paths: Mapping[str, Path] | None = None,
-) -> None:
+def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_historical_content: bool = False) -> None:
     if _is_product_manifest(manifest):
         expected_units = PRODUCT_UNIT_EXEC_START if manifest["format"] == PRODUCT_MANIFEST_FORMAT else {"agent-vm-native.service": PRODUCT_UNIT_EXEC_START["agent-vm-native.service"]}
         expected_hashes = PRODUCT_UNIT_CONTENT_SHA256
@@ -839,7 +525,7 @@ def _verify_unit_contents(
             name = Path(item["path"]).name
             if name not in expected_units:
                 _fail("unit_unverified", f"product unit is not in the fixed allowlist: {name}")
-            path = _artifact_runtime_path(root, item, artifact_paths)
+            path = root / Path(*PurePosixPath(item["path"]).parts)
             try:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
@@ -861,7 +547,7 @@ def _verify_unit_contents(
             name = Path(item["path"]).name
             if name not in GO_UNIT_EXEC_START:
                 _fail("unit_unverified", f"Go unit is not in the fixed allowlist: {name}")
-            path = _artifact_runtime_path(root, item, artifact_paths)
+            path = root / Path(*PurePosixPath(item["path"]).parts)
             try:
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
@@ -882,7 +568,7 @@ def _verify_unit_contents(
         name = Path(item["path"]).name
         if name not in UNIT_EXEC_START and name != "agent-vm-native-age-gc.timer":
             _fail("unit_unverified", f"unit is not in the fixed allowlist: {name}")
-        path = _artifact_runtime_path(root, item, artifact_paths)
+        path = root / Path(*PurePosixPath(item["path"]).parts)
         try:
             content = path.read_text(encoding="utf-8")
         except (OSError, UnicodeError):
@@ -900,16 +586,10 @@ def _verify_unit_contents(
             _fail("unit_unverified", f"unit contains a forbidden control path: {name}")
 
 
-def _reject_transaction_extras(
-    root: Path,
-    manifest: Mapping[str, Any],
-    *,
-    allowed_extra_paths: set[str] | None = None,
-) -> None:
+def _reject_transaction_extras(root: Path, manifest: Mapping[str, Any]) -> None:
     allowed = {MANIFEST_NAME, "client-release.json", ".wrapper-state.json", ".verified.json"} | {
         item["path"] for item in manifest["artifacts"]
     }
-    allowed.update(allowed_extra_paths or set())
     for path in root.rglob("*"):
         if path.is_symlink():
             _fail("artifact_unverified", "transaction contains a symlink", {"path": path.relative_to(root).as_posix()})
@@ -1115,7 +795,6 @@ def _verify_retained_release(config: Mapping[str, Any], target: Path) -> dict[st
 
 def _atomic_symlink(target: Path, link: Path) -> None:
     temporary = link.with_name("." + link.name + ".tmp")
-    _require_directory_chain(link.parent, "activation_failed", f"release pointer parent: {link.parent}")
     try:
         if temporary.exists() or temporary.is_symlink():
             temporary.unlink()
@@ -1127,12 +806,7 @@ def _atomic_symlink(target: Path, link: Path) -> None:
 
 
 def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
-    _require_directory_chain(target.parent, "activation_unverified", f"activation target parent: {target.parent}")
-    try:
-        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    except OSError:
-        _fail("activation_failed", f"cannot prepare activation target parent: {target.parent.name}")
-    _require_directory_chain(target.parent, "activation_unverified", f"activation target parent: {target.parent}")
+    target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     if target.exists() or target.is_symlink():
         try:
             info = target.lstat()
@@ -1140,13 +814,10 @@ def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
             _fail("activation_unverified", f"cannot inspect activation target: {target.name}")
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             _fail("activation_unverified", f"activation target is not a regular file: {target.name}")
-    descriptor = None
-    temporary = None
+    descriptor, name = tempfile.mkstemp(prefix="." + target.name + ".", suffix=".release-tmp", dir=target.parent)
+    temporary = Path(name)
     try:
-        descriptor, name = tempfile.mkstemp(prefix="." + target.name + ".", suffix=".release-tmp", dir=target.parent)
-        temporary = Path(name)
         with os.fdopen(descriptor, "wb") as target_handle, source.open("rb") as source_handle:
-            descriptor = None
             shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
             target_handle.flush()
             os.fchmod(target_handle.fileno(), mode)
@@ -1156,62 +827,12 @@ def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
         os.replace(temporary, target)
         _fsync_directory(target.parent, "activation_failed")
     except OSError as exc:
-        if descriptor is not None:
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
         try:
-            if temporary is not None and temporary.exists():
+            if temporary.exists():
                 temporary.unlink()
         except OSError:
             pass
         _fail("activation_failed", f"cannot atomically install artifact: {target.name}")
-
-
-def _remove_owned_target(path: Path, owner_uid: int, modes: tuple[int, ...]) -> None:
-    """Remove one fixed predecessor artifact after checking its ownership and mode."""
-    _require_directory_chain(path.parent, "activation_unverified", f"activation target parent: {path.parent}")
-    if not path.exists() and not path.is_symlink():
-        return
-    _require_owned_regular_modes(path, owner_uid, modes)
-    try:
-        path.unlink()
-        _fsync_directory(path.parent, "activation_failed")
-    except OSError:
-        _fail("activation_failed", f"cannot retire the exact predecessor artifact: {path.name}")
-
-
-def _remove_native_predecessor_files(config: Mapping[str, Any], owner_uid: int) -> None:
-    """Remove the exact native artifacts when returning to the format-1 runtime."""
-    bundle_root = Path(config["control_path"]).parent
-    targets: list[tuple[Path, tuple[int, ...]]] = [
-        (bundle_root / "agent_vm_control_bridge.ts", (0o755,)),
-        (_go_control_target(config), (0o755,)),
-        (Path(config["unit_dir"]) / "agent-vm-native.service", (0o644,)),
-        (Path(config["unit_dir"]) / "agent-vm-web.service", (0o644,)),
-        (bundle_root / "systemd" / "agent-vm-native.service", (0o644,)),
-        (bundle_root / "systemd" / "agent-vm-web.service", (0o644,)),
-        (bundle_root / "config" / "agent-vm-web.json.example", (0o640, 0o644)),
-        (bundle_root / "web-assets.manifest.json", (0o644,)),
-    ]
-    for path, modes in targets:
-        _remove_owned_target(path, owner_uid, modes)
-
-
-def _remove_legacy_predecessor_files(config: Mapping[str, Any], owner_uid: int) -> None:
-    """Remove exact format-1-only files before installing a native runtime."""
-    bundle_root = Path(config["control_path"]).parent
-    targets = [
-        (bundle_root / name, (SUPPORT_ARTIFACT_MODES[name],))
-        for name in LEGACY_ONLY_SUPPORT_NAMES
-    ]
-    targets.extend(
-        (bundle_root / "systemd" / name, (0o644,))
-        for name in FIXED_UNIT_NAMES
-    )
-    for path, modes in targets:
-        _remove_owned_target(path, owner_uid, modes)
 
 
 def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
@@ -1219,19 +840,17 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
     targets = (
         Path(config["control_path"]),
         _go_control_target(config),
-        Path(config["control_path"]).with_name("agent_vm_control_bridge.ts"),
         Path(config["control_path"]).with_name(RETIRED_CONTROL_NAME),
         Path(config["control_path"]).with_name(RETIRED_CLIENT_NAME),
         Path(config["control_path"]).with_name("agent_vm.ts"),
         *(Path(config["control_path"]).with_name(name) for name in sorted(SUPPORT_ARTIFACT_NAMES)),
         Path(config["control_path"]).with_name(MANIFEST_NAME),
         Path(config["control_path"]).with_name("client-release.json"),
-    ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], "agent-vm-native.service", "agent-vm-web.service")) + tuple(
-        [bundle_root / "systemd" / name for name in (*FIXED_UNIT_NAMES, *PRODUCT_UNIT_NAMES)]
-        + [
-            bundle_root / "config" / "agent-vm-web.json.example",
-            bundle_root / "web-assets.manifest.json",
-        ]
+    ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], "agent-vm-native.service", "agent-vm-web.service")) + (
+        bundle_root / "systemd" / "agent-vm-native.service",
+        bundle_root / "systemd" / "agent-vm-web.service",
+        bundle_root / "config" / "agent-vm-web.json.example",
+        bundle_root / "web-assets.manifest.json",
     )
     return tuple(dict.fromkeys(targets))
 
@@ -1239,7 +858,6 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
 def _snapshot_targets(config: Mapping[str, Any]) -> dict[Path, tuple[bytes, int, int] | None]:
     snapshot: dict[Path, tuple[bytes, int, int] | None] = {}
     for target in _activation_targets(config):
-        _require_directory_chain(target.parent, "activation_unverified", f"activation target parent: {target.parent}")
         if not target.exists() and not target.is_symlink():
             snapshot[target] = None
             continue
@@ -1253,92 +871,8 @@ def _snapshot_targets(config: Mapping[str, Any]) -> dict[Path, tuple[bytes, int,
     return snapshot
 
 
-def _predecessor_snapshot_path(config: Mapping[str, Any], transaction_id: str) -> Path:
-    return Path(config["state_root"]) / (transaction_id + ".predecessor.json")
-
-
-def _persist_predecessor_snapshot(
-    config: Mapping[str, Any],
-    transaction_id: str,
-    snapshot: Mapping[Path, tuple[bytes, int, int] | None],
-    manifest: Mapping[str, Any],
-) -> None:
-    """Persist exact installed targets before a pointer-less runtime is stopped."""
-    targets: dict[str, Any] = {}
-    for target in sorted(snapshot, key=str):
-        saved = snapshot[target]
-        if saved is None:
-            targets[str(target)] = None
-            continue
-        data, mode, owner_uid = saved
-        targets[str(target)] = {
-            "data": base64.b64encode(data).decode("ascii"),
-            "mode": mode,
-            "owner_uid": owner_uid,
-        }
-    _write_json(
-        _predecessor_snapshot_path(config, transaction_id),
-        {
-            "format": 1,
-            "transaction_id": transaction_id,
-            "manifest": dict(manifest),
-            "targets": targets,
-        },
-    )
-
-
-def _load_predecessor_snapshot(
-    config: Mapping[str, Any],
-    transaction_id: str,
-) -> tuple[dict[Path, tuple[bytes, int, int] | None], dict[str, Any]]:
-    """Load and validate the durable predecessor material for interrupted activation."""
-    path = _predecessor_snapshot_path(config, transaction_id)
-    _require_owned_regular(path, int(config["owner_uid"]), 0o600)
-    record = _read_json(path, "rollback_unavailable")
-    if record.get("format") != 1 or record.get("transaction_id") != transaction_id:
-        _fail("rollback_unavailable", "pointer-less predecessor snapshot does not match the transaction")
-    manifest = record.get("manifest")
-    targets = record.get("targets")
-    if not isinstance(manifest, Mapping) or not isinstance(targets, Mapping):
-        _fail("rollback_unavailable", "pointer-less predecessor snapshot is incomplete")
-    expected_targets = {str(target) for target in _activation_targets(config)}
-    if set(targets) != expected_targets:
-        _fail("rollback_unavailable", "pointer-less predecessor snapshot has an unexpected target set")
-    restored: dict[Path, tuple[bytes, int, int] | None] = {}
-    for target in _activation_targets(config):
-        value = targets.get(str(target))
-        if value is None:
-            restored[target] = None
-            continue
-        if not isinstance(value, Mapping):
-            _fail("rollback_unavailable", "pointer-less predecessor snapshot entry is invalid")
-        encoded = value.get("data")
-        mode = value.get("mode")
-        owner_uid = value.get("owner_uid")
-        if (
-            not isinstance(encoded, str)
-            or isinstance(mode, bool)
-            or not isinstance(mode, int)
-            or mode < 0
-            or mode > 0o777
-            or isinstance(owner_uid, bool)
-            or not isinstance(owner_uid, int)
-            or owner_uid < 0
-        ):
-            _fail("rollback_unavailable", "pointer-less predecessor snapshot entry is invalid")
-        try:
-            data = base64.b64decode(encoded, validate=True)
-        except (ValueError, TypeError):
-            _fail("rollback_unavailable", "pointer-less predecessor snapshot bytes are invalid")
-        if len(data) > MAX_FILE_BYTES:
-            _fail("rollback_unavailable", "pointer-less predecessor snapshot file is too large")
-        restored[target] = (data, mode, owner_uid)
-    return restored, dict(manifest)
-
-
 def _restore_targets(snapshot: Mapping[Path, tuple[bytes, int, int] | None]) -> None:
     for target, saved in snapshot.items():
-        _require_directory_chain(target.parent, "activation_restore_failed", f"activation target parent: {target.parent}")
         if saved is None:
             try:
                 if target.exists() or target.is_symlink():
@@ -1351,7 +885,6 @@ def _restore_targets(snapshot: Mapping[Path, tuple[bytes, int, int] | None]) -> 
         temporary = None
         try:
             target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-            _require_directory_chain(target.parent, "activation_restore_failed", f"activation target parent: {target.parent}")
             descriptor, name = tempfile.mkstemp(prefix="." + target.name + ".", suffix=".restore-tmp", dir=target.parent)
             temporary = Path(name)
             with os.fdopen(descriptor, "wb") as handle:
@@ -1374,7 +907,6 @@ def _restore_targets(snapshot: Mapping[Path, tuple[bytes, int, int] | None]) -> 
 
 def _restore_pointer(link: Path, target: Path | None) -> None:
     if target is None:
-        _require_directory_chain(link.parent, "activation_restore_failed", f"release pointer parent: {link.parent}")
         try:
             if link.exists() or link.is_symlink():
                 link.unlink()
@@ -1434,156 +966,26 @@ def _validate_state_compatibility(manifest: Mapping[str, Any], capabilities: Any
             )
 
 
-def _read_state_capabilities(database: sqlite3.Connection) -> list[str]:
-    """Read the fixed state registry from an already-open read transaction."""
-    tables = {
-        str(row[0])
-        for row in database.execute(
-            "SELECT name FROM sqlite_master WHERE type = 'table'",
-        ).fetchall()
-    }
-    if "state_capabilities" not in tables:
-        _validate_legacy_state_schema(database)
-        return [STATE_CAPABILITY_MARKERS[0]]
-    rows = database.execute(
-        "SELECT name, version FROM state_capabilities ORDER BY name, version",
-    ).fetchall()
-    return [f"{name}@{version}" for name, version in rows]
-
-
 def _read_live_state_capabilities() -> list[str]:
     """Read the fixed state registry when an older controller omits it in drain-status."""
     uri = f"file:{STATE_DB_PATH}?mode=ro"
     try:
         with sqlite3.connect(uri, uri=True, timeout=30) as database:
-            return _read_state_capabilities(database)
+            rows = database.execute(
+                "SELECT name, version FROM state_capabilities ORDER BY name, version",
+            ).fetchall()
     except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower() and STATE_CAPABILITY_MARKERS:
+            try:
+                with sqlite3.connect(uri, uri=True, timeout=30) as database:
+                    _validate_legacy_state_schema(database)
+            except (OSError, sqlite3.Error):
+                _fail("state_compatibility_unverified", "live state schema could not be validated")
+            return [STATE_CAPABILITY_MARKERS[0]]
         _fail("state_compatibility_unverified", "live state capabilities could not be read")
     except (OSError, sqlite3.Error):
         _fail("state_compatibility_unverified", "live state capabilities could not be read")
-
-
-def _verify_durable_drain_state(
-    target_manifest: Mapping[str, Any] | None = None,
-    *,
-    expected_owner: str | None = None,
-) -> None:
-    """Prove admission silence from one consistent state-database snapshot.
-
-    Recovery may run after the activation interrupted while the predecessor
-    authority was being stopped. In that state the control command cannot be
-    used as the observation source, so the database must independently prove
-    that the release drain is still owned, sealed when supported, and free of
-    active work before rollback mutates files again.
-    """
-    uri = f"file:{STATE_DB_PATH}?mode=ro"
-    try:
-        with sqlite3.connect(uri, uri=True, timeout=30) as database:
-            database.execute("PRAGMA query_only = ON")
-            # Python's sqlite3 legacy transaction mode does not start a
-            # transaction for a SELECT. Begin explicitly so every drain and
-            # convergence query below observes one durable snapshot.
-            database.execute("BEGIN")
-            tables = {
-                str(row[0])
-                for row in database.execute(
-                    "SELECT name FROM sqlite_master WHERE type = 'table'",
-                ).fetchall()
-            }
-            required = {"meta", "tasks", "operations"}
-            if not required.issubset(tables):
-                _fail("drain_unverified", "durable release drain schema is incomplete")
-            meta = dict(
-                database.execute(
-                    "SELECT key, value FROM meta WHERE key IN ('draining', 'drain_owner', 'drain_sealed')",
-                ).fetchall()
-            )
-            if meta.get("draining") != "1":
-                _fail("drain_required", "release recovery requires an active admission drain")
-            owner = meta.get("drain_owner")
-            if expected_owner is not None:
-                if owner != expected_owner:
-                    _fail("drain_unverified", "durable release drain is not owned by this activation transaction")
-            elif owner not in (None, "") and (
-                not isinstance(owner, str) or not owner.startswith("release-")
-            ):
-                _fail("drain_unverified", "durable release drain is owned by another actor")
-            if "drain_sealed" in meta and meta["drain_sealed"] != "1":
-                _fail("drain_unverified", "durable release drain has not converged")
-            pending_operations = database.execute(
-                """
-                SELECT operation_id FROM operations
-                WHERE json_extract(response_json, '$.outcome') = 'pending'
-                ORDER BY created_at, operation_id LIMIT 1001
-                """,
-            ).fetchall()
-            if pending_operations:
-                _fail(
-                    "drain_unverified",
-                    "release recovery requires management operations to converge",
-                    {"pending_operations": [str(row[0]) for row in pending_operations[:100]]},
-                )
-            task_states = database.execute(
-                """
-                SELECT state, COUNT(*) FROM tasks
-                WHERE state IN ('closing', 'deleting', 'failed')
-                GROUP BY state ORDER BY state
-                """,
-            ).fetchall()
-            if task_states:
-                _fail(
-                    "drain_unverified",
-                    "release recovery requires task transitions to converge",
-                    {"task_states": {str(state): int(count) for state, count in task_states}},
-                )
-            if "management_operations" in tables:
-                management_operations = database.execute(
-                    """
-                    SELECT operation_id FROM management_operations
-                    WHERE status IN ('running', 'reconciling')
-                    ORDER BY created_at, operation_id LIMIT 1001
-                    """,
-                ).fetchall()
-                if management_operations:
-                    _fail(
-                        "drain_unverified",
-                        "release recovery requires management operations to converge",
-                        {"pending_operations": [str(row[0]) for row in management_operations[:100]]},
-                    )
-            capabilities = _read_state_capabilities(database)
-    except WrapperError:
-        raise
-    except (OSError, sqlite3.Error):
-        _fail("drain_unverified", "durable release drain could not be verified")
-    if target_manifest is not None:
-        _validate_state_compatibility(target_manifest, capabilities)
-
-
-def _verify_durable_drain_owner(expected_owner: str, *, allow_ownerless: bool = False) -> None:
-    """Prove or claim that the active durable drain belongs to this release transaction."""
-    uri = f"file:{STATE_DB_PATH}?mode=rw"
-    try:
-        with sqlite3.connect(uri, uri=True, timeout=30) as database:
-            database.execute("BEGIN IMMEDIATE")
-            meta = dict(
-                database.execute(
-                    "SELECT key, value FROM meta WHERE key IN ('draining', 'drain_owner')",
-                ).fetchall()
-            )
-            if meta.get("draining") != "1":
-                _fail("drain_required", "release activation requires an active admission drain")
-            owner = meta.get("drain_owner")
-            if owner in (None, "") and allow_ownerless:
-                database.execute(
-                    "INSERT INTO meta(key, value) VALUES('drain_owner', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    (expected_owner,),
-                )
-            elif owner != expected_owner:
-                _fail("drain_unverified", "durable release drain is not owned by this activation transaction")
-    except WrapperError:
-        raise
-    except (OSError, sqlite3.Error):
-        _fail("drain_unverified", "durable release drain owner could not be verified")
+    return [f"{name}@{version}" for name, version in rows]
 
 
 def _validate_legacy_state_schema(database: sqlite3.Connection) -> None:
@@ -1611,114 +1013,19 @@ def _validate_legacy_state_schema(database: sqlite3.Connection) -> None:
             _fail("state_compatibility_unverified", "live state schema is incomplete")
 
 
-def _verify_installed_release(
-    config: Mapping[str, Any],
-    installed_root: Path,
-    manifest: Mapping[str, Any],
-) -> dict[str, Any]:
-    """Verify the split runtime layout before using its control authority."""
-    _require_activation_parent_dirs(config, "drain_unverified")
-    runtime_paths: Mapping[str, Path] | None = None
-    if _is_go_manifest(manifest):
-        runtime_paths = _native_runtime_artifact_paths(config, manifest)
-        verify_go_bundle(installed_root, manifest)
-    elif _is_product_manifest(manifest):
-        target = manifest.get("target")
-        if not isinstance(target, Mapping) or target.get("os") != "linux":
-            _fail("drain_unverified", "installed product release is not a native Linux package")
-        runtime_paths = _native_runtime_artifact_paths(config, manifest)
-        from release_manifest import verify_product_bundle
-        verify_product_bundle(
-            installed_root,
-            manifest,
-            allow_historical_web_config_mode=True,
-        )
-    else:
-        runtime_paths = _legacy_runtime_artifact_paths(config, installed_root, manifest)
-        verify_runtime_bundle(manifest, runtime_paths)
-    checked = verify_client_sidecar(
-        installed_root,
-        manifest,
-        allow_historical_web_config_mode=True,
-    )
-    historical_legacy_residue = {
-        name for name in LEGACY_ONLY_SUPPORT_NAMES
-        if (installed_root / name).exists() or (installed_root / name).is_symlink()
-    } if (_is_go_manifest(checked) or _is_product_manifest(checked)) else set()
-    bridge_alias = installed_root / "agent_vm_control.ts"
-    allowed_extra_paths = set(historical_legacy_residue)
-    if (_is_go_manifest(checked) or _is_product_manifest(checked)) and (bridge_alias.exists() or bridge_alias.is_symlink()):
-        allowed_extra_paths.add(bridge_alias.name)
-    _reject_transaction_extras(installed_root, checked, allowed_extra_paths=allowed_extra_paths)
-    _verify_fixed_artifacts(config, checked, allow_historical_web_config_mode=True)
-    _verify_python_syntax(installed_root, checked)
-    _verify_typescript_syntax(installed_root, checked)
-    _verify_unit_contents(
-        installed_root,
-        checked,
-        allow_historical_content=True,
-        artifact_paths=runtime_paths,
-    )
-    owner_uid = int(config["owner_uid"])
-    _require_owned_regular(installed_root / MANIFEST_NAME, owner_uid, 0o644)
-    _require_owned_regular(installed_root / "client-release.json", owner_uid, 0o644)
-    for name in historical_legacy_residue:
-        _require_owned_regular(installed_root / name, owner_uid, SUPPORT_ARTIFACT_MODES[name])
-    for item in checked["artifacts"]:
-        _require_owned_regular(
-            _artifact_runtime_path(installed_root, item, runtime_paths),
-            owner_uid,
-            item["mode"],
-        )
-    if (_is_go_manifest(checked) or _is_product_manifest(checked)) and (bridge_alias.exists() or bridge_alias.is_symlink()):
-        bridge = next(
-            (item for item in checked["artifacts"] if item["path"] == "agent_vm_control_bridge.ts"),
-            None,
-        )
-        if bridge is None:
-            _fail("artifact_unverified", "installed compatibility bridge alias has no declared bridge")
-        _require_owned_regular(bridge_alias, owner_uid, bridge["mode"])
-    return checked
-
-
-def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any] | None = None) -> bool | None:
+def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any] | None = None) -> None:
     if not config["require_drained"]:
-        return None
-    _require_activation_parent_dirs(config, "drain_unverified")
+        return
     command = [BUN_PATH, str(config["control_path"])]
-    owner_capable = False
     sidecar = Path(config["control_path"]).with_name("client-release.json")
-    manifest_path = sidecar.parent / MANIFEST_NAME
-    if sidecar.exists() or sidecar.is_symlink():
+    if sidecar.is_file():
         try:
-            installed_root = sidecar.parent
-            installed_manifest = load_release_manifest(
-                installed_root / MANIFEST_NAME,
-                allow_historical_web_config_mode=True,
-            )
-            checked = _verify_installed_release(config, installed_root, installed_manifest)
-        except ManifestError as exc:
-            _fail("drain_unverified", "installed client release metadata is invalid", exc.as_dict())
-        except WrapperError as exc:
-            if exc.code == "drain_unverified":
-                raise
-            _fail("drain_unverified", "installed client release integrity is not verified", exc.as_dict())
-        if checked.get("format") in {GO_MANIFEST_FORMAT, LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
-            view = checked.get("client_view")
-            transport = view.get("transport") if isinstance(view, Mapping) else None
-            if transport not in {"legacy-bun", "go-request", "https"}:
-                _fail("drain_unverified", "installed client release transport is invalid")
-            if transport in {"go-request", "https"}:
-                command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
-                owner_capable = True
-            elif _is_go_manifest(checked) or _is_product_manifest(checked):
-                # Historical native packages may declare legacy-bun while
-                # carrying only the declared bridge, without the old alias.
-                # The bridge is the verified native compatibility authority.
-                command = [BUN_PATH, str(_go_bridge_target(config))]
-                owner_capable = True
-    elif manifest_path.exists() or manifest_path.is_symlink():
-        _fail("drain_unverified", "installed release manifest is present but the client sidecar is missing")
+            metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            _fail("drain_unverified", "installed client release metadata is invalid")
+        view = metadata.get("client_view") if isinstance(metadata, Mapping) else None
+        if isinstance(metadata, Mapping) and metadata.get("format") in {GO_MANIFEST_FORMAT, LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT} and isinstance(view, Mapping) and view.get("transport") == "go-request":
+            command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
     def control_result(action: str, *, allow_legacy_unknown: bool = False) -> Mapping[str, Any] | None:
         try:
             process = subprocess.run(
@@ -1775,7 +1082,6 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
             _fail("drain_unverified", "control returned an invalid pending-operation list")
         if pending:
             _fail("drain_unverified", "release activation requires management operations to converge", {"pending_operations": pending[:100]})
-    return owner_capable
 
 
 def _daemon_reload() -> None:
@@ -1823,7 +1129,7 @@ def _legacy_expiry_timers() -> tuple[str, ...]:
         )
     except (OSError, subprocess.TimeoutExpired):
         _fail("activation_failed", "systemd legacy expiry timer inventory could not be verified")
-    if process.returncode not in (0, 1) or (process.returncode == 1 and process.stderr.strip()):
+    if process.returncode not in (0, 1):
         _fail("activation_failed", "systemd legacy expiry timer inventory failed")
     units: set[str] = set()
     for line in process.stdout.decode("utf-8", errors="strict").splitlines():
@@ -1834,110 +1140,9 @@ def _legacy_expiry_timers() -> tuple[str, ...]:
     return tuple(sorted(units))
 
 
-def _legacy_expiry_services(timers: tuple[str, ...]) -> tuple[str, ...]:
-    prefix = "agent-vm-native-expire-"
-    suffix = ".timer"
-    services = []
-    for timer in timers:
-        if not timer.startswith(prefix) or not timer.endswith(suffix):
-            _fail("activation_failed", "systemd legacy expiry timer inventory contained an invalid unit")
-        instance = timer[len(prefix):-len(suffix)]
-        services.append(f"agent-vm-native-expire@{instance}.service")
-    try:
-        process = subprocess.run(
-            ["systemctl", "list-units", "--all", "--no-legend", "--no-pager", "agent-vm-native-expire@*.service"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        _fail("activation_failed", "systemd legacy expiry service inventory could not be verified")
-    if process.returncode not in (0, 1) or (process.returncode == 1 and process.stderr.strip()):
-        _fail("activation_failed", "systemd legacy expiry service inventory failed")
-    try:
-        lines = process.stdout.decode("utf-8", errors="strict").splitlines()
-    except UnicodeDecodeError:
-        _fail("activation_failed", "systemd legacy expiry service inventory is invalid")
-    for line in lines:
-        name = line.split()[0] if line.split() else ""
-        if LEGACY_EXPIRY_SERVICE_RE.fullmatch(name):
-            services.append(name)
-    return tuple(sorted(set(services)))
-
-
-def _deactivate_units(units: tuple[tuple[str, str], ...]) -> None:
-    errors: list[dict[str, Any]] = []
-    for action, unit in units:
-        try:
-            _systemctl(action, unit, allow_missing=True)
-        except WrapperError as error:
-            errors.append(error.as_dict())
-    if errors:
-        _fail("activation_failed", "one or more runtime deactivation steps failed", {"errors": errors})
-
-
 def _deactivate_web_runtime() -> None:
-    _deactivate_units((
-        ("stop", "agent-vm-web.service"),
-        ("disable", "agent-vm-web.service"),
-    ))
-
-
-def _deactivate_native_runtime() -> None:
-    """Stop native authorities before their fixed runtime files are retired."""
-    errors: list[dict[str, Any]] = []
-    try:
-        _deactivate_web_runtime()
-    except WrapperError as error:
-        errors.append(error.as_dict())
-    try:
-        _deactivate_units((
-            ("stop", "agent-vm-native.service"),
-            ("disable", "agent-vm-native.service"),
-        ))
-    except WrapperError as error:
-        errors.append(error.as_dict())
-    if errors:
-        _fail("activation_failed", "one or more native deactivation steps failed", {"errors": errors})
-
-
-def _deactivate_legacy_runtime() -> None:
-    """Stop the fixed legacy triggers before their files are retired."""
-    errors: list[dict[str, Any]] = []
-    try:
-        expiry_timers = _legacy_expiry_timers()
-    except WrapperError as error:
-        errors.append(error.as_dict())
-        expiry_timers = ()
-    try:
-        expiry_services = _legacy_expiry_services(expiry_timers)
-    except WrapperError as error:
-        errors.append(error.as_dict())
-        expiry_services = ()
-    try:
-        retired_timers = tuple(unit for unit in GO_RETIRED_UNITS if unit.endswith(".timer"))
-        retired_services = tuple(unit for unit in GO_RETIRED_UNITS if not unit.endswith(".timer"))
-        _deactivate_units(tuple(
-            (action, unit)
-            for unit in (*retired_timers, *expiry_timers, *retired_services, *expiry_services)
-            for action in ("stop", "disable")
-        ))
-    except WrapperError as error:
-        errors.append(error.as_dict())
-    if errors:
-        _fail("activation_failed", "one or more legacy deactivation steps failed", {"errors": errors})
-
-
-def _stop_runtime_authorities() -> list[dict[str, Any]]:
-    """Stop every runtime authority before reporting an incomplete recovery."""
-    shutdown_errors: list[dict[str, Any]] = []
-    for deactivate in (_deactivate_native_runtime, _deactivate_legacy_runtime):
-        try:
-            deactivate()
-        except WrapperError as shutdown_error:
-            shutdown_errors.append(shutdown_error.as_dict())
-    return shutdown_errors
+    _systemctl("stop", "agent-vm-web.service", allow_missing=True)
+    _systemctl("disable", "agent-vm-web.service", allow_missing=True)
 
 
 def _unit_is_enabled(unit: str) -> bool:
@@ -1959,7 +1164,9 @@ def _activate_go_runtime(*, web_enabled: bool = False) -> None:
     """Retire legacy triggers, enable Go, and verify that it is active."""
     if not web_enabled:
         _deactivate_web_runtime()
-    _deactivate_legacy_runtime()
+    for unit in (*GO_RETIRED_UNITS, *_legacy_expiry_timers()):
+        _systemctl("stop", unit, allow_missing=True)
+        _systemctl("disable", unit, allow_missing=True)
     _systemctl("enable", "agent-vm-native.service")
     _systemctl("restart", "agent-vm-native.service")
     _systemctl("is-active", "agent-vm-native.service")
@@ -1973,25 +1180,16 @@ def _activate_product_runtime(
     web_enabled = manifest.get("format") == PRODUCT_MANIFEST_FORMAT
     if web_enabled and web_was_enabled is None:
         web_was_enabled = _unit_is_enabled("agent-vm-web.service")
-    if web_enabled and web_was_enabled is False:
-        _deactivate_web_runtime()
     _activate_go_runtime(web_enabled=web_enabled)
     if web_was_enabled:
         # Requires=agent-vm-native.service stops Web during native restart.
-        _systemctl("enable", "agent-vm-web.service", allow_missing=True)
         _systemctl("start", "agent-vm-web.service", allow_missing=True)
 
 
-def _activate_legacy_runtime(
-    *,
-    native_already_stopped: bool = False,
-    refresh_fence=None,
-) -> None:
+def _activate_legacy_runtime() -> None:
     """Restore only the fixed legacy reconciliation triggers for rollback."""
-    if not native_already_stopped:
-        _deactivate_native_runtime()
-    if refresh_fence is not None:
-        refresh_fence()
+    _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+    _systemctl("disable", "agent-vm-native.service", allow_missing=True)
     _systemctl("start", "agent-vm-native-reconcile.service", allow_missing=True)
     _systemctl("enable", "agent-vm-native-reconcile.service", allow_missing=True)
     _systemctl("start", "agent-vm-native-age-gc.timer", allow_missing=True)
@@ -2002,7 +1200,6 @@ def _activate_legacy_runtime(
 
 
 def _install_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
-    _require_activation_parent_dirs(config, "activation_unverified")
     if _is_product_manifest(manifest):
         _install_product_release_files(config, release_root, manifest)
         return
@@ -2036,7 +1233,6 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
             support_installed.add(item["path"])
     if support_installed != SUPPORT_ARTIFACT_NAMES:
         _fail("activation_unverified", "fixed support modules are missing")
-    _remove_native_predecessor_files(config, owner_uid)
     manifest_source = release_root / MANIFEST_NAME
     _require_owned_regular(manifest_source, owner_uid, 0o644)
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
@@ -2081,12 +1277,6 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
         elif item["role"] == "control":
             if item["path"] == "agent_vm_control_bridge.ts":
                 _copy_atomic(source, _go_bridge_target(config), owner_uid, item["mode"])
-                # Keep the historical Bun entrypoint aligned with the bridge
-                # so the publisher and installed-release verifier share one
-                # compatibility authority across native package formats.
-                legacy_target = Path(config["control_path"])
-                if legacy_target != _go_bridge_target(config):
-                    _copy_atomic(source, legacy_target, owner_uid, item["mode"])
             elif item["path"] == "bin/agent-vm-control":
                 _copy_atomic(source, _go_control_target(config), owner_uid, item["mode"])
             else:
@@ -2101,7 +1291,6 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
     expected_client_support = {path for _, path, role, _ in PRODUCT_CLIENT_ARTIFACTS if role == "support"}
     if installed_support != expected_support or not expected_client_support.issubset(installed_support) or installed_controls != {"agent_vm_control_bridge.ts", "bin/agent-vm-control"}:
         _fail("activation_unverified", "fixed product control artifacts are missing")
-    _remove_legacy_predecessor_files(config, owner_uid)
     for name in GO_RETIRED_UNITS:
         retired = Path(config["unit_dir"]) / name
         if retired.exists() or retired.is_symlink():
@@ -2185,7 +1374,6 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
             _copy_atomic(source, go_bundle_root / item["path"], owner_uid, item["mode"])
     if installed_support != expected_support or installed_controls != {"agent_vm_control_bridge.ts", "bin/agent-vm-control"}:
         _fail("activation_unverified", "fixed Go control artifacts are missing")
-    _remove_legacy_predecessor_files(config, owner_uid)
     for name in GO_RETIRED_UNITS:
         retired = Path(config["unit_dir"]) / name
         if retired.exists() or retired.is_symlink():
@@ -2228,61 +1416,22 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
                 _fail("activation_failed", "cannot retire the exact replaced executable")
 
 
-def activate(
-    config: Mapping[str, Any],
-    transaction_id: str,
-    release_id: str,
-    session_id: str | None = None,
-) -> dict[str, Any]:
-    drain_owner = _release_drain_owner(transaction_id, session_id)
+def activate(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     with _release_lock(config):
-        with _activation_fence(config, transaction_id, release_id) as refresh_fence:
-            try:
-                return _activate_unlocked(
-                    config,
-                    transaction_id,
-                    release_id,
-                    refresh_fence,
-                    drain_owner,
-                )
-            except WrapperError:
-                refresh_fence.allow_failure_cleanup()
-                raise
+        with _activation_fence(config, transaction_id, release_id):
+            return _activate_unlocked(config, transaction_id, release_id)
 
 
-def _activate_unlocked(
-    config: Mapping[str, Any],
-    transaction_id: str,
-    release_id: str,
-    refresh_fence=None,
-    expected_drain_owner: str | None = None,
-    _drain_preflighted: bool = False,
-    _owner_capable: bool | None = None,
-) -> dict[str, Any]:
+def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
-    drain_owner = _release_drain_owner(transaction_id, expected_drain_owner)
     verified = _verify_transaction(config, transaction_id, release_id)
     staged = _transaction_dir(config, transaction_id)
     try:
         candidate_manifest = load_release_manifest(staged / MANIFEST_NAME)
     except ManifestError as exc:
         _fail(exc.code, exc.message, exc.detail)
-    if not _drain_preflighted:
-        owner_capable = _ensure_drained(config, candidate_manifest)
-        with _admission_lock():
-            return _activate_unlocked(
-                config,
-                transaction_id,
-                release_id,
-                refresh_fence,
-                drain_owner,
-                _drain_preflighted=True,
-                _owner_capable=owner_capable,
-            )
-    owner_capable = _owner_capable
-    if config["require_drained"]:
-        _verify_durable_drain_owner(drain_owner, allow_ownerless=owner_capable is False)
+    _ensure_drained(config, candidate_manifest)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
     if activation_path.exists() or activation_path.is_symlink():
         _fail("transaction_exists", "activation record already exists for this transaction")
@@ -2293,40 +1442,12 @@ def _activate_unlocked(
     old_previous = _current_target(previous_link, release_root)
     if old_current is not None and old_current == old_previous:
         _fail("activation_unverified", "current and previous pointers must not target the same release")
-    old_runtime_manifest = None
     if old_current is not None:
-        old_runtime_manifest = _verify_retained_release(config, old_current)
-    else:
-        # A legacy wrapper may have installed a runtime before the release
-        # pointers were introduced. Treat that installed control plane as the
-        # predecessor so cross-format activation stops it before retiring its
-        # files, instead of leaving an orphaned authority behind.
-        installed_root = Path(config["control_path"]).parent
-        installed_sidecar = installed_root / "client-release.json"
-        installed_manifest_path = installed_root / MANIFEST_NAME
-        if installed_sidecar.exists() or installed_sidecar.is_symlink():
-            try:
-                installed_manifest = load_release_manifest(
-                    installed_manifest_path,
-                    allow_historical_web_config_mode=True,
-                )
-                old_runtime_manifest = _verify_installed_release(
-                    config,
-                    installed_root,
-                    installed_manifest,
-                )
-            except ManifestError as exc:
-                _fail("activation_unverified", "installed release metadata is invalid", exc.as_dict())
-            except WrapperError as exc:
-                _fail("activation_unverified", "installed release integrity is not verified", exc.as_dict())
-        elif installed_manifest_path.exists() or installed_manifest_path.is_symlink():
-            _fail("activation_unverified", "installed release manifest is present but the client sidecar is missing")
+        _verify_retained_release(config, old_current)
     if old_previous is not None:
         _verify_retained_release(config, old_previous)
     web_unit_enabled = None
     if _is_product_manifest(candidate_manifest) or _is_go_manifest(candidate_manifest):
-        web_unit_enabled = _unit_is_enabled("agent-vm-web.service")
-    elif old_runtime_manifest is not None and _is_product_manifest(old_runtime_manifest):
         web_unit_enabled = _unit_is_enabled("agent-vm-web.service")
     _mkdir_private(release_root, 0o755)
     release_dir = release_root / release_id
@@ -2351,10 +1472,6 @@ def _activate_unlocked(
         _fail("activation_failed", "cannot commit verified release directory")
     previous_id = old_current.name if old_current else None
     target_snapshot = _snapshot_targets(config)
-    predecessor_snapshot = None
-    if old_current is None and old_runtime_manifest is not None:
-        _persist_predecessor_snapshot(config, transaction_id, target_snapshot, old_runtime_manifest)
-        predecessor_snapshot = True
     record = {
         "transaction_id": transaction_id,
         "release_id": release_id,
@@ -2366,38 +1483,11 @@ def _activate_unlocked(
         "activation_phase": "prepared",
         "rollback_attempts": 0,
         "web_unit_enabled": web_unit_enabled,
-        "drain_owner": drain_owner,
-        "predecessor_snapshot": predecessor_snapshot,
     }
     _write_json(activation_path, record)
     runtime_switch_attempted = False
-    predecessor_runtime_stopped = False
     try:
         manifest = load_release_manifest(release_dir / MANIFEST_NAME)
-        target_is_native = _is_product_manifest(manifest) or _is_go_manifest(manifest)
-        old_is_native = old_runtime_manifest is not None and (
-            _is_product_manifest(old_runtime_manifest) or _is_go_manifest(old_runtime_manifest)
-        )
-        if not target_is_native and old_is_native:
-            runtime_switch_attempted = True
-            record["activation_phase"] = "runtime-switching"
-            _write_json(activation_path, record)
-            _deactivate_native_runtime()
-            if refresh_fence is not None:
-                refresh_fence()
-            predecessor_runtime_stopped = True
-            record["activation_phase"] = "predecessor-stopped"
-            _write_json(activation_path, record)
-        elif target_is_native and old_runtime_manifest is not None and not old_is_native:
-            runtime_switch_attempted = True
-            record["activation_phase"] = "runtime-switching"
-            _write_json(activation_path, record)
-            _deactivate_legacy_runtime()
-            if refresh_fence is not None:
-                refresh_fence()
-            predecessor_runtime_stopped = True
-            record["activation_phase"] = "predecessor-stopped"
-            _write_json(activation_path, record)
         _install_release_files(config, release_dir, manifest)
         record["activation_phase"] = "files-installed"
         _write_json(activation_path, record)
@@ -2421,11 +1511,6 @@ def _activate_unlocked(
             _activate_go_runtime()
             record["activation_phase"] = "runtime-switched"
             _write_json(activation_path, record)
-        else:
-            runtime_switch_attempted = True
-            _activate_legacy_runtime(native_already_stopped=predecessor_runtime_stopped)
-            record["activation_phase"] = "runtime-switched"
-            _write_json(activation_path, record)
         record["activated"] = True
         record["activation_phase"] = "active"
         _write_json(activation_path, record)
@@ -2434,19 +1519,16 @@ def _activate_unlocked(
             raw_failure.code, raw_failure.message, raw_failure.detail,
         )
         restored = True
-        preserve_fence = False
-        old_manifest = old_runtime_manifest
+        old_manifest = None
         old_compatibility_error = None
-        if old_manifest is not None:
+        if old_current is not None:
             try:
-                if old_current is not None:
-                    old_manifest = load_release_manifest(old_current / MANIFEST_NAME)
+                old_manifest = load_release_manifest(old_current / MANIFEST_NAME)
                 _validate_state_compatibility(old_manifest, _read_live_state_capabilities())
             except (WrapperError, ManifestError) as compatibility_error:
                 old_compatibility_error = compatibility_error
         if old_compatibility_error is not None:
             restored = False
-            preserve_fence = True
             failure = WrapperError(
                 "activation_restore_blocked",
                 "the previous release cannot read the migrated state; the compatible candidate remains selected",
@@ -2468,51 +1550,33 @@ def _activate_unlocked(
                 )
             except WrapperError as restore_error:
                 restored = False
-                preserve_fence = True
                 failure = WrapperError(
                     "activation_restore_failed",
                     "activation failed and the previous release could not be fully restored",
                     {"activation_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
                 )
-        if not restored or (old_manifest is None and runtime_switch_attempted):
-            shutdown_errors = _stop_runtime_authorities()
-            if shutdown_errors:
-                preserve_fence = True
-                failure = WrapperError(
-                    "activation_restore_failed",
-                    "activation failed and the authorities could not be stopped safely",
-                    {"activation_error": failure.as_dict(), "shutdown_errors": shutdown_errors},
-                )
-        elif runtime_switch_attempted:
+        if runtime_switch_attempted:
             try:
-                assert old_manifest is not None
-                if _is_product_manifest(old_manifest):
-                    snapshot = record.get("web_unit_enabled")
-                    _activate_product_runtime(
-                        old_manifest,
-                        web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
-                    )
-                elif _is_go_manifest(old_manifest):
-                    _activate_go_runtime()
+                if not restored or old_current is None:
+                    _systemctl("stop", "agent-vm-native.service", allow_missing=True)
                 else:
-                    _activate_legacy_runtime(refresh_fence=refresh_fence)
+                    assert old_manifest is not None
+                    if _is_product_manifest(old_manifest):
+                        snapshot = record.get("web_unit_enabled")
+                        _activate_product_runtime(
+                            old_manifest,
+                            web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
+                        )
+                    elif _is_go_manifest(old_manifest):
+                        _activate_go_runtime()
+                    else:
+                        _activate_legacy_runtime()
             except (WrapperError, ManifestError) as runtime_error:
-                preserve_fence = True
                 failure = WrapperError(
                     "activation_restore_failed",
                     "activation failed and the previous runtime could not be restored",
                     {"activation_error": failure.as_dict(), "runtime_error": getattr(runtime_error, "as_dict", lambda: {"message": str(runtime_error)})()},
                 )
-                shutdown_errors = _stop_runtime_authorities()
-                if shutdown_errors:
-                    preserve_fence = True
-                    failure = WrapperError(
-                        "activation_restore_failed",
-                        "activation failed and the authorities could not be stopped safely",
-                        {"activation_error": failure.as_dict(), "shutdown_errors": shutdown_errors},
-                    )
-        if preserve_fence:
-            _preserve_activation_fence(refresh_fence)
         try:
             _write_json(activation_path, {
                 **record,
@@ -2526,41 +1590,15 @@ def _activate_unlocked(
     return record
 
 
-def rollback(
-    config: Mapping[str, Any],
-    transaction_id: str,
-    release_id: str,
-    session_id: str | None = None,
-) -> dict[str, Any]:
-    drain_owner = _release_drain_owner(transaction_id, session_id)
+def rollback(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     with _release_lock(config):
-        with _activation_fence(config, transaction_id, release_id) as refresh_fence:
-            try:
-                return _rollback_unlocked(
-                    config,
-                    transaction_id,
-                    release_id,
-                    refresh_fence,
-                    drain_owner,
-                )
-            except WrapperError:
-                refresh_fence.allow_failure_cleanup()
-                raise
+        with _activation_fence(config, transaction_id, release_id):
+            return _rollback_unlocked(config, transaction_id, release_id)
 
 
-def _rollback_unlocked(
-    config: Mapping[str, Any],
-    transaction_id: str,
-    release_id: str,
-    refresh_fence=None,
-    expected_drain_owner: str | None = None,
-    _admission_lock_held: bool = False,
-    _owner_capable: bool | None = None,
-    _preflight_web_unit_enabled: bool | None = None,
-) -> dict[str, Any]:
+def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
-    drain_owner = _release_drain_owner(transaction_id, expected_drain_owner)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
     try:
         activation_info = activation_path.lstat()
@@ -2571,40 +1609,24 @@ def _rollback_unlocked(
     record = _read_json(activation_path, "rollback_unavailable")
     interrupted_phases = {
         "prepared",
-        "runtime-switching",
-        "predecessor-stopped",
         "files-installed",
         "previous-pointer-updated",
         "current-pointer-updated",
         "daemon-reloaded",
         "runtime-switched",
-        "failed",
     }
     interrupted = record.get("activated") is False and record.get("activation_phase") in interrupted_phases
     if record.get("release_id") != release_id or not (record.get("activated") is True or interrupted):
         _fail("rollback_unavailable", "rollback transaction does not match the active release")
     rollback_state = record.get("rollback_state")
-    recovering_in_progress = rollback_state in {"in-progress", "failed"}
+    recovering_in_progress = record.get("activated") is True and rollback_state == "in-progress"
     if record.get("rollback_attempts", 0) >= 1 and not recovering_in_progress:
         _fail("rollback_already_attempted", "automatic rollback is limited to one attempt")
-    record_drain_owner = record.get("drain_owner")
-    if "drain_owner" in record and record_drain_owner != drain_owner:
-        _fail("drain_unverified", "rollback owner does not match the activation transaction")
-    if (interrupted or recovering_in_progress) and not isinstance(record_drain_owner, str):
-        _fail("drain_unverified", "activation recovery has no durable release owner")
     previous_id = record.get("previous_release_id")
-    pointerless_predecessor = previous_id is None and record.get("predecessor_snapshot") is True
-    predecessor_snapshot: dict[Path, tuple[bytes, int, int] | None] | None = None
-    predecessor_record_manifest: dict[str, Any] | None = None
-    if pointerless_predecessor:
-        predecessor_snapshot, predecessor_record_manifest = _load_predecessor_snapshot(config, transaction_id)
-        previous_dir = None
-        previous_manifest = predecessor_record_manifest
-    else:
-        if not isinstance(previous_id, str) or RELEASE_ID_RE.fullmatch(previous_id) is None:
-            _fail("rollback_unavailable", "no previous verified release is retained")
-        previous_dir = Path(config["release_root"]) / previous_id
-        previous_manifest = _verify_retained_release(config, previous_dir)
+    if not isinstance(previous_id, str) or RELEASE_ID_RE.fullmatch(previous_id) is None:
+        _fail("rollback_unavailable", "no previous verified release is retained")
+    previous_dir = Path(config["release_root"]) / previous_id
+    previous_manifest = _verify_retained_release(config, previous_dir)
     current_link = Path(config["current_link"])
     previous_link = Path(config["previous_link"])
     actual_current = _current_target(current_link, Path(config["release_root"]))
@@ -2613,40 +1635,23 @@ def _rollback_unlocked(
     old_previous_id = record.get("old_previous_release_id")
     if record.get("activated") is True:
         old_current_id = old_current_id or previous_id
-    elif not pointerless_predecessor and not isinstance(old_current_id, str):
+    elif not isinstance(old_current_id, str):
         _fail("rollback_unavailable", "interrupted activation has no retained current pointer record")
     for value, label in ((old_current_id, "old_current_release_id"), (old_previous_id, "old_previous_release_id")):
         if value is not None and (not isinstance(value, str) or RELEASE_ID_RE.fullmatch(value) is None):
             _fail("rollback_unavailable", f"{label} is invalid")
-    if old_current_id is not None and old_current_id == old_previous_id:
+    if old_current_id == old_previous_id:
         _fail("activation_unverified", "current and previous pointers must not target the same release")
     if old_current_id != previous_id:
         _fail("rollback_unavailable", "retained current release does not match the activation record")
-    active_manifest = None
-    if actual_current is not None:
-        active_manifest = _verify_retained_release(config, actual_current)
-    active_web_unit_enabled = None
-    if active_manifest is not None and active_manifest.get("format") == PRODUCT_MANIFEST_FORMAT:
-        active_web_unit_enabled = (
-            _preflight_web_unit_enabled
-            if _admission_lock_held
-            else _unit_is_enabled("agent-vm-web.service")
-        )
+    if old_current_id is not None:
+        _verify_retained_release(config, Path(config["release_root"]) / old_current_id)
     if old_previous_id is not None:
         _verify_retained_release(config, Path(config["release_root"]) / old_previous_id)
     if record.get("activated") is True:
         actual_current_name = actual_current.name if actual_current is not None else None
         actual_previous_name = actual_previous.name if actual_previous is not None else None
-        if pointerless_predecessor:
-            if recovering_in_progress:
-                if actual_current_name not in {release_id, None}:
-                    _fail("rollback_stale", "in-progress pointer-less rollback no longer matches the active release")
-                if actual_previous_name not in {old_previous_id, None}:
-                    _fail("rollback_stale", "in-progress pointer-less rollback previous pointer is unexpected")
-            else:
-                if actual_current_name != release_id or actual_previous_name != old_previous_id:
-                    _fail("rollback_stale", "pointer-less rollback transaction no longer matches release pointers")
-        elif recovering_in_progress:
+        if recovering_in_progress:
             before_current_switch = {old_current_id, old_previous_id, None}
             after_current_switch = {old_current_id, old_previous_id, release_id, None}
             if actual_current_name == release_id and actual_previous_name not in before_current_switch:
@@ -2663,43 +1668,11 @@ def _rollback_unlocked(
     else:
         allowed_current = {release_id, old_current_id}
         allowed_previous = {None, old_current_id, old_previous_id, release_id}
-        if (actual_current is None and not pointerless_predecessor) or (
-            actual_current is not None and actual_current.name not in allowed_current
-        ):
+        if actual_current is None or actual_current.name not in allowed_current:
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
         if actual_previous is not None and actual_previous.name not in allowed_previous:
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
-    if not _admission_lock_held:
-        preflight_owner_capable = _owner_capable
-        if not (interrupted or recovering_in_progress):
-            preflight_owner_capable = _ensure_drained(config, previous_manifest)
-        with _admission_lock():
-            return _rollback_unlocked(
-                config,
-                transaction_id,
-                release_id,
-                refresh_fence,
-                drain_owner,
-                _admission_lock_held=True,
-                _owner_capable=preflight_owner_capable,
-                _preflight_web_unit_enabled=active_web_unit_enabled,
-            )
-    # The activation record is written only after the original activation has
-    # drained the control plane. An interrupted activation or rollback may
-    # have already stopped that authority, so recovery must prove the current
-    # durable drain from one state-database snapshot instead of trusting the
-    # historical record or pointer layout. This also rejects a drain that was
-    # exited, or new work that crossed the fence, after the interruption.
-    if interrupted or recovering_in_progress:
-        if config["require_drained"]:
-            legacy_ownerless = not (_is_go_manifest(previous_manifest) or _is_product_manifest(previous_manifest))
-            _verify_durable_drain_owner(record_drain_owner, allow_ownerless=legacy_ownerless)
-            _verify_durable_drain_state(previous_manifest, expected_owner=record_drain_owner)
-    elif config["require_drained"]:
-        _verify_durable_drain_owner(
-            record_drain_owner if isinstance(record_drain_owner, str) else drain_owner,
-            allow_ownerless=_owner_capable is False,
-        )
+    _ensure_drained(config, previous_manifest)
     target_snapshot = _snapshot_targets(config)
     record["rollback_attempts"] = 1
     record["rollback_started"] = True
@@ -2707,75 +1680,24 @@ def _rollback_unlocked(
     record["rollback_state"] = "in-progress"
     record["draining"] = True
     _write_json(activation_path, record)
-    predecessor_runtime_stopped = False
-    runtime_switch_attempted = False
     try:
-        target_is_native = _is_product_manifest(previous_manifest) or _is_go_manifest(previous_manifest)
-        active_is_native = active_manifest is not None and (
-            _is_product_manifest(active_manifest) or _is_go_manifest(active_manifest)
-        )
-        if not target_is_native and active_is_native:
-            runtime_switch_attempted = True
-            _deactivate_native_runtime()
-            if refresh_fence is not None:
-                refresh_fence()
-            predecessor_runtime_stopped = True
-        elif target_is_native and active_manifest is not None and not active_is_native:
-            runtime_switch_attempted = True
-            _deactivate_legacy_runtime()
-            if refresh_fence is not None:
-                refresh_fence()
-            predecessor_runtime_stopped = True
-        if pointerless_predecessor:
-            if not predecessor_runtime_stopped and not active_is_native:
-                _deactivate_legacy_runtime()
-            _restore_targets(predecessor_snapshot or {})
-            restored_manifest_path = Path(config["control_path"]).with_name(MANIFEST_NAME)
-            restored_manifest = load_release_manifest(
-                restored_manifest_path,
-                allow_historical_web_config_mode=True,
-            )
-            previous_manifest = _verify_installed_release(
-                config,
-                restored_manifest_path.parent,
-                restored_manifest,
-            )
-        else:
-            _install_release_files(config, previous_dir, previous_manifest)
-        _restore_pointer(current_link, None) if pointerless_predecessor else _atomic_symlink(previous_dir, current_link)
+        _install_release_files(config, previous_dir, previous_manifest)
+        _atomic_symlink(previous_dir, current_link)
         if record.get("activated") is True:
-            if pointerless_predecessor:
-                _restore_pointer(
-                    previous_link,
-                    Path(config["release_root"]) / old_previous_id if old_previous_id is not None else None,
-                )
-            else:
-                _atomic_symlink(Path(config["release_root"]) / release_id, previous_link)
+            _atomic_symlink(Path(config["release_root"]) / release_id, previous_link)
         else:
             _restore_pointer(
                 previous_link,
                 Path(config["release_root"]) / old_previous_id if old_previous_id is not None else None,
             )
         _daemon_reload()
-        runtime_switch_attempted = True
         if _is_product_manifest(previous_manifest):
-            snapshot = record.get("web_unit_enabled")
-            _activate_product_runtime(
-                previous_manifest,
-                web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
-            )
+            _activate_product_runtime(previous_manifest)
         elif _is_go_manifest(previous_manifest):
             _activate_go_runtime()
         else:
-            _activate_legacy_runtime(native_already_stopped=predecessor_runtime_stopped or pointerless_predecessor)
-    except (WrapperError, ManifestError) as raw_failure:
-        failure = raw_failure if isinstance(raw_failure, WrapperError) else WrapperError(
-            raw_failure.code,
-            raw_failure.message,
-            raw_failure.detail,
-        )
-        restore_succeeded = False
-        preserve_fence = False
+            _activate_legacy_runtime()
+    except WrapperError as failure:
         try:
             _restore_activation_state(
                 config,
@@ -2785,54 +1707,12 @@ def _rollback_unlocked(
                 actual_previous,
                 target_snapshot,
             )
-            restore_succeeded = True
         except WrapperError as restore_error:
-            preserve_fence = True
             failure = WrapperError(
                 "activation_restore_failed",
                 "rollback failed and the previous release could not be fully restored",
                 {"rollback_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
             )
-        if not restore_succeeded:
-            preserve_fence = True
-            shutdown_errors = _stop_runtime_authorities()
-            if shutdown_errors:
-                preserve_fence = True
-                failure = WrapperError(
-                    "activation_restore_failed",
-                    "rollback failed and the authorities could not be stopped safely",
-                    {"rollback_error": failure.as_dict(), "shutdown_errors": shutdown_errors},
-                )
-        elif runtime_switch_attempted:
-            try:
-                if active_manifest is None:
-                    _systemctl("stop", "agent-vm-native.service", allow_missing=True)
-                elif _is_product_manifest(active_manifest):
-                    _activate_product_runtime(
-                        active_manifest,
-                        web_was_enabled=active_web_unit_enabled,
-                    )
-                elif _is_go_manifest(active_manifest):
-                    _activate_go_runtime()
-                else:
-                    _activate_legacy_runtime(refresh_fence=refresh_fence)
-            except (WrapperError, ManifestError) as runtime_error:
-                preserve_fence = True
-                failure = WrapperError(
-                    "activation_restore_failed",
-                    "rollback failed and the previous runtime could not be restored",
-                    {"rollback_error": failure.as_dict(), "runtime_error": getattr(runtime_error, "as_dict", lambda: {"message": str(runtime_error)})()},
-                )
-                shutdown_errors = _stop_runtime_authorities()
-                if shutdown_errors:
-                    preserve_fence = True
-                    failure = WrapperError(
-                        "activation_restore_failed",
-                        "rollback failed and the authorities could not be stopped safely",
-                        {"rollback_error": failure.as_dict(), "shutdown_errors": shutdown_errors},
-                    )
-        if preserve_fence:
-            _preserve_activation_fence(refresh_fence)
         record["rollback_phase"] = "failed"
         record["rollback_state"] = "failed"
         record["rollback_error"] = failure.as_dict()
@@ -2849,8 +1729,6 @@ def _rollback_unlocked(
     try:
         _write_json(activation_path, record)
     except WrapperError as record_error:
-        shutdown_errors = _stop_runtime_authorities()
-        restore_error = None
         try:
             _restore_activation_state(
                 config,
@@ -2860,46 +1738,12 @@ def _rollback_unlocked(
                 actual_previous,
                 target_snapshot,
             )
-        except WrapperError as error:
-            restore_error = error
-        if shutdown_errors or restore_error is not None:
-            _preserve_activation_fence(refresh_fence)
-            detail = {"record_error": record_error.as_dict()}
-            if shutdown_errors:
-                detail["shutdown_errors"] = shutdown_errors
-            if restore_error is not None:
-                detail["restore_error"] = restore_error.as_dict()
+        except WrapperError as restore_error:
             raise WrapperError(
                 "activation_restore_failed",
                 "rollback record could not be persisted and the active release could not be fully restored",
-                detail,
+                {"record_error": record_error.as_dict(), "restore_error": restore_error.as_dict()},
             ) from restore_error
-        try:
-            if active_manifest is None:
-                _systemctl("stop", "agent-vm-native.service", allow_missing=True)
-            elif _is_product_manifest(active_manifest):
-                _activate_product_runtime(
-                    active_manifest,
-                    web_was_enabled=active_web_unit_enabled,
-                )
-            elif _is_go_manifest(active_manifest):
-                _activate_go_runtime()
-            else:
-                _activate_legacy_runtime(refresh_fence=refresh_fence)
-        except (WrapperError, ManifestError) as runtime_error:
-            _preserve_activation_fence(refresh_fence)
-            shutdown_errors = _stop_runtime_authorities()
-            detail = {
-                "record_error": record_error.as_dict(),
-                "runtime_error": getattr(runtime_error, "as_dict", lambda: {"message": str(runtime_error)})(),
-            }
-            if shutdown_errors:
-                detail["shutdown_errors"] = shutdown_errors
-            raise WrapperError(
-                "activation_restore_failed",
-                "rollback record could not be persisted and the active runtime could not be restored",
-                detail,
-            ) from runtime_error
         record["rollback_error"] = record_error.as_dict()
         try:
             _write_json(activation_path, record)
@@ -2908,9 +1752,8 @@ def _rollback_unlocked(
         raise record_error
     return {
         "rolled_back": True,
-        "release_id": _manifest_release_id(previous_manifest) if pointerless_predecessor else previous_id,
+        "release_id": previous_id,
         "previous_release_id": release_id if record.get("activated") is True else None,
-        "predecessor_restored": pointerless_predecessor,
     }
 
 
@@ -2922,7 +1765,6 @@ def status(config: Mapping[str, Any]) -> dict[str, Any]:
         "current_release_id": current.name if current else None,
         "previous_release_id": previous.name if previous else None,
         "release_root": str(config["release_root"]),
-        "supports_release_session_id": True,
     }
 
 
@@ -2938,11 +1780,9 @@ def build_parser() -> argparse.ArgumentParser:
     activate_parser = subparsers.add_parser("activate")
     activate_parser.add_argument("--transaction-id", required=True)
     activate_parser.add_argument("--release-id", required=True)
-    activate_parser.add_argument("--session-id")
     rollback_parser = subparsers.add_parser("rollback")
     rollback_parser.add_argument("--transaction-id", required=True)
     rollback_parser.add_argument("--release-id", required=True)
-    rollback_parser.add_argument("--session-id")
     subparsers.add_parser("status")
     return parser
 
@@ -2957,9 +1797,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "verify":
             result = verify_transaction(config, _safe_id(args.transaction_id, "transaction_id"), _release_id(args.release_id))
         elif args.action == "activate":
-            result = activate(config, args.transaction_id, args.release_id, args.session_id)
+            result = activate(config, args.transaction_id, args.release_id)
         elif args.action == "rollback":
-            result = rollback(config, args.transaction_id, args.release_id, args.session_id)
+            result = rollback(config, args.transaction_id, args.release_id)
         else:
             result = status(config)
         sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")

@@ -13,7 +13,6 @@ export const DEFAULT_RESOURCES = { cpu: 2, memory_mib: 4096, disk_gib: 20 };
 export const DEFAULT_CONFIG_PATH = "/etc/agent-vm-native/config.json";
 export const DEFAULT_TIMER_DIR = "/etc/systemd/system";
 export const DEFAULT_RELEASE_FENCE_PATH = "/run/agent-vm-native/release-activation.fence";
-export const PERSISTENT_RELEASE_FENCE_PATH = "/run/agent-vm-release/release-activation.fence";
 export const TASK_ID_RE = /^[a-z0-9][a-z0-9-]{0,47}$/;
 export const SESSION_ID_RE = /^[A-Za-z0-9_.:@/-]{1,160}$/;
 export const PORT_NAME_RE = /^[a-z][a-z0-9-]{0,30}$/;
