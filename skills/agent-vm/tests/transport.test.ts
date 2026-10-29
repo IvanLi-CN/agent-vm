@@ -102,7 +102,7 @@ test("HTTPS response data and errors redact the bearer token before return, jour
   const f = fixture(); httpsSidecar(f);
   f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
   f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
-  f.client.http = async (_url, init) => new Response(json(response(parseJson(String(init.body)), { result: { echoed: "opaque-agent-token" } })), { status: 200 });
+  f.client.http = async (_url, init) => new Response(json(response(parseJson(String(init.body)), { result: { echoed: "opaque-agent-token", "opaque-agent-token": "object-key" } })), { status: 200 });
   const returned = await f.client.request("renew", { session: "https-session", generation: 8, operationId: "echo-success", write: true });
   expect(JSON.stringify(returned)).not.toContain("opaque-agent-token");
   expect(JSON.stringify(readJson(f.client.operationPath("https-session", "echo-success")))).not.toContain("opaque-agent-token");

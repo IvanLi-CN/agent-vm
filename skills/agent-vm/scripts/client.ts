@@ -79,7 +79,7 @@ function redactSecret(value: any, secret: string): any {
   if (!secret) return value;
   if (typeof value === "string") return value.replaceAll(secret, "[REDACTED]");
   if (Array.isArray(value)) return value.map(item => redactSecret(item, secret));
-  if (record(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactSecret(item, secret)]));
+  if (record(value)) return Object.fromEntries(Object.entries(value).map(([key, item]) => [key.replaceAll(secret, "[REDACTED]"), redactSecret(item, secret)]));
   return value;
 }
 
