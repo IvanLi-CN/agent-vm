@@ -177,6 +177,7 @@ type Store struct {
 	reads            [2]*sql.DB
 	readIndex        atomic.Uint32
 	imageSelectionMu sync.Mutex
+	remote           *remoteBackend
 }
 
 type Tx struct {
@@ -205,6 +206,9 @@ type TaskCondition struct {
 func Open(path string, allowCreate bool) (*Store, error) {
 	if path == "" {
 		return nil, fmt.Errorf("%s: empty path", missingDBCode)
+	}
+	if isRemoteDSN(path) {
+		return openRemote(path, allowCreate)
 	}
 	if info, err := os.Stat(path); err != nil {
 		if !allowCreate && errors.Is(err, os.ErrNotExist) {
@@ -268,6 +272,9 @@ func OpenForTest(path string) (*Store, error) {
 func (s *Store) Path() string { return s.path }
 
 func (s *Store) Close() error {
+	if s.remote != nil {
+		return s.remote.close()
+	}
 	var first error
 	for _, db := range s.reads {
 		if db != nil {
@@ -352,6 +359,9 @@ func configure(conn *sql.Conn, ctx context.Context) error {
 }
 
 func (s *Store) withRead(ctx context.Context, fn func(*sql.Conn) error) error {
+	if s.remote != nil {
+		return s.remote.withRead(ctx, fn)
+	}
 	db := s.reads[s.readIndex.Add(1)%uint32(len(s.reads))]
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -365,6 +375,9 @@ func (s *Store) withRead(ctx context.Context, fn func(*sql.Conn) error) error {
 }
 
 func (s *Store) withWrite(ctx context.Context, fn func(*Tx) error) error {
+	if s.remote != nil {
+		return s.remote.withWrite(ctx, fn)
+	}
 	conn, err := s.write.Conn(ctx)
 	if err != nil {
 		return &TransactionError{Phase: "connection", SQLOperation: "write", StateCommitted: committed(false), Cause: err}
@@ -803,6 +816,10 @@ func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
 func (s *Store) DeleteTaskIf(ctx context.Context, taskID string, condition TaskCondition) (bool, error) {
 	deleted := false
 	err := s.withWrite(ctx, func(tx *Tx) error {
+		// A remote write may replay the callback after a proven state-epoch
+		// conflict. Recompute the result from the final attempt instead of
+		// retaining a successful result from an abandoned local attempt.
+		deleted = false
 		var sessionID string
 		var generation int64
 		err := tx.conn.QueryRowContext(ctx, "SELECT session_id, generation FROM tasks WHERE task_id = ?", taskID).Scan(&sessionID, &generation)
