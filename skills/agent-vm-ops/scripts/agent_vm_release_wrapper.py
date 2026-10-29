@@ -280,7 +280,9 @@ def _require_directory_chain(path: Path, code: str, label: str) -> None:
             continue
         if not stat.S_ISDIR(info.st_mode):
             _fail(code, f"{label} is not a directory")
-        if info.st_uid not in allowed_owners or stat.S_IMODE(info.st_mode) & 0o022:
+        mode = stat.S_IMODE(info.st_mode)
+        sticky_shared = info.st_uid == 0 and mode & 0o1000 and mode & 0o022
+        if info.st_uid not in allowed_owners or (mode & 0o022 and not sticky_shared):
             _fail(code, f"{label} is not owned and private")
         if current == current.parent:
             return
@@ -1495,6 +1497,7 @@ def _activate_product_runtime(
     _activate_go_runtime(web_enabled=web_enabled)
     if web_was_enabled:
         # Requires=agent-vm-native.service stops Web during native restart.
+        _systemctl("enable", "agent-vm-web.service", allow_missing=True)
         _systemctl("start", "agent-vm-web.service", allow_missing=True)
 
 

@@ -374,8 +374,10 @@ class WrapperTests(unittest.TestCase):
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn(["systemctl", "is-enabled", "--quiet", "agent-vm-web.service"], commands)
         native_restart = commands.index(["systemctl", "restart", "agent-vm-native.service"])
+        web_enable = commands.index(["systemctl", "enable", "agent-vm-web.service"])
         web_start = commands.index(["systemctl", "start", "agent-vm-web.service"])
-        self.assertLess(native_restart, web_start)
+        self.assertLess(native_restart, web_enable)
+        self.assertLess(web_enable, web_start)
 
     def test_product_runtime_does_not_start_a_disabled_web_unit(self):
         def run(command, **kwargs):
