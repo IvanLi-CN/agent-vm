@@ -93,6 +93,20 @@ func (err *StateEpochError) Error() string {
 	return fmt.Sprintf("state_unverified: state database epoch %s", err.Reason)
 }
 
+func validateStateEpoch(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "initial" || stateEpochHex.MatchString(value) {
+		return nil
+	}
+	if value == "0" || (value != "" && value[0] != '0') {
+		if parsed, parseErr := strconv.ParseUint(value, 10, 63); parseErr == nil && parsed <= uint64(^uint64(0)>>1) {
+			return nil
+		}
+		return &StateEpochError{Value: value, Reason: "is out of range"}
+	}
+	return &StateEpochError{Value: value, Reason: "is invalid"}
+}
+
 // TransactionError preserves the point at which a SQLite mutation failed.
 // A nil StateCommitted means that the commit result cannot be established and
 // callers must keep the operation pending for reconciliation.
@@ -440,17 +454,7 @@ func (s *Store) StateEpoch(ctx context.Context) (string, error) {
 		if err != nil {
 			return err
 		}
-		value = strings.TrimSpace(value)
-		if value == "initial" || stateEpochHex.MatchString(value) {
-			return nil
-		}
-		if value == "0" || (value != "" && value[0] != '0') {
-			if parsed, parseErr := strconv.ParseUint(value, 10, 63); parseErr == nil && parsed <= uint64(^uint64(0)>>1) {
-				return nil
-			}
-			return &StateEpochError{Value: value, Reason: "is out of range"}
-		}
-		return &StateEpochError{Value: value, Reason: "is invalid"}
+		return validateStateEpoch(value)
 	})
 	return value, err
 }

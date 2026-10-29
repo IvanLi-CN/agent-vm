@@ -195,6 +195,9 @@ func (err *ImageReferenceError) Error() string {
 }
 
 func (s *Store) EnsureManagementSchema(ctx context.Context) error {
+	if s.remote != nil {
+		return s.remote.ensureManagementSchema(ctx)
+	}
 	return s.withWrite(ctx, func(tx *Tx) error {
 		if _, err := tx.exec(managementSchema); err != nil {
 			return fmt.Errorf("create management schema: %w", err)

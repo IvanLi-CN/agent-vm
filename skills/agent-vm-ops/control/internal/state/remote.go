@@ -97,10 +97,11 @@ type remoteSnapshot struct {
 	Epoch   string
 }
 
-// SQLiteMigrationGate is the proof supplied by the caller that the one-time
-// migration fence has already stopped new durable writes, drained native
-// workers, and closed all SQLite writers. The adapter deliberately fails
-// closed when any one of those facts is absent.
+// SQLiteMigrationGate is the state-layer test boundary for evidence that a
+// service/deployment coordinator will eventually provide. These booleans do
+// not establish a production fence; the exported migration entry remains
+// disabled until that coordinator supplies real writer, worker and native
+// quiescence evidence.
 type SQLiteMigrationGate struct {
 	StateWriteFenced    bool
 	WorkersQuiescent    bool
@@ -116,6 +117,21 @@ func isRemoteDSN(path string) bool {
 }
 
 func openRemote(dsn string, allowCreate bool) (*Store, error) {
+	store, err := newRemoteStore(dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := store.remote.open(context.Background(), allowCreate); err != nil {
+		_ = store.Close()
+		return nil, err
+	}
+	return store, nil
+}
+
+// newRemoteStore creates only the local mirror and HTTP client. It deliberately
+// does not probe or mutate the remote database so migration can perform a
+// side-effect-free target preflight first.
+func newRemoteStore(dsn string) (*Store, error) {
 	parsed, err := url.Parse(dsn)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return nil, fmt.Errorf("state backend URL is invalid")
@@ -141,10 +157,6 @@ func openRemote(dsn string, allowCreate bool) (*Store, error) {
 		write:  mirror,
 		reads:  [2]*sql.DB{mirror, mirror},
 		remote: backend,
-	}
-	if err := backend.open(context.Background(), allowCreate); err != nil {
-		_ = backend.close()
-		return nil, err
 	}
 	return store, nil
 }
@@ -176,6 +188,11 @@ func (r *remoteBackend) open(ctx context.Context, allowCreate bool) error {
 	if err != nil {
 		return fmt.Errorf("rqlite schema probe: %w", err)
 	}
+	if len(objects) != 0 {
+		if err := requireCanonicalCoreSchema(ctx, objects); err != nil {
+			return err
+		}
+	}
 	if allowCreate {
 		statements := make([]remoteStatement, 0, 8)
 		for _, statement := range splitSQLStatements(schema) {
@@ -190,7 +207,7 @@ func (r *remoteBackend) open(ctx context.Context, allowCreate bool) error {
 			return fmt.Errorf("rqlite schema recheck: %w", err)
 		}
 	}
-	if err := requireCoreSchema(objects); err != nil {
+	if err := requireCanonicalCoreSchema(ctx, objects); err != nil {
 		if !allowCreate && len(objects) == 0 {
 			return fmt.Errorf("%s: %s", missingDBCode, r.base.String())
 		}
@@ -219,16 +236,121 @@ func requireCoreSchema(objects []remoteSchemaObject) error {
 	return nil
 }
 
+func requireCanonicalCoreSchema(ctx context.Context, objects []remoteSchemaObject) error {
+	if err := requireCoreSchema(objects); err != nil {
+		return err
+	}
+	canonical, err := canonicalCoreSchema(ctx)
+	if err != nil {
+		return fmt.Errorf("build canonical core schema: %w", err)
+	}
+	actual := make(map[string]remoteSchemaObject, len(objects))
+	for _, object := range objects {
+		key := objectKey(object.Type, object.Name)
+		if _, exists := actual[key]; exists {
+			return fmt.Errorf("database schema contains duplicate object %s", key)
+		}
+		actual[key] = object
+	}
+	for key, expected := range canonical {
+		object, exists := actual[key]
+		if !exists {
+			return fmt.Errorf("database schema missing canonical object %s", key)
+		}
+		if object.SQL != expected.SQL {
+			return fmt.Errorf("database schema differs from canonical object %s", key)
+		}
+	}
+	return nil
+}
+
+func canonicalCoreSchema(ctx context.Context) (map[string]remoteSchemaObject, error) {
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	for _, statement := range splitSQLStatements(schema) {
+		if _, err := conn.ExecContext(ctx, statement); err != nil {
+			return nil, err
+		}
+	}
+	objects, err := localSchemaObjects(ctx, conn)
+	if err != nil {
+		return nil, err
+	}
+	result := make(map[string]remoteSchemaObject, len(objects))
+	for _, object := range objects {
+		result[objectKey(object.Type, object.Name)] = object
+	}
+	return result, nil
+}
+
 func (r *remoteBackend) ensureRemoteEpoch(ctx context.Context) error {
 	result, err := r.query(ctx, "SELECT value FROM meta WHERE key = 'state_epoch'")
 	if err != nil {
 		return fmt.Errorf("read rqlite state epoch: %w", err)
 	}
 	if len(result.Values) != 0 {
+		if len(result.Values) != 1 || len(result.Values[0]) != 1 {
+			return errors.New("rqlite state epoch is not unique")
+		}
+		value := strings.TrimSpace(fmt.Sprint(result.Values[0][0]))
+		if err := validateStateEpoch(value); err != nil {
+			return err
+		}
 		return nil
 	}
 	if _, err := r.request(ctx, []remoteStatement{{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('state_epoch', 'initial')"}}, true); err != nil {
 		return fmt.Errorf("initialize rqlite state epoch: %w", err)
+	}
+	return nil
+}
+
+func (r *remoteBackend) ensureManagementSchema(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	statements := make([]remoteStatement, 0, 12)
+	for _, statement := range splitSQLStatements(managementSchema) {
+		statements = append(statements, remoteStatement{query: statement})
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for _, marker := range []struct {
+		name    string
+		version int64
+	}{
+		{name: "legacy-agent-vm-core", version: 1},
+		{name: "managed-image-catalog", version: 1},
+		{name: "session-image-binding", version: 1},
+		{name: "management-operation-audit", version: 1},
+	} {
+		statements = append(statements, remoteStatement{
+			query: "INSERT OR IGNORE INTO state_capabilities(name, version, created_at) VALUES(?, ?, ?)",
+			args:  []any{marker.name, marker.version, now},
+		})
+	}
+	statements = append(statements,
+		remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('management_selection_revision', '1')"},
+		remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('management_catalog_revision', '1')"},
+	)
+	if _, err := r.request(ctx, statements, true); err != nil {
+		var statementErr *remoteStatementError
+		stateCommitted := (*bool)(nil)
+		if errors.As(err, &statementErr) {
+			stateCommitted = committed(false)
+		}
+		return &TransactionError{Phase: "commit", SQLOperation: "rqlite_management_schema", StateCommitted: stateCommitted, Cause: err}
+	}
+	if err := r.syncLocked(ctx); err != nil {
+		return &TransactionError{Phase: "verify", SQLOperation: "rqlite_management_schema", StateCommitted: nil, Cause: err}
 	}
 	return nil
 }
@@ -374,8 +496,8 @@ func (r *remoteBackend) request(ctx context.Context, statements []remoteStatemen
 		return remoteResponse{}, fmt.Errorf("decode rqlite response: %w", err)
 	}
 	for index, item := range result.Results {
-		if item.Error != "" {
-			return result, &remoteStatementError{Index: index, Message: item.Error}
+		if message := remoteResultError(item); message != "" {
+			return result, &remoteStatementError{Index: index, Message: message}
 		}
 	}
 	return result, nil
@@ -399,10 +521,27 @@ func (r *remoteBackend) query(ctx context.Context, statement string) (remoteResu
 	if len(result.Results) == 0 {
 		return remoteResult{}, nil
 	}
-	if result.Results[0].Error != "" {
-		return remoteResult{}, &remoteStatementError{Index: 0, Message: result.Results[0].Error}
+	if message := remoteResultError(result.Results[0]); message != "" {
+		return remoteResult{}, &remoteStatementError{Index: 0, Message: message}
 	}
 	return result.Results[0], nil
+}
+
+func remoteResultError(result remoteResult) string {
+	if result.Error != "" {
+		return result.Error
+	}
+	if result.ErrorV2 == nil {
+		return ""
+	}
+	if message, ok := result.ErrorV2.(string); ok && message != "" {
+		return message
+	}
+	encoded, err := json.Marshal(result.ErrorV2)
+	if err == nil && string(encoded) != "null" {
+		return "rqlite error_v2: " + string(encoded)
+	}
+	return "rqlite error_v2"
 }
 
 func (r *remoteBackend) do(ctx context.Context, method, path string, values url.Values, body io.Reader) (io.ReadCloser, error) {
@@ -462,7 +601,7 @@ func (r *remoteBackend) syncLocked(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := requireCoreSchema(objects); err != nil {
+		if err := requireCanonicalCoreSchema(ctx, objects); err != nil {
 			return err
 		}
 		if err := r.rebuildMirror(ctx, objects); err != nil {
@@ -484,10 +623,14 @@ func (r *remoteBackend) remoteEpoch(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if len(result.Values) != 1 || len(result.Values[0]) < 1 {
+	if len(result.Values) != 1 || len(result.Values[0]) != 1 {
 		return "", errors.New("rqlite state epoch is missing")
 	}
-	return fmt.Sprint(result.Values[0][0]), nil
+	value := strings.TrimSpace(fmt.Sprint(result.Values[0][0]))
+	if err := validateStateEpoch(value); err != nil {
+		return "", err
+	}
+	return value, nil
 }
 
 func (r *remoteBackend) rebuildMirror(ctx context.Context, objects []remoteSchemaObject) error {
@@ -848,7 +991,7 @@ func snapshotConn(ctx context.Context, conn *sql.Conn) (remoteSnapshot, error) {
 		if keyIndex >= 0 && valueIndex >= 0 {
 			for _, row := range table.Rows {
 				if fmt.Sprint(row.Values[keyIndex]) == "state_epoch" {
-					snapshot.Epoch = fmt.Sprint(row.Values[valueIndex])
+					snapshot.Epoch = strings.TrimSpace(fmt.Sprint(row.Values[valueIndex]))
 					break
 				}
 			}
@@ -995,6 +1138,12 @@ func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteS
 	if targetEpoch == "" {
 		targetEpoch = after.Epoch
 	}
+	if err := validateStateEpoch(expectedEpoch); err != nil {
+		return false, fmt.Errorf("invalid expected state epoch: %w", err)
+	}
+	if err := validateStateEpoch(targetEpoch); err != nil {
+		return false, fmt.Errorf("invalid target state epoch: %w", err)
+	}
 	statements := make([]remoteStatement, 0)
 
 	for key := range before.Objects {
@@ -1011,6 +1160,9 @@ func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteS
 			return false, fmt.Errorf("rqlite schema changed for %s", key)
 		}
 	}
+	if !snapshotHasStateEpoch(before) && snapshotHasStateEpoch(after) {
+		statements = append(statements, remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('state_epoch', 'initial')"})
+	}
 
 	for _, tableName := range orderedSnapshotTables(after.Tables) {
 		afterTable := after.Tables[tableName]
@@ -1025,27 +1177,54 @@ func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteS
 	if len(statements) == 0 {
 		return true, nil
 	}
+	guardKey := "__agent_vm_epoch_guard_" + randomHex(12)
+	proofKey := guardKey + "_proof"
+	guardIndex := len(statements)
 	statements = append(statements,
+		remoteStatement{
+			query: "INSERT INTO meta(key, value) SELECT ?, CASE WHEN EXISTS (SELECT 1 FROM meta WHERE key = 'state_epoch' AND value = ?) THEN 'ok' ELSE NULL END",
+			args:  []any{guardKey, expectedEpoch},
+		},
 		remoteStatement{
 			query: "UPDATE meta SET value = ? WHERE key = 'state_epoch' AND value = ?",
 			args:  []any{targetEpoch, expectedEpoch},
 		},
+		remoteStatement{
+			query: "INSERT INTO meta(key, value) SELECT ?, CASE WHEN changes() = 1 THEN 'ok' ELSE NULL END",
+			args:  []any{proofKey},
+		},
+		remoteStatement{query: "DELETE FROM meta WHERE key IN (?, ?)", args: []any{guardKey, proofKey}},
 	)
 	response, err := r.request(ctx, statements, true)
 	if err != nil {
 		return false, err
 	}
-	if len(response.Results) == 0 {
+	if len(response.Results) <= guardIndex+1 {
 		return false, errors.New("rqlite transaction did not return its epoch update")
 	}
-	// /db/execute returns statement metadata rather than row values, so the
-	// guarded epoch update's rows_affected field is the commit proof. A zero
-	// count means another writer changed the epoch before this transaction.
-	update := response.Results[len(response.Results)-1]
+	// /db/execute returns statement metadata rather than row values. The
+	// guarded update and the immediately following proof statement establish
+	// that the expected epoch existed and was advanced inside this same
+	// request-level transaction. A stale epoch makes the proof statement fail,
+	// which rolls back DDL and every row change in the batch.
+	update := response.Results[guardIndex+1]
 	if update.RowsAffected != 1 {
-		return false, nil
+		return false, errors.New("rqlite transaction did not advance its epoch")
 	}
 	return true, nil
+}
+
+func snapshotHasStateEpoch(snapshot remoteSnapshot) bool {
+	table, exists := snapshot.Tables["meta"]
+	if !exists {
+		return false
+	}
+	for _, row := range table.Rows {
+		if isStateEpochRow(table, row) {
+			return true
+		}
+	}
+	return false
 }
 
 func afterObjectsMissing(before, after map[string]remoteSchemaObject) []remoteSchemaObject {
@@ -1209,28 +1388,21 @@ func equalIntSlices(left, right []int) bool {
 }
 
 func migrationSnapshotsEqual(left, right remoteSnapshot) bool {
-	if len(left.Objects) != len(right.Objects) || len(left.Tables) != len(right.Tables) || left.Epoch != right.Epoch {
-		return false
-	}
-	for key := range left.Objects {
-		if _, exists := right.Objects[key]; !exists {
-			return false
-		}
-	}
-	for table, value := range left.Tables {
-		other, exists := right.Tables[table]
-		if !exists || !tableSnapshotsEqual(value, other) {
-			return false
-		}
-	}
-	return true
+	return snapshotsEqual(left, right)
 }
 
-// MigrateSQLiteToRQLite imports a fenced SQLite snapshot into a pristine
-// rqlite database. It never opens the source as a writer and refuses to
-// overwrite an existing target. A failed rqlite transaction leaves the target
-// unchanged, while a lost response is returned as an unknown commit.
-func MigrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, gate SQLiteMigrationGate) error {
+// MigrateSQLiteToRQLite is intentionally fail-closed until the service and
+// deployment layers provide a real migration fence and quiescence proof.
+func MigrateSQLiteToRQLite(context.Context, string, string, SQLiteMigrationGate) error {
+	return errors.New("state migration is disabled until service/deployment fence evidence is integrated")
+}
+
+// migrateSQLiteToRQLite imports a fenced SQLite snapshot into a pristine
+// rqlite database for state-package validation. It is deliberately unexported
+// so production callers cannot mistake caller-supplied booleans for a real
+// migration fence. A failed rqlite transaction leaves the target unchanged,
+// while a lost response is returned as an unknown commit.
+func migrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, gate SQLiteMigrationGate) error {
 	if !gate.StateWriteFenced || !gate.WorkersQuiescent || !gate.SQLiteWritersClosed {
 		return errors.New("state migration requires a write fence, quiescent workers, and closed SQLite writers")
 	}
@@ -1251,19 +1423,49 @@ func MigrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, ga
 	if err != nil {
 		return fmt.Errorf("snapshot SQLite state: %w", err)
 	}
+	if !snapshotHasStateEpoch(sourceSnapshot) {
+		return errors.New("SQLite state epoch is missing")
+	}
+	if err := validateStateEpoch(sourceSnapshot.Epoch); err != nil {
+		return fmt.Errorf("validate SQLite state epoch: %w", err)
+	}
 
-	target, err := openRemote(rqliteURL, true)
+	target, err := newRemoteStore(rqliteURL)
 	if err != nil {
 		return err
 	}
 	defer target.Close()
 	target.remote.mu.Lock()
 	defer target.remote.mu.Unlock()
-	targetSnapshot, err := snapshotDB(ctx, target.remote.mirror)
+	targetObjects, err := target.remote.remoteSchema(ctx)
 	if err != nil {
-		return fmt.Errorf("snapshot rqlite target: %w", err)
+		return fmt.Errorf("probe rqlite target: %w", err)
 	}
-	if !pristineRemoteTarget(targetSnapshot) {
+	targetSnapshot := remoteSnapshot{
+		Objects: make(map[string]remoteSchemaObject),
+		Tables:  make(map[string]remoteTableSnapshot),
+		Epoch:   "initial",
+	}
+	if len(targetObjects) != 0 {
+		if err := requireCanonicalCoreSchema(ctx, targetObjects); err != nil {
+			return fmt.Errorf("validate rqlite target schema: %w", err)
+		}
+		if _, err := target.remote.remoteEpoch(ctx); err != nil {
+			return fmt.Errorf("validate rqlite target epoch: %w", err)
+		}
+		if err := target.remote.syncLocked(ctx); err != nil {
+			return fmt.Errorf("refresh rqlite target: %w", err)
+		}
+		targetSnapshot, err = snapshotDB(ctx, target.remote.mirror)
+		if err != nil {
+			return fmt.Errorf("snapshot rqlite target: %w", err)
+		}
+	}
+	pristine, err := pristineRemoteTarget(ctx, targetSnapshot)
+	if err != nil {
+		return fmt.Errorf("validate rqlite target contents: %w", err)
+	}
+	if !pristine {
 		return errors.New("rqlite migration target is not pristine")
 	}
 	applied, err := target.remote.applySnapshot(ctx, targetSnapshot, sourceSnapshot, targetSnapshot.Epoch, sourceSnapshot.Epoch)
@@ -1276,17 +1478,17 @@ func MigrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, ga
 		return &TransactionError{Phase: "commit", SQLOperation: "rqlite_migration", StateCommitted: nil, Cause: cause}
 	}
 	if !applied {
-		return errors.New("rqlite migration target changed concurrently")
+		return &TransactionError{Phase: "commit", SQLOperation: "rqlite_migration", StateCommitted: committed(false), Cause: errors.New("rqlite migration target changed concurrently")}
 	}
 	if err := target.remote.syncLocked(ctx); err != nil {
-		return fmt.Errorf("refresh imported rqlite state: %w", err)
+		return &TransactionError{Phase: "verify", SQLOperation: "rqlite_migration", StateCommitted: nil, Cause: fmt.Errorf("refresh imported rqlite state: %w", err)}
 	}
 	imported, err := snapshotDB(ctx, target.remote.mirror)
 	if err != nil {
-		return fmt.Errorf("verify imported rqlite state: %w", err)
+		return &TransactionError{Phase: "verify", SQLOperation: "rqlite_migration", StateCommitted: nil, Cause: fmt.Errorf("verify imported rqlite state: %w", err)}
 	}
 	if !migrationSnapshotsEqual(sourceSnapshot, imported) {
-		return errors.New("rqlite import verification mismatch")
+		return &TransactionError{Phase: "verify", SQLOperation: "rqlite_migration", StateCommitted: nil, Cause: errors.New("rqlite import verification mismatch")}
 	}
 	return nil
 }
@@ -1295,9 +1497,9 @@ func openSQLiteReadOnly(path string) (*sql.DB, error) {
 	if path == "" {
 		return nil, fmt.Errorf("%s: empty path", missingDBCode)
 	}
-	readonlyPath := path
-	if !strings.HasPrefix(path, "file:") && !strings.Contains(path, "?") {
-		readonlyPath = "file:" + path + "?mode=ro"
+	readonlyPath, err := sqliteReadOnlyDSN(path)
+	if err != nil {
+		return nil, err
 	}
 	db, err := sql.Open("sqlite", readonlyPath)
 	if err != nil {
@@ -1305,7 +1507,28 @@ func openSQLiteReadOnly(path string) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open SQLite read-only: %w", err)
+	}
 	return db, nil
+}
+
+func sqliteReadOnlyDSN(path string) (string, error) {
+	if strings.HasPrefix(path, "file:") {
+		parsed, err := url.Parse(path)
+		if err != nil {
+			return "", fmt.Errorf("parse SQLite URI: %w", err)
+		}
+		query := parsed.Query()
+		query.Set("mode", "ro")
+		parsed.RawQuery = query.Encode()
+		return parsed.String(), nil
+	}
+	if strings.Contains(path, "?") {
+		return "", errors.New("SQLite paths with query parameters must use a file: URI")
+	}
+	return "file:" + path + "?mode=ro", nil
 }
 
 func requireSQLiteSchema(ctx context.Context, db *sql.DB) error {
@@ -1318,7 +1541,7 @@ func requireSQLiteSchema(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	return requireCoreSchema(objects)
+	return requireCanonicalCoreSchema(ctx, objects)
 }
 
 func countMigrationBlockingOperations(ctx context.Context, db *sql.DB) (int, error) {
@@ -1346,24 +1569,50 @@ func countMigrationBlockingOperations(ctx context.Context, db *sql.DB) (int, err
 	return pending + unknown + managementBlocking, nil
 }
 
-func pristineRemoteTarget(snapshot remoteSnapshot) bool {
+func pristineRemoteTarget(ctx context.Context, snapshot remoteSnapshot) (bool, error) {
+	if len(snapshot.Objects) == 0 {
+		return len(snapshot.Tables) == 0 && snapshot.Epoch == "initial", nil
+	}
+	canonical, err := canonicalCoreSchema(ctx)
+	if err != nil {
+		return false, err
+	}
+	if len(snapshot.Objects) != len(canonical) {
+		return false, nil
+	}
+	for key, expected := range canonical {
+		actual, exists := snapshot.Objects[key]
+		if !exists || actual.SQL != expected.SQL {
+			return false, nil
+		}
+	}
+	if snapshot.Epoch != "initial" {
+		return false, nil
+	}
 	for table := range snapshot.Tables {
 		if table != "meta" && table != "tasks" && table != "ports" && table != "operations" && table != "audit" {
-			return false
+			return false, nil
 		}
 	}
 	for table, value := range snapshot.Tables {
 		if table == "meta" {
+			if len(value.Rows) != 1 {
+				return false, nil
+			}
+			valueIndex := indexOf(value.Columns, "value")
+			if valueIndex < 0 {
+				return false, nil
+			}
 			for key, row := range value.Rows {
-				if !isStateEpochRow(value, row) || key == "" {
-					return false
+				if !isStateEpochRow(value, row) || key == "" || valueIndex >= len(row.Values) || fmt.Sprint(row.Values[valueIndex]) != "initial" {
+					return false, nil
 				}
 			}
 			continue
 		}
 		if len(value.Rows) != 0 {
-			return false
+			return false, nil
 		}
 	}
-	return true
+	return true, nil
 }
