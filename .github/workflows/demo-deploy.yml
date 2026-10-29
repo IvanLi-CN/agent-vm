@@ -44,6 +44,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           name: demo-site
@@ -51,13 +52,22 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.11.0'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - name: Install locked deployment tools
+        run: bun install --frozen-lockfile
+      - name: Reject stale main revision
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
+        run: test "$(gh api "repos/$REPOSITORY/commits/main" --jq .sha)" = "$SOURCE_SHA"
       - name: Stage artifact outside the repository
         run: |
           stage="$(mktemp -d "$RUNNER_TEMP/edgeone-demo.XXXXXX")"
           cp -R demo-site/. "$stage/"
           echo "EDGEONE_ARTIFACT_DIR=$stage" >> "$GITHUB_ENV"
-      - name: Install project verification SDK
-        run: npm install --prefix "$RUNNER_TEMP/edgeone-sdk" --ignore-scripts --no-audit --no-fund @edgeone/makers-sdk@0.1.0
       - name: Verify existing EdgeOne project
         env:
           EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
@@ -65,8 +75,7 @@ jobs:
           EDGEONE_PROJECT_NAME: ${{ vars.EDGEONE_PROJECT_NAME }}
         run: |
           node --input-type=module <<'NODE'
-          import { pathToFileURL } from 'node:url';
-          const { Makers } = await import(pathToFileURL(`${process.env.RUNNER_TEMP}/edgeone-sdk/node_modules/@edgeone/makers-sdk/dist/index.js`));
+          import { Makers } from '@edgeone/makers-sdk';
           if (!process.env.EDGEONE_API_TOKEN || !process.env.EDGEONE_PROJECT_ID || process.env.EDGEONE_PROJECT_NAME !== 'agent-vm-demo') throw new Error('Missing or unexpected deployment configuration');
           const makers = new Makers({ token: process.env.EDGEONE_API_TOKEN, region: 'china' });
           const project = await makers.projects.get({ projectId: process.env.EDGEONE_PROJECT_ID });
@@ -79,4 +88,4 @@ jobs:
         run: |
           test -n "$EDGEONE_API_TOKEN"
           test "$EDGEONE_PROJECT_NAME" = agent-vm-demo
-          npx --yes edgeone@1.6.47 makers deploy "$EDGEONE_ARTIFACT_DIR" --name "$EDGEONE_PROJECT_NAME" --token "$EDGEONE_API_TOKEN" --env production --skip-ai-gateway-sync
+          node_modules/.bin/edgeone makers deploy "$EDGEONE_ARTIFACT_DIR" --name "$EDGEONE_PROJECT_NAME" --token "$EDGEONE_API_TOKEN" --env production --skip-ai-gateway-sync
