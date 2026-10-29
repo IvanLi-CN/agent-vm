@@ -1921,8 +1921,8 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     if old_current_id != previous_id:
         _fail("rollback_unavailable", "retained current release does not match the activation record")
     active_manifest = None
-    if old_current_id is not None:
-        active_manifest = _verify_retained_release(config, Path(config["release_root"]) / old_current_id)
+    if actual_current is not None:
+        active_manifest = _verify_retained_release(config, actual_current)
     if old_previous_id is not None:
         _verify_retained_release(config, Path(config["release_root"]) / old_previous_id)
     if record.get("activated") is True:
@@ -1982,6 +1982,7 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 Path(config["release_root"]) / old_previous_id if old_previous_id is not None else None,
             )
         _daemon_reload()
+        runtime_switch_attempted = True
         if _is_product_manifest(previous_manifest):
             _activate_product_runtime(previous_manifest)
         elif _is_go_manifest(previous_manifest):

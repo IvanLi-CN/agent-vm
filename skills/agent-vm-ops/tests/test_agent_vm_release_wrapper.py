@@ -653,6 +653,13 @@ class WrapperTests(unittest.TestCase):
             self.assertFalse((installed_root / "systemd" / name).exists(), name)
         for name in WRAPPER.GO_RETIRED_UNITS:
             self.assertFalse((Path(self.loaded["unit_dir"]) / name).exists(), name)
+        installed_manifest = MANIFEST.load_release_manifest(
+            installed_root / MANIFEST.MANIFEST_NAME,
+        )
+        self.assertEqual(
+            WRAPPER._verify_installed_release(self.loaded, installed_root, installed_manifest)["format"],
+            MANIFEST.GO_MANIFEST_FORMAT,
+        )
 
     def test_native_to_format_one_activation_hands_off_runtime_before_cleanup(self):
         self.loaded["require_drained"] = False
@@ -676,6 +683,130 @@ class WrapperTests(unittest.TestCase):
         self.assertLess(native_stop, legacy_start)
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, legacy_release_id)
         self.assertFalse((Path(self.loaded["unit_dir"]) / "agent-vm-native.service").exists())
+
+    def test_cross_format_rollback_hands_off_runtime_before_cleanup(self):
+        self.loaded["require_drained"] = False
+        legacy_release_id = "b" * 40
+        native_release_id = "a" * 40
+        native_payload = self._go_payload(native_release_id, transport="https")
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            WRAPPER.stage(self.loaded, "tx-legacy", legacy_release_id, self.payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-legacy", legacy_release_id)
+            WRAPPER.activate(self.loaded, "tx-legacy", legacy_release_id)
+            WRAPPER.stage(self.loaded, "tx-native", native_release_id, native_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-native", native_release_id)
+            WRAPPER.activate(self.loaded, "tx-native", native_release_id)
+
+        events = []
+        original_install = WRAPPER._install_release_files
+
+        def install(*args, **kwargs):
+            events.append("install")
+            return original_install(*args, **kwargs)
+
+        def stop_native():
+            events.append("deactivate-native")
+
+        def daemon_reload():
+            events.append("daemon-reload")
+
+        def start_legacy(*, native_already_stopped=False):
+            events.append(("activate-legacy", native_already_stopped))
+
+        with mock.patch.object(WRAPPER, "_install_release_files", side_effect=install), mock.patch.object(
+            WRAPPER, "_deactivate_native_runtime", side_effect=stop_native,
+        ), mock.patch.object(WRAPPER, "_daemon_reload", side_effect=daemon_reload), mock.patch.object(
+            WRAPPER, "_activate_legacy_runtime", side_effect=start_legacy,
+        ):
+            result = WRAPPER.rollback(self.loaded, "tx-native", native_release_id)
+
+        self.assertTrue(result["rolled_back"])
+        self.assertLess(events.index("deactivate-native"), events.index("install"))
+        self.assertLess(events.index("install"), events.index("daemon-reload"))
+        self.assertEqual(events[-1], ("activate-legacy", True))
+
+    def test_native_rollback_runtime_failure_restores_previous_authority(self):
+        self.loaded["require_drained"] = False
+        first_release_id = "a" * 40
+        second_release_id = "b" * 40
+        first_payload = self._go_payload(first_release_id, transport="https")
+        second_payload = self._go_payload(second_release_id, transport="https")
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            WRAPPER.stage(self.loaded, "tx-first-native", first_release_id, first_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-first-native", first_release_id)
+            WRAPPER.activate(self.loaded, "tx-first-native", first_release_id)
+            WRAPPER.stage(self.loaded, "tx-second-native", second_release_id, second_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-second-native", second_release_id)
+            WRAPPER.activate(self.loaded, "tx-second-native", second_release_id)
+
+            with mock.patch.object(
+                WRAPPER,
+                "_activate_go_runtime",
+                side_effect=[WRAPPER.WrapperError("activation_failed", "injected"), None],
+            ) as activate_go:
+                with self.assertRaises(WRAPPER.WrapperError) as failure:
+                    WRAPPER.rollback(self.loaded, "tx-second-native", second_release_id)
+
+        self.assertEqual(failure.exception.code, "activation_failed")
+        self.assertEqual(activate_go.call_count, 2)
+        record = json.loads(
+            (Path(self.loaded["state_root"]) / "tx-second-native.activation.json").read_text(),
+        )
+        self.assertEqual(record["rollback_state"], "failed")
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, second_release_id)
+
+    def test_cross_format_rollback_to_native_hands_off_legacy_before_cleanup(self):
+        self.loaded["require_drained"] = False
+        native_release_id = "a" * 40
+        legacy_release_id = "b" * 40
+        native_payload = self._go_payload(native_release_id, transport="https")
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            WRAPPER.stage(self.loaded, "tx-native", native_release_id, native_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-native", native_release_id)
+            WRAPPER.activate(self.loaded, "tx-native", native_release_id)
+            WRAPPER.stage(self.loaded, "tx-legacy", legacy_release_id, self.payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-legacy", legacy_release_id)
+            WRAPPER.activate(self.loaded, "tx-legacy", legacy_release_id)
+
+        events = []
+        original_install = WRAPPER._install_release_files
+
+        def install(*args, **kwargs):
+            events.append("install")
+            return original_install(*args, **kwargs)
+
+        def stop_legacy():
+            events.append("deactivate-legacy")
+
+        def daemon_reload():
+            events.append("daemon-reload")
+
+        def start_native():
+            events.append("activate-native")
+
+        with mock.patch.object(WRAPPER, "_install_release_files", side_effect=install), mock.patch.object(
+            WRAPPER, "_deactivate_legacy_runtime", side_effect=stop_legacy,
+        ), mock.patch.object(WRAPPER, "_daemon_reload", side_effect=daemon_reload), mock.patch.object(
+            WRAPPER, "_activate_go_runtime", side_effect=start_native,
+        ):
+            result = WRAPPER.rollback(self.loaded, "tx-legacy", legacy_release_id)
+
+        self.assertTrue(result["rolled_back"])
+        self.assertLess(events.index("deactivate-legacy"), events.index("install"))
+        self.assertLess(events.index("install"), events.index("daemon-reload"))
+        self.assertEqual(events[-1], "activate-native")
 
     def test_format_one_install_removes_native_predecessor_files(self):
         self._install_go_runtime("https")
