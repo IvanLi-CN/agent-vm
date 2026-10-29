@@ -1,6 +1,6 @@
 import { dirname, join, basename } from "node:path";
 import { lstatSync } from "node:fs";
-import { ControlError, Data, PROTOCOL_VERSION, DEFAULT_TIMER_DIR, DEFAULT_RELEASE_FENCE_PATH, SESSION_ID_RE, TASK_ID_RE, require_string, require_int, parse_json, canonical_json, digest, iso_time, parse_time, is_record, resource_mapping, sub, compare } from "./control-types.ts";
+import { ControlError, Data, PROTOCOL_VERSION, DEFAULT_TIMER_DIR, DEFAULT_RELEASE_FENCE_PATH, PERSISTENT_RELEASE_FENCE_PATH, SESSION_ID_RE, TASK_ID_RE, require_string, require_int, parse_json, canonical_json, digest, iso_time, parse_time, is_record, resource_mapping, sub, compare } from "./control-types.ts";
 import { CommandRunner, IncusClient, with_lock, object_lock_path } from "./control-native.ts";
 import { StateStore } from "./control-store.ts";
 import { SystemdManager } from "./control-systemd.ts";
@@ -55,10 +55,18 @@ export class ControlCore {
   _release_metadata(): Data { return manifest_metadata(this.release_manifest, { present: this.release_manifest_present, verified: this.release_artifacts_verified, legacy: this.release_manifest === null }); }
   _response_compatibility(): Data { return { schema: 1, semantic_revision: 1 }; }
   _release_activation_fenced(): boolean {
-    let info;
-    try { info = lstatSync(this.release_fence_path); } catch (error: any) { if (error.code === "ENOENT") return false; throw new ControlError("release_fence_unverified", "release activation fence cannot be inspected"); }
-    if (!info.isFile() || info.isSymbolicLink() || this.release_fence_path === DEFAULT_RELEASE_FENCE_PATH && (info.uid !== 0 || (info.mode & 0o777) !== 0o600)) throw new ControlError("release_fence_unverified", "release activation fence is not a regular file");
-    return true;
+    const paths = Array.from(new Set([this.release_fence_path, PERSISTENT_RELEASE_FENCE_PATH]));
+    for (const path of paths) {
+      let info;
+      try { info = lstatSync(path); }
+      catch (error: any) {
+        if (error.code === "ENOENT") continue;
+        throw new ControlError("release_fence_unverified", "release activation fence cannot be inspected");
+      }
+      if (!info.isFile() || info.isSymbolicLink() || [DEFAULT_RELEASE_FENCE_PATH, PERSISTENT_RELEASE_FENCE_PATH].includes(path) && (info.uid !== 0 || (info.mode & 0o777) !== 0o600)) throw new ControlError("release_fence_unverified", "release activation fence is not a regular file");
+      return true;
+    }
+    return false;
   }
   _merge_warnings(...groups: Data[][]): Data[] {
     const seen = new Set<string>(); return groups.flat().filter(item => { const identity = canonical_json([item.code ?? null, item.action ?? null, item.message ?? null]); if (seen.has(identity)) return false; seen.add(identity); return true; }).map(item => ({ ...item }));

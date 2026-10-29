@@ -104,6 +104,7 @@ RETIRED_CONTROL_NAME = "agent_vm_control.py"
 RETIRED_CLIENT_NAME = "agent_vm.py"
 CANONICAL_UNIT_DIR = Path("/etc/systemd/system")
 RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
+PERSISTENT_RELEASE_FENCE_PATH = Path("/run/agent-vm-release/release-activation.fence")
 GO_CONTROL_PATH = Path("/opt/agent-vm-native/bin/agent-vm-control")
 GO_CONTROL_SOCKET = Path("/run/agent-vm-native/control.sock")
 STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
@@ -510,12 +511,18 @@ def _fsync_tree(root: Path) -> None:
         _fail("activation_failed", "cannot persist copied release files")
 
 
-@contextmanager
-def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id: str):
-    """Keep control-plane drain exit fenced for the whole activation window."""
-    path = Path(config.get("fence_path", RELEASE_FENCE_PATH))
+def _activation_fence_paths(config: Mapping[str, Any]) -> tuple[Path, ...]:
+    primary = Path(config.get("fence_path", RELEASE_FENCE_PATH))
+    if primary == RELEASE_FENCE_PATH:
+        persistent = PERSISTENT_RELEASE_FENCE_PATH
+    else:
+        persistent = primary.with_name("." + primary.name + ".persistent")
+    return tuple(dict.fromkeys((primary, persistent)))
+
+
+def _write_activation_fence(path: Path, transaction_id: str, release_id: str) -> None:
     _mkdir_private(path.parent, 0o755)
-    if path == RELEASE_FENCE_PATH:
+    if path in {RELEASE_FENCE_PATH, PERSISTENT_RELEASE_FENCE_PATH}:
         _require_root_owned_path(path.parent, "release activation fence directory")
     try:
         info = path.lstat()
@@ -524,7 +531,7 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
     except OSError:
         _fail("release_fence_unverified", "release activation fence cannot be inspected")
     if info is not None:
-        if (path == RELEASE_FENCE_PATH and info.st_uid != 0) or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        if (path in {RELEASE_FENCE_PATH, PERSISTENT_RELEASE_FENCE_PATH} and info.st_uid != 0) or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
             _fail("release_fence_unverified", "release activation fence is not a private regular file")
         existing = _read_json(path, "release_fence_unverified")
         if (
@@ -533,30 +540,47 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
             or existing.get("release_id") != release_id
         ):
             _fail("release_activation_in_progress", "another release activation fence is active")
-    else:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(path, flags, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump({"format": 1, "transaction_id": transaction_id, "release_id": release_id}, handle, sort_keys=True)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            _fsync_directory(path.parent)
-        except FileExistsError:
-            _fail("release_activation_in_progress", "another release activation fence is active")
-        except OSError:
-            _fail("release_fence_unavailable", "release activation fence cannot be created")
+        return
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
-        yield
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump({"format": 1, "transaction_id": transaction_id, "release_id": release_id}, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        _fsync_directory(path.parent)
+    except FileExistsError:
+        _fail("release_activation_in_progress", "another release activation fence is active")
+    except OSError:
+        _fail("release_fence_unavailable", "release activation fence cannot be created")
+
+
+@contextmanager
+def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id: str):
+    """Keep control-plane drain exit fenced for the whole activation window."""
+    paths = _activation_fence_paths(config)
+    for path in paths:
+        _write_activation_fence(path, transaction_id, release_id)
+
+    def refresh() -> None:
+        # systemd may remove the service-owned primary directory when the
+        # native authority is stopped. Recreate both fence paths before any
+        # predecessor or candidate authority can be started again.
+        for path in paths:
+            _write_activation_fence(path, transaction_id, release_id)
+
+    try:
+        yield refresh
     finally:
-        try:
-            path.unlink()
-            _fsync_directory(path.parent)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            _fail("release_fence_cleanup_failed", "release activation fence could not be cleared")
+        for path in paths:
+            try:
+                path.unlink()
+                _fsync_directory(path.parent)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                _fail("release_fence_cleanup_failed", "release activation fence could not be cleared")
 
 
 def _write_json(path: Path, value: Mapping[str, Any], mode: int = 0o600) -> None:
@@ -1905,11 +1929,16 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
 
 def activate(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     with _release_lock(config):
-        with _activation_fence(config, transaction_id, release_id):
-            return _activate_unlocked(config, transaction_id, release_id)
+        with _activation_fence(config, transaction_id, release_id) as refresh_fence:
+            return _activate_unlocked(config, transaction_id, release_id, refresh_fence)
 
 
-def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
+def _activate_unlocked(
+    config: Mapping[str, Any],
+    transaction_id: str,
+    release_id: str,
+    refresh_fence=None,
+) -> dict[str, Any]:
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
     verified = _verify_transaction(config, transaction_id, release_id)
@@ -2013,6 +2042,8 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             record["activation_phase"] = "runtime-switching"
             _write_json(activation_path, record)
             _deactivate_native_runtime()
+            if refresh_fence is not None:
+                refresh_fence()
             predecessor_runtime_stopped = True
             record["activation_phase"] = "predecessor-stopped"
             _write_json(activation_path, record)
@@ -2021,6 +2052,8 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             record["activation_phase"] = "runtime-switching"
             _write_json(activation_path, record)
             _deactivate_legacy_runtime()
+            if refresh_fence is not None:
+                refresh_fence()
             predecessor_runtime_stopped = True
             record["activation_phase"] = "predecessor-stopped"
             _write_json(activation_path, record)
@@ -2060,11 +2093,12 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             raw_failure.code, raw_failure.message, raw_failure.detail,
         )
         restored = True
-        old_manifest = None
+        old_manifest = old_runtime_manifest
         old_compatibility_error = None
-        if old_current is not None:
+        if old_manifest is not None:
             try:
-                old_manifest = load_release_manifest(old_current / MANIFEST_NAME)
+                if old_current is not None:
+                    old_manifest = load_release_manifest(old_current / MANIFEST_NAME)
                 _validate_state_compatibility(old_manifest, _read_live_state_capabilities())
             except (WrapperError, ManifestError) as compatibility_error:
                 old_compatibility_error = compatibility_error
@@ -2096,7 +2130,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                     "activation failed and the previous release could not be fully restored",
                     {"activation_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
                 )
-        if not restored or (old_current is None and runtime_switch_attempted):
+        if not restored or (old_manifest is None and runtime_switch_attempted):
             shutdown_errors = _stop_runtime_authorities()
             if shutdown_errors:
                 failure = WrapperError(
@@ -2145,11 +2179,16 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
 
 def rollback(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     with _release_lock(config):
-        with _activation_fence(config, transaction_id, release_id):
-            return _rollback_unlocked(config, transaction_id, release_id)
+        with _activation_fence(config, transaction_id, release_id) as refresh_fence:
+            return _rollback_unlocked(config, transaction_id, release_id, refresh_fence)
 
 
-def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
+def _rollback_unlocked(
+    config: Mapping[str, Any],
+    transaction_id: str,
+    release_id: str,
+    refresh_fence=None,
+) -> dict[str, Any]:
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
@@ -2259,10 +2298,14 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         if not target_is_native and active_is_native:
             runtime_switch_attempted = True
             _deactivate_native_runtime()
+            if refresh_fence is not None:
+                refresh_fence()
             predecessor_runtime_stopped = True
         elif target_is_native and active_manifest is not None and not active_is_native:
             runtime_switch_attempted = True
             _deactivate_legacy_runtime()
+            if refresh_fence is not None:
+                refresh_fence()
             predecessor_runtime_stopped = True
         _install_release_files(config, previous_dir, previous_manifest)
         _atomic_symlink(previous_dir, current_link)

@@ -373,6 +373,17 @@ class WrapperTests(unittest.TestCase):
                 WRAPPER._copy_atomic(source, target, os.getuid(), 0o644)
         self.assertEqual(failure.exception.code, "activation_failed")
 
+    def test_activation_fence_refresh_restores_service_owned_primary_path(self):
+        primary = self.loaded["fence_path"]
+        persistent = primary.with_name("." + primary.name + ".persistent")
+        with WRAPPER._activation_fence(self.loaded, "tx-fence", "a" * 40) as refresh:
+            primary.unlink()
+            refresh()
+            self.assertTrue(primary.is_file())
+            self.assertTrue(persistent.is_file())
+        self.assertFalse(primary.exists())
+        self.assertFalse(persistent.exists())
+
     def test_legacy_product_runtime_stops_the_web_unit(self):
         with mock.patch.object(
             WRAPPER.subprocess, "run",
@@ -1505,6 +1516,40 @@ class WrapperTests(unittest.TestCase):
 
         self.assertLess(events.index("deactivate-legacy"), events.index("install"))
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, release_id)
+
+    def test_initial_activation_failure_restores_installed_legacy_runtime_without_pointer(self):
+        self.loaded["require_drained"] = False
+        legacy_root = self.root / "legacy-installed-failure"
+        WRAPPER.safe_extract_archive(self.payload, legacy_root)
+        legacy_manifest = MANIFEST.load_release_manifest(legacy_root / MANIFEST.MANIFEST_NAME)
+        WRAPPER._install_release_files(self.loaded, legacy_root, legacy_manifest)
+
+        release_id = "a" * 40
+        native_payload = self._go_payload(release_id, transport="https")
+        WRAPPER.stage(self.loaded, "tx-initial-native-failure", release_id, native_payload)
+        WRAPPER.verify_transaction(self.loaded, "tx-initial-native-failure", release_id)
+        with mock.patch.object(WRAPPER, "_deactivate_legacy_runtime") as stop_legacy, mock.patch.object(
+            WRAPPER,
+            "_install_release_files",
+            side_effect=WRAPPER.WrapperError("activation_failed", "injected install failure"),
+        ), mock.patch.object(WRAPPER, "_restore_activation_state"), mock.patch.object(
+            WRAPPER, "_daemon_reload",
+        ), mock.patch.object(WRAPPER, "_unit_is_enabled", return_value=False), mock.patch.object(
+            WRAPPER, "_activate_legacy_runtime",
+        ) as activate_legacy, mock.patch.object(
+            WRAPPER, "_stop_runtime_authorities",
+        ) as stop_all, mock.patch.object(
+            WRAPPER,
+            "_read_live_state_capabilities",
+            return_value=[MANIFEST.STATE_CAPABILITY_MARKERS[0]],
+        ):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER.activate(self.loaded, "tx-initial-native-failure", release_id)
+
+        self.assertEqual(failure.exception.code, "activation_failed")
+        stop_legacy.assert_called_once_with()
+        activate_legacy.assert_called_once_with()
+        stop_all.assert_not_called()
 
     def test_activation_failure_restores_existing_support_bytes_modes_and_owners(self):
         installed = Path(self.loaded["control_path"]).parent
