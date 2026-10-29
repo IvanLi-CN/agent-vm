@@ -37,7 +37,7 @@ The first management-enabled release uses these markers:
 | `legacy-agent-vm-core@1` | Existing protocol-4 tasks, generations, leases, reservations, ports and operation journal. |
 | `managed-image-catalog@1` | Immutable image records, labels, verification, references and default selection. |
 | `session-image-binding@1` | Session and cache identity remains bound to the exact image fingerprint. |
-| `management-operation-audit@1` | Durable administrator operation identity, actor, reason, target, phase and outcome. |
+| `management-operation-audit@1` | Durable administrator operation identity, current or `legacy_unknown` actor, optional reason, target, phase and outcome. |
 | `principal-identity@1` | The configured OIDC issuer/subject is the sole administrator actor; claims and historical user mappings are never guessed. |
 | `token-revocation@1` | Opaque machine-Token digest, resource version, scope, expiry and revocation state are durable across slots. |
 

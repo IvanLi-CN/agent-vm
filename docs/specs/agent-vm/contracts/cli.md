@@ -64,7 +64,7 @@ The Bun client sidecar identifies `agent_vm.ts` as its `client_artifact` and dec
 
 Management-enabled packages use product manifest format 4 to declare durable state capabilities. That manifest change does not change protocol 4 or add a public client action; formats 1 through 3 remain pre-management rollback targets and are rejected after management-state markers are present.
 
-The built-in management console uses the same-origin `/api/v1` contract in [management-api.yaml](management-api.yaml). It does not wrap CLI output, tunnel protocol-4 requests, or add a public `agent-vm` command. OIDC establishes the sole administrator actor as the exact `(issuer, subject)` pair; administrator actions require explicit capability, reason, preview/confirmation and audit. Existing `status`, `admin status`, `admin session list`, request envelopes and protocol-4 action compatibility remain unchanged.
+The built-in management console uses the same-origin `/api/v1` contract in [management-api.yaml](management-api.yaml). It does not wrap CLI output, tunnel protocol-4 requests, or add a public `agent-vm` command. OIDC establishes the sole administrator actor as the exact `(issuer, subject)` pair; administrator actions require explicit capability, optional reason when supplied, the contract-defined preview/confirmation, and audit. Existing `status`, `admin status`, `admin session list`, request envelopes and protocol-4 action compatibility remain unchanged.
 
 ## Agent API transport compatibility
 

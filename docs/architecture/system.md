@@ -55,13 +55,13 @@ Caddy 只将下列固定路径转发到活动槽位，并清除不在允许集�
 
 OIDC 登录使用 Authorization Code Flow + PKCE，且只接受 `code_challenge_method=S256`；`plain` 或任何未明确允许的方法必须拒绝。服务端为每次登录生成一次性 `state`、`nonce` 和 code verifier 事务，并把回调 URI、目标客户端、过期时间和消费状态绑定到事务；跨槽位时事务存于共享状态，code verifier 受保护存储。启动响应同时设置短时、不可读、`Secure`、`HttpOnly`、`SameSite=Lax` 的 login-binding cookie，事务只保存其摘要；回调必须同时匹配该 cookie、未过期且未消费的 `state`，成功后清除 cookie，再创建浏览器会话。服务端和项目 Caddy 的访问日志必须省略 OIDC 回调 query string 和 `Referer`，应用日志只能记录脱敏的事件 ID、issuer 和阶段，不得记录 code、state、nonce 或 verifier。回调还必须校验授权码交换的 TLS、redirect URI、ID Token 签名和 discovery issuer，且检查 `iss` 精确等于配置的 issuer、`aud` 包含本客户端 ID、`exp` 有效以及 `nonce` 与事务一致。OIDC 提供方不可用、验证失败或事务重复消费时登录失败，不伪造身份。
 
-服务把唯一管理员身份表示为大小写敏感的 `(issuer, subject)` 二元组。`issuer` 必须是经过配置和 discovery 校验的完整标识；`subject` 使用 OIDC `sub`，不使用邮箱、名称、group 或未经验证的代理头。该二元组用于管理员 allowlist、会话 actor 和审计，不用于建立用户资源关系、用户间共享或历史会话认领关系。未匹配配置管理员主体的登录被拒绝；历史记录只按 task、generation、lease、operation journal 和 native identity 恢复，不需要映射到另一个用户。
+服务把唯一管理员身份表示为大小写敏感的 `(issuer, subject)` 二元组。`issuer` 必须是经过配置和 discovery 校验的完整标识；`subject` 使用 OIDC `sub`，不使用邮箱、名称、group 或未经验证的代理头。该二元组用于管理员 allowlist、当前会话 actor 和新审计事件，不用于建立用户资源关系、用户间共享或历史会话认领关系。未匹配配置管理员主体的登录被拒绝；历史记录只按 task、generation、lease、operation journal 和 native identity 恢复，不需要映射到另一个用户，无法证明的旧 actor 原值保留为显式未知。
 
 浏览器会话使用不可预测的 opaque cookie，带 `Secure`、`HttpOnly`、`SameSite=Strict`、`Path=/` 和有限 TTL；会话摘要、issuer/subject、能力、创建时间、过期时间和撤销状态存入共享状态。`GET /api/v1/session` 返回当前二元组、角色、能力和一次会话绑定的 CSRF token。每个写请求必须带同一会话、CSRF token 和与稳定 HTTPS 入口完全相等的 `Origin`；CORS 关闭。浏览器会话不是 Agent Token，也不能调用 Agent API。
 
 管理员的授权检查必须同时满足：浏览器或机器 Token 已由配置的管理员主体认证、Token scope 覆盖操作，且目标 `session_id`、generation、lease 和 state version 当前有效。`session_id` 只标识 Agent VM 工作会话，不是用户身份或 Token 绑定关系；唯一管理员可在 scope 允许时管理所有受管会话。未知目标、过期/撤销 Token、过期 lease 或 stale version 必须拒绝，不得通过猜测 ID 或筛选条件绕过资源状态检查。
 
-管理员对有效租约、镜像默认值、镜像退役/删除、维护和 Token 撤销等敏感操作必须先返回影响预览，再提交绑定到当前主体、准确目标、参数、resource version 和 generation 的一次性 confirmation token。提交请求必须带非空且有界的原因；服务端再次检查授权和状态，失败不产生 native effect。接受、拒绝、成功、失败和结果未知都写入审计，审计保存 `(issuer, subject)`、角色、原因、operation ID、目标、阶段、结果和安全错误码，不保存 Token 明文、OIDC code、原始命令输出、凭据或私有路径。
+管理员对有效租约、镜像默认值、镜像退役/删除、维护和 Token 撤销等敏感操作必须先返回影响预览，再提交绑定到当前主体、准确目标、参数、resource version 和 generation 的一次性 confirmation token。任何管理操作都可以带非空且有界的原因；缺失原因必须接受，不得因此拒绝，服务端只在提供时校验长度并再次检查授权和状态，失败不产生 native effect。接受、拒绝、成功、失败和结果未知都写入审计，审计保存当前 `(issuer, subject)` 或保留原值的显式未知历史 actor、角色、可选原因、operation ID、目标、阶段、结果和安全错误码，不保存 Token 明文、OIDC code、原始命令输出、凭据或私有路径。
 
 ## Token API 与 Agent API
 
@@ -89,7 +89,7 @@ rqlite 成为权威后，所有跨行状态变化使用 `POST /db/execute?transa
 
 ## 权限与故障
 
-每个 Agent VM 服务作为 root 运行以使用现有 Incus 权限；Caddy 作为独立非 root UID 运行，仅能连接已验证的活动 socket。统一服务边界接受浏览器请求和 native control 在同一高权限进程中的风险，因此必须限制请求大小、方法、路径和静态资源清单，禁止任意命令/文件/内部转发路由，严格执行 OIDC、Cookie、CSRF、Origin、Token、scope、administrator allowlist、generation 和 reason 校验，使用结构化脱敏日志，并通过 systemd 限制文件系统、执行权限和网络。该边界替代 [ADR 0042](../adr/0042-agent-vm-web-management-boundary.md)，现行选择见 [ADR 0043](../adr/0043-agent-vm-unified-service-security-boundary.md)。
+每个 Agent VM 服务作为 root 运行以使用现有 Incus 权限；Caddy 作为独立非 root UID 运行，仅能连接已验证的活动 socket。统一服务边界接受浏览器请求和 native control 在同一高权限进程中的风险，因此必须限制请求大小、方法、路径和静态资源清单，禁止任意命令/文件/内部转发路由，严格执行 OIDC、Cookie、CSRF、Origin、Token、scope、administrator allowlist、generation 和可选 reason 的提供时校验，使用结构化脱敏日志，并通过 systemd 限制文件系统、执行权限和网络。该边界替代 [ADR 0042](../adr/0042-agent-vm-web-management-boundary.md)，现行选择见 [ADR 0043](../adr/0043-agent-vm-unified-service-security-boundary.md)。
 
 rqlite 在迁移后仍是唯一状态权威。若 rqlite 不可用、数据校验失败或摘要不一致，服务必须保持 durable-write fence 和 native admission closed，保留可读的有效租约，不把旧 SQLite 当作当前状态。恢复优先使用迁移后的已验证 rqlite backup/snapshot，但内部摘要、epoch 或 journal 校验本身不足以证明恢复源覆盖故障前最后可信提交；必须同时验证 backup coverage boundary，并用可信 backup tail、append-only journal 或 native-effect evidence 补齐其后的提交区间。任何缺失区间、Token/session revocation 或 native effect 无法核对时都必须继续 fenced，进入 administrator-authorized reconciliation。只有证据证明切换后没有 durable write、`state_epoch` advance、lease change 或 native effect，才可重新导入切换前 SQLite snapshot；禁止并行打开 stale SQLite、猜测重建或删表恢复。
 

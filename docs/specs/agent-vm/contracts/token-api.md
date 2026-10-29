@@ -20,7 +20,7 @@ All browser mutations require the opaque browser session cookie, the session-bou
 | `POST /api/v1/tokens/{token_id}/revoke` | Revoke a Token idempotently. | The request must carry the current preview version and single-use confirmation token. |
 | `GET /api/v1/tokens/{token_id}` | Read one Token's metadata. | Return safe metadata only, including `resource_version`. |
 
-The create request contains an operation ID for durable idempotency:
+The create request contains an operation ID for durable idempotency. It may also contain an audit `reason`; omission is valid.
 
 ```json
 {
@@ -36,9 +36,9 @@ On the first successful create transaction, the service generates the high-entro
 
 An identical request arriving concurrently or after the latch is consumed returns the existing operation outcome and safe Token metadata without a `token` field, with disclosure state `consumed`. A retry with a different canonical request returns `operation_conflict`; the administrator actor is part of the operation identity. The latch is consumed before the first response is sent, so a process crash or network loss after the durable commit is treated as a lost response and never authorizes plaintext re-disclosure. `GET /api/v1/operations/{operation_id}` returns the operation target `token_id`, safe `token_metadata` and disclosure state, but never the bearer.
 
-For a lost create response, the administrator keeps the original operation ID, queries its operation status until the authoritative state is available, confirms the returned `token_id` and metadata, and explicitly revokes that Token with a new revoke operation and bounded reason. The administrator then creates a replacement Token with a new operation ID. The service never automatically reissues plaintext, creates a guessed replacement, or treats a timeout as proof that no Token exists. Only an authoritative result proving that the original operation never committed permits retrying the same operation ID.
+For a lost create response, the administrator keeps the original operation ID, queries its operation status until the authoritative state is available, confirms the returned `token_id` and metadata, and explicitly revokes that Token with a new revoke operation and an optional bounded reason. The administrator then creates a replacement Token with a new operation ID. The service never automatically reissues plaintext, creates a guessed replacement, or treats a timeout as proof that no Token exists. Only an authoritative result proving that the original operation never committed permits retrying the same operation ID.
 
-The revoke preview is available at `POST /api/v1/tokens/{token_id}/revoke/preview` with the current `target_version`. It returns the exact Token ID, safe current metadata, a short-lived (no more than five minutes), single-use `confirmation_token` bound to the administrator's `(issuer, subject)`, action, Token ID, target version and metadata. The revoke request contains an operation ID, bounded reason, the same `target_version` and that confirmation token. Reusing an operation ID with a different canonical request returns `operation_conflict`; repeating the same request returns the existing outcome.
+The revoke preview is available at `POST /api/v1/tokens/{token_id}/revoke/preview` with the current `target_version`. It returns the exact Token ID, safe current metadata, a short-lived (no more than five minutes), single-use `confirmation_token` bound to the administrator's `(issuer, subject)`, action, Token ID, target version and metadata. The revoke request contains an operation ID, the same `target_version` and that confirmation token; an optional reason is retained when supplied and is not required. Reusing an operation ID with a different canonical request returns `operation_conflict`; repeating the same request returns the existing outcome.
 
 ## Storage and request checks
 
