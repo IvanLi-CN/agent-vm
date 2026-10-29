@@ -345,6 +345,34 @@ class WrapperTests(unittest.TestCase):
                 WRAPPER._read_live_state_capabilities()
         self.assertEqual(failure.exception.code, "state_compatibility_unverified")
 
+    def test_interrupted_recovery_accepts_a_consistent_durable_drain_snapshot(self):
+        database_path = self._durable_drain_database()
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", database_path):
+            WRAPPER._verify_durable_drain_state({"format": MANIFEST.GO_MANIFEST_FORMAT})
+
+    def test_interrupted_recovery_rejects_an_exited_drain(self):
+        database_path = self._durable_drain_database(draining="0")
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", database_path):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._verify_durable_drain_state()
+        self.assertEqual(failure.exception.code, "drain_required")
+
+    def test_interrupted_recovery_rejects_new_pending_work(self):
+        database_path = self._durable_drain_database(pending=True)
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", database_path):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._verify_durable_drain_state()
+        self.assertEqual(failure.exception.code, "drain_unverified")
+
+    def test_atomic_install_converts_temporary_file_creation_failure(self):
+        source = self.root / "source.txt"
+        source.write_text("source", encoding="utf-8")
+        target = self.root / "installed" / "target.txt"
+        with mock.patch.object(WRAPPER.tempfile, "mkstemp", side_effect=OSError("no space")):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._copy_atomic(source, target, os.getuid(), 0o644)
+        self.assertEqual(failure.exception.code, "activation_failed")
+
     def test_legacy_product_runtime_stops_the_web_unit(self):
         with mock.patch.object(
             WRAPPER.subprocess, "run",
@@ -574,6 +602,30 @@ class WrapperTests(unittest.TestCase):
     def _install_go_payload(self, transport):
         payload = self._go_payload("c" * 40, transport=transport)
         WRAPPER.safe_extract_archive(payload, Path(self.loaded["control_path"]).parent)
+
+    def _durable_drain_database(self, *, draining="1", pending=False):
+        database_path = self.root / "durable-drain.sqlite3"
+        with sqlite3.connect(database_path) as database:
+            database.executescript("""
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                CREATE TABLE tasks (state TEXT NOT NULL);
+                CREATE TABLE operations (operation_id TEXT, response_json TEXT, created_at TEXT);
+                CREATE TABLE state_capabilities (name TEXT NOT NULL, version INTEGER NOT NULL);
+            """)
+            database.executemany(
+                "INSERT INTO meta(key, value) VALUES (?, ?)",
+                [("draining", draining), ("drain_owner", "release-tx-recovery"), ("drain_sealed", "1")],
+            )
+            database.execute(
+                "INSERT INTO state_capabilities(name, version) VALUES (?, ?)",
+                ("legacy-agent-vm-core", 1),
+            )
+            if pending:
+                database.execute(
+                    "INSERT INTO operations(operation_id, response_json, created_at) VALUES (?, ?, ?)",
+                    ("pending-operation", json.dumps({"outcome": "pending"}), "now"),
+                )
+        return database_path
 
     def _install_go_runtime(self, transport):
         extracted = self.root / "go-installed"
@@ -859,16 +911,13 @@ class WrapperTests(unittest.TestCase):
                     WRAPPER.activate(self.loaded, "tx-interrupted", legacy_release_id)
 
             with mock.patch.object(
-                WRAPPER, "_ensure_drained", side_effect=AssertionError("interrupted rollback must not drain"),
-            ), mock.patch.object(WRAPPER, "_read_live_state_capabilities", return_value=[MANIFEST.STATE_CAPABILITY_MARKERS[0]]) as read_capabilities, mock.patch.object(
-                WRAPPER, "_validate_state_compatibility",
-            ) as validate_compatibility, mock.patch.object(WRAPPER, "_activate_go_runtime"):
+                WRAPPER, "_verify_durable_drain_state",
+            ) as verify_durable_drain, mock.patch.object(WRAPPER, "_ensure_drained", side_effect=AssertionError("interrupted rollback must not use the stopped authority")), mock.patch.object(WRAPPER, "_activate_go_runtime"):
                 result = WRAPPER.rollback(self.loaded, "tx-interrupted", legacy_release_id)
 
         self.assertTrue(result["rolled_back"])
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, native_release_id)
-        read_capabilities.assert_called_once_with()
-        validate_compatibility.assert_called_once()
+        verify_durable_drain.assert_called_once()
 
     def test_activation_restore_failure_stops_all_runtime_authorities(self):
         self.loaded["require_drained"] = False
@@ -1559,7 +1608,7 @@ class WrapperTests(unittest.TestCase):
         activation_path.write_text(json.dumps(record), encoding="utf-8")
         WRAPPER._atomic_symlink(Path(self.loaded["release_root"]) / ("c" * 40), Path(self.loaded["current_link"]))
         with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")), mock.patch.object(
-            WRAPPER, "_read_live_state_capabilities", return_value=[MANIFEST.STATE_CAPABILITY_MARKERS[0]],
+            WRAPPER, "_verify_durable_drain_state",
         ):
             result = WRAPPER.rollback(self.loaded, "tx-retry-second", "d" * 40)
         self.assertTrue(result["rolled_back"])
@@ -1620,7 +1669,7 @@ class WrapperTests(unittest.TestCase):
         record["activation_phase"] = "current-pointer-updated"
         activation_path.write_text(json.dumps(record), encoding="utf-8")
         with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")), mock.patch.object(
-            WRAPPER, "_read_live_state_capabilities", return_value=[MANIFEST.STATE_CAPABILITY_MARKERS[0]],
+            WRAPPER, "_verify_durable_drain_state",
         ):
             result = WRAPPER.rollback(self.loaded, "tx-interrupted-second", "2" * 40)
         self.assertTrue(result["rolled_back"])

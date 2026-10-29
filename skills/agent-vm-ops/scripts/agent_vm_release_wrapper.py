@@ -928,7 +928,10 @@ def _atomic_symlink(target: Path, link: Path) -> None:
 
 def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
     _require_directory_chain(target.parent, "activation_unverified", f"activation target parent: {target.parent}")
-    target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    try:
+        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    except OSError:
+        _fail("activation_failed", f"cannot prepare activation target parent: {target.parent.name}")
     _require_directory_chain(target.parent, "activation_unverified", f"activation target parent: {target.parent}")
     if target.exists() or target.is_symlink():
         try:
@@ -937,10 +940,13 @@ def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
             _fail("activation_unverified", f"cannot inspect activation target: {target.name}")
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             _fail("activation_unverified", f"activation target is not a regular file: {target.name}")
-    descriptor, name = tempfile.mkstemp(prefix="." + target.name + ".", suffix=".release-tmp", dir=target.parent)
-    temporary = Path(name)
+    descriptor = None
+    temporary = None
     try:
+        descriptor, name = tempfile.mkstemp(prefix="." + target.name + ".", suffix=".release-tmp", dir=target.parent)
+        temporary = Path(name)
         with os.fdopen(descriptor, "wb") as target_handle, source.open("rb") as source_handle:
+            descriptor = None
             shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
             target_handle.flush()
             os.fchmod(target_handle.fileno(), mode)
@@ -950,8 +956,13 @@ def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
         os.replace(temporary, target)
         _fsync_directory(target.parent, "activation_failed")
     except OSError as exc:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         try:
-            if temporary.exists():
+            if temporary is not None and temporary.exists():
                 temporary.unlink()
         except OSError:
             pass
@@ -1140,26 +1151,120 @@ def _validate_state_compatibility(manifest: Mapping[str, Any], capabilities: Any
             )
 
 
+def _read_state_capabilities(database: sqlite3.Connection) -> list[str]:
+    """Read the fixed state registry from an already-open read transaction."""
+    tables = {
+        str(row[0])
+        for row in database.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'",
+        ).fetchall()
+    }
+    if "state_capabilities" not in tables:
+        _validate_legacy_state_schema(database)
+        return [STATE_CAPABILITY_MARKERS[0]]
+    rows = database.execute(
+        "SELECT name, version FROM state_capabilities ORDER BY name, version",
+    ).fetchall()
+    return [f"{name}@{version}" for name, version in rows]
+
+
 def _read_live_state_capabilities() -> list[str]:
     """Read the fixed state registry when an older controller omits it in drain-status."""
     uri = f"file:{STATE_DB_PATH}?mode=ro"
     try:
         with sqlite3.connect(uri, uri=True, timeout=30) as database:
-            rows = database.execute(
-                "SELECT name, version FROM state_capabilities ORDER BY name, version",
-            ).fetchall()
+            return _read_state_capabilities(database)
     except sqlite3.OperationalError as exc:
-        if "no such table" in str(exc).lower() and STATE_CAPABILITY_MARKERS:
-            try:
-                with sqlite3.connect(uri, uri=True, timeout=30) as database:
-                    _validate_legacy_state_schema(database)
-            except (OSError, sqlite3.Error):
-                _fail("state_compatibility_unverified", "live state schema could not be validated")
-            return [STATE_CAPABILITY_MARKERS[0]]
         _fail("state_compatibility_unverified", "live state capabilities could not be read")
     except (OSError, sqlite3.Error):
         _fail("state_compatibility_unverified", "live state capabilities could not be read")
-    return [f"{name}@{version}" for name, version in rows]
+
+
+def _verify_durable_drain_state(
+    target_manifest: Mapping[str, Any] | None = None,
+) -> None:
+    """Prove admission silence from one consistent state-database snapshot.
+
+    Recovery may run after the activation interrupted while the predecessor
+    authority was being stopped. In that state the control command cannot be
+    used as the observation source, so the database must independently prove
+    that the release drain is still owned, sealed when supported, and free of
+    active work before rollback mutates files again.
+    """
+    uri = f"file:{STATE_DB_PATH}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=30) as database:
+            database.execute("PRAGMA query_only = ON")
+            tables = {
+                str(row[0])
+                for row in database.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'",
+                ).fetchall()
+            }
+            required = {"meta", "tasks", "operations"}
+            if not required.issubset(tables):
+                _fail("drain_unverified", "durable release drain schema is incomplete")
+            meta = dict(
+                database.execute(
+                    "SELECT key, value FROM meta WHERE key IN ('draining', 'drain_owner', 'drain_sealed')",
+                ).fetchall()
+            )
+            if meta.get("draining") != "1":
+                _fail("drain_required", "release recovery requires an active admission drain")
+            owner = meta.get("drain_owner")
+            if owner not in (None, "") and (
+                not isinstance(owner, str) or not owner.startswith("release-")
+            ):
+                _fail("drain_unverified", "durable release drain is owned by another actor")
+            if "drain_sealed" in meta and meta["drain_sealed"] != "1":
+                _fail("drain_unverified", "durable release drain has not converged")
+            pending_operations = database.execute(
+                """
+                SELECT operation_id FROM operations
+                WHERE json_extract(response_json, '$.outcome') = 'pending'
+                ORDER BY created_at, operation_id LIMIT 1001
+                """,
+            ).fetchall()
+            if pending_operations:
+                _fail(
+                    "drain_unverified",
+                    "release recovery requires management operations to converge",
+                    {"pending_operations": [str(row[0]) for row in pending_operations[:100]]},
+                )
+            task_states = database.execute(
+                """
+                SELECT state, COUNT(*) FROM tasks
+                WHERE state IN ('closing', 'deleting', 'failed')
+                GROUP BY state ORDER BY state
+                """,
+            ).fetchall()
+            if task_states:
+                _fail(
+                    "drain_unverified",
+                    "release recovery requires task transitions to converge",
+                    {"task_states": {str(state): int(count) for state, count in task_states}},
+                )
+            if "management_operations" in tables:
+                management_operations = database.execute(
+                    """
+                    SELECT operation_id FROM management_operations
+                    WHERE status IN ('running', 'reconciling')
+                    ORDER BY created_at, operation_id LIMIT 1001
+                    """,
+                ).fetchall()
+                if management_operations:
+                    _fail(
+                        "drain_unverified",
+                        "release recovery requires management operations to converge",
+                        {"pending_operations": [str(row[0]) for row in management_operations[:100]]},
+                    )
+            capabilities = _read_state_capabilities(database)
+    except WrapperError:
+        raise
+    except (OSError, sqlite3.Error):
+        _fail("drain_unverified", "durable release drain could not be verified")
+    if target_manifest is not None:
+        _validate_state_compatibility(target_manifest, capabilities)
 
 
 def _validate_legacy_state_schema(database: sqlite3.Connection) -> None:
@@ -2124,12 +2229,13 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
     # The activation record is written only after the original activation has
     # drained the control plane. An interrupted activation or rollback may
-    # have already stopped that authority, so asking it to drain again would
-    # make recovery impossible; the release fence and retained pointers are
-    # the recovery proof for this bounded retry.
+    # have already stopped that authority, so recovery must prove the current
+    # durable drain from one state-database snapshot instead of trusting the
+    # historical record or pointer layout. This also rejects a drain that was
+    # exited, or new work that crossed the fence, after the interruption.
     if interrupted or recovering_in_progress:
         if config["require_drained"]:
-            _validate_state_compatibility(previous_manifest, _read_live_state_capabilities())
+            _verify_durable_drain_state(previous_manifest)
     else:
         _ensure_drained(config, previous_manifest)
     target_snapshot = _snapshot_targets(config)
