@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, formatDateTime, shortFingerprint, stateTone } from "./format";
+import { formatActor, formatBytes, formatDateTime, shortFingerprint, stateTone } from "./format";
 
 describe("management formatting", () => {
   it("keeps byte values readable without losing unknown state", () => {
@@ -19,5 +19,10 @@ describe("management formatting", () => {
     expect(stateTone("stale")).toBe("warning");
     expect(stateTone("failed")).toBe("danger");
     expect(stateTone("passed")).toBe("success");
+  });
+
+  it("preserves actor provenance in audit labels", () => {
+    expect(formatActor({ issuer: "https://issuer.example.invalid", subject: "admin-maintainer", role: "administrator" })).toBe("admin-maintainer · https://issuer.example.invalid");
+    expect(formatActor({ kind: "legacy_unknown", raw_actor: "legacy-admin" })).toBe("legacy-admin · legacy_unknown");
   });
 });

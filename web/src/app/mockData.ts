@@ -1,4 +1,13 @@
-import type { AuditEvent, ImageReferenceCounts, ManagedImage, ManagedVM, Operation, Overview, SystemStatus } from "./types";
+import type { AgentToken, AuditEvent, ImageReferenceCounts, ManagedImage, ManagedVM, ManagementSession, Operation, Overview, SystemStatus } from "./types";
+
+export const session: ManagementSession = {
+  issuer: "https://issuer.example.invalid",
+  subject: "admin-maintainer",
+  role: "administrator",
+  capabilities: ["read", "operate", "manage_images", "maintain_system", "manage_tokens", "observe_admin"],
+  csrf_token: "synthetic-csrf-token-0123456789abcdef0123456789abcdef",
+  expires_at: "2027-01-15T11:20:30Z",
+};
 
 export const overview: Overview = {
   resource_version: "overview:synthetic-17",
@@ -56,17 +65,19 @@ export const images: ManagedImage[] = [
   { fingerprint: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", resource_version: "image:cccc:revision-2", version_label: "2025.12-maintenance", architecture: "x86_64", instance_type: "container", source: { kind: "trusted_remote", source_id: "ubuntu-staging" }, state: "retired", verification: { integrity: "passed", suitability: "passed", findings: [] }, is_default: false, default_compatibility: "none", references: { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 }, created_at: "2025-12-16T08:30:00Z" },
 ];
 
+const administratorActor = { issuer: session.issuer, subject: session.subject, role: "administrator" as const };
+
 export const operations: Operation[] = [
-  { operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb125", action: "image_import", status: "running", phase: "suitability_check", target: { kind: "image_catalog", id: "image-catalog" }, actor: "admin@example.invalid", reason: "Evaluate the next approved session image", created_at: "2026-01-15T09:55:00Z", updated_at: "2026-01-15T10:05:00Z", result: null, error: null },
-  { operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb124", action: "restart", status: "succeeded", phase: "completed", target: { kind: "vm", id: "task_example_01" }, actor: "admin@example.invalid", reason: "Restore service after a confirmed guest-side fault", created_at: "2026-01-15T09:40:00Z", updated_at: "2026-01-15T09:43:00Z", result: { effect: "completed", affected_session_count: 1 }, error: null },
-  { operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb128", action: "destroy", status: "failed", phase: "reference_check", target: { kind: "vm", id: "task_delta_04" }, actor: "admin@example.invalid", reason: "Remove failed lease after stale target review", created_at: "2026-01-15T09:15:00Z", updated_at: "2026-01-15T09:16:00Z", result: null, error: { code: "stale_target", phase: "precondition", retryable: false, safe_fields: { current_target_version: "vm:task_delta_04:revision-9" } } },
-  { operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb129", action: "reconcile", status: "outcome_unknown", phase: "reconciliation", target: { kind: "system", id: "system" }, actor: "admin@example.invalid", reason: "Confirm state after authority restart", created_at: "2026-01-15T08:55:00Z", updated_at: "2026-01-15T08:57:00Z", result: null, error: { code: "authority_unavailable", phase: "reconciliation", retryable: true } },
+  { operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb125", action: "image_import", status: "running", phase: "suitability_check", target: { kind: "image_catalog", id: "image-catalog" }, actor: administratorActor, reason: "Evaluate the next approved session image", created_at: "2026-01-15T09:55:00Z", updated_at: "2026-01-15T10:05:00Z", result: null, error: null },
+  { operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb124", action: "restart", status: "succeeded", phase: "completed", target: { kind: "vm", id: "task_example_01" }, actor: administratorActor, reason: "Restore service after a confirmed guest-side fault", created_at: "2026-01-15T09:40:00Z", updated_at: "2026-01-15T09:43:00Z", result: { effect: "completed", affected_session_count: 1 }, error: null },
+  { operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb128", action: "destroy", status: "failed", phase: "reference_check", target: { kind: "vm", id: "task_delta_04" }, actor: administratorActor, reason: "Remove failed lease after stale target review", created_at: "2026-01-15T09:15:00Z", updated_at: "2026-01-15T09:16:00Z", result: null, error: { code: "stale_target", phase: "precondition", retryable: false, safe_fields: { current_target_version: "vm:task_delta_04:revision-9" } } },
+  { operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb129", action: "reconcile", status: "outcome_unknown", phase: "reconciliation", target: { kind: "system", id: "system" }, actor: administratorActor, reason: "Confirm state after authority restart", created_at: "2026-01-15T08:55:00Z", updated_at: "2026-01-15T08:57:00Z", result: null, error: { code: "authority_unavailable", phase: "reconciliation", retryable: true } },
 ];
 
 export const audits: AuditEvent[] = [
-  { event_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb126", operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb124", action: "restart", actor: "admin@example.invalid", reason: "Restore service after a confirmed guest-side fault", target: { kind: "vm", id: "task_example_01" }, outcome: "accepted", phase: "queued", occurred_at: "2026-01-15T10:10:00Z", safe_code: null },
-  { event_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb130", operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb128", action: "destroy", actor: "admin@example.invalid", reason: "Remove failed lease after stale target review", target: { kind: "vm", id: "task_delta_04" }, outcome: "failed", phase: "reference_check", occurred_at: "2026-01-15T09:16:00Z", safe_code: "stale_target" },
-  { event_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb131", operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb129", action: "reconcile", actor: "admin@example.invalid", reason: "Confirm state after authority restart", target: { kind: "system", id: "system" }, outcome: "outcome_unknown", phase: "reconciliation", occurred_at: "2026-01-15T08:57:00Z", safe_code: "authority_unavailable" },
+  { event_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb126", operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb124", action: "restart", actor: administratorActor, reason: "Restore service after a confirmed guest-side fault", target: { kind: "vm", id: "task_example_01" }, outcome: "accepted", phase: "queued", occurred_at: "2026-01-15T10:10:00Z", safe_code: null },
+  { event_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb130", operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb128", action: "destroy", actor: administratorActor, reason: "Remove failed lease after stale target review", target: { kind: "vm", id: "task_delta_04" }, outcome: "failed", phase: "reference_check", occurred_at: "2026-01-15T09:16:00Z", safe_code: "stale_target" },
+  { event_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb131", operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb129", action: "reconcile", actor: administratorActor, reason: "Confirm state after authority restart", target: { kind: "system", id: "system" }, outcome: "outcome_unknown", phase: "reconciliation", occurred_at: "2026-01-15T08:57:00Z", safe_code: "authority_unavailable" },
 ];
 
 export const system: SystemStatus = {
@@ -84,4 +95,9 @@ export const system: SystemStatus = {
 
 export const emptyReferences: ImageReferenceCounts = { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 };
 
-export const mockState = { overview, vms, images, operations, audits, system };
+export const tokens: AgentToken[] = [
+  { token_id: "tok_read_01_7d9e22b1", resource_version: "token:read:revision-2", scopes: ["agent:read"], created_at: "2026-10-10T08:00:00Z", expires_at: "2027-02-10T08:00:00Z", revoked_at: null },
+  { token_id: "tok_ops_02_4f1c6a77", resource_version: "token:ops:revision-5", scopes: ["agent:read", "agent:operate"], created_at: "2026-09-20T08:00:00Z", expires_at: "2027-01-20T08:00:00Z", revoked_at: "2026-10-14T18:30:00Z" },
+];
+
+export const mockState = { overview, vms, images, operations, audits, system, session, tokens };

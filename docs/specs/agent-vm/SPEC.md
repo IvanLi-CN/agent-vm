@@ -180,6 +180,25 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 - `VER-AGENT-VM-028` covers: `REQ-AGENT-VM-028` through [the state migration ADR](../../adr/0044-agent-vm-state-migration-to-rqlite.md), the migration sections of [the management contract](contracts/management-api.md) and [the release contract](contracts/release.md), and transaction/concurrency/recovery checks. This is planned target validation and remains pending until the target surface and tests exist.
 - `VER-AGENT-VM-029` covers: `REQ-AGENT-VM-029` through the blue-green sections of [the system architecture](../../architecture/system.md), [the release contract](contracts/release.md), and active-link, compatibility-window and rollback checks. This is planned target validation and remains pending until the target surface and tests exist.
 
+## Visual Evidence
+
+The management-console web surface has confirmed visual evidence from the local `ui_demo` source.
+The captures use mock data without a backend, login, credentials or live deployment.
+They cover Token management, pending revocation-preview recovery, and the 512-character reason limit in Token creation, confirmation dialogs and image import.
+The reason-limit captures show that overlong input remains editable and submission is disabled until it is corrected.
+The pending-preview capture delays the mock response to expose its recovery controls.
+Mobile captures use a `393x852` CSS-pixel viewport; the desktop capture shows the full rendered page surface.
+
+- [Desktop System page](assets/agent-vm-web-system-desktop.png)
+- [Mobile System page](assets/agent-vm-web-system-mobile-list.png)
+- [Mobile revocation preview dialog](assets/agent-vm-web-system-mobile-revoke-dialog.png)
+- [Mobile pending revocation preview](assets/agent-vm-web-system-mobile-preview-pending.png)
+- [Mobile confirmation reason limit](assets/agent-vm-web-system-mobile-dialog-reason-limit.png)
+- [Mobile Token creation reason limit](assets/agent-vm-web-system-mobile-create-reason-limit.png)
+- [Mobile image import reason limit](assets/agent-vm-web-images-mobile-import-reason-limit.png)
+
+Owner confirmation applies to the rendered UI shown here; it does not assert end-to-end backend integration or deployment readiness.
+
 ## Related ADRs
 
 - [Agent VM topology and recovery boundary](../../adr/0028-agent-vm-topology-recovery-boundary.md)
