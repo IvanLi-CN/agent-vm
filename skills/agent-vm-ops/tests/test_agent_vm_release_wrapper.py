@@ -58,6 +58,10 @@ class WrapperTests(unittest.TestCase):
         self.drain_patch = mock.patch.object(WRAPPER, "_ensure_drained")
         self.drain_patch.start()
         self.addCleanup(self.drain_patch.stop)
+        self.durable_drain_owner = WRAPPER._verify_durable_drain_owner
+        self.drain_owner_patch = mock.patch.object(WRAPPER, "_verify_durable_drain_owner")
+        self.drain_owner_patch.start()
+        self.addCleanup(self.drain_owner_patch.stop)
         syntax_patch = mock.patch.object(WRAPPER, "verify_typescript_syntax")
         self.typescript_check = syntax_patch.start()
         self.addCleanup(syntax_patch.stop)
@@ -432,6 +436,53 @@ class WrapperTests(unittest.TestCase):
                 expected_owner="release-tx-recovery",
             )
 
+    def test_normal_activation_requires_the_current_transaction_owner(self):
+        release_id = "b" * 40
+        WRAPPER.stage(self.loaded, "tx-owner-check", release_id, self.payload)
+        WRAPPER.verify_transaction(self.loaded, "tx-owner-check", release_id)
+        database_path = self._durable_drain_database(owner="release-other")
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", database_path), mock.patch.object(
+            WRAPPER,
+            "_verify_durable_drain_owner",
+            side_effect=self.durable_drain_owner,
+        ):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER.activate(self.loaded, "tx-owner-check", release_id)
+        self.assertEqual(failure.exception.code, "drain_unverified")
+        self.assertFalse(Path(self.loaded["current_link"]).exists())
+
+    def test_normal_rollback_requires_the_activation_transaction_owner(self):
+        self.loaded["require_drained"] = False
+        first_release_id = "a" * 40
+        second_release_id = "c" * 40
+        first_bundle = self.root / "owner-first.tar"
+        second_bundle = self.root / "owner-second.tar"
+        RELEASE.build_release(ROOT, first_bundle, first_release_id)
+        RELEASE.build_release(ROOT, second_bundle, second_release_id)
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            WRAPPER.stage(self.loaded, "tx-owner-first", first_release_id, first_bundle.read_bytes())
+            WRAPPER.verify_transaction(self.loaded, "tx-owner-first", first_release_id)
+            WRAPPER.activate(self.loaded, "tx-owner-first", first_release_id)
+            WRAPPER.stage(self.loaded, "tx-owner-second", second_release_id, second_bundle.read_bytes())
+            WRAPPER.verify_transaction(self.loaded, "tx-owner-second", second_release_id)
+            WRAPPER.activate(self.loaded, "tx-owner-second", second_release_id)
+
+        self.loaded["require_drained"] = True
+        database_path = self._durable_drain_database(owner="release-other")
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", database_path), mock.patch.object(
+            WRAPPER,
+            "_verify_durable_drain_owner",
+            side_effect=self.durable_drain_owner,
+        ):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER.rollback(self.loaded, "tx-owner-second", second_release_id)
+        self.assertEqual(failure.exception.code, "drain_unverified")
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, second_release_id)
+
     def test_legacy_product_runtime_stops_the_web_unit(self):
         with mock.patch.object(
             WRAPPER.subprocess, "run",
@@ -451,6 +502,25 @@ class WrapperTests(unittest.TestCase):
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn(["systemctl", "stop", "agent-vm-web.service"], commands)
         self.assertIn(["systemctl", "disable", "agent-vm-web.service"], commands)
+
+    def test_legacy_runtime_refreshes_the_fence_after_native_stop(self):
+        events = []
+
+        def stop_native():
+            events.append("stop-native")
+
+        def refresh_fence():
+            events.append("refresh-fence")
+
+        with mock.patch.object(WRAPPER, "_deactivate_native_runtime", side_effect=stop_native), mock.patch.object(
+            WRAPPER,
+            "_systemctl",
+            side_effect=lambda action, unit, **kwargs: events.append((action, unit)),
+        ), mock.patch.object(WRAPPER, "_legacy_expiry_timers", return_value=()):
+            WRAPPER._activate_legacy_runtime(refresh_fence=refresh_fence)
+
+        self.assertLess(events.index("stop-native"), events.index("refresh-fence"))
+        self.assertLess(events.index("refresh-fence"), events.index(("start", "agent-vm-native-reconcile.service")))
 
     def test_product_runtime_restores_an_enabled_web_unit_after_native_restart(self):
         with mock.patch.object(
@@ -662,7 +732,7 @@ class WrapperTests(unittest.TestCase):
         payload = self._go_payload("c" * 40, transport=transport)
         WRAPPER.safe_extract_archive(payload, Path(self.loaded["control_path"]).parent)
 
-    def _durable_drain_database(self, *, draining="1", pending=False):
+    def _durable_drain_database(self, *, draining="1", owner="release-tx-recovery", pending=False):
         database_path = self.root / "durable-drain.sqlite3"
         with sqlite3.connect(database_path) as database:
             database.executescript("""
@@ -673,7 +743,7 @@ class WrapperTests(unittest.TestCase):
             """)
             database.executemany(
                 "INSERT INTO meta(key, value) VALUES (?, ?)",
-                [("draining", draining), ("drain_owner", "release-tx-recovery"), ("drain_sealed", "1")],
+                [("draining", draining), ("drain_owner", owner), ("drain_sealed", "1")],
             )
             database.execute(
                 "INSERT INTO state_capabilities(name, version) VALUES (?, ?)",
@@ -1596,7 +1666,7 @@ class WrapperTests(unittest.TestCase):
 
         self.assertEqual(failure.exception.code, "activation_failed")
         stop_legacy.assert_called_once_with()
-        activate_legacy.assert_called_once_with()
+        activate_legacy.assert_called_once_with(refresh_fence=mock.ANY)
         stop_all.assert_not_called()
 
     def test_interrupted_initial_activation_restores_pointerless_legacy_predecessor(self):

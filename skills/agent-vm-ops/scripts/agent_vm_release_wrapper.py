@@ -1447,6 +1447,28 @@ def _verify_durable_drain_state(
         _validate_state_compatibility(target_manifest, capabilities)
 
 
+def _verify_durable_drain_owner(expected_owner: str) -> None:
+    """Prove the active durable drain belongs to this release transaction."""
+    uri = f"file:{STATE_DB_PATH}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=30) as database:
+            database.execute("PRAGMA query_only = ON")
+            database.execute("BEGIN")
+            meta = dict(
+                database.execute(
+                    "SELECT key, value FROM meta WHERE key IN ('draining', 'drain_owner')",
+                ).fetchall()
+            )
+            if meta.get("draining") != "1":
+                _fail("drain_required", "release activation requires an active admission drain")
+            if meta.get("drain_owner") != expected_owner:
+                _fail("drain_unverified", "durable release drain is not owned by this activation transaction")
+    except WrapperError:
+        raise
+    except (OSError, sqlite3.Error):
+        _fail("drain_unverified", "durable release drain owner could not be verified")
+
+
 def _validate_legacy_state_schema(database: sqlite3.Connection) -> None:
     required = {
         "meta": {"key", "value"},
@@ -1839,10 +1861,16 @@ def _activate_product_runtime(
         _systemctl("start", "agent-vm-web.service", allow_missing=True)
 
 
-def _activate_legacy_runtime(*, native_already_stopped: bool = False) -> None:
+def _activate_legacy_runtime(
+    *,
+    native_already_stopped: bool = False,
+    refresh_fence=None,
+) -> None:
     """Restore only the fixed legacy reconciliation triggers for rollback."""
     if not native_already_stopped:
         _deactivate_native_runtime()
+    if refresh_fence is not None:
+        refresh_fence()
     _systemctl("start", "agent-vm-native-reconcile.service", allow_missing=True)
     _systemctl("enable", "agent-vm-native-reconcile.service", allow_missing=True)
     _systemctl("start", "agent-vm-native-age-gc.timer", allow_missing=True)
@@ -2114,6 +2142,8 @@ def _activate_unlocked(
     except ManifestError as exc:
         _fail(exc.code, exc.message, exc.detail)
     _ensure_drained(config, candidate_manifest)
+    if config["require_drained"]:
+        _verify_durable_drain_owner(drain_owner)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
     if activation_path.exists() or activation_path.is_symlink():
         _fail("transaction_exists", "activation record already exists for this transaction")
@@ -2322,7 +2352,7 @@ def _activate_unlocked(
                 elif _is_go_manifest(old_manifest):
                     _activate_go_runtime()
                 else:
-                    _activate_legacy_runtime()
+                    _activate_legacy_runtime(refresh_fence=refresh_fence)
             except (WrapperError, ManifestError) as runtime_error:
                 failure = WrapperError(
                     "activation_restore_failed",
@@ -2491,6 +2521,10 @@ def _rollback_unlocked(
             _verify_durable_drain_state(previous_manifest, expected_owner=record_drain_owner)
     else:
         _ensure_drained(config, previous_manifest)
+        if config["require_drained"]:
+            _verify_durable_drain_owner(
+                record_drain_owner if isinstance(record_drain_owner, str) else drain_owner,
+            )
     target_snapshot = _snapshot_targets(config)
     record["rollback_attempts"] = 1
     record["rollback_started"] = True
@@ -2559,7 +2593,12 @@ def _rollback_unlocked(
             _activate_go_runtime()
         else:
             _activate_legacy_runtime(native_already_stopped=predecessor_runtime_stopped or pointerless_predecessor)
-    except WrapperError as failure:
+    except (WrapperError, ManifestError) as raw_failure:
+        failure = raw_failure if isinstance(raw_failure, WrapperError) else WrapperError(
+            raw_failure.code,
+            raw_failure.message,
+            raw_failure.detail,
+        )
         restore_succeeded = False
         try:
             _restore_activation_state(
@@ -2597,7 +2636,7 @@ def _rollback_unlocked(
                 elif _is_go_manifest(active_manifest):
                     _activate_go_runtime()
                 else:
-                    _activate_legacy_runtime()
+                    _activate_legacy_runtime(refresh_fence=refresh_fence)
             except (WrapperError, ManifestError) as runtime_error:
                 failure = WrapperError(
                     "activation_restore_failed",
@@ -2662,7 +2701,7 @@ def _rollback_unlocked(
             elif _is_go_manifest(active_manifest):
                 _activate_go_runtime()
             else:
-                _activate_legacy_runtime()
+                _activate_legacy_runtime(refresh_fence=refresh_fence)
         except (WrapperError, ManifestError) as runtime_error:
             shutdown_errors = _stop_runtime_authorities()
             detail = {
