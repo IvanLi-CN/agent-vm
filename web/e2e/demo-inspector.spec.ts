@@ -7,6 +7,7 @@ test("supports left, right, floating and minimized inspector positions", async (
   const runtime = page.locator(".demo-runtime");
   const shell = page.locator(".demo-inspector-shell");
   await expect(runtime).toHaveClass(/demo-runtime--right/);
+  await expect(page.locator(".demo-inspector .eyebrow-label")).toHaveCount(0);
   await expect(page.locator(".demo-inspector")).toHaveCSS("position", "sticky");
   const positionButton = page.getByRole("button", { name: "Inspector position" });
   await positionButton.click();

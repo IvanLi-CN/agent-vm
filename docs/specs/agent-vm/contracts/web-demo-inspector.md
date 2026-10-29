@@ -10,7 +10,7 @@ Inspector 必须让第一次打开 Demo 的人立即知道三件事：这是安�
 
 Inspector 按以下顺序组织内容，不得用一组无标签的图标替代结构化字段：
 
-1. 身份区：`SAFE DEMO`/`安全演示` eyebrow、`Demo inspector`/`演示控制面板` 标题，以及布局控制和浮动模式的显式拖动手柄。
+1. 身份区：`Demo inspector`/`演示控制面板` 标题，以及布局控制和浮动模式的显式拖动手柄；不再在标题上方重复显示独立 eyebrow。
 2. 安全提示：明确显示 `In-memory simulation`/`仅内存模拟`，说明不会连接真实管理 API 或资源。
 3. 场景字段：场景、模拟身份、数据密度；字段使用带可访问名称的 shadcn/ui 风格 `Select`。
 4. 网络字段：在线/故障互斥切换，并把当前网络状态显式呈现。
@@ -18,6 +18,8 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 6. 分享与恢复：复制安全分享链接、重置场景，以及链接只包含场景、权限、网络和数据设置的说明。
 
 控件必须沿用 `web/components.json` 声明的 open-code shadcn/ui 基线。源码位于 `web/src/components/ui`，别名固定为 `@/components/ui`、`@/lib/utils`；组件层使用 Radix primitives、Tailwind utilities、CVA、`clsx`/`tailwind-merge` 的 `cn` helper 和 Lucide icons。Inspector 直接使用 shadcn `Button`、`ResizablePanelGroup`/`ResizableHandle`、Radix-backed `Select`、`ContextMenu`/`DropdownMenu` 和 Tooltip primitives，业务样式只通过现有 paper-line CSS tokens 做组合，不再新增原生裸按钮来替代组件层。
+
+面板的安全身份以 `In-memory simulation`/`仅内存模拟` 提示为唯一主视觉入口；启动失败页仍可使用 `SAFE DEMO`/`安全演示` eyebrow，作为 fail-closed 错误面的上下文标识。
 
 布局控制按钮的交互必须明确分层：普通单击只执行宽屏默认布局切换（宽屏优先右栏，窄屏优先悬浮），不得打开菜单；鼠标右键、键盘 `Shift+F10`/ContextMenu 键以及触摸长按才打开 shadcn 菜单，菜单提供左栏、右栏、悬浮、最小化四个互斥选项。悬浮模式的 shadcn `ResizableHandle withHandle` 是独立拖动手柄，精确指针桌面采用 20px 紧凑命中行，粗指针/窄屏扩展到至少 44px，支持 pointer capture、边界约束和方向键移动；布局按钮与拖动手柄不能共用职责。
 
