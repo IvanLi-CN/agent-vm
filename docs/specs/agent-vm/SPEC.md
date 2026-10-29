@@ -185,6 +185,7 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 The management-console web surface has confirmed visual evidence from the local `ui_demo` source.
 The captures use mock data without a backend, login, credentials or live deployment.
 They cover Token management, pending revocation-preview recovery, and the 512-character reason limit in Token creation, confirmation dialogs and image import.
+The reason-limit captures show that overlong input remains editable and submission is disabled until it is corrected.
 The pending-preview capture delays the mock response to expose its recovery controls.
 Mobile captures use a `393x852` CSS-pixel viewport; the desktop capture shows the full rendered page surface.
 

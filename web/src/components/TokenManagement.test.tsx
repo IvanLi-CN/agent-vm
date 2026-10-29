@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import "../app/i18n";
@@ -316,19 +316,70 @@ describe("TokenManagement pagination", () => {
     expect(firstRender.client.getQueryData<{ preview: typeof retryPreview }>(["token-revoke-recovery"])?.preview?.confirmation_token).toBe("confirmation-retry");
   });
 
-  it("bounds Token creation reasons at the contract limit", async () => {
+  it.each([
+    { label: "an omitted reason", correctedReason: "" },
+    { label: "512 supplementary characters", correctedReason: "😀".repeat(512) },
+  ])("blocks Token creation until an overlong reason is corrected to $label", async ({ correctedReason }) => {
+    const user = userEvent.setup();
     listTokensMock.mockReset().mockResolvedValue({ items: [], page: { limit: 25, next_cursor: null } });
-    createAgentTokenMock.mockReset();
+    createAgentTokenMock.mockReset().mockResolvedValue({ operation_id: "operation-create-reason", metadata: token("tok_create_reason"), plaintext_disclosure: "consumed" });
 
     renderTokenManagement();
     await screen.findByTestId("token-management");
     const reason = screen.getByRole("textbox", { name: /审计原因|audit reason/i });
-    const validReason = "😀".repeat(512);
-    fireEvent.change(reason, { target: { value: validReason } });
-    expect(reason).toHaveValue(validReason);
-    fireEvent.change(reason, { target: { value: `${validReason}界` } });
-    expect(reason).toHaveValue(validReason);
+    const createButton = screen.getByRole("button", { name: /创建 Token|create token/i });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    const invalidReason = "😀".repeat(513);
+    fireEvent.change(reason, { target: { value: invalidReason } });
+    expect(reason).toHaveValue(invalidReason);
+    expect(reason).toHaveAttribute("aria-invalid", "true");
     expect(await screen.findByRole("alert")).toHaveTextContent(/512/);
+    expect(createButton).toBeDisabled();
+    fireEvent.submit(createButton.closest("form")!);
     expect(createAgentTokenMock).not.toHaveBeenCalled();
+
+    fireEvent.change(reason, { target: { value: correctedReason } });
+    expect(reason).toHaveValue(correctedReason);
+    expect(reason).not.toHaveAttribute("aria-invalid", "true");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(createButton).toBeEnabled();
+    await user.click(createButton);
+    await waitFor(() => expect(createAgentTokenMock).toHaveBeenCalledWith(["agent:read"], expect.any(String), correctedReason, expect.any(String)));
+  });
+
+  it.each([
+    { label: "an omitted reason", correctedReason: "" },
+    { label: "512 supplementary characters", correctedReason: "😀".repeat(512) },
+  ])("blocks Token revocation until an overlong reason is corrected to $label", async ({ correctedReason }) => {
+    const user = userEvent.setup();
+    const target = token("tok_revoke_reason");
+    const preview = { token_id: target.token_id, target_version: target.resource_version, confirmation_token: "confirmation-reason", expires_at: "2027-01-01T00:05:00.000Z", metadata: target };
+    listTokensMock.mockReset().mockResolvedValue({ items: [target], page: { limit: 25, next_cursor: null } });
+    previewTokenRevocationMock.mockReset().mockResolvedValue(preview);
+    submitTokenRevocationMock.mockReset().mockResolvedValue({ operation_id: "operation-revoke-reason", status: "succeeded" });
+
+    renderTokenManagement();
+    const revokeButton = await screen.findByRole("button", { name: /撤销|revoke/i });
+    await waitFor(() => expect(revokeButton).toBeEnabled());
+    await user.click(revokeButton);
+    const dialog = await screen.findByRole("dialog");
+    const reason = within(dialog).getByRole("textbox", { name: /原因|reason/i });
+    const confirmButton = within(dialog).getByRole("button", { name: /确认提交|confirm and submit/i });
+    const invalidReason = "😀".repeat(513);
+    fireEvent.change(reason, { target: { value: invalidReason } });
+    expect(reason).toHaveValue(invalidReason);
+    expect(reason).toHaveAttribute("aria-invalid", "true");
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(/512/);
+    expect(confirmButton).toBeDisabled();
+    await user.click(confirmButton);
+    expect(submitTokenRevocationMock).not.toHaveBeenCalled();
+
+    fireEvent.change(reason, { target: { value: correctedReason } });
+    expect(reason).toHaveValue(correctedReason);
+    expect(reason).not.toHaveAttribute("aria-invalid", "true");
+    expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument();
+    expect(confirmButton).toBeEnabled();
+    await user.click(confirmButton);
+    await waitFor(() => expect(submitTokenRevocationMock).toHaveBeenCalledWith(target.token_id, correctedReason, preview, expect.any(String)));
   });
 });

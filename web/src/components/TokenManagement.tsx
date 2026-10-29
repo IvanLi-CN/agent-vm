@@ -126,6 +126,7 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
   const [scopes, setScopes] = useState<TokenScope[]>(["agent:read"]);
   const [expiresAt, setExpiresAt] = useState(defaultExpiry);
   const [reason, setReason] = useState("");
+  const createReasonTooLong = !auditReasonWithinLimit(reason);
   const [createErrorCode, setCreateErrorCode] = useState<string | null>(() => persistedCreateRecovery?.createErrorCode ?? null);
   const [createError, setCreateError] = useState<string | null>(() => errorMessageForCode(persistedCreateRecovery?.createErrorCode ?? null, t));
   const [createRequest, setCreateRequest] = useState<CreateRequest | null>(() => persistedCreateRecovery?.createRequest ?? null);
@@ -641,11 +642,11 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
         </fieldset>
         <div className="token-form-fields">
           <label className="field-label"><span>{t("tokens.expiresAt")}</span><Input type="datetime-local" value={expiresAt} onChange={(event) => { resetCreateIntent(); setExpiresAt(event.target.value); }} disabled={!canManageTokens} required /></label>
-          <label className="field-label"><span>{t("tokens.reason")} <em>({t("common.optional")})</em></span><Textarea value={reason} onChange={(event) => { const next = event.target.value; resetCreateIntent(); if (auditReasonWithinLimit(next)) { setReason(next); setCreateError(null); } else setCreateError(t("common.reasonTooLong")); }} rows={2} disabled={!canManageTokens} placeholder={t("common.reasonPlaceholder")} /></label>
+          <label className="field-label"><span>{t("tokens.reason")} <em>({t("common.optional")})</em></span><Textarea value={reason} aria-invalid={createReasonTooLong ? "true" : undefined} aria-describedby={createReasonTooLong ? "token-create-reason-error" : undefined} onChange={(event) => { resetCreateIntent(); setReason(event.target.value); }} rows={2} disabled={!canManageTokens} placeholder={t("common.reasonPlaceholder")} /></label>
         </div>
-        {createError ? <div role="alert"><p className="field-error">{createError}</p>{createOperationIdValue ? <p className="token-retry-hint">{t("tokens.retryCreate", { operationId: createOperationIdValue })}</p> : null}</div> : null}
+        {createReasonTooLong || createError ? <div role="alert" id={createReasonTooLong ? "token-create-reason-error" : undefined}><p className="field-error">{createReasonTooLong ? t("common.reasonTooLong") : createError}</p>{createOperationIdValue ? <p className="token-retry-hint">{t("tokens.retryCreate", { operationId: createOperationIdValue })}</p> : null}</div> : null}
         {createRecoveryOperationId ? <div className="token-recovery"><p className="token-retry-hint">{t("tokens.operationRecoveryHint", { operationId: createRecoveryOperationId })}</p><Button type="button" variant="ghost" disabled={createRecoveryPending} onClick={() => void checkCreateOperation()}>{createRecoveryPending ? t("common.loading") : t("tokens.checkOperation")}</Button>{createRecoveryError ? <p className="field-error" role="alert">{createRecoveryError}</p> : null}{createRecoveryStatus ? <p className="token-retry-hint" data-testid="token-operation-status">{t("tokens.operationStatus", { status: t(`status.${createRecoveryStatus.status}`) })}</p> : null}</div> : null}
-        <div className="token-form-actions"><Button type="submit" variant="primary" disabled={createMutation.isPending || !canManageTokens || Boolean(createRecoveryOperationId && createRecoveryDecision !== "retry_same" && createRecoveryDecision !== "new_intent")} icon={<KeyRound />}>{createMutation.isPending ? t("common.loading") : createOperationIdValue ? t("tokens.retryCreateButton") : t("tokens.create")}</Button></div>
+        <div className="token-form-actions"><Button type="submit" variant="primary" disabled={createMutation.isPending || !canManageTokens || createReasonTooLong || Boolean(createRecoveryOperationId && createRecoveryDecision !== "retry_same" && createRecoveryDecision !== "new_intent")} icon={<KeyRound />}>{createMutation.isPending ? t("common.loading") : createOperationIdValue ? t("tokens.retryCreateButton") : t("tokens.create")}</Button></div>
       </form>
     </div>
     {plaintextMetadata ? <PlaintextDisclosure token={plaintextMetadata} plaintext={plaintextToken} consumed={plaintextConsumed} onDismiss={() => { setPlaintextToken(null); setPlaintextConsumed(true); }} /> : null}

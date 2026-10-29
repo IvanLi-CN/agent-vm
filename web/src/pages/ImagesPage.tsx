@@ -35,6 +35,7 @@ export function ImagesPage() {
   const [metadataFile, setMetadataFile] = useState<File | null>(null);
   const [rootfsFile, setRootfsFile] = useState<File | null>(null);
   const [reason, setReason] = useState("");
+  const importReasonTooLong = !auditReasonWithinLimit(reason);
   const [importMessage, setImportMessage] = useState("");
   const [pendingImport, setPendingImport] = useState<ImportSubmission | null>(null);
   const [action, setAction] = useState<ImageAction | null>(null);
@@ -75,13 +76,13 @@ export function ImagesPage() {
   };
 
   const startImport = () => {
+    if (importReasonTooLong) { setImportMessage(t("common.reasonTooLong")); return; }
     if (pendingImport) {
       importMutation.mutate(pendingImport);
       return;
     }
     const targetVersion = query.data?.catalog_version;
     if (!targetVersion) { setImportMessage(t("images.targetUnavailable")); return; }
-    if (!auditReasonWithinLimit(reason)) { setImportMessage(t("common.reasonTooLong")); return; }
     const operation_id = createOperationId();
     const providedReason = optionalAuditReason(reason);
     const optionalReason = providedReason === undefined ? {} : { reason: providedReason };
@@ -164,9 +165,9 @@ export function ImagesPage() {
             <label className="file-field"><span>{t("images.rootfsFile")}</span><span className="file-input"><FileUp aria-hidden="true" /><input type="file" accept="application/octet-stream,.tar,.tar.gz" onChange={(event) => setRootfsFile(event.target.files?.[0] ?? null)} /><span>{rootfsFile?.name ?? t("images.chooseFile")}</span></span></label>
           </>}
         </>}
-        <label className="field-label field-span-2">{t("images.importReason")}<Input value={reason} onChange={(event) => { const next = event.target.value; if (auditReasonWithinLimit(next)) { setReason(next); setImportMessage(""); } else setImportMessage(t("common.reasonTooLong")); }} placeholder={t("common.reasonPlaceholder")} /></label>
+        <label className="field-label field-span-2">{t("images.importReason")}<Input value={reason} aria-invalid={importReasonTooLong ? "true" : undefined} aria-describedby={importReasonTooLong ? "image-import-reason-error" : undefined} onChange={(event) => { setReason(event.target.value); setImportMessage(""); }} placeholder={t("common.reasonPlaceholder")} /></label>
       </div>
-      <div className="import-footer"><span className={importMessage.includes("created") || importMessage.includes("已创建") ? "success-copy" : "field-error"}>{importMessage}</span><Button variant="primary" icon={<FileUp />} disabled={importMutation.isPending} onClick={startImport}>{importMutation.isPending ? t("common.loading") : t("images.startImport")}</Button></div>
+      <div className="import-footer"><span id={importReasonTooLong ? "image-import-reason-error" : undefined} role={importReasonTooLong ? "alert" : undefined} className={!importReasonTooLong && (importMessage.includes("created") || importMessage.includes("已创建")) ? "success-copy" : "field-error"}>{importReasonTooLong ? t("common.reasonTooLong") : importMessage}</span><Button variant="primary" icon={<FileUp />} disabled={importMutation.isPending || importReasonTooLong} onClick={startImport}>{importMutation.isPending ? t("common.loading") : t("images.startImport")}</Button></div>
     </Panel>
     {action && preview && selected ? <ActionDialog preview={preview} actionLabel={actionLabel(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", locale)} target={`${selected.version_label} · ${shortFingerprint(selected.fingerprint)}`} dangerous={action === "delete" || action === "retire"} busy={actionMutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null); }} onConfirm={(actionReason) => actionMutation.mutate({ reason: actionReason })} /> : null}
   </div>;

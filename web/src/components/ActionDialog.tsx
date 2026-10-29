@@ -24,7 +24,7 @@ export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm
   const { t, i18n } = useTranslation();
   const locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const [reason, setReason] = useState("");
-  const [reasonError, setReasonError] = useState<string | null>(null);
+  const reasonTooLong = !auditReasonWithinLimit(reason);
   const reasonRef = useRef<HTMLTextAreaElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(returnFocusTarget ?? (typeof document === "undefined" ? null : document.activeElement as HTMLElement));
@@ -103,10 +103,7 @@ export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm
   }, [busy, onCancel]);
 
   const submit = () => {
-    if (!auditReasonWithinLimit(reason)) {
-      setReasonError(t("common.reasonTooLong"));
-      return;
-    }
+    if (reasonTooLong) return;
     onConfirm(reason);
   };
 
@@ -120,10 +117,10 @@ export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm
       {error ? <p className="field-error" role="alert">{error}</p> : null}
       <p className="dialog-expiry">{t("dialog.expires", { time: formatDateTime(preview.expires_at, locale) })}</p>
       <label className="field-label" htmlFor="action-reason">{t("common.reason")} <span>({t("common.optional")})</span></label>
-      <Textarea ref={reasonRef} id="action-reason" value={reason} aria-invalid={reasonError ? "true" : undefined} aria-describedby={reasonError ? "action-reason-error" : undefined} onChange={(event) => { const next = event.target.value; if (!auditReasonWithinLimit(next)) { setReasonError(t("common.reasonTooLong")); return; } setReason(next); setReasonError(null); }} placeholder={t("common.reasonPlaceholder")} rows={3} />
-      {reasonError ? <p id="action-reason-error" className="field-error" role="alert">{reasonError}</p> : null}
+      <Textarea ref={reasonRef} id="action-reason" value={reason} aria-invalid={reasonTooLong ? "true" : undefined} aria-describedby={reasonTooLong ? "action-reason-error" : undefined} onChange={(event) => setReason(event.target.value)} placeholder={t("common.reasonPlaceholder")} rows={3} />
+      {reasonTooLong ? <p id="action-reason-error" className="field-error" role="alert">{t("common.reasonTooLong")}</p> : null}
       <p className="dialog-warning">{confirmationText ?? t("vms.actionConfirmText")}</p>
-      <div className="dialog-actions"><Button variant="ghost" disabled={busy} onClick={onCancel}>{t("common.cancel")}</Button><Button variant={dangerous ? "danger" : "primary"} disabled={busy} onClick={submit} icon={busy ? <ShieldCheck /> : <ArrowRight />}>{busy ? t("common.loading") : t("dialog.submit")}</Button></div>
+      <div className="dialog-actions"><Button variant="ghost" disabled={busy} onClick={onCancel}>{t("common.cancel")}</Button><Button variant={dangerous ? "danger" : "primary"} disabled={busy || reasonTooLong} onClick={submit} icon={busy ? <ShieldCheck /> : <ArrowRight />}>{busy ? t("common.loading") : t("dialog.submit")}</Button></div>
     </div>
   </dialog>;
 }
