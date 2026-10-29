@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { build_product_manifest, PRODUCT_LINUX_ARTIFACTS, verify_product_bundle, type Artifact } from "../scripts/product-manifest.ts";
+import { build_product_manifest, PRODUCT_LINUX_ARTIFACTS, validate_product_manifest, verify_product_bundle, type Artifact } from "../scripts/product-manifest.ts";
 import { default_operations } from "../scripts/release-manifest.ts";
 
 test("format-3 client manifest fixes product identity, source and action windows", () => {
@@ -75,6 +75,9 @@ test("format-4 management manifest requires the Linux product target", () => {
       "legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1",
     ]);
     expect(verify_product_bundle(root, manifest)).toEqual(manifest);
+    const historical = structuredClone(manifest);
+    historical.client_view.transport = "legacy-bun";
+    expect(validate_product_manifest(historical)).toEqual(historical);
     expect(() => build_product_manifest("1.0.0", "b".repeat(40), artifacts, {
       format: 4,
       target: { os: "linux", arch: "amd64" },

@@ -133,7 +133,7 @@ class WrapperTests(unittest.TestCase):
 
     def test_drain_verification_uses_fixed_go_request_after_cutover(self):
         self.drain_patch.stop()
-        self._install_go_payload("go-request")
+        self._install_go_runtime("go-request")
         response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
         with mock.patch.object(
             WRAPPER.subprocess, "run",
@@ -156,7 +156,7 @@ class WrapperTests(unittest.TestCase):
 
     def test_drain_verification_uses_fixed_go_request_for_https_metadata(self):
         self.drain_patch.stop()
-        self._install_go_payload("https")
+        self._install_go_runtime("https")
         response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
         with mock.patch.object(
             WRAPPER.subprocess, "run",
@@ -167,6 +167,31 @@ class WrapperTests(unittest.TestCase):
             run.call_args.args[0],
             [str(WRAPPER.GO_CONTROL_PATH), "request", "--socket", str(WRAPPER.GO_CONTROL_SOCKET), "--timeout", "30s"],
         )
+
+    def test_drain_verification_accepts_installed_go_runtime_layout(self):
+        self.drain_patch.stop()
+        self._install_go_runtime("https")
+        response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ) as run:
+            WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(
+            run.call_args.args[0],
+            [str(WRAPPER.GO_CONTROL_PATH), "request", "--socket", str(WRAPPER.GO_CONTROL_SOCKET), "--timeout", "30s"],
+        )
+
+    def test_drain_verification_rejects_tampered_active_native_unit(self):
+        self.drain_patch.stop()
+        self._install_go_runtime("https")
+        unit = Path(self.loaded["unit_dir"]) / "agent-vm-native.service"
+        unit.write_bytes(unit.read_bytes() + b"\n# tampered\n")
+        with mock.patch.object(WRAPPER.subprocess, "run") as run:
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(failure.exception.code, "drain_unverified")
+        run.assert_not_called()
 
     def test_drain_verification_rejects_malformed_present_sidecar(self):
         self.drain_patch.stop()
@@ -531,6 +556,12 @@ class WrapperTests(unittest.TestCase):
         payload = self._go_payload("c" * 40, transport=transport)
         WRAPPER.safe_extract_archive(payload, Path(self.loaded["control_path"]).parent)
 
+    def _install_go_runtime(self, transport):
+        extracted = self.root / "go-installed"
+        WRAPPER.safe_extract_archive(self._go_payload("e" * 40, transport=transport), extracted)
+        manifest = MANIFEST.load_release_manifest(extracted / MANIFEST.MANIFEST_NAME)
+        WRAPPER._install_go_release_files(self.loaded, extracted, manifest)
+
     def _go_payload(self, release_id, *, transport="go-request"):
         extracted = self.root / "go-candidate"
         client_root = ROOT / "skills/agent-vm/scripts"
@@ -607,6 +638,47 @@ class WrapperTests(unittest.TestCase):
         self.assertTrue((unit_dir / "agent-vm-native.service").is_file())
         for name in MANIFEST.GO_RETIRED_UNITS:
             self.assertFalse((unit_dir / name).exists())
+
+    def test_native_install_removes_format_one_predecessor_files(self):
+        legacy_root = self.root / "legacy-before-native"
+        WRAPPER.safe_extract_archive(self.payload, legacy_root)
+        legacy_manifest = MANIFEST.load_release_manifest(legacy_root / MANIFEST.MANIFEST_NAME)
+        WRAPPER._install_release_files(self.loaded, legacy_root, legacy_manifest)
+
+        self._install_go_runtime("https")
+        installed_root = Path(self.loaded["control_path"]).parent
+        for name in WRAPPER.LEGACY_ONLY_SUPPORT_NAMES:
+            self.assertFalse((installed_root / name).exists(), name)
+        for name in WRAPPER.FIXED_UNIT_NAMES:
+            self.assertFalse((installed_root / "systemd" / name).exists(), name)
+        for name in WRAPPER.GO_RETIRED_UNITS:
+            self.assertFalse((Path(self.loaded["unit_dir"]) / name).exists(), name)
+
+    def test_format_one_install_removes_native_predecessor_files(self):
+        self._install_go_runtime("https")
+        installed_root = Path(self.loaded["control_path"]).parent
+        legacy_root = self.root / "legacy-after-native"
+        WRAPPER.safe_extract_archive(self.payload, legacy_root)
+        legacy_manifest = MANIFEST.load_release_manifest(legacy_root / MANIFEST.MANIFEST_NAME)
+        WRAPPER._install_release_files(self.loaded, legacy_root, legacy_manifest)
+
+        self.assertFalse((installed_root / "agent_vm_control_bridge.ts").exists())
+        self.assertFalse((installed_root / "bin" / "agent-vm-control").exists())
+        self.assertFalse((installed_root / "systemd" / "agent-vm-native.service").exists())
+        self.assertFalse((installed_root / "systemd" / "agent-vm-web.service").exists())
+        self.assertFalse((installed_root / "config" / "agent-vm-web.json.example").exists())
+        self.assertFalse((installed_root / "web-assets.manifest.json").exists())
+        self.assertFalse((Path(self.loaded["unit_dir"]) / "agent-vm-native.service").exists())
+        self.assertFalse((Path(self.loaded["unit_dir"]) / "agent-vm-web.service").exists())
+        self.drain_patch.stop()
+        response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ) as run:
+            WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(run.call_args.args[0], ["/usr/local/bin/bun", str(self.loaded["control_path"])])
 
     def test_unit_policy_bytes_are_pinned_even_when_manifest_checksum_matches(self):
         payload = self._tampered_unit_payload()

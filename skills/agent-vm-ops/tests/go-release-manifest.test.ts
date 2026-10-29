@@ -23,6 +23,9 @@ test("format-2 manifest emits and validates the direct HTTPS transport", () => {
 
 test("format-2 manifest rejects the legacy Bun transport for native Linux artifacts", () => {
   expect(() => build_go_manifest("a".repeat(40), artifacts, { transport: "legacy-bun" })).toThrow("native Linux");
+  const historical = build_go_manifest("a".repeat(40), artifacts);
+  historical.client_view.transport = "legacy-bun";
+  expect(validate_go_manifest(historical)).toEqual(historical);
 });
 
 test("format-2 manifest rejects a candidate artifact or unknown transport before execution", () => {

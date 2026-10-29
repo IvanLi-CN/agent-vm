@@ -102,8 +102,7 @@ class ProductManifestTests(unittest.TestCase):
 
             legacy = copy.deepcopy(manifest)
             legacy["client_view"]["transport"] = "legacy-bun"
-            with self.assertRaises(Exception):
-                validate_product_manifest(legacy)
+            self.assertEqual(validate_product_manifest(legacy), legacy)
 
             historical = copy.deepcopy(manifest)
             historical_web = next(item for item in historical["artifacts"] if item["path"] == "config/agent-vm-web.json.example")

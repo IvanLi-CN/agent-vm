@@ -115,6 +115,10 @@ MAX_FILE_BYTES = 64 * 1024 * 1024
 FORBIDDEN_CONFIG_NAMES = {"config.json", "state.sqlite3", "control.lock", "authority.lock", "admission.lock"}
 FIXED_UNIT_NAMES = tuple(sorted(set(UNIT_EXEC_START) | {"agent-vm-native-age-gc.timer"}))
 PRODUCT_UNIT_NAMES = ("agent-vm-native.service", "agent-vm-web.service")
+GO_SUPPORT_ARTIFACT_NAMES = frozenset(
+    path for _, path, role, _ in GO_FIXED_ARTIFACTS if role == "support"
+)
+LEGACY_ONLY_SUPPORT_NAMES = tuple(sorted(SUPPORT_ARTIFACT_NAMES - GO_SUPPORT_ARTIFACT_NAMES))
 FIXED_ARTIFACTS = {
     ("client", "agent_vm.ts"),
     ("control", "agent_vm_control.ts"),
@@ -153,6 +157,18 @@ def _legacy_runtime_artifact_paths(
         else:
             paths[relative] = installed_root / Path(*PurePosixPath(relative).parts)
     return paths
+
+
+def _native_runtime_artifact_paths(
+    config: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> dict[str, Path]:
+    """Map native unit artifacts to the active systemd installation."""
+    return {
+        str(artifact["path"]): Path(config["unit_dir"]) / Path(str(artifact["path"])).name
+        for artifact in manifest["artifacts"]
+        if artifact["role"] == "unit"
+    }
 
 
 def _manifest_release_id(manifest: Mapping[str, Any]) -> str:
@@ -541,9 +557,8 @@ def _artifact_runtime_path(
 ) -> Path:
     if artifact_paths is not None:
         path = artifact_paths.get(str(artifact["path"]))
-        if path is None:
-            _fail("artifact_unverified", f"runtime artifact path is not configured: {artifact['path']}")
-        return path
+        if path is not None:
+            return path
     return root / Path(*PurePosixPath(str(artifact["path"])).parts)
 
 
@@ -625,10 +640,16 @@ def _verify_unit_contents(
             _fail("unit_unverified", f"unit contains a forbidden control path: {name}")
 
 
-def _reject_transaction_extras(root: Path, manifest: Mapping[str, Any]) -> None:
+def _reject_transaction_extras(
+    root: Path,
+    manifest: Mapping[str, Any],
+    *,
+    allowed_extra_paths: set[str] | None = None,
+) -> None:
     allowed = {MANIFEST_NAME, "client-release.json", ".wrapper-state.json", ".verified.json"} | {
         item["path"] for item in manifest["artifacts"]
     }
+    allowed.update(allowed_extra_paths or set())
     for path in root.rglob("*"):
         if path.is_symlink():
             _fail("artifact_unverified", "transaction contains a symlink", {"path": path.relative_to(root).as_posix()})
@@ -874,22 +895,68 @@ def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
         _fail("activation_failed", f"cannot atomically install artifact: {target.name}")
 
 
+def _remove_owned_target(path: Path, owner_uid: int, modes: tuple[int, ...]) -> None:
+    """Remove one fixed predecessor artifact after checking its ownership and mode."""
+    if not path.exists() and not path.is_symlink():
+        return
+    _require_owned_regular_modes(path, owner_uid, modes)
+    try:
+        path.unlink()
+        _fsync_directory(path.parent, "activation_failed")
+    except OSError:
+        _fail("activation_failed", f"cannot retire the exact predecessor artifact: {path.name}")
+
+
+def _remove_native_predecessor_files(config: Mapping[str, Any], owner_uid: int) -> None:
+    """Remove the exact native artifacts when returning to the format-1 runtime."""
+    bundle_root = Path(config["control_path"]).parent
+    targets: list[tuple[Path, tuple[int, ...]]] = [
+        (bundle_root / "agent_vm_control_bridge.ts", (0o755,)),
+        (_go_control_target(config), (0o755,)),
+        (Path(config["unit_dir"]) / "agent-vm-native.service", (0o644,)),
+        (Path(config["unit_dir"]) / "agent-vm-web.service", (0o644,)),
+        (bundle_root / "systemd" / "agent-vm-native.service", (0o644,)),
+        (bundle_root / "systemd" / "agent-vm-web.service", (0o644,)),
+        (bundle_root / "config" / "agent-vm-web.json.example", (0o640, 0o644)),
+        (bundle_root / "web-assets.manifest.json", (0o644,)),
+    ]
+    for path, modes in targets:
+        _remove_owned_target(path, owner_uid, modes)
+
+
+def _remove_legacy_predecessor_files(config: Mapping[str, Any], owner_uid: int) -> None:
+    """Remove exact format-1-only files before installing a native runtime."""
+    bundle_root = Path(config["control_path"]).parent
+    targets = [
+        (bundle_root / name, (SUPPORT_ARTIFACT_MODES[name],))
+        for name in LEGACY_ONLY_SUPPORT_NAMES
+    ]
+    targets.extend(
+        (bundle_root / "systemd" / name, (0o644,))
+        for name in FIXED_UNIT_NAMES
+    )
+    for path, modes in targets:
+        _remove_owned_target(path, owner_uid, modes)
+
+
 def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
     bundle_root = Path(config["control_path"]).parent
     targets = (
         Path(config["control_path"]),
         _go_control_target(config),
+        Path(config["control_path"]).with_name("agent_vm_control_bridge.ts"),
         Path(config["control_path"]).with_name(RETIRED_CONTROL_NAME),
         Path(config["control_path"]).with_name(RETIRED_CLIENT_NAME),
         Path(config["control_path"]).with_name("agent_vm.ts"),
         *(Path(config["control_path"]).with_name(name) for name in sorted(SUPPORT_ARTIFACT_NAMES)),
         Path(config["control_path"]).with_name(MANIFEST_NAME),
         Path(config["control_path"]).with_name("client-release.json"),
-    ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], "agent-vm-native.service", "agent-vm-web.service")) + (
-        bundle_root / "systemd" / "agent-vm-native.service",
-        bundle_root / "systemd" / "agent-vm-web.service",
-        bundle_root / "config" / "agent-vm-web.json.example",
-        bundle_root / "web-assets.manifest.json",
+    ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], "agent-vm-native.service", "agent-vm-web.service")) + tuple(
+        [bundle_root / "systemd" / name for name in (*FIXED_UNIT_NAMES, *PRODUCT_UNIT_NAMES)]
+        + [
+            bundle_root / "config" / "agent-vm-web.json.example",
+            bundle_root / "web-assets.manifest.json",
+        ]
     )
     return tuple(dict.fromkeys(targets))
 
@@ -1060,11 +1127,13 @@ def _verify_installed_release(
     """Verify the split runtime layout before using its control authority."""
     runtime_paths: Mapping[str, Path] | None = None
     if _is_go_manifest(manifest):
+        runtime_paths = _native_runtime_artifact_paths(config, manifest)
         verify_go_bundle(installed_root, manifest)
     elif _is_product_manifest(manifest):
         target = manifest.get("target")
         if not isinstance(target, Mapping) or target.get("os") != "linux":
             _fail("drain_unverified", "installed product release is not a native Linux package")
+        runtime_paths = _native_runtime_artifact_paths(config, manifest)
         from release_manifest import verify_product_bundle
         verify_product_bundle(
             installed_root,
@@ -1079,7 +1148,9 @@ def _verify_installed_release(
         manifest,
         allow_historical_web_config_mode=True,
     )
-    _reject_transaction_extras(installed_root, checked)
+    bridge_alias = installed_root / "agent_vm_control.ts"
+    allowed_extra_paths = {bridge_alias.name} if (_is_go_manifest(checked) or _is_product_manifest(checked)) and (bridge_alias.exists() or bridge_alias.is_symlink()) else set()
+    _reject_transaction_extras(installed_root, checked, allowed_extra_paths=allowed_extra_paths)
     _verify_fixed_artifacts(config, checked, allow_historical_web_config_mode=True)
     _verify_python_syntax(installed_root, checked)
     _verify_typescript_syntax(installed_root, checked)
@@ -1098,6 +1169,16 @@ def _verify_installed_release(
             owner_uid,
             item["mode"],
         )
+    if (_is_go_manifest(checked) or _is_product_manifest(checked)) and (bridge_alias.exists() or bridge_alias.is_symlink()):
+        bridge = next(
+            (item for item in checked["artifacts"] if item["path"] == "agent_vm_control_bridge.ts"),
+            None,
+        )
+        if bridge is None:
+            _fail("artifact_unverified", "installed compatibility bridge alias has no declared bridge")
+        _require_owned_regular(bridge_alias, owner_uid, bridge["mode"])
+        if sha256_file(bridge_alias) != bridge["sha256"]:
+            _fail("artifact_checksum_mismatch", "installed compatibility bridge alias differs")
     return checked
 
 
@@ -1337,6 +1418,7 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
             support_installed.add(item["path"])
     if support_installed != SUPPORT_ARTIFACT_NAMES:
         _fail("activation_unverified", "fixed support modules are missing")
+    _remove_native_predecessor_files(config, owner_uid)
     manifest_source = release_root / MANIFEST_NAME
     _require_owned_regular(manifest_source, owner_uid, 0o644)
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
@@ -1381,6 +1463,12 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
         elif item["role"] == "control":
             if item["path"] == "agent_vm_control_bridge.ts":
                 _copy_atomic(source, _go_bridge_target(config), owner_uid, item["mode"])
+                # Keep the historical Bun entrypoint aligned with the bridge
+                # so the publisher and installed-release verifier share one
+                # compatibility authority across native package formats.
+                legacy_target = Path(config["control_path"])
+                if legacy_target != _go_bridge_target(config):
+                    _copy_atomic(source, legacy_target, owner_uid, item["mode"])
             elif item["path"] == "bin/agent-vm-control":
                 _copy_atomic(source, _go_control_target(config), owner_uid, item["mode"])
             else:
@@ -1395,6 +1483,7 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
     expected_client_support = {path for _, path, role, _ in PRODUCT_CLIENT_ARTIFACTS if role == "support"}
     if installed_support != expected_support or not expected_client_support.issubset(installed_support) or installed_controls != {"agent_vm_control_bridge.ts", "bin/agent-vm-control"}:
         _fail("activation_unverified", "fixed product control artifacts are missing")
+    _remove_legacy_predecessor_files(config, owner_uid)
     for name in GO_RETIRED_UNITS:
         retired = Path(config["unit_dir"]) / name
         if retired.exists() or retired.is_symlink():
@@ -1478,6 +1567,7 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
             _copy_atomic(source, go_bundle_root / item["path"], owner_uid, item["mode"])
     if installed_support != expected_support or installed_controls != {"agent_vm_control_bridge.ts", "bin/agent-vm-control"}:
         _fail("activation_unverified", "fixed Go control artifacts are missing")
+    _remove_legacy_predecessor_files(config, owner_uid)
     for name in GO_RETIRED_UNITS:
         retired = Path(config["unit_dir"]) / name
         if retired.exists() or retired.is_symlink():

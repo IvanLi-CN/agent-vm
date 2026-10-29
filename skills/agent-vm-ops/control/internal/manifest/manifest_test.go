@@ -157,7 +157,7 @@ func TestLoadAcceptsHTTPSGoTransport(t *testing.T) {
 	}
 }
 
-func TestRejectsLegacyBunNativeTransport(t *testing.T) {
+func TestLoadsHistoricalLegacyBunNativeTransport(t *testing.T) {
 	format2Path, _ := validManifest(t)
 	for name, manifestPath := range map[string]string{
 		"format-2": format2Path,
@@ -165,8 +165,12 @@ func TestRejectsLegacyBunNativeTransport(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			rewriteTransport(t, manifestPath, "legacy-bun")
-			if err := Load(manifestPath); err == nil || !strings.Contains(err.Error(), "Linux") {
-				t.Fatalf("legacy Bun transport error = %v", err)
+			metadata, err := LoadMetadata(manifestPath)
+			if err != nil {
+				t.Fatalf("legacy Bun transport load error = %v", err)
+			}
+			if metadata.Transport != "legacy-bun" || !metadata.ManifestPresent || !metadata.ArtifactsVerified {
+				t.Fatalf("legacy Bun metadata = %#v", metadata)
 			}
 		})
 	}
