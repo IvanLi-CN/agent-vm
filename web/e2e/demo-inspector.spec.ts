@@ -169,6 +169,8 @@ test("keeps the demo isolated while a scenario and simulated action change", asy
 });
 
 test("supports a mobile inspector drawer and fail-closed bootstrap", async ({ page }) => {
+  const realRequests: string[] = [];
+  page.on("request", (request) => { if (new URL(request.url()).pathname.startsWith("/api/v1")) realRequests.push(request.url()); });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("?demo=empty");
   await expect(page.getByTestId("overview-page")).toBeVisible();
@@ -189,6 +191,7 @@ test("supports a mobile inspector drawer and fail-closed bootstrap", async ({ pa
   await expect(page.getByRole("heading", { name: "Demo could not start" })).toBeVisible();
   await expect(page.getByText("The simulated environment was not ready")).toBeVisible();
   await expect(page.getByRole("heading", { name: "Demo inspector" })).toHaveCount(0);
+  expect(realRequests).toEqual([]);
 });
 
 test("covers route pages, denied reads, keyboard controls and clipboard failure", async ({ page }) => {
