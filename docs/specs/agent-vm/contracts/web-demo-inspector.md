@@ -19,7 +19,7 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 
 控件必须沿用 `web/components.json` 声明的 open-code shadcn/ui 基线。源码位于 `web/src/components/ui`，别名固定为 `@/components/ui`、`@/lib/utils`；组件层使用 Radix primitives、Tailwind utilities、CVA、`clsx`/`tailwind-merge` 的 `cn` helper 和 Lucide icons。Inspector 直接使用 shadcn `Button`、`ResizablePanelGroup`/`ResizableHandle`、Radix-backed `Select`、`ContextMenu`/`DropdownMenu` 和 Tooltip primitives，业务样式只通过现有 paper-line CSS tokens 做组合，不再新增原生裸按钮来替代组件层。
 
-布局控制按钮的交互必须明确分层：普通单击只执行宽屏默认布局切换（宽屏优先右栏，窄屏优先悬浮），不得打开菜单；鼠标右键、键盘 `Shift+F10`/ContextMenu 键以及触摸长按才打开 shadcn 菜单，菜单提供左栏、右栏、悬浮、最小化四个互斥选项。悬浮模式的 shadcn `ResizableHandle withHandle` 是独立拖动手柄，热区至少 44px（粗指针），支持 pointer capture、边界约束和方向键移动；布局按钮与拖动手柄不能共用职责。
+布局控制按钮的交互必须明确分层：普通单击只执行宽屏默认布局切换（宽屏优先右栏，窄屏优先悬浮），不得打开菜单；鼠标右键、键盘 `Shift+F10`/ContextMenu 键以及触摸长按才打开 shadcn 菜单，菜单提供左栏、右栏、悬浮、最小化四个互斥选项。悬浮模式的 shadcn `ResizableHandle withHandle` 是独立拖动手柄，精确指针桌面采用 32px 紧凑命中行，粗指针/窄屏扩展到至少 44px，支持 pointer capture、边界约束和方向键移动；布局按钮与拖动手柄不能共用职责。
 
 所有控制项必须具备可读名称、可见 focus-visible 状态和不依赖颜色的选中/错误语义；Inspector 内部不手写菜单定位、outside-click 或 menuitem ARIA 状态，交由 Radix primitives 管理焦点、portal、Esc 关闭和菜单键盘导航。组件层变更需同步 Storybook 状态与页面级浏览器验证。
 
@@ -52,9 +52,9 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 
 ### 可发现的热区
 
-浮动模式面板顶部必须显示独立的面板级拖动手柄，而不是把标题文字或业务按钮作为隐藏热区。手柄必须使用已登记的 shadcn/ui `ResizableHandle`，通过 `withHandle` 显示官方 grip；它横跨面板主要宽度但不显示“拖动”操作文案，通过 Tooltip 和 accessible name 解释用途，DOM 保留 `role="separator"` 与键盘焦点。手柄具有清晰的 hover/pressed/focus-visible 状态和至少 44×44px 的移动端触控目标。固定左栏、固定右栏和最小化模式不显示该手柄，避免暗示不可用的拖动。
+浮动模式面板顶部必须显示独立的面板级拖动手柄，而不是把标题文字或业务按钮作为隐藏热区。手柄必须使用已登记的 shadcn/ui `ResizableHandle`，通过 `withHandle` 显示官方 grip；它横跨面板主要宽度但不显示“拖动”操作文案，通过 Tooltip 和 accessible name 解释用途，DOM 保留 `role="separator"` 与键盘焦点。精确指针桌面使用紧凑的 32px 视觉/命中行，窄屏与触控布局扩展为至少 44×44px；两者都必须有清晰的 hover/pressed/focus-visible 状态。固定左栏、固定右栏和最小化模式不显示该手柄，避免暗示不可用的拖动。
 
-手柄只负责移动面板，不负责打开位置菜单；位置图标仍是单独的控制。浮动面板的 44×44px 热区从面板顶部边缘开始，官方 grip 视觉保持 32px 长度并在热区内水平居中、垂直视觉居中；手柄区域与标题之间不再额外堆叠大段空白。手柄与标题、Select、网络切换和操作按钮之间必须有清晰的 hit-area 边界，避免一次触控同时触发拖动和业务操作。
+手柄只负责移动面板，不负责打开位置菜单；位置图标仍是单独的控制。浮动面板的紧凑行从面板顶部边缘开始，官方 grip 视觉保持 32px 长度并在行内水平、垂直居中；窄屏/触控布局将同一行扩展到 44×44px，但不增加额外的视觉空白。手柄区域与标题之间不再额外堆叠大段空白。手柄与标题、Select、网络切换和操作按钮之间必须有清晰的 hit-area 边界，避免一次触控同时触发拖动和业务操作。
 
 ### 指针与触控
 
@@ -87,7 +87,7 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 - [Material 3 Bottom sheets](https://m3.material.io/components/bottom-sheets/overview) 将 drag handle 作为可选视觉提示，同时要求至少 48dp 的可访问触控热区。
 - [Apple Human Interface Guidelines — Windows](https://developer.apple.com/design/human-interface-guidelines/windows) 将可移动窗口的 frame/title bar 与业务按钮分开，窗口通过 frame 移动。
 
-因此 Inspector 采用“顶部边缘对齐的 shadcn `ResizableHandle withHandle` + 44px 整条热区 + Tooltip/accessible name”的组合；位置按钮只负责布局菜单，不能兼任拖动手柄。`ResizableHandle` 的官方 grip 视觉被复用为移动热区，但两个隐藏面板被锁定，禁止把浮动移动误认为可调宽度操作。
+因此 Inspector 采用“顶部边缘对齐的 shadcn `ResizableHandle withHandle` + 桌面 32px 紧凑行/触控 44px 行 + Tooltip/accessible name”的组合；位置按钮只负责布局菜单，不能兼任拖动手柄。`ResizableHandle` 的官方 grip 视觉被复用为移动热区，但两个隐藏面板被锁定，禁止把浮动移动误认为可调宽度操作。
 
 ## 响应式与可访问性门禁
 
@@ -97,7 +97,7 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 - 所有按钮、选择器和位置菜单可通过键盘到达；`Tab` 顺序先经过面板身份/布局控制，再经过字段和操作。
 - 位置菜单的打开、关闭、选中、最小化和恢复均可通过键盘完成；拖动有方向键替代。
 - 焦点环在浅色背景上可见，普通文本对比度满足 4.5:1，非文本控件边界满足 3:1；减少动画时不丢失状态反馈。
-- 触控目标至少 44×44px；固定元素和滚动内容不遮挡键盘焦点；窄屏正文不要求横向滚动。
+- 粗指针/触控目标至少 44×44px；精确指针桌面使用 32px 紧凑行；固定元素和滚动内容不遮挡键盘焦点；窄屏正文不要求横向滚动。
 
 ## 测试与证据
 
@@ -110,7 +110,7 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 
 ## Visual Evidence
 
-- [浮动 Inspector 顶部边缘手柄](../assets/web-demo-inspector-panel-handle.png)：合成 `images` 页面、1280×720 viewport、`floating` 布局；用于确认 44px 热区、32px 水平居中 grip 和标题区无额外大留白。
+- [浮动 Inspector 顶部边缘手柄](../assets/web-demo-inspector-panel-handle.png)：合成 `images` 页面、1280×720 viewport、`floating` 布局；用于确认桌面 32px 紧凑行、32px 水平居中 grip 和标题区无额外大留白。移动端另由页面级浏览器测试确认 44px 触控行。
 
 ## 非目标
 

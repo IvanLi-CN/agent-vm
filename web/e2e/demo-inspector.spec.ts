@@ -44,11 +44,11 @@ test("supports left, right, floating and minimized inspector positions", async (
   const headerBox = await page.locator(".demo-inspector-header").boundingBox();
   if (!beforeDrag || !dragBox || !gripBox || !headerBox) throw new Error("Floating inspector is not measurable");
   expect(dragBox.width).toBeGreaterThan(beforeDrag.width - 40);
-  expect(dragBox.height).toBeGreaterThanOrEqual(44);
+  expect(dragBox.height).toBe(32);
   expect(gripBox.width).toBeGreaterThanOrEqual(32);
   expect(Math.abs((gripBox.x + gripBox.width / 2) - (beforeDrag.x + beforeDrag.width / 2))).toBeLessThanOrEqual(1);
-  expect(gripBox.y - beforeDrag.y).toBeGreaterThanOrEqual(20);
-  expect(gripBox.y - beforeDrag.y).toBeLessThanOrEqual(24);
+  expect(gripBox.y - beforeDrag.y).toBeGreaterThanOrEqual(12);
+  expect(gripBox.y - beforeDrag.y).toBeLessThanOrEqual(16);
   expect(Math.abs(headerBox.y - (dragBox.y + dragBox.height))).toBeLessThanOrEqual(1);
   await page.mouse.move(dragBox.x + dragBox.width / 2, dragBox.y + dragBox.height / 2);
   await page.mouse.down();
@@ -130,6 +130,9 @@ test("supports a mobile inspector drawer and fail-closed bootstrap", async ({ pa
   await expect(page.getByRole("button", { name: "Open demo inspector" })).toBeVisible();
   await page.getByRole("button", { name: "Open demo inspector" }).click();
   await expect(page.getByRole("heading", { name: "Demo inspector" })).toBeVisible();
+  const mobileHandleBox = await page.getByRole("separator", { name: "Drag panel" }).boundingBox();
+  if (!mobileHandleBox) throw new Error("Mobile floating handle is not measurable");
+  expect(mobileHandleBox.height).toBe(44);
   await page.goto("?demo=normal&d_bootstrap=fail");
   await expect(page.getByRole("heading", { name: "Demo could not start" })).toBeVisible();
   await expect(page.getByText("The simulated environment was not ready")).toBeVisible();
