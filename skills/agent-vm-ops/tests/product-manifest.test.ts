@@ -77,6 +77,12 @@ test("format-4 management manifest requires the Linux product target", () => {
     expect(verify_product_bundle(root, manifest)).toEqual(manifest);
     expect(() => build_product_manifest("1.0.0", "b".repeat(40), artifacts, {
       format: 4,
+      target: { os: "linux", arch: "amd64" },
+      transport: "legacy-bun",
+      operations: default_operations(),
+    })).toThrow("Linux product");
+    expect(() => build_product_manifest("1.0.0", "b".repeat(40), artifacts, {
+      format: 4,
       target: { os: "source", arch: "any" },
       transport: "legacy-bun",
       operations: default_operations(),

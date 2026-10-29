@@ -59,6 +59,7 @@ try:
         verify_client_sidecar,
         verify_bundle,
         verify_go_bundle,
+        verify_runtime_bundle,
         verify_typescript_syntax,
     )
 except ModuleNotFoundError:
@@ -92,6 +93,7 @@ except ModuleNotFoundError:
         verify_client_sidecar,
         verify_bundle,
         verify_go_bundle,
+        verify_runtime_bundle,
         verify_typescript_syntax,
     )
 
@@ -133,6 +135,24 @@ def _is_go_manifest(manifest: Mapping[str, Any]) -> bool:
 
 def _is_product_manifest(manifest: Mapping[str, Any]) -> bool:
     return manifest.get("format") in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}
+
+
+def _legacy_runtime_artifact_paths(
+    config: Mapping[str, Any],
+    installed_root: Path,
+    manifest: Mapping[str, Any],
+) -> dict[str, Path]:
+    """Map format-1 bundle paths to their split installed runtime paths."""
+    paths: dict[str, Path] = {}
+    for artifact in manifest["artifacts"]:
+        relative = str(artifact["path"])
+        if artifact["role"] == "unit":
+            paths[relative] = Path(config["unit_dir"]) / Path(relative).name
+        elif relative == "agent_vm_control.ts":
+            paths[relative] = Path(config["control_path"])
+        else:
+            paths[relative] = installed_root / Path(*PurePosixPath(relative).parts)
+    return paths
 
 
 def _manifest_release_id(manifest: Mapping[str, Any]) -> str:
@@ -1036,7 +1056,10 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
                     allow_historical_web_config_mode=True,
                 )
             else:
-                verify_bundle(installed_root, installed_manifest)
+                verify_runtime_bundle(
+                    installed_manifest,
+                    _legacy_runtime_artifact_paths(config, installed_root, installed_manifest),
+                )
             checked = verify_client_sidecar(
                 installed_root,
                 installed_manifest,

@@ -59,6 +59,10 @@ class GoManifestContractTests(unittest.TestCase):
         self.assertEqual(checked["client_view"]["transport"], "https")
         self.assertEqual(MANIFEST.validate_release_manifest(manifest), manifest)
 
+    def test_native_linux_rejects_legacy_bun_transport(self) -> None:
+        with self.assertRaises(MANIFEST.ManifestError):
+            MANIFEST.build_go_manifest("b" * 40, self.manifest["artifacts"], transport="legacy-bun")
+
     def test_format_one_loader_remains_strict_but_generic_loader_accepts_format_two(self) -> None:
         path = self.root / MANIFEST.MANIFEST_NAME
         path.write_text(json.dumps(self.manifest), encoding="utf-8")

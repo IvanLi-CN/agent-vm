@@ -143,6 +143,7 @@ export function build_go_manifest(sourceRevision: string, artifacts: readonly Go
   const actions = options.operations ?? default_operations();
   const transport = options.transport ?? "go-request";
   if (!CLIENT_TRANSPORTS.includes(transport)) error("client transport is unsupported");
+  if (transport === "legacy-bun") error("native Linux releases require go-request or https transport");
   return validate_go_manifest({
     format: GO_MANIFEST_FORMAT,
     release_id: revisionValue,
@@ -177,6 +178,7 @@ export function validate_go_manifest(value: unknown): GoReleaseManifest {
   const view = root.client_view;
   if (!view || typeof view !== "object" || Array.isArray(view) || Object.keys(view).sort().join(",") !== "actions,protocol,release_id,source_revision,transport") error("client_view has an unexpected shape");
   if (view.release_id !== sourceRevision || view.source_revision !== sourceRevision || view.protocol !== 4 || !CLIENT_TRANSPORTS.includes(view.transport)) error("client_view identity or transport is invalid");
+  if (view.transport === "legacy-bun") error("native Linux releases require go-request or https transport");
   if (canonical_json(view.actions) !== canonical_json(actions)) error("client_view actions differ from manifest actions");
   return { format: 2, release_id: sourceRevision, source_revision: sourceRevision, protocol: 4, target: checkedTarget, toolchain: { go: GO_TOOLCHAIN, cgo_enabled: false }, artifacts, actions, client_view: { release_id: sourceRevision, source_revision: sourceRevision, protocol: 4, transport: view.transport, actions }, retired_units: [...RETIRED_UNITS] };
 }

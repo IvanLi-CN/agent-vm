@@ -75,6 +75,23 @@ class WrapperTests(unittest.TestCase):
             ["/usr/local/bin/bun", str(self.loaded["control_path"])],
         )
 
+    def test_drain_verification_accepts_installed_format1_layout(self):
+        self.drain_patch.stop()
+        extracted = self.root / "legacy-installed"
+        WRAPPER.safe_extract_archive(self.payload, extracted)
+        manifest = MANIFEST.load_release_manifest(extracted / MANIFEST.MANIFEST_NAME)
+        WRAPPER._install_release_files(self.loaded, extracted, manifest)
+        response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ) as run:
+            WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/usr/local/bin/bun", str(self.loaded["control_path"])],
+        )
+
     def test_drain_verification_uses_fixed_go_request_after_cutover(self):
         self.drain_patch.stop()
         self._install_go_payload("go-request")

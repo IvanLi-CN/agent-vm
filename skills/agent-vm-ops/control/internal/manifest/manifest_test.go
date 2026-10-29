@@ -157,6 +157,21 @@ func TestLoadAcceptsHTTPSGoTransport(t *testing.T) {
 	}
 }
 
+func TestRejectsLegacyBunNativeTransport(t *testing.T) {
+	format2Path, _ := validManifest(t)
+	for name, manifestPath := range map[string]string{
+		"format-2": format2Path,
+		"format-4": validProductManifestFormat(t, ProductFormat, "go-request"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rewriteTransport(t, manifestPath, "legacy-bun")
+			if err := Load(manifestPath); err == nil || !strings.Contains(err.Error(), "Linux") {
+				t.Fatalf("legacy Bun transport error = %v", err)
+			}
+		})
+	}
+}
+
 func TestLoadMetadataReturnsActionCompatibility(t *testing.T) {
 	manifestPath, _ := validManifest(t)
 	metadata, err := LoadMetadata(manifestPath)

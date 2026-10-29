@@ -1582,6 +1582,7 @@ export function validate_product_manifest(value: unknown): ProductManifest {
   const actions = _product_actions(root.actions);
   const view = _require_mapping(root.client_view, "client_view");
   if (!_same_keys(view, ["actions", "protocol", "source_revision", "transport", "version"]) || view.version !== version || view.source_revision !== source_revision || Number(view.protocol) !== PROTOCOL_VERSION || (view.transport !== "legacy-bun" && view.transport !== "go-request" && view.transport !== "https") || !_json_equal(view.actions, actions)) throw _product_error("manifest_invalid", "client_view does not match product manifest");
+  if (target.os === "linux" && view.transport === "legacy-bun") throw _product_error("manifest_transport_target_mismatch", "Linux product releases require go-request or https transport");
   const result: ProductManifest = { format, version, release_id, source_revision, target, toolchain: { bun: PRODUCT_TOOLCHAIN.bun, go: PRODUCT_TOOLCHAIN.go, cgo_enabled: false }, protocol: 4, artifacts, actions, client_view: { version, source_revision, protocol: 4, transport: view.transport, actions } };
   if (format === PRODUCT_MANIFEST_FORMAT) {
     const compatibility = _require_mapping(root.state_compatibility, "state_compatibility");

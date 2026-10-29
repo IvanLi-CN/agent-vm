@@ -604,6 +604,8 @@ def validate_go_manifest(value: Any) -> dict[str, Any]:
     transport = client_view["transport"]
     if client_view["release_id"] != source_revision or client_view["source_revision"] != source_revision or _require_int(client_view["protocol"], "client_view.protocol", 1) != PROTOCOL_VERSION or transport not in GO_CLIENT_TRANSPORTS:
         raise _error("manifest_invalid", "Go client_view identity or transport is invalid")
+    if transport == "legacy-bun":
+        raise _error("manifest_transport_target_mismatch", "Linux Go releases require go-request or https transport")
     if json.dumps(client_view["actions"], sort_keys=True, separators=(",", ":")) != json.dumps(actions, sort_keys=True, separators=(",", ":")):
         raise _error("manifest_invalid", "Go client_view actions differ from manifest actions")
     return {
@@ -684,6 +686,8 @@ def validate_product_manifest(value: Any, *, allow_historical_web_config_mode: b
     transport = client_view["transport"]
     if client_view["version"] != version or client_view["source_revision"] != source_revision or _require_int(client_view["protocol"], "client_view.protocol", 1) != PROTOCOL_VERSION or transport not in GO_CLIENT_TRANSPORTS:
         raise _error("manifest_invalid", "product client_view identity or transport is invalid")
+    if target["os"] == "linux" and transport == "legacy-bun":
+        raise _error("manifest_transport_target_mismatch", "Linux product releases require go-request or https transport")
     if json.dumps(client_view["actions"], sort_keys=True, separators=(",", ":")) != json.dumps(actions, sort_keys=True, separators=(",", ":")):
         raise _error("manifest_invalid", "product client_view actions differ from manifest actions")
     result = {

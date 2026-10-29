@@ -309,6 +309,9 @@ func validate(root map[string]any, directory string) error {
 	if !ok || !supportedTransport(transport) {
 		return fmt.Errorf("manifest_invalid: client_view transport is unsupported")
 	}
+	if transport == "legacy-bun" {
+		return fmt.Errorf("manifest_transport_target_mismatch: Linux Go releases require go-request or https transport")
+	}
 	if err := validateOperationMap(view["actions"], "client_view.actions"); err != nil {
 		return err
 	}
@@ -393,6 +396,9 @@ func validateProduct(root map[string]any, directory string) error {
 	transport, ok := view["transport"].(string)
 	if !ok || !supportedTransport(transport) {
 		return fmt.Errorf("manifest_invalid: product client_view transport is unsupported")
+	}
+	if transport == "legacy-bun" {
+		return fmt.Errorf("manifest_transport_target_mismatch: Linux product releases require go-request or https transport")
 	}
 	if err := validateOperationMap(view["actions"], "client_view.actions"); err != nil {
 		return err

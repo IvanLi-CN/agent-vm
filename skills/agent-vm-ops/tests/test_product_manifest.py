@@ -100,6 +100,11 @@ class ProductManifestTests(unittest.TestCase):
             self.assertIn("systemd/agent-vm-web.service", {item["path"] for item in manifest["artifacts"]})
             self.assertIn("web-assets.manifest.json", {item["path"] for item in manifest["artifacts"]})
 
+            legacy = copy.deepcopy(manifest)
+            legacy["client_view"]["transport"] = "legacy-bun"
+            with self.assertRaises(Exception):
+                validate_product_manifest(legacy)
+
             historical = copy.deepcopy(manifest)
             historical_web = next(item for item in historical["artifacts"] if item["path"] == "config/agent-vm-web.json.example")
             historical_web["mode"] = 0o644
