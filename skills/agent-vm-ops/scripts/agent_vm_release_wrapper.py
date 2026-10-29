@@ -111,9 +111,12 @@ STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
 LEGACY_EXPIRY_TIMER_RE = re.compile(r"^agent-vm-native-expire-[A-Za-z0-9_.:-]+\.timer$")
 LEGACY_EXPIRY_SERVICE_RE = re.compile(r"^agent-vm-native-expire@[A-Za-z0-9_.:-]+\.service$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+RELEASE_SESSION_ALLOWED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:@/-")
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_FILE_BYTES = 64 * 1024 * 1024
+
+_ACTIVATION_FENCE_DEPTH: dict[tuple[str, str, str], int] = {}
 FORBIDDEN_CONFIG_NAMES = {"config.json", "state.sqlite3", "control.lock", "authority.lock", "admission.lock"}
 FIXED_UNIT_NAMES = tuple(sorted(set(UNIT_EXEC_START) | {"agent-vm-native-age-gc.timer"}))
 PRODUCT_UNIT_NAMES = ("agent-vm-native.service", "agent-vm-web.service")
@@ -216,7 +219,12 @@ def _safe_id(value: Any, label: str) -> str:
 def _release_drain_owner(transaction_id: str, session_id: str | None = None) -> str:
     """Resolve the exact release owner used by drain-enter and recovery."""
     owner = "release-" + transaction_id if session_id is None else session_id
-    if not isinstance(owner, str) or ID_RE.fullmatch(owner) is None or not owner.startswith("release-"):
+    if (
+        not isinstance(owner, str)
+        or not owner.startswith("release-")
+        or not 1 <= len(owner) <= 160
+        or any(character not in RELEASE_SESSION_ALLOWED for character in owner)
+    ):
         _fail("invalid_request", "release drain owner is invalid")
     return owner
 
@@ -430,6 +438,37 @@ def _release_lock(config: Mapping[str, Any]):
             pass
 
 
+@contextmanager
+def _admission_lock():
+    """Share the controller's admission lock across Bun, Go, and the wrapper."""
+    lock_path = STATE_DB_PATH.parent / "admission.lock"
+    try:
+        _require_root_owned_path(lock_path.parent, "admission lock directory")
+        descriptor = os.open(
+            lock_path,
+            os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError:
+        _fail("wrapper_lock_unavailable", "cannot open the shared admission lock")
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+        except OSError:
+            _fail("wrapper_lock_unavailable", "cannot acquire the shared admission lock")
+        yield
+    finally:
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
 def _safe_member_path(name: str) -> Path:
     if not name or "\x00" in name or "\\" in name:
         _fail("unsafe_archive", "archive member name is invalid")
@@ -530,7 +569,7 @@ def _activation_fence_paths(config: Mapping[str, Any]) -> tuple[Path, ...]:
 
 def _write_activation_fence(path: Path, transaction_id: str, release_id: str) -> bool:
     """Create or verify one fence and report whether this call created it."""
-    _mkdir_private(path.parent, 0o755)
+    _mkdir_private(path.parent, 0o750)
     if path in {RELEASE_FENCE_PATH, PERSISTENT_RELEASE_FENCE_PATH}:
         _require_root_owned_path(path.parent, "release activation fence directory")
     try:
@@ -610,14 +649,23 @@ def _clear_activation_fence(path: Path, transaction_id: str, release_id: str) ->
 def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id: str):
     """Keep control-plane drain exit fenced for the whole activation window."""
     paths = _activation_fence_paths(config)
-    created_paths: list[Path] = []
+    entries: list[tuple[Path, tuple[str, str, str], bool, bool]] = []
     try:
         for path in paths:
-            if _write_activation_fence(path, transaction_id, release_id):
-                created_paths.append(path)
+            created = _write_activation_fence(path, transaction_id, release_id)
+            key = (str(path), transaction_id, release_id)
+            previous_depth = _ACTIVATION_FENCE_DEPTH.get(key, 0)
+            _ACTIVATION_FENCE_DEPTH[key] = previous_depth + 1
+            entries.append((path, key, created, previous_depth == 0))
     except WrapperError as failure:
         cleanup_errors: list[dict[str, Any]] = []
-        for path in reversed(created_paths):
+        for path, key, created, outermost in reversed(entries):
+            if _ACTIVATION_FENCE_DEPTH.get(key, 0) <= 1:
+                _ACTIVATION_FENCE_DEPTH.pop(key, None)
+            else:
+                _ACTIVATION_FENCE_DEPTH[key] -= 1
+            if not created or not outermost:
+                continue
             try:
                 _clear_activation_fence(path, transaction_id, release_id)
             except WrapperError as cleanup_error:
@@ -637,10 +685,20 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
         for path in paths:
             _write_activation_fence(path, transaction_id, release_id)
 
+    completed = False
     try:
         yield refresh
+        completed = True
     finally:
-        for path in paths:
+        for path, key, created, outermost in reversed(entries):
+            final_depth = _ACTIVATION_FENCE_DEPTH.get(key, 0)
+            if final_depth <= 1:
+                _ACTIVATION_FENCE_DEPTH.pop(key, None)
+            else:
+                _ACTIVATION_FENCE_DEPTH[key] -= 1
+                continue
+            if not created and (not outermost or not completed):
+                continue
             try:
                 _clear_activation_fence(path, transaction_id, release_id)
             except WrapperError:
@@ -1447,13 +1505,12 @@ def _verify_durable_drain_state(
         _validate_state_compatibility(target_manifest, capabilities)
 
 
-def _verify_durable_drain_owner(expected_owner: str) -> None:
-    """Prove the active durable drain belongs to this release transaction."""
-    uri = f"file:{STATE_DB_PATH}?mode=ro"
+def _verify_durable_drain_owner(expected_owner: str, *, allow_ownerless: bool = False) -> None:
+    """Prove or claim that the active durable drain belongs to this release transaction."""
+    uri = f"file:{STATE_DB_PATH}?mode=rw"
     try:
         with sqlite3.connect(uri, uri=True, timeout=30) as database:
-            database.execute("PRAGMA query_only = ON")
-            database.execute("BEGIN")
+            database.execute("BEGIN IMMEDIATE")
             meta = dict(
                 database.execute(
                     "SELECT key, value FROM meta WHERE key IN ('draining', 'drain_owner')",
@@ -1461,7 +1518,13 @@ def _verify_durable_drain_owner(expected_owner: str) -> None:
             )
             if meta.get("draining") != "1":
                 _fail("drain_required", "release activation requires an active admission drain")
-            if meta.get("drain_owner") != expected_owner:
+            owner = meta.get("drain_owner")
+            if owner in (None, "") and allow_ownerless:
+                database.execute(
+                    "INSERT INTO meta(key, value) VALUES('drain_owner', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (expected_owner,),
+                )
+            elif owner != expected_owner:
                 _fail("drain_unverified", "durable release drain is not owned by this activation transaction")
     except WrapperError:
         raise
@@ -1564,11 +1627,12 @@ def _verify_installed_release(
     return checked
 
 
-def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any] | None = None) -> None:
+def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any] | None = None) -> bool | None:
     if not config["require_drained"]:
-        return
+        return None
     _require_activation_parent_dirs(config, "drain_unverified")
     command = [BUN_PATH, str(config["control_path"])]
+    owner_capable = False
     sidecar = Path(config["control_path"]).with_name("client-release.json")
     manifest_path = sidecar.parent / MANIFEST_NAME
     if sidecar.exists() or sidecar.is_symlink():
@@ -1592,11 +1656,13 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
                 _fail("drain_unverified", "installed client release transport is invalid")
             if transport in {"go-request", "https"}:
                 command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
+                owner_capable = True
             elif _is_go_manifest(checked) or _is_product_manifest(checked):
                 # Historical native packages may declare legacy-bun while
                 # carrying only the declared bridge, without the old alias.
                 # The bridge is the verified native compatibility authority.
                 command = [BUN_PATH, str(_go_bridge_target(config))]
+                owner_capable = True
     elif manifest_path.exists() or manifest_path.is_symlink():
         _fail("drain_unverified", "installed release manifest is present but the client sidecar is missing")
     def control_result(action: str, *, allow_legacy_unknown: bool = False) -> Mapping[str, Any] | None:
@@ -1655,6 +1721,7 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
             _fail("drain_unverified", "control returned an invalid pending-operation list")
         if pending:
             _fail("drain_unverified", "release activation requires management operations to converge", {"pending_operations": pending[:100]})
+    return owner_capable
 
 
 def _daemon_reload() -> None:
@@ -2115,14 +2182,15 @@ def activate(
 ) -> dict[str, Any]:
     drain_owner = _release_drain_owner(transaction_id, session_id)
     with _release_lock(config):
-        with _activation_fence(config, transaction_id, release_id) as refresh_fence:
-            return _activate_unlocked(
-                config,
-                transaction_id,
-                release_id,
-                refresh_fence,
-                drain_owner,
-            )
+        with _admission_lock():
+            with _activation_fence(config, transaction_id, release_id) as refresh_fence:
+                return _activate_unlocked(
+                    config,
+                    transaction_id,
+                    release_id,
+                    refresh_fence,
+                    drain_owner,
+                )
 
 
 def _activate_unlocked(
@@ -2141,9 +2209,9 @@ def _activate_unlocked(
         candidate_manifest = load_release_manifest(staged / MANIFEST_NAME)
     except ManifestError as exc:
         _fail(exc.code, exc.message, exc.detail)
-    _ensure_drained(config, candidate_manifest)
+    owner_capable = _ensure_drained(config, candidate_manifest)
     if config["require_drained"]:
-        _verify_durable_drain_owner(drain_owner)
+        _verify_durable_drain_owner(drain_owner, allow_ownerless=owner_capable is False)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
     if activation_path.exists() or activation_path.is_symlink():
         _fail("transaction_exists", "activation record already exists for this transaction")
@@ -2387,14 +2455,15 @@ def rollback(
 ) -> dict[str, Any]:
     drain_owner = _release_drain_owner(transaction_id, session_id)
     with _release_lock(config):
-        with _activation_fence(config, transaction_id, release_id) as refresh_fence:
-            return _rollback_unlocked(
-                config,
-                transaction_id,
-                release_id,
-                refresh_fence,
-                drain_owner,
-            )
+        with _admission_lock():
+            with _activation_fence(config, transaction_id, release_id) as refresh_fence:
+                return _rollback_unlocked(
+                    config,
+                    transaction_id,
+                    release_id,
+                    refresh_fence,
+                    drain_owner,
+                )
 
 
 def _rollback_unlocked(
@@ -2518,12 +2587,15 @@ def _rollback_unlocked(
     # exited, or new work that crossed the fence, after the interruption.
     if interrupted or recovering_in_progress:
         if config["require_drained"]:
+            legacy_ownerless = not (_is_go_manifest(previous_manifest) or _is_product_manifest(previous_manifest))
+            _verify_durable_drain_owner(record_drain_owner, allow_ownerless=legacy_ownerless)
             _verify_durable_drain_state(previous_manifest, expected_owner=record_drain_owner)
     else:
-        _ensure_drained(config, previous_manifest)
+        owner_capable = _ensure_drained(config, previous_manifest)
         if config["require_drained"]:
             _verify_durable_drain_owner(
                 record_drain_owner if isinstance(record_drain_owner, str) else drain_owner,
+                allow_ownerless=owner_capable is False,
             )
     target_snapshot = _snapshot_targets(config)
     record["rollback_attempts"] = 1

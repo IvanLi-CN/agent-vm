@@ -1,12 +1,15 @@
 package native
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 
 	"golang.org/x/sys/unix"
 )
+
+var ErrLockBusy = errors.New("lock_busy")
 
 type AuthorityLock struct {
 	file *os.File
@@ -16,8 +19,12 @@ func AcquireLock(path string, exclusive bool, nonBlocking bool) (*AuthorityLock,
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, err
 	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o640)
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
+		return nil, err
+	}
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
 		return nil, err
 	}
 	flags := unix.LOCK_SH
@@ -29,6 +36,9 @@ func AcquireLock(path string, exclusive bool, nonBlocking bool) (*AuthorityLock,
 	}
 	if err := unix.Flock(int(file.Fd()), flags); err != nil {
 		_ = file.Close()
+		if nonBlocking && (errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK)) {
+			return nil, fmt.Errorf("%w: authority lock: %v", ErrLockBusy, err)
+		}
 		return nil, fmt.Errorf("authority lock: %w", err)
 	}
 	return &AuthorityLock{file: file}, nil

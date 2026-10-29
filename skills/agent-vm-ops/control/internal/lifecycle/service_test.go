@@ -233,6 +233,30 @@ func TestReleaseDrainExitRemainsFencedDuringActivation(t *testing.T) {
 	}
 }
 
+func TestReleaseDrainExitRefusesBusySharedAdmissionLock(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.SetMeta(ctx, "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(ctx, "drain_owner", "release-owner"); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := native.AcquireLock(filepath.Join(filepath.Dir(store.Path()), "admission.lock"), true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	service := New(store, config.Defaults(), Options{})
+	if _, err := service.drain(ctx, false, protocol.Request{"session_id": "release-owner"}); protocol.AsError(err).Code != "release_activation_in_progress" {
+		t.Fatalf("busy shared admission lock error = %#v", err)
+	}
+}
+
 func TestReleaseMayTakeOverBrowserDrainBeforeActivation(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

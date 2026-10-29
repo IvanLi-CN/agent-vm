@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -2263,7 +2264,19 @@ func (s *Service) portRemove(ctx context.Context, request protocol.Request) (map
 	return map[string]any{"task_id": task.TaskID, "name": name, "protocol": protocolName, "removed": true}, nil
 }
 
+func (s *Service) acquireReleaseAdmissionLock() (*native.AuthorityLock, error) {
+	return native.AcquireLock(filepath.Join(filepath.Dir(s.Store.Path()), "admission.lock"), true, true)
+}
+
 func (s *Service) drain(ctx context.Context, value bool, request protocol.Request) (map[string]any, error) {
+	lock, lockErr := s.acquireReleaseAdmissionLock()
+	if lockErr != nil {
+		if errors.Is(lockErr, native.ErrLockBusy) {
+			return nil, protocol.NewError("release_activation_in_progress", "admission drain is blocked while release activation is fenced", nil)
+		}
+		return nil, protocol.NewError("release_fence_unverified", "shared admission lock cannot be verified", nil)
+	}
+	defer lock.Close()
 	draining, _, err := s.Store.Meta(ctx, "draining")
 	if err != nil {
 		return nil, s.sqliteError(err)

@@ -58,6 +58,9 @@ class WrapperTests(unittest.TestCase):
         self.drain_patch = mock.patch.object(WRAPPER, "_ensure_drained")
         self.drain_patch.start()
         self.addCleanup(self.drain_patch.stop)
+        self.admission_lock_patch = mock.patch.object(WRAPPER, "_admission_lock")
+        self.admission_lock_patch.start()
+        self.addCleanup(self.admission_lock_patch.stop)
         self.durable_drain_owner = WRAPPER._verify_durable_drain_owner
         self.drain_owner_patch = mock.patch.object(WRAPPER, "_verify_durable_drain_owner")
         self.drain_owner_patch.start()
@@ -406,6 +409,44 @@ class WrapperTests(unittest.TestCase):
         self.assertFalse(primary.exists())
         self.assertFalse(persistent.exists())
 
+    def test_activation_fence_retry_preserves_the_existing_transaction_fence(self):
+        primary = self.loaded["fence_path"]
+        persistent = primary.with_name("." + primary.name + ".persistent")
+        with WRAPPER._activation_fence(self.loaded, "tx-retry-fence", "a" * 40):
+            with WRAPPER._activation_fence(self.loaded, "tx-retry-fence", "a" * 40):
+                self.assertTrue(primary.exists())
+                self.assertTrue(persistent.exists())
+            self.assertTrue(primary.exists())
+            self.assertTrue(persistent.exists())
+        self.assertFalse(primary.exists())
+        self.assertFalse(persistent.exists())
+
+    def test_activation_fence_adopts_a_preexisting_transaction_fence_after_success(self):
+        primary = self.loaded["fence_path"]
+        persistent = primary.with_name("." + primary.name + ".persistent")
+        WRAPPER._write_activation_fence(primary, "tx-adopt-fence", "a" * 40)
+        WRAPPER._write_activation_fence(persistent, "tx-adopt-fence", "a" * 40)
+        with WRAPPER._activation_fence(self.loaded, "tx-adopt-fence", "a" * 40):
+            self.assertTrue(primary.exists())
+            self.assertTrue(persistent.exists())
+        self.assertFalse(primary.exists())
+        self.assertFalse(persistent.exists())
+
+    def test_activation_fence_preserves_a_preexisting_transaction_fence_on_failure(self):
+        primary = self.loaded["fence_path"]
+        persistent = primary.with_name("." + primary.name + ".persistent")
+        WRAPPER._write_activation_fence(primary, "tx-preserve-fence", "a" * 40)
+        WRAPPER._write_activation_fence(persistent, "tx-preserve-fence", "a" * 40)
+        try:
+            with self.assertRaises(RuntimeError):
+                with WRAPPER._activation_fence(self.loaded, "tx-preserve-fence", "a" * 40):
+                    raise RuntimeError("injected activation failure")
+            self.assertTrue(primary.exists())
+            self.assertTrue(persistent.exists())
+        finally:
+            WRAPPER._clear_activation_fence(primary, "tx-preserve-fence", "a" * 40)
+            WRAPPER._clear_activation_fence(persistent, "tx-preserve-fence", "a" * 40)
+
     def test_activation_fence_cleans_created_file_when_directory_fsync_fails(self):
         primary = self.loaded["fence_path"]
         persistent = primary.with_name("." + primary.name + ".persistent")
@@ -436,6 +477,18 @@ class WrapperTests(unittest.TestCase):
                 expected_owner="release-tx-recovery",
             )
 
+    def test_legacy_ownerless_drain_can_be_claimed_by_the_release_transaction(self):
+        database_path = self._durable_drain_database(owner="")
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", database_path):
+            self.durable_drain_owner("release-tx-legacy", allow_ownerless=True)
+        with sqlite3.connect(database_path) as database:
+            owner = database.execute("SELECT value FROM meta WHERE key = 'drain_owner'").fetchone()[0]
+        self.assertEqual(owner, "release-tx-legacy")
+
+    def test_release_owner_accepts_the_controller_session_id_contract(self):
+        owner = WRAPPER._release_drain_owner("tx-session", "release-deploy/@blue-green")
+        self.assertEqual(owner, "release-deploy/@blue-green")
+
     def test_normal_activation_requires_the_current_transaction_owner(self):
         release_id = "b" * 40
         WRAPPER.stage(self.loaded, "tx-owner-check", release_id, self.payload)
@@ -450,6 +503,27 @@ class WrapperTests(unittest.TestCase):
                 WRAPPER.activate(self.loaded, "tx-owner-check", release_id)
         self.assertEqual(failure.exception.code, "drain_unverified")
         self.assertFalse(Path(self.loaded["current_link"]).exists())
+
+    def test_legacy_activation_claims_an_ownerless_drain(self):
+        release_id = "b" * 40
+        WRAPPER.stage(self.loaded, "tx-ownerless-legacy", release_id, self.payload)
+        WRAPPER.verify_transaction(self.loaded, "tx-ownerless-legacy", release_id)
+        database_path = self._durable_drain_database(owner="")
+        WRAPPER._ensure_drained.return_value = False
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", database_path), mock.patch.object(
+            WRAPPER,
+            "_verify_durable_drain_owner",
+            side_effect=self.durable_drain_owner,
+        ), mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            activation = WRAPPER.activate(self.loaded, "tx-ownerless-legacy", release_id)
+        self.assertTrue(activation["activated"])
+        with sqlite3.connect(database_path) as database:
+            owner = database.execute("SELECT value FROM meta WHERE key = 'drain_owner'").fetchone()[0]
+        self.assertEqual(owner, "release-tx-ownerless-legacy")
 
     def test_normal_rollback_requires_the_activation_transaction_owner(self):
         self.loaded["require_drained"] = False
