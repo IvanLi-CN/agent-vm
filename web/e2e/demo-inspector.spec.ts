@@ -1,5 +1,26 @@
 import { expect, test } from "@playwright/test";
 
+test("embeds the inspector on wide screens and keeps a floating fallback", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("?demo=normal");
+
+  const runtime = page.locator(".demo-runtime");
+  const shell = page.locator(".demo-inspector-shell");
+  await expect(runtime).toHaveClass(/demo-runtime--docked/);
+  await expect(page.locator(".demo-inspector")).toHaveCSS("position", "sticky");
+  await expect(page.getByRole("button", { name: "Docked in page" })).toHaveAttribute("aria-pressed", "true");
+
+  await page.getByRole("button", { name: "Floating panel" }).click();
+  await expect(runtime).toHaveClass(/demo-runtime--floating/);
+  await expect(page.locator(".demo-inspector")).toHaveCSS("position", "fixed");
+
+  await page.getByRole("button", { name: "Docked in page" }).click();
+  await expect(runtime).toHaveClass(/demo-runtime--docked/);
+  await page.getByRole("button", { name: "Close demo inspector" }).click();
+  await expect(shell).toHaveClass(/is-closed/);
+  await expect(page.getByRole("button", { name: "Open demo inspector" })).toBeVisible();
+});
+
 test("keeps the demo isolated while a scenario and simulated action change", async ({ page }) => {
   const realRequests: string[] = [];
   page.on("request", (request) => { if (request.url().includes("/api/v1")) realRequests.push(request.url()); });

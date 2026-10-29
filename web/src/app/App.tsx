@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useEffect, useSyncExternalStore } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import type { PageKey } from "./types";
@@ -10,7 +10,7 @@ import { OverviewPage } from "../pages/OverviewPage";
 import { SystemPage } from "../pages/SystemPage";
 import { VMsPage } from "../pages/VMsPage";
 import { DemoInspector } from "../demo/DemoInspector";
-import { DemoProvider, isDemoRuntime, useDemoRuntime } from "../demo/runtime";
+import { DemoProvider, getDemoInspectorLayout, isDemoRuntime, saveDemoInspectorLayout, useDemoRuntime, type DemoInspectorLayout } from "../demo/runtime";
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 4_000, retry: 1 } } });
 
@@ -48,5 +48,12 @@ function ConsoleApp() {
 
 export function App() {
   const demoRuntime = useDemoRuntime();
-  return <DemoProvider><QueryClientProvider client={queryClient}><ConsoleApp />{isDemoRuntime() && !demoRuntime.bootstrapError ? <DemoInspector /> : null}</QueryClientProvider></DemoProvider>;
+  const isDemo = isDemoRuntime();
+  const [inspectorLayout, setInspectorLayout] = useState<DemoInspectorLayout>(() => getDemoInspectorLayout());
+  const setDemoInspectorLayout = (layout: DemoInspectorLayout) => {
+    setInspectorLayout(layout);
+    saveDemoInspectorLayout(layout);
+  };
+  const showInspector = isDemo && !demoRuntime.bootstrapError;
+  return <DemoProvider><QueryClientProvider client={queryClient}>{showInspector ? <div className={`demo-runtime demo-runtime--${inspectorLayout}`}><ConsoleApp /><DemoInspector layout={inspectorLayout} onLayoutChange={setDemoInspectorLayout} /></div> : <ConsoleApp />}</QueryClientProvider></DemoProvider>;
 }

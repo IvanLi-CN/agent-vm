@@ -6,6 +6,7 @@ export type DemoPersona = "admin" | "viewer";
 export type DemoNetwork = "online" | "offline";
 export type DemoDataMode = "full" | "minimal";
 export type DemoForcedOutcome = "succeeded" | "failed" | "outcome_unknown";
+export type DemoInspectorLayout = "docked" | "floating";
 
 export interface DemoRuntimeState {
   scene: DemoScene;
@@ -20,6 +21,8 @@ export interface DemoRuntimeState {
 
 const listeners = new Set<() => void>();
 let runtime: DemoRuntimeState | null = null;
+
+const inspectorLayoutStorageKey = "agent-vm:demo-inspector-layout";
 
 const isDemoBuild = import.meta.env.MODE === "demo";
 
@@ -107,6 +110,26 @@ function createRuntime(): DemoRuntimeState {
 
 export function isDemoRuntime(): boolean {
   return isDemoBuild;
+}
+
+export function getDemoInspectorLayout(): DemoInspectorLayout {
+  if (typeof window === "undefined") return "floating";
+  try {
+    const stored = window.localStorage.getItem(inspectorLayoutStorageKey);
+    if (stored === "docked" || stored === "floating") return stored;
+  } catch {
+    // The demo still works when storage is unavailable.
+  }
+  return (window.matchMedia?.("(min-width: 1280px)")?.matches ?? false) ? "docked" : "floating";
+}
+
+export function saveDemoInspectorLayout(layout: DemoInspectorLayout): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(inspectorLayoutStorageKey, layout);
+  } catch {
+    // Local layout persistence is best-effort and must not affect the demo runtime.
+  }
 }
 
 export function getDemoRuntime(): DemoRuntimeState {
