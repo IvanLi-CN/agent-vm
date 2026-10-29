@@ -16,6 +16,7 @@ const scopeOptions: Array<{ scope: TokenScope; label: string }> = [
 ];
 
 type CreateRequest = { scopes: TokenScope[]; expiresAt: string; auditReason: string; operationId: string };
+type CreateRecoveryDecision = "check" | "retry_same" | "new_intent" | "blocked";
 
 function defaultExpiry(): string {
   const value = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
@@ -59,6 +60,8 @@ export function TokenManagement() {
   const [createOperationIdValue, setCreateOperationIdValue] = useState<string | null>(null);
   const [createRecoveryOperationId, setCreateRecoveryOperationId] = useState<string | null>(null);
   const [createRecoveryStatus, setCreateRecoveryStatus] = useState<Operation | null>(null);
+  const [createRecoveryTokenId, setCreateRecoveryTokenId] = useState<string | null>(null);
+  const [createRecoveryDecision, setCreateRecoveryDecision] = useState<CreateRecoveryDecision | null>(null);
   const [createRecoveryPending, setCreateRecoveryPending] = useState(false);
   const [createRecoveryError, setCreateRecoveryError] = useState<string | null>(null);
   const [plaintextToken, setPlaintextToken] = useState<string | null>(null);
@@ -79,11 +82,17 @@ export function TokenManagement() {
   const session = sessionQuery.data;
   const canManageTokens = session?.capabilities.includes("manage_tokens") ?? false;
   const tokensQuery = useQuery({ queryKey: ["tokens", tokenCursor], queryFn: () => listTokens(tokenCursor), enabled: canManageTokens, refetchInterval: 10_000, refetchIntervalInBackground: false });
+  const clearSessionAfterAuthFailure = (error: unknown) => {
+    if (error instanceof ManagementRequestError && (error.code === "authentication_required" || error.code === "csrf_invalid")) client.removeQueries({ queryKey: ["management-session"], exact: true });
+  };
+
+  useEffect(() => { clearSessionAfterAuthFailure(sessionQuery.error); }, [sessionQuery.error]);
+  useEffect(() => { clearSessionAfterAuthFailure(tokensQuery.error); }, [tokensQuery.error]);
 
   const createMutation = useMutation({
     mutationFn: (request: CreateRequest) => createAgentToken(request.scopes, request.expiresAt, request.auditReason, request.operationId),
-    onSuccess: (result: TokenCreateResult) => {
-      const mutation = client.getMutationCache().getAll().find((candidate) => candidate.state.data === result);
+    onSuccess: (result: TokenCreateResult, request: CreateRequest) => {
+      const mutation = client.getMutationCache().getAll().find((candidate) => candidate.state.variables === request);
       if (mutation) client.getMutationCache().remove(mutation);
       setCreateError(null);
       setCreateRequest(null);
@@ -91,6 +100,8 @@ export function TokenManagement() {
       setCreateOperationIdValue(null);
       setCreateRecoveryOperationId(null);
       setCreateRecoveryStatus(null);
+      setCreateRecoveryTokenId(null);
+      setCreateRecoveryDecision(null);
       setCreateRecoveryError(null);
       setTokenCursor(undefined);
       setTokenCursorStack([]);
@@ -107,11 +118,13 @@ export function TokenManagement() {
       void client.invalidateQueries({ queryKey: ["audit"] });
     },
     onError: (error, request: CreateRequest) => {
+      clearSessionAfterAuthFailure(error);
       setCreateError(errorMessage(error, t));
       setCreateRequest(request);
       setCreateOperationIdValue(null);
       setCreateRecoveryOperationId(request.operationId);
       setCreateRecoveryStatus(null);
+      setCreateRecoveryDecision("check");
       setCreateRecoveryError(null);
     },
   });
@@ -123,6 +136,13 @@ export function TokenManagement() {
   const revokeMutation = useMutation({
     mutationFn: ({ tokenId, preview, auditReason, operationId }: { tokenId: string; preview: TokenRevokePreview; auditReason: string; operationId: string }) => submitTokenRevocation(tokenId, auditReason, preview, operationId),
     onSuccess: () => {
+      if (createRecoveryTokenId && revokeToken?.token_id === createRecoveryTokenId) {
+        setCreateRequest(null);
+        setCreateRecoveryOperationId(null);
+        setCreateRecoveryStatus(null);
+        setCreateRecoveryTokenId(null);
+        setCreateRecoveryDecision(null);
+      }
       revokeInFlightRef.current = false;
       setRevokeToken(null);
       setRevokePreview(null);
@@ -133,17 +153,25 @@ export function TokenManagement() {
       void client.invalidateQueries({ queryKey: ["operations"] });
       void client.invalidateQueries({ queryKey: ["audit"] });
     },
-    onError: (error) => setRevokeError(errorMessage(error, t)),
+    onError: (error) => { clearSessionAfterAuthFailure(error); setRevokeError(errorMessage(error, t)); },
   });
 
   const resetCreateIntent = () => {
     if (createMutation.isPending) return;
     setCreateError(null);
-    setCreateRequest(null);
     setCreateOperationIdValue(null);
-    setCreateRecoveryOperationId(null);
-    setCreateRecoveryStatus(null);
     setCreateRecoveryError(null);
+    if (!createRecoveryOperationId) {
+      setCreateRequest(null);
+      setCreateRecoveryStatus(null);
+      setCreateRecoveryTokenId(null);
+      setCreateRecoveryDecision(null);
+      return;
+    }
+    if (createRecoveryDecision === "retry_same") {
+      setCreateRequest(null);
+      setCreateRecoveryDecision("new_intent");
+    }
   };
 
   const toggleScope = (scope: TokenScope) => {
@@ -160,6 +188,7 @@ export function TokenManagement() {
   const submitCreate = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!canManageTokens) return;
+    if (createRecoveryOperationId && createRecoveryDecision !== "retry_same" && createRecoveryDecision !== "new_intent") return;
     setCreateError(null);
     const expiry = Date.parse(expiresAt);
     if (!scopes.length) {
@@ -175,6 +204,8 @@ export function TokenManagement() {
     setCreateRequest(request);
     setCreateRecoveryOperationId(null);
     setCreateRecoveryStatus(null);
+    setCreateRecoveryTokenId(null);
+    setCreateRecoveryDecision(null);
     setCreateRecoveryError(null);
     createMutation.mutate(request);
   };
@@ -193,14 +224,19 @@ export function TokenManagement() {
         setCreateError(null);
         setCreateRequest(null);
         setCreateOperationIdValue(null);
+        setCreateRecoveryTokenId(operation.result.token_metadata.token_id);
+        setCreateRecoveryDecision("blocked");
       } else if (operation.status === "failed" && !operation.result) {
         setCreateOperationIdValue(operation.operation_id);
         setCreateError(null);
+        setCreateRecoveryDecision("retry_same");
       } else {
         setCreateOperationIdValue(null);
+        setCreateRecoveryDecision("check");
       }
     } catch (error) {
       setCreateRecoveryError(errorMessage(error, t));
+      setCreateRecoveryDecision(error instanceof ManagementRequestError && error.code === "not_found" ? "new_intent" : "check");
     } finally {
       setCreateRecoveryPending(false);
     }
@@ -279,7 +315,7 @@ export function TokenManagement() {
         </div>
         {createError ? <div role="alert"><p className="field-error">{createError}</p>{createOperationIdValue ? <p className="token-retry-hint">{t("tokens.retryCreate", { operationId: createOperationIdValue })}</p> : null}</div> : null}
         {createRecoveryOperationId ? <div className="token-recovery"><p className="token-retry-hint">{t("tokens.operationRecoveryHint", { operationId: createRecoveryOperationId })}</p><Button type="button" variant="ghost" disabled={createRecoveryPending} onClick={() => void checkCreateOperation()}>{createRecoveryPending ? t("common.loading") : t("tokens.checkOperation")}</Button>{createRecoveryError ? <p className="field-error" role="alert">{createRecoveryError}</p> : null}{createRecoveryStatus ? <p className="token-retry-hint" data-testid="token-operation-status">{t("tokens.operationStatus", { status: t(`status.${createRecoveryStatus.status}`) })}</p> : null}</div> : null}
-        <div className="token-form-actions"><Button type="submit" variant="primary" disabled={createMutation.isPending || !canManageTokens} icon={<KeyRound />}>{createMutation.isPending ? t("common.loading") : createOperationIdValue ? t("tokens.retryCreateButton") : t("tokens.create")}</Button></div>
+        <div className="token-form-actions"><Button type="submit" variant="primary" disabled={createMutation.isPending || !canManageTokens || Boolean(createRecoveryOperationId && createRecoveryDecision !== "retry_same" && createRecoveryDecision !== "new_intent")} icon={<KeyRound />}>{createMutation.isPending ? t("common.loading") : createOperationIdValue ? t("tokens.retryCreateButton") : t("tokens.create")}</Button></div>
       </form>
     </div>
     {plaintextMetadata ? <PlaintextDisclosure token={plaintextMetadata} plaintext={plaintextToken} consumed={plaintextConsumed} onDismiss={() => { setPlaintextToken(null); setPlaintextConsumed(true); }} /> : null}

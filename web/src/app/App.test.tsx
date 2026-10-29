@@ -66,6 +66,8 @@ describe("management console workflow", () => {
     await user.click(revokeTrigger);
     expect(await screen.findByRole("dialog")).toHaveTextContent(/撤销后新的 Agent API 授权会被拒绝|new Agent API authorization/i);
     expect(screen.getAllByRole("button", { name: /撤销|revoke/i }).every((button) => button.hasAttribute("disabled"))).toBe(true);
+    document.body.focus();
+    expect(document.getElementById("action-reason")).toHaveFocus();
     await user.click(screen.getByRole("button", { name: /取消|cancel/i }));
     expect(revokeTrigger).toHaveFocus();
     await user.click(revokeTrigger);
