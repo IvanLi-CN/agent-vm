@@ -402,6 +402,21 @@ class WrapperTests(unittest.TestCase):
         self.assertFalse(primary.exists())
         self.assertFalse(persistent.exists())
 
+    def test_activation_fence_cleans_created_file_when_directory_fsync_fails(self):
+        primary = self.loaded["fence_path"]
+        persistent = primary.with_name("." + primary.name + ".persistent")
+        with mock.patch.object(
+            WRAPPER,
+            "_fsync_directory",
+            side_effect=WRAPPER.WrapperError("wrapper_io_error", "injected directory fsync failure"),
+        ):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                with WRAPPER._activation_fence(self.loaded, "tx-fsync-fence", "a" * 40):
+                    pass
+        self.assertEqual(failure.exception.code, "wrapper_io_error")
+        self.assertFalse(primary.exists())
+        self.assertFalse(persistent.exists())
+
     def test_durable_drain_recovery_requires_the_current_transaction_owner(self):
         database_path = self._durable_drain_database()
         with mock.patch.object(WRAPPER, "STATE_DB_PATH", database_path):
@@ -1627,6 +1642,40 @@ class WrapperTests(unittest.TestCase):
             ),
             legacy_manifest,
         )
+        activate_legacy.assert_called_once_with(native_already_stopped=True)
+
+    def test_completed_initial_activation_can_rollback_to_pointerless_predecessor(self):
+        self.loaded["require_drained"] = False
+        legacy_root = self.root / "legacy-installed-completed"
+        WRAPPER.safe_extract_archive(self.payload, legacy_root)
+        legacy_manifest = MANIFEST.load_release_manifest(legacy_root / MANIFEST.MANIFEST_NAME)
+        WRAPPER._install_release_files(self.loaded, legacy_root, legacy_manifest)
+
+        release_id = "b" * 40
+        native_payload = self._go_payload(release_id, transport="https")
+        WRAPPER.stage(self.loaded, "tx-initial-native-completed", release_id, native_payload)
+        WRAPPER.verify_transaction(self.loaded, "tx-initial-native-completed", release_id)
+        with mock.patch.object(WRAPPER, "_deactivate_legacy_runtime"), mock.patch.object(
+            WRAPPER, "_daemon_reload",
+        ), mock.patch.object(WRAPPER, "_activate_go_runtime"), mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            activation = WRAPPER.activate(self.loaded, "tx-initial-native-completed", release_id)
+        self.assertTrue(activation["activated"])
+        self.assertFalse(Path(self.loaded["previous_link"]).exists())
+
+        with mock.patch.object(WRAPPER, "_deactivate_native_runtime"), mock.patch.object(
+            WRAPPER, "_daemon_reload",
+        ), mock.patch.object(WRAPPER, "_activate_legacy_runtime") as activate_legacy:
+            result = WRAPPER.rollback(self.loaded, "tx-initial-native-completed", release_id)
+
+        self.assertTrue(result["rolled_back"])
+        self.assertTrue(result["predecessor_restored"])
+        self.assertEqual(result["release_id"], legacy_manifest["release_id"])
+        self.assertFalse(Path(self.loaded["current_link"]).exists())
+        self.assertFalse(Path(self.loaded["previous_link"]).exists())
         activate_legacy.assert_called_once_with(native_already_stopped=True)
 
     def test_activation_failure_restores_existing_support_bytes_modes_and_owners(self):

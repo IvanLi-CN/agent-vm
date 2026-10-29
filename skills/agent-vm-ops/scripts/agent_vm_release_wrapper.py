@@ -565,7 +565,7 @@ def _write_activation_fence(path: Path, transaction_id: str, release_id: str) ->
         _fsync_directory(path.parent)
     except FileExistsError:
         _fail("release_activation_in_progress", "another release activation fence is active")
-    except OSError:
+    except (OSError, WrapperError) as failure:
         if descriptor is not None:
             try:
                 os.close(descriptor)
@@ -574,9 +574,10 @@ def _write_activation_fence(path: Path, transaction_id: str, release_id: str) ->
         if created:
             try:
                 path.unlink()
-                _fsync_directory(path.parent)
             except OSError:
                 pass
+        if isinstance(failure, WrapperError):
+            raise
         _fail("release_fence_unavailable", "release activation fence cannot be created")
     return True
 
@@ -2401,6 +2402,11 @@ def _rollback_unlocked(
     recovering_in_progress = record.get("activated") is True and rollback_state == "in-progress"
     if record.get("rollback_attempts", 0) >= 1 and not recovering_in_progress:
         _fail("rollback_already_attempted", "automatic rollback is limited to one attempt")
+    record_drain_owner = record.get("drain_owner")
+    if "drain_owner" in record and record_drain_owner != drain_owner:
+        _fail("drain_unverified", "rollback owner does not match the activation transaction")
+    if (interrupted or recovering_in_progress) and not isinstance(record_drain_owner, str):
+        _fail("drain_unverified", "activation recovery has no durable release owner")
     previous_id = record.get("previous_release_id")
     pointerless_predecessor = previous_id is None and record.get("predecessor_snapshot") is True
     predecessor_snapshot: dict[Path, tuple[bytes, int, int] | None] | None = None
@@ -2442,7 +2448,16 @@ def _rollback_unlocked(
     if record.get("activated") is True:
         actual_current_name = actual_current.name if actual_current is not None else None
         actual_previous_name = actual_previous.name if actual_previous is not None else None
-        if recovering_in_progress:
+        if pointerless_predecessor:
+            if recovering_in_progress:
+                if actual_current_name not in {release_id, None}:
+                    _fail("rollback_stale", "in-progress pointer-less rollback no longer matches the active release")
+                if actual_previous_name not in {old_previous_id, None}:
+                    _fail("rollback_stale", "in-progress pointer-less rollback previous pointer is unexpected")
+            else:
+                if actual_current_name != release_id or actual_previous_name != old_previous_id:
+                    _fail("rollback_stale", "pointer-less rollback transaction no longer matches release pointers")
+        elif recovering_in_progress:
             before_current_switch = {old_current_id, old_previous_id, None}
             after_current_switch = {old_current_id, old_previous_id, release_id, None}
             if actual_current_name == release_id and actual_previous_name not in before_current_switch:
@@ -2473,7 +2488,7 @@ def _rollback_unlocked(
     # exited, or new work that crossed the fence, after the interruption.
     if interrupted or recovering_in_progress:
         if config["require_drained"]:
-            _verify_durable_drain_state(previous_manifest, expected_owner=drain_owner)
+            _verify_durable_drain_state(previous_manifest, expected_owner=record_drain_owner)
     else:
         _ensure_drained(config, previous_manifest)
     target_snapshot = _snapshot_targets(config)
