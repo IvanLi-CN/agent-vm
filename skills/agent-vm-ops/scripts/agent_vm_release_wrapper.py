@@ -1395,7 +1395,7 @@ def _legacy_expiry_timers() -> tuple[str, ...]:
         )
     except (OSError, subprocess.TimeoutExpired):
         _fail("activation_failed", "systemd legacy expiry timer inventory could not be verified")
-    if process.returncode not in (0, 1):
+    if process.returncode not in (0, 1) or (process.returncode == 1 and process.stderr.strip()):
         _fail("activation_failed", "systemd legacy expiry timer inventory failed")
     units: set[str] = set()
     for line in process.stdout.decode("utf-8", errors="strict").splitlines():
@@ -1425,7 +1425,7 @@ def _legacy_expiry_services(timers: tuple[str, ...]) -> tuple[str, ...]:
         )
     except (OSError, subprocess.TimeoutExpired):
         _fail("activation_failed", "systemd legacy expiry service inventory could not be verified")
-    if process.returncode not in (0, 1):
+    if process.returncode not in (0, 1) or (process.returncode == 1 and process.stderr.strip()):
         _fail("activation_failed", "systemd legacy expiry service inventory failed")
     try:
         lines = process.stdout.decode("utf-8", errors="strict").splitlines()
@@ -1488,9 +1488,11 @@ def _deactivate_legacy_runtime() -> None:
         errors.append(error.as_dict())
         expiry_services = ()
     try:
+        retired_timers = tuple(unit for unit in GO_RETIRED_UNITS if unit.endswith(".timer"))
+        retired_services = tuple(unit for unit in GO_RETIRED_UNITS if not unit.endswith(".timer"))
         _deactivate_units(tuple(
             (action, unit)
-            for unit in (*GO_RETIRED_UNITS, *expiry_timers, *expiry_services)
+            for unit in (*retired_timers, *expiry_timers, *retired_services, *expiry_services)
             for action in ("stop", "disable")
         ))
     except WrapperError as error:
@@ -1543,6 +1545,8 @@ def _activate_product_runtime(
     web_enabled = manifest.get("format") == PRODUCT_MANIFEST_FORMAT
     if web_enabled and web_was_enabled is None:
         web_was_enabled = _unit_is_enabled("agent-vm-web.service")
+    if web_enabled and web_was_enabled is False:
+        _deactivate_web_runtime()
     _activate_go_runtime(web_enabled=web_enabled)
     if web_was_enabled:
         # Requires=agent-vm-native.service stops Web during native restart.

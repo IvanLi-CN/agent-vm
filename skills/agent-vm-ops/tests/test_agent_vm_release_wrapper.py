@@ -388,6 +388,23 @@ class WrapperTests(unittest.TestCase):
         with mock.patch.object(WRAPPER.subprocess, "run", side_effect=run) as process:
             WRAPPER._activate_product_runtime({"format": MANIFEST.PRODUCT_MANIFEST_FORMAT})
         commands = [call.args[0] for call in process.call_args_list]
+        self.assertIn(["systemctl", "stop", "agent-vm-web.service"], commands)
+        self.assertIn(["systemctl", "disable", "agent-vm-web.service"], commands)
+        self.assertNotIn(["systemctl", "start", "agent-vm-web.service"], commands)
+
+    def test_product_runtime_restores_a_saved_disabled_web_unit(self):
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ) as process:
+            WRAPPER._activate_product_runtime(
+                {"format": MANIFEST.PRODUCT_MANIFEST_FORMAT},
+                web_was_enabled=False,
+            )
+        commands = [call.args[0] for call in process.call_args_list]
+        self.assertIn(["systemctl", "stop", "agent-vm-web.service"], commands)
+        self.assertIn(["systemctl", "disable", "agent-vm-web.service"], commands)
         self.assertNotIn(["systemctl", "start", "agent-vm-web.service"], commands)
 
     def test_product_runtime_uses_the_activation_snapshot_after_web_was_disabled(self):
@@ -1375,11 +1392,22 @@ class WrapperTests(unittest.TestCase):
             with self.assertRaises(WRAPPER.WrapperError):
                 WRAPPER._deactivate_legacy_runtime()
 
-        expected_units = (*WRAPPER.GO_RETIRED_UNITS, expiry, expiry_service)
+        retired_timers = tuple(unit for unit in WRAPPER.GO_RETIRED_UNITS if unit.endswith(".timer"))
+        retired_services = tuple(unit for unit in WRAPPER.GO_RETIRED_UNITS if not unit.endswith(".timer"))
+        expected_units = (*retired_timers, expiry, *retired_services, expiry_service)
         self.assertEqual(
             events,
             [(action, unit) for unit in expected_units for action in ("stop", "disable")],
         )
+
+    def test_legacy_expiry_inventory_errors_fail_closed(self):
+        failed = subprocess.CompletedProcess(
+            [], 1, b"", b"Failed to list units: Input/output error\n",
+        )
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=failed):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._legacy_expiry_services(())
+        self.assertEqual(failure.exception.code, "activation_failed")
 
     def test_legacy_deactivation_stops_timerless_expiry_service_instances(self):
         service = "agent-vm-native-expire@demo-g1.service"
