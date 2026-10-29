@@ -924,6 +924,40 @@ class WrapperTests(unittest.TestCase):
         stop_native.assert_called_once_with()
         stop_legacy.assert_called_once_with()
 
+    def test_rollback_runtime_restore_failure_stops_all_authorities(self):
+        self.loaded["require_drained"] = False
+        first_release_id = "a" * 40
+        second_release_id = "b" * 40
+        first_payload = self._go_payload(first_release_id, transport="https")
+        second_payload = self._go_payload(second_release_id, transport="https")
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            WRAPPER.stage(self.loaded, "tx-first-native", first_release_id, first_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-first-native", first_release_id)
+            WRAPPER.activate(self.loaded, "tx-first-native", first_release_id)
+            WRAPPER.stage(self.loaded, "tx-second-native", second_release_id, second_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-second-native", second_release_id)
+            WRAPPER.activate(self.loaded, "tx-second-native", second_release_id)
+
+            with mock.patch.object(
+                WRAPPER,
+                "_activate_go_runtime",
+                side_effect=WRAPPER.WrapperError("activation_failed", "injected runtime restore failure"),
+            ) as activate_go, mock.patch.object(WRAPPER, "_deactivate_native_runtime") as stop_native, mock.patch.object(
+                WRAPPER, "_deactivate_legacy_runtime",
+            ) as stop_legacy:
+                with self.assertRaises(WRAPPER.WrapperError) as failure:
+                    WRAPPER.rollback(self.loaded, "tx-second-native", second_release_id)
+
+        self.assertEqual(failure.exception.code, "activation_restore_failed")
+        self.assertEqual(activate_go.call_count, 2)
+        activate_go.assert_any_call()
+        stop_native.assert_called_once_with()
+        stop_legacy.assert_called_once_with()
+
     def test_cross_format_rollback_to_native_hands_off_legacy_before_cleanup(self):
         self.loaded["require_drained"] = False
         native_release_id = "a" * 40
@@ -1139,6 +1173,57 @@ class WrapperTests(unittest.TestCase):
                 WRAPPER._install_release_files(self.loaded, self.root, {})
         self.assertEqual(install_failure.exception.code, "activation_unverified")
         copy.assert_not_called()
+
+    def test_activation_parent_directories_reject_writable_ancestors(self):
+        unsafe = self.root / "unsafe-parent"
+        nested = unsafe / "nested"
+        unsafe.mkdir()
+        nested.mkdir()
+        unsafe.chmod(0o777)
+
+        with self.assertRaises(WRAPPER.WrapperError) as failure:
+            WRAPPER._require_directory_chain(nested, "activation_unverified", "test activation parent")
+        self.assertEqual(failure.exception.code, "activation_unverified")
+
+    def test_native_deactivation_attempts_all_units_after_web_failure(self):
+        events = []
+
+        def systemctl(action, unit, *, allow_missing=False):
+            events.append((action, unit))
+            if (action, unit) == ("stop", "agent-vm-web.service"):
+                raise WRAPPER.WrapperError("activation_failed", "injected web stop failure")
+
+        with mock.patch.object(WRAPPER, "_systemctl", side_effect=systemctl):
+            with self.assertRaises(WRAPPER.WrapperError):
+                WRAPPER._deactivate_native_runtime()
+
+        self.assertEqual(events, [
+            ("stop", "agent-vm-web.service"),
+            ("disable", "agent-vm-web.service"),
+            ("stop", "agent-vm-native.service"),
+            ("disable", "agent-vm-native.service"),
+        ])
+
+    def test_legacy_deactivation_attempts_all_units_after_failure(self):
+        expiry = "agent-vm-native-expire-test.timer"
+        events = []
+
+        def systemctl(action, unit, *, allow_missing=False):
+            events.append((action, unit))
+            if unit == WRAPPER.GO_RETIRED_UNITS[0] and action == "stop":
+                raise WRAPPER.WrapperError("activation_failed", "injected legacy stop failure")
+
+        with mock.patch.object(WRAPPER, "_legacy_expiry_timers", return_value=(expiry,)), mock.patch.object(
+            WRAPPER, "_systemctl", side_effect=systemctl,
+        ):
+            with self.assertRaises(WRAPPER.WrapperError):
+                WRAPPER._deactivate_legacy_runtime()
+
+        expected_units = (*WRAPPER.GO_RETIRED_UNITS, expiry)
+        self.assertEqual(
+            events,
+            [(action, unit) for unit in expected_units for action in ("stop", "disable")],
+        )
 
     def test_activation_failure_restores_existing_support_bytes_modes_and_owners(self):
         installed = Path(self.loaded["control_path"]).parent

@@ -248,8 +248,10 @@ def _require_root_owned_path(path: Path, label: str, *, regular: bool = False, a
 
 
 def _require_directory_chain(path: Path, code: str, label: str) -> None:
-    """Reject a symlinked or non-directory existing path boundary."""
+    """Reject untrusted, writable, symlinked, or non-directory path boundaries."""
     current = path
+    visited: set[Path] = set()
+    allowed_owners = {0, os.geteuid()}
     while True:
         try:
             info = current.lstat()
@@ -262,10 +264,27 @@ def _require_directory_chain(path: Path, code: str, label: str) -> None:
         except OSError:
             _fail(code, f"cannot inspect {label}")
         if stat.S_ISLNK(info.st_mode):
-            _fail(code, f"{label} contains a symlink")
+            # macOS exposes /var as a root-owned link to /private/var. It is
+            # safe to traverse only this fixed platform boundary; activation
+            # directories themselves must never be symlinked.
+            try:
+                resolved = current.resolve(strict=True)
+            except OSError:
+                _fail(code, f"{label} contains an unresolved symlink")
+            if current != Path("/var") or resolved != Path("/private/var") or info.st_uid not in allowed_owners:
+                _fail(code, f"{label} contains a symlink")
+            if resolved in visited:
+                _fail(code, f"{label} contains a symlink cycle")
+            visited.add(resolved)
+            current = resolved
+            continue
         if not stat.S_ISDIR(info.st_mode):
             _fail(code, f"{label} is not a directory")
-        return
+        if info.st_uid not in allowed_owners or stat.S_IMODE(info.st_mode) & 0o022:
+            _fail(code, f"{label} is not owned and private")
+        if current == current.parent:
+            return
+        current = current.parent
 
 
 def _activation_parent_dirs(config: Mapping[str, Any]) -> tuple[Path, ...]:
@@ -1373,23 +1392,60 @@ def _legacy_expiry_timers() -> tuple[str, ...]:
     return tuple(sorted(units))
 
 
+def _deactivate_units(units: tuple[tuple[str, str], ...]) -> None:
+    errors: list[dict[str, Any]] = []
+    for action, unit in units:
+        try:
+            _systemctl(action, unit, allow_missing=True)
+        except WrapperError as error:
+            errors.append(error.as_dict())
+    if errors:
+        _fail("activation_failed", "one or more runtime deactivation steps failed", {"errors": errors})
+
+
 def _deactivate_web_runtime() -> None:
-    _systemctl("stop", "agent-vm-web.service", allow_missing=True)
-    _systemctl("disable", "agent-vm-web.service", allow_missing=True)
+    _deactivate_units((
+        ("stop", "agent-vm-web.service"),
+        ("disable", "agent-vm-web.service"),
+    ))
 
 
 def _deactivate_native_runtime() -> None:
     """Stop native authorities before their fixed runtime files are retired."""
-    _deactivate_web_runtime()
-    _systemctl("stop", "agent-vm-native.service", allow_missing=True)
-    _systemctl("disable", "agent-vm-native.service", allow_missing=True)
+    errors: list[dict[str, Any]] = []
+    try:
+        _deactivate_web_runtime()
+    except WrapperError as error:
+        errors.append(error.as_dict())
+    try:
+        _deactivate_units((
+            ("stop", "agent-vm-native.service"),
+            ("disable", "agent-vm-native.service"),
+        ))
+    except WrapperError as error:
+        errors.append(error.as_dict())
+    if errors:
+        _fail("activation_failed", "one or more native deactivation steps failed", {"errors": errors})
 
 
 def _deactivate_legacy_runtime() -> None:
     """Stop the fixed legacy triggers before their files are retired."""
-    for unit in (*GO_RETIRED_UNITS, *_legacy_expiry_timers()):
-        _systemctl("stop", unit, allow_missing=True)
-        _systemctl("disable", unit, allow_missing=True)
+    errors: list[dict[str, Any]] = []
+    try:
+        expiry_timers = _legacy_expiry_timers()
+    except WrapperError as error:
+        errors.append(error.as_dict())
+        expiry_timers = ()
+    try:
+        _deactivate_units(tuple(
+            (action, unit)
+            for unit in (*GO_RETIRED_UNITS, *expiry_timers)
+            for action in ("stop", "disable")
+        ))
+    except WrapperError as error:
+        errors.append(error.as_dict())
+    if errors:
+        _fail("activation_failed", "one or more legacy deactivation steps failed", {"errors": errors})
 
 
 def _stop_runtime_authorities() -> list[dict[str, Any]]:
@@ -2081,6 +2137,13 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                     "rollback failed and the previous runtime could not be restored",
                     {"rollback_error": failure.as_dict(), "runtime_error": getattr(runtime_error, "as_dict", lambda: {"message": str(runtime_error)})()},
                 )
+                shutdown_errors = _stop_runtime_authorities()
+                if shutdown_errors:
+                    failure = WrapperError(
+                        "activation_restore_failed",
+                        "rollback failed and the authorities could not be stopped safely",
+                        {"rollback_error": failure.as_dict(), "shutdown_errors": shutdown_errors},
+                    )
         record["rollback_phase"] = "failed"
         record["rollback_state"] = "failed"
         record["rollback_error"] = failure.as_dict()
