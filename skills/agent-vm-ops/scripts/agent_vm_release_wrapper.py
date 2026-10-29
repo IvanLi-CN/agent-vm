@@ -1216,8 +1216,14 @@ def _verify_installed_release(
         manifest,
         allow_historical_web_config_mode=True,
     )
+    historical_legacy_residue = {
+        name for name in LEGACY_ONLY_SUPPORT_NAMES
+        if (installed_root / name).exists() or (installed_root / name).is_symlink()
+    } if (_is_go_manifest(checked) or _is_product_manifest(checked)) else set()
     bridge_alias = installed_root / "agent_vm_control.ts"
-    allowed_extra_paths = {bridge_alias.name} if (_is_go_manifest(checked) or _is_product_manifest(checked)) and (bridge_alias.exists() or bridge_alias.is_symlink()) else set()
+    allowed_extra_paths = set(historical_legacy_residue)
+    if (_is_go_manifest(checked) or _is_product_manifest(checked)) and (bridge_alias.exists() or bridge_alias.is_symlink()):
+        allowed_extra_paths.add(bridge_alias.name)
     _reject_transaction_extras(installed_root, checked, allowed_extra_paths=allowed_extra_paths)
     _verify_fixed_artifacts(config, checked, allow_historical_web_config_mode=True)
     _verify_python_syntax(installed_root, checked)
@@ -1231,6 +1237,8 @@ def _verify_installed_release(
     owner_uid = int(config["owner_uid"])
     _require_owned_regular(installed_root / MANIFEST_NAME, owner_uid, 0o644)
     _require_owned_regular(installed_root / "client-release.json", owner_uid, 0o644)
+    for name in historical_legacy_residue:
+        _require_owned_regular(installed_root / name, owner_uid, SUPPORT_ARTIFACT_MODES[name])
     for item in checked["artifacts"]:
         _require_owned_regular(
             _artifact_runtime_path(installed_root, item, runtime_paths),
@@ -1394,6 +1402,18 @@ def _legacy_expiry_timers() -> tuple[str, ...]:
     return tuple(sorted(units))
 
 
+def _legacy_expiry_services(timers: tuple[str, ...]) -> tuple[str, ...]:
+    prefix = "agent-vm-native-expire-"
+    suffix = ".timer"
+    services = []
+    for timer in timers:
+        if not timer.startswith(prefix) or not timer.endswith(suffix):
+            _fail("activation_failed", "systemd legacy expiry timer inventory contained an invalid unit")
+        instance = timer[len(prefix):-len(suffix)]
+        services.append(f"agent-vm-native-expire@{instance}.service")
+    return tuple(sorted(set(services)))
+
+
 def _deactivate_units(units: tuple[tuple[str, str], ...]) -> None:
     errors: list[dict[str, Any]] = []
     for action, unit in units:
@@ -1438,10 +1458,11 @@ def _deactivate_legacy_runtime() -> None:
     except WrapperError as error:
         errors.append(error.as_dict())
         expiry_timers = ()
+    expiry_services = _legacy_expiry_services(expiry_timers)
     try:
         _deactivate_units(tuple(
             (action, unit)
-            for unit in (*GO_RETIRED_UNITS, *expiry_timers)
+            for unit in (*GO_RETIRED_UNITS, *expiry_services, *expiry_timers)
             for action in ("stop", "disable")
         ))
     except WrapperError as error:
@@ -2015,6 +2036,9 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     active_manifest = None
     if actual_current is not None:
         active_manifest = _verify_retained_release(config, actual_current)
+    active_web_unit_enabled = None
+    if active_manifest is not None and active_manifest.get("format") == PRODUCT_MANIFEST_FORMAT:
+        active_web_unit_enabled = _unit_is_enabled("agent-vm-web.service")
     if old_previous_id is not None:
         _verify_retained_release(config, Path(config["release_root"]) / old_previous_id)
     if record.get("activated") is True:
@@ -2125,10 +2149,9 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 if active_manifest is None:
                     _systemctl("stop", "agent-vm-native.service", allow_missing=True)
                 elif _is_product_manifest(active_manifest):
-                    snapshot = record.get("web_unit_enabled")
                     _activate_product_runtime(
                         active_manifest,
-                        web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
+                        web_was_enabled=active_web_unit_enabled,
                     )
                 elif _is_go_manifest(active_manifest):
                     _activate_go_runtime()
@@ -2191,10 +2214,9 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             if active_manifest is None:
                 _systemctl("stop", "agent-vm-native.service", allow_missing=True)
             elif _is_product_manifest(active_manifest):
-                snapshot = record.get("web_unit_enabled")
                 _activate_product_runtime(
                     active_manifest,
-                    web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
+                    web_was_enabled=active_web_unit_enabled,
                 )
             elif _is_go_manifest(active_manifest):
                 _activate_go_runtime()

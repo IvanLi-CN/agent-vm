@@ -663,6 +663,21 @@ class WrapperTests(unittest.TestCase):
             MANIFEST.GO_MANIFEST_FORMAT,
         )
 
+    def test_native_preflight_accepts_fixed_historical_legacy_residue(self):
+        self._install_go_runtime("https")
+        installed_root = Path(self.loaded["control_path"]).parent
+        for name in WRAPPER.LEGACY_ONLY_SUPPORT_NAMES:
+            residue = installed_root / name
+            residue.write_bytes(b"historical legacy residue\n")
+            residue.chmod(WRAPPER.SUPPORT_ARTIFACT_MODES[name])
+        installed_manifest = MANIFEST.load_release_manifest(
+            installed_root / MANIFEST.MANIFEST_NAME,
+        )
+
+        checked = WRAPPER._verify_installed_release(self.loaded, installed_root, installed_manifest)
+
+        self.assertEqual(checked["format"], MANIFEST.GO_MANIFEST_FORMAT)
+
     def test_native_to_format_one_activation_hands_off_runtime_before_cleanup(self):
         self.loaded["require_drained"] = False
         go_release_id = "a" * 40
@@ -888,6 +903,59 @@ class WrapperTests(unittest.TestCase):
 
         self.assertTrue(result["rolled_back"])
         activate_product.assert_called_once_with(previous_manifest, web_was_enabled=True)
+
+    def test_failed_rollback_restores_current_product_web_unit_state(self):
+        self.loaded["require_drained"] = False
+        previous_release_id = "a" * 40
+        active_release_id = "b" * 40
+        previous_dir = Path(self.loaded["release_root"]) / previous_release_id
+        active_dir = Path(self.loaded["release_root"]) / active_release_id
+        previous_dir.mkdir(parents=True)
+        active_dir.mkdir(parents=True)
+        Path(self.loaded["current_link"]).symlink_to(active_dir)
+        Path(self.loaded["previous_link"]).symlink_to(previous_dir)
+        activation_path = Path(self.loaded["state_root"]) / "tx-product-failure.activation.json"
+        activation_path.parent.mkdir(parents=True)
+        activation_path.write_text(json.dumps({
+            "transaction_id": "tx-product-failure",
+            "release_id": active_release_id,
+            "previous_release_id": previous_release_id,
+            "old_current_release_id": previous_release_id,
+            "old_previous_release_id": None,
+            "manifest_sha256": "0" * 64,
+            "activated": True,
+            "activation_phase": "active",
+            "rollback_attempts": 0,
+            "web_unit_enabled": False,
+        }), encoding="utf-8")
+        active_manifest = {
+            "format": MANIFEST.PRODUCT_MANIFEST_FORMAT,
+            "state_compatibility": {
+                "reads": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+                "writes": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+            },
+        }
+        previous_manifest = {"format": MANIFEST.MANIFEST_FORMAT}
+
+        def retained_manifest(_config, path):
+            return previous_manifest if path == previous_dir else active_manifest
+
+        with mock.patch.object(WRAPPER, "_verify_retained_release", side_effect=retained_manifest), mock.patch.object(
+            WRAPPER, "_snapshot_targets", return_value={},
+        ), mock.patch.object(WRAPPER, "_install_release_files"), mock.patch.object(
+            WRAPPER, "_deactivate_native_runtime",
+        ), mock.patch.object(WRAPPER, "_daemon_reload"), mock.patch.object(
+            WRAPPER, "_activate_legacy_runtime",
+            side_effect=WRAPPER.WrapperError("activation_failed", "injected legacy start failure"),
+        ), mock.patch.object(WRAPPER, "_restore_activation_state"), mock.patch.object(
+            WRAPPER, "_unit_is_enabled", return_value=True,
+        ) as is_enabled, mock.patch.object(WRAPPER, "_activate_product_runtime") as activate_product:
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._rollback_unlocked(self.loaded, "tx-product-failure", active_release_id)
+
+        self.assertEqual(failure.exception.code, "activation_failed")
+        is_enabled.assert_called_once_with("agent-vm-web.service")
+        activate_product.assert_called_once_with(active_manifest, web_was_enabled=True)
 
     def test_rollback_restore_failure_keeps_all_authorities_stopped(self):
         self.loaded["require_drained"] = False
@@ -1263,7 +1331,7 @@ class WrapperTests(unittest.TestCase):
             with self.assertRaises(WRAPPER.WrapperError):
                 WRAPPER._deactivate_legacy_runtime()
 
-        expected_units = (*WRAPPER.GO_RETIRED_UNITS, expiry)
+        expected_units = (*WRAPPER.GO_RETIRED_UNITS, *WRAPPER._legacy_expiry_services((expiry,)), expiry)
         self.assertEqual(
             events,
             [(action, unit) for unit in expected_units for action in ("stop", "disable")],
