@@ -74,10 +74,18 @@ func validManifest(t *testing.T) (string, string) {
 }
 
 func validProductManifest(t *testing.T) string {
+	return validProductManifestFormat(t, LegacyProductFormat, "go-request")
+}
+
+func validProductManifestFormat(t *testing.T, format int64, transport string) string {
 	t.Helper()
 	root := t.TempDir()
-	artifacts := make([]any, 0, len(fixedArtifacts))
-	for _, expected := range fixedArtifacts {
+	expectedArtifacts := productLegacyArtifacts
+	if format == ProductFormat {
+		expectedArtifacts = productArtifacts
+	}
+	artifacts := make([]any, 0, len(expectedArtifacts))
+	for _, expected := range expectedArtifacts {
 		path := filepath.Join(root, filepath.FromSlash(expected.path))
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
@@ -106,12 +114,18 @@ func validProductManifest(t *testing.T) string {
 		actions[action] = operationSpec()
 	}
 	rootValue := map[string]any{
-		"format": 3, "version": "1.0.0", "release_id": strings.Repeat("b", 40), "source_revision": strings.Repeat("b", 40), "protocol": 4,
+		"format": format, "version": "1.0.0", "release_id": strings.Repeat("b", 40), "source_revision": strings.Repeat("b", 40), "protocol": 4,
 		"target":      map[string]any{"os": "linux", "arch": runtime.GOARCH},
 		"toolchain":   map[string]any{"bun": "1.4.4", "go": GoToolchain, "cgo_enabled": false},
 		"artifacts":   artifacts,
 		"actions":     actions,
-		"client_view": map[string]any{"version": "1.0.0", "source_revision": strings.Repeat("b", 40), "protocol": 4, "transport": "go-request", "actions": actions},
+		"client_view": map[string]any{"version": "1.0.0", "source_revision": strings.Repeat("b", 40), "protocol": 4, "transport": transport, "actions": actions},
+	}
+	if format == ProductFormat {
+		rootValue["state_compatibility"] = map[string]any{
+			"reads":  append([]string(nil), stateCapabilityMarkers...),
+			"writes": append([]string(nil), stateCapabilityMarkers...),
+		}
 	}
 	manifestPath := filepath.Join(root, "release-manifest.json")
 	encoded, err := json.Marshal(rootValue)
@@ -128,6 +142,37 @@ func TestLoadVerifiesCompleteGoBundle(t *testing.T) {
 	manifestPath, _ := validManifest(t)
 	if err := Load(manifestPath); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLoadAcceptsHTTPSGoTransport(t *testing.T) {
+	manifestPath, _ := validManifest(t)
+	rewriteTransport(t, manifestPath, "https")
+	metadata, err := LoadMetadata(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Transport != "https" || !metadata.ManifestPresent || !metadata.ArtifactsVerified {
+		t.Fatalf("HTTPS metadata = %#v", metadata)
+	}
+}
+
+func TestLoadsHistoricalLegacyBunNativeTransport(t *testing.T) {
+	format2Path, _ := validManifest(t)
+	for name, manifestPath := range map[string]string{
+		"format-2": format2Path,
+		"format-4": validProductManifestFormat(t, ProductFormat, "go-request"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			rewriteTransport(t, manifestPath, "legacy-bun")
+			metadata, err := LoadMetadata(manifestPath)
+			if err != nil {
+				t.Fatalf("legacy Bun transport load error = %v", err)
+			}
+			if metadata.Transport != "legacy-bun" || !metadata.ManifestPresent || !metadata.ArtifactsVerified {
+				t.Fatalf("legacy Bun metadata = %#v", metadata)
+			}
+		})
 	}
 }
 
@@ -166,6 +211,28 @@ func TestLoadVerifiesProductManifest(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsHTTPSProductTransport(t *testing.T) {
+	manifestPath := validProductManifest(t)
+	rewriteTransport(t, manifestPath, "https")
+	metadata, err := LoadMetadata(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Transport != "https" || metadata.Version != "1.0.0" {
+		t.Fatalf("HTTPS product metadata = %#v", metadata)
+	}
+}
+
+func TestLoadAcceptsHTTPSManagementProductTransport(t *testing.T) {
+	metadata, err := LoadMetadata(validProductManifestFormat(t, ProductFormat, "https"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Transport != "https" || metadata.Version != "1.0.0" || len(metadata.StateReads) != len(stateCapabilityMarkers) || len(metadata.StateWrites) != len(stateCapabilityMarkers) {
+		t.Fatalf("HTTPS management product metadata = %#v", metadata)
+	}
+}
+
 func TestValidateStateCapabilitiesFailsClosedForLegacyMetadata(t *testing.T) {
 	legacy := Metadata{ManifestPresent: true}
 	if err := ValidateStateCapabilities(legacy, []string{"legacy-agent-vm-core@1", "managed-image-catalog@1"}); err == nil || !strings.Contains(err.Error(), "managed-image-catalog@1") {
@@ -173,6 +240,30 @@ func TestValidateStateCapabilitiesFailsClosedForLegacyMetadata(t *testing.T) {
 	}
 	modern := Metadata{ManifestPresent: true, StateReads: append([]string(nil), stateCapabilityMarkers...), StateWrites: append([]string(nil), stateCapabilityMarkers...)}
 	if err := ValidateStateCapabilities(modern, stateCapabilityMarkers); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func rewriteTransport(t *testing.T, manifestPath, transport string) {
+	t.Helper()
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	view, ok := root["client_view"].(map[string]any)
+	if !ok {
+		t.Fatal("client_view is not an object")
+	}
+	view["transport"] = transport
+	encoded, err := json.Marshal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, append(encoded, '\n'), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
