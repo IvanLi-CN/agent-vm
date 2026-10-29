@@ -46,7 +46,7 @@ export function loadRelease(path: string): [Data, Data[]] {
     const version = productVersion(raw.version);
     if (raw.protocol !== PROTOCOL) fail("protocol_unsupported", "release sidecar protocol must be 4");
     const v = raw.client_view;
-    if (!shape(v, ["version", "source_revision", "protocol", "transport", "actions"]) || v.version !== version || v.source_revision !== raw.source_revision || v.protocol !== PROTOCOL || !["legacy-bun", "go-request"].includes(v.transport) || !shape(v.actions, ACTIONS)) fail("release_metadata_invalid", "product client view identity, transport or fixed action set differs");
+    if (!shape(v, ["version", "source_revision", "protocol", "transport", "actions"]) || v.version !== version || v.source_revision !== raw.source_revision || v.protocol !== PROTOCOL || !["legacy-bun", "go-request", "https"].includes(v.transport) || !shape(v.actions, ACTIONS)) fail("release_metadata_invalid", "product client view identity, transport or fixed action set differs");
     for (const action of ACTIONS) {
       const s = v.actions[action];
       if (!shape(s, ["request", "response", "client_to_control", "control_to_client"])) fail("release_metadata_invalid", "client_view action has an invalid shape");
@@ -65,7 +65,7 @@ export function loadRelease(path: string): [Data, Data[]] {
   if (raw.protocol !== PROTOCOL) fail("protocol_unsupported", "release sidecar protocol must be 4");
   const v = raw.client_view;
   const viewKeys = raw.format === 2 ? ["release_id", "source_revision", "protocol", "transport", "actions"] : ["release_id", "source_revision", "protocol", "actions"];
-  if (!shape(v, viewKeys) || v.release_id !== raw.release_id || v.source_revision !== raw.source_revision || v.protocol !== PROTOCOL || raw.format === 2 && !["legacy-bun", "go-request"].includes(v.transport) || !shape(v.actions, ACTIONS)) fail("release_metadata_invalid", "client_view identity, transport or fixed action set differs");
+  if (!shape(v, viewKeys) || v.release_id !== raw.release_id || v.source_revision !== raw.source_revision || v.protocol !== PROTOCOL || raw.format === 2 && !["legacy-bun", "go-request", "https"].includes(v.transport) || !shape(v.actions, ACTIONS)) fail("release_metadata_invalid", "client_view identity, transport or fixed action set differs");
   for (const action of ACTIONS) {
     const s = v.actions[action];
     if (!shape(s, ["request", "response", "client_to_control", "control_to_client"])) fail("release_metadata_invalid", "client_view action has an invalid shape");
