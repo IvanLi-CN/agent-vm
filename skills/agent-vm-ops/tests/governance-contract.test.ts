@@ -52,6 +52,7 @@ test("PR scheduling is exact, non-preemptive, and separate from Main", () => {
 test("demo deployment is serialized and never exposes credentials to PR builds", () => {
   const workflow = parse(read(".github/workflows/demo-deploy.yml"));
   expect(workflow.concurrency["cancel-in-progress"]).toBe(false);
+  expect(workflow.concurrency.group).toBe("demo-deploy-${{ github.ref }}");
   expect(workflow.jobs.deploy.if).toContain("github.event_name != 'pull_request'");
   expect(workflow.jobs.deploy.if).toContain("refs/heads/main");
   expect(JSON.stringify(workflow.jobs.build)).not.toContain("EDGEONE_API_TOKEN");
