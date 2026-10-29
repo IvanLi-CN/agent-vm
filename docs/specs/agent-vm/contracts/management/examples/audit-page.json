@@ -4,7 +4,11 @@
       "event_id": "50e8400e-ccf8-4c7b-8d1d-14f66c7fb126",
       "operation_id": "50e8400e-ccf8-4c7b-8d1d-14f66c7fb124",
       "action": "restart",
-      "actor": "admin@example.invalid",
+      "actor": {
+        "issuer": "https://id.example.invalid/",
+        "subject": "subject-admin-01",
+        "role": "administrator"
+      },
       "reason": "Restore service after a confirmed guest-side fault",
       "target": {
         "kind": "vm",

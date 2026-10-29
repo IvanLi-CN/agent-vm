@@ -1,10 +1,10 @@
 # Agent VM Control-Plane Release Contract
 
-This contract describes the manual release boundary for the Agent VM client and control environment. It is not a public `agent-vm` lifecycle command and it does not grant access to PVE, a host manager, an Incus policy API, a guest, or an HTTP gateway. Product release completion is the verified GitHub Release and its versioned installation packages; deployment is a separate explicit operation.
+This contract describes the manual release boundary for the Agent VM client and control environment. It is not a public `agent-vm` lifecycle command and it does not grant access to PVE, a host manager, an Incus policy API, a guest, or an HTTP gateway. Product release completion is the verified GitHub Release and its versioned installation packages; deployment is a separate explicit operation. The blue-green design uses two complete Agent VM service slots behind one stable Caddy entry point and does not add a router, Web/BFF, native service or publication wrapper; the fixed format-1/2 wrapper described below is retained only as a legacy compatibility path.
 
 ## Product formats 3 and 4
 
-The client product package uses `release-manifest.json` format 3 and one product SemVer. Native Linux control packages use the fixed format-2 Go manifest consumed by the installed wrapper. A management-enabled product package uses format 4 and adds the embedded Web UI, local fonts and the state-compatibility declaration below. Product formats 3 and 4 carry the same exact 40-character Git `source_revision`, SHA-derived `release_id`, target, fixed Bun/Go toolchain, protocol 4, action compatibility windows and per-file byte/mode digests. `client-release.json` carries the package's client view. A package is accepted only when the builder proves that the checked-out commit equals the declared `source_revision`; an arbitrary SHA string is not provenance.
+The client product package uses `release-manifest.json` format 3 and one product SemVer. Native Linux control packages use the fixed format-2 Go manifest consumed by the installed legacy wrapper. A management-enabled product package uses format 4 and adds the embedded Web UI, local fonts, OIDC/Token/Agent API compatibility and the state-compatibility declaration below. Product formats 3 and 4 carry the same exact 40-character Git `source_revision`, SHA-derived `release_id`, target, fixed Bun/Go toolchain, protocol 4, action compatibility windows and per-file byte/mode digests. `client-release.json` carries the package's client view. A package is accepted only when the builder proves that the checked-out commit equals the declared `source_revision`; an arbitrary SHA string is not provenance.
 
 `release_id` is not a second product version. It is the legacy protocol-4 peer capability field and remains a Git SHA; it must never be populated with the SemVer product version. Format 1 remains a read-only legacy input, format 2 is the native deployment and rollback format, format 3 is a read-only product/rollback input, and management-enabled production builders write format 4.
 
@@ -20,9 +20,15 @@ Each artifact declares only a relative path, role, exact SHA-256 of its bytes, a
 
 Each action declares `request.schema`, `request.semantic_revision`, `response.schema`, `response.semantic_revision`, and explicit `client_to_control` and `control_to_client` objects with `schema_min`, `schema_max`, `semantic_min`, and `semantic_max`. JSON parseability is not compatibility evidence. The control process checks protocol, action, request window, response window, and all artifact bytes before a journal record, native handler, or timer preemption.
 
+## Blue-green compatibility window
+
+The publisher retains the current and previous verified package, static resource manifest and state capability declaration for at least one hour after a slot switch. Each candidate declares the common protocol-4 action set, direct HTTPS Agent API transport, Token API and browser management API request/response/semantic windows. A candidate may become active only when it can read and write every capability present in the shared state and when OIDC issuer/client/redirect configuration is compatible. Caddy switches only the protected `active` link; it never retries a write or selects a slot from an external request.
+
+The one-hour window covers in-flight browser assets, OIDC callback transactions, browser sessions, Token revocation and protocol-4 requests. A page or client outside the window receives a structured compatibility or refresh result. The previous package remains a valid rollback target only while its capability and API declarations are compatible; rollback never downgrades, recreates or overwrites shared state.
+
 ## Management-state compatibility
 
-The SQLite `state_capabilities` registry stores versioned durable-state markers. The capability set is returned by the management System API as sorted `name@version` strings. A database without a capability table is treated as `legacy-agent-vm-core@1` only after its existing protocol-4 schema validates; unknown or malformed state fails closed.
+The state backend's `state_capabilities` registry stores versioned durable-state markers. Before migration it is read from SQLite; after migration it is read from shared rqlite. The capability set is returned by the management System API as sorted `name@version` strings. A database without a capability table is treated as `legacy-agent-vm-core@1` only after its existing protocol-4 schema validates; unknown or malformed state fails closed.
 
 The first management-enabled release uses these markers:
 
@@ -32,6 +38,8 @@ The first management-enabled release uses these markers:
 | `managed-image-catalog@1` | Immutable image records, labels, verification, references and default selection. |
 | `session-image-binding@1` | Session and cache identity remains bound to the exact image fingerprint. |
 | `management-operation-audit@1` | Durable administrator operation identity, actor, reason, target, phase and outcome. |
+| `principal-identity@1` | OIDC issuer/subject is the stable principal identity and historical ownership is never guessed. |
+| `token-revocation@1` | Opaque Agent Token digest, owner, scope, expiry and revocation state are durable across slots. |
 
 The format-4 manifest declares:
 
@@ -41,13 +49,17 @@ The format-4 manifest declares:
     "legacy-agent-vm-core@1",
     "managed-image-catalog@1",
     "management-operation-audit@1",
-    "session-image-binding@1"
+    "principal-identity@1",
+    "session-image-binding@1",
+    "token-revocation@1"
   ],
   "writes": [
     "legacy-agent-vm-core@1",
     "managed-image-catalog@1",
     "management-operation-audit@1",
-    "session-image-binding@1"
+    "principal-identity@1",
+    "session-image-binding@1",
+    "token-revocation@1"
   ]
 }
 ```
@@ -58,7 +70,15 @@ Installer preflight checks the candidate package before changing active pointers
 
 The client reads only its local sidecar client view. Legacy format 1/2 sidecars have the exact top-level fields `format`, `release_id`, `source_revision`, `protocol`, `client_artifact`, `client_dependencies` and `client_view`; format 3 replaces the product identity portion with `format`, `version`, `source_revision`, `protocol`, `client_artifact`, `client_dependencies` and `client_view`. `client_artifact` identifies `agent_vm.ts` with role `client`; `client_dependencies` lists the other seven fixed client files with role `support`. Each entry has exactly `name`, `path`, `role`, `sha256` and `mode`, with basename-only paths beside the sidecar. Missing, duplicate, extra or changed dependencies fail before SSH. The view contains the complete fixed action set and explicit request/response compatibility windows. A missing sidecar selects the explicit `legacy-protocol-4` capability and returns a structured warning; it does not silently claim a current release. A present but malformed, path-invalid, mode-invalid, or checksum-invalid sidecar fails closed, including an old Python-only sidecar. A compatible action across different revisions succeeds with a top-level warning, and write-operation replay preserves that warning.
 
+### SQLite to rqlite migration
+
+The initial state migration is conservative. SQLite remains the sole writer while the service enters drain, stops new native admission, creates a consistent backup/export and records schema, capability, row-count, generation, journal and identity summaries. The target rqlite state is imported through one `POST /db/execute?transaction` request after schema/capability preflight; the migration does not use SQL `BEGIN`/`COMMIT`, dual writes, a shared SQLite file or guessed reverse synchronization. The target is read-only until all summaries and journal ordering validate, then one slot is started for readiness before the protected active link changes.
+
+After cutover, rqlite is the only live state authority. Critical ownership, lease, generation, operation-journal, Token-revocation and capability reads use linearizable consistency. Cross-row updates use one rqlite transaction with conditional updates or unique constraints. A lost commit response or native result remains pending/unknown under the original operation ID; it is never replayed under a new ID. The old SQLite file is protected recovery material, not a rollback database to be opened concurrently or downgraded.
+
 ## Wrapper boundary
+
+The fixed wrapper in this section is the pre-existing format-1/2 compatibility publisher. The blue-green architecture does not introduce a new publication wrapper, router, Web service or native service; slot readiness, shared-state checks and the protected `active` link remain release-operator actions within the existing publication boundary. No wrapper may own lifecycle state or write rqlite independently of the Agent VM service.
 
 Format 4 client sidecars use the same exact product identity and client-view fields as format 3 with `format: 4`. They do not carry the server database's `state_compatibility` declaration; that declaration belongs only to the complete product release manifest and is enforced by the installer.
 

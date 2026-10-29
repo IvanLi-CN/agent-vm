@@ -5,7 +5,9 @@
     "legacy-agent-vm-core@1",
     "managed-image-catalog@1",
     "management-operation-audit@1",
-    "session-image-binding@1"
+    "principal-identity@1",
+    "session-image-binding@1",
+    "token-revocation@1"
   ],
   "maintenance": {
     "draining": false,
@@ -14,19 +16,25 @@
   },
   "components": [
     {
-      "name": "web",
+      "name": "service",
       "state": "ready",
       "version": "0.0.0+synthetic",
       "observed_at": "2026-01-15T10:20:30Z"
     },
     {
-      "name": "authority",
+      "name": "rqlite",
       "state": "ready",
       "version": "0.0.0+synthetic",
       "observed_at": "2026-01-15T10:20:30Z"
     },
     {
-      "name": "observer",
+      "name": "caddy",
+      "state": "ready",
+      "version": "2.11.7",
+      "observed_at": "2026-01-15T10:20:30Z"
+    },
+    {
+      "name": "incus",
       "state": "degraded",
       "version": null,
       "observed_at": "2026-01-15T10:00:00Z"

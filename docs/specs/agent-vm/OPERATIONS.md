@@ -2,6 +2,14 @@
 
 This document is the public operational boundary for the Native Incus Agent VM contract. It records the topology that is actually established by the deployment evidence and the recovery actions that the existing client and control contract can perform. It is not a host inventory and does not claim a physical or virtual source below the observed CT.
 
+This runbook describes the current pre-blue-green SSH/SQLite recovery baseline.
+The target deployment uses the unified service, stable project Caddy and shared
+rqlite defined by [the system architecture](../../architecture/system.md) and
+[ADR 0044](../../adr/0044-agent-vm-state-migration-to-rqlite.md). After the
+one-time migration, do not restore or open the protected SQLite material as a
+second live authority; perform drain, export, import and verification according
+to that ADR.
+
 ## Topology and provenance
 
 | Layer | Established role | Boundary |
@@ -106,6 +114,6 @@ The inventory view covers active, preparing, closing, deleting, failed, cached a
 
 - [Native Incus Agent VM specification](SPEC.md)
 - [Agent VM CLI contract](contracts/cli.md)
-- [Native deployment boundary](../../skills/agent-vm-ops/references/deployment.md)
+- [Native deployment boundary](../../../skills/agent-vm-ops/references/deployment.md)
 - [Agent VM topology and recovery boundary](../../adr/0028-agent-vm-topology-recovery-boundary.md)
 - [Agent VM control-plane update boundary](../../adr/0030-agent-vm-control-plane-update-boundary.md)

@@ -4,12 +4,15 @@ info:
   version: 1.0.0
   description: |
     Same-origin browser API for the built-in Agent VM management console.
-    This contract is separate from the protocol-4 client and control API.
+    Authentication uses the service's OIDC Authorization Code + PKCE flow.
+    This contract is separate from the protocol-4 Agent API.
 servers:
   - url: /api/v1
     description: Same-origin API served by the installed Agent VM product.
 tags:
+  - name: Auth
   - name: Session
+  - name: Tokens
   - name: Overview
   - name: VMs
   - name: Images
@@ -17,15 +20,64 @@ tags:
   - name: Audit
   - name: System
 security:
-  - forwardAuth: []
-    webSession: []
+  - browserSession: []
 paths:
+  /auth/oidc/start:
+    get:
+      tags: [Auth]
+      operationId: startOidcLogin
+      security: []
+      summary: Start an OIDC Authorization Code + PKCE login
+      responses:
+        "302":
+          description: Redirect to the configured OIDC authorization endpoint.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /auth/oidc/callback:
+    get:
+      tags: [Auth]
+      operationId: completeOidcLogin
+      security: []
+      summary: Consume one OIDC authorization response
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: state
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 32
+      responses:
+        "302":
+          description: Redirect to the configured management origin after creating the browser session.
+          headers:
+            Location:
+              schema:
+                type: string
+                format: uri
+            Set-Cookie:
+              schema:
+                type: string
+        default:
+          $ref: "#/components/responses/Problem"
+
   /session:
     get:
       tags: [Session]
       operationId: getManagementSession
       security:
-        - forwardAuth: []
+        - browserSession: []
       summary: Establish the browser session and return its administrator context
       responses:
         "200":
@@ -39,6 +91,148 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ManagementSession"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /tokens:
+    get:
+      tags: [Tokens]
+      operationId: listAgentTokens
+      summary: List Token metadata visible to the current principal
+      security:
+        - browserSession: []
+      parameters:
+        - $ref: "#/components/parameters/Limit"
+        - $ref: "#/components/parameters/Cursor"
+      responses:
+        "200":
+          description: Cursor-paginated Token metadata; plaintext values are never returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPage"
+        default:
+          $ref: "#/components/responses/Problem"
+    post:
+      tags: [Tokens]
+      operationId: createAgentToken
+      summary: Create one opaque Agent Token and return its plaintext once
+      security:
+        - browserSession: []
+          csrfToken: []
+      parameters:
+        - $ref: "#/components/parameters/Origin"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenCreateRequest"
+      responses:
+        "201":
+          description: Token metadata and a one-time plaintext Token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenCreateResponse"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /tokens/{token_id}:
+    parameters:
+      - $ref: "#/components/parameters/TokenID"
+    get:
+      tags: [Tokens]
+      operationId: getAgentToken
+      summary: Read one Token's metadata without returning its plaintext
+      security:
+        - browserSession: []
+      responses:
+        "200":
+          description: Token metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Token"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /tokens/{token_id}/revoke:
+    parameters:
+      - $ref: "#/components/parameters/TokenID"
+      - $ref: "#/components/parameters/Origin"
+    post:
+      tags: [Tokens]
+      operationId: revokeAgentToken
+      summary: Revoke one Token for the owner or an authorized administrator
+      security:
+        - browserSession: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenRevokeRequest"
+      responses:
+        "202":
+          description: Durable revocation operation accepted or an identical result returned.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /ownership-mappings/preview:
+    post:
+      tags: [System]
+      operationId: previewOwnershipMapping
+      summary: Preview binding one legacy owner record to an exact OIDC principal
+      security:
+        - browserSession: []
+          csrfToken: []
+      parameters:
+        - $ref: "#/components/parameters/Origin"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OwnershipMappingPreviewRequest"
+      responses:
+        "200":
+          description: Impact preview and a short-lived confirmation token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionPreview"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /ownership-mappings:
+    post:
+      tags: [System]
+      operationId: createOwnershipMapping
+      summary: Bind one legacy owner record to an exact OIDC principal
+      security:
+        - browserSession: []
+          csrfToken: []
+      parameters:
+        - $ref: "#/components/parameters/Origin"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OwnershipMappingRequest"
+      responses:
+        "202":
+          description: Durable ownership mapping operation accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
         default:
           $ref: "#/components/responses/Problem"
 
@@ -133,8 +327,7 @@ paths:
       operationId: previewVMAction
       summary: Preview one fixed, supported VM action
       security:
-        - forwardAuth: []
-          webSession: []
+        - browserSession: []
           csrfToken: []
       requestBody:
         required: true
@@ -161,8 +354,7 @@ paths:
       operationId: submitVMAction
       summary: Submit a confirmed VM action as a durable operation
       security:
-        - forwardAuth: []
-          webSession: []
+        - browserSession: []
           csrfToken: []
       requestBody:
         required: true
@@ -242,8 +434,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
-        - forwardAuth: []
-          webSession: []
+        - browserSession: []
           csrfToken: []
       requestBody:
         required: true
@@ -278,8 +469,7 @@ paths:
       summary: Stream the declared bytes for an existing local image import operation
       description: The stream is accepted once, must match the declared size and is never resumable.
       security:
-        - forwardAuth: []
-          webSession: []
+        - browserSession: []
           csrfToken: []
       requestBody:
         required: true
@@ -319,8 +509,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
-        - forwardAuth: []
-          webSession: []
+        - browserSession: []
           csrfToken: []
       requestBody:
         required: true
@@ -346,8 +535,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
-        - forwardAuth: []
-          webSession: []
+        - browserSession: []
           csrfToken: []
       requestBody:
         required: true
@@ -374,8 +562,7 @@ paths:
       operationId: previewImageRetirement
       summary: Preview retirement of an image version
       security:
-        - forwardAuth: []
-          webSession: []
+        - browserSession: []
           csrfToken: []
       requestBody:
         required: true
@@ -402,8 +589,7 @@ paths:
       operationId: retireManagedImage
       summary: Retire an image so it cannot be selected for new sessions
       security:
-        - forwardAuth: []
-          webSession: []
+        - browserSession: []
           csrfToken: []
       requestBody:
         required: true
@@ -430,8 +616,7 @@ paths:
       operationId: previewImageDeletion
       summary: Preview deletion and show every blocking image reference
       security:
-        - forwardAuth: []
-          webSession: []
+        - browserSession: []
           csrfToken: []
       requestBody:
         required: true
@@ -458,8 +643,7 @@ paths:
       operationId: deleteManagedImage
       summary: Delete an unreferenced, non-default image
       security:
-        - forwardAuth: []
-          webSession: []
+        - browserSession: []
           csrfToken: []
       requestBody:
         required: true
@@ -613,8 +797,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
-        - forwardAuth: []
-          webSession: []
+        - browserSession: []
           csrfToken: []
       requestBody:
         required: true
@@ -640,8 +823,7 @@ paths:
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
-        - forwardAuth: []
-          webSession: []
+        - browserSession: []
           csrfToken: []
       requestBody:
         required: true
@@ -661,19 +843,11 @@ paths:
 
 components:
   securitySchemes:
-    forwardAuth:
-      type: apiKey
-      in: header
-      name: X-Forwarded-User
-      description: >-
-        Set only by the configured reverse proxy after stripping browser-supplied
-        identity headers. The Web process accepts it only on the trusted proxy
-        Unix socket with the configured peer UID.
-    webSession:
+    browserSession:
       type: apiKey
       in: cookie
       name: agent_vm_session
-      description: Opaque browser session cookie; it is not an identity credential.
+      description: Opaque browser session cookie bound to the OIDC (issuer, subject) principal.
     csrfToken:
       type: apiKey
       in: header
@@ -732,6 +906,15 @@ components:
       schema:
         type: string
         format: uuid
+    TokenID:
+      name: token_id
+      in: path
+      required: true
+      description: Opaque non-secret Token identifier; never the bearer value.
+      schema:
+        type: string
+        minLength: 16
+        maxLength: 128
   responses:
     Problem:
       description: A structured, field-whitelisted API error.
@@ -755,23 +938,194 @@ components:
     ManagementSession:
       type: object
       additionalProperties: false
-      required: [subject, capabilities, csrf_token, expires_at]
+      required: [issuer, subject, role, capabilities, csrf_token, expires_at]
       properties:
+        issuer:
+          type: string
+          format: uri
+          description: Exact configured OIDC issuer identifier.
         subject:
           type: string
           minLength: 1
+          maxLength: 255
+        role:
+          type: string
+          enum: [user, administrator]
         capabilities:
           type: array
           uniqueItems: true
           items:
             type: string
-            enum: [read, operate, manage_images, maintain_system]
+            enum: [read, operate, manage_images, maintain_system, manage_tokens, observe_admin, map_ownership]
         csrf_token:
           type: string
           minLength: 32
         expires_at:
           type: string
           format: date-time
+    Principal:
+      type: object
+      additionalProperties: false
+      required: [issuer, subject]
+      properties:
+        issuer:
+          type: string
+          format: uri
+        subject:
+          type: string
+          minLength: 1
+          maxLength: 255
+        role:
+          type: [string, "null"]
+          enum: [user, administrator, null]
+    Token:
+      type: object
+      additionalProperties: false
+      required: [token_id, owner, session_ids, scopes, created_at, expires_at, revoked_at]
+      properties:
+        token_id:
+          type: string
+          minLength: 16
+          maxLength: 128
+        owner:
+          $ref: "#/components/schemas/Principal"
+        session_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+        scopes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            enum: [agent:read, agent:operate, agent:sync, agent:observe_admin]
+        created_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: [string, "null"]
+          format: date-time
+    TokenPage:
+      type: object
+      additionalProperties: false
+      required: [items, page]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Token"
+        page:
+          $ref: "#/components/schemas/PageInfo"
+    TokenCreateRequest:
+      type: object
+      additionalProperties: false
+      required: [session_ids, scopes, expires_at]
+      properties:
+        session_ids:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+        scopes:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            enum: [agent:read, agent:operate, agent:sync, agent:observe_admin]
+        expires_at:
+          type: string
+          format: date-time
+    TokenCreateResponse:
+      type: object
+      additionalProperties: false
+      required: [token, metadata]
+      properties:
+        token:
+          type: string
+          minLength: 32
+          description: Plaintext bearer value returned only for this creation response.
+        metadata:
+          $ref: "#/components/schemas/Token"
+    TokenRevokeRequest:
+      type: object
+      additionalProperties: false
+      required: [operation_id, reason]
+      properties:
+        operation_id:
+          type: string
+          format: uuid
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 512
+        target_version:
+          type: [string, "null"]
+          maxLength: 256
+        confirmation_token:
+          type: [string, "null"]
+          minLength: 32
+    OwnershipMappingPreviewRequest:
+      type: object
+      additionalProperties: false
+      required: [legacy_owner_id, issuer, subject, target_version]
+      properties:
+        legacy_owner_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+        issuer:
+          type: string
+          format: uri
+        subject:
+          type: string
+          minLength: 1
+          maxLength: 255
+        target_version:
+          type: string
+          minLength: 1
+          maxLength: 256
+    OwnershipMappingRequest:
+      type: object
+      additionalProperties: false
+      required: [operation_id, reason, legacy_owner_id, issuer, subject, target_version, confirmation_token]
+      properties:
+        operation_id:
+          type: string
+          format: uuid
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 512
+        legacy_owner_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+        issuer:
+          type: string
+          format: uri
+        subject:
+          type: string
+          minLength: 1
+          maxLength: 255
+        target_version:
+          type: string
+          minLength: 1
+          maxLength: 256
+        confirmation_token:
+          type: string
+          minLength: 32
     PageInfo:
       type: object
       additionalProperties: false
@@ -1349,7 +1703,7 @@ components:
       properties:
         kind:
           type: string
-          enum: [vm, image, image_catalog, system]
+          enum: [vm, image, image_catalog, token, principal, system]
         id:
           type: string
           minLength: 1
@@ -1362,6 +1716,7 @@ components:
           type: string
           enum:
             - authentication_required
+            - oidc_unavailable
             - administrator_required
             - csrf_invalid
             - origin_invalid
@@ -1372,6 +1727,9 @@ components:
             - not_found
             - unsupported_action
             - permission_denied
+            - ownership_required
+            - token_expired
+            - token_revoked
             - source_not_allowed
             - upload_too_large
             - staging_capacity_low
@@ -1382,9 +1740,9 @@ components:
             - capacity_unverified
             - admission_denied
             - precondition_required
-            - authority_unavailable
+            - service_unavailable
+            - state_unavailable
             - rate_limited
-            - sqlite_unavailable
             - lease_expired
             - task_not_active
             - draining
@@ -1463,8 +1821,7 @@ components:
         target:
           $ref: "#/components/schemas/OperationTarget"
         actor:
-          type: string
-          minLength: 1
+          $ref: "#/components/schemas/Principal"
         reason:
           type: string
         created_at:
@@ -1506,7 +1863,7 @@ components:
         action:
           $ref: "#/components/schemas/ManagementAction"
         actor:
-          type: string
+          $ref: "#/components/schemas/Principal"
         reason:
           type: string
         target:
@@ -1572,7 +1929,7 @@ components:
             properties:
               name:
                 type: string
-                enum: [web, authority, observer]
+                enum: [service, caddy, rqlite, incus]
               state:
                 type: string
                 enum: [ready, degraded, unavailable, unknown]
@@ -1590,13 +1947,13 @@ components:
       enum: [drain_enter, reconcile, gc]
     ManagementAction:
       type: string
-      enum: [restart, resize, release, destroy, port_add, port_remove, image_import, default_image_select, image_retire, image_delete, drain_enter, reconcile, gc]
+      enum: [restart, resize, release, destroy, port_add, port_remove, image_import, default_image_select, image_retire, image_delete, token_revoke, identity_mapping, drain_enter, reconcile, gc]
     OperationPhase:
       type: string
-      enum: [queued, awaiting_upload, upload, integrity_check, image_import, suitability_check, reference_check, native_action, reconciliation, cleanup, completed]
+      enum: [queued, awaiting_upload, upload, integrity_check, image_import, suitability_check, reference_check, token_revocation, native_action, reconciliation, cleanup, completed]
     ErrorPhase:
       type: string
-      enum: [authentication, authorization, request_validation, precondition, admission, awaiting_upload, upload, integrity_check, image_import, suitability_check, reference_check, native_action, reconciliation, cleanup, internal]
+      enum: [authentication, authorization, request_validation, precondition, admission, awaiting_upload, upload, integrity_check, image_import, suitability_check, reference_check, token, native_action, reconciliation, cleanup, internal]
     MaintenancePreviewRequest:
       type: object
       additionalProperties: false

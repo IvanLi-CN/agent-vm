@@ -1,109 +1,95 @@
 # Agent VM Management Contract
 
-The built-in management console uses the same-origin [Management API](management-api.yaml) and its [synthetic shared examples](management/examples/). The API is a browser-facing surface for existing Agent VM resources; it is independent of the client protocol, internal control API, and deployment observation bridge.
+The built-in management console uses the same-origin `/api/v1` surface defined by [management-api.yaml](management-api.yaml) and its [synthetic shared examples](management/examples/). The API is served by the active blue or green Agent VM service. It manages existing Agent VM resources and is independent from the protocol-4 [Agent API](agent-api.md), the [Token API](token-api.md), and the deployment observation bridge.
 
-## Authentication and process boundary
+## Authentication, identity and service boundary
 
-The first release uses Forward Auth at an operator-managed HTTPS reverse proxy. The proxy connects to the Web process through a dedicated Unix socket. The Web process accepts forwarded identity only when the socket peer UID matches its configured proxy UID and the stable subject is in the explicit administrator allowlist. The proxy must remove identity headers received from the browser before setting its own `X-Forwarded-User` header. Group headers, browser-supplied identity and an unlisted subject never grant access.
+The project Caddy entry point terminates TLS and forwards only fixed paths to the active service. It does not perform Forward Auth, inject `X-Forwarded-User`, accept browser-supplied identity headers or decide resource ownership. There is no independent Web process, management UDS, public TCP bypass, arbitrary router or browser-to-control proxy. The same Go/Gin service serves static assets, OIDC callbacks, `/api/v1`, `/agent/v1/control`, lifecycle rules and native workers; the high-privilege browser boundary is an explicit decision recorded in [ADR 0043](../../../adr/0043-agent-vm-unified-service-security-boundary.md).
 
-The Web process runs as its dedicated non-root system user. It has no direct SQLite access, control-service private configuration, Incus credentials, or membership in an Incus administration group. It calls the sole Go control authority through a separate management UDS. The authority verifies the Web peer UID, administrator subject and fixed action before dispatch. It rechecks ownership, generation, lease, image-reference and journal rules inside the authority.
+The first release uses an external OIDC provider as a relying-party identity service. `GET /api/v1/auth/oidc/start` creates a one-time Authorization Code + PKCE transaction. The transaction binds random `state`, `nonce`, a protected code verifier, the exact redirect URI, client ID, creation/expiry time and consumed state in shared storage. `GET /api/v1/auth/oidc/callback` accepts only the matching unexpired authorization response and consumes it once. The service validates TLS, the authorization code exchange, redirect URI, discovery issuer, ID Token signature/JWKS, exact `iss`, `aud`/`azp`, `exp`, `iat` policy and `nonce`; a provider outage, mismatch or replay fails closed.
 
-The Web listener has no public TCP mode or authentication bypass. The reverse proxy owns TLS and login. The authenticated external origin, trusted proxy UID, Web UID, authority socket and authority peer UID, forwarded-identity header, administrator subject allowlist, allowed trusted image source IDs, upload maximum, private staging directory and minimum free-space reserve are explicit deployment inputs. Configuration is incomplete when a required value is missing, empty or inconsistent; in that case the management listener remains disabled. No deployment address, subject, credential, filesystem path or live inventory belongs in this repository.
+The service represents a principal as the exact case-sensitive `(issuer, subject)` pair. The issuer is the configured discovery issuer and the subject is the OIDC `sub`; email, display name, groups and forwarded headers are not identity keys. Roles and capabilities are resolved from that pair. A successful OIDC login does not grant administrator capability by itself, and an unknown historical owner is not assigned by email or first login. An administrator must explicitly map an unbound legacy record to one exact pair through the auditable ownership-mapping operation before that record is visible to a user.
 
-The immutable Web and authority configuration has these required names and meanings:
+The service creates an opaque browser session with `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/` and a bounded TTL. Session metadata stores the principal pair, role, capabilities, creation/expiry/revocation state and a digest of the session identifier in shared state. `GET /api/v1/session` returns the principal, role, capabilities and a session-bound CSRF token. Every `POST` and `PUT` carries the cookie, `X-CSRF-Token` and an `Origin` exactly equal to the configured HTTPS origin; CORS is disabled. The browser session is not an Agent Token and is never accepted by `/agent/v1/control`.
+
+Required deployment inputs are explicit and incomplete configuration disables the management listener:
 
 | Field | Meaning and validation |
 | --- | --- |
-| `management.enabled` | Defaults to `false`; becomes `true` only after every enabled boundary below validates. |
+| `management.enabled` | Defaults to `false`; enabled only after all required OIDC, origin, session, Token and staging limits validate. |
 | `management.external_origin` | One normalized HTTPS origin, including a non-default port when used; no path, wildcard or list. |
-| `management.forward_auth.socket_path` | Private Unix socket on which the trusted reverse proxy reaches Web. |
-| `management.forward_auth.peer_uid` | Exact non-root UID required on the accepted proxy socket peer. |
-| `management.forward_auth.identity_header` | Fixed to `X-Forwarded-User`; the proxy strips browser-supplied values before writing it. |
-| `management.allowed_admin_subjects` | Non-empty, unique stable-subject allowlist shared by Web and authority; group claims do not grant access. |
-| `management.web_uid` | Dedicated service UID used by Web and presented on the authority UDS. |
-| `management.authority.socket_path` | Dedicated local management UDS; it is distinct from the client/control UDS. |
-| `management.authority.expected_web_uid` | Must equal `management.web_uid`; authority rejects every other peer UID. |
-| `management.session_ttl_seconds` | Opaque in-memory Web session lifetime, from 60 through 3600 seconds; default is 900 seconds. A Web restart invalidates all sessions. |
-| `management.trusted_image_source_ids` | Unique IDs resolved only through preconfigured Incus remotes; URLs, aliases and credentials are not accepted from callers. |
-| `management.upload.enabled` | Enables the local upload route; false disables it without disabling trusted-source imports. |
-| `management.upload.max_bytes` | Positive decimal byte ceiling required when upload is enabled. |
-| `management.upload.staging_path` | Absolute, private, service-owned staging directory outside the repository and guest data. |
-| `management.upload.minimum_free_bytes` | Positive physical-free-space reserve required before a local upload begins and while staging; when trusted image sources are configured, the same reserve is checked against the configured Incus pool before remote import. |
+| `management.oidc.issuer` | Exact discovery issuer URL; discovery metadata and ID Token `iss` must match it. |
+| `management.oidc.client_id` | Registered client ID bound to the callback and ID Token audience check. |
+| `management.oidc.redirect_uri` | One exact callback URI under the stable Caddy origin; it is stored in each login transaction. |
+| `management.oidc.client_secret` | Protected deployment secret used only by the authorization-code exchange; never stored in repository files or logs. |
+| `management.admin_principals` | Explicit unique `(issuer, subject)` mappings with administrator capabilities; no email or group-only entries. |
+| `management.session_ttl_seconds` | Browser session lifetime from 60 through 3600 seconds; default 900 seconds. |
+| `management.token_ttl_seconds` | Maximum Agent Token lifetime; each Token also carries its own expiry and revocation state. |
+| `management.upload.*` | Bounded image upload, private staging and minimum free-space limits from the image contract. |
 
-Web and authority consume separate read-only configuration files. The package configuration validator must require the administrator subject sets and Web peer UID to agree before enabling the listener. All socket paths are deployment-local and must not be published in examples.
+## Authorization and sensitive actions
 
-The Web process issues a short-lived opaque browser session cookie with `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/` and `Max-Age` equal to the configured session TTL. `GET /session` returns a random session-bound CSRF token. Every `POST` and `PUT` must carry that cookie, `X-CSRF-Token`, and an `Origin` exactly equal to the configured scheme, host and port. CORS is disabled. The cookie and CSRF token do not replace Forward Auth or the administrator allowlist.
+Ordinary users can use their own browser session and the [Token API](token-api.md). They can never use a query, guessed identifier or stale response to read or mutate another principal's sessions, Tokens or resources. The management console's inventory, image, system and audit views are administrator capabilities unless a future contract explicitly defines a narrower owner view.
+
+Every administrator mutation carries a UUID `operation_id`, a non-empty reason of at most 512 characters and the current `target_version`; VM actions also carry the exact expected generation. Actions that can affect an effective lease, image default/reference, deletion, maintenance, ownership mapping or Token owned by another principal first return an impact preview. Its confirmation token is opaque, short-lived (no more than five minutes), single-use and bound to the authenticated `(issuer, subject)`, exact target, action, parameters, target version and generation. Submission repeats authorization, ownership, reference, generation, lease, capacity and state checks inside the service.
+
+An identical operation retry returns the same durable outcome; reusing an operation ID with a different canonical request returns `operation_conflict`. A browser disconnect, timeout or `outcome_unknown` state does not authorize a new operation ID. The caller queries `GET /operations/{operation_id}` and the audit record until the service establishes an outcome. A native result that is not verified remains pending and is never replayed automatically.
+
+Audit records cover rejected and accepted requests as well as successful, failed and unknown outcomes. Each record stores the actor's `(issuer, subject)`, role/capability, reason, operation ID, target, phase, safe error code and timestamp. It never stores OIDC codes, Token values, credentials, raw command output, SQL or private deployment paths. Responses use field-whitelisted structured errors and do not expose internal stack traces.
+
+## Token and Agent API relationship
+
+The Token API creates the opaque Bearer credentials used by `POST /agent/v1/control`; its complete ownership, scope, one-time plaintext and revocation rules are in [token-api.md](token-api.md). The Agent API retains protocol 4 and its operation/generation/journal semantics; its authentication and compatibility contract is in [agent-api.md](agent-api.md). The management API must not wrap an arbitrary protocol-4 request or accept an Agent Token as a browser session.
 
 ## Wire behavior
 
-`management-api.yaml` is the wire contract for `/api/v1`. The backend and frontend consume the same request, response and error shapes. This API does not wrap arbitrary CLI commands or forward arbitrary internal-control request bodies. Unknown fields, unsupported enum values, extra properties, stale target versions and actions outside the enumerated allowlist are rejected.
+`management-api.yaml` is the wire contract for the same-origin `/api/v1` browser API. The backend and frontend consume the same request, response and error shapes. Unknown fields, unsupported enum values, extra properties, stale target versions and actions outside the enumerated allowlist are rejected.
 
 List endpoints use opaque keyset cursors. The default limit is 25 and the maximum is 100. Timestamps are UTC RFC 3339 values. Byte counts and generation values are decimal strings so TypeScript clients do not lose precision. A missing, stale, failed or unverified observation is returned with its state and a null value; it is never converted to zero, false or healthy.
 
 Every resource exposes an opaque `resource_version`. Write requests carry that version as `target_version`; VM actions also carry the exact `expected_generation`. The version is a concurrency guard, not a user-editable label. The API returns `stale_target` when the version, generation, lease, ownership or image references changed. The client must reload the resource and request a new preview; it must not silently retarget or replay a dangerous action.
 
-All mutations use a client-generated UUID `operation_id`, a non-empty reason of at most 512 characters, and the current `target_version`. The authenticated actor is derived from Forward Auth and is never accepted from the request body. The same operation ID and identical canonical request returns the same durable operation. Reusing it with a different request returns `operation_conflict`. A disconnected browser, timeout or `outcome_unknown` state does not mean failure and does not authorize a new operation ID. The caller queries `GET /operations/{operation_id}` and the audit record until the authority establishes an outcome.
+Image import starts as a durable operation. A local upload declares exact byte counts and SHA-256 values before upload; the service applies the configured size ceiling and physical-space reserve before and during staging. A trusted-source import resolves the exact fingerprint and image size first, then checks the same reserve against the configured Incus pool before native copy. Both paths run integrity and suitability checks before an image can be selected.
 
-`PUT /images/imports/{operation_id}/content` continues the already-created upload operation. Its path binds the operation ID, and the reason, actor and target version remain those stored by the creation request; the stream cannot create a second operation or change its metadata.
-
-Actions that affect existing VMs or images, change the default image, or perform system maintenance first use their matching preview endpoint. A preview reports affected sessions, image-reference counts and a localized-safe summary code. Its opaque confirmation token is bound to the authenticated subject, exact action, target, parameters and `target_version`, and expires promptly. Submission consumes that token and repeats all authorization, generation, lease, reference and capacity checks. A mismatch returns a conflict and performs no native effect. The token is a confirmation of the displayed impact, not an authorization credential. The Web boundary may enter admission drain for controlled maintenance, but exiting drain is reserved for the active release transaction's release-scoped session; a browser request cannot reopen admission during publication.
-
-Image import starts directly as a durable operation because it creates a new immutable candidate without changing an existing VM, image, default selection or maintenance state. A local upload must declare exact byte counts and SHA-256 values before upload; the authority applies the configured size ceiling and physical-space reserve before and during staging. A trusted-source import resolves the exact fingerprint and image size first, then checks the same reserve against the configured Incus pool before native copy. Both paths run integrity and suitability checks before the image can be selected.
-
-The API uses stable machine error codes, phases and a small allowlist of safe structured fields. The frontend maps codes to English and Simplified Chinese copy. Unknown codes use a generic localized failure message. Responses never include raw command output, credentials, private paths, database content or internal stack traces. Audit events record the authenticated actor, reason, target, action, phase and outcome; the UI keeps user-entered reasons unchanged. While admission is drained, the System page shows that recovery is release-managed and does not offer a browser `drain_exit` control; only the active release transaction may reopen admission.
-
-Confirmation tokens expire no later than five minutes after issue and cannot be reused.
+The API uses stable machine error codes, phases and a small allowlist of safe structured fields. The frontend maps codes to English and Simplified Chinese copy. Unknown codes use a generic localized failure message. Responses never include raw command output, credentials, private paths, database content or internal stack traces. While admission is drained, the System page shows that recovery is release-managed and does not offer a browser `drain_exit` control; only the active release transaction may reopen admission.
 
 ## Product and language behavior
 
 The first release has exactly two interface locales: `zh-CN` and `en`. Selection priority is a saved user choice, then the browser language, then English. Every navigation label, field label, accessible name, confirmation, validation message, status explanation and error has both translations. Technical identifiers, fingerprints, error codes and user-authored content are not translated.
 
-The API returns locale-neutral values and stable codes. The frontend formats numbers and dates with `Intl` using the selected locale and the browser's local time zone; it displays the time zone with timestamps. No server-side translation catalog or third-party translation service is required.
+The first viewport opens on Overview. Navigation covers Overview, VMs, Images, Operations & Audit, and System. The VM page keeps the selected resource identity, status evidence and allowed action context visible together. It has no manual VM creation flow. Overview, VM, image, operation and system data retain source freshness and unknown state. The design direction and responsive behavior are specified in [DESIGN.md](../../../../DESIGN.md) and the [Web surface brief](../../../../.impeccable/surfaces/web.md).
 
-The first viewport opens on Overview. Navigation covers Overview, VMs, Images, Operations & Audit, and System. The VM page keeps the selected resource identity, status evidence and allowed action context visible together. It has no manual VM creation flow. Overview, VM, image, operation and system data each retain source freshness and unknown state. The design direction and responsive behavior are specified in [DESIGN.md](../../../../DESIGN.md) and the [Web surface brief](../../../../.impeccable/surfaces/web.md); viewport widths in the delivery plan are evidence cases, not a general device-support promise.
-
-## Image and VM invariants
+## Image, VM and ownership invariants
 
 Unified local uploads use one `application/octet-stream` payload with one expected size and SHA-256. Split local uploads use `multipart/form-data` with exactly one `metadata` and one `rootfs` part; each part has its own expected size and SHA-256 in the import request, and the upload ceiling applies to the sum of their payload sizes. Original filenames are not used as Incus aliases or filesystem paths.
 
 An image is identified by its immutable Incus fingerprint. Version labels and configured source IDs are metadata, not identity. A trusted-remote import accepts only a configured `source_id` and an expected fingerprint; it does not accept an arbitrary URL, alias or credential. A local upload declares its package format, exact byte count and SHA-256 before the stream begins. The upload must fit the configured maximum and staging reserve, is received once, and is not resumable. A short, oversized, mismatched or interrupted stream becomes a queryable failed operation and its incomplete staging data is cleaned up.
 
-Integrity and Agent VM suitability are separate results. Verification uses a bounded, isolated temporary system container without production credentials, host mounts or production network access. Only an image with passed integrity and suitability can be selected as a new default. Selection changes apply to new sessions only. Existing tasks and caches remain pinned to their stored fingerprint; changing the default never rewrites them. A cached VM resumes with its recorded fingerprint when the image is verified or is an available legacy-config image seeded during migration while management is disabled. A missing, retired or otherwise unverified image is rejected until the exact session is explicitly destroyed.
-
-The initial migration preserves the configured legacy default and each task's existing fingerprint. The legacy default remains usable as the compatibility default until an administrator selects a fully verified replacement, but it is displayed as `legacy_unverified` and cannot be selected again through the management API. Retiring an image prevents new selection but does not invalidate existing bindings. Deletion is rejected while the image is default or has any active, cached, releasing (closing, deleting or failed cleanup), pending-creation or verification reference. The authority rechecks references while holding the image operation lock before native deletion.
+Integrity and Agent VM suitability are separate results. Verification uses a bounded, isolated temporary system container without production credentials, host mounts or production network access. Only an image with passed integrity and suitability can be selected as a new default. Selection changes apply to new sessions only. Existing tasks and caches remain pinned to their stored fingerprint. Retiring an image prevents new selection but does not invalidate existing bindings. Deletion is rejected while the image is default or has any active, cached, releasing, pending-creation or verification reference; reference checks are serialized with image operations.
 
 ## State migration and package rollback
 
-The management state is additive. The SQLite `state_capabilities` registry contains versioned capability markers; the API renders each marker as `name@version`. The first management release declares:
+The management state is additive. The `state_capabilities` registry contains versioned markers and the API renders each as `name@version`. The initial capability set retains the existing protocol-4 task, generation, lease, reservation, port and journal markers and adds the management catalog, session-image binding, operation-audit, principal-identity and Token-revocation markers. Migration preserves task IDs, session IDs, image fingerprints, generations, leases, ports, reservations, operation journals and existing audit evidence.
 
-| Capability | Meaning |
-| --- | --- |
-| `legacy-agent-vm-core@1` | Existing protocol-4 tasks, generations, leases, reservations, ports and operation journal. |
-| `managed-image-catalog@1` | Immutable image records, labels, verification, references and default selection. |
-| `session-image-binding@1` | Session and cache identity remains bound to the exact image fingerprint. |
-| `management-operation-audit@1` | Durable administrator operation identity, actor, reason, target, phase and outcome. |
+SQLite remains the single writer during the pre-rqlite phase. The conservative migration described by [ADR 0044](../../../adr/0044-agent-vm-state-migration-to-rqlite.md) drains native admission, exports a consistent backup, verifies schema/capability/row-count and identity summaries, imports through one rqlite transaction and validates before activating the shared backend. It never dual-writes, opens a shared SQLite file from both slots, downgrades a schema or recreates state to force rollback. After cutover, rqlite is the only live authority and critical reads use linearizable consistency.
 
-The migration inserts each marker in the same transaction as its schema changes. It does not rewrite task IDs, session IDs, image fingerprints, generations, leases, ports, reservations, operation journals or existing audit data. It seeds the catalog from the current configured image alias and fingerprint without asserting new verification evidence. A failed or interrupted migration leaves the previous schema usable and does not partially publish a capability marker.
+The database is never downgraded or recreated during package rollback. An installed package may activate only when it declares support to read and write every present capability marker. A target that cannot preserve issuer/subject ownership, session/Token revocation, journal, generation and unknown-outcome semantics is rejected before changing the active slot. The current package remains selected and admission stays drained for operator recovery.
 
-Default selection and new-session creation use one serialized authority boundary: creation resolves the current selection and records its pending image reference atomically, while default changes use the same boundary. This prevents a new task from observing a mixed selection or losing its image reference during a concurrent change.
+## Compatibility window
 
-The CLI remains on protocol 4. Its request shapes, command set, session identity rules, `status`, `admin status`, `admin session list`, and release-manifest action compatibility remain unchanged. Existing status data's `image_fingerprint` is the session pin. A default-image change never invalidates a cached session; lifecycle rejection is reserved for a missing or unverified pinned image. The management API does not add a public `agent-vm` command and does not change the session lifecycle protocol.
-
-Product manifest format 4 adds `state_compatibility.reads` and `state_compatibility.writes`, each a sorted list of supported `name@version` markers. Formats 1, 2 and 3 have no such declaration and are treated as supporting only the pre-management state. An installer or rollback preflight reads the live marker set and permits activation only if the target release declares support to both read and write every present marker. Unknown or unreadable markers fail closed before changing the active package pointer or starting the target service.
-
-The database is never downgraded or recreated during package rollback. A compatible target receives a complete package rollback and uses the same state database. An incompatible target is rejected before activation; the current package remains selected, admission stays drained, and the operation requires operator recovery. A post-migration health failure must not automatically launch a target that cannot read the new state. The product version is selected by the release process; it is independent of API version 1 and CLI protocol 4.
+The blue-green release contract retains the current and previous verified package and their fixed static resource manifests for at least one hour. Each package declares protocol, request/response/semantic windows, Token and management API versions, and state capability read/write sets. Both slots may receive requests during convergence only when the operation is in the shared compatibility set; Caddy never retries writes. A browser asset past the window receives a clear refresh response. SSH `legacy-bun`/`go-request` remains a compatibility transport until the declared window ends, while direct HTTPS uses the same protocol-4 body and does not change lifecycle semantics.
 
 ## Shared contract examples
 
 The JSON files beside this contract are synthetic fixtures, contain no deployment facts, and are intended to be shared by backend and frontend contract tests:
 
-- `overview.json` covers separate freshness and an unverified pressure value.
+- `overview.json` covers separate freshness and an unverified pressure observation.
 - `vms-page.json` covers a pinned image, generation, effective lease and bounded port data.
 - `images-page.json` covers a verified candidate and a preserved legacy compatibility default.
 - `image-import-request.json` covers an exact-size local upload declaration.
 - `image-import-split-request.json` covers separate metadata and rootfs payload declarations.
 - `vm-action-request.json` covers a preview-bound restart request.
-- `operation.json` covers durable asynchronous progress.
-- `audit-page.json` covers actor, reason, target and outcome.
-- `system.json` covers product state capabilities and component readiness.
+- `operation.json` covers durable asynchronous progress and an issuer/subject actor.
+- `audit-page.json` covers an issuer/subject actor, reason, target and outcome.
+- `system.json` covers the unified service, Caddy, rqlite and Incus readiness.
 - `error.json` covers a stale-target conflict without internal diagnostics.
