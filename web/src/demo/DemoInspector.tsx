@@ -1,5 +1,5 @@
-import { Check, Clipboard, Minimize2, Move, PanelLeft, PanelRight, RotateCcw, Wifi, WifiOff } from "lucide-react";
-import { useEffect, useRef, useState, type PointerEvent } from "react";
+import { Check, Clipboard, GripVertical, Minimize2, Move, PanelLeft, PanelRight, RotateCcw, Wifi, WifiOff } from "lucide-react";
+import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { demoShareUrl, getDemoInspectorPosition, saveDemoInspectorPosition, setDemoControl, useDemoRuntime, type DemoDataMode, type DemoInspectorLayout, type DemoInspectorPosition, type DemoPersona, type DemoRuntimeState, type DemoScene } from "./runtime";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/Select";
@@ -131,7 +131,7 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
     setMenuOpen(true);
   };
 
-  const handleDragStart = (event: PointerEvent<HTMLDivElement>) => {
+  const handleDragStart = (event: PointerEvent<HTMLElement>) => {
     if (layout !== "floating" || event.button !== 0) return;
     const inspector = inspectorRef.current;
     if (!inspector) return;
@@ -145,7 +145,7 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
     setDragging(true);
   };
 
-  const handleDragMove = (event: PointerEvent<HTMLDivElement>) => {
+  const handleDragMove = (event: PointerEvent<HTMLElement>) => {
     const drag = dragRef.current;
     const inspector = inspectorRef.current;
     if (!drag || drag.pointerId !== event.pointerId || !inspector) return;
@@ -155,7 +155,7 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
     setFloatingPosition(next);
   };
 
-  const finishDrag = (event: PointerEvent<HTMLDivElement>) => {
+  const finishDrag = (event: PointerEvent<HTMLElement>) => {
     const drag = dragRef.current;
     if (!drag || drag.pointerId !== event.pointerId) return;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
@@ -163,6 +163,26 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
     setDragging(false);
     const finalPosition = floatingPositionRef.current;
     if (finalPosition) saveDemoInspectorPosition(finalPosition);
+  };
+
+  const moveFloatingPosition = (deltaLeft: number, deltaTop: number) => {
+    const inspector = inspectorRef.current;
+    if (layout !== "floating" || !inspector) return;
+    const rect = inspector.getBoundingClientRect();
+    const current = clampPosition(floatingPositionRef.current ?? { left: rect.left, top: rect.top }, rect.width, rect.height);
+    const next = clampPosition({ left: current.left + deltaLeft, top: current.top + deltaTop }, rect.width, rect.height);
+    floatingPositionRef.current = next;
+    setFloatingPosition(next);
+    saveDemoInspectorPosition(next);
+  };
+
+  const handleDragKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (layout !== "floating") return;
+    const step = event.shiftKey ? 48 : 16;
+    const delta = event.key === "ArrowLeft" ? { left: -step, top: 0 } : event.key === "ArrowRight" ? { left: step, top: 0 } : event.key === "ArrowUp" ? { left: 0, top: -step } : event.key === "ArrowDown" ? { left: 0, top: step } : null;
+    if (!delta) return;
+    event.preventDefault();
+    moveFloatingPosition(delta.left, delta.top);
   };
 
   const copyLink = async () => {
@@ -189,7 +209,7 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
   return <div className={`demo-inspector-shell demo-inspector-shell--${layout} ${isMinimized ? "is-closed" : "is-open"}`}>
     <button type="button" className={`demo-bubble ${isMinimized ? "" : "is-open"}`} aria-label={t("demo.openInspector")} onClick={restoreLayout}><PanelRight aria-hidden="true" /></button>
     {!isMinimized ? <aside ref={inspectorRef} className={`demo-inspector ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.inspector")} style={layout === "floating" && floatingPosition ? { left: `${floatingPosition.left}px`, top: `${floatingPosition.top}px`, right: "auto", bottom: "auto" } : undefined}>
-      <div className="demo-inspector-header"><div className={`demo-inspector-heading ${layout === "floating" ? "demo-inspector-drag-handle" : ""}`} onPointerDown={handleDragStart} onPointerMove={handleDragMove} onPointerUp={finishDrag} onPointerCancel={finishDrag} title={layout === "floating" ? t("demo.dragInspector") : undefined}><span className="eyebrow-label">{t("demo.eyebrow")}</span><h2>{t("demo.inspector")}</h2></div><div className="demo-layout-menu" ref={menuRef}><IconButton label={t("demo.layoutButton")} aria-haspopup="menu" aria-expanded={menuOpen} onClick={handleLayoutDefaultClick} onKeyDown={handleLayoutKeyDown} onContextMenu={handleLayoutContextMenu} onPointerDown={handleLayoutPointerDown} onPointerUp={clearLongPress} onPointerCancel={clearLongPress}><LayoutIcon layout={layout} /></IconButton>{menuOpen ? <div className="demo-layout-menu-popover" role="menu" aria-label={t("demo.layoutMenu")}>{layoutOptions.map(({ value, label, icon: Icon }) => <button type="button" role="menuitemradio" aria-checked={layout === value} className={layout === value ? "selected" : ""} key={value} onClick={() => changeLayout(value)}><Icon aria-hidden="true" /><span>{label}</span>{layout === value ? <Check aria-hidden="true" /> : null}</button>)}</div> : null}</div></div>
+      <div className="demo-inspector-header"><div className="demo-inspector-heading"><span className="eyebrow-label">{t("demo.eyebrow")}</span><h2>{t("demo.inspector")}</h2></div><div className="demo-inspector-header-actions">{layout === "floating" ? <button type="button" className={`demo-inspector-drag-handle ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.dragInspector")} aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown" onPointerDown={handleDragStart} onPointerMove={handleDragMove} onPointerUp={finishDrag} onPointerCancel={finishDrag} onKeyDown={handleDragKeyDown}><GripVertical aria-hidden="true" /><span>{t("demo.dragHint")}</span></button> : null}<div className="demo-layout-menu" ref={menuRef}><IconButton label={t("demo.layoutButton")} aria-haspopup="menu" aria-expanded={menuOpen} onClick={handleLayoutDefaultClick} onKeyDown={handleLayoutKeyDown} onContextMenu={handleLayoutContextMenu} onPointerDown={handleLayoutPointerDown} onPointerUp={clearLongPress} onPointerCancel={clearLongPress}><LayoutIcon layout={layout} /></IconButton>{menuOpen ? <div className="demo-layout-menu-popover" role="menu" aria-label={t("demo.layoutMenu")}>{layoutOptions.map(({ value, label, icon: Icon }) => <button type="button" role="menuitemradio" aria-checked={layout === value} className={layout === value ? "selected" : ""} key={value} onClick={() => changeLayout(value)}><Icon aria-hidden="true" /><span>{label}</span>{layout === value ? <Check aria-hidden="true" /> : null}</button>)}</div> : null}</div></div></div>
       <div className="demo-safe-banner"><span className="demo-safe-dot" aria-hidden="true" /><div><strong>{t("demo.safeTitle")}</strong><span>{t("demo.safeText")}</span></div></div>
       <label className="demo-field"><span>{t("demo.scene")}</span><Select value={runtime.scene} onValueChange={(value) => set("scene", value as DemoScene)}><SelectTrigger aria-label={t("demo.scene")}><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="normal">{t("demo.scenes.normal")}</SelectItem><SelectItem value="capacity">{t("demo.scenes.capacity")}</SelectItem><SelectItem value="conflict">{t("demo.scenes.conflict")}</SelectItem><SelectItem value="empty">{t("demo.scenes.empty")}</SelectItem></SelectGroup></SelectContent></Select></label>
       <label className="demo-field"><span>{t("demo.persona")}</span><Select value={runtime.persona} onValueChange={(value) => set("persona", value as DemoPersona)}><SelectTrigger aria-label={t("demo.persona")}><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="admin">{t("demo.personas.admin")}</SelectItem><SelectItem value="viewer">{t("demo.personas.viewer")}</SelectItem></SelectGroup></SelectContent></Select></label>

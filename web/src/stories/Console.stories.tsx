@@ -26,3 +26,6 @@ export const ImageImport: Story = { render: () => <StoryFrame page="images"><Ima
 export const OperationsAudit: Story = { render: () => <StoryFrame page="operations"><OperationsPage /></StoryFrame> };
 export const SystemMaintenance: Story = { render: () => <StoryFrame page="system"><SystemPage /></StoryFrame> };
 export const DemoInspectorPanel: Story = { render: () => <div style={{ minHeight: "720px" }}><DemoInspector /></div> };
+export const DemoInspectorFloating: Story = { render: () => <div style={{ minHeight: "720px" }}><DemoInspector layout="floating" /></div> };
+export const DemoInspectorRightRail: Story = { render: () => <div style={{ minHeight: "720px" }}><DemoInspector layout="right" /></div> };
+export const DemoInspectorMinimized: Story = { render: () => <div style={{ minHeight: "720px" }}><DemoInspector layout="minimized" /></div> };
