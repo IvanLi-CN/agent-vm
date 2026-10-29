@@ -57,6 +57,7 @@ test("demo deployment is serialized and never exposes credentials to PR builds",
   expect(JSON.stringify(workflow.jobs.build)).not.toContain("EDGEONE_API_TOKEN");
   const steps = workflow.jobs.deploy.steps;
   const names = steps.map((step: { name?: string }) => step.name);
+  for (const name of ["Install locked deployment tools", "Reject stale main revision", "Verify existing EdgeOne project", "Deploy to EdgeOne Makers"]) expect(names).toContain(name);
   expect(names.indexOf("Install locked deployment tools")).toBeLessThan(names.indexOf("Verify existing EdgeOne project"));
   expect(names.indexOf("Reject stale main revision")).toBeLessThan(names.indexOf("Deploy to EdgeOne Makers"));
   expect(names.indexOf("Verify existing EdgeOne project")).toBeLessThan(names.indexOf("Deploy to EdgeOne Makers"));

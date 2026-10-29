@@ -85,7 +85,11 @@ jobs:
         env:
           EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
           EDGEONE_PROJECT_NAME: ${{ vars.EDGEONE_PROJECT_NAME }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+          REPOSITORY: ${{ github.repository }}
         run: |
           test -n "$EDGEONE_API_TOKEN"
           test "$EDGEONE_PROJECT_NAME" = agent-vm-demo
+          test "$(gh api "repos/$REPOSITORY/commits/main" --jq .sha)" = "$SOURCE_SHA"
           node_modules/.bin/edgeone makers deploy "$EDGEONE_ARTIFACT_DIR" --name "$EDGEONE_PROJECT_NAME" --token "$EDGEONE_API_TOKEN" --env production --skip-ai-gateway-sync

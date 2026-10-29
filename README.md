@@ -89,6 +89,7 @@ from `main`. Pull requests build the artifact without deployment credentials.
 Configure the `EDGEONE_API_TOKEN` repository secret, the `EDGEONE_PROJECT_NAME`
 repository variable as `agent-vm-demo`, and `EDGEONE_PROJECT_ID` as the existing
 Makers project ID before enabling the production workflow.
+The existing Makers project must support direct-upload deployments.
 The workflow also supports a manual run on `main`; do not upload builds from a local machine.
 The artifact includes `web/edgeone.json`, which provides SPA fallback for paths
 such as `/images` while serving existing assets normally.
