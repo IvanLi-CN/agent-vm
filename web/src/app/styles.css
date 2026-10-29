@@ -148,9 +148,28 @@ svg { flex: none; }
 .form-control::placeholder { color: var(--faint); }
 .form-control[aria-invalid="true"] { border-color: var(--negative); }
 .form-textarea { min-height: 82px; resize: vertical; line-height: 1.5; }
-.select-wrap { position: relative; display: block; }
-.select-wrap select { appearance: none; padding-right: 30px; }
-.select-icon { position: absolute; top: 9px; right: 9px; width: 14px; height: 14px; pointer-events: none; color: var(--muted); }
+.select-trigger { display: inline-flex; align-items: center; justify-content: space-between; gap: 8px; width: 100%; min-height: 32px; padding: 6px 10px; color: var(--text); background: var(--surface); border: 1px solid var(--control); border-radius: var(--radius-control); font-size: 13px; line-height: 1.35; text-align: left; transition: background-color .16s ease, border-color .16s ease, box-shadow .16s ease; }
+.select-trigger:hover { background: var(--raised); }
+.select-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.select-trigger[data-state="open"] { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.select-trigger[data-disabled] { cursor: not-allowed; opacity: .52; }
+.select-trigger-icon { flex: none; width: 14px; height: 14px; color: var(--muted); transition: transform .16s ease; }
+.select-trigger[data-state="open"] .select-trigger-icon { transform: rotate(180deg); }
+.select-content { z-index: 50; min-width: var(--radix-select-trigger-width); max-height: var(--radix-select-content-available-height); overflow: hidden; padding: 4px; color: var(--text); background: var(--surface); border: 1px solid var(--control); border-radius: 8px; box-shadow: 0 14px 30px rgba(19,20,22,.16); transform-origin: var(--radix-select-content-transform-origin); animation: select-content-in .12s ease-out; }
+.select-content[data-state="closed"] { animation: select-content-out .1s ease-in; }
+.select-viewport { padding: 2px; }
+.select-item { position: relative; display: flex; align-items: center; min-height: 32px; padding: 6px 30px 6px 8px; color: var(--text); border-radius: 4px; outline: none; cursor: pointer; font-size: 13px; line-height: 1.35; user-select: none; }
+.select-item[data-highlighted] { color: var(--text); background: var(--active); }
+.select-item[data-state="checked"] { background: var(--accent-soft); }
+.select-item[data-disabled] { pointer-events: none; opacity: .52; }
+.select-item-indicator { position: absolute; right: 8px; display: inline-flex; align-items: center; }
+.select-item-indicator svg { width: 14px; height: 14px; color: var(--accent); }
+.select-label { padding: 6px 8px; color: var(--muted); font-size: 12px; }
+.select-separator { height: 1px; margin: 4px 0; background: var(--rule); }
+.select-scroll-button { display: flex; align-items: center; justify-content: center; height: 20px; color: var(--muted); background: transparent; border: 0; cursor: default; }
+.select-scroll-button svg { width: 14px; height: 14px; }
+@keyframes select-content-in { from { opacity: 0; transform: translateY(-3px) scale(.98); } to { opacity: 1; transform: translateY(0) scale(1); } }
+@keyframes select-content-out { from { opacity: 1; transform: translateY(0) scale(1); } to { opacity: 0; transform: translateY(-3px) scale(.98); } }
 
 .split-layout { display: grid; grid-template-columns: minmax(0, 1fr) 384px; gap: 16px; align-items: start; }
 .list-panel { min-width: 0; }
@@ -308,7 +327,7 @@ svg { flex: none; }
 .demo-safe-banner span { margin-top: 2px; }
 .demo-safe-dot { flex: none; width: 8px; height: 8px; margin-top: 4px; background: var(--positive); border-radius: 50%; }
 .demo-field { display: flex; flex-direction: column; gap: 5px; color: var(--muted); font-size: 12px; }
-.demo-field .select-wrap select { min-height: 36px; }
+.demo-field .select-trigger { min-height: 36px; }
 .demo-network-toggle { display: grid; grid-template-columns: 1fr 1fr; gap: 5px; }
 .demo-network-toggle button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 34px; color: var(--muted); background: var(--raised); border: 1px solid var(--border); border-radius: 5px; font-size: 12px; }
 .demo-network-toggle button svg { width: 14px; height: 14px; }
@@ -361,7 +380,7 @@ svg { flex: none; }
   .ui-button { min-height: 44px; }
   .icon-button { width: 44px; height: 44px; }
   .form-control { min-height: 44px; }
-  .select-icon { top: 15px; }
+  .select-trigger { min-height: 44px; }
   .language-toggle button { min-height: 44px; }
   .import-mode button, .tabs-row button { min-height: 44px; }
   .file-input { min-height: 44px; }

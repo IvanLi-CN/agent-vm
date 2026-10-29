@@ -6,7 +6,8 @@ import { actionLabel, formatDateTime, shortFingerprint } from "../app/format";
 import { ManagementRequestError, createOperationId, listImages, previewImageAction, startImageImport, submitImageAction, uploadImageImportContent } from "../app/api";
 import type { ActionPreview, ImageImportRequest, Locale, ManagedImage } from "../app/types";
 import { ActionDialog } from "../components/ActionDialog";
-import { CopyButton, EmptyState, Input, Panel, PanelHeader, Select, StatusBadge, Button } from "../components/ui";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/Select";
+import { CopyButton, EmptyState, Input, Panel, PanelHeader, StatusBadge, Button } from "../components/ui";
 import { DefinitionList, PageIntro, QueryError } from "../components/PagePrimitives";
 
 type ImageAction = "default" | "delete" | "retire";
@@ -149,7 +150,7 @@ export function ImagesPage() {
           <label className="field-label">{t("images.sourceId")}<Input value={sourceId} onChange={(event) => setSourceId(event.target.value)} /></label>
           <label className="field-label field-span-2">{t("images.expectedFingerprint")}<Input className="mono" value={expectedFingerprint} onChange={(event) => setExpectedFingerprint(event.target.value)} /></label>
         </> : <>
-          <label className="field-label">{t("images.packageFormat")}<Select value={format} onChange={(event) => setFormat(event.target.value as "unified" | "split")}><option value="unified">{t("images.unified")}</option><option value="split">{t("images.split")}</option></Select></label>
+          <label className="field-label">{t("images.packageFormat")}<Select value={format} onValueChange={(value) => setFormat(value as "unified" | "split")}><SelectTrigger aria-label={t("images.packageFormat")}><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="unified">{t("images.unified")}</SelectItem><SelectItem value="split">{t("images.split")}</SelectItem></SelectGroup></SelectContent></Select></label>
           {format === "unified" ? <>
             <label className="field-label">{t("images.expectedSize")}<Input className="mono" value={expectedSize} readOnly placeholder="—" /></label>
             <label className="field-label">{t("images.expectedSha")}<Input className="mono" value={expectedSha} onChange={(event) => setExpectedSha(event.target.value)} /></label>

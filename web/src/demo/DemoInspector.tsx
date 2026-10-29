@@ -2,7 +2,8 @@ import { Check, Clipboard, PanelRight, RotateCcw, Wifi, WifiOff, X } from "lucid
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { demoShareUrl, setDemoControl, useDemoRuntime, type DemoDataMode, type DemoNetwork, type DemoPersona, type DemoRuntimeState, type DemoScene } from "./runtime";
-import { Button, IconButton, Select, StatusBadge } from "../components/ui";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/Select";
+import { Button, IconButton, StatusBadge } from "../components/ui";
 
 export function DemoInspector() {
   const { t } = useTranslation();
@@ -28,9 +29,9 @@ export function DemoInspector() {
     {open ? <aside className="demo-inspector" aria-label={t("demo.inspector")}>
       <div className="demo-inspector-header"><div><span className="eyebrow-label">{t("demo.eyebrow")}</span><h2>{t("demo.inspector")}</h2></div><IconButton label={t("demo.closeInspector")} onClick={() => setOpen(false)}><X /></IconButton></div>
       <div className="demo-safe-banner"><span className="demo-safe-dot" aria-hidden="true" /><div><strong>{t("demo.safeTitle")}</strong><span>{t("demo.safeText")}</span></div></div>
-      <label className="demo-field"><span>{t("demo.scene")}</span><Select value={runtime.scene} onChange={(event) => set("scene", event.target.value as DemoScene)}><option value="normal">{t("demo.scenes.normal")}</option><option value="capacity">{t("demo.scenes.capacity")}</option><option value="conflict">{t("demo.scenes.conflict")}</option><option value="empty">{t("demo.scenes.empty")}</option></Select></label>
-      <label className="demo-field"><span>{t("demo.persona")}</span><Select value={runtime.persona} onChange={(event) => set("persona", event.target.value as DemoPersona)}><option value="admin">{t("demo.personas.admin")}</option><option value="viewer">{t("demo.personas.viewer")}</option></Select></label>
-      <label className="demo-field"><span>{t("demo.data")}</span><Select value={runtime.dataMode} onChange={(event) => set("dataMode", event.target.value as DemoDataMode)}><option value="full">{t("demo.dataModes.full")}</option><option value="minimal">{t("demo.dataModes.minimal")}</option></Select></label>
+      <label className="demo-field"><span>{t("demo.scene")}</span><Select value={runtime.scene} onValueChange={(value) => set("scene", value as DemoScene)}><SelectTrigger aria-label={t("demo.scene")}><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="normal">{t("demo.scenes.normal")}</SelectItem><SelectItem value="capacity">{t("demo.scenes.capacity")}</SelectItem><SelectItem value="conflict">{t("demo.scenes.conflict")}</SelectItem><SelectItem value="empty">{t("demo.scenes.empty")}</SelectItem></SelectGroup></SelectContent></Select></label>
+      <label className="demo-field"><span>{t("demo.persona")}</span><Select value={runtime.persona} onValueChange={(value) => set("persona", value as DemoPersona)}><SelectTrigger aria-label={t("demo.persona")}><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="admin">{t("demo.personas.admin")}</SelectItem><SelectItem value="viewer">{t("demo.personas.viewer")}</SelectItem></SelectGroup></SelectContent></Select></label>
+      <label className="demo-field"><span>{t("demo.data")}</span><Select value={runtime.dataMode} onValueChange={(value) => set("dataMode", value as DemoDataMode)}><SelectTrigger aria-label={t("demo.data")}><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="full">{t("demo.dataModes.full")}</SelectItem><SelectItem value="minimal">{t("demo.dataModes.minimal")}</SelectItem></SelectGroup></SelectContent></Select></label>
       <div className="demo-field"><span>{t("demo.network")}</span><div className="demo-network-toggle" role="group" aria-label={t("demo.network")}><button className={runtime.network === "online" ? "selected" : ""} onClick={() => set("network", "online")}><Wifi aria-hidden="true" />{t("demo.networkOnline")}</button><button className={runtime.network === "offline" ? "selected" : ""} onClick={() => set("network", "offline")}><WifiOff aria-hidden="true" />{t("demo.networkOffline")}</button></div></div>
       <div className="demo-state-row"><span>{t("demo.access")}</span><StatusBadge state={runtime.persona === "admin" ? "ready" : "unavailable"} /></div>
       <div className="demo-state-row"><span>{t("demo.status")}</span><StatusBadge state={runtime.network === "online" ? "available" : "failed"} /></div>

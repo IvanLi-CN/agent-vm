@@ -1,5 +1,5 @@
-import { forwardRef, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type SelectHTMLAttributes, type TextareaHTMLAttributes } from "react";
-import { Check, ChevronDown, Copy, LoaderCircle } from "lucide-react";
+import { forwardRef, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type TextareaHTMLAttributes } from "react";
+import { Check, Copy, LoaderCircle } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { stateLabel, stateTone } from "../app/format";
@@ -39,10 +39,6 @@ export function Input(props: InputHTMLAttributes<HTMLInputElement>) {
 export const Textarea = forwardRef<HTMLTextAreaElement, TextareaHTMLAttributes<HTMLTextAreaElement>>(function Textarea(props, ref) {
   return <textarea ref={ref} className="form-control form-textarea" {...props} />;
 });
-
-export function Select({ children, ...props }: SelectHTMLAttributes<HTMLSelectElement>) {
-  return <span className="select-wrap"><select className="form-control" {...props}>{children}</select><ChevronDown className="select-icon" aria-hidden="true" /></span>;
-}
 
 export function ProgressBar({ value, tone = "accent" }: { value: number; tone?: "accent" | "success" | "danger" }) {
   return <div className="progress-track" aria-label={`${Math.round(value)}%`}><span className={`progress-fill progress-${tone}`} style={{ width: `${Math.max(0, Math.min(value, 100))}%` }} /></div>;
