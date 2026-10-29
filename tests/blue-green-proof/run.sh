@@ -12,10 +12,14 @@ KEEP_PROOF_DIR="${KEEP_PROOF_DIR:-0}"
 
 cleanup() {
   if [[ "${KEEP_PROOF_DIR}" != "1" ]]; then
-    if [[ -f "${PROOF_DIR}/rqlited.pid" ]]; then
+    if [[ -e "${PROOF_DIR}/rqlited.started" ]]; then
+      if [[ ! -f "${PROOF_DIR}/rqlited.pid" ]]; then
+        printf 'cleanup_skipped=rqlited_pid_unknown proof_dir=%s\n' "${PROOF_DIR}" >&2
+        return 0
+      fi
       pid="$(<"${PROOF_DIR}/rqlited.pid")"
-      if [[ "${pid}" =~ ^[0-9]+$ ]] && { [[ ! -d /proc ]] || [[ -e "/proc/${pid}" ]]; }; then
-        printf 'cleanup_skipped=unable_to_confirm_rqlited_pid_%s_exit proof_dir=%s\n' "${pid}" "${PROOF_DIR}" >&2
+      if [[ ! "${pid}" =~ ^[0-9]+$ ]] || [[ ! -d /proc ]] || [[ -e "/proc/${pid}" ]]; then
+        printf 'cleanup_skipped=unable_to_confirm_rqlited_pid_exit proof_dir=%s\n' "${PROOF_DIR}" >&2
         return 0
       fi
     fi
@@ -25,6 +29,17 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+forward_signal() {
+  local signal="$1"
+  if [[ -z "${BUN_PID:-}" ]]; then
+    [[ "${signal}" == "TERM" ]] && exit 143
+    exit 130
+  fi
+  kill "-${signal}" "${BUN_PID}" 2>/dev/null || true
+}
+trap 'forward_signal TERM' TERM
+trap 'forward_signal INT' INT
 
 if [[ -n "${RQLITED_BIN:-}" ]]; then
   RQLITED_BIN="$(CDPATH= cd -- "$(dirname -- "${RQLITED_BIN}")" && pwd)/$(basename -- "${RQLITED_BIN}")"
@@ -39,6 +54,18 @@ else
 fi
 
 [[ -x "${RQLITED_BIN}" ]]
+BUN_PID=""
 bun "${SCRIPT_DIR}/run-rqlite-proof.ts" \
   --rqlited "${RQLITED_BIN}" \
-  --proof-dir "${PROOF_DIR}"
+  --proof-dir "${PROOF_DIR}" &
+BUN_PID=$!
+set +e
+wait "${BUN_PID}"
+status=$?
+if [[ "${status}" -eq 143 || "${status}" -eq 130 ]]; then
+  wait "${BUN_PID}"
+  status=$?
+fi
+set -e
+trap - INT TERM
+exit "${status}"

@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { request as httpRequest } from "node:http";
+import { request as httpRequest, type ClientRequest } from "node:http";
 import { createServer, createConnection, type AddressInfo, type Server, type Socket } from "node:net";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -112,6 +112,25 @@ function assertCondition(condition: unknown, message: string, detail: JsonObject
   if (!condition) throw new ProofFailure(message, detail);
 }
 
+function expectedTransactionError(error: unknown, expectedError: string, context: string, expectedPriorRows: Array<number | null>): JsonObject {
+  assertCondition(error instanceof HttpFailure, `${context} did not return an HTTP statement error`, { error: String(error) });
+  const detail = error.detail;
+  const body = asObject(detail.body, `${context} error body`);
+  const errors = body.errors;
+  assertCondition(Array.isArray(errors) && errors.includes(expectedError), `${context} returned an unexpected statement error`, { expected_error: expectedError, detail });
+  const response = asObject(body.response, `${context} error response`);
+  const results = response.results;
+  assertCondition(Array.isArray(results) && results.length === expectedPriorRows.length + 1, `${context} returned an unexpected result sequence`, { expected_prior_rows: expectedPriorRows, detail });
+  expectedPriorRows.forEach((rowsAffected, index) => {
+    if (rowsAffected === null) return;
+    const result = asObject(results[index], `${context} result ${index}`);
+    assertCondition(result.rows_affected === rowsAffected, `${context} did not reach the injected failure after the expected statements`, { expected_prior_rows: expectedPriorRows, detail });
+  });
+  const failureResult = asObject(results[results.length - 1], `${context} failure result`);
+  assertCondition(failureResult.error === expectedError, `${context} failure result did not match the expected constraint`, { expected_error: expectedError, detail });
+  return detail;
+}
+
 function asObject(value: unknown, context: string): JsonObject {
   assertCondition(value !== null && typeof value === "object" && !Array.isArray(value), `${context} is not an object`);
   return value as JsonObject;
@@ -198,8 +217,9 @@ async function allocateFreePort(): Promise<number> {
   return port;
 }
 
-function startRqlite(options: Options): RqliteProcess {
+async function startRqlite(options: Options): Promise<RqliteProcess> {
   mkdirSync(options.proofDir, { recursive: true });
+  writeFileSync(join(options.proofDir, "rqlited.started"), "1\n");
   const dataDir = join(options.proofDir, "rqlite-data");
   const child = spawn(options.rqlited, [
     "-node-id", "blue-green-proof-1",
@@ -207,8 +227,6 @@ function startRqlite(options: Options): RqliteProcess {
     "-raft-addr", `${options.host}:${options.raftPort}`,
     dataDir,
   ], { stdio: ["ignore", "pipe", "pipe"] });
-  assertCondition(child.pid !== undefined, "rqlite child process has no PID");
-  writeFileSync(join(options.proofDir, "rqlited.pid"), `${child.pid}\n`);
   const log: string[] = [];
   child.stdout?.on("data", chunk => log.push(String(chunk)));
   child.stderr?.on("data", chunk => log.push(String(chunk)));
@@ -226,6 +244,18 @@ function startRqlite(options: Options): RqliteProcess {
     })();
     return stopPromise;
   };
+
+  try {
+    assertCondition(child.pid !== undefined, "rqlite child process has no PID");
+    writeFileSync(join(options.proofDir, "rqlited.pid"), `${child.pid}\n`);
+  } catch (error) {
+    try {
+      await stop();
+    } catch (stopError) {
+      throw new ProofFailure("failed to record rqlite PID and stop the child", { start_error: String(error), stop_error: String(stopError), pid: child.pid });
+    }
+    throw error;
+  }
 
   return { process: child, log, stop };
 }
@@ -350,7 +380,11 @@ async function startDropProxy(upstreamPort: number): Promise<DropProxy> {
     outcomeSettled = true;
     resolveOutcome(value);
   };
+  const clientSockets = new Set<Socket>();
+  const upstreamSockets = new Set<Socket>();
   const server: Server = createServer((client: Socket) => {
+    clientSockets.add(client);
+    client.once("close", () => clientSockets.delete(client));
     let requestBytes = Buffer.alloc(0);
     let forwarded = false;
     client.on("error", () => undefined);
@@ -360,11 +394,15 @@ async function startDropProxy(upstreamPort: number): Promise<DropProxy> {
       if (!messageComplete(requestBytes)) return;
       forwarded = true;
       const upstream = createConnection({ host: DEFAULT_HOST, port: upstreamPort }, () => upstream.write(requestBytes));
+      upstreamSockets.add(upstream);
+      upstream.once("close", () => upstreamSockets.delete(upstream));
       let responseBytes = Buffer.alloc(0);
       let closed = false;
+      let responseTimeout: ReturnType<typeof setTimeout> | null = null;
       const closeBoth = (complete: boolean, reason: string): void => {
         if (closed) return;
         closed = true;
+        if (responseTimeout) clearTimeout(responseTimeout);
         settleOutcome({ complete, reason, status_code: responseStatus(responseBytes), response_bytes: responseBytes.length });
         upstream.destroy();
         client.destroy();
@@ -375,7 +413,8 @@ async function startDropProxy(upstreamPort: number): Promise<DropProxy> {
       });
       upstream.on("end", () => closeBoth(false, "upstream_ended_before_complete"));
       upstream.on("error", error => closeBoth(false, `upstream_error:${error.message}`));
-      setTimeout(() => closeBoth(false, "upstream_response_timeout"), 10_000).unref();
+      responseTimeout = setTimeout(() => closeBoth(false, "upstream_response_timeout"), 10_000);
+      responseTimeout.unref();
     });
   });
   await new Promise<void>((resolve, reject) => {
@@ -387,8 +426,18 @@ async function startDropProxy(upstreamPort: number): Promise<DropProxy> {
     port: address.port,
     outcome,
     close: () => new Promise(resolve => {
+      let closed = false;
+      const finish = (): void => {
+        if (closed) return;
+        closed = true;
+        resolve();
+      };
       settleOutcome({ complete: false, reason: "proxy_closed_before_upstream_response", status_code: null, response_bytes: 0 });
-      server.close(() => resolve());
+      server.close(finish);
+      for (const socket of clientSockets) socket.destroy();
+      for (const socket of upstreamSockets) socket.destroy();
+      const closeTimeout = setTimeout(finish, 1_000);
+      closeTimeout.unref();
     }),
   };
 }
@@ -406,22 +455,37 @@ async function postAndLoseResponse(port: number, statements: string[]): Promise<
   return new Promise((resolve, reject) => {
     let settled = false;
     let gotResponse = false;
-    let timeout: ReturnType<typeof setTimeout>;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    let request: ClientRequest | null = null;
+    const activeSignal = activeRequestAbortController?.signal;
+    const abortRequest = (): void => {
+      request?.destroy();
+      finish(new Error("response-drop proxy request interrupted"));
+    };
     const finish = (error?: Error): void => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeout);
+      if (timeout) clearTimeout(timeout);
+      activeSignal?.removeEventListener("abort", abortRequest);
       if (error) reject(error);
       else resolve("client observed a closed connection without an HTTP response");
     };
-    const request = httpRequest({
+    if (activeSignal?.aborted) {
+      finish(new Error("response-drop proxy request interrupted"));
+      return;
+    }
+    activeSignal?.addEventListener("abort", abortRequest, { once: true });
+    request = httpRequest({
       host: DEFAULT_HOST,
       port,
       path: "/db/execute?transaction",
       method: "POST",
       headers: { "content-type": "application/json", "content-length": body.length, connection: "close" },
     });
-    timeout = setTimeout(() => finish(new Error("timed out waiting for the response-drop proxy")), 15_000);
+    timeout = setTimeout(() => {
+      request?.destroy();
+      finish(new Error("timed out waiting for the response-drop proxy"));
+    }, 15_000);
     request.on("response", response => {
       gotResponse = true;
       response.resume();
@@ -445,7 +509,7 @@ async function run(options: Options): Promise<JsonObject> {
   while (raftPort === httpPort) raftPort = await allocateFreePort();
   const runtimeOptions = { ...options, httpPort, raftPort };
   const baseUrl = `http://${runtimeOptions.host}:${runtimeOptions.httpPort}`;
-  const server = startRqlite(runtimeOptions);
+  const server = await startRqlite(runtimeOptions);
   const requestAbortController = new AbortController();
   activeRequestAbortController = requestAbortController;
   let interrupted: NodeJS.Signals | null = null;
@@ -495,8 +559,7 @@ async function run(options: Options): Promise<JsonObject> {
         "INSERT INTO failure_guard(id) VALUES ('fixed')",
       ]);
     } catch (error) {
-      assertCondition(error instanceof HttpFailure, "expected the failing transaction to return an HTTP/statement error");
-      rollbackError = error.detail;
+      rollbackError = expectedTransactionError(error, "UNIQUE constraint failed: failure_guard.id", "failed transaction", [1, 1]);
     }
     assertCondition(rollbackError !== null, "the deliberately failing transaction unexpectedly succeeded");
     const partial = await readSlot(baseUrl, "partial");
@@ -534,8 +597,7 @@ async function run(options: Options): Promise<JsonObject> {
     try {
       await execute(baseUrl, conditionalWriteStatements(lostOperation, requestDigestFor(lostOperation, "different-owner", "lost"), "different-owner", "lost"));
     } catch (error) {
-      assertCondition(error instanceof HttpFailure, "expected a mismatched operation retry to return an HTTP/statement error");
-      conflictError = error.detail;
+      conflictError = expectedTransactionError(error, "UNIQUE constraint failed: operation_conflict_guard.id", "mismatched operation retry", [null]);
     }
     assertCondition(conflictError !== null, "a mismatched operation retry unexpectedly succeeded");
     const lostAfterConflict = await readOperation(baseUrl, lostOperation);
