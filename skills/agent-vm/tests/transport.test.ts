@@ -65,7 +65,7 @@ test("HTTPS CA configuration is private, certificate verification cannot be disa
   expect(f.commands).toEqual([]);
 });
 
-test("HTTPS timeout and connection failure retain the original operation journal for a safe retry", async () => {
+test("HTTPS timeout retains the original operation journal for a safe retry", async () => {
   const f = fixture(); httpsSidecar(f);
   f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
   f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
@@ -84,6 +84,52 @@ test("HTTPS timeout and connection failure retain the original operation journal
   expect(bodies).toHaveLength(1);
   expect(parseJson(bodies[0])).toMatchObject({ operation_id: "https-operation", generation: 9007199254740993n });
   expect(readJson(operation).outcome).toBe("success");
+});
+
+test("HTTPS connection failure retains the original operation journal", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  f.client.http = async () => { throw new Error("socket refused"); };
+  let error: any;
+  try { await f.client.request("renew", { session: "https-session", generation: 9, operationId: "connection-operation", write: true }); }
+  catch (caught) { error = caught; }
+  expect(error).toMatchObject({ code: "remote_failed", detail: { operation_id: "connection-operation", generation: 9, transport: "https" } });
+  expect(readJson(f.client.operationPath("https-session", "connection-operation")).outcome).toBe("pending");
+});
+
+test("HTTPS response data and errors redact the bearer token before return, journaling or CLI failure", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  f.client.http = async (_url, init) => new Response(json(response(parseJson(String(init.body)), { result: { echoed: "opaque-agent-token" } })), { status: 200 });
+  const returned = await f.client.request("renew", { session: "https-session", generation: 8, operationId: "echo-success", write: true });
+  expect(JSON.stringify(returned)).not.toContain("opaque-agent-token");
+  expect(JSON.stringify(readJson(f.client.operationPath("https-session", "echo-success")))).not.toContain("opaque-agent-token");
+
+  f.client.http = async (_url, init) => {
+    const request = parseJson(String(init.body));
+    return new Response(json({ ok: false, protocol: 4, action: request.action, session_id: request.session_id, generation: request.generation ?? null, operation_id: request.operation_id, error: { code: "remote_failed", message: "server echoed opaque-agent-token", detail: { echoed: "opaque-agent-token" } } }), { status: 502 });
+  };
+  let error: any;
+  try { await f.client.request("renew", { session: "https-session", generation: 10, operationId: "echo-operation", write: true }); }
+  catch (caught) { error = caught; }
+  expect(error.message).not.toContain("opaque-agent-token");
+  expect(JSON.stringify(error.detail)).not.toContain("opaque-agent-token");
+  expect(JSON.stringify(readJson(f.client.operationPath("https-session", "echo-operation")))).not.toContain("opaque-agent-token");
+});
+
+test("HTTPS response overflow reports an uncertain result and preserves the pending operation", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  f.client.http = async () => new Response("x".repeat(STDOUT_LIMIT + 1), { status: 200 });
+  let error: any;
+  try { await f.client.request("renew", { session: "https-session", generation: 11, operationId: "overflow-operation", write: true }); }
+  catch (caught) { error = caught; }
+  expect(error).toMatchObject({ code: "remote_failed", detail: { operation_id: "overflow-operation", generation: 11, transport: "https", stdout_truncated: true } });
+  expect(error.message).toContain("uncertain");
+  expect(readJson(f.client.operationPath("https-session", "overflow-operation")).outcome).toBe("pending");
 });
 
 test("D transport regression: canonical controller directly with Bun, safe quoting and budgets", async () => {
