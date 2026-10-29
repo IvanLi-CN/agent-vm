@@ -151,11 +151,12 @@ describe("TokenManagement pagination", () => {
 
     firstRender.unmount();
     rejectCreate?.(new ManagementRequestError("invalid_request", "validation"));
-    await waitFor(() => expect(firstRender.client.getQueryData(["token-create-recovery"])).toBeNull());
+    await waitFor(() => expect(firstRender.client.getQueryData(["token-create-recovery"])).toMatchObject({ createErrorCode: "invalid_request" }));
 
     renderTokenManagement(firstRender.client);
     expect(await screen.findByRole("button", { name: /创建 Token|create token/i })).toBeEnabled();
     expect(screen.queryByRole("button", { name: /查询操作|check operation/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(/请求未完成|request did not complete/i);
   });
 
   it("syncs deterministic recovery cleanup when the page returns before the response", async () => {
@@ -179,6 +180,7 @@ describe("TokenManagement pagination", () => {
 
     await waitFor(() => expect(screen.queryByRole("button", { name: /查询操作|check operation/i })).not.toBeInTheDocument());
     expect(screen.getByRole("button", { name: /创建 Token|create token/i })).toBeEnabled();
+    expect(screen.getByRole("alert")).toHaveTextContent(/请求未完成|request did not complete/i);
   });
 
   it("keeps successful create recovery after an unmounted response without storing plaintext", async () => {
