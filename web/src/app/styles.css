@@ -325,9 +325,9 @@ svg { flex: none; }
 .demo-inspector-header-actions { display: flex; align-items: flex-start; gap: 6px; flex: none; }
 .demo-layout-button { color: var(--muted); touch-action: none; user-select: none; }
 .demo-layout-button:hover { color: var(--text); }
-.demo-inspector-panel-handle-group { width: calc(100% + 36px); height: 44px !important; flex: 0 0 44px; margin-right: -18px; margin-left: -18px; overflow: visible !important; }
+.demo-inspector-panel-handle-group { width: calc(100% + 36px) !important; height: 44px !important; flex: 0 0 44px; margin-right: -18px; margin-left: -18px; overflow: visible !important; }
 .demo-inspector--floating .demo-inspector-panel-handle-group { margin-bottom: -8px; }
-.demo-inspector--floating .demo-inspector-panel-handle-group [data-slot="resizable-handle"] > div { position: relative; top: -8px; }
+.demo-inspector--floating .demo-inspector-panel-handle-group [data-slot="resizable-handle"] > div { position: relative; top: 0; height: 32px; }
 .demo-inspector-header h2 { margin-top: 2px; font-size: 17px; }
 .demo-safe-banner { display: flex; gap: 9px; padding: 10px; color: var(--positive-ink); background: var(--positive-bg); border: 1px solid var(--positive-border); border-radius: 6px; font-size: 11px; }
 .demo-safe-banner strong, .demo-safe-banner span { display: block; }

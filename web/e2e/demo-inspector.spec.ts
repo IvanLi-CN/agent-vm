@@ -45,8 +45,10 @@ test("supports left, right, floating and minimized inspector positions", async (
   if (!beforeDrag || !dragBox || !gripBox || !headerBox) throw new Error("Floating inspector is not measurable");
   expect(dragBox.width).toBeGreaterThan(beforeDrag.width - 40);
   expect(dragBox.height).toBeGreaterThanOrEqual(44);
-  expect(gripBox.y - beforeDrag.y).toBeGreaterThanOrEqual(8);
-  expect(gripBox.y - beforeDrag.y).toBeLessThanOrEqual(14);
+  expect(gripBox.width).toBeGreaterThanOrEqual(32);
+  expect(Math.abs((gripBox.x + gripBox.width / 2) - (beforeDrag.x + beforeDrag.width / 2))).toBeLessThanOrEqual(1);
+  expect(gripBox.y - beforeDrag.y).toBeGreaterThanOrEqual(20);
+  expect(gripBox.y - beforeDrag.y).toBeLessThanOrEqual(24);
   expect(Math.abs(headerBox.y - (dragBox.y + dragBox.height))).toBeLessThanOrEqual(1);
   await page.mouse.move(dragBox.x + dragBox.width / 2, dragBox.y + dragBox.height / 2);
   await page.mouse.down();

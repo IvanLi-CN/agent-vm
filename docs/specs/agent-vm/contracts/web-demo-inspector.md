@@ -54,7 +54,7 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 
 浮动模式面板顶部必须显示独立的面板级拖动手柄，而不是把标题文字或业务按钮作为隐藏热区。手柄必须使用已登记的 shadcn/ui `ResizableHandle`，通过 `withHandle` 显示官方 grip；它横跨面板主要宽度但不显示“拖动”操作文案，通过 Tooltip 和 accessible name 解释用途，DOM 保留 `role="separator"` 与键盘焦点。手柄具有清晰的 hover/pressed/focus-visible 状态和至少 44×44px 的移动端触控目标。固定左栏、固定右栏和最小化模式不显示该手柄，避免暗示不可用的拖动。
 
-手柄只负责移动面板，不负责打开位置菜单；位置图标仍是单独的控制。浮动面板的 44×44px 热区从面板顶部边缘开始，官方 grip 视觉在热区内保持约 8–12px 的顶部内缩；手柄区域与标题之间不再额外堆叠大段空白。手柄与标题、Select、网络切换和操作按钮之间必须有清晰的 hit-area 边界，避免一次触控同时触发拖动和业务操作。
+手柄只负责移动面板，不负责打开位置菜单；位置图标仍是单独的控制。浮动面板的 44×44px 热区从面板顶部边缘开始，官方 grip 视觉保持 32px 长度并在热区内水平居中、垂直视觉居中；手柄区域与标题之间不再额外堆叠大段空白。手柄与标题、Select、网络切换和操作按钮之间必须有清晰的 hit-area 边界，避免一次触控同时触发拖动和业务操作。
 
 ### 指针与触控
 
@@ -110,7 +110,7 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 
 ## Visual Evidence
 
-- [浮动 Inspector 顶部边缘手柄](../assets/web-demo-inspector-panel-handle.png)：合成 `images` 页面、1280×720 viewport、`floating` 布局；用于确认 44px 热区、8–12px grip 顶部内缩和标题区无额外大留白。
+- [浮动 Inspector 顶部边缘手柄](../assets/web-demo-inspector-panel-handle.png)：合成 `images` 页面、1280×720 viewport、`floating` 布局；用于确认 44px 热区、32px 水平居中 grip 和标题区无额外大留白。
 
 ## 非目标
 
