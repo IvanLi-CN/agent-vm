@@ -686,9 +686,13 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
             _write_activation_fence(path, transaction_id, release_id)
 
     completed = False
+    failure: BaseException | None = None
     try:
         yield refresh
         completed = True
+    except BaseException as error:
+        failure = error
+        raise
     finally:
         for path, key, created, outermost in reversed(entries):
             final_depth = _ACTIVATION_FENCE_DEPTH.get(key, 0)
@@ -698,6 +702,8 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
                 _ACTIVATION_FENCE_DEPTH[key] -= 1
                 continue
             if not created and (not outermost or not completed):
+                continue
+            if created and failure is not None and not isinstance(failure, WrapperError):
                 continue
             try:
                 _clear_activation_fence(path, transaction_id, release_id)
@@ -2809,6 +2815,7 @@ def status(config: Mapping[str, Any]) -> dict[str, Any]:
         "current_release_id": current.name if current else None,
         "previous_release_id": previous.name if previous else None,
         "release_root": str(config["release_root"]),
+        "supports_release_session_id": True,
     }
 
 

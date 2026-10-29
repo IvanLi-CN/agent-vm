@@ -836,6 +836,17 @@ class ReleasePublisher:
         )
         return _result(response)
 
+    def _verify_wrapper_session_capability(self, transaction_id: str, release_id: str) -> None:
+        """Refuse a custom owner before drain when an old wrapper is installed."""
+        if self.session_id is None:
+            return
+        status = self._wrapper("status", transaction_id, release_id)
+        if status.get("supports_release_session_id") is not True:
+            _fail(
+                "wrapper_capability_missing",
+                "remote release wrapper does not support explicit release session IDs",
+            )
+
     @staticmethod
     def _healthy(
         metrics: Mapping[str, Any],
@@ -1064,6 +1075,8 @@ class ReleasePublisher:
             temporary.cleanup()
         transaction = transaction_id or ("tx-" + uuid.uuid4().hex)
         session = self.session_id or ("release-" + transaction)
+        wrapper_session = self.session_id
+        self._verify_wrapper_session_capability(transaction, manifest["release_id"])
         staged = self._wrapper("stage", transaction, manifest["release_id"], payload)
         if staged.get("staged") is not True:
             _fail("stage_unverified", "remote wrapper did not confirm staging")
@@ -1074,7 +1087,7 @@ class ReleasePublisher:
         if drain.get("draining") is not True:
             _fail("drain_unverified", "control did not confirm admission drain")
         self._wait_for_convergence(manifest, timeout, poll)
-        activation = self._wrapper("activate", transaction, manifest["release_id"], session_id=session)
+        activation = self._wrapper("activate", transaction, manifest["release_id"], session_id=wrapper_session)
         if activation.get("activated") is not True:
             _fail("activation_unverified", "remote wrapper did not confirm activation")
         try:
@@ -1082,7 +1095,7 @@ class ReleasePublisher:
         except ReleaseError as health_error:
             rollback_manifest = legacy_manifest()
             try:
-                rollback_result = self._wrapper("rollback", transaction, manifest["release_id"], session_id=session)
+                rollback_result = self._wrapper("rollback", transaction, manifest["release_id"], session_id=wrapper_session)
                 self._verify_automatic_rollback(transaction, manifest["release_id"], rollback_result)
                 # The wrapper has switched the control files back to the
                 # retained previous release.  Validate that peer through the
@@ -1131,8 +1144,10 @@ class ReleasePublisher:
         if manifest["release_id"] == release_id:
             _fail("rollback_release_mismatch", "rollback bundle must identify the previous release, not the active release")
         session = self.session_id or ("release-" + transaction_id)
+        wrapper_session = self.session_id
+        self._verify_wrapper_session_capability(transaction_id, release_id)
         self._control(manifest, "drain-enter", session=session, write=True)
-        result = self._wrapper("rollback", transaction_id, release_id, session_id=session)
+        result = self._wrapper("rollback", transaction_id, release_id, session_id=wrapper_session)
         if result.get("release_id") != manifest["release_id"]:
             _fail(
                 "rollback_release_mismatch",

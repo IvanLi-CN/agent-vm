@@ -447,6 +447,19 @@ class WrapperTests(unittest.TestCase):
             WRAPPER._clear_activation_fence(primary, "tx-preserve-fence", "a" * 40)
             WRAPPER._clear_activation_fence(persistent, "tx-preserve-fence", "a" * 40)
 
+    def test_activation_fence_preserves_a_new_fence_on_process_interrupt(self):
+        primary = self.loaded["fence_path"]
+        persistent = primary.with_name("." + primary.name + ".persistent")
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                with WRAPPER._activation_fence(self.loaded, "tx-interrupt-fence", "a" * 40):
+                    raise KeyboardInterrupt()
+            self.assertTrue(primary.exists())
+            self.assertTrue(persistent.exists())
+        finally:
+            WRAPPER._clear_activation_fence(primary, "tx-interrupt-fence", "a" * 40)
+            WRAPPER._clear_activation_fence(persistent, "tx-interrupt-fence", "a" * 40)
+
     def test_activation_fence_cleans_created_file_when_directory_fsync_fails(self):
         primary = self.loaded["fence_path"]
         persistent = primary.with_name("." + primary.name + ".persistent")
