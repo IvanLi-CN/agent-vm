@@ -21,9 +21,8 @@ function token(tokenId: string): AgentToken {
   return { token_id: tokenId, resource_version: `token:${tokenId}:revision-1`, scopes: ["agent:read"], created_at: "2027-01-01T00:00:00.000Z", expires_at: "2027-01-15T00:00:00.000Z", revoked_at: null };
 }
 
-function renderTokenManagement() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<QueryClientProvider client={client}><TokenManagement /></QueryClientProvider>);
+function renderTokenManagement(client = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
+  return { client, ...render(<QueryClientProvider client={client}><TokenManagement /></QueryClientProvider>) };
 }
 
 describe("TokenManagement pagination", () => {
@@ -60,7 +59,7 @@ describe("TokenManagement pagination", () => {
   it("blocks replacement after an unresolved operation lookup", async () => {
     const user = userEvent.setup();
     listTokensMock.mockReset().mockResolvedValue({ items: [], page: { limit: 25, next_cursor: null } });
-    createAgentTokenMock.mockReset().mockRejectedValueOnce(new ManagementRequestError("authority_unavailable", "reconciliation", null, null, true));
+    createAgentTokenMock.mockReset().mockRejectedValueOnce(new ManagementRequestError("internal_error", "internal"));
     getOperationMock.mockReset().mockRejectedValueOnce(new ManagementRequestError("not_found", "reconciliation"));
 
     renderTokenManagement();
@@ -93,5 +92,54 @@ describe("TokenManagement pagination", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(/请求未完成|request did not complete/i);
     expect(screen.queryByRole("button", { name: /查询操作|check operation/i })).not.toBeInTheDocument();
     expect(createButton).toBeEnabled();
+  });
+
+  it("keeps unresolved create recovery across a page unmount", async () => {
+    const user = userEvent.setup();
+    listTokensMock.mockReset().mockResolvedValue({ items: [], page: { limit: 25, next_cursor: null } });
+    createAgentTokenMock.mockReset().mockRejectedValueOnce(new ManagementRequestError("internal_error", "internal"));
+
+    const firstRender = renderTokenManagement();
+    await screen.findByTestId("token-management");
+    (document.querySelector("form") as HTMLFormElement).noValidate = true;
+    const createButton = screen.getByRole("button", { name: /创建 Token|create token/i });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    await user.click(createButton);
+    expect(await screen.findByRole("button", { name: /查询操作|check operation/i })).toBeInTheDocument();
+
+    firstRender.unmount();
+    renderTokenManagement(firstRender.client);
+    expect(await screen.findByRole("button", { name: /查询操作|check operation/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /创建 Token|create token/i })).toBeDisabled();
+  });
+
+  it("allows revocation of an expired but not revoked token", async () => {
+    const expired = { ...token("tok_expired_01"), expires_at: "2026-01-15T00:00:00.000Z" };
+    listTokensMock.mockReset().mockResolvedValue({ items: [expired], page: { limit: 25, next_cursor: null } });
+
+    renderTokenManagement();
+    await waitFor(() => expect(screen.getByRole("button", { name: /撤销|revoke/i })).toBeEnabled());
+  });
+
+  it("releases recovery when the token list confirms an external revocation", async () => {
+    const user = userEvent.setup();
+    const recovered = token("tok_recovered_01");
+    const revoked = { ...recovered, revoked_at: "2026-10-29T09:00:00.000Z" };
+    let listCalls = 0;
+    listTokensMock.mockReset().mockImplementation(() => Promise.resolve({ items: listCalls++ === 0 ? [] : [revoked], page: { limit: 25, next_cursor: null } }));
+    createAgentTokenMock.mockReset().mockRejectedValueOnce(new ManagementRequestError("internal_error", "internal"));
+    getOperationMock.mockReset().mockResolvedValueOnce({ operation_id: "operation-recovered-01", action: "token_create", status: "succeeded", phase: "completed", target: { kind: "token", id: recovered.token_id }, actor: { issuer: "issuer.example.invalid", subject: "admin-maintainer", role: "administrator" }, reason: null, created_at: "2026-10-29T09:00:00.000Z", updated_at: "2026-10-29T09:00:00.000Z", result: { token_metadata: recovered, plaintext_disclosure: "returned" }, error: null });
+
+    renderTokenManagement();
+    await screen.findByTestId("token-management");
+    (document.querySelector("form") as HTMLFormElement).noValidate = true;
+    const createButton = screen.getByRole("button", { name: /创建 Token|create token/i });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    await user.click(createButton);
+    const checkButton = await screen.findByRole("button", { name: /查询操作|check operation/i });
+    await user.click(checkButton);
+
+    await waitFor(() => expect(createButton).toBeEnabled());
+    expect(screen.queryByRole("button", { name: /查询操作|check operation/i })).not.toBeInTheDocument();
   });
 });

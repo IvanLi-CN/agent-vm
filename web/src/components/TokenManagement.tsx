@@ -17,6 +17,31 @@ const scopeOptions: Array<{ scope: TokenScope; label: string }> = [
 
 type CreateRequest = { scopes: TokenScope[]; expiresAt: string; auditReason: string; operationId: string };
 type CreateRecoveryDecision = "check" | "retry_same" | "new_intent" | "blocked";
+type CreateRecoverySnapshot = {
+  createRequest: CreateRequest | null;
+  createOperationIdValue: string | null;
+  createRecoveryOperationId: string | null;
+  createRecoveryStatus: Operation | null;
+  createRecoveryTokenId: string | null;
+  createRecoveryDecision: CreateRecoveryDecision | null;
+  createRecoveryError: string | null;
+};
+
+const createRecoveryQueryKey = ["token-create-recovery"] as const;
+const definitiveCreateFailureCodes = new Set([
+  "authentication_required",
+  "administrator_required",
+  "permission_denied",
+  "csrf_invalid",
+  "origin_invalid",
+  "invalid_request",
+  "invalid_state",
+  "unsupported_action",
+  "not_found",
+  "stale_target",
+  "operation_conflict",
+  "precondition_required",
+]);
 
 function defaultExpiry(): string {
   const value = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
@@ -49,25 +74,26 @@ function errorMessage(error: unknown, t: (key: string, options?: { defaultValue?
 }
 
 function createOutcomeIsUncertain(error: unknown): boolean {
-  return !(error instanceof ManagementRequestError) || error.retryable;
+  return !(error instanceof ManagementRequestError) || error.retryable || !definitiveCreateFailureCodes.has(error.code);
 }
 
 export function TokenManagement() {
   const { t, i18n } = useTranslation();
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const client = useQueryClient();
+  const persistedCreateRecovery = client.getQueryData<CreateRecoverySnapshot>(createRecoveryQueryKey);
   const [scopes, setScopes] = useState<TokenScope[]>(["agent:read"]);
   const [expiresAt, setExpiresAt] = useState(defaultExpiry);
   const [reason, setReason] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
-  const [createRequest, setCreateRequest] = useState<CreateRequest | null>(null);
-  const [createOperationIdValue, setCreateOperationIdValue] = useState<string | null>(null);
-  const [createRecoveryOperationId, setCreateRecoveryOperationId] = useState<string | null>(null);
-  const [createRecoveryStatus, setCreateRecoveryStatus] = useState<Operation | null>(null);
-  const [createRecoveryTokenId, setCreateRecoveryTokenId] = useState<string | null>(null);
-  const [createRecoveryDecision, setCreateRecoveryDecision] = useState<CreateRecoveryDecision | null>(null);
+  const [createRequest, setCreateRequest] = useState<CreateRequest | null>(() => persistedCreateRecovery?.createRequest ?? null);
+  const [createOperationIdValue, setCreateOperationIdValue] = useState<string | null>(() => persistedCreateRecovery?.createOperationIdValue ?? null);
+  const [createRecoveryOperationId, setCreateRecoveryOperationId] = useState<string | null>(() => persistedCreateRecovery?.createRecoveryOperationId ?? null);
+  const [createRecoveryStatus, setCreateRecoveryStatus] = useState<Operation | null>(() => persistedCreateRecovery?.createRecoveryStatus ?? null);
+  const [createRecoveryTokenId, setCreateRecoveryTokenId] = useState<string | null>(() => persistedCreateRecovery?.createRecoveryTokenId ?? null);
+  const [createRecoveryDecision, setCreateRecoveryDecision] = useState<CreateRecoveryDecision | null>(() => persistedCreateRecovery?.createRecoveryDecision ?? null);
   const [createRecoveryPending, setCreateRecoveryPending] = useState(false);
-  const [createRecoveryError, setCreateRecoveryError] = useState<string | null>(null);
+  const [createRecoveryError, setCreateRecoveryError] = useState<string | null>(() => persistedCreateRecovery?.createRecoveryError ?? null);
   const [plaintextToken, setPlaintextToken] = useState<string | null>(null);
   const [plaintextMetadata, setPlaintextMetadata] = useState<AgentToken | null>(null);
   const [plaintextConsumed, setPlaintextConsumed] = useState(false);
@@ -91,6 +117,27 @@ export function TokenManagement() {
   };
 
   useEffect(() => { refreshSessionAfterAuthFailure(tokensQuery.error); }, [tokensQuery.error]);
+  useEffect(() => {
+    const snapshot: CreateRecoverySnapshot = { createRequest, createOperationIdValue, createRecoveryOperationId, createRecoveryStatus, createRecoveryTokenId, createRecoveryDecision, createRecoveryError };
+    if (snapshot.createRequest || snapshot.createOperationIdValue || snapshot.createRecoveryOperationId || snapshot.createRecoveryStatus || snapshot.createRecoveryTokenId || snapshot.createRecoveryDecision || snapshot.createRecoveryError) client.setQueryData(createRecoveryQueryKey, snapshot);
+    else client.removeQueries({ queryKey: createRecoveryQueryKey, exact: true });
+  }, [client, createRequest, createOperationIdValue, createRecoveryOperationId, createRecoveryStatus, createRecoveryTokenId, createRecoveryDecision, createRecoveryError]);
+
+  const clearCreateRecovery = () => {
+    setCreateRequest(null);
+    setCreateOperationIdValue(null);
+    setCreateRecoveryOperationId(null);
+    setCreateRecoveryStatus(null);
+    setCreateRecoveryTokenId(null);
+    setCreateRecoveryDecision(null);
+    setCreateRecoveryError(null);
+  };
+
+  useEffect(() => {
+    if (!createRecoveryTokenId) return;
+    const recoveredToken = tokensQuery.data?.items.find((token) => token.token_id === createRecoveryTokenId);
+    if (recoveredToken?.revoked_at) clearCreateRecovery();
+  }, [createRecoveryTokenId, tokensQuery.data]);
 
   const createMutation = useMutation({
     mutationFn: (request: CreateRequest) => createAgentToken(request.scopes, request.expiresAt, request.auditReason, request.operationId),
@@ -98,14 +145,8 @@ export function TokenManagement() {
       const mutation = client.getMutationCache().getAll().find((candidate) => candidate.state.variables === request);
       if (mutation) client.getMutationCache().remove(mutation);
       setCreateError(null);
-      setCreateRequest(null);
+      clearCreateRecovery();
       setReason("");
-      setCreateOperationIdValue(null);
-      setCreateRecoveryOperationId(null);
-      setCreateRecoveryStatus(null);
-      setCreateRecoveryTokenId(null);
-      setCreateRecoveryDecision(null);
-      setCreateRecoveryError(null);
       setTokenCursor(undefined);
       setTokenCursorStack([]);
       setPlaintextMetadata(result.metadata);
@@ -124,13 +165,7 @@ export function TokenManagement() {
       refreshSessionAfterAuthFailure(error);
       setCreateError(errorMessage(error, t));
       if (!createOutcomeIsUncertain(error)) {
-        setCreateRequest(null);
-        setCreateOperationIdValue(null);
-        setCreateRecoveryOperationId(null);
-        setCreateRecoveryStatus(null);
-        setCreateRecoveryTokenId(null);
-        setCreateRecoveryDecision(null);
-        setCreateRecoveryError(null);
+        clearCreateRecovery();
         return;
       }
       setCreateRequest(request);
@@ -150,11 +185,7 @@ export function TokenManagement() {
     mutationFn: ({ tokenId, preview, auditReason, operationId }: { tokenId: string; preview: TokenRevokePreview; auditReason: string; operationId: string }) => submitTokenRevocation(tokenId, auditReason, preview, operationId),
     onSuccess: () => {
       if (createRecoveryTokenId && revokeToken?.token_id === createRecoveryTokenId) {
-        setCreateRequest(null);
-        setCreateRecoveryOperationId(null);
-        setCreateRecoveryStatus(null);
-        setCreateRecoveryTokenId(null);
-        setCreateRecoveryDecision(null);
+        clearCreateRecovery();
       }
       revokeInFlightRef.current = false;
       setRevokeToken(null);
@@ -237,8 +268,12 @@ export function TokenManagement() {
         setCreateError(null);
         setCreateRequest(null);
         setCreateOperationIdValue(null);
-        setCreateRecoveryTokenId(operation.result.token_metadata.token_id);
-        setCreateRecoveryDecision("blocked");
+        if (operation.result.token_metadata.revoked_at) {
+          clearCreateRecovery();
+        } else {
+          setCreateRecoveryTokenId(operation.result.token_metadata.token_id);
+          setCreateRecoveryDecision("blocked");
+        }
         setTokenCursor(undefined);
         setTokenCursorStack([]);
         void client.invalidateQueries({ queryKey: ["tokens"] });
@@ -364,7 +399,7 @@ function TokenRow({ token, locale, revokeDisabled, onRevoke }: { token: AgentTok
   return <article className="token-row" role="listitem">
     <div className="token-row-main"><div className="token-row-title"><strong className="mono" title={token.token_id}>{token.token_id}</strong><CopyButton value={token.token_id} /><Badge tone={state === "active" ? "success" : state === "expired" ? "warning" : "danger"}>{t(`tokens.${state}`)}</Badge></div><div className="token-scopes">{token.scopes.map((scope) => <span className="scope-tag" key={scope}>{scope}</span>)}</div></div>
     <dl className="token-row-meta"><div><dt>{t("tokens.created")}</dt><dd>{formatDateTime(token.created_at, locale)}</dd></div><div><dt>{token.revoked_at ? t("tokens.revokedAt") : t("tokens.expires")}</dt><dd>{formatDateTime(token.revoked_at ?? token.expires_at, locale)}</dd></div></dl>
-    <Button variant="danger" disabled={state !== "active" || revokeDisabled} onClick={(event) => onRevoke(event.currentTarget)} icon={<ShieldCheck />}>{t("tokens.revoke")}</Button>
+    <Button variant="danger" disabled={state === "revoked" || revokeDisabled} onClick={(event) => onRevoke(event.currentTarget)} icon={<ShieldCheck />}>{t("tokens.revoke")}</Button>
   </article>;
 }
 
