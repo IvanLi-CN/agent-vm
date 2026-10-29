@@ -1,10 +1,9 @@
 import { mockState } from "./mockData";
-import type { ActionPreview, AuditEvent, ImageImportRequest, ManagedImage, ManagedVM, Operation, Overview, SystemStatus } from "./types";
+import type { ActionPreview, AgentToken, AuditEvent, ImageImportRequest, ManagedImage, ManagedVM, ManagementSession, Operation, Overview, SystemStatus, TokenCreateResult, TokenPage, TokenRevokePreview, TokenScope } from "./types";
 
 const useRealApi = import.meta.env.VITE_MANAGEMENT_API === "real";
 
 type RealRequestOptions = { contentType?: string | null };
-type ManagementSession = { csrf_token: string; expires_at?: string };
 
 export class ManagementRequestError extends Error {
   readonly code: string;
@@ -86,6 +85,11 @@ function delay<T>(value: T): Promise<T> {
   return new Promise((resolve) => window.setTimeout(() => resolve(value), 120));
 }
 
+export async function getManagementSession(): Promise<ManagementSession> {
+  if (useRealApi) return realRequest<ManagementSession>("/session");
+  return delay(mockState.session);
+}
+
 export async function getOverview(): Promise<Overview> {
   return useRealApi ? realRequest<Overview>("/overview") : delay(mockState.overview);
 }
@@ -115,6 +119,40 @@ export async function listImages(query = "", cursor?: string): Promise<{ items: 
   return delay({ items, page: { limit: 25, next_cursor: null }, default_fingerprint: mockState.images.find((image) => image.is_default)?.fingerprint ?? null, selection_version: "image-selection:revision-12", catalog_version: "image-catalog:revision-12" });
 }
 
+export async function listTokens(cursor?: string): Promise<TokenPage> {
+  if (useRealApi) return realRequest<TokenPage>(`/tokens?limit=25${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+  return delay({ items: mockState.tokens, page: { limit: 25, next_cursor: null } });
+}
+
+export async function createAgentToken(scopes: TokenScope[], expiresAt: string, reason?: string, operationId = createOperationId()): Promise<TokenCreateResult> {
+  const body = { operation_id: operationId, scopes, expires_at: expiresAt, ...(reason?.trim() ? { reason: reason.trim() } : {}) };
+  if (useRealApi) return realRequest<TokenCreateResult>("/tokens", { method: "POST", body: JSON.stringify(body) });
+  const tokenId = `tok_${createOperationId().replaceAll("-", "").slice(0, 24)}`;
+  const metadata: AgentToken = { token_id: tokenId, resource_version: `token:${tokenId}:revision-1`, scopes, created_at: new Date().toISOString(), expires_at: expiresAt, revoked_at: null };
+  mockState.tokens.unshift(metadata);
+  const plaintext = `${createOperationId().replaceAll("-", "")}${createOperationId().replaceAll("-", "")}`;
+  const operation = createMockOperation("token_create", { kind: "token", id: tokenId }, reason?.trim() || null, "succeeded", operationId);
+  operation.result = { token_metadata: metadata, plaintext_disclosure: "returned" };
+  return delay({ operation_id: operationId, token: plaintext, metadata, plaintext_disclosure: "returned" });
+}
+
+export async function previewTokenRevocation(tokenId: string, targetVersion: string): Promise<TokenRevokePreview> {
+  if (useRealApi) return realRequest<TokenRevokePreview>(`/tokens/${encodeURIComponent(tokenId)}/revoke/preview`, { method: "POST", body: JSON.stringify({ target_version: targetVersion }) });
+  const token = mockState.tokens.find((candidate) => candidate.token_id === tokenId) ?? mockState.tokens[0];
+  return delay({ token_id: token.token_id, target_version: token.resource_version, confirmation_token: `synthetic-confirmation-${createOperationId()}`, expires_at: "2027-01-15T10:25:00Z", metadata: token });
+}
+
+export async function submitTokenRevocation(tokenId: string, reason: string, preview: TokenRevokePreview, operationId = createOperationId()): Promise<Operation> {
+  const body = { operation_id: operationId, target_version: preview.target_version, confirmation_token: preview.confirmation_token, ...(reason.trim() ? { reason: reason.trim() } : {}) };
+  if (useRealApi) return realRequest<Operation>(`/tokens/${encodeURIComponent(tokenId)}/revoke`, { method: "POST", body: JSON.stringify(body) });
+  const token = mockState.tokens.find((candidate) => candidate.token_id === tokenId);
+  if (token && !token.revoked_at) {
+    token.revoked_at = new Date().toISOString();
+    token.resource_version = `${token.resource_version}:revoked`;
+  }
+  return delay(createMockOperation("token_revoke", { kind: "token", id: tokenId }, reason.trim() || null, "succeeded", operationId));
+}
+
 export async function listOperations(status = "all", cursor?: string): Promise<{ items: Operation[]; page: { limit: number; next_cursor: string | null } }> {
   if (useRealApi) return realRequest(`/operations?limit=25${status !== "all" ? `&status=${status}` : ""}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
   return delay({ items: mockState.operations.filter((operation) => status === "all" || operation.status === status), page: { limit: 25, next_cursor: null } });
@@ -138,17 +176,17 @@ export async function previewVMAction(taskId: string, action: string, current?: 
 }
 
 export async function submitVMAction(taskId: string, action: string, reason: string, preview: ActionPreview, expectedGeneration: string, parameters: Record<string, unknown> = {}, operationId = createOperationId()): Promise<Operation> {
-  if (useRealApi) return realRequest(`/vms/${encodeURIComponent(taskId)}/actions`, { method: "POST", body: JSON.stringify({ operation_id: operationId, reason, target_version: preview.target_version, action, expected_generation: expectedGeneration, parameters, confirmation_token: preview.confirmation_token }) });
-  return createMockOperation(action as Operation["action"], { kind: "vm", id: taskId }, reason);
+  if (useRealApi) return realRequest(`/vms/${encodeURIComponent(taskId)}/actions`, { method: "POST", body: JSON.stringify({ operation_id: operationId, ...(reason.trim() ? { reason: reason.trim() } : {}), target_version: preview.target_version, action, expected_generation: expectedGeneration, parameters, confirmation_token: preview.confirmation_token }) });
+  return createMockOperation(action as Operation["action"], { kind: "vm", id: taskId }, reason, "queued", operationId);
 }
 
 export async function startImageImport(request: ImageImportRequest): Promise<Operation> {
   if (useRealApi) return realRequest("/images/imports", { method: "POST", body: JSON.stringify(request) });
-  return createMockOperation("image_import", { kind: "image_catalog", id: "image-catalog" }, request.reason, request.source.kind === "local_upload" ? "awaiting_upload" : "running");
+  return createMockOperation("image_import", { kind: "image_catalog", id: "image-catalog" }, request.reason, request.source.kind === "local_upload" ? "awaiting_upload" : "running", request.operation_id);
 }
 
 export async function uploadImageImportContent(operationId: string, content: File | { metadata: File; rootfs: File }): Promise<Operation> {
-  if (!useRealApi) return createMockOperation("image_import", { kind: "image_catalog", id: "image-catalog" }, "upload image content", "running");
+  if (!useRealApi) return createMockOperation("image_import", { kind: "image_catalog", id: "image-catalog" }, "upload image content", "running", operationId);
   if ("metadata" in content) {
     const form = new FormData();
     form.append("metadata", content.metadata, content.metadata.name);
@@ -173,11 +211,11 @@ export async function submitImageAction(fingerprint: string, action: "default" |
   if (useRealApi) {
     const path = action === "default" ? "/images/default" : `/images/${fingerprint}/${action === "delete" ? "delete" : "retire"}`;
     const body = action === "default"
-      ? { operation_id: operationId, reason, target_version: preview.target_version, fingerprint, confirmation_token: preview.confirmation_token }
-      : { operation_id: operationId, reason, target_version: preview.target_version, confirmation_token: preview.confirmation_token };
+      ? { operation_id: operationId, ...(reason.trim() ? { reason: reason.trim() } : {}), target_version: preview.target_version, fingerprint, confirmation_token: preview.confirmation_token }
+      : { operation_id: operationId, ...(reason.trim() ? { reason: reason.trim() } : {}), target_version: preview.target_version, confirmation_token: preview.confirmation_token };
     return realRequest(path, { method: "POST", body: JSON.stringify(body) });
   }
-  return createMockOperation(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", { kind: "image", id: fingerprint }, reason);
+  return createMockOperation(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", { kind: "image", id: fingerprint }, reason, "succeeded", operationId);
 }
 
 export async function previewMaintenance(action: "drain_enter" | "reconcile" | "gc", currentResourceVersion?: string): Promise<ActionPreview> {
@@ -189,12 +227,12 @@ export async function previewMaintenance(action: "drain_enter" | "reconcile" | "
 }
 
 export async function submitMaintenance(action: "drain_enter" | "reconcile" | "gc", reason: string, preview: ActionPreview, operationId = createOperationId()): Promise<Operation> {
-  if (useRealApi) return realRequest("/system/maintenance", { method: "POST", body: JSON.stringify({ operation_id: operationId, reason, target_version: preview.target_version, action, confirmation_token: preview.confirmation_token, parameters: { apply: true } }) });
-  return createMockOperation(action, { kind: "system", id: "system" }, reason);
+  if (useRealApi) return realRequest("/system/maintenance", { method: "POST", body: JSON.stringify({ operation_id: operationId, ...(reason.trim() ? { reason: reason.trim() } : {}), target_version: preview.target_version, action, confirmation_token: preview.confirmation_token, parameters: { apply: true } }) });
+  return createMockOperation(action, { kind: "system", id: "system" }, reason, "succeeded", operationId);
 }
 
-function createMockOperation(action: Operation["action"], target: Operation["target"], reason: string, status: Operation["status"] = "queued"): Operation {
-  const operation: Operation = { operation_id: createOperationId(), action, status, phase: status === "awaiting_upload" ? "awaiting_upload" : status === "running" ? "suitability_check" : "queued", target, actor: "admin@example.invalid", reason, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), result: null, error: null };
+function createMockOperation(action: Operation["action"], target: Operation["target"], reason: string | null | undefined, status: Operation["status"] = "queued", operationId = createOperationId()): Operation {
+  const operation: Operation = { operation_id: operationId, action, status, phase: status === "awaiting_upload" ? "awaiting_upload" : status === "running" ? "suitability_check" : status === "succeeded" ? "completed" : "queued", target, actor: { issuer: mockState.session.issuer, subject: mockState.session.subject, role: "administrator" }, reason: reason?.trim() || null, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), result: null, error: null };
   mockState.operations.unshift(operation);
   return operation;
 }

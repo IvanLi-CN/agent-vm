@@ -79,24 +79,24 @@ export function ImagesPage() {
       return;
     }
     const targetVersion = query.data?.catalog_version;
-    if (!reason.trim()) { setImportMessage(t("dialog.reasonRequired")); return; }
     if (!targetVersion) { setImportMessage(t("images.targetUnavailable")); return; }
     const operation_id = createOperationId();
+    const optionalReason = reason.trim() ? { reason: reason.trim() } : {};
     if (sourceKind === "trusted_remote") {
-      const request: ImageImportRequest = { operation_id, reason: reason.trim(), target_version: targetVersion, version_label: versionLabel, source: { kind: "trusted_remote", source_id: sourceId, expected_fingerprint: expectedFingerprint } };
+      const request: ImageImportRequest = { operation_id, ...optionalReason, target_version: targetVersion, version_label: versionLabel, source: { kind: "trusted_remote", source_id: sourceId, expected_fingerprint: expectedFingerprint } };
       submitImport({ request });
       return;
     }
     if (format === "unified") {
       if (!uploadFile) { setImportMessage(t("images.fileRequired")); return; }
       if (!expectedSha.trim()) { setImportMessage(t("images.expectedShaRequired")); return; }
-      const request: ImageImportRequest = { operation_id, reason: reason.trim(), target_version: targetVersion, version_label: versionLabel, source: { kind: "local_upload", format: "unified", expected_sha256: expectedSha.trim(), expected_size_bytes: String(uploadFile.size) } };
+      const request: ImageImportRequest = { operation_id, ...optionalReason, target_version: targetVersion, version_label: versionLabel, source: { kind: "local_upload", format: "unified", expected_sha256: expectedSha.trim(), expected_size_bytes: String(uploadFile.size) } };
       submitImport({ request, content: uploadFile });
       return;
     }
     if (!metadataFile || !rootfsFile) { setImportMessage(t("images.fileRequired")); return; }
     if (!expectedMetadataSha.trim() || !expectedRootfsSha.trim()) { setImportMessage(t("images.expectedShaRequired")); return; }
-    const request: ImageImportRequest = { operation_id, reason: reason.trim(), target_version: targetVersion, version_label: versionLabel, source: { kind: "local_upload", format: "split", metadata: { expected_sha256: expectedMetadataSha.trim(), expected_size_bytes: String(metadataFile.size) }, rootfs: { expected_sha256: expectedRootfsSha.trim(), expected_size_bytes: String(rootfsFile.size) } } };
+    const request: ImageImportRequest = { operation_id, ...optionalReason, target_version: targetVersion, version_label: versionLabel, source: { kind: "local_upload", format: "split", metadata: { expected_sha256: expectedMetadataSha.trim(), expected_size_bytes: String(metadataFile.size) }, rootfs: { expected_sha256: expectedRootfsSha.trim(), expected_size_bytes: String(rootfsFile.size) } } };
     submitImport({ request, content: { metadata: metadataFile, rootfs: rootfsFile } });
   };
 

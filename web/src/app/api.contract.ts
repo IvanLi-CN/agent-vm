@@ -49,4 +49,34 @@ describe("real management API client", () => {
     expect(new Headers(init.headers).get("Content-Type")).toBe("application/octet-stream");
     expect(init.body).toBe(file);
   });
+
+  it("omits an optional reason when creating a Token", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ csrf_token: "csrf-token", expires_at: "2027-01-15T11:20:30Z" }))
+      .mockResolvedValueOnce(response({ operation_id: "op-token-create", token: "bearer-value", metadata: { token_id: "tok-1", resource_version: "token:tok-1:1", scopes: ["agent:read"], created_at: "2026-10-29T00:00:00Z", expires_at: "2027-01-15T00:00:00Z", revoked_at: null }, plaintext_disclosure: "returned" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { createAgentToken } = await import("./api");
+
+    await createAgentToken(["agent:read"], "2027-01-15T00:00:00.000Z", "   ", "op-token-create");
+
+    const request = fetchMock.mock.calls[1]?.[1] as RequestInit;
+    expect(JSON.parse(String(request.body))).toEqual({ operation_id: "op-token-create", scopes: ["agent:read"], expires_at: "2027-01-15T00:00:00.000Z" });
+  });
+
+  it("keeps Token revocation preview and confirmation separate", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(response({ csrf_token: "csrf-token", expires_at: "2027-01-15T11:20:30Z" }))
+      .mockResolvedValueOnce(response({ token_id: "tok-1", target_version: "token:tok-1:1", confirmation_token: "confirm-token", expires_at: "2026-10-29T00:05:00Z", metadata: { token_id: "tok-1", resource_version: "token:tok-1:1", scopes: ["agent:read"], created_at: "2026-10-29T00:00:00Z", expires_at: "2027-01-15T00:00:00Z", revoked_at: null } }))
+      .mockResolvedValueOnce(response({ operation_id: "op-token-revoke", status: "queued" }));
+    vi.stubGlobal("fetch", fetchMock);
+    const { previewTokenRevocation, submitTokenRevocation } = await import("./api");
+
+    const preview = await previewTokenRevocation("tok-1", "token:tok-1:1");
+    await submitTokenRevocation("tok-1", "   ", preview, "op-token-revoke");
+
+    const previewRequest = fetchMock.mock.calls[1]?.[1] as RequestInit;
+    expect(JSON.parse(String(previewRequest.body))).toEqual({ target_version: "token:tok-1:1" });
+    const revokeRequest = fetchMock.mock.calls[2]?.[1] as RequestInit;
+    expect(JSON.parse(String(revokeRequest.body))).toEqual({ operation_id: "op-token-revoke", target_version: "token:tok-1:1", confirmation_token: "confirm-token" });
+  });
 });

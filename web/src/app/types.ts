@@ -1,6 +1,55 @@
 export type Locale = "zh-CN" | "en";
 export type PageKey = "overview" | "vms" | "images" | "operations" | "system";
 
+export type ManagementCapability = "read" | "operate" | "manage_images" | "maintain_system" | "manage_tokens" | "observe_admin";
+export type TokenScope = "agent:read" | "agent:operate" | "agent:sync" | "agent:observe_admin";
+
+export interface ManagementSession {
+  issuer: string;
+  subject: string;
+  role: "administrator";
+  capabilities: ManagementCapability[];
+  csrf_token: string;
+  expires_at: string;
+}
+
+export interface AgentToken {
+  token_id: string;
+  resource_version: string;
+  scopes: TokenScope[];
+  created_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+}
+
+export interface TokenPage {
+  items: AgentToken[];
+  page: { limit: number; next_cursor: string | null };
+}
+
+export interface TokenCreateResponse {
+  operation_id: string;
+  token: string;
+  metadata: AgentToken;
+  plaintext_disclosure: "returned";
+}
+
+export interface TokenCreateReplayResponse {
+  operation_id: string;
+  metadata: AgentToken;
+  plaintext_disclosure: "consumed";
+}
+
+export type TokenCreateResult = TokenCreateResponse | TokenCreateReplayResponse;
+
+export interface TokenRevokePreview {
+  token_id: string;
+  target_version: string;
+  confirmation_token: string;
+  expires_at: string;
+  metadata: AgentToken;
+}
+
 export type ObservationState = "available" | "stale" | "missing" | "failed" | "unverified";
 export type VMState = "preparing" | "active" | "cached" | "closing" | "deleting" | "failed" | "absent";
 export type LeaseState = "effective" | "expired" | "absent" | "unknown";
@@ -100,7 +149,7 @@ export interface ManagedImage {
 
 export type OperationStatus = "awaiting_upload" | "queued" | "running" | "reconciling" | "succeeded" | "failed" | "outcome_unknown";
 export type OperationPhase = "queued" | "awaiting_upload" | "upload" | "integrity_check" | "image_import" | "suitability_check" | "reference_check" | "native_action" | "reconciliation" | "cleanup" | "completed";
-export type ManagementAction = "restart" | "resize" | "release" | "destroy" | "port_add" | "port_remove" | "image_import" | "default_image_select" | "image_retire" | "image_delete" | "drain_enter" | "reconcile" | "gc";
+export type ManagementAction = "restart" | "resize" | "release" | "destroy" | "port_add" | "port_remove" | "image_import" | "default_image_select" | "image_retire" | "image_delete" | "drain_enter" | "reconcile" | "gc" | "token_create" | "token_revoke";
 
 export interface SafeError {
   code: string;
@@ -120,22 +169,30 @@ export interface Operation {
   action: ManagementAction;
   status: OperationStatus;
   phase: OperationPhase;
-  target: { kind: "vm" | "image" | "image_catalog" | "system"; id: string };
-  actor: string;
-  reason: string;
+  target: { kind: "vm" | "image" | "image_catalog" | "system" | "token"; id: string };
+  actor: AuditActor;
+  reason: string | null;
   created_at: string;
   updated_at: string;
-  result: { image_fingerprint?: string | null; default_fingerprint?: string | null; affected_session_count?: number | null; effect?: string | null } | null;
+  result: { token_metadata?: AgentToken | null; plaintext_disclosure?: "returned" | "consumed" | null; image_fingerprint?: string | null; default_fingerprint?: string | null; affected_session_count?: number | null; effect?: string | null } | null;
   error: SafeError | null;
 }
+
+export type AuditActor = string | {
+  issuer?: string;
+  subject?: string;
+  role?: "administrator";
+  kind?: "legacy_unknown" | "unauthenticated" | "unauthorized";
+  raw_actor?: string;
+};
 
 export interface AuditEvent {
   event_id: string;
   operation_id: string;
   action: ManagementAction;
-  actor: string;
-  reason: string;
-  target: { kind: "vm" | "image" | "image_catalog" | "system"; id: string };
+  actor: AuditActor;
+  reason: string | null;
+  target: { kind: "vm" | "image" | "image_catalog" | "system" | "token"; id: string };
   outcome: "accepted" | "rejected" | "succeeded" | "failed" | "outcome_unknown";
   phase: OperationPhase;
   occurred_at: string;
@@ -165,7 +222,7 @@ export interface ActionPreview {
 
 export interface ImageImportRequest {
   operation_id: string;
-  reason: string;
+  reason?: string;
   target_version: string;
   version_label?: string;
   source:

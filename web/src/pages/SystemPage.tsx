@@ -7,6 +7,7 @@ import { actionLabel, formatDateTime } from "../app/format";
 import type { ActionPreview, Locale, SystemStatus } from "../app/types";
 import { ActionDialog } from "../components/ActionDialog";
 import { PageIntro, QueryError } from "../components/PagePrimitives";
+import { TokenManagement } from "../components/TokenManagement";
 import { Button, Panel, PanelHeader, StatusBadge } from "../components/ui";
 
 type MaintenanceAction = "drain_enter" | "reconcile" | "gc";
@@ -58,6 +59,7 @@ export function SystemPage() {
       <Panel><PanelHeader title={t("system.capabilities")} /><div className="capability-list">{query.data.state_capabilities.map((capability) => <div key={capability}><Database aria-hidden="true" /><span className="mono">{capability}</span><CheckCircle2 aria-hidden="true" /></div>)}</div></Panel>
       <Panel><PanelHeader title={t("system.source")} /><div className="source-list">{query.data.sources.map((source) => <div className="source-row" key={source.name}><div><strong>{source.name}</strong><span>{source.safe_code ?? "—"}</span></div><StatusBadge state={source.state} /></div>)}</div></Panel>
     </div>
+    <TokenManagement />
     {action && preview ? <ActionDialog preview={preview} actionLabel={actionLabel(action, locale)} target={`${t("system.title")} · ${t("system.maintenance")}`} error={actionError} dangerous={action === "drain_enter" || action === "gc"} busy={mutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null); setActionError(null); }} onConfirm={(reason) => mutation.mutate({ reason })} /> : null}
   </div>;
 }

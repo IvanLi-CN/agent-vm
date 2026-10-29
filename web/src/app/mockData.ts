@@ -1,4 +1,13 @@
-import type { AuditEvent, ImageReferenceCounts, ManagedImage, ManagedVM, Operation, Overview, SystemStatus } from "./types";
+import type { AgentToken, AuditEvent, ImageReferenceCounts, ManagedImage, ManagedVM, ManagementSession, Operation, Overview, SystemStatus } from "./types";
+
+export const session: ManagementSession = {
+  issuer: "https://issuer.example.invalid",
+  subject: "admin-maintainer",
+  role: "administrator",
+  capabilities: ["read", "operate", "manage_images", "maintain_system", "manage_tokens", "observe_admin"],
+  csrf_token: "synthetic-csrf-token",
+  expires_at: "2027-01-15T11:20:30Z",
+};
 
 export const overview: Overview = {
   resource_version: "overview:synthetic-17",
@@ -84,4 +93,9 @@ export const system: SystemStatus = {
 
 export const emptyReferences: ImageReferenceCounts = { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 };
 
-export const mockState = { overview, vms, images, operations, audits, system };
+export const tokens: AgentToken[] = [
+  { token_id: "tok_read_01_7d9e22b1", resource_version: "token:read:revision-2", scopes: ["agent:read"], created_at: "2026-10-10T08:00:00Z", expires_at: "2027-02-10T08:00:00Z", revoked_at: null },
+  { token_id: "tok_ops_02_4f1c6a77", resource_version: "token:ops:revision-5", scopes: ["agent:read", "agent:operate"], created_at: "2026-09-20T08:00:00Z", expires_at: "2027-01-20T08:00:00Z", revoked_at: "2026-10-14T18:30:00Z" },
+];
+
+export const mockState = { overview, vms, images, operations, audits, system, session, tokens };
