@@ -43,7 +43,7 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, statErr := os.Stat(socket); statErr == nil {
+		if info, statErr := os.Stat(socket); statErr == nil && info.Mode().Perm() == 0o600 {
 			break
 		}
 		select {
@@ -52,7 +52,7 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("control socket was not created")
+			t.Fatal("control socket was not created with mode 0600")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
