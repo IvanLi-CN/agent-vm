@@ -24,6 +24,9 @@ const defaultHttp: HttpRequester = (url, init) => fetch(url, init as RequestInit
 class ResponseLimitExceeded extends Error {
   constructor(readonly streamCleanupVerified: boolean) { super(); }
 }
+function httpsExitCode(response: Response): number {
+  return response.headers.get("X-Agent-VM-Exit-Code") === "3" ? 3 : 2;
+}
 
 export function httpsEndpoint(value = process.env.AGENT_VM_CONTROL_HOST): string {
   if (!value) fail("config_missing", "AGENT_VM_CONTROL_HOST is required for the HTTPS control transport");
@@ -245,12 +248,13 @@ export class Client {
         tls: config.tls,
       });
       let stdout: { body: Buffer; streamCleanupVerified: boolean };
+      const exitCode = response.status >= 200 && response.status < 300 ? 0 : httpsExitCode(response);
       try { stdout = await readResponseBody(response, STDOUT_LIMIT); }
       catch (error) {
-        if (error instanceof ResponseLimitExceeded) return { code: response.status, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), stdoutTruncated: true, stderrTruncated: false, timedOut: false, streamCleanupVerified: error.streamCleanupVerified };
+        if (error instanceof ResponseLimitExceeded) return { code: exitCode, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), stdoutTruncated: true, stderrTruncated: false, timedOut: false, streamCleanupVerified: error.streamCleanupVerified };
         throw error;
       }
-      return { code: response.status >= 200 && response.status < 300 ? 0 : response.status, stdout: stdout.body, stderr: Buffer.alloc(0), stdoutTruncated: false, stderrTruncated: false, timedOut: false, streamCleanupVerified: stdout.streamCleanupVerified };
+      return { code: exitCode, stdout: stdout.body, stderr: Buffer.alloc(0), stdoutTruncated: false, stderrTruncated: false, timedOut: false, streamCleanupVerified: stdout.streamCleanupVerified };
     } catch (error) {
       if (timedOut) fail("remote_timeout", "control outcome is uncertain; retry the same operation ID", detail);
       const message = error instanceof Error ? error.message.toLowerCase() : "";

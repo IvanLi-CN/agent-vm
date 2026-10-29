@@ -109,14 +109,31 @@ test("HTTPS response data and errors redact the bearer token before return, jour
 
   f.client.http = async (_url, init) => {
     const request = parseJson(String(init.body));
-    return new Response(json({ ok: false, protocol: 4, action: request.action, session_id: request.session_id, generation: request.generation ?? null, operation_id: request.operation_id, error: { code: "remote_failed", message: "server echoed opaque-agent-token", detail: { echoed: "opaque-agent-token" } } }), { status: 502 });
+    return new Response(json({ ok: false, protocol: 4, action: request.action, session_id: request.session_id, generation: request.generation ?? null, operation_id: request.operation_id, error: { code: "remote_failed", message: "server echoed opaque-agent-token", detail: { echoed: "opaque-agent-token" } } }), { status: 502, headers: { "X-Agent-VM-Exit-Code": "3" } });
   };
   let error: any;
   try { await f.client.request("renew", { session: "https-session", generation: 10, operationId: "echo-operation", write: true }); }
   catch (caught) { error = caught; }
   expect(error.message).not.toContain("opaque-agent-token");
+  expect(error.exitCode).toBe(3);
   expect(JSON.stringify(error.detail)).not.toContain("opaque-agent-token");
   expect(JSON.stringify(readJson(f.client.operationPath("https-session", "echo-operation")))).not.toContain("opaque-agent-token");
+});
+
+test("HTTPS HTTP failures preserve the control CLI exit code instead of the status code", async () => {
+  for (const [status, exitCode] of [[400, 2], [503, 3]] as const) {
+    const f = fixture(); httpsSidecar(f);
+    f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+    f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+    f.client.http = async (_url, init) => {
+      const request = parseJson(String(init.body));
+      return new Response(json({ ok: false, protocol: 4, action: request.action, session_id: request.session_id, generation: request.generation ?? null, operation_id: request.operation_id, error: { code: "remote_failed", message: "control failed" } }), { status, headers: { "X-Agent-VM-Exit-Code": String(exitCode) } });
+    };
+    let error: any;
+    try { await f.client.request("renew", { session: "https-session", generation: status, operationId: `http-${status}`, write: true }); }
+    catch (caught) { error = caught; }
+    expect(error).toMatchObject({ code: "remote_failed", exitCode });
+  }
 });
 
 test("HTTPS response overflow reports an uncertain result and preserves the pending operation", async () => {
