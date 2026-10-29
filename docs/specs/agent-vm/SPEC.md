@@ -180,6 +180,25 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 - `VER-AGENT-VM-028` covers: `REQ-AGENT-VM-028` through [the state migration ADR](../../adr/0044-agent-vm-state-migration-to-rqlite.md), the migration sections of [the management contract](contracts/management-api.md) and [the release contract](contracts/release.md), and transaction/concurrency/recovery checks. This is planned target validation and remains pending until the target surface and tests exist.
 - `VER-AGENT-VM-029` covers: `REQ-AGENT-VM-029` through the blue-green sections of [the system architecture](../../architecture/system.md), [the release contract](contracts/release.md), and active-link, compatibility-window and rollback checks. This is planned target validation and remains pending until the target surface and tests exist.
 
+## Visual Evidence
+
+The management-console web surface has confirmed pre-merge visual evidence from
+the deterministic local `ui_demo` source. The capture is mock-only, requires no
+backend, login, credentials or live deployment, and covers the System page's
+Token creation, one-time disclosure dismissal and revocation-preview flow. The
+mobile captures use the requested `393x852` CSS-pixel viewport; the desktop
+capture uses the full rendered page surface and needs no whitespace crop.
+
+- [Desktop System page](assets/agent-vm-web-system-desktop.png)
+- [Mobile System page](assets/agent-vm-web-system-mobile-list.png)
+- [Mobile revocation preview dialog](assets/agent-vm-web-system-mobile-revoke-dialog.png)
+
+This evidence is bound to PR [#32](https://github.com/IvanLi-CN/agent-vm/pull/32),
+base `79a4fb8aa0fb8db11e6f3ba80047f88fc1a26fed`, and the metadata-only evidence
+candidate descended from UI head `2a8d0634fa0299c3f5f059f5ea00275c5a18e6c0`.
+Owner confirmation applies to the rendered UI shown here; it does not assert
+end-to-end backend integration or deployment readiness.
+
 ## Related ADRs
 
 - [Agent VM topology and recovery boundary](../../adr/0028-agent-vm-topology-recovery-boundary.md)
