@@ -134,6 +134,17 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "drain_unverified")
         run.assert_not_called()
 
+    def test_drain_verification_rejects_manifest_without_sidecar(self):
+        self.drain_patch.stop()
+        self._install_go_payload("https")
+        sidecar = Path(self.loaded["control_path"]).with_name("client-release.json")
+        sidecar.unlink()
+        with mock.patch.object(WRAPPER.subprocess, "run") as run:
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(failure.exception.code, "drain_unverified")
+        run.assert_not_called()
+
     def test_drain_verification_rejects_inflight_management_operations(self):
         self.drain_patch.stop()
         responses = [

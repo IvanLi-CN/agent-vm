@@ -1018,6 +1018,7 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
         return
     command = [BUN_PATH, str(config["control_path"])]
     sidecar = Path(config["control_path"]).with_name("client-release.json")
+    manifest_path = sidecar.parent / MANIFEST_NAME
     if sidecar.exists() or sidecar.is_symlink():
         try:
             installed_root = sidecar.parent
@@ -1050,6 +1051,8 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
                 _fail("drain_unverified", "installed client release transport is invalid")
             if transport in {"go-request", "https"}:
                 command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
+    elif manifest_path.exists() or manifest_path.is_symlink():
+        _fail("drain_unverified", "installed release manifest is present but the client sidecar is missing")
     def control_result(action: str, *, allow_legacy_unknown: bool = False) -> Mapping[str, Any] | None:
         try:
             process = subprocess.run(
