@@ -117,6 +117,7 @@ export function TokenManagement() {
   };
 
   useEffect(() => { refreshSessionAfterAuthFailure(tokensQuery.error); }, [tokensQuery.error]);
+  useEffect(() => { client.setQueryDefaults(createRecoveryQueryKey, { gcTime: Infinity }); }, [client]);
   useEffect(() => {
     const snapshot: CreateRecoverySnapshot = { createRequest, createOperationIdValue, createRecoveryOperationId, createRecoveryStatus, createRecoveryTokenId, createRecoveryDecision, createRecoveryError };
     if (snapshot.createRequest || snapshot.createOperationIdValue || snapshot.createRecoveryOperationId || snapshot.createRecoveryStatus || snapshot.createRecoveryTokenId || snapshot.createRecoveryDecision || snapshot.createRecoveryError) client.setQueryData(createRecoveryQueryKey, snapshot);
@@ -145,6 +146,7 @@ export function TokenManagement() {
       const mutation = client.getMutationCache().getAll().find((candidate) => candidate.state.variables === request);
       if (mutation) client.getMutationCache().remove(mutation);
       setCreateError(null);
+      setCreateRecoveryPending(false);
       clearCreateRecovery();
       setReason("");
       setTokenCursor(undefined);
@@ -163,6 +165,7 @@ export function TokenManagement() {
     },
     onError: (error, request: CreateRequest) => {
       refreshSessionAfterAuthFailure(error);
+      setCreateRecoveryPending(false);
       setCreateError(errorMessage(error, t));
       if (!createOutcomeIsUncertain(error)) {
         clearCreateRecovery();
@@ -246,11 +249,12 @@ export function TokenManagement() {
     const retryRequest = createOperationIdValue && createRequest?.operationId === createOperationIdValue ? createRequest : null;
     const request: CreateRequest = retryRequest ?? { scopes: [...scopes], expiresAt: new Date(expiresAt).toISOString(), auditReason: reason.trim(), operationId: createOperationId() };
     setCreateRequest(request);
-    setCreateRecoveryOperationId(null);
+    setCreateRecoveryOperationId(request.operationId);
     setCreateRecoveryStatus(null);
     setCreateRecoveryTokenId(null);
-    setCreateRecoveryDecision(null);
+    setCreateRecoveryDecision("check");
     setCreateRecoveryError(null);
+    setCreateRecoveryPending(true);
     createMutation.mutate(request);
   };
 

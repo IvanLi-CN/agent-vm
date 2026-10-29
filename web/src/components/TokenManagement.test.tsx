@@ -106,11 +106,33 @@ describe("TokenManagement pagination", () => {
     await waitFor(() => expect(createButton).toBeEnabled());
     await user.click(createButton);
     expect(await screen.findByRole("button", { name: /查询操作|check operation/i })).toBeInTheDocument();
+    expect(firstRender.client.getQueryCache().find({ queryKey: ["token-create-recovery"], exact: true })?.options.gcTime).toBe(Infinity);
 
     firstRender.unmount();
     renderTokenManagement(firstRender.client);
     expect(await screen.findByRole("button", { name: /查询操作|check operation/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /创建 Token|create token/i })).toBeDisabled();
+  });
+
+  it("keeps create protection when the page unmounts before the response", async () => {
+    const user = userEvent.setup();
+    let resolveCreate: ((result: unknown) => void) | undefined;
+    listTokensMock.mockReset().mockResolvedValue({ items: [], page: { limit: 25, next_cursor: null } });
+    createAgentTokenMock.mockReset().mockImplementationOnce(() => new Promise((resolve) => { resolveCreate = resolve; }));
+
+    const firstRender = renderTokenManagement();
+    await screen.findByTestId("token-management");
+    (document.querySelector("form") as HTMLFormElement).noValidate = true;
+    const createButton = screen.getByRole("button", { name: /创建 Token|create token/i });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    await user.click(createButton);
+    await waitFor(() => expect(createAgentTokenMock).toHaveBeenCalled());
+
+    firstRender.unmount();
+    renderTokenManagement(firstRender.client);
+    expect(await screen.findByRole("button", { name: /查询操作|check operation/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /创建 Token|create token/i })).toBeDisabled();
+    resolveCreate?.({ operation_id: "operation-pending-01", metadata: token("tok_pending_01"), plaintext_disclosure: "consumed" });
   });
 
   it("allows revocation of an expired but not revoked token", async () => {
