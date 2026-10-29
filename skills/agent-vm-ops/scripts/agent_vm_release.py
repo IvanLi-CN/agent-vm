@@ -95,6 +95,7 @@ DEFAULT_POLL_SECONDS = 1.0
 MAX_TIMEOUT_SECONDS = 8100
 MAX_POLL_SECONDS = 1.0
 ACTIVATION_TIMEOUT_SECONDS = 300
+RELEASE_SESSION_ALLOWED = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:@/-")
 CANONICAL_REMOTE_CONTROL = "/opt/agent-vm-native/agent_vm_control.ts"
 CANONICAL_REMOTE_WRAPPER = "/usr/local/sbin/agent-vm-release-wrapper"
 CONTROL_TRANSITION_STATES = {"preparing", "closing", "deleting", "failed"}
@@ -137,6 +138,17 @@ class ReleaseError(Exception):
 
 def _fail(code: str, message: str, detail: Any = None) -> None:
     raise ReleaseError(code, message, detail)
+
+
+def _validate_release_session(session: Any) -> str:
+    if (
+        not isinstance(session, str)
+        or not session.startswith("release-")
+        or not 1 <= len(session) <= 160
+        or any(character not in RELEASE_SESSION_ALLOWED for character in session)
+    ):
+        _fail("invalid_request", "release drain owner is invalid")
+    return session
 
 
 def _fsync_directory(path: Path) -> None:
@@ -1075,6 +1087,7 @@ class ReleasePublisher:
             temporary.cleanup()
         transaction = transaction_id or ("tx-" + uuid.uuid4().hex)
         session = self.session_id or ("release-" + transaction)
+        _validate_release_session(session)
         wrapper_session = self.session_id
         self._verify_wrapper_session_capability(transaction, manifest["release_id"])
         staged = self._wrapper("stage", transaction, manifest["release_id"], payload)
@@ -1144,6 +1157,7 @@ class ReleasePublisher:
         if manifest["release_id"] == release_id:
             _fail("rollback_release_mismatch", "rollback bundle must identify the previous release, not the active release")
         session = self.session_id or ("release-" + transaction_id)
+        _validate_release_session(session)
         wrapper_session = self.session_id
         self._verify_wrapper_session_capability(transaction_id, release_id)
         self._control(manifest, "drain-enter", session=session, write=True)

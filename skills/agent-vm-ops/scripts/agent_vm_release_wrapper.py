@@ -2205,15 +2205,14 @@ def activate(
 ) -> dict[str, Any]:
     drain_owner = _release_drain_owner(transaction_id, session_id)
     with _release_lock(config):
-        with _admission_lock():
-            with _activation_fence(config, transaction_id, release_id) as refresh_fence:
-                return _activate_unlocked(
-                    config,
-                    transaction_id,
-                    release_id,
-                    refresh_fence,
-                    drain_owner,
-                )
+        with _activation_fence(config, transaction_id, release_id) as refresh_fence:
+            return _activate_unlocked(
+                config,
+                transaction_id,
+                release_id,
+                refresh_fence,
+                drain_owner,
+            )
 
 
 def _activate_unlocked(
@@ -2222,6 +2221,8 @@ def _activate_unlocked(
     release_id: str,
     refresh_fence=None,
     expected_drain_owner: str | None = None,
+    _drain_preflighted: bool = False,
+    _owner_capable: bool | None = None,
 ) -> dict[str, Any]:
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
@@ -2232,7 +2233,19 @@ def _activate_unlocked(
         candidate_manifest = load_release_manifest(staged / MANIFEST_NAME)
     except ManifestError as exc:
         _fail(exc.code, exc.message, exc.detail)
-    owner_capable = _ensure_drained(config, candidate_manifest)
+    if not _drain_preflighted:
+        owner_capable = _ensure_drained(config, candidate_manifest)
+        with _admission_lock():
+            return _activate_unlocked(
+                config,
+                transaction_id,
+                release_id,
+                refresh_fence,
+                drain_owner,
+                _drain_preflighted=True,
+                _owner_capable=owner_capable,
+            )
+    owner_capable = _owner_capable
     if config["require_drained"]:
         _verify_durable_drain_owner(drain_owner, allow_ownerless=owner_capable is False)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
@@ -2478,15 +2491,14 @@ def rollback(
 ) -> dict[str, Any]:
     drain_owner = _release_drain_owner(transaction_id, session_id)
     with _release_lock(config):
-        with _admission_lock():
-            with _activation_fence(config, transaction_id, release_id) as refresh_fence:
-                return _rollback_unlocked(
-                    config,
-                    transaction_id,
-                    release_id,
-                    refresh_fence,
-                    drain_owner,
-                )
+        with _activation_fence(config, transaction_id, release_id) as refresh_fence:
+            return _rollback_unlocked(
+                config,
+                transaction_id,
+                release_id,
+                refresh_fence,
+                drain_owner,
+            )
 
 
 def _rollback_unlocked(
@@ -2495,6 +2507,9 @@ def _rollback_unlocked(
     release_id: str,
     refresh_fence=None,
     expected_drain_owner: str | None = None,
+    _admission_lock_held: bool = False,
+    _owner_capable: bool | None = None,
+    _preflight_web_unit_enabled: bool | None = None,
 ) -> dict[str, Any]:
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
@@ -2564,7 +2579,11 @@ def _rollback_unlocked(
         active_manifest = _verify_retained_release(config, actual_current)
     active_web_unit_enabled = None
     if active_manifest is not None and active_manifest.get("format") == PRODUCT_MANIFEST_FORMAT:
-        active_web_unit_enabled = _unit_is_enabled("agent-vm-web.service")
+        active_web_unit_enabled = (
+            _preflight_web_unit_enabled
+            if _admission_lock_held
+            else _unit_is_enabled("agent-vm-web.service")
+        )
     if old_previous_id is not None:
         _verify_retained_release(config, Path(config["release_root"]) / old_previous_id)
     if record.get("activated") is True:
@@ -2602,6 +2621,21 @@ def _rollback_unlocked(
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
         if actual_previous is not None and actual_previous.name not in allowed_previous:
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
+    if not _admission_lock_held:
+        preflight_owner_capable = _owner_capable
+        if not (interrupted or recovering_in_progress):
+            preflight_owner_capable = _ensure_drained(config, previous_manifest)
+        with _admission_lock():
+            return _rollback_unlocked(
+                config,
+                transaction_id,
+                release_id,
+                refresh_fence,
+                drain_owner,
+                _admission_lock_held=True,
+                _owner_capable=preflight_owner_capable,
+                _preflight_web_unit_enabled=active_web_unit_enabled,
+            )
     # The activation record is written only after the original activation has
     # drained the control plane. An interrupted activation or rollback may
     # have already stopped that authority, so recovery must prove the current
@@ -2613,13 +2647,11 @@ def _rollback_unlocked(
             legacy_ownerless = not (_is_go_manifest(previous_manifest) or _is_product_manifest(previous_manifest))
             _verify_durable_drain_owner(record_drain_owner, allow_ownerless=legacy_ownerless)
             _verify_durable_drain_state(previous_manifest, expected_owner=record_drain_owner)
-    else:
-        owner_capable = _ensure_drained(config, previous_manifest)
-        if config["require_drained"]:
-            _verify_durable_drain_owner(
-                record_drain_owner if isinstance(record_drain_owner, str) else drain_owner,
-                allow_ownerless=owner_capable is False,
-            )
+    elif config["require_drained"]:
+        _verify_durable_drain_owner(
+            record_drain_owner if isinstance(record_drain_owner, str) else drain_owner,
+            allow_ownerless=_owner_capable is False,
+        )
     target_snapshot = _snapshot_targets(config)
     record["rollback_attempts"] = 1
     record["rollback_started"] = True

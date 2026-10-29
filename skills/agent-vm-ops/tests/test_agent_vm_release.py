@@ -221,6 +221,17 @@ class ReleasePublisherTests(unittest.TestCase):
         activation = next(call for call in transport.calls if call[:2] == ("wrapper", "activate"))
         self.assertEqual(activation[-1], "release-custom/@blue")
 
+    def test_publish_rejects_an_invalid_release_session_before_drain(self):
+        transport = FakeTransport()
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            self.publisher(
+                transport,
+                client_target=self.root / "client" / "agent_vm.ts",
+                session_id="browser-session",
+            ).publish(timeout=5, poll=1, transaction_id="tx-invalid-session")
+        self.assertEqual(failure.exception.code, "invalid_request")
+        self.assertNotIn(("control", "drain-enter", mock.ANY), transport.calls)
+
     def test_build_and_install_use_all_bun_files_and_never_python_client_paths(self):
         from release_manifest import verify_typescript_syntax
         temporary, root, manifest = RELEASE._open_bundle(self.bundle)
