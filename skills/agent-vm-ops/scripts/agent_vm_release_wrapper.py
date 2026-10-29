@@ -2163,6 +2163,8 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     try:
         _write_json(activation_path, record)
     except WrapperError as record_error:
+        shutdown_errors = _stop_runtime_authorities()
+        restore_error = None
         try:
             _restore_activation_state(
                 config,
@@ -2172,12 +2174,45 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 actual_previous,
                 target_snapshot,
             )
-        except WrapperError as restore_error:
+        except WrapperError as error:
+            restore_error = error
+        if shutdown_errors or restore_error is not None:
+            detail = {"record_error": record_error.as_dict()}
+            if shutdown_errors:
+                detail["shutdown_errors"] = shutdown_errors
+            if restore_error is not None:
+                detail["restore_error"] = restore_error.as_dict()
             raise WrapperError(
                 "activation_restore_failed",
                 "rollback record could not be persisted and the active release could not be fully restored",
-                {"record_error": record_error.as_dict(), "restore_error": restore_error.as_dict()},
+                detail,
             ) from restore_error
+        try:
+            if active_manifest is None:
+                _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+            elif _is_product_manifest(active_manifest):
+                snapshot = record.get("web_unit_enabled")
+                _activate_product_runtime(
+                    active_manifest,
+                    web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
+                )
+            elif _is_go_manifest(active_manifest):
+                _activate_go_runtime()
+            else:
+                _activate_legacy_runtime()
+        except (WrapperError, ManifestError) as runtime_error:
+            shutdown_errors = _stop_runtime_authorities()
+            detail = {
+                "record_error": record_error.as_dict(),
+                "runtime_error": getattr(runtime_error, "as_dict", lambda: {"message": str(runtime_error)})(),
+            }
+            if shutdown_errors:
+                detail["shutdown_errors"] = shutdown_errors
+            raise WrapperError(
+                "activation_restore_failed",
+                "rollback record could not be persisted and the active runtime could not be restored",
+                detail,
+            ) from runtime_error
         record["rollback_error"] = record_error.as_dict()
         try:
             _write_json(activation_path, record)

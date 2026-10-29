@@ -960,6 +960,48 @@ class WrapperTests(unittest.TestCase):
         stop_native.assert_called_once_with()
         stop_legacy.assert_called_once_with()
 
+    def test_rollback_record_failure_restores_original_runtime(self):
+        self.loaded["require_drained"] = False
+        first_release_id = "a" * 40
+        second_release_id = "b" * 40
+        first_payload = self._go_payload(first_release_id, transport="https")
+        second_payload = self._go_payload(second_release_id, transport="https")
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            WRAPPER.stage(self.loaded, "tx-first-native", first_release_id, first_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-first-native", first_release_id)
+            WRAPPER.activate(self.loaded, "tx-first-native", first_release_id)
+            WRAPPER.stage(self.loaded, "tx-second-native", second_release_id, second_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-second-native", second_release_id)
+            WRAPPER.activate(self.loaded, "tx-second-native", second_release_id)
+
+            activation_path = Path(self.loaded["state_root"]) / "tx-second-native.activation.json"
+            original_write = WRAPPER._write_json
+
+            def write_record(path, value):
+                if path == activation_path and value.get("rollback_phase") == "complete":
+                    raise WRAPPER.WrapperError("activation_failed", "injected record persistence failure")
+                return original_write(path, value)
+
+            with mock.patch.object(WRAPPER, "_write_json", side_effect=write_record), mock.patch.object(
+                WRAPPER,
+                "_activate_go_runtime",
+                return_value=None,
+            ) as activate_go, mock.patch.object(WRAPPER, "_deactivate_native_runtime") as stop_native, mock.patch.object(
+                WRAPPER, "_deactivate_legacy_runtime",
+            ) as stop_legacy:
+                with self.assertRaises(WRAPPER.WrapperError) as failure:
+                    WRAPPER.rollback(self.loaded, "tx-second-native", second_release_id)
+
+        self.assertEqual(failure.exception.code, "activation_failed")
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, second_release_id)
+        self.assertEqual(activate_go.call_count, 2)
+        stop_native.assert_called_once_with()
+        stop_legacy.assert_called_once_with()
+
     def test_cross_format_rollback_to_native_hands_off_legacy_before_cleanup(self):
         self.loaded["require_drained"] = False
         native_release_id = "a" * 40
