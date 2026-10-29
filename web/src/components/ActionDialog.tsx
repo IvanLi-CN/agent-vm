@@ -24,6 +24,20 @@ export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm
   useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
+    const inerted: Array<{ element: HTMLElement; inert: boolean; hadInertAttribute: boolean; ariaHidden: string | null }> = [];
+    let current: HTMLElement = dialog;
+    while (current.parentElement) {
+      const parent = current.parentElement;
+      for (const child of Array.from(parent.children)) {
+        if (child === current || !(child instanceof HTMLElement)) continue;
+        inerted.push({ element: child, inert: child.inert, hadInertAttribute: child.hasAttribute("inert"), ariaHidden: child.getAttribute("aria-hidden") });
+        child.inert = true;
+        child.setAttribute("inert", "");
+        child.setAttribute("aria-hidden", "true");
+      }
+      if (parent === document.body) break;
+      current = parent;
+    }
     const handleFocusIn = (event: FocusEvent) => {
       if (dialog.contains(event.target as Node)) return;
       event.preventDefault();
@@ -60,6 +74,13 @@ export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm
     return () => {
       document.removeEventListener("focusin", handleFocusIn);
       document.removeEventListener("keydown", handleKeyDown);
+      for (const { element, inert, hadInertAttribute, ariaHidden } of inerted) {
+        element.inert = inert;
+        if (hadInertAttribute) element.setAttribute("inert", "");
+        else element.removeAttribute("inert");
+        if (ariaHidden === null) element.removeAttribute("aria-hidden");
+        else element.setAttribute("aria-hidden", ariaHidden);
+      }
     };
   }, [busy, onCancel]);
   return <dialog ref={dialogRef} open className="dialog-backdrop" aria-modal="true" aria-labelledby="action-dialog-title" onCancel={(event) => { event.preventDefault(); if (!busy) onCancel(); }}><div className="action-dialog"><div className="dialog-heading"><div className={`dialog-icon ${dangerous ? "danger" : ""}`} aria-hidden="true">{dangerous ? <AlertTriangle /> : <ShieldCheck />}</div><div><h2 id="action-dialog-title">{t("vms.actionConfirm", { action: actionLabel })}</h2><p>{target}</p></div></div><div className="dialog-target-row"><span>{t("dialog.preview")}</span><span className="mono">{preview.target_version}</span></div><div className="impact-grid"><div><span>{t("dialog.impactSessions")}</span><strong>{preview.impact.affected_session_count}</strong></div><div><span>{t("dialog.impactRefs")}</span><strong>{Object.values(preview.impact.affected_image_references).reduce((total, value) => total + value, 0)}</strong></div></div><div className="dialog-changes"><span>{t("dialog.changes")}</span>{preview.impact.changes.map((change) => <div key={change.code}><span className="change-code">{change.code}</span><span>{change.value ?? change.count ?? t("dialog.noImpact")}</span></div>)}</div>{children}{error ? <p className="field-error" role="alert">{error}</p> : null}<p className="dialog-expiry">{t("dialog.expires", { time: formatDateTime(preview.expires_at, locale) })}</p><label className="field-label" htmlFor="action-reason">{t("common.reason")} <span>({t("common.optional")})</span></label><Textarea ref={reasonRef} id="action-reason" value={reason} onChange={(event) => setReason(event.target.value)} placeholder={t("common.reasonPlaceholder")} rows={3} /><p className="dialog-warning">{confirmationText ?? t("vms.actionConfirmText")}</p><div className="dialog-actions"><Button variant="ghost" disabled={busy} onClick={onCancel}>{t("common.cancel")}</Button><Button variant={dangerous ? "danger" : "primary"} disabled={busy} onClick={() => onConfirm(reason.trim())} icon={busy ? <ShieldCheck /> : <ArrowRight />}>{busy ? t("common.loading") : t("dialog.submit")}</Button></div></div></dialog>;

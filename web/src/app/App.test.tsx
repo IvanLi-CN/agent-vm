@@ -1,15 +1,13 @@
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import "./i18n";
 import { App } from "./App";
-import * as api from "./api";
-import { createAgentToken, ManagementRequestError } from "./api";
 
 function renderApp() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return { client, ...render(<QueryClientProvider client={client}><App /></QueryClientProvider>) };
+  return { client, ...render(<App client={client} />) };
 }
 
 describe("management console workflow", () => {
@@ -65,40 +63,27 @@ describe("management console workflow", () => {
 
     await waitFor(() => expect(screen.getAllByRole("button", { name: /撤销|revoke/i })).toHaveLength(3));
     const revokeTrigger = screen.getAllByRole("button", { name: /撤销|revoke/i })[0];
-    await user.click(revokeTrigger);
-    expect(await screen.findByRole("dialog")).toHaveTextContent(/撤销后新的 Agent API 授权会被拒绝|new Agent API authorization/i);
-    expect(screen.getAllByRole("button", { name: /撤销|revoke/i }).every((button) => button.hasAttribute("disabled"))).toBe(true);
     const outside = document.createElement("button");
     outside.type = "button";
     outside.textContent = "outside dialog";
     document.body.append(outside);
-    outside.focus();
-    expect(document.getElementById("action-reason")).toHaveFocus();
-    outside.remove();
-    await user.click(screen.getByRole("button", { name: /取消|cancel/i }));
-    expect(revokeTrigger).toHaveFocus();
-    await user.click(revokeTrigger);
-    expect(await screen.findByRole("dialog")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: /确认提交|confirm and submit/i }));
-    await waitFor(() => expect(screen.getAllByRole("button", { name: /撤销|revoke/i })[0]).toBeDisabled());
-  });
-
-  it("blocks a replacement after an unresolved operation lookup", async () => {
-    const user = userEvent.setup();
-    const createSpy = vi.spyOn(api, "createAgentToken").mockRejectedValueOnce(new ManagementRequestError("authority_unavailable", "reconciliation"));
     try {
-      window.history.replaceState({}, "", "/system");
-      renderApp();
-      expect(await screen.findByTestId("token-management")).toBeInTheDocument();
-      await user.click(screen.getByRole("button", { name: /创建 Token|create token/i }));
-      const checkButton = await screen.findByRole("button", { name: /查询操作|check operation/i });
-      expect(screen.getByRole("button", { name: /创建 Token|create token/i })).toBeDisabled();
-
-      await user.click(checkButton);
-      expect(await screen.findByText(/暂时没有权威的操作结果|No authoritative operation result/i)).toBeInTheDocument();
-      expect(screen.getByRole("button", { name: /创建 Token|create token/i })).toBeDisabled();
+      await user.click(revokeTrigger);
+      expect(await screen.findByRole("dialog")).toHaveTextContent(/撤销后新的 Agent API 授权会被拒绝|new Agent API authorization/i);
+      expect(screen.getAllByRole("button", { name: /撤销|revoke/i, hidden: true }).every((button) => button.hasAttribute("disabled"))).toBe(true);
+      expect(outside).toHaveAttribute("inert");
+      outside.focus();
+      expect(document.getElementById("action-reason")).toHaveFocus();
+      await user.click(screen.getByRole("button", { name: /取消|cancel/i }));
+      expect(revokeTrigger).toHaveFocus();
+      expect(outside).not.toHaveAttribute("inert");
+      await user.click(revokeTrigger);
+      expect(await screen.findByRole("dialog")).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: /确认提交|confirm and submit/i }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+      expect(outside).not.toHaveAttribute("inert");
     } finally {
-      createSpy.mockRestore();
+      outside.remove();
     }
   });
 

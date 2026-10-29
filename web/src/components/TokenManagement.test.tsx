@@ -6,13 +6,16 @@ import "../app/i18n";
 import type { AgentToken, TokenPage } from "../app/types";
 
 const listTokensMock = vi.hoisted(() => vi.fn());
+const createAgentTokenMock = vi.hoisted(() => vi.fn());
+const getOperationMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../app/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../app/api")>();
-  return { ...actual, listTokens: listTokensMock };
+  return { ...actual, createAgentToken: createAgentTokenMock, getOperation: getOperationMock, listTokens: listTokensMock };
 });
 
 import { TokenManagement } from "./TokenManagement";
+import { ManagementRequestError } from "../app/api";
 
 function token(tokenId: string): AgentToken {
   return { token_id: tokenId, resource_version: `token:${tokenId}:revision-1`, scopes: ["agent:read"], created_at: "2027-01-01T00:00:00.000Z", expires_at: "2027-01-15T00:00:00.000Z", revoked_at: null };
@@ -30,7 +33,7 @@ describe("TokenManagement pagination", () => {
     const secondPageTokenId = "tok_page_02_00";
     const secondPage: TokenPage = { items: [token(secondPageTokenId)], page: { limit: 25, next_cursor: null } };
     listTokensMock.mockReset();
-    listTokensMock.mockResolvedValueOnce(firstPage).mockResolvedValueOnce(secondPage);
+    listTokensMock.mockImplementation((cursor?: string) => Promise.resolve(cursor === "mock-token:25" ? secondPage : firstPage));
 
     renderTokenManagement();
     await waitFor(() => expect(screen.getByRole("button", { name: /下一页|next/i })).toBeEnabled());
@@ -38,9 +41,57 @@ describe("TokenManagement pagination", () => {
 
     await user.click(screen.getByRole("button", { name: /下一页|next/i }));
     expect(await screen.findByText(secondPageTokenId)).toBeInTheDocument();
+    expect(listTokensMock).toHaveBeenCalledWith("mock-token:25");
     expect(screen.getByRole("button", { name: /上一页|previous/i })).toBeEnabled();
 
     await user.click(screen.getByRole("button", { name: /上一页|previous/i }));
     await waitFor(() => expect(screen.queryByText(secondPageTokenId)).not.toBeInTheDocument());
+  });
+
+  it("does not render an empty state when token listing fails", async () => {
+    listTokensMock.mockReset();
+    listTokensMock.mockRejectedValueOnce(new Error("authority unavailable"));
+
+    renderTokenManagement();
+    expect(await screen.findByRole("alert")).toHaveTextContent(/请求未完成|request did not complete/i);
+    expect(screen.queryByText(/暂无机器 Token|no machine tokens/i)).not.toBeInTheDocument();
+  });
+
+  it("blocks replacement after an unresolved operation lookup", async () => {
+    const user = userEvent.setup();
+    listTokensMock.mockReset().mockResolvedValue({ items: [], page: { limit: 25, next_cursor: null } });
+    createAgentTokenMock.mockReset().mockRejectedValueOnce(new ManagementRequestError("authority_unavailable", "reconciliation", null, null, true));
+    getOperationMock.mockReset().mockRejectedValueOnce(new ManagementRequestError("not_found", "reconciliation"));
+
+    renderTokenManagement();
+    await screen.findByTestId("token-management");
+    (document.querySelector("form") as HTMLFormElement).noValidate = true;
+    const createButton = screen.getByRole("button", { name: /创建 Token|create token/i });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    await user.click(createButton);
+    await waitFor(() => expect(createAgentTokenMock).toHaveBeenCalled());
+    const checkButton = await screen.findByRole("button", { name: /查询操作|check operation/i });
+    expect(screen.getByRole("button", { name: /创建 Token|create token/i })).toBeDisabled();
+
+    await user.click(checkButton);
+    expect(await screen.findByText(/暂时没有权威的操作结果|No authoritative operation result/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /创建 Token|create token/i })).toBeDisabled();
+  });
+
+  it("releases the form after a deterministic create rejection", async () => {
+    const user = userEvent.setup();
+    listTokensMock.mockReset().mockResolvedValue({ items: [], page: { limit: 25, next_cursor: null } });
+    createAgentTokenMock.mockReset().mockRejectedValueOnce(new ManagementRequestError("invalid_request", "validation"));
+
+    renderTokenManagement();
+    await screen.findByTestId("token-management");
+    (document.querySelector("form") as HTMLFormElement).noValidate = true;
+    const createButton = screen.getByRole("button", { name: /创建 Token|create token/i });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    await user.click(createButton);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/请求未完成|request did not complete/i);
+    expect(screen.queryByRole("button", { name: /查询操作|check operation/i })).not.toBeInTheDocument();
+    expect(createButton).toBeEnabled();
   });
 });

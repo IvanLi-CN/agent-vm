@@ -48,6 +48,10 @@ function errorMessage(error: unknown, t: (key: string, options?: { defaultValue?
   return t("errors.generic");
 }
 
+function createOutcomeIsUncertain(error: unknown): boolean {
+  return !(error instanceof ManagementRequestError) || error.retryable;
+}
+
 export function TokenManagement() {
   const { t, i18n } = useTranslation();
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
@@ -82,12 +86,11 @@ export function TokenManagement() {
   const session = sessionQuery.data;
   const canManageTokens = session?.capabilities.includes("manage_tokens") ?? false;
   const tokensQuery = useQuery({ queryKey: ["tokens", tokenCursor], queryFn: () => listTokens(tokenCursor), enabled: canManageTokens, refetchInterval: 10_000, refetchIntervalInBackground: false });
-  const clearSessionAfterAuthFailure = (error: unknown) => {
-    if (error instanceof ManagementRequestError && (error.code === "authentication_required" || error.code === "csrf_invalid")) client.removeQueries({ queryKey: ["management-session"], exact: true });
+  const refreshSessionAfterAuthFailure = (error: unknown) => {
+    if (error instanceof ManagementRequestError && (error.code === "authentication_required" || error.code === "csrf_invalid")) void client.invalidateQueries({ queryKey: ["management-session"], exact: true });
   };
 
-  useEffect(() => { clearSessionAfterAuthFailure(sessionQuery.error); }, [sessionQuery.error]);
-  useEffect(() => { clearSessionAfterAuthFailure(tokensQuery.error); }, [tokensQuery.error]);
+  useEffect(() => { refreshSessionAfterAuthFailure(tokensQuery.error); }, [tokensQuery.error]);
 
   const createMutation = useMutation({
     mutationFn: (request: CreateRequest) => createAgentToken(request.scopes, request.expiresAt, request.auditReason, request.operationId),
@@ -118,8 +121,18 @@ export function TokenManagement() {
       void client.invalidateQueries({ queryKey: ["audit"] });
     },
     onError: (error, request: CreateRequest) => {
-      clearSessionAfterAuthFailure(error);
+      refreshSessionAfterAuthFailure(error);
       setCreateError(errorMessage(error, t));
+      if (!createOutcomeIsUncertain(error)) {
+        setCreateRequest(null);
+        setCreateOperationIdValue(null);
+        setCreateRecoveryOperationId(null);
+        setCreateRecoveryStatus(null);
+        setCreateRecoveryTokenId(null);
+        setCreateRecoveryDecision(null);
+        setCreateRecoveryError(null);
+        return;
+      }
       setCreateRequest(request);
       setCreateOperationIdValue(null);
       setCreateRecoveryOperationId(request.operationId);
@@ -153,7 +166,7 @@ export function TokenManagement() {
       void client.invalidateQueries({ queryKey: ["operations"] });
       void client.invalidateQueries({ queryKey: ["audit"] });
     },
-    onError: (error) => { clearSessionAfterAuthFailure(error); setRevokeError(errorMessage(error, t)); },
+    onError: (error) => { refreshSessionAfterAuthFailure(error); setRevokeError(errorMessage(error, t)); },
   });
 
   const resetCreateIntent = () => {
@@ -226,6 +239,9 @@ export function TokenManagement() {
         setCreateOperationIdValue(null);
         setCreateRecoveryTokenId(operation.result.token_metadata.token_id);
         setCreateRecoveryDecision("blocked");
+        setTokenCursor(undefined);
+        setTokenCursorStack([]);
+        void client.invalidateQueries({ queryKey: ["tokens"] });
       } else if (operation.status === "failed" && !operation.result) {
         setCreateOperationIdValue(operation.operation_id);
         setCreateError(null);
@@ -327,8 +343,7 @@ export function TokenManagement() {
     <div className="token-list-section">
       <div className="section-header token-section-header"><div><h3>{t("tokens.listTitle")}</h3><p>{t("tokens.count", { count: tokens.length })}</p></div></div>
       {revokeError && !revokePreview ? <p className="field-error" role="alert">{revokeError}</p> : null}
-      {sessionQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : !canManageTokens ? <p className="token-capability-note">{t("tokens.permissionDenied")}</p> : tokensQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : tokens.length ? <div className="token-list" role="list">{tokens.map((token) => <TokenRow key={token.token_id} token={token} locale={locale} revokeDisabled={Boolean(revokeToken) || revokePreviewPending || revokeMutation.isPending || !canManageTokens} onRevoke={(trigger) => void openRevoke(token, trigger)} />)}</div> : <EmptyState title={t("tokens.noTokens")} />}
-      {tokensQuery.isError ? <p className="field-error" role="alert">{t("errors.generic")}</p> : null}
+      {sessionQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : sessionQuery.isError ? <div role="alert"><p className="field-error">{t("errors.generic")}</p><Button variant="ghost" onClick={() => void sessionQuery.refetch()}>{t("common.retry")}</Button></div> : !canManageTokens ? <p className="token-capability-note">{t("tokens.permissionDenied")}</p> : tokensQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : tokensQuery.isError ? <div role="alert"><p className="field-error">{t("errors.generic")}</p><Button variant="ghost" onClick={() => void tokensQuery.refetch()}>{t("common.retry")}</Button></div> : tokens.length ? <div className="token-list" role="list">{tokens.map((token) => <TokenRow key={token.token_id} token={token} locale={locale} revokeDisabled={Boolean(revokeToken) || revokePreviewPending || revokeMutation.isPending || !canManageTokens} onRevoke={(trigger) => void openRevoke(token, trigger)} />)}</div> : <EmptyState title={t("tokens.noTokens")} />}
       <div className="pagination token-pagination"><span>{tokens.length}</span><div><Button variant="ghost" aria-label={t("common.previous")} disabled={!tokenCursorStack.length} onClick={previousTokenPage} icon={<ChevronLeft />} /><Button variant="ghost" aria-label={t("common.next")} disabled={!tokensQuery.data?.page.next_cursor} onClick={nextTokenPage} icon={<ChevronRight />} /></div></div>
     </div>
     {revokeToken && revokePreview ? <ActionDialog preview={actionPreview(revokePreview)} actionLabel={t("tokens.revoke")} target={`${t("tokens.tokenId")} · ${revokeToken.token_id}`} dangerous busy={revokeMutation.isPending} error={revokeError} confirmationText={t("tokens.revokeConfirm")} returnFocusTarget={revokeTriggerRef.current} onCancel={cancelRevoke} onConfirm={(auditReason) => revokeMutation.mutate({ tokenId: revokeToken.token_id, preview: revokePreview, auditReason, operationId: revokeOperationId ?? createOperationId() })} /> : null}
