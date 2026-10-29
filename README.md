@@ -10,35 +10,7 @@ at `2651fc8a8d32eaa611027fc04aa7908843639222` from `agent-toolkit`.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    C["Codex client\nBun"] --> A["request adapter\nSSH compatibility"]
-    A --> U["protected Unix socket\nHTTP over UDS"]
-    U --> H["Gin v1\ninternal control API"]
-    H --> S["Go lifecycle service\nstate, admission, scheduler"]
-    S --> D[("SQLite\ndatabase/sql + modernc.org/sqlite")]
-    S --> I["Incus system containers\nnested LXC boundary"]
-    S --> O["fixed snapshots\ntextfile and relay readers"]
-    F["future transport"] -. "same internal API" .-> U
-```
-
-SSH is retained as a compatibility adapter for the current client contract. It
-is not the business protocol or the control authority, and it can be removed or
-replaced by another transport without changing the Go service or its Gin API.
-The managed guest is an Incus system container inside the authorized control
-environment. This design does not require KVM or `/dev/kvm`.
-
-## Technology boundary
-
-- Go `1.27.3` owns the resident control service and native lifecycle boundary.
-- Gin v1 serves the protected internal HTTP API.
-- SQLite is accessed through `database/sql` and `modernc.org/sqlite`; the
-  control module uses one writer and separate read connections.
-- `x/sys/unix`, `os/exec` and `log/slog` cover Unix process, command and logging
-  boundaries.
-- Bun remains the local client, compatibility bridge and guest one-shot runtime.
-- Python is limited to release/publisher compatibility tools and standard
-  library tests.
+The [system architecture](docs/architecture/system.md) describes the selected component boundaries and identifies the parts that are not yet implemented. Agent VM uses Incus system containers and does not require KVM or `/dev/kvm`.
 
 ## Layout
 
@@ -48,6 +20,8 @@ environment. This design does not require KVM or `/dev/kvm`.
 - `docs/specs/agent-vm/` contains the public behavior and protocol contracts.
 - `docs/adr/` contains the accepted lifecycle, transport, recovery and runtime
   decisions.
+
+See the [documentation guide](docs/README.md) for architecture, specifications, decisions and operations.
 
 ## Management console design
 
