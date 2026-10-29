@@ -1,9 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import "./i18n";
 import { App } from "./App";
+import * as api from "./api";
+import { createAgentToken, ManagementRequestError } from "./api";
 
 function renderApp() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -66,13 +68,57 @@ describe("management console workflow", () => {
     await user.click(revokeTrigger);
     expect(await screen.findByRole("dialog")).toHaveTextContent(/撤销后新的 Agent API 授权会被拒绝|new Agent API authorization/i);
     expect(screen.getAllByRole("button", { name: /撤销|revoke/i }).every((button) => button.hasAttribute("disabled"))).toBe(true);
-    document.body.focus();
+    const outside = document.createElement("button");
+    outside.type = "button";
+    outside.textContent = "outside dialog";
+    document.body.append(outside);
+    outside.focus();
     expect(document.getElementById("action-reason")).toHaveFocus();
+    outside.remove();
     await user.click(screen.getByRole("button", { name: /取消|cancel/i }));
     expect(revokeTrigger).toHaveFocus();
     await user.click(revokeTrigger);
     expect(await screen.findByRole("dialog")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /确认提交|confirm and submit/i }));
     await waitFor(() => expect(screen.getAllByRole("button", { name: /撤销|revoke/i })[0]).toBeDisabled());
+  });
+
+  it("blocks a replacement after an unresolved operation lookup", async () => {
+    const user = userEvent.setup();
+    const createSpy = vi.spyOn(api, "createAgentToken").mockRejectedValueOnce(new ManagementRequestError("authority_unavailable", "reconciliation"));
+    try {
+      window.history.replaceState({}, "", "/system");
+      renderApp();
+      expect(await screen.findByTestId("token-management")).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: /创建 Token|create token/i }));
+      const checkButton = await screen.findByRole("button", { name: /查询操作|check operation/i });
+      expect(screen.getByRole("button", { name: /创建 Token|create token/i })).toBeDisabled();
+
+      await user.click(checkButton);
+      expect(await screen.findByText(/暂时没有权威的操作结果|No authoritative operation result/i)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /创建 Token|create token/i })).toBeDisabled();
+    } finally {
+      createSpy.mockRestore();
+    }
+  });
+
+  it("moves through the bounded token pages", async () => {
+    const user = userEvent.setup();
+    const created = await Promise.all(Array.from({ length: 26 }, (_, index) => createAgentToken(["agent:read"], "2027-01-15T00:00:00.000Z", undefined, `50e8400e-ccf8-4c7b-8d1d-${String(index + 900).padStart(12, "0")}`)));
+    const secondPageTokenId = created[0]?.metadata.token_id;
+    expect(secondPageTokenId).toBeTruthy();
+
+    window.history.replaceState({}, "", "/system");
+    renderApp();
+    expect(await screen.findByTestId("token-management")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: /下一页|next/i })).toBeEnabled());
+    expect(screen.queryByText(secondPageTokenId as string)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /下一页|next/i }));
+    expect(await screen.findByText(secondPageTokenId as string)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /上一页|previous/i })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: /上一页|previous/i }));
+    await waitFor(() => expect(screen.queryByText(secondPageTokenId as string)).not.toBeInTheDocument());
   });
 });

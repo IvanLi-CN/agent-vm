@@ -82,6 +82,7 @@ i18n.addResource("zh-CN", "translation", "tokens.permissionDenied", "当前管�
 i18n.addResource("zh-CN", "translation", "tokens.operationRecoveryHint", "请求结果可能在连接中断前已提交。请先查询操作 {{operationId}}，不要直接重提未知请求。");
 i18n.addResource("zh-CN", "translation", "tokens.checkOperation", "查询操作状态");
 i18n.addResource("zh-CN", "translation", "tokens.operationStatus", "操作状态：{{status}}。只有明确失败且未产生结果时才允许复用原操作 ID。");
+i18n.addResource("zh-CN", "translation", "tokens.operationNotFound", "暂时没有权威的操作结果，不能据此创建替代 Token。请稍后再次查询；在明确确认原操作未提交前不要重提。");
 i18n.addResource("zh-CN", "translation", "tokens.roleAdministrator", "管理员");
 i18n.addResource("zh-CN", "translation", "common.copyFailed", "复制失败，请手动复制。");
 i18n.addResource("en", "translation", "tokens.scopeRequired", "Select at least one Token scope.");
@@ -92,6 +93,7 @@ i18n.addResource("en", "translation", "tokens.permissionDenied", "This administr
 i18n.addResource("en", "translation", "tokens.operationRecoveryHint", "The request may have committed before the connection failed. Query operation {{operationId}} before retrying.");
 i18n.addResource("en", "translation", "tokens.checkOperation", "Check operation status");
 i18n.addResource("en", "translation", "tokens.operationStatus", "Operation status: {{status}}. Reuse the operation ID only after an authoritative failure with no result.");
+i18n.addResource("en", "translation", "tokens.operationNotFound", "No authoritative operation result is available, so a replacement Token is blocked. Check again later; do not retry until the original operation is confirmed not to have committed.");
 i18n.addResource("en", "translation", "tokens.roleAdministrator", "Administrator");
 i18n.addResource("en", "translation", "common.copyFailed", "Copy failed; copy it manually.");
 

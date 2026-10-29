@@ -235,8 +235,13 @@ export function TokenManagement() {
         setCreateRecoveryDecision("check");
       }
     } catch (error) {
-      setCreateRecoveryError(errorMessage(error, t));
-      setCreateRecoveryDecision(error instanceof ManagementRequestError && error.code === "not_found" ? "new_intent" : "check");
+      if (error instanceof ManagementRequestError && error.code === "not_found") {
+        setCreateRecoveryError(t("tokens.operationNotFound"));
+        setCreateRecoveryDecision("blocked");
+      } else {
+        setCreateRecoveryError(errorMessage(error, t));
+        setCreateRecoveryDecision("check");
+      }
     } finally {
       setCreateRecoveryPending(false);
     }
