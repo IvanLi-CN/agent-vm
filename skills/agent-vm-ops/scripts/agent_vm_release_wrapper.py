@@ -1024,7 +1024,7 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
         except (OSError, UnicodeError, json.JSONDecodeError):
             _fail("drain_unverified", "installed client release metadata is invalid")
         view = metadata.get("client_view") if isinstance(metadata, Mapping) else None
-        if isinstance(metadata, Mapping) and metadata.get("format") in {GO_MANIFEST_FORMAT, LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT} and isinstance(view, Mapping) and view.get("transport") == "go-request":
+        if isinstance(metadata, Mapping) and metadata.get("format") in {GO_MANIFEST_FORMAT, LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT} and isinstance(view, Mapping) and view.get("transport") in {"go-request", "https"}:
             command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
     def control_result(action: str, *, allow_legacy_unknown: bool = False) -> Mapping[str, Any] | None:
         try:

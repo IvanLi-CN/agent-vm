@@ -15,6 +15,12 @@ test("format-2 manifest fixes the Go target, toolchain, transport enum and retir
   expect(validate_go_manifest(manifest)).toEqual(manifest);
 });
 
+test("format-2 manifest emits and validates the direct HTTPS transport", () => {
+  const manifest = build_go_manifest("a".repeat(40), artifacts, { transport: "https" });
+  expect(manifest.client_view.transport).toBe("https");
+  expect(validate_go_manifest(manifest)).toEqual(manifest);
+});
+
 test("format-2 manifest rejects a candidate artifact or unknown transport before execution", () => {
   const manifest = build_go_manifest("a".repeat(40), artifacts);
   expect(() => validate_go_manifest({ ...manifest, client_view: { ...manifest.client_view, transport: "shell" } })).toThrow("transport");
@@ -56,6 +62,8 @@ test("format-2 release archive excludes host metadata members", { timeout: 120_0
         "a".repeat(40),
         "--target",
         "linux/amd64",
+        "--transport",
+        "https",
         "--output",
         output,
       ],
@@ -67,6 +75,8 @@ test("format-2 release archive excludes host metadata members", { timeout: 120_0
     const members = new TextDecoder().decode(listing.stdout).trim().split("\n").filter(Boolean);
     expect(members.some((member) => member.split("/").some((part) => part.startsWith("._")))).toBe(false);
     expect(members).toContain("release-manifest.json");
+    const manifest = JSON.parse(new TextDecoder().decode(Bun.spawnSync(["tar", "-xOf", output, "release-manifest.json"], { stdout: "pipe", stderr: "pipe" }).stdout));
+    expect(manifest.client_view.transport).toBe("https");
     expect(readFileSync(output).byteLength).toBeGreaterThan(0);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });

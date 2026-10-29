@@ -131,6 +131,18 @@ func TestLoadVerifiesCompleteGoBundle(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsHTTPSGoTransport(t *testing.T) {
+	manifestPath, _ := validManifest(t)
+	rewriteTransport(t, manifestPath, "https")
+	metadata, err := LoadMetadata(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Transport != "https" || !metadata.ManifestPresent || !metadata.ArtifactsVerified {
+		t.Fatalf("HTTPS metadata = %#v", metadata)
+	}
+}
+
 func TestLoadMetadataReturnsActionCompatibility(t *testing.T) {
 	manifestPath, _ := validManifest(t)
 	metadata, err := LoadMetadata(manifestPath)
@@ -166,6 +178,18 @@ func TestLoadVerifiesProductManifest(t *testing.T) {
 	}
 }
 
+func TestLoadAcceptsHTTPSProductTransport(t *testing.T) {
+	manifestPath := validProductManifest(t)
+	rewriteTransport(t, manifestPath, "https")
+	metadata, err := LoadMetadata(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Transport != "https" || metadata.Version != "1.0.0" {
+		t.Fatalf("HTTPS product metadata = %#v", metadata)
+	}
+}
+
 func TestValidateStateCapabilitiesFailsClosedForLegacyMetadata(t *testing.T) {
 	legacy := Metadata{ManifestPresent: true}
 	if err := ValidateStateCapabilities(legacy, []string{"legacy-agent-vm-core@1", "managed-image-catalog@1"}); err == nil || !strings.Contains(err.Error(), "managed-image-catalog@1") {
@@ -173,6 +197,30 @@ func TestValidateStateCapabilitiesFailsClosedForLegacyMetadata(t *testing.T) {
 	}
 	modern := Metadata{ManifestPresent: true, StateReads: append([]string(nil), stateCapabilityMarkers...), StateWrites: append([]string(nil), stateCapabilityMarkers...)}
 	if err := ValidateStateCapabilities(modern, stateCapabilityMarkers); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func rewriteTransport(t *testing.T, manifestPath, transport string) {
+	t.Helper()
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(data, &root); err != nil {
+		t.Fatal(err)
+	}
+	view, ok := root["client_view"].(map[string]any)
+	if !ok {
+		t.Fatal("client_view is not an object")
+	}
+	view["transport"] = transport
+	encoded, err := json.Marshal(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, append(encoded, '\n'), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }

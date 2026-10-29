@@ -58,10 +58,11 @@ test("format-4 management manifest requires the Linux product target", () => {
     const manifest = build_product_manifest("1.0.0", "b".repeat(40), artifacts, {
       format: 4,
       target: { os: "linux", arch: "amd64" },
-      transport: "go-request",
+      transport: "https",
       operations: default_operations(),
     });
     expect(manifest.format).toBe(4);
+    expect(manifest.client_view.transport).toBe("https");
     expect(manifest.state_compatibility?.reads).toEqual([
       "legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1",
     ]);

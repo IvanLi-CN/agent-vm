@@ -130,7 +130,7 @@ FIXED_ARTIFACTS = frozenset({
 GO_MANIFEST_FORMAT = 2
 GO_TOOLCHAIN = "go1.27.3"
 GO_TARGETS = ("linux/amd64", "linux/arm64")
-GO_CLIENT_TRANSPORTS = ("legacy-bun", "go-request")
+GO_CLIENT_TRANSPORTS = ("legacy-bun", "go-request", "https")
 GO_RETIRED_UNITS = (
     "agent-vm-native-age-gc.service",
     "agent-vm-native-age-gc.timer",

@@ -53,6 +53,12 @@ class GoManifestContractTests(unittest.TestCase):
         self.assertEqual(checked["client_view"]["transport"], "go-request")
         self.assertEqual(checked["retired_units"], list(MANIFEST.GO_RETIRED_UNITS))
 
+    def test_format_two_https_transport_round_trips_through_python(self) -> None:
+        manifest = MANIFEST.build_go_manifest("b" * 40, self.manifest["artifacts"], transport="https")
+        checked = MANIFEST.verify_go_bundle(self.root, manifest)
+        self.assertEqual(checked["client_view"]["transport"], "https")
+        self.assertEqual(MANIFEST.validate_release_manifest(manifest), manifest)
+
     def test_format_one_loader_remains_strict_but_generic_loader_accepts_format_two(self) -> None:
         path = self.root / MANIFEST.MANIFEST_NAME
         path.write_text(json.dumps(self.manifest), encoding="utf-8")

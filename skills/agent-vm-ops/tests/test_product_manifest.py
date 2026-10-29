@@ -87,11 +87,12 @@ class ProductManifestTests(unittest.TestCase):
                 "toolchain": {"bun": "1.4.4", "go": "go1.27.3", "cgo_enabled": False},
                 "artifacts": artifacts,
                 "actions": actions,
-                "client_view": {"version": "1.0.0", "source_revision": "b" * 40, "protocol": 4, "transport": "go-request", "actions": actions},
+                "client_view": {"version": "1.0.0", "source_revision": "b" * 40, "protocol": 4, "transport": "https", "actions": actions},
                 "state_compatibility": {"reads": ["legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1"], "writes": ["legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1"]},
             }
             self.assertEqual(validate_product_manifest(manifest), manifest)
             self.assertEqual(verify_product_bundle(root, manifest), manifest)
+            self.assertEqual(manifest["client_view"]["transport"], "https")
             self.assertIn("systemd/agent-vm-web.service", {item["path"] for item in manifest["artifacts"]})
             self.assertIn("web-assets.manifest.json", {item["path"] for item in manifest["artifacts"]})
 

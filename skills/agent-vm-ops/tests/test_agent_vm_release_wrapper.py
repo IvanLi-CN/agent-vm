@@ -100,6 +100,22 @@ class WrapperTests(unittest.TestCase):
         )
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
+    def test_drain_verification_uses_fixed_go_request_for_https_metadata(self):
+        self.drain_patch.stop()
+        sidecar = Path(self.loaded["control_path"]).with_name("client-release.json")
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"format": 2, "client_view": {"transport": "https"}}), encoding="utf-8")
+        response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
+        with mock.patch.object(
+            WRAPPER.subprocess, "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ) as run:
+            WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(
+            run.call_args.args[0],
+            [str(WRAPPER.GO_CONTROL_PATH), "request", "--socket", str(WRAPPER.GO_CONTROL_SOCKET), "--timeout", "30s"],
+        )
+
     def test_drain_verification_rejects_inflight_management_operations(self):
         self.drain_patch.stop()
         responses = [
