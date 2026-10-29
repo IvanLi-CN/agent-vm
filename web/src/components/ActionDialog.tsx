@@ -5,17 +5,20 @@ import type { ActionPreview } from "../app/types";
 import { formatDateTime } from "../app/format";
 import { Button, Textarea } from "./ui";
 
-export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm, dangerous = false, busy = false, error, confirmationText, children }: { preview: ActionPreview; actionLabel: string; target: string; onCancel: () => void; onConfirm: (reason: string) => void; dangerous?: boolean; busy?: boolean; error?: string | null; confirmationText?: ReactNode; children?: ReactNode }) {
+export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm, dangerous = false, busy = false, error, confirmationText, returnFocusTarget, children }: { preview: ActionPreview; actionLabel: string; target: string; onCancel: () => void; onConfirm: (reason: string) => void; dangerous?: boolean; busy?: boolean; error?: string | null; confirmationText?: ReactNode; returnFocusTarget?: HTMLElement | null; children?: ReactNode }) {
   const { t, i18n } = useTranslation();
   const locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const [reason, setReason] = useState("");
   const reasonRef = useRef<HTMLTextAreaElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
-  const returnFocusRef = useRef<HTMLElement | null>(typeof document === "undefined" ? null : document.activeElement as HTMLElement);
+  const returnFocusRef = useRef<HTMLElement | null>(returnFocusTarget ?? (typeof document === "undefined" ? null : document.activeElement as HTMLElement));
   useLayoutEffect(() => {
     reasonRef.current?.focus();
     return () => {
-      returnFocusRef.current?.focus();
+      const targetElement = returnFocusRef.current;
+      if (!targetElement) return;
+      targetElement.focus();
+      if (document.activeElement !== targetElement) window.setTimeout(() => targetElement.focus(), 0);
     };
   }, []);
   useEffect(() => {

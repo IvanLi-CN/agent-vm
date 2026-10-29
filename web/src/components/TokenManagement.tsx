@@ -2,9 +2,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, ChevronLeft, ChevronRight, KeyRound, ShieldCheck, UserRound } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { ManagementRequestError, createAgentToken, createOperationId, getManagementSession, listTokens, previewTokenRevocation, submitTokenRevocation } from "../app/api";
+import { ManagementRequestError, createAgentToken, createOperationId, getManagementSession, getOperation, listTokens, previewTokenRevocation, submitTokenRevocation } from "../app/api";
 import { formatDateTime } from "../app/format";
-import type { ActionPreview, AgentToken, Locale, ManagementSession, TokenCreateResult, TokenRevokePreview, TokenScope } from "../app/types";
+import type { ActionPreview, AgentToken, Locale, ManagementSession, Operation, TokenCreateResult, TokenRevokePreview, TokenScope } from "../app/types";
 import { ActionDialog } from "./ActionDialog";
 import { Badge, EmptyState, Button, CopyButton, Input, Panel, PanelHeader, StatusBadge, Textarea } from "./ui";
 
@@ -14,6 +14,8 @@ const scopeOptions: Array<{ scope: TokenScope; label: string }> = [
   { scope: "agent:sync", label: "tokens.scopeSync" },
   { scope: "agent:observe_admin", label: "tokens.scopeObserve" },
 ];
+
+type CreateRequest = { scopes: TokenScope[]; expiresAt: string; auditReason: string; operationId: string };
 
 function defaultExpiry(): string {
   const value = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
@@ -53,7 +55,12 @@ export function TokenManagement() {
   const [expiresAt, setExpiresAt] = useState(defaultExpiry);
   const [reason, setReason] = useState("");
   const [createError, setCreateError] = useState<string | null>(null);
+  const [createRequest, setCreateRequest] = useState<CreateRequest | null>(null);
   const [createOperationIdValue, setCreateOperationIdValue] = useState<string | null>(null);
+  const [createRecoveryOperationId, setCreateRecoveryOperationId] = useState<string | null>(null);
+  const [createRecoveryStatus, setCreateRecoveryStatus] = useState<Operation | null>(null);
+  const [createRecoveryPending, setCreateRecoveryPending] = useState(false);
+  const [createRecoveryError, setCreateRecoveryError] = useState<string | null>(null);
   const [plaintextToken, setPlaintextToken] = useState<string | null>(null);
   const [plaintextMetadata, setPlaintextMetadata] = useState<AgentToken | null>(null);
   const [plaintextConsumed, setPlaintextConsumed] = useState(false);
@@ -62,21 +69,29 @@ export function TokenManagement() {
   const [revokeOperationId, setRevokeOperationId] = useState<string | null>(null);
   const [revokeError, setRevokeError] = useState<string | null>(null);
   const revokePreviewRequestRef = useRef(0);
+  const revokeInFlightRef = useRef(false);
+  const revokeTriggerRef = useRef<HTMLElement | null>(null);
   const [revokePreviewPending, setRevokePreviewPending] = useState(false);
   const [tokenCursor, setTokenCursor] = useState<string | undefined>();
   const [tokenCursorStack, setTokenCursorStack] = useState<string[]>([]);
 
   const sessionQuery = useQuery<ManagementSession>({ queryKey: ["management-session"], queryFn: getManagementSession, staleTime: 30_000 });
-  const tokensQuery = useQuery({ queryKey: ["tokens", tokenCursor], queryFn: () => listTokens(tokenCursor), refetchInterval: 10_000, refetchIntervalInBackground: false });
   const session = sessionQuery.data;
   const canManageTokens = session?.capabilities.includes("manage_tokens") ?? false;
+  const tokensQuery = useQuery({ queryKey: ["tokens", tokenCursor], queryFn: () => listTokens(tokenCursor), enabled: canManageTokens, refetchInterval: 10_000, refetchIntervalInBackground: false });
 
   const createMutation = useMutation({
-    mutationFn: ({ auditReason, operationId }: { auditReason: string; operationId: string }) => createAgentToken(scopes, new Date(expiresAt).toISOString(), auditReason, operationId),
+    mutationFn: (request: CreateRequest) => createAgentToken(request.scopes, request.expiresAt, request.auditReason, request.operationId),
     onSuccess: (result: TokenCreateResult) => {
+      const mutation = client.getMutationCache().getAll().find((candidate) => candidate.state.data === result);
+      if (mutation) client.getMutationCache().remove(mutation);
       setCreateError(null);
+      setCreateRequest(null);
       setReason("");
       setCreateOperationIdValue(null);
+      setCreateRecoveryOperationId(null);
+      setCreateRecoveryStatus(null);
+      setCreateRecoveryError(null);
       setTokenCursor(undefined);
       setTokenCursorStack([]);
       setPlaintextMetadata(result.metadata);
@@ -91,7 +106,14 @@ export function TokenManagement() {
       void client.invalidateQueries({ queryKey: ["operations"] });
       void client.invalidateQueries({ queryKey: ["audit"] });
     },
-    onError: (error) => setCreateError(errorMessage(error, t)),
+    onError: (error, request: CreateRequest) => {
+      setCreateError(errorMessage(error, t));
+      setCreateRequest(request);
+      setCreateOperationIdValue(null);
+      setCreateRecoveryOperationId(request.operationId);
+      setCreateRecoveryStatus(null);
+      setCreateRecoveryError(null);
+    },
   });
 
   useEffect(() => {
@@ -99,8 +121,9 @@ export function TokenManagement() {
   }, [createMutation.isSuccess]);
 
   const revokeMutation = useMutation({
-    mutationFn: ({ auditReason, operationId }: { auditReason: string; operationId: string }) => submitTokenRevocation(revokeToken?.token_id ?? "", auditReason, revokePreview!, operationId),
+    mutationFn: ({ tokenId, preview, auditReason, operationId }: { tokenId: string; preview: TokenRevokePreview; auditReason: string; operationId: string }) => submitTokenRevocation(tokenId, auditReason, preview, operationId),
     onSuccess: () => {
+      revokeInFlightRef.current = false;
       setRevokeToken(null);
       setRevokePreview(null);
       setRevokeOperationId(null);
@@ -113,7 +136,18 @@ export function TokenManagement() {
     onError: (error) => setRevokeError(errorMessage(error, t)),
   });
 
+  const resetCreateIntent = () => {
+    if (createMutation.isPending) return;
+    setCreateError(null);
+    setCreateRequest(null);
+    setCreateOperationIdValue(null);
+    setCreateRecoveryOperationId(null);
+    setCreateRecoveryStatus(null);
+    setCreateRecoveryError(null);
+  };
+
   const toggleScope = (scope: TokenScope) => {
+    resetCreateIntent();
     setScopes((current) => {
       if (current.includes(scope)) {
         if (scope === "agent:read" && current.includes("agent:operate")) return current;
@@ -136,15 +170,50 @@ export function TokenManagement() {
       setCreateError(t("tokens.expiryRequired"));
       return;
     }
-    const operationId = createOperationIdValue ?? createOperationId();
-    if (!createOperationIdValue) setCreateOperationIdValue(operationId);
-    createMutation.mutate({ auditReason: reason.trim(), operationId });
+    const retryRequest = createOperationIdValue && createRequest?.operationId === createOperationIdValue ? createRequest : null;
+    const request: CreateRequest = retryRequest ?? { scopes: [...scopes], expiresAt: new Date(expiresAt).toISOString(), auditReason: reason.trim(), operationId: createOperationId() };
+    setCreateRequest(request);
+    setCreateRecoveryOperationId(null);
+    setCreateRecoveryStatus(null);
+    setCreateRecoveryError(null);
+    createMutation.mutate(request);
   };
 
-  const openRevoke = async (token: AgentToken) => {
+  const checkCreateOperation = async () => {
+    if (!createRecoveryOperationId) return;
+    setCreateRecoveryPending(true);
+    setCreateRecoveryError(null);
+    try {
+      const operation = await getOperation(createRecoveryOperationId);
+      setCreateRecoveryStatus(operation);
+      if (operation.status === "succeeded" && operation.result?.token_metadata) {
+        setPlaintextMetadata(operation.result.token_metadata);
+        setPlaintextToken(null);
+        setPlaintextConsumed(true);
+        setCreateError(null);
+        setCreateRequest(null);
+        setCreateOperationIdValue(null);
+      } else if (operation.status === "failed" && !operation.result) {
+        setCreateOperationIdValue(operation.operation_id);
+        setCreateError(null);
+      } else {
+        setCreateOperationIdValue(null);
+      }
+    } catch (error) {
+      setCreateRecoveryError(errorMessage(error, t));
+    } finally {
+      setCreateRecoveryPending(false);
+    }
+  };
+
+  const openRevoke = async (token: AgentToken, trigger?: HTMLElement) => {
+    if (revokeInFlightRef.current || revokeToken) return;
+    revokeInFlightRef.current = true;
+    revokeTriggerRef.current = trigger ?? (typeof document === "undefined" ? null : document.activeElement as HTMLElement);
     const requestId = revokePreviewRequestRef.current + 1;
     revokePreviewRequestRef.current = requestId;
     setRevokeError(null);
+    setRevokePreview(null);
     setRevokePreviewPending(true);
     setRevokeToken(token);
     setRevokeOperationId(createOperationId());
@@ -153,6 +222,7 @@ export function TokenManagement() {
       if (revokePreviewRequestRef.current === requestId) setRevokePreview(preview);
     } catch (error) {
       if (revokePreviewRequestRef.current === requestId) {
+        revokeInFlightRef.current = false;
         setRevokeToken(null);
         setRevokePreview(null);
         setRevokeError(errorMessage(error, t));
@@ -164,6 +234,7 @@ export function TokenManagement() {
 
   const cancelRevoke = () => {
     revokePreviewRequestRef.current += 1;
+    revokeInFlightRef.current = false;
     setRevokePreviewPending(false);
     setRevokeToken(null);
     setRevokePreview(null);
@@ -203,10 +274,11 @@ export function TokenManagement() {
           {scopes.includes("agent:operate") ? <p className="field-hint">{t("tokens.operateNeedsRead")}</p> : null}
         </fieldset>
         <div className="token-form-fields">
-          <label className="field-label"><span>{t("tokens.expiresAt")}</span><Input type="datetime-local" value={expiresAt} onChange={(event) => setExpiresAt(event.target.value)} disabled={!canManageTokens} required /></label>
-          <label className="field-label"><span>{t("tokens.reason")} <em>({t("common.optional")})</em></span><Textarea value={reason} onChange={(event) => setReason(event.target.value)} rows={2} disabled={!canManageTokens} placeholder={t("common.reasonPlaceholder")} /></label>
+          <label className="field-label"><span>{t("tokens.expiresAt")}</span><Input type="datetime-local" value={expiresAt} onChange={(event) => { resetCreateIntent(); setExpiresAt(event.target.value); }} disabled={!canManageTokens} required /></label>
+          <label className="field-label"><span>{t("tokens.reason")} <em>({t("common.optional")})</em></span><Textarea value={reason} onChange={(event) => { resetCreateIntent(); setReason(event.target.value); }} rows={2} disabled={!canManageTokens} placeholder={t("common.reasonPlaceholder")} /></label>
         </div>
         {createError ? <div role="alert"><p className="field-error">{createError}</p>{createOperationIdValue ? <p className="token-retry-hint">{t("tokens.retryCreate", { operationId: createOperationIdValue })}</p> : null}</div> : null}
+        {createRecoveryOperationId ? <div className="token-recovery"><p className="token-retry-hint">{t("tokens.operationRecoveryHint", { operationId: createRecoveryOperationId })}</p><Button type="button" variant="ghost" disabled={createRecoveryPending} onClick={() => void checkCreateOperation()}>{createRecoveryPending ? t("common.loading") : t("tokens.checkOperation")}</Button>{createRecoveryError ? <p className="field-error" role="alert">{createRecoveryError}</p> : null}{createRecoveryStatus ? <p className="token-retry-hint" data-testid="token-operation-status">{t("tokens.operationStatus", { status: t(`status.${createRecoveryStatus.status}`) })}</p> : null}</div> : null}
         <div className="token-form-actions"><Button type="submit" variant="primary" disabled={createMutation.isPending || !canManageTokens} icon={<KeyRound />}>{createMutation.isPending ? t("common.loading") : createOperationIdValue ? t("tokens.retryCreateButton") : t("tokens.create")}</Button></div>
       </form>
     </div>
@@ -214,11 +286,11 @@ export function TokenManagement() {
     <div className="token-list-section">
       <div className="section-header token-section-header"><div><h3>{t("tokens.listTitle")}</h3><p>{t("tokens.count", { count: tokens.length })}</p></div></div>
       {revokeError && !revokePreview ? <p className="field-error" role="alert">{revokeError}</p> : null}
-      {tokensQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : tokens.length ? <div className="token-list" role="list">{tokens.map((token) => <TokenRow key={token.token_id} token={token} locale={locale} revokeDisabled={revokePreviewPending || !canManageTokens} onRevoke={() => void openRevoke(token)} />)}</div> : <EmptyState title={t("tokens.noTokens")} />}
+      {sessionQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : !canManageTokens ? <p className="token-capability-note">{t("tokens.permissionDenied")}</p> : tokensQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : tokens.length ? <div className="token-list" role="list">{tokens.map((token) => <TokenRow key={token.token_id} token={token} locale={locale} revokeDisabled={Boolean(revokeToken) || revokePreviewPending || revokeMutation.isPending || !canManageTokens} onRevoke={(trigger) => void openRevoke(token, trigger)} />)}</div> : <EmptyState title={t("tokens.noTokens")} />}
       {tokensQuery.isError ? <p className="field-error" role="alert">{t("errors.generic")}</p> : null}
       <div className="pagination token-pagination"><span>{tokens.length}</span><div><Button variant="ghost" aria-label={t("common.previous")} disabled={!tokenCursorStack.length} onClick={previousTokenPage} icon={<ChevronLeft />} /><Button variant="ghost" aria-label={t("common.next")} disabled={!tokensQuery.data?.page.next_cursor} onClick={nextTokenPage} icon={<ChevronRight />} /></div></div>
     </div>
-    {revokeToken && revokePreview ? <ActionDialog preview={actionPreview(revokePreview)} actionLabel={t("tokens.revoke")} target={`${t("tokens.tokenId")} · ${revokeToken.token_id}`} dangerous busy={revokeMutation.isPending} error={revokeError} confirmationText={t("tokens.revokeConfirm")} onCancel={cancelRevoke} onConfirm={(auditReason) => revokeMutation.mutate({ auditReason, operationId: revokeOperationId ?? createOperationId() })} /> : null}
+    {revokeToken && revokePreview ? <ActionDialog preview={actionPreview(revokePreview)} actionLabel={t("tokens.revoke")} target={`${t("tokens.tokenId")} · ${revokeToken.token_id}`} dangerous busy={revokeMutation.isPending} error={revokeError} confirmationText={t("tokens.revokeConfirm")} returnFocusTarget={revokeTriggerRef.current} onCancel={cancelRevoke} onConfirm={(auditReason) => revokeMutation.mutate({ tokenId: revokeToken.token_id, preview: revokePreview, auditReason, operationId: revokeOperationId ?? createOperationId() })} /> : null}
   </Panel>;
 }
 
@@ -230,13 +302,13 @@ function SessionSummary({ session, locale }: { session: ManagementSession; local
   </div>;
 }
 
-function TokenRow({ token, locale, revokeDisabled, onRevoke }: { token: AgentToken; locale: Locale; revokeDisabled: boolean; onRevoke: () => void }) {
+function TokenRow({ token, locale, revokeDisabled, onRevoke }: { token: AgentToken; locale: Locale; revokeDisabled: boolean; onRevoke: (trigger: HTMLElement) => void }) {
   const { t } = useTranslation();
   const state = tokenState(token);
   return <article className="token-row" role="listitem">
     <div className="token-row-main"><div className="token-row-title"><strong className="mono" title={token.token_id}>{token.token_id}</strong><CopyButton value={token.token_id} /><Badge tone={state === "active" ? "success" : state === "expired" ? "warning" : "danger"}>{t(`tokens.${state}`)}</Badge></div><div className="token-scopes">{token.scopes.map((scope) => <span className="scope-tag" key={scope}>{scope}</span>)}</div></div>
     <dl className="token-row-meta"><div><dt>{t("tokens.created")}</dt><dd>{formatDateTime(token.created_at, locale)}</dd></div><div><dt>{token.revoked_at ? t("tokens.revokedAt") : t("tokens.expires")}</dt><dd>{formatDateTime(token.revoked_at ?? token.expires_at, locale)}</dd></div></dl>
-    <Button variant="danger" disabled={state !== "active" || revokeDisabled} onClick={onRevoke} icon={<ShieldCheck />}>{t("tokens.revoke")}</Button>
+    <Button variant="danger" disabled={state !== "active" || revokeDisabled} onClick={(event) => onRevoke(event.currentTarget)} icon={<ShieldCheck />}>{t("tokens.revoke")}</Button>
   </article>;
 }
 

@@ -78,14 +78,20 @@ i18n.addResource("zh-CN", "translation", "tokens.scopeRequired", "至少选择�
 i18n.addResource("zh-CN", "translation", "tokens.expiryRequired", "请输入未来的到期时间。");
 i18n.addResource("zh-CN", "translation", "tokens.retryCreate", "可使用同一操作 ID 重试本次请求：{{operationId}}");
 i18n.addResource("zh-CN", "translation", "tokens.retryCreateButton", "重试同一操作");
-i18n.addResource("zh-CN", "translation", "tokens.permissionDenied", "当前管理员会话没有 manage_tokens 能力；只能查看 Token 状态。");
+i18n.addResource("zh-CN", "translation", "tokens.permissionDenied", "当前管理员会话没有 manage_tokens 能力；Token 端点不可用。");
+i18n.addResource("zh-CN", "translation", "tokens.operationRecoveryHint", "请求结果可能在连接中断前已提交。请先查询操作 {{operationId}}，不要直接重提未知请求。");
+i18n.addResource("zh-CN", "translation", "tokens.checkOperation", "查询操作状态");
+i18n.addResource("zh-CN", "translation", "tokens.operationStatus", "操作状态：{{status}}。只有明确失败且未产生结果时才允许复用原操作 ID。");
 i18n.addResource("zh-CN", "translation", "tokens.roleAdministrator", "管理员");
 i18n.addResource("zh-CN", "translation", "common.copyFailed", "复制失败，请手动复制。");
 i18n.addResource("en", "translation", "tokens.scopeRequired", "Select at least one Token scope.");
 i18n.addResource("en", "translation", "tokens.expiryRequired", "Enter an expiration time in the future.");
 i18n.addResource("en", "translation", "tokens.retryCreate", "Retry this request with the same operation ID: {{operationId}}");
 i18n.addResource("en", "translation", "tokens.retryCreateButton", "Retry same operation");
-i18n.addResource("en", "translation", "tokens.permissionDenied", "This administrator session lacks manage_tokens; Token status is read-only.");
+i18n.addResource("en", "translation", "tokens.permissionDenied", "This administrator session lacks manage_tokens; Token endpoints are unavailable.");
+i18n.addResource("en", "translation", "tokens.operationRecoveryHint", "The request may have committed before the connection failed. Query operation {{operationId}} before retrying.");
+i18n.addResource("en", "translation", "tokens.checkOperation", "Check operation status");
+i18n.addResource("en", "translation", "tokens.operationStatus", "Operation status: {{status}}. Reuse the operation ID only after an authoritative failure with no result.");
 i18n.addResource("en", "translation", "tokens.roleAdministrator", "Administrator");
 i18n.addResource("en", "translation", "common.copyFailed", "Copy failed; copy it manually.");
 

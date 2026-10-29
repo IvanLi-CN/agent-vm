@@ -7,7 +7,7 @@ import { App } from "./App";
 
 function renderApp() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(<QueryClientProvider client={client}><App /></QueryClientProvider>);
+  return { client, ...render(<QueryClientProvider client={client}><App /></QueryClientProvider>) };
 }
 
 describe("management console workflow", () => {
@@ -47,7 +47,7 @@ describe("management console workflow", () => {
   it("creates a machine token and only exposes its plaintext until dismissed", async () => {
     const user = userEvent.setup();
     window.history.replaceState({}, "", "/system");
-    renderApp();
+    const { client } = renderApp();
     expect(await screen.findByTestId("token-management")).toBeInTheDocument();
     expect(await screen.findByText("tok_read_01_7d9e22b1")).toBeInTheDocument();
 
@@ -55,14 +55,21 @@ describe("management console workflow", () => {
     expect(await screen.findByTestId("token-plaintext")).toBeInTheDocument();
     const plaintext = screen.getByTestId("token-plaintext").textContent;
     expect(plaintext).toBeTruthy();
+    expect(client.getMutationCache().getAll().every((mutation) => !mutation.state.data || !("token" in (mutation.state.data as object)))).toBe(true);
 
     await user.click(screen.getByRole("button", { name: /隐藏明文|hide plaintext/i }));
     expect(screen.queryByTestId("token-plaintext")).not.toBeInTheDocument();
     expect(screen.getByTestId("token-disclosure")).toHaveTextContent(/明文披露状态已消费|disclosure latch is consumed/i);
 
     await waitFor(() => expect(screen.getAllByRole("button", { name: /撤销|revoke/i })).toHaveLength(3));
-    await user.click(screen.getAllByRole("button", { name: /撤销|revoke/i })[0]);
+    const revokeTrigger = screen.getAllByRole("button", { name: /撤销|revoke/i })[0];
+    await user.click(revokeTrigger);
     expect(await screen.findByRole("dialog")).toHaveTextContent(/撤销后新的 Agent API 授权会被拒绝|new Agent API authorization/i);
+    expect(screen.getAllByRole("button", { name: /撤销|revoke/i }).every((button) => button.hasAttribute("disabled"))).toBe(true);
+    await user.click(screen.getByRole("button", { name: /取消|cancel/i }));
+    expect(revokeTrigger).toHaveFocus();
+    await user.click(revokeTrigger);
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /确认提交|confirm and submit/i }));
     await waitFor(() => expect(screen.getAllByRole("button", { name: /撤销|revoke/i })[0]).toBeDisabled());
   });

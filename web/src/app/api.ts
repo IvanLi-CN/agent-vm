@@ -10,23 +10,40 @@ export class ManagementRequestError extends Error {
   readonly phase: string | null;
   readonly operationId: string | null;
   readonly safeFields: Record<string, unknown> | null;
+  readonly retryable: boolean;
 
-  constructor(code: string, phase: string | null = null, operationId: string | null = null, safeFields: Record<string, unknown> | null = null) {
+  constructor(code: string, phase: string | null = null, operationId: string | null = null, safeFields: Record<string, unknown> | null = null, retryable = false) {
     super(code);
     this.name = "ManagementRequestError";
     this.code = code;
     this.phase = phase;
     this.operationId = operationId;
     this.safeFields = safeFields;
+    this.retryable = retryable;
   }
 }
 
 let csrfToken: string | null = null;
 let csrfExpiresAt = 0;
-let sessionPromise: Promise<string> | null = null;
+let managementSession: ManagementSession | null = null;
+let sessionPromise: Promise<ManagementSession> | null = null;
 const mockTokenCreates = new Map<string, { metadata: AgentToken; request: string }>();
 const mockTokenRevocations = new Map<string, { operation: Operation; request: string }>();
 const mockTokenRevocationPreviews = new Map<string, { tokenId: string; targetVersion: string; expiresAt: string }>();
+
+function cloneTokenMetadata(token: AgentToken): AgentToken {
+  return { ...token, scopes: [...token.scopes] };
+}
+
+function cloneOperation(operation: Operation): Operation {
+  return {
+    ...operation,
+    actor: { ...operation.actor },
+    target: { ...operation.target },
+    result: operation.result ? { ...operation.result, token_metadata: operation.result.token_metadata ? cloneTokenMetadata(operation.result.token_metadata) : operation.result.token_metadata } : null,
+    error: operation.error ? { ...operation.error, safe_fields: operation.error.safe_fields ? { ...operation.error.safe_fields } : operation.error.safe_fields } : null,
+  };
+}
 
 export function createOperationId(): string {
   const cryptoApi = typeof globalThis.crypto !== "undefined" ? globalThis.crypto : null;
@@ -47,27 +64,33 @@ async function requestJSON<T>(path: string, init: RequestInit | undefined, optio
   const response = await fetch(`/api/v1${path}`, { credentials: "same-origin", ...init, headers });
   if (response.ok) return JSON.parse(await response.text()) as T;
   const raw = await response.text();
-  let body: (T & { error?: { code?: string; phase?: string; operation_id?: string; safe_fields?: Record<string, unknown> } }) | null = null;
+  let body: (T & { error?: { code?: string; phase?: string; operation_id?: string; retryable?: boolean; safe_fields?: Record<string, unknown> } }) | null = null;
   if (raw) {
     try {
-      body = JSON.parse(raw) as T & { error?: { code?: string } };
+      body = JSON.parse(raw) as T & { error?: { code?: string; phase?: string; operation_id?: string; retryable?: boolean; safe_fields?: Record<string, unknown> } };
     } catch {
       body = null;
     }
   }
-  throw new ManagementRequestError(body?.error?.code ?? "internal_error", body?.error?.phase ?? null, body?.error?.operation_id ?? null, body?.error?.safe_fields ?? null);
+  throw new ManagementRequestError(body?.error?.code ?? "internal_error", body?.error?.phase ?? null, body?.error?.operation_id ?? null, body?.error?.safe_fields ?? null, body?.error?.retryable === true);
 }
 
-async function ensureSession(): Promise<string> {
-  if (csrfToken && Date.now() < csrfExpiresAt - 5_000) return csrfToken;
+function sessionIsFresh(): boolean {
+  return Boolean(csrfToken && managementSession && Date.now() < csrfExpiresAt - 5_000);
+}
+
+async function loadManagementSession(): Promise<ManagementSession> {
+  if (sessionIsFresh() && managementSession) return managementSession;
   csrfToken = null;
+  managementSession = null;
   if (!sessionPromise) {
     sessionPromise = requestJSON<ManagementSession>("/session", undefined)
       .then((session) => {
         if (!session.csrf_token) throw new Error("authentication_required");
+        managementSession = session;
         csrfToken = session.csrf_token;
         csrfExpiresAt = session.expires_at ? Date.parse(session.expires_at) : Date.now() + 14 * 60_000;
-        return session.csrf_token;
+        return session;
       })
       .finally(() => {
         sessionPromise = null;
@@ -76,17 +99,27 @@ async function ensureSession(): Promise<string> {
   return sessionPromise;
 }
 
+async function ensureSession(): Promise<string> {
+  if (sessionIsFresh() && csrfToken) return csrfToken;
+  csrfToken = null;
+  managementSession = null;
+  return (await loadManagementSession()).csrf_token;
+}
+
 async function realRequest<T>(path: string, init?: RequestInit, options: RealRequestOptions = {}): Promise<T> {
   const method = (init?.method ?? "GET").toUpperCase();
+  if (path === "/session" && method === "GET") return loadManagementSession() as Promise<T>;
   const headers = new Headers(init?.headers);
   if (method !== "GET" && method !== "HEAD") headers.set("X-CSRF-Token", await ensureSession());
   else await ensureSession();
   try {
-    return await requestJSON<T>(path, { ...init, headers }, options);
+    const result = await requestJSON<T>(path, { ...init, headers }, options);
+    return result;
   } catch (error) {
     if (error instanceof ManagementRequestError && (error.code === "authentication_required" || error.code === "csrf_invalid")) {
       csrfToken = null;
       csrfExpiresAt = 0;
+      managementSession = null;
     }
     throw error;
   }
@@ -132,7 +165,19 @@ export async function listImages(query = "", cursor?: string): Promise<{ items: 
 
 export async function listTokens(cursor?: string): Promise<TokenPage> {
   if (useRealApi) return realRequest<TokenPage>(`/tokens?limit=25${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
-  return delay({ items: mockState.tokens.map((token) => ({ ...token, scopes: [...token.scopes] })), page: { limit: 25, next_cursor: null } });
+  const offset = cursor ? Number(/^mock-token:(\d+)$/.exec(cursor)?.[1] ?? NaN) : 0;
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new ManagementRequestError("invalid_request", "validation");
+  const limit = 25;
+  const pageItems = mockState.tokens.slice(offset, offset + limit).map(cloneTokenMetadata);
+  const nextOffset = offset + pageItems.length;
+  return delay({ items: pageItems, page: { limit, next_cursor: nextOffset < mockState.tokens.length ? `mock-token:${nextOffset}` : null } });
+}
+
+export async function getOperation(operationId: string): Promise<Operation> {
+  if (useRealApi) return realRequest<Operation>(`/operations/${encodeURIComponent(operationId)}`);
+  const operation = mockState.operations.find((candidate) => candidate.operation_id === operationId);
+  if (!operation) throw new ManagementRequestError("not_found", "reconciliation", operationId);
+  return delay(cloneOperation(operation));
 }
 
 export async function createAgentToken(scopes: TokenScope[], expiresAt: string, reason?: string, operationId = createOperationId()): Promise<TokenCreateResult> {
@@ -142,17 +187,18 @@ export async function createAgentToken(scopes: TokenScope[], expiresAt: string, 
   const previous = mockTokenCreates.get(operationId);
   if (previous) {
     if (previous.request !== request) throw new ManagementRequestError("operation_conflict", "precondition", operationId);
-    return delay({ operation_id: operationId, metadata: previous.metadata, plaintext_disclosure: "consumed" });
+    return delay({ operation_id: operationId, metadata: cloneTokenMetadata(previous.metadata), plaintext_disclosure: "consumed" });
   }
   const tokenId = `tok_${createOperationId().replaceAll("-", "").slice(0, 24)}`;
   const metadata: AgentToken = { token_id: tokenId, resource_version: `token:${tokenId}:revision-1`, scopes: [...scopes], created_at: new Date().toISOString(), expires_at: expiresAt, revoked_at: null };
-  mockState.tokens.unshift(metadata);
-  mockTokenCreates.set(operationId, { metadata, request });
+  const storedMetadata = cloneTokenMetadata(metadata);
+  mockState.tokens.unshift(storedMetadata);
+  mockTokenCreates.set(operationId, { metadata: cloneTokenMetadata(storedMetadata), request });
   const plaintext = `${createOperationId().replaceAll("-", "")}${createOperationId().replaceAll("-", "")}`;
   const operation = createMockOperation("token_create", { kind: "token", id: tokenId }, reason?.trim() || null, "succeeded", operationId);
-  operation.result = { token_metadata: metadata, plaintext_disclosure: "returned" };
+  operation.result = { token_metadata: cloneTokenMetadata(storedMetadata), plaintext_disclosure: "returned" };
   createMockAudit(operation);
-  return delay({ operation_id: operationId, token: plaintext, metadata, plaintext_disclosure: "returned" });
+  return delay({ operation_id: operationId, token: plaintext, metadata: cloneTokenMetadata(storedMetadata), plaintext_disclosure: "returned" });
 }
 
 export async function previewTokenRevocation(tokenId: string, targetVersion: string): Promise<TokenRevokePreview> {
@@ -173,7 +219,7 @@ export async function submitTokenRevocation(tokenId: string, reason: string | un
   const previous = mockTokenRevocations.get(operationId);
   if (previous) {
     if (previous.request !== request) throw new ManagementRequestError("operation_conflict", "precondition", operationId);
-    return delay(previous.operation);
+    return delay(cloneOperation(previous.operation));
   }
   const token = mockState.tokens.find((candidate) => candidate.token_id === tokenId);
   const previewBinding = mockTokenRevocationPreviews.get(preview.confirmation_token);
@@ -187,7 +233,7 @@ export async function submitTokenRevocation(tokenId: string, reason: string | un
   mockTokenRevocations.set(operationId, { operation, request });
   mockTokenRevocationPreviews.delete(preview.confirmation_token);
   createMockAudit(operation);
-  return delay(operation);
+  return delay(cloneOperation(operation));
 }
 
 export async function listOperations(status = "all", cursor?: string): Promise<{ items: Operation[]; page: { limit: number; next_cursor: string | null } }> {
