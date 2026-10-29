@@ -2,6 +2,38 @@
 
 This document is the public operational boundary for the Native Incus Agent VM contract. It records the topology that is actually established by the deployment evidence and the recovery actions that the existing client and control contract can perform. It is not a host inventory and does not claim a physical or virtual source below the observed CT.
 
+This runbook describes the current pre-blue-green SSH/SQLite recovery baseline.
+The target deployment uses the unified service, stable project Caddy and shared
+rqlite defined by [the system architecture](../../architecture/system.md) and
+[ADR 0044](../../adr/0044-agent-vm-state-migration-to-rqlite.md). After the
+one-time migration, do not restore or open the protected SQLite material as a
+second live authority; perform drain, export, import and verification according
+to that ADR.
+
+## Post-cutover rqlite recovery
+
+After cutover, rqlite is the only live state authority. If it is unavailable, its
+data fails schema/capability or digest validation, or its journal cannot be
+verified, keep the state-write fence and native admission closed while retaining
+read-only access to effective leases; do not treat the old SQLite export as
+current state. Recovery first restores a verified post-cutover rqlite
+backup/snapshot into an isolated target. The backup must record a coverage
+boundary at or after the last trusted commit; recovery then reconciles the
+backup tail after that boundary with the trusted append-only journal and native
+effect evidence. `state_epoch`, generations, operation journal order, Token
+revocation, audit records and native-effect checks alone do not prove backup
+coverage. Resume the shared service only after the boundary and tail are
+proven.
+
+The pre-cutover SQLite snapshot is admissible only when protected evidence proves
+that no post-cutover durable write, epoch advance, lease change or native effect
+occurred. If any post-cutover write may have happened, a verified rqlite recovery
+source with a proven coverage boundary and tail is required. If the coverage
+or tail cannot be proven, stay fenced for administrator-authorized
+journal/native inventory reconciliation; do not open stale SQLite concurrently,
+guess a new generation, reconstruct state from logs, or delete records to force
+readiness.
+
 ## Topology and provenance
 
 | Layer | Established role | Boundary |
@@ -106,6 +138,6 @@ The inventory view covers active, preparing, closing, deleting, failed, cached a
 
 - [Native Incus Agent VM specification](SPEC.md)
 - [Agent VM CLI contract](contracts/cli.md)
-- [Native deployment boundary](../../skills/agent-vm-ops/references/deployment.md)
+- [Native deployment boundary](../../../skills/agent-vm-ops/references/deployment.md)
 - [Agent VM topology and recovery boundary](../../adr/0028-agent-vm-topology-recovery-boundary.md)
 - [Agent VM control-plane update boundary](../../adr/0030-agent-vm-control-plane-update-boundary.md)

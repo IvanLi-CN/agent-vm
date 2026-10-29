@@ -10,7 +10,7 @@ at `2651fc8a8d32eaa611027fc04aa7908843639222` from `agent-toolkit`.
 
 ## Architecture
 
-The [system architecture](docs/architecture/system.md) describes the selected component boundaries and identifies the parts that are not yet implemented. Agent VM uses Incus system containers and does not require KVM or `/dev/kvm`.
+The [system architecture](docs/architecture/system.md) is the single architecture source of truth for two complete blue-green Agent VM service slots behind one project-owned Caddy entry point and shared rqlite state. It identifies the parts that are not yet implemented. Agent VM uses Incus system containers and does not require KVM or `/dev/kvm`.
 
 ## Layout
 
@@ -25,9 +25,9 @@ See the [documentation guide](docs/README.md) for architecture, specifications, 
 
 ## Management console design
 
-The built-in Web management console is a product target and has not been implemented. Its scope covers managed images and existing Agent session VMs, with controlled maintenance and audit. The approved first-release contract fixes five pages, `zh-CN`/`en` localization, the authenticated same-origin `/api/v1` boundary, image migration, and package rollback compatibility.
+The built-in Web management console is a product target and has not been implemented. Its scope covers managed images and existing Agent session VMs, with controlled maintenance and audit. The approved first-release contract fixes five pages, `zh-CN`/`en` localization, OIDC Authorization Code + PKCE for the single administrator, the same-origin `/api/v1` boundary, the opaque machine-Token `/agent/v1/control` API, conservative SQLite-to-rqlite migration, and package rollback compatibility.
 
-Read [PRODUCT.md](PRODUCT.md) for product boundaries, [DESIGN.md](DESIGN.md) for the selected workbench baseline, and the [Web surface brief](.impeccable/surfaces/web.md) for task flows. The [management contract](docs/specs/agent-vm/contracts/management-api.md), [OpenAPI document](docs/specs/agent-vm/contracts/management-api.yaml), and its synthetic examples define the shared frontend/backend API and state-compatibility boundary. The [decision memo](docs/proposals/agent-vm-web-console.md) records the source investigation and architecture rationale.
+Read [PRODUCT.md](PRODUCT.md) for product boundaries, [DESIGN.md](DESIGN.md) for the selected workbench baseline, and the [Web surface brief](.impeccable/surfaces/web.md) for task flows. The [management contract](docs/specs/agent-vm/contracts/management-api.md), [Token API](docs/specs/agent-vm/contracts/token-api.md), [Agent API](docs/specs/agent-vm/contracts/agent-api.md), [OpenAPI document](docs/specs/agent-vm/contracts/management-api.yaml), and its synthetic examples define the shared frontend/backend API and state-compatibility boundary. The [decision memo](docs/proposals/agent-vm-web-console.md) records historical product research; the active security choice is [ADR 0043](docs/adr/0043-agent-vm-unified-service-security-boundary.md).
 
 ## Local validation
 

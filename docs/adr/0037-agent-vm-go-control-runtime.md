@@ -4,6 +4,11 @@
 
 Accepted for the Agent VM control-plane migration.
 
+The SQLite, protected-UDS and SSH details in this ADR describe the pre-blue-green
+control-runtime baseline. The blue-green service boundary and the post-migration
+shared state authority are defined by ADR 0043 and ADR 0044; those decisions do
+not change the lifecycle, journal or protocol-4 invariants recorded here.
+
 ## Context
 
 The existing Agent VM control path is a Bun process started once per request. It owns SQLite state, Incus lifecycle actions, maintenance scheduling and observation sampling in the same execution model. A resident parent service must be introduced without creating a second writer, changing operation identity, or making expiry depend on an external trigger.
