@@ -1,0 +1,66 @@
+name: Demo Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: demo-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build demo artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: bun run build:demo
+      - name: Assemble static artifact
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: |
+          cp web/edgeone.json web/dist-demo/edgeone.json
+          printf '{"source_revision":"%s"}\n' "$SOURCE_SHA" > web/dist-demo/demo-build.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-site
+          path: web/dist-demo
+          if-no-files-found: error
+          include-hidden-files: true
+
+  deploy:
+    name: Deploy demo to EdgeOne
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: demo-site
+          path: demo-site
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.11.0'
+      - name: Stage artifact outside the repository
+        run: |
+          stage="$(mktemp -d "$RUNNER_TEMP/edgeone-demo.XXXXXX")"
+          cp -R demo-site/. "$stage/"
+          echo "EDGEONE_ARTIFACT_DIR=$stage" >> "$GITHUB_ENV"
+      - name: Deploy to EdgeOne Makers
+        env:
+          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
+          EDGEONE_PROJECT_NAME: ${{ vars.EDGEONE_PROJECT_NAME }}
+        run: |
+          test -n "$EDGEONE_API_TOKEN"
+          test "$EDGEONE_PROJECT_NAME" = agent-vm-demo
+          npx --yes edgeone@1.6.47 makers deploy "$EDGEONE_ARTIFACT_DIR" --name "$EDGEONE_PROJECT_NAME" --token "$EDGEONE_API_TOKEN" --env production --skip-ai-gateway-sync

@@ -84,10 +84,13 @@ bun run build:demo
 bun run preview:demo
 ```
 
-Deploy the contents of `web/dist-demo` at the origin root. Static hosts must serve
-existing assets normally and fall back to `index.html` for page paths such as
-`/images` (SPA fallback). For EdgeOne Makers, include an `edgeone.json` in the
-uploaded directory with `{"rewrites":[{"source":"/*","destination":"/index.html"}]}`.
+GitHub Actions builds a single Demo artifact and deploys it to EdgeOne Makers
+from `main`. Pull requests build the artifact without deployment credentials.
+Configure the `EDGEONE_API_TOKEN` repository secret and the `EDGEONE_PROJECT_NAME`
+repository variable as `agent-vm-demo` before enabling the production workflow.
+The workflow also supports a manual run on `main`; do not upload builds from a local machine.
+The artifact includes `web/edgeone.json`, which provides SPA fallback for paths
+such as `/images` while serving existing assets normally.
 The formal build remains `bun run build:web` and
 uses the configured real management API boundary.
 

@@ -10,7 +10,7 @@
     }
   },
   "required_checks": ["PR gate (ubuntu-latest)", "PR gate (macos-latest)"],
-  "informational_checks": ["Main gate (ubuntu-latest)", "Main gate (macos-latest)"],
+  "informational_checks": ["Main gate (ubuntu-latest)", "Main gate (macos-latest)", "Build demo artifact"],
   "waivers": [],
   "expected_pr_workflows": [
     {

@@ -138,6 +138,8 @@ The repository MAY ship a static Web Demo that reuses the management console's f
 
 The standalone Demo MUST use the origin root for its entry, assets, page routes, and share links. Static hosting MUST serve the Demo entry for unknown page paths to support direct navigation and refresh. The former `/demo/` route is not a supported compatibility path.
 
+The Demo deployment pipeline MUST build a single static artifact for the current revision and deploy that artifact to the existing EdgeOne Makers project only from trusted main-branch runs. Pull request runs MUST build without deploying or accessing deployment credentials. Deployment credentials MUST remain in the hosting repository's secret store; local or manual artifact upload is not an authorized deployment path.
+
 The Demo Inspector MUST follow the [Web Demo Inspector UX/UI contract](contracts/web-demo-inspector.md): its structure, responsive layout, position-menu semantics, explicit floating drag handle, keyboard movement alternative, focus behavior, touch targets and visual evidence requirements are part of the Demo contract. A single click on the position control MUST apply the viewport default and MUST NOT open the menu; right-click, long-press and `Shift+F10` MAY open it. A floating Inspector MUST expose a visible `Drag`/`拖动` handle and MUST keep the panel within the viewport without persisting coordinates to the share URL.
 
 ## Synchronization and retrieval
