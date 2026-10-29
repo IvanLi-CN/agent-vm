@@ -654,6 +654,29 @@ class WrapperTests(unittest.TestCase):
         for name in WRAPPER.GO_RETIRED_UNITS:
             self.assertFalse((Path(self.loaded["unit_dir"]) / name).exists(), name)
 
+    def test_native_to_format_one_activation_hands_off_runtime_before_cleanup(self):
+        self.loaded["require_drained"] = False
+        go_release_id = "a" * 40
+        legacy_release_id = "b" * 40
+        go_payload = self._go_payload(go_release_id, transport="https")
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ) as run:
+            WRAPPER.stage(self.loaded, "tx-native", go_release_id, go_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-native", go_release_id)
+            WRAPPER.activate(self.loaded, "tx-native", go_release_id)
+            WRAPPER.stage(self.loaded, "tx-legacy", legacy_release_id, self.payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-legacy", legacy_release_id)
+            WRAPPER.activate(self.loaded, "tx-legacy", legacy_release_id)
+        commands = [call.args[0] for call in run.call_args_list]
+        native_stop = commands.index(["systemctl", "stop", "agent-vm-native.service"])
+        legacy_start = commands.index(["systemctl", "start", "agent-vm-native-reconcile.service"])
+        self.assertLess(native_stop, legacy_start)
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, legacy_release_id)
+        self.assertFalse((Path(self.loaded["unit_dir"]) / "agent-vm-native.service").exists())
+
     def test_format_one_install_removes_native_predecessor_files(self):
         self._install_go_runtime("https")
         installed_root = Path(self.loaded["control_path"]).parent
@@ -709,8 +732,10 @@ class WrapperTests(unittest.TestCase):
                 self.assertEqual(stat.S_IMODE(installed.stat().st_mode), WRAPPER.SUPPORT_ARTIFACT_MODES[name])
                 self.assertEqual(installed.stat().st_uid, os.getuid())
                 self.assertIn(installed, WRAPPER._activation_targets(self.loaded))
-        self.assertEqual(run.call_args.args[0], ["systemctl", "daemon-reload"])
-        self.assertFalse(any("stop" in arg or "disable" in arg for arg in run.call_args.args[0]))
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["systemctl", "daemon-reload"], commands)
+        self.assertIn(["systemctl", "start", "agent-vm-native-reconcile.service"], commands)
+        self.assertIn(["systemctl", "enable", "agent-vm-native-age-gc.timer"], commands)
 
     def test_activation_retires_only_the_exact_replaced_python_entrypoints(self):
         installed = Path(self.loaded["control_path"]).parent
@@ -724,8 +749,13 @@ class WrapperTests(unittest.TestCase):
         unrelated = installed / "operator-owned.py"
         unrelated.write_bytes(b"untouched\n")
         WRAPPER.stage(self.loaded, "tx-retire", "b" * 40, self.payload)
-        with mock.patch.object(WRAPPER, "_daemon_reload"):
-            WRAPPER.activate(self.loaded, "tx-retire", "b" * 40)
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            with mock.patch.object(WRAPPER, "_daemon_reload"):
+                WRAPPER.activate(self.loaded, "tx-retire", "b" * 40)
         self.assertFalse(retired.exists())
         self.assertFalse(retired_client.exists())
         self.assertEqual(unrelated.read_bytes(), b"untouched\n")

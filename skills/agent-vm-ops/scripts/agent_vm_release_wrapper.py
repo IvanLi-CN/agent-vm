@@ -1330,6 +1330,20 @@ def _deactivate_web_runtime() -> None:
     _systemctl("disable", "agent-vm-web.service", allow_missing=True)
 
 
+def _deactivate_native_runtime() -> None:
+    """Stop native authorities before their fixed runtime files are retired."""
+    _deactivate_web_runtime()
+    _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+    _systemctl("disable", "agent-vm-native.service", allow_missing=True)
+
+
+def _deactivate_legacy_runtime() -> None:
+    """Stop the fixed legacy triggers before their files are retired."""
+    for unit in (*GO_RETIRED_UNITS, *_legacy_expiry_timers()):
+        _systemctl("stop", unit, allow_missing=True)
+        _systemctl("disable", unit, allow_missing=True)
+
+
 def _unit_is_enabled(unit: str) -> bool:
     """Capture whether a unit was enabled before a dependency restart."""
     try:
@@ -1349,9 +1363,7 @@ def _activate_go_runtime(*, web_enabled: bool = False) -> None:
     """Retire legacy triggers, enable Go, and verify that it is active."""
     if not web_enabled:
         _deactivate_web_runtime()
-    for unit in (*GO_RETIRED_UNITS, *_legacy_expiry_timers()):
-        _systemctl("stop", unit, allow_missing=True)
-        _systemctl("disable", unit, allow_missing=True)
+    _deactivate_legacy_runtime()
     _systemctl("enable", "agent-vm-native.service")
     _systemctl("restart", "agent-vm-native.service")
     _systemctl("is-active", "agent-vm-native.service")
@@ -1371,10 +1383,10 @@ def _activate_product_runtime(
         _systemctl("start", "agent-vm-web.service", allow_missing=True)
 
 
-def _activate_legacy_runtime() -> None:
+def _activate_legacy_runtime(*, native_already_stopped: bool = False) -> None:
     """Restore only the fixed legacy reconciliation triggers for rollback."""
-    _systemctl("stop", "agent-vm-native.service", allow_missing=True)
-    _systemctl("disable", "agent-vm-native.service", allow_missing=True)
+    if not native_already_stopped:
+        _deactivate_native_runtime()
     _systemctl("start", "agent-vm-native-reconcile.service", allow_missing=True)
     _systemctl("enable", "agent-vm-native-reconcile.service", allow_missing=True)
     _systemctl("start", "agent-vm-native-age-gc.timer", allow_missing=True)
@@ -1636,12 +1648,15 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     old_previous = _current_target(previous_link, release_root)
     if old_current is not None and old_current == old_previous:
         _fail("activation_unverified", "current and previous pointers must not target the same release")
+    old_runtime_manifest = None
     if old_current is not None:
-        _verify_retained_release(config, old_current)
+        old_runtime_manifest = _verify_retained_release(config, old_current)
     if old_previous is not None:
         _verify_retained_release(config, old_previous)
     web_unit_enabled = None
     if _is_product_manifest(candidate_manifest) or _is_go_manifest(candidate_manifest):
+        web_unit_enabled = _unit_is_enabled("agent-vm-web.service")
+    elif old_runtime_manifest is not None and _is_product_manifest(old_runtime_manifest):
         web_unit_enabled = _unit_is_enabled("agent-vm-web.service")
     _mkdir_private(release_root, 0o755)
     release_dir = release_root / release_id
@@ -1680,8 +1695,21 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     }
     _write_json(activation_path, record)
     runtime_switch_attempted = False
+    predecessor_runtime_stopped = False
     try:
         manifest = load_release_manifest(release_dir / MANIFEST_NAME)
+        target_is_native = _is_product_manifest(manifest) or _is_go_manifest(manifest)
+        old_is_native = old_runtime_manifest is not None and (
+            _is_product_manifest(old_runtime_manifest) or _is_go_manifest(old_runtime_manifest)
+        )
+        if not target_is_native and old_is_native:
+            runtime_switch_attempted = True
+            _deactivate_native_runtime()
+            predecessor_runtime_stopped = True
+        elif target_is_native and old_runtime_manifest is not None and not old_is_native:
+            runtime_switch_attempted = True
+            _deactivate_legacy_runtime()
+            predecessor_runtime_stopped = True
         _install_release_files(config, release_dir, manifest)
         record["activation_phase"] = "files-installed"
         _write_json(activation_path, record)
@@ -1703,6 +1731,11 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         elif _is_go_manifest(manifest):
             runtime_switch_attempted = True
             _activate_go_runtime()
+            record["activation_phase"] = "runtime-switched"
+            _write_json(activation_path, record)
+        else:
+            runtime_switch_attempted = True
+            _activate_legacy_runtime(native_already_stopped=predecessor_runtime_stopped)
             record["activation_phase"] = "runtime-switched"
             _write_json(activation_path, record)
         record["activated"] = True
@@ -1838,8 +1871,9 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _fail("activation_unverified", "current and previous pointers must not target the same release")
     if old_current_id != previous_id:
         _fail("rollback_unavailable", "retained current release does not match the activation record")
+    active_manifest = None
     if old_current_id is not None:
-        _verify_retained_release(config, Path(config["release_root"]) / old_current_id)
+        active_manifest = _verify_retained_release(config, Path(config["release_root"]) / old_current_id)
     if old_previous_id is not None:
         _verify_retained_release(config, Path(config["release_root"]) / old_previous_id)
     if record.get("activated") is True:
@@ -1874,7 +1908,21 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     record["rollback_state"] = "in-progress"
     record["draining"] = True
     _write_json(activation_path, record)
+    predecessor_runtime_stopped = False
+    runtime_switch_attempted = False
     try:
+        target_is_native = _is_product_manifest(previous_manifest) or _is_go_manifest(previous_manifest)
+        active_is_native = active_manifest is not None and (
+            _is_product_manifest(active_manifest) or _is_go_manifest(active_manifest)
+        )
+        if not target_is_native and active_is_native:
+            runtime_switch_attempted = True
+            _deactivate_native_runtime()
+            predecessor_runtime_stopped = True
+        elif target_is_native and active_manifest is not None and not active_is_native:
+            runtime_switch_attempted = True
+            _deactivate_legacy_runtime()
+            predecessor_runtime_stopped = True
         _install_release_files(config, previous_dir, previous_manifest)
         _atomic_symlink(previous_dir, current_link)
         if record.get("activated") is True:
@@ -1890,7 +1938,7 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         elif _is_go_manifest(previous_manifest):
             _activate_go_runtime()
         else:
-            _activate_legacy_runtime()
+            _activate_legacy_runtime(native_already_stopped=predecessor_runtime_stopped)
     except WrapperError as failure:
         try:
             _restore_activation_state(
@@ -1907,6 +1955,26 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 "rollback failed and the previous release could not be fully restored",
                 {"rollback_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
             )
+        if runtime_switch_attempted:
+            try:
+                if active_manifest is None:
+                    _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+                elif _is_product_manifest(active_manifest):
+                    snapshot = record.get("web_unit_enabled")
+                    _activate_product_runtime(
+                        active_manifest,
+                        web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
+                    )
+                elif _is_go_manifest(active_manifest):
+                    _activate_go_runtime()
+                else:
+                    _activate_legacy_runtime()
+            except (WrapperError, ManifestError) as runtime_error:
+                failure = WrapperError(
+                    "activation_restore_failed",
+                    "rollback failed and the previous runtime could not be restored",
+                    {"rollback_error": failure.as_dict(), "runtime_error": getattr(runtime_error, "as_dict", lambda: {"message": str(runtime_error)})()},
+                )
         record["rollback_phase"] = "failed"
         record["rollback_state"] = "failed"
         record["rollback_error"] = failure.as_dict()
