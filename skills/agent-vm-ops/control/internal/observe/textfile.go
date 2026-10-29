@@ -1,9 +1,11 @@
 package observe
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -103,7 +105,7 @@ func (store *SnapshotStore) Publish(source string, value any) error {
 }
 
 func snapshotMetrics(source string, value any) map[string]string {
-	object, _ := value.(map[string]any)
+	object := normalizedSnapshotObject(value)
 	if nested, ok := object["result"].(map[string]any); ok {
 		object = nested
 	}
@@ -120,13 +122,69 @@ func snapshotMetrics(source string, value any) map[string]string {
 		"agent_vm_" + source + "_scrape_timestamp_seconds": fmt.Sprintf("agent_vm_%s_scrape_timestamp_seconds %d", source, observed),
 	}
 	if source == "capacity" {
-		result["agent_vm_admission_ready"] = fmt.Sprintf("agent_vm_admission_ready %d", boolNumber(object["admission_ready"], false))
-		result["agent_vm_admission_draining"] = fmt.Sprintf("agent_vm_admission_draining %d", boolNumber(object["draining"], false))
-		result["agent_vm_observation_consistent"] = fmt.Sprintf("agent_vm_observation_consistent %d", boolNumber(object["observation_consistent"], false))
+		addBoolMetricIfPresent(result, "agent_vm_admission_ready", object, "admission_ready")
+		addBoolMetricIfPresent(result, "agent_vm_admission_draining", object, "draining")
+		addBoolMetricIfPresent(result, "agent_vm_observation_consistent", object, "observation_consistent")
 		if resources, ok := objectMap(object["resources"]); ok {
 			addResourceMetric(result, "cpu", "cpu", resources, "vcpu", 1)
 			addResourceMetric(result, "memory", "memory_mib", resources, "bytes", 1024*1024)
-			addResourceMetric(result, "disk", "disk_gib", resources, "bytes", 1024*1024*1024)
+		}
+		if admission, ok := objectMap(object["disk_admission"]); ok {
+			if physical, ok := objectMap(admission["physical_admission"]); ok {
+				addPhysicalDiskMetric(result, physical)
+			}
+		}
+		if instances, ok := objectMap(object["instances"]); ok {
+			if admission, ok := objectMap(instances["admission"]); ok {
+				addInstanceMetric(result, "allocated", admission["allocated"])
+				addInstanceMetric(result, "reserved", admission["reserved"])
+				addInstanceMetric(result, "allocated_and_reserved", admission["allocated_and_reserved"])
+				addInstanceMetric(result, "remaining", admission["remaining"])
+				addInstanceMetric(result, "limit", admission["limit"])
+				addInstanceMetric(result, "capacity", admission["capacity"])
+			}
+		}
+		if defaultAdmission, ok := objectMap(object["default_admission"]); ok {
+			if requested, ok := objectMap(defaultAdmission["requested"]); ok {
+				addMetric(result, "agent_vm_admission_default_request_cpu_vcpu", requested["cpu"], 1)
+				addMetric(result, "agent_vm_admission_default_request_memory_bytes", requested["memory_mib"], 1024*1024)
+				addMetric(result, "agent_vm_admission_default_request_disk_bytes", requested["disk_gib"], 1024*1024*1024)
+			}
+			addMetric(result, "agent_vm_admission_default_request_physical_cost_bytes", defaultAdmission["request_cost_bytes"], 1)
+		}
+		addDefaultSlotMetrics(result, object)
+		if operations, ok := objectMap(object["operations"]); ok {
+			addSummaryMetrics(result, "agent_vm_operations_total", operations, []string{"action", "outcome", "phase"})
+		}
+		if failures, ok := objectMap(object["image_unpack_failures"]); ok {
+			addSummaryMetrics(result, "agent_vm_image_unpack_failures_total", failures, []string{"phase", "reason"})
+		}
+		if warnings, ok := objectMap(object["warning_counts"]); ok {
+			addSummaryMetrics(result, "agent_vm_warnings_total", warnings, []string{"code"})
+		}
+		if value, exists := object["reclaim_required"]; exists && value != nil {
+			addBooleanMetric(result, "agent_vm_admission_reclaim_required", value)
+		}
+		if cpu, ok := objectMap(object["ct_cpu"]); ok {
+			addMetric(result, "agent_vm_admission_cpu_capacity_vcpu", cpu["capacity_vcpu"], 1)
+			if pressure, ok := objectMap(cpu["pressure"]); ok {
+				addMetric(result, "agent_vm_cpu_pressure_some_avg10_percent", nestedMetricValue(pressure, "some", "avg10"), 1)
+				addMetric(result, "agent_vm_cpu_pressure_full_avg10_percent", nestedMetricValue(pressure, "full", "avg10"), 1)
+			}
+			if startup, ok := objectMap(cpu["startup_pressure"]); ok {
+				addMetric(result, "agent_vm_cpu_startup_pressure_threshold_percent", startup["threshold_full_avg10_percent"], 1)
+				if startup["verified"] == true {
+					addBooleanMetric(result, "agent_vm_cpu_startup_blocked", startup["startup_blocked"])
+				}
+			}
+		}
+		if memory, ok := objectMap(object["ct_memory"]); ok {
+			addMetric(result, "agent_vm_admission_memory_capacity_bytes", memory["capacity_bytes"], 1)
+			addMetric(result, "agent_vm_memory_current_bytes", memory["current_bytes"], 1)
+			addMetric(result, "agent_vm_memory_available_bytes", memory["available_bytes"], 1)
+			addMetric(result, "agent_vm_memory_pressure_threshold_bytes", memory["pressure_threshold_bytes"], 1)
+			addBooleanMetric(result, "agent_vm_memory_pressure", memory["pressure"])
+			addOOMMetrics(result, memory["oom_events"])
 		}
 	}
 	if source == "inventory" {
@@ -148,12 +206,346 @@ func snapshotMetrics(source string, value any) map[string]string {
 				result["agent_vm_task_states"] += fmt.Sprintf("agent_vm_task_states{state=%s} %s\n", strconv.Quote(state), number(count))
 			}
 		}
+		if tasks, ok := object["tasks"].([]any); ok {
+			for _, rawTask := range tasks {
+				task, ok := objectMap(rawTask)
+				if !ok {
+					continue
+				}
+				addTaskMetrics(result, task)
+			}
+		}
 	}
 	if source == "health" {
 		result["agent_vm_up"] = fmt.Sprintf("agent_vm_up %d", up)
-		result["agent_vm_health_ready"] = fmt.Sprintf("agent_vm_health_ready %d", boolNumber(object["ready"], false))
+		addBoolMetricIfPresent(result, "agent_vm_health_ready", object, "ready")
 	}
 	return result
+}
+
+func addBoolMetricIfPresent(result map[string]string, name string, object map[string]any, key string) {
+	value, ok := object[key].(bool)
+	if !ok {
+		return
+	}
+	result[name] = fmt.Sprintf("%s %d", name, boolNumber(value, false))
+}
+
+func addBooleanMetric(result map[string]string, name string, value any) {
+	parsed, ok := value.(bool)
+	if !ok {
+		return
+	}
+	result[name] = fmt.Sprintf("%s %d", name, boolNumber(parsed, false))
+}
+
+func addOOMMetrics(result map[string]string, value any) {
+	events, ok := objectMap(value)
+	if !ok {
+		return
+	}
+	keys := make([]string, 0, len(events))
+	for key := range events {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if _, ok := numeric(events[key]); !ok {
+			continue
+		}
+		name := "agent_vm_memory_oom_events_total"
+		result[name] += fmt.Sprintf("%s{kind=%s} %s\n", name, strconv.Quote(key), number(events[key]))
+	}
+}
+
+func addSummaryMetrics(result map[string]string, name string, values map[string]any, labels []string) {
+	for key, rawValue := range values {
+		_, ok := numeric(rawValue)
+		if !ok {
+			continue
+		}
+		parts := strings.Split(key, "|")
+		if len(parts) != len(labels) {
+			if len(labels) != 1 {
+				continue
+			}
+			parts = []string{key}
+		}
+		labelValues := make([]string, len(labels))
+		valid := true
+		for index, part := range parts {
+			if part == "" || strings.ContainsAny(part, "\r\n") {
+				valid = false
+				break
+			}
+			labelValues[index] = strconv.Quote(part)
+		}
+		if !valid {
+			continue
+		}
+		labelPairs := make([]string, len(labels))
+		for index, label := range labels {
+			labelPairs[index] = label + "=" + labelValues[index]
+		}
+		result[name] += fmt.Sprintf("%s{%s} %s\n", name, strings.Join(labelPairs, ","), number(rawValue))
+	}
+}
+
+func addDefaultSlotMetrics(result map[string]string, object map[string]any) {
+	if rawConsistency, present := object["observation_consistent"]; present {
+		consistent, ok := rawConsistency.(bool)
+		if !ok || !consistent {
+			return
+		}
+	}
+	defaultAdmission, ok := objectMap(object["default_admission"])
+	if !ok {
+		return
+	}
+	requested, ok := objectMap(defaultAdmission["requested"])
+	if !ok {
+		return
+	}
+	cpuRequest, cpuOK := integerValue(requested["cpu"])
+	memoryRequest, memoryOK := integerValue(requested["memory_mib"])
+	physicalCost, costOK := integerValue(defaultAdmission["request_cost_bytes"])
+	if !cpuOK || !memoryOK || !costOK || cpuRequest <= 0 || memoryRequest <= 0 || physicalCost <= 0 {
+		return
+	}
+	resources, resourcesOK := objectMap(object["resources"])
+	remaining, remainingOK := objectMap(resources["remaining"])
+	diskAdmission, diskOK := objectMap(object["disk_admission"])
+	physical, physicalOK := objectMap(diskAdmission["physical_admission"])
+	cpuRemaining, cpuRemainingOK := integerValue(remaining["cpu"])
+	memoryRemaining, memoryRemainingOK := integerValue(remaining["memory_mib"])
+	physicalRemaining, physicalRemainingOK := integerValue(physical["remaining_bytes"])
+	if !resourcesOK || !remainingOK || !diskOK || !physicalOK || !cpuRemainingOK || !memoryRemainingOK || !physicalRemainingOK {
+		return
+	}
+	ratios := []int64{slotRatio(cpuRemaining, cpuRequest), slotRatio(memoryRemaining, memoryRequest), slotRatio(physicalRemaining, physicalCost)}
+	if rawDiskRemaining, hasLogicalDiskBudget := remaining["disk_gib"]; hasLogicalDiskBudget {
+		diskRemaining, diskRemainingOK := integerValue(rawDiskRemaining)
+		diskRequest, diskRequestOK := integerValue(requested["disk_gib"])
+		if !diskRemainingOK || !diskRequestOK {
+			return
+		}
+		ratio := slotRatio(diskRemaining, diskRequest)
+		if ratio < 0 {
+			return
+		}
+		ratios = append(ratios, ratio)
+	}
+	logicalSlots := minSlots(ratios...)
+	if logicalSlots < 0 {
+		return
+	}
+	addMetric(result, "agent_vm_admission_default_vm_logical_slots", logicalSlots, 1)
+
+	ctCPU, ctCPUOK := objectMap(object["ct_cpu"])
+	startup, startupOK := objectMap(ctCPU["startup_pressure"])
+	capacity, capacityOK := integerValue(ctCPU["capacity_vcpu"])
+	allocated, allocatedOK := objectMap(resources["allocated_and_reserved"])
+	allocatedCPU, allocatedCPUOK := integerValue(allocated["cpu"])
+	startupVerified, startupVerifiedOK := startup["verified"].(bool)
+	startupBlocked, startupBlockedOK := startup["startup_blocked"].(bool)
+	if !ctCPUOK || !startupOK || !capacityOK || !allocatedOK || !allocatedCPUOK || !startupVerified || !startupVerifiedOK || !startupBlockedOK {
+		return
+	}
+	ctHeadroom := capacity - allocatedCPU
+	if ctHeadroom < 0 {
+		ctHeadroom = 0
+	}
+	startableSlots := minSlots(logicalSlots, slotRatio(ctHeadroom, cpuRequest))
+	if startupBlocked {
+		startableSlots = 0
+	}
+	addMetric(result, "agent_vm_admission_default_vm_startable_slots", startableSlots, 1)
+}
+
+func integerValue(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case json.Number:
+		parsed, err := typed.Int64()
+		return parsed, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func slotRatio(headroom, request int64) int64 {
+	if request <= 0 {
+		return -1
+	}
+	if headroom <= 0 {
+		return 0
+	}
+	return headroom / request
+}
+
+func minSlots(values ...int64) int64 {
+	if len(values) == 0 {
+		return -1
+	}
+	minimum := values[0]
+	for _, value := range values[1:] {
+		if value < minimum {
+			minimum = value
+		}
+	}
+	return minimum
+}
+
+func normalizedSnapshotObject(value any) map[string]any {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		object, _ := value.(map[string]any)
+		return object
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	object := map[string]any{}
+	if err := decoder.Decode(&object); err != nil {
+		return map[string]any{}
+	}
+	return object
+}
+
+func addPhysicalDiskMetric(result map[string]string, physical map[string]any) {
+	for _, kind := range []string{"allocated", "reserved", "allocated_and_reserved", "remaining", "limit", "capacity"} {
+		value, ok := physical[kind+"_bytes"]
+		if !ok {
+			continue
+		}
+		name := "agent_vm_admission_disk_" + kind + "_bytes"
+		addMetric(result, name, value, 1)
+	}
+	addMetric(result, "agent_vm_admission_disk_low_watermark_bytes", physical["low_watermark_bytes"], 1)
+	addMetric(result, "agent_vm_admission_disk_target_watermark_bytes", physical["target_watermark_bytes"], 1)
+}
+
+func addInstanceMetric(result map[string]string, kind string, value any) {
+	addMetric(result, "agent_vm_admission_instances_"+kind+"_count", value, 1)
+}
+
+func addMetric(result map[string]string, name string, value any, multiplier float64) {
+	if _, ok := numeric(value); !ok {
+		return
+	}
+	result[name] = fmt.Sprintf("%s %s", name, numberWithMultiplier(value, multiplier))
+}
+
+func nestedMetricValue(object map[string]any, outer, inner string) any {
+	nested, ok := objectMap(object[outer])
+	if !ok {
+		return nil
+	}
+	return nested[inner]
+}
+
+func addTaskMetrics(result map[string]string, task map[string]any) {
+	taskID := taskLabel(task["task_id"])
+	state := taskLabel(task["state"])
+	baseLabels := fmt.Sprintf("task_id=%s,state=%s", taskID, state)
+	infoLabels := baseLabels + ",instance_name=" + taskLabel(task["instance_name"]) + ",session_id=" + taskLabel(task["session_id"]) + ",native_status=" + taskLabel(task["native_status"]) + ",guest_available=" + taskLabel(tristateLabel(task["guest_available"])) + ",effective_lease=" + taskLabel(task["effective_lease"])
+	result["agent_vm_task_info"] += fmt.Sprintf("agent_vm_task_info{%s} 1\n", infoLabels)
+	if resources, ok := objectMap(task["resources"]); ok {
+		addLabeledMetric(result, "agent_vm_task_cpu_vcpu", baseLabels, resources["cpu"], 1)
+		addLabeledMetric(result, "agent_vm_task_memory_bytes", baseLabels, resources["memory_mib"], 1024*1024)
+		addLabeledMetric(result, "agent_vm_task_disk_bytes", baseLabels, resources["disk_gib"], 1024*1024*1024)
+	}
+	if timestamp, ok := timestampSeconds(task["lease_expires_at"]); ok {
+		addLabeledMetric(result, "agent_vm_task_lease_expires_at_seconds", baseLabels, timestamp, 1)
+	}
+	if lastError, ok := taskError(task["last_error"]); ok {
+		labels := baseLabels + ",code=" + taskLabel(lastError["code"]) + ",phase=" + taskLabel(lastError["phase"])
+		result["agent_vm_task_last_error_info"] += fmt.Sprintf("agent_vm_task_last_error_info{%s} 1\n", labels)
+	}
+	if ports, ok := task["ports"].([]any); ok {
+		for _, rawPort := range ports {
+			port, ok := objectMap(rawPort)
+			if !ok {
+				continue
+			}
+			labels := baseLabels + ",port_name=" + taskLabel(port["port_name"]) + ",protocol=" + taskLabel(port["protocol"]) + ",device_name=" + taskLabel(port["device_name"])
+			result["agent_vm_task_ssh_mapping"] += fmt.Sprintf("agent_vm_task_ssh_mapping{%s} 1\n", labels)
+		}
+	}
+}
+
+func addLabeledMetric(result map[string]string, name, labels string, value any, multiplier float64) {
+	if _, ok := numeric(value); !ok {
+		return
+	}
+	result[name] += fmt.Sprintf("%s{%s} %s\n", name, labels, numberWithMultiplier(value, multiplier))
+}
+
+func taskLabel(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return strconv.Quote("unknown")
+	case bool:
+		if typed {
+			return strconv.Quote("true")
+		}
+		return strconv.Quote("false")
+	case string:
+		if typed == "" {
+			return strconv.Quote("unknown")
+		}
+		return strconv.Quote(typed)
+	default:
+		return strconv.Quote(fmt.Sprint(typed))
+	}
+}
+
+func tristateLabel(value any) string {
+	if value == nil {
+		return "unknown"
+	}
+	if typed, ok := value.(bool); ok {
+		if typed {
+			return "true"
+		}
+		return "false"
+	}
+	if text, ok := value.(string); ok && text != "" {
+		return text
+	}
+	return fmt.Sprint(value)
+}
+
+func timestampSeconds(value any) (int64, bool) {
+	text, ok := value.(string)
+	if !ok || text == "" {
+		return 0, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, text)
+	if err != nil {
+		return 0, false
+	}
+	return parsed.Unix(), true
+}
+
+func taskError(value any) (map[string]any, bool) {
+	if value == nil {
+		return nil, false
+	}
+	if object, ok := objectMap(value); ok {
+		return object, true
+	}
+	text, ok := value.(string)
+	if !ok || text == "" {
+		return nil, false
+	}
+	var object map[string]any
+	if json.Unmarshal([]byte(text), &object) != nil || object == nil {
+		return nil, false
+	}
+	return object, true
 }
 
 func addResourceMetric(result map[string]string, dimension, inputKey string, resources map[string]any, suffix string, multiplier float64) {
@@ -170,7 +562,7 @@ func addResourceMetric(result map[string]string, dimension, inputKey string, res
 		if kind == "limits" {
 			name = "agent_vm_admission_" + dimension + "_limit_" + suffix
 		}
-		result[name] = fmt.Sprintf("%s %s", name, numberWithMultiplier(value, multiplier))
+		addMetric(result, name, value, multiplier)
 	}
 }
 
@@ -199,11 +591,32 @@ func numericValue(value any) float64 {
 func number(value any) string { return numberWithMultiplier(value, 1) }
 
 func numberWithMultiplier(value any, multiplier float64) string {
+	if integer, ok := exactInteger(value); ok && multiplier == float64(int64(multiplier)) {
+		return integer.Mul(integer, big.NewInt(int64(multiplier))).String()
+	}
 	valueFloat, ok := numeric(value)
 	if !ok {
 		return "NaN"
 	}
 	return strconv.FormatFloat(valueFloat*multiplier, 'f', -1, 64)
+}
+
+func exactInteger(value any) (*big.Int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return big.NewInt(int64(typed)), true
+	case int64:
+		return big.NewInt(typed), true
+	case json.Number:
+		text := typed.String()
+		if strings.ContainsAny(text, ".eE") {
+			return nil, false
+		}
+		integer, ok := new(big.Int).SetString(text, 10)
+		return integer, ok
+	default:
+		return nil, false
+	}
 }
 
 func numeric(value any) (float64, bool) {

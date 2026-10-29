@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
@@ -35,6 +37,7 @@ func (backend *blockingImageBackend) ImportTrusted(ctx context.Context, sourceID
 	backend.once.Do(func() { close(backend.entered) })
 	select {
 	case <-backend.release:
+		backend.imports++
 		return backend.artifact, nil
 	case <-ctx.Done():
 		return ImageArtifact{}, ctx.Err()
@@ -305,6 +308,153 @@ func TestConcurrentTrustedImportsReserveImageStorage(t *testing.T) {
 	}
 }
 
+func TestConcurrentTrustedImportRetriesSerializeByOperation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "trusted-import-retry.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	fingerprint := strings.Repeat("a", 64)
+	backend := &blockingImageBackend{
+		fakeImageBackend: fakeImageBackend{artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}},
+		entered:          make(chan struct{}), release: make(chan struct{}),
+	}
+	service := New(store, Options{
+		TrustedImageSourceIDs:      []string{"approved"},
+		UploadMinimumFreeBytes:     512,
+		AvailableImageStorageBytes: func() (int64, error) { return 513, nil },
+		Backend:                    backend,
+	})
+	request := ImportRequest{OperationID: "trusted-retry", Actor: "admin", Reason: "retry race", TargetVersion: "image-catalog:revision-1", VersionLabel: "a", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}}
+	if _, err := service.StartImageImport(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		operation, processErr := service.ProcessTrustedImport(context.Background(), request.OperationID)
+		if processErr == nil && operation.Status != "succeeded" {
+			processErr = fmt.Errorf("first operation = %#v", operation)
+		}
+		firstDone <- processErr
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first import did not reach native backend")
+	}
+	secondDone := make(chan struct {
+		operation *state.ManagementOperation
+		err       error
+	}, 1)
+	go func() {
+		operation, processErr := service.ProcessTrustedImport(context.Background(), request.OperationID)
+		secondDone <- struct {
+			operation *state.ManagementOperation
+			err       error
+		}{operation: operation, err: processErr}
+	}()
+	select {
+	case result := <-secondDone:
+		t.Fatalf("retry returned before original import completed: operation=%#v err=%v", result.operation, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(backend.release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case result := <-secondDone:
+		if result.err != nil || result.operation == nil || result.operation.Status != "succeeded" {
+			t.Fatalf("serialized retry result = operation:%#v err:%v", result.operation, result.err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("serialized retry did not observe the completed operation")
+	}
+	if backend.imports != 1 {
+		t.Fatalf("serialized retry imported %d times, want 1", backend.imports)
+	}
+}
+
+func TestTrustedImportUsesSharedReservationCallbackUntilCompletion(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	fingerprint := strings.Repeat("a", 64)
+	backend := &blockingImageBackend{fakeImageBackend: fakeImageBackend{artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}}, entered: make(chan struct{}), release: make(chan struct{})}
+	var reservationMu sync.Mutex
+	activeReservations := 0
+	reserveCalls := 0
+	service := New(store, Options{
+		TrustedImageSourceIDs:  []string{"approved"},
+		UploadMinimumFreeBytes: 512,
+		ReserveImageStorage: func(size int64) (func(), error) {
+			reservationMu.Lock()
+			defer reservationMu.Unlock()
+			if size != 1 {
+				return nil, fmt.Errorf("unexpected reservation size %d", size)
+			}
+			reserveCalls++
+			if activeReservations != 0 {
+				return nil, errors.New("shared reservation is occupied")
+			}
+			activeReservations++
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					reservationMu.Lock()
+					activeReservations--
+					reservationMu.Unlock()
+				})
+			}, nil
+		},
+		Backend: backend,
+	})
+	requests := []ImportRequest{
+		{OperationID: "trusted-callback-a", Actor: "admin", Reason: "shared callback", TargetVersion: "image-catalog:revision-1", VersionLabel: "a", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}},
+		{OperationID: "trusted-callback-b", Actor: "admin", Reason: "shared callback", TargetVersion: "image-catalog:revision-1", VersionLabel: "b", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}},
+	}
+	for _, request := range requests {
+		if _, err := service.StartImageImport(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		operation, processErr := service.ProcessTrustedImport(context.Background(), requests[0].OperationID)
+		if processErr == nil && operation.Status != "succeeded" {
+			processErr = fmt.Errorf("first operation = %#v", operation)
+		}
+		firstDone <- processErr
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("callback-backed import did not reach native backend")
+	}
+	reservationMu.Lock()
+	active, calls := activeReservations, reserveCalls
+	reservationMu.Unlock()
+	if active != 1 || calls != 1 {
+		t.Fatalf("shared reservation state = active:%d calls:%d", active, calls)
+	}
+	second, err := service.ProcessTrustedImport(context.Background(), requests[1].OperationID)
+	if err == nil || !strings.Contains(err.Error(), "shared reservation is occupied") || second.Status != "queued" {
+		t.Fatalf("second callback-backed import = operation:%#v err:%v", second, err)
+	}
+	close(backend.release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	reservationMu.Lock()
+	active, calls = activeReservations, reserveCalls
+	reservationMu.Unlock()
+	if active != 0 || calls != 2 || backend.imports != 1 {
+		t.Fatalf("shared reservation release = active:%d calls:%d imports:%d", active, calls, backend.imports)
+	}
+}
+
 func TestImageImportUploadStreamFailureIsDurable(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -360,6 +510,41 @@ func TestLocalImportReadFailureRecordsFingerprintAndCleanup(t *testing.T) {
 	}
 	if finished.Error["imported_fingerprint"] != fingerprint || finished.Error["cleanup"] != "verified" {
 		t.Fatalf("cleanup evidence = %#v", finished.Error)
+	}
+}
+
+func TestNativeImageUnpackFailureIsClassifiedForAudit(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	content := []byte("abc")
+	backend := &partialImageBackend{err: &native.UncertainError{Cause: &native.CommandError{
+		Result: native.Result{Code: 1, Stderr: []byte("Error: Unable to unpack image, run out of disk space")},
+		Cause:  errors.New("incus: exit status 1"),
+	}}}
+	service := New(store, Options{UploadMaxBytes: 1024, Backend: backend})
+	operation, err := service.StartImageImport(context.Background(), ImportRequest{
+		OperationID: "native-image-unpack-failure", Actor: "admin", Reason: "classify native failure", TargetVersion: "image-catalog:revision-1", VersionLabel: "2026.07",
+		Source: ImportSource{Kind: "local_upload", Format: "unified", ExpectedSHA256: digestBytes(content), ExpectedSize: int64(len(content))},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished, err := service.UploadImageImport(context.Background(), operation.OperationID, content, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished.Status != "outcome_unknown" || finished.Error["code"] != "image_unpack_failed" || finished.Error["failure_class"] != "image_unpack" {
+		t.Fatalf("finished operation = %#v", finished)
+	}
+	summary, err := store.AuditSummary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ImageUnpackFailures["reconciliation|image_unpack_failed"] != 1 {
+		t.Fatalf("image unpack summary = %#v", summary.ImageUnpackFailures)
 	}
 }
 

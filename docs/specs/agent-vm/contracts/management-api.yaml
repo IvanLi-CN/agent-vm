@@ -1381,6 +1381,8 @@ components:
             - default_image_required
             - capacity_unverified
             - admission_denied
+            - resource_insufficient
+            - watermarks_unreachable
             - precondition_required
             - authority_unavailable
             - rate_limited
