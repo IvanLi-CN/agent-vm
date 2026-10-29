@@ -48,24 +48,24 @@ Caddy 只将下列固定路径转发到活动槽位，并清除不在允许集�
 
 | 路径 | 合同 | 身份方式 |
 | --- | --- | --- |
-| `/api/v1/auth/oidc/start`、`/api/v1/auth/oidc/callback` | 浏览器登录启动与一次性回调 | OIDC Authorization Code + PKCE；回调不接受 Bearer Token |
+| `/api/v1/auth/oidc/start`、`/api/v1/auth/oidc/callback` | 浏览器登录启动与一次性回调 | OIDC Authorization Code + PKCE（仅 `code_challenge_method=S256`）；回调不接受 Bearer Token |
 | `/api/v1/` | 同源管理、会话和 Token API | 活动服务签发的安全 Cookie，写操作另需 CSRF 和精确 Origin |
 | `/agent/v1/control` | Agent API | `Authorization: Bearer <opaque-token>`；不接受浏览器 Cookie |
 | 静态资源和健康检查 | 活动发布包的固定清单 | 不承载资源授权；不得暴露任意本机路径或调试路由 |
 
-OIDC 登录使用 Authorization Code Flow + PKCE。服务端为每次登录生成一次性 `state`、`nonce` 和 code verifier 事务，并把回调 URI、目标客户端、过期时间和消费状态绑定到事务；跨槽位时事务存于共享状态，code verifier 受保护存储。启动响应同时设置短时、不可读、`Secure`、`HttpOnly`、`SameSite=Lax` 的 login-binding cookie，事务只保存其摘要；回调必须同时匹配该 cookie、未过期且未消费的 `state`，成功后清除 cookie，再创建浏览器会话。服务端和项目 Caddy 的访问日志必须省略 OIDC 回调 query string 和 `Referer`，应用日志只能记录脱敏的事件 ID、issuer 和阶段，不得记录 code、state、nonce 或 verifier。回调还必须校验授权码交换的 TLS、redirect URI、ID Token 签名和 discovery issuer，且检查 `iss` 精确等于配置的 issuer、`aud` 包含本客户端 ID、`exp` 有效以及 `nonce` 与事务一致。OIDC 提供方不可用、验证失败或事务重复消费时登录失败，不伪造身份。
+OIDC 登录使用 Authorization Code Flow + PKCE，且只接受 `code_challenge_method=S256`；`plain` 或任何未明确允许的方法必须拒绝。服务端为每次登录生成一次性 `state`、`nonce` 和 code verifier 事务，并把回调 URI、目标客户端、过期时间和消费状态绑定到事务；跨槽位时事务存于共享状态，code verifier 受保护存储。启动响应同时设置短时、不可读、`Secure`、`HttpOnly`、`SameSite=Lax` 的 login-binding cookie，事务只保存其摘要；回调必须同时匹配该 cookie、未过期且未消费的 `state`，成功后清除 cookie，再创建浏览器会话。服务端和项目 Caddy 的访问日志必须省略 OIDC 回调 query string 和 `Referer`，应用日志只能记录脱敏的事件 ID、issuer 和阶段，不得记录 code、state、nonce 或 verifier。回调还必须校验授权码交换的 TLS、redirect URI、ID Token 签名和 discovery issuer，且检查 `iss` 精确等于配置的 issuer、`aud` 包含本客户端 ID、`exp` 有效以及 `nonce` 与事务一致。OIDC 提供方不可用、验证失败或事务重复消费时登录失败，不伪造身份。
 
 服务把稳定用户身份表示为大小写敏感的 `(issuer, subject)` 二元组。`issuer` 必须是经过配置和 discovery 校验的完整标识；`subject` 使用 OIDC `sub`，不使用邮箱、名称、group 或未经验证的代理头。角色和能力映射按完整二元组解析并持久化；登录不自动获得管理员权限。历史数据无法根据该二元组确定归属时，普通用户不能领取资源，必须由管理员对明确的旧记录和新 `(issuer, subject)` 做一次有原因、有确认、有审计的显式映射；不能用相似邮箱或“第一个登录者”猜测归属。
 
 浏览器会话使用不可预测的 opaque cookie，带 `Secure`、`HttpOnly`、`SameSite=Strict`、`Path=/` 和有限 TTL；会话摘要、issuer/subject、能力、创建时间、过期时间和撤销状态存入共享状态。`GET /api/v1/session` 返回当前二元组、角色、能力和一次会话绑定的 CSRF token。每个写请求必须带同一会话、CSRF token 和与稳定 HTTPS 入口完全相等的 `Origin`；CORS 关闭。浏览器会话不是 Agent Token，也不能调用 Agent API。
 
-普通用户的授权检查必须同时满足：会话的 `(issuer, subject)`、Token 所有者和请求的 `session_id` 三者相符，且 Token scope 覆盖操作。普通用户只能读取、创建、轮换或撤销自己的 Token，只能看到自己的会话和 Token 元数据，不能通过猜测 ID、筛选条件或管理页面读取别人的资源。管理员能力来自精确的角色映射，并且仍受每个操作的 scope、ownership、generation 和 state version 检查。
+普通用户的授权检查必须同时满足：会话的 `(issuer, subject)`、Token 所有者和请求的 `session_id` 三者相符，且 Token scope 覆盖操作。普通用户只能读取、创建或撤销自己的 Token，只能看到自己的会话和 Token 元数据，不能通过猜测 ID、筛选条件或管理页面读取别人的资源。管理员能力来自精确的角色映射，并且仍受每个操作的 scope、ownership、generation 和 state version 检查。
 
 管理员对有效租约、镜像默认值、镜像退役/删除、维护和历史归属的干预必须先返回影响预览，再提交绑定到当前主体、准确目标、参数、resource version 和 generation 的一次性 confirmation token。提交请求必须带非空且有界的原因；服务端再次检查授权和状态，失败不产生 native effect。接受、拒绝、成功、失败和结果未知都写入审计，审计保存 `(issuer, subject)`、角色、原因、operation ID、目标、阶段、结果和安全错误码，不保存 Token 明文、OIDC code、原始命令输出、凭据或私有路径。
 
 ## Token API 与 Agent API
 
-Token API 和管理 API 共用同源 `/api/v1`，具体字段见 [Token API 合同](../specs/agent-vm/contracts/token-api.md) 及其 OpenAPI 路径。Token 是高熵、不可预测的不透明 Bearer 值；服务端只保存带版本的验证摘要和必要元数据。明文只在创建响应中返回一次，随后不可恢复。Token 不出现在 URL、日志、审计 reason、operation journal、静态资源或浏览器 Cookie 中；撤销、过期和 scope 检查对每个请求重新执行。
+Token API 和管理 API 共用同源 `/api/v1`，具体字段见 [Token API 合同](../specs/agent-vm/contracts/token-api.md) 及其 OpenAPI 路径。Token 是高熵、不可预测的不透明 Bearer 值；服务端只保存带版本的验证摘要和必要元数据。创建操作以精确的 `(issuer, subject, operation_id, canonical request digest)` 作为幂等身份，并在持久化摘要和 operation result 的同一事务中先消费一次性明文披露 latch，再发送唯一的创建响应。明文只在该响应中返回一次，随后不可恢复；相同主体的并发或重试只返回 `token_id`、安全元数据和披露状态，不重发明文。响应丢失时，主体通过原 `operation_id` 查询 owner-scoped operation，确认其 `token_id` 和元数据后显式撤销，再使用新的 operation ID 创建新 Token；服务绝不自动重发或猜测 bearer。Token 不出现在 URL、日志、审计 reason、operation journal、静态资源或浏览器 Cookie 中；撤销、过期和 scope 检查对每个请求重新执行。
 
 Agent API 是 `POST /agent/v1/control`。它接收原有 protocol-4 JSON body，不新增第二套生命周期协议。服务端先验证 Token，再验证 issuer/subject、scope、session 所有权、generation、operation ID 和 request digest；session-scoped action 不能通过 Token 改写成另一个主体。无 session 的只读观测只对显式的管理员观测能力开放。Agent API 返回原有成功、错误、未知结果和 journal 语义；网络超时不等于 native effect 未发生，也不允许用新 operation ID 重放。
 
@@ -79,7 +79,7 @@ Agent API 是 `POST /agent/v1/control`。它接收原有 protocol-4 JSON body，
 
 ## 状态、迁移和原子并发
 
-现有 SQLite 是迁移前的单一权威，保留 schema、protocol 4、generation、`state_epoch`、operation journal 和 unknown-outcome 语义。迁移到 rqlite 采用保守的一次性切换：先进入 state-write fence，drain 并拒绝新的浏览器/API/Agent durable mutation，暂停 scheduler、reconciliation 和 timer 的 durable writes；允许已在途请求和 native worker 完成，或先把结果以原 operation ID 记录为 pending/unknown。所有在途 state transaction 收敛后关闭全部 SQLite 写入者，记录最终 `state_epoch`，在 fence 内生成一致的 SQLite 备份和导出，验证 schema/capability/行数/摘要，再以 rqlite 的事务请求导入；验证失败时保持 SQLite 未修改并恢复旧服务，不做双写、实时双主或反向猜测同步。
+现有 SQLite 是迁移前的单一权威，保留 schema、protocol 4、generation、`state_epoch`、operation journal 和 unknown-outcome 语义。迁移到 rqlite 采用保守的一次性切换：先进入 state-write fence，drain 并拒绝新的浏览器/API/Agent durable mutation，暂停 scheduler、reconciliation 和 timer 的 durable writes；已在途请求和 native worker 必须完成其原 operation ID 下的 durable result，并逐一验证 worker 进程组、PID 身份和已知 Incus operation identity 已停止且静默。若结果仍 pending/unknown、worker 仍能运行或任何 quiescence 证据不可验证，迁移保持 fenced 并阻止导出，不能只记录 pending/unknown 后继续。只有所有 state transaction 和 native worker 都收敛、所有 SQLite writer 都关闭后，才能记录最终 `state_epoch`，在 fence 内生成一致的 SQLite 备份和导出，验证 schema/capability/行数/摘要，再以 rqlite 的事务请求导入；验证失败时保持 SQLite 未修改并恢复旧服务，不做双写、实时双主或反向猜测同步。
 
 rqlite 成为权威后，所有跨行状态变化使用 `POST /db/execute?transaction` 的单请求事务，不能在 SQL 中自行发送 `BEGIN`、`COMMIT`、`ROLLBACK` 或把多条关键写入拆成独立 HTTP 请求。关键授权、ownership、lease、generation、operation journal、Token 撤销、状态能力和 `state_epoch` 读取使用 linearizable consistency；native observation 前后的 epoch 比较也必须使用 linearizable consistency，只有观测值本身在明确可接受新鲜度时才能使用较弱一致性，并保留 freshness。服务不直接读取 rqlite 节点的 SQLite 文件。
 

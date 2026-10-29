@@ -14,7 +14,16 @@ The endpoint accepts only the fixed method, path, request size, JSON shape and a
 
 ## Authorization
 
-The service resolves the Token's validation digest to its exact `(issuer, subject)` owner, checks expiry and revocation, and verifies that the requested scope covers the action. For a session-scoped action, the request `session_id` must be one of the Token's bound sessions and owned by that same pair. The service then checks the current generation, lease, resource ownership, admission state and operation journal before any native effect.
+The service resolves the Token's validation digest to its exact `(issuer, subject)` owner, checks expiry and revocation, and verifies that the requested scope covers the action. The first release fixes this mapping; there is no implicit scope inheritance:
+
+| Token scope | Protocol-4 actions authorized by that scope |
+| --- | --- |
+| `agent:read` | `doctor`, `status`, `port-list` |
+| `agent:operate` | `acquire`, `renew`, `release`, `destroy`, `restart`, `resize`, `port-add`, `port-remove` |
+| `agent:sync` | `ssh-info` only, to obtain the session's bounded SSH/source-transfer connection data; it does not authorize arbitrary SSH commands, `exec`, file transfer or export by itself. |
+| `agent:observe_admin` | Read-only `admin-metrics`, `admin-status`, `admin-session-list` and `drain-status`; the principal must also have the explicit administrator observation capability. |
+
+`admin-reconcile`, `admin-gc`, `drain-enter`, `drain-exit`, `timer-expire`, `timer-reconcile` and `timer-age-gc` are never authorized by an Agent Token scope; they remain capability-gated management or scheduler actions. An action not listed above, a scope used outside its row, or a malformed/unknown action is denied before durable or native effects. For a session-scoped action, the request `session_id` must be one of the Token's bound sessions and owned by that same pair. The service then checks the current generation, lease, resource ownership, admission state and operation journal before any native effect.
 
 An ordinary user Token cannot list or mutate another user's session, use a sessionless administrator action, or elevate its scope by changing JSON. Sessionless read-only observation such as `admin-metrics` requires a separately granted administrator observation scope. Administrator Token use remains subject to the administrator capability and audit policy; a machine Token does not bypass reason, confirmation or state checks for sensitive management operations.
 

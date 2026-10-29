@@ -13,14 +13,14 @@ status: accepted
 迁移分为明确的单一权威阶段：
 
 1. **SQLite 基线**：迁移前保持当前 SQLite schema、protocol-4 请求/响应、generation、`state_epoch`、journal、audit 和 unknown-outcome 语义。现有服务继续是唯一写入者。
-2. **排空和导出**：迁移开始前进入 state-write fence，停止新的浏览器/API/Agent durable mutation 和 native admission，暂停 scheduler、reconciliation、timer 的 durable writes；让已在途请求和 native worker 完成，或先用原 operation ID 记录 pending/unknown。所有在途 state transaction 收敛后关闭全部 SQLite 写入者，记录最终 `state_epoch`，只允许读和备份，再生成一致的 SQLite 备份与导出，并记录 schema、capability、行数、主键范围、generation/journal 摘要和受保护密钥版本。
+2. **排空和导出**：迁移开始前进入 state-write fence，停止新的浏览器/API/Agent durable mutation 和 native admission，暂停 scheduler、reconciliation、timer 的 durable writes。已在途请求和 native worker 必须以原 operation ID 完成 durable result，并通过 worker PID 启动身份、进程组以及已知 Incus operation identity 验证每个 worker 已停止且静默；pending/unknown 结果、仍可运行的 worker 或无法证明 quiescence 的 native effect 都是迁移阻塞条件，不能只记录后继续。只有所有在途 state transaction 和 native worker 收敛、全部 SQLite 写入者关闭后，才能记录最终 `state_epoch`，只允许读和备份，再生成一致的 SQLite 备份与导出，并记录 schema、capability、行数、主键范围、generation/journal 摘要和受保护密钥版本。
 3. **一次性导入**：目标 rqlite 先通过 schema/capability 预检，再使用 `POST /db/execute?transaction` 的单请求事务导入数据。不能在请求 SQL 中自行发送 `BEGIN`、`COMMIT`、`ROLLBACK`、`SAVEPOINT` 或 `RELEASE`；多条语句必须由 rqlite 的事务请求包住，任何失败都不能发布部分迁移。
 4. **验证和切换**：对 rqlite 做 schema、capability、行数、摘要、generation、journal 顺序、Token/会话摘要和审计校验；启动一个目标服务做只读/readiness 验证，再绑定蓝绿活动槽位。验证失败保持 SQLite 备份和旧服务不变，不写回或猜测修复 rqlite。
 5. **迁移后**：rqlite 成为唯一共享状态权威，蓝绿服务均通过受保护 API 读写；SQLite 文件只作为受保护的恢复材料，不再由运行服务打开。不得双写、实时双主、从 rqlite 反向重建 SQLite，或通过删表/降级 schema 让旧包“兼容”。
 
 关键授权、主体 ownership、会话、Token 撤销、租约、generation、operation journal、状态 capability、`state_epoch` 和 compare-and-act 读取使用 linearizable consistency；native observation 前后的 epoch 比较也使用 linearizable consistency。只有明确允许延迟的观测值可以选择更弱的一致性，并且必须保留 freshness/observed-at。跨行变化使用同一个 rqlite transaction；条件更新和唯一约束负责 operation ID、request digest、resource version 和 generation 的原子检查。
 
-native Incus 操作在数据库事务外执行时，事务先创建带 slot、worker identity、generation 和 operation ID 的 pending journal；native 结果通过同一身份条件提交。提交响应丢失、rqlite 不可用或 native 结果不明时保留 pending/unknown 状态，阻止冲突操作，不创建新 operation ID 重放。
+native Incus 操作在数据库事务外执行时，事务先创建带 slot、worker identity、generation 和 operation ID 的 pending journal；native 结果通过同一身份条件提交。提交响应丢失、rqlite 不可用或 native 结果不明时保留 pending/unknown 状态，阻止冲突操作，不创建新 operation ID 重放。迁移 fence 的最终导出门禁还必须证明这些 pending/unknown worker 已有终态 durable result 且 process group、PID 身份和 Incus operation identity 均已静默；任何未收敛或可继续产生 native effect 的 worker 都必须使迁移停止在 SQLite。
 
 ## Consequences
 

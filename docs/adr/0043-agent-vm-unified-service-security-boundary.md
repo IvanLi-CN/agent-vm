@@ -17,11 +17,11 @@ Agent VM 的 Go 服务已经是唯一的 Incus、生命周期、scheduler 和持
 
 Caddy 是唯一项目专用的外部入口。它负责 TLS、固定路径和活动槽位转发，只连接已验证的活动 Unix socket；它不执行用户登录、不接受或注入身份头、不实现资源授权，也不提供任意路径代理。服务端不接受浏览器提供的 `X-Forwarded-User` 或其他代理身份头。
 
-浏览器认证使用第三方 OIDC 的 Authorization Code Flow + PKCE。服务端在共享状态中记录一次性 `state`、`nonce`、受保护的 code verifier、回调 URI、过期时间和消费状态，并绑定短时 `Secure`、`HttpOnly`、`SameSite=Lax` login-binding cookie 的摘要；回调必须同时匹配两者，并在创建会话前清除 cookie。回调验证 issuer、subject、audience、签名、有效期、state、nonce、TLS 和 redirect URI。服务端和 Caddy 访问日志省略回调 query string 和 `Referer`，应用日志不保留 code、state、nonce 或 verifier。稳定身份严格是大小写敏感的 `(issuer, subject)`，不使用邮箱、显示名或 group claim。OIDC 结果只建立主体，不自动授予管理员能力。
+浏览器认证使用第三方 OIDC 的 Authorization Code Flow + PKCE，且只接受 `code_challenge_method=S256`；`plain` 或其他方法必须拒绝。服务端在共享状态中记录一次性 `state`、`nonce`、受保护的 code verifier、回调 URI、过期时间和消费状态，并绑定短时 `Secure`、`HttpOnly`、`SameSite=Lax` login-binding cookie 的摘要；回调必须同时匹配两者，并在创建会话前清除 cookie。回调验证 issuer、subject、audience、签名、有效期、state、nonce、TLS 和 redirect URI。服务端和 Caddy 访问日志省略回调 query string 和 `Referer`，应用日志不保留 code、state、nonce 或 verifier。稳定身份严格是大小写敏感的 `(issuer, subject)`，不使用邮箱、显示名或 group claim。OIDC 结果只建立主体，不自动授予管理员能力。
 
 角色和能力映射按完整 `(issuer, subject)` 持久化。普通用户的浏览器会话和 Agent Token 只能访问自己拥有的 session；管理员敏感操作仍需显式 capability、非空有界 reason、预览、一次性 confirmation token、当前 resource version/generation 和审计。审计保存主体二元组及 operation 的阶段和结果，不保存 Token、授权码或原始 native 诊断。
 
-Agent Token 是高熵不透明 Bearer 值，验证摘要存入共享状态，明文只返回一次。浏览器 Cookie 只用于同源管理 API，不能调用 Agent API；`/agent/v1/control` 只接受 Bearer Token，并在每个请求重新检查 Token 的撤销、过期、scope、主体和 session ownership。Agent API 复用 protocol 4，不建立第二套生命周期语义。
+Agent Token 是高熵不透明 Bearer 值，验证摘要存入共享状态，明文只返回一次。Token 创建按精确的 `(issuer, subject, operation_id, canonical request digest)` 幂等；服务在同一持久化事务中消费一次性披露 latch 后才发送唯一明文响应，并把 `token_id`、元数据和披露状态写入 operation result。相同主体的并发或重试只能读取安全元数据，不能再次取得明文；响应丢失时，主体用原 operation ID 查询、确认 token_id 后显式撤销，再用新 operation ID 创建，服务不得自动重发或猜测 bearer。浏览器 Cookie 只用于同源管理 API，不能调用 Agent API；`/agent/v1/control` 只接受 Bearer Token，并在每个请求重新检查 Token 的撤销、过期、scope、主体和 session ownership。Agent API 复用 protocol 4，不建立第二套生命周期语义。
 
 统一服务必须执行固定路由、方法、请求大小、字段白名单、Origin/CSRF、静态资源清单和结构化脱敏日志；不得向浏览器提供任意命令、文件路径、内部 control body、Incus 管理入口或调试 handler。服务继续以现有 Incus 所需权限运行；Caddy 以独立非 root UID 运行。该设计明确接受高权限 Web 请求处理这一取舍，并将隔离责任转移到输入边界、身份授权、原子状态检查、系统服务限制和审计上。
 

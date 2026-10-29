@@ -28,6 +28,7 @@ paths:
       operationId: startOidcLogin
       security: []
       summary: Start an OIDC Authorization Code + PKCE login
+      description: The authorization request uses code_challenge_method=S256 only; plain and any other PKCE method are rejected.
       responses:
         "302":
           description: Redirect to the configured OIDC authorization endpoint.
@@ -49,6 +50,7 @@ paths:
       operationId: completeOidcLogin
       security: []
       summary: Consume one OIDC authorization response
+      description: The callback consumes the S256-bound transaction once and never exposes or logs the authorization code.
       parameters:
         - name: code
           in: query
@@ -136,8 +138,14 @@ paths:
             schema:
               $ref: "#/components/schemas/TokenCreateRequest"
       responses:
+        "200":
+          description: Identical Token-create retry after the one-time plaintext disclosure latch was consumed; metadata is returned without the bearer value.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenCreateReplayResponse"
         "201":
-          description: Token metadata and a one-time plaintext Token.
+          description: Token metadata and the one-time plaintext Token response; the disclosure latch is consumed before this response is sent.
           content:
             application/json:
               schema:
@@ -1039,6 +1047,7 @@ components:
         operation_id:
           type: string
           format: uuid
+          description: Idempotency identity bound to the exact OIDC (issuer, subject) principal and canonical request digest.
         session_ids:
           type: array
           minItems: 1
@@ -1061,14 +1070,33 @@ components:
     TokenCreateResponse:
       type: object
       additionalProperties: false
-      required: [token, metadata]
+      required: [operation_id, token, metadata, plaintext_disclosure]
       properties:
+        operation_id:
+          type: string
+          format: uuid
         token:
           type: string
           minLength: 32
-          description: Plaintext bearer value returned only for this creation response.
+          description: Plaintext bearer value returned only for this creation response; never stored or returned by operation status.
         metadata:
           $ref: "#/components/schemas/Token"
+        plaintext_disclosure:
+          const: returned
+          description: The one-time disclosure latch was consumed before this response was sent.
+    TokenCreateReplayResponse:
+      type: object
+      additionalProperties: false
+      required: [operation_id, metadata, plaintext_disclosure]
+      properties:
+        operation_id:
+          type: string
+          format: uuid
+        metadata:
+          $ref: "#/components/schemas/Token"
+        plaintext_disclosure:
+          const: consumed
+          description: The bearer was already designated for the one permitted creation response and is never reissued.
     TokenRevokeRequest:
       type: object
       additionalProperties: false
@@ -1800,6 +1828,15 @@ components:
       type: object
       additionalProperties: false
       properties:
+        token_metadata:
+          oneOf:
+            - $ref: "#/components/schemas/Token"
+            - type: "null"
+          description: Safe Token metadata for a token_create operation; never contains the bearer value.
+        plaintext_disclosure:
+          type: [string, "null"]
+          enum: [returned, consumed, null]
+          description: Durable one-time Token disclosure state; consumed means the bearer cannot be reissued.
         image_fingerprint:
           oneOf:
             - $ref: "#/components/schemas/Fingerprint"
@@ -1958,10 +1995,10 @@ components:
       enum: [drain_enter, reconcile, gc]
     ManagementAction:
       type: string
-      enum: [restart, resize, release, destroy, port_add, port_remove, image_import, default_image_select, image_retire, image_delete, token_revoke, identity_mapping, drain_enter, reconcile, gc]
+      enum: [restart, resize, release, destroy, port_add, port_remove, image_import, default_image_select, image_retire, image_delete, token_create, token_revoke, identity_mapping, drain_enter, reconcile, gc]
     OperationPhase:
       type: string
-      enum: [queued, awaiting_upload, upload, integrity_check, image_import, suitability_check, reference_check, token_revocation, native_action, reconciliation, cleanup, completed]
+      enum: [queued, awaiting_upload, upload, integrity_check, image_import, suitability_check, reference_check, token_creation, token_revocation, native_action, reconciliation, cleanup, completed]
     ErrorPhase:
       type: string
       enum: [authentication, authorization, request_validation, precondition, admission, awaiting_upload, upload, integrity_check, image_import, suitability_check, reference_check, token, native_action, reconciliation, cleanup, internal]
