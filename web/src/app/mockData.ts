@@ -45,14 +45,14 @@ const baseVM = {
 export const vms: ManagedVM[] = [
   { ...baseVM, task_id: "task_example_01" },
   { ...baseVM, task_id: "task_aurora_02", session_id: "session_aurora_02", generation: "18", resource_version: "vm:task_aurora_02:revision-4", state: "active", image: { fingerprint: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", version_label: "legacy-default" }, resources: { cpu_vcpu: 2, memory_bytes: "4294967296", disk_bytes: "32212254720" }, lease: { state: "effective", expires_at: "2026-01-15T10:44:00Z" }, port_mappings: [{ name: "preview", protocol: "tcp", host_port: 24002, guest_port: 3000 }] },
-  { ...baseVM, task_id: "task_cedar_03", session_id: "session_cedar_03", generation: "7", resource_version: "vm:task_cedar_03:revision-12", state: "cached", native_state: "stopped", guest_availability: "unavailable", lease: { state: "absent", expires_at: null }, resources: { cpu_vcpu: 1, memory_bytes: "2147483648", disk_bytes: "21474836480" }, port_mappings: [] },
-  { ...baseVM, task_id: "task_delta_04", session_id: "session_delta_04", generation: "33", resource_version: "vm:task_delta_04:revision-8", state: "failed", native_state: "unknown", guest_availability: "unknown", lease: { state: "expired", expires_at: "2026-01-14T22:10:00Z" }, last_error: { code: "authority_unavailable", phase: "native_action", retryable: true }, port_mappings: [] },
-  { ...baseVM, task_id: "task_echo_05", session_id: "session_echo_05", generation: "11", resource_version: "vm:task_echo_05:revision-3", state: "preparing", native_state: "transitional", guest_availability: "unavailable", image: { fingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", version_label: "2026.01" }, lease: { state: "unknown", expires_at: null }, resources: { cpu_vcpu: 2, memory_bytes: "4294967296", disk_bytes: "21474836480" }, port_mappings: [] },
+  { ...baseVM, task_id: "task_cedar_03", session_id: "session_cedar_03", generation: "7", resource_version: "vm:task_cedar_03:revision-12", state: "cached", native_state: "stopped", guest_availability: "unavailable", lease: { state: "absent", expires_at: null }, resources: { cpu_vcpu: 1, memory_bytes: "2147483648", disk_bytes: "21474836480" }, port_mappings: [], allowed_actions: ["release", "destroy"] },
+  { ...baseVM, task_id: "task_delta_04", session_id: "session_delta_04", generation: "33", resource_version: "vm:task_delta_04:revision-8", state: "failed", native_state: "unknown", guest_availability: "unknown", lease: { state: "expired", expires_at: "2026-01-14T22:10:00Z" }, last_error: { code: "authority_unavailable", phase: "native_action", retryable: true }, port_mappings: [], allowed_actions: ["release", "destroy"] },
+  { ...baseVM, task_id: "task_echo_05", session_id: "session_echo_05", generation: "11", resource_version: "vm:task_echo_05:revision-3", state: "preparing", native_state: "transitional", guest_availability: "unavailable", image: { fingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", version_label: "2026.01" }, lease: { state: "unknown", expires_at: null }, resources: { cpu_vcpu: 2, memory_bytes: "4294967296", disk_bytes: "21474836480" }, port_mappings: [], allowed_actions: ["release", "destroy"] },
 ];
 
 export const images: ManagedImage[] = [
   { fingerprint: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", resource_version: "image:bbbb:revision-3", version_label: "legacy-default", architecture: "x86_64", instance_type: "container", source: { kind: "legacy_config", source_id: null }, state: "available", verification: { integrity: "legacy_unverified", suitability: "not_assessed", findings: [] }, is_default: true, default_compatibility: "legacy_unverified", references: { default: 1, active: 1, cached: 1, releasing: 0, pending_creation: 0, verification: 0 }, created_at: "2025-10-01T00:00:00Z" },
-  { fingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", resource_version: "image:aaaa:revision-1", version_label: "2026.01", architecture: "x86_64", instance_type: "container", source: { kind: "local_upload", source_id: null }, state: "available", verification: { integrity: "passed", suitability: "passed", findings: [] }, is_default: false, default_compatibility: "none", references: { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 }, created_at: "2026-01-15T09:55:00Z" },
+  { fingerprint: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", resource_version: "image:aaaa:revision-1", version_label: "2026.01", architecture: "x86_64", instance_type: "container", source: { kind: "local_upload", source_id: null }, state: "available", verification: { integrity: "passed", suitability: "passed", findings: [] }, is_default: false, default_compatibility: "none", references: { default: 0, active: 1, cached: 0, releasing: 0, pending_creation: 1, verification: 0 }, created_at: "2026-01-15T09:55:00Z" },
   { fingerprint: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", resource_version: "image:cccc:revision-2", version_label: "2025.12-maintenance", architecture: "x86_64", instance_type: "container", source: { kind: "trusted_remote", source_id: "ubuntu-staging" }, state: "retired", verification: { integrity: "passed", suitability: "passed", findings: [] }, is_default: false, default_compatibility: "none", references: { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 }, created_at: "2025-12-16T08:30:00Z" },
 ];
 
@@ -84,4 +84,23 @@ export const system: SystemStatus = {
 
 export const emptyReferences: ImageReferenceCounts = { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 };
 
-export const mockState = { overview, vms, images, operations, audits, system };
+export type MockState = {
+  overview: Overview;
+  vms: ManagedVM[];
+  images: ManagedImage[];
+  operations: Operation[];
+  audits: AuditEvent[];
+  system: SystemStatus;
+  image_selection_version: string;
+  image_catalog_version: string;
+};
+export const mockState: MockState = {
+  overview,
+  vms,
+  images,
+  operations,
+  audits,
+  system,
+  image_selection_version: "image-selection:revision-12",
+  image_catalog_version: "image-catalog:revision-12",
+};

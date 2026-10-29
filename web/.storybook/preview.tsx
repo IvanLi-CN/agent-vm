@@ -3,6 +3,7 @@ import "../src/app/styles.css";
 
 const preview: Preview = {
   parameters: {
+    a11y: { test: "error" },
     controls: { expanded: true },
     layout: "fullscreen",
     backgrounds: {

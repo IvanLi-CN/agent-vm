@@ -1,0 +1,12 @@
+{
+  "$schema": "https://react.doctor/schema/config.json",
+  "blocking": "error",
+  "ignore": {
+    "files": ["dist/**", "dist-demo/**", "storybook-static/**", "test-results/**"]
+  },
+  "noScore": true,
+  "share": false,
+  "supplyChain": {
+    "enabled": false
+  }
+}
