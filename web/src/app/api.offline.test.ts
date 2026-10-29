@@ -1,9 +1,11 @@
 import { expect, it, vi } from "vitest";
 
-vi.mock("../demo/runtime", async (importOriginal) => ({
-  ...await importOriginal<typeof import("../demo/runtime")>(),
+vi.mock("../demo/runtime", () => ({
   isDemoRuntime: () => true,
   demoMutationError: () => "network_unavailable",
+  getMockState: () => mockState,
+  demoForcedOutcome: () => "succeeded",
+  emitDemoChange: () => {},
 }));
 
 import { previewVMAction, startImageImport } from "./api";
