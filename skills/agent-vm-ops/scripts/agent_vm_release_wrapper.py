@@ -213,6 +213,14 @@ def _safe_id(value: Any, label: str) -> str:
     return value
 
 
+def _release_drain_owner(transaction_id: str, session_id: str | None = None) -> str:
+    """Resolve the exact release owner used by drain-enter and recovery."""
+    owner = "release-" + transaction_id if session_id is None else session_id
+    if not isinstance(owner, str) or ID_RE.fullmatch(owner) is None or not owner.startswith("release-"):
+        _fail("invalid_request", "release drain owner is invalid")
+    return owner
+
+
 def _release_id(value: Any) -> str:
     if not isinstance(value, str) or RELEASE_ID_RE.fullmatch(value) is None:
         _fail("invalid_request", "release_id must be a 40-character lowercase Git revision")
@@ -520,7 +528,8 @@ def _activation_fence_paths(config: Mapping[str, Any]) -> tuple[Path, ...]:
     return tuple(dict.fromkeys((primary, persistent)))
 
 
-def _write_activation_fence(path: Path, transaction_id: str, release_id: str) -> None:
+def _write_activation_fence(path: Path, transaction_id: str, release_id: str) -> bool:
+    """Create or verify one fence and report whether this call created it."""
     _mkdir_private(path.parent, 0o755)
     if path in {RELEASE_FENCE_PATH, PERSISTENT_RELEASE_FENCE_PATH}:
         _require_root_owned_path(path.parent, "release activation fence directory")
@@ -540,11 +549,15 @@ def _write_activation_fence(path: Path, transaction_id: str, release_id: str) ->
             or existing.get("release_id") != release_id
         ):
             _fail("release_activation_in_progress", "another release activation fence is active")
-        return
+        return False
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    created = False
     try:
         descriptor = os.open(path, flags, 0o600)
+        created = True
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            descriptor = None
             json.dump({"format": 1, "transaction_id": transaction_id, "release_id": release_id}, handle, sort_keys=True)
             handle.write("\n")
             handle.flush()
@@ -553,15 +566,68 @@ def _write_activation_fence(path: Path, transaction_id: str, release_id: str) ->
     except FileExistsError:
         _fail("release_activation_in_progress", "another release activation fence is active")
     except OSError:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if created:
+            try:
+                path.unlink()
+                _fsync_directory(path.parent)
+            except OSError:
+                pass
         _fail("release_fence_unavailable", "release activation fence cannot be created")
+    return True
+
+
+def _clear_activation_fence(path: Path, transaction_id: str, release_id: str) -> None:
+    """Remove only the fence owned by this activation transaction."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    except OSError:
+        _fail("release_fence_cleanup_failed", "release activation fence could not be inspected")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        _fail("release_fence_cleanup_failed", "release activation fence is not a private regular file")
+    existing = _read_json(path, "release_fence_cleanup_failed")
+    if (
+        existing.get("format") != 1
+        or existing.get("transaction_id") != transaction_id
+        or existing.get("release_id") != release_id
+    ):
+        _fail("release_fence_cleanup_failed", "release activation fence ownership changed")
+    try:
+        path.unlink()
+        _fsync_directory(path.parent)
+    except OSError:
+        _fail("release_fence_cleanup_failed", "release activation fence could not be cleared")
 
 
 @contextmanager
 def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id: str):
     """Keep control-plane drain exit fenced for the whole activation window."""
     paths = _activation_fence_paths(config)
-    for path in paths:
-        _write_activation_fence(path, transaction_id, release_id)
+    created_paths: list[Path] = []
+    try:
+        for path in paths:
+            if _write_activation_fence(path, transaction_id, release_id):
+                created_paths.append(path)
+    except WrapperError as failure:
+        cleanup_errors: list[dict[str, Any]] = []
+        for path in reversed(created_paths):
+            try:
+                _clear_activation_fence(path, transaction_id, release_id)
+            except WrapperError as cleanup_error:
+                cleanup_errors.append(cleanup_error.as_dict())
+        if cleanup_errors:
+            raise WrapperError(
+                "release_fence_cleanup_failed",
+                "release activation fence initialization failed and could not be fully cleaned up",
+                {"initial_error": failure.as_dict(), "cleanup_errors": cleanup_errors},
+            ) from failure
+        raise
 
     def refresh() -> None:
         # systemd may remove the service-owned primary directory when the
@@ -575,12 +641,9 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
     finally:
         for path in paths:
             try:
-                path.unlink()
-                _fsync_directory(path.parent)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                _fail("release_fence_cleanup_failed", "release activation fence could not be cleared")
+                _clear_activation_fence(path, transaction_id, release_id)
+            except WrapperError:
+                raise
 
 
 def _write_json(path: Path, value: Mapping[str, Any], mode: int = 0o600) -> None:
@@ -1077,6 +1140,89 @@ def _snapshot_targets(config: Mapping[str, Any]) -> dict[Path, tuple[bytes, int,
     return snapshot
 
 
+def _predecessor_snapshot_path(config: Mapping[str, Any], transaction_id: str) -> Path:
+    return Path(config["state_root"]) / (transaction_id + ".predecessor.json")
+
+
+def _persist_predecessor_snapshot(
+    config: Mapping[str, Any],
+    transaction_id: str,
+    snapshot: Mapping[Path, tuple[bytes, int, int] | None],
+    manifest: Mapping[str, Any],
+) -> None:
+    """Persist exact installed targets before a pointer-less runtime is stopped."""
+    targets: dict[str, Any] = {}
+    for target in sorted(snapshot, key=str):
+        saved = snapshot[target]
+        if saved is None:
+            targets[str(target)] = None
+            continue
+        data, mode, owner_uid = saved
+        targets[str(target)] = {
+            "data": base64.b64encode(data).decode("ascii"),
+            "mode": mode,
+            "owner_uid": owner_uid,
+        }
+    _write_json(
+        _predecessor_snapshot_path(config, transaction_id),
+        {
+            "format": 1,
+            "transaction_id": transaction_id,
+            "manifest": dict(manifest),
+            "targets": targets,
+        },
+    )
+
+
+def _load_predecessor_snapshot(
+    config: Mapping[str, Any],
+    transaction_id: str,
+) -> tuple[dict[Path, tuple[bytes, int, int] | None], dict[str, Any]]:
+    """Load and validate the durable predecessor material for interrupted activation."""
+    path = _predecessor_snapshot_path(config, transaction_id)
+    _require_owned_regular(path, int(config["owner_uid"]), 0o600)
+    record = _read_json(path, "rollback_unavailable")
+    if record.get("format") != 1 or record.get("transaction_id") != transaction_id:
+        _fail("rollback_unavailable", "pointer-less predecessor snapshot does not match the transaction")
+    manifest = record.get("manifest")
+    targets = record.get("targets")
+    if not isinstance(manifest, Mapping) or not isinstance(targets, Mapping):
+        _fail("rollback_unavailable", "pointer-less predecessor snapshot is incomplete")
+    expected_targets = {str(target) for target in _activation_targets(config)}
+    if set(targets) != expected_targets:
+        _fail("rollback_unavailable", "pointer-less predecessor snapshot has an unexpected target set")
+    restored: dict[Path, tuple[bytes, int, int] | None] = {}
+    for target in _activation_targets(config):
+        value = targets.get(str(target))
+        if value is None:
+            restored[target] = None
+            continue
+        if not isinstance(value, Mapping):
+            _fail("rollback_unavailable", "pointer-less predecessor snapshot entry is invalid")
+        encoded = value.get("data")
+        mode = value.get("mode")
+        owner_uid = value.get("owner_uid")
+        if (
+            not isinstance(encoded, str)
+            or isinstance(mode, bool)
+            or not isinstance(mode, int)
+            or mode < 0
+            or mode > 0o777
+            or isinstance(owner_uid, bool)
+            or not isinstance(owner_uid, int)
+            or owner_uid < 0
+        ):
+            _fail("rollback_unavailable", "pointer-less predecessor snapshot entry is invalid")
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            _fail("rollback_unavailable", "pointer-less predecessor snapshot bytes are invalid")
+        if len(data) > MAX_FILE_BYTES:
+            _fail("rollback_unavailable", "pointer-less predecessor snapshot file is too large")
+        restored[target] = (data, mode, owner_uid)
+    return restored, dict(manifest)
+
+
 def _restore_targets(snapshot: Mapping[Path, tuple[bytes, int, int] | None]) -> None:
     for target, saved in snapshot.items():
         _require_directory_chain(target.parent, "activation_restore_failed", f"activation target parent: {target.parent}")
@@ -1206,6 +1352,8 @@ def _read_live_state_capabilities() -> list[str]:
 
 def _verify_durable_drain_state(
     target_manifest: Mapping[str, Any] | None = None,
+    *,
+    expected_owner: str | None = None,
 ) -> None:
     """Prove admission silence from one consistent state-database snapshot.
 
@@ -1240,7 +1388,10 @@ def _verify_durable_drain_state(
             if meta.get("draining") != "1":
                 _fail("drain_required", "release recovery requires an active admission drain")
             owner = meta.get("drain_owner")
-            if owner not in (None, "") and (
+            if expected_owner is not None:
+                if owner != expected_owner:
+                    _fail("drain_unverified", "durable release drain is not owned by this activation transaction")
+            elif owner not in (None, "") and (
                 not isinstance(owner, str) or not owner.startswith("release-")
             ):
                 _fail("drain_unverified", "durable release drain is owned by another actor")
@@ -1927,10 +2078,22 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
                 _fail("activation_failed", "cannot retire the exact replaced executable")
 
 
-def activate(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
+def activate(
+    config: Mapping[str, Any],
+    transaction_id: str,
+    release_id: str,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    drain_owner = _release_drain_owner(transaction_id, session_id)
     with _release_lock(config):
         with _activation_fence(config, transaction_id, release_id) as refresh_fence:
-            return _activate_unlocked(config, transaction_id, release_id, refresh_fence)
+            return _activate_unlocked(
+                config,
+                transaction_id,
+                release_id,
+                refresh_fence,
+                drain_owner,
+            )
 
 
 def _activate_unlocked(
@@ -1938,9 +2101,11 @@ def _activate_unlocked(
     transaction_id: str,
     release_id: str,
     refresh_fence=None,
+    expected_drain_owner: str | None = None,
 ) -> dict[str, Any]:
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
+    drain_owner = _release_drain_owner(transaction_id, expected_drain_owner)
     verified = _verify_transaction(config, transaction_id, release_id)
     staged = _transaction_dir(config, transaction_id)
     try:
@@ -2016,6 +2181,10 @@ def _activate_unlocked(
         _fail("activation_failed", "cannot commit verified release directory")
     previous_id = old_current.name if old_current else None
     target_snapshot = _snapshot_targets(config)
+    predecessor_snapshot = None
+    if old_current is None and old_runtime_manifest is not None:
+        _persist_predecessor_snapshot(config, transaction_id, target_snapshot, old_runtime_manifest)
+        predecessor_snapshot = True
     record = {
         "transaction_id": transaction_id,
         "release_id": release_id,
@@ -2027,6 +2196,8 @@ def _activate_unlocked(
         "activation_phase": "prepared",
         "rollback_attempts": 0,
         "web_unit_enabled": web_unit_enabled,
+        "drain_owner": drain_owner,
+        "predecessor_snapshot": predecessor_snapshot,
     }
     _write_json(activation_path, record)
     runtime_switch_attempted = False
@@ -2177,10 +2348,22 @@ def _activate_unlocked(
     return record
 
 
-def rollback(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
+def rollback(
+    config: Mapping[str, Any],
+    transaction_id: str,
+    release_id: str,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    drain_owner = _release_drain_owner(transaction_id, session_id)
     with _release_lock(config):
         with _activation_fence(config, transaction_id, release_id) as refresh_fence:
-            return _rollback_unlocked(config, transaction_id, release_id, refresh_fence)
+            return _rollback_unlocked(
+                config,
+                transaction_id,
+                release_id,
+                refresh_fence,
+                drain_owner,
+            )
 
 
 def _rollback_unlocked(
@@ -2188,9 +2371,11 @@ def _rollback_unlocked(
     transaction_id: str,
     release_id: str,
     refresh_fence=None,
+    expected_drain_owner: str | None = None,
 ) -> dict[str, Any]:
     transaction_id = _safe_id(transaction_id, "transaction_id")
     release_id = _release_id(release_id)
+    drain_owner = _release_drain_owner(transaction_id, expected_drain_owner)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
     try:
         activation_info = activation_path.lstat()
@@ -2217,10 +2402,18 @@ def _rollback_unlocked(
     if record.get("rollback_attempts", 0) >= 1 and not recovering_in_progress:
         _fail("rollback_already_attempted", "automatic rollback is limited to one attempt")
     previous_id = record.get("previous_release_id")
-    if not isinstance(previous_id, str) or RELEASE_ID_RE.fullmatch(previous_id) is None:
-        _fail("rollback_unavailable", "no previous verified release is retained")
-    previous_dir = Path(config["release_root"]) / previous_id
-    previous_manifest = _verify_retained_release(config, previous_dir)
+    pointerless_predecessor = previous_id is None and record.get("predecessor_snapshot") is True
+    predecessor_snapshot: dict[Path, tuple[bytes, int, int] | None] | None = None
+    predecessor_record_manifest: dict[str, Any] | None = None
+    if pointerless_predecessor:
+        predecessor_snapshot, predecessor_record_manifest = _load_predecessor_snapshot(config, transaction_id)
+        previous_dir = None
+        previous_manifest = predecessor_record_manifest
+    else:
+        if not isinstance(previous_id, str) or RELEASE_ID_RE.fullmatch(previous_id) is None:
+            _fail("rollback_unavailable", "no previous verified release is retained")
+        previous_dir = Path(config["release_root"]) / previous_id
+        previous_manifest = _verify_retained_release(config, previous_dir)
     current_link = Path(config["current_link"])
     previous_link = Path(config["previous_link"])
     actual_current = _current_target(current_link, Path(config["release_root"]))
@@ -2229,12 +2422,12 @@ def _rollback_unlocked(
     old_previous_id = record.get("old_previous_release_id")
     if record.get("activated") is True:
         old_current_id = old_current_id or previous_id
-    elif not isinstance(old_current_id, str):
+    elif not pointerless_predecessor and not isinstance(old_current_id, str):
         _fail("rollback_unavailable", "interrupted activation has no retained current pointer record")
     for value, label in ((old_current_id, "old_current_release_id"), (old_previous_id, "old_previous_release_id")):
         if value is not None and (not isinstance(value, str) or RELEASE_ID_RE.fullmatch(value) is None):
             _fail("rollback_unavailable", f"{label} is invalid")
-    if old_current_id == old_previous_id:
+    if old_current_id is not None and old_current_id == old_previous_id:
         _fail("activation_unverified", "current and previous pointers must not target the same release")
     if old_current_id != previous_id:
         _fail("rollback_unavailable", "retained current release does not match the activation record")
@@ -2266,7 +2459,9 @@ def _rollback_unlocked(
     else:
         allowed_current = {release_id, old_current_id}
         allowed_previous = {None, old_current_id, old_previous_id, release_id}
-        if actual_current is None or actual_current.name not in allowed_current:
+        if (actual_current is None and not pointerless_predecessor) or (
+            actual_current is not None and actual_current.name not in allowed_current
+        ):
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
         if actual_previous is not None and actual_previous.name not in allowed_previous:
             _fail("rollback_stale", "interrupted rollback transaction no longer matches release pointers")
@@ -2278,7 +2473,7 @@ def _rollback_unlocked(
     # exited, or new work that crossed the fence, after the interruption.
     if interrupted or recovering_in_progress:
         if config["require_drained"]:
-            _verify_durable_drain_state(previous_manifest)
+            _verify_durable_drain_state(previous_manifest, expected_owner=drain_owner)
     else:
         _ensure_drained(config, previous_manifest)
     target_snapshot = _snapshot_targets(config)
@@ -2307,10 +2502,31 @@ def _rollback_unlocked(
             if refresh_fence is not None:
                 refresh_fence()
             predecessor_runtime_stopped = True
-        _install_release_files(config, previous_dir, previous_manifest)
-        _atomic_symlink(previous_dir, current_link)
+        if pointerless_predecessor:
+            if not predecessor_runtime_stopped and not active_is_native:
+                _deactivate_legacy_runtime()
+            _restore_targets(predecessor_snapshot or {})
+            restored_manifest_path = Path(config["control_path"]).with_name(MANIFEST_NAME)
+            restored_manifest = load_release_manifest(
+                restored_manifest_path,
+                allow_historical_web_config_mode=True,
+            )
+            previous_manifest = _verify_installed_release(
+                config,
+                restored_manifest_path.parent,
+                restored_manifest,
+            )
+        else:
+            _install_release_files(config, previous_dir, previous_manifest)
+        _restore_pointer(current_link, None) if pointerless_predecessor else _atomic_symlink(previous_dir, current_link)
         if record.get("activated") is True:
-            _atomic_symlink(Path(config["release_root"]) / release_id, previous_link)
+            if pointerless_predecessor:
+                _restore_pointer(
+                    previous_link,
+                    Path(config["release_root"]) / old_previous_id if old_previous_id is not None else None,
+                )
+            else:
+                _atomic_symlink(Path(config["release_root"]) / release_id, previous_link)
         else:
             _restore_pointer(
                 previous_link,
@@ -2327,7 +2543,7 @@ def _rollback_unlocked(
         elif _is_go_manifest(previous_manifest):
             _activate_go_runtime()
         else:
-            _activate_legacy_runtime(native_already_stopped=predecessor_runtime_stopped)
+            _activate_legacy_runtime(native_already_stopped=predecessor_runtime_stopped or pointerless_predecessor)
     except WrapperError as failure:
         restore_succeeded = False
         try:
@@ -2453,8 +2669,9 @@ def _rollback_unlocked(
         raise record_error
     return {
         "rolled_back": True,
-        "release_id": previous_id,
+        "release_id": _manifest_release_id(previous_manifest) if pointerless_predecessor else previous_id,
         "previous_release_id": release_id if record.get("activated") is True else None,
+        "predecessor_restored": pointerless_predecessor,
     }
 
 
@@ -2481,9 +2698,11 @@ def build_parser() -> argparse.ArgumentParser:
     activate_parser = subparsers.add_parser("activate")
     activate_parser.add_argument("--transaction-id", required=True)
     activate_parser.add_argument("--release-id", required=True)
+    activate_parser.add_argument("--session-id")
     rollback_parser = subparsers.add_parser("rollback")
     rollback_parser.add_argument("--transaction-id", required=True)
     rollback_parser.add_argument("--release-id", required=True)
+    rollback_parser.add_argument("--session-id")
     subparsers.add_parser("status")
     return parser
 
@@ -2498,9 +2717,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "verify":
             result = verify_transaction(config, _safe_id(args.transaction_id, "transaction_id"), _release_id(args.release_id))
         elif args.action == "activate":
-            result = activate(config, args.transaction_id, args.release_id)
+            result = activate(config, args.transaction_id, args.release_id, args.session_id)
         elif args.action == "rollback":
-            result = rollback(config, args.transaction_id, args.release_id)
+            result = rollback(config, args.transaction_id, args.release_id, args.session_id)
         else:
             result = status(config)
         sys.stdout.write(json.dumps(result, sort_keys=True) + "\n")

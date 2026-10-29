@@ -43,8 +43,8 @@ class FakeTransport:
         self.control_release_ids = []
         self.health_checks = 0
 
-    def wrapper(self, host, wrapper_path, action, transaction_id, release_id, payload=None):
-        self.calls.append(("wrapper", action, transaction_id, release_id, payload is not None))
+    def wrapper(self, host, wrapper_path, action, transaction_id, release_id, payload=None, session_id=None):
+        self.calls.append(("wrapper", action, transaction_id, release_id, payload is not None, session_id))
         if action == "activate":
             if self.fail_activation:
                 return {"ok": False, "error": {"code": "activation_failed", "message": "injected"}}

@@ -18,6 +18,11 @@ import (
 
 const defaultManagementSessionTTLSeconds int64 = 900
 
+// PersistentReleaseFencePath is independent of the service-owned runtime
+// directory. The release wrapper keeps this fence across native authority
+// restarts so every controller generation blocks drain exit during activation.
+const PersistentReleaseFencePath = "/run/agent-vm-release/release-activation.fence"
+
 var (
 	guestToolPattern          = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$`)
 	trustedImageSourcePattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,63}$`)

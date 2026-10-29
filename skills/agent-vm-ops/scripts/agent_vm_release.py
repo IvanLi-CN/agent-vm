@@ -653,7 +653,16 @@ def _install_client_package(root: Path, client_path: Path, release_id: str) -> N
 
 
 class ReleaseTransport(Protocol):
-    def wrapper(self, host: str, wrapper_path: str, action: str, transaction_id: str, release_id: str, payload: bytes | None = None) -> Mapping[str, Any]: ...
+    def wrapper(
+        self,
+        host: str,
+        wrapper_path: str,
+        action: str,
+        transaction_id: str,
+        release_id: str,
+        payload: bytes | None = None,
+        session_id: str | None = None,
+    ) -> Mapping[str, Any]: ...
     def control(self, host: str, remote_control: str, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
@@ -698,10 +707,21 @@ class SSHTransport:
             _fail("remote_timeout", "remote release action timed out")
         return self._parse(process, command[0])
 
-    def wrapper(self, host: str, wrapper_path: str, action: str, transaction_id: str, release_id: str, payload: bytes | None = None) -> Mapping[str, Any]:
+    def wrapper(
+        self,
+        host: str,
+        wrapper_path: str,
+        action: str,
+        transaction_id: str,
+        release_id: str,
+        payload: bytes | None = None,
+        session_id: str | None = None,
+    ) -> Mapping[str, Any]:
         command = [wrapper_path, action]
         if action != "status":
             command.extend(["--transaction-id", transaction_id, "--release-id", release_id])
+        if action in {"activate", "rollback"} and session_id is not None:
+            command.extend(["--session-id", session_id])
         if action == "activate":
             return self._run(host, command, payload, timeout=ACTIVATION_TIMEOUT_SECONDS)
         return self._run(host, command, payload)
@@ -797,8 +817,23 @@ class ReleasePublisher:
         )
         return _result(response)
 
-    def _wrapper(self, action: str, transaction_id: str, release_id: str, payload: bytes | None = None) -> dict[str, Any]:
-        response = self._transport().wrapper(self.control_host, self.wrapper_path, action, transaction_id, release_id, payload)
+    def _wrapper(
+        self,
+        action: str,
+        transaction_id: str,
+        release_id: str,
+        payload: bytes | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        response = self._transport().wrapper(
+            self.control_host,
+            self.wrapper_path,
+            action,
+            transaction_id,
+            release_id,
+            payload,
+            session_id,
+        )
         return _result(response)
 
     @staticmethod
@@ -954,10 +989,14 @@ class ReleasePublisher:
                 {"rollback": dict(rollback_result), "failed_release_id": failed_release_id},
             )
         status = self._wrapper("status", transaction_id, failed_release_id)
-        if (
-            status.get("current_release_id") != target_release_id
-            or status.get("previous_release_id") != failed_release_id
-        ):
+        if rollback_result.get("predecessor_restored") is True:
+            status_matches = status.get("current_release_id") is None and status.get("previous_release_id") is None
+        else:
+            status_matches = (
+                status.get("current_release_id") == target_release_id
+                and status.get("previous_release_id") == failed_release_id
+            )
+        if not status_matches:
             _fail(
                 "rollback_unverified",
                 "automatic rollback pointers do not match the retained release record",
@@ -1035,7 +1074,7 @@ class ReleasePublisher:
         if drain.get("draining") is not True:
             _fail("drain_unverified", "control did not confirm admission drain")
         self._wait_for_convergence(manifest, timeout, poll)
-        activation = self._wrapper("activate", transaction, manifest["release_id"])
+        activation = self._wrapper("activate", transaction, manifest["release_id"], session_id=session)
         if activation.get("activated") is not True:
             _fail("activation_unverified", "remote wrapper did not confirm activation")
         try:
@@ -1043,7 +1082,7 @@ class ReleasePublisher:
         except ReleaseError as health_error:
             rollback_manifest = legacy_manifest()
             try:
-                rollback_result = self._wrapper("rollback", transaction, manifest["release_id"])
+                rollback_result = self._wrapper("rollback", transaction, manifest["release_id"], session_id=session)
                 self._verify_automatic_rollback(transaction, manifest["release_id"], rollback_result)
                 # The wrapper has switched the control files back to the
                 # retained previous release.  Validate that peer through the
@@ -1093,7 +1132,7 @@ class ReleasePublisher:
             _fail("rollback_release_mismatch", "rollback bundle must identify the previous release, not the active release")
         session = self.session_id or ("release-" + transaction_id)
         self._control(manifest, "drain-enter", session=session, write=True)
-        result = self._wrapper("rollback", transaction_id, release_id)
+        result = self._wrapper("rollback", transaction_id, release_id, session_id=session)
         if result.get("release_id") != manifest["release_id"]:
             _fail(
                 "rollback_release_mismatch",
