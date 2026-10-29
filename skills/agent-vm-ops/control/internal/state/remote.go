@@ -56,6 +56,8 @@ type remoteResult struct {
 
 type remoteResponse struct {
 	Results []remoteResult `json:"results"`
+	Error   any            `json:"error"`
+	ErrorV2 any            `json:"error_v2"`
 }
 
 type remoteStatementError struct {
@@ -191,7 +193,7 @@ func (r *remoteBackend) open(ctx context.Context, allowCreate bool) error {
 		return fmt.Errorf("rqlite schema probe: %w", err)
 	}
 	if len(objects) != 0 {
-		if err := requireCanonicalCoreSchema(ctx, objects); err != nil {
+		if err := requireSupportedSchema(ctx, objects); err != nil {
 			return err
 		}
 	}
@@ -209,7 +211,7 @@ func (r *remoteBackend) open(ctx context.Context, allowCreate bool) error {
 			return fmt.Errorf("rqlite schema recheck: %w", err)
 		}
 	}
-	if err := requireCanonicalCoreSchema(ctx, objects); err != nil {
+	if err := requireSupportedSchema(ctx, objects); err != nil {
 		if !allowCreate && len(objects) == 0 {
 			return fmt.Errorf("%s: %s", missingDBCode, r.base.String())
 		}
@@ -259,11 +261,49 @@ func requireCanonicalCoreSchema(ctx context.Context, objects []remoteSchemaObjec
 		if !exists {
 			return fmt.Errorf("database schema missing canonical object %s", key)
 		}
-		if object.SQL != expected.SQL {
+		if normalizeSchemaSQL(object.SQL) != normalizeSchemaSQL(expected.SQL) {
 			return fmt.Errorf("database schema differs from canonical object %s", key)
 		}
 	}
 	return nil
+}
+
+func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) error {
+	if err := requireCanonicalCoreSchema(ctx, objects); err != nil {
+		return err
+	}
+	core, err := canonicalCoreSchema(ctx)
+	if err != nil {
+		return fmt.Errorf("build canonical core schema: %w", err)
+	}
+	management, err := canonicalManagementSchema(ctx)
+	if err != nil {
+		return fmt.Errorf("build canonical management schema: %w", err)
+	}
+	for _, object := range objects {
+		key := objectKey(object.Type, object.Name)
+		if expected, exists := core[key]; exists {
+			if normalizeSchemaSQL(object.SQL) != normalizeSchemaSQL(expected.SQL) {
+				return fmt.Errorf("database schema differs from canonical object %s", key)
+			}
+			continue
+		}
+		expected, exists := management[key]
+		if !exists {
+			return fmt.Errorf("database schema contains unsupported object %s", key)
+		}
+		if normalizeSchemaSQL(object.SQL) != normalizeSchemaSQL(expected.SQL) {
+			return fmt.Errorf("database schema differs from canonical management object %s", key)
+		}
+	}
+	return nil
+}
+
+func normalizeSchemaSQL(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.TrimSuffix(value, ";")
+	value = strings.ReplaceAll(value, "if not exists", "")
+	return strings.Join(strings.Fields(value), " ")
 }
 
 func canonicalCoreSchema(ctx context.Context) (map[string]remoteSchemaObject, error) {
@@ -511,10 +551,15 @@ func (r *remoteBackend) request(ctx context.Context, statements []remoteStatemen
 	if err := decoder.Decode(&result); err != nil {
 		return remoteResponse{}, fmt.Errorf("decode rqlite response: %w", err)
 	}
+	if message := remoteResponseError(result); message != "" {
+		return result, errors.New(message)
+	}
+	if len(result.Results) > len(statements) {
+		return result, fmt.Errorf("rqlite response returned %d results for %d statements", len(result.Results), len(statements))
+	}
 	for index, item := range result.Results {
 		if message := remoteResultError(item); message != "" {
-			guarded := index < len(statements) && statements[index].epochGuard
-			return result, &remoteStatementError{Index: index, Message: message, EpochGuard: guarded}
+			return result, &remoteStatementError{Index: index, Message: message, EpochGuard: statements[index].epochGuard}
 		}
 	}
 	if len(result.Results) != len(statements) {
@@ -538,8 +583,11 @@ func (r *remoteBackend) query(ctx context.Context, statement string) (remoteResu
 	if err := decoder.Decode(&result); err != nil {
 		return remoteResult{}, fmt.Errorf("decode rqlite query: %w", err)
 	}
-	if len(result.Results) == 0 {
-		return remoteResult{}, nil
+	if message := remoteResponseError(result); message != "" {
+		return remoteResult{}, errors.New(message)
+	}
+	if len(result.Results) != 1 {
+		return remoteResult{}, fmt.Errorf("rqlite query returned %d results, want 1", len(result.Results))
 	}
 	if message := remoteResultError(result.Results[0]); message != "" {
 		return remoteResult{}, &remoteStatementError{Index: 0, Message: message}
@@ -562,6 +610,26 @@ func remoteResultError(result remoteResult) string {
 		return "rqlite error_v2: " + string(encoded)
 	}
 	return "rqlite error_v2"
+}
+
+func remoteResponseError(result remoteResponse) string {
+	if result.Error != nil {
+		if message, ok := result.Error.(string); ok {
+			if message == "" {
+				return ""
+			}
+			return message
+		}
+		encoded, err := json.Marshal(result.Error)
+		if err == nil && string(encoded) != "null" {
+			return "rqlite error: " + string(encoded)
+		}
+		return "rqlite error"
+	}
+	if result.ErrorV2 != nil {
+		return remoteResultError(remoteResult{ErrorV2: result.ErrorV2})
+	}
+	return ""
 }
 
 func (r *remoteBackend) do(ctx context.Context, method, path string, values url.Values, body io.Reader) (io.ReadCloser, error) {
@@ -621,7 +689,7 @@ func (r *remoteBackend) syncLocked(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := requireCanonicalCoreSchema(ctx, objects); err != nil {
+		if err := requireSupportedSchema(ctx, objects); err != nil {
 			return err
 		}
 		if err := r.rebuildMirror(ctx, objects); err != nil {
@@ -1194,9 +1262,6 @@ func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteS
 			return false, err
 		}
 	}
-	if len(statements) == 0 {
-		return true, nil
-	}
 	guardKey := "__agent_vm_epoch_guard_" + randomHex(12)
 	proofKey := guardKey + "_proof"
 	guardIndex := len(statements)
@@ -1469,7 +1534,7 @@ func migrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, ga
 		Epoch:   "initial",
 	}
 	if len(targetObjects) != 0 {
-		if err := requireCanonicalCoreSchema(ctx, targetObjects); err != nil {
+		if err := requireSupportedSchema(ctx, targetObjects); err != nil {
 			return fmt.Errorf("validate rqlite target schema: %w", err)
 		}
 		if _, err := target.remote.remoteEpoch(ctx); err != nil {
@@ -1563,34 +1628,7 @@ func requireSQLiteSchema(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	if err := requireCanonicalCoreSchema(ctx, objects); err != nil {
-		return err
-	}
-	management, err := canonicalManagementSchema(ctx)
-	if err != nil {
-		return fmt.Errorf("build canonical management schema: %w", err)
-	}
-	core, err := canonicalCoreSchema(ctx)
-	if err != nil {
-		return fmt.Errorf("build canonical core schema: %w", err)
-	}
-	for _, object := range objects {
-		key := objectKey(object.Type, object.Name)
-		if expected, exists := core[key]; exists {
-			if object.SQL != expected.SQL {
-				return fmt.Errorf("database schema differs from canonical object %s", key)
-			}
-			continue
-		}
-		expected, exists := management[key]
-		if !exists {
-			return fmt.Errorf("database schema contains unsupported object %s", key)
-		}
-		if object.SQL != expected.SQL {
-			return fmt.Errorf("database schema differs from canonical management object %s", key)
-		}
-	}
-	return nil
+	return requireSupportedSchema(ctx, objects)
 }
 
 func countMigrationBlockingOperations(ctx context.Context, db *sql.DB) (int, error) {
@@ -1599,23 +1637,78 @@ func countMigrationBlockingOperations(ctx context.Context, db *sql.DB) (int, err
 		return 0, err
 	}
 	defer conn.Close()
-	var pending, unknown int
-	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending'`).Scan(&pending); err != nil {
+	blocking := 0
+	rows, err := conn.QueryContext(ctx, "SELECT operation_id, response_json FROM operations")
+	if err != nil {
 		return 0, err
 	}
-	if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM operations WHERE json_extract(response_json, '$.outcome') = 'error' AND json_extract(response_json, '$.error.code') = 'operation_outcome_unknown'`).Scan(&unknown); err != nil {
+	for rows.Next() {
+		var operationID, raw string
+		if err := rows.Scan(&operationID, &raw); err != nil {
+			_ = rows.Close()
+			return 0, err
+		}
+		var response map[string]any
+		if err := json.Unmarshal([]byte(raw), &response); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("operation %s has invalid response JSON: %w", operationID, err)
+		}
+		outcome, ok := response["outcome"].(string)
+		if !ok || (outcome != "success" && outcome != "pending" && outcome != "error") {
+			_ = rows.Close()
+			return 0, fmt.Errorf("operation %s has unsupported outcome %q", operationID, outcome)
+		}
+		if outcome == "pending" {
+			blocking++
+			continue
+		}
+		if outcome == "error" {
+			errorValue, _ := response["error"].(map[string]any)
+			if code, _ := errorValue["code"].(string); code == "operation_outcome_unknown" {
+				blocking++
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, err
+	}
+	if err := rows.Close(); err != nil {
 		return 0, err
 	}
 	managementBlocking := 0
 	var managementTable string
 	if err := conn.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'management_operations'").Scan(&managementTable); err == nil {
-		if err := conn.QueryRowContext(ctx, `SELECT count(*) FROM management_operations WHERE status IN ('awaiting_upload', 'queued', 'running', 'reconciling', 'outcome_unknown')`).Scan(&managementBlocking); err != nil {
+		managementRows, err := conn.QueryContext(ctx, "SELECT operation_id, status FROM management_operations")
+		if err != nil {
+			return 0, err
+		}
+		for managementRows.Next() {
+			var operationID, status string
+			if err := managementRows.Scan(&operationID, &status); err != nil {
+				_ = managementRows.Close()
+				return 0, err
+			}
+			switch status {
+			case "awaiting_upload", "queued", "running", "reconciling", "outcome_unknown":
+				managementBlocking++
+			case "succeeded", "failed":
+			default:
+				_ = managementRows.Close()
+				return 0, fmt.Errorf("management operation %s has unsupported status %q", operationID, status)
+			}
+		}
+		if err := managementRows.Err(); err != nil {
+			_ = managementRows.Close()
+			return 0, err
+		}
+		if err := managementRows.Close(); err != nil {
 			return 0, err
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
-	return pending + unknown + managementBlocking, nil
+	return blocking + managementBlocking, nil
 }
 
 func pristineRemoteTarget(ctx context.Context, snapshot remoteSnapshot) (bool, error) {
@@ -1631,7 +1724,7 @@ func pristineRemoteTarget(ctx context.Context, snapshot remoteSnapshot) (bool, e
 	}
 	for key, expected := range canonical {
 		actual, exists := snapshot.Objects[key]
-		if !exists || actual.SQL != expected.SQL {
+		if !exists || normalizeSchemaSQL(actual.SQL) != normalizeSchemaSQL(expected.SQL) {
 			return false, nil
 		}
 	}

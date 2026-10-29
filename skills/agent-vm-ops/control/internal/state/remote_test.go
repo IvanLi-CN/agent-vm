@@ -27,6 +27,15 @@ type rqliteTestDescriptor struct {
 	CommandLine string `json:"command_line"`
 }
 
+type rqliteStatusIdentity struct {
+	HTTP struct {
+		BindAddr string `json:"bind_addr"`
+	} `json:"http"`
+	OS struct {
+		PID int `json:"pid"`
+	} `json:"os"`
+}
+
 func requireSessionOwnedRQLite(t *testing.T) string {
 	t.Helper()
 	descriptorPath := os.Getenv("AGENT_VM_RQLITE_DESCRIPTOR")
@@ -44,11 +53,15 @@ func requireSessionOwnedRQLite(t *testing.T) string {
 	if descriptor.SessionID == "" || descriptor.URL == "" || descriptor.PID <= 0 || descriptor.DataDir == "" {
 		t.Fatalf("rqlite descriptor is incomplete: %#v", descriptor)
 	}
-	if expected := os.Getenv("AGENT_VM_SESSION_ID"); expected != "" && expected != descriptor.SessionID {
-		t.Fatalf("rqlite session = %q, want current session %q", descriptor.SessionID, expected)
+	expectedSession := os.Getenv("AGENT_VM_SESSION_ID")
+	if expectedSession == "" {
+		t.Fatal("AGENT_VM_SESSION_ID is required when an rqlite descriptor is provided")
+	}
+	if expectedSession != descriptor.SessionID {
+		t.Fatalf("rqlite session = %q, want current session %q", descriptor.SessionID, expectedSession)
 	}
 	parsed, err := url.Parse(descriptor.URL)
-	if err != nil || parsed.Scheme != "http" || parsed.Hostname() == "" {
+	if err != nil || parsed.Scheme != "http" || parsed.Hostname() == "" || parsed.Port() == "" {
 		t.Fatalf("rqlite descriptor URL is invalid: %q", descriptor.URL)
 	}
 	switch parsed.Hostname() {
@@ -75,6 +88,22 @@ func requireSessionOwnedRQLite(t *testing.T) string {
 		if cwdErr != nil || (cwd != descriptor.DataDir && !strings.HasPrefix(cwd, filepath.Clean(descriptor.DataDir)+string(filepath.Separator))) {
 			t.Fatalf("rqlite process is not bound to descriptor data directory: command=%q cwd=%q data_dir=%q", commandLine, cwd, descriptor.DataDir)
 		}
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	response, err := client.Get(strings.TrimRight(descriptor.URL, "/") + "/status")
+	if err != nil {
+		t.Fatalf("read rqlite status identity: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("rqlite status identity HTTP status = %d", response.StatusCode)
+	}
+	var status rqliteStatusIdentity
+	if err := json.NewDecoder(response.Body).Decode(&status); err != nil {
+		t.Fatalf("decode rqlite status identity: %v", err)
+	}
+	if status.OS.PID != descriptor.PID || status.HTTP.BindAddr != parsed.Host {
+		t.Fatalf("rqlite status identity = pid %d bind %q, want pid %d bind %q", status.OS.PID, status.HTTP.BindAddr, descriptor.PID, parsed.Host)
 	}
 	return descriptor.URL
 }
@@ -361,6 +390,48 @@ func TestRemoteRequestRejectsErrorV2(t *testing.T) {
 	}
 }
 
+func TestRemoteQueryRejectsMalformedResultShape(t *testing.T) {
+	for _, testCase := range []struct {
+		name    string
+		results []remoteResult
+	}{
+		{name: "empty", results: nil},
+		{name: "multiple", results: []remoteResult{{}, {}}},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				writer.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(writer).Encode(remoteResponse{Results: testCase.results})
+			}))
+			defer server.Close()
+			parsed, err := url.Parse(server.URL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			backend := &remoteBackend{base: parsed, client: server.Client()}
+			if _, err := backend.query(context.Background(), "SELECT 1"); err == nil {
+				t.Fatal("malformed query response was accepted")
+			}
+		})
+	}
+}
+
+func TestRemoteQueryRejectsTopLevelError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Error: "query failed"})
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client()}
+	if _, err := backend.query(context.Background(), "SELECT 1"); err == nil || !strings.Contains(err.Error(), "query failed") {
+		t.Fatalf("top-level query error = %v", err)
+	}
+}
+
 func TestRemoteRequestClassifiesPartialEpochRollback(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
@@ -406,6 +477,27 @@ func TestRemoteRequestRejectsTruncatedSuccess(t *testing.T) {
 	var statementErr *remoteStatementError
 	if err == nil || errors.As(err, &statementErr) {
 		t.Fatalf("truncated success error = %#v", err)
+	}
+}
+
+func TestRemoteRequestRejectsExtraErrorResultAsUnknown(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{
+			{RowsAffected: 1},
+			{Error: "unexpected extra result"},
+		}})
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client()}
+	_, err = backend.request(context.Background(), []remoteStatement{{query: "INSERT INTO meta(key, value) VALUES(?, ?)"}}, true)
+	var statementErr *remoteStatementError
+	if err == nil || errors.As(err, &statementErr) {
+		t.Fatalf("extra result error = %#v", err)
 	}
 }
 
@@ -524,6 +616,48 @@ func TestMigrationTargetPreflightDoesNotWrite(t *testing.T) {
 	}
 }
 
+func TestMigrationAcceptsLegacyCoreSchemaFormatting(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.sqlite3")
+	db, err := openLegacyFixture(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := requireSQLiteSchema(context.Background(), db); err != nil {
+		t.Fatalf("legacy fixture schema rejected: %v", err)
+	}
+}
+
+func TestRemoteOpenRejectsMalformedManagementSchemaBeforeWrite(t *testing.T) {
+	canonical, err := canonicalCoreSchema(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := make([][]any, 0, len(canonical)+1)
+	for _, object := range canonical {
+		values = append(values, []any{object.Type, object.Name, object.SQL})
+	}
+	values = append(values, []any{"table", "state_capabilities", "CREATE TABLE state_capabilities(incompatible TEXT)"})
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			posts++
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{{
+			Columns: []string{"type", "name", "sql"},
+			Values:  values,
+		}}})
+	}))
+	defer server.Close()
+	if _, err := openRemote(server.URL, false); err == nil || !strings.Contains(err.Error(), "canonical management object") {
+		t.Fatalf("malformed management schema error = %v", err)
+	}
+	if posts != 0 {
+		t.Fatalf("malformed management schema issued %d remote writes", posts)
+	}
+}
+
 func TestMigrationRejectsUnsupportedSourceSchemaBeforeRemoteWrite(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "source.sqlite3")
 	source, err := OpenForTest(sourcePath)
@@ -612,6 +746,134 @@ func TestApplySnapshotRequiresEpochProof(t *testing.T) {
 	}
 	if applied, err := backend.applySnapshot(context.Background(), before, after, "initial", "initial"); err == nil || applied {
 		t.Fatalf("epoch proof failure = applied=%v err=%v", applied, err)
+	}
+}
+
+func TestApplySnapshotProvesEpochWhenOnlyEpochChanges(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var batch [][]any
+		if err := json.NewDecoder(request.Body).Decode(&batch); err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		foundEpochUpdate := false
+		results := make([]remoteResult, len(batch))
+		for index, statement := range batch {
+			if len(statement) > 0 {
+				if query, ok := statement[0].(string); ok && strings.HasPrefix(query, "UPDATE meta SET value") {
+					foundEpochUpdate = true
+				}
+			}
+			results[index].RowsAffected = 1
+		}
+		if !foundEpochUpdate {
+			t.Errorf("epoch-only snapshot omitted guarded epoch update: %#v", batch)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: results})
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client()}
+	before := remoteSnapshot{
+		Objects: map[string]remoteSchemaObject{},
+		Tables: map[string]remoteTableSnapshot{
+			"meta": {
+				Name:       "meta",
+				Columns:    []string{"key", "value"},
+				PrimaryKey: []int{0},
+				Rows:       map[string]remoteRow{"state_epoch": {Values: []any{"state_epoch", "initial"}}},
+			},
+		},
+		Epoch: "initial",
+	}
+	after := before
+	after.Tables = map[string]remoteTableSnapshot{
+		"meta": {
+			Name:       "meta",
+			Columns:    []string{"key", "value"},
+			PrimaryKey: []int{0},
+			Rows:       map[string]remoteRow{"state_epoch": {Values: []any{"state_epoch", "0123456789abcdef0123456789abcdef"}}},
+		},
+	}
+	after.Epoch = "0123456789abcdef0123456789abcdef"
+	applied, err := backend.applySnapshot(context.Background(), before, after, before.Epoch, after.Epoch)
+	if err != nil || !applied {
+		t.Fatalf("epoch-only snapshot applied=%v err=%v", applied, err)
+	}
+}
+
+func TestMigrationRejectsUnknownOperationStateBeforeRemoteWrite(t *testing.T) {
+	testCases := []struct {
+		name string
+		seed func(context.Context, *Store) error
+	}{
+		{
+			name: "operation outcome",
+			seed: func(ctx context.Context, store *Store) error {
+				_, err := store.ClaimOperation(ctx, "unknown-outcome", "acquire", nil, nil, map[string]any{"outcome": "mystery"})
+				return err
+			},
+		},
+		{
+			name: "management status",
+			seed: func(ctx context.Context, store *Store) error {
+				if err := store.EnsureManagementSchema(ctx); err != nil {
+					return err
+				}
+				_, err := store.ClaimManagementOperation(ctx, ManagementOperation{
+					OperationID: "unknown-status",
+					Action:      "test",
+					TargetKind:  "test",
+					TargetID:    "test",
+					Actor:       "test",
+					Reason:      "test",
+					Phase:       "test",
+					Status:      "mystery",
+					Request:     map[string]any{},
+				})
+				return err
+			},
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "source.sqlite3")
+			store, err := OpenForTest(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := testCase.seed(context.Background(), store); err != nil {
+				store.Close()
+				t.Fatal(err)
+			}
+			if err := store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var posts int
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+				if request.Method == http.MethodPost {
+					posts++
+				}
+				writer.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{}})
+			}))
+			defer server.Close()
+			err = migrateSQLiteToRQLite(context.Background(), path, server.URL, SQLiteMigrationGate{
+				StateWriteFenced:    true,
+				WorkersQuiescent:    true,
+				SQLiteWritersClosed: true,
+			})
+			if err == nil || !strings.Contains(err.Error(), "unsupported") {
+				t.Fatalf("unknown state error = %v", err)
+			}
+			if posts != 0 {
+				t.Fatalf("unknown state issued %d remote writes", posts)
+			}
+		})
 	}
 }
 
