@@ -129,3 +129,38 @@ test("product release CLI rejects HTTPS before creating an archive", () => {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
 });
+
+test("product release CLI preserves target-specific default transports", { timeout: 120_000 }, () => {
+  const repositoryRoot = new URL("../", import.meta.url).pathname;
+  const revisionResult = Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+  expect(revisionResult.exitCode).toBe(0);
+  const revision = new TextDecoder().decode(revisionResult.stdout).trim();
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-product-release-defaults-test-"));
+  try {
+    for (const [target, expectedTransport] of [["client", "legacy-bun"], ["linux/amd64", "go-request"]] as const) {
+      const output = join(temporaryRoot, `${target.replace("/", "-")}.tar`);
+      const result = Bun.spawnSync(
+        [
+          process.execPath,
+          "scripts/build_product_release.ts",
+          "--version",
+          "1.0.0",
+          "--source-revision",
+          revision,
+          "--target",
+          target,
+          "--output",
+          output,
+        ],
+        { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" },
+      );
+      expect(result.exitCode).toBe(0);
+      const manifestResult = Bun.spawnSync(["tar", "-xOf", output, "release-manifest.json"], { stdout: "pipe", stderr: "pipe" });
+      expect(manifestResult.exitCode).toBe(0);
+      const manifest = JSON.parse(new TextDecoder().decode(manifestResult.stdout));
+      expect(manifest.client_view.transport).toBe(expectedTransport);
+    }
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
