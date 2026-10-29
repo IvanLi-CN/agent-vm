@@ -9,6 +9,8 @@ session-owned Agent VM. It uses the non-queued
 `POST /db/execute?transaction` API and `GET /db/query?level=strong` for
 verification. The SQL model is deliberately small: an operation journal, one
 conditional slot row, and a trigger-backed database-visible effect row.
+The runner chooses free loopback ports when none are supplied and verifies the
+rqlite status PID, node ID, and bound HTTP address before it writes any schema.
 
 Run it from the repository root in an acquired Agent VM session:
 

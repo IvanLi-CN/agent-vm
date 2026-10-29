@@ -32,6 +32,6 @@ else
 fi
 
 [[ -x "${RQLITED_BIN}" ]]
-exec bun "${SCRIPT_DIR}/run-rqlite-proof.ts" \
+bun "${SCRIPT_DIR}/run-rqlite-proof.ts" \
   --rqlited "${RQLITED_BIN}" \
   --proof-dir "${PROOF_DIR}"

@@ -42,7 +42,15 @@ type RqliteProcess = {
 
 type DropProxy = {
   port: number;
+  outcome: Promise<ProxyOutcome>;
   close: () => Promise<void>;
+};
+
+type ProxyOutcome = {
+  complete: boolean;
+  reason: string;
+  status_code: number | null;
+  response_bytes: number;
 };
 
 function sleep(milliseconds: number): Promise<void> {
@@ -69,7 +77,7 @@ function parseArgs(argv: string[]): Options {
     const value = values.get(name);
     if (value === undefined) return fallback;
     const parsed = Number(value);
-    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 65535) {
+    if (!Number.isInteger(parsed) || parsed < 0 || parsed > 65535) {
       throw new ProofFailure(`invalid integer argument: ${name}`);
     }
     return parsed;
@@ -132,9 +140,12 @@ function rqliteResultErrors(body: JsonObject): string[] {
   });
 }
 
-async function waitForReady(baseUrl: string): Promise<JsonObject> {
+async function waitForReady(baseUrl: string, server: RqliteProcess): Promise<JsonObject> {
   let lastStatus: JsonObject = {};
   for (let attempt = 0; attempt < 300; attempt += 1) {
+    if (server.process.exitCode !== null) {
+      throw new ProofFailure("rqlite exited before becoming ready", { exit_code: server.process.exitCode, log: server.log.join("").slice(-2000) });
+    }
     try {
       const response = await jsonRequest(`${baseUrl}/status`);
       lastStatus = response.body;
@@ -146,6 +157,18 @@ async function waitForReady(baseUrl: string): Promise<JsonObject> {
     await sleep(100);
   }
   throw new ProofFailure("rqlite did not become ready", { lastStatus });
+}
+
+async function allocateFreePort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, DEFAULT_HOST, () => resolve());
+  });
+  const address = server.address() as AddressInfo;
+  const port = address.port;
+  await new Promise<void>(resolve => server.close(() => resolve()));
+  return port;
 }
 
 function startRqlite(options: Options): RqliteProcess {
@@ -276,6 +299,14 @@ function responseComplete(bytes: Buffer): boolean {
 }
 
 async function startDropProxy(upstreamPort: number): Promise<DropProxy> {
+  let resolveOutcome: (outcome: ProxyOutcome) => void = () => undefined;
+  let outcomeSettled = false;
+  const outcome = new Promise<ProxyOutcome>(resolve => { resolveOutcome = resolve; });
+  const settleOutcome = (value: ProxyOutcome): void => {
+    if (outcomeSettled) return;
+    outcomeSettled = true;
+    resolveOutcome(value);
+  };
   const server: Server = createServer((client: Socket) => {
     let requestBytes = Buffer.alloc(0);
     let forwarded = false;
@@ -288,19 +319,20 @@ async function startDropProxy(upstreamPort: number): Promise<DropProxy> {
       const upstream = createConnection({ host: DEFAULT_HOST, port: upstreamPort }, () => upstream.write(requestBytes));
       let responseBytes = Buffer.alloc(0);
       let closed = false;
-      const closeBoth = (): void => {
+      const closeBoth = (complete: boolean, reason: string): void => {
         if (closed) return;
         closed = true;
+        settleOutcome({ complete, reason, status_code: responseStatus(responseBytes), response_bytes: responseBytes.length });
         upstream.destroy();
         client.destroy();
       };
       upstream.on("data", (responseChunk: Buffer) => {
         responseBytes = Buffer.concat([responseBytes, responseChunk]);
-        if (responseComplete(responseBytes)) closeBoth();
+        if (responseComplete(responseBytes)) closeBoth(true, "upstream_response_complete");
       });
-      upstream.on("end", closeBoth);
-      upstream.on("error", closeBoth);
-      setTimeout(closeBoth, 10_000).unref();
+      upstream.on("end", () => closeBoth(false, "upstream_ended_before_complete"));
+      upstream.on("error", error => closeBoth(false, `upstream_error:${error.message}`));
+      setTimeout(() => closeBoth(false, "upstream_response_timeout"), 10_000).unref();
     });
   });
   await new Promise<void>((resolve, reject) => {
@@ -310,8 +342,20 @@ async function startDropProxy(upstreamPort: number): Promise<DropProxy> {
   const address = server.address() as AddressInfo;
   return {
     port: address.port,
-    close: () => new Promise(resolve => server.close(() => resolve())),
+    outcome,
+    close: () => new Promise(resolve => {
+      settleOutcome({ complete: false, reason: "proxy_closed_before_upstream_response", status_code: null, response_bytes: 0 });
+      server.close(() => resolve());
+    }),
   };
+}
+
+function responseStatus(bytes: Buffer): number | null {
+  const headers = headersComplete(bytes);
+  if (!headers) return null;
+  const statusLine = bytes.subarray(0, headers.headerEnd).toString("latin1").split("\r\n", 1)[0] ?? "";
+  const match = statusLine.match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})\b/);
+  return match ? Number(match[1]) : null;
 }
 
 async function postAndLoseResponse(port: number, statements: string[]): Promise<string> {
@@ -319,6 +363,7 @@ async function postAndLoseResponse(port: number, statements: string[]): Promise<
   return new Promise((resolve, reject) => {
     let settled = false;
     let gotResponse = false;
+    let timeout: ReturnType<typeof setTimeout>;
     const finish = (error?: Error): void => {
       if (settled) return;
       settled = true;
@@ -333,6 +378,7 @@ async function postAndLoseResponse(port: number, statements: string[]): Promise<
       method: "POST",
       headers: { "content-type": "application/json", "content-length": body.length, connection: "close" },
     });
+    timeout = setTimeout(() => finish(new Error("timed out waiting for the response-drop proxy")), 15_000);
     request.on("response", response => {
       gotResponse = true;
       response.resume();
@@ -347,17 +393,27 @@ async function postAndLoseResponse(port: number, statements: string[]): Promise<
     });
     request.write(body);
     request.end();
-    const timeout = setTimeout(() => finish(new Error("timed out waiting for the response-drop proxy")), 15_000);
   });
 }
 
 async function run(options: Options): Promise<JsonObject> {
-  const baseUrl = `http://${options.host}:${options.httpPort}`;
-  const server = startRqlite(options);
+  const httpPort = options.httpPort || await allocateFreePort();
+  let raftPort = options.raftPort || await allocateFreePort();
+  while (raftPort === httpPort) raftPort = await allocateFreePort();
+  const runtimeOptions = { ...options, httpPort, raftPort };
+  const baseUrl = `http://${runtimeOptions.host}:${runtimeOptions.httpPort}`;
+  const server = startRqlite(runtimeOptions);
   try {
-    const status = await waitForReady(baseUrl);
+    const status = await waitForReady(baseUrl, server);
     const build = asObject(status.build, "status.build");
     assertCondition(build.version === TARGET_VERSION, "rqlite version mismatch", { expected: TARGET_VERSION, observed: build.version });
+    const http = asObject(status.http, "status.http");
+    const cluster = asObject(status.cluster, "status.cluster");
+    const store = asObject(status.store, "status.store");
+    const os = asObject(status.os, "status.os");
+    assertCondition(http.bind_addr === `${runtimeOptions.host}:${runtimeOptions.httpPort}` && cluster.api_addr === `${runtimeOptions.host}:${runtimeOptions.httpPort}`, "rqlite HTTP identity does not match the selected loopback port", { http_bind_addr: http.bind_addr, cluster_api_addr: cluster.api_addr, expected: `${runtimeOptions.host}:${runtimeOptions.httpPort}` });
+    assertCondition(store.node_id === "blue-green-proof-1", "rqlite node identity does not match the child process", { node_id: store.node_id });
+    assertCondition(Number(os.pid) === server.process.pid, "rqlite status PID does not match the child process", { status_pid: os.pid, child_pid: server.process.pid });
     await initializeSchema(baseUrl);
 
     const concurrentA = "concurrent-a";
@@ -398,10 +454,13 @@ async function run(options: Options): Promise<JsonObject> {
 
     const lostOperation = "lost-response";
     const lostDigest = requestDigestFor(lostOperation, "lost", "lost");
-    const proxy = await startDropProxy(options.httpPort);
+    const proxy = await startDropProxy(runtimeOptions.httpPort);
     let transportObservation = "";
+    let proxyObservation: ProxyOutcome;
     try {
       transportObservation = await postAndLoseResponse(proxy.port, conditionalWriteStatements(lostOperation, lostDigest, "lost", "lost"));
+      proxyObservation = await proxy.outcome;
+      assertCondition(proxyObservation.complete, "response-drop proxy did not observe a complete upstream response before closing the client", { proxyObservation });
     } finally {
       await proxy.close();
     }
@@ -461,6 +520,7 @@ async function run(options: Options): Promise<JsonObject> {
         },
         lost_response_recovery: {
           transport: transportObservation,
+          proxy: proxyObservation,
           after_disconnect: { operation: lostAfterDisconnect, slot: lostSlotAfterDisconnect, durable_effect_rows: lostEffectsAfterDisconnect },
           after_same_operation_retry: { operation: lostAfterRetry, slot: lostSlotAfterRetry, durable_effect_rows: lostEffectsAfterRetry },
           result: "observed_recovery_without_duplicate_durable_effect",
