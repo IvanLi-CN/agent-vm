@@ -38,7 +38,7 @@ Demo Inspector 的结构、布局、位置控制、浮动拖动热区、键盘�
 - 使用页面级浏览器验证覆盖隔离及启动失败、五个页面、模拟写入与记录、异常和空状态、权限拒绝、URL 分享与深链刷新、浏览器导航、面板响应式布局及键盘操作。验证不得依赖真实服务或资源。
 - Storybook 继续承担组件和交互检查，新增 accessibility 检查并覆盖控制面板关键组件；自动检查不能替代键盘与页面级检查。
 - React Doctor 采用锁定版本与版本化配置，本地针对 staged React 文件、CI 针对 changed React 文件；诊断 error 阻断，warning 可见。范围无法计算时失败，确认空集合时跳过。
-- 核对现有组件与已选 shadcn/ui 基线，新增面板优先遵循该基线；现有组件按实际需要渐进收敛，不因库名要求无条件重写。
+- `web/` 已建立可审计的 shadcn/ui 基线：`components.json`、`@/components/ui`/`@/lib/utils` aliases、Tailwind v4、CVA、`clsx`/`tailwind-merge`、Radix primitives 和 Lucide icons。Demo Inspector 的 Button、Select、ContextMenu/DropdownMenu、Tooltip 直接使用 checked-in open-code primitives；其余旧页面通过兼容导出渐进迁移，不因库名要求一次性重写全部旧组件。
 - 优先将 Demo 构建、浏览器测试和 React Doctor 纳入现有稳定 PR gate，按平台能力分配检查；检查失败必须传递到对应 gate。若改变 required check 集合，更新 `.github/quality-gates.json`，并在获适当授权后核验 GitHub 分支保护与声明一致。当前平台状态未经本次核验。
 - 正式管理台的真实产品版本、认证、API、资源打包、安装和回滚另按既有产品合同验收，不以 Demo 成功替代。
 

@@ -6,9 +6,9 @@ import { actionLabel, formatDateTime } from "../app/format";
 import { listAudit, listOperations } from "../app/api";
 import type { Locale, Operation } from "../app/types";
 import { PageIntro, QueryError } from "../components/PagePrimitives";
-import { SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/Select";
+import { SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { Button, Panel, PanelHeader, StatusBadge } from "../components/ui";
-import { Select } from "../components/Select";
+import { Select } from "../components/ui/select";
 
 const phaseProgress: Record<string, number> = { queued: 12, awaiting_upload: 22, upload: 38, integrity_check: 54, image_import: 68, suitability_check: 80, reference_check: 82, native_action: 88, reconciliation: 94, cleanup: 97, completed: 100 };
 

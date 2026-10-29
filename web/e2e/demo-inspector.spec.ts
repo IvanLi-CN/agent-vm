@@ -35,6 +35,7 @@ test("supports left, right, floating and minimized inspector positions", async (
   const inspector = page.locator(".demo-inspector");
   const dragHandle = page.getByRole("button", { name: "Drag inspector" });
   await expect(dragHandle).toBeVisible();
+  await expect(dragHandle.getByText("Drag")).toBeVisible();
   await expect(dragHandle).toHaveAttribute("aria-keyshortcuts", "ArrowLeft ArrowRight ArrowUp ArrowDown");
   const beforeDrag = await inspector.boundingBox();
   const dragBox = await dragHandle.boundingBox();

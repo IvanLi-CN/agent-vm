@@ -17,7 +17,11 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 5. 结果摘要：操作权限和模拟连接状态使用带文字的状态徽章，未知、故障和拒绝不得只用颜色表示。
 6. 分享与恢复：复制安全分享链接、重置场景，以及链接只包含场景、权限、网络和数据设置的说明。
 
-控件沿用仓库现有的 open-code shadcn/ui 基线：`IconButton`、`Button`、Radix-backed `Select`、Lucide icon 和现有 CSS tokens。新增控件必须复用这些 primitives、颜色 token、focus-visible 样式和 4/8px 间距节奏，不引入一套独立的视觉语言。
+控件必须沿用 `web/components.json` 声明的 open-code shadcn/ui 基线。源码位于 `web/src/components/ui`，别名固定为 `@/components/ui`、`@/lib/utils`；组件层使用 Radix primitives、Tailwind utilities、CVA、`clsx`/`tailwind-merge` 的 `cn` helper 和 Lucide icons。Inspector 直接使用 shadcn `Button`、Radix-backed `Select`、`ContextMenu`/`DropdownMenu` 和 Tooltip primitives，业务样式只通过现有 paper-line CSS tokens 做组合，不再新增原生裸按钮来替代组件层。
+
+布局控制按钮的交互必须明确分层：普通单击只执行宽屏默认布局切换（宽屏优先右栏，窄屏优先悬浮），不得打开菜单；鼠标右键、键盘 `Shift+F10`/ContextMenu 键以及触摸长按才打开 shadcn 菜单，菜单提供左栏、右栏、悬浮、最小化四个互斥选项。悬浮模式的 `GripVertical` shadcn icon button 是独立拖动手柄，热区至少 44px（粗指针），支持 pointer capture、边界约束和方向键移动；布局按钮与拖动手柄不能共用职责。
+
+所有控制项必须具备可读名称、可见 focus-visible 状态和不依赖颜色的选中/错误语义；Inspector 内部不手写菜单定位、outside-click 或 menuitem ARIA 状态，交由 Radix primitives 管理焦点、portal、Esc 关闭和菜单键盘导航。组件层变更需同步 Storybook 状态与页面级浏览器验证。
 
 ## 布局模式
 

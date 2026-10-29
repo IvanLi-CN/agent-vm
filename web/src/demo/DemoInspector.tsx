@@ -2,8 +2,12 @@ import { Check, Clipboard, GripVertical, Minimize2, Move, PanelLeft, PanelRight,
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { demoShareUrl, getDemoInspectorPosition, saveDemoInspectorPosition, setDemoControl, useDemoRuntime, type DemoDataMode, type DemoInspectorLayout, type DemoInspectorPosition, type DemoPersona, type DemoRuntimeState, type DemoScene } from "./runtime";
-import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/Select";
-import { Button, IconButton, StatusBadge } from "../components/ui";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
+import { Button, StatusBadge } from "../components/ui";
+import { Button as ShadcnButton } from "../components/ui/button";
+import { ContextMenu, ContextMenuContent, ContextMenuRadioGroup, ContextMenuRadioItem, ContextMenuTrigger } from "../components/ui/context-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger } from "../components/ui/dropdown-menu";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../components/ui/tooltip";
 
 type ExpandedLayout = Exclude<DemoInspectorLayout, "minimized">;
 
@@ -31,12 +35,11 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
   const { t } = useTranslation();
   const runtime = useDemoRuntime();
   const [localLayout, setLocalLayout] = useState<DemoInspectorLayout>(controlledLayout ?? "floating");
-  const [menuOpen, setMenuOpen] = useState(false);
+  const [longPressMenuOpen, setLongPressMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
   const [floatingPosition, setFloatingPosition] = useState<DemoInspectorPosition | null>(() => getDemoInspectorPosition());
   const [dragging, setDragging] = useState(false);
-  const menuRef = useRef<HTMLDivElement>(null);
   const inspectorRef = useRef<HTMLElement>(null);
   const lastExpandedLayout = useRef<ExpandedLayout>(controlledLayout && controlledLayout !== "minimized" ? controlledLayout : "floating");
   const longPressTimer = useRef<number | null>(null);
@@ -53,22 +56,6 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
   useEffect(() => {
     if (controlledLayout && controlledLayout !== "minimized") lastExpandedLayout.current = controlledLayout;
   }, [controlledLayout]);
-
-  useEffect(() => {
-    if (!menuOpen) return;
-    const closeOnOutsidePointer = (event: globalThis.PointerEvent) => {
-      if (menuRef.current && !menuRef.current.contains(event.target as Node)) setMenuOpen(false);
-    };
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setMenuOpen(false);
-    };
-    document.addEventListener("pointerdown", closeOnOutsidePointer);
-    document.addEventListener("keydown", closeOnEscape);
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsidePointer);
-      document.removeEventListener("keydown", closeOnEscape);
-    };
-  }, [menuOpen]);
 
   useEffect(() => {
     if (layout !== "floating") return;
@@ -96,7 +83,7 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
     if (next !== "minimized") lastExpandedLayout.current = next;
     if (!controlledLayout) setLocalLayout(next);
     onLayoutChange?.(next);
-    setMenuOpen(false);
+    setLongPressMenuOpen(false);
   };
 
   const restoreLayout = () => changeLayout(lastExpandedLayout.current);
@@ -104,10 +91,23 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
   const handleLayoutPointerDown = (event: PointerEvent<HTMLButtonElement>) => {
     clearLongPress();
     if (event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.focus();
     longPressTimer.current = window.setTimeout(() => {
       suppressClick.current = true;
-      setMenuOpen(true);
+      setLongPressMenuOpen(true);
     }, 550);
+  };
+
+  const handleLayoutKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    if (event.key === "ContextMenu" || (event.key === "F10" && event.shiftKey)) {
+      event.preventDefault();
+      setLongPressMenuOpen(true);
+      return;
+    }
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    handleLayoutDefaultClick();
   };
 
   const handleLayoutDefaultClick = () => {
@@ -117,18 +117,6 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
     }
     const wide = window.matchMedia?.("(min-width: 1280px)")?.matches ?? false;
     changeLayout(wide ? "right" : "floating");
-  };
-
-  const handleLayoutKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>) => {
-    if (event.key !== "ContextMenu" && !(event.key === "F10" && event.shiftKey)) return;
-    event.preventDefault();
-    setMenuOpen(true);
-  };
-
-  const handleLayoutContextMenu = (event: React.MouseEvent<HTMLButtonElement>) => {
-    event.preventDefault();
-    clearLongPress();
-    setMenuOpen(true);
   };
 
   const handleDragStart = (event: PointerEvent<HTMLElement>) => {
@@ -206,20 +194,42 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
     { value: "minimized", label: t("demo.layoutMinimized"), icon: Minimize2 },
   ];
 
-  return <div className={`demo-inspector-shell demo-inspector-shell--${layout} ${isMinimized ? "is-closed" : "is-open"}`}>
-    <button type="button" className={`demo-bubble ${isMinimized ? "" : "is-open"}`} aria-label={t("demo.openInspector")} onClick={restoreLayout}><PanelRight aria-hidden="true" /></button>
+  return <TooltipProvider delayDuration={350}><div className={`demo-inspector-shell demo-inspector-shell--${layout} ${isMinimized ? "is-closed" : "is-open"}`}>
+    <ShadcnButton type="button" variant="outline" size="icon-lg" className={`demo-bubble ${isMinimized ? "" : "is-open"}`} aria-label={t("demo.openInspector")} onClick={restoreLayout}><PanelRight aria-hidden="true" /></ShadcnButton>
     {!isMinimized ? <aside ref={inspectorRef} className={`demo-inspector ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.inspector")} style={layout === "floating" && floatingPosition ? { left: `${floatingPosition.left}px`, top: `${floatingPosition.top}px`, right: "auto", bottom: "auto" } : undefined}>
-      <div className="demo-inspector-header"><div className="demo-inspector-heading"><span className="eyebrow-label">{t("demo.eyebrow")}</span><h2>{t("demo.inspector")}</h2></div><div className="demo-inspector-header-actions">{layout === "floating" ? <button type="button" className={`demo-inspector-drag-handle ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.dragInspector")} aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown" onPointerDown={handleDragStart} onPointerMove={handleDragMove} onPointerUp={finishDrag} onPointerCancel={finishDrag} onKeyDown={handleDragKeyDown}><GripVertical aria-hidden="true" /><span>{t("demo.dragHint")}</span></button> : null}<div className="demo-layout-menu" ref={menuRef}><IconButton label={t("demo.layoutButton")} aria-haspopup="menu" aria-expanded={menuOpen} onClick={handleLayoutDefaultClick} onKeyDown={handleLayoutKeyDown} onContextMenu={handleLayoutContextMenu} onPointerDown={handleLayoutPointerDown} onPointerUp={clearLongPress} onPointerCancel={clearLongPress}><LayoutIcon layout={layout} /></IconButton>{menuOpen ? <div className="demo-layout-menu-popover" role="menu" aria-label={t("demo.layoutMenu")}>{layoutOptions.map(({ value, label, icon: Icon }) => <button type="button" role="menuitemradio" aria-checked={layout === value} className={layout === value ? "selected" : ""} key={value} onClick={() => changeLayout(value)}><Icon aria-hidden="true" /><span>{label}</span>{layout === value ? <Check aria-hidden="true" /> : null}</button>)}</div> : null}</div></div></div>
+      <div className="demo-inspector-header">
+        <div className="demo-inspector-heading"><span className="eyebrow-label">{t("demo.eyebrow")}</span><h2>{t("demo.inspector")}</h2></div>
+        <div className="demo-inspector-header-actions">
+          {layout === "floating" ? <Tooltip><TooltipTrigger asChild><ShadcnButton type="button" variant="outline" size="default" className={`demo-inspector-drag-handle ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.dragInspector")} aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown" onPointerDown={handleDragStart} onPointerMove={handleDragMove} onPointerUp={finishDrag} onPointerCancel={finishDrag} onKeyDown={handleDragKeyDown}><GripVertical aria-hidden="true" /><span>{t("demo.dragHint")}</span></ShadcnButton></TooltipTrigger><TooltipContent side="bottom">{t("demo.dragHint")}</TooltipContent></Tooltip> : null}
+          <div className="demo-layout-menu">
+            <ContextMenu>
+              <DropdownMenu open={longPressMenuOpen} onOpenChange={setLongPressMenuOpen}>
+                <ContextMenuTrigger asChild>
+                  <DropdownMenuTrigger asChild>
+                    <ShadcnButton type="button" variant="ghost" size="icon-lg" className="demo-layout-button" aria-label={t("demo.layoutButton")} aria-haspopup="menu" aria-expanded={longPressMenuOpen} aria-keyshortcuts="Shift+F10" onClick={handleLayoutDefaultClick} onPointerDown={handleLayoutPointerDown} onPointerUp={clearLongPress} onPointerCancel={clearLongPress} onKeyDown={handleLayoutKeyDown}><LayoutIcon layout={layout} /></ShadcnButton>
+                  </DropdownMenuTrigger>
+                </ContextMenuTrigger>
+                <DropdownMenuContent align="end" sideOffset={6} aria-label={t("demo.layoutMenu")}>
+                  <DropdownMenuRadioGroup value={layout} onValueChange={(value) => changeLayout(value as DemoInspectorLayout)}>{layoutOptions.map(({ value, label, icon: Icon }) => <DropdownMenuRadioItem value={value} key={value}><Icon aria-hidden="true" /><span>{label}</span></DropdownMenuRadioItem>)}</DropdownMenuRadioGroup>
+                </DropdownMenuContent>
+              </DropdownMenu>
+              <ContextMenuContent aria-label={t("demo.layoutMenu")}>
+                <ContextMenuRadioGroup value={layout} onValueChange={(value) => changeLayout(value as DemoInspectorLayout)}>{layoutOptions.map(({ value, label, icon: Icon }) => <ContextMenuRadioItem value={value} key={value}><Icon aria-hidden="true" /><span>{label}</span></ContextMenuRadioItem>)}</ContextMenuRadioGroup>
+              </ContextMenuContent>
+            </ContextMenu>
+          </div>
+        </div>
+      </div>
       <div className="demo-safe-banner"><span className="demo-safe-dot" aria-hidden="true" /><div><strong>{t("demo.safeTitle")}</strong><span>{t("demo.safeText")}</span></div></div>
       <label className="demo-field"><span>{t("demo.scene")}</span><Select value={runtime.scene} onValueChange={(value) => set("scene", value as DemoScene)}><SelectTrigger aria-label={t("demo.scene")}><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="normal">{t("demo.scenes.normal")}</SelectItem><SelectItem value="capacity">{t("demo.scenes.capacity")}</SelectItem><SelectItem value="conflict">{t("demo.scenes.conflict")}</SelectItem><SelectItem value="empty">{t("demo.scenes.empty")}</SelectItem></SelectGroup></SelectContent></Select></label>
       <label className="demo-field"><span>{t("demo.persona")}</span><Select value={runtime.persona} onValueChange={(value) => set("persona", value as DemoPersona)}><SelectTrigger aria-label={t("demo.persona")}><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="admin">{t("demo.personas.admin")}</SelectItem><SelectItem value="viewer">{t("demo.personas.viewer")}</SelectItem></SelectGroup></SelectContent></Select></label>
       <label className="demo-field"><span>{t("demo.data")}</span><Select value={runtime.dataMode} onValueChange={(value) => set("dataMode", value as DemoDataMode)}><SelectTrigger aria-label={t("demo.data")}><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="full">{t("demo.dataModes.full")}</SelectItem><SelectItem value="minimal">{t("demo.dataModes.minimal")}</SelectItem></SelectGroup></SelectContent></Select></label>
-      <div className="demo-field"><span>{t("demo.network")}</span><div className="demo-network-toggle" role="group" aria-label={t("demo.network")}><button type="button" className={runtime.network === "online" ? "selected" : ""} onClick={() => set("network", "online")}><Wifi aria-hidden="true" />{t("demo.networkOnline")}</button><button type="button" className={runtime.network === "offline" ? "selected" : ""} onClick={() => set("network", "offline")}><WifiOff aria-hidden="true" />{t("demo.networkOffline")}</button></div></div>
+      <div className="demo-field"><span>{t("demo.network")}</span><div className="demo-network-toggle" role="group" aria-label={t("demo.network")}><ShadcnButton type="button" variant={runtime.network === "online" ? "outline" : "secondary"} size="sm" className={runtime.network === "online" ? "network-toggle-button selected" : "network-toggle-button"} aria-pressed={runtime.network === "online"} onClick={() => set("network", "online")}><Wifi aria-hidden="true" />{t("demo.networkOnline")}</ShadcnButton><ShadcnButton type="button" variant={runtime.network === "offline" ? "outline" : "secondary"} size="sm" className={runtime.network === "offline" ? "network-toggle-button selected" : "network-toggle-button"} aria-pressed={runtime.network === "offline"} onClick={() => set("network", "offline")}><WifiOff aria-hidden="true" />{t("demo.networkOffline")}</ShadcnButton></div></div>
       <div className="demo-state-row"><span>{t("demo.access")}</span><StatusBadge state={runtime.persona === "admin" ? "ready" : "unavailable"} /></div>
       <div className="demo-state-row"><span>{t("demo.status")}</span><StatusBadge state={runtime.network === "online" ? "available" : "failed"} /></div>
       <div className="demo-actions"><Button variant="primary" icon={copied ? <Check /> : <Clipboard />} onClick={() => void copyLink()}>{copied ? t("demo.copied") : copyFailed ? t("demo.copyFailed") : t("demo.copyShare")}</Button><Button variant="ghost" icon={<RotateCcw />} onClick={() => setDemoControl({ scene: runtime.scene, persona: runtime.persona, network: runtime.network, dataMode: runtime.dataMode })}>{t("demo.reset")}</Button></div>
       {copyFailed ? <p className="demo-copy-error" role="status">{t("demo.copyFailedText")}</p> : null}
       <p className="demo-footnote">{t("demo.urlHint")}</p>
     </aside> : null}
-  </div>;
+  </div></TooltipProvider>;
 }

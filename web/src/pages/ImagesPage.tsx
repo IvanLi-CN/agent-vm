@@ -6,7 +6,7 @@ import { actionLabel, formatDateTime, shortFingerprint } from "../app/format";
 import { ManagementRequestError, createOperationId, listImages, previewImageAction, startImageImport, submitImageAction, uploadImageImportContent } from "../app/api";
 import type { ActionPreview, ImageImportRequest, Locale, ManagedImage } from "../app/types";
 import { ActionDialog } from "../components/ActionDialog";
-import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/Select";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { CopyButton, EmptyState, Input, Panel, PanelHeader, StatusBadge, Button } from "../components/ui";
 import { DefinitionList, PageIntro, QueryError } from "../components/PagePrimitives";
 

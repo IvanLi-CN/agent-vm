@@ -3,15 +3,17 @@ import { Check, Copy, LoaderCircle } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { stateLabel, stateTone } from "../app/format";
+import { Button as ShadcnButton, type ButtonProps as ShadcnButtonProps } from "./ui/button";
 
 type Tone = "neutral" | "success" | "warning" | "danger";
 
-export function Button({ variant = "secondary", tone = "neutral", icon, children, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "secondary" | "ghost" | "danger"; tone?: Tone; icon?: ReactNode }) {
-  return <button className={`ui-button ui-button-${variant} ui-button-${tone}`} {...props}>{icon ? <span className="button-icon" aria-hidden="true">{icon}</span> : null}<span>{children}</span></button>;
+export function Button({ variant = "secondary", tone = "neutral", icon, children, className, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "primary" | "secondary" | "ghost" | "danger"; tone?: Tone; icon?: ReactNode; className?: string }) {
+  const mappedVariant: ShadcnButtonProps["variant"] = variant === "primary" ? "default" : variant === "danger" ? "destructive" : variant === "secondary" ? "outline" : "ghost";
+  return <ShadcnButton variant={mappedVariant} className={`ui-button ui-button-${variant} ui-button-${tone} ${className ?? ""}`} {...props}>{icon ? <span className="button-icon" aria-hidden="true">{icon}</span> : null}<span>{children}</span></ShadcnButton>;
 }
 
 export function IconButton({ label, children, className, ...props }: ButtonHTMLAttributes<HTMLButtonElement> & { label: string }) {
-  return <button className={`icon-button ${className ?? ""}`} aria-label={label} title={label} {...props}>{children}</button>;
+  return <ShadcnButton variant="ghost" size="icon" className={`icon-button ${className ?? ""}`} aria-label={label} title={label} {...props}>{children}</ShadcnButton>;
 }
 
 export function Panel({ as: Tag = "section", className = "", children, ...props }: { as?: "section" | "div"; className?: string; children: ReactNode } & React.HTMLAttributes<HTMLElement>) {

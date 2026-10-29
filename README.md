@@ -70,6 +70,13 @@ Demo mutations never call `/api/v1`, never read upload files, and are reset on
 refresh. A failed Demo bootstrap stops before rendering the console. This is a
 review and documentation surface, not a production-management deployment.
 
+The Inspector UX/UI contract is documented in
+[`docs/specs/agent-vm/contracts/web-demo-inspector.md`](docs/specs/agent-vm/contracts/web-demo-inspector.md).
+Its interactive controls use the checked-in shadcn/ui baseline declared by
+[`web/components.json`](web/components.json) and implemented under
+`web/src/components/ui`; normal click, context-menu/long-press, and floating
+drag-handle behavior are intentionally separate contracts.
+
 Build and preview it with:
 
 ```bash
