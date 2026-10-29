@@ -8,7 +8,7 @@ import type { Locale, Operation } from "../app/types";
 import { PageIntro, QueryError } from "../components/PagePrimitives";
 import { Button, Panel, PanelHeader, Select, StatusBadge } from "../components/ui";
 
-const phaseProgress: Record<string, number> = { queued: 12, awaiting_upload: 22, upload: 38, integrity_check: 54, image_import: 68, suitability_check: 80, reference_check: 82, native_action: 88, reconciliation: 94, cleanup: 97, completed: 100 };
+const phaseProgress: Record<string, number> = { queued: 12, awaiting_upload: 22, upload: 38, integrity_check: 54, image_import: 68, suitability_check: 80, reference_check: 82, token_creation: 84, token_revocation: 88, native_action: 88, reconciliation: 94, cleanup: 97, completed: 100 };
 
 export function OperationsPage() {
   const { t, i18n } = useTranslation();

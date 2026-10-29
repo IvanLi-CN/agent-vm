@@ -1,12 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, KeyRound, ShieldCheck, UserRound } from "lucide-react";
-import { FormEvent, useState } from "react";
+import { AlertTriangle, ChevronLeft, ChevronRight, KeyRound, ShieldCheck, UserRound } from "lucide-react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ManagementRequestError, createAgentToken, createOperationId, getManagementSession, listTokens, previewTokenRevocation, submitTokenRevocation } from "../app/api";
 import { formatDateTime } from "../app/format";
 import type { ActionPreview, AgentToken, Locale, ManagementSession, TokenCreateResult, TokenRevokePreview, TokenScope } from "../app/types";
 import { ActionDialog } from "./ActionDialog";
-import { EmptyState, Button, CopyButton, Input, Panel, PanelHeader, StatusBadge, Textarea } from "./ui";
+import { Badge, EmptyState, Button, CopyButton, Input, Panel, PanelHeader, StatusBadge, Textarea } from "./ui";
 
 const scopeOptions: Array<{ scope: TokenScope; label: string }> = [
   { scope: "agent:read", label: "tokens.scopeRead" },
@@ -61,9 +61,15 @@ export function TokenManagement() {
   const [revokePreview, setRevokePreview] = useState<TokenRevokePreview | null>(null);
   const [revokeOperationId, setRevokeOperationId] = useState<string | null>(null);
   const [revokeError, setRevokeError] = useState<string | null>(null);
+  const revokePreviewRequestRef = useRef(0);
+  const [revokePreviewPending, setRevokePreviewPending] = useState(false);
+  const [tokenCursor, setTokenCursor] = useState<string | undefined>();
+  const [tokenCursorStack, setTokenCursorStack] = useState<string[]>([]);
 
   const sessionQuery = useQuery<ManagementSession>({ queryKey: ["management-session"], queryFn: getManagementSession, staleTime: 30_000 });
-  const tokensQuery = useQuery({ queryKey: ["tokens"], queryFn: () => listTokens(), refetchInterval: 10_000, refetchIntervalInBackground: false });
+  const tokensQuery = useQuery({ queryKey: ["tokens", tokenCursor], queryFn: () => listTokens(tokenCursor), refetchInterval: 10_000, refetchIntervalInBackground: false });
+  const session = sessionQuery.data;
+  const canManageTokens = session?.capabilities.includes("manage_tokens") ?? false;
 
   const createMutation = useMutation({
     mutationFn: ({ auditReason, operationId }: { auditReason: string; operationId: string }) => createAgentToken(scopes, new Date(expiresAt).toISOString(), auditReason, operationId),
@@ -71,6 +77,8 @@ export function TokenManagement() {
       setCreateError(null);
       setReason("");
       setCreateOperationIdValue(null);
+      setTokenCursor(undefined);
+      setTokenCursorStack([]);
       setPlaintextMetadata(result.metadata);
       if ("token" in result) {
         setPlaintextToken(result.token);
@@ -81,9 +89,14 @@ export function TokenManagement() {
       }
       void client.invalidateQueries({ queryKey: ["tokens"] });
       void client.invalidateQueries({ queryKey: ["operations"] });
+      void client.invalidateQueries({ queryKey: ["audit"] });
     },
     onError: (error) => setCreateError(errorMessage(error, t)),
   });
+
+  useEffect(() => {
+    if (createMutation.isSuccess) createMutation.reset();
+  }, [createMutation.isSuccess]);
 
   const revokeMutation = useMutation({
     mutationFn: ({ auditReason, operationId }: { auditReason: string; operationId: string }) => submitTokenRevocation(revokeToken?.token_id ?? "", auditReason, revokePreview!, operationId),
@@ -91,9 +104,11 @@ export function TokenManagement() {
       setRevokeToken(null);
       setRevokePreview(null);
       setRevokeOperationId(null);
+      setRevokePreviewPending(false);
       setRevokeError(null);
       void client.invalidateQueries({ queryKey: ["tokens"] });
       void client.invalidateQueries({ queryKey: ["operations"] });
+      void client.invalidateQueries({ queryKey: ["audit"] });
     },
     onError: (error) => setRevokeError(errorMessage(error, t)),
   });
@@ -110,6 +125,7 @@ export function TokenManagement() {
 
   const submitCreate = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
+    if (!canManageTokens) return;
     setCreateError(null);
     const expiry = Date.parse(expiresAt);
     if (!scopes.length) {
@@ -120,33 +136,63 @@ export function TokenManagement() {
       setCreateError(t("tokens.expiryRequired"));
       return;
     }
-    const operationId = createOperationId();
-    setCreateOperationIdValue(operationId);
+    const operationId = createOperationIdValue ?? createOperationId();
+    if (!createOperationIdValue) setCreateOperationIdValue(operationId);
     createMutation.mutate({ auditReason: reason.trim(), operationId });
   };
 
   const openRevoke = async (token: AgentToken) => {
+    const requestId = revokePreviewRequestRef.current + 1;
+    revokePreviewRequestRef.current = requestId;
     setRevokeError(null);
+    setRevokePreviewPending(true);
     setRevokeToken(token);
     setRevokeOperationId(createOperationId());
     try {
-      setRevokePreview(await previewTokenRevocation(token.token_id, token.resource_version));
+      const preview = await previewTokenRevocation(token.token_id, token.resource_version);
+      if (revokePreviewRequestRef.current === requestId) setRevokePreview(preview);
     } catch (error) {
-      setRevokeToken(null);
-      setRevokePreview(null);
-      setRevokeError(errorMessage(error, t));
+      if (revokePreviewRequestRef.current === requestId) {
+        setRevokeToken(null);
+        setRevokePreview(null);
+        setRevokeError(errorMessage(error, t));
+      }
+    } finally {
+      if (revokePreviewRequestRef.current === requestId) setRevokePreviewPending(false);
     }
   };
 
-  const session = sessionQuery.data;
+  const cancelRevoke = () => {
+    revokePreviewRequestRef.current += 1;
+    setRevokePreviewPending(false);
+    setRevokeToken(null);
+    setRevokePreview(null);
+    setRevokeOperationId(null);
+    setRevokeError(null);
+  };
+
+  const nextTokenPage = () => {
+    const next = tokensQuery.data?.page.next_cursor;
+    if (!next) return;
+    setTokenCursorStack((stack) => [...stack, tokenCursor ?? ""]);
+    setTokenCursor(next);
+  };
+
+  const previousTokenPage = () => {
+    const previous = tokenCursorStack[tokenCursorStack.length - 1];
+    setTokenCursorStack((stack) => stack.slice(0, -1));
+    setTokenCursor(previous || undefined);
+  };
+
   const tokens = tokensQuery.data?.items ?? [];
   return <Panel className="token-panel" data-testid="token-management">
     <PanelHeader title={t("tokens.title")} description={t("tokens.subtitle")} action={<StatusBadge state={session ? "active" : "unknown"} />} />
     {session ? <SessionSummary session={session} locale={locale} /> : sessionQuery.isPending ? <div className="token-session-summary token-session-loading"><span /><span /><span /></div> : null}
+    {!canManageTokens && session ? <p className="token-capability-note">{t("tokens.permissionDenied")}</p> : null}
     <div className="token-create-section">
       <div className="section-header token-section-header"><div><h3>{t("tokens.create")}</h3><p>{t("tokens.createHint")}</p></div></div>
       <form className="token-create-form" onSubmit={submitCreate}>
-        <fieldset className="token-scope-fieldset">
+        <fieldset className="token-scope-fieldset" disabled={!canManageTokens}>
           <legend>{t("tokens.scopes")}</legend>
           <div className="token-scope-grid">
             {scopeOptions.map(({ scope, label }) => <label className="scope-option" key={scope}>
@@ -157,20 +203,22 @@ export function TokenManagement() {
           {scopes.includes("agent:operate") ? <p className="field-hint">{t("tokens.operateNeedsRead")}</p> : null}
         </fieldset>
         <div className="token-form-fields">
-          <label className="field-label"><span>{t("tokens.expiresAt")}</span><Input type="datetime-local" value={expiresAt} onChange={(event) => setExpiresAt(event.target.value)} required /></label>
-          <label className="field-label"><span>{t("tokens.reason")} <em>({t("common.optional")})</em></span><Textarea value={reason} onChange={(event) => setReason(event.target.value)} rows={2} placeholder={t("common.reasonPlaceholder")} /></label>
+          <label className="field-label"><span>{t("tokens.expiresAt")}</span><Input type="datetime-local" value={expiresAt} onChange={(event) => setExpiresAt(event.target.value)} disabled={!canManageTokens} required /></label>
+          <label className="field-label"><span>{t("tokens.reason")} <em>({t("common.optional")})</em></span><Textarea value={reason} onChange={(event) => setReason(event.target.value)} rows={2} disabled={!canManageTokens} placeholder={t("common.reasonPlaceholder")} /></label>
         </div>
-        {createError ? <p className="field-error" role="alert">{createError}</p> : null}
-        <div className="token-form-actions"><Button type="submit" variant="primary" disabled={createMutation.isPending || Boolean(createOperationIdValue)} icon={<KeyRound />}>{createMutation.isPending ? t("common.loading") : t("tokens.create")}</Button></div>
+        {createError ? <div role="alert"><p className="field-error">{createError}</p>{createOperationIdValue ? <p className="token-retry-hint">{t("tokens.retryCreate", { operationId: createOperationIdValue })}</p> : null}</div> : null}
+        <div className="token-form-actions"><Button type="submit" variant="primary" disabled={createMutation.isPending || !canManageTokens} icon={<KeyRound />}>{createMutation.isPending ? t("common.loading") : createOperationIdValue ? t("tokens.retryCreateButton") : t("tokens.create")}</Button></div>
       </form>
     </div>
     {plaintextMetadata ? <PlaintextDisclosure token={plaintextMetadata} plaintext={plaintextToken} consumed={plaintextConsumed} onDismiss={() => { setPlaintextToken(null); setPlaintextConsumed(true); }} /> : null}
     <div className="token-list-section">
       <div className="section-header token-section-header"><div><h3>{t("tokens.listTitle")}</h3><p>{t("tokens.count", { count: tokens.length })}</p></div></div>
-      {tokensQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : tokens.length ? <div className="token-list" role="list">{tokens.map((token) => <TokenRow key={token.token_id} token={token} locale={locale} onRevoke={() => void openRevoke(token)} />)}</div> : <EmptyState title={t("tokens.noTokens")} />}
+      {revokeError && !revokePreview ? <p className="field-error" role="alert">{revokeError}</p> : null}
+      {tokensQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : tokens.length ? <div className="token-list" role="list">{tokens.map((token) => <TokenRow key={token.token_id} token={token} locale={locale} revokeDisabled={revokePreviewPending || !canManageTokens} onRevoke={() => void openRevoke(token)} />)}</div> : <EmptyState title={t("tokens.noTokens")} />}
       {tokensQuery.isError ? <p className="field-error" role="alert">{t("errors.generic")}</p> : null}
+      <div className="pagination token-pagination"><span>{tokens.length}</span><div><Button variant="ghost" aria-label={t("common.previous")} disabled={!tokenCursorStack.length} onClick={previousTokenPage} icon={<ChevronLeft />} /><Button variant="ghost" aria-label={t("common.next")} disabled={!tokensQuery.data?.page.next_cursor} onClick={nextTokenPage} icon={<ChevronRight />} /></div></div>
     </div>
-    {revokeToken && revokePreview ? <ActionDialog preview={actionPreview(revokePreview)} actionLabel={t("tokens.revoke")} target={`${t("tokens.tokenId")} · ${revokeToken.token_id}`} dangerous busy={revokeMutation.isPending} error={revokeError} onCancel={() => { setRevokeToken(null); setRevokePreview(null); setRevokeOperationId(null); setRevokeError(null); }} onConfirm={(auditReason) => revokeMutation.mutate({ auditReason, operationId: revokeOperationId ?? createOperationId() })}><p className="dialog-warning token-revoke-warning">{t("tokens.revokeConfirm")}</p></ActionDialog> : null}
+    {revokeToken && revokePreview ? <ActionDialog preview={actionPreview(revokePreview)} actionLabel={t("tokens.revoke")} target={`${t("tokens.tokenId")} · ${revokeToken.token_id}`} dangerous busy={revokeMutation.isPending} error={revokeError} confirmationText={t("tokens.revokeConfirm")} onCancel={cancelRevoke} onConfirm={(auditReason) => revokeMutation.mutate({ auditReason, operationId: revokeOperationId ?? createOperationId() })} /> : null}
   </Panel>;
 }
 
@@ -178,21 +226,21 @@ function SessionSummary({ session, locale }: { session: ManagementSession; local
   const { t } = useTranslation();
   return <div className="token-session-summary">
     <div className="token-session-heading"><div className="token-session-icon" aria-hidden="true"><UserRound /></div><div><h3>{t("tokens.adminSession")}</h3><p className="mono">{session.subject}</p></div><StatusBadge state="active" /></div>
-    <dl className="token-session-grid"><div><dt>{t("tokens.principal")}</dt><dd className="mono">{session.subject}</dd></div><div><dt>{t("tokens.issuer")}</dt><dd className="mono">{session.issuer}</dd></div><div><dt>{t("tokens.role")}</dt><dd>{session.role}</dd></div><div><dt>{t("tokens.expires")}</dt><dd>{formatDateTime(session.expires_at, locale)}</dd></div><div className="token-capabilities"><dt>{t("tokens.capabilities")}</dt><dd>{session.capabilities.map((capability) => <span className="scope-tag" key={capability}>{capability}</span>)}</dd></div></dl>
+    <dl className="token-session-grid"><div><dt>{t("tokens.principal")}</dt><dd className="mono">{session.subject}</dd></div><div><dt>{t("tokens.issuer")}</dt><dd className="mono">{session.issuer}</dd></div><div><dt>{t("tokens.role")}</dt><dd>{t("tokens.roleAdministrator")}</dd></div><div><dt>{t("tokens.expires")}</dt><dd>{formatDateTime(session.expires_at, locale)}</dd></div><div className="token-capabilities"><dt>{t("tokens.capabilities")}</dt><dd>{session.capabilities.map((capability) => <span className="scope-tag" key={capability}>{capability}</span>)}</dd></div></dl>
   </div>;
 }
 
-function TokenRow({ token, locale, onRevoke }: { token: AgentToken; locale: Locale; onRevoke: () => void }) {
+function TokenRow({ token, locale, revokeDisabled, onRevoke }: { token: AgentToken; locale: Locale; revokeDisabled: boolean; onRevoke: () => void }) {
   const { t } = useTranslation();
   const state = tokenState(token);
   return <article className="token-row" role="listitem">
-    <div className="token-row-main"><div className="token-row-title"><strong className="mono">{token.token_id}</strong><StatusBadge state={state} /></div><div className="token-scopes">{token.scopes.map((scope) => <span className="scope-tag" key={scope}>{scope}</span>)}</div></div>
+    <div className="token-row-main"><div className="token-row-title"><strong className="mono" title={token.token_id}>{token.token_id}</strong><CopyButton value={token.token_id} /><Badge tone={state === "active" ? "success" : state === "expired" ? "warning" : "danger"}>{t(`tokens.${state}`)}</Badge></div><div className="token-scopes">{token.scopes.map((scope) => <span className="scope-tag" key={scope}>{scope}</span>)}</div></div>
     <dl className="token-row-meta"><div><dt>{t("tokens.created")}</dt><dd>{formatDateTime(token.created_at, locale)}</dd></div><div><dt>{token.revoked_at ? t("tokens.revokedAt") : t("tokens.expires")}</dt><dd>{formatDateTime(token.revoked_at ?? token.expires_at, locale)}</dd></div></dl>
-    <Button variant="danger" disabled={state !== "active"} onClick={onRevoke} icon={<ShieldCheck />}>{t("tokens.revoke")}</Button>
+    <Button variant="danger" disabled={state !== "active" || revokeDisabled} onClick={onRevoke} icon={<ShieldCheck />}>{t("tokens.revoke")}</Button>
   </article>;
 }
 
 function PlaintextDisclosure({ token, plaintext, consumed, onDismiss }: { token: AgentToken; plaintext: string | null; consumed: boolean; onDismiss: () => void }) {
   const { t } = useTranslation();
-  return <div className="token-disclosure" role="status" data-testid="token-disclosure"><div className="token-disclosure-heading"><AlertTriangle aria-hidden="true" /><div><strong>{t("tokens.plaintextTitle")}</strong><p>{consumed ? t("tokens.plaintextConsumed") : t("tokens.plaintextWarning")}</p></div></div>{plaintext ? <div className="token-value"><code data-testid="token-plaintext">{plaintext}</code><CopyButton value={plaintext} /></div> : null}<div className="token-disclosure-meta"><span className="mono">{token.token_id}</span><Button variant="ghost" onClick={onDismiss}>{t("tokens.dismissPlaintext")}</Button></div></div>;
+  return <div className="token-disclosure" role="region" aria-labelledby="token-plaintext-title" data-testid="token-disclosure"><div className="token-disclosure-heading"><AlertTriangle aria-hidden="true" /><div><strong id="token-plaintext-title">{t("tokens.plaintextTitle")}</strong><p>{consumed ? t("tokens.plaintextConsumed") : t("tokens.plaintextWarning")}</p></div></div>{plaintext ? <div className="token-value"><code data-testid="token-plaintext">{plaintext}</code><CopyButton value={plaintext} /></div> : null}<div className="token-disclosure-meta"><span className="mono">{token.token_id}</span><Button variant="ghost" onClick={onDismiss}>{t("tokens.dismissPlaintext")}</Button></div></div>;
 }

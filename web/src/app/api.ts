@@ -24,9 +24,20 @@ export class ManagementRequestError extends Error {
 let csrfToken: string | null = null;
 let csrfExpiresAt = 0;
 let sessionPromise: Promise<string> | null = null;
+const mockTokenCreates = new Map<string, { metadata: AgentToken; request: string }>();
+const mockTokenRevocations = new Map<string, { operation: Operation; request: string }>();
+const mockTokenRevocationPreviews = new Map<string, { tokenId: string; targetVersion: string; expiresAt: string }>();
 
 export function createOperationId(): string {
-  return typeof crypto !== "undefined" && "randomUUID" in crypto ? crypto.randomUUID() : `synthetic-${Date.now()}`;
+  const cryptoApi = typeof globalThis.crypto !== "undefined" ? globalThis.crypto : null;
+  if (cryptoApi?.randomUUID) return cryptoApi.randomUUID();
+  const bytes = new Uint8Array(16);
+  if (cryptoApi?.getRandomValues) cryptoApi.getRandomValues(bytes);
+  else bytes.forEach((_, index) => { bytes[index] = Math.floor(Math.random() * 256); });
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
 async function requestJSON<T>(path: string, init: RequestInit | undefined, options: RealRequestOptions = {}): Promise<T> {
@@ -121,36 +132,62 @@ export async function listImages(query = "", cursor?: string): Promise<{ items: 
 
 export async function listTokens(cursor?: string): Promise<TokenPage> {
   if (useRealApi) return realRequest<TokenPage>(`/tokens?limit=25${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
-  return delay({ items: mockState.tokens, page: { limit: 25, next_cursor: null } });
+  return delay({ items: mockState.tokens.map((token) => ({ ...token, scopes: [...token.scopes] })), page: { limit: 25, next_cursor: null } });
 }
 
 export async function createAgentToken(scopes: TokenScope[], expiresAt: string, reason?: string, operationId = createOperationId()): Promise<TokenCreateResult> {
   const body = { operation_id: operationId, scopes, expires_at: expiresAt, ...(reason?.trim() ? { reason: reason.trim() } : {}) };
   if (useRealApi) return realRequest<TokenCreateResult>("/tokens", { method: "POST", body: JSON.stringify(body) });
+  const request = JSON.stringify({ scopes: [...scopes].sort(), expires_at: expiresAt, reason: reason?.trim() || null });
+  const previous = mockTokenCreates.get(operationId);
+  if (previous) {
+    if (previous.request !== request) throw new ManagementRequestError("operation_conflict", "precondition", operationId);
+    return delay({ operation_id: operationId, metadata: previous.metadata, plaintext_disclosure: "consumed" });
+  }
   const tokenId = `tok_${createOperationId().replaceAll("-", "").slice(0, 24)}`;
-  const metadata: AgentToken = { token_id: tokenId, resource_version: `token:${tokenId}:revision-1`, scopes, created_at: new Date().toISOString(), expires_at: expiresAt, revoked_at: null };
+  const metadata: AgentToken = { token_id: tokenId, resource_version: `token:${tokenId}:revision-1`, scopes: [...scopes], created_at: new Date().toISOString(), expires_at: expiresAt, revoked_at: null };
   mockState.tokens.unshift(metadata);
+  mockTokenCreates.set(operationId, { metadata, request });
   const plaintext = `${createOperationId().replaceAll("-", "")}${createOperationId().replaceAll("-", "")}`;
   const operation = createMockOperation("token_create", { kind: "token", id: tokenId }, reason?.trim() || null, "succeeded", operationId);
   operation.result = { token_metadata: metadata, plaintext_disclosure: "returned" };
+  createMockAudit(operation);
   return delay({ operation_id: operationId, token: plaintext, metadata, plaintext_disclosure: "returned" });
 }
 
 export async function previewTokenRevocation(tokenId: string, targetVersion: string): Promise<TokenRevokePreview> {
   if (useRealApi) return realRequest<TokenRevokePreview>(`/tokens/${encodeURIComponent(tokenId)}/revoke/preview`, { method: "POST", body: JSON.stringify({ target_version: targetVersion }) });
-  const token = mockState.tokens.find((candidate) => candidate.token_id === tokenId) ?? mockState.tokens[0];
-  return delay({ token_id: token.token_id, target_version: token.resource_version, confirmation_token: `synthetic-confirmation-${createOperationId()}`, expires_at: "2027-01-15T10:25:00Z", metadata: token });
+  const token = mockState.tokens.find((candidate) => candidate.token_id === tokenId);
+  if (!token || token.resource_version !== targetVersion) throw new ManagementRequestError("stale_target", "precondition");
+  const confirmationToken = `synthetic-confirmation-${createOperationId()}`;
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+  mockTokenRevocationPreviews.set(confirmationToken, { tokenId: token.token_id, targetVersion: token.resource_version, expiresAt });
+  return delay({ token_id: token.token_id, target_version: token.resource_version, confirmation_token: confirmationToken, expires_at: expiresAt, metadata: { ...token, scopes: [...token.scopes] } });
 }
 
-export async function submitTokenRevocation(tokenId: string, reason: string, preview: TokenRevokePreview, operationId = createOperationId()): Promise<Operation> {
-  const body = { operation_id: operationId, target_version: preview.target_version, confirmation_token: preview.confirmation_token, ...(reason.trim() ? { reason: reason.trim() } : {}) };
+export async function submitTokenRevocation(tokenId: string, reason: string | undefined, preview: TokenRevokePreview, operationId = createOperationId()): Promise<Operation> {
+  const normalizedReason = reason?.trim() ?? "";
+  const body = { operation_id: operationId, target_version: preview.target_version, confirmation_token: preview.confirmation_token, ...(normalizedReason ? { reason: normalizedReason } : {}) };
   if (useRealApi) return realRequest<Operation>(`/tokens/${encodeURIComponent(tokenId)}/revoke`, { method: "POST", body: JSON.stringify(body) });
+  const request = JSON.stringify({ token_id: tokenId, target_version: preview.target_version, confirmation_token: preview.confirmation_token, reason: normalizedReason || null });
+  const previous = mockTokenRevocations.get(operationId);
+  if (previous) {
+    if (previous.request !== request) throw new ManagementRequestError("operation_conflict", "precondition", operationId);
+    return delay(previous.operation);
+  }
   const token = mockState.tokens.find((candidate) => candidate.token_id === tokenId);
+  const previewBinding = mockTokenRevocationPreviews.get(preview.confirmation_token);
+  if (!token || preview.token_id !== tokenId || !previewBinding || previewBinding.tokenId !== tokenId || previewBinding.targetVersion !== preview.target_version || token.resource_version !== preview.target_version) throw new ManagementRequestError("stale_target", "precondition");
+  if (Date.parse(previewBinding.expiresAt) <= Date.now()) throw new ManagementRequestError("precondition_required", "precondition");
   if (token && !token.revoked_at) {
     token.revoked_at = new Date().toISOString();
     token.resource_version = `${token.resource_version}:revoked`;
   }
-  return delay(createMockOperation("token_revoke", { kind: "token", id: tokenId }, reason.trim() || null, "succeeded", operationId));
+  const operation = createMockOperation("token_revoke", { kind: "token", id: tokenId }, normalizedReason || null, "succeeded", operationId);
+  mockTokenRevocations.set(operationId, { operation, request });
+  mockTokenRevocationPreviews.delete(preview.confirmation_token);
+  createMockAudit(operation);
+  return delay(operation);
 }
 
 export async function listOperations(status = "all", cursor?: string): Promise<{ items: Operation[]; page: { limit: number; next_cursor: string | null } }> {
@@ -235,4 +272,8 @@ function createMockOperation(action: Operation["action"], target: Operation["tar
   const operation: Operation = { operation_id: operationId, action, status, phase: status === "awaiting_upload" ? "awaiting_upload" : status === "running" ? "suitability_check" : status === "succeeded" ? "completed" : "queued", target, actor: { issuer: mockState.session.issuer, subject: mockState.session.subject, role: "administrator" }, reason: reason?.trim() || null, created_at: new Date().toISOString(), updated_at: new Date().toISOString(), result: null, error: null };
   mockState.operations.unshift(operation);
   return operation;
+}
+
+function createMockAudit(operation: Operation): void {
+  mockState.audits.unshift({ event_id: createOperationId(), operation_id: operation.operation_id, action: operation.action, actor: operation.actor, reason: operation.reason, target: operation.target, outcome: operation.status === "succeeded" ? "succeeded" : operation.status === "failed" ? "failed" : operation.status === "outcome_unknown" ? "outcome_unknown" : "accepted", phase: operation.phase, occurred_at: operation.updated_at, safe_code: operation.error?.code ?? null });
 }

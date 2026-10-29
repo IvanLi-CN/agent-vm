@@ -51,8 +51,7 @@ export function actionLabel(action: string, locale: Locale): string {
 }
 
 export function formatActor(actor: AuditActor): string {
-  if (typeof actor === "string") return actor;
-  if (actor.subject) return actor.subject;
-  if (actor.raw_actor) return actor.raw_actor;
-  return actor.kind ?? "—";
+  if ("subject" in actor) return `${actor.subject} · ${actor.issuer}`;
+  if ("raw_actor" in actor) return `${actor.raw_actor} · ${actor.kind}`;
+  return actor.kind;
 }

@@ -148,7 +148,7 @@ export interface ManagedImage {
 }
 
 export type OperationStatus = "awaiting_upload" | "queued" | "running" | "reconciling" | "succeeded" | "failed" | "outcome_unknown";
-export type OperationPhase = "queued" | "awaiting_upload" | "upload" | "integrity_check" | "image_import" | "suitability_check" | "reference_check" | "native_action" | "reconciliation" | "cleanup" | "completed";
+export type OperationPhase = "queued" | "awaiting_upload" | "upload" | "integrity_check" | "image_import" | "suitability_check" | "reference_check" | "token_creation" | "token_revocation" | "native_action" | "reconciliation" | "cleanup" | "completed";
 export type ManagementAction = "restart" | "resize" | "release" | "destroy" | "port_add" | "port_remove" | "image_import" | "default_image_select" | "image_retire" | "image_delete" | "drain_enter" | "reconcile" | "gc" | "token_create" | "token_revoke";
 
 export interface SafeError {
@@ -171,27 +171,24 @@ export interface Operation {
   phase: OperationPhase;
   target: { kind: "vm" | "image" | "image_catalog" | "system" | "token"; id: string };
   actor: AuditActor;
-  reason: string | null;
+  reason?: string | null;
   created_at: string;
   updated_at: string;
   result: { token_metadata?: AgentToken | null; plaintext_disclosure?: "returned" | "consumed" | null; image_fingerprint?: string | null; default_fingerprint?: string | null; affected_session_count?: number | null; effect?: string | null } | null;
   error: SafeError | null;
 }
 
-export type AuditActor = string | {
-  issuer?: string;
-  subject?: string;
-  role?: "administrator";
-  kind?: "legacy_unknown" | "unauthenticated" | "unauthorized";
-  raw_actor?: string;
-};
+export type AuditActor =
+  | { issuer: string; subject: string; role: "administrator" }
+  | { kind: "legacy_unknown"; raw_actor: string }
+  | { kind: "unauthenticated" | "unauthorized" };
 
 export interface AuditEvent {
   event_id: string;
   operation_id: string;
   action: ManagementAction;
   actor: AuditActor;
-  reason: string | null;
+  reason?: string | null;
   target: { kind: "vm" | "image" | "image_catalog" | "system" | "token"; id: string };
   outcome: "accepted" | "rejected" | "succeeded" | "failed" | "outcome_unknown";
   phase: OperationPhase;

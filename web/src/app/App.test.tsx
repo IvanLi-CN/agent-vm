@@ -60,6 +60,7 @@ describe("management console workflow", () => {
     expect(screen.queryByTestId("token-plaintext")).not.toBeInTheDocument();
     expect(screen.getByTestId("token-disclosure")).toHaveTextContent(/明文披露状态已消费|disclosure latch is consumed/i);
 
+    await waitFor(() => expect(screen.getAllByRole("button", { name: /撤销|revoke/i })).toHaveLength(3));
     await user.click(screen.getAllByRole("button", { name: /撤销|revoke/i })[0]);
     expect(await screen.findByRole("dialog")).toHaveTextContent(/撤销后新的 Agent API 授权会被拒绝|new Agent API authorization/i);
     await user.click(screen.getByRole("button", { name: /确认提交|confirm and submit/i }));
