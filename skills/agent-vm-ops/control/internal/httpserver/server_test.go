@@ -6,14 +6,18 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/observe"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
@@ -132,5 +136,15 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server did not shut down")
+	}
+}
+
+func TestWriteErrorMapsUnreachableWatermarksToServiceUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	writeError(context, protocol.NewError("watermarks_unreachable", "configure reachable CT storage watermarks", nil), nil)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("watermarks error status = %d", recorder.Code)
 	}
 }

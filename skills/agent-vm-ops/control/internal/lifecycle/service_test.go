@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
@@ -30,19 +31,73 @@ type staticCPUObserver struct {
 	err         error
 }
 
+type staticMemoryObserver struct {
+	observation observe.MemoryObservation
+	err         error
+}
+
+type capacityGuest struct {
+	*startupGuest
+	capacity        native.StorageCapacity
+	capacityFunc    func() native.StorageCapacity
+	capacityErr     error
+	probeErr        error
+	capacityEntered chan struct{}
+	capacityRelease <-chan struct{}
+	probeHook       func()
+	capacityMu      sync.Mutex
+	capacityCalls   int
+}
+
+func (guest *capacityGuest) StoragePoolCapacity(context.Context) (native.StorageCapacity, error) {
+	guest.capacityMu.Lock()
+	guest.capacityCalls++
+	guest.capacityMu.Unlock()
+	if guest.capacityEntered != nil {
+		guest.capacityEntered <- struct{}{}
+	}
+	if guest.capacityRelease != nil {
+		<-guest.capacityRelease
+	}
+	if guest.capacityFunc != nil {
+		return guest.capacityFunc(), guest.capacityErr
+	}
+	return guest.capacity, guest.capacityErr
+}
+
+func (guest *capacityGuest) Probe(context.Context) error {
+	if guest.probeHook != nil {
+		guest.probeHook()
+	}
+	return guest.probeErr
+}
+
 type startupGuest struct {
-	initErr     error
-	status      string
-	statuses    []map[string]any
-	statusCalls int
-	deleteCalls int
-	config      map[string]any
-	configErr   error
-	stopErr     error
-	deviceSets  []string
+	initErr             error
+	status              string
+	statusErr           error
+	statuses            []map[string]any
+	statusCalls         int
+	deleteCalls         int
+	config              map[string]any
+	configErr           error
+	configSetErr        error
+	deviceSetErr        error
+	deviceSetFailDevice string
+	initEntered         chan<- struct{}
+	initRelease         <-chan struct{}
+	stopErr             error
+	deleteErr           error
+	deviceSets          []string
 }
 
 func (guest *startupGuest) Init(_ context.Context, _, _ string, ownership map[string]string) error {
+	if guest.initEntered != nil {
+		guest.initEntered <- struct{}{}
+	}
+	if guest.initRelease != nil {
+		<-guest.initRelease
+	}
 	if guest.config != nil {
 		config := guest.config["config"].(map[string]any)
 		for key, value := range ownership {
@@ -51,7 +106,11 @@ func (guest *startupGuest) Init(_ context.Context, _, _ string, ownership map[st
 	}
 	return guest.initErr
 }
+func (guest *startupGuest) Probe(context.Context) error { return nil }
 func (guest *startupGuest) ConfigSet(_ context.Context, _ string, key, value string) error {
+	if guest.configSetErr != nil {
+		return guest.configSetErr
+	}
 	if guest.config != nil {
 		if config, ok := guest.config["config"].(map[string]any); ok {
 			config[key] = value
@@ -61,6 +120,9 @@ func (guest *startupGuest) ConfigSet(_ context.Context, _ string, key, value str
 }
 
 func (guest *startupGuest) DeviceSet(_ context.Context, _ string, device, key, value string) error {
+	if guest.deviceSetErr != nil && (guest.deviceSetFailDevice == "" || guest.deviceSetFailDevice == device) {
+		return guest.deviceSetErr
+	}
 	guest.deviceSets = append(guest.deviceSets, device+":"+key+"="+value)
 	return nil
 }
@@ -70,8 +132,14 @@ func (guest *startupGuest) DeviceAdd(context.Context, string, string, string, ma
 func (guest *startupGuest) DeviceRemove(context.Context, string, string) error { return nil }
 func (guest *startupGuest) Start(context.Context, string) error                { return nil }
 func (guest *startupGuest) Stop(context.Context, string) error                 { return guest.stopErr }
-func (guest *startupGuest) Delete(context.Context, string) error               { guest.deleteCalls++; return nil }
+func (guest *startupGuest) Delete(context.Context, string) error {
+	guest.deleteCalls++
+	return guest.deleteErr
+}
 func (guest *startupGuest) Status(context.Context, string) (map[string]any, error) {
+	if guest.statusErr != nil {
+		return nil, guest.statusErr
+	}
 	index := guest.statusCalls
 	guest.statusCalls++
 	if len(guest.statuses) > 0 {
@@ -93,6 +161,10 @@ func (guest *startupGuest) Exec(context.Context, string, []string, []byte) (nati
 }
 
 func (observer staticCPUObserver) Observe(context.Context) (observe.CPUObservation, error) {
+	return observer.observation, observer.err
+}
+
+func (observer staticMemoryObserver) Observe(context.Context) (observe.MemoryObservation, error) {
 	return observer.observation, observer.err
 }
 
@@ -148,6 +220,43 @@ func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
 	if control := protocol.AsError(err); control.Code != "draining" {
 		t.Fatalf("drain error = %#v", control)
 	}
+}
+
+func TestAcquirePersistsPhysicalReservationWhilePreparing(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.VMIPStart = "10.0.0.2"
+	cfg.VMIPEnd = "10.0.0.254"
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{initEntered: entered, initRelease: release},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024},
+	}
+	service := New(store, cfg, Options{Guest: guest})
+	service.MarkReady()
+	result := make(chan error, 1)
+	go func() {
+		_, dispatchErr := service.Dispatch(context.Background(), protocol.Request{
+			"protocol": protocol.Version, "action": "acquire", "session_id": "preparing-reservation", "generation": int64(0), "operation_id": "preparing-reservation-acquire",
+		})
+		result <- dispatchErr
+	}()
+	<-entered
+	task, err := store.GetTask(context.Background(), map[string]any{"session_id": "preparing-reservation"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil || task.State != statePreparing || task.ReservationBytes != cfg.CreateCostBytes {
+		t.Fatalf("preparing task reservation = %#v", task)
+	}
+	close(release)
+	<-result
 }
 
 func TestReleaseDrainExitClaimsLegacyOwnerlessFence(t *testing.T) {
@@ -376,6 +485,1578 @@ func TestAdminMetricsIncludesPendingOperations(t *testing.T) {
 	pending, ok := result["pending_operations"].([]any)
 	if !ok || len(pending) != 0 {
 		t.Fatalf("pending operations = %#v", result["pending_operations"])
+	}
+}
+
+func TestAdmissionRejectsWhenPhysicalStorageCannotBeMeasured(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	service := New(store, cfg, Options{Guest: &startupGuest{}, Resident: true})
+	service.MarkReady()
+	err = service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_unverified" {
+		t.Fatalf("unmeasured storage error = %#v", err)
+	}
+}
+
+func TestAdmissionRejectsLowPhysicalStorageWithoutTouchingEffectiveLease(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	now := time.Date(2026, 10, 29, 0, 0, 0, 0, time.UTC)
+	lease := now.Add(time.Hour).Format(time.RFC3339Nano)
+	active := state.Task{
+		TaskID: "active-task", SessionID: "active-session", Generation: 1, State: stateActive,
+		InstanceName: "active-instance", LeaseExpiresAt: &lease, CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: "{}",
+	}
+	if err := store.InsertTask(ctx, active); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 13 * 1024 * 1024 * 1024},
+	}
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.DiskLowBytes = 10 * 1024 * 1024 * 1024
+	cfg.DiskTargetBytes = 20 * 1024 * 1024 * 1024
+	service := New(store, cfg, Options{Guest: guest, Resident: true, Clock: func() time.Time { return now }})
+	service.MarkReady()
+	err = service.checkAdmission(ctx, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_insufficient" {
+		t.Fatalf("low storage error = %#v", err)
+	}
+	stored, err := store.GetTask(ctx, map[string]any{"task_id": active.TaskID})
+	if err != nil || stored == nil || stored.State != stateActive || stored.LeaseExpiresAt == nil || *stored.LeaseExpiresAt != lease {
+		t.Fatalf("effective lease changed after rejection: task=%#v err=%v", stored, err)
+	}
+}
+
+func TestUnreachableWatermarksFinalizeAcquireOperation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "unreachable-watermarks-operation.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.DiskLowBytes = 90 * gib
+	cfg.DiskTargetBytes = 80 * gib
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 90 * gib},
+	}
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
+	service.MarkReady()
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "acquire", "session_id": "unreachable-watermarks", "generation": int64(0), "operation_id": "unreachable-watermarks-acquire",
+	}
+	_, err = service.Dispatch(context.Background(), request)
+	if control := protocol.AsError(err); control == nil || control.Code != "watermarks_unreachable" {
+		t.Fatalf("unreachable watermark error = %#v", err)
+	}
+	operation, err := store.GetOperation(context.Background(), "unreachable-watermarks-acquire")
+	if err != nil || operation == nil || stringValue(operation.Response["outcome"]) != "error" {
+		t.Fatalf("unreachable watermark operation = %#v err=%v", operation, err)
+	}
+	if pending, err := store.PendingOperations(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if len(pending) != 0 {
+		t.Fatalf("unreachable watermark left pending operations = %#v", pending)
+	}
+}
+
+func TestAdmissionRejectsIncompleteDurableDiskReservation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	task := state.Task{TaskID: "incomplete-reservation-task", SessionID: "incomplete-reservation-session", State: stateActive, InstanceName: "incomplete-reservation-instance", ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{"cpu":4,"memory_mib":8192}`}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024}}
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
+	service.MarkReady()
+	_, err = service.diskAdmission(ctx, "")
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_unverified" {
+		t.Fatalf("incomplete disk reservation error = %#v", err)
+	}
+}
+
+func TestAdmissionRejectsMalformedLogicalResources(t *testing.T) {
+	cases := []struct {
+		name         string
+		resources    string
+		reservations string
+	}{
+		{name: "incomplete resources", resources: `{"cpu":2,"memory_mib":4096}`, reservations: `{}`},
+		{name: "reservation does not mask incomplete resources", resources: `{"cpu":2,"memory_mib":4096}`, reservations: `{"cpu":4,"memory_mib":8192,"disk_gib":20}`},
+		{name: "null resource", resources: `{"cpu":null,"memory_mib":4096,"disk_gib":20}`, reservations: `{}`},
+		{name: "negative reservation", resources: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, reservations: `{"cpu":-1,"memory_mib":4096,"disk_gib":20}`},
+		{name: "resource sum overflow", resources: `{"cpu":9223372036854775807,"memory_mib":4096,"disk_gib":20}`, reservations: `{}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			task := state.Task{TaskID: "malformed-logical-task", SessionID: "malformed-logical-session", State: stateActive, InstanceName: "malformed-logical-instance", ResourcesJSON: tc.resources, ResourceReservationJSON: tc.reservations}
+			if err := store.InsertTask(context.Background(), task); err != nil {
+				t.Fatal(err)
+			}
+			service := New(store, config.Defaults(), Options{})
+			err = service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
+			if control := protocol.AsError(err); control == nil || control.Code != "resource_unverified" {
+				t.Fatalf("malformed logical resource error = %#v", err)
+			}
+		})
+	}
+}
+
+func TestAdmissionCountsOriginalResourcesWhenResizeReservationIsPending(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.CPUBudget = 5
+	cfg.CPUOvercommitRatio = json.Number("1")
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "pending-resize-task", SessionID: "pending-resize-session", State: stateActive,
+		InstanceName: "pending-resize-instance", ResourcesJSON: `{"cpu":4,"memory_mib":4096,"disk_gib":20}`,
+		ResourceReservationJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, cfg, Options{})
+	err = service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_insufficient" {
+		t.Fatalf("pending resize admission error = %#v", err)
+	}
+}
+
+func TestFailedDiskResizeRetainsPhysicalCostReservation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 29, 0, 0, 0, 0, time.UTC)
+	lease := now.Add(time.Hour).Format(time.RFC3339Nano)
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "failed-disk-resize-task", SessionID: "failed-disk-resize-session", Generation: 1, State: stateActive,
+		InstanceName: "failed-disk-resize-instance", LeaseExpiresAt: &lease, CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const gib = int64(1024 * 1024 * 1024)
+	cfg := config.Defaults()
+	cfg.DiskLowBytes = 200 * gib
+	cfg.DiskTargetBytes = 300 * gib
+	cfg.ResizeCostBytes = 7 * gib
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{deviceSetErr: errors.New("disk resize unavailable")},
+		capacity:     native.StorageCapacity{TotalBytes: 1024 * gib, FreeBytes: 210 * gib},
+	}
+	service := New(store, cfg, Options{Guest: guest, Resident: true, Clock: func() time.Time { return now }})
+	service.MarkReady()
+	_, err = service.resize(ctx, protocol.Request{"session_id": "failed-disk-resize-session", "generation": int64(1), "disk_gib": int64(30)})
+	if control := protocol.AsError(err); control == nil || control.Code != "resize_partial" {
+		t.Fatalf("failed disk resize error = %#v", err)
+	}
+	task, err := store.GetTask(ctx, map[string]any{"task_id": "failed-disk-resize-task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil {
+		t.Fatalf("failed disk resize task is missing")
+	}
+	reservation, reservationErr := decodeResourceMap(task.ResourceReservationJSON, "test reservation", false)
+	if reservationErr != nil || task.ReservationBytes != 7*gib || reservation["cpu"] != 2 || reservation["memory_mib"] != 4096 || reservation["disk_gib"] != 30 {
+		t.Fatalf("failed disk resize reservation = %#v", task)
+	}
+	disk, err := service.diskAdmission(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical := disk["physical_admission"].(map[string]any)
+	if physical["reserved_bytes"] != int64(7*gib) {
+		t.Fatalf("failed disk resize physical reservation = %#v", physical)
+	}
+	if control := protocol.AsError(service.checkAdmission(ctx, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)); control == nil || control.Code != "resource_insufficient" {
+		t.Fatalf("failed disk resize follow-up admission = %#v", control)
+	}
+	guest.configSetErr = errors.New("CPU resize unavailable")
+	_, err = service.resize(ctx, protocol.Request{"session_id": "failed-disk-resize-session", "generation": int64(1), "cpu": int64(3)})
+	if control := protocol.AsError(err); control == nil || control.Code != "resize_partial" {
+		t.Fatalf("failed follow-up CPU resize error = %#v", err)
+	}
+	task, err = store.GetTask(ctx, map[string]any{"task_id": "failed-disk-resize-task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, reservationErr = decodeResourceMap(task.ResourceReservationJSON, "test reservation", false)
+	if reservationErr != nil || task.ReservationBytes != 7*gib || reservation["cpu"] != 3 || reservation["memory_mib"] != 4096 || reservation["disk_gib"] != 30 {
+		t.Fatalf("failed follow-up CPU resize reservation = %#v", task)
+	}
+	guest.configSetErr = nil
+	guest.deviceSetErr = nil
+	if _, err := service.resize(ctx, protocol.Request{"session_id": "failed-disk-resize-session", "generation": int64(1), "cpu": int64(4)}); err != nil {
+		t.Fatalf("follow-up CPU resize = %#v", err)
+	}
+	task, err = store.GetTask(ctx, map[string]any{"task_id": "failed-disk-resize-task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, reservationErr = decodeResourceMap(task.ResourceReservationJSON, "test reservation", false)
+	if reservationErr != nil || task.ReservationBytes != 7*gib || reservation["cpu"] != 4 || reservation["memory_mib"] != 4096 || reservation["disk_gib"] != 30 {
+		t.Fatalf("follow-up CPU resize reservation = %#v", task)
+	}
+	if _, err := service.resize(ctx, protocol.Request{"session_id": "failed-disk-resize-session", "generation": int64(1), "disk_gib": int64(31)}); err != nil {
+		t.Fatalf("retry disk resize = %#v", err)
+	}
+	task, err = store.GetTask(ctx, map[string]any{"task_id": "failed-disk-resize-task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
+		t.Fatalf("successful retry disk resize reservation = %#v", task)
+	}
+}
+
+func TestInvalidLiveResizeDoesNotReclaimCachedCapacity(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 29, 0, 0, 0, 0, time.UTC)
+	lease := now.Add(time.Hour).Format(time.RFC3339Nano)
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "invalid-live-task", SessionID: "invalid-live-session", Generation: 1, State: stateActive,
+		InstanceName: "agent-invalid-live", LeaseExpiresAt: &lease, CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "invalid-live-cache", SessionID: "invalid-live-cache-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-invalid-live-cache", InactiveSince: stringPointer(nowString(now)), CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const gib = int64(1024 * 1024 * 1024)
+	cfg := config.Defaults()
+	cfg.DiskLowBytes = 20 * gib
+	cfg.DiskTargetBytes = 30 * gib
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{
+			status: "Stopped",
+			config: map[string]any{
+				"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "invalid-live-cache", "user.agent-vm.session": "invalid-live-cache-session", "user.agent-vm.generation": "1"},
+				"devices": map[string]any{}, "expanded_devices": map[string]any{},
+			},
+		},
+		capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 10 * gib},
+	}
+	service := New(store, cfg, Options{Guest: guest, Resident: true, Clock: func() time.Time { return now }})
+	_, err = service.resize(ctx, protocol.Request{"session_id": "invalid-live-session", "generation": int64(1), "live_memory": true, "memory_mib": int64(8192), "disk_gib": int64(30)})
+	control := protocol.AsError(err)
+	if control == nil || control.Code != "invalid_request" {
+		t.Fatalf("invalid live resize error = %#v", control)
+	}
+	if guest.deleteCalls != 0 {
+		t.Fatalf("invalid live resize reclaimed %d cached guests", guest.deleteCalls)
+	}
+	if task, getErr := store.GetTask(ctx, map[string]any{"task_id": "invalid-live-cache"}); getErr != nil || task == nil {
+		t.Fatalf("invalid live resize cache = %#v err=%v", task, getErr)
+	}
+}
+
+func TestSuccessfulDiskResizeClearsPhysicalCostReservation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 29, 0, 0, 0, 0, time.UTC)
+	lease := now.Add(time.Hour).Format(time.RFC3339Nano)
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "successful-disk-resize-task", SessionID: "successful-disk-resize-session", Generation: 1, State: stateActive,
+		InstanceName: "successful-disk-resize-instance", LeaseExpiresAt: &lease, CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const gib = int64(1024 * 1024 * 1024)
+	cfg := config.Defaults()
+	cfg.DiskLowBytes = 200 * gib
+	cfg.DiskTargetBytes = 300 * gib
+	cfg.ResizeCostBytes = 7 * gib
+	guest := &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 1024 * gib, FreeBytes: 210 * gib}}
+	service := New(store, cfg, Options{Guest: guest, Resident: true, Clock: func() time.Time { return now }})
+	service.MarkReady()
+	if _, err := service.resize(ctx, protocol.Request{"session_id": "successful-disk-resize-session", "generation": int64(1), "disk_gib": int64(30)}); err != nil {
+		t.Fatal(err)
+	}
+	task, err := store.GetTask(ctx, map[string]any{"task_id": "successful-disk-resize-task"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
+		t.Fatalf("successful disk resize reservation = %#v", task)
+	}
+	disk, err := service.diskAdmission(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	physical := disk["physical_admission"].(map[string]any)
+	if physical["reserved_bytes"] != int64(0) {
+		t.Fatalf("successful disk resize physical reservation = %#v", physical)
+	}
+}
+
+func TestAdminMetricsRejectsMalformedLogicalResources(t *testing.T) {
+	cases := []struct {
+		name         string
+		resources    string
+		reservations string
+	}{
+		{name: "incomplete resources", resources: `{"cpu":2,"memory_mib":4096}`, reservations: `{}`},
+		{name: "null resource", resources: `{"cpu":null,"memory_mib":4096,"disk_gib":20}`, reservations: `{}`},
+		{name: "negative reservation", resources: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, reservations: `{"cpu":-1,"memory_mib":4096,"disk_gib":20}`},
+		{name: "incomplete reservation", resources: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, reservations: `{"cpu":4,"memory_mib":8192}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			task := state.Task{TaskID: "malformed-metrics-task", SessionID: "malformed-metrics-session", State: stateActive, InstanceName: "malformed-metrics-instance", ResourcesJSON: tc.resources, ResourceReservationJSON: tc.reservations}
+			if err := store.InsertTask(context.Background(), task); err != nil {
+				t.Fatal(err)
+			}
+			service := New(store, config.Defaults(), Options{})
+			service.MarkReady()
+			_, err = service.adminMetrics(context.Background())
+			if control := protocol.AsError(err); control == nil || control.Code != "resource_unverified" {
+				t.Fatalf("malformed metrics error = %#v", err)
+			}
+		})
+	}
+}
+
+func TestAdminMetricsRejectsDefaultProjectionOverflow(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.CPUBudget = maxInt64Value
+	cfg.CPUOvercommitRatio = json.Number("1")
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "projection-overflow-task", SessionID: "projection-overflow-session", State: stateActive,
+		InstanceName: "projection-overflow-instance", ResourcesJSON: `{"cpu":9223372036854775807,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, cfg, Options{})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := metrics["default_admission"].(map[string]any)
+	if admission["ready"] != false {
+		t.Fatalf("overflow default admission = %#v", admission)
+	}
+	reasons := admission["reasons"].([]any)
+	found := false
+	for _, raw := range reasons {
+		if reason, ok := raw.(map[string]any); ok && reason["code"] == "resource_unverified" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("overflow default admission reasons = %#v", reasons)
+	}
+}
+
+func TestStartupPressureDetailRejectsProjectionOverflow(t *testing.T) {
+	service := New(nil, config.Defaults(), Options{})
+	detail := service.startupPressureDetail(observe.CPUObservation{Capacity: 8}, maxInt64Value, 2)
+	if detail["verified"] != false || detail["projected_cpu"] != nil || detail["startup_blocked"] != nil {
+		t.Fatalf("overflow startup pressure detail = %#v", detail)
+	}
+}
+
+func TestExternalPhysicalReservationSharesLifecycleAdmission(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024},
+	}
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
+	service.MarkReady()
+	release, err := service.ReservePhysicalStorage(ctx, 75*1024*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	err = service.checkAdmission(ctx, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_insufficient" {
+		t.Fatalf("shared physical reservation error = %#v", err)
+	}
+}
+
+func TestConcurrentPhysicalReservationsSerialize(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	capacityEntered := make(chan struct{}, 2)
+	capacityRelease := make(chan struct{})
+	guest := &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024}, capacityEntered: capacityEntered, capacityRelease: capacityRelease}
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
+	service.MarkReady()
+	type reservationResult struct {
+		release func()
+		err     error
+	}
+	results := make(chan reservationResult, 2)
+	go func() {
+		release, reserveErr := service.ReservePhysicalStorage(context.Background(), 75*1024*1024*1024)
+		results <- reservationResult{release: release, err: reserveErr}
+	}()
+	select {
+	case <-capacityEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first reservation did not reach capacity probe")
+	}
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		release, reserveErr := service.ReservePhysicalStorage(context.Background(), 75*1024*1024*1024)
+		results <- reservationResult{release: release, err: reserveErr}
+	}()
+	<-secondStarted
+	select {
+	case <-capacityEntered:
+		t.Fatal("second reservation entered the capacity probe before the first released the admission lock")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(capacityRelease)
+	first, second := <-results, <-results
+	successes := 0
+	for _, result := range []reservationResult{first, second} {
+		if result.err == nil {
+			successes++
+			result.release()
+			continue
+		}
+		if control := protocol.AsError(result.err); control == nil || control.Code != "resource_insufficient" {
+			t.Fatalf("concurrent reservation error = %#v", result.err)
+		}
+	}
+	if successes != 1 {
+		t.Fatalf("concurrent reservation successes = %d, want 1", successes)
+	}
+}
+
+func TestExternalPhysicalReservationPreservesManagementFreeSpaceFloor(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.Management.Upload.MinimumFreeBytes = 30 * 1024 * 1024 * 1024
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 40 * 1024 * 1024 * 1024},
+	}
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
+	service.MarkReady()
+	_, err = service.ReservePhysicalStorage(context.Background(), 20*1024*1024*1024)
+	if control := protocol.AsError(err); control == nil || control.Code != "resource_insufficient" {
+		t.Fatalf("management free-space floor error = %#v", err)
+	}
+}
+
+func TestExternalPhysicalReservationRefusesAdmissionDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.SetMeta(context.Background(), "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100, FreeBytes: 90}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	_, err = service.ReservePhysicalStorage(context.Background(), 1)
+	control := protocol.AsError(err)
+	if control == nil || control.Code != "draining" {
+		t.Fatalf("draining reservation error = %#v", err)
+	}
+	if guest.capacityCalls != 0 {
+		t.Fatalf("draining reservation probed capacity %d times", guest.capacityCalls)
+	}
+}
+
+func TestCachedResumeWithDiskGrowthChargesBothPhysicalCosts(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.ResumeCostBytes = 10
+	cfg.ResizeCostBytes = 7
+	service := New(store, cfg, Options{})
+	task := state.Task{TaskID: "cached-cost-task", SessionID: "cached-cost-session", State: stateCached, ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	cost, err := service.admissionStorageCost(context.Background(), task.TaskID, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 30}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cost != 17 {
+		t.Fatalf("cached resume cost = %d, want 17", cost)
+	}
+}
+
+func TestFailedCachedResumeRetainsLastAppliedResourcesForRetryCost(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "failed-cached-resume.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	fingerprint := strings.Repeat("a", 64)
+	if err := store.SeedLegacyImage(ctx, fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpdateManagedImageVerification(ctx, fingerprint, "passed", "passed", nil, "available"); err != nil {
+		t.Fatal(err)
+	}
+	session := "failed-cached-resume-session"
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "failed-cached-resume-task", SessionID: session, Generation: 1, State: stateCached,
+		InstanceName: "agent-failed-cached-resume", VMIP: stringPointer("10.0.0.10"), ImageFingerprint: fingerprint,
+		CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Network = ""
+	cfg.NetworkACL = ""
+	guest := &startupGuest{
+		status:              "Stopped",
+		deviceSetErr:        errors.New("disk resize unavailable"),
+		deviceSetFailDevice: "root",
+		config: map[string]any{
+			"config": map[string]any{
+				"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "failed-cached-resume-task",
+				"user.agent-vm.session": session, "user.agent-vm.generation": "1",
+			},
+			"devices": map[string]any{},
+			"expanded_devices": map[string]any{"eth0": map[string]any{
+				"type": "nic", "network": "", "ipv4.address": "10.0.0.10",
+				"security.mac_filtering": "true", "security.ipv4_filtering": "true",
+				"security.ipv6_filtering": "true", "security.port_isolation": "true",
+				"security.acls": "", "security.acls.default.ingress.action": "allow",
+				"security.acls.default.egress.action": "allow",
+			}},
+		},
+	}
+	service := New(store, cfg, Options{Guest: guest})
+	_, err = service.acquire(ctx, protocol.Request{"session_id": session, "generation": int64(1)})
+	if protocol.AsError(err).Code != "native_failed" {
+		t.Fatalf("failed cached resume error = %#v", err)
+	}
+	if _, err := service.reconcile(ctx, true); err != nil {
+		t.Fatalf("failed cached resume cleanup = %v", err)
+	}
+	cached, err := store.GetTask(ctx, map[string]any{"session_id": session})
+	if err != nil || cached == nil || cached.State != stateCached {
+		t.Fatalf("cached failed resume task = %#v err=%v", cached, err)
+	}
+	resources, resourceErr := decodeResourceMap(cached.ResourcesJSON, "cached failed resume resources", false)
+	if resourceErr != nil || !sameResources(resources, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}) {
+		t.Fatalf("cached failed resume resources = %s err=%v", cached.ResourcesJSON, resourceErr)
+	}
+	cost, err := service.admissionStorageCost(ctx, cached.TaskID, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 40}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cost != cfg.ResumeCostBytes+cfg.ResizeCostBytes {
+		t.Fatalf("retry physical cost = %d, want %d", cost, cfg.ResumeCostBytes+cfg.ResizeCostBytes)
+	}
+}
+
+func TestFailedInitialAcquireRetainsLastAppliedResourcesForRetryCost(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "failed-initial-acquire.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	cfg := config.Defaults()
+	cfg.Network = ""
+	cfg.NetworkACL = ""
+	cfg.VMIPStart = "10.0.0.10"
+	cfg.VMIPEnd = "10.0.0.20"
+	guest := &startupGuest{
+		status:              "Stopped",
+		deviceSetErr:        errors.New("disk resize unavailable"),
+		deviceSetFailDevice: "root",
+		config: map[string]any{
+			"config":  map[string]any{},
+			"devices": map[string]any{},
+			"expanded_devices": map[string]any{"eth0": map[string]any{
+				"type": "nic", "network": "", "ipv4.address": "10.0.0.10",
+				"security.mac_filtering": "true", "security.ipv4_filtering": "true",
+				"security.ipv6_filtering": "true", "security.port_isolation": "true",
+				"security.acls": "", "security.acls.default.ingress.action": "allow",
+				"security.acls.default.egress.action": "allow",
+			}},
+		},
+	}
+	service := New(store, cfg, Options{Guest: guest})
+	_, err = service.acquire(ctx, protocol.Request{"session_id": "failed-initial", "generation": int64(0), "disk_gib": int64(40)})
+	if protocol.AsError(err).Code != "native_failed" {
+		t.Fatalf("failed initial acquire error = %#v", err)
+	}
+	if _, err := service.reconcile(ctx, true); err != nil {
+		t.Fatalf("failed initial acquire cleanup = %v", err)
+	}
+	cached, err := store.GetTask(ctx, map[string]any{"session_id": "failed-initial"})
+	if err != nil || cached == nil || cached.State != stateCached {
+		t.Fatalf("cached failed initial acquire task = %#v err=%v", cached, err)
+	}
+	resources, resourceErr := decodeResourceMap(cached.ResourcesJSON, "cached failed initial acquire resources", false)
+	if resourceErr != nil || !sameResources(resources, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 0}) {
+		t.Fatalf("cached failed initial acquire resources = %s err=%v", cached.ResourcesJSON, resourceErr)
+	}
+	cost, err := service.admissionStorageCost(ctx, cached.TaskID, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 40}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cost != cfg.ResumeCostBytes+cfg.ResizeCostBytes {
+		t.Fatalf("retry physical cost = %d, want %d", cost, cfg.ResumeCostBytes+cfg.ResizeCostBytes)
+	}
+}
+
+func TestCachedReleaseRetainsResourcesForResumeCostClassification(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.ResumeCostBytes = 10
+	cfg.ResizeCostBytes = 7
+	service := New(store, cfg, Options{})
+	task := state.Task{TaskID: "release-cache-task", SessionID: "release-cache-session", Generation: 1, State: stateActive, ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.releaseUnlocked(context.Background(), protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false); err != nil {
+		t.Fatal(err)
+	}
+	cached, err := store.GetTask(context.Background(), map[string]any{"task_id": task.TaskID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cached == nil || cached.ResourcesJSON != task.ResourcesJSON {
+		t.Fatalf("cached resources = %#v, want %s", cached, task.ResourcesJSON)
+	}
+	sameSize, err := service.admissionStorageCost(context.Background(), task.TaskID, map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sameSize != cfg.ResumeCostBytes {
+		t.Fatalf("same-size cached resume cost = %d, want %d", sameSize, cfg.ResumeCostBytes)
+	}
+}
+
+func TestReclaimCachedCapacitySkipsIneligibleGuest(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "running-cache", SessionID: "running-cache-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-running-cache", CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{startupGuest: &startupGuest{
+		status: "Running",
+		config: map[string]any{
+			"config": map[string]any{
+				"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "running-cache",
+				"user.agent-vm.session": "running-cache-session", "user.agent-vm.generation": "1",
+			},
+			"devices": map[string]any{}, "expanded_devices": map[string]any{},
+		},
+	}, capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 10 * gib}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	service.admissionMu.Lock()
+	reclaimed, reclaimErr := service.reclaimCachedCapacity(context.Background(), 1, "", 0)
+	service.admissionMu.Unlock()
+	if reclaimErr != nil {
+		t.Fatal(reclaimErr)
+	}
+	if reclaimed || guest.deleteCalls != 0 {
+		t.Fatalf("ineligible cache reclaimed=%v delete_calls=%d", reclaimed, guest.deleteCalls)
+	}
+}
+
+func TestReclaimCachedCapacityUsesOldestCacheFirst(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	oldest := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	newer := oldest.Add(time.Hour)
+	for _, task := range []state.Task{
+		{TaskID: "z-old-cache", SessionID: "z-old-session", Generation: 1, State: stateCached, InstanceName: "agent-z-old-cache", CreatedAt: nowString(oldest), UpdatedAt: nowString(oldest), InactiveSince: stringPointer(nowString(oldest)), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`},
+		{TaskID: "a-new-cache", SessionID: "a-new-session", Generation: 1, State: stateCached, InstanceName: "agent-a-new-cache", CreatedAt: nowString(newer), UpdatedAt: nowString(newer), InactiveSince: stringPointer(nowString(newer)), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`},
+	} {
+		if err := store.InsertTask(context.Background(), task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	guest := &capacityGuest{startupGuest: &startupGuest{
+		status: "Stopped",
+		config: map[string]any{
+			"config": map[string]any{
+				"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "z-old-cache",
+				"user.agent-vm.session": "z-old-session", "user.agent-vm.generation": "1",
+			},
+			"devices": map[string]any{}, "expanded_devices": map[string]any{},
+		},
+	}, capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 10 * gib}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	guest.capacityFunc = func() native.StorageCapacity {
+		if guest.deleteCalls > 0 {
+			return native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 60 * gib}
+		}
+		return guest.capacity
+	}
+	service.admissionMu.Lock()
+	reclaimed, reclaimErr := service.reclaimCachedCapacity(context.Background(), 1, "", 0)
+	service.admissionMu.Unlock()
+	if reclaimErr != nil || !reclaimed {
+		t.Fatalf("oldest cache reclaim = %v, err=%v", reclaimed, reclaimErr)
+	}
+	if task, err := store.GetTask(context.Background(), map[string]any{"task_id": "z-old-cache"}); err != nil || task != nil {
+		t.Fatalf("oldest cache task = %#v err=%v", task, err)
+	}
+	if task, err := store.GetTask(context.Background(), map[string]any{"task_id": "a-new-cache"}); err != nil || task == nil {
+		t.Fatalf("newer cache task = %#v err=%v", task, err)
+	}
+}
+
+func TestReclaimCachedCapacityJournalsSessionScopedCleanup(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	session := "reclaim-journal-session"
+	generation := int64(1)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "reclaim-journal-task", SessionID: session, Generation: generation, State: stateCached,
+		InstanceName: "agent-reclaim-journal", CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{startupGuest: &startupGuest{
+		status:    "Stopped",
+		deleteErr: errors.New("delete interrupted"),
+		config: map[string]any{
+			"config": map[string]any{
+				"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "reclaim-journal-task",
+				"user.agent-vm.session": session, "user.agent-vm.generation": "1",
+			},
+			"devices": map[string]any{}, "expanded_devices": map[string]any{},
+		},
+	}, capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 10 * gib}}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	service.admissionMu.Lock()
+	_, reclaimErr := service.reclaimCachedCapacity(context.Background(), 1, "", 0)
+	service.admissionMu.Unlock()
+	if reclaimErr == nil {
+		t.Fatal("reclaim unexpectedly succeeded")
+	}
+	pending, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].Action != "destroy" || pending[0].SessionID == nil || *pending[0].SessionID != session {
+		t.Fatalf("pending reclaim cleanup = %#v", pending)
+	}
+	request, ok := pending[0].Response["_request"].(map[string]any)
+	if !ok || request["session_id"] != session || request["operation_id"] != pending[0].OperationID {
+		t.Fatalf("reclaim cleanup request = %#v", pending[0].Response["_request"])
+	}
+	task, err := store.GetTask(context.Background(), map[string]any{"task_id": "reclaim-journal-task"})
+	if err != nil || task == nil || task.State != stateDeleting {
+		t.Fatalf("reclaim task = %#v err=%v", task, err)
+	}
+}
+
+func TestAdminMetricsDefaultAdmissionReflectsDrainAndStructuredUnknowns(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	service := New(store, cfg, Options{})
+	service.MarkReady()
+	if _, err := service.drain(ctx, true, protocol.Request{"session_id": "test-drain"}); err != nil {
+		t.Fatal(err)
+	}
+	metrics, err := service.adminMetrics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultAdmission := metrics["default_admission"].(map[string]any)
+	if defaultAdmission["ready"] != false {
+		t.Fatalf("default admission = %#v", defaultAdmission)
+	}
+	reasons := defaultAdmission["reasons"].([]any)
+	if len(reasons) == 0 || reasons[0].(map[string]any)["code"] != "draining" {
+		t.Fatalf("default admission reasons = %#v", reasons)
+	}
+	if metrics["admission_ready"] != false {
+		t.Fatalf("admission_ready = %#v", metrics["admission_ready"])
+	}
+	if warningCounts, ok := metrics["warning_counts"].(map[string]int64); !ok || len(warningCounts) != 0 {
+		t.Fatalf("transient warning counts = %#v", metrics["warning_counts"])
+	}
+	if warnings, ok := metrics["warnings"].([]any); !ok || len(warnings) == 0 {
+		t.Fatalf("transient warnings = %#v", metrics["warnings"])
+	}
+	if metrics["reclaim_required"] != nil {
+		t.Fatalf("unmeasured reclaim_required = %#v", metrics["reclaim_required"])
+	}
+	if _, ok := metrics["disk_admission"].(map[string]any); !ok {
+		t.Fatalf("disk_admission = %#v", metrics["disk_admission"])
+	}
+	if _, ok := metrics["ct_memory"].(map[string]any); !ok {
+		t.Fatalf("ct_memory = %#v", metrics["ct_memory"])
+	}
+	if _, ok := metrics["instances"].(map[string]any); !ok {
+		t.Fatalf("instances = %#v", metrics["instances"])
+	}
+	doctor, ok := metrics["doctor"].(map[string]any)
+	if !ok || doctor["ready"] != false {
+		t.Fatalf("doctor = %#v", metrics["doctor"])
+	}
+}
+
+func TestAdminMetricsPreservesPhysicalCapacityAndAdmissionCost(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024},
+	}
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	capacity, ok := metrics["capacity"].(map[string]any)
+	if !ok || capacity["verified"] != true || capacity["free_bytes"] != int64(90*1024*1024*1024) {
+		t.Fatalf("capacity = %#v", metrics["capacity"])
+	}
+	admission := metrics["default_admission"].(map[string]any)
+	if admission["request_cost_bytes"] != cfg.CreateCostBytes || admission["ready"] != false {
+		t.Fatalf("default admission = %#v", admission)
+	}
+	reasons := admission["reasons"].([]any)
+	if len(reasons) == 0 || reasons[0].(map[string]any)["code"] != "resource_unverified" {
+		t.Fatalf("default admission reasons = %#v", reasons)
+	}
+	disk, ok := metrics["disk_admission"].(map[string]any)
+	if !ok || disk["verified"] != true {
+		t.Fatalf("disk admission = %#v", metrics["disk_admission"])
+	}
+}
+
+func TestAdminMetricsPublishesVerifiedMemoryObservation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	current := int64(3 * 1024 * 1024 * 1024)
+	service := New(store, config.Defaults(), Options{
+		Memory: staticMemoryObserver{observation: observe.MemoryObservation{
+			LimitBytes: 4 * 1024 * 1024 * 1024, AvailableBytes: 512 * 1024 * 1024,
+			CurrentBytes: &current, ThresholdBytes: 1024 * 1024 * 1024,
+			OOMEvents: map[string]int64{"oom": 2},
+		}},
+	})
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	memory := metrics["ct_memory"].(map[string]any)
+	if memory["capacity_bytes"] != int64(4*1024*1024*1024) || memory["current_bytes"] != &current || memory["available_bytes"] != int64(512*1024*1024) {
+		t.Fatalf("ct memory = %#v", memory)
+	}
+	if memory["pressure"] != true || memory["oom_events"].(map[string]int64)["oom"] != 2 {
+		t.Fatalf("ct memory pressure = %#v", memory)
+	}
+}
+
+func TestAdminMetricsFailsAdmissionReadinessWhenResidentMemoryIsUnverified(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024},
+	}
+	service := New(store, config.Defaults(), Options{
+		Guest:    guest,
+		CPU:      staticCPUObserver{observation: observe.CPUObservation{Capacity: 8}},
+		Resident: true,
+	})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics["admission_ready"] != false || metrics["default_admission"].(map[string]any)["ready"] != false {
+		t.Fatalf("unverified resident memory readiness = %#v", metrics)
+	}
+	found := false
+	for _, raw := range metrics["default_admission"].(map[string]any)["reasons"].([]any) {
+		if reason, ok := raw.(map[string]any); ok && reason["code"] == "resource_unverified" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("unverified resident memory reasons = %#v", metrics["default_admission"])
+	}
+}
+
+func TestAdmissionFailsClosedWhenConfiguredMemoryObservationFails(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, config.Defaults(), Options{
+		Memory:   staticMemoryObserver{err: errors.New("memory probe unavailable")},
+		Resident: true,
+	})
+	err = service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)
+	control := protocol.AsError(err)
+	if control == nil || control.Code != "resource_unverified" {
+		t.Fatalf("memory observation admission error = %#v", err)
+	}
+}
+
+func TestAdminMetricsDefaultAdmissionMatchesPhysicalRejection(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.DiskLowBytes = 200 * gib
+	cfg.DiskTargetBytes = 300 * gib
+	cfg.CreateCostBytes = 4 * gib
+	guest := &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 1024 * gib, FreeBytes: 203 * gib}}
+	service := New(store, cfg, Options{Guest: guest, CPU: staticCPUObserver{observation: observe.CPUObservation{Capacity: 8}}, Resident: true})
+	service.MarkReady()
+	requested := map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}
+	if control := protocol.AsError(service.checkAdmission(context.Background(), requested, "", true)); control == nil || control.Code != "resource_insufficient" {
+		t.Fatalf("physical rejection = %#v", control)
+	}
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := metrics["default_admission"].(map[string]any)
+	if admission["ready"] != false {
+		t.Fatalf("physical default admission = %#v", admission)
+	}
+	reasons := admission["reasons"].([]any)
+	found := false
+	for _, raw := range reasons {
+		if reason, ok := raw.(map[string]any); ok && reason["code"] == "disk_reclaim_required" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("physical default admission reasons = %#v", reasons)
+	}
+}
+
+func TestAdmissionReclaimsCachedCapacityBeforeRejectingPhysicalSpace(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "reclaimable-cache", SessionID: "reclaimable-cache-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-reclaimable-cache", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{
+			status: "Stopped",
+			config: map[string]any{
+				"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "reclaimable-cache", "user.agent-vm.session": "reclaimable-cache-session", "user.agent-vm.generation": "1"},
+				"devices": map[string]any{}, "expanded_devices": map[string]any{},
+			},
+		},
+		capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 25 * gib},
+	}
+	cfg := config.Defaults()
+	cfg.DiskLowBytes = 20 * gib
+	cfg.DiskTargetBytes = 30 * gib
+	cfg.CreateCostBytes = 10 * gib
+	service := New(store, cfg, Options{Guest: guest, Clock: func() time.Time { return now }})
+	guest.capacityFunc = func() native.StorageCapacity {
+		if guest.deleteCalls > 0 {
+			return native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 60 * gib}
+		}
+		return guest.capacity
+	}
+	if err := service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true); err != nil {
+		t.Fatal(err)
+	}
+	if guest.deleteCalls != 1 {
+		t.Fatalf("cached delete calls = %d", guest.deleteCalls)
+	}
+	if task, err := store.GetTask(context.Background(), map[string]any{"task_id": "reclaimable-cache"}); err != nil || task != nil {
+		t.Fatalf("reclaimed task = %#v err=%v", task, err)
+	}
+}
+
+func TestReclaimCachedCapacityReachesTargetWatermark(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "target-cache", SessionID: "target-cache-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-target-cache", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{
+			status: "Stopped",
+			config: map[string]any{
+				"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "target-cache", "user.agent-vm.session": "target-cache-session", "user.agent-vm.generation": "1"},
+				"devices": map[string]any{}, "expanded_devices": map[string]any{},
+			},
+		},
+		capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 10 * gib},
+	}
+	cfg := config.Defaults()
+	cfg.DiskLowBytes = 20 * gib
+	cfg.DiskTargetBytes = 30 * gib
+	guest.capacityFunc = func() native.StorageCapacity {
+		if guest.deleteCalls > 0 {
+			return native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 25 * gib}
+		}
+		return guest.capacity
+	}
+	service := New(store, cfg, Options{Guest: guest, Clock: func() time.Time { return now }})
+	service.admissionMu.Lock()
+	reclaimed, reclaimErr := service.reclaimCachedCapacity(context.Background(), 1, "", 0)
+	service.admissionMu.Unlock()
+	if reclaimErr != nil {
+		t.Fatal(reclaimErr)
+	}
+	if !reclaimed {
+		t.Fatalf("reclaim did not report low-watermark admission after candidate exhaustion")
+	}
+	if guest.deleteCalls != 1 {
+		t.Fatalf("cached delete calls = %d", guest.deleteCalls)
+	}
+	if guest.capacityCalls < 2 {
+		t.Fatalf("reclaim stopped before checking the target watermark: capacity calls = %d", guest.capacityCalls)
+	}
+}
+
+func TestReclaimCachedCapacitySkipsBusySession(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "busy-cache", SessionID: "busy-cache-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-busy-cache", CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	unlockSession, locked := service.trySessionLock("busy-cache-session")
+	if !locked {
+		t.Fatal("failed to acquire busy session lock")
+	}
+	defer unlockSession()
+
+	service.admissionMu.Lock()
+	reclaimed, reclaimErr := service.reclaimCachedCapacity(context.Background(), 1, "", 0)
+	service.admissionMu.Unlock()
+	if reclaimErr != nil {
+		t.Fatal(reclaimErr)
+	}
+	if reclaimed {
+		t.Fatal("busy cached session was reclaimed")
+	}
+}
+
+func TestAdmissionDoesNotReclaimCachedCapacityWhenStartupPressureRejects(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	const gib = int64(1024 * 1024 * 1024)
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "pressure-cache", SessionID: "pressure-cache-session", Generation: 1, State: stateCached,
+		InstanceName: "agent-pressure-cache", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{
+			status: "Stopped",
+			config: map[string]any{
+				"config": map[string]any{
+					"user.agent-vm.managed":    "native-v1",
+					"user.agent-vm.task":       "pressure-cache",
+					"user.agent-vm.session":    "pressure-cache-session",
+					"user.agent-vm.generation": "1",
+				},
+				"devices": map[string]any{}, "expanded_devices": map[string]any{},
+			},
+		},
+		capacity: native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 25 * gib},
+	}
+	guest.capacityFunc = func() native.StorageCapacity {
+		if guest.deleteCalls > 0 {
+			return native.StorageCapacity{TotalBytes: 100 * gib, FreeBytes: 60 * gib}
+		}
+		return guest.capacity
+	}
+	cfg := config.Defaults()
+	cfg.DiskLowBytes = 20 * gib
+	cfg.DiskTargetBytes = 30 * gib
+	cfg.CreateCostBytes = 10 * gib
+	cfg.CPUStartupPressureFullAvg10Percent = 20
+	service := New(store, cfg, Options{
+		Guest: guest,
+		CPU:   staticCPUObserver{observation: observe.CPUObservation{Capacity: 1, Full: observe.PSIValues{Avg10: 50}}},
+		Clock: func() time.Time { return now },
+	})
+	control := protocol.AsError(service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true))
+	if control == nil || control.Code != "resource_pressure" {
+		t.Fatalf("startup pressure rejection = %#v", control)
+	}
+	if guest.deleteCalls != 0 {
+		t.Fatalf("cached delete calls = %d", guest.deleteCalls)
+	}
+	if task, err := store.GetTask(context.Background(), map[string]any{"task_id": "pressure-cache"}); err != nil || task == nil {
+		t.Fatalf("pressure cache task = %#v err=%v", task, err)
+	}
+}
+
+func TestInconsistentAdminMetricsCannotReportReady(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	calls := 0
+	guest := &capacityGuest{
+		startupGuest: &startupGuest{},
+		capacity:     native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024},
+		probeHook: func() {
+			calls++
+			if err := store.SetMeta(context.Background(), "probe_epoch", fmt.Sprintf("%d", calls)); err != nil {
+				t.Fatalf("probe epoch = %v", err)
+			}
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls == 0 {
+		t.Fatal("native probe hook was not called")
+	}
+	if metrics["observation_consistent"] != false {
+		t.Fatalf("observation consistency = %#v", metrics["observation_consistent"])
+	}
+	if metrics["admission_ready"] != false {
+		t.Fatalf("admission ready = %#v", metrics["admission_ready"])
+	}
+	defaultAdmission := metrics["default_admission"].(map[string]any)
+	if defaultAdmission["ready"] != false {
+		t.Fatalf("default admission = %#v", defaultAdmission)
+	}
+	doctor := metrics["doctor"].(map[string]any)
+	if doctor["ready"] != false {
+		t.Fatalf("doctor = %#v", doctor)
+	}
+}
+
+func TestFailedSnapshotRefreshInvalidatesPreviousSource(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	snapshots := observe.NewSnapshotStore(filepath.Join(t.TempDir(), "metrics"))
+	service := New(store, config.Defaults(), Options{Snapshots: snapshots})
+	if err := snapshots.Publish("capacity", map[string]any{"up": true, "resources": map[string]any{"allocated": map[string]any{"cpu": int64(2)}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.publishSnapshotFailure("admin-metrics", protocol.NewError("resource_unverified", "capacity unavailable", nil)); err != nil {
+		t.Fatal(err)
+	}
+	capacity, err := snapshots.Read("capacity")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(capacity), `"up":false`) {
+		t.Fatalf("failed capacity snapshot = %s", capacity)
+	}
+	capacityMetrics, err := os.ReadFile(filepath.Join(snapshots.Directory, "capacity.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(capacityMetrics), "agent_vm_capacity_up 0") || strings.Contains(string(capacityMetrics), "agent_vm_admission_cpu_allocated_vcpu") {
+		t.Fatalf("failed capacity metrics = %s", capacityMetrics)
+	}
+	if err := snapshots.Publish("inventory", map[string]any{"up": true, "tasks": []any{map[string]any{"task_id": "stale"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.publishSnapshotFailure("admin-status", protocol.NewError("sqlite_unavailable", "inventory unavailable", nil)); err != nil {
+		t.Fatal(err)
+	}
+	inventory, err := snapshots.Read("inventory")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(inventory), `"tasks"`) || strings.Contains(string(inventory), `"task_states"`) {
+		t.Fatalf("failed inventory snapshot retained unverifiable rows = %s", inventory)
+	}
+	inventoryMetrics, err := os.ReadFile(filepath.Join(snapshots.Directory, "inventory.prom"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(inventoryMetrics), "agent_vm_inventory_up 0") || strings.Contains(string(inventoryMetrics), "task_info") {
+		t.Fatalf("failed inventory metrics = %s", inventoryMetrics)
+	}
+}
+
+func TestAdminMetricsMatchesAdmissionForUnknownState(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.InstanceLimit = 0
+	task := state.Task{TaskID: "unknown-state-task", SessionID: "unknown-state-session", State: "mystery", ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, cfg, Options{Guest: &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024}}, CPU: staticCPUObserver{observation: observe.CPUObservation{Capacity: 8}}})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := metrics["default_admission"].(map[string]any)
+	if admission["ready"] != false {
+		t.Fatalf("unknown state default admission = %#v", admission)
+	}
+	if _, ok := metrics["instances"].(map[string]any)["verified"].(bool); !ok || metrics["instances"].(map[string]any)["verified"] != false {
+		t.Fatalf("unknown state instance verification = %#v", metrics["instances"])
+	}
+	instances := metrics["instances"].(map[string]any)["admission"].(map[string]any)
+	for _, key := range []string{"allocated", "reserved", "allocated_and_reserved", "remaining"} {
+		if instances[key] != nil {
+			t.Fatalf("unknown state instance %s = %#v", key, instances[key])
+		}
+	}
+	resources := metrics["resources"].(map[string]any)
+	for _, key := range []string{"allocated", "reserved", "allocated_and_reserved"} {
+		value, ok := resources[key].(map[string]int64)
+		if !ok || value != nil {
+			t.Fatalf("unknown state resource %s = %#v", key, resources[key])
+		}
+	}
+	if remaining, ok := resources["remaining"].(map[string]any); !ok || len(remaining) != 0 {
+		t.Fatalf("unknown state resource remaining = %#v", resources["remaining"])
+	}
+	startupPressure := metrics["ct_cpu"].(map[string]any)["startup_pressure"].(map[string]any)
+	if startupPressure["verified"] != false || startupPressure["startup_blocked"] != nil {
+		t.Fatalf("unknown state startup pressure = %#v", startupPressure)
+	}
+	if control := protocol.AsError(service.checkAdmission(context.Background(), map[string]int64{"cpu": 2, "memory_mib": 4096, "disk_gib": 20}, "", true)); control == nil || control.Code != "resource_unverified" {
+		t.Fatalf("unknown state admission error = %#v", control)
+	}
+}
+
+func TestAdminMetricsDoesNotDoubleCountResizeReservation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.CPUBudget = 6
+	cfg.CPUOvercommitRatio = json.Number("1")
+	cfg.MemoryBudgetMiB = 12288
+	cfg.MemoryOvercommitRatio = json.Number("1")
+	cfg.DiskBudgetGiB = 50
+	task := state.Task{TaskID: "resize-metrics-task", SessionID: "resize-metrics-session", State: stateActive, ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{"cpu":4,"memory_mib":8192,"disk_gib":30}`}
+	if err := store.InsertTask(context.Background(), task); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, cfg, Options{Guest: &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024}}})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := metrics["default_admission"].(map[string]any)
+	if admission["ready"] != true {
+		t.Fatalf("resize default admission = %#v", admission)
+	}
+	resources := metrics["resources"].(map[string]any)["allocated_and_reserved"].(map[string]int64)
+	if resources["cpu"] != 4 || resources["memory_mib"] != 8192 || resources["disk_gib"] != 30 {
+		t.Fatalf("resize allocated_and_reserved = %#v", resources)
+	}
+}
+
+func TestAdminMetricsSumsSeparateAllocatedAndReservedTasks(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	cfg.CPUBudget = 6
+	cfg.CPUOvercommitRatio = json.Number("1")
+	cfg.MemoryBudgetMiB = 12288
+	cfg.MemoryOvercommitRatio = json.Number("1")
+	cfg.DiskBudgetGiB = 50
+	active := state.Task{TaskID: "allocated-task", SessionID: "allocated-session", State: stateActive, InstanceName: "allocated-instance", ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`}
+	preparing := state.Task{TaskID: "reserved-task", SessionID: "reserved-session", State: statePreparing, InstanceName: "reserved-instance", ResourcesJSON: `{"cpu":3,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`}
+	for _, task := range []state.Task{active, preparing} {
+		if err := store.InsertTask(context.Background(), task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(store, cfg, Options{})
+	service.MarkReady()
+	metrics, err := service.adminMetrics(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	resources := metrics["resources"].(map[string]any)["allocated_and_reserved"].(map[string]int64)
+	if resources["cpu"] != 5 || resources["memory_mib"] != 8192 || resources["disk_gib"] != 40 {
+		t.Fatalf("separate task allocated_and_reserved = %#v", resources)
+	}
+	if metrics["default_admission"].(map[string]any)["ready"] != false {
+		t.Fatalf("separate task default admission = %#v", metrics["default_admission"])
+	}
+}
+
+func TestStatusReportsCachedNativeStateAndGuestAvailability(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session := "cached-status"
+	task := state.Task{
+		TaskID: "cached-status-task", SessionID: session, Generation: 2, State: stateCached,
+		InstanceName: "cached-status-instance", CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()),
+		ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: "{}",
+	}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	guest := &perInstanceGuest{
+		startupGuest: startupGuest{status: "Stopped"},
+		configs: map[string]map[string]any{
+			task.InstanceName: {
+				"config": map[string]any{
+					"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID,
+					"user.agent-vm.session": task.SessionID, "user.agent-vm.generation": "2",
+				}, "devices": map[string]any{}, "expanded_devices": map[string]any{},
+			},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	result, err := service.status(ctx, session)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["native_status"] != "Stopped" || result["guest_available"] != false {
+		t.Fatalf("cached status = %#v", result)
+	}
+	admin, err := service.adminStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items := admin["tasks"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["native_status"] != "Stopped" {
+		t.Fatalf("admin status = %#v", admin)
+	}
+}
+
+func TestStatusKeepsGuestAvailabilityUnknownWhenNativeStatusIsUnverified(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	task := state.Task{TaskID: "unverified-status-task", SessionID: "unverified-status-session", Generation: 1, State: stateCached, InstanceName: "unverified-status-instance", ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	guest := &perInstanceGuest{
+		startupGuest: startupGuest{statusErr: errors.New("status transport failed")},
+		configs:      map[string]map[string]any{task.InstanceName: {"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": task.SessionID, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	result, err := service.status(ctx, task.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result["native_status"] != "unverified" || result["guest_available"] != nil {
+		t.Fatalf("unverified status = %#v", result)
+	}
+	if result["resources"] != nil || result["resource_reservation"] != nil {
+		t.Fatalf("unverified durable resources were fabricated = %#v", result)
+	}
+	resourceState, ok := result["resource_state"].(map[string]any)
+	if !ok || resourceState["verified"] != false {
+		t.Fatalf("unverified durable resource state = %#v", result)
+	}
+	admin, err := service.adminStatus(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adminTask := admin["tasks"].([]any)[0].(map[string]any)
+	if adminTask["resources"] != nil || adminTask["resource_reservation"] != nil || adminTask["resource_state"] == nil {
+		t.Fatalf("admin status fabricated durable resources = %#v", adminTask)
 	}
 }
 
@@ -1956,6 +3637,35 @@ func TestAcquireInitUncertainResultCanReconcileOwnedInstance(t *testing.T) {
 	}
 	if task == nil || task.State != stateCached || task.ResourceReservationJSON != "{}" {
 		t.Fatalf("reconciled task = %#v", task)
+	}
+}
+
+func TestLifecycleImageUnpackFailureIsCountedForUnknownOutcome(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "lifecycle-image-unpack-audit.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.VMIPStart = "10.0.0.10"
+	cfg.VMIPEnd = "10.0.0.20"
+	guest := &startupGuest{initErr: &native.CommandError{
+		Cause:  errors.New("exit status 1"),
+		Result: native.Result{Code: 1, Stderr: []byte("Error: failed to unpack image rootfs")},
+	}}
+	service := New(store, cfg, Options{Guest: guest})
+	_, err = service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "acquire", "session_id": "unpack-audit", "generation": int64(0), "operation_id": "unpack-audit-acquire",
+	})
+	if protocol.AsError(err).Code != "native_failed" {
+		t.Fatalf("lifecycle image unpack error = %#v", err)
+	}
+	summary, err := store.AuditSummary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ImageUnpackFailures["native-init|image_unpack_failed"] != 1 {
+		t.Fatalf("lifecycle image unpack summary = %#v", summary.ImageUnpackFailures)
 	}
 }
 

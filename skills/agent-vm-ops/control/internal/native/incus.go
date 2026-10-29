@@ -17,6 +17,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 var missingImageDiagnostic = regexp.MustCompile(`\bimage(?:\s+(?:"[^"]+"|'[^']+'|[A-Za-z0-9_.:@/-]+))?\s+(?:not found|does not exist)\b`)
@@ -40,6 +42,21 @@ type Guest interface {
 // fixture Guest implementations without weakening the real Incus client.
 type HealthProbe interface {
 	Probe(context.Context) error
+}
+
+// StorageCapacity is the verified capacity of the configured Incus pool's
+// backing filesystem. It is intentionally separate from the pool resource
+// endpoint used by image staging, because session admission needs the
+// configured pool source and filesystem watermarks.
+type StorageCapacity struct {
+	TotalBytes int64
+	FreeBytes  int64
+}
+
+// StoragePoolProbe exposes the physical storage observation needed by
+// lifecycle admission without making every Guest test double implement it.
+type StoragePoolProbe interface {
+	StoragePoolCapacity(context.Context) (StorageCapacity, error)
 }
 
 // NetworkInventory exposes addresses already claimed by Incus so lifecycle
@@ -80,17 +97,19 @@ func (err *UncertainError) Unwrap() error   { return err.Cause }
 func (err *UncertainError) Uncertain() bool { return true }
 
 type IncusClient struct {
-	Runner  *Runner
-	Project string
-	Profile string
-	Network string
-	Pool    string
+	Runner      *Runner
+	Project     string
+	Profile     string
+	Network     string
+	Pool        string
+	StoragePath string
 }
 
 type ClientOptions struct {
-	Profile string
-	Network string
-	Pool    string
+	Profile     string
+	Network     string
+	Pool        string
+	StoragePath string
 }
 
 // CommandError carries the bounded result of a failed Incus invocation. The
@@ -166,7 +185,7 @@ func NewIncusClient(runner *Runner, project string, options ...ClientOptions) *I
 	}
 	client := &IncusClient{Runner: runner, Project: project}
 	if len(options) > 0 {
-		client.Profile, client.Network, client.Pool = options[0].Profile, options[0].Network, options[0].Pool
+		client.Profile, client.Network, client.Pool, client.StoragePath = options[0].Profile, options[0].Network, options[0].Pool, options[0].StoragePath
 	}
 	return client
 }
@@ -186,25 +205,51 @@ func (c *IncusClient) run(ctx context.Context, args ...string) error {
 }
 
 func (c *IncusClient) json(ctx context.Context, args ...string) (map[string]any, error) {
-	var result Result
-	var err error
+	project := ""
+	if c != nil {
+		project = c.Project
+	}
 	if len(args) > 0 && args[0] == "query" {
 		if len(args) != 2 {
-			return nil, fmt.Errorf("invalid Incus query arguments")
+			return nil, errors.New("invalid Incus query arguments")
 		}
-		endpoint, parseErr := url.Parse(args[1])
-		if parseErr != nil {
-			return nil, fmt.Errorf("invalid Incus query path: %w", parseErr)
-		}
-		if c.Project != "" {
-			query := endpoint.Query()
-			query.Set("project", c.Project)
-			endpoint.RawQuery = query.Encode()
-		}
-		result, err = c.Runner.Run(ctx, []string{"incus", "query", endpoint.String()}, nil)
-	} else {
-		result, err = c.command(ctx, append(args, "--format", "json")...)
+		return c.jsonWithProject(ctx, args[1], project)
 	}
+	return c.jsonCommand(ctx, args...)
+}
+
+func (c *IncusClient) jsonWithProject(ctx context.Context, path, project string) (map[string]any, error) {
+	return c.jsonQuery(ctx, path, project)
+}
+
+func (c *IncusClient) jsonCommand(ctx context.Context, args ...string) (map[string]any, error) {
+	var result Result
+	var err error
+	result, err = c.command(ctx, append(args, "--format", "json")...)
+	if err != nil {
+		return nil, wrapCommandError(result, err)
+	}
+	if result.StdoutTruncated {
+		return nil, wrapCommandError(result, fmt.Errorf("incus output exceeded diagnostic limit"))
+	}
+	var value map[string]any
+	if err := json.Unmarshal(result.Stdout, &value); err != nil {
+		return nil, wrapCommandError(result, fmt.Errorf("invalid incus JSON: %w", err))
+	}
+	return value, nil
+}
+
+func (c *IncusClient) jsonQuery(ctx context.Context, path, project string) (map[string]any, error) {
+	endpoint, parseErr := url.Parse(path)
+	if parseErr != nil {
+		return nil, fmt.Errorf("invalid Incus query path: %w", parseErr)
+	}
+	if project != "" {
+		query := endpoint.Query()
+		query.Set("project", project)
+		endpoint.RawQuery = query.Encode()
+	}
+	result, err := c.Runner.Run(ctx, []string{"incus", "query", endpoint.String()}, nil)
 	if err != nil {
 		return nil, wrapCommandError(result, err)
 	}
@@ -319,6 +364,57 @@ func (c *IncusClient) StoragePoolAvailableBytes(ctx context.Context) (int64, err
 		}
 	}
 	return 0, errors.New("incus storage pool response has no available capacity")
+}
+
+// StoragePoolCapacity verifies the configured directory pool and measures its
+// backing filesystem. This is the physical admission source for new managed
+// containers; it must not be inferred from sparse rootfs allocation or the
+// image-upload resource endpoint.
+func (c *IncusClient) StoragePoolCapacity(ctx context.Context) (StorageCapacity, error) {
+	if c == nil || c.Pool == "" {
+		return StorageCapacity{}, errors.New("storage pool is not configured")
+	}
+	if c.StoragePath == "" {
+		return StorageCapacity{}, errors.New("storage pool source path is not configured")
+	}
+	value, err := c.jsonWithProject(ctx, "/1.0/storage-pools/"+url.PathEscape(c.Pool), "default")
+	if err != nil {
+		return StorageCapacity{}, err
+	}
+	if name, ok := value["name"].(string); !ok || name != c.Pool {
+		return StorageCapacity{}, errors.New("incus storage pool name differs from configuration")
+	}
+	if driver, ok := value["driver"].(string); !ok || driver != "dir" {
+		return StorageCapacity{}, errors.New("configured Incus pool is not a directory pool")
+	}
+	poolConfig, ok := value["config"].(map[string]any)
+	if !ok {
+		return StorageCapacity{}, errors.New("incus storage pool configuration is unavailable")
+	}
+	source, ok := poolConfig["source"].(string)
+	if !ok || filepath.Clean(source) != filepath.Clean(c.StoragePath) {
+		return StorageCapacity{}, errors.New("Incus storage pool source differs from configured storage path")
+	}
+	var stat unix.Statfs_t
+	if err := unix.Statfs(c.StoragePath, &stat); err != nil {
+		return StorageCapacity{}, err
+	}
+	if stat.Bsize <= 0 || stat.Blocks == 0 || stat.Bavail < 0 {
+		return StorageCapacity{}, errors.New("invalid storage pool filesystem capacity")
+	}
+	return storageCapacityFromBlocks(uint64(stat.Blocks), uint64(stat.Bavail), uint64(stat.Bsize))
+}
+
+func storageCapacityFromBlocks(blocks, availableBlocks, blockSize uint64) (StorageCapacity, error) {
+	maxInt64 := uint64(^uint64(0) >> 1)
+	if blocks == 0 || blockSize == 0 || availableBlocks > blocks || blocks > ^uint64(0)/blockSize || availableBlocks > ^uint64(0)/blockSize {
+		return StorageCapacity{}, errors.New("storage pool filesystem capacity exceeds supported range")
+	}
+	total, free := blocks*blockSize, availableBlocks*blockSize
+	if total == 0 || free > total || total > maxInt64 || free > maxInt64 {
+		return StorageCapacity{}, errors.New("storage pool filesystem capacity exceeds supported range")
+	}
+	return StorageCapacity{TotalBytes: int64(total), FreeBytes: int64(free)}, nil
 }
 
 func nestedMap(value map[string]any, key string) map[string]any {
