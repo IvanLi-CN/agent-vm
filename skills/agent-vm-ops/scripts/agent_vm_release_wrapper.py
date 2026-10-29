@@ -618,6 +618,18 @@ def _write_activation_fence(path: Path, transaction_id: str, release_id: str) ->
         if isinstance(failure, WrapperError):
             raise
         _fail("release_fence_unavailable", "release activation fence cannot be created")
+    except BaseException:
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if created:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        raise
     return True
 
 
@@ -657,7 +669,7 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
             previous_depth = _ACTIVATION_FENCE_DEPTH.get(key, 0)
             _ACTIVATION_FENCE_DEPTH[key] = previous_depth + 1
             entries.append((path, key, created, previous_depth == 0))
-    except WrapperError as failure:
+    except BaseException as failure:
         cleanup_errors: list[dict[str, Any]] = []
         for path, key, created, outermost in reversed(entries):
             if _ACTIVATION_FENCE_DEPTH.get(key, 0) <= 1:
@@ -671,10 +683,15 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
             except WrapperError as cleanup_error:
                 cleanup_errors.append(cleanup_error.as_dict())
         if cleanup_errors:
+            initial_error = (
+                failure.as_dict()
+                if isinstance(failure, WrapperError)
+                else {"code": "activation_interrupted", "message": type(failure).__name__}
+            )
             raise WrapperError(
                 "release_fence_cleanup_failed",
                 "release activation fence initialization failed and could not be fully cleaned up",
-                {"initial_error": failure.as_dict(), "cleanup_errors": cleanup_errors},
+                {"initial_error": initial_error, "cleanup_errors": cleanup_errors},
             ) from failure
         raise
 

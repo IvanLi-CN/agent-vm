@@ -409,6 +409,32 @@ class WrapperTests(unittest.TestCase):
         self.assertFalse(primary.exists())
         self.assertFalse(persistent.exists())
 
+    def test_activation_fence_cleans_created_fences_when_initialization_is_interrupted(self):
+        primary = self.loaded["fence_path"]
+        persistent = primary.with_name("." + primary.name + ".persistent")
+        original = WRAPPER._write_activation_fence
+
+        def interrupt_persistent(path, transaction_id, release_id):
+            if path == persistent:
+                raise KeyboardInterrupt()
+            return original(path, transaction_id, release_id)
+
+        with mock.patch.object(WRAPPER, "_write_activation_fence", side_effect=interrupt_persistent):
+            with self.assertRaises(KeyboardInterrupt):
+                with WRAPPER._activation_fence(self.loaded, "tx-interrupted-init", "a" * 40):
+                    pass
+        self.assertFalse(primary.exists())
+        self.assertFalse(persistent.exists())
+
+    def test_activation_fence_cleans_a_partially_written_fence_on_interrupt(self):
+        primary = self.loaded["fence_path"]
+        persistent = primary.with_name("." + primary.name + ".persistent")
+        with mock.patch.object(WRAPPER, "_fsync_directory", side_effect=KeyboardInterrupt()):
+            with self.assertRaises(KeyboardInterrupt):
+                WRAPPER._write_activation_fence(primary, "tx-interrupted-write", "a" * 40)
+        self.assertFalse(primary.exists())
+        self.assertFalse(persistent.exists())
+
     def test_activation_fence_retry_preserves_the_existing_transaction_fence(self):
         primary = self.loaded["fence_path"]
         persistent = primary.with_name("." + primary.name + ".persistent")
