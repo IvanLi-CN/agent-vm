@@ -1,6 +1,6 @@
 import { closeSync, fchmodSync, fsyncSync, lstatSync, openSync, readFileSync, writeFileSync, constants as C } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isIPv4 } from "node:net";
 import { randomUUID } from "node:crypto";
 import { Data, fail, record, integer, json, parseJson, equal, sha256, readJson, durable, fsyncDir, privateDir, Runner, runBounded, shellJoin, inherited } from "./client-io.ts";
@@ -9,6 +9,72 @@ import { nativeCapabilities } from "./sync-native.ts";
 
 export const STDOUT_LIMIT = 2 * 1024 * 1024, STDERR_LIMIT = 64 * 1024;
 export const timeoutSeconds = (action: string, fields: Data = {}): number => ["acquire", "restart"].includes(action) || action === "resize" && fields.allow_restart === true ? 600 : 240;
+export const AGENT_API_PATH = "/agent/v1/control";
+
+export interface HttpsRequestInit extends RequestInit {
+  tls?: { ca?: string; rejectUnauthorized: true };
+}
+export type HttpRequester = (url: string, init: HttpsRequestInit) => Promise<Response>;
+export interface HttpsConfig {
+  url: string;
+  token: string;
+  tls: { ca?: string; rejectUnauthorized: true };
+}
+const defaultHttp: HttpRequester = (url, init) => fetch(url, init as RequestInit);
+class ResponseLimitExceeded extends Error {}
+
+export function httpsEndpoint(value = process.env.AGENT_VM_CONTROL_HOST): string {
+  if (!value) fail("config_missing", "AGENT_VM_CONTROL_HOST is required for the HTTPS control transport");
+  const raw = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) ? value : `https://${value}`;
+  let url: URL;
+  try { url = new URL(raw); } catch { fail("config_invalid", "AGENT_VM_CONTROL_HOST is not a valid control endpoint"); }
+  if (url.protocol !== "https:") fail("config_invalid", "HTTPS control transport requires an https endpoint");
+  if (!url.hostname || url.username || url.password || url.search || url.hash || url.pathname !== "/" && url.pathname !== AGENT_API_PATH)
+    fail("config_invalid", "control endpoint must identify the fixed HTTPS Agent API without credentials or query data");
+  url.pathname = AGENT_API_PATH;
+  return url.toString();
+}
+
+function privateConfigFile(path: string, label: string): string {
+  if (!isAbsolute(path) || path.split("/").some(part => part === "." || part === "..") || path.includes("\0"))
+    fail("config_invalid", `${label} must be an absolute canonical file path`);
+  let stat;
+  try { stat = lstatSync(path); } catch { fail("config_invalid", `${label} cannot be read`); }
+  if (!stat.isFile() || stat.isSymbolicLink()) fail("config_invalid", `${label} must be a regular file`);
+  let content: string;
+  try { content = readFileSync(path, "utf8"); } catch { fail("config_invalid", `${label} cannot be read`); }
+  if (!content.trim() || /\0/.test(content)) fail("config_invalid", `${label} is empty or invalid`);
+  return content;
+}
+
+export function httpsConfig(env = process.env): HttpsConfig {
+  const token = env.AGENT_VM_TOKEN ?? env.AGENT_VM_AGENT_TOKEN ?? env.AGENT_VM_CONTROL_TOKEN;
+  if (token === undefined) fail("config_missing", "an Agent API bearer token is required for the HTTPS control transport");
+  if (!token || token.trim() !== token || /[\r\n\0]/.test(token)) fail("config_invalid", "the Agent API bearer token is invalid");
+  const caPath = env.AGENT_VM_CONTROL_CA ?? env.AGENT_VM_CA_FILE;
+  const ca = caPath === undefined ? undefined : privateConfigFile(caPath, "AGENT_VM_CONTROL_CA");
+  return { url: httpsEndpoint(env.AGENT_VM_CONTROL_HOST), token, tls: { ...(ca === undefined ? {} : { ca }), rejectUnauthorized: true } };
+}
+
+async function readResponseBody(response: Response, limit: number): Promise<Buffer> {
+  if (!response.body) return Buffer.alloc(0);
+  const reader = response.body.getReader(), chunks: Buffer[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const item = await reader.read();
+      if (item.done) return Buffer.concat(chunks);
+      const chunk = Buffer.from(item.value);
+      size += chunk.length;
+      if (size > limit) {
+        try { await reader.cancel(); } catch { /* response is already bounded as failed */ }
+        throw new ResponseLimitExceeded();
+      }
+      chunks.push(chunk);
+    }
+  } finally { try { reader.releaseLock(); } catch { /* reader is already closed */ } }
+}
+
 export function sessionId(explicit?: string, required = true, env = process.env): string | null {
   const value = explicit ?? env.AGENT_VM_SESSION_ID;
   if (value === undefined && !required) return null;
@@ -38,7 +104,8 @@ export function remoteError(raw: Buffer, request: Data): Data | null {
 export interface RequestOptions { session: string | null; generation?: number | bigint; write?: boolean; operationId?: string; fields?: Data; }
 export class Client {
   stateRoot: string; configRoot: string; sidecar: string;
-  constructor(public env: Record<string, string | undefined> = process.env, public run: Runner = runBounded, public diagnostics: (bytes: Buffer) => void = b => { process.stderr.write(b); }) {
+  httpsTimeoutMs?: number;
+  constructor(public env: Record<string, string | undefined> = process.env, public run: Runner = runBounded, public diagnostics: (bytes: Buffer) => void = b => { process.stderr.write(b); }, public http: HttpRequester = defaultHttp) {
     this.stateRoot = join(env.XDG_STATE_HOME ?? join(homedir(), ".local/state"), "agent-vm");
     this.configRoot = join(env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "agent-vm");
     this.sidecar = env.AGENT_VM_RELEASE_MANIFEST || join(import.meta.dir, "client-release.json");
@@ -144,12 +211,42 @@ export class Client {
     try { durable(path, json({ request, ...result }) + "\n"); }
     catch { fail("local_journal_update_failed", "remote operation outcome is known but the local operation journal could not be finalized", { operation_id: request.operation_id }); }
   }
+  private async httpsRequest(request: Data, timeout: number, config: HttpsConfig): Promise<{ code: number; stdout: Buffer; stderr: Buffer; stdoutTruncated: boolean; stderrTruncated: boolean; timedOut: boolean; streamCleanupVerified: boolean }> {
+    const controller = new AbortController();
+    const timeoutMs = this.httpsTimeoutMs ?? timeout * 1000;
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
+    let response: Response | undefined;
+    const detail = { operation_id: request.operation_id ?? null, generation: request.generation ?? null, transport: "https", timeout_ms: timeoutMs };
+    try {
+      response = await this.http(config.url, {
+        method: "POST",
+        headers: { Accept: "application/json", Authorization: `Bearer ${config.token}`, "Content-Type": "application/json" },
+        body: json(request),
+        redirect: "error",
+        signal: controller.signal,
+        tls: config.tls,
+      });
+      let stdout: Buffer;
+      try { stdout = await readResponseBody(response, STDOUT_LIMIT); }
+      catch (error) {
+        if (error instanceof ResponseLimitExceeded) return { code: response.status, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), stdoutTruncated: true, stderrTruncated: false, timedOut: false, streamCleanupVerified: true };
+        throw error;
+      }
+      return { code: response.status >= 200 && response.status < 300 ? 0 : response.status, stdout, stderr: Buffer.alloc(0), stdoutTruncated: false, stderrTruncated: false, timedOut: false, streamCleanupVerified: true };
+    } catch (error) {
+      if (timedOut) fail("remote_timeout", "control outcome is uncertain; retry the same operation ID", detail);
+      const message = error instanceof Error ? error.message.toLowerCase() : "";
+      fail("remote_failed", "HTTPS control request failed; control outcome is not verified", { ...detail, ...(message.includes("certificate") || message.includes("tls") || message.includes("self signed") ? { tls_verification_failed: true } : {}) });
+    } finally { clearTimeout(timer); }
+  }
   async request(action: string, options: RequestOptions): Promise<Data> {
     const { session, generation, write = false, operationId, fields = {} } = options;
     if (write && session === null) fail("missing_session", "AGENT_VM_SESSION_ID is required");
     let request: Data = { protocol: PROTOCOL, action, ...(session === null ? {} : { session_id: session }), ...(generation === undefined ? {} : { generation }), ...(write ? { operation_id: operationId || randomUUID() } : {}), ...fields };
     const [metadata, warnings] = loadRelease(this.sidecar);
     request.compatibility = capability(action, metadata);
+    const https = metadata.transport === "https" ? httpsConfig(this.env) : undefined;
     let op: string | undefined;
     if (write) {
       op = this.operationPath(session!, request.operation_id); privateDir(dirname(op));
@@ -166,7 +263,9 @@ export class Client {
     const remoteCommand = transport === "go-request"
       ? shellJoin([this.env.AGENT_VM_REMOTE_REQUEST ?? "/opt/agent-vm-native/bin/agent-vm-control", "request", "--socket", this.env.AGENT_VM_REMOTE_SOCKET ?? "/run/agent-vm-native/control.sock", "--timeout", `${timeout}s`])
       : shellJoin(["bun", this.env.AGENT_VM_REMOTE_CONTROL ?? "/opt/agent-vm-native/agent_vm_control.ts"]);
-    const result = await this.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", this.env.AGENT_VM_CONTROL_HOST ?? "agent-vm-host", remoteCommand], { input: json(request), timeoutMs: timeout * 1000, stdoutLimit: STDOUT_LIMIT, stderrLimit: STDERR_LIMIT, env: this.env });
+    const result = transport === "https"
+      ? await this.httpsRequest(request, timeout, https!)
+      : await this.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", this.env.AGENT_VM_CONTROL_HOST ?? "agent-vm-host", remoteCommand], { input: json(request), timeoutMs: timeout * 1000, stdoutLimit: STDOUT_LIMIT, stderrLimit: STDERR_LIMIT, env: this.env });
     const detail = { operation_id: request.operation_id ?? null, stream_cleanup_verified: result.streamCleanupVerified, ...(!result.streamCleanupVerified ? { stream_cleanup_error: "reader_cancelled_before_eof" } : {}) };
     if (result.timedOut) fail("remote_timeout", "control outcome is uncertain; retry the same operation ID", detail);
     if (result.stderr.length) this.diagnostics(result.stderr);

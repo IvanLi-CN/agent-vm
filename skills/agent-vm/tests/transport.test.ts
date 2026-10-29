@@ -2,12 +2,89 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Client, STDERR_LIMIT, STDOUT_LIMIT, timeoutSeconds } from "../scripts/client.ts";
-import { json, parseJson, runBounded } from "../scripts/client-io.ts";
+import { json, parseJson, readJson, runBounded, sha256 } from "../scripts/client-io.ts";
+import { ACTIONS, CLIENT_DEPENDENCIES } from "../scripts/client-release.ts";
 import { Fixture, response, result } from "./support.ts";
 
 let fixtures: Fixture[] = [];
 const fixture = () => { const f = new Fixture(); fixtures.push(f); return f; };
 afterEach(() => { fixtures.forEach(f => f.close()); fixtures = []; });
+
+function httpsSidecar(f: Fixture): void {
+  const revision = "c".repeat(40), schema = { schema: 1, semantic_revision: 1 }, window = { schema_min: 1, schema_max: 1, semantic_min: 1, semantic_max: 1 };
+  const client = readFileSync(new URL("../scripts/agent_vm.ts", import.meta.url));
+  writeFileSync(join(f.root, "agent_vm.ts"), client, { mode: 0o755 });
+  const dependencies = CLIENT_DEPENDENCIES.map(([name, mode]) => {
+    const bytes = readFileSync(new URL(`../scripts/${name}`, import.meta.url));
+    writeFileSync(join(f.root, name), bytes, { mode });
+    return { name, path: name, role: "support", mode, sha256: sha256(bytes) };
+  });
+  const sidecar = {
+    format: 2, release_id: revision, source_revision: revision, protocol: 4,
+    client_artifact: { name: "agent_vm.ts", path: "agent_vm.ts", role: "client", mode: 0o755, sha256: sha256(client) },
+    client_dependencies: dependencies,
+    client_view: { release_id: revision, source_revision: revision, protocol: 4, transport: "https", actions: Object.fromEntries(ACTIONS.map(action => [action, { request: schema, response: schema, client_to_control: window, control_to_client: window }])) },
+  };
+  const path = join(f.root, "client-release.json");
+  writeFileSync(path, json(sidecar), { mode: 0o600 });
+  f.client.sidecar = path;
+}
+
+test("direct HTTPS sends protocol-4 JSON to the fixed Agent API with a bearer credential and TLS verification", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example/";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  const seen: { url?: string; init?: any } = {};
+  f.client.http = async (url, init) => {
+    seen.url = url; seen.init = init;
+    return new Response(json(response(parseJson(String(init.body)))), { status: 200, headers: { "content-type": "application/json" } });
+  };
+  await f.client.request("renew", { session: "https-session", generation: 7, operationId: "https-operation", write: true });
+  expect(seen.url).toBe("https://control.example/agent/v1/control");
+  expect(seen.init.method).toBe("POST");
+  expect(seen.init.headers).toEqual({ Accept: "application/json", Authorization: "Bearer opaque-agent-token", "Content-Type": "application/json" });
+  expect(seen.init.tls).toEqual({ rejectUnauthorized: true });
+  expect(parseJson(String(seen.init.body))).toMatchObject({ protocol: 4, action: "renew", session_id: "https-session", generation: 7, operation_id: "https-operation" });
+  expect(JSON.stringify(readJson(f.client.operationPath("https-session", "https-operation")))).not.toContain("opaque-agent-token");
+  expect(f.commands).toEqual([]);
+});
+
+test("HTTPS CA configuration is private, certificate verification cannot be disabled, and missing credentials fail before a journal", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  const ca = join(f.root, "control-ca.pem"); writeFileSync(ca, "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+  f.client.env.AGENT_VM_CONTROL_CA = ca;
+  let tls: any;
+  f.client.http = async (_url, init) => { tls = init.tls; return new Response(json(response(parseJson(String(init.body)))), { status: 200 }); };
+  await f.client.request("status", { session: "https-session" });
+  expect(tls).toEqual({ ca: readFileSync(ca, "utf8"), rejectUnauthorized: true });
+
+  delete f.client.env.AGENT_VM_TOKEN;
+  await expect(f.client.request("status", { session: "missing-token" })).rejects.toMatchObject({ code: "config_missing" });
+  expect(f.commands).toEqual([]);
+});
+
+test("HTTPS timeout and connection failure retain the original operation journal for a safe retry", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  f.client.httpsTimeoutMs = 10;
+  f.client.http = async (_url, init) => await new Promise<Response>((_resolve, reject) => init.signal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+  await expect(f.client.request("renew", { session: "https-session", generation: 9007199254740993n, operationId: "https-operation", write: true })).rejects.toMatchObject({ code: "remote_timeout" });
+  const operation = f.client.operationPath("https-session", "https-operation");
+  expect(readJson(operation).outcome).toBe("pending");
+
+  const bodies: string[] = [];
+  f.client.http = async (_url, init) => {
+    bodies.push(String(init.body));
+    return new Response(json(response(parseJson(String(init.body)))), { status: 200 });
+  };
+  await f.client.request("renew", { session: "https-session", generation: 9007199254740993n, operationId: "https-operation", write: true });
+  expect(bodies).toHaveLength(1);
+  expect(parseJson(bodies[0])).toMatchObject({ operation_id: "https-operation", generation: 9007199254740993n });
+  expect(readJson(operation).outcome).toBe("success");
+});
 
 test("D transport regression: canonical controller directly with Bun, safe quoting and budgets", async () => {
   const f = fixture();
