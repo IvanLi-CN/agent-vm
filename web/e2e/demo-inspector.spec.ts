@@ -1,24 +1,46 @@
 import { expect, test } from "@playwright/test";
 
-test("embeds the inspector on wide screens and keeps a floating fallback", async ({ page }) => {
+test("supports left, right, floating and minimized inspector positions", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("?demo=normal");
 
   const runtime = page.locator(".demo-runtime");
   const shell = page.locator(".demo-inspector-shell");
-  await expect(runtime).toHaveClass(/demo-runtime--docked/);
+  await expect(runtime).toHaveClass(/demo-runtime--right/);
   await expect(page.locator(".demo-inspector")).toHaveCSS("position", "sticky");
-  await expect(page.getByRole("button", { name: "Docked in page" })).toHaveAttribute("aria-pressed", "true");
+  const positionButton = page.getByRole("button", { name: "Inspector position" });
+  await positionButton.click();
+  await expect(page.getByRole("menu")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await positionButton.click({ button: "right" });
+  await expect(page.getByRole("menu")).toBeVisible();
+  await page.keyboard.press("Escape");
+  const positionBox = await positionButton.boundingBox();
+  if (!positionBox) throw new Error("Inspector position button is not measurable");
+  await page.mouse.move(positionBox.x + positionBox.width / 2, positionBox.y + positionBox.height / 2);
+  await page.mouse.down();
+  await page.waitForTimeout(650);
+  await expect(page.getByRole("menu")).toBeVisible();
+  await page.mouse.up();
 
-  await page.getByRole("button", { name: "Floating panel" }).click();
+  await page.getByRole("menuitemradio", { name: "Left rail" }).click();
+  await expect(runtime).toHaveClass(/demo-runtime--left/);
+  await expect(page.locator(".demo-inspector")).toHaveCSS("position", "sticky");
+
+  await positionButton.click();
+  await page.getByRole("menuitemradio", { name: "Floating" }).click();
   await expect(runtime).toHaveClass(/demo-runtime--floating/);
   await expect(page.locator(".demo-inspector")).toHaveCSS("position", "fixed");
 
-  await page.getByRole("button", { name: "Docked in page" }).click();
-  await expect(runtime).toHaveClass(/demo-runtime--docked/);
-  await page.getByRole("button", { name: "Close demo inspector" }).click();
+  await positionButton.click();
+  await page.getByRole("menuitemradio", { name: "Minimize" }).click();
+  await expect(runtime).toHaveClass(/demo-runtime--minimized/);
   await expect(shell).toHaveClass(/is-closed/);
+  await expect(shell).toHaveCSS("display", "contents");
+  await expect(page.locator(".demo-bubble")).toHaveCSS("position", "fixed");
   await expect(page.getByRole("button", { name: "Open demo inspector" })).toBeVisible();
+  await page.getByRole("button", { name: "Open demo inspector" }).click();
+  await expect(runtime).toHaveClass(/demo-runtime--floating/);
 });
 
 test("keeps the demo isolated while a scenario and simulated action change", async ({ page }) => {
@@ -64,7 +86,8 @@ test("supports a mobile inspector drawer and fail-closed bootstrap", async ({ pa
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("?demo=empty");
   await expect(page.getByTestId("overview-page")).toBeVisible();
-  await page.getByRole("button", { name: "Close demo inspector" }).click();
+  await page.getByRole("button", { name: "Inspector position" }).click();
+  await page.getByRole("menuitemradio", { name: "Minimize" }).click();
   await expect(page.getByRole("button", { name: "Open demo inspector" })).toBeVisible();
   await page.getByRole("button", { name: "Open demo inspector" }).click();
   await expect(page.getByRole("heading", { name: "Demo inspector" })).toBeVisible();
@@ -80,9 +103,12 @@ test("covers route pages, denied reads, keyboard controls and clipboard failure"
   await expect(page.getByTestId("images-page")).toBeVisible();
   await page.getByRole("button", { name: "System" }).click();
   await expect(page.getByTestId("system-page")).toBeVisible();
-  await page.getByRole("button", { name: "Close demo inspector" }).focus();
+  await page.getByRole("button", { name: "Inspector position" }).focus();
   await page.keyboard.press("Enter");
+  await expect(page.getByRole("menu")).toBeVisible();
+  await page.getByRole("menuitemradio", { name: "Minimize" }).click();
   await expect(page.getByRole("button", { name: "Open demo inspector" })).toBeVisible();
+  await page.getByRole("button", { name: "Open demo inspector" }).click();
 
   await page.goto("?demo=normal&d_persona=viewer");
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();

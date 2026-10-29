@@ -6,7 +6,7 @@ export type DemoPersona = "admin" | "viewer";
 export type DemoNetwork = "online" | "offline";
 export type DemoDataMode = "full" | "minimal";
 export type DemoForcedOutcome = "succeeded" | "failed" | "outcome_unknown";
-export type DemoInspectorLayout = "docked" | "floating";
+export type DemoInspectorLayout = "left" | "right" | "floating" | "minimized";
 
 export interface DemoRuntimeState {
   scene: DemoScene;
@@ -116,11 +116,12 @@ export function getDemoInspectorLayout(): DemoInspectorLayout {
   if (typeof window === "undefined") return "floating";
   try {
     const stored = window.localStorage.getItem(inspectorLayoutStorageKey);
-    if (stored === "docked" || stored === "floating") return stored;
+    if (stored === "docked") return "right";
+    if (stored === "left" || stored === "right" || stored === "floating" || stored === "minimized") return stored;
   } catch {
     // The demo still works when storage is unavailable.
   }
-  return (window.matchMedia?.("(min-width: 1280px)")?.matches ?? false) ? "docked" : "floating";
+  return (window.matchMedia?.("(min-width: 1280px)")?.matches ?? false) ? "right" : "floating";
 }
 
 export function saveDemoInspectorLayout(layout: DemoInspectorLayout): void {
