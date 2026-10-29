@@ -31,14 +31,14 @@
 
 宽屏可停靠，普通桌面可使用有安全边界的浮层，移动端使用可收起的入口和抽屉；各布局均应允许收起与恢复，不遮蔽待审查的正式界面。
 
-Demo Inspector 的结构、布局、位置控制、浮动拖动热区、键盘替代、响应式和可访问性要求以[Web Demo Inspector UX/UI 合同](../specs/agent-vm/contracts/web-demo-inspector.md)为规范来源。位置图标不是关闭按钮：单击只应用当前视口默认布局，右键、长按或 `Shift+F10` 才打开位置菜单；浮动模式必须显示横跨面板主要宽度的 shadcn `Button` + `GripHorizontal` 手柄，文字只通过 Tooltip/accessible name 提示，不能把标题文字或业务按钮作为隐含热区。
+Demo Inspector 的结构、布局、位置控制、浮动拖动热区、键盘替代、响应式和可访问性要求以[Web Demo Inspector UX/UI 合同](../specs/agent-vm/contracts/web-demo-inspector.md)为规范来源。位置图标不是关闭按钮：单击只应用当前视口默认布局，右键、长按或 `Shift+F10` 才打开位置菜单；浮动模式必须显示横跨面板主要宽度的 shadcn `ResizableHandle withHandle` 手柄，文字只通过 Tooltip/accessible name 提示，不能把标题文字或业务按钮作为隐含热区。
 
 ### 验收与相邻对齐
 
 - 使用页面级浏览器验证覆盖隔离及启动失败、五个页面、模拟写入与记录、异常和空状态、权限拒绝、URL 分享与深链刷新、浏览器导航、面板响应式布局及键盘操作。验证不得依赖真实服务或资源。
 - Storybook 继续承担组件和交互检查，新增 accessibility 检查并覆盖控制面板关键组件；自动检查不能替代键盘与页面级检查。
 - React Doctor 采用锁定版本与版本化配置，本地针对 staged React 文件、CI 针对 changed React 文件；诊断 error 阻断，warning 可见。范围无法计算时失败，确认空集合时跳过。
-- `web/` 已建立可审计的 shadcn/ui 基线：`components.json`、`@/components/ui`/`@/lib/utils` aliases、Tailwind v4、CVA、`clsx`/`tailwind-merge`、Radix primitives 和 Lucide icons。Demo Inspector 的 Button、Select、ContextMenu/DropdownMenu、Tooltip 直接使用 checked-in open-code primitives；其余旧页面通过兼容导出渐进迁移，不因库名要求一次性重写全部旧组件。
+- `web/` 已建立可审计的 shadcn/ui 基线：`components.json`、`@/components/ui`/`@/lib/utils` aliases、Tailwind v4、CVA、`clsx`/`tailwind-merge`、Radix primitives 和 Lucide icons。Demo Inspector 的 Button、Resizable、Select、ContextMenu/DropdownMenu、Tooltip 直接使用 checked-in open-code primitives；其余旧页面通过兼容导出渐进迁移，不因库名要求一次性重写全部旧组件。
 - 优先将 Demo 构建、浏览器测试和 React Doctor 纳入现有稳定 PR gate，按平台能力分配检查；检查失败必须传递到对应 gate。若改变 required check 集合，更新 `.github/quality-gates.json`，并在获适当授权后核验 GitHub 分支保护与声明一致。当前平台状态未经本次核验。
 - 正式管理台的真实产品版本、认证、API、资源打包、安装和回滚另按既有产品合同验收，不以 Demo 成功替代。
 

@@ -1,4 +1,4 @@
-import { Check, Clipboard, GripHorizontal, Minimize2, Move, PanelLeft, PanelRight, RotateCcw, Wifi, WifiOff } from "lucide-react";
+import { Check, Clipboard, Minimize2, Move, PanelLeft, PanelRight, RotateCcw, Wifi, WifiOff } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { demoShareUrl, getDemoInspectorPosition, saveDemoInspectorPosition, setDemoControl, useDemoRuntime, type DemoDataMode, type DemoInspectorLayout, type DemoInspectorPosition, type DemoPersona, type DemoRuntimeState, type DemoScene } from "./runtime";
@@ -7,6 +7,7 @@ import { Button, StatusBadge } from "../components/ui";
 import { Button as ShadcnButton } from "../components/ui/button";
 import { ContextMenu, ContextMenuContent, ContextMenuRadioGroup, ContextMenuRadioItem, ContextMenuTrigger } from "../components/ui/context-menu";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger } from "../components/ui/dropdown-menu";
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "../components/ui/resizable";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../components/ui/tooltip";
 import { cn } from "../lib/utils";
 
@@ -165,7 +166,7 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
     saveDemoInspectorPosition(next);
   };
 
-  const handleDragKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+  const handleDragKeyDown = (event: ReactKeyboardEvent<HTMLElement>) => {
     if (layout !== "floating") return;
     const step = event.shiftKey ? 48 : 16;
     const delta = event.key === "ArrowLeft" ? { left: -step, top: 0 } : event.key === "ArrowRight" ? { left: step, top: 0 } : event.key === "ArrowUp" ? { left: 0, top: -step } : event.key === "ArrowDown" ? { left: 0, top: step } : null;
@@ -198,7 +199,7 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
   return <TooltipProvider delayDuration={350}><div className={`demo-inspector-shell demo-inspector-shell--${layout} ${isMinimized ? "is-closed" : "is-open"}`}>
     <ShadcnButton type="button" variant="outline" size="icon-lg" className={`demo-bubble ${isMinimized ? "" : "is-open"}`} aria-label={t("demo.openInspector")} onClick={restoreLayout}><PanelRight aria-hidden="true" /></ShadcnButton>
     {!isMinimized ? <aside ref={inspectorRef} className={`demo-inspector ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.inspector")} style={layout === "floating" && floatingPosition ? { left: `${floatingPosition.left}px`, top: `${floatingPosition.top}px`, right: "auto", bottom: "auto" } : undefined}>
-      {layout === "floating" ? <Tooltip><TooltipTrigger asChild><ShadcnButton type="button" variant={dragging ? "secondary" : "ghost"} size="lg" className={cn("demo-inspector-panel-handle w-full min-h-11 touch-none cursor-grab", dragging && "cursor-grabbing")} aria-label={t("demo.dragHandle")} aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown" onPointerDown={handleDragStart} onPointerMove={handleDragMove} onPointerUp={finishDrag} onPointerCancel={finishDrag} onKeyDown={handleDragKeyDown}><GripHorizontal aria-hidden="true" /></ShadcnButton></TooltipTrigger><TooltipContent side="bottom">{t("demo.dragInspector")}</TooltipContent></Tooltip> : null}
+      {layout === "floating" ? <ResizablePanelGroup orientation="vertical" className="demo-inspector-panel-handle-group" aria-label={t("demo.dragHandle")}><ResizablePanel defaultSize={50} disabled style={{ position: "absolute", inset: 0, pointerEvents: "none" }} /><Tooltip><TooltipTrigger asChild><ResizableHandle withHandle className={cn("demo-inspector-panel-handle min-h-11 bg-transparent aria-[orientation=horizontal]:after:inset-y-auto aria-[orientation=horizontal]:after:top-1/2 aria-[orientation=horizontal]:after:-translate-y-1/2 touch-none cursor-grab", dragging && "cursor-grabbing")} aria-label={t("demo.dragHandle")} aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown" onPointerDown={handleDragStart} onPointerMove={handleDragMove} onPointerUp={finishDrag} onPointerCancel={finishDrag} onKeyDown={handleDragKeyDown} /></TooltipTrigger><TooltipContent side="bottom">{t("demo.dragInspector")}</TooltipContent></Tooltip><ResizablePanel defaultSize={50} disabled style={{ position: "absolute", inset: 0, pointerEvents: "none" }} /></ResizablePanelGroup> : null}
       <div className="demo-inspector-header">
         <div className="demo-inspector-heading"><span className="eyebrow-label">{t("demo.eyebrow")}</span><h2>{t("demo.inspector")}</h2></div>
         <div className="demo-inspector-header-actions">

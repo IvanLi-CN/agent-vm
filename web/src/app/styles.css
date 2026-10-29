@@ -324,6 +324,7 @@ svg { flex: none; }
 .demo-inspector-header-actions { display: flex; align-items: flex-start; gap: 6px; flex: none; }
 .demo-layout-button { color: var(--muted); touch-action: none; user-select: none; }
 .demo-layout-button:hover { color: var(--text); }
+.demo-inspector-panel-handle-group { height: 44px !important; flex: 0 0 44px; overflow: visible !important; }
 .demo-inspector-header h2 { margin-top: 2px; font-size: 17px; }
 .demo-safe-banner { display: flex; gap: 9px; padding: 10px; color: var(--positive-ink); background: var(--positive-bg); border: 1px solid var(--positive-border); border-radius: 6px; font-size: 11px; }
 .demo-safe-banner strong, .demo-safe-banner span { display: block; }

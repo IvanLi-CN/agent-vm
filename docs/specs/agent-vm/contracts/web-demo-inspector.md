@@ -17,9 +17,9 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 5. 结果摘要：操作权限和模拟连接状态使用带文字的状态徽章，未知、故障和拒绝不得只用颜色表示。
 6. 分享与恢复：复制安全分享链接、重置场景，以及链接只包含场景、权限、网络和数据设置的说明。
 
-控件必须沿用 `web/components.json` 声明的 open-code shadcn/ui 基线。源码位于 `web/src/components/ui`，别名固定为 `@/components/ui`、`@/lib/utils`；组件层使用 Radix primitives、Tailwind utilities、CVA、`clsx`/`tailwind-merge` 的 `cn` helper 和 Lucide icons。Inspector 直接使用 shadcn `Button`、Radix-backed `Select`、`ContextMenu`/`DropdownMenu` 和 Tooltip primitives，业务样式只通过现有 paper-line CSS tokens 做组合，不再新增原生裸按钮来替代组件层。
+控件必须沿用 `web/components.json` 声明的 open-code shadcn/ui 基线。源码位于 `web/src/components/ui`，别名固定为 `@/components/ui`、`@/lib/utils`；组件层使用 Radix primitives、Tailwind utilities、CVA、`clsx`/`tailwind-merge` 的 `cn` helper 和 Lucide icons。Inspector 直接使用 shadcn `Button`、`ResizablePanelGroup`/`ResizableHandle`、Radix-backed `Select`、`ContextMenu`/`DropdownMenu` 和 Tooltip primitives，业务样式只通过现有 paper-line CSS tokens 做组合，不再新增原生裸按钮来替代组件层。
 
-布局控制按钮的交互必须明确分层：普通单击只执行宽屏默认布局切换（宽屏优先右栏，窄屏优先悬浮），不得打开菜单；鼠标右键、键盘 `Shift+F10`/ContextMenu 键以及触摸长按才打开 shadcn 菜单，菜单提供左栏、右栏、悬浮、最小化四个互斥选项。悬浮模式的 `GripVertical` shadcn icon button 是独立拖动手柄，热区至少 44px（粗指针），支持 pointer capture、边界约束和方向键移动；布局按钮与拖动手柄不能共用职责。
+布局控制按钮的交互必须明确分层：普通单击只执行宽屏默认布局切换（宽屏优先右栏，窄屏优先悬浮），不得打开菜单；鼠标右键、键盘 `Shift+F10`/ContextMenu 键以及触摸长按才打开 shadcn 菜单，菜单提供左栏、右栏、悬浮、最小化四个互斥选项。悬浮模式的 shadcn `ResizableHandle withHandle` 是独立拖动手柄，热区至少 44px（粗指针），支持 pointer capture、边界约束和方向键移动；布局按钮与拖动手柄不能共用职责。
 
 所有控制项必须具备可读名称、可见 focus-visible 状态和不依赖颜色的选中/错误语义；Inspector 内部不手写菜单定位、outside-click 或 menuitem ARIA 状态，交由 Radix primitives 管理焦点、portal、Esc 关闭和菜单键盘导航。组件层变更需同步 Storybook 状态与页面级浏览器验证。
 
@@ -52,7 +52,7 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 
 ### 可发现的热区
 
-浮动模式面板顶部必须显示独立的面板级拖动手柄，而不是把标题文字或业务按钮作为隐藏热区。手柄应使用已登记 shadcn/ui `Button` 的 `ghost`/`secondary` variant，内部只放 `GripHorizontal` 图标，横跨面板主要宽度但不显示“拖动”操作文案，通过 Tooltip 和 accessible name 解释用途；手柄具有清晰的 hover/pressed/focus-visible 状态和至少 44×44px 的移动端触控目标。固定左栏、固定右栏和最小化模式不显示该手柄，避免暗示不可用的拖动。
+浮动模式面板顶部必须显示独立的面板级拖动手柄，而不是把标题文字或业务按钮作为隐藏热区。手柄必须使用已登记的 shadcn/ui `ResizableHandle`，通过 `withHandle` 显示官方 grip；它横跨面板主要宽度但不显示“拖动”操作文案，通过 Tooltip 和 accessible name 解释用途，DOM 保留 `role="separator"` 与键盘焦点。手柄具有清晰的 hover/pressed/focus-visible 状态和至少 44×44px 的移动端触控目标。固定左栏、固定右栏和最小化模式不显示该手柄，避免暗示不可用的拖动。
 
 手柄只负责移动面板，不负责打开位置菜单；位置图标仍是单独的控制。手柄与标题、Select、网络切换和操作按钮之间必须有清晰的 hit-area 边界，避免一次触控同时触发拖动和业务操作。
 
@@ -66,7 +66,7 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 
 ### 键盘替代
 
-拖动手柄是可聚焦按钮，声明 `aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown"`。获得焦点后：
+拖动手柄是可聚焦的 shadcn separator，声明 `aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown"`。获得焦点后：
 
 - 方向键按 16px 移动；`Shift`+方向键按 48px 移动。
 - 位置同样遵守 viewport 安全边距并立即保存。
@@ -82,12 +82,12 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 
 ## 参考案例与设计结论
 
-- [shadcn/ui Resizable](https://ui.shadcn.com/docs/components/base/resizable) 的 `ResizableHandle` 是面板之间的窄分隔手柄；`withHandle` 只增加可视 grip，不把它做成带业务文案的按钮。
+- [shadcn/ui Resizable](https://ui.shadcn.com/docs/components/radix/resizable) 的 `ResizableHandle` 是面板之间的窄分隔手柄；`withHandle` 只增加可视 grip，不把它做成带业务文案的按钮。
 - [Vaul Drawer API](https://vaul.emilkowal.ski/api) 将 `Drawer.Handle` 作为独立部件，明确区别于标题和关闭控件，并支持 `handleOnly` 让拖动只从 handle 开始。
 - [Material 3 Bottom sheets](https://m3.material.io/components/bottom-sheets/overview) 将 drag handle 作为可选视觉提示，同时要求至少 48dp 的可访问触控热区。
 - [Apple Human Interface Guidelines — Windows](https://developer.apple.com/design/human-interface-guidelines/windows) 将可移动窗口的 frame/title bar 与业务按钮分开，窗口通过 frame 移动。
 
-因此 Inspector 采用“顶部居中 shadcn Button + GripHorizontal + 44px 以上整条热区 + Tooltip/accessible name”的组合；位置按钮只负责布局菜单，不能兼任拖动手柄。`ResizableHandle` 只用于调整大小，不被冒充为浮动面板移动控件。
+因此 Inspector 采用“顶部居中 shadcn `ResizableHandle withHandle` + 44px 以上整条热区 + Tooltip/accessible name”的组合；位置按钮只负责布局菜单，不能兼任拖动手柄。`ResizableHandle` 的官方 grip 视觉被复用为移动热区，但两个隐藏面板被锁定，禁止把浮动移动误认为可调宽度操作。
 
 ## 响应式与可访问性门禁
 
