@@ -678,6 +678,48 @@ class WrapperTests(unittest.TestCase):
 
         self.assertEqual(checked["format"], MANIFEST.GO_MANIFEST_FORMAT)
 
+    def test_native_preflight_accepts_historical_legacy_control_residue(self):
+        self._install_go_runtime("https")
+        installed_root = Path(self.loaded["control_path"]).parent
+        legacy_root = self.root / "legacy-control"
+        WRAPPER.safe_extract_archive(self.payload, legacy_root)
+        alias = installed_root / "agent_vm_control.ts"
+        alias.write_bytes((legacy_root / "agent_vm_control.ts").read_bytes())
+        alias.chmod(0o755)
+        installed_manifest = MANIFEST.load_release_manifest(
+            installed_root / MANIFEST.MANIFEST_NAME,
+        )
+
+        checked = WRAPPER._verify_installed_release(self.loaded, installed_root, installed_manifest)
+
+        self.assertEqual(checked["format"], MANIFEST.GO_MANIFEST_FORMAT)
+
+    def test_drain_verification_uses_native_bridge_for_historical_legacy_transport(self):
+        self.drain_patch.stop()
+        self._install_go_runtime("https")
+        installed_root = Path(self.loaded["control_path"]).parent
+        (installed_root / "agent_vm_control.ts").unlink()
+        manifest_path = installed_root / MANIFEST.MANIFEST_NAME
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["client_view"]["transport"] = "legacy-bun"
+        manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
+        sidecar_path = installed_root / "client-release.json"
+        sidecar = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        sidecar["client_view"]["transport"] = "legacy-bun"
+        sidecar_path.write_text(json.dumps(sidecar, sort_keys=True) + "\n", encoding="utf-8")
+        response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ) as run:
+            WRAPPER._ensure_drained(self.loaded)
+
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [WRAPPER.BUN_PATH, str(installed_root / "agent_vm_control_bridge.ts")],
+        )
+
     def test_native_to_format_one_activation_hands_off_runtime_before_cleanup(self):
         self.loaded["require_drained"] = False
         go_release_id = "a" * 40
@@ -1318,6 +1360,7 @@ class WrapperTests(unittest.TestCase):
 
     def test_legacy_deactivation_attempts_all_units_after_failure(self):
         expiry = "agent-vm-native-expire-test.timer"
+        expiry_service = "agent-vm-native-expire@test.service"
         events = []
 
         def systemctl(action, unit, *, allow_missing=False):
@@ -1326,16 +1369,65 @@ class WrapperTests(unittest.TestCase):
                 raise WRAPPER.WrapperError("activation_failed", "injected legacy stop failure")
 
         with mock.patch.object(WRAPPER, "_legacy_expiry_timers", return_value=(expiry,)), mock.patch.object(
-            WRAPPER, "_systemctl", side_effect=systemctl,
+            WRAPPER, "_legacy_expiry_services", return_value=(expiry_service,),
+        ), mock.patch.object(WRAPPER, "_systemctl", side_effect=systemctl,
         ):
             with self.assertRaises(WRAPPER.WrapperError):
                 WRAPPER._deactivate_legacy_runtime()
 
-        expected_units = (*WRAPPER.GO_RETIRED_UNITS, *WRAPPER._legacy_expiry_services((expiry,)), expiry)
+        expected_units = (*WRAPPER.GO_RETIRED_UNITS, expiry, expiry_service)
         self.assertEqual(
             events,
             [(action, unit) for unit in expected_units for action in ("stop", "disable")],
         )
+
+    def test_legacy_deactivation_stops_timerless_expiry_service_instances(self):
+        service = "agent-vm-native-expire@demo-g1.service"
+        events = []
+
+        def systemctl(action, unit, *, allow_missing=False):
+            events.append((action, unit))
+
+        with mock.patch.object(WRAPPER, "_legacy_expiry_timers", return_value=()), mock.patch.object(
+            WRAPPER, "_legacy_expiry_services", return_value=(service,)
+        ), mock.patch.object(WRAPPER, "_systemctl", side_effect=systemctl):
+            WRAPPER._deactivate_legacy_runtime()
+
+        self.assertIn(("stop", service), events)
+        self.assertIn(("disable", service), events)
+
+    def test_initial_activation_hands_off_installed_legacy_runtime_without_current_pointer(self):
+        self.loaded["require_drained"] = False
+        legacy_root = self.root / "legacy-installed"
+        WRAPPER.safe_extract_archive(self.payload, legacy_root)
+        legacy_manifest = MANIFEST.load_release_manifest(legacy_root / MANIFEST.MANIFEST_NAME)
+        WRAPPER._install_release_files(self.loaded, legacy_root, legacy_manifest)
+
+        release_id = "a" * 40
+        native_payload = self._go_payload(release_id, transport="https")
+        events = []
+        original_install = WRAPPER._install_release_files
+
+        def install(*args, **kwargs):
+            events.append("install")
+            return original_install(*args, **kwargs)
+
+        def stop_legacy():
+            events.append("deactivate-legacy")
+
+        with mock.patch.object(WRAPPER, "_install_release_files", side_effect=install), mock.patch.object(
+            WRAPPER, "_deactivate_legacy_runtime", side_effect=stop_legacy,
+        ), mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            WRAPPER.stage(self.loaded, "tx-initial-native", release_id, native_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-initial-native", release_id)
+            WRAPPER.activate(self.loaded, "tx-initial-native", release_id)
+
+        self.assertLess(events.index("deactivate-legacy"), events.index("install"))
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, release_id)
 
     def test_activation_failure_restores_existing_support_bytes_modes_and_owners(self):
         installed = Path(self.loaded["control_path"]).parent

@@ -108,6 +108,7 @@ GO_CONTROL_PATH = Path("/opt/agent-vm-native/bin/agent-vm-control")
 GO_CONTROL_SOCKET = Path("/run/agent-vm-native/control.sock")
 STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
 LEGACY_EXPIRY_TIMER_RE = re.compile(r"^agent-vm-native-expire-[A-Za-z0-9_.:-]+\.timer$")
+LEGACY_EXPIRY_SERVICE_RE = re.compile(r"^agent-vm-native-expire@[A-Za-z0-9_.:-]+\.service$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -1253,8 +1254,6 @@ def _verify_installed_release(
         if bridge is None:
             _fail("artifact_unverified", "installed compatibility bridge alias has no declared bridge")
         _require_owned_regular(bridge_alias, owner_uid, bridge["mode"])
-        if sha256_file(bridge_alias) != bridge["sha256"]:
-            _fail("artifact_checksum_mismatch", "installed compatibility bridge alias differs")
     return checked
 
 
@@ -1286,6 +1285,11 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
                 _fail("drain_unverified", "installed client release transport is invalid")
             if transport in {"go-request", "https"}:
                 command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
+            elif _is_go_manifest(checked) or _is_product_manifest(checked):
+                # Historical native packages may declare legacy-bun while
+                # carrying only the declared bridge, without the old alias.
+                # The bridge is the verified native compatibility authority.
+                command = [BUN_PATH, str(_go_bridge_target(config))]
     elif manifest_path.exists() or manifest_path.is_symlink():
         _fail("drain_unverified", "installed release manifest is present but the client sidecar is missing")
     def control_result(action: str, *, allow_legacy_unknown: bool = False) -> Mapping[str, Any] | None:
@@ -1411,6 +1415,26 @@ def _legacy_expiry_services(timers: tuple[str, ...]) -> tuple[str, ...]:
             _fail("activation_failed", "systemd legacy expiry timer inventory contained an invalid unit")
         instance = timer[len(prefix):-len(suffix)]
         services.append(f"agent-vm-native-expire@{instance}.service")
+    try:
+        process = subprocess.run(
+            ["systemctl", "list-units", "--all", "--no-legend", "--no-pager", "agent-vm-native-expire@*.service"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _fail("activation_failed", "systemd legacy expiry service inventory could not be verified")
+    if process.returncode not in (0, 1):
+        _fail("activation_failed", "systemd legacy expiry service inventory failed")
+    try:
+        lines = process.stdout.decode("utf-8", errors="strict").splitlines()
+    except UnicodeDecodeError:
+        _fail("activation_failed", "systemd legacy expiry service inventory is invalid")
+    for line in lines:
+        name = line.split()[0] if line.split() else ""
+        if LEGACY_EXPIRY_SERVICE_RE.fullmatch(name):
+            services.append(name)
     return tuple(sorted(set(services)))
 
 
@@ -1458,11 +1482,15 @@ def _deactivate_legacy_runtime() -> None:
     except WrapperError as error:
         errors.append(error.as_dict())
         expiry_timers = ()
-    expiry_services = _legacy_expiry_services(expiry_timers)
+    try:
+        expiry_services = _legacy_expiry_services(expiry_timers)
+    except WrapperError as error:
+        errors.append(error.as_dict())
+        expiry_services = ()
     try:
         _deactivate_units(tuple(
             (action, unit)
-            for unit in (*GO_RETIRED_UNITS, *expiry_services, *expiry_timers)
+            for unit in (*GO_RETIRED_UNITS, *expiry_timers, *expiry_services)
             for action in ("stop", "disable")
         ))
     except WrapperError as error:
@@ -1791,6 +1819,31 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     old_runtime_manifest = None
     if old_current is not None:
         old_runtime_manifest = _verify_retained_release(config, old_current)
+    else:
+        # A legacy wrapper may have installed a runtime before the release
+        # pointers were introduced. Treat that installed control plane as the
+        # predecessor so cross-format activation stops it before retiring its
+        # files, instead of leaving an orphaned authority behind.
+        installed_root = Path(config["control_path"]).parent
+        installed_sidecar = installed_root / "client-release.json"
+        installed_manifest_path = installed_root / MANIFEST_NAME
+        if installed_sidecar.exists() or installed_sidecar.is_symlink():
+            try:
+                installed_manifest = load_release_manifest(
+                    installed_manifest_path,
+                    allow_historical_web_config_mode=True,
+                )
+                old_runtime_manifest = _verify_installed_release(
+                    config,
+                    installed_root,
+                    installed_manifest,
+                )
+            except ManifestError as exc:
+                _fail("activation_unverified", "installed release metadata is invalid", exc.as_dict())
+            except WrapperError as exc:
+                _fail("activation_unverified", "installed release integrity is not verified", exc.as_dict())
+        elif installed_manifest_path.exists() or installed_manifest_path.is_symlink():
+            _fail("activation_unverified", "installed release manifest is present but the client sidecar is missing")
     if old_previous is not None:
         _verify_retained_release(config, old_previous)
     web_unit_enabled = None
