@@ -1,5 +1,5 @@
 import { AlertTriangle, ArrowRight, ShieldCheck } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import type { ActionPreview } from "../app/types";
 import { formatDateTime } from "../app/format";
@@ -12,9 +12,11 @@ export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm
   const reasonRef = useRef<HTMLTextAreaElement>(null);
   const dialogRef = useRef<HTMLDialogElement>(null);
   const returnFocusRef = useRef<HTMLElement | null>(typeof document === "undefined" ? null : document.activeElement as HTMLElement);
-  useEffect(() => {
+  useLayoutEffect(() => {
     reasonRef.current?.focus();
-    return () => returnFocusRef.current?.focus();
+    return () => {
+      returnFocusRef.current?.focus();
+    };
   }, []);
   useEffect(() => {
     const dialog = dialogRef.current;

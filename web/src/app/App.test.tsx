@@ -36,7 +36,7 @@ describe("management console workflow", () => {
     window.history.replaceState({}, "", "/vms");
     renderApp();
     expect(await screen.findByTestId("vms-page")).toBeInTheDocument();
-    const trigger = screen.getByRole("button", { name: /释放租约|release lease/i });
+    const trigger = await screen.findByRole("button", { name: /释放租约|release lease/i });
     await user.click(trigger);
     const reason = await screen.findByRole("textbox", { name: /原因|reason/i });
     expect(reason).toHaveFocus();
