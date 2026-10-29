@@ -319,12 +319,15 @@ svg { flex: none; }
 .demo-runtime { min-height: 100vh; }
 .demo-inspector-shell { display: contents; }
 .demo-inspector { position: fixed; z-index: 25; top: 76px; right: 22px; display: flex; flex-direction: column; gap: 13px; width: min(300px, calc(100vw - 32px)); max-height: calc(100vh - 98px); overflow: auto; padding: 18px; background: rgba(255,255,255,.97); border: 1px solid var(--border); border-radius: 10px; box-shadow: 0 18px 40px rgba(19,20,22,.14); }
+.demo-inspector--floating { gap: 8px; padding: 0 18px 18px; }
 .demo-inspector-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .demo-inspector-heading { min-width: 0; }
 .demo-inspector-header-actions { display: flex; align-items: flex-start; gap: 6px; flex: none; }
 .demo-layout-button { color: var(--muted); touch-action: none; user-select: none; }
 .demo-layout-button:hover { color: var(--text); }
-.demo-inspector-panel-handle-group { height: 44px !important; flex: 0 0 44px; overflow: visible !important; }
+.demo-inspector-panel-handle-group { width: calc(100% + 36px); height: 44px !important; flex: 0 0 44px; margin-right: -18px; margin-left: -18px; overflow: visible !important; }
+.demo-inspector--floating .demo-inspector-panel-handle-group { margin-bottom: -8px; }
+.demo-inspector--floating .demo-inspector-panel-handle-group [data-slot="resizable-handle"] > div { position: relative; top: -8px; }
 .demo-inspector-header h2 { margin-top: 2px; font-size: 17px; }
 .demo-safe-banner { display: flex; gap: 9px; padding: 10px; color: var(--positive-ink); background: var(--positive-bg); border: 1px solid var(--positive-border); border-radius: 6px; font-size: 11px; }
 .demo-safe-banner strong, .demo-safe-banner span { display: block; }

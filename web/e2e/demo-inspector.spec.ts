@@ -40,8 +40,14 @@ test("supports left, right, floating and minimized inspector positions", async (
   await expect(dragHandle).toHaveAttribute("aria-keyshortcuts", "ArrowLeft ArrowRight ArrowUp ArrowDown");
   const beforeDrag = await inspector.boundingBox();
   const dragBox = await dragHandle.boundingBox();
-  if (!beforeDrag || !dragBox) throw new Error("Floating inspector is not measurable");
+  const gripBox = await dragHandle.locator("div").boundingBox();
+  const headerBox = await page.locator(".demo-inspector-header").boundingBox();
+  if (!beforeDrag || !dragBox || !gripBox || !headerBox) throw new Error("Floating inspector is not measurable");
   expect(dragBox.width).toBeGreaterThan(beforeDrag.width - 40);
+  expect(dragBox.height).toBeGreaterThanOrEqual(44);
+  expect(gripBox.y - beforeDrag.y).toBeGreaterThanOrEqual(8);
+  expect(gripBox.y - beforeDrag.y).toBeLessThanOrEqual(14);
+  expect(Math.abs(headerBox.y - (dragBox.y + dragBox.height))).toBeLessThanOrEqual(1);
   await page.mouse.move(dragBox.x + dragBox.width / 2, dragBox.y + dragBox.height / 2);
   await page.mouse.down();
   await page.mouse.move(dragBox.x + dragBox.width / 2 - 120, dragBox.y + dragBox.height / 2 + 60);
