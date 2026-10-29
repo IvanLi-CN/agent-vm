@@ -1195,6 +1195,10 @@ def _verify_durable_drain_state(
     try:
         with sqlite3.connect(uri, uri=True, timeout=30) as database:
             database.execute("PRAGMA query_only = ON")
+            # Python's sqlite3 legacy transaction mode does not start a
+            # transaction for a SELECT. Begin explicitly so every drain and
+            # convergence query below observes one durable snapshot.
+            database.execute("BEGIN")
             tables = {
                 str(row[0])
                 for row in database.execute(
