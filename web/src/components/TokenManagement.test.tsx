@@ -151,11 +151,61 @@ describe("TokenManagement pagination", () => {
 
     firstRender.unmount();
     rejectCreate?.(new ManagementRequestError("invalid_request", "validation"));
-    await waitFor(() => expect(firstRender.client.getQueryData(["token-create-recovery"])).toBeUndefined());
+    await waitFor(() => expect(firstRender.client.getQueryData(["token-create-recovery"])).toBeNull());
 
     renderTokenManagement(firstRender.client);
     expect(await screen.findByRole("button", { name: /创建 Token|create token/i })).toBeEnabled();
     expect(screen.queryByRole("button", { name: /查询操作|check operation/i })).not.toBeInTheDocument();
+  });
+
+  it("syncs deterministic recovery cleanup when the page returns before the response", async () => {
+    const user = userEvent.setup();
+    let rejectCreate: ((error: unknown) => void) | undefined;
+    listTokensMock.mockReset().mockResolvedValue({ items: [], page: { limit: 25, next_cursor: null } });
+    createAgentTokenMock.mockReset().mockImplementationOnce(() => new Promise((_, reject) => { rejectCreate = reject; }));
+
+    const firstRender = renderTokenManagement();
+    await screen.findByTestId("token-management");
+    (document.querySelector("form") as HTMLFormElement).noValidate = true;
+    const createButton = screen.getByRole("button", { name: /创建 Token|create token/i });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    await user.click(createButton);
+    await waitFor(() => expect(createAgentTokenMock).toHaveBeenCalled());
+
+    firstRender.unmount();
+    renderTokenManagement(firstRender.client);
+    expect(await screen.findByRole("button", { name: /查询操作|check operation/i })).toBeInTheDocument();
+    rejectCreate?.(new ManagementRequestError("invalid_request", "validation"));
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: /查询操作|check operation/i })).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: /创建 Token|create token/i })).toBeEnabled();
+  });
+
+  it("keeps successful create recovery after an unmounted response without storing plaintext", async () => {
+    const user = userEvent.setup();
+    let resolveCreate: ((result: unknown) => void) | undefined;
+    const created = token("tok_success_01");
+    listTokensMock.mockReset().mockResolvedValue({ items: [], page: { limit: 25, next_cursor: null } });
+    createAgentTokenMock.mockReset().mockImplementationOnce(() => new Promise((resolve) => { resolveCreate = resolve; }));
+
+    const firstRender = renderTokenManagement();
+    await screen.findByTestId("token-management");
+    (document.querySelector("form") as HTMLFormElement).noValidate = true;
+    const createButton = screen.getByRole("button", { name: /创建 Token|create token/i });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    await user.click(createButton);
+    await waitFor(() => expect(createAgentTokenMock).toHaveBeenCalled());
+
+    firstRender.unmount();
+    renderTokenManagement(firstRender.client);
+    expect(await screen.findByRole("button", { name: /查询操作|check operation/i })).toBeInTheDocument();
+    resolveCreate?.({ operation_id: "operation-success-01", token: "secret-token-must-not-persist", metadata: created, plaintext_disclosure: "returned" });
+    await waitFor(() => expect(firstRender.client.getQueryData(["token-create-recovery"])).toMatchObject({ createRecoveryOperationId: "operation-success-01", createRecoveryTokenId: created.token_id, createRecoveryDecision: "blocked" }));
+    expect(JSON.stringify(firstRender.client.getQueryData(["token-create-recovery"]))).not.toContain("secret-token-must-not-persist");
+
+    expect(screen.getByRole("button", { name: /创建 Token|create token/i })).toBeDisabled();
+    expect(screen.queryByTestId("token-plaintext")).not.toBeInTheDocument();
+    expect(screen.getByTestId("token-disclosure")).toHaveTextContent(/明文披露状态已消费|disclosure latch is consumed/i);
   });
 
   it("allows revocation of an expired but not revoked token", async () => {

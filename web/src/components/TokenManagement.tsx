@@ -23,6 +23,7 @@ type CreateRecoverySnapshot = {
   createRecoveryOperationId: string | null;
   createRecoveryStatus: Operation | null;
   createRecoveryTokenId: string | null;
+  createRecoveryTokenMetadata: AgentToken | null;
   createRecoveryDecision: CreateRecoveryDecision | null;
   createRecoveryError: string | null;
 };
@@ -81,7 +82,14 @@ export function TokenManagement() {
   const { t, i18n } = useTranslation();
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const client = useQueryClient();
-  const persistedCreateRecovery = client.getQueryData<CreateRecoverySnapshot>(createRecoveryQueryKey);
+  const createRecoveryQuery = useQuery<CreateRecoverySnapshot | null>({
+    queryKey: createRecoveryQueryKey,
+    queryFn: () => Promise.resolve(client.getQueryData<CreateRecoverySnapshot>(createRecoveryQueryKey) ?? null),
+    enabled: false,
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const persistedCreateRecovery = createRecoveryQuery.data ?? client.getQueryData<CreateRecoverySnapshot>(createRecoveryQueryKey);
   const [scopes, setScopes] = useState<TokenScope[]>(["agent:read"]);
   const [expiresAt, setExpiresAt] = useState(defaultExpiry);
   const [reason, setReason] = useState("");
@@ -91,12 +99,13 @@ export function TokenManagement() {
   const [createRecoveryOperationId, setCreateRecoveryOperationId] = useState<string | null>(() => persistedCreateRecovery?.createRecoveryOperationId ?? null);
   const [createRecoveryStatus, setCreateRecoveryStatus] = useState<Operation | null>(() => persistedCreateRecovery?.createRecoveryStatus ?? null);
   const [createRecoveryTokenId, setCreateRecoveryTokenId] = useState<string | null>(() => persistedCreateRecovery?.createRecoveryTokenId ?? null);
+  const [createRecoveryTokenMetadata, setCreateRecoveryTokenMetadata] = useState<AgentToken | null>(() => persistedCreateRecovery?.createRecoveryTokenMetadata ?? null);
   const [createRecoveryDecision, setCreateRecoveryDecision] = useState<CreateRecoveryDecision | null>(() => persistedCreateRecovery?.createRecoveryDecision ?? null);
   const [createRecoveryPending, setCreateRecoveryPending] = useState(false);
   const [createRecoveryError, setCreateRecoveryError] = useState<string | null>(() => persistedCreateRecovery?.createRecoveryError ?? null);
   const [plaintextToken, setPlaintextToken] = useState<string | null>(null);
-  const [plaintextMetadata, setPlaintextMetadata] = useState<AgentToken | null>(null);
-  const [plaintextConsumed, setPlaintextConsumed] = useState(false);
+  const [plaintextMetadata, setPlaintextMetadata] = useState<AgentToken | null>(() => persistedCreateRecovery?.createRecoveryTokenMetadata ?? null);
+  const [plaintextConsumed, setPlaintextConsumed] = useState(() => Boolean(persistedCreateRecovery?.createRecoveryTokenMetadata));
   const [revokeToken, setRevokeToken] = useState<AgentToken | null>(null);
   const [revokePreview, setRevokePreview] = useState<TokenRevokePreview | null>(null);
   const [revokeOperationId, setRevokeOperationId] = useState<string | null>(null);
@@ -104,6 +113,7 @@ export function TokenManagement() {
   const revokePreviewRequestRef = useRef(0);
   const revokeInFlightRef = useRef(false);
   const revokeTriggerRef = useRef<HTMLElement | null>(null);
+  const mountedRef = useRef(false);
   const [revokePreviewPending, setRevokePreviewPending] = useState(false);
   const [tokenCursor, setTokenCursor] = useState<string | undefined>();
   const [tokenCursorStack, setTokenCursorStack] = useState<string[]>([]);
@@ -117,17 +127,38 @@ export function TokenManagement() {
   };
 
   useEffect(() => { refreshSessionAfterAuthFailure(tokensQuery.error); }, [tokensQuery.error]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
   useEffect(() => { client.setQueryDefaults(createRecoveryQueryKey, { gcTime: Infinity }); }, [client]);
   const persistCreateRecovery = useCallback((snapshot: CreateRecoverySnapshot | null) => {
     if (snapshot) client.setQueryData(createRecoveryQueryKey, snapshot);
-    else client.removeQueries({ queryKey: createRecoveryQueryKey, exact: true });
+    else client.setQueryData(createRecoveryQueryKey, null);
   }, [client]);
 
   useEffect(() => {
-    const snapshot: CreateRecoverySnapshot = { createRequest, createOperationIdValue, createRecoveryOperationId, createRecoveryStatus, createRecoveryTokenId, createRecoveryDecision, createRecoveryError };
-    if (snapshot.createRequest || snapshot.createOperationIdValue || snapshot.createRecoveryOperationId || snapshot.createRecoveryStatus || snapshot.createRecoveryTokenId || snapshot.createRecoveryDecision || snapshot.createRecoveryError) persistCreateRecovery(snapshot);
+    const snapshot: CreateRecoverySnapshot = { createRequest, createOperationIdValue, createRecoveryOperationId, createRecoveryStatus, createRecoveryTokenId, createRecoveryTokenMetadata, createRecoveryDecision, createRecoveryError };
+    if (snapshot.createRequest || snapshot.createOperationIdValue || snapshot.createRecoveryOperationId || snapshot.createRecoveryStatus || snapshot.createRecoveryTokenId || snapshot.createRecoveryTokenMetadata || snapshot.createRecoveryDecision || snapshot.createRecoveryError) persistCreateRecovery(snapshot);
     else persistCreateRecovery(null);
-  }, [createRequest, createOperationIdValue, createRecoveryOperationId, createRecoveryStatus, createRecoveryTokenId, createRecoveryDecision, createRecoveryError, persistCreateRecovery]);
+  }, [createRequest, createOperationIdValue, createRecoveryOperationId, createRecoveryStatus, createRecoveryTokenId, createRecoveryTokenMetadata, createRecoveryDecision, createRecoveryError, persistCreateRecovery]);
+
+  useEffect(() => {
+    const snapshot = persistedCreateRecovery;
+    setCreateRequest(snapshot?.createRequest ?? null);
+    setCreateOperationIdValue(snapshot?.createOperationIdValue ?? null);
+    setCreateRecoveryOperationId(snapshot?.createRecoveryOperationId ?? null);
+    setCreateRecoveryStatus(snapshot?.createRecoveryStatus ?? null);
+    setCreateRecoveryTokenId(snapshot?.createRecoveryTokenId ?? null);
+    setCreateRecoveryTokenMetadata(snapshot?.createRecoveryTokenMetadata ?? null);
+    setCreateRecoveryDecision(snapshot?.createRecoveryDecision ?? null);
+    setCreateRecoveryError(snapshot?.createRecoveryError ?? null);
+    if (snapshot?.createRecoveryTokenMetadata && !plaintextMetadata) {
+      setPlaintextMetadata(snapshot.createRecoveryTokenMetadata);
+      setPlaintextToken(null);
+      setPlaintextConsumed(true);
+    }
+  }, [persistedCreateRecovery, plaintextMetadata]);
 
   const clearCreateRecovery = () => {
     persistCreateRecovery(null);
@@ -136,6 +167,7 @@ export function TokenManagement() {
     setCreateRecoveryOperationId(null);
     setCreateRecoveryStatus(null);
     setCreateRecoveryTokenId(null);
+    setCreateRecoveryTokenMetadata(null);
     setCreateRecoveryDecision(null);
     setCreateRecoveryError(null);
   };
@@ -151,6 +183,22 @@ export function TokenManagement() {
     onSuccess: (result: TokenCreateResult, request: CreateRequest) => {
       const mutation = client.getMutationCache().getAll().find((candidate) => candidate.state.variables === request);
       if (mutation) client.getMutationCache().remove(mutation);
+      if (!mountedRef.current) {
+        persistCreateRecovery({
+          createRequest: request,
+          createOperationIdValue: null,
+          createRecoveryOperationId: result.operation_id,
+          createRecoveryStatus: null,
+          createRecoveryTokenId: result.metadata.token_id,
+          createRecoveryTokenMetadata: result.metadata,
+          createRecoveryDecision: "blocked",
+          createRecoveryError: null,
+        });
+        void client.invalidateQueries({ queryKey: ["tokens"] });
+        void client.invalidateQueries({ queryKey: ["operations"] });
+        void client.invalidateQueries({ queryKey: ["audit"] });
+        return;
+      }
       persistCreateRecovery(null);
       setCreateError(null);
       setCreateRecoveryPending(false);
@@ -184,6 +232,7 @@ export function TokenManagement() {
         createRecoveryOperationId: request.operationId,
         createRecoveryStatus: null,
         createRecoveryTokenId: null,
+        createRecoveryTokenMetadata: null,
         createRecoveryDecision: "check",
         createRecoveryError: null,
       });
@@ -228,6 +277,7 @@ export function TokenManagement() {
       setCreateRequest(null);
       setCreateRecoveryStatus(null);
       setCreateRecoveryTokenId(null);
+      setCreateRecoveryTokenMetadata(null);
       setCreateRecoveryDecision(null);
       return;
     }
@@ -264,10 +314,21 @@ export function TokenManagement() {
     }
     const retryRequest = createOperationIdValue && createRequest?.operationId === createOperationIdValue ? createRequest : null;
     const request: CreateRequest = retryRequest ?? { scopes: [...scopes], expiresAt: new Date(expiresAt).toISOString(), auditReason: reason.trim(), operationId: createOperationId() };
+    persistCreateRecovery({
+      createRequest: request,
+      createOperationIdValue: null,
+      createRecoveryOperationId: request.operationId,
+      createRecoveryStatus: null,
+      createRecoveryTokenId: null,
+      createRecoveryTokenMetadata: null,
+      createRecoveryDecision: "check",
+      createRecoveryError: null,
+    });
     setCreateRequest(request);
     setCreateRecoveryOperationId(request.operationId);
     setCreateRecoveryStatus(null);
     setCreateRecoveryTokenId(null);
+    setCreateRecoveryTokenMetadata(null);
     setCreateRecoveryDecision("check");
     setCreateRecoveryError(null);
     setCreateRecoveryPending(true);
@@ -292,6 +353,7 @@ export function TokenManagement() {
           clearCreateRecovery();
         } else {
           setCreateRecoveryTokenId(operation.result.token_metadata.token_id);
+          setCreateRecoveryTokenMetadata(operation.result.token_metadata);
           setCreateRecoveryDecision("blocked");
         }
         setTokenCursor(undefined);
