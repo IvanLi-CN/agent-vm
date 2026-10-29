@@ -232,6 +232,17 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "invalid_request")
         self.assertNotIn(("control", "drain-enter", mock.ANY), transport.calls)
 
+    def test_publish_rejects_an_empty_explicit_session_before_drain(self):
+        transport = FakeTransport()
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            self.publisher(
+                transport,
+                client_target=self.root / "client" / "agent_vm.ts",
+                session_id="",
+            ).publish(timeout=5, poll=1, transaction_id="tx-empty-session")
+        self.assertEqual(failure.exception.code, "invalid_request")
+        self.assertNotIn(("control", "drain-enter", mock.ANY), transport.calls)
+
     def test_build_and_install_use_all_bun_files_and_never_python_client_paths(self):
         from release_manifest import verify_typescript_syntax
         temporary, root, manifest = RELEASE._open_bundle(self.bundle)
@@ -583,6 +594,22 @@ class ReleasePublisherTests(unittest.TestCase):
         sidecar = json.loads((target.parent / "client-release.json").read_text(encoding="utf-8"))
         self.assertEqual(sidecar["release_id"], "c" * 40)
         self.assertEqual([item[1] for item in transport.calls][-1], "drain-exit")
+
+    def test_manual_rollback_rejects_an_empty_explicit_session_before_drain(self):
+        previous_bundle = self.root / "previous-empty-session.tar"
+        RELEASE.build_release(ROOT, previous_bundle, "c" * 40)
+        transport = FakeTransport()
+        with self.assertRaises(RELEASE.ReleaseError) as failure:
+            RELEASE.ReleasePublisher(
+                bundle=previous_bundle,
+                control_host="staging-control",
+                wrapper_path="/usr/local/sbin/agent-vm-release-wrapper",
+                client_target=self.root / "client" / "agent_vm.ts",
+                transport=transport,
+                session_id="",
+            ).rollback(transaction_id="tx-current", release_id="e" * 40)
+        self.assertEqual(failure.exception.code, "invalid_request")
+        self.assertNotIn(("control", "drain-enter", mock.ANY), transport.calls)
 
     def package_record(self, *, phase="installing", absent=False):
         directory = self.root / "recovery"

@@ -1145,6 +1145,15 @@ class WrapperTests(unittest.TestCase):
         )
         self.assertEqual(record["rollback_state"], "failed")
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, second_release_id)
+        self.assertFalse(Path(self.loaded["fence_path"]).exists())
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ), mock.patch.object(WRAPPER, "_activate_go_runtime"):
+            retry = WRAPPER.rollback(self.loaded, "tx-second-native", second_release_id)
+        self.assertTrue(retry["rolled_back"])
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, first_release_id)
 
     def test_interrupted_handoff_can_rollback_without_the_stopped_authority(self):
         self.loaded["require_drained"] = True
@@ -1218,6 +1227,23 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "activation_restore_failed")
         self.assertGreaterEqual(events.count("stop-native"), 2)
         self.assertEqual(events[-2:], ["stop-native", "stop-legacy"])
+        primary = Path(self.loaded["fence_path"])
+        persistent = primary.with_name("." + primary.name + ".persistent")
+        self.assertTrue(primary.exists())
+        self.assertTrue(persistent.exists())
+
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ), mock.patch.object(WRAPPER, "_deactivate_legacy_runtime"), mock.patch.object(
+            WRAPPER, "_daemon_reload",
+        ), mock.patch.object(WRAPPER, "_activate_go_runtime"):
+            recovered = WRAPPER.rollback(self.loaded, "tx-legacy", legacy_release_id)
+        self.assertTrue(recovered["rolled_back"])
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, native_release_id)
+        self.assertFalse(primary.exists())
+        self.assertFalse(persistent.exists())
 
     def test_rollback_to_product_restores_saved_web_unit_state(self):
         self.loaded["require_drained"] = False
@@ -1895,10 +1921,8 @@ class WrapperTests(unittest.TestCase):
         self.assertFalse(Path(self.loaded["current_link"]).exists())
         primary = Path(self.loaded["fence_path"])
         persistent = primary.with_name("." + primary.name + ".persistent")
-        self.assertTrue(primary.exists())
-        self.assertTrue(persistent.exists())
-        WRAPPER._clear_activation_fence(primary, "tx-support-restore", "b" * 40)
-        WRAPPER._clear_activation_fence(persistent, "tx-support-restore", "b" * 40)
+        self.assertFalse(primary.exists())
+        self.assertFalse(persistent.exists())
 
     def test_activation_rejects_a_modified_retained_release(self):
         first = self.root / "retained-first.tar"

@@ -657,6 +657,36 @@ def _clear_activation_fence(path: Path, transaction_id: str, release_id: str) ->
         _fail("release_fence_cleanup_failed", "release activation fence could not be cleared")
 
 
+class _ActivationFenceHandle:
+    """Callable fence refresh hook with explicit failure cleanup policy."""
+
+    def __init__(self, refresh):
+        self._refresh = refresh
+        self._preserve_failure = False
+        self._cleanup_failure = False
+
+    def __call__(self) -> None:
+        self._refresh()
+
+    def preserve_on_failure(self) -> None:
+        self._preserve_failure = True
+        self._cleanup_failure = False
+
+    def allow_failure_cleanup(self) -> None:
+        if not self._preserve_failure:
+            self._cleanup_failure = True
+
+    @property
+    def cleanup_on_failure(self) -> bool:
+        return self._cleanup_failure
+
+
+def _preserve_activation_fence(refresh_fence) -> None:
+    preserve = getattr(refresh_fence, "preserve_on_failure", None)
+    if callable(preserve):
+        preserve()
+
+
 @contextmanager
 def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id: str):
     """Keep control-plane drain exit fenced for the whole activation window."""
@@ -702,10 +732,11 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
         for path in paths:
             _write_activation_fence(path, transaction_id, release_id)
 
+    fence_handle = _ActivationFenceHandle(refresh)
     completed = False
     failure: BaseException | None = None
     try:
-        yield refresh
+        yield fence_handle
         completed = True
     except BaseException as error:
         failure = error
@@ -720,7 +751,7 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
                 continue
             if not outermost or (not created and not completed):
                 continue
-            if failure is not None:
+            if failure is not None and not fence_handle.cleanup_on_failure:
                 continue
             try:
                 _clear_activation_fence(path, transaction_id, release_id)
@@ -2206,13 +2237,17 @@ def activate(
     drain_owner = _release_drain_owner(transaction_id, session_id)
     with _release_lock(config):
         with _activation_fence(config, transaction_id, release_id) as refresh_fence:
-            return _activate_unlocked(
-                config,
-                transaction_id,
-                release_id,
-                refresh_fence,
-                drain_owner,
-            )
+            try:
+                return _activate_unlocked(
+                    config,
+                    transaction_id,
+                    release_id,
+                    refresh_fence,
+                    drain_owner,
+                )
+            except WrapperError:
+                refresh_fence.allow_failure_cleanup()
+                raise
 
 
 def _activate_unlocked(
@@ -2399,6 +2434,7 @@ def _activate_unlocked(
             raw_failure.code, raw_failure.message, raw_failure.detail,
         )
         restored = True
+        preserve_fence = False
         old_manifest = old_runtime_manifest
         old_compatibility_error = None
         if old_manifest is not None:
@@ -2410,6 +2446,7 @@ def _activate_unlocked(
                 old_compatibility_error = compatibility_error
         if old_compatibility_error is not None:
             restored = False
+            preserve_fence = True
             failure = WrapperError(
                 "activation_restore_blocked",
                 "the previous release cannot read the migrated state; the compatible candidate remains selected",
@@ -2431,6 +2468,7 @@ def _activate_unlocked(
                 )
             except WrapperError as restore_error:
                 restored = False
+                preserve_fence = True
                 failure = WrapperError(
                     "activation_restore_failed",
                     "activation failed and the previous release could not be fully restored",
@@ -2439,6 +2477,7 @@ def _activate_unlocked(
         if not restored or (old_manifest is None and runtime_switch_attempted):
             shutdown_errors = _stop_runtime_authorities()
             if shutdown_errors:
+                preserve_fence = True
                 failure = WrapperError(
                     "activation_restore_failed",
                     "activation failed and the authorities could not be stopped safely",
@@ -2458,6 +2497,7 @@ def _activate_unlocked(
                 else:
                     _activate_legacy_runtime(refresh_fence=refresh_fence)
             except (WrapperError, ManifestError) as runtime_error:
+                preserve_fence = True
                 failure = WrapperError(
                     "activation_restore_failed",
                     "activation failed and the previous runtime could not be restored",
@@ -2465,11 +2505,14 @@ def _activate_unlocked(
                 )
                 shutdown_errors = _stop_runtime_authorities()
                 if shutdown_errors:
+                    preserve_fence = True
                     failure = WrapperError(
                         "activation_restore_failed",
                         "activation failed and the authorities could not be stopped safely",
                         {"activation_error": failure.as_dict(), "shutdown_errors": shutdown_errors},
                     )
+        if preserve_fence:
+            _preserve_activation_fence(refresh_fence)
         try:
             _write_json(activation_path, {
                 **record,
@@ -2492,13 +2535,17 @@ def rollback(
     drain_owner = _release_drain_owner(transaction_id, session_id)
     with _release_lock(config):
         with _activation_fence(config, transaction_id, release_id) as refresh_fence:
-            return _rollback_unlocked(
-                config,
-                transaction_id,
-                release_id,
-                refresh_fence,
-                drain_owner,
-            )
+            try:
+                return _rollback_unlocked(
+                    config,
+                    transaction_id,
+                    release_id,
+                    refresh_fence,
+                    drain_owner,
+                )
+            except WrapperError:
+                refresh_fence.allow_failure_cleanup()
+                raise
 
 
 def _rollback_unlocked(
@@ -2531,12 +2578,13 @@ def _rollback_unlocked(
         "current-pointer-updated",
         "daemon-reloaded",
         "runtime-switched",
+        "failed",
     }
     interrupted = record.get("activated") is False and record.get("activation_phase") in interrupted_phases
     if record.get("release_id") != release_id or not (record.get("activated") is True or interrupted):
         _fail("rollback_unavailable", "rollback transaction does not match the active release")
     rollback_state = record.get("rollback_state")
-    recovering_in_progress = record.get("activated") is True and rollback_state == "in-progress"
+    recovering_in_progress = rollback_state in {"in-progress", "failed"}
     if record.get("rollback_attempts", 0) >= 1 and not recovering_in_progress:
         _fail("rollback_already_attempted", "automatic rollback is limited to one attempt")
     record_drain_owner = record.get("drain_owner")
@@ -2727,6 +2775,7 @@ def _rollback_unlocked(
             raw_failure.detail,
         )
         restore_succeeded = False
+        preserve_fence = False
         try:
             _restore_activation_state(
                 config,
@@ -2738,14 +2787,17 @@ def _rollback_unlocked(
             )
             restore_succeeded = True
         except WrapperError as restore_error:
+            preserve_fence = True
             failure = WrapperError(
                 "activation_restore_failed",
                 "rollback failed and the previous release could not be fully restored",
                 {"rollback_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
             )
         if not restore_succeeded:
+            preserve_fence = True
             shutdown_errors = _stop_runtime_authorities()
             if shutdown_errors:
+                preserve_fence = True
                 failure = WrapperError(
                     "activation_restore_failed",
                     "rollback failed and the authorities could not be stopped safely",
@@ -2765,6 +2817,7 @@ def _rollback_unlocked(
                 else:
                     _activate_legacy_runtime(refresh_fence=refresh_fence)
             except (WrapperError, ManifestError) as runtime_error:
+                preserve_fence = True
                 failure = WrapperError(
                     "activation_restore_failed",
                     "rollback failed and the previous runtime could not be restored",
@@ -2772,11 +2825,14 @@ def _rollback_unlocked(
                 )
                 shutdown_errors = _stop_runtime_authorities()
                 if shutdown_errors:
+                    preserve_fence = True
                     failure = WrapperError(
                         "activation_restore_failed",
                         "rollback failed and the authorities could not be stopped safely",
                         {"rollback_error": failure.as_dict(), "shutdown_errors": shutdown_errors},
                     )
+        if preserve_fence:
+            _preserve_activation_fence(refresh_fence)
         record["rollback_phase"] = "failed"
         record["rollback_state"] = "failed"
         record["rollback_error"] = failure.as_dict()
@@ -2807,6 +2863,7 @@ def _rollback_unlocked(
         except WrapperError as error:
             restore_error = error
         if shutdown_errors or restore_error is not None:
+            _preserve_activation_fence(refresh_fence)
             detail = {"record_error": record_error.as_dict()}
             if shutdown_errors:
                 detail["shutdown_errors"] = shutdown_errors
@@ -2830,6 +2887,7 @@ def _rollback_unlocked(
             else:
                 _activate_legacy_runtime(refresh_fence=refresh_fence)
         except (WrapperError, ManifestError) as runtime_error:
+            _preserve_activation_fence(refresh_fence)
             shutdown_errors = _stop_runtime_authorities()
             detail = {
                 "record_error": record_error.as_dict(),

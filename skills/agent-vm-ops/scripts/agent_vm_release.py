@@ -1086,8 +1086,9 @@ class ReleasePublisher:
         finally:
             temporary.cleanup()
         transaction = transaction_id or ("tx-" + uuid.uuid4().hex)
-        session = self.session_id or ("release-" + transaction)
-        _validate_release_session(session)
+        if self.session_id is not None:
+            _validate_release_session(self.session_id)
+        session = self.session_id if self.session_id is not None else ("release-" + transaction)
         wrapper_session = self.session_id
         self._verify_wrapper_session_capability(transaction, manifest["release_id"])
         staged = self._wrapper("stage", transaction, manifest["release_id"], payload)
@@ -1156,8 +1157,9 @@ class ReleasePublisher:
         temporary.cleanup()
         if manifest["release_id"] == release_id:
             _fail("rollback_release_mismatch", "rollback bundle must identify the previous release, not the active release")
-        session = self.session_id or ("release-" + transaction_id)
-        _validate_release_session(session)
+        if self.session_id is not None:
+            _validate_release_session(self.session_id)
+        session = self.session_id if self.session_id is not None else ("release-" + transaction_id)
         wrapper_session = self.session_id
         self._verify_wrapper_session_capability(transaction_id, release_id)
         self._control(manifest, "drain-enter", session=session, write=True)
