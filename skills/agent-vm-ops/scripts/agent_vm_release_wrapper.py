@@ -1392,6 +1392,17 @@ def _deactivate_legacy_runtime() -> None:
         _systemctl("disable", unit, allow_missing=True)
 
 
+def _stop_runtime_authorities() -> list[dict[str, Any]]:
+    """Stop every runtime authority before reporting an incomplete recovery."""
+    shutdown_errors: list[dict[str, Any]] = []
+    for deactivate in (_deactivate_native_runtime, _deactivate_legacy_runtime):
+        try:
+            deactivate()
+        except WrapperError as shutdown_error:
+            shutdown_errors.append(shutdown_error.as_dict())
+    return shutdown_errors
+
+
 def _unit_is_enabled(unit: str) -> bool:
     """Capture whether a unit was enabled before a dependency restart."""
     try:
@@ -1839,28 +1850,40 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                     "activation failed and the previous release could not be fully restored",
                     {"activation_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
                 )
-        if runtime_switch_attempted:
+        if not restored or (old_current is None and runtime_switch_attempted):
+            shutdown_errors = _stop_runtime_authorities()
+            if shutdown_errors:
+                failure = WrapperError(
+                    "activation_restore_failed",
+                    "activation failed and the authorities could not be stopped safely",
+                    {"activation_error": failure.as_dict(), "shutdown_errors": shutdown_errors},
+                )
+        elif runtime_switch_attempted:
             try:
-                if not restored or old_current is None:
-                    _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+                assert old_manifest is not None
+                if _is_product_manifest(old_manifest):
+                    snapshot = record.get("web_unit_enabled")
+                    _activate_product_runtime(
+                        old_manifest,
+                        web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
+                    )
+                elif _is_go_manifest(old_manifest):
+                    _activate_go_runtime()
                 else:
-                    assert old_manifest is not None
-                    if _is_product_manifest(old_manifest):
-                        snapshot = record.get("web_unit_enabled")
-                        _activate_product_runtime(
-                            old_manifest,
-                            web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
-                        )
-                    elif _is_go_manifest(old_manifest):
-                        _activate_go_runtime()
-                    else:
-                        _activate_legacy_runtime()
+                    _activate_legacy_runtime()
             except (WrapperError, ManifestError) as runtime_error:
                 failure = WrapperError(
                     "activation_restore_failed",
                     "activation failed and the previous runtime could not be restored",
                     {"activation_error": failure.as_dict(), "runtime_error": getattr(runtime_error, "as_dict", lambda: {"message": str(runtime_error)})()},
                 )
+                shutdown_errors = _stop_runtime_authorities()
+                if shutdown_errors:
+                    failure = WrapperError(
+                        "activation_restore_failed",
+                        "activation failed and the authorities could not be stopped safely",
+                        {"activation_error": failure.as_dict(), "shutdown_errors": shutdown_errors},
+                    )
         try:
             _write_json(activation_path, {
                 **record,
@@ -1964,7 +1987,10 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     # have already stopped that authority, so asking it to drain again would
     # make recovery impossible; the release fence and retained pointers are
     # the recovery proof for this bounded retry.
-    if not interrupted and not recovering_in_progress:
+    if interrupted or recovering_in_progress:
+        if config["require_drained"]:
+            _validate_state_compatibility(previous_manifest, _read_live_state_capabilities())
+    else:
         _ensure_drained(config, previous_manifest)
     target_snapshot = _snapshot_targets(config)
     record["rollback_attempts"] = 1
@@ -2000,7 +2026,11 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _daemon_reload()
         runtime_switch_attempted = True
         if _is_product_manifest(previous_manifest):
-            _activate_product_runtime(previous_manifest)
+            snapshot = record.get("web_unit_enabled")
+            _activate_product_runtime(
+                previous_manifest,
+                web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
+            )
         elif _is_go_manifest(previous_manifest):
             _activate_go_runtime()
         else:
@@ -2024,12 +2054,7 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 {"rollback_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
             )
         if not restore_succeeded:
-            shutdown_errors = []
-            for deactivate in (_deactivate_native_runtime, _deactivate_legacy_runtime):
-                try:
-                    deactivate()
-                except WrapperError as shutdown_error:
-                    shutdown_errors.append(shutdown_error.as_dict())
+            shutdown_errors = _stop_runtime_authorities()
             if shutdown_errors:
                 failure = WrapperError(
                     "activation_restore_failed",

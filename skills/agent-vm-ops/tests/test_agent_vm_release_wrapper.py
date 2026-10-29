@@ -764,7 +764,7 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, second_release_id)
 
     def test_interrupted_handoff_can_rollback_without_the_stopped_authority(self):
-        self.loaded["require_drained"] = False
+        self.loaded["require_drained"] = True
         native_release_id = "a" * 40
         legacy_release_id = "b" * 40
         native_payload = self._go_payload(native_release_id, transport="https")
@@ -784,11 +784,108 @@ class WrapperTests(unittest.TestCase):
 
             with mock.patch.object(
                 WRAPPER, "_ensure_drained", side_effect=AssertionError("interrupted rollback must not drain"),
-            ), mock.patch.object(WRAPPER, "_activate_go_runtime"):
+            ), mock.patch.object(WRAPPER, "_read_live_state_capabilities", return_value=[MANIFEST.STATE_CAPABILITY_MARKERS[0]]) as read_capabilities, mock.patch.object(
+                WRAPPER, "_validate_state_compatibility",
+            ) as validate_compatibility, mock.patch.object(WRAPPER, "_activate_go_runtime"):
                 result = WRAPPER.rollback(self.loaded, "tx-interrupted", legacy_release_id)
 
         self.assertTrue(result["rolled_back"])
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, native_release_id)
+        read_capabilities.assert_called_once_with()
+        validate_compatibility.assert_called_once()
+
+    def test_activation_restore_failure_stops_all_runtime_authorities(self):
+        self.loaded["require_drained"] = False
+        native_release_id = "a" * 40
+        legacy_release_id = "b" * 40
+        native_payload = self._go_payload(native_release_id, transport="https")
+        events = []
+
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            WRAPPER.stage(self.loaded, "tx-native", native_release_id, native_payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-native", native_release_id)
+            WRAPPER.activate(self.loaded, "tx-native", native_release_id)
+            WRAPPER.stage(self.loaded, "tx-legacy", legacy_release_id, self.payload)
+            WRAPPER.verify_transaction(self.loaded, "tx-legacy", legacy_release_id)
+            with mock.patch.object(
+                WRAPPER,
+                "_deactivate_native_runtime",
+                side_effect=lambda: events.append("stop-native"),
+            ), mock.patch.object(
+                WRAPPER,
+                "_deactivate_legacy_runtime",
+                side_effect=lambda: events.append("stop-legacy"),
+            ), mock.patch.object(
+                WRAPPER,
+                "_activate_legacy_runtime",
+                side_effect=WRAPPER.WrapperError("activation_failed", "injected legacy start failure"),
+            ), mock.patch.object(
+                WRAPPER,
+                "_restore_activation_state",
+                side_effect=WRAPPER.WrapperError("activation_restore_failed", "injected restore failure"),
+            ), mock.patch.object(
+                WRAPPER,
+                "_read_live_state_capabilities",
+                return_value=[MANIFEST.STATE_CAPABILITY_MARKERS[0]],
+            ):
+                with self.assertRaises(WRAPPER.WrapperError) as failure:
+                    WRAPPER.activate(self.loaded, "tx-legacy", legacy_release_id)
+
+        self.assertEqual(failure.exception.code, "activation_restore_failed")
+        self.assertGreaterEqual(events.count("stop-native"), 2)
+        self.assertEqual(events[-2:], ["stop-native", "stop-legacy"])
+
+    def test_rollback_to_product_restores_saved_web_unit_state(self):
+        self.loaded["require_drained"] = False
+        previous_release_id = "a" * 40
+        active_release_id = "b" * 40
+        previous_dir = Path(self.loaded["release_root"]) / previous_release_id
+        active_dir = Path(self.loaded["release_root"]) / active_release_id
+        previous_dir.mkdir(parents=True)
+        active_dir.mkdir(parents=True)
+        Path(self.loaded["current_link"]).symlink_to(active_dir)
+        Path(self.loaded["previous_link"]).symlink_to(previous_dir)
+        activation_path = Path(self.loaded["state_root"]) / "tx-product.activation.json"
+        activation_path.parent.mkdir(parents=True)
+        activation_path.write_text(json.dumps({
+            "transaction_id": "tx-product",
+            "release_id": active_release_id,
+            "previous_release_id": previous_release_id,
+            "old_current_release_id": previous_release_id,
+            "old_previous_release_id": None,
+            "manifest_sha256": "0" * 64,
+            "activated": True,
+            "activation_phase": "active",
+            "rollback_attempts": 0,
+            "web_unit_enabled": True,
+        }), encoding="utf-8")
+        previous_manifest = {
+            "format": MANIFEST.PRODUCT_MANIFEST_FORMAT,
+            "state_compatibility": {
+                "reads": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+                "writes": list(MANIFEST.STATE_CAPABILITY_MARKERS),
+            },
+        }
+        active_manifest = {"format": MANIFEST.LEGACY_PRODUCT_MANIFEST_FORMAT}
+
+        def retained_manifest(_config, path):
+            return previous_manifest if path == previous_dir else active_manifest
+
+        with mock.patch.object(WRAPPER, "_verify_retained_release", side_effect=retained_manifest), mock.patch.object(
+            WRAPPER, "_snapshot_targets", return_value={},
+        ), mock.patch.object(WRAPPER, "_install_release_files"), mock.patch.object(
+            WRAPPER, "_deactivate_legacy_runtime",
+        ), mock.patch.object(WRAPPER, "_daemon_reload"), mock.patch.object(
+            WRAPPER, "_activate_product_runtime",
+        ) as activate_product:
+            result = WRAPPER._rollback_unlocked(self.loaded, "tx-product", active_release_id)
+
+        self.assertTrue(result["rolled_back"])
+        activate_product.assert_called_once_with(previous_manifest, web_was_enabled=True)
 
     def test_rollback_restore_failure_keeps_all_authorities_stopped(self):
         self.loaded["require_drained"] = False
@@ -1144,7 +1241,9 @@ class WrapperTests(unittest.TestCase):
         record.update({"rollback_attempts": 1, "rollback_state": "in-progress", "rollback_phase": "started"})
         activation_path.write_text(json.dumps(record), encoding="utf-8")
         WRAPPER._atomic_symlink(Path(self.loaded["release_root"]) / ("c" * 40), Path(self.loaded["current_link"]))
-        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")), mock.patch.object(
+            WRAPPER, "_read_live_state_capabilities", return_value=[MANIFEST.STATE_CAPABILITY_MARKERS[0]],
+        ):
             result = WRAPPER.rollback(self.loaded, "tx-retry-second", "d" * 40)
         self.assertTrue(result["rolled_back"])
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, "c" * 40)
@@ -1203,7 +1302,9 @@ class WrapperTests(unittest.TestCase):
         record["activated"] = False
         record["activation_phase"] = "current-pointer-updated"
         activation_path.write_text(json.dumps(record), encoding="utf-8")
-        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")), mock.patch.object(
+            WRAPPER, "_read_live_state_capabilities", return_value=[MANIFEST.STATE_CAPABILITY_MARKERS[0]],
+        ):
             result = WRAPPER.rollback(self.loaded, "tx-interrupted-second", "2" * 40)
         self.assertTrue(result["rolled_back"])
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, "1" * 40)
