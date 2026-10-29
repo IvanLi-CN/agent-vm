@@ -31,7 +31,7 @@
 
 宽屏可停靠，普通桌面可使用有安全边界的浮层，移动端使用可收起的入口和抽屉；各布局均应允许收起与恢复，不遮蔽待审查的正式界面。
 
-Demo Inspector 的结构、布局、位置控制、浮动拖动热区、键盘替代、响应式和可访问性要求以[Web Demo Inspector UX/UI 合同](../specs/agent-vm/contracts/web-demo-inspector.md)为规范来源。位置图标不是关闭按钮：单击只应用当前视口默认布局，右键、长按或 `Shift+F10` 才打开位置菜单；浮动模式必须显示横跨面板主要宽度的独立 `Drag panel`/`拖动面板` 手柄，不能把标题文字或小型工具按钮作为隐含热区。
+Demo Inspector 的结构、布局、位置控制、浮动拖动热区、键盘替代、响应式和可访问性要求以[Web Demo Inspector UX/UI 合同](../specs/agent-vm/contracts/web-demo-inspector.md)为规范来源。位置图标不是关闭按钮：单击只应用当前视口默认布局，右键、长按或 `Shift+F10` 才打开位置菜单；浮动模式必须显示横跨面板主要宽度的顶部居中 grip/pill 手柄，文字只通过 Tooltip/accessible name 提示，不能把标题文字或业务按钮作为隐含热区。
 
 ### 验收与相邻对齐
 

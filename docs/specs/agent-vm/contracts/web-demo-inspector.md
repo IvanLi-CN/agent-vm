@@ -52,7 +52,7 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 
 ### 可发现的热区
 
-浮动模式面板顶部必须显示独立的面板级拖动手柄，而不是把标题文字或一个小型工具按钮作为隐藏热区。手柄应横跨面板主要宽度，包含横向抓手图标和可见的 `拖动面板`/`Drag panel` 文案，具有清晰边界、hover/pressed/focus-visible 状态和至少 44×44px 的移动端触控目标。固定左栏、固定右栏和最小化模式不显示该手柄，避免暗示不可用的拖动。
+浮动模式面板顶部必须显示独立的面板级拖动手柄，而不是把标题文字或业务按钮作为隐藏热区。手柄应横跨面板主要宽度，视觉上使用居中的 grip/pill（不显示“拖动”操作文案），通过 Tooltip 和 accessible name 解释用途；手柄具有清晰的 hover/pressed/focus-visible 状态和至少 44×44px 的移动端触控目标。固定左栏、固定右栏和最小化模式不显示该手柄，避免暗示不可用的拖动。
 
 手柄只负责移动面板，不负责打开位置菜单；位置图标仍是单独的控制。手柄与标题、Select、网络切换和操作按钮之间必须有清晰的 hit-area 边界，避免一次触控同时触发拖动和业务操作。
 
@@ -79,6 +79,15 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 - 分享链接只允许 `demo`、`d_persona`、`d_network`、`d_data` 等已登记设置；布局、拖动坐标、原因、文件元数据、凭据和任何敏感字段不得进入 URL。
 - 复制链接失败时提供不泄露敏感信息的状态提示；刷新清理模拟写入，但保留 URL 驱动的场景设置。
 - 所有 icon-only control 必须有 accessible name；装饰图标 `aria-hidden="true"`；颜色、阴影和图标不能成为唯一状态来源。
+
+## 参考案例与设计结论
+
+- [shadcn/ui Resizable](https://ui.shadcn.com/docs/components/base/resizable) 的 `ResizableHandle` 是面板之间的窄分隔手柄；`withHandle` 只增加可视 grip，不把它做成带业务文案的按钮。
+- [Vaul Drawer API](https://vaul.emilkowal.ski/api) 将 `Drawer.Handle` 作为独立部件，明确区别于标题和关闭控件，并支持 `handleOnly` 让拖动只从 handle 开始。
+- [Material 3 Bottom sheets](https://m3.material.io/components/bottom-sheets/overview) 将 drag handle 作为可选视觉提示，同时要求至少 48dp 的可访问触控热区。
+- [Apple Human Interface Guidelines — Windows](https://developer.apple.com/design/human-interface-guidelines/windows) 将可移动窗口的 frame/title bar 与业务按钮分开，窗口通过 frame 移动。
+
+因此 Inspector 采用“顶部居中 grip + 44px 以上整条热区 + Tooltip/accessible name”的组合；位置按钮只负责布局菜单，不能兼任拖动手柄。
 
 ## 响应式与可访问性门禁
 
