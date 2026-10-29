@@ -177,6 +177,7 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 
 - [Web Demo capacity scenario, desktop](assets/web-demo-capacity-desktop.png)
 - [Web Demo empty scenario, mobile 393×852 CSS px](assets/web-demo-empty-mobile.png)
+- [Web Demo floating Inspector with panel-level drag handle](assets/web-demo-inspector-panel-handle.png)
 
 ## Related material
 

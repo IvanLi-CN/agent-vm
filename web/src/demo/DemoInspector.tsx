@@ -1,4 +1,4 @@
-import { Check, Clipboard, GripVertical, Minimize2, Move, PanelLeft, PanelRight, RotateCcw, Wifi, WifiOff } from "lucide-react";
+import { Check, Clipboard, GripHorizontal, Minimize2, Move, PanelLeft, PanelRight, RotateCcw, Wifi, WifiOff } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { demoShareUrl, getDemoInspectorPosition, saveDemoInspectorPosition, setDemoControl, useDemoRuntime, type DemoDataMode, type DemoInspectorLayout, type DemoInspectorPosition, type DemoPersona, type DemoRuntimeState, type DemoScene } from "./runtime";
@@ -197,10 +197,10 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
   return <TooltipProvider delayDuration={350}><div className={`demo-inspector-shell demo-inspector-shell--${layout} ${isMinimized ? "is-closed" : "is-open"}`}>
     <ShadcnButton type="button" variant="outline" size="icon-lg" className={`demo-bubble ${isMinimized ? "" : "is-open"}`} aria-label={t("demo.openInspector")} onClick={restoreLayout}><PanelRight aria-hidden="true" /></ShadcnButton>
     {!isMinimized ? <aside ref={inspectorRef} className={`demo-inspector ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.inspector")} style={layout === "floating" && floatingPosition ? { left: `${floatingPosition.left}px`, top: `${floatingPosition.top}px`, right: "auto", bottom: "auto" } : undefined}>
+      {layout === "floating" ? <Tooltip><TooltipTrigger asChild><ShadcnButton type="button" variant="outline" size="default" className={`demo-inspector-panel-handle ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.dragHandle")} aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown" onPointerDown={handleDragStart} onPointerMove={handleDragMove} onPointerUp={finishDrag} onPointerCancel={finishDrag} onKeyDown={handleDragKeyDown}><GripHorizontal aria-hidden="true" /><span>{t("demo.dragHandle")}</span></ShadcnButton></TooltipTrigger><TooltipContent side="bottom">{t("demo.dragInspector")}</TooltipContent></Tooltip> : null}
       <div className="demo-inspector-header">
         <div className="demo-inspector-heading"><span className="eyebrow-label">{t("demo.eyebrow")}</span><h2>{t("demo.inspector")}</h2></div>
         <div className="demo-inspector-header-actions">
-          {layout === "floating" ? <Tooltip><TooltipTrigger asChild><ShadcnButton type="button" variant="outline" size="default" className={`demo-inspector-drag-handle ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.dragInspector")} aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown" onPointerDown={handleDragStart} onPointerMove={handleDragMove} onPointerUp={finishDrag} onPointerCancel={finishDrag} onKeyDown={handleDragKeyDown}><GripVertical aria-hidden="true" /><span>{t("demo.dragHint")}</span></ShadcnButton></TooltipTrigger><TooltipContent side="bottom">{t("demo.dragHint")}</TooltipContent></Tooltip> : null}
           <div className="demo-layout-menu">
             <ContextMenu>
               <DropdownMenu open={longPressMenuOpen} onOpenChange={setLongPressMenuOpen}>

@@ -26,20 +26,21 @@ test("supports left, right, floating and minimized inspector positions", async (
   await page.getByRole("menuitemradio", { name: "Left rail" }).click();
   await expect(runtime).toHaveClass(/demo-runtime--left/);
   await expect(page.locator(".demo-inspector")).toHaveCSS("position", "sticky");
-  await expect(page.getByRole("button", { name: "Drag inspector" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Drag panel" })).toHaveCount(0);
 
   await positionButton.click({ button: "right" });
   await page.getByRole("menuitemradio", { name: "Floating" }).click();
   await expect(runtime).toHaveClass(/demo-runtime--floating/);
   await expect(page.locator(".demo-inspector")).toHaveCSS("position", "fixed");
   const inspector = page.locator(".demo-inspector");
-  const dragHandle = page.getByRole("button", { name: "Drag inspector" });
+  const dragHandle = page.getByRole("button", { name: "Drag panel" });
   await expect(dragHandle).toBeVisible();
-  await expect(dragHandle.getByText("Drag")).toBeVisible();
+  await expect(dragHandle.getByText("Drag panel")).toBeVisible();
   await expect(dragHandle).toHaveAttribute("aria-keyshortcuts", "ArrowLeft ArrowRight ArrowUp ArrowDown");
   const beforeDrag = await inspector.boundingBox();
   const dragBox = await dragHandle.boundingBox();
   if (!beforeDrag || !dragBox) throw new Error("Floating inspector is not measurable");
+  expect(dragBox.width).toBeGreaterThan(beforeDrag.width - 40);
   await page.mouse.move(dragBox.x + dragBox.width / 2, dragBox.y + dragBox.height / 2);
   await page.mouse.down();
   await page.mouse.move(dragBox.x + dragBox.width / 2 - 120, dragBox.y + dragBox.height / 2 + 60);
@@ -59,7 +60,7 @@ test("supports left, right, floating and minimized inspector positions", async (
   await page.getByRole("menuitemradio", { name: "Minimize" }).click();
   await expect(runtime).toHaveClass(/demo-runtime--minimized/);
   await expect(shell).toHaveClass(/is-closed/);
-  await expect(page.getByRole("button", { name: "Drag inspector" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Drag panel" })).toHaveCount(0);
   await expect(shell).toHaveCSS("display", "contents");
   await expect(page.locator(".demo-bubble")).toHaveCSS("position", "fixed");
   await expect(page.getByRole("button", { name: "Open demo inspector" })).toBeVisible();

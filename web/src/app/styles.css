@@ -322,12 +322,12 @@ svg { flex: none; }
 .demo-inspector-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
 .demo-inspector-heading { min-width: 0; }
 .demo-inspector-header-actions { display: flex; align-items: flex-start; gap: 6px; flex: none; }
-.demo-inspector-drag-handle, .demo-layout-button { color: var(--muted); touch-action: none; user-select: none; }
-.demo-inspector-drag-handle { min-width: 78px; padding: 0 9px; cursor: grab; }
-.demo-inspector-drag-handle:hover, .demo-layout-button:hover { color: var(--text); }
-.demo-inspector-drag-handle.is-dragging, .demo-inspector.is-dragging .demo-inspector-drag-handle { color: var(--text); background: var(--accent-soft); border-color: var(--accent); cursor: grabbing; }
-.demo-inspector-drag-handle svg, .demo-layout-button svg { width: 17px; height: 17px; }
-.demo-inspector-drag-handle span { font-size: 11px; line-height: 1; }
+.demo-inspector-panel-handle, .demo-layout-button { color: var(--muted); touch-action: none; user-select: none; }
+.demo-inspector-panel-handle { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; min-height: 44px; margin: -5px 0 1px; padding: 0 12px; border-style: dashed; cursor: grab; }
+.demo-inspector-panel-handle:hover, .demo-layout-button:hover { color: var(--text); }
+.demo-inspector-panel-handle.is-dragging, .demo-inspector.is-dragging .demo-inspector-panel-handle { color: var(--text); background: var(--accent-soft); border-color: var(--accent); cursor: grabbing; }
+.demo-inspector-panel-handle svg, .demo-layout-button svg { width: 18px; height: 18px; }
+.demo-inspector-panel-handle span { font-size: 11px; font-weight: 600; letter-spacing: .03em; line-height: 1; }
 .demo-inspector-header h2 { margin-top: 2px; font-size: 17px; }
 .demo-safe-banner { display: flex; gap: 9px; padding: 10px; color: var(--positive-ink); background: var(--positive-bg); border: 1px solid var(--positive-border); border-radius: 6px; font-size: 11px; }
 .demo-safe-banner strong, .demo-safe-banner span { display: block; }
@@ -400,7 +400,7 @@ svg { flex: none; }
   h1 { font-size: 20px; line-height: 26px; }
   .ui-button { min-height: 44px; }
   .icon-button { width: 44px; height: 44px; }
-  .demo-inspector-drag-handle, .demo-layout-button { min-height: 44px; min-width: 44px; }
+  .demo-inspector-panel-handle, .demo-layout-button { min-height: 44px; min-width: 44px; }
   .form-control { min-height: 44px; }
   [data-slot="select-trigger"] { min-height: 44px; }
   .language-toggle button { min-height: 44px; }
@@ -451,7 +451,7 @@ svg { flex: none; }
 }
 
 @media (pointer: coarse) {
-  .demo-inspector-drag-handle { min-width: 88px; min-height: 44px; }
+  .demo-inspector-panel-handle { min-width: 88px; min-height: 44px; }
   .demo-layout-button { min-width: 44px; min-height: 44px; }
   [data-slot="dropdown-menu-radio-item"], [data-slot="context-menu-radio-item"] { min-height: 44px; }
 }
