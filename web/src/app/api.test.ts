@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { mockState } from "./mockData";
-import { ManagementRequestError, previewImageAction, previewMaintenance, previewVMAction, startImageImport, submitImageAction, submitMaintenance, submitVMAction, uploadImageImportContent } from "./api";
+import { getVM, ManagementRequestError, previewImageAction, previewMaintenance, previewVMAction, startImageImport, submitImageAction, submitMaintenance, submitVMAction, uploadImageImportContent } from "./api";
 
 describe("mock image uploads", () => {
   let snapshot = structuredClone(mockState);
@@ -8,6 +8,17 @@ describe("mock image uploads", () => {
   afterEach(() => {
     Object.assign(mockState, snapshot);
     snapshot = structuredClone(mockState);
+  });
+
+  it("rejects unknown targets and previews the requested VM's current image references", async () => {
+    await expect(getVM("missing-vm")).rejects.toMatchObject({ code: "not_found" });
+    await expect(previewVMAction("missing-vm", "restart")).rejects.toMatchObject({ code: "not_found" });
+    await expect(previewImageAction("missing-image", "retire")).rejects.toMatchObject({ code: "not_found" });
+    const vm = mockState.vms[0];
+    const image = mockState.images.find((candidate) => candidate.fingerprint === vm.image.fingerprint)!;
+    image.references.active = 7;
+    const preview = await previewVMAction(vm.task_id, "restart", vm);
+    expect(preview.impact.affected_image_references).toEqual(image.references);
   });
 
   it("continues the awaiting operation without reading demo content", async () => {

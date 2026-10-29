@@ -28,6 +28,7 @@ const listeners = new Set<() => void>();
 let runtime: DemoRuntimeState | null = null;
 
 const inspectorLayoutStorageKey = "agent-vm:demo-inspector-layout";
+const inspectorExpandedLayoutStorageKey = "agent-vm:demo-inspector-expanded-layout";
 const inspectorPositionStorageKey = "agent-vm:demo-inspector-position";
 
 const isDemoBuild = import.meta.env.MODE === "demo";
@@ -133,10 +134,31 @@ export function getDemoInspectorLayout(): DemoInspectorLayout {
 export function saveDemoInspectorLayout(layout: DemoInspectorLayout): void {
   if (typeof window === "undefined") return;
   try {
+    if (layout !== "minimized") window.localStorage.setItem(inspectorExpandedLayoutStorageKey, layout);
     window.localStorage.setItem(inspectorLayoutStorageKey, layout);
   } catch {
     // Local layout persistence is best-effort and must not affect the demo runtime.
   }
+}
+
+export function saveDemoInspectorExpandedLayout(layout: Exclude<DemoInspectorLayout, "minimized">): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(inspectorExpandedLayoutStorageKey, layout);
+  } catch {
+    // Local layout persistence is best-effort.
+  }
+}
+
+export function getDemoInspectorExpandedLayout(): Exclude<DemoInspectorLayout, "minimized"> {
+  if (typeof window === "undefined") return "floating";
+  try {
+    const stored = window.localStorage.getItem(inspectorExpandedLayoutStorageKey);
+    if (stored === "left" || stored === "right" || stored === "floating") return stored;
+  } catch {
+    // The default remains usable when storage is unavailable.
+  }
+  return "floating";
 }
 
 export function getDemoInspectorPosition(): DemoInspectorPosition | null {

@@ -78,6 +78,26 @@ test("supports left, right, floating and minimized inspector positions", async (
   await expect(runtime).toHaveClass(/demo-runtime--floating/);
 });
 
+test("restores the docked inspector after a minimized reload", async ({ page }) => {
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto("?demo=normal");
+  await page.getByRole("button", { name: "Inspector position" }).click({ button: "right" });
+  await page.getByRole("menuitemradio", { name: "Minimize" }).click();
+  await page.reload();
+  await page.getByRole("button", { name: "Open demo inspector" }).click();
+  await expect(page.locator(".demo-runtime")).toHaveClass(/demo-runtime--right/);
+});
+
+test("shows the simulated network failure without making real API requests", async ({ page }) => {
+  const realRequests: string[] = [];
+  page.on("request", (request) => { if (request.url().includes("/api/v1")) realRequests.push(request.url()); });
+  await page.goto("?demo=normal&d_network=offline");
+  await expect(page.getByRole("button", { name: "Fault" })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByText("Failed", { exact: true }).last()).toBeVisible();
+  await expect(page.getByRole("button", { name: "Release lease" })).toHaveCount(0);
+  expect(realRequests).toEqual([]);
+});
+
 test("keeps the demo isolated while a scenario and simulated action change", async ({ page }) => {
   const realRequests: string[] = [];
   page.on("request", (request) => { if (request.url().includes("/api/v1")) realRequests.push(request.url()); });

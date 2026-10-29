@@ -129,8 +129,10 @@ export async function listVMs(filters: { q?: string; state?: string; leaseState?
 }
 
 export async function getVM(taskId: string): Promise<ManagedVM> {
-  const state = mockStateForRequest();
-  return useRealApi ? realRequest<ManagedVM>(`/vms/${encodeURIComponent(taskId)}`) : delay(state.vms.find((vm) => vm.task_id === taskId) ?? state.vms[0]);
+  if (useRealApi) return realRequest<ManagedVM>(`/vms/${encodeURIComponent(taskId)}`);
+  const vm = mockStateForRequest().vms.find((candidate) => candidate.task_id === taskId);
+  if (!vm) throw new ManagementRequestError("not_found");
+  return delay(vm);
 }
 
 export async function listImages(query = "", cursor?: string): Promise<{ items: ManagedImage[]; page: { limit: number; next_cursor: string | null }; default_fingerprint: string | null; selection_version: string; catalog_version: string }> {
@@ -163,10 +165,10 @@ export async function previewVMAction(taskId: string, action: string, current?: 
   mockStateForRequest();
   assertMockMutationAllowed();
   const state = getMockState();
-  const vm = state.vms.find((candidate) => candidate.task_id === taskId) ?? state.vms[0];
+  const vm = state.vms.find((candidate) => candidate.task_id === taskId);
   if (!vm) throw new ManagementRequestError("not_found");
   if (current && (current.resource_version !== vm.resource_version || current.generation !== vm.generation)) throw new ManagementRequestError("stale_target", "precondition", null, { current_target_version: vm.resource_version });
-  return delay(issueMockPreview(state, { kind: "vm", targetId: taskId, action, targetVersion: vm.resource_version, expectedGeneration: vm.generation, parameters }, { summary_code: vm.lease.state === "effective" ? "effective_lease_affected" : "no_active_lease", affected_session_count: vm.lease.state === "effective" ? 1 : 0, affected_image_references: vm.image.fingerprint === mockState.images[0].fingerprint ? mockState.images[0].references : { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 }, changes: [{ code: action === "destroy" ? "session_access_revoked" : "native_action", count: 1, value: null }] }));
+  return delay(issueMockPreview(state, { kind: "vm", targetId: taskId, action, targetVersion: vm.resource_version, expectedGeneration: vm.generation, parameters }, { summary_code: vm.lease.state === "effective" ? "effective_lease_affected" : "no_active_lease", affected_session_count: vm.lease.state === "effective" ? 1 : 0, affected_image_references: { ...(state.images.find((image) => image.fingerprint === vm.image.fingerprint)?.references ?? emptyReferences) }, changes: [{ code: action === "destroy" ? "session_access_revoked" : "native_action", count: 1, value: null }] }));
 }
 
 export async function submitVMAction(taskId: string, action: string, reason: string, preview: ActionPreview, expectedGeneration: string, parameters: Record<string, unknown> = {}, operationId = createOperationId()): Promise<Operation> {
@@ -223,7 +225,7 @@ export async function previewImageAction(fingerprint: string, action: "default" 
   mockStateForRequest();
   assertMockMutationAllowed();
   const state = getMockState();
-  const image = state.images.find((candidate) => candidate.fingerprint === fingerprint) ?? state.images[0];
+  const image = state.images.find((candidate) => candidate.fingerprint === fingerprint);
   if (!image) throw new ManagementRequestError("not_found");
   const targetVersion = action === "default" ? state.image_selection_version : image.resource_version;
   if (currentResourceVersion !== undefined && currentResourceVersion !== targetVersion) throw new ManagementRequestError("stale_target", "precondition", null, { current_target_version: targetVersion });

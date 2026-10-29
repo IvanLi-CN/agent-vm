@@ -27,5 +27,6 @@ export const OperationsAudit: Story = { render: () => <StoryFrame page="operatio
 export const SystemMaintenance: Story = { render: () => <StoryFrame page="system"><SystemPage /></StoryFrame> };
 export const DemoInspectorPanel: Story = { render: () => <div style={{ minHeight: "720px" }}><DemoInspector /></div> };
 export const DemoInspectorFloating: Story = { render: () => <div style={{ minHeight: "720px" }}><DemoInspector layout="floating" /></div> };
+export const DemoInspectorPositionMenu: Story = { render: () => <div style={{ minHeight: "720px" }}><DemoInspector layout="floating" /></div>, play: async ({ canvasElement }) => { const button = await within(canvasElement).findByRole("button", { name: "Inspector position" }); await userEvent.pointer({ keys: "[MouseRight]", target: button }); expect(await within(document.body).findByRole("menu", { name: "Choose inspector position" })).toBeVisible(); } };
 export const DemoInspectorRightRail: Story = { render: () => <div style={{ minHeight: "720px" }}><DemoInspector layout="right" /></div> };
 export const DemoInspectorMinimized: Story = { render: () => <div style={{ minHeight: "720px" }}><DemoInspector layout="minimized" /></div> };

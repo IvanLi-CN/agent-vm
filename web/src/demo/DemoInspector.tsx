@@ -1,7 +1,7 @@
 import { Check, Clipboard, Minimize2, Move, PanelLeft, PanelRight, RotateCcw, Wifi, WifiOff } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent } from "react";
 import { useTranslation } from "react-i18next";
-import { demoShareUrl, getDemoInspectorPosition, saveDemoInspectorPosition, setDemoControl, useDemoRuntime, type DemoDataMode, type DemoInspectorLayout, type DemoInspectorPosition, type DemoPersona, type DemoRuntimeState, type DemoScene } from "./runtime";
+import { demoShareUrl, getDemoInspectorExpandedLayout, getDemoInspectorPosition, saveDemoInspectorExpandedLayout, saveDemoInspectorPosition, setDemoControl, useDemoRuntime, type DemoDataMode, type DemoInspectorLayout, type DemoInspectorPosition, type DemoPersona, type DemoRuntimeState, type DemoScene } from "./runtime";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { Button, StatusBadge } from "../components/ui";
 import { Button as ShadcnButton } from "../components/ui/button";
@@ -43,7 +43,7 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
   const [floatingPosition, setFloatingPosition] = useState<DemoInspectorPosition | null>(() => getDemoInspectorPosition());
   const [dragging, setDragging] = useState(false);
   const inspectorRef = useRef<HTMLElement>(null);
-  const lastExpandedLayout = useRef<ExpandedLayout>(controlledLayout && controlledLayout !== "minimized" ? controlledLayout : "floating");
+  const lastExpandedLayout = useRef<ExpandedLayout>(controlledLayout && controlledLayout !== "minimized" ? controlledLayout : getDemoInspectorExpandedLayout());
   const longPressTimer = useRef<number | null>(null);
   const suppressClick = useRef(false);
   const floatingPositionRef = useRef(floatingPosition);
@@ -82,6 +82,7 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
   };
 
   const changeLayout = (next: DemoInspectorLayout) => {
+    if (next === "minimized") saveDemoInspectorExpandedLayout(lastExpandedLayout.current);
     if (next !== "minimized") lastExpandedLayout.current = next;
     if (!controlledLayout) setLocalLayout(next);
     onLayoutChange?.(next);
