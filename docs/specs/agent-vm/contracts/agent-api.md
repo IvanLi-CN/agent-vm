@@ -14,12 +14,12 @@ The endpoint accepts only the fixed method, path, request size, JSON shape and a
 
 ## Authorization
 
-The service resolves the Token's validation digest, checks expiry and revocation with a linearizable read, and verifies that the requested scope covers the action. A Token whose `revoked_at` was committed before this authorization read is rejected; an already-authorized in-flight operation is not retroactively rolled back. A machine Token has no pre-bound session or user-owner relation; the target `session_id` comes from the protocol-4 request and is checked against current resource state. The first release fixes this mapping; there is no implicit scope inheritance:
+The service resolves the Token's validation digest, checks expiry and revocation with a linearizable read, and verifies that the requested scope covers the action. A Token whose `revoked_at` was committed before this authorization read is rejected; an already-authorized in-flight operation is not retroactively rolled back. A machine Token has no pre-bound session or user-owner relation; the target `session_id` comes from the protocol-4 request and is checked against current resource state. The first release fixes this mapping; there is no implicit scope inheritance. Token issuance rejects `agent:operate` unless `agent:read` is also explicitly present, so operation-capable Tokens can query status/reconciliation after a lost response:
 
 | Token scope | Protocol-4 actions authorized by that scope |
 | --- | --- |
 | `agent:read` | `doctor`, `status`, `port-list` |
-| `agent:operate` | `acquire`, `renew`, `release`, `destroy`, `restart`, `resize`, `port-add`, `port-remove` |
+| `agent:operate` (issued with explicit `agent:read`) | `acquire`, `renew`, `release`, `destroy`, `restart`, `resize`, `port-add`, `port-remove` |
 | `agent:sync` | `ssh-info` only, to obtain the session's bounded SSH/source-transfer connection data; it does not authorize arbitrary SSH commands, `exec`, file transfer or export by itself. |
 | `agent:observe_admin` | Read-only `admin-metrics`, `admin-status`, `admin-session-list` and `drain-status`; the scope itself is the explicit machine authorization for these observations. |
 

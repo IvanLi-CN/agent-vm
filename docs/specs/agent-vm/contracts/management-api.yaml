@@ -681,7 +681,7 @@ paths:
       tags: [Operations]
       operationId: listOperations
       summary: List durable management operations visible to the current principal
-      description: The sole administrator receives field-whitelisted operations. The actor is either the exact current (issuer, subject) pair or an explicitly marked historical actor whose original value is retained without identity inference.
+      description: The sole administrator receives field-whitelisted operations. The actor is the exact current (issuer, subject) pair, a typed rejected request without administrator authority, or an explicitly marked historical actor whose original value is retained without identity inference.
       parameters:
         - name: status
           in: query
@@ -722,7 +722,7 @@ paths:
       tags: [Operations]
       operationId: getOperation
       summary: Read an operation by its durable identity
-      description: The sole administrator receives field-whitelisted operation status. Historical actor values remain explicitly unknown and are never converted into a guessed OIDC identity. Token-create results never contain bearer plaintext.
+      description: The sole administrator receives field-whitelisted operation status. Current rejected-request actors and historical actor values remain explicitly non-administrator identities and are never converted into a guessed OIDC identity. Token-create results never contain bearer plaintext.
       responses:
         "200":
           description: Current phase, outcome and safe result or error.
@@ -1008,11 +1008,21 @@ components:
           minLength: 1
           maxLength: 512
           description: Original actor value retained verbatim from legacy state; it is not an authentication or authorization identity.
+    RejectedRequestActor:
+      type: object
+      additionalProperties: false
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [unauthenticated, unauthorized]
+          description: Current rejected request without an administrator identity; this actor grants no role or capability and carries no inferred OIDC identity.
     AuditActor:
       oneOf:
         - $ref: "#/components/schemas/Principal"
         - $ref: "#/components/schemas/HistoricalActor"
-      description: Current administrator actor or an explicitly unknown historical actor with its original value preserved.
+        - $ref: "#/components/schemas/RejectedRequestActor"
+      description: Current administrator actor, a typed rejected request without administrator authority, or an explicitly unknown historical actor with its original value preserved.
     Token:
       type: object
       additionalProperties: false
@@ -1058,6 +1068,19 @@ components:
       type: object
       additionalProperties: false
       required: [operation_id, scopes, expires_at]
+      allOf:
+        - if:
+            required: [scopes]
+            properties:
+              scopes:
+                contains:
+                  const: agent:operate
+          then:
+            properties:
+              scopes:
+                contains:
+                  const: agent:read
+                description: An operation Token must explicitly include agent:read so its client can query status/reconciliation after a lost response; scope inheritance is not allowed.
       properties:
         operation_id:
           type: string
@@ -1069,7 +1092,7 @@ components:
           maxLength: 512
           description: Optional audit reason; omission is valid and is retained as absent.
         scopes:
-          description: Machine capabilities; agent:observe_admin is an explicit scope for read-only administrator observations.
+          description: Machine capabilities; agent:observe_admin is an explicit scope for read-only administrator observations. If agent:operate is present, agent:read must also be present explicitly for status/reconciliation recovery; there is no implicit scope inheritance.
           type: array
           minItems: 1
           uniqueItems: true
@@ -1851,10 +1874,35 @@ components:
         effect:
           type: [string, "null"]
           enum: [changed, unchanged, stopped, destroyed, verified, deleted, retired, completed, null]
+    TokenCreateOperationResult:
+      allOf:
+        - $ref: "#/components/schemas/OperationResult"
+        - type: object
+          required: [token_metadata, plaintext_disclosure]
+          properties:
+            token_metadata:
+              $ref: "#/components/schemas/Token"
+            plaintext_disclosure:
+              type: string
+              enum: [returned, consumed]
+          description: A succeeded token_create operation must expose safe Token metadata, including token_id, and the durable plaintext disclosure state; it never contains the bearer value.
     Operation:
       type: object
       additionalProperties: false
       required: [operation_id, action, status, phase, target, actor, created_at, updated_at]
+      allOf:
+        - if:
+            required: [action, status]
+            properties:
+              action:
+                const: token_create
+              status:
+                const: succeeded
+          then:
+            required: [result]
+            properties:
+              result:
+                $ref: "#/components/schemas/TokenCreateOperationResult"
       properties:
         operation_id:
           type: string
@@ -1885,6 +1933,7 @@ components:
           oneOf:
             - $ref: "#/components/schemas/OperationResult"
             - type: "null"
+          description: Required and non-null for a succeeded token_create operation; that result contains token_metadata and plaintext_disclosure.
         error:
           oneOf:
             - $ref: "#/components/schemas/SafeError"

@@ -4,7 +4,7 @@ The Token API is the same-origin `/api/v1/tokens` surface used by the sole authe
 
 ## Identity and target model
 
-The authenticated administrator is the exact case-sensitive `(issuer, subject)` pair produced by OIDC. Email, display name, group membership and browser-provided identity headers are not identity keys. This pair is the actor recorded for issuance, revocation and audit; it is not a user-resource relation.
+The authenticated administrator is the exact case-sensitive `(issuer, subject)` pair produced by OIDC. Email, display name, group membership and browser-provided identity headers are not identity keys. This pair is the actor recorded for authenticated issuance, revocation and their audit entries; rejected unauthenticated or unauthorized requests use the typed actor defined by the management contract and are not assigned administrator identity. The pair is not a user-resource relation.
 
 Every machine Token has an opaque `token_id`, an opaque `resource_version`, a bounded scope set, creation time, expiry and revocation state. It has no owner field and no pre-bound session set. A valid, unexpired, non-revoked Token may target any `session_id` carried by a protocol-4 request when its scope permits the action; the service still checks the target session's generation, lease, native identity and state for every request.
 
@@ -20,7 +20,7 @@ All browser mutations require the opaque browser session cookie, the session-bou
 | `POST /api/v1/tokens/{token_id}/revoke` | Revoke a Token idempotently. | The request must carry the current preview version and single-use confirmation token. |
 | `GET /api/v1/tokens/{token_id}` | Read one Token's metadata. | Return safe metadata only, including `resource_version`. |
 
-The create request contains an operation ID for durable idempotency. It may also contain an audit `reason`; omission is valid.
+The create request contains an operation ID for durable idempotency. It may also contain an audit `reason`; omission is valid. If `scopes` includes `agent:operate`, it must also explicitly include `agent:read` so the same Token can query status/reconciliation after a lost response; the service never infers one scope from another.
 
 ```json
 {
@@ -32,7 +32,7 @@ The create request contains an operation ID for durable idempotency. It may also
 
 The operation identity is the exact `(issuer, subject, operation_id, canonical request digest)` tuple. The authenticated browser session, CSRF token and exact configured `Origin` are checked before looking up or mutating that operation. The service must apply a configured maximum lifetime, reject an empty scope set, and accept `agent:observe_admin` only as an explicit machine scope for read-only administrator observations.
 
-On the first successful create transaction, the service generates the high-entropy opaque value, stores only its versioned validation digest and safe metadata, creates the `token_create` operation result, and atomically consumes a persistent one-time plaintext-disclosure latch before sending the `201` response. That response contains the `operation_id`, `token_id`, `resource_version`, scopes, expiry, revocation state, disclosure state and a `token` field. The bearer is held only long enough to form that response; it is never written to the database, operation record, audit event or log.
+On the first successful create transaction, the service generates the high-entropy opaque value, stores only its versioned validation digest and safe metadata, creates the `token_create` operation result, and atomically consumes a persistent one-time plaintext-disclosure latch before sending the `201` response. The succeeded operation result is mandatory and contains the `token_id` through safe `token_metadata` plus the durable `plaintext_disclosure` state; it never contains the bearer value. That response contains the `operation_id`, `token_id`, `resource_version`, scopes, expiry, revocation state, disclosure state and a `token` field. The bearer is held only long enough to form that response; it is never written to the database, operation record, audit event or log.
 
 An identical request arriving concurrently or after the latch is consumed returns the existing operation outcome and safe Token metadata without a `token` field, with disclosure state `consumed`. A retry with a different canonical request returns `operation_conflict`; the administrator actor is part of the operation identity. The latch is consumed before the first response is sent, so a process crash or network loss after the durable commit is treated as a lost response and never authorizes plaintext re-disclosure. `GET /api/v1/operations/{operation_id}` returns the operation target `token_id`, safe `token_metadata` and disclosure state, but never the bearer.
 
