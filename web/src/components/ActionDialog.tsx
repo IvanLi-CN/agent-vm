@@ -21,7 +21,7 @@ export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm
       if (document.activeElement !== targetElement) window.setTimeout(() => targetElement.focus(), 0);
     };
   }, []);
-  useEffect(() => {
+  useLayoutEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
     const inerted: Array<{ element: HTMLElement; inert: boolean; hadInertAttribute: boolean; ariaHidden: string | null }> = [];

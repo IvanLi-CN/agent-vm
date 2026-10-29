@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, ChevronLeft, ChevronRight, KeyRound, ShieldCheck, UserRound } from "lucide-react";
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ManagementRequestError, createAgentToken, createOperationId, getManagementSession, getOperation, listTokens, previewTokenRevocation, submitTokenRevocation } from "../app/api";
 import { formatDateTime } from "../app/format";
@@ -118,13 +118,19 @@ export function TokenManagement() {
 
   useEffect(() => { refreshSessionAfterAuthFailure(tokensQuery.error); }, [tokensQuery.error]);
   useEffect(() => { client.setQueryDefaults(createRecoveryQueryKey, { gcTime: Infinity }); }, [client]);
+  const persistCreateRecovery = useCallback((snapshot: CreateRecoverySnapshot | null) => {
+    if (snapshot) client.setQueryData(createRecoveryQueryKey, snapshot);
+    else client.removeQueries({ queryKey: createRecoveryQueryKey, exact: true });
+  }, [client]);
+
   useEffect(() => {
     const snapshot: CreateRecoverySnapshot = { createRequest, createOperationIdValue, createRecoveryOperationId, createRecoveryStatus, createRecoveryTokenId, createRecoveryDecision, createRecoveryError };
-    if (snapshot.createRequest || snapshot.createOperationIdValue || snapshot.createRecoveryOperationId || snapshot.createRecoveryStatus || snapshot.createRecoveryTokenId || snapshot.createRecoveryDecision || snapshot.createRecoveryError) client.setQueryData(createRecoveryQueryKey, snapshot);
-    else client.removeQueries({ queryKey: createRecoveryQueryKey, exact: true });
-  }, [client, createRequest, createOperationIdValue, createRecoveryOperationId, createRecoveryStatus, createRecoveryTokenId, createRecoveryDecision, createRecoveryError]);
+    if (snapshot.createRequest || snapshot.createOperationIdValue || snapshot.createRecoveryOperationId || snapshot.createRecoveryStatus || snapshot.createRecoveryTokenId || snapshot.createRecoveryDecision || snapshot.createRecoveryError) persistCreateRecovery(snapshot);
+    else persistCreateRecovery(null);
+  }, [createRequest, createOperationIdValue, createRecoveryOperationId, createRecoveryStatus, createRecoveryTokenId, createRecoveryDecision, createRecoveryError, persistCreateRecovery]);
 
   const clearCreateRecovery = () => {
+    persistCreateRecovery(null);
     setCreateRequest(null);
     setCreateOperationIdValue(null);
     setCreateRecoveryOperationId(null);
@@ -145,6 +151,7 @@ export function TokenManagement() {
     onSuccess: (result: TokenCreateResult, request: CreateRequest) => {
       const mutation = client.getMutationCache().getAll().find((candidate) => candidate.state.variables === request);
       if (mutation) client.getMutationCache().remove(mutation);
+      persistCreateRecovery(null);
       setCreateError(null);
       setCreateRecoveryPending(false);
       clearCreateRecovery();
@@ -171,6 +178,15 @@ export function TokenManagement() {
         clearCreateRecovery();
         return;
       }
+      persistCreateRecovery({
+        createRequest: request,
+        createOperationIdValue: null,
+        createRecoveryOperationId: request.operationId,
+        createRecoveryStatus: null,
+        createRecoveryTokenId: null,
+        createRecoveryDecision: "check",
+        createRecoveryError: null,
+      });
       setCreateRequest(request);
       setCreateOperationIdValue(null);
       setCreateRecoveryOperationId(request.operationId);

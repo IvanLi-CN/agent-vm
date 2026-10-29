@@ -135,6 +135,29 @@ describe("TokenManagement pagination", () => {
     resolveCreate?.({ operation_id: "operation-pending-01", metadata: token("tok_pending_01"), plaintext_disclosure: "consumed" });
   });
 
+  it("clears deterministic create recovery when the response arrives after page unmount", async () => {
+    const user = userEvent.setup();
+    let rejectCreate: ((error: unknown) => void) | undefined;
+    listTokensMock.mockReset().mockResolvedValue({ items: [], page: { limit: 25, next_cursor: null } });
+    createAgentTokenMock.mockReset().mockImplementationOnce(() => new Promise((_, reject) => { rejectCreate = reject; }));
+
+    const firstRender = renderTokenManagement();
+    await screen.findByTestId("token-management");
+    (document.querySelector("form") as HTMLFormElement).noValidate = true;
+    const createButton = screen.getByRole("button", { name: /创建 Token|create token/i });
+    await waitFor(() => expect(createButton).toBeEnabled());
+    await user.click(createButton);
+    await waitFor(() => expect(createAgentTokenMock).toHaveBeenCalled());
+
+    firstRender.unmount();
+    rejectCreate?.(new ManagementRequestError("invalid_request", "validation"));
+    await waitFor(() => expect(firstRender.client.getQueryData(["token-create-recovery"])).toBeUndefined());
+
+    renderTokenManagement(firstRender.client);
+    expect(await screen.findByRole("button", { name: /创建 Token|create token/i })).toBeEnabled();
+    expect(screen.queryByRole("button", { name: /查询操作|check operation/i })).not.toBeInTheDocument();
+  });
+
   it("allows revocation of an expired but not revoked token", async () => {
     const expired = { ...token("tok_expired_01"), expires_at: "2026-01-15T00:00:00.000Z" };
     listTokensMock.mockReset().mockResolvedValue({ items: [expired], page: { limit: 25, next_cursor: null } });
