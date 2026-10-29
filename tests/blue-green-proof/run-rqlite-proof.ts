@@ -9,6 +9,9 @@ const TARGET_VERSION = "v10.5.2";
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_HTTP_PORT = 0;
 const DEFAULT_RAFT_PORT = 0;
+const HTTP_REQUEST_TIMEOUT_MS = 10_000;
+const READINESS_REQUEST_TIMEOUT_MS = 1_000;
+const READINESS_BUDGET_MS = 30_000;
 
 type JsonObject = Record<string, unknown>;
 type Cell = string | number | boolean | null;
@@ -52,6 +55,8 @@ type ProxyOutcome = {
   status_code: number | null;
   response_bytes: number;
 };
+
+let activeRequestAbortController: AbortController | null = null;
 
 function sleep(milliseconds: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, milliseconds));
@@ -117,18 +122,38 @@ function asRows(value: unknown, context: string): QueryRow[] {
   return value as QueryRow[];
 }
 
-async function jsonRequest(url: string, init: RequestInit = {}): Promise<{ status: number; body: JsonObject; text: string }> {
-  const response = await fetch(url, init);
-  const text = await response.text();
-  let parsed: unknown;
+async function jsonRequest(url: string, init: RequestInit = {}, timeoutMs = HTTP_REQUEST_TIMEOUT_MS): Promise<{ status: number; body: JsonObject; text: string }> {
+  const requestController = new AbortController();
+  const activeSignal = activeRequestAbortController?.signal;
+  const abortFromRun = (): void => requestController.abort();
+  if (activeSignal?.aborted) requestController.abort();
+  else activeSignal?.addEventListener("abort", abortFromRun, { once: true });
+  const timeout = setTimeout(() => requestController.abort(), timeoutMs);
   try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new HttpFailure(response.status, "rqlite returned non-JSON", { text: text.slice(0, 400) });
+    const response = await fetch(url, { ...init, signal: requestController.signal });
+    const text = await response.text();
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new HttpFailure(response.status, "rqlite returned non-JSON", { text: text.slice(0, 400) });
+    }
+    const body = asObject(parsed, "rqlite response");
+    if (!response.ok) throw new HttpFailure(response.status, `rqlite HTTP ${response.status}`, body);
+    return { status: response.status, body, text };
+  } catch (error) {
+    if (requestController.signal.aborted) {
+      throw new ProofFailure("rqlite HTTP request timed out or was interrupted", {
+        url,
+        timeout_ms: timeoutMs,
+        interrupted: activeSignal?.aborted === true,
+      });
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    activeSignal?.removeEventListener("abort", abortFromRun);
   }
-  const body = asObject(parsed, "rqlite response");
-  if (!response.ok) throw new HttpFailure(response.status, `rqlite HTTP ${response.status}`, body);
-  return { status: response.status, body, text };
 }
 
 function rqliteResultErrors(body: JsonObject): string[] {
@@ -142,19 +167,21 @@ function rqliteResultErrors(body: JsonObject): string[] {
 
 async function waitForReady(baseUrl: string, server: RqliteProcess): Promise<JsonObject> {
   let lastStatus: JsonObject = {};
-  for (let attempt = 0; attempt < 300; attempt += 1) {
-    if (server.process.exitCode !== null) {
-      throw new ProofFailure("rqlite exited before becoming ready", { exit_code: server.process.exitCode, log: server.log.join("").slice(-2000) });
+  const deadline = Date.now() + READINESS_BUDGET_MS;
+  for (let attempt = 0; attempt < 300 && Date.now() < deadline; attempt += 1) {
+    if (childExited(server.process)) {
+      throw new ProofFailure("rqlite exited before becoming ready", { ...childExitDetail(server.process), log: server.log.join("").slice(-2000) });
     }
     try {
-      const response = await jsonRequest(`${baseUrl}/status`);
+      const response = await jsonRequest(`${baseUrl}/status`, {}, READINESS_REQUEST_TIMEOUT_MS);
       lastStatus = response.body;
       const store = asObject(response.body.store, "status.store");
       if (store.ready === true) return response.body;
-    } catch {
+    } catch (error) {
+      if (activeRequestAbortController?.signal.aborted) throw error;
       // The process is still starting. The bounded loop is the readiness budget.
     }
-    await sleep(100);
+    await sleep(Math.min(100, Math.max(0, deadline - Date.now())));
   }
   throw new ProofFailure("rqlite did not become ready", { lastStatus });
 }
@@ -190,17 +217,25 @@ function startRqlite(options: Options): RqliteProcess {
   const stop = (): Promise<void> => {
     if (stopPromise) return stopPromise;
     stopPromise = (async () => {
-      if (child.exitCode !== null) return;
+      if (childExited(child)) return;
       child.kill("SIGTERM");
-      for (let attempt = 0; attempt < 50 && child.exitCode === null; attempt += 1) await sleep(100);
-      if (child.exitCode === null) child.kill("SIGKILL");
-      for (let attempt = 0; attempt < 100 && child.exitCode === null; attempt += 1) await sleep(100);
-      if (child.exitCode === null) throw new ProofFailure("rqlite did not exit after SIGKILL", { pid: child.pid });
+      for (let attempt = 0; attempt < 50 && !childExited(child); attempt += 1) await sleep(100);
+      if (!childExited(child)) child.kill("SIGKILL");
+      for (let attempt = 0; attempt < 100 && !childExited(child); attempt += 1) await sleep(100);
+      if (!childExited(child)) throw new ProofFailure("rqlite did not exit after SIGKILL", { pid: child.pid });
     })();
     return stopPromise;
   };
 
   return { process: child, log, stop };
+}
+
+function childExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function childExitDetail(child: ChildProcess): JsonObject {
+  return { exit_code: child.exitCode, signal: child.signalCode };
 }
 
 async function execute(baseUrl: string, statements: string[]): Promise<JsonObject> {
@@ -411,9 +446,12 @@ async function run(options: Options): Promise<JsonObject> {
   const runtimeOptions = { ...options, httpPort, raftPort };
   const baseUrl = `http://${runtimeOptions.host}:${runtimeOptions.httpPort}`;
   const server = startRqlite(runtimeOptions);
+  const requestAbortController = new AbortController();
+  activeRequestAbortController = requestAbortController;
   let interrupted: NodeJS.Signals | null = null;
   const onSignal = (signal: NodeJS.Signals): void => {
     interrupted ??= signal;
+    requestAbortController.abort();
     void server.stop();
   };
   process.once("SIGINT", onSignal);
@@ -566,6 +604,7 @@ async function run(options: Options): Promise<JsonObject> {
     } finally {
       process.off("SIGINT", onSignal);
       process.off("SIGTERM", onSignal);
+      if (activeRequestAbortController === requestAbortController) activeRequestAbortController = null;
       writeFileSync(join(options.proofDir, "rqlite.log"), server.log.join(""));
     }
   }
