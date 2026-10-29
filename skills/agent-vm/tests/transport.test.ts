@@ -132,6 +132,28 @@ test("HTTPS response overflow reports an uncertain result and preserves the pend
   expect(readJson(f.client.operationPath("https-session", "overflow-operation")).outcome).toBe("pending");
 });
 
+test("HTTPS response overflow reports unverified cleanup when cancellation fails", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  f.client.http = async () => ({
+    status: 200,
+    body: {
+      getReader: () => ({
+        read: async () => ({ done: false, value: Buffer.from("x".repeat(STDOUT_LIMIT + 1)) }),
+        cancel: async () => { throw new Error("cancel failed"); },
+        releaseLock: () => {},
+      }),
+    },
+  } as unknown as Response);
+  let error: any;
+  try { await f.client.request("renew", { session: "https-session", generation: 12, operationId: "overflow-cleanup-operation", write: true }); }
+  catch (caught) { error = caught; }
+  expect(error).toMatchObject({ code: "remote_failed", detail: { operation_id: "overflow-cleanup-operation", generation: 12, transport: "https", stream_cleanup_verified: false, stream_cleanup_error: "reader_cancelled_before_eof" } });
+  expect(error.message).toContain("stream cleanup is not verified");
+  expect(readJson(f.client.operationPath("https-session", "overflow-cleanup-operation")).outcome).toBe("pending");
+});
+
 test("D transport regression: canonical controller directly with Bun, safe quoting and budgets", async () => {
   const f = fixture();
   const budgets: number[] = [];

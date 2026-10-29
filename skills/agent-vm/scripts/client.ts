@@ -21,7 +21,9 @@ export interface HttpsConfig {
   tls: { ca?: string; rejectUnauthorized: true };
 }
 const defaultHttp: HttpRequester = (url, init) => fetch(url, init as RequestInit);
-class ResponseLimitExceeded extends Error {}
+class ResponseLimitExceeded extends Error {
+  constructor(readonly streamCleanupVerified: boolean) { super(); }
+}
 
 export function httpsEndpoint(value = process.env.AGENT_VM_CONTROL_HOST): string {
   if (!value) fail("config_missing", "AGENT_VM_CONTROL_HOST is required for the HTTPS control transport");
@@ -56,23 +58,30 @@ export function httpsConfig(env = process.env): HttpsConfig {
   return { url: httpsEndpoint(env.AGENT_VM_CONTROL_HOST), token, tls: { ...(ca === undefined ? {} : { ca }), rejectUnauthorized: true } };
 }
 
-async function readResponseBody(response: Response, limit: number): Promise<Buffer> {
-  if (!response.body) return Buffer.alloc(0);
+async function readResponseBody(response: Response, limit: number): Promise<{ body: Buffer; streamCleanupVerified: boolean }> {
+  if (!response.body) return { body: Buffer.alloc(0), streamCleanupVerified: true };
   const reader = response.body.getReader(), chunks: Buffer[] = [];
   let size = 0;
+  let streamCleanupVerified = true;
+  let exceeded = false;
   try {
     for (;;) {
       const item = await reader.read();
-      if (item.done) return Buffer.concat(chunks);
+      if (item.done) break;
       const chunk = Buffer.from(item.value);
       size += chunk.length;
       if (size > limit) {
-        try { await reader.cancel(); } catch { /* response is already bounded as failed */ }
-        throw new ResponseLimitExceeded();
+        try { await reader.cancel(); } catch { streamCleanupVerified = false; }
+        exceeded = true;
+        break;
       }
       chunks.push(chunk);
     }
-  } finally { try { reader.releaseLock(); } catch { /* reader is already closed */ } }
+  } finally {
+    try { reader.releaseLock(); } catch { streamCleanupVerified = false; }
+  }
+  if (exceeded) throw new ResponseLimitExceeded(streamCleanupVerified);
+  return { body: Buffer.concat(chunks), streamCleanupVerified };
 }
 
 function redactSecret(value: any, secret: string): any {
@@ -235,13 +244,13 @@ export class Client {
         signal: controller.signal,
         tls: config.tls,
       });
-      let stdout: Buffer;
+      let stdout: { body: Buffer; streamCleanupVerified: boolean };
       try { stdout = await readResponseBody(response, STDOUT_LIMIT); }
       catch (error) {
-        if (error instanceof ResponseLimitExceeded) return { code: response.status, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), stdoutTruncated: true, stderrTruncated: false, timedOut: false, streamCleanupVerified: true };
+        if (error instanceof ResponseLimitExceeded) return { code: response.status, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), stdoutTruncated: true, stderrTruncated: false, timedOut: false, streamCleanupVerified: error.streamCleanupVerified };
         throw error;
       }
-      return { code: response.status >= 200 && response.status < 300 ? 0 : response.status, stdout, stderr: Buffer.alloc(0), stdoutTruncated: false, stderrTruncated: false, timedOut: false, streamCleanupVerified: true };
+      return { code: response.status >= 200 && response.status < 300 ? 0 : response.status, stdout: stdout.body, stderr: Buffer.alloc(0), stdoutTruncated: false, stderrTruncated: false, timedOut: false, streamCleanupVerified: stdout.streamCleanupVerified };
     } catch (error) {
       if (timedOut) fail("remote_timeout", "control outcome is uncertain; retry the same operation ID", detail);
       const message = error instanceof Error ? error.message.toLowerCase() : "";
