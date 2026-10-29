@@ -815,6 +815,39 @@ class WrapperTests(unittest.TestCase):
         for suffix in ("release-tmp", "restore-tmp"):
             self.assertTrue((self.root / (".client.ts." + suffix)).is_symlink())
 
+    def test_install_cleanup_and_restore_reject_symlinked_parent_directories(self):
+        source = self.root / "source.ts"
+        source.write_bytes(b"new")
+        bundle_root = Path(self.loaded["control_path"]).parent
+        bundle_root.mkdir(parents=True)
+        outside = self.root / "operator-owned"
+        outside.mkdir()
+        foreign = outside / "foreign.ts"
+        foreign.write_bytes(b"keep")
+        systemd = bundle_root / "systemd"
+        systemd.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaises(WRAPPER.WrapperError) as copy_failure:
+            WRAPPER._copy_atomic(source, systemd / "new.service", os.getuid(), 0o644)
+        self.assertEqual(copy_failure.exception.code, "activation_unverified")
+        self.assertFalse((outside / "new.service").exists())
+
+        with self.assertRaises(WRAPPER.WrapperError) as remove_failure:
+            WRAPPER._remove_owned_target(systemd / foreign.name, os.getuid(), (0o644,))
+        self.assertEqual(remove_failure.exception.code, "activation_unverified")
+        self.assertEqual(foreign.read_bytes(), b"keep")
+
+        with self.assertRaises(WRAPPER.WrapperError) as restore_failure:
+            WRAPPER._restore_targets({systemd / "restored.service": (b"old", 0o644, os.getuid())})
+        self.assertEqual(restore_failure.exception.code, "activation_restore_failed")
+        self.assertFalse((outside / "restored.service").exists())
+
+        with mock.patch.object(WRAPPER, "_copy_atomic") as copy:
+            with self.assertRaises(WRAPPER.WrapperError) as install_failure:
+                WRAPPER._install_release_files(self.loaded, self.root, {})
+        self.assertEqual(install_failure.exception.code, "activation_unverified")
+        copy.assert_not_called()
+
     def test_activation_failure_restores_existing_support_bytes_modes_and_owners(self):
         installed = Path(self.loaded["control_path"]).parent
         installed.mkdir(parents=True)

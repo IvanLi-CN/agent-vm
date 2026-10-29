@@ -247,6 +247,43 @@ def _require_root_owned_path(path: Path, label: str, *, regular: bool = False, a
             _fail("wrapper_config_invalid", f"{label} is not a regular file")
 
 
+def _require_directory_chain(path: Path, code: str, label: str) -> None:
+    """Reject a symlinked or non-directory existing path boundary."""
+    current = path
+    while True:
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            parent = current.parent
+            if parent == current:
+                return
+            current = parent
+            continue
+        except OSError:
+            _fail(code, f"cannot inspect {label}")
+        if stat.S_ISLNK(info.st_mode):
+            _fail(code, f"{label} contains a symlink")
+        if not stat.S_ISDIR(info.st_mode):
+            _fail(code, f"{label} is not a directory")
+        return
+
+
+def _activation_parent_dirs(config: Mapping[str, Any]) -> tuple[Path, ...]:
+    bundle_root = Path(config["control_path"]).parent
+    return tuple(dict.fromkeys((
+        bundle_root,
+        bundle_root / "bin",
+        bundle_root / "config",
+        bundle_root / "systemd",
+        Path(config["unit_dir"]),
+    )))
+
+
+def _require_activation_parent_dirs(config: Mapping[str, Any], code: str) -> None:
+    for path in _activation_parent_dirs(config):
+        _require_directory_chain(path, code, f"activation parent directory: {path}")
+
+
 def _paths_overlap(left: Path, right: Path) -> bool:
     # Compare configured path entries without following a current/previous
     # symlink into release_root.  Pointer targets are verified separately.
@@ -317,6 +354,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
                 _fail("wrapper_config_invalid", "wrapper paths must not overlap", {"left": str(left), "right": str(right)})
     for key, configured_path in ((key, config[key]) for key in config if isinstance(config[key], Path)):
         _require_root_owned_path(configured_path, key, allow_symlink=key in {"current_link", "previous_link"})
+    _require_activation_parent_dirs(config, "wrapper_config_invalid")
     return config
 
 
@@ -855,6 +893,7 @@ def _verify_retained_release(config: Mapping[str, Any], target: Path) -> dict[st
 
 def _atomic_symlink(target: Path, link: Path) -> None:
     temporary = link.with_name("." + link.name + ".tmp")
+    _require_directory_chain(link.parent, "activation_failed", f"release pointer parent: {link.parent}")
     try:
         if temporary.exists() or temporary.is_symlink():
             temporary.unlink()
@@ -866,7 +905,9 @@ def _atomic_symlink(target: Path, link: Path) -> None:
 
 
 def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
+    _require_directory_chain(target.parent, "activation_unverified", f"activation target parent: {target.parent}")
     target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    _require_directory_chain(target.parent, "activation_unverified", f"activation target parent: {target.parent}")
     if target.exists() or target.is_symlink():
         try:
             info = target.lstat()
@@ -897,6 +938,7 @@ def _copy_atomic(source: Path, target: Path, owner_uid: int, mode: int) -> None:
 
 def _remove_owned_target(path: Path, owner_uid: int, modes: tuple[int, ...]) -> None:
     """Remove one fixed predecessor artifact after checking its ownership and mode."""
+    _require_directory_chain(path.parent, "activation_unverified", f"activation target parent: {path.parent}")
     if not path.exists() and not path.is_symlink():
         return
     _require_owned_regular_modes(path, owner_uid, modes)
@@ -964,6 +1006,7 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
 def _snapshot_targets(config: Mapping[str, Any]) -> dict[Path, tuple[bytes, int, int] | None]:
     snapshot: dict[Path, tuple[bytes, int, int] | None] = {}
     for target in _activation_targets(config):
+        _require_directory_chain(target.parent, "activation_unverified", f"activation target parent: {target.parent}")
         if not target.exists() and not target.is_symlink():
             snapshot[target] = None
             continue
@@ -979,6 +1022,7 @@ def _snapshot_targets(config: Mapping[str, Any]) -> dict[Path, tuple[bytes, int,
 
 def _restore_targets(snapshot: Mapping[Path, tuple[bytes, int, int] | None]) -> None:
     for target, saved in snapshot.items():
+        _require_directory_chain(target.parent, "activation_restore_failed", f"activation target parent: {target.parent}")
         if saved is None:
             try:
                 if target.exists() or target.is_symlink():
@@ -991,6 +1035,7 @@ def _restore_targets(snapshot: Mapping[Path, tuple[bytes, int, int] | None]) -> 
         temporary = None
         try:
             target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            _require_directory_chain(target.parent, "activation_restore_failed", f"activation target parent: {target.parent}")
             descriptor, name = tempfile.mkstemp(prefix="." + target.name + ".", suffix=".restore-tmp", dir=target.parent)
             temporary = Path(name)
             with os.fdopen(descriptor, "wb") as handle:
@@ -1013,6 +1058,7 @@ def _restore_targets(snapshot: Mapping[Path, tuple[bytes, int, int] | None]) -> 
 
 def _restore_pointer(link: Path, target: Path | None) -> None:
     if target is None:
+        _require_directory_chain(link.parent, "activation_restore_failed", f"release pointer parent: {link.parent}")
         try:
             if link.exists() or link.is_symlink():
                 link.unlink()
@@ -1125,6 +1171,7 @@ def _verify_installed_release(
     manifest: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Verify the split runtime layout before using its control authority."""
+    _require_activation_parent_dirs(config, "drain_unverified")
     runtime_paths: Mapping[str, Path] | None = None
     if _is_go_manifest(manifest):
         runtime_paths = _native_runtime_artifact_paths(config, manifest)
@@ -1185,6 +1232,7 @@ def _verify_installed_release(
 def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any] | None = None) -> None:
     if not config["require_drained"]:
         return
+    _require_activation_parent_dirs(config, "drain_unverified")
     command = [BUN_PATH, str(config["control_path"])]
     sidecar = Path(config["control_path"]).with_name("client-release.json")
     manifest_path = sidecar.parent / MANIFEST_NAME
@@ -1397,6 +1445,7 @@ def _activate_legacy_runtime(*, native_already_stopped: bool = False) -> None:
 
 
 def _install_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
+    _require_activation_parent_dirs(config, "activation_unverified")
     if _is_product_manifest(manifest):
         _install_product_release_files(config, release_root, manifest)
         return
