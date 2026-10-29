@@ -10,8 +10,8 @@ test("supports left, right, floating and minimized inspector positions", async (
   await expect(page.locator(".demo-inspector")).toHaveCSS("position", "sticky");
   const positionButton = page.getByRole("button", { name: "Inspector position" });
   await positionButton.click();
-  await expect(page.getByRole("menu")).toBeVisible();
-  await page.keyboard.press("Escape");
+  await expect(page.getByRole("menu")).toHaveCount(0);
+  await expect(runtime).toHaveClass(/demo-runtime--right/);
   await positionButton.click({ button: "right" });
   await expect(page.getByRole("menu")).toBeVisible();
   await page.keyboard.press("Escape");
@@ -27,7 +27,7 @@ test("supports left, right, floating and minimized inspector positions", async (
   await expect(runtime).toHaveClass(/demo-runtime--left/);
   await expect(page.locator(".demo-inspector")).toHaveCSS("position", "sticky");
 
-  await positionButton.click();
+  await positionButton.click({ button: "right" });
   await page.getByRole("menuitemradio", { name: "Floating" }).click();
   await expect(runtime).toHaveClass(/demo-runtime--floating/);
   await expect(page.locator(".demo-inspector")).toHaveCSS("position", "fixed");
@@ -45,7 +45,7 @@ test("supports left, right, floating and minimized inspector positions", async (
   expect(afterDrag.x).toBeLessThan(beforeDrag.x - 50);
   expect(afterDrag.y).toBeGreaterThan(beforeDrag.y + 20);
 
-  await positionButton.click();
+  await positionButton.click({ button: "right" });
   await page.getByRole("menuitemradio", { name: "Minimize" }).click();
   await expect(runtime).toHaveClass(/demo-runtime--minimized/);
   await expect(shell).toHaveClass(/is-closed/);
@@ -99,7 +99,12 @@ test("supports a mobile inspector drawer and fail-closed bootstrap", async ({ pa
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("?demo=empty");
   await expect(page.getByTestId("overview-page")).toBeVisible();
-  await page.getByRole("button", { name: "Inspector position" }).click();
+  const mobilePositionButton = page.getByRole("button", { name: "Inspector position" });
+  await mobilePositionButton.click({ button: "right" });
+  await page.getByRole("menuitemradio", { name: "Right rail" }).click();
+  await mobilePositionButton.click();
+  await expect(page.getByRole("menu")).toHaveCount(0);
+  await page.getByRole("button", { name: "Inspector position" }).click({ button: "right" });
   await page.getByRole("menuitemradio", { name: "Minimize" }).click();
   await expect(page.getByRole("button", { name: "Open demo inspector" })).toBeVisible();
   await page.getByRole("button", { name: "Open demo inspector" }).click();
@@ -118,6 +123,8 @@ test("covers route pages, denied reads, keyboard controls and clipboard failure"
   await expect(page.getByTestId("system-page")).toBeVisible();
   await page.getByRole("button", { name: "Inspector position" }).focus();
   await page.keyboard.press("Enter");
+  await expect(page.getByRole("menu")).toHaveCount(0);
+  await page.keyboard.press("Shift+F10");
   await expect(page.getByRole("menu")).toBeVisible();
   await page.getByRole("menuitemradio", { name: "Minimize" }).click();
   await expect(page.getByRole("button", { name: "Open demo inspector" })).toBeVisible();
