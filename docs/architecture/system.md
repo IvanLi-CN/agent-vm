@@ -105,7 +105,7 @@ rqlite 在迁移后仍是唯一状态权威。若 rqlite 不可用、数据校�
 ## 架构验证条件
 
 - 验证 OIDC Authorization Code + PKCE 的 issuer/subject、state、nonce、签名、audience、过期和一次性回调消费；验证蓝绿切换后浏览器会话和 Token 摘要仍可用。
-- 验证仅配置的管理员主体可以建立浏览器会话，管理员敏感操作需要权限、原因、预览确认和完整审计；验证无预绑定机器 Token 的目标 session 检查、Token 撤销、过期、scope 缩减和未知主体拒绝。
+- 验证仅配置的管理员主体可以建立浏览器会话，管理员敏感操作需要权限、预览确认和完整审计；原因可省略，若提供则必须是符合现有接口长度约束的字符串，并按提供值记录，不对原因内容作额外判断；验证无预绑定机器 Token 的目标 session 检查、Token 撤销、过期、scope 缩减和未知主体拒绝。
 - 在隔离 Agent VM 中验证 `/agent/v1/control` 与 SSH 兼容路径的 protocol-4 请求、generation、operation journal、超时恢复和重复请求；验证 Caddy 不接受任意路由或身份头。
 - 验证 SQLite 导出到 rqlite 的 schema/capability/行数/摘要一致性、单次事务导入、失败回退、无双写和关键读取的一致性选择；验证 rqlite 不可用时安全停写。
 - 验证蓝绿并发 acquire、renew、release、resize、端口、调度和容量准入，保证同一 session 串行、跨槽位原子 compare-and-act、native unknown 不重放。
