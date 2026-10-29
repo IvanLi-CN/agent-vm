@@ -473,6 +473,19 @@ class WrapperTests(unittest.TestCase):
             WRAPPER._clear_activation_fence(primary, "tx-preserve-fence", "a" * 40)
             WRAPPER._clear_activation_fence(persistent, "tx-preserve-fence", "a" * 40)
 
+    def test_activation_fence_preserves_a_new_fence_on_wrapper_failure(self):
+        primary = self.loaded["fence_path"]
+        persistent = primary.with_name("." + primary.name + ".persistent")
+        try:
+            with self.assertRaises(WRAPPER.WrapperError):
+                with WRAPPER._activation_fence(self.loaded, "tx-wrapper-failure-fence", "a" * 40):
+                    raise WRAPPER.WrapperError("activation_failed", "injected activation failure")
+            self.assertTrue(primary.exists())
+            self.assertTrue(persistent.exists())
+        finally:
+            WRAPPER._clear_activation_fence(primary, "tx-wrapper-failure-fence", "a" * 40)
+            WRAPPER._clear_activation_fence(persistent, "tx-wrapper-failure-fence", "a" * 40)
+
     def test_activation_fence_preserves_a_new_fence_on_process_interrupt(self):
         primary = self.loaded["fence_path"]
         persistent = primary.with_name("." + primary.name + ".persistent")
@@ -1880,7 +1893,12 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "activation_failed")
         self.assertEqual(WRAPPER._snapshot_targets(self.loaded), before)
         self.assertFalse(Path(self.loaded["current_link"]).exists())
-        self.assertFalse(Path(self.loaded["fence_path"]).exists())
+        primary = Path(self.loaded["fence_path"])
+        persistent = primary.with_name("." + primary.name + ".persistent")
+        self.assertTrue(primary.exists())
+        self.assertTrue(persistent.exists())
+        WRAPPER._clear_activation_fence(primary, "tx-support-restore", "b" * 40)
+        WRAPPER._clear_activation_fence(persistent, "tx-support-restore", "b" * 40)
 
     def test_activation_rejects_a_modified_retained_release(self):
         first = self.root / "retained-first.tar"

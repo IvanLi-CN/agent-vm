@@ -718,9 +718,9 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
             else:
                 _ACTIVATION_FENCE_DEPTH[key] -= 1
                 continue
-            if not created and (not outermost or not completed):
+            if not outermost or (not created and not completed):
                 continue
-            if created and failure is not None and not isinstance(failure, WrapperError):
+            if failure is not None:
                 continue
             try:
                 _clear_activation_fence(path, transaction_id, release_id)
