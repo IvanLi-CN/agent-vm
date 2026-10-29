@@ -24,8 +24,11 @@ const defaultHttp: HttpRequester = (url, init) => fetch(url, init as RequestInit
 class ResponseLimitExceeded extends Error {
   constructor(readonly streamCleanupVerified: boolean) { super(); }
 }
-function httpsExitCode(response: Response): number {
-  return response.headers.get("X-Agent-VM-Exit-Code") === "3" ? 3 : 2;
+function httpsExitCode(response: Response): number | null {
+  const value = response.headers.get("X-Agent-VM-Exit-Code");
+  if (value !== "0" && value !== "2" && value !== "3") return null;
+  const exitCode = Number(value);
+  return exitCode === 0 ? response.status === 200 ? 0 : null : response.status >= 400 ? exitCode : null;
 }
 
 export function httpsEndpoint(value = process.env.AGENT_VM_CONTROL_HOST): string {
@@ -248,12 +251,13 @@ export class Client {
         tls: config.tls,
       });
       let stdout: { body: Buffer; streamCleanupVerified: boolean };
-      const exitCode = response.status >= 200 && response.status < 300 ? 0 : httpsExitCode(response);
+      const responseExitCode = httpsExitCode(response), exitCode = responseExitCode ?? 3;
       try { stdout = await readResponseBody(response, STDOUT_LIMIT); }
       catch (error) {
         if (error instanceof ResponseLimitExceeded) return { code: exitCode, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), stdoutTruncated: true, stderrTruncated: false, timedOut: false, streamCleanupVerified: error.streamCleanupVerified };
         throw error;
       }
+      if (responseExitCode === null) return { code: 3, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0), stdoutTruncated: false, stderrTruncated: false, timedOut: false, streamCleanupVerified: stdout.streamCleanupVerified };
       return { code: exitCode, stdout: stdout.body, stderr: Buffer.alloc(0), stdoutTruncated: false, stderrTruncated: false, timedOut: false, streamCleanupVerified: stdout.streamCleanupVerified };
     } catch (error) {
       if (timedOut) fail("remote_timeout", "control outcome is uncertain; retry the same operation ID", detail);
