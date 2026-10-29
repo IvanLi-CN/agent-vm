@@ -1,7 +1,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { Client, STDERR_LIMIT, STDOUT_LIMIT, timeoutSeconds } from "../scripts/client.ts";
+import { Client, httpsEndpoint, STDERR_LIMIT, STDOUT_LIMIT, timeoutSeconds } from "../scripts/client.ts";
 import { json, parseJson, readJson, runBounded, sha256 } from "../scripts/client-io.ts";
 import { ACTIONS, CLIENT_DEPENDENCIES } from "../scripts/client-release.ts";
 import { Fixture, response, result } from "./support.ts";
@@ -9,6 +9,10 @@ import { Fixture, response, result } from "./support.ts";
 let fixtures: Fixture[] = [];
 const fixture = () => { const f = new Fixture(); fixtures.push(f); return f; };
 afterEach(() => { fixtures.forEach(f => f.close()); fixtures = []; });
+
+test("HTTPS endpoint accepts a bare hostname with an explicit port", () => {
+  expect(httpsEndpoint("control.example:8443")).toBe("https://control.example:8443/agent/v1/control");
+});
 
 function httpsSidecar(f: Fixture): void {
   const revision = "c".repeat(40), schema = { schema: 1, semantic_revision: 1 }, window = { schema_min: 1, schema_max: 1, semantic_min: 1, semantic_max: 1 };

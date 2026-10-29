@@ -30,7 +30,7 @@ function httpsExitCode(response: Response): number {
 
 export function httpsEndpoint(value = process.env.AGENT_VM_CONTROL_HOST): string {
   if (!value) fail("config_missing", "AGENT_VM_CONTROL_HOST is required for the HTTPS control transport");
-  const raw = /^[A-Za-z][A-Za-z0-9+.-]*:/.test(value) ? value : `https://${value}`;
+  const raw = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value) ? value : `https://${value}`;
   let url: URL;
   try { url = new URL(raw); } catch { fail("config_invalid", "AGENT_VM_CONTROL_HOST is not a valid control endpoint"); }
   if (url.protocol !== "https:") fail("config_invalid", "HTTPS control transport requires an https endpoint");
