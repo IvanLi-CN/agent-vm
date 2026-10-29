@@ -17,14 +17,19 @@ data fails schema/capability or digest validation, or its journal cannot be
 verified, keep the state-write fence and native admission closed while retaining
 read-only access to effective leases; do not treat the old SQLite export as
 current state. Recovery first restores a verified post-cutover rqlite
-backup/snapshot into an isolated target and checks `state_epoch`, generations,
-operation journal order, Token/session revocation, audit records and native
-effect evidence before resuming the shared service.
+backup/snapshot into an isolated target. The backup must record a coverage
+boundary at or after the last trusted commit; recovery then reconciles the
+backup tail after that boundary with the trusted append-only journal and native
+effect evidence. `state_epoch`, generations, operation journal order, Token
+revocation, audit records and native-effect checks alone do not prove backup
+coverage. Resume the shared service only after the boundary and tail are
+proven.
 
 The pre-cutover SQLite snapshot is admissible only when protected evidence proves
 that no post-cutover durable write, epoch advance, lease change or native effect
 occurred. If any post-cutover write may have happened, a verified rqlite recovery
-source is required. If neither source exists, stop for owner-authorized
+source with a proven coverage boundary and tail is required. If the coverage
+or tail cannot be proven, stay fenced for administrator-authorized
 journal/native inventory reconciliation; do not open stale SQLite concurrently,
 guess a new generation, reconstruct state from logs, or delete records to force
 readiness.

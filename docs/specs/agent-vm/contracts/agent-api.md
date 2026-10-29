@@ -14,18 +14,18 @@ The endpoint accepts only the fixed method, path, request size, JSON shape and a
 
 ## Authorization
 
-The service resolves the Token's validation digest to its exact `(issuer, subject)` owner, checks expiry and revocation with a linearizable read, and verifies that the requested scope covers the action. A Token whose `revoked_at` was committed before this authorization read is rejected; an already-authorized in-flight operation is not retroactively rolled back. The first release fixes this mapping; there is no implicit scope inheritance:
+The service resolves the Token's validation digest, checks expiry and revocation with a linearizable read, and verifies that the requested scope covers the action. A Token whose `revoked_at` was committed before this authorization read is rejected; an already-authorized in-flight operation is not retroactively rolled back. A machine Token has no pre-bound session or user-owner relation; the target `session_id` comes from the protocol-4 request and is checked against current resource state. The first release fixes this mapping; there is no implicit scope inheritance:
 
 | Token scope | Protocol-4 actions authorized by that scope |
 | --- | --- |
 | `agent:read` | `doctor`, `status`, `port-list` |
 | `agent:operate` | `acquire`, `renew`, `release`, `destroy`, `restart`, `resize`, `port-add`, `port-remove` |
 | `agent:sync` | `ssh-info` only, to obtain the session's bounded SSH/source-transfer connection data; it does not authorize arbitrary SSH commands, `exec`, file transfer or export by itself. |
-| `agent:observe_admin` | Read-only `admin-metrics`, `admin-status`, `admin-session-list` and `drain-status`; the principal must also have the explicit administrator observation capability. |
+| `agent:observe_admin` | Read-only `admin-metrics`, `admin-status`, `admin-session-list` and `drain-status`; the scope itself is the explicit machine authorization for these observations. |
 
-`admin-reconcile`, `admin-gc`, `drain-enter`, `drain-exit`, `timer-expire`, `timer-reconcile` and `timer-age-gc` are never authorized by an Agent Token scope; they remain capability-gated management or scheduler actions. An action not listed above, a scope used outside its row, or a malformed/unknown action is denied before durable or native effects. For a session-scoped action, the request `session_id` must be one of the Token's bound sessions and owned by that same pair. The service then checks the current generation, lease, resource ownership, admission state and operation journal before any native effect.
+`admin-reconcile`, `admin-gc`, `drain-enter`, `drain-exit`, `timer-expire`, `timer-reconcile` and `timer-age-gc` are never authorized by an Agent Token scope; they remain capability-gated management or scheduler actions. An action not listed above, a scope used outside its row, or a malformed/unknown action is denied before durable or native effects. For a session-scoped action, the request `session_id` must identify a managed target whose current generation, lease, native identity, admission state and operation journal satisfy the existing protocol-4 contract. The Token does not need to be pre-bound to that session.
 
-An ordinary user Token cannot list or mutate another user's session, use a sessionless administrator action, or elevate its scope by changing JSON. Sessionless read-only observation such as `admin-metrics` requires a separately granted administrator observation scope. Administrator Token use remains subject to the administrator capability and audit policy; a machine Token does not bypass reason, confirmation or state checks for sensitive management operations.
+A machine Token cannot elevate its scope by changing JSON or use a management-only action. Sessionless read-only observation such as `admin-metrics` requires the explicit `agent:observe_admin` scope. A machine Token does not bypass reason, confirmation or state checks for sensitive management operations.
 
 ## Response and recovery
 
@@ -39,4 +39,4 @@ The Agent API returns a structured state-backend failure during migration. The l
 
 The release manifest declares per-action request, response and semantic compatibility for `legacy-bun`, `go-request` and direct HTTPS transport. During the blue-green window, both slots must accept their shared protocol-4 compatibility set and the active release must retain the previous verified package for at least one hour of static-resource/API compatibility. SSH remains a compatibility transport while the declared window is open; it is not a second control authority.
 
-The direct HTTPS transport does not alter session ownership, generation, operation identity, journal ordering, image binding, lease or native-worker recovery rules. An incompatible transport or action is rejected before durable or native effects, and a release that cannot read/write the shared state capabilities is not eligible for activation or rollback.
+The direct HTTPS transport does not alter session selection, generation, operation identity, journal ordering, image binding, lease or native-worker recovery rules. An incompatible transport or action is rejected before durable or native effects, and a release that cannot read/write the shared state capabilities is not eligible for activation or rollback.
