@@ -6,6 +6,8 @@ import "./i18n";
 import { App } from "./App";
 import * as api from "./api";
 import { createAgentToken, ManagementRequestError } from "./api";
+import { mockState } from "./mockData";
+import type { AgentToken } from "./types";
 
 function renderApp() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -104,21 +106,27 @@ describe("management console workflow", () => {
 
   it("moves through the bounded token pages", async () => {
     const user = userEvent.setup();
-    const created = await Promise.all(Array.from({ length: 26 }, (_, index) => createAgentToken(["agent:read"], "2027-01-15T00:00:00.000Z", undefined, `50e8400e-ccf8-4c7b-8d1d-${String(index + 900).padStart(12, "0")}`)));
-    const secondPageTokenId = created[0]?.metadata.token_id;
-    expect(secondPageTokenId).toBeTruthy();
+    const token = (tokenId: string): AgentToken => ({ token_id: tokenId, resource_version: `token:${tokenId}:revision-1`, scopes: ["agent:read"], created_at: "2027-01-01T00:00:00.000Z", expires_at: "2027-01-15T00:00:00.000Z", revoked_at: null });
+    const firstPageTokens = Array.from({ length: 25 }, (_, index) => token(`tok_page_01_${String(index).padStart(2, "0")}`));
+    const secondPageTokenId = "tok_page_02_00";
+    const originalTokens = mockState.tokens.slice();
+    mockState.tokens.unshift(...firstPageTokens, token(secondPageTokenId));
 
-    window.history.replaceState({}, "", "/system");
-    renderApp();
-    expect(await screen.findByTestId("token-management")).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByRole("button", { name: /下一页|next/i })).toBeEnabled());
-    expect(screen.queryByText(secondPageTokenId as string)).not.toBeInTheDocument();
+    try {
+      window.history.replaceState({}, "", "/system");
+      renderApp();
+      expect(await screen.findByTestId("token-management")).toBeInTheDocument();
+      await waitFor(() => expect(screen.getByRole("button", { name: /下一页|next/i })).toBeEnabled());
+      expect(screen.queryByText(secondPageTokenId)).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: /下一页|next/i }));
-    expect(await screen.findByText(secondPageTokenId as string)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /上一页|previous/i })).toBeEnabled();
+      await user.click(screen.getByRole("button", { name: /下一页|next/i }));
+      expect(await screen.findByText(secondPageTokenId)).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: /上一页|previous/i })).toBeEnabled();
 
-    await user.click(screen.getByRole("button", { name: /上一页|previous/i }));
-    await waitFor(() => expect(screen.queryByText(secondPageTokenId as string)).not.toBeInTheDocument());
+      await user.click(screen.getByRole("button", { name: /上一页|previous/i }));
+      await waitFor(() => expect(screen.queryByText(secondPageTokenId)).not.toBeInTheDocument());
+    } finally {
+      mockState.tokens.splice(0, mockState.tokens.length, ...originalTokens);
+    }
   });
 });
