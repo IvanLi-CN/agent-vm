@@ -360,6 +360,54 @@ func TestRemoteRequestRejectsErrorV2(t *testing.T) {
 	}
 }
 
+func TestRemoteRequestClassifiesPartialEpochRollback(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{
+			{RowsAffected: 0},
+			{Error: "NOT NULL constraint failed: meta.value"},
+		}})
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client()}
+	_, err = backend.request(context.Background(), []remoteStatement{
+		{query: "INSERT INTO meta(key, value) SELECT ?, ? WHERE 0"},
+		{query: "INSERT INTO meta(key, value) SELECT ?, NULL", epochGuard: true},
+		{query: "UPDATE meta SET value = value"},
+		{query: "INSERT INTO meta(key, value) VALUES(?, ?)"},
+		{query: "DELETE FROM meta WHERE key = ?"},
+	}, true)
+	var statementErr *remoteStatementError
+	if !errors.As(err, &statementErr) || !statementErr.EpochGuard {
+		t.Fatalf("partial epoch rollback error = %#v", err)
+	}
+}
+
+func TestRemoteRequestRejectsTruncatedSuccess(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{{RowsAffected: 1}}})
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client()}
+	_, err = backend.request(context.Background(), []remoteStatement{
+		{query: "INSERT INTO meta(key, value) VALUES(?, ?)"},
+		{query: "DELETE FROM meta WHERE key = ?"},
+	}, true)
+	var statementErr *remoteStatementError
+	if err == nil || errors.As(err, &statementErr) {
+		t.Fatalf("truncated success error = %#v", err)
+	}
+}
+
 func TestRemoteRequestLostResponseIsNotRetried(t *testing.T) {
 	var posts int
 	var postsMu sync.Mutex

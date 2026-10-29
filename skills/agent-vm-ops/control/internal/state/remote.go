@@ -39,8 +39,9 @@ type remoteBackend struct {
 }
 
 type remoteStatement struct {
-	query string
-	args  []any
+	query      string
+	args       []any
+	epochGuard bool
 }
 
 type remoteResult struct {
@@ -58,8 +59,9 @@ type remoteResponse struct {
 }
 
 type remoteStatementError struct {
-	Index   int
-	Message string
+	Index      int
+	Message    string
+	EpochGuard bool
 }
 
 func (err *remoteStatementError) Error() string {
@@ -440,6 +442,12 @@ func (r *remoteBackend) withWrite(ctx context.Context, fn func(*Tx) error) error
 			// establish whether rqlite committed. Preserve the operation as
 			// unknown instead of retrying it under a new request.
 			var statementErr *remoteStatementError
+			if errors.As(err, &statementErr) && statementErr.EpochGuard {
+				// The epoch sentinel is part of the same request-level
+				// transaction. Its constraint failure proves that rqlite
+				// rolled the batch back, so refresh and replay the callback.
+				continue
+			}
 			if errors.As(err, &statementErr) {
 				return &TransactionError{Phase: "commit", SQLOperation: "rqlite_transaction", StateCommitted: committed(false), Cause: err}
 			}
@@ -495,13 +503,14 @@ func (r *remoteBackend) request(ctx context.Context, statements []remoteStatemen
 	if err := decoder.Decode(&result); err != nil {
 		return remoteResponse{}, fmt.Errorf("decode rqlite response: %w", err)
 	}
-	if len(result.Results) != len(statements) {
-		return result, fmt.Errorf("rqlite response returned %d results for %d statements", len(result.Results), len(statements))
-	}
 	for index, item := range result.Results {
 		if message := remoteResultError(item); message != "" {
-			return result, &remoteStatementError{Index: index, Message: message}
+			guarded := index < len(statements) && statements[index].epochGuard
+			return result, &remoteStatementError{Index: index, Message: message, EpochGuard: guarded}
 		}
+	}
+	if len(result.Results) != len(statements) {
+		return result, fmt.Errorf("rqlite response returned %d results for %d statements", len(result.Results), len(statements))
 	}
 	return result, nil
 }
@@ -1185,16 +1194,18 @@ func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteS
 	guardIndex := len(statements)
 	statements = append(statements,
 		remoteStatement{
-			query: "INSERT INTO meta(key, value) SELECT ?, CASE WHEN EXISTS (SELECT 1 FROM meta WHERE key = 'state_epoch' AND value = ?) THEN 'ok' ELSE NULL END",
-			args:  []any{guardKey, expectedEpoch},
+			query:      "INSERT INTO meta(key, value) SELECT ?, CASE WHEN EXISTS (SELECT 1 FROM meta WHERE key = 'state_epoch' AND value = ?) THEN 'ok' ELSE NULL END",
+			args:       []any{guardKey, expectedEpoch},
+			epochGuard: true,
 		},
 		remoteStatement{
 			query: "UPDATE meta SET value = ? WHERE key = 'state_epoch' AND value = ?",
 			args:  []any{targetEpoch, expectedEpoch},
 		},
 		remoteStatement{
-			query: "INSERT INTO meta(key, value) SELECT ?, CASE WHEN changes() = 1 THEN 'ok' ELSE NULL END",
-			args:  []any{proofKey},
+			query:      "INSERT INTO meta(key, value) SELECT ?, CASE WHEN changes() = 1 THEN 'ok' ELSE NULL END",
+			args:       []any{proofKey},
+			epochGuard: true,
 		},
 		remoteStatement{query: "DELETE FROM meta WHERE key IN (?, ?)", args: []any{guardKey, proofKey}},
 	)
