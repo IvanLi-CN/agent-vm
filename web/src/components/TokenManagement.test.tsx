@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import "../app/i18n";
@@ -271,6 +271,51 @@ describe("TokenManagement pagination", () => {
     expect(getOperationMock).toHaveBeenCalledWith(recovery.operationId);
   });
 
+  it("allows a pending revoke preview to be canceled after navigation", async () => {
+    const user = userEvent.setup();
+    const target = token("tok_preview_pending_01");
+    listTokensMock.mockReset().mockResolvedValue({ items: [target], page: { limit: 25, next_cursor: null } });
+    previewTokenRevocationMock.mockReset().mockImplementation(() => new Promise(() => {}));
+
+    const firstRender = renderTokenManagement();
+    await waitFor(() => expect(screen.getByRole("button", { name: /撤销|revoke/i })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: /撤销|revoke/i }));
+    await screen.findByTestId("token-revoke-preview-recovery");
+    firstRender.unmount();
+    renderTokenManagement(firstRender.client);
+    await user.click(await screen.findByRole("button", { name: /取消|cancel/i }));
+    await waitFor(() => expect(screen.queryByTestId("token-revoke-preview-recovery")).not.toBeInTheDocument());
+    expect(screen.getByRole("button", { name: /撤销|revoke/i })).toBeEnabled();
+  });
+
+  it("retries a pending revoke preview after navigation without accepting the old response", async () => {
+    const user = userEvent.setup();
+    const target = token("tok_preview_retry_01");
+    const firstPreview = { token_id: target.token_id, target_version: target.resource_version, confirmation_token: "confirmation-old", expires_at: "2027-01-01T00:05:00.000Z", metadata: target };
+    const retryPreview = { ...firstPreview, confirmation_token: "confirmation-retry" };
+    let resolveFirst: ((value: typeof firstPreview) => void) | undefined;
+    listTokensMock.mockReset().mockResolvedValue({ items: [target], page: { limit: 25, next_cursor: null } });
+    previewTokenRevocationMock.mockReset()
+      .mockImplementationOnce(() => new Promise<typeof firstPreview>((resolve) => { resolveFirst = resolve; }))
+      .mockResolvedValueOnce(retryPreview);
+
+    const firstRender = renderTokenManagement();
+    await waitFor(() => expect(screen.getByRole("button", { name: /撤销|revoke/i })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: /撤销|revoke/i }));
+    await screen.findByTestId("token-revoke-preview-recovery");
+    firstRender.unmount();
+
+    renderTokenManagement(firstRender.client);
+    await user.click(await screen.findByRole("button", { name: /重试撤销预览|retry revoke preview/i }));
+    await screen.findByRole("dialog");
+    expect(previewTokenRevocationMock).toHaveBeenCalledTimes(2);
+    expect(firstRender.client.getQueryData<{ preview: typeof retryPreview }>(["token-revoke-recovery"])?.preview?.confirmation_token).toBe("confirmation-retry");
+
+    resolveFirst?.(firstPreview);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(firstRender.client.getQueryData<{ preview: typeof retryPreview }>(["token-revoke-recovery"])?.preview?.confirmation_token).toBe("confirmation-retry");
+  });
+
   it("bounds Token creation reasons at the contract limit", async () => {
     listTokensMock.mockReset().mockResolvedValue({ items: [], page: { limit: 25, next_cursor: null } });
     createAgentTokenMock.mockReset();
@@ -278,7 +323,12 @@ describe("TokenManagement pagination", () => {
     renderTokenManagement();
     await screen.findByTestId("token-management");
     const reason = screen.getByRole("textbox", { name: /审计原因|audit reason/i });
-    expect(reason).toHaveAttribute("maxLength", "512");
+    const validReason = "😀".repeat(512);
+    fireEvent.change(reason, { target: { value: validReason } });
+    expect(reason).toHaveValue(validReason);
+    fireEvent.change(reason, { target: { value: `${validReason}界` } });
+    expect(reason).toHaveValue(validReason);
+    expect(await screen.findByRole("alert")).toHaveTextContent(/512/);
     expect(createAgentTokenMock).not.toHaveBeenCalled();
   });
 });

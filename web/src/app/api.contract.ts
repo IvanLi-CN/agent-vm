@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "./i18n";
+import { auditReasonCharacterLength, auditReasonWithinLimit } from "./validation";
 
 const managementErrorCodes = [
-  "authentication_required", "oidc_unavailable", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "token_expired", "token_revoked", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "service_unavailable", "state_unavailable", "rate_limited", "lease_expired", "task_not_active", "draining", "cleanup_incomplete", "resource_unverified", "startup_reconcile_required", "internal_error",
+  "authentication_required", "oidc_unavailable", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "token_expired", "token_revoked", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "service_unavailable", "state_unavailable", "rate_limited", "lease_expired", "task_not_active", "draining", "mapping_unverified", "cleanup_incomplete", "resource_unverified", "startup_reconcile_required", "internal_error",
 ] as const;
 
 function response(body: unknown, status = 200): Response {
@@ -194,9 +195,22 @@ describe("management error localization", () => {
     for (const locale of ["zh-CN", "en"] as const) {
       await i18n.changeLanguage(locale);
       for (const code of managementErrorCodes) {
-        expect(i18n.t(`errors.${code}`), `${locale}:${code}`).not.toBe(`errors.${code}`);
+        const message = i18n.getResource(locale, "translation", `errors.${code}`);
+        expect(message, `${locale}:${code}`).toBeTruthy();
+        if (code !== "internal_error") expect(message, `${locale}:${code}`).not.toBe(i18n.t("errors.generic"));
       }
     }
     await i18n.changeLanguage("en");
+  });
+});
+
+describe("audit reason limit", () => {
+  it("matches the OpenAPI 512-character limit", () => {
+    expect(auditReasonCharacterLength("界".repeat(512))).toBe(512);
+    expect(auditReasonWithinLimit("界".repeat(512))).toBe(true);
+    expect(auditReasonWithinLimit("界".repeat(513))).toBe(false);
+    expect(auditReasonCharacterLength("😀".repeat(512))).toBe(512);
+    expect(auditReasonWithinLimit("😀".repeat(512))).toBe(true);
+    expect(auditReasonWithinLimit("😀".repeat(513))).toBe(false);
   });
 });

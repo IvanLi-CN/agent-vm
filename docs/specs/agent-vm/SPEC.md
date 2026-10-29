@@ -182,22 +182,21 @@ The TypeScript/Bun synchronization helper transfers tracked, unignored worktree 
 
 ## Visual Evidence
 
-The management-console web surface has confirmed pre-merge visual evidence from
-the deterministic local `ui_demo` source. The capture is mock-only, requires no
-backend, login, credentials or live deployment, and covers the System page's
-Token creation, one-time disclosure dismissal and revocation-preview flow. The
-mobile captures use the requested `393x852` CSS-pixel viewport; the desktop
-capture uses the full rendered page surface and needs no whitespace crop.
+The management-console web surface has confirmed visual evidence from the local `ui_demo` source.
+The captures use mock data without a backend, login, credentials or live deployment.
+They cover Token management, pending revocation-preview recovery, and the 512-character reason limit in Token creation, confirmation dialogs and image import.
+The pending-preview capture delays the mock response to expose its recovery controls.
+Mobile captures use a `393x852` CSS-pixel viewport; the desktop capture shows the full rendered page surface.
 
 - [Desktop System page](assets/agent-vm-web-system-desktop.png)
 - [Mobile System page](assets/agent-vm-web-system-mobile-list.png)
 - [Mobile revocation preview dialog](assets/agent-vm-web-system-mobile-revoke-dialog.png)
+- [Mobile pending revocation preview](assets/agent-vm-web-system-mobile-preview-pending.png)
+- [Mobile confirmation reason limit](assets/agent-vm-web-system-mobile-dialog-reason-limit.png)
+- [Mobile Token creation reason limit](assets/agent-vm-web-system-mobile-create-reason-limit.png)
+- [Mobile image import reason limit](assets/agent-vm-web-images-mobile-import-reason-limit.png)
 
-This evidence is bound to PR [#32](https://github.com/IvanLi-CN/agent-vm/pull/32),
-base `79a4fb8aa0fb8db11e6f3ba80047f88fc1a26fed`, and the metadata-only evidence
-candidate descended from UI head `2a8d0634fa0299c3f5f059f5ea00275c5a18e6c0`.
-Owner confirmation applies to the rendered UI shown here; it does not assert
-end-to-end backend integration or deployment readiness.
+Owner confirmation applies to the rendered UI shown here; it does not assert end-to-end backend integration or deployment readiness.
 
 ## Related ADRs
 

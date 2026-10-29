@@ -5,7 +5,7 @@ import { useTranslation } from "react-i18next";
 import { ManagementRequestError, createAgentToken, createOperationId, getManagementSession, getOperation, listTokens, previewTokenRevocation, submitTokenRevocation } from "../app/api";
 import { formatDateTime } from "../app/format";
 import type { ActionPreview, AgentToken, Locale, ManagementSession, Operation, TokenCreateResult, TokenRevokePreview, TokenScope } from "../app/types";
-import { AUDIT_REASON_MAX_LENGTH } from "../app/validation";
+import { auditReasonWithinLimit } from "../app/validation";
 import { ActionDialog } from "./ActionDialog";
 import { Badge, EmptyState, Button, CopyButton, Input, Panel, PanelHeader, StatusBadge, Textarea } from "./ui";
 
@@ -431,7 +431,7 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
       setCreateError(t("tokens.expiryRequired"));
       return;
     }
-    if (reason.length > AUDIT_REASON_MAX_LENGTH) {
+    if (!auditReasonWithinLimit(reason)) {
       setCreateError(t("common.reasonTooLong"));
       return;
     }
@@ -504,8 +504,8 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
     }
   };
 
-  const openRevoke = async (token: AgentToken, trigger?: HTMLElement) => {
-    if (dialogBlocked || revokeInFlightRef.current || revokeRecovery) return;
+  const openRevoke = async (token: AgentToken, trigger?: HTMLElement, retryPreview = false) => {
+    if (dialogBlocked || revokeInFlightRef.current || (revokeRecovery && !retryPreview)) return;
     revokeInFlightRef.current = true;
     onDialogStateChange?.(true);
     revokeTriggerRef.current = trigger ?? (typeof document === "undefined" ? null : document.activeElement as HTMLElement);
@@ -536,7 +536,7 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
 
   const submitRevoke = (auditReason: string) => {
     if (!revokeRecovery?.token || !revokeRecovery.preview || !revokeRecovery.operationId) return;
-    if (auditReason.length > AUDIT_REASON_MAX_LENGTH) {
+    if (!auditReasonWithinLimit(auditReason)) {
       setRevokeError(t("common.reasonTooLong"));
       return;
     }
@@ -601,6 +601,13 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
     clearRevokeRecovery();
   };
 
+  const retryRevokePreview = () => {
+    if (revokeRecovery?.decision !== "preview_pending") return;
+    const token = revokeRecovery.token;
+    clearRevokeRecovery();
+    void openRevoke(token, undefined, true);
+  };
+
   const nextTokenPage = () => {
     const next = tokensQuery.data?.page.next_cursor;
     if (!next) return;
@@ -634,7 +641,7 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
         </fieldset>
         <div className="token-form-fields">
           <label className="field-label"><span>{t("tokens.expiresAt")}</span><Input type="datetime-local" value={expiresAt} onChange={(event) => { resetCreateIntent(); setExpiresAt(event.target.value); }} disabled={!canManageTokens} required /></label>
-          <label className="field-label"><span>{t("tokens.reason")} <em>({t("common.optional")})</em></span><Textarea value={reason} maxLength={AUDIT_REASON_MAX_LENGTH} onChange={(event) => { resetCreateIntent(); setReason(event.target.value); }} rows={2} disabled={!canManageTokens} placeholder={t("common.reasonPlaceholder")} /></label>
+          <label className="field-label"><span>{t("tokens.reason")} <em>({t("common.optional")})</em></span><Textarea value={reason} onChange={(event) => { const next = event.target.value; resetCreateIntent(); if (auditReasonWithinLimit(next)) { setReason(next); setCreateError(null); } else setCreateError(t("common.reasonTooLong")); }} rows={2} disabled={!canManageTokens} placeholder={t("common.reasonPlaceholder")} /></label>
         </div>
         {createError ? <div role="alert"><p className="field-error">{createError}</p>{createOperationIdValue ? <p className="token-retry-hint">{t("tokens.retryCreate", { operationId: createOperationIdValue })}</p> : null}</div> : null}
         {createRecoveryOperationId ? <div className="token-recovery"><p className="token-retry-hint">{t("tokens.operationRecoveryHint", { operationId: createRecoveryOperationId })}</p><Button type="button" variant="ghost" disabled={createRecoveryPending} onClick={() => void checkCreateOperation()}>{createRecoveryPending ? t("common.loading") : t("tokens.checkOperation")}</Button>{createRecoveryError ? <p className="field-error" role="alert">{createRecoveryError}</p> : null}{createRecoveryStatus ? <p className="token-retry-hint" data-testid="token-operation-status">{t("tokens.operationStatus", { status: t(`status.${createRecoveryStatus.status}`) })}</p> : null}</div> : null}
@@ -645,6 +652,7 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
     <div className="token-list-section">
       <div className="section-header token-section-header"><div><h3>{t("tokens.listTitle")}</h3><p>{t("tokens.count", { count: tokens.length })}</p></div></div>
       {revokeError && !revokeDialogOpen && !revokeRecovery ? <p className="field-error" role="alert">{revokeError}</p> : null}
+      {revokeRecovery?.decision === "preview_pending" ? <div className="token-recovery" data-testid="token-revoke-preview-recovery"><p className="token-retry-hint">{t("tokens.revokePreviewPending")}</p><div className="token-form-actions"><Button type="button" variant="ghost" onClick={retryRevokePreview}>{t("tokens.retryRevokePreviewButton")}</Button><Button type="button" variant="ghost" onClick={cancelRevoke}>{t("common.cancel")}</Button></div></div> : null}
       {revokeRecovery && revokeRecovery.decision !== "preview_pending" && revokeRecovery.decision !== "ready" ? <div className="token-recovery" data-testid="token-revoke-recovery"><p className="token-retry-hint">{t("tokens.revokeRecoveryHint", { operationId: revokeRecovery.operationId })}</p>{revokeRecovery.errorCode ? <p className="field-error" role="alert">{errorMessageForCode(revokeRecovery.errorCode, t)}</p> : null}{revokeRecovery.recoveryErrorCode ? <p className="field-error" role="alert">{revokeRecovery.recoveryErrorCode === "not_found" ? t("tokens.operationNotFound") : errorMessageForCode(revokeRecovery.recoveryErrorCode, t)}</p> : null}{revokeRecovery.status ? <p className="token-retry-hint" data-testid="token-revoke-operation-status">{t("tokens.operationStatus", { status: t(`status.${revokeRecovery.status.status}`) })}</p> : null}<div className="token-form-actions"><Button type="button" variant="ghost" disabled={revokeCheckPending || revokeMutation.isPending} onClick={() => void checkRevokeOperation()}>{revokeCheckPending ? t("common.loading") : t("tokens.checkOperation")}</Button>{revokeRecovery.decision === "retry_same" ? <Button type="button" variant="secondary" disabled={revokeMutation.isPending} onClick={retryRevoke}>{t("tokens.retryRevokeButton")}</Button> : null}</div></div> : null}
       {sessionQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : sessionQuery.isError ? <div role="alert"><p className="field-error">{t("errors.generic")}</p><Button variant="ghost" onClick={() => void sessionQuery.refetch()}>{t("common.retry")}</Button></div> : !canManageTokens ? <p className="token-capability-note">{t("tokens.permissionDenied")}</p> : tokensQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : tokensQuery.isError ? <div role="alert"><p className="field-error">{t("errors.generic")}</p><Button variant="ghost" onClick={() => void tokensQuery.refetch()}>{t("common.retry")}</Button></div> : tokens.length ? <div className="token-list" role="list">{tokens.map((token) => <TokenRow key={token.token_id} token={token} locale={locale} revokeDisabled={dialogBlocked || Boolean(revokeRecovery) || revokePreviewPending || revokeMutation.isPending || !canManageTokens} onRevoke={(trigger) => void openRevoke(token, trigger)} />)}</div> : <EmptyState title={t("tokens.noTokens")} />}
       <div className="pagination token-pagination"><span>{tokens.length}</span><div><Button variant="ghost" aria-label={t("common.previous")} disabled={!tokenCursorStack.length} onClick={previousTokenPage} icon={<ChevronLeft />} /><Button variant="ghost" aria-label={t("common.next")} disabled={!tokensQuery.data?.page.next_cursor} onClick={nextTokenPage} icon={<ChevronRight />} /></div></div>

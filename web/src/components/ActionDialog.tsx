@@ -3,7 +3,7 @@ import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import type { ActionPreview } from "../app/types";
 import { formatDateTime } from "../app/format";
-import { AUDIT_REASON_MAX_LENGTH } from "../app/validation";
+import { auditReasonWithinLimit } from "../app/validation";
 import { Button, Textarea } from "./ui";
 
 type ActionDialogProps = {
@@ -103,7 +103,7 @@ export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm
   }, [busy, onCancel]);
 
   const submit = () => {
-    if (reason.length > AUDIT_REASON_MAX_LENGTH) {
+    if (!auditReasonWithinLimit(reason)) {
       setReasonError(t("common.reasonTooLong"));
       return;
     }
@@ -120,7 +120,7 @@ export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm
       {error ? <p className="field-error" role="alert">{error}</p> : null}
       <p className="dialog-expiry">{t("dialog.expires", { time: formatDateTime(preview.expires_at, locale) })}</p>
       <label className="field-label" htmlFor="action-reason">{t("common.reason")} <span>({t("common.optional")})</span></label>
-      <Textarea ref={reasonRef} id="action-reason" value={reason} maxLength={AUDIT_REASON_MAX_LENGTH} aria-invalid={reasonError ? "true" : undefined} aria-describedby={reasonError ? "action-reason-error" : undefined} onChange={(event) => { setReason(event.target.value); setReasonError(event.target.value.length > AUDIT_REASON_MAX_LENGTH ? t("common.reasonTooLong") : null); }} placeholder={t("common.reasonPlaceholder")} rows={3} />
+      <Textarea ref={reasonRef} id="action-reason" value={reason} aria-invalid={reasonError ? "true" : undefined} aria-describedby={reasonError ? "action-reason-error" : undefined} onChange={(event) => { const next = event.target.value; if (!auditReasonWithinLimit(next)) { setReasonError(t("common.reasonTooLong")); return; } setReason(next); setReasonError(null); }} placeholder={t("common.reasonPlaceholder")} rows={3} />
       {reasonError ? <p id="action-reason-error" className="field-error" role="alert">{reasonError}</p> : null}
       <p className="dialog-warning">{confirmationText ?? t("vms.actionConfirmText")}</p>
       <div className="dialog-actions"><Button variant="ghost" disabled={busy} onClick={onCancel}>{t("common.cancel")}</Button><Button variant={dangerous ? "danger" : "primary"} disabled={busy} onClick={submit} icon={busy ? <ShieldCheck /> : <ArrowRight />}>{busy ? t("common.loading") : t("dialog.submit")}</Button></div>

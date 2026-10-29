@@ -5,7 +5,7 @@ import { useTranslation } from "react-i18next";
 import { actionLabel, formatDateTime, shortFingerprint } from "../app/format";
 import { ManagementRequestError, createOperationId, listImages, previewImageAction, startImageImport, submitImageAction, uploadImageImportContent } from "../app/api";
 import type { ActionPreview, ImageImportRequest, Locale, ManagedImage } from "../app/types";
-import { AUDIT_REASON_MAX_LENGTH, optionalAuditReason } from "../app/validation";
+import { auditReasonWithinLimit, optionalAuditReason } from "../app/validation";
 import { ActionDialog } from "../components/ActionDialog";
 import { CopyButton, EmptyState, Input, Panel, PanelHeader, Select, StatusBadge, Button } from "../components/ui";
 import { DefinitionList, PageIntro, QueryError } from "../components/PagePrimitives";
@@ -81,7 +81,7 @@ export function ImagesPage() {
     }
     const targetVersion = query.data?.catalog_version;
     if (!targetVersion) { setImportMessage(t("images.targetUnavailable")); return; }
-    if (reason.length > AUDIT_REASON_MAX_LENGTH) { setImportMessage(t("common.reasonTooLong")); return; }
+    if (!auditReasonWithinLimit(reason)) { setImportMessage(t("common.reasonTooLong")); return; }
     const operation_id = createOperationId();
     const providedReason = optionalAuditReason(reason);
     const optionalReason = providedReason === undefined ? {} : { reason: providedReason };
@@ -164,7 +164,7 @@ export function ImagesPage() {
             <label className="file-field"><span>{t("images.rootfsFile")}</span><span className="file-input"><FileUp aria-hidden="true" /><input type="file" accept="application/octet-stream,.tar,.tar.gz" onChange={(event) => setRootfsFile(event.target.files?.[0] ?? null)} /><span>{rootfsFile?.name ?? t("images.chooseFile")}</span></span></label>
           </>}
         </>}
-        <label className="field-label field-span-2">{t("images.importReason")}<Input value={reason} maxLength={AUDIT_REASON_MAX_LENGTH} onChange={(event) => setReason(event.target.value)} placeholder={t("common.reasonPlaceholder")} /></label>
+        <label className="field-label field-span-2">{t("images.importReason")}<Input value={reason} onChange={(event) => { const next = event.target.value; if (auditReasonWithinLimit(next)) { setReason(next); setImportMessage(""); } else setImportMessage(t("common.reasonTooLong")); }} placeholder={t("common.reasonPlaceholder")} /></label>
       </div>
       <div className="import-footer"><span className={importMessage.includes("created") || importMessage.includes("已创建") ? "success-copy" : "field-error"}>{importMessage}</span><Button variant="primary" icon={<FileUp />} disabled={importMutation.isPending} onClick={startImport}>{importMutation.isPending ? t("common.loading") : t("images.startImport")}</Button></div>
     </Panel>
