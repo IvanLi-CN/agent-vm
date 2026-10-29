@@ -1025,6 +1025,17 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
                 installed_root / MANIFEST_NAME,
                 allow_historical_web_config_mode=True,
             )
+            if _is_go_manifest(installed_manifest):
+                verify_go_bundle(installed_root, installed_manifest)
+            elif _is_product_manifest(installed_manifest):
+                from release_manifest import verify_product_bundle
+                verify_product_bundle(
+                    installed_root,
+                    installed_manifest,
+                    allow_historical_web_config_mode=True,
+                )
+            else:
+                verify_bundle(installed_root, installed_manifest)
             checked = verify_client_sidecar(
                 installed_root,
                 installed_manifest,

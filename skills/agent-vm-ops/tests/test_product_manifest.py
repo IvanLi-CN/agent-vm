@@ -49,6 +49,10 @@ class ProductManifestTests(unittest.TestCase):
             self.assertEqual(validate_product_manifest(manifest), manifest)
             self.assertEqual(validate_release_manifest(manifest), manifest)
             self.assertEqual(verify_product_bundle(root, manifest), manifest)
+            https_client = copy.deepcopy(manifest)
+            https_client["client_view"]["transport"] = "https"
+            self.assertEqual(validate_product_manifest(https_client), https_client)
+            self.assertEqual(verify_product_bundle(root, https_client), https_client)
             malformed = dict(manifest)
             malformed["version"] = "0.1"
             with self.assertRaises(Exception):

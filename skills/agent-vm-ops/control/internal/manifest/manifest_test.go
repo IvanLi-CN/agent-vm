@@ -74,10 +74,18 @@ func validManifest(t *testing.T) (string, string) {
 }
 
 func validProductManifest(t *testing.T) string {
+	return validProductManifestFormat(t, LegacyProductFormat, "go-request")
+}
+
+func validProductManifestFormat(t *testing.T, format int64, transport string) string {
 	t.Helper()
 	root := t.TempDir()
-	artifacts := make([]any, 0, len(fixedArtifacts))
-	for _, expected := range fixedArtifacts {
+	expectedArtifacts := productLegacyArtifacts
+	if format == ProductFormat {
+		expectedArtifacts = productArtifacts
+	}
+	artifacts := make([]any, 0, len(expectedArtifacts))
+	for _, expected := range expectedArtifacts {
 		path := filepath.Join(root, filepath.FromSlash(expected.path))
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 			t.Fatal(err)
@@ -106,12 +114,18 @@ func validProductManifest(t *testing.T) string {
 		actions[action] = operationSpec()
 	}
 	rootValue := map[string]any{
-		"format": 3, "version": "1.0.0", "release_id": strings.Repeat("b", 40), "source_revision": strings.Repeat("b", 40), "protocol": 4,
+		"format": format, "version": "1.0.0", "release_id": strings.Repeat("b", 40), "source_revision": strings.Repeat("b", 40), "protocol": 4,
 		"target":      map[string]any{"os": "linux", "arch": runtime.GOARCH},
 		"toolchain":   map[string]any{"bun": "1.4.4", "go": GoToolchain, "cgo_enabled": false},
 		"artifacts":   artifacts,
 		"actions":     actions,
-		"client_view": map[string]any{"version": "1.0.0", "source_revision": strings.Repeat("b", 40), "protocol": 4, "transport": "go-request", "actions": actions},
+		"client_view": map[string]any{"version": "1.0.0", "source_revision": strings.Repeat("b", 40), "protocol": 4, "transport": transport, "actions": actions},
+	}
+	if format == ProductFormat {
+		rootValue["state_compatibility"] = map[string]any{
+			"reads":  append([]string(nil), stateCapabilityMarkers...),
+			"writes": append([]string(nil), stateCapabilityMarkers...),
+		}
 	}
 	manifestPath := filepath.Join(root, "release-manifest.json")
 	encoded, err := json.Marshal(rootValue)
@@ -187,6 +201,16 @@ func TestLoadAcceptsHTTPSProductTransport(t *testing.T) {
 	}
 	if metadata.Transport != "https" || metadata.Version != "1.0.0" {
 		t.Fatalf("HTTPS product metadata = %#v", metadata)
+	}
+}
+
+func TestLoadAcceptsHTTPSManagementProductTransport(t *testing.T) {
+	metadata, err := LoadMetadata(validProductManifestFormat(t, ProductFormat, "https"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Transport != "https" || metadata.Version != "1.0.0" || len(metadata.StateReads) != len(stateCapabilityMarkers) || len(metadata.StateWrites) != len(stateCapabilityMarkers) {
+		t.Fatalf("HTTPS management product metadata = %#v", metadata)
 	}
 }
 

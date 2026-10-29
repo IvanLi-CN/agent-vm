@@ -29,6 +29,14 @@ test("format-3 client manifest fixes product identity, source and action windows
     expect(manifest.client_view.version).toBe("1.0.0");
     expect(manifest.state_compatibility).toBeUndefined();
     expect(verify_product_bundle(root, manifest)).toEqual(manifest);
+    const httpsManifest = build_product_manifest("1.0.0", "a".repeat(40), artifacts, {
+      format: 3,
+      target: { os: "source", arch: "any" },
+      transport: "https",
+      operations: default_operations(),
+    });
+    expect(httpsManifest.client_view.transport).toBe("https");
+    expect(verify_product_bundle(root, httpsManifest)).toEqual(httpsManifest);
     expect(() => build_product_manifest("1.0.0", "a".repeat(40), artifacts.slice(0, 1), { target: { os: "source", arch: "any" } })).toThrow();
     expect(() => build_product_manifest("1.0", "a".repeat(40), artifacts)).toThrow();
   } finally {

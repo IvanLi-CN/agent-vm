@@ -114,9 +114,20 @@ class WrapperTests(unittest.TestCase):
 
     def test_drain_verification_rejects_malformed_present_sidecar(self):
         self.drain_patch.stop()
+        self._install_go_payload("https")
         sidecar = Path(self.loaded["control_path"]).with_name("client-release.json")
-        sidecar.parent.mkdir(parents=True, exist_ok=True)
         sidecar.write_text(json.dumps({"format": 2, "client_view": {"transport": "https"}}), encoding="utf-8")
+        with mock.patch.object(WRAPPER.subprocess, "run") as run:
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(failure.exception.code, "drain_unverified")
+        run.assert_not_called()
+
+    def test_drain_verification_rejects_tampered_installed_control_artifact(self):
+        self.drain_patch.stop()
+        self._install_go_payload("https")
+        binary = Path(self.loaded["control_path"]).parent / "bin" / "agent-vm-control"
+        binary.write_bytes(binary.read_bytes() + b"tampered")
         with mock.patch.object(WRAPPER.subprocess, "run") as run:
             with self.assertRaises(WRAPPER.WrapperError) as failure:
                 WRAPPER._ensure_drained(self.loaded)
