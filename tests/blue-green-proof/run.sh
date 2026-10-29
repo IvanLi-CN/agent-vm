@@ -12,6 +12,13 @@ KEEP_PROOF_DIR="${KEEP_PROOF_DIR:-0}"
 
 cleanup() {
   if [[ "${KEEP_PROOF_DIR}" != "1" ]]; then
+    if [[ -f "${PROOF_DIR}/rqlited.pid" ]]; then
+      pid="$(<"${PROOF_DIR}/rqlited.pid")"
+      if [[ "${pid}" =~ ^[0-9]+$ ]] && ps -p "${pid}" -o comm= 2>/dev/null | tr -d '[:space:]' | grep -qx 'rqlited'; then
+        printf 'cleanup_skipped=rqlited_pid_%s_still_alive proof_dir=%s\n' "${pid}" "${PROOF_DIR}" >&2
+        return 0
+      fi
+    fi
     rm -rf -- "${PROOF_DIR}"
   else
     printf 'proof_dir=%s\n' "${PROOF_DIR}" >&2

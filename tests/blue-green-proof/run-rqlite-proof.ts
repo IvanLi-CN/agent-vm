@@ -7,8 +7,8 @@ import { spawn, type ChildProcess } from "node:child_process";
 
 const TARGET_VERSION = "v10.5.2";
 const DEFAULT_HOST = "127.0.0.1";
-const DEFAULT_HTTP_PORT = 4001;
-const DEFAULT_RAFT_PORT = 4002;
+const DEFAULT_HTTP_PORT = 0;
+const DEFAULT_RAFT_PORT = 0;
 
 type JsonObject = Record<string, unknown>;
 type Cell = string | number | boolean | null;
@@ -180,16 +180,24 @@ function startRqlite(options: Options): RqliteProcess {
     "-raft-addr", `${options.host}:${options.raftPort}`,
     dataDir,
   ], { stdio: ["ignore", "pipe", "pipe"] });
+  assertCondition(child.pid !== undefined, "rqlite child process has no PID");
+  writeFileSync(join(options.proofDir, "rqlited.pid"), `${child.pid}\n`);
   const log: string[] = [];
   child.stdout?.on("data", chunk => log.push(String(chunk)));
   child.stderr?.on("data", chunk => log.push(String(chunk)));
 
-  const stop = async (): Promise<void> => {
-    if (child.exitCode !== null) return;
-    child.kill("SIGTERM");
-    for (let attempt = 0; attempt < 50 && child.exitCode === null; attempt += 1) await sleep(100);
-    if (child.exitCode === null) child.kill("SIGKILL");
-    for (let attempt = 0; attempt < 20 && child.exitCode === null; attempt += 1) await sleep(100);
+  let stopPromise: Promise<void> | null = null;
+  const stop = (): Promise<void> => {
+    if (stopPromise) return stopPromise;
+    stopPromise = (async () => {
+      if (child.exitCode !== null) return;
+      child.kill("SIGTERM");
+      for (let attempt = 0; attempt < 50 && child.exitCode === null; attempt += 1) await sleep(100);
+      if (child.exitCode === null) child.kill("SIGKILL");
+      for (let attempt = 0; attempt < 100 && child.exitCode === null; attempt += 1) await sleep(100);
+      if (child.exitCode === null) throw new ProofFailure("rqlite did not exit after SIGKILL", { pid: child.pid });
+    })();
+    return stopPromise;
   };
 
   return { process: child, log, stop };
@@ -403,6 +411,13 @@ async function run(options: Options): Promise<JsonObject> {
   const runtimeOptions = { ...options, httpPort, raftPort };
   const baseUrl = `http://${runtimeOptions.host}:${runtimeOptions.httpPort}`;
   const server = startRqlite(runtimeOptions);
+  let interrupted: NodeJS.Signals | null = null;
+  const onSignal = (signal: NodeJS.Signals): void => {
+    interrupted ??= signal;
+    void server.stop();
+  };
+  process.once("SIGINT", onSignal);
+  process.once("SIGTERM", onSignal);
   try {
     const status = await waitForReady(baseUrl, server);
     const build = asObject(status.build, "status.build");
@@ -491,6 +506,7 @@ async function run(options: Options): Promise<JsonObject> {
     assertCondition(lostAfterConflict?.request_digest === lostAfterRetry?.request_digest && lostAfterConflict?.outcome === "success", "mismatched operation retry changed the original journal row", { lostAfterRetry, lostAfterConflict });
     assertCondition(lostSlotAfterConflict.generation === 1 && lostEffectsAfterConflict === 1, "mismatched operation retry changed durable state", { lostSlotAfterConflict, lostEffectsAfterConflict });
 
+    if (interrupted) throw new ProofFailure(`interrupted by ${interrupted}`);
     return {
       schema_version: 1,
       experiment: "rqlite-request-level-conditional-atomicity",
@@ -545,8 +561,13 @@ async function run(options: Options): Promise<JsonObject> {
       verdict: "db_level_contract_observed_with_external_effect_scope_limit",
     };
   } finally {
-    await server.stop();
-    writeFileSync(join(options.proofDir, "rqlite.log"), server.log.join(""));
+    try {
+      await server.stop();
+    } finally {
+      process.off("SIGINT", onSignal);
+      process.off("SIGTERM", onSignal);
+      writeFileSync(join(options.proofDir, "rqlite.log"), server.log.join(""));
+    }
   }
 }
 
