@@ -61,8 +61,8 @@ Read [PRODUCT.md](PRODUCT.md) for product boundaries, [DESIGN.md](DESIGN.md) for
 
 ### Web Demo
 
-The repository also ships an independent, static-safe Demo build under
-`/demo/`. It reuses the five management pages and route suffixes but runs only
+The repository also ships an independent, static-safe Demo build at the origin
+root. It reuses the five management pages and route suffixes but runs only
 against an in-memory model. The inspector can switch normal, capacity/data
 fault, conflict/unknown-outcome, and empty scenarios; simulated identity,
 network, and data settings are shareable as `demo`/`d_*` query parameters.
@@ -84,8 +84,11 @@ bun run build:demo
 bun run preview:demo
 ```
 
-Static hosts must serve `web/dist-demo/index.html` for `/demo/` and unknown
-`/demo/*` paths (SPA fallback). The formal build remains `bun run build:web` and
+Deploy the contents of `web/dist-demo` at the origin root. Static hosts must serve
+existing assets normally and fall back to `index.html` for page paths such as
+`/images` (SPA fallback). For EdgeOne Makers, include an `edgeone.json` in the
+uploaded directory with `{"rewrites":[{"source":"/*","destination":"/index.html"}]}`.
+The formal build remains `bun run build:web` and
 uses the configured real management API boundary.
 
 ## Local validation

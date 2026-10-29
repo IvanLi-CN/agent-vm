@@ -1,5 +1,36 @@
 import { expect, test } from "@playwright/test";
 
+test("uses root routes for navigation, refresh, history and share links", async ({ page }) => {
+  const realRequests: string[] = [];
+  page.on("request", (request) => { if (new URL(request.url()).pathname.startsWith("/api/v1")) realRequests.push(request.url()); });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (value: string) => { sessionStorage.setItem("test-share", value); } } });
+  });
+  await page.goto("/?demo=normal&d_persona=admin&d_network=online&d_data=full");
+  const routes = [["VMs", "vms"], ["Images", "images"], ["Operations & Audit", "operations"], ["System", "system"], ["Overview", "overview"]] as const;
+  for (const [name, route] of routes) {
+    await page.getByRole("button", { name, exact: true }).click();
+    expect(new URL(page.url()).pathname).toBe(route === "overview" ? "/" : `/${route}`);
+    await expect(page.getByTestId(`${route}-page`)).toBeVisible();
+    await page.reload();
+    await expect(page.getByTestId(`${route}-page`)).toBeVisible();
+  }
+  await page.goBack();
+  await expect(page.getByTestId("system-page")).toBeVisible();
+  await page.goForward();
+  await expect(page.getByTestId("overview-page")).toBeVisible();
+  await page.getByRole("button", { name: "Images", exact: true }).click();
+  await page.getByRole("button", { name: "Copy share link" }).click();
+  const shared = await page.evaluate(() => sessionStorage.getItem("test-share"));
+  expect(shared).not.toBeNull();
+  const shareUrl = new URL(shared!);
+  expect(shareUrl.pathname).toBe("/images");
+  expect(shareUrl.searchParams.get("demo")).toBe("normal");
+  await page.goto(shareUrl.href);
+  await expect(page.getByTestId("images-page")).toBeVisible();
+  expect(realRequests).toEqual([]);
+});
+
 test("supports left, right, floating and minimized inspector positions", async ({ page }) => {
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.goto("?demo=normal");
@@ -121,7 +152,7 @@ test("keeps the demo isolated while a scenario and simulated action change", asy
   await expect(page.getByRole("option", { name: "Capacity or data fault" })).toBeVisible();
   await page.getByRole("option", { name: "Capacity or data fault" }).click();
   await page.getByRole("button", { name: "VMs" }).click();
-  await expect(page).toHaveURL(/\/demo\/vms\?demo=capacity/);
+  await expect(page).toHaveURL(/\/vms\?demo=capacity/);
   await expect(page.getByTestId("vms-page")).toBeVisible();
   await page.getByRole("button", { name: "Release lease" }).click();
   await expect(page.getByRole("dialog")).toBeVisible();
@@ -194,7 +225,7 @@ test("covers route pages, denied reads, keyboard controls and clipboard failure"
 });
 
 test("refreshes a conflict deep link with an inspectable unknown outcome", async ({ page }) => {
-  await page.goto("/demo/operations?demo=conflict&d_persona=admin");
+  await page.goto("/operations?demo=conflict&d_persona=admin");
   await expect(page.getByTestId("operations-page")).toBeVisible();
   await expect(page.getByText("Outcome unknown").nth(1)).toBeVisible();
   await page.reload();

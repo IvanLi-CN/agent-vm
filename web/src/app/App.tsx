@@ -15,11 +15,10 @@ import { DemoProvider, getDemoInspectorLayout, isDemoRuntime, saveDemoInspectorL
 const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 4_000, retry: 1 } } });
 
 function pageFromPath(path: string): PageKey {
-  const normalized = path.replace(/^\/demo(?=\/|$)/, "");
-  if (normalized.startsWith("/vms")) return "vms";
-  if (normalized.startsWith("/images")) return "images";
-  if (normalized.startsWith("/operations")) return "operations";
-  if (normalized.startsWith("/system")) return "system";
+  if (path.startsWith("/vms")) return "vms";
+  if (path.startsWith("/images")) return "images";
+  if (path.startsWith("/operations")) return "operations";
+  if (path.startsWith("/system")) return "system";
   return "overview";
 }
 

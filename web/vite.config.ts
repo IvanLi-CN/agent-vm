@@ -9,7 +9,7 @@ export default defineConfig(({ mode }) => {
   const demo = mode === "demo";
   return {
     root: webRoot,
-    base: demo ? "/demo/" : "/",
+    base: "/",
     plugins: [tailwindcss(), react()],
     resolve: {
       alias: {
