@@ -267,6 +267,14 @@ func requireCanonicalCoreSchema(ctx context.Context, objects []remoteSchemaObjec
 }
 
 func canonicalCoreSchema(ctx context.Context) (map[string]remoteSchemaObject, error) {
+	return canonicalSchema(ctx, schema)
+}
+
+func canonicalManagementSchema(ctx context.Context) (map[string]remoteSchemaObject, error) {
+	return canonicalSchema(ctx, managementSchema)
+}
+
+func canonicalSchema(ctx context.Context, source string) (map[string]remoteSchemaObject, error) {
 	db, err := sql.Open("sqlite", ":memory:")
 	if err != nil {
 		return nil, err
@@ -279,7 +287,7 @@ func canonicalCoreSchema(ctx context.Context) (map[string]remoteSchemaObject, er
 		return nil, err
 	}
 	defer conn.Close()
-	for _, statement := range splitSQLStatements(schema) {
+	for _, statement := range splitSQLStatements(source) {
 		if _, err := conn.ExecContext(ctx, statement); err != nil {
 			return nil, err
 		}
@@ -1555,7 +1563,34 @@ func requireSQLiteSchema(ctx context.Context, db *sql.DB) error {
 	if err != nil {
 		return err
 	}
-	return requireCanonicalCoreSchema(ctx, objects)
+	if err := requireCanonicalCoreSchema(ctx, objects); err != nil {
+		return err
+	}
+	management, err := canonicalManagementSchema(ctx)
+	if err != nil {
+		return fmt.Errorf("build canonical management schema: %w", err)
+	}
+	core, err := canonicalCoreSchema(ctx)
+	if err != nil {
+		return fmt.Errorf("build canonical core schema: %w", err)
+	}
+	for _, object := range objects {
+		key := objectKey(object.Type, object.Name)
+		if expected, exists := core[key]; exists {
+			if object.SQL != expected.SQL {
+				return fmt.Errorf("database schema differs from canonical object %s", key)
+			}
+			continue
+		}
+		expected, exists := management[key]
+		if !exists {
+			return fmt.Errorf("database schema contains unsupported object %s", key)
+		}
+		if object.SQL != expected.SQL {
+			return fmt.Errorf("database schema differs from canonical management object %s", key)
+		}
+	}
+	return nil
 }
 
 func countMigrationBlockingOperations(ctx context.Context, db *sql.DB) (int, error) {

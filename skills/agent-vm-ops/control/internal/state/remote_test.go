@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -520,6 +521,49 @@ func TestMigrationTargetPreflightDoesNotWrite(t *testing.T) {
 	defer postsMu.Unlock()
 	if posts != 0 {
 		t.Fatalf("target preflight issued %d write requests", posts)
+	}
+}
+
+func TestMigrationRejectsUnsupportedSourceSchemaBeforeRemoteWrite(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "source.sqlite3")
+	source, err := OpenForTest(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE TABLE unsupported_source_state(value TEXT)"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			posts++
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{}})
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := migrateSQLiteToRQLite(ctx, sourcePath, server.URL, SQLiteMigrationGate{
+		StateWriteFenced:    true,
+		WorkersQuiescent:    true,
+		SQLiteWritersClosed: true,
+	}); err == nil || !strings.Contains(err.Error(), "unsupported object") {
+		t.Fatalf("unsupported source schema error = %v", err)
+	}
+	if posts != 0 {
+		t.Fatalf("unsupported source schema issued %d remote writes", posts)
 	}
 }
 
