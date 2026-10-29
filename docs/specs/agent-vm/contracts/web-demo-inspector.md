@@ -52,7 +52,7 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 
 ### 可发现的热区
 
-浮动模式面板顶部必须显示独立的面板级拖动手柄，而不是把标题文字或业务按钮作为隐藏热区。手柄应横跨面板主要宽度，视觉上使用居中的 grip/pill（不显示“拖动”操作文案），通过 Tooltip 和 accessible name 解释用途；手柄具有清晰的 hover/pressed/focus-visible 状态和至少 44×44px 的移动端触控目标。固定左栏、固定右栏和最小化模式不显示该手柄，避免暗示不可用的拖动。
+浮动模式面板顶部必须显示独立的面板级拖动手柄，而不是把标题文字或业务按钮作为隐藏热区。手柄应使用已登记 shadcn/ui `Button` 的 `ghost`/`secondary` variant，内部只放 `GripHorizontal` 图标，横跨面板主要宽度但不显示“拖动”操作文案，通过 Tooltip 和 accessible name 解释用途；手柄具有清晰的 hover/pressed/focus-visible 状态和至少 44×44px 的移动端触控目标。固定左栏、固定右栏和最小化模式不显示该手柄，避免暗示不可用的拖动。
 
 手柄只负责移动面板，不负责打开位置菜单；位置图标仍是单独的控制。手柄与标题、Select、网络切换和操作按钮之间必须有清晰的 hit-area 边界，避免一次触控同时触发拖动和业务操作。
 
@@ -87,7 +87,7 @@ Inspector 按以下顺序组织内容，不得用一组无标签的图标替代�
 - [Material 3 Bottom sheets](https://m3.material.io/components/bottom-sheets/overview) 将 drag handle 作为可选视觉提示，同时要求至少 48dp 的可访问触控热区。
 - [Apple Human Interface Guidelines — Windows](https://developer.apple.com/design/human-interface-guidelines/windows) 将可移动窗口的 frame/title bar 与业务按钮分开，窗口通过 frame 移动。
 
-因此 Inspector 采用“顶部居中 grip + 44px 以上整条热区 + Tooltip/accessible name”的组合；位置按钮只负责布局菜单，不能兼任拖动手柄。
+因此 Inspector 采用“顶部居中 shadcn Button + GripHorizontal + 44px 以上整条热区 + Tooltip/accessible name”的组合；位置按钮只负责布局菜单，不能兼任拖动手柄。`ResizableHandle` 只用于调整大小，不被冒充为浮动面板移动控件。
 
 ## 响应式与可访问性门禁
 

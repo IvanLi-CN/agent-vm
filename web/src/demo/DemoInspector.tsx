@@ -8,6 +8,7 @@ import { Button as ShadcnButton } from "../components/ui/button";
 import { ContextMenu, ContextMenuContent, ContextMenuRadioGroup, ContextMenuRadioItem, ContextMenuTrigger } from "../components/ui/context-menu";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuRadioGroup, DropdownMenuRadioItem, DropdownMenuTrigger } from "../components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "../components/ui/tooltip";
+import { cn } from "../lib/utils";
 
 type ExpandedLayout = Exclude<DemoInspectorLayout, "minimized">;
 
@@ -197,7 +198,7 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
   return <TooltipProvider delayDuration={350}><div className={`demo-inspector-shell demo-inspector-shell--${layout} ${isMinimized ? "is-closed" : "is-open"}`}>
     <ShadcnButton type="button" variant="outline" size="icon-lg" className={`demo-bubble ${isMinimized ? "" : "is-open"}`} aria-label={t("demo.openInspector")} onClick={restoreLayout}><PanelRight aria-hidden="true" /></ShadcnButton>
     {!isMinimized ? <aside ref={inspectorRef} className={`demo-inspector ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.inspector")} style={layout === "floating" && floatingPosition ? { left: `${floatingPosition.left}px`, top: `${floatingPosition.top}px`, right: "auto", bottom: "auto" } : undefined}>
-      {layout === "floating" ? <Tooltip><TooltipTrigger asChild><ShadcnButton type="button" variant="ghost" size="default" className={`demo-inspector-panel-handle ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.dragHandle")} aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown" onPointerDown={handleDragStart} onPointerMove={handleDragMove} onPointerUp={finishDrag} onPointerCancel={finishDrag} onKeyDown={handleDragKeyDown}><GripHorizontal aria-hidden="true" /></ShadcnButton></TooltipTrigger><TooltipContent side="bottom">{t("demo.dragInspector")}</TooltipContent></Tooltip> : null}
+      {layout === "floating" ? <Tooltip><TooltipTrigger asChild><ShadcnButton type="button" variant={dragging ? "secondary" : "ghost"} size="lg" className={cn("demo-inspector-panel-handle w-full min-h-11 touch-none cursor-grab", dragging && "cursor-grabbing")} aria-label={t("demo.dragHandle")} aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown" onPointerDown={handleDragStart} onPointerMove={handleDragMove} onPointerUp={finishDrag} onPointerCancel={finishDrag} onKeyDown={handleDragKeyDown}><GripHorizontal aria-hidden="true" /></ShadcnButton></TooltipTrigger><TooltipContent side="bottom">{t("demo.dragInspector")}</TooltipContent></Tooltip> : null}
       <div className="demo-inspector-header">
         <div className="demo-inspector-heading"><span className="eyebrow-label">{t("demo.eyebrow")}</span><h2>{t("demo.inspector")}</h2></div>
         <div className="demo-inspector-header-actions">
