@@ -50,12 +50,12 @@ paths:
       operationId: completeOidcLogin
       security: []
       summary: Consume one OIDC authorization response
-      description: The callback consumes the S256-bound transaction once and never exposes or logs the authorization code.
+      description: "Exactly one callback shape is accepted: a successful response has code and state, or a provider error has error and state without code. The matching S256-bound transaction is consumed once; provider error details are never exposed or logged."
       parameters:
         - name: code
           in: query
-          required: true
-          description: One-time authorization code; never logged or returned in an application error.
+          required: false
+          description: One-time authorization code, required when error is absent; never logged or returned in an application error.
           schema:
             type: string
             minLength: 1
@@ -66,9 +66,33 @@ paths:
           schema:
             type: string
             minLength: 32
+        - name: error
+          in: query
+          required: false
+          description: OIDC provider error, required when code is absent; unknown values become a generic login failure.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 64
+            pattern: "^[A-Za-z0-9_.-]+$"
+        - name: error_description
+          in: query
+          required: false
+          description: Provider diagnostic accepted only for bounded processing; never displayed, logged or returned.
+          schema:
+            type: string
+            maxLength: 512
+        - name: error_uri
+          in: query
+          required: false
+          description: Provider reference accepted but never fetched, displayed, logged or returned.
+          schema:
+            type: string
+            format: uri
+            maxLength: 2048
       responses:
         "302":
-          description: Redirect to the configured management origin after creating the browser session.
+          description: Redirect to the configured management origin after creating the browser session, or after clearing the binding cookie with a generic localized login-failure state and no session for a provider error.
           headers:
             Location:
               schema:
@@ -191,11 +215,39 @@ paths:
               $ref: "#/components/schemas/TokenRevokeRequest"
       responses:
         "202":
-          description: Durable revocation operation accepted or an identical result returned.
+          description: Revocation is atomically committed before this acknowledgment; linearizable Agent authorization rejects new requests using the Token. An identical durable result may be returned.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/Operation"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /tokens/{token_id}/revoke/preview:
+    parameters:
+      - $ref: "#/components/parameters/TokenID"
+      - $ref: "#/components/parameters/Origin"
+    post:
+      tags: [Tokens]
+      operationId: previewAgentTokenRevocation
+      summary: Preview cross-owner Token revocation
+      description: Requires the explicit administrator Token-management capability; the response binds the exact Token metadata, target version and administrator to a single-use confirmation token.
+      security:
+        - browserSession: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenRevokePreviewRequest"
+      responses:
+        "200":
+          description: Preview with a short-lived confirmation token.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenRevokePreviewResponse"
         default:
           $ref: "#/components/responses/Problem"
 
@@ -680,7 +732,8 @@ paths:
     get:
       tags: [Operations]
       operationId: listOperations
-      summary: List durable management operations
+      summary: List durable management operations visible to the current principal
+      description: Ordinary principals receive only operations whose actor is the exact current (issuer, subject) pair. Administrators with observe_admin may query other actors subject to redaction and audit policy.
       parameters:
         - name: status
           in: query
@@ -721,6 +774,7 @@ paths:
       tags: [Operations]
       operationId: getOperation
       summary: Read an operation by its durable identity
+      description: Ordinary principals receive an operation only when its actor is the exact current (issuer, subject) pair; administrators with observe_admin may read other actors' safe results. Token-create results never contain bearer plaintext.
       responses:
         "200":
           description: Current phase, outcome and safe result or error.
@@ -1097,6 +1151,38 @@ components:
         plaintext_disclosure:
           const: consumed
           description: The bearer was already designated for the one permitted creation response and is never reissued.
+    TokenRevokePreviewRequest:
+      type: object
+      additionalProperties: false
+      required: [target_version]
+      properties:
+        target_version:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Current opaque Token resource version; the preview is invalid if it changes.
+    TokenRevokePreviewResponse:
+      type: object
+      additionalProperties: false
+      required: [token_id, target_version, confirmation_token, expires_at, metadata]
+      properties:
+        token_id:
+          type: string
+          minLength: 16
+          maxLength: 128
+        target_version:
+          type: string
+          minLength: 1
+          maxLength: 256
+        confirmation_token:
+          type: string
+          minLength: 32
+          description: Opaque single-use token bound to the administrator, token_revoke action, exact Token ID, parameters, target version and metadata; valid for no more than five minutes.
+        expires_at:
+          type: string
+          format: date-time
+        metadata:
+          $ref: "#/components/schemas/Token"
     TokenRevokeRequest:
       type: object
       additionalProperties: false
@@ -1112,9 +1198,11 @@ components:
         target_version:
           type: [string, "null"]
           maxLength: 256
+          description: Required for cross-owner administrator revocation and must equal the unexpired preview version; owner revocation may omit it.
         confirmation_token:
           type: [string, "null"]
           minLength: 32
+          description: Required for cross-owner administrator revocation and must be the single-use token from the matching preview; owner revocation may omit it.
     OwnershipMappingPreviewRequest:
       type: object
       additionalProperties: false

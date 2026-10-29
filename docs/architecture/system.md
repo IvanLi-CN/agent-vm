@@ -91,6 +91,8 @@ rqlite 成为权威后，所有跨行状态变化使用 `POST /db/execute?transa
 
 每个 Agent VM 服务作为 root 运行以使用现有 Incus 权限；Caddy 作为独立非 root UID 运行，仅能连接已验证的活动 socket。统一服务边界接受浏览器请求和 native control 在同一高权限进程中的风险，因此必须限制请求大小、方法、路径和静态资源清单，禁止任意命令/文件/内部转发路由，严格执行 OIDC、Cookie、CSRF、Origin、Token、scope、ownership、generation 和 reason 校验，使用结构化脱敏日志，并通过 systemd 限制文件系统、执行权限和网络。该边界替代 [ADR 0042](../adr/0042-agent-vm-web-management-boundary.md)，现行选择见 [ADR 0043](../adr/0043-agent-vm-unified-service-security-boundary.md)。
 
+rqlite 在迁移后仍是唯一状态权威。若 rqlite 不可用、数据校验失败或摘要不一致，服务必须保持 durable-write fence 和 native admission closed，保留可读的有效租约，不把旧 SQLite 当作当前状态。恢复优先使用迁移后的已验证 rqlite backup/snapshot；只有证据证明切换后没有 durable write、`state_epoch` advance、lease change 或 native effect，才可重新导入切换前 SQLite snapshot。若已有切换后写入而没有可验证的 rqlite 恢复材料，必须停在 fence 内进行 owner-authorized journal/native reconciliation，禁止并行打开 stale SQLite、猜测重建或删表恢复。
+
 | 故障 | 行为 |
 | --- | --- |
 | 某槽位不健康 | 不把新请求切到该槽位；活动槽位失败时返回可识别错误，不盲目切换或重放。 |

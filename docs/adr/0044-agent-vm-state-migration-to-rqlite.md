@@ -18,6 +18,8 @@ status: accepted
 4. **验证和切换**：对 rqlite 做 schema、capability、行数、摘要、generation、journal 顺序、Token/会话摘要和审计校验；启动一个目标服务做只读/readiness 验证，再绑定蓝绿活动槽位。验证失败保持 SQLite 备份和旧服务不变，不写回或猜测修复 rqlite。
 5. **迁移后**：rqlite 成为唯一共享状态权威，蓝绿服务均通过受保护 API 读写；SQLite 文件只作为受保护的恢复材料，不再由运行服务打开。不得双写、实时双主、从 rqlite 反向重建 SQLite，或通过删表/降级 schema 让旧包“兼容”。
 
+迁移后的 rqlite 故障恢复也必须保持单一权威。服务发现 rqlite 不可用、数据损坏或摘要不一致时，立即保持 state-write fence、停止新的 native admission，并保留可读的有效租约；不得把 stale SQLite 当作现行数据库。恢复源优先使用 cutover 后已验证的 rqlite backup/snapshot，先在隔离目标上校验 schema、capability、`state_epoch`、generation、operation journal、Token/session revocation、审计和 native-effect evidence，再切回共享服务。只有证据证明 cutover 后没有任何 durable write、epoch advance、lease change 或 native effect 时，才允许重新导入原始 pre-cutover SQLite snapshot；否则必须取得 post-cutover rqlite recovery material。两者都不存在时，服务保持 fenced，进行 owner-authorized journal/native inventory reconciliation，不能猜测重建、并行打开旧 SQLite 或通过删表恢复。
+
 关键授权、主体 ownership、会话、Token 撤销、租约、generation、operation journal、状态 capability、`state_epoch` 和 compare-and-act 读取使用 linearizable consistency；native observation 前后的 epoch 比较也使用 linearizable consistency。只有明确允许延迟的观测值可以选择更弱的一致性，并且必须保留 freshness/observed-at。跨行变化使用同一个 rqlite transaction；条件更新和唯一约束负责 operation ID、request digest、resource version 和 generation 的原子检查。
 
 native Incus 操作在数据库事务外执行时，事务先创建带 slot、worker identity、generation 和 operation ID 的 pending journal；native 结果通过同一身份条件提交。提交响应丢失、rqlite 不可用或 native 结果不明时保留 pending/unknown 状态，阻止冲突操作，不创建新 operation ID 重放。迁移 fence 的最终导出门禁还必须证明这些 pending/unknown worker 已有终态 durable result 且 process group、PID 身份和 Incus operation identity 均已静默；任何未收敛或可继续产生 native effect 的 worker 都必须使迁移停止在 SQLite。
