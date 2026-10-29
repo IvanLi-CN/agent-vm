@@ -5,7 +5,6 @@ import { useTranslation } from "react-i18next";
 import { changeLocale } from "../app/i18n";
 import type { Locale, PageKey } from "../app/types";
 import { Button, IconButton } from "./ui";
-import { isDemoRuntime } from "../demo/runtime";
 
 const navItems: Array<{ key: PageKey; icon: typeof Gauge }> = [
   { key: "overview", icon: Gauge },
@@ -23,9 +22,8 @@ export function Shell({ page, onNavigate, children }: { page: PageKey; onNavigat
 
   const navigate = (next: PageKey) => {
     onNavigate?.(next);
-    const prefix = isDemoRuntime() ? "/demo" : "";
     const url = new URL(window.location.href);
-    url.pathname = `${prefix}${next === "overview" ? "/" : `/${next}`}`;
+    url.pathname = next === "overview" ? "/" : `/${next}`;
     window.history.pushState({}, "", `${url.pathname}${url.search}${url.hash}`);
     window.dispatchEvent(new PopStateEvent("popstate"));
   };
