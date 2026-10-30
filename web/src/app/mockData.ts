@@ -83,7 +83,7 @@ export const audits: AuditEvent[] = [
 export const system: SystemStatus = {
   product_version: "0.0.0+synthetic",
   resource_version: "system:revision-4",
-  state_capabilities: ["legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1"],
+  state_capabilities: ["legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "principal-identity@1", "session-image-binding@1", "token-revocation@1"],
   maintenance: { draining: false, reconciliation_pending: 0, garbage_collection_pending: 0 },
   components: [
     { name: "web", state: "ready", version: "0.0.0+synthetic", observed_at: "2026-01-15T10:20:30Z" },
