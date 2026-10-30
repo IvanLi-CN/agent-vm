@@ -1044,7 +1044,7 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 	if _, err := s.Store.StateEpoch(ctx); err != nil {
 		return s.sqliteError(err)
 	}
-	_, reconcileErr := s.reconcile(ctx, true)
+	_, reconcileErr := s.reconcile(ctx, true, "startup")
 	if reconcileErr != nil && protocol.AsError(reconcileErr).Code != "cleanup_incomplete" {
 		return reconcileErr
 	}
@@ -2675,7 +2675,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 	return nil, protocol.NewError("observation_unavailable", "metrics observation did not converge", nil)
 }
 
-func (s *Service) reconcile(ctx context.Context, apply bool, _ ...string) (map[string]any, error) {
+func (s *Service) reconcile(ctx context.Context, apply bool, mode ...string) (map[string]any, error) {
 	if apply {
 		pending, pendingErr := s.Store.PendingOperations(ctx)
 		if pendingErr != nil {
@@ -2689,6 +2689,12 @@ func (s *Service) reconcile(ctx context.Context, apply bool, _ ...string) (map[s
 		}
 		if err := s.recoverPending(ctx, pending); err != nil {
 			return nil, err
+		}
+		startup := len(mode) > 0 && mode[0] == "startup"
+		if !startup {
+			if err := s.reconcileOrphanedAcquireOperations(ctx, pending); err != nil {
+				return nil, err
+			}
 		}
 	}
 	tasks, err := s.Store.ListTasks(ctx)
@@ -3306,7 +3312,6 @@ func (s *Service) configureNetwork(ctx context.Context, task *state.Task) error 
 		return protocol.NewError("mapping_unverified", "managed guest IPv4 address is unavailable", map[string]any{"outcome_verified": false})
 	}
 	properties := []struct{ key, value string }{
-		{"ipv4.address", *task.VMIP},
 		{"security.mac_filtering", "true"},
 		{"security.ipv4_filtering", "true"},
 		{"security.ipv6_filtering", "true"},
@@ -3314,6 +3319,9 @@ func (s *Service) configureNetwork(ctx context.Context, task *state.Task) error 
 		{"security.acls", s.Config.NetworkACL},
 		{"security.acls.default.ingress.action", "allow"},
 		{"security.acls.default.egress.action", "allow"},
+		// Incus requires IPv4 filtering before a static address on a bridge
+		// whose DHCP server is disabled.
+		{"ipv4.address", *task.VMIP},
 	}
 	for _, property := range properties {
 		if err := s.Guest.DeviceSet(ctx, task.InstanceName, "eth0", property.key, property.value); err != nil {

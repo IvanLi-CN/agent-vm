@@ -425,6 +425,67 @@ func TestRemoteRequestRejectsErrorV2(t *testing.T) {
 	}
 }
 
+func TestRemoteSyncUsesStrongEpochFenceForCachedMirror(t *testing.T) {
+	var queries int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		queries++
+		if request.Method != http.MethodGet || request.URL.Path != "/db/query" {
+			http.Error(writer, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{{
+			Columns: []string{"value"}, Types: []string{"text"}, Values: [][]any{{"initial"}},
+		}}})
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client(), syncedEpoch: "initial"}
+	if err := backend.syncLocked(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if queries != 1 {
+		t.Fatalf("cached sync issued %d strong epoch queries, want 1", queries)
+	}
+}
+
+func TestRemoteSyncDoesNotAdvanceCacheWhenRefreshFailsAfterEpochChange(t *testing.T) {
+	var queries int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		queries++
+		if request.Method != http.MethodGet || request.URL.Path != "/db/query" {
+			http.Error(writer, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		if strings.Contains(request.URL.Query().Get("q"), "state_epoch") {
+			writer.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{{
+				Columns: []string{"value"}, Types: []string{"text"}, Values: [][]any{{"0123456789abcdef0123456789abcdef"}},
+			}}})
+			return
+		}
+		http.Error(writer, "schema temporarily unavailable", http.StatusServiceUnavailable)
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client(), syncedEpoch: "initial"}
+	if err := backend.syncLocked(context.Background()); err == nil {
+		t.Fatal("epoch-changed refresh unexpectedly succeeded")
+	}
+	if backend.syncedEpoch != "initial" {
+		t.Fatalf("failed refresh advanced cached epoch to %q", backend.syncedEpoch)
+	}
+	if queries != 2 {
+		t.Fatalf("failed refresh issued %d queries, want strong epoch plus schema", queries)
+	}
+}
+
 func TestRemoteQueryRejectsMalformedResultShape(t *testing.T) {
 	for _, testCase := range []struct {
 		name    string

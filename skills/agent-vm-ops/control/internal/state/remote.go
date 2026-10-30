@@ -4,8 +4,9 @@ package state
 // their existing database/sql-shaped implementation, while the adapter uses a
 // short-lived SQLite mirror to evaluate those callbacks and submits the
 // resulting row/schema delta as one rqlite request-level transaction. The
-// mirror is never a second authority: every read refreshes it from a strong
-// rqlite query, and every write is fenced by state_epoch in the remote batch.
+// mirror is never a second authority: every read fences it with a strong
+// rqlite epoch query, and every write is fenced by state_epoch in the remote
+// batch. An unchanged epoch may skip the expensive schema/table rebuild.
 
 import (
 	"bytes"
@@ -33,10 +34,11 @@ const (
 )
 
 type remoteBackend struct {
-	base   *url.URL
-	client *http.Client
-	mirror *sql.DB
-	mu     sync.Mutex
+	base        *url.URL
+	client      *http.Client
+	mirror      *sql.DB
+	mu          sync.Mutex
+	syncedEpoch string
 }
 
 type remoteStatement struct {
@@ -517,6 +519,7 @@ func (r *remoteBackend) ensureRemoteEpoch(ctx context.Context) error {
 		}
 		return nil
 	}
+	r.syncedEpoch = ""
 	if _, err := r.request(ctx, []remoteStatement{{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('state_epoch', 'initial')"}}, true); err != nil {
 		return fmt.Errorf("initialize rqlite state epoch: %w", err)
 	}
@@ -551,7 +554,12 @@ func (r *remoteBackend) ensureManagementSchema(ctx context.Context) error {
 	statements = append(statements,
 		remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('management_selection_revision', '1')"},
 		remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('management_catalog_revision', '1')"},
+		remoteStatement{query: "UPDATE meta SET value = ? WHERE key = 'state_epoch'", args: []any{newEpoch()}},
 	)
+	// Management bootstrap changes schema and metadata without advancing the
+	// core state_epoch. Force the next sync to rebuild the mirror even when the
+	// epoch itself is unchanged. This also covers an ambiguous request result.
+	r.syncedEpoch = ""
 	if _, err := r.request(ctx, statements, true); err != nil {
 		var statementErr *remoteStatementError
 		stateCommitted := (*bool)(nil)
@@ -612,6 +620,9 @@ func (r *remoteBackend) withWrite(ctx context.Context, fn func(*Tx) error) error
 		if err := fn(tx); err != nil {
 			_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
 			_ = conn.Close()
+			if rollbackErr != nil {
+				r.syncedEpoch = ""
+			}
 			stateCommitted := committed(false)
 			if rollbackErr != nil {
 				stateCommitted = nil
@@ -623,6 +634,9 @@ func (r *remoteBackend) withWrite(ctx context.Context, fn func(*Tx) error) error
 			if _, err := tx.conn.ExecContext(ctx, "INSERT INTO meta(key, value) VALUES('state_epoch', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", newEpoch()); err != nil {
 				_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
 				_ = conn.Close()
+				if rollbackErr != nil {
+					r.syncedEpoch = ""
+				}
 				stateCommitted := committed(false)
 				if rollbackErr != nil {
 					stateCommitted = nil
@@ -633,20 +647,26 @@ func (r *remoteBackend) withWrite(ctx context.Context, fn func(*Tx) error) error
 		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 			_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
 			_ = conn.Close()
+			r.syncedEpoch = ""
 			return &TransactionError{Phase: "commit", SQLOperation: "commit", StateCommitted: nil, RollbackError: rollbackErr, Cause: err}
 		}
 		tx.closed = true
 		_ = conn.Close()
+		// The local mirror now contains a speculative commit. Keep it invalid
+		// until the remote compare-and-act succeeds or a fresh sync rebuilds it.
+		r.syncedEpoch = ""
 
 		after, err := snapshotDB(ctx, r.mirror)
 		if err != nil {
 			return &TransactionError{Phase: "commit", SQLOperation: "snapshot", StateCommitted: nil, Cause: err}
 		}
 		if snapshotsEqual(before, after) {
+			r.syncedEpoch = after.Epoch
 			return nil
 		}
 		applied, err := r.applySnapshot(ctx, before, after, before.Epoch, after.Epoch)
 		if err != nil {
+			r.syncedEpoch = ""
 			// Once the HTTP request has been sent, a transport failure cannot
 			// establish whether rqlite committed. Preserve the operation as
 			// unknown instead of retrying it under a new request.
@@ -663,6 +683,7 @@ func (r *remoteBackend) withWrite(ctx context.Context, fn func(*Tx) error) error
 			return &TransactionError{Phase: "commit", SQLOperation: "rqlite_transaction", StateCommitted: nil, Cause: err}
 		}
 		if applied {
+			r.syncedEpoch = after.Epoch
 			return nil
 		}
 		// Another slot committed after this mirror was refreshed. The
@@ -884,6 +905,9 @@ func (r *remoteBackend) syncLocked(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if startEpoch == r.syncedEpoch {
+			return nil
+		}
 		objects, err := r.remoteSchema(ctx)
 		if err != nil {
 			return err
@@ -899,6 +923,7 @@ func (r *remoteBackend) syncLocked(ctx context.Context) error {
 			return err
 		}
 		if startEpoch == endEpoch {
+			r.syncedEpoch = endEpoch
 			return nil
 		}
 	}

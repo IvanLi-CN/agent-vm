@@ -32,10 +32,12 @@ type staticCPUObserver struct {
 
 type startupGuest struct {
 	initErr     error
+	initCalls   int
 	status      string
 	statuses    []map[string]any
 	statusCalls int
 	deleteCalls int
+	startCalls  int
 	config      map[string]any
 	configErr   error
 	stopErr     error
@@ -43,6 +45,7 @@ type startupGuest struct {
 }
 
 func (guest *startupGuest) Init(_ context.Context, _, _ string, ownership map[string]string) error {
+	guest.initCalls++
 	if guest.config != nil {
 		config := guest.config["config"].(map[string]any)
 		for key, value := range ownership {
@@ -68,7 +71,7 @@ func (guest *startupGuest) DeviceAdd(context.Context, string, string, string, ma
 	return nil
 }
 func (guest *startupGuest) DeviceRemove(context.Context, string, string) error { return nil }
-func (guest *startupGuest) Start(context.Context, string) error                { return nil }
+func (guest *startupGuest) Start(context.Context, string) error                { guest.startCalls++; return nil }
 func (guest *startupGuest) Stop(context.Context, string) error                 { return guest.stopErr }
 func (guest *startupGuest) Delete(context.Context, string) error               { guest.deleteCalls++; return nil }
 func (guest *startupGuest) Status(context.Context, string) (map[string]any, error) {
@@ -365,8 +368,18 @@ func TestConfigureNetworkMatchesManagedContainerContract(t *testing.T) {
 	if err := service.configureNetwork(context.Background(), &state.Task{InstanceName: "agent-ready", VMIP: stringPointer("10.250.19.20")}); err != nil {
 		t.Fatal(err)
 	}
-	if len(guest.deviceSets) != 8 || guest.deviceSets[0] != "eth0:ipv4.address=10.250.19.20" {
-		t.Fatalf("device sets = %#v", guest.deviceSets)
+	want := []string{
+		"eth0:security.mac_filtering=true",
+		"eth0:security.ipv4_filtering=true",
+		"eth0:security.ipv6_filtering=true",
+		"eth0:security.port_isolation=true",
+		"eth0:security.acls=agent-vm-acl",
+		"eth0:security.acls.default.ingress.action=allow",
+		"eth0:security.acls.default.egress.action=allow",
+		"eth0:ipv4.address=10.250.19.20",
+	}
+	if !reflect.DeepEqual(guest.deviceSets, want) {
+		t.Fatalf("device sets = %#v, want %#v", guest.deviceSets, want)
 	}
 }
 
@@ -1585,6 +1598,112 @@ func TestStartupReconcileCancelsAcquireForCachedStoppedTask(t *testing.T) {
 	control, ok := operation.Response["error"].(map[string]any)
 	if !ok || control["code"] != "lease_released" {
 		t.Fatalf("cached pending acquire error = %#v", operation.Response["error"])
+	}
+}
+
+func TestReconcileFinalizesOrphanedAcquireWithoutReplay(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "periodic-cached-pending-acquire.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	session := "periodic-cached-pending-acquire-session"
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "periodic-cached-pending-task", SessionID: session, Generation: 2, State: stateCached,
+		InstanceName: "agent-periodic-cached-pending", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(1), "operation_id": "periodic-cached-pending-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(1)
+	if err := store.RecordOperation(ctx, "periodic-cached-pending-acquire", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request), "worker": map[string]any{"state": "exited"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status: "Stopped",
+		config: map[string]any{
+			"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "periodic-cached-pending-task", "user.agent-vm.session": session, "user.agent-vm.generation": "2"},
+			"devices": map[string]any{}, "expanded_devices": map[string]any{},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
+	if _, err := service.reconcile(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(ctx, "periodic-cached-pending-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("periodic orphaned acquire = %#v", operation)
+	}
+	control, ok := operation.Response["error"].(map[string]any)
+	if !ok || control["code"] != "lease_released" {
+		t.Fatalf("periodic orphaned acquire error = %#v", operation.Response["error"])
+	}
+	if operation.Response["_request_digest"] != digest {
+		t.Fatalf("periodic orphaned acquire digest = %#v, want %q", operation.Response["_request_digest"], digest)
+	}
+	if guest.initCalls != 0 || guest.startCalls != 0 {
+		t.Fatalf("periodic reconciliation replayed native acquire: init=%d start=%d", guest.initCalls, guest.startCalls)
+	}
+}
+
+func TestReconcileLeavesOrphanedAcquirePendingWhenNativeStateIsUnverified(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "periodic-unverified-acquire.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session := "periodic-unverified-acquire-session"
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "periodic-unverified-task", SessionID: session, Generation: 2, State: stateCached,
+		InstanceName: "agent-periodic-unverified", CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(1), "operation_id": "periodic-unverified-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(1)
+	if err := store.RecordOperation(ctx, "periodic-unverified-acquire", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request), "worker": map[string]any{"state": "exited"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status: "Running",
+		config: map[string]any{
+			"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "periodic-unverified-task", "user.agent-vm.session": session, "user.agent-vm.generation": "2"},
+			"devices": map[string]any{}, "expanded_devices": map[string]any{},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	if _, err := service.reconcile(ctx, true); protocol.AsError(err).Code != "startup_reconcile_required" {
+		t.Fatalf("unverified orphaned acquire error = %v", err)
+	}
+	operation, err := store.GetOperation(ctx, "periodic-unverified-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "pending" || operation.Response["_request_digest"] != digest {
+		t.Fatalf("unverified orphaned acquire was finalized or changed: %#v", operation)
+	}
+	if guest.initCalls != 0 || guest.startCalls != 0 {
+		t.Fatalf("unverified reconciliation replayed native acquire: init=%d start=%d", guest.initCalls, guest.startCalls)
 	}
 }
 
