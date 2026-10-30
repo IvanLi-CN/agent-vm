@@ -25,6 +25,7 @@
     "test:skills": "bun run bin/test_runner.ts --scope skills"
   },
   "devDependencies": {
+    "@edgeone/makers-sdk": "0.1.0",
     "@playwright/test": "1.58.2",
     "@storybook/addon-a11y": "8.6.14",
     "@storybook/addon-essentials": "^8.6.14",
@@ -43,6 +44,7 @@
     "bun-types": "^1.4.3",
     "class-variance-authority": "^0.7",
     "clsx": "^2",
+    "edgeone": "1.6.47",
     "jsdom": "^30.1.3",
     "react-doctor": "0.9.18",
     "storybook": "^8.6.14",
@@ -51,7 +53,8 @@
     "tw-animate-css": "^1",
     "typescript": "^5.9.0",
     "vite": "^8.3.5",
-    "vitest": "^5.0.5"
+    "vitest": "^5.0.5",
+    "yaml": "2.9.1"
   },
   "dependencies": {
     "@fontsource/ibm-plex-mono": "^5.3.0",
