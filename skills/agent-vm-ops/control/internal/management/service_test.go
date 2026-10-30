@@ -91,6 +91,13 @@ type fakeActionBackend struct {
 	err              error
 }
 
+type blockingActionBackend struct {
+	fakeActionBackend
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
 func (backend *fakeActionBackend) ExecuteVMAction(context.Context, string, string, string, int64, map[string]any) (map[string]any, error) {
 	backend.vmCalls++
 	return map[string]any{"state": "changed"}, backend.err
@@ -99,6 +106,16 @@ func (backend *fakeActionBackend) ExecuteVMAction(context.Context, string, strin
 func (backend *fakeActionBackend) ExecuteMaintenance(context.Context, string, string, map[string]any) (map[string]any, error) {
 	backend.maintenanceCalls++
 	return map[string]any{"state": "changed"}, backend.err
+}
+
+func (backend *blockingActionBackend) ExecuteMaintenance(ctx context.Context, operationID, action string, parameters map[string]any) (map[string]any, error) {
+	backend.once.Do(func() { close(backend.entered) })
+	select {
+	case <-backend.release:
+		return map[string]any{"state": "changed"}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (backend *fakeActionBackend) ValidateVMAction(context.Context, state.Task, string, map[string]any) error {
@@ -665,6 +682,69 @@ func TestMaintenanceDoesNotBecomeStaleFromItsOwnJournalWrites(t *testing.T) {
 	}
 	if operation.Status != "succeeded" {
 		t.Fatalf("operation = %#v", operation)
+	}
+}
+
+func TestRecoverPendingOperationsWaitsForPeerOperationLock(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "state.sqlite3")
+	firstStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStore.Close()
+	secondStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	backend := &blockingActionBackend{entered: make(chan struct{}), release: make(chan struct{})}
+	lockDir := filepath.Join(root, "locks")
+	first := New(firstStore, Options{Actions: backend, CurrentSystemVersion: func(context.Context) (string, error) { return "system:initial", nil }, OperationLockDir: lockDir})
+	second := New(secondStore, Options{OperationLockDir: lockDir})
+	request := MaintenanceRequest{OperationID: "maintenance-peer-fence", Actor: "admin", Reason: "peer fence", TargetVersion: "system:initial", Action: "reconcile"}
+	executionDone := make(chan struct{})
+	var execution *state.ManagementOperation
+	var executionErr error
+	go func() {
+		execution, executionErr = first.ExecuteMaintenance(context.Background(), request)
+		close(executionDone)
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("peer maintenance action did not start")
+	}
+	recoveryDone := make(chan error, 1)
+	go func() { recoveryDone <- second.RecoverPendingOperations(context.Background()) }()
+	select {
+	case err := <-recoveryDone:
+		t.Fatalf("recovery finalized a live peer operation: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(backend.release)
+	select {
+	case <-executionDone:
+	case <-time.After(time.Second):
+		t.Fatal("peer maintenance action did not finish")
+	}
+	if executionErr != nil || execution == nil || execution.Status != "succeeded" {
+		t.Fatalf("execution=%#v err=%v", execution, executionErr)
+	}
+	select {
+	case err := <-recoveryDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not finish after peer released operation lock")
+	}
+	recovered, err := second.GetOperation(context.Background(), request.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.Status != "succeeded" {
+		t.Fatalf("recovered operation = %#v, want peer result", recovered)
 	}
 }
 

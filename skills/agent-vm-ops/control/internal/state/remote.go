@@ -554,7 +554,6 @@ func (r *remoteBackend) ensureManagementSchema(ctx context.Context) error {
 	statements = append(statements,
 		remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('management_selection_revision', '1')"},
 		remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('management_catalog_revision', '1')"},
-		remoteStatement{query: "UPDATE meta SET value = ? WHERE key = 'state_epoch'", args: []any{newEpoch()}},
 	)
 	// Management bootstrap changes schema and metadata without advancing the
 	// core state_epoch. Force the next sync to rebuild the mirror even when the

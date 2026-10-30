@@ -118,6 +118,22 @@ func TestAgentSuccessResponseRedactsNativeDiagnostics(t *testing.T) {
 	}
 }
 
+func TestSafeAgentCodePreservesProtocol4RecoverySemantics(t *testing.T) {
+	for _, code := range []string{
+		"acquire_partial", "restart_partial", "resize_partial", "cleanup_incomplete",
+		"mapping_unverified", "network_unverified", "guest_ip_mismatch", "native_failed", "native_unavailable",
+		"state_unverified", "operation_incomplete", "operation_outcome_unknown", "operation_unverified",
+		"sqlite_unavailable", "startup_reconcile_required", "stale_target",
+	} {
+		if got := safeAgentCode(code); got != code {
+			t.Fatalf("safeAgentCode(%q) = %q, want protocol-4 code preserved", code, got)
+		}
+	}
+	if got := safeAgentCode("private_internal_code"); got != "internal_error" {
+		t.Fatalf("unknown safeAgentCode = %q, want internal_error", got)
+	}
+}
+
 func TestUnifiedTokenRevokeConfirmationCrossesSlots(t *testing.T) {
 	authorityBlue, storeBlue, cfg := testAuthority(t)
 	storeGreen, err := state.OpenForTest(storeBlue.Path())

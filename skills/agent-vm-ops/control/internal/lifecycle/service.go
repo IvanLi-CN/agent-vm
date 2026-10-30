@@ -1047,6 +1047,11 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 		return err
 	}
 	defer unlockDrain()
+	unlockMaintenance, err := s.lockNamedActionWithContext(ctx, "maintenance")
+	if err != nil {
+		return err
+	}
+	defer unlockMaintenance()
 	s.maintenance.Lock()
 	defer s.maintenance.Unlock()
 	if _, err := s.Store.StateEpoch(ctx); err != nil {

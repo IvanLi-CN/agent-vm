@@ -19,6 +19,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
@@ -63,6 +64,7 @@ type Options struct {
 	Clock                      func() time.Time
 	Backend                    ImageBackend
 	Actions                    ActionBackend
+	OperationLockDir           string
 }
 
 func (s *Service) rejectNewManagementAction(ctx context.Context) error {
@@ -171,6 +173,20 @@ func New(store *state.Store, options Options) *Service {
 		clock = time.Now
 	}
 	return &Service{Store: store, Clock: clock, Options: options}
+}
+
+func (s *Service) lockOperation(ctx context.Context, operationID string) (func(), error) {
+	if operationID == "" {
+		return nil, errors.New("invalid_request: operation ID is required")
+	}
+	if s.Options.OperationLockDir == "" {
+		return func() {}, nil
+	}
+	lock, err := native.AcquireNamedLock(ctx, s.Options.OperationLockDir, "management-operation:"+operationID)
+	if err != nil {
+		return nil, fmt.Errorf("management operation lock: %w", err)
+	}
+	return func() { _ = lock.Close() }, nil
 }
 
 func (s *Service) Initialize(ctx context.Context, legacyFingerprint string) error {
@@ -490,6 +506,11 @@ func (s *Service) beginLocalImageUpload(ctx context.Context, operationID string)
 }
 
 func (s *Service) UploadImageImport(ctx context.Context, operationID string, metadata, rootfs []byte) (*state.ManagementOperation, error) {
+	unlock, err := s.lockOperation(ctx, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	operation, request, release, err := s.beginLocalImageUpload(ctx, operationID)
 	if err != nil {
 		return operation, err
@@ -526,6 +547,11 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 }
 
 func (s *Service) UploadImageImportFiles(ctx context.Context, operationID, metadataPath, rootfsPath string) (*state.ManagementOperation, error) {
+	unlock, err := s.lockOperation(ctx, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	operation, request, release, err := s.beginLocalImageUpload(ctx, operationID)
 	if err != nil {
 		return operation, err
@@ -621,6 +647,11 @@ func validateImportFile(path string, expectedSize int64, expectedDigest string) 
 // FailImageImportUpload durably closes an upload operation when the HTTP
 // stream fails before the bytes can reach the image verifier.
 func (s *Service) FailImageImportUpload(ctx context.Context, operationID string, err error) (*state.ManagementOperation, error) {
+	unlock, lockErr := s.lockOperation(ctx, operationID)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer unlock()
 	operation, getErr := s.Store.GetManagementOperation(ctx, operationID)
 	if getErr != nil || operation == nil {
 		return operation, getErr
@@ -646,6 +677,11 @@ func (s *Service) FailImageImportUpload(ctx context.Context, operationID string,
 }
 
 func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) (*state.ManagementOperation, error) {
+	unlock, err := s.lockOperation(ctx, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	operation, err := s.Store.GetManagementOperation(ctx, operationID)
 	if err != nil {
 		return nil, err
@@ -754,6 +790,11 @@ func (s *Service) cleanupImportedImage(ctx context.Context, fingerprint string) 
 // recovery path. Running native work is never replayed automatically because
 // the previous executor may still be alive or its result may be uncertain.
 func (s *Service) RecoverOperation(ctx context.Context, operationID string) (*state.ManagementOperation, error) {
+	unlock, err := s.lockOperation(ctx, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	operation, err := s.Store.GetManagementOperation(ctx, operationID)
 	if err != nil {
 		return nil, err
@@ -984,6 +1025,11 @@ func (s *Service) requireImageVersion(ctx context.Context, fingerprint, expected
 }
 
 func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reason, action, targetID, targetVersion string, mutate func() (map[string]any, error)) (*state.ManagementOperation, error) {
+	unlock, err := s.lockOperation(ctx, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if operationID == "" || actor == "" {
 		return nil, errors.New("invalid_request: operation and actor are required")
 	}
@@ -1030,6 +1076,11 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 }
 
 func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) (*state.ManagementOperation, error) {
+	unlock, err := s.lockOperation(ctx, request.OperationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	s.vmActionMu.Lock()
 	defer s.vmActionMu.Unlock()
 	actionRequest := map[string]any{"action": request.Action, "task_id": request.TaskID, "target_version": request.TargetVersion, "generation": request.ExpectedGeneration, "parameters": request.Parameters, "actor": request.Actor, "reason": request.Reason, "target_kind": "vm", "target_id": request.TaskID}
@@ -1123,6 +1174,11 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 }
 
 func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceRequest) (*state.ManagementOperation, error) {
+	unlock, err := s.lockOperation(ctx, request.OperationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 	actionRequest := map[string]any{"action": request.Action, "target_version": request.TargetVersion, "parameters": request.Parameters, "actor": request.Actor, "reason": request.Reason, "target_kind": "system", "target_id": "system"}

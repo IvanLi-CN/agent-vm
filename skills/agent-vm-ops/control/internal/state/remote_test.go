@@ -36,6 +36,39 @@ type rqliteStatusIdentity struct {
 	} `json:"os"`
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
+func installRemoteConflictTransport(store *Store, conflict func() error) func() error {
+	original := store.remote.client.Transport
+	base := http.DefaultTransport
+	triggered := false
+	var conflictErr error
+	var once sync.Once
+	store.remote.client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.Method == http.MethodPost && request.URL.Path == "/db/execute" && request.URL.Query().Has("transaction") {
+			once.Do(func() {
+				triggered = true
+				conflictErr = conflict()
+			})
+			if conflictErr != nil {
+				return nil, conflictErr
+			}
+		}
+		return base.RoundTrip(request)
+	})
+	return func() error {
+		store.remote.client.Transport = original
+		if !triggered {
+			return errors.New("remote conflict transport was not triggered")
+		}
+		return conflictErr
+	}
+}
+
 func requireSessionOwnedRQLite(t *testing.T) string {
 	t.Helper()
 	descriptorPath := os.Getenv("AGENT_VM_RQLITE_DESCRIPTOR")
@@ -481,6 +514,191 @@ func TestRemoteOIDCConsumptionReplaysEpochConflict(t *testing.T) {
 	}
 	if consumed != 1 {
 		t.Fatalf("successful remote OIDC consumers = %d, want 1", consumed)
+	}
+}
+
+func TestRemoteAuthCallbacksClearSpeculativeResultsOnEpochConflict(t *testing.T) {
+	rqliteURL := requireSessionOwnedRQLite(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	runID := randomHex(6)
+	first, err := OpenForTest(rqliteURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := OpenForTest(rqliteURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if err := first.EnsureManagementSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.EnsureManagementSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	stateDigest := "remote-auth-replay-state-" + runID
+	if err := first.InsertOIDCTransaction(ctx, OIDCTransaction{
+		TransactionID: "remote-auth-replay-transaction-" + runID, StateDigest: stateDigest, NonceDigest: "remote-auth-replay-nonce-" + runID,
+		CodeVerifierSealed: "sealed", BindingCookieDigest: "remote-auth-replay-binding-" + runID, ClientID: "client", RedirectURI: "https://console.example/api/v1/auth/oidc/callback",
+		CreatedAt: "2026-10-29T00:00:00Z", ExpiresAt: "2099-10-29T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	peerConsumed := false
+	finishConflict := installRemoteConflictTransport(first, func() error {
+		_, peerConsumed, err = second.ConsumeOIDCTransaction(ctx, stateDigest, "2026-10-29T00:01:00Z")
+		return err
+	})
+	_, consumed, err := first.ConsumeOIDCTransaction(ctx, stateDigest, "2026-10-29T00:01:00Z")
+	if conflictErr := finishConflict(); conflictErr != nil {
+		t.Fatal(conflictErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !peerConsumed || consumed {
+		t.Fatalf("OIDC conflict result peer=%v first=%v, want peer=true first=false", peerConsumed, consumed)
+	}
+
+	remoteToken := AgentToken{
+		TokenID: "remote-auth-replay-token-" + runID, TokenDigest: "remote-auth-replay-token-digest-" + runID, OperationID: "remote-auth-replay-token-operation-" + runID, RequestDigest: "remote-auth-replay-token-request-" + runID,
+		Issuer: "https://issuer.example", Subject: "admin", Scopes: []string{"agent:read"}, CreatedAt: "2026-10-29T00:00:00Z", ExpiresAt: "2099-10-29T00:00:00Z", ResourceVersion: "token:initial-" + runID, PlaintextDisclosure: "returned",
+	}
+	remoteOperation := ManagementOperation{
+		OperationID: remoteToken.OperationID, Action: "token_create", TargetKind: "token", TargetID: remoteToken.TokenID, Actor: "https://issuer.example\x00admin", Phase: "durable_state", Status: "succeeded",
+		Request: map[string]any{"_request_digest": remoteToken.RequestDigest}, Result: map[string]any{"token_metadata": map[string]any{"token_id": remoteToken.TokenID}, "plaintext_disclosure": "returned"}, CreatedAt: remoteToken.CreatedAt, UpdatedAt: remoteToken.CreatedAt,
+	}
+	remoteAudit := ManagementAudit{EventID: "remote-auth-replay-token-event-" + runID, OperationID: stringPointer(remoteToken.OperationID), Action: "token_create", Actor: remoteOperation.Actor, Target: map[string]any{"kind": "token", "id": remoteToken.TokenID}, Outcome: "succeeded", Phase: "durable_state", OccurredAt: remoteToken.CreatedAt}
+	peerCreated := false
+	finishConflict = installRemoteConflictTransport(first, func() error {
+		_, _, peerCreated, err = second.ClaimAgentTokenWithOperation(ctx, remoteToken, remoteOperation, remoteAudit)
+		return err
+	})
+	createdOperation, createdToken, created, err := first.ClaimAgentTokenWithOperation(ctx, remoteToken, remoteOperation, remoteAudit)
+	if conflictErr := finishConflict(); conflictErr != nil {
+		t.Fatal(conflictErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !peerCreated || created || createdOperation == nil || createdToken == nil {
+		t.Fatalf("Token create conflict operation=%#v token=%#v peer_created=%v created=%v", createdOperation, createdToken, peerCreated, created)
+	}
+
+	peerChanged := false
+	finishConflict = installRemoteConflictTransport(first, func() error {
+		_, peerChanged, err = second.RevokeAgentToken(ctx, remoteToken.TokenID, remoteToken.ResourceVersion, "token:revoked-"+runID, "2026-10-29T00:02:00Z")
+		return err
+	})
+	revokedToken, changed, err := first.RevokeAgentToken(ctx, remoteToken.TokenID, remoteToken.ResourceVersion, "token:revoked-"+runID, "2026-10-29T00:02:00Z")
+	if conflictErr := finishConflict(); conflictErr != nil {
+		t.Fatal(conflictErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !peerChanged || changed || revokedToken == nil || revokedToken.RevokedAt == nil {
+		t.Fatalf("Token revoke conflict token=%#v peer_changed=%v changed=%v", revokedToken, peerChanged, changed)
+	}
+
+	secondToken := AgentToken{
+		TokenID: "remote-auth-replay-operation-token-" + runID, TokenDigest: "remote-auth-replay-operation-token-digest-" + runID, OperationID: "remote-auth-replay-operation-create-" + runID, RequestDigest: "remote-auth-replay-operation-request-" + runID,
+		Issuer: "https://issuer.example", Subject: "admin", Scopes: []string{"agent:read"}, CreatedAt: "2026-10-29T00:03:00Z", ExpiresAt: "2099-10-29T00:00:00Z", ResourceVersion: "token:initial-operation-" + runID, PlaintextDisclosure: "returned",
+	}
+	secondCreateOperation := ManagementOperation{
+		OperationID: secondToken.OperationID, Action: "token_create", TargetKind: "token", TargetID: secondToken.TokenID, Actor: remoteOperation.Actor, Phase: "durable_state", Status: "succeeded",
+		Request: map[string]any{"_request_digest": secondToken.RequestDigest}, Result: map[string]any{"token_metadata": map[string]any{"token_id": secondToken.TokenID}, "plaintext_disclosure": "returned"}, CreatedAt: secondToken.CreatedAt, UpdatedAt: secondToken.CreatedAt,
+	}
+	secondCreateAudit := ManagementAudit{EventID: "remote-auth-replay-operation-create-event-" + runID, OperationID: stringPointer(secondToken.OperationID), Action: "token_create", Actor: remoteOperation.Actor, Target: map[string]any{"kind": "token", "id": secondToken.TokenID}, Outcome: "succeeded", Phase: "durable_state", OccurredAt: secondToken.CreatedAt}
+	if _, _, created, err := second.ClaimAgentTokenWithOperation(ctx, secondToken, secondCreateOperation, secondCreateAudit); err != nil || !created {
+		t.Fatalf("second Token create created=%v err=%v", created, err)
+	}
+	revokeOperation := ManagementOperation{
+		OperationID: "remote-auth-replay-operation-revoke-" + runID, Action: "token_revoke", TargetKind: "token", TargetID: secondToken.TokenID, Actor: remoteOperation.Actor, Phase: "durable_state",
+		Request: map[string]any{"_request_digest": "remote-auth-replay-operation-revoke-request-" + runID}, CreatedAt: "2026-10-29T00:04:00Z", UpdatedAt: "2026-10-29T00:04:00Z",
+	}
+	revokeAudit := ManagementAudit{EventID: "remote-auth-replay-operation-revoke-event-" + runID, OperationID: stringPointer(revokeOperation.OperationID), Action: "token_revoke", Actor: remoteOperation.Actor, Target: map[string]any{"kind": "token", "id": secondToken.TokenID}, Outcome: "succeeded", Phase: "durable_state", OccurredAt: revokeOperation.CreatedAt}
+	peerChanged = false
+	finishConflict = installRemoteConflictTransport(first, func() error {
+		_, _, peerChanged, err = second.RevokeAgentTokenWithOperation(ctx, secondToken.TokenID, secondToken.ResourceVersion, "token:revoked-operation-"+runID, "2026-10-29T00:05:00Z", revokeOperation, revokeAudit)
+		return err
+	})
+	revokedOperation, revokedOperationToken, changed, err := first.RevokeAgentTokenWithOperation(ctx, secondToken.TokenID, secondToken.ResourceVersion, "token:revoked-operation-"+runID, "2026-10-29T00:05:00Z", revokeOperation, revokeAudit)
+	if conflictErr := finishConflict(); conflictErr != nil {
+		t.Fatal(conflictErr)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !peerChanged || changed || revokedOperation == nil || revokedOperationToken == nil || revokedOperationToken.RevokedAt == nil {
+		t.Fatalf("Token operation revoke conflict operation=%#v token=%#v peer_changed=%v changed=%v", revokedOperation, revokedOperationToken, peerChanged, changed)
+	}
+}
+
+func TestRemoteManagementBootstrapAndSelectionPreserveReadEpoch(t *testing.T) {
+	rqliteURL := requireSessionOwnedRQLite(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	store, err := OpenForTest(rqliteURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if err := store.EnsureManagementSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	beforeBootstrap, err := store.StateEpoch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureManagementSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	afterBootstrap, err := store.StateEpoch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterBootstrap != beforeBootstrap {
+		t.Fatalf("repeated management bootstrap changed epoch from %q to %q", beforeBootstrap, afterBootstrap)
+	}
+	fingerprint := strings.Repeat("d", 64)
+	if err := store.InsertManagedImage(ctx, ManagedImage{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed", DefaultCompatibility: "none"}); err != nil {
+		t.Fatal(err)
+	}
+	beforeSelection, err := store.StateEpoch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectionVersion, err := store.ImageSelectionVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectedVersion, err := store.SelectManagedImage(ctx, fingerprint, selectionVersion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if selectedVersion == selectionVersion {
+		t.Fatalf("image selection version did not advance from %q", selectionVersion)
+	}
+	afterSelection, err := store.StateEpoch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterSelection == beforeSelection {
+		t.Fatalf("image selection did not advance epoch %q", beforeSelection)
+	}
+	if err := store.EnsureManagementSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	afterRead, err := store.StateEpoch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRead != afterSelection {
+		t.Fatalf("read-only management bootstrap changed selection epoch from %q to %q", afterSelection, afterRead)
 	}
 }
 

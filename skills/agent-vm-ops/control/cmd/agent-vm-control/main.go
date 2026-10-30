@@ -198,9 +198,10 @@ func serve(args []string) error {
 		IsDraining: func(ctx context.Context) (bool, error) {
 			return service.IsDraining(ctx)
 		},
-		Clock:   time.Now,
-		Backend: imageBackend,
-		Actions: &webadmin.LifecycleActions{Service: service, Store: store},
+		Clock:            time.Now,
+		Backend:          imageBackend,
+		Actions:          &webadmin.LifecycleActions{Service: service, Store: store},
+		OperationLockDir: filepath.Join(cfg.StoragePath, "locks"),
 	}
 	if cfg.Management.Upload.Enabled {
 		managementOptions.AvailableStagingBytes = func() (int64, error) {

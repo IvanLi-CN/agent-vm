@@ -316,6 +316,11 @@ func (s *Store) ClaimAgentTokenWithOperation(ctx context.Context, token AgentTok
 	var existingToken *AgentToken
 	created := false
 	err = s.withWrite(ctx, func(tx *Tx) error {
+		// A remote epoch conflict can replay this callback. Do not return a
+		// speculative result from the failed attempt when the mirror is refreshed.
+		existing = nil
+		existingToken = nil
+		created = false
 		current, scanErr := scanManagementOperation(ctx, tx.conn, operation.OperationID)
 		if scanErr == nil {
 			existing = current
@@ -479,6 +484,10 @@ func (s *Store) RevokeAgentToken(ctx context.Context, tokenID, expectedVersion, 
 	var value *AgentToken
 	changed := false
 	err := s.withWrite(ctx, func(tx *Tx) error {
+		// A remote epoch conflict can replay this callback after another slot
+		// revoked or changed the token.
+		value = nil
+		changed = false
 		candidate, err := scanAgentToken(tx.conn.QueryRowContext(ctx, agentTokenSelect+" WHERE token_id = ?", tokenID))
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
@@ -577,6 +586,11 @@ func (s *Store) revokeAgentTokenWithOperation(ctx context.Context, tokenID, expe
 	var value *AgentToken
 	changed := false
 	err = s.withWrite(ctx, func(tx *Tx) error {
+		// A remote epoch conflict can replay this callback. Clear the result from
+		// the previous speculative attempt before reading the refreshed mirror.
+		existing = nil
+		value = nil
+		changed = false
 		current, scanErr := scanManagementOperation(ctx, tx.conn, operation.OperationID)
 		if scanErr == nil {
 			existing = current

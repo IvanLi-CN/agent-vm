@@ -194,20 +194,35 @@ func safeAgentError(err error) *protocol.Error {
 	control := protocol.AsError(err)
 	code := safeAgentCode(control.Code)
 	messages := map[string]string{
-		"authentication_required": "Agent Token authentication is required",
-		"permission_denied":       "Agent Token scope does not authorize this action",
-		"token_expired":           "Agent Token has expired",
-		"token_revoked":           "Agent Token has been revoked",
-		"state_unavailable":       "Agent state is unavailable",
-		"invalid_request":         "Agent request is invalid",
-		"protocol_mismatch":       "Agent protocol is not supported",
-		"unknown_action":          "Agent action is not supported",
-		"operation_conflict":      "Agent operation conflicts with durable state",
-		"generation_mismatch":     "Agent generation is stale",
-		"lease_expired":           "Agent lease has expired",
-		"task_missing":            "Agent session was not found",
-		"task_not_active":         "Agent session is not active",
-		"draining":                "Agent service is draining",
+		"authentication_required":   "Agent Token authentication is required",
+		"permission_denied":         "Agent Token scope does not authorize this action",
+		"token_expired":             "Agent Token has expired",
+		"token_revoked":             "Agent Token has been revoked",
+		"state_unavailable":         "Agent state is unavailable",
+		"invalid_request":           "Agent request is invalid",
+		"protocol_mismatch":         "Agent protocol is not supported",
+		"unknown_action":            "Agent action is not supported",
+		"operation_conflict":        "Agent operation conflicts with durable state",
+		"operation_incomplete":      "Agent operation has an uncertain outcome and requires recovery",
+		"operation_outcome_unknown": "Agent operation outcome is unknown and requires recovery",
+		"operation_unverified":      "Agent operation could not be verified",
+		"stale_target":              "Agent target is stale",
+		"generation_mismatch":       "Agent generation is stale",
+		"lease_expired":             "Agent lease has expired",
+		"lease_released":            "Agent lease was released",
+		"task_missing":              "Agent session was not found",
+		"task_not_active":           "Agent session is not active",
+		"draining":                  "Agent service is draining",
+		"native_failed":             "Agent native action failed",
+		"native_unavailable":        "Agent native state is unavailable",
+		"state_unverified":          "Agent state could not be verified",
+		"cleanup_incomplete":        "Agent cleanup is incomplete and requires recovery",
+		"restart_partial":           "Agent restart is incomplete and requires recovery",
+		"resize_partial":            "Agent resize is incomplete and requires recovery",
+		"mapping_unverified":        "Agent network mapping could not be verified",
+		"network_unverified":        "Agent network state could not be verified",
+		"guest_ip_mismatch":         "Agent guest address could not be verified",
+		"sqlite_unavailable":        "Agent state backend is unavailable",
 	}
 	message, ok := messages[code]
 	if !ok {
@@ -218,7 +233,7 @@ func safeAgentError(err error) *protocol.Error {
 
 func safeAgentCode(code string) string {
 	switch code {
-	case "authentication_required", "permission_denied", "token_expired", "token_revoked", "state_unavailable", "invalid_request", "protocol_mismatch", "unknown_action", "operation_conflict", "generation_mismatch", "lease_expired", "task_missing", "task_not_active", "draining", "request_too_large", "resource_insufficient", "startup_reconcile_required":
+	case "authentication_required", "permission_denied", "token_expired", "token_revoked", "state_unavailable", "invalid_request", "protocol_mismatch", "unknown_action", "operation_conflict", "operation_incomplete", "operation_outcome_unknown", "operation_unverified", "stale_target", "generation_mismatch", "lease_expired", "lease_released", "task_missing", "task_not_active", "task_transition", "draining", "request_too_large", "resource_insufficient", "startup_reconcile_required", "acquire_partial", "restart_partial", "resize_partial", "cleanup_incomplete", "mapping_unverified", "network_unverified", "guest_ip_mismatch", "native_failed", "native_unavailable", "state_unverified", "sqlite_unavailable", "observation_unavailable", "resource_unverified", "resource_pressure", "ownership_mismatch", "guest_host_key_missing", "vm_ip_unverified", "vm_ip_exhausted", "cache_stale", "cache_ineligible", "unsupported_action", "not_found", "missing_session", "resource_config_mismatch", "config_invalid", "compatibility_action_mismatch", "compatibility_invalid", "request_schema_incompatible", "request_semantic_incompatible", "response_schema_incompatible", "response_semantic_incompatible":
 		return code
 	default:
 		return "internal_error"
@@ -231,14 +246,14 @@ func agentErrorStatus(code string) int {
 		return http.StatusUnauthorized
 	case "permission_denied":
 		return http.StatusForbidden
-	case "invalid_request", "protocol_mismatch", "unknown_action", "request_too_large":
+	case "invalid_request", "protocol_mismatch", "unknown_action", "missing_session", "cache_stale", "request_too_large", "unsupported_action", "not_found", "resource_config_mismatch", "config_invalid", "compatibility_action_mismatch", "compatibility_invalid", "request_schema_incompatible", "request_semantic_incompatible", "response_schema_incompatible", "response_semantic_incompatible":
 		if code == "request_too_large" {
 			return http.StatusRequestEntityTooLarge
 		}
 		return http.StatusBadRequest
-	case "operation_conflict", "generation_mismatch", "lease_expired", "task_missing", "task_not_active", "draining", "resource_insufficient":
+	case "operation_conflict", "operation_incomplete", "stale_target", "generation_mismatch", "lease_expired", "lease_released", "task_missing", "task_not_active", "task_transition", "draining", "resource_insufficient", "cache_ineligible":
 		return http.StatusConflict
-	case "state_unavailable", "startup_reconcile_required":
+	case "state_unavailable", "operation_outcome_unknown", "operation_unverified", "startup_reconcile_required", "acquire_partial", "restart_partial", "resize_partial", "cleanup_incomplete", "mapping_unverified", "network_unverified", "guest_ip_mismatch", "native_unavailable", "state_unverified", "sqlite_unavailable", "observation_unavailable", "resource_unverified", "resource_pressure", "ownership_mismatch", "guest_host_key_missing", "vm_ip_unverified":
 		return http.StatusServiceUnavailable
 	default:
 		return http.StatusInternalServerError
