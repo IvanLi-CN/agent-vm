@@ -396,6 +396,7 @@ func TestRemoteQueryRejectsMalformedResultShape(t *testing.T) {
 		results []remoteResult
 	}{
 		{name: "empty", results: nil},
+		{name: "missing fields", results: []remoteResult{{}}},
 		{name: "multiple", results: []remoteResult{{}, {}}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -429,6 +430,38 @@ func TestRemoteQueryRejectsTopLevelError(t *testing.T) {
 	backend := &remoteBackend{base: parsed, client: server.Client()}
 	if _, err := backend.query(context.Background(), "SELECT 1"); err == nil || !strings.Contains(err.Error(), "query failed") {
 		t.Fatalf("top-level query error = %v", err)
+	}
+}
+
+func TestRemoteResponseRejectsEmptyErrorWithErrorV2(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"error":"","error_v2":{"message":"query failed"},"results":[{"columns":["value"],"types":["text"],"values":[["ok"]]}]}`))
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client()}
+	if _, err := backend.query(context.Background(), "SELECT 1"); err == nil || !strings.Contains(err.Error(), "error_v2") {
+		t.Fatalf("empty top-level error with error_v2 = %v", err)
+	}
+}
+
+func TestRemoteResponseRejectsTrailingJSON(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"results":[{"columns":["value"],"types":["text"],"values":[["ok"]]}]}{"error":"trailing"}`))
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client()}
+	if _, err := backend.query(context.Background(), "SELECT 1"); err == nil || !strings.Contains(err.Error(), "trailing") {
+		t.Fatalf("trailing JSON response = %v", err)
 	}
 }
 
@@ -542,7 +575,11 @@ func TestRemoteRequestLostResponseIsNotRetried(t *testing.T) {
 func TestRemoteEpochRejectsMalformedValue(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{{Values: [][]any{{"not-an-epoch"}}}}})
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{{
+			Columns: []string{"value"},
+			Types:   []string{"text"},
+			Values:  [][]any{{"not-an-epoch"}},
+		}}})
 	}))
 	defer server.Close()
 	parsed, err := url.Parse(server.URL)
@@ -616,6 +653,36 @@ func TestMigrationTargetPreflightDoesNotWrite(t *testing.T) {
 	}
 }
 
+func TestMigrationRejectsMalformedTargetQueryWithoutWrite(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "source.sqlite3")
+	source, err := OpenForTest(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			posts++
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{{}}})
+	}))
+	defer server.Close()
+	if err := migrateSQLiteToRQLite(context.Background(), sourcePath, server.URL, SQLiteMigrationGate{
+		StateWriteFenced:    true,
+		WorkersQuiescent:    true,
+		SQLiteWritersClosed: true,
+	}); err == nil {
+		t.Fatal("malformed target query response was accepted")
+	}
+	if posts != 0 {
+		t.Fatalf("malformed target query issued %d remote writes", posts)
+	}
+}
+
 func TestMigrationAcceptsLegacyCoreSchemaFormatting(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "legacy.sqlite3")
 	db, err := openLegacyFixture(path)
@@ -625,6 +692,88 @@ func TestMigrationAcceptsLegacyCoreSchemaFormatting(t *testing.T) {
 	defer db.Close()
 	if err := requireSQLiteSchema(context.Background(), db); err != nil {
 		t.Fatalf("legacy fixture schema rejected: %v", err)
+	}
+}
+
+func TestLegacyMigrationSnapshotSynthesizesInitialEpoch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.sqlite3")
+	db, err := openLegacyFixture(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("DELETE FROM operations WHERE operation_id = 'baseline-pending'"); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := snapshotDB(context.Background(), db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshotHasStateEpoch(snapshot) {
+		t.Fatal("legacy snapshot unexpectedly contained a state epoch")
+	}
+	if err := ensureSnapshotStateEpoch(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if !snapshotHasStateEpoch(snapshot) || snapshot.Epoch != "initial" {
+		t.Fatalf("legacy snapshot epoch = %q, has_epoch=%v", snapshot.Epoch, snapshotHasStateEpoch(snapshot))
+	}
+	meta := snapshot.Tables["meta"]
+	if len(meta.Rows) != 2 {
+		t.Fatalf("legacy meta rows = %d, want 2", len(meta.Rows))
+	}
+}
+
+func TestLegacyMigrationWithoutEpochReachesTargetPreflight(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "legacy.sqlite3")
+	db, err := openLegacyFixture(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("DELETE FROM operations WHERE operation_id = 'baseline-pending'"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			posts++
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		if request.Method == http.MethodGet {
+			_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{{
+				Columns: []string{"type", "name", "sql"},
+				Types:   []string{"text", "text", "text"},
+				Values:  [][]any{},
+			}}})
+			return
+		}
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{}})
+	}))
+	defer server.Close()
+	err = migrateSQLiteToRQLite(context.Background(), sourcePath, server.URL, SQLiteMigrationGate{
+		StateWriteFenced:    true,
+		WorkersQuiescent:    true,
+		SQLiteWritersClosed: true,
+	})
+	if err == nil || strings.Contains(err.Error(), "state epoch is missing") {
+		t.Fatalf("legacy migration without epoch error = %v", err)
+	}
+	if posts != 1 {
+		t.Fatalf("legacy migration without epoch POST count = %d, want 1", posts)
+	}
+}
+
+func TestSchemaSQLNormalizationPreservesLiteralSemantics(t *testing.T) {
+	canonical := "CREATE TABLE IF NOT EXISTS sample (value TEXT DEFAULT 'none')"
+	if normalizeSchemaSQL(canonical) == normalizeSchemaSQL("CREATE TABLE sample (value TEXT DEFAULT 'NONE')") {
+		t.Fatal("schema normalization changed a string literal")
+	}
+	if normalizeSchemaSQL(canonical) == normalizeSchemaSQL("CREATE TABLE sample (value TEXT DEFAULT 'IF NOT EXISTSnone')") {
+		t.Fatal("schema normalization removed text inside a string literal")
 	}
 }
 
@@ -646,6 +795,7 @@ func TestRemoteOpenRejectsMalformedManagementSchemaBeforeWrite(t *testing.T) {
 		writer.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{{
 			Columns: []string{"type", "name", "sql"},
+			Types:   []string{"text", "text", "text"},
 			Values:  values,
 		}}})
 	}))
@@ -698,6 +848,47 @@ func TestMigrationRejectsUnsupportedSourceSchemaBeforeRemoteWrite(t *testing.T) 
 	}
 	if posts != 0 {
 		t.Fatalf("unsupported source schema issued %d remote writes", posts)
+	}
+}
+
+func TestMigrationRejectsPartialManagementSchemaBeforeRemoteWrite(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "source.sqlite3")
+	source, err := OpenForTest(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("DROP INDEX managed_images_one_default"); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var posts int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.Method == http.MethodPost {
+			posts++
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{}})
+	}))
+	defer server.Close()
+	if err := migrateSQLiteToRQLite(context.Background(), sourcePath, server.URL, SQLiteMigrationGate{
+		StateWriteFenced:    true,
+		WorkersQuiescent:    true,
+		SQLiteWritersClosed: true,
+	}); err == nil || !strings.Contains(err.Error(), "missing canonical management object") {
+		t.Fatalf("partial management schema error = %v", err)
+	}
+	if posts != 0 {
+		t.Fatalf("partial management schema issued %d remote writes", posts)
 	}
 }
 
@@ -803,6 +994,50 @@ func TestApplySnapshotProvesEpochWhenOnlyEpochChanges(t *testing.T) {
 	applied, err := backend.applySnapshot(context.Background(), before, after, before.Epoch, after.Epoch)
 	if err != nil || !applied {
 		t.Fatalf("epoch-only snapshot applied=%v err=%v", applied, err)
+	}
+}
+
+func TestApplySnapshotAcceptsEquivalentSchemaFormatting(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var batch [][]any
+		if err := json.NewDecoder(request.Body).Decode(&batch); err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		results := make([]remoteResult, len(batch))
+		for index := range results {
+			results[index].RowsAffected = 1
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: results})
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client()}
+	before := remoteSnapshot{
+		Objects: map[string]remoteSchemaObject{
+			objectKey("table", "meta"): {Type: "table", Name: "meta", SQL: "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"},
+		},
+		Tables: map[string]remoteTableSnapshot{
+			"meta": {
+				Name:       "meta",
+				Columns:    []string{"key", "value"},
+				PrimaryKey: []int{0},
+				Rows:       map[string]remoteRow{"state_epoch": {Values: []any{"state_epoch", "initial"}}},
+			},
+		},
+		Epoch: "initial",
+	}
+	after := before
+	after.Objects = map[string]remoteSchemaObject{
+		objectKey("table", "meta"): {Type: "table", Name: "meta", SQL: "CREATE TABLE meta (\n  key TEXT PRIMARY KEY,\n  value TEXT NOT NULL\n)"},
+	}
+	applied, err := backend.applySnapshot(context.Background(), before, after, "initial", "initial")
+	if err != nil || !applied {
+		t.Fatalf("equivalent schema snapshot applied=%v err=%v", applied, err)
 	}
 }
 

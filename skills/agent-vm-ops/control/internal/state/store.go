@@ -127,6 +127,13 @@ func (err *TransactionError) Error() string {
 
 func (err *TransactionError) Unwrap() error { return err.Cause }
 
+// Uncertain marks a transaction whose commit outcome cannot be established.
+// Callers that journal externally visible operations must preserve them for
+// reconciliation instead of converting the result into a retryable failure.
+func (err *TransactionError) Uncertain() bool {
+	return err != nil && err.StateCommitted == nil
+}
+
 func committed(value bool) *bool { return &value }
 
 type Task struct {

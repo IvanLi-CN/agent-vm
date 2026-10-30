@@ -280,6 +280,7 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 	if err != nil {
 		return fmt.Errorf("build canonical management schema: %w", err)
 	}
+	managementPresent := false
 	for _, object := range objects {
 		key := objectKey(object.Type, object.Name)
 		if expected, exists := core[key]; exists {
@@ -292,18 +293,130 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 		if !exists {
 			return fmt.Errorf("database schema contains unsupported object %s", key)
 		}
+		managementPresent = true
 		if normalizeSchemaSQL(object.SQL) != normalizeSchemaSQL(expected.SQL) {
 			return fmt.Errorf("database schema differs from canonical management object %s", key)
+		}
+	}
+	if managementPresent {
+		actual := make(map[string]bool, len(objects))
+		for _, object := range objects {
+			actual[objectKey(object.Type, object.Name)] = true
+		}
+		for key := range management {
+			if !actual[key] {
+				return fmt.Errorf("database schema missing canonical management object %s", key)
+			}
 		}
 	}
 	return nil
 }
 
 func normalizeSchemaSQL(value string) string {
-	value = strings.ToLower(strings.TrimSpace(value))
-	value = strings.TrimSuffix(value, ";")
-	value = strings.ReplaceAll(value, "if not exists", "")
-	return strings.Join(strings.Fields(value), " ")
+	value = strings.TrimSuffix(strings.TrimSpace(value), ";")
+	tokens := tokenizeSchemaSQL(value)
+	filtered := make([]schemaSQLToken, 0, len(tokens))
+	for index := 0; index < len(tokens); index++ {
+		if index+2 < len(tokens) && index > 0 && tokens[index-1].word && tokens[index-1].text != "" &&
+			tokens[index].word && tokens[index].text == "if" &&
+			tokens[index+1].word && tokens[index+1].text == "not" &&
+			tokens[index+2].word && tokens[index+2].text == "exists" &&
+			(tokens[index-1].text == "table" || tokens[index-1].text == "index") {
+			index += 2
+			continue
+		}
+		filtered = append(filtered, tokens[index])
+	}
+	var builder strings.Builder
+	for index, token := range filtered {
+		if index > 0 && filtered[index-1].word && (token.word || token.quoted) {
+			builder.WriteByte(' ')
+		}
+		builder.WriteString(token.text)
+	}
+	return builder.String()
+}
+
+type schemaSQLToken struct {
+	text   string
+	word   bool
+	quoted bool
+}
+
+func tokenizeSchemaSQL(value string) []schemaSQLToken {
+	var tokens []schemaSQLToken
+	for index := 0; index < len(value); {
+		switch value[index] {
+		case ' ', '\t', '\r', '\n', '\f':
+			index++
+		case '-', '/':
+			if index+1 < len(value) && value[index] == '-' && value[index+1] == '-' {
+				index += 2
+				for index < len(value) && value[index] != '\n' {
+					index++
+				}
+				continue
+			}
+			if index+1 < len(value) && value[index] == '/' && value[index+1] == '*' {
+				index += 2
+				for index+1 < len(value) && !(value[index] == '*' && value[index+1] == '/') {
+					index++
+				}
+				if index+1 < len(value) {
+					index += 2
+				}
+				continue
+			}
+			fallthrough
+		case '(', ')', ',', '.', ';', '=', '<', '>', '+', '*', '|', '&', '!', '?', '%':
+			tokens = append(tokens, schemaSQLToken{text: value[index : index+1]})
+			index++
+		case '\'', '"', '`':
+			quote := value[index]
+			start := index
+			index++
+			for index < len(value) {
+				if value[index] != quote {
+					index++
+					continue
+				}
+				if index+1 < len(value) && value[index+1] == quote {
+					index += 2
+					continue
+				}
+				index++
+				break
+			}
+			tokens = append(tokens, schemaSQLToken{text: value[start:index], quoted: true})
+		case '[':
+			start := index
+			index++
+			for index < len(value) && value[index] != ']' {
+				index++
+			}
+			if index < len(value) {
+				index++
+			}
+			tokens = append(tokens, schemaSQLToken{text: value[start:index], quoted: true})
+		default:
+			start := index
+			for index < len(value) {
+				character := value[index]
+				if (character >= 'a' && character <= 'z') || (character >= 'A' && character <= 'Z') || (character >= '0' && character <= '9') || character == '_' || character == '$' {
+					index++
+					continue
+				}
+				break
+			}
+			if start == index {
+				tokens = append(tokens, schemaSQLToken{text: value[index : index+1]})
+				index++
+				continue
+			}
+			tokens = append(tokens, schemaSQLToken{text: strings.ToLower(value[start:index]), word: true})
+		}
+	}
+	return tokens
 }
 
 func canonicalCoreSchema(ctx context.Context) (map[string]remoteSchemaObject, error) {
@@ -545,11 +658,9 @@ func (r *remoteBackend) request(ctx context.Context, statements []remoteStatemen
 		return remoteResponse{}, err
 	}
 	defer response.Close()
-	var result remoteResponse
-	decoder := json.NewDecoder(response)
-	decoder.UseNumber()
-	if err := decoder.Decode(&result); err != nil {
-		return remoteResponse{}, fmt.Errorf("decode rqlite response: %w", err)
+	result, err := decodeRemoteResponse(response, "rqlite response")
+	if err != nil {
+		return remoteResponse{}, err
 	}
 	if message := remoteResponseError(result); message != "" {
 		return result, errors.New(message)
@@ -577,11 +688,9 @@ func (r *remoteBackend) query(ctx context.Context, statement string) (remoteResu
 		return remoteResult{}, err
 	}
 	defer response.Close()
-	var result remoteResponse
-	decoder := json.NewDecoder(response)
-	decoder.UseNumber()
-	if err := decoder.Decode(&result); err != nil {
-		return remoteResult{}, fmt.Errorf("decode rqlite query: %w", err)
+	result, err := decodeRemoteResponse(response, "rqlite query")
+	if err != nil {
+		return remoteResult{}, err
 	}
 	if message := remoteResponseError(result); message != "" {
 		return remoteResult{}, errors.New(message)
@@ -592,7 +701,42 @@ func (r *remoteBackend) query(ctx context.Context, statement string) (remoteResu
 	if message := remoteResultError(result.Results[0]); message != "" {
 		return remoteResult{}, &remoteStatementError{Index: 0, Message: message}
 	}
+	if err := validateRemoteQueryResult(result.Results[0]); err != nil {
+		return remoteResult{}, err
+	}
 	return result.Results[0], nil
+}
+
+func validateRemoteQueryResult(result remoteResult) error {
+	if result.Columns == nil || result.Types == nil || result.Values == nil {
+		return errors.New("rqlite query result is missing columns, types, or values")
+	}
+	if len(result.Columns) != len(result.Types) {
+		return fmt.Errorf("rqlite query result has %d columns and %d types", len(result.Columns), len(result.Types))
+	}
+	for index, row := range result.Values {
+		if len(row) != len(result.Columns) {
+			return fmt.Errorf("rqlite query row %d has %d values, want %d", index, len(row), len(result.Columns))
+		}
+	}
+	return nil
+}
+
+func decodeRemoteResponse(reader io.Reader, label string) (remoteResponse, error) {
+	var result remoteResponse
+	decoder := json.NewDecoder(reader)
+	decoder.UseNumber()
+	if err := decoder.Decode(&result); err != nil {
+		return remoteResponse{}, fmt.Errorf("decode %s: %w", label, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return remoteResponse{}, fmt.Errorf("decode %s: trailing JSON value", label)
+		}
+		return remoteResponse{}, fmt.Errorf("decode %s trailing data: %w", label, err)
+	}
+	return result, nil
 }
 
 func remoteResultError(result remoteResult) string {
@@ -615,16 +759,16 @@ func remoteResultError(result remoteResult) string {
 func remoteResponseError(result remoteResponse) string {
 	if result.Error != nil {
 		if message, ok := result.Error.(string); ok {
-			if message == "" {
-				return ""
+			if message != "" {
+				return message
 			}
-			return message
+		} else {
+			encoded, err := json.Marshal(result.Error)
+			if err == nil && string(encoded) != "null" {
+				return "rqlite error: " + string(encoded)
+			}
+			return "rqlite error"
 		}
-		encoded, err := json.Marshal(result.Error)
-		if err == nil && string(encoded) != "null" {
-			return "rqlite error: " + string(encoded)
-		}
-		return "rqlite error"
 	}
 	if result.ErrorV2 != nil {
 		return remoteResultError(remoteResult{ErrorV2: result.ErrorV2})
@@ -659,7 +803,7 @@ func (r *remoteBackend) remoteSchema(ctx context.Context) ([]remoteSchemaObject,
 	}
 	objects := make([]remoteSchemaObject, 0, len(result.Values))
 	for index, row := range result.Values {
-		if len(row) < 3 {
+		if len(row) != 3 {
 			return nil, fmt.Errorf("rqlite schema row %d is incomplete", index)
 		}
 		typeName, ok := row[0].(string)
@@ -1159,7 +1303,7 @@ func snapshotsEqual(left, right remoteSnapshot) bool {
 	}
 	for key, object := range left.Objects {
 		other, exists := right.Objects[key]
-		if !exists || object.SQL != other.SQL {
+		if !exists || normalizeSchemaSQL(object.SQL) != normalizeSchemaSQL(other.SQL) {
 			return false
 		}
 	}
@@ -1244,7 +1388,7 @@ func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteS
 	}
 	for key, object := range before.Objects {
 		other, exists := after.Objects[key]
-		if !exists || other.SQL != object.SQL {
+		if !exists || normalizeSchemaSQL(other.SQL) != normalizeSchemaSQL(object.SQL) {
 			return false, fmt.Errorf("rqlite schema changed for %s", key)
 		}
 	}
@@ -1312,6 +1456,32 @@ func snapshotHasStateEpoch(snapshot remoteSnapshot) bool {
 		}
 	}
 	return false
+}
+
+func ensureSnapshotStateEpoch(snapshot *remoteSnapshot) error {
+	if snapshotHasStateEpoch(*snapshot) {
+		return nil
+	}
+	table, exists := snapshot.Tables["meta"]
+	if !exists {
+		return errors.New("state epoch requires a meta table")
+	}
+	keyIndex := indexOf(table.Columns, "key")
+	valueIndex := indexOf(table.Columns, "value")
+	if keyIndex < 0 || valueIndex < 0 {
+		return errors.New("state epoch requires key and value columns")
+	}
+	values := make([]any, len(table.Columns))
+	values[keyIndex] = "state_epoch"
+	values[valueIndex] = "initial"
+	if table.Rows == nil {
+		table.Rows = make(map[string]remoteRow)
+	}
+	key := snapshotRowKey(values, 0, table.Name, table.PrimaryKey)
+	table.Rows[key] = remoteRow{Values: values, HasRowID: len(table.PrimaryKey) == 0}
+	snapshot.Tables["meta"] = table
+	snapshot.Epoch = "initial"
+	return nil
 }
 
 func afterObjectsMissing(before, after map[string]remoteSchemaObject) []remoteSchemaObject {
@@ -1510,8 +1680,8 @@ func migrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, ga
 	if err != nil {
 		return fmt.Errorf("snapshot SQLite state: %w", err)
 	}
-	if !snapshotHasStateEpoch(sourceSnapshot) {
-		return errors.New("SQLite state epoch is missing")
+	if err := ensureSnapshotStateEpoch(&sourceSnapshot); err != nil {
+		return fmt.Errorf("initialize SQLite state epoch: %w", err)
 	}
 	if err := validateStateEpoch(sourceSnapshot.Epoch); err != nil {
 		return fmt.Errorf("validate SQLite state epoch: %w", err)
