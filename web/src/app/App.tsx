@@ -25,6 +25,6 @@ function ConsoleApp() {
   return <Shell page={page} onNavigate={setPage}><div className="sr-only" aria-live="polite">{t(`nav.${page}`)}</div>{page === "overview" ? <OverviewPage /> : page === "vms" ? <VMsPage /> : page === "images" ? <ImagesPage /> : page === "operations" ? <OperationsPage /> : <SystemPage />}</Shell>;
 }
 
-export function App() {
-  return <QueryClientProvider client={queryClient}><ConsoleApp /></QueryClientProvider>;
+export function App({ client = queryClient }: { client?: QueryClient } = {}) {
+  return <QueryClientProvider client={client}><ConsoleApp /></QueryClientProvider>;
 }

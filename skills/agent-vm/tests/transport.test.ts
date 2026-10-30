@@ -1,13 +1,192 @@
 import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { Client, STDERR_LIMIT, STDOUT_LIMIT, timeoutSeconds } from "../scripts/client.ts";
-import { json, parseJson, runBounded } from "../scripts/client-io.ts";
+import { Client, httpsEndpoint, STDERR_LIMIT, STDOUT_LIMIT, timeoutSeconds } from "../scripts/client.ts";
+import { json, parseJson, readJson, runBounded, sha256 } from "../scripts/client-io.ts";
+import { ACTIONS, CLIENT_DEPENDENCIES } from "../scripts/client-release.ts";
 import { Fixture, response, result } from "./support.ts";
 
 let fixtures: Fixture[] = [];
 const fixture = () => { const f = new Fixture(); fixtures.push(f); return f; };
 afterEach(() => { fixtures.forEach(f => f.close()); fixtures = []; });
+
+test("HTTPS endpoint accepts a bare hostname with an explicit port", () => {
+  expect(httpsEndpoint("control.example:8443")).toBe("https://control.example:8443/agent/v1/control");
+});
+
+function httpsSidecar(f: Fixture): void {
+  const revision = "c".repeat(40), schema = { schema: 1, semantic_revision: 1 }, window = { schema_min: 1, schema_max: 1, semantic_min: 1, semantic_max: 1 };
+  const client = readFileSync(new URL("../scripts/agent_vm.ts", import.meta.url));
+  writeFileSync(join(f.root, "agent_vm.ts"), client, { mode: 0o755 });
+  const dependencies = CLIENT_DEPENDENCIES.map(([name, mode]) => {
+    const bytes = readFileSync(new URL(`../scripts/${name}`, import.meta.url));
+    writeFileSync(join(f.root, name), bytes, { mode });
+    return { name, path: name, role: "support", mode, sha256: sha256(bytes) };
+  });
+  const sidecar = {
+    format: 2, release_id: revision, source_revision: revision, protocol: 4,
+    client_artifact: { name: "agent_vm.ts", path: "agent_vm.ts", role: "client", mode: 0o755, sha256: sha256(client) },
+    client_dependencies: dependencies,
+    client_view: { release_id: revision, source_revision: revision, protocol: 4, transport: "https", actions: Object.fromEntries(ACTIONS.map(action => [action, { request: schema, response: schema, client_to_control: window, control_to_client: window }])) },
+  };
+  const path = join(f.root, "client-release.json");
+  writeFileSync(path, json(sidecar), { mode: 0o600 });
+  f.client.sidecar = path;
+}
+
+test("direct HTTPS sends protocol-4 JSON to the fixed Agent API with a bearer credential and TLS verification", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example/";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  const seen: { url?: string; init?: any } = {};
+  f.client.http = async (url, init) => {
+    seen.url = url; seen.init = init;
+    return new Response(json(response(parseJson(String(init.body)))), { status: 200, headers: { "content-type": "application/json", "X-Agent-VM-Exit-Code": "0" } });
+  };
+  await f.client.request("renew", { session: "https-session", generation: 7, operationId: "https-operation", write: true });
+  expect(seen.url).toBe("https://control.example/agent/v1/control");
+  expect(seen.init.method).toBe("POST");
+  expect(seen.init.headers).toEqual({ Accept: "application/json", Authorization: "Bearer opaque-agent-token", "Content-Type": "application/json" });
+  expect(seen.init.tls).toEqual({ rejectUnauthorized: true });
+  expect(parseJson(String(seen.init.body))).toMatchObject({ protocol: 4, action: "renew", session_id: "https-session", generation: 7, operation_id: "https-operation" });
+  expect(JSON.stringify(readJson(f.client.operationPath("https-session", "https-operation")))).not.toContain("opaque-agent-token");
+  expect(f.commands).toEqual([]);
+});
+
+test("HTTPS CA configuration is private, certificate verification cannot be disabled, and missing credentials fail before a journal", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  const ca = join(f.root, "control-ca.pem"); writeFileSync(ca, "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n", { mode: 0o600 });
+  f.client.env.AGENT_VM_CONTROL_CA = ca;
+  let tls: any;
+  f.client.http = async (_url, init) => { tls = init.tls; return new Response(json(response(parseJson(String(init.body)))), { status: 200, headers: { "X-Agent-VM-Exit-Code": "0" } }); };
+  await f.client.request("status", { session: "https-session" });
+  expect(tls).toEqual({ ca: readFileSync(ca, "utf8"), rejectUnauthorized: true });
+
+  delete f.client.env.AGENT_VM_TOKEN;
+  await expect(f.client.request("status", { session: "missing-token" })).rejects.toMatchObject({ code: "config_missing" });
+  expect(f.commands).toEqual([]);
+});
+
+test("HTTPS timeout retains the original operation journal for a safe retry", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  f.client.httpsTimeoutMs = 10;
+  f.client.http = async (_url, init) => await new Promise<Response>((_resolve, reject) => init.signal!.addEventListener("abort", () => reject(new Error("aborted")), { once: true }));
+  await expect(f.client.request("renew", { session: "https-session", generation: 9007199254740993n, operationId: "https-operation", write: true })).rejects.toMatchObject({ code: "remote_timeout" });
+  const operation = f.client.operationPath("https-session", "https-operation");
+  expect(readJson(operation).outcome).toBe("pending");
+
+  const bodies: string[] = [];
+  f.client.http = async (_url, init) => {
+    bodies.push(String(init.body));
+    return new Response(json(response(parseJson(String(init.body)))), { status: 200, headers: { "X-Agent-VM-Exit-Code": "0" } });
+  };
+  await f.client.request("renew", { session: "https-session", generation: 9007199254740993n, operationId: "https-operation", write: true });
+  expect(bodies).toHaveLength(1);
+  expect(parseJson(bodies[0])).toMatchObject({ operation_id: "https-operation", generation: 9007199254740993n });
+  expect(readJson(operation).outcome).toBe("success");
+});
+
+test("HTTPS connection failure retains the original operation journal", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  f.client.http = async () => { throw new Error("socket refused"); };
+  let error: any;
+  try { await f.client.request("renew", { session: "https-session", generation: 9, operationId: "connection-operation", write: true }); }
+  catch (caught) { error = caught; }
+  expect(error).toMatchObject({ code: "remote_failed", detail: { operation_id: "connection-operation", generation: 9, transport: "https" } });
+  expect(readJson(f.client.operationPath("https-session", "connection-operation")).outcome).toBe("pending");
+});
+
+test("HTTPS response data and errors redact the bearer token before return, journaling or CLI failure", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  f.client.http = async (_url, init) => new Response(json(response(parseJson(String(init.body)), { result: { echoed: "opaque-agent-token", "opaque-agent-token": "object-key" } })), { status: 200, headers: { "X-Agent-VM-Exit-Code": "0" } });
+  const returned = await f.client.request("renew", { session: "https-session", generation: 8, operationId: "echo-success", write: true });
+  expect(JSON.stringify(returned)).not.toContain("opaque-agent-token");
+  expect(JSON.stringify(readJson(f.client.operationPath("https-session", "echo-success")))).not.toContain("opaque-agent-token");
+
+  f.client.http = async (_url, init) => {
+    const request = parseJson(String(init.body));
+    return new Response(json({ ok: false, protocol: 4, action: request.action, session_id: request.session_id, generation: request.generation ?? null, operation_id: request.operation_id, error: { code: "remote_failed", message: "server echoed opaque-agent-token", detail: { echoed: "opaque-agent-token" } } }), { status: 502, headers: { "X-Agent-VM-Exit-Code": "3" } });
+  };
+  let error: any;
+  try { await f.client.request("renew", { session: "https-session", generation: 10, operationId: "echo-operation", write: true }); }
+  catch (caught) { error = caught; }
+  expect(error.message).not.toContain("opaque-agent-token");
+  expect(error.exitCode).toBe(3);
+  expect(JSON.stringify(error.detail)).not.toContain("opaque-agent-token");
+  expect(JSON.stringify(readJson(f.client.operationPath("https-session", "echo-operation")))).not.toContain("opaque-agent-token");
+});
+
+test("HTTPS HTTP failures preserve the control CLI exit code instead of the status code", async () => {
+  for (const [status, exitCode] of [[400, 2], [503, 3]] as const) {
+    const f = fixture(); httpsSidecar(f);
+    f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+    f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+    f.client.http = async (_url, init) => {
+      const request = parseJson(String(init.body));
+      return new Response(json({ ok: false, protocol: 4, action: request.action, session_id: request.session_id, generation: request.generation ?? null, operation_id: request.operation_id, error: { code: "remote_failed", message: "control failed" } }), { status, headers: { "X-Agent-VM-Exit-Code": String(exitCode) } });
+    };
+    let error: any;
+    try { await f.client.request("renew", { session: "https-session", generation: status, operationId: `http-${status}`, write: true }); }
+    catch (caught) { error = caught; }
+    expect(error).toMatchObject({ code: "remote_failed", exitCode });
+  }
+});
+
+test("HTTPS status and exit-code header must agree before finalizing a write", async () => {
+  for (const [status, exitCode] of [[200, "3"], [503, "0"], [200, undefined]] as const) {
+    const f = fixture(); httpsSidecar(f);
+    f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+    f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+    f.client.http = async (_url, init) => new Response(json(response(parseJson(String(init.body)))), { status, headers: exitCode === undefined ? {} : { "X-Agent-VM-Exit-Code": exitCode } });
+    const operationId = `inconsistent-${status}-${exitCode ?? "missing"}`;
+    await expect(f.client.request("renew", { session: "https-session", generation: status, operationId, write: true })).rejects.toMatchObject({ code: "remote_failed", exitCode: 3 });
+    expect(readJson(f.client.operationPath("https-session", operationId)).outcome).toBe("pending");
+  }
+});
+
+test("HTTPS response overflow reports an uncertain result and preserves the pending operation", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  f.client.http = async () => new Response("x".repeat(STDOUT_LIMIT + 1), { status: 200, headers: { "X-Agent-VM-Exit-Code": "0" } });
+  let error: any;
+  try { await f.client.request("renew", { session: "https-session", generation: 11, operationId: "overflow-operation", write: true }); }
+  catch (caught) { error = caught; }
+  expect(error).toMatchObject({ code: "remote_failed", detail: { operation_id: "overflow-operation", generation: 11, transport: "https", stdout_truncated: true } });
+  expect(error.message).toContain("uncertain");
+  expect(readJson(f.client.operationPath("https-session", "overflow-operation")).outcome).toBe("pending");
+});
+
+test("HTTPS response overflow reports unverified cleanup when cancellation fails", async () => {
+  const f = fixture(); httpsSidecar(f);
+  f.client.env.AGENT_VM_CONTROL_HOST = "https://control.example";
+  f.client.env.AGENT_VM_TOKEN = "opaque-agent-token";
+  f.client.http = async () => ({
+    status: 200,
+    headers: new Headers({ "X-Agent-VM-Exit-Code": "0" }),
+    body: {
+      getReader: () => ({
+        read: async () => ({ done: false, value: Buffer.from("x".repeat(STDOUT_LIMIT + 1)) }),
+        cancel: async () => { throw new Error("cancel failed"); },
+        releaseLock: () => {},
+      }),
+    },
+  } as unknown as Response);
+  let error: any;
+  try { await f.client.request("renew", { session: "https-session", generation: 12, operationId: "overflow-cleanup-operation", write: true }); }
+  catch (caught) { error = caught; }
+  expect(error).toMatchObject({ code: "remote_failed", detail: { operation_id: "overflow-cleanup-operation", generation: 12, transport: "https", stream_cleanup_verified: false, stream_cleanup_error: "reader_cancelled_before_eof" } });
+  expect(error.message).toContain("stream cleanup is not verified");
+  expect(readJson(f.client.operationPath("https-session", "overflow-cleanup-operation")).outcome).toBe("pending");
+});
 
 test("D transport regression: canonical controller directly with Bun, safe quoting and budgets", async () => {
   const f = fixture();

@@ -18,6 +18,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
+  CLIENT_TRANSPORTS,
   build_product_manifest,
   LEGACY_PRODUCT_MANIFEST_FORMAT,
   PRODUCT_LINUX_ARTIFACTS,
@@ -25,11 +26,12 @@ import {
   verify_client_sidecar,
   verify_product_bundle,
   type Artifact,
+  type ClientTransport,
   type ProductTarget,
 } from "./product-manifest.ts";
 import { CLIENT_DEPENDENCIES } from "../../agent-vm/scripts/client-release.ts";
 
-const usage = "usage: build_product_release.ts --version <semver> --source-revision <40-hex> --target <client|linux/amd64|linux/arm64> --output <absolute-path>";
+const usage = "usage: build_product_release.ts --version <semver> --source-revision <40-hex> --target <client|linux/amd64|linux/arm64> --output <absolute-path> [--transport <legacy-bun|go-request|https>]";
 const args = process.argv.slice(2);
 const value = (name: string): string => {
   const index = args.indexOf(name);
@@ -43,6 +45,12 @@ if (!/^[0-9a-f]{40}$/.test(revision)) throw new Error("source revision must be a
 const rawTarget = value("--target");
 const targetMatch = /^(linux)\/(amd64|arm64)$/.exec(rawTarget);
 if (rawTarget !== "client" && !targetMatch) throw new Error("target must be client or linux/amd64 or linux/arm64");
+const defaultTransport: ClientTransport = rawTarget === "client" ? "legacy-bun" : "go-request";
+const rawTransport = args.includes("--transport") ? value("--transport") : defaultTransport;
+if (!CLIENT_TRANSPORTS.includes(rawTransport as ClientTransport)) throw new Error("transport must be legacy-bun, go-request, or https");
+if (rawTarget !== "client" && rawTransport === "legacy-bun") throw new Error("Linux product releases require go-request or https transport");
+if (rawTransport === "https") throw new Error("https transport is validation-only until bundled client HTTPS support is integrated");
+const transport = rawTransport as ClientTransport;
 const rawOutput = value("--output");
 if (!isAbsolute(rawOutput)) throw new Error("output must be absolute");
 const output = resolve(rawOutput);
@@ -139,7 +147,7 @@ try {
   const manifest = build_product_manifest(version, revision, artifacts, {
     format: rawTarget === "client" ? LEGACY_PRODUCT_MANIFEST_FORMAT : PRODUCT_MANIFEST_FORMAT,
     target,
-    transport: rawTarget === "client" ? "legacy-bun" : "go-request",
+    transport,
   });
   writeFileSync(join(temporaryRoot, "release-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });
   const clientArtifact = artifacts.find((item) => item.role === "client");
@@ -172,7 +180,7 @@ try {
   }
   chmodSync(temporaryArchive, 0o644);
   renameSync(temporaryArchive, output);
-  console.log(JSON.stringify({ output, target: rawTarget, version, source_revision: revision, artifact_count: artifacts.length, format: manifest.format, cgo_enabled: false, web_assets: rawTarget !== "client" }));
+  console.log(JSON.stringify({ output, target: rawTarget, version, source_revision: revision, transport, artifact_count: artifacts.length, format: manifest.format, cgo_enabled: false, web_assets: rawTarget !== "client" }));
 } finally {
   rmSync(temporaryRoot, { recursive: true, force: true });
 }

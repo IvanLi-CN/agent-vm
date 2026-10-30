@@ -265,6 +265,10 @@ func metadataWindow(value any) (CompatibilityWindow, error) {
 	return CompatibilityWindow{SchemaMin: values["schema_min"], SchemaMax: values["schema_max"], SemanticMin: values["semantic_min"], SemanticMax: values["semantic_max"]}, nil
 }
 
+func supportedTransport(value string) bool {
+	return value == "legacy-bun" || value == "go-request" || value == "https"
+}
+
 func validate(root map[string]any, directory string) error {
 	if !sameKeys(root, []string{"actions", "artifacts", "client_view", "format", "protocol", "release_id", "retired_units", "source_revision", "target", "toolchain"}) {
 		return fmt.Errorf("manifest_invalid: manifest shape is incomplete or contains extra fields")
@@ -302,7 +306,7 @@ func validate(root map[string]any, directory string) error {
 		return fmt.Errorf("manifest_invalid: client_view protocol differs from the manifest")
 	}
 	transport, ok := view["transport"].(string)
-	if !ok || (transport != "legacy-bun" && transport != "go-request") {
+	if !ok || !supportedTransport(transport) {
 		return fmt.Errorf("manifest_invalid: client_view transport is unsupported")
 	}
 	if err := validateOperationMap(view["actions"], "client_view.actions"); err != nil {
@@ -387,7 +391,7 @@ func validateProduct(root map[string]any, directory string) error {
 		return fmt.Errorf("manifest_invalid: product client_view protocol differs from manifest")
 	}
 	transport, ok := view["transport"].(string)
-	if !ok || (transport != "legacy-bun" && transport != "go-request") {
+	if !ok || !supportedTransport(transport) {
 		return fmt.Errorf("manifest_invalid: product client_view transport is unsupported")
 	}
 	if err := validateOperationMap(view["actions"], "client_view.actions"); err != nil {

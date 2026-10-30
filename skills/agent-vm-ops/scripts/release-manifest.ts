@@ -74,6 +74,16 @@ export const ACTION_NAMES: readonly string[] = Object.freeze([
 
 const ACTION_SET: ReadonlySet<string> = new Set(ACTION_NAMES);
 
+const HTTPS_TRANSPORT_UNAVAILABLE =
+  "https transport is validation-only until bundled client HTTPS support is integrated";
+
+export const CLIENT_TRANSPORTS = Object.freeze([
+  "legacy-bun",
+  "go-request",
+  "https",
+] as const);
+export type ClientTransport = (typeof CLIENT_TRANSPORTS)[number];
+
 export const UNIT_EXEC_START = Object.freeze({
   "agent-vm-native-age-gc.service":
     "ExecStart=/usr/local/bin/bun /opt/agent-vm-native/agent_vm_control.ts --timer-age-gc",
@@ -1456,7 +1466,7 @@ export interface ProductManifest {
     version: string;
     source_revision: string;
     protocol: 4;
-    transport: "legacy-bun" | "go-request";
+    transport: ClientTransport;
     actions: Record<string, OperationSpec>;
   };
   state_compatibility?: {
@@ -1527,19 +1537,22 @@ export function build_product_manifest(
   version: string,
   source_revision: string,
   artifacts: readonly Artifact[],
-  options: { format?: 3 | 4; target?: ProductTarget; transport?: "legacy-bun" | "go-request"; operations?: Record<string, OperationSpec> } = {},
+  options: { format?: 3 | 4; target?: ProductTarget; transport?: ClientTransport; operations?: Record<string, OperationSpec> } = {},
 ): ProductManifest {
   parseSemVer(version);
   if (!_fullmatch(SOURCE_REVISION_RE, source_revision)) throw _product_error("manifest_invalid", "source_revision must be a Git revision");
   const format = options.format ?? PRODUCT_MANIFEST_FORMAT;
   const actions = options.operations ?? default_operations();
   const transport = options.transport ?? "go-request";
+  const target = options.target ?? { os: "source", arch: "any" };
+  if (target.os === "linux" && transport === "legacy-bun") throw _product_error("manifest_transport_target_mismatch", "new Linux product releases require go-request or https transport");
+  if (transport === "https") throw _product_error("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE);
   return validate_product_manifest({
     format,
     version,
     release_id: source_revision,
     source_revision,
-    target: options.target ?? { os: "source", arch: "any" },
+    target,
     toolchain: PRODUCT_TOOLCHAIN,
     protocol: PROTOCOL_VERSION,
     artifacts: artifacts.map((item) => ({ ...item })),
@@ -1574,7 +1587,7 @@ export function validate_product_manifest(value: unknown): ProductManifest {
   const artifacts = _product_artifacts(root.artifacts, target, format);
   const actions = _product_actions(root.actions);
   const view = _require_mapping(root.client_view, "client_view");
-  if (!_same_keys(view, ["actions", "protocol", "source_revision", "transport", "version"]) || view.version !== version || view.source_revision !== source_revision || Number(view.protocol) !== PROTOCOL_VERSION || (view.transport !== "legacy-bun" && view.transport !== "go-request") || !_json_equal(view.actions, actions)) throw _product_error("manifest_invalid", "client_view does not match product manifest");
+  if (!_same_keys(view, ["actions", "protocol", "source_revision", "transport", "version"]) || view.version !== version || view.source_revision !== source_revision || Number(view.protocol) !== PROTOCOL_VERSION || (view.transport !== "legacy-bun" && view.transport !== "go-request" && view.transport !== "https") || !_json_equal(view.actions, actions)) throw _product_error("manifest_invalid", "client_view does not match product manifest");
   const result: ProductManifest = { format, version, release_id, source_revision, target, toolchain: { bun: PRODUCT_TOOLCHAIN.bun, go: PRODUCT_TOOLCHAIN.go, cgo_enabled: false }, protocol: 4, artifacts, actions, client_view: { version, source_revision, protocol: 4, transport: view.transport, actions } };
   if (format === PRODUCT_MANIFEST_FORMAT) {
     const compatibility = _require_mapping(root.state_compatibility, "state_compatibility");
@@ -1599,6 +1612,7 @@ function _verify_product_elf(path: string, target: ProductTarget): void {
 
 export function verify_product_bundle(root: string, manifest: unknown): ProductManifest {
   const checked = validate_product_manifest(manifest);
+  if (checked.client_view.transport === "https") throw _product_error("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE);
   for (const item of checked.artifacts) {
     const path = join(root, ...item.path.split("/"));
     let info: ReturnType<typeof lstatSync>;
