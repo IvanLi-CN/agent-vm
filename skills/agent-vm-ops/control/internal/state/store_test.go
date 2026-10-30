@@ -306,6 +306,12 @@ func TestTransactionErrorRetainsRollbackPhaseAndCommitState(t *testing.T) {
 	if typed.Phase != "write" || typed.SQLOperation != "write" || typed.StateCommitted == nil || *typed.StateCommitted {
 		t.Fatalf("transaction metadata = %#v", typed)
 	}
+	if typed.Uncertain() {
+		t.Fatal("proven rollback was classified as uncertain")
+	}
+	if !(&TransactionError{StateCommitted: nil}).Uncertain() {
+		t.Fatal("unknown commit was not classified as uncertain")
+	}
 	if _, found, err := store.Meta(context.Background(), "transaction-test"); err != nil || found {
 		t.Fatalf("rolled back metadata found=%v err=%v", found, err)
 	}

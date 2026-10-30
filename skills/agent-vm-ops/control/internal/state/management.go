@@ -195,6 +195,9 @@ func (err *ImageReferenceError) Error() string {
 }
 
 func (s *Store) EnsureManagementSchema(ctx context.Context) error {
+	if s.remote != nil {
+		return s.remote.ensureManagementSchema(ctx)
+	}
 	return s.withWrite(ctx, func(tx *Tx) error {
 		if _, err := tx.exec(managementSchema); err != nil {
 			return fmt.Errorf("create management schema: %w", err)
@@ -771,6 +774,7 @@ func (s *Store) TransitionManagementOperation(ctx context.Context, operationID, 
 	var value *ManagementOperation
 	claimed := false
 	err := s.withWrite(ctx, func(tx *Tx) error {
+		claimed = false
 		current, err := scanManagementOperation(ctx, tx.conn, operationID)
 		if err != nil {
 			return err
@@ -798,6 +802,7 @@ func (s *Store) TransitionManagementOperationUnlessDraining(ctx context.Context,
 	var value *ManagementOperation
 	claimed := false
 	err := s.withWrite(ctx, func(tx *Tx) error {
+		claimed = false
 		var draining string
 		if err := tx.conn.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = 'draining'").Scan(&draining); err == nil && draining == "1" {
 			return errors.New("draining: new management action is refused while the control plane is draining")
@@ -832,6 +837,7 @@ func (s *Store) TransitionManagementOperationUnlessReleaseDraining(ctx context.C
 	var value *ManagementOperation
 	claimed := false
 	err := s.withWrite(ctx, func(tx *Tx) error {
+		claimed = false
 		var draining, owner string
 		if err := tx.conn.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = 'draining'").Scan(&draining); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
