@@ -270,6 +270,41 @@ func TestRemoteMigrationPreservesStateAndSerializesConcurrentOperations(t *testi
 			t.Fatalf("concurrent management bootstrap %d: %v", index, err)
 		}
 	}
+	authStateDigest := "remote-state-" + runID
+	if err := first.InsertOIDCTransaction(ctx, OIDCTransaction{
+		TransactionID: "remote-transaction-" + runID, StateDigest: authStateDigest, NonceDigest: "remote-nonce-" + runID,
+		CodeVerifierSealed: "sealed", BindingCookieDigest: "remote-binding-" + runID, ClientID: "client", RedirectURI: "https://console.example/api/v1/auth/oidc/callback",
+		CreatedAt: "2026-10-29T00:00:00Z", ExpiresAt: "2099-10-29T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if transaction, err := second.GetOIDCTransaction(ctx, authStateDigest); err != nil || transaction == nil {
+		t.Fatalf("remote OIDC transaction=%#v err=%v", transaction, err)
+	}
+	if _, consumed, err := second.ConsumeOIDCTransaction(ctx, authStateDigest, "2026-10-29T00:01:00Z"); err != nil || !consumed {
+		t.Fatalf("remote OIDC consume consumed=%v err=%v", consumed, err)
+	}
+	if _, consumed, err := first.ConsumeOIDCTransaction(ctx, authStateDigest, "2026-10-29T00:01:00Z"); err != nil || consumed {
+		t.Fatalf("remote OIDC replay consumed=%v err=%v", consumed, err)
+	}
+	remoteToken := AgentToken{
+		TokenID: "remote-token-" + runID, TokenDigest: "remote-token-digest-" + runID, OperationID: "remote-token-operation-" + runID, RequestDigest: "remote-token-request-" + runID,
+		Issuer: "https://issuer.example", Subject: "admin", Scopes: []string{"agent:read"}, CreatedAt: "2026-10-29T00:00:00Z", ExpiresAt: "2099-10-29T00:00:00Z", ResourceVersion: "token:initial-" + runID, PlaintextDisclosure: "returned",
+	}
+	remoteOperation := ManagementOperation{
+		OperationID: remoteToken.OperationID, Action: "token_create", TargetKind: "token", TargetID: remoteToken.TokenID, Actor: "https://issuer.example\x00admin", Phase: "durable_state", Status: "succeeded",
+		Request: map[string]any{"_request_digest": remoteToken.RequestDigest}, Result: map[string]any{"token_metadata": map[string]any{"token_id": remoteToken.TokenID}, "plaintext_disclosure": "returned"}, CreatedAt: remoteToken.CreatedAt, UpdatedAt: remoteToken.CreatedAt,
+	}
+	remoteAudit := ManagementAudit{EventID: "remote-token-event-" + runID, OperationID: stringPointer(remoteToken.OperationID), Action: "token_create", Actor: remoteOperation.Actor, Target: map[string]any{"kind": "token", "id": remoteToken.TokenID}, Outcome: "succeeded", Phase: "durable_state", OccurredAt: remoteToken.CreatedAt}
+	if _, _, created, err := first.ClaimAgentTokenWithOperation(ctx, remoteToken, remoteOperation, remoteAudit); err != nil || !created {
+		t.Fatalf("remote Token create created=%v err=%v", created, err)
+	}
+	if _, replayed, created, err := second.ClaimAgentTokenWithOperation(ctx, remoteToken, remoteOperation, remoteAudit); err != nil || created || replayed == nil {
+		t.Fatalf("remote Token replay token=%#v created=%v err=%v", replayed, created, err)
+	}
+	if token, err := second.GetAgentTokenByDigest(ctx, remoteToken.TokenDigest); err != nil || token == nil {
+		t.Fatalf("remote Token read token=%#v err=%v", token, err)
+	}
 	first.remote.mu.Lock()
 	beforeGuard, err := snapshotDB(ctx, first.remote.mirror)
 	if err != nil {
@@ -869,6 +904,30 @@ func TestRemoteOpenRejectsMalformedManagementSchemaBeforeWrite(t *testing.T) {
 	}
 	if posts != 0 {
 		t.Fatalf("malformed management schema issued %d remote writes", posts)
+	}
+}
+
+func TestSupportedSchemaAcceptsLegacyManagementBeforeAuthBootstrap(t *testing.T) {
+	core, err := canonicalCoreSchema(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	management, err := canonicalManagementSchema(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := make([]remoteSchemaObject, 0, len(core)+len(management))
+	for _, object := range core {
+		objects = append(objects, object)
+	}
+	for key, object := range management {
+		if isAuthManagementObject(key) {
+			continue
+		}
+		objects = append(objects, object)
+	}
+	if err := requireSupportedSchema(context.Background(), objects); err != nil {
+		t.Fatalf("legacy management schema rejected before additive auth bootstrap: %v", err)
 	}
 }
 

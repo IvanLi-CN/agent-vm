@@ -51,6 +51,7 @@ type peerContextKey struct{}
 type Server struct {
 	Service   *lifecycle.Service
 	Snapshots *observe.SnapshotStore
+	App       http.Handler
 }
 
 func New(service *lifecycle.Service, snapshots ...*observe.SnapshotStore) *Server {
@@ -61,6 +62,10 @@ func New(service *lifecycle.Service, snapshots ...*observe.SnapshotStore) *Serve
 	return &Server{Service: service, Snapshots: store}
 }
 
+func NewWithApp(service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler) *Server {
+	return &Server{Service: service, Snapshots: snapshots, App: app}
+}
+
 func (s *Server) Handler() http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
@@ -68,7 +73,12 @@ func (s *Server) Handler() http.Handler {
 		writeJSON(c, http.StatusInternalServerError, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("internal_error", "internal control server failure", nil)}, 3)
 		c.Abort()
 	}), func(c *gin.Context) {
-		if conn, ok := c.Request.Context().Value(peerContextKey{}).(*peerConn); ok {
+		if strings.HasPrefix(c.Request.URL.Path, "/internal/v1/") {
+			conn, ok := c.Request.Context().Value(peerContextKey{}).(*peerConn)
+			if !ok {
+				c.Next()
+				return
+			}
 			uid := os.Getuid()
 			if (uid == 0 && conn.uid != 0) || (uid != 0 && conn.uid != uid) {
 				writeJSON(c, http.StatusForbidden, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("peer_unauthorized", "Unix peer credentials are not authorized", nil)}, 2)
@@ -81,6 +91,13 @@ func (s *Server) Handler() http.Handler {
 	router.POST("/internal/v1/control", s.control)
 	router.GET("/internal/v1/health", s.health)
 	router.GET("/internal/v1/snapshots/:source", s.snapshot)
+	router.NoRoute(func(c *gin.Context) {
+		if s.App != nil {
+			s.App.ServeHTTP(c.Writer, c.Request)
+			return
+		}
+		c.Status(http.StatusNotFound)
+	})
 	return router
 }
 
@@ -165,6 +182,18 @@ func writeJSON(c *gin.Context, status int, value any, exitCode int) {
 }
 
 func Serve(ctx context.Context, socket string, service *lifecycle.Service, snapshots ...*observe.SnapshotStore) error {
+	var store *observe.SnapshotStore
+	if len(snapshots) > 0 {
+		store = snapshots[0]
+	}
+	return serve(ctx, socket, service, store, nil)
+}
+
+func ServeApp(ctx context.Context, socket string, service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler) error {
+	return serve(ctx, socket, service, snapshots, app)
+}
+
+func serve(ctx context.Context, socket string, service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler) error {
 	if err := prepareSocket(socket); err != nil {
 		return err
 	}
@@ -172,12 +201,16 @@ func Serve(ctx context.Context, socket string, service *lifecycle.Service, snaps
 	if err != nil {
 		return fmt.Errorf("listen on control socket: %w", err)
 	}
-	if err := os.Chmod(socket, 0o600); err != nil {
+	mode := os.FileMode(0o600)
+	if app != nil {
+		mode = 0o660
+	}
+	if err := os.Chmod(socket, mode); err != nil {
 		_ = listener.Close()
 		return err
 	}
 	wrapped := &peerListener{Listener: listener}
-	server := &http.Server{Handler: New(service, snapshots...).Handler(), ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 600 * time.Second, ReadTimeout: 600 * time.Second, MaxHeaderBytes: maxHeaderBytes, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+	server := &http.Server{Handler: NewWithApp(service, snapshots, app).Handler(), ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 600 * time.Second, ReadTimeout: 600 * time.Second, MaxHeaderBytes: maxHeaderBytes, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 		if peer, ok := conn.(*peerConn); ok {
 			return context.WithValue(ctx, peerContextKey{}, peer)
 		}

@@ -301,6 +301,7 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 		return fmt.Errorf("build canonical management schema: %w", err)
 	}
 	managementPresent := false
+	authPresent := false
 	for _, object := range objects {
 		key := objectKey(object.Type, object.Name)
 		if expected, exists := core[key]; exists {
@@ -314,6 +315,9 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 			return fmt.Errorf("database schema contains unsupported object %s", key)
 		}
 		managementPresent = true
+		if isAuthManagementObject(key) {
+			authPresent = true
+		}
 		if normalizeSchemaSQL(object.SQL) != normalizeSchemaSQL(expected.SQL) {
 			return fmt.Errorf("database schema differs from canonical management object %s", key)
 		}
@@ -324,12 +328,28 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 			actual[objectKey(object.Type, object.Name)] = true
 		}
 		for key := range management {
+			// The principal/session/Token tables were added after the original
+			// management schema. An existing remote database may still expose
+			// the complete legacy management set; EnsureManagementSchema adds
+			// the new tables in one transaction after this read-only preflight.
+			if !authPresent && isAuthManagementObject(key) {
+				continue
+			}
 			if !actual[key] {
 				return fmt.Errorf("database schema missing canonical management object %s", key)
 			}
 		}
 	}
 	return nil
+}
+
+func isAuthManagementObject(key string) bool {
+	switch key {
+	case "table:oidc_transactions", "table:browser_sessions", "table:agent_tokens":
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeSchemaSQL(value string) string {
@@ -514,6 +534,8 @@ func (r *remoteBackend) ensureManagementSchema(ctx context.Context) error {
 		{name: "managed-image-catalog", version: 1},
 		{name: "session-image-binding", version: 1},
 		{name: "management-operation-audit", version: 1},
+		{name: "principal-identity", version: 1},
+		{name: "token-revocation", version: 1},
 	} {
 		statements = append(statements, remoteStatement{
 			query: "INSERT OR IGNORE INTO state_capabilities(name, version, created_at) VALUES(?, ?, ?)",
@@ -990,7 +1012,7 @@ func orderedTables(objects []remoteSchemaObject) []string {
 			present[object.Name] = true
 		}
 	}
-	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "managed_image_tombstones", "image_references", "management_operations", "management_audit"}
+	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "managed_image_tombstones", "image_references", "management_operations", "management_audit", "oidc_transactions", "browser_sessions", "agent_tokens"}
 	values := make([]string, 0, len(present))
 	for _, table := range order {
 		if present[table] {

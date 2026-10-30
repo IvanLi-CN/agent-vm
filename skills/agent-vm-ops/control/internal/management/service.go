@@ -17,12 +17,26 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
 var fingerprintPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+func validateReason(value string) error {
+	if value == "" {
+		return nil
+	}
+	if strings.TrimSpace(value) == "" {
+		return errors.New("invalid_request: reason must not be blank")
+	}
+	if !utf8.ValidString(value) || utf8.RuneCountInString(value) > 512 {
+		return errors.New("invalid_request: reason exceeds 512 Unicode characters")
+	}
+	return nil
+}
 
 type Service struct {
 	Store                *state.Store
@@ -294,11 +308,11 @@ func (s *Service) StartImageImport(ctx context.Context, request ImportRequest) (
 }
 
 func (s *Service) ValidateImport(request ImportRequest) error {
-	if request.OperationID == "" || request.Actor == "" || strings.TrimSpace(request.Reason) == "" {
-		return errors.New("invalid_request: operation_id, actor and reason are required")
+	if request.OperationID == "" || request.Actor == "" {
+		return errors.New("invalid_request: operation_id and actor are required")
 	}
-	if len(request.Reason) > 512 {
-		return errors.New("invalid_request: reason exceeds 512 characters")
+	if err := validateReason(request.Reason); err != nil {
+		return err
 	}
 	if request.TargetVersion == "" || request.VersionLabel == "" {
 		return errors.New("invalid_request: target_version and version_label are required")
@@ -970,8 +984,11 @@ func (s *Service) requireImageVersion(ctx context.Context, fingerprint, expected
 }
 
 func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reason, action, targetID, targetVersion string, mutate func() (map[string]any, error)) (*state.ManagementOperation, error) {
-	if operationID == "" || actor == "" || strings.TrimSpace(reason) == "" {
-		return nil, errors.New("invalid_request: operation, actor and reason are required")
+	if operationID == "" || actor == "" {
+		return nil, errors.New("invalid_request: operation and actor are required")
+	}
+	if err := validateReason(reason); err != nil {
+		return nil, err
 	}
 	if err := s.rejectNewManagementAction(ctx); err != nil {
 		return nil, err
@@ -1170,8 +1187,11 @@ func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceReq
 }
 
 func (s *Service) claimAction(ctx context.Context, operationID, actor, reason, action, targetKind, targetID string, request map[string]any) (*state.ManagementOperation, error) {
-	if operationID == "" || actor == "" || strings.TrimSpace(reason) == "" {
-		return nil, errors.New("invalid_request: operation, actor and reason are required")
+	if operationID == "" || actor == "" {
+		return nil, errors.New("invalid_request: operation and actor are required")
+	}
+	if err := validateReason(reason); err != nil {
+		return nil, err
 	}
 	request["actor"], request["reason"] = actor, reason
 	request["action"], request["target_kind"], request["target_id"] = action, targetKind, targetID

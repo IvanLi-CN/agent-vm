@@ -19,6 +19,26 @@ type fakeImageBackend struct {
 	deletes  int
 }
 
+func TestReasonValidationUsesUnicodeCodePointsAndAllowsOmission(t *testing.T) {
+	for _, value := range []string{"", strings.Repeat("a", 512), strings.Repeat("\U0001f431", 512)} {
+		if err := validateReason(value); err != nil {
+			t.Fatalf("reason %q rejected: %v", value[:minTestStringLen(len(value), 8)], err)
+		}
+	}
+	for _, value := range []string{" \t\n", strings.Repeat("a", 513), string([]byte{0xff})} {
+		if err := validateReason(value); err == nil {
+			t.Fatalf("invalid reason %q was accepted", value[:minTestStringLen(len(value), 8)])
+		}
+	}
+}
+
+func minTestStringLen(value, maximum int) int {
+	if value < maximum {
+		return value
+	}
+	return maximum
+}
+
 type blockingImageBackend struct {
 	fakeImageBackend
 	entered chan struct{}

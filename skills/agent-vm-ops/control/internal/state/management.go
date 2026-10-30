@@ -75,6 +75,42 @@ CREATE TABLE IF NOT EXISTS management_audit (
   phase TEXT NOT NULL,
   detail_json TEXT,
   occurred_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS oidc_transactions (
+  transaction_id TEXT PRIMARY KEY,
+  state_digest TEXT NOT NULL UNIQUE,
+  nonce_digest TEXT NOT NULL,
+  code_verifier_sealed TEXT NOT NULL,
+  binding_cookie_digest TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  redirect_uri TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS browser_sessions (
+  session_digest TEXT PRIMARY KEY,
+  issuer TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  csrf_digest TEXT NOT NULL,
+  capabilities_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+CREATE TABLE IF NOT EXISTS agent_tokens (
+  token_id TEXT PRIMARY KEY,
+  token_digest TEXT NOT NULL UNIQUE,
+  operation_id TEXT NOT NULL UNIQUE,
+  request_digest TEXT NOT NULL,
+  issuer TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  scopes_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  resource_version TEXT NOT NULL,
+  revoked_at TEXT,
+  plaintext_disclosure TEXT NOT NULL
 );`
 
 var imageFingerprintPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
@@ -211,6 +247,8 @@ func (s *Store) EnsureManagementSchema(ctx context.Context) error {
 			{name: "managed-image-catalog", version: 1},
 			{name: "session-image-binding", version: 1},
 			{name: "management-operation-audit", version: 1},
+			{name: "principal-identity", version: 1},
+			{name: "token-revocation", version: 1},
 		} {
 			if _, err := tx.exec("INSERT OR IGNORE INTO state_capabilities(name, version, created_at) VALUES(?, ?, ?)", marker.name, marker.version, now); err != nil {
 				return fmt.Errorf("record state capability: %w", err)

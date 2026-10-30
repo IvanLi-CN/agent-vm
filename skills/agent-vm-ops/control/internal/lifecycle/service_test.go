@@ -96,6 +96,21 @@ func (observer staticCPUObserver) Observe(context.Context) (observe.CPUObservati
 	return observer.observation, observer.err
 }
 
+func TestNamedActionLockHonorsContext(t *testing.T) {
+	service := New(nil, config.Defaults(), Options{})
+	unlock, err := service.lockNamedActionWithContext(context.Background(), "session:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := service.lockNamedActionWithContext(ctx, "session:test"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lock error = %v, want deadline exceeded", err)
+	}
+}
+
 func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -595,7 +610,9 @@ func TestDrainStatusIncludesStateCapabilities(t *testing.T) {
 		"legacy-agent-vm-core@1",
 		"managed-image-catalog@1",
 		"management-operation-audit@1",
+		"principal-identity@1",
 		"session-image-binding@1",
+		"token-revocation@1",
 	}
 	if !reflect.DeepEqual(capabilities, expected) {
 		t.Fatalf("state capabilities = %#v, want %#v", capabilities, expected)

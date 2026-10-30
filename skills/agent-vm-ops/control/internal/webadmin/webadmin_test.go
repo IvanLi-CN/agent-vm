@@ -25,6 +25,8 @@ func testManagementConfig(t *testing.T) config.ManagementConfig {
 	root := t.TempDir()
 	return config.ManagementConfig{
 		Enabled: true, ExternalOrigin: "https://console.example",
+		OIDC:                 config.OIDCConfig{Issuer: "https://issuer.example", ClientID: "client", ClientSecret: "secret", RedirectURI: "https://console.example/api/v1/auth/oidc/callback"},
+		AdminPrincipal:       config.AdminPrincipalConfig{Issuer: "https://issuer.example", Subject: "admin@example", Capabilities: []string{"read", "operate", "manage_images", "maintain_system", "manage_tokens", "observe_admin"}},
 		ForwardAuth:          config.ForwardAuthConfig{SocketPath: filepath.Join(root, "web.sock"), PeerUID: 1001, IdentityHeader: "X-Forwarded-User"},
 		AllowedAdminSubjects: []string{"admin@example"}, WebUID: 1002,
 		SessionTTLSeconds: 900,
@@ -88,6 +90,19 @@ func TestSafeOperationErrorPreservesImportRecoveryEvidence(t *testing.T) {
 func jsonString(value any) string {
 	raw, _ := json.Marshal(value)
 	return string(raw)
+}
+
+func TestWebReasonValidationUsesUnicodeCodePoints(t *testing.T) {
+	for _, value := range []string{"", strings.Repeat("a", 512), strings.Repeat("\U0001f431", 512)} {
+		if err := validateReason(value); err != nil {
+			t.Fatalf("reason rejected: %v", err)
+		}
+	}
+	for _, value := range []string{" \t\n", strings.Repeat("a", 513), string([]byte{0xff})} {
+		if err := validateReason(value); err == nil {
+			t.Fatalf("invalid reason was accepted")
+		}
+	}
 }
 
 func TestAuthorityListsImagesOnlyForAuthorizedPeer(t *testing.T) {

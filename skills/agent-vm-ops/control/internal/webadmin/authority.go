@@ -20,6 +20,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -1830,11 +1831,14 @@ func validateFingerprint(value string) error {
 }
 
 func validateReason(value string) error {
-	if strings.TrimSpace(value) == "" {
-		return errors.New("reason is required")
+	if value == "" {
+		return nil
 	}
-	if len(value) > 512 {
-		return errors.New("reason must not exceed 512 characters")
+	if strings.TrimSpace(value) == "" {
+		return errors.New("reason must not be blank")
+	}
+	if !utf8.ValidString(value) || utf8.RuneCountInString(value) > 512 {
+		return errors.New("reason must not exceed 512 Unicode characters")
 	}
 	return nil
 }
@@ -2082,7 +2086,11 @@ func operationValue(operation state.ManagementOperation) map[string]any {
 	if operation.Error != nil {
 		errorValue = safeOperationError(operation.Error, operation.OperationID, operation.Phase)
 	}
-	return map[string]any{"operation_id": operation.OperationID, "action": operation.Action, "status": operationStatus(operation), "phase": operationPhase(operation), "target": map[string]any{"kind": operation.TargetKind, "id": operation.TargetID}, "actor": operation.Actor, "reason": operation.Reason, "created_at": operation.CreatedAt, "updated_at": operation.UpdatedAt, "result": resultValue, "error": errorValue}
+	var reason any
+	if operation.Reason != "" {
+		reason = operation.Reason
+	}
+	return map[string]any{"operation_id": operation.OperationID, "action": operation.Action, "status": operationStatus(operation), "phase": operationPhase(operation), "target": map[string]any{"kind": operation.TargetKind, "id": operation.TargetID}, "actor": actorValue(operation.Actor), "reason": reason, "created_at": operation.CreatedAt, "updated_at": operation.UpdatedAt, "result": resultValue, "error": errorValue}
 }
 
 func operationStatus(operation state.ManagementOperation) string {
@@ -2108,9 +2116,16 @@ func safeOperationResult(value map[string]any) map[string]any {
 		return nil
 	}
 	result := map[string]any{}
-	for _, key := range []string{"image_fingerprint", "default_fingerprint", "affected_session_count", "effect"} {
+	for _, key := range []string{"image_fingerprint", "default_fingerprint", "affected_session_count", "effect", "plaintext_disclosure"} {
 		if item, ok := value[key]; ok {
 			result[key] = item
+		}
+	}
+	if metadata, ok := value["token_metadata"].(map[string]any); ok {
+		result["token_metadata"] = map[string]any{
+			"token_id": metadata["token_id"], "resource_version": metadata["resource_version"],
+			"scopes": metadata["scopes"], "created_at": metadata["created_at"],
+			"expires_at": metadata["expires_at"], "revoked_at": metadata["revoked_at"],
 		}
 	}
 	if value["fingerprint"] != nil && result["image_fingerprint"] == nil {
@@ -2166,13 +2181,25 @@ func auditValue(value state.ManagementAudit) map[string]any {
 	if phase == "" {
 		phase = "reconciliation"
 	}
-	result := map[string]any{"event_id": value.EventID, "operation_id": operationID, "action": value.Action, "actor": value.Actor, "reason": value.Reason, "target": value.Target, "outcome": value.Outcome, "phase": phase, "occurred_at": value.OccurredAt}
+	var reason any
+	if value.Reason != "" {
+		reason = value.Reason
+	}
+	result := map[string]any{"event_id": value.EventID, "operation_id": operationID, "action": value.Action, "actor": actorValue(value.Actor), "reason": reason, "target": value.Target, "outcome": value.Outcome, "phase": phase, "occurred_at": value.OccurredAt}
 	if value.Detail != nil {
 		result["safe_code"] = safeCode(stringValue(value.Detail["code"]))
 	} else {
 		result["safe_code"] = nil
 	}
 	return result
+}
+
+func actorValue(value string) any {
+	parts := strings.SplitN(value, "\x00", 2)
+	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+		return map[string]any{"issuer": parts[0], "subject": parts[1], "role": "administrator"}
+	}
+	return value
 }
 
 func actionPreviewValue(targetVersion, token string, expiresAt time.Time, impact map[string]any) map[string]any {
