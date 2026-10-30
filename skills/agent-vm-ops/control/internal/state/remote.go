@@ -335,6 +335,12 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 			if !authPresent && isAuthManagementObject(key) {
 				continue
 			}
+			// Confirmation records were added after the first durable auth
+			// schema. Keep an already-complete OIDC/session/Token database
+			// open so EnsureManagementSchema can add this table atomically.
+			if authPresent && key == "table:management_confirmations" && !actual[key] {
+				continue
+			}
 			if !actual[key] {
 				return fmt.Errorf("database schema missing canonical management object %s", key)
 			}
@@ -345,7 +351,7 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 
 func isAuthManagementObject(key string) bool {
 	switch key {
-	case "table:oidc_transactions", "table:browser_sessions", "table:agent_tokens":
+	case "table:oidc_transactions", "table:browser_sessions", "table:agent_tokens", "table:management_confirmations":
 		return true
 	default:
 		return false
@@ -1012,7 +1018,7 @@ func orderedTables(objects []remoteSchemaObject) []string {
 			present[object.Name] = true
 		}
 	}
-	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "managed_image_tombstones", "image_references", "management_operations", "management_audit", "oidc_transactions", "browser_sessions", "agent_tokens"}
+	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "managed_image_tombstones", "image_references", "management_operations", "management_audit", "oidc_transactions", "browser_sessions", "agent_tokens", "management_confirmations"}
 	values := make([]string, 0, len(present))
 	for _, table := range order {
 		if present[table] {

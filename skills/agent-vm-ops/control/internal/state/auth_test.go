@@ -47,6 +47,52 @@ func TestOIDCTransactionIsConsumedExactlyOnce(t *testing.T) {
 	}
 }
 
+func TestManagementConfirmationIsCrossStoreSingleUse(t *testing.T) {
+	path := t.TempDir() + "/state.sqlite3"
+	first, err := OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	ctx := context.Background()
+	if err := first.InsertManagementConfirmation(ctx, ManagementConfirmation{
+		ConfirmationDigest: strings.Repeat("a", 64), Subject: "issuer\x00admin", Action: "token_revoke", Target: "token:token-1", TargetVersion: "token:initial", ParamsDigest: strings.Repeat("b", 64), CreatedAt: "2026-10-30T00:00:00Z", ExpiresAt: "2026-10-30T00:05:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var wait sync.WaitGroup
+	var mu sync.Mutex
+	consumed := 0
+	wait.Add(2)
+	for _, store := range []*Store{first, second} {
+		go func(store *Store) {
+			defer wait.Done()
+			ok, err := store.ConsumeManagementConfirmation(ctx, strings.Repeat("a", 64), "issuer\x00admin", "token_revoke", "token:token-1", "token:initial", strings.Repeat("b", 64), "2026-10-30T00:01:00Z")
+			if err != nil {
+				t.Errorf("consume: %v", err)
+				return
+			}
+			if ok {
+				mu.Lock()
+				consumed++
+				mu.Unlock()
+			}
+		}(store)
+	}
+	wait.Wait()
+	if consumed != 1 {
+		t.Fatalf("successful cross-store consumers = %d, want 1", consumed)
+	}
+	if ok, err := first.ConsumeManagementConfirmation(ctx, strings.Repeat("a", 64), "issuer\x00admin", "token_revoke", "token:token-1", "token:initial", strings.Repeat("b", 64), "2026-10-30T00:02:00Z"); err != nil || ok {
+		t.Fatalf("replay consume = %v, err=%v", ok, err)
+	}
+}
+
 func TestAgentTokenLifecycleDoesNotPersistBearer(t *testing.T) {
 	store, err := OpenForTest(t.TempDir() + "/state.sqlite3")
 	if err != nil {
@@ -83,8 +129,15 @@ func TestAgentTokenLifecycleDoesNotPersistBearer(t *testing.T) {
 	if strings.Contains(schemaSQL, "token_plaintext") || strings.Contains(schemaSQL, "bearer") {
 		t.Fatalf("agent token schema contains plaintext storage: %s", schemaSQL)
 	}
+	if err := store.InsertManagementConfirmation(ctx, ManagementConfirmation{
+		ConfirmationDigest: strings.Repeat("c", 64), Subject: operation.Actor, Action: "token_revoke", Target: "token:" + value.TokenID, TargetVersion: value.ResourceVersion, ParamsDigest: strings.Repeat("d", 64), CreatedAt: "2026-10-30T00:01:00Z", ExpiresAt: "2026-10-30T00:05:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
 	const nextVersion = "token:revoked"
-	revokedOperation, revokedToken, changed, err := store.RevokeAgentTokenWithOperation(ctx, value.TokenID, value.ResourceVersion, nextVersion, "2026-10-30T00:02:00Z", ManagementOperation{
+	revokedOperation, revokedToken, changed, err := store.RevokeAgentTokenWithOperationAndConfirmation(ctx, value.TokenID, value.ResourceVersion, nextVersion, "2026-10-30T00:02:00Z", ManagementConfirmationClaim{
+		ConfirmationDigest: strings.Repeat("c", 64), Subject: operation.Actor, Action: "token_revoke", Target: "token:" + value.TokenID, TargetVersion: value.ResourceVersion, ParamsDigest: strings.Repeat("d", 64),
+	}, ManagementOperation{
 		OperationID: "operation-revoke-123456789012", Action: "token_revoke", TargetKind: "token", TargetID: value.TokenID, Actor: operation.Actor, Phase: "durable_state", Request: map[string]any{"_request_digest": "revoke"}, CreatedAt: "2026-10-30T00:02:00Z", UpdatedAt: "2026-10-30T00:02:00Z",
 	}, ManagementAudit{EventID: "event-2", OperationID: stringPointerForTest("operation-revoke-123456789012"), Action: "token_revoke", Actor: operation.Actor, Target: map[string]any{"kind": "token", "id": value.TokenID}, Outcome: "succeeded", Phase: "durable_state", OccurredAt: "2026-10-30T00:02:00Z"})
 	if err != nil || !changed || revokedOperation == nil || revokedToken == nil || revokedToken.RevokedAt == nil || revokedToken.ResourceVersion != nextVersion {

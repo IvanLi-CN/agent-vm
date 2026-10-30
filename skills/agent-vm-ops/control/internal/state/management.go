@@ -111,6 +111,17 @@ CREATE TABLE IF NOT EXISTS agent_tokens (
   resource_version TEXT NOT NULL,
   revoked_at TEXT,
   plaintext_disclosure TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS management_confirmations (
+  confirmation_digest TEXT PRIMARY KEY,
+  subject TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target TEXT NOT NULL,
+  target_version TEXT NOT NULL,
+  params_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT
 );`
 
 var imageFingerprintPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)

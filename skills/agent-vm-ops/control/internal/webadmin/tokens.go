@@ -239,9 +239,9 @@ func (server *UnifiedServer) previewTokenRevoke(writer http.ResponseWriter, requ
 		return
 	}
 	params := map[string]any{"token_id": tokenID, "target_version": payload.TargetVersion, "metadata": agentTokenValue(*value)}
-	token, expiresAt, err := server.Authority.confirmations.issue(server.now(), principal.actor(), "token_revoke", "token:"+tokenID, payload.TargetVersion, params)
+	token, expiresAt, err := issueDurableConfirmation(request.Context(), server.Store, server.now(), principal.actor(), "token_revoke", "token:"+tokenID, payload.TargetVersion, params)
 	if err != nil {
-		writeProblem(writer, newAPIError("internal_error", "revocation preview could not be created", http.StatusInternalServerError, "internal", true, ""))
+		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
 	}
 	writeJSON(writer, http.StatusOK, map[string]any{"token_id": tokenID, "target_version": payload.TargetVersion, "confirmation_token": token, "expires_at": expiresAt.UTC().Format(time.RFC3339Nano), "metadata": agentTokenValue(*value)})
@@ -306,7 +306,8 @@ func (server *UnifiedServer) revokeToken(writer http.ResponseWriter, request *ht
 		return
 	}
 	params := map[string]any{"token_id": tokenID, "target_version": payload.TargetVersion, "metadata": agentTokenValue(*value)}
-	if err := server.Authority.confirmations.consume(server.now(), payload.ConfirmationToken, actor, "token_revoke", "token:"+tokenID, payload.TargetVersion, params); err != nil {
+	confirmation, err := durableConfirmationClaim(payload.ConfirmationToken, actor, "token_revoke", "token:"+tokenID, payload.TargetVersion, params)
+	if err != nil {
 		writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
 		return
 	}
@@ -323,7 +324,7 @@ func (server *UnifiedServer) revokeToken(writer http.ResponseWriter, request *ht
 		Result:  map[string]any{"token_id": tokenID, "effect": "revoked"}, CreatedAt: now, UpdatedAt: now,
 	}
 	audit := state.ManagementAudit{EventID: uuid.NewString(), OperationID: stringPointer(payload.OperationID), Action: "token_revoke", Actor: actor, Reason: payload.Reason, Target: map[string]any{"kind": "token", "id": tokenID}, Outcome: "succeeded", Phase: "durable_state", OccurredAt: now}
-	committedOperation, _, _, err := server.Store.RevokeAgentTokenWithOperation(request.Context(), tokenID, payload.TargetVersion, "token:"+nextVersion, now, operation, audit)
+	committedOperation, _, _, err := server.Store.RevokeAgentTokenWithOperationAndConfirmation(request.Context(), tokenID, payload.TargetVersion, "token:"+nextVersion, now, confirmation, operation, audit)
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
 		return

@@ -35,6 +35,29 @@ type BrowserSession struct {
 	RevokedAt        *string
 }
 
+// ManagementConfirmation is metadata for a short-lived, one-use browser
+// confirmation. The raw confirmation value is never part of this record.
+type ManagementConfirmation struct {
+	ConfirmationDigest string
+	Subject            string
+	Action             string
+	Target             string
+	TargetVersion      string
+	ParamsDigest       string
+	CreatedAt          string
+	ExpiresAt          string
+	ConsumedAt         *string
+}
+
+type ManagementConfirmationClaim struct {
+	ConfirmationDigest string
+	Subject            string
+	Action             string
+	Target             string
+	TargetVersion      string
+	ParamsDigest       string
+}
+
 // AgentToken is deliberately metadata-only. TokenDigest is a one-way
 // verifier, and PlaintextDisclosure records that the bearer was disclosed in
 // the creation response without storing that bearer in state.
@@ -162,6 +185,59 @@ func (s *Store) RevokeBrowserSession(ctx context.Context, sessionDigest, now str
 		_, err := tx.exec("UPDATE browser_sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE session_digest = ?", now, sessionDigest)
 		return err
 	})
+}
+
+// InsertManagementConfirmation persists only a digest of the raw browser
+// confirmation. A later slot can consume the same record atomically.
+func (s *Store) InsertManagementConfirmation(ctx context.Context, value ManagementConfirmation) error {
+	if value.ConfirmationDigest == "" || value.Subject == "" || value.Action == "" || value.Target == "" || value.TargetVersion == "" || value.ParamsDigest == "" || value.CreatedAt == "" || value.ExpiresAt == "" {
+		return errors.New("invalid management confirmation")
+	}
+	return s.withWrite(ctx, func(tx *Tx) error {
+		_, err := tx.exec(`INSERT INTO management_confirmations(confirmation_digest, subject, action, target, target_version, params_digest, created_at, expires_at, consumed_at)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)`, value.ConfirmationDigest, value.Subject, value.Action, value.Target, value.TargetVersion, value.ParamsDigest, value.CreatedAt, value.ExpiresAt)
+		return err
+	})
+}
+
+// ConsumeManagementConfirmation atomically validates and consumes a
+// confirmation. Exactly one concurrent caller can change consumed_at.
+func (s *Store) ConsumeManagementConfirmation(ctx context.Context, confirmationDigest, subject, action, target, targetVersion, paramsDigest, now string) (bool, error) {
+	claim := ManagementConfirmationClaim{ConfirmationDigest: confirmationDigest, Subject: subject, Action: action, Target: target, TargetVersion: targetVersion, ParamsDigest: paramsDigest}
+	if err := validateManagementConfirmationClaim(claim, now); err != nil {
+		return false, err
+	}
+	consumed := false
+	err := s.withWrite(ctx, func(tx *Tx) error {
+		var err error
+		consumed, err = consumeManagementConfirmationTx(tx, claim, now)
+		return err
+	})
+	return consumed, err
+}
+
+func validateManagementConfirmationClaim(claim ManagementConfirmationClaim, now string) error {
+	if claim.ConfirmationDigest == "" || claim.Subject == "" || claim.Action == "" || claim.Target == "" || claim.TargetVersion == "" || claim.ParamsDigest == "" || now == "" {
+		return errors.New("confirmation identity and current time are required")
+	}
+	return nil
+}
+
+func consumeManagementConfirmationTx(tx *Tx, claim ManagementConfirmationClaim, now string) (bool, error) {
+	if err := validateManagementConfirmationClaim(claim, now); err != nil {
+		return false, err
+	}
+	result, err := tx.exec(`UPDATE management_confirmations
+SET consumed_at = ?
+WHERE confirmation_digest = ? AND subject = ? AND action = ? AND target = ? AND target_version = ? AND params_digest = ? AND consumed_at IS NULL AND expires_at > ?`, now, claim.ConfirmationDigest, claim.Subject, claim.Action, claim.Target, claim.TargetVersion, claim.ParamsDigest, now)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows == 1, nil
 }
 
 func (s *Store) InsertAgentToken(ctx context.Context, value AgentToken) error {
@@ -433,6 +509,16 @@ func (s *Store) RevokeAgentToken(ctx context.Context, tokenID, expectedVersion, 
 // operation/audit record in one transaction. The conditional version update is
 // the authorization fence used by every caller.
 func (s *Store) RevokeAgentTokenWithOperation(ctx context.Context, tokenID, expectedVersion, nextVersion, now string, operation ManagementOperation, audit ManagementAudit) (*ManagementOperation, *AgentToken, bool, error) {
+	return s.revokeAgentTokenWithOperation(ctx, tokenID, expectedVersion, nextVersion, now, nil, operation, audit)
+}
+
+// RevokeAgentTokenWithOperationAndConfirmation commits the one-use browser
+// confirmation and Token revocation in the same state transaction.
+func (s *Store) RevokeAgentTokenWithOperationAndConfirmation(ctx context.Context, tokenID, expectedVersion, nextVersion, now string, confirmation ManagementConfirmationClaim, operation ManagementOperation, audit ManagementAudit) (*ManagementOperation, *AgentToken, bool, error) {
+	return s.revokeAgentTokenWithOperation(ctx, tokenID, expectedVersion, nextVersion, now, &confirmation, operation, audit)
+}
+
+func (s *Store) revokeAgentTokenWithOperation(ctx context.Context, tokenID, expectedVersion, nextVersion, now string, confirmation *ManagementConfirmationClaim, operation ManagementOperation, audit ManagementAudit) (*ManagementOperation, *AgentToken, bool, error) {
 	if tokenID == "" || expectedVersion == "" || nextVersion == "" || now == "" || operation.OperationID == "" || operation.Action == "" || operation.TargetKind == "" || operation.TargetID == "" || operation.Actor == "" {
 		return nil, nil, false, errors.New("token, version, time and operation are required")
 	}
@@ -441,6 +527,14 @@ func (s *Store) RevokeAgentTokenWithOperation(ctx context.Context, tokenID, expe
 	}
 	if audit.OperationID != nil && *audit.OperationID != operation.OperationID {
 		return nil, nil, false, errors.New("token audit identity does not match revoke operation")
+	}
+	if confirmation != nil {
+		if err := validateManagementConfirmationClaim(*confirmation, now); err != nil {
+			return nil, nil, false, err
+		}
+		if confirmation.Action != operation.Action || confirmation.Target != operation.TargetKind+":"+operation.TargetID || confirmation.TargetVersion != expectedVersion {
+			return nil, nil, false, errors.New("confirmation identity does not match token revoke operation")
+		}
 	}
 	operation.Status = "succeeded"
 	if operation.Phase == "" {
@@ -508,6 +602,15 @@ func (s *Store) RevokeAgentTokenWithOperation(ctx context.Context, tokenID, expe
 		}
 		if candidate.ResourceVersion != expectedVersion {
 			return fmt.Errorf("stale_target: expected %s, current %s", expectedVersion, candidate.ResourceVersion)
+		}
+		if confirmation != nil {
+			consumed, err := consumeManagementConfirmationTx(tx, *confirmation, now)
+			if err != nil {
+				return err
+			}
+			if !consumed {
+				return errors.New("precondition_required: confirmation token is invalid or expired")
+			}
 		}
 		if _, err := tx.exec(`INSERT INTO management_operations(operation_id, action, target_kind, target_id, actor, reason, phase, status, request_json, result_json, error_json, created_at, updated_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, operation.OperationID, operation.Action, operation.TargetKind, operation.TargetID, operation.Actor, operation.Reason, operation.Phase, operation.Status, string(requestJSON), resultJSON, errorJSON, operation.CreatedAt, operation.UpdatedAt); err != nil {

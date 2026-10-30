@@ -931,6 +931,30 @@ func TestSupportedSchemaAcceptsLegacyManagementBeforeAuthBootstrap(t *testing.T)
 	}
 }
 
+func TestSupportedSchemaAcceptsDurableAuthBeforeConfirmationBootstrap(t *testing.T) {
+	core, err := canonicalCoreSchema(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	management, err := canonicalManagementSchema(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects := make([]remoteSchemaObject, 0, len(core)+len(management)-1)
+	for _, object := range core {
+		objects = append(objects, object)
+	}
+	for key, object := range management {
+		if key == "table:management_confirmations" {
+			continue
+		}
+		objects = append(objects, object)
+	}
+	if err := requireSupportedSchema(context.Background(), objects); err != nil {
+		t.Fatalf("durable auth schema rejected before confirmation bootstrap: %v", err)
+	}
+}
+
 func TestMigrationRejectsUnsupportedSourceSchemaBeforeRemoteWrite(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "source.sqlite3")
 	source, err := OpenForTest(sourcePath)
