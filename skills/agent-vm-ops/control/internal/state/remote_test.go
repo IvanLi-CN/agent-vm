@@ -456,6 +456,31 @@ func TestRemoteQueryRejectsNullValues(t *testing.T) {
 	}
 }
 
+func TestRemoteQueryPreservesLargeIntegerValues(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"results":[{"columns":["value"],"types":["INTEGER"],"values":[[9007199254740993]]}]}`))
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client()}
+	result, err := backend.query(context.Background(), "SELECT value FROM large_values")
+	if err != nil {
+		t.Fatal(err)
+	}
+	number, ok := result.Values[0][0].(json.Number)
+	if !ok || number.String() != "9007199254740993" {
+		t.Fatalf("large integer value = %#v (%T)", result.Values[0][0], result.Values[0][0])
+	}
+	normalized, ok := normalizeRemoteValue(number, "INTEGER").(int64)
+	if !ok || normalized != 9007199254740993 {
+		t.Fatalf("normalized large integer = %#v (%T)", normalizeRemoteValue(number, "INTEGER"), normalizeRemoteValue(number, "INTEGER"))
+	}
+}
+
 func TestRemoteQueryRejectsTopLevelError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")

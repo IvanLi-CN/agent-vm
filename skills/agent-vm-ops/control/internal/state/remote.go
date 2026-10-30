@@ -59,7 +59,9 @@ type remoteResult struct {
 func (result *remoteResult) UnmarshalJSON(data []byte) error {
 	type plain remoteResult
 	var decoded plain
-	if err := json.Unmarshal(data, &decoded); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	if err := decoder.Decode(&decoded); err != nil {
 		return err
 	}
 	var fields map[string]json.RawMessage
