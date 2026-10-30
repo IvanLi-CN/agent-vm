@@ -54,7 +54,6 @@ type Authority struct {
 	Snapshots      *observe.SnapshotStore
 	ProductVersion string
 	Clock          func() time.Time
-	confirmations  *confirmationStore
 	uploadMu       sync.Mutex
 }
 
@@ -79,7 +78,6 @@ func NewAuthority(options AuthorityOptions) (*Authority, error) {
 		Snapshots:      options.Snapshots,
 		ProductVersion: options.ProductVersion,
 		Clock:          options.Clock,
-		confirmations:  newConfirmationStore(),
 	}, nil
 }
 
@@ -706,7 +704,7 @@ func (authority *Authority) previewVMAction(writer http.ResponseWriter, request 
 		writeProblem(writer, problemFromError(err, "precondition", ""))
 		return
 	}
-	token, expiresAt, err := authority.confirmations.issue(authority.Clock(), actor, payload.Action, "vm:"+taskID, payload.TargetVersion, parameters)
+	token, expiresAt, err := issueDurableConfirmation(request.Context(), authority.Store, authority.Clock(), actor, payload.Action, "vm:"+taskID, payload.TargetVersion, parameters)
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
@@ -753,7 +751,7 @@ func (authority *Authority) submitVMAction(writer http.ResponseWriter, request *
 			writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
 			return
 		}
-		if err := authority.confirmations.consume(authority.Clock(), payload.ConfirmationToken, actor, payload.Action, "vm:"+taskID, payload.TargetVersion, parameters); err != nil {
+		if err := consumeDurableConfirmation(request.Context(), authority.Store, authority.Clock(), payload.ConfirmationToken, actor, payload.Action, "vm:"+taskID, payload.TargetVersion, parameters); err != nil {
 			writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
 			return
 		}
@@ -1249,7 +1247,7 @@ func (authority *Authority) previewDefaultImage(writer http.ResponseWriter, requ
 		return
 	}
 	params := map[string]any{"fingerprint": payload.Fingerprint}
-	token, expiresAt, err := authority.confirmations.issue(authority.Clock(), actor, "default_image_select", "image:"+payload.Fingerprint, payload.TargetVersion, params)
+	token, expiresAt, err := issueDurableConfirmation(request.Context(), authority.Store, authority.Clock(), actor, "default_image_select", "image:"+payload.Fingerprint, payload.TargetVersion, params)
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
@@ -1301,7 +1299,7 @@ func (authority *Authority) submitDefaultImage(writer http.ResponseWriter, reque
 		return
 	}
 	if existing == nil {
-		if err := authority.confirmations.consume(authority.Clock(), payload.ConfirmationToken, actor, "default_image_select", "image:"+payload.Fingerprint, payload.TargetVersion, params); err != nil {
+		if err := consumeDurableConfirmation(request.Context(), authority.Store, authority.Clock(), payload.ConfirmationToken, actor, "default_image_select", "image:"+payload.Fingerprint, payload.TargetVersion, params); err != nil {
 			writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
 			return
 		}
@@ -1347,7 +1345,7 @@ func (authority *Authority) previewImageMutation(writer http.ResponseWriter, req
 		return
 	}
 	params := map[string]any{"fingerprint": fingerprint}
-	token, expiresAt, err := authority.confirmations.issue(authority.Clock(), actor, action, "image:"+fingerprint, payload.TargetVersion, params)
+	token, expiresAt, err := issueDurableConfirmation(request.Context(), authority.Store, authority.Clock(), actor, action, "image:"+fingerprint, payload.TargetVersion, params)
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
@@ -1398,7 +1396,7 @@ func (authority *Authority) submitImageMutation(writer http.ResponseWriter, requ
 		return
 	}
 	if existing == nil {
-		if err := authority.confirmations.consume(authority.Clock(), payload.ConfirmationToken, actor, action, "image:"+fingerprint, payload.TargetVersion, params); err != nil {
+		if err := consumeDurableConfirmation(request.Context(), authority.Store, authority.Clock(), payload.ConfirmationToken, actor, action, "image:"+fingerprint, payload.TargetVersion, params); err != nil {
 			writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
 			return
 		}
@@ -1442,7 +1440,7 @@ func (authority *Authority) previewMaintenance(writer http.ResponseWriter, reque
 		writeProblem(writer, problemFromError(fmt.Errorf("stale_target: expected %s, current %s", payload.TargetVersion, current), "precondition", ""))
 		return
 	}
-	token, expiresAt, err := authority.confirmations.issue(authority.Clock(), actor, payload.Action, "system", payload.TargetVersion, parameters)
+	token, expiresAt, err := issueDurableConfirmation(request.Context(), authority.Store, authority.Clock(), actor, payload.Action, "system", payload.TargetVersion, parameters)
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
@@ -1497,7 +1495,7 @@ func (authority *Authority) submitMaintenance(writer http.ResponseWriter, reques
 		return
 	}
 	if existing == nil {
-		if err := authority.confirmations.consume(authority.Clock(), payload.ConfirmationToken, actor, payload.Action, "system", payload.TargetVersion, parameters); err != nil {
+		if err := consumeDurableConfirmation(request.Context(), authority.Store, authority.Clock(), payload.ConfirmationToken, actor, payload.Action, "system", payload.TargetVersion, parameters); err != nil {
 			writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
 			return
 		}

@@ -302,20 +302,66 @@ func TestWebRejectsAPIPathsFromStaticFallback(t *testing.T) {
 }
 
 func TestConfirmationTokenIsBoundAndSingleUse(t *testing.T) {
-	store := newConfirmationStore()
-	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
-	token, _, err := store.issue(now, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", map[string]any{"live": false})
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.consume(now, token, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", map[string]any{"live": true}); err == nil {
-		t.Fatal("parameter mismatch unexpectedly accepted")
-	}
-	if err := store.consume(now, token, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", map[string]any{"live": false}); err != nil {
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	params := map[string]any{"live": false}
+	token, _, err := issueDurableConfirmation(ctx, store, now, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", params)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.consume(now, token, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", map[string]any{"live": false}); err == nil {
+	if err := consumeDurableConfirmation(ctx, store, now, token, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", map[string]any{"live": true}); err == nil {
+		t.Fatal("parameter mismatch unexpectedly accepted")
+	}
+	if err := consumeDurableConfirmation(ctx, store, now, token, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", params); err != nil {
+		t.Fatal(err)
+	}
+	if err := consumeDurableConfirmation(ctx, store, now, token, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", params); err == nil {
 		t.Fatal("confirmation token was reusable")
+	}
+}
+
+func TestDurableConfirmationClassesCrossSlots(t *testing.T) {
+	blue, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blue.Close()
+	green, err := state.OpenForTest(blue.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer green.Close()
+
+	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		action string
+		target string
+		params map[string]any
+	}{
+		{name: "vm", action: "restart", target: "vm:task-1", params: map[string]any{"live": false}},
+		{name: "default-image", action: "default_image_select", target: "image:" + strings.Repeat("a", 64), params: map[string]any{"fingerprint": strings.Repeat("a", 64)}},
+		{name: "image-mutation", action: "image_retire", target: "image:" + strings.Repeat("b", 64), params: map[string]any{"fingerprint": strings.Repeat("b", 64)}},
+		{name: "maintenance", action: "reconcile", target: "system", params: map[string]any{"scope": "all"}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			token, _, err := issueDurableConfirmation(context.Background(), blue, now, "admin@example", test.action, test.target, "version-1", test.params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := consumeDurableConfirmation(context.Background(), green, now, token, "admin@example", test.action, test.target, "version-1", test.params); err != nil {
+				t.Fatalf("cross-slot consume: %v", err)
+			}
+			if err := consumeDurableConfirmation(context.Background(), blue, now, token, "admin@example", test.action, test.target, "version-1", test.params); err == nil {
+				t.Fatal("confirmation replay was accepted")
+			}
+		})
 	}
 }
 
