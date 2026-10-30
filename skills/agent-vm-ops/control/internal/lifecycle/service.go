@@ -1039,6 +1039,14 @@ func hasWarning(existing []any, candidate any) bool {
 // marked ready. Pending journal intents are evidence of an uncertain native
 // outcome and must remain visible for explicit inspection or cleanup.
 func (s *Service) StartupReconcile(ctx context.Context) error {
+	// Startup recovery may inspect and stop a pending native worker. Share the
+	// release-sensitive drain boundary with normal lifecycle actions so one
+	// slot cannot recover a worker that another slot is still starting.
+	unlockDrain, err := s.lockNamedActionWithContext(ctx, "drain")
+	if err != nil {
+		return err
+	}
+	defer unlockDrain()
 	s.maintenance.Lock()
 	defer s.maintenance.Unlock()
 	if _, err := s.Store.StateEpoch(ctx); err != nil {

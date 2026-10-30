@@ -114,6 +114,10 @@ func (s *Store) ConsumeOIDCTransaction(ctx context.Context, stateDigest, now str
 	var value *OIDCTransaction
 	consumed := false
 	err := s.withWrite(ctx, func(tx *Tx) error {
+		// A remote epoch conflict can replay this callback. Clear the result
+		// from the previous speculative attempt before reading the mirror again.
+		value = nil
+		consumed = false
 		candidate, err := scanOIDCTransaction(tx.conn.QueryRowContext(ctx, `SELECT transaction_id, state_digest, nonce_digest, code_verifier_sealed, binding_cookie_digest, client_id, redirect_uri, created_at, expires_at, consumed_at FROM oidc_transactions WHERE state_digest = ?`, stateDigest))
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil

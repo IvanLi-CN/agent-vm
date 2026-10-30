@@ -114,6 +114,27 @@ func TestNamedActionLockHonorsContext(t *testing.T) {
 	}
 }
 
+func TestStartupReconcileSharesCrossProcessDrainBoundary(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	lockDir := t.TempDir()
+	first := New(store, config.Defaults(), Options{LockDir: lockDir})
+	second := New(store, config.Defaults(), Options{LockDir: lockDir})
+	unlock, err := first.lockNamedActionWithContext(context.Background(), "drain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := second.StartupReconcile(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("startup reconcile error = %v, want drain lock deadline", err)
+	}
+}
+
 func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

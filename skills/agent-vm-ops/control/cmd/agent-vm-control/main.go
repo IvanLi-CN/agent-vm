@@ -125,8 +125,13 @@ func serve(args []string) error {
 		if err := store.EnsureManagementSchema(context.Background()); err != nil {
 			return fmt.Errorf("initialize management schema: %w", err)
 		}
-		if err := webadmin.CleanupUploadStaging(cfg.Management.Upload.StagingPath); err != nil {
-			return fmt.Errorf("clean upload staging: %w", err)
+		if !remoteStateDSN(cfg.StateDB) {
+			// Remote blue-green slots share this directory. A slot cannot prove
+			// that an upload temp file belongs to a stopped peer, so only the
+			// SQLite authority may perform startup cleanup.
+			if err := webadmin.CleanupUploadStaging(cfg.Management.Upload.StagingPath); err != nil {
+				return fmt.Errorf("clean upload staging: %w", err)
+			}
 		}
 		if err := store.SeedLegacyImage(context.Background(), cfg.ImageFingerprint); err != nil {
 			return fmt.Errorf("initialize managed image catalog: %w", err)

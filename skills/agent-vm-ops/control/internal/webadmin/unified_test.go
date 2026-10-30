@@ -99,6 +99,25 @@ func TestUnifiedTokenAPIIsIdempotentAndRevocable(t *testing.T) {
 	}
 }
 
+func TestAgentSuccessResponseRedactsNativeDiagnostics(t *testing.T) {
+	value := map[string]any{
+		"result": map[string]any{
+			"last_error": `{"phase":"native-init","cause":"/private/path and command output"}`,
+			"nested":     []any{map[string]any{"last_error": "native_failed: private stderr"}},
+		},
+	}
+	safe := safeAgentResponse(value).(map[string]any)
+	encoded := jsonString(safe)
+	if strings.Contains(encoded, "private") || strings.Contains(encoded, "native-init") || strings.Contains(encoded, "command output") {
+		t.Fatalf("native diagnostic leaked: %s", encoded)
+	}
+	result := safe["result"].(map[string]any)
+	lastError := result["last_error"].(map[string]any)
+	if lastError["code"] != "internal_error" || lastError["phase"] != "internal" || lastError["retryable"] != false {
+		t.Fatalf("safe diagnostic = %#v", lastError)
+	}
+}
+
 func TestUnifiedTokenRevokeConfirmationCrossesSlots(t *testing.T) {
 	authorityBlue, storeBlue, cfg := testAuthority(t)
 	storeGreen, err := state.OpenForTest(storeBlue.Path())

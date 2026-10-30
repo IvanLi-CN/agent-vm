@@ -425,12 +425,79 @@ func TestRemoteRequestRejectsErrorV2(t *testing.T) {
 	}
 }
 
+func TestRemoteOIDCConsumptionReplaysEpochConflict(t *testing.T) {
+	rqliteURL := requireSessionOwnedRQLite(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	runID := randomHex(6)
+	first, err := OpenForTest(rqliteURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := OpenForTest(rqliteURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	if err := first.EnsureManagementSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	stateDigest := "remote-oidc-conflict-" + runID
+	if err := first.InsertOIDCTransaction(ctx, OIDCTransaction{
+		TransactionID: "remote-oidc-transaction-" + runID, StateDigest: stateDigest, NonceDigest: "remote-oidc-nonce-" + runID,
+		CodeVerifierSealed: "sealed", BindingCookieDigest: "remote-oidc-binding-" + runID, ClientID: "client", RedirectURI: "https://console.example/api/v1/auth/oidc/callback",
+		CreatedAt: "2026-10-29T00:00:00Z", ExpiresAt: "2099-10-29T00:00:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if transaction, err := first.GetOIDCTransaction(ctx, stateDigest); err != nil || transaction == nil {
+		t.Fatalf("first remote OIDC transaction=%#v err=%v", transaction, err)
+	}
+	if transaction, err := second.GetOIDCTransaction(ctx, stateDigest); err != nil || transaction == nil {
+		t.Fatalf("second remote OIDC transaction=%#v err=%v", transaction, err)
+	}
+
+	type result struct {
+		consumed bool
+		err      error
+	}
+	results := make(chan result, 2)
+	for _, store := range []*Store{first, second} {
+		go func(store *Store) {
+			_, consumed, err := store.ConsumeOIDCTransaction(ctx, stateDigest, "2026-10-29T00:01:00Z")
+			results <- result{consumed: consumed, err: err}
+		}(store)
+	}
+	consumed := 0
+	for range 2 {
+		outcome := <-results
+		if outcome.err != nil {
+			t.Fatalf("remote OIDC consume: %v", outcome.err)
+		}
+		if outcome.consumed {
+			consumed++
+		}
+	}
+	if consumed != 1 {
+		t.Fatalf("successful remote OIDC consumers = %d, want 1", consumed)
+	}
+}
+
 func TestRemoteSyncUsesStrongEpochFenceForCachedMirror(t *testing.T) {
 	var queries int
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		queries++
 		if request.Method != http.MethodGet || request.URL.Path != "/db/query" {
 			http.Error(writer, "unexpected request", http.StatusBadRequest)
+			return
+		}
+		if request.URL.Query().Get("level") != "strong" {
+			http.Error(writer, "epoch query was not strong", http.StatusBadRequest)
+			return
+		}
+		if !strings.Contains(request.URL.Query().Get("q"), "state_epoch") {
+			http.Error(writer, "query did not read state_epoch", http.StatusBadRequest)
 			return
 		}
 		writer.Header().Set("Content-Type", "application/json")

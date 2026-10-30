@@ -62,7 +62,63 @@ func (server *UnifiedServer) agentControl(writer http.ResponseWriter, request *h
 		writeAgentError(writer, controlRequest, dispatchErr)
 		return
 	}
-	writeAgentJSON(writer, http.StatusOK, response, 0)
+	writeAgentJSON(writer, http.StatusOK, safeAgentResponse(response), 0)
+}
+
+func safeAgentResponse(value any) any {
+	switch item := value.(type) {
+	case map[string]any:
+		result := make(map[string]any, len(item))
+		for key, child := range item {
+			if key == "last_error" {
+				result[key] = safeAgentDiagnostic(child)
+				continue
+			}
+			result[key] = safeAgentResponse(child)
+		}
+		return result
+	case []any:
+		result := make([]any, len(item))
+		for index, child := range item {
+			result[index] = safeAgentResponse(child)
+		}
+		return result
+	case *string:
+		if item == nil {
+			return nil
+		}
+		return *item
+	default:
+		return value
+	}
+}
+
+func safeAgentDiagnostic(value any) any {
+	if value == nil {
+		return nil
+	}
+	var raw string
+	switch item := value.(type) {
+	case string:
+		raw = item
+	case *string:
+		if item != nil {
+			raw = *item
+		}
+	case map[string]any:
+		if item["code"] == nil && item["message"] == nil && item["cause"] == nil {
+			return nil
+		}
+		if code, ok := item["code"].(string); ok {
+			return map[string]any{"code": safeAgentCode(code), "phase": "internal", "retryable": false}
+		}
+	default:
+		return nil
+	}
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	return map[string]any{"code": "internal_error", "phase": "internal", "retryable": false}
 }
 
 func (server *UnifiedServer) agentToken(request *http.Request) (*state.AgentToken, *protocol.Error) {
