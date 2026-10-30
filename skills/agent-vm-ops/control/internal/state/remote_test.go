@@ -417,6 +417,45 @@ func TestRemoteQueryRejectsMalformedResultShape(t *testing.T) {
 	}
 }
 
+func TestRemoteQueryAcceptsEmptyResultWithoutValues(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"results":[{"columns":["value"],"types":["text"]}]}`))
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client()}
+	result, err := backend.query(context.Background(), "SELECT value FROM empty")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Values == nil {
+		t.Fatal("empty result values were not normalized")
+	}
+	if len(result.Values) != 0 {
+		t.Fatalf("empty result values = %#v", result.Values)
+	}
+}
+
+func TestRemoteQueryRejectsNullValues(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_, _ = writer.Write([]byte(`{"results":[{"columns":["value"],"types":["text"],"values":null}]}`))
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client()}
+	if _, err := backend.query(context.Background(), "SELECT value FROM empty"); err == nil {
+		t.Fatal("null query values were accepted")
+	}
+}
+
 func TestRemoteQueryRejectsTopLevelError(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")

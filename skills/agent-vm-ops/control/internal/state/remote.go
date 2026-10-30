@@ -8,6 +8,7 @@ package state
 // rqlite query, and every write is fenced by state_epoch in the remote batch.
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -52,6 +53,23 @@ type remoteResult struct {
 	LastInsertID int64    `json:"last_insert_id"`
 	Error        string   `json:"error"`
 	ErrorV2      any      `json:"error_v2"`
+	valuesNull   bool     `json:"-"`
+}
+
+func (result *remoteResult) UnmarshalJSON(data []byte) error {
+	type plain remoteResult
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*result = remoteResult(decoded)
+	raw, present := fields["values"]
+	result.valuesNull = present && bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+	return nil
 }
 
 type remoteResponse struct {
@@ -704,12 +722,19 @@ func (r *remoteBackend) query(ctx context.Context, statement string) (remoteResu
 	if err := validateRemoteQueryResult(result.Results[0]); err != nil {
 		return remoteResult{}, err
 	}
+	if result.Results[0].Values == nil {
+		// rqlite omits values when a valid query returns no rows.
+		result.Results[0].Values = [][]any{}
+	}
 	return result.Results[0], nil
 }
 
 func validateRemoteQueryResult(result remoteResult) error {
-	if result.Columns == nil || result.Types == nil || result.Values == nil {
-		return errors.New("rqlite query result is missing columns, types, or values")
+	if result.Columns == nil || result.Types == nil {
+		return errors.New("rqlite query result is missing columns or types")
+	}
+	if result.valuesNull {
+		return errors.New("rqlite query result values is null")
 	}
 	if len(result.Columns) != len(result.Types) {
 		return fmt.Errorf("rqlite query result has %d columns and %d types", len(result.Columns), len(result.Types))
