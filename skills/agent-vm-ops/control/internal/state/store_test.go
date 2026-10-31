@@ -96,6 +96,45 @@ func TestExistingSchemaLifecycleAndOpaqueEpoch(t *testing.T) {
 	}
 }
 
+func TestManagementConfirmationWritesDoNotInvalidateSystemVersion(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	ctx := context.Background()
+	before, err := store.StateEpoch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	confirmation := ManagementConfirmation{
+		ConfirmationDigest: strings.Repeat("a", 64), Subject: "admin@example", Action: "reconcile", Target: "system",
+		TargetVersion: "system:" + before, ParamsDigest: strings.Repeat("b", 64), CreatedAt: "2026-10-31T00:00:00Z", ExpiresAt: "2026-11-01T00:00:00Z",
+	}
+	if err := store.InsertManagementConfirmation(ctx, confirmation); err != nil {
+		t.Fatal(err)
+	}
+	afterInsert, err := store.StateEpoch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterInsert != before {
+		t.Fatalf("confirmation insert advanced system version: %q -> %q", before, afterInsert)
+	}
+	consumed, err := store.ConsumeManagementConfirmation(ctx, confirmation.ConfirmationDigest, confirmation.Subject, confirmation.Action, confirmation.Target, confirmation.TargetVersion, confirmation.ParamsDigest, "2026-10-31T00:01:00Z")
+	if err != nil || !consumed {
+		t.Fatalf("confirmation consume = %v, err=%v", consumed, err)
+	}
+	afterConsume, err := store.StateEpoch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterConsume != before {
+		t.Fatalf("confirmation consume advanced system version: %q -> %q", before, afterConsume)
+	}
+}
+
 func TestMissingDatabaseFailsClosed(t *testing.T) {
 	_, err := Open(filepath.Join(t.TempDir(), "missing.sqlite3"), false)
 	if err == nil {

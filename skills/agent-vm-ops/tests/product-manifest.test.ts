@@ -74,7 +74,7 @@ test("format-4 management manifest requires the Linux product target", () => {
     expect(manifest.format).toBe(4);
     expect(manifest.client_view.transport).toBe("go-request");
     expect(manifest.state_compatibility?.reads).toEqual([
-      "legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1",
+      "legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "principal-identity@1", "session-image-binding@1", "token-revocation@1",
     ]);
     expect(verify_product_bundle(root, manifest)).toEqual(manifest);
     const httpsManifest = structuredClone(manifest);

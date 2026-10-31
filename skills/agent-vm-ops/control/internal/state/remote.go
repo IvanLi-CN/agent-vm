@@ -4,8 +4,10 @@ package state
 // their existing database/sql-shaped implementation, while the adapter uses a
 // short-lived SQLite mirror to evaluate those callbacks and submits the
 // resulting row/schema delta as one rqlite request-level transaction. The
-// mirror is never a second authority: every read refreshes it from a strong
-// rqlite query, and every write is fenced by state_epoch in the remote batch.
+// mirror is never a second authority: every read fences it with strong
+// resource and management-auth epoch queries, and every write is fenced by
+// both epochs in the remote batch. An unchanged pair may skip the expensive
+// schema/table rebuild.
 
 import (
 	"bytes"
@@ -33,10 +35,12 @@ const (
 )
 
 type remoteBackend struct {
-	base   *url.URL
-	client *http.Client
-	mirror *sql.DB
-	mu     sync.Mutex
+	base            *url.URL
+	client          *http.Client
+	mirror          *sql.DB
+	mu              sync.Mutex
+	syncedEpoch     string
+	syncedAuthEpoch string
 }
 
 type remoteStatement struct {
@@ -116,9 +120,10 @@ type remoteTableSnapshot struct {
 }
 
 type remoteSnapshot struct {
-	Objects map[string]remoteSchemaObject
-	Tables  map[string]remoteTableSnapshot
-	Epoch   string
+	Objects   map[string]remoteSchemaObject
+	Tables    map[string]remoteTableSnapshot
+	Epoch     string
+	AuthEpoch string
 }
 
 // SQLiteMigrationGate is the state-layer test boundary for evidence that a
@@ -200,6 +205,11 @@ func (r *remoteBackend) close() error {
 	return r.mirror.Close()
 }
 
+func (r *remoteBackend) invalidateSync() {
+	r.syncedEpoch = ""
+	r.syncedAuthEpoch = ""
+}
+
 func (r *remoteBackend) endpoint(path string, values url.Values) string {
 	copyURL := *r.base
 	copyURL.Path = strings.TrimRight(copyURL.Path, "/") + path
@@ -222,7 +232,10 @@ func (r *remoteBackend) open(ctx context.Context, allowCreate bool) error {
 		for _, statement := range splitSQLStatements(schema) {
 			statements = append(statements, remoteStatement{query: statement})
 		}
-		statements = append(statements, remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('state_epoch', 'initial')"})
+		statements = append(statements,
+			remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('state_epoch', 'initial')"},
+			remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('management_auth_epoch', 'initial')"},
+		)
 		if _, err := r.request(ctx, statements, true); err != nil {
 			return fmt.Errorf("initialize rqlite schema: %w", err)
 		}
@@ -301,6 +314,7 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 		return fmt.Errorf("build canonical management schema: %w", err)
 	}
 	managementPresent := false
+	authPresent := false
 	for _, object := range objects {
 		key := objectKey(object.Type, object.Name)
 		if expected, exists := core[key]; exists {
@@ -314,6 +328,9 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 			return fmt.Errorf("database schema contains unsupported object %s", key)
 		}
 		managementPresent = true
+		if isAuthManagementObject(key) {
+			authPresent = true
+		}
 		if normalizeSchemaSQL(object.SQL) != normalizeSchemaSQL(expected.SQL) {
 			return fmt.Errorf("database schema differs from canonical management object %s", key)
 		}
@@ -324,12 +341,34 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 			actual[objectKey(object.Type, object.Name)] = true
 		}
 		for key := range management {
+			// The principal/session/Token tables were added after the original
+			// management schema. An existing remote database may still expose
+			// the complete legacy management set; EnsureManagementSchema adds
+			// the new tables in one transaction after this read-only preflight.
+			if !authPresent && isAuthManagementObject(key) {
+				continue
+			}
+			// Confirmation records were added after the first durable auth
+			// schema. Keep an already-complete OIDC/session/Token database
+			// open so EnsureManagementSchema can add this table atomically.
+			if authPresent && key == objectKey("table", "management_confirmations") && !actual[key] {
+				continue
+			}
 			if !actual[key] {
 				return fmt.Errorf("database schema missing canonical management object %s", key)
 			}
 		}
 	}
 	return nil
+}
+
+func isAuthManagementObject(key string) bool {
+	switch key {
+	case objectKey("table", "oidc_transactions"), objectKey("table", "browser_sessions"), objectKey("table", "agent_tokens"), objectKey("table", "management_confirmations"):
+		return true
+	default:
+		return false
+	}
 }
 
 func normalizeSchemaSQL(value string) string {
@@ -489,10 +528,28 @@ func (r *remoteBackend) ensureRemoteEpoch(ctx context.Context) error {
 		if err := validateStateEpoch(value); err != nil {
 			return err
 		}
+	} else {
+		r.invalidateSync()
+		if _, err := r.request(ctx, []remoteStatement{{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('state_epoch', 'initial')"}}, true); err != nil {
+			return fmt.Errorf("initialize rqlite state epoch: %w", err)
+		}
+	}
+	authResult, err := r.query(ctx, "SELECT value FROM meta WHERE key = 'management_auth_epoch'")
+	if err != nil {
+		return fmt.Errorf("read rqlite management auth epoch: %w", err)
+	}
+	if len(authResult.Values) > 1 || (len(authResult.Values) == 1 && len(authResult.Values[0]) != 1) {
+		return errors.New("rqlite management auth epoch is not unique")
+	}
+	if len(authResult.Values) == 0 {
+		r.invalidateSync()
+		if _, err := r.request(ctx, []remoteStatement{{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('management_auth_epoch', 'initial')"}}, true); err != nil {
+			return fmt.Errorf("initialize rqlite management auth epoch: %w", err)
+		}
 		return nil
 	}
-	if _, err := r.request(ctx, []remoteStatement{{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('state_epoch', 'initial')"}}, true); err != nil {
-		return fmt.Errorf("initialize rqlite state epoch: %w", err)
+	if err := validateStateEpoch(strings.TrimSpace(fmt.Sprint(authResult.Values[0][0]))); err != nil {
+		return fmt.Errorf("validate rqlite management auth epoch: %w", err)
 	}
 	return nil
 }
@@ -514,6 +571,8 @@ func (r *remoteBackend) ensureManagementSchema(ctx context.Context) error {
 		{name: "managed-image-catalog", version: 1},
 		{name: "session-image-binding", version: 1},
 		{name: "management-operation-audit", version: 1},
+		{name: "principal-identity", version: 1},
+		{name: "token-revocation", version: 1},
 	} {
 		statements = append(statements, remoteStatement{
 			query: "INSERT OR IGNORE INTO state_capabilities(name, version, created_at) VALUES(?, ?, ?)",
@@ -523,7 +582,12 @@ func (r *remoteBackend) ensureManagementSchema(ctx context.Context) error {
 	statements = append(statements,
 		remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('management_selection_revision', '1')"},
 		remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('management_catalog_revision', '1')"},
+		remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('management_auth_epoch', 'initial')"},
 	)
+	// Management bootstrap changes schema and metadata without advancing the
+	// core state_epoch. Force the next sync to rebuild the mirror even when the
+	// epoch itself is unchanged. This also covers an ambiguous request result.
+	r.invalidateSync()
 	if _, err := r.request(ctx, statements, true); err != nil {
 		var statementErr *remoteStatementError
 		stateCommitted := (*bool)(nil)
@@ -584,6 +648,9 @@ func (r *remoteBackend) withWrite(ctx context.Context, fn func(*Tx) error) error
 		if err := fn(tx); err != nil {
 			_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
 			_ = conn.Close()
+			if rollbackErr != nil {
+				r.invalidateSync()
+			}
 			stateCommitted := committed(false)
 			if rollbackErr != nil {
 				stateCommitted = nil
@@ -595,6 +662,9 @@ func (r *remoteBackend) withWrite(ctx context.Context, fn func(*Tx) error) error
 			if _, err := tx.conn.ExecContext(ctx, "INSERT INTO meta(key, value) VALUES('state_epoch', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", newEpoch()); err != nil {
 				_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
 				_ = conn.Close()
+				if rollbackErr != nil {
+					r.invalidateSync()
+				}
 				stateCommitted := committed(false)
 				if rollbackErr != nil {
 					stateCommitted = nil
@@ -602,23 +672,44 @@ func (r *remoteBackend) withWrite(ctx context.Context, fn func(*Tx) error) error
 				return &TransactionError{Phase: "commit", SQLOperation: "state_epoch", StateCommitted: stateCommitted, RollbackError: rollbackErr, Cause: err}
 			}
 		}
+		if tx.authChanged {
+			if _, err := tx.conn.ExecContext(ctx, "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", managementAuthEpochKey, newEpoch()); err != nil {
+				_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
+				_ = conn.Close()
+				if rollbackErr != nil {
+					r.invalidateSync()
+				}
+				stateCommitted := committed(false)
+				if rollbackErr != nil {
+					stateCommitted = nil
+				}
+				return &TransactionError{Phase: "commit", SQLOperation: managementAuthEpochKey, StateCommitted: stateCommitted, RollbackError: rollbackErr, Cause: err}
+			}
+		}
 		if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 			_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
 			_ = conn.Close()
+			r.invalidateSync()
 			return &TransactionError{Phase: "commit", SQLOperation: "commit", StateCommitted: nil, RollbackError: rollbackErr, Cause: err}
 		}
 		tx.closed = true
 		_ = conn.Close()
+		// The local mirror now contains a speculative commit. Keep it invalid
+		// until the remote compare-and-act succeeds or a fresh sync rebuilds it.
+		r.invalidateSync()
 
 		after, err := snapshotDB(ctx, r.mirror)
 		if err != nil {
 			return &TransactionError{Phase: "commit", SQLOperation: "snapshot", StateCommitted: nil, Cause: err}
 		}
 		if snapshotsEqual(before, after) {
+			r.syncedEpoch = after.Epoch
+			r.syncedAuthEpoch = after.AuthEpoch
 			return nil
 		}
 		applied, err := r.applySnapshot(ctx, before, after, before.Epoch, after.Epoch)
 		if err != nil {
+			r.invalidateSync()
 			// Once the HTTP request has been sent, a transport failure cannot
 			// establish whether rqlite committed. Preserve the operation as
 			// unknown instead of retrying it under a new request.
@@ -635,6 +726,8 @@ func (r *remoteBackend) withWrite(ctx context.Context, fn func(*Tx) error) error
 			return &TransactionError{Phase: "commit", SQLOperation: "rqlite_transaction", StateCommitted: nil, Cause: err}
 		}
 		if applied {
+			r.syncedEpoch = after.Epoch
+			r.syncedAuthEpoch = after.AuthEpoch
 			return nil
 		}
 		// Another slot committed after this mirror was refreshed. The
@@ -856,6 +949,13 @@ func (r *remoteBackend) syncLocked(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		startAuthEpoch, err := r.remoteAuthEpoch(ctx)
+		if err != nil {
+			return err
+		}
+		if startEpoch == r.syncedEpoch && startAuthEpoch == r.syncedAuthEpoch {
+			return nil
+		}
 		objects, err := r.remoteSchema(ctx)
 		if err != nil {
 			return err
@@ -870,7 +970,13 @@ func (r *remoteBackend) syncLocked(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if startEpoch == endEpoch {
+		endAuthEpoch, err := r.remoteAuthEpoch(ctx)
+		if err != nil {
+			return err
+		}
+		if startEpoch == endEpoch && startAuthEpoch == endAuthEpoch {
+			r.syncedEpoch = endEpoch
+			r.syncedAuthEpoch = endAuthEpoch
 			return nil
 		}
 	}
@@ -888,6 +994,24 @@ func (r *remoteBackend) remoteEpoch(ctx context.Context) (string, error) {
 	value := strings.TrimSpace(fmt.Sprint(result.Values[0][0]))
 	if err := validateStateEpoch(value); err != nil {
 		return "", err
+	}
+	return value, nil
+}
+
+func (r *remoteBackend) remoteAuthEpoch(ctx context.Context) (string, error) {
+	result, err := r.query(ctx, "SELECT value FROM meta WHERE key = 'management_auth_epoch'")
+	if err != nil {
+		return "", err
+	}
+	if len(result.Values) == 0 {
+		return "initial", nil
+	}
+	if len(result.Values) != 1 || len(result.Values[0]) != 1 {
+		return "", errors.New("rqlite management auth epoch is missing or not unique")
+	}
+	value := strings.TrimSpace(fmt.Sprint(result.Values[0][0]))
+	if err := validateStateEpoch(value); err != nil {
+		return "", fmt.Errorf("management auth epoch: %w", err)
 	}
 	return value, nil
 }
@@ -990,7 +1114,7 @@ func orderedTables(objects []remoteSchemaObject) []string {
 			present[object.Name] = true
 		}
 	}
-	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "managed_image_tombstones", "image_references", "management_operations", "management_audit"}
+	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "managed_image_tombstones", "image_references", "management_operations", "management_audit", "oidc_transactions", "browser_sessions", "agent_tokens", "management_confirmations"}
 	values := make([]string, 0, len(present))
 	for _, table := range order {
 		if present[table] {
@@ -1206,9 +1330,10 @@ func snapshotConn(ctx context.Context, conn *sql.Conn) (remoteSnapshot, error) {
 		return remoteSnapshot{}, err
 	}
 	snapshot := remoteSnapshot{
-		Objects: make(map[string]remoteSchemaObject, len(objects)),
-		Tables:  make(map[string]remoteTableSnapshot),
-		Epoch:   "initial",
+		Objects:   make(map[string]remoteSchemaObject, len(objects)),
+		Tables:    make(map[string]remoteTableSnapshot),
+		Epoch:     "initial",
+		AuthEpoch: "initial",
 	}
 	for _, object := range objects {
 		snapshot.Objects[objectKey(object.Type, object.Name)] = object
@@ -1249,9 +1374,11 @@ func snapshotConn(ctx context.Context, conn *sql.Conn) (remoteSnapshot, error) {
 		valueIndex := indexOf(table.Columns, "value")
 		if keyIndex >= 0 && valueIndex >= 0 {
 			for _, row := range table.Rows {
-				if fmt.Sprint(row.Values[keyIndex]) == "state_epoch" {
+				switch fmt.Sprint(row.Values[keyIndex]) {
+				case "state_epoch":
 					snapshot.Epoch = strings.TrimSpace(fmt.Sprint(row.Values[valueIndex]))
-					break
+				case managementAuthEpochKey:
+					snapshot.AuthEpoch = strings.TrimSpace(fmt.Sprint(row.Values[valueIndex]))
 				}
 			}
 		}
@@ -1325,7 +1452,7 @@ func snapshotRowKey(values []any, rowID int64, table string, primaryKey []int) s
 }
 
 func snapshotsEqual(left, right remoteSnapshot) bool {
-	if left.Epoch != right.Epoch || len(left.Objects) != len(right.Objects) || len(left.Tables) != len(right.Tables) {
+	if left.Epoch != right.Epoch || left.AuthEpoch != right.AuthEpoch || len(left.Objects) != len(right.Objects) || len(left.Tables) != len(right.Tables) {
 		return false
 	}
 	for key, object := range left.Objects {
@@ -1394,14 +1521,31 @@ func equalStrings(left, right []string) bool {
 }
 
 func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteSnapshot, expectedEpoch, targetEpoch string) (bool, error) {
+	if expectedEpoch == "" {
+		expectedEpoch = before.Epoch
+	}
 	if targetEpoch == "" {
 		targetEpoch = after.Epoch
 	}
+	if before.AuthEpoch == "" {
+		before.AuthEpoch = "initial"
+	}
+	if after.AuthEpoch == "" {
+		after.AuthEpoch = "initial"
+	}
+	expectedAuthEpoch := before.AuthEpoch
+	targetAuthEpoch := after.AuthEpoch
 	if err := validateStateEpoch(expectedEpoch); err != nil {
 		return false, fmt.Errorf("invalid expected state epoch: %w", err)
 	}
 	if err := validateStateEpoch(targetEpoch); err != nil {
 		return false, fmt.Errorf("invalid target state epoch: %w", err)
+	}
+	if err := validateStateEpoch(expectedAuthEpoch); err != nil {
+		return false, fmt.Errorf("invalid expected management auth epoch: %w", err)
+	}
+	if err := validateStateEpoch(targetAuthEpoch); err != nil {
+		return false, fmt.Errorf("invalid target management auth epoch: %w", err)
 	}
 	statements := make([]remoteStatement, 0)
 
@@ -1422,6 +1566,9 @@ func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteS
 	if !snapshotHasStateEpoch(before) && snapshotHasStateEpoch(after) {
 		statements = append(statements, remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('state_epoch', 'initial')"})
 	}
+	if !snapshotHasManagementAuthEpoch(before) {
+		statements = append(statements, remoteStatement{query: "INSERT OR IGNORE INTO meta(key, value) VALUES('management_auth_epoch', 'initial')"})
+	}
 
 	for _, tableName := range orderedSnapshotTables(after.Tables) {
 		afterTable := after.Tables[tableName]
@@ -1429,47 +1576,59 @@ func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteS
 		if exists && (!equalStrings(beforeTable.Columns, afterTable.Columns) || !equalIntSlices(beforeTable.PrimaryKey, afterTable.PrimaryKey)) {
 			return false, fmt.Errorf("rqlite table layout changed for %s", tableName)
 		}
-		if err := appendTableDiff(&statements, beforeTable, exists, afterTable, expectedEpoch); err != nil {
+		if err := appendTableDiff(&statements, beforeTable, exists, afterTable, expectedEpoch, before.AuthEpoch); err != nil {
 			return false, err
 		}
 	}
 	guardKey := "__agent_vm_epoch_guard_" + randomHex(12)
-	proofKey := guardKey + "_proof"
-	guardIndex := len(statements)
+	stateProofKey := guardKey + "_state_proof"
+	authProofKey := guardKey + "_auth_proof"
 	statements = append(statements,
 		remoteStatement{
-			query:      "INSERT INTO meta(key, value) SELECT ?, CASE WHEN EXISTS (SELECT 1 FROM meta WHERE key = 'state_epoch' AND value = ?) THEN 'ok' ELSE NULL END",
-			args:       []any{guardKey, expectedEpoch},
+			query:      "INSERT INTO meta(key, value) SELECT ?, CASE WHEN EXISTS (SELECT 1 FROM meta WHERE key = 'state_epoch' AND value = ?) AND EXISTS (SELECT 1 FROM meta WHERE key = 'management_auth_epoch' AND value = ?) THEN 'ok' ELSE NULL END",
+			args:       []any{guardKey, expectedEpoch, expectedAuthEpoch},
 			epochGuard: true,
 		},
 		remoteStatement{
-			query: "UPDATE meta SET value = ? WHERE key = 'state_epoch' AND value = ?",
-			args:  []any{targetEpoch, expectedEpoch},
+			query:      "UPDATE meta SET value = ? WHERE key = 'state_epoch' AND value = ?",
+			args:       []any{targetEpoch, expectedEpoch},
+			epochGuard: true,
 		},
+		remoteStatement{
+			query:      "INSERT INTO meta(key, value) SELECT ?, CASE WHEN changes() = 1 THEN 'ok' ELSE NULL END",
+			args:       []any{stateProofKey},
+			epochGuard: true,
+		},
+		remoteStatement{
+			query:      "UPDATE meta SET value = ? WHERE key = 'management_auth_epoch' AND value = ?",
+			args:       []any{targetAuthEpoch, expectedAuthEpoch},
+			epochGuard: true,
+		},
+		remoteStatement{
+			query:      "INSERT INTO meta(key, value) SELECT ?, CASE WHEN changes() = 1 THEN 'ok' ELSE NULL END",
+			args:       []any{authProofKey},
+			epochGuard: true,
+		},
+		remoteStatement{query: "DELETE FROM meta WHERE key IN (?, ?, ?)", args: []any{guardKey, stateProofKey, authProofKey}},
+	)
+	if _, err := r.request(ctx, statements, true); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func appendRowMutationProof(statements *[]remoteStatement) {
+	// Keep the row-count proof inside the same rqlite transaction. A stale row
+	// makes the NOT NULL proof insert fail, rolling back the whole request.
+	proofKey := "__agent_vm_row_guard_" + randomHex(12)
+	*statements = append(*statements,
 		remoteStatement{
 			query:      "INSERT INTO meta(key, value) SELECT ?, CASE WHEN changes() = 1 THEN 'ok' ELSE NULL END",
 			args:       []any{proofKey},
 			epochGuard: true,
 		},
-		remoteStatement{query: "DELETE FROM meta WHERE key IN (?, ?)", args: []any{guardKey, proofKey}},
+		remoteStatement{query: "DELETE FROM meta WHERE key = ?", args: []any{proofKey}},
 	)
-	response, err := r.request(ctx, statements, true)
-	if err != nil {
-		return false, err
-	}
-	if len(response.Results) <= guardIndex+1 {
-		return false, errors.New("rqlite transaction did not return its epoch update")
-	}
-	// /db/execute returns statement metadata rather than row values. The
-	// guarded update and the immediately following proof statement establish
-	// that the expected epoch existed and was advanced inside this same
-	// request-level transaction. A stale epoch makes the proof statement fail,
-	// which rolls back DDL and every row change in the batch.
-	update := response.Results[guardIndex+1]
-	if update.RowsAffected != 1 {
-		return false, errors.New("rqlite transaction did not advance its epoch")
-	}
-	return true, nil
 }
 
 func snapshotHasStateEpoch(snapshot remoteSnapshot) bool {
@@ -1479,6 +1638,19 @@ func snapshotHasStateEpoch(snapshot remoteSnapshot) bool {
 	}
 	for _, row := range table.Rows {
 		if isStateEpochRow(table, row) {
+			return true
+		}
+	}
+	return false
+}
+
+func snapshotHasManagementAuthEpoch(snapshot remoteSnapshot) bool {
+	table, exists := snapshot.Tables["meta"]
+	if !exists {
+		return false
+	}
+	for _, row := range table.Rows {
+		if isManagementAuthEpochRow(table, row) {
 			return true
 		}
 	}
@@ -1511,6 +1683,35 @@ func ensureSnapshotStateEpoch(snapshot *remoteSnapshot) error {
 	return nil
 }
 
+func ensureSnapshotManagementAuthEpoch(snapshot *remoteSnapshot) error {
+	if snapshotHasManagementAuthEpoch(*snapshot) {
+		if snapshot.AuthEpoch == "" {
+			snapshot.AuthEpoch = "initial"
+		}
+		return nil
+	}
+	table, exists := snapshot.Tables["meta"]
+	if !exists {
+		return errors.New("management auth epoch requires a meta table")
+	}
+	keyIndex := indexOf(table.Columns, "key")
+	valueIndex := indexOf(table.Columns, "value")
+	if keyIndex < 0 || valueIndex < 0 {
+		return errors.New("management auth epoch requires key and value columns")
+	}
+	values := make([]any, len(table.Columns))
+	values[keyIndex] = managementAuthEpochKey
+	values[valueIndex] = "initial"
+	if table.Rows == nil {
+		table.Rows = make(map[string]remoteRow)
+	}
+	key := snapshotRowKey(values, 0, table.Name, table.PrimaryKey)
+	table.Rows[key] = remoteRow{Values: values, HasRowID: len(table.PrimaryKey) == 0}
+	snapshot.Tables["meta"] = table
+	snapshot.AuthEpoch = "initial"
+	return nil
+}
+
 func afterObjectsMissing(before, after map[string]remoteSchemaObject) []remoteSchemaObject {
 	values := make([]remoteSchemaObject, 0)
 	for key, object := range after {
@@ -1530,7 +1731,7 @@ func orderedSnapshotTables(tables map[string]remoteTableSnapshot) []string {
 	return values
 }
 
-func appendTableDiff(statements *[]remoteStatement, before remoteTableSnapshot, beforeExists bool, after remoteTableSnapshot, expectedEpoch string) error {
+func appendTableDiff(statements *[]remoteStatement, before remoteTableSnapshot, beforeExists bool, after remoteTableSnapshot, expectedEpoch, expectedAuthEpoch string) error {
 	if !beforeExists {
 		before = remoteTableSnapshot{Name: after.Name, Columns: after.Columns, PrimaryKey: after.PrimaryKey, Rows: map[string]remoteRow{}}
 	}
@@ -1539,33 +1740,33 @@ func appendTableDiff(statements *[]remoteStatement, before remoteTableSnapshot, 
 		if _, exists := after.Rows[key]; exists {
 			continue
 		}
-		if isStateEpochRow(after, row) {
+		if isEpochRow(after, row) {
 			continue
 		}
-		appendDelete(statements, after, row, expectedEpoch)
+		appendDelete(statements, after, row, expectedEpoch, expectedAuthEpoch)
 	}
 	for _, key := range sortedSnapshotRowKeys(after) {
 		row := after.Rows[key]
 		previous, exists := before.Rows[key]
 		if !exists {
-			if isStateEpochRow(after, row) {
+			if isEpochRow(after, row) {
 				continue
 			}
-			appendInsert(statements, after, row, expectedEpoch)
+			appendInsert(statements, after, row, expectedEpoch, expectedAuthEpoch)
 			continue
 		}
-		if isStateEpochRow(after, row) {
+		if isEpochRow(after, row) {
 			continue
 		}
 		if rowsEqual(previous, row) {
 			continue
 		}
 		if previous.HasRowID != row.HasRowID || (previous.HasRowID && previous.RowID != row.RowID) {
-			appendDelete(statements, after, previous, expectedEpoch)
-			appendInsert(statements, after, row, expectedEpoch)
+			appendDelete(statements, after, previous, expectedEpoch, expectedAuthEpoch)
+			appendInsert(statements, after, row, expectedEpoch, expectedAuthEpoch)
 			continue
 		}
-		if err := appendUpdate(statements, after, previous, row, expectedEpoch); err != nil {
+		if err := appendUpdate(statements, after, previous, row, expectedEpoch, expectedAuthEpoch); err != nil {
 			return err
 		}
 	}
@@ -1595,17 +1796,30 @@ func isStateEpochRow(table remoteTableSnapshot, row remoteRow) bool {
 	return keyIndex >= 0 && keyIndex < len(row.Values) && fmt.Sprint(row.Values[keyIndex]) == "state_epoch"
 }
 
-func epochGuard(expectedEpoch string) (string, []any) {
-	return `EXISTS (SELECT 1 FROM "meta" WHERE "key" = 'state_epoch' AND "value" = ?)`, []any{expectedEpoch}
+func isManagementAuthEpochRow(table remoteTableSnapshot, row remoteRow) bool {
+	if table.Name != "meta" {
+		return false
+	}
+	keyIndex := indexOf(table.Columns, "key")
+	return keyIndex >= 0 && keyIndex < len(row.Values) && fmt.Sprint(row.Values[keyIndex]) == managementAuthEpochKey
 }
 
-func appendDelete(statements *[]remoteStatement, table remoteTableSnapshot, row remoteRow, expectedEpoch string) {
+func isEpochRow(table remoteTableSnapshot, row remoteRow) bool {
+	return isStateEpochRow(table, row) || isManagementAuthEpochRow(table, row)
+}
+
+func epochGuard(expectedEpoch, expectedAuthEpoch string) (string, []any) {
+	return `EXISTS (SELECT 1 FROM "meta" WHERE "key" = 'state_epoch' AND "value" = ?) AND EXISTS (SELECT 1 FROM "meta" WHERE "key" = 'management_auth_epoch' AND "value" = ?)`, []any{expectedEpoch, expectedAuthEpoch}
+}
+
+func appendDelete(statements *[]remoteStatement, table remoteTableSnapshot, row remoteRow, expectedEpoch, expectedAuthEpoch string) {
 	where, args := rowPredicate(table, row)
-	guard, guardArgs := epochGuard(expectedEpoch)
-	*statements = append(*statements, remoteStatement{query: "DELETE FROM " + quoteIdentifier(table.Name) + " WHERE " + where + " AND " + guard, args: append(args, guardArgs...)})
+	guard, guardArgs := epochGuard(expectedEpoch, expectedAuthEpoch)
+	*statements = append(*statements, remoteStatement{query: "DELETE FROM " + quoteIdentifier(table.Name) + " WHERE " + where + " AND " + guard, args: append(args, guardArgs...), epochGuard: true})
+	appendRowMutationProof(statements)
 }
 
-func appendInsert(statements *[]remoteStatement, table remoteTableSnapshot, row remoteRow, expectedEpoch string) {
+func appendInsert(statements *[]remoteStatement, table remoteTableSnapshot, row remoteRow, expectedEpoch, expectedAuthEpoch string) {
 	columns := append([]string(nil), table.Columns...)
 	values := append([]any(nil), row.Values...)
 	if row.HasRowID {
@@ -1616,12 +1830,13 @@ func appendInsert(statements *[]remoteStatement, table remoteTableSnapshot, row 
 	for index := range placeholders {
 		placeholders[index] = "?"
 	}
-	guard, guardArgs := epochGuard(expectedEpoch)
+	guard, guardArgs := epochGuard(expectedEpoch, expectedAuthEpoch)
 	query := "INSERT INTO " + quoteIdentifier(table.Name) + "(" + joinIdentifiers(columns) + ") SELECT " + strings.Join(placeholders, ", ") + " WHERE " + guard
-	*statements = append(*statements, remoteStatement{query: query, args: append(values, guardArgs...)})
+	*statements = append(*statements, remoteStatement{query: query, args: append(values, guardArgs...), epochGuard: true})
+	appendRowMutationProof(statements)
 }
 
-func appendUpdate(statements *[]remoteStatement, table remoteTableSnapshot, previous, current remoteRow, expectedEpoch string) error {
+func appendUpdate(statements *[]remoteStatement, table remoteTableSnapshot, previous, current remoteRow, expectedEpoch, expectedAuthEpoch string) error {
 	primary := make(map[int]bool, len(table.PrimaryKey))
 	for _, index := range table.PrimaryKey {
 		primary[index] = true
@@ -1639,10 +1854,11 @@ func appendUpdate(statements *[]remoteStatement, table remoteTableSnapshot, prev
 		return fmt.Errorf("row changed without an updateable column in %s", table.Name)
 	}
 	where, whereArgs := rowPredicate(table, previous)
-	guard, guardArgs := epochGuard(expectedEpoch)
+	guard, guardArgs := epochGuard(expectedEpoch, expectedAuthEpoch)
 	args = append(args, whereArgs...)
 	args = append(args, guardArgs...)
-	*statements = append(*statements, remoteStatement{query: "UPDATE " + quoteIdentifier(table.Name) + " SET " + strings.Join(sets, ", ") + " WHERE " + where + " AND " + guard, args: args})
+	*statements = append(*statements, remoteStatement{query: "UPDATE " + quoteIdentifier(table.Name) + " SET " + strings.Join(sets, ", ") + " WHERE " + where + " AND " + guard, args: args, epochGuard: true})
+	appendRowMutationProof(statements)
 	return nil
 }
 
@@ -1710,6 +1926,9 @@ func migrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, ga
 	if err := ensureSnapshotStateEpoch(&sourceSnapshot); err != nil {
 		return fmt.Errorf("initialize SQLite state epoch: %w", err)
 	}
+	if err := ensureSnapshotManagementAuthEpoch(&sourceSnapshot); err != nil {
+		return fmt.Errorf("initialize SQLite management auth epoch: %w", err)
+	}
 	if err := validateStateEpoch(sourceSnapshot.Epoch); err != nil {
 		return fmt.Errorf("validate SQLite state epoch: %w", err)
 	}
@@ -1726,16 +1945,17 @@ func migrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, ga
 		return fmt.Errorf("probe rqlite target: %w", err)
 	}
 	targetSnapshot := remoteSnapshot{
-		Objects: make(map[string]remoteSchemaObject),
-		Tables:  make(map[string]remoteTableSnapshot),
-		Epoch:   "initial",
+		Objects:   make(map[string]remoteSchemaObject),
+		Tables:    make(map[string]remoteTableSnapshot),
+		Epoch:     "initial",
+		AuthEpoch: "initial",
 	}
 	if len(targetObjects) != 0 {
 		if err := requireSupportedSchema(ctx, targetObjects); err != nil {
 			return fmt.Errorf("validate rqlite target schema: %w", err)
 		}
-		if _, err := target.remote.remoteEpoch(ctx); err != nil {
-			return fmt.Errorf("validate rqlite target epoch: %w", err)
+		if err := target.remote.ensureRemoteEpoch(ctx); err != nil {
+			return fmt.Errorf("validate rqlite epochs: %w", err)
 		}
 		if err := target.remote.syncLocked(ctx); err != nil {
 			return fmt.Errorf("refresh rqlite target: %w", err)
@@ -1935,7 +2155,7 @@ func pristineRemoteTarget(ctx context.Context, snapshot remoteSnapshot) (bool, e
 	}
 	for table, value := range snapshot.Tables {
 		if table == "meta" {
-			if len(value.Rows) != 1 {
+			if len(value.Rows) != 1 && len(value.Rows) != 2 {
 				return false, nil
 			}
 			valueIndex := indexOf(value.Columns, "value")
@@ -1943,7 +2163,7 @@ func pristineRemoteTarget(ctx context.Context, snapshot remoteSnapshot) (bool, e
 				return false, nil
 			}
 			for key, row := range value.Rows {
-				if !isStateEpochRow(value, row) || key == "" || valueIndex >= len(row.Values) || fmt.Sprint(row.Values[valueIndex]) != "initial" {
+				if key == "" || valueIndex >= len(row.Values) || fmt.Sprint(row.Values[valueIndex]) != "initial" || (!isStateEpochRow(value, row) && !isManagementAuthEpochRow(value, row)) {
 					return false, nil
 				}
 			}

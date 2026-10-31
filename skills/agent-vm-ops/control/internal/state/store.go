@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS audit (
 
 const missingDBCode = "database_missing"
 
+const managementAuthEpochKey = "management_auth_epoch"
+
 var stateEpochHex = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 type StateEpochError struct {
@@ -202,9 +204,10 @@ type Store struct {
 }
 
 type Tx struct {
-	conn    *sql.Conn
-	changed bool
-	closed  bool
+	conn        *sql.Conn
+	changed     bool
+	authChanged bool
+	closed      bool
 }
 
 // LockImageSelection serializes default-image changes with lifecycle
@@ -326,9 +329,13 @@ func (s *Store) initialize(ctx context.Context) error {
 		} else if err != nil {
 			return fmt.Errorf("read state epoch: %w", err)
 		}
+		if _, err := tx.exec("INSERT OR IGNORE INTO meta(key, value) VALUES(?, 'initial')", managementAuthEpochKey); err != nil {
+			return fmt.Errorf("initialize management auth epoch: %w", err)
+		}
 		// Schema/bootstrap writes establish the known initial sentinel; the
 		// first business mutation receives an opaque token on its commit.
 		tx.changed = false
+		tx.authChanged = false
 		return nil
 	})
 }
@@ -429,6 +436,16 @@ func (s *Store) withWrite(ctx context.Context, fn func(*Tx) error) error {
 			return &TransactionError{Phase: "commit", SQLOperation: "state_epoch", StateCommitted: stateCommitted, RollbackError: rollbackErr, Cause: err}
 		}
 	}
+	if tx.authChanged {
+		if _, err := tx.conn.ExecContext(ctx, "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", managementAuthEpochKey, newEpoch()); err != nil {
+			_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
+			stateCommitted := committed(false)
+			if rollbackErr != nil {
+				stateCommitted = nil
+			}
+			return &TransactionError{Phase: "commit", SQLOperation: managementAuthEpochKey, StateCommitted: stateCommitted, RollbackError: rollbackErr, Cause: err}
+		}
+	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
 		return &TransactionError{Phase: "commit", SQLOperation: "commit", StateCommitted: nil, RollbackError: rollbackErr, Cause: err}
@@ -438,13 +455,29 @@ func (s *Store) withWrite(ctx context.Context, fn func(*Tx) error) error {
 }
 
 func (tx *Tx) exec(query string, args ...any) (sql.Result, error) {
+	return tx.execWithEpoch(true, query, args...)
+}
+
+// execWithoutEpoch records a durable authorization-row change without
+// advancing the shared state epoch. The transaction rotates the separate
+// management auth epoch instead, so confirmation latches do not invalidate the
+// resource version returned by their own preview.
+func (tx *Tx) execWithoutEpoch(query string, args ...any) (sql.Result, error) {
+	return tx.execWithEpoch(false, query, args...)
+}
+
+func (tx *Tx) execWithEpoch(advanceEpoch bool, query string, args ...any) (sql.Result, error) {
 	if tx.closed {
 		return nil, errors.New("transaction is closed")
 	}
 	result, err := tx.conn.ExecContext(context.Background(), query, args...)
 	if err == nil {
 		if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows > 0 {
-			tx.changed = true
+			if advanceEpoch {
+				tx.changed = true
+			} else if rowsErr == nil {
+				tx.authChanged = true
+			}
 		}
 	}
 	return result, err
