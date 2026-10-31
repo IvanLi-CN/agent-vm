@@ -150,6 +150,7 @@ mkdir -p -- \
   "$systemd_root/etc/systemd/system" \
   "$systemd_root/etc/agent-vm-native/slots/test_instance" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/bin" \
+  "$systemd_root/usr/bin" \
   "$systemd_root/usr/local/bin"
 cp "$unit_dir/agent-vm-rqlite.service" "$unit_dir/agent-vm-native@.service" "$unit_dir/agent-vm-caddy.service" "$systemd_root/etc/systemd/system/"
 touch \
@@ -157,8 +158,8 @@ touch \
   "$systemd_root/etc/agent-vm-native/slots/test_instance/config.json" \
   "$systemd_root/opt/agent-vm-native/release-manifest.json" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/release-manifest.json"
-touch "$systemd_root/usr/local/bin/caddy" "$systemd_root/usr/local/bin/rqlited" "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control"
-chmod 0755 "$systemd_root/usr/local/bin/caddy" "$systemd_root/usr/local/bin/rqlited" "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control"
+touch "$systemd_root/usr/bin/test" "$systemd_root/usr/local/bin/caddy" "$systemd_root/usr/local/bin/rqlited" "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control"
+chmod 0755 "$systemd_root/usr/bin/test" "$systemd_root/usr/local/bin/caddy" "$systemd_root/usr/local/bin/rqlited" "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control"
 printf '%s\n' \
   'root:x:0:0:root:/root:/bin/sh' \
   'caddy:x:995:995:caddy:/var/lib/caddy:/usr/sbin/nologin' \
@@ -189,6 +190,11 @@ rqlite_url="https://github.com/rqlite/rqlite/releases/download/v10.5.2/rqlite-v1
 rqlite_sha256="1a04a7c2c542e8e1c1347bd31af0fa9ef7043febb3c4d1806d36bc1702c6fa0f"
 curl --fail --silent --show-error --location --retry 3 --output "$rqlite_archive" "$rqlite_url"
 printf '%s  %s\n' "$rqlite_sha256" "$rqlite_archive" | sha256sum --check --status - || fail "rqlite checksum failed"
+rqlite_arm64_archive="$proof_dir/rqlite-arm64.tar.gz"
+rqlite_arm64_url="https://github.com/rqlite/rqlite/releases/download/v10.5.2/rqlite-v10.5.2-linux-arm64.tar.gz"
+rqlite_arm64_sha256="44b4bd7ca39720dee3b916f9ef59da117c07ddc008704ac25e56385e56951b8a"
+curl --fail --silent --show-error --location --retry 3 --output "$rqlite_arm64_archive" "$rqlite_arm64_url"
+printf '%s  %s\n' "$rqlite_arm64_sha256" "$rqlite_arm64_archive" | sha256sum --check --status - || fail "rqlite arm64 checksum failed"
 mkdir -p -- "$proof_dir/rqlite"
 tar --extract --gzip --file "$rqlite_archive" --directory "$proof_dir/rqlite"
 rqlited="$proof_dir/rqlite/rqlite-v10.5.2-linux-amd64/rqlited"
@@ -263,21 +269,107 @@ INSERT INTO meta(key, value) VALUES ('state_epoch', 'epoch-1'), ('generation', '
 connection.commit()
 connection.close()
 PY
+evidence_private_key="$proof_dir/evidence-private.pem"
+evidence_public_key="$proof_dir/evidence-public.pem"
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$evidence_private_key" >/dev/null 2>&1
+openssl pkey -in "$evidence_private_key" -pubout -out "$evidence_public_key" >/dev/null 2>&1
+chmod 0600 "$evidence_private_key" "$evidence_public_key"
+
+write_evidence_payload() {
+  local output_path="$1"
+  local evidence_id="$2"
+  local workers_quiescent="$3"
+  local source_sha256="$4"
+  local source_size="$5"
+  local trusted_commit="$6"
+  local state_epoch="$7"
+  local state_generation="$8"
+  local tail_verified="$9"
+  local backup_sha256="${10}"
+  python3 - "$output_path" "$evidence_id" "$workers_quiescent" "$source_sha256" "$source_size" "$trusted_commit" "$state_epoch" "$state_generation" "$tail_verified" "$backup_sha256" <<'PY'
+import json
+import sys
+from datetime import datetime, timedelta, timezone
+
+output, evidence_id, workers, source_sha256, source_size, trusted_commit, state_epoch, state_generation, tail_verified, backup_sha256 = sys.argv[1:]
+now = datetime.now(timezone.utc)
+payload = {
+    "schema_version": 1,
+    "producer": "agent-vm-control",
+    "evidence_id": evidence_id,
+    "state_write_fenced": True,
+    "workers_quiescent": workers == "true",
+    "sqlite_writers_closed": True,
+    "release_fence_path": "/run/agent-vm-native/release-activation.fence",
+    "fence_generation": 1,
+    "state_epoch": state_epoch,
+    "state_generation": state_generation,
+    "trusted_commit": trusted_commit,
+    "observed_at": now.isoformat().replace("+00:00", "Z"),
+    "expires_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+}
+if source_sha256 != "-":
+    payload["source_sha256"] = source_sha256
+    payload["source_size"] = int(source_size)
+if tail_verified != "-":
+    payload["tail_verified"] = tail_verified == "true"
+    payload["coverage_boundary_verified"] = True
+    payload["last_verified_commit"] = trusted_commit
+    payload["backup_sha256"] = backup_sha256
+with open(output, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+PY
+}
+
+sign_evidence() {
+  local payload_path="$1"
+  local evidence_path="$2"
+  local canonical_path="${payload_path}.canonical"
+  local signature_path="${payload_path}.sig"
+  cp "$payload_path" "$canonical_path"
+  openssl dgst -sha256 -sign "$evidence_private_key" -out "$signature_path" "$canonical_path"
+  local signature
+  signature="$(openssl base64 -A -in "$signature_path")"
+  python3 - "$payload_path" "$evidence_path" "$signature" <<'PY'
+import json
+import sys
+
+payload_path, evidence_path, signature = sys.argv[1:]
+with open(payload_path, encoding="utf-8") as handle:
+    payload = json.load(handle)
+with open(evidence_path, "w", encoding="utf-8") as handle:
+    json.dump({"payload": payload, "signature": signature}, handle, sort_keys=True, separators=(",", ":"))
+PY
+  chmod 0600 "$evidence_path"
+}
+
+sqlite_source_sha256="$(sha256sum "$sqlite_source" | awk '{print $1}')"
+sqlite_source_size="$(stat -c '%s' "$sqlite_source")"
 invalid_evidence="$proof_dir/invalid-evidence.json"
-printf '{"evidence_id":"invalid","state_write_fenced":true,"workers_quiescent":false,"sqlite_writers_closed":true}\n' >"$invalid_evidence"
+write_evidence_payload "$proof_dir/invalid-payload.json" invalid-deployment-0001 false "$sqlite_source_sha256" "$sqlite_source_size" commit-1 epoch-1 7 - -
+sign_evidence "$proof_dir/invalid-payload.json" "$invalid_evidence"
 if bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.ts" \
-  preflight --source "$sqlite_source" --evidence "$invalid_evidence" --output-dir "$proof_dir/invalid-output" >/dev/null 2>&1; then
+  preflight --source "$sqlite_source" --evidence "$invalid_evidence" --evidence-public-key "$evidence_public_key" --output-dir "$proof_dir/invalid-output" >/dev/null 2>&1; then
   fail "migration preflight accepted incomplete fence evidence"
 fi
 evidence="$proof_dir/evidence.json"
-printf '{"evidence_id":"isolated-deployment-0001","trusted_commit":"commit-1","state_write_fenced":true,"workers_quiescent":true,"sqlite_writers_closed":true}\n' >"$evidence"
+write_evidence_payload "$proof_dir/evidence-payload.json" isolated-deployment-0001 true "$sqlite_source_sha256" "$sqlite_source_size" commit-1 epoch-1 7 - -
+sign_evidence "$proof_dir/evidence-payload.json" "$evidence"
 migration_dir="$proof_dir/migration"
 bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.ts" \
-  preflight --source "$sqlite_source" --evidence "$evidence" --output-dir "$migration_dir" >"$proof_dir/migration.json"
+  preflight --source "$sqlite_source" --evidence "$evidence" --evidence-public-key "$evidence_public_key" --output-dir "$migration_dir" >"$proof_dir/migration.json"
+backup_sha256="$(python3 - "$migration_dir/snapshot-manifest.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["backup_sha256"])
+PY
+)"
 tail_evidence="$proof_dir/tail-evidence.json"
-printf '{"evidence_id":"isolated-deployment-0002","tail_verified":true,"last_verified_commit":"commit-1","state_write_fenced":true,"workers_quiescent":true,"sqlite_writers_closed":true}\n' >"$tail_evidence"
+write_evidence_payload "$proof_dir/tail-payload.json" isolated-deployment-0002 true - - commit-1 epoch-1 7 true "$backup_sha256"
+sign_evidence "$proof_dir/tail-payload.json" "$tail_evidence"
 bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.ts" \
   restore-check --backup-manifest "$migration_dir/snapshot-manifest.json" \
-  --tail-evidence "$tail_evidence" --output "$proof_dir/restore.json" >"$proof_dir/restore-result.json"
+  --tail-evidence "$tail_evidence" --evidence-public-key "$evidence_public_key" --output "$proof_dir/restore.json" >"$proof_dir/restore-result.json"
 
 printf '{"schema_version":1,"verdict":"pass","caddy":"2.11.7","rqlite":"10.5.2","checks":["pinned artifact checksums","CA and leaf certificates","Caddy configuration","systemd units","authenticated TLS rqlite","blue-green cutover guard","evidence-gated snapshot","restore admissibility"]}\n'

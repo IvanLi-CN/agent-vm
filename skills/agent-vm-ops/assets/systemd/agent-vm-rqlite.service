@@ -8,6 +8,7 @@ Before=agent-vm-native@blue.service agent-vm-native@green.service
 Type=simple
 User=agent-vm-rqlite
 Group=agent-vm-rqlite
+SupplementaryGroups=agent-vm-web
 ExecStart=/usr/local/bin/rqlited -node-id agent-vm-state -http-addr 127.0.0.1:4001 -raft-addr 127.0.0.1:4002 -auth /etc/agent-vm-native/rqlite/auth.json -http-cert /etc/agent-vm-native/tls/rqlite/server.crt -http-key /etc/agent-vm-native/tls/rqlite/server.key /var/lib/agent-vm-native/rqlite
 Restart=on-failure
 RestartSec=2s

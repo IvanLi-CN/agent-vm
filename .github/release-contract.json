@@ -70,6 +70,10 @@
           "linux/amd64": {
             "url": "https://github.com/rqlite/rqlite/releases/download/v10.5.2/rqlite-v10.5.2-linux-amd64.tar.gz",
             "checksum": "1a04a7c2c542e8e1c1347bd31af0fa9ef7043febb3c4d1806d36bc1702c6fa0f"
+          },
+          "linux/arm64": {
+            "url": "https://github.com/rqlite/rqlite/releases/download/v10.5.2/rqlite-v10.5.2-linux-arm64.tar.gz",
+            "checksum": "44b4bd7ca39720dee3b916f9ef59da117c07ddc008704ac25e56385e56951b8a"
           }
         }
       }

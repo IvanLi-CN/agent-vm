@@ -46,6 +46,7 @@ if (metadata) {
   requireCheck(metadata.policy?.verification === "pinned-checksum", "deployment metadata requires pinned checksums");
   requireCheck(metadata.caddy?.version === "2.11.7", "Caddy is pinned to 2.11.7");
   requireCheck(metadata.rqlite?.version === "10.5.2", "rqlite is pinned to 10.5.2");
+  requireCheck(JSON.stringify(metadata.rqlite?.supported_architectures) === JSON.stringify(["amd64", "arm64"]), "rqlite supports the product Linux architectures");
   const caddyArtifacts = Array.isArray(metadata.caddy?.artifacts) ? metadata.caddy.artifacts : [];
   const rqliteArtifacts = Array.isArray(metadata.rqlite?.artifacts) ? metadata.rqlite.artifacts : [];
   for (const artifact of [...caddyArtifacts, ...rqliteArtifacts]) {
@@ -91,6 +92,7 @@ try {
 
 const rqliteUnit = read(join(assetsRoot, "systemd/agent-vm-rqlite.service"));
 requireText(rqliteUnit, "User=agent-vm-rqlite", "rqlite runs as a dedicated user");
+requireText(rqliteUnit, "SupplementaryGroups=agent-vm-web", "rqlite can traverse the protected parent directories");
 requireText(rqliteUnit, "-http-addr 127.0.0.1:4001", "rqlite HTTP binds to loopback");
 requireText(rqliteUnit, "-raft-addr 127.0.0.1:4002", "rqlite raft binds to loopback");
 requireText(rqliteUnit, "-auth /etc/agent-vm-native/rqlite/auth.json", "rqlite auth file is explicit");
@@ -108,9 +110,15 @@ forbidText(slotUnit, "ExecStart=/usr/bin/caddy", "slot service does not start a 
 const caddyUnit = read(join(assetsRoot, "systemd/agent-vm-caddy.service"));
 requireText(caddyUnit, "User=caddy", "Caddy does not run as root");
 requireText(caddyUnit, "SupplementaryGroups=agent-vm-web", "Caddy can access the protected socket group");
+requireText(caddyUnit, "ConditionPathExists=/var/lib/agent-vm-native/active/app.sock", "Caddy requires an active socket at startup");
+requireText(caddyUnit, "ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock", "Caddy checks the active socket before starting");
 requireText(caddyUnit, "ReadOnlyPaths=/etc/agent-vm-native/Caddyfile", "Caddy configuration is read-only");
 requireText(caddyUnit, "CapabilityBoundingSet=CAP_NET_BIND_SERVICE", "Caddy has only its bind capability");
 forbidText(caddyUnit, "User=root", "Caddy is not configured as root");
+
+const sysusers = read(join(assetsRoot, "sysusers.d/agent-vm-native.conf"));
+requireText(sysusers, "u agent-vm-rqlite", "the state authority user is declared");
+requireText(sysusers, "u caddy", "the edge proxy user is declared");
 
 const tmpfiles = read(join(assetsRoot, "tmpfiles.d/agent-vm-native.conf"));
 forbidText(tmpfiles, "/var/lib/agent-vm-native/active 0750", "tmpfiles does not pre-create the active symlink as a directory");

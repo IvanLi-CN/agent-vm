@@ -9,13 +9,13 @@
  * prevents an operator from turning a backup helper into a second authority.
  */
 
-import { createHash } from "node:crypto";
+import { createHash, createVerify } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 const usage = `usage:
-  agent_vm_state_migration.ts preflight --source <sqlite-path> --evidence <json-path> --output-dir <empty-dir>
-  agent_vm_state_migration.ts restore-check --backup-manifest <json-path> --tail-evidence <json-path> --output <json-path>`;
+  agent_vm_state_migration.ts preflight --source <sqlite-path> --evidence <json-path> --evidence-public-key <pem-path> --output-dir <empty-dir>
+  agent_vm_state_migration.ts restore-check --backup-manifest <json-path> --tail-evidence <json-path> --evidence-public-key <pem-path> --output <json-path>`;
 
 function fail(message: string): never {
   console.error(`state migration: ${message}`);
@@ -43,14 +43,76 @@ function absolute(path: string, label: string): string {
   return resolve(path);
 }
 
-function requireEvidence(path: string): Record<string, unknown> {
-  const evidence = readJson(path);
-  for (const key of ["state_write_fenced", "workers_quiescent", "sqlite_writers_closed"]) {
-    if (evidence[key] !== true) fail(`evidence ${path} does not prove ${key}=true`);
+function canonicalJson(value: unknown): string {
+  if (value === null) return "null";
+  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) throw new Error("canonical JSON cannot contain a non-finite number");
+    return JSON.stringify(value);
   }
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(",")}}`;
+  }
+  throw new Error("canonical JSON cannot contain undefined or unsupported values");
+}
+
+function requireRegularFile(path: string, label: string): NonNullable<ReturnType<typeof lstatSync>> {
+  const file = lstatSync(path, { throwIfNoEntry: false });
+  if (!file || file.isSymbolicLink() || !file.isFile()) fail(`${label} must be a regular file`);
+  return file as NonNullable<ReturnType<typeof lstatSync>>;
+}
+
+function requireSignedEvidence(path: string, publicKeyPath: string): Record<string, unknown> {
+  requireRegularFile(path, "evidence");
+  const wrapper = readJson(path);
+  const payload = wrapper.payload;
+  const signatureText = wrapper.signature;
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) fail(`evidence ${path} needs a payload object`);
+  if (typeof signatureText !== "string" || !/^[A-Za-z0-9+/]+={0,2}$/.test(signatureText) || signatureText.length % 4 !== 0) {
+    fail(`evidence ${path} needs a base64 signature`);
+  }
+  const publicKeyFile = requireRegularFile(publicKeyPath, "evidence public key");
+  if ((Number(publicKeyFile.mode) & 0o022) !== 0) fail(`evidence public key ${publicKeyPath} must not be group/world writable`);
+  let canonicalPayload: string;
+  let signature: Buffer;
+  try {
+    canonicalPayload = canonicalJson(payload);
+    signature = Buffer.from(signatureText, "base64");
+    if (signature.length === 0) fail(`evidence ${path} has an empty signature`);
+    const verifier = createVerify("sha256");
+    verifier.update(canonicalPayload, "utf8");
+    if (!verifier.verify(readFileSync(publicKeyPath, "utf8"), signature)) fail(`evidence ${path} signature verification failed`);
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("state migration:")) throw error;
+    fail(`evidence ${path} signature verification failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  for (const key of ["state_write_fenced", "workers_quiescent", "sqlite_writers_closed"]) {
+    if ((payload as Record<string, unknown>)[key] !== true) fail(`evidence ${path} does not prove ${key}=true`);
+  }
+  if ((payload as Record<string, unknown>).schema_version !== 1 || (payload as Record<string, unknown>).producer !== "agent-vm-control") {
+    fail(`evidence ${path} has an unsupported producer or schema`);
+  }
+  const evidence = payload as Record<string, unknown>;
   if (typeof evidence.evidence_id !== "string" || evidence.evidence_id.length < 8) {
     fail(`evidence ${path} needs an evidence_id`);
   }
+  if (evidence.release_fence_path !== "/run/agent-vm-native/release-activation.fence") {
+    fail(`evidence ${path} has an unexpected release fence path`);
+  }
+  if (!Number.isInteger(evidence.fence_generation) || Number(evidence.fence_generation) < 1) {
+    fail(`evidence ${path} needs a positive fence_generation`);
+  }
+  for (const key of ["state_epoch", "state_generation", "trusted_commit"]) {
+    if (typeof evidence[key] !== "string" || evidence[key].length === 0) fail(`evidence ${path} needs ${key}`);
+  }
+  const observedAt = Date.parse(String(evidence.observed_at));
+  const expiresAt = Date.parse(String(evidence.expires_at));
+  if (!Number.isFinite(observedAt) || !Number.isFinite(expiresAt) || expiresAt <= observedAt || expiresAt <= Date.now()) {
+    fail(`evidence ${path} has an invalid or expired validity window`);
+  }
+  if (observedAt > Date.now() + 5 * 60 * 1000) fail(`evidence ${path} is from the future`);
   return evidence;
 }
 
@@ -119,6 +181,7 @@ finally:
 function preflight(args: string[]): void {
   const source = absolute(value(args, "--source"), "source");
   const evidencePath = absolute(value(args, "--evidence"), "evidence");
+  const publicKeyPath = absolute(value(args, "--evidence-public-key"), "evidence-public-key");
   const outputDir = absolute(value(args, "--output-dir"), "output-dir");
   const sourceStat = lstatSync(source, { throwIfNoEntry: false });
   if (!sourceStat) fail("source does not exist");
@@ -130,10 +193,17 @@ function preflight(args: string[]): void {
     mkdirSync(outputDir, { recursive: true, mode: 0o700 });
   }
   chmodSync(outputDir, 0o700);
-  const evidence = requireEvidence(evidencePath);
+  const evidence = requireSignedEvidence(evidencePath, publicKeyPath);
   const inspection = runPython(sqliteInspection, [source]);
   if (inspection.integrity !== "ok") fail("SQLite integrity is not ok");
   if (inspection.pending_operation_count !== 0) fail("management operation journal contains unresolved operations");
+  const sourceHash = createHash("sha256").update(readFileSync(source)).digest("hex");
+  if (evidence.source_sha256 !== sourceHash || evidence.source_size !== sourceStat.size) {
+    fail("fence evidence does not describe the exact SQLite source");
+  }
+  if (evidence.state_epoch !== inspection.state_epoch || evidence.state_generation !== String(inspection.generation)) {
+    fail("fence evidence does not describe the observed SQLite state epoch and generation");
+  }
 
   const backupPath = `${outputDir}/state.sqlite3`;
   const backupResult = Bun.spawnSync(["python3", "-c", String.raw`
@@ -157,13 +227,18 @@ finally:
     backup_path: backupPath,
     evidence_id: evidence.evidence_id,
     fence: {
-      state_write_fenced: true,
-      workers_quiescent: true,
-      sqlite_writers_closed: true,
+      state_write_fenced: evidence.state_write_fenced,
+      workers_quiescent: evidence.workers_quiescent,
+      sqlite_writers_closed: evidence.sqlite_writers_closed,
+      release_fence_path: evidence.release_fence_path,
+      fence_generation: evidence.fence_generation,
     },
     inspection,
     backup_sha256: createHash("sha256").update(readFileSync(backupPath)).digest("hex"),
-    trusted_commit: typeof evidence.trusted_commit === "string" ? evidence.trusted_commit : null,
+    trusted_commit: evidence.trusted_commit,
+    state_epoch: evidence.state_epoch,
+    state_generation: evidence.state_generation,
+    evidence_payload_sha256: createHash("sha256").update(canonicalJson(evidence)).digest("hex"),
   };
   const manifestPath = `${outputDir}/snapshot-manifest.json`;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
@@ -173,30 +248,45 @@ finally:
 function restoreCheck(args: string[]): void {
   const manifestPath = absolute(value(args, "--backup-manifest"), "backup-manifest");
   const tailPath = absolute(value(args, "--tail-evidence"), "tail-evidence");
+  const publicKeyPath = absolute(value(args, "--evidence-public-key"), "evidence-public-key");
   const outputPath = absolute(value(args, "--output"), "output");
   const manifest = readJson(manifestPath);
   if (manifest.kind !== "sqlite-state-snapshot" || manifest.schema_version !== 1) fail("backup manifest is not a supported state snapshot");
   const fence = manifest.fence;
-  if (!fence || typeof fence !== "object" || fence === null || (fence as Record<string, unknown>).sqlite_writers_closed !== true) {
-    fail("backup manifest does not prove closed SQLite writers");
+  if (!fence || typeof fence !== "object" || fence === null) fail("backup manifest has no fence");
+  const manifestFence = fence as Record<string, unknown>;
+  for (const key of ["state_write_fenced", "workers_quiescent", "sqlite_writers_closed"]) {
+    if (manifestFence[key] !== true) fail(`backup manifest does not prove ${key}=true`);
   }
-  const tail = requireEvidence(tailPath);
+  if (manifestFence.release_fence_path !== "/run/agent-vm-native/release-activation.fence" || !Number.isInteger(manifestFence.fence_generation)) {
+    fail("backup manifest has no valid release fence identity");
+  }
+  const tail = requireSignedEvidence(tailPath, publicKeyPath);
   if (tail.tail_verified !== true) fail("tail evidence must set tail_verified=true");
+  if (tail.coverage_boundary_verified !== true) fail("tail evidence must prove the coverage boundary");
   const trustedCommit = manifest.trusted_commit;
   const tailCommit = tail.last_verified_commit;
-  if (typeof trustedCommit !== "string" || typeof tailCommit !== "string" || trustedCommit !== tailCommit) {
+  if (typeof trustedCommit !== "string" || typeof tailCommit !== "string" || trustedCommit !== tailCommit || trustedCommit !== tail.trusted_commit) {
     fail("restore requires an exact trusted-commit and verified-tail match");
+  }
+  if (manifest.state_epoch !== tail.state_epoch || manifest.state_generation !== tail.state_generation || manifestFence.fence_generation !== tail.fence_generation) {
+    fail("restore evidence does not describe the same fenced state");
   }
   const backupPath = manifest.backup_path;
   if (typeof backupPath !== "string" || !isAbsolute(backupPath) || !existsSync(backupPath)) fail("backup file is missing");
   const actualHash = createHash("sha256").update(readFileSync(backupPath)).digest("hex");
-  if (actualHash !== manifest.backup_sha256) fail("backup hash does not match the manifest");
+  if (actualHash !== manifest.backup_sha256 || actualHash !== tail.backup_sha256) fail("backup hash does not match the manifest and signed tail evidence");
   const authorization = {
     schema_version: 1,
     verdict: "restore_admissible",
     backup_manifest: manifestPath,
     tail_evidence: tailPath,
     trusted_commit: trustedCommit,
+    state_epoch: manifest.state_epoch,
+    state_generation: manifest.state_generation,
+    fence_generation: manifestFence.fence_generation,
+    backup_sha256: actualHash,
+    tail_evidence_payload_sha256: createHash("sha256").update(canonicalJson(tail)).digest("hex"),
     note: "A service-owned rqlite restore is still required; this command does not write the state authority.",
   };
   mkdirSync(dirname(outputPath), { recursive: true, mode: 0o700 });
