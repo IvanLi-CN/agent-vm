@@ -124,6 +124,8 @@ func TestManagementConfigRequiresSeparateAuthenticatedBoundaries(t *testing.T) {
 	value := validConfig()
 	value.Management = ManagementConfig{
 		Enabled: true, ExternalOrigin: "https://console.example",
+		OIDC:                 OIDCConfig{Issuer: "https://issuer.example", ClientID: "client", ClientSecret: "secret", RedirectURI: "https://console.example/api/v1/auth/oidc/callback"},
+		AdminPrincipal:       AdminPrincipalConfig{Issuer: "https://issuer.example", Subject: "admin", Capabilities: []string{"read"}},
 		ForwardAuth:          ForwardAuthConfig{SocketPath: "/run/agent-vm-native/proxy.sock", PeerUID: 1001, IdentityHeader: "X-Forwarded-User"},
 		AllowedAdminSubjects: []string{"admin@example"}, WebUID: 1002,
 		SessionTTLSeconds: 900,
@@ -139,6 +141,8 @@ func TestManagementConfigRequiresSeparateAuthenticatedBoundaries(t *testing.T) {
 	value = validConfig()
 	value.Management = ManagementConfig{
 		Enabled: true, ExternalOrigin: "https://console.example", ForwardAuth: ForwardAuthConfig{SocketPath: "/run/proxy.sock", PeerUID: 1001, IdentityHeader: "X-Forwarded-User"},
+		OIDC:                 OIDCConfig{Issuer: "https://issuer.example", ClientID: "client", ClientSecret: "secret", RedirectURI: "https://console.example/api/v1/auth/oidc/callback"},
+		AdminPrincipal:       AdminPrincipalConfig{Issuer: "https://issuer.example", Subject: "admin", Capabilities: []string{"read"}},
 		AllowedAdminSubjects: []string{"admin@example"}, WebUID: 1002, Authority: ManagementAuthorityConfig{SocketPath: "/run/authority.sock", ExpectedWebUID: 1002},
 		Upload: ManagementUploadConfig{Enabled: true, MaxBytes: 1024, StagingPath: "/", MinimumFreeBytes: 512},
 	}
@@ -151,6 +155,8 @@ func TestManagementConfigRejectsUnsafeIncusRemoteNames(t *testing.T) {
 	value := validConfig()
 	value.Management = ManagementConfig{
 		Enabled: true, ExternalOrigin: "https://console.example",
+		OIDC:                 OIDCConfig{Issuer: "https://issuer.example", ClientID: "client", ClientSecret: "secret", RedirectURI: "https://console.example/api/v1/auth/oidc/callback"},
+		AdminPrincipal:       AdminPrincipalConfig{Issuer: "https://issuer.example", Subject: "admin", Capabilities: []string{"read"}},
 		ForwardAuth:          ForwardAuthConfig{SocketPath: "/run/proxy.sock", PeerUID: 1001, IdentityHeader: "X-Forwarded-User"},
 		AllowedAdminSubjects: []string{"admin@example"}, WebUID: 1002,
 		TrustedImageSourceIDs: []string{"approved/remote"},
@@ -165,6 +171,8 @@ func TestManagementConfigRequiresPoolReserveForTrustedImages(t *testing.T) {
 	value := validConfig()
 	value.Management = ManagementConfig{
 		Enabled: true, ExternalOrigin: "https://console.example",
+		OIDC:                 OIDCConfig{Issuer: "https://issuer.example", ClientID: "client", ClientSecret: "secret", RedirectURI: "https://console.example/api/v1/auth/oidc/callback"},
+		AdminPrincipal:       AdminPrincipalConfig{Issuer: "https://issuer.example", Subject: "admin", Capabilities: []string{"read"}},
 		ForwardAuth:          ForwardAuthConfig{SocketPath: "/run/proxy.sock", PeerUID: 1001, IdentityHeader: "X-Forwarded-User"},
 		AllowedAdminSubjects: []string{"admin@example"}, WebUID: 1002,
 		TrustedImageSourceIDs: []string{"approved"},

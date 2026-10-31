@@ -45,7 +45,7 @@ function ConsoleApp() {
   return <Shell key={`${page}-${runtime.revision}`} page={page}><div className="sr-only" aria-live="polite">{t(`nav.${page}`)}</div>{page === "overview" ? <OverviewPage /> : page === "vms" ? <VMsPage /> : page === "images" ? <ImagesPage /> : page === "operations" ? <OperationsPage /> : <SystemPage />}</Shell>;
 }
 
-export function App() {
+export function App({ client = queryClient }: { client?: QueryClient } = {}) {
   const demoRuntime = useDemoRuntime();
   const isDemo = isDemoRuntime();
   const [inspectorLayout, setInspectorLayout] = useState<DemoInspectorLayout>(() => getDemoInspectorLayout());
@@ -54,5 +54,5 @@ export function App() {
     saveDemoInspectorLayout(layout);
   };
   const showInspector = isDemo && !demoRuntime.bootstrapError;
-  return <DemoProvider><QueryClientProvider client={queryClient}>{showInspector ? <div className={`demo-runtime demo-runtime--${inspectorLayout}`}><ConsoleApp /><DemoInspector layout={inspectorLayout} onLayoutChange={setDemoInspectorLayout} /></div> : <ConsoleApp />}</QueryClientProvider></DemoProvider>;
+  return <DemoProvider><QueryClientProvider client={client}>{showInspector ? <div className={`demo-runtime demo-runtime--${inspectorLayout}`}><ConsoleApp /><DemoInspector layout={inspectorLayout} onLayoutChange={setDemoInspectorLayout} /></div> : <ConsoleApp />}</QueryClientProvider></DemoProvider>;
 }

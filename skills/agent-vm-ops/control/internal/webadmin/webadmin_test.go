@@ -25,6 +25,8 @@ func testManagementConfig(t *testing.T) config.ManagementConfig {
 	root := t.TempDir()
 	return config.ManagementConfig{
 		Enabled: true, ExternalOrigin: "https://console.example",
+		OIDC:                 config.OIDCConfig{Issuer: "https://issuer.example", ClientID: "client", ClientSecret: "secret", RedirectURI: "https://console.example/api/v1/auth/oidc/callback"},
+		AdminPrincipal:       config.AdminPrincipalConfig{Issuer: "https://issuer.example", Subject: "admin@example", Capabilities: []string{"read", "operate", "manage_images", "maintain_system", "manage_tokens", "observe_admin"}},
 		ForwardAuth:          config.ForwardAuthConfig{SocketPath: filepath.Join(root, "web.sock"), PeerUID: 1001, IdentityHeader: "X-Forwarded-User"},
 		AllowedAdminSubjects: []string{"admin@example"}, WebUID: 1002,
 		SessionTTLSeconds: 900,
@@ -53,6 +55,64 @@ func testAuthority(t *testing.T) (*Authority, *state.Store, config.ManagementCon
 	}
 	t.Cleanup(func() { store.Close() })
 	return authority, store, cfg
+}
+
+type maintenanceActionBackend struct{}
+
+func (maintenanceActionBackend) ExecuteVMAction(context.Context, string, string, string, int64, map[string]any) (map[string]any, error) {
+	return map[string]any{"state": "changed"}, nil
+}
+
+func (maintenanceActionBackend) ExecuteMaintenance(context.Context, string, string, map[string]any) (map[string]any, error) {
+	return map[string]any{"state": "changed"}, nil
+}
+
+func TestMaintenancePreviewSubmissionKeepsSystemVersionStable(t *testing.T) {
+	authority, store, cfg := testAuthority(t)
+	authority.Management.Options.Actions = maintenanceActionBackend{}
+	authority.Management.Options.CurrentSystemVersion = func(ctx context.Context) (string, error) {
+		epoch, err := store.StateEpoch(ctx)
+		if err != nil {
+			return "", err
+		}
+		return "system:" + epoch, nil
+	}
+	initialEpoch, err := store.StateEpoch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetVersion := "system:" + initialEpoch
+
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req = req.WithContext(WithPeerUID(req.Context(), cfg.WebUID))
+		req.Header.Set(forwardedActorHeader, "admin@example")
+		req.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		authority.Handler().ServeHTTP(recorder, req)
+		return recorder
+	}
+
+	preview := request(http.MethodPost, "/internal/v1/management/system/maintenance/preview", `{"action":"reconcile","target_version":"`+targetVersion+`","parameters":{}}`)
+	if preview.Code != http.StatusOK {
+		t.Fatalf("maintenance preview status=%d body=%s", preview.Code, preview.Body.String())
+	}
+	var previewValue struct {
+		ConfirmationToken string `json:"confirmation_token"`
+	}
+	if err := json.Unmarshal(preview.Body.Bytes(), &previewValue); err != nil || previewValue.ConfirmationToken == "" {
+		t.Fatalf("maintenance preview=%s err=%v", preview.Body.String(), err)
+	}
+	if epoch, err := store.StateEpoch(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if epoch != initialEpoch {
+		t.Fatalf("maintenance preview changed system version: %q", epoch)
+	}
+
+	submit := request(http.MethodPost, "/internal/v1/management/system/maintenance", `{"operation_id":"80e8400e-ccf8-4c7b-8d1d-14f66c7fb127","action":"reconcile","target_version":"`+targetVersion+`","parameters":{},"confirmation_token":"`+previewValue.ConfirmationToken+`"}`)
+	if submit.Code != http.StatusAccepted {
+		t.Fatalf("maintenance submit status=%d body=%s", submit.Code, submit.Body.String())
+	}
 }
 
 func TestAuthorityRejectsUntrustedPeer(t *testing.T) {
@@ -88,6 +148,19 @@ func TestSafeOperationErrorPreservesImportRecoveryEvidence(t *testing.T) {
 func jsonString(value any) string {
 	raw, _ := json.Marshal(value)
 	return string(raw)
+}
+
+func TestWebReasonValidationUsesUnicodeCodePoints(t *testing.T) {
+	for _, value := range []string{"", strings.Repeat("a", 512), strings.Repeat("\U0001f431", 512)} {
+		if err := validateReason(value); err != nil {
+			t.Fatalf("reason rejected: %v", err)
+		}
+	}
+	for _, value := range []string{" \t\n", strings.Repeat("a", 513), string([]byte{0xff})} {
+		if err := validateReason(value); err == nil {
+			t.Fatalf("invalid reason was accepted")
+		}
+	}
 }
 
 func TestAuthorityListsImagesOnlyForAuthorizedPeer(t *testing.T) {
@@ -287,20 +360,66 @@ func TestWebRejectsAPIPathsFromStaticFallback(t *testing.T) {
 }
 
 func TestConfirmationTokenIsBoundAndSingleUse(t *testing.T) {
-	store := newConfirmationStore()
-	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
-	token, _, err := store.issue(now, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", map[string]any{"live": false})
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.consume(now, token, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", map[string]any{"live": true}); err == nil {
-		t.Fatal("parameter mismatch unexpectedly accepted")
-	}
-	if err := store.consume(now, token, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", map[string]any{"live": false}); err != nil {
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 27, 0, 0, 0, 0, time.UTC)
+	params := map[string]any{"live": false}
+	token, _, err := issueDurableConfirmation(ctx, store, now, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", params)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.consume(now, token, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", map[string]any{"live": false}); err == nil {
+	if err := consumeDurableConfirmation(ctx, store, now, token, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", map[string]any{"live": true}); err == nil {
+		t.Fatal("parameter mismatch unexpectedly accepted")
+	}
+	if err := consumeDurableConfirmation(ctx, store, now, token, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", params); err != nil {
+		t.Fatal(err)
+	}
+	if err := consumeDurableConfirmation(ctx, store, now, token, "admin@example", "restart", "vm:task-1", "vm:task-1:updated", params); err == nil {
 		t.Fatal("confirmation token was reusable")
+	}
+}
+
+func TestDurableConfirmationClassesCrossSlots(t *testing.T) {
+	blue, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blue.Close()
+	green, err := state.OpenForTest(blue.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer green.Close()
+
+	now := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		action string
+		target string
+		params map[string]any
+	}{
+		{name: "vm", action: "restart", target: "vm:task-1", params: map[string]any{"live": false}},
+		{name: "default-image", action: "default_image_select", target: "image:" + strings.Repeat("a", 64), params: map[string]any{"fingerprint": strings.Repeat("a", 64)}},
+		{name: "image-mutation", action: "image_retire", target: "image:" + strings.Repeat("b", 64), params: map[string]any{"fingerprint": strings.Repeat("b", 64)}},
+		{name: "maintenance", action: "reconcile", target: "system", params: map[string]any{"scope": "all"}},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			token, _, err := issueDurableConfirmation(context.Background(), blue, now, "admin@example", test.action, test.target, "version-1", test.params)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := consumeDurableConfirmation(context.Background(), green, now, token, "admin@example", test.action, test.target, "version-1", test.params); err != nil {
+				t.Fatalf("cross-slot consume: %v", err)
+			}
+			if err := consumeDurableConfirmation(context.Background(), blue, now, token, "admin@example", test.action, test.target, "version-1", test.params); err == nil {
+				t.Fatal("confirmation replay was accepted")
+			}
+		})
 	}
 }
 

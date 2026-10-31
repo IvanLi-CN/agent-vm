@@ -20,6 +20,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 
@@ -53,7 +54,6 @@ type Authority struct {
 	Snapshots      *observe.SnapshotStore
 	ProductVersion string
 	Clock          func() time.Time
-	confirmations  *confirmationStore
 	uploadMu       sync.Mutex
 }
 
@@ -78,7 +78,6 @@ func NewAuthority(options AuthorityOptions) (*Authority, error) {
 		Snapshots:      options.Snapshots,
 		ProductVersion: options.ProductVersion,
 		Clock:          options.Clock,
-		confirmations:  newConfirmationStore(),
 	}, nil
 }
 
@@ -102,6 +101,7 @@ func (authority *Authority) Serve(ctx context.Context) error {
 func (authority *Authority) handle(writer http.ResponseWriter, request *http.Request) {
 	actor, authErr := authority.authorize(request)
 	if authErr != nil {
+		recordRejectedManagementAudit(authority.Store, authority.Clock, request, request.URL.Path, authErr)
 		writeProblem(writer, authErr)
 		return
 	}
@@ -705,7 +705,7 @@ func (authority *Authority) previewVMAction(writer http.ResponseWriter, request 
 		writeProblem(writer, problemFromError(err, "precondition", ""))
 		return
 	}
-	token, expiresAt, err := authority.confirmations.issue(authority.Clock(), actor, payload.Action, "vm:"+taskID, payload.TargetVersion, parameters)
+	token, expiresAt, err := issueDurableConfirmation(request.Context(), authority.Store, authority.Clock(), actor, payload.Action, "vm:"+taskID, payload.TargetVersion, parameters)
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
@@ -752,7 +752,7 @@ func (authority *Authority) submitVMAction(writer http.ResponseWriter, request *
 			writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
 			return
 		}
-		if err := authority.confirmations.consume(authority.Clock(), payload.ConfirmationToken, actor, payload.Action, "vm:"+taskID, payload.TargetVersion, parameters); err != nil {
+		if err := consumeDurableConfirmation(request.Context(), authority.Store, authority.Clock(), payload.ConfirmationToken, actor, payload.Action, "vm:"+taskID, payload.TargetVersion, parameters); err != nil {
 			writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
 			return
 		}
@@ -893,6 +893,12 @@ func (authority *Authority) startImageImport(writer http.ResponseWriter, request
 }
 
 func (authority *Authority) uploadImageImport(writer http.ResponseWriter, request *http.Request, operationID, actor string) {
+	resourceUnlock, err := authority.Management.AcquireResourceLock(request.Context(), "image-staging")
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "upload", operationID))
+		return
+	}
+	defer resourceUnlock()
 	authority.uploadMu.Lock()
 	defer authority.uploadMu.Unlock()
 	if !authority.Config.Upload.Enabled {
@@ -1248,7 +1254,7 @@ func (authority *Authority) previewDefaultImage(writer http.ResponseWriter, requ
 		return
 	}
 	params := map[string]any{"fingerprint": payload.Fingerprint}
-	token, expiresAt, err := authority.confirmations.issue(authority.Clock(), actor, "default_image_select", "image:"+payload.Fingerprint, payload.TargetVersion, params)
+	token, expiresAt, err := issueDurableConfirmation(request.Context(), authority.Store, authority.Clock(), actor, "default_image_select", "image:"+payload.Fingerprint, payload.TargetVersion, params)
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
@@ -1300,7 +1306,7 @@ func (authority *Authority) submitDefaultImage(writer http.ResponseWriter, reque
 		return
 	}
 	if existing == nil {
-		if err := authority.confirmations.consume(authority.Clock(), payload.ConfirmationToken, actor, "default_image_select", "image:"+payload.Fingerprint, payload.TargetVersion, params); err != nil {
+		if err := consumeDurableConfirmation(request.Context(), authority.Store, authority.Clock(), payload.ConfirmationToken, actor, "default_image_select", "image:"+payload.Fingerprint, payload.TargetVersion, params); err != nil {
 			writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
 			return
 		}
@@ -1346,7 +1352,7 @@ func (authority *Authority) previewImageMutation(writer http.ResponseWriter, req
 		return
 	}
 	params := map[string]any{"fingerprint": fingerprint}
-	token, expiresAt, err := authority.confirmations.issue(authority.Clock(), actor, action, "image:"+fingerprint, payload.TargetVersion, params)
+	token, expiresAt, err := issueDurableConfirmation(request.Context(), authority.Store, authority.Clock(), actor, action, "image:"+fingerprint, payload.TargetVersion, params)
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
@@ -1397,7 +1403,7 @@ func (authority *Authority) submitImageMutation(writer http.ResponseWriter, requ
 		return
 	}
 	if existing == nil {
-		if err := authority.confirmations.consume(authority.Clock(), payload.ConfirmationToken, actor, action, "image:"+fingerprint, payload.TargetVersion, params); err != nil {
+		if err := consumeDurableConfirmation(request.Context(), authority.Store, authority.Clock(), payload.ConfirmationToken, actor, action, "image:"+fingerprint, payload.TargetVersion, params); err != nil {
 			writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
 			return
 		}
@@ -1441,7 +1447,7 @@ func (authority *Authority) previewMaintenance(writer http.ResponseWriter, reque
 		writeProblem(writer, problemFromError(fmt.Errorf("stale_target: expected %s, current %s", payload.TargetVersion, current), "precondition", ""))
 		return
 	}
-	token, expiresAt, err := authority.confirmations.issue(authority.Clock(), actor, payload.Action, "system", payload.TargetVersion, parameters)
+	token, expiresAt, err := issueDurableConfirmation(request.Context(), authority.Store, authority.Clock(), actor, payload.Action, "system", payload.TargetVersion, parameters)
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "internal", ""))
 		return
@@ -1496,7 +1502,7 @@ func (authority *Authority) submitMaintenance(writer http.ResponseWriter, reques
 		return
 	}
 	if existing == nil {
-		if err := authority.confirmations.consume(authority.Clock(), payload.ConfirmationToken, actor, payload.Action, "system", payload.TargetVersion, parameters); err != nil {
+		if err := consumeDurableConfirmation(request.Context(), authority.Store, authority.Clock(), payload.ConfirmationToken, actor, payload.Action, "system", payload.TargetVersion, parameters); err != nil {
 			writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
 			return
 		}
@@ -1830,11 +1836,14 @@ func validateFingerprint(value string) error {
 }
 
 func validateReason(value string) error {
-	if strings.TrimSpace(value) == "" {
-		return errors.New("reason is required")
+	if value == "" {
+		return nil
 	}
-	if len(value) > 512 {
-		return errors.New("reason must not exceed 512 characters")
+	if strings.TrimSpace(value) == "" {
+		return errors.New("reason must not be blank")
+	}
+	if !utf8.ValidString(value) || utf8.RuneCountInString(value) > 512 {
+		return errors.New("reason must not exceed 512 Unicode characters")
 	}
 	return nil
 }
@@ -2082,7 +2091,11 @@ func operationValue(operation state.ManagementOperation) map[string]any {
 	if operation.Error != nil {
 		errorValue = safeOperationError(operation.Error, operation.OperationID, operation.Phase)
 	}
-	return map[string]any{"operation_id": operation.OperationID, "action": operation.Action, "status": operationStatus(operation), "phase": operationPhase(operation), "target": map[string]any{"kind": operation.TargetKind, "id": operation.TargetID}, "actor": operation.Actor, "reason": operation.Reason, "created_at": operation.CreatedAt, "updated_at": operation.UpdatedAt, "result": resultValue, "error": errorValue}
+	var reason any
+	if operation.Reason != "" {
+		reason = operation.Reason
+	}
+	return map[string]any{"operation_id": operation.OperationID, "action": operation.Action, "status": operationStatus(operation), "phase": operationPhase(operation), "target": map[string]any{"kind": operation.TargetKind, "id": operation.TargetID}, "actor": actorValue(operation.Actor), "reason": reason, "created_at": operation.CreatedAt, "updated_at": operation.UpdatedAt, "result": resultValue, "error": errorValue}
 }
 
 func operationStatus(operation state.ManagementOperation) string {
@@ -2108,9 +2121,16 @@ func safeOperationResult(value map[string]any) map[string]any {
 		return nil
 	}
 	result := map[string]any{}
-	for _, key := range []string{"image_fingerprint", "default_fingerprint", "affected_session_count", "effect"} {
+	for _, key := range []string{"image_fingerprint", "default_fingerprint", "affected_session_count", "effect", "plaintext_disclosure"} {
 		if item, ok := value[key]; ok {
 			result[key] = item
+		}
+	}
+	if metadata, ok := value["token_metadata"].(map[string]any); ok {
+		result["token_metadata"] = map[string]any{
+			"token_id": metadata["token_id"], "resource_version": metadata["resource_version"],
+			"scopes": metadata["scopes"], "created_at": metadata["created_at"],
+			"expires_at": metadata["expires_at"], "revoked_at": metadata["revoked_at"],
 		}
 	}
 	if value["fingerprint"] != nil && result["image_fingerprint"] == nil {
@@ -2166,13 +2186,28 @@ func auditValue(value state.ManagementAudit) map[string]any {
 	if phase == "" {
 		phase = "reconciliation"
 	}
-	result := map[string]any{"event_id": value.EventID, "operation_id": operationID, "action": value.Action, "actor": value.Actor, "reason": value.Reason, "target": value.Target, "outcome": value.Outcome, "phase": phase, "occurred_at": value.OccurredAt}
+	var reason any
+	if value.Reason != "" {
+		reason = value.Reason
+	}
+	result := map[string]any{"event_id": value.EventID, "operation_id": operationID, "action": value.Action, "actor": actorValue(value.Actor), "reason": reason, "target": value.Target, "outcome": value.Outcome, "phase": phase, "occurred_at": value.OccurredAt}
 	if value.Detail != nil {
 		result["safe_code"] = safeCode(stringValue(value.Detail["code"]))
 	} else {
 		result["safe_code"] = nil
 	}
 	return result
+}
+
+func actorValue(value string) any {
+	if kind := rejectedActorKind(value); kind != "" {
+		return map[string]any{"kind": kind}
+	}
+	parts := strings.SplitN(value, "\x00", 2)
+	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+		return map[string]any{"issuer": parts[0], "subject": parts[1], "role": "administrator"}
+	}
+	return map[string]any{"kind": "legacy_unknown", "raw_actor": value}
 }
 
 func actionPreviewValue(targetVersion, token string, expiresAt time.Time, impact map[string]any) map[string]any {

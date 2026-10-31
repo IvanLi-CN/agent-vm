@@ -74,6 +74,8 @@ func (guest *capacityGuest) Probe(context.Context) error {
 
 type startupGuest struct {
 	initErr             error
+	initCalls           int
+	startCalls          int
 	status              string
 	statusErr           error
 	statuses            []map[string]any
@@ -92,6 +94,7 @@ type startupGuest struct {
 }
 
 func (guest *startupGuest) Init(_ context.Context, _, _ string, ownership map[string]string) error {
+	guest.initCalls++
 	if guest.initEntered != nil {
 		guest.initEntered <- struct{}{}
 	}
@@ -130,7 +133,7 @@ func (guest *startupGuest) DeviceAdd(context.Context, string, string, string, ma
 	return nil
 }
 func (guest *startupGuest) DeviceRemove(context.Context, string, string) error { return nil }
-func (guest *startupGuest) Start(context.Context, string) error                { return nil }
+func (guest *startupGuest) Start(context.Context, string) error                { guest.startCalls++; return nil }
 func (guest *startupGuest) Stop(context.Context, string) error                 { return guest.stopErr }
 func (guest *startupGuest) Delete(context.Context, string) error {
 	guest.deleteCalls++
@@ -166,6 +169,94 @@ func (observer staticCPUObserver) Observe(context.Context) (observe.CPUObservati
 
 func (observer staticMemoryObserver) Observe(context.Context) (observe.MemoryObservation, error) {
 	return observer.observation, observer.err
+}
+
+func TestNamedActionLockHonorsContext(t *testing.T) {
+	service := New(nil, config.Defaults(), Options{})
+	unlock, err := service.lockNamedActionWithContext(context.Background(), "session:test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := service.lockNamedActionWithContext(ctx, "session:test"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("lock error = %v, want deadline exceeded", err)
+	}
+}
+
+func TestStartupReconcileSharesCrossProcessDrainBoundary(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	lockDir := t.TempDir()
+	first := New(store, config.Defaults(), Options{LockDir: lockDir})
+	second := New(store, config.Defaults(), Options{LockDir: lockDir})
+	unlock, err := first.lockNamedActionWithContext(context.Background(), "drain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := second.StartupReconcile(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("startup reconcile error = %v, want drain lock deadline", err)
+	}
+}
+
+func TestStartupReconcileSharesCrossProcessMaintenanceBoundary(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	lockDir := t.TempDir()
+	first := New(store, config.Defaults(), Options{LockDir: lockDir})
+	second := New(store, config.Defaults(), Options{LockDir: lockDir})
+	unlock, err := first.lockNamedActionWithContext(context.Background(), "maintenance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := second.StartupReconcile(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("startup reconcile error = %v, want maintenance lock deadline", err)
+	}
+}
+
+func TestAcquireSharesCrossProcessImageCatalogBoundary(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	lockDir := t.TempDir()
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	first := New(store, cfg, Options{LockDir: lockDir})
+	second := New(store, cfg, Options{LockDir: lockDir})
+	unlock, err := first.lockNamedActionWithContext(context.Background(), "management-resource:image-catalog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	request := protocol.Request{
+		"protocol":     protocol.Version,
+		"action":       "acquire",
+		"session_id":   "catalog-fence",
+		"generation":   int64(0),
+		"operation_id": "catalog-fence-acquire",
+	}
+	if _, err := second.Dispatch(ctx, request); err == nil || !strings.Contains(err.Error(), "operation_conflict") {
+		t.Fatalf("acquire error = %v, want operation_conflict", err)
+	}
 }
 
 func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
@@ -459,8 +550,18 @@ func TestConfigureNetworkMatchesManagedContainerContract(t *testing.T) {
 	if err := service.configureNetwork(context.Background(), &state.Task{InstanceName: "agent-ready", VMIP: stringPointer("10.250.19.20")}); err != nil {
 		t.Fatal(err)
 	}
-	if len(guest.deviceSets) != 8 || guest.deviceSets[0] != "eth0:ipv4.address=10.250.19.20" {
-		t.Fatalf("device sets = %#v", guest.deviceSets)
+	want := []string{
+		"eth0:security.mac_filtering=true",
+		"eth0:security.ipv4_filtering=true",
+		"eth0:security.ipv6_filtering=true",
+		"eth0:security.port_isolation=true",
+		"eth0:security.acls=agent-vm-acl",
+		"eth0:security.acls.default.ingress.action=allow",
+		"eth0:security.acls.default.egress.action=allow",
+		"eth0:ipv4.address=10.250.19.20",
+	}
+	if !reflect.DeepEqual(guest.deviceSets, want) {
+		t.Fatalf("device sets = %#v, want %#v", guest.deviceSets, want)
 	}
 }
 
@@ -987,20 +1088,68 @@ func TestConcurrentPhysicalReservationsSerialize(t *testing.T) {
 	case <-time.After(25 * time.Millisecond):
 	}
 	close(capacityRelease)
-	first, second := <-results, <-results
-	successes := 0
-	for _, result := range []reservationResult{first, second} {
-		if result.err == nil {
-			successes++
-			result.release()
-			continue
-		}
-		if control := protocol.AsError(result.err); control == nil || control.Code != "resource_insufficient" {
-			t.Fatalf("concurrent reservation error = %#v", result.err)
-		}
+	first := <-results
+	if first.err != nil {
+		t.Fatalf("first reservation error = %v", first.err)
 	}
-	if successes != 1 {
-		t.Fatalf("concurrent reservation successes = %d, want 1", successes)
+	first.release()
+	second := <-results
+	if second.err != nil || second.release == nil {
+		t.Fatalf("second reservation did not proceed after first released: release=%v err=%v", second.release != nil, second.err)
+	}
+	second.release()
+}
+
+func TestPhysicalReservationFencesPeerAdmissionAcrossServices(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "state.sqlite3")
+	firstStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStore.Close()
+	secondStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	cfg := config.Defaults()
+	cfg.StateDB = path
+	guest := func() *capacityGuest {
+		return &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024}}
+	}
+	lockDir := filepath.Join(root, "locks")
+	first := New(firstStore, cfg, Options{Guest: guest(), Resident: true, LockDir: lockDir})
+	second := New(secondStore, cfg, Options{Guest: guest(), Resident: true, LockDir: lockDir})
+	firstRelease, err := first.ReservePhysicalStorage(context.Background(), 75*1024*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerDone := make(chan struct {
+		unlock func()
+		err    error
+	}, 1)
+	go func() {
+		unlock, lockErr := second.lockActionWithContext(context.Background(), "acquire", protocol.Request{"action": "acquire"})
+		peerDone <- struct {
+			unlock func()
+			err    error
+		}{unlock: unlock, err: lockErr}
+	}()
+	select {
+	case result := <-peerDone:
+		t.Fatalf("peer admission crossed active physical reservation: unlock=%v err=%v", result.unlock != nil, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	firstRelease()
+	select {
+	case result := <-peerDone:
+		if result.err != nil || result.unlock == nil {
+			t.Fatalf("peer admission lock result = unlock=%v err=%v", result.unlock != nil, result.err)
+		}
+		result.unlock()
+	case <-time.After(time.Second):
+		t.Fatal("peer admission did not proceed after reservation release")
 	}
 }
 
@@ -2276,7 +2425,9 @@ func TestDrainStatusIncludesStateCapabilities(t *testing.T) {
 		"legacy-agent-vm-core@1",
 		"managed-image-catalog@1",
 		"management-operation-audit@1",
+		"principal-identity@1",
 		"session-image-binding@1",
+		"token-revocation@1",
 	}
 	if !reflect.DeepEqual(capabilities, expected) {
 		t.Fatalf("state capabilities = %#v, want %#v", capabilities, expected)
@@ -3249,6 +3400,112 @@ func TestStartupReconcileCancelsAcquireForCachedStoppedTask(t *testing.T) {
 	control, ok := operation.Response["error"].(map[string]any)
 	if !ok || control["code"] != "lease_released" {
 		t.Fatalf("cached pending acquire error = %#v", operation.Response["error"])
+	}
+}
+
+func TestReconcileFinalizesOrphanedAcquireWithoutReplay(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "periodic-cached-pending-acquire.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
+	session := "periodic-cached-pending-acquire-session"
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "periodic-cached-pending-task", SessionID: session, Generation: 2, State: stateCached,
+		InstanceName: "agent-periodic-cached-pending", CreatedAt: nowString(now), UpdatedAt: nowString(now),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(1), "operation_id": "periodic-cached-pending-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(1)
+	if err := store.RecordOperation(ctx, "periodic-cached-pending-acquire", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request), "worker": map[string]any{"state": "exited"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status: "Stopped",
+		config: map[string]any{
+			"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "periodic-cached-pending-task", "user.agent-vm.session": session, "user.agent-vm.generation": "2"},
+			"devices": map[string]any{}, "expanded_devices": map[string]any{},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
+	if _, err := service.reconcile(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(ctx, "periodic-cached-pending-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("periodic orphaned acquire = %#v", operation)
+	}
+	control, ok := operation.Response["error"].(map[string]any)
+	if !ok || control["code"] != "lease_released" {
+		t.Fatalf("periodic orphaned acquire error = %#v", operation.Response["error"])
+	}
+	if operation.Response["_request_digest"] != digest {
+		t.Fatalf("periodic orphaned acquire digest = %#v, want %q", operation.Response["_request_digest"], digest)
+	}
+	if guest.initCalls != 0 || guest.startCalls != 0 {
+		t.Fatalf("periodic reconciliation replayed native acquire: init=%d start=%d", guest.initCalls, guest.startCalls)
+	}
+}
+
+func TestReconcileLeavesOrphanedAcquirePendingWhenNativeStateIsUnverified(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "periodic-unverified-acquire.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session := "periodic-unverified-acquire-session"
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: "periodic-unverified-task", SessionID: session, Generation: 2, State: stateCached,
+		InstanceName: "agent-periodic-unverified", CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()),
+		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(1), "operation_id": "periodic-unverified-acquire"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(1)
+	if err := store.RecordOperation(ctx, "periodic-unverified-acquire", "acquire", stringPointer(session), &generation, map[string]any{
+		"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request), "worker": map[string]any{"state": "exited"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status: "Running",
+		config: map[string]any{
+			"config":  map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "periodic-unverified-task", "user.agent-vm.session": session, "user.agent-vm.generation": "2"},
+			"devices": map[string]any{}, "expanded_devices": map[string]any{},
+		},
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	if _, err := service.reconcile(ctx, true); protocol.AsError(err).Code != "startup_reconcile_required" {
+		t.Fatalf("unverified orphaned acquire error = %v", err)
+	}
+	operation, err := store.GetOperation(ctx, "periodic-unverified-acquire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "pending" || operation.Response["_request_digest"] != digest {
+		t.Fatalf("unverified orphaned acquire was finalized or changed: %#v", operation)
+	}
+	if guest.initCalls != 0 || guest.startCalls != 0 {
+		t.Fatalf("unverified reconciliation replayed native acquire: init=%d start=%d", guest.initCalls, guest.startCalls)
 	}
 }
 

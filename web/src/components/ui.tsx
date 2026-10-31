@@ -1,5 +1,5 @@
 import { forwardRef, type ButtonHTMLAttributes, type InputHTMLAttributes, type ReactNode, type TextareaHTMLAttributes } from "react";
-import { Check, Copy, LoaderCircle } from "lucide-react";
+import { Check, CircleAlert, Copy, LoaderCircle } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { stateLabel, stateTone } from "../app/format";
@@ -61,7 +61,20 @@ export function EmptyState({ title, description }: { title: ReactNode; descripti
 export function CopyButton({ value }: { value: string }) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
-  return <IconButton label={copied ? t("common.copied") : t("common.copy")} onClick={() => { void navigator.clipboard?.writeText(value); setCopied(true); window.setTimeout(() => setCopied(false), 1200); }}>{copied ? <Check /> : <Copy />}</IconButton>;
+  const [copyFailed, setCopyFailed] = useState(false);
+  const copy = async () => {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard_unavailable");
+      await navigator.clipboard.writeText(value);
+      setCopyFailed(false);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+      setCopyFailed(true);
+    }
+  };
+  return <IconButton label={copied ? t("common.copied") : copyFailed ? t("common.copyFailed") : t("common.copy")} onClick={() => void copy()}>{copied ? <Check /> : copyFailed ? <CircleAlert /> : <Copy />}</IconButton>;
 }
 
 export function LoadingRows({ rows = 3 }: { rows?: number }) {

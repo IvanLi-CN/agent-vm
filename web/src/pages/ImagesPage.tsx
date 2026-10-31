@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { actionLabel, formatDateTime, shortFingerprint } from "../app/format";
 import { ManagementRequestError, createOperationId, listImages, previewImageAction, startImageImport, submitImageAction, uploadImageImportContent } from "../app/api";
 import type { ActionPreview, ImageImportRequest, Locale, ManagedImage } from "../app/types";
+import { auditReasonWithinLimit, optionalAuditReason } from "../app/validation";
 import { ActionDialog } from "../components/ActionDialog";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { CopyButton, EmptyState, Input, Panel, PanelHeader, StatusBadge, Button } from "../components/ui";
@@ -35,6 +36,7 @@ export function ImagesPage() {
   const [metadataFile, setMetadataFile] = useState<File | null>(null);
   const [rootfsFile, setRootfsFile] = useState<File | null>(null);
   const [reason, setReason] = useState("");
+  const importReasonTooLong = !auditReasonWithinLimit(reason);
   const [importMessage, setImportMessage] = useState("");
   const [pendingImport, setPendingImport] = useState<ImportSubmission | null>(null);
   const [action, setAction] = useState<ImageAction | null>(null);
@@ -75,29 +77,31 @@ export function ImagesPage() {
   };
 
   const startImport = () => {
+    if (importReasonTooLong) { setImportMessage(t("common.reasonTooLong")); return; }
     if (pendingImport) {
       importMutation.mutate(pendingImport);
       return;
     }
     const targetVersion = query.data?.catalog_version;
-    if (!reason.trim()) { setImportMessage(t("dialog.reasonRequired")); return; }
     if (!targetVersion) { setImportMessage(t("images.targetUnavailable")); return; }
     const operation_id = createOperationId();
+    const providedReason = optionalAuditReason(reason);
+    const optionalReason = providedReason === undefined ? {} : { reason: providedReason };
     if (sourceKind === "trusted_remote") {
-      const request: ImageImportRequest = { operation_id, reason: reason.trim(), target_version: targetVersion, version_label: versionLabel, source: { kind: "trusted_remote", source_id: sourceId, expected_fingerprint: expectedFingerprint } };
+      const request: ImageImportRequest = { operation_id, ...optionalReason, target_version: targetVersion, version_label: versionLabel, source: { kind: "trusted_remote", source_id: sourceId, expected_fingerprint: expectedFingerprint } };
       submitImport({ request });
       return;
     }
     if (format === "unified") {
       if (!uploadFile) { setImportMessage(t("images.fileRequired")); return; }
       if (!expectedSha.trim()) { setImportMessage(t("images.expectedShaRequired")); return; }
-      const request: ImageImportRequest = { operation_id, reason: reason.trim(), target_version: targetVersion, version_label: versionLabel, source: { kind: "local_upload", format: "unified", expected_sha256: expectedSha.trim(), expected_size_bytes: String(uploadFile.size) } };
+      const request: ImageImportRequest = { operation_id, ...optionalReason, target_version: targetVersion, version_label: versionLabel, source: { kind: "local_upload", format: "unified", expected_sha256: expectedSha.trim(), expected_size_bytes: String(uploadFile.size) } };
       submitImport({ request, content: uploadFile });
       return;
     }
     if (!metadataFile || !rootfsFile) { setImportMessage(t("images.fileRequired")); return; }
     if (!expectedMetadataSha.trim() || !expectedRootfsSha.trim()) { setImportMessage(t("images.expectedShaRequired")); return; }
-    const request: ImageImportRequest = { operation_id, reason: reason.trim(), target_version: targetVersion, version_label: versionLabel, source: { kind: "local_upload", format: "split", metadata: { expected_sha256: expectedMetadataSha.trim(), expected_size_bytes: String(metadataFile.size) }, rootfs: { expected_sha256: expectedRootfsSha.trim(), expected_size_bytes: String(rootfsFile.size) } } };
+    const request: ImageImportRequest = { operation_id, ...optionalReason, target_version: targetVersion, version_label: versionLabel, source: { kind: "local_upload", format: "split", metadata: { expected_sha256: expectedMetadataSha.trim(), expected_size_bytes: String(metadataFile.size) }, rootfs: { expected_sha256: expectedRootfsSha.trim(), expected_size_bytes: String(rootfsFile.size) } } };
     submitImport({ request, content: { metadata: metadataFile, rootfs: rootfsFile } });
   };
 
@@ -162,9 +166,9 @@ export function ImagesPage() {
             <label className="file-field"><span>{t("images.rootfsFile")}</span><span className="file-input"><FileUp aria-hidden="true" /><input type="file" accept="application/octet-stream,.tar,.tar.gz" onChange={(event) => setRootfsFile(event.target.files?.[0] ?? null)} /><span>{rootfsFile?.name ?? t("images.chooseFile")}</span></span></label>
           </>}
         </>}
-        <label className="field-label field-span-2">{t("images.importReason")}<Input value={reason} onChange={(event) => setReason(event.target.value)} placeholder={t("common.reasonPlaceholder")} /></label>
+        <label className="field-label field-span-2">{t("images.importReason")}<Input value={reason} aria-invalid={importReasonTooLong ? "true" : undefined} aria-describedby={importReasonTooLong ? "image-import-reason-error" : undefined} onChange={(event) => { setReason(event.target.value); setImportMessage(""); }} placeholder={t("common.reasonPlaceholder")} /></label>
       </div>
-      <div className="import-footer"><span className={importMessage.includes("created") || importMessage.includes("已创建") ? "success-copy" : "field-error"}>{importMessage}</span><Button variant="primary" icon={<FileUp />} disabled={importMutation.isPending} onClick={startImport}>{importMutation.isPending ? t("common.loading") : t("images.startImport")}</Button></div>
+      <div className="import-footer"><span id={importReasonTooLong ? "image-import-reason-error" : undefined} role={importReasonTooLong ? "alert" : undefined} className={!importReasonTooLong && (importMessage.includes("created") || importMessage.includes("已创建")) ? "success-copy" : "field-error"}>{importReasonTooLong ? t("common.reasonTooLong") : importMessage}</span><Button variant="primary" icon={<FileUp />} disabled={importMutation.isPending || importReasonTooLong} onClick={startImport}>{importMutation.isPending ? t("common.loading") : t("images.startImport")}</Button></div>
     </Panel>
     {action && preview && selected ? <ActionDialog preview={preview} actionLabel={actionLabel(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", locale)} target={`${selected.version_label} · ${shortFingerprint(selected.fingerprint)}`} dangerous={action === "delete" || action === "retire"} busy={actionMutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null); }} onConfirm={(actionReason) => actionMutation.mutate({ reason: actionReason })} /> : null}
   </div>;

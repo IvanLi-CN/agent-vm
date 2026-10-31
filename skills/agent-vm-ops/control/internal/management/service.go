@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
@@ -24,6 +25,19 @@ import (
 )
 
 var fingerprintPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
+
+func validateReason(value string) error {
+	if value == "" {
+		return nil
+	}
+	if strings.TrimSpace(value) == "" {
+		return errors.New("invalid_request: reason must not be blank")
+	}
+	if !utf8.ValidString(value) || utf8.RuneCountInString(value) > 512 {
+		return errors.New("invalid_request: reason exceeds 512 Unicode characters")
+	}
+	return nil
+}
 
 type Service struct {
 	Store                *state.Store
@@ -58,6 +72,7 @@ type Options struct {
 	Clock                      func() time.Time
 	Backend                    ImageBackend
 	Actions                    ActionBackend
+	OperationLockDir           string
 }
 
 func (s *Service) rejectNewManagementAction(ctx context.Context) error {
@@ -198,6 +213,35 @@ func (s *Service) lockTrustedImport(operationID string) func() {
 	}
 }
 
+func (s *Service) lockOperation(ctx context.Context, operationID string) (func(), error) {
+	if operationID == "" {
+		return nil, errors.New("invalid_request: operation ID is required")
+	}
+	return s.lockResource(ctx, "management-operation:"+operationID)
+}
+
+// AcquireResourceLock returns a process-independent lock for shared management
+// resources. The lock directory is shared by blue and green services after the
+// rqlite cutover; callers hold it across the native effect and its catalog or
+// capacity bookkeeping.
+func (s *Service) AcquireResourceLock(ctx context.Context, resource string) (func(), error) {
+	if resource == "" {
+		return nil, errors.New("invalid_request: resource lock key is required")
+	}
+	return s.lockResource(ctx, "management-resource:"+resource)
+}
+
+func (s *Service) lockResource(ctx context.Context, key string) (func(), error) {
+	if s.Options.OperationLockDir == "" {
+		return func() {}, nil
+	}
+	lock, err := native.AcquireNamedLock(ctx, s.Options.OperationLockDir, key)
+	if err != nil {
+		return nil, fmt.Errorf("management operation lock: %w", err)
+	}
+	return func() { _ = lock.Close() }, nil
+}
+
 func (s *Service) Initialize(ctx context.Context, legacyFingerprint string) error {
 	if err := s.Store.EnsureManagementSchema(ctx); err != nil {
 		return err
@@ -333,11 +377,11 @@ func (s *Service) StartImageImport(ctx context.Context, request ImportRequest) (
 }
 
 func (s *Service) ValidateImport(request ImportRequest) error {
-	if request.OperationID == "" || request.Actor == "" || strings.TrimSpace(request.Reason) == "" {
-		return errors.New("invalid_request: operation_id, actor and reason are required")
+	if request.OperationID == "" || request.Actor == "" {
+		return errors.New("invalid_request: operation_id and actor are required")
 	}
-	if len(request.Reason) > 512 {
-		return errors.New("invalid_request: reason exceeds 512 characters")
+	if err := validateReason(request.Reason); err != nil {
+		return err
 	}
 	if request.TargetVersion == "" || request.VersionLabel == "" {
 		return errors.New("invalid_request: target_version and version_label are required")
@@ -413,11 +457,14 @@ func (s *Service) checkImageStorageCapacity(size int64) error {
 // imports that have passed the capacity probe but have not finished writing.
 // The returned release function is idempotent and must be called after native
 // import (or when the operation claim is lost).
-func (s *Service) reserveImageStorage(size int64, required bool) (func(), error) {
+func (s *Service) reserveImageStorage(ctx context.Context, size int64, required bool) (func(), error) {
 	if size < 0 {
 		return nil, errors.New("invalid_request: image size must not be negative")
 	}
 	if s.Options.ReserveImageStorage != nil {
+		// The production callback is lifecycle.ReservePhysicalStorage, which
+		// owns the shared image-storage fence together with VM admission. Do not
+		// acquire the same named lock here or the callback would self-deadlock.
 		return s.Options.ReserveImageStorage(size)
 	}
 	if s.Options.AvailableImageStorageBytes == nil || s.Options.UploadMinimumFreeBytes <= 0 {
@@ -426,13 +473,19 @@ func (s *Service) reserveImageStorage(size int64, required bool) (func(), error)
 		}
 		return func() {}, nil
 	}
+	sharedUnlock, err := s.AcquireResourceLock(ctx, "image-storage")
+	if err != nil {
+		return nil, err
+	}
 	s.imageStorageMu.Lock()
 	defer s.imageStorageMu.Unlock()
 	available, err := s.Options.AvailableImageStorageBytes()
 	if err != nil {
+		sharedUnlock()
 		return nil, errors.New("staging_capacity_low: image storage capacity could not be verified")
 	}
 	if available < 0 || size > math.MaxInt64-s.Options.UploadMinimumFreeBytes || s.imageStorageReserved > math.MaxInt64-size-s.Options.UploadMinimumFreeBytes || available < s.imageStorageReserved+size+s.Options.UploadMinimumFreeBytes {
+		sharedUnlock()
 		return nil, errors.New("staging_capacity_low: image storage reserve is insufficient")
 	}
 	s.imageStorageReserved += size
@@ -445,6 +498,7 @@ func (s *Service) reserveImageStorage(size int64, required bool) (func(), error)
 				s.imageStorageReserved = 0
 			}
 			s.imageStorageMu.Unlock()
+			sharedUnlock()
 		})
 	}, nil
 }
@@ -501,7 +555,7 @@ func (s *Service) beginLocalImageUpload(ctx context.Context, operationID string)
 	if err := s.checkStagingCapacity(declaredSize); err != nil {
 		return operation, nil, nil, err
 	}
-	release, err := s.reserveImageStorage(declaredSize, false)
+	release, err := s.reserveImageStorage(ctx, declaredSize, false)
 	if err != nil {
 		return operation, nil, nil, err
 	}
@@ -518,6 +572,11 @@ func (s *Service) beginLocalImageUpload(ctx context.Context, operationID string)
 }
 
 func (s *Service) UploadImageImport(ctx context.Context, operationID string, metadata, rootfs []byte) (*state.ManagementOperation, error) {
+	unlock, err := s.lockOperation(ctx, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	operation, request, release, err := s.beginLocalImageUpload(ctx, operationID)
 	if err != nil {
 		return operation, err
@@ -554,6 +613,11 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 }
 
 func (s *Service) UploadImageImportFiles(ctx context.Context, operationID, metadataPath, rootfsPath string) (*state.ManagementOperation, error) {
+	unlock, err := s.lockOperation(ctx, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	operation, request, release, err := s.beginLocalImageUpload(ctx, operationID)
 	if err != nil {
 		return operation, err
@@ -649,6 +713,11 @@ func validateImportFile(path string, expectedSize int64, expectedDigest string) 
 // FailImageImportUpload durably closes an upload operation when the HTTP
 // stream fails before the bytes can reach the image verifier.
 func (s *Service) FailImageImportUpload(ctx context.Context, operationID string, err error) (*state.ManagementOperation, error) {
+	unlock, lockErr := s.lockOperation(ctx, operationID)
+	if lockErr != nil {
+		return nil, lockErr
+	}
+	defer unlock()
 	operation, getErr := s.Store.GetManagementOperation(ctx, operationID)
 	if getErr != nil || operation == nil {
 		return operation, getErr
@@ -674,6 +743,11 @@ func (s *Service) FailImageImportUpload(ctx context.Context, operationID string,
 }
 
 func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) (*state.ManagementOperation, error) {
+	operationUnlock, err := s.lockOperation(ctx, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer operationUnlock()
 	unlock := s.lockTrustedImport(operationID)
 	defer unlock()
 	operation, err := s.Store.GetManagementOperation(ctx, operationID)
@@ -710,7 +784,7 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 	if size <= 0 {
 		return operation, errors.New("capacity_unverified: trusted image size could not be verified")
 	}
-	release, err := s.reserveImageStorage(size, true)
+	release, err := s.reserveImageStorage(ctx, size, true)
 	if err != nil {
 		return operation, err
 	}
@@ -790,6 +864,11 @@ func imageUnpackText(value string) bool {
 }
 
 func (s *Service) cleanupImportedImage(ctx context.Context, fingerprint string) string {
+	catalogUnlock, lockErr := s.AcquireResourceLock(ctx, "image-catalog")
+	if lockErr != nil {
+		return "blocked_catalog_unverified"
+	}
+	defer catalogUnlock()
 	unlock := s.Store.LockImageSelection()
 	defer unlock()
 	image, err := s.Store.GetManagedImage(ctx, fingerprint)
@@ -816,6 +895,11 @@ func (s *Service) cleanupImportedImage(ctx context.Context, fingerprint string) 
 // recovery path. Running native work is never replayed automatically because
 // the previous executor may still be alive or its result may be uncertain.
 func (s *Service) RecoverOperation(ctx context.Context, operationID string) (*state.ManagementOperation, error) {
+	unlock, err := s.lockOperation(ctx, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	operation, err := s.Store.GetManagementOperation(ctx, operationID)
 	if err != nil {
 		return nil, err
@@ -896,8 +980,14 @@ func (s *Service) finishImport(ctx context.Context, operation *state.ManagementO
 		InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID),
 		State: "available", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none",
 	}
-	if err := s.Store.InsertManagedImage(ctx, image); err != nil {
-		return s.recoverImportedCatalogFailure(ctx, operation, artifact, err)
+	catalogUnlock, lockErr := s.AcquireResourceLock(ctx, "image-catalog")
+	if lockErr != nil {
+		return s.recoverImportedCatalogFailure(ctx, operation, artifact, lockErr)
+	}
+	insertErr := s.Store.InsertManagedImage(ctx, image)
+	catalogUnlock()
+	if insertErr != nil {
+		return s.recoverImportedCatalogFailure(ctx, operation, artifact, insertErr)
 	}
 	return s.finishOperation(ctx, operation, "completed", "succeeded", map[string]any{"fingerprint": artifact.Fingerprint, "state": "available"}, nil)
 }
@@ -914,6 +1004,12 @@ func (s *Service) recoverImportedCatalogFailure(ctx context.Context, operation *
 		"imported_fingerprint": artifact.Fingerprint,
 		"catalog_error":        "catalog persistence failed",
 	}
+	catalogUnlock, lockErr := s.AcquireResourceLock(ctx, "image-catalog")
+	if lockErr != nil {
+		detail["cleanup"] = "blocked_catalog_unverified"
+		return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, detail)
+	}
+	defer catalogUnlock()
 	unlock := s.Store.LockImageSelection()
 	defer unlock()
 	if existing, err := s.Store.GetManagedImage(ctx, artifact.Fingerprint); err == nil && existing != nil {
@@ -938,8 +1034,14 @@ func (s *Service) failImportWithImage(ctx context.Context, operation *state.Mana
 	if !fingerprintPattern.MatchString(artifact.Fingerprint) {
 		return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
 	}
-	if err := s.Store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Architecture: artifact.Architecture, InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID), State: "failed", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none"}); err != nil {
-		return s.recoverImportedCatalogFailure(ctx, operation, artifact, err)
+	catalogUnlock, lockErr := s.AcquireResourceLock(ctx, "image-catalog")
+	if lockErr != nil {
+		return s.recoverImportedCatalogFailure(ctx, operation, artifact, lockErr)
+	}
+	insertErr := s.Store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Architecture: artifact.Architecture, InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID), State: "failed", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none"})
+	catalogUnlock()
+	if insertErr != nil {
+		return s.recoverImportedCatalogFailure(ctx, operation, artifact, insertErr)
 	}
 	return s.finishOperation(ctx, operation, "completed", "failed", nil, map[string]any{"code": "image_not_applicable", "phase": "suitability_check", "findings": findings})
 }
@@ -1046,12 +1148,25 @@ func (s *Service) requireImageVersion(ctx context.Context, fingerprint, expected
 }
 
 func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reason, action, targetID, targetVersion string, mutate func() (map[string]any, error)) (*state.ManagementOperation, error) {
-	if operationID == "" || actor == "" || strings.TrimSpace(reason) == "" {
-		return nil, errors.New("invalid_request: operation, actor and reason are required")
+	unlock, err := s.lockOperation(ctx, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if operationID == "" || actor == "" {
+		return nil, errors.New("invalid_request: operation and actor are required")
+	}
+	if err := validateReason(reason); err != nil {
+		return nil, err
 	}
 	if err := s.rejectNewManagementAction(ctx); err != nil {
 		return nil, err
 	}
+	catalogUnlock, err := s.AcquireResourceLock(ctx, "image-catalog")
+	if err != nil {
+		return nil, err
+	}
+	defer catalogUnlock()
 	req := map[string]any{"action": action, "target_id": targetID, "target_version": targetVersion, "actor": actor, "reason": reason}
 	digest, _ := protocol.Digest(protocol.Request(req))
 	operation := state.ManagementOperation{OperationID: operationID, Action: action, TargetKind: "image", TargetID: targetID, Actor: actor, Reason: reason, Phase: "reference_check", Status: "queued", Request: map[string]any{"_request_digest": digest, "request": req}}
@@ -1089,6 +1204,11 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 }
 
 func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) (*state.ManagementOperation, error) {
+	unlock, err := s.lockOperation(ctx, request.OperationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	s.vmActionMu.Lock()
 	defer s.vmActionMu.Unlock()
 	actionRequest := map[string]any{"action": request.Action, "task_id": request.TaskID, "target_version": request.TargetVersion, "generation": request.ExpectedGeneration, "parameters": request.Parameters, "actor": request.Actor, "reason": request.Reason, "target_kind": "vm", "target_id": request.TaskID}
@@ -1182,6 +1302,11 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 }
 
 func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceRequest) (*state.ManagementOperation, error) {
+	unlock, err := s.lockOperation(ctx, request.OperationID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 	actionRequest := map[string]any{"action": request.Action, "target_version": request.TargetVersion, "parameters": request.Parameters, "actor": request.Actor, "reason": request.Reason, "target_kind": "system", "target_id": "system"}
@@ -1246,8 +1371,11 @@ func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceReq
 }
 
 func (s *Service) claimAction(ctx context.Context, operationID, actor, reason, action, targetKind, targetID string, request map[string]any) (*state.ManagementOperation, error) {
-	if operationID == "" || actor == "" || strings.TrimSpace(reason) == "" {
-		return nil, errors.New("invalid_request: operation, actor and reason are required")
+	if operationID == "" || actor == "" {
+		return nil, errors.New("invalid_request: operation and actor are required")
+	}
+	if err := validateReason(reason); err != nil {
+		return nil, err
 	}
 	request["actor"], request["reason"] = actor, reason
 	request["action"], request["target_kind"], request["target_id"] = action, targetKind, targetID

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -21,11 +22,81 @@ type fakeImageBackend struct {
 	deletes  int
 }
 
+func TestReasonValidationUsesUnicodeCodePointsAndAllowsOmission(t *testing.T) {
+	for _, value := range []string{"", strings.Repeat("a", 512), strings.Repeat("\U0001f431", 512)} {
+		if err := validateReason(value); err != nil {
+			t.Fatalf("reason %q rejected: %v", value[:minTestStringLen(len(value), 8)], err)
+		}
+	}
+	for _, value := range []string{" \t\n", strings.Repeat("a", 513), string([]byte{0xff})} {
+		if err := validateReason(value); err == nil {
+			t.Fatalf("invalid reason %q was accepted", value[:minTestStringLen(len(value), 8)])
+		}
+	}
+}
+
+func minTestStringLen(value, maximum int) int {
+	if value < maximum {
+		return value
+	}
+	return maximum
+}
+
 type blockingImageBackend struct {
 	fakeImageBackend
 	entered chan struct{}
 	release chan struct{}
 	once    sync.Once
+}
+
+type sharedCapacityImageBackend struct {
+	artifact  ImageArtifact
+	entered   chan struct{}
+	release   chan struct{}
+	once      sync.Once
+	mu        sync.Mutex
+	imports   int
+	completed bool
+}
+
+func (backend *sharedCapacityImageBackend) ImportTrusted(ctx context.Context, sourceID, fingerprint string) (ImageArtifact, error) {
+	backend.mu.Lock()
+	backend.imports++
+	count := backend.imports
+	backend.mu.Unlock()
+	if count == 1 {
+		backend.once.Do(func() { close(backend.entered) })
+		select {
+		case <-backend.release:
+		case <-ctx.Done():
+			return ImageArtifact{}, ctx.Err()
+		}
+		backend.mu.Lock()
+		backend.completed = true
+		backend.mu.Unlock()
+	}
+	return backend.artifact, nil
+}
+
+func (backend *sharedCapacityImageBackend) TrustedImportSize(context.Context, string, string) (int64, error) {
+	return 1, nil
+}
+
+func (backend *sharedCapacityImageBackend) ImportLocal(context.Context, string, []byte, []byte) (ImageArtifact, error) {
+	return backend.artifact, nil
+}
+
+func (backend *sharedCapacityImageBackend) DeleteImage(context.Context, string) error {
+	return nil
+}
+
+func (backend *sharedCapacityImageBackend) available() (int64, error) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if backend.completed {
+		return 512, nil
+	}
+	return 513, nil
 }
 
 type partialImageBackend struct {
@@ -74,6 +145,13 @@ type fakeActionBackend struct {
 	err              error
 }
 
+type blockingActionBackend struct {
+	fakeActionBackend
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
 func (backend *fakeActionBackend) ExecuteVMAction(context.Context, string, string, string, int64, map[string]any) (map[string]any, error) {
 	backend.vmCalls++
 	return map[string]any{"state": "changed"}, backend.err
@@ -82,6 +160,16 @@ func (backend *fakeActionBackend) ExecuteVMAction(context.Context, string, strin
 func (backend *fakeActionBackend) ExecuteMaintenance(context.Context, string, string, map[string]any) (map[string]any, error) {
 	backend.maintenanceCalls++
 	return map[string]any{"state": "changed"}, backend.err
+}
+
+func (backend *blockingActionBackend) ExecuteMaintenance(ctx context.Context, operationID, action string, parameters map[string]any) (map[string]any, error) {
+	backend.once.Do(func() { close(backend.entered) })
+	select {
+	case <-backend.release:
+		return map[string]any{"state": "changed"}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (backend *fakeActionBackend) ValidateVMAction(context.Context, state.Task, string, map[string]any) error {
@@ -308,30 +396,42 @@ func TestConcurrentTrustedImportsReserveImageStorage(t *testing.T) {
 	}
 }
 
-func TestConcurrentTrustedImportRetriesSerializeByOperation(t *testing.T) {
-	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "trusted-import-retry.sqlite3"))
+func TestConcurrentTrustedImportsUseSharedStorageLock(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "state.sqlite3")
+	firstStore, err := state.OpenForTest(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
-	fingerprint := strings.Repeat("a", 64)
-	backend := &blockingImageBackend{
-		fakeImageBackend: fakeImageBackend{artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}},
-		entered:          make(chan struct{}), release: make(chan struct{}),
-	}
-	service := New(store, Options{
-		TrustedImageSourceIDs:      []string{"approved"},
-		UploadMinimumFreeBytes:     512,
-		AvailableImageStorageBytes: func() (int64, error) { return 513, nil },
-		Backend:                    backend,
-	})
-	request := ImportRequest{OperationID: "trusted-retry", Actor: "admin", Reason: "retry race", TargetVersion: "image-catalog:revision-1", VersionLabel: "a", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}}
-	if _, err := service.StartImageImport(context.Background(), request); err != nil {
+	defer firstStore.Close()
+	secondStore, err := state.OpenForTest(path)
+	if err != nil {
 		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	fingerprint := strings.Repeat("d", 64)
+	backend := &sharedCapacityImageBackend{
+		artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true},
+		entered:  make(chan struct{}), release: make(chan struct{}),
+	}
+	options := Options{
+		TrustedImageSourceIDs: []string{"approved"}, UploadMinimumFreeBytes: 512,
+		AvailableImageStorageBytes: backend.available, Backend: backend, OperationLockDir: filepath.Join(root, "locks"),
+	}
+	first := New(firstStore, options)
+	second := New(secondStore, options)
+	requests := []ImportRequest{
+		{OperationID: "shared-storage-a", Actor: "admin", Reason: "shared lock", TargetVersion: "image-catalog:revision-1", VersionLabel: "a", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}},
+		{OperationID: "shared-storage-b", Actor: "admin", Reason: "shared lock", TargetVersion: "image-catalog:revision-1", VersionLabel: "b", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}},
+	}
+	for _, request := range requests {
+		if _, err := first.StartImageImport(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
 	}
 	firstDone := make(chan error, 1)
 	go func() {
-		operation, processErr := service.ProcessTrustedImport(context.Background(), request.OperationID)
+		operation, processErr := first.ProcessTrustedImport(context.Background(), requests[0].OperationID)
 		if processErr == nil && operation.Status != "succeeded" {
 			processErr = fmt.Errorf("first operation = %#v", operation)
 		}
@@ -340,14 +440,14 @@ func TestConcurrentTrustedImportRetriesSerializeByOperation(t *testing.T) {
 	select {
 	case <-backend.entered:
 	case <-time.After(time.Second):
-		t.Fatal("first import did not reach native backend")
+		t.Fatal("first shared-storage import did not reach native backend")
 	}
 	secondDone := make(chan struct {
 		operation *state.ManagementOperation
 		err       error
 	}, 1)
 	go func() {
-		operation, processErr := service.ProcessTrustedImport(context.Background(), request.OperationID)
+		operation, processErr := second.ProcessTrustedImport(context.Background(), requests[1].OperationID)
 		secondDone <- struct {
 			operation *state.ManagementOperation
 			err       error
@@ -355,103 +455,141 @@ func TestConcurrentTrustedImportRetriesSerializeByOperation(t *testing.T) {
 	}()
 	select {
 	case result := <-secondDone:
-		t.Fatalf("retry returned before original import completed: operation=%#v err=%v", result.operation, result.err)
-	case <-time.After(50 * time.Millisecond):
+		t.Fatalf("second import crossed shared storage lock: operation=%#v err=%v", result.operation, result.err)
+	case <-time.After(100 * time.Millisecond):
 	}
 	close(backend.release)
 	if err := <-firstDone; err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case result := <-secondDone:
-		if result.err != nil || result.operation == nil || result.operation.Status != "succeeded" {
-			t.Fatalf("serialized retry result = operation:%#v err:%v", result.operation, result.err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("serialized retry did not observe the completed operation")
-	}
-	if backend.imports != 1 {
-		t.Fatalf("serialized retry imported %d times, want 1", backend.imports)
+	result := <-secondDone
+	if result.err == nil || !strings.HasPrefix(result.err.Error(), "staging_capacity_low:") || result.operation == nil || result.operation.Status != "queued" {
+		t.Fatalf("second shared-storage result = %#v err=%v", result.operation, result.err)
 	}
 }
 
-func TestTrustedImportUsesSharedReservationCallbackUntilCompletion(t *testing.T) {
-	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+func TestSharedManagementResourceLockSerializesAcrossServices(t *testing.T) {
+	lockDir := filepath.Join(t.TempDir(), "locks")
+	first := New(nil, Options{OperationLockDir: lockDir})
+	second := New(nil, Options{OperationLockDir: lockDir})
+	firstUnlock, err := first.AcquireResourceLock(context.Background(), "image-catalog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDone := make(chan struct {
+		unlock func()
+		err    error
+	}, 1)
+	go func() {
+		unlock, lockErr := second.AcquireResourceLock(context.Background(), "image-catalog")
+		secondDone <- struct {
+			unlock func()
+			err    error
+		}{unlock: unlock, err: lockErr}
+	}()
+	select {
+	case result := <-secondDone:
+		if result.unlock != nil {
+			result.unlock()
+		}
+		t.Fatalf("shared management lock was not exclusive: err=%v", result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	firstUnlock()
+	result := <-secondDone
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	result.unlock()
+}
+
+func TestFinishImportCatalogLockFailurePersistsUnknownOutcome(t *testing.T) {
+	root := t.TempDir()
+	store, err := state.OpenForTest(filepath.Join(root, "state.sqlite3"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	fingerprint := strings.Repeat("a", 64)
-	backend := &blockingImageBackend{fakeImageBackend: fakeImageBackend{artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}}, entered: make(chan struct{}), release: make(chan struct{})}
-	var reservationMu sync.Mutex
-	activeReservations := 0
-	reserveCalls := 0
-	service := New(store, Options{
-		TrustedImageSourceIDs:  []string{"approved"},
-		UploadMinimumFreeBytes: 512,
-		ReserveImageStorage: func(size int64) (func(), error) {
-			reservationMu.Lock()
-			defer reservationMu.Unlock()
-			if size != 1 {
-				return nil, fmt.Errorf("unexpected reservation size %d", size)
-			}
-			reserveCalls++
-			if activeReservations != 0 {
-				return nil, errors.New("shared reservation is occupied")
-			}
-			activeReservations++
-			var once sync.Once
-			return func() {
-				once.Do(func() {
-					reservationMu.Lock()
-					activeReservations--
-					reservationMu.Unlock()
-				})
-			}, nil
-		},
-		Backend: backend,
-	})
-	requests := []ImportRequest{
-		{OperationID: "trusted-callback-a", Actor: "admin", Reason: "shared callback", TargetVersion: "image-catalog:revision-1", VersionLabel: "a", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}},
-		{OperationID: "trusted-callback-b", Actor: "admin", Reason: "shared callback", TargetVersion: "image-catalog:revision-1", VersionLabel: "b", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}},
+
+	fingerprint := strings.Repeat("c", 64)
+	operationID := "catalog-lock-failure"
+	operation := state.ManagementOperation{
+		OperationID: operationID, Action: "image_import", TargetKind: "image_catalog", TargetID: "image-catalog",
+		Actor: "admin", Reason: "catalog lock regression", Phase: "image_import", Status: "running",
+		Request: map[string]any{"request": map[string]any{"operation_id": operationID}},
 	}
-	for _, request := range requests {
-		if _, err := service.StartImageImport(context.Background(), request); err != nil {
-			t.Fatal(err)
-		}
-	}
-	firstDone := make(chan error, 1)
-	go func() {
-		operation, processErr := service.ProcessTrustedImport(context.Background(), requests[0].OperationID)
-		if processErr == nil && operation.Status != "succeeded" {
-			processErr = fmt.Errorf("first operation = %#v", operation)
-		}
-		firstDone <- processErr
-	}()
-	select {
-	case <-backend.entered:
-	case <-time.After(time.Second):
-		t.Fatal("callback-backed import did not reach native backend")
-	}
-	reservationMu.Lock()
-	active, calls := activeReservations, reserveCalls
-	reservationMu.Unlock()
-	if active != 1 || calls != 1 {
-		t.Fatalf("shared reservation state = active:%d calls:%d", active, calls)
-	}
-	second, err := service.ProcessTrustedImport(context.Background(), requests[1].OperationID)
-	if err == nil || !strings.Contains(err.Error(), "shared reservation is occupied") || second.Status != "queued" {
-		t.Fatalf("second callback-backed import = operation:%#v err:%v", second, err)
-	}
-	close(backend.release)
-	if err := <-firstDone; err != nil {
+	if _, err := store.ClaimManagementOperationWithAudit(context.Background(), operation, state.ManagementAudit{
+		EventID: "catalog-lock-failure-accepted", OperationID: &operationID, Action: operation.Action, Actor: operation.Actor,
+		Reason: operation.Reason, Target: map[string]any{"kind": operation.TargetKind, "id": operation.TargetID}, Outcome: "accepted", Phase: operation.Phase,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	reservationMu.Lock()
-	active, calls = activeReservations, reserveCalls
-	reservationMu.Unlock()
-	if active != 0 || calls != 2 || backend.imports != 1 {
-		t.Fatalf("shared reservation release = active:%d calls:%d imports:%d", active, calls, backend.imports)
+	lockPath := filepath.Join(root, "locks-file")
+	if err := os.WriteFile(lockPath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeImageBackend{}
+	service := New(store, Options{OperationLockDir: lockPath, Backend: backend})
+	request := ImportRequest{OperationID: operationID, VersionLabel: "2026.10", Source: ImportSource{Kind: "trusted_remote", ExpectedFingerprint: fingerprint}}
+	artifact := ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}
+
+	result, err := service.finishImport(context.Background(), &operation, request, artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.Status != "outcome_unknown" || result.Phase != "reconciliation" {
+		t.Fatalf("result = %#v", result)
+	}
+	if result.Error["imported_fingerprint"] != fingerprint || result.Error["cleanup"] != "blocked_catalog_unverified" {
+		t.Fatalf("result error = %#v", result.Error)
+	}
+	if backend.deletes != 0 {
+		t.Fatalf("cleanup unexpectedly reached backend: %d", backend.deletes)
+	}
+}
+
+func TestFailImportWithImageCatalogLockFailurePersistsUnknownOutcome(t *testing.T) {
+	root := t.TempDir()
+	store, err := state.OpenForTest(filepath.Join(root, "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	fingerprint := strings.Repeat("d", 64)
+	operationID := "suitability-lock-failure"
+	operation := state.ManagementOperation{
+		OperationID: operationID, Action: "image_import", TargetKind: "image_catalog", TargetID: "image-catalog",
+		Actor: "admin", Reason: "suitability lock regression", Phase: "suitability_check", Status: "running",
+		Request: map[string]any{"request": map[string]any{"operation_id": operationID}},
+	}
+	if _, err := store.ClaimManagementOperationWithAudit(context.Background(), operation, state.ManagementAudit{
+		EventID: "suitability-lock-failure-accepted", OperationID: &operationID, Action: operation.Action, Actor: operation.Actor,
+		Reason: operation.Reason, Target: map[string]any{"kind": operation.TargetKind, "id": operation.TargetID}, Outcome: "accepted", Phase: operation.Phase,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(root, "locks-file")
+	if err := os.WriteFile(lockPath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeImageBackend{}
+	service := New(store, Options{OperationLockDir: lockPath, Backend: backend})
+	request := ImportRequest{OperationID: operationID, VersionLabel: "2026.10", Source: ImportSource{Kind: "local_upload"}}
+	artifact := ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "vm", Runtime: true, SyncTool: true, GuestReady: true}
+
+	result, err := service.failImportWithImage(context.Background(), &operation, request, artifact, "passed", "failed", []string{"unsupported_instance_type"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.Status != "outcome_unknown" || result.Phase != "reconciliation" {
+		t.Fatalf("result = %#v", result)
+	}
+	if result.Error["imported_fingerprint"] != fingerprint || result.Error["cleanup"] != "blocked_catalog_unverified" {
+		t.Fatalf("result error = %#v", result.Error)
+	}
+	if backend.deletes != 0 {
+		t.Fatalf("cleanup unexpectedly reached backend: %d", backend.deletes)
 	}
 }
 
@@ -830,6 +968,140 @@ func TestMaintenanceDoesNotBecomeStaleFromItsOwnJournalWrites(t *testing.T) {
 	}
 	if operation.Status != "succeeded" {
 		t.Fatalf("operation = %#v", operation)
+	}
+}
+
+func TestRecoverPendingOperationsWaitsForPeerOperationLock(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "state.sqlite3")
+	firstStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStore.Close()
+	secondStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	backend := &blockingActionBackend{entered: make(chan struct{}), release: make(chan struct{})}
+	lockDir := filepath.Join(root, "locks")
+	first := New(firstStore, Options{Actions: backend, CurrentSystemVersion: func(context.Context) (string, error) { return "system:initial", nil }, OperationLockDir: lockDir})
+	second := New(secondStore, Options{OperationLockDir: lockDir})
+	request := MaintenanceRequest{OperationID: "maintenance-peer-fence", Actor: "admin", Reason: "peer fence", TargetVersion: "system:initial", Action: "reconcile"}
+	executionDone := make(chan struct{})
+	var execution *state.ManagementOperation
+	var executionErr error
+	go func() {
+		execution, executionErr = first.ExecuteMaintenance(context.Background(), request)
+		close(executionDone)
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("peer maintenance action did not start")
+	}
+	recoveryDone := make(chan error, 1)
+	go func() { recoveryDone <- second.RecoverPendingOperations(context.Background()) }()
+	select {
+	case err := <-recoveryDone:
+		t.Fatalf("recovery finalized a live peer operation: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(backend.release)
+	select {
+	case <-executionDone:
+	case <-time.After(time.Second):
+		t.Fatal("peer maintenance action did not finish")
+	}
+	if executionErr != nil || execution == nil || execution.Status != "succeeded" {
+		t.Fatalf("execution=%#v err=%v", execution, executionErr)
+	}
+	select {
+	case err := <-recoveryDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not finish after peer released operation lock")
+	}
+	recovered, err := second.GetOperation(context.Background(), request.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.Status != "succeeded" {
+		t.Fatalf("recovered operation = %#v, want peer result", recovered)
+	}
+}
+
+func TestRecoverPendingTrustedImportWaitsForPeerOperationLock(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "state.sqlite3")
+	firstStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStore.Close()
+	secondStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	fingerprint := strings.Repeat("e", 64)
+	backend := &blockingImageBackend{
+		fakeImageBackend: fakeImageBackend{artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}},
+		entered:          make(chan struct{}), release: make(chan struct{}),
+	}
+	lockDir := filepath.Join(root, "locks")
+	first := New(firstStore, Options{TrustedImageSourceIDs: []string{"approved"}, Backend: backend, UploadMinimumFreeBytes: 512, AvailableImageStorageBytes: func() (int64, error) { return 4096, nil }, OperationLockDir: lockDir})
+	second := New(secondStore, Options{OperationLockDir: lockDir})
+	request := ImportRequest{OperationID: "trusted-peer-fence", Actor: "admin", Reason: "peer fence", TargetVersion: "image-catalog:revision-1", VersionLabel: "peer", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}}
+	operation, err := first.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executionDone := make(chan struct{})
+	var execution *state.ManagementOperation
+	var executionErr error
+	go func() {
+		execution, executionErr = first.ProcessTrustedImport(context.Background(), operation.OperationID)
+		close(executionDone)
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("peer trusted import did not start")
+	}
+	recoveryDone := make(chan error, 1)
+	go func() { recoveryDone <- second.RecoverPendingOperations(context.Background()) }()
+	select {
+	case recoveryErr := <-recoveryDone:
+		t.Fatalf("recovery finalized a live peer trusted import: %v", recoveryErr)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(backend.release)
+	select {
+	case <-executionDone:
+	case <-time.After(time.Second):
+		t.Fatal("peer trusted import did not finish")
+	}
+	if executionErr != nil || execution == nil || execution.Status != "succeeded" {
+		t.Fatalf("execution=%#v err=%v", execution, executionErr)
+	}
+	select {
+	case recoveryErr := <-recoveryDone:
+		if recoveryErr != nil {
+			t.Fatal(recoveryErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not finish after peer trusted import released operation lock")
+	}
+	recovered, err := second.GetOperation(context.Background(), operation.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.Status != "succeeded" {
+		t.Fatalf("recovered operation = %#v, want peer result", recovered)
 	}
 }
 

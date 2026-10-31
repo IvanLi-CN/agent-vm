@@ -1584,12 +1584,12 @@ export class ResourceControl extends ControlCore {
 
   async _configure_network(instance_name: string, vm_ip: string): Promise<void> {
     const properties: Data = {
-      "ipv4.address": vm_ip,
       "security.mac_filtering": "true", "security.ipv4_filtering": "true",
       "security.ipv6_filtering": "true", "security.port_isolation": "true",
       "security.acls": this.config.network_acl,
       "security.acls.default.ingress.action": "allow",
       "security.acls.default.egress.action": "allow",
+      "ipv4.address": vm_ip,
     };
     for (const [key, value] of Object.entries(properties))
       await this.incus.device_set(instance_name, "eth0", key, value);

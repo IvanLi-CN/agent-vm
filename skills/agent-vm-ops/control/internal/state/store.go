@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS audit (
 
 const missingDBCode = "database_missing"
 
+const managementAuthEpochKey = "management_auth_epoch"
+
 var stateEpochHex = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 type StateEpochError struct {
@@ -91,6 +93,20 @@ type StateEpochError struct {
 
 func (err *StateEpochError) Error() string {
 	return fmt.Sprintf("state_unverified: state database epoch %s", err.Reason)
+}
+
+func validateStateEpoch(value string) error {
+	value = strings.TrimSpace(value)
+	if value == "initial" || stateEpochHex.MatchString(value) {
+		return nil
+	}
+	if value == "0" || (value != "" && value[0] != '0') {
+		if parsed, parseErr := strconv.ParseUint(value, 10, 63); parseErr == nil && parsed <= uint64(^uint64(0)>>1) {
+			return nil
+		}
+		return &StateEpochError{Value: value, Reason: "is out of range"}
+	}
+	return &StateEpochError{Value: value, Reason: "is invalid"}
 }
 
 // TransactionError preserves the point at which a SQLite mutation failed.
@@ -112,6 +128,13 @@ func (err *TransactionError) Error() string {
 }
 
 func (err *TransactionError) Unwrap() error { return err.Cause }
+
+// Uncertain marks a transaction whose commit outcome cannot be established.
+// Callers that journal externally visible operations must preserve them for
+// reconciliation instead of converting the result into a retryable failure.
+func (err *TransactionError) Uncertain() bool {
+	return err != nil && err.StateCommitted == nil
+}
 
 func committed(value bool) *bool { return &value }
 
@@ -183,15 +206,17 @@ type Store struct {
 	reads             [2]*sql.DB
 	readIndex         atomic.Uint32
 	imageSelectionMu  sync.Mutex
+	remote            *remoteBackend
 	auditSummaryMu    sync.Mutex
 	auditSummary      AuditSummary
 	auditSummaryReady bool
 }
 
 type Tx struct {
-	conn    *sql.Conn
-	changed bool
-	closed  bool
+	conn        *sql.Conn
+	changed     bool
+	authChanged bool
+	closed      bool
 }
 
 // LockImageSelection serializes default-image changes with lifecycle
@@ -214,6 +239,9 @@ type TaskCondition struct {
 func Open(path string, allowCreate bool) (*Store, error) {
 	if path == "" {
 		return nil, fmt.Errorf("%s: empty path", missingDBCode)
+	}
+	if isRemoteDSN(path) {
+		return openRemote(path, allowCreate)
 	}
 	if info, err := os.Stat(path); err != nil {
 		if !allowCreate && errors.Is(err, os.ErrNotExist) {
@@ -277,6 +305,9 @@ func OpenForTest(path string) (*Store, error) {
 func (s *Store) Path() string { return s.path }
 
 func (s *Store) Close() error {
+	if s.remote != nil {
+		return s.remote.close()
+	}
 	var first error
 	for _, db := range s.reads {
 		if db != nil {
@@ -307,9 +338,13 @@ func (s *Store) initialize(ctx context.Context) error {
 		} else if err != nil {
 			return fmt.Errorf("read state epoch: %w", err)
 		}
+		if _, err := tx.exec("INSERT OR IGNORE INTO meta(key, value) VALUES(?, 'initial')", managementAuthEpochKey); err != nil {
+			return fmt.Errorf("initialize management auth epoch: %w", err)
+		}
 		// Schema/bootstrap writes establish the known initial sentinel; the
 		// first business mutation receives an opaque token on its commit.
 		tx.changed = false
+		tx.authChanged = false
 		return nil
 	})
 }
@@ -361,6 +396,9 @@ func configure(conn *sql.Conn, ctx context.Context) error {
 }
 
 func (s *Store) withRead(ctx context.Context, fn func(*sql.Conn) error) error {
+	if s.remote != nil {
+		return s.remote.withRead(ctx, fn)
+	}
 	db := s.reads[s.readIndex.Add(1)%uint32(len(s.reads))]
 	conn, err := db.Conn(ctx)
 	if err != nil {
@@ -374,6 +412,9 @@ func (s *Store) withRead(ctx context.Context, fn func(*sql.Conn) error) error {
 }
 
 func (s *Store) withWrite(ctx context.Context, fn func(*Tx) error) error {
+	if s.remote != nil {
+		return s.remote.withWrite(ctx, fn)
+	}
 	conn, err := s.write.Conn(ctx)
 	if err != nil {
 		return &TransactionError{Phase: "connection", SQLOperation: "write", StateCommitted: committed(false), Cause: err}
@@ -404,6 +445,16 @@ func (s *Store) withWrite(ctx context.Context, fn func(*Tx) error) error {
 			return &TransactionError{Phase: "commit", SQLOperation: "state_epoch", StateCommitted: stateCommitted, RollbackError: rollbackErr, Cause: err}
 		}
 	}
+	if tx.authChanged {
+		if _, err := tx.conn.ExecContext(ctx, "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", managementAuthEpochKey, newEpoch()); err != nil {
+			_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
+			stateCommitted := committed(false)
+			if rollbackErr != nil {
+				stateCommitted = nil
+			}
+			return &TransactionError{Phase: "commit", SQLOperation: managementAuthEpochKey, StateCommitted: stateCommitted, RollbackError: rollbackErr, Cause: err}
+		}
+	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		_, rollbackErr := conn.ExecContext(context.Background(), "ROLLBACK")
 		return &TransactionError{Phase: "commit", SQLOperation: "commit", StateCommitted: nil, RollbackError: rollbackErr, Cause: err}
@@ -413,13 +464,29 @@ func (s *Store) withWrite(ctx context.Context, fn func(*Tx) error) error {
 }
 
 func (tx *Tx) exec(query string, args ...any) (sql.Result, error) {
+	return tx.execWithEpoch(true, query, args...)
+}
+
+// execWithoutEpoch records a durable authorization-row change without
+// advancing the shared state epoch. The transaction rotates the separate
+// management auth epoch instead, so confirmation latches do not invalidate the
+// resource version returned by their own preview.
+func (tx *Tx) execWithoutEpoch(query string, args ...any) (sql.Result, error) {
+	return tx.execWithEpoch(false, query, args...)
+}
+
+func (tx *Tx) execWithEpoch(advanceEpoch bool, query string, args ...any) (sql.Result, error) {
 	if tx.closed {
 		return nil, errors.New("transaction is closed")
 	}
 	result, err := tx.conn.ExecContext(context.Background(), query, args...)
 	if err == nil {
 		if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows > 0 {
-			tx.changed = true
+			if advanceEpoch {
+				tx.changed = true
+			} else if rowsErr == nil {
+				tx.authChanged = true
+			}
 		}
 	}
 	return result, err
@@ -436,17 +503,7 @@ func (s *Store) StateEpoch(ctx context.Context) (string, error) {
 		if err != nil {
 			return err
 		}
-		value = strings.TrimSpace(value)
-		if value == "initial" || stateEpochHex.MatchString(value) {
-			return nil
-		}
-		if value == "0" || (value != "" && value[0] != '0') {
-			if parsed, parseErr := strconv.ParseUint(value, 10, 63); parseErr == nil && parsed <= uint64(^uint64(0)>>1) {
-				return nil
-			}
-			return &StateEpochError{Value: value, Reason: "is out of range"}
-		}
-		return &StateEpochError{Value: value, Reason: "is invalid"}
+		return validateStateEpoch(value)
 	})
 	return value, err
 }
@@ -812,6 +869,10 @@ func (s *Store) DeleteTask(ctx context.Context, taskID string) error {
 func (s *Store) DeleteTaskIf(ctx context.Context, taskID string, condition TaskCondition) (bool, error) {
 	deleted := false
 	err := s.withWrite(ctx, func(tx *Tx) error {
+		// A remote write may replay the callback after a proven state-epoch
+		// conflict. Recompute the result from the final attempt instead of
+		// retaining a successful result from an abandoned local attempt.
+		deleted = false
 		var sessionID string
 		var generation int64
 		err := tx.conn.QueryRowContext(ctx, "SELECT session_id, generation FROM tasks WHERE task_id = ?", taskID).Scan(&sessionID, &generation)
@@ -1175,7 +1236,9 @@ func (s *Store) Audit(ctx context.Context, action, taskID, sessionID, outcome st
 		s.auditSummaryReady = false
 		return err
 	}
-	if s.auditSummaryReady {
+	// Keep the incremental cache only for local SQLite. Remote summaries are
+	// rebuilt after withRead synchronizes the mirror with rqlite.
+	if s.remote == nil && s.auditSummaryReady {
 		var parsed any
 		decoder := json.NewDecoder(strings.NewReader(string(raw)))
 		decoder.UseNumber()
@@ -1190,7 +1253,10 @@ func (s *Store) Audit(ctx context.Context, action, taskID, sessionID, outcome st
 func (s *Store) AuditSummary(ctx context.Context) (AuditSummary, error) {
 	s.auditSummaryMu.Lock()
 	defer s.auditSummaryMu.Unlock()
-	if s.auditSummaryReady {
+	// A remote store must synchronize its mirror before every summary read;
+	// the process-local cache cannot observe audit rows committed by the peer
+	// slot. Local SQLite keeps the existing cache for the hot path.
+	if s.remote == nil && s.auditSummaryReady {
 		return cloneAuditSummary(s.auditSummary), nil
 	}
 	result := AuditSummary{

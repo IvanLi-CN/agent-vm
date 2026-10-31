@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -87,6 +88,7 @@ type Service struct {
 	activeMu          sync.Mutex
 	activeOps         map[string]int
 	admissionMu       sync.Mutex
+	lockDir           string
 	storageMu         sync.Mutex
 	storageReserved   int64
 	auditSummaryMu    sync.RWMutex
@@ -117,6 +119,7 @@ type Options struct {
 	CPU       CPUObserver
 	Memory    MemoryObserver
 	Release   *protocol.ReleaseMetadata
+	LockDir   string
 }
 
 type CPUObserver interface {
@@ -132,7 +135,12 @@ func New(store *state.Store, cfg config.Config, options Options) *Service {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Memory: options.Memory, Release: options.Release, resident: options.Resident, ready: false, wake: options.Wake, actionLocks: make(map[string]*sync.Mutex), activeOps: make(map[string]int)}
+	lockDir := options.LockDir
+	if lockDir == "" && cfg.StoragePath != "" {
+		lockDir = filepath.Join(cfg.StoragePath, "locks")
+	}
+	service := &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Memory: options.Memory, Release: options.Release, lockDir: lockDir, resident: options.Resident, ready: false, wake: options.Wake, actionLocks: make(map[string]*sync.Mutex), activeOps: make(map[string]int)}
+	return service
 }
 
 func (s *Service) auditSummary(ctx context.Context, epoch string) (state.AuditSummary, error) {
@@ -189,6 +197,16 @@ func (s *Service) ReservePhysicalStorage(ctx context.Context, size int64) (func(
 	}
 	unlockDrain := s.lockNamedAction("drain")
 	defer unlockDrain()
+	unlockStorage, lockErr := s.lockNamedActionWithContext(ctx, "management-resource:image-storage")
+	if lockErr != nil {
+		return nil, resourceLockError(lockErr)
+	}
+	reservationHeld := false
+	defer func() {
+		if !reservationHeld {
+			unlockStorage()
+		}
+	}()
 	if draining, err := s.isDraining(ctx); err != nil {
 		return nil, s.sqliteError(err)
 	} else if draining {
@@ -231,6 +249,7 @@ func (s *Service) ReservePhysicalStorage(ctx context.Context, size int64) (func(
 	}
 	s.storageReserved += size
 	s.storageMu.Unlock()
+	reservationHeld = true
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -241,6 +260,7 @@ func (s *Service) ReservePhysicalStorage(ctx context.Context, size int64) (func(
 				s.storageReserved = 0
 			}
 			s.storageMu.Unlock()
+			unlockStorage()
 		})
 	}, nil
 }
@@ -261,17 +281,58 @@ func (s *Service) wakeScheduler() {
 }
 
 func (s *Service) lockAction(action string, request protocol.Request) func() {
+	unlock, err := s.lockActionWithContext(context.Background(), action, request)
+	if err != nil {
+		return func() {}
+	}
+	return unlock
+}
+
+func (s *Service) lockActionWithContext(ctx context.Context, action string, request protocol.Request) (func(), error) {
 	var unlocks []func()
+	acquire := func(key string) error {
+		unlock, err := s.lockNamedActionWithContext(ctx, key)
+		if err != nil {
+			return err
+		}
+		unlocks = append(unlocks, unlock)
+		return nil
+	}
 	if releaseSensitiveAction(action, request) || action == "drain-enter" || action == "drain-exit" || action == "admin-metrics" {
 		// Drain ownership is a process-wide release boundary. It must not be
 		// serialized only by the caller's session lock: a release
 		// transaction and a native management action must observe one durable
 		// owner in order.
-		unlocks = append(unlocks, s.lockNamedAction("drain"))
+		if err := acquire("drain"); err != nil {
+			return func() {}, err
+		}
+	}
+	if action == "acquire" || action == "release" || action == "destroy" || action == "resize" {
+		if err := acquire("management-resource:image-storage"); err != nil {
+			for index := len(unlocks) - 1; index >= 0; index-- {
+				unlocks[index]()
+			}
+			return func() {}, err
+		}
 	}
 	if action == "admin-reconcile" || action == "timer-reconcile" || action == "admin-gc" || action == "timer-age-gc" {
-		s.maintenance.Lock()
-		unlocks = append(unlocks, s.maintenance.Unlock)
+		if err := acquire("maintenance"); err != nil {
+			for index := len(unlocks) - 1; index >= 0; index-- {
+				unlocks[index]()
+			}
+			return func() {}, err
+		}
+	}
+	if action == "acquire" {
+		// Image selection is shared with management mutations. Use the same
+		// process-independent fence before reading the default image and
+		// persisting the preparing task.
+		if err := acquire("management-resource:image-catalog"); err != nil {
+			for index := len(unlocks) - 1; index >= 0; index-- {
+				unlocks[index]()
+			}
+			return func() {}, err
+		}
 	}
 	key := ""
 	if action != "drain-enter" && action != "drain-exit" && !releaseSensitiveAction(action, request) {
@@ -282,18 +343,31 @@ func (s *Service) lockAction(action string, request protocol.Request) func() {
 		}
 	}
 	if key != "" {
-		unlocks = append(unlocks, s.lockNamedAction(key))
+		if err := acquire(key); err != nil {
+			for index := len(unlocks) - 1; index >= 0; index-- {
+				unlocks[index]()
+			}
+			return func() {}, err
+		}
 	}
 	return func() {
 		for index := len(unlocks) - 1; index >= 0; index-- {
 			unlocks[index]()
 		}
-	}
+	}, nil
 }
 
 func (s *Service) lockNamedAction(key string) func() {
-	if key == "" {
+	unlock, err := s.lockNamedActionWithContext(context.Background(), key)
+	if err != nil {
 		return func() {}
+	}
+	return unlock
+}
+
+func (s *Service) lockNamedActionWithContext(ctx context.Context, key string) (func(), error) {
+	if key == "" {
+		return func() {}, nil
 	}
 	s.lockMu.Lock()
 	lock, exists := s.actionLocks[key]
@@ -302,8 +376,47 @@ func (s *Service) lockNamedAction(key string) func() {
 		s.actionLocks[key] = lock
 	}
 	s.lockMu.Unlock()
-	lock.Lock()
-	return lock.Unlock
+	if err := lockWithContext(ctx, lock); err != nil {
+		return nil, err
+	}
+	if s.lockDir == "" {
+		return lock.Unlock, nil
+	}
+	processLock, err := native.AcquireNamedLock(ctx, s.lockDir, key)
+	if err != nil {
+		lock.Unlock()
+		return nil, err
+	}
+	return func() {
+		_ = processLock.Close()
+		lock.Unlock()
+	}, nil
+}
+
+func lockWithContext(ctx context.Context, lock *sync.Mutex) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if lock.TryLock() {
+			return nil
+		}
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
 
 func (s *Service) trySessionLock(session string) (func(), bool) {
@@ -318,16 +431,37 @@ func (s *Service) trySessionLock(session string) (func(), bool) {
 	if !lock.TryLock() {
 		return nil, false
 	}
-	return lock.Unlock, true
+	if s.lockDir == "" {
+		return lock.Unlock, true
+	}
+	processLock, acquired, err := native.TryNamedLock(s.lockDir, key)
+	if err != nil || !acquired {
+		lock.Unlock()
+		return nil, false
+	}
+	return func() {
+		_ = processLock.Close()
+		lock.Unlock()
+	}, true
 }
 
-func (s *Service) withSessionLock(session string, fn func() (map[string]any, error)) (map[string]any, error) {
+func (s *Service) withSessionLock(ctx context.Context, session string, fn func() (map[string]any, error)) (map[string]any, error) {
 	if session == "" {
 		return fn()
 	}
-	unlock := s.lockAction("session", protocol.Request{"session_id": session})
+	unlock, err := s.lockActionWithContext(ctx, "session", protocol.Request{"session_id": session})
+	if err != nil {
+		return nil, resourceLockError(err)
+	}
 	defer unlock()
 	return fn()
+}
+
+func resourceLockError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return protocol.NewError("operation_conflict", "resource lock acquisition did not complete", nil)
+	}
+	return protocol.NewError("state_unavailable", "resource lock is unavailable", nil)
 }
 
 func (s *Service) markOperationActive(operationID string) func() {
@@ -879,7 +1013,10 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if write && request["generation"] == nil {
 		return nil, protocol.NewError("invalid_request", "write request requires generation", nil)
 	}
-	unlock := s.lockAction(action, request)
+	unlock, lockErr := s.lockActionWithContext(ctx, action, request)
+	if lockErr != nil {
+		return nil, resourceLockError(lockErr)
+	}
 	defer unlock()
 	if releaseSensitiveAction(action, request) && !isInternalCleanup(ctx) {
 		releaseDrain, drainErr := s.releaseDrainOwned(ctx)
@@ -1083,12 +1220,25 @@ func hasWarning(existing []any, candidate any) bool {
 // marked ready. Pending journal intents are evidence of an uncertain native
 // outcome and must remain visible for explicit inspection or cleanup.
 func (s *Service) StartupReconcile(ctx context.Context) error {
+	// Startup recovery may inspect and stop a pending native worker. Share the
+	// release-sensitive drain boundary with normal lifecycle actions so one
+	// slot cannot recover a worker that another slot is still starting.
+	unlockDrain, err := s.lockNamedActionWithContext(ctx, "drain")
+	if err != nil {
+		return err
+	}
+	defer unlockDrain()
+	unlockMaintenance, err := s.lockNamedActionWithContext(ctx, "maintenance")
+	if err != nil {
+		return err
+	}
+	defer unlockMaintenance()
 	s.maintenance.Lock()
 	defer s.maintenance.Unlock()
 	if _, err := s.Store.StateEpoch(ctx); err != nil {
 		return s.sqliteError(err)
 	}
-	_, reconcileErr := s.reconcile(ctx, true)
+	_, reconcileErr := s.reconcile(ctx, true, "startup")
 	if reconcileErr != nil && protocol.AsError(reconcileErr).Code != "cleanup_incomplete" {
 		return reconcileErr
 	}
@@ -1930,7 +2080,7 @@ func (s *Service) renew(ctx context.Context, request protocol.Request) (map[stri
 }
 
 func (s *Service) release(ctx context.Context, request protocol.Request, destroy bool) (map[string]any, error) {
-	return s.withSessionLock(stringValue(request["session_id"]), func() (map[string]any, error) {
+	return s.withSessionLock(ctx, stringValue(request["session_id"]), func() (map[string]any, error) {
 		return s.releaseUnlocked(ctx, request, destroy)
 	})
 }
@@ -3047,7 +3197,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 	return nil, protocol.NewError("observation_unavailable", "metrics observation did not converge", nil)
 }
 
-func (s *Service) reconcile(ctx context.Context, apply bool, _ ...string) (map[string]any, error) {
+func (s *Service) reconcile(ctx context.Context, apply bool, mode ...string) (map[string]any, error) {
 	if apply {
 		pending, pendingErr := s.Store.PendingOperations(ctx)
 		if pendingErr != nil {
@@ -3061,6 +3211,12 @@ func (s *Service) reconcile(ctx context.Context, apply bool, _ ...string) (map[s
 		}
 		if err := s.recoverPending(ctx, pending); err != nil {
 			return nil, err
+		}
+		startup := len(mode) > 0 && mode[0] == "startup"
+		if !startup {
+			if err := s.reconcileOrphanedAcquireOperations(ctx, pending); err != nil {
+				return nil, err
+			}
 		}
 	}
 	tasks, err := s.Store.ListTasks(ctx)
@@ -3132,7 +3288,10 @@ func (s *Service) reconcile(ctx context.Context, apply bool, _ ...string) (map[s
 
 // A pending destroy remains authoritative even if earlier recovery left the task closing.
 func (s *Service) reconcileClosing(ctx context.Context, task *state.Task) error {
-	unlock := s.lockAction("session", protocol.Request{"session_id": task.SessionID})
+	unlock, lockErr := s.lockActionWithContext(ctx, "session", protocol.Request{"session_id": task.SessionID})
+	if lockErr != nil {
+		return resourceLockError(lockErr)
+	}
 	defer unlock()
 	pending, err := s.Store.PendingOperations(ctx)
 	if err != nil {
@@ -3729,7 +3888,6 @@ func (s *Service) configureNetwork(ctx context.Context, task *state.Task) error 
 		return protocol.NewError("mapping_unverified", "managed guest IPv4 address is unavailable", map[string]any{"outcome_verified": false})
 	}
 	properties := []struct{ key, value string }{
-		{"ipv4.address", *task.VMIP},
 		{"security.mac_filtering", "true"},
 		{"security.ipv4_filtering", "true"},
 		{"security.ipv6_filtering", "true"},
@@ -3737,6 +3895,9 @@ func (s *Service) configureNetwork(ctx context.Context, task *state.Task) error 
 		{"security.acls", s.Config.NetworkACL},
 		{"security.acls.default.ingress.action", "allow"},
 		{"security.acls.default.egress.action", "allow"},
+		// Incus requires IPv4 filtering before a static address on a bridge
+		// whose DHCP server is disabled.
+		{"ipv4.address", *task.VMIP},
 	}
 	for _, property := range properties {
 		if err := s.Guest.DeviceSet(ctx, task.InstanceName, "eth0", property.key, property.value); err != nil {

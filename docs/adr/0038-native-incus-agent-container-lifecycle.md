@@ -5,6 +5,11 @@ supersedes: 0025-native-incus-agent-vm-lifecycle.md
 
 # Native Incus Agent container lifecycle
 
+The transport and SQLite labels in the diagram show the pre-blue-green baseline.
+ADR 0043 and ADR 0044 define the current unified service boundary and the
+conservative migration to shared rqlite; the Incus container and lifecycle
+invariants below remain unchanged.
+
 ## Context
 
 The Agent VM product name describes the isolated execution boundary, not the Incus instance type. The control environment may itself run inside an LXC container, and the managed session must remain low-cost inside that boundary. Requiring an Incus VM would add QEMU and hardware-virtualization dependencies, including `/dev/kvm`, without improving the session contract.

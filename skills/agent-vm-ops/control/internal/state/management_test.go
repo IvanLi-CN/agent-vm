@@ -34,7 +34,7 @@ func TestManagementMigrationIsAdditiveAndSeedsLegacyDefault(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(capabilities) != 4 {
+	if len(capabilities) != 6 {
 		t.Fatalf("capabilities = %#v", capabilities)
 	}
 	image, err := store.GetManagedImage(context.Background(), fingerprint)

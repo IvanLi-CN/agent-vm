@@ -1,0 +1,686 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { AlertTriangle, ChevronLeft, ChevronRight, KeyRound, ShieldCheck, UserRound } from "lucide-react";
+import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { ManagementRequestError, createAgentToken, createOperationId, getManagementSession, getOperation, listTokens, previewTokenRevocation, submitTokenRevocation } from "../app/api";
+import { formatDateTime } from "../app/format";
+import type { ActionPreview, AgentToken, Locale, ManagementSession, Operation, TokenCreateResult, TokenRevokePreview, TokenScope } from "../app/types";
+import { auditReasonWithinLimit } from "../app/validation";
+import { ActionDialog } from "./ActionDialog";
+import { Badge, EmptyState, Button, CopyButton, Input, Panel, PanelHeader, StatusBadge, Textarea } from "./ui";
+
+const scopeOptions: Array<{ scope: TokenScope; label: string }> = [
+  { scope: "agent:read", label: "tokens.scopeRead" },
+  { scope: "agent:operate", label: "tokens.scopeOperate" },
+  { scope: "agent:sync", label: "tokens.scopeSync" },
+  { scope: "agent:observe_admin", label: "tokens.scopeObserve" },
+];
+
+type CreateRequest = { scopes: TokenScope[]; expiresAt: string; auditReason: string; operationId: string };
+type CreateRecoveryDecision = "check" | "retry_same" | "new_intent" | "blocked";
+type CreateRecoverySnapshot = {
+  createRequest: CreateRequest | null;
+  createOperationIdValue: string | null;
+  createRecoveryOperationId: string | null;
+  createRecoveryStatus: Operation | null;
+  createRecoveryTokenId: string | null;
+  createRecoveryTokenMetadata: AgentToken | null;
+  createRecoveryDecision: CreateRecoveryDecision | null;
+  createRecoveryError: string | null;
+  createErrorCode: string | null;
+};
+
+type RevokeRecoveryDecision = "preview_pending" | "ready" | "check" | "retry_same" | "blocked";
+type RevokeRecoverySnapshot = {
+  token: AgentToken;
+  preview: TokenRevokePreview | null;
+  operationId: string;
+  auditReason: string;
+  decision: RevokeRecoveryDecision;
+  status: Operation | null;
+  errorCode: string | null;
+  recoveryErrorCode: string | null;
+};
+
+const createRecoveryQueryKey = ["token-create-recovery"] as const;
+const revokeRecoveryQueryKey = ["token-revoke-recovery"] as const;
+const definitiveCreateFailureCodes = new Set([
+  "authentication_required",
+  "administrator_required",
+  "permission_denied",
+  "csrf_invalid",
+  "origin_invalid",
+  "invalid_request",
+  "invalid_state",
+  "unsupported_action",
+  "not_found",
+  "stale_target",
+  "operation_conflict",
+  "precondition_required",
+]);
+
+function defaultExpiry(): string {
+  const value = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000);
+  value.setSeconds(0, 0);
+  return value.toISOString().slice(0, 16);
+}
+
+function tokenState(token: AgentToken): "active" | "expired" | "revoked" {
+  if (token.revoked_at) return "revoked";
+  return Date.parse(token.expires_at) <= Date.now() ? "expired" : "active";
+}
+
+function actionPreview(preview: TokenRevokePreview): ActionPreview {
+  return {
+    target_version: preview.target_version,
+    confirmation_token: preview.confirmation_token,
+    expires_at: preview.expires_at,
+    impact: {
+      summary_code: "token_revoke",
+      affected_session_count: 0,
+      affected_image_references: { default: 0, active: 0, cached: 0, releasing: 0, pending_creation: 0, verification: 0 },
+      changes: [{ code: "token_revoked", count: null, value: preview.token_id }],
+    },
+  };
+}
+
+function errorMessageForCode(code: string | null, t: (key: string, options?: { defaultValue?: string }) => string): string | null {
+  if (!code) return null;
+  if (code === "generic") return t("errors.generic");
+  return t(`errors.${code}`, { defaultValue: t("errors.generic") });
+}
+
+function errorMessage(error: unknown, t: (key: string, options?: { defaultValue?: string }) => string): string {
+  return errorMessageForCode(error instanceof ManagementRequestError ? error.code : "generic", t) ?? t("errors.generic");
+}
+
+function createOutcomeIsUncertain(error: unknown): boolean {
+  return !(error instanceof ManagementRequestError) || error.retryable || !definitiveCreateFailureCodes.has(error.code);
+}
+
+type TokenManagementProps = {
+  dialogBlocked?: boolean;
+  onDialogStateChange?: (open: boolean) => void;
+};
+
+export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: TokenManagementProps = {}) {
+  const { t, i18n } = useTranslation();
+  const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
+  const client = useQueryClient();
+  const createRecoveryQuery = useQuery<CreateRecoverySnapshot | null>({
+    queryKey: createRecoveryQueryKey,
+    queryFn: () => Promise.resolve(client.getQueryData<CreateRecoverySnapshot>(createRecoveryQueryKey) ?? null),
+    enabled: false,
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const persistedCreateRecovery = createRecoveryQuery.data ?? client.getQueryData<CreateRecoverySnapshot>(createRecoveryQueryKey);
+  const revokeRecoveryQuery = useQuery<RevokeRecoverySnapshot | null>({
+    queryKey: revokeRecoveryQueryKey,
+    queryFn: () => Promise.resolve(client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey) ?? null),
+    enabled: false,
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
+  const persistedRevokeRecovery = revokeRecoveryQuery.data ?? client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey);
+  const [scopes, setScopes] = useState<TokenScope[]>(["agent:read"]);
+  const [expiresAt, setExpiresAt] = useState(defaultExpiry);
+  const [reason, setReason] = useState("");
+  const createReasonTooLong = !auditReasonWithinLimit(reason);
+  const [createErrorCode, setCreateErrorCode] = useState<string | null>(() => persistedCreateRecovery?.createErrorCode ?? null);
+  const [createError, setCreateError] = useState<string | null>(() => errorMessageForCode(persistedCreateRecovery?.createErrorCode ?? null, t));
+  const [createRequest, setCreateRequest] = useState<CreateRequest | null>(() => persistedCreateRecovery?.createRequest ?? null);
+  const [createOperationIdValue, setCreateOperationIdValue] = useState<string | null>(() => persistedCreateRecovery?.createOperationIdValue ?? null);
+  const [createRecoveryOperationId, setCreateRecoveryOperationId] = useState<string | null>(() => persistedCreateRecovery?.createRecoveryOperationId ?? null);
+  const [createRecoveryStatus, setCreateRecoveryStatus] = useState<Operation | null>(() => persistedCreateRecovery?.createRecoveryStatus ?? null);
+  const [createRecoveryTokenId, setCreateRecoveryTokenId] = useState<string | null>(() => persistedCreateRecovery?.createRecoveryTokenId ?? null);
+  const [createRecoveryTokenMetadata, setCreateRecoveryTokenMetadata] = useState<AgentToken | null>(() => persistedCreateRecovery?.createRecoveryTokenMetadata ?? null);
+  const [createRecoveryDecision, setCreateRecoveryDecision] = useState<CreateRecoveryDecision | null>(() => persistedCreateRecovery?.createRecoveryDecision ?? null);
+  const [createRecoveryPending, setCreateRecoveryPending] = useState(false);
+  const [createRecoveryError, setCreateRecoveryError] = useState<string | null>(() => persistedCreateRecovery?.createRecoveryError ?? null);
+  const [plaintextToken, setPlaintextToken] = useState<string | null>(null);
+  const [plaintextMetadata, setPlaintextMetadata] = useState<AgentToken | null>(() => persistedCreateRecovery?.createRecoveryTokenMetadata ?? null);
+  const [plaintextConsumed, setPlaintextConsumed] = useState(() => Boolean(persistedCreateRecovery?.createRecoveryTokenMetadata));
+  const [revokeRecovery, setRevokeRecovery] = useState<RevokeRecoverySnapshot | null>(() => persistedRevokeRecovery ?? null);
+  const [revokeError, setRevokeError] = useState<string | null>(null);
+  const [revokeCheckPending, setRevokeCheckPending] = useState(false);
+  const revokePreviewRequestRef = useRef(0);
+  const revokeInFlightRef = useRef(false);
+  const revokeTriggerRef = useRef<HTMLElement | null>(null);
+  const mountedRef = useRef(false);
+  const [tokenCursor, setTokenCursor] = useState<string | undefined>();
+  const [tokenCursorStack, setTokenCursorStack] = useState<string[]>([]);
+
+  const sessionQuery = useQuery<ManagementSession>({ queryKey: ["management-session"], queryFn: getManagementSession, staleTime: 30_000 });
+  const session = sessionQuery.data;
+  const canManageTokens = session?.capabilities.includes("manage_tokens") ?? false;
+  const tokensQuery = useQuery({ queryKey: ["tokens", tokenCursor], queryFn: () => listTokens(tokenCursor), enabled: canManageTokens, refetchInterval: 10_000, refetchIntervalInBackground: false });
+  const refreshSessionAfterAuthFailure = (error: unknown) => {
+    if (error instanceof ManagementRequestError && (error.code === "authentication_required" || error.code === "csrf_invalid")) void client.invalidateQueries({ queryKey: ["management-session"], exact: true });
+  };
+
+  useEffect(() => { refreshSessionAfterAuthFailure(tokensQuery.error); }, [tokensQuery.error]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+  useEffect(() => {
+    client.setQueryDefaults(createRecoveryQueryKey, { gcTime: Infinity });
+    client.setQueryDefaults(revokeRecoveryQueryKey, { gcTime: Infinity });
+  }, [client]);
+  useEffect(() => {
+    if (revokeRecoveryQuery.data !== undefined) setRevokeRecovery(revokeRecoveryQuery.data);
+  }, [revokeRecoveryQuery.data]);
+  const persistCreateRecovery = useCallback((snapshot: CreateRecoverySnapshot | null) => {
+    if (snapshot) client.setQueryData(createRecoveryQueryKey, snapshot);
+    else client.setQueryData(createRecoveryQueryKey, null);
+  }, [client]);
+  const persistRevokeRecovery = useCallback((snapshot: RevokeRecoverySnapshot | null) => {
+    client.setQueryData(revokeRecoveryQueryKey, snapshot);
+    if (mountedRef.current) setRevokeRecovery(snapshot);
+  }, [client]);
+  const clearRevokeRecovery = useCallback(() => {
+    revokePreviewRequestRef.current += 1;
+    revokeInFlightRef.current = false;
+    persistRevokeRecovery(null);
+    if (mountedRef.current) {
+      setRevokeError(null);
+      setRevokeCheckPending(false);
+      onDialogStateChange?.(false);
+    }
+  }, [onDialogStateChange, persistRevokeRecovery]);
+
+  const revokeToken = revokeRecovery?.token ?? null;
+  const revokePreview = revokeRecovery?.preview ?? null;
+  const revokePreviewPending = revokeRecovery?.decision === "preview_pending";
+  const revokeDialogOpen = Boolean(revokeToken && revokePreview && revokeRecovery?.decision === "ready");
+
+  useEffect(() => {
+    if (!onDialogStateChange) return;
+    onDialogStateChange(revokeRecovery?.decision === "preview_pending" || revokeDialogOpen);
+  }, [onDialogStateChange, revokeDialogOpen, revokeRecovery?.decision]);
+
+  useEffect(() => {
+    const snapshot: CreateRecoverySnapshot = { createRequest, createOperationIdValue, createRecoveryOperationId, createRecoveryStatus, createRecoveryTokenId, createRecoveryTokenMetadata, createRecoveryDecision, createRecoveryError, createErrorCode };
+    if (snapshot.createRequest || snapshot.createOperationIdValue || snapshot.createRecoveryOperationId || snapshot.createRecoveryStatus || snapshot.createRecoveryTokenId || snapshot.createRecoveryTokenMetadata || snapshot.createRecoveryDecision || snapshot.createRecoveryError || snapshot.createErrorCode) persistCreateRecovery(snapshot);
+    else persistCreateRecovery(null);
+  }, [createRequest, createOperationIdValue, createRecoveryOperationId, createRecoveryStatus, createRecoveryTokenId, createRecoveryTokenMetadata, createRecoveryDecision, createRecoveryError, createErrorCode, persistCreateRecovery]);
+
+  useEffect(() => {
+    const snapshot = persistedCreateRecovery;
+    setCreateRequest(snapshot?.createRequest ?? null);
+    setCreateOperationIdValue(snapshot?.createOperationIdValue ?? null);
+    setCreateRecoveryOperationId(snapshot?.createRecoveryOperationId ?? null);
+    setCreateRecoveryStatus(snapshot?.createRecoveryStatus ?? null);
+    setCreateRecoveryTokenId(snapshot?.createRecoveryTokenId ?? null);
+    setCreateRecoveryTokenMetadata(snapshot?.createRecoveryTokenMetadata ?? null);
+    setCreateRecoveryDecision(snapshot?.createRecoveryDecision ?? null);
+    setCreateRecoveryError(snapshot?.createRecoveryError ?? null);
+    setCreateErrorCode(snapshot?.createErrorCode ?? null);
+    if (snapshot?.createErrorCode) setCreateError(errorMessageForCode(snapshot.createErrorCode, t));
+    if (snapshot?.createRecoveryTokenMetadata && !plaintextMetadata) {
+      setPlaintextMetadata(snapshot.createRecoveryTokenMetadata);
+      setPlaintextToken(null);
+      setPlaintextConsumed(true);
+    }
+  }, [persistedCreateRecovery, plaintextMetadata, t]);
+
+  const clearCreateRecovery = (preservedErrorCode: string | null = null) => {
+    persistCreateRecovery(preservedErrorCode ? {
+      createRequest: null,
+      createOperationIdValue: null,
+      createRecoveryOperationId: null,
+      createRecoveryStatus: null,
+      createRecoveryTokenId: null,
+      createRecoveryTokenMetadata: null,
+      createRecoveryDecision: null,
+      createRecoveryError: null,
+      createErrorCode: preservedErrorCode,
+    } : null);
+    setCreateRequest(null);
+    setCreateOperationIdValue(null);
+    setCreateRecoveryOperationId(null);
+    setCreateRecoveryStatus(null);
+    setCreateRecoveryTokenId(null);
+    setCreateRecoveryTokenMetadata(null);
+    setCreateRecoveryDecision(null);
+    setCreateRecoveryError(null);
+    setCreateErrorCode(preservedErrorCode);
+    if (!preservedErrorCode) setCreateError(null);
+  };
+
+  useEffect(() => {
+    if (!createRecoveryTokenId) return;
+    const recoveredToken = tokensQuery.data?.items.find((token) => token.token_id === createRecoveryTokenId);
+    if (recoveredToken?.revoked_at) clearCreateRecovery();
+  }, [createRecoveryTokenId, tokensQuery.data]);
+
+  const createMutation = useMutation({
+    mutationFn: (request: CreateRequest) => createAgentToken(request.scopes, request.expiresAt, request.auditReason, request.operationId),
+    onSuccess: (result: TokenCreateResult, request: CreateRequest) => {
+      const mutation = client.getMutationCache().getAll().find((candidate) => candidate.state.variables === request);
+      if (mutation) client.getMutationCache().remove(mutation);
+      if (!mountedRef.current) {
+        persistCreateRecovery({
+          createRequest: request,
+          createOperationIdValue: null,
+          createRecoveryOperationId: result.operation_id,
+          createRecoveryStatus: null,
+          createRecoveryTokenId: result.metadata.token_id,
+          createRecoveryTokenMetadata: result.metadata,
+          createRecoveryDecision: "blocked",
+          createRecoveryError: null,
+          createErrorCode: null,
+        });
+        void client.invalidateQueries({ queryKey: ["tokens"] });
+        void client.invalidateQueries({ queryKey: ["operations"] });
+        void client.invalidateQueries({ queryKey: ["audit"] });
+        return;
+      }
+      persistCreateRecovery(null);
+      setCreateErrorCode(null);
+      setCreateError(null);
+      setCreateRecoveryPending(false);
+      clearCreateRecovery();
+      setReason("");
+      setTokenCursor(undefined);
+      setTokenCursorStack([]);
+      setPlaintextMetadata(result.metadata);
+      if ("token" in result) {
+        setPlaintextToken(result.token);
+        setPlaintextConsumed(false);
+      } else {
+        setPlaintextToken(null);
+        setPlaintextConsumed(true);
+      }
+      void client.invalidateQueries({ queryKey: ["tokens"] });
+      void client.invalidateQueries({ queryKey: ["operations"] });
+      void client.invalidateQueries({ queryKey: ["audit"] });
+    },
+    onError: (error, request: CreateRequest) => {
+      refreshSessionAfterAuthFailure(error);
+      setCreateRecoveryPending(false);
+      const errorCode = error instanceof ManagementRequestError ? error.code : "generic";
+      setCreateErrorCode(errorCode);
+      setCreateError(errorMessage(error, t));
+      if (!createOutcomeIsUncertain(error)) {
+        clearCreateRecovery(errorCode);
+        return;
+      }
+      persistCreateRecovery({
+        createRequest: request,
+        createOperationIdValue: null,
+        createRecoveryOperationId: request.operationId,
+        createRecoveryStatus: null,
+        createRecoveryTokenId: null,
+        createRecoveryTokenMetadata: null,
+        createRecoveryDecision: "check",
+        createRecoveryError: null,
+        createErrorCode: errorCode,
+      });
+      setCreateRequest(request);
+      setCreateOperationIdValue(null);
+      setCreateRecoveryOperationId(request.operationId);
+      setCreateRecoveryStatus(null);
+      setCreateRecoveryDecision("check");
+      setCreateRecoveryError(null);
+    },
+  });
+
+  useEffect(() => {
+    if (createMutation.isSuccess) createMutation.reset();
+  }, [createMutation.isSuccess]);
+
+  const revokeMutation = useMutation({
+    mutationFn: ({ tokenId, preview, auditReason, operationId }: { tokenId: string; preview: TokenRevokePreview; auditReason: string; operationId: string }) => submitTokenRevocation(tokenId, auditReason, preview, operationId),
+    onSuccess: (operation: Operation, variables: { tokenId: string; preview: TokenRevokePreview; auditReason: string; operationId: string }) => {
+      const current = client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey);
+      if (!current || current.operationId !== variables.operationId) return;
+      if (createRecoveryTokenId && variables.tokenId === createRecoveryTokenId) {
+        clearCreateRecovery();
+      }
+      if (operation.status === "succeeded") {
+        clearRevokeRecovery();
+      } else {
+        persistRevokeRecovery({
+          ...current,
+          preview: variables.preview,
+          operationId: variables.operationId,
+          auditReason: variables.auditReason,
+          decision: operation.status === "failed" && !operation.result ? "retry_same" : "check",
+          status: operation,
+          errorCode: null,
+          recoveryErrorCode: null,
+        });
+        revokeInFlightRef.current = false;
+        if (mountedRef.current) setRevokeError(null);
+      }
+      void client.invalidateQueries({ queryKey: ["tokens"] });
+      void client.invalidateQueries({ queryKey: ["operations"] });
+      void client.invalidateQueries({ queryKey: ["audit"] });
+    },
+    onError: (error: unknown, variables: { tokenId: string; preview: TokenRevokePreview; auditReason: string; operationId: string }) => {
+      const current = client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey);
+      if (!current || current.operationId !== variables.operationId) return;
+      refreshSessionAfterAuthFailure(error);
+      const errorCode = error instanceof ManagementRequestError ? error.code : "generic";
+      const message = errorMessage(error, t);
+      if (!createOutcomeIsUncertain(error)) {
+        clearRevokeRecovery();
+        if (mountedRef.current) setRevokeError(message);
+        return;
+      }
+      persistRevokeRecovery({
+        ...current,
+        token: current.token,
+        preview: variables.preview,
+        operationId: variables.operationId,
+        auditReason: variables.auditReason,
+        decision: "check",
+        status: null,
+        errorCode,
+        recoveryErrorCode: null,
+      });
+      revokeInFlightRef.current = false;
+      if (mountedRef.current) setRevokeError(message);
+    },
+  });
+
+  const resetCreateIntent = () => {
+    if (createMutation.isPending) return;
+    setCreateError(null);
+    setCreateErrorCode(null);
+    setCreateOperationIdValue(null);
+    setCreateRecoveryError(null);
+    if (!createRecoveryOperationId) {
+      setCreateRequest(null);
+      setCreateRecoveryStatus(null);
+      setCreateRecoveryTokenId(null);
+      setCreateRecoveryTokenMetadata(null);
+      setCreateRecoveryDecision(null);
+      return;
+    }
+    if (createRecoveryDecision === "retry_same") {
+      setCreateRequest(null);
+      setCreateRecoveryDecision("new_intent");
+    }
+  };
+
+  const toggleScope = (scope: TokenScope) => {
+    resetCreateIntent();
+    setScopes((current) => {
+      if (current.includes(scope)) {
+        if (scope === "agent:read" && current.includes("agent:operate")) return current;
+        return current.filter((value) => value !== scope);
+      }
+      return scope === "agent:operate" && !current.includes("agent:read") ? [...current, "agent:read", scope] : [...current, scope];
+    });
+  };
+
+  const submitCreate = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!canManageTokens) return;
+    if (createRecoveryOperationId && createRecoveryDecision !== "retry_same" && createRecoveryDecision !== "new_intent") return;
+    setCreateError(null);
+    setCreateErrorCode(null);
+    const expiry = Date.parse(expiresAt);
+    if (!scopes.length) {
+      setCreateError(t("tokens.scopeRequired"));
+      return;
+    }
+    if (!Number.isFinite(expiry) || expiry <= Date.now()) {
+      setCreateError(t("tokens.expiryRequired"));
+      return;
+    }
+    if (!auditReasonWithinLimit(reason)) {
+      setCreateError(t("common.reasonTooLong"));
+      return;
+    }
+    const retryRequest = createOperationIdValue && createRequest?.operationId === createOperationIdValue ? createRequest : null;
+    const request: CreateRequest = retryRequest ?? { scopes: [...scopes], expiresAt: new Date(expiresAt).toISOString(), auditReason: reason, operationId: createOperationId() };
+    persistCreateRecovery({
+      createRequest: request,
+      createOperationIdValue: null,
+      createRecoveryOperationId: request.operationId,
+      createRecoveryStatus: null,
+      createRecoveryTokenId: null,
+      createRecoveryTokenMetadata: null,
+      createRecoveryDecision: "check",
+      createRecoveryError: null,
+      createErrorCode: null,
+    });
+    setCreateRequest(request);
+    setCreateRecoveryOperationId(request.operationId);
+    setCreateRecoveryStatus(null);
+    setCreateRecoveryTokenId(null);
+    setCreateRecoveryTokenMetadata(null);
+    setCreateRecoveryDecision("check");
+    setCreateRecoveryError(null);
+    setCreateRecoveryPending(true);
+    createMutation.mutate(request);
+  };
+
+  const checkCreateOperation = async () => {
+    if (!createRecoveryOperationId) return;
+    setCreateRecoveryPending(true);
+    setCreateRecoveryError(null);
+    try {
+      const operation = await getOperation(createRecoveryOperationId);
+      setCreateRecoveryStatus(operation);
+      if (operation.status === "succeeded" && operation.result?.token_metadata) {
+        setPlaintextMetadata(operation.result.token_metadata);
+        setPlaintextToken(null);
+        setPlaintextConsumed(true);
+        setCreateError(null);
+        setCreateRequest(null);
+        setCreateOperationIdValue(null);
+        if (operation.result.token_metadata.revoked_at) {
+          clearCreateRecovery();
+        } else {
+          setCreateRecoveryTokenId(operation.result.token_metadata.token_id);
+          setCreateRecoveryTokenMetadata(operation.result.token_metadata);
+          setCreateRecoveryDecision("blocked");
+        }
+        setTokenCursor(undefined);
+        setTokenCursorStack([]);
+        void client.invalidateQueries({ queryKey: ["tokens"] });
+      } else if (operation.status === "failed" && !operation.result) {
+        setCreateOperationIdValue(operation.operation_id);
+        setCreateError(null);
+        setCreateRecoveryDecision("retry_same");
+      } else {
+        setCreateOperationIdValue(null);
+        setCreateRecoveryDecision("check");
+      }
+    } catch (error) {
+      if (error instanceof ManagementRequestError && error.code === "not_found") {
+        setCreateRecoveryError(t("tokens.operationNotFound"));
+        setCreateRecoveryDecision("blocked");
+      } else {
+        setCreateRecoveryError(errorMessage(error, t));
+        setCreateRecoveryDecision("check");
+      }
+    } finally {
+      setCreateRecoveryPending(false);
+    }
+  };
+
+  const openRevoke = async (token: AgentToken, trigger?: HTMLElement, retryPreview = false) => {
+    if (dialogBlocked || revokeInFlightRef.current || (revokeRecovery && !retryPreview)) return;
+    revokeInFlightRef.current = true;
+    onDialogStateChange?.(true);
+    revokeTriggerRef.current = trigger ?? (typeof document === "undefined" ? null : document.activeElement as HTMLElement);
+    const requestId = revokePreviewRequestRef.current + 1;
+    revokePreviewRequestRef.current = requestId;
+    const operationId = createOperationId();
+    const initialRecovery: RevokeRecoverySnapshot = { token, preview: null, operationId, auditReason: "", decision: "preview_pending", status: null, errorCode: null, recoveryErrorCode: null };
+    setRevokeError(null);
+    persistRevokeRecovery(initialRecovery);
+    try {
+      const preview = await previewTokenRevocation(token.token_id, token.resource_version);
+      if (revokePreviewRequestRef.current !== requestId) return;
+      const current = client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey);
+      if (!current || current.operationId !== operationId || current.decision !== "preview_pending") return;
+      persistRevokeRecovery({ ...initialRecovery, preview, decision: "ready" });
+    } catch (error) {
+      const current = client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey);
+      if (revokePreviewRequestRef.current === requestId && current?.operationId === operationId && current.decision === "preview_pending") {
+        revokeInFlightRef.current = false;
+        persistRevokeRecovery(null);
+        if (mountedRef.current) {
+          setRevokeError(errorMessage(error, t));
+          onDialogStateChange?.(false);
+        }
+      }
+    }
+  };
+
+  const submitRevoke = (auditReason: string) => {
+    if (!revokeRecovery?.token || !revokeRecovery.preview || !revokeRecovery.operationId) return;
+    if (!auditReasonWithinLimit(auditReason)) {
+      setRevokeError(t("common.reasonTooLong"));
+      return;
+    }
+    const variables = { tokenId: revokeRecovery.token.token_id, preview: revokeRecovery.preview, auditReason, operationId: revokeRecovery.operationId };
+    persistRevokeRecovery({ ...revokeRecovery, auditReason, decision: "check", status: null, errorCode: null, recoveryErrorCode: null });
+    revokeInFlightRef.current = true;
+    setRevokeError(null);
+    onDialogStateChange?.(false);
+    revokeMutation.mutate(variables);
+  };
+
+  const retryRevoke = () => {
+    if (revokeRecovery?.decision !== "retry_same" || !revokeRecovery.preview) return;
+    const variables = { tokenId: revokeRecovery.token.token_id, preview: revokeRecovery.preview, auditReason: revokeRecovery.auditReason, operationId: revokeRecovery.operationId };
+    persistRevokeRecovery({ ...revokeRecovery, decision: "check", status: null, errorCode: null, recoveryErrorCode: null });
+    revokeInFlightRef.current = true;
+    setRevokeError(null);
+    revokeMutation.mutate(variables);
+  };
+
+  const checkRevokeOperation = async () => {
+    if (!revokeRecovery?.operationId) return;
+    const operationId = revokeRecovery.operationId;
+    setRevokeCheckPending(true);
+    const current = client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey);
+    if (!current || current.operationId !== operationId) {
+      setRevokeCheckPending(false);
+      return;
+    }
+    persistRevokeRecovery({ ...current, recoveryErrorCode: null });
+    try {
+      const operation = await getOperation(operationId);
+      const latest = client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey);
+      if (!latest || latest.operationId !== operationId) return;
+      if (operation.status === "succeeded") {
+        clearRevokeRecovery();
+      } else {
+        persistRevokeRecovery({
+          ...latest,
+          status: operation,
+          decision: operation.status === "failed" && !operation.result ? "retry_same" : operation.status === "failed" ? "blocked" : "check",
+          errorCode: null,
+          recoveryErrorCode: null,
+        });
+        revokeInFlightRef.current = false;
+      }
+      void client.invalidateQueries({ queryKey: ["tokens"] });
+      void client.invalidateQueries({ queryKey: ["operations"] });
+    } catch (error) {
+      const recoveryErrorCode = error instanceof ManagementRequestError ? error.code : "generic";
+      const latest = client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey);
+      if (latest?.operationId === operationId) {
+        persistRevokeRecovery({ ...latest, decision: recoveryErrorCode === "not_found" ? "blocked" : "check", recoveryErrorCode });
+        revokeInFlightRef.current = false;
+      }
+    } finally {
+      if (mountedRef.current) setRevokeCheckPending(false);
+    }
+  };
+
+  const cancelRevoke = () => {
+    clearRevokeRecovery();
+  };
+
+  const retryRevokePreview = () => {
+    if (revokeRecovery?.decision !== "preview_pending") return;
+    const token = revokeRecovery.token;
+    clearRevokeRecovery();
+    void openRevoke(token, undefined, true);
+  };
+
+  const nextTokenPage = () => {
+    const next = tokensQuery.data?.page.next_cursor;
+    if (!next) return;
+    setTokenCursorStack((stack) => [...stack, tokenCursor ?? ""]);
+    setTokenCursor(next);
+  };
+
+  const previousTokenPage = () => {
+    const previous = tokenCursorStack[tokenCursorStack.length - 1];
+    setTokenCursorStack((stack) => stack.slice(0, -1));
+    setTokenCursor(previous || undefined);
+  };
+
+  const tokens = tokensQuery.data?.items ?? [];
+  return <Panel className="token-panel" data-testid="token-management">
+    <PanelHeader title={t("tokens.title")} description={t("tokens.subtitle")} action={<StatusBadge state={session ? "active" : "unknown"} />} />
+    {session ? <SessionSummary session={session} locale={locale} /> : sessionQuery.isPending ? <div className="token-session-summary token-session-loading"><span /><span /><span /></div> : null}
+    {!canManageTokens && session ? <p className="token-capability-note">{t("tokens.permissionDenied")}</p> : null}
+    <div className="token-create-section">
+      <div className="section-header token-section-header"><div><h3>{t("tokens.create")}</h3><p>{t("tokens.createHint")}</p></div></div>
+      <form className="token-create-form" onSubmit={submitCreate}>
+        <fieldset className="token-scope-fieldset" disabled={!canManageTokens}>
+          <legend>{t("tokens.scopes")}</legend>
+          <div className="token-scope-grid">
+            {scopeOptions.map(({ scope, label }) => <label className="scope-option" key={scope}>
+              <input type="checkbox" checked={scopes.includes(scope)} disabled={scope === "agent:read" && scopes.includes("agent:operate")} onChange={() => toggleScope(scope)} />
+              <span><strong className="mono">{scope}</strong><small>{t(label)}</small></span>
+            </label>)}
+          </div>
+          {scopes.includes("agent:operate") ? <p className="field-hint">{t("tokens.operateNeedsRead")}</p> : null}
+        </fieldset>
+        <div className="token-form-fields">
+          <label className="field-label"><span>{t("tokens.expiresAt")}</span><Input type="datetime-local" value={expiresAt} onChange={(event) => { resetCreateIntent(); setExpiresAt(event.target.value); }} disabled={!canManageTokens} required /></label>
+          <label className="field-label"><span>{t("tokens.reason")} <em>({t("common.optional")})</em></span><Textarea value={reason} aria-invalid={createReasonTooLong ? "true" : undefined} aria-describedby={createReasonTooLong ? "token-create-reason-error" : undefined} onChange={(event) => { resetCreateIntent(); setReason(event.target.value); }} rows={2} disabled={!canManageTokens} placeholder={t("common.reasonPlaceholder")} /></label>
+        </div>
+        {createReasonTooLong || createError ? <div role="alert" id={createReasonTooLong ? "token-create-reason-error" : undefined}><p className="field-error">{createReasonTooLong ? t("common.reasonTooLong") : createError}</p>{createOperationIdValue ? <p className="token-retry-hint">{t("tokens.retryCreate", { operationId: createOperationIdValue })}</p> : null}</div> : null}
+        {createRecoveryOperationId ? <div className="token-recovery"><p className="token-retry-hint">{t("tokens.operationRecoveryHint", { operationId: createRecoveryOperationId })}</p><Button type="button" variant="ghost" disabled={createRecoveryPending} onClick={() => void checkCreateOperation()}>{createRecoveryPending ? t("common.loading") : t("tokens.checkOperation")}</Button>{createRecoveryError ? <p className="field-error" role="alert">{createRecoveryError}</p> : null}{createRecoveryStatus ? <p className="token-retry-hint" data-testid="token-operation-status">{t("tokens.operationStatus", { status: t(`status.${createRecoveryStatus.status}`) })}</p> : null}</div> : null}
+        <div className="token-form-actions"><Button type="submit" variant="primary" disabled={createMutation.isPending || !canManageTokens || createReasonTooLong || Boolean(createRecoveryOperationId && createRecoveryDecision !== "retry_same" && createRecoveryDecision !== "new_intent")} icon={<KeyRound />}>{createMutation.isPending ? t("common.loading") : createOperationIdValue ? t("tokens.retryCreateButton") : t("tokens.create")}</Button></div>
+      </form>
+    </div>
+    {plaintextMetadata ? <PlaintextDisclosure token={plaintextMetadata} plaintext={plaintextToken} consumed={plaintextConsumed} onDismiss={() => { setPlaintextToken(null); setPlaintextConsumed(true); }} /> : null}
+    <div className="token-list-section">
+      <div className="section-header token-section-header"><div><h3>{t("tokens.listTitle")}</h3><p>{t("tokens.count", { count: tokens.length })}</p></div></div>
+      {revokeError && !revokeDialogOpen && !revokeRecovery ? <p className="field-error" role="alert">{revokeError}</p> : null}
+      {revokeRecovery?.decision === "preview_pending" ? <div className="token-recovery" data-testid="token-revoke-preview-recovery"><p className="token-retry-hint">{t("tokens.revokePreviewPending")}</p><div className="token-form-actions"><Button type="button" variant="ghost" onClick={retryRevokePreview}>{t("tokens.retryRevokePreviewButton")}</Button><Button type="button" variant="ghost" onClick={cancelRevoke}>{t("common.cancel")}</Button></div></div> : null}
+      {revokeRecovery && revokeRecovery.decision !== "preview_pending" && revokeRecovery.decision !== "ready" ? <div className="token-recovery" data-testid="token-revoke-recovery"><p className="token-retry-hint">{t("tokens.revokeRecoveryHint", { operationId: revokeRecovery.operationId })}</p>{revokeRecovery.errorCode ? <p className="field-error" role="alert">{errorMessageForCode(revokeRecovery.errorCode, t)}</p> : null}{revokeRecovery.recoveryErrorCode ? <p className="field-error" role="alert">{revokeRecovery.recoveryErrorCode === "not_found" ? t("tokens.operationNotFound") : errorMessageForCode(revokeRecovery.recoveryErrorCode, t)}</p> : null}{revokeRecovery.status ? <p className="token-retry-hint" data-testid="token-revoke-operation-status">{t("tokens.operationStatus", { status: t(`status.${revokeRecovery.status.status}`) })}</p> : null}<div className="token-form-actions"><Button type="button" variant="ghost" disabled={revokeCheckPending || revokeMutation.isPending} onClick={() => void checkRevokeOperation()}>{revokeCheckPending ? t("common.loading") : t("tokens.checkOperation")}</Button>{revokeRecovery.decision === "retry_same" ? <Button type="button" variant="secondary" disabled={revokeMutation.isPending} onClick={retryRevoke}>{t("tokens.retryRevokeButton")}</Button> : null}</div></div> : null}
+      {sessionQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : sessionQuery.isError ? <div role="alert"><p className="field-error">{t("errors.generic")}</p><Button variant="ghost" onClick={() => void sessionQuery.refetch()}>{t("common.retry")}</Button></div> : !canManageTokens ? <p className="token-capability-note">{t("tokens.permissionDenied")}</p> : tokensQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : tokensQuery.isError ? <div role="alert"><p className="field-error">{t("errors.generic")}</p><Button variant="ghost" onClick={() => void tokensQuery.refetch()}>{t("common.retry")}</Button></div> : tokens.length ? <div className="token-list" role="list">{tokens.map((token) => <TokenRow key={token.token_id} token={token} locale={locale} revokeDisabled={dialogBlocked || Boolean(revokeRecovery) || revokePreviewPending || revokeMutation.isPending || !canManageTokens} onRevoke={(trigger) => void openRevoke(token, trigger)} />)}</div> : <EmptyState title={t("tokens.noTokens")} />}
+      <div className="pagination token-pagination"><span>{tokens.length}</span><div><Button variant="ghost" aria-label={t("common.previous")} disabled={!tokenCursorStack.length} onClick={previousTokenPage} icon={<ChevronLeft />} /><Button variant="ghost" aria-label={t("common.next")} disabled={!tokensQuery.data?.page.next_cursor} onClick={nextTokenPage} icon={<ChevronRight />} /></div></div>
+    </div>
+    {revokeDialogOpen && revokeToken && revokePreview ? <ActionDialog preview={actionPreview(revokePreview)} actionLabel={t("tokens.revoke")} target={`${t("tokens.tokenId")} · ${revokeToken.token_id}`} dangerous busy={revokeMutation.isPending} error={revokeError} confirmationText={t("tokens.revokeConfirm")} returnFocusTarget={revokeTriggerRef.current} onCancel={cancelRevoke} onConfirm={submitRevoke} /> : null}
+  </Panel>;
+}
+
+function SessionSummary({ session, locale }: { session: ManagementSession; locale: Locale }) {
+  const { t } = useTranslation();
+  return <div className="token-session-summary">
+    <div className="token-session-heading"><div className="token-session-icon" aria-hidden="true"><UserRound /></div><div><h3>{t("tokens.adminSession")}</h3><p className="mono">{session.subject}</p></div><StatusBadge state="active" /></div>
+    <dl className="token-session-grid"><div><dt>{t("tokens.principal")}</dt><dd className="mono">{session.subject}</dd></div><div><dt>{t("tokens.issuer")}</dt><dd className="mono">{session.issuer}</dd></div><div><dt>{t("tokens.role")}</dt><dd>{t("tokens.roleAdministrator")}</dd></div><div><dt>{t("tokens.expires")}</dt><dd>{formatDateTime(session.expires_at, locale)}</dd></div><div className="token-capabilities"><dt>{t("tokens.capabilities")}</dt><dd>{session.capabilities.map((capability) => <span className="scope-tag" key={capability}>{capability}</span>)}</dd></div></dl>
+  </div>;
+}
+
+function TokenRow({ token, locale, revokeDisabled, onRevoke }: { token: AgentToken; locale: Locale; revokeDisabled: boolean; onRevoke: (trigger: HTMLElement) => void }) {
+  const { t } = useTranslation();
+  const state = tokenState(token);
+  return <article className="token-row" role="listitem">
+    <div className="token-row-main"><div className="token-row-title"><strong className="mono" title={token.token_id}>{token.token_id}</strong><CopyButton value={token.token_id} /><Badge tone={state === "active" ? "success" : state === "expired" ? "warning" : "danger"}>{t(`tokens.${state}`)}</Badge></div><div className="token-scopes">{token.scopes.map((scope) => <span className="scope-tag" key={scope}>{scope}</span>)}</div></div>
+    <dl className="token-row-meta"><div><dt>{t("tokens.created")}</dt><dd>{formatDateTime(token.created_at, locale)}</dd></div><div><dt>{token.revoked_at ? t("tokens.revokedAt") : t("tokens.expires")}</dt><dd>{formatDateTime(token.revoked_at ?? token.expires_at, locale)}</dd></div></dl>
+    <Button variant="danger" disabled={state === "revoked" || revokeDisabled} onClick={(event) => onRevoke(event.currentTarget)} icon={<ShieldCheck />}>{t("tokens.revoke")}</Button>
+  </article>;
+}
+
+function PlaintextDisclosure({ token, plaintext, consumed, onDismiss }: { token: AgentToken; plaintext: string | null; consumed: boolean; onDismiss: () => void }) {
+  const { t } = useTranslation();
+  return <div className="token-disclosure" role="region" aria-labelledby="token-plaintext-title" data-testid="token-disclosure"><div className="token-disclosure-heading"><AlertTriangle aria-hidden="true" /><div><strong id="token-plaintext-title">{t("tokens.plaintextTitle")}</strong><p>{consumed ? t("tokens.plaintextConsumed") : t("tokens.plaintextWarning")}</p></div></div>{plaintext ? <div className="token-value"><code data-testid="token-plaintext">{plaintext}</code><CopyButton value={plaintext} /></div> : null}<div className="token-disclosure-meta"><span className="mono">{token.token_id}</span><Button variant="ghost" onClick={onDismiss}>{t("tokens.dismissPlaintext")}</Button></div></div>;
+}

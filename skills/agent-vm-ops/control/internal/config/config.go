@@ -41,12 +41,28 @@ type ManagementUploadConfig struct {
 	MinimumFreeBytes int64  `json:"minimum_free_bytes"`
 }
 
+type OIDCConfig struct {
+	Issuer       string `json:"issuer"`
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+	RedirectURI  string `json:"redirect_uri"`
+}
+
+type AdminPrincipalConfig struct {
+	Issuer       string   `json:"issuer"`
+	Subject      string   `json:"subject"`
+	Capabilities []string `json:"capabilities"`
+}
+
 // ManagementConfig is deliberately shared by the authority and Web loaders.
 // The Web loader reads only this subtree, while the resident control process
 // reads it alongside the legacy control configuration.
 type ManagementConfig struct {
 	Enabled               bool                      `json:"enabled"`
 	ExternalOrigin        string                    `json:"external_origin"`
+	OIDC                  OIDCConfig                `json:"oidc"`
+	AdminPrincipal        AdminPrincipalConfig      `json:"admin_principal"`
+	TokenTTLSeconds       int64                     `json:"token_ttl_seconds"`
 	ForwardAuth           ForwardAuthConfig         `json:"forward_auth"`
 	AllowedAdminSubjects  []string                  `json:"allowed_admin_subjects"`
 	WebUID                int                       `json:"web_uid"`
@@ -130,6 +146,7 @@ func Defaults() Config {
 		RequiredGuestTools:                 []string{"bun", "python3", "sshd", "rsync", "docker", "growpart"},
 		Management: ManagementConfig{
 			SessionTTLSeconds: defaultManagementSessionTTLSeconds,
+			TokenTTLSeconds:   3600,
 			ForwardAuth:       ForwardAuthConfig{IdentityHeader: "X-Forwarded-User"},
 		},
 	}
@@ -296,26 +313,14 @@ func (c ManagementConfig) Validate(webOnly bool) error {
 	if err != nil || origin.Scheme != "https" || origin.Host == "" || strings.Contains(origin.Host, "*") || origin.User != nil || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
 		return errors.New("config_invalid: management.external_origin must be one HTTPS origin without a path")
 	}
-	if c.ForwardAuth.IdentityHeader != "X-Forwarded-User" {
-		return errors.New("config_invalid: management.forward_auth.identity_header is fixed to X-Forwarded-User")
+	if err := validateOIDC(c); err != nil {
+		return err
 	}
-	if c.ForwardAuth.SocketPath == "" {
-		return errors.New("config_missing: management.forward_auth.socket_path")
+	if c.TokenTTLSeconds == 0 {
+		c.TokenTTLSeconds = 3600
 	}
-	if c.ForwardAuth.PeerUID <= 0 {
-		return errors.New("config_invalid: management.forward_auth.peer_uid must be a non-root UID")
-	}
-	if c.WebUID <= 0 {
-		return errors.New("config_invalid: management.web_uid must be a non-root UID")
-	}
-	if c.Authority.SocketPath == "" {
-		return errors.New("config_missing: management.authority.socket_path")
-	}
-	if c.Authority.ExpectedWebUID != c.WebUID {
-		return errors.New("config_invalid: management.authority.expected_web_uid must equal management.web_uid")
-	}
-	if c.ForwardAuth.SocketPath == c.Authority.SocketPath {
-		return errors.New("config_invalid: management.forward_auth.socket_path must be distinct from the authority socket")
+	if c.TokenTTLSeconds < 60 || c.TokenTTLSeconds > 86400 {
+		return errors.New("config_invalid: management.token_ttl_seconds must be between 60 and 86400")
 	}
 	if c.SessionTTLSeconds == 0 {
 		c.SessionTTLSeconds = defaultManagementSessionTTLSeconds
@@ -323,8 +328,14 @@ func (c ManagementConfig) Validate(webOnly bool) error {
 	if c.SessionTTLSeconds < 60 || c.SessionTTLSeconds > 3600 {
 		return errors.New("config_invalid: management.session_ttl_seconds must be between 60 and 3600")
 	}
-	if err := validateUniqueIDs("management.allowed_admin_subjects", c.AllowedAdminSubjects, true); err != nil {
+	if err := validateUniqueIDs("management.admin_principal.capabilities", c.AdminPrincipal.Capabilities, true); err != nil {
 		return err
+	}
+	allowedCapabilities := map[string]bool{"read": true, "operate": true, "manage_images": true, "maintain_system": true, "manage_tokens": true, "observe_admin": true}
+	for _, capability := range c.AdminPrincipal.Capabilities {
+		if !allowedCapabilities[capability] {
+			return errors.New("config_invalid: management.admin_principal.capabilities contains an unsupported capability")
+		}
 	}
 	if err := validateUniqueIDs("management.trusted_image_source_ids", c.TrustedImageSourceIDs, false); err != nil {
 		return err
@@ -353,10 +364,65 @@ func (c ManagementConfig) Validate(webOnly bool) error {
 	if len(c.TrustedImageSourceIDs) > 0 && c.Upload.MinimumFreeBytes <= 0 {
 		return errors.New("config_invalid: management.upload.minimum_free_bytes must be positive when trusted image sources are configured")
 	}
-	if webOnly && c.Authority.SocketPath == "" {
-		return errors.New("config_missing: management.authority.socket_path")
+	legacyBoundary := c.ForwardAuth.SocketPath != "" || c.ForwardAuth.PeerUID != 0 || c.Authority.SocketPath != "" || c.WebUID != 0 || c.Authority.ExpectedWebUID != 0
+	if legacyBoundary {
+		if c.ForwardAuth.IdentityHeader != "X-Forwarded-User" {
+			return errors.New("config_invalid: management.forward_auth.identity_header is fixed to X-Forwarded-User")
+		}
+		if c.ForwardAuth.SocketPath == "" {
+			return errors.New("config_missing: management.forward_auth.socket_path")
+		}
+		if c.ForwardAuth.PeerUID <= 0 || c.WebUID <= 0 {
+			return errors.New("config_invalid: legacy management peer UIDs must be non-root")
+		}
+		if c.Authority.SocketPath == "" {
+			return errors.New("config_missing: management.authority.socket_path")
+		}
+		if c.Authority.ExpectedWebUID != c.WebUID {
+			return errors.New("config_invalid: management.authority.expected_web_uid must equal management.web_uid")
+		}
+		if c.ForwardAuth.SocketPath == c.Authority.SocketPath {
+			return errors.New("config_invalid: management.forward_auth.socket_path must be distinct from the authority socket")
+		}
 	}
 	return nil
+}
+
+func validateOIDC(c ManagementConfig) error {
+	issuer, err := url.Parse(c.OIDC.Issuer)
+	if err != nil || issuer.Scheme != "https" || issuer.Host == "" || issuer.User != nil || issuer.RawQuery != "" || issuer.Fragment != "" {
+		return errors.New("config_invalid: management.oidc.issuer must be one HTTPS issuer URL")
+	}
+	if c.OIDC.ClientID == "" || len(c.OIDC.ClientID) > 256 {
+		return errors.New("config_missing: management.oidc.client_id")
+	}
+	if c.OIDC.ClientSecret == "" {
+		return errors.New("config_missing: management.oidc.client_secret")
+	}
+	redirect, err := url.Parse(c.OIDC.RedirectURI)
+	if err != nil || redirect.Scheme != "https" || redirect.Host == "" || redirect.User != nil || redirect.RawQuery != "" || redirect.Fragment != "" || redirect.Path != "/api/v1/auth/oidc/callback" {
+		return errors.New("config_invalid: management.oidc.redirect_uri must be the fixed HTTPS callback path")
+	}
+	if redirect.Scheme != originScheme(c.ExternalOrigin) || redirect.Host != originHost(c.ExternalOrigin) {
+		return errors.New("config_invalid: management.oidc.redirect_uri must use management.external_origin")
+	}
+	if c.AdminPrincipal.Issuer == "" || c.AdminPrincipal.Issuer != c.OIDC.Issuer {
+		return errors.New("config_invalid: management.admin_principal.issuer must equal management.oidc.issuer")
+	}
+	if strings.TrimSpace(c.AdminPrincipal.Subject) == "" || c.AdminPrincipal.Subject != strings.TrimSpace(c.AdminPrincipal.Subject) || len(c.AdminPrincipal.Subject) > 255 {
+		return errors.New("config_invalid: management.admin_principal.subject")
+	}
+	return nil
+}
+
+func originScheme(value string) string {
+	parsed, _ := url.Parse(value)
+	return parsed.Scheme
+}
+
+func originHost(value string) string {
+	parsed, _ := url.Parse(value)
+	return parsed.Host
 }
 
 func validateUniqueIDs(name string, values []string, requireNonEmpty bool) error {

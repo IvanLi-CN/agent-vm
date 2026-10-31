@@ -10,35 +10,7 @@ at `2651fc8a8d32eaa611027fc04aa7908843639222` from `agent-toolkit`.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    C["Codex client\nBun"] --> A["request adapter\nSSH compatibility"]
-    A --> U["protected Unix socket\nHTTP over UDS"]
-    U --> H["Gin v1\ninternal control API"]
-    H --> S["Go lifecycle service\nstate, admission, scheduler"]
-    S --> D[("SQLite\ndatabase/sql + modernc.org/sqlite")]
-    S --> I["Incus system containers\nnested LXC boundary"]
-    S --> O["fixed snapshots\ntextfile and relay readers"]
-    F["future transport"] -. "same internal API" .-> U
-```
-
-SSH is retained as a compatibility adapter for the current client contract. It
-is not the business protocol or the control authority, and it can be removed or
-replaced by another transport without changing the Go service or its Gin API.
-The managed guest is an Incus system container inside the authorized control
-environment. This design does not require KVM or `/dev/kvm`.
-
-## Technology boundary
-
-- Go `1.27.3` owns the resident control service and native lifecycle boundary.
-- Gin v1 serves the protected internal HTTP API.
-- SQLite is accessed through `database/sql` and `modernc.org/sqlite`; the
-  control module uses one writer and separate read connections.
-- `x/sys/unix`, `os/exec` and `log/slog` cover Unix process, command and logging
-  boundaries.
-- Bun remains the local client, compatibility bridge and guest one-shot runtime.
-- Python is limited to release/publisher compatibility tools and standard
-  library tests.
+The [system architecture](docs/architecture/system.md) is the single architecture source of truth for two complete blue-green Agent VM service slots behind one project-owned Caddy entry point and shared rqlite state. It identifies the parts that are not yet implemented. Agent VM uses Incus system containers and does not require KVM or `/dev/kvm`.
 
 ## Layout
 
@@ -49,15 +21,18 @@ environment. This design does not require KVM or `/dev/kvm`.
 - `docs/adr/` contains the accepted lifecycle, transport, recovery and runtime
   decisions.
 
+See the [documentation guide](docs/README.md) for architecture, specifications, decisions and operations.
+
 ## Management console design
 
 The built-in Web management console targets managed images and existing Agent
 session VMs, with controlled maintenance and audit. The approved first-release
 contract fixes five pages, `zh-CN`/`en` localization, the authenticated
-same-origin `/api/v1` boundary, image migration, and package rollback
-compatibility.
+same-origin `/api/v1` boundary, the opaque machine-Token `/agent/v1/control`
+API, conservative SQLite-to-rqlite migration, image migration, and package
+rollback compatibility.
 
-Read [PRODUCT.md](PRODUCT.md) for product boundaries, [DESIGN.md](DESIGN.md) for the selected workbench baseline, and the [Web surface brief](.impeccable/surfaces/web.md) for task flows. The [management contract](docs/specs/agent-vm/contracts/management-api.md), [OpenAPI document](docs/specs/agent-vm/contracts/management-api.yaml), and its synthetic examples define the shared frontend/backend API and state-compatibility boundary. The [decision memo](docs/proposals/agent-vm-web-console.md) records the source investigation and architecture rationale.
+Read [PRODUCT.md](PRODUCT.md) for product boundaries, [DESIGN.md](DESIGN.md) for the selected workbench baseline, and the [Web surface brief](.impeccable/surfaces/web.md) for task flows. The [management contract](docs/specs/agent-vm/contracts/management-api.md), [Token API](docs/specs/agent-vm/contracts/token-api.md), [Agent API](docs/specs/agent-vm/contracts/agent-api.md), [OpenAPI document](docs/specs/agent-vm/contracts/management-api.yaml), and its synthetic examples define the shared frontend/backend API and state-compatibility boundary. The [decision memo](docs/proposals/agent-vm-web-console.md) records historical product research; the active security choice is [ADR 0043](docs/adr/0043-agent-vm-unified-service-security-boundary.md).
 
 ### Web Demo
 

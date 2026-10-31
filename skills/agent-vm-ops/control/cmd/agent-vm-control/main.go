@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -99,13 +101,17 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	// Establish exclusive control ownership before opening SQLite. The legacy
-	// bridge takes the shared side of this same lock before touching state.
-	lock, err := native.AcquireLock(filepath.Join(filepath.Dir(cfg.StateDB), "authority.lock"), true, false)
-	if err != nil {
-		return err
+	// Local SQLite remains single-writer with the legacy bridge. Remote rqlite
+	// is the shared blue-green authority and must not be guarded by one process
+	// exclusive lock; lifecycle resources use named locks below instead.
+	var authorityLock *native.AuthorityLock
+	if !remoteStateDSN(cfg.StateDB) {
+		authorityLock, err = native.AcquireLock(filepath.Join(filepath.Dir(cfg.StateDB), "authority.lock"), true, false)
+		if err != nil {
+			return err
+		}
+		defer authorityLock.Close()
 	}
-	defer lock.Close()
 	store, err := state.Open(cfg.StateDB, cfg.AllowCreateDB)
 	if err != nil {
 		return err
@@ -119,8 +125,20 @@ func serve(args []string) error {
 		if err := store.EnsureManagementSchema(context.Background()); err != nil {
 			return fmt.Errorf("initialize management schema: %w", err)
 		}
-		if err := webadmin.CleanupUploadStaging(cfg.Management.Upload.StagingPath); err != nil {
-			return fmt.Errorf("clean upload staging: %w", err)
+		// SQLite is single-writer, but the staging directory is also shared by
+		// the two resident services. Hold the same resource lock used by the
+		// upload path before removing files left by a crashed peer.
+		stagingLock, err := native.AcquireNamedLock(context.Background(), filepath.Join(cfg.StoragePath, "locks"), "management-resource:image-staging")
+		if err != nil {
+			return fmt.Errorf("lock upload staging: %w", err)
+		}
+		cleanupErr := webadmin.CleanupUploadStaging(cfg.Management.Upload.StagingPath)
+		closeErr := stagingLock.Close()
+		if cleanupErr != nil {
+			return fmt.Errorf("clean upload staging: %w", cleanupErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close upload staging lock: %w", closeErr)
 		}
 		if err := store.SeedLegacyImage(context.Background(), cfg.ImageFingerprint); err != nil {
 			return fmt.Errorf("initialize managed image catalog: %w", err)
@@ -166,7 +184,7 @@ func serve(args []string) error {
 			Actions: actions,
 		}
 	}
-	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver(), Memory: observe.NewMemoryObserver(), Release: releaseMetadata})
+	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver(), Memory: observe.NewMemoryObserver(), Release: releaseMetadata, LockDir: filepath.Join(cfg.StoragePath, "locks")})
 	imageBackend := management.NewIncusImageBackend(guest, cfg.Management.Upload.StagingPath, cfg.RequiredGuestTools)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -190,9 +208,10 @@ func serve(args []string) error {
 		IsDraining: func(ctx context.Context) (bool, error) {
 			return service.IsDraining(ctx)
 		},
-		Clock:   time.Now,
-		Backend: imageBackend,
-		Actions: &webadmin.LifecycleActions{Service: service, Store: store},
+		Clock:            time.Now,
+		Backend:          imageBackend,
+		Actions:          &webadmin.LifecycleActions{Service: service, Store: store},
+		OperationLockDir: filepath.Join(cfg.StoragePath, "locks"),
 	}
 	if cfg.Management.Upload.Enabled {
 		managementOptions.AvailableStagingBytes = func() (int64, error) {
@@ -213,51 +232,51 @@ func serve(args []string) error {
 		if authorityErr != nil {
 			return authorityErr
 		}
+		if err := webassets.Verify(); err != nil {
+			return err
+		}
+		unified, unifiedErr := webadmin.NewUnifiedServer(webadmin.UnifiedOptions{
+			Config: cfg.Management, Authority: authority, Lifecycle: service, Store: store,
+			Snapshots: snapshots, ProductVersion: release.Version, Assets: webassets.Files,
+		})
+		if unifiedErr != nil {
+			return unifiedErr
+		}
+		var app http.Handler = unified.Handler()
 		go func() {
-			if err := authority.Serve(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				slog.Error("management authority stopped", "error", err)
+			if err := httpserver.ServeApp(ctx, cfg.Socket, service, snapshots, app); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Error("unified control server stopped", "error", err)
+				stop()
+			}
+		}()
+	} else {
+		go func() {
+			if err := httpserver.Serve(ctx, cfg.Socket, service, snapshots); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Error("control server stopped", "error", err)
 				stop()
 			}
 		}()
 	}
 	schedulerInstance := scheduler.New(service)
-	go func() {
-		if err := httpserver.Serve(ctx, cfg.Socket, service, snapshots); err != nil && !errors.Is(err, context.Canceled) {
-			slog.Error("control server stopped", "error", err)
-			stop()
-		}
-	}()
-	slog.Info("agent vm control started", "socket", cfg.Socket, "database", cfg.StateDB)
+	slog.Info("agent vm control started", "socket", cfg.Socket, "database_backend", stateBackend(cfg.StateDB))
 	return schedulerInstance.Run(ctx)
 }
 
+func stateBackend(value string) string {
+	if remoteStateDSN(value) {
+		return "rqlite"
+	}
+	return "sqlite"
+}
+
+func remoteStateDSN(value string) bool {
+	parsed, err := url.Parse(value)
+	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
+}
+
 func web(args []string) error {
-	flags := flag.NewFlagSet("web", flag.ContinueOnError)
-	flags.SetOutput(io.Discard)
-	configPath := flags.String("config", "/etc/agent-vm-native/web.json", "Web configuration path")
-	if err := flags.Parse(args); err != nil {
-		return err
-	}
-	cfg, err := config.LoadWeb(*configPath)
-	if err != nil {
-		return err
-	}
-	if !cfg.Management.Enabled {
-		return errors.New("management_disabled: Web management is disabled")
-	}
-	if os.Geteuid() == 0 || os.Geteuid() != cfg.Management.WebUID {
-		return errors.New("permission_denied: Web must run as the configured non-root service UID")
-	}
-	if err := webassets.Verify(); err != nil {
-		return err
-	}
-	server, err := webadmin.NewWebServer(cfg.Management, webadmin.NewAuthorityClient(cfg.Management.Authority.SocketPath))
-	if err != nil {
-		return err
-	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
-	return server.Serve(ctx)
+	_ = args
+	return errors.New("management web command is retired; use agent-vm-control serve")
 }
 
 func availableStagingBytes(path string) (int64, error) {

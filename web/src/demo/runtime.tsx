@@ -87,7 +87,7 @@ export function modelForScene(scene: DemoScene, dataMode: DemoDataMode = "full")
       status: "outcome_unknown",
       phase: "native_action",
       target: { kind: "vm", id: "task_delta_04" },
-      actor: "admin@example.invalid",
+      actor: { issuer: model.session.issuer, subject: model.session.subject, role: model.session.role },
       reason: "Simulate an interrupted native action",
       created_at: model.overview.observed_at,
       updated_at: model.overview.observed_at,

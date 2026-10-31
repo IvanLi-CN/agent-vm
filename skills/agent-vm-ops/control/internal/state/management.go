@@ -75,6 +75,53 @@ CREATE TABLE IF NOT EXISTS management_audit (
   phase TEXT NOT NULL,
   detail_json TEXT,
   occurred_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS oidc_transactions (
+  transaction_id TEXT PRIMARY KEY,
+  state_digest TEXT NOT NULL UNIQUE,
+  nonce_digest TEXT NOT NULL,
+  code_verifier_sealed TEXT NOT NULL,
+  binding_cookie_digest TEXT NOT NULL,
+  client_id TEXT NOT NULL,
+  redirect_uri TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT
+);
+CREATE TABLE IF NOT EXISTS browser_sessions (
+  session_digest TEXT PRIMARY KEY,
+  issuer TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  csrf_digest TEXT NOT NULL,
+  capabilities_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT
+);
+CREATE TABLE IF NOT EXISTS agent_tokens (
+  token_id TEXT PRIMARY KEY,
+  token_digest TEXT NOT NULL UNIQUE,
+  operation_id TEXT NOT NULL UNIQUE,
+  request_digest TEXT NOT NULL,
+  issuer TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  scopes_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  resource_version TEXT NOT NULL,
+  revoked_at TEXT,
+  plaintext_disclosure TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS management_confirmations (
+  confirmation_digest TEXT PRIMARY KEY,
+  subject TEXT NOT NULL,
+  action TEXT NOT NULL,
+  target TEXT NOT NULL,
+  target_version TEXT NOT NULL,
+  params_digest TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  consumed_at TEXT
 );`
 
 var imageFingerprintPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
@@ -195,6 +242,9 @@ func (err *ImageReferenceError) Error() string {
 }
 
 func (s *Store) EnsureManagementSchema(ctx context.Context) error {
+	if s.remote != nil {
+		return s.remote.ensureManagementSchema(ctx)
+	}
 	return s.withWrite(ctx, func(tx *Tx) error {
 		if _, err := tx.exec(managementSchema); err != nil {
 			return fmt.Errorf("create management schema: %w", err)
@@ -208,6 +258,8 @@ func (s *Store) EnsureManagementSchema(ctx context.Context) error {
 			{name: "managed-image-catalog", version: 1},
 			{name: "session-image-binding", version: 1},
 			{name: "management-operation-audit", version: 1},
+			{name: "principal-identity", version: 1},
+			{name: "token-revocation", version: 1},
 		} {
 			if _, err := tx.exec("INSERT OR IGNORE INTO state_capabilities(name, version, created_at) VALUES(?, ?, ?)", marker.name, marker.version, now); err != nil {
 				return fmt.Errorf("record state capability: %w", err)
@@ -219,9 +271,13 @@ func (s *Store) EnsureManagementSchema(ctx context.Context) error {
 		if _, err := tx.exec("INSERT OR IGNORE INTO meta(key, value) VALUES('management_catalog_revision', '1')"); err != nil {
 			return fmt.Errorf("initialize management catalog revision: %w", err)
 		}
+		if _, err := tx.execWithoutEpoch("INSERT OR IGNORE INTO meta(key, value) VALUES(?, 'initial')", managementAuthEpochKey); err != nil {
+			return fmt.Errorf("initialize management auth epoch: %w", err)
+		}
 		// Schema and capability bootstrap are compatibility metadata, not a
 		// business mutation. Preserve the existing observation epoch.
 		tx.changed = false
+		tx.authChanged = false
 		return nil
 	})
 }
@@ -771,6 +827,7 @@ func (s *Store) TransitionManagementOperation(ctx context.Context, operationID, 
 	var value *ManagementOperation
 	claimed := false
 	err := s.withWrite(ctx, func(tx *Tx) error {
+		claimed = false
 		current, err := scanManagementOperation(ctx, tx.conn, operationID)
 		if err != nil {
 			return err
@@ -798,6 +855,7 @@ func (s *Store) TransitionManagementOperationUnlessDraining(ctx context.Context,
 	var value *ManagementOperation
 	claimed := false
 	err := s.withWrite(ctx, func(tx *Tx) error {
+		claimed = false
 		var draining string
 		if err := tx.conn.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = 'draining'").Scan(&draining); err == nil && draining == "1" {
 			return errors.New("draining: new management action is refused while the control plane is draining")
@@ -832,6 +890,7 @@ func (s *Store) TransitionManagementOperationUnlessReleaseDraining(ctx context.C
 	var value *ManagementOperation
 	claimed := false
 	err := s.withWrite(ctx, func(tx *Tx) error {
+		claimed = false
 		var draining, owner string
 		if err := tx.conn.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = 'draining'").Scan(&draining); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
@@ -1269,7 +1328,7 @@ func (s *Store) RecordManagementAudit(ctx context.Context, value ManagementAudit
 }
 
 func recordManagementAuditTx(tx *Tx, value ManagementAudit, target string, detail any, occurredAt string) (bool, error) {
-	result, err := tx.exec(`INSERT OR IGNORE INTO management_audit(event_id, operation_id, action, actor, reason, target_json, outcome, phase, detail_json, occurred_at)
+	result, err := tx.execWithoutEpoch(`INSERT OR IGNORE INTO management_audit(event_id, operation_id, action, actor, reason, target_json, outcome, phase, detail_json, occurred_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, value.EventID, nullableStringArg(value.OperationID), value.Action, value.Actor, value.Reason, target, value.Outcome, value.Phase, detail, occurredAt)
 	if err != nil {
 		return false, err
