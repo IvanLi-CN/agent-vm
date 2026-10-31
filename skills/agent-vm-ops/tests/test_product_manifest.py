@@ -16,6 +16,7 @@ from release_manifest import (  # noqa: E402
     ManifestError,
     PRODUCT_LINUX_ARTIFACTS,
     PRODUCT_MANIFEST_FORMAT,
+    STATE_CAPABILITY_MARKERS,
     default_operations,
     validate_product_manifest,
     validate_release_manifest,
@@ -95,7 +96,7 @@ class ProductManifestTests(unittest.TestCase):
                 "artifacts": artifacts,
                 "actions": actions,
                 "client_view": {"version": "1.0.0", "source_revision": "b" * 40, "protocol": 4, "transport": "https", "actions": actions},
-                "state_compatibility": {"reads": ["legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1"], "writes": ["legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1"]},
+                "state_compatibility": {"reads": list(STATE_CAPABILITY_MARKERS), "writes": list(STATE_CAPABILITY_MARKERS)},
             }
             self.assertEqual(validate_product_manifest(manifest), manifest)
             with self.assertRaises(ManifestError) as failure:

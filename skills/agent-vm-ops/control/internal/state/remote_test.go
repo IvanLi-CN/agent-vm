@@ -542,40 +542,23 @@ func TestRemoteManagementConfirmationIsVisibleAcrossMirrorsAndSingleUse(t *testi
 		CreatedAt:          "2026-10-31T00:00:00Z",
 		ExpiresAt:          "2099-10-31T00:05:00Z",
 	}
-	if err := first.InsertManagementConfirmation(ctx, confirmation); err != nil {
-		t.Fatal(err)
-	}
-	// Warm both mirrors before the consume race so the test exercises the
-	// management-auth epoch rather than an initial mirror refresh.
+	// Warm both mirrors before the insert so the test exercises propagation of
+	// the management-auth epoch rather than an initial mirror refresh.
 	for index, store := range []*Store{first, second} {
 		if _, err := store.StateEpoch(ctx); err != nil {
 			t.Fatalf("warm mirror %d: %v", index, err)
 		}
 	}
-
-	type result struct {
-		consumed bool
-		err      error
+	if err := first.InsertManagementConfirmation(ctx, confirmation); err != nil {
+		t.Fatal(err)
 	}
-	results := make(chan result, 2)
-	for _, store := range []*Store{first, second} {
-		go func(store *Store) {
-			consumed, err := store.ConsumeManagementConfirmation(ctx, confirmation.ConfirmationDigest, confirmation.Subject, confirmation.Action, confirmation.Target, confirmation.TargetVersion, confirmation.ParamsDigest, "2026-10-31T00:01:00Z")
-			results <- result{consumed: consumed, err: err}
-		}(store)
+	consumed, err := second.ConsumeManagementConfirmation(ctx, confirmation.ConfirmationDigest, confirmation.Subject, confirmation.Action, confirmation.Target, confirmation.TargetVersion, confirmation.ParamsDigest, "2026-10-31T00:01:00Z")
+	if err != nil || !consumed {
+		t.Fatalf("cached second mirror consume = %v, %v", consumed, err)
 	}
-	consumed := 0
-	for range 2 {
-		outcome := <-results
-		if outcome.err != nil {
-			t.Fatalf("remote confirmation consume: %v", outcome.err)
-		}
-		if outcome.consumed {
-			consumed++
-		}
-	}
-	if consumed != 1 {
-		t.Fatalf("successful remote confirmation consumers = %d, want 1", consumed)
+	replayed, err := first.ConsumeManagementConfirmation(ctx, confirmation.ConfirmationDigest, confirmation.Subject, confirmation.Action, confirmation.Target, confirmation.TargetVersion, confirmation.ParamsDigest, "2026-10-31T00:02:00Z")
+	if err != nil || replayed {
+		t.Fatalf("stale first mirror replay = %v, %v", replayed, err)
 	}
 }
 
@@ -1457,13 +1440,16 @@ func TestApplySnapshotRequiresEpochProof(t *testing.T) {
 		}
 		results := make([]remoteResult, len(batch))
 		for index, statement := range batch {
+			results[index].RowsAffected = 1
 			if len(statement) > 0 {
-				if query, ok := statement[0].(string); ok && strings.HasPrefix(query, "UPDATE meta") {
+				query, _ := statement[0].(string)
+				if strings.HasPrefix(query, "UPDATE meta SET") {
 					results[index].RowsAffected = 0
-					continue
+				}
+				if strings.Contains(query, "CASE WHEN changes() = 1") && index > 0 && results[index-1].RowsAffected == 0 {
+					results[index].Error = "NOT NULL constraint failed: meta.value"
 				}
 			}
-			results[index].RowsAffected = 1
 		}
 		writer.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: results})
@@ -1566,6 +1552,9 @@ func TestApplySnapshotRejectsStaleRowMutation(t *testing.T) {
 			if len(statement) > 0 {
 				if query, ok := statement[0].(string); ok && strings.HasPrefix(query, `UPDATE "tasks" SET`) {
 					results[index].RowsAffected = 0
+				}
+				if query, ok := statement[0].(string); ok && strings.Contains(query, "CASE WHEN changes() = 1") && index > 0 && results[index-1].RowsAffected == 0 {
+					results[index].Error = "NOT NULL constraint failed: meta.value"
 				}
 			}
 		}

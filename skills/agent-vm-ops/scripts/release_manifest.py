@@ -189,7 +189,9 @@ STATE_CAPABILITY_MARKERS = (
     "legacy-agent-vm-core@1",
     "managed-image-catalog@1",
     "management-operation-audit@1",
+    "principal-identity@1",
     "session-image-binding@1",
+    "token-revocation@1",
 )
 PRODUCT_BUN_TOOLCHAIN = "1.4.4"
 PRODUCT_GO_TOOLCHAIN = "go1.27.3"

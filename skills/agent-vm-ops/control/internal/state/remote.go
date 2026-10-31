@@ -44,10 +44,9 @@ type remoteBackend struct {
 }
 
 type remoteStatement struct {
-	query        string
-	args         []any
-	epochGuard   bool
-	expectedRows int64
+	query      string
+	args       []any
+	epochGuard bool
 }
 
 type remoteResult struct {
@@ -1582,8 +1581,8 @@ func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteS
 		}
 	}
 	guardKey := "__agent_vm_epoch_guard_" + randomHex(12)
-	proofKey := guardKey + "_proof"
-	guardIndex := len(statements)
+	stateProofKey := guardKey + "_state_proof"
+	authProofKey := guardKey + "_auth_proof"
 	statements = append(statements,
 		remoteStatement{
 			query:      "INSERT INTO meta(key, value) SELECT ?, CASE WHEN EXISTS (SELECT 1 FROM meta WHERE key = 'state_epoch' AND value = ?) AND EXISTS (SELECT 1 FROM meta WHERE key = 'management_auth_epoch' AND value = ?) THEN 'ok' ELSE NULL END",
@@ -1591,42 +1590,45 @@ func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteS
 			epochGuard: true,
 		},
 		remoteStatement{
-			query:        "UPDATE meta SET value = ? WHERE key = 'state_epoch' AND value = ?",
-			args:         []any{targetEpoch, expectedEpoch},
-			epochGuard:   true,
-			expectedRows: 1,
+			query:      "UPDATE meta SET value = ? WHERE key = 'state_epoch' AND value = ?",
+			args:       []any{targetEpoch, expectedEpoch},
+			epochGuard: true,
 		},
 		remoteStatement{
-			query:        "UPDATE meta SET value = ? WHERE key = 'management_auth_epoch' AND value = ?",
-			args:         []any{targetAuthEpoch, expectedAuthEpoch},
-			epochGuard:   true,
-			expectedRows: 1,
+			query:      "INSERT INTO meta(key, value) SELECT ?, CASE WHEN changes() = 1 THEN 'ok' ELSE NULL END",
+			args:       []any{stateProofKey},
+			epochGuard: true,
 		},
+		remoteStatement{
+			query:      "UPDATE meta SET value = ? WHERE key = 'management_auth_epoch' AND value = ?",
+			args:       []any{targetAuthEpoch, expectedAuthEpoch},
+			epochGuard: true,
+		},
+		remoteStatement{
+			query:      "INSERT INTO meta(key, value) SELECT ?, CASE WHEN changes() = 1 THEN 'ok' ELSE NULL END",
+			args:       []any{authProofKey},
+			epochGuard: true,
+		},
+		remoteStatement{query: "DELETE FROM meta WHERE key IN (?, ?, ?)", args: []any{guardKey, stateProofKey, authProofKey}},
+	)
+	if _, err := r.request(ctx, statements, true); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func appendRowMutationProof(statements *[]remoteStatement) {
+	// Keep the row-count proof inside the same rqlite transaction. A stale row
+	// makes the NOT NULL proof insert fail, rolling back the whole request.
+	proofKey := "__agent_vm_row_guard_" + randomHex(12)
+	*statements = append(*statements,
 		remoteStatement{
 			query:      "INSERT INTO meta(key, value) SELECT ?, CASE WHEN changes() = 1 THEN 'ok' ELSE NULL END",
 			args:       []any{proofKey},
 			epochGuard: true,
 		},
-		remoteStatement{query: "DELETE FROM meta WHERE key IN (?, ?)", args: []any{guardKey, proofKey}},
+		remoteStatement{query: "DELETE FROM meta WHERE key = ?", args: []any{proofKey}},
 	)
-	response, err := r.request(ctx, statements, true)
-	if err != nil {
-		return false, err
-	}
-	if len(response.Results) <= guardIndex+3 {
-		return false, errors.New("rqlite transaction did not return its epoch updates")
-	}
-	for index, statement := range statements {
-		if statement.expectedRows == 0 || response.Results[index].RowsAffected == statement.expectedRows {
-			continue
-		}
-		return false, &remoteStatementError{
-			Index:      index,
-			Message:    fmt.Sprintf("rqlite statement affected %d rows, want %d", response.Results[index].RowsAffected, statement.expectedRows),
-			EpochGuard: statement.epochGuard,
-		}
-	}
-	return true, nil
 }
 
 func snapshotHasStateEpoch(snapshot remoteSnapshot) bool {
@@ -1813,7 +1815,8 @@ func epochGuard(expectedEpoch, expectedAuthEpoch string) (string, []any) {
 func appendDelete(statements *[]remoteStatement, table remoteTableSnapshot, row remoteRow, expectedEpoch, expectedAuthEpoch string) {
 	where, args := rowPredicate(table, row)
 	guard, guardArgs := epochGuard(expectedEpoch, expectedAuthEpoch)
-	*statements = append(*statements, remoteStatement{query: "DELETE FROM " + quoteIdentifier(table.Name) + " WHERE " + where + " AND " + guard, args: append(args, guardArgs...), epochGuard: true, expectedRows: 1})
+	*statements = append(*statements, remoteStatement{query: "DELETE FROM " + quoteIdentifier(table.Name) + " WHERE " + where + " AND " + guard, args: append(args, guardArgs...), epochGuard: true})
+	appendRowMutationProof(statements)
 }
 
 func appendInsert(statements *[]remoteStatement, table remoteTableSnapshot, row remoteRow, expectedEpoch, expectedAuthEpoch string) {
@@ -1829,7 +1832,8 @@ func appendInsert(statements *[]remoteStatement, table remoteTableSnapshot, row 
 	}
 	guard, guardArgs := epochGuard(expectedEpoch, expectedAuthEpoch)
 	query := "INSERT INTO " + quoteIdentifier(table.Name) + "(" + joinIdentifiers(columns) + ") SELECT " + strings.Join(placeholders, ", ") + " WHERE " + guard
-	*statements = append(*statements, remoteStatement{query: query, args: append(values, guardArgs...), epochGuard: true, expectedRows: 1})
+	*statements = append(*statements, remoteStatement{query: query, args: append(values, guardArgs...), epochGuard: true})
+	appendRowMutationProof(statements)
 }
 
 func appendUpdate(statements *[]remoteStatement, table remoteTableSnapshot, previous, current remoteRow, expectedEpoch, expectedAuthEpoch string) error {
@@ -1853,7 +1857,8 @@ func appendUpdate(statements *[]remoteStatement, table remoteTableSnapshot, prev
 	guard, guardArgs := epochGuard(expectedEpoch, expectedAuthEpoch)
 	args = append(args, whereArgs...)
 	args = append(args, guardArgs...)
-	*statements = append(*statements, remoteStatement{query: "UPDATE " + quoteIdentifier(table.Name) + " SET " + strings.Join(sets, ", ") + " WHERE " + where + " AND " + guard, args: args, epochGuard: true, expectedRows: 1})
+	*statements = append(*statements, remoteStatement{query: "UPDATE " + quoteIdentifier(table.Name) + " SET " + strings.Join(sets, ", ") + " WHERE " + where + " AND " + guard, args: args, epochGuard: true})
+	appendRowMutationProof(statements)
 	return nil
 }
 
