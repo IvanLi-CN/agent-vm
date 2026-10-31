@@ -904,7 +904,7 @@ func (s *Service) finishImport(ctx context.Context, operation *state.ManagementO
 	}
 	catalogUnlock, lockErr := s.AcquireResourceLock(ctx, "image-catalog")
 	if lockErr != nil {
-		return operation, lockErr
+		return s.recoverImportedCatalogFailure(ctx, operation, artifact, lockErr)
 	}
 	insertErr := s.Store.InsertManagedImage(ctx, image)
 	catalogUnlock()

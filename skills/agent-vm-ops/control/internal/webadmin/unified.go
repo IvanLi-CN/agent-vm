@@ -125,30 +125,30 @@ func (server *UnifiedServer) browserAPI(c *gin.Context) {
 	principal, session, authErr := server.sessionFor(request)
 	if pathValue == "/session" && request.Method == http.MethodGet {
 		if authErr != nil {
-			writeProblem(c.Writer, authErr)
+			server.writeRejectedProblem(c.Writer, request, pathValue, authErr)
 			return
 		}
 		server.writeSession(c.Writer, principal, session)
 		return
 	}
 	if authErr != nil {
-		writeProblem(c.Writer, authErr)
+		server.writeRejectedProblem(c.Writer, request, pathValue, authErr)
 		return
 	}
 	if request.Method == http.MethodPost || request.Method == http.MethodPut || request.Method == http.MethodDelete || request.Method == http.MethodPatch {
 		origins := request.Header.Values("Origin")
 		if len(origins) != 1 || origins[0] != server.Config.ExternalOrigin {
-			writeProblem(c.Writer, newAPIError("origin_invalid", "request origin is not authorized", http.StatusForbidden, "authentication", false, ""))
+			server.writeRejectedProblem(c.Writer, request, pathValue, newAPIError("origin_invalid", "request origin is not authorized", http.StatusForbidden, "authentication", false, ""))
 			return
 		}
 		csrfValues := request.Header.Values("X-CSRF-Token")
 		if len(csrfValues) != 1 {
-			writeProblem(c.Writer, newAPIError("csrf_invalid", "request CSRF token is not valid", http.StatusForbidden, "authentication", false, ""))
+			server.writeRejectedProblem(c.Writer, request, pathValue, newAPIError("csrf_invalid", "request CSRF token is not valid", http.StatusForbidden, "authentication", false, ""))
 			return
 		}
 		csrf := csrfValues[0]
 		if csrf == "" || !server.OIDC.validCSRF(request, session, csrf) {
-			writeProblem(c.Writer, newAPIError("csrf_invalid", "request CSRF token is not valid", http.StatusForbidden, "authentication", false, ""))
+			server.writeRejectedProblem(c.Writer, request, pathValue, newAPIError("csrf_invalid", "request CSRF token is not valid", http.StatusForbidden, "authentication", false, ""))
 			return
 		}
 		if !isUploadContentPath(request.Method, pathValue) {
@@ -168,7 +168,7 @@ func (server *UnifiedServer) browserAPI(c *gin.Context) {
 		return
 	}
 	if required := requiredCapabilities(request.Method, pathValue); len(required) > 0 && !hasAnyCapability(session.Capabilities, required) {
-		writeProblem(c.Writer, newAPIError("permission_denied", "the administrator capability is required", http.StatusForbidden, "authorization", false, ""))
+		server.writeRejectedProblem(c.Writer, request, pathValue, newAPIError("permission_denied", "the administrator capability is required", http.StatusForbidden, "authorization", false, ""))
 		return
 	}
 	if server.Authority == nil {

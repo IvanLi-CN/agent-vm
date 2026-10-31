@@ -101,6 +101,7 @@ func (authority *Authority) Serve(ctx context.Context) error {
 func (authority *Authority) handle(writer http.ResponseWriter, request *http.Request) {
 	actor, authErr := authority.authorize(request)
 	if authErr != nil {
+		recordRejectedManagementAudit(authority.Store, authority.Clock, request, request.URL.Path, authErr)
 		writeProblem(writer, authErr)
 		return
 	}
@@ -2199,11 +2200,14 @@ func auditValue(value state.ManagementAudit) map[string]any {
 }
 
 func actorValue(value string) any {
+	if kind := rejectedActorKind(value); kind != "" {
+		return map[string]any{"kind": kind}
+	}
 	parts := strings.SplitN(value, "\x00", 2)
 	if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
 		return map[string]any{"issuer": parts[0], "subject": parts[1], "role": "administrator"}
 	}
-	return value
+	return map[string]any{"kind": "legacy_unknown", "raw_actor": value}
 }
 
 func actionPreviewValue(targetVersion, token string, expiresAt time.Time, impact map[string]any) map[string]any {

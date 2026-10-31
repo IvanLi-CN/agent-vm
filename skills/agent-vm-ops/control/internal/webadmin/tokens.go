@@ -38,7 +38,7 @@ type tokenRevokePayload struct {
 
 func (server *UnifiedServer) tokenRoute(writer http.ResponseWriter, request *http.Request, pathValue string, principal unifiedPrincipal, session *state.BrowserSession) {
 	if !containsString(session.Capabilities, "manage_tokens") {
-		writeProblem(writer, newAPIError("permission_denied", "Token-management capability is required", http.StatusForbidden, "authorization", false, ""))
+		server.writeRejectedProblem(writer, request, pathValue, newAPIError("permission_denied", "Token-management capability is required", http.StatusForbidden, "authorization", false, ""))
 		return
 	}
 	switch {
