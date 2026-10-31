@@ -194,13 +194,22 @@ type Operation struct {
 	CreatedAt   string
 }
 
+type AuditSummary struct {
+	Operations          map[string]int64
+	ImageUnpackFailures map[string]int64
+	Warnings            map[string]int64
+}
+
 type Store struct {
-	path             string
-	write            *sql.DB
-	reads            [2]*sql.DB
-	readIndex        atomic.Uint32
-	imageSelectionMu sync.Mutex
-	remote           *remoteBackend
+	path              string
+	write             *sql.DB
+	reads             [2]*sql.DB
+	readIndex         atomic.Uint32
+	imageSelectionMu  sync.Mutex
+	remote            *remoteBackend
+	auditSummaryMu    sync.Mutex
+	auditSummary      AuditSummary
+	auditSummaryReady bool
 }
 
 type Tx struct {
@@ -1217,10 +1226,249 @@ func (s *Store) Audit(ctx context.Context, action, taskID, sessionID, outcome st
 	if err != nil {
 		return err
 	}
-	return s.withWrite(ctx, func(tx *Tx) error {
+	s.auditSummaryMu.Lock()
+	defer s.auditSummaryMu.Unlock()
+	err = s.withWrite(ctx, func(tx *Tx) error {
 		_, err := tx.exec("INSERT INTO audit(action, task_id, session_id, generation, outcome, detail_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)", action, nullableStringArg(stringPointerIfNonEmpty(taskID)), nullableStringArg(stringPointerIfNonEmpty(sessionID)), nullableIntArg(generation), outcome, string(raw), time.Now().UTC().Format(time.RFC3339))
 		return err
 	})
+	if err != nil {
+		s.auditSummaryReady = false
+		return err
+	}
+	if s.auditSummaryReady {
+		var parsed any
+		decoder := json.NewDecoder(strings.NewReader(string(raw)))
+		decoder.UseNumber()
+		if decodeErr := decoder.Decode(&parsed); decodeErr != nil {
+			parsed = nil
+		}
+		addAuditSummary(&s.auditSummary, action, outcome, auditPhase(parsed), parsed, string(raw))
+	}
+	return nil
+}
+
+func (s *Store) AuditSummary(ctx context.Context) (AuditSummary, error) {
+	s.auditSummaryMu.Lock()
+	defer s.auditSummaryMu.Unlock()
+	if s.auditSummaryReady {
+		return cloneAuditSummary(s.auditSummary), nil
+	}
+	result := AuditSummary{
+		Operations:          map[string]int64{},
+		ImageUnpackFailures: map[string]int64{},
+		Warnings:            map[string]int64{},
+	}
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		rows, err := conn.QueryContext(ctx, "SELECT action, outcome, detail_json FROM audit")
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var action, outcome string
+			var raw sql.NullString
+			if err := rows.Scan(&action, &outcome, &raw); err != nil {
+				return err
+			}
+			var detail any
+			if raw.Valid && raw.String != "" {
+				decoder := json.NewDecoder(strings.NewReader(raw.String))
+				decoder.UseNumber()
+				if err := decoder.Decode(&detail); err != nil {
+					detail = nil
+				}
+			}
+			addAuditSummary(&result, action, outcome, auditPhase(detail), detail, raw.String)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		var managementTable string
+		if err := conn.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'management_audit'").Scan(&managementTable); errors.Is(err, sql.ErrNoRows) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		managementRows, err := conn.QueryContext(ctx, "SELECT action, outcome, phase, detail_json FROM management_audit")
+		if err != nil {
+			return err
+		}
+		defer managementRows.Close()
+		for managementRows.Next() {
+			var action, outcome, phase string
+			var raw sql.NullString
+			if err := managementRows.Scan(&action, &outcome, &phase, &raw); err != nil {
+				return err
+			}
+			var detail any
+			if raw.Valid && raw.String != "" {
+				decoder := json.NewDecoder(strings.NewReader(raw.String))
+				decoder.UseNumber()
+				if err := decoder.Decode(&detail); err != nil {
+					detail = nil
+				}
+			}
+			addAuditSummary(&result, action, outcome, phase, detail, raw.String)
+		}
+		return managementRows.Err()
+	})
+	if err != nil {
+		s.auditSummaryReady = false
+		return AuditSummary{}, err
+	}
+	s.auditSummary = cloneAuditSummary(result)
+	s.auditSummaryReady = true
+	return cloneAuditSummary(result), nil
+}
+
+func cloneAuditSummary(summary AuditSummary) AuditSummary {
+	clone := AuditSummary{
+		Operations:          make(map[string]int64, len(summary.Operations)),
+		ImageUnpackFailures: make(map[string]int64, len(summary.ImageUnpackFailures)),
+		Warnings:            make(map[string]int64, len(summary.Warnings)),
+	}
+	for key, value := range summary.Operations {
+		clone.Operations[key] = value
+	}
+	for key, value := range summary.ImageUnpackFailures {
+		clone.ImageUnpackFailures[key] = value
+	}
+	for key, value := range summary.Warnings {
+		clone.Warnings[key] = value
+	}
+	return clone
+}
+
+func addAuditSummary(result *AuditSummary, action, outcome, phase string, detail any, raw string) {
+	code := auditCode(detail)
+	if code == "" {
+		code = "unknown"
+	}
+	phase = strings.TrimSpace(phase)
+	if phase == "" {
+		phase = "unknown"
+	}
+	outcome = normalizeAuditOutcome(outcome)
+	result.Operations[action+"|"+outcome+"|"+phase]++
+	for _, warning := range auditWarnings(detail) {
+		result.Warnings[warning]++
+	}
+	if outcome == "error" && (code == "memory_pressure" || code == "resource_unverified" || code == "capacity_insufficient") {
+		result.Warnings[code]++
+	}
+	structuredUnpack := code == "image_unpack_failed" || auditField(detail, "failure_class", false) == "image_unpack"
+	if structuredUnpack {
+		code = "image_unpack_failed"
+	}
+	lower := strings.ToLower(raw)
+	legacyUnpack := strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs"))
+	if (outcome == "error" || outcome == "unknown") && (structuredUnpack || (outcome == "error" && legacyUnpack)) {
+		result.ImageUnpackFailures[phase+"|"+code]++
+	}
+}
+
+func normalizeAuditOutcome(outcome string) string {
+	switch outcome {
+	case "succeeded":
+		return "success"
+	case "failed":
+		return "error"
+	case "outcome_unknown":
+		return "unknown"
+	default:
+		return outcome
+	}
+}
+
+func auditCode(value any) string {
+	return auditField(value, "code", false)
+}
+
+func auditPhase(value any) string {
+	// Error details carry the operation's concrete phase below the outer
+	// dispatch audit record. Prefer that nested phase, then use the outer
+	// operation_phase/phase fields, and keep the traversal deterministic.
+	return auditField(value, "phase", true)
+}
+
+func auditField(value any, wanted string, nestedFirst bool) string {
+	var visit func(any) string
+	visit = func(current any) string {
+		typed, ok := current.(map[string]any)
+		if !ok {
+			if values, ok := current.([]any); ok {
+				for _, item := range values {
+					if found := visit(item); found != "" {
+						return found
+					}
+				}
+			}
+			return ""
+		}
+		if !nestedFirst {
+			if text, ok := typed[wanted].(string); ok && text != "" {
+				return text
+			}
+		}
+		for _, key := range []string{"detail", "error", "cause"} {
+			if found := visit(typed[key]); found != "" {
+				return found
+			}
+		}
+		if nestedFirst {
+			for _, key := range []string{"operation_phase", "phase"} {
+				if text, ok := typed[key].(string); ok && text != "" {
+					return text
+				}
+			}
+		}
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if key == wanted || key == "detail" || key == "error" || key == "cause" || key == "operation_phase" || key == "phase" {
+				continue
+			}
+			if found := visit(typed[key]); found != "" {
+				return found
+			}
+		}
+		return ""
+	}
+	return visit(value)
+}
+
+func auditWarnings(value any) []string {
+	var result []string
+	var visit func(any)
+	visit = func(current any) {
+		switch typed := current.(type) {
+		case map[string]any:
+			for key, item := range typed {
+				if key == "warnings" {
+					if values, ok := item.([]any); ok {
+						for _, rawWarning := range values {
+							if warning, ok := rawWarning.(map[string]any); ok {
+								if code, ok := warning["code"].(string); ok && code != "" {
+									result = append(result, code)
+								}
+							}
+						}
+					}
+				}
+				visit(item)
+			}
+		case []any:
+			for _, item := range typed {
+				visit(item)
+			}
+		}
+	}
+	visit(value)
+	return result
 }
 
 func nullableStringArg(value *string) any {

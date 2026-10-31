@@ -6,14 +6,18 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/observe"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
@@ -39,7 +43,7 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, statErr := os.Stat(socket); statErr == nil {
+		if info, statErr := os.Stat(socket); statErr == nil && info.Mode().Perm() == 0o600 {
 			break
 		}
 		select {
@@ -48,7 +52,7 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("control socket was not created")
+			t.Fatal("control socket was not created with mode 0600")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -132,5 +136,15 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server did not shut down")
+	}
+}
+
+func TestWriteErrorMapsUnreachableWatermarksToServiceUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	writeError(context, protocol.NewError("watermarks_unreachable", "configure reachable CT storage watermarks", nil), nil)
+	if recorder.Code != http.StatusServiceUnavailable {
+		t.Fatalf("watermarks error status = %d", recorder.Code)
 	}
 }

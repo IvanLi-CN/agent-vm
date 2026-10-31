@@ -102,7 +102,6 @@ func TestManagementConfirmationWritesDoNotInvalidateSystemVersion(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer store.Close()
-
 	ctx := context.Background()
 	before, err := store.StateEpoch(ctx)
 	if err != nil {
@@ -132,6 +131,88 @@ func TestManagementConfirmationWritesDoNotInvalidateSystemVersion(t *testing.T) 
 	}
 	if afterConsume != before {
 		t.Fatalf("confirmation consume advanced system version: %q -> %q", before, afterConsume)
+	}
+}
+
+func TestAuditSummaryAggregatesStableObservabilityLabels(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.Audit(ctx, "acquire", "task", "session", "error", intPointer(1), map[string]any{
+		"code": "image_unpack_failed", "phase": "dispatch", "message": "image rootfs unpack failed",
+		"detail":   map[string]any{"phase": "native-unpack"},
+		"warnings": []map[string]any{{"code": "capacity_insufficient"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Audit(ctx, "acquire", "task", "session", "success", intPointer(1), map[string]any{"phase": "dispatch"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureManagementSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordManagementAudit(ctx, ManagementAudit{
+		EventID: "management-image-unpack-failure", Action: "image_import", Outcome: "failed", Phase: "image_import",
+		Target: map[string]any{"kind": "image_catalog"}, Detail: map[string]any{"code": "internal_error", "message": "image rootfs unpack failed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordManagementAudit(ctx, ManagementAudit{
+		EventID: "management-image-catalog-failure", Action: "image_import", Outcome: "failed", Phase: "reconciliation",
+		Target: map[string]any{"kind": "image_catalog"}, Detail: map[string]any{"code": "internal_error", "message": "catalog persistence failed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	summary, err := store.AuditSummary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Operations["acquire|error|native-unpack"] != 1 || summary.Operations["acquire|success|dispatch"] != 1 || summary.Operations["image_import|error|image_import"] != 1 {
+		t.Fatalf("operation summary = %#v", summary.Operations)
+	}
+	if summary.ImageUnpackFailures["native-unpack|image_unpack_failed"] != 1 || summary.ImageUnpackFailures["image_import|internal_error"] != 1 || summary.Warnings["capacity_insufficient"] != 1 {
+		t.Fatalf("failure summary = %#v warnings=%#v", summary.ImageUnpackFailures, summary.Warnings)
+	}
+	if _, exists := summary.ImageUnpackFailures["reconciliation|internal_error"]; exists {
+		t.Fatalf("catalog persistence failure was misclassified as unpack failure: %#v", summary.ImageUnpackFailures)
+	}
+}
+
+func TestAuditSummaryUpdatesAfterCacheInitialization(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.Audit(ctx, "acquire", "task", "session", "success", intPointer(1), map[string]any{"phase": "dispatch"}); err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.AuditSummary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Operations["acquire|success|dispatch"] != 1 {
+		t.Fatalf("initial audit summary = %#v", first.Operations)
+	}
+	if err := store.Audit(ctx, "release", "task", "session", "error", intPointer(1), map[string]any{"phase": "cleanup", "code": "capacity_insufficient"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordManagementAudit(ctx, ManagementAudit{
+		EventID: "incremental-management-audit", Action: "image_import", Outcome: "failed", Phase: "reconciliation",
+		Target: map[string]any{"kind": "image_catalog"}, Detail: map[string]any{"code": "internal_error", "message": "catalog persistence failed"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.AuditSummary(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Operations["release|error|cleanup"] != 1 || second.Operations["image_import|error|reconciliation"] != 1 || second.Warnings["capacity_insufficient"] != 1 {
+		t.Fatalf("incremental audit summary = %#v warnings=%#v", second.Operations, second.Warnings)
 	}
 }
 

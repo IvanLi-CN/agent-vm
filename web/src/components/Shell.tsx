@@ -14,15 +14,18 @@ const navItems: Array<{ key: PageKey; icon: typeof Gauge }> = [
   { key: "system", icon: Settings2 },
 ];
 
-export function Shell({ page, onNavigate, children }: { page: PageKey; onNavigate: (next: PageKey) => void; children: ReactNode }) {
+export function Shell({ page, onNavigate, children }: { page: PageKey; onNavigate?: (next: PageKey) => void; children: ReactNode }) {
   const { t, i18n } = useTranslation();
   const [menuOpen, setMenuOpen] = useState(false);
   const locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   useEffect(() => { setMenuOpen(false); }, [page]);
 
   const navigate = (next: PageKey) => {
-    onNavigate(next);
-    window.history.replaceState({}, "", next === "overview" ? "/" : `/${next}`);
+    onNavigate?.(next);
+    const url = new URL(window.location.href);
+    url.pathname = next === "overview" ? "/" : `/${next}`;
+    window.history.pushState({}, "", `${url.pathname}${url.search}${url.hash}`);
+    window.dispatchEvent(new PopStateEvent("popstate"));
   };
 
   return <div className="app-frame">

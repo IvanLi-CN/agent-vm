@@ -2,6 +2,7 @@ package management
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
@@ -106,6 +108,7 @@ func (backend *blockingImageBackend) ImportTrusted(ctx context.Context, sourceID
 	backend.once.Do(func() { close(backend.entered) })
 	select {
 	case <-backend.release:
+		backend.imports++
 		return backend.artifact, nil
 	case <-ctx.Done():
 		return ImageArtifact{}, ctx.Err()
@@ -645,6 +648,41 @@ func TestLocalImportReadFailureRecordsFingerprintAndCleanup(t *testing.T) {
 	}
 	if finished.Error["imported_fingerprint"] != fingerprint || finished.Error["cleanup"] != "verified" {
 		t.Fatalf("cleanup evidence = %#v", finished.Error)
+	}
+}
+
+func TestNativeImageUnpackFailureIsClassifiedForAudit(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	content := []byte("abc")
+	backend := &partialImageBackend{err: &native.UncertainError{Cause: &native.CommandError{
+		Result: native.Result{Code: 1, Stderr: []byte("Error: Unable to unpack image, run out of disk space")},
+		Cause:  errors.New("incus: exit status 1"),
+	}}}
+	service := New(store, Options{UploadMaxBytes: 1024, Backend: backend})
+	operation, err := service.StartImageImport(context.Background(), ImportRequest{
+		OperationID: "native-image-unpack-failure", Actor: "admin", Reason: "classify native failure", TargetVersion: "image-catalog:revision-1", VersionLabel: "2026.07",
+		Source: ImportSource{Kind: "local_upload", Format: "unified", ExpectedSHA256: digestBytes(content), ExpectedSize: int64(len(content))},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished, err := service.UploadImageImport(context.Background(), operation.OperationID, content, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finished.Status != "outcome_unknown" || finished.Error["code"] != "image_unpack_failed" || finished.Error["failure_class"] != "image_unpack" {
+		t.Fatalf("finished operation = %#v", finished)
+	}
+	summary, err := store.AuditSummary(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ImageUnpackFailures["reconciliation|image_unpack_failed"] != 1 {
+		t.Fatalf("image unpack summary = %#v", summary.ImageUnpackFailures)
 	}
 }
 

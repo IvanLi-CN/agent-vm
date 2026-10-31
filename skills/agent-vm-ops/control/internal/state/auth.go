@@ -341,7 +341,7 @@ func (s *Store) ClaimAgentTokenWithOperation(ctx context.Context, token AgentTok
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, operation.OperationID, operation.Action, operation.TargetKind, operation.TargetID, operation.Actor, operation.Reason, operation.Phase, operation.Status, string(requestJSON), resultJSON, errorJSON, operation.CreatedAt, operation.UpdatedAt); err != nil {
 			return err
 		}
-		if err := recordManagementAuditTx(tx, audit, string(auditTarget), auditDetail, audit.OccurredAtOr(operation.CreatedAt)); err != nil {
+		if _, err := recordManagementAuditTx(tx, audit, string(auditTarget), auditDetail, audit.OccurredAtOr(operation.CreatedAt)); err != nil {
 			return err
 		}
 		if _, err := tx.exec(`INSERT INTO agent_tokens(token_id, token_digest, operation_id, request_digest, issuer, subject, scopes_json, created_at, expires_at, resource_version, revoked_at, plaintext_disclosure)
@@ -640,7 +640,7 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, operation.OperationID, operation
 		revokedAt := now
 		value.RevokedAt = &revokedAt
 		value.ResourceVersion = nextVersion
-		if err := recordManagementAuditTx(tx, audit, string(auditTarget), auditDetail, audit.OccurredAtOr(now)); err != nil {
+		if _, err := recordManagementAuditTx(tx, audit, string(auditTarget), auditDetail, audit.OccurredAtOr(now)); err != nil {
 			return err
 		}
 		changed = true

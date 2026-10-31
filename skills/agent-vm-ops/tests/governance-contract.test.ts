@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { parse } from "yaml";
 
 const root = resolve(import.meta.dir, "../../..");
 const read = (path: string) => readFileSync(resolve(root, path), "utf8");
@@ -46,6 +47,21 @@ test("PR scheduling is exact, non-preemptive, and separate from Main", () => {
   expect(main).toContain("name: Main gate");
   expect(main).toContain("group: main");
   expect(main).toContain("max-parallel: 1");
+});
+
+test("demo deployment is serialized and never exposes credentials to PR builds", () => {
+  const workflow = parse(read(".github/workflows/demo-deploy.yml"));
+  expect(workflow.concurrency["cancel-in-progress"]).toBe(false);
+  expect(workflow.concurrency.group).toBe("demo-deploy-${{ github.ref }}");
+  expect(workflow.jobs.deploy.if).toContain("github.event_name != 'pull_request'");
+  expect(workflow.jobs.deploy.if).toContain("refs/heads/main");
+  expect(JSON.stringify(workflow.jobs.build)).not.toContain("EDGEONE_API_TOKEN");
+  const steps = workflow.jobs.deploy.steps;
+  const names = steps.map((step: { name?: string }) => step.name);
+  for (const name of ["Install locked deployment tools", "Reject stale main revision", "Verify existing EdgeOne project", "Deploy to EdgeOne Makers"]) expect(names).toContain(name);
+  expect(names.indexOf("Install locked deployment tools")).toBeLessThan(names.indexOf("Verify existing EdgeOne project"));
+  expect(names.indexOf("Reject stale main revision")).toBeLessThan(names.indexOf("Deploy to EdgeOne Makers"));
+  expect(names.indexOf("Verify existing EdgeOne project")).toBeLessThan(names.indexOf("Deploy to EdgeOne Makers"));
 });
 
 test("notification routing is metadata-only and fail-closed before transport selection", () => {

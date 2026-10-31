@@ -1,0 +1,15 @@
+[Unit]
+Description=Generate unique SSH host keys for the native validation image
+Before=ssh.service
+Wants=ssh.service
+ConditionPathExists=!/var/lib/agent-vm-native-validation/ssh-keys-generated
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/mkdir -p /var/lib/agent-vm-native-validation
+ExecStart=/usr/bin/ssh-keygen -A
+ExecStart=/usr/bin/touch /var/lib/agent-vm-native-validation/ssh-keys-generated
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -2,7 +2,7 @@ name: Notify failed workflow
 
 on:
   workflow_run:
-    workflows: [CI (PR), CI (Main), Release recovery]
+    workflows: [CI (PR), CI (Main), Release recovery, Demo Deploy]
     types: [completed]
 
 permissions:
@@ -30,7 +30,7 @@ jobs:
           FAILED_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
           FAILED_WORKFLOW: ${{ github.event.workflow_run.name }}
           FAILED_EVENT: ${{ github.event.workflow_run.event }}
-          FAILED_REF: refs/heads/${{ github.event.workflow_run.head_branch }}
+          FAILED_REF: ${{ github.event.workflow_run.event == 'pull_request' && format('refs/pull/{0}/merge', github.event.workflow_run.pull_requests[0].number) || format('refs/heads/{0}', github.event.workflow_run.head_branch) }}
           FAILED_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           FAILED_PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
           FAILED_RUN_ID: ${{ github.event.workflow_run.id }}

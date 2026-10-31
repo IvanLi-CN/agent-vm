@@ -156,7 +156,7 @@ func serve(args []string) error {
 		}
 	}
 	runner := native.NewRunner()
-	guest := native.NewIncusClient(runner, cfg.Project, native.ClientOptions{Profile: cfg.Profile, Network: cfg.Network, Pool: cfg.Pool})
+	guest := native.NewIncusClient(runner, cfg.Project, native.ClientOptions{Profile: cfg.Profile, Network: cfg.Network, Pool: cfg.Pool, StoragePath: cfg.StoragePath})
 	var snapshots *observe.SnapshotStore
 	if cfg.MetricsDir != "" {
 		snapshots = observe.NewSnapshotStore(cfg.MetricsDir)
@@ -184,7 +184,7 @@ func serve(args []string) error {
 			Actions: actions,
 		}
 	}
-	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver(), Release: releaseMetadata, LockDir: filepath.Join(cfg.StoragePath, "locks")})
+	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver(), Memory: observe.NewMemoryObserver(), Release: releaseMetadata, LockDir: filepath.Join(cfg.StoragePath, "locks")})
 	imageBackend := management.NewIncusImageBackend(guest, cfg.Management.Upload.StagingPath, cfg.RequiredGuestTools)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -194,6 +194,9 @@ func serve(args []string) error {
 		UploadMinimumFreeBytes: cfg.Management.Upload.MinimumFreeBytes,
 		AvailableImageStorageBytes: func() (int64, error) {
 			return guest.StoragePoolAvailableBytes(context.Background())
+		},
+		ReserveImageStorage: func(size int64) (func(), error) {
+			return service.ReservePhysicalStorage(context.Background(), size)
 		},
 		CurrentSystemVersion: func(ctx context.Context) (string, error) {
 			epoch, err := store.StateEpoch(ctx)

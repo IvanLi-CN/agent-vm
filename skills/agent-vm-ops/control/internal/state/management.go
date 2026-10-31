@@ -997,6 +997,9 @@ func (s *Store) ClaimManagementOperationWithAudit(ctx context.Context, value Man
 		return nil, err
 	}
 	var existing *ManagementOperation
+	var auditRecorded bool
+	s.auditSummaryMu.Lock()
+	defer s.auditSummaryMu.Unlock()
 	err = s.withWrite(ctx, func(tx *Tx) error {
 		current, scanErr := scanManagementOperation(ctx, tx.conn, value.OperationID)
 		if scanErr == nil {
@@ -1017,8 +1020,14 @@ func (s *Store) ClaimManagementOperationWithAudit(ctx context.Context, value Man
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`, value.OperationID, value.Action, value.TargetKind, value.TargetID, value.Actor, value.Reason, value.Phase, value.Status, string(request), now, value.UpdatedAt); err != nil {
 			return err
 		}
-		return recordManagementAuditTx(tx, audit, string(target), detail, now)
+		auditRecorded, err = recordManagementAuditTx(tx, audit, string(target), detail, now)
+		return err
 	})
+	if err != nil {
+		s.auditSummaryReady = false
+	} else if auditRecorded && s.auditSummaryReady {
+		addManagementAuditSummary(&s.auditSummary, audit, detail)
+	}
 	return existing, err
 }
 
@@ -1225,6 +1234,9 @@ func (s *Store) FinishManagementOperation(ctx context.Context, operationID, phas
 	if err != nil {
 		return nil, err
 	}
+	var auditRecorded bool
+	s.auditSummaryMu.Lock()
+	defer s.auditSummaryMu.Unlock()
 	err = s.withWrite(ctx, func(tx *Tx) error {
 		value, err := scanManagementOperation(ctx, tx.conn, operationID)
 		if err != nil {
@@ -1251,10 +1263,15 @@ func (s *Store) FinishManagementOperation(ctx context.Context, operationID, phas
 		if _, err := tx.exec("UPDATE management_operations SET phase = ?, status = ?, result_json = ?, error_json = ?, updated_at = ? WHERE operation_id = ?", phase, status, resultJSON, errorJSON, now, operationID); err != nil {
 			return err
 		}
-		return recordManagementAuditTx(tx, audit, string(target), detail, now)
+		auditRecorded, err = recordManagementAuditTx(tx, audit, string(target), detail, now)
+		return err
 	})
 	if err != nil {
+		s.auditSummaryReady = false
 		return nil, err
+	}
+	if auditRecorded && s.auditSummaryReady {
+		addManagementAuditSummary(&s.auditSummary, audit, detail)
 	}
 	return s.GetManagementOperation(ctx, operationID)
 }
@@ -1295,15 +1312,45 @@ func (s *Store) RecordManagementAudit(ctx context.Context, value ManagementAudit
 	if now == "" {
 		now = time.Now().UTC().Format(time.RFC3339Nano)
 	}
-	return s.withWrite(ctx, func(tx *Tx) error {
-		return recordManagementAuditTx(tx, value, string(target), detail, now)
+	var auditRecorded bool
+	s.auditSummaryMu.Lock()
+	defer s.auditSummaryMu.Unlock()
+	err = s.withWrite(ctx, func(tx *Tx) error {
+		auditRecorded, err = recordManagementAuditTx(tx, value, string(target), detail, now)
+		return err
 	})
+	if err != nil {
+		s.auditSummaryReady = false
+	} else if auditRecorded && s.auditSummaryReady {
+		addManagementAuditSummary(&s.auditSummary, value, detail)
+	}
+	return err
 }
 
-func recordManagementAuditTx(tx *Tx, value ManagementAudit, target string, detail any, occurredAt string) error {
-	_, err := tx.execWithoutEpoch(`INSERT OR IGNORE INTO management_audit(event_id, operation_id, action, actor, reason, target_json, outcome, phase, detail_json, occurred_at)
+func recordManagementAuditTx(tx *Tx, value ManagementAudit, target string, detail any, occurredAt string) (bool, error) {
+	result, err := tx.execWithoutEpoch(`INSERT OR IGNORE INTO management_audit(event_id, operation_id, action, actor, reason, target_json, outcome, phase, detail_json, occurred_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, value.EventID, nullableStringArg(value.OperationID), value.Action, value.Actor, value.Reason, target, value.Outcome, value.Phase, detail, occurredAt)
-	return err
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
+func addManagementAuditSummary(summary *AuditSummary, value ManagementAudit, detail any) {
+	raw, _ := detail.(string)
+	var parsed any
+	if raw != "" {
+		decoder := json.NewDecoder(strings.NewReader(raw))
+		decoder.UseNumber()
+		if err := decoder.Decode(&parsed); err != nil {
+			parsed = nil
+		}
+	}
+	addAuditSummary(summary, value.Action, value.Outcome, value.Phase, parsed, raw)
 }
 
 func (s *Store) ListManagementAudit(ctx context.Context, limit int) ([]ManagementAudit, error) {

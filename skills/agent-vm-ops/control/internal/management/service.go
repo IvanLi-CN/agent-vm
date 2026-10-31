@@ -48,6 +48,13 @@ type Service struct {
 	imageImportMu        sync.Mutex
 	imageStorageMu       sync.Mutex
 	imageStorageReserved int64
+	trustedImportLocksMu sync.Mutex
+	trustedImportLocks   map[string]*trustedImportLock
+}
+
+type trustedImportLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 const operationFinalizeTimeout = 30 * time.Second
@@ -59,6 +66,7 @@ type Options struct {
 	UploadMinimumFreeBytes     int64
 	AvailableStagingBytes      func() (int64, error)
 	AvailableImageStorageBytes func() (int64, error)
+	ReserveImageStorage        func(int64) (func(), error)
 	CurrentSystemVersion       func(context.Context) (string, error)
 	IsDraining                 func(context.Context) (bool, error)
 	Clock                      func() time.Time
@@ -172,7 +180,37 @@ func New(store *state.Store, options Options) *Service {
 	if clock == nil {
 		clock = time.Now
 	}
-	return &Service{Store: store, Clock: clock, Options: options}
+	return &Service{Store: store, Clock: clock, Options: options, trustedImportLocks: make(map[string]*trustedImportLock)}
+}
+
+// lockTrustedImport serializes the preflight, storage reservation and durable
+// claim for one trusted import operation. A retry racing the original request
+// must not reserve capacity or reclaim caches before it observes the claimed
+// operation. Different operation IDs remain independent and can proceed in
+// parallel.
+func (s *Service) lockTrustedImport(operationID string) func() {
+	s.trustedImportLocksMu.Lock()
+	if s.trustedImportLocks == nil {
+		s.trustedImportLocks = make(map[string]*trustedImportLock)
+	}
+	lock := s.trustedImportLocks[operationID]
+	if lock == nil {
+		lock = &trustedImportLock{}
+		s.trustedImportLocks[operationID] = lock
+	}
+	lock.refs++
+	s.trustedImportLocksMu.Unlock()
+
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		s.trustedImportLocksMu.Lock()
+		lock.refs--
+		if lock.refs == 0 && s.trustedImportLocks[operationID] == lock {
+			delete(s.trustedImportLocks, operationID)
+		}
+		s.trustedImportLocksMu.Unlock()
+	}
 }
 
 func (s *Service) lockOperation(ctx context.Context, operationID string) (func(), error) {
@@ -422,6 +460,9 @@ func (s *Service) checkImageStorageCapacity(size int64) error {
 func (s *Service) reserveImageStorage(ctx context.Context, size int64, required bool) (func(), error) {
 	if size < 0 {
 		return nil, errors.New("invalid_request: image size must not be negative")
+	}
+	if s.Options.ReserveImageStorage != nil {
+		return s.Options.ReserveImageStorage(size)
 	}
 	if s.Options.AvailableImageStorageBytes == nil || s.Options.UploadMinimumFreeBytes <= 0 {
 		if required {
@@ -699,10 +740,7 @@ func (s *Service) FailImageImportUpload(ctx context.Context, operationID string,
 }
 
 func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) (*state.ManagementOperation, error) {
-	unlock, err := s.lockOperation(ctx, operationID)
-	if err != nil {
-		return nil, err
-	}
+	unlock := s.lockTrustedImport(operationID)
 	defer unlock()
 	operation, err := s.Store.GetManagementOperation(ctx, operationID)
 	if err != nil {
@@ -768,6 +806,13 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 // an untracked native image when cleanup cannot be verified.
 func (s *Service) finishBackendImportFailure(ctx context.Context, operation *state.ManagementOperation, artifact ImageArtifact, importErr error) (*state.ManagementOperation, error) {
 	detail := safeError(importErr)
+	if isImageUnpackFailure(importErr) {
+		// Native command failures are deliberately reduced to safe fields before
+		// they enter the durable journal. Preserve the operational classification
+		// without persisting the native command's potentially sensitive message.
+		detail["code"] = "image_unpack_failed"
+		detail["failure_class"] = "image_unpack"
+	}
 	status := "failed"
 	if isUncertain(importErr) {
 		status = "outcome_unknown"
@@ -783,6 +828,31 @@ func (s *Service) finishBackendImportFailure(ctx context.Context, operation *sta
 		}
 	}
 	return s.finishOperation(ctx, operation, "reconciliation", status, nil, detail)
+}
+
+func isImageUnpackFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	if imageUnpackText(err.Error()) {
+		return true
+	}
+	var commandErr *native.CommandError
+	if !errors.As(err, &commandErr) {
+		return false
+	}
+	diagnostic := commandErr.Diagnostic()
+	for _, key := range []string{"stderr", "stdout"} {
+		if text, ok := diagnostic[key].(string); ok && imageUnpackText(text) {
+			return true
+		}
+	}
+	return false
+}
+
+func imageUnpackText(value string) bool {
+	lower := strings.ToLower(value)
+	return strings.Contains(lower, "unpack") && (strings.Contains(lower, "image") || strings.Contains(lower, "rootfs"))
 }
 
 func (s *Service) cleanupImportedImage(ctx context.Context, fingerprint string) string {
@@ -1432,7 +1502,7 @@ func safeError(err error) map[string]any {
 }
 
 func safeCode(code string) string {
-	if contains([]string{"authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "authority_unavailable", "rate_limited", "sqlite_unavailable", "internal_error"}, code) {
+	if contains([]string{"authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "authority_unavailable", "rate_limited", "sqlite_unavailable", "internal_error", "resource_insufficient", "watermarks_unreachable"}, code) {
 		return code
 	}
 	return "internal_error"
