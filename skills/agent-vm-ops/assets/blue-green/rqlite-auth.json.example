@@ -1,0 +1,12 @@
+[
+  {
+    "username": "agent-vm-control",
+    "password": "<operator-managed-control-secret>",
+    "perms": ["execute", "query", "ready", "status"]
+  },
+  {
+    "username": "agent-vm-backup",
+    "password": "<operator-managed-backup-secret>",
+    "perms": ["backup", "query", "ready", "status"]
+  }
+]

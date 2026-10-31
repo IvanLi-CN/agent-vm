@@ -1,0 +1,28 @@
+[Unit]
+Description=Agent VM rqlite state authority
+After=network-online.target
+Wants=network-online.target
+Before=agent-vm-native@blue.service agent-vm-native@green.service
+
+[Service]
+Type=simple
+User=agent-vm-rqlite
+Group=agent-vm-rqlite
+SupplementaryGroups=agent-vm-web
+ExecStart=/usr/local/bin/rqlited -node-id agent-vm-state -http-addr 127.0.0.1:4001 -raft-addr 127.0.0.1:4002 -auth /etc/agent-vm-native/rqlite/auth.json -http-cert /etc/agent-vm-native/tls/rqlite/server.crt -http-key /etc/agent-vm-native/tls/rqlite/server.key /var/lib/agent-vm-native/rqlite
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/agent-vm-native/rqlite
+ReadOnlyPaths=/etc/agent-vm-native/rqlite /etc/agent-vm-native/tls/rqlite
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
