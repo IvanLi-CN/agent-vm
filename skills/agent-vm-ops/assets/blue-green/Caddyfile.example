@@ -1,0 +1,34 @@
+{
+	admin off
+	auto_https off
+	log default {
+		output stderr
+		format filter {
+			request>uri regexp "\\?.*" "?REDACTED"
+			request>headers>Referer delete
+			request>headers>Cookie delete
+			request>headers>Authorization delete
+			resp_headers>Set-Cookie delete
+			wrap json
+		}
+	}
+}
+
+https://{$AGENT_VM_DOMAIN} {
+	tls /etc/agent-vm-native/tls/caddy/server.crt /etc/agent-vm-native/tls/caddy/server.key
+	log default
+
+	@internal path /internal/v1/*
+	handle @internal {
+		respond 404
+	}
+
+	handle {
+		reverse_proxy unix//var/lib/agent-vm-native/active/app.sock {
+			header_up -X-Forwarded-User
+			header_up -X-Original-URL
+			header_up -X-Original-Method
+			header_up -Forwarded
+		}
+	}
+}

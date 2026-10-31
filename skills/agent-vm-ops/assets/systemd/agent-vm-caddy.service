@@ -1,0 +1,31 @@
+[Unit]
+Description=Agent VM Caddy edge proxy
+After=agent-vm-rqlite.service agent-vm-native@blue.service agent-vm-native@green.service
+Wants=agent-vm-rqlite.service
+ConditionPathExists=/etc/agent-vm-native/Caddyfile
+
+[Service]
+Type=simple
+User=caddy
+Group=caddy
+SupplementaryGroups=agent-vm-web
+EnvironmentFile=-/etc/agent-vm-native/caddy.env
+ExecStart=/usr/local/bin/caddy run --environ --config /etc/agent-vm-native/Caddyfile --adapter caddyfile
+ExecReload=/usr/local/bin/caddy reload --config /etc/agent-vm-native/Caddyfile --adapter caddyfile
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/agent-vm-native/caddy
+ReadOnlyPaths=/etc/agent-vm-native/Caddyfile /etc/agent-vm-native/caddy.env /etc/agent-vm-native/tls/caddy
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

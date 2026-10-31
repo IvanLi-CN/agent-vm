@@ -40,6 +40,41 @@
     "cgo_enabled": false,
     "targets": ["linux/amd64", "linux/arm64"]
   },
+  "deployment_artifacts": {
+    "metadata": "skills/agent-vm-ops/assets/blue-green/deployment-components.json",
+    "automatic_install": false,
+    "components": [
+      {
+        "name": "caddy",
+        "version": "2.11.7",
+        "repository": "caddyserver/caddy",
+        "checksums_url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_checksums.txt",
+        "checksum_algorithm": "sha512",
+        "artifacts": {
+          "linux/amd64": {
+            "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_amd64.tar.gz",
+            "checksum": "a7a433a1b133efc3c8d10eb0b99d52a24b5ef5c322dc77f5282182b1c0402139ab83f3a99f0c52409df77d20123fb0b523edad8a66d8f5e49136197bf61ef0e7"
+          },
+          "linux/arm64": {
+            "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_arm64.tar.gz",
+            "checksum": "3db36ba90c7a6e8dda40ee3dd71fa08844c76b5fb08f61b31e5e78d2ed38e71c51dc7baed875e50d1ca1279196e84302967237386ae87c91ae9f2aaceada682e"
+          }
+        }
+      },
+      {
+        "name": "rqlite",
+        "version": "10.5.2",
+        "repository": "rqlite/rqlite",
+        "checksum_algorithm": "sha256",
+        "artifacts": {
+          "linux/amd64": {
+            "url": "https://github.com/rqlite/rqlite/releases/download/v10.5.2/rqlite-v10.5.2-linux-amd64.tar.gz",
+            "checksum": "1a04a7c2c542e8e1c1347bd31af0fa9ef7043febb3c4d1806d36bc1702c6fa0f"
+          }
+        }
+      }
+    ]
+  },
   "deployment_boundary": {
     "automatic_deploy": false,
     "native_install_validation": "conditional-on-incus-systemd-deployment-boundary",
