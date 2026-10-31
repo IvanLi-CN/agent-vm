@@ -59,7 +59,7 @@ jobs:
           RQLITE_SHA256: '1a04a7c2c542e8e1c1347bd31af0fa9ef7043febb3c4d1806d36bc1702c6fa0f'
         run: |
           set -Eeuo pipefail
-          proof_dir="$(mktemp -d "${RUNNER_TEMP}/agent-vm-rqlite.XXXXXX")"
+          proof_dir="$(mktemp -d /tmp/agent-vm-rqlite.XXXXXX)"
           archive="${proof_dir}/rqlite.tar.gz"
           data_dir="${proof_dir}/rqlite-data"
           http_addr="127.0.0.1:4091"
