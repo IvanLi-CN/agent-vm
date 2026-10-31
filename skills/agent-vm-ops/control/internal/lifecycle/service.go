@@ -181,6 +181,17 @@ func (s *Service) lockActionWithContext(ctx context.Context, action string, requ
 			return func() {}, err
 		}
 	}
+	if action == "acquire" {
+		// Image selection is shared with management mutations. Use the same
+		// process-independent fence before reading the default image and
+		// persisting the preparing task.
+		if err := acquire("management-resource:image-catalog"); err != nil {
+			for index := len(unlocks) - 1; index >= 0; index-- {
+				unlocks[index]()
+			}
+			return func() {}, err
+		}
+	}
 	key := ""
 	if action != "drain-enter" && action != "drain-exit" && !releaseSensitiveAction(action, request) {
 		if session := stringValue(request["session_id"]); session != "" {

@@ -156,6 +156,37 @@ func TestStartupReconcileSharesCrossProcessMaintenanceBoundary(t *testing.T) {
 	}
 }
 
+func TestAcquireSharesCrossProcessImageCatalogBoundary(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	lockDir := t.TempDir()
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	first := New(store, cfg, Options{LockDir: lockDir})
+	second := New(store, cfg, Options{LockDir: lockDir})
+	unlock, err := first.lockNamedActionWithContext(context.Background(), "management-resource:image-catalog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	request := protocol.Request{
+		"protocol":     protocol.Version,
+		"action":       "acquire",
+		"session_id":   "catalog-fence",
+		"generation":   int64(0),
+		"operation_id": "catalog-fence-acquire",
+	}
+	if _, err := second.Dispatch(ctx, request); err == nil || !strings.Contains(err.Error(), "operation_conflict") {
+		t.Fatalf("acquire error = %v, want operation_conflict", err)
+	}
+}
+
 func TestLeaseJournalAndBuiltInCleanup(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
