@@ -351,7 +351,7 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 			// Confirmation records were added after the first durable auth
 			// schema. Keep an already-complete OIDC/session/Token database
 			// open so EnsureManagementSchema can add this table atomically.
-			if authPresent && key == "table:management_confirmations" && !actual[key] {
+			if authPresent && key == objectKey("table", "management_confirmations") && !actual[key] {
 				continue
 			}
 			if !actual[key] {
@@ -364,7 +364,7 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 
 func isAuthManagementObject(key string) bool {
 	switch key {
-	case "table:oidc_transactions", "table:browser_sessions", "table:agent_tokens", "table:management_confirmations":
+	case objectKey("table", "oidc_transactions"), objectKey("table", "browser_sessions"), objectKey("table", "agent_tokens"), objectKey("table", "management_confirmations"):
 		return true
 	default:
 		return false

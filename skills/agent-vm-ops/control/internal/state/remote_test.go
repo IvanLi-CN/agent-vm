@@ -1337,7 +1337,7 @@ func TestSupportedSchemaAcceptsDurableAuthBeforeConfirmationBootstrap(t *testing
 		objects = append(objects, object)
 	}
 	for key, object := range management {
-		if key == "table:management_confirmations" {
+		if key == objectKey("table", "management_confirmations") {
 			continue
 		}
 		objects = append(objects, object)
@@ -1603,6 +1603,87 @@ func TestApplySnapshotRejectsStaleRowMutation(t *testing.T) {
 	var statementErr *remoteStatementError
 	if !errors.As(err, &statementErr) || !statementErr.EpochGuard {
 		t.Fatalf("stale row mutation error = %v", err)
+	}
+}
+
+func TestRowMutationProofRollsBackEarlierBatchChanges(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "proof.sqlite3")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for _, statement := range []string{
+		"CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+		"CREATE TABLE tasks(task_id TEXT PRIMARY KEY, state TEXT NOT NULL)",
+		"INSERT INTO meta(key, value) VALUES ('state_epoch', 'initial'), ('management_auth_epoch', 'initial')",
+		"INSERT INTO tasks(task_id, state) VALUES ('task-1', 'active')",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before := remoteTableSnapshot{
+		Name:       "tasks",
+		Columns:    []string{"task_id", "state"},
+		PrimaryKey: []int{0},
+		Rows: map[string]remoteRow{
+			"task-1": {Values: []any{"task-1", "active"}},
+			"task-2": {Values: []any{"task-2", "active"}},
+		},
+	}
+	after := remoteTableSnapshot{
+		Name:       "tasks",
+		Columns:    []string{"task_id", "state"},
+		PrimaryKey: []int{0},
+		Rows: map[string]remoteRow{
+			"task-1": {Values: []any{"task-1", "cached"}},
+			"task-2": {Values: []any{"task-2", "cached"}},
+		},
+	}
+	var statements []remoteStatement
+	if err := appendTableDiff(&statements, before, true, after, "initial", "initial"); err != nil {
+		t.Fatal(err)
+	}
+	if len(statements) != 6 || !strings.Contains(statements[1].query, "CASE WHEN changes() = 1") || !strings.Contains(statements[4].query, "CASE WHEN changes() = 1") {
+		t.Fatalf("row mutation proof statements = %#v", statements)
+	}
+
+	tx, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var proofErr error
+	for index, statement := range statements {
+		if _, err := tx.ExecContext(context.Background(), statement.query, statement.args...); err != nil {
+			proofErr = fmt.Errorf("statement %d: %w", index, err)
+			break
+		}
+	}
+	if proofErr == nil {
+		t.Fatal("stale row proof unexpectedly succeeded")
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	var taskOne, stateEpoch, authEpoch string
+	var taskTwoCount int
+	if err := db.QueryRow("SELECT state FROM tasks WHERE task_id = 'task-1'").Scan(&taskOne); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM tasks WHERE task_id = 'task-2'").Scan(&taskTwoCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT value FROM meta WHERE key = 'state_epoch'").Scan(&stateEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow("SELECT value FROM meta WHERE key = 'management_auth_epoch'").Scan(&authEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if taskOne != "active" || taskTwoCount != 0 || stateEpoch != "initial" || authEpoch != "initial" {
+		t.Fatalf("rolled-back state = task-1=%q task-2-count=%d state_epoch=%q auth_epoch=%q", taskOne, taskTwoCount, stateEpoch, authEpoch)
 	}
 }
 
