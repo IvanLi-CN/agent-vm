@@ -56,7 +56,7 @@ function evidencePayload(source: string, evidenceId: string, overrides: Record<s
     release_fence_path: "/run/agent-vm-native/release-activation.fence",
     fence_generation: 1,
     state_epoch: "epoch-1",
-    state_generation: "7",
+    state_generation: "6728b2001bc842af236929770c506c5dca42faca834859e693d7b9ff7d969cf6",
     trusted_commit: "commit-1",
     observed_at: new Date(Date.now() - 1000).toISOString(),
     expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
@@ -124,7 +124,7 @@ test("CA generation and state preflight require operator evidence", () => {
     expect(statSync(join(caDir, "caddy/server.key")).mode & 0o777).toBe(0o600);
 
     const source = join(temporaryRoot, "state.sqlite3");
-    const database = run(["python3", "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\"); c.executemany(\"INSERT INTO meta VALUES (?,?)\", [('state_epoch','epoch-1'), ('generation','7')]); c.commit(); c.close()", source]);
+    const database = run(["python3", "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\"); c.execute(\"CREATE TABLE tasks (session_id TEXT NOT NULL, generation INTEGER NOT NULL)\"); c.execute(\"INSERT INTO meta VALUES ('state_epoch','epoch-1')\"); c.execute(\"INSERT INTO tasks VALUES ('session-1',7)\"); c.commit(); c.close()", source]);
     expect(database.exitCode).toBe(0);
     const signer = createEvidenceSigner(temporaryRoot);
     const invalidEvidence = join(temporaryRoot, "invalid.json");
@@ -149,7 +149,7 @@ test("CA generation and state preflight require operator evidence", () => {
     expect(manifest.state_epoch).toBe("epoch-1");
 
     const blockedSource = join(temporaryRoot, "blocked.sqlite3");
-    const blockedDatabase = run(["python3", "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(\"CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO meta VALUES ('state_epoch','epoch-1'), ('generation','7'); CREATE TABLE management_operations (status TEXT); INSERT INTO management_operations VALUES ('outcome_unknown');\"); c.commit(); c.close()", blockedSource]);
+    const blockedDatabase = run(["python3", "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.executescript(\"CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); INSERT INTO meta VALUES ('state_epoch','epoch-1'); CREATE TABLE tasks (session_id TEXT NOT NULL, generation INTEGER NOT NULL); INSERT INTO tasks VALUES ('session-1',7); CREATE TABLE operations (operation_id TEXT, response_json TEXT); INSERT INTO operations VALUES ('lifecycle-pending', '{\\\"outcome\\\":\\\"pending\\\"}'); CREATE TABLE management_operations (operation_id TEXT, status TEXT); INSERT INTO management_operations VALUES ('blocked-upload','awaiting_upload');\"); c.commit(); c.close()", blockedSource]);
     expect(blockedDatabase.exitCode).toBe(0);
     const blockedEvidence = join(temporaryRoot, "blocked-evidence.json");
     signedEvidence(blockedEvidence, evidencePayload(blockedSource, "blocked-0001"), signer.privateKey);
@@ -161,6 +161,7 @@ test("CA generation and state preflight require operator evidence", () => {
 });
 
 test("cutover dry-run accepts only a verified blue or green layout", () => {
+  expect(read("skills/agent-vm-ops/scripts/agent_vm_cutover.sh")).toContain("mv -Tf --");
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-cutover-test-"));
   try {
     const layout = join(temporaryRoot, "layout");

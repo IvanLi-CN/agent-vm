@@ -125,7 +125,10 @@ func (server *UnifiedServer) createToken(writer http.ResponseWriter, request *ht
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	expiresAt, expiresValue, err := server.validateTokenExpiry(payload.ExpiresAt)
+	// Parse and canonicalize before looking up the idempotency record. A replay
+	// must still resolve to the original result even after the requested expiry
+	// has passed; only a new operation is subject to the live expiry window.
+	expiresAt, expiresValue, err := parseTokenExpiry(payload.ExpiresAt)
 	if err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
@@ -156,6 +159,10 @@ func (server *UnifiedServer) createToken(writer http.ResponseWriter, request *ht
 			return
 		}
 		writeJSON(writer, http.StatusOK, map[string]any{"operation_id": payload.OperationID, "metadata": agentTokenValue(*value), "plaintext_disclosure": "consumed"})
+		return
+	}
+	if expiresAt, expiresValue, err = server.validateTokenExpiry(expiresValue); err != nil {
+		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
 	rawToken, err := randomToken(32)
@@ -359,7 +366,7 @@ func normalizeTokenScopes(values []string) ([]string, error) {
 	return result, nil
 }
 
-func (server *UnifiedServer) validateTokenExpiry(raw string) (time.Time, string, error) {
+func parseTokenExpiry(raw string) (time.Time, string, error) {
 	if raw == "" {
 		return time.Time{}, "", errors.New("expires_at is required")
 	}
@@ -367,13 +374,21 @@ func (server *UnifiedServer) validateTokenExpiry(raw string) (time.Time, string,
 	if err != nil {
 		return time.Time{}, "", errors.New("expires_at must be an RFC3339 timestamp")
 	}
+	value = value.UTC()
+	return value, value.Format(time.RFC3339Nano), nil
+}
+
+func (server *UnifiedServer) validateTokenExpiry(raw string) (time.Time, string, error) {
+	value, normalized, err := parseTokenExpiry(raw)
+	if err != nil {
+		return time.Time{}, "", err
+	}
 	now := server.now()
 	maximum := now.Add(time.Duration(server.Config.TokenTTLSeconds) * time.Second)
 	if !value.After(now) || value.After(maximum) {
 		return time.Time{}, "", fmt.Errorf("expires_at must be within %d seconds", server.Config.TokenTTLSeconds)
 	}
-	value = value.UTC()
-	return value, value.Format(time.RFC3339Nano), nil
+	return value, normalized, nil
 }
 
 func agentTokenValue(value state.AgentToken) map[string]any {

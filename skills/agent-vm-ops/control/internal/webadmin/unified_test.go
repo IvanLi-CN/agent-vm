@@ -66,6 +66,12 @@ func TestUnifiedTokenAPIIsIdempotentAndRevocable(t *testing.T) {
 	if replayed.Code != http.StatusOK || strings.Contains(replayed.Body.String(), rawToken) || strings.Contains(replayed.Body.String(), `"token"`) {
 		t.Fatalf("replay status/body=%d %s", replayed.Code, replayed.Body.String())
 	}
+	server.Clock = func() time.Time { return now.Add(6 * time.Minute) }
+	lateReplay := makeRequest(http.MethodPost, "/api/v1/tokens", createBody)
+	if lateReplay.Code != http.StatusOK || !strings.Contains(lateReplay.Body.String(), `"plaintext_disclosure":"consumed"`) || strings.Contains(lateReplay.Body.String(), rawToken) {
+		t.Fatalf("late replay status/body=%d %s", lateReplay.Code, lateReplay.Body.String())
+	}
+	server.Clock = func() time.Time { return now }
 	validAgent := httptest.NewRequest(http.MethodPost, "/agent/v1/control", strings.NewReader(`{"protocol":4,"action":"status","session_id":"agent-test"}`))
 	validAgent.Header.Set("Authorization", "Bearer "+rawToken)
 	validAgent.Header.Set("Content-Type", "application/json")

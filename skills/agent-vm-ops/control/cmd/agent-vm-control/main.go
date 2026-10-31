@@ -258,8 +258,15 @@ func serve(args []string) error {
 		}()
 	}
 	schedulerInstance := scheduler.New(service)
-	slog.Info("agent vm control started", "socket", cfg.Socket, "database", cfg.StateDB)
+	slog.Info("agent vm control started", "socket", cfg.Socket, "database_backend", stateBackend(cfg.StateDB))
 	return schedulerInstance.Run(ctx)
+}
+
+func stateBackend(value string) string {
+	if remoteStateDSN(value) {
+		return "rqlite"
+	}
+	return "sqlite"
 }
 
 func remoteStateDSN(value string) bool {

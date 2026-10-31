@@ -462,7 +462,22 @@ func (s *Service) reserveImageStorage(ctx context.Context, size int64, required 
 		return nil, errors.New("invalid_request: image size must not be negative")
 	}
 	if s.Options.ReserveImageStorage != nil {
-		return s.Options.ReserveImageStorage(size)
+		sharedUnlock, err := s.AcquireResourceLock(ctx, "image-storage")
+		if err != nil {
+			return nil, err
+		}
+		release, err := s.Options.ReserveImageStorage(size)
+		if err != nil {
+			sharedUnlock()
+			return nil, err
+		}
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				release()
+				sharedUnlock()
+			})
+		}, nil
 	}
 	if s.Options.AvailableImageStorageBytes == nil || s.Options.UploadMinimumFreeBytes <= 0 {
 		if required {
@@ -740,6 +755,11 @@ func (s *Service) FailImageImportUpload(ctx context.Context, operationID string,
 }
 
 func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) (*state.ManagementOperation, error) {
+	operationUnlock, err := s.lockOperation(ctx, operationID)
+	if err != nil {
+		return nil, err
+	}
+	defer operationUnlock()
 	unlock := s.lockTrustedImport(operationID)
 	defer unlock()
 	operation, err := s.Store.GetManagementOperation(ctx, operationID)

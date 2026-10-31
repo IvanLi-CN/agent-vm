@@ -468,6 +468,60 @@ func TestConcurrentTrustedImportsUseSharedStorageLock(t *testing.T) {
 	}
 }
 
+func TestConfiguredStorageReservationUsesSharedLock(t *testing.T) {
+	lockDir := filepath.Join(t.TempDir(), "locks")
+	entered := make(chan struct{})
+	var callsMu sync.Mutex
+	calls := 0
+	reserve := func(int64) (func(), error) {
+		callsMu.Lock()
+		calls++
+		call := calls
+		callsMu.Unlock()
+		if call == 1 {
+			close(entered)
+		}
+		return func() {}, nil
+	}
+	first := New(nil, Options{OperationLockDir: lockDir, ReserveImageStorage: reserve})
+	second := New(nil, Options{OperationLockDir: lockDir, ReserveImageStorage: reserve})
+	firstRelease, err := first.reserveImageStorage(context.Background(), 1, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("configured storage reservation did not run")
+	}
+	secondDone := make(chan struct {
+		release func()
+		err     error
+	}, 1)
+	go func() {
+		release, reserveErr := second.reserveImageStorage(context.Background(), 1, true)
+		secondDone <- struct {
+			release func()
+			err     error
+		}{release: release, err: reserveErr}
+	}()
+	select {
+	case result := <-secondDone:
+		t.Fatalf("configured reservation crossed shared lock: release=%v err=%v", result.release != nil, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	firstRelease()
+	select {
+	case result := <-secondDone:
+		if result.err != nil || result.release == nil {
+			t.Fatalf("second configured reservation = release=%v err=%v", result.release != nil, result.err)
+		}
+		result.release()
+	case <-time.After(time.Second):
+		t.Fatal("second configured reservation did not proceed after release")
+	}
+}
+
 func TestSharedManagementResourceLockSerializesAcrossServices(t *testing.T) {
 	lockDir := filepath.Join(t.TempDir(), "locks")
 	first := New(nil, Options{OperationLockDir: lockDir})
@@ -1026,6 +1080,77 @@ func TestRecoverPendingOperationsWaitsForPeerOperationLock(t *testing.T) {
 		t.Fatal("recovery did not finish after peer released operation lock")
 	}
 	recovered, err := second.GetOperation(context.Background(), request.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.Status != "succeeded" {
+		t.Fatalf("recovered operation = %#v, want peer result", recovered)
+	}
+}
+
+func TestRecoverPendingTrustedImportWaitsForPeerOperationLock(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "state.sqlite3")
+	firstStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStore.Close()
+	secondStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	fingerprint := strings.Repeat("e", 64)
+	backend := &blockingImageBackend{
+		fakeImageBackend: fakeImageBackend{artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true}},
+		entered:          make(chan struct{}), release: make(chan struct{}),
+	}
+	lockDir := filepath.Join(root, "locks")
+	first := New(firstStore, Options{TrustedImageSourceIDs: []string{"approved"}, Backend: backend, UploadMinimumFreeBytes: 512, AvailableImageStorageBytes: func() (int64, error) { return 4096, nil }, OperationLockDir: lockDir})
+	second := New(secondStore, Options{OperationLockDir: lockDir})
+	request := ImportRequest{OperationID: "trusted-peer-fence", Actor: "admin", Reason: "peer fence", TargetVersion: "image-catalog:revision-1", VersionLabel: "peer", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}}
+	operation, err := first.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executionDone := make(chan struct{})
+	var execution *state.ManagementOperation
+	var executionErr error
+	go func() {
+		execution, executionErr = first.ProcessTrustedImport(context.Background(), operation.OperationID)
+		close(executionDone)
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("peer trusted import did not start")
+	}
+	recoveryDone := make(chan error, 1)
+	go func() { recoveryDone <- second.RecoverPendingOperations(context.Background()) }()
+	select {
+	case recoveryErr := <-recoveryDone:
+		t.Fatalf("recovery finalized a live peer trusted import: %v", recoveryErr)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(backend.release)
+	select {
+	case <-executionDone:
+	case <-time.After(time.Second):
+		t.Fatal("peer trusted import did not finish")
+	}
+	if executionErr != nil || execution == nil || execution.Status != "succeeded" {
+		t.Fatalf("execution=%#v err=%v", execution, executionErr)
+	}
+	select {
+	case recoveryErr := <-recoveryDone:
+		if recoveryErr != nil {
+			t.Fatal(recoveryErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not finish after peer trusted import released operation lock")
+	}
+	recovered, err := second.GetOperation(context.Background(), operation.OperationID)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -264,7 +264,9 @@ import sys
 connection = sqlite3.connect(sys.argv[1])
 connection.executescript("""
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-INSERT INTO meta(key, value) VALUES ('state_epoch', 'epoch-1'), ('generation', '7');
+INSERT INTO meta(key, value) VALUES ('state_epoch', 'epoch-1');
+CREATE TABLE tasks (session_id TEXT NOT NULL, generation INTEGER NOT NULL);
+INSERT INTO tasks(session_id, generation) VALUES ('session-1', 7);
 """)
 connection.commit()
 connection.close()
@@ -345,15 +347,16 @@ PY
 
 sqlite_source_sha256="$(sha256sum "$sqlite_source" | awk '{print $1}')"
 sqlite_source_size="$(stat -c '%s' "$sqlite_source")"
+state_generation="6728b2001bc842af236929770c506c5dca42faca834859e693d7b9ff7d969cf6"
 invalid_evidence="$proof_dir/invalid-evidence.json"
-write_evidence_payload "$proof_dir/invalid-payload.json" invalid-deployment-0001 false "$sqlite_source_sha256" "$sqlite_source_size" commit-1 epoch-1 7 - -
+write_evidence_payload "$proof_dir/invalid-payload.json" invalid-deployment-0001 false "$sqlite_source_sha256" "$sqlite_source_size" commit-1 epoch-1 "$state_generation" - -
 sign_evidence "$proof_dir/invalid-payload.json" "$invalid_evidence"
 if bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.ts" \
   preflight --source "$sqlite_source" --evidence "$invalid_evidence" --evidence-public-key "$evidence_public_key" --output-dir "$proof_dir/invalid-output" >/dev/null 2>&1; then
   fail "migration preflight accepted incomplete fence evidence"
 fi
 evidence="$proof_dir/evidence.json"
-write_evidence_payload "$proof_dir/evidence-payload.json" isolated-deployment-0001 true "$sqlite_source_sha256" "$sqlite_source_size" commit-1 epoch-1 7 - -
+write_evidence_payload "$proof_dir/evidence-payload.json" isolated-deployment-0001 true "$sqlite_source_sha256" "$sqlite_source_size" commit-1 epoch-1 "$state_generation" - -
 sign_evidence "$proof_dir/evidence-payload.json" "$evidence"
 migration_dir="$proof_dir/migration"
 bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.ts" \
@@ -366,7 +369,7 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 PY
 )"
 tail_evidence="$proof_dir/tail-evidence.json"
-write_evidence_payload "$proof_dir/tail-payload.json" isolated-deployment-0002 true - - commit-1 epoch-1 7 true "$backup_sha256"
+write_evidence_payload "$proof_dir/tail-payload.json" isolated-deployment-0002 true - - commit-1 epoch-1 "$state_generation" true "$backup_sha256"
 sign_evidence "$proof_dir/tail-payload.json" "$tail_evidence"
 bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.ts" \
   restore-check --backup-manifest "$migration_dir/snapshot-manifest.json" \

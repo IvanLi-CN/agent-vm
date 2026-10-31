@@ -1236,7 +1236,10 @@ func (s *Store) Audit(ctx context.Context, action, taskID, sessionID, outcome st
 		s.auditSummaryReady = false
 		return err
 	}
-	if s.auditSummaryReady {
+	// A remote store refreshes its local mirror from rqlite inside withRead.
+	// Do not serve a process-local cache before that refresh, otherwise a
+	// blue-green slot can hide audit rows committed by its peer.
+	if s.remote == nil && s.auditSummaryReady {
 		var parsed any
 		decoder := json.NewDecoder(strings.NewReader(string(raw)))
 		decoder.UseNumber()

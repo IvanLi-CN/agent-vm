@@ -111,6 +111,9 @@ health_body="$(curl --fail --silent --show-error --max-time "$health_timeout" \
 [[ "$health_body" == *'"ready":true'* ]] || die "candidate health response is not ready"
 
 ln -s -- "$candidate" "$temporary_link"
-mv -f -- "$temporary_link" "$active"
+# `active` is itself a symlink to a slot directory. GNU mv without -T treats
+# that directory target as a container and moves the temporary link inside it;
+# -T makes the replacement operate on the link path, preserving atomic cutover.
+mv -Tf -- "$temporary_link" "$active"
 printf '{"dry_run":false,"previous":"%s","active":"%s","health":"ready"}\n' \
   "$current_slot" "$slot"

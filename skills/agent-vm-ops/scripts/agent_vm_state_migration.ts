@@ -154,15 +154,37 @@ try:
     if "meta" in tables:
         row = connection.execute("SELECT value FROM meta WHERE key = 'state_epoch'").fetchone()
         state_epoch = row[0] if row else None
-    generation = None
+    generations = []
+    if "tasks" in tables:
+        generations = [
+            [row[0], row[1]]
+            for row in connection.execute("SELECT session_id, generation FROM tasks ORDER BY session_id, generation")
+        ]
+    tombstones = []
     if "meta" in tables:
-        row = connection.execute("SELECT value FROM meta WHERE key = 'generation'").fetchone()
-        generation = row[0] if row else None
+        tombstones = [
+            [row[0], row[1]]
+            for row in connection.execute("SELECT key, value FROM meta WHERE key LIKE 'generation_tombstone:%' ORDER BY key")
+        ]
+    state_generation = hashlib.sha256(json.dumps({"tasks": generations, "tombstones": tombstones}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     pending = 0
+    if "operations" in tables:
+        for operation_id, raw in connection.execute("SELECT operation_id, response_json FROM operations"):
+            try:
+                response = json.loads(raw)
+            except Exception as error:
+                raise SystemExit(f"operation {operation_id} has invalid response JSON: {error}")
+            outcome = response.get("outcome") if isinstance(response, dict) else None
+            if outcome not in ("success", "pending", "error"):
+                raise SystemExit(f"operation {operation_id} has unsupported outcome {outcome!r}")
+            if outcome == "pending" or (outcome == "error" and isinstance(response.get("error"), dict) and response["error"].get("code") == "operation_outcome_unknown"):
+                pending += 1
     if "management_operations" in tables:
-        pending = connection.execute(
-            "SELECT COUNT(*) FROM management_operations WHERE status IN ('queued', 'running', 'reconciling', 'unknown', 'outcome_unknown')"
-        ).fetchone()[0]
+        for operation_id, status in connection.execute("SELECT operation_id, status FROM management_operations"):
+            if status in ("awaiting_upload", "queued", "running", "reconciling", "outcome_unknown"):
+                pending += 1
+            elif status not in ("succeeded", "failed"):
+                raise SystemExit(f"management operation {operation_id} has unsupported status {status!r}")
     schema = "\n".join("|".join("" if value is None else str(value) for value in row) for row in objects)
     print(json.dumps({
         "integrity": integrity,
@@ -170,7 +192,7 @@ try:
         "tables": tables,
         "row_counts": counts,
         "state_epoch": state_epoch,
-        "generation": generation,
+        "state_generation": state_generation,
         "pending_operation_count": pending,
         "source_size": os.stat(path).st_size,
     }, sort_keys=True))
@@ -201,7 +223,7 @@ function preflight(args: string[]): void {
   if (evidence.source_sha256 !== sourceHash || evidence.source_size !== sourceStat.size) {
     fail("fence evidence does not describe the exact SQLite source");
   }
-  if (evidence.state_epoch !== inspection.state_epoch || evidence.state_generation !== String(inspection.generation)) {
+  if (evidence.state_epoch !== inspection.state_epoch || evidence.state_generation !== inspection.state_generation) {
     fail("fence evidence does not describe the observed SQLite state epoch and generation");
   }
 
