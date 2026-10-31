@@ -1301,7 +1301,7 @@ func (s *Store) RecordManagementAudit(ctx context.Context, value ManagementAudit
 }
 
 func recordManagementAuditTx(tx *Tx, value ManagementAudit, target string, detail any, occurredAt string) error {
-	_, err := tx.exec(`INSERT OR IGNORE INTO management_audit(event_id, operation_id, action, actor, reason, target_json, outcome, phase, detail_json, occurred_at)
+	_, err := tx.execWithoutEpoch(`INSERT OR IGNORE INTO management_audit(event_id, operation_id, action, actor, reason, target_json, outcome, phase, detail_json, occurred_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, value.EventID, nullableStringArg(value.OperationID), value.Action, value.Actor, value.Reason, target, value.Outcome, value.Phase, detail, occurredAt)
 	return err
 }

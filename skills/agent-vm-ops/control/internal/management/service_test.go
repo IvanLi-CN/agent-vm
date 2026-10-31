@@ -545,6 +545,51 @@ func TestFinishImportCatalogLockFailurePersistsUnknownOutcome(t *testing.T) {
 	}
 }
 
+func TestFailImportWithImageCatalogLockFailurePersistsUnknownOutcome(t *testing.T) {
+	root := t.TempDir()
+	store, err := state.OpenForTest(filepath.Join(root, "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	fingerprint := strings.Repeat("d", 64)
+	operationID := "suitability-lock-failure"
+	operation := state.ManagementOperation{
+		OperationID: operationID, Action: "image_import", TargetKind: "image_catalog", TargetID: "image-catalog",
+		Actor: "admin", Reason: "suitability lock regression", Phase: "suitability_check", Status: "running",
+		Request: map[string]any{"request": map[string]any{"operation_id": operationID}},
+	}
+	if _, err := store.ClaimManagementOperationWithAudit(context.Background(), operation, state.ManagementAudit{
+		EventID: "suitability-lock-failure-accepted", OperationID: &operationID, Action: operation.Action, Actor: operation.Actor,
+		Reason: operation.Reason, Target: map[string]any{"kind": operation.TargetKind, "id": operation.TargetID}, Outcome: "accepted", Phase: operation.Phase,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(root, "locks-file")
+	if err := os.WriteFile(lockPath, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend := &fakeImageBackend{}
+	service := New(store, Options{OperationLockDir: lockPath, Backend: backend})
+	request := ImportRequest{OperationID: operationID, VersionLabel: "2026.10", Source: ImportSource{Kind: "local_upload"}}
+	artifact := ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "vm", Runtime: true, SyncTool: true, GuestReady: true}
+
+	result, err := service.failImportWithImage(context.Background(), &operation, request, artifact, "passed", "failed", []string{"unsupported_instance_type"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || result.Status != "outcome_unknown" || result.Phase != "reconciliation" {
+		t.Fatalf("result = %#v", result)
+	}
+	if result.Error["imported_fingerprint"] != fingerprint || result.Error["cleanup"] != "blocked_catalog_unverified" {
+		t.Fatalf("result error = %#v", result.Error)
+	}
+	if backend.deletes != 0 {
+		t.Fatalf("cleanup unexpectedly reached backend: %d", backend.deletes)
+	}
+}
+
 func TestImageImportUploadStreamFailureIsDurable(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

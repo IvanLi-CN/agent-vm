@@ -958,7 +958,7 @@ func (s *Service) failImportWithImage(ctx context.Context, operation *state.Mana
 	}
 	catalogUnlock, lockErr := s.AcquireResourceLock(ctx, "image-catalog")
 	if lockErr != nil {
-		return operation, lockErr
+		return s.recoverImportedCatalogFailure(ctx, operation, artifact, lockErr)
 	}
 	insertErr := s.Store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Architecture: artifact.Architecture, InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID), State: "failed", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none"})
 	catalogUnlock()
