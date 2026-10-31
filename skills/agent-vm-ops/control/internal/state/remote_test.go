@@ -517,6 +517,68 @@ func TestRemoteOIDCConsumptionReplaysEpochConflict(t *testing.T) {
 	}
 }
 
+func TestRemoteManagementConfirmationIsVisibleAcrossMirrorsAndSingleUse(t *testing.T) {
+	rqliteURL := requireSessionOwnedRQLite(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	runID := randomHex(6)
+	first, err := OpenForTest(rqliteURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := OpenForTest(rqliteURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	confirmation := ManagementConfirmation{
+		ConfirmationDigest: "remote-confirmation-" + runID,
+		Subject:            "issuer\x00admin",
+		Action:             "token_revoke",
+		Target:             "token:remote-" + runID,
+		TargetVersion:      "token:initial",
+		ParamsDigest:       "remote-params-" + runID,
+		CreatedAt:          "2026-10-31T00:00:00Z",
+		ExpiresAt:          "2099-10-31T00:05:00Z",
+	}
+	if err := first.InsertManagementConfirmation(ctx, confirmation); err != nil {
+		t.Fatal(err)
+	}
+	// Warm both mirrors before the consume race so the test exercises the
+	// management-auth epoch rather than an initial mirror refresh.
+	for index, store := range []*Store{first, second} {
+		if _, err := store.StateEpoch(ctx); err != nil {
+			t.Fatalf("warm mirror %d: %v", index, err)
+		}
+	}
+
+	type result struct {
+		consumed bool
+		err      error
+	}
+	results := make(chan result, 2)
+	for _, store := range []*Store{first, second} {
+		go func(store *Store) {
+			consumed, err := store.ConsumeManagementConfirmation(ctx, confirmation.ConfirmationDigest, confirmation.Subject, confirmation.Action, confirmation.Target, confirmation.TargetVersion, confirmation.ParamsDigest, "2026-10-31T00:01:00Z")
+			results <- result{consumed: consumed, err: err}
+		}(store)
+	}
+	consumed := 0
+	for range 2 {
+		outcome := <-results
+		if outcome.err != nil {
+			t.Fatalf("remote confirmation consume: %v", outcome.err)
+		}
+		if outcome.consumed {
+			consumed++
+		}
+	}
+	if consumed != 1 {
+		t.Fatalf("successful remote confirmation consumers = %d, want 1", consumed)
+	}
+}
+
 func TestRemoteAuthCallbacksClearSpeculativeResultsOnEpochConflict(t *testing.T) {
 	rqliteURL := requireSessionOwnedRQLite(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
@@ -714,8 +776,9 @@ func TestRemoteSyncUsesStrongEpochFenceForCachedMirror(t *testing.T) {
 			http.Error(writer, "epoch query was not strong", http.StatusBadRequest)
 			return
 		}
-		if !strings.Contains(request.URL.Query().Get("q"), "state_epoch") {
-			http.Error(writer, "query did not read state_epoch", http.StatusBadRequest)
+		query := request.URL.Query().Get("q")
+		if !strings.Contains(query, "state_epoch") && !strings.Contains(query, "management_auth_epoch") {
+			http.Error(writer, "query did not read a synchronization epoch", http.StatusBadRequest)
 			return
 		}
 		writer.Header().Set("Content-Type", "application/json")
@@ -728,12 +791,12 @@ func TestRemoteSyncUsesStrongEpochFenceForCachedMirror(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend := &remoteBackend{base: parsed, client: server.Client(), syncedEpoch: "initial"}
+	backend := &remoteBackend{base: parsed, client: server.Client(), syncedEpoch: "initial", syncedAuthEpoch: "initial"}
 	if err := backend.syncLocked(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if queries != 1 {
-		t.Fatalf("cached sync issued %d strong epoch queries, want 1", queries)
+	if queries != 2 {
+		t.Fatalf("cached sync issued %d strong epoch queries, want 2", queries)
 	}
 }
 
@@ -1487,6 +1550,70 @@ func TestApplySnapshotProvesEpochWhenOnlyEpochChanges(t *testing.T) {
 	applied, err := backend.applySnapshot(context.Background(), before, after, before.Epoch, after.Epoch)
 	if err != nil || !applied {
 		t.Fatalf("epoch-only snapshot applied=%v err=%v", applied, err)
+	}
+}
+
+func TestApplySnapshotRejectsStaleRowMutation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		var batch [][]any
+		if err := json.NewDecoder(request.Body).Decode(&batch); err != nil {
+			http.Error(writer, err.Error(), http.StatusBadRequest)
+			return
+		}
+		results := make([]remoteResult, len(batch))
+		for index, statement := range batch {
+			results[index].RowsAffected = 1
+			if len(statement) > 0 {
+				if query, ok := statement[0].(string); ok && strings.HasPrefix(query, `UPDATE "tasks" SET`) {
+					results[index].RowsAffected = 0
+				}
+			}
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: results})
+	}))
+	defer server.Close()
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend := &remoteBackend{base: parsed, client: server.Client()}
+	before := remoteSnapshot{
+		Objects: map[string]remoteSchemaObject{
+			objectKey("table", "meta"):  {Type: "table", Name: "meta", SQL: "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)"},
+			objectKey("table", "tasks"): {Type: "table", Name: "tasks", SQL: "CREATE TABLE tasks(task_id TEXT PRIMARY KEY, state TEXT NOT NULL)"},
+		},
+		Tables: map[string]remoteTableSnapshot{
+			"meta": {
+				Name: "meta", Columns: []string{"key", "value"}, PrimaryKey: []int{0}, Rows: map[string]remoteRow{
+					"state_epoch":          {Values: []any{"state_epoch", "initial"}},
+					managementAuthEpochKey: {Values: []any{managementAuthEpochKey, "initial"}},
+				},
+			},
+			"tasks": {
+				Name: "tasks", Columns: []string{"task_id", "state"}, PrimaryKey: []int{0}, Rows: map[string]remoteRow{
+					"task-1": {Values: []any{"task-1", "active"}},
+				},
+			},
+		},
+		Epoch: "initial", AuthEpoch: "initial",
+	}
+	after := before
+	after.Tables = map[string]remoteTableSnapshot{
+		"meta": before.Tables["meta"],
+		"tasks": {
+			Name: "tasks", Columns: []string{"task_id", "state"}, PrimaryKey: []int{0}, Rows: map[string]remoteRow{
+				"task-1": {Values: []any{"task-1", "cached"}},
+			},
+		},
+	}
+	applied, err := backend.applySnapshot(context.Background(), before, after, before.Epoch, after.Epoch)
+	if applied {
+		t.Fatal("stale row mutation was applied")
+	}
+	var statementErr *remoteStatementError
+	if !errors.As(err, &statementErr) || !statementErr.EpochGuard {
+		t.Fatalf("stale row mutation error = %v", err)
 	}
 }
 

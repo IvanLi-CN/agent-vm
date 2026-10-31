@@ -271,9 +271,13 @@ func (s *Store) EnsureManagementSchema(ctx context.Context) error {
 		if _, err := tx.exec("INSERT OR IGNORE INTO meta(key, value) VALUES('management_catalog_revision', '1')"); err != nil {
 			return fmt.Errorf("initialize management catalog revision: %w", err)
 		}
+		if _, err := tx.execWithoutEpoch("INSERT OR IGNORE INTO meta(key, value) VALUES(?, 'initial')", managementAuthEpochKey); err != nil {
+			return fmt.Errorf("initialize management auth epoch: %w", err)
+		}
 		// Schema and capability bootstrap are compatibility metadata, not a
 		// business mutation. Preserve the existing observation epoch.
 		tx.changed = false
+		tx.authChanged = false
 		return nil
 	})
 }
