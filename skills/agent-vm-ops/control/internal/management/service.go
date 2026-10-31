@@ -462,22 +462,10 @@ func (s *Service) reserveImageStorage(ctx context.Context, size int64, required 
 		return nil, errors.New("invalid_request: image size must not be negative")
 	}
 	if s.Options.ReserveImageStorage != nil {
-		sharedUnlock, err := s.AcquireResourceLock(ctx, "image-storage")
-		if err != nil {
-			return nil, err
-		}
-		release, err := s.Options.ReserveImageStorage(size)
-		if err != nil {
-			sharedUnlock()
-			return nil, err
-		}
-		var once sync.Once
-		return func() {
-			once.Do(func() {
-				release()
-				sharedUnlock()
-			})
-		}, nil
+		// The production callback is lifecycle.ReservePhysicalStorage, which
+		// owns the shared image-storage fence together with VM admission. Do not
+		// acquire the same named lock here or the callback would self-deadlock.
+		return s.Options.ReserveImageStorage(size)
 	}
 	if s.Options.AvailableImageStorageBytes == nil || s.Options.UploadMinimumFreeBytes <= 0 {
 		if required {

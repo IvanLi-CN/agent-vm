@@ -1088,20 +1088,68 @@ func TestConcurrentPhysicalReservationsSerialize(t *testing.T) {
 	case <-time.After(25 * time.Millisecond):
 	}
 	close(capacityRelease)
-	first, second := <-results, <-results
-	successes := 0
-	for _, result := range []reservationResult{first, second} {
-		if result.err == nil {
-			successes++
-			result.release()
-			continue
-		}
-		if control := protocol.AsError(result.err); control == nil || control.Code != "resource_insufficient" {
-			t.Fatalf("concurrent reservation error = %#v", result.err)
-		}
+	first := <-results
+	if first.err != nil {
+		t.Fatalf("first reservation error = %v", first.err)
 	}
-	if successes != 1 {
-		t.Fatalf("concurrent reservation successes = %d, want 1", successes)
+	first.release()
+	second := <-results
+	if second.err != nil || second.release == nil {
+		t.Fatalf("second reservation did not proceed after first released: release=%v err=%v", second.release != nil, second.err)
+	}
+	second.release()
+}
+
+func TestPhysicalReservationFencesPeerAdmissionAcrossServices(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "state.sqlite3")
+	firstStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStore.Close()
+	secondStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	cfg := config.Defaults()
+	cfg.StateDB = path
+	guest := func() *capacityGuest {
+		return &capacityGuest{startupGuest: &startupGuest{}, capacity: native.StorageCapacity{TotalBytes: 100 * 1024 * 1024 * 1024, FreeBytes: 90 * 1024 * 1024 * 1024}}
+	}
+	lockDir := filepath.Join(root, "locks")
+	first := New(firstStore, cfg, Options{Guest: guest(), Resident: true, LockDir: lockDir})
+	second := New(secondStore, cfg, Options{Guest: guest(), Resident: true, LockDir: lockDir})
+	firstRelease, err := first.ReservePhysicalStorage(context.Background(), 75*1024*1024*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerDone := make(chan struct {
+		unlock func()
+		err    error
+	}, 1)
+	go func() {
+		unlock, lockErr := second.lockActionWithContext(context.Background(), "acquire", protocol.Request{"action": "acquire"})
+		peerDone <- struct {
+			unlock func()
+			err    error
+		}{unlock: unlock, err: lockErr}
+	}()
+	select {
+	case result := <-peerDone:
+		t.Fatalf("peer admission crossed active physical reservation: unlock=%v err=%v", result.unlock != nil, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	firstRelease()
+	select {
+	case result := <-peerDone:
+		if result.err != nil || result.unlock == nil {
+			t.Fatalf("peer admission lock result = unlock=%v err=%v", result.unlock != nil, result.err)
+		}
+		result.unlock()
+	case <-time.After(time.Second):
+		t.Fatal("peer admission did not proceed after reservation release")
 	}
 }
 

@@ -197,6 +197,16 @@ func (s *Service) ReservePhysicalStorage(ctx context.Context, size int64) (func(
 	}
 	unlockDrain := s.lockNamedAction("drain")
 	defer unlockDrain()
+	unlockStorage, lockErr := s.lockNamedActionWithContext(ctx, "management-resource:image-storage")
+	if lockErr != nil {
+		return nil, resourceLockError(lockErr)
+	}
+	reservationHeld := false
+	defer func() {
+		if !reservationHeld {
+			unlockStorage()
+		}
+	}()
 	if draining, err := s.isDraining(ctx); err != nil {
 		return nil, s.sqliteError(err)
 	} else if draining {
@@ -239,6 +249,7 @@ func (s *Service) ReservePhysicalStorage(ctx context.Context, size int64) (func(
 	}
 	s.storageReserved += size
 	s.storageMu.Unlock()
+	reservationHeld = true
 	var once sync.Once
 	return func() {
 		once.Do(func() {
@@ -249,6 +260,7 @@ func (s *Service) ReservePhysicalStorage(ctx context.Context, size int64) (func(
 				s.storageReserved = 0
 			}
 			s.storageMu.Unlock()
+			unlockStorage()
 		})
 	}, nil
 }
@@ -292,6 +304,14 @@ func (s *Service) lockActionWithContext(ctx context.Context, action string, requ
 		// transaction and a native management action must observe one durable
 		// owner in order.
 		if err := acquire("drain"); err != nil {
+			return func() {}, err
+		}
+	}
+	if action == "acquire" || action == "release" || action == "destroy" || action == "resize" {
+		if err := acquire("management-resource:image-storage"); err != nil {
+			for index := len(unlocks) - 1; index >= 0; index-- {
+				unlocks[index]()
+			}
 			return func() {}, err
 		}
 	}

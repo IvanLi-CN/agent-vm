@@ -468,60 +468,6 @@ func TestConcurrentTrustedImportsUseSharedStorageLock(t *testing.T) {
 	}
 }
 
-func TestConfiguredStorageReservationUsesSharedLock(t *testing.T) {
-	lockDir := filepath.Join(t.TempDir(), "locks")
-	entered := make(chan struct{})
-	var callsMu sync.Mutex
-	calls := 0
-	reserve := func(int64) (func(), error) {
-		callsMu.Lock()
-		calls++
-		call := calls
-		callsMu.Unlock()
-		if call == 1 {
-			close(entered)
-		}
-		return func() {}, nil
-	}
-	first := New(nil, Options{OperationLockDir: lockDir, ReserveImageStorage: reserve})
-	second := New(nil, Options{OperationLockDir: lockDir, ReserveImageStorage: reserve})
-	firstRelease, err := first.reserveImageStorage(context.Background(), 1, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("configured storage reservation did not run")
-	}
-	secondDone := make(chan struct {
-		release func()
-		err     error
-	}, 1)
-	go func() {
-		release, reserveErr := second.reserveImageStorage(context.Background(), 1, true)
-		secondDone <- struct {
-			release func()
-			err     error
-		}{release: release, err: reserveErr}
-	}()
-	select {
-	case result := <-secondDone:
-		t.Fatalf("configured reservation crossed shared lock: release=%v err=%v", result.release != nil, result.err)
-	case <-time.After(100 * time.Millisecond):
-	}
-	firstRelease()
-	select {
-	case result := <-secondDone:
-		if result.err != nil || result.release == nil {
-			t.Fatalf("second configured reservation = release=%v err=%v", result.release != nil, result.err)
-		}
-		result.release()
-	case <-time.After(time.Second):
-		t.Fatal("second configured reservation did not proceed after release")
-	}
-}
-
 func TestSharedManagementResourceLockSerializesAcrossServices(t *testing.T) {
 	lockDir := filepath.Join(t.TempDir(), "locks")
 	first := New(nil, Options{OperationLockDir: lockDir})

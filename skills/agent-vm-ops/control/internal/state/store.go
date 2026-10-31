@@ -1236,9 +1236,8 @@ func (s *Store) Audit(ctx context.Context, action, taskID, sessionID, outcome st
 		s.auditSummaryReady = false
 		return err
 	}
-	// A remote store refreshes its local mirror from rqlite inside withRead.
-	// Do not serve a process-local cache before that refresh, otherwise a
-	// blue-green slot can hide audit rows committed by its peer.
+	// Keep the incremental cache only for local SQLite. Remote summaries are
+	// rebuilt after withRead synchronizes the mirror with rqlite.
 	if s.remote == nil && s.auditSummaryReady {
 		var parsed any
 		decoder := json.NewDecoder(strings.NewReader(string(raw)))
@@ -1254,7 +1253,10 @@ func (s *Store) Audit(ctx context.Context, action, taskID, sessionID, outcome st
 func (s *Store) AuditSummary(ctx context.Context) (AuditSummary, error) {
 	s.auditSummaryMu.Lock()
 	defer s.auditSummaryMu.Unlock()
-	if s.auditSummaryReady {
+	// A remote store must synchronize its mirror before every summary read;
+	// the process-local cache cannot observe audit rows committed by the peer
+	// slot. Local SQLite keeps the existing cache for the hot path.
+	if s.remote == nil && s.auditSummaryReady {
 		return cloneAuditSummary(s.auditSummary), nil
 	}
 	result := AuditSummary{
