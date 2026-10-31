@@ -179,10 +179,25 @@ func (s *Service) lockOperation(ctx context.Context, operationID string) (func()
 	if operationID == "" {
 		return nil, errors.New("invalid_request: operation ID is required")
 	}
+	return s.lockResource(ctx, "management-operation:"+operationID)
+}
+
+// AcquireResourceLock returns a process-independent lock for shared management
+// resources. The lock directory is shared by blue and green services after the
+// rqlite cutover; callers hold it across the native effect and its catalog or
+// capacity bookkeeping.
+func (s *Service) AcquireResourceLock(ctx context.Context, resource string) (func(), error) {
+	if resource == "" {
+		return nil, errors.New("invalid_request: resource lock key is required")
+	}
+	return s.lockResource(ctx, "management-resource:"+resource)
+}
+
+func (s *Service) lockResource(ctx context.Context, key string) (func(), error) {
 	if s.Options.OperationLockDir == "" {
 		return func() {}, nil
 	}
-	lock, err := native.AcquireNamedLock(ctx, s.Options.OperationLockDir, "management-operation:"+operationID)
+	lock, err := native.AcquireNamedLock(ctx, s.Options.OperationLockDir, key)
 	if err != nil {
 		return nil, fmt.Errorf("management operation lock: %w", err)
 	}
@@ -404,7 +419,7 @@ func (s *Service) checkImageStorageCapacity(size int64) error {
 // imports that have passed the capacity probe but have not finished writing.
 // The returned release function is idempotent and must be called after native
 // import (or when the operation claim is lost).
-func (s *Service) reserveImageStorage(size int64, required bool) (func(), error) {
+func (s *Service) reserveImageStorage(ctx context.Context, size int64, required bool) (func(), error) {
 	if size < 0 {
 		return nil, errors.New("invalid_request: image size must not be negative")
 	}
@@ -414,13 +429,19 @@ func (s *Service) reserveImageStorage(size int64, required bool) (func(), error)
 		}
 		return func() {}, nil
 	}
+	sharedUnlock, err := s.AcquireResourceLock(ctx, "image-storage")
+	if err != nil {
+		return nil, err
+	}
 	s.imageStorageMu.Lock()
 	defer s.imageStorageMu.Unlock()
 	available, err := s.Options.AvailableImageStorageBytes()
 	if err != nil {
+		sharedUnlock()
 		return nil, errors.New("staging_capacity_low: image storage capacity could not be verified")
 	}
 	if available < 0 || size > math.MaxInt64-s.Options.UploadMinimumFreeBytes || s.imageStorageReserved > math.MaxInt64-size-s.Options.UploadMinimumFreeBytes || available < s.imageStorageReserved+size+s.Options.UploadMinimumFreeBytes {
+		sharedUnlock()
 		return nil, errors.New("staging_capacity_low: image storage reserve is insufficient")
 	}
 	s.imageStorageReserved += size
@@ -433,6 +454,7 @@ func (s *Service) reserveImageStorage(size int64, required bool) (func(), error)
 				s.imageStorageReserved = 0
 			}
 			s.imageStorageMu.Unlock()
+			sharedUnlock()
 		})
 	}, nil
 }
@@ -489,7 +511,7 @@ func (s *Service) beginLocalImageUpload(ctx context.Context, operationID string)
 	if err := s.checkStagingCapacity(declaredSize); err != nil {
 		return operation, nil, nil, err
 	}
-	release, err := s.reserveImageStorage(declaredSize, false)
+	release, err := s.reserveImageStorage(ctx, declaredSize, false)
 	if err != nil {
 		return operation, nil, nil, err
 	}
@@ -716,7 +738,7 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 	if size <= 0 {
 		return operation, errors.New("capacity_unverified: trusted image size could not be verified")
 	}
-	release, err := s.reserveImageStorage(size, true)
+	release, err := s.reserveImageStorage(ctx, size, true)
 	if err != nil {
 		return operation, err
 	}
@@ -764,6 +786,11 @@ func (s *Service) finishBackendImportFailure(ctx context.Context, operation *sta
 }
 
 func (s *Service) cleanupImportedImage(ctx context.Context, fingerprint string) string {
+	catalogUnlock, lockErr := s.AcquireResourceLock(ctx, "image-catalog")
+	if lockErr != nil {
+		return "blocked_catalog_unverified"
+	}
+	defer catalogUnlock()
 	unlock := s.Store.LockImageSelection()
 	defer unlock()
 	image, err := s.Store.GetManagedImage(ctx, fingerprint)
@@ -875,8 +902,14 @@ func (s *Service) finishImport(ctx context.Context, operation *state.ManagementO
 		InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID),
 		State: "available", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none",
 	}
-	if err := s.Store.InsertManagedImage(ctx, image); err != nil {
-		return s.recoverImportedCatalogFailure(ctx, operation, artifact, err)
+	catalogUnlock, lockErr := s.AcquireResourceLock(ctx, "image-catalog")
+	if lockErr != nil {
+		return operation, lockErr
+	}
+	insertErr := s.Store.InsertManagedImage(ctx, image)
+	catalogUnlock()
+	if insertErr != nil {
+		return s.recoverImportedCatalogFailure(ctx, operation, artifact, insertErr)
 	}
 	return s.finishOperation(ctx, operation, "completed", "succeeded", map[string]any{"fingerprint": artifact.Fingerprint, "state": "available"}, nil)
 }
@@ -893,6 +926,12 @@ func (s *Service) recoverImportedCatalogFailure(ctx context.Context, operation *
 		"imported_fingerprint": artifact.Fingerprint,
 		"catalog_error":        "catalog persistence failed",
 	}
+	catalogUnlock, lockErr := s.AcquireResourceLock(ctx, "image-catalog")
+	if lockErr != nil {
+		detail["cleanup"] = "blocked_catalog_unverified"
+		return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, detail)
+	}
+	defer catalogUnlock()
 	unlock := s.Store.LockImageSelection()
 	defer unlock()
 	if existing, err := s.Store.GetManagedImage(ctx, artifact.Fingerprint); err == nil && existing != nil {
@@ -917,8 +956,14 @@ func (s *Service) failImportWithImage(ctx context.Context, operation *state.Mana
 	if !fingerprintPattern.MatchString(artifact.Fingerprint) {
 		return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
 	}
-	if err := s.Store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Architecture: artifact.Architecture, InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID), State: "failed", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none"}); err != nil {
-		return s.recoverImportedCatalogFailure(ctx, operation, artifact, err)
+	catalogUnlock, lockErr := s.AcquireResourceLock(ctx, "image-catalog")
+	if lockErr != nil {
+		return operation, lockErr
+	}
+	insertErr := s.Store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Architecture: artifact.Architecture, InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID), State: "failed", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none"})
+	catalogUnlock()
+	if insertErr != nil {
+		return s.recoverImportedCatalogFailure(ctx, operation, artifact, insertErr)
 	}
 	return s.finishOperation(ctx, operation, "completed", "failed", nil, map[string]any{"code": "image_not_applicable", "phase": "suitability_check", "findings": findings})
 }
@@ -1039,6 +1084,11 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 	if err := s.rejectNewManagementAction(ctx); err != nil {
 		return nil, err
 	}
+	catalogUnlock, err := s.AcquireResourceLock(ctx, "image-catalog")
+	if err != nil {
+		return nil, err
+	}
+	defer catalogUnlock()
 	req := map[string]any{"action": action, "target_id": targetID, "target_version": targetVersion, "actor": actor, "reason": reason}
 	digest, _ := protocol.Digest(protocol.Request(req))
 	operation := state.ManagementOperation{OperationID: operationID, Action: action, TargetKind: "image", TargetID: targetID, Actor: actor, Reason: reason, Phase: "reference_check", Status: "queued", Request: map[string]any{"_request_digest": digest, "request": req}}

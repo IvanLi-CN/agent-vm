@@ -438,13 +438,26 @@ func (s *Store) withWrite(ctx context.Context, fn func(*Tx) error) error {
 }
 
 func (tx *Tx) exec(query string, args ...any) (sql.Result, error) {
+	return tx.execWithEpoch(true, query, args...)
+}
+
+// execWithoutEpoch records a durable row change without advancing the shared
+// state epoch. Ephemeral authorization records such as confirmation latches
+// must not invalidate the resource version returned by their own preview.
+func (tx *Tx) execWithoutEpoch(query string, args ...any) (sql.Result, error) {
+	return tx.execWithEpoch(false, query, args...)
+}
+
+func (tx *Tx) execWithEpoch(advanceEpoch bool, query string, args ...any) (sql.Result, error) {
 	if tx.closed {
 		return nil, errors.New("transaction is closed")
 	}
 	result, err := tx.conn.ExecContext(context.Background(), query, args...)
 	if err == nil {
-		if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows > 0 {
-			tx.changed = true
+		if advanceEpoch {
+			if rows, rowsErr := result.RowsAffected(); rowsErr != nil || rows > 0 {
+				tx.changed = true
+			}
 		}
 	}
 	return result, err

@@ -198,7 +198,7 @@ func (s *Store) InsertManagementConfirmation(ctx context.Context, value Manageme
 		return errors.New("invalid management confirmation")
 	}
 	return s.withWrite(ctx, func(tx *Tx) error {
-		_, err := tx.exec(`INSERT INTO management_confirmations(confirmation_digest, subject, action, target, target_version, params_digest, created_at, expires_at, consumed_at)
+		_, err := tx.execWithoutEpoch(`INSERT INTO management_confirmations(confirmation_digest, subject, action, target, target_version, params_digest, created_at, expires_at, consumed_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, NULL)`, value.ConfirmationDigest, value.Subject, value.Action, value.Target, value.TargetVersion, value.ParamsDigest, value.CreatedAt, value.ExpiresAt)
 		return err
 	})
@@ -231,7 +231,7 @@ func consumeManagementConfirmationTx(tx *Tx, claim ManagementConfirmationClaim, 
 	if err := validateManagementConfirmationClaim(claim, now); err != nil {
 		return false, err
 	}
-	result, err := tx.exec(`UPDATE management_confirmations
+	result, err := tx.execWithoutEpoch(`UPDATE management_confirmations
 SET consumed_at = ?
 WHERE confirmation_digest = ? AND subject = ? AND action = ? AND target = ? AND target_version = ? AND params_digest = ? AND consumed_at IS NULL AND expires_at > ?`, now, claim.ConfirmationDigest, claim.Subject, claim.Action, claim.Target, claim.TargetVersion, claim.ParamsDigest, now)
 	if err != nil {

@@ -46,6 +46,56 @@ type blockingImageBackend struct {
 	once    sync.Once
 }
 
+type sharedCapacityImageBackend struct {
+	artifact  ImageArtifact
+	entered   chan struct{}
+	release   chan struct{}
+	once      sync.Once
+	mu        sync.Mutex
+	imports   int
+	completed bool
+}
+
+func (backend *sharedCapacityImageBackend) ImportTrusted(ctx context.Context, sourceID, fingerprint string) (ImageArtifact, error) {
+	backend.mu.Lock()
+	backend.imports++
+	count := backend.imports
+	backend.mu.Unlock()
+	if count == 1 {
+		backend.once.Do(func() { close(backend.entered) })
+		select {
+		case <-backend.release:
+		case <-ctx.Done():
+			return ImageArtifact{}, ctx.Err()
+		}
+		backend.mu.Lock()
+		backend.completed = true
+		backend.mu.Unlock()
+	}
+	return backend.artifact, nil
+}
+
+func (backend *sharedCapacityImageBackend) TrustedImportSize(context.Context, string, string) (int64, error) {
+	return 1, nil
+}
+
+func (backend *sharedCapacityImageBackend) ImportLocal(context.Context, string, []byte, []byte) (ImageArtifact, error) {
+	return backend.artifact, nil
+}
+
+func (backend *sharedCapacityImageBackend) DeleteImage(context.Context, string) error {
+	return nil
+}
+
+func (backend *sharedCapacityImageBackend) available() (int64, error) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if backend.completed {
+		return 512, nil
+	}
+	return 513, nil
+}
+
 type partialImageBackend struct {
 	fakeImageBackend
 	err error
@@ -340,6 +390,113 @@ func TestConcurrentTrustedImportsReserveImageStorage(t *testing.T) {
 	if err := <-firstDone; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestConcurrentTrustedImportsUseSharedStorageLock(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "state.sqlite3")
+	firstStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstStore.Close()
+	secondStore, err := state.OpenForTest(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondStore.Close()
+	fingerprint := strings.Repeat("d", 64)
+	backend := &sharedCapacityImageBackend{
+		artifact: ImageArtifact{Fingerprint: fingerprint, Architecture: "x86_64", InstanceType: "container", Runtime: true, SyncTool: true, GuestReady: true},
+		entered:  make(chan struct{}), release: make(chan struct{}),
+	}
+	options := Options{
+		TrustedImageSourceIDs: []string{"approved"}, UploadMinimumFreeBytes: 512,
+		AvailableImageStorageBytes: backend.available, Backend: backend, OperationLockDir: filepath.Join(root, "locks"),
+	}
+	first := New(firstStore, options)
+	second := New(secondStore, options)
+	requests := []ImportRequest{
+		{OperationID: "shared-storage-a", Actor: "admin", Reason: "shared lock", TargetVersion: "image-catalog:revision-1", VersionLabel: "a", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}},
+		{OperationID: "shared-storage-b", Actor: "admin", Reason: "shared lock", TargetVersion: "image-catalog:revision-1", VersionLabel: "b", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: fingerprint}},
+	}
+	for _, request := range requests {
+		if _, err := first.StartImageImport(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		operation, processErr := first.ProcessTrustedImport(context.Background(), requests[0].OperationID)
+		if processErr == nil && operation.Status != "succeeded" {
+			processErr = fmt.Errorf("first operation = %#v", operation)
+		}
+		firstDone <- processErr
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first shared-storage import did not reach native backend")
+	}
+	secondDone := make(chan struct {
+		operation *state.ManagementOperation
+		err       error
+	}, 1)
+	go func() {
+		operation, processErr := second.ProcessTrustedImport(context.Background(), requests[1].OperationID)
+		secondDone <- struct {
+			operation *state.ManagementOperation
+			err       error
+		}{operation: operation, err: processErr}
+	}()
+	select {
+	case result := <-secondDone:
+		t.Fatalf("second import crossed shared storage lock: operation=%#v err=%v", result.operation, result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(backend.release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	result := <-secondDone
+	if result.err == nil || !strings.HasPrefix(result.err.Error(), "staging_capacity_low:") || result.operation == nil || result.operation.Status != "queued" {
+		t.Fatalf("second shared-storage result = %#v err=%v", result.operation, result.err)
+	}
+}
+
+func TestSharedManagementResourceLockSerializesAcrossServices(t *testing.T) {
+	lockDir := filepath.Join(t.TempDir(), "locks")
+	first := New(nil, Options{OperationLockDir: lockDir})
+	second := New(nil, Options{OperationLockDir: lockDir})
+	firstUnlock, err := first.AcquireResourceLock(context.Background(), "image-catalog")
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondDone := make(chan struct {
+		unlock func()
+		err    error
+	}, 1)
+	go func() {
+		unlock, lockErr := second.AcquireResourceLock(context.Background(), "image-catalog")
+		secondDone <- struct {
+			unlock func()
+			err    error
+		}{unlock: unlock, err: lockErr}
+	}()
+	select {
+	case result := <-secondDone:
+		if result.unlock != nil {
+			result.unlock()
+		}
+		t.Fatalf("shared management lock was not exclusive: err=%v", result.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	firstUnlock()
+	result := <-secondDone
+	if result.err != nil {
+		t.Fatal(result.err)
+	}
+	result.unlock()
 }
 
 func TestImageImportUploadStreamFailureIsDurable(t *testing.T) {

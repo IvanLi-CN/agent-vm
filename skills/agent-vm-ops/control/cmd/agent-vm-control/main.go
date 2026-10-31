@@ -125,13 +125,20 @@ func serve(args []string) error {
 		if err := store.EnsureManagementSchema(context.Background()); err != nil {
 			return fmt.Errorf("initialize management schema: %w", err)
 		}
-		if !remoteStateDSN(cfg.StateDB) {
-			// Remote blue-green slots share this directory. A slot cannot prove
-			// that an upload temp file belongs to a stopped peer, so only the
-			// SQLite authority may perform startup cleanup.
-			if err := webadmin.CleanupUploadStaging(cfg.Management.Upload.StagingPath); err != nil {
-				return fmt.Errorf("clean upload staging: %w", err)
-			}
+		// SQLite is single-writer, but the staging directory is also shared by
+		// the two resident services. Hold the same resource lock used by the
+		// upload path before removing files left by a crashed peer.
+		stagingLock, err := native.AcquireNamedLock(context.Background(), filepath.Join(cfg.StoragePath, "locks"), "management-resource:image-staging")
+		if err != nil {
+			return fmt.Errorf("lock upload staging: %w", err)
+		}
+		cleanupErr := webadmin.CleanupUploadStaging(cfg.Management.Upload.StagingPath)
+		closeErr := stagingLock.Close()
+		if cleanupErr != nil {
+			return fmt.Errorf("clean upload staging: %w", cleanupErr)
+		}
+		if closeErr != nil {
+			return fmt.Errorf("close upload staging lock: %w", closeErr)
 		}
 		if err := store.SeedLegacyImage(context.Background(), cfg.ImageFingerprint); err != nil {
 			return fmt.Errorf("initialize managed image catalog: %w", err)

@@ -51,6 +51,56 @@ jobs:
       - name: Go control tests
         working-directory: skills/agent-vm-ops/control
         run: go test -count=1 ./...
+      - name: Run isolated rqlite integration tests
+        if: matrix.os == 'ubuntu-latest'
+        working-directory: skills/agent-vm-ops/control
+        env:
+          RQLITE_VERSION: '10.5.2'
+          RQLITE_SHA256: '1a04a7c2c542e8e1c1347bd31af0fa9ef7043febb3c4d1806d36bc1702c6fa0f'
+        run: |
+          set -Eeuo pipefail
+          proof_dir="$(mktemp -d "${RUNNER_TEMP}/agent-vm-rqlite.XXXXXX")"
+          archive="${proof_dir}/rqlite.tar.gz"
+          data_dir="${proof_dir}/rqlite-data"
+          http_addr="127.0.0.1:4091"
+          raft_addr="127.0.0.1:4092"
+          base_url="http://${http_addr}"
+          rqlite_asset="rqlite-v${RQLITE_VERSION}-linux-amd64.tar.gz"
+          rqlite_url="https://github.com/rqlite/rqlite/releases/download/v${RQLITE_VERSION}/${rqlite_asset}"
+          curl --fail --silent --show-error --location --retry 3 --output "${archive}" "${rqlite_url}"
+          printf '%s  %s\n' "${RQLITE_SHA256}" "${archive}" | sha256sum --check --status -
+          tar --extract --gzip --file "${archive}" --directory "${proof_dir}"
+          rqlited="${proof_dir}/rqlite-v${RQLITE_VERSION}-linux-amd64/rqlited"
+          mkdir -p "${data_dir}"
+          "${rqlited}" -node-id "ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" -http-addr "${http_addr}" -raft-addr "${raft_addr}" "${data_dir}" >"${proof_dir}/rqlite.log" 2>&1 &
+          rqlited_pid=$!
+          cleanup() {
+            kill -TERM "${rqlited_pid}" 2>/dev/null || true
+            wait "${rqlited_pid}" 2>/dev/null || true
+            rm -rf -- "${proof_dir}"
+          }
+          trap cleanup EXIT
+          ready=0
+          for attempt in $(seq 1 120); do
+            if ! kill -0 "${rqlited_pid}" 2>/dev/null; then
+              cat "${proof_dir}/rqlite.log"
+              exit 1
+            fi
+            if curl --fail --silent "${base_url}/status" | grep -q '"ready":true'; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [[ "${ready}" -ne 1 ]]; then
+            cat "${proof_dir}/rqlite.log"
+            exit 1
+          fi
+          printf '{"session_id":"ci-%s-%s","url":"%s","pid":%s,"data_dir":"%s"}\n' \
+            "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${base_url}" "${rqlited_pid}" "${data_dir}" >"${proof_dir}/descriptor.json"
+          AGENT_VM_SESSION_ID="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+          AGENT_VM_RQLITE_DESCRIPTOR="${proof_dir}/descriptor.json" \
+            go test -race -count=1 ./internal/state -run '^TestRemote'
       - name: Go control vet
         run: go -C skills/agent-vm-ops/control vet ./...
       - name: Run repository checks

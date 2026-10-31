@@ -57,6 +57,64 @@ func testAuthority(t *testing.T) (*Authority, *state.Store, config.ManagementCon
 	return authority, store, cfg
 }
 
+type maintenanceActionBackend struct{}
+
+func (maintenanceActionBackend) ExecuteVMAction(context.Context, string, string, string, int64, map[string]any) (map[string]any, error) {
+	return map[string]any{"state": "changed"}, nil
+}
+
+func (maintenanceActionBackend) ExecuteMaintenance(context.Context, string, string, map[string]any) (map[string]any, error) {
+	return map[string]any{"state": "changed"}, nil
+}
+
+func TestMaintenancePreviewSubmissionKeepsSystemVersionStable(t *testing.T) {
+	authority, store, cfg := testAuthority(t)
+	authority.Management.Options.Actions = maintenanceActionBackend{}
+	authority.Management.Options.CurrentSystemVersion = func(ctx context.Context) (string, error) {
+		epoch, err := store.StateEpoch(ctx)
+		if err != nil {
+			return "", err
+		}
+		return "system:" + epoch, nil
+	}
+	initialEpoch, err := store.StateEpoch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetVersion := "system:" + initialEpoch
+
+	request := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req = req.WithContext(WithPeerUID(req.Context(), cfg.WebUID))
+		req.Header.Set(forwardedActorHeader, "admin@example")
+		req.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		authority.Handler().ServeHTTP(recorder, req)
+		return recorder
+	}
+
+	preview := request(http.MethodPost, "/internal/v1/management/system/maintenance/preview", `{"action":"reconcile","target_version":"`+targetVersion+`","parameters":{}}`)
+	if preview.Code != http.StatusOK {
+		t.Fatalf("maintenance preview status=%d body=%s", preview.Code, preview.Body.String())
+	}
+	var previewValue struct {
+		ConfirmationToken string `json:"confirmation_token"`
+	}
+	if err := json.Unmarshal(preview.Body.Bytes(), &previewValue); err != nil || previewValue.ConfirmationToken == "" {
+		t.Fatalf("maintenance preview=%s err=%v", preview.Body.String(), err)
+	}
+	if epoch, err := store.StateEpoch(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if epoch != initialEpoch {
+		t.Fatalf("maintenance preview changed system version: %q", epoch)
+	}
+
+	submit := request(http.MethodPost, "/internal/v1/management/system/maintenance", `{"operation_id":"80e8400e-ccf8-4c7b-8d1d-14f66c7fb127","action":"reconcile","target_version":"`+targetVersion+`","parameters":{},"confirmation_token":"`+previewValue.ConfirmationToken+`"}`)
+	if submit.Code != http.StatusAccepted {
+		t.Fatalf("maintenance submit status=%d body=%s", submit.Code, submit.Body.String())
+	}
+}
+
 func TestAuthorityRejectsUntrustedPeer(t *testing.T) {
 	authority, _, _ := testAuthority(t)
 	request := httptest.NewRequest(http.MethodGet, "/internal/v1/management/images", nil)

@@ -892,6 +892,12 @@ func (authority *Authority) startImageImport(writer http.ResponseWriter, request
 }
 
 func (authority *Authority) uploadImageImport(writer http.ResponseWriter, request *http.Request, operationID, actor string) {
+	resourceUnlock, err := authority.Management.AcquireResourceLock(request.Context(), "image-staging")
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "upload", operationID))
+		return
+	}
+	defer resourceUnlock()
 	authority.uploadMu.Lock()
 	defer authority.uploadMu.Unlock()
 	if !authority.Config.Upload.Enabled {
