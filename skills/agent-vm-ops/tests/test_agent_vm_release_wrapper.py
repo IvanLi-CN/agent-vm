@@ -115,6 +115,38 @@ class WrapperTests(unittest.TestCase):
                 WRAPPER._ensure_drained(self.loaded)
         self.assertEqual(failure.exception.code, "drain_unverified")
 
+    def test_drain_verification_allows_only_queued_prestart_recovery(self):
+        self.drain_patch.stop()
+        database_path = self.root / "pending.sqlite3"
+        queued_port = {
+            "outcome": "pending",
+            "worker": {"state": "exited", "start_attempted": False},
+        }
+        queued_drain_exit = {
+            "outcome": "pending",
+            "_request": {"session_id": "old-release-owner"},
+        }
+        with sqlite3.connect(database_path) as database:
+            database.executescript("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE operations (operation_id TEXT, action TEXT, response_json TEXT);")
+            database.execute("INSERT INTO meta(key, value) VALUES ('drain_owner', 'release-current-owner')")
+            database.execute("INSERT INTO operations VALUES (?, ?, ?)", ("queued-port", "port-add", json.dumps(queued_port)))
+            database.execute("INSERT INTO operations VALUES (?, ?, ?)", ("queued-exit", "drain-exit", json.dumps(queued_drain_exit)))
+            database.commit()
+        responses = [
+            json.dumps({"ok": True, "result": {"draining": True}}).encode(),
+            json.dumps({"ok": True, "result": {"pending_operations": [{"operation_id": "queued-port"}, {"operation_id": "queued-exit"}]}}).encode(),
+        ]
+        with mock.patch.object(
+            WRAPPER,
+            "STATE_DB_PATH",
+            database_path,
+        ), mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            side_effect=[subprocess.CompletedProcess([], 0, response, b"") for response in responses],
+        ):
+            WRAPPER._ensure_drained(self.loaded)
+
     def test_drain_verification_checks_target_state_compatibility(self):
         self.drain_patch.stop()
         response = json.dumps({

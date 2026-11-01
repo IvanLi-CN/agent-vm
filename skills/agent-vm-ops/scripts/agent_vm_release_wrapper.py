@@ -988,6 +988,55 @@ def _read_live_state_capabilities() -> list[str]:
     return [f"{name}@{version}" for name, version in rows]
 
 
+def _read_activation_safe_pending_ids() -> set[str]:
+    """Return only queued journal intents the candidate can safely retry.
+
+    The activation fence must still reject every native-effect operation that
+    crossed the worker barrier.  A crash before worker start is different: the
+    durable worker record explicitly says that no process identity exists, so
+    the candidate release may retry the original operation ID during startup
+    reconciliation.  A drain-exit record without a worker is likewise a
+    durable admission-state request; it is safe to retry only when its saved
+    owner no longer owns the current release fence.
+    """
+    uri = f"file:{STATE_DB_PATH}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=5) as database:
+            rows = database.execute(
+                "SELECT operation_id, action, response_json FROM operations",
+            ).fetchall()
+            owner_row = database.execute(
+                "SELECT value FROM meta WHERE key = 'drain_owner'",
+            ).fetchone()
+    except (OSError, sqlite3.Error) as exc:
+        _fail("drain_unverified", "pending-operation safety could not be verified")
+    owner = str(owner_row[0]) if owner_row and owner_row[0] is not None else ""
+    safe: set[str] = set()
+    for operation_id, action, response_json in rows:
+        try:
+            response = json.loads(response_json)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(response, Mapping) or response.get("outcome") != "pending":
+            continue
+        if action in {"port-add", "port-remove"}:
+            worker = response.get("worker")
+            if not isinstance(worker, Mapping):
+                continue
+            if worker.get("state") not in {"starting", "exited"} or worker.get("start_attempted") is not False:
+                continue
+            if any(key in worker for key in ("pid", "start_time", "process_group")):
+                continue
+            safe.add(str(operation_id))
+            continue
+        if action == "drain-exit" and "worker" not in response:
+            request = response.get("_request")
+            requested_owner = request.get("session_id") if isinstance(request, Mapping) else None
+            if owner.startswith("release-") and isinstance(requested_owner, str) and requested_owner != owner:
+                safe.add(str(operation_id))
+    return safe
+
+
 def _validate_legacy_state_schema(database: sqlite3.Connection) -> None:
     required = {
         "meta": {"key", "value"},
@@ -1081,7 +1130,10 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
         if not isinstance(pending, list):
             _fail("drain_unverified", "control returned an invalid pending-operation list")
         if pending:
-            _fail("drain_unverified", "release activation requires management operations to converge", {"pending_operations": pending[:100]})
+            safe_ids = _read_activation_safe_pending_ids()
+            unsafe = [item for item in pending if not isinstance(item, Mapping) or item.get("operation_id") not in safe_ids]
+            if unsafe:
+                _fail("drain_unverified", "release activation requires management operations to converge", {"pending_operations": unsafe[:100]})
 
 
 def _daemon_reload() -> None:
