@@ -719,7 +719,7 @@ def validate_product_manifest(
                 allow_historical_state_compatibility
                 and isinstance(declared, list)
                 and declared
-                and declared == list(STATE_CAPABILITY_MARKERS[: len(declared)])
+                and declared == [marker for marker in STATE_CAPABILITY_MARKERS if marker in declared]
             ):
                 if historical_compatibility is None:
                     historical_compatibility = {}

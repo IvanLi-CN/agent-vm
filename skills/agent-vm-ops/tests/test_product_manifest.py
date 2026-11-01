@@ -112,8 +112,8 @@ class ProductManifestTests(unittest.TestCase):
 
             historical_state = copy.deepcopy(legacy)
             historical_state["state_compatibility"] = {
-                "reads": list(STATE_CAPABILITY_MARKERS[:4]),
-                "writes": list(STATE_CAPABILITY_MARKERS[:4]),
+                "reads": [STATE_CAPABILITY_MARKERS[index] for index in (0, 1, 2, 4)],
+                "writes": [STATE_CAPABILITY_MARKERS[index] for index in (0, 1, 2, 4)],
             }
             with self.assertRaises(Exception):
                 validate_product_manifest(historical_state)
