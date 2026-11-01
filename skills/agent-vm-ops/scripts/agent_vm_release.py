@@ -39,6 +39,13 @@ try:
         UNIT_EXEC_START,
         UNIT_CONTENT_SHA256,
         GO_FIXED_ARTIFACTS,
+        LEGACY_PRODUCT_MANIFEST_FORMAT,
+        PRODUCT_CLIENT_ARTIFACTS,
+        PRODUCT_LINUX_ARTIFACTS,
+        PRODUCT_LINUX_LEGACY_ARTIFACTS,
+        PRODUCT_MANIFEST_FORMAT,
+        PRODUCT_UNIT_CONTENT_SHA256,
+        PRODUCT_UNIT_EXEC_START,
         GO_UNIT_EXEC_START,
         GO_UNIT_CONTENT_SHA256,
         ManifestError,
@@ -66,6 +73,13 @@ except ModuleNotFoundError:
         UNIT_EXEC_START,
         UNIT_CONTENT_SHA256,
         GO_FIXED_ARTIFACTS,
+        LEGACY_PRODUCT_MANIFEST_FORMAT,
+        PRODUCT_CLIENT_ARTIFACTS,
+        PRODUCT_LINUX_ARTIFACTS,
+        PRODUCT_LINUX_LEGACY_ARTIFACTS,
+        PRODUCT_MANIFEST_FORMAT,
+        PRODUCT_UNIT_CONTENT_SHA256,
+        PRODUCT_UNIT_EXEC_START,
         GO_UNIT_EXEC_START,
         GO_UNIT_CONTENT_SHA256,
         ManifestError,
@@ -268,14 +282,21 @@ def build_release(source_root: Path, output: Path, source_revision: str | None =
 
 
 def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
-    go_release = manifest.get("format") == 2
-    expected_exec = GO_UNIT_EXEC_START if go_release else UNIT_EXEC_START
-    expected_digest = GO_UNIT_CONTENT_SHA256 if go_release else UNIT_CONTENT_SHA256
+    format_value = manifest.get("format")
+    if format_value == 2:
+        expected_exec = GO_UNIT_EXEC_START
+        expected_digest = GO_UNIT_CONTENT_SHA256
+    elif format_value in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
+        expected_exec = PRODUCT_UNIT_EXEC_START
+        expected_digest = PRODUCT_UNIT_CONTENT_SHA256
+    else:
+        expected_exec = UNIT_EXEC_START
+        expected_digest = UNIT_CONTENT_SHA256
     for artifact in manifest["artifacts"]:
         if artifact["role"] != "unit":
             continue
         name = Path(artifact["path"]).name
-        if name not in expected_exec and (go_release or name != "agent-vm-native-age-gc.timer"):
+        if name not in expected_exec and format_value in {2, LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
             _fail("unit_unverified", f"unit is not in the fixed allowlist: {name}")
         try:
             content = (root / Path(*PurePosixPath(artifact["path"]).parts)).read_text(encoding="utf-8")
@@ -314,8 +335,20 @@ def _reject_bundle_extras(root: Path, manifest: Mapping[str, Any]) -> None:
 
 
 def _verify_fixed_artifact_set(manifest: Mapping[str, Any]) -> None:
-    if manifest.get("format") == 2:
+    format_value = manifest.get("format")
+    if format_value == 2:
         expected = {(role, destination) for _, destination, role, _ in GO_FIXED_ARTIFACTS}
+    elif format_value in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
+        target = manifest.get("target")
+        if not isinstance(target, Mapping) or target.get("os") not in {"source", "linux"}:
+            _fail("bundle_invalid", "product manifest target is invalid")
+        if target["os"] == "source":
+            product_artifacts = PRODUCT_CLIENT_ARTIFACTS
+        elif format_value == LEGACY_PRODUCT_MANIFEST_FORMAT:
+            product_artifacts = PRODUCT_LINUX_LEGACY_ARTIFACTS
+        else:
+            product_artifacts = PRODUCT_LINUX_ARTIFACTS
+        expected = {(role, destination) for _, destination, role, _ in product_artifacts}
     else:
         expected = {(role, destination) for destination, _, role, _ in SOURCE_ARTIFACTS}
     actual = {(item["role"], item["path"]) for item in manifest["artifacts"]}

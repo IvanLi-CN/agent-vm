@@ -177,6 +177,27 @@ class ReleasePublisherTests(unittest.TestCase):
         finally:
             temporary.cleanup()
 
+    def test_open_bundle_accepts_format_four_product_allowlists(self):
+        manifest = {
+            "format": MANIFEST.PRODUCT_MANIFEST_FORMAT,
+            "target": {"os": "linux", "arch": "amd64"},
+            "artifacts": [{"role": role, "path": path} for _, path, role, _ in MANIFEST.PRODUCT_LINUX_ARTIFACTS],
+        }
+        RELEASE._verify_fixed_artifact_set(manifest)
+        with tempfile.TemporaryDirectory(prefix="agent-vm-product-unit-check-") as raw_root:
+            root = Path(raw_root)
+            unit_artifacts = []
+            for name, path, role, mode in sorted(MANIFEST.PRODUCT_LINUX_ARTIFACTS, key=lambda item: item[1]):
+                if role != "unit":
+                    continue
+                destination = root / path
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                source = ROOT / "skills/agent-vm-ops/assets" / path
+                destination.write_bytes(source.read_bytes())
+                destination.chmod(mode)
+                unit_artifacts.append({"name": name, "path": path, "role": role, "mode": mode})
+            RELEASE._verify_unit_contents(root, {"format": MANIFEST.PRODUCT_MANIFEST_FORMAT, "artifacts": unit_artifacts})
+
     def test_publish_is_remote_first_and_exits_drain_after_local_client(self):
         transport = FakeTransport()
         target = self.root / "client" / "agent_vm.ts"
