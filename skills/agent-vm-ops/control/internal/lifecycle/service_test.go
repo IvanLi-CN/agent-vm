@@ -2590,6 +2590,52 @@ func TestStartupReconcileRetriesTimerBeforeNativeStart(t *testing.T) {
 	}
 }
 
+func TestStartupReconcileRetriesExplicitlyUnattemptedPortOperation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "port-prestart-recovery.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session := "pre-start-port-session"
+	generation := int64(1)
+	operationID := "pre-start-port-add"
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "port-add", "session_id": session,
+		"generation": generation, "operation_id": operationID, "name": "web",
+		"port_protocol": "tcp", "host_port": int64(20006), "vm_port": int64(20006),
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, operationID, "port-add", &session, &generation, map[string]any{
+		"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest,
+		"worker": map[string]any{"state": "exited", "start_attempted": false, "observed_at": "2026-10-29T15:58:31Z"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup: %v", err)
+	}
+	operation, err := store.GetOperation(ctx, operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("recovered port operation = %#v", operation)
+	}
+	control, ok := operation.Response["error"].(map[string]any)
+	if !ok || control["code"] != "task_not_active" {
+		t.Fatalf("recovered port error = %#v", operation.Response["error"])
+	}
+	pending, err := store.PendingOperations(ctx)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending = %#v, error = %v", pending, err)
+	}
+}
+
 func TestIncompatibleCapabilityIsRejectedBeforeJournalClaim(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

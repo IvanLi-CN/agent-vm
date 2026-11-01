@@ -781,22 +781,22 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 		if s.operationActive(operation.OperationID) {
 			continue
 		}
-		preStartTimer := false
+		preStartRetry := false
 		if workerValue, hasWorker := operation.Response["worker"]; hasWorker {
 			worker, validWorker := workerValue.(map[string]any)
 			stateValue := ""
 			if validWorker {
 				stateValue = stringValue(worker["state"])
-				preStartTimer = recoverableBeforeNativeStart(operation.Action, worker)
+				preStartRetry = recoverableBeforeNativeStart(operation.Action, worker)
 			}
-			if !validWorker || !recoverableOperation(operation.Action) || (stateValue != "finished" && stateValue != "exited" && !preStartTimer) {
+			if !validWorker || (!recoverableOperation(operation.Action) && !preStartRetry) || (stateValue != "finished" && stateValue != "exited" && !preStartRetry) {
 				continue
 			}
 		}
-		if !recoverableOperation(operation.Action) {
+		if !recoverableOperation(operation.Action) && !preStartRetry {
 			continue
 		}
-		if recoveryAttempts(operation.Response) > 0 && !preStartTimer {
+		if recoveryAttempts(operation.Response) > 0 && !preStartRetry && operation.Action != "drain-exit" {
 			eligible, retryErr := s.mayRetryClearedMaintenance(ctx, operation)
 			if retryErr != nil {
 				return retryErr
@@ -929,10 +929,19 @@ func recoverableOperation(action string) bool {
 }
 
 func recoverableBeforeNativeStart(action string, worker map[string]any) bool {
-	if action != "timer-reconcile" && action != "timer-age-gc" {
+	if action != "timer-reconcile" && action != "timer-age-gc" && action != "port-add" && action != "port-remove" {
 		return false
 	}
-	return stringValue(worker["state"]) == "starting" && !boolValue(worker["start_attempted"])
+	if stringValue(worker["state"]) != "starting" && stringValue(worker["state"]) != "exited" {
+		return false
+	}
+	if boolValue(worker["start_attempted"]) {
+		return false
+	}
+	_, hasPID := worker["pid"]
+	_, hasStart := worker["start_time"]
+	_, hasGroup := worker["process_group"]
+	return !hasPID && !hasStart && !hasGroup
 }
 
 func operationHasNativeEffect(action string) bool {
@@ -5082,7 +5091,7 @@ func uncertain(err error) bool {
 	switch control.Code {
 	case "acquire_partial", "resize_partial", "restart_partial", "cleanup_incomplete", "operation_unverified", "native_failed":
 		return true
-	case "invalid_request", "missing_session", "generation_mismatch", "lease_expired", "draining", "cache_stale", "task_missing", "task_not_active", "resource_pressure", "resource_insufficient", "resource_unverified", "watermarks_unreachable":
+	case "invalid_request", "missing_session", "generation_mismatch", "lease_expired", "draining", "permission_denied", "cache_stale", "task_missing", "task_not_active", "resource_pressure", "resource_insufficient", "resource_unverified", "watermarks_unreachable":
 		return false
 	default:
 		return true
