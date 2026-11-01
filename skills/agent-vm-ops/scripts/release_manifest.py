@@ -623,7 +623,12 @@ def validate_go_manifest(value: Any) -> dict[str, Any]:
     }
 
 
-def validate_product_manifest(value: Any, *, allow_historical_web_config_mode: bool = False) -> dict[str, Any]:
+def validate_product_manifest(
+    value: Any,
+    *,
+    allow_historical_web_config_mode: bool = False,
+    allow_historical_state_compatibility: bool = False,
+) -> dict[str, Any]:
     """Validate the SemVer product manifest without executing its artifacts."""
     root = _require_mapping(value, "manifest")
     format_value = _require_int(root.get("format"), "format", 1)
@@ -705,10 +710,24 @@ def validate_product_manifest(value: Any, *, allow_historical_web_config_mode: b
         compatibility = _require_mapping(root["state_compatibility"], "state_compatibility")
         if set(compatibility) != {"reads", "writes"}:
             raise _error("manifest_state_compatibility_invalid", "state_compatibility has an unexpected shape")
+        historical_compatibility: dict[str, list[str]] | None = None
         for key in ("reads", "writes"):
-            if compatibility[key] != list(STATE_CAPABILITY_MARKERS):
+            declared = compatibility[key]
+            if declared == list(STATE_CAPABILITY_MARKERS):
+                continue
+            if (
+                allow_historical_state_compatibility
+                and isinstance(declared, list)
+                and declared
+                and declared == list(STATE_CAPABILITY_MARKERS[: len(declared)])
+            ):
+                if historical_compatibility is None:
+                    historical_compatibility = {}
+                historical_compatibility[key] = list(declared)
+                continue
+            if declared != list(STATE_CAPABILITY_MARKERS):
                 raise _error("manifest_state_compatibility_invalid", f"state_compatibility.{key} must declare all state capability markers in order")
-        result["state_compatibility"] = {"reads": list(STATE_CAPABILITY_MARKERS), "writes": list(STATE_CAPABILITY_MARKERS)}
+        result["state_compatibility"] = historical_compatibility or {"reads": list(STATE_CAPABILITY_MARKERS), "writes": list(STATE_CAPABILITY_MARKERS)}
     return result
 
 
@@ -757,7 +776,12 @@ def load_manifest(path: Path) -> dict[str, Any]:
     return validate_manifest(value)
 
 
-def load_release_manifest(path: Path, *, allow_historical_web_config_mode: bool = False) -> dict[str, Any]:
+def load_release_manifest(
+    path: Path,
+    *,
+    allow_historical_web_config_mode: bool = False,
+    allow_historical_state_compatibility: bool = False,
+) -> dict[str, Any]:
     """Load either supported release format; legacy callers keep load_manifest."""
     try:
         info = path.lstat()
@@ -772,7 +796,11 @@ def load_release_manifest(path: Path, *, allow_historical_web_config_mode: bool 
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise _error("manifest_invalid", "release manifest is not valid UTF-8 JSON") from exc
     if isinstance(value, Mapping) and value.get("format") in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
-        return validate_product_manifest(value, allow_historical_web_config_mode=allow_historical_web_config_mode)
+        return validate_product_manifest(
+            value,
+            allow_historical_web_config_mode=allow_historical_web_config_mode,
+            allow_historical_state_compatibility=allow_historical_state_compatibility,
+        )
     if isinstance(value, Mapping) and value.get("format") == GO_MANIFEST_FORMAT:
         return validate_go_manifest(value)
     return validate_manifest(value)
@@ -864,6 +892,7 @@ def verify_product_bundle(
     manifest: Mapping[str, Any] | None = None,
     *,
     allow_historical_web_config_mode: bool = False,
+    allow_historical_state_compatibility: bool = False,
 ) -> dict[str, Any]:
     """Verify product artifact bytes, modes, and target ELF headers."""
     root = root.resolve()
@@ -872,6 +901,7 @@ def verify_product_bundle(
     checked = validate_product_manifest(
         manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME),
         allow_historical_web_config_mode=allow_historical_web_config_mode,
+        allow_historical_state_compatibility=allow_historical_state_compatibility,
     )
     if checked["client_view"]["transport"] == "https":
         raise _error("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE)
@@ -936,15 +966,21 @@ def verify_client_sidecar(
     manifest: Mapping[str, Any] | None = None,
     *,
     allow_historical_web_config_mode: bool = False,
+    allow_historical_state_compatibility: bool = False,
 ) -> dict[str, Any]:
     """Verify the derived client-only sidecar without making it an artifact."""
     root = root.resolve()
     candidate = manifest if manifest is not None else load_release_manifest(
         root / MANIFEST_NAME,
         allow_historical_web_config_mode=allow_historical_web_config_mode,
+        allow_historical_state_compatibility=allow_historical_state_compatibility,
     )
     if isinstance(candidate, Mapping) and candidate.get("format") in {LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT}:
-        checked = validate_product_manifest(candidate, allow_historical_web_config_mode=allow_historical_web_config_mode)
+        checked = validate_product_manifest(
+            candidate,
+            allow_historical_web_config_mode=allow_historical_web_config_mode,
+            allow_historical_state_compatibility=allow_historical_state_compatibility,
+        )
     else:
         checked = validate_release_manifest(candidate)
     sidecar_path = _resolve_regular(root, CLIENT_SIDECAR_NAME)

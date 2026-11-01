@@ -769,15 +769,29 @@ def _current_target(link: Path, release_root: Path | None = None) -> Path | None
 def _verify_retained_release(config: Mapping[str, Any], target: Path) -> dict[str, Any]:
     """Re-verify a release before using it as an activation or rollback target."""
     try:
-        manifest = load_release_manifest(target / MANIFEST_NAME, allow_historical_web_config_mode=True)
+        manifest = load_release_manifest(
+            target / MANIFEST_NAME,
+            allow_historical_web_config_mode=True,
+            allow_historical_state_compatibility=True,
+        )
         if _is_go_manifest(manifest):
             verify_go_bundle(target, manifest)
         elif _is_product_manifest(manifest):
             from release_manifest import verify_product_bundle
-            verify_product_bundle(target, manifest, allow_historical_web_config_mode=True)
+            verify_product_bundle(
+                target,
+                manifest,
+                allow_historical_web_config_mode=True,
+                allow_historical_state_compatibility=True,
+            )
         else:
             verify_bundle(target, manifest)
-        verify_client_sidecar(target, manifest, allow_historical_web_config_mode=True)
+        verify_client_sidecar(
+            target,
+            manifest,
+            allow_historical_web_config_mode=True,
+            allow_historical_state_compatibility=True,
+        )
     except ManifestError as exc:
         _fail("activation_unverified", "retained release cannot be verified", exc.as_dict())
     _reject_transaction_extras(target, manifest)

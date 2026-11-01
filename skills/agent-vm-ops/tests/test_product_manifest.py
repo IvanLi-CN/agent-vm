@@ -110,6 +110,18 @@ class ProductManifestTests(unittest.TestCase):
             legacy["client_view"]["transport"] = "legacy-bun"
             self.assertEqual(validate_product_manifest(legacy), legacy)
 
+            historical_state = copy.deepcopy(legacy)
+            historical_state["state_compatibility"] = {
+                "reads": list(STATE_CAPABILITY_MARKERS[:4]),
+                "writes": list(STATE_CAPABILITY_MARKERS[:4]),
+            }
+            with self.assertRaises(Exception):
+                validate_product_manifest(historical_state)
+            self.assertEqual(
+                validate_product_manifest(historical_state, allow_historical_state_compatibility=True),
+                historical_state,
+            )
+
             historical = copy.deepcopy(legacy)
             historical_web = next(item for item in historical["artifacts"] if item["path"] == "config/agent-vm-web.json.example")
             historical_web["mode"] = 0o644
