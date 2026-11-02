@@ -46,20 +46,15 @@
     "components": [
       {
         "name": "caddy",
-        "version": "2.11.7",
+        "version_major": 2,
         "repository": "caddyserver/caddy",
-        "checksums_url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_checksums.txt",
+        "version_policy": "operator-selected-v2-release",
+        "builder": "xcaddy",
+        "provider_module": "github.com/caddy-dns/dnspod",
+        "provider_ref": "fb7cc31cc04c68a304b8d2672c3e5d9f2ad3d7ba",
+        "provider_module_name": "dns.providers.dnspod",
         "checksum_algorithm": "sha512",
-        "artifacts": {
-          "linux/amd64": {
-            "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_amd64.tar.gz",
-            "checksum": "a7a433a1b133efc3c8d10eb0b99d52a24b5ef5c322dc77f5282182b1c0402139ab83f3a99f0c52409df77d20123fb0b523edad8a66d8f5e49136197bf61ef0e7"
-          },
-          "linux/arm64": {
-            "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_arm64.tar.gz",
-            "checksum": "3db36ba90c7a6e8dda40ee3dd71fa08844c76b5fb08f61b31e5e78d2ed38e71c51dc7baed875e50d1ca1279196e84302967237386ae87c91ae9f2aaceada682e"
-          }
-        }
+        "artifact_verification": "operator-recorded-custom-build"
       },
       {
         "name": "rqlite",

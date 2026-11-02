@@ -2,16 +2,25 @@
 
 These files define the deployment boundary for the native Go control service. They are installation resources and isolated acceptance checks; they do not perform a production deployment, contain an inventory, or store credentials. The parent service integration must still provide the real migration fence before SQLite state can be imported into rqlite.
 
-## Pinned components
+## Component policy
 
-The authoritative, machine-readable metadata is [`deployment-components.json`](../../skills/agent-vm-ops/assets/blue-green/deployment-components.json). Only the official GitHub release URLs in that file are allowed.
+The authoritative, machine-readable metadata is [`deployment-components.json`](../../skills/agent-vm-ops/assets/blue-green/deployment-components.json). Caddy is built from an operator-selected official Caddy v2 release with the pinned official DNSPod provider source. The repository does not select or pin a Caddy patch release, and the operator records the checksum of the resulting custom binary before installation.
 
 | Component | Version | Runtime role | Supported artifact |
 | --- | --- | --- | --- |
-| Caddy | 2.11.7 | HTTPS edge proxy | Linux amd64 and arm64 tarballs, SHA-512 verified |
+| Caddy | major 2 | HTTPS edge proxy | `xcaddy` custom build with `dns.providers.dnspod`, operator-recorded SHA-512 |
 | rqlite | 10.5.2 | Single-node state authority | Linux amd64 and arm64 tarballs, SHA-256 verified |
 
-Automatic installation is disabled. An operator must verify the pinned checksum before placing either binary at `/usr/local/bin/caddy` or `/usr/local/bin/rqlited`.
+Automatic installation is disabled. Install `xcaddy`, choose an explicit `v2.x.y` release, and build both supported Linux targets with the repository helper:
+
+```sh
+bun skills/agent-vm-ops/scripts/build_caddy.ts \
+  --caddy-version <v2.x.y> \
+  --target linux/amd64 \
+  --output /tmp/caddy
+```
+
+The helper passes the DNSPod module and its repository-pinned commit to `xcaddy`, checks the resulting Go build metadata for Caddy v2 and the DNSPod module, and rejects non-v2 or implicit `latest` inputs. The operator must record and verify the custom binary checksum before placing it at `/usr/local/bin/caddy`.
 
 ## Resource layout
 
@@ -22,7 +31,6 @@ The systemd units in `skills/agent-vm-ops/assets/systemd/` use this layout:
   Caddyfile
   caddy.env
   rqlite/auth.json
-  tls/caddy/{server.crt,server.key}
   tls/rqlite/{server.crt,server.key}
   slots/{blue,green}/config.json
 /opt/agent-vm-native/
@@ -32,6 +40,7 @@ The systemd units in `skills/agent-vm-ops/assets/systemd/` use this layout:
 /var/lib/agent-vm-native/
   active -> slots/{blue,green}
   slots/{blue,green}/app.sock -> /run/agent-vm-native/{blue,green}/app.sock
+  caddy/
   rqlite/
 /run/agent-vm-native/{blue,green}/app.sock
 ```
@@ -40,9 +49,9 @@ The systemd units in `skills/agent-vm-ops/assets/systemd/` use this layout:
 
 Run `systemd-sysusers` and `systemd-tmpfiles --create` with the supplied `sysusers.d` and `tmpfiles.d` entries before starting units. These entries create both the dedicated rqlite user and the unprivileged `caddy` user. The `active` path is intentionally not created by tmpfiles because it must be an atomic symlink, not a directory.
 
-## CA and TLS
+## Caddy TLS and rqlite CA
 
-Create a deployment-local CA in an empty operator-owned directory:
+Create a deployment-local CA for the loopback-only rqlite HTTPS service in an empty operator-owned directory:
 
 ```sh
 bash skills/agent-vm-ops/scripts/generate_deployment_ca.sh \
@@ -50,9 +59,11 @@ bash skills/agent-vm-ops/scripts/generate_deployment_ca.sh \
   --hostname <operator-provided-hostname>
 ```
 
-Install `ca.crt`, the Caddy leaf pair, and the rqlite leaf pair into the paths named by the units. Keep all private keys outside the repository, assign each leaf key to its service user (`caddy` or `agent-vm-rqlite`), and use mode `0600`. Install the CA into the host trust store only when the Go control service must validate the rqlite HTTPS endpoint. The deployment hostname is an operator input; it is deliberately absent from this repository.
+Install `ca.crt` and the rqlite leaf pair into the paths named by the units. Keep the CA private key and rqlite private key outside the repository, assign the rqlite key to `agent-vm-rqlite`, and use mode `0600`. Install the CA into the host trust store only when the Go control service must validate the rqlite HTTPS endpoint.
 
-The Caddy example disables the admin API and automatic certificate issuance, removes query values and sensitive headers from logs, blocks `/internal/v1/*` at the edge, and forwards public requests to the active Unix socket. It does not add an identity header or disable upstream TLS verification.
+Caddy is the certificate owner. Its custom v2 binary includes `github.com/caddy-dns/dnspod`, and the Caddyfile enables `tls { dns dnspod {env.DNSPOD_TOKEN} }` so Caddy performs ACME DNS-01 through Tencent DNSPod. Put `AGENT_VM_DOMAIN` and the operator-managed `DNSPOD_TOKEN` in the protected `/etc/agent-vm-native/caddy.env`; neither value belongs in this repository. Caddy persists certificates, keys and ACME state in `/var/lib/agent-vm-native/caddy`, and the service account owns that directory. Do not install a static Caddy leaf or an independent ACME client.
+
+The Caddy example disables the admin API and HTTP-to-HTTPS redirects, removes query values and sensitive headers from logs, blocks `/internal/v1/*` at the edge, and forwards public requests to the active Unix socket. It does not add an identity header or disable upstream TLS verification.
 
 ## rqlite boundary
 
@@ -102,4 +113,4 @@ Run the following in the session-owned Agent VM, not on the developer host:
 bash skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh
 ```
 
-The check executes the pinned amd64 artifacts and verifies the pinned arm64 rqlite checksum without executing that foreign-architecture binary. It also validates the Caddyfile, verifies all three systemd units, creates a temporary CA, starts a loopback-only authenticated TLS rqlite node, exercises the cutover guard, and proves both signed migration-fence rejection and restore admissibility. The temporary database, credentials, certificates, logs, signing key, public key, and evidence are removed at exit unless `KEEP_PROOF_DIR=1` is explicitly set inside the isolated VM.
+The check builds the operator-selected amd64 Caddy v2 binary with the DNSPod module, verifies the pinned arm64 and amd64 rqlite checksums, and does not contact DNSPod or request a public certificate. It validates the Caddyfile with a placeholder token, uses a temporary rqlite certificate only for the local smoke test, verifies all three systemd units, starts a loopback-only authenticated TLS rqlite node, exercises the cutover guard, and proves both signed migration-fence rejection and restore admissibility. Set `CADDY_VERSION` to an explicit v2 release before running it. The temporary database, credentials, certificates, logs, signing key, public key, and evidence are removed at exit unless `KEEP_PROOF_DIR=1` is explicitly set inside the isolated VM.

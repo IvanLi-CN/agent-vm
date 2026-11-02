@@ -66,17 +66,32 @@ function evidencePayload(source: string, evidenceId: string, overrides: Record<s
   };
 }
 
-test("blue-green deployment metadata and static validator stay pinned", () => {
+test("blue-green deployment metadata and static validator enforce the Caddy v2 DNSPod boundary", () => {
   const metadata = json("skills/agent-vm-ops/assets/blue-green/deployment-components.json");
-  expect(metadata.caddy.version).toBe("2.11.7");
+  expect(metadata.schema_version).toBe(2);
+  expect(metadata.caddy.version_major).toBe(2);
+  expect(metadata.caddy.version_policy).toBe("operator-selected-v2-release");
+  expect(metadata.caddy.builder).toBe("xcaddy");
+  expect(metadata.caddy.provider_module).toBe("github.com/caddy-dns/dnspod");
+  expect(metadata.caddy.provider_module_name).toBe("dns.providers.dnspod");
+  expect(metadata.caddy.provider_ref).toMatch(/^[0-9a-f]{40}$/);
+  expect(metadata.caddy.version).toBeUndefined();
   expect(metadata.rqlite.version).toBe("10.5.2");
   expect(metadata.rqlite.supported_architectures).toEqual(["amd64", "arm64"]);
   expect(metadata.policy.automatic_install).toBe(false);
-  expect(metadata.caddy.artifacts[0].sha512).toHaveLength(128);
+  expect(metadata.caddy.artifacts).toBeUndefined();
   expect(metadata.rqlite.artifacts).toHaveLength(2);
   expect(metadata.rqlite.artifacts[1].arch).toBe("arm64");
   expect(metadata.rqlite.artifacts[1].sha256).toHaveLength(64);
-  expect(json(".github/release-contract.json").deployment_artifacts.components).toHaveLength(2);
+  const releaseComponents = json(".github/release-contract.json").deployment_artifacts.components;
+  expect(releaseComponents).toHaveLength(2);
+  expect(releaseComponents.find((component: any) => component.name === "caddy")).toMatchObject({
+    version_major: 2,
+    version_policy: "operator-selected-v2-release",
+    builder: "xcaddy",
+    provider_module: "github.com/caddy-dns/dnspod",
+    provider_module_name: "dns.providers.dnspod",
+  });
 
   const result = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/validate_blue_green_deployment.ts")]);
   expect(result.exitCode).toBe(0);
@@ -88,12 +103,21 @@ test("blue-green deployment metadata and static validator stay pinned", () => {
 test("deployment examples keep the edge and state boundaries fail-closed", () => {
   const caddy = read("skills/agent-vm-ops/assets/blue-green/Caddyfile.example");
   expect(caddy).toContain("admin off");
+  expect(caddy).toContain("auto_https disable_redirects");
+  expect(caddy).toContain("storage file_system /var/lib/agent-vm-native/caddy");
+  expect(caddy).toContain("dns dnspod {env.DNSPOD_TOKEN}");
   expect(caddy).toContain("\tlog default");
   expect(caddy).toContain("reverse_proxy unix//var/lib/agent-vm-native/active/app.sock");
+  expect(caddy).toContain("header_up -X-Forwarded-User");
+  expect(caddy).not.toContain("header_up X-Forwarded-User");
   expect(caddy).toContain("request>uri regexp");
   expect(caddy).not.toContain("tls_insecure_skip_verify");
   expect(caddy).toContain("@internal path /internal/v1/*");
   expect(caddy).toContain("respond 404");
+  expect(caddy).not.toContain("auto_https off");
+  expect(caddy).not.toContain("/etc/agent-vm-native/tls/caddy");
+  expect(caddy).not.toContain("forward_auth");
+  expect(caddy).not.toContain("edgeone");
 
   const rqlite = read("skills/agent-vm-ops/assets/systemd/agent-vm-rqlite.service");
   expect(rqlite).toContain("User=agent-vm-rqlite");
@@ -107,10 +131,103 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(slot).toContain("--manifest /opt/agent-vm-native/release-manifest.json");
   const caddyUnit = read("skills/agent-vm-ops/assets/systemd/agent-vm-caddy.service");
   expect(caddyUnit).toContain("User=caddy");
+  expect(caddyUnit).toContain("After=network-online.target");
+  expect(caddyUnit).toContain("ConditionPathExists=/etc/agent-vm-native/caddy.env");
+  expect(caddyUnit).toContain("EnvironmentFile=/etc/agent-vm-native/caddy.env");
   expect(caddyUnit).toContain("ConditionPathExists=/var/lib/agent-vm-native/active/app.sock");
   expect(caddyUnit).toContain("ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock");
+  expect(caddyUnit).toContain("ReadWritePaths=/var/lib/agent-vm-native/caddy");
+  expect(caddyUnit).not.toContain("/etc/agent-vm-native/tls/caddy");
   const sysusers = read("skills/agent-vm-ops/assets/sysusers.d/agent-vm-native.conf");
   expect(sysusers).toContain("u caddy");
+});
+
+test("Caddy build integration requires an explicit v2 release and embeds DNSPod", () => {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-caddy-build-test-"));
+  try {
+    const binDir = join(temporaryRoot, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const argsPath = join(temporaryRoot, "xcaddy.args");
+    const xcaddy = join(binDir, "xcaddy");
+    writeFileSync(xcaddy, `#!/bin/sh
+set -eu
+printf '%s\\n' "$@" > "$XCADDY_ARGS_FILE"
+output=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "--output" ]; then
+    shift
+    output="$1"
+  fi
+  shift
+done
+cat > "$output" <<'EOF'
+#!/bin/sh
+case "\${1:-}" in
+  list-modules) printf '%s\\n' 'dns.providers.dnspod' ;;
+  version) printf '%s\\n' 'v2.99.1' ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod 0755 "$output"
+`, { mode: 0o755 });
+    const go = join(binDir, "go");
+    writeFileSync(go, `#!/bin/sh
+set -eu
+if [ "\$1" = "version" ] && [ "\$2" = "-m" ]; then
+  printf '%s\\n' 'path caddy' 'dep github.com/caddyserver/caddy/v2 v2.10.0' 'dep github.com/caddy-dns/dnspod v0.0.4'
+  exit 0
+fi
+exit 1
+`, { mode: 0o755 });
+    const output = join(temporaryRoot, "caddy");
+    const built = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      output,
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        XCADDY_ARGS_FILE: argsPath,
+      },
+    });
+    expect(built.exitCode).toBe(0);
+    expect(statSync(output).mode & 0o111).not.toBe(0);
+    const args = readFileSync(argsPath, "utf8").trim().split("\n");
+    expect(args).toEqual([
+      "build",
+      "v2.10.0",
+      "--output",
+      output,
+      "--with",
+      "github.com/caddy-dns/dnspod@fb7cc31cc04c68a304b8d2672c3e5d9f2ad3d7ba",
+    ]);
+
+    const rejected = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "latest",
+      "--target",
+      "linux/amd64",
+      "--output",
+      join(temporaryRoot, "rejected-caddy"),
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        XCADDY_ARGS_FILE: argsPath,
+      },
+    });
+    expect(rejected.exitCode).not.toBe(0);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
 });
 
 test("CA generation and state preflight require operator evidence", () => {
@@ -121,7 +238,7 @@ test("CA generation and state preflight require operator evidence", () => {
     expect(ca.exitCode).toBe(0);
     expect(existsSync(join(caDir, "ca.crt"))).toBe(true);
     expect(statSync(join(caDir, "ca.key")).mode & 0o777).toBe(0o600);
-    expect(statSync(join(caDir, "caddy/server.key")).mode & 0o777).toBe(0o600);
+    expect(existsSync(join(caDir, "caddy/server.key"))).toBe(false);
 
     const source = join(temporaryRoot, "state.sqlite3");
     const database = run(["python3", "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\"); c.execute(\"CREATE TABLE tasks (session_id TEXT NOT NULL, generation INTEGER NOT NULL)\"); c.execute(\"INSERT INTO meta VALUES ('state_epoch','epoch-1')\"); c.execute(\"INSERT INTO tasks VALUES ('session-1',7)\"); c.commit(); c.close()", source]);

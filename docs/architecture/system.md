@@ -32,7 +32,7 @@ flowchart LR
 | Agent 客户端 | 现有 Bun 客户端逐步增加 HTTPS transport；使用高熵不透明机器 Token 调用 Agent API，保留 protocol 4 的操作 ID、generation 和本地 journal。进入容器及源码同步的 SSH 路径与控制 API 传输分别处理。 |
 | 用户浏览器 | 唯一管理员通过 Authorization Code + PKCE 登录第三方 OIDC；使用安全浏览器会话访问 `/api/v1`。服务端只接受配置的管理员主体。 |
 | 第三方 OIDC 提供方 | 负责用户认证和 ID Token；服务端校验 discovery issuer、授权码响应、签名、audience、有效期、state 和 nonce，不把邮箱、显示名或 group claim 当作稳定身份。 |
-| Caddy | 项目专用 Caddy 2.11.7，独立的非 root systemd 服务，在配置的稳定 HTTPS 入口提供一个外部入口；只做 TLS、固定路径转发和活动槽位选择，不实现用户身份或资源授权，不注入身份头。 |
+| Caddy | 项目专用 Caddy v2 自定义构建，编译 `dns.providers.dnspod` 模块，独立的非 root systemd 服务，在配置的稳定 HTTPS 入口提供一个外部入口；由 Caddy 自己执行 Tencent DNSPod DNS-01 和证书持久化，只做 TLS、固定路径转发和活动槽位选择，不实现用户身份或资源授权，不注入身份头。 |
 | 蓝色、绿色 Agent VM 服务 | 同一个 Go/Gin 程序的两个独立 systemd 实例，各自包含 Web、`/api/v1`、OIDC、Token 校验、`/agent/v1/control`、生命周期、调度和 native worker。每个实例使用自己的 Unix socket，代码、静态资源和发布身份属于对应版本。 |
 | rqlite | 项目专用 rqlite v10.5.2 单节点服务，本机回环 API，启用认证并使用受保护凭据。它是迁移完成后的共享状态权威，保存浏览器会话、OIDC 事务、管理员主体、Token 验证摘要、租约、generation、预留、operation journal、状态能力和审计；服务不直接打开 rqlite 底层 SQLite 文件。 |
 | Incus 与会话容器 | Incus 提供系统容器生命周期和网络等原生能力；Agent VM 服务通过受控 native worker 调用，容器是被管理资源。 |
@@ -42,7 +42,7 @@ Caddy、rqlite 和 Incus 是共享依赖，不属于蓝绿产品槽位；这些�
 
 ## 入口、身份与授权
 
-Caddy 使用项目配置的证书和稳定入口提供 HTTPS，禁用公开管理接口和额外 HTTP 监听。客户端和浏览器必须验证证书；不得通过关闭校验、信任任意证书或接受未经配置的入口来绕过 TLS。特定 OIDC 提供方若不接受 IP 回调，部署必须提供与其兼容、由客户端可解析且证书覆盖的稳定名称；不能假设默认 IP 必定可用。
+Caddy 使用稳定入口提供 HTTPS，并通过其内置的 Tencent DNSPod DNS-01 provider 管理证书，禁用公开管理接口和额外 HTTP 监听。DNSPod token 和域名是部署输入，留在受保护的 systemd 环境文件；仓库不包含真实地址、凭据或证书私钥。客户端和浏览器必须验证证书；不得通过关闭校验、信任任意证书或接受未经配置的入口来绕过 TLS。特定 OIDC 提供方若不接受 IP 回调，部署必须提供与其兼容、由客户端可解析且证书覆盖的稳定名称；不能假设默认 IP 必定可用。
 
 Caddy 只将下列固定路径转发到活动槽位，并清除不在允许集合内的请求头：
 

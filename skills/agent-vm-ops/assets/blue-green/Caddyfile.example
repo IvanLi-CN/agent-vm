@@ -1,6 +1,7 @@
 {
 	admin off
-	auto_https off
+	auto_https disable_redirects
+	storage file_system /var/lib/agent-vm-native/caddy
 	log default {
 		output stderr
 		format filter {
@@ -15,7 +16,9 @@
 }
 
 https://{$AGENT_VM_DOMAIN} {
-	tls /etc/agent-vm-native/tls/caddy/server.crt /etc/agent-vm-native/tls/caddy/server.key
+	tls {
+		dns dnspod {env.DNSPOD_TOKEN}
+	}
 	log default
 
 	@internal path /internal/v1/*

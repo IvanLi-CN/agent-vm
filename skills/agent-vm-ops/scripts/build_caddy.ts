@@ -1,0 +1,168 @@
+#!/usr/bin/env bun
+
+import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+
+const repositoryRoot = resolve(import.meta.dir, "../../..");
+const metadataPath = join(repositoryRoot, "skills/agent-vm-ops/assets/blue-green/deployment-components.json");
+
+type CaddyMetadata = {
+  version_major: number;
+  version_policy: string;
+  builder: string;
+  provider_module: string;
+  provider_ref: string;
+  provider_module_name: string;
+};
+
+type BuildOptions = {
+  caddyVersion: string;
+  target: "linux/amd64" | "linux/arm64";
+  output: string;
+};
+
+function usage(): string {
+  return [
+    "usage: bun skills/agent-vm-ops/scripts/build_caddy.ts \\",
+    "  --caddy-version <v2.x.y> \\",
+    "  --target <linux/amd64|linux/arm64> \\",
+    "  --output <absolute-path>",
+  ].join("\n");
+}
+
+function fail(message: string): never {
+  throw new Error(message);
+}
+
+function parseArgs(args: string[]): BuildOptions {
+  let caddyVersion = "";
+  let target: BuildOptions["target"] | "" = "";
+  let output = "";
+
+  for (let index = 0; index < args.length; index += 1) {
+    const flag = args[index];
+    const value = args[index + 1];
+    if (flag === "--help" || flag === "-h") {
+      console.log(usage());
+      process.exit(0);
+    }
+    if (flag === "--caddy-version") {
+      caddyVersion = value ?? "";
+      index += 1;
+    } else if (flag === "--target") {
+      target = (value ?? "") as BuildOptions["target"];
+      index += 1;
+    } else if (flag === "--output") {
+      output = value ?? "";
+      index += 1;
+    } else {
+      fail(`unknown argument: ${flag}\n${usage()}`);
+    }
+  }
+
+  if (!caddyVersion) fail(`--caddy-version is required\n${usage()}`);
+  if (!/^v?2\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(caddyVersion)) {
+    fail("--caddy-version must be an explicit Caddy v2 release (for example, v2.x.y)");
+  }
+  if (target !== "linux/amd64" && target !== "linux/arm64") {
+    fail("--target must be linux/amd64 or linux/arm64");
+  }
+  if (!output || !output.startsWith("/")) fail("--output must be an absolute path");
+
+  return {
+    caddyVersion: caddyVersion.startsWith("v") ? caddyVersion : `v${caddyVersion}`,
+    target,
+    output,
+  };
+}
+
+function readCaddyMetadata(): CaddyMetadata {
+  let metadata: any;
+  try {
+    metadata = JSON.parse(readFileSync(metadataPath, "utf8"));
+  } catch (error) {
+    fail(`cannot read Caddy metadata: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const caddy = metadata?.caddy;
+  if (
+    caddy?.version_major !== 2 ||
+    caddy?.version_policy !== "operator-selected-v2-release" ||
+    caddy?.builder !== "xcaddy" ||
+    typeof caddy?.provider_module !== "string" ||
+    caddy?.provider_module_name !== "dns.providers.dnspod" ||
+    !/^[0-9a-f]{40}$/.test(caddy?.provider_ref ?? "")
+  ) {
+    fail("Caddy metadata does not describe the supported xcaddy DNSPod build");
+  }
+  return caddy as CaddyMetadata;
+}
+
+export function commandFor(options: BuildOptions, metadata: CaddyMetadata): string[] {
+  return [
+    "build",
+    options.caddyVersion,
+    "--output",
+    options.output,
+    "--with",
+    `${metadata.provider_module}@${metadata.provider_ref}`,
+  ];
+}
+
+export function buildCaddy(args: string[], environment: Record<string, string | undefined> = process.env): number {
+  const options = parseArgs(args);
+  const metadata = readCaddyMetadata();
+  mkdirSync(dirname(options.output), { recursive: true });
+
+  let result: ReturnType<typeof Bun.spawnSync>;
+  try {
+    result = Bun.spawnSync([metadata.builder, ...commandFor(options, metadata)], {
+      env: {
+        ...environment,
+        GOOS: "linux",
+        GOARCH: options.target === "linux/amd64" ? "amd64" : "arm64",
+      },
+      stdout: "inherit",
+      stderr: "inherit",
+    });
+  } catch (error) {
+    fail(`failed to start ${metadata.builder}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  if (result.exitCode !== 0) fail(`${metadata.builder} exited with status ${result.exitCode}`);
+  if (!existsSync(options.output)) fail(`Caddy build did not create ${options.output}`);
+  const mode = statSync(options.output).mode & 0o777;
+  if ((mode & 0o111) === 0) fail(`Caddy build output is not executable: ${options.output}`);
+  // `go version -m` inspects Go build metadata without executing the target
+  // binary, so cross-compiled linux/amd64 and linux/arm64 outputs are both
+  // verifiable from the operator's build host.
+  const buildInfo = Bun.spawnSync(["go", "version", "-m", options.output], { stdout: "pipe", stderr: "pipe" });
+  const buildInfoOutput = new TextDecoder().decode(buildInfo.stdout);
+  if (buildInfo.exitCode !== 0 || !/\bdep\s+github\.com\/caddyserver\/caddy\/v2\s+v?2\./.test(buildInfoOutput)) {
+    fail(`Caddy build does not contain the Caddy v2 module metadata: ${buildInfoOutput.trim() || "no build metadata"}`);
+  }
+  if (buildInfo.exitCode !== 0 || !buildInfoOutput.includes(metadata.provider_module)) {
+    fail(`Caddy build does not contain ${metadata.provider_module}: ${buildInfoOutput.trim() || "no build metadata"}`);
+  }
+  console.log(JSON.stringify({
+    schema_version: 1,
+    caddy_version: options.caddyVersion,
+    requested_version: options.caddyVersion,
+    provider_module: metadata.provider_module,
+    provider_module_name: metadata.provider_module_name,
+    provider_ref: metadata.provider_ref,
+    target: options.target,
+    output: options.output,
+    verification: "go-version-m",
+  }));
+  return result.exitCode;
+}
+
+if (import.meta.main) {
+  try {
+    buildCaddy(process.argv.slice(2));
+  } catch (error) {
+    console.error(`Caddy build failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
+}

@@ -8,6 +8,8 @@ The client product package uses `release-manifest.json` format 3 and one product
 
 `release_id` is not a second product version. It is the legacy protocol-4 peer capability field and remains a Git SHA; it must never be populated with the SemVer product version. Format 1 remains a read-only legacy input, format 2 is the native deployment and rollback format, format 3 is a read-only product/rollback input, and management-enabled production builders write format 4.
 
+The deployment Caddy boundary is separate from the product SemVer. Caddy is major version 2 only and is built with `xcaddy` plus the official `github.com/caddy-dns/dnspod` module described in [`deployment-components.json`](../../../../skills/agent-vm-ops/assets/blue-green/deployment-components.json). The exact Caddy v2 patch release is an explicit operator build input and is not pinned in the repository or resolved implicitly as `latest`. Caddy owns ACME DNS-01 through `DNSPOD_TOKEN` and persists its certificate state in its dedicated data directory. The release excludes the DNSPod credential, domain, deployment address, certificate private keys and live inventory; no independent ACME client or static Caddy leaf is part of the release.
+
 The client prints the package SemVer when a valid format-3 or format-4 sidecar is installed and prints `dev` for development or legacy installations without a product version. The Go control response includes `version` for format-3 and format-4 product manifests while retaining the SHA-derived `release_id` and `source_revision` compatibility fields.
 
 ## Release manifest

@@ -5,7 +5,8 @@ usage() {
   cat >&2 <<'EOF'
 usage: generate_deployment_ca.sh --output-dir <empty-directory> --hostname <dns-name>
 
-Creates a local deployment CA and server certificates for Caddy and rqlite.
+Creates a local deployment CA and an rqlite server certificate.
+Caddy obtains its own public certificate with DNS-01 and does not use a static leaf.
 The output directory must not contain files. The private keys are mode 0600.
 EOF
 }
@@ -59,7 +60,7 @@ fi
 command -v openssl >/dev/null 2>&1 || { echo "openssl is required" >&2; exit 2; }
 
 umask 077
-mkdir -p -- "$output_dir/caddy" "$output_dir/rqlite"
+mkdir -p -- "$output_dir/rqlite"
 temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-vm-ca.XXXXXX")"
 cleanup() {
   rm -rf -- "$temporary_dir"
@@ -101,10 +102,9 @@ create_leaf() {
   chmod 0644 "$output_dir/$name/server.crt"
 }
 
-create_leaf caddy
 create_leaf rqlite
 chmod 0600 "$output_dir/ca.key"
 chmod 0644 "$output_dir/ca.crt"
 
-printf '{"output_dir":"%s","hostname":"%s","files":["ca.crt","ca.key","caddy/server.crt","caddy/server.key","rqlite/server.crt","rqlite/server.key"]}\n' \
+printf '{"output_dir":"%s","hostname":"%s","files":["ca.crt","ca.key","rqlite/server.crt","rqlite/server.key"]}\n' \
   "$output_dir" "$hostname_value"

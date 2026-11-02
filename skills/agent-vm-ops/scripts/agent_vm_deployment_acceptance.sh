@@ -41,10 +41,10 @@ require_command() {
 require_command bun
 require_command curl
 require_command sha256sum
-require_command sha512sum
 require_command tar
 require_command openssl
 require_command systemd-analyze
+require_command xcaddy
 
 static_result="$proof_dir/static.json"
 bun run "$repository_root/skills/agent-vm-ops/scripts/validate_blue_green_deployment.ts" >"$static_result" || {
@@ -52,16 +52,14 @@ bun run "$repository_root/skills/agent-vm-ops/scripts/validate_blue_green_deploy
   fail "static deployment validation failed"
 }
 
-caddy_archive="$proof_dir/caddy.tar.gz"
-caddy_url="https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_amd64.tar.gz"
-caddy_sha512="a7a433a1b133efc3c8d10eb0b99d52a24b5ef5c322dc77f5282182b1c0402139ab83f3a99f0c52409df77d20123fb0b523edad8a66d8f5e49136197bf61ef0e7"
-curl --fail --silent --show-error --location --retry 3 --output "$caddy_archive" "$caddy_url"
-printf '%s  %s\n' "$caddy_sha512" "$caddy_archive" | sha512sum --check --status - || fail "Caddy checksum failed"
-mkdir -p -- "$proof_dir/caddy"
-tar --extract --gzip --file "$caddy_archive" --directory "$proof_dir/caddy"
-caddy_binary="$proof_dir/caddy/caddy"
-[[ -x "$caddy_binary" ]] || fail "Caddy binary was not found"
-"$caddy_binary" version | grep -q '2.11.7' || fail "Caddy version is not 2.11.7"
+caddy_version="${CADDY_VERSION:-}"
+[[ -n "$caddy_version" ]] || fail "CADDY_VERSION must be an explicit v2 release selected for this isolated run"
+caddy_binary="$proof_dir/caddy"
+bun run "$repository_root/skills/agent-vm-ops/scripts/build_caddy.ts" \
+  --caddy-version "$caddy_version" \
+  --target linux/amd64 \
+  --output "$caddy_binary" >"$proof_dir/caddy-build.json"
+[[ -x "$caddy_binary" ]] || fail "Caddy custom build was not found"
 
 ca_dir="$proof_dir/ca"
 bash "$repository_root/skills/agent-vm-ops/scripts/generate_deployment_ca.sh" \
@@ -69,14 +67,20 @@ bash "$repository_root/skills/agent-vm-ops/scripts/generate_deployment_ca.sh" \
 
 caddy_config="$proof_dir/Caddyfile"
 sed \
-  -e "s#/etc/agent-vm-native/tls/caddy/server.crt#$ca_dir/caddy/server.crt#g" \
-  -e "s#/etc/agent-vm-native/tls/caddy/server.key#$ca_dir/caddy/server.key#g" \
+  -e "s#/var/lib/agent-vm-native/caddy#$proof_dir/caddy-data#g" \
   "$repository_root/skills/agent-vm-ops/assets/blue-green/Caddyfile.example" >"$caddy_config"
-AGENT_VM_DOMAIN="localhost:8443" "$caddy_binary" validate --config "$caddy_config" --adapter caddyfile >"$proof_dir/caddy-validate.json" 2>&1
+mkdir -p -- "$proof_dir/caddy-data"
+AGENT_VM_DOMAIN="localhost:8443" DNSPOD_TOKEN="isolated-dnspod-token" \
+  "$caddy_binary" validate --config "$caddy_config" --adapter caddyfile >"$proof_dir/caddy-validate.json" 2>&1
 
 backend_socket="$proof_dir/backend.sock"
 smoke_config="$proof_dir/Caddyfile.smoke"
-sed -e "s#/var/lib/agent-vm-native/active/app.sock#$backend_socket#g" "$caddy_config" >"$smoke_config"
+sed -e "s#/var/lib/agent-vm-native/active/app.sock#$backend_socket#g" "$caddy_config" \
+  | awk -v cert="$ca_dir/rqlite/server.crt" -v key="$ca_dir/rqlite/server.key" '
+      /^[[:space:]]*tls \{$/ { print "\ttls " cert " " key; skip_tls=1; next }
+      skip_tls && /^[[:space:]]*\}$/ { skip_tls=0; next }
+      !skip_tls { print }
+    ' >"$smoke_config"
 python3 - "$backend_socket" >"$proof_dir/backend.log" 2>&1 <<'PY' &
 import http.server
 import os
@@ -112,7 +116,8 @@ for _ in $(seq 1 40); do
 done
 [[ -S "$backend_socket" ]] || fail "Unix backend did not start"
 caddy_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
-AGENT_VM_DOMAIN="localhost:$caddy_port" "$caddy_binary" run --config "$smoke_config" --adapter caddyfile >"$proof_dir/caddy.log" 2>&1 &
+AGENT_VM_DOMAIN="localhost:$caddy_port" DNSPOD_TOKEN="isolated-dnspod-token" \
+  "$caddy_binary" run --config "$smoke_config" --adapter caddyfile >"$proof_dir/caddy.log" 2>&1 &
 caddy_pid=$!
 auth_header_token="isolated-${BASHPID}-token"
 query_marker="isolated-${BASHPID}-query"
@@ -155,6 +160,7 @@ mkdir -p -- \
 cp "$unit_dir/agent-vm-rqlite.service" "$unit_dir/agent-vm-native@.service" "$unit_dir/agent-vm-caddy.service" "$systemd_root/etc/systemd/system/"
 touch \
   "$systemd_root/etc/agent-vm-native/Caddyfile" \
+  "$systemd_root/etc/agent-vm-native/caddy.env" \
   "$systemd_root/etc/agent-vm-native/slots/test_instance/config.json" \
   "$systemd_root/opt/agent-vm-native/release-manifest.json" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/release-manifest.json"
@@ -175,6 +181,10 @@ printf '%s\n' \
 cat >"$systemd_root/etc/systemd/system/sysinit.target" <<'EOF'
 [Unit]
 Description=Isolated verification target
+EOF
+cat >"$systemd_root/etc/systemd/system/network-online.target" <<'EOF'
+[Unit]
+Description=Isolated network readiness target
 EOF
 systemd-analyze --root="$systemd_root" verify \
   agent-vm-rqlite.service \
@@ -375,4 +385,4 @@ bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.t
   restore-check --backup-manifest "$migration_dir/snapshot-manifest.json" \
   --tail-evidence "$tail_evidence" --evidence-public-key "$evidence_public_key" --output "$proof_dir/restore.json" >"$proof_dir/restore-result.json"
 
-printf '{"schema_version":1,"verdict":"pass","caddy":"2.11.7","rqlite":"10.5.2","checks":["pinned artifact checksums","CA and leaf certificates","Caddy configuration","systemd units","authenticated TLS rqlite","blue-green cutover guard","evidence-gated snapshot","restore admissibility"]}\n'
+printf '{"schema_version":1,"verdict":"pass","caddy_major":2,"caddy_build":"operator-selected-v2","rqlite":"10.5.2","checks":["custom Caddy DNSPod build","rqlite artifact checksums","CA and rqlite leaf certificate","Caddy configuration","systemd units","authenticated TLS rqlite","blue-green cutover guard","evidence-gated snapshot","restore admissibility"]}\n'

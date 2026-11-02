@@ -1,8 +1,9 @@
 [Unit]
 Description=Agent VM Caddy edge proxy
-After=agent-vm-rqlite.service agent-vm-native@blue.service agent-vm-native@green.service
-Wants=agent-vm-rqlite.service
+After=network-online.target agent-vm-rqlite.service agent-vm-native@blue.service agent-vm-native@green.service
+Wants=network-online.target agent-vm-rqlite.service
 ConditionPathExists=/etc/agent-vm-native/Caddyfile
+ConditionPathExists=/etc/agent-vm-native/caddy.env
 ConditionPathExists=/var/lib/agent-vm-native/active/app.sock
 RequiresMountsFor=/var/lib/agent-vm-native/active/app.sock
 
@@ -11,7 +12,7 @@ Type=simple
 User=caddy
 Group=caddy
 SupplementaryGroups=agent-vm-web
-EnvironmentFile=-/etc/agent-vm-native/caddy.env
+EnvironmentFile=/etc/agent-vm-native/caddy.env
 ExecStartPre=/usr/bin/test -L /var/lib/agent-vm-native/active
 ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock
 ExecStart=/usr/local/bin/caddy run --environ --config /etc/agent-vm-native/Caddyfile --adapter caddyfile
@@ -25,7 +26,7 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/agent-vm-native/caddy
-ReadOnlyPaths=/etc/agent-vm-native/Caddyfile /etc/agent-vm-native/caddy.env /etc/agent-vm-native/tls/caddy
+ReadOnlyPaths=/etc/agent-vm-native/Caddyfile /etc/agent-vm-native/caddy.env
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE
