@@ -98,6 +98,7 @@ type Service struct {
 	ready             bool
 	wake              func()
 	mutationGate      func() bool
+	trafficAccepting  atomic.Bool
 }
 
 type internalCleanupContextKey struct{}
@@ -141,6 +142,7 @@ func New(store *state.Store, cfg config.Config, options Options) *Service {
 		lockDir = filepath.Join(cfg.StoragePath, "locks")
 	}
 	service := &Service{Store: store, Config: cfg, Guest: options.Guest, Clock: clock, Snapshots: options.Snapshots, CPU: options.CPU, Memory: options.Memory, Release: options.Release, lockDir: lockDir, resident: options.Resident, ready: false, wake: options.Wake, actionLocks: make(map[string]*sync.Mutex), activeOps: make(map[string]int)}
+	service.trafficAccepting.Store(false)
 	return service
 }
 
@@ -204,6 +206,14 @@ func (s *Service) mutationAllowed() bool {
 	gate := s.mutationGate
 	s.mu.RUnlock()
 	return gate == nil || gate()
+}
+
+func (s *Service) SetTrafficAccepting(value bool) {
+	s.trafficAccepting.Store(value)
+}
+
+func (s *Service) TrafficAccepting() bool {
+	return s.trafficAccepting.Load()
 }
 
 func (s *Service) activeOperationCount() int {
@@ -1097,6 +1107,9 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		return nil, resourceLockError(lockErr)
 	}
 	defer unlock()
+	if write && !leaseExempt && !s.mutationAllowed() {
+		return nil, protocol.NewError("controller_lease_required", "controller lease is required for mutation", map[string]any{"admission_ready": false})
+	}
 	if releaseSensitiveAction(action, request) && !isInternalCleanup(ctx) {
 		releaseDrain, drainErr := s.releaseDrainOwned(ctx)
 		if drainErr != nil {
@@ -2856,6 +2869,7 @@ func (s *Service) drain(ctx context.Context, value bool, request protocol.Reques
 	if err := s.Store.SetMeta(ctx, "drain_sealed", "0"); err != nil {
 		return nil, s.sqliteError(err)
 	}
+	s.SetTrafficAccepting(!value)
 	return map[string]any{"draining": value}, nil
 }
 
@@ -2892,7 +2906,7 @@ func (s *Service) adminStatus(ctx context.Context) (map[string]any, error) {
 		}
 		items = append(items, item)
 	}
-	return map[string]any{"up": true, "ready": s.Ready(), "tasks": items}, nil
+	return map[string]any{"up": true, "ready": s.Ready(), "observed_at": nowString(s.Clock()), "tasks": items}, nil
 }
 
 func (s *Service) adminSessionList(ctx context.Context) (map[string]any, error) {
@@ -3802,7 +3816,7 @@ func (s *Service) doctor(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	return map[string]any{"up": true, "ready": s.Ready(), "issues": []any{}, "draining": draining, "state_epoch": epoch, "transport": "http-over-uds"}, nil
+	return map[string]any{"up": true, "ready": s.Ready(), "observed_at": nowString(s.Clock()), "issues": []any{}, "draining": draining, "state_epoch": epoch, "transport": "http-over-uds"}, nil
 }
 
 func (s *Service) sshInfo(ctx context.Context, request protocol.Request) (map[string]any, error) {

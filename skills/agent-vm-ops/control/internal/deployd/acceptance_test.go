@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,11 +19,55 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd/store"
 )
 
+func TestServeUDSRefusesLiveAndReplacesStaleSocket(t *testing.T) {
+	directory, err := os.MkdirTemp("/tmp", "deployd-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	socket := filepath.Join(directory, "deployd.sock")
+	live, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ServeUDS(context.Background(), socket, http.NotFoundHandler()); err == nil {
+		t.Fatal("live deployd socket was replaced")
+	}
+	if err := live.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errorsCh := make(chan error, 1)
+	go func() { errorsCh <- ServeUDS(ctx, socket, http.NotFoundHandler()) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, statErr := os.Stat(socket); statErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("deployd did not replace stale socket")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case serveErr := <-errorsCh:
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			t.Fatalf("serve error = %v", serveErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("deployd did not stop")
+	}
+}
+
 type acceptanceRuntime struct {
 	mu        sync.Mutex
 	active    string
 	slots     map[string]SlotObservation
 	draining  map[string]bool
+	traffic   map[string]bool
 	uncertain bool
 }
 
@@ -34,6 +79,7 @@ func newAcceptanceRuntime() *acceptanceRuntime {
 			"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
 		},
 		draining: map[string]bool{},
+		traffic:  map[string]bool{"blue": true},
 	}
 }
 
@@ -43,7 +89,11 @@ func (runtime *acceptanceRuntime) Observe(context.Context) (RuntimeSnapshot, err
 	now := time.Now().UTC()
 	slots := make(map[string]SlotObservation, len(runtime.slots))
 	for slot, value := range runtime.slots {
-		value.TrafficAccepting = runtime.active == slot && !runtime.draining[slot]
+		value.TrafficAccepting = runtime.traffic[slot] && !runtime.draining[slot]
+		value.ReleaseID = "release-" + slot
+		value.SourceRevision = "revision-1"
+		value.StateEpoch = "epoch-1"
+		value.StateCapabilities = []string{"reads@1", "writes@1"}
 		value.ObservedUnix = now.Unix()
 		slots[slot] = value
 	}
@@ -96,7 +146,7 @@ func (runtime *acceptanceRuntime) GrantController(_ context.Context, slot string
 	return nil
 }
 
-func (runtime *acceptanceRuntime) RevokeController(_ context.Context, slot string) error {
+func (runtime *acceptanceRuntime) RevokeController(_ context.Context, slot string, _ uint64) error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	if value, ok := runtime.slots[slot]; ok {
@@ -106,7 +156,19 @@ func (runtime *acceptanceRuntime) RevokeController(_ context.Context, slot strin
 	return nil
 }
 
-func (runtime *acceptanceRuntime) EnableTraffic(context.Context, string) error { return nil }
+func (runtime *acceptanceRuntime) EnableTraffic(_ context.Context, slot string) error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	runtime.traffic[slot] = true
+	return nil
+}
+
+func (runtime *acceptanceRuntime) DisableTraffic(_ context.Context, slot string) error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	runtime.traffic[slot] = false
+	return nil
+}
 
 func (runtime *acceptanceRuntime) SwitchActive(_ context.Context, slot string) error {
 	runtime.mu.Lock()
@@ -156,6 +218,8 @@ func (runtime *acceptanceRuntime) Rollback(_ context.Context, target, previous s
 	runtime.slots[target] = targetValue
 	runtime.draining[target] = true
 	runtime.active = previous
+	runtime.traffic[previous] = true
+	runtime.traffic[target] = false
 	return nil
 }
 

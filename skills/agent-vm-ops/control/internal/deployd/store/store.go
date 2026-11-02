@@ -16,6 +16,8 @@ import (
 
 const schemaVersion = 1
 
+const LatestObservationID = "__latest__"
+
 const schema = `
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -38,6 +40,9 @@ CREATE TABLE IF NOT EXISTS deployment_transactions (
 );
 CREATE INDEX IF NOT EXISTS deployment_transactions_state_updated
   ON deployment_transactions(state, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS deployment_transactions_one_active
+  ON deployment_transactions((1))
+  WHERE state NOT IN ('finalized','rolled_back','failed');
 CREATE TABLE IF NOT EXISTS deployment_phase_events (
   event_id INTEGER PRIMARY KEY AUTOINCREMENT,
   transaction_id TEXT NOT NULL,
@@ -68,6 +73,13 @@ CREATE TABLE IF NOT EXISTS deployment_observations (
   digest TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   FOREIGN KEY(transaction_id) REFERENCES deployment_transactions(transaction_id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS deployment_latest_observation (
+  id INTEGER PRIMARY KEY CHECK(id = 1),
+  observed_at TEXT NOT NULL,
+  fresh_until TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  payload_json TEXT NOT NULL
 );`
 
 type Transaction struct {
@@ -212,6 +224,15 @@ func (s *Store) Create(ctx context.Context, transaction Transaction, evidence ma
 		transaction.State = "active"
 	}
 	return s.write(ctx, func(tx *sql.Tx) error {
+		var activeID string
+		activeErr := tx.QueryRowContext(ctx, `SELECT transaction_id FROM deployment_transactions
+			WHERE state NOT IN ('finalized','rolled_back','failed') LIMIT 1`).Scan(&activeID)
+		if activeErr == nil {
+			return fmt.Errorf("deployment transaction %s is already active", activeID)
+		}
+		if !errors.Is(activeErr, sql.ErrNoRows) {
+			return activeErr
+		}
 		rollback := boolInt(transaction.RollbackUsed)
 		recovery := boolInt(transaction.RecoveryRequired)
 		if _, err := tx.ExecContext(ctx, `INSERT INTO deployment_transactions
@@ -279,6 +300,41 @@ func (s *Store) SetRollbackUsed(ctx context.Context, id string, now time.Time) e
 	})
 }
 
+// BeginRollback atomically records the one permitted rollback and its phase
+// event. A failed event insert must not consume the rollback budget.
+func (s *Store) BeginRollback(ctx context.Context, id, expectedPhase, phase, transition, source string, evidence map[string]any, now time.Time) (*Transaction, error) {
+	if now.IsZero() {
+		now = s.clock().UTC()
+	}
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		var currentPhase string
+		var rollbackUsed int
+		if err := tx.QueryRowContext(ctx, "SELECT phase, rollback_used FROM deployment_transactions WHERE transaction_id = ?", id).Scan(&currentPhase, &rollbackUsed); err != nil {
+			return err
+		}
+		if currentPhase != expectedPhase {
+			return fmt.Errorf("deployment phase conflict: expected %s, got %s", expectedPhase, currentPhase)
+		}
+		if rollbackUsed != 0 {
+			return errors.New("transaction rollback is already used")
+		}
+		var sequence int64
+		if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(sequence), 0) + 1 FROM deployment_phase_events WHERE transaction_id = ?", id).Scan(&sequence); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE deployment_transactions
+			SET phase = ?, state = 'active', rollback_used = 1, recovery_required = 0, updated_at = ?
+			WHERE transaction_id = ?`, phase, formatTime(now), id); err != nil {
+			return err
+		}
+		return insertEvent(ctx, tx, id, sequence, phase, transition, source, evidence, now)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.Get(ctx, id)
+}
+
 func (s *Store) RecordFailure(ctx context.Context, id, phase, code, source, digest string, payload map[string]any, now time.Time) error {
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -308,6 +364,11 @@ func (s *Store) SaveObservation(ctx context.Context, id string, observation Obse
 		return err
 	}
 	return s.write(ctx, func(tx *sql.Tx) error {
+		if id == LatestObservationID {
+			_, err := tx.ExecContext(ctx, `INSERT INTO deployment_latest_observation(id,observed_at,fresh_until,digest,payload_json)
+				VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET observed_at=excluded.observed_at,fresh_until=excluded.fresh_until,digest=excluded.digest,payload_json=excluded.payload_json`, formatTime(observation.ObservedAt), formatTime(observation.FreshUntil), observation.Digest, payload)
+			return err
+		}
 		_, err := tx.ExecContext(ctx, `INSERT INTO deployment_observations(transaction_id,observed_at,fresh_until,digest,payload_json)
 			VALUES(?,?,?,?,?) ON CONFLICT(transaction_id) DO UPDATE SET observed_at=excluded.observed_at,fresh_until=excluded.fresh_until,digest=excluded.digest,payload_json=excluded.payload_json`, id, formatTime(observation.ObservedAt), formatTime(observation.FreshUntil), observation.Digest, payload)
 		return err
@@ -316,7 +377,13 @@ func (s *Store) SaveObservation(ctx context.Context, id string, observation Obse
 
 func (s *Store) Observation(ctx context.Context, id string) (*Observation, error) {
 	var observed, fresh, digest, payload string
-	if err := s.db.QueryRowContext(ctx, "SELECT observed_at,fresh_until,digest,payload_json FROM deployment_observations WHERE transaction_id = ?", id).Scan(&observed, &fresh, &digest, &payload); err != nil {
+	query := "SELECT observed_at,fresh_until,digest,payload_json FROM deployment_observations WHERE transaction_id = ?"
+	args := []any{id}
+	if id == LatestObservationID {
+		query = "SELECT observed_at,fresh_until,digest,payload_json FROM deployment_latest_observation WHERE id = 1"
+		args = nil
+	}
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&observed, &fresh, &digest, &payload); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}

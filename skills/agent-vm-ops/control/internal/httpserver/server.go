@@ -97,6 +97,7 @@ func (s *Server) Handler() http.Handler {
 	})
 	router.POST("/internal/v1/control", s.control)
 	router.POST("/internal/v1/controller-role", s.controllerRole)
+	router.POST("/internal/v1/traffic-role", s.trafficRole)
 	router.GET("/internal/v1/health", s.health)
 	router.GET("/internal/v1/snapshots/:source", s.snapshot)
 	router.NoRoute(func(c *gin.Context) {
@@ -147,8 +148,49 @@ func (s *Server) health(c *gin.Context) {
 	}
 	c.JSON(status, map[string]any{
 		"ok": true, "ready": ready, "process_ready": true, "controller_ready": ready,
-		"controller_owned": controllerOwned, "lease": lease, "protocol": protocol.Version,
+		"controller_owned": controllerOwned, "traffic_accepting": s.Service.TrafficAccepting(), "lease": lease, "protocol": protocol.Version,
+		"release_id":      releaseValue(s.Service.Release, func(value *protocol.ReleaseMetadata) string { return value.ReleaseID }),
+		"source_revision": releaseValue(s.Service.Release, func(value *protocol.ReleaseMetadata) string { return value.SourceRevision }),
 	})
+}
+
+func (s *Server) trafficRole(c *gin.Context) {
+	reader := http.MaxBytesReader(c.Writer, c.Request.Body, 64*1024)
+	defer c.Request.Body.Close()
+	var command struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(reader).Decode(&command); err != nil || (command.Action != "enable" && command.Action != "disable") {
+		writeJSON(c, http.StatusBadRequest, map[string]any{"ok": false, "error": protocol.NewError("invalid_request", "traffic role action must be enable or disable", nil)}, 2)
+		return
+	}
+	draining, err := s.Service.IsDraining(c.Request.Context())
+	if err != nil {
+		writeJSON(c, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": protocol.NewError("observation_unavailable", "traffic role state is unavailable", nil)}, 2)
+		return
+	}
+	if draining && command.Action == "enable" {
+		writeJSON(c, http.StatusConflict, map[string]any{"ok": false, "error": protocol.NewError("draining", "draining slot cannot accept traffic", nil)}, 2)
+		return
+	}
+	if command.Action == "enable" && (s.RoleGate == nil || !s.RoleGate.Valid()) {
+		writeJSON(c, http.StatusConflict, map[string]any{"ok": false, "error": protocol.NewError("controller_role_required", "controller role is required before enabling traffic", nil)}, 2)
+		return
+	}
+	if command.Action == "enable" && !s.Service.Ready() {
+		writeJSON(c, http.StatusConflict, map[string]any{"ok": false, "error": protocol.NewError("slot_not_ready", "slot must be ready before enabling traffic", nil)}, 2)
+		return
+	}
+	accepting := command.Action == "enable"
+	s.Service.SetTrafficAccepting(accepting)
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true, "traffic_accepting": accepting, "protocol": protocol.Version}, 0)
+}
+
+func releaseValue(value *protocol.ReleaseMetadata, selectValue func(*protocol.ReleaseMetadata) string) string {
+	if value == nil {
+		return ""
+	}
+	return selectValue(value)
 }
 
 func (s *Server) controllerRole(c *gin.Context) {

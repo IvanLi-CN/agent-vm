@@ -170,7 +170,7 @@ Recovery process 必须将该 boundary 之后的 backup tail 与 trusted append-
 1 GiB 按实际文件大小计算，不是预分配空间，也不存在体积下限。
 最后两个可验证恢复点不能删除；迁移源 SQLite snapshot 在迁移完成并通过新的 rqlite restore check 后保留七天。
 只有在没有 pending/unknown operation 或未解决的 `needs_recovery`、对应保留期已到期，且清理后仍保留两个恢复点时，材料才可进入 `purge_eligible`。
-唯一 active `deployd` 的 retention worker 在每次成功备份后和每小时执行清理。
+状态迁移或灾难恢复流程的 retention worker 在每次成功备份后和每小时执行清理；该 worker 不属于蓝绿 Deployd。
 预算不足时必须返回 `backup_storage_exhausted` 并拒绝新的备份或状态迁移；任何删除都必须针对准确的材料 ID 执行并写入审计。
 状态数据库中的终态操作和审计历史 MUST 默认保留三十天后回收；不得通过放大恢复材料预算替代历史记录回收。
 

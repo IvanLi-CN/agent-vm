@@ -6,6 +6,25 @@ import (
 	"testing"
 )
 
+func TestAdminMetricsValidationUsesTopLevelObservationEpoch(t *testing.T) {
+	result := map[string]any{
+		"up":                            true,
+		"observed_at":                   "2026-11-03T00:00:00Z",
+		"observation_epoch":             "epoch-1",
+		"pending_operations":            []any{},
+		"historical_unknown_operations": []any{},
+		"in_flight_operations":          float64(0),
+		"doctor":                        map[string]any{"ready": true, "issues": []any{}},
+	}
+	if err := validateSourceResult("admin-metrics", result); err != nil {
+		t.Fatalf("admin-metrics response rejected: %v", err)
+	}
+	delete(result, "observation_epoch")
+	if err := validateSourceResult("admin-metrics", result); err == nil {
+		t.Fatal("admin-metrics response without observation epoch was accepted")
+	}
+}
+
 func TestCompareReleaseTreesRejectsStagedTampering(t *testing.T) {
 	expectedRoot := t.TempDir()
 	actualRoot := t.TempDir()

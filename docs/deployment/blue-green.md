@@ -67,6 +67,9 @@ Prometheus 的 scrape job 使用 `agent-vm-deployd`；Grafana 只通过 Promethe
 该监听不暴露公共业务 TCP 端点，不写业务状态或 rqlite，也不替代 Caddy。
 
 Deployd 观测原子 `active` 链接、两个槽位的 systemd 服务单元和 socket、槽位就绪状态/状态能力、控制器主权、流量角色和在途计数器、native worker/pending-operation 状态以及 release manifest。
+
+槽位进程启动时默认保持 `traffic_accepting=false`；只有 Deployd 在完成新鲜观测并授予 controller role 后，才能为当前 `active` 槽位启用流量角色。
+Deployd 重启或槽位进程重启后必须重新完成这条恢复路径，不能根据旧的本地状态直接恢复流量或 controller role。
 它的独立 SQLite 数据库保存事务阶段、阶段事件、失败证据和最新观测快照，不保存每次轮询，也不成为运行时来源的权威。
 Deployd 的 `/metrics` 只输出最近一次已完成的组合快照，不在 scrape 请求中触发采样或部署变更。
 所有槽位级指标都必须带 `slot` 标签；切换期间两个槽位可以同时存活，但最终 Prometheus target 只有 deployd 这一份出口。
@@ -171,7 +174,7 @@ restore check 只有在 backup hash 与 manifest 和单独签名的 tail-evidenc
 最后两个可验证恢复点始终保留；迁移源 SQLite snapshot 在迁移完成并通过新的 rqlite restore check 后保留七天。
 
 只有在状态后端已恢复、隔离 restore check 已通过、没有 pending/unknown operation 或未解决的 `needs_recovery`、迁移源保留期已到期，并且清理后仍保留两个可验证恢复点时，材料才可以进入 `purge_eligible`。
-唯一 active `deployd` 的 retention worker 在每次成功备份后和每小时执行清理。
+状态迁移或灾难恢复流程的 retention worker 在每次成功备份后和每小时执行清理；该 worker 不属于蓝绿 Deployd，也不读取 Deployd socket。
 删除必须针对准确的材料 ID 并写入审计；预算仍不足时报告 `backup_storage_exhausted`，拒绝新的备份或状态迁移，不删除受保护恢复点。
 状态数据库中的终态操作和审计历史默认保留三十天后回收，不能依靠放大 1 GiB 预算掩盖数据库自身的无界增长。
 

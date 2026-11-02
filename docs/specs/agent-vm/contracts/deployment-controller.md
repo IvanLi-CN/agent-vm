@@ -121,6 +121,9 @@ Deployd 的后台采样分别读取两个槽位的 `admin-metrics`、`admin-stat
 standby 或 retiring 槽位可以提供受保护的就绪状态和只读观测，但没有该 role 时 MUST NOT 执行 `StartupReconcile`、`timer-reconcile`、`timer-age-gc` 或任何等价的后台 native mutation。
 role 丢失时，必须先 fence 这些循环，槽位才能进入 retiring 或 standby。
 
+槽位进程启动时默认不得接受新流量。
+只有 Deployd 在新鲜观测通过后授予 controller role，才能启用当前 `active` 槽位的 traffic role；Deployd 或槽位重启后必须重新观测、授予 role 并启用流量，不能依据旧状态直接恢复。
+
 控制器持有排他的宿主级协调锁。
 槽位 controller role 是进程持有型的；deployd 或持有 role 的槽位失去已认证角色通道后，该 role 立即失效。
 deployd 重启会使所有尚未验证的交接失效，并要求重新观测后才能授予新的 role。
@@ -220,7 +223,7 @@ Deployd 使用独立的本机 SQLite 数据库，路径为 `/var/lib/agent-vm-na
 
 已 `finalize` 且不再被恢复流程引用的 `deployment_transactions`、`deployment_phase_events` 和 `deployment_failure_evidence` 默认保留三十天后回收。
 活动事务、`needs_recovery` 事务、未解决的 phase、pending/unknown operation 和恢复所需证据不得回收。
-如果创建 `deployment.sqlite3` 的 recovery copy，它与业务状态恢复材料共同计入 1 GiB 总硬上限；不能通过单独保留部署库绕过该上限。
+如果独立的状态迁移或灾难恢复流程创建 `deployment.sqlite3` 的 recovery copy，该 copy 与业务状态恢复材料共同计入 1 GiB 总硬上限；Deployd 不创建、登记或清理这些恢复材料。
 
 数据库 MUST 由 deployd 服务账号保护，使用有界 transaction lock 和与所选 SQLite 模式匹配的 fsync/atomic commit 语义，并拒绝没有明确兼容声明的 schema/version 变化。
 数据库故障会阻止新的阶段转换，但不能让 deployd 声称槽位已停止、已排空或已激活。

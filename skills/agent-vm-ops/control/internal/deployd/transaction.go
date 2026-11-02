@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sync"
 	"time"
 
@@ -54,7 +55,10 @@ type SlotObservation struct {
 	PendingOperations int64             `json:"pending_operations"`
 	ObservedUnix      int64             `json:"observed_at_seconds"`
 	StateEpoch        string            `json:"state_epoch,omitempty"`
-	MetricFamilies    map[string]string `json:"-"`
+	ReleaseID         string            `json:"release_id,omitempty"`
+	SourceRevision    string            `json:"source_revision,omitempty"`
+	StateCapabilities []string          `json:"state_capabilities,omitempty"`
+	MetricFamilies    map[string]string `json:"metric_families,omitempty"`
 }
 
 type RuntimeSnapshot struct {
@@ -78,8 +82,9 @@ type Runtime interface {
 	Stage(context.Context, string, string) error
 	Verify(context.Context, string, string) error
 	GrantController(context.Context, string, controllerrole.Lease) error
-	RevokeController(context.Context, string) error
+	RevokeController(context.Context, string, uint64) error
 	EnableTraffic(context.Context, string) error
+	DisableTraffic(context.Context, string) error
 	SwitchActive(context.Context, string) error
 	Drain(context.Context, string) error
 	Quiesce(context.Context, string) error
@@ -197,10 +202,10 @@ func (manager *Manager) Stage(ctx context.Context, targetSlot, bundle string) (*
 	if err := manager.Runtime.Stage(ctx, targetSlot, bundle); err != nil {
 		return nil, manager.failure(ctx, transaction.ID, PhaseStage, err)
 	}
-	updated, err := manager.transition(ctx, transaction.ID, PhaseStage, PhaseStandbyValidation, "staged", map[string]any{"target_slot": targetSlot})
-	if err != nil {
+	if err := manager.transitionAfterEffect(ctx, transaction.ID, PhaseStage, PhaseStandbyValidation, "staged", map[string]any{"target_slot": targetSlot}); err != nil {
 		return nil, err
 	}
+	updated, err := manager.Store.Get(ctx, transaction.ID)
 	return updated, nil
 }
 
@@ -222,10 +227,17 @@ func (manager *Manager) Verify(ctx context.Context, id string) (*store.Transacti
 		return nil, manager.failure(ctx, id, PhaseStandbyValidation, err)
 	}
 	target, ok := observation.Slots[transaction.TargetSlot]
-	if !ok || !target.ProcessUp || !target.ProcessReady {
+	if !validObservation(observation, manager.Clock().UTC()) || !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || target.TrafficAccepting || target.ReleaseID == "" || target.SourceRevision == "" || target.StateEpoch == "" || len(target.StateCapabilities) == 0 {
 		return nil, manager.failure(ctx, id, PhaseStandbyValidation, errors.New("candidate slot is not process-ready"))
 	}
-	updated, err := manager.transition(ctx, id, PhaseStandbyValidation, PhaseControllerHandoff, "verified", map[string]any{"candidate_ready": true})
+	previous, previousOK := observation.Slots[transaction.PreviousSlot]
+	if previousOK && previous.StateEpoch != "" && previous.StateEpoch != target.StateEpoch {
+		return nil, manager.failure(ctx, id, PhaseStandbyValidation, errors.New("candidate state epoch is incompatible with the active slot"))
+	}
+	if err := manager.transitionAfterEffect(ctx, id, PhaseStandbyValidation, PhaseControllerHandoff, "verified", map[string]any{"candidate_ready": true, "release_id": target.ReleaseID, "source_revision": target.SourceRevision, "state_epoch": target.StateEpoch}); err != nil {
+		return nil, err
+	}
+	updated, err := manager.Store.Get(ctx, id)
 	return updated, err
 }
 
@@ -243,66 +255,79 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	if err != nil {
 		return nil, manager.failure(ctx, id, transaction.Phase, err)
 	}
-	if observation.ActiveSlot != transaction.PreviousSlot {
+	if !validObservation(observation, manager.Clock().UTC()) || observation.ActiveSlot != transaction.PreviousSlot {
 		return nil, manager.failure(ctx, id, transaction.Phase, errors.New("active slot changed outside deployd"))
 	}
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
-		if err := manager.Runtime.RevokeController(ctx, transaction.PreviousSlot); err != nil {
-			return nil, manager.failure(ctx, id, PhaseControllerHandoff, err)
+		if err := manager.Runtime.RevokeController(ctx, transaction.PreviousSlot, manager.nextFenceTerm()); err != nil {
+			return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, err)
 		}
 	}
 	lease := manager.newLease(transaction.TargetSlot, transaction.Generation)
 	if err := manager.Runtime.GrantController(ctx, transaction.TargetSlot, lease); err != nil {
-		return nil, manager.failure(ctx, id, PhaseControllerHandoff, err)
+		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, err)
 	}
 	observation, err = manager.observe(ctx, id)
 	if err != nil {
 		return nil, manager.rollbackOrFence(ctx, *transaction, err)
 	}
 	target, ok := observation.Slots[transaction.TargetSlot]
-	if !ok || !target.ProcessUp || !target.ProcessReady || !target.ControllerOwned {
+	if !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || target.ReleaseID == "" || target.SourceRevision == "" || target.StateEpoch == "" {
 		return nil, manager.rollbackOrFence(ctx, *transaction, errors.New("candidate controller lease was not observed"))
 	}
 	if err := manager.waitForReady(ctx, id, transaction.TargetSlot); err != nil {
 		return nil, manager.rollbackOrFence(ctx, *transaction, err)
 	}
-	if _, err := manager.transition(ctx, id, PhaseControllerHandoff, PhaseTrafficEnable, "controller_granted", map[string]any{"lease_id": lease.LeaseID, "term": lease.Term}); err != nil {
+	if err := manager.transitionAfterEffect(ctx, id, PhaseControllerHandoff, PhaseTrafficEnable, "controller_granted", map[string]any{"lease_id": lease.LeaseID, "term": lease.Term}); err != nil {
 		return nil, err
 	}
 	if err := manager.Runtime.EnableTraffic(ctx, transaction.TargetSlot); err != nil {
-		return nil, manager.rollbackOrFence(ctx, *transaction, err)
+		return nil, manager.effectFailure(ctx, id, PhaseTrafficEnable, err)
 	}
-	if _, err := manager.transition(ctx, id, PhaseTrafficEnable, PhaseActiveSwitch, "traffic_enabled", nil); err != nil {
+	observation, err = manager.observe(ctx, id)
+	if err != nil {
+		return nil, manager.effectFailure(ctx, id, PhaseTrafficEnable, err)
+	}
+	target, ok = observation.Slots[transaction.TargetSlot]
+	if !validObservation(observation, manager.Clock().UTC()) || !ok || !target.ControllerOwned || !target.TrafficAccepting {
+		return nil, manager.effectFailure(ctx, id, PhaseTrafficEnable, errors.New("candidate traffic role was not observed"))
+	}
+	if err := manager.transitionAfterEffect(ctx, id, PhaseTrafficEnable, PhaseActiveSwitch, "traffic_enabled", nil); err != nil {
 		return nil, err
 	}
 	if err := manager.Runtime.SwitchActive(ctx, transaction.TargetSlot); err != nil {
 		return nil, manager.rollbackOrFence(ctx, *transaction, err)
 	}
+	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
+		if err := manager.Runtime.DisableTraffic(ctx, transaction.PreviousSlot); err != nil {
+			return nil, manager.effectFailure(ctx, id, PhaseActiveSwitch, err)
+		}
+	}
 	observation, err = manager.observe(ctx, id)
 	if err != nil {
 		return nil, manager.rollbackOrFence(ctx, *transaction, err)
 	}
 	target, ok = observation.Slots[transaction.TargetSlot]
-	if !ok || observation.ActiveSlot != transaction.TargetSlot || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned {
+	if !validObservation(observation, manager.Clock().UTC()) || !ok || observation.ActiveSlot != transaction.TargetSlot || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || !target.TrafficAccepting {
 		return nil, manager.rollbackOrFence(ctx, *transaction, errors.New("active switch was not verified"))
 	}
-	if _, err := manager.transition(ctx, id, PhaseActiveSwitch, PhaseDrainOld, "active_switched", map[string]any{"active_slot": transaction.TargetSlot}); err != nil {
+	if err := manager.transitionAfterEffect(ctx, id, PhaseActiveSwitch, PhaseDrainOld, "active_switched", map[string]any{"active_slot": transaction.TargetSlot}); err != nil {
 		return nil, err
 	}
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
 		if err := manager.Runtime.Drain(ctx, transaction.PreviousSlot); err != nil {
-			return nil, manager.rollbackOrFence(ctx, *transaction, err)
+			return nil, manager.effectFailure(ctx, id, PhaseDrainOld, err)
 		}
 	}
-	if _, err := manager.transition(ctx, id, PhaseDrainOld, PhaseQuiescence, "drain_started", nil); err != nil {
+	if err := manager.transitionAfterEffect(ctx, id, PhaseDrainOld, PhaseQuiescence, "drain_started", nil); err != nil {
 		return nil, err
 	}
 	if err := manager.Runtime.Quiesce(ctx, transaction.PreviousSlot); err != nil {
-		return nil, manager.rollbackOrFence(ctx, *transaction, err)
+		return nil, manager.effectFailure(ctx, id, PhaseQuiescence, err)
 	}
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
 		if err := manager.Runtime.Stop(ctx, transaction.PreviousSlot); err != nil {
-			return nil, manager.rollbackOrFence(ctx, *transaction, err)
+			return nil, manager.effectFailure(ctx, id, PhaseQuiescence, err)
 		}
 	}
 	observation, err = manager.observe(ctx, id)
@@ -310,10 +335,14 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 		return nil, manager.rollbackOrFence(ctx, *transaction, err)
 	}
 	target, ok = observation.Slots[transaction.TargetSlot]
-	if !ok || observation.ActiveSlot != transaction.TargetSlot || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned {
+	old, oldOK := observation.Slots[transaction.PreviousSlot]
+	if !validObservation(observation, manager.Clock().UTC()) || !ok || observation.ActiveSlot != transaction.TargetSlot || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || !target.TrafficAccepting || (oldOK && (old.ProcessUp || old.TrafficAccepting || old.InFlightRequests != 0 || old.NativeWorkers != 0 || old.PendingOperations != 0)) {
 		return nil, manager.rollbackOrFence(ctx, *transaction, errors.New("final active slot was not verified"))
 	}
-	updated, err := manager.transition(ctx, id, PhaseQuiescence, PhaseFinalize, "finalized", map[string]any{"quiescent": true})
+	if err := manager.transitionAfterEffect(ctx, id, PhaseQuiescence, PhaseFinalize, "finalized", map[string]any{"quiescent": true}); err != nil {
+		return nil, err
+	}
+	updated, err := manager.Store.Get(ctx, id)
 	return updated, err
 }
 
@@ -357,7 +386,7 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 		if observeErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), false) {
 			return nil, errors.New("recovery evidence is not sufficient to finalize")
 		}
-		if err := manager.Runtime.RevokeController(ctx, otherSlot(transaction.TargetSlot)); err != nil {
+		if err := manager.Runtime.RevokeController(ctx, otherSlot(transaction.TargetSlot), manager.nextFenceTerm()); err != nil {
 			return nil, fmt.Errorf("fence the non-selected slot before recovery finalize: %w", err)
 		}
 		lease := manager.newLease(transaction.TargetSlot, transaction.Generation)
@@ -477,8 +506,13 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	if observation.ActiveSlot == "blue" {
 		other = "green"
 	}
-	if err := manager.Runtime.RevokeController(ctx, other); err != nil {
-		return fmt.Errorf("fence inactive controller: %w", err)
+	if inactive, inactiveOK := observation.Slots[other]; inactiveOK && inactive.ProcessUp {
+		if err := manager.Runtime.DisableTraffic(ctx, other); err != nil {
+			return fmt.Errorf("disable inactive traffic role: %w", err)
+		}
+		if err := manager.Runtime.RevokeController(ctx, other, manager.nextFenceTerm()); err != nil {
+			return fmt.Errorf("fence inactive controller: %w", err)
+		}
 	}
 	generation := int64(1)
 	for _, transaction := range transactions {
@@ -491,13 +525,22 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	if err := manager.Runtime.GrantController(ctx, observation.ActiveSlot, lease); err != nil {
 		return fmt.Errorf("grant active controller: %w", err)
 	}
+	if err := manager.Runtime.EnableTraffic(ctx, observation.ActiveSlot); err != nil {
+		disableErr := manager.Runtime.DisableTraffic(ctx, observation.ActiveSlot)
+		fenceErr := manager.fenceSlots(ctx, errors.New("active traffic role could not be established"))
+		if disableErr != nil {
+			return fmt.Errorf("enable active traffic: %w; disable after failure: %v; %v", err, disableErr, fenceErr)
+		}
+		return fmt.Errorf("enable active traffic: %w; %v", err, fenceErr)
+	}
 	return nil
 }
 
 func (manager *Manager) fenceSlots(ctx context.Context, cause error) error {
 	var first error
+	fenceTerm := manager.nextFenceTerm()
 	for _, slot := range []string{"blue", "green"} {
-		if err := manager.Runtime.RevokeController(ctx, slot); err != nil && first == nil {
+		if err := manager.Runtime.RevokeController(ctx, slot, fenceTerm); err != nil && first == nil {
 			first = err
 		}
 	}
@@ -521,11 +564,15 @@ func (manager *Manager) observe(ctx context.Context, transactionID string) (Runt
 	if observation.Slots == nil {
 		observation.Slots = map[string]SlotObservation{}
 	}
+	payload := map[string]any{"active_slot": observation.ActiveSlot, "controller_slot": observation.ControllerSlot, "consistent": observation.Consistent, "observed_at": observation.ObservedAt, "fresh_until": observation.FreshUntil, "slots": observation.Slots, "sources": observation.Sources}
+	encoded, _ := json.Marshal(payload)
+	digest := sha256.Sum256(encoded)
+	value := store.Observation{ObservedAt: observation.ObservedAt, FreshUntil: observation.FreshUntil, Digest: hex.EncodeToString(digest[:]), Payload: payload}
+	if err := manager.Store.SaveObservation(ctx, store.LatestObservationID, value); err != nil {
+		return RuntimeSnapshot{}, err
+	}
 	if transactionID != "" {
-		payload := map[string]any{"active_slot": observation.ActiveSlot, "consistent": observation.Consistent, "slots": observation.Slots}
-		encoded, _ := json.Marshal(payload)
-		digest := sha256.Sum256(encoded)
-		if err := manager.Store.SaveObservation(ctx, transactionID, store.Observation{ObservedAt: observation.ObservedAt, FreshUntil: observation.FreshUntil, Digest: hex.EncodeToString(digest[:]), Payload: payload}); err != nil {
+		if err := manager.Store.SaveObservation(ctx, transactionID, value); err != nil {
 			return RuntimeSnapshot{}, err
 		}
 	}
@@ -550,6 +597,23 @@ func (manager *Manager) failure(ctx context.Context, id, phase string, cause err
 	return cause
 }
 
+func (manager *Manager) effectFailure(ctx context.Context, id, phase string, cause error) error {
+	failureErr := manager.failure(ctx, id, phase, &UncertainError{Cause: cause})
+	fenceErr := manager.fenceSlots(ctx, errors.New("deployment runtime effect failed; controller roles were fenced"))
+	if fenceErr != nil {
+		return fmt.Errorf("%w; %v", failureErr, fenceErr)
+	}
+	return failureErr
+}
+
+func (manager *Manager) transitionAfterEffect(ctx context.Context, id, expected, phase, transition string, evidence map[string]any) error {
+	if _, err := manager.transition(ctx, id, expected, phase, transition, evidence); err == nil {
+		return nil
+	} else {
+		return manager.effectFailure(ctx, id, expected, &UncertainError{Cause: fmt.Errorf("persist deployment phase %s: %w", phase, err)})
+	}
+}
+
 func (manager *Manager) rollbackOrFence(ctx context.Context, transaction store.Transaction, cause error) error {
 	if errors.Is(cause, ErrUncertain) || errors.As(cause, new(*UncertainError)) {
 		failureErr := manager.failure(ctx, transaction.ID, transaction.Phase, cause)
@@ -562,6 +626,11 @@ func (manager *Manager) rollbackOrFence(ctx context.Context, transaction store.T
 	if transaction.RollbackUsed {
 		return manager.failure(ctx, transaction.ID, transaction.Phase, cause)
 	}
+	if current, err := manager.Store.Get(ctx, transaction.ID); err != nil {
+		return err
+	} else if current != nil {
+		transaction = *current
+	}
 	if err := manager.rollback(ctx, transaction); err != nil {
 		return err
 	}
@@ -569,15 +638,12 @@ func (manager *Manager) rollbackOrFence(ctx context.Context, transaction store.T
 }
 
 func (manager *Manager) rollback(ctx context.Context, transaction store.Transaction) error {
-	if err := manager.Store.SetRollbackUsed(ctx, transaction.ID, manager.Clock().UTC()); err != nil {
-		return err
-	}
-	if _, err := manager.transition(ctx, transaction.ID, transaction.Phase, PhaseRollback, "rollback_started", map[string]any{"bounded": true}); err != nil {
-		return err
-	}
-	lease := controllerrole.Lease{}
+	lease := controllerrole.Lease{Slot: transaction.TargetSlot, Term: manager.nextFenceTerm()}
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
 		lease = manager.newLease(transaction.PreviousSlot, transaction.Generation)
+	}
+	if _, err := manager.Store.BeginRollback(ctx, transaction.ID, transaction.Phase, PhaseRollback, "rollback_started", "deployd", map[string]any{"bounded": true}, manager.Clock().UTC()); err != nil {
+		return err
 	}
 	if err := manager.Runtime.Rollback(ctx, transaction.TargetSlot, transaction.PreviousSlot, lease); err != nil {
 		failureErr := manager.failure(ctx, transaction.ID, PhaseRollback, err)
@@ -596,21 +662,41 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 		fenceErr := manager.fenceSlots(ctx, errors.New("rollback verification failed; controller roles were fenced"))
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)
 	}
-	_, err := manager.transition(ctx, transaction.ID, PhaseRollback, PhaseFinalize, "rolled_back", map[string]any{"active_slot": transaction.PreviousSlot})
-	return err
+	return manager.transitionAfterEffect(ctx, transaction.ID, PhaseRollback, PhaseFinalize, "rolled_back", map[string]any{"active_slot": transaction.PreviousSlot})
 }
 
 func (manager *Manager) newLease(slot string, generation int64) controllerrole.Lease {
 	manager.term++
-	return controllerrole.Lease{Slot: slot, Term: manager.term, LeaseID: newID("lease"), Expiry: manager.Clock().Add(manager.LeaseDuration), Generation: generation, Nonce: newID("nonce")}
+	return controllerrole.Lease{Slot: slot, Term: manager.term, LeaseID: newID("lease"), Expiry: manager.Clock().Add(manager.LeaseDuration), Generation: generation, Nonce: newID("nonce"), OwnerPID: os.Getpid()}
+}
+
+func (manager *Manager) nextFenceTerm() uint64 {
+	manager.term++
+	return manager.term
 }
 
 func recoveryTargetVerified(observation RuntimeSnapshot, transaction store.Transaction, now time.Time, requireController bool) bool {
-	if !observation.Consistent || observation.ActiveSlot != transaction.TargetSlot || observation.FreshUntil.IsZero() || !observation.FreshUntil.After(now) {
+	if !validObservation(observation, now) || observation.ActiveSlot != transaction.TargetSlot {
 		return false
 	}
 	target, ok := observation.Slots[transaction.TargetSlot]
-	return ok && target.ProcessUp && target.ProcessReady && target.Ready && (!requireController || target.ControllerOwned)
+	if !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.TrafficAccepting || target.StateEpoch == "" || (requireController && !target.ControllerOwned) {
+		return false
+	}
+	old, oldOK := observation.Slots[transaction.PreviousSlot]
+	return !oldOK || (!old.TrafficAccepting && old.InFlightRequests == 0 && old.NativeWorkers == 0 && old.PendingOperations == 0)
+}
+
+func validObservation(observation RuntimeSnapshot, now time.Time) bool {
+	if !observation.Consistent || observation.ObservedAt.IsZero() || observation.FreshUntil.IsZero() || !observation.FreshUntil.After(now) || len(observation.Sources) == 0 {
+		return false
+	}
+	for _, source := range observation.Sources {
+		if !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) || source.ObservedAt.Before(observation.ObservedAt.Add(-2*time.Second)) {
+			return false
+		}
+	}
+	return true
 }
 
 func otherSlot(slot string) string {

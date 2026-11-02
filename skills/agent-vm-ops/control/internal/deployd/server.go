@@ -14,8 +14,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd/store"
 	"github.com/gin-gonic/gin"
 )
 
@@ -141,13 +143,46 @@ func (server *Server) Sample(ctx context.Context) error {
 	return nil
 }
 
+// RestoreLatest restores the last persisted observation before the first live
+// sample. Its freshness bound is preserved, so an expired snapshot is visible
+// as stale rather than being presented as a fresh observation.
+func (server *Server) RestoreLatest(ctx context.Context) error {
+	observation, err := server.Manager.Store.Observation(ctx, store.LatestObservationID)
+	if err != nil {
+		return err
+	}
+	if observation == nil {
+		return nil
+	}
+	encoded, err := json.Marshal(observation.Payload)
+	if err != nil {
+		return err
+	}
+	var snapshot RuntimeSnapshot
+	if err := json.Unmarshal(encoded, &snapshot); err != nil {
+		return fmt.Errorf("decode persisted deployd observation: %w", err)
+	}
+	if snapshot.ObservedAt.IsZero() || snapshot.FreshUntil.IsZero() {
+		return errors.New("persisted deployd observation has no freshness timestamps")
+	}
+	server.mu.Lock()
+	server.latest = snapshot
+	server.Metrics.Set(snapshot)
+	server.mu.Unlock()
+	return nil
+}
+
 func (server *Server) status(c *gin.Context) {
 	status, err := server.Manager.Status(c.Request.Context())
 	if err != nil {
 		writeError(c, http.StatusServiceUnavailable, "observation_unavailable", err.Error())
 		return
 	}
-	writeOK(c, status)
+	transactions := make([]map[string]any, 0, len(status.Transactions))
+	for index := range status.Transactions {
+		transactions = append(transactions, publicTransaction(status.Transactions[index]))
+	}
+	writeOK(c, map[string]any{"observation": status.Observed, "transactions": transactions})
 }
 
 func (server *Server) transaction(c *gin.Context) {
@@ -155,6 +190,9 @@ func (server *Server) transaction(c *gin.Context) {
 	if err != nil {
 		writeError(c, http.StatusNotFound, "transaction_not_found", err.Error())
 		return
+	}
+	if transaction, ok := value["transaction"].(*store.Transaction); ok && transaction != nil {
+		value["transaction"] = publicTransaction(*transaction)
 	}
 	writeOK(c, value)
 }
@@ -176,6 +214,8 @@ func (server *Server) plan(c *gin.Context) {
 		writeError(c, http.StatusConflict, "plan_rejected", err.Error())
 		return
 	}
+	delete(result, "bundle")
+	result["bundle_present"] = value.Bundle != ""
 	writeOK(c, result)
 }
 
@@ -189,7 +229,7 @@ func (server *Server) stage(c *gin.Context) {
 		writeError(c, http.StatusConflict, "stage_rejected", err.Error())
 		return
 	}
-	writeOK(c, transaction)
+	writeOK(c, publicTransaction(*transaction))
 }
 
 func (server *Server) verify(c *gin.Context) {
@@ -202,7 +242,7 @@ func (server *Server) verify(c *gin.Context) {
 		writeError(c, http.StatusConflict, "verify_rejected", err.Error())
 		return
 	}
-	writeOK(c, transaction)
+	writeOK(c, publicTransaction(*transaction))
 }
 
 func (server *Server) activate(c *gin.Context) {
@@ -219,7 +259,7 @@ func (server *Server) activate(c *gin.Context) {
 		writeError(c, http.StatusConflict, "activate_rejected", err.Error())
 		return
 	}
-	writeOK(c, transaction)
+	writeOK(c, publicTransaction(*transaction))
 }
 
 func (server *Server) rollback(c *gin.Context) {
@@ -232,7 +272,7 @@ func (server *Server) rollback(c *gin.Context) {
 		writeError(c, http.StatusConflict, "rollback_rejected", err.Error())
 		return
 	}
-	writeOK(c, transaction)
+	writeOK(c, publicTransaction(*transaction))
 }
 
 func (server *Server) recover(c *gin.Context) {
@@ -245,7 +285,7 @@ func (server *Server) recover(c *gin.Context) {
 		writeError(c, http.StatusConflict, "recover_rejected", err.Error())
 		return
 	}
-	writeOK(c, transaction)
+	writeOK(c, publicTransaction(*transaction))
 }
 
 func decodeRequest(c *gin.Context, target any) bool {
@@ -270,7 +310,56 @@ func writeOK(c *gin.Context, value any) {
 }
 
 func writeError(c *gin.Context, status int, code, message string) {
-	c.JSON(status, map[string]any{"ok": false, "error": map[string]any{"code": code, "message": message}})
+	c.JSON(status, map[string]any{"ok": false, "error": map[string]any{"code": code, "message": publicErrorMessage(code, message)}})
+}
+
+func publicErrorMessage(code, fallback string) string {
+	switch code {
+	case "observation_unavailable":
+		return "deployment observation is unavailable"
+	case "transaction_not_found":
+		return "deployment transaction was not found"
+	case "plan_rejected":
+		return "deployment plan was rejected"
+	case "stage_rejected":
+		return "deployment stage was rejected"
+	case "verify_rejected":
+		return "deployment verification was rejected"
+	case "activate_rejected":
+		return "deployment activation was rejected"
+	case "rollback_rejected":
+		return "deployment rollback was rejected"
+	case "recover_rejected":
+		return "deployment recovery was rejected"
+	case "state_unverified":
+		return "deployment state could not be verified"
+	default:
+		if strings.Contains(fallback, "/") || strings.Contains(strings.ToLower(fallback), "systemctl") {
+			return "deployd operation failed"
+		}
+		return fallback
+	}
+}
+
+func publicTransaction(transaction store.Transaction) map[string]any {
+	errorCode := transaction.ErrorCode
+	if errorCode == "" {
+		errorCode = "none"
+	}
+	return map[string]any{
+		"transaction_id":    transaction.ID,
+		"target_slot":       transaction.TargetSlot,
+		"previous_slot":     transaction.PreviousSlot,
+		"phase":             transaction.Phase,
+		"state":             transaction.State,
+		"generation":        transaction.Generation,
+		"rollback_used":     transaction.RollbackUsed,
+		"recovery_required": transaction.RecoveryRequired,
+		"error_code":        errorCode,
+		"error_message":     publicErrorMessage(transaction.ErrorCode, transaction.ErrorMessage),
+		"created_at":        transaction.CreatedAt,
+		"updated_at":        transaction.UpdatedAt,
+	}
 }
 
 func ServeUDS(ctx context.Context, socket string, handler http.Handler) error {
@@ -284,8 +373,16 @@ func ServeUDS(ctx context.Context, socket string, handler http.Handler) error {
 		if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
 			return errors.New("deployd socket path is not a socket")
 		}
-		if err := os.Remove(socket); err != nil {
-			return err
+		probe, probeErr := net.DialTimeout("unix", socket, 200*time.Millisecond)
+		if probeErr == nil {
+			_ = probe.Close()
+			return errors.New("deployd socket is already present; refusing to replace an existing listener")
+		}
+		if !errors.Is(probeErr, syscall.ECONNREFUSED) && !errors.Is(probeErr, syscall.ENOENT) {
+			return fmt.Errorf("deployd socket is already present and could not be probed: %w", probeErr)
+		}
+		if err := os.Remove(socket); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove stale deployd socket: %w", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
@@ -298,6 +395,17 @@ func ServeUDS(ctx context.Context, socket string, handler http.Handler) error {
 		_ = listener.Close()
 		return err
 	}
+	ownedInfo, err := os.Stat(socket)
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
+	defer func() {
+		currentInfo, statErr := os.Stat(socket)
+		if statErr == nil && os.SameFile(ownedInfo, currentInfo) {
+			_ = os.Remove(socket)
+		}
+	}()
 	wrapped := &peerListener{Listener: listener}
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, MaxHeaderBytes: 8 * 1024, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 		if peer, ok := conn.(*peerConn); ok {

@@ -3,7 +3,9 @@ package controllerrole
 import (
 	"errors"
 	"fmt"
+	"os"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -23,6 +25,7 @@ type Lease struct {
 	Expiry     time.Time `json:"expiry"`
 	Generation int64     `json:"generation"`
 	Nonce      string    `json:"nonce"`
+	OwnerPID   int       `json:"owner_pid,omitempty"`
 }
 
 type Command struct {
@@ -47,6 +50,7 @@ type Gate struct {
 	mu    sync.RWMutex
 	lease Lease
 	valid bool
+	term  uint64
 
 	changed chan struct{}
 }
@@ -65,11 +69,12 @@ func (gate *Gate) Grant(lease Lease) error {
 	}
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
-	if gate.valid && gate.lease.LeaseID != lease.LeaseID && lease.Term <= gate.lease.Term {
+	if lease.Term <= gate.term {
 		return fmt.Errorf("%w: term is not newer", ErrLeaseMismatch)
 	}
 	gate.lease = lease
 	gate.valid = true
+	gate.term = lease.Term
 	gate.signalLocked()
 	return nil
 }
@@ -77,14 +82,23 @@ func (gate *Gate) Grant(lease Lease) error {
 func (gate *Gate) Revoke(lease Lease) error {
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
+	if lease.Slot != gate.slot || lease.Term == 0 {
+		return ErrInvalidLease
+	}
 	if !gate.valid {
+		if lease.Term > gate.term {
+			gate.term = lease.Term
+		}
 		return nil
 	}
-	if lease.LeaseID != "" && lease.LeaseID != gate.lease.LeaseID || lease.Term != 0 && lease.Term != gate.lease.Term {
+	if lease.Term < gate.lease.Term || lease.Term == gate.lease.Term && lease.LeaseID != "" && lease.LeaseID != gate.lease.LeaseID {
 		return ErrLeaseMismatch
 	}
 	gate.valid = false
 	gate.lease = Lease{}
+	if lease.Term > gate.term {
+		gate.term = lease.Term
+	}
 	gate.signalLocked()
 	return nil
 }
@@ -95,13 +109,24 @@ func (gate *Gate) Valid() bool {
 	if !gate.valid {
 		return false
 	}
-	if !gate.lease.Expiry.After(gate.clock()) {
+	if !gate.lease.Expiry.After(gate.clock()) || !ownerAlive(gate.lease.OwnerPID) {
 		gate.valid = false
 		gate.lease = Lease{}
 		gate.signalLocked()
 		return false
 	}
 	return true
+}
+
+func ownerAlive(pid int) bool {
+	if pid <= 0 {
+		return true
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return process.Signal(syscall.Signal(0)) == nil
 }
 
 func (gate *Gate) Snapshot() (Lease, bool) {

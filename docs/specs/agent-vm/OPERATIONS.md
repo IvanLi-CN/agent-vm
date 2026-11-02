@@ -54,7 +54,7 @@ Backup 必须记录不早于最后可信提交的 coverage boundary；随后用�
 迁移或恢复事务未进入 `finalized` 前禁止删除任何恢复材料。
 进入 `finalized` 后，只有在新的隔离恢复验证完成、没有 pending/unknown operation 或未解决的 `needs_recovery`、迁移源保留期已到期，并且清理后仍保留两个可验证恢复点时，材料才可进入 `purge_eligible`。
 
-唯一持有 active controller role 的 `deployd` 在每次成功备份后和每小时执行 retention worker。
+状态迁移或灾难恢复流程的 retention worker 在每次成功备份后和每小时执行清理；蓝绿 Deployd 不读取、创建或删除这些业务恢复材料。
 它按数量、年龄或总字节预算任一超限清理最旧的可删除材料。
 清理后仍无空间时，报告 `backup_storage_exhausted` 并拒绝新的备份或状态迁移，不删除受保护恢复点，也不影响正常蓝绿切换。
 

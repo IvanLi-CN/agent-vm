@@ -41,29 +41,37 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		active = "unknown"
 	}
 	snapshot := RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(2 * runtime.Config.ObserveInterval()), ActiveSlot: active, ControllerSlot: "none", Consistent: activeErr == nil, Slots: map[string]SlotObservation{}, Sources: map[string]SourceObservation{}}
-	setSource := func(name string, up bool, cause error) {
-		observation := SourceObservation{Up: up, ObservedAt: now}
+	sourceTimes := map[string]time.Time{}
+	setSource := func(name string, observedAt time.Time, up bool, cause error) {
+		if observedAt.IsZero() {
+			observedAt = now
+		}
+		observation := SourceObservation{Up: up, ObservedAt: observedAt}
 		if cause != nil {
 			observation.Error = cause.Error()
 		}
 		snapshot.Sources[name] = observation
 	}
 	if activeErr != nil {
-		setSource("active_link", false, activeErr)
+		setSource("active_link", now, false, activeErr)
 	} else {
-		setSource("active_link", true, nil)
+		setSource("active_link", now, true, nil)
 	}
 	slotContractsUp := true
 	nativeObservationUp := true
 	inventoryObservationUp := true
 	for _, slot := range []string{"blue", "green"} {
-		observation := SlotObservation{Slot: slot, TrafficAccepting: slot == active, ObservedUnix: now.Unix()}
+		observation := SlotObservation{Slot: slot, ObservedUnix: now.Unix()}
 		body, status, requestErr := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil)
-		if requestErr != nil {
+		if requestErr != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) {
+			if requestErr == nil {
+				requestErr = fmt.Errorf("slot %s health returned HTTP %d or an invalid health envelope", slot, status)
+			}
 			if slot == active || active == "none" || active == "unknown" {
 				slotContractsUp = false
 				snapshot.Consistent = false
 			}
+			runtime.clearSlotMetrics(slot)
 			observation.MetricFamilies = runtime.slotMetrics(slot)
 			snapshot.Slots[slot] = observation
 			continue
@@ -82,37 +90,63 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		observation.ProcessReady = processReady
 		observation.Ready, _ = body["ready"].(bool)
 		observation.ControllerOwned, _ = body["controller_owned"].(bool)
-		if metrics, metricsStatus, metricsErr := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "admin-metrics"}); metricsErr == nil && metricsStatus < 500 {
-			result, _ := metrics["result"].(map[string]any)
-			runtime.rememberMetrics(slot, "capacity", observe.MetricsForSnapshot("capacity", result))
-			observation.InFlightRequests = integer(result["in_flight_operations"])
-			observation.PendingOperations = arrayLength(result["pending_operations"])
-			observation.NativeWorkers = nativeWorkerCount(result["pending_operations"])
-			if doctor, ok := result["doctor"].(map[string]any); ok {
-				if epoch, ok := doctor["state_epoch"].(string); ok {
-					observation.StateEpoch = epoch
-				}
-			}
+		observation.TrafficAccepting, _ = body["traffic_accepting"].(bool)
+		observation.ReleaseID, _ = body["release_id"].(string)
+		observation.SourceRevision, _ = body["source_revision"].(string)
+		metrics, metricsAt, metricsErr := runtime.observeSource(ctx, slot, "capacity", "admin-metrics")
+		if metricsErr == nil {
+			runtime.rememberMetrics(slot, "capacity", observe.MetricsForSnapshot("capacity", metrics))
+			observation.InFlightRequests, _ = integerValue(metrics["in_flight_operations"])
+			observation.PendingOperations, _ = arrayLengthValue(metrics["pending_operations"])
+			observation.NativeWorkers = nativeWorkerCount(metrics["pending_operations"])
+			observation.StateEpoch, _ = metrics["observation_epoch"].(string)
+			sourceTimes["native_observation"] = minTime(sourceTimes["native_observation"], metricsAt)
 		} else {
 			nativeObservationUp = false
 			runtime.invalidateMetrics(slot, "capacity")
 			snapshot.Consistent = false
 		}
-		if inventory, inventoryStatus, inventoryErr := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "admin-status"}); inventoryErr != nil || inventoryStatus >= 500 {
+		inventory, inventoryAt, inventoryErr := runtime.observeSource(ctx, slot, "inventory", "admin-status")
+		if inventoryErr != nil {
 			inventoryObservationUp = false
 			runtime.invalidateMetrics(slot, "inventory")
 			snapshot.Consistent = false
-		} else if result, ok := inventory["result"].(map[string]any); ok {
-			runtime.rememberMetrics(slot, "inventory", observe.MetricsForSnapshot("inventory", result))
+		} else {
+			runtime.rememberMetrics(slot, "inventory", observe.MetricsForSnapshot("inventory", inventory))
+			sourceTimes["inventory_observation"] = minTime(sourceTimes["inventory_observation"], inventoryAt)
 		}
-		if doctor, doctorStatus, doctorErr := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "doctor"}); doctorErr != nil || doctorStatus >= 500 {
+		doctor, doctorAt, doctorErr := runtime.observeSource(ctx, slot, "health", "doctor")
+		if doctorErr != nil {
 			nativeObservationUp = false
 			runtime.invalidateMetrics(slot, "health")
 			snapshot.Consistent = false
-		} else if result, ok := doctor["result"].(map[string]any); ok {
-			health := cloneMap(result)
+		} else {
+			doctorValid := true
+			doctorEpoch, epochOK := doctor["state_epoch"].(string)
+			if !epochOK || doctorEpoch == "" || (observation.StateEpoch != "" && doctorEpoch != observation.StateEpoch) {
+				doctorValid = false
+				nativeObservationUp = false
+				snapshot.Consistent = false
+				runtime.invalidateMetrics(slot, "health")
+			} else if observation.StateEpoch == "" {
+				observation.StateEpoch = doctorEpoch
+			}
+			health := cloneMap(doctor)
 			health["up"] = true
-			runtime.rememberMetrics(slot, "health", observe.MetricsForSnapshot("health", health))
+			if doctorValid {
+				runtime.rememberMetrics(slot, "health", observe.MetricsForSnapshot("health", health))
+			}
+			sourceTimes["native_observation"] = minTime(sourceTimes["native_observation"], doctorAt)
+		}
+		drainStatus, _, drainErr := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-status"})
+		if drainErr != nil {
+			nativeObservationUp = false
+			snapshot.Consistent = false
+		} else if result, ok := drainStatus["result"].(map[string]any); ok {
+			observation.StateCapabilities = stringSlice(result["state_capabilities"])
+		} else {
+			nativeObservationUp = false
+			snapshot.Consistent = false
 		}
 		observation.MetricFamilies = runtime.slotMetrics(slot)
 		snapshot.Slots[slot] = observation
@@ -129,19 +163,19 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		snapshot.Consistent = false
 	}
 	if !slotContractsUp {
-		setSource("slot_contracts", false, errors.New("one or more slot health contracts could not be observed"))
+		setSource("slot_contracts", now, false, errors.New("one or more slot health contracts could not be observed"))
 	} else {
-		setSource("slot_contracts", true, nil)
+		setSource("slot_contracts", now, true, nil)
 	}
 	if !nativeObservationUp {
-		setSource("native_observation", false, errors.New("one or more native observation lanes failed"))
+		setSource("native_observation", sourceTimes["native_observation"], false, errors.New("one or more native observation lanes failed"))
 	} else {
-		setSource("native_observation", true, nil)
+		setSource("native_observation", sourceTimes["native_observation"], true, nil)
 	}
 	if !inventoryObservationUp {
-		setSource("inventory_observation", false, errors.New("one or more inventory observation lanes failed"))
+		setSource("inventory_observation", sourceTimes["inventory_observation"], false, errors.New("one or more inventory observation lanes failed"))
 	} else {
-		setSource("inventory_observation", true, nil)
+		setSource("inventory_observation", sourceTimes["inventory_observation"], true, nil)
 	}
 	return snapshot, nil
 }
@@ -157,6 +191,12 @@ func (runtime *HostRuntime) rememberMetrics(slot, source string, families map[st
 
 func (runtime *HostRuntime) invalidateMetrics(slot, source string) {
 	runtime.rememberMetrics(slot, source, nil)
+}
+
+func (runtime *HostRuntime) clearSlotMetrics(slot string) {
+	runtime.mu.Lock()
+	delete(runtime.metrics, slot)
+	runtime.mu.Unlock()
 }
 
 func (runtime *HostRuntime) slotMetrics(slot string) map[string]string {
@@ -543,7 +583,7 @@ func (runtime *HostRuntime) GrantController(ctx context.Context, slot string, le
 	if err != nil {
 		return err
 	}
-	if status >= 300 {
+	if status != http.StatusOK || !responseOK(body) {
 		return fmt.Errorf("slot %s rejected controller lease with HTTP %d", slot, status)
 	}
 	valid, ok := body["valid"].(bool)
@@ -553,26 +593,52 @@ func (runtime *HostRuntime) GrantController(ctx context.Context, slot string, le
 	return nil
 }
 
-func (runtime *HostRuntime) RevokeController(ctx context.Context, slot string) error {
+func (runtime *HostRuntime) RevokeController(ctx context.Context, slot string, term uint64) error {
 	if slot == "" || slot == "none" {
 		return nil
 	}
-	_, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, "/internal/v1/controller-role", map[string]any{"action": "revoke", "lease": map[string]any{"slot": slot}})
+	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, "/internal/v1/controller-role", map[string]any{"action": "revoke", "lease": map[string]any{"slot": slot, "term": term}})
 	if err != nil {
 		return err
 	}
-	if status >= 300 {
+	if status != http.StatusOK || !responseOK(body) {
 		return fmt.Errorf("slot %s rejected controller revoke with HTTP %d", slot, status)
 	}
 	return nil
 }
 
 func (runtime *HostRuntime) EnableTraffic(ctx context.Context, slot string) error {
-	_, err := runtime.activeSlot()
+	if err := validSlot(slot); err != nil {
+		return err
+	}
+	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, "/internal/v1/traffic-role", map[string]any{"action": "enable"})
 	if err != nil {
 		return err
 	}
-	return validSlot(slot)
+	if status != http.StatusOK || !responseOK(body) {
+		return fmt.Errorf("slot %s rejected traffic role with HTTP %d", slot, status)
+	}
+	if accepting, ok := body["traffic_accepting"].(bool); !ok || !accepting {
+		return fmt.Errorf("slot %s did not confirm traffic role", slot)
+	}
+	return nil
+}
+
+func (runtime *HostRuntime) DisableTraffic(ctx context.Context, slot string) error {
+	if slot == "" || slot == "none" {
+		return nil
+	}
+	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, "/internal/v1/traffic-role", map[string]any{"action": "disable"})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK || !responseOK(body) {
+		return fmt.Errorf("slot %s rejected traffic disable with HTTP %d", slot, status)
+	}
+	if accepting, ok := body["traffic_accepting"].(bool); !ok || accepting {
+		return fmt.Errorf("slot %s did not confirm traffic was disabled", slot)
+	}
+	return nil
 }
 
 func (runtime *HostRuntime) SwitchActive(ctx context.Context, slot string) error {
@@ -614,11 +680,11 @@ func (runtime *HostRuntime) Drain(ctx context.Context, slot string) error {
 	if slot == "" || slot == "none" {
 		return nil
 	}
-	_, status, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-enter", "operation_id": "deployd-drain-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0)})
+	statusBody, status, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-enter", "operation_id": "deployd-drain-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0)})
 	if err != nil {
 		return err
 	}
-	if status >= 300 {
+	if status != http.StatusOK || !responseOK(statusBody) {
 		return fmt.Errorf("slot %s rejected drain with HTTP %d", slot, status)
 	}
 	return nil
@@ -632,22 +698,35 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 	if err != nil {
 		return err
 	}
-	if statusCode >= 300 {
+	if statusCode != http.StatusOK {
 		return fmt.Errorf("slot %s drain status returned HTTP %d", slot, statusCode)
 	}
-	result, _ := status["result"].(map[string]any)
-	if draining, _ := result["draining"].(bool); !draining {
+	result, ok := status["result"].(map[string]any)
+	if !ok {
+		return errors.New("old slot drain status result is missing")
+	}
+	draining, ok := result["draining"].(bool)
+	if !ok || !draining {
 		return errors.New("old slot is not fenced for drain")
 	}
 	metrics, metricsCode, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "admin-metrics"})
 	if err != nil {
 		return err
 	}
-	if metricsCode >= 300 {
+	if metricsCode != http.StatusOK {
 		return fmt.Errorf("slot %s metrics returned HTTP %d", slot, metricsCode)
 	}
-	value, _ := metrics["result"].(map[string]any)
-	if arrayLength(value["pending_operations"]) != 0 || integer(value["in_flight_operations"]) != 0 || arrayLength(value["historical_unknown_operations"]) != 0 {
+	value, ok := metrics["result"].(map[string]any)
+	if !ok {
+		return errors.New("old slot metrics result is missing")
+	}
+	pending, pendingOK := arrayLengthValue(value["pending_operations"])
+	inFlight, inFlightOK := integerValue(value["in_flight_operations"])
+	unknown, unknownOK := arrayLengthValue(value["historical_unknown_operations"])
+	if !pendingOK || !inFlightOK || !unknownOK {
+		return errors.New("old slot quiescence counters are incomplete")
+	}
+	if pending != 0 || inFlight != 0 || unknown != 0 {
 		return errors.New("old slot still has pending or in-flight operations")
 	}
 	return nil
@@ -661,7 +740,7 @@ func (runtime *HostRuntime) Stop(ctx context.Context, slot string) error {
 }
 
 func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease) error {
-	if err := runtime.RevokeController(ctx, target); err != nil {
+	if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
 		return err
 	}
 	if previous != "" && previous != "none" {
@@ -748,7 +827,107 @@ func (runtime *HostRuntime) activeSlot() (string, error) {
 }
 
 func (runtime *HostRuntime) control(ctx context.Context, socket string, request map[string]any) (map[string]any, int, error) {
-	return runtime.slotRequest(ctx, socket, http.MethodPost, "/internal/v1/control", request)
+	body, status, err := runtime.slotRequest(ctx, socket, http.MethodPost, "/internal/v1/control", request)
+	if err != nil {
+		return nil, status, err
+	}
+	if status != http.StatusOK {
+		return nil, status, fmt.Errorf("slot control action returned HTTP %d", status)
+	}
+	if !responseOK(body) {
+		return nil, status, errors.New("slot control response is not successful")
+	}
+	protocolValue, ok := integerValue(body["protocol"])
+	if !ok || protocolValue != 4 {
+		return nil, status, errors.New("slot control response has an invalid protocol")
+	}
+	if action, ok := request["action"].(string); !ok || body["action"] != action {
+		return nil, status, errors.New("slot control response action does not match the request")
+	}
+	if _, ok := body["result"].(map[string]any); !ok {
+		return nil, status, errors.New("slot control response result is missing")
+	}
+	return body, status, nil
+}
+
+func (runtime *HostRuntime) observeSource(ctx context.Context, slot, source, action string) (map[string]any, time.Time, error) {
+	if _, _, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": action}); err != nil {
+		return nil, time.Time{}, err
+	}
+	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/snapshots/"+source, nil)
+	if err != nil {
+		return nil, time.Time{}, err
+	}
+	if status != http.StatusOK || !responseOK(body) {
+		return nil, time.Time{}, fmt.Errorf("%s snapshot returned HTTP %d or an invalid envelope", source, status)
+	}
+	protocolValue, protocolOK := integerValue(body["protocol"])
+	if !protocolOK || protocolValue != 4 {
+		return nil, time.Time{}, fmt.Errorf("%s snapshot has an invalid protocol", source)
+	}
+	result, ok := body["result"].(map[string]any)
+	if !ok {
+		return nil, time.Time{}, fmt.Errorf("%s observation result is missing", source)
+	}
+	if err := validateSourceResult(action, result); err != nil {
+		return nil, time.Time{}, fmt.Errorf("%s observation is invalid: %w", source, err)
+	}
+	observedAt, ok := parseObservedAt(result["observed_at"])
+	if !ok {
+		return nil, time.Time{}, fmt.Errorf("%s observation timestamp is missing", source)
+	}
+	return result, observedAt, nil
+}
+
+func validateSourceResult(action string, result map[string]any) error {
+	up, ok := result["up"].(bool)
+	if !ok {
+		return errors.New("up is missing or invalid")
+	}
+	if !up {
+		return errors.New("up is false")
+	}
+	if _, ok := parseObservedAt(result["observed_at"]); !ok {
+		return errors.New("observed_at is missing or invalid")
+	}
+	switch action {
+	case "admin-metrics":
+		observationEpoch, ok := result["observation_epoch"].(string)
+		if !ok || observationEpoch == "" {
+			return errors.New("observation_epoch is missing or invalid")
+		}
+		if _, ok := result["pending_operations"].([]any); !ok {
+			return errors.New("pending_operations is missing or invalid")
+		}
+		if _, ok := result["historical_unknown_operations"].([]any); !ok {
+			return errors.New("historical_unknown_operations is missing or invalid")
+		}
+		if _, ok := integerValue(result["in_flight_operations"]); !ok {
+			return errors.New("in_flight_operations is missing or invalid")
+		}
+		doctor, ok := result["doctor"].(map[string]any)
+		if !ok {
+			return errors.New("doctor is missing or invalid")
+		}
+		if _, ok := doctor["issues"].([]any); !ok {
+			return errors.New("doctor.issues is missing or invalid")
+		}
+	case "admin-status":
+		if _, ok := result["tasks"].([]any); !ok {
+			return errors.New("tasks is missing or invalid")
+		}
+	case "doctor":
+		stateEpoch, ok := result["state_epoch"].(string)
+		if !ok || stateEpoch == "" {
+			return errors.New("state_epoch is missing or invalid")
+		}
+		if _, ok := result["issues"].([]any); !ok {
+			return errors.New("issues is missing or invalid")
+		}
+	default:
+		return errors.New("unsupported observation action")
+	}
+	return nil
 }
 
 func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, path string, value any) (map[string]any, int, error) {
@@ -790,6 +969,9 @@ func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, pat
 			return nil, response.StatusCode, err
 		}
 	}
+	if result == nil {
+		return nil, response.StatusCode, errors.New("slot response must be a JSON object")
+	}
 	return result, response.StatusCode, nil
 }
 
@@ -803,31 +985,91 @@ func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) 
 	command := exec.CommandContext(ctx, "systemctl", action, unit)
 	output, err := command.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("systemctl %s %s: %w: %s", action, unit, err, strings.TrimSpace(string(output)))
+		_ = output
+		return fmt.Errorf("systemctl %s %s failed: %w", action, unit, err)
 	}
 	return nil
 }
 
 func integer(value any) int64 {
+	parsed, _ := integerValue(value)
+	return parsed
+}
+
+func integerValue(value any) (int64, bool) {
 	switch typed := value.(type) {
 	case float64:
-		return int64(typed)
+		return int64(typed), typed == float64(int64(typed))
 	case int64:
-		return typed
+		return typed, true
 	case json.Number:
-		parsed, _ := typed.Int64()
-		return parsed
+		parsed, err := typed.Int64()
+		return parsed, err == nil
+	case int:
+		return int64(typed), true
 	default:
-		return 0
+		return 0, false
 	}
 }
 
 func arrayLength(value any) int64 {
+	parsed, _ := arrayLengthValue(value)
+	return parsed
+}
+
+func arrayLengthValue(value any) (int64, bool) {
 	items, ok := value.([]any)
 	if !ok {
-		return 0
+		return 0, false
 	}
-	return int64(len(items))
+	return int64(len(items)), true
+}
+
+func responseOK(body map[string]any) bool {
+	value, ok := body["ok"].(bool)
+	return ok && value
+}
+
+func healthEnvelopeValid(body map[string]any) bool {
+	envelopeOK, ok := body["ok"].(bool)
+	protocolValue, protocolOK := integerValue(body["protocol"])
+	processReady, processReadyOK := body["process_ready"].(bool)
+	_, readyOK := body["ready"].(bool)
+	_, controllerOK := body["controller_owned"].(bool)
+	_, trafficOK := body["traffic_accepting"].(bool)
+	return ok && envelopeOK && protocolOK && protocolValue == 4 && processReadyOK && readyOK && controllerOK && trafficOK && processReady
+}
+
+func parseObservedAt(value any) (time.Time, bool) {
+	text, ok := value.(string)
+	if !ok {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, text)
+	return parsed, err == nil
+}
+
+func stringSlice(value any) []string {
+	items, ok := value.([]any)
+	if !ok {
+		return nil
+	}
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		text, ok := item.(string)
+		if !ok || text == "" {
+			return nil
+		}
+		result = append(result, text)
+	}
+	return result
+}
+
+func minTime(left, right time.Time) time.Time {
+	if left.IsZero() || (!right.IsZero() && right.Before(left)) {
+		return right
+	}
+	return left
 }
 
 func nativeWorkerCount(value any) int64 {

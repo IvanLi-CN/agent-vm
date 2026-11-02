@@ -59,6 +59,9 @@ func run(args []string) error {
 	}
 	metrics := deployd.NewMetrics(manager)
 	server := deployd.NewServer(manager, metrics)
+	if err := server.RestoreLatest(ctx); err != nil {
+		slog.Warn("persisted deployd observation could not be restored", "error", err)
+	}
 	if err := server.Sample(ctx); err != nil {
 		slog.Warn("initial deployd observation failed", "error", err)
 	}

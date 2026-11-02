@@ -16,10 +16,29 @@ type fakeRuntime struct {
 	observations map[string]SlotObservation
 	failSwitch   bool
 	sequence     []string
+	traffic      map[string]bool
 }
 
 func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
-	return RuntimeSnapshot{ObservedAt: time.Unix(100, 0), FreshUntil: time.Unix(110, 0), ActiveSlot: runtime.active, Consistent: true, Slots: runtime.observations}, nil
+	slots := make(map[string]SlotObservation, len(runtime.observations))
+	for slot, value := range runtime.observations {
+		if runtime.traffic == nil {
+			value.TrafficAccepting = runtime.active == slot
+		} else {
+			value.TrafficAccepting = runtime.traffic[slot]
+		}
+		value.ReleaseID = "release-" + slot
+		value.SourceRevision = "revision-1"
+		value.StateEpoch = "epoch-1"
+		value.StateCapabilities = []string{"reads@1", "writes@1"}
+		slots[slot] = value
+	}
+	now := time.Unix(100, 0).UTC()
+	sources := map[string]SourceObservation{}
+	for _, source := range []string{"active_link", "slot_contracts", "native_observation", "inventory_observation"} {
+		sources[source] = SourceObservation{Up: true, ObservedAt: now}
+	}
+	return RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: runtime.active, ControllerSlot: runtime.active, Consistent: true, Slots: slots, Sources: sources}, nil
 }
 func (runtime *fakeRuntime) Stage(context.Context, string, string) error {
 	runtime.sequence = append(runtime.sequence, "stage")
@@ -37,7 +56,7 @@ func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, _ co
 	}
 	return nil
 }
-func (runtime *fakeRuntime) RevokeController(_ context.Context, slot string) error {
+func (runtime *fakeRuntime) RevokeController(_ context.Context, slot string, _ uint64) error {
 	runtime.sequence = append(runtime.sequence, "revoke")
 	if observation, ok := runtime.observations[slot]; ok {
 		observation.ControllerOwned = false
@@ -45,8 +64,20 @@ func (runtime *fakeRuntime) RevokeController(_ context.Context, slot string) err
 	}
 	return nil
 }
-func (runtime *fakeRuntime) EnableTraffic(context.Context, string) error {
+func (runtime *fakeRuntime) EnableTraffic(_ context.Context, slot string) error {
 	runtime.sequence = append(runtime.sequence, "traffic")
+	if runtime.traffic == nil {
+		runtime.traffic = map[string]bool{}
+	}
+	runtime.traffic[slot] = true
+	return nil
+}
+func (runtime *fakeRuntime) DisableTraffic(_ context.Context, slot string) error {
+	runtime.sequence = append(runtime.sequence, "traffic-disable")
+	if runtime.traffic == nil {
+		runtime.traffic = map[string]bool{}
+	}
+	runtime.traffic[slot] = false
 	return nil
 }
 func (runtime *fakeRuntime) SwitchActive(_ context.Context, slot string) error {
@@ -67,11 +98,22 @@ func (runtime *fakeRuntime) Quiesce(context.Context, string) error {
 }
 func (runtime *fakeRuntime) Stop(context.Context, string) error {
 	runtime.sequence = append(runtime.sequence, "stop")
+	value := runtime.observations["blue"]
+	value.ProcessUp = false
+	value.ProcessReady = false
+	value.Ready = false
+	value.ControllerOwned = false
+	runtime.observations["blue"] = value
 	return nil
 }
 func (runtime *fakeRuntime) Rollback(context.Context, string, string, controllerrole.Lease) error {
 	runtime.sequence = append(runtime.sequence, "rollback")
 	runtime.active = "blue"
+	if runtime.traffic == nil {
+		runtime.traffic = map[string]bool{}
+	}
+	runtime.traffic["blue"] = true
+	runtime.traffic["green"] = false
 	return nil
 }
 
@@ -150,7 +192,16 @@ func TestManagerReconcilesControllerOnlyAfterFreshObservation(t *testing.T) {
 	if err := manager.MaintainController(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if len(runtime.sequence) != 2 || runtime.sequence[0] != "revoke" || runtime.sequence[1] != "grant" {
+	wantSequence := []string{"traffic-disable", "revoke", "grant", "traffic"}
+	if len(runtime.sequence) != len(wantSequence) {
+		t.Fatalf("controller maintenance sequence = %v, want %v", runtime.sequence, wantSequence)
+	}
+	for index, want := range wantSequence {
+		if runtime.sequence[index] != want {
+			t.Fatalf("controller maintenance sequence = %v, want %v", runtime.sequence, wantSequence)
+		}
+	}
+	if !runtime.traffic["blue"] {
 		t.Fatalf("controller maintenance sequence = %v", runtime.sequence)
 	}
 }
@@ -206,6 +257,7 @@ func TestManagerRecoveryFinalizeReestablishesControllerAfterRestart(t *testing.T
 		t.Fatalf("restart recovery error = %v", err)
 	}
 	runtime.active = "green"
+	runtime.traffic = map[string]bool{"blue": false, "green": true}
 	updated, err := manager.Recover(context.Background(), transaction.ID, "finalize")
 	if err != nil {
 		t.Fatal(err)
