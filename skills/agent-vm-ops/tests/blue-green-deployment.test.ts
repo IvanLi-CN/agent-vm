@@ -121,12 +121,15 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(caddy).not.toContain("forward_auth");
   expect(caddy).not.toContain("edgeone");
   expect(read("docs/deployment/blue-green.md")).toContain("install -o root -g root -m 0600");
+  expect(read("docs/deployment/blue-green.md")).toContain("install -o agent-vm-rqlite -g agent-vm-rqlite -m 0600");
 
   const rqlite = read("skills/agent-vm-ops/assets/systemd/agent-vm-rqlite.service");
   expect(rqlite).toContain("User=agent-vm-rqlite");
   expect(rqlite).toContain("SupplementaryGroups=agent-vm-web");
   expect(rqlite).toContain("-http-addr 127.0.0.1:4001");
   expect(rqlite).toContain("-auth /etc/agent-vm-native/rqlite/auth.json");
+  expect(rqlite).toContain("ExecStartPre=/usr/bin/test -f /etc/agent-vm-native/rqlite/auth.json");
+  expect(rqlite).toContain("agent-vm-rqlite:600");
   expect(rqlite).not.toContain("0.0.0.0");
 
   const slot = read("skills/agent-vm-ops/assets/systemd/agent-vm-native@.service");
@@ -353,6 +356,9 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain("pending_file");
   expect(cutover).toContain("recover_pending_cutover");
   expect(cutover).toContain("validate_candidate_layout");
+  expect(cutover).toContain('! -L "$slot_dir"');
+  expect(cutover).toContain("sync -f");
+  expect(cutover).toContain("candidate_record/app.sock");
   expect(cutover).toContain("read_current_slot");
   expect(cutover).toContain("active_matches_current || die");
   expect(cutover).toContain("active target slot is missing");
@@ -367,6 +373,10 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(acceptance).toContain("env -i");
   expect(acceptance).toContain("stop_process");
   expect(acceptance).toContain("kill -KILL");
+  expect(acceptance).toContain("setsid --wait");
+  expect(acceptance).toContain('kill -TERM -- "-$group_id"');
+  expect(acceptance).toContain("process_group_for");
+  expect(acceptance).toContain('wait "$pid"');
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-cutover-test-"));
   try {
     const layout = join(temporaryRoot, "layout");

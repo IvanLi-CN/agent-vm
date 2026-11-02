@@ -11,31 +11,78 @@ rqlite_auth_config=""
 keep_proof="${KEEP_PROOF_DIR:-0}"
 runtime_home="$proof_dir/home"
 runtime_path="/usr/local/bin:/usr/bin:/bin"
+cleanup_failed=0
 mkdir -p -- "$runtime_home"
+script_pgid=""
+
+process_group_for() {
+  local pid="$1"
+  local group_id
+  local child_pid
+  group_id="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+  if [[ "$group_id" == "$script_pgid" ]]; then
+    child_pid="$(pgrep -P "$pid" 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$child_pid" ]]; then
+      group_id="$(ps -o pgid= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)"
+    fi
+  fi
+  if [[ "$group_id" =~ ^[0-9]+$ && "$group_id" != "$script_pgid" ]]; then
+    printf '%s\n' "$group_id"
+  fi
+}
+
+process_group_alive() {
+  local group_id="$1"
+  [[ -n "$group_id" ]] && kill -0 -- "-$group_id" 2>/dev/null
+}
 
 stop_process() {
   local pid="$1"
+  local group_id
   [[ -n "$pid" ]] || return 0
+  if ! kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" 2>/dev/null || true
+    return 0
+  fi
+  group_id="$(process_group_for "$pid")"
+  if [[ -n "$group_id" ]]; then
+    kill -TERM -- "-$group_id" 2>/dev/null || true
+  fi
   kill -TERM "$pid" 2>/dev/null || true
   for _ in $(seq 1 50); do
-    if ! kill -0 "$pid" 2>/dev/null; then
+    if ! kill -0 "$pid" 2>/dev/null && ! process_group_alive "$group_id"; then
       wait "$pid" 2>/dev/null || true
       return 0
     fi
     sleep 0.1
   done
+  if [[ -n "$group_id" ]]; then
+    kill -KILL -- "-$group_id" 2>/dev/null || true
+  fi
   kill -KILL "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    if ! kill -0 "$pid" 2>/dev/null && ! process_group_alive "$group_id"; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
 }
 
 cleanup() {
   if [[ -n "$caddy_pid" ]]; then
-    stop_process "$caddy_pid"
+    stop_process "$caddy_pid" || cleanup_failed=1
   fi
   if [[ -n "$backend_pid" ]]; then
-    stop_process "$backend_pid"
+    stop_process "$backend_pid" || cleanup_failed=1
   fi
   if [[ -n "$rqlited_pid" ]]; then
-    stop_process "$rqlited_pid"
+    stop_process "$rqlited_pid" || cleanup_failed=1
+  fi
+  if (( cleanup_failed != 0 )); then
+    printf 'cleanup incomplete; live acceptance process tree retained at %s\n' "$proof_dir" >&2
+    return 0
   fi
   if [[ -n "$rqlite_auth_file" ]]; then
     rm -f -- "$rqlite_auth_file"
@@ -70,6 +117,10 @@ require_command openssl
 require_command systemd-analyze
 require_command xcaddy
 require_command go
+require_command setsid
+require_command pgrep
+require_command ps
+script_pgid="$(ps -o pgid= -p "$$" | tr -d ' ')"
 
 static_result="$proof_dir/static.json"
 bun run "$repository_root/skills/agent-vm-ops/scripts/validate_blue_green_deployment.ts" >"$static_result" || {
@@ -137,7 +188,7 @@ sed -e "s#/var/lib/agent-vm-native/active/app.sock#$backend_socket#g" "$caddy_co
       skip_tls && /^[[:space:]]*\}$/ { skip_tls=0; next }
       !skip_tls { print }
     ' >"$smoke_config"
-env -i PATH="$runtime_path" HOME="$runtime_home" PYTHONUNBUFFERED=1 \
+setsid --wait env -i PATH="$runtime_path" HOME="$runtime_home" PYTHONUNBUFFERED=1 \
   python3 - "$backend_socket" >"$proof_dir/backend.log" 2>&1 <<'PY' &
 import http.server
 import os
@@ -173,7 +224,7 @@ for _ in $(seq 1 40); do
 done
 [[ -S "$backend_socket" ]] || fail "Unix backend did not start"
 caddy_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
-env -i \
+setsid --wait env -i \
   PATH="$runtime_path" \
   HOME="$runtime_home" \
   XDG_CONFIG_HOME="$proof_dir/xdg-config" \
@@ -214,6 +265,7 @@ unit_dir="$repository_root/skills/agent-vm-ops/assets/systemd"
 systemd_root="$proof_dir/systemd-root"
 mkdir -p -- \
   "$systemd_root/etc/systemd/system" \
+  "$systemd_root/etc/agent-vm-native/rqlite" \
   "$systemd_root/etc/agent-vm-native/slots/test_instance" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/bin" \
   "$systemd_root/bin" \
@@ -223,9 +275,11 @@ cp "$unit_dir/agent-vm-rqlite.service" "$unit_dir/agent-vm-native@.service" "$un
 touch \
   "$systemd_root/etc/agent-vm-native/Caddyfile" \
   "$systemd_root/etc/agent-vm-native/caddy.env" \
+  "$systemd_root/etc/agent-vm-native/rqlite/auth.json" \
   "$systemd_root/etc/agent-vm-native/slots/test_instance/config.json" \
   "$systemd_root/opt/agent-vm-native/release-manifest.json" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/release-manifest.json"
+chmod 0600 "$systemd_root/etc/agent-vm-native/rqlite/auth.json"
 touch \
   "$systemd_root/bin/sh" \
   "$systemd_root/usr/bin/curl" \
@@ -307,7 +361,7 @@ http_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 
 raft_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 rqlite_data="$proof_dir/rqlite-data"
 mkdir -p -- "$rqlite_data"
-env -i PATH="$runtime_path" HOME="$runtime_home" \
+setsid --wait env -i PATH="$runtime_path" HOME="$runtime_home" \
   "$rqlited" \
   -node-id isolated-agent-vm \
   -http-addr "127.0.0.1:$http_port" \

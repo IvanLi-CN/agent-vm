@@ -74,7 +74,7 @@ The Caddy example disables the admin API and all automatic HTTP listeners, remov
 
 ## rqlite boundary
 
-Copy `rqlite-auth.json.example` to the protected `/etc/agent-vm-native/rqlite/auth.json` path and replace both placeholders with operator-managed secrets. The control user is limited to the SQL permissions used by the state adapter. The backup user cannot execute SQL. The rqlite unit binds HTTP and raft to loopback and enables HTTPS plus HTTP authentication.
+Copy `rqlite-auth.json.example` to the protected `/etc/agent-vm-native/rqlite/auth.json` path with `install -o agent-vm-rqlite -g agent-vm-rqlite -m 0600`, then replace both placeholders with operator-managed secrets. The rqlite unit checks that the file is owned by `agent-vm-rqlite` and remains mode `0600` before startup. The control user is limited to the SQL permissions used by the state adapter. The backup user cannot execute SQL. The rqlite unit binds HTTP and raft to loopback and enables HTTPS plus HTTP authentication.
 
 The state URL in each slot configuration may use the operator-managed HTTPS URL and credentials after the client transport has been configured to trust the deployment CA. Do not put that URL, credentials, or CA private key in a release manifest or source file.
 

@@ -109,10 +109,11 @@ forbidText(caddyfile, "tls_insecure_skip_verify", "Caddy does not disable upstre
 forbidText(caddyfile, "0.0.0.0", "Caddy does not bind or forward to an unspecified address");
 
 const caddyEnv = read(join(blueGreenRoot, "caddy.env.example"));
+const blueGreenDoc = read(join(repositoryRoot, "docs/deployment/blue-green.md"));
 requireText(caddyEnv, "AGENT_VM_DOMAIN=<operator-provided-hostname>", "Caddy hostname remains an operator input");
 requireText(caddyEnv, "DNSPOD_TOKEN=<operator-managed-dnspod-token>", "DNSPod credentials remain an operator-managed placeholder");
 forbidText(caddyEnv, "api_key", "Caddy environment does not use a legacy DNSPod API key");
-requireCheck(read(join(repositoryRoot, "docs/deployment/blue-green.md")).includes("install -o root -g root -m 0600"), "Caddy environment installation requires root-only mode 0600");
+requireCheck(blueGreenDoc.includes("install -o root -g root -m 0600"), "Caddy environment installation requires root-only mode 0600");
 
 const authText = read(join(blueGreenRoot, "rqlite-auth.json.example"));
 try {
@@ -137,6 +138,9 @@ requireText(rqliteUnit, "SupplementaryGroups=agent-vm-web", "rqlite can traverse
 requireText(rqliteUnit, "-http-addr 127.0.0.1:4001", "rqlite HTTP binds to loopback");
 requireText(rqliteUnit, "-raft-addr 127.0.0.1:4002", "rqlite raft binds to loopback");
 requireText(rqliteUnit, "-auth /etc/agent-vm-native/rqlite/auth.json", "rqlite auth file is explicit");
+requireText(rqliteUnit, "ExecStartPre=/usr/bin/test -f /etc/agent-vm-native/rqlite/auth.json", "rqlite auth file is checked before startup");
+requireText(rqliteUnit, "agent-vm-rqlite:600", "rqlite auth file is dedicated-user mode 0600");
+requireText(blueGreenDoc, "install -o agent-vm-rqlite -g agent-vm-rqlite -m 0600", "deployment docs install rqlite auth as dedicated-user mode 0600");
 requireText(rqliteUnit, "-http-cert /etc/agent-vm-native/tls/rqlite/server.crt", "rqlite TLS certificate is explicit");
 requireText(rqliteUnit, "-http-key /etc/agent-vm-native/tls/rqlite/server.key", "rqlite TLS key is explicit");
 forbidText(rqliteUnit, "0.0.0.0", "rqlite does not bind to all interfaces");
@@ -174,6 +178,10 @@ requireText(acceptance, "require_command flock", "isolated acceptance checks the
 requireText(acceptance, "env -i", "isolated runtime children do not inherit ambient credentials");
 requireText(acceptance, "stop_process", "isolated acceptance bounds runtime child cleanup");
 requireText(acceptance, "kill -KILL", "isolated acceptance force-cleans stalled runtime children");
+requireText(acceptance, "setsid --wait", "isolated acceptance gives runtime children a dedicated process group");
+requireText(acceptance, 'kill -TERM -- "-$group_id"', "isolated acceptance terminates the runtime process group");
+requireText(acceptance, "process_group_for", "isolated acceptance resolves the runtime process group");
+requireText(acceptance, 'wait "$pid"', "isolated acceptance waits for runtime process termination");
 for (const commandPath of ["$systemd_root/bin/sh", "$systemd_root/usr/bin/curl", "$systemd_root/usr/bin/sleep", "$systemd_root/usr/bin/stat"]) {
   requireText(acceptance, commandPath, `systemd staging root provides ${commandPath}`);
 }
@@ -187,6 +195,9 @@ requireText(cutover, "rollback_link", "cutover has a protected rollback link for
 requireText(cutover, "pending_file", "cutover persists an interrupted-swap recovery record");
 requireText(cutover, "recover_pending_cutover", "cutover recovers an interrupted swap before a new replacement");
 requireText(cutover, "validate_candidate_layout", "cutover revalidates the candidate while holding the active lock");
+requireText(cutover, '! -L "$slot_dir"', "cutover rejects symlinked slot directories");
+requireText(cutover, "sync -f", "cutover flushes recovery and active-link directory updates");
+requireText(cutover, "candidate_record/app.sock", "cutover confirms a pending candidate before rollback");
 requireText(cutover, "flock --wait 30 9", "cutover serializes active link writers with a kernel lock");
 forbidText(cutover, 'mkdir -- "$lock_dir"', "cutover does not use a crash-stale directory lock");
 forbidText(caddyUnit, "/etc/agent-vm-native/tls/caddy", "Caddy systemd unit does not require static certificate files");
