@@ -102,6 +102,21 @@ func TestSystemdSlotStoppedRequiresLoadedDeadUnit(t *testing.T) {
 	}
 }
 
+func TestSlotMetricsPreserveIndependentLanes(t *testing.T) {
+	runtime := NewHostRuntime(Config{})
+	runtime.rememberMetrics("blue", "capacity", map[string]string{"capacity_metric": "1"})
+	runtime.rememberMetrics("blue", "inventory", map[string]string{"inventory_metric": "2"})
+	runtime.rememberMetrics("blue", "health", map[string]string{"health_metric": "3"})
+	runtime.invalidateMetrics("blue", "health")
+	metrics := runtime.slotMetrics("blue")
+	if metrics["capacity_metric"] != "1" || metrics["inventory_metric"] != "2" {
+		t.Fatalf("independent slot metrics were cleared: %#v", metrics)
+	}
+	if _, ok := metrics["health_metric"]; ok {
+		t.Fatalf("failed health lane remained visible: %#v", metrics)
+	}
+}
+
 func TestActiveSlotRequiresLink(t *testing.T) {
 	runtime := NewHostRuntime(Config{ActivePath: filepath.Join(t.TempDir(), "active")})
 	if _, err := runtime.activeSlot(); err == nil {

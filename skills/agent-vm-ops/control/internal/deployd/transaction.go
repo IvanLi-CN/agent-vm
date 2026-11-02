@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sort"
 	"sync"
 	"time"
 
@@ -82,7 +83,7 @@ type Runtime interface {
 	Observe(context.Context) (RuntimeSnapshot, error)
 	Stage(context.Context, string, string) error
 	Verify(context.Context, string, string) error
-	VerifySlotIdentity(context.Context, string, string, string) error
+	VerifySlotIdentity(context.Context, string, string, string, []string) error
 	GrantController(context.Context, string, controllerrole.Lease) error
 	RevokeController(context.Context, string, uint64) error
 	FenceController(context.Context, string) error
@@ -200,12 +201,13 @@ func (manager *Manager) Stage(ctx context.Context, targetSlot, bundle string) (*
 	createdEvidence := map[string]any{"active_slot": observation.ActiveSlot}
 	if observation.ActiveSlot != "none" {
 		previous, ok := observation.Slots[observation.ActiveSlot]
-		if !ok || previous.ReleaseID == "" || previous.SourceRevision == "" || previous.StateEpoch == "" {
+		if !ok || previous.ReleaseID == "" || previous.SourceRevision == "" || previous.StateEpoch == "" || len(previous.StateCapabilities) == 0 {
 			return nil, errors.New("active slot identity is incomplete for rollback")
 		}
 		createdEvidence["previous_release_id"] = previous.ReleaseID
 		createdEvidence["previous_source_revision"] = previous.SourceRevision
 		createdEvidence["previous_state_epoch"] = previous.StateEpoch
+		createdEvidence["previous_state_capabilities"] = append([]string(nil), previous.StateCapabilities...)
 	}
 	now := manager.Clock().UTC()
 	transaction := store.Transaction{ID: newID("tx"), TargetSlot: targetSlot, PreviousSlot: observation.ActiveSlot, Bundle: bundle, Phase: PhaseStage, State: "active", Generation: now.UnixNano(), CreatedAt: now, UpdatedAt: now}
@@ -244,10 +246,10 @@ func (manager *Manager) Verify(ctx context.Context, id string) (*store.Transacti
 		return nil, manager.failure(ctx, id, PhaseStandbyValidation, errors.New("candidate slot is not process-ready"))
 	}
 	previous, previousOK := observation.Slots[transaction.PreviousSlot]
-	if previousOK && previous.StateEpoch != "" && previous.StateEpoch != target.StateEpoch {
-		return nil, manager.failure(ctx, id, PhaseStandbyValidation, errors.New("candidate state epoch is incompatible with the active slot"))
+	if previousOK && (previous.StateEpoch != target.StateEpoch || !sameStateCapabilities(previous.StateCapabilities, target.StateCapabilities)) {
+		return nil, manager.failure(ctx, id, PhaseStandbyValidation, errors.New("candidate state contract is incompatible with the active slot"))
 	}
-	if err := manager.transitionAfterEffect(ctx, id, PhaseStandbyValidation, PhaseControllerHandoff, "verified", map[string]any{"candidate_ready": true, "release_id": target.ReleaseID, "source_revision": target.SourceRevision, "state_epoch": target.StateEpoch}); err != nil {
+	if err := manager.transitionAfterEffect(ctx, id, PhaseStandbyValidation, PhaseControllerHandoff, "verified", map[string]any{"candidate_ready": true, "release_id": target.ReleaseID, "source_revision": target.SourceRevision, "state_epoch": target.StateEpoch, "state_capabilities": append([]string(nil), target.StateCapabilities...)}); err != nil {
 		return nil, err
 	}
 	updated, err := manager.Store.Get(ctx, id)
@@ -264,7 +266,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	if transaction.Phase != PhaseControllerHandoff {
 		return nil, fmt.Errorf("transaction %s is in phase %s", id, transaction.Phase)
 	}
-	verifiedReleaseID, verifiedSourceRevision, identityErr := manager.verifiedCandidateIdentity(ctx, id)
+	verifiedReleaseID, verifiedSourceRevision, verifiedStateEpoch, verifiedCapabilities, identityErr := manager.verifiedCandidateIdentity(ctx, id)
 	if identityErr != nil {
 		return nil, manager.failure(ctx, id, transaction.Phase, identityErr)
 	}
@@ -279,7 +281,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 		return nil, manager.failure(ctx, id, transaction.Phase, errors.New("active slot changed outside deployd"))
 	}
 	target, targetOK := observation.Slots[transaction.TargetSlot]
-	if !targetOK || !target.ProcessUp || !target.ProcessReady || !target.Ready || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch == "" {
+	if !targetOK || !target.ProcessUp || !target.ProcessReady || !target.Ready || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch != verifiedStateEpoch || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) {
 		return nil, manager.failure(ctx, id, transaction.Phase, errors.New("candidate identity or readiness changed after verification"))
 	}
 	var ok bool
@@ -304,7 +306,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 		return nil, manager.rollbackOrFence(ctx, *transaction, err)
 	}
 	target, ok = observation.Slots[transaction.TargetSlot]
-	if !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch == "" {
+	if !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch != verifiedStateEpoch || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) {
 		return nil, manager.rollbackOrFence(ctx, *transaction, errors.New("candidate controller lease was not observed"))
 	}
 	if err := manager.waitForReady(ctx, id, transaction.TargetSlot); err != nil {
@@ -321,7 +323,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 		return nil, manager.effectFailure(ctx, id, PhaseTrafficEnable, err)
 	}
 	target, ok = observation.Slots[transaction.TargetSlot]
-	if !validObservation(observation, manager.Clock().UTC()) || !ok || !target.ControllerOwned || !target.TrafficAccepting {
+	if !validObservation(observation, manager.Clock().UTC()) || !ok || !target.ControllerOwned || !target.TrafficAccepting || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch != verifiedStateEpoch || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) {
 		return nil, manager.effectFailure(ctx, id, PhaseTrafficEnable, errors.New("candidate traffic role was not observed"))
 	}
 	if err := manager.transitionAfterEffect(ctx, id, PhaseTrafficEnable, PhaseActiveSwitch, "traffic_enabled", nil); err != nil {
@@ -340,7 +342,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 		return nil, manager.rollbackOrFence(ctx, *transaction, err)
 	}
 	target, ok = observation.Slots[transaction.TargetSlot]
-	if !validObservation(observation, manager.Clock().UTC()) || !ok || observation.ActiveSlot != transaction.TargetSlot || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || !target.TrafficAccepting {
+	if !validObservation(observation, manager.Clock().UTC()) || !ok || observation.ActiveSlot != transaction.TargetSlot || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || !target.TrafficAccepting || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch != verifiedStateEpoch || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) {
 		return nil, manager.rollbackOrFence(ctx, *transaction, errors.New("active switch was not verified"))
 	}
 	if err := manager.transitionAfterEffect(ctx, id, PhaseActiveSwitch, PhaseDrainOld, "active_switched", map[string]any{"active_slot": transaction.TargetSlot}); err != nil {
@@ -371,7 +373,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	}
 	target, ok = observation.Slots[transaction.TargetSlot]
 	old, oldOK := observation.Slots[transaction.PreviousSlot]
-	if !validObservation(observation, manager.Clock().UTC()) || !ok || observation.ActiveSlot != transaction.TargetSlot || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || !target.TrafficAccepting || (oldOK && (old.ProcessUp || old.TrafficAccepting || old.InFlightRequests != 0 || old.NativeWorkers != 0 || old.PendingOperations != 0)) {
+	if !validObservation(observation, manager.Clock().UTC()) || !ok || observation.ActiveSlot != transaction.TargetSlot || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || !target.TrafficAccepting || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch != verifiedStateEpoch || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) || (oldOK && (old.ProcessUp || old.TrafficAccepting || old.InFlightRequests != 0 || old.NativeWorkers != 0 || old.PendingOperations != 0)) {
 		return nil, manager.rollbackOrFence(ctx, *transaction, errors.New("final active slot was not verified"))
 	}
 	if err := manager.transitionAfterEffect(ctx, id, PhaseQuiescence, PhaseFinalize, "finalized", map[string]any{"quiescent": true}); err != nil {
@@ -418,8 +420,8 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 		return manager.Store.Get(ctx, id)
 	case "finalize":
 		observation, observeErr := manager.observe(ctx, id)
-		verifiedReleaseID, verifiedSourceRevision, identityErr := manager.verifiedCandidateIdentity(ctx, id)
-		if observeErr != nil || identityErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), false, false, verifiedReleaseID, verifiedSourceRevision) {
+		verifiedReleaseID, verifiedSourceRevision, verifiedStateEpoch, verifiedCapabilities, identityErr := manager.verifiedCandidateIdentity(ctx, id)
+		if observeErr != nil || identityErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), false, false, verifiedReleaseID, verifiedSourceRevision, verifiedStateEpoch, verifiedCapabilities) {
 			return nil, errors.New("recovery evidence is not sufficient to finalize")
 		}
 		term, termErr := manager.nextFenceTerm(ctx)
@@ -447,7 +449,7 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 			return nil, fmt.Errorf("%w; %v", failureErr, fenceErr)
 		}
 		observation, observeErr = manager.observe(ctx, id)
-		if observeErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), true, true, verifiedReleaseID, verifiedSourceRevision) {
+		if observeErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), true, true, verifiedReleaseID, verifiedSourceRevision, verifiedStateEpoch, verifiedCapabilities) {
 			failureErr := manager.failure(ctx, id, transaction.Phase, &UncertainError{Cause: errors.New("recovery finalize controller evidence was not verified")})
 			fenceErr := manager.fenceSlots(ctx, errors.New("recovery finalize was fenced"))
 			return nil, fmt.Errorf("%w; %v", failureErr, fenceErr)
@@ -609,16 +611,7 @@ func (manager *Manager) fenceSlots(ctx context.Context, cause error) error {
 			first = err
 		}
 	}
-	fenceTerm, termErr := manager.nextFenceTerm(ctx)
-	if termErr != nil && first == nil {
-		first = termErr
-	}
 	for _, slot := range []string{"blue", "green"} {
-		if termErr == nil {
-			if err := manager.Runtime.RevokeController(ctx, slot, fenceTerm); err != nil && first == nil {
-				first = err
-			}
-		}
 		if err := manager.Runtime.FenceController(ctx, slot); err != nil && first == nil {
 			first = err
 		}
@@ -662,36 +655,40 @@ func (manager *Manager) transition(ctx context.Context, id, expected, phase, tra
 	return manager.Store.Transition(ctx, id, expected, phase, stateForPhase(phase), transition, "deployd", evidence, manager.Clock().UTC())
 }
 
-func (manager *Manager) verifiedCandidateIdentity(ctx context.Context, id string) (string, string, error) {
+func (manager *Manager) verifiedCandidateIdentity(ctx context.Context, id string) (string, string, string, []string, error) {
 	event, err := manager.Store.LatestEvent(ctx, id, PhaseControllerHandoff, "verified")
 	if err != nil {
-		return "", "", fmt.Errorf("read verified candidate identity: %w", err)
+		return "", "", "", nil, fmt.Errorf("read verified candidate identity: %w", err)
 	}
 	if event == nil {
-		return "", "", errors.New("verified candidate identity is missing")
+		return "", "", "", nil, errors.New("verified candidate identity is missing")
 	}
 	releaseID, releaseOK := event.Evidence["release_id"].(string)
 	sourceRevision, sourceOK := event.Evidence["source_revision"].(string)
-	if !releaseOK || releaseID == "" || !sourceOK || sourceRevision == "" {
-		return "", "", errors.New("verified candidate identity is incomplete")
+	stateEpoch, epochOK := event.Evidence["state_epoch"].(string)
+	capabilities, capabilitiesOK := evidenceStrings(event.Evidence["state_capabilities"])
+	if !releaseOK || releaseID == "" || !sourceOK || sourceRevision == "" || !epochOK || stateEpoch == "" || !capabilitiesOK || len(capabilities) == 0 {
+		return "", "", "", nil, errors.New("verified candidate identity is incomplete")
 	}
-	return releaseID, sourceRevision, nil
+	return releaseID, sourceRevision, stateEpoch, capabilities, nil
 }
 
-func (manager *Manager) verifiedPreviousIdentity(ctx context.Context, id string) (string, string, error) {
+func (manager *Manager) verifiedPreviousIdentity(ctx context.Context, id string) (string, string, string, []string, error) {
 	event, err := manager.Store.LatestEventByTransition(ctx, id, "created")
 	if err != nil {
-		return "", "", fmt.Errorf("read rollback target identity: %w", err)
+		return "", "", "", nil, fmt.Errorf("read rollback target identity: %w", err)
 	}
 	if event == nil {
-		return "", "", errors.New("rollback target identity is missing")
+		return "", "", "", nil, errors.New("rollback target identity is missing")
 	}
 	releaseID, releaseOK := event.Evidence["previous_release_id"].(string)
 	sourceRevision, sourceOK := event.Evidence["previous_source_revision"].(string)
-	if !releaseOK || releaseID == "" || !sourceOK || sourceRevision == "" {
-		return "", "", errors.New("rollback target identity is incomplete")
+	stateEpoch, epochOK := event.Evidence["previous_state_epoch"].(string)
+	capabilities, capabilitiesOK := evidenceStrings(event.Evidence["previous_state_capabilities"])
+	if !releaseOK || releaseID == "" || !sourceOK || sourceRevision == "" || !epochOK || stateEpoch == "" || !capabilitiesOK || len(capabilities) == 0 {
+		return "", "", "", nil, errors.New("rollback target identity is incomplete")
 	}
-	return releaseID, sourceRevision, nil
+	return releaseID, sourceRevision, stateEpoch, capabilities, nil
 }
 
 func (manager *Manager) failure(ctx context.Context, id, phase string, cause error) error {
@@ -779,13 +776,13 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 	if transaction.PreviousSlot == "" || transaction.PreviousSlot == "none" {
 		return errors.New("rollback requires a previous active slot")
 	}
-	previousReleaseID, previousSourceRevision, identityErr := manager.verifiedPreviousIdentity(ctx, transaction.ID)
+	previousReleaseID, previousSourceRevision, previousStateEpoch, previousCapabilities, identityErr := manager.verifiedPreviousIdentity(ctx, transaction.ID)
 	if identityErr != nil {
 		failureErr := manager.failure(ctx, transaction.ID, transaction.Phase, identityErr)
 		fenceErr := manager.fenceSlots(ctx, errors.New("rollback target identity was not verified; controller roles were fenced"))
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)
 	}
-	if err := manager.Runtime.VerifySlotIdentity(ctx, transaction.PreviousSlot, previousReleaseID, previousSourceRevision); err != nil {
+	if err := manager.Runtime.VerifySlotIdentity(ctx, transaction.PreviousSlot, previousReleaseID, previousSourceRevision, previousCapabilities); err != nil {
 		failureErr := manager.failure(ctx, transaction.ID, transaction.Phase, err)
 		fenceErr := manager.fenceSlots(ctx, errors.New("rollback target was not verified; controller roles were fenced"))
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)
@@ -824,7 +821,7 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)
 	}
 	previous, previousOK := observation.Slots[transaction.PreviousSlot]
-	if !previousOK || !observation.Consistent || observation.ActiveSlot != transaction.PreviousSlot || !previous.ProcessUp || !previous.ProcessReady || !previous.Ready || !previous.ControllerOwned || !previous.TrafficAccepting || previous.NativeWorkers != 0 || previous.PendingOperations != 0 || previous.InFlightRequests != 0 {
+	if !previousOK || !observation.Consistent || observation.ActiveSlot != transaction.PreviousSlot || !previous.ProcessUp || !previous.ProcessReady || !previous.Ready || !previous.ControllerOwned || !previous.TrafficAccepting || previous.StateEpoch != previousStateEpoch || !sameStateCapabilities(previous.StateCapabilities, previousCapabilities) || previous.NativeWorkers != 0 || previous.PendingOperations != 0 || previous.InFlightRequests != 0 {
 		failureErr := manager.failure(ctx, transaction.ID, PhaseRollback, errors.New("rollback outcome was not verified"))
 		fenceErr := manager.fenceSlots(ctx, errors.New("rollback verification failed; controller roles were fenced"))
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)
@@ -848,16 +845,51 @@ func (manager *Manager) nextFenceTerm(ctx context.Context) (uint64, error) {
 	return manager.Store.NextFenceTerm(ctx)
 }
 
-func recoveryTargetVerified(observation RuntimeSnapshot, transaction store.Transaction, now time.Time, requireTraffic, requireController bool, releaseID, sourceRevision string) bool {
+func recoveryTargetVerified(observation RuntimeSnapshot, transaction store.Transaction, now time.Time, requireTraffic, requireController bool, releaseID, sourceRevision, stateEpoch string, capabilities []string) bool {
 	if !validObservation(observation, now) || observation.ActiveSlot != transaction.TargetSlot {
 		return false
 	}
 	target, ok := observation.Slots[transaction.TargetSlot]
-	if !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || target.StateEpoch == "" || target.ReleaseID != releaseID || target.SourceRevision != sourceRevision || (requireTraffic && !target.TrafficAccepting) || (requireController && !target.ControllerOwned) {
+	if !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || target.StateEpoch != stateEpoch || !sameStateCapabilities(target.StateCapabilities, capabilities) || target.ReleaseID != releaseID || target.SourceRevision != sourceRevision || (requireTraffic && !target.TrafficAccepting) || (requireController && !target.ControllerOwned) {
 		return false
 	}
 	old, oldOK := observation.Slots[transaction.PreviousSlot]
 	return !oldOK || (!old.TrafficAccepting && old.InFlightRequests == 0 && old.NativeWorkers == 0 && old.PendingOperations == 0)
+}
+
+func evidenceStrings(value any) ([]string, bool) {
+	switch typed := value.(type) {
+	case []string:
+		return append([]string(nil), typed...), true
+	case []any:
+		result := make([]string, len(typed))
+		for index, item := range typed {
+			value, ok := item.(string)
+			if !ok || value == "" {
+				return nil, false
+			}
+			result[index] = value
+		}
+		return result, true
+	default:
+		return nil, false
+	}
+}
+
+func sameStateCapabilities(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	leftSet := append([]string(nil), left...)
+	rightSet := append([]string(nil), right...)
+	sort.Strings(leftSet)
+	sort.Strings(rightSet)
+	for index := range leftSet {
+		if leftSet[index] != rightSet[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func validObservation(observation RuntimeSnapshot, now time.Time) bool {

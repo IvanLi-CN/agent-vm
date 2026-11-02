@@ -12,14 +12,17 @@ import (
 )
 
 type fakeRuntime struct {
-	active        string
-	observations  map[string]SlotObservation
-	failSwitch    bool
-	inconsistent  bool
-	identityError error
-	sequence      []string
-	traffic       map[string]bool
-	releaseIDs    map[string]string
+	active                string
+	observations          map[string]SlotObservation
+	failSwitch            bool
+	inconsistent          bool
+	identityError         error
+	stateEpoch            string
+	capabilities          []string
+	mutateContractOnGrant bool
+	sequence              []string
+	traffic               map[string]bool
+	releaseIDs            map[string]string
 }
 
 func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
@@ -35,13 +38,19 @@ func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 			value.ReleaseID = releaseID
 		}
 		value.SourceRevision = "revision-1"
-		value.StateEpoch = "epoch-1"
-		value.StateCapabilities = []string{"reads@1", "writes@1"}
+		value.StateEpoch = runtime.stateEpoch
+		if value.StateEpoch == "" {
+			value.StateEpoch = "epoch-1"
+		}
+		value.StateCapabilities = append([]string(nil), runtime.capabilities...)
+		if len(value.StateCapabilities) == 0 {
+			value.StateCapabilities = []string{"reads@1", "writes@1"}
+		}
 		slots[slot] = value
 	}
 	now := time.Unix(100, 0).UTC()
 	sources := map[string]SourceObservation{}
-	for _, source := range []string{"active_link", "slot_contracts", "native_observation", "inventory_observation"} {
+	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		sources[source] = SourceObservation{Up: true, ObservedAt: now}
 	}
 	return RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: runtime.active, ControllerSlot: runtime.active, Consistent: !runtime.inconsistent, Slots: slots, Sources: sources}, nil
@@ -54,12 +63,15 @@ func (runtime *fakeRuntime) Verify(context.Context, string, string) error {
 	runtime.sequence = append(runtime.sequence, "verify")
 	return nil
 }
-func (runtime *fakeRuntime) VerifySlotIdentity(context.Context, string, string, string) error {
+func (runtime *fakeRuntime) VerifySlotIdentity(context.Context, string, string, string, []string) error {
 	runtime.sequence = append(runtime.sequence, "verify-identity")
 	return runtime.identityError
 }
 func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, _ controllerrole.Lease) error {
 	runtime.sequence = append(runtime.sequence, "grant")
+	if runtime.mutateContractOnGrant {
+		runtime.stateEpoch = "epoch-2"
+	}
 	if observation, ok := runtime.observations[slot]; ok {
 		observation.ControllerOwned = true
 		runtime.observations[slot] = observation
@@ -248,7 +260,7 @@ func TestManagerResumesRollbackAfterRestart(t *testing.T) {
 		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
 	}}
 	transaction := store.Transaction{ID: "tx-resume-rollback", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseActiveSwitch, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
-	if err := database.Create(context.Background(), transaction, map[string]any{"previous_release_id": "release-blue", "previous_source_revision": "revision-1"}); err != nil {
+	if err := database.Create(context.Background(), transaction, map[string]any{"previous_release_id": "release-blue", "previous_source_revision": "revision-1", "previous_state_epoch": "epoch-1", "previous_state_capabilities": []string{"reads@1", "writes@1"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.BeginRollback(context.Background(), transaction.ID, transaction.Phase, PhaseRollback, "rollback_started", "test", nil, now); err != nil {
@@ -328,6 +340,65 @@ func TestManagerRejectsCandidateIdentityChangedAfterVerify(t *testing.T) {
 	}
 }
 
+func TestManagerRejectsCandidateStateContractChangedAfterVerify(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	transaction, err := manager.Stage(context.Background(), "green", "/bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Verify(context.Background(), transaction.ID); err != nil {
+		t.Fatal(err)
+	}
+	runtime.capabilities = []string{"legacy-agent-vm-core@1"}
+	if _, err := manager.Activate(context.Background(), transaction.ID); err == nil {
+		t.Fatal("candidate state contract change unexpectedly activated")
+	}
+	for _, action := range runtime.sequence {
+		if action == "revoke" || action == "grant" {
+			t.Fatalf("state contract mismatch caused controller effect: %v", runtime.sequence)
+		}
+	}
+}
+
+func TestManagerFencesWhenCandidateStateContractChangesAfterGrant(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", mutateContractOnGrant: true, observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	transaction, err := manager.Stage(context.Background(), "green", "/bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Verify(context.Background(), transaction.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Activate(context.Background(), transaction.ID); err == nil {
+		t.Fatal("candidate state contract change after grant unexpectedly activated")
+	}
+	for _, action := range runtime.sequence {
+		if action == "switch" {
+			t.Fatalf("state contract mismatch after grant caused an active-link switch: %v", runtime.sequence)
+		}
+	}
+}
+
 func TestManagerReconcilesControllerOnlyAfterFreshObservation(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
@@ -376,6 +447,13 @@ func TestManagerHardFencesInconsistentObservation(t *testing.T) {
 		if observation.ControllerOwned {
 			t.Fatalf("slot %s retained controller ownership after hard fencing", slot)
 		}
+	}
+	term, err := database.NextFenceTerm(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if term != 1 {
+		t.Fatalf("hard fencing allocated a durable term: %d", term)
 	}
 }
 
@@ -429,7 +507,7 @@ func TestManagerMarksActiveTransactionForRecoveryAfterRestart(t *testing.T) {
 	if err := manager.MaintainController(context.Background()); err == nil {
 		t.Fatal("controller was maintained while recovery was required")
 	}
-	wantSequence := []string{"traffic-disable", "traffic-disable", "revoke", "fence", "revoke", "fence"}
+	wantSequence := []string{"traffic-disable", "traffic-disable", "fence", "fence"}
 	if len(runtime.sequence) != len(wantSequence) {
 		t.Fatalf("fencing sequence = %v", runtime.sequence)
 	}

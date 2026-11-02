@@ -39,7 +39,7 @@ func (metrics *Metrics) Render() string {
 	output.WriteString("# TYPE agent_vm_deployd_observation_up gauge\n")
 	output.WriteString("# HELP agent_vm_deployd_observation_fresh Whether a source observation is within the composed freshness bound.\n")
 	output.WriteString("# TYPE agent_vm_deployd_observation_fresh gauge\n")
-	for _, source := range []string{"active_link", "slot_contracts", "native_observation", "inventory_observation"} {
+	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		observation := metrics.latest.Sources[source]
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_up{source=%s} %d\n", quote(source), boolInt(observation.Up)))
 		freshUntil := observation.FreshUntil
@@ -51,7 +51,7 @@ func (metrics *Metrics) Render() string {
 	}
 	output.WriteString("# HELP agent_vm_deployd_observation_timestamp_seconds Unix timestamp of the composed observation.\n")
 	output.WriteString("# TYPE agent_vm_deployd_observation_timestamp_seconds gauge\n")
-	for _, source := range []string{"active_link", "slot_contracts", "native_observation", "inventory_observation"} {
+	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		observation := metrics.latest.Sources[source]
 		if !observation.ObservedAt.IsZero() {
 			output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_timestamp_seconds{source=%s} %d\n", quote(source), observation.ObservedAt.Unix()))
@@ -163,7 +163,7 @@ func composedSnapshotFresh(snapshot RuntimeSnapshot, now time.Time) bool {
 	if !snapshot.Consistent || (snapshot.ActiveSlot != "blue" && snapshot.ActiveSlot != "green") || snapshot.ObservedAt.IsZero() || snapshot.FreshUntil.IsZero() || !snapshot.FreshUntil.After(now) {
 		return false
 	}
-	for _, name := range []string{"active_link", "slot_contracts", "native_observation", "inventory_observation"} {
+	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		source, ok := snapshot.Sources[name]
 		if !ok || !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) {
 			return false

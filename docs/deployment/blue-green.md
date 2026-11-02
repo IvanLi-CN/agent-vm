@@ -49,6 +49,8 @@
 Deployd 将候选 format-2 bundle 中经过完整清单校验的文件原子暂存到对应的 `/var/lib/agent-vm-native/slots/<slot>` 目录，然后才启动该槽位。
 服务继续使用现有 Incus 控制边界和 `agent-vm-web` socket 组。
 `agent-vm-deployd.service` 是槽位之外、由 root 拥有的宿主级控制器；它不是边缘代理、业务 API 或 rqlite 写入者。
+Deployd unit 不会因为自身重启而自动拉起槽位；槽位的启动、停止和切换由
+Deployd 在已验证的事务阶段中显式协调。
 Deployd 还从部署配置读取一个仅供 Prometheus 访问的内部管理监听地址，并在该地址提供只读 `GET /metrics`。
 该监听不经过 Caddy，不接收公网业务流量，也不替代 deployd 的 Unix socket。
 `agent-vm-caddy.service` 是唯一的边缘代理服务单元。
@@ -183,7 +185,7 @@ restore check 只有在 backup hash 与 manifest 和单独签名的 tail-evidenc
 在当前会话拥有的 Agent VM 中运行以下命令，不要在开发机上运行：
 
 ```sh
-bash skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh
+AGENT_VM_REAL_SYSTEMD=1 bash skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh
 ```
 
 该检查执行固定的 amd64 产物，并验证固定的 arm64 rqlite checksum，但不执行异构架构二进制文件。

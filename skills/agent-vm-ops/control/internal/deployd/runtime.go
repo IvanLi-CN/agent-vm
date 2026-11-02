@@ -76,6 +76,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		setSource("active_link", now, true, nil)
 	}
 	slotContractsUp := true
+	systemdObservationUp := true
 	nativeObservationUp := true
 	inventoryObservationUp := true
 	for _, slot := range []string{"blue", "green"} {
@@ -83,6 +84,10 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		body, status, requestErr := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil)
 		if requestErr != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) {
 			if requestErr != nil && runtime.systemdSlotStopped(ctx, slot) {
+				if slot == active {
+					slotContractsUp = false
+					snapshot.Consistent = false
+				}
 				observation.MetricFamilies = runtime.slotMetrics(slot)
 				snapshot.Slots[slot] = observation
 				continue
@@ -90,9 +95,10 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			if requestErr == nil {
 				requestErr = fmt.Errorf("slot %s health returned HTTP %d or an invalid health envelope", slot, status)
 			}
+			systemdObservationUp = false
 			slotContractsUp = false
 			snapshot.Consistent = false
-			runtime.clearSlotMetrics(slot)
+			runtime.invalidateMetrics(slot, "health")
 			observation.MetricFamilies = runtime.slotMetrics(slot)
 			snapshot.Slots[slot] = observation
 			continue
@@ -113,7 +119,9 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		observation.ReleaseID, _ = body["release_id"].(string)
 		observation.SourceRevision, _ = body["source_revision"].(string)
 		process, processOK := processIdentityFromHealth(body)
-		if !processOK || runtime.systemdProcessMatches(ctx, slot, process) != nil {
+		systemdErr := runtime.systemdProcessMatches(ctx, slot, process)
+		if !processOK || systemdErr != nil {
+			systemdObservationUp = false
 			slotContractsUp = false
 			snapshot.Consistent = false
 			observation.ProcessUp = false
@@ -121,7 +129,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			observation.Ready = false
 			observation.ControllerOwned = false
 			observation.TrafficAccepting = false
-			runtime.clearSlotMetrics(slot)
+			runtime.invalidateMetrics(slot, "health")
 			observation.MetricFamilies = runtime.slotMetrics(slot)
 			snapshot.Slots[slot] = observation
 			continue
@@ -200,6 +208,11 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 	} else {
 		setSource("slot_contracts", now, true, nil)
 	}
+	if !systemdObservationUp {
+		setSource("systemd", now, false, errors.New("one or more systemd slot identities could not be observed"))
+	} else {
+		setSource("systemd", now, true, nil)
+	}
 	if !nativeObservationUp {
 		setSource("native_observation", sourceTimes["native_observation"], false, errors.New("one or more native observation lanes failed"))
 	} else {
@@ -261,12 +274,6 @@ func (runtime *HostRuntime) rememberMetrics(slot, source string, families map[st
 
 func (runtime *HostRuntime) invalidateMetrics(slot, source string) {
 	runtime.rememberMetrics(slot, source, nil)
-}
-
-func (runtime *HostRuntime) clearSlotMetrics(slot string) {
-	runtime.mu.Lock()
-	delete(runtime.metrics, slot)
-	runtime.mu.Unlock()
 }
 
 func (runtime *HostRuntime) slotMetrics(slot string) map[string]string {
@@ -372,7 +379,7 @@ func (runtime *HostRuntime) Verify(ctx context.Context, slot, bundle string) err
 	return nil
 }
 
-func (runtime *HostRuntime) VerifySlotIdentity(_ context.Context, slot, releaseID, sourceRevision string) error {
+func (runtime *HostRuntime) VerifySlotIdentity(_ context.Context, slot, releaseID, sourceRevision string, capabilities []string) error {
 	if err := validSlot(slot); err != nil {
 		return err
 	}
@@ -389,6 +396,9 @@ func (runtime *HostRuntime) VerifySlotIdentity(_ context.Context, slot, releaseI
 	}
 	if metadata.ReleaseID != releaseID || metadata.SourceRevision != sourceRevision {
 		return fmt.Errorf("slot %s release identity does not match the verified rollback target", slot)
+	}
+	if err := releaseManifest.ValidateStateCapabilities(metadata, capabilities); err != nil {
+		return fmt.Errorf("verify slot %s state compatibility: %w", slot, err)
 	}
 	return nil
 }

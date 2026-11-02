@@ -136,6 +136,7 @@ const scriptPaths = [
   join(import.meta.dir, "generate_deployment_ca.sh"),
   join(import.meta.dir, "agent_vm_cutover.sh"),
   join(import.meta.dir, "agent_vm_state_migration.ts"),
+  join(import.meta.dir, "agent_vm_deployd_systemd_acceptance.sh"),
 ];
 for (const path of scriptPaths) {
   try {

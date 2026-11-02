@@ -70,6 +70,7 @@ loopback listener 可以使用本机访问控制；私有管理地址必须使�
 
 `/metrics` 请求只读取 deployd 最近一次完成的观测快照，不在 HTTP 请求中触发槽位采样、部署变更或 native effect。
 Deployd 的后台采样分别读取两个槽位的 `admin-metrics`、`admin-status`、`doctor`、native-worker 和 pending-operation 观测，并结合 `active` 符号链接、systemd、角色合同和流量计数器生成最终快照。
+来源至少包括 `active_link`、`systemd`、`slot_contracts`、`native_observation` 和 `inventory_observation`；systemd 身份校验失败必须能与槽位健康合同失败分别观测。
 容量与清单采样必须保持独立的 observation lane；一条 lane 失败不能擦除另一条 lane 的最新有效指标。
 
 槽位指标必须带 `slot="blue"` 或 `slot="green"` 标签。

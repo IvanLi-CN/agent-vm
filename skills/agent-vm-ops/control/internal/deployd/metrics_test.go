@@ -48,7 +48,7 @@ func TestMetricsMarkComposedSnapshotStaleWhenASourceFails(t *testing.T) {
 	now := time.Now().UTC()
 	metrics := NewMetrics(nil)
 	sources := map[string]SourceObservation{}
-	for _, name := range []string{"active_link", "slot_contracts", "native_observation", "inventory_observation"} {
+	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		sources[name] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
 	}
 	sources["native_observation"] = SourceObservation{Up: false, ObservedAt: now, FreshUntil: now.Add(time.Minute), Error: "observation unavailable"}

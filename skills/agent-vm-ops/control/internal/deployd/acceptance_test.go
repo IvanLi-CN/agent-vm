@@ -108,7 +108,7 @@ func (runtime *acceptanceRuntime) Observe(context.Context) (RuntimeSnapshot, err
 		}
 	}
 	sources := map[string]SourceObservation{}
-	for _, source := range []string{"active_link", "slot_contracts", "native_observation", "inventory_observation"} {
+	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		sources[source] = SourceObservation{Up: true, ObservedAt: now}
 	}
 	return RuntimeSnapshot{
@@ -137,7 +137,7 @@ func (runtime *acceptanceRuntime) Stage(_ context.Context, slot, _ string) error
 
 func (runtime *acceptanceRuntime) Verify(context.Context, string, string) error { return nil }
 
-func (runtime *acceptanceRuntime) VerifySlotIdentity(context.Context, string, string, string) error {
+func (runtime *acceptanceRuntime) VerifySlotIdentity(context.Context, string, string, string, []string) error {
 	return nil
 }
 

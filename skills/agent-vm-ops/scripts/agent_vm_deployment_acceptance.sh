@@ -45,6 +45,7 @@ require_command sha512sum
 require_command tar
 require_command openssl
 require_command systemd-analyze
+require_command systemctl
 require_command go
 
 static_result="$proof_dir/static.json"
@@ -393,7 +394,13 @@ bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.t
 
 go -C "$repository_root/skills/agent-vm-ops/control" test ./internal/deployd -run TestDeploydAgentVMAcceptance -count=1 >"$proof_dir/deployd-acceptance.txt" 2>&1 || {
   cat "$proof_dir/deployd-acceptance.txt" >&2
-  fail "Deployd dual-slot, metrics, rollback and restart acceptance failed"
+  fail "Deployd transaction acceptance failed"
 }
 
-printf '{"schema_version":1,"verdict":"pass","caddy":"2.11.7","rqlite":"10.5.2","checks":["pinned artifact checksums","CA and leaf certificates","Caddy configuration","systemd units","authenticated TLS rqlite","blue-green cutover guard","Deployd dual-slot controller and metrics","rollback and restart recovery","evidence-gated snapshot","restore admissibility"]}\n'
+[[ "${AGENT_VM_REAL_SYSTEMD:-0}" == 1 ]] || fail "real Agent VM acceptance requires AGENT_VM_REAL_SYSTEMD=1"
+bash "$repository_root/skills/agent-vm-ops/scripts/agent_vm_deployd_systemd_acceptance.sh" >"$proof_dir/deployd-systemd-acceptance.json" 2>&1 || {
+  cat "$proof_dir/deployd-systemd-acceptance.json" >&2
+  fail "real Deployd systemd acceptance failed"
+}
+
+printf '{"schema_version":1,"verdict":"pass","caddy":"2.11.7","rqlite":"10.5.2","checks":["pinned artifact checksums","CA and leaf certificates","Caddy configuration","systemd units","authenticated TLS rqlite","blue-green cutover guard","Deployd dual-slot controller and metrics","real systemd PID/cgroup/UDS","rollback and restart recovery","evidence-gated snapshot","restore admissibility"]}\n'
