@@ -1673,6 +1673,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             try:
                 if not restored or old_current is None:
                     _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+                    _deactivate_web_runtime()
                 else:
                     assert old_manifest is not None
                     if _is_product_manifest(old_manifest):
