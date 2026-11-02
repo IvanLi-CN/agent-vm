@@ -6,6 +6,7 @@ proof_dir="$(mktemp -d /tmp/agent-vm-deployment.XXXXXX)"
 rqlited_pid=""
 backend_pid=""
 caddy_pid=""
+rqlite_auth_config=""
 keep_proof="${KEEP_PROOF_DIR:-0}"
 
 cleanup() {
@@ -20,6 +21,9 @@ cleanup() {
   if [[ -n "$rqlited_pid" ]]; then
     kill -TERM "$rqlited_pid" 2>/dev/null || true
     wait "$rqlited_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$rqlite_auth_config" ]]; then
+    rm -f -- "$rqlite_auth_config"
   fi
   if [[ "$keep_proof" != 1 ]]; then
     rm -rf -- "$proof_dir"
@@ -253,6 +257,11 @@ mkdir -p -- "$rqlite_data"
   "$rqlite_data" >"$proof_dir/rqlite.log" 2>&1 &
 rqlited_pid=$!
 rqlite_base="https://127.0.0.1:$http_port"
+rqlite_auth_config="$proof_dir/rqlite-curl.conf"
+(
+  umask 077
+  printf 'user = "agent-vm-backup:%s"\n' "$backup_secret" >"$rqlite_auth_config"
+)
 rqlite_ready=0
 for _ in $(seq 1 120); do
   if ! kill -0 "$rqlited_pid" 2>/dev/null; then
@@ -260,13 +269,15 @@ for _ in $(seq 1 120); do
     fail "rqlited exited before becoming ready"
   fi
   if curl --fail --silent --show-error --cacert "$ca_dir/ca.crt" \
-    --user "agent-vm-backup:$backup_secret" "$rqlite_base/status" >/dev/null 2>&1; then
+    --config "$rqlite_auth_config" "$rqlite_base/status" >/dev/null 2>&1; then
     rqlite_ready=1
     break
   fi
   sleep 0.25
 done
 (( rqlite_ready == 1 )) || { cat "$proof_dir/rqlite.log" >&2; fail "rqlite did not become ready"; }
+rm -f -- "$rqlite_auth_config"
+rqlite_auth_config=""
 if curl --fail --silent --cacert "$ca_dir/ca.crt" "$rqlite_base/status" >/dev/null 2>&1; then
   fail "rqlite accepted an unauthenticated request"
 fi

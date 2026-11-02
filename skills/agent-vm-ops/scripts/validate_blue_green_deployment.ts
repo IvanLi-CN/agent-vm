@@ -149,6 +149,7 @@ requireText(slotUnit, "Requires=agent-vm-rqlite.service", "slot service requires
 forbidText(slotUnit, "ExecStart=/usr/bin/caddy", "slot service does not start a second proxy");
 
 const caddyUnit = read(join(assetsRoot, "systemd/agent-vm-caddy.service"));
+const acceptance = read(join(repositoryRoot, "skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh"));
 requireText(caddyUnit, "User=caddy", "Caddy does not run as root");
 requireText(caddyUnit, "After=network-online.target", "Caddy waits for network readiness before DNS-01");
 requireText(caddyUnit, "SupplementaryGroups=agent-vm-web", "Caddy can access the protected socket group");
@@ -161,6 +162,9 @@ requireText(caddyUnit, "ReadOnlyPaths=/etc/agent-vm-native/Caddyfile", "Caddy co
 requireText(caddyUnit, "ReadOnlyPaths=/etc/agent-vm-native/Caddyfile /etc/agent-vm-native/caddy.env", "Caddy configuration and credentials are read-only");
 requireText(caddyUnit, "ReadWritePaths=/var/lib/agent-vm-native/caddy", "Caddy can persist ACME state in its dedicated directory");
 forbidText(caddyUnit, "--environ", "Caddy does not dump the DNSPod environment at startup");
+requireText(acceptance, "rqlite-curl.conf", "rqlite readiness credentials use a temporary curl config");
+requireText(acceptance, "umask 077", "temporary rqlite curl credentials are owner-only");
+forbidText(acceptance, '--user "agent-vm-backup:$backup_secret"', "rqlite credentials are not placed in curl argv");
 forbidText(caddyUnit, "/etc/agent-vm-native/tls/caddy", "Caddy systemd unit does not require static certificate files");
 requireText(caddyUnit, "CapabilityBoundingSet=CAP_NET_BIND_SERVICE", "Caddy has only its bind capability");
 forbidText(caddyUnit, "User=root", "Caddy is not configured as root");

@@ -153,19 +153,22 @@ test("Caddy build integration requires an explicit v2 release and embeds DNSPod"
   try {
     const binDir = join(temporaryRoot, "bin");
     mkdirSync(binDir, { recursive: true });
-    const argsPath = join(temporaryRoot, "xcaddy.args");
     const xcaddy = join(binDir, "xcaddy");
     writeFileSync(xcaddy, `#!/bin/sh
 set -eu
-printf '%s\\n' "$@" > "$XCADDY_ARGS_FILE"
 output=""
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "--output" ]; then
-    shift
-    output="$1"
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "--output" ]; then
+    output="$argument"
   fi
-  shift
+  previous="$argument"
 done
+printf '%s\\n' "$@" > "$output.args"
+if env | grep -qE '^(DNSPOD_TOKEN|AGENT_VM_DOMAIN)='; then
+  printf '%s\\n' 'deployment environment leaked to xcaddy' >&2
+  exit 23
+fi
 cat > "$output" <<'EOF'
 #!/bin/sh
 case "\${1:-}" in
@@ -180,7 +183,12 @@ chmod 0755 "$output"
     writeFileSync(go, `#!/bin/sh
 set -eu
 if [ "\$1" = "version" ] && [ "\$2" = "-m" ]; then
-  printf '%s\\n' 'path caddy' "dep github.com/caddyserver/caddy/v2 \${CADDY_BUILD_VERSION:-v2.10.0}" "dep github.com/caddy-dns/dnspod \${DNSPOD_BUILD_VERSION:-v0.0.5-0.20260325061251-fb7cc31cc04c}"
+  case "\$3" in
+    *mismatched-version-caddy) caddy_version=v2.10.1; provider_version=v0.0.5-0.20260325061251-fb7cc31cc04c ;;
+    *mismatched-provider-caddy) caddy_version=v2.10.0; provider_version=v0.0.5-0.20260325061251-000000000000 ;;
+    *) caddy_version=v2.10.0; provider_version=v0.0.5-0.20260325061251-fb7cc31cc04c ;;
+  esac
+  printf '%s\\n' 'path caddy' "dep github.com/caddyserver/caddy/v2 \$caddy_version" "dep github.com/caddy-dns/dnspod \$provider_version"
   exit 0
 fi
 exit 1
@@ -199,12 +207,13 @@ exit 1
       env: {
         ...process.env,
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
-        XCADDY_ARGS_FILE: argsPath,
+        DNSPOD_TOKEN: "test-secret",
+        AGENT_VM_DOMAIN: "test.example",
       },
     });
     expect(built.exitCode).toBe(0);
     expect(statSync(output).mode & 0o111).not.toBe(0);
-    const args = readFileSync(argsPath, "utf8").trim().split("\n");
+    const args = readFileSync(`${output}.args`, "utf8").trim().split("\n");
     expect(args).toEqual([
       "build",
       "v2.10.0",
@@ -231,8 +240,6 @@ exit 1
       env: {
         ...process.env,
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
-        XCADDY_ARGS_FILE: argsPath,
-        CADDY_BUILD_VERSION: "v2.10.1",
       },
     });
     expect(mismatchedVersion.exitCode).not.toBe(0);
@@ -250,8 +257,6 @@ exit 1
       env: {
         ...process.env,
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
-        XCADDY_ARGS_FILE: argsPath,
-        DNSPOD_BUILD_VERSION: "v0.0.5-0.20260325061251-000000000000",
       },
     });
     expect(mismatchedProvider.exitCode).not.toBe(0);
@@ -269,7 +274,6 @@ exit 1
       env: {
         ...process.env,
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
-        XCADDY_ARGS_FILE: argsPath,
       },
     });
     expect(rejected.exitCode).not.toBe(0);

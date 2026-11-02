@@ -23,6 +23,38 @@ type BuildOptions = {
   expectedSha512?: string;
 };
 
+const buildEnvironmentKeys = [
+  "PATH",
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "GOCACHE",
+  "GOMODCACHE",
+  "GOPATH",
+  "GOROOT",
+  "GOTOOLCHAIN",
+  "GOFLAGS",
+  "GOPROXY",
+  "GOSUMDB",
+  "GONOSUMDB",
+  "GONOPROXY",
+  "GOPRIVATE",
+  "CGO_ENABLED",
+  "CC",
+  "CXX",
+  "PKG_CONFIG",
+  "SOURCE_DATE_EPOCH",
+  "XDG_CACHE_HOME",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+] as const;
+
 function usage(): string {
   return [
     "usage: bun skills/agent-vm-ops/scripts/build_caddy.ts \\",
@@ -121,6 +153,15 @@ function buildInfoValue(buildInfo: string, key: string): string {
   return match?.[1] ?? "";
 }
 
+function buildEnvironment(environment: Record<string, string | undefined>): Record<string, string> {
+  const sanitized: Record<string, string> = {};
+  for (const key of buildEnvironmentKeys) {
+    const value = environment[key];
+    if (typeof value === "string") sanitized[key] = value;
+  }
+  return sanitized;
+}
+
 export function commandFor(options: BuildOptions, metadata: CaddyMetadata): string[] {
   return [
     "build",
@@ -135,13 +176,14 @@ export function commandFor(options: BuildOptions, metadata: CaddyMetadata): stri
 export function buildCaddy(args: string[], environment: Record<string, string | undefined> = process.env): number {
   const options = parseArgs(args);
   const metadata = readCaddyMetadata();
+  const sanitizedEnvironment = buildEnvironment(environment);
   mkdirSync(dirname(options.output), { recursive: true });
 
   let result: ReturnType<typeof Bun.spawnSync>;
   try {
     result = Bun.spawnSync([metadata.builder, ...commandFor(options, metadata)], {
       env: {
-        ...environment,
+        ...sanitizedEnvironment,
         GOOS: "linux",
         GOARCH: options.target === "linux/amd64" ? "amd64" : "arm64",
       },
@@ -159,7 +201,11 @@ export function buildCaddy(args: string[], environment: Record<string, string | 
   // `go version -m` inspects Go build metadata without executing the target
   // binary, so cross-compiled linux/amd64 and linux/arm64 outputs are both
   // verifiable from the operator's build host.
-  const buildInfo = Bun.spawnSync(["go", "version", "-m", options.output], { stdout: "pipe", stderr: "pipe" });
+  const buildInfo = Bun.spawnSync(["go", "version", "-m", options.output], {
+    env: sanitizedEnvironment,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
   const buildInfoOutput = new TextDecoder().decode(buildInfo.stdout);
   const observedCaddyVersion = moduleVersion(buildInfoOutput, "github.com/caddyserver/caddy/v2");
   const observedProviderVersion = moduleVersion(buildInfoOutput, metadata.provider_module);
