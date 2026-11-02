@@ -9,6 +9,8 @@ backend_pid=""
 backend_pgid=""
 caddy_pid=""
 caddy_pgid=""
+cutover_pid=""
+cutover_pgid=""
 rqlite_auth_file=""
 rqlite_auth_config=""
 keep_proof="${KEEP_PROOF_DIR:-0}"
@@ -105,20 +107,26 @@ cleanup() {
   if [[ -n "$rqlited_pid" || -n "$rqlited_pgid" ]]; then
     stop_process "$rqlited_pid" "$rqlited_pgid" || cleanup_failed=1
   fi
+  if [[ -n "$cutover_pid" || -n "$cutover_pgid" ]]; then
+    stop_process "$cutover_pid" "$cutover_pgid" || cleanup_failed=1
+  fi
   if process_alive "$caddy_pid" || process_group_alive "$caddy_pgid" \
     || process_alive "$backend_pid" || process_group_alive "$backend_pgid" \
-    || process_alive "$rqlited_pid" || process_group_alive "$rqlited_pgid"; then
+    || process_alive "$rqlited_pid" || process_group_alive "$rqlited_pgid" \
+    || process_alive "$cutover_pid" || process_group_alive "$cutover_pgid"; then
     cleanup_failed=1
+  fi
+  # Credentials are temporary even when a stubborn process tree requires the
+  # proof directory to remain for diagnosis.
+  if [[ -n "$rqlite_auth_file" ]]; then
+    rm -f -- "$rqlite_auth_file" || cleanup_failed=1
+  fi
+  if [[ -n "$rqlite_auth_config" ]]; then
+    rm -f -- "$rqlite_auth_config" || cleanup_failed=1
   fi
   if (( cleanup_failed != 0 )); then
     printf 'cleanup incomplete; live acceptance process tree retained at %s\n' "$proof_dir" >&2
     return 0
-  fi
-  if [[ -n "$rqlite_auth_file" ]]; then
-    rm -f -- "$rqlite_auth_file"
-  fi
-  if [[ -n "$rqlite_auth_config" ]]; then
-    rm -f -- "$rqlite_auth_config"
   fi
   if [[ "$keep_proof" != 1 ]]; then
     rm -rf -- "$proof_dir"
@@ -339,6 +347,32 @@ chmod 0755 \
   "$systemd_root/usr/local/bin/caddy" \
   "$systemd_root/usr/local/bin/rqlited" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control"
+# The staged root is intentionally minimal, so provide command shims that
+# execute the host utilities while preserving the paths used by the units.
+cat >"$systemd_root/bin/sh" <<'EOF'
+#!/bin/sh
+exec /bin/sh "$@"
+EOF
+cat >"$systemd_root/usr/bin/test" <<'EOF'
+#!/bin/sh
+exec /usr/bin/test "$@"
+EOF
+cat >"$systemd_root/usr/bin/stat" <<'EOF'
+#!/bin/sh
+if [ "$1" = "-c" ] && [ "$2" = "%U:%a" ]; then
+  mode=$(/usr/bin/stat -c "%a" "$3")
+  uid=$(/usr/bin/stat -c "%u" "$3")
+  case "$uid" in
+    0) name=root ;;
+    994) name=agent-vm-rqlite ;;
+    *) name=UNKNOWN ;;
+  esac
+  printf '%s:%s\n' "$name" "$mode"
+  exit 0
+fi
+exec /usr/bin/stat "$@"
+EOF
+chmod 0755 "$systemd_root/bin/sh" "$systemd_root/usr/bin/test" "$systemd_root/usr/bin/stat"
 printf '%s\n' \
   'root:x:0:0:root:/root:/bin/sh' \
   'caddy:x:995:995:caddy:/var/lib/caddy:/usr/sbin/nologin' \
@@ -369,16 +403,19 @@ systemd-analyze --root="$systemd_root" verify \
     }
 
 # systemd-analyze --root verifies unit syntax and dependencies but does not run
-# ExecStartPre. Execute the metadata preconditions against the staged paths so
-# the acceptance gate exercises the same fail-closed ownership and mode checks.
+# ExecStartPre. Execute the metadata preconditions through the staged command
+# paths so the acceptance gate exercises the same fail-closed checks, including
+# the systemd-expanded %U metadata format.
 staged_auth="$systemd_root/etc/agent-vm-native/rqlite/auth.json"
 staged_caddy_env="$systemd_root/etc/agent-vm-native/caddy.env"
-/usr/bin/test -f "$staged_auth"
-staged_rqlite_uid="$(/usr/bin/stat -c "%u" "$staged_auth")"
-staged_rqlite_mode="$(/usr/bin/stat -c "%a" "$staged_auth")"
-[[ "$staged_rqlite_uid" == "$(awk -F: '$1 == "agent-vm-rqlite" {print $3}' "$systemd_root/etc/passwd")" && "$staged_rqlite_mode" == "600" ]] || fail "staged rqlite auth metadata does not satisfy ExecStartPre"
-/usr/bin/test -f "$staged_caddy_env"
-[[ "$(/usr/bin/stat -c "%u:%g:%a" "$staged_caddy_env")" == "0:0:600" ]] || fail "staged Caddy environment metadata does not satisfy ExecStartPre"
+"$systemd_root/bin/sh" -c '
+  "$3" -f "$1"
+  test "$("$2" -c "%U:%a" "$1")" = "agent-vm-rqlite:600"
+' _ "$staged_auth" "$systemd_root/usr/bin/stat" "$systemd_root/usr/bin/test" || fail "staged rqlite auth metadata does not satisfy ExecStartPre"
+"$systemd_root/bin/sh" -c '
+  "$3" -f "$1"
+  test "$("$2" -c "%u:%g:%a" "$1")" = "0:0:600"
+' _ "$staged_caddy_env" "$systemd_root/usr/bin/stat" "$systemd_root/usr/bin/test" || fail "staged Caddy environment metadata does not satisfy ExecStartPre"
 
 rqlite_archive="$proof_dir/rqlite.tar.gz"
 rqlite_url="https://github.com/rqlite/rqlite/releases/download/v10.5.2/rqlite-v10.5.2-linux-amd64.tar.gz"
@@ -453,18 +490,112 @@ fi
 
 layout_root="$proof_dir/layout"
 runtime_root="$proof_dir/runtime"
+cutover_health="$proof_dir/cutover-health"
 mkdir -p -- "$layout_root/slots/blue" "$layout_root/slots/green" "$runtime_root/blue" "$runtime_root/green"
+mkdir -p -- "$cutover_health"
 printf '{"slot":"blue"}\n' >"$layout_root/slots/blue/release-manifest.json"
 printf '{"slot":"green"}\n' >"$layout_root/slots/green/release-manifest.json"
 ln -s "$runtime_root/blue/app.sock" "$layout_root/slots/blue/app.sock"
 ln -s "$runtime_root/green/app.sock" "$layout_root/slots/green/app.sock"
-bash "$repository_root/skills/agent-vm-ops/scripts/agent_vm_cutover.sh" \
-  --root "$layout_root" --runtime-root "$runtime_root" --slot green --dry-run >"$proof_dir/cutover.json"
+printf 'ready\n' >"$cutover_health/blue.mode"
+printf 'ready\n' >"$cutover_health/green.mode"
+setsid --wait env -i PATH="$runtime_path" HOME="$runtime_home" PYTHONUNBUFFERED=1 \
+  python3 - "$runtime_root" "$cutover_health" >"$proof_dir/cutover-health.log" 2>&1 <<'PY' &
+import http.server
+import os
+import socketserver
+import sys
+import threading
+
+runtime_root, state_root = sys.argv[1:]
+counts = {}
+last_modes = {}
+lock = threading.Lock()
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        slot = self.server.slot
+        mode_path = os.path.join(state_root, f"{slot}.mode")
+        try:
+            with open(mode_path, encoding="utf-8") as handle:
+                mode = handle.read().strip()
+        except FileNotFoundError:
+            mode = "fail"
+        with lock:
+            if last_modes.get(slot) != mode:
+                last_modes[slot] = mode
+                counts[slot] = 0
+            counts[slot] = counts.get(slot, 0) + 1
+            ready = mode == "ready" or (mode == "once" and counts[slot] == 1)
+        payload = b'{"ready":true}\n' if ready else b'{"ready":false}\n'
+        self.send_response(200 if ready else 503)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, format, *args):
+        pass
+
+class Server(socketserver.ThreadingUnixStreamServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+servers = []
+for slot in ("blue", "green"):
+    socket_path = os.path.join(runtime_root, slot, "app.sock")
+    try:
+        os.unlink(socket_path)
+    except FileNotFoundError:
+        pass
+    server = Server(socket_path, Handler)
+    server.slot = slot
+    servers.append(server)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+threading.Event().wait()
+PY
+cutover_pid=$!
+cutover_pgid="$(capture_process_group "$cutover_pid")" || fail "cutover health process group was not isolated"
+for slot in blue green; do
+  for _ in $(seq 1 40); do
+    [[ -S "$runtime_root/$slot/app.sock" ]] && break
+    sleep 0.05
+  done
+  [[ -S "$runtime_root/$slot/app.sock" ]] || fail "cutover health socket did not start: $slot"
+done
+cutover_script="$repository_root/skills/agent-vm-ops/scripts/agent_vm_cutover.sh"
 ln -s "$layout_root/slots/blue" "$layout_root/active"
-if bash "$repository_root/skills/agent-vm-ops/scripts/agent_vm_cutover.sh" \
+if bash "$cutover_script" \
   --root "$layout_root" --runtime-root "$runtime_root" --slot red --dry-run >/dev/null 2>&1; then
   fail "cutover accepted an unknown slot"
 fi
+bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot green >"$proof_dir/cutover-green.json"
+[[ "$(readlink -f -- "$layout_root/active")" == "$(readlink -f -- "$layout_root/slots/green")" ]] || fail "cutover did not activate green"
+[[ ! -e "$layout_root/.active.cutover.pending" && ! -L "$layout_root/.active.cutover.pending" ]] || fail "cutover left a pending record"
+
+# Move back to blue, then make green pass its candidate check and fail its
+# post-swap check so the real rollback path is exercised.
+bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot blue >"$proof_dir/cutover-blue.json"
+printf 'once\n' >"$cutover_health/green.mode"
+if bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot green >"$proof_dir/cutover-rollback.json" 2>&1; then
+  fail "cutover accepted a candidate that failed post-swap health"
+fi
+[[ "$(readlink -f -- "$layout_root/active")" == "$(readlink -f -- "$layout_root/slots/blue")" ]] || fail "cutover rollback did not restore blue"
+[[ ! -e "$layout_root/.active.cutover.pending" && ! -L "$layout_root/.active.cutover.pending" ]] || fail "rollback left a pending record"
+
+# Create the durable pending record left by an interrupted green swap, make
+# green unhealthy, and let the next blue cutover recover it before proceeding.
+printf 'ready\n' >"$cutover_health/green.mode"
+bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot green >"$proof_dir/cutover-green-recovery.json"
+printf 'fail\n' >"$cutover_health/green.mode"
+printf 'previous=blue\ncandidate=green\n' >"$layout_root/.active.cutover.pending"
+chmod 0600 "$layout_root/.active.cutover.pending"
+bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot blue >"$proof_dir/cutover-recovery.json"
+[[ "$(readlink -f -- "$layout_root/active")" == "$(readlink -f -- "$layout_root/slots/blue")" ]] || fail "pending recovery did not restore blue"
+[[ ! -e "$layout_root/.active.cutover.pending" && ! -L "$layout_root/.active.cutover.pending" ]] || fail "pending recovery left a record"
+stop_process "$cutover_pid" "$cutover_pgid" || fail "cutover health process group did not stop"
+cutover_pid=""
+cutover_pgid=""
 
 sqlite_source="$proof_dir/source.sqlite3"
 python3 - "$sqlite_source" <<'PY'

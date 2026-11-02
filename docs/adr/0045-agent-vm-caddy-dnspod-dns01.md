@@ -12,7 +12,7 @@ Caddy 的 DNS challenge provider 不是 stock binary 的默认模块。官方 `c
 
 ## Decision
 
-部署使用由 `xcaddy` 构建的自定义 Caddy v2 binary，并编译官方 `github.com/caddy-dns/dnspod` provider。仓库只约束 Caddy major version 2；构建 helper 要求操作者显式提供一个 v2 release，拒绝 `latest`、分支和其他隐式版本解析。DNSPod provider source 使用仓库 metadata 中的官方 commit ref，以便自定义 binary 的模块输入可复核。
+部署使用由 `xcaddy` 构建的自定义 Caddy v2 binary，并编译官方 `github.com/caddy-dns/dnspod` provider。仓库只约束 Caddy major version 2；构建 helper 要求操作者显式提供一个 v2 release，拒绝 `latest`、分支和其他隐式版本解析。DNSPod provider source 使用仓库 metadata 中的官方 commit ref，以便自定义 binary 的模块输入可复核。Ubuntu PR gate 与隔离 acceptance 还会验证真实 cutover、失败回滚、pending recovery 和 staged systemd metadata preconditions；cutover 的临时 staging 名称与 PID 无关，避免 PID 重用阻塞后续交换。
 
 Caddyfile 由 Caddy 自己通过 DNS-01 申请、续期并持久化证书和私钥，同时关闭自动 HTTP listener。域名和 `DNSPOD_TOKEN` 只通过 root-owned mode-0600 的 deployment environment file 提供；Caddy 以非 root 用户运行，并将 ACME storage 写入专用持久目录。Caddy 启动不打印环境变量，systemd 在启动 Caddy 前以 root peer 身份等待 active Unix socket 的健康 endpoint 返回 ready，避免把 stale socket 当作可用服务。候选槽位发布和 active link 的 cutover/rollback 由 `/var/lib/agent-vm-native/.cutover.lock` 上的内核 `flock` 串行化；交换前写入 mode-0600 的 `.active.cutover.pending` 记录，使后续 cutover 能恢复进程在交换后退出留下的半完成状态。进程退出后不会留下阻塞后续操作的目录锁。仓库不保存真实域名、DNSPod 凭据、证书私钥、部署地址或 inventory。
 

@@ -201,7 +201,7 @@ if [ "\$1" = "version" ] && [ "\$2" = "-m" ]; then
     *mismatched-provider-caddy) caddy_version=v2.10.0; provider_version=v0.0.5-0.20260325061251-000000000000 ;;
     *) caddy_version=v2.10.0; provider_version=v0.0.5-0.20260325061251-fb7cc31cc04c ;;
   esac
-  printf '%s\\n' 'path caddy' "dep github.com/caddyserver/caddy/v2 \$caddy_version" "dep github.com/caddy-dns/dnspod \$provider_version"
+  printf '%s\\n' 'path caddy' "mod github.com/caddyserver/caddy/v2 \$caddy_version" "dep github.com/caddy-dns/dnspod \$provider_version"
   exit 0
 fi
 exit 1
@@ -368,6 +368,8 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain("active_matches_current || die");
   expect(cutover).toContain("active target slot is missing");
   expect(cutover).toContain("flock --wait 30 9");
+  expect(cutover).toContain("mktemp -d -- \"$root_dir/.active-stage.XXXXXX\"");
+  expect(cutover).not.toContain(".active.$$.tmp");
   expect(cutover).not.toContain('mkdir -- "$lock_dir"');
   expect(cutover).toContain("Every writer of the protected active link must hold this kernel lock");
   const acceptance = read("skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh");
@@ -384,9 +386,22 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(acceptance).toContain('kill -TERM -- "-$group_id"');
   expect(acceptance).toContain("process_group_for");
   expect(acceptance).toContain('wait "$pid"');
+  expect(acceptance).toContain('rm -f -- "$rqlite_auth_file" || cleanup_failed=1');
+  expect(acceptance).toContain('rm -f -- "$rqlite_auth_config" || cleanup_failed=1');
   expect(acceptance).toContain("chown 994:994");
   expect(acceptance).toContain("staged rqlite auth metadata does not satisfy ExecStartPre");
   expect(acceptance).toContain("staged Caddy environment metadata does not satisfy ExecStartPre");
+  expect(acceptance).toContain('"$systemd_root/bin/sh" -c');
+  expect(acceptance).toContain('"$2" -c "%U:%a"');
+  expect(acceptance).toContain('failed post-swap health');
+  expect(acceptance).toContain('previous=blue\\ncandidate=green');
+  expect(acceptance).toContain('pending recovery did not restore blue');
+  const ci = read(".github/workflows/ci.yml");
+  expect(ci).toContain("github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.4");
+  expect(ci).toContain("skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh");
+  expect(ci).toContain("repos/caddyserver/caddy/releases");
+  expect(ci).toContain("CADDY_VERSION=$caddy_version");
+  expect(ci).not.toContain("CADDY_VERSION: v2.");
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-cutover-test-"));
   try {
     const layout = join(temporaryRoot, "layout");

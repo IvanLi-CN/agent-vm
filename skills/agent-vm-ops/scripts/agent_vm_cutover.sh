@@ -129,6 +129,7 @@ fi
 [[ "$EUID" -eq 0 ]] || die "health verification must run as root for the protected Unix endpoint"
 command -v curl >/dev/null 2>&1 || die "curl is required for the protected health check"
 command -v flock >/dev/null 2>&1 || die "flock is required for the active link lock"
+command -v mktemp >/dev/null 2>&1 || die "mktemp is required for unique cutover staging"
 command -v stat >/dev/null 2>&1 || die "stat is required for cutover recovery metadata"
 command -v sync >/dev/null 2>&1 || die "sync is required for cutover recovery durability"
 [[ -S "$expected_socket" ]] || die "candidate runtime socket is not present"
@@ -137,11 +138,16 @@ mkdir -p -- "$root_dir"
 lock_path="$root_dir/.cutover.lock"
 exec 9>"$lock_path" || die "cannot open the active link lock"
 flock --wait 30 9 || die "another active link operation is in progress"
-temporary_link="$root_dir/.active.$$.tmp"
-rollback_link="$root_dir/.active.$$.rollback.tmp"
+stage_dir=""
+temporary_link=""
+rollback_link=""
+stage_dir="$(mktemp -d -- "$root_dir/.active-stage.XXXXXX")" || die "cannot create unique cutover staging directory"
+temporary_link="$stage_dir/active"
+rollback_link="$stage_dir/rollback"
 cleanup() {
-  rm -f -- "$temporary_link"
-  rm -f -- "$rollback_link"
+  if [[ -n "$stage_dir" ]]; then
+    rm -rf -- "$stage_dir"
+  fi
   flock --unlock 9 2>/dev/null || true
   exec 9>&-
 }

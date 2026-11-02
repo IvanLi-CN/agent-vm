@@ -157,6 +157,7 @@ forbidText(slotUnit, "ExecStart=/usr/bin/caddy", "slot service does not start a 
 const caddyUnit = read(join(assetsRoot, "systemd/agent-vm-caddy.service"));
 const acceptance = read(join(repositoryRoot, "skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh"));
 const cutover = read(join(import.meta.dir, "agent_vm_cutover.sh"));
+const ciWorkflow = read(join(repositoryRoot, ".github/workflows/ci.yml"));
 requireText(caddyUnit, "User=caddy", "Caddy does not run as root");
 requireText(caddyUnit, "After=network-online.target", "Caddy waits for network readiness before DNS-01");
 requireText(caddyUnit, "SupplementaryGroups=agent-vm-web", "Caddy can access the protected socket group");
@@ -188,12 +189,23 @@ requireText(acceptance, 'wait "$pid"', "isolated acceptance waits for runtime pr
 requireText(acceptance, "chown 994:994", "staged rqlite auth is owned by the service UID");
 requireText(acceptance, "staged rqlite auth metadata does not satisfy ExecStartPre", "staging executes the rqlite metadata precondition");
 requireText(acceptance, "staged Caddy environment metadata does not satisfy ExecStartPre", "staging executes the Caddy metadata precondition");
+requireText(acceptance, '"$systemd_root/bin/sh" -c', "staging executes preconditions through the staged shell path");
+requireText(acceptance, '"$2" -c "%U:%a"', "staging exercises the systemd-expanded owner metadata format");
 for (const commandPath of ["$systemd_root/bin/sh", "$systemd_root/usr/bin/curl", "$systemd_root/usr/bin/sleep", "$systemd_root/usr/bin/stat"]) {
   requireText(acceptance, commandPath, `systemd staging root provides ${commandPath}`);
 }
 requireText(acceptance, 'rqlite_auth_file="$proof_dir/auth.json"', "temporary rqlite auth file has an explicit path");
 requireText(acceptance, 'chmod 0600 "$rqlite_auth_file"', "temporary rqlite auth file is owner-only");
 requireText(acceptance, 'rm -f -- "$rqlite_auth_file"', "temporary rqlite auth file is removed during cleanup");
+requireText(acceptance, "failed post-swap health", "isolated acceptance executes the rollback path");
+requireText(acceptance, 'previous=blue\\ncandidate=green', "isolated acceptance executes pending recovery");
+requireText(acceptance, "pending recovery did not restore blue", "isolated acceptance verifies pending recovery");
+requireText(ciWorkflow, "github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.4", "Ubuntu PR gate installs a pinned xcaddy builder");
+requireText(ciWorkflow, "skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh", "Ubuntu PR gate runs isolated deployment acceptance");
+requireText(ciWorkflow, "repos/caddyserver/caddy/releases", "Ubuntu PR gate resolves an official Caddy release");
+requireText(ciWorkflow, "CADDY_VERSION=$caddy_version", "Ubuntu PR gate passes an explicit resolved Caddy v2 input");
+requireText(ciWorkflow, "^v2\\\\.", "Ubuntu PR gate selects only stable Caddy v2 releases");
+forbidText(ciWorkflow, "CADDY_VERSION: v2.", "Ubuntu PR gate does not pin a Caddy patch release");
 forbidText(acceptance, '--user "agent-vm-backup:$backup_secret"', "rqlite credentials are not placed in curl argv");
 requireText(cutover, 'health_check "$active/app.sock"', "cutover rechecks the active socket after atomic replacement");
 requireText(cutover, "active_matches_current || die", "cutover refuses to replace an active link changed during readiness");
@@ -209,6 +221,8 @@ requireText(cutover, 'validate_slot_layout "$current_slot"', "cutover validates 
 requireText(cutover, "sync -f", "cutover flushes recovery and active-link directory updates");
 requireText(cutover, "candidate_record/app.sock", "cutover confirms a pending candidate before rollback");
 requireText(cutover, "flock --wait 30 9", "cutover serializes active link writers with a kernel lock");
+requireText(cutover, 'mktemp -d -- "$root_dir/.active-stage.XXXXXX"', "cutover uses PID-independent unique staging");
+forbidText(cutover, ".active.$$.tmp", "cutover does not reuse PID-derived staging names");
 forbidText(cutover, 'mkdir -- "$lock_dir"', "cutover does not use a crash-stale directory lock");
 forbidText(caddyUnit, "/etc/agent-vm-native/tls/caddy", "Caddy systemd unit does not require static certificate files");
 requireText(caddyUnit, "CapabilityBoundingSet=CAP_NET_BIND_SERVICE", "Caddy has only its bind capability");

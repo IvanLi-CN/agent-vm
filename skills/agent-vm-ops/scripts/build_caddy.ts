@@ -142,7 +142,8 @@ function readCaddyMetadata(): CaddyMetadata {
 
 function moduleVersion(buildInfo: string, modulePath: string): string {
   const escapedModulePath = modulePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = buildInfo.match(new RegExp(`^\\s*dep\\s+${escapedModulePath}\\s+(\\S+)`, "m"));
+  // The main module is emitted as `mod`; dependencies are emitted as `dep`.
+  const match = buildInfo.match(new RegExp(`^\\s*(?:mod|dep)\\s+${escapedModulePath}\\s+(\\S+)`, "m"));
   return match?.[1] ?? "";
 }
 
