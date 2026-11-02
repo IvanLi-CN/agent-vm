@@ -109,10 +109,16 @@ func (runtime *fakeRuntime) Stop(context.Context, string) error {
 func (runtime *fakeRuntime) Rollback(context.Context, string, string, controllerrole.Lease) error {
 	runtime.sequence = append(runtime.sequence, "rollback")
 	runtime.active = "blue"
+	previous := runtime.observations["blue"]
+	previous.ProcessUp = true
+	previous.ProcessReady = true
+	previous.Ready = true
+	previous.ControllerOwned = true
+	runtime.observations["blue"] = previous
 	if runtime.traffic == nil {
 		runtime.traffic = map[string]bool{}
 	}
-	runtime.traffic["blue"] = true
+	runtime.traffic["blue"] = false
 	runtime.traffic["green"] = false
 	return nil
 }
@@ -177,6 +183,37 @@ func TestManagerFencesUncertainActiveSwitch(t *testing.T) {
 	}
 }
 
+func TestManagerRollsBackFinalizedTransaction(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	transaction, err := manager.Stage(context.Background(), "green", "/tmp/release.tar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Verify(context.Background(), transaction.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Activate(context.Background(), transaction.ID); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := manager.Rollback(context.Background(), transaction.ID)
+	if err != nil {
+		t.Fatalf("rollback finalized transaction: %v", err)
+	}
+	if updated.State != "finalized" || updated.Phase != PhaseFinalize || !updated.RollbackUsed {
+		t.Fatalf("rolled back transaction = %#v", updated)
+	}
+}
+
 func TestManagerReconcilesControllerOnlyAfterFreshObservation(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
@@ -232,8 +269,14 @@ func TestManagerMarksActiveTransactionForRecoveryAfterRestart(t *testing.T) {
 	if err := manager.MaintainController(context.Background()); err == nil {
 		t.Fatal("controller was maintained while recovery was required")
 	}
-	if len(runtime.sequence) != 2 || runtime.sequence[0] != "revoke" || runtime.sequence[1] != "revoke" {
+	wantSequence := []string{"traffic-disable", "traffic-disable", "revoke", "revoke"}
+	if len(runtime.sequence) != len(wantSequence) {
 		t.Fatalf("fencing sequence = %v", runtime.sequence)
+	}
+	for index, want := range wantSequence {
+		if runtime.sequence[index] != want {
+			t.Fatalf("fencing sequence = %v, want %v", runtime.sequence, wantSequence)
+		}
 	}
 }
 

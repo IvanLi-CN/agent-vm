@@ -183,9 +183,14 @@ func cloneAuditSummary(summary state.AuditSummary) state.AuditSummary {
 	return clone
 }
 
-func (s *Service) MarkReady()    { s.mu.Lock(); s.ready = true; s.mu.Unlock() }
-func (s *Service) MarkNotReady() { s.mu.Lock(); s.ready = false; s.mu.Unlock() }
-func (s *Service) Ready() bool   { s.mu.RLock(); defer s.mu.RUnlock(); return s.ready }
+func (s *Service) MarkReady() { s.mu.Lock(); s.ready = true; s.mu.Unlock() }
+func (s *Service) MarkNotReady() {
+	s.mu.Lock()
+	s.ready = false
+	s.mu.Unlock()
+	s.SetTrafficAccepting(false)
+}
+func (s *Service) Ready() bool { s.mu.RLock(); defer s.mu.RUnlock(); return s.ready }
 func (s *Service) SetWake(wake func()) {
 	s.mu.Lock()
 	s.wake = wake

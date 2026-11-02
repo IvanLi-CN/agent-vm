@@ -140,15 +140,20 @@ func (s *Server) health(c *gin.Context) {
 		controllerOwned = valid
 		if valid {
 			lease = current
+		} else {
+			// Lease expiry is a traffic fence as well as a mutation fence.
+			s.Service.SetTrafficAccepting(false)
 		}
 	}
 	status := http.StatusOK
 	if !ready {
 		status = http.StatusServiceUnavailable
 	}
+	processStartTime := controllerrole.ProcessStartToken(os.Getpid())
 	c.JSON(status, map[string]any{
 		"ok": true, "ready": ready, "process_ready": true, "controller_ready": ready,
 		"controller_owned": controllerOwned, "traffic_accepting": s.Service.TrafficAccepting(), "lease": lease, "protocol": protocol.Version,
+		"process_id": os.Getpid(), "process_start_time": processStartTime,
 		"release_id":      releaseValue(s.Service.Release, func(value *protocol.ReleaseMetadata) string { return value.ReleaseID }),
 		"source_revision": releaseValue(s.Service.Release, func(value *protocol.ReleaseMetadata) string { return value.SourceRevision }),
 	})
@@ -211,6 +216,9 @@ func (s *Server) controllerRole(c *gin.Context) {
 		err = s.RoleGate.Grant(command.Lease)
 	case "revoke":
 		err = s.RoleGate.Revoke(command.Lease)
+		if err == nil {
+			s.Service.SetTrafficAccepting(false)
+		}
 	default:
 		err = protocol.NewError("invalid_request", "controller role action must be grant or revoke", nil)
 	}

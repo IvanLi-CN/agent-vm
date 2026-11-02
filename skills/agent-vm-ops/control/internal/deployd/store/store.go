@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -210,6 +211,43 @@ func (s *Store) initialize(ctx context.Context) error {
 	return tx.Commit()
 }
 
+// NextFenceTerm allocates a term durably so a Deployd restart cannot reuse an
+// older fencing token or depend on wall-clock monotonicity.
+func (s *Store) NextFenceTerm(ctx context.Context) (uint64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	var encoded string
+	err = tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = 'fencing_term'").Scan(&encoded)
+	current := uint64(0)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = nil
+	} else if err == nil {
+		current, err = strconv.ParseUint(encoded, 10, 64)
+	}
+	if err != nil {
+		_ = tx.Rollback()
+		return 0, fmt.Errorf("read fencing term: %w", err)
+	}
+	if current == ^uint64(0) {
+		_ = tx.Rollback()
+		return 0, errors.New("fencing term exhausted")
+	}
+	next := current + 1
+	if _, err := tx.ExecContext(ctx, `INSERT INTO meta(key,value) VALUES('fencing_term',?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, strconv.FormatUint(next, 10)); err != nil {
+		_ = tx.Rollback()
+		return 0, fmt.Errorf("write fencing term: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit fencing term: %w", err)
+	}
+	return next, nil
+}
+
 func (s *Store) Create(ctx context.Context, transaction Transaction, evidence map[string]any) error {
 	if transaction.ID == "" || transaction.TargetSlot == "" || transaction.Bundle == "" || transaction.Generation < 1 {
 		return errors.New("deployment transaction identity is incomplete")
@@ -341,20 +379,45 @@ func (s *Store) RecordFailure(ctx context.Context, id, phase, code, source, dige
 		return err
 	}
 	return s.write(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, "INSERT INTO deployment_failure_evidence(transaction_id,phase,code,source,payload_json,digest,created_at) VALUES(?,?,?,?,?,?,?)", id, phase, code, source, encoded, digest, formatTime(now)); err != nil {
+		var currentPhase, currentState string
+		if err := tx.QueryRowContext(ctx, "SELECT phase, state FROM deployment_transactions WHERE transaction_id = ?", id).Scan(&currentPhase, &currentState); err != nil {
 			return err
 		}
-		recoveryRequired := code == "state_unverified"
-		state := "failed"
-		if recoveryRequired {
-			state = "needs_recovery"
+		if currentState == "finalized" || currentState == "rolled_back" || currentState == "failed" || currentState == "needs_recovery" {
+			return nil
+		}
+		if currentPhase != phase {
+			return fmt.Errorf("deployment failure phase conflict: expected %s, got %s", phase, currentPhase)
 		}
 		errorMessage := code
 		if message, ok := payload["message"].(string); ok && message != "" {
 			errorMessage = message
 		}
-		_, err := tx.ExecContext(ctx, "UPDATE deployment_transactions SET error_code = ?, error_message = ?, recovery_required = ?, state = ?, updated_at = ? WHERE transaction_id = ?", code, errorMessage, boolInt(recoveryRequired), state, formatTime(now), id)
-		return err
+		recoveryRequired := code == "state_unverified"
+		state := "failed"
+		transition := "failed"
+		if recoveryRequired {
+			state = "needs_recovery"
+			transition = "needs_recovery"
+		}
+		var sequence int64
+		if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(sequence), 0) + 1 FROM deployment_phase_events WHERE transaction_id = ?", id).Scan(&sequence); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO deployment_failure_evidence(transaction_id,phase,code,source,payload_json,digest,created_at) VALUES(?,?,?,?,?,?,?)", id, phase, code, source, encoded, digest, formatTime(now)); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE deployment_transactions SET error_code = ?, error_message = ?, recovery_required = ?, state = ?, updated_at = ?
+			WHERE transaction_id = ? AND phase = ? AND state NOT IN ('finalized','rolled_back','failed','needs_recovery')`, code, errorMessage, boolInt(recoveryRequired), state, formatTime(now), id, phase)
+		if err != nil {
+			return err
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return err
+		} else if affected != 1 {
+			return errors.New("deployment failure state changed concurrently")
+		}
+		return insertEvent(ctx, tx, id, sequence, phase, transition, source, payload, now)
 	})
 }
 

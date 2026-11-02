@@ -26,12 +26,21 @@ import (
 type HostRuntime struct {
 	Config Config
 
-	mu      sync.Mutex
-	metrics map[string]map[string]map[string]string
+	mu            sync.Mutex
+	metrics       map[string]map[string]map[string]string
+	sources       map[string]SourceObservation
+	stagedProcess map[string]processIdentity
 }
 
+type processIdentity struct {
+	PID       int64
+	StartTime string
+}
+
+const deploydDrainSession = "release-agent-vm-deployd"
+
 func NewHostRuntime(config Config) *HostRuntime {
-	return &HostRuntime{Config: config, metrics: map[string]map[string]map[string]string{}}
+	return &HostRuntime{Config: config, metrics: map[string]map[string]map[string]string{}, sources: map[string]SourceObservation{}, stagedProcess: map[string]processIdentity{}}
 }
 
 func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error) {
@@ -43,12 +52,21 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 	snapshot := RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(2 * runtime.Config.ObserveInterval()), ActiveSlot: active, ControllerSlot: "none", Consistent: activeErr == nil, Slots: map[string]SlotObservation{}, Sources: map[string]SourceObservation{}}
 	sourceTimes := map[string]time.Time{}
 	setSource := func(name string, observedAt time.Time, up bool, cause error) {
-		if observedAt.IsZero() {
-			observedAt = now
-		}
-		observation := SourceObservation{Up: up, ObservedAt: observedAt}
-		if cause != nil {
-			observation.Error = cause.Error()
+		observation := SourceObservation{Up: up}
+		if up {
+			observation.ObservedAt = observedAt
+			if observation.ObservedAt.IsZero() {
+				observation.ObservedAt = now
+			}
+			observation.FreshUntil = observation.ObservedAt.Add(runtime.sourceFreshness())
+			runtime.rememberSource(name, observation)
+		} else {
+			previous := runtime.source(name)
+			observation.ObservedAt = previous.ObservedAt
+			observation.FreshUntil = previous.FreshUntil
+			if cause != nil {
+				observation.Error = "observation unavailable"
+			}
 		}
 		snapshot.Sources[name] = observation
 	}
@@ -177,7 +195,44 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 	} else {
 		setSource("inventory_observation", sourceTimes["inventory_observation"], true, nil)
 	}
+	snapshot.FreshUntil = composedFreshUntil(snapshot.Sources, now)
 	return snapshot, nil
+}
+
+func (runtime *HostRuntime) sourceFreshness() time.Duration {
+	interval := runtime.Config.ObserveInterval()
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	return 2 * interval
+}
+
+func (runtime *HostRuntime) source(name string) SourceObservation {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.sources[name]
+}
+
+func (runtime *HostRuntime) rememberSource(name string, observation SourceObservation) {
+	runtime.mu.Lock()
+	runtime.sources[name] = observation
+	runtime.mu.Unlock()
+}
+
+func composedFreshUntil(sources map[string]SourceObservation, now time.Time) time.Time {
+	var result time.Time
+	for _, source := range sources {
+		if source.FreshUntil.IsZero() {
+			continue
+		}
+		if result.IsZero() || source.FreshUntil.Before(result) {
+			result = source.FreshUntil
+		}
+	}
+	if result.IsZero() {
+		return now
+	}
+	return result
 }
 
 func (runtime *HostRuntime) rememberMetrics(slot, source string, families map[string]string) {
@@ -238,10 +293,21 @@ func (runtime *HostRuntime) Stage(ctx context.Context, slot, bundle string) erro
 	if active == slot {
 		return fmt.Errorf("cannot stage over active slot %s", slot)
 	}
+	previousProcess, previousProcessOK := runtime.readProcessIdentity(ctx, slot)
 	if err := runtime.stageBundle(slot, bundle); err != nil {
 		return err
 	}
-	return runtime.systemctl(ctx, "start", "agent-vm-native@"+slot+".service")
+	if err := runtime.systemctl(ctx, "restart", "agent-vm-native@"+slot+".service"); err != nil {
+		return err
+	}
+	currentProcess, err := runtime.waitSlotIdentity(ctx, slot, previousProcess, previousProcessOK)
+	if err != nil {
+		return err
+	}
+	runtime.mu.Lock()
+	runtime.stagedProcess[slot] = currentProcess
+	runtime.mu.Unlock()
+	return nil
 }
 
 func (runtime *HostRuntime) Verify(ctx context.Context, slot, bundle string) error {
@@ -253,14 +319,50 @@ func (runtime *HostRuntime) Verify(ctx context.Context, slot, bundle string) err
 		return fmt.Errorf("create staged bundle verification directory: %w", err)
 	}
 	defer os.RemoveAll(temporary)
-	if _, err := extractAndVerifyBundle(bundle, temporary); err != nil {
+	manifest, err := extractAndVerifyBundle(bundle, temporary)
+	if err != nil {
+		return err
+	}
+	if err := runtime.ensureSlotSocketLink(temporary, slot); err != nil {
 		return err
 	}
 	staged := filepath.Join(runtime.Config.ReleaseRoot, "slots", slot)
+	if err := runtime.verifySlotSocketLink(staged, slot); err != nil {
+		return err
+	}
 	if err := compareReleaseTrees(temporary, staged); err != nil {
 		return fmt.Errorf("staged slot %s does not match the verified bundle: %w", slot, err)
 	}
+	releaseID, err := manifestString(manifest, "release_id")
+	if err != nil {
+		return err
+	}
+	sourceRevision, err := manifestString(manifest, "source_revision")
+	if err != nil {
+		return err
+	}
+	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil)
+	if err != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) {
+		if err != nil {
+			return fmt.Errorf("verify slot %s health: %w", slot, err)
+		}
+		return fmt.Errorf("verify slot %s health returned HTTP %d or an invalid health envelope", slot, status)
+	}
+	if body["release_id"] != releaseID || body["source_revision"] != sourceRevision {
+		return fmt.Errorf("slot %s process identity does not match the verified release manifest", slot)
+	}
+	if process, ok := processIdentityFromHealth(body); !ok || !processMatchesStaged(runtime, slot, process) {
+		return fmt.Errorf("slot %s process identity was not verified after restart", slot)
+	}
 	return nil
+}
+
+func manifestString(manifest map[string]any, key string) (string, error) {
+	value, ok := manifest[key].(string)
+	if !ok || value == "" {
+		return "", fmt.Errorf("release manifest %s is missing or invalid", key)
+	}
+	return value, nil
 }
 
 const (
@@ -312,6 +414,9 @@ func (runtime *HostRuntime) stageBundle(slot, bundle string) error {
 	if _, err := extractAndVerifyBundle(bundle, temporary); err != nil {
 		return err
 	}
+	if err := runtime.ensureSlotSocketLink(temporary, slot); err != nil {
+		return err
+	}
 	if err := syncDirectory(temporary); err != nil {
 		return err
 	}
@@ -321,11 +426,12 @@ func (runtime *HostRuntime) stageBundle(slot, bundle string) error {
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 			return fmt.Errorf("slot target is not a directory: %s", slot)
 		}
-		_ = os.RemoveAll(backup)
+		if err := os.RemoveAll(backup); err != nil {
+			return fmt.Errorf("remove previous slot backup: %w", err)
+		}
 		if err := os.Rename(target, backup); err != nil {
 			return fmt.Errorf("move previous slot stage: %w", err)
 		}
-		defer func() { _ = os.RemoveAll(backup) }()
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return statErr
 	}
@@ -337,6 +443,30 @@ func (runtime *HostRuntime) stageBundle(slot, bundle string) error {
 	}
 	keepTemporary = false
 	return syncDirectory(root)
+}
+
+func (runtime *HostRuntime) ensureSlotSocketLink(root, slot string) error {
+	link := filepath.Join(root, "app.sock")
+	if _, err := os.Lstat(link); err == nil {
+		return fmt.Errorf("staged slot already contains app.sock")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := os.Symlink(runtime.socket(slot), link); err != nil {
+		return fmt.Errorf("create %s app.sock link: %w", slot, err)
+	}
+	return nil
+}
+
+func (runtime *HostRuntime) verifySlotSocketLink(root, slot string) error {
+	target, err := os.Readlink(filepath.Join(root, "app.sock"))
+	if err != nil {
+		return fmt.Errorf("slot %s app.sock link is unavailable: %w", slot, err)
+	}
+	if target != runtime.socket(slot) {
+		return fmt.Errorf("slot %s app.sock link points to an unexpected socket", slot)
+	}
+	return nil
 }
 
 func extractAndVerifyBundle(bundle, destination string) (map[string]any, error) {
@@ -511,6 +641,9 @@ func readReleaseTree(root string) (map[string]releaseFile, error) {
 			return nil
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
+			if path == filepath.Join(root, "app.sock") {
+				return nil
+			}
 			return fmt.Errorf("release tree contains a symlink: %s", path)
 		}
 		if info.IsDir() {
@@ -680,7 +813,7 @@ func (runtime *HostRuntime) Drain(ctx context.Context, slot string) error {
 	if slot == "" || slot == "none" {
 		return nil
 	}
-	statusBody, status, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-enter", "operation_id": "deployd-drain-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0)})
+	statusBody, status, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-enter", "session_id": deploydDrainSession, "operation_id": "deployd-drain-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0)})
 	if err != nil {
 		return err
 	}
@@ -709,27 +842,39 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 	if !ok || !draining {
 		return errors.New("old slot is not fenced for drain")
 	}
-	metrics, metricsCode, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "admin-metrics"})
-	if err != nil {
-		return err
+	deadline := time.NewTimer(15 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		metrics, metricsCode, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "admin-metrics"})
+		if err != nil {
+			return err
+		}
+		if metricsCode != http.StatusOK {
+			return fmt.Errorf("slot %s metrics returned HTTP %d", slot, metricsCode)
+		}
+		value, ok := metrics["result"].(map[string]any)
+		if !ok {
+			return errors.New("old slot metrics result is missing")
+		}
+		pending, pendingOK := arrayLengthValue(value["pending_operations"])
+		inFlight, inFlightOK := integerValue(value["in_flight_operations"])
+		unknown, unknownOK := arrayLengthValue(value["historical_unknown_operations"])
+		if !pendingOK || !inFlightOK || !unknownOK {
+			return errors.New("old slot quiescence counters are incomplete")
+		}
+		if pending == 0 && inFlight == 0 && unknown == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return errors.New("old slot did not quiesce before the bounded deadline")
+		case <-ticker.C:
+		}
 	}
-	if metricsCode != http.StatusOK {
-		return fmt.Errorf("slot %s metrics returned HTTP %d", slot, metricsCode)
-	}
-	value, ok := metrics["result"].(map[string]any)
-	if !ok {
-		return errors.New("old slot metrics result is missing")
-	}
-	pending, pendingOK := arrayLengthValue(value["pending_operations"])
-	inFlight, inFlightOK := integerValue(value["in_flight_operations"])
-	unknown, unknownOK := arrayLengthValue(value["historical_unknown_operations"])
-	if !pendingOK || !inFlightOK || !unknownOK {
-		return errors.New("old slot quiescence counters are incomplete")
-	}
-	if pending != 0 || inFlight != 0 || unknown != 0 {
-		return errors.New("old slot still has pending or in-flight operations")
-	}
-	return nil
 }
 
 func (runtime *HostRuntime) Stop(ctx context.Context, slot string) error {
@@ -760,6 +905,9 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 	if err := runtime.SwitchActive(ctx, previous); err != nil {
 		return err
 	}
+		if _, _, err := runtime.control(ctx, runtime.socket(previous), map[string]any{"protocol": 4, "action": "drain-exit", "session_id": deploydDrainSession, "operation_id": "deployd-drain-exit-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0)}); err != nil {
+		return fmt.Errorf("exit rollback drain on slot %s: %w", previous, err)
+	}
 	if target != "" && target != "none" && target != previous {
 		if err := runtime.Drain(ctx, target); err != nil {
 			return err
@@ -775,8 +923,22 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 }
 
 func (runtime *HostRuntime) waitSlot(ctx context.Context, slot string) error {
+	_, err := runtime.waitSlotIdentity(ctx, slot, processIdentity{}, false)
+	return err
+}
+
+func (runtime *HostRuntime) readProcessIdentity(ctx context.Context, slot string) (processIdentity, bool) {
+	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil)
+	if err != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) {
+		return processIdentity{}, false
+	}
+	identity, ok := processIdentityFromHealth(body)
+	return identity, ok
+}
+
+func (runtime *HostRuntime) waitSlotIdentity(ctx context.Context, slot string, previous processIdentity, requireChanged bool) (processIdentity, error) {
 	if err := validSlot(slot); err != nil {
-		return err
+		return processIdentity{}, err
 	}
 	deadline := time.NewTimer(10 * time.Second)
 	defer deadline.Stop()
@@ -784,19 +946,45 @@ func (runtime *HostRuntime) waitSlot(ctx context.Context, slot string) error {
 	defer ticker.Stop()
 	for {
 		body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil)
-		if err == nil && status > 0 {
-			if _, ok := body["process_ready"].(bool); ok {
-				return nil
+		if err == nil && (status == http.StatusOK || status == http.StatusServiceUnavailable) && healthEnvelopeValid(body) {
+			if identity, ok := processIdentityFromHealth(body); ok && (!requireChanged || !sameProcess(identity, previous)) {
+				return identity, nil
 			}
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return processIdentity{}, ctx.Err()
 		case <-deadline.C:
-			return fmt.Errorf("slot %s did not expose its health contract after start", slot)
+			if requireChanged {
+				return processIdentity{}, fmt.Errorf("slot %s process identity did not change after restart", slot)
+			}
+			return processIdentity{}, fmt.Errorf("slot %s did not expose its health contract after start", slot)
 		case <-ticker.C:
 		}
 	}
+}
+
+func processIdentityFromHealth(body map[string]any) (processIdentity, bool) {
+	pid, pidOK := integerValue(body["process_id"])
+	startTime, startOK := body["process_start_time"].(string)
+	if !pidOK || pid <= 0 || !startOK {
+		return processIdentity{}, false
+	}
+	return processIdentity{PID: pid, StartTime: startTime}, true
+}
+
+func sameProcess(left, right processIdentity) bool {
+	if left.PID != right.PID {
+		return false
+	}
+	return left.StartTime == "" || right.StartTime == "" || left.StartTime == right.StartTime
+}
+
+func processMatchesStaged(runtime *HostRuntime, slot string, identity processIdentity) bool {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	expected, ok := runtime.stagedProcess[slot]
+	return !ok || sameProcess(identity, expected)
 }
 
 func (runtime *HostRuntime) socket(slot string) string {
@@ -1037,7 +1225,9 @@ func healthEnvelopeValid(body map[string]any) bool {
 	_, readyOK := body["ready"].(bool)
 	_, controllerOK := body["controller_owned"].(bool)
 	_, trafficOK := body["traffic_accepting"].(bool)
-	return ok && envelopeOK && protocolOK && protocolValue == 4 && processReadyOK && readyOK && controllerOK && trafficOK && processReady
+	_, processIDOK := integerValue(body["process_id"])
+	_, processStartOK := body["process_start_time"].(string)
+	return ok && envelopeOK && protocolOK && protocolValue == 4 && processReadyOK && readyOK && controllerOK && trafficOK && processIDOK && processStartOK && processReady
 }
 
 func parseObservedAt(value any) (time.Time, bool) {

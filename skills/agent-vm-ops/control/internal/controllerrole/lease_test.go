@@ -2,6 +2,7 @@ package controllerrole
 
 import (
 	"errors"
+	"os"
 	"testing"
 	"time"
 )
@@ -49,5 +50,17 @@ func TestGateRejectsOlderTermAndMismatchedRevoke(t *testing.T) {
 	}
 	if gate.Valid() {
 		t.Fatal("revoked lease remained valid")
+	}
+}
+
+func TestGateRejectsPIDReuseWithDifferentProcessStartToken(t *testing.T) {
+	now := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	gate := New("blue", func() time.Time { return now })
+	lease := Lease{Slot: "blue", Term: 1, LeaseID: "lease-1", Expiry: now.Add(time.Minute), Generation: 1, Nonce: "nonce-1", OwnerPID: os.Getpid(), OwnerStartTime: "not-the-current-process"}
+	if err := gate.Grant(lease); err != nil {
+		t.Fatal(err)
+	}
+	if gate.Valid() {
+		t.Fatal("lease with a reused PID token remained valid")
 	}
 }

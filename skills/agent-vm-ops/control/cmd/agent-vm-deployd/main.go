@@ -13,6 +13,7 @@ import (
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd/store"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 )
 
 var version = "agent-vm-deployd/dev"
@@ -42,6 +43,11 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	processLock, err := native.AcquireLock(config.LockPath, true, true)
+	if err != nil {
+		return fmt.Errorf("acquire deployd singleton lock: %w", err)
+	}
+	defer processLock.Close()
 	database, err := store.Open(config.Database, config.Retention(), time.Now)
 	if err != nil {
 		return err

@@ -217,8 +217,9 @@ func (runtime *acceptanceRuntime) Rollback(_ context.Context, target, previous s
 	targetValue.ControllerOwned = false
 	runtime.slots[target] = targetValue
 	runtime.draining[target] = true
+	runtime.draining[previous] = false
 	runtime.active = previous
-	runtime.traffic[previous] = true
+	runtime.traffic[previous] = false
 	runtime.traffic[target] = false
 	return nil
 }

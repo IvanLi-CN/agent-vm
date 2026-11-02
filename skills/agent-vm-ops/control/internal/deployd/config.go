@@ -20,6 +20,7 @@ type MetricsTLSConfig struct {
 
 type Config struct {
 	Socket         string           `json:"socket"`
+	LockPath       string           `json:"lock_path"`
 	MetricsListen  string           `json:"metrics_listen"`
 	MetricsTLS     MetricsTLSConfig `json:"metrics_tls"`
 	NetworkACL     string           `json:"network_acl"`
@@ -36,6 +37,7 @@ type Config struct {
 func Defaults() Config {
 	return Config{
 		Socket:         "/run/agent-vm-native/deployd.sock",
+		LockPath:       "/run/agent-vm-native/deployd.lock",
 		MetricsListen:  "127.0.0.1:9911",
 		Database:       "/var/lib/agent-vm-native/deployment/deployment.sqlite3",
 		ActivePath:     "/var/lib/agent-vm-native/active",
@@ -71,7 +73,7 @@ func Load(path string) (Config, error) {
 
 func (config Config) Validate() error {
 	for name, value := range map[string]string{
-		"socket": config.Socket, "database": config.Database, "active_path": config.ActivePath,
+		"socket": config.Socket, "lock_path": config.LockPath, "database": config.Database, "active_path": config.ActivePath,
 		"release_root": config.ReleaseRoot, "blue_socket": config.BlueSocket, "green_socket": config.GreenSocket,
 	} {
 		if value == "" || !filepath.IsAbs(value) {
@@ -84,8 +86,8 @@ func (config Config) Validate() error {
 	if config.LeaseSeconds < 3 || config.RetentionDays <= 0 || config.ObserveSeconds <= 0 {
 		return errors.New("deployd config invalid: lease, retention and observe intervals are invalid")
 	}
-	if config.Socket == config.Database || config.Socket == config.ActivePath {
-		return errors.New("deployd config invalid: socket path collides with a state path")
+	if config.Socket == config.LockPath || config.Socket == config.Database || config.Socket == config.ActivePath || config.LockPath == config.Database || config.LockPath == config.ActivePath {
+		return errors.New("deployd config invalid: socket or lock path collides with a state path")
 	}
 	host, _, err := net.SplitHostPort(config.MetricsListen)
 	if err != nil || host == "" {

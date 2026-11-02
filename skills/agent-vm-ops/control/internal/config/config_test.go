@@ -136,6 +136,36 @@ func TestLoadPreservesCanonicalAdmissionFields(t *testing.T) {
 	}
 }
 
+func TestLoadDerivesSlotScopedPathsWhenOmitted(t *testing.T) {
+	value := validConfig()
+	value.Slot = "green"
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	delete(raw, "socket")
+	delete(raw, "metrics_dir")
+	data, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Socket != "/run/agent-vm-native/green/control.sock" || loaded.MetricsDir != "/run/agent-vm-native/green/metrics" {
+		t.Fatalf("derived slot paths = socket:%q metrics:%q", loaded.Socket, loaded.MetricsDir)
+	}
+}
+
 func TestManagementConfigRequiresSeparateAuthenticatedBoundaries(t *testing.T) {
 	value := validConfig()
 	value.Management = ManagementConfig{

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd/store"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/gin-gonic/gin"
 )
 
@@ -366,6 +367,11 @@ func ServeUDS(ctx context.Context, socket string, handler http.Handler) error {
 	if socket == "" {
 		return errors.New("deployd socket path is empty")
 	}
+	listenerLock, err := native.AcquireLock(socket+".lock", true, true)
+	if err != nil {
+		return fmt.Errorf("acquire deployd socket lock: %w", err)
+	}
+	defer listenerLock.Close()
 	if err := os.MkdirAll(filepathDir(socket), 0o750); err != nil {
 		return err
 	}

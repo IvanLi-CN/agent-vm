@@ -74,6 +74,7 @@ type RuntimeSnapshot struct {
 type SourceObservation struct {
 	Up         bool      `json:"up"`
 	ObservedAt time.Time `json:"observed_at"`
+	FreshUntil time.Time `json:"fresh_until"`
 	Error      string    `json:"error,omitempty"`
 }
 
@@ -103,8 +104,8 @@ type Manager struct {
 	Clock         func() time.Time
 	LeaseDuration time.Duration
 
-	mu   sync.Mutex
-	term uint64
+	mu            sync.Mutex
+	startupFenced bool
 }
 
 func NewManager(database *store.Store, runtime Runtime, leaseDuration time.Duration, clock func() time.Time) *Manager {
@@ -114,11 +115,7 @@ func NewManager(database *store.Store, runtime Runtime, leaseDuration time.Durat
 	if leaseDuration <= 0 {
 		leaseDuration = 15 * time.Second
 	}
-	term := uint64(clock().UnixNano())
-	if term == 0 {
-		term = 1
-	}
-	return &Manager{Store: database, Runtime: runtime, Clock: clock, LeaseDuration: leaseDuration, term: term}
+	return &Manager{Store: database, Runtime: runtime, Clock: clock, LeaseDuration: leaseDuration}
 }
 
 func (manager *Manager) Status(ctx context.Context) (Status, error) {
@@ -259,11 +256,18 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 		return nil, manager.failure(ctx, id, transaction.Phase, errors.New("active slot changed outside deployd"))
 	}
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
-		if err := manager.Runtime.RevokeController(ctx, transaction.PreviousSlot, manager.nextFenceTerm()); err != nil {
+		term, termErr := manager.nextFenceTerm(ctx)
+		if termErr != nil {
+			return nil, fmt.Errorf("allocate controller fencing term: %w", termErr)
+		}
+		if err := manager.Runtime.RevokeController(ctx, transaction.PreviousSlot, term); err != nil {
 			return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, err)
 		}
 	}
-	lease := manager.newLease(transaction.TargetSlot, transaction.Generation)
+	lease, err := manager.newLease(ctx, transaction.TargetSlot, transaction.Generation)
+	if err != nil {
+		return nil, fmt.Errorf("allocate candidate controller lease: %w", err)
+	}
 	if err := manager.Runtime.GrantController(ctx, transaction.TargetSlot, lease); err != nil {
 		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, err)
 	}
@@ -386,10 +390,17 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 		if observeErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), false) {
 			return nil, errors.New("recovery evidence is not sufficient to finalize")
 		}
-		if err := manager.Runtime.RevokeController(ctx, otherSlot(transaction.TargetSlot), manager.nextFenceTerm()); err != nil {
+		term, termErr := manager.nextFenceTerm(ctx)
+		if termErr != nil {
+			return nil, fmt.Errorf("allocate recovery fencing term: %w", termErr)
+		}
+		if err := manager.Runtime.RevokeController(ctx, otherSlot(transaction.TargetSlot), term); err != nil {
 			return nil, fmt.Errorf("fence the non-selected slot before recovery finalize: %w", err)
 		}
-		lease := manager.newLease(transaction.TargetSlot, transaction.Generation)
+		lease, err := manager.newLease(ctx, transaction.TargetSlot, transaction.Generation)
+		if err != nil {
+			return nil, fmt.Errorf("allocate recovery controller lease: %w", err)
+		}
 		if err := manager.Runtime.GrantController(ctx, transaction.TargetSlot, lease); err != nil {
 			return nil, fmt.Errorf("regrant the selected controller before recovery finalize: %w", err)
 		}
@@ -404,6 +415,7 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 			fenceErr := manager.fenceSlots(ctx, errors.New("recovery finalize persistence failed; controller roles were fenced"))
 			return nil, fmt.Errorf("%w; %v", err, fenceErr)
 		}
+		manager.startupFenced = false
 		return updated, nil
 	default:
 		return nil, errors.New("recovery action must be rollback or finalize")
@@ -415,6 +427,7 @@ func (manager *Manager) RecoverOnStart(ctx context.Context) error {
 	defer manager.mu.Unlock()
 	transactions, err := manager.Store.ListActive(ctx)
 	if err != nil {
+		manager.startupFenced = true
 		return err
 	}
 	var firstErr error
@@ -429,6 +442,9 @@ func (manager *Manager) RecoverOnStart(ctx context.Context) error {
 				firstErr = err
 			}
 		}
+	}
+	if firstErr != nil {
+		manager.startupFenced = true
 	}
 	return firstErr
 }
@@ -482,6 +498,9 @@ func (manager *Manager) waitForReady(ctx context.Context, transactionID, slot st
 func (manager *Manager) MaintainController(ctx context.Context) error {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
+	if manager.startupFenced {
+		return manager.fenceSlots(ctx, errors.New("deployd startup recovery is unresolved"))
+	}
 	observation, err := manager.observe(ctx, "")
 	if err != nil {
 		return err
@@ -490,10 +509,8 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	for _, transaction := range transactions {
-		if transaction.RecoveryRequired || transaction.State == "needs_recovery" {
-			return manager.fenceSlots(ctx, errors.New("deployment recovery is required"))
-		}
+	if len(transactions) != 0 {
+		return manager.fenceSlots(ctx, errors.New("deployment transaction is active"))
 	}
 	if !observation.Consistent {
 		return manager.fenceSlots(ctx, errors.New("slot observation is inconsistent"))
@@ -510,7 +527,11 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 		if err := manager.Runtime.DisableTraffic(ctx, other); err != nil {
 			return fmt.Errorf("disable inactive traffic role: %w", err)
 		}
-		if err := manager.Runtime.RevokeController(ctx, other, manager.nextFenceTerm()); err != nil {
+		term, termErr := manager.nextFenceTerm(ctx)
+		if termErr != nil {
+			return fmt.Errorf("allocate inactive fencing term: %w", termErr)
+		}
+		if err := manager.Runtime.RevokeController(ctx, other, term); err != nil {
 			return fmt.Errorf("fence inactive controller: %w", err)
 		}
 	}
@@ -521,7 +542,10 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 			break
 		}
 	}
-	lease := manager.newLease(observation.ActiveSlot, generation)
+	lease, err := manager.newLease(ctx, observation.ActiveSlot, generation)
+	if err != nil {
+		return fmt.Errorf("allocate active controller lease: %w", err)
+	}
 	if err := manager.Runtime.GrantController(ctx, observation.ActiveSlot, lease); err != nil {
 		return fmt.Errorf("grant active controller: %w", err)
 	}
@@ -538,8 +562,19 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 
 func (manager *Manager) fenceSlots(ctx context.Context, cause error) error {
 	var first error
-	fenceTerm := manager.nextFenceTerm()
 	for _, slot := range []string{"blue", "green"} {
+		if err := manager.Runtime.DisableTraffic(ctx, slot); err != nil && first == nil {
+			first = err
+		}
+	}
+	fenceTerm, termErr := manager.nextFenceTerm(ctx)
+	if termErr != nil && first == nil {
+		first = termErr
+	}
+	for _, slot := range []string{"blue", "green"} {
+		if termErr != nil {
+			break
+		}
 		if err := manager.Runtime.RevokeController(ctx, slot, fenceTerm); err != nil && first == nil {
 			first = err
 		}
@@ -615,6 +650,12 @@ func (manager *Manager) transitionAfterEffect(ctx context.Context, id, expected,
 }
 
 func (manager *Manager) rollbackOrFence(ctx context.Context, transaction store.Transaction, cause error) error {
+	if current, err := manager.Store.Get(ctx, transaction.ID); err != nil {
+		fenceErr := manager.fenceSlots(ctx, errors.New("transaction state could not be read before fencing"))
+		return fmt.Errorf("read transaction before failure: %w; %v", err, fenceErr)
+	} else if current != nil {
+		transaction = *current
+	}
 	if errors.Is(cause, ErrUncertain) || errors.As(cause, new(*UncertainError)) {
 		failureErr := manager.failure(ctx, transaction.ID, transaction.Phase, cause)
 		fenceErr := manager.fenceSlots(ctx, errors.New("deployment outcome is uncertain; controller roles were fenced"))
@@ -638,9 +679,16 @@ func (manager *Manager) rollbackOrFence(ctx context.Context, transaction store.T
 }
 
 func (manager *Manager) rollback(ctx context.Context, transaction store.Transaction) error {
-	lease := controllerrole.Lease{Slot: transaction.TargetSlot, Term: manager.nextFenceTerm()}
+	term, termErr := manager.nextFenceTerm(ctx)
+	if termErr != nil {
+		return fmt.Errorf("allocate rollback fencing term: %w", termErr)
+	}
+	lease := controllerrole.Lease{Slot: transaction.TargetSlot, Term: term}
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
-		lease = manager.newLease(transaction.PreviousSlot, transaction.Generation)
+		lease, termErr = manager.newLease(ctx, transaction.PreviousSlot, transaction.Generation)
+		if termErr != nil {
+			return fmt.Errorf("allocate rollback controller lease: %w", termErr)
+		}
 	}
 	if _, err := manager.Store.BeginRollback(ctx, transaction.ID, transaction.Phase, PhaseRollback, "rollback_started", "deployd", map[string]any{"bounded": true}, manager.Clock().UTC()); err != nil {
 		return err
@@ -650,6 +698,13 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 		fenceErr := manager.fenceSlots(ctx, errors.New("rollback did not reach a verified outcome"))
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)
 	}
+	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
+		if err := manager.Runtime.EnableTraffic(ctx, transaction.PreviousSlot); err != nil {
+			failureErr := manager.failure(ctx, transaction.ID, PhaseRollback, err)
+			fenceErr := manager.fenceSlots(ctx, errors.New("rollback traffic role could not be restored"))
+			return fmt.Errorf("%w; %v", failureErr, fenceErr)
+		}
+	}
 	observation, observeErr := manager.observe(ctx, transaction.ID)
 	if observeErr != nil {
 		failureErr := manager.failure(ctx, transaction.ID, PhaseRollback, observeErr)
@@ -657,22 +712,28 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)
 	}
 	previous, previousOK := observation.Slots[transaction.PreviousSlot]
-	if !previousOK || !observation.Consistent || observation.ActiveSlot != transaction.PreviousSlot || !previous.ProcessUp || !previous.ProcessReady || !previous.Ready || !previous.ControllerOwned || previous.NativeWorkers != 0 || previous.PendingOperations != 0 || previous.InFlightRequests != 0 {
+	if !previousOK || !observation.Consistent || observation.ActiveSlot != transaction.PreviousSlot || !previous.ProcessUp || !previous.ProcessReady || !previous.Ready || !previous.ControllerOwned || !previous.TrafficAccepting || previous.NativeWorkers != 0 || previous.PendingOperations != 0 || previous.InFlightRequests != 0 {
 		failureErr := manager.failure(ctx, transaction.ID, PhaseRollback, errors.New("rollback outcome was not verified"))
 		fenceErr := manager.fenceSlots(ctx, errors.New("rollback verification failed; controller roles were fenced"))
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)
 	}
-	return manager.transitionAfterEffect(ctx, transaction.ID, PhaseRollback, PhaseFinalize, "rolled_back", map[string]any{"active_slot": transaction.PreviousSlot})
+	if err := manager.transitionAfterEffect(ctx, transaction.ID, PhaseRollback, PhaseFinalize, "rolled_back", map[string]any{"active_slot": transaction.PreviousSlot}); err != nil {
+		return err
+	}
+	manager.startupFenced = false
+	return nil
 }
 
-func (manager *Manager) newLease(slot string, generation int64) controllerrole.Lease {
-	manager.term++
-	return controllerrole.Lease{Slot: slot, Term: manager.term, LeaseID: newID("lease"), Expiry: manager.Clock().Add(manager.LeaseDuration), Generation: generation, Nonce: newID("nonce"), OwnerPID: os.Getpid()}
+func (manager *Manager) newLease(ctx context.Context, slot string, generation int64) (controllerrole.Lease, error) {
+	term, err := manager.nextFenceTerm(ctx)
+	if err != nil {
+		return controllerrole.Lease{}, err
+	}
+	return controllerrole.Lease{Slot: slot, Term: term, LeaseID: newID("lease"), Expiry: manager.Clock().Add(manager.LeaseDuration), Generation: generation, Nonce: newID("nonce"), OwnerPID: os.Getpid(), OwnerStartTime: controllerrole.ProcessStartToken(os.Getpid())}, nil
 }
 
-func (manager *Manager) nextFenceTerm() uint64 {
-	manager.term++
-	return manager.term
+func (manager *Manager) nextFenceTerm(ctx context.Context) (uint64, error) {
+	return manager.Store.NextFenceTerm(ctx)
 }
 
 func recoveryTargetVerified(observation RuntimeSnapshot, transaction store.Transaction, now time.Time, requireController bool) bool {
@@ -692,7 +753,11 @@ func validObservation(observation RuntimeSnapshot, now time.Time) bool {
 		return false
 	}
 	for _, source := range observation.Sources {
-		if !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) || source.ObservedAt.Before(observation.ObservedAt.Add(-2*time.Second)) {
+		freshUntil := source.FreshUntil
+		if freshUntil.IsZero() {
+			freshUntil = source.ObservedAt.Add(10 * time.Second)
+		}
+		if !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) || !freshUntil.After(now) || source.ObservedAt.Before(observation.ObservedAt.Add(-2*time.Second)) {
 			return false
 		}
 	}

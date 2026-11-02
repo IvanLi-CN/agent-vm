@@ -210,6 +210,9 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(encoded, &value); err != nil {
 		return value, fmt.Errorf("config_invalid: %w", err)
 	}
+	if _, exists := raw["socket"]; !exists {
+		value.Socket = "/run/agent-vm-native/" + value.Slot + "/control.sock"
+	}
 	if _, exists := raw["metrics_dir"]; !exists {
 		value.MetricsDir = "/run/agent-vm-native/" + value.Slot + "/metrics"
 	}

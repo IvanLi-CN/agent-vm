@@ -152,3 +152,53 @@ func TestStoreCleansDeterministicallyFailedTransaction(t *testing.T) {
 		t.Fatalf("cleanup removed=%d err=%v", removed, err)
 	}
 }
+
+func TestStorePersistsFenceTermsAndMakesRecoveryFailuresIdempotent(t *testing.T) {
+	now := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	path := filepath.Join(t.TempDir(), "deployment.sqlite3")
+	s, err := Open(path, time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.NextFenceTerm(context.Background())
+	if err != nil || first != 1 {
+		t.Fatalf("first fencing term = %d err=%v", first, err)
+	}
+	transaction := Transaction{ID: "tx-idempotent", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: "active_switch", Generation: 1, CreatedAt: now, UpdatedAt: now}
+	if err := s.Create(context.Background(), transaction, nil); err != nil {
+		t.Fatal(err)
+	}
+	payload := map[string]any{"message": "effect result was lost", "uncertain": true}
+	if err := s.RecordFailure(context.Background(), transaction.ID, transaction.Phase, "state_unverified", "test", "digest-1", payload, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordFailure(context.Background(), transaction.ID, transaction.Phase, "state_unverified", "test", "digest-2", payload, now.Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	current, err := s.Get(context.Background(), transaction.ID)
+	if err != nil || current == nil || current.State != "needs_recovery" || !current.RecoveryRequired {
+		t.Fatalf("recovery transaction = %#v err=%v", current, err)
+	}
+	var evidenceCount, eventCount int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM deployment_failure_evidence WHERE transaction_id = ?", transaction.ID).Scan(&evidenceCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM deployment_phase_events WHERE transaction_id = ?", transaction.ID).Scan(&eventCount); err != nil {
+		t.Fatal(err)
+	}
+	if evidenceCount != 1 || eventCount != 2 {
+		t.Fatalf("idempotent recovery records = evidence:%d events:%d", evidenceCount, eventCount)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s, err = Open(path, time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	second, err := s.NextFenceTerm(context.Background())
+	if err != nil || second != 2 {
+		t.Fatalf("persisted fencing term = %d err=%v", second, err)
+	}
+}

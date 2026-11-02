@@ -43,3 +43,17 @@ func TestMetricsHaveOneDeploydSeriesPerSlot(t *testing.T) {
 		t.Fatalf("transaction series missing:\n%s", text)
 	}
 }
+
+func TestMetricsMarkComposedSnapshotStaleWhenASourceFails(t *testing.T) {
+	now := time.Now().UTC()
+	metrics := NewMetrics(nil)
+	sources := map[string]SourceObservation{}
+	for _, name := range []string{"active_link", "slot_contracts", "native_observation", "inventory_observation"} {
+		sources[name] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
+	}
+	sources["native_observation"] = SourceObservation{Up: false, ObservedAt: now, FreshUntil: now.Add(time.Minute), Error: "observation unavailable"}
+	metrics.Set(RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), Consistent: false, Sources: sources})
+	if strings.Contains(metrics.Render(), "agent_vm_deployd_snapshot_fresh 1") {
+		t.Fatal("failed source was exposed as a fresh composed snapshot")
+	}
+}

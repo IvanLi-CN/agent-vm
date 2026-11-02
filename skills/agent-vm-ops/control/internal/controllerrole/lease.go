@@ -19,13 +19,14 @@ var (
 // It is deliberately not persisted by the slot process: a restart must start
 // fenced until deployd observes the slot again and grants a fresh lease.
 type Lease struct {
-	Slot       string    `json:"slot"`
-	Term       uint64    `json:"term"`
-	LeaseID    string    `json:"lease_id"`
-	Expiry     time.Time `json:"expiry"`
-	Generation int64     `json:"generation"`
-	Nonce      string    `json:"nonce"`
-	OwnerPID   int       `json:"owner_pid,omitempty"`
+	Slot           string    `json:"slot"`
+	Term           uint64    `json:"term"`
+	LeaseID        string    `json:"lease_id"`
+	Expiry         time.Time `json:"expiry"`
+	Generation     int64     `json:"generation"`
+	Nonce          string    `json:"nonce"`
+	OwnerPID       int       `json:"owner_pid,omitempty"`
+	OwnerStartTime string    `json:"owner_start_time,omitempty"`
 }
 
 type Command struct {
@@ -109,7 +110,7 @@ func (gate *Gate) Valid() bool {
 	if !gate.valid {
 		return false
 	}
-	if !gate.lease.Expiry.After(gate.clock()) || !ownerAlive(gate.lease.OwnerPID) {
+	if !gate.lease.Expiry.After(gate.clock()) || !ownerAlive(gate.lease.OwnerPID, gate.lease.OwnerStartTime) {
 		gate.valid = false
 		gate.lease = Lease{}
 		gate.signalLocked()
@@ -118,7 +119,7 @@ func (gate *Gate) Valid() bool {
 	return true
 }
 
-func ownerAlive(pid int) bool {
+func ownerAlive(pid int, startTime string) bool {
 	if pid <= 0 {
 		return true
 	}
@@ -126,8 +127,18 @@ func ownerAlive(pid int) bool {
 	if err != nil {
 		return false
 	}
-	return process.Signal(syscall.Signal(0)) == nil
+	if process.Signal(syscall.Signal(0)) != nil {
+		return false
+	}
+	if startTime == "" {
+		return true
+	}
+	return processStartToken(pid) == startTime
 }
+
+// ProcessStartToken identifies a process instance, not just its PID. Linux
+// uses the kernel start-time field so PID reuse cannot extend an old lease.
+func ProcessStartToken(pid int) string { return processStartToken(pid) }
 
 func (gate *Gate) Snapshot() (Lease, bool) {
 	if !gate.Valid() {

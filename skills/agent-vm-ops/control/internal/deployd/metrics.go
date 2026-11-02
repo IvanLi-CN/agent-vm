@@ -21,6 +21,8 @@ func (metrics *Metrics) Set(snapshot RuntimeSnapshot, transactions ...[]store.Tr
 	metrics.latest = snapshot
 	if len(transactions) > 0 {
 		metrics.transactions = append([]store.Transaction(nil), transactions[0]...)
+	} else {
+		metrics.transactions = nil
 	}
 }
 
@@ -31,7 +33,7 @@ func (metrics *Metrics) Render() string {
 	output.WriteString("agent_vm_deployd_up 1\n")
 	output.WriteString("# HELP agent_vm_deployd_snapshot_fresh Whether the composed observation is within its freshness bound.\n")
 	output.WriteString("# TYPE agent_vm_deployd_snapshot_fresh gauge\n")
-	snapshotFresh := !metrics.latest.ObservedAt.IsZero() && !metrics.latest.FreshUntil.IsZero() && time.Now().UTC().Before(metrics.latest.FreshUntil)
+	snapshotFresh := composedSnapshotFresh(metrics.latest, time.Now().UTC())
 	output.WriteString(fmt.Sprintf("agent_vm_deployd_snapshot_fresh %d\n", boolInt(snapshotFresh)))
 	output.WriteString("# HELP agent_vm_deployd_observation_up Whether the latest composed observation is valid.\n")
 	output.WriteString("# TYPE agent_vm_deployd_observation_up gauge\n")
@@ -40,7 +42,11 @@ func (metrics *Metrics) Render() string {
 	for _, source := range []string{"active_link", "slot_contracts", "native_observation", "inventory_observation"} {
 		observation := metrics.latest.Sources[source]
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_up{source=%s} %d\n", quote(source), boolInt(observation.Up)))
-		fresh := !observation.ObservedAt.IsZero() && !metrics.latest.FreshUntil.IsZero() && time.Now().UTC().Before(metrics.latest.FreshUntil)
+		freshUntil := observation.FreshUntil
+		if freshUntil.IsZero() {
+			freshUntil = metrics.latest.FreshUntil
+		}
+		fresh := observation.Up && !observation.ObservedAt.IsZero() && !freshUntil.IsZero() && time.Now().UTC().Before(freshUntil)
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_fresh{source=%s} %d\n", quote(source), boolInt(fresh)))
 	}
 	output.WriteString("# HELP agent_vm_deployd_observation_timestamp_seconds Unix timestamp of the composed observation.\n")
@@ -152,6 +158,27 @@ func withSlotLabel(content, slot string) string {
 }
 
 func quote(value string) string { return strconv.Quote(value) }
+
+func composedSnapshotFresh(snapshot RuntimeSnapshot, now time.Time) bool {
+	if !snapshot.Consistent || snapshot.ObservedAt.IsZero() || snapshot.FreshUntil.IsZero() || !snapshot.FreshUntil.After(now) {
+		return false
+	}
+	for _, name := range []string{"active_link", "slot_contracts", "native_observation", "inventory_observation"} {
+		source, ok := snapshot.Sources[name]
+		if !ok || !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) {
+			return false
+		}
+		freshUntil := source.FreshUntil
+		if freshUntil.IsZero() {
+			freshUntil = snapshot.FreshUntil
+		}
+		if !freshUntil.After(now) {
+			return false
+		}
+	}
+	return true
+}
+
 func boolInt(value bool) int {
 	if value {
 		return 1
