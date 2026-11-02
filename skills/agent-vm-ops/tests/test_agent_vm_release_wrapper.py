@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -118,19 +119,30 @@ class WrapperTests(unittest.TestCase):
     def test_drain_verification_allows_only_queued_prestart_recovery(self):
         self.drain_patch.stop()
         database_path = self.root / "pending.sqlite3"
+        queued_request = {
+            "protocol": 4,
+            "action": "port-add",
+            "operation_id": "queued-port",
+            "session_id": "session-1",
+            "generation": 3,
+            "name": "http",
+            "vm_port": 8080,
+        }
         queued_port = {
             "outcome": "pending",
             "worker": {"state": "exited", "start_attempted": False},
+            "_request": queued_request,
+            "_request_digest": hashlib.sha256(json.dumps(queued_request, sort_keys=True).encode()).hexdigest(),
         }
         queued_drain_exit = {
             "outcome": "pending",
             "_request": {"session_id": "old-release-owner"},
         }
         with sqlite3.connect(database_path) as database:
-            database.executescript("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE operations (operation_id TEXT, action TEXT, response_json TEXT);")
+            database.executescript("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE operations (operation_id TEXT, action TEXT, session_id TEXT, generation INTEGER, response_json TEXT);")
             database.execute("INSERT INTO meta(key, value) VALUES ('drain_owner', 'release-current-owner')")
-            database.execute("INSERT INTO operations VALUES (?, ?, ?)", ("queued-port", "port-add", json.dumps(queued_port)))
-            database.execute("INSERT INTO operations VALUES (?, ?, ?)", ("queued-exit", "drain-exit", json.dumps(queued_drain_exit)))
+            database.execute("INSERT INTO operations VALUES (?, ?, ?, ?, ?)", ("queued-port", "port-add", "session-1", 3, json.dumps(queued_port)))
+            database.execute("INSERT INTO operations VALUES (?, ?, ?, ?, ?)", ("queued-exit", "drain-exit", None, None, json.dumps(queued_drain_exit)))
             database.commit()
         responses = [
             json.dumps({"ok": True, "result": {"draining": True}}).encode(),
@@ -146,6 +158,35 @@ class WrapperTests(unittest.TestCase):
             side_effect=[subprocess.CompletedProcess([], 0, response, b"") for response in responses],
         ):
             WRAPPER._ensure_drained(self.loaded)
+
+    def test_drain_verification_rejects_malformed_queued_port(self):
+        self.drain_patch.stop()
+        database_path = self.root / "malformed-pending.sqlite3"
+        queued_port = {
+            "outcome": "pending",
+            "worker": {"state": "exited", "start_attempted": False},
+        }
+        with sqlite3.connect(database_path) as database:
+            database.executescript("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL); CREATE TABLE operations (operation_id TEXT, action TEXT, session_id TEXT, generation INTEGER, response_json TEXT);")
+            database.execute("INSERT INTO meta(key, value) VALUES ('drain_owner', 'release-current-owner')")
+            database.execute("INSERT INTO operations VALUES (?, ?, ?, ?, ?)", ("malformed-port", "port-add", "session-1", 3, json.dumps(queued_port)))
+            database.commit()
+        responses = [
+            json.dumps({"ok": True, "result": {"draining": True}}).encode(),
+            json.dumps({"ok": True, "result": {"pending_operations": [{"operation_id": "malformed-port"}]}}).encode(),
+        ]
+        with mock.patch.object(
+            WRAPPER,
+            "STATE_DB_PATH",
+            database_path,
+        ), mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            side_effect=[subprocess.CompletedProcess([], 0, response, b"") for response in responses],
+        ):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(failure.exception.code, "drain_unverified")
 
     def test_drain_verification_checks_target_state_compatibility(self):
         self.drain_patch.stop()
@@ -847,6 +888,29 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(record["rollback_state"], "failed")
         self.assertTrue(record["draining"])
         self.assertEqual(record["rollback_error"]["code"], "injected")
+
+    def test_rollback_runtime_failure_restores_selected_release_runtime(self):
+        first = self.root / "runtime-first.tar"
+        second = self.root / "runtime-second.tar"
+        RELEASE.build_release(ROOT, first, "a" * 40)
+        RELEASE.build_release(ROOT, second, "b" * 40)
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            WRAPPER.stage(self.loaded, "tx-runtime-first", "a" * 40, first.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-runtime-first", "a" * 40)
+            WRAPPER.stage(self.loaded, "tx-runtime-second", "b" * 40, second.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-runtime-second", "b" * 40)
+            with mock.patch.object(
+                WRAPPER,
+                "_activate_legacy_runtime",
+                side_effect=[WRAPPER.WrapperError("runtime_failed", "injected"), None],
+            ) as activate_runtime:
+                with self.assertRaises(WRAPPER.WrapperError) as failure:
+                    WRAPPER.rollback(self.loaded, "tx-runtime-second", "b" * 40)
+        self.assertEqual(failure.exception.code, "runtime_failed")
+        self.assertEqual(activate_runtime.call_count, 2)
+        self.assertEqual(Path(self.loaded["current_link"]).resolve().name, "b" * 40)
+        record = json.loads((Path(self.loaded["state_root"]) / "tx-runtime-second.activation.json").read_text(encoding="utf-8"))
+        self.assertEqual(record["rollback_state"], "failed")
 
 
 if __name__ == "__main__":

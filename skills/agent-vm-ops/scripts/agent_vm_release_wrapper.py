@@ -1017,7 +1017,7 @@ def _read_activation_safe_pending_ids() -> set[str]:
     try:
         with sqlite3.connect(uri, uri=True, timeout=5) as database:
             rows = database.execute(
-                "SELECT operation_id, action, response_json FROM operations",
+                "SELECT operation_id, action, session_id, generation, response_json FROM operations",
             ).fetchall()
             owner_row = database.execute(
                 "SELECT value FROM meta WHERE key = 'drain_owner'",
@@ -1026,7 +1026,7 @@ def _read_activation_safe_pending_ids() -> set[str]:
         _fail("drain_unverified", "pending-operation safety could not be verified")
     owner = str(owner_row[0]) if owner_row and owner_row[0] is not None else ""
     safe: set[str] = set()
-    for operation_id, action, response_json in rows:
+    for operation_id, action, session_id, generation, response_json in rows:
         try:
             response = json.loads(response_json)
         except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
@@ -1040,6 +1040,27 @@ def _read_activation_safe_pending_ids() -> set[str]:
             if worker.get("state") not in {"starting", "exited"} or worker.get("start_attempted") is not False:
                 continue
             if any(key in worker for key in ("pid", "start_time", "process_group")):
+                continue
+            request = response.get("_request")
+            if not isinstance(request, Mapping):
+                continue
+            if type(request.get("protocol")) is not int or request["protocol"] != 4:
+                continue
+            if request.get("action") != action or request.get("operation_id") != operation_id:
+                continue
+            if type(session_id) is not str or type(request.get("session_id")) is not str or request["session_id"] != session_id:
+                continue
+            if type(generation) is not int or type(request.get("generation")) is not int or request["generation"] != generation or generation < 0:
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", request["session_id"]):
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", request["operation_id"]):
+                continue
+            try:
+                request_digest = hashlib.sha256(json.dumps(dict(request), sort_keys=True).encode()).hexdigest()
+            except (TypeError, ValueError):
+                continue
+            if request_digest != response.get("_request_digest"):
                 continue
             safe.add(str(operation_id))
             continue
@@ -1263,6 +1284,29 @@ def _activate_legacy_runtime() -> None:
     for unit in _legacy_expiry_timers():
         _systemctl("start", unit, allow_missing=True)
         _systemctl("enable", unit, allow_missing=True)
+
+
+def _restore_runtime_for_release(current: Path | None, record: Mapping[str, Any]) -> None:
+    """Make the runtime match the release selected by restored pointers."""
+    if current is None:
+        _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+        _deactivate_web_runtime()
+        return
+    manifest = load_release_manifest(
+        current / MANIFEST_NAME,
+        allow_historical_web_config_mode=True,
+        allow_historical_state_compatibility=True,
+    )
+    if _is_product_manifest(manifest):
+        snapshot = record.get("web_unit_enabled")
+        _activate_product_runtime(
+            manifest,
+            web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
+        )
+    elif _is_go_manifest(manifest):
+        _activate_go_runtime()
+    else:
+        _activate_legacy_runtime()
 
 
 def _install_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
@@ -1768,6 +1812,7 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         else:
             _activate_legacy_runtime()
     except WrapperError as failure:
+        restore_error: WrapperError | None = None
         try:
             _restore_activation_state(
                 config,
@@ -1777,12 +1822,25 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 actual_previous,
                 target_snapshot,
             )
-        except WrapperError as restore_error:
+        except WrapperError as state_restore_error:
+            restore_error = state_restore_error
             failure = WrapperError(
                 "activation_restore_failed",
                 "rollback failed and the previous release could not be fully restored",
-                {"rollback_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
+                {"rollback_error": failure.as_dict(), "restore_error": state_restore_error.as_dict()},
             )
+        if restore_error is None:
+            try:
+                _restore_runtime_for_release(actual_current, record)
+            except (WrapperError, ManifestError) as runtime_error:
+                failure = WrapperError(
+                    "activation_restore_failed",
+                    "rollback failed and the restored release runtime could not be activated",
+                    {
+                        "rollback_error": failure.as_dict(),
+                        "runtime_restore_error": getattr(runtime_error, "as_dict", lambda: {"message": str(runtime_error)})(),
+                    },
+                )
         record["rollback_phase"] = "failed"
         record["rollback_state"] = "failed"
         record["rollback_error"] = failure.as_dict()

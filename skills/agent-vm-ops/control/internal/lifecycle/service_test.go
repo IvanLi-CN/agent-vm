@@ -2667,10 +2667,10 @@ func TestStartupReconcileLeavesPortOperationPendingDuringReleaseDrain(t *testing
 	}); err != nil {
 		t.Fatal(err)
 	}
-	service := New(store, config.Defaults(), Options{Resident: true})
+	service := New(store, config.Defaults(), Options{})
 	err = service.StartupReconcile(ctx)
-	if control := protocol.AsError(err); control.Code != "startup_reconcile_required" {
-		t.Fatalf("startup error = %#v", control)
+	if err != nil {
+		t.Fatalf("startup error = %#v", err)
 	}
 	operation, err := store.GetOperation(ctx, operationID)
 	if err != nil {

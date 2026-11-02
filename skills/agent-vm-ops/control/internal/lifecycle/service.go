@@ -958,6 +958,30 @@ func recoverableBeforeNativeStart(action string, worker map[string]any) bool {
 	return !hasPID && !hasStart && !hasGroup
 }
 
+func activationSafeQueuedPort(operation state.Operation) bool {
+	if operation.Action != "port-add" && operation.Action != "port-remove" {
+		return false
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	if !ok || !recoverableBeforeNativeStart(operation.Action, worker) {
+		return false
+	}
+	rawRequest, ok := operation.Response["_request"].(map[string]any)
+	if !ok {
+		return false
+	}
+	request := protocol.Request(rawRequest)
+	if protocol.ValidateRequest(request) != nil || stringValue(request["action"]) != operation.Action || stringValue(request["operation_id"]) != operation.OperationID || operation.SessionID == nil || optionalString(request["session_id"]) == nil || *operation.SessionID != stringValue(request["session_id"]) || operation.Generation == nil {
+		return false
+	}
+	generation, generationOK := protocol.Integer(request["generation"])
+	if !generationOK || generation != *operation.Generation {
+		return false
+	}
+	digest, err := protocol.Digest(request)
+	return err == nil && digest == stringValue(operation.Response["_request_digest"])
+}
+
 func operationHasNativeEffect(action string) bool {
 	switch action {
 	case "acquire", "release", "destroy", "restart", "resize", "port-add", "port-remove", "admin-reconcile", "admin-gc", "timer-reconcile", "timer-age-gc":
@@ -1312,8 +1336,23 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 	if reconcileErr != nil {
 		return reconcileErr
 	}
+	blockingPending := len(pending)
 	if len(pending) > 0 {
-		return protocol.NewError("startup_reconcile_required", "pending operations require explicit recovery before admission", map[string]any{"count": len(pending), "admission_ready": false})
+		releaseDrain, drainErr := s.releaseDrainOwned(ctx)
+		if drainErr != nil {
+			return s.sqliteError(drainErr)
+		}
+		if releaseDrain {
+			blockingPending = 0
+			for _, operation := range pending {
+				if !activationSafeQueuedPort(operation) {
+					blockingPending++
+				}
+			}
+		}
+	}
+	if blockingPending > 0 {
+		return protocol.NewError("startup_reconcile_required", "pending operations require explicit recovery before admission", map[string]any{"count": blockingPending, "admission_ready": false})
 	}
 	return s.verifyResidentNativeState(ctx)
 }
@@ -2620,6 +2659,9 @@ func (s *Service) portAdd(ctx context.Context, request protocol.Request) (map[st
 		if task.VMIP == nil {
 			return nil, protocol.NewError("mapping_unverified", "guest IPv4 address is unavailable", map[string]any{"outcome_verified": false})
 		}
+		if err := s.allowPortNativeStart(ctx); err != nil {
+			return nil, err
+		}
 		hostAddress := s.hostAddress()
 		workerCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 		err := s.Guest.DeviceAdd(workerCtx, task.InstanceName, value.DeviceName, "proxy", map[string]string{
@@ -2687,6 +2729,9 @@ func (s *Service) portRemove(ctx context.Context, request protocol.Request) (map
 	} else {
 		for _, port := range portList {
 			if port.PortName == name && port.Protocol == protocolName && s.Guest != nil {
+				if err := s.allowPortNativeStart(ctx); err != nil {
+					return nil, err
+				}
 				workerCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 				err := s.removePortDevice(workerCtx, task, port)
 				cancel()
@@ -2700,6 +2745,19 @@ func (s *Service) portRemove(ctx context.Context, request protocol.Request) (map
 		return nil, s.sqliteError(err)
 	}
 	return map[string]any{"task_id": task.TaskID, "name": name, "protocol": protocolName, "removed": true}, nil
+}
+
+func (s *Service) allowPortNativeStart(ctx context.Context) error {
+	operationID := native.WorkerOperationID(ctx)
+	if operationID == "" {
+		return nil
+	}
+	if err := s.WorkerStartAllowed(ctx, operationID); err != nil {
+		return protocol.NewError("state_unverified", "port operation native-effect barrier could not be recorded", map[string]any{
+			"operation_id": operationID, "outcome_verified": false, "cause": err.Error(),
+		})
+	}
+	return nil
 }
 
 func (s *Service) drain(ctx context.Context, value bool, request protocol.Request) (map[string]any, error) {
@@ -2891,12 +2949,23 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			if managementPendingErr != nil {
 				return nil, s.sqliteError(managementPendingErr)
 			}
+			releaseDrain, releaseDrainErr := s.releaseDrainOwned(ctx)
+			if releaseDrainErr != nil {
+				return nil, s.sqliteError(releaseDrainErr)
+			}
 			auditSummary, auditSummaryErr := s.auditSummary(ctx, epoch)
 			if auditSummaryErr != nil {
 				return nil, s.sqliteError(auditSummaryErr)
 			}
 			pendingOperations := make([]any, 0, len(pending))
 			for _, operation := range pending {
+				if releaseDrain && activationSafeQueuedPort(operation) {
+					// A queued port intent with a verified pre-native worker is
+					// intentionally held behind the release drain. It is not an
+					// activation blocker and remains visible in the journal until
+					// the next controller exits the drain and retries it.
+					continue
+				}
 				item := map[string]any{
 					"operation_id": operation.OperationID,
 					"action":       operation.Action,
@@ -2997,9 +3066,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				return nil, s.sqliteError(drainErr)
 			}
 			if initialConsistent && len(pendingOperations) == 0 && states[stateClosing] == 0 && states[stateDeleting] == 0 && states[stateFailed] == 0 {
-				if releaseDrain, drainErr := s.releaseDrainOwned(ctx); drainErr != nil {
-					return nil, s.sqliteError(drainErr)
-				} else if releaseDrain {
+				if releaseDrain {
 					if err := s.Store.SetMeta(ctx, "drain_sealed", "1"); err != nil {
 						return nil, s.sqliteError(err)
 					}
