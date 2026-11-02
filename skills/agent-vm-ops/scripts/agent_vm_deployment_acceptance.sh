@@ -6,6 +6,7 @@ proof_dir="$(mktemp -d /tmp/agent-vm-deployment.XXXXXX)"
 rqlited_pid=""
 backend_pid=""
 caddy_pid=""
+rqlite_auth_file=""
 rqlite_auth_config=""
 keep_proof="${KEEP_PROOF_DIR:-0}"
 
@@ -21,6 +22,9 @@ cleanup() {
   if [[ -n "$rqlited_pid" ]]; then
     kill -TERM "$rqlited_pid" 2>/dev/null || true
     wait "$rqlited_pid" 2>/dev/null || true
+  fi
+  if [[ -n "$rqlite_auth_file" ]]; then
+    rm -f -- "$rqlite_auth_file"
   fi
   if [[ -n "$rqlite_auth_config" ]]; then
     rm -f -- "$rqlite_auth_config"
@@ -237,12 +241,17 @@ grep -q '10.5.2' <<<"$rqlite_version" || fail "rqlite version is not 10.5.2"
 
 control_secret="isolated-control-${BASHPID}-secret"
 backup_secret="isolated-backup-${BASHPID}-secret"
-cat >"$proof_dir/auth.json" <<EOF
+rqlite_auth_file="$proof_dir/auth.json"
+(
+  umask 077
+  cat >"$rqlite_auth_file" <<EOF
 [
   {"username":"agent-vm-control","password":"$control_secret","perms":["execute","query","ready","status"]},
   {"username":"agent-vm-backup","password":"$backup_secret","perms":["backup","query","ready","status"]}
 ]
 EOF
+)
+chmod 0600 "$rqlite_auth_file"
 http_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 raft_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 rqlite_data="$proof_dir/rqlite-data"
@@ -251,7 +260,7 @@ mkdir -p -- "$rqlite_data"
   -node-id isolated-agent-vm \
   -http-addr "127.0.0.1:$http_port" \
   -raft-addr "127.0.0.1:$raft_port" \
-  -auth "$proof_dir/auth.json" \
+  -auth "$rqlite_auth_file" \
   -http-cert "$ca_dir/rqlite/server.crt" \
   -http-key "$ca_dir/rqlite/server.key" \
   "$rqlite_data" >"$proof_dir/rqlite.log" 2>&1 &

@@ -167,6 +167,9 @@ requireText(caddyUnit, "ReadWritePaths=/var/lib/agent-vm-native/caddy", "Caddy c
 forbidText(caddyUnit, "--environ", "Caddy does not dump the DNSPod environment at startup");
 requireText(acceptance, "rqlite-curl.conf", "rqlite readiness credentials use a temporary curl config");
 requireText(acceptance, "umask 077", "temporary rqlite curl credentials are owner-only");
+requireText(acceptance, 'rqlite_auth_file="$proof_dir/auth.json"', "temporary rqlite auth file has an explicit path");
+requireText(acceptance, 'chmod 0600 "$rqlite_auth_file"', "temporary rqlite auth file is owner-only");
+requireText(acceptance, 'rm -f -- "$rqlite_auth_file"', "temporary rqlite auth file is removed during cleanup");
 forbidText(acceptance, '--user "agent-vm-backup:$backup_secret"', "rqlite credentials are not placed in curl argv");
 requireText(cutover, 'health_check "$active/app.sock"', "cutover rechecks the active socket after atomic replacement");
 requireText(cutover, "active_matches_current || die", "cutover refuses to replace an active link changed during readiness");

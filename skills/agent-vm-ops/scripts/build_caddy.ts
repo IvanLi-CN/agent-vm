@@ -37,7 +37,6 @@ const buildEnvironmentKeys = [
   "GOROOT",
   "GOTOOLCHAIN",
   "GOFLAGS",
-  "GOPROXY",
   "GOSUMDB",
   "GONOSUMDB",
   "GONOPROXY",

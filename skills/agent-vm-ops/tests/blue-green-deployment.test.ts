@@ -171,6 +171,10 @@ if env | grep -qE '^(DNSPOD_TOKEN|AGENT_VM_DOMAIN)='; then
   printf '%s\\n' 'deployment environment leaked to xcaddy' >&2
   exit 23
 fi
+if env | grep -qE '^GOPROXY='; then
+  printf '%s\\n' 'credential-bearing Go proxy environment leaked to xcaddy' >&2
+  exit 24
+fi
 cat > "$output" <<'EOF'
 #!/bin/sh
 case "\${1:-}" in
@@ -211,6 +215,7 @@ exit 1
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
         DNSPOD_TOKEN: "test-secret",
         AGENT_VM_DOMAIN: "test.example",
+        GOPROXY: "https://user:pass@proxy.example.invalid",
       },
     });
     expect(built.exitCode).toBe(0);
@@ -279,6 +284,11 @@ exit 1
       },
     });
     expect(rejected.exitCode).not.toBe(0);
+
+    const acceptance = read("skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh");
+    expect(acceptance).toContain('rqlite_auth_file="$proof_dir/auth.json"');
+    expect(acceptance).toContain('chmod 0600 "$rqlite_auth_file"');
+    expect(acceptance).toContain('rm -f -- "$rqlite_auth_file"');
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
