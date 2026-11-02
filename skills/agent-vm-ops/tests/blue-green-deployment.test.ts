@@ -130,6 +130,7 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(rqlite).toContain("-auth /etc/agent-vm-native/rqlite/auth.json");
   expect(rqlite).toContain("ExecStartPre=/usr/bin/test -f /etc/agent-vm-native/rqlite/auth.json");
   expect(rqlite).toContain("agent-vm-rqlite:600");
+  expect(rqlite).toContain("/usr/bin/stat");
   expect(rqlite).not.toContain("0.0.0.0");
 
   const slot = read("skills/agent-vm-ops/assets/systemd/agent-vm-native@.service");
@@ -146,7 +147,7 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(caddyUnit).toContain('while [ "$$attempt" -lt 30 ]');
   expect(caddyUnit).toContain("attempt=$$(($$attempt + 1))");
   expect(caddyUnit).toContain("--unix-socket /var/lib/agent-vm-native/active/app.sock http://localhost/internal/v1/health");
-  expect(caddyUnit).toContain("stat -c");
+  expect(caddyUnit).toContain("/usr/bin/stat -c");
   expect(caddyUnit).toContain("0:0:600");
   expect(caddyUnit).not.toContain("--environ");
   expect(caddyUnit).toContain("ReadWritePaths=/var/lib/agent-vm-native/caddy");
@@ -357,6 +358,10 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain("recover_pending_cutover");
   expect(cutover).toContain("validate_candidate_layout");
   expect(cutover).toContain('! -L "$slot_dir"');
+  expect(cutover).toContain('! -L "$slot_dir/release-manifest.json"');
+  expect(cutover).toContain('! -L "$root_dir/slots"');
+  expect(cutover).toContain('[[ -e "$pending_file" || -L "$pending_file" ]]');
+  expect(cutover).toContain('validate_slot_layout "$current_slot"');
   expect(cutover).toContain("sync -f");
   expect(cutover).toContain("candidate_record/app.sock");
   expect(cutover).toContain("read_current_slot");
@@ -372,11 +377,16 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(acceptance).toContain('"$systemd_root/usr/bin/stat"');
   expect(acceptance).toContain("env -i");
   expect(acceptance).toContain("stop_process");
+  expect(acceptance).toContain("process_alive");
+  expect(acceptance).toContain("capture_process_group");
   expect(acceptance).toContain("kill -KILL");
   expect(acceptance).toContain("setsid --wait");
   expect(acceptance).toContain('kill -TERM -- "-$group_id"');
   expect(acceptance).toContain("process_group_for");
   expect(acceptance).toContain('wait "$pid"');
+  expect(acceptance).toContain("chown 994:994");
+  expect(acceptance).toContain("staged rqlite auth metadata does not satisfy ExecStartPre");
+  expect(acceptance).toContain("staged Caddy environment metadata does not satisfy ExecStartPre");
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-cutover-test-"));
   try {
     const layout = join(temporaryRoot, "layout");
@@ -390,6 +400,37 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
     expect(JSON.parse(new TextDecoder().decode(accepted.stdout)).candidate).toBe("blue");
     const rejected = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", runtime, "--slot", "red", "--dry-run"]);
     expect(rejected.exitCode).not.toBe(0);
+
+    const symlinkedSlotsLayout = join(temporaryRoot, "symlinked-slots-layout");
+    const symlinkedSlots = join(temporaryRoot, "outside-slots");
+    mkdirSync(join(symlinkedSlots, "blue"), { recursive: true });
+    mkdirSync(symlinkedSlotsLayout, { recursive: true });
+    writeFileSync(join(symlinkedSlots, "blue/release-manifest.json"), "{}\n");
+    symlinkSync(join(runtime, "blue/app.sock"), join(symlinkedSlots, "blue/app.sock"));
+    symlinkSync(symlinkedSlots, join(symlinkedSlotsLayout, "slots"));
+    const symlinkedSlotsResult = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", symlinkedSlotsLayout, "--runtime-root", runtime, "--slot", "blue", "--dry-run"]);
+    expect(symlinkedSlotsResult.exitCode).not.toBe(0);
+
+    const symlinkedManifestLayout = join(temporaryRoot, "symlinked-manifest-layout");
+    mkdirSync(join(symlinkedManifestLayout, "slots/blue"), { recursive: true });
+    writeFileSync(join(symlinkedManifestLayout, "slots/blue/manifest-target.json"), "{}\n");
+    symlinkSync(join(symlinkedManifestLayout, "slots/blue/manifest-target.json"), join(symlinkedManifestLayout, "slots/blue/release-manifest.json"));
+    symlinkSync(join(runtime, "blue/app.sock"), join(symlinkedManifestLayout, "slots/blue/app.sock"));
+    const symlinkedManifestResult = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", symlinkedManifestLayout, "--runtime-root", runtime, "--slot", "blue", "--dry-run"]);
+    expect(symlinkedManifestResult.exitCode).not.toBe(0);
+
+    const malformedActiveLayout = join(temporaryRoot, "malformed-active-layout");
+    const malformedActiveRuntime = join(temporaryRoot, "malformed-active-runtime");
+    mkdirSync(join(malformedActiveLayout, "slots/blue"), { recursive: true });
+    mkdirSync(join(malformedActiveLayout, "slots/green"), { recursive: true });
+    mkdirSync(join(malformedActiveRuntime, "blue"), { recursive: true });
+    mkdirSync(join(malformedActiveRuntime, "green"), { recursive: true });
+    writeFileSync(join(malformedActiveLayout, "slots/green/release-manifest.json"), "{}\n");
+    symlinkSync(join(malformedActiveRuntime, "green/app.sock"), join(malformedActiveLayout, "slots/green/app.sock"));
+    symlinkSync(join(malformedActiveRuntime, "blue/app.sock"), join(malformedActiveLayout, "slots/blue/app.sock"));
+    symlinkSync(join(malformedActiveLayout, "slots/blue"), join(malformedActiveLayout, "active"));
+    const malformedActiveResult = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", malformedActiveLayout, "--runtime-root", malformedActiveRuntime, "--slot", "green", "--dry-run"]);
+    expect(malformedActiveResult.exitCode).not.toBe(0);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }

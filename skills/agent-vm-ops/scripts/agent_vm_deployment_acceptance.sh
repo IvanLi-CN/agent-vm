@@ -4,8 +4,11 @@ set -Eeuo pipefail
 repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 proof_dir="$(mktemp -d /tmp/agent-vm-deployment.XXXXXX)"
 rqlited_pid=""
+rqlited_pgid=""
 backend_pid=""
+backend_pgid=""
 caddy_pid=""
+caddy_pgid=""
 rqlite_auth_file=""
 rqlite_auth_config=""
 keep_proof="${KEEP_PROOF_DIR:-0}"
@@ -31,27 +34,47 @@ process_group_for() {
   fi
 }
 
+process_alive() {
+  local pid="$1"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
 process_group_alive() {
   local group_id="$1"
   [[ -n "$group_id" ]] && kill -0 -- "-$group_id" 2>/dev/null
 }
 
-stop_process() {
+capture_process_group() {
   local pid="$1"
   local group_id
-  [[ -n "$pid" ]] || return 0
-  if ! kill -0 "$pid" 2>/dev/null; then
-    wait "$pid" 2>/dev/null || true
-    return 0
+  for _ in $(seq 1 20); do
+    group_id="$(process_group_for "$pid")"
+    if [[ -n "$group_id" ]]; then
+      printf '%s\n' "$group_id"
+      return 0
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
+stop_process() {
+  local pid="$1"
+  local group_id="${2:-}"
+  [[ -n "$pid" || -n "$group_id" ]] || return 0
+  if [[ -z "$group_id" && -n "$pid" ]]; then
+    group_id="$(process_group_for "$pid")"
   fi
-  group_id="$(process_group_for "$pid")"
+  [[ -z "$group_id" || "$group_id" != "$script_pgid" ]] || return 1
   if [[ -n "$group_id" ]]; then
     kill -TERM -- "-$group_id" 2>/dev/null || true
   fi
-  kill -TERM "$pid" 2>/dev/null || true
+  if [[ -n "$pid" ]]; then
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
   for _ in $(seq 1 50); do
-    if ! kill -0 "$pid" 2>/dev/null && ! process_group_alive "$group_id"; then
-      wait "$pid" 2>/dev/null || true
+    if ! process_alive "$pid" && ! process_group_alive "$group_id"; then
+      [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true
       return 0
     fi
     sleep 0.1
@@ -59,10 +82,12 @@ stop_process() {
   if [[ -n "$group_id" ]]; then
     kill -KILL -- "-$group_id" 2>/dev/null || true
   fi
-  kill -KILL "$pid" 2>/dev/null || true
+  if [[ -n "$pid" ]]; then
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
   for _ in $(seq 1 50); do
-    if ! kill -0 "$pid" 2>/dev/null && ! process_group_alive "$group_id"; then
-      wait "$pid" 2>/dev/null || true
+    if ! process_alive "$pid" && ! process_group_alive "$group_id"; then
+      [[ -z "$pid" ]] || wait "$pid" 2>/dev/null || true
       return 0
     fi
     sleep 0.1
@@ -71,14 +96,19 @@ stop_process() {
 }
 
 cleanup() {
-  if [[ -n "$caddy_pid" ]]; then
-    stop_process "$caddy_pid" || cleanup_failed=1
+  if [[ -n "$caddy_pid" || -n "$caddy_pgid" ]]; then
+    stop_process "$caddy_pid" "$caddy_pgid" || cleanup_failed=1
   fi
-  if [[ -n "$backend_pid" ]]; then
-    stop_process "$backend_pid" || cleanup_failed=1
+  if [[ -n "$backend_pid" || -n "$backend_pgid" ]]; then
+    stop_process "$backend_pid" "$backend_pgid" || cleanup_failed=1
   fi
-  if [[ -n "$rqlited_pid" ]]; then
-    stop_process "$rqlited_pid" || cleanup_failed=1
+  if [[ -n "$rqlited_pid" || -n "$rqlited_pgid" ]]; then
+    stop_process "$rqlited_pid" "$rqlited_pgid" || cleanup_failed=1
+  fi
+  if process_alive "$caddy_pid" || process_group_alive "$caddy_pgid" \
+    || process_alive "$backend_pid" || process_group_alive "$backend_pgid" \
+    || process_alive "$rqlited_pid" || process_group_alive "$rqlited_pgid"; then
+    cleanup_failed=1
   fi
   if (( cleanup_failed != 0 )); then
     printf 'cleanup incomplete; live acceptance process tree retained at %s\n' "$proof_dir" >&2
@@ -117,9 +147,12 @@ require_command openssl
 require_command systemd-analyze
 require_command xcaddy
 require_command go
+require_command chown
+require_command awk
 require_command setsid
 require_command pgrep
 require_command ps
+[[ "$EUID" -eq 0 ]] || fail "staged ownership acceptance requires root"
 script_pgid="$(ps -o pgid= -p "$$" | tr -d ' ')"
 
 static_result="$proof_dir/static.json"
@@ -218,6 +251,7 @@ with Server(socket_path, Handler) as server:
     server.serve_forever()
 PY
 backend_pid=$!
+backend_pgid="$(capture_process_group "$backend_pid")" || fail "backend process group was not isolated"
 for _ in $(seq 1 40); do
   [[ -S "$backend_socket" ]] && break
   sleep 0.05
@@ -233,6 +267,7 @@ setsid --wait env -i \
   DNSPOD_TOKEN="isolated-dnspod-token" \
   "$caddy_binary" run --config "$smoke_config" --adapter caddyfile >"$proof_dir/caddy.log" 2>&1 &
 caddy_pid=$!
+caddy_pgid="$(capture_process_group "$caddy_pid")" || fail "Caddy process group was not isolated"
 auth_header_token="isolated-${BASHPID}-token"
 query_marker="isolated-${BASHPID}-query"
 smoke_ready=0
@@ -256,10 +291,12 @@ blocked_code="$(curl --silent --show-error --output /dev/null --write-out '%{htt
 if grep -q "$query_marker\|$auth_header_token" "$proof_dir/caddy.log"; then
   fail "Caddy access log retained sensitive request data"
 fi
-stop_process "$caddy_pid"
+stop_process "$caddy_pid" "$caddy_pgid" || fail "Caddy process group did not stop"
 caddy_pid=""
-stop_process "$backend_pid"
+caddy_pgid=""
+stop_process "$backend_pid" "$backend_pgid" || fail "backend process group did not stop"
 backend_pid=""
+backend_pgid=""
 
 unit_dir="$repository_root/skills/agent-vm-ops/assets/systemd"
 systemd_root="$proof_dir/systemd-root"
@@ -279,7 +316,11 @@ touch \
   "$systemd_root/etc/agent-vm-native/slots/test_instance/config.json" \
   "$systemd_root/opt/agent-vm-native/release-manifest.json" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/release-manifest.json"
-chmod 0600 "$systemd_root/etc/agent-vm-native/rqlite/auth.json"
+chmod 0600 \
+  "$systemd_root/etc/agent-vm-native/caddy.env" \
+  "$systemd_root/etc/agent-vm-native/rqlite/auth.json"
+chown 0:0 "$systemd_root/etc/agent-vm-native/caddy.env"
+chown 994:994 "$systemd_root/etc/agent-vm-native/rqlite/auth.json"
 touch \
   "$systemd_root/bin/sh" \
   "$systemd_root/usr/bin/curl" \
@@ -327,6 +368,18 @@ systemd-analyze --root="$systemd_root" verify \
       fail "systemd unit verification failed"
     }
 
+# systemd-analyze --root verifies unit syntax and dependencies but does not run
+# ExecStartPre. Execute the metadata preconditions against the staged paths so
+# the acceptance gate exercises the same fail-closed ownership and mode checks.
+staged_auth="$systemd_root/etc/agent-vm-native/rqlite/auth.json"
+staged_caddy_env="$systemd_root/etc/agent-vm-native/caddy.env"
+/usr/bin/test -f "$staged_auth"
+staged_rqlite_uid="$(/usr/bin/stat -c "%u" "$staged_auth")"
+staged_rqlite_mode="$(/usr/bin/stat -c "%a" "$staged_auth")"
+[[ "$staged_rqlite_uid" == "$(awk -F: '$1 == "agent-vm-rqlite" {print $3}' "$systemd_root/etc/passwd")" && "$staged_rqlite_mode" == "600" ]] || fail "staged rqlite auth metadata does not satisfy ExecStartPre"
+/usr/bin/test -f "$staged_caddy_env"
+[[ "$(/usr/bin/stat -c "%u:%g:%a" "$staged_caddy_env")" == "0:0:600" ]] || fail "staged Caddy environment metadata does not satisfy ExecStartPre"
+
 rqlite_archive="$proof_dir/rqlite.tar.gz"
 rqlite_url="https://github.com/rqlite/rqlite/releases/download/v10.5.2/rqlite-v10.5.2-linux-amd64.tar.gz"
 rqlite_sha256="1a04a7c2c542e8e1c1347bd31af0fa9ef7043febb3c4d1806d36bc1702c6fa0f"
@@ -371,6 +424,7 @@ setsid --wait env -i PATH="$runtime_path" HOME="$runtime_home" \
   -http-key "$ca_dir/rqlite/server.key" \
   "$rqlite_data" >"$proof_dir/rqlite.log" 2>&1 &
 rqlited_pid=$!
+rqlited_pgid="$(capture_process_group "$rqlited_pid")" || fail "rqlite process group was not isolated"
 rqlite_base="https://127.0.0.1:$http_port"
 rqlite_auth_config="$proof_dir/rqlite-curl.conf"
 (

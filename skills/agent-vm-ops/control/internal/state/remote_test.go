@@ -1299,6 +1299,64 @@ func TestRemoteOpenRejectsMalformedManagementSchemaBeforeWrite(t *testing.T) {
 	}
 }
 
+func TestRemoteOpenRedactsCredentialsFromMissingDatabaseError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{{
+			Columns: []string{"type", "name", "sql"},
+			Types:   []string{"text", "text", "text"},
+			Values:  [][]any{},
+		}}})
+	}))
+	defer server.Close()
+	dsn := strings.Replace(server.URL, "http://", "http://state-user:state-password@", 1) + "?secret=query-secret"
+	_, err := openRemote(dsn, false)
+	if err == nil {
+		t.Fatal("missing remote database unexpectedly opened")
+	}
+	message := err.Error()
+	for _, secret := range []string{"state-user", "state-password", "query-secret"} {
+		if strings.Contains(message, secret) {
+			t.Fatalf("remote error leaked %q: %s", secret, message)
+		}
+	}
+	if !strings.Contains(message, "database_missing") || !strings.Contains(message, server.Listener.Addr().String()) {
+		t.Fatalf("remote error lost safe endpoint context: %s", message)
+	}
+}
+
+func TestRemoteRequestUsesBasicAuthHeaderWithoutURLCredentials(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.User != nil {
+			t.Errorf("request URL retained userinfo: %s", request.URL)
+		}
+		username, password, ok := request.BasicAuth()
+		if !ok || username != "state-user" || password != "state-password" {
+			t.Errorf("request BasicAuth = (%q, %q, %t)", username, password, ok)
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{{
+			Columns: []string{"value"},
+			Types:   []string{"text"},
+			Values:  [][]any{{"ok"}},
+		}}})
+	}))
+	defer server.Close()
+	dsn := strings.Replace(server.URL, "http://", "http://state-user:state-password@", 1)
+	store, err := newRemoteStore(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	result, err := store.remote.query(context.Background(), "SELECT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Values) != 1 || result.Values[0][0] != "ok" {
+		t.Fatalf("remote query result = %#v", result.Values)
+	}
+}
+
 func TestSupportedSchemaAcceptsLegacyManagementBeforeAuthBootstrap(t *testing.T) {
 	core, err := canonicalCoreSchema(context.Background())
 	if err != nil {

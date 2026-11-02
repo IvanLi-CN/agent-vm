@@ -54,6 +54,20 @@ die() {
 [[ "$slot" == blue || "$slot" == green ]] || die "slot must be blue or green"
 [[ "$health_timeout" =~ ^[1-9][0-9]*$ ]] || die "health timeout must be a positive integer"
 
+if (( dry_run == 0 )); then
+  mkdir -p -- "$root_dir"
+fi
+
+validate_release_root() {
+  [[ -d "$root_dir" && ! -L "$root_dir" ]] || die "release root is missing or symlinked: $root_dir"
+  root_dir="$(readlink -f -- "$root_dir")" || die "release root cannot be canonicalized"
+  [[ -d "$root_dir" && ! -L "$root_dir" ]] || die "canonical release root is missing or symlinked: $root_dir"
+  [[ -d "$root_dir/slots" && ! -L "$root_dir/slots" ]] || die "slot root is missing or symlinked: $root_dir/slots"
+  [[ "$(readlink -f -- "$root_dir/slots")" == "$root_dir/slots" ]] || die "slot root path is not canonical: $root_dir/slots"
+}
+
+validate_release_root
+
 candidate="$root_dir/slots/$slot"
 candidate_socket="$candidate/app.sock"
 expected_socket="$runtime_root/$slot/app.sock"
@@ -66,7 +80,8 @@ validate_slot_layout() {
   local socket_link="$slot_dir/app.sock"
   local expected_slot_socket="$runtime_root/$slot_name/app.sock"
   [[ -d "$slot_dir" && ! -L "$slot_dir" ]] || die "slot directory is missing or symlinked: $slot_dir"
-  [[ -f "$slot_dir/release-manifest.json" ]] || die "slot release manifest is missing: $slot_name"
+  [[ -f "$slot_dir/release-manifest.json" && ! -L "$slot_dir/release-manifest.json" ]] || die "slot release manifest is missing or symlinked: $slot_name"
+  [[ "$(readlink -f -- "$slot_dir")" == "$root_dir/slots/$slot_name" ]] || die "slot directory resolves outside the release root: $slot_name"
   [[ -L "$socket_link" ]] || die "slot socket link is missing: $slot_name"
   [[ "$(readlink -- "$socket_link")" == "$expected_slot_socket" ]] || die "slot socket link is not the expected runtime socket: $slot_name"
 }
@@ -89,6 +104,7 @@ read_current_slot() {
     esac
     [[ -d "$current_target" ]] || die "active target slot is missing"
     current_slot="${current_target##*/}"
+    validate_slot_layout "$current_slot"
   else
     current_target=""
     current_slot="none"
@@ -162,7 +178,7 @@ clear_pending_record() {
 }
 
 recover_pending_cutover() {
-  [[ -e "$pending_file" ]] || return 0
+  [[ -e "$pending_file" || -L "$pending_file" ]] || return 0
   [[ -f "$pending_file" && ! -L "$pending_file" ]] || die "cutover recovery record is not a regular file"
   [[ "$(stat -c "%a" "$pending_file")" == "600" ]] || die "cutover recovery record is not mode 0600"
 
@@ -229,6 +245,7 @@ if ! health_check "$active/app.sock"; then
   if [[ "$current_slot" == "none" ]]; then
     rm -f -- "$active" || die "candidate failed post-cutover health and active rollback failed"
   else
+    validate_slot_layout "$current_slot"
     ln -s -- "$root_dir/slots/$current_slot" "$rollback_link"
     mv -Tf -- "$rollback_link" "$active" || die "candidate failed post-cutover health and active rollback failed"
     sync_path "$root_dir"

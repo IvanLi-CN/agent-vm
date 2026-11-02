@@ -140,6 +140,7 @@ requireText(rqliteUnit, "-raft-addr 127.0.0.1:4002", "rqlite raft binds to loopb
 requireText(rqliteUnit, "-auth /etc/agent-vm-native/rqlite/auth.json", "rqlite auth file is explicit");
 requireText(rqliteUnit, "ExecStartPre=/usr/bin/test -f /etc/agent-vm-native/rqlite/auth.json", "rqlite auth file is checked before startup");
 requireText(rqliteUnit, "agent-vm-rqlite:600", "rqlite auth file is dedicated-user mode 0600");
+requireText(rqliteUnit, "/usr/bin/stat", "rqlite auth metadata check uses an absolute stat path");
 requireText(blueGreenDoc, "install -o agent-vm-rqlite -g agent-vm-rqlite -m 0600", "deployment docs install rqlite auth as dedicated-user mode 0600");
 requireText(rqliteUnit, "-http-cert /etc/agent-vm-native/tls/rqlite/server.crt", "rqlite TLS certificate is explicit");
 requireText(rqliteUnit, "-http-key /etc/agent-vm-native/tls/rqlite/server.key", "rqlite TLS key is explicit");
@@ -166,7 +167,7 @@ requireText(caddyUnit, "ExecStartPre=+/bin/sh -c", "Caddy runs its active socket
 requireText(caddyUnit, 'while [ "$$attempt" -lt 30 ]', "systemd preserves the Caddy readiness loop shell variable");
 requireText(caddyUnit, "attempt=$$(($$attempt + 1))", "systemd preserves the Caddy readiness loop arithmetic");
 requireText(caddyUnit, "--unix-socket /var/lib/agent-vm-native/active/app.sock http://localhost/internal/v1/health", "Caddy waits for a ready native listener, not only a socket inode");
-requireText(caddyUnit, "stat -c", "Caddy verifies the environment file metadata before starting");
+requireText(caddyUnit, "/usr/bin/stat -c", "Caddy verifies the environment file metadata before starting");
 requireText(caddyUnit, "0:0:600", "Caddy requires a root-owned mode-0600 environment file");
 requireText(caddyUnit, "ReadOnlyPaths=/etc/agent-vm-native/Caddyfile", "Caddy configuration is read-only");
 requireText(caddyUnit, "ReadOnlyPaths=/etc/agent-vm-native/Caddyfile /etc/agent-vm-native/caddy.env", "Caddy configuration and credentials are read-only");
@@ -177,11 +178,16 @@ requireText(acceptance, "umask 077", "temporary rqlite curl credentials are owne
 requireText(acceptance, "require_command flock", "isolated acceptance checks the active link lock dependency");
 requireText(acceptance, "env -i", "isolated runtime children do not inherit ambient credentials");
 requireText(acceptance, "stop_process", "isolated acceptance bounds runtime child cleanup");
+requireText(acceptance, "process_alive", "isolated acceptance checks direct process liveness");
+requireText(acceptance, "capture_process_group", "isolated acceptance records each runtime process group");
 requireText(acceptance, "kill -KILL", "isolated acceptance force-cleans stalled runtime children");
 requireText(acceptance, "setsid --wait", "isolated acceptance gives runtime children a dedicated process group");
 requireText(acceptance, 'kill -TERM -- "-$group_id"', "isolated acceptance terminates the runtime process group");
 requireText(acceptance, "process_group_for", "isolated acceptance resolves the runtime process group");
 requireText(acceptance, 'wait "$pid"', "isolated acceptance waits for runtime process termination");
+requireText(acceptance, "chown 994:994", "staged rqlite auth is owned by the service UID");
+requireText(acceptance, "staged rqlite auth metadata does not satisfy ExecStartPre", "staging executes the rqlite metadata precondition");
+requireText(acceptance, "staged Caddy environment metadata does not satisfy ExecStartPre", "staging executes the Caddy metadata precondition");
 for (const commandPath of ["$systemd_root/bin/sh", "$systemd_root/usr/bin/curl", "$systemd_root/usr/bin/sleep", "$systemd_root/usr/bin/stat"]) {
   requireText(acceptance, commandPath, `systemd staging root provides ${commandPath}`);
 }
@@ -196,6 +202,10 @@ requireText(cutover, "pending_file", "cutover persists an interrupted-swap recov
 requireText(cutover, "recover_pending_cutover", "cutover recovers an interrupted swap before a new replacement");
 requireText(cutover, "validate_candidate_layout", "cutover revalidates the candidate while holding the active lock");
 requireText(cutover, '! -L "$slot_dir"', "cutover rejects symlinked slot directories");
+requireText(cutover, '! -L "$slot_dir/release-manifest.json"', "cutover rejects symlinked release manifests");
+requireText(cutover, '! -L "$root_dir/slots"', "cutover rejects a symlinked slot root");
+requireText(cutover, '[[ -e "$pending_file" || -L "$pending_file" ]]', "cutover fails closed on dangling recovery links");
+requireText(cutover, 'validate_slot_layout "$current_slot"', "cutover validates the active slot before recovery");
 requireText(cutover, "sync -f", "cutover flushes recovery and active-link directory updates");
 requireText(cutover, "candidate_record/app.sock", "cutover confirms a pending candidate before rollback");
 requireText(cutover, "flock --wait 30 9", "cutover serializes active link writers with a kernel lock");
