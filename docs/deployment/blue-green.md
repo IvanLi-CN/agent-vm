@@ -79,7 +79,8 @@ Deployd 的 `/metrics` 只输出最近一次已完成的组合快照，不在 sc
 不得让两个槽位共用一个 metrics 目录，否则旧槽位和候选槽位可能相互覆盖 snapshot。
 切换期间两个槽位进程可以同时活跃；deployd 一次只授予一个槽位运行 scheduler 和 scheduler-driven native mutation 的权限。
 槽位必须先取得该角色，才能运行 startup reconciliation 或启用 timer/reconcile/GC 循环；角色丢失时必须先 fence 这些循环。
-之后 deployd 排空旧槽位，并且只有 quiescence 证据完整后才能停止它。
+之后 deployd 排空旧槽位，确认在途请求、pending operation、native worker 和 scheduler work 都已收敛，再停止旧槽位。
+只有重新观测到旧槽位已经停止、目标槽位仍保持 controller role 和 traffic role，事务才能进入 finalize。
 
 Prometheus 只配置一个 `agent-vm-deployd` scrape job，目标是部署配置提供的 Deployd `/metrics` 地址。
 Grafana 只通过 Prometheus 查询，不读取 Deployd socket、部署 SQLite、槽位 snapshot 或 Caddy 日志。
@@ -131,9 +132,12 @@ sudo agent-vm-deploy status --transaction <transaction-id> --json
 ```
 
 Deployd 启动候选槽位，验证 release manifest、socket、就绪状态、状态能力和共享状态纪元，将控制器主权交给候选槽位，启用其流量角色，原子替换受保护的 `active` 链接，并将旧槽位置为 `retiring`。
-随后等待流量排空、pending operation、native worker 和 scheduler work 达到可验证的收敛状态后再 finalize。
+随后等待流量排空、pending operation、native worker 和 scheduler work 达到可验证的收敛状态，停止旧槽位，并重新观测停止结果后再 finalize。
 切换前检查失败时保持当前槽位和 active 链接不变。
 切换后失败时允许通过 deployd 向上一个兼容槽位执行一次有界 rollback；结果不明确时保持 `needs_recovery` 并 fence admission。
+
+Deployd 重启后的 recovery finalize 也必须遵守同一顺序：先撤销旧槽位角色并停止旧槽位，再重新授予目标槽位角色并恢复流量。
+任一撤销、停止或观测步骤失败，都保持 `needs_recovery` 并对两个槽位执行 hard-fence。
 
 `agent_vm_cutover.sh --dry-run` 仍可用于隔离布局和 active-link guard，但它不是蓝绿事务权威，不能用它证明控制器交接、流量排空或 native quiescence。
 

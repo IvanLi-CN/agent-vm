@@ -184,7 +184,13 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			nativeObservationUp = false
 			snapshot.Consistent = false
 		} else if result, ok := drainStatus["result"].(map[string]any); ok {
-			observation.StateCapabilities = stringSlice(result["state_capabilities"])
+			capabilities := stringSlice(result["state_capabilities"])
+			if len(capabilities) == 0 {
+				nativeObservationUp = false
+				snapshot.Consistent = false
+			} else {
+				observation.StateCapabilities = capabilities
+			}
 		} else {
 			nativeObservationUp = false
 			snapshot.Consistent = false
@@ -320,11 +326,14 @@ func (runtime *HostRuntime) Stage(ctx context.Context, slot, bundle string) erro
 		return err
 	}
 	if err := runtime.systemctl(ctx, "restart", "agent-vm-native@"+slot+".service"); err != nil {
-		return err
+		return runtime.restoreAfterStageFailure(ctx, slot, err)
 	}
 	currentProcess, err := runtime.waitSlotIdentity(ctx, slot, previousProcess, previousProcessOK)
 	if err != nil {
-		return err
+		return runtime.restoreAfterStageFailure(ctx, slot, err)
+	}
+	if err := runtime.discardStagedBackup(slot); err != nil {
+		return &UncertainError{Cause: fmt.Errorf("stage completed but previous slot backup could not be removed: %w", err)}
 	}
 	runtime.mu.Lock()
 	runtime.stagedProcess[slot] = currentProcess
@@ -488,6 +497,53 @@ func (runtime *HostRuntime) stageBundle(slot, bundle string) error {
 		return fmt.Errorf("activate staged slot files: %w", err)
 	}
 	keepTemporary = false
+	if err := syncDirectory(root); err != nil {
+		if restoreErr := restoreStagedSlot(root, slot); restoreErr != nil {
+			return &UncertainError{Cause: fmt.Errorf("sync staged slot: %w; restore previous slot: %v", err, restoreErr)}
+		}
+		return fmt.Errorf("sync staged slot: %w", err)
+	}
+	return nil
+}
+
+func restoreStagedSlot(root, slot string) error {
+	target := filepath.Join(root, slot)
+	backup := filepath.Join(root, "."+slot+".previous-stage")
+	if _, err := os.Lstat(backup); err != nil {
+		return fmt.Errorf("previous stage backup is unavailable: %w", err)
+	}
+	if err := os.RemoveAll(target); err != nil {
+		return fmt.Errorf("remove failed staged slot: %w", err)
+	}
+	if err := os.Rename(backup, target); err != nil {
+		return fmt.Errorf("restore previous staged slot: %w", err)
+	}
+	return syncDirectory(root)
+}
+
+func (runtime *HostRuntime) restoreAfterStageFailure(ctx context.Context, slot string, cause error) error {
+	if err := runtime.systemctl(ctx, "stop", "agent-vm-native@"+slot+".service"); err != nil {
+		return &UncertainError{Cause: fmt.Errorf("stage failed and slot could not be stopped: %w; original error: %v", err, cause)}
+	}
+	if !runtime.systemdSlotStopped(ctx, slot) {
+		return &UncertainError{Cause: fmt.Errorf("stage failed but slot stop was not verified; original error: %v", cause)}
+	}
+	root := filepath.Join(runtime.Config.ReleaseRoot, "slots")
+	if err := restoreStagedSlot(root, slot); err != nil {
+		return &UncertainError{Cause: fmt.Errorf("stage failed and previous slot could not be restored: %w; original error: %v", err, cause)}
+	}
+	if err := runtime.systemctl(ctx, "restart", "agent-vm-native@"+slot+".service"); err != nil {
+		return &UncertainError{Cause: fmt.Errorf("stage failed and restored slot could not be restarted: %w; original error: %v", err, cause)}
+	}
+	return fmt.Errorf("stage failed and previous slot was restored: %w", cause)
+}
+
+func (runtime *HostRuntime) discardStagedBackup(slot string) error {
+	root := filepath.Join(runtime.Config.ReleaseRoot, "slots")
+	backup := filepath.Join(root, "."+slot+".previous-stage")
+	if err := os.RemoveAll(backup); err != nil {
+		return err
+	}
 	return syncDirectory(root)
 }
 
@@ -965,9 +1021,16 @@ func (runtime *HostRuntime) Stop(ctx context.Context, slot string) error {
 
 func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease) error {
 	if target != "" && target != "none" {
-		if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
-			if stopErr := runtime.Stop(ctx, target); stopErr != nil {
-				return fmt.Errorf("revoke target controller: %w; stop target after revoke failure: %v", err, stopErr)
+		if !runtime.systemdSlotStopped(ctx, target) {
+			if err := runtime.DisableTraffic(ctx, target); err != nil && !runtime.systemdSlotStopped(ctx, target) {
+				return err
+			}
+			if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
+				if stopErr := runtime.Stop(ctx, target); stopErr != nil {
+					return fmt.Errorf("revoke target controller: %w; stop target after revoke failure: %v", err, stopErr)
+				}
+			} else if err := runtime.Stop(ctx, target); err != nil {
+				return fmt.Errorf("stop target after revoke: %w", err)
 			}
 		}
 	}
@@ -1145,7 +1208,7 @@ func (runtime *HostRuntime) observeSource(ctx context.Context, slot, source, act
 	if err := validateSourceResult(action, result); err != nil {
 		return nil, time.Time{}, fmt.Errorf("%s observation is invalid: %w", source, err)
 	}
-	observedAt, ok := parseObservedAt(result["observed_at"])
+	observedAt, ok := validObservedAt(result["observed_at"], time.Now().UTC())
 	if !ok {
 		return nil, time.Time{}, fmt.Errorf("%s observation timestamp is missing", source)
 	}
@@ -1165,6 +1228,10 @@ func validateSourceResult(action string, result map[string]any) error {
 	}
 	switch action {
 	case "admin-metrics":
+		observationConsistent, ok := result["observation_consistent"].(bool)
+		if !ok || !observationConsistent {
+			return errors.New("observation_consistent is missing or false")
+		}
 		observationEpoch, ok := result["observation_epoch"].(string)
 		if !ok || observationEpoch == "" {
 			return errors.New("observation_epoch is missing or invalid")
@@ -1405,6 +1472,14 @@ func parseObservedAt(value any) (time.Time, bool) {
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, text)
 	return parsed, err == nil
+}
+
+func validObservedAt(value any, now time.Time) (time.Time, bool) {
+	parsed, ok := parseObservedAt(value)
+	if !ok || parsed.After(now) {
+		return time.Time{}, false
+	}
+	return parsed, true
 }
 
 func stringSlice(value any) []string {

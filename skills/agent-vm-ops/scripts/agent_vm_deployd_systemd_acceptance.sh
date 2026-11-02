@@ -69,46 +69,86 @@ backup_unit() {
 }
 
 restore_environment() {
+  local main_status="${1:-0}"
+  local restore_status=0
+  local unit path backup
   set +e +u
   for unit in "${runtime_units[@]}"; do
-    systemctl stop "$unit" >/dev/null 2>&1 || true
-  done
-  for path in "${test_paths[@]}"; do
-    if [[ -e "$path" || -L "$path" ]]; then
-      rm -rf -- "$path"
+    if ! systemctl stop "$unit" >/dev/null 2>&1; then
+      restore_status=1
     fi
-    local backup="${path_backup[$path]:-}"
-    if [[ -n "$backup" && ( -e "$backup" || -L "$backup" ) ]]; then
-      mkdir -p -- "$(dirname "$path")"
-      mv -- "$backup" "$path"
+    if systemctl is-active --quiet "$unit"; then
+      restore_status=1
     fi
   done
-  for unit in "${managed_units[@]}"; do
-    local path="/etc/systemd/system/$unit"
-    if [[ -e "$path" || -L "$path" ]]; then
-      rm -f -- "$path"
+  if [[ "$restore_status" -eq 0 ]]; then
+    for path in "${test_paths[@]}"; do
+      if [[ -e "$path" || -L "$path" ]]; then
+        rm -rf -- "$path"
+        if [[ -e "$path" || -L "$path" ]]; then
+          restore_status=1
+          continue
+        fi
+      fi
+      backup="${path_backup[$path]:-}"
+      if [[ -n "$backup" && ( -e "$backup" || -L "$backup" ) ]]; then
+        mkdir -p -- "$(dirname "$path")" || restore_status=1
+        mv -- "$backup" "$path" || restore_status=1
+      fi
+    done
+    for unit in "${managed_units[@]}"; do
+      path="/etc/systemd/system/$unit"
+      if [[ -e "$path" || -L "$path" ]]; then
+        rm -f -- "$path" || restore_status=1
+      fi
+      backup="${unit_backup[$unit]:-}"
+      if [[ -n "$backup" && ( -e "$backup" || -L "$backup" ) ]]; then
+        mv -- "$backup" "$path" || restore_status=1
+      fi
+    done
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+      restore_status=1
     fi
-    local backup="${unit_backup[$unit]:-}"
-    if [[ -n "$backup" && ( -e "$backup" || -L "$backup" ) ]]; then
-      mv -- "$backup" "$path"
+    for unit in "${runtime_units[@]}"; do
+      if [[ "${unit_was_active[$unit]:-0}" == 1 ]]; then
+        if ! systemctl start "$unit" >/dev/null 2>&1 || ! systemctl is-active --quiet "$unit"; then
+          restore_status=1
+        fi
+      fi
+    done
+    if [[ "$group_created" == 1 ]] && ! groupdel agent-vm-web >/dev/null 2>&1; then
+      restore_status=1
     fi
-  done
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  for unit in "${runtime_units[@]}"; do
-    if [[ "${unit_was_active[$unit]:-0}" == 1 ]]; then
-      systemctl start "$unit" >/dev/null 2>&1 || true
-    fi
-  done
-  if [[ "$group_created" == 1 ]]; then
-    groupdel agent-vm-web >/dev/null 2>&1 || true
+  else
+    echo "deployd systemd acceptance: refusing filesystem restore while a managed unit remains active" >&2
+  fi
+  if [[ "$restore_status" -ne 0 || "$main_status" -ne 0 ]]; then
+    keep_proof=1
   fi
   if [[ "$keep_proof" == 1 ]]; then
     printf 'proof_dir=%s\n' "$test_root" >&2
   else
-    rm -rf -- "$test_root"
+    if ! rm -rf -- "$test_root"; then
+      restore_status=1
+    fi
   fi
+  if [[ "$restore_status" -ne 0 ]]; then
+    return 1
+  fi
+  return "$main_status"
 }
-trap restore_environment EXIT
+
+on_exit() {
+  local main_status="$?"
+  restore_environment "$main_status"
+  local restore_status="$?"
+  trap - EXIT
+  if [[ "$restore_status" -ne 0 ]]; then
+    exit "$restore_status"
+  fi
+  exit "$main_status"
+}
+trap on_exit EXIT
 
 [[ "${EUID:-$(id -u)}" == 0 ]] || fail "real systemd acceptance requires root in the session-owned Agent VM"
 for command in bun curl go git python3 sha256sum systemctl tar; do
@@ -124,11 +164,14 @@ for unit in "${runtime_units[@]}"; do
     unit_was_active["$unit"]=0
   fi
 done
+for unit in "${runtime_units[@]}"; do
+  systemctl stop "$unit" >/dev/null 2>&1 || fail "could not stop pre-existing unit $unit"
+  if systemctl is-active --quiet "$unit"; then
+    fail "pre-existing unit $unit remained active after stop"
+  fi
+done
 for unit in "${managed_units[@]}"; do
   backup_unit "$unit"
-done
-for unit in "${runtime_units[@]}"; do
-  systemctl stop "$unit" >/dev/null 2>&1 || true
 done
 for path in "${test_paths[@]}"; do
   backup_path "$path"
@@ -238,6 +281,26 @@ debug_unit() {
   systemctl status --no-pager --full "$1" >&2 || true
 }
 
+assert_exec_start() {
+  local actual="$1"
+  local expected="$2"
+  local label="$3"
+  python3 - "$actual" "$expected" "$label" <<'PY'
+import shlex
+import sys
+
+actual, expected, label = sys.argv[1:]
+marker = "argv[]="
+if marker not in actual:
+    raise SystemExit(f"{label} does not expose argv[]")
+command = actual.split(marker, 1)[1]
+if " ;" in command:
+    command = command.split(" ;", 1)[0]
+if shlex.split(command) != shlex.split(expected):
+    raise SystemExit(f"{label} does not exactly match the expected argv")
+PY
+}
+
 wait_active() {
   local unit="$1"
   for _ in $(seq 1 80); do
@@ -264,7 +327,7 @@ for slot in blue green; do
   [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || fail "$slot MainPID was not verified"
   [[ "$control_group" == */agent-vm-native@"$slot".service ]] || fail "$slot cgroup was not verified"
   [[ "$fragment_path" == /etc/systemd/system/agent-vm-native@.service ]] || fail "$slot fragment path was not verified"
-  [[ "$exec_start" == *"/var/lib/agent-vm-native/slots/$slot/bin/agent-vm-control serve --config /etc/agent-vm-native/slots/$slot/config.json --manifest /var/lib/agent-vm-native/slots/$slot/release-manifest.json"* ]] || fail "$slot ExecStart was not verified"
+  assert_exec_start "$exec_start" "/var/lib/agent-vm-native/slots/$slot/bin/agent-vm-control serve --config /etc/agent-vm-native/slots/$slot/config.json --manifest /var/lib/agent-vm-native/slots/$slot/release-manifest.json" "$slot ExecStart" || fail "$slot ExecStart was not verified"
 done
 
 systemctl start agent-vm-deployd.service
@@ -286,7 +349,7 @@ deployd_exec="$(systemctl show agent-vm-deployd.service --property=ExecStart --v
 [[ "$deployd_pid" =~ ^[1-9][0-9]*$ ]] || fail "Deployd MainPID was not verified"
 [[ "$deployd_group" == */agent-vm-deployd.service ]] || fail "Deployd cgroup was not verified"
 [[ "$deployd_fragment" == /etc/systemd/system/agent-vm-deployd.service ]] || fail "Deployd fragment path was not verified"
-[[ "$deployd_exec" == *"/opt/agent-vm-native/bin/agent-vm-deployd --config /etc/agent-vm-native/deployd.json"* ]] || fail "Deployd ExecStart was not verified"
+assert_exec_start "$deployd_exec" "/opt/agent-vm-native/bin/agent-vm-deployd --config /etc/agent-vm-native/deployd.json" "Deployd ExecStart" || fail "Deployd ExecStart was not verified"
 
 assert_status() {
   local payload="$1"

@@ -20,6 +20,8 @@ type fakeRuntime struct {
 	stateEpoch            string
 	capabilities          []string
 	mutateContractOnGrant bool
+	invalidCapabilities   bool
+	failRevoke            bool
 	sequence              []string
 	traffic               map[string]bool
 	releaseIDs            map[string]string
@@ -42,9 +44,11 @@ func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 		if value.StateEpoch == "" {
 			value.StateEpoch = "epoch-1"
 		}
-		value.StateCapabilities = append([]string(nil), runtime.capabilities...)
-		if len(value.StateCapabilities) == 0 {
-			value.StateCapabilities = []string{"reads@1", "writes@1"}
+		if !runtime.invalidCapabilities {
+			value.StateCapabilities = append([]string(nil), runtime.capabilities...)
+			if len(value.StateCapabilities) == 0 {
+				value.StateCapabilities = []string{"reads@1", "writes@1"}
+			}
 		}
 		slots[slot] = value
 	}
@@ -80,6 +84,9 @@ func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, _ co
 }
 func (runtime *fakeRuntime) RevokeController(_ context.Context, slot string, _ uint64) error {
 	runtime.sequence = append(runtime.sequence, "revoke")
+	if runtime.failRevoke {
+		return errors.New("revoke failed")
+	}
 	if observation, ok := runtime.observations[slot]; ok {
 		observation.ControllerOwned = false
 		runtime.observations[slot] = observation
@@ -130,14 +137,14 @@ func (runtime *fakeRuntime) Quiesce(context.Context, string) error {
 	runtime.sequence = append(runtime.sequence, "quiesce")
 	return nil
 }
-func (runtime *fakeRuntime) Stop(context.Context, string) error {
+func (runtime *fakeRuntime) Stop(_ context.Context, slot string) error {
 	runtime.sequence = append(runtime.sequence, "stop")
-	value := runtime.observations["blue"]
+	value := runtime.observations[slot]
 	value.ProcessUp = false
 	value.ProcessReady = false
 	value.Ready = false
 	value.ControllerOwned = false
-	runtime.observations["blue"] = value
+	runtime.observations[slot] = value
 	return nil
 }
 func (runtime *fakeRuntime) Rollback(context.Context, string, string, controllerrole.Lease) error {
@@ -562,6 +569,80 @@ func TestManagerRecoveryFinalizeReestablishesControllerAfterRestart(t *testing.T
 	if !runtime.traffic["green"] {
 		t.Fatal("recovery finalize did not restore target traffic")
 	}
+	if runtime.observations["blue"].ProcessUp || runtime.observations["blue"].ControllerOwned {
+		t.Fatalf("recovery finalize left the previous slot running: %#v", runtime.observations["blue"])
+	}
+	if !containsSequence(runtime.sequence, "stop") {
+		t.Fatalf("recovery finalize did not stop the previous slot: %v", runtime.sequence)
+	}
+}
+
+func TestManagerRecoveryFinalizeFencesWhenPreviousRevokeFails(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", failRevoke: true, observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	transaction, err := manager.Stage(context.Background(), "green", "/bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Verify(context.Background(), transaction.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Transition(context.Background(), transaction.ID, PhaseControllerHandoff, PhaseActiveSwitch, "active", "active_switched", "test", nil, now); err != nil {
+		t.Fatal(err)
+	}
+	transaction, err = database.Get(context.Background(), transaction.ID)
+	if err != nil || transaction == nil {
+		t.Fatalf("read recovery transaction: %#v err=%v", transaction, err)
+	}
+	if err := manager.RecoverOnStart(context.Background()); err == nil || !errors.Is(err, ErrUncertain) {
+		t.Fatalf("restart recovery error = %v", err)
+	}
+	runtime.active = "green"
+	runtime.traffic = map[string]bool{"blue": false, "green": false}
+	if _, err := manager.Recover(context.Background(), transaction.ID, "finalize"); err == nil || !errors.Is(err, ErrUncertain) {
+		t.Fatalf("recovery finalize error = %v", err)
+	}
+	if runtime.observations["blue"].ControllerOwned || runtime.observations["green"].ControllerOwned {
+		t.Fatalf("recovery revoke failure did not fence both slots: %#v", runtime.observations)
+	}
+}
+
+func TestManagerDoesNotMaintainControllerWithoutStateCapabilities(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", invalidCapabilities: true, observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if err := manager.MaintainController(context.Background()); err == nil {
+		t.Fatal("controller maintenance succeeded without state capabilities")
+	}
+	if runtime.observations["blue"].ControllerOwned || runtime.observations["green"].ControllerOwned {
+		t.Fatalf("controller roles were not fenced without state capabilities: %#v", runtime.observations)
+	}
+}
+
+func containsSequence(sequence []string, expected string) bool {
+	for _, item := range sequence {
+		if item == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func TestManagerRejectsConcurrentDeploymentTransactions(t *testing.T) {

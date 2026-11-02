@@ -4,12 +4,14 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestAdminMetricsValidationUsesTopLevelObservationEpoch(t *testing.T) {
 	result := map[string]any{
 		"up":                            true,
 		"observed_at":                   "2026-11-03T00:00:00Z",
+		"observation_consistent":        true,
 		"observation_epoch":             "epoch-1",
 		"pending_operations":            []any{},
 		"historical_unknown_operations": []any{},
@@ -22,6 +24,32 @@ func TestAdminMetricsValidationUsesTopLevelObservationEpoch(t *testing.T) {
 	delete(result, "observation_epoch")
 	if err := validateSourceResult("admin-metrics", result); err == nil {
 		t.Fatal("admin-metrics response without observation epoch was accepted")
+	}
+}
+
+func TestAdminMetricsValidationRejectsInconsistentObservation(t *testing.T) {
+	result := map[string]any{
+		"up":                            true,
+		"observed_at":                   "2026-11-03T00:00:00Z",
+		"observation_consistent":        false,
+		"observation_epoch":             "epoch-1",
+		"pending_operations":            []any{},
+		"historical_unknown_operations": []any{},
+		"in_flight_operations":          float64(0),
+		"doctor":                        map[string]any{"ready": true, "issues": []any{}},
+	}
+	if err := validateSourceResult("admin-metrics", result); err == nil {
+		t.Fatal("inconsistent admin-metrics response was accepted")
+	}
+}
+
+func TestValidObservedAtRejectsFutureTimestamp(t *testing.T) {
+	now := time.Date(2026, time.November, 3, 0, 0, 0, 0, time.UTC)
+	if _, ok := validObservedAt("2026-11-03T00:00:01Z", now); ok {
+		t.Fatal("future observation timestamp was accepted")
+	}
+	if _, ok := validObservedAt("2026-11-03T00:00:00Z", now); !ok {
+		t.Fatal("current observation timestamp was rejected")
 	}
 }
 

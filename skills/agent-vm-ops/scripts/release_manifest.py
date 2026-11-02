@@ -175,6 +175,7 @@ HISTORICAL_GO_UNIT_CONTENT_SHA256 = {
 }
 HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256 = {
     "agent-vm-native.service": HISTORICAL_GO_UNIT_CONTENT_SHA256["agent-vm-native.service"],
+	"agent-vm-deployd.service": HISTORICAL_GO_UNIT_CONTENT_SHA256["agent-vm-deployd.service"],
     "agent-vm-web.service": (
         "50eecb2b8dd88f0532b4546fb5555e069f3ef557e9228d45ff84e56e6a356d0d",
         "f7dd481311850d4d1349000b920867208fb43a5b9da16a4f4f617e6f15d28b7b",

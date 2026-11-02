@@ -591,6 +591,25 @@ class WrapperTests(unittest.TestCase):
         for name in MANIFEST.GO_RETIRED_UNITS:
             self.assertFalse((unit_dir / name).exists())
 
+    def test_format_four_retained_release_accepts_historical_deployd_unit(self):
+        root = self.root / "historical-product"
+        unit = root / "systemd/agent-vm-deployd.service"
+        unit.parent.mkdir(parents=True)
+        current = (ROOT / "skills/agent-vm-ops/assets/systemd/agent-vm-deployd.service").read_bytes()
+        historical = current.replace(
+            b"After=local-fs.target\n",
+            b"After=local-fs.target\nWants=agent-vm-native@blue.service agent-vm-native@green.service\n",
+        )
+        unit.write_bytes(historical)
+        unit.chmod(0o644)
+        manifest = {
+            "format": MANIFEST.PRODUCT_MANIFEST_FORMAT,
+            "artifacts": [{"path": "systemd/agent-vm-deployd.service", "role": "unit"}],
+        }
+        with self.assertRaises(WRAPPER.WrapperError):
+            WRAPPER._verify_unit_contents(root, manifest, allow_historical_content=False)
+        WRAPPER._verify_unit_contents(root, manifest, allow_historical_content=True)
+
     def test_unit_policy_bytes_are_pinned_even_when_manifest_checksum_matches(self):
         payload = self._tampered_unit_payload()
         WRAPPER.stage(self.loaded, "tx-tampered-unit", "b" * 40, payload)

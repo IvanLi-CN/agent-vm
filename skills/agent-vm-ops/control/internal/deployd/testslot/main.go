@@ -136,7 +136,8 @@ func serve(config configuration, manifest releaseManifest) error {
 		case "admin-metrics":
 			result = map[string]any{
 				"up": true, "observed_at": time.Now().UTC().Format(time.RFC3339Nano),
-				"observation_epoch": "epoch-1", "pending_operations": []any{},
+				"observation_consistent": true,
+				"observation_epoch":      "epoch-1", "pending_operations": []any{},
 				"historical_unknown_operations": []any{}, "in_flight_operations": 0,
 				"doctor": map[string]any{"ready": true, "issues": []any{}},
 			}
@@ -213,7 +214,8 @@ func serve(config configuration, manifest releaseManifest) error {
 		case "admin-metrics":
 			result = map[string]any{
 				"up": true, "observed_at": time.Now().UTC().Format(time.RFC3339Nano),
-				"observation_epoch": "epoch-1", "pending_operations": []any{},
+				"observation_consistent": true,
+				"observation_epoch":      "epoch-1", "pending_operations": []any{},
 				"historical_unknown_operations": []any{}, "in_flight_operations": 0,
 				"doctor": map[string]any{"ready": true, "issues": []any{}},
 			}

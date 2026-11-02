@@ -165,7 +165,7 @@ stage
 | `active_switch` | 同一文件系统上的 `active` 替换成功，重新观测到的目标与事务一致。 |
 | `drain_old` | 旧槽位拒绝新流量，同时保留在途请求和 native 观测能力。 |
 | `quiescence` | 在途请求、pending operation、native worker 和 scheduler work 都有已知的 terminal/converged 证据。 |
-| `finalize` | 候选槽位保持健康；旧 release 仍保留为兼容 rollback 目标；事务结果已持久化。 |
+| `finalize` | 候选槽位保持健康；旧槽位已停止且不再持有 controller 或 traffic role；旧 release 仍保留为兼容 rollback 目标；事务结果已持久化。 |
 
 ## 观测响应
 
@@ -206,6 +206,10 @@ stage
   "outcome": "pending"
 }
 ```
+
+`observed_at` 和每个来源的 `source_observed_at` 必须是不晚于当前时间的有效 RFC3339 时间戳。
+Deployd 必须拒绝未来时间戳，不能用未来时间延长 freshness window。
+`admin-metrics` 结果还必须明确给出 `observation_consistent=true`；缺失或为 false 时，该来源视为不一致，不能继续授予或续租 controller role。
 
 确切 wire schema 仍由 deployd CLI contract 版本化。
 响应 MUST 标识 transaction 和 release，区分 selected/process/traffic/controller/native 角色，保留各来源时间戳，并暴露 failure code 和 phase；不得包含原始命令输出、凭据或私有部署路径。
@@ -250,6 +254,9 @@ CLI 永远不能直接编辑 `active`。
 只有再次观测到对应运行时证据，记录的 phase 才能视为完成。
 如果无法证明该 phase，deployd 进入 `needs_recovery`，保持部署和受影响的 admission fenced，并保留证据。
 只有运维者确认事务标识且必需来源新鲜、相互一致后，恢复流程才能 resume、rollback 或 finalize。
+执行 recovery finalize 时，deployd 必须先确认目标槽位仍然是已验证的 active 槽位，撤销旧槽位的 controller role 和 traffic role，完成 drain/quiescence，并停止旧槽位。
+只有重新观测到旧槽位已经停止、目标槽位重新持有 controller role 且可以接受流量后，才能把事务写成 `finalize`。
+撤销、停止或重新观测任一步失败，都必须保持 `needs_recovery` 并对两个槽位执行 hard-fence，不能猜测恢复已经完成。
 
 目标验证覆盖 Go unit 和 socket permissions、SQLite migration 和 crash recovery、重复协调器防护、双槽位进程存活、唯一 controller leadership、候选槽位验证、原子 active switch、traffic drain、在途请求完成、native-worker quiescence、有界 rollback，以及守护进程在每个不可幂等阶段重启时的行为。
 验证在当前会话拥有的 Agent VM 中运行，不修改开发机或现网部署。

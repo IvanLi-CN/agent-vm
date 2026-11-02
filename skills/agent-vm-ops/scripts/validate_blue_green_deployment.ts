@@ -138,6 +138,10 @@ const scriptPaths = [
   join(import.meta.dir, "agent_vm_state_migration.ts"),
   join(import.meta.dir, "agent_vm_deployd_systemd_acceptance.sh"),
 ];
+const realSystemdAcceptance = read(join(import.meta.dir, "agent_vm_deployd_systemd_acceptance.sh"));
+requireText(realSystemdAcceptance, "assert_exec_start", "real systemd acceptance compares ExecStart argv exactly");
+requireText(realSystemdAcceptance, "refusing filesystem restore while a managed unit remains active", "real systemd acceptance refuses unsafe cleanup");
+requireText(realSystemdAcceptance, "systemctl is-active --quiet \"$unit\"", "real systemd acceptance verifies stopped units during cleanup");
 for (const path of scriptPaths) {
   try {
     const mode = statSync(path).mode & 0o777;

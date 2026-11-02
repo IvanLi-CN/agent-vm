@@ -177,6 +177,10 @@ SSH 仍是旧版兼容传输，不是当前部署事务的权威。
 激活前失败保持当前槽位和 active 链接不变。
 激活后健康或 quiescence 失败允许通过 deployd 向上一个已验证槽位执行一次有界 rollback；rollback 失败时保持部署和业务 admission fenced，不能改写 state、generation 或 uncertain operation。
 
+恢复 finalize 不是对旧阶段记录的盲目重放。
+Deployd 必须重新确认目标槽位、撤销旧槽位的 controller 和 traffic role，完成排空与 quiescence，并确认旧槽位已经停止；之后才能重新授予目标槽位 role、恢复流量并持久化 finalize。
+撤销、停止或观测失败时，事务保持 `needs_recovery`，两个槽位都必须 hard-fence。
+
 ## 稀疏磁盘与故障域
 
 Agent VM disk admission 不会为每个 container 预留完整请求的 rootfs allocation（does not reserve the full requested rootfs allocation）。

@@ -421,15 +421,41 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 	case "finalize":
 		observation, observeErr := manager.observe(ctx, id)
 		verifiedReleaseID, verifiedSourceRevision, verifiedStateEpoch, verifiedCapabilities, identityErr := manager.verifiedCandidateIdentity(ctx, id)
-		if observeErr != nil || identityErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), false, false, verifiedReleaseID, verifiedSourceRevision, verifiedStateEpoch, verifiedCapabilities) {
+		if observeErr != nil || identityErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), false, false, false, verifiedReleaseID, verifiedSourceRevision, verifiedStateEpoch, verifiedCapabilities) {
 			return nil, errors.New("recovery evidence is not sufficient to finalize")
 		}
-		term, termErr := manager.nextFenceTerm(ctx)
-		if termErr != nil {
-			return nil, fmt.Errorf("allocate recovery fencing term: %w", termErr)
+		previous, previousOK := observation.Slots[transaction.PreviousSlot]
+		if previousOK && previous.ProcessUp {
+			if err := manager.Runtime.DisableTraffic(ctx, transaction.PreviousSlot); err != nil {
+				return nil, manager.effectFailure(ctx, id, transaction.Phase, fmt.Errorf("disable previous traffic before recovery finalize: %w", err))
+			}
+			term, termErr := manager.nextFenceTerm(ctx)
+			if termErr != nil {
+				return nil, manager.effectFailure(ctx, id, transaction.Phase, fmt.Errorf("allocate recovery fencing term: %w", termErr))
+			}
+			if err := manager.Runtime.RevokeController(ctx, transaction.PreviousSlot, term); err != nil {
+				return nil, manager.effectFailure(ctx, id, transaction.Phase, fmt.Errorf("fence the non-selected slot before recovery finalize: %w", err))
+			}
+			if err := manager.Runtime.Drain(ctx, transaction.PreviousSlot); err != nil {
+				return nil, manager.effectFailure(ctx, id, transaction.Phase, fmt.Errorf("drain the previous slot before recovery finalize: %w", err))
+			}
+			if err := manager.Runtime.Quiesce(ctx, transaction.PreviousSlot); err != nil {
+				return nil, manager.effectFailure(ctx, id, transaction.Phase, fmt.Errorf("quiesce the previous slot before recovery finalize: %w", err))
+			}
+			if err := manager.Runtime.ExitDrain(ctx, transaction.PreviousSlot); err != nil {
+				return nil, manager.effectFailure(ctx, id, transaction.Phase, fmt.Errorf("complete previous slot drain before recovery finalize: %w", err))
+			}
+			if err := manager.Runtime.Stop(ctx, transaction.PreviousSlot); err != nil {
+				return nil, manager.effectFailure(ctx, id, transaction.Phase, fmt.Errorf("stop the previous slot before recovery finalize: %w", err))
+			}
 		}
-		if err := manager.Runtime.RevokeController(ctx, otherSlot(transaction.TargetSlot), term); err != nil {
-			return nil, fmt.Errorf("fence the non-selected slot before recovery finalize: %w", err)
+		observation, observeErr = manager.observe(ctx, id)
+		if observeErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), false, false, true, verifiedReleaseID, verifiedSourceRevision, verifiedStateEpoch, verifiedCapabilities) {
+			cause := errors.New("previous slot was not stopped before recovery finalize")
+			if observeErr != nil {
+				cause = fmt.Errorf("observe recovery stop outcome: %w", observeErr)
+			}
+			return nil, manager.effectFailure(ctx, id, transaction.Phase, cause)
 		}
 		lease, err := manager.newLease(ctx, transaction.TargetSlot, transaction.Generation)
 		if err != nil {
@@ -449,7 +475,7 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 			return nil, fmt.Errorf("%w; %v", failureErr, fenceErr)
 		}
 		observation, observeErr = manager.observe(ctx, id)
-		if observeErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), true, true, verifiedReleaseID, verifiedSourceRevision, verifiedStateEpoch, verifiedCapabilities) {
+		if observeErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), true, true, true, verifiedReleaseID, verifiedSourceRevision, verifiedStateEpoch, verifiedCapabilities) {
 			failureErr := manager.failure(ctx, id, transaction.Phase, &UncertainError{Cause: errors.New("recovery finalize controller evidence was not verified")})
 			fenceErr := manager.fenceSlots(ctx, errors.New("recovery finalize was fenced"))
 			return nil, fmt.Errorf("%w; %v", failureErr, fenceErr)
@@ -560,7 +586,7 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 		return manager.fenceSlots(ctx, errors.New("slot observation is inconsistent"))
 	}
 	target, ok := observation.Slots[observation.ActiveSlot]
-	if !ok || !target.ProcessUp || !target.ProcessReady {
+	if !ok || !target.ProcessUp || !target.ProcessReady || target.StateEpoch == "" || len(target.StateCapabilities) == 0 {
 		return manager.fenceSlots(ctx, errors.New("active slot is not process-ready"))
 	}
 	other := "blue"
@@ -845,7 +871,7 @@ func (manager *Manager) nextFenceTerm(ctx context.Context) (uint64, error) {
 	return manager.Store.NextFenceTerm(ctx)
 }
 
-func recoveryTargetVerified(observation RuntimeSnapshot, transaction store.Transaction, now time.Time, requireTraffic, requireController bool, releaseID, sourceRevision, stateEpoch string, capabilities []string) bool {
+func recoveryTargetVerified(observation RuntimeSnapshot, transaction store.Transaction, now time.Time, requireTraffic, requireController, requirePreviousStopped bool, releaseID, sourceRevision, stateEpoch string, capabilities []string) bool {
 	if !validObservation(observation, now) || observation.ActiveSlot != transaction.TargetSlot {
 		return false
 	}
@@ -854,7 +880,13 @@ func recoveryTargetVerified(observation RuntimeSnapshot, transaction store.Trans
 		return false
 	}
 	old, oldOK := observation.Slots[transaction.PreviousSlot]
-	return !oldOK || (!old.TrafficAccepting && old.InFlightRequests == 0 && old.NativeWorkers == 0 && old.PendingOperations == 0)
+	if !oldOK {
+		return true
+	}
+	if old.TrafficAccepting || old.InFlightRequests != 0 || old.NativeWorkers != 0 || old.PendingOperations != 0 {
+		return false
+	}
+	return !requirePreviousStopped || (!old.ProcessUp && !old.ControllerOwned)
 }
 
 func evidenceStrings(value any) ([]string, bool) {
