@@ -27,12 +27,17 @@ https://{$AGENT_VM_DOMAIN} {
 		respond 404
 	}
 
-	handle {
+	@public path / /index.html /assets/* /api/v1 /api/v1/* /agent/v1/control
+	handle @public {
 		reverse_proxy unix//var/lib/agent-vm-native/active/app.sock {
 			header_up -X-Forwarded-User
 			header_up -X-Original-URL
 			header_up -X-Original-Method
 			header_up -Forwarded
 		}
+	}
+
+	handle {
+		respond 404
 	}
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { createHash } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 const repositoryRoot = resolve(import.meta.dir, "../../..");
@@ -207,7 +207,9 @@ export function buildCaddy(args: string[], environment: Record<string, string | 
 
     if (result.exitCode !== 0) fail(`${metadata.builder} exited with status ${result.exitCode}`);
     if (!existsSync(stagingOutput)) fail(`Caddy build did not create ${stagingOutput}`);
-    const mode = statSync(stagingOutput).mode & 0o777;
+    const stagingStat = lstatSync(stagingOutput);
+    if (stagingStat.isSymbolicLink() || !stagingStat.isFile()) fail(`Caddy build output is not a regular file: ${stagingOutput}`);
+    const mode = stagingStat.mode & 0o777;
     if ((mode & 0o111) === 0) fail(`Caddy build output is not executable: ${stagingOutput}`);
     // `go version -m` inspects Go build metadata without executing the target
     // binary, so cross-compiled linux/amd64 and linux/arm64 outputs are both

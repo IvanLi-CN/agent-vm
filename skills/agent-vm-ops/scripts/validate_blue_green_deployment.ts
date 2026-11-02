@@ -93,6 +93,8 @@ requireText(caddyfile, "reverse_proxy unix//var/lib/agent-vm-native/active/app.s
 requireText(caddyfile, "header_up -X-Forwarded-User", "Caddy strips browser-supplied identity headers");
 requireText(caddyfile, "@internal path /internal/v1/*", "internal routes are explicitly matched");
 requireText(caddyfile, "respond 404", "internal routes return 404 at the edge");
+requireText(caddyfile, "@public path / /index.html /assets/* /api/v1 /api/v1/* /agent/v1/control", "Caddy forwards only the fixed public paths");
+requireText(caddyfile, "handle @public", "Caddy applies the active socket proxy only to the fixed public matcher");
 requireText(caddyfile, "request>uri regexp", "request query values are filtered from logs");
 requireText(caddyfile, "request>headers>Authorization delete", "authorization headers are filtered from logs");
 requireText(caddyfile, "request>headers>Cookie delete", "cookie headers are filtered from logs");
@@ -158,6 +160,7 @@ const caddyUnit = read(join(assetsRoot, "systemd/agent-vm-caddy.service"));
 const acceptance = read(join(repositoryRoot, "skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh"));
 const cutover = read(join(import.meta.dir, "agent_vm_cutover.sh"));
 const caddyBuilder = read(join(import.meta.dir, "build_caddy.ts"));
+const caGenerator = read(join(import.meta.dir, "generate_deployment_ca.sh"));
 const ciWorkflow = read(join(repositoryRoot, ".github/workflows/ci.yml"));
 requireText(caddyUnit, "User=caddy", "Caddy does not run as root");
 requireText(caddyUnit, "After=network-online.target", "Caddy waits for network readiness before DNS-01");
@@ -205,6 +208,8 @@ requireText(acceptance, "exit 1", "isolated acceptance fails when cleanup is inc
 requireText(caddyBuilder, "mkdtempSync", "Caddy builds into a private staging directory");
 requireText(caddyBuilder, "renameSync(stagingOutput, options.output)", "Caddy installs only after verification via atomic rename");
 requireText(caddyBuilder, "isSymbolicLink()", "Caddy rejects symlinked output paths");
+requireText(caGenerator, '[[ -L "$output_dir" ]]', "CA generation rejects a symlinked output directory");
+requireText(caGenerator, '"$output_dir/ca.key"', "CA generation cleans the private key after a failed run");
 requireText(ciWorkflow, "github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.4", "Ubuntu PR gate installs a pinned xcaddy builder");
 requireText(ciWorkflow, "skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh", "Ubuntu PR gate runs isolated deployment acceptance");
 requireText(ciWorkflow, "repos/caddyserver/caddy/releases", "Ubuntu PR gate resolves an official Caddy release");

@@ -125,6 +125,12 @@ cleanup() {
   if [[ -n "$rqlite_auth_config" ]]; then
     rm -f -- "$rqlite_auth_config" || cleanup_failed=1
   fi
+  for secret_path in \
+    "$proof_dir/ca/ca.key" \
+    "$proof_dir/ca/rqlite/server.key" \
+    "$proof_dir/evidence-private.pem"; do
+    rm -f -- "$secret_path" || cleanup_failed=1
+  done
   if (( cleanup_failed != 0 )); then
     printf 'cleanup incomplete; live acceptance process tree retained at %s\n' "$proof_dir" >&2
     exit 1
@@ -193,12 +199,28 @@ env -i \
   --target linux/amd64 \
   --output "$caddy_binary" \
   "${expected_caddy_sha512_args[@]}" >"$proof_dir/caddy-build.log" 2>&1
-[[ -x "$caddy_binary" ]] || fail "Caddy custom build was not found"
-caddy_build_sha512="$(python3 - "$proof_dir/caddy-build.log" "$proof_dir/caddy-build.json" <<'PY'
+[[ -f "$caddy_binary" && ! -L "$caddy_binary" && -x "$caddy_binary" ]] || fail "Caddy custom build was not found as a regular executable"
+caddy_build_sha512="$(python3 - "$proof_dir/caddy-build.log" "$proof_dir/caddy-build.json" "$caddy_binary" "$caddy_version" "$repository_root/skills/agent-vm-ops/assets/blue-green/deployment-components.json" <<'PY'
+import hashlib
 import json
 import sys
+from pathlib import Path
 
-log_path, receipt_path = sys.argv[1:]
+log_path, receipt_path, binary_path, requested_version, metadata_path = sys.argv[1:]
+if not requested_version.startswith("v"):
+    requested_version = "v" + requested_version
+with open(metadata_path, encoding="utf-8") as handle:
+    metadata = json.load(handle)
+caddy_metadata = metadata["caddy"]
+expected = {
+    "schema_version": 1,
+    "requested_version": requested_version,
+    "observed_caddy_version": requested_version,
+    "provider_module": caddy_metadata["provider_module"],
+    "provider_module_name": caddy_metadata["provider_module_name"],
+    "target": "linux/amd64",
+    "verification": "go-version-m",
+}
 receipt = None
 with open(log_path, encoding="utf-8") as handle:
     for line in reversed(handle.readlines()):
@@ -211,13 +233,21 @@ with open(log_path, encoding="utf-8") as handle:
             break
 if receipt is None:
     raise SystemExit("Caddy build emitted no JSON receipt")
+for key, value in expected.items():
+    if receipt.get(key) != value:
+        raise SystemExit(f"Caddy build receipt field {key} mismatch")
+provider_ref = caddy_metadata["provider_ref"]
+if receipt.get("provider_ref") != provider_ref:
+    raise SystemExit("Caddy build receipt provider ref mismatch")
+receipt_sha512 = receipt.get("sha512")
+if not isinstance(receipt_sha512, str) or len(receipt_sha512) != 128 or any(char not in "0123456789abcdef" for char in receipt_sha512):
+    raise SystemExit("Caddy build receipt has no valid SHA-512")
+actual_sha512 = hashlib.sha512(Path(binary_path).read_bytes()).hexdigest()
+if actual_sha512 != receipt_sha512:
+    raise SystemExit("Caddy build receipt SHA-512 does not match the installed binary")
 with open(receipt_path, "w", encoding="utf-8") as handle:
     json.dump(receipt, handle, sort_keys=True, separators=(",", ":"))
-if receipt.get("observed_caddy_version") != receipt.get("requested_version"):
-    raise SystemExit("Caddy build receipt version mismatch")
-if not receipt.get("sha512") or len(receipt["sha512"]) != 128:
-    raise SystemExit("Caddy build receipt has no SHA-512")
-print(receipt["sha512"])
+print(actual_sha512)
 PY
 )"
 
@@ -304,7 +334,7 @@ for _ in $(seq 1 80); do
   fi
   if curl --fail --silent --show-error --cacert "$ca_dir/ca.crt" \
     -H "Authorization: Bearer $auth_header_token" \
-    "https://localhost:$caddy_port/health?secret=$query_marker" | grep -q 'backend'; then
+    "https://localhost:$caddy_port/api/v1/session?secret=$query_marker" | grep -q 'backend'; then
     smoke_ready=1
     break
   fi
@@ -314,6 +344,9 @@ done
 blocked_code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
   --cacert "$ca_dir/ca.crt" "https://localhost:$caddy_port/internal/v1/health")"
 [[ "$blocked_code" == 404 ]] || fail "Caddy exposed an internal endpoint"
+blocked_public_code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+  --cacert "$ca_dir/ca.crt" "https://localhost:$caddy_port/not-allowed")"
+[[ "$blocked_public_code" == 404 ]] || fail "Caddy exposed an unlisted public endpoint"
 if grep -q "$query_marker\|$auth_header_token" "$proof_dir/caddy.log"; then
   fail "Caddy access log retained sensitive request data"
 fi

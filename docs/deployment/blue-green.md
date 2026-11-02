@@ -70,7 +70,7 @@ install -o root -g root -m 0600 /path/to/caddy.env.example /etc/agent-vm-native/
 
 Replace the placeholders using a root-only editor and preserve `root:root` ownership and mode `0600`; neither value belongs in this repository. Caddy persists certificates, keys and ACME state in `/var/lib/agent-vm-native/caddy`, and the service account owns that directory. Do not install a static Caddy leaf or an independent ACME client.
 
-The Caddy example disables the admin API and all automatic HTTP listeners, removes query values and sensitive headers from logs, blocks `/internal/v1/*` at the edge, and forwards public requests to the active Unix socket. It does not add an identity header or disable upstream TLS verification.
+The Caddy example disables the admin API and all automatic HTTP listeners, removes query values and sensitive headers from logs, blocks `/internal/v1/*` at the edge, forwards only `/`, `/index.html`, `/assets/*`, `/api/v1`, `/api/v1/*` and `/agent/v1/control` to the active Unix socket, and returns `404` for every other path. It does not add an identity header or disable upstream TLS verification.
 
 ## rqlite boundary
 

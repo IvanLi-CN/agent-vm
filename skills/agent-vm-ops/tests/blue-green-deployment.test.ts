@@ -115,6 +115,8 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(caddy).toContain("request>headers>X-Csrf-Token delete");
   expect(caddy).not.toContain("tls_insecure_skip_verify");
   expect(caddy).toContain("@internal path /internal/v1/*");
+  expect(caddy).toContain("@public path / /index.html /assets/* /api/v1 /api/v1/* /agent/v1/control");
+  expect(caddy).toContain("handle @public");
   expect(caddy).toContain("respond 404");
   expect(caddy).not.toContain("auto_https disable_redirects");
   expect(caddy).not.toContain("/etc/agent-vm-native/tls/caddy");
@@ -173,7 +175,8 @@ for argument in "$@"; do
   fi
   previous="$argument"
 done
-printf '%s\\n' "$@" > "$(dirname "$(dirname "$output")")/xcaddy.args"
+build_root="$(dirname "$(dirname "$output")")"
+printf '%s\\n' "$@" > "$build_root/xcaddy.args"
 if env | grep -qE '^(DNSPOD_TOKEN|AGENT_VM_DOMAIN)='; then
   printf '%s\\n' 'deployment environment leaked to xcaddy' >&2
   exit 23
@@ -181,6 +184,11 @@ fi
 if env | grep -qE '^GOPROXY='; then
   printf '%s\\n' 'credential-bearing Go proxy environment leaked to xcaddy' >&2
   exit 24
+fi
+if [ -f "$build_root/fake-xcaddy-mode" ] && [ "$(cat "$build_root/fake-xcaddy-mode")" = symlink ]; then
+  printf '%s\\n' '#!/bin/sh' > "$output.target"
+  ln -s "$output.target" "$output"
+  exit 0
 fi
 cat > "$output" <<'EOF'
 #!/bin/sh
@@ -278,6 +286,22 @@ exit 1
     expect(lstatSync(symlinkOutput).isSymbolicLink()).toBe(true);
     expect(readFileSync(symlinkTarget, "utf8")).toBe("protected-caddy\n");
 
+    const stagingSymlinkOutput = join(temporaryRoot, "staging-symlink-caddy");
+    writeFileSync(join(temporaryRoot, "fake-xcaddy-mode"), "symlink\n");
+    const rejectedStagingSymlink = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      stagingSymlinkOutput,
+    ], { env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` } });
+    expect(rejectedStagingSymlink.exitCode).not.toBe(0);
+    expect(existsSync(stagingSymlinkOutput)).toBe(false);
+    rmSync(join(temporaryRoot, "fake-xcaddy-mode"));
+
     writeFileSync(join(temporaryRoot, "fake-go-mode"), "version\n");
     const mismatchedVersion = run([
       process.execPath,
@@ -335,6 +359,12 @@ exit 1
     expect(acceptance).toContain('rqlite_auth_file="$proof_dir/auth.json"');
     expect(acceptance).toContain('chmod 0600 "$rqlite_auth_file"');
     expect(acceptance).toContain('rm -f -- "$rqlite_auth_file"');
+    expect(acceptance).toContain('"$proof_dir/ca/ca.key"');
+    expect(acceptance).toContain("Caddy build receipt SHA-512 does not match the installed binary");
+    expect(acceptance).toContain("not-allowed");
+  const caGenerator = read("skills/agent-vm-ops/scripts/generate_deployment_ca.sh");
+  expect(caGenerator).toContain('[[ -L "$output_dir" ]]');
+  expect(caGenerator).toContain('"$output_dir/ca.key"');
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
@@ -349,6 +379,33 @@ test("CA generation and state preflight require operator evidence", () => {
     expect(existsSync(join(caDir, "ca.crt"))).toBe(true);
     expect(statSync(join(caDir, "ca.key")).mode & 0o777).toBe(0o600);
     expect(existsSync(join(caDir, "caddy/server.key"))).toBe(false);
+
+    const symlinkTarget = join(temporaryRoot, "ca-target");
+    const symlinkDir = join(temporaryRoot, "ca-link");
+    mkdirSync(symlinkTarget);
+    symlinkSync(symlinkTarget, symlinkDir);
+    const rejectedSymlinkDir = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/generate_deployment_ca.sh"), "--output-dir", symlinkDir, "--hostname", "localhost"]);
+    expect(rejectedSymlinkDir.exitCode).not.toBe(0);
+    expect(existsSync(join(symlinkTarget, "ca.key"))).toBe(false);
+
+    const opensslPath = new TextDecoder().decode(run(["sh", "-c", "command -v openssl"]).stdout).trim();
+    const fakeBin = join(temporaryRoot, "fake-bin");
+    mkdirSync(fakeBin);
+    writeFileSync(join(fakeBin, "openssl"), `#!/bin/sh
+set -eu
+if [ "\$1" = req ] && [ "\$2" = -new ]; then
+  exit 42
+fi
+exec "${opensslPath}" "\$@"
+`, { mode: 0o755 });
+    const failedCaDir = join(temporaryRoot, "failed-ca");
+    const failedCa = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/generate_deployment_ca.sh"), "--output-dir", failedCaDir, "--hostname", "localhost"], {
+      env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}` },
+    });
+    expect(failedCa.exitCode).not.toBe(0);
+    expect(existsSync(join(failedCaDir, "ca.key"))).toBe(false);
+    expect(existsSync(join(failedCaDir, "ca.crt"))).toBe(false);
+    expect(existsSync(join(failedCaDir, "rqlite/server.key"))).toBe(false);
 
     const source = join(temporaryRoot, "state.sqlite3");
     const database = run(["python3", "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\"); c.execute(\"CREATE TABLE tasks (session_id TEXT NOT NULL, generation INTEGER NOT NULL)\"); c.execute(\"INSERT INTO meta VALUES ('state_epoch','epoch-1')\"); c.execute(\"INSERT INTO tasks VALUES ('session-1',7)\"); c.commit(); c.close()", source]);
@@ -410,6 +467,7 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain("mktemp -d -- \"$root_dir/.active-stage.XXXXXX\"");
   expect(cutover).toContain('[[ -L "$lock_path" ]]');
   expect(cutover).toContain('ln -- "$lock_seed" "$lock_path"');
+  expect(cutover).toContain("if ! ln --");
   expect(cutover).toContain('mktemp "$stage_dir/pending.XXXXXX"');
   expect(cutover).not.toContain(".active.cutover.pending.$$.tmp");
   expect(cutover).not.toContain(".active.$$.tmp");

@@ -142,10 +142,16 @@ if [[ -L "$lock_path" ]]; then
   die "active link lock is symlinked"
 fi
 if [[ ! -e "$lock_path" ]]; then
-  ln -- "$lock_seed" "$lock_path" || {
-    rm -f -- "$lock_seed"
-    die "cannot install the active link lock"
-  }
+  if ! ln -- "$lock_seed" "$lock_path"; then
+    if [[ -L "$lock_path" ]]; then
+      rm -f -- "$lock_seed"
+      die "active link lock is symlinked"
+    fi
+    [[ -f "$lock_path" ]] || {
+      rm -f -- "$lock_seed"
+      die "cannot install the active link lock"
+    }
+  fi
 fi
 rm -f -- "$lock_seed"
 [[ -f "$lock_path" && ! -L "$lock_path" ]] || die "active link lock is not a regular file"
