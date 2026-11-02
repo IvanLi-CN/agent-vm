@@ -86,7 +86,7 @@ func prepareUnixSocketParent(path string) error {
 	defer func() { _ = unix.Close(fd) }()
 
 	components := strings.Split(strings.TrimPrefix(parent, string(filepath.Separator)), string(filepath.Separator))
-	for _, component := range components {
+	for index, component := range components {
 		if component == "" {
 			continue
 		}
@@ -109,11 +109,14 @@ func prepareUnixSocketParent(path string) error {
 			_ = unix.Close(next)
 			return fmt.Errorf("control socket parent is not a directory: %s", parent)
 		}
+		if index == len(components)-1 {
+			if chmodErr := unix.Fchmodat(fd, component, 0o750, 0); chmodErr != nil {
+				_ = unix.Close(next)
+				return fmt.Errorf("chmod control socket parent: %w", chmodErr)
+			}
+		}
 		_ = unix.Close(fd)
 		fd = next
-	}
-	if err := unix.Fchmod(fd, 0o750); err != nil {
-		return fmt.Errorf("chmod control socket parent: %w", err)
 	}
 	return nil
 }
