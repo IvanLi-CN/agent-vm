@@ -18,6 +18,9 @@ const unixSocketBacklog = 128
 // before binding. This prevents an ancestor replacement from redirecting the
 // pathname between validation and bind.
 func listenUnixSocket(path string, mode os.FileMode) (net.Listener, error) {
+	if err := prepareUnixSocketParent(path); err != nil {
+		return nil, err
+	}
 	parentFD, name, err := openUnixSocketParent(path)
 	if err != nil {
 		return nil, err
@@ -45,7 +48,7 @@ func listenUnixSocket(path string, mode os.FileMode) (net.Listener, error) {
 	if err := unix.Listen(socketFD, unixSocketBacklog); err != nil {
 		return nil, fmt.Errorf("listen on control socket: %w", err)
 	}
-	if err := unix.Fchmod(socketFD, uint32(mode.Perm())); err != nil {
+	if err := unix.Fchmodat(parentFD, name, uint32(mode.Perm()), 0); err != nil {
 		return nil, fmt.Errorf("chmod control socket: %w", err)
 	}
 
@@ -64,6 +67,55 @@ func listenUnixSocket(path string, mode os.FileMode) (net.Listener, error) {
 		return nil, fmt.Errorf("close control socket descriptor: %w", closeErr)
 	}
 	return listener, nil
+}
+
+func prepareUnixSocketParent(path string) error {
+	if !filepath.IsAbs(path) {
+		return fmt.Errorf("control socket path must be absolute: %s", path)
+	}
+	parent := filepath.Dir(filepath.Clean(path))
+	if parent == string(filepath.Separator) {
+		return nil
+	}
+
+	flags := unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC
+	fd, err := unix.Open("/", flags, 0)
+	if err != nil {
+		return fmt.Errorf("open control socket root: %w", err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+
+	components := strings.Split(strings.TrimPrefix(parent, string(filepath.Separator)), string(filepath.Separator))
+	for _, component := range components {
+		if component == "" {
+			continue
+		}
+		next, openErr := unix.Openat(fd, component, flags|unix.O_NOFOLLOW, 0)
+		if openErr == unix.ENOENT {
+			if mkdirErr := unix.Mkdirat(fd, component, 0o750); mkdirErr != nil && mkdirErr != unix.EEXIST {
+				return fmt.Errorf("create control socket parent %s: %w", parent, mkdirErr)
+			}
+			next, openErr = unix.Openat(fd, component, flags|unix.O_NOFOLLOW, 0)
+		}
+		if openErr != nil {
+			return fmt.Errorf("open control socket parent %s: %w", parent, openErr)
+		}
+		var stat unix.Stat_t
+		if statErr := unix.Fstat(next, &stat); statErr != nil {
+			_ = unix.Close(next)
+			return fmt.Errorf("inspect control socket parent %s: %w", parent, statErr)
+		}
+		if stat.Mode&unix.S_IFMT != unix.S_IFDIR {
+			_ = unix.Close(next)
+			return fmt.Errorf("control socket parent is not a directory: %s", parent)
+		}
+		_ = unix.Close(fd)
+		fd = next
+	}
+	if err := unix.Fchmod(fd, 0o750); err != nil {
+		return fmt.Errorf("chmod control socket parent: %w", err)
+	}
+	return nil
 }
 
 func openUnixSocketParent(path string) (int, string, error) {
