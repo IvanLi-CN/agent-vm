@@ -2,6 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -36,7 +39,13 @@ func TestStorePersistsLatestObservationSeparatelyFromTransactions(t *testing.T) 
 		t.Fatal(err)
 	}
 	defer s.Close()
-	want := Observation{ObservedAt: now, FreshUntil: now.Add(time.Minute), Digest: "digest", Payload: map[string]any{"active_slot": "blue", "sources": map[string]any{"health": map[string]any{"up": true}}}}
+	payload := map[string]any{"active_slot": "blue", "sources": map[string]any{"health": map[string]any{"up": true}}}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(encoded)
+	want := Observation{ObservedAt: now, FreshUntil: now.Add(time.Minute), Digest: hex.EncodeToString(digest[:]), Payload: payload}
 	if err := s.SaveObservation(context.Background(), LatestObservationID, want); err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +58,29 @@ func TestStorePersistsLatestObservationSeparatelyFromTransactions(t *testing.T) 
 	}
 	if transactionObservation, err := s.Observation(context.Background(), "missing"); err != nil || transactionObservation != nil {
 		t.Fatalf("missing transaction observation = %#v err=%v", transactionObservation, err)
+	}
+}
+
+func TestStoreRejectsObservationDigestMismatch(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), time.Hour, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	payload := map[string]any{"active_slot": "blue"}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(encoded)
+	if err := s.SaveObservation(context.Background(), LatestObservationID, Observation{ObservedAt: time.Now().UTC(), FreshUntil: time.Now().UTC().Add(time.Minute), Digest: hex.EncodeToString(digest[:]), Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.ExecContext(context.Background(), "UPDATE deployment_latest_observation SET payload_json = ? WHERE id = 1", `{"active_slot":"green"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Observation(context.Background(), LatestObservationID); err == nil {
+		t.Fatal("observation with a mismatched digest was accepted")
 	}
 }
 

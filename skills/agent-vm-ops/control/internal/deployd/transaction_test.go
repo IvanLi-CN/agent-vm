@@ -12,12 +12,14 @@ import (
 )
 
 type fakeRuntime struct {
-	active       string
-	observations map[string]SlotObservation
-	failSwitch   bool
-	sequence     []string
-	traffic      map[string]bool
-	releaseIDs   map[string]string
+	active        string
+	observations  map[string]SlotObservation
+	failSwitch    bool
+	inconsistent  bool
+	identityError error
+	sequence      []string
+	traffic       map[string]bool
+	releaseIDs    map[string]string
 }
 
 func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
@@ -42,7 +44,7 @@ func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 	for _, source := range []string{"active_link", "slot_contracts", "native_observation", "inventory_observation"} {
 		sources[source] = SourceObservation{Up: true, ObservedAt: now}
 	}
-	return RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: runtime.active, ControllerSlot: runtime.active, Consistent: true, Slots: slots, Sources: sources}, nil
+	return RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: runtime.active, ControllerSlot: runtime.active, Consistent: !runtime.inconsistent, Slots: slots, Sources: sources}, nil
 }
 func (runtime *fakeRuntime) Stage(context.Context, string, string) error {
 	runtime.sequence = append(runtime.sequence, "stage")
@@ -51,6 +53,10 @@ func (runtime *fakeRuntime) Stage(context.Context, string, string) error {
 func (runtime *fakeRuntime) Verify(context.Context, string, string) error {
 	runtime.sequence = append(runtime.sequence, "verify")
 	return nil
+}
+func (runtime *fakeRuntime) VerifySlotIdentity(context.Context, string, string, string) error {
+	runtime.sequence = append(runtime.sequence, "verify-identity")
+	return runtime.identityError
 }
 func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, _ controllerrole.Lease) error {
 	runtime.sequence = append(runtime.sequence, "grant")
@@ -62,6 +68,14 @@ func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, _ co
 }
 func (runtime *fakeRuntime) RevokeController(_ context.Context, slot string, _ uint64) error {
 	runtime.sequence = append(runtime.sequence, "revoke")
+	if observation, ok := runtime.observations[slot]; ok {
+		observation.ControllerOwned = false
+		runtime.observations[slot] = observation
+	}
+	return nil
+}
+func (runtime *fakeRuntime) FenceController(_ context.Context, slot string) error {
+	runtime.sequence = append(runtime.sequence, "fence")
 	if observation, ok := runtime.observations[slot]; ok {
 		observation.ControllerOwned = false
 		runtime.observations[slot] = observation
@@ -94,6 +108,10 @@ func (runtime *fakeRuntime) SwitchActive(_ context.Context, slot string) error {
 }
 func (runtime *fakeRuntime) Drain(context.Context, string) error {
 	runtime.sequence = append(runtime.sequence, "drain")
+	return nil
+}
+func (runtime *fakeRuntime) ExitDrain(context.Context, string) error {
+	runtime.sequence = append(runtime.sequence, "drain-exit")
 	return nil
 }
 func (runtime *fakeRuntime) Quiesce(context.Context, string) error {
@@ -230,7 +248,7 @@ func TestManagerResumesRollbackAfterRestart(t *testing.T) {
 		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
 	}}
 	transaction := store.Transaction{ID: "tx-resume-rollback", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseActiveSwitch, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
-	if err := database.Create(context.Background(), transaction, nil); err != nil {
+	if err := database.Create(context.Background(), transaction, map[string]any{"previous_release_id": "release-blue", "previous_source_revision": "revision-1"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.BeginRollback(context.Background(), transaction.ID, transaction.Phase, PhaseRollback, "rollback_started", "test", nil, now); err != nil {
@@ -339,6 +357,52 @@ func TestManagerReconcilesControllerOnlyAfterFreshObservation(t *testing.T) {
 	}
 }
 
+func TestManagerHardFencesInconsistentObservation(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", inconsistent: true, observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if err := manager.MaintainController(context.Background()); err == nil {
+		t.Fatal("inconsistent observation unexpectedly maintained a controller")
+	}
+	for slot, observation := range runtime.observations {
+		if observation.ControllerOwned {
+			t.Fatalf("slot %s retained controller ownership after hard fencing", slot)
+		}
+	}
+}
+
+func TestManagerHardFencesWhenObservationPersistenceFails(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.MaintainController(context.Background()); err == nil {
+		t.Fatal("database failure unexpectedly maintained a controller")
+	}
+	for slot, observation := range runtime.observations {
+		if observation.ControllerOwned {
+			t.Fatalf("slot %s retained controller ownership after persistence failure", slot)
+		}
+	}
+}
+
 func TestManagerMarksActiveTransactionForRecoveryAfterRestart(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
@@ -365,7 +429,7 @@ func TestManagerMarksActiveTransactionForRecoveryAfterRestart(t *testing.T) {
 	if err := manager.MaintainController(context.Background()); err == nil {
 		t.Fatal("controller was maintained while recovery was required")
 	}
-	wantSequence := []string{"traffic-disable", "traffic-disable", "revoke", "revoke"}
+	wantSequence := []string{"traffic-disable", "traffic-disable", "revoke", "fence", "revoke", "fence"}
 	if len(runtime.sequence) != len(wantSequence) {
 		t.Fatalf("fencing sequence = %v", runtime.sequence)
 	}
@@ -387,11 +451,21 @@ func TestManagerRecoveryFinalizeReestablishesControllerAfterRestart(t *testing.T
 		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true},
 		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
 	}}
-	transaction := store.Transaction{ID: "tx-restart-finalize", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseActiveSwitch, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
-	if err := database.Create(context.Background(), transaction, nil); err != nil {
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	transaction, err := manager.Stage(context.Background(), "green", "/bundle")
+	if err != nil {
 		t.Fatal(err)
 	}
-	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if _, err := manager.Verify(context.Background(), transaction.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Transition(context.Background(), transaction.ID, PhaseControllerHandoff, PhaseActiveSwitch, "active", "active_switched", "test", nil, now); err != nil {
+		t.Fatal(err)
+	}
+	transaction, err = database.Get(context.Background(), transaction.ID)
+	if err != nil || transaction == nil {
+		t.Fatalf("read recovery transaction: %#v err=%v", transaction, err)
+	}
 	if err := manager.RecoverOnStart(context.Background()); err == nil || !errors.Is(err, ErrUncertain) {
 		t.Fatalf("restart recovery error = %v", err)
 	}

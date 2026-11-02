@@ -120,6 +120,10 @@ Deployd 的后台采样分别读取两个槽位的 `admin-metrics`、`admin-stat
 槽位 Go 服务 MUST 在运行 startup reconciliation 或启用 scheduler、timer reconciliation、age-GC 和 scheduler-driven native-mutation 循环前，先获取并认证 deployd 授予的 controller role。
 standby 或 retiring 槽位可以提供受保护的就绪状态和只读观测，但没有该 role 时 MUST NOT 执行 `StartupReconcile`、`timer-reconcile`、`timer-age-gc` 或任何等价的后台 native mutation。
 role 丢失时，必须先 fence 这些循环，槽位才能进入 retiring 或 standby。
+当 Deployd 无法确认观测、部署状态或角色通道时，必须先对两个槽位执行本地
+hard-fence：清除槽位的 controller role 和 traffic role；如果角色 socket 不可用，
+则停止对应 systemd 单元作为兜底。hard-fence 不依据旧状态重新授予角色，也不分配
+新的持久化 term；后续恢复必须重新观测，并使用更高的持久化 term 授予新 role。
 
 槽位进程启动时默认不得接受新流量。
 只有 Deployd 在新鲜观测通过后授予 controller role，才能启用当前 `active` 槽位的 traffic role；Deployd 或槽位重启后必须重新观测、授予 role 并启用流量，不能依据旧状态直接恢复。

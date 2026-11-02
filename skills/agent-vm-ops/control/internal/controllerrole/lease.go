@@ -104,6 +104,20 @@ func (gate *Gate) Revoke(lease Lease) error {
 	return nil
 }
 
+// Fence unconditionally drops the current role while preserving the highest
+// accepted term. The deployd hard-fence path uses this when durable fencing
+// state is unavailable; future grants still require a newer persisted term.
+func (gate *Gate) Fence() {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if !gate.valid {
+		return
+	}
+	gate.valid = false
+	gate.lease = Lease{}
+	gate.signalLocked()
+}
+
 func (gate *Gate) Valid() bool {
 	gate.mu.Lock()
 	defer gate.mu.Unlock()

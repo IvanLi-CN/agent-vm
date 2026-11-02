@@ -160,7 +160,7 @@ func withSlotLabel(content, slot string) string {
 func quote(value string) string { return strconv.Quote(value) }
 
 func composedSnapshotFresh(snapshot RuntimeSnapshot, now time.Time) bool {
-	if !snapshot.Consistent || snapshot.ObservedAt.IsZero() || snapshot.FreshUntil.IsZero() || !snapshot.FreshUntil.After(now) {
+	if !snapshot.Consistent || (snapshot.ActiveSlot != "blue" && snapshot.ActiveSlot != "green") || snapshot.ObservedAt.IsZero() || snapshot.FreshUntil.IsZero() || !snapshot.FreshUntil.After(now) {
 		return false
 	}
 	for _, name := range []string{"active_link", "slot_contracts", "native_observation", "inventory_observation"} {

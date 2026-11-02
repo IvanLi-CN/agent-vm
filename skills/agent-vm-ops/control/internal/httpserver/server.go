@@ -219,8 +219,11 @@ func (s *Server) controllerRole(c *gin.Context) {
 		if err == nil {
 			s.Service.SetTrafficAccepting(false)
 		}
+	case "fence":
+		s.RoleGate.Fence()
+		s.Service.SetTrafficAccepting(false)
 	default:
-		err = protocol.NewError("invalid_request", "controller role action must be grant or revoke", nil)
+		err = protocol.NewError("invalid_request", "controller role action must be grant, revoke or fence", nil)
 	}
 	if err != nil {
 		code := "controller_role_rejected"

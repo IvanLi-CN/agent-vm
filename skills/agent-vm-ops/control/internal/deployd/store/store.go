@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -309,6 +311,18 @@ func (s *Store) LatestEvent(ctx context.Context, transactionID, phase, transitio
 		FROM deployment_phase_events
 		WHERE transaction_id = ? AND phase = ? AND transition = ?
 		ORDER BY sequence DESC LIMIT 1`, transactionID, phase, transition)
+	return scanPhaseEvent(row)
+}
+
+func (s *Store) LatestEventByTransition(ctx context.Context, transactionID, transition string) (*PhaseEvent, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT sequence,phase,transition,source,evidence_json,created_at
+		FROM deployment_phase_events
+		WHERE transaction_id = ? AND transition = ?
+		ORDER BY sequence ASC LIMIT 1`, transactionID, transition)
+	return scanPhaseEvent(row)
+}
+
+func scanPhaseEvent(row scanner) (*PhaseEvent, error) {
 	var event PhaseEvent
 	var evidence, created string
 	if err := row.Scan(&event.Sequence, &event.Phase, &event.Transition, &event.Source, &evidence, &created); err != nil {
@@ -332,6 +346,7 @@ func (s *Store) Transition(ctx context.Context, id, expectedPhase, phase, state,
 	if now.IsZero() {
 		now = s.clock().UTC()
 	}
+	var result *Transaction
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		var currentPhase string
 		var sequence int64
@@ -347,12 +362,17 @@ func (s *Store) Transition(ctx context.Context, id, expectedPhase, phase, state,
 		if _, err := tx.ExecContext(ctx, "UPDATE deployment_transactions SET phase = ?, state = ?, updated_at = ?, recovery_required = ? WHERE transaction_id = ?", phase, state, formatTime(now), boolInt(state == "needs_recovery"), id); err != nil {
 			return err
 		}
-		return insertEvent(ctx, tx, id, sequence, phase, transition, source, evidence, now)
+		if err := insertEvent(ctx, tx, id, sequence, phase, transition, source, evidence, now); err != nil {
+			return err
+		}
+		var scanErr error
+		result, scanErr = scanTransaction(tx.QueryRowContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,error_code,error_message,created_at,updated_at FROM deployment_transactions WHERE transaction_id = ?`, id))
+		return scanErr
 	})
 	if err != nil {
 		return nil, err
 	}
-	return s.Get(ctx, id)
+	return result, nil
 }
 
 func (s *Store) SetRollbackUsed(ctx context.Context, id string, now time.Time) error {
@@ -368,6 +388,7 @@ func (s *Store) BeginRollback(ctx context.Context, id, expectedPhase, phase, tra
 	if now.IsZero() {
 		now = s.clock().UTC()
 	}
+	var result *Transaction
 	err := s.write(ctx, func(tx *sql.Tx) error {
 		var currentPhase string
 		var rollbackUsed int
@@ -389,12 +410,17 @@ func (s *Store) BeginRollback(ctx context.Context, id, expectedPhase, phase, tra
 			WHERE transaction_id = ?`, phase, formatTime(now), id); err != nil {
 			return err
 		}
-		return insertEvent(ctx, tx, id, sequence, phase, transition, source, evidence, now)
+		if err := insertEvent(ctx, tx, id, sequence, phase, transition, source, evidence, now); err != nil {
+			return err
+		}
+		var scanErr error
+		result, scanErr = scanTransaction(tx.QueryRowContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,error_code,error_message,created_at,updated_at FROM deployment_transactions WHERE transaction_id = ?`, id))
+		return scanErr
 	})
 	if err != nil {
 		return nil, err
 	}
-	return s.Get(ctx, id)
+	return result, nil
 }
 
 func (s *Store) RecordFailure(ctx context.Context, id, phase, code, source, digest string, payload map[string]any, now time.Time) error {
@@ -475,6 +501,10 @@ func (s *Store) Observation(ctx context.Context, id string) (*Observation, error
 			return nil, nil
 		}
 		return nil, err
+	}
+	digestValue := sha256.Sum256([]byte(payload))
+	if digest != hex.EncodeToString(digestValue[:]) {
+		return nil, errors.New("persisted observation digest mismatch")
 	}
 	var value map[string]any
 	if err := json.Unmarshal([]byte(payload), &value); err != nil {

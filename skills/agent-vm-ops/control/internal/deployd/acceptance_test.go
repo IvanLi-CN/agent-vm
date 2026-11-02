@@ -137,6 +137,10 @@ func (runtime *acceptanceRuntime) Stage(_ context.Context, slot, _ string) error
 
 func (runtime *acceptanceRuntime) Verify(context.Context, string, string) error { return nil }
 
+func (runtime *acceptanceRuntime) VerifySlotIdentity(context.Context, string, string, string) error {
+	return nil
+}
+
 func (runtime *acceptanceRuntime) GrantController(_ context.Context, slot string, _ controllerrole.Lease) error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
@@ -153,6 +157,17 @@ func (runtime *acceptanceRuntime) RevokeController(_ context.Context, slot strin
 		value.ControllerOwned = false
 		runtime.slots[slot] = value
 	}
+	return nil
+}
+
+func (runtime *acceptanceRuntime) FenceController(_ context.Context, slot string) error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if value, ok := runtime.slots[slot]; ok {
+		value.ControllerOwned = false
+		runtime.slots[slot] = value
+	}
+	runtime.traffic[slot] = false
 	return nil
 }
 
@@ -184,6 +199,13 @@ func (runtime *acceptanceRuntime) Drain(_ context.Context, slot string) error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	runtime.draining[slot] = true
+	return nil
+}
+
+func (runtime *acceptanceRuntime) ExitDrain(_ context.Context, slot string) error {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	runtime.draining[slot] = false
 	return nil
 }
 
@@ -296,6 +318,12 @@ func TestDeploydAgentVMAcceptance(t *testing.T) {
 	assertMetric(t, activeMetrics, `agent_vm_deployd_slot_process_up{slot="green"} 1`)
 	assertMetric(t, activeMetrics, `agent_vm_deployd_slot_controller_owned{slot="blue"} 0`)
 	assertMetric(t, activeMetrics, `agent_vm_deployd_slot_controller_owned{slot="green"} 1`)
+	runtime.mu.Lock()
+	if runtime.draining["blue"] {
+		runtime.mu.Unlock()
+		t.Fatal("successful activation left the old slot durably drained")
+	}
+	runtime.mu.Unlock()
 
 	callDeploydJSON(t, client, http.MethodPost, "/v1/rollback", map[string]any{"transaction_id": transactionID})
 	if err := server.Sample(ctx); err != nil {

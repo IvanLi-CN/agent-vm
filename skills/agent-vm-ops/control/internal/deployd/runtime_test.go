@@ -63,3 +63,31 @@ func TestParseSystemdProperties(t *testing.T) {
 		t.Fatal("ExecStart property was not retained")
 	}
 }
+
+func TestProcessIdentityRequiresStartToken(t *testing.T) {
+	if _, ok := processIdentityFromHealth(map[string]any{"process_id": float64(42), "process_start_time": ""}); ok {
+		t.Fatal("empty process start token was accepted")
+	}
+	if sameProcess(processIdentity{PID: 42, StartTime: ""}, processIdentity{PID: 42, StartTime: ""}) {
+		t.Fatal("empty process start token matched another process")
+	}
+}
+
+func TestSystemdExecStartMatchesExactSlotCommand(t *testing.T) {
+	expected := "/var/lib/agent-vm-native/slots/blue/bin/agent-vm-control serve --config /etc/agent-vm-native/slots/blue/config.json --manifest /var/lib/agent-vm-native/slots/blue/release-manifest.json"
+	valid := "{ path=/var/lib/agent-vm-native/slots/blue/bin/agent-vm-control ; argv[]=" + expected + " ; ignore_errors=no }"
+	if !systemdExecStartMatches(valid, expected) {
+		t.Fatal("exact systemd command was rejected")
+	}
+	unsafe := "{ path=/var/lib/agent-vm-native/slots/blue/bin/agent-vm-control ; argv[]=" + expected + " --unsafe ; ignore_errors=no }"
+	if systemdExecStartMatches(unsafe, expected) {
+		t.Fatal("systemd command with extra arguments was accepted")
+	}
+}
+
+func TestActiveSlotRequiresLink(t *testing.T) {
+	runtime := NewHostRuntime(Config{ActivePath: filepath.Join(t.TempDir(), "active")})
+	if _, err := runtime.activeSlot(); err == nil {
+		t.Fatal("missing active link was treated as a valid slot")
+	}
+}

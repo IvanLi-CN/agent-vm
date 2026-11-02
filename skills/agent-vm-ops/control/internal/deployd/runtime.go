@@ -85,10 +85,8 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			if requestErr == nil {
 				requestErr = fmt.Errorf("slot %s health returned HTTP %d or an invalid health envelope", slot, status)
 			}
-			if slot == active || active == "none" || active == "unknown" {
-				slotContractsUp = false
-				snapshot.Consistent = false
-			}
+			slotContractsUp = false
+			snapshot.Consistent = false
 			runtime.clearSlotMetrics(slot)
 			observation.MetricFamilies = runtime.slotMetrics(slot)
 			snapshot.Slots[slot] = observation
@@ -96,10 +94,8 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		}
 		processReady, processReadyOK := body["process_ready"].(bool)
 		if !processReadyOK {
-			if slot == active || active == "none" || active == "unknown" {
-				slotContractsUp = false
-				snapshot.Consistent = false
-			}
+			slotContractsUp = false
+			snapshot.Consistent = false
 			observation.MetricFamilies = runtime.slotMetrics(slot)
 			snapshot.Slots[slot] = observation
 			continue
@@ -113,10 +109,8 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		observation.SourceRevision, _ = body["source_revision"].(string)
 		process, processOK := processIdentityFromHealth(body)
 		if !processOK || runtime.systemdProcessMatches(ctx, slot, process) != nil {
-			if slot == active || active == "none" || active == "unknown" {
-				slotContractsUp = false
-				snapshot.Consistent = false
-			}
+			slotContractsUp = false
+			snapshot.Consistent = false
 			observation.ProcessUp = false
 			observation.ProcessReady = false
 			observation.Ready = false
@@ -369,6 +363,27 @@ func (runtime *HostRuntime) Verify(ctx context.Context, slot, bundle string) err
 	}
 	if process, ok := processIdentityFromHealth(body); !ok || !processMatchesStaged(runtime, slot, process) {
 		return fmt.Errorf("slot %s process identity was not verified after restart", slot)
+	}
+	return nil
+}
+
+func (runtime *HostRuntime) VerifySlotIdentity(_ context.Context, slot, releaseID, sourceRevision string) error {
+	if err := validSlot(slot); err != nil {
+		return err
+	}
+	if releaseID == "" || sourceRevision == "" {
+		return errors.New("slot identity is incomplete")
+	}
+	root := filepath.Join(runtime.Config.ReleaseRoot, "slots", slot)
+	if err := runtime.verifySlotSocketLink(root, slot); err != nil {
+		return err
+	}
+	metadata, err := releaseManifest.LoadMetadata(filepath.Join(root, "release-manifest.json"))
+	if err != nil {
+		return fmt.Errorf("verify slot %s release manifest: %w", slot, err)
+	}
+	if metadata.ReleaseID != releaseID || metadata.SourceRevision != sourceRevision {
+		return fmt.Errorf("slot %s release identity does not match the verified rollback target", slot)
 	}
 	return nil
 }
@@ -756,6 +771,25 @@ func (runtime *HostRuntime) RevokeController(ctx context.Context, slot string, t
 	return nil
 }
 
+func (runtime *HostRuntime) FenceController(ctx context.Context, slot string) error {
+	if slot == "" || slot == "none" {
+		return nil
+	}
+	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, "/internal/v1/controller-role", map[string]any{"action": "fence"})
+	if err == nil && status == http.StatusOK && responseOK(body) {
+		if valid, ok := body["valid"].(bool); ok && !valid {
+			return nil
+		}
+		err = errors.New("slot did not confirm hard controller fencing")
+	} else if err == nil {
+		err = fmt.Errorf("slot %s rejected hard controller fencing with HTTP %d", slot, status)
+	}
+	if stopErr := runtime.Stop(ctx, slot); stopErr != nil {
+		return fmt.Errorf("hard fence slot %s: %w; stop fallback: %v", slot, err, stopErr)
+	}
+	return nil
+}
+
 func (runtime *HostRuntime) EnableTraffic(ctx context.Context, slot string) error {
 	if err := validSlot(slot); err != nil {
 		return err
@@ -835,6 +869,20 @@ func (runtime *HostRuntime) Drain(ctx context.Context, slot string) error {
 	}
 	if status != http.StatusOK || !responseOK(statusBody) {
 		return fmt.Errorf("slot %s rejected drain with HTTP %d", slot, status)
+	}
+	return nil
+}
+
+func (runtime *HostRuntime) ExitDrain(ctx context.Context, slot string) error {
+	if slot == "" || slot == "none" {
+		return nil
+	}
+	_, status, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-exit", "session_id": deploydDrainSession, "operation_id": "deployd-drain-exit-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0)})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("slot %s rejected drain exit with HTTP %d", slot, status)
 	}
 	return nil
 }
@@ -925,7 +973,7 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 	if err := runtime.SwitchActive(ctx, previous); err != nil {
 		return err
 	}
-	if _, _, err := runtime.control(ctx, runtime.socket(previous), map[string]any{"protocol": 4, "action": "drain-exit", "session_id": deploydDrainSession, "operation_id": "deployd-drain-exit-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0)}); err != nil {
+	if err := runtime.ExitDrain(ctx, previous); err != nil {
 		return fmt.Errorf("exit rollback drain on slot %s: %w", previous, err)
 	}
 	if target != "" && target != "none" && target != previous {
@@ -989,24 +1037,24 @@ func (runtime *HostRuntime) waitSlotIdentity(ctx context.Context, slot string, p
 func processIdentityFromHealth(body map[string]any) (processIdentity, bool) {
 	pid, pidOK := integerValue(body["process_id"])
 	startTime, startOK := body["process_start_time"].(string)
-	if !pidOK || pid <= 0 || !startOK {
+	if !pidOK || pid <= 0 || !startOK || startTime == "" {
 		return processIdentity{}, false
 	}
 	return processIdentity{PID: pid, StartTime: startTime}, true
 }
 
 func sameProcess(left, right processIdentity) bool {
-	if left.PID != right.PID {
+	if left.PID <= 0 || right.PID <= 0 || left.StartTime == "" || right.StartTime == "" || left.PID != right.PID {
 		return false
 	}
-	return left.StartTime == "" || right.StartTime == "" || left.StartTime == right.StartTime
+	return left.StartTime == right.StartTime
 }
 
 func processMatchesStaged(runtime *HostRuntime, slot string, identity processIdentity) bool {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	expected, ok := runtime.stagedProcess[slot]
-	return !ok || sameProcess(identity, expected)
+	return ok && sameProcess(identity, expected)
 }
 
 func (runtime *HostRuntime) socket(slot string) string {
@@ -1019,7 +1067,7 @@ func (runtime *HostRuntime) socket(slot string) string {
 func (runtime *HostRuntime) activeSlot() (string, error) {
 	target, err := os.Readlink(runtime.Config.ActivePath)
 	if errors.Is(err, os.ErrNotExist) {
-		return "none", nil
+		return "", errors.New("active link is missing")
 	}
 	if err != nil {
 		return "", err
@@ -1221,17 +1269,33 @@ func (runtime *HostRuntime) systemdProcessMatches(ctx context.Context, slot stri
 	if err != nil || mainPID <= 0 || mainPID != identity.PID {
 		return errors.New("systemd main process does not match slot health")
 	}
-	if filepath.Base(properties["FragmentPath"]) != "agent-vm-native@.service" {
+	if filepath.Clean(properties["FragmentPath"]) != "/etc/systemd/system/agent-vm-native@.service" {
 		return errors.New("systemd unit template is not the native slot unit")
 	}
 	if !strings.HasSuffix(properties["ControlGroup"], "/agent-vm-native@"+slot+".service") {
 		return errors.New("systemd cgroup does not match the native slot unit")
 	}
 	expectedBinary := filepath.Join(runtime.Config.ReleaseRoot, "slots", slot, "bin", "agent-vm-control")
-	if !strings.Contains(properties["ExecStart"], expectedBinary) {
+	expectedConfig := filepath.Join("/etc/agent-vm-native/slots", slot, "config.json")
+	expectedManifest := filepath.Join(runtime.Config.ReleaseRoot, "slots", slot, "release-manifest.json")
+	expectedCommand := expectedBinary + " serve --config " + expectedConfig + " --manifest " + expectedManifest
+	if !systemdExecStartMatches(properties["ExecStart"], expectedCommand) {
 		return errors.New("systemd executable does not match the native slot")
 	}
 	return nil
+}
+
+func systemdExecStartMatches(value, expected string) bool {
+	const marker = "argv[]="
+	index := strings.Index(value, marker)
+	if index < 0 {
+		return false
+	}
+	command := value[index+len(marker):]
+	if end := strings.Index(command, " ;"); end >= 0 {
+		command = command[:end]
+	}
+	return command == expected
 }
 
 func parseSystemdProperties(output string) map[string]string {
@@ -1292,8 +1356,8 @@ func healthEnvelopeValid(body map[string]any) bool {
 	_, controllerOK := body["controller_owned"].(bool)
 	_, trafficOK := body["traffic_accepting"].(bool)
 	_, processIDOK := integerValue(body["process_id"])
-	_, processStartOK := body["process_start_time"].(string)
-	return ok && envelopeOK && protocolOK && protocolValue == 4 && processReadyOK && readyOK && controllerOK && trafficOK && processIDOK && processStartOK && processReady
+	processStartTime, processStartOK := body["process_start_time"].(string)
+	return ok && envelopeOK && protocolOK && protocolValue == 4 && processReadyOK && readyOK && controllerOK && trafficOK && processIDOK && processStartOK && processStartTime != "" && processReady
 }
 
 func parseObservedAt(value any) (time.Time, bool) {

@@ -64,3 +64,23 @@ func TestGateRejectsPIDReuseWithDifferentProcessStartToken(t *testing.T) {
 		t.Fatal("lease with a reused PID token remained valid")
 	}
 }
+
+func TestGateFencePreservesTermForFutureGrants(t *testing.T) {
+	now := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	gate := New("blue", func() time.Time { return now })
+	lease := Lease{Slot: "blue", Term: 4, LeaseID: "lease-4", Expiry: now.Add(time.Minute), Generation: 1, Nonce: "nonce-4"}
+	if err := gate.Grant(lease); err != nil {
+		t.Fatal(err)
+	}
+	gate.Fence()
+	if gate.Valid() {
+		t.Fatal("hard-fenced lease remained valid")
+	}
+	if err := gate.Grant(lease); !errors.Is(err, ErrLeaseMismatch) {
+		t.Fatalf("same-term grant after hard fence = %v", err)
+	}
+	lease.Term = 5
+	if err := gate.Grant(lease); err != nil {
+		t.Fatalf("newer-term grant after hard fence: %v", err)
+	}
+}
