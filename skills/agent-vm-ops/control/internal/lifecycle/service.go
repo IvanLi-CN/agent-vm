@@ -2663,7 +2663,7 @@ func (s *Service) portAdd(ctx context.Context, request protocol.Request) (map[st
 			return nil, err
 		}
 		hostAddress := s.hostAddress()
-		workerCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+		workerCtx, cancel := context.WithTimeout(native.WithWorkerStartClaimed(ctx), time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 		err := s.Guest.DeviceAdd(workerCtx, task.InstanceName, value.DeviceName, "proxy", map[string]string{
 			"listen":  protocolName + ":" + hostAddress + ":" + strconv.FormatInt(hostPort, 10),
 			"connect": protocolName + ":" + *task.VMIP + ":" + strconv.FormatInt(vmPort, 10),
@@ -2732,7 +2732,7 @@ func (s *Service) portRemove(ctx context.Context, request protocol.Request) (map
 				if err := s.allowPortNativeStart(ctx); err != nil {
 					return nil, err
 				}
-				workerCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+				workerCtx, cancel := context.WithTimeout(native.WithWorkerStartClaimed(ctx), time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 				err := s.removePortDevice(workerCtx, task, port)
 				cancel()
 				if err != nil {

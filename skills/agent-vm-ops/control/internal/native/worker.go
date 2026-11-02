@@ -33,6 +33,7 @@ type WorkerStartFailureRecorder interface {
 
 type workerContextKey struct{}
 type workerRecoveryContextKey struct{}
+type workerStartClaimedContextKey struct{}
 
 type workerBinding struct {
 	operationID string
@@ -54,6 +55,24 @@ func WithWorkerRecovery(ctx context.Context, coordinatorOperationID string) cont
 		return ctx
 	}
 	return context.WithValue(ctx, workerRecoveryContextKey{}, coordinatorOperationID)
+}
+
+// WithWorkerStartClaimed marks a context whose operation journal already
+// crossed the native-start barrier. The runner still records the actual
+// process identity, but must not claim the same barrier a second time.
+func WithWorkerStartClaimed(ctx context.Context) context.Context {
+	if ctx == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, workerStartClaimedContextKey{}, true)
+}
+
+func WorkerStartClaimed(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	claimed, _ := ctx.Value(workerStartClaimedContextKey{}).(bool)
+	return claimed
 }
 
 func WorkerOperationID(ctx context.Context) string {

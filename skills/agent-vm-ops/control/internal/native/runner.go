@@ -99,7 +99,7 @@ func (r *Runner) Run(ctx context.Context, argv []string, input []byte) (result R
 	configureCommand(command)
 	tracker.configureCommand(command)
 	binding := workerBindingFromContext(ctx)
-	if guard, ok := binding.recorder.(WorkerStartGuard); ok {
+	if guard, ok := binding.recorder.(WorkerStartGuard); ok && !WorkerStartClaimed(ctx) {
 		if err := guard.WorkerStartAllowed(ctx, binding.operationID); err != nil {
 			return Result{}, fmt.Errorf("native worker start blocked: %w", err)
 		}
