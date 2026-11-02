@@ -131,7 +131,7 @@ function readCaddyMetadata(): CaddyMetadata {
     caddy?.version_major !== 2 ||
     caddy?.version_policy !== "operator-selected-v2-release" ||
     caddy?.builder !== "xcaddy" ||
-    typeof caddy?.provider_module !== "string" ||
+    caddy?.provider_module !== "github.com/caddy-dns/dnspod" ||
     caddy?.provider_module_name !== "dns.providers.dnspod" ||
     !/^[0-9a-f]{40}$/.test(caddy?.provider_ref ?? "")
   ) {

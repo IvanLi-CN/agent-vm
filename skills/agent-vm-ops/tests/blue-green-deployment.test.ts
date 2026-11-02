@@ -76,6 +76,7 @@ test("blue-green deployment metadata and static validator enforce the Caddy v2 D
   expect(metadata.caddy.provider_module_name).toBe("dns.providers.dnspod");
   expect(metadata.caddy.provider_ref).toMatch(/^[0-9a-f]{40}$/);
   expect(metadata.caddy.version).toBeUndefined();
+  expect(read("skills/agent-vm-ops/scripts/build_caddy.ts")).toContain('caddy?.provider_module !== "github.com/caddy-dns/dnspod"');
   expect(metadata.rqlite.version).toBe("10.5.2");
   expect(metadata.rqlite.supported_architectures).toEqual(["amd64", "arm64"]);
   expect(metadata.policy.automatic_install).toBe(false);
@@ -509,6 +510,7 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(acceptance).toContain('failed post-swap health');
   expect(acceptance).toContain('previous=blue\\ncandidate=green\\nprevious_manifest=%s\\ncandidate_manifest=%s');
   expect(acceptance).toContain('pending recovery did not restore blue');
+  expect(acceptance).toContain('pending recovery accepted a changed previous manifest');
   expect(acceptance).toContain('candidate whose manifest changed after swap');
   const ci = read(".github/workflows/ci.yml");
   expect(ci).toContain("github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.4");

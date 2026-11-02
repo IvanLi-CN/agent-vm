@@ -22,14 +22,15 @@ func TestOpenUnixSocketParentRejectsSymlinkedAncestor(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, err := openUnixSocketParent(filepath.Join(parentRoot, "agent-vm-native", "blue", "app.sock")); err == nil {
+	if listener, err := listenUnixSocket(filepath.Join(parentRoot, "agent-vm-native", "blue", "app.sock"), 0o600); err == nil {
+		_ = listener.Close()
 		t.Fatal("socket parent traversal accepted a symlinked ancestor")
 	}
 }
 
 func TestListenUnixSocketAnchorsSocketInVerifiedParent(t *testing.T) {
 	root := t.TempDir()
-	socket := filepath.Join(root, "app.sock")
+	socket := filepath.Join(root, "nested", "app.sock")
 	listener, err := listenUnixSocket(socket, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -45,5 +46,12 @@ func TestListenUnixSocketAnchorsSocketInVerifiedParent(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("socket permissions = %o", info.Mode().Perm())
+	}
+	parentInfo, err := os.Stat(filepath.Dir(socket))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parentInfo.Mode().Perm() != 0o750 {
+		t.Fatalf("socket parent permissions = %o", parentInfo.Mode().Perm())
 	}
 }

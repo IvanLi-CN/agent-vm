@@ -672,6 +672,28 @@ mv -- "$green_slot_backup" "$layout_root/slots/green"
 # green unhealthy, and let the next blue cutover recover it before proceeding.
 printf 'ready\n' >"$cutover_health/green.mode"
 bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot green >"$proof_dir/cutover-green-recovery.json"
+
+# A healthy interrupted candidate must not clear recovery state when the
+# recorded previous slot has changed, because that identity is still needed
+# for a safe later rollback.
+blue_manifest_backup="$proof_dir/blue-manifest-backup.json"
+blue_manifest_sha256="$(sha256sum -- "$layout_root/slots/blue/release-manifest.json" | cut -d' ' -f1)"
+green_manifest_sha256="$(sha256sum -- "$layout_root/slots/green/release-manifest.json" | cut -d' ' -f1)"
+printf 'previous=blue\ncandidate=green\nprevious_manifest=%s\ncandidate_manifest=%s\n' \
+  "$blue_manifest_sha256" "$green_manifest_sha256" >"$layout_root/.active.cutover.pending"
+chmod 0600 "$layout_root/.active.cutover.pending"
+cp -- "$layout_root/slots/blue/release-manifest.json" "$blue_manifest_backup"
+printf '{"slot":"mutated"}\n' >"$layout_root/slots/blue/release-manifest.json"
+if bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot blue >"$proof_dir/cutover-previous-manifest-mutation.json" 2>&1; then
+  fail "pending recovery accepted a changed previous manifest"
+fi
+[[ "$(readlink -f -- "$layout_root/active")" == "$(readlink -f -- "$layout_root/slots/green")" ]] || fail "previous manifest mutation changed active"
+[[ -f "$layout_root/.active.cutover.pending" && ! -L "$layout_root/.active.cutover.pending" ]] || fail "previous manifest mutation cleared pending state"
+mv -- "$blue_manifest_backup" "$layout_root/slots/blue/release-manifest.json"
+bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot blue >"$proof_dir/cutover-previous-manifest-recovery.json"
+[[ "$(readlink -f -- "$layout_root/active")" == "$(readlink -f -- "$layout_root/slots/blue")" ]] || fail "previous manifest recovery did not activate blue"
+[[ ! -e "$layout_root/.active.cutover.pending" && ! -L "$layout_root/.active.cutover.pending" ]] || fail "previous manifest recovery left a record"
+
 printf 'fail\n' >"$cutover_health/green.mode"
 blue_manifest_sha256="$(sha256sum -- "$layout_root/slots/blue/release-manifest.json" | cut -d' ' -f1)"
 green_manifest_sha256="$(sha256sum -- "$layout_root/slots/green/release-manifest.json" | cut -d' ' -f1)"

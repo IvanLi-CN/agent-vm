@@ -210,6 +210,7 @@ requireText(acceptance, "candidate whose manifest changed after swap", "isolated
 requireText(acceptance, "exit 1", "isolated acceptance fails when cleanup is incomplete");
 requireText(caddyBuilder, "mkdtempSync", "Caddy builds into a private staging directory");
 requireText(caddyBuilder, "renameSync(stagingOutput, options.output)", "Caddy installs only after verification via atomic rename");
+requireText(caddyBuilder, 'caddy?.provider_module !== "github.com/caddy-dns/dnspod"', "Caddy builder pins the official DNSPod provider module");
 requireText(caddyBuilder, "isSymbolicLink()", "Caddy rejects symlinked output paths");
 requireText(caGenerator, '[[ -L "$output_dir" ]]', "CA generation rejects a symlinked output directory");
 requireText(caGenerator, '"$output_dir/ca.key"', "CA generation cleans the private key after a failed run");

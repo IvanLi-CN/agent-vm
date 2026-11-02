@@ -284,6 +284,10 @@ recover_pending_cutover() {
   validate_slot_layout "$candidate_record"
   assert_manifest_digest "$candidate_record" "$candidate_manifest_record"
   if [[ -S "$runtime_root/$candidate_record/app.sock" ]] && health_check "$root_dir/slots/$candidate_record/app.sock"; then
+    if [[ "$previous_record" != "none" ]]; then
+      validate_slot_layout "$previous_record"
+      assert_manifest_digest "$previous_record" "$previous_manifest_record"
+    fi
     clear_pending_record
     return 0
   fi
