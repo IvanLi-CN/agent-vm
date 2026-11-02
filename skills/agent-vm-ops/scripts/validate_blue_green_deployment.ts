@@ -150,6 +150,7 @@ forbidText(slotUnit, "ExecStart=/usr/bin/caddy", "slot service does not start a 
 
 const caddyUnit = read(join(assetsRoot, "systemd/agent-vm-caddy.service"));
 const acceptance = read(join(repositoryRoot, "skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh"));
+const cutover = read(join(import.meta.dir, "agent_vm_cutover.sh"));
 requireText(caddyUnit, "User=caddy", "Caddy does not run as root");
 requireText(caddyUnit, "After=network-online.target", "Caddy waits for network readiness before DNS-01");
 requireText(caddyUnit, "SupplementaryGroups=agent-vm-web", "Caddy can access the protected socket group");
@@ -167,6 +168,9 @@ forbidText(caddyUnit, "--environ", "Caddy does not dump the DNSPod environment a
 requireText(acceptance, "rqlite-curl.conf", "rqlite readiness credentials use a temporary curl config");
 requireText(acceptance, "umask 077", "temporary rqlite curl credentials are owner-only");
 forbidText(acceptance, '--user "agent-vm-backup:$backup_secret"', "rqlite credentials are not placed in curl argv");
+requireText(cutover, 'health_check "$active/app.sock"', "cutover rechecks the active socket after atomic replacement");
+requireText(cutover, "active_matches_current || die", "cutover refuses to replace an active link changed during readiness");
+requireText(cutover, "rollback_link", "cutover has a protected rollback link for post-swap health failure");
 forbidText(caddyUnit, "/etc/agent-vm-native/tls/caddy", "Caddy systemd unit does not require static certificate files");
 requireText(caddyUnit, "CapabilityBoundingSet=CAP_NET_BIND_SERVICE", "Caddy has only its bind capability");
 forbidText(caddyUnit, "User=root", "Caddy is not configured as root");

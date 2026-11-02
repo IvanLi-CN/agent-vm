@@ -63,21 +63,34 @@ active="$root_dir/active"
 [[ -L "$candidate_socket" ]] || die "candidate socket link is missing"
 [[ "$(readlink -- "$candidate_socket")" == "$expected_socket" ]] || die "candidate socket link is not the expected runtime socket"
 
-if [[ -e "$active" && ! -L "$active" ]]; then
-  die "active must be an absent path or a symlink"
-fi
-if [[ -L "$active" ]]; then
-  current_target="$(readlink -f -- "$active")"
-  case "$current_target" in
-    "$root_dir/slots/blue"|"$root_dir/slots/green") ;;
-    *) die "active points outside the two verified slots" ;;
-  esac
-  current_slot="${current_target##*/}"
-else
-  current_slot="none"
-fi
+read_current_slot() {
+  if [[ -e "$active" && ! -L "$active" ]]; then
+    die "active must be an absent path or a symlink"
+  fi
+  if [[ -L "$active" ]]; then
+    current_target="$(readlink -f -- "$active")"
+    case "$current_target" in
+      "$root_dir/slots/blue"|"$root_dir/slots/green") ;;
+      *) die "active points outside the two verified slots" ;;
+    esac
+    [[ -d "$current_target" ]] || die "active target slot is missing"
+    current_slot="${current_target##*/}"
+  else
+    current_target=""
+    current_slot="none"
+  fi
+}
+
+active_matches_current() {
+  if [[ "$current_slot" == "none" ]]; then
+    [[ ! -e "$active" && ! -L "$active" ]]
+  else
+    [[ -L "$active" ]] && [[ "$(readlink -f -- "$active")" == "$root_dir/slots/$current_slot" ]]
+  fi
+}
 
 if (( dry_run == 1 )); then
+  read_current_slot
   printf '{"dry_run":true,"candidate":"%s","current":"%s","socket":"%s"}\n' \
     "$slot" "$current_slot" "$expected_socket"
   exit 0
@@ -99,21 +112,45 @@ for _ in $(seq 1 300); do
 done
 (( lock_acquired == 1 )) || die "another cutover is in progress"
 temporary_link="$root_dir/.active.$$.tmp"
+rollback_link="$root_dir/.active.$$.rollback.tmp"
 cleanup() {
   rm -f -- "$temporary_link"
+  rm -f -- "$rollback_link"
   rmdir -- "$lock_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
+read_current_slot
 
-health_body="$(curl --fail --silent --show-error --max-time "$health_timeout" \
-  --unix-socket "$expected_socket" \
-  http://localhost/internal/v1/health)" || die "candidate health check failed"
-[[ "$health_body" == *'"ready":true'* ]] || die "candidate health response is not ready"
+health_check() {
+  local socket_path="$1"
+  local health_body
+  health_body="$(curl --fail --silent --show-error --max-time "$health_timeout" \
+    --unix-socket "$socket_path" \
+    http://localhost/internal/v1/health)" || return 1
+  [[ "$health_body" == *'"ready":true'* ]]
+}
+
+health_check "$expected_socket" || die "candidate health check failed"
+active_matches_current || die "active changed while candidate was becoming ready"
 
 ln -s -- "$candidate" "$temporary_link"
 # `active` is itself a symlink to a slot directory. GNU mv without -T treats
 # that directory target as a container and moves the temporary link inside it;
 # -T makes the replacement operate on the link path, preserving atomic cutover.
+active_matches_current || die "active changed before cutover"
 mv -Tf -- "$temporary_link" "$active"
+if ! health_check "$active/app.sock"; then
+  if [[ ! -L "$active" ]] || [[ "$(readlink -f -- "$active")" != "$candidate" ]]; then
+    die "candidate failed post-cutover health and active changed; refusing rollback"
+  fi
+  if [[ "$current_slot" == "none" ]]; then
+    rm -f -- "$active" || die "candidate failed post-cutover health and active rollback failed"
+  else
+    ln -s -- "$root_dir/slots/$current_slot" "$rollback_link"
+    mv -Tf -- "$rollback_link" "$active" || die "candidate failed post-cutover health and active rollback failed"
+    health_check "$active/app.sock" || die "candidate failed post-cutover health; previous slot rollback is not ready"
+  fi
+  die "candidate failed post-cutover health; rolled back to $current_slot"
+fi
 printf '{"dry_run":false,"previous":"%s","active":"%s","health":"ready"}\n' \
   "$current_slot" "$slot"

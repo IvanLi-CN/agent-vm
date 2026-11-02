@@ -332,7 +332,14 @@ test("CA generation and state preflight require operator evidence", () => {
 });
 
 test("cutover dry-run accepts only a verified blue or green layout", () => {
-  expect(read("skills/agent-vm-ops/scripts/agent_vm_cutover.sh")).toContain("mv -Tf --");
+  const cutover = read("skills/agent-vm-ops/scripts/agent_vm_cutover.sh");
+  expect(cutover).toContain("mv -Tf --");
+  expect(cutover).toContain('health_check "$active/app.sock"');
+  expect(cutover).toContain("candidate failed post-cutover health");
+  expect(cutover).toContain("rollback_link");
+  expect(cutover).toContain("read_current_slot");
+  expect(cutover).toContain("active_matches_current || die");
+  expect(cutover).toContain("active target slot is missing");
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-cutover-test-"));
   try {
     const layout = join(temporaryRoot, "layout");
