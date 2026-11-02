@@ -141,6 +141,8 @@ class ReleasePublisherTests(unittest.TestCase):
                 path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42)
             elif relative == "systemd/agent-vm-native.service":
                 path.write_bytes((ops_root / "assets/systemd/agent-vm-native.service").read_bytes())
+            elif relative == "systemd/agent-vm-native@.service":
+                path.write_bytes((ops_root / "assets/systemd/agent-vm-native@.service").read_bytes())
             elif relative == "systemd/agent-vm-deployd.service":
                 path.write_bytes((ops_root / "assets/systemd/agent-vm-deployd.service").read_bytes())
             elif relative == "agent_vm_control_bridge.ts":
