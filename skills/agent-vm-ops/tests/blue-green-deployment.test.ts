@@ -131,6 +131,7 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
 
   const slot = read("skills/agent-vm-ops/assets/systemd/agent-vm-native@.service");
   expect(slot).toContain("BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json");
+  expect(slot).toContain("--socket /run/agent-vm-native/%i/app.sock");
   expect(slot).toContain("--manifest /opt/agent-vm-native/release-manifest.json");
   const caddyUnit = read("skills/agent-vm-ops/assets/systemd/agent-vm-caddy.service");
   expect(caddyUnit).toContain("User=caddy");

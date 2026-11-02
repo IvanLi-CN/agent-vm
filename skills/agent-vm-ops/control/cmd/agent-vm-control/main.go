@@ -87,6 +87,7 @@ func serve(args []string) error {
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "/etc/agent-vm-native/config.json", "configuration path")
 	manifestPath := flags.String("manifest", installedManifestPath, "validated release manifest path")
+	socketOverride := flags.String("socket", "", "control socket override")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -96,6 +97,11 @@ func serve(args []string) error {
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
+	}
+	if socket, socketErr := validateServeSocketOverride(*socketOverride); socketErr != nil {
+		return socketErr
+	} else if socket != "" {
+		cfg.Socket = socket
 	}
 	release, err := manifest.LoadMetadata(*manifestPath)
 	if err != nil {
@@ -267,6 +273,16 @@ func stateBackend(value string) string {
 		return "rqlite"
 	}
 	return "sqlite"
+}
+
+func validateServeSocketOverride(value string) (string, error) {
+	if value == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(value) {
+		return "", errors.New("config_invalid: serve socket override must be absolute")
+	}
+	return value, nil
 }
 
 func remoteStateDSN(value string) bool {

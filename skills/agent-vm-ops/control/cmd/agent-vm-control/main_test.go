@@ -2,6 +2,18 @@ package main
 
 import "testing"
 
+func TestValidateServeSocketOverride(t *testing.T) {
+	if value, err := validateServeSocketOverride(""); err != nil || value != "" {
+		t.Fatalf("empty socket override = %q, %v", value, err)
+	}
+	if value, err := validateServeSocketOverride("/run/agent-vm-native/blue/app.sock"); err != nil || value != "/run/agent-vm-native/blue/app.sock" {
+		t.Fatalf("absolute socket override = %q, %v", value, err)
+	}
+	if _, err := validateServeSocketOverride("run/agent-vm-native/blue/app.sock"); err == nil {
+		t.Fatal("relative socket override was accepted")
+	}
+}
+
 func TestStateBackendDoesNotExposeDSN(t *testing.T) {
 	for _, test := range []struct {
 		name  string
