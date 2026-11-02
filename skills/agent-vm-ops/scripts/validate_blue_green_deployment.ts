@@ -149,10 +149,11 @@ requireText(rqliteUnit, "-http-key /etc/agent-vm-native/tls/rqlite/server.key", 
 forbidText(rqliteUnit, "0.0.0.0", "rqlite does not bind to all interfaces");
 
 const slotUnit = read(join(assetsRoot, "systemd/agent-vm-native@.service"));
-requireText(slotUnit, "--manifest /opt/agent-vm-native/release-manifest.json", "slot service uses the fixed manifest path");
+requireText(slotUnit, "ConditionPathExists=/opt/agent-vm-native/slots/%i/release-manifest.json", "slot service requires its release manifest");
+requireText(slotUnit, "--manifest /opt/agent-vm-native/slots/%i/release-manifest.json", "slot service uses its slot manifest path");
 requireText(slotUnit, "--slot %i", "slot service passes its blue-green identity");
 requireText(slotUnit, "--socket /run/agent-vm-native/%i/app.sock", "slot service uses its per-slot runtime socket");
-requireText(slotUnit, "BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json", "slot manifest is isolated in the service mount namespace");
+forbidText(slotUnit, "BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json", "slot service does not hide the package root behind a manifest-only mount");
 requireText(slotUnit, "Group=agent-vm-web", "slot service owns the protected web socket group");
 requireText(slotUnit, "Requires=agent-vm-rqlite.service", "slot service requires the state authority");
 forbidText(slotUnit, "ExecStart=/usr/bin/caddy", "slot service does not start a second proxy");
@@ -160,6 +161,8 @@ forbidText(slotUnit, "ExecStart=/usr/bin/caddy", "slot service does not start a 
 const caddyUnit = read(join(assetsRoot, "systemd/agent-vm-caddy.service"));
 const acceptance = read(join(repositoryRoot, "skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh"));
 const cutover = read(join(import.meta.dir, "agent_vm_cutover.sh"));
+const controlServer = read(join(repositoryRoot, "skills/agent-vm-ops/control/internal/httpserver/server.go"));
+const linuxSocketListener = read(join(repositoryRoot, "skills/agent-vm-ops/control/internal/httpserver/socket_listener_linux.go"));
 const caddyBuilder = read(join(import.meta.dir, "build_caddy.ts"));
 const caGenerator = read(join(import.meta.dir, "generate_deployment_ca.sh"));
 const ciWorkflow = read(join(repositoryRoot, ".github/workflows/ci.yml"));
@@ -222,6 +225,8 @@ requireText(ciWorkflow, "^v2\\\\.", "Ubuntu PR gate selects only stable Caddy v2
 forbidText(ciWorkflow, "CADDY_VERSION: v2.", "Ubuntu PR gate does not pin a Caddy patch release");
 forbidText(acceptance, '--user "agent-vm-backup:$backup_secret"', "rqlite credentials are not placed in curl argv");
 requireText(cutover, 'health_check "$active/app.sock"', "cutover rechecks the active socket after atomic replacement");
+requireText(cutover, "active_candidate_layout_matches", "cutover rechecks the exact active candidate socket link after replacement");
+requireText(cutover, "post_cutover_check", "cutover combines health, manifest and socket-link checks before success");
 requireText(cutover, "slot_manifest_digest", "cutover records release manifest identities for recovery");
 requireText(cutover, "assert_manifest_digest", "cutover fails closed on a changed recovery manifest");
 requireText(cutover, 'assert_manifest_digest "$current_slot" "$pending_previous_manifest"', "cutover binds post-swap rollback to the recorded previous manifest");
@@ -243,6 +248,9 @@ requireText(cutover, 'exec 8<"$root_dir"', "cutover anchors lock-path creation t
 requireText(cutover, "flock --wait 30 8", "cutover serializes lock-path creation before opening the regular lock");
 requireText(cutover, 'mktemp -d -- "$root_dir/.active-stage.XXXXXX"', "cutover uses PID-independent unique staging");
 requireText(cutover, '[[ -L "$lock_path" ]]', "cutover rejects a symlinked active-link lock");
+requireText(controlServer, "mode := os.FileMode(0o660)", "control sockets are accessible to the protected Caddy group");
+requireText(linuxSocketListener, "unix.Umask", "Linux socket binding has an old-kernel mode compatibility path");
+requireText(linuxSocketListener, "unix.AT_EMPTY_PATH", "Linux socket mode uses an exact inode operation when supported");
 requireText(cutover, 'ln -- "$lock_seed" "$lock_path"', "cutover atomically creates the active-link lock without following a symlink");
 requireText(cutover, 'mktemp "$stage_dir/pending.XXXXXX"', "cutover uses PID-independent pending staging");
 forbidText(cutover, ".active.cutover.pending.$$.tmp", "cutover does not reuse PID-derived pending staging names");

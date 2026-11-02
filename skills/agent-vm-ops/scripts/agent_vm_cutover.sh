@@ -194,6 +194,24 @@ health_check() {
   [[ "$health_body" == *'"ready":true'* ]]
 }
 
+active_target_is_candidate() {
+  [[ -L "$active" ]] || return 1
+  [[ "$(readlink -f -- "$active")" == "$candidate" ]]
+}
+
+active_candidate_layout_matches() {
+  active_target_is_candidate || return 1
+  [[ -L "$candidate_socket" ]] || return 1
+  [[ "$(readlink -- "$candidate_socket")" == "$expected_socket" ]]
+}
+
+post_cutover_check() {
+  active_candidate_layout_matches || return 1
+  health_check "$active/app.sock" || return 1
+  (assert_manifest_digest "$slot" "$pending_candidate_manifest") || return 1
+  active_candidate_layout_matches
+}
+
 sync_path() {
   sync -f "$1" || die "cannot flush cutover path: $1"
 }
@@ -324,8 +342,8 @@ ln -s -- "$candidate" "$temporary_link"
 # -T makes the replacement operate on the link path, preserving atomic cutover.
 mv -Tf -- "$temporary_link" "$active"
 sync_path "$root_dir"
-if ! health_check "$active/app.sock" || ! (assert_manifest_digest "$slot" "$pending_candidate_manifest"); then
-  if [[ ! -L "$active" ]] || [[ "$(readlink -f -- "$active")" != "$candidate" ]]; then
+if ! post_cutover_check; then
+  if ! active_target_is_candidate; then
     die "candidate failed post-cutover health and active changed; refusing rollback"
   fi
   if [[ "$current_slot" == "none" ]]; then

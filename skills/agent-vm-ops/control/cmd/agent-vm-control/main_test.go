@@ -38,6 +38,22 @@ func TestValidateServeSocketOverride(t *testing.T) {
 	}
 }
 
+func TestValidateServeInvocationBindsSlotIdentity(t *testing.T) {
+	var cfg config.Config
+	if _, err := validateServeInvocation("", "blue", "/opt/agent-vm-native/slots/blue/release-manifest.json", cfg); err == nil {
+		t.Fatal("slot serve without a socket override was accepted")
+	}
+	if _, err := validateServeInvocation("/run/agent-vm-native/blue/app.sock", "blue", installedManifestPath, cfg); err == nil {
+		t.Fatal("slot serve with the shared manifest path was accepted")
+	}
+	if _, err := validateServeInvocation("/run/agent-vm-native/blue/app.sock", "test", "/opt/agent-vm-native/slots/test/release-manifest.json", cfg); err == nil {
+		t.Fatal("non-blue-green slot identity was accepted")
+	}
+	if socket, err := validateServeInvocation("/run/agent-vm-native/blue/app.sock", "blue", "/opt/agent-vm-native/slots/blue/release-manifest.json", cfg); err != nil || socket != "/run/agent-vm-native/blue/app.sock" {
+		t.Fatalf("valid slot invocation = %q, %v", socket, err)
+	}
+}
+
 func TestValidateServeSocketParentsRejectsSymlinkAncestorBelowMissingSlot(t *testing.T) {
 	root := t.TempDir()
 	outside := filepath.Join(root, "outside")

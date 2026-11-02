@@ -3,6 +3,7 @@
 package httpserver
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -39,13 +40,13 @@ func listenUnixSocket(path string, mode os.FileMode) (net.Listener, error) {
 	}()
 
 	bindPath := fmt.Sprintf("/proc/self/fd/%d/%s", parentFD, name)
-	if err := unix.Bind(socketFD, &unix.SockaddrUnix{Name: bindPath}); err != nil {
+	if err := bindUnixSocket(socketFD, bindPath, mode); err != nil {
 		return nil, fmt.Errorf("bind control socket: %w", err)
 	}
 	if err := unix.Listen(socketFD, unixSocketBacklog); err != nil {
 		return nil, fmt.Errorf("listen on control socket: %w", err)
 	}
-	if err := chmodUnixSocketAt(parentFD, name, mode); err != nil {
+	if err := chmodUnixSocketAt(parentFD, name, socketFD, mode); err != nil {
 		return nil, fmt.Errorf("chmod control socket: %w", err)
 	}
 
@@ -64,6 +65,15 @@ func listenUnixSocket(path string, mode os.FileMode) (net.Listener, error) {
 		return nil, fmt.Errorf("close control socket descriptor: %w", closeErr)
 	}
 	return listener, nil
+}
+
+func bindUnixSocket(socketFD int, path string, mode os.FileMode) error {
+	// Linux applies umask when it creates the AF_UNIX pathname. This provides
+	// the compatibility path for kernels without fchmodat2; the exact inode is
+	// still checked after bind before the listener is exposed.
+	oldUmask := unix.Umask(int(0o777 &^ uint32(mode.Perm())))
+	defer unix.Umask(oldUmask)
+	return unix.Bind(socketFD, &unix.SockaddrUnix{Name: path})
 }
 
 func openUnixSocketParent(path string) (int, string, error) {
@@ -132,13 +142,7 @@ func chmodUnixSocketParent(directoryFD int) error {
 	return unix.Fchmod(chmodFD, 0o750)
 }
 
-func chmodUnixSocketAt(parentFD int, name string, mode os.FileMode) error {
-	socketFD, err := unix.Openat(parentFD, name, unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
-	if err != nil {
-		return fmt.Errorf("open bound control socket: %w", err)
-	}
-	defer unix.Close(socketFD)
-
+func chmodUnixSocketAt(parentFD int, name string, socketFD int, mode os.FileMode) error {
 	var before unix.Stat_t
 	if err := unix.Fstat(socketFD, &before); err != nil {
 		return fmt.Errorf("inspect bound control socket: %w", err)
@@ -146,16 +150,42 @@ func chmodUnixSocketAt(parentFD int, name string, mode os.FileMode) error {
 	if before.Mode&unix.S_IFMT != unix.S_IFSOCK {
 		return fmt.Errorf("bound control path is not a socket: %s", name)
 	}
-	if err := unix.Fchmodat(socketFD, "", uint32(mode.Perm()), unix.AT_EMPTY_PATH); err != nil {
-		return fmt.Errorf("set bound control socket mode: %w", err)
+	wantedMode := uint32(mode.Perm())
+	chmodErr := unix.Fchmodat(socketFD, "", wantedMode, unix.AT_EMPTY_PATH)
+	if chmodErr != nil {
+		if !errors.Is(chmodErr, unix.EOPNOTSUPP) && !errors.Is(chmodErr, unix.ENOSYS) {
+			return fmt.Errorf("set bound control socket mode: %w", chmodErr)
+		}
+		// fchmodat2, which implements AT_EMPTY_PATH, was added in Linux 6.6.
+		// Older kernels already applied the requested mode during bind via the
+		// temporary umask above, so only accept the fallback when it is exact.
+		if uint32(before.Mode)&0o7777 != wantedMode {
+			return fmt.Errorf("bound control socket mode cannot be verified on this kernel: %w", chmodErr)
+		}
 	}
 
 	var after unix.Stat_t
-	if err := unix.Fstatat(parentFD, name, &after, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return fmt.Errorf("recheck bound control socket: %w", err)
+	if err := unix.Fstat(socketFD, &after); err != nil {
+		return fmt.Errorf("recheck bound control socket descriptor: %w", err)
 	}
 	if after.Dev != before.Dev || after.Ino != before.Ino {
 		return fmt.Errorf("bound control socket changed while setting mode")
+	}
+	if uint32(after.Mode)&0o7777 != wantedMode {
+		return fmt.Errorf("bound control socket mode is %o, want %o", uint32(after.Mode)&0o7777, wantedMode)
+	}
+	var pathAfter unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &pathAfter, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("recheck bound control socket path: %w", err)
+	}
+	if pathAfter.Mode&unix.S_IFMT != unix.S_IFSOCK {
+		return fmt.Errorf("bound control path is no longer a socket: %s", name)
+	}
+	if pathAfter.Dev != before.Dev || pathAfter.Ino != before.Ino {
+		return fmt.Errorf("bound control socket path changed while setting mode")
+	}
+	if uint32(pathAfter.Mode)&0o7777 != wantedMode {
+		return fmt.Errorf("bound control socket path mode is %o, want %o", uint32(pathAfter.Mode)&0o7777, wantedMode)
 	}
 	return nil
 }

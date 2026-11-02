@@ -92,14 +92,11 @@ func serve(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *manifestPath != installedManifestPath {
-		return errors.New("manifest_invalid: serve requires the fixed installed release manifest path")
-	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
 	}
-	if socket, socketErr := validateServeSocketOverride(*socketOverride, *slot, cfg); socketErr != nil {
+	if socket, socketErr := validateServeInvocation(*socketOverride, *slot, *manifestPath, cfg); socketErr != nil {
 		return socketErr
 	} else if socket != "" {
 		cfg.Socket = socket
@@ -303,6 +300,26 @@ func validateServeSocketOverride(value string, slot string, cfg config.Config) (
 		return "", err
 	}
 	return value, nil
+}
+
+func validateServeInvocation(socketOverride string, slot string, manifestPath string, cfg config.Config) (string, error) {
+	if slot == "" {
+		if manifestPath != installedManifestPath {
+			return "", errors.New("manifest_invalid: serve requires the fixed installed release manifest path")
+		}
+		return validateServeSocketOverride(socketOverride, slot, cfg)
+	}
+	if slot != "blue" && slot != "green" {
+		return "", errors.New("config_invalid: serve slot identity must be blue or green")
+	}
+	if socketOverride == "" {
+		return "", errors.New("config_invalid: slot serve requires its fixed runtime socket override")
+	}
+	expectedManifest := filepath.Join("/opt/agent-vm-native/slots", slot, "release-manifest.json")
+	if manifestPath != expectedManifest {
+		return "", fmt.Errorf("manifest_invalid: slot serve requires its slot release manifest path: %s", expectedManifest)
+	}
+	return validateServeSocketOverride(socketOverride, slot, cfg)
 }
 
 func validateServeSocketParents(value string) error {

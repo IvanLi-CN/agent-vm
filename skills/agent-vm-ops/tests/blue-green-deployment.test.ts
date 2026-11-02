@@ -137,10 +137,12 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(rqlite).not.toContain("0.0.0.0");
 
   const slot = read("skills/agent-vm-ops/assets/systemd/agent-vm-native@.service");
-  expect(slot).toContain("BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json");
+  expect(slot).toContain("ConditionPathExists=/opt/agent-vm-native/slots/%i/release-manifest.json");
   expect(slot).toContain("--slot %i");
   expect(slot).toContain("--socket /run/agent-vm-native/%i/app.sock");
-  expect(slot).toContain("--manifest /opt/agent-vm-native/release-manifest.json");
+  expect(slot).toContain("--manifest /opt/agent-vm-native/slots/%i/release-manifest.json");
+  expect(slot).not.toContain("BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json");
+  expect(read("skills/agent-vm-ops/control/internal/httpserver/server.go")).toContain("mode := os.FileMode(0o660)");
   const caddyUnit = read("skills/agent-vm-ops/assets/systemd/agent-vm-caddy.service");
   expect(caddyUnit).toContain("User=caddy");
   expect(caddyUnit).toContain("After=network-online.target");
@@ -450,6 +452,8 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   const cutover = read("skills/agent-vm-ops/scripts/agent_vm_cutover.sh");
   expect(cutover).toContain("mv -Tf --");
   expect(cutover).toContain('health_check "$active/app.sock"');
+  expect(cutover).toContain("active_candidate_layout_matches");
+  expect(cutover).toContain("post_cutover_check");
   expect(cutover).toContain("candidate failed post-cutover health");
   expect(cutover).toContain("rollback_link");
   expect(cutover).toContain("pending_file");

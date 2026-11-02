@@ -194,10 +194,10 @@ func ServeApp(ctx context.Context, socket string, service *lifecycle.Service, sn
 }
 
 func serve(ctx context.Context, socket string, service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler) error {
-	mode := os.FileMode(0o600)
-	if app != nil {
-		mode = 0o660
-	}
+	// Both the unified app and the legacy control handler are reached through
+	// the project-owned Caddy edge, whose service account is in this group.
+	// Keep the same protected group mode for both paths.
+	mode := os.FileMode(0o660)
 	listener, err := listenUnixSocket(socket, mode)
 	if err != nil {
 		return err
