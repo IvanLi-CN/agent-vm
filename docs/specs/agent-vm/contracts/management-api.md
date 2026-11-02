@@ -1,106 +1,212 @@
-# Agent VM Management Contract
+# Agent VM 管理合同
 
-The built-in management console uses the same-origin `/api/v1` surface defined by [management-api.yaml](management-api.yaml) and its [synthetic shared examples](management/examples/). The API is served by the active blue or green Agent VM service. It manages existing Agent VM resources and is independent from the protocol-4 [Agent API](agent-api.md), the [Token API](token-api.md), and the deployment observation bridge.
+内置 management console 使用[management-api.yaml](management-api.yaml)及其[synthetic shared examples](management/examples/)定义的 same-origin `/api/v1` surface。
+API 由 active blue 或 green Agent VM service 提供。
+它管理 existing Agent VM resources，并独立于 protocol-4 [Agent API](agent-api.md)、[Token API](token-api.md)和 deployment observation bridge。
 
-## Authentication, identity and service boundary
+## 认证、身份与服务边界
 
-The project Caddy entry point terminates TLS and forwards only fixed paths to the active service. It does not perform Forward Auth, inject `X-Forwarded-User`, accept browser-supplied identity headers or decide resource authorization. There is no independent Web process, management UDS, public TCP bypass, arbitrary router or browser-to-control proxy. The same Go/Gin service serves static assets, OIDC callbacks, `/api/v1`, `/agent/v1/control`, lifecycle rules and native workers; the high-privilege browser boundary is an explicit decision recorded in [ADR 0043](../../../adr/0043-agent-vm-unified-service-security-boundary.md).
+项目 Caddy 入口终止 TLS，只向 active service 转发固定路径。
+它不执行 Forward Auth，不注入 `X-Forwarded-User`，不接受浏览器提供的身份标头，也不决定资源授权。
+系统没有独立 Web 进程、公共管理 UDS、公共 TCP 绕过路径、任意路由器或浏览器到控制服务的代理。
+同一个 Go/Gin 服务提供静态资源、OIDC 回调、`/api/v1`、`/agent/v1/control`、生命周期规则和 native worker；运维者专用的 deployd Unix socket 是独立的部署边界，Caddy 和浏览器都不可访问。
+高权限浏览器边界是[ADR 0043](../../../adr/0043-agent-vm-unified-service-security-boundary.md) 明确记录的设计决定。
 
-The first release uses an external OIDC provider as a relying-party identity service. `GET /api/v1/auth/oidc/start` creates a one-time Authorization Code + PKCE transaction with `code_challenge_method=S256` only and sets a short-lived `Secure`, `HttpOnly`, `SameSite=Lax` login-binding cookie; `plain` or another PKCE method is rejected. The transaction binds random `state`, `nonce`, a protected code verifier, a digest of that browser-binding cookie, the exact redirect URI, client ID, creation/expiry time and consumed state in shared storage. `GET /api/v1/auth/oidc/callback` accepts either a successful response (`code` + matching `state`) or a provider denial/error (`error` + matching `state` and no `code`); both forms consume the transaction once and clear the binding cookie. A provider error redirects to a generic localized login-failure state without creating a session or echoing `error_description`/`error_uri`; malformed, missing-state, mismatch, cross-browser transfer or replay fails closed. The service validates TLS, the authorization code exchange, redirect URI, discovery issuer, ID Token signature/JWKS, exact `iss`, `aud`/`azp`, `exp`, `iat` policy and `nonce`; a provider outage fails closed. The service and Caddy omit callback query strings and `Referer` from access logs, and application logs never retain OIDC code, state, nonce, verifier, error description or error URI values.
+首个 release 使用 external OIDC provider 作为 relying-party identity service。
+`GET /api/v1/auth/oidc/start` 创建一次性的 Authorization Code + PKCE transaction，仅允许 `code_challenge_method=S256`，并设置短时 `Secure`、`HttpOnly`、`SameSite=Lax` login-binding cookie；`plain` 或其他 PKCE method 必须拒绝。
+Transaction 在 shared storage 中绑定 random `state`、`nonce`、protected code verifier、browser-binding cookie 的 digest、exact redirect URI、client ID、creation/expiry time 和 consumed state。
+`GET /api/v1/auth/oidc/callback` 接受 successful response（`code` + matching `state`）或 provider denial/error（`error` + matching `state` 且无 `code`）；两种形式都只消费一次 transaction，并清除 binding cookie。
+Provider error 重定向到 generic localized login-failure state，不创建 session，也不回显 `error_description`/`error_uri`；malformed、missing-state、mismatch、cross-browser transfer 或 replay 必须 fail closed。
+Service 验证 TLS、authorization code exchange、redirect URI、discovery issuer、ID Token signature/JWKS、exact `iss`、`aud`/`azp`、`exp`、`iat` policy 和 `nonce`；provider outage 必须 fail closed。
+Service 与 Caddy 从 access logs 中删除 callback query strings 和 `Referer`；application logs 绝不保留 OIDC code、state、nonce、verifier、error description 或 error URI values。
 
-The service represents the sole administrator as the exact case-sensitive `(issuer, subject)` pair. The issuer is the configured discovery issuer and the subject is the OIDC `sub`; email, display name, groups and forwarded headers are not identity keys. A successful login is accepted only when that pair matches the configured administrator principal, and the session receives the configured administrator capabilities. No ordinary-user role, user-resource relation or historical principal mapping exists; legacy task and native records are reconciled by task identity, generation, lease, journal and native identity.
+Service 将 sole administrator 表示为精确且区分大小写的 `(issuer, subject)` pair。
+Issuer 是 configured discovery issuer，subject 是 OIDC `sub`；email、display name、groups 和 forwarded headers 不是 identity keys。
+只有该 pair 匹配 configured administrator principal 时，successful login 才接受，并为 session 授予 configured administrator capabilities。
+不存在 ordinary-user role、user-resource relation 或 historical principal mapping；legacy task 和 native records 根据 task identity、generation、lease、journal 和 native identity reconcile。
 
-The service creates an opaque browser session with `Secure`, `HttpOnly`, `SameSite=Strict`, `Path=/` and a bounded TTL. Session metadata stores the principal pair, role, capabilities, creation/expiry/revocation state and a digest of the session identifier in shared state. `GET /api/v1/session` returns the principal, role, capabilities and a session-bound CSRF token. Every `POST` and `PUT` carries the cookie, `X-CSRF-Token` and an `Origin` exactly equal to the configured HTTPS origin; CORS is disabled. The browser session is not an Agent Token and is never accepted by `/agent/v1/control`.
+Service 创建 opaque browser session，使用 `Secure`、`HttpOnly`、`SameSite=Strict`、`Path=/` 和 bounded TTL。
+Session metadata 在 shared state 中存储 principal pair、role、capabilities、creation/expiry/revocation state 以及 session identifier 的 digest。
+`GET /api/v1/session` 返回 principal、role、capabilities 和 session-bound CSRF token。
+每个 `POST` 和 `PUT` 携带 cookie、`X-CSRF-Token` 以及与 configured HTTPS origin 完全相等的 `Origin`；CORS disabled。
+Browser session 不是 Agent Token，`/agent/v1/control` 永不接受它。
 
-Required deployment inputs are explicit and incomplete configuration disables the management listener:
+Required deployment inputs 必须显式提供；configuration 不完整时，management listener disabled：
 
-| Field | Meaning and validation |
+| 字段 | 含义与校验 |
 | --- | --- |
-| `management.enabled` | Defaults to `false`; enabled only after all required OIDC, origin, session, Token and staging limits validate. |
-| `management.external_origin` | One normalized HTTPS origin, including a non-default port when used; no path, wildcard or list. |
-| `management.oidc.issuer` | Exact discovery issuer URL; discovery metadata and ID Token `iss` must match it. |
-| `management.oidc.client_id` | Registered client ID bound to the callback and ID Token audience check. |
-| `management.oidc.redirect_uri` | One exact callback URI under the stable Caddy origin; it is stored in each login transaction. |
-| `management.oidc.client_secret` | Protected deployment secret used only by the authorization-code exchange; never stored in repository files or logs. |
-| `management.admin_principal` | One exact `(issuer, subject)` administrator allowlist entry with configured capabilities; no email or group-only entry. |
-| `management.session_ttl_seconds` | Browser session lifetime from 60 through 3600 seconds; default 900 seconds. |
-| `management.token_ttl_seconds` | Maximum Agent Token lifetime; each Token also carries its own expiry and revocation state. |
-| `management.upload.*` | Bounded image upload, private staging and minimum free-space limits from the image contract. |
+| `management.enabled` | 默认值为 `false`；只有所有 required OIDC、origin、session、Token 和 staging limits 验证通过后才启用。 |
+| `management.external_origin` | 一个 normalized HTTPS origin；使用 non-default port 时必须包含该 port；不允许 path、wildcard 或 list。 |
+| `management.oidc.issuer` | Exact discovery issuer URL；discovery metadata 和 ID Token `iss` 必须匹配。 |
+| `management.oidc.client_id` | 绑定 callback 和 ID Token audience check 的 registered client ID。 |
+| `management.oidc.redirect_uri` | stable Caddy origin 下的一个 exact callback URI；存储在每个 login transaction 中。 |
+| `management.oidc.client_secret` | 仅用于 authorization-code exchange 的 protected deployment secret；不得存储在 repository files 或 logs 中。 |
+| `management.admin_principal` | 一个带 configured capabilities 的 exact `(issuer, subject)` administrator allowlist entry；不接受仅 email 或 group 的 entry。 |
+| `management.session_ttl_seconds` | Browser session lifetime 为 60 至 3600 秒；默认 900 秒。 |
+| `management.token_ttl_seconds` | Maximum Agent Token lifetime；每个 Token 还携带自己的 expiry 和 revocation state。 |
+| `management.upload.*` | 由 image contract 定义的 bounded image upload、private staging 和 minimum free-space limits。 |
 
-## Authorization and sensitive actions
+## 授权与敏感操作
 
-The sole administrator uses the browser session and the [Token API](token-api.md). The API has no ordinary-user or cross-principal resource boundary: the administrator may inspect and manage every target permitted by the configured capability. Token creation requires a UUID operation ID and canonical retry identity bound to the exact administrator `(issuer, subject)` pair. A requested `agent:operate` scope must be accompanied by an explicit `agent:read` scope; this is a co-requirement, not implicit inheritance, so the same Token can query status/reconciliation after a lost response. Its succeeded durable operation status exposes `token_id`, safe metadata and one-time disclosure state; a successful `token_create` result cannot omit those fields, and a concurrent or repeated request never reissues plaintext. If the creation response is lost, the administrator queries the original operation, confirms and revokes the Token by ID with a new operation ID, then creates a replacement with another operation ID. `agent:observe_admin` is an explicit machine scope, not a user role. The capability matrix below is normative: the administrator role does not imply every action capability, and every endpoint rejects a request missing its mapped capability.
+Sole administrator 使用 browser session 和[Token API](token-api.md)。
+API 没有 ordinary-user 或 cross-principal resource boundary：administrator 可以 inspect/manage configured capability 允许的每个 target。
+Token creation 要求 UUID operation ID 和绑定 exact administrator `(issuer, subject)` pair 的 canonical retry identity。
+Requested `agent:operate` scope 必须同时显式带有 `agent:read` scope；这是 co-requirement，不是 implicit inheritance，因此 response 丢失后同一个 Token 仍可 query status/reconciliation。
+Succeeded durable operation status 暴露 `token_id`、safe metadata 和 one-time disclosure state；successful `token_create` result 不能省略这些 fields，并且 concurrent 或 repeated request 绝不重新签发 plaintext。
+Creation response 丢失时，administrator query original operation，使用 new operation ID 按 ID 确认并 revoke Token，然后用另一个 operation ID 创建 replacement。
+`agent:observe_admin` 是 explicit machine scope，不是 user role。
+下方 capability matrix 是 normative：administrator role 不代表拥有每个 action capability，每个 endpoint 都拒绝缺少对应 mapped capability 的 request。
 
 | Browser capability | Authorized management surface | Additional authorization rule |
 | --- | --- | --- |
-| `read` | `GET /api/v1/session`; `GET /api/v1/operations` and `GET /api/v1/operations/{operation_id}`. | Only the exact administrator principal may access the browser API; operation metadata remains field-whitelisted. |
-| `operate` | VM action preview and submission for `restart`, `resize`, `release`, `destroy`, `port_add` and `port_remove`. | The target `target_version`, generation, lease and state are rechecked; sensitive actions still require preview and confirmation. An audit reason may be supplied but is not required. |
-| `manage_tokens` | Token list, read, create, revoke and revoke-preview endpoints. | Token revocation requires the current target version and a preview-bound confirmation token. |
-| `manage_images` | Image list, import, upload, default selection, retirement, deletion and their previews. | Integrity, suitability, reference, target-version and confirmation checks remain mandatory. |
-| `maintain_system` | System maintenance preview and submission, including drain, reconcile and garbage collection. | The release transaction and state-write fence remain authoritative; a browser request cannot reopen admission. |
-| `observe_admin` | Overview, VM inventory, image/system/audit views and administrator observation pages. | This capability does not grant mutation, Token issuance or the machine `agent:observe_admin` scope by itself. |
+| `read` | `GET /api/v1/session`；`GET /api/v1/operations` 和 `GET /api/v1/operations/{operation_id}`。 | 只有 exact administrator principal 可以访问 browser API；operation metadata 仍受 field whitelist 约束。 |
+| `operate` | VM action preview 和 `restart`、`resize`、`release`、`destroy`、`port_add`、`port_remove` 的 submission。 | 重新检查 target `target_version`、generation、lease 和 state；sensitive actions 仍要求 preview 和 confirmation。可以提供 audit reason，但不是必需项。 |
+| `manage_tokens` | Token list、read、create、revoke 和 revoke-preview endpoints。 | Token revocation 要求 current target version 和 preview-bound confirmation token。 |
+| `manage_images` | Image list、import、upload、default selection、retirement、deletion 及其 previews。 | Integrity、suitability、reference、target-version 和 confirmation checks 仍是必需项。 |
+| `maintain_system` | System maintenance preview 和 submission，包括 drain、reconcile 和 garbage collection。 | Release transaction 和 state-write fence 仍是权威；browser request 不能 reopen admission。 |
+| `observe_admin` | Overview、VM inventory、image/system/audit views 和 administrator observation pages。 | 该 capability 本身不授予 mutation、Token issuance 或 machine `agent:observe_admin` scope。 |
 
-Capabilities are administrator-internal least-privilege gates. They are not ordinary-user roles, Token-to-user grants or session bindings. Capabilities are never inferred from email, group or an unverified header, and unknown action/capability combinations fail before any durable or native effect.
+Capabilities 是 administrator-internal least-privilege gates，不是 ordinary-user roles、Token-to-user grants 或 session bindings。
+Capabilities 绝不从 email、group 或 unverified header 推断；unknown action/capability combinations 必须在任何 durable 或 native effect 前失败。
 
-Every administrator mutation carries a UUID `operation_id`; mutations of an existing resource carry the current `target_version`, and VM actions also carry the exact expected generation. Durable creates, including Token issuance, use their operation ID and canonical request identity without requiring a target version or preview. Any mutation may include an audit `reason`; when present it must be non-empty and at most 512 characters, while omission is valid and does not reject the request. Changes to an effective lease, image default/reference, deletion, maintenance or an existing Token first return an impact preview. Token creation is a durable-create exception and has no separate preview. A confirmation token is opaque, short-lived (no more than five minutes), single-use and bound to the authenticated `(issuer, subject)`, exact target, action, parameters, target version and generation. Submission repeats authorization, reference, generation, lease, capacity and state checks inside the service.
+Every administrator mutation 携带 UUID `operation_id`；existing resource 的 mutation 携带 current `target_version`，VM actions 还携带 exact expected generation。
+Durable creates（包括 Token issuance）使用 operation ID 和 canonical request identity，不要求 target version 或 preview。
+任何 mutation MAY 包含 audit `reason`；提供时必须 non-empty 且不超过 512 characters，省略合法，不会拒绝 request。
+Effective lease、image default/reference、deletion、maintenance 或 existing Token 的 change，首先返回 impact preview。
+Token creation 是 durable-create exception，不需要 separate preview。
+Confirmation token 是 opaque、short-lived（不超过 five minutes）、single-use，并绑定 authenticated `(issuer, subject)`、exact target、action、parameters、target version 和 generation。
+Submission 在 service 内重新执行 authorization、reference、generation、lease、capacity 和 state checks。
 
-An identical operation retry returns the same durable outcome; for Token creation, that outcome includes only safe metadata after the one-time plaintext disclosure latch is consumed. Reusing an operation ID with a different canonical request returns `operation_conflict`. A browser disconnect, timeout or `outcome_unknown` state does not authorize a new operation ID. The administrator queries `GET /operations/{operation_id}` and the audit record until the service establishes an outcome. A Token revoke commits `revoked_at` and advances the Token `resource_version` atomically in shared state before the `202` response is sent, and Agent authorization reads revocation with linearizable consistency; a request that has not crossed the authorization read after that commit is rejected. A native result that is not verified remains pending and is never replayed automatically.
+Identical operation retry 返回相同 durable outcome；Token creation 在 one-time plaintext disclosure latch 被消费后，outcome 只包含 safe metadata。
+使用不同 canonical request 重用 operation ID 时返回 `operation_conflict`。
+Browser disconnect、timeout 或 `outcome_unknown` state 不授权创建 new operation ID。
+Administrator 查询 `GET /operations/{operation_id}` 和 audit record，直到 service 建立 outcome。
+Token revoke 在发送 `202` response 前，在 shared state 中原子 commit `revoked_at` 并推进 Token `resource_version`；Agent authorization 以 linearizable consistency 读取 revocation，因此 commit 后尚未越过 authorization read 的 request 会被拒绝。
+未验证的 native result 保持 pending，绝不自动 replay。
 
-Audit records cover rejected and accepted requests as well as successful, failed and unknown outcomes. Each record stores either the current administrator actor's `(issuer, subject)` and role/capability, a typed `unauthenticated` or `unauthorized` rejected-request actor with no role/capability, or an explicitly `legacy_unknown` actor with the original historical value preserved verbatim; it never guesses an OIDC identity. `legacy_unknown` is reserved for historical records, while rejected-request actors carry no inferred OIDC identity. The optional reason is stored when supplied and remains explicitly absent when omitted, together with operation ID, target, phase, safe error code and timestamp. It never stores OIDC codes, Token values, credentials, raw command output, SQL or private deployment paths. Responses use field-whitelisted structured errors and do not expose internal stack traces.
+Audit records 覆盖 rejected/accepted requests，以及 successful、failed 和 unknown outcomes。
+每条 record 存储以下三者之一：current administrator actor 的 `(issuer, subject)` 和 role/capability；没有 role/capability 的 typed `unauthenticated` 或 `unauthorized` rejected-request actor；或明确的 `legacy_unknown` actor，并逐字保留 original historical value；绝不猜测 OIDC identity。
+`legacy_unknown` 仅用于 historical records；rejected-request actors 不携带 inferred OIDC identity。
+提供 optional reason 时存储，省略时明确保持 absent，并同时存储 operation ID、target、phase、safe error code 和 timestamp。
+绝不存储 OIDC codes、Token values、credentials、raw command output、SQL 或 private deployment paths。
+Responses 使用 field-whitelisted structured errors，不暴露 internal stack traces。
 
-## Token and Agent API relationship
+## Token 与 Agent API 的关系
 
-The Token API creates the opaque Bearer credentials used by `POST /agent/v1/control`; its complete machine-Token, scope, one-time plaintext and revocation rules are in [token-api.md](token-api.md). The Agent API retains protocol 4 and its operation/generation/journal semantics; its authentication and compatibility contract is in [agent-api.md](agent-api.md). The management API must not wrap an arbitrary protocol-4 request or accept an Agent Token as a browser session.
+Token API 创建 `POST /agent/v1/control` 使用的 opaque Bearer credentials；完整的 machine-Token、scope、one-time plaintext 和 revocation rules 见[token-api.md](token-api.md)。
+Agent API 保留 protocol 4 及其 operation/generation/journal semantics；authentication 和 compatibility contract 见[agent-api.md](agent-api.md)。
+Management API 不得包装 arbitrary protocol-4 request，也不得将 Agent Token 作为 browser session 接受。
 
-## Wire behavior
+## Wire 行为
 
-`management-api.yaml` is the wire contract for the same-origin `/api/v1` browser API. The backend and frontend consume the same request, response and error shapes. Unknown fields, unsupported enum values, extra properties, stale target versions and actions outside the enumerated allowlist are rejected.
+`management-api.yaml` 是 same-origin `/api/v1` browser API 的 wire contract。
+Backend 和 frontend 消费相同的 request、response 和 error shapes。
+Unknown fields、unsupported enum values、extra properties、stale target versions 以及不在 enumerated allowlist 中的 actions 都必须拒绝。
 
-List endpoints use opaque keyset cursors. The default limit is 25 and the maximum is 100. Timestamps are UTC RFC 3339 values. Byte counts and generation values are decimal strings so TypeScript clients do not lose precision. A missing, stale, failed or unverified observation is returned with its state and a null value; it is never converted to zero, false or healthy.
+List endpoints 使用 opaque keyset cursors。
+Default limit 为 25，maximum 为 100。
+Timestamps 是 UTC RFC 3339 values。
+Byte counts 和 generation values 使用 decimal strings，避免 TypeScript clients 丢失 precision。
+Missing、stale、failed 或 unverified observation 返回其 state 和 null value，绝不转换为 zero、false 或 healthy。
 
-Every resource exposes an opaque `resource_version`. Write requests carry that version as `target_version`; VM actions also carry the exact `expected_generation`. The version is a concurrency guard, not a user-editable label. The API returns `stale_target` when the version, generation, lease, native identity or image references changed. The client must reload the resource and request a new preview; it must not silently retarget or replay a dangerous action.
+Every resource 暴露 opaque `resource_version`。
+Write requests 将该 version 作为 `target_version` 携带；VM actions 还携带 exact `expected_generation`。
+Version 是 concurrency guard，不是 user-editable label。
+当 version、generation、lease、native identity 或 image references 变化时，API 返回 `stale_target`。
+Client 必须 reload resource 并 request new preview；不得静默 retarget 或 replay dangerous action。
 
-Image import starts as a durable operation. A local upload declares exact byte counts and SHA-256 values before upload; the service applies the configured size ceiling and physical-space reserve before and during staging. A trusted-source import resolves the exact fingerprint and image size first, then checks the same reserve against the configured Incus pool before native copy. Both paths run integrity and suitability checks before an image can be selected.
+Image import 以 durable operation 开始。
+Local upload 在 upload 前声明 exact byte counts 和 SHA-256 values；service 在 staging 前及 staging 期间应用 configured size ceiling 和 physical-space reserve。
+Trusted-source import 先解析 exact fingerprint 和 image size，然后在 native copy 前针对 configured Incus pool 检查同一 reserve。
+两条路径都必须在 image 可被 selected 前运行 integrity 和 suitability checks。
 
-The API uses stable machine error codes, phases and a small allowlist of safe structured fields. The frontend maps codes to English and Simplified Chinese copy. Unknown codes use a generic localized failure message. Responses never include raw command output, credentials, private paths, database content or internal stack traces. While admission is drained, the System page shows that recovery is release-managed and does not offer a browser `drain_exit` control; only the active release transaction may reopen admission.
+API 使用 stable machine error codes、phases 和小范围 safe structured fields allowlist。
+Frontend 将 codes 映射为 English 和 Simplified Chinese copy。
+Unknown codes 使用 generic localized failure message。
+Responses 绝不包含 raw command output、credentials、private paths、database content 或 internal stack traces。
+Admission drained 时，System page 显示 recovery 由 release 管理，不提供 browser `drain_exit` control；只有 active release transaction 可以 reopen admission。
 
-## Product and language behavior
+## 产品与语言行为
 
-The first release has exactly two interface locales: `zh-CN` and `en`. Selection priority is a saved user choice, then the browser language, then English. Every navigation label, field label, accessible name, confirmation, validation message, status explanation and error has both translations. Technical identifiers, fingerprints, error codes and user-authored content are not translated.
+首个 release 只有两个 interface locales：`zh-CN` 和 `en`。
+Selection priority 依次是 saved user choice、browser language、English。
+每个 navigation label、field label、accessible name、confirmation、validation message、status explanation 和 error 都有两种翻译。
+Technical identifiers、fingerprints、error codes 和 user-authored content 不翻译。
 
-The first viewport opens on Overview. Navigation covers Overview, VMs, Images, Operations & Audit, and System. The VM page keeps the selected resource identity, status evidence and allowed action context visible together. It has no manual VM creation flow. Overview, VM, image, operation and system data retain source freshness and unknown state. The design direction and responsive behavior are specified in [DESIGN.md](../../../../DESIGN.md) and the [Web surface brief](../../../../.impeccable/surfaces/web.md).
+First viewport 打开 Overview。
+Navigation 包含 Overview、VMs、Images、Operations & Audit 和 System。
+VM page 同时保持 selected resource identity、status evidence 和 allowed action context 可见。
+不提供 manual VM creation flow。
+Overview、VM、image、operation 和 system data 保留 source freshness 与 unknown state。
+Design direction 和 responsive behavior 见[DESIGN.md](../../../../DESIGN.md)及[Web surface brief](../../../../.impeccable/surfaces/web.md)。
 
-## Image and VM invariants
+## Image 与 VM 不变量
 
-Unified local uploads use one `application/octet-stream` payload with one expected size and SHA-256. Split local uploads use `multipart/form-data` with exactly one `metadata` and one `rootfs` part; each part has its own expected size and SHA-256 in the import request, and the upload ceiling applies to the sum of their payload sizes. Original filenames are not used as Incus aliases or filesystem paths.
+Unified local uploads 使用一个 `application/octet-stream` payload，携带一个 expected size 和 SHA-256。
+Split local uploads 使用 `multipart/form-data`，且恰好包含一个 `metadata` part 和一个 `rootfs` part；import request 为每个 part 声明自己的 expected size 和 SHA-256，upload ceiling 作用于两个 payload sizes 之和。
+Original filenames 不作为 Incus aliases 或 filesystem paths。
 
-An image is identified by its immutable Incus fingerprint. Version labels and configured source IDs are metadata, not identity. A trusted-remote import accepts only a configured `source_id` and an expected fingerprint; it does not accept an arbitrary URL, alias or credential. A local upload declares its package format, exact byte count and SHA-256 before the stream begins. The upload must fit the configured maximum and staging reserve, is received once, and is not resumable. A short, oversized, mismatched or interrupted stream becomes a queryable failed operation and its incomplete staging data is cleaned up.
+Image 由 immutable Incus fingerprint 标识。
+Version labels 和 configured source IDs 是 metadata，不是 identity。
+Trusted-remote import 只接受 configured `source_id` 和 expected fingerprint，不接受 arbitrary URL、alias 或 credential。
+Local upload 在 stream 开始前声明 package format、exact byte count 和 SHA-256。
+Upload 必须符合 configured maximum 和 staging reserve，只接收一次且不可 resumable。
+Short、oversized、mismatched 或 interrupted stream 会成为 queryable failed operation，其 incomplete staging data 会清理。
 
-Integrity and Agent VM suitability are separate results. Verification uses a bounded, isolated temporary system container without production credentials, host mounts or production network access. Only an image with passed integrity and suitability can be selected as a new default. Selection changes apply to new sessions only. Existing tasks and caches remain pinned to their stored fingerprint. Retiring an image prevents new selection but does not invalidate existing bindings. Deletion is rejected while the image is default or has any active, cached, releasing, pending-creation or verification reference; reference checks are serialized with image operations.
+Integrity 和 Agent VM suitability 是独立 results。
+Verification 使用有界、隔离的 temporary system container，不带 production credentials、host mounts 或 production network access。
+只有 integrity 和 suitability 都 passed 的 image 才能作为 new default 被 selected。
+Selection changes 只影响 new sessions。
+Existing tasks 和 caches 继续 pin 到 stored fingerprint。
+Retiring image 会阻止 new selection，但不使 existing bindings 失效。
+Image 为 default，或存在 active、cached、releasing、pending-creation 或 verification reference 时，deletion 被拒绝；reference checks 与 image operations 串行化。
 
-## State migration and package rollback
+## 状态迁移与包回滚
 
-The management state is additive. The `state_capabilities` registry contains versioned markers and the API renders each as `name@version`. The initial capability set retains the existing protocol-4 task, generation, lease, reservation, port and journal markers and adds the management catalog, session-image binding, operation-audit, principal-identity and Token-revocation markers. Migration preserves task IDs, session IDs, image fingerprints, generations, leases, ports, reservations, operation journals and existing audit evidence. Legacy operation/audit actor strings are retained as `legacy_unknown` values unless the configured administrator identity is directly proven; the service never guesses or fabricates an OIDC actor. It does not create user-to-session or user-to-Token ownership mappings.
+Management state 是 additive。
+`state_capabilities` registry 包含 versioned markers，API 将每个 marker 渲染为 `name@version`。
+Initial capability set 保留既有 protocol-4 task、generation、lease、reservation、port 和 journal markers，并新增 management catalog、session-image binding、operation-audit、principal-identity 和 Token-revocation markers。
+Migration 保留 task IDs、session IDs、image fingerprints、generations、leases、ports、reservations、operation journals 和 existing audit evidence。
+除非 configured administrator identity 有直接证据，legacy operation/audit actor strings 保留为 `legacy_unknown` values；service 绝不猜测或伪造 OIDC actor。
+不创建 user-to-session 或 user-to-Token ownership mappings。
 
-SQLite remains the single writer during the pre-rqlite phase. The conservative migration described by [ADR 0044](../../../adr/0044-agent-vm-state-migration-to-rqlite.md) enters a state-write fence, rejects new browser/API/Agent durable mutations, pauses scheduler/reconciliation/timer durable writes, and requires every in-flight native worker to finish with a durable result under its original operation ID plus verified process-group, PID-identity and Incus-operation quiescence. An unresolved pending/unknown result, active worker or unverified quiescence blocks final export; it is not enough to record the outcome and continue. Only after all transactions and workers converge does the service close SQLite writers and export a consistent backup. It verifies schema/capability/row-count and identity summaries, imports through one rqlite transaction and validates before activating the shared backend. It never dual-writes, opens a shared SQLite file from both slots, downgrades a schema or recreates state to force rollback. After cutover, rqlite is the only live authority; critical reads and observation epoch boundaries use linearizable consistency. If rqlite becomes unavailable, the service fences durable mutations and native admission and preserves active leases without guessing. A verified rqlite backup/snapshot is the first recovery source, and it must record a coverage boundary at or after the last trusted commit. Recovery must reconcile the backup tail after that boundary using the trusted append-only journal and native-effect evidence; schema, digest, epoch or journal checks alone do not prove coverage. The pre-cutover SQLite snapshot may be re-imported only when evidence proves that no post-cutover durable write, epoch advance, lease change or native effect occurred. If the backup tail or any post-cutover write cannot be proven, recovery remains fenced for administrator-authorized journal/native reconciliation; it must not open stale SQLite as a competing authority or reconstruct state by guesswork.
+Pre-rqlite phase 中 SQLite 继续作为 single writer。
+[ADR 0044](../../../adr/0044-agent-vm-state-migration-to-rqlite.md)描述的 conservative migration 进入 state-write fence，拒绝新的 browser/API/Agent durable mutations，暂停 scheduler/reconciliation/timer durable writes，并要求每个 in-flight native worker 在 original operation ID 下以 durable result 完成，同时验证 process-group、PID-identity 和 Incus-operation quiescence。
+Unresolved pending/unknown result、active worker 或 unverified quiescence 会阻止 final export；不能只记录 outcome 然后继续。
+只有所有 transactions 和 workers converge 后，service 才关闭 SQLite writers 并导出 consistent backup。
+它验证 schema/capability/row-count 和 identity summaries，通过一个 rqlite transaction import，并在激活 shared backend 前完成 validation。
+绝不 dual-write、从两个 slots 打开 shared SQLite file、downgrade schema 或 recreate state 来强制 rollback。
+Cutover 后 rqlite 是唯一 live authority；critical reads 和 observation epoch boundaries 使用 linearizable consistency。
+如果 rqlite unavailable，service fence durable mutations 和 native admission，并在不猜测的情况下保留 active leases。
+Verified rqlite backup/snapshot 是第一恢复来源，必须记录不早于 last trusted commit 的 coverage boundary。
+Recovery 必须使用 trusted append-only journal 和 native-effect evidence reconcile 该 boundary 之后的 backup tail；仅 schema、digest、epoch 或 journal checks 不能证明 coverage。
+只有证据证明没有 post-cutover durable write、epoch advance、lease change 或 native effect 时，pre-cutover SQLite snapshot 才可 re-import。
+如果无法证明 backup tail 或任何 post-cutover write，recovery 保持 fenced，等待 administrator-authorized journal/native reconciliation；不得打开 stale SQLite 作为 competing authority，也不得通过猜测重建 state。
 
-The database is never downgraded or recreated during package rollback. An installed package may activate only when it declares support to read and write every present capability marker. A target that cannot preserve the administrator issuer/subject actor, typed rejected-request actors without administrator authority, explicit unknown historical actor values, Token revocation, journal, generation and unknown-outcome semantics is rejected before changing the active slot. The current package remains selected and admission stays drained for operator recovery.
+Package rollback 期间绝不 downgrade 或 recreate database。
+Installed package 只有声明支持 read/write 每个 present capability marker 时才能 activation。
+无法保留 administrator issuer/subject actor、没有 administrator authority 的 typed rejected-request actors、explicit unknown historical actor values、Token revocation、journal、generation 和 unknown-outcome semantics 的 target，必须在改变 active slot 前拒绝。
+Current package 保持 selected，admission 保持 drained，等待 operator recovery。
 
-## Compatibility window
+## 兼容窗口
 
-The blue-green release contract retains the current and previous verified package and their fixed static resource manifests for at least one hour. Each package declares protocol, request/response/semantic windows, Token and management API versions, and state capability read/write sets. Both slots may receive requests during convergence only when the operation is in the shared compatibility set; Caddy never retries writes. A browser asset past the window receives a clear refresh response. SSH `legacy-bun`/`go-request` remains a compatibility transport until the declared window ends, while direct HTTPS uses the same protocol-4 body and does not change lifecycle semantics.
+Blue-green release contract 至少保留 current 和 previous verified packages 及其 fixed static resource manifests 一小时。
+每个 package 声明 protocol、request/response/semantic windows、Token 和 management API versions，以及 state capability read/write sets。
+Convergence 期间，只有 operation 位于 shared compatibility set 时，两个 slots 才能接收 requests；Caddy 绝不 retry writes。
+超过窗口的 browser asset 收到明确的 refresh response。
+SSH `legacy-bun`/`go-request` 在声明窗口结束前继续作为 compatibility transport；direct HTTPS 使用相同的 protocol-4 body，不改变 lifecycle semantics。
 
-## Shared contract examples
+## 共享合同示例
 
-The JSON files beside this contract are synthetic fixtures, contain no deployment facts, and are intended to be shared by backend and frontend contract tests:
+本合同旁的 JSON files 是 synthetic fixtures，不包含 deployment facts，供 backend 和 frontend contract tests 共享：
 
-- `overview.json` covers separate freshness and an unverified pressure observation.
-- `vms-page.json` covers a pinned image, generation, effective lease and bounded port data.
-- `images-page.json` covers a verified candidate and a preserved legacy compatibility default.
-- `image-import-request.json` covers an exact-size local upload declaration.
-- `image-import-split-request.json` covers separate metadata and rootfs payload declarations.
-- `vm-action-request.json` covers a preview-bound restart request.
-- `operation.json` covers durable asynchronous progress and a current issuer/subject actor.
-- `audit-page.json` covers a current, typed rejected-request, or explicitly unknown historical actor, optional reason, target and outcome.
-- `system.json` covers the unified service, Caddy, rqlite and Incus readiness.
-- `error.json` covers a stale-target conflict without internal diagnostics.
+- `overview.json` 覆盖 separate freshness 和 unverified pressure observation。
+- `vms-page.json` 覆盖 pinned image、generation、effective lease 和 bounded port data。
+- `images-page.json` 覆盖 verified candidate 和 preserved legacy compatibility default。
+- `image-import-request.json` 覆盖 exact-size local upload declaration。
+- `image-import-split-request.json` 覆盖 separate metadata 和 rootfs payload declarations。
+- `vm-action-request.json` 覆盖 preview-bound restart request。
+- `operation.json` 覆盖 durable asynchronous progress 和 current issuer/subject actor。
+- `audit-page.json` 覆盖 current、typed rejected-request 或 explicitly unknown historical actor，以及 optional reason、target 和 outcome。
+- `system.json` 覆盖 unified service、Caddy、rqlite 和 Incus readiness。
+- `error.json` 覆盖不带 internal diagnostics 的 stale-target conflict。

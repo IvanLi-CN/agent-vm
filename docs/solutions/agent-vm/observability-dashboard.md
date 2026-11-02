@@ -1,5 +1,5 @@
 ---
-title: Provision Agent VM Capacity and Failure Dashboards
+title: Agent VM 容量与故障看板
 module: agent-vm
 problem_type: observability
 component: grafana-prometheus
@@ -15,98 +15,125 @@ related_specs:
   - docs/specs/agent-vm/contracts/observability.md
 ---
 
-# Context
+# 背景
 
-The `incus-agent-vm` dashboard must explain why container creation can fail even when an Incus data pool appears to have free space. It needs to show the CT root filesystem, transient image-unpack staging, physical pool usage, guest rootfs allocation, native admission and cleanup failures as separate facts.
+`incus-agent-vm` 看板必须解释：为什么 Incus data pool 看起来还有空闲空间，创建容器却仍然可能失败。
+看板需要把 CT root filesystem、临时 image unpack staging、physical pool usage、guest rootfs allocation、native admission 和 cleanup failure 作为彼此独立的事实展示。
 
-# Symptoms
+# 症状
 
-- The dashboard reports guest filesystem quota but cannot show the filesystem used by `/var/lib/incus/images`.
-- `incus_project_limit` is `-1` for CPU, memory, disk or instance count, so project metrics do not provide native admission ceilings.
-- Image creation reports `Unable to unpack image, run out of disk space` while the final Incus pool still reports available space.
-- The dashboard is provisioned and its runtime copy cannot be saved safely because provisioning will overwrite it.
-- Auto-refresh was disabled by default and packet-per-second panels multiplied counts by `8`.
+- 看板能够报告 guest filesystem quota，却不能展示 `/var/lib/incus/images` 使用的 filesystem。
+- `incus_project_limit` 在 CPU、memory、disk 或 instance count 上为 `-1`，所以 project metrics 没有提供 native admission ceiling。
+- image creation 报告 `Unable to unpack image, run out of disk space`，但最终 Incus pool 仍报告有 available space。
+- 看板已经完成 provisioning，但 runtime copy 无法安全保存，因为 provisioning 会覆盖它。
+- auto-refresh 默认关闭，packet-per-second panel 把 count rate 错误地乘以了 `8`。
 
-# Root cause
+# 根因
 
-Incus pool metrics and guest filesystem metrics describe different layers. Image unpacking uses the CT-local staging path before final instance storage is allocated, while the native controller keeps admission reservations and state in a separate control boundary. A dashboard that uses only Incus project or guest metrics cannot explain either failure domain or the native limit.
+Incus pool metrics 与 guest filesystem metrics 描述的是不同层次。
+Image unpacking 会在最终分配 instance storage 之前使用 CT-local staging path，而 native controller 在另一个控制边界维护 admission reservation 和状态。
+只使用 Incus project 或 guest metrics 的看板无法解释这两个 failure domain，也无法解释 native limit。
 
-This `agent-vm` checkout owns the native controller, its public contracts, and a parameterized Grafana baseline under `skills/agent-vm/references/observability/`. Updating a Grafana database copy is still temporary, but the public template plus renderer is a repository implementation that can be instantiated by each deployment.
+本仓库拥有 native controller、公开合同以及 `skills/agent-vm/references/observability/` 下的参数化 Grafana 基线。
+直接修改 Grafana database copy 仍然只是临时操作，公共模板与 renderer 才是可以由各部署实例化的仓库实现。
 
-The dashboard also lacked a clear CPU startup-admission explanation: logical CPU reservation, CT-visible CPU capacity and CT-local PSI were shown as if they were one limit. The approved overcommit policy keeps the logical ceiling independent and uses `full.avg10 >= 50%` only when projected CPU is above CT-visible capacity. The `some.avg10` and `full.avg10` series are pressure observations, not CPU usage or allocation counts.
+原看板还没有清晰说明 CPU startup admission：logical CPU reservation、CT-visible CPU capacity 和 CT-local PSI 被看成了同一个 limit。
+批准的 overcommit policy 保持 logical ceiling 独立，只有 projected CPU 超过 CT-visible capacity 且 `full.avg10 >= 50%` 时才阻止启动。
+`some.avg10` 和 `full.avg10` 是 pressure observation，不是 CPU usage 或 allocation count。
 
-The deployment source was located in the operator-owned `obs` stack. Its dashboard path is `grafana/dashboards/incus/incus-agent-vm.json`, and its provisioning provider is `grafana/provisioning/dashboards/incus.yml`; the Grafana service mounts both paths read-only. The recovered dashboard snapshot is useful as deployment evidence and as the visual baseline for the public template, but the deployment instance must remain in the owning repository. If that snapshot is untracked, version it in the owning repository before applying dashboard changes.
+部署方的 dashboard source 位于 operator-owned `obs` stack。
+它的 dashboard path 是 `grafana/dashboards/incus/incus-agent-vm.json`，provisioning provider 是 `grafana/provisioning/dashboards/incus.yml`；Grafana service 以 read-only 方式挂载这两个路径。
+恢复出的 dashboard snapshot 可以作为部署证据和公共模板的视觉基线，但部署实例必须保留在拥有它的仓库中。
+如果 snapshot 尚未被跟踪，应用 dashboard 变更前必须先在拥有它的仓库中完成版本化。
 
-# Resolution
+# 解决方案
 
-## Repository-owned contract
+## 仓库合同
 
-Use [the observability contract](../../specs/agent-vm/contracts/observability.md) as the source for metric names, authority boundaries, line rules and verification. It deliberately separates:
+使用[观测合同](../../specs/agent-vm/contracts/observability.md)作为 metric name、权威边界、limit line 规则和验证方法的来源。
+该文件就是本方案的 `observability contract` 引用入口。
+该合同明确区分以下事实：
 
-- CT root and `/var/lib/incus/images` filesystem capacity.
-- Physical Incus pool total, used and free bytes.
-- Guest rootfs allocation and quota.
-- Native CPU, memory, disk and VM-slot allocation, reservation, remaining and limit.
-- Admission readiness, reclaim-required, draining, operation failures, image-unpack failures, warnings and task states.
-- Logical and currently startable default-container snapshot estimates, with their request/cost inputs and explicit non-authoritative wording.
+- CT root 和 `/var/lib/incus/images` 的 filesystem capacity。
+- Physical Incus pool 的 total、used 和 free bytes。
+- Guest rootfs allocation 和 quota。
+- Native CPU、memory、disk 和 managed-container slot 的 allocation、reservation、remaining 和 limit。
+- Admission readiness、reclaim-required、draining、operation failure、image-unpack failure、warning 和 task state。
+- Logical default-container slot 与当前可启动 default-container slot 的 snapshot estimate，以及它们的 request/cost 输入和非权威声明。
 
-The rendered deployment is split into two dashboards:
+渲染后的部署看板分为两个：
 
-- `Agent VM / Capacity & Admission`: aggregate reservation composition, CT-visible capacity, CPU PSI/startup gate, runtime pressure, disk/image staging and admission/failure state.
-- `Agent VM / Inventory & Operations`: all managed task states, bounded per-task resources/lease/mapping data, structured error code/phase, and pending cleanup/operation state.
+- `Agent VM / Capacity & Admission`：展示 reservation composition、CT-visible capacity、CPU PSI/startup gate、runtime pressure、disk/image staging 以及 admission/failure state。
+- `Agent VM / Inventory & Operations`：展示所有 managed task state、有界的 per-task resource/lease/mapping data、structured error code/phase 以及 pending cleanup/operation state。
 
-The first reads `admin-metrics`; the second reads `admin-status`. A read-only bridge must remove stale task rows after successful scrapes and expose `up=0` and freshness failure when either action fails. It must not add a resident HTTP broker.
+第一个看板使用 `admin-metrics`，第二个看板使用 `admin-status`。
+两个 action 遵循 `independent sampling lanes`；inventory failure `does not erase the last valid capacity families`。
+`agent-vm-deployd` 在后台分别采样两个 action，并通过自己的 `GET /metrics` endpoint 向 Prometheus 输出最终指标。
+慢或失败的 inventory observation 必须 `removes or invalidates task rows`，同时保留最新有效的 capacity families。
+该 endpoint 不在 scrape 请求中触发新的采样，也不引入独立的 controller bridge、Pushgateway 或 textfile relay。
 
-## Deployment implementation
+## 部署实现
 
-1. In the owning deployment repository, copy [the public observability config example](../../../skills/agent-vm/references/observability/observability.config.json.example), fill its deployment-owned values, set `dashboard_path` to the stable `current` directory inside the Grafana container, and render the two dashboard/provisioning outputs with `render_observability_dashboard.ts` or the deployment's documented split-render wrapper. The renderer publishes the dashboard pair through an atomic `current` symlink; install the provisioning YAML with a single temporary-file-plus-rename operation.
-2. Add the native read-only scrape bridge or textfile collector and expose the metric families in the observability contract. Do not add a resident HTTP broker to the one-shot controller solely for dashboard access.
-3. Add CT root and `/var/lib/incus/images` filesystem series to the Prometheus target. Do not derive them from `incus_project_limit`, guest rootfs size or pool free space.
-4. Run `validate_observability_dashboard.ts` against the rendered files, then review the generated diff. Deployment-specific panels may be added in the owning repository when their data authority is documented.
-5. Configure horizontal dashed limit lines only from authoritative metrics or explicit policy thresholds. Do not draw a line for a missing or `-1` Incus project limit.
-6. Reload provisioning and verify the dashboard through Grafana. Confirm that the dashboard metadata remains provisioned, every panel returns fresh data, and an image-unpack failure can be distinguished from pool exhaustion, CT-root exhaustion and guest-level ENOSPC.
+1. 在拥有部署配置的仓库中复制[公共观测配置示例](../../../skills/agent-vm/references/observability/observability.config.json.example)，填写部署方负责的值，把 `dashboard_path` 设置为 Grafana 容器内稳定的 `current` 目录，然后使用 `render_observability_dashboard.ts` 或部署方记录的 split-render wrapper 渲染两个 dashboard 和 provisioning 输出。Renderer 通过原子 `current` symlink 发布 dashboard pair，provisioning YAML 通过一次临时文件加 rename 安装。
+2. 把 Prometheus scrape target 指向部署控制服务的内部 `agent-vm-deployd /metrics` endpoint，并把 `controller_job` 设置为 `agent-vm-deployd`。不要把槽位 textfile、snapshot 文件或独立 bridge 作为第二个 scrape target。
+3. 把 CT root 和 `/var/lib/incus/images` filesystem series 纳入 deployd 的最终输出。不得从 `incus_project_limit`、guest rootfs size 或 pool free space 推导这些 series。
+4. 使用 `validate_observability_dashboard.ts` 检查渲染文件，然后审查生成 diff。部署方可以在拥有部署配置的仓库中增加专用 panel，但必须记录每个 panel 的数据权威。
+5. 只根据 authoritative metric 或明确的 policy threshold 配置横向虚线 limit line。对于缺失或为 `-1` 的 Incus project limit 不得绘制 line。
+6. Reload provisioning 后通过 Grafana 验证看板。必须确认 dashboard metadata 仍被正确 provisioning、每个 panel 都能返回 fresh data，并且可以区分 image-unpack failure、pool exhaustion、CT-root exhaustion 和 guest-level ENOSPC。
 
-## Current memory lines
+## 当前 memory line
 
-The current deployment's CT-visible memory capacity is `32768 MiB` (`32 GiB`) and its configured logical memory budget is also `32768 MiB` with a `2x` `memory_overcommit_ratio`, producing one authoritative logical limit of `65536 MiB` (`64 GiB`). The public template deliberately labels these series as `CT capacity` and `logical limit` and reads their values from the authoritative metrics; it must not bake this deployment policy into a reusable asset. The dashboard must not derive these values from PVE UI working-set values, a project quota of `-1`, or a pressure sample.
+当前部署的 CT-visible memory capacity 是 `32768 MiB`（`32 GiB`），配置的 logical memory budget 同样是 `32768 MiB`，`memory_overcommit_ratio` 为 `2x`，因此唯一权威的 logical limit 是 `65536 MiB`（`64 GiB`）。
+公共模板将这些 series 分别标记为 `CT capacity` 和 `logical limit`，并从 authoritative metric 读取值；不能把该部署策略写死在可复用资源中。
+看板不得从 PVE UI working-set value、值为 `-1` 的 project quota 或 pressure sample 推导这些值。
 
-The capacity view must show the actual CPU and memory walls separately from policy targets, and must show physical pool available bytes separately from guest rootfs allocation. The answer to “how large can the next managed container be?” comes from native `allocated`, `reserved`, `remaining` and `limit` metrics across CPU, memory and disk, together with the controller's readiness and reclaim state. Pool free bytes alone are only physical headroom, not a complete admission result.
+容量视图必须把实际 CPU、memory wall 与 policy target 分开，并把 physical pool available bytes 与 guest rootfs allocation 分开。
+“下一个 managed container 能有多大”必须由 CPU、memory 和 disk 的 native `allocated`、`reserved`、`remaining`、`limit` metrics，以及 controller readiness 和 reclaim state 共同回答。
+Pool free bytes 只是 physical headroom，不是完整的 admission result。
 
-The capacity view must also show the policy default-container request/cost, observed task-state counts, logical default-container slots and currently startable default-container slots. The two slot values are bounded snapshot estimates: calculate the logical estimate from the minimum verified CPU, memory and physical-disk headroom ratios, then apply current CT-visible CPU capacity and the 50 percent startup-pressure policy for the startable estimate. Omit them when inputs are unverified. Never label them as a native or safe maximum.
+容量视图还必须展示 policy default-container request/cost、观测到的 task-state count、logical default-container slot 和当前可启动的 default-container slot。
+这两个 slot value 都是有界的 snapshot estimate：先根据已验证的 CPU、memory 和 physical-disk headroom ratio 的最小值计算 logical estimate，再对 startable estimate 应用当前 CT-visible CPU capacity 和 50 percent startup-pressure policy。
+输入未验证时省略估算，不能把它们称为 native maximum 或 safe maximum。
 
-The inventory view must show active, preparing, closing, deleting, failed, cached and absent records, with active/transitional rows first, failed cleanup next and cached/absent rows collapsed by default. Keep task ID, instance/session identity, state, native status, guest availability, requested resources, effective lease, expiry, SSH mapping and structured last-error code/phase. Render requested CPU as vCPU, requested RAM and disk as GiB, and lease expiry as Unix seconds so the table does not present raw byte counts as ambiguous short values. Do not expose raw error messages, credentials or deployment paths.
+清单视图必须展示 active、preparing、closing、deleting、failed、cached 和 absent record。
+排序时先展示 active/transitional row，再展示 failed cleanup，cached/absent 默认折叠。
+保留 task ID、instance/session identity、state、native status、guest availability、requested resource、effective lease、expiry、SSH mapping 和 structured last-error code/phase。
+Requested CPU 以 vCPU 展示，requested RAM 和 disk 以 GiB 展示，lease expiry 使用 Unix seconds，避免表格把原始 byte count 当成含义不明确的短值。
+不得暴露 raw error message、credentials 或 deployment path。
 
-## Acceptance
+## 验收
 
-The reusable dashboard path is considered complete when the public template renders and passes validation. A deployment is complete only when its rendered source is versioned in the owning provisioning repository and the following are observable without host-manager access:
+公共 dashboard template 能够完成渲染并通过 validation 时，可复用看板路径才算完成。
+部署实现只有在渲染源已经版本化到拥有 provisioning 的仓库，并且无需访问 host manager 即可观察以下事实时才算完成：
 
-- CT root and image-staging used/available bytes.
-- Physical pool total/used/free bytes.
-- Guest rootfs allocation shown separately from physical usage.
-- Allocated, reserved, remaining and limit values for CPU, memory, disk and managed-container slots.
-- Admission ready, reclaim-required and draining state.
-- Operation success/failure by phase, image-unpack failures, warnings, uptime, scrape freshness and task-state counts.
-- Horizontal dashed lines for every available authoritative limit, with no invented line for `-1` or missing values.
-- CT-visible memory capacity and logical memory reservation limit are separate metric-backed lines; pressure and OOM are observations and do not move the logical line.
-- CPU PSI `some.avg10`, `full.avg10`, the 50 percent startup threshold and `startup_blocked` are visible separately from logical CPU remaining; the pressure lines do not move the logical line.
-- The two dashboards use automatic refresh and remain visibly separate after a reload; the inventory table does not retain stale task rows after a successful scrape.
-- The two read-only actions use independent sampling lanes; a slow or failed inventory action does not erase the last valid capacity families, and a failed inventory scrape removes or invalidates task rows instead of silently retaining stale series. Source-specific health and observation timestamps remain distinguishable from aggregate `up=0`.
+- CT root 和 image-staging 的 used/available bytes。
+- Physical pool 的 total/used/free bytes。
+- 与 physical usage 分开显示的 guest rootfs allocation。
+- CPU、memory、disk 和 managed-container slot 的 allocated、reserved、remaining 和 limit。
+- Admission ready、reclaim-required 和 draining state。
+- 按 phase 区分的 operation success/failure、image-unpack failure、warning、uptime、scrape freshness 和 task-state count。
+- 每个可用 authoritative limit 都有 horizontal dashed line，缺失或为 `-1` 的值不生成虚构 line。
+- CT-visible memory capacity 与 logical memory reservation limit 是两条由 metric 支撑的独立 line，pressure 和 OOM 只是 observation，不改变 logical line。
+- CPU PSI `some.avg10`、`full.avg10`、50 percent startup threshold 和 `startup_blocked` 与 logical CPU remaining 分开显示，pressure line 不改变 logical line。
+- 两个 dashboard 使用自动刷新，reload 后仍然彼此独立；成功 observation 后 inventory table 不保留 stale task row。
+- 两个 read-only action 使用独立的 sampling lane；慢或失败的 inventory action 不会擦除最新有效的 capacity family，失败的 inventory observation 会移除或标记 task row 失效，而不是静默保留 stale series。Source-specific health 和 observation timestamp 必须能与 aggregate `up=0` 区分。
+- Prometheus 只抓取 `agent-vm-deployd` 的 `/metrics`，Grafana 只通过 Prometheus datasource 查询，双槽位同时存活时所有槽位级 series 都带 `slot` label。
 
-# Guardrails / Reuse notes
+# 防护规则与复用说明
 
-- Do not edit a provisioned Grafana database and treat the result as a durable implementation.
-- Do not use Incus project quota metrics as native admission limits when the values are `-1`.
-- Do not label guest rootfs allocation as physical disk usage.
-- Do not infer CT root or image-staging capacity from Incus pool capacity.
-- Do not treat CPU PSI as CPU utilization, logical reservation usage or a native managed-container-slot limit.
-- Do not call a derived default-container slot estimate a safe maximum or authoritative Incus capacity.
-- Do not multiply packet-per-second queries by `8`.
-- Keep deployment addresses, credentials, dashboard datasource identity, controller job, rendered dashboard, and collector paths in the deployment repository or protected operator records. Keep only placeholders and generic defaults in the public bundle.
+- 不要修改 provisioned Grafana database 后把结果当作持久实现。
+- 当值为 `-1` 时，不要使用 Incus project quota metric 作为 native admission limit。
+- 不要把 guest rootfs allocation 标记为 physical disk usage。
+- 不要从 Incus pool capacity 推断 CT root 或 image-staging capacity。
+- 不要把 CPU PSI 当作 CPU utilization、logical reservation usage 或 native managed-container-slot limit。
+- 不要把 derived default-container slot estimate 称为 safe maximum 或 authoritative Incus capacity。
+- 不要把 packet-per-second query 乘以 `8`。
+- Deployment address、credential、dashboard datasource identity、controller job、渲染后的 dashboard 和 metrics listener 配置必须保存在部署仓库或受保护的运维记录中；公共资源包只保留占位符和通用默认值。
 
-# References
+# 参考
 
-- [Agent VM observability contract](../../specs/agent-vm/contracts/observability.md)
-- [Agent VM topology and recovery runbook](../../specs/agent-vm/OPERATIONS.md)
-- [Native deployment boundary](../../../skills/agent-vm-ops/references/deployment.md)
-- [Agent VM CPU startup pressure for overcommit ADR](../../adr/0032-agent-vm-cpu-startup-pressure-for-overcommit.md)
+- [Agent VM 观测合同](../../specs/agent-vm/contracts/observability.md)
+- [Agent VM 拓扑与恢复运维手册](../../specs/agent-vm/OPERATIONS.md)
+- [Native 部署边界](../../../skills/agent-vm-ops/references/deployment.md)
+- [Agent VM overcommit CPU startup pressure ADR](../../adr/0032-agent-vm-cpu-startup-pressure-for-overcommit.md)
 - [Agent VM capacity and inventory observability ADR](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)

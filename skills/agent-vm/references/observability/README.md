@@ -1,10 +1,11 @@
-# Agent VM observability bundle
+# Agent VM 观测资源包
 
-This directory contains the portable Grafana source for the Agent VM observability contract. It is a parameterized baseline, not a deployment export.
+本目录包含 Agent VM 观测合同对应的可移植 Grafana 源文件。
+它是带参数的公共基线，不是某个部署的导出文件。
 
-## Render
+## 渲染
 
-Copy [the example configuration](observability.config.json.example), replace every placeholder with values owned by the deployment, and render the bundle into a bundle root:
+复制[示例配置](observability.config.json.example)，替换部署方负责的所有占位符，然后把资源包渲染到输出目录：
 
 ```bash
 bun skills/agent-vm/scripts/render_observability_dashboard.ts \
@@ -13,36 +14,45 @@ bun skills/agent-vm/scripts/render_observability_dashboard.ts \
   --force
 ```
 
-The renderer writes the parameterized capacity dashboard, inventory dashboard, and Grafana file-provider definition. Dashboard JSON files are published below `generated/current`, which is replaced as one atomic symlink; previous releases remain below `generated/.releases`. The deployment implementation must set `dashboard_path` to the container-visible `current` directory and copy the provisioning YAML as one atomic file replacement. This prevents Grafana from observing a half-published dashboard bundle.
+渲染器会生成容量看板、清单看板和 Grafana file-provider 配置。
+看板 JSON 写入 `generated/current`，该路径通过原子符号链接整体替换；旧版本保留在 `generated/.releases` 下。
+部署实现必须把 `dashboard_path` 设置为 Grafana 容器内可见的 `current` 目录，并通过一次临时文件加 rename 原子替换 provisioning YAML。
+这样 Grafana 不会读到只发布了一半的看板资源包。
 
-The deployment repository should review and commit the rendered files together with its Prometheus scrape configuration and read-only controller metrics bridge. The public repository does not receive those rendered files, datasource credentials, hostnames, collector paths, or live inventory.
+部署仓库应当把渲染后的文件与 Prometheus scrape 配置一并审查和提交。
+Prometheus 的 target 必须指向槽位外 `agent-vm-deployd` 服务的内部 `GET /metrics` endpoint；不再部署独立的 controller bridge、Pushgateway 或 textfile relay 作为最终出口。
+公共仓库不接收这些渲染文件、datasource 凭据、主机名、metrics 监听地址或实时清单。
 
-If provisioning activation fails and the previous `current` link cannot be restored, the renderer removes the stable link and retains the staged release for recovery rather than serving a mixed dashboard/provisioning pair.
+如果 provisioning 激活失败且无法恢复旧的 `current` 链接，渲染器会移除稳定链接，并保留 staged release 供恢复，而不是继续提供混合版本的看板和 provisioning 配置。
 
-## Configuration
+## 配置字段
 
-| Field | Meaning |
+| 字段 | 含义 |
 | --- | --- |
-| `dashboard_uid` | Stable Grafana dashboard UID for this deployment. |
-| `dashboard_title` | Dashboard title shown in Grafana. |
-| `grafana_org_id` | Numeric Grafana organization ID that owns the dashboard. |
-| `provider_name` | Grafana provisioning provider name. |
-| `dashboard_folder` | Grafana folder for the dashboard. |
-| `prometheus_datasource_uid` | Existing Prometheus datasource UID. |
-| `controller_job` | Prometheus `job` label for the read-only Agent VM controller bridge. |
-| `dashboard_path` | Container-visible `current` directory that Grafana scans for JSON dashboards; it must point at the stable active-bundle path, not the release parent. |
-| `dashboard_filename` | Optional rendered filename; defaults to `agent-vm-observability.json`. |
-| `inventory_dashboard_uid` | Optional stable UID for the inventory dashboard; defaults to `<dashboard_uid>-inventory`. |
-| `inventory_dashboard_title` | Optional inventory dashboard title; defaults to `<dashboard_title> / Inventory & Operations`. |
-| `inventory_dashboard_filename` | Optional inventory filename; defaults to `agent-vm-observability-inventory.json`. |
+| `dashboard_uid` | 本部署稳定的 Grafana dashboard UID。 |
+| `dashboard_title` | Grafana 中显示的 dashboard 标题。 |
+| `grafana_org_id` | 拥有该 dashboard 的 Grafana organization ID。 |
+| `provider_name` | Grafana provisioning provider 名称。 |
+| `dashboard_folder` | dashboard 所在的 Grafana folder。 |
+| `prometheus_datasource_uid` | 已存在的 Prometheus datasource UID。 |
+| `controller_job` | Prometheus 的 `job` label；默认应为 `agent-vm-deployd`，指向 Deployd 的 `/metrics` target。 |
+| `dashboard_path` | Grafana 扫描 JSON dashboard 的容器内 `current` 目录；必须指向稳定的活动资源包路径，不能指向 release 父目录。 |
+| `dashboard_filename` | 可选的渲染文件名，默认是 `agent-vm-observability.json`。 |
+| `inventory_dashboard_uid` | 可选的清单 dashboard UID，默认是 `<dashboard_uid>-inventory`。 |
+| `inventory_dashboard_title` | 可选的清单 dashboard 标题，默认是 `<dashboard_title> / Inventory & Operations`。 |
+| `inventory_dashboard_filename` | 可选的清单文件名，默认是 `agent-vm-observability-inventory.json`。 |
 
-The template uses a hidden `controller_job` variable so controller queries remain portable while the deployment supplies its actual job label. CPU capacity is read from `agent_vm_admission_cpu_capacity_vcpu`; memory and disk limits are rendered only from their authoritative metric families.
+模板使用隐藏的 `controller_job` 变量，使 controller 查询保持可移植；部署方提供实际的 job label。
+CPU capacity 从 `agent_vm_admission_cpu_capacity_vcpu` 读取，memory 和 disk limit 只从权威 metric family 渲染。
 
-The capacity dashboard separates logical admission from runtime pressure: its summary shows logical RAM remaining, CT-local `MemAvailable`, pressure/OOM state, and compact CPU/disk readiness; the policy snapshot below shows the default request, slot estimates, and task-state counts. The inventory dashboard exposes every lifecycle state through the state filter, shows active and transitional/failed rows by default, and keeps cached/absent history collapsed until selected. Inventory fields are joined by a `task_id|state` snapshot key so a lifecycle transition cannot combine resource data from different states.
+容量看板把逻辑 admission 与运行时压力分开：摘要显示逻辑 RAM 余量、CT-local `MemAvailable`、pressure/OOM 状态以及紧凑的 CPU/disk readiness；policy snapshot 显示默认请求、slot estimate 和 task-state 计数。
+清单看板通过 state filter 展示所有生命周期状态，默认显示 active、transitional 和 failed 行，并把 cached/absent 历史折叠到筛选结果中。
+清单字段使用 `task_id|state` snapshot key join，因此生命周期切换不会把不同状态的资源数据拼接在一起。
 
-## Validate
+## 验证
 
-The renderer validates both dashboards before writing them. A previously rendered bundle can be checked directly:
+渲染器在写入前会验证两个 dashboard。
+已经渲染的资源包也可以直接检查：
 
 ```bash
 bun skills/agent-vm/scripts/validate_observability_dashboard.ts \
@@ -50,7 +60,7 @@ bun skills/agent-vm/scripts/validate_observability_dashboard.ts \
   --provisioning /path/to/deployment/grafana/generated/agent-vm-observability.yml
 ```
 
-Use the inventory profile when checking `agent-vm-observability-inventory.json`:
+验证 `agent-vm-observability-inventory.json` 时使用 inventory profile：
 
 ```bash
 bun skills/agent-vm/scripts/validate_observability_dashboard.ts \
@@ -59,4 +69,4 @@ bun skills/agent-vm/scripts/validate_observability_dashboard.ts \
   --profile inventory
 ```
 
-The validator checks the selected dashboard profile's panel/metric contract, automatic refresh, datasource consistency, the controller variable, and the rule that packet-rate PromQL must not multiply by `8`.
+验证器会检查所选 dashboard profile 的 panel/metric 合同、自动刷新、datasource 一致性、controller 变量，以及 packet-rate PromQL 不能乘以 `8` 的规则。
