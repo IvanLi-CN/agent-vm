@@ -85,6 +85,23 @@ func TestSystemdExecStartMatchesExactSlotCommand(t *testing.T) {
 	}
 }
 
+func TestSystemdSlotStoppedRequiresLoadedDeadUnit(t *testing.T) {
+	properties := map[string]string{
+		"LoadState":    "loaded",
+		"ActiveState":  "inactive",
+		"SubState":     "dead",
+		"MainPID":      "0",
+		"FragmentPath": "/etc/systemd/system/agent-vm-native@.service",
+	}
+	if !systemdSlotStoppedProperties(properties) {
+		t.Fatal("loaded inactive unit was not recognized as stopped")
+	}
+	properties["SubState"] = "failed"
+	if systemdSlotStoppedProperties(properties) {
+		t.Fatal("failed unit was treated as an expected stopped slot")
+	}
+}
+
 func TestActiveSlotRequiresLink(t *testing.T) {
 	runtime := NewHostRuntime(Config{ActivePath: filepath.Join(t.TempDir(), "active")})
 	if _, err := runtime.activeSlot(); err == nil {

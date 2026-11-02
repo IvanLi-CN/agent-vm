@@ -82,6 +82,11 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		observation := SlotObservation{Slot: slot, ObservedUnix: now.Unix()}
 		body, status, requestErr := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil)
 		if requestErr != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) {
+			if requestErr != nil && runtime.systemdSlotStopped(ctx, slot) {
+				observation.MetricFamilies = runtime.slotMetrics(slot)
+				snapshot.Slots[slot] = observation
+				continue
+			}
 			if requestErr == nil {
 				requestErr = fmt.Errorf("slot %s health returned HTTP %d or an invalid health envelope", slot, status)
 			}
@@ -1283,6 +1288,29 @@ func (runtime *HostRuntime) systemdProcessMatches(ctx context.Context, slot stri
 		return errors.New("systemd executable does not match the native slot")
 	}
 	return nil
+}
+
+func (runtime *HostRuntime) systemdSlotStopped(ctx context.Context, slot string) bool {
+	if validSlot(slot) != nil {
+		return false
+	}
+	unit := "agent-vm-native@" + slot + ".service"
+	command := exec.CommandContext(ctx, "systemctl", "show", unit,
+		"--property=LoadState", "--property=ActiveState", "--property=SubState",
+		"--property=MainPID", "--property=FragmentPath")
+	output, err := command.Output()
+	if err != nil {
+		return false
+	}
+	return systemdSlotStoppedProperties(parseSystemdProperties(string(output)))
+}
+
+func systemdSlotStoppedProperties(properties map[string]string) bool {
+	return properties["LoadState"] == "loaded" &&
+		properties["ActiveState"] == "inactive" &&
+		properties["SubState"] == "dead" &&
+		properties["MainPID"] == "0" &&
+		filepath.Clean(properties["FragmentPath"]) == "/etc/systemd/system/agent-vm-native@.service"
 }
 
 func systemdExecStartMatches(value, expected string) bool {
