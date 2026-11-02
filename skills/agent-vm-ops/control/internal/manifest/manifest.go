@@ -103,13 +103,20 @@ var productLegacyArtifacts = []artifactSpec{
 	{name: "unit:agent-vm-native.service", path: "systemd/agent-vm-native.service", role: "unit", mode: 0o644},
 }
 
-var productArtifacts = append(append([]artifactSpec(nil), productLegacyArtifacts...),
+var goArtifacts = append(append([]artifactSpec(nil), productLegacyArtifacts...),
+	artifactSpec{name: "unit:agent-vm-native@.service", path: "systemd/agent-vm-native@.service", role: "unit", mode: 0o644},
+	artifactSpec{name: "agent-vm-deployd", path: "bin/agent-vm-deployd", role: "control", mode: 0o755},
+	artifactSpec{name: "agent-vm-deploy", path: "bin/agent-vm-deploy", role: "control", mode: 0o755},
+	artifactSpec{name: "unit:agent-vm-deployd.service", path: "systemd/agent-vm-deployd.service", role: "unit", mode: 0o644},
+)
+
+var productArtifacts = append(append([]artifactSpec(nil), goArtifacts...),
 	artifactSpec{name: "unit:agent-vm-web.service", path: "systemd/agent-vm-web.service", role: "unit", mode: 0o644},
 	artifactSpec{name: "web-config-example", path: "config/agent-vm-web.json.example", role: "support", mode: 0o640},
 	artifactSpec{name: "web-assets-manifest", path: "web-assets.manifest.json", role: "support", mode: 0o644},
 )
 
-var fixedArtifacts = productLegacyArtifacts
+var fixedArtifacts = goArtifacts
 
 var artifactNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.:@-]{1,120}$`)
 var revisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)

@@ -51,6 +51,22 @@ func TestDefaultsUseSafeDiskWatermarks(t *testing.T) {
 	}
 }
 
+func TestSlotDefaultsUseIsolatedMetricsDirectory(t *testing.T) {
+	value := Defaults()
+	if value.Slot != "blue" || value.MetricsDir != "/run/agent-vm-native/blue/metrics" {
+		t.Fatalf("defaults slot=%q metrics=%q", value.Slot, value.MetricsDir)
+	}
+	value = validConfig()
+	value.Slot = "green"
+	value.MetricsDir = ""
+	if err := value.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if value.MetricsDir != "" {
+		t.Fatalf("explicit empty metrics directory was changed during validation: %q", value.MetricsDir)
+	}
+}
+
 func TestLoadRejectsMissingRawEnvironmentFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"state_db":"/tmp/state.sqlite3"}`), 0o600); err != nil {

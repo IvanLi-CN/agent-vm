@@ -1445,6 +1445,9 @@ export const PRODUCT_LINUX_LEGACY_ARTIFACTS: readonly ArtifactTuple[] = Object.f
 
 export const PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ...PRODUCT_LINUX_LEGACY_ARTIFACTS,
+  ["agent-vm-deployd", "bin/agent-vm-deployd", "control", 0o755],
+  ["agent-vm-deploy", "bin/agent-vm-deploy", "control", 0o755],
+  ["unit:agent-vm-deployd.service", "systemd/agent-vm-deployd.service", "unit", 0o644],
   ["unit:agent-vm-web.service", "systemd/agent-vm-web.service", "unit", 0o644],
   ["web-config-example", "config/agent-vm-web.json.example", "support", 0o640],
   ["web-assets-manifest", "web-assets.manifest.json", "support", 0o644],

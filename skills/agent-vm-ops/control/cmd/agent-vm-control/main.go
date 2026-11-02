@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/httpserver"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/management"
@@ -90,12 +91,12 @@ func serve(args []string) error {
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *manifestPath != installedManifestPath {
-		return errors.New("manifest_invalid: serve requires the fixed installed release manifest path")
-	}
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		return err
+	}
+	if *manifestPath != installedManifestPath && *manifestPath != slotManifestPath(cfg.Slot) {
+		return errors.New("manifest_invalid: serve requires the fixed installed or slot release manifest path")
 	}
 	release, err := manifest.LoadMetadata(*manifestPath)
 	if err != nil {
@@ -185,6 +186,8 @@ func serve(args []string) error {
 		}
 	}
 	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver(), Memory: observe.NewMemoryObserver(), Release: releaseMetadata, LockDir: filepath.Join(cfg.StoragePath, "locks")})
+	roleGate := controllerrole.New(cfg.Slot, time.Now)
+	service.SetMutationGate(roleGate.Valid)
 	imageBackend := management.NewIncusImageBackend(guest, cfg.Management.Upload.StagingPath, cfg.RequiredGuestTools)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -244,21 +247,21 @@ func serve(args []string) error {
 		}
 		var app http.Handler = unified.Handler()
 		go func() {
-			if err := httpserver.ServeApp(ctx, cfg.Socket, service, snapshots, app); err != nil && !errors.Is(err, context.Canceled) {
+			if err := httpserver.ServeAppRole(ctx, cfg.Socket, service, snapshots, app, roleGate); err != nil && !errors.Is(err, context.Canceled) {
 				slog.Error("unified control server stopped", "error", err)
 				stop()
 			}
 		}()
 	} else {
 		go func() {
-			if err := httpserver.Serve(ctx, cfg.Socket, service, snapshots); err != nil && !errors.Is(err, context.Canceled) {
+			if err := httpserver.ServeRole(ctx, cfg.Socket, service, snapshots, roleGate); err != nil && !errors.Is(err, context.Canceled) {
 				slog.Error("control server stopped", "error", err)
 				stop()
 			}
 		}()
 	}
-	schedulerInstance := scheduler.New(service)
-	slog.Info("agent vm control started", "socket", cfg.Socket, "database_backend", stateBackend(cfg.StateDB))
+	schedulerInstance := scheduler.New(service, roleGate)
+	slog.Info("agent vm control started", "socket", cfg.Socket, "database_backend", stateBackend(cfg.StateDB), "slot", cfg.Slot, "controller_lease", "fenced")
 	return schedulerInstance.Run(ctx)
 }
 
@@ -272,6 +275,10 @@ func stateBackend(value string) string {
 func remoteStateDSN(value string) bool {
 	parsed, err := url.Parse(value)
 	return err == nil && (parsed.Scheme == "http" || parsed.Scheme == "https") && parsed.Host != ""
+}
+
+func slotManifestPath(slot string) string {
+	return filepath.Join("/var/lib/agent-vm-native/slots", slot, "release-manifest.json")
 }
 
 func web(args []string) error {

@@ -187,7 +187,7 @@ Format 4 client sidecars 使用与 format 3 相同的 exact product identity 和
 它们不携带 server database 的 `state_compatibility` declaration；该 declaration 只属于 complete product release manifest，并由 installer enforce。
 
 Operator 在固定 path `/usr/local/sbin/agent-vm-release-wrapper` 预安装 root-owned narrow wrapper，并提供 protected deployment configuration。
-Format 1 使用 `/opt/agent-vm-native/agent_vm_control.ts` 和 `/usr/local/bin/bun`；format 2 安装 `/opt/agent-vm-native/bin/agent-vm-control`、fixed bridge 和 `agent-vm-native.service`。
+Format 1 使用 `/opt/agent-vm-native/agent_vm_control.ts` 和 `/usr/local/bin/bun`；format 2 安装 `/opt/agent-vm-native/bin/agent-vm-control`、`agent-vm-deployd`、`agent-vm-deploy`、fixed bridge、蓝绿槽位模板和 Deployd unit。
 Systemd target directory 固定为 `/etc/systemd/system`，activation fence 固定为 `/run/agent-vm-native/release-activation.fence`；wrapper configuration 不能 redirect 这些 targets。
 其 fixed actions 是 `stage`、`verify`、`activate`、`rollback` 和 `status`。
 Callers 只提供 transaction/release identity 和 structured action；wrapper 不接受 arbitrary destinations、shell commands、configuration paths、state database paths 或 VM paths。
@@ -202,7 +202,7 @@ Callers 只提供 transaction/release identity 和 structured action；wrapper �
 
 手工发布器 [`agent_vm_release.py`](../../../../skills/agent-vm-ops/scripts/agent_vm_release.py) 仍是 format-1 发布器和旧版兼容路径，默认构建 legacy format-1 client bundle，并且只能发布通过同一 fixed manifest verifier 的 bundle。
 Format-2 native package 和 product formats 3/4 由各自的专用 builder 构建，并分别执行其 artifact 和 state checks。
-Format-2 bundle 构建器是[`build_go_release.ts`](../../../../skills/agent-vm-ops/scripts/build_go_release.ts)；它使用 `CGO_ENABLED=0` 为 `linux/amd64` 或 `linux/arm64` 构建二进制文件，在不执行候选产物的情况下校验字节和元数据，并同时发布固定 bridge 与 `agent-vm-native.service`。
+Format-2 bundle 构建器是[`build_go_release.ts`](../../../../skills/agent-vm-ops/scripts/build_go_release.ts)；它使用 `CGO_ENABLED=0` 为 `linux/amd64` 或 `linux/arm64` 构建三个二进制文件，在不执行候选产物的情况下校验字节和元数据，并同时发布固定 bridge、蓝绿槽位模板、Deployd unit 和兼容的 native unit。
 当前蓝绿生产激活通过 deployd 执行，而该发布器继续负责产物校验和兼容安装包行为。
 发布必须保留本地校验、远端暂存/校验、通过当前客户端传输执行的排空，以及最多每 1 秒一次的 `admin-metrics` 轮询。
 Format-2 迁移排空预算默认 8100 秒且不得超过 8100 秒；激活另有 300 秒上限。

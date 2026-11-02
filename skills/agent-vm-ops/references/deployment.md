@@ -10,8 +10,8 @@
 | 面 | 部署输入 |
 | --- | --- |
 | 旧版 format-2 控制服务 | `/opt/agent-vm-native/bin/agent-vm-control`，由 `agent-vm-native.service` 启动 |
-| 目标蓝绿槽位服务 | `/opt/agent-vm-native/slots/{blue,green}/bin/agent-vm-control`，由 `agent-vm-native@{blue,green}.service` 启动 |
-| Deployd | `/opt/agent-vm-native/deployd/bin/agent-vm-deployd`，由两个槽位外的 `agent-vm-deployd.service` 启动；Prometheus 从其内部管理监听的 `GET /metrics` 拉取指标 |
+| 目标蓝绿槽位服务 | `/var/lib/agent-vm-native/slots/{blue,green}/bin/agent-vm-control`，由 `agent-vm-native@{blue,green}.service` 启动 |
+| Deployd | `/opt/agent-vm-native/bin/agent-vm-deployd`，由两个槽位外的 `agent-vm-deployd.service` 启动；Prometheus 从其内部管理监听的 `GET /metrics` 拉取指标 |
 | 槽位观测目录 | `/run/agent-vm-native/{blue,green}/metrics`；每个槽位独占自己的 snapshot 目录，deployd 按槽位读取 |
 | 目标部署状态 | `/var/lib/agent-vm-native/deployment/deployment.sqlite3`，独立于业务状态和 rqlite |
 | 兼容 bridge | `/opt/agent-vm-native/agent_vm_control_bridge.ts`；format-1 release 可以保留旧版 Bun controller |

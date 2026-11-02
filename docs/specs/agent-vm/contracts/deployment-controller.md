@@ -2,7 +2,7 @@
 
 本文定义 Deployd（进程名 `agent-vm-deployd`）及其运维 CLI `agent-vm-deploy` 的目标合同。
 Deployd 负责部署协调和部署观测，但不是第二个 Agent VM 生命周期权威、业务状态后端或公共业务 HTTP 服务。
-当前仓库不声称该目标服务已经安装。
+发布包提供该服务、CLI 和槽位模板 unit；实际安装的配置、槽位配置和运行目录仍由部署方提供。
 
 ## 边界
 
@@ -39,8 +39,32 @@ Prometheus 跨主机拉取时，部署必须通过私有网络访问控制并使
 Prometheus 的 scrape job 固定使用 `agent-vm-deployd`。
 Grafana 只查询 Prometheus，不直接访问 deployd socket、槽位 socket、SQLite 数据库或 snapshot 文件。
 
+Prometheus 的部署配置只创建一个 Deployd target，结构等价于：
+
+```yaml
+scrape_configs:
+  - job_name: agent-vm-deployd
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["<deployment-managed-deployd-metrics-address>"]
+```
+
+`<deployment-managed-deployd-metrics-address>` 是部署系统提供的地址，不属于仓库内容。
+不得为两个槽位的 socket、textfile 目录或 JSON snapshot 另建 scrape target。
+
+Grafana 面板通过 Prometheus 查询 Deployd 输出，例如：
+
+- `agent_vm_deployd_slot_ready{slot=~"blue|green"}`：比较两个槽位的就绪状态；
+- `agent_vm_deployd_slot_controller_owned{slot=~"blue|green"}`：确认唯一 controller lease；
+- `agent_vm_deployd_slot_selected{slot=~"blue|green"}`：确认受保护的 `active` 指针；
+- `agent_vm_deployd_transaction_phase` 与 `agent_vm_deployd_recovery_required`：显示事务阶段和恢复阻塞；
+- `agent_vm_deployd_observation_up`：按来源识别观测 lane 故障；
+- `agent_vm_deployd_slot_in_flight_requests` 与 `agent_vm_deployd_slot_pending_operations`：判断旧槽位是否可以 quiescence。
+
+面板必须保留 `slot` 和 `source` 维度，不能把蓝、绿槽位聚合成无法区分来源的单一值。
+
 `deployd.json` 必须为 metrics listener 提供部署配置。
-至少包含 `metrics.listen_address`；当地址不是 loopback 时，还必须包含用于校验 Prometheus client certificate 的 CA、服务端 certificate 和 private key 路径。
+至少包含 `metrics_listen`；当地址不是 loopback 时，还必须包含用于校验 Prometheus client certificate 的 CA、服务端 certificate 和 private key 路径。
 loopback listener 可以使用本机访问控制；私有管理地址必须使用 mTLS 和网络 ACL。
 这些路径、地址和端口是部署输入，不能写入 release manifest、公共 dashboard 或本仓库的测试 fixture。
 
@@ -58,7 +82,9 @@ Deployd 的后台采样分别读取两个槽位的 `admin-metrics`、`admin-stat
 | 指标 | 类型 | 语义 |
 | --- | --- | --- |
 | `agent_vm_deployd_up` | gauge | deployd 进程和 `/metrics` 监听是否可用；Prometheus 无法连接时仍由 Prometheus 自身的 target `up` 表示抓取失败。 |
+| `agent_vm_deployd_snapshot_fresh` | gauge | 组合观测是否仍在 Deployd 的 freshness bound 内。 |
 | `agent_vm_deployd_observation_up` | gauge | 按 `source` 表示某个运行时来源最近一次观测是否成功。 |
+| `agent_vm_deployd_observation_fresh` | gauge | 按 `source` 表示该来源的最近一次观测是否仍在 freshness bound 内。 |
 | `agent_vm_deployd_observation_timestamp_seconds` | gauge | 按 `source` 表示来源快照的实际采样时间。 |
 | `agent_vm_deployd_slot_process_up` | gauge | 按 `slot` 表示槽位进程是否存活且身份可验证。 |
 | `agent_vm_deployd_slot_ready` | gauge | 按 `slot` 表示槽位是否通过当前 release 的 readiness 合同。 |

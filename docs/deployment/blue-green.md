@@ -32,11 +32,11 @@
   slots/{blue,green}/config.json
 /opt/agent-vm-native/
   release-manifest.json
-  deployd/bin/agent-vm-deployd
-  slots/{blue,green}/bin/agent-vm-control
-  slots/{blue,green}/release-manifest.json
+  bin/agent-vm-deployd
 /var/lib/agent-vm-native/
   active -> slots/{blue,green}
+  slots/{blue,green}/bin/agent-vm-control
+  slots/{blue,green}/release-manifest.json
   slots/{blue,green}/app.sock -> /run/agent-vm-native/{blue,green}/app.sock
   deployment/deployment.sqlite3
   rqlite/
@@ -45,7 +45,8 @@
 /run/agent-vm-native/deployd.sock
 ```
 
-`agent-vm-native@.service` 为每个槽位启动一个 Go 服务，并把该槽位的 manifest 绑定到 Go 二进制要求的固定 manifest 路径。
+`agent-vm-native@.service` 为每个槽位启动一个 Go 服务，并把该槽位目录中的 manifest 作为该服务的校验输入。
+Deployd 将候选 format-2 bundle 中经过完整清单校验的文件原子暂存到对应的 `/var/lib/agent-vm-native/slots/<slot>` 目录，然后才启动该槽位。
 服务继续使用现有 Incus 控制边界和 `agent-vm-web` socket 组。
 `agent-vm-deployd.service` 是槽位之外、由 root 拥有的宿主级控制器；它不是边缘代理、业务 API 或 rqlite 写入者。
 Deployd 还从部署配置读取一个仅供 Prometheus 访问的内部管理监听地址，并在该地址提供只读 `GET /metrics`。
@@ -74,6 +75,13 @@ Deployd 的 `/metrics` 只输出最近一次已完成的组合快照，不在 sc
 切换期间两个槽位进程可以同时活跃；deployd 一次只授予一个槽位运行 scheduler 和 scheduler-driven native mutation 的权限。
 槽位必须先取得该角色，才能运行 startup reconciliation 或启用 timer/reconcile/GC 循环；角色丢失时必须先 fence 这些循环。
 之后 deployd 排空旧槽位，并且只有 quiescence 证据完整后才能停止它。
+
+Prometheus 只配置一个 `agent-vm-deployd` scrape job，目标是部署配置提供的 Deployd `/metrics` 地址。
+Grafana 只通过 Prometheus 查询，不读取 Deployd socket、部署 SQLite、槽位 snapshot 或 Caddy 日志。
+切换期间的核心查询是 `agent_vm_deployd_snapshot_fresh`、`agent_vm_deployd_slot_selected`、`agent_vm_deployd_slot_ready`、`agent_vm_deployd_slot_controller_owned`、`agent_vm_deployd_transaction_phase` 和 `agent_vm_deployd_recovery_required`。
+来源故障通过 `agent_vm_deployd_observation_up` 与 `agent_vm_deployd_observation_fresh` 区分；前者表示来源结果，后者表示结果是否仍然新鲜。
+旧槽位是否能够停止，则结合 `agent_vm_deployd_slot_in_flight_requests`、`agent_vm_deployd_slot_pending_operations` 和对应的 `slot` 标签判断。
+槽位 metrics 目录只供 Deployd 采样，不能作为第二个 Prometheus target。
 
 ## CA 与 TLS
 

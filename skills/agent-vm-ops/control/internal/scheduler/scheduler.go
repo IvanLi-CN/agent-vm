@@ -11,11 +11,16 @@ import (
 
 type Scheduler struct {
 	Service *lifecycle.Service
+	Gate    LeaseGate
 	wake    chan struct{}
 }
 
-func New(service *lifecycle.Service) *Scheduler {
-	scheduler := &Scheduler{Service: service, wake: make(chan struct{}, 1)}
+type LeaseGate interface {
+	Valid() bool
+}
+
+func New(service *lifecycle.Service, gate LeaseGate) *Scheduler {
+	scheduler := &Scheduler{Service: service, Gate: gate, wake: make(chan struct{}, 1)}
 	service.SetWake(scheduler.Wake)
 	return scheduler
 }
@@ -32,11 +37,6 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 }
 
 func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInterval time.Duration) error {
-	if err := scheduler.Service.StartupReconcile(ctx); err == nil {
-		scheduler.Service.MarkReady()
-	} else {
-		slog.Warn("startup reconcile failed", "error", err)
-	}
 	go scheduler.sampleLoop(ctx, "admin-metrics", "capacity", 10*time.Second)
 	go scheduler.sampleLoop(ctx, "admin-status", "inventory", 30*time.Second)
 	go scheduler.sampleLoop(ctx, "doctor", "health", 15*time.Second)
@@ -49,6 +49,10 @@ func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInter
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
+			if !scheduler.controllerLeaseValid() {
+				scheduler.Service.MarkNotReady()
+				continue
+			}
 			if !scheduler.Service.Ready() {
 				if err := scheduler.Service.StartupReconcile(ctx); err == nil {
 					scheduler.Service.MarkReady()
@@ -57,13 +61,21 @@ func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInter
 				}
 				continue
 			}
-			_, _ = scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true})
+			if _, err := scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true}); err != nil && protocol.AsError(err).Code == "controller_lease_required" {
+				scheduler.Service.MarkNotReady()
+			}
 		case <-ageTicker.C:
-			if !scheduler.Service.Ready() {
+			if !scheduler.controllerLeaseValid() || !scheduler.Service.Ready() {
 				continue
 			}
-			_, _ = scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-age-gc", "apply": true})
+			if _, err := scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-age-gc", "apply": true}); err != nil && protocol.AsError(err).Code == "controller_lease_required" {
+				scheduler.Service.MarkNotReady()
+			}
 		case <-scheduler.wake:
+			if !scheduler.controllerLeaseValid() {
+				scheduler.Service.MarkNotReady()
+				continue
+			}
 			if !scheduler.Service.Ready() {
 				if err := scheduler.Service.StartupReconcile(ctx); err == nil {
 					scheduler.Service.MarkReady()
@@ -72,9 +84,15 @@ func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInter
 				}
 				continue
 			}
-			_, _ = scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true})
+			if _, err := scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true}); err != nil && protocol.AsError(err).Code == "controller_lease_required" {
+				scheduler.Service.MarkNotReady()
+			}
 		}
 	}
+}
+
+func (scheduler *Scheduler) controllerLeaseValid() bool {
+	return scheduler.Gate != nil && scheduler.Gate.Valid()
 }
 
 func (scheduler *Scheduler) sampleLoop(ctx context.Context, action, source string, interval time.Duration) {

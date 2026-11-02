@@ -31,7 +31,11 @@ export const GO_FIXED_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["sync_worktree.ts", "sync_worktree.ts", "support", 0o755],
   ["agent_vm_control_bridge.ts", "agent_vm_control_bridge.ts", "control", 0o755],
   ["agent-vm-control", "bin/agent-vm-control", "control", 0o755],
+  ["agent-vm-deployd", "bin/agent-vm-deployd", "control", 0o755],
+  ["agent-vm-deploy", "bin/agent-vm-deploy", "control", 0o755],
   ["unit:agent-vm-native.service", "systemd/agent-vm-native.service", "unit", 0o644],
+  ["unit:agent-vm-native@.service", "systemd/agent-vm-native@.service", "unit", 0o644],
+  ["unit:agent-vm-deployd.service", "systemd/agent-vm-deployd.service", "unit", 0o644],
 ]);
 
 export interface GoArtifact {
@@ -201,7 +205,7 @@ export function verify_go_bundle(root: string, manifest: unknown): GoReleaseMani
     if ((info.mode & 0o7777) !== item.mode) throw new GoManifestError("artifact_mode_mismatch", `artifact mode differs: ${item.path}`);
     const digest = createHash("sha256").update(readFileSync(path)).digest("hex");
     if (digest !== item.sha256) throw new GoManifestError("artifact_checksum_mismatch", `artifact checksum differs: ${item.path}`);
-    if (item.path === "bin/agent-vm-control") verifyElfTarget(path, checked.target);
+    if (["bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"].includes(item.path)) verifyElfTarget(path, checked.target);
   }
   return checked;
 }

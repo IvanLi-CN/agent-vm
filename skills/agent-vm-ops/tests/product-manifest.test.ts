@@ -51,7 +51,7 @@ test("format-4 management manifest requires the Linux product target", () => {
   try {
     const artifacts: Artifact[] = PRODUCT_LINUX_ARTIFACTS.map(([name, relative, role, mode]) => {
       const path = join(root, relative);
-      const content = relative === "bin/agent-vm-control"
+      const content = ["bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"].includes(relative)
         ? (() => {
           const bytes = new Uint8Array(20);
           bytes.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]);

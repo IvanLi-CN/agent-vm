@@ -45,6 +45,7 @@ require_command sha512sum
 require_command tar
 require_command openssl
 require_command systemd-analyze
+require_command go
 
 static_result="$proof_dir/static.json"
 bun run "$repository_root/skills/agent-vm-ops/scripts/validate_blue_green_deployment.ts" >"$static_result" || {
@@ -149,17 +150,28 @@ systemd_root="$proof_dir/systemd-root"
 mkdir -p -- \
   "$systemd_root/etc/systemd/system" \
   "$systemd_root/etc/agent-vm-native/slots/test_instance" \
+  "$systemd_root/etc/agent-vm-native/slots/blue" \
+  "$systemd_root/etc/agent-vm-native/slots/green" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/bin" \
+  "$systemd_root/opt/agent-vm-native/bin" \
+  "$systemd_root/var/lib/agent-vm-native/slots/blue/bin" \
+  "$systemd_root/var/lib/agent-vm-native/slots/green/bin" \
   "$systemd_root/usr/bin" \
   "$systemd_root/usr/local/bin"
-cp "$unit_dir/agent-vm-rqlite.service" "$unit_dir/agent-vm-native@.service" "$unit_dir/agent-vm-caddy.service" "$systemd_root/etc/systemd/system/"
+cp "$unit_dir/agent-vm-rqlite.service" "$unit_dir/agent-vm-native@.service" "$unit_dir/agent-vm-deployd.service" "$unit_dir/agent-vm-caddy.service" "$systemd_root/etc/systemd/system/"
 touch \
   "$systemd_root/etc/agent-vm-native/Caddyfile" \
+  "$systemd_root/etc/agent-vm-native/deployd.json" \
   "$systemd_root/etc/agent-vm-native/slots/test_instance/config.json" \
+  "$systemd_root/etc/agent-vm-native/slots/blue/config.json" \
+  "$systemd_root/etc/agent-vm-native/slots/green/config.json" \
   "$systemd_root/opt/agent-vm-native/release-manifest.json" \
-  "$systemd_root/opt/agent-vm-native/slots/test_instance/release-manifest.json"
-touch "$systemd_root/usr/bin/test" "$systemd_root/usr/local/bin/caddy" "$systemd_root/usr/local/bin/rqlited" "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control"
+  "$systemd_root/opt/agent-vm-native/slots/test_instance/release-manifest.json" \
+  "$systemd_root/var/lib/agent-vm-native/slots/blue/release-manifest.json" \
+  "$systemd_root/var/lib/agent-vm-native/slots/green/release-manifest.json"
+touch "$systemd_root/usr/bin/test" "$systemd_root/usr/local/bin/caddy" "$systemd_root/usr/local/bin/rqlited" "$systemd_root/opt/agent-vm-native/bin/agent-vm-deployd" "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control" "$systemd_root/var/lib/agent-vm-native/slots/blue/bin/agent-vm-control" "$systemd_root/var/lib/agent-vm-native/slots/green/bin/agent-vm-control"
 chmod 0755 "$systemd_root/usr/bin/test" "$systemd_root/usr/local/bin/caddy" "$systemd_root/usr/local/bin/rqlited" "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control"
+chmod 0755 "$systemd_root/opt/agent-vm-native/bin/agent-vm-deployd" "$systemd_root/var/lib/agent-vm-native/slots/blue/bin/agent-vm-control" "$systemd_root/var/lib/agent-vm-native/slots/green/bin/agent-vm-control"
 printf '%s\n' \
   'root:x:0:0:root:/root:/bin/sh' \
   'caddy:x:995:995:caddy:/var/lib/caddy:/usr/sbin/nologin' \
@@ -179,6 +191,9 @@ EOF
 systemd-analyze --root="$systemd_root" verify \
   agent-vm-rqlite.service \
   agent-vm-native@test_instance.service \
+  agent-vm-native@blue.service \
+  agent-vm-native@green.service \
+  agent-vm-deployd.service \
   agent-vm-caddy.service \
   >"$proof_dir/systemd-verify.txt" 2>&1 || {
       cat "$proof_dir/systemd-verify.txt" >&2
@@ -375,4 +390,9 @@ bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.t
   restore-check --backup-manifest "$migration_dir/snapshot-manifest.json" \
   --tail-evidence "$tail_evidence" --evidence-public-key "$evidence_public_key" --output "$proof_dir/restore.json" >"$proof_dir/restore-result.json"
 
-printf '{"schema_version":1,"verdict":"pass","caddy":"2.11.7","rqlite":"10.5.2","checks":["pinned artifact checksums","CA and leaf certificates","Caddy configuration","systemd units","authenticated TLS rqlite","blue-green cutover guard","evidence-gated snapshot","restore admissibility"]}\n'
+go -C "$repository_root/skills/agent-vm-ops/control" test ./internal/deployd -run TestDeploydAgentVMAcceptance -count=1 >"$proof_dir/deployd-acceptance.txt" 2>&1 || {
+  cat "$proof_dir/deployd-acceptance.txt" >&2
+  fail "Deployd dual-slot, metrics, rollback and restart acceptance failed"
+}
+
+printf '{"schema_version":1,"verdict":"pass","caddy":"2.11.7","rqlite":"10.5.2","checks":["pinned artifact checksums","CA and leaf certificates","Caddy configuration","systemd units","authenticated TLS rqlite","blue-green cutover guard","Deployd dual-slot controller and metrics","rollback and restart recovery","evidence-gated snapshot","restore admissibility"]}\n'

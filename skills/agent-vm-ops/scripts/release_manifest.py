@@ -141,16 +141,26 @@ GO_RETIRED_UNITS = (
 GO_UNIT_EXEC_START = {
     "agent-vm-native.service":
         "ExecStart=/opt/agent-vm-native/bin/agent-vm-control serve --config /etc/agent-vm-native/config.json --manifest /opt/agent-vm-native/release-manifest.json",
+    "agent-vm-native@.service":
+        "ExecStart=/var/lib/agent-vm-native/slots/%i/bin/agent-vm-control serve --config /etc/agent-vm-native/slots/%i/config.json --manifest /var/lib/agent-vm-native/slots/%i/release-manifest.json",
+    "agent-vm-deployd.service":
+        "ExecStart=/opt/agent-vm-native/bin/agent-vm-deployd --config /etc/agent-vm-native/deployd.json",
 }
 GO_UNIT_CONTENT_SHA256 = {
     "agent-vm-native.service": "834cd02f2afbc10d463d79375e8a1aa9d1e2e94157bfaed96476295744817cc6",
+    "agent-vm-native@.service": "1312d885549089b96d73190bf7c7c4fe49626d7a0624e87d33b9462334f2fc06",
+    "agent-vm-deployd.service": "fd376fdb7733fd7e18503b9681ec8227c39b552107f4bfefae4017c927a0f20c",
 }
 PRODUCT_UNIT_EXEC_START = {
     "agent-vm-native.service": GO_UNIT_EXEC_START["agent-vm-native.service"],
+    "agent-vm-native@.service": GO_UNIT_EXEC_START["agent-vm-native@.service"],
+    "agent-vm-deployd.service": GO_UNIT_EXEC_START["agent-vm-deployd.service"],
     "agent-vm-web.service": "ExecStart=/opt/agent-vm-native/bin/agent-vm-control web --config /etc/agent-vm-native/web.json",
 }
 PRODUCT_UNIT_CONTENT_SHA256 = {
     "agent-vm-native.service": GO_UNIT_CONTENT_SHA256["agent-vm-native.service"],
+    "agent-vm-native@.service": GO_UNIT_CONTENT_SHA256["agent-vm-native@.service"],
+    "agent-vm-deployd.service": GO_UNIT_CONTENT_SHA256["agent-vm-deployd.service"],
     "agent-vm-web.service": "50eecb2b8dd88f0532b4546fb5555e069f3ef557e9228d45ff84e56e6a356d0d",
 }
 HISTORICAL_GO_UNIT_CONTENT_SHA256 = {
@@ -178,7 +188,11 @@ GO_FIXED_ARTIFACTS = frozenset({
     ("sync_worktree.ts", "sync_worktree.ts", "support", 0o755),
     ("agent_vm_control_bridge.ts", "agent_vm_control_bridge.ts", "control", 0o755),
     ("agent-vm-control", "bin/agent-vm-control", "control", 0o755),
+    ("unit:agent-vm-native@.service", "systemd/agent-vm-native@.service", "unit", 0o644),
+    ("agent-vm-deployd", "bin/agent-vm-deployd", "control", 0o755),
+    ("agent-vm-deploy", "bin/agent-vm-deploy", "control", 0o755),
     ("unit:agent-vm-native.service", "systemd/agent-vm-native.service", "unit", 0o644),
+    ("unit:agent-vm-deployd.service", "systemd/agent-vm-deployd.service", "unit", 0o644),
 })
 
 # Format 3 remains a read-only product format. Format 4 adds the management
@@ -200,9 +214,21 @@ PRODUCT_CLIENT_ARTIFACTS = frozenset({
     ("agent_vm.ts", "agent_vm.ts", "client", 0o755),
     *( (name, name, "support", mode) for name, mode in CLIENT_DEPENDENCY_MODES.items() ),
 })
-PRODUCT_LINUX_LEGACY_ARTIFACTS = GO_FIXED_ARTIFACTS
+PRODUCT_LINUX_LEGACY_ARTIFACTS = frozenset({
+    ("agent_vm.ts", "agent_vm.ts", "client", 0o755),
+    ("byte-fs.ts", "byte-fs.ts", "support", 0o644),
+    ("client-io.ts", "client-io.ts", "support", 0o644),
+    ("client-release.ts", "client-release.ts", "support", 0o644),
+    ("client.ts", "client.ts", "support", 0o644),
+    ("guest-source.ts", "guest-source.ts", "support", 0o644),
+    ("sync-native.ts", "sync-native.ts", "support", 0o644),
+    ("sync_worktree.ts", "sync_worktree.ts", "support", 0o755),
+    ("agent_vm_control_bridge.ts", "agent_vm_control_bridge.ts", "control", 0o755),
+    ("agent-vm-control", "bin/agent-vm-control", "control", 0o755),
+    ("unit:agent-vm-native.service", "systemd/agent-vm-native.service", "unit", 0o644),
+})
 PRODUCT_LINUX_ARTIFACTS = frozenset({
-    *PRODUCT_LINUX_LEGACY_ARTIFACTS,
+    *GO_FIXED_ARTIFACTS,
     ("unit:agent-vm-web.service", "systemd/agent-vm-web.service", "unit", 0o644),
     ("web-config-example", "config/agent-vm-web.json.example", "support", 0o640),
     ("web-assets-manifest", "web-assets.manifest.json", "support", 0o644),
@@ -882,7 +908,7 @@ def verify_go_bundle(root: Path, manifest: Mapping[str, Any] | None = None) -> d
     for item in checked["artifacts"]:
         artifact = _resolve_regular(root, item["path"])
         _verify_artifact_file(artifact, item)
-        if item["path"] == "bin/agent-vm-control":
+        if item["path"] in {"bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
             _verify_elf_target(artifact, checked["target"])
     return checked
 
@@ -908,7 +934,7 @@ def verify_product_bundle(
     for item in checked["artifacts"]:
         artifact = _resolve_regular(root, item["path"])
         _verify_artifact_file(artifact, item)
-        if item["path"] == "bin/agent-vm-control":
+        if item["path"] in {"bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
             _verify_elf_target(artifact, checked["target"])
     return checked
 

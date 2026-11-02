@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
@@ -21,7 +22,12 @@ func TestSchedulerReconcilesExpiryAndAgeGC(t *testing.T) {
 	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
 	cfg := config.Defaults()
 	cfg.CacheSeconds = 0
+	gate := controllerrole.New("blue", func() time.Time { return now })
+	if err := gate.Grant(controllerrole.Lease{Slot: "blue", Term: 1, LeaseID: "scheduler-test", Expiry: now.Add(time.Hour), Generation: 1, Nonce: "scheduler-test"}); err != nil {
+		t.Fatal(err)
+	}
 	service := lifecycle.New(store, cfg, lifecycle.Options{Clock: func() time.Time { return now }})
+	service.SetMutationGate(gate.Valid)
 	if _, err := service.Dispatch(context.Background(), protocol.Request{
 		"protocol": protocol.Version, "action": "acquire", "session_id": "scheduled", "generation": int64(0), "operation_id": "scheduled-acquire",
 	}); err != nil {
@@ -35,7 +41,7 @@ func TestSchedulerReconcilesExpiryAndAgeGC(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	instance := New(service)
+	instance := New(service, gate)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := make(chan error, 1)

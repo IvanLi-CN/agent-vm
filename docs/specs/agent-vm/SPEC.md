@@ -13,7 +13,7 @@
 目标控制环境在每个蓝绿槽位运行一个受保护的 Go 常驻服务，并在槽位外运行一个 Go Deployd（`agent-vm-deployd`）；它们的内部 UDS API 都是实现边界，不是公共客户端入口。
 槽位服务拥有业务生命周期状态和 native operation；deployd 只拥有部署事务、槽位观测以及控制器/流量协调，永远不写业务状态或 rqlite。
 内置管理控制台和 direct Agent API 是 active service 通过项目 Caddy 入口提供的目标入口，二者都不得暴露任意内部控制路由。
-当前 checkout 仍暴露既有 protocol-4/UDS 和 SSH 兼容路径；目标 OIDC、Caddy、浏览器 API、direct Agent API、deployd 和 rqlite 拓扑不代表监听器已实现或已部署。
+当前 checkout 已实现 protocol-4/UDS、双槽位 Go 服务、槽位外 deployd 和 SSH 兼容路径；具体 OIDC、Caddy、浏览器 API、direct Agent API、地址、证书和 rqlite 运行拓扑仍由部署配置提供，不能从仓库实现推断为已部署。
 
 部署拓扑是分层的：本机 Codex client 访问已配置的 Agent VM control endpoint；control environment 运行在已观测的 CT109 LXC 内；control environment 拥有按 session 管理的 Incus system containers；CT109 下方的物理或虚拟来源不属于已验证的公共边界。
 control endpoint 只是进入路径，不是底层宿主机或其重建权限的证据。
@@ -464,7 +464,7 @@ Export 直接向 caller stream tar archive，不创建 server-side archive。
 
 - `VER-AGENT-VM-030` 覆盖：`REQ-AGENT-VM-030`，依据[Web Demo decision memo](../../proposals/agent-vm-web-demo.md)、[Web Demo Inspector UX/UI 合同](contracts/web-demo-inspector.md)、Demo runtime/API isolation tests、page-level browser suite、static build 以及现有 management API boundary checks。
 - `VER-AGENT-VM-031` 覆盖: `REQ-AGENT-VM-031`：验证本 SPEC 的部署控制器边界、[部署控制器合同](contracts/deployment-controller.md)、[发布合同中的部署控制器章节](contracts/release.md#deployment-controller-boundary)、[部署观测合同](contracts/observability.md#deployment-control-observation)、[蓝绿部署资源](../../deployment/blue-green.md)，以及隔离的 Go/systemd/双槽位事务和恢复检查；[部署控制器 ADR](../../adr/0045-agent-vm-deployment-controller.md)只提供决策背景。
-  该项属于目标验证计划，在 deployd 入口和测试存在前保持待实现。
+  当前实现证据包括 `agent-vm-deployd`/`agent-vm-deploy`、controller lease fencing、独立部署 SQLite、双槽位事务/恢复测试、Prometheus exposition 测试、发布清单测试和 Agent VM 隔离验收脚本；真实部署地址、证书、配置和长期 Prometheus/Grafana 实例仍属于部署方验证。
 
 ## 视觉证据
 

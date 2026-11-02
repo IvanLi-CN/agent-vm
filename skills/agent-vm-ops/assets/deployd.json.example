@@ -1,0 +1,12 @@
+{
+  "socket": "/run/agent-vm-native/deployd.sock",
+  "metrics_listen": "127.0.0.1:9911",
+  "database": "/var/lib/agent-vm-native/deployment/deployment.sqlite3",
+  "active_path": "/var/lib/agent-vm-native/active",
+  "release_root": "/var/lib/agent-vm-native",
+  "blue_socket": "/run/agent-vm-native/blue/app.sock",
+  "green_socket": "/run/agent-vm-native/green/app.sock",
+  "lease_seconds": 15,
+  "retention_days": 30,
+  "observe_seconds": 5
+}

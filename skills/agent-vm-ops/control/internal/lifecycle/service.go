@@ -97,6 +97,7 @@ type Service struct {
 	resident          bool
 	ready             bool
 	wake              func()
+	mutationGate      func() bool
 }
 
 type internalCleanupContextKey struct{}
@@ -180,12 +181,39 @@ func cloneAuditSummary(summary state.AuditSummary) state.AuditSummary {
 	return clone
 }
 
-func (s *Service) MarkReady()  { s.mu.Lock(); s.ready = true; s.mu.Unlock() }
-func (s *Service) Ready() bool { s.mu.RLock(); defer s.mu.RUnlock(); return s.ready }
+func (s *Service) MarkReady()    { s.mu.Lock(); s.ready = true; s.mu.Unlock() }
+func (s *Service) MarkNotReady() { s.mu.Lock(); s.ready = false; s.mu.Unlock() }
+func (s *Service) Ready() bool   { s.mu.RLock(); defer s.mu.RUnlock(); return s.ready }
 func (s *Service) SetWake(wake func()) {
 	s.mu.Lock()
 	s.wake = wake
 	s.mu.Unlock()
+}
+
+// SetMutationGate installs the process-local controller lease check. Read-only
+// requests remain available to a standby slot, while every journaled or
+// scheduler-driven write fails closed when the lease is absent or expired.
+func (s *Service) SetMutationGate(gate func() bool) {
+	s.mu.Lock()
+	s.mutationGate = gate
+	s.mu.Unlock()
+}
+
+func (s *Service) mutationAllowed() bool {
+	s.mu.RLock()
+	gate := s.mutationGate
+	s.mu.RUnlock()
+	return gate == nil || gate()
+}
+
+func (s *Service) activeOperationCount() int {
+	s.activeMu.Lock()
+	defer s.activeMu.Unlock()
+	count := 0
+	for _, value := range s.activeOps {
+		count += value
+	}
+	return count
 }
 
 // ReservePhysicalStorage serializes an external pool consumer, such as an
@@ -1054,6 +1082,10 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		return nil, protocol.NewError("invalid_request", "admin-metrics is sessionless and read-only", nil)
 	}
 	write := (writeActions[action] || isJournaledTimerAction(action, request)) && !(action == "admin-reconcile" && requestBool(request, "apply") == false && request["operation_id"] == nil)
+	leaseExempt := action == "drain-enter" || action == "drain-exit"
+	if write && !leaseExempt && !s.mutationAllowed() {
+		return nil, protocol.NewError("controller_lease_required", "controller lease is required for mutation", map[string]any{"admission_ready": false})
+	}
 	if write && request["operation_id"] == nil {
 		return nil, protocol.NewError("invalid_request", "write request requires operation_id", nil)
 	}
@@ -1267,6 +1299,9 @@ func hasWarning(existing []any, candidate any) bool {
 // marked ready. Pending journal intents are evidence of an uncertain native
 // outcome and must remain visible for explicit inspection or cleanup.
 func (s *Service) StartupReconcile(ctx context.Context) error {
+	if !s.mutationAllowed() {
+		return protocol.NewError("controller_lease_required", "controller lease is required for startup reconciliation", map[string]any{"admission_ready": false})
+	}
 	// Startup recovery may inspect and stop a pending native worker. Share the
 	// release-sensitive drain boundary with normal lifecycle actions so one
 	// slot cannot recover a worker that another slot is still starting.
@@ -2979,7 +3014,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				if operation.Generation != nil {
 					item["generation"] = *operation.Generation
 				}
-				for _, key := range []string{"task_id", "task_generation", "acquire_resources"} {
+				for _, key := range []string{"task_id", "task_generation", "acquire_resources", "worker"} {
 					if value, ok := operation.Response[key]; ok {
 						item[key] = value
 					}
@@ -3279,7 +3314,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				"reclaim_required": reclaimRequired, "disk_admission": diskAdmission,
 				"default_admission": map[string]any{"requested": defaultRequested, "request_cost_bytes": s.Config.CreateCostBytes, "ready": defaultReady, "reasons": defaultReasons, "reclaim_required": reclaimRequired},
 				"ct_memory":         map[string]any{"capacity_bytes": memoryObservation["limit_bytes"], "current_bytes": memoryObservation["current_bytes"], "available_bytes": memoryObservation["available_bytes"], "pressure_threshold_bytes": memoryObservation["threshold_bytes"], "pressure": memoryObservation["pressure"], "oom_events": memoryObservation["oom_events"]},
-				"task_states":       states, "pending_operations": pendingOperations, "historical_unknown_operations": unknownOperations, "instances": instances, "operations": operationMetrics, "image_unpack_failures": auditSummary.ImageUnpackFailures, "doctor": map[string]any{"ready": len(doctorIssues) == 0, "issues": doctorIssues}, "warnings": warnings,
+				"task_states":       states, "pending_operations": pendingOperations, "historical_unknown_operations": unknownOperations, "in_flight_operations": s.activeOperationCount(), "instances": instances, "operations": operationMetrics, "image_unpack_failures": auditSummary.ImageUnpackFailures, "doctor": map[string]any{"ready": len(doctorIssues) == 0, "issues": doctorIssues}, "warnings": warnings,
 				"warning_counts": warningCounts,
 			}, nil
 		}
