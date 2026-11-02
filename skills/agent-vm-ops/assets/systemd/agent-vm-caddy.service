@@ -4,7 +4,6 @@ After=network-online.target agent-vm-rqlite.service agent-vm-native@blue.service
 Wants=network-online.target agent-vm-rqlite.service
 ConditionPathExists=/etc/agent-vm-native/Caddyfile
 ConditionPathExists=/etc/agent-vm-native/caddy.env
-ConditionPathExists=/var/lib/agent-vm-native/active/app.sock
 RequiresMountsFor=/var/lib/agent-vm-native/active/app.sock
 
 [Service]
@@ -15,7 +14,8 @@ SupplementaryGroups=agent-vm-web
 EnvironmentFile=/etc/agent-vm-native/caddy.env
 ExecStartPre=/usr/bin/test -L /var/lib/agent-vm-native/active
 ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock
-ExecStart=/usr/local/bin/caddy run --environ --config /etc/agent-vm-native/Caddyfile --adapter caddyfile
+ExecStartPre=/bin/sh -c 'test "$(stat -c "%%u:%%g:%%a" /etc/agent-vm-native/caddy.env)" = "0:0:600"'
+ExecStart=/usr/local/bin/caddy run --config /etc/agent-vm-native/Caddyfile --adapter caddyfile
 ExecReload=/usr/local/bin/caddy reload --config /etc/agent-vm-native/Caddyfile --adapter caddyfile
 Restart=on-failure
 RestartSec=2s

@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
@@ -19,6 +20,7 @@ type BuildOptions = {
   caddyVersion: string;
   target: "linux/amd64" | "linux/arm64";
   output: string;
+  expectedSha512?: string;
 };
 
 function usage(): string {
@@ -26,7 +28,8 @@ function usage(): string {
     "usage: bun skills/agent-vm-ops/scripts/build_caddy.ts \\",
     "  --caddy-version <v2.x.y> \\",
     "  --target <linux/amd64|linux/arm64> \\",
-    "  --output <absolute-path>",
+    "  --output <absolute-path> \\",
+    "  [--expected-sha512 <128-character-hex-digest>]",
   ].join("\n");
 }
 
@@ -38,6 +41,7 @@ function parseArgs(args: string[]): BuildOptions {
   let caddyVersion = "";
   let target: BuildOptions["target"] | "" = "";
   let output = "";
+  let expectedSha512 = "";
 
   for (let index = 0; index < args.length; index += 1) {
     const flag = args[index];
@@ -55,6 +59,9 @@ function parseArgs(args: string[]): BuildOptions {
     } else if (flag === "--output") {
       output = value ?? "";
       index += 1;
+    } else if (flag === "--expected-sha512") {
+      expectedSha512 = value ?? "";
+      index += 1;
     } else {
       fail(`unknown argument: ${flag}\n${usage()}`);
     }
@@ -68,11 +75,15 @@ function parseArgs(args: string[]): BuildOptions {
     fail("--target must be linux/amd64 or linux/arm64");
   }
   if (!output || !output.startsWith("/")) fail("--output must be an absolute path");
+  if (expectedSha512 && !/^[0-9a-f]{128}$/.test(expectedSha512)) {
+    fail("--expected-sha512 must be a 128-character lowercase SHA-512 digest");
+  }
 
   return {
     caddyVersion: caddyVersion.startsWith("v") ? caddyVersion : `v${caddyVersion}`,
     target,
     output,
+    expectedSha512: expectedSha512 || undefined,
   };
 }
 
@@ -96,6 +107,18 @@ function readCaddyMetadata(): CaddyMetadata {
     fail("Caddy metadata does not describe the supported xcaddy DNSPod build");
   }
   return caddy as CaddyMetadata;
+}
+
+function moduleVersion(buildInfo: string, modulePath: string): string {
+  const escapedModulePath = modulePath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = buildInfo.match(new RegExp(`^\\s*dep\\s+${escapedModulePath}\\s+(\\S+)`, "m"));
+  return match?.[1] ?? "";
+}
+
+function buildInfoValue(buildInfo: string, key: string): string {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = buildInfo.match(new RegExp(`^\\s*build\\s+${escapedKey}=(\\S+)`, "m"));
+  return match?.[1] ?? "";
 }
 
 export function commandFor(options: BuildOptions, metadata: CaddyMetadata): string[] {
@@ -138,19 +161,40 @@ export function buildCaddy(args: string[], environment: Record<string, string | 
   // verifiable from the operator's build host.
   const buildInfo = Bun.spawnSync(["go", "version", "-m", options.output], { stdout: "pipe", stderr: "pipe" });
   const buildInfoOutput = new TextDecoder().decode(buildInfo.stdout);
-  if (buildInfo.exitCode !== 0 || !/\bdep\s+github\.com\/caddyserver\/caddy\/v2\s+v?2\./.test(buildInfoOutput)) {
+  const observedCaddyVersion = moduleVersion(buildInfoOutput, "github.com/caddyserver/caddy/v2");
+  const observedProviderVersion = moduleVersion(buildInfoOutput, metadata.provider_module);
+  if (buildInfo.exitCode !== 0 || !observedCaddyVersion.startsWith("v2.")) {
     fail(`Caddy build does not contain the Caddy v2 module metadata: ${buildInfoOutput.trim() || "no build metadata"}`);
   }
-  if (buildInfo.exitCode !== 0 || !buildInfoOutput.includes(metadata.provider_module)) {
+  if (observedCaddyVersion !== options.caddyVersion) {
+    fail(`Caddy build version ${observedCaddyVersion || "<missing>"} does not match requested ${options.caddyVersion}`);
+  }
+  if (!observedProviderVersion) {
     fail(`Caddy build does not contain ${metadata.provider_module}: ${buildInfoOutput.trim() || "no build metadata"}`);
+  }
+  const providerRefSuffix = metadata.provider_ref.slice(0, 12);
+  if (!observedProviderVersion.endsWith(`-${providerRefSuffix}`)) {
+    fail(`Caddy build DNSPod module ${observedProviderVersion} does not resolve to pinned ref ${metadata.provider_ref}`);
+  }
+  const sha512 = createHash("sha512").update(readFileSync(options.output)).digest("hex");
+  const buildVcsRevision = buildInfoValue(buildInfoOutput, "vcs.revision");
+  const buildVcsModified = buildInfoValue(buildInfoOutput, "vcs.modified");
+  if (options.expectedSha512 && sha512 !== options.expectedSha512) {
+    fail(`Caddy SHA-512 ${sha512} does not match expected ${options.expectedSha512}`);
   }
   console.log(JSON.stringify({
     schema_version: 1,
     caddy_version: options.caddyVersion,
     requested_version: options.caddyVersion,
+    observed_caddy_version: observedCaddyVersion,
     provider_module: metadata.provider_module,
     provider_module_name: metadata.provider_module_name,
     provider_ref: metadata.provider_ref,
+    observed_provider_version: observedProviderVersion,
+    sha512,
+    build_vcs_revision: buildVcsRevision || null,
+    build_vcs_modified: buildVcsModified || null,
+    ...(options.expectedSha512 ? { expected_sha512: options.expectedSha512 } : {}),
     target: options.target,
     output: options.output,
     verification: "go-version-m",

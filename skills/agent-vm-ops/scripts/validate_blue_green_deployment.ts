@@ -85,7 +85,7 @@ if (metadata && releaseCaddy) {
 
 const caddyfile = read(join(blueGreenRoot, "Caddyfile.example"));
 requireText(caddyfile, "admin off", "Caddy admin API is disabled");
-requireText(caddyfile, "auto_https disable_redirects", "Caddy does not expose an HTTP redirect entry point");
+requireText(caddyfile, "auto_https off", "Caddy does not expose an automatic HTTP listener");
 requireText(caddyfile, "storage file_system /var/lib/agent-vm-native/caddy", "Caddy certificate storage is persistent and explicit");
 requireText(caddyfile, "dns dnspod {env.DNSPOD_TOKEN}", "Caddy owns DNS-01 through the DNSPod provider");
 requireText(caddyfile, "\tlog default", "Caddy access logging uses the filtered logger");
@@ -96,7 +96,9 @@ requireText(caddyfile, "respond 404", "internal routes return 404 at the edge");
 requireText(caddyfile, "request>uri regexp", "request query values are filtered from logs");
 requireText(caddyfile, "request>headers>Authorization delete", "authorization headers are filtered from logs");
 requireText(caddyfile, "request>headers>Cookie delete", "cookie headers are filtered from logs");
-forbidText(caddyfile, "auto_https off", "Caddy automatic HTTPS is not disabled");
+requireText(caddyfile, "request>headers>X-Csrf-Token delete", "CSRF tokens are filtered from logs");
+requireText(caddyfile, "force_automate", "Caddy keeps certificate automation explicit when automatic HTTP is disabled");
+forbidText(caddyfile, "auto_https disable_redirects", "Caddy does not create an automatic HTTP listener");
 forbidText(caddyfile, "/etc/agent-vm-native/tls/caddy", "Caddy does not load a static leaf certificate");
 forbidText(caddyfile, "certbot", "Caddy does not delegate certificate management to certbot");
 forbidText(caddyfile, "lego", "Caddy does not delegate certificate management to lego");
@@ -110,6 +112,7 @@ const caddyEnv = read(join(blueGreenRoot, "caddy.env.example"));
 requireText(caddyEnv, "AGENT_VM_DOMAIN=<operator-provided-hostname>", "Caddy hostname remains an operator input");
 requireText(caddyEnv, "DNSPOD_TOKEN=<operator-managed-dnspod-token>", "DNSPod credentials remain an operator-managed placeholder");
 forbidText(caddyEnv, "api_key", "Caddy environment does not use a legacy DNSPod API key");
+requireCheck(read(join(repositoryRoot, "docs/deployment/blue-green.md")).includes("install -o root -g root -m 0600"), "Caddy environment installation requires root-only mode 0600");
 
 const authText = read(join(blueGreenRoot, "rqlite-auth.json.example"));
 try {
@@ -151,11 +154,13 @@ requireText(caddyUnit, "After=network-online.target", "Caddy waits for network r
 requireText(caddyUnit, "SupplementaryGroups=agent-vm-web", "Caddy can access the protected socket group");
 requireText(caddyUnit, "ConditionPathExists=/etc/agent-vm-native/caddy.env", "Caddy requires its protected environment file");
 requireText(caddyUnit, "EnvironmentFile=/etc/agent-vm-native/caddy.env", "Caddy receives DNSPod credentials from its environment file");
-requireText(caddyUnit, "ConditionPathExists=/var/lib/agent-vm-native/active/app.sock", "Caddy requires an active socket at startup");
 requireText(caddyUnit, "ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock", "Caddy checks the active socket before starting");
+requireText(caddyUnit, "stat -c", "Caddy verifies the environment file metadata before starting");
+requireText(caddyUnit, "0:0:600", "Caddy requires a root-owned mode-0600 environment file");
 requireText(caddyUnit, "ReadOnlyPaths=/etc/agent-vm-native/Caddyfile", "Caddy configuration is read-only");
 requireText(caddyUnit, "ReadOnlyPaths=/etc/agent-vm-native/Caddyfile /etc/agent-vm-native/caddy.env", "Caddy configuration and credentials are read-only");
 requireText(caddyUnit, "ReadWritePaths=/var/lib/agent-vm-native/caddy", "Caddy can persist ACME state in its dedicated directory");
+forbidText(caddyUnit, "--environ", "Caddy does not dump the DNSPod environment at startup");
 forbidText(caddyUnit, "/etc/agent-vm-native/tls/caddy", "Caddy systemd unit does not require static certificate files");
 requireText(caddyUnit, "CapabilityBoundingSet=CAP_NET_BIND_SERVICE", "Caddy has only its bind capability");
 forbidText(caddyUnit, "User=root", "Caddy is not configured as root");
@@ -165,6 +170,7 @@ requireText(sysusers, "u agent-vm-rqlite", "the state authority user is declared
 requireText(sysusers, "u caddy", "the edge proxy user is declared");
 
 const tmpfiles = read(join(assetsRoot, "tmpfiles.d/agent-vm-native.conf"));
+requireText(tmpfiles, "z /etc/agent-vm-native/caddy.env 0600 root root", "tmpfiles locks the Caddy environment to root-only mode 0600");
 forbidText(tmpfiles, "/var/lib/agent-vm-native/active 0750", "tmpfiles does not pre-create the active symlink as a directory");
 requireText(tmpfiles, "/var/lib/agent-vm-native/slots 0750", "slot storage has a fixed owner and mode");
 requireText(tmpfiles, "/var/lib/agent-vm-native/rqlite 0700", "rqlite data has private mode");

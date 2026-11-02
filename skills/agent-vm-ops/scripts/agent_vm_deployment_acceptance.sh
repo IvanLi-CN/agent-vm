@@ -40,6 +40,7 @@ require_command() {
 
 require_command bun
 require_command curl
+require_command python3
 require_command sha256sum
 require_command tar
 require_command openssl
@@ -55,11 +56,29 @@ bun run "$repository_root/skills/agent-vm-ops/scripts/validate_blue_green_deploy
 caddy_version="${CADDY_VERSION:-}"
 [[ -n "$caddy_version" ]] || fail "CADDY_VERSION must be an explicit v2 release selected for this isolated run"
 caddy_binary="$proof_dir/caddy"
+expected_caddy_sha512_args=()
+if [[ -n "${CADDY_SHA512:-}" ]]; then
+  expected_caddy_sha512_args=(--expected-sha512 "$CADDY_SHA512")
+fi
 bun run "$repository_root/skills/agent-vm-ops/scripts/build_caddy.ts" \
   --caddy-version "$caddy_version" \
   --target linux/amd64 \
-  --output "$caddy_binary" >"$proof_dir/caddy-build.json"
+  --output "$caddy_binary" \
+  "${expected_caddy_sha512_args[@]}" >"$proof_dir/caddy-build.json"
 [[ -x "$caddy_binary" ]] || fail "Caddy custom build was not found"
+caddy_build_sha512="$(python3 - "$proof_dir/caddy-build.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    receipt = json.load(handle)
+if receipt.get("observed_caddy_version") != receipt.get("requested_version"):
+    raise SystemExit("Caddy build receipt version mismatch")
+if not receipt.get("sha512") or len(receipt["sha512"]) != 128:
+    raise SystemExit("Caddy build receipt has no SHA-512")
+print(receipt["sha512"])
+PY
+)"
 
 ca_dir="$proof_dir/ca"
 bash "$repository_root/skills/agent-vm-ops/scripts/generate_deployment_ca.sh" \
@@ -77,7 +96,7 @@ backend_socket="$proof_dir/backend.sock"
 smoke_config="$proof_dir/Caddyfile.smoke"
 sed -e "s#/var/lib/agent-vm-native/active/app.sock#$backend_socket#g" "$caddy_config" \
   | awk -v cert="$ca_dir/rqlite/server.crt" -v key="$ca_dir/rqlite/server.key" '
-      /^[[:space:]]*tls \{$/ { print "\ttls " cert " " key; skip_tls=1; next }
+      /^[[:space:]]*tls( force_automate)? \{$/ { print "\ttls " cert " " key; skip_tls=1; next }
       skip_tls && /^[[:space:]]*\}$/ { skip_tls=0; next }
       !skip_tls { print }
     ' >"$smoke_config"
@@ -385,4 +404,4 @@ bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.t
   restore-check --backup-manifest "$migration_dir/snapshot-manifest.json" \
   --tail-evidence "$tail_evidence" --evidence-public-key "$evidence_public_key" --output "$proof_dir/restore.json" >"$proof_dir/restore-result.json"
 
-printf '{"schema_version":1,"verdict":"pass","caddy_major":2,"caddy_build":"operator-selected-v2","rqlite":"10.5.2","checks":["custom Caddy DNSPod build","rqlite artifact checksums","CA and rqlite leaf certificate","Caddy configuration","systemd units","authenticated TLS rqlite","blue-green cutover guard","evidence-gated snapshot","restore admissibility"]}\n'
+printf '{"schema_version":1,"verdict":"pass","caddy_major":2,"caddy_build":"operator-selected-v2","caddy_sha512":"%s","rqlite":"10.5.2","checks":["custom Caddy DNSPod build","rqlite artifact checksums","CA and rqlite leaf certificate","Caddy configuration","systemd units","authenticated TLS rqlite","blue-green cutover guard","evidence-gated snapshot","restore admissibility"]}\n' "$caddy_build_sha512"

@@ -20,7 +20,7 @@ bun skills/agent-vm-ops/scripts/build_caddy.ts \
   --output /tmp/caddy
 ```
 
-The helper passes the DNSPod module and its repository-pinned commit to `xcaddy`, checks the resulting Go build metadata for Caddy v2 and the DNSPod module, and rejects non-v2 or implicit `latest` inputs. The operator must record and verify the custom binary checksum before placing it at `/usr/local/bin/caddy`.
+The helper passes the DNSPod module and its repository-pinned commit to `xcaddy`, checks the resulting Go build metadata for the requested Caddy v2 release and provider commit, emits the custom binary SHA-512 plus Go VCS metadata, and rejects non-v2 or implicit `latest` inputs. When an operator has a pre-recorded digest, pass it as `--expected-sha512 <128-lowercase-hex>` to make the build fail closed on mismatch. The isolated acceptance script accepts the same value through `CADDY_SHA512`. The operator must record and verify the custom binary checksum before placing it at `/usr/local/bin/caddy`.
 
 ## Resource layout
 
@@ -61,9 +61,15 @@ bash skills/agent-vm-ops/scripts/generate_deployment_ca.sh \
 
 Install `ca.crt` and the rqlite leaf pair into the paths named by the units. Keep the CA private key and rqlite private key outside the repository, assign the rqlite key to `agent-vm-rqlite`, and use mode `0600`. Install the CA into the host trust store only when the Go control service must validate the rqlite HTTPS endpoint.
 
-Caddy is the certificate owner. Its custom v2 binary includes `github.com/caddy-dns/dnspod`, and the Caddyfile enables `tls { dns dnspod {env.DNSPOD_TOKEN} }` so Caddy performs ACME DNS-01 through Tencent DNSPod. Put `AGENT_VM_DOMAIN` and the operator-managed `DNSPOD_TOKEN` in the protected `/etc/agent-vm-native/caddy.env`; neither value belongs in this repository. Caddy persists certificates, keys and ACME state in `/var/lib/agent-vm-native/caddy`, and the service account owns that directory. Do not install a static Caddy leaf or an independent ACME client.
+Caddy is the certificate owner. Its custom v2 binary includes `github.com/caddy-dns/dnspod`, and the Caddyfile enables `tls force_automate { dns dnspod {env.DNSPOD_TOKEN} }` so Caddy performs ACME DNS-01 through Tencent DNSPod without creating an HTTP listener. Put `AGENT_VM_DOMAIN` and the operator-managed `DNSPOD_TOKEN` in `/etc/agent-vm-native/caddy.env` with root-only permissions:
 
-The Caddy example disables the admin API and HTTP-to-HTTPS redirects, removes query values and sensitive headers from logs, blocks `/internal/v1/*` at the edge, and forwards public requests to the active Unix socket. It does not add an identity header or disable upstream TLS verification.
+```sh
+install -o root -g root -m 0600 /path/to/caddy.env.example /etc/agent-vm-native/caddy.env
+```
+
+Replace the placeholders using a root-only editor and preserve `root:root` ownership and mode `0600`; neither value belongs in this repository. Caddy persists certificates, keys and ACME state in `/var/lib/agent-vm-native/caddy`, and the service account owns that directory. Do not install a static Caddy leaf or an independent ACME client.
+
+The Caddy example disables the admin API and all automatic HTTP listeners, removes query values and sensitive headers from logs, blocks `/internal/v1/*` at the edge, and forwards public requests to the active Unix socket. It does not add an identity header or disable upstream TLS verification.
 
 ## rqlite boundary
 
@@ -80,7 +86,7 @@ sudo systemctl start agent-vm-native@green.service
 sudo bash skills/agent-vm-ops/scripts/agent_vm_cutover.sh --slot green
 ```
 
-The cutover command must run as root because the internal health endpoint accepts only the protected peer identity. It verifies the candidate manifest, exact socket link, and `{"ready":true}` health response, then atomically replaces `/var/lib/agent-vm-native/active`. Caddy has a startup condition and `ExecStartPre` check for that active Unix socket, so it fails closed when no slot is serving. Caddy resolves the active socket on subsequent requests; it does not need an external proxy or a second router.
+The cutover command must run as root because the internal health endpoint accepts only the protected peer identity. It verifies the candidate manifest, exact socket link, and `{"ready":true}` health response, then atomically replaces `/var/lib/agent-vm-native/active`. Caddy has an `ExecStartPre` check for that active Unix socket, so it fails closed and retries when no slot is serving. Caddy resolves the active socket on subsequent requests; it does not need an external proxy or a second router.
 
 Use `--dry-run` to validate a candidate layout without changing the symlink. A rollback is the same health-gated operation against the previous slot, and is allowed only when the previous release is compatible with the current state protocol. No retrying write request is introduced by the proxy or cutover helper.
 
@@ -113,4 +119,4 @@ Run the following in the session-owned Agent VM, not on the developer host:
 bash skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh
 ```
 
-The check builds the operator-selected amd64 Caddy v2 binary with the DNSPod module, verifies the pinned arm64 and amd64 rqlite checksums, and does not contact DNSPod or request a public certificate. It validates the Caddyfile with a placeholder token, uses a temporary rqlite certificate only for the local smoke test, verifies all three systemd units, starts a loopback-only authenticated TLS rqlite node, exercises the cutover guard, and proves both signed migration-fence rejection and restore admissibility. Set `CADDY_VERSION` to an explicit v2 release before running it. The temporary database, credentials, certificates, logs, signing key, public key, and evidence are removed at exit unless `KEEP_PROOF_DIR=1` is explicitly set inside the isolated VM.
+The check builds the operator-selected amd64 Caddy v2 binary with the DNSPod module, verifies the requested Caddy release and pinned provider ref from Go build metadata, emits the custom binary SHA-512, verifies the pinned arm64 and amd64 rqlite checksums, and does not contact DNSPod or request a public certificate. It validates the Caddyfile with a placeholder token, uses a temporary rqlite certificate only for the local smoke test, verifies all three systemd units, starts a loopback-only authenticated TLS rqlite node, exercises the cutover guard, and proves both signed migration-fence rejection and restore admissibility. Set `CADDY_VERSION` to an explicit v2 release before running it. The temporary database, credentials, certificates, logs, signing key, public key, and evidence are removed at exit unless `KEEP_PROOF_DIR=1` is explicitly set inside the isolated VM.

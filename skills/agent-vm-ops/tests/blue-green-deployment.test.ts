@@ -103,21 +103,24 @@ test("blue-green deployment metadata and static validator enforce the Caddy v2 D
 test("deployment examples keep the edge and state boundaries fail-closed", () => {
   const caddy = read("skills/agent-vm-ops/assets/blue-green/Caddyfile.example");
   expect(caddy).toContain("admin off");
-  expect(caddy).toContain("auto_https disable_redirects");
+  expect(caddy).toContain("auto_https off");
   expect(caddy).toContain("storage file_system /var/lib/agent-vm-native/caddy");
   expect(caddy).toContain("dns dnspod {env.DNSPOD_TOKEN}");
+  expect(caddy).toContain("force_automate");
   expect(caddy).toContain("\tlog default");
   expect(caddy).toContain("reverse_proxy unix//var/lib/agent-vm-native/active/app.sock");
   expect(caddy).toContain("header_up -X-Forwarded-User");
   expect(caddy).not.toContain("header_up X-Forwarded-User");
   expect(caddy).toContain("request>uri regexp");
+  expect(caddy).toContain("request>headers>X-Csrf-Token delete");
   expect(caddy).not.toContain("tls_insecure_skip_verify");
   expect(caddy).toContain("@internal path /internal/v1/*");
   expect(caddy).toContain("respond 404");
-  expect(caddy).not.toContain("auto_https off");
+  expect(caddy).not.toContain("auto_https disable_redirects");
   expect(caddy).not.toContain("/etc/agent-vm-native/tls/caddy");
   expect(caddy).not.toContain("forward_auth");
   expect(caddy).not.toContain("edgeone");
+  expect(read("docs/deployment/blue-green.md")).toContain("install -o root -g root -m 0600");
 
   const rqlite = read("skills/agent-vm-ops/assets/systemd/agent-vm-rqlite.service");
   expect(rqlite).toContain("User=agent-vm-rqlite");
@@ -134,12 +137,15 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(caddyUnit).toContain("After=network-online.target");
   expect(caddyUnit).toContain("ConditionPathExists=/etc/agent-vm-native/caddy.env");
   expect(caddyUnit).toContain("EnvironmentFile=/etc/agent-vm-native/caddy.env");
-  expect(caddyUnit).toContain("ConditionPathExists=/var/lib/agent-vm-native/active/app.sock");
   expect(caddyUnit).toContain("ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock");
+  expect(caddyUnit).toContain("stat -c");
+  expect(caddyUnit).toContain("0:0:600");
+  expect(caddyUnit).not.toContain("--environ");
   expect(caddyUnit).toContain("ReadWritePaths=/var/lib/agent-vm-native/caddy");
   expect(caddyUnit).not.toContain("/etc/agent-vm-native/tls/caddy");
   const sysusers = read("skills/agent-vm-ops/assets/sysusers.d/agent-vm-native.conf");
   expect(sysusers).toContain("u caddy");
+  expect(read("skills/agent-vm-ops/assets/tmpfiles.d/agent-vm-native.conf")).toContain("z /etc/agent-vm-native/caddy.env 0600 root root");
 });
 
 test("Caddy build integration requires an explicit v2 release and embeds DNSPod", () => {
@@ -174,7 +180,7 @@ chmod 0755 "$output"
     writeFileSync(go, `#!/bin/sh
 set -eu
 if [ "\$1" = "version" ] && [ "\$2" = "-m" ]; then
-  printf '%s\\n' 'path caddy' 'dep github.com/caddyserver/caddy/v2 v2.10.0' 'dep github.com/caddy-dns/dnspod v0.0.4'
+  printf '%s\\n' 'path caddy' "dep github.com/caddyserver/caddy/v2 \${CADDY_BUILD_VERSION:-v2.10.0}" "dep github.com/caddy-dns/dnspod \${DNSPOD_BUILD_VERSION:-v0.0.5-0.20260325061251-fb7cc31cc04c}"
   exit 0
 fi
 exit 1
@@ -207,6 +213,48 @@ exit 1
       "--with",
       "github.com/caddy-dns/dnspod@fb7cc31cc04c68a304b8d2672c3e5d9f2ad3d7ba",
     ]);
+    const buildReceipt = JSON.parse(new TextDecoder().decode(built.stdout));
+    expect(buildReceipt.observed_caddy_version).toBe("v2.10.0");
+    expect(buildReceipt.observed_provider_version).toContain("-fb7cc31cc04c");
+    expect(buildReceipt.sha512).toMatch(/^[0-9a-f]{128}$/);
+
+    const mismatchedVersion = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      join(temporaryRoot, "mismatched-version-caddy"),
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        XCADDY_ARGS_FILE: argsPath,
+        CADDY_BUILD_VERSION: "v2.10.1",
+      },
+    });
+    expect(mismatchedVersion.exitCode).not.toBe(0);
+
+    const mismatchedProvider = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      join(temporaryRoot, "mismatched-provider-caddy"),
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        XCADDY_ARGS_FILE: argsPath,
+        DNSPOD_BUILD_VERSION: "v0.0.5-0.20260325061251-000000000000",
+      },
+    });
+    expect(mismatchedProvider.exitCode).not.toBe(0);
 
     const rejected = run([
       process.execPath,
