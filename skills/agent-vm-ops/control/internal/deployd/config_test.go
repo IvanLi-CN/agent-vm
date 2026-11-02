@@ -32,6 +32,14 @@ func TestConfigRejectsInvalidMetricsACLAndPartialTLS(t *testing.T) {
 	}
 }
 
+func TestConfigRejectsNonSingletonLockPath(t *testing.T) {
+	config := Defaults()
+	config.LockPath = "/tmp/second-deployd.lock"
+	if err := config.Validate(); err == nil {
+		t.Fatal("deployd accepted a configurable singleton lock path")
+	}
+}
+
 func TestMetricsAddressRequiresTLSTreatsWildcardAsNonLoopback(t *testing.T) {
 	for _, address := range []string{":9911", "0.0.0.0:9911", "[::]:9911", "192.0.2.10:9911"} {
 		if !MetricsAddressRequiresTLS(address) {

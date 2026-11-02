@@ -53,3 +53,13 @@ func TestCompareReleaseTreesRejectsStagedTampering(t *testing.T) {
 		t.Fatal("release tree with an undeclared member was accepted")
 	}
 }
+
+func TestParseSystemdProperties(t *testing.T) {
+	properties := parseSystemdProperties("ActiveState=active\nMainPID=42\nExecStart={ path=/var/lib/agent-vm-native/slots/blue/bin/agent-vm-control ; argv[]=/var/lib/agent-vm-native/slots/blue/bin/agent-vm-control serve }\n")
+	if properties["ActiveState"] != "active" || properties["MainPID"] != "42" {
+		t.Fatalf("parsed systemd properties = %#v", properties)
+	}
+	if properties["ExecStart"] == "" {
+		t.Fatal("ExecStart property was not retained")
+	}
+}

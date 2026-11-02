@@ -17,6 +17,7 @@ type fakeRuntime struct {
 	failSwitch   bool
 	sequence     []string
 	traffic      map[string]bool
+	releaseIDs   map[string]string
 }
 
 func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
@@ -28,6 +29,9 @@ func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 			value.TrafficAccepting = runtime.traffic[slot]
 		}
 		value.ReleaseID = "release-" + slot
+		if releaseID := runtime.releaseIDs[slot]; releaseID != "" {
+			value.ReleaseID = releaseID
+		}
 		value.SourceRevision = "revision-1"
 		value.StateEpoch = "epoch-1"
 		value.StateCapabilities = []string{"reads@1", "writes@1"}
@@ -214,6 +218,98 @@ func TestManagerRollsBackFinalizedTransaction(t *testing.T) {
 	}
 }
 
+func TestManagerResumesRollbackAfterRestart(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "green", observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+	}}
+	transaction := store.Transaction{ID: "tx-resume-rollback", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseActiveSwitch, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
+	if err := database.Create(context.Background(), transaction, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.BeginRollback(context.Background(), transaction.ID, transaction.Phase, PhaseRollback, "rollback_started", "test", nil, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.RecordFailure(context.Background(), transaction.ID, PhaseRollback, "state_unverified", "test", "digest", map[string]any{"message": "deployment state could not be verified"}, now); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	updated, err := manager.Rollback(context.Background(), transaction.ID)
+	if err != nil {
+		t.Fatalf("rollback resume failed: %v", err)
+	}
+	if updated.State != "finalized" || updated.Phase != PhaseFinalize || !updated.RollbackUsed {
+		t.Fatalf("resumed rollback transaction = %#v", updated)
+	}
+	if runtime.active != "blue" || !runtime.traffic["blue"] {
+		t.Fatalf("resumed rollback runtime active=%s traffic=%#v", runtime.active, runtime.traffic)
+	}
+}
+
+func TestManagerRejectsRollbackWithoutPreviousBeforeEffects(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "green", observations: map[string]SlotObservation{
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+	}}
+	transaction := store.Transaction{ID: "tx-no-previous", TargetSlot: "green", PreviousSlot: "none", Bundle: "/bundle", Phase: PhaseActiveSwitch, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
+	if err := database.Create(context.Background(), transaction, nil); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if _, err := manager.Rollback(context.Background(), transaction.ID); err == nil {
+		t.Fatal("rollback without a previous slot unexpectedly succeeded")
+	}
+	if len(runtime.sequence) != 0 {
+		t.Fatalf("rollback without previous slot caused effects: %v", runtime.sequence)
+	}
+	current, err := database.Get(context.Background(), transaction.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.RollbackUsed || current.Phase != PhaseActiveSwitch {
+		t.Fatalf("rollback without previous slot changed transaction: %#v", current)
+	}
+}
+
+func TestManagerRejectsCandidateIdentityChangedAfterVerify(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", releaseIDs: map[string]string{}, observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	transaction, err := manager.Stage(context.Background(), "green", "/bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Verify(context.Background(), transaction.ID); err != nil {
+		t.Fatal(err)
+	}
+	runtime.releaseIDs["green"] = "release-replaced"
+	if _, err := manager.Activate(context.Background(), transaction.ID); err == nil {
+		t.Fatal("activation accepted a release changed after verify")
+	}
+	if len(runtime.sequence) != 3 || runtime.sequence[2] != "verify" {
+		t.Fatalf("activation performed native effects after identity mismatch: %v", runtime.sequence)
+	}
+}
+
 func TestManagerReconcilesControllerOnlyAfterFreshObservation(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
@@ -300,7 +396,7 @@ func TestManagerRecoveryFinalizeReestablishesControllerAfterRestart(t *testing.T
 		t.Fatalf("restart recovery error = %v", err)
 	}
 	runtime.active = "green"
-	runtime.traffic = map[string]bool{"blue": false, "green": true}
+	runtime.traffic = map[string]bool{"blue": false, "green": false}
 	updated, err := manager.Recover(context.Background(), transaction.ID, "finalize")
 	if err != nil {
 		t.Fatal(err)
@@ -310,6 +406,9 @@ func TestManagerRecoveryFinalizeReestablishesControllerAfterRestart(t *testing.T
 	}
 	if !runtime.observations["green"].ControllerOwned || runtime.observations["blue"].ControllerOwned {
 		t.Fatalf("controller ownership after recovery = %#v", runtime.observations)
+	}
+	if !runtime.traffic["green"] {
+		t.Fatal("recovery finalize did not restore target traffic")
 	}
 }
 

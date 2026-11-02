@@ -111,6 +111,22 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		observation.TrafficAccepting, _ = body["traffic_accepting"].(bool)
 		observation.ReleaseID, _ = body["release_id"].(string)
 		observation.SourceRevision, _ = body["source_revision"].(string)
+		process, processOK := processIdentityFromHealth(body)
+		if !processOK || runtime.systemdProcessMatches(ctx, slot, process) != nil {
+			if slot == active || active == "none" || active == "unknown" {
+				slotContractsUp = false
+				snapshot.Consistent = false
+			}
+			observation.ProcessUp = false
+			observation.ProcessReady = false
+			observation.Ready = false
+			observation.ControllerOwned = false
+			observation.TrafficAccepting = false
+			runtime.clearSlotMetrics(slot)
+			observation.MetricFamilies = runtime.slotMetrics(slot)
+			snapshot.Slots[slot] = observation
+			continue
+		}
 		metrics, metricsAt, metricsErr := runtime.observeSource(ctx, slot, "capacity", "admin-metrics")
 		if metricsErr == nil {
 			runtime.rememberMetrics(slot, "capacity", observe.MetricsForSnapshot("capacity", metrics))
@@ -885,8 +901,12 @@ func (runtime *HostRuntime) Stop(ctx context.Context, slot string) error {
 }
 
 func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease) error {
-	if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
-		return err
+	if target != "" && target != "none" {
+		if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
+			if stopErr := runtime.Stop(ctx, target); stopErr != nil {
+				return fmt.Errorf("revoke target controller: %w; stop target after revoke failure: %v", err, stopErr)
+			}
+		}
 	}
 	if previous != "" && previous != "none" {
 		if err := runtime.systemctl(ctx, "start", "agent-vm-native@"+previous+".service"); err != nil {
@@ -905,7 +925,7 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 	if err := runtime.SwitchActive(ctx, previous); err != nil {
 		return err
 	}
-		if _, _, err := runtime.control(ctx, runtime.socket(previous), map[string]any{"protocol": 4, "action": "drain-exit", "session_id": deploydDrainSession, "operation_id": "deployd-drain-exit-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0)}); err != nil {
+	if _, _, err := runtime.control(ctx, runtime.socket(previous), map[string]any{"protocol": 4, "action": "drain-exit", "session_id": deploydDrainSession, "operation_id": "deployd-drain-exit-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0)}); err != nil {
 		return fmt.Errorf("exit rollback drain on slot %s: %w", previous, err)
 	}
 	if target != "" && target != "none" && target != previous {
@@ -948,7 +968,9 @@ func (runtime *HostRuntime) waitSlotIdentity(ctx context.Context, slot string, p
 		body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil)
 		if err == nil && (status == http.StatusOK || status == http.StatusServiceUnavailable) && healthEnvelopeValid(body) {
 			if identity, ok := processIdentityFromHealth(body); ok && (!requireChanged || !sameProcess(identity, previous)) {
-				return identity, nil
+				if err := runtime.systemdProcessMatches(ctx, slot, identity); err == nil {
+					return identity, nil
+				}
 			}
 		}
 		select {
@@ -1164,7 +1186,7 @@ func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, pat
 }
 
 func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) error {
-	if action != "start" && action != "stop" {
+	if action != "start" && action != "stop" && action != "restart" {
 		return errors.New("unsupported systemd action")
 	}
 	if !strings.HasPrefix(unit, "agent-vm-native@") || !strings.HasSuffix(unit, ".service") {
@@ -1177,6 +1199,50 @@ func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) 
 		return fmt.Errorf("systemctl %s %s failed: %w", action, unit, err)
 	}
 	return nil
+}
+
+func (runtime *HostRuntime) systemdProcessMatches(ctx context.Context, slot string, identity processIdentity) error {
+	if err := validSlot(slot); err != nil {
+		return err
+	}
+	unit := "agent-vm-native@" + slot + ".service"
+	command := exec.CommandContext(ctx, "systemctl", "show", unit,
+		"--property=ActiveState", "--property=SubState", "--property=MainPID",
+		"--property=ControlGroup", "--property=FragmentPath", "--property=ExecStart")
+	output, err := command.Output()
+	if err != nil {
+		return errors.New("systemd unit status is unavailable")
+	}
+	properties := parseSystemdProperties(string(output))
+	if properties["ActiveState"] != "active" || properties["SubState"] != "running" {
+		return errors.New("systemd slot unit is not active")
+	}
+	mainPID, err := strconv.ParseInt(properties["MainPID"], 10, 64)
+	if err != nil || mainPID <= 0 || mainPID != identity.PID {
+		return errors.New("systemd main process does not match slot health")
+	}
+	if filepath.Base(properties["FragmentPath"]) != "agent-vm-native@.service" {
+		return errors.New("systemd unit template is not the native slot unit")
+	}
+	if !strings.HasSuffix(properties["ControlGroup"], "/agent-vm-native@"+slot+".service") {
+		return errors.New("systemd cgroup does not match the native slot unit")
+	}
+	expectedBinary := filepath.Join(runtime.Config.ReleaseRoot, "slots", slot, "bin", "agent-vm-control")
+	if !strings.Contains(properties["ExecStart"], expectedBinary) {
+		return errors.New("systemd executable does not match the native slot")
+	}
+	return nil
+}
+
+func parseSystemdProperties(output string) map[string]string {
+	properties := make(map[string]string)
+	for _, line := range strings.Split(output, "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if ok && key != "" {
+			properties[key] = value
+		}
+	}
+	return properties
 }
 
 func integer(value any) int64 {

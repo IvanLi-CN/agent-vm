@@ -248,6 +248,13 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	if transaction.Phase != PhaseControllerHandoff {
 		return nil, fmt.Errorf("transaction %s is in phase %s", id, transaction.Phase)
 	}
+	verifiedReleaseID, verifiedSourceRevision, identityErr := manager.verifiedCandidateIdentity(ctx, id)
+	if identityErr != nil {
+		return nil, manager.failure(ctx, id, transaction.Phase, identityErr)
+	}
+	if err := manager.Runtime.Verify(ctx, transaction.TargetSlot, transaction.Bundle); err != nil {
+		return nil, manager.failure(ctx, id, transaction.Phase, err)
+	}
 	observation, err := manager.observe(ctx, id)
 	if err != nil {
 		return nil, manager.failure(ctx, id, transaction.Phase, err)
@@ -255,6 +262,11 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	if !validObservation(observation, manager.Clock().UTC()) || observation.ActiveSlot != transaction.PreviousSlot {
 		return nil, manager.failure(ctx, id, transaction.Phase, errors.New("active slot changed outside deployd"))
 	}
+	target, targetOK := observation.Slots[transaction.TargetSlot]
+	if !targetOK || !target.ProcessUp || !target.ProcessReady || !target.Ready || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch == "" {
+		return nil, manager.failure(ctx, id, transaction.Phase, errors.New("candidate identity or readiness changed after verification"))
+	}
+	var ok bool
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
 		term, termErr := manager.nextFenceTerm(ctx)
 		if termErr != nil {
@@ -275,8 +287,8 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	if err != nil {
 		return nil, manager.rollbackOrFence(ctx, *transaction, err)
 	}
-	target, ok := observation.Slots[transaction.TargetSlot]
-	if !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || target.ReleaseID == "" || target.SourceRevision == "" || target.StateEpoch == "" {
+	target, ok = observation.Slots[transaction.TargetSlot]
+	if !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch == "" {
 		return nil, manager.rollbackOrFence(ctx, *transaction, errors.New("candidate controller lease was not observed"))
 	}
 	if err := manager.waitForReady(ctx, id, transaction.TargetSlot); err != nil {
@@ -357,7 +369,7 @@ func (manager *Manager) Rollback(ctx context.Context, id string) (*store.Transac
 	if err != nil || transaction == nil {
 		return transaction, errOrNotFound(err, id, transaction)
 	}
-	if transaction.RollbackUsed {
+	if transaction.RollbackUsed && transaction.Phase != PhaseRollback {
 		return nil, errors.New("transaction rollback is already used")
 	}
 	if err := manager.rollback(ctx, *transaction); err != nil {
@@ -378,7 +390,7 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 	}
 	switch action {
 	case "rollback":
-		if transaction.RollbackUsed {
+		if transaction.RollbackUsed && transaction.Phase != PhaseRollback {
 			return nil, errors.New("transaction rollback is already used")
 		}
 		if err := manager.rollback(ctx, *transaction); err != nil {
@@ -387,7 +399,7 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 		return manager.Store.Get(ctx, id)
 	case "finalize":
 		observation, observeErr := manager.observe(ctx, id)
-		if observeErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), false) {
+		if observeErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), false, false) {
 			return nil, errors.New("recovery evidence is not sufficient to finalize")
 		}
 		term, termErr := manager.nextFenceTerm(ctx)
@@ -404,8 +416,18 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 		if err := manager.Runtime.GrantController(ctx, transaction.TargetSlot, lease); err != nil {
 			return nil, fmt.Errorf("regrant the selected controller before recovery finalize: %w", err)
 		}
+		if err := manager.waitForReady(ctx, id, transaction.TargetSlot); err != nil {
+			failureErr := manager.failure(ctx, id, transaction.Phase, &UncertainError{Cause: err})
+			fenceErr := manager.fenceSlots(ctx, errors.New("recovery finalize readiness was not verified"))
+			return nil, fmt.Errorf("%w; %v", failureErr, fenceErr)
+		}
+		if err := manager.Runtime.EnableTraffic(ctx, transaction.TargetSlot); err != nil {
+			failureErr := manager.failure(ctx, id, transaction.Phase, &UncertainError{Cause: err})
+			fenceErr := manager.fenceSlots(ctx, errors.New("recovery finalize traffic role was not restored"))
+			return nil, fmt.Errorf("%w; %v", failureErr, fenceErr)
+		}
 		observation, observeErr = manager.observe(ctx, id)
-		if observeErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), true) {
+		if observeErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), true, true) {
 			failureErr := manager.failure(ctx, id, transaction.Phase, &UncertainError{Cause: errors.New("recovery finalize controller evidence was not verified")})
 			fenceErr := manager.fenceSlots(ctx, errors.New("recovery finalize was fenced"))
 			return nil, fmt.Errorf("%w; %v", failureErr, fenceErr)
@@ -618,18 +640,50 @@ func (manager *Manager) transition(ctx context.Context, id, expected, phase, tra
 	return manager.Store.Transition(ctx, id, expected, phase, stateForPhase(phase), transition, "deployd", evidence, manager.Clock().UTC())
 }
 
+func (manager *Manager) verifiedCandidateIdentity(ctx context.Context, id string) (string, string, error) {
+	event, err := manager.Store.LatestEvent(ctx, id, PhaseControllerHandoff, "verified")
+	if err != nil {
+		return "", "", fmt.Errorf("read verified candidate identity: %w", err)
+	}
+	if event == nil {
+		return "", "", errors.New("verified candidate identity is missing")
+	}
+	releaseID, releaseOK := event.Evidence["release_id"].(string)
+	sourceRevision, sourceOK := event.Evidence["source_revision"].(string)
+	if !releaseOK || releaseID == "" || !sourceOK || sourceRevision == "" {
+		return "", "", errors.New("verified candidate identity is incomplete")
+	}
+	return releaseID, sourceRevision, nil
+}
+
 func (manager *Manager) failure(ctx context.Context, id, phase string, cause error) error {
 	code := "deployment_failed"
 	if phase == PhaseRollback || errors.Is(cause, ErrUncertain) {
 		code = "state_unverified"
 	}
-	payload := map[string]any{"message": cause.Error(), "uncertain": code == "state_unverified"}
+	payload := map[string]any{"message": failureMessage(phase, code), "uncertain": code == "state_unverified"}
 	encoded, _ := json.Marshal(payload)
 	digest := sha256.Sum256(encoded)
 	if err := manager.Store.RecordFailure(ctx, id, phase, code, "deployd", hex.EncodeToString(digest[:]), payload, manager.Clock().UTC()); err != nil {
 		return fmt.Errorf("%w; record deployment failure: %v", cause, err)
 	}
 	return cause
+}
+
+func failureMessage(phase, code string) string {
+	if code == "state_unverified" {
+		return "deployment state could not be verified"
+	}
+	switch phase {
+	case PhaseStage:
+		return "deployment stage failed"
+	case PhaseStandbyValidation:
+		return "deployment verification failed"
+	case PhaseControllerHandoff, PhaseTrafficEnable, PhaseActiveSwitch, PhaseDrainOld, PhaseQuiescence:
+		return "deployment activation failed"
+	default:
+		return "deployment operation failed"
+	}
 }
 
 func (manager *Manager) effectFailure(ctx context.Context, id, phase string, cause error) error {
@@ -656,6 +710,11 @@ func (manager *Manager) rollbackOrFence(ctx context.Context, transaction store.T
 	} else if current != nil {
 		transaction = *current
 	}
+	if transaction.PreviousSlot == "" || transaction.PreviousSlot == "none" {
+		failureErr := manager.failure(ctx, transaction.ID, transaction.Phase, cause)
+		fenceErr := manager.fenceSlots(ctx, errors.New("deployment has no previous active slot; controller roles were fenced"))
+		return fmt.Errorf("%w; %v", failureErr, fenceErr)
+	}
 	if errors.Is(cause, ErrUncertain) || errors.As(cause, new(*UncertainError)) {
 		failureErr := manager.failure(ctx, transaction.ID, transaction.Phase, cause)
 		fenceErr := manager.fenceSlots(ctx, errors.New("deployment outcome is uncertain; controller roles were fenced"))
@@ -664,7 +723,7 @@ func (manager *Manager) rollbackOrFence(ctx context.Context, transaction store.T
 		}
 		return failureErr
 	}
-	if transaction.RollbackUsed {
+	if transaction.RollbackUsed && transaction.Phase != PhaseRollback {
 		return manager.failure(ctx, transaction.ID, transaction.Phase, cause)
 	}
 	if current, err := manager.Store.Get(ctx, transaction.ID); err != nil {
@@ -679,23 +738,27 @@ func (manager *Manager) rollbackOrFence(ctx context.Context, transaction store.T
 }
 
 func (manager *Manager) rollback(ctx context.Context, transaction store.Transaction) error {
-	term, termErr := manager.nextFenceTerm(ctx)
-	if termErr != nil {
-		return fmt.Errorf("allocate rollback fencing term: %w", termErr)
+	if transaction.PreviousSlot == "" || transaction.PreviousSlot == "none" {
+		return errors.New("rollback requires a previous active slot")
 	}
-	lease := controllerrole.Lease{Slot: transaction.TargetSlot, Term: term}
-	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
-		lease, termErr = manager.newLease(ctx, transaction.PreviousSlot, transaction.Generation)
-		if termErr != nil {
-			return fmt.Errorf("allocate rollback controller lease: %w", termErr)
+	lease, err := manager.newLease(ctx, transaction.PreviousSlot, transaction.Generation)
+	if err != nil {
+		return fmt.Errorf("allocate rollback controller lease: %w", err)
+	}
+	resuming := transaction.RollbackUsed && transaction.Phase == PhaseRollback
+	if !resuming {
+		if _, err := manager.Store.BeginRollback(ctx, transaction.ID, transaction.Phase, PhaseRollback, "rollback_started", "deployd", map[string]any{"bounded": true}, manager.Clock().UTC()); err != nil {
+			return err
 		}
-	}
-	if _, err := manager.Store.BeginRollback(ctx, transaction.ID, transaction.Phase, PhaseRollback, "rollback_started", "deployd", map[string]any{"bounded": true}, manager.Clock().UTC()); err != nil {
-		return err
 	}
 	if err := manager.Runtime.Rollback(ctx, transaction.TargetSlot, transaction.PreviousSlot, lease); err != nil {
 		failureErr := manager.failure(ctx, transaction.ID, PhaseRollback, err)
 		fenceErr := manager.fenceSlots(ctx, errors.New("rollback did not reach a verified outcome"))
+		return fmt.Errorf("%w; %v", failureErr, fenceErr)
+	}
+	if err := manager.waitForReady(ctx, transaction.ID, transaction.PreviousSlot); err != nil {
+		failureErr := manager.failure(ctx, transaction.ID, PhaseRollback, &UncertainError{Cause: err})
+		fenceErr := manager.fenceSlots(ctx, errors.New("rollback readiness was not verified; controller roles were fenced"))
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)
 	}
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
@@ -736,12 +799,12 @@ func (manager *Manager) nextFenceTerm(ctx context.Context) (uint64, error) {
 	return manager.Store.NextFenceTerm(ctx)
 }
 
-func recoveryTargetVerified(observation RuntimeSnapshot, transaction store.Transaction, now time.Time, requireController bool) bool {
+func recoveryTargetVerified(observation RuntimeSnapshot, transaction store.Transaction, now time.Time, requireTraffic, requireController bool) bool {
 	if !validObservation(observation, now) || observation.ActiveSlot != transaction.TargetSlot {
 		return false
 	}
 	target, ok := observation.Slots[transaction.TargetSlot]
-	if !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.TrafficAccepting || target.StateEpoch == "" || (requireController && !target.ControllerOwned) {
+	if !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || target.StateEpoch == "" || (requireTraffic && !target.TrafficAccepting) || (requireController && !target.ControllerOwned) {
 		return false
 	}
 	old, oldOK := observation.Slots[transaction.PreviousSlot]

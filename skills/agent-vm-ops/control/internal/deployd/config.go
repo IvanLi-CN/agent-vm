@@ -72,6 +72,9 @@ func Load(path string) (Config, error) {
 }
 
 func (config Config) Validate() error {
+	if config.LockPath != Defaults().LockPath {
+		return fmt.Errorf("deployd config invalid: lock_path must be the host singleton path %s", Defaults().LockPath)
+	}
 	for name, value := range map[string]string{
 		"socket": config.Socket, "lock_path": config.LockPath, "database": config.Database, "active_path": config.ActivePath,
 		"release_root": config.ReleaseRoot, "blue_socket": config.BlueSocket, "green_socket": config.GreenSocket,

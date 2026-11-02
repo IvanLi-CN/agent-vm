@@ -166,9 +166,18 @@ func (server *Server) RestoreLatest(ctx context.Context) error {
 	if snapshot.ObservedAt.IsZero() || snapshot.FreshUntil.IsZero() {
 		return errors.New("persisted deployd observation has no freshness timestamps")
 	}
+	transactions, err := server.Manager.Store.ListActive(ctx)
+	if err != nil {
+		return fmt.Errorf("restore active deployment transactions: %w", err)
+	}
+	if len(transactions) > 0 {
+		// A persisted observation can describe the last healthy state, but it
+		// cannot prove that recovery has completed after a Deployd restart.
+		snapshot.Consistent = false
+	}
 	server.mu.Lock()
 	server.latest = snapshot
-	server.Metrics.Set(snapshot)
+	server.Metrics.Set(snapshot, transactions)
 	server.mu.Unlock()
 	return nil
 }
@@ -335,10 +344,7 @@ func publicErrorMessage(code, fallback string) string {
 	case "state_unverified":
 		return "deployment state could not be verified"
 	default:
-		if strings.Contains(fallback, "/") || strings.Contains(strings.ToLower(fallback), "systemctl") {
-			return "deployd operation failed"
-		}
-		return fallback
+		return "deployd operation failed"
 	}
 }
 

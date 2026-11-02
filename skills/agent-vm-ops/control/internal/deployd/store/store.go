@@ -304,6 +304,30 @@ func (s *Store) ListActive(ctx context.Context) ([]Transaction, error) {
 	return result, rows.Err()
 }
 
+func (s *Store) LatestEvent(ctx context.Context, transactionID, phase, transition string) (*PhaseEvent, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT sequence,phase,transition,source,evidence_json,created_at
+		FROM deployment_phase_events
+		WHERE transaction_id = ? AND phase = ? AND transition = ?
+		ORDER BY sequence DESC LIMIT 1`, transactionID, phase, transition)
+	var event PhaseEvent
+	var evidence, created string
+	if err := row.Scan(&event.Sequence, &event.Phase, &event.Transition, &event.Source, &evidence, &created); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if err := json.Unmarshal([]byte(evidence), &event.Evidence); err != nil {
+		return nil, err
+	}
+	var err error
+	event.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+	if err != nil {
+		return nil, err
+	}
+	return &event, nil
+}
+
 func (s *Store) Transition(ctx context.Context, id, expectedPhase, phase, state, transition, source string, evidence map[string]any, now time.Time) (*Transaction, error) {
 	if now.IsZero() {
 		now = s.clock().UTC()
