@@ -183,6 +183,7 @@ mkdir -p -- \
   "$systemd_root/etc/systemd/system" \
   "$systemd_root/etc/agent-vm-native/slots/test_instance" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/bin" \
+  "$systemd_root/bin" \
   "$systemd_root/usr/bin" \
   "$systemd_root/usr/local/bin"
 cp "$unit_dir/agent-vm-rqlite.service" "$unit_dir/agent-vm-native@.service" "$unit_dir/agent-vm-caddy.service" "$systemd_root/etc/systemd/system/"
@@ -192,8 +193,24 @@ touch \
   "$systemd_root/etc/agent-vm-native/slots/test_instance/config.json" \
   "$systemd_root/opt/agent-vm-native/release-manifest.json" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/release-manifest.json"
-touch "$systemd_root/usr/bin/test" "$systemd_root/usr/local/bin/caddy" "$systemd_root/usr/local/bin/rqlited" "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control"
-chmod 0755 "$systemd_root/usr/bin/test" "$systemd_root/usr/local/bin/caddy" "$systemd_root/usr/local/bin/rqlited" "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control"
+touch \
+  "$systemd_root/bin/sh" \
+  "$systemd_root/usr/bin/curl" \
+  "$systemd_root/usr/bin/sleep" \
+  "$systemd_root/usr/bin/stat" \
+  "$systemd_root/usr/bin/test" \
+  "$systemd_root/usr/local/bin/caddy" \
+  "$systemd_root/usr/local/bin/rqlited" \
+  "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control"
+chmod 0755 \
+  "$systemd_root/bin/sh" \
+  "$systemd_root/usr/bin/curl" \
+  "$systemd_root/usr/bin/sleep" \
+  "$systemd_root/usr/bin/stat" \
+  "$systemd_root/usr/bin/test" \
+  "$systemd_root/usr/local/bin/caddy" \
+  "$systemd_root/usr/local/bin/rqlited" \
+  "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control"
 printf '%s\n' \
   'root:x:0:0:root:/root:/bin/sh' \
   'caddy:x:995:995:caddy:/var/lib/caddy:/usr/sbin/nologin' \

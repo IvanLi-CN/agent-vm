@@ -354,6 +354,11 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain("flock --wait 30 9");
   expect(cutover).not.toContain('mkdir -- "$lock_dir"');
   expect(cutover).toContain("Every writer of the protected active link must hold this kernel lock");
+  const acceptance = read("skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh");
+  expect(acceptance).toContain('"$systemd_root/bin/sh"');
+  expect(acceptance).toContain('"$systemd_root/usr/bin/curl"');
+  expect(acceptance).toContain('"$systemd_root/usr/bin/sleep"');
+  expect(acceptance).toContain('"$systemd_root/usr/bin/stat"');
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-cutover-test-"));
   try {
     const layout = join(temporaryRoot, "layout");

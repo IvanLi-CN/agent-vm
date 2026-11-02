@@ -169,6 +169,9 @@ forbidText(caddyUnit, "--environ", "Caddy does not dump the DNSPod environment a
 requireText(acceptance, "rqlite-curl.conf", "rqlite readiness credentials use a temporary curl config");
 requireText(acceptance, "umask 077", "temporary rqlite curl credentials are owner-only");
 requireText(acceptance, "require_command flock", "isolated acceptance checks the active link lock dependency");
+for (const commandPath of ["$systemd_root/bin/sh", "$systemd_root/usr/bin/curl", "$systemd_root/usr/bin/sleep", "$systemd_root/usr/bin/stat"]) {
+  requireText(acceptance, commandPath, `systemd staging root provides ${commandPath}`);
+}
 requireText(acceptance, 'rqlite_auth_file="$proof_dir/auth.json"', "temporary rqlite auth file has an explicit path");
 requireText(acceptance, 'chmod 0600 "$rqlite_auth_file"', "temporary rqlite auth file is owner-only");
 requireText(acceptance, 'rm -f -- "$rqlite_auth_file"', "temporary rqlite auth file is removed during cleanup");
