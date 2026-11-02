@@ -8,25 +8,31 @@ import (
 
 func TestValidateServeSocketOverride(t *testing.T) {
 	var cfg config.Config
-	if value, err := validateServeSocketOverride("", cfg); err != nil || value != "" {
+	if value, err := validateServeSocketOverride("", "", cfg); err != nil || value != "" {
 		t.Fatalf("empty socket override = %q, %v", value, err)
 	}
-	if value, err := validateServeSocketOverride("/run/agent-vm-native/blue/../blue/app.sock", cfg); err != nil || value != "/run/agent-vm-native/blue/app.sock" {
+	if value, err := validateServeSocketOverride("/run/agent-vm-native/blue/app.sock", "blue", cfg); err != nil || value != "/run/agent-vm-native/blue/app.sock" {
 		t.Fatalf("absolute socket override = %q, %v", value, err)
 	}
-	if _, err := validateServeSocketOverride("run/agent-vm-native/blue/app.sock", cfg); err == nil {
+	if _, err := validateServeSocketOverride("run/agent-vm-native/blue/app.sock", "blue", cfg); err == nil {
 		t.Fatal("relative socket override was accepted")
+	}
+	if _, err := validateServeSocketOverride("/run/agent-vm-native/blue/app.sock", "", cfg); err == nil {
+		t.Fatal("socket override without a slot identity was accepted")
 	}
 	cfg.Management.Authority.SocketPath = "/run/agent-vm-native/authority.sock"
 	cfg.Management.ForwardAuth.SocketPath = "/run/agent-vm-native/forward-auth.sock"
 	for _, reserved := range []string{
 		"/run/agent-vm-native/authority.sock",
 		"/run/agent-vm-native/forward-auth.sock",
-		"/run/agent-vm-native/forward-auth/../forward-auth.sock",
+		"/run/agent-vm-native/blue/../green/app.sock",
 	} {
-		if _, err := validateServeSocketOverride(reserved, cfg); err == nil {
+		if _, err := validateServeSocketOverride(reserved, "blue", cfg); err == nil {
 			t.Fatalf("reserved socket override was accepted: %s", reserved)
 		}
+	}
+	if _, err := validateServeSocketOverride("/run/agent-vm-native/green/app.sock", "blue", cfg); err == nil {
+		t.Fatal("cross-slot socket override was accepted")
 	}
 }
 

@@ -137,6 +137,7 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
 
   const slot = read("skills/agent-vm-ops/assets/systemd/agent-vm-native@.service");
   expect(slot).toContain("BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json");
+  expect(slot).toContain("--slot %i");
   expect(slot).toContain("--socket /run/agent-vm-native/%i/app.sock");
   expect(slot).toContain("--manifest /opt/agent-vm-native/release-manifest.json");
   const caddyUnit = read("skills/agent-vm-ops/assets/systemd/agent-vm-caddy.service");
@@ -458,6 +459,7 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain('! -L "$root_dir/slots"');
   expect(cutover).toContain('[[ -e "$pending_file" || -L "$pending_file" ]]');
   expect(cutover).toContain('validate_slot_layout "$current_slot"');
+  expect(cutover).toContain('validate_slot_layout "$candidate_record"');
   expect(cutover).toContain("sync -f");
   expect(cutover).toContain("candidate_record/app.sock");
   expect(cutover).toContain("read_current_slot");

@@ -87,6 +87,7 @@ func serve(args []string) error {
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "/etc/agent-vm-native/config.json", "configuration path")
 	manifestPath := flags.String("manifest", installedManifestPath, "validated release manifest path")
+	slot := flags.String("slot", "", "blue-green slot identity")
 	socketOverride := flags.String("socket", "", "control socket override")
 	if err := flags.Parse(args); err != nil {
 		return err
@@ -98,7 +99,7 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	if socket, socketErr := validateServeSocketOverride(*socketOverride, cfg); socketErr != nil {
+	if socket, socketErr := validateServeSocketOverride(*socketOverride, *slot, cfg); socketErr != nil {
 		return socketErr
 	} else if socket != "" {
 		cfg.Socket = socket
@@ -275,20 +276,45 @@ func stateBackend(value string) string {
 	return "sqlite"
 }
 
-func validateServeSocketOverride(value string, cfg config.Config) (string, error) {
+func validateServeSocketOverride(value string, slot string, cfg config.Config) (string, error) {
 	if value == "" {
 		return "", nil
+	}
+	if slot != "blue" && slot != "green" {
+		return "", errors.New("config_invalid: serve socket override requires a blue or green slot identity")
 	}
 	if !filepath.IsAbs(value) {
 		return "", errors.New("config_invalid: serve socket override must be absolute")
 	}
 	value = filepath.Clean(value)
+	expected := filepath.Join("/run/agent-vm-native", slot, "app.sock")
+	if value != expected {
+		return "", fmt.Errorf("config_invalid: serve socket override must match the %s runtime socket", slot)
+	}
 	for name, reserved := range map[string]string{
 		"management.authority.socket_path":    cfg.Management.Authority.SocketPath,
 		"management.forward_auth.socket_path": cfg.Management.ForwardAuth.SocketPath,
 	} {
 		if reserved != "" && value == filepath.Clean(reserved) {
 			return "", fmt.Errorf("config_invalid: serve socket override must be distinct from %s", name)
+		}
+	}
+	for parent := filepath.Dir(value); ; parent = filepath.Dir(parent) {
+		info, err := os.Lstat(parent)
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return "", fmt.Errorf("config_invalid: cannot inspect serve socket parent %s: %w", parent, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", fmt.Errorf("config_invalid: serve socket parent must not be a symlink: %s", parent)
+		}
+		if !info.IsDir() {
+			return "", fmt.Errorf("config_invalid: serve socket parent is not a directory: %s", parent)
+		}
+		if parent == "/" {
+			break
 		}
 	}
 	return value, nil

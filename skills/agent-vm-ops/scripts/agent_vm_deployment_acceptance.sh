@@ -634,6 +634,23 @@ fi
 [[ "$(readlink -f -- "$layout_root/active")" == "$(readlink -f -- "$layout_root/slots/blue")" ]] || fail "cutover rollback did not restore blue"
 [[ ! -e "$layout_root/.active.cutover.pending" && ! -L "$layout_root/.active.cutover.pending" ]] || fail "rollback left a pending record"
 
+# Pending recovery must revalidate the candidate layout while the previous
+# slot remains active; a candidate directory symlink must fail closed.
+green_slot_backup="$proof_dir/green-slot-backup"
+green_manifest_sha256="$(sha256sum -- "$layout_root/slots/green/release-manifest.json" | cut -d' ' -f1)"
+printf 'previous=blue\ncandidate=green\nprevious_manifest=%s\ncandidate_manifest=%s\n' \
+  "$(sha256sum -- "$layout_root/slots/blue/release-manifest.json" | cut -d' ' -f1)" "$green_manifest_sha256" >"$layout_root/.active.cutover.pending"
+chmod 0600 "$layout_root/.active.cutover.pending"
+mv -- "$layout_root/slots/green" "$green_slot_backup"
+ln -s -- "$green_slot_backup" "$layout_root/slots/green"
+if bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot blue >"$proof_dir/cutover-symlink-recovery.json" 2>&1; then
+  fail "pending recovery accepted a symlinked candidate slot"
+fi
+[[ "$(readlink -f -- "$layout_root/active")" == "$(readlink -f -- "$layout_root/slots/blue")" ]] || fail "symlinked candidate recovery changed active"
+[[ -f "$layout_root/.active.cutover.pending" && ! -L "$layout_root/.active.cutover.pending" ]] || fail "symlinked candidate recovery cleared pending state"
+rm -f -- "$layout_root/slots/green"
+mv -- "$green_slot_backup" "$layout_root/slots/green"
+
 # Create the durable pending record left by an interrupted green swap, make
 # green unhealthy, and let the next blue cutover recover it before proceeding.
 printf 'ready\n' >"$cutover_health/green.mode"

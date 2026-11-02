@@ -46,7 +46,7 @@ The systemd units in `skills/agent-vm-ops/assets/systemd/` use this layout:
 /run/agent-vm-native/{blue,green}/app.sock
 ```
 
-`agent-vm-native@.service` starts one Go service per slot, overrides its control socket to `/run/agent-vm-native/%i/app.sock`, and binds that slot's manifest into the fixed manifest path required by the Go binary. The service runs with the existing Incus control boundary and the `agent-vm-web` socket group. `agent-vm-caddy.service` is the only edge proxy unit. The retired `agent-vm-web.service` is not part of the blue-green path.
+`agent-vm-native@.service` starts one Go service per slot, passes the explicit `%i` slot identity, overrides its control socket to `/run/agent-vm-native/%i/app.sock`, and binds that slot's manifest into the fixed manifest path required by the Go binary. The Go service accepts a socket override only when it matches that blue/green slot's fixed runtime path and all existing parent directories are non-symlinked directories. The service runs with the existing Incus control boundary and the `agent-vm-web` socket group. `agent-vm-caddy.service` is the only edge proxy unit. The retired `agent-vm-web.service` is not part of the blue-green path.
 
 Run `systemd-sysusers` and `systemd-tmpfiles --create` with the supplied `sysusers.d` and `tmpfiles.d` entries before starting units. These entries create both the dedicated rqlite user and the unprivileged `caddy` user. The `active` path is intentionally not created by tmpfiles because it must be an atomic symlink, not a directory.
 

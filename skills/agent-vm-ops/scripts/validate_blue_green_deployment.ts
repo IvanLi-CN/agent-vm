@@ -150,6 +150,7 @@ forbidText(rqliteUnit, "0.0.0.0", "rqlite does not bind to all interfaces");
 
 const slotUnit = read(join(assetsRoot, "systemd/agent-vm-native@.service"));
 requireText(slotUnit, "--manifest /opt/agent-vm-native/release-manifest.json", "slot service uses the fixed manifest path");
+requireText(slotUnit, "--slot %i", "slot service passes its blue-green identity");
 requireText(slotUnit, "--socket /run/agent-vm-native/%i/app.sock", "slot service uses its per-slot runtime socket");
 requireText(slotUnit, "BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json", "slot manifest is isolated in the service mount namespace");
 requireText(slotUnit, "Group=agent-vm-web", "slot service owns the protected web socket group");

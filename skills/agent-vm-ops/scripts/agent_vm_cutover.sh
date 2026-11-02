@@ -255,6 +255,7 @@ recover_pending_cutover() {
     [[ "$previous_manifest_record" =~ ^[0-9a-f]{64}$ ]] || die "cutover recovery previous manifest identity is invalid"
   fi
   [[ "$candidate_manifest_record" =~ ^[0-9a-f]{64}$ ]] || die "cutover recovery candidate manifest identity is invalid"
+  validate_slot_layout "$candidate_record"
   assert_manifest_digest "$candidate_record" "$candidate_manifest_record"
 
   if [[ "$current_slot" == "$previous_record" ]]; then
