@@ -462,7 +462,7 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 			return nil, fmt.Errorf("allocate recovery controller lease: %w", err)
 		}
 		if err := manager.Runtime.GrantController(ctx, transaction.TargetSlot, lease); err != nil {
-			return nil, fmt.Errorf("regrant the selected controller before recovery finalize: %w", err)
+			return nil, manager.effectFailure(ctx, id, transaction.Phase, fmt.Errorf("regrant the selected controller before recovery finalize: %w", err))
 		}
 		if err := manager.waitForReady(ctx, id, transaction.TargetSlot); err != nil {
 			failureErr := manager.failure(ctx, id, transaction.Phase, &UncertainError{Cause: err})

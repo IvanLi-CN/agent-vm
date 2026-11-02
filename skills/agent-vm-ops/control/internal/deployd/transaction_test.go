@@ -22,6 +22,7 @@ type fakeRuntime struct {
 	mutateContractOnGrant bool
 	invalidCapabilities   bool
 	failRevoke            bool
+	failGrant             bool
 	sequence              []string
 	traffic               map[string]bool
 	releaseIDs            map[string]string
@@ -79,6 +80,9 @@ func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, _ co
 	if observation, ok := runtime.observations[slot]; ok {
 		observation.ControllerOwned = true
 		runtime.observations[slot] = observation
+	}
+	if runtime.failGrant {
+		return errors.New("grant response lost")
 	}
 	return nil
 }
@@ -613,6 +617,45 @@ func TestManagerRecoveryFinalizeFencesWhenPreviousRevokeFails(t *testing.T) {
 	}
 	if runtime.observations["blue"].ControllerOwned || runtime.observations["green"].ControllerOwned {
 		t.Fatalf("recovery revoke failure did not fence both slots: %#v", runtime.observations)
+	}
+}
+
+func TestManagerRecoveryFinalizeFencesWhenTargetGrantIsUncertain(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", failGrant: true, observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	transaction, err := manager.Stage(context.Background(), "green", "/bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Verify(context.Background(), transaction.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Transition(context.Background(), transaction.ID, PhaseControllerHandoff, PhaseActiveSwitch, "active", "active_switched", "test", nil, now); err != nil {
+		t.Fatal(err)
+	}
+	transaction, err = database.Get(context.Background(), transaction.ID)
+	if err != nil || transaction == nil {
+		t.Fatalf("read recovery transaction: %#v err=%v", transaction, err)
+	}
+	if err := manager.RecoverOnStart(context.Background()); err == nil || !errors.Is(err, ErrUncertain) {
+		t.Fatalf("restart recovery error = %v", err)
+	}
+	runtime.active = "green"
+	runtime.traffic = map[string]bool{"blue": false, "green": false}
+	if _, err := manager.Recover(context.Background(), transaction.ID, "finalize"); err == nil || !errors.Is(err, ErrUncertain) {
+		t.Fatalf("recovery finalize error = %v", err)
+	}
+	if runtime.observations["blue"].ControllerOwned || runtime.observations["green"].ControllerOwned {
+		t.Fatalf("uncertain target grant did not fence both slots: %#v", runtime.observations)
 	}
 }
 
