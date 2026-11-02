@@ -551,14 +551,14 @@ ln -s "$runtime_root/green/app.sock" "$layout_root/slots/green/app.sock"
 printf 'ready\n' >"$cutover_health/blue.mode"
 printf 'ready\n' >"$cutover_health/green.mode"
 setsid --wait env -i PATH="$runtime_path" HOME="$runtime_home" PYTHONUNBUFFERED=1 \
-  python3 - "$runtime_root" "$cutover_health" >"$proof_dir/cutover-health.log" 2>&1 <<'PY' &
+  python3 - "$runtime_root" "$cutover_health" "$layout_root" >"$proof_dir/cutover-health.log" 2>&1 <<'PY' &
 import http.server
 import os
 import socketserver
 import sys
 import threading
 
-runtime_root, state_root = sys.argv[1:]
+runtime_root, state_root, layout_root = sys.argv[1:]
 counts = {}
 last_modes = {}
 lock = threading.Lock()
@@ -578,6 +578,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 counts[slot] = 0
             counts[slot] = counts.get(slot, 0) + 1
             ready = mode == "ready" or (mode == "once" and counts[slot] == 1)
+            if mode == "mutate" and counts[slot] == 2:
+                manifest_path = os.path.join(layout_root, "slots", slot, "release-manifest.json")
+                with open(manifest_path, "w", encoding="utf-8") as handle:
+                    handle.write('{"slot":"mutated"}\n')
+            if mode == "mutate":
+                ready = True
         payload = b'{"ready":true}\n' if ready else b'{"ready":false}\n'
         self.send_response(200 if ready else 503)
         self.send_header("Content-Type", "application/json")
@@ -633,6 +639,17 @@ if bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" -
 fi
 [[ "$(readlink -f -- "$layout_root/active")" == "$(readlink -f -- "$layout_root/slots/blue")" ]] || fail "cutover rollback did not restore blue"
 [[ ! -e "$layout_root/.active.cutover.pending" && ! -L "$layout_root/.active.cutover.pending" ]] || fail "rollback left a pending record"
+
+# Make the candidate pass its post-swap health probe while changing its
+# manifest during that probe; cutover must roll back and retain identity safety.
+printf 'ready\n' >"$cutover_health/green.mode"
+bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot blue >"$proof_dir/cutover-blue-before-manifest-mutation.json"
+printf 'mutate\n' >"$cutover_health/green.mode"
+if bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot green >"$proof_dir/cutover-manifest-mutation.json" 2>&1; then
+  fail "cutover accepted a candidate whose manifest changed after swap"
+fi
+[[ "$(readlink -f -- "$layout_root/active")" == "$(readlink -f -- "$layout_root/slots/blue")" ]] || fail "manifest mutation rollback did not restore blue"
+[[ ! -e "$layout_root/.active.cutover.pending" && ! -L "$layout_root/.active.cutover.pending" ]] || fail "manifest mutation rollback left a pending record"
 
 # Pending recovery must revalidate the candidate layout while the previous
 # slot remains active; a candidate directory symlink must fail closed.

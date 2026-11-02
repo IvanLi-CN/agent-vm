@@ -137,6 +137,8 @@ command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required for cutover r
 
 mkdir -p -- "$root_dir"
 lock_path="$root_dir/.cutover.lock"
+exec 8<"$root_dir" || die "cannot open the release-root lock directory"
+flock --wait 30 8 || die "another active link operation is in progress"
 lock_seed="$(mktemp "$root_dir/.cutover-lock.XXXXXX")" || die "cannot create the active link lock seed"
 if [[ -L "$lock_path" ]]; then
   rm -f -- "$lock_seed"
@@ -162,6 +164,7 @@ stage_dir=""
 temporary_link=""
 rollback_link=""
 pending_previous_manifest=""
+pending_candidate_manifest=""
 stage_dir="$(mktemp -d -- "$root_dir/.active-stage.XXXXXX")" || die "cannot create unique cutover staging directory"
 temporary_link="$stage_dir/active"
 rollback_link="$stage_dir/rollback"
@@ -171,10 +174,15 @@ cleanup() {
   fi
   flock --unlock 9 2>/dev/null || true
   exec 9>&-
+  flock --unlock 8 2>/dev/null || true
+  exec 8>&-
 }
 trap cleanup EXIT
-# Every writer of the protected active link must hold this kernel lock. The
-# lock remains valid across the readiness checks and atomic replacement.
+# Every writer of the protected active link must hold this kernel lock and the
+# release-root directory lock. The directory lock serializes lock-path
+# creation and opening; the regular lock file remains the documented
+# cross-process lock identity. Both locks remain valid across readiness checks
+# and atomic replacement.
 read_current_slot
 
 health_check() {
@@ -194,6 +202,7 @@ slot_manifest_digest() {
   local slot_name="$1"
   local manifest_path="$root_dir/slots/$slot_name/release-manifest.json"
   local digest
+  [[ -f "$manifest_path" && ! -L "$manifest_path" ]] || die "slot release manifest is missing or symlinked: $slot_name"
   digest="$(sha256sum -- "$manifest_path")" || die "cannot hash slot release manifest: $slot_name"
   digest="${digest%% *}"
   [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "slot release manifest hash is invalid: $slot_name"
@@ -215,6 +224,7 @@ write_pending_record() {
   pending_previous_manifest="$previous_manifest"
   local candidate_manifest
   candidate_manifest="$(slot_manifest_digest "$slot")"
+  pending_candidate_manifest="$candidate_manifest"
   pending_tmp="$(mktemp "$stage_dir/pending.XXXXXX")" || die "cannot create the cutover recovery staging file"
   printf 'previous=%s\ncandidate=%s\nprevious_manifest=%s\ncandidate_manifest=%s\n' \
     "$current_slot" "$slot" "$previous_manifest" "$candidate_manifest" >"$pending_tmp" || die "cannot write the cutover recovery record"
@@ -310,7 +320,7 @@ ln -s -- "$candidate" "$temporary_link"
 # -T makes the replacement operate on the link path, preserving atomic cutover.
 mv -Tf -- "$temporary_link" "$active"
 sync_path "$root_dir"
-if ! health_check "$active/app.sock"; then
+if ! health_check "$active/app.sock" || ! (assert_manifest_digest "$slot" "$pending_candidate_manifest"); then
   if [[ ! -L "$active" ]] || [[ "$(readlink -f -- "$active")" != "$candidate" ]]; then
     die "candidate failed post-cutover health and active changed; refusing rollback"
   fi

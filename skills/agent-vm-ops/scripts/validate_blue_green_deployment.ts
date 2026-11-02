@@ -206,6 +206,7 @@ requireText(acceptance, "failed post-swap health", "isolated acceptance executes
 requireText(acceptance, 'previous=blue\\ncandidate=green', "isolated acceptance executes pending recovery");
 requireText(acceptance, 'previous_manifest=%s\\ncandidate_manifest=%s', "isolated acceptance binds pending recovery to manifest identities");
 requireText(acceptance, "pending recovery did not restore blue", "isolated acceptance verifies pending recovery");
+requireText(acceptance, "candidate whose manifest changed after swap", "isolated acceptance verifies post-swap manifest identity");
 requireText(acceptance, "exit 1", "isolated acceptance fails when cleanup is incomplete");
 requireText(caddyBuilder, "mkdtempSync", "Caddy builds into a private staging directory");
 requireText(caddyBuilder, "renameSync(stagingOutput, options.output)", "Caddy installs only after verification via atomic rename");
@@ -223,6 +224,7 @@ requireText(cutover, 'health_check "$active/app.sock"', "cutover rechecks the ac
 requireText(cutover, "slot_manifest_digest", "cutover records release manifest identities for recovery");
 requireText(cutover, "assert_manifest_digest", "cutover fails closed on a changed recovery manifest");
 requireText(cutover, 'assert_manifest_digest "$current_slot" "$pending_previous_manifest"', "cutover binds post-swap rollback to the recorded previous manifest");
+requireText(cutover, 'assert_manifest_digest "$slot" "$pending_candidate_manifest"', "cutover binds post-swap success to the recorded candidate manifest");
 requireText(cutover, "active_matches_current || die", "cutover refuses to replace an active link changed during readiness");
 requireText(cutover, "rollback_link", "cutover has a protected rollback link for post-swap health failure");
 requireText(cutover, "pending_file", "cutover persists an interrupted-swap recovery record");
@@ -236,6 +238,8 @@ requireText(cutover, 'validate_slot_layout "$current_slot"', "cutover validates 
 requireText(cutover, "sync -f", "cutover flushes recovery and active-link directory updates");
 requireText(cutover, "candidate_record/app.sock", "cutover confirms a pending candidate before rollback");
 requireText(cutover, "flock --wait 30 9", "cutover serializes active link writers with a kernel lock");
+requireText(cutover, 'exec 8<"$root_dir"', "cutover anchors lock-path creation to the release-root directory");
+requireText(cutover, "flock --wait 30 8", "cutover serializes lock-path creation before opening the regular lock");
 requireText(cutover, 'mktemp -d -- "$root_dir/.active-stage.XXXXXX"', "cutover uses PID-independent unique staging");
 requireText(cutover, '[[ -L "$lock_path" ]]', "cutover rejects a symlinked active-link lock");
 requireText(cutover, 'ln -- "$lock_seed" "$lock_path"', "cutover atomically creates the active-link lock without following a symlink");

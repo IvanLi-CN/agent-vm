@@ -470,8 +470,11 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain("candidate_manifest=");
   expect(cutover).toContain('assert_manifest_digest "$previous_record" "$previous_manifest_record"');
   expect(cutover).toContain('assert_manifest_digest "$current_slot" "$pending_previous_manifest"');
+  expect(cutover).toContain('assert_manifest_digest "$slot" "$pending_candidate_manifest"');
   expect(cutover).toContain('health_check "$root_dir/slots/$previous_record/app.sock"');
   expect(cutover).toContain("flock --wait 30 9");
+  expect(cutover).toContain('exec 8<"$root_dir"');
+  expect(cutover).toContain("flock --wait 30 8");
   expect(cutover).toContain("mktemp -d -- \"$root_dir/.active-stage.XXXXXX\"");
   expect(cutover).toContain('[[ -L "$lock_path" ]]');
   expect(cutover).toContain('ln -- "$lock_seed" "$lock_path"');
@@ -506,6 +509,7 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(acceptance).toContain('failed post-swap health');
   expect(acceptance).toContain('previous=blue\\ncandidate=green\\nprevious_manifest=%s\\ncandidate_manifest=%s');
   expect(acceptance).toContain('pending recovery did not restore blue');
+  expect(acceptance).toContain('candidate whose manifest changed after swap');
   const ci = read(".github/workflows/ci.yml");
   expect(ci).toContain("github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.4");
   expect(ci).toContain("skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh");

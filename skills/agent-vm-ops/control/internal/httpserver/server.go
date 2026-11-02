@@ -194,19 +194,12 @@ func ServeApp(ctx context.Context, socket string, service *lifecycle.Service, sn
 }
 
 func serve(ctx context.Context, socket string, service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler) error {
-	if err := prepareSocket(socket); err != nil {
-		return err
-	}
-	listener, err := net.Listen("unix", socket)
-	if err != nil {
-		return fmt.Errorf("listen on control socket: %w", err)
-	}
 	mode := os.FileMode(0o600)
 	if app != nil {
 		mode = 0o660
 	}
-	if err := os.Chmod(socket, mode); err != nil {
-		_ = listener.Close()
+	listener, err := listenUnixSocket(socket, mode)
+	if err != nil {
 		return err
 	}
 	wrapped := &peerListener{Listener: listener}
