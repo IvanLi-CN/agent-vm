@@ -2573,7 +2573,7 @@ func TestStartupReconcileRetriesTimerBeforeNativeStart(t *testing.T) {
 	if err := store.RecordOperation(ctx, "timer-prestart-recovery", "timer-reconcile", nil, &generation, map[string]any{
 		"outcome": "pending", "_request": request, "_request_digest": digest,
 		"_recovery_attempts": int64(1),
-		"worker":             map[string]any{"state": "starting", "prepared_at": "2026-10-28T00:00:00+00:00"},
+		"worker":             map[string]any{"state": "starting", "start_attempted": false, "prepared_at": "2026-10-28T00:00:00+00:00"},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -2587,6 +2587,183 @@ func TestStartupReconcileRetriesTimerBeforeNativeStart(t *testing.T) {
 	}
 	if operation == nil || operation.Response["outcome"] != "success" {
 		t.Fatalf("recovered timer operation = %#v", operation)
+	}
+}
+
+func TestStartupReconcileRetriesExplicitlyUnattemptedPortOperation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "port-prestart-recovery.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session := "pre-start-port-session"
+	generation := int64(1)
+	operationID := "pre-start-port-add"
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "port-add", "session_id": session,
+		"generation": generation, "operation_id": operationID, "name": "web",
+		"port_protocol": "tcp", "host_port": int64(20006), "vm_port": int64(20006),
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, operationID, "port-add", &session, &generation, map[string]any{
+		"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest,
+		"worker": map[string]any{"state": "exited", "start_attempted": false, "observed_at": "2026-10-29T15:58:31Z"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup: %v", err)
+	}
+	operation, err := store.GetOperation(ctx, operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("recovered port operation = %#v", operation)
+	}
+	control, ok := operation.Response["error"].(map[string]any)
+	if !ok || control["code"] != "task_not_active" {
+		t.Fatalf("recovered port error = %#v", operation.Response["error"])
+	}
+	pending, err := store.PendingOperations(ctx)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("pending = %#v, error = %v", pending, err)
+	}
+}
+
+func TestStartupReconcileLeavesPortOperationPendingDuringReleaseDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "port-drain-recovery.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.SetMeta(ctx, "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(ctx, "drain_owner", "release-activation-test"); err != nil {
+		t.Fatal(err)
+	}
+	session := "port-drain-session"
+	generation := int64(1)
+	operationID := "port-drain-recovery"
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "port-add", "session_id": session,
+		"generation": generation, "operation_id": operationID, "name": "web",
+		"port_protocol": "tcp", "host_port": int64(20007), "vm_port": int64(20007),
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, operationID, "port-add", &session, &generation, map[string]any{
+		"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest,
+		"worker": map[string]any{"state": "exited", "start_attempted": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	err = service.StartupReconcile(ctx)
+	if err != nil {
+		t.Fatalf("startup error = %#v", err)
+	}
+	operation, err := store.GetOperation(ctx, operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "pending" {
+		t.Fatalf("drained port operation = %#v", operation)
+	}
+}
+
+func TestStartupReconcileDoesNotReplayPortOperationWithoutStartMarker(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "port-missing-marker.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session := "port-missing-marker-session"
+	generation := int64(1)
+	operationID := "port-missing-marker"
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "port-add", "session_id": session,
+		"generation": generation, "operation_id": operationID, "name": "web",
+		"port_protocol": "tcp", "host_port": int64(20008), "vm_port": int64(20008),
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, operationID, "port-add", &session, &generation, map[string]any{
+		"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest,
+		"worker": map[string]any{"state": "exited"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Resident: true})
+	err = service.StartupReconcile(ctx)
+	if control := protocol.AsError(err); control.Code != "startup_reconcile_required" {
+		t.Fatalf("startup error = %#v", control)
+	}
+	operation, err := store.GetOperation(ctx, operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "pending" {
+		t.Fatalf("missing-marker port operation = %#v", operation)
+	}
+}
+
+func TestRecoverPendingDefersPortRemoveDuringReleaseDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "port-remove-drain.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.SetMeta(ctx, "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SetMeta(ctx, "drain_owner", "release-port-remove"); err != nil {
+		t.Fatal(err)
+	}
+	session := "port-remove-drain-session"
+	generation := int64(1)
+	operationID := "port-remove-drain"
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "port-remove", "session_id": session,
+		"generation": generation, "operation_id": operationID, "name": "web", "port_protocol": "tcp",
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, operationID, "port-remove", &session, &generation, map[string]any{
+		"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest,
+		"worker": map[string]any{"state": "exited", "start_attempted": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	pending, err := store.PendingOperations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.recoverPending(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(ctx, operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "pending" {
+		t.Fatalf("drained port-remove operation = %#v", operation)
 	}
 }
 

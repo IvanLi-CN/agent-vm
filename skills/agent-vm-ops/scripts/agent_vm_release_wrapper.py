@@ -769,15 +769,29 @@ def _current_target(link: Path, release_root: Path | None = None) -> Path | None
 def _verify_retained_release(config: Mapping[str, Any], target: Path) -> dict[str, Any]:
     """Re-verify a release before using it as an activation or rollback target."""
     try:
-        manifest = load_release_manifest(target / MANIFEST_NAME, allow_historical_web_config_mode=True)
+        manifest = load_release_manifest(
+            target / MANIFEST_NAME,
+            allow_historical_web_config_mode=True,
+            allow_historical_state_compatibility=True,
+        )
         if _is_go_manifest(manifest):
             verify_go_bundle(target, manifest)
         elif _is_product_manifest(manifest):
             from release_manifest import verify_product_bundle
-            verify_product_bundle(target, manifest, allow_historical_web_config_mode=True)
+            verify_product_bundle(
+                target,
+                manifest,
+                allow_historical_web_config_mode=True,
+                allow_historical_state_compatibility=True,
+            )
         else:
             verify_bundle(target, manifest)
-        verify_client_sidecar(target, manifest, allow_historical_web_config_mode=True)
+        verify_client_sidecar(
+            target,
+            manifest,
+            allow_historical_web_config_mode=True,
+            allow_historical_state_compatibility=True,
+        )
     except ManifestError as exc:
         _fail("activation_unverified", "retained release cannot be verified", exc.as_dict())
     _reject_transaction_extras(target, manifest)
@@ -988,6 +1002,76 @@ def _read_live_state_capabilities() -> list[str]:
     return [f"{name}@{version}" for name, version in rows]
 
 
+def _read_activation_safe_pending_ids() -> set[str]:
+    """Return only queued journal intents the candidate can safely retry.
+
+    The activation fence must still reject every native-effect operation that
+    crossed the worker barrier.  A crash before worker start is different: the
+    durable worker record explicitly says that no process identity exists, so
+    the candidate release may retry the original operation ID during startup
+    reconciliation.  A drain-exit record without a worker is likewise a
+    durable admission-state request; it is safe to retry only when its saved
+    owner no longer owns the current release fence.
+    """
+    uri = f"file:{STATE_DB_PATH}?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True, timeout=5) as database:
+            rows = database.execute(
+                "SELECT operation_id, action, session_id, generation, response_json FROM operations",
+            ).fetchall()
+            owner_row = database.execute(
+                "SELECT value FROM meta WHERE key = 'drain_owner'",
+            ).fetchone()
+    except (OSError, sqlite3.Error) as exc:
+        _fail("drain_unverified", "pending-operation safety could not be verified")
+    owner = str(owner_row[0]) if owner_row and owner_row[0] is not None else ""
+    safe: set[str] = set()
+    for operation_id, action, session_id, generation, response_json in rows:
+        try:
+            response = json.loads(response_json)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(response, Mapping) or response.get("outcome") != "pending":
+            continue
+        if action in {"port-add", "port-remove"}:
+            worker = response.get("worker")
+            if not isinstance(worker, Mapping):
+                continue
+            if worker.get("state") not in {"starting", "exited"} or worker.get("start_attempted") is not False:
+                continue
+            if any(key in worker for key in ("pid", "start_time", "process_group")):
+                continue
+            request = response.get("_request")
+            if not isinstance(request, Mapping):
+                continue
+            if type(request.get("protocol")) is not int or request["protocol"] != 4:
+                continue
+            if request.get("action") != action or request.get("operation_id") != operation_id:
+                continue
+            if type(session_id) is not str or type(request.get("session_id")) is not str or request["session_id"] != session_id:
+                continue
+            if type(generation) is not int or type(request.get("generation")) is not int or request["generation"] != generation or generation < 0:
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", request["session_id"]):
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", request["operation_id"]):
+                continue
+            try:
+                request_digest = hashlib.sha256(json.dumps(dict(request), sort_keys=True).encode()).hexdigest()
+            except (TypeError, ValueError):
+                continue
+            if request_digest != response.get("_request_digest"):
+                continue
+            safe.add(str(operation_id))
+            continue
+        if action == "drain-exit" and "worker" not in response:
+            request = response.get("_request")
+            requested_owner = request.get("session_id") if isinstance(request, Mapping) else None
+            if owner.startswith("release-") and isinstance(requested_owner, str) and requested_owner != owner:
+                safe.add(str(operation_id))
+    return safe
+
+
 def _validate_legacy_state_schema(database: sqlite3.Connection) -> None:
     required = {
         "meta": {"key", "value"},
@@ -1081,7 +1165,10 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
         if not isinstance(pending, list):
             _fail("drain_unverified", "control returned an invalid pending-operation list")
         if pending:
-            _fail("drain_unverified", "release activation requires management operations to converge", {"pending_operations": pending[:100]})
+            safe_ids = _read_activation_safe_pending_ids()
+            unsafe = [item for item in pending if not isinstance(item, Mapping) or item.get("operation_id") not in safe_ids]
+            if unsafe:
+                _fail("drain_unverified", "release activation requires management operations to converge", {"pending_operations": unsafe[:100]})
 
 
 def _daemon_reload() -> None:
@@ -1197,6 +1284,29 @@ def _activate_legacy_runtime() -> None:
     for unit in _legacy_expiry_timers():
         _systemctl("start", unit, allow_missing=True)
         _systemctl("enable", unit, allow_missing=True)
+
+
+def _restore_runtime_for_release(current: Path | None, record: Mapping[str, Any]) -> None:
+    """Make the runtime match the release selected by restored pointers."""
+    if current is None:
+        _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+        _deactivate_web_runtime()
+        return
+    manifest = load_release_manifest(
+        current / MANIFEST_NAME,
+        allow_historical_web_config_mode=True,
+        allow_historical_state_compatibility=True,
+    )
+    if _is_product_manifest(manifest):
+        snapshot = record.get("web_unit_enabled")
+        _activate_product_runtime(
+            manifest,
+            web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
+        )
+    elif _is_go_manifest(manifest):
+        _activate_go_runtime()
+    else:
+        _activate_legacy_runtime()
 
 
 def _install_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
@@ -1523,7 +1633,11 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         old_compatibility_error = None
         if old_current is not None:
             try:
-                old_manifest = load_release_manifest(old_current / MANIFEST_NAME)
+                old_manifest = load_release_manifest(
+                    old_current / MANIFEST_NAME,
+                    allow_historical_web_config_mode=True,
+                    allow_historical_state_compatibility=True,
+                )
                 _validate_state_compatibility(old_manifest, _read_live_state_capabilities())
             except (WrapperError, ManifestError) as compatibility_error:
                 old_compatibility_error = compatibility_error
@@ -1559,6 +1673,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             try:
                 if not restored or old_current is None:
                     _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+                    _deactivate_web_runtime()
                 else:
                     assert old_manifest is not None
                     if _is_product_manifest(old_manifest):
@@ -1698,6 +1813,7 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         else:
             _activate_legacy_runtime()
     except WrapperError as failure:
+        restore_error: WrapperError | None = None
         try:
             _restore_activation_state(
                 config,
@@ -1707,12 +1823,25 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 actual_previous,
                 target_snapshot,
             )
-        except WrapperError as restore_error:
+        except WrapperError as state_restore_error:
+            restore_error = state_restore_error
             failure = WrapperError(
                 "activation_restore_failed",
                 "rollback failed and the previous release could not be fully restored",
-                {"rollback_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
+                {"rollback_error": failure.as_dict(), "restore_error": state_restore_error.as_dict()},
             )
+        if restore_error is None:
+            try:
+                _restore_runtime_for_release(actual_current, record)
+            except (WrapperError, ManifestError) as runtime_error:
+                failure = WrapperError(
+                    "activation_restore_failed",
+                    "rollback failed and the restored release runtime could not be activated",
+                    {
+                        "rollback_error": failure.as_dict(),
+                        "runtime_restore_error": getattr(runtime_error, "as_dict", lambda: {"message": str(runtime_error)})(),
+                    },
+                )
         record["rollback_phase"] = "failed"
         record["rollback_state"] = "failed"
         record["rollback_error"] = failure.as_dict()

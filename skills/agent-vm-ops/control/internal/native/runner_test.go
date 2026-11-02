@@ -199,6 +199,19 @@ func TestRunnerAppliesWorkerStartGuardBeforeSpawn(t *testing.T) {
 	}
 }
 
+func TestRunnerDoesNotReclaimAnAlreadyClaimedWorkerStart(t *testing.T) {
+	recorder := &blockingWorkerRecorder{err: errors.New("second claim must not run")}
+	ctx := WithWorkerStartClaimed(WithWorkerRecorder(context.Background(), "operation", recorder))
+	if _, err := NewRunner().Run(ctx, []string{"/bin/echo", "worker"}, nil); err != nil {
+		t.Fatalf("Run() error = %v, want claimed start to proceed", err)
+	}
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	if len(recorder.started) != 1 || len(recorder.finished) != 1 {
+		t.Fatalf("worker callbacks = %#v, want one start and finish", recorder)
+	}
+}
+
 func TestRunnerRecordsCleanupAfterWorkerStartCallbackFailure(t *testing.T) {
 	recorder := &failingStartRecorder{err: errors.New("worker identity journal unavailable")}
 	ctx := WithWorkerRecorder(context.Background(), "operation", recorder)
