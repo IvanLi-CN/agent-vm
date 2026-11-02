@@ -138,6 +138,8 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(caddyUnit).toContain("ConditionPathExists=/etc/agent-vm-native/caddy.env");
   expect(caddyUnit).toContain("EnvironmentFile=/etc/agent-vm-native/caddy.env");
   expect(caddyUnit).toContain("ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock");
+  expect(caddyUnit).toContain("ExecStartPre=+/bin/sh -c");
+  expect(caddyUnit).toContain("--unix-socket /var/lib/agent-vm-native/active/app.sock http://localhost/internal/v1/health");
   expect(caddyUnit).toContain("stat -c");
   expect(caddyUnit).toContain("0:0:600");
   expect(caddyUnit).not.toContain("--environ");

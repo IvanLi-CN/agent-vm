@@ -156,6 +156,8 @@ requireText(caddyUnit, "SupplementaryGroups=agent-vm-web", "Caddy can access the
 requireText(caddyUnit, "ConditionPathExists=/etc/agent-vm-native/caddy.env", "Caddy requires its protected environment file");
 requireText(caddyUnit, "EnvironmentFile=/etc/agent-vm-native/caddy.env", "Caddy receives DNSPod credentials from its environment file");
 requireText(caddyUnit, "ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock", "Caddy checks the active socket before starting");
+requireText(caddyUnit, "ExecStartPre=+/bin/sh -c", "Caddy runs its active socket readiness probe with root peer credentials");
+requireText(caddyUnit, "--unix-socket /var/lib/agent-vm-native/active/app.sock http://localhost/internal/v1/health", "Caddy waits for a ready native listener, not only a socket inode");
 requireText(caddyUnit, "stat -c", "Caddy verifies the environment file metadata before starting");
 requireText(caddyUnit, "0:0:600", "Caddy requires a root-owned mode-0600 environment file");
 requireText(caddyUnit, "ReadOnlyPaths=/etc/agent-vm-native/Caddyfile", "Caddy configuration is read-only");

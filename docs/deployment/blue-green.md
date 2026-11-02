@@ -86,7 +86,7 @@ sudo systemctl start agent-vm-native@green.service
 sudo bash skills/agent-vm-ops/scripts/agent_vm_cutover.sh --slot green
 ```
 
-The cutover command must run as root because the internal health endpoint accepts only the protected peer identity. It verifies the candidate manifest, exact socket link, and `{"ready":true}` health response, then atomically replaces `/var/lib/agent-vm-native/active`. Caddy has an `ExecStartPre` check for that active Unix socket, so it fails closed and retries when no slot is serving. Caddy resolves the active socket on subsequent requests; it does not need an external proxy or a second router.
+The cutover command must run as root because the internal health endpoint accepts only the protected peer identity. It verifies the candidate manifest, exact socket link, and `{"ready":true}` health response, then atomically replaces `/var/lib/agent-vm-native/active`. Caddy first checks the active Unix socket and then runs a root-executed readiness probe against `/internal/v1/health`, waiting briefly for a listener that is actually ready instead of trusting a stale socket inode. Caddy resolves the active socket on subsequent requests; it does not need an external proxy or a second router.
 
 Use `--dry-run` to validate a candidate layout without changing the symlink. A rollback is the same health-gated operation against the previous slot, and is allowed only when the previous release is compatible with the current state protocol. No retrying write request is introduced by the proxy or cutover helper.
 
