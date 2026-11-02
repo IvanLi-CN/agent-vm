@@ -623,6 +623,31 @@ class WrapperTests(unittest.TestCase):
         for name in WRAPPER.SUPPORT_ARTIFACT_NAMES:
             self.assertFalse(Path(self.loaded["control_path"]).with_name(name).exists())
 
+    def test_activation_failure_reloads_retained_manifest_with_historical_compatibility(self):
+        first = self.root / "historical-first.tar"
+        second = self.root / "historical-second.tar"
+        RELEASE.build_release(ROOT, first, "c" * 40)
+        RELEASE.build_release(ROOT, second, "d" * 40)
+        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+            WRAPPER.stage(self.loaded, "tx-historical-first", "c" * 40, first.read_bytes())
+            WRAPPER.activate(self.loaded, "tx-historical-first", "c" * 40)
+            old_current = Path(self.loaded["current_link"]).resolve()
+            WRAPPER.stage(self.loaded, "tx-historical-second", "d" * 40, second.read_bytes())
+            WRAPPER.verify_transaction(self.loaded, "tx-historical-second", "d" * 40)
+        with mock.patch.object(
+            WRAPPER, "_daemon_reload", side_effect=[WRAPPER.WrapperError("activation_failed", "injected"), None],
+        ), mock.patch.object(WRAPPER, "load_release_manifest", wraps=WRAPPER.load_release_manifest) as load_manifest:
+            with self.assertRaises(WRAPPER.WrapperError):
+                WRAPPER.activate(self.loaded, "tx-historical-second", "d" * 40)
+        retained_calls = [
+            call for call in load_manifest.call_args_list
+            if call.args and Path(call.args[0]) == old_current / MANIFEST.MANIFEST_NAME
+        ]
+        self.assertGreaterEqual(len(retained_calls), 2)
+        for call in retained_calls:
+            self.assertTrue(call.kwargs.get("allow_historical_web_config_mode"))
+            self.assertTrue(call.kwargs.get("allow_historical_state_compatibility"))
+
     def test_package_install_and_restore_do_not_touch_unowned_temporary_symlinks(self):
         source = self.root / "source.ts"
         source.write_bytes(b"new")

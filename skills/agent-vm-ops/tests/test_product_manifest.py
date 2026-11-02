@@ -59,14 +59,16 @@ class ProductManifestTests(unittest.TestCase):
             self.assertEqual(failure.exception.code, "manifest_transport_unavailable")
             malformed = dict(manifest)
             malformed["version"] = "0.1"
-            with self.assertRaises(Exception):
+            with self.assertRaises(ManifestError) as failure:
                 validate_product_manifest(malformed)
+            self.assertEqual(failure.exception.code, "manifest_invalid")
 
             management_client = copy.deepcopy(manifest)
             management_client["format"] = PRODUCT_MANIFEST_FORMAT
             management_client["state_compatibility"] = {"reads": ["legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1"], "writes": ["legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "session-image-binding@1"]}
-            with self.assertRaises(Exception):
+            with self.assertRaises(ManifestError) as failure:
                 validate_product_manifest(management_client)
+            self.assertEqual(failure.exception.code, "manifest_target_format_mismatch")
 
     def test_format_4_linux_bundle_requires_web_package_contract(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-vm-product-linux-python-") as raw_root:
@@ -115,8 +117,9 @@ class ProductManifestTests(unittest.TestCase):
                 "reads": [STATE_CAPABILITY_MARKERS[index] for index in (0, 1, 2, 4)],
                 "writes": [STATE_CAPABILITY_MARKERS[index] for index in (0, 1, 2, 4)],
             }
-            with self.assertRaises(Exception):
+            with self.assertRaises(ManifestError) as failure:
                 validate_product_manifest(historical_state)
+            self.assertEqual(failure.exception.code, "manifest_state_compatibility_invalid")
             self.assertEqual(
                 validate_product_manifest(historical_state, allow_historical_state_compatibility=True),
                 historical_state,
@@ -126,8 +129,9 @@ class ProductManifestTests(unittest.TestCase):
             historical_web = next(item for item in historical["artifacts"] if item["path"] == "config/agent-vm-web.json.example")
             historical_web["mode"] = 0o644
             (root / historical_web["path"]).chmod(0o644)
-            with self.assertRaises(Exception):
+            with self.assertRaises(ManifestError) as failure:
                 validate_product_manifest(historical)
+            self.assertEqual(failure.exception.code, "manifest_artifact_set_invalid")
             self.assertEqual(
                 validate_product_manifest(historical, allow_historical_web_config_mode=True),
                 historical,

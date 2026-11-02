@@ -1589,7 +1589,11 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         old_compatibility_error = None
         if old_current is not None:
             try:
-                old_manifest = load_release_manifest(old_current / MANIFEST_NAME)
+                old_manifest = load_release_manifest(
+                    old_current / MANIFEST_NAME,
+                    allow_historical_web_config_mode=True,
+                    allow_historical_state_compatibility=True,
+                )
                 _validate_state_compatibility(old_manifest, _read_live_state_capabilities())
             except (WrapperError, ManifestError) as compatibility_error:
                 old_compatibility_error = compatibility_error

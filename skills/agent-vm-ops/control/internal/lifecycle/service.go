@@ -818,6 +818,19 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 		if !ok {
 			continue
 		}
+		if operation.Action == "port-add" || operation.Action == "port-remove" {
+			releaseDrain, drainErr := s.releaseDrainOwned(ctx)
+			if drainErr != nil {
+				return s.sqliteError(drainErr)
+			}
+			if releaseDrain {
+				// Port mutations are safe to retry only before native execution has
+				// started, but an activation-owned drain still fences them from
+				// entering the native boundary. Leave the original journal intent
+				// pending so the next controller can retry it after drain exit.
+				continue
+			}
+		}
 		if err := s.Store.MarkOperationRecoveryAttempt(ctx, operation.OperationID); err != nil {
 			if firstErr == nil {
 				firstErr = s.sqliteError(err)
@@ -935,7 +948,8 @@ func recoverableBeforeNativeStart(action string, worker map[string]any) bool {
 	if stringValue(worker["state"]) != "starting" && stringValue(worker["state"]) != "exited" {
 		return false
 	}
-	if boolValue(worker["start_attempted"]) {
+	attempted, explicit := worker["start_attempted"].(bool)
+	if !explicit || attempted {
 		return false
 	}
 	_, hasPID := worker["pid"]
