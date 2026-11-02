@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
@@ -33,6 +35,25 @@ func TestValidateServeSocketOverride(t *testing.T) {
 	}
 	if _, err := validateServeSocketOverride("/run/agent-vm-native/green/app.sock", "blue", cfg); err == nil {
 		t.Fatal("cross-slot socket override was accepted")
+	}
+}
+
+func TestValidateServeSocketParentsRejectsSymlinkAncestorBelowMissingSlot(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(root, "outside")
+	if err := os.Mkdir(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	runRoot := filepath.Join(root, "run")
+	if err := os.Mkdir(runRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(runRoot, "agent-vm-native")); err != nil {
+		t.Fatal(err)
+	}
+	value := filepath.Join(runRoot, "agent-vm-native", "blue", "app.sock")
+	if err := validateServeSocketParents(value); err == nil {
+		t.Fatal("socket parent traversal accepted a symlink ancestor behind a missing slot directory")
 	}
 }
 

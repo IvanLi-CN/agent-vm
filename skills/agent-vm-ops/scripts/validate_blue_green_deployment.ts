@@ -222,6 +222,7 @@ forbidText(acceptance, '--user "agent-vm-backup:$backup_secret"', "rqlite creden
 requireText(cutover, 'health_check "$active/app.sock"', "cutover rechecks the active socket after atomic replacement");
 requireText(cutover, "slot_manifest_digest", "cutover records release manifest identities for recovery");
 requireText(cutover, "assert_manifest_digest", "cutover fails closed on a changed recovery manifest");
+requireText(cutover, 'assert_manifest_digest "$current_slot" "$pending_previous_manifest"', "cutover binds post-swap rollback to the recorded previous manifest");
 requireText(cutover, "active_matches_current || die", "cutover refuses to replace an active link changed during readiness");
 requireText(cutover, "rollback_link", "cutover has a protected rollback link for post-swap health failure");
 requireText(cutover, "pending_file", "cutover persists an interrupted-swap recovery record");

@@ -161,6 +161,7 @@ flock --wait 30 9 || die "another active link operation is in progress"
 stage_dir=""
 temporary_link=""
 rollback_link=""
+pending_previous_manifest=""
 stage_dir="$(mktemp -d -- "$root_dir/.active-stage.XXXXXX")" || die "cannot create unique cutover staging directory"
 temporary_link="$stage_dir/active"
 rollback_link="$stage_dir/rollback"
@@ -211,6 +212,7 @@ write_pending_record() {
   if [[ "$current_slot" != "none" ]]; then
     previous_manifest="$(slot_manifest_digest "$current_slot")"
   fi
+  pending_previous_manifest="$previous_manifest"
   local candidate_manifest
   candidate_manifest="$(slot_manifest_digest "$slot")"
   pending_tmp="$(mktemp "$stage_dir/pending.XXXXXX")" || die "cannot create the cutover recovery staging file"
@@ -316,6 +318,7 @@ if ! health_check "$active/app.sock"; then
     rm -f -- "$active" || die "candidate failed post-cutover health and active rollback failed"
   else
     validate_slot_layout "$current_slot"
+    assert_manifest_digest "$current_slot" "$pending_previous_manifest"
     ln -s -- "$root_dir/slots/$current_slot" "$rollback_link"
     mv -Tf -- "$rollback_link" "$active" || die "candidate failed post-cutover health and active rollback failed"
     sync_path "$root_dir"

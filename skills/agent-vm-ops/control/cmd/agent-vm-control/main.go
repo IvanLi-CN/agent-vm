@@ -299,25 +299,35 @@ func validateServeSocketOverride(value string, slot string, cfg config.Config) (
 			return "", fmt.Errorf("config_invalid: serve socket override must be distinct from %s", name)
 		}
 	}
+	if err := validateServeSocketParents(value); err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+func validateServeSocketParents(value string) error {
 	for parent := filepath.Dir(value); ; parent = filepath.Dir(parent) {
 		info, err := os.Lstat(parent)
 		if errors.Is(err, os.ErrNotExist) {
-			break
+			if parent == "/" {
+				break
+			}
+			continue
 		}
 		if err != nil {
-			return "", fmt.Errorf("config_invalid: cannot inspect serve socket parent %s: %w", parent, err)
+			return fmt.Errorf("config_invalid: cannot inspect serve socket parent %s: %w", parent, err)
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
-			return "", fmt.Errorf("config_invalid: serve socket parent must not be a symlink: %s", parent)
+			return fmt.Errorf("config_invalid: serve socket parent must not be a symlink: %s", parent)
 		}
 		if !info.IsDir() {
-			return "", fmt.Errorf("config_invalid: serve socket parent is not a directory: %s", parent)
+			return fmt.Errorf("config_invalid: serve socket parent is not a directory: %s", parent)
 		}
 		if parent == "/" {
 			break
 		}
 	}
-	return value, nil
+	return nil
 }
 
 func remoteStateDSN(value string) bool {

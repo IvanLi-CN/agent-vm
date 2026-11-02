@@ -469,6 +469,7 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain("previous_manifest=");
   expect(cutover).toContain("candidate_manifest=");
   expect(cutover).toContain('assert_manifest_digest "$previous_record" "$previous_manifest_record"');
+  expect(cutover).toContain('assert_manifest_digest "$current_slot" "$pending_previous_manifest"');
   expect(cutover).toContain('health_check "$root_dir/slots/$previous_record/app.sock"');
   expect(cutover).toContain("flock --wait 30 9");
   expect(cutover).toContain("mktemp -d -- \"$root_dir/.active-stage.XXXXXX\"");
