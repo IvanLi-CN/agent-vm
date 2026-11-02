@@ -140,6 +140,8 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(caddyUnit).toContain("EnvironmentFile=/etc/agent-vm-native/caddy.env");
   expect(caddyUnit).toContain("ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock");
   expect(caddyUnit).toContain("ExecStartPre=+/bin/sh -c");
+  expect(caddyUnit).toContain('while [ "$$attempt" -lt 30 ]');
+  expect(caddyUnit).toContain("attempt=$$(($$attempt + 1))");
   expect(caddyUnit).toContain("--unix-socket /var/lib/agent-vm-native/active/app.sock http://localhost/internal/v1/health");
   expect(caddyUnit).toContain("stat -c");
   expect(caddyUnit).toContain("0:0:600");
@@ -348,6 +350,9 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain('health_check "$active/app.sock"');
   expect(cutover).toContain("candidate failed post-cutover health");
   expect(cutover).toContain("rollback_link");
+  expect(cutover).toContain("pending_file");
+  expect(cutover).toContain("recover_pending_cutover");
+  expect(cutover).toContain("validate_candidate_layout");
   expect(cutover).toContain("read_current_slot");
   expect(cutover).toContain("active_matches_current || die");
   expect(cutover).toContain("active target slot is missing");
@@ -359,6 +364,9 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(acceptance).toContain('"$systemd_root/usr/bin/curl"');
   expect(acceptance).toContain('"$systemd_root/usr/bin/sleep"');
   expect(acceptance).toContain('"$systemd_root/usr/bin/stat"');
+  expect(acceptance).toContain("env -i");
+  expect(acceptance).toContain("stop_process");
+  expect(acceptance).toContain("kill -KILL");
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-cutover-test-"));
   try {
     const layout = join(temporaryRoot, "layout");

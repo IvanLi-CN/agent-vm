@@ -58,10 +58,24 @@ candidate="$root_dir/slots/$slot"
 candidate_socket="$candidate/app.sock"
 expected_socket="$runtime_root/$slot/app.sock"
 active="$root_dir/active"
-[[ -d "$candidate" ]] || die "candidate slot directory is missing: $candidate"
-[[ -f "$candidate/release-manifest.json" ]] || die "candidate release manifest is missing"
-[[ -L "$candidate_socket" ]] || die "candidate socket link is missing"
-[[ "$(readlink -- "$candidate_socket")" == "$expected_socket" ]] || die "candidate socket link is not the expected runtime socket"
+pending_file="$root_dir/.active.cutover.pending"
+
+validate_slot_layout() {
+  local slot_name="$1"
+  local slot_dir="$root_dir/slots/$slot_name"
+  local socket_link="$slot_dir/app.sock"
+  local expected_slot_socket="$runtime_root/$slot_name/app.sock"
+  [[ -d "$slot_dir" ]] || die "slot directory is missing: $slot_dir"
+  [[ -f "$slot_dir/release-manifest.json" ]] || die "slot release manifest is missing: $slot_name"
+  [[ -L "$socket_link" ]] || die "slot socket link is missing: $slot_name"
+  [[ "$(readlink -- "$socket_link")" == "$expected_slot_socket" ]] || die "slot socket link is not the expected runtime socket: $slot_name"
+}
+
+validate_candidate_layout() {
+  validate_slot_layout "$slot"
+}
+
+validate_candidate_layout
 
 read_current_slot() {
   if [[ -e "$active" && ! -L "$active" ]]; then
@@ -127,14 +141,68 @@ health_check() {
   [[ "$health_body" == *'"ready":true'* ]]
 }
 
+write_pending_record() {
+  local pending_tmp="$root_dir/.active.cutover.pending.$$.tmp"
+  printf 'previous=%s\ncandidate=%s\n' "$current_slot" "$slot" >"$pending_tmp" || die "cannot write the cutover recovery record"
+  chmod 0600 "$pending_tmp" || die "cannot protect the cutover recovery record"
+  mv -Tf -- "$pending_tmp" "$pending_file" || die "cannot install the cutover recovery record"
+}
+
+clear_pending_record() {
+  rm -f -- "$pending_file"
+}
+
+recover_pending_cutover() {
+  [[ -e "$pending_file" ]] || return 0
+  [[ -f "$pending_file" && ! -L "$pending_file" ]] || die "cutover recovery record is not a regular file"
+
+  local previous_record=""
+  local candidate_record=""
+  local line_count=0
+  local line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line_count=$((line_count + 1))
+    case "$line" in
+      previous=blue|previous=green|previous=none) previous_record="${line#previous=}" ;;
+      candidate=blue|candidate=green) candidate_record="${line#candidate=}" ;;
+      *) die "cutover recovery record is malformed" ;;
+    esac
+  done <"$pending_file"
+  [[ "$line_count" -eq 2 && -n "$previous_record" && -n "$candidate_record" ]] || die "cutover recovery record is incomplete"
+
+  if [[ "$current_slot" == "$previous_record" ]]; then
+    clear_pending_record
+    return 0
+  fi
+  [[ "$current_slot" == "$candidate_record" ]] || die "cutover recovery record does not match active slot"
+  if [[ "$previous_record" == "none" ]]; then
+    rm -f -- "$active" || die "interrupted cutover recovery could not remove active link"
+  else
+    validate_slot_layout "$previous_record"
+    [[ -S "$runtime_root/$previous_record/app.sock" ]] || die "previous slot socket is not present for interrupted cutover recovery"
+    health_check "$root_dir/slots/$previous_record/app.sock" || die "previous slot is not ready for interrupted cutover recovery"
+    ln -s -- "$root_dir/slots/$previous_record" "$rollback_link" || die "interrupted cutover recovery could not stage previous link"
+    mv -Tf -- "$rollback_link" "$active" || die "interrupted cutover recovery could not restore previous link"
+    health_check "$active/app.sock" || die "previous slot failed interrupted cutover recovery"
+  fi
+  clear_pending_record
+  read_current_slot
+}
+
+recover_pending_cutover
+validate_candidate_layout
+[[ -S "$expected_socket" ]] || die "candidate runtime socket is not present"
+
 health_check "$expected_socket" || die "candidate health check failed"
 active_matches_current || die "active changed while candidate was becoming ready"
 
+validate_candidate_layout
+active_matches_current || die "active changed before cutover"
+write_pending_record
 ln -s -- "$candidate" "$temporary_link"
 # `active` is itself a symlink to a slot directory. GNU mv without -T treats
 # that directory target as a container and moves the temporary link inside it;
 # -T makes the replacement operate on the link path, preserving atomic cutover.
-active_matches_current || die "active changed before cutover"
 mv -Tf -- "$temporary_link" "$active"
 if ! health_check "$active/app.sock"; then
   if [[ ! -L "$active" ]] || [[ "$(readlink -f -- "$active")" != "$candidate" ]]; then
@@ -147,7 +215,9 @@ if ! health_check "$active/app.sock"; then
     mv -Tf -- "$rollback_link" "$active" || die "candidate failed post-cutover health and active rollback failed"
     health_check "$active/app.sock" || die "candidate failed post-cutover health; previous slot rollback is not ready"
   fi
+  clear_pending_record
   die "candidate failed post-cutover health; rolled back to $current_slot"
 fi
+clear_pending_record
 printf '{"dry_run":false,"previous":"%s","active":"%s","health":"ready"}\n' \
   "$current_slot" "$slot"

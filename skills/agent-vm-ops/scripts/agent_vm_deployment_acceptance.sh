@@ -9,19 +9,33 @@ caddy_pid=""
 rqlite_auth_file=""
 rqlite_auth_config=""
 keep_proof="${KEEP_PROOF_DIR:-0}"
+runtime_home="$proof_dir/home"
+runtime_path="/usr/local/bin:/usr/bin:/bin"
+mkdir -p -- "$runtime_home"
+
+stop_process() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 0
+  kill -TERM "$pid" 2>/dev/null || true
+  for _ in $(seq 1 50); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
 
 cleanup() {
   if [[ -n "$caddy_pid" ]]; then
-    kill -TERM "$caddy_pid" 2>/dev/null || true
-    wait "$caddy_pid" 2>/dev/null || true
+    stop_process "$caddy_pid"
   fi
   if [[ -n "$backend_pid" ]]; then
-    kill -TERM "$backend_pid" 2>/dev/null || true
-    wait "$backend_pid" 2>/dev/null || true
+    stop_process "$backend_pid"
   fi
   if [[ -n "$rqlited_pid" ]]; then
-    kill -TERM "$rqlited_pid" 2>/dev/null || true
-    wait "$rqlited_pid" 2>/dev/null || true
+    stop_process "$rqlited_pid"
   fi
   if [[ -n "$rqlite_auth_file" ]]; then
     rm -f -- "$rqlite_auth_file"
@@ -55,6 +69,7 @@ require_command tar
 require_command openssl
 require_command systemd-analyze
 require_command xcaddy
+require_command go
 
 static_result="$proof_dir/static.json"
 bun run "$repository_root/skills/agent-vm-ops/scripts/validate_blue_green_deployment.ts" >"$static_result" || {
@@ -69,7 +84,14 @@ expected_caddy_sha512_args=()
 if [[ -n "${CADDY_SHA512:-}" ]]; then
   expected_caddy_sha512_args=(--expected-sha512 "$CADDY_SHA512")
 fi
-bun run "$repository_root/skills/agent-vm-ops/scripts/build_caddy.ts" \
+build_path="$(dirname "$(command -v bun)"):$(dirname "$(command -v xcaddy)"):$(dirname "$(command -v go)"):$runtime_path"
+acceptance_goproxy="${AGENT_VM_ACCEPTANCE_GOPROXY:-https://proxy.golang.org,direct}"
+env -i \
+  PATH="$build_path" \
+  HOME="$runtime_home" \
+  GOPROXY="$acceptance_goproxy" \
+  GOSUMDB=sum.golang.org \
+  "$(command -v bun)" run "$repository_root/skills/agent-vm-ops/scripts/build_caddy.ts" \
   --caddy-version "$caddy_version" \
   --target linux/amd64 \
   --output "$caddy_binary" \
@@ -98,7 +120,13 @@ sed \
   -e "s#/var/lib/agent-vm-native/caddy#$proof_dir/caddy-data#g" \
   "$repository_root/skills/agent-vm-ops/assets/blue-green/Caddyfile.example" >"$caddy_config"
 mkdir -p -- "$proof_dir/caddy-data"
-AGENT_VM_DOMAIN="localhost:8443" DNSPOD_TOKEN="isolated-dnspod-token" \
+env -i \
+  PATH="$runtime_path" \
+  HOME="$runtime_home" \
+  XDG_CONFIG_HOME="$proof_dir/xdg-config" \
+  XDG_DATA_HOME="$proof_dir/xdg-data" \
+  AGENT_VM_DOMAIN="localhost:8443" \
+  DNSPOD_TOKEN="isolated-dnspod-token" \
   "$caddy_binary" validate --config "$caddy_config" --adapter caddyfile >"$proof_dir/caddy-validate.json" 2>&1
 
 backend_socket="$proof_dir/backend.sock"
@@ -109,7 +137,8 @@ sed -e "s#/var/lib/agent-vm-native/active/app.sock#$backend_socket#g" "$caddy_co
       skip_tls && /^[[:space:]]*\}$/ { skip_tls=0; next }
       !skip_tls { print }
     ' >"$smoke_config"
-python3 - "$backend_socket" >"$proof_dir/backend.log" 2>&1 <<'PY' &
+env -i PATH="$runtime_path" HOME="$runtime_home" PYTHONUNBUFFERED=1 \
+  python3 - "$backend_socket" >"$proof_dir/backend.log" 2>&1 <<'PY' &
 import http.server
 import os
 import socketserver
@@ -144,7 +173,13 @@ for _ in $(seq 1 40); do
 done
 [[ -S "$backend_socket" ]] || fail "Unix backend did not start"
 caddy_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
-AGENT_VM_DOMAIN="localhost:$caddy_port" DNSPOD_TOKEN="isolated-dnspod-token" \
+env -i \
+  PATH="$runtime_path" \
+  HOME="$runtime_home" \
+  XDG_CONFIG_HOME="$proof_dir/xdg-config" \
+  XDG_DATA_HOME="$proof_dir/xdg-data" \
+  AGENT_VM_DOMAIN="localhost:$caddy_port" \
+  DNSPOD_TOKEN="isolated-dnspod-token" \
   "$caddy_binary" run --config "$smoke_config" --adapter caddyfile >"$proof_dir/caddy.log" 2>&1 &
 caddy_pid=$!
 auth_header_token="isolated-${BASHPID}-token"
@@ -170,11 +205,9 @@ blocked_code="$(curl --silent --show-error --output /dev/null --write-out '%{htt
 if grep -q "$query_marker\|$auth_header_token" "$proof_dir/caddy.log"; then
   fail "Caddy access log retained sensitive request data"
 fi
-kill -TERM "$caddy_pid" 2>/dev/null || true
-wait "$caddy_pid" 2>/dev/null || true
+stop_process "$caddy_pid"
 caddy_pid=""
-kill -TERM "$backend_pid" 2>/dev/null || true
-wait "$backend_pid" 2>/dev/null || true
+stop_process "$backend_pid"
 backend_pid=""
 
 unit_dir="$repository_root/skills/agent-vm-ops/assets/systemd"
@@ -274,7 +307,8 @@ http_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 
 raft_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 rqlite_data="$proof_dir/rqlite-data"
 mkdir -p -- "$rqlite_data"
-"$rqlited" \
+env -i PATH="$runtime_path" HOME="$runtime_home" \
+  "$rqlited" \
   -node-id isolated-agent-vm \
   -http-addr "127.0.0.1:$http_port" \
   -raft-addr "127.0.0.1:$raft_port" \

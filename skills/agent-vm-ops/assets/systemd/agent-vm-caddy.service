@@ -14,7 +14,7 @@ SupplementaryGroups=agent-vm-web
 EnvironmentFile=/etc/agent-vm-native/caddy.env
 ExecStartPre=/usr/bin/test -L /var/lib/agent-vm-native/active
 ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock
-ExecStartPre=+/bin/sh -c 'attempt=0; while [ "$attempt" -lt 30 ]; do if /usr/bin/curl --fail --silent --show-error --max-time 1 --unix-socket /var/lib/agent-vm-native/active/app.sock http://localhost/internal/v1/health >/dev/null; then exit 0; fi; attempt=$((attempt + 1)); /usr/bin/sleep 0.5; done; exit 1'
+ExecStartPre=+/bin/sh -c 'attempt=0; while [ "$$attempt" -lt 30 ]; do if /usr/bin/curl --fail --silent --show-error --max-time 1 --unix-socket /var/lib/agent-vm-native/active/app.sock http://localhost/internal/v1/health >/dev/null; then exit 0; fi; attempt=$$(($$attempt + 1)); /usr/bin/sleep 0.5; done; exit 1'
 ExecStartPre=/bin/sh -c 'test "$(stat -c "%%u:%%g:%%a" /etc/agent-vm-native/caddy.env)" = "0:0:600"'
 ExecStart=/usr/local/bin/caddy run --config /etc/agent-vm-native/Caddyfile --adapter caddyfile
 ExecReload=/usr/local/bin/caddy reload --config /etc/agent-vm-native/Caddyfile --adapter caddyfile

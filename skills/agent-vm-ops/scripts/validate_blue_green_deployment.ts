@@ -159,6 +159,8 @@ requireText(caddyUnit, "ConditionPathExists=/etc/agent-vm-native/caddy.env", "Ca
 requireText(caddyUnit, "EnvironmentFile=/etc/agent-vm-native/caddy.env", "Caddy receives DNSPod credentials from its environment file");
 requireText(caddyUnit, "ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock", "Caddy checks the active socket before starting");
 requireText(caddyUnit, "ExecStartPre=+/bin/sh -c", "Caddy runs its active socket readiness probe with root peer credentials");
+requireText(caddyUnit, 'while [ "$$attempt" -lt 30 ]', "systemd preserves the Caddy readiness loop shell variable");
+requireText(caddyUnit, "attempt=$$(($$attempt + 1))", "systemd preserves the Caddy readiness loop arithmetic");
 requireText(caddyUnit, "--unix-socket /var/lib/agent-vm-native/active/app.sock http://localhost/internal/v1/health", "Caddy waits for a ready native listener, not only a socket inode");
 requireText(caddyUnit, "stat -c", "Caddy verifies the environment file metadata before starting");
 requireText(caddyUnit, "0:0:600", "Caddy requires a root-owned mode-0600 environment file");
@@ -169,6 +171,9 @@ forbidText(caddyUnit, "--environ", "Caddy does not dump the DNSPod environment a
 requireText(acceptance, "rqlite-curl.conf", "rqlite readiness credentials use a temporary curl config");
 requireText(acceptance, "umask 077", "temporary rqlite curl credentials are owner-only");
 requireText(acceptance, "require_command flock", "isolated acceptance checks the active link lock dependency");
+requireText(acceptance, "env -i", "isolated runtime children do not inherit ambient credentials");
+requireText(acceptance, "stop_process", "isolated acceptance bounds runtime child cleanup");
+requireText(acceptance, "kill -KILL", "isolated acceptance force-cleans stalled runtime children");
 for (const commandPath of ["$systemd_root/bin/sh", "$systemd_root/usr/bin/curl", "$systemd_root/usr/bin/sleep", "$systemd_root/usr/bin/stat"]) {
   requireText(acceptance, commandPath, `systemd staging root provides ${commandPath}`);
 }
@@ -179,6 +184,9 @@ forbidText(acceptance, '--user "agent-vm-backup:$backup_secret"', "rqlite creden
 requireText(cutover, 'health_check "$active/app.sock"', "cutover rechecks the active socket after atomic replacement");
 requireText(cutover, "active_matches_current || die", "cutover refuses to replace an active link changed during readiness");
 requireText(cutover, "rollback_link", "cutover has a protected rollback link for post-swap health failure");
+requireText(cutover, "pending_file", "cutover persists an interrupted-swap recovery record");
+requireText(cutover, "recover_pending_cutover", "cutover recovers an interrupted swap before a new replacement");
+requireText(cutover, "validate_candidate_layout", "cutover revalidates the candidate while holding the active lock");
 requireText(cutover, "flock --wait 30 9", "cutover serializes active link writers with a kernel lock");
 forbidText(cutover, 'mkdir -- "$lock_dir"', "cutover does not use a crash-stale directory lock");
 forbidText(caddyUnit, "/etc/agent-vm-native/tls/caddy", "Caddy systemd unit does not require static certificate files");
