@@ -154,6 +154,7 @@ mkdir -p -- \
   "$systemd_root/etc/agent-vm-native/slots/green" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/bin" \
   "$systemd_root/opt/agent-vm-native/bin" \
+  "$systemd_root/var/lib/agent-vm-native/slots/test_instance/bin" \
   "$systemd_root/var/lib/agent-vm-native/slots/blue/bin" \
   "$systemd_root/var/lib/agent-vm-native/slots/green/bin" \
   "$systemd_root/usr/bin" \
@@ -169,9 +170,9 @@ touch \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/release-manifest.json" \
   "$systemd_root/var/lib/agent-vm-native/slots/blue/release-manifest.json" \
   "$systemd_root/var/lib/agent-vm-native/slots/green/release-manifest.json"
-touch "$systemd_root/usr/bin/test" "$systemd_root/usr/local/bin/caddy" "$systemd_root/usr/local/bin/rqlited" "$systemd_root/opt/agent-vm-native/bin/agent-vm-deployd" "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control" "$systemd_root/var/lib/agent-vm-native/slots/blue/bin/agent-vm-control" "$systemd_root/var/lib/agent-vm-native/slots/green/bin/agent-vm-control"
+touch "$systemd_root/usr/bin/test" "$systemd_root/usr/local/bin/caddy" "$systemd_root/usr/local/bin/rqlited" "$systemd_root/opt/agent-vm-native/bin/agent-vm-deployd" "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control" "$systemd_root/var/lib/agent-vm-native/slots/test_instance/bin/agent-vm-control" "$systemd_root/var/lib/agent-vm-native/slots/blue/bin/agent-vm-control" "$systemd_root/var/lib/agent-vm-native/slots/green/bin/agent-vm-control"
 chmod 0755 "$systemd_root/usr/bin/test" "$systemd_root/usr/local/bin/caddy" "$systemd_root/usr/local/bin/rqlited" "$systemd_root/opt/agent-vm-native/slots/test_instance/bin/agent-vm-control"
-chmod 0755 "$systemd_root/opt/agent-vm-native/bin/agent-vm-deployd" "$systemd_root/var/lib/agent-vm-native/slots/blue/bin/agent-vm-control" "$systemd_root/var/lib/agent-vm-native/slots/green/bin/agent-vm-control"
+chmod 0755 "$systemd_root/opt/agent-vm-native/bin/agent-vm-deployd" "$systemd_root/var/lib/agent-vm-native/slots/test_instance/bin/agent-vm-control" "$systemd_root/var/lib/agent-vm-native/slots/blue/bin/agent-vm-control" "$systemd_root/var/lib/agent-vm-native/slots/green/bin/agent-vm-control"
 printf '%s\n' \
   'root:x:0:0:root:/root:/bin/sh' \
   'caddy:x:995:995:caddy:/var/lib/caddy:/usr/sbin/nologin' \
