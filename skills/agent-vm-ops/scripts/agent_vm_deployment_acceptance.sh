@@ -98,6 +98,7 @@ stop_process() {
 }
 
 cleanup() {
+  local original_status="$?"
   if [[ -n "$caddy_pid" || -n "$caddy_pgid" ]]; then
     stop_process "$caddy_pid" "$caddy_pgid" || cleanup_failed=1
   fi
@@ -126,13 +127,17 @@ cleanup() {
   fi
   if (( cleanup_failed != 0 )); then
     printf 'cleanup incomplete; live acceptance process tree retained at %s\n' "$proof_dir" >&2
-    return 0
+    exit 1
   fi
   if [[ "$keep_proof" != 1 ]]; then
-    rm -rf -- "$proof_dir"
+    rm -rf -- "$proof_dir" || {
+      printf 'cleanup incomplete; proof directory could not be removed: %s\n' "$proof_dir" >&2
+      exit 1
+    }
   else
     printf 'proof_dir=%s\n' "$proof_dir" >&2
   fi
+  exit "$original_status"
 }
 trap cleanup EXIT
 
@@ -187,14 +192,27 @@ env -i \
   --caddy-version "$caddy_version" \
   --target linux/amd64 \
   --output "$caddy_binary" \
-  "${expected_caddy_sha512_args[@]}" >"$proof_dir/caddy-build.json"
+  "${expected_caddy_sha512_args[@]}" >"$proof_dir/caddy-build.log" 2>&1
 [[ -x "$caddy_binary" ]] || fail "Caddy custom build was not found"
-caddy_build_sha512="$(python3 - "$proof_dir/caddy-build.json" <<'PY'
+caddy_build_sha512="$(python3 - "$proof_dir/caddy-build.log" "$proof_dir/caddy-build.json" <<'PY'
 import json
 import sys
 
-with open(sys.argv[1], encoding="utf-8") as handle:
-    receipt = json.load(handle)
+log_path, receipt_path = sys.argv[1:]
+receipt = None
+with open(log_path, encoding="utf-8") as handle:
+    for line in reversed(handle.readlines()):
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and candidate.get("observed_caddy_version"):
+            receipt = candidate
+            break
+if receipt is None:
+    raise SystemExit("Caddy build emitted no JSON receipt")
+with open(receipt_path, "w", encoding="utf-8") as handle:
+    json.dump(receipt, handle, sort_keys=True, separators=(",", ":"))
 if receipt.get("observed_caddy_version") != receipt.get("requested_version"):
     raise SystemExit("Caddy build receipt version mismatch")
 if not receipt.get("sha512") or len(receipt["sha512"]) != 128:

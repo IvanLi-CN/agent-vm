@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -173,7 +173,7 @@ for argument in "$@"; do
   fi
   previous="$argument"
 done
-printf '%s\\n' "$@" > "$output.args"
+printf '%s\\n' "$@" > "$(dirname "$(dirname "$output")")/xcaddy.args"
 if env | grep -qE '^(DNSPOD_TOKEN|AGENT_VM_DOMAIN)='; then
   printf '%s\\n' 'deployment environment leaked to xcaddy' >&2
   exit 23
@@ -196,9 +196,13 @@ chmod 0755 "$output"
     writeFileSync(go, `#!/bin/sh
 set -eu
 if [ "\$1" = "version" ] && [ "\$2" = "-m" ]; then
-  case "\$3" in
-    *mismatched-version-caddy) caddy_version=v2.10.1; provider_version=v0.0.5-0.20260325061251-fb7cc31cc04c ;;
-    *mismatched-provider-caddy) caddy_version=v2.10.0; provider_version=v0.0.5-0.20260325061251-000000000000 ;;
+  mode=normal
+  if [ -f "${join(temporaryRoot, "fake-go-mode")}" ]; then
+    mode="\$(cat "${join(temporaryRoot, "fake-go-mode")}")"
+  fi
+  case "\$mode" in
+    version) caddy_version=v2.10.1; provider_version=v0.0.5-0.20260325061251-fb7cc31cc04c ;;
+    provider) caddy_version=v2.10.0; provider_version=v0.0.5-0.20260325061251-000000000000 ;;
     *) caddy_version=v2.10.0; provider_version=v0.0.5-0.20260325061251-fb7cc31cc04c ;;
   esac
   printf '%s\\n' 'path caddy' "mod github.com/caddyserver/caddy/v2 \$caddy_version" "dep github.com/caddy-dns/dnspod \$provider_version"
@@ -227,12 +231,10 @@ exit 1
     });
     expect(built.exitCode).toBe(0);
     expect(statSync(output).mode & 0o111).not.toBe(0);
-    const args = readFileSync(`${output}.args`, "utf8").trim().split("\n");
-    expect(args).toEqual([
-      "build",
-      "v2.10.0",
-      "--output",
-      output,
+    const args = readFileSync(join(temporaryRoot, "xcaddy.args"), "utf8").trim().split("\n");
+    expect(args.slice(0, 3)).toEqual(["build", "v2.10.0", "--output"]);
+    expect(args[3]).toMatch(/\/\.caddy-build-[^/]+\/caddy$/);
+    expect(args.slice(4)).toEqual([
       "--with",
       "github.com/caddy-dns/dnspod@fb7cc31cc04c68a304b8d2672c3e5d9f2ad3d7ba",
     ]);
@@ -241,6 +243,42 @@ exit 1
     expect(buildReceipt.observed_provider_version).toContain("-fb7cc31cc04c");
     expect(buildReceipt.sha512).toMatch(/^[0-9a-f]{128}$/);
 
+    const existingOutput = join(temporaryRoot, "existing-caddy");
+    writeFileSync(existingOutput, "previous-caddy\n");
+    const failedReplacement = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      existingOutput,
+      "--expected-sha512",
+      "0".repeat(128),
+    ], { env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` } });
+    expect(failedReplacement.exitCode).not.toBe(0);
+    expect(readFileSync(existingOutput, "utf8")).toBe("previous-caddy\n");
+
+    const symlinkTarget = join(temporaryRoot, "caddy-target");
+    const symlinkOutput = join(temporaryRoot, "symlink-caddy");
+    writeFileSync(symlinkTarget, "protected-caddy\n");
+    symlinkSync(symlinkTarget, symlinkOutput);
+    const rejectedSymlink = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      symlinkOutput,
+    ], { env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` } });
+    expect(rejectedSymlink.exitCode).not.toBe(0);
+    expect(lstatSync(symlinkOutput).isSymbolicLink()).toBe(true);
+    expect(readFileSync(symlinkTarget, "utf8")).toBe("protected-caddy\n");
+
+    writeFileSync(join(temporaryRoot, "fake-go-mode"), "version\n");
     const mismatchedVersion = run([
       process.execPath,
       resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
@@ -258,6 +296,7 @@ exit 1
     });
     expect(mismatchedVersion.exitCode).not.toBe(0);
 
+    writeFileSync(join(temporaryRoot, "fake-go-mode"), "provider\n");
     const mismatchedProvider = run([
       process.execPath,
       resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
@@ -369,6 +408,10 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain("active target slot is missing");
   expect(cutover).toContain("flock --wait 30 9");
   expect(cutover).toContain("mktemp -d -- \"$root_dir/.active-stage.XXXXXX\"");
+  expect(cutover).toContain('[[ -L "$lock_path" ]]');
+  expect(cutover).toContain('ln -- "$lock_seed" "$lock_path"');
+  expect(cutover).toContain('mktemp "$stage_dir/pending.XXXXXX"');
+  expect(cutover).not.toContain(".active.cutover.pending.$$.tmp");
   expect(cutover).not.toContain(".active.$$.tmp");
   expect(cutover).not.toContain('mkdir -- "$lock_dir"');
   expect(cutover).toContain("Every writer of the protected active link must hold this kernel lock");
@@ -388,6 +431,7 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(acceptance).toContain('wait "$pid"');
   expect(acceptance).toContain('rm -f -- "$rqlite_auth_file" || cleanup_failed=1');
   expect(acceptance).toContain('rm -f -- "$rqlite_auth_config" || cleanup_failed=1');
+  expect(acceptance).toContain("exit 1");
   expect(acceptance).toContain("chown 994:994");
   expect(acceptance).toContain("staged rqlite auth metadata does not satisfy ExecStartPre");
   expect(acceptance).toContain("staged Caddy environment metadata does not satisfy ExecStartPre");

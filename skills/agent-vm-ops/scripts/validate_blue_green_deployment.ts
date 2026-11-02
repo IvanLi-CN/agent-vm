@@ -157,6 +157,7 @@ forbidText(slotUnit, "ExecStart=/usr/bin/caddy", "slot service does not start a 
 const caddyUnit = read(join(assetsRoot, "systemd/agent-vm-caddy.service"));
 const acceptance = read(join(repositoryRoot, "skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh"));
 const cutover = read(join(import.meta.dir, "agent_vm_cutover.sh"));
+const caddyBuilder = read(join(import.meta.dir, "build_caddy.ts"));
 const ciWorkflow = read(join(repositoryRoot, ".github/workflows/ci.yml"));
 requireText(caddyUnit, "User=caddy", "Caddy does not run as root");
 requireText(caddyUnit, "After=network-online.target", "Caddy waits for network readiness before DNS-01");
@@ -200,6 +201,10 @@ requireText(acceptance, 'rm -f -- "$rqlite_auth_file"', "temporary rqlite auth f
 requireText(acceptance, "failed post-swap health", "isolated acceptance executes the rollback path");
 requireText(acceptance, 'previous=blue\\ncandidate=green', "isolated acceptance executes pending recovery");
 requireText(acceptance, "pending recovery did not restore blue", "isolated acceptance verifies pending recovery");
+requireText(acceptance, "exit 1", "isolated acceptance fails when cleanup is incomplete");
+requireText(caddyBuilder, "mkdtempSync", "Caddy builds into a private staging directory");
+requireText(caddyBuilder, "renameSync(stagingOutput, options.output)", "Caddy installs only after verification via atomic rename");
+requireText(caddyBuilder, "isSymbolicLink()", "Caddy rejects symlinked output paths");
 requireText(ciWorkflow, "github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.4", "Ubuntu PR gate installs a pinned xcaddy builder");
 requireText(ciWorkflow, "skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh", "Ubuntu PR gate runs isolated deployment acceptance");
 requireText(ciWorkflow, "repos/caddyserver/caddy/releases", "Ubuntu PR gate resolves an official Caddy release");
@@ -222,6 +227,10 @@ requireText(cutover, "sync -f", "cutover flushes recovery and active-link direct
 requireText(cutover, "candidate_record/app.sock", "cutover confirms a pending candidate before rollback");
 requireText(cutover, "flock --wait 30 9", "cutover serializes active link writers with a kernel lock");
 requireText(cutover, 'mktemp -d -- "$root_dir/.active-stage.XXXXXX"', "cutover uses PID-independent unique staging");
+requireText(cutover, '[[ -L "$lock_path" ]]', "cutover rejects a symlinked active-link lock");
+requireText(cutover, 'ln -- "$lock_seed" "$lock_path"', "cutover atomically creates the active-link lock without following a symlink");
+requireText(cutover, 'mktemp "$stage_dir/pending.XXXXXX"', "cutover uses PID-independent pending staging");
+forbidText(cutover, ".active.cutover.pending.$$.tmp", "cutover does not reuse PID-derived pending staging names");
 forbidText(cutover, ".active.$$.tmp", "cutover does not reuse PID-derived staging names");
 forbidText(cutover, 'mkdir -- "$lock_dir"', "cutover does not use a crash-stale directory lock");
 forbidText(caddyUnit, "/etc/agent-vm-native/tls/caddy", "Caddy systemd unit does not require static certificate files");

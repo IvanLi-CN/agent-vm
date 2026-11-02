@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 
 const repositoryRoot = resolve(import.meta.dir, "../../..");
@@ -177,75 +177,92 @@ export function buildCaddy(args: string[], environment: Record<string, string | 
   const options = parseArgs(args);
   const metadata = readCaddyMetadata();
   const sanitizedEnvironment = buildEnvironment(environment);
-  mkdirSync(dirname(options.output), { recursive: true });
-
-  let result: ReturnType<typeof Bun.spawnSync>;
   try {
-    result = Bun.spawnSync([metadata.builder, ...commandFor(options, metadata)], {
-      env: {
-        ...sanitizedEnvironment,
-        GOOS: "linux",
-        GOARCH: options.target === "linux/amd64" ? "amd64" : "arm64",
-      },
-      stdout: "inherit",
-      stderr: "inherit",
-    });
+    const outputStat = lstatSync(options.output);
+    if (outputStat.isSymbolicLink()) fail(`Caddy output must not be a symlink: ${options.output}`);
+    if (!outputStat.isFile()) fail(`Caddy output must be a regular file: ${options.output}`);
   } catch (error) {
-    fail(`failed to start ${metadata.builder}: ${error instanceof Error ? error.message : String(error)}`);
+    if (!(error instanceof Error) || !("code" in error) || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
+  mkdirSync(dirname(options.output), { recursive: true });
+  const stagingDirectory = mkdtempSync(join(dirname(options.output), ".caddy-build-"));
+  const stagingOutput = join(stagingDirectory, "caddy");
 
-  if (result.exitCode !== 0) fail(`${metadata.builder} exited with status ${result.exitCode}`);
-  if (!existsSync(options.output)) fail(`Caddy build did not create ${options.output}`);
-  const mode = statSync(options.output).mode & 0o777;
-  if ((mode & 0o111) === 0) fail(`Caddy build output is not executable: ${options.output}`);
-  // `go version -m` inspects Go build metadata without executing the target
-  // binary, so cross-compiled linux/amd64 and linux/arm64 outputs are both
-  // verifiable from the operator's build host.
-  const buildInfo = Bun.spawnSync(["go", "version", "-m", options.output], {
-    env: sanitizedEnvironment,
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  const buildInfoOutput = new TextDecoder().decode(buildInfo.stdout);
-  const observedCaddyVersion = moduleVersion(buildInfoOutput, "github.com/caddyserver/caddy/v2");
-  const observedProviderVersion = moduleVersion(buildInfoOutput, metadata.provider_module);
-  if (buildInfo.exitCode !== 0 || !observedCaddyVersion.startsWith("v2.")) {
-    fail(`Caddy build does not contain the Caddy v2 module metadata: ${buildInfoOutput.trim() || "no build metadata"}`);
+  try {
+    const buildOptions = { ...options, output: stagingOutput };
+    let result: ReturnType<typeof Bun.spawnSync>;
+    try {
+      result = Bun.spawnSync([metadata.builder, ...commandFor(buildOptions, metadata)], {
+        env: {
+          ...sanitizedEnvironment,
+          GOOS: "linux",
+          GOARCH: options.target === "linux/amd64" ? "amd64" : "arm64",
+        },
+        stdout: "inherit",
+        stderr: "inherit",
+      });
+    } catch (error) {
+      fail(`failed to start ${metadata.builder}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+
+    if (result.exitCode !== 0) fail(`${metadata.builder} exited with status ${result.exitCode}`);
+    if (!existsSync(stagingOutput)) fail(`Caddy build did not create ${stagingOutput}`);
+    const mode = statSync(stagingOutput).mode & 0o777;
+    if ((mode & 0o111) === 0) fail(`Caddy build output is not executable: ${stagingOutput}`);
+    // `go version -m` inspects Go build metadata without executing the target
+    // binary, so cross-compiled linux/amd64 and linux/arm64 outputs are both
+    // verifiable from the operator's build host.
+    const buildInfo = Bun.spawnSync(["go", "version", "-m", stagingOutput], {
+      env: sanitizedEnvironment,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const buildInfoOutput = new TextDecoder().decode(buildInfo.stdout);
+    const observedCaddyVersion = moduleVersion(buildInfoOutput, "github.com/caddyserver/caddy/v2");
+    const observedProviderVersion = moduleVersion(buildInfoOutput, metadata.provider_module);
+    if (buildInfo.exitCode !== 0 || !observedCaddyVersion.startsWith("v2.")) {
+      fail(`Caddy build does not contain the Caddy v2 module metadata: ${buildInfoOutput.trim() || "no build metadata"}`);
+    }
+    if (observedCaddyVersion !== options.caddyVersion) {
+      fail(`Caddy build version ${observedCaddyVersion || "<missing>"} does not match requested ${options.caddyVersion}`);
+    }
+    if (!observedProviderVersion) {
+      fail(`Caddy build does not contain ${metadata.provider_module}: ${buildInfoOutput.trim() || "no build metadata"}`);
+    }
+    const providerRefSuffix = metadata.provider_ref.slice(0, 12);
+    if (!observedProviderVersion.endsWith(`-${providerRefSuffix}`)) {
+      fail(`Caddy build DNSPod module ${observedProviderVersion} does not resolve to pinned ref ${metadata.provider_ref}`);
+    }
+    const sha512 = createHash("sha512").update(readFileSync(stagingOutput)).digest("hex");
+    const buildVcsRevision = buildInfoValue(buildInfoOutput, "vcs.revision");
+    const buildVcsModified = buildInfoValue(buildInfoOutput, "vcs.modified");
+    if (options.expectedSha512 && sha512 !== options.expectedSha512) {
+      fail(`Caddy SHA-512 ${sha512} does not match expected ${options.expectedSha512}`);
+    }
+    renameSync(stagingOutput, options.output);
+    const finalStat = lstatSync(options.output);
+    if (finalStat.isSymbolicLink() || !finalStat.isFile()) fail(`Caddy output was not installed as a regular file: ${options.output}`);
+    console.log(JSON.stringify({
+      schema_version: 1,
+      caddy_version: options.caddyVersion,
+      requested_version: options.caddyVersion,
+      observed_caddy_version: observedCaddyVersion,
+      provider_module: metadata.provider_module,
+      provider_module_name: metadata.provider_module_name,
+      provider_ref: metadata.provider_ref,
+      observed_provider_version: observedProviderVersion,
+      sha512,
+      build_vcs_revision: buildVcsRevision || null,
+      build_vcs_modified: buildVcsModified || null,
+      ...(options.expectedSha512 ? { expected_sha512: options.expectedSha512 } : {}),
+      target: options.target,
+      output: options.output,
+      verification: "go-version-m",
+    }));
+    return result.exitCode;
+  } finally {
+    rmSync(stagingDirectory, { recursive: true, force: true });
   }
-  if (observedCaddyVersion !== options.caddyVersion) {
-    fail(`Caddy build version ${observedCaddyVersion || "<missing>"} does not match requested ${options.caddyVersion}`);
-  }
-  if (!observedProviderVersion) {
-    fail(`Caddy build does not contain ${metadata.provider_module}: ${buildInfoOutput.trim() || "no build metadata"}`);
-  }
-  const providerRefSuffix = metadata.provider_ref.slice(0, 12);
-  if (!observedProviderVersion.endsWith(`-${providerRefSuffix}`)) {
-    fail(`Caddy build DNSPod module ${observedProviderVersion} does not resolve to pinned ref ${metadata.provider_ref}`);
-  }
-  const sha512 = createHash("sha512").update(readFileSync(options.output)).digest("hex");
-  const buildVcsRevision = buildInfoValue(buildInfoOutput, "vcs.revision");
-  const buildVcsModified = buildInfoValue(buildInfoOutput, "vcs.modified");
-  if (options.expectedSha512 && sha512 !== options.expectedSha512) {
-    fail(`Caddy SHA-512 ${sha512} does not match expected ${options.expectedSha512}`);
-  }
-  console.log(JSON.stringify({
-    schema_version: 1,
-    caddy_version: options.caddyVersion,
-    requested_version: options.caddyVersion,
-    observed_caddy_version: observedCaddyVersion,
-    provider_module: metadata.provider_module,
-    provider_module_name: metadata.provider_module_name,
-    provider_ref: metadata.provider_ref,
-    observed_provider_version: observedProviderVersion,
-    sha512,
-    build_vcs_revision: buildVcsRevision || null,
-    build_vcs_modified: buildVcsModified || null,
-    ...(options.expectedSha512 ? { expected_sha512: options.expectedSha512 } : {}),
-    target: options.target,
-    output: options.output,
-    verification: "go-version-m",
-  }));
-  return result.exitCode;
 }
 
 if (import.meta.main) {

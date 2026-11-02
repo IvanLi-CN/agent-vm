@@ -136,7 +136,20 @@ command -v sync >/dev/null 2>&1 || die "sync is required for cutover recovery du
 
 mkdir -p -- "$root_dir"
 lock_path="$root_dir/.cutover.lock"
-exec 9>"$lock_path" || die "cannot open the active link lock"
+lock_seed="$(mktemp "$root_dir/.cutover-lock.XXXXXX")" || die "cannot create the active link lock seed"
+if [[ -L "$lock_path" ]]; then
+  rm -f -- "$lock_seed"
+  die "active link lock is symlinked"
+fi
+if [[ ! -e "$lock_path" ]]; then
+  ln -- "$lock_seed" "$lock_path" || {
+    rm -f -- "$lock_seed"
+    die "cannot install the active link lock"
+  }
+fi
+rm -f -- "$lock_seed"
+[[ -f "$lock_path" && ! -L "$lock_path" ]] || die "active link lock is not a regular file"
+exec 9<>"$lock_path" || die "cannot open the active link lock"
 flock --wait 30 9 || die "another active link operation is in progress"
 stage_dir=""
 temporary_link=""
@@ -170,7 +183,8 @@ sync_path() {
 }
 
 write_pending_record() {
-  local pending_tmp="$root_dir/.active.cutover.pending.$$.tmp"
+  local pending_tmp
+  pending_tmp="$(mktemp "$stage_dir/pending.XXXXXX")" || die "cannot create the cutover recovery staging file"
   printf 'previous=%s\ncandidate=%s\n' "$current_slot" "$slot" >"$pending_tmp" || die "cannot write the cutover recovery record"
   chmod 0600 "$pending_tmp" || die "cannot protect the cutover recovery record"
   sync_path "$pending_tmp"
