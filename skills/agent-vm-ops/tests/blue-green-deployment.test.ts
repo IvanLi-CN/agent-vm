@@ -351,6 +351,9 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain("read_current_slot");
   expect(cutover).toContain("active_matches_current || die");
   expect(cutover).toContain("active target slot is missing");
+  expect(cutover).toContain("flock --wait 30 9");
+  expect(cutover).not.toContain('mkdir -- "$lock_dir"');
+  expect(cutover).toContain("Every writer of the protected active link must hold this kernel lock");
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-cutover-test-"));
   try {
     const layout = join(temporaryRoot, "layout");

@@ -48,6 +48,7 @@ require_command() {
 
 require_command bun
 require_command curl
+require_command flock
 require_command python3
 require_command sha256sum
 require_command tar

@@ -98,27 +98,24 @@ fi
 
 [[ "$EUID" -eq 0 ]] || die "health verification must run as root for the protected Unix endpoint"
 command -v curl >/dev/null 2>&1 || die "curl is required for the protected health check"
+command -v flock >/dev/null 2>&1 || die "flock is required for the active link lock"
 [[ -S "$expected_socket" ]] || die "candidate runtime socket is not present"
 
-lock_dir="$root_dir/.cutover.lock"
 mkdir -p -- "$root_dir"
-lock_acquired=0
-for _ in $(seq 1 300); do
-  if mkdir -- "$lock_dir" 2>/dev/null; then
-    lock_acquired=1
-    break
-  fi
-  sleep 0.1
-done
-(( lock_acquired == 1 )) || die "another cutover is in progress"
+lock_path="$root_dir/.cutover.lock"
+exec 9>"$lock_path" || die "cannot open the active link lock"
+flock --wait 30 9 || die "another active link operation is in progress"
 temporary_link="$root_dir/.active.$$.tmp"
 rollback_link="$root_dir/.active.$$.rollback.tmp"
 cleanup() {
   rm -f -- "$temporary_link"
   rm -f -- "$rollback_link"
-  rmdir -- "$lock_dir" 2>/dev/null || true
+  flock --unlock 9 2>/dev/null || true
+  exec 9>&-
 }
 trap cleanup EXIT
+# Every writer of the protected active link must hold this kernel lock. The
+# lock remains valid across the readiness checks and atomic replacement.
 read_current_slot
 
 health_check() {

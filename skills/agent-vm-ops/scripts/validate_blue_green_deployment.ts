@@ -168,6 +168,7 @@ requireText(caddyUnit, "ReadWritePaths=/var/lib/agent-vm-native/caddy", "Caddy c
 forbidText(caddyUnit, "--environ", "Caddy does not dump the DNSPod environment at startup");
 requireText(acceptance, "rqlite-curl.conf", "rqlite readiness credentials use a temporary curl config");
 requireText(acceptance, "umask 077", "temporary rqlite curl credentials are owner-only");
+requireText(acceptance, "require_command flock", "isolated acceptance checks the active link lock dependency");
 requireText(acceptance, 'rqlite_auth_file="$proof_dir/auth.json"', "temporary rqlite auth file has an explicit path");
 requireText(acceptance, 'chmod 0600 "$rqlite_auth_file"', "temporary rqlite auth file is owner-only");
 requireText(acceptance, 'rm -f -- "$rqlite_auth_file"', "temporary rqlite auth file is removed during cleanup");
@@ -175,6 +176,8 @@ forbidText(acceptance, '--user "agent-vm-backup:$backup_secret"', "rqlite creden
 requireText(cutover, 'health_check "$active/app.sock"', "cutover rechecks the active socket after atomic replacement");
 requireText(cutover, "active_matches_current || die", "cutover refuses to replace an active link changed during readiness");
 requireText(cutover, "rollback_link", "cutover has a protected rollback link for post-swap health failure");
+requireText(cutover, "flock --wait 30 9", "cutover serializes active link writers with a kernel lock");
+forbidText(cutover, 'mkdir -- "$lock_dir"', "cutover does not use a crash-stale directory lock");
 forbidText(caddyUnit, "/etc/agent-vm-native/tls/caddy", "Caddy systemd unit does not require static certificate files");
 requireText(caddyUnit, "CapabilityBoundingSet=CAP_NET_BIND_SERVICE", "Caddy has only its bind capability");
 forbidText(caddyUnit, "User=root", "Caddy is not configured as root");
