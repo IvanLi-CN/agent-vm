@@ -98,7 +98,7 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	if socket, socketErr := validateServeSocketOverride(*socketOverride); socketErr != nil {
+	if socket, socketErr := validateServeSocketOverride(*socketOverride, cfg); socketErr != nil {
 		return socketErr
 	} else if socket != "" {
 		cfg.Socket = socket
@@ -275,12 +275,21 @@ func stateBackend(value string) string {
 	return "sqlite"
 }
 
-func validateServeSocketOverride(value string) (string, error) {
+func validateServeSocketOverride(value string, cfg config.Config) (string, error) {
 	if value == "" {
 		return "", nil
 	}
 	if !filepath.IsAbs(value) {
 		return "", errors.New("config_invalid: serve socket override must be absolute")
+	}
+	value = filepath.Clean(value)
+	for name, reserved := range map[string]string{
+		"management.authority.socket_path":    cfg.Management.Authority.SocketPath,
+		"management.forward_auth.socket_path": cfg.Management.ForwardAuth.SocketPath,
+	} {
+		if reserved != "" && value == filepath.Clean(reserved) {
+			return "", fmt.Errorf("config_invalid: serve socket override must be distinct from %s", name)
+		}
 	}
 	return value, nil
 }

@@ -132,6 +132,7 @@ command -v flock >/dev/null 2>&1 || die "flock is required for the active link l
 command -v mktemp >/dev/null 2>&1 || die "mktemp is required for unique cutover staging"
 command -v stat >/dev/null 2>&1 || die "stat is required for cutover recovery metadata"
 command -v sync >/dev/null 2>&1 || die "sync is required for cutover recovery durability"
+command -v sha256sum >/dev/null 2>&1 || die "sha256sum is required for cutover recovery identity"
 [[ -S "$expected_socket" ]] || die "candidate runtime socket is not present"
 
 mkdir -p -- "$root_dir"
@@ -188,10 +189,33 @@ sync_path() {
   sync -f "$1" || die "cannot flush cutover path: $1"
 }
 
+slot_manifest_digest() {
+  local slot_name="$1"
+  local manifest_path="$root_dir/slots/$slot_name/release-manifest.json"
+  local digest
+  digest="$(sha256sum -- "$manifest_path")" || die "cannot hash slot release manifest: $slot_name"
+  digest="${digest%% *}"
+  [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || die "slot release manifest hash is invalid: $slot_name"
+  printf '%s\n' "$digest"
+}
+
+assert_manifest_digest() {
+  local slot_name="$1"
+  local expected_digest="$2"
+  [[ "$(slot_manifest_digest "$slot_name")" == "$expected_digest" ]] || die "slot release manifest changed during cutover recovery: $slot_name"
+}
+
 write_pending_record() {
   local pending_tmp
+  local previous_manifest="none"
+  if [[ "$current_slot" != "none" ]]; then
+    previous_manifest="$(slot_manifest_digest "$current_slot")"
+  fi
+  local candidate_manifest
+  candidate_manifest="$(slot_manifest_digest "$slot")"
   pending_tmp="$(mktemp "$stage_dir/pending.XXXXXX")" || die "cannot create the cutover recovery staging file"
-  printf 'previous=%s\ncandidate=%s\n' "$current_slot" "$slot" >"$pending_tmp" || die "cannot write the cutover recovery record"
+  printf 'previous=%s\ncandidate=%s\nprevious_manifest=%s\ncandidate_manifest=%s\n' \
+    "$current_slot" "$slot" "$previous_manifest" "$candidate_manifest" >"$pending_tmp" || die "cannot write the cutover recovery record"
   chmod 0600 "$pending_tmp" || die "cannot protect the cutover recovery record"
   sync_path "$pending_tmp"
   mv -Tf -- "$pending_tmp" "$pending_file" || die "cannot install the cutover recovery record"
@@ -210,6 +234,8 @@ recover_pending_cutover() {
 
   local previous_record=""
   local candidate_record=""
+  local previous_manifest_record=""
+  local candidate_manifest_record=""
   local line_count=0
   local line
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -217,17 +243,33 @@ recover_pending_cutover() {
     case "$line" in
       previous=blue|previous=green|previous=none) previous_record="${line#previous=}" ;;
       candidate=blue|candidate=green) candidate_record="${line#candidate=}" ;;
+      previous_manifest=*) previous_manifest_record="${line#previous_manifest=}" ;;
+      candidate_manifest=*) candidate_manifest_record="${line#candidate_manifest=}" ;;
       *) die "cutover recovery record is malformed" ;;
     esac
   done <"$pending_file"
-  [[ "$line_count" -eq 2 && -n "$previous_record" && -n "$candidate_record" ]] || die "cutover recovery record is incomplete"
+  [[ "$line_count" -eq 4 && -n "$previous_record" && -n "$candidate_record" && -n "$previous_manifest_record" && -n "$candidate_manifest_record" ]] || die "cutover recovery record is incomplete"
+  if [[ "$previous_record" == "none" ]]; then
+    [[ "$previous_manifest_record" == "none" ]] || die "cutover recovery previous manifest identity is invalid"
+  else
+    [[ "$previous_manifest_record" =~ ^[0-9a-f]{64}$ ]] || die "cutover recovery previous manifest identity is invalid"
+  fi
+  [[ "$candidate_manifest_record" =~ ^[0-9a-f]{64}$ ]] || die "cutover recovery candidate manifest identity is invalid"
+  assert_manifest_digest "$candidate_record" "$candidate_manifest_record"
 
   if [[ "$current_slot" == "$previous_record" ]]; then
+    if [[ "$previous_record" != "none" ]]; then
+      validate_slot_layout "$previous_record"
+      assert_manifest_digest "$previous_record" "$previous_manifest_record"
+      [[ -S "$runtime_root/$previous_record/app.sock" ]] || die "previous slot socket is not present for interrupted cutover recovery"
+      health_check "$root_dir/slots/$previous_record/app.sock" || die "previous slot is not ready for interrupted cutover recovery"
+    fi
     clear_pending_record
     return 0
   fi
   [[ "$current_slot" == "$candidate_record" ]] || die "cutover recovery record does not match active slot"
   validate_slot_layout "$candidate_record"
+  assert_manifest_digest "$candidate_record" "$candidate_manifest_record"
   if [[ -S "$runtime_root/$candidate_record/app.sock" ]] && health_check "$root_dir/slots/$candidate_record/app.sock"; then
     clear_pending_record
     return 0
@@ -237,6 +279,7 @@ recover_pending_cutover() {
     sync_path "$root_dir"
   else
     validate_slot_layout "$previous_record"
+    assert_manifest_digest "$previous_record" "$previous_manifest_record"
     [[ -S "$runtime_root/$previous_record/app.sock" ]] || die "previous slot socket is not present for interrupted cutover recovery"
     health_check "$root_dir/slots/$previous_record/app.sock" || die "previous slot is not ready for interrupted cutover recovery"
     ln -s -- "$root_dir/slots/$previous_record" "$rollback_link" || die "interrupted cutover recovery could not stage previous link"

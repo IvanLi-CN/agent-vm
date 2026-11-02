@@ -203,6 +203,7 @@ requireText(acceptance, 'chmod 0600 "$rqlite_auth_file"', "temporary rqlite auth
 requireText(acceptance, 'rm -f -- "$rqlite_auth_file"', "temporary rqlite auth file is removed during cleanup");
 requireText(acceptance, "failed post-swap health", "isolated acceptance executes the rollback path");
 requireText(acceptance, 'previous=blue\\ncandidate=green', "isolated acceptance executes pending recovery");
+requireText(acceptance, 'previous_manifest=%s\\ncandidate_manifest=%s', "isolated acceptance binds pending recovery to manifest identities");
 requireText(acceptance, "pending recovery did not restore blue", "isolated acceptance verifies pending recovery");
 requireText(acceptance, "exit 1", "isolated acceptance fails when cleanup is incomplete");
 requireText(caddyBuilder, "mkdtempSync", "Caddy builds into a private staging directory");
@@ -218,6 +219,8 @@ requireText(ciWorkflow, "^v2\\\\.", "Ubuntu PR gate selects only stable Caddy v2
 forbidText(ciWorkflow, "CADDY_VERSION: v2.", "Ubuntu PR gate does not pin a Caddy patch release");
 forbidText(acceptance, '--user "agent-vm-backup:$backup_secret"', "rqlite credentials are not placed in curl argv");
 requireText(cutover, 'health_check "$active/app.sock"', "cutover rechecks the active socket after atomic replacement");
+requireText(cutover, "slot_manifest_digest", "cutover records release manifest identities for recovery");
+requireText(cutover, "assert_manifest_digest", "cutover fails closed on a changed recovery manifest");
 requireText(cutover, "active_matches_current || die", "cutover refuses to replace an active link changed during readiness");
 requireText(cutover, "rollback_link", "cutover has a protected rollback link for post-swap health failure");
 requireText(cutover, "pending_file", "cutover persists an interrupted-swap recovery record");

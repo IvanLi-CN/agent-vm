@@ -639,7 +639,10 @@ fi
 printf 'ready\n' >"$cutover_health/green.mode"
 bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot green >"$proof_dir/cutover-green-recovery.json"
 printf 'fail\n' >"$cutover_health/green.mode"
-printf 'previous=blue\ncandidate=green\n' >"$layout_root/.active.cutover.pending"
+blue_manifest_sha256="$(sha256sum -- "$layout_root/slots/blue/release-manifest.json" | cut -d' ' -f1)"
+green_manifest_sha256="$(sha256sum -- "$layout_root/slots/green/release-manifest.json" | cut -d' ' -f1)"
+printf 'previous=blue\ncandidate=green\nprevious_manifest=%s\ncandidate_manifest=%s\n' \
+  "$blue_manifest_sha256" "$green_manifest_sha256" >"$layout_root/.active.cutover.pending"
 chmod 0600 "$layout_root/.active.cutover.pending"
 bash "$cutover_script" --root "$layout_root" --runtime-root "$runtime_root" --slot blue >"$proof_dir/cutover-recovery.json"
 [[ "$(readlink -f -- "$layout_root/active")" == "$(readlink -f -- "$layout_root/slots/blue")" ]] || fail "pending recovery did not restore blue"
