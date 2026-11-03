@@ -234,6 +234,32 @@ scenario("admin metrics bounds an unstable observation and reports a warning", a
   });
 });
 
+scenario("admin status preserves the bounded paginated observation contract", async f => {
+  await f.acquire({ session: "thread-a" });
+  await f.acquire({ session: "thread-b" });
+
+  const first = await f.call("admin-status", { session: null, limit: 1 });
+  expect(first.limit).toBe(1);
+  expect(first.tasks).toHaveLength(1);
+  expect(first.next_cursor).toBeString();
+  expect(first.partial).toBe(false);
+  expect(first.observation_consistent).toBe(true);
+  expect(first.probed).toBe(1);
+  expect(first.verified).toBe(1);
+  expect(first.timed_out).toBe(0);
+
+  const second = await f.call("admin-status", {
+    session: null,
+    limit: 25,
+    cursor: first.next_cursor,
+  });
+  expect(second.tasks).toHaveLength(1);
+  expect(second.next_cursor).toBeNull();
+  await expect_error("invalid_request", () =>
+    f.call("admin-status", { session: null, limit: 101 }),
+  );
+});
+
 scenario("activation fence prevents drain exit and leaves admission closed", async f => {
   await f.call("drain-enter", { session: null });
   writeFileSync(f.config.release_fence_path, "activation");

@@ -73,6 +73,8 @@ Controller 在 SQLite lock 外采样 native state，然后比较 probe 前后的
 Deployd 可以按 task ID join 两个 read-only responses，但不得暴露 raw error text、credentials 或 deployment filesystem paths。
 成功 scrape 后必须移除 stale task rows；任一 action 无法读取或解析时，必须报告 `up=0` 和 freshness failure。
 
+`admin-status` 接受可选的 numeric `limit` 和 task-id `cursor`。默认 limit 为 25，最大为 100，超过最大值必须拒绝。每页最多 8 个并发 native read，每个 probe deadline 为 1 秒，整页 deadline 为 5 秒。结果包含 `limit`、`next_cursor`、`partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out`。native observation 不可用或不确定时，task 的 `native_status` 必须为 `unknown`、`verified` 为 false，并计入 `unknown`；`native_missing` 仅是 observation detail，不创建 lifecycle state。
+
 Unknown flags 和 command layouts 必须拒绝；调用方应使用已安装 build 的 `--help`。
 
 ## Request 与 response

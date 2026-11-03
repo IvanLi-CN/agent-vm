@@ -122,6 +122,9 @@ Infrastructure operations 要求单独的显式授权，并使用相同的 confi
 
 Go control service 继续是 Incus operations、durable lifecycle state、lease generations、capacity admission、native mappings、observation snapshots 和 maintenance 的唯一 authority。
 其 in-process scheduler 负责 lease expiry、startup compensation、bounded retries 和 cache age-GC；systemd 只负责启动和重启 service，不是 durable scheduler。
+Scheduled reconcile 和 age-GC 使用独立的 single-flight lane、additive `maintenance_cursor` meta key、每轮最多 16 个 task 或 2 秒，以及 2/4/8/16/32/60 秒的 bounded retry backoff。
+Cursor 只有在 task/native journal commit 已 durable 后才前移；失败 round 记录 phase 和 error，但不前移失败 task。
+历史 `timer-reconcile` 和 `timer-age-gc` journal rows 仍可读取和恢复，但 scheduler tick 不创建新的 timer operation。
 本机 `agent-vm` CLI 仍是带版本的 request client；publication、update 和 rollback 属于 operator-owned deployment actions，不是 public CLI lifecycle commands。
 Unattended control-plane updates 默认关闭。
 
@@ -203,6 +206,8 @@ MUST NOT 将 configured address、CT identifier 或 Incus identity 解释为下�
 
 Recovery MUST 保留 state database 和 WAL/journals、operation 和 audit records、generations、configuration、protected recovery copies、native timer assets 以及 Incus container data。
 它 MUST 在 drain 下恢复匹配的 components，根据 native identity 和 generations reconcile durable records；当 state、provenance、capacity 或 native identity 缺失或不一致时，必须保持 admission closed。
+`native_missing` observation 只有在 exact contextual not-found result 时才能设置，且不得新增 task state 或单独 finalize cleanup。
+Failed acquire cleanup MAY 只清理明确的 pre-native、同 generation、无 worker effect 的 intent；terminal absence 还必须有 destroy journal、generation tombstone、worker quiescence 和 exact absence proof。
 MUST NOT invent operation IDs、reset generations、replay uncertain native effects 或执行 broad cleanup。
 
 ### REQ-AGENT-VM-012 - 稀疏磁盘故障边界
@@ -265,6 +270,7 @@ Pending 或 failed inventory read MUST NOT 移除最新有效的 capacity metric
 Retained source snapshot MUST 保留其原始 observation timestamp，并暴露 source-specific health 或 freshness failure；deployd MUST NOT 使用伪造的 zeroes 替换 unavailable values。
 Prometheus MUST 只抓取 deployd 的 `/metrics` endpoint，并使用 `job="agent-vm-deployd"`；槽位级 metric series MUST 带 `slot` label，以支持切换期间两个槽位同时存活。
 蓝色和绿色槽位 MUST 使用各自独立的 snapshot 目录；共享 snapshot 目录 MUST NOT 用于蓝绿运行。
+`admin-status` MUST use keyset pagination with a default page size of 25 and a maximum of 100, probe no more than 8 tasks concurrently, bound each task probe to 1 second and the page to 5 seconds, and expose `partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out` without treating unknown native state as healthy。
 
 这些规则的固定合同名称是 independent observation lanes、pending or failed inventory read、latest valid capacity metric families、retained source snapshot 和 original observation timestamp；它们对应上面的中文语义，不是额外的英文操作说明。
 

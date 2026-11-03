@@ -230,14 +230,19 @@ export class ResourceControl extends ControlCore {
 
   async _runtime_summary(task: Data): Promise<Data> {
     const result = this._state_summary(task);
-    result.guest_available = false;
+    result.guest_available = null;
+    result.native_status = "unknown";
+    result.verified = false;
     if (task.state === "absent") {
       result.native_status = "absent";
+      result.guest_available = false;
+      result.verified = true;
       return result;
     }
     try {
       await this._ownership(task);
       result.native_status = (await this.incus.instance_info(task.instance_name)).status;
+      result.verified = true;
       result.guest_available = result.effective_lease && result.native_status.toLowerCase() === "running";
       if (result.effective_lease && !result.guest_available)
         result.guest_error = {
@@ -246,8 +251,11 @@ export class ResourceControl extends ControlCore {
         };
     } catch (error) {
       if (!(error instanceof ControlError)) throw error;
-      result.native_status = "unverified";
+      result.native_status = "unknown";
+      result.guest_available = null;
       result.guest_error = error.as_dict();
+      if (is_record(error.detail) && error.detail.native_missing === true)
+        result.native_missing = true;
     }
     return result;
   }

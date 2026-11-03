@@ -3,6 +3,7 @@ package state
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -434,6 +435,98 @@ func TestTransactionErrorRetainsRollbackPhaseAndCommitState(t *testing.T) {
 	}
 	if _, found, err := store.Meta(context.Background(), "transaction-test"); err != nil || found {
 		t.Fatalf("rolled back metadata found=%v err=%v", found, err)
+	}
+}
+
+func TestMaintenanceCursorIsAdditiveAndValidated(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "maintenance-cursor.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	cursor, err := store.MaintenanceCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.Reconcile.NextAttemptAt == "" || cursor.AgeGC.NextAttemptAt == "" {
+		t.Fatalf("default maintenance cursor = %#v", cursor)
+	}
+	cursor.Reconcile.Attempt = 3
+	cursor.Reconcile.ScanAfterTaskID = "task-15"
+	cursor.Reconcile.LastErrorCode = "native_unavailable"
+	cursor.Reconcile.LastErrorPhase = "reconcile"
+	if err := store.SetMaintenanceCursor(ctx, cursor); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.MaintenanceCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Reconcile.Attempt != 3 || loaded.Reconcile.ScanAfterTaskID != "task-15" || loaded.Reconcile.LastErrorCode != "native_unavailable" {
+		t.Fatalf("loaded maintenance cursor = %#v", loaded)
+	}
+	if err := store.SetMeta(ctx, MaintenanceCursorMetaKey, `{"reconcile":{"attempt":7,"next_attempt_at":"2026-11-03T00:00:00Z","updated_at":"2026-11-03T00:00:00Z"},"age_gc":{"attempt":0,"next_attempt_at":"2026-11-03T00:00:00Z","updated_at":"2026-11-03T00:00:00Z"}}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MaintenanceCursor(ctx); err == nil {
+		t.Fatal("invalid maintenance cursor was accepted")
+	}
+}
+
+func TestOperationIdentityAndWorkerIdentityRemainImmutable(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "operation-identity.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session := "identity-session"
+	generation := int64(2)
+	if err := store.RecordOperation(ctx, "identity-operation", "acquire", &session, &generation, map[string]any{
+		"outcome": "pending", "_request_digest": "identity-digest", "worker": map[string]any{"state": "starting", "start_attempted": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	identity := map[string]any{"state": "running", "pid": int64(11), "start_time": "start-11", "process_group": int64(11)}
+	if err := store.RecordOperationWorker(ctx, "identity-operation", identity); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperationWorker(ctx, "identity-operation", map[string]any{"state": "running", "pid": int64(12), "start_time": "start-12", "process_group": int64(12)}); err == nil {
+		t.Fatal("worker identity overwrite was accepted")
+	}
+	if err := store.RecordOperation(ctx, "identity-operation", "acquire", &session, &generation, map[string]any{
+		"outcome": "success", "worker": map[string]any{"state": "finished", "pid": int64(12), "start_time": "start-12", "process_group": int64(12)},
+	}); err == nil {
+		t.Fatal("terminal worker identity overwrite was accepted")
+	}
+	if err := store.RecordOperation(ctx, "identity-operation", "acquire", &session, &generation, map[string]any{
+		"outcome": "success", "_request_digest": "different-digest",
+	}); err == nil {
+		t.Fatal("operation request digest overwrite was accepted")
+	}
+	if err := store.UpdateOperationResponse(ctx, "identity-operation", func(response map[string]any) error {
+		response["_request_digest"] = "different-digest"
+		return nil
+	}); err == nil {
+		t.Fatal("pending operation request digest mutation was accepted")
+	}
+	if err := store.RecordOperation(ctx, "identity-operation", "release", &session, &generation, map[string]any{"outcome": "success"}); err == nil {
+		t.Fatal("operation identity overwrite was accepted")
+	}
+	if err := store.RecordOperation(ctx, "identity-operation", "acquire", &session, &generation, map[string]any{"outcome": "success"}); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(ctx, "identity-operation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	if !ok || worker["pid"] != json.Number("11") {
+		t.Fatalf("finalized worker evidence = %#v", operation.Response)
+	}
+	if operation.Response["_request_digest"] != "identity-digest" {
+		t.Fatalf("finalized request digest = %#v", operation.Response["_request_digest"])
 	}
 }
 

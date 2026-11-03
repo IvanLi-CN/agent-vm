@@ -133,6 +133,7 @@ Slow 或 unavailable `admin-status` call MUST NOT 擦除 last valid `admin-metri
 Failed `admin-status` observation MUST remove 或 invalidate task rows，不得静默保留 stale inventory。
 反之，failed `admin-metrics` scrape MUST 将 capacity freshness 和 source health 标记为 failed；MUST NOT 被 newly completed inventory scrape 隐藏。
 Source-specific timestamps 和 health diagnostics MUST 与 aggregate `agent_vm_up` value 保持可区分。
+`admin-status` uses keyset pagination with a default page size of 25 and a maximum of 100, limits native probes to 8 concurrent tasks, applies a 1-second per-task and 5-second per-page deadline, and exposes `partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out`。Unknown or `native_missing` task observations remain unverified and must not be rendered as healthy。
 
 Prometheus MUST 只抓取 deployd 的 `/metrics` endpoint，并使用 `job="agent-vm-deployd"` 标识该 scrape target。
 Deployd 输出的槽位级 series MUST 带 `slot` label；部署级 series 不得因为两个槽位同时存活而生成重复的无槽位 series。
