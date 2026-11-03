@@ -45,6 +45,27 @@ func TestAdminMetricsValidationRejectsInconsistentObservation(t *testing.T) {
 	}
 }
 
+func TestAdminStatusValidationRetainsPartialObservation(t *testing.T) {
+	result := map[string]any{
+		"up": true, "observed_at": "2026-11-03T00:00:00Z", "partial": false,
+		"unknown": float64(0), "probed": float64(1), "verified": float64(1), "timed_out": float64(0),
+		"observation_consistent": true, "tasks": []any{},
+	}
+	if err := validateSourceResult("admin-status", result); err != nil {
+		t.Fatalf("complete admin-status response rejected: %v", err)
+	}
+	result["up"] = false
+	result["partial"] = true
+	result["unknown"] = float64(1)
+	if err := validateSourceResult("admin-status", result); err != nil {
+		t.Fatalf("partial admin-status response rejected: %v", err)
+	}
+	result["partial"] = false
+	if err := validateSourceResult("admin-status", result); err == nil {
+		t.Fatal("admin-status up=false without partial observation was accepted")
+	}
+}
+
 func TestValidObservedAtRejectsFutureTimestamp(t *testing.T) {
 	now := time.Date(2026, time.November, 3, 0, 0, 0, 0, time.UTC)
 	if _, ok := validObservedAt("2026-11-03T00:00:01Z", now); ok {

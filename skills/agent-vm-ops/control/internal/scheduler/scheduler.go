@@ -69,15 +69,23 @@ func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInter
 				}
 				continue
 			}
-			if _, err := scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true}); err != nil && protocol.AsError(err).Code == "controller_lease_required" {
-				scheduler.Service.MarkNotReady()
+			if err := scheduler.Service.RunMaintenance(ctx, "reconcile"); err != nil {
+				if protocol.AsError(err).Code == "controller_lease_required" {
+					scheduler.Service.MarkNotReady()
+				} else {
+					slog.Warn("scheduled reconcile failed", "error", err)
+				}
 			}
 		case <-ageTicker.C:
 			if !scheduler.controllerLeaseValid() || !scheduler.Service.Ready() {
 				continue
 			}
-			if _, err := scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-age-gc", "apply": true}); err != nil && protocol.AsError(err).Code == "controller_lease_required" {
-				scheduler.Service.MarkNotReady()
+			if err := scheduler.Service.RunMaintenance(ctx, "age-gc"); err != nil {
+				if protocol.AsError(err).Code == "controller_lease_required" {
+					scheduler.Service.MarkNotReady()
+				} else {
+					slog.Warn("scheduled age-gc failed", "error", err)
+				}
 			}
 		case <-scheduler.wake:
 			if !scheduler.controllerLeaseValid() {
@@ -92,8 +100,12 @@ func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInter
 				}
 				continue
 			}
-			if _, err := scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true}); err != nil && protocol.AsError(err).Code == "controller_lease_required" {
-				scheduler.Service.MarkNotReady()
+			if err := scheduler.Service.RunMaintenance(ctx, "reconcile"); err != nil {
+				if protocol.AsError(err).Code == "controller_lease_required" {
+					scheduler.Service.MarkNotReady()
+				} else {
+					slog.Warn("wake reconcile failed", "error", err)
+				}
 			}
 		}
 	}

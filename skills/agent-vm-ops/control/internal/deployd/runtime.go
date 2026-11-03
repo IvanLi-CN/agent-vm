@@ -189,6 +189,12 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			runtime.invalidateMetrics(slot, "inventory")
 			snapshot.Consistent = false
 		} else {
+			if partial, ok := inventory["partial"].(bool); ok && partial {
+				snapshot.Consistent = false
+			}
+			if consistent, ok := inventory["observation_consistent"].(bool); ok && !consistent {
+				snapshot.Consistent = false
+			}
 			runtime.rememberMetrics(slot, "inventory", observe.MetricsForSnapshot("inventory", inventory))
 			sourceTimes["inventory_observation"] = minTime(sourceTimes["inventory_observation"], inventoryAt)
 		}
@@ -1326,7 +1332,7 @@ func validateSourceResult(action string, result map[string]any) error {
 	if !ok {
 		return errors.New("up is missing or invalid")
 	}
-	if !up {
+	if !up && action != "admin-status" {
 		return errors.New("up is false")
 	}
 	if _, ok := parseObservedAt(result["observed_at"]); !ok {
@@ -1361,6 +1367,21 @@ func validateSourceResult(action string, result map[string]any) error {
 	case "admin-status":
 		if _, ok := result["tasks"].([]any); !ok {
 			return errors.New("tasks is missing or invalid")
+		}
+		partial, partialOK := result["partial"].(bool)
+		if !partialOK {
+			return errors.New("partial is missing or invalid")
+		}
+		if !up && !partial {
+			return errors.New("admin-status up is false without a partial observation")
+		}
+		if _, ok := result["observation_consistent"].(bool); !ok {
+			return errors.New("observation_consistent is missing or invalid")
+		}
+		for _, field := range []string{"unknown", "probed", "verified", "timed_out"} {
+			if _, ok := integerValue(result[field]); !ok {
+				return fmt.Errorf("%s is missing or invalid", field)
+			}
 		}
 	case "doctor":
 		stateEpoch, ok := result["state_epoch"].(string)

@@ -74,15 +74,29 @@ Native outcome 不确定时，不得 rotate、compact、convert 或 rewrite pend
 5. 恢复或验证 `agent-vm-deployd.service`、其受保护 socket 和独立部署数据库。允许部署转换前，必须重新观测两个槽位。
 6. 执行只读健康和清单检查：`agent-vm doctor`、`agent-vm admin status`、`agent-vm admin session list`、`agent-vm admin reconcile` 和 `agent-vm-deploy status --json`。除非显式提供 `--apply`，reconcile command 都是 dry-run。
 
+常驻 scheduler 将 reconcile 与 cache age-GC 保持为独立的 single-flight lane。
+每轮最多处理 16 个 task 或运行 2 秒，并在 additive `maintenance_cursor` meta
+record 中保存 restart cursor 和 retry backoff。缺少 cursor 时任务立即到期。
+不得删除或手工修改 cursor 来强制 cleanup；恢复时必须与 state database 和
+operation journal 一起保留。历史 timer operation rows 仍可检查和恢复，但正常
+scheduler tick 不再创建新的 timer rows。
+
 ### Reconcile pending operation 与 generation
 
 本机 client journal 和 control `operations` table 是 mutation 的 identity record。Transport timeout 或 `outcome: pending` 表示 native effect 不确定，绝不是成功信号。
 
-- 将原始 `operation_id`、request payload 和 generation 一起保留。绝不创建替代 ID、修改 generation，或把不确定的 native effect 作为新 intent replay。
-- 在提交任何其他操作前，检查 `status`、`admin status`、`admin session list` 和 dry-run reconciliation result。Completed 或 error record 只有在使用原始 operation ID 和完全相同 request 时才能 replay；pending record 必须保持 blocked，直到 native state 明确。
-- 对每个 durable task 对比其 session、task identity、generation、state、lease deadline、resource reservation、native instance ownership、native status、port 和 timer token。Generation mismatch、record 缺失、foreign identity 或无法执行 inspection 都是 stop condition。
-- 只有 dry-run 确认 ownership、generation、lease state 以及 native cleanup/rearm action 全部正确时，才能应用 `agent-vm admin reconcile --apply`。确认其 native instance 和 port 均不存在后，reconciliation 可以验证并修复 resource/reservation state malformed 或不一致且非零的 `absent` record；也可以关闭 incomplete cleanup 或 rearm 当前 generation。不得制造 generation，也不得重新打开 stale mapping。
-- 按现有合同保持 effective lease 可用于 status、retrieval、renewal 和 release。带 stopped 或未经验证 guest 的 effective lease 属于 unavailable；不得推断为 OOM，也不得自动 restart。
+- 将原始 `operation_id`、request payload 和 generation 一起保留。
+  绝不创建替代 ID、修改 generation，或把不确定的 native effect 作为新 intent replay。
+- 在提交任何其他操作前，检查 `status`、`admin status`、`admin session list` 和 dry-run reconciliation result。
+  Completed 或 error record 只有在使用原始 operation ID 和完全相同 request 时才能 replay；pending record 必须保持 blocked，直到 native state 明确。
+- 对每个 durable task 对比其 session、task identity、generation、state、lease deadline、resource reservation、native instance ownership、native status、port 和 timer token。
+  Generation mismatch、record 缺失、foreign identity 或无法执行 inspection 都是 stop condition。
+- 将 `native_missing` 视为有界 observation。它不是 lifecycle state，也不足以单独删除 task：terminal absence 还必须有匹配的 destroy journal、generation tombstone、worker quiescence 和精确 absence proof。包含 `partial`、`unknown` 或 `observation_consistent=false` 的 page 保持 unverified。
+- 只有 dry-run 确认 ownership、generation、lease state 以及 native cleanup/rearm action 全部正确时，才能应用 `agent-vm admin reconcile --apply`。
+  确认其 native instance 和 port 均不存在后，reconciliation 可以验证并修复 resource/reservation state malformed 或不一致且非零的 `absent` record；也可以关闭 incomplete cleanup 或 rearm 当前 generation。
+  不得制造 generation，也不得重新打开 stale mapping。
+- 按现有合同保持 effective lease 可用于 status、retrieval、renewal 和 release。
+  带 stopped 或未经验证 guest 的 effective lease 属于 unavailable；不得推断为 OOM，也不得自动 restart。
 
 ### 重新开放 admission
 
