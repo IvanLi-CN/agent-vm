@@ -10,8 +10,10 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd/store"
@@ -731,12 +733,34 @@ func (manager *Manager) failure(ctx context.Context, id, phase string, cause err
 		code = "state_unverified"
 	}
 	payload := map[string]any{"message": failureMessage(phase, code), "uncertain": code == "state_unverified"}
+	if sanitized := sanitizedFailureCause(cause); sanitized != "" {
+		payload["cause"] = sanitized
+		payload["cause_type"] = fmt.Sprintf("%T", cause)
+	}
 	encoded, _ := json.Marshal(payload)
 	digest := sha256.Sum256(encoded)
 	if err := manager.Store.RecordFailure(ctx, id, phase, code, "deployd", hex.EncodeToString(digest[:]), payload, manager.Clock().UTC()); err != nil {
 		return fmt.Errorf("%w; record deployment failure: %v", cause, err)
 	}
 	return cause
+}
+
+func sanitizedFailureCause(cause error) string {
+	if cause == nil {
+		return ""
+	}
+	value := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return ' '
+		}
+		return r
+	}, cause.Error())
+	value = strings.Join(strings.Fields(value), " ")
+	const maxLength = 512
+	if len(value) > maxLength {
+		return value[:maxLength] + "..."
+	}
+	return value
 }
 
 func failureMessage(phase, code string) string {

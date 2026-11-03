@@ -398,6 +398,34 @@ func TestManagerFencesWhenRollbackStateCannotBePersisted(t *testing.T) {
 	}
 }
 
+func TestManagerPersistsSanitizedFailureCause(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	transaction := store.Transaction{ID: "tx-failure-cause", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseStage, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
+	if err := database.Create(context.Background(), transaction, nil); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(database, &fakeRuntime{}, time.Minute, func() time.Time { return now })
+	cause := errors.New("counter proof failed\nslot=green")
+	if err := manager.failure(context.Background(), transaction.ID, PhaseStage, cause); !errors.Is(err, cause) {
+		t.Fatalf("failure returned %v, want %v", err, cause)
+	}
+	evidence, err := database.LatestFailureEvidence(context.Background(), transaction.ID)
+	if err != nil || evidence == nil {
+		t.Fatalf("failure evidence = %#v err=%v", evidence, err)
+	}
+	if evidence.Payload["cause"] != "counter proof failed slot=green" {
+		t.Fatalf("failure cause = %#v", evidence.Payload["cause"])
+	}
+	if evidence.Payload["cause_type"] != "*errors.errorString" {
+		t.Fatalf("failure cause type = %#v", evidence.Payload["cause_type"])
+	}
+}
+
 func TestManagerResumesRollbackAfterRestart(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })

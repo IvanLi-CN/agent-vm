@@ -322,6 +322,34 @@ func (s *Store) LatestEventByTransition(ctx context.Context, transactionID, tran
 	return scanPhaseEvent(row)
 }
 
+func (s *Store) LatestFailureEvidence(ctx context.Context, transactionID string) (*FailureEvidence, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT phase,code,source,payload_json,digest,created_at
+		FROM deployment_failure_evidence
+		WHERE transaction_id = ?
+		ORDER BY evidence_id DESC LIMIT 1`, transactionID)
+	var evidence FailureEvidence
+	var payload, created string
+	if err := row.Scan(&evidence.Phase, &evidence.Code, &evidence.Source, &payload, &evidence.Digest, &created); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	digestValue := sha256.Sum256([]byte(payload))
+	if evidence.Digest != hex.EncodeToString(digestValue[:]) {
+		return nil, errors.New("persisted failure evidence digest mismatch")
+	}
+	if err := json.Unmarshal([]byte(payload), &evidence.Payload); err != nil {
+		return nil, err
+	}
+	var err error
+	evidence.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+	if err != nil {
+		return nil, err
+	}
+	return &evidence, nil
+}
+
 func scanPhaseEvent(row scanner) (*PhaseEvent, error) {
 	var event PhaseEvent
 	var evidence, created string

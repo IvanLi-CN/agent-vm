@@ -376,6 +376,26 @@ func TestReleaseDrainExitClaimsLegacyOwnerlessFence(t *testing.T) {
 	}
 }
 
+func TestDeploydDrainExitCanKeepTrafficFenced(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.SetMeta(ctx, "draining", "1"); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	service.SetTrafficAccepting(true)
+	if _, err := service.drain(ctx, false, protocol.Request{"session_id": "release-agent-vm-deployd", "preserve_traffic": true}); err != nil {
+		t.Fatal(err)
+	}
+	if service.TrafficAccepting() {
+		t.Fatal("drain exit reopened traffic while preservation was requested")
+	}
+}
+
 func TestDrainOwnershipCannotBeReplacedByAnotherCaller(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {

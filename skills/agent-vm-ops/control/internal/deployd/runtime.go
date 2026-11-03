@@ -87,6 +87,9 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			if requestErr != nil && runtime.systemdSlotStopped(ctx, slot) {
 				runtime.mu.Lock()
 				wasQuiesced := runtime.quiesced[slot]
+				if wasQuiesced {
+					runtime.quiesced[slot] = false
+				}
 				runtime.mu.Unlock()
 				if wasQuiesced {
 					observation.CountersKnown = true
@@ -141,6 +144,9 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			snapshot.Slots[slot] = observation
 			continue
 		}
+		runtime.mu.Lock()
+		runtime.quiesced[slot] = false
+		runtime.mu.Unlock()
 		metrics, metricsAt, metricsErr := runtime.observeSource(ctx, slot, "capacity", "admin-metrics")
 		if metricsErr == nil {
 			inFlight, inFlightOK := integerValue(metrics["in_flight_operations"])
@@ -982,7 +988,7 @@ func (runtime *HostRuntime) ExitDrain(ctx context.Context, slot string) error {
 	if slot == "" || slot == "none" {
 		return nil
 	}
-	_, status, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-exit", "session_id": deploydDrainSession, "operation_id": "deployd-drain-exit-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0)})
+	_, status, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-exit", "session_id": deploydDrainSession, "operation_id": "deployd-drain-exit-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0), "preserve_traffic": true})
 	if err != nil {
 		return err
 	}
