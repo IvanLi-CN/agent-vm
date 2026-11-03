@@ -10,9 +10,13 @@ import (
 
 func TestMetricsHaveOneDeploydSeriesPerSlot(t *testing.T) {
 	metrics := NewMetrics(nil)
+	now := time.Now().UTC()
+	sources := map[string]SourceObservation{}
+	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
+		sources[name] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
+	}
 	metrics.Set(RuntimeSnapshot{
-		ObservedAt: time.Unix(100, 0), Consistent: true, ActiveSlot: "green",
-		Sources: map[string]SourceObservation{"active_link": {Up: true, ObservedAt: time.Unix(100, 0)}},
+		ObservedAt: now, FreshUntil: now.Add(time.Minute), Consistent: true, ActiveSlot: "green", Sources: sources,
 		Slots: map[string]SlotObservation{
 			"blue":  {ProcessUp: true, ProcessReady: true, ControllerOwned: false, TrafficAccepting: false, CountersKnown: true, InFlightRequests: 2, NativeWorkers: 1, PendingOperations: 1, MetricFamilies: map[string]string{"health": "agent_vm_up 1\n"}},
 			"green": {ProcessUp: true, ProcessReady: true, ControllerOwned: true, TrafficAccepting: true},
@@ -57,6 +61,33 @@ func TestMetricsOmitUnknownSlotCounters(t *testing.T) {
 	} {
 		if strings.Contains(text, name) {
 			t.Fatalf("unknown slot counter was exposed: %s\n%s", name, text)
+		}
+	}
+}
+
+func TestMetricsOmitSlotStateWhenSnapshotIsNotFresh(t *testing.T) {
+	metrics := NewMetrics(nil)
+	metrics.Set(RuntimeSnapshot{
+		ObservedAt: time.Now().UTC().Add(-time.Minute),
+		FreshUntil: time.Now().UTC().Add(-time.Second),
+		Consistent: false,
+		ActiveSlot: "blue",
+		Slots: map[string]SlotObservation{
+			"blue":  {ProcessUp: true, Ready: true, ControllerOwned: true, TrafficAccepting: true},
+			"green": {ProcessUp: false},
+		},
+	})
+	text := metrics.Render()
+	for _, name := range []string{
+		"agent_vm_deployd_active_slot{slot=",
+		"agent_vm_deployd_slot_process_up{slot=",
+		"agent_vm_deployd_slot_ready{slot=",
+		"agent_vm_deployd_slot_selected{slot=",
+		"agent_vm_deployd_slot_controller_owned{slot=",
+		"agent_vm_deployd_slot_traffic_accepting{slot=",
+	} {
+		if strings.Contains(text, name) {
+			t.Fatalf("stale slot state was exposed: %s\n%s", name, text)
 		}
 	}
 }

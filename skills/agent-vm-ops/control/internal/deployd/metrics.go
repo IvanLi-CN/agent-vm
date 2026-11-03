@@ -28,12 +28,13 @@ func (metrics *Metrics) Set(snapshot RuntimeSnapshot, transactions ...[]store.Tr
 
 func (metrics *Metrics) Render() string {
 	var output strings.Builder
+	now := time.Now().UTC()
 	output.WriteString("# HELP agent_vm_deployd_up Deployd process and metrics publisher health.\n")
 	output.WriteString("# TYPE agent_vm_deployd_up gauge\n")
 	output.WriteString("agent_vm_deployd_up 1\n")
 	output.WriteString("# HELP agent_vm_deployd_snapshot_fresh Whether the composed observation is within its freshness bound.\n")
 	output.WriteString("# TYPE agent_vm_deployd_snapshot_fresh gauge\n")
-	snapshotFresh := composedSnapshotFresh(metrics.latest, time.Now().UTC())
+	snapshotFresh := composedSnapshotFresh(metrics.latest, now)
 	output.WriteString(fmt.Sprintf("agent_vm_deployd_snapshot_fresh %d\n", boolInt(snapshotFresh)))
 	output.WriteString("# HELP agent_vm_deployd_observation_up Whether the latest composed observation is valid.\n")
 	output.WriteString("# TYPE agent_vm_deployd_observation_up gauge\n")
@@ -46,7 +47,7 @@ func (metrics *Metrics) Render() string {
 		if freshUntil.IsZero() {
 			freshUntil = metrics.latest.FreshUntil
 		}
-		fresh := observation.Up && !observation.ObservedAt.IsZero() && !freshUntil.IsZero() && time.Now().UTC().Before(freshUntil)
+		fresh := observation.Up && !observation.ObservedAt.IsZero() && !freshUntil.IsZero() && now.Before(freshUntil)
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_fresh{source=%s} %d\n", quote(source), boolInt(fresh)))
 	}
 	output.WriteString("# HELP agent_vm_deployd_observation_timestamp_seconds Unix timestamp of the composed observation.\n")
@@ -57,14 +58,16 @@ func (metrics *Metrics) Render() string {
 			output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_timestamp_seconds{source=%s} %d\n", quote(source), observation.ObservedAt.Unix()))
 		}
 	}
-	output.WriteString("# HELP agent_vm_deployd_active_slot Active slot selected by the protected active link.\n")
-	output.WriteString("# TYPE agent_vm_deployd_active_slot gauge\n")
-	for _, slot := range []string{"blue", "green"} {
-		value := 0
-		if metrics.latest.ActiveSlot == slot {
-			value = 1
+	if snapshotFresh {
+		output.WriteString("# HELP agent_vm_deployd_active_slot Active slot selected by the protected active link.\n")
+		output.WriteString("# TYPE agent_vm_deployd_active_slot gauge\n")
+		for _, slot := range []string{"blue", "green"} {
+			value := 0
+			if metrics.latest.ActiveSlot == slot {
+				value = 1
+			}
+			output.WriteString(fmt.Sprintf("agent_vm_deployd_active_slot{slot=%s} %d\n", quote(slot), value))
 		}
-		output.WriteString(fmt.Sprintf("agent_vm_deployd_active_slot{slot=%s} %d\n", quote(slot), value))
 	}
 	output.WriteString("# HELP agent_vm_deployd_slot_process_up Whether a slot control process responded.\n")
 	output.WriteString("# TYPE agent_vm_deployd_slot_process_up gauge\n")
@@ -82,20 +85,22 @@ func (metrics *Metrics) Render() string {
 	output.WriteString("# TYPE agent_vm_deployd_slot_pending_operations gauge\n")
 	output.WriteString("# HELP agent_vm_deployd_slot_native_workers Number of native workers that have crossed the effect barrier.\n")
 	output.WriteString("# TYPE agent_vm_deployd_slot_native_workers gauge\n")
-	for _, slot := range []string{"blue", "green"} {
-		observation := metrics.latest.Slots[slot]
-		output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_process_up{slot=%s} %d\n", quote(slot), boolInt(observation.ProcessUp)))
-		output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_ready{slot=%s} %d\n", quote(slot), boolInt(observation.Ready)))
-		output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_selected{slot=%s} %d\n", quote(slot), boolInt(metrics.latest.ActiveSlot == slot)))
-		output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_controller_owned{slot=%s} %d\n", quote(slot), boolInt(observation.ControllerOwned)))
-		output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_traffic_accepting{slot=%s} %d\n", quote(slot), boolInt(observation.TrafficAccepting)))
-		if observation.CountersKnown {
-			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_in_flight_requests{slot=%s} %d\n", quote(slot), observation.InFlightRequests))
-			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_pending_operations{slot=%s} %d\n", quote(slot), observation.PendingOperations))
-			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_native_workers{slot=%s} %d\n", quote(slot), observation.NativeWorkers))
-		}
-		for _, family := range sortedFamilies(observation.MetricFamilies) {
-			output.WriteString(withSlotLabel(observation.MetricFamilies[family], slot))
+	if snapshotFresh {
+		for _, slot := range []string{"blue", "green"} {
+			observation := metrics.latest.Slots[slot]
+			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_process_up{slot=%s} %d\n", quote(slot), boolInt(observation.ProcessUp)))
+			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_ready{slot=%s} %d\n", quote(slot), boolInt(observation.Ready)))
+			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_selected{slot=%s} %d\n", quote(slot), boolInt(metrics.latest.ActiveSlot == slot)))
+			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_controller_owned{slot=%s} %d\n", quote(slot), boolInt(observation.ControllerOwned)))
+			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_traffic_accepting{slot=%s} %d\n", quote(slot), boolInt(observation.TrafficAccepting)))
+			if observation.CountersKnown {
+				output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_in_flight_requests{slot=%s} %d\n", quote(slot), observation.InFlightRequests))
+				output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_pending_operations{slot=%s} %d\n", quote(slot), observation.PendingOperations))
+				output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_native_workers{slot=%s} %d\n", quote(slot), observation.NativeWorkers))
+			}
+			for _, family := range sortedFamilies(observation.MetricFamilies) {
+				output.WriteString(withSlotLabel(observation.MetricFamilies[family], slot))
+			}
 		}
 	}
 	output.WriteString("# HELP agent_vm_deployd_transaction_phase Current deployment transaction phase.\n")
