@@ -99,6 +99,7 @@ type Service struct {
 	wake              func()
 	mutationGate      func() bool
 	mutationChanges   func() <-chan struct{}
+	mutationCommit    func(func() error) error
 	trafficAccepting  atomic.Bool
 }
 
@@ -215,11 +216,29 @@ func (s *Service) SetMutationFence(changes func() <-chan struct{}) {
 	s.mu.Unlock()
 }
 
+// SetMutationCommit supplies the lease-serialized commit used to record a
+// successful mutation. The callback must cover only the short durable commit.
+func (s *Service) SetMutationCommit(commit func(func() error) error) {
+	s.mu.Lock()
+	s.mutationCommit = commit
+	s.mu.Unlock()
+}
+
 func (s *Service) mutationAllowed() bool {
 	s.mu.RLock()
 	gate := s.mutationGate
 	s.mu.RUnlock()
 	return gate == nil || gate()
+}
+
+func (s *Service) commitMutation(commit func() error) error {
+	s.mu.RLock()
+	commitGate := s.mutationCommit
+	s.mu.RUnlock()
+	if commitGate == nil {
+		return commit()
+	}
+	return commitGate(commit)
 }
 
 func (s *Service) mutationContext(ctx context.Context) (context.Context, func(), func() bool) {
@@ -1254,8 +1273,26 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		operationID := stringValue(request["operation_id"])
 		digest, _ := protocol.Digest(request)
 		response["_request_digest"] = digest
-		if err := s.Store.RecordOperation(ctx, operationID, stringValue(request["action"]), optionalString(request["session_id"]), generationPointer(intValue(request["generation"]), request["generation"] != nil), response); err != nil {
-			return nil, s.sqliteError(err)
+		recordErr := s.commitMutation(func() error {
+			if !leaseExempt && mutationLost() {
+				return controllerLeaseLostError(nil)
+			}
+			return s.Store.RecordOperation(ctx, operationID, stringValue(request["action"]), optionalString(request["session_id"]), generationPointer(intValue(request["generation"]), request["generation"] != nil), response)
+		})
+		if recordErr != nil {
+			err = recordErr
+			if _, ok := recordErr.(*protocol.Error); !ok {
+				err = s.sqliteError(recordErr)
+			}
+			if s.Snapshots != nil {
+				_ = s.publishSnapshotFailure(action, err)
+			}
+			outcome := "error"
+			if uncertain(err) {
+				outcome = "unknown"
+			}
+			_ = s.recordAudit(ctx, request, outcome, err, nil)
+			return nil, err
 		}
 		_ = s.recordAudit(ctx, request, "success", nil, response)
 	}

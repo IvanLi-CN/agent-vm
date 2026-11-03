@@ -33,3 +33,23 @@ func TestMutationContextCancelsWhenControllerLeaseChanges(t *testing.T) {
 		t.Fatal("mutation context did not record controller lease loss")
 	}
 }
+
+func TestMutationCommitUsesLeaseSerializedCommit(t *testing.T) {
+	now := time.Now().UTC()
+	gate := controllerrole.New("blue", func() time.Time { return now })
+	if err := gate.Grant(controllerrole.Lease{
+		Slot: "blue", Term: 1, LeaseID: "lease-1", Nonce: "nonce-1", Generation: 1,
+		Expiry: now.Add(time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := &Service{}
+	service.SetMutationCommit(gate.WithValid)
+	if err := service.commitMutation(func() error { return nil }); err != nil {
+		t.Fatalf("lease-serialized commit failed: %v", err)
+	}
+	gate.Fence()
+	if err := service.commitMutation(func() error { t.Fatal("fenced commit callback ran"); return nil }); err == nil {
+		t.Fatal("fenced commit unexpectedly succeeded")
+	}
+}

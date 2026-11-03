@@ -121,16 +121,35 @@ func (gate *Gate) Fence() {
 func (gate *Gate) Valid() bool {
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
+	return gate.validLocked() == nil
+}
+
+// WithValid serializes a short durable commit with lease revocation. The
+// callback is the commit linearization point: a fence that starts after the
+// callback acquires the gate lock cannot precede the callback's result.
+func (gate *Gate) WithValid(commit func() error) error {
+	if commit == nil {
+		return ErrInvalidLease
+	}
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if err := gate.validLocked(); err != nil {
+		return err
+	}
+	return commit()
+}
+
+func (gate *Gate) validLocked() error {
 	if !gate.valid {
-		return false
+		return ErrLeaseExpired
 	}
 	if !gate.lease.Expiry.After(gate.clock()) || !ownerAlive(gate.lease.OwnerPID, gate.lease.OwnerStartTime) {
 		gate.valid = false
 		gate.lease = Lease{}
 		gate.signalLocked()
-		return false
+		return ErrLeaseExpired
 	}
-	return true
+	return nil
 }
 
 func ownerAlive(pid int, startTime string) bool {

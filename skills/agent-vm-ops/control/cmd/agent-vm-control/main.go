@@ -189,6 +189,17 @@ func serve(args []string) error {
 	roleGate := controllerrole.New(cfg.Slot, time.Now)
 	service.SetMutationGate(roleGate.Valid)
 	service.SetMutationFence(roleGate.Changes)
+	service.SetMutationCommit(func(commit func() error) error {
+		err := roleGate.WithValid(commit)
+		if errors.Is(err, controllerrole.ErrLeaseExpired) || errors.Is(err, controllerrole.ErrLeaseMismatch) {
+			return protocol.NewError("state_unverified", "controller lease was lost during mutation", map[string]any{
+				"outcome_verified": false,
+				"phase":            "controller-lease",
+				"cause":            err.Error(),
+			})
+		}
+		return err
+	})
 	imageBackend := management.NewIncusImageBackend(guest, cfg.Management.Upload.StagingPath, cfg.RequiredGuestTools)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

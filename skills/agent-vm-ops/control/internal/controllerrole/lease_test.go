@@ -3,6 +3,7 @@ package controllerrole
 import (
 	"errors"
 	"os"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -82,5 +83,48 @@ func TestGateFencePreservesTermForFutureGrants(t *testing.T) {
 	lease.Term = 5
 	if err := gate.Grant(lease); err != nil {
 		t.Fatalf("newer-term grant after hard fence: %v", err)
+	}
+}
+
+func TestGateCommitSerializesFenceAfterDurableCommit(t *testing.T) {
+	now := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	gate := New("blue", func() time.Time { return now })
+	lease := Lease{Slot: "blue", Term: 1, LeaseID: "lease-1", Expiry: now.Add(time.Minute), Generation: 1, Nonce: "nonce-1"}
+	if err := gate.Grant(lease); err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var committed atomic.Bool
+	commitDone := make(chan error, 1)
+	go func() {
+		commitDone <- gate.WithValid(func() error {
+			close(started)
+			<-release
+			committed.Store(true)
+			return nil
+		})
+	}()
+	<-started
+	fenceDone := make(chan struct{})
+	go func() {
+		gate.Fence()
+		close(fenceDone)
+	}()
+	select {
+	case <-fenceDone:
+		t.Fatal("fence overtook the durable commit")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-commitDone; err != nil {
+		t.Fatal(err)
+	}
+	<-fenceDone
+	if !committed.Load() {
+		t.Fatal("durable commit callback did not run")
+	}
+	if gate.Valid() {
+		t.Fatal("fenced lease remained valid")
 	}
 }
