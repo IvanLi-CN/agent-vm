@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
@@ -24,6 +25,16 @@ func listenUnixSocket(path string, mode os.FileMode) (net.Listener, error) {
 		return nil, err
 	}
 	defer unix.Close(parentFD)
+	unlockParent, err := lockUnixSocketParent(parentFD)
+	if err != nil {
+		return nil, err
+	}
+	parentLocked := true
+	defer func() {
+		if parentLocked {
+			_ = unlockParent()
+		}
+	}()
 
 	if err := prepareUnixSocketAt(parentFD, name); err != nil {
 		return nil, err
@@ -46,7 +57,7 @@ func listenUnixSocket(path string, mode os.FileMode) (net.Listener, error) {
 	if err := unix.Listen(socketFD, unixSocketBacklog); err != nil {
 		return nil, fmt.Errorf("listen on control socket: %w", err)
 	}
-	if err := chmodUnixSocketAt(parentFD, name, socketFD, mode); err != nil {
+	if err := chmodUnixSocketAt(parentFD, name, mode); err != nil {
 		return nil, fmt.Errorf("chmod control socket: %w", err)
 	}
 
@@ -64,7 +75,39 @@ func listenUnixSocket(path string, mode os.FileMode) (net.Listener, error) {
 		_ = listener.Close()
 		return nil, fmt.Errorf("close control socket descriptor: %w", closeErr)
 	}
-	return listener, nil
+	parentLocked = false
+	return &lockedUnixListener{Listener: listener, unlock: unlockParent}, nil
+}
+
+type lockedUnixListener struct {
+	net.Listener
+	unlock    func() error
+	closeOnce sync.Once
+	unlockErr error
+}
+
+func (listener *lockedUnixListener) Close() error {
+	listenerErr := listener.Listener.Close()
+	listener.closeOnce.Do(func() {
+		listener.unlockErr = listener.unlock()
+	})
+	return errors.Join(listenerErr, listener.unlockErr)
+}
+
+func lockUnixSocketParent(parentFD int) (func() error, error) {
+	lockFD, err := unix.Openat(parentFD, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open control socket parent lock: %w", err)
+	}
+	if err := unix.Flock(lockFD, unix.LOCK_EX); err != nil {
+		_ = unix.Close(lockFD)
+		return nil, fmt.Errorf("lock control socket parent: %w", err)
+	}
+	return func() error {
+		unlockErr := unix.Flock(lockFD, unix.LOCK_UN)
+		closeErr := unix.Close(lockFD)
+		return errors.Join(unlockErr, closeErr)
+	}, nil
 }
 
 func bindUnixSocket(socketFD int, path string, mode os.FileMode) error {
@@ -142,16 +185,22 @@ func chmodUnixSocketParent(directoryFD int) error {
 	return unix.Fchmod(chmodFD, 0o750)
 }
 
-func chmodUnixSocketAt(parentFD int, name string, socketFD int, mode os.FileMode) error {
+func chmodUnixSocketAt(parentFD int, name string, mode os.FileMode) error {
+	pathFD, err := unix.Openat(parentFD, name, unix.O_PATH|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open bound control socket: %w", err)
+	}
+	defer unix.Close(pathFD)
+
 	var before unix.Stat_t
-	if err := unix.Fstat(socketFD, &before); err != nil {
+	if err := unix.Fstat(pathFD, &before); err != nil {
 		return fmt.Errorf("inspect bound control socket: %w", err)
 	}
 	if before.Mode&unix.S_IFMT != unix.S_IFSOCK {
 		return fmt.Errorf("bound control path is not a socket: %s", name)
 	}
 	wantedMode := uint32(mode.Perm())
-	chmodErr := unix.Fchmodat(socketFD, "", wantedMode, unix.AT_EMPTY_PATH)
+	chmodErr := unix.Fchmodat(pathFD, "", wantedMode, unix.AT_EMPTY_PATH)
 	if chmodErr != nil {
 		if !errors.Is(chmodErr, unix.EOPNOTSUPP) && !errors.Is(chmodErr, unix.ENOSYS) {
 			return fmt.Errorf("set bound control socket mode: %w", chmodErr)
@@ -165,7 +214,7 @@ func chmodUnixSocketAt(parentFD int, name string, socketFD int, mode os.FileMode
 	}
 
 	var after unix.Stat_t
-	if err := unix.Fstat(socketFD, &after); err != nil {
+	if err := unix.Fstat(pathFD, &after); err != nil {
 		return fmt.Errorf("recheck bound control socket descriptor: %w", err)
 	}
 	if after.Dev != before.Dev || after.Ino != before.Ino {

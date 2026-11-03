@@ -306,6 +306,23 @@ exit 1
     expect(existsSync(stagingSymlinkOutput)).toBe(false);
     rmSync(join(temporaryRoot, "fake-xcaddy-mode"));
 
+    const linkedOutputTarget = join(temporaryRoot, "linked-output-target");
+    const linkedOutputParent = join(temporaryRoot, "linked-output-parent");
+    mkdirSync(linkedOutputTarget);
+    symlinkSync(linkedOutputTarget, linkedOutputParent);
+    const rejectedLinkedParent = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      join(linkedOutputParent, "caddy"),
+    ], { env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` } });
+    expect(rejectedLinkedParent.exitCode).not.toBe(0);
+    expect(existsSync(join(linkedOutputTarget, "caddy"))).toBe(false);
+
     writeFileSync(join(temporaryRoot, "fake-go-mode"), "version\n");
     const mismatchedVersion = run([
       process.execPath,
@@ -365,6 +382,7 @@ exit 1
     expect(acceptance).toContain('rm -f -- "$rqlite_auth_file"');
     expect(acceptance).toContain('"$proof_dir/ca/ca.key"');
     expect(acceptance).toContain("Caddy build receipt SHA-512 does not match the installed binary");
+    expect(acceptance).toContain("--target linux/arm64");
     expect(acceptance).toContain("not-allowed");
   const caGenerator = read("skills/agent-vm-ops/scripts/generate_deployment_ca.sh");
   expect(caGenerator).toContain('[[ -L "$output_dir" ]]');
@@ -391,6 +409,21 @@ test("CA generation and state preflight require operator evidence", () => {
     const rejectedSymlinkDir = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/generate_deployment_ca.sh"), "--output-dir", symlinkDir, "--hostname", "localhost"]);
     expect(rejectedSymlinkDir.exitCode).not.toBe(0);
     expect(existsSync(join(symlinkTarget, "ca.key"))).toBe(false);
+
+    const linkedParentTarget = join(temporaryRoot, "ca-parent-target");
+    const linkedParent = join(temporaryRoot, "ca-parent-link");
+    mkdirSync(linkedParentTarget);
+    symlinkSync(linkedParentTarget, linkedParent);
+    const rejectedLinkedParent = run([
+      "bash",
+      resolve(root, "skills/agent-vm-ops/scripts/generate_deployment_ca.sh"),
+      "--output-dir",
+      join(linkedParent, "ca"),
+      "--hostname",
+      "localhost",
+    ]);
+    expect(rejectedLinkedParent.exitCode).not.toBe(0);
+    expect(existsSync(join(linkedParentTarget, "ca", "ca.key"))).toBe(false);
 
     const opensslPath = new TextDecoder().decode(run(["sh", "-c", "command -v openssl"]).stdout).trim();
     const fakeBin = join(temporaryRoot, "fake-bin");

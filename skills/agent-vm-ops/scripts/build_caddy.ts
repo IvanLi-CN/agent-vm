@@ -162,6 +162,23 @@ function buildEnvironment(environment: Record<string, string | undefined>): Reco
   return sanitized;
 }
 
+function assertNoSymlinkedDirectoryAncestors(path: string, label: string): void {
+  let current = resolve(path);
+  for (;;) {
+    const stat = lstatSync(current, { throwIfNoEntry: false });
+    if (stat) {
+      // macOS exposes /var as a stable system alias for /private/var.
+      if (stat.isSymbolicLink() && !(process.platform === "darwin" && current === "/var")) {
+        fail(`${label} path contains a symlinked directory: ${current}`);
+      }
+      if (!stat.isSymbolicLink() && !stat.isDirectory()) fail(`${label} parent is not a directory: ${current}`);
+    }
+    const parent = dirname(current);
+    if (parent === current) return;
+    current = parent;
+  }
+}
+
 export function commandFor(options: BuildOptions, metadata: CaddyMetadata): string[] {
   return [
     "build",
@@ -177,6 +194,8 @@ export function buildCaddy(args: string[], environment: Record<string, string | 
   const options = parseArgs(args);
   const metadata = readCaddyMetadata();
   const sanitizedEnvironment = buildEnvironment(environment);
+  const outputDirectory = dirname(options.output);
+  assertNoSymlinkedDirectoryAncestors(outputDirectory, "Caddy output");
   try {
     const outputStat = lstatSync(options.output);
     if (outputStat.isSymbolicLink()) fail(`Caddy output must not be a symlink: ${options.output}`);
@@ -184,8 +203,9 @@ export function buildCaddy(args: string[], environment: Record<string, string | 
   } catch (error) {
     if (!(error instanceof Error) || !("code" in error) || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  mkdirSync(dirname(options.output), { recursive: true });
-  const stagingDirectory = mkdtempSync(join(dirname(options.output), ".caddy-build-"));
+  mkdirSync(outputDirectory, { recursive: true });
+  assertNoSymlinkedDirectoryAncestors(outputDirectory, "Caddy output");
+  const stagingDirectory = mkdtempSync(join(outputDirectory, ".caddy-build-"));
   const stagingOutput = join(stagingDirectory, "caddy");
 
   try {
@@ -241,7 +261,9 @@ export function buildCaddy(args: string[], environment: Record<string, string | 
     if (options.expectedSha512 && sha512 !== options.expectedSha512) {
       fail(`Caddy SHA-512 ${sha512} does not match expected ${options.expectedSha512}`);
     }
+    assertNoSymlinkedDirectoryAncestors(outputDirectory, "Caddy output");
     renameSync(stagingOutput, options.output);
+    assertNoSymlinkedDirectoryAncestors(outputDirectory, "Caddy output");
     const finalStat = lstatSync(options.output);
     if (finalStat.isSymbolicLink() || !finalStat.isFile()) fail(`Caddy output was not installed as a regular file: ${options.output}`);
     console.log(JSON.stringify({

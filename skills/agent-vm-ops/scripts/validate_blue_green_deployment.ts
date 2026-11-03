@@ -215,10 +215,15 @@ requireText(caddyBuilder, "mkdtempSync", "Caddy builds into a private staging di
 requireText(caddyBuilder, "renameSync(stagingOutput, options.output)", "Caddy installs only after verification via atomic rename");
 requireText(caddyBuilder, 'caddy?.provider_module !== "github.com/caddy-dns/dnspod"', "Caddy builder pins the official DNSPod provider module");
 requireText(caddyBuilder, "isSymbolicLink()", "Caddy rejects symlinked output paths");
+requireText(caddyBuilder, "assertNoSymlinkedDirectoryAncestors", "Caddy rejects symlinked output ancestors");
 requireText(caGenerator, '[[ -L "$output_dir" ]]', "CA generation rejects a symlinked output directory");
+requireText(caGenerator, "assert_no_symlinked_ancestors", "CA generation rejects symlinked output ancestors");
 requireText(caGenerator, '"$output_dir/ca.key"', "CA generation cleans the private key after a failed run");
+requireText(linuxSocketListener, "lockUnixSocketParent", "Linux socket setup serializes parent-directory writers");
+requireText(linuxSocketListener, "unix.Flock", "Linux socket setup holds a parent-directory kernel lock");
 requireText(ciWorkflow, "github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.4", "Ubuntu PR gate installs a pinned xcaddy builder");
 requireText(ciWorkflow, "skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh", "Ubuntu PR gate runs isolated deployment acceptance");
+requireText(acceptance, "--target linux/arm64", "isolated acceptance verifies the supported arm64 Caddy build");
 requireText(ciWorkflow, "repos/caddyserver/caddy/releases", "Ubuntu PR gate resolves an official Caddy release");
 requireText(ciWorkflow, "CADDY_VERSION=$caddy_version", "Ubuntu PR gate passes an explicit resolved Caddy v2 input");
 requireText(ciWorkflow, "^v2\\\\.", "Ubuntu PR gate selects only stable Caddy v2 releases");

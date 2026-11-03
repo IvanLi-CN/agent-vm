@@ -251,6 +251,64 @@ print(actual_sha512)
 PY
 )"
 
+caddy_arm64_binary="$proof_dir/caddy-arm64"
+env -i \
+  PATH="$build_path" \
+  HOME="$runtime_home" \
+  GOPROXY="$acceptance_goproxy" \
+  GOSUMDB=sum.golang.org \
+  "$(command -v bun)" run "$repository_root/skills/agent-vm-ops/scripts/build_caddy.ts" \
+  --caddy-version "$caddy_version" \
+  --target linux/arm64 \
+  --output "$caddy_arm64_binary" >"$proof_dir/caddy-arm64-build.log" 2>&1
+[[ -f "$caddy_arm64_binary" && ! -L "$caddy_arm64_binary" && -x "$caddy_arm64_binary" ]] || fail "Caddy arm64 custom build was not found as a regular executable"
+python3 - "$proof_dir/caddy-arm64-build.log" "$caddy_arm64_binary" "$caddy_version" "$repository_root/skills/agent-vm-ops/assets/blue-green/deployment-components.json" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+log_path, binary_path, requested_version, metadata_path = sys.argv[1:]
+if not requested_version.startswith("v"):
+    requested_version = "v" + requested_version
+with open(metadata_path, encoding="utf-8") as handle:
+    metadata = json.load(handle)
+caddy_metadata = metadata["caddy"]
+receipt = None
+with open(log_path, encoding="utf-8") as handle:
+    for line in reversed(handle.readlines()):
+        try:
+            candidate = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict) and candidate.get("observed_caddy_version"):
+            receipt = candidate
+            break
+if receipt is None:
+    raise SystemExit("Caddy arm64 build emitted no JSON receipt")
+expected = {
+    "schema_version": 1,
+    "requested_version": requested_version,
+    "observed_caddy_version": requested_version,
+    "provider_module": caddy_metadata["provider_module"],
+    "provider_module_name": caddy_metadata["provider_module_name"],
+    "target": "linux/arm64",
+    "verification": "go-version-m",
+}
+for key, value in expected.items():
+    if receipt.get(key) != value:
+        raise SystemExit(f"Caddy arm64 build receipt field {key} mismatch")
+if receipt.get("provider_ref") != caddy_metadata["provider_ref"]:
+    raise SystemExit("Caddy arm64 build receipt provider ref mismatch")
+receipt_sha512 = receipt.get("sha512")
+if not isinstance(receipt_sha512, str) or len(receipt_sha512) != 128 or any(char not in "0123456789abcdef" for char in receipt_sha512):
+    raise SystemExit("Caddy arm64 build receipt has no valid SHA-512")
+actual_sha512 = hashlib.sha512(Path(binary_path).read_bytes()).hexdigest()
+if actual_sha512 != receipt_sha512:
+    raise SystemExit("Caddy arm64 build receipt SHA-512 does not match the built binary")
+print(actual_sha512)
+PY
+
 ca_dir="$proof_dir/ca"
 bash "$repository_root/skills/agent-vm-ops/scripts/generate_deployment_ca.sh" \
   --output-dir "$ca_dir" --hostname deployment-test.local >"$proof_dir/ca.json"

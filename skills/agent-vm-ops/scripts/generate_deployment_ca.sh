@@ -39,6 +39,26 @@ done
 
 [[ -n "$output_dir" && -n "$hostname_value" ]] || { usage; exit 2; }
 [[ "$output_dir" = /* ]] || { echo "output directory must be absolute" >&2; exit 2; }
+
+assert_no_symlinked_ancestors() {
+  local path="$1"
+  while :; do
+    if [[ -L "$path" ]]; then
+      if [[ "$(uname -s)" != Darwin || "$path" != "/var" ]]; then
+        echo "path contains a symlinked directory: $path" >&2
+        exit 2
+      fi
+    fi
+    if [[ -e "$path" && ! -d "$path" ]]; then
+      echo "path component is not a directory: $path" >&2
+      exit 2
+    fi
+    [[ "$path" == "/" ]] && return 0
+    path="$(dirname -- "$path")"
+  done
+}
+
+assert_no_symlinked_ancestors "$output_dir"
 if [[ ! "$hostname_value" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
   echo "hostname must be a DNS name without a port" >&2
   exit 2
@@ -61,12 +81,15 @@ else
   mkdir -p -- "$output_dir"
   output_dir_created=1
 fi
+assert_no_symlinked_ancestors "$output_dir"
 [[ -d "$output_dir" && ! -L "$output_dir" ]] || { echo "output path is missing or symlinked" >&2; exit 2; }
 
 command -v openssl >/dev/null 2>&1 || { echo "openssl is required" >&2; exit 2; }
 
 umask 077
-mkdir -p -- "$output_dir/rqlite"
+assert_no_symlinked_ancestors "$output_dir/rqlite"
+mkdir -- "$output_dir/rqlite"
+assert_no_symlinked_ancestors "$output_dir/rqlite"
 temporary_dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-vm-ca.XXXXXX")"
 cleanup() {
   local original_status="$?"
