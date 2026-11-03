@@ -150,7 +150,7 @@ func (s *Service) reconcileMaintenancePageWithCursor(ctx context.Context, afterT
 	if err != nil {
 		return maintenancePageResult{}, s.sqliteError(err)
 	}
-	page := maintenancePageResult{operationCursorUpdated: true}
+	page := maintenancePageResult{}
 	var firstErr error
 	for index := range pending {
 		if err := ctx.Err(); err != nil {
@@ -166,16 +166,18 @@ func (s *Service) reconcileMaintenancePageWithCursor(ctx context.Context, afterT
 			s.recoverPending,
 			s.reconcileOrphanedAcquireOperations,
 		} {
-			if reconcileErr := reconcile(ctx, one); reconcileErr != nil && firstErr == nil {
-				firstErr = reconcileErr
+			if reconcileErr := reconcile(ctx, one); reconcileErr != nil {
+				return page, reconcileErr
 			}
 		}
 		page.nextOperationAt = pending[index].CreatedAt
 		page.nextOperationID = pending[index].OperationID
+		page.operationCursorUpdated = true
 	}
 	if !morePending {
 		page.nextOperationAt = ""
 		page.nextOperationID = ""
+		page.operationCursorUpdated = true
 	}
 
 	tasks, more, err := s.Store.ListTasksPage(ctx, state.TaskPageFilter{AfterTaskID: afterTaskID, Limit: maintenancePageSize})
@@ -192,14 +194,15 @@ func (s *Service) reconcileMaintenancePageWithCursor(ctx context.Context, afterT
 			}
 			return page, firstErr
 		}
-		if reconcileErr := s.reconcileMaintenanceTask(ctx, &task); reconcileErr != nil && firstErr == nil {
-			firstErr = reconcileErr
+		if reconcileErr := s.reconcileMaintenanceTask(ctx, &task); reconcileErr != nil {
+			return page, reconcileErr
 		}
 		page.nextTaskID = task.TaskID
 		page.taskCursorUpdated = true
 	}
 	if !more {
 		page.nextTaskID = ""
+		page.taskCursorUpdated = true
 	}
 	return page, firstErr
 }
@@ -349,7 +352,7 @@ func (s *Service) ageGCMaintenancePage(ctx context.Context, afterTaskID string) 
 	if err != nil {
 		return maintenancePageResult{}, s.sqliteError(err)
 	}
-	page := maintenancePageResult{taskCursorUpdated: true}
+	page := maintenancePageResult{}
 	var firstErr error
 	for _, task := range tasks {
 		if err := ctx.Err(); err != nil {
@@ -359,42 +362,39 @@ func (s *Service) ageGCMaintenancePage(ctx context.Context, afterTaskID string) 
 			return page, firstErr
 		}
 		if task.State != stateCached || task.CleanupAfter == nil {
+			page.nextTaskID = task.TaskID
+			page.taskCursorUpdated = true
 			continue
 		}
 		deadline, parseErr := time.Parse(time.RFC3339Nano, *task.CleanupAfter)
 		if parseErr != nil || deadline.After(s.Clock()) {
+			page.nextTaskID = task.TaskID
+			page.taskCursorUpdated = true
 			continue
 		}
 		gcNow := s.Clock()
 		updated, updateErr := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateCached}, LeaseExpiredAt: &gcNow}, map[string]any{"state": stateDeleting, "updated_at": nowString(gcNow)})
 		if updateErr != nil {
-			if firstErr == nil {
-				firstErr = s.sqliteError(updateErr)
-			}
-			page.nextTaskID = task.TaskID
-			continue
+			return page, s.sqliteError(updateErr)
 		}
 		if !updated {
 			page.nextTaskID = task.TaskID
+			page.taskCursorUpdated = true
 			continue
 		}
 		cleanupRequest := protocol.Request{"session_id": task.SessionID, "generation": task.Generation}
 		if _, releaseErr := s.maintenanceCleanup(ctx, &task, "destroy"); releaseErr != nil {
-			if firstErr == nil {
-				firstErr = releaseErr
-			}
-			page.nextTaskID = task.TaskID
-			continue
+			return page, releaseErr
 		}
 		if err := s.deleteDestroyedTask(ctx, cleanupRequest, &task.Generation); err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
+			return page, err
 		}
 		page.nextTaskID = task.TaskID
+		page.taskCursorUpdated = true
 	}
 	if !more {
 		page.nextTaskID = ""
+		page.taskCursorUpdated = true
 	}
 	return page, firstErr
 }

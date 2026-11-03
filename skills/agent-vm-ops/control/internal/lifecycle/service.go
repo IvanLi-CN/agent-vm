@@ -2685,9 +2685,14 @@ func acquireOperationMatchesTask(operation state.Operation, task *state.Task) bo
 }
 
 func (s *Service) pendingAcquireOperations(ctx context.Context, task *state.Task) ([]state.Operation, error) {
-	pending, err := s.Store.PendingOperations(ctx)
+	pending, more, err := s.Store.PendingOperationsForSessionPage(ctx, task.SessionID, 128)
 	if err != nil {
 		return nil, s.sqliteError(err)
+	}
+	if more {
+		return nil, protocol.NewError("state_unverified", "pending acquire operations exceed the bounded recovery page", map[string]any{
+			"session_id": task.SessionID, "outcome_verified": false,
+		})
 	}
 	result := make([]state.Operation, 0)
 	for _, operation := range pending {

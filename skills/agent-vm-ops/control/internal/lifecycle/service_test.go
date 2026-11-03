@@ -3150,6 +3150,67 @@ func TestScheduledMaintenanceUsesCursorWithoutTimerOperations(t *testing.T) {
 	}
 }
 
+func TestAgeGCMaintenanceAdvancesAcrossNonCandidates(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "age-gc-fairness.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour).Format(time.RFC3339Nano)
+	for index := 0; index < 17; index++ {
+		id := fmt.Sprintf("task-%02d", index)
+		if err := store.InsertTask(context.Background(), state.Task{TaskID: id, SessionID: "session-" + id, Generation: 1, State: stateActive, InstanceName: "instance-" + id, LeaseExpiresAt: &future, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	if err := service.RunMaintenance(context.Background(), maintenanceAgeGCLane); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := store.MaintenanceCursor(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.AgeGC.ScanAfterTaskID != "task-15" {
+		t.Fatalf("age-gc cursor stalled on non-candidates = %#v", cursor)
+	}
+}
+
+func TestMaintenanceDoesNotAdvancePastFailedCleanup(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "maintenance-failure-cursor.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	cleanupAfter := now.Add(-time.Second).Format(time.RFC3339Nano)
+	if err := store.InsertTask(context.Background(), state.Task{
+		TaskID: "failed-gc", SessionID: "failed-gc-session", Generation: 1, State: stateCached,
+		InstanceName: "failed-gc-instance", CleanupAfter: &cleanupAfter, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &startupGuest{
+		status: "Stopped", deleteErr: errors.New("delete outcome unknown"),
+		config: map[string]any{"config": map[string]any{
+			"user.agent-vm.managed": "native-v1", "user.agent-vm.task": "failed-gc",
+			"user.agent-vm.session": "failed-gc-session", "user.agent-vm.generation": "1",
+		}, "devices": map[string]any{}, "expanded_devices": map[string]any{}},
+	}
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }, Guest: guest})
+	if err := service.RunMaintenance(context.Background(), maintenanceAgeGCLane); err == nil {
+		t.Fatal("failed cleanup unexpectedly succeeded")
+	}
+	cursor, err := store.MaintenanceCursor(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.AgeGC.ScanAfterTaskID != "" {
+		t.Fatalf("failed cleanup advanced age-gc cursor = %#v", cursor)
+	}
+}
+
 func TestMaintenanceRequiresControllerLeaseBeforeCursorCommit(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "maintenance-lease.sqlite3"))
 	if err != nil {

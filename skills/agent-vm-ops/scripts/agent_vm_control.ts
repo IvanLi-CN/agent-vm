@@ -37,6 +37,11 @@ export * from "./control-store.ts";
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const MAX_METRICS_OBSERVATION_ATTEMPTS = 3;
+const ADMIN_STATUS_DEFAULT_LIMIT = 25;
+const ADMIN_STATUS_MAX_LIMIT = 100;
+const ADMIN_STATUS_MAX_PROBES = 8;
+const ADMIN_STATUS_ITEM_DEADLINE_MS = 1000;
+const ADMIN_STATUS_PAGE_DEADLINE_MS = 5000;
 
 function equal(left: unknown, right: unknown): boolean {
   return canonical_json(left ?? null) === canonical_json(right ?? null);
@@ -60,22 +65,107 @@ export class Control extends LifecycleControl {
     request: Data,
     session_id: string | null,
   ): Promise<Data> {
-    const { draining, task_snapshots } = await this._global_lock(
+    let limit = ADMIN_STATUS_DEFAULT_LIMIT;
+    if (Object.hasOwn(request, "limit")) {
+      const value = integer(request.limit);
+      if (value < 0n) throw new ControlError("invalid_request", "admin-status limit must be a non-negative integer");
+      if (value > BigInt(ADMIN_STATUS_MAX_LIMIT)) throw new ControlError("invalid_request", "admin-status limit must not exceed 100", { max: ADMIN_STATUS_MAX_LIMIT });
+      if (value > 0n) limit = Number(value);
+    }
+    let cursor = "";
+    if (Object.hasOwn(request, "cursor")) {
+      if (typeof request.cursor !== "string" || request.cursor.length > 128)
+        throw new ControlError("invalid_request", "admin-status cursor is invalid");
+      cursor = request.cursor;
+    }
+
+    const observed_at = iso_time(this.now());
+    const page_deadline = Date.now() + ADMIN_STATUS_PAGE_DEADLINE_MS;
+    const { draining, start_epoch, task_snapshots, has_more } = await this._global_lock(
       async () => ({
         draining: this.store.get_meta("draining") === "1",
-        task_snapshots: this.store.list_tasks(),
+        start_epoch: this.store.state_epoch(),
+        ...(() => {
+          const tasks = this.store.list_tasks()
+            .filter(task => !cursor || String(task.task_id) > cursor)
+            .sort((left, right) => String(left.task_id).localeCompare(String(right.task_id)));
+          return { task_snapshots: tasks.slice(0, limit), has_more: tasks.length > limit };
+        })(),
       }),
     );
 
-    const tasks: Data[] = [];
-    for (const task of task_snapshots) {
-      tasks.push(await this._runtime_summary(task));
-    }
+    const items = new Array<Data>(task_snapshots.length);
+    const probe = async (task: Data): Promise<{ item: Data; probed: boolean; timed_out: boolean }> => {
+      const base = this._state_summary(task);
+      const remaining = Math.min(ADMIN_STATUS_ITEM_DEADLINE_MS, Math.max(0, page_deadline - Date.now()));
+      if (remaining === 0) {
+        return {
+          item: { ...base, native_status: "unknown", guest_available: null, verified: false, probed: false, timed_out: true,
+            observation_error: { code: "probe_timeout", message: "native status probe exceeded its deadline" } },
+          probed: false, timed_out: true,
+        };
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<{ item: Data; probed: boolean; timed_out: boolean }>(resolve => {
+        timer = setTimeout(() => resolve({
+          item: { ...base, native_status: "unknown", guest_available: null, verified: false, probed: false, timed_out: true,
+            observation_error: { code: "probe_timeout", message: "native status probe exceeded its deadline" } },
+          probed: false, timed_out: true,
+        }), remaining);
+      });
+      const operation = (async () => {
+        try {
+          const item = await this._runtime_summary(task);
+          return { item, probed: task.state !== "absent", timed_out: false };
+        } catch (error) {
+          const detail = error instanceof ControlError ? error.as_dict() : { code: "native_unavailable", message: String(error) };
+          return {
+            item: { ...base, native_status: "unknown", guest_available: null, verified: false,
+              probed: task.state !== "absent", timed_out: false, observation_error: detail },
+            probed: task.state !== "absent", timed_out: false,
+          };
+        }
+      })();
+      const result = await Promise.race([operation, timeout]);
+      if (timer !== undefined) clearTimeout(timer);
+      return result;
+    };
 
+    let next_index = 0;
+    const worker = async (): Promise<void> => {
+      while (true) {
+        const index = next_index++;
+        if (index >= task_snapshots.length) return;
+        const result = await probe(task_snapshots[index]);
+        result.item.probed = result.probed;
+        result.item.timed_out = result.timed_out;
+        items[index] = result.item;
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(ADMIN_STATUS_MAX_PROBES, task_snapshots.length) }, () => worker()));
+
+    const end_epoch = await this._global_lock(() => this.store.state_epoch());
+    const observation_consistent = start_epoch === end_epoch;
+    let unknown = items.filter(item => item?.verified !== true).length;
+    const timed_out = items.filter(item => item?.timed_out === true).length;
+    if (!observation_consistent) unknown += 1;
+    const partial = unknown > 0 || timed_out > 0 || !observation_consistent;
+    const probed = items.filter(item => item?.probed === true).length;
+    const verified = items.filter(item => item?.verified === true).length;
     return {
+      up: !partial,
+      ready: this.release_artifacts_verified && this.release_manifest_error === null,
       draining,
-      tasks,
-      doctor: await this.doctor(request, session_id),
+      tasks: items,
+      limit,
+      next_cursor: has_more && items.length > 0 ? items.at(-1)?.task_id : null,
+      partial,
+      unknown,
+      observation_consistent,
+      probed,
+      verified,
+      timed_out,
+      observed_at,
     };
   }
 

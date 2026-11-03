@@ -142,7 +142,7 @@ func serve(config configuration, manifest releaseManifest) error {
 				"doctor": map[string]any{"ready": true, "issues": []any{}},
 			}
 		case "admin-status":
-			result = map[string]any{"up": true, "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "tasks": []any{}}
+			result = map[string]any{"up": true, "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "tasks": []any{}, "limit": 25, "next_cursor": nil, "partial": false, "unknown": 0, "observation_consistent": true, "probed": 0, "verified": 0, "timed_out": 0}
 		case "doctor":
 			result = map[string]any{"up": true, "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "state_epoch": "epoch-1", "issues": []any{}}
 		case "drain-status":
@@ -220,7 +220,7 @@ func serve(config configuration, manifest releaseManifest) error {
 				"doctor": map[string]any{"ready": true, "issues": []any{}},
 			}
 		case "admin-status":
-			result = map[string]any{"up": true, "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "tasks": []any{}}
+			result = map[string]any{"up": true, "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "tasks": []any{}, "limit": 25, "next_cursor": nil, "partial": false, "unknown": 0, "observation_consistent": true, "probed": 0, "verified": 0, "timed_out": 0}
 		case "doctor":
 			result = map[string]any{"up": true, "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "state_epoch": "epoch-1", "issues": []any{}}
 		default:
