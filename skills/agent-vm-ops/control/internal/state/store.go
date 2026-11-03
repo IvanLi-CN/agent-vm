@@ -1042,6 +1042,9 @@ func (s *Store) RecordOperation(ctx context.Context, operationID, action string,
 			if outcome, _ := current.Response["outcome"].(string); outcome != "pending" {
 				return errors.New("operation journal is already finalized")
 			}
+			if err := preserveRequestDigest(current.Response, response); err != nil {
+				return err
+			}
 			if _, present := response["worker"]; !present {
 				if worker, hasWorker := current.Response["worker"]; hasWorker {
 					response["worker"] = worker
@@ -1105,8 +1108,15 @@ func (s *Store) UpdateOperationResponse(ctx context.Context, operationID string,
 		if outcome != "pending" {
 			return errors.New("operation journal is already finalized")
 		}
+		previousResponse := map[string]any{}
+		if digest, ok := operation.Response["_request_digest"]; ok {
+			previousResponse["_request_digest"] = digest
+		}
 		previousWorker, _ := operation.Response["worker"].(map[string]any)
 		if err := update(operation.Response); err != nil {
+			return err
+		}
+		if err := preserveRequestDigest(previousResponse, operation.Response); err != nil {
 			return err
 		}
 		if currentWorker, ok := operation.Response["worker"].(map[string]any); ok {
@@ -1131,6 +1141,27 @@ func (s *Store) UpdateOperationResponse(ctx context.Context, operationID string,
 		}
 		return nil
 	})
+}
+
+func preserveRequestDigest(previous, current map[string]any) error {
+	previousDigest, hadPrevious := previous["_request_digest"]
+	currentDigest, hasCurrent := current["_request_digest"]
+	if !hadPrevious {
+		if hasCurrent {
+			delete(current, "_request_digest")
+		}
+		return nil
+	}
+	if !hasCurrent {
+		current["_request_digest"] = previousDigest
+		return nil
+	}
+	previousString, previousOK := previousDigest.(string)
+	currentString, currentOK := currentDigest.(string)
+	if !previousOK || !currentOK || previousString != currentString {
+		return errors.New("operation request digest is immutable")
+	}
+	return nil
 }
 
 func preserveWorkerIdentity(previous, current map[string]any) error {

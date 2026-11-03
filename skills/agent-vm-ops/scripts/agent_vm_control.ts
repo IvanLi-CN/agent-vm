@@ -82,16 +82,15 @@ export class Control extends LifecycleControl {
     const observed_at = iso_time(this.now());
     const page_deadline = Date.now() + ADMIN_STATUS_PAGE_DEADLINE_MS;
     const { draining, start_epoch, task_snapshots, has_more } = await this._global_lock(
-      async () => ({
-        draining: this.store.get_meta("draining") === "1",
-        start_epoch: this.store.state_epoch(),
-        ...(() => {
-          const tasks = this.store.list_tasks()
-            .filter(task => !cursor || String(task.task_id) > cursor)
-            .sort((left, right) => String(left.task_id).localeCompare(String(right.task_id)));
-          return { task_snapshots: tasks.slice(0, limit), has_more: tasks.length > limit };
-        })(),
-      }),
+      async () => {
+        const page = this.store.list_tasks_page(cursor, limit);
+        return {
+          draining: this.store.get_meta("draining") === "1",
+          start_epoch: this.store.state_epoch(),
+          task_snapshots: page.tasks,
+          has_more: page.has_more,
+        };
+      },
     );
 
     const items = new Array<Data>(task_snapshots.length);

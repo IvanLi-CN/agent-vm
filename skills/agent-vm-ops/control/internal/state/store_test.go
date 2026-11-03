@@ -484,7 +484,7 @@ func TestOperationIdentityAndWorkerIdentityRemainImmutable(t *testing.T) {
 	session := "identity-session"
 	generation := int64(2)
 	if err := store.RecordOperation(ctx, "identity-operation", "acquire", &session, &generation, map[string]any{
-		"outcome": "pending", "worker": map[string]any{"state": "starting", "start_attempted": false},
+		"outcome": "pending", "_request_digest": "identity-digest", "worker": map[string]any{"state": "starting", "start_attempted": false},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -500,6 +500,17 @@ func TestOperationIdentityAndWorkerIdentityRemainImmutable(t *testing.T) {
 	}); err == nil {
 		t.Fatal("terminal worker identity overwrite was accepted")
 	}
+	if err := store.RecordOperation(ctx, "identity-operation", "acquire", &session, &generation, map[string]any{
+		"outcome": "success", "_request_digest": "different-digest",
+	}); err == nil {
+		t.Fatal("operation request digest overwrite was accepted")
+	}
+	if err := store.UpdateOperationResponse(ctx, "identity-operation", func(response map[string]any) error {
+		response["_request_digest"] = "different-digest"
+		return nil
+	}); err == nil {
+		t.Fatal("pending operation request digest mutation was accepted")
+	}
 	if err := store.RecordOperation(ctx, "identity-operation", "release", &session, &generation, map[string]any{"outcome": "success"}); err == nil {
 		t.Fatal("operation identity overwrite was accepted")
 	}
@@ -513,6 +524,9 @@ func TestOperationIdentityAndWorkerIdentityRemainImmutable(t *testing.T) {
 	worker, ok := operation.Response["worker"].(map[string]any)
 	if !ok || worker["pid"] != json.Number("11") {
 		t.Fatalf("finalized worker evidence = %#v", operation.Response)
+	}
+	if operation.Response["_request_digest"] != "identity-digest" {
+		t.Fatalf("finalized request digest = %#v", operation.Response["_request_digest"])
 	}
 }
 

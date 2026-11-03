@@ -763,6 +763,16 @@ export class StateStore {
     return this._rows("SELECT * FROM tasks ORDER BY created_at");
   }
 
+  list_tasks_page(after_task_id = "", limit = 25): { tasks: Data[]; has_more: boolean } {
+    const bounded = limit > 0 && limit <= 100 ? limit : 25;
+    const rows = this._rows(
+      "SELECT * FROM tasks WHERE task_id > ? ORDER BY task_id LIMIT ?",
+      [after_task_id, bounded + 1],
+    );
+    const has_more = rows.length > bounded;
+    return { tasks: has_more ? rows.slice(0, bounded) : rows, has_more };
+  }
+
   put_task(task: Data): void {
     const values = TASK_FIELDS.map((field) =>
       get(
