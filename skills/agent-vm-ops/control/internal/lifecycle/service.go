@@ -2143,7 +2143,7 @@ func (s *Service) dispatchAction(ctx context.Context, action string, request pro
 	case "drain-status":
 		return s.drainStatus(ctx)
 	case "admin-status":
-		return s.adminStatus(ctx)
+		return s.adminStatus(ctx, request)
 	case "admin-session-list":
 		return s.adminSessionList(ctx)
 	case "admin-metrics":
@@ -3127,20 +3127,143 @@ func (s *Service) drainStatus(ctx context.Context) (map[string]any, error) {
 	return map[string]any{"draining": draining, "ready": s.Ready(), "state_capabilities": stateCapabilities}, nil
 }
 
-func (s *Service) adminStatus(ctx context.Context) (map[string]any, error) {
-	tasks, err := s.Store.ListTasks(ctx)
+func (s *Service) adminStatus(ctx context.Context, requests ...protocol.Request) (map[string]any, error) {
+	request := protocol.Request{}
+	if len(requests) > 0 && requests[0] != nil {
+		request = requests[0]
+	}
+	limit := 25
+	if rawLimit, exists := request["limit"]; exists {
+		value, ok := protocol.Integer(rawLimit)
+		if !ok || value < 0 {
+			return nil, protocol.NewError("invalid_request", "admin-status limit must be a non-negative integer", nil)
+		}
+		if value > 100 {
+			return nil, protocol.NewError("invalid_request", "admin-status limit must not exceed 100", map[string]any{"max": 100})
+		}
+		if value > 0 {
+			limit = int(value)
+		}
+	}
+	cursor := ""
+	if rawCursor, exists := request["cursor"]; exists {
+		value, ok := rawCursor.(string)
+		if !ok || len(value) > 128 {
+			return nil, protocol.NewError("invalid_request", "admin-status cursor is invalid", nil)
+		}
+		cursor = value
+	}
+
+	pageCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	startEpoch, err := s.Store.StateEpoch(pageCtx)
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	items := make([]any, 0, len(tasks))
-	for index := range tasks {
-		item, summaryErr := s.summary(ctx, &tasks[index])
-		if summaryErr != nil {
-			return nil, summaryErr
-		}
-		items = append(items, item)
+	tasks, hasMore, err := s.Store.ListTasksPage(pageCtx, state.TaskPageFilter{AfterTaskID: cursor, Limit: limit})
+	if err != nil {
+		return nil, s.sqliteError(err)
 	}
-	return map[string]any{"up": true, "ready": s.Ready(), "observed_at": nowString(s.Clock()), "tasks": items}, nil
+	items := make([]any, len(tasks))
+	probed := 0
+	verified := 0
+	timedOut := 0
+	unknown := 0
+	var itemMu sync.Mutex
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 8)
+	for index := range tasks {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			itemCtx, itemCancel := context.WithTimeout(pageCtx, time.Second)
+			defer itemCancel()
+			started := time.Now()
+			select {
+			case semaphore <- struct{}{}:
+			case <-itemCtx.Done():
+				item := adminStatusProbeTimeout(&tasks[index], itemCtx.Err())
+				item["latency_ms"] = time.Since(started).Milliseconds()
+				itemMu.Lock()
+				items[index] = item
+				timedOut++
+				unknown++
+				itemMu.Unlock()
+				return
+			}
+			defer func() { <-semaphore }()
+			item, summaryErr := s.summary(itemCtx, &tasks[index])
+			itemMu.Lock()
+			defer itemMu.Unlock()
+			if summaryErr != nil {
+				item = adminStatusProbeFailure(&tasks[index], summaryErr)
+			}
+			item["latency_ms"] = time.Since(started).Milliseconds()
+			if itemCtx.Err() != nil {
+				item["timed_out"] = true
+				item["probed"] = false
+				timedOut++
+			} else {
+				item["timed_out"] = false
+				item["probed"] = s.Guest != nil
+				if s.Guest != nil {
+					probed++
+				}
+			}
+			isVerified, _ := item["verified"].(bool)
+			if isVerified {
+				verified++
+			} else {
+				if item["state"] != stateAbsent {
+					item["native_status"] = "unknown"
+				}
+				unknown++
+			}
+			items[index] = item
+		}(index)
+	}
+	wg.Wait()
+	endEpoch, epochErr := s.Store.StateEpoch(pageCtx)
+	consistent := epochErr == nil && startEpoch == endEpoch
+	if !consistent {
+		unknown++
+	}
+	partial := unknown > 0 || timedOut > 0 || !consistent
+	var nextCursor any
+	if hasMore && len(tasks) > 0 {
+		nextCursor = tasks[len(tasks)-1].TaskID
+	}
+	return map[string]any{
+		"up":                     !partial,
+		"ready":                  s.Ready(),
+		"tasks":                  items,
+		"limit":                  limit,
+		"next_cursor":            nextCursor,
+		"partial":                partial,
+		"unknown":                unknown,
+		"observation_consistent": consistent,
+		"probed":                 probed,
+		"verified":               verified,
+		"timed_out":              timedOut,
+		"observed_at":            nowString(s.Clock()),
+	}, nil
+}
+
+func adminStatusProbeTimeout(task *state.Task, cause error) map[string]any {
+	return map[string]any{
+		"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State,
+		"native_status": "unknown", "guest_available": nil, "probed": false, "verified": false, "timed_out": true,
+		"observation_error": map[string]any{"code": "probe_timeout", "message": "native status probe exceeded its deadline", "cause": cause.Error()},
+	}
+}
+
+func adminStatusProbeFailure(task *state.Task, err error) map[string]any {
+	control := protocol.AsError(err)
+	return map[string]any{
+		"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State,
+		"native_status": "unknown", "guest_available": nil, "probed": true, "verified": false,
+		"observation_error": map[string]any{"code": control.Code, "message": control.Message, "detail": control.Detail},
+	}
 }
 
 func (s *Service) adminSessionList(ctx context.Context) (map[string]any, error) {
@@ -4106,7 +4229,7 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 		if task != nil {
 			session = task.SessionID
 		}
-		return map[string]any{"state": stateAbsent, "session_id": session, "effective_lease": false, "native_status": stateAbsent, "guest_available": false}, nil
+		return map[string]any{"state": stateAbsent, "session_id": session, "effective_lease": false, "native_status": stateAbsent, "guest_available": false, "verified": true}, nil
 	}
 	var resources any
 	var reservation any
@@ -4139,7 +4262,7 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	result := map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": nil}
+	result := map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": nil, "verified": false}
 	if resourceState != nil {
 		result["resource_state"] = resourceState
 	}
@@ -4147,7 +4270,11 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 		return result, nil
 	}
 	if _, ownershipErr := s.verifyOwnership(ctx, task); ownershipErr != nil {
-		result["guest_error"] = protocol.AsError(ownershipErr)
+		control := protocol.AsError(ownershipErr)
+		result["guest_error"] = control
+		if detail, ok := control.Detail.(map[string]any); ok && detail["native_missing"] == true {
+			result["native_missing"] = true
+		}
 		return result, nil
 	}
 	status, statusErr := s.Guest.Status(ctx, task.InstanceName)
@@ -4161,6 +4288,7 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 		return result, nil
 	}
 	result["native_status"] = nativeStatus
+	result["verified"] = true
 	guestAvailable := result["effective_lease"] == true && strings.EqualFold(nativeStatus, "running")
 	result["guest_available"] = guestAvailable
 	if result["effective_lease"] == true && !guestAvailable {

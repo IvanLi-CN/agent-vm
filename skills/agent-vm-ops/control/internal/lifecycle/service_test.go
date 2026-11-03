@@ -2997,6 +2997,98 @@ func TestWorkerFinishedKeepsFailedWorkerReconciliable(t *testing.T) {
 	}
 }
 
+func TestAdminStatusUsesBoundedPaginationAndUnknownProvenance(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "admin-status-page.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	for index := 0; index < 101; index++ {
+		id := fmt.Sprintf("task-%03d", index)
+		if err := store.InsertTask(ctx, state.Task{TaskID: id, SessionID: "session-" + id, Generation: 1, State: stateActive, InstanceName: "instance-" + id, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(store, config.Defaults(), Options{})
+	first, err := service.adminStatus(ctx, protocol.Request{"limit": int64(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first["limit"] != 25 || len(first["tasks"].([]any)) != 25 || first["next_cursor"] == nil {
+		t.Fatalf("first admin-status page = %#v", first)
+	}
+	if first["partial"] != true || first["up"] != false || first["unknown"] != 25 || first["probed"] != 0 || first["verified"] != 0 {
+		t.Fatalf("unknown admin-status page = %#v", first)
+	}
+	if _, err := service.adminStatus(ctx, protocol.Request{"limit": int64(101)}); protocol.AsError(err).Code != "invalid_request" {
+		t.Fatalf("limit 101 error = %v", err)
+	}
+	page100, err := service.adminStatus(ctx, protocol.Request{"limit": int64(100), "cursor": first["next_cursor"]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page100["limit"] != 100 || len(page100["tasks"].([]any)) != 76 || page100["next_cursor"] != nil {
+		t.Fatalf("last admin-status page = %#v", page100)
+	}
+}
+
+func TestScheduledMaintenanceUsesCursorWithoutTimerOperations(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "maintenance-page.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour).Format(time.RFC3339Nano)
+	for index := 0; index < 17; index++ {
+		id := fmt.Sprintf("task-%02d", index)
+		if err := store.InsertTask(context.Background(), state.Task{TaskID: id, SessionID: "session-" + id, Generation: 1, State: stateActive, InstanceName: "instance-" + id, LeaseExpiresAt: &future, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	if err := service.RunMaintenance(context.Background(), "reconcile"); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err := store.MaintenanceCursor(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.Reconcile.ScanAfterTaskID != "task-15" {
+		t.Fatalf("first maintenance cursor = %#v", cursor)
+	}
+	operations, err := store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 0 {
+		t.Fatalf("scheduled maintenance created timer journal rows = %#v", operations)
+	}
+	if err := service.RunMaintenance(context.Background(), "reconcile"); err != nil {
+		t.Fatal(err)
+	}
+	cursor, err = store.MaintenanceCursor(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.Reconcile.ScanAfterTaskID != "" {
+		t.Fatalf("maintenance cursor did not wrap = %#v", cursor)
+	}
+	for index := 0; index < 1000; index++ {
+		if err := service.RunMaintenance(context.Background(), "reconcile"); err != nil {
+			t.Fatalf("maintenance tick %d = %v", index, err)
+		}
+	}
+	operations, err = store.PendingOperations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(operations) != 0 {
+		t.Fatalf("repeated maintenance ticks created journal rows = %#v", operations)
+	}
+}
+
 func TestWorkerStartGateRecordsAdmissionAndRejectsRetry(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "worker-admission.sqlite3"))
 	if err != nil {

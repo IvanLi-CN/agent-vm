@@ -194,6 +194,28 @@ type Operation struct {
 	CreatedAt   string
 }
 
+const MaintenanceCursorMetaKey = "maintenance_cursor"
+
+type MaintenanceLane struct {
+	NextAttemptAt   string `json:"next_attempt_at"`
+	Attempt         int    `json:"attempt"`
+	ScanAfterTaskID string `json:"scan_after_task_id"`
+	LastErrorCode   string `json:"last_error_code"`
+	LastErrorPhase  string `json:"last_error_phase"`
+	UpdatedAt       string `json:"updated_at"`
+}
+
+type MaintenanceCursor struct {
+	Reconcile MaintenanceLane `json:"reconcile"`
+	AgeGC     MaintenanceLane `json:"age_gc"`
+}
+
+func DefaultMaintenanceCursor(now time.Time) MaintenanceCursor {
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	lane := MaintenanceLane{NextAttemptAt: stamp, UpdatedAt: stamp}
+	return MaintenanceCursor{Reconcile: lane, AgeGC: lane}
+}
+
 type AuditSummary struct {
 	Operations          map[string]int64
 	ImageUnpackFailures map[string]int64
@@ -537,6 +559,58 @@ func (s *Store) SetMeta(ctx context.Context, key, value string) error {
 		_, err = tx.exec("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, value)
 		return err
 	})
+}
+
+func (s *Store) MaintenanceCursor(ctx context.Context) (MaintenanceCursor, error) {
+	raw, found, err := s.Meta(ctx, MaintenanceCursorMetaKey)
+	if err != nil {
+		return MaintenanceCursor{}, err
+	}
+	if !found || strings.TrimSpace(raw) == "" {
+		// An absent additive key is due immediately. The cursor is initialized
+		// lazily by the first maintenance commit, so older state remains valid.
+		return DefaultMaintenanceCursor(time.Unix(0, 0).UTC()), nil
+	}
+	var cursor MaintenanceCursor
+	if err := json.Unmarshal([]byte(raw), &cursor); err != nil {
+		return MaintenanceCursor{}, fmt.Errorf("maintenance cursor: %w", err)
+	}
+	if err := validateMaintenanceLane(cursor.Reconcile); err != nil {
+		return MaintenanceCursor{}, fmt.Errorf("maintenance cursor reconcile: %w", err)
+	}
+	if err := validateMaintenanceLane(cursor.AgeGC); err != nil {
+		return MaintenanceCursor{}, fmt.Errorf("maintenance cursor age-gc: %w", err)
+	}
+	return cursor, nil
+}
+
+func validateMaintenanceLane(lane MaintenanceLane) error {
+	if lane.Attempt < 0 || lane.Attempt > 6 {
+		return errors.New("attempt is outside the bounded retry range")
+	}
+	for _, value := range []string{lane.NextAttemptAt, lane.UpdatedAt} {
+		if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
+			return errors.New("timestamp is invalid")
+		}
+	}
+	if len(lane.ScanAfterTaskID) > 128 || len(lane.LastErrorCode) > 128 || len(lane.LastErrorPhase) > 128 {
+		return errors.New("cursor field is too long")
+	}
+	return nil
+}
+
+func (s *Store) SetMaintenanceCursor(ctx context.Context, cursor MaintenanceCursor) error {
+	if err := validateMaintenanceLane(cursor.Reconcile); err != nil {
+		return fmt.Errorf("maintenance cursor reconcile: %w", err)
+	}
+	if err := validateMaintenanceLane(cursor.AgeGC); err != nil {
+		return fmt.Errorf("maintenance cursor age-gc: %w", err)
+	}
+	raw, err := json.Marshal(cursor)
+	if err != nil {
+		return err
+	}
+	return s.SetMeta(ctx, MaintenanceCursorMetaKey, string(raw))
 }
 
 func generationMetaKey(sessionID string) string {
@@ -947,27 +1021,54 @@ func (s *Store) ClaimOperation(ctx context.Context, operationID, action string, 
 }
 
 func (s *Store) RecordOperation(ctx context.Context, operationID, action string, sessionID *string, generation *int64, response map[string]any) error {
-	raw, err := json.Marshal(response)
-	if err != nil {
-		return err
-	}
 	return s.withWrite(ctx, func(tx *Tx) error {
-		result, err := tx.exec("UPDATE operations SET action = ?, session_id = ?, generation = ?, response_json = ? WHERE operation_id = ? AND json_extract(response_json, '$.outcome') = 'pending'", action, nullableStringArg(sessionID), nullableIntArg(generation), string(raw), operationID)
+		current, scanErr := scanOperation(ctx, tx.conn, operationID)
+		if scanErr == nil {
+			if current.Action != action || !sameNullableString(current.SessionID, sessionID) || !sameNullableInt64(current.Generation, generation) {
+				return errors.New("operation journal identity is immutable")
+			}
+			if outcome, _ := current.Response["outcome"].(string); outcome != "pending" {
+				return errors.New("operation journal is already finalized")
+			}
+			if _, present := response["worker"]; !present {
+				if worker, hasWorker := current.Response["worker"]; hasWorker {
+					response["worker"] = worker
+				}
+			}
+			raw, err := json.Marshal(response)
+			if err != nil {
+				return err
+			}
+			_, err = tx.exec("UPDATE operations SET response_json = ? WHERE operation_id = ? AND json_extract(response_json, '$.outcome') = 'pending'", string(raw), operationID)
+			return err
+		}
+		if !errors.Is(scanErr, sql.ErrNoRows) {
+			return scanErr
+		}
+		raw, err := json.Marshal(response)
 		if err != nil {
 			return err
 		}
-		if rows, rowsErr := result.RowsAffected(); rowsErr == nil && rows > 0 {
-			return nil
-		}
-		result, err = tx.exec("INSERT INTO operations(operation_id, action, session_id, generation, response_json, created_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO NOTHING", operationID, action, nullableStringArg(sessionID), nullableIntArg(generation), string(raw), time.Now().UTC().Format(time.RFC3339Nano))
+		_, err = tx.exec("INSERT INTO operations(operation_id, action, session_id, generation, response_json, created_at) VALUES(?, ?, ?, ?, ?, ?)", operationID, action, nullableStringArg(sessionID), nullableIntArg(generation), string(raw), time.Now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
-		}
-		if rows, rowsErr := result.RowsAffected(); rowsErr == nil && rows == 0 {
-			return errors.New("operation journal is already finalized")
 		}
 		return nil
 	})
+}
+
+func sameNullableString(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func sameNullableInt64(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 // UpdateOperationResponse mutates a pending operation in the same write
@@ -984,8 +1085,14 @@ func (s *Store) UpdateOperationResponse(ctx context.Context, operationID string,
 		if outcome != "pending" {
 			return errors.New("operation journal is already finalized")
 		}
+		previousWorker, _ := operation.Response["worker"].(map[string]any)
 		if err := update(operation.Response); err != nil {
 			return err
+		}
+		if currentWorker, ok := operation.Response["worker"].(map[string]any); ok {
+			if err := preserveWorkerIdentity(previousWorker, currentWorker); err != nil {
+				return err
+			}
 		}
 		raw, err := json.Marshal(operation.Response)
 		if err != nil {
@@ -1004,6 +1111,26 @@ func (s *Store) UpdateOperationResponse(ctx context.Context, operationID string,
 		}
 		return nil
 	})
+}
+
+func preserveWorkerIdentity(previous, current map[string]any) error {
+	if previous == nil || current == nil {
+		return nil
+	}
+	for _, key := range []string{"pid", "start_time", "process_group"} {
+		oldValue, exists := previous[key]
+		if !exists {
+			continue
+		}
+		newValue, hasNewValue := current[key]
+		if hasNewValue && fmt.Sprint(oldValue) != fmt.Sprint(newValue) {
+			return errors.New("native worker identity is immutable")
+		}
+		if !hasNewValue {
+			current[key] = oldValue
+		}
+	}
+	return nil
 }
 
 func (s *Store) RecordOperationWorker(ctx context.Context, operationID string, worker map[string]any) error {

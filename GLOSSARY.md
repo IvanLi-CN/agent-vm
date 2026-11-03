@@ -63,6 +63,14 @@ _Avoid_：把排空理解为立即停止进程或强制终止 guest。
 **管理操作（Management operation）**：具有 UUID、操作者、原因、目标、阶段和结果的持久管理动作记录。
 浏览器断开或 native 结果不确定时，仍可按 operation ID 查询；它不替代现有会话生命周期 journal。
 
+**native_missing（native 缺失观测）**：一次精确、带实例与 project 上下文的 native not-found 观测。它是 status/admin-status 的 observation field，不是 task state；传输失败、超时、截断或上下文不匹配都不能设置它。
+
+**outcome unknown（结果未知）**：native effect 或 SQLite commit 是否发生无法证明的 journal outcome。它必须保留原 operation identity、generation、digest 和 worker evidence，不能通过新 operation 重放。
+
+**terminal-absent（终态 absent）**：只有 destroy journal、generation tombstone、同代 worker quiescence 和精确 native absence 都已验证后，才允许删除 durable task row 的恢复结论。它不是对单次 not-found 错误的别名。
+
+**maintenance cursor（维护游标）**：`meta` 中 additive 的 JSON 状态，分别保存 reconcile 与 age-GC lane 的下一次尝试时间、退避次数和 task keyset 游标。它只在该轮 durable work 提交后前移，旧数据库没有该 key 时按立即执行处理。
+
 _Avoid_：把受管镜像、VM 缓存与 Agent VM 产品发布包统称为“镜像”；把“释放租约”理解为保留访问权的普通关机。
 
 ## 资源与初始化
