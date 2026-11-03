@@ -122,6 +122,21 @@ func TestProcessIdentityRequiresStartToken(t *testing.T) {
 	}
 }
 
+func TestStoppedSlotCountersRequireDeploydStopRequest(t *testing.T) {
+	evidence := quiescenceEvidence{Process: processIdentity{PID: 42, StartTime: "start-1"}}
+	if quiescenceEvidenceProvesStopped(evidence) {
+		t.Fatal("quiescence evidence without a deployd stop request proved stopped counters")
+	}
+	evidence.StopRequested = true
+	if !quiescenceEvidenceProvesStopped(evidence) {
+		t.Fatal("verified deployd stop request did not prove stopped counters")
+	}
+	evidence.Process = processIdentity{}
+	if quiescenceEvidenceProvesStopped(evidence) {
+		t.Fatal("quiescence evidence without process identity proved stopped counters")
+	}
+}
+
 func TestProcessStartTokenMatchesExactProcessInstance(t *testing.T) {
 	token := controllerrole.ProcessStartToken(os.Getpid())
 	if token == "" {
