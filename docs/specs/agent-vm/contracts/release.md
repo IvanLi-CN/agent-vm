@@ -38,6 +38,7 @@ The first management-enabled release uses these markers:
 | `managed-image-catalog@1` | Immutable image records, labels, verification, references and default selection. |
 | `session-image-binding@1` | Session and cache identity remains bound to the exact image fingerprint. |
 | `management-operation-audit@1` | Durable administrator operation identity, current, typed rejected-request or `legacy_unknown` actor, optional reason, target, phase and outcome. |
+| `oidc-return-path@1` | One-time OIDC transactions retain only an allowlisted same-origin return path until callback consumption. |
 | `principal-identity@1` | The configured OIDC issuer/subject is the sole administrator actor; claims and historical user mappings are never guessed. |
 | `token-revocation@1` | Opaque machine-Token digest, resource version, scope, expiry and revocation state are durable across slots. |
 
@@ -49,6 +50,7 @@ The format-4 manifest declares:
     "legacy-agent-vm-core@1",
     "managed-image-catalog@1",
     "management-operation-audit@1",
+    "oidc-return-path@1",
     "principal-identity@1",
     "session-image-binding@1",
     "token-revocation@1"
@@ -57,6 +59,7 @@ The format-4 manifest declares:
     "legacy-agent-vm-core@1",
     "managed-image-catalog@1",
     "management-operation-audit@1",
+    "oidc-return-path@1",
     "principal-identity@1",
     "session-image-binding@1",
     "token-revocation@1"

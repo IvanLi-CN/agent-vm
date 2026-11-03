@@ -88,6 +88,11 @@ CREATE TABLE IF NOT EXISTS oidc_transactions (
   expires_at TEXT NOT NULL,
   consumed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS oidc_transaction_return_paths (
+  state_digest TEXT PRIMARY KEY,
+  return_to TEXT NOT NULL,
+  FOREIGN KEY (state_digest) REFERENCES oidc_transactions(state_digest) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS browser_sessions (
   session_digest TEXT PRIMARY KEY,
   issuer TEXT NOT NULL,
@@ -258,6 +263,7 @@ func (s *Store) EnsureManagementSchema(ctx context.Context) error {
 			{name: "managed-image-catalog", version: 1},
 			{name: "session-image-binding", version: 1},
 			{name: "management-operation-audit", version: 1},
+			{name: "oidc-return-path", version: 1},
 			{name: "principal-identity", version: 1},
 			{name: "token-revocation", version: 1},
 		} {

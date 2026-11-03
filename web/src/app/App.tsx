@@ -3,6 +3,7 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import type { PageKey } from "./types";
+import { ManagementAuthBoundary, ManagementAuthProvider } from "./auth";
 import { Shell } from "../components/Shell";
 import { ImagesPage } from "../pages/ImagesPage";
 import { OperationsPage } from "../pages/OperationsPage";
@@ -42,7 +43,7 @@ function ConsoleApp() {
   if (isDemoRuntime() && runtime.bootstrapError) {
     return <div className="demo-boot-error"><div><span className="eyebrow-label">{t("demo.eyebrow")}</span><h1>{t("demo.bootFailed")}</h1><p>{t("demo.bootFailedText")}</p><code>{runtime.bootstrapError}</code></div></div>;
   }
-  return <Shell key={`${page}-${runtime.revision}`} page={page}><div className="sr-only" aria-live="polite">{t(`nav.${page}`)}</div>{page === "overview" ? <OverviewPage /> : page === "vms" ? <VMsPage /> : page === "images" ? <ImagesPage /> : page === "operations" ? <OperationsPage /> : <SystemPage />}</Shell>;
+  return <ManagementAuthProvider><Shell key={`${page}-${runtime.revision}`} page={page}><div className="sr-only" aria-live="polite">{t(`nav.${page}`)}</div><ManagementAuthBoundary>{page === "overview" ? <OverviewPage /> : page === "vms" ? <VMsPage /> : page === "images" ? <ImagesPage /> : page === "operations" ? <OperationsPage /> : <SystemPage />}</ManagementAuthBoundary></Shell></ManagementAuthProvider>;
 }
 
 export function App({ client = queryClient }: { client?: QueryClient } = {}) {

@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { actionLabel, formatDateTime, shortFingerprint } from "../app/format";
 import { ManagementRequestError, createOperationId, listImages, previewImageAction, startImageImport, submitImageAction, uploadImageImportContent } from "../app/api";
+import { useManagementAuth } from "../app/auth";
 import type { ActionPreview, ImageImportRequest, Locale, ManagedImage } from "../app/types";
 import { auditReasonWithinLimit, optionalAuditReason } from "../app/validation";
 import { ActionDialog } from "../components/ActionDialog";
@@ -17,6 +18,7 @@ const importRejectedCodes = new Set(["invalid_request", "source_not_allowed", "p
 
 export function ImagesPage() {
   const { t, i18n } = useTranslation();
+  const auth = useManagementAuth();
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const client = useQueryClient();
   const [search, setSearch] = useState("");
@@ -42,7 +44,7 @@ export function ImagesPage() {
   const [action, setAction] = useState<ImageAction | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
   const [operationId, setOperationId] = useState<string | null>(null);
-  const query = useQuery({ queryKey: ["images", search, cursor], queryFn: () => listImages(search, cursor), refetchInterval: 10_000, refetchIntervalInBackground: false });
+  const query = useQuery({ queryKey: ["images", search, cursor], queryFn: () => listImages(search, cursor), enabled: auth.isAuthenticated, refetchInterval: 10_000, refetchIntervalInBackground: false });
   const selected = query.data?.items.find((image) => image.fingerprint === selectedFingerprint) ?? query.data?.items[0] ?? null;
   const importMutation = useMutation({
     mutationFn: async ({ request, content }: ImportSubmission) => {

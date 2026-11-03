@@ -39,6 +39,10 @@ const (
 
 var oidcErrorPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
 
+var oidcReturnPaths = map[string]struct{}{
+	"/": {}, "/vms": {}, "/images": {}, "/operations": {}, "/system": {},
+}
+
 type oidcDiscovery struct {
 	Issuer              string
 	Authorization       string
@@ -57,8 +61,28 @@ type oidcAuthenticator struct {
 
 func (auth *oidcAuthenticator) oidcStart(c *gin.Context) {
 	request := c.Request
-	if request.Method != http.MethodGet || len(request.URL.Query()) != 0 {
-		writeProblem(c.Writer, invalidRequest("OIDC start accepts only a query-free GET"))
+	query := request.URL.Query()
+	if request.Method != http.MethodGet || !allowedQueryKeys(query, map[string]bool{"return_to": true}) {
+		writeProblem(c.Writer, invalidRequest("OIDC start accepts only an optional return_to GET parameter"))
+		return
+	}
+	returnTo := "/"
+	if values, present := query["return_to"]; present {
+		if len(values) != 1 || values[0] == "" {
+			writeProblem(c.Writer, invalidRequest("OIDC return path is invalid"))
+			return
+		}
+		returnTo = values[0]
+		if _, ok := oidcReturnPaths[returnTo]; !ok {
+			writeProblem(c.Writer, invalidRequest("OIDC return path is invalid"))
+			return
+		}
+	}
+	if returnTo == "" {
+		returnTo = "/"
+	}
+	if request.URL.RawQuery != "" && query.Get("return_to") == "" {
+		writeProblem(c.Writer, invalidRequest("OIDC return path is invalid"))
 		return
 	}
 	discovery, err := auth.getDiscovery(request.Context())
@@ -100,6 +124,7 @@ func (auth *oidcAuthenticator) oidcStart(c *gin.Context) {
 		BindingCookieDigest: digestString(binding),
 		ClientID:            auth.server.Config.OIDC.ClientID,
 		RedirectURI:         auth.server.Config.OIDC.RedirectURI,
+		ReturnTo:            returnTo,
 		CreatedAt:           now.Format(time.RFC3339Nano),
 		ExpiresAt:           now.Add(oidcTransactionTTL).Format(time.RFC3339Nano),
 	}
@@ -224,7 +249,7 @@ func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 	auth.clearBinding(c.Writer)
 	c.Header("Cache-Control", "no-store")
 	c.Header("Referrer-Policy", "no-referrer")
-	http.Redirect(c.Writer, request, strings.TrimRight(auth.server.Config.ExternalOrigin, "/")+"/", http.StatusFound)
+	http.Redirect(c.Writer, request, strings.TrimRight(auth.server.Config.ExternalOrigin, "/")+transaction.ReturnTo, http.StatusFound)
 }
 
 func (auth *oidcAuthenticator) sessionFor(request *http.Request) (unifiedPrincipal, *state.BrowserSession, *APIError) {

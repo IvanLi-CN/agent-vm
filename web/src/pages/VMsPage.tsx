@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { actionLabel, formatBytes, formatDateTime, shortFingerprint } from "../app/format";
 import { ManagementRequestError, createOperationId, listVMs, previewVMAction, submitVMAction } from "../app/api";
+import { useManagementAuth } from "../app/auth";
 import type { ActionPreview, Locale, ManagedVM } from "../app/types";
 import { ActionDialog } from "../components/ActionDialog";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
@@ -16,6 +17,7 @@ function vmDisplayName(vm: ManagedVM): string {
 
 export function VMsPage() {
   const { t, i18n } = useTranslation();
+  const auth = useManagementAuth();
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const queryClient = useQueryClient();
   const [q, setQ] = useState("");
@@ -29,7 +31,7 @@ export function VMsPage() {
   const [parameters, setParameters] = useState<Record<string, unknown>>({});
   const [operationId, setOperationId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
-  const vmQuery = useQuery({ queryKey: ["vms", q, state, leaseState, cursor], queryFn: () => listVMs({ q, state, leaseState, cursor }), refetchInterval: 10_000, refetchIntervalInBackground: false });
+  const vmQuery = useQuery({ queryKey: ["vms", q, state, leaseState, cursor], queryFn: () => listVMs({ q, state, leaseState, cursor }), enabled: auth.isAuthenticated, refetchInterval: 10_000, refetchIntervalInBackground: false });
   const selected = vmQuery.data?.items.find((vm) => vm.task_id === selectedId) ?? vmQuery.data?.items[0] ?? null;
 
   useEffect(() => {

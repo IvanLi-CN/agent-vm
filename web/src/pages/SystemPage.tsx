@@ -3,6 +3,7 @@ import { CheckCircle2, Database, Wrench } from "lucide-react";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ManagementRequestError, createOperationId, getSystem, previewMaintenance, submitMaintenance } from "../app/api";
+import { useManagementAuth } from "../app/auth";
 import { actionLabel, formatDateTime } from "../app/format";
 import type { ActionPreview, Locale, SystemStatus } from "../app/types";
 import { ActionDialog } from "../components/ActionDialog";
@@ -15,6 +16,7 @@ type ActionDialogOwner = "maintenance" | "token" | null;
 
 export function SystemPage() {
   const { t, i18n } = useTranslation();
+  const auth = useManagementAuth();
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const client = useQueryClient();
   const [action, setAction] = useState<MaintenanceAction | null>(null);
@@ -28,7 +30,7 @@ export function SystemPage() {
       return current === "token" ? null : current;
     });
   }, []);
-  const query = useQuery({ queryKey: ["system"], queryFn: getSystem, refetchInterval: 10_000, refetchIntervalInBackground: false });
+  const query = useQuery({ queryKey: ["system"], queryFn: getSystem, enabled: auth.isAuthenticated, refetchInterval: 10_000, refetchIntervalInBackground: false });
   const showError = (error: unknown) => setActionError(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
   const mutation = useMutation({
     mutationFn: ({ reason }: { reason: string }) => submitMaintenance(action!, reason, preview!, operationId ?? undefined),

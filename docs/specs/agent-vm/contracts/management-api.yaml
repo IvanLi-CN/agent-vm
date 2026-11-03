@@ -28,7 +28,16 @@ paths:
       operationId: startOidcLogin
       security: []
       summary: Start an OIDC Authorization Code + PKCE login
-      description: The authorization request uses code_challenge_method=S256 only; plain and any other PKCE method are rejected.
+      description: The authorization request uses code_challenge_method=S256 only; plain and any other PKCE method are rejected. An optional return_to value is validated as one of the allowlisted same-origin management page paths /, /vms, /images, /operations or /system and stored in the one-time transaction.
+      parameters:
+        - name: return_to
+          in: query
+          required: false
+          description: Allowlisted same-origin management page path to visit after successful login. Duplicate values, unknown parameters, external URLs, protocol-relative URLs, path traversal and unsupported paths are rejected; a missing value defaults to /.
+          schema:
+            type: string
+            maxLength: 256
+            enum: [/, /vms, /images, /operations, /system]
       responses:
         "302":
           description: Redirect to the configured OIDC authorization endpoint.
@@ -92,7 +101,7 @@ paths:
             maxLength: 2048
       responses:
         "302":
-          description: Redirect to the configured management origin after creating the browser session, or after clearing the binding cookie with a generic localized login-failure state and no session for a provider error.
+          description: Redirect to the validated return_to path after creating the browser session, or to the management origin with auth=failed after clearing the binding cookie and creating no session for a provider error or failed callback.
           headers:
             Location:
               schema:
@@ -111,10 +120,10 @@ paths:
       operationId: getManagementSession
       security:
         - browserSession: []
-      summary: Establish the browser session and return its administrator context
+      summary: Bootstrap the browser session and return its administrator context
       responses:
         "200":
-          description: Authenticated administrator context and CSRF token.
+          description: Authenticated administrator context and CSRF token. The SPA must bootstrap this endpoint before showing administrator identity, capabilities or managed resources; authentication_required and csrf_invalid suspend subsequent queries and mutations until explicit reauthentication.
           headers:
             Set-Cookie:
               description: Opaque session cookie; Secure, HttpOnly, SameSite=Strict, Path=/, Max-Age equal to the configured session TTL.
