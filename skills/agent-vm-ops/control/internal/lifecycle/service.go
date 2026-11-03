@@ -1085,11 +1085,17 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 			continue
 		}
 		finishActive := s.markOperationActive(operation.OperationID)
-		recoveryCtx := native.WithWorkerRecorder(ctx, operation.OperationID, s)
-		if coordinatorID := native.WorkerOperationID(ctx); coordinatorID != "" && coordinatorID != operation.OperationID {
-			recoveryCtx = native.WithWorkerRecovery(recoveryCtx, coordinatorID)
+		var result any
+		var dispatchErr error
+		if _, legacyMaintenance := maintenanceLaneForAction(operation.Action); legacyMaintenance {
+			result, dispatchErr = s.recoverLegacyMaintenancePage(ctx, operation.Action)
+		} else {
+			recoveryCtx := native.WithWorkerRecorder(ctx, operation.OperationID, s)
+			if coordinatorID := native.WorkerOperationID(ctx); coordinatorID != "" && coordinatorID != operation.OperationID {
+				recoveryCtx = native.WithWorkerRecovery(recoveryCtx, coordinatorID)
+			}
+			result, dispatchErr = s.dispatchAction(recoveryCtx, operation.Action, request)
 		}
-		result, dispatchErr := s.dispatchAction(recoveryCtx, operation.Action, request)
 		finishActive()
 		if dispatchErr != nil {
 			if uncertain(dispatchErr) {
@@ -1168,7 +1174,7 @@ func (s *Service) mayRetryClearedMaintenance(ctx context.Context, operation stat
 
 func recoverableOperation(action string) bool {
 	switch action {
-	case "drain-enter", "drain-exit", "admin-reconcile", "admin-gc", "timer-reconcile", "timer-age-gc":
+	case "drain-enter", "drain-exit", "timer-expire", "admin-reconcile", "admin-gc", "timer-reconcile", "timer-age-gc":
 		return true
 	default:
 		return false
@@ -1176,7 +1182,7 @@ func recoverableOperation(action string) bool {
 }
 
 func recoverableBeforeNativeStart(action string, worker map[string]any) bool {
-	if action != "timer-reconcile" && action != "timer-age-gc" && action != "port-add" && action != "port-remove" {
+	if action != "timer-expire" && action != "timer-reconcile" && action != "timer-age-gc" && action != "port-add" && action != "port-remove" {
 		return false
 	}
 	if stringValue(worker["state"]) != "starting" && stringValue(worker["state"]) != "exited" {

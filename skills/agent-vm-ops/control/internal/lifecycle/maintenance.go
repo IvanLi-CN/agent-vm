@@ -78,6 +78,7 @@ func (s *Service) RunMaintenance(ctx context.Context, lane string) error {
 	if err == nil && (mutationLost() || !s.mutationAllowed()) {
 		err = controllerLeaseLostError(nil)
 	}
+	completedAt := s.Clock().UTC()
 	if page.taskCursorUpdated {
 		laneCursor.ScanAfterTaskID = page.nextTaskID
 	}
@@ -87,7 +88,7 @@ func (s *Service) RunMaintenance(ctx context.Context, lane string) error {
 	}
 	if err == nil {
 		laneCursor.Attempt = 0
-		laneCursor.NextAttemptAt = nowString(now)
+		laneCursor.NextAttemptAt = nowString(completedAt)
 		laneCursor.LastErrorCode = ""
 		laneCursor.LastErrorPhase = ""
 	} else {
@@ -95,12 +96,12 @@ func (s *Service) RunMaintenance(ctx context.Context, lane string) error {
 		if laneCursor.Attempt > 6 {
 			laneCursor.Attempt = 6
 		}
-		laneCursor.NextAttemptAt = nowString(now.Add(maintenanceBackoff(laneCursor.Attempt)))
+		laneCursor.NextAttemptAt = nowString(completedAt.Add(maintenanceBackoff(laneCursor.Attempt)))
 		control := protocol.AsError(err)
 		laneCursor.LastErrorCode = control.Code
 		laneCursor.LastErrorPhase = lane
 	}
-	laneCursor.UpdatedAt = nowString(now)
+	laneCursor.UpdatedAt = nowString(completedAt)
 	if mutationLost() || !s.mutationAllowed() {
 		return controllerLeaseLostError(err)
 	}
@@ -170,6 +171,9 @@ func (s *Service) reconcileMaintenancePageWithCursor(ctx context.Context, afterT
 				return page, reconcileErr
 			}
 		}
+		if err := s.ensureMaintenanceOperationResolved(ctx, pending[index].OperationID); err != nil {
+			return page, err
+		}
 		page.nextOperationAt = pending[index].CreatedAt
 		page.nextOperationID = pending[index].OperationID
 		page.operationCursorUpdated = true
@@ -180,19 +184,24 @@ func (s *Service) reconcileMaintenancePageWithCursor(ctx context.Context, afterT
 		page.operationCursorUpdated = true
 	}
 
+	tasksPage, err := s.reconcileMaintenanceTaskPage(ctx, afterTaskID)
+	if err != nil {
+		return page, err
+	}
+	page.nextTaskID = tasksPage.nextTaskID
+	page.taskCursorUpdated = tasksPage.taskCursorUpdated
+	return page, firstErr
+}
+
+func (s *Service) reconcileMaintenanceTaskPage(ctx context.Context, afterTaskID string) (maintenancePageResult, error) {
 	tasks, more, err := s.Store.ListTasksPage(ctx, state.TaskPageFilter{AfterTaskID: afterTaskID, Limit: maintenancePageSize})
 	if err != nil {
-		if firstErr == nil {
-			firstErr = s.sqliteError(err)
-		}
-		return page, firstErr
+		return maintenancePageResult{}, s.sqliteError(err)
 	}
+	page := maintenancePageResult{}
 	for _, task := range tasks {
 		if err := ctx.Err(); err != nil {
-			if firstErr == nil {
-				firstErr = protocol.NewError("maintenance_timeout", "reconcile maintenance budget expired", map[string]any{"phase": maintenanceReconcileLane})
-			}
-			return page, firstErr
+			return page, protocol.NewError("maintenance_timeout", "reconcile maintenance budget expired", map[string]any{"phase": maintenanceReconcileLane})
 		}
 		if reconcileErr := s.reconcileMaintenanceTask(ctx, &task); reconcileErr != nil {
 			return page, reconcileErr
@@ -204,7 +213,67 @@ func (s *Service) reconcileMaintenancePageWithCursor(ctx context.Context, afterT
 		page.nextTaskID = ""
 		page.taskCursorUpdated = true
 	}
-	return page, firstErr
+	return page, nil
+}
+
+func (s *Service) ensureMaintenanceOperationResolved(ctx context.Context, operationID string) error {
+	operation, err := s.Store.GetOperation(ctx, operationID)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if operation != nil && stringValue(operation.Response["outcome"]) == "pending" {
+		return protocol.NewError("operation_unverified", "maintenance operation remains pending; cursor was not advanced", map[string]any{"operation_id": operationID})
+	}
+	return nil
+}
+
+func maintenanceLaneForAction(action string) (string, bool) {
+	switch action {
+	case "admin-reconcile", "timer-reconcile":
+		return maintenanceReconcileLane, true
+	case "admin-gc", "timer-age-gc":
+		return maintenanceAgeGCLane, true
+	default:
+		return "", false
+	}
+}
+
+func (s *Service) recoverLegacyMaintenancePage(ctx context.Context, action string) (map[string]any, error) {
+	lane, ok := maintenanceLaneForAction(action)
+	if !ok {
+		return nil, protocol.NewError("operation_unverified", "legacy operation is not a maintenance action", map[string]any{"action": action})
+	}
+	cursor, err := s.Store.MaintenanceCursor(ctx)
+	if err != nil {
+		return nil, s.sqliteError(err)
+	}
+	laneCursor := maintenanceLane(&cursor, lane)
+	workCtx, cancel := context.WithTimeout(ctx, maintenanceBudget)
+	defer cancel()
+	var page maintenancePageResult
+	if lane == maintenanceReconcileLane {
+		page, err = s.reconcileMaintenanceTaskPage(workCtx, laneCursor.ScanAfterTaskID)
+	} else {
+		page, err = s.ageGCMaintenancePage(workCtx, laneCursor.ScanAfterTaskID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if page.taskCursorUpdated {
+		laneCursor.ScanAfterTaskID = page.nextTaskID
+	}
+	completedAt := s.Clock().UTC()
+	laneCursor.Attempt = 0
+	laneCursor.NextAttemptAt = nowString(completedAt)
+	laneCursor.LastErrorCode = ""
+	laneCursor.LastErrorPhase = ""
+	laneCursor.UpdatedAt = nowString(completedAt)
+	if err := s.commitMutationContext(ctx, func() error {
+		return s.Store.SetMaintenanceCursor(ctx, cursor)
+	}); err != nil {
+		return nil, s.sqliteError(err)
+	}
+	return map[string]any{"legacy_recovered": true, "maintenance_lane": lane, "task_cursor": laneCursor.ScanAfterTaskID}, nil
 }
 
 func (s *Service) reconcileMaintenanceTask(ctx context.Context, task *state.Task) error {

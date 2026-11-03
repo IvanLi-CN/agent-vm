@@ -2622,6 +2622,42 @@ func TestStartupReconcileRetriesTimerBeforeNativeStart(t *testing.T) {
 	}
 }
 
+func TestStartupReconcileRetriesPendingTimerExpire(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "timer-expire-recovery.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	request := protocol.Request{
+		"protocol": protocol.Version, "action": "timer-expire", "task_id": "missing-expire-task",
+		"session_id": "missing-expire-session", "generation": int64(1), "operation_id": "pending-timer-expire",
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(1)
+	session := "missing-expire-session"
+	if err := store.RecordOperation(ctx, "pending-timer-expire", "timer-expire", &session, &generation, map[string]any{
+		"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest,
+		"worker": map[string]any{"state": "starting", "start_attempted": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Resident: true})
+	if err := service.StartupReconcile(ctx); err != nil {
+		t.Fatalf("startup: %v", err)
+	}
+	operation, err := store.GetOperation(ctx, "pending-timer-expire")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "success" {
+		t.Fatalf("recovered timer-expire operation = %#v", operation)
+	}
+}
+
 func TestStartupReconcileRetriesExplicitlyUnattemptedPortOperation(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "port-prestart-recovery.sqlite3"))
 	if err != nil {
@@ -3208,6 +3244,143 @@ func TestMaintenanceDoesNotAdvancePastFailedCleanup(t *testing.T) {
 	}
 	if cursor.AgeGC.ScanAfterTaskID != "" {
 		t.Fatalf("failed cleanup advanced age-gc cursor = %#v", cursor)
+	}
+}
+
+func TestMaintenanceDoesNotAdvancePastLockedPendingOperation(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "maintenance-locked-operation.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	session := "locked-maintenance-session"
+	generation := int64(1)
+	if err := store.RecordOperation(ctx, "locked-maintenance-operation", "release", &session, &generation, map[string]any{
+		"outcome": "pending", "worker": map[string]any{"state": "starting", "start_attempted": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	unlock, locked := service.trySessionLock(session)
+	if !locked {
+		t.Fatal("failed to hold the session lock")
+	}
+	defer unlock()
+	if err := service.RunMaintenance(ctx, maintenanceReconcileLane); err == nil {
+		t.Fatal("locked pending operation unexpectedly reconciled")
+	}
+	cursor, err := store.MaintenanceCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.Reconcile.ScanAfterOperationID != "" || cursor.Reconcile.ScanAfterOperationAt != "" {
+		t.Fatalf("locked pending operation advanced cursor = %#v", cursor)
+	}
+}
+
+func TestMaintenanceBackoffStartsAfterCompletedRound(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "maintenance-backoff.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	base := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	cursor, err := store.MaintenanceCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor.Reconcile.NextAttemptAt = base.Format(time.RFC3339Nano)
+	if err := store.SetMaintenanceCursor(ctx, cursor); err != nil {
+		t.Fatal(err)
+	}
+	session := "backoff-maintenance-session"
+	generation := int64(1)
+	if err := store.RecordOperation(ctx, "backoff-maintenance-operation", "release", &session, &generation, map[string]any{
+		"outcome": "pending", "worker": map[string]any{"state": "starting", "start_attempted": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clockCalls := 0
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time {
+		clockCalls++
+		if clockCalls == 1 {
+			return base
+		}
+		return base.Add(time.Second)
+	}})
+	unlock, locked := service.trySessionLock(session)
+	if !locked {
+		t.Fatal("failed to hold the session lock")
+	}
+	defer unlock()
+	if err := service.RunMaintenance(ctx, maintenanceReconcileLane); err == nil {
+		t.Fatal("locked pending operation unexpectedly reconciled")
+	}
+	cursor, err = store.MaintenanceCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextAttempt, err := time.Parse(time.RFC3339Nano, cursor.Reconcile.NextAttemptAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := base.Add(3 * time.Second)
+	if !nextAttempt.Equal(want) {
+		t.Fatalf("maintenance backoff deadline = %s, want %s", nextAttempt, want)
+	}
+}
+
+func TestLegacyTimerRecoveryUsesBoundedTaskPage(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "legacy-timer-page.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	now := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	future := now.Add(time.Hour).Format(time.RFC3339Nano)
+	for index := 0; index < 17; index++ {
+		id := fmt.Sprintf("legacy-task-%02d", index)
+		if err := store.InsertTask(ctx, state.Task{TaskID: id, SessionID: "legacy-session-" + id, Generation: 1, State: stateActive, InstanceName: "legacy-instance-" + id, LeaseExpiresAt: &future, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "timer-reconcile", "apply": true, "generation": int64(0), "operation_id": "legacy-timer-page"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generation := int64(0)
+	if err := store.RecordOperation(ctx, "legacy-timer-page", "timer-reconcile", nil, &generation, map[string]any{
+		"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest,
+		"worker": map[string]any{"state": "exited", "start_attempted": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	pending, err := store.PendingOperations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.recoverPending(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(ctx, "legacy-timer-page")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "success" {
+		t.Fatalf("legacy timer operation = %#v", operation)
+	}
+	cursor, err := store.MaintenanceCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.Reconcile.ScanAfterTaskID != "legacy-task-15" {
+		t.Fatalf("legacy timer cursor = %#v", cursor)
 	}
 }
 
