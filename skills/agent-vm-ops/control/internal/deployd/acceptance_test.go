@@ -95,6 +95,7 @@ func (runtime *acceptanceRuntime) Observe(context.Context) (RuntimeSnapshot, err
 		value.SourceRevision = "revision-1"
 		value.StateEpoch = "epoch-1"
 		value.StateCapabilities = []string{"reads@1", "writes@1"}
+		value.CountersKnown = true
 		value.ObservedUnix = now.Unix()
 		slots[slot] = value
 	}
@@ -323,9 +324,9 @@ func TestDeploydAgentVMAcceptance(t *testing.T) {
 	assertMetric(t, activeMetrics, `agent_vm_deployd_slot_controller_owned{slot="blue"} 0`)
 	assertMetric(t, activeMetrics, `agent_vm_deployd_slot_controller_owned{slot="green"} 1`)
 	runtime.mu.Lock()
-	if runtime.draining["blue"] {
+	if !runtime.draining["blue"] {
 		runtime.mu.Unlock()
-		t.Fatal("successful activation left the old slot durably drained")
+		t.Fatal("successful activation reopened the old slot before it was stopped")
 	}
 	runtime.mu.Unlock()
 

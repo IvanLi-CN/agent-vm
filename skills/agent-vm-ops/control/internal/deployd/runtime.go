@@ -30,6 +30,7 @@ type HostRuntime struct {
 	metrics       map[string]map[string]map[string]string
 	sources       map[string]SourceObservation
 	stagedProcess map[string]processIdentity
+	quiesced      map[string]bool
 }
 
 type processIdentity struct {
@@ -40,7 +41,7 @@ type processIdentity struct {
 const deploydDrainSession = "release-agent-vm-deployd"
 
 func NewHostRuntime(config Config) *HostRuntime {
-	return &HostRuntime{Config: config, metrics: map[string]map[string]map[string]string{}, sources: map[string]SourceObservation{}, stagedProcess: map[string]processIdentity{}}
+	return &HostRuntime{Config: config, metrics: map[string]map[string]map[string]string{}, sources: map[string]SourceObservation{}, stagedProcess: map[string]processIdentity{}, quiesced: map[string]bool{}}
 }
 
 func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error) {
@@ -84,6 +85,12 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		body, status, requestErr := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil)
 		if requestErr != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) {
 			if requestErr != nil && runtime.systemdSlotStopped(ctx, slot) {
+				runtime.mu.Lock()
+				wasQuiesced := runtime.quiesced[slot]
+				runtime.mu.Unlock()
+				if wasQuiesced {
+					observation.CountersKnown = true
+				}
 				if slot == active {
 					slotContractsUp = false
 					snapshot.Consistent = false
@@ -351,6 +358,9 @@ func (runtime *HostRuntime) Stage(ctx context.Context, slot, bundle string) erro
 	}
 	currentProcess, err := runtime.waitSlotIdentity(ctx, slot, previousProcess, previousProcessOK)
 	if err != nil {
+		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, err)
+	}
+	if err := runtime.ExitDrain(ctx, slot); err != nil {
 		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, err)
 	}
 	if err := runtime.discardStagedBackup(slot); err != nil {
@@ -979,6 +989,9 @@ func (runtime *HostRuntime) ExitDrain(ctx context.Context, slot string) error {
 	if status != http.StatusOK {
 		return fmt.Errorf("slot %s rejected drain exit with HTTP %d", slot, status)
 	}
+	runtime.mu.Lock()
+	runtime.quiesced[slot] = false
+	runtime.mu.Unlock()
 	return nil
 }
 
@@ -986,6 +999,9 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 	if slot == "" || slot == "none" {
 		return nil
 	}
+	runtime.mu.Lock()
+	runtime.quiesced[slot] = false
+	runtime.mu.Unlock()
 	status, statusCode, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-status"})
 	if err != nil {
 		return err
@@ -1024,6 +1040,9 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 			return errors.New("old slot quiescence counters are incomplete")
 		}
 		if pending == 0 && inFlight == 0 && unknown == 0 {
+			runtime.mu.Lock()
+			runtime.quiesced[slot] = true
+			runtime.mu.Unlock()
 			return nil
 		}
 		select {

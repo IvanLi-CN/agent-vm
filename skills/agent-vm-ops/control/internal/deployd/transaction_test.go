@@ -23,6 +23,7 @@ type fakeRuntime struct {
 	capabilities          []string
 	mutateContractOnGrant bool
 	invalidCapabilities   bool
+	unknownCounters       bool
 	failRevoke            bool
 	failGrant             bool
 	readyAfterGrant       bool
@@ -55,6 +56,7 @@ func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 				value.StateCapabilities = []string{"reads@1", "writes@1"}
 			}
 		}
+		value.CountersKnown = !runtime.unknownCounters
 		slots[slot] = value
 	}
 	now := time.Unix(100, 0).UTC()
@@ -270,6 +272,55 @@ func TestManagerFencesUncertainActiveSwitch(t *testing.T) {
 	}
 	if current.State != "needs_recovery" || !current.RecoveryRequired {
 		t.Fatalf("uncertain transaction was not fenced: %#v", current)
+	}
+}
+
+func TestManagerRejectsStageWhenTargetStillServesTraffic(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", traffic: map[string]bool{"blue": true, "green": true}, observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if _, err := manager.Stage(context.Background(), "green", "/tmp/release.tar"); err == nil {
+		t.Fatal("stage unexpectedly succeeded while the target accepted traffic")
+	}
+	if len(runtime.sequence) != 0 {
+		t.Fatalf("stage mutated a serving target: %v", runtime.sequence)
+	}
+}
+
+func TestManagerFencesWhenQuiescenceCountersAreUnknown(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	transaction, err := manager.Stage(context.Background(), "green", "/tmp/release.tar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Verify(context.Background(), transaction.ID); err != nil {
+		t.Fatal(err)
+	}
+	runtime.unknownCounters = true
+	if _, err := manager.Activate(context.Background(), transaction.ID); err == nil {
+		t.Fatal("activation unexpectedly succeeded with unknown quiescence counters")
+	}
+	current, err := database.Get(context.Background(), transaction.ID)
+	if err != nil || current == nil || current.State != "needs_recovery" || !current.RecoveryRequired {
+		t.Fatalf("unknown-counter transaction = %#v err=%v", current, err)
 	}
 }
 
@@ -645,7 +696,7 @@ func TestManagerRecoveryFinalizeReestablishesControllerAfterRestart(t *testing.T
 	}
 	defer database.Close()
 	runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
-		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true},
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
 		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
 	}}
 	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
