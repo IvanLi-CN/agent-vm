@@ -35,7 +35,7 @@ func validManifest(t *testing.T) (string, string) {
 			t.Fatal(err)
 		}
 		data := []byte("artifact:" + expected.path)
-		if expected.path == "bin/agent-vm-control" {
+		if isGoBinaryArtifact(expected.path) {
 			data = make([]byte, 20)
 			copy(data, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
 			machine := uint16(62)
@@ -77,12 +77,15 @@ func validProductManifest(t *testing.T) string {
 	return validProductManifestFormat(t, LegacyProductFormat, "go-request")
 }
 
-func validProductManifestFormat(t *testing.T, format int64, transport string) string {
+func validProductManifestFormat(t *testing.T, format int64, transport string, historical ...bool) string {
 	t.Helper()
 	root := t.TempDir()
 	expectedArtifacts := productLegacyArtifacts
 	if format == ProductFormat {
 		expectedArtifacts = productArtifacts
+		if len(historical) > 0 && historical[0] {
+			expectedArtifacts = historicalProductArtifacts
+		}
 	}
 	artifacts := make([]any, 0, len(expectedArtifacts))
 	for _, expected := range expectedArtifacts {
@@ -91,7 +94,7 @@ func validProductManifestFormat(t *testing.T, format int64, transport string) st
 			t.Fatal(err)
 		}
 		data := []byte("product-artifact:" + expected.path)
-		if expected.path == "bin/agent-vm-control" {
+		if isGoBinaryArtifact(expected.path) {
 			data = make([]byte, 20)
 			copy(data, []byte{0x7f, 'E', 'L', 'F', 2, 1, 1})
 			machine := uint16(62)
@@ -208,6 +211,16 @@ func TestLoadVerifiesProductManifest(t *testing.T) {
 	}
 	if metadata.Version != "1.0.0" || metadata.ReleaseID != strings.Repeat("b", 40) || metadata.SourceRevision != strings.Repeat("b", 40) {
 		t.Fatalf("product metadata identity = %#v", metadata)
+	}
+}
+
+func TestLoadVerifiesHistoricalProductManifest(t *testing.T) {
+	metadata, err := LoadMetadata(validProductManifestFormat(t, ProductFormat, "go-request", true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Version != "1.0.0" || metadata.ReleaseID != strings.Repeat("b", 40) || metadata.SourceRevision != strings.Repeat("b", 40) {
+		t.Fatalf("historical product metadata identity = %#v", metadata)
 	}
 }
 

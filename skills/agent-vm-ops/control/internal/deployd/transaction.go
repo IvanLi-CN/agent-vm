@@ -826,7 +826,8 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 	resuming := transaction.RollbackUsed && transaction.Phase == PhaseRollback
 	if !resuming {
 		if _, err := manager.Store.BeginRollback(ctx, transaction.ID, transaction.Phase, PhaseRollback, "rollback_started", "deployd", map[string]any{"bounded": true}, manager.Clock().UTC()); err != nil {
-			return err
+			fenceErr := manager.fenceSlots(ctx, errors.New("rollback state could not be persisted; controller roles were fenced"))
+			return fmt.Errorf("persist rollback state: %w; %v", err, fenceErr)
 		}
 	}
 	if err := manager.Runtime.Rollback(ctx, transaction.TargetSlot, transaction.PreviousSlot, lease); err != nil {

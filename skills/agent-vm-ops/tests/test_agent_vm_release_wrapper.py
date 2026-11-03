@@ -297,7 +297,7 @@ class WrapperTests(unittest.TestCase):
             WRAPPER.subprocess, "run",
             return_value=subprocess.CompletedProcess([], 0, b"", b""),
         ) as run:
-            WRAPPER._activate_product_runtime({"format": MANIFEST.LEGACY_PRODUCT_MANIFEST_FORMAT})
+            WRAPPER._activate_product_runtime(self.loaded, {"format": MANIFEST.LEGACY_PRODUCT_MANIFEST_FORMAT})
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn(["systemctl", "stop", "agent-vm-web.service"], commands)
         self.assertIn(["systemctl", "disable", "agent-vm-web.service"], commands)
@@ -318,27 +318,38 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "activation_unverified")
 
     def test_product_runtime_retire_web_unit_and_keep_resident_control(self):
+        runtime_root = WRAPPER._go_runtime_root(self.loaded)
+        (runtime_root / "slots" / "blue").mkdir(parents=True)
+        (runtime_root / "slots" / "green").mkdir(parents=True)
+        (runtime_root / "active").symlink_to(runtime_root / "slots" / "blue")
         with mock.patch.object(
             WRAPPER.subprocess, "run",
             return_value=subprocess.CompletedProcess([], 0, b"", b""),
         ) as run:
-            WRAPPER._activate_product_runtime({"format": MANIFEST.PRODUCT_MANIFEST_FORMAT})
+            WRAPPER._activate_product_runtime(self.loaded, {"format": MANIFEST.PRODUCT_MANIFEST_FORMAT})
         commands = [call.args[0] for call in run.call_args_list]
-        native_restart = commands.index(["systemctl", "restart", "agent-vm-native.service"])
         self.assertIn(["systemctl", "stop", "agent-vm-web.service"], commands)
         self.assertNotIn(["systemctl", "start", "agent-vm-web.service"], commands)
-        self.assertGreater(native_restart, commands.index(["systemctl", "disable", "agent-vm-web.service"]))
+        self.assertIn(["systemctl", "stop", "agent-vm-native.service"], commands)
+        self.assertIn(["systemctl", "disable", "agent-vm-native.service"], commands)
+        self.assertIn(["systemctl", "restart", "agent-vm-native@blue.service"], commands)
+        self.assertIn(["systemctl", "restart", "agent-vm-native@green.service"], commands)
+        self.assertIn(["systemctl", "restart", "agent-vm-deployd.service"], commands)
 
-    def test_product_runtime_does_not_start_deployd_alongside_legacy_web(self):
+    def test_product_runtime_starts_deployd_for_format4(self):
+        runtime_root = WRAPPER._go_runtime_root(self.loaded)
+        (runtime_root / "slots" / "blue").mkdir(parents=True)
+        (runtime_root / "slots" / "green").mkdir(parents=True)
+        (runtime_root / "active").symlink_to(runtime_root / "slots" / "blue")
         with mock.patch.object(
             WRAPPER.subprocess,
             "run",
             return_value=subprocess.CompletedProcess([], 0, b"", b""),
         ) as run:
-            WRAPPER._activate_product_runtime({"format": MANIFEST.PRODUCT_MANIFEST_FORMAT})
+            WRAPPER._activate_product_runtime(self.loaded, {"format": MANIFEST.PRODUCT_MANIFEST_FORMAT})
         commands = [call.args[0] for call in run.call_args_list]
-        self.assertNotIn(["systemctl", "enable", "agent-vm-deployd.service"], commands)
-        self.assertIn(["systemctl", "restart", "agent-vm-native.service"], commands)
+        self.assertIn(["systemctl", "enable", "agent-vm-deployd.service"], commands)
+        self.assertNotIn(["systemctl", "restart", "agent-vm-native.service"], commands)
 
     def test_product_bundle_targets_use_the_control_bundle_root(self):
         targets = WRAPPER._activation_targets(self.loaded)

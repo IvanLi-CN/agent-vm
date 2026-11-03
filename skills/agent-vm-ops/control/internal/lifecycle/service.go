@@ -105,12 +105,23 @@ type Service struct {
 
 type internalCleanupContextKey struct{}
 
+type leaseExemptMutationContextKey struct{}
+
 func withInternalCleanup(ctx context.Context) context.Context {
 	return context.WithValue(ctx, internalCleanupContextKey{}, true)
 }
 
 func isInternalCleanup(ctx context.Context) bool {
 	value, _ := ctx.Value(internalCleanupContextKey{}).(bool)
+	return value
+}
+
+func withLeaseExemptMutation(ctx context.Context) context.Context {
+	return context.WithValue(ctx, leaseExemptMutationContextKey{}, true)
+}
+
+func leaseExemptMutation(ctx context.Context) bool {
+	value, _ := ctx.Value(leaseExemptMutationContextKey{}).(bool)
 	return value
 }
 
@@ -239,6 +250,67 @@ func (s *Service) commitMutation(commit func() error) error {
 		return commit()
 	}
 	return commitGate(commit)
+}
+
+func (s *Service) commitMutationContext(ctx context.Context, commit func() error) error {
+	if leaseExemptMutation(ctx) {
+		return commit()
+	}
+	return s.commitMutation(commit)
+}
+
+func (s *Service) updateTask(ctx context.Context, taskID string, updates map[string]any) error {
+	return s.commitMutationContext(ctx, func() error {
+		return s.Store.UpdateTask(ctx, taskID, updates)
+	})
+}
+
+func (s *Service) updateTaskIf(ctx context.Context, taskID string, condition state.TaskCondition, updates map[string]any) (bool, error) {
+	var updated bool
+	err := s.commitMutationContext(ctx, func() error {
+		var err error
+		updated, err = s.Store.UpdateTaskIf(ctx, taskID, condition, updates)
+		return err
+	})
+	return updated, err
+}
+
+func (s *Service) deleteTaskIf(ctx context.Context, taskID string, condition state.TaskCondition) (bool, error) {
+	var deleted bool
+	err := s.commitMutationContext(ctx, func() error {
+		var err error
+		deleted, err = s.Store.DeleteTaskIf(ctx, taskID, condition)
+		return err
+	})
+	return deleted, err
+}
+
+func (s *Service) deletePort(ctx context.Context, taskID, name, protocolName string) error {
+	return s.commitMutationContext(ctx, func() error {
+		return s.Store.DeletePort(ctx, taskID, name, protocolName)
+	})
+}
+
+func (s *Service) upsertPort(ctx context.Context, port state.Port) error {
+	return s.commitMutationContext(ctx, func() error {
+		return s.Store.UpsertPort(ctx, port)
+	})
+}
+
+func (s *Service) upsertPortIf(ctx context.Context, port state.Port, condition state.TaskCondition) (bool, error) {
+	var updated bool
+	err := s.commitMutationContext(ctx, func() error {
+		var err error
+		updated, err = s.Store.UpsertPortIf(ctx, port, condition)
+		return err
+	})
+	return updated, err
+}
+
+func (s *Service) setMeta(ctx context.Context, key, value string) error {
+	return s.commitMutationContext(ctx, func() error {
+		return s.Store.SetMeta(ctx, key, value)
+	})
 }
 
 func (s *Service) mutationContext(ctx context.Context) (context.Context, func(), func() bool) {
@@ -692,7 +764,7 @@ func (s *Service) WorkerStartAllowed(ctx context.Context, operationID string) er
 	}
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
-	return s.commitMutation(func() error {
+	return s.commitMutationContext(ctx, func() error {
 		return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
 			worker, _ := response["worker"].(map[string]any)
 			if workerNeedsReconciliation(worker, true) {
@@ -729,7 +801,7 @@ func (s *Service) updateWorker(ctx context.Context, operationID string, worker m
 	// The bounded background context only covers this small durable update.
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
-	return s.commitMutation(func() error {
+	return s.commitMutationContext(ctx, func() error {
 		return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
 			if callback != workerCallbackState {
 				if previous, ok := response["worker"].(map[string]any); ok && stringValue(previous["state"]) == "running" {
@@ -930,7 +1002,7 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 			if !eligible {
 				continue
 			}
-			if err := s.commitMutation(func() error {
+			if err := s.commitMutationContext(ctx, func() error {
 				return s.Store.UpdateOperationResponse(ctx, operation.OperationID, func(response map[string]any) error {
 					if stringValue(response["outcome"]) != "pending" || boolValue(response["_recovery_after_clear_attempted"]) {
 						return errUnresolvedWorker
@@ -959,7 +1031,7 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 				continue
 			}
 		}
-		if err := s.commitMutation(func() error {
+		if err := s.commitMutationContext(ctx, func() error {
 			return s.Store.MarkOperationRecoveryAttempt(ctx, operation.OperationID)
 		}); err != nil {
 			if firstErr == nil {
@@ -1202,6 +1274,9 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if write && !leaseExempt && !s.mutationAllowed() {
 		return nil, protocol.NewError("controller_lease_required", "controller lease is required for mutation", map[string]any{"admission_ready": false})
 	}
+	if leaseExempt {
+		ctx = withLeaseExemptMutation(ctx)
+	}
 	if releaseSensitiveAction(action, request) && !isInternalCleanup(ctx) {
 		releaseDrain, drainErr := s.releaseDrainOwned(ctx)
 		if drainErr != nil {
@@ -1231,7 +1306,12 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		generation := intValue(request["generation"])
 		session := optionalString(request["session_id"])
 		finishActive := s.markOperationActive(operationID)
-		existing, err := s.Store.ClaimOperation(ctx, operationID, action, session, generationPointer(generation, request["generation"] != nil), pending)
+		var existing *state.Operation
+		err = s.commitMutationContext(ctx, func() error {
+			var commitErr error
+			existing, commitErr = s.Store.ClaimOperation(ctx, operationID, action, session, generationPointer(generation, request["generation"] != nil), pending)
+			return commitErr
+		})
 		if err != nil {
 			finishActive()
 			return nil, s.sqliteError(err)
@@ -1281,7 +1361,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		operationID := stringValue(request["operation_id"])
 		digest, _ := protocol.Digest(request)
 		response["_request_digest"] = digest
-		recordErr := s.commitMutation(func() error {
+		recordErr := s.commitMutationContext(ctx, func() error {
 			if !leaseExempt && mutationLost() {
 				return controllerLeaseLostError(nil)
 			}
@@ -2009,7 +2089,7 @@ func (s *Service) recordError(ctx context.Context, request protocol.Request, cau
 }
 
 func (s *Service) recordOperation(ctx context.Context, operationID, action string, sessionID *string, generation *int64, response map[string]any) error {
-	return s.commitMutation(func() error {
+	return s.commitMutationContext(ctx, func() error {
 		return s.Store.RecordOperation(ctx, operationID, action, sessionID, generation, response)
 	})
 }
@@ -2029,7 +2109,9 @@ func (s *Service) recordAudit(ctx context.Context, request protocol.Request, out
 			detail["warnings"] = warnings
 		}
 	}
-	return s.Store.Audit(ctx, stringValue(request["action"]), stringValue(request["task_id"]), stringValue(request["session_id"]), outcome, generationPointer(intValue(request["generation"]), request["generation"] != nil), detail)
+	return s.commitMutationContext(ctx, func() error {
+		return s.Store.Audit(ctx, stringValue(request["action"]), stringValue(request["task_id"]), stringValue(request["session_id"]), outcome, generationPointer(intValue(request["generation"]), request["generation"] != nil), detail)
+	})
 }
 
 func (s *Service) dispatchAction(ctx context.Context, action string, request protocol.Request) (any, error) {
@@ -2197,19 +2279,25 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	}
 	task.ReservationBytes = reservationBytes
 	if created {
-		nextGeneration, generationErr := s.Store.NextGeneration(ctx, session)
-		if generationErr != nil {
-			return nil, s.sqliteError(generationErr)
-		}
-		task.Generation = nextGeneration
-		if err := s.Store.InsertTask(ctx, *task); err != nil {
+		var nextGeneration int64
+		if err := s.commitMutationContext(ctx, func() error {
+			var generationErr error
+			nextGeneration, generationErr = s.Store.NextGeneration(ctx, session)
+			if generationErr != nil {
+				return generationErr
+			}
+			task.Generation = nextGeneration
+			return s.Store.InsertTask(ctx, *task)
+		}); err != nil {
 			return nil, s.sqliteError(err)
 		}
-	} else if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"generation": task.Generation, "state": task.State, "resources_json": task.ResourcesJSON, "resource_reservation_json": task.ResourceReservationJSON, "reservation_bytes": reservationBytes, "lease_expires_at": task.LeaseExpiresAt, "updated_at": nowString(now), "last_error": task.LastError, "image_fingerprint": task.ImageFingerprint, "previous_generation": task.PreviousGeneration}); err != nil {
+	} else if err := s.commitMutationContext(ctx, func() error {
+		return s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"generation": task.Generation, "state": task.State, "resources_json": task.ResourcesJSON, "resource_reservation_json": task.ResourceReservationJSON, "reservation_bytes": reservationBytes, "lease_expires_at": task.LeaseExpiresAt, "updated_at": nowString(now), "last_error": task.LastError, "image_fingerprint": task.ImageFingerprint, "previous_generation": task.PreviousGeneration})
+	}); err != nil {
 		return nil, s.sqliteError(err)
 	}
 	if operationID := native.WorkerOperationID(ctx); operationID != "" {
-		if err := s.commitMutation(func() error {
+		if err := s.commitMutationContext(ctx, func() error {
 			return s.Store.UpdateOperationResponse(ctx, operationID, func(response map[string]any) error {
 				response["_task_id"] = task.TaskID
 				response["_task_generation"] = task.Generation
@@ -2228,7 +2316,9 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 				return s.failTask(ctx, task, "native-network", allocationErr)
 			}
 			task.VMIP = &ip
-			if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"vm_ip": ip, "updated_at": nowString(s.Clock())}); err != nil {
+			if err := s.commitMutationContext(ctx, func() error {
+				return s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"vm_ip": ip, "updated_at": nowString(s.Clock())})
+			}); err != nil {
 				return nil, s.sqliteError(err)
 			}
 		}
@@ -2276,7 +2366,9 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if ip != *task.VMIP {
 			return s.failTask(ctx, task, "guest-readiness", protocol.NewError("guest_ip_mismatch", "guest IPv4 address does not match the allocated fixed address", map[string]any{"expected": *task.VMIP, "actual": ip}))
 		}
-		if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"vm_ip": ip, "updated_at": nowString(s.Clock())}); err != nil {
+		if err := s.commitMutationContext(ctx, func() error {
+			return s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"vm_ip": ip, "updated_at": nowString(s.Clock())})
+		}); err != nil {
 			return nil, s.sqliteError(err)
 		}
 		if err := s.exposeSSH(ctx, task, request, nativeCtx); err != nil {
@@ -2287,7 +2379,12 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		return s.failTask(ctx, task, "lease-expiry", errors.New("lease expired during preparation"))
 	}
 	commitNow := s.Clock()
-	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{statePreparing}, LeaseActiveAfter: &commitNow}, map[string]any{"state": stateActive, "lease_expires_at": nowString(deadline), "inactive_since": nil, "cleanup_after": nil, "updated_at": nowString(commitNow), "last_error": nil, "resource_reservation_json": "{}", "reservation_bytes": int64(0)})
+	var updated bool
+	err = s.commitMutationContext(ctx, func() error {
+		var commitErr error
+		updated, commitErr = s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{statePreparing}, LeaseActiveAfter: &commitNow}, map[string]any{"state": stateActive, "lease_expires_at": nowString(deadline), "inactive_since": nil, "cleanup_after": nil, "updated_at": nowString(commitNow), "last_error": nil, "resource_reservation_json": "{}", "reservation_bytes": int64(0)})
+		return commitErr
+	})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
@@ -2314,7 +2411,7 @@ func (s *Service) renew(ctx context.Context, request protocol.Request) (map[stri
 		deadline = max
 	}
 	now := s.Clock()
-	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &now}, map[string]any{"lease_expires_at": nowString(deadline), "updated_at": nowString(now)})
+	updated, err := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &now}, map[string]any{"lease_expires_at": nowString(deadline), "updated_at": nowString(now)})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
@@ -2365,7 +2462,7 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		if destroy {
 			targetState = stateDeleting
 		}
-		updated, updateErr := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{task.State}}, map[string]any{"state": targetState, "lease_expires_at": nil, "updated_at": nowString(s.Clock())})
+		updated, updateErr := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{task.State}}, map[string]any{"state": targetState, "lease_expires_at": nil, "updated_at": nowString(s.Clock())})
 		if updateErr != nil {
 			return nil, s.sqliteError(updateErr)
 		}
@@ -2405,7 +2502,7 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 				if err := s.cancelPendingAcquireOperations(ctx, task); err != nil {
 					return nil, err
 				}
-				updated, updateErr := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateClosing}}, map[string]any{"state": stateDeleting, "updated_at": nowString(s.Clock())})
+				updated, updateErr := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateClosing}}, map[string]any{"state": stateDeleting, "updated_at": nowString(s.Clock())})
 				if updateErr != nil {
 					return nil, s.sqliteError(updateErr)
 				}
@@ -2432,7 +2529,7 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 				break
 			}
 		}
-		if removeErr := s.Store.DeletePort(ctx, task.TaskID, port.PortName, port.Protocol); removeErr != nil {
+		if removeErr := s.deletePort(ctx, task.TaskID, port.PortName, port.Protocol); removeErr != nil {
 			cleanupErrors = append(cleanupErrors, port.DeviceName+": "+removeErr.Error())
 			break
 		}
@@ -2497,7 +2594,7 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		updates["inactive_since"] = inactive
 		updates["cleanup_after"] = nowString(s.Clock().Add(time.Duration(s.Config.CacheSeconds) * time.Second))
 	}
-	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{task.State}}, updates)
+	updated, err := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{task.State}}, updates)
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
@@ -2505,7 +2602,7 @@ func (s *Service) releaseUnlocked(ctx context.Context, request protocol.Request,
 		return nil, protocol.NewError("cleanup_incomplete", "session changed before cleanup could be committed", map[string]any{"outcome_verified": false})
 	}
 	if destroy {
-		deleted, err := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateAbsent}})
+		deleted, err := s.deleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateAbsent}})
 		if err != nil {
 			return nil, s.sqliteError(err)
 		}
@@ -2600,7 +2697,7 @@ func (s *Service) cancelPendingAcquireOperations(ctx context.Context, task *stat
 			}
 		}
 	}
-	if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"last_error": mustJSON(marker), "updated_at": nowString(s.Clock())}); err != nil {
+	if err := s.updateTask(ctx, task.TaskID, map[string]any{"last_error": mustJSON(marker), "updated_at": nowString(s.Clock())}); err != nil {
 		return s.sqliteError(err)
 	}
 	return nil
@@ -2714,7 +2811,7 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 	}
 	reservationJSON := mustJSON(reservationTarget)
 	reservationNow := s.Clock()
-	reserved, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &reservationNow}, map[string]any{"resource_reservation_json": reservationJSON, "reservation_bytes": reservationBytes, "updated_at": nowString(reservationNow)})
+	reserved, err := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &reservationNow}, map[string]any{"resource_reservation_json": reservationJSON, "reservation_bytes": reservationBytes, "updated_at": nowString(reservationNow)})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
@@ -2775,7 +2872,7 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 	if request["disk_gib"] == nil {
 		commitReservationBytes = task.ReservationBytes
 	}
-	updated, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow}, map[string]any{"resources_json": mustJSON(target), "resource_reservation_json": commitReservationJSON, "reservation_bytes": commitReservationBytes, "updated_at": nowString(commitNow)})
+	updated, err := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow}, map[string]any{"resources_json": mustJSON(target), "resource_reservation_json": commitReservationJSON, "reservation_bytes": commitReservationBytes, "updated_at": nowString(commitNow)})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
@@ -2836,7 +2933,7 @@ func (s *Service) portAdd(ctx context.Context, request protocol.Request) (map[st
 		return nil, protocol.NewError("invalid_request", "host_port must be between 1024 and 65535", nil)
 	}
 	value := state.Port{TaskID: task.TaskID, Generation: task.Generation, PortName: name, Protocol: protocolName, HostPort: hostPort, VMPort: vmPort, DeviceName: "proxy-" + name + "-" + protocolName, State: "preparing", CreatedAt: nowString(s.Clock())}
-	if err := s.Store.UpsertPort(ctx, value); err != nil {
+	if err := s.upsertPort(ctx, value); err != nil {
 		return nil, s.sqliteError(err)
 	}
 	if s.Guest != nil {
@@ -2859,7 +2956,7 @@ func (s *Service) portAdd(ctx context.Context, request protocol.Request) (map[st
 		}
 	}
 	commitNow := s.Clock()
-	active, err := s.Store.UpsertPortIf(ctx, state.Port{TaskID: value.TaskID, Generation: value.Generation, PortName: value.PortName, Protocol: value.Protocol, HostPort: value.HostPort, VMPort: value.VMPort, DeviceName: value.DeviceName, State: "active", CreatedAt: value.CreatedAt}, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow})
+	active, err := s.upsertPortIf(ctx, state.Port{TaskID: value.TaskID, Generation: value.Generation, PortName: value.PortName, Protocol: value.Protocol, HostPort: value.HostPort, VMPort: value.VMPort, DeviceName: value.DeviceName, State: "active", CreatedAt: value.CreatedAt}, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &commitNow})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
@@ -2872,7 +2969,7 @@ func (s *Service) portAdd(ctx context.Context, request protocol.Request) (map[st
 				return nil, protocol.NewError("cleanup_incomplete", "native proxy cleanup after lease fence failed", nativePhaseDetail("port-add-cleanup", cleanupErr))
 			}
 		}
-		if deleteErr := s.Store.DeletePort(ctx, value.TaskID, value.PortName, value.Protocol); deleteErr != nil {
+		if deleteErr := s.deletePort(ctx, value.TaskID, value.PortName, value.Protocol); deleteErr != nil {
 			return nil, s.sqliteError(deleteErr)
 		}
 		return nil, protocol.NewError("lease_expired", "lease or generation changed after native proxy creation", map[string]any{"phase": "durable-fence", "outcome_verified": true})
@@ -2925,7 +3022,7 @@ func (s *Service) portRemove(ctx context.Context, request protocol.Request) (map
 			}
 		}
 	}
-	if err := s.Store.DeletePort(ctx, task.TaskID, name, protocolName); err != nil {
+	if err := s.deletePort(ctx, task.TaskID, name, protocolName); err != nil {
 		return nil, s.sqliteError(err)
 	}
 	return map[string]any{"task_id": task.TaskID, "name": name, "protocol": protocolName, "removed": true}, nil
@@ -2968,20 +3065,20 @@ func (s *Service) drain(ctx context.Context, value bool, request protocol.Reques
 				if !strings.HasPrefix(incoming, "release-") {
 					return map[string]any{"draining": true}, nil
 				}
-				if err := s.Store.SetMeta(ctx, "drain_owner", incoming); err != nil {
+				if err := s.setMeta(ctx, "drain_owner", incoming); err != nil {
 					return nil, s.sqliteError(err)
 				}
 			case strings.HasPrefix(incoming, "release-") && strings.HasPrefix(owner, "operation:"):
 				// A release may explicitly take over a browser-entered drain;
 				// a browser or a different release may never replace an active
 				// release owner.
-				if err := s.Store.SetMeta(ctx, "drain_owner", incoming); err != nil {
+				if err := s.setMeta(ctx, "drain_owner", incoming); err != nil {
 					return nil, s.sqliteError(err)
 				}
 			default:
 				return nil, protocol.NewError("operation_conflict", "admission drain is owned by another transaction", nil)
 			}
-		} else if err := s.Store.SetMeta(ctx, "drain_owner", incoming); err != nil {
+		} else if err := s.setMeta(ctx, "drain_owner", incoming); err != nil {
 			return nil, s.sqliteError(err)
 		}
 	} else {
@@ -2996,13 +3093,13 @@ func (s *Service) drain(ctx context.Context, value bool, request protocol.Reques
 			return nil, protocol.NewError("permission_denied", "only the active release transaction may exit admission drain", nil)
 		}
 	}
-	if err := s.Store.SetMeta(ctx, "draining", boolString(value)); err != nil {
+	if err := s.setMeta(ctx, "draining", boolString(value)); err != nil {
 		return nil, s.sqliteError(err)
 	}
 	if !value {
-		_ = s.Store.SetMeta(ctx, "drain_owner", "")
+		_ = s.setMeta(ctx, "drain_owner", "")
 	}
-	if err := s.Store.SetMeta(ctx, "drain_sealed", "0"); err != nil {
+	if err := s.setMeta(ctx, "drain_sealed", "0"); err != nil {
 		return nil, s.sqliteError(err)
 	}
 	s.SetTrafficAccepting(!value)
@@ -3251,8 +3348,8 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				return nil, s.sqliteError(drainErr)
 			}
 			if initialConsistent && len(pendingOperations) == 0 && states[stateClosing] == 0 && states[stateDeleting] == 0 && states[stateFailed] == 0 {
-				if releaseDrain {
-					if err := s.Store.SetMeta(ctx, "drain_sealed", "1"); err != nil {
+				if releaseDrain && s.mutationAllowed() {
+					if err := s.setMeta(ctx, "drain_sealed", "1"); err != nil {
 						return nil, s.sqliteError(err)
 					}
 				}
@@ -3846,7 +3943,7 @@ func (s *Service) deleteDestroyedTask(ctx context.Context, request protocol.Requ
 	if expectedGeneration != nil {
 		conditionGeneration = *expectedGeneration
 	}
-	deleted, err := s.Store.DeleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &conditionGeneration, States: []string{stateAbsent}})
+	deleted, err := s.deleteTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &conditionGeneration, States: []string{stateAbsent}})
 	if err != nil {
 		return s.sqliteError(err)
 	}
@@ -3899,7 +3996,7 @@ func (s *Service) gc(ctx context.Context, apply bool) (map[string]any, error) {
 		candidates = append(candidates, map[string]any{"task_id": task.TaskID, "instance_name": task.InstanceName, "generation": task.Generation, "inactive_since": task.InactiveSince})
 		if apply {
 			gcNow := s.Clock()
-			updated, updateErr := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateCached}, LeaseExpiredAt: &gcNow}, map[string]any{"state": stateDeleting, "updated_at": nowString(gcNow)})
+			updated, updateErr := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateCached}, LeaseExpiredAt: &gcNow}, map[string]any{"state": stateDeleting, "updated_at": nowString(gcNow)})
 			if updateErr != nil {
 				if firstErr == nil {
 					firstErr = s.sqliteError(updateErr)
@@ -3933,7 +4030,7 @@ func (s *Service) expire(ctx context.Context, request protocol.Request) (map[str
 		return map[string]any{"expired": false, "stale": true}, nil
 	}
 	now := s.Clock()
-	marked, err := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &generation, States: []string{stateActive, statePreparing}, LeaseExpiredAt: &now}, map[string]any{"state": stateClosing, "lease_expires_at": nil, "updated_at": nowString(now)})
+	marked, err := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &generation, States: []string{stateActive, statePreparing}, LeaseExpiredAt: &now}, map[string]any{"state": stateClosing, "lease_expires_at": nil, "updated_at": nowString(now)})
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
@@ -4381,7 +4478,7 @@ func (s *Service) exposeSSH(ctx context.Context, task *state.Task, request proto
 		return errors.New("ssh_host_port must be between 1024 and 65535")
 	}
 	port := state.Port{TaskID: task.TaskID, Generation: task.Generation, PortName: "ssh", Protocol: "tcp", HostPort: hostPort, VMPort: 22, DeviceName: "proxy-ssh-tcp", State: "preparing", CreatedAt: nowString(s.Clock())}
-	if err := s.Store.UpsertPort(ctx, port); err != nil {
+	if err := s.upsertPort(ctx, port); err != nil {
 		return err
 	}
 	host := s.Config.HostAddress
@@ -4410,11 +4507,16 @@ func (s *Service) exposeSSH(ctx context.Context, task *state.Task, request proto
 	} else if device, ok := devices[port.DeviceName].(map[string]any); !ok || !s.proxyMatches(task, port, device) {
 		return protocol.NewError("mapping_unverified", "native SSH mapping was not confirmed", nil)
 	}
-	if err := s.Store.UpsertPort(ctx, state.Port{TaskID: port.TaskID, Generation: port.Generation, PortName: port.PortName, Protocol: port.Protocol, HostPort: port.HostPort, VMPort: port.VMPort, DeviceName: port.DeviceName, State: "active", CreatedAt: port.CreatedAt}); err != nil {
+	if err := s.commitMutationContext(ctx, func() error {
+		if err := s.Store.UpsertPort(ctx, state.Port{TaskID: port.TaskID, Generation: port.Generation, PortName: port.PortName, Protocol: port.Protocol, HostPort: port.HostPort, VMPort: port.VMPort, DeviceName: port.DeviceName, State: "active", CreatedAt: port.CreatedAt}); err != nil {
+			return err
+		}
+		return s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"ssh_host_port": hostPort, "updated_at": nowString(s.Clock())})
+	}); err != nil {
 		return err
 	}
 	task.SSHHostPort = &hostPort
-	return s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"ssh_host_port": hostPort, "updated_at": nowString(s.Clock())})
+	return nil
 }
 
 func guestIPv4(value map[string]any) string {
@@ -4820,7 +4922,12 @@ func (s *Service) claimReclaimCleanup(ctx context.Context, task *state.Task) (pr
 	}
 	session := task.SessionID
 	generation := task.Generation
-	existing, err := s.Store.ClaimOperation(ctx, operationID, "destroy", &session, &generation, pending)
+	var existing *state.Operation
+	err = s.commitMutationContext(ctx, func() error {
+		var commitErr error
+		existing, commitErr = s.Store.ClaimOperation(ctx, operationID, "destroy", &session, &generation, pending)
+		return commitErr
+	})
 	if err != nil {
 		return nil, "", s.sqliteError(err)
 	}
@@ -5107,7 +5214,7 @@ func (s *Service) failTask(ctx context.Context, task *state.Task, phase string, 
 		detail["applied_resources"] = applied
 		task.ResourcesJSON = resourcesJSON
 	}
-	if stateErr := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "resources_json": resourcesJSON, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
+	if stateErr := s.updateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "resources_json": resourcesJSON, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
 		detail["state_persisted"] = false
 		detail["state_error"] = stateErr.Error()
 		return nil, protocol.NewError("state_unverified", "native failure could not be durably recorded", detail)
@@ -5127,7 +5234,7 @@ func (s *Service) failTaskForOperation(ctx context.Context, task *state.Task, ph
 	if operationID != "" {
 		detail["operation_id"] = operationID
 	}
-	if stateErr := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "resources_json": resourcesJSON, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
+	if stateErr := s.updateTask(ctx, task.TaskID, map[string]any{"state": stateFailed, "lease_expires_at": nil, "resources_json": resourcesJSON, "last_error": mustJSON(detail), "updated_at": nowString(s.Clock())}); stateErr != nil {
 		detail["state_persisted"] = false
 		detail["state_error"] = stateErr.Error()
 		return nil, protocol.NewError("state_unverified", "native failure could not be durably recorded", detail)
@@ -5158,7 +5265,7 @@ func (s *Service) persistPreparationProgress(ctx context.Context, task *state.Ta
 		}
 	}
 	task.LastError = stringPointer(marker)
-	if err := s.Store.UpdateTask(ctx, task.TaskID, map[string]any{"last_error": marker, "updated_at": nowString(s.Clock())}); err != nil {
+	if err := s.updateTask(ctx, task.TaskID, map[string]any{"last_error": marker, "updated_at": nowString(s.Clock())}); err != nil {
 		return s.sqliteError(err)
 	}
 	return nil

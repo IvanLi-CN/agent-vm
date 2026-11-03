@@ -142,6 +142,7 @@ class ProductManifestTests(unittest.TestCase):
                     "sha256": hashlib.sha256(payload.read_bytes()).hexdigest(),
                     "mode": mode,
                 })
+            self.assertEqual(validate_product_manifest(historical), historical)
             historical_web = next(item for item in historical["artifacts"] if item["path"] == "config/agent-vm-web.json.example")
             historical_web["mode"] = 0o644
             (root / historical_web["path"]).chmod(0o644)

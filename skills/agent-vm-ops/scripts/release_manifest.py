@@ -699,7 +699,7 @@ def validate_product_manifest(
     expected_artifacts = PRODUCT_CLIENT_ARTIFACTS if target["os"] == "source" else (PRODUCT_LINUX_LEGACY_ARTIFACTS if format_value == LEGACY_PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_ARTIFACTS)
     historical_artifacts = (
         HISTORICAL_PRODUCT_LINUX_ARTIFACTS
-        if allow_historical_web_config_mode and format_value == PRODUCT_MANIFEST_FORMAT and target["os"] == "linux"
+        if format_value == PRODUCT_MANIFEST_FORMAT and target["os"] == "linux"
         else None
     )
     allowed_lengths = {len(expected_artifacts)}
@@ -719,16 +719,13 @@ def validate_product_manifest(
         artifacts.append(item)
     actual_shape = {(item["name"], item["path"], item["role"], item["mode"]) for item in artifacts}
     accepted_shapes = {frozenset(expected_artifacts)}
-    if (
-        allow_historical_web_config_mode
-        and format_value == PRODUCT_MANIFEST_FORMAT
-        and target["os"] == "linux"
-    ):
+    if historical_artifacts is not None:
         accepted_shapes.add(frozenset(HISTORICAL_PRODUCT_LINUX_ARTIFACTS))
-        accepted_shapes.add(frozenset({
-            *HISTORICAL_PRODUCT_LINUX_ARTIFACTS,
-            ("web-config-example", "config/agent-vm-web.json.example", "support", 0o644),
-        } - {("web-config-example", "config/agent-vm-web.json.example", "support", 0o640)}))
+        if allow_historical_web_config_mode:
+            accepted_shapes.add(frozenset({
+                *HISTORICAL_PRODUCT_LINUX_ARTIFACTS,
+                ("web-config-example", "config/agent-vm-web.json.example", "support", 0o644),
+            } - {("web-config-example", "config/agent-vm-web.json.example", "support", 0o640)}))
     if frozenset(actual_shape) not in accepted_shapes:
         raise _error("manifest_artifact_set_invalid", "product artifact set differs from the fixed target allowlist", {"expected": sorted(expected_artifacts), "actual": sorted(actual_shape)})
 

@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { build_product_manifest, PRODUCT_LINUX_ARTIFACTS, validate_product_manifest, verify_product_bundle, type Artifact } from "../scripts/product-manifest.ts";
+import { build_product_manifest, HISTORICAL_PRODUCT_LINUX_ARTIFACTS, PRODUCT_LINUX_ARTIFACTS, validate_product_manifest, verify_product_bundle, type Artifact } from "../scripts/product-manifest.ts";
 import { default_operations } from "../scripts/release-manifest.ts";
 
 test("format-3 client manifest fixes product identity, source and action windows", () => {
@@ -77,13 +77,27 @@ test("format-4 management manifest requires the Linux product target", () => {
       "legacy-agent-vm-core@1", "managed-image-catalog@1", "management-operation-audit@1", "principal-identity@1", "session-image-binding@1", "token-revocation@1",
     ]);
     expect(verify_product_bundle(root, manifest)).toEqual(manifest);
+    const historical = structuredClone(manifest);
+    for (const [name, relative, role, mode] of HISTORICAL_PRODUCT_LINUX_ARTIFACTS.filter(
+      ([, path]) => !PRODUCT_LINUX_ARTIFACTS.some(([, currentPath]) => currentPath === path),
+    )) {
+      const path = join(root, relative);
+      const content = new TextEncoder().encode(`// historical ${relative}\n`);
+      const parent = path.slice(0, path.lastIndexOf("/"));
+      if (parent !== root) mkdirSync(parent, { recursive: true, mode: 0o755 });
+      writeFileSync(path, content, { mode });
+      chmodSync(path, mode);
+      historical.artifacts.push({ name, path: relative, role, mode, sha256: new Bun.CryptoHasher("sha256").update(content).digest("hex") });
+    }
+    expect(validate_product_manifest(historical)).toEqual(historical);
+    expect(verify_product_bundle(root, historical)).toEqual(historical);
     const httpsManifest = structuredClone(manifest);
     httpsManifest.client_view.transport = "https";
     expect(validate_product_manifest(httpsManifest)).toEqual(httpsManifest);
     expect(() => verify_product_bundle(root, httpsManifest)).toThrow("validation-only");
-    const historical = structuredClone(manifest);
-    historical.client_view.transport = "legacy-bun";
-    expect(validate_product_manifest(historical)).toEqual(historical);
+    const legacyTransport = structuredClone(manifest);
+    legacyTransport.client_view.transport = "legacy-bun";
+    expect(validate_product_manifest(legacyTransport)).toEqual(legacyTransport);
     expect(() => build_product_manifest("1.0.0", "b".repeat(40), artifacts, {
       format: 4,
       target: { os: "linux", arch: "amd64" },

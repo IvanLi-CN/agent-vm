@@ -1333,12 +1333,17 @@ def _activate_go_runtime(
 
 
 def _activate_product_runtime(
+    config: Mapping[str, Any],
     manifest: Mapping[str, Any],
 ) -> None:
     # The unified management API is served by the resident Go control process.
     # The standalone Web unit is retired and must never be restored by a
     # product activation or rollback.
-    _activate_go_runtime(web_enabled=False, deployd_enabled=False)
+    _activate_go_runtime(
+        config,
+        web_enabled=False,
+        deployd_enabled=manifest.get("format") == PRODUCT_MANIFEST_FORMAT,
+    )
 
 
 def _activate_legacy_runtime() -> None:
@@ -1366,7 +1371,7 @@ def _restore_runtime_for_release(config: Mapping[str, Any], current: Path | None
         allow_historical_state_compatibility=True,
     )
     if _is_product_manifest(manifest):
-        _activate_product_runtime(manifest)
+        _activate_product_runtime(config, manifest)
     elif _is_go_manifest(manifest):
         _activate_go_runtime(config, deployd_enabled=True)
     else:
@@ -1691,7 +1696,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _write_json(activation_path, record)
         if _is_product_manifest(manifest):
             runtime_switch_attempted = True
-            _activate_product_runtime(manifest)
+            _activate_product_runtime(config, manifest)
             record["activation_phase"] = "runtime-switched"
             _write_json(activation_path, record)
         elif _is_go_manifest(manifest):
@@ -1755,7 +1760,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 else:
                     assert old_manifest is not None
                     if _is_product_manifest(old_manifest):
-                        _activate_product_runtime(old_manifest)
+                        _activate_product_runtime(config, old_manifest)
                     elif _is_go_manifest(old_manifest):
                         _activate_go_runtime(config, deployd_enabled=True)
                     else:
@@ -1881,7 +1886,7 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             )
         _daemon_reload()
         if _is_product_manifest(previous_manifest):
-            _activate_product_runtime(previous_manifest)
+            _activate_product_runtime(config, previous_manifest)
         elif _is_go_manifest(previous_manifest):
             _activate_go_runtime(config, deployd_enabled=True)
         else:

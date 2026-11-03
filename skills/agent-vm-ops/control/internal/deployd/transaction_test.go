@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -271,6 +272,49 @@ func TestManagerRollsBackFinalizedTransaction(t *testing.T) {
 	}
 	if updated.State != "finalized" || updated.Phase != PhaseFinalize || !updated.RollbackUsed {
 		t.Fatalf("rolled back transaction = %#v", updated)
+	}
+}
+
+func TestManagerFencesWhenRollbackStateCannotBePersisted(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &fakeRuntime{active: "green", observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+	}}
+	transaction := store.Transaction{ID: "tx-rollback-persist-failure", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseFinalize, State: "finalized", Generation: 1, CreatedAt: now, UpdatedAt: now}
+	if err := database.Create(context.Background(), transaction, map[string]any{
+		"previous_release_id":         "release-blue",
+		"previous_source_revision":    "revision-1",
+		"previous_state_epoch":        "epoch-1",
+		"previous_state_capabilities": []string{"reads@1", "writes@1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	closed := false
+	clock := func() time.Time {
+		if !closed {
+			closed = true
+			_ = database.Close()
+		}
+		return now
+	}
+	manager := NewManager(database, runtime, time.Minute, clock)
+	if _, err := manager.Rollback(context.Background(), transaction.ID); err == nil {
+		t.Fatal("rollback unexpectedly succeeded after its state store was closed")
+	} else if !strings.Contains(err.Error(), "persist rollback state") {
+		t.Fatalf("rollback persistence error = %v", err)
+	}
+	for _, slot := range []string{"blue", "green"} {
+		if runtime.observations[slot].ControllerOwned || runtime.traffic[slot] {
+			t.Fatalf("slot %s remained active after rollback persistence failure: %#v", slot, runtime.observations[slot])
+		}
+	}
+	if len(runtime.sequence) != 5 || runtime.sequence[0] != "verify-identity" || runtime.sequence[1] != "traffic-disable" || runtime.sequence[2] != "traffic-disable" || runtime.sequence[3] != "fence" || runtime.sequence[4] != "fence" {
+		t.Fatalf("rollback persistence fencing sequence = %v", runtime.sequence)
 	}
 }
 
