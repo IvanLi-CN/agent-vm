@@ -306,6 +306,22 @@ func (s *Store) ListActive(ctx context.Context) ([]Transaction, error) {
 	return result, rows.Err()
 }
 
+func (s *Store) LatestFinalizedMigration(ctx context.Context) (*Transaction, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,error_code,error_message,created_at,updated_at
+		FROM deployment_transactions
+		WHERE target_slot = 'state' AND state = 'finalized'
+		ORDER BY updated_at DESC
+		LIMIT 1`)
+	transaction, err := scanTransaction(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return transaction, nil
+}
+
 func (s *Store) LatestEvent(ctx context.Context, transactionID, phase, transition string) (*PhaseEvent, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT sequence,phase,transition,source,evidence_json,created_at
 		FROM deployment_phase_events

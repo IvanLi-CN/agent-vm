@@ -4,16 +4,15 @@ status: accepted
 
 # Agent VM SQLite 到 rqlite 的保守状态迁移
 
-本文是 Architecture Decision Record，只记录一次性状态后端迁移和独立恢复边界的决策背景、技术取舍与被否决方案。
-规范设计和长期要求以 [Agent VM SPEC](../specs/agent-vm/SPEC.md) 的 `REQ-AGENT-VM-028` 及其关联合同为准；本文不替代该 SPEC。
-本文不定义蓝绿服务槽位切换。
-蓝绿 `stage`、`activate` 和 `rollback` 不替换业务数据库；它们要求两个槽位使用同一个已经验证的状态权威。
+本文是 Architecture Decision Record，只记录一次性状态后端迁移和独立恢复边界的决策背景、技术取舍与被否决方案。规范设计和长期要求以 [Agent VM SPEC](../specs/agent-vm/SPEC.md) 的 `REQ-AGENT-VM-028` 及其关联合同为准；本文不替代该 SPEC。本文不定义蓝绿服务槽位切换，但规定首次蓝绿部署必须如何自动完成状态后端切换。蓝绿 `stage`、`activate` 和 `rollback` 不替换业务数据库；它们要求两个槽位使用同一个已经验证的状态权威。
 
 ## Context
 
 现有 Agent VM 使用 `database/sql`、`modernc.org/sqlite`、protocol 4、generation、`state_epoch` 和 operation journal。蓝绿服务需要两个版本共享同一份状态，但不能让两个槽位直接打开同一个 SQLite 文件，也不能通过双写制造两个状态权威。rqlite 提供服务化的 SQLite 状态入口，但它的事务和读一致性语义与本地 `BEGIN IMMEDIATE` 不同，不能把旧 SQL 调用原样包在 HTTP 请求中。
 
 ## Decision
+
+首次部署由槽位外的 `agent-vm-deployd` 通过 `POST /v1/migrate` 自动执行本 ADR 的一次性迁移流程。发布器不得要求运维者先手工导出、导入或停止旧服务；这些动作由 Deployd 以一个可恢复的 durable transaction 串行完成。普通蓝绿 `stage`、`activate` 和 `rollback` 不调用该 API，也不触碰业务数据库。
 
 迁移分为明确的单一权威阶段：
 
@@ -27,15 +26,14 @@ status: accepted
 
 ### 有界备份保留与删除门禁
 
-迁移源 SQLite snapshot/export、迁移后的 rqlite backup/snapshot、deployd `deployment.sqlite3` recovery copy（如有）、backup tail、manifest、tail-evidence 和 recovery authorization record 都属于恢复材料。
-蓝绿 `stage`、`activate` 和 `rollback` 不创建、替换或删除这些材料。
+迁移源 SQLite snapshot/export、迁移后的 rqlite backup/snapshot、backup tail、manifest、tail-evidence 和 recovery authorization record 都属于恢复材料。普通蓝绿 `stage`、`activate` 和 `rollback` 不创建、替换或删除这些材料；首次 `migrate` 只创建自己的迁移源 snapshot，不创建 rqlite backup。
 
 恢复材料使用有界保留策略，默认参数固定如下：
 
 - `minimum_verified_points = 2`：至少保留当前和上一个可验证的 rqlite 恢复点。
 - `maximum_verified_points = 3`：超过三个恢复点时，优先删除最旧且已通过删除门禁的恢复点。
 - `maximum_age = 30d`：超过三十天的恢复点进入清理候选，但不能因此删除最后两个恢复点。
-- `recovery_max_bytes = 1 GiB`：这是同一控制环境内全部恢复材料的总硬上限，包含业务状态、deployd 数据库的 recovery copy（如有）和关联证据；它不是预分配空间，也不存在体积下限。
+- `recovery_max_bytes = 1 GiB`：这是状态后端恢复材料的总硬上限；部署控制面另外对每个自动创建的迁移源 snapshot 执行 1 GiB 文件上限。它不是预分配空间，也不存在体积下限。
 - `migration_source_hold = 7d`：迁移源 SQLite snapshot 在迁移完成后至少保留七天，七天从迁移事务 `finalized` 且新的 rqlite 恢复点通过 restore check 时开始计算。
 - `state_history_retention = 30d`：终态 operation 和 audit history 在不再被恢复流程引用且完成外部归档（如需要）后，保留三十天。
 
@@ -48,19 +46,13 @@ status: accepted
 - 清理后仍至少保留两个可验证的 rqlite 恢复点。
 - 运维者针对准确的材料 ID 执行带审计记录的 purge；不得使用目录级或全局 cleanup 代替精确删除。
 
-Retention worker 在每次成功创建恢复点后运行一次，并由唯一持有 active controller role 的 `deployd` 每小时运行一次。
-它按“超过最大数量、超过最大年龄或超过总字节预算”的任一条件选择最旧候选，但永远跳过保留期未到、仍被事务引用、或属于最后两个恢复点的材料。
+业务状态后端的 retention worker 在每次成功创建恢复点后运行一次，并按“超过最大数量、超过最大年龄或超过总字节预算”的任一条件选择最旧候选，但永远跳过保留期未到、仍被事务引用、或属于最后两个恢复点的材料。Deployd 每小时只清理自己创建的 `migration-*.sqlite3` snapshot，且不会删除 rqlite backup。
 
-生成新恢复点前必须先清理可删除材料并检查 `recovery_max_bytes`。
-如果清理后仍没有空间，必须拒绝新的备份或迁移操作并报告 `backup_storage_exhausted`，不能删除受保护恢复点，也不能继续写入导致磁盘无界增长。
-这个容量失败不改变正常蓝绿槽位，但会阻止依赖新恢复点的状态迁移或灾难恢复流程。
+生成新恢复点前必须先清理可删除材料并检查 `recovery_max_bytes`。如果清理后仍没有空间，必须拒绝新的备份或迁移操作并报告 `backup_storage_exhausted`，不能删除受保护恢复点，也不能继续写入导致磁盘无界增长。这个容量失败不改变正常蓝绿槽位，但会阻止依赖新恢复点的状态迁移或灾难恢复流程。
 
-1 GiB 预算按实际文件大小计算，不为小数据库预留固定空间，也不因为预算存在就把小备份填充到某个最小体积。
-实现必须在创建新恢复点前测量数据库、WAL/临时文件、manifest、tail-evidence 和已有恢复材料的实际大小；候选恢复点连同临时写入空间超过 1 GiB 时，必须在发布前失败。
+1 GiB 预算按实际文件大小计算，不为小数据库预留固定空间，也不因为预算存在就把小备份填充到某个最小体积。实现必须在创建新恢复点前测量数据库、WAL/临时文件、manifest、tail-evidence 和已有恢复材料的实际大小；候选恢复点连同临时写入空间超过 1 GiB 时，必须在发布前失败。
 
-该上限成立的前提是状态数据库自身不会无限增长。
-`operations`、`audit`、`management_operations` 和 `management_audit` 中已完成且不再被恢复流程引用的历史记录，必须按 `state_history_retention` 回收；pending/unknown operation、活动 operation、当前租约、generation、Token 撤销和恢复所需审计不得回收。
-若部署需要超过该保留期的审计，必须先归档到状态库之外，再从状态库删除；不能通过放大恢复材料预算来掩盖历史记录无界增长。
+该上限成立的前提是状态数据库自身不会无限增长。 `operations`、`audit`、`management_operations` 和 `management_audit` 中已完成且不再被恢复流程引用的历史记录，必须按 `state_history_retention` 回收；pending/unknown operation、活动 operation、当前租约、generation、Token 撤销和恢复所需审计不得回收。若部署需要超过该保留期的审计，必须先归档到状态库之外，再从状态库删除；不能通过放大恢复材料预算来掩盖历史记录无界增长。
 
 临时 preflight/acceptance 工作目录可以在进程退出时清理，但只要其中的文件被登记为恢复材料，就必须遵守上述有界保留和删除门禁。
 

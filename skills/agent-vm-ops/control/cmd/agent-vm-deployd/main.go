@@ -54,7 +54,7 @@ func run(args []string) error {
 	}
 	defer database.Close()
 	runtime := deployd.NewHostRuntime(config)
-	manager := deployd.NewManager(database, runtime, config.LeaseDuration(), time.Now)
+	manager := deployd.NewManagerWithMigration(database, runtime, runtime, config.LeaseDuration(), time.Now)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	if err := manager.RecoverOnStart(ctx); err != nil {
@@ -113,6 +113,9 @@ func maintenanceLoop(ctx context.Context, manager *deployd.Manager, server *depl
 		case <-cleanupTicker.C:
 			if err := manager.Cleanup(ctx); err != nil {
 				slog.Warn("deployd retention cleanup failed", "error", err)
+			}
+			if err := manager.CleanupMigrationBackups(ctx); err != nil {
+				slog.Warn("migration backup cleanup failed", "error", err)
 			}
 		}
 	}

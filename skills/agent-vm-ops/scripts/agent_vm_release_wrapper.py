@@ -111,7 +111,9 @@ GO_DEPLOYD_PATH = Path("/opt/agent-vm-native/bin/agent-vm-deployd")
 GO_DEPLOY_PATH = Path("/opt/agent-vm-native/bin/agent-vm-deploy")
 GO_SLOT_NAMES = ("blue", "green")
 GO_CONTROL_SOCKET = Path("/run/agent-vm-native/control.sock")
+GO_DEPLOYD_SOCKET = Path("/run/agent-vm-native/deployd.sock")
 STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
+MIGRATION_TIMEOUT_SECONDS = 9000
 LEGACY_EXPIRY_TIMER_RE = re.compile(r"^agent-vm-native-expire-[A-Za-z0-9_.:-]+\.timer$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -188,6 +190,43 @@ def _verify_go_runtime_layout(config: Mapping[str, Any]) -> None:
     allowed = {_go_slot_root(config, slot).resolve(strict=False) for slot in GO_SLOT_NAMES}
     if target not in allowed:
         _fail("activation_unverified", "Go runtime active pointer targets an unknown slot")
+
+
+def _prepare_initial_go_runtime_layout(config: Mapping[str, Any]) -> bool:
+    """Allow only the legacy-to-blue-green bootstrap to start without active."""
+    active = _go_runtime_root(config) / "active"
+    if active.is_symlink() or active.exists():
+        _verify_go_runtime_layout(config)
+        return False
+    if not Path(STATE_DB_PATH).is_file():
+        _fail("activation_unverified", "Go runtime active pointer is missing and no legacy SQLite state is present")
+    for slot in GO_SLOT_NAMES:
+        if not _go_slot_root(config, slot).is_dir():
+            _fail("activation_unverified", f"initial Go slot directory is missing: {slot}")
+    return True
+
+
+def _migration_marker_path(config: Mapping[str, Any]) -> Path:
+    return _go_runtime_root(config) / "migration" / ".rqlite-cutover-complete"
+
+
+def _migration_marker_is_valid(config: Mapping[str, Any]) -> bool:
+    path = _migration_marker_path(config)
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        _fail("activation_unverified", "migration completion marker cannot be inspected")
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+        _fail("activation_unverified", "migration completion marker is not a private regular file")
+    try:
+        marker = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        _fail("activation_unverified", "migration completion marker is invalid")
+    if not isinstance(marker, Mapping) or marker.get("format") != 1 or not marker.get("transaction_id") or marker.get("business_authority") != "rqlite":
+        _fail("activation_unverified", "migration completion marker is invalid")
+    return True
 
 
 def _go_bridge_target(config: Mapping[str, Any]) -> Path:
@@ -1269,6 +1308,70 @@ def _systemctl(action: str, unit: str, *, allow_missing: bool = False) -> None:
         _fail("activation_failed", f"systemd {action} failed: {unit}")
 
 
+def _run_deployd_cli(command: str, *arguments: str, timeout_seconds: int) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            [
+                str(GO_DEPLOY_PATH),
+                command,
+                "--socket",
+                str(GO_DEPLOYD_SOCKET),
+                "--timeout",
+                str(timeout_seconds),
+                "--json",
+                *arguments,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=timeout_seconds + 300,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _fail("activation_failed", f"Deployd {command} could not be verified")
+
+
+def _needs_migration_recovery() -> str | None:
+    process = _run_deployd_cli("status", timeout_seconds=30)
+    if process.returncode != 0:
+        return None
+    try:
+        payload = json.loads(process.stdout.decode("utf-8"))
+        transactions = payload.get("value", {}).get("transactions", [])
+    except (UnicodeError, json.JSONDecodeError, AttributeError):
+        return None
+    if not isinstance(transactions, list):
+        return None
+    for transaction in transactions:
+        if not isinstance(transaction, Mapping):
+            continue
+        if transaction.get("target_slot") == "state" and transaction.get("state") == "needs_recovery":
+            value = transaction.get("transaction_id")
+            if isinstance(value, str) and value:
+                return value
+    return None
+
+
+def _run_initial_state_migration(config: Mapping[str, Any]) -> None:
+    if _migration_marker_is_valid(config):
+        return
+    process = _run_deployd_cli("migrate", timeout_seconds=MIGRATION_TIMEOUT_SECONDS)
+    if process.returncode == 0:
+        return
+    transaction_id = _needs_migration_recovery()
+    if transaction_id is not None:
+        recovery = _run_deployd_cli(
+            "recover",
+            "--transaction",
+            transaction_id,
+            "--action",
+            "retry-migration",
+            timeout_seconds=MIGRATION_TIMEOUT_SECONDS,
+        )
+        if recovery.returncode == 0:
+            return
+    _fail("activation_failed", "initial SQLite-to-rqlite migration did not complete; the runtime remains fenced")
+
+
 def _legacy_expiry_timers() -> tuple[str, ...]:
     """Return only fixed-shape generation expiry timers owned by legacy control."""
     try:
@@ -1304,16 +1407,27 @@ def _activate_go_runtime(
     deployd_enabled: bool = False,
 ) -> None:
     """Retire legacy triggers, enable Go, and verify that it is active."""
+
+    bootstrap_active = False
     if deployd_enabled:
         if config is None:
             _fail("activation_unverified", "Go blue-green activation requires wrapper configuration")
-        _verify_go_runtime_layout(config)
+        bootstrap_active = _prepare_initial_go_runtime_layout(config)
     if not web_enabled:
         _deactivate_web_runtime()
     for unit in (*GO_RETIRED_UNITS, *_legacy_expiry_timers()):
         _systemctl("stop", unit, allow_missing=True)
         _systemctl("disable", unit, allow_missing=True)
     if deployd_enabled:
+        # Deployd must be available while the legacy singleton is still the
+        # SQLite writer. It fences and drains that writer before any slot is
+        # started, so systemd must not pull slots in as a dependency here.
+        _systemctl("enable", "agent-vm-deployd.service")
+        _systemctl("restart", "agent-vm-deployd.service")
+        _systemctl("is-active", "agent-vm-deployd.service")
+        _run_initial_state_migration(config)
+        if bootstrap_active:
+            _atomic_symlink(_go_slot_root(config, "blue"), _go_runtime_root(config) / "active")
         # The blue-green control plane owns the slot instances. Leaving the
         # legacy singleton enabled would create a third scheduler process.
         _systemctl("stop", "agent-vm-native.service", allow_missing=True)
@@ -1323,9 +1437,6 @@ def _activate_go_runtime(
             _systemctl("enable", unit)
             _systemctl("restart", unit)
             _systemctl("is-active", unit)
-        _systemctl("enable", "agent-vm-deployd.service")
-        _systemctl("restart", "agent-vm-deployd.service")
-        _systemctl("is-active", "agent-vm-deployd.service")
         return
     _systemctl("enable", "agent-vm-native.service")
     _systemctl("restart", "agent-vm-native.service")

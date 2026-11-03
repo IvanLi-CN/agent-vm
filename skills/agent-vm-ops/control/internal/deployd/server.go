@@ -108,6 +108,7 @@ func (server *Server) Handler() http.Handler {
 	router.POST("/v1/activate", server.activate)
 	router.POST("/v1/rollback", server.rollback)
 	router.POST("/v1/recover", server.recover)
+	router.POST("/v1/migrate", server.migrate)
 	router.NoRoute(func(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "not_found", "deployd endpoint was not found")
 	})
@@ -302,6 +303,23 @@ func (server *Server) recover(c *gin.Context) {
 	writeOK(c, publicTransaction(*transaction))
 }
 
+func (server *Server) migrate(c *gin.Context) {
+	var value request
+	if !decodeRequest(c, &value) {
+		return
+	}
+	transaction, err := server.Manager.Migrate(c.Request.Context())
+	if err != nil {
+		if errors.Is(err, ErrUncertain) {
+			writeMigrationError(c, http.StatusConflict, "state_unverified", err)
+			return
+		}
+		writeMigrationError(c, http.StatusConflict, "migration_rejected", err)
+		return
+	}
+	writeOK(c, publicTransaction(*transaction))
+}
+
 func decodeRequest(c *gin.Context, target any) bool {
 	reader := http.MaxBytesReader(c.Writer, c.Request.Body, maxRequestBytes)
 	defer c.Request.Body.Close()
@@ -327,6 +345,16 @@ func writeError(c *gin.Context, status int, code, message string) {
 	c.JSON(status, map[string]any{"ok": false, "error": map[string]any{"code": code, "message": publicErrorMessage(code, message)}})
 }
 
+func writeMigrationError(c *gin.Context, status int, code string, cause error) {
+	detail := map[string]any{"code": code, "message": publicErrorMessage(code, cause.Error())}
+	var migrationErr *MigrationError
+	if errors.As(cause, &migrationErr) {
+		detail["transaction_id"] = migrationErr.TransactionID
+		detail["phase"] = migrationErr.Phase
+	}
+	c.JSON(status, map[string]any{"ok": false, "error": detail})
+}
+
 func publicErrorMessage(code, fallback string) string {
 	switch code {
 	case "observation_unavailable":
@@ -345,6 +373,8 @@ func publicErrorMessage(code, fallback string) string {
 		return "deployment rollback was rejected"
 	case "recover_rejected":
 		return "deployment recovery was rejected"
+	case "migration_rejected":
+		return "initial state migration was rejected"
 	case "state_unverified":
 		return "deployment state could not be verified"
 	default:

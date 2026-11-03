@@ -108,6 +108,7 @@ type Status struct {
 type Manager struct {
 	Store         *store.Store
 	Runtime       Runtime
+	Migration     MigrationRuntime
 	Clock         func() time.Time
 	LeaseDuration time.Duration
 
@@ -116,13 +117,17 @@ type Manager struct {
 }
 
 func NewManager(database *store.Store, runtime Runtime, leaseDuration time.Duration, clock func() time.Time) *Manager {
+	return NewManagerWithMigration(database, runtime, nil, leaseDuration, clock)
+}
+
+func NewManagerWithMigration(database *store.Store, runtime Runtime, migration MigrationRuntime, leaseDuration time.Duration, clock func() time.Time) *Manager {
 	if clock == nil {
 		clock = time.Now
 	}
 	if leaseDuration <= 0 {
 		leaseDuration = 15 * time.Second
 	}
-	return &Manager{Store: database, Runtime: runtime, Clock: clock, LeaseDuration: leaseDuration}
+	return &Manager{Store: database, Runtime: runtime, Migration: migration, Clock: clock, LeaseDuration: leaseDuration}
 }
 
 func (manager *Manager) Status(ctx context.Context) (Status, error) {
@@ -422,6 +427,37 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 	if !transaction.RecoveryRequired && transaction.State != "needs_recovery" {
 		return nil, errors.New("transaction does not require recovery")
 	}
+	if transaction.TargetSlot == "state" {
+		if action != "retry-migration" {
+			return nil, errors.New("state migration recovery action must be retry-migration")
+		}
+		if manager.Migration == nil {
+			return nil, errors.New("migration runtime is unavailable")
+		}
+		if err := manager.Migration.FenceLegacy(ctx); err != nil {
+			return nil, err
+		}
+		if err := manager.Migration.StartStateAuthority(ctx); err != nil {
+			return nil, err
+		}
+		result, err := manager.Migration.RetryMigration(ctx, transaction.ID)
+		if err != nil {
+			return nil, &UncertainError{Cause: err}
+		}
+		updated, err := manager.Store.Transition(ctx, transaction.ID, transaction.Phase, PhaseMigrationFinalize, stateForPhase(PhaseMigrationFinalize), "recovery_import_verified", "deployd", map[string]any{
+			"source_sha256": result.SourceSHA256,
+			"source_size":   result.SourceSize,
+			"state_epoch":   result.StateEpoch,
+		}, manager.Clock().UTC())
+		if err != nil {
+			return nil, err
+		}
+		if err := manager.Migration.FinalizeMigration(ctx, transaction.ID, true); err != nil {
+			return nil, &UncertainError{Cause: err}
+		}
+		updated, err = manager.Store.Transition(ctx, transaction.ID, PhaseMigrationFinalize, PhaseFinalize, stateForPhase(PhaseFinalize), "migration_recovered", "deployd", map[string]any{"business_authority": "rqlite"}, manager.Clock().UTC())
+		return updated, err
+	}
 	switch action {
 	case "rollback":
 		if transaction.RollbackUsed && transaction.Phase != PhaseRollback {
@@ -512,6 +548,12 @@ func (manager *Manager) RecoverOnStart(ctx context.Context) error {
 	}
 	var firstErr error
 	for _, transaction := range transactions {
+		if transaction.TargetSlot == "state" && manager.Migration != nil {
+			if err := manager.recoverMigrationOnStart(ctx, transaction); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
 		_, observeErr := manager.observe(ctx, transaction.ID)
 		cause := &UncertainError{Cause: errors.New("deployd restarted while deployment transaction was active")}
 		if observeErr != nil {

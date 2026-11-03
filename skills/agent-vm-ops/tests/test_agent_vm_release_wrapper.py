@@ -317,6 +317,24 @@ class WrapperTests(unittest.TestCase):
             WRAPPER._activate_go_runtime(self.loaded, deployd_enabled=True)
         self.assertEqual(failure.exception.code, "activation_unverified")
 
+    def test_initial_go_runtime_migrates_before_creating_active_or_starting_slots(self):
+        runtime_root = WRAPPER._go_runtime_root(self.loaded)
+        for slot in WRAPPER.GO_SLOT_NAMES:
+            (runtime_root / "slots" / slot).mkdir(parents=True)
+        legacy_state = runtime_root / "state.sqlite3"
+        legacy_state.write_bytes(b"legacy")
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", legacy_state), mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ) as run:
+            WRAPPER._activate_go_runtime(self.loaded, deployd_enabled=True)
+        commands = [call.args[0] for call in run.call_args_list]
+        migration_index = next(index for index, command in enumerate(commands) if command[0] == str(WRAPPER.GO_DEPLOY_PATH) and command[1] == "migrate")
+        slot_index = next(index for index, command in enumerate(commands) if command == ["systemctl", "restart", "agent-vm-native@blue.service"])
+        self.assertLess(migration_index, slot_index)
+        self.assertTrue((runtime_root / "active").is_symlink())
+
     def test_product_runtime_retire_web_unit_and_keep_resident_control(self):
         runtime_root = WRAPPER._go_runtime_root(self.loaded)
         (runtime_root / "slots" / "blue").mkdir(parents=True)

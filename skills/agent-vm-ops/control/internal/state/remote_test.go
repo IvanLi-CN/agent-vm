@@ -209,7 +209,7 @@ func TestRemoteMigrationPreservesStateAndSerializesConcurrentOperations(t *testi
 		t.Fatal(err)
 	}
 
-	if err := migrateSQLiteToRQLite(ctx, sourcePath, rqliteURL, SQLiteMigrationGate{
+	if err := migrateSQLiteToRQLite(ctx, sourcePath, rqliteURL, nil, SQLiteMigrationGate{
 		StateWriteFenced:    true,
 		WorkersQuiescent:    true,
 		SQLiteWritersClosed: true,
@@ -239,10 +239,10 @@ func TestRemoteMigrationPreservesStateAndSerializesConcurrentOperations(t *testi
 		t.Fatal(err)
 	}
 
-	if err := migrateSQLiteToRQLite(ctx, sourcePath, rqliteURL, SQLiteMigrationGate{}); err == nil {
+	if err := migrateSQLiteToRQLite(ctx, sourcePath, rqliteURL, nil, SQLiteMigrationGate{}); err == nil {
 		t.Fatal("migration without all fence proofs succeeded")
 	}
-	if err := migrateSQLiteToRQLite(ctx, sourcePath, rqliteURL, SQLiteMigrationGate{
+	if err := migrateSQLiteToRQLite(ctx, sourcePath, rqliteURL, nil, SQLiteMigrationGate{
 		StateWriteFenced:    true,
 		WorkersQuiescent:    true,
 		SQLiteWritersClosed: true,
@@ -1104,6 +1104,36 @@ func TestSQLiteReadOnlyURIOverridesWritableMode(t *testing.T) {
 	}
 }
 
+func TestSnapshotSQLiteCreatesAProtectedConsistentCopy(t *testing.T) {
+	sourcePath := filepath.Join(t.TempDir(), "source.sqlite3")
+	destinationPath := filepath.Join(t.TempDir(), "migration", "snapshot.sqlite3")
+	source, err := OpenForTest(sourcePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := SnapshotSQLite(context.Background(), sourcePath, destinationPath); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(destinationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("snapshot mode = %o, want 600", info.Mode().Perm())
+	}
+	copy, err := openSQLiteReadOnly(destinationPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer copy.Close()
+	if err := requireSQLiteSchema(context.Background(), copy); err != nil {
+		t.Fatalf("snapshot schema = %v", err)
+	}
+}
+
 func TestMigrationTargetPreflightDoesNotWrite(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "source.sqlite3")
 	source, err := OpenForTest(sourcePath)
@@ -1130,7 +1160,7 @@ func TestMigrationTargetPreflightDoesNotWrite(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := migrateSQLiteToRQLite(ctx, sourcePath, server.URL, SQLiteMigrationGate{
+	if err := migrateSQLiteToRQLite(ctx, sourcePath, server.URL, nil, SQLiteMigrationGate{
 		StateWriteFenced:    true,
 		WorkersQuiescent:    true,
 		SQLiteWritersClosed: true,
@@ -1162,7 +1192,7 @@ func TestMigrationRejectsMalformedTargetQueryWithoutWrite(t *testing.T) {
 		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{{}}})
 	}))
 	defer server.Close()
-	if err := migrateSQLiteToRQLite(context.Background(), sourcePath, server.URL, SQLiteMigrationGate{
+	if err := migrateSQLiteToRQLite(context.Background(), sourcePath, server.URL, nil, SQLiteMigrationGate{
 		StateWriteFenced:    true,
 		WorkersQuiescent:    true,
 		SQLiteWritersClosed: true,
@@ -1245,7 +1275,7 @@ func TestLegacyMigrationWithoutEpochReachesTargetPreflight(t *testing.T) {
 		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{}})
 	}))
 	defer server.Close()
-	err = migrateSQLiteToRQLite(context.Background(), sourcePath, server.URL, SQLiteMigrationGate{
+	err = migrateSQLiteToRQLite(context.Background(), sourcePath, server.URL, nil, SQLiteMigrationGate{
 		StateWriteFenced:    true,
 		WorkersQuiescent:    true,
 		SQLiteWritersClosed: true,
@@ -1378,7 +1408,7 @@ func TestMigrationRejectsUnsupportedSourceSchemaBeforeRemoteWrite(t *testing.T) 
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := migrateSQLiteToRQLite(ctx, sourcePath, server.URL, SQLiteMigrationGate{
+	if err := migrateSQLiteToRQLite(ctx, sourcePath, server.URL, nil, SQLiteMigrationGate{
 		StateWriteFenced:    true,
 		WorkersQuiescent:    true,
 		SQLiteWritersClosed: true,
@@ -1419,7 +1449,7 @@ func TestMigrationRejectsPartialManagementSchemaBeforeRemoteWrite(t *testing.T) 
 		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{}})
 	}))
 	defer server.Close()
-	if err := migrateSQLiteToRQLite(context.Background(), sourcePath, server.URL, SQLiteMigrationGate{
+	if err := migrateSQLiteToRQLite(context.Background(), sourcePath, server.URL, nil, SQLiteMigrationGate{
 		StateWriteFenced:    true,
 		WorkersQuiescent:    true,
 		SQLiteWritersClosed: true,
@@ -1787,7 +1817,7 @@ func TestMigrationRejectsUnknownOperationStateBeforeRemoteWrite(t *testing.T) {
 				_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{}})
 			}))
 			defer server.Close()
-			err = migrateSQLiteToRQLite(context.Background(), path, server.URL, SQLiteMigrationGate{
+			err = migrateSQLiteToRQLite(context.Background(), path, server.URL, nil, SQLiteMigrationGate{
 				StateWriteFenced:    true,
 				WorkersQuiescent:    true,
 				SQLiteWritersClosed: true,
@@ -1803,11 +1833,7 @@ func TestMigrationRejectsUnknownOperationStateBeforeRemoteWrite(t *testing.T) {
 }
 
 func TestExportedMigrationEntryFailsClosed(t *testing.T) {
-	if err := MigrateSQLiteToRQLite(context.Background(), "source.sqlite3", "http://127.0.0.1:4001", SQLiteMigrationGate{
-		StateWriteFenced:    true,
-		WorkersQuiescent:    true,
-		SQLiteWritersClosed: true,
-	}); err == nil || !strings.Contains(err.Error(), "disabled") {
+	if _, err := MigrateSQLiteToRQLite(context.Background(), "source.sqlite3", "http://127.0.0.1:4001", SQLiteMigrationEvidence{}); err == nil || !strings.Contains(err.Error(), "evidence is incomplete") {
 		t.Fatalf("exported migration entry error = %v", err)
 	}
 }
