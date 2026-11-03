@@ -495,6 +495,11 @@ func TestOperationIdentityAndWorkerIdentityRemainImmutable(t *testing.T) {
 	if err := store.RecordOperationWorker(ctx, "identity-operation", map[string]any{"state": "running", "pid": int64(12), "start_time": "start-12", "process_group": int64(12)}); err == nil {
 		t.Fatal("worker identity overwrite was accepted")
 	}
+	if err := store.RecordOperation(ctx, "identity-operation", "acquire", &session, &generation, map[string]any{
+		"outcome": "success", "worker": map[string]any{"state": "finished", "pid": int64(12), "start_time": "start-12", "process_group": int64(12)},
+	}); err == nil {
+		t.Fatal("terminal worker identity overwrite was accepted")
+	}
 	if err := store.RecordOperation(ctx, "identity-operation", "release", &session, &generation, map[string]any{"outcome": "success"}); err == nil {
 		t.Fatal("operation identity overwrite was accepted")
 	}

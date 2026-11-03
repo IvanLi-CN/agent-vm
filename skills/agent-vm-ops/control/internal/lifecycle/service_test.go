@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/observe"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
@@ -91,6 +92,16 @@ type startupGuest struct {
 	stopErr             error
 	deleteErr           error
 	deviceSets          []string
+}
+
+type blockingStatusGuest struct {
+	*startupGuest
+	release chan struct{}
+}
+
+func (guest *blockingStatusGuest) Status(context.Context, string) (map[string]any, error) {
+	<-guest.release
+	return map[string]any{"status": "running"}, nil
 }
 
 func (guest *startupGuest) Init(_ context.Context, _, _ string, ownership map[string]string) error {
@@ -3033,6 +3044,55 @@ func TestAdminStatusUsesBoundedPaginationAndUnknownProvenance(t *testing.T) {
 	}
 }
 
+func TestAdminStatusReturnsAtPageDeadlineWhenProbeIgnoresContext(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "admin-status-timeout.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	taskID := "admin-timeout"
+	if err := store.InsertTask(ctx, state.Task{
+		TaskID: taskID, SessionID: "admin-timeout-session", Generation: 1, State: stateActive,
+		InstanceName: "agent-vm-admin-timeout", ResourcesJSON: `{"cpu":0,"memory_mib":0,"disk_gib":0}`,
+		ResourceReservationJSON: `{}`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &blockingStatusGuest{
+		startupGuest: &startupGuest{config: map[string]any{
+			"config": map[string]any{
+				"user.agent-vm.managed":    "native-v1",
+				"user.agent-vm.task":       taskID,
+				"user.agent-vm.session":    "admin-timeout-session",
+				"user.agent-vm.generation": "1",
+			},
+			"devices":          map[string]any{},
+			"expanded_devices": map[string]any{},
+		}},
+		release: make(chan struct{}),
+	}
+	service := New(store, config.Defaults(), Options{Guest: guest})
+	pageCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	result, err := service.adminStatus(pageCtx, protocol.Request{"limit": int64(1)})
+	close(guest.release)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("admin-status waited for an uncooperative probe: %s", elapsed)
+	}
+	if result["partial"] != true || result["timed_out"] != 1 || result["verified"] != 0 {
+		t.Fatalf("timed-out admin-status page = %#v", result)
+	}
+	item := result["tasks"].([]any)[0].(map[string]any)
+	if item["timed_out"] != true || item["verified"] != false || item["native_status"] != "unknown" {
+		t.Fatalf("timed-out admin-status item = %#v", item)
+	}
+}
+
 func TestScheduledMaintenanceUsesCursorWithoutTimerOperations(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "maintenance-page.sqlite3"))
 	if err != nil {
@@ -3086,6 +3146,28 @@ func TestScheduledMaintenanceUsesCursorWithoutTimerOperations(t *testing.T) {
 	}
 	if len(operations) != 0 {
 		t.Fatalf("repeated maintenance ticks created journal rows = %#v", operations)
+	}
+}
+
+func TestMaintenanceRequiresControllerLeaseBeforeCursorCommit(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "maintenance-lease.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
+	gate := controllerrole.New("blue", func() time.Time { return now })
+	service := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	service.SetMutationGate(gate.Valid)
+	if err := service.RunMaintenance(context.Background(), maintenanceReconcileLane); protocol.AsError(err).Code != "controller_lease_required" {
+		t.Fatalf("maintenance without controller lease = %v", err)
+	}
+	cursor, err := store.MaintenanceCursor(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cursor.Reconcile.UpdatedAt != cursor.AgeGC.UpdatedAt || cursor.Reconcile.NextAttemptAt != cursor.AgeGC.NextAttemptAt {
+		t.Fatalf("maintenance cursor changed without lease = %#v", cursor)
 	}
 }
 

@@ -1034,6 +1034,14 @@ func (s *Store) RecordOperation(ctx context.Context, operationID, action string,
 				if worker, hasWorker := current.Response["worker"]; hasWorker {
 					response["worker"] = worker
 				}
+			} else if worker, hasWorker := current.Response["worker"].(map[string]any); hasWorker {
+				incoming, valid := response["worker"].(map[string]any)
+				if !valid {
+					return errors.New("native worker identity is immutable")
+				}
+				if err := preserveWorkerIdentity(worker, incoming); err != nil {
+					return err
+				}
 			}
 			raw, err := json.Marshal(response)
 			if err != nil {
@@ -1179,6 +1187,16 @@ func decodeOperationJSON(raw string, target *map[string]any) error {
 
 func (s *Store) PendingOperations(ctx context.Context) ([]Operation, error) {
 	return s.listObservedOperations(ctx, `SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending' ORDER BY created_at, operation_id`)
+}
+
+// PendingOperationsPage keeps bounded maintenance reads from materializing the
+// complete journal. The full PendingOperations query remains available to
+// startup and diagnostic paths that intentionally need a complete snapshot.
+func (s *Store) PendingOperationsPage(ctx context.Context, limit int) ([]Operation, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	return s.listObservedOperations(ctx, fmt.Sprintf(`SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending' ORDER BY created_at, operation_id LIMIT %d`, limit))
 }
 
 // ReconciledUnknownOperations remains observable after a superseded operation

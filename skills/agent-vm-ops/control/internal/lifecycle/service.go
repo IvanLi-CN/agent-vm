@@ -105,6 +105,13 @@ type Service struct {
 
 type internalCleanupContextKey struct{}
 
+type adminStatusProbeResult struct {
+	index    int
+	item     map[string]any
+	probed   bool
+	timedOut bool
+}
+
 type leaseExemptMutationContextKey struct{}
 
 func withInternalCleanup(ctx context.Context) context.Context {
@@ -3154,6 +3161,7 @@ func (s *Service) adminStatus(ctx context.Context, requests ...protocol.Request)
 		cursor = value
 	}
 
+	observedAt := nowString(s.Clock())
 	pageCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	startEpoch, err := s.Store.StateEpoch(pageCtx)
@@ -3169,13 +3177,10 @@ func (s *Service) adminStatus(ctx context.Context, requests ...protocol.Request)
 	verified := 0
 	timedOut := 0
 	unknown := 0
-	var itemMu sync.Mutex
-	var wg sync.WaitGroup
+	results := make(chan adminStatusProbeResult, len(tasks))
 	semaphore := make(chan struct{}, 8)
 	for index := range tasks {
-		wg.Add(1)
 		go func(index int) {
-			defer wg.Done()
 			itemCtx, itemCancel := context.WithTimeout(pageCtx, time.Second)
 			defer itemCancel()
 			started := time.Now()
@@ -3184,31 +3189,46 @@ func (s *Service) adminStatus(ctx context.Context, requests ...protocol.Request)
 			case <-itemCtx.Done():
 				item := adminStatusProbeTimeout(&tasks[index], itemCtx.Err())
 				item["latency_ms"] = time.Since(started).Milliseconds()
-				itemMu.Lock()
-				items[index] = item
-				timedOut++
-				unknown++
-				itemMu.Unlock()
+				results <- adminStatusProbeResult{index: index, item: item, timedOut: true}
 				return
 			}
 			defer func() { <-semaphore }()
 			item, summaryErr := s.summary(itemCtx, &tasks[index])
-			itemMu.Lock()
-			defer itemMu.Unlock()
+			if itemCtx.Err() != nil {
+				item = adminStatusProbeTimeout(&tasks[index], itemCtx.Err())
+				item["latency_ms"] = time.Since(started).Milliseconds()
+				results <- adminStatusProbeResult{index: index, item: item, timedOut: true}
+				return
+			}
 			if summaryErr != nil {
 				item = adminStatusProbeFailure(&tasks[index], summaryErr)
 			}
 			item["latency_ms"] = time.Since(started).Milliseconds()
-			if itemCtx.Err() != nil {
-				item["timed_out"] = true
-				item["probed"] = false
+			results <- adminStatusProbeResult{index: index, item: item, probed: s.Guest != nil}
+		}(index)
+	}
+	completed := 0
+	deadlineReached := false
+probeLoop:
+	for completed < len(tasks) {
+		if pageCtx.Err() != nil {
+			deadlineReached = true
+			break
+		}
+		select {
+		case result := <-results:
+			completed++
+			items[result.index] = result.item
+			if result.timedOut {
 				timedOut++
-			} else {
-				item["timed_out"] = false
-				item["probed"] = s.Guest != nil
-				if s.Guest != nil {
-					probed++
-				}
+				unknown++
+				continue
+			}
+			item := result.item
+			item["timed_out"] = false
+			item["probed"] = result.probed
+			if result.probed {
+				probed++
 			}
 			isVerified, _ := item["verified"].(bool)
 			if isVerified {
@@ -3219,12 +3239,28 @@ func (s *Service) adminStatus(ctx context.Context, requests ...protocol.Request)
 				}
 				unknown++
 			}
-			items[index] = item
-		}(index)
+		case <-pageCtx.Done():
+			deadlineReached = true
+			break probeLoop
+		}
 	}
-	wg.Wait()
+	if deadlineReached {
+		for index := range tasks {
+			if items[index] != nil {
+				continue
+			}
+			items[index] = adminStatusProbeTimeout(&tasks[index], pageCtx.Err())
+			timedOut++
+			unknown++
+		}
+	}
+	consistent := false
 	endEpoch, epochErr := s.Store.StateEpoch(pageCtx)
-	consistent := epochErr == nil && startEpoch == endEpoch
+	if epochErr == nil {
+		consistent = startEpoch == endEpoch
+	} else if pageCtx.Err() == nil {
+		return nil, s.sqliteError(epochErr)
+	}
 	if !consistent {
 		unknown++
 	}
@@ -3245,7 +3281,7 @@ func (s *Service) adminStatus(ctx context.Context, requests ...protocol.Request)
 		"probed":                 probed,
 		"verified":               verified,
 		"timed_out":              timedOut,
-		"observed_at":            nowString(s.Clock()),
+		"observed_at":            observedAt,
 	}, nil
 }
 

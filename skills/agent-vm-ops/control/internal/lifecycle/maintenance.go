@@ -2,7 +2,10 @@ package lifecycle
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
@@ -11,10 +14,11 @@ import (
 )
 
 const (
-	maintenanceReconcileLane = "reconcile"
-	maintenanceAgeGCLane     = "age-gc"
-	maintenancePageSize      = 16
-	maintenanceBudget        = 2 * time.Second
+	maintenanceReconcileLane   = "reconcile"
+	maintenanceAgeGCLane       = "age-gc"
+	maintenancePageSize        = 16
+	maintenancePendingPageSize = 4
+	maintenanceBudget          = 2 * time.Second
 )
 
 type maintenancePageResult struct {
@@ -41,9 +45,14 @@ func (s *Service) RunMaintenance(ctx context.Context, lane string) error {
 	defer unlockMaintenance()
 	s.maintenance.Lock()
 	defer s.maintenance.Unlock()
+	if !s.mutationAllowed() {
+		return protocol.NewError("controller_lease_required", "controller lease is required for maintenance", map[string]any{"admission_ready": false})
+	}
+	workCtx, stopMutationWatch, mutationLost := s.mutationContext(ctx)
+	defer stopMutationWatch()
 
 	now := s.Clock().UTC()
-	cursor, err := s.Store.MaintenanceCursor(ctx)
+	cursor, err := s.Store.MaintenanceCursor(workCtx)
 	if err != nil {
 		return s.sqliteError(err)
 	}
@@ -54,13 +63,16 @@ func (s *Service) RunMaintenance(ctx context.Context, lane string) error {
 		return protocol.NewError("state_unverified", "maintenance cursor deadline is invalid", map[string]any{"lane": lane})
 	}
 
-	workCtx, cancel := context.WithTimeout(ctx, maintenanceBudget)
+	workCtx, cancel := context.WithTimeout(workCtx, maintenanceBudget)
 	defer cancel()
 	var page maintenancePageResult
 	if lane == maintenanceReconcileLane {
 		page, err = s.reconcileMaintenancePage(workCtx, laneCursor.ScanAfterTaskID)
 	} else {
 		page, err = s.ageGCMaintenancePage(workCtx, laneCursor.ScanAfterTaskID)
+	}
+	if err == nil && (mutationLost() || !s.mutationAllowed()) {
+		err = controllerLeaseLostError(nil)
 	}
 	if err == nil {
 		laneCursor.ScanAfterTaskID = page.nextTaskID
@@ -79,10 +91,20 @@ func (s *Service) RunMaintenance(ctx context.Context, lane string) error {
 		laneCursor.LastErrorPhase = lane
 	}
 	laneCursor.UpdatedAt = nowString(now)
-	if cursorErr := s.Store.SetMaintenanceCursor(ctx, cursor); cursorErr != nil {
+	if mutationLost() || !s.mutationAllowed() {
+		return controllerLeaseLostError(err)
+	}
+	if cursorErr := s.commitMutationContext(ctx, func() error {
+		return s.Store.SetMaintenanceCursor(ctx, cursor)
+	}); cursorErr != nil {
 		return s.sqliteError(cursorErr)
 	}
 	return err
+}
+
+func maintenanceCleanupOperationID(action, sessionID string, generation int64) string {
+	digest := sha256.Sum256([]byte(action + "\x00" + sessionID + "\x00" + strconv.FormatInt(generation, 10)))
+	return "maintenance-" + action + "-" + hex.EncodeToString(digest[:12])
 }
 
 func maintenanceLane(cursor *state.MaintenanceCursor, lane string) *state.MaintenanceLane {
@@ -110,7 +132,7 @@ func maintenanceBackoff(attempt int) time.Duration {
 }
 
 func (s *Service) reconcileMaintenancePage(ctx context.Context, afterTaskID string) (maintenancePageResult, error) {
-	pending, err := s.Store.PendingOperations(ctx)
+	pending, err := s.Store.PendingOperationsPage(ctx, maintenancePendingPageSize)
 	if err != nil {
 		return maintenancePageResult{}, s.sqliteError(err)
 	}
@@ -168,35 +190,77 @@ func (s *Service) reconcileMaintenanceTask(ctx context.Context, task *state.Task
 }
 
 func (s *Service) reconcileFailedTask(ctx context.Context, task *state.Task) error {
-	cleanupRequest, cleanupOperationID, err := s.pendingCleanupRequest(ctx, task.SessionID, task.Generation, "release")
+	result, err := s.maintenanceCleanup(ctx, task, "release")
 	if err != nil {
 		return err
-	}
-	cleanupCtx := ctx
-	if cleanupOperationID != "" {
-		cleanupCtx = native.WithWorkerRecorder(cleanupCtx, cleanupOperationID, s)
-	}
-	result, releaseErr := s.release(withInternalCleanup(cleanupCtx), cleanupRequest, false)
-	if releaseErr != nil {
-		return releaseErr
 	}
 	return s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, "release", result)
 }
 
 func (s *Service) reconcileDeletingTask(ctx context.Context, task *state.Task) error {
-	cleanupRequest, cleanupOperationID, err := s.pendingCleanupRequest(ctx, task.SessionID, task.Generation, "destroy")
+	result, err := s.maintenanceCleanup(ctx, task, "destroy")
 	if err != nil {
 		return err
 	}
-	cleanupCtx := ctx
-	if cleanupOperationID != "" {
-		cleanupCtx = native.WithWorkerRecorder(cleanupCtx, cleanupOperationID, s)
-	}
-	result, releaseErr := s.release(withInternalCleanup(cleanupCtx), cleanupRequest, true)
-	if releaseErr != nil {
-		return releaseErr
-	}
 	return s.finalizePendingCleanup(ctx, task.SessionID, task.Generation, "destroy", result)
+}
+
+func (s *Service) maintenanceCleanup(ctx context.Context, task *state.Task, action string) (map[string]any, error) {
+	request, operationID, err := s.pendingCleanupRequest(ctx, task.SessionID, task.Generation, action)
+	if err != nil {
+		return nil, err
+	}
+	if operationID == "" {
+		request = cloneMap(request)
+		request["protocol"] = protocol.Version
+		request["action"] = action
+		operationID = maintenanceCleanupOperationID(action, task.SessionID, task.Generation)
+		request["operation_id"] = operationID
+		digest, digestErr := protocol.Digest(request)
+		if digestErr != nil {
+			return nil, protocol.NewError("invalid_request", "maintenance cleanup request cannot be canonicalized", nil)
+		}
+		pending := map[string]any{
+			"outcome":         "pending",
+			"_request_digest": digest,
+			"_request":        map[string]any(request),
+			"worker":          map[string]any{"state": "starting", "start_attempted": false, "prepared_at": nowString(s.Clock())},
+		}
+		finishActive := s.markOperationActive(operationID)
+		var existing *state.Operation
+		claimErr := s.commitMutationContext(ctx, func() error {
+			var err error
+			existing, err = s.Store.ClaimOperation(ctx, operationID, action, &task.SessionID, &task.Generation, pending)
+			return err
+		})
+		if claimErr != nil {
+			finishActive()
+			return nil, s.sqliteError(claimErr)
+		}
+		if existing != nil {
+			finishActive()
+			return s.replayRecord(request, existing, nil)
+		}
+		defer finishActive()
+	}
+	cleanupCtx := native.WithWorkerRecorder(withInternalCleanup(ctx), operationID, s)
+	result, cleanupErr := s.release(cleanupCtx, request, action == "destroy")
+	if cleanupErr != nil {
+		if !uncertain(cleanupErr) {
+			_ = s.recordError(ctx, request, cleanupErr)
+		}
+		return nil, cleanupErr
+	}
+	response := protocol.SuccessWithRelease(request, result, s.Release, nil)
+	responseDigest, digestErr := protocol.Digest(request)
+	if digestErr != nil {
+		return nil, protocol.NewError("state_unverified", "maintenance cleanup request digest could not be recomputed", map[string]any{"operation_id": operationID})
+	}
+	response["_request_digest"] = responseDigest
+	if err := s.recordOperation(ctx, operationID, action, &task.SessionID, &task.Generation, response); err != nil {
+		return nil, s.sqliteError(err)
+	}
+	return result, nil
 }
 
 func (s *Service) ageGCMaintenancePage(ctx context.Context, afterTaskID string) (maintenancePageResult, error) {
@@ -216,7 +280,7 @@ func (s *Service) ageGCMaintenancePage(ctx context.Context, afterTaskID string) 
 			continue
 		}
 		gcNow := s.Clock()
-		updated, updateErr := s.Store.UpdateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateCached}, LeaseExpiredAt: &gcNow}, map[string]any{"state": stateDeleting, "updated_at": nowString(gcNow)})
+		updated, updateErr := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateCached}, LeaseExpiredAt: &gcNow}, map[string]any{"state": stateDeleting, "updated_at": nowString(gcNow)})
 		if updateErr != nil {
 			return maintenancePageResult{}, s.sqliteError(updateErr)
 		}
@@ -224,7 +288,7 @@ func (s *Service) ageGCMaintenancePage(ctx context.Context, afterTaskID string) 
 			continue
 		}
 		cleanupRequest := protocol.Request{"session_id": task.SessionID, "generation": task.Generation}
-		if _, releaseErr := s.release(withInternalCleanup(ctx), cleanupRequest, true); releaseErr != nil {
+		if _, releaseErr := s.maintenanceCleanup(ctx, &task, "destroy"); releaseErr != nil {
 			return maintenancePageResult{}, releaseErr
 		}
 		if err := s.deleteDestroyedTask(ctx, cleanupRequest, &task.Generation); err != nil {
