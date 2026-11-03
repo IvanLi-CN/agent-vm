@@ -43,7 +43,7 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if info, statErr := os.Stat(socket); statErr == nil && info.Mode().Perm() == 0o660 {
+		if info, statErr := os.Stat(socket); statErr == nil && info.Mode().Perm() == 0o600 {
 			break
 		}
 		select {
@@ -52,7 +52,7 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 		default:
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("control socket was not created with mode 0660")
+			t.Fatal("control socket was not created with mode 0600")
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -60,7 +60,7 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 	if statErr != nil {
 		t.Fatal(statErr)
 	}
-	if socketInfo.Mode().Perm() != 0o660 {
+	if socketInfo.Mode().Perm() != 0o600 {
 		t.Fatalf("socket mode = %v", socketInfo.Mode().Perm())
 	}
 	parentInfo, statErr := os.Stat(root)
@@ -136,6 +136,53 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server did not shut down")
+	}
+}
+
+func TestUDSAppSocketUsesWebGroupMode(t *testing.T) {
+	root := t.TempDir()
+	store, err := state.OpenForTest(filepath.Join(root, "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	cfg := config.Defaults()
+	cfg.StateDB = store.Path()
+	snapshots := observe.NewSnapshotStore(filepath.Join(root, "metrics"))
+	service := lifecycle.New(store, cfg, lifecycle.Options{Snapshots: snapshots})
+	service.MarkReady()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	socket := filepath.Join(root, "a")
+	serverErrors := make(chan error, 1)
+	go func() {
+		serverErrors <- ServeApp(ctx, socket, service, snapshots, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if info, statErr := os.Stat(socket); statErr == nil && info.Mode().Perm() == 0o660 {
+			break
+		}
+		select {
+		case serveErr := <-serverErrors:
+			t.Fatalf("app serve exited before creating socket: %v", serveErr)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("app socket was not created with mode 0660")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case serveErr := <-serverErrors:
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			t.Fatalf("app serve error = %v", serveErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("app server did not shut down")
 	}
 }
 

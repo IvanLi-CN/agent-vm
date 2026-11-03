@@ -179,6 +179,34 @@ function assertNoSymlinkedDirectoryAncestors(path: string, label: string): void 
   }
 }
 
+function targetBinaryInfo(target: BuildOptions["target"]): { architecture: string; machine: number; machineName: string } {
+  return target === "linux/amd64"
+    ? { architecture: "amd64", machine: 0x3e, machineName: "EM_X86_64" }
+    : { architecture: "arm64", machine: 0xb7, machineName: "EM_AARCH64" };
+}
+
+function verifyLinuxTargetBinary(path: string, target: BuildOptions["target"]): { architecture: string; machineName: string } {
+  const binary = readFileSync(path);
+  const expected = targetBinaryInfo(target);
+  if (
+    binary.length < 20 ||
+    binary[0] !== 0x7f ||
+    binary[1] !== 0x45 ||
+    binary[2] !== 0x4c ||
+    binary[3] !== 0x46 ||
+    binary[4] !== 2 ||
+    binary[5] !== 1 ||
+    binary[6] !== 1
+  ) {
+    fail(`Caddy build is not an ELF64 little-endian Linux executable: ${path}`);
+  }
+  const machine = binary.readUInt16LE(18);
+  if (machine !== expected.machine) {
+    fail(`Caddy build ELF machine ${machine} does not match ${target} (${expected.machineName})`);
+  }
+  return expected;
+}
+
 export function commandFor(options: BuildOptions, metadata: CaddyMetadata): string[] {
   return [
     "build",
@@ -231,6 +259,7 @@ export function buildCaddy(args: string[], environment: Record<string, string | 
     if (stagingStat.isSymbolicLink() || !stagingStat.isFile()) fail(`Caddy build output is not a regular file: ${stagingOutput}`);
     const mode = stagingStat.mode & 0o777;
     if ((mode & 0o111) === 0) fail(`Caddy build output is not executable: ${stagingOutput}`);
+    const binaryTarget = verifyLinuxTargetBinary(stagingOutput, options.target);
     // `go version -m` inspects Go build metadata without executing the target
     // binary, so cross-compiled linux/amd64 and linux/arm64 outputs are both
     // verifiable from the operator's build host.
@@ -275,13 +304,16 @@ export function buildCaddy(args: string[], environment: Record<string, string | 
       provider_module_name: metadata.provider_module_name,
       provider_ref: metadata.provider_ref,
       observed_provider_version: observedProviderVersion,
+      binary_format: "ELF64-little-endian",
+      binary_architecture: binaryTarget.architecture,
+      binary_elf_machine: binaryTarget.machineName,
       sha512,
       build_vcs_revision: buildVcsRevision || null,
       build_vcs_modified: buildVcsModified || null,
       ...(options.expectedSha512 ? { expected_sha512: options.expectedSha512 } : {}),
       target: options.target,
       output: options.output,
-      verification: "go-version-m",
+      verification: "elf64-target-and-go-version-m",
     }));
     return result.exitCode;
   } finally {

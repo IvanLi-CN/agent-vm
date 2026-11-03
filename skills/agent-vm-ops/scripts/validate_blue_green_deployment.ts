@@ -141,6 +141,10 @@ requireText(rqliteUnit, "-http-addr 127.0.0.1:4001", "rqlite HTTP binds to loopb
 requireText(rqliteUnit, "-raft-addr 127.0.0.1:4002", "rqlite raft binds to loopback");
 requireText(rqliteUnit, "-auth /etc/agent-vm-native/rqlite/auth.json", "rqlite auth file is explicit");
 requireText(rqliteUnit, "ExecStartPre=/usr/bin/test -f /etc/agent-vm-native/rqlite/auth.json", "rqlite auth file is checked before startup");
+requireText(rqliteUnit, "ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/rqlite/auth.json", "rqlite auth file cannot be a symlink");
+requireText(rqliteUnit, "ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/tls/rqlite/server.crt", "rqlite TLS certificate cannot be a symlink");
+requireText(rqliteUnit, "ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/tls/rqlite/server.key", "rqlite TLS key cannot be a symlink");
+requireText(rqliteUnit, "/usr/bin/readlink -f", "rqlite protected paths reject symlinked ancestors");
 requireText(rqliteUnit, "agent-vm-rqlite:600", "rqlite auth file is dedicated-user mode 0600");
 requireText(rqliteUnit, "/usr/bin/stat", "rqlite auth metadata check uses an absolute stat path");
 requireText(blueGreenDoc, "install -o agent-vm-rqlite -g agent-vm-rqlite -m 0600", "deployment docs install rqlite auth as dedicated-user mode 0600");
@@ -171,6 +175,13 @@ requireText(caddyUnit, "After=network-online.target", "Caddy waits for network r
 requireText(caddyUnit, "SupplementaryGroups=agent-vm-web", "Caddy can access the protected socket group");
 requireText(caddyUnit, "ConditionPathExists=/etc/agent-vm-native/caddy.env", "Caddy requires its protected environment file");
 requireText(caddyUnit, "EnvironmentFile=/etc/agent-vm-native/caddy.env", "Caddy receives DNSPod credentials from its environment file");
+requireText(caddyUnit, "ConditionPathIsSymbolicLink=!/etc", "Caddy conditions reject a symlinked /etc ancestor");
+requireText(caddyUnit, "ConditionPathIsSymbolicLink=!/etc/agent-vm-native", "Caddy conditions reject a symlinked deployment ancestor");
+requireText(caddyUnit, "ConditionPathIsSymbolicLink=!/etc/agent-vm-native/Caddyfile", "Caddy conditions reject a symlinked configuration");
+requireText(caddyUnit, "ConditionPathIsSymbolicLink=!/etc/agent-vm-native/caddy.env", "Caddy conditions reject a symlinked environment");
+requireText(caddyUnit, "ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/Caddyfile", "Caddy configuration cannot be a symlink");
+requireText(caddyUnit, "ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/caddy.env", "Caddy environment cannot be a symlink");
+requireText(caddyUnit, "/usr/bin/readlink -f", "Caddy protected paths reject symlinked ancestors");
 requireText(caddyUnit, "ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock", "Caddy checks the active socket before starting");
 requireText(caddyUnit, "ExecStartPre=+/bin/sh -c", "Caddy runs its active socket readiness probe with root peer credentials");
 requireText(caddyUnit, 'while [ "$$attempt" -lt 30 ]', "systemd preserves the Caddy readiness loop shell variable");
@@ -181,6 +192,7 @@ requireText(caddyUnit, "0:0:600", "Caddy requires a root-owned mode-0600 environ
 requireText(caddyUnit, "ReadOnlyPaths=/etc/agent-vm-native/Caddyfile", "Caddy configuration is read-only");
 requireText(caddyUnit, "ReadOnlyPaths=/etc/agent-vm-native/Caddyfile /etc/agent-vm-native/caddy.env", "Caddy configuration and credentials are read-only");
 requireText(caddyUnit, "ReadWritePaths=/var/lib/agent-vm-native/caddy", "Caddy can persist ACME state in its dedicated directory");
+forbidText(caddyUnit, "ExecReload=", "Caddy's disabled admin API is not advertised as a reload interface");
 forbidText(caddyUnit, "--environ", "Caddy does not dump the DNSPod environment at startup");
 requireText(acceptance, "rqlite-curl.conf", "rqlite readiness credentials use a temporary curl config");
 requireText(acceptance, "umask 077", "temporary rqlite curl credentials are owner-only");
@@ -197,9 +209,10 @@ requireText(acceptance, 'wait "$pid"', "isolated acceptance waits for runtime pr
 requireText(acceptance, "chown 994:994", "staged rqlite auth is owned by the service UID");
 requireText(acceptance, "staged rqlite auth metadata does not satisfy ExecStartPre", "staging executes the rqlite metadata precondition");
 requireText(acceptance, "staged Caddy environment metadata does not satisfy ExecStartPre", "staging executes the Caddy metadata precondition");
+requireText(acceptance, "staged credential, TLS and Caddy paths are symlinked or non-canonical", "staging rejects symlinked protected paths");
 requireText(acceptance, '"$systemd_root/bin/sh" -c', "staging executes preconditions through the staged shell path");
 requireText(acceptance, '"$2" -c "%U:%a"', "staging exercises the systemd-expanded owner metadata format");
-for (const commandPath of ["$systemd_root/bin/sh", "$systemd_root/usr/bin/curl", "$systemd_root/usr/bin/sleep", "$systemd_root/usr/bin/stat"]) {
+for (const commandPath of ["$systemd_root/bin/sh", "$systemd_root/usr/bin/curl", "$systemd_root/usr/bin/sleep", "$systemd_root/usr/bin/readlink", "$systemd_root/usr/bin/stat"]) {
   requireText(acceptance, commandPath, `systemd staging root provides ${commandPath}`);
 }
 requireText(acceptance, 'rqlite_auth_file="$proof_dir/auth.json"', "temporary rqlite auth file has an explicit path");
@@ -210,17 +223,24 @@ requireText(acceptance, 'previous=blue\\ncandidate=green', "isolated acceptance 
 requireText(acceptance, 'previous_manifest=%s\\ncandidate_manifest=%s', "isolated acceptance binds pending recovery to manifest identities");
 requireText(acceptance, "pending recovery did not restore blue", "isolated acceptance verifies pending recovery");
 requireText(acceptance, "candidate whose manifest changed after swap", "isolated acceptance verifies post-swap manifest identity");
+requireText(acceptance, "binary_architecture", "isolated acceptance verifies Caddy binary architecture");
+requireText(acceptance, "binary[18:20]", "isolated acceptance independently reads the Caddy ELF machine");
 requireText(acceptance, "exit 1", "isolated acceptance fails when cleanup is incomplete");
 requireText(caddyBuilder, "mkdtempSync", "Caddy builds into a private staging directory");
 requireText(caddyBuilder, "renameSync(stagingOutput, options.output)", "Caddy installs only after verification via atomic rename");
 requireText(caddyBuilder, 'caddy?.provider_module !== "github.com/caddy-dns/dnspod"', "Caddy builder pins the official DNSPod provider module");
 requireText(caddyBuilder, "isSymbolicLink()", "Caddy rejects symlinked output paths");
 requireText(caddyBuilder, "assertNoSymlinkedDirectoryAncestors", "Caddy rejects symlinked output ancestors");
+requireText(caddyBuilder, "readUInt16LE(18)", "Caddy verifies the target ELF machine");
 requireText(caGenerator, '[[ -L "$output_dir" ]]', "CA generation rejects a symlinked output directory");
 requireText(caGenerator, "assert_no_symlinked_ancestors", "CA generation rejects symlinked output ancestors");
 requireText(caGenerator, '"$output_dir/ca.key"', "CA generation cleans the private key after a failed run");
 requireText(linuxSocketListener, "lockUnixSocketParent", "Linux socket setup serializes parent-directory writers");
 requireText(linuxSocketListener, "unix.Flock", "Linux socket setup holds a parent-directory kernel lock");
+requireText(linuxSocketListener, "bindTemporaryUnixSocket", "Linux socket setup prepares a replacement socket separately");
+requireText(linuxSocketListener, "unix.Renameat2", "Linux socket setup installs a prepared socket atomically");
+requireText(linuxSocketListener, "unix.RENAME_EXCHANGE", "Linux socket setup can restore the previous socket after a failed replacement check");
+requireText(linuxSocketListener, "unix.RENAME_NOREPLACE", "Linux socket setup does not overwrite a concurrent new socket when the target was absent");
 requireText(ciWorkflow, "github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.4", "Ubuntu PR gate installs a pinned xcaddy builder");
 requireText(ciWorkflow, "skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh", "Ubuntu PR gate runs isolated deployment acceptance");
 requireText(acceptance, "--target linux/arm64", "isolated acceptance verifies the supported arm64 Caddy build");
@@ -241,6 +261,10 @@ requireText(cutover, "rollback_link", "cutover has a protected rollback link for
 requireText(cutover, "pending_file", "cutover persists an interrupted-swap recovery record");
 requireText(cutover, "recover_pending_cutover", "cutover recovers an interrupted swap before a new replacement");
 requireText(cutover, "validate_candidate_layout", "cutover revalidates the candidate while holding the active lock");
+requireText(cutover, "validate_runtime_root", "cutover validates the runtime socket root");
+requireText(cutover, '! -L "$runtime_root"', "cutover rejects a symlinked runtime socket root");
+requireText(cutover, "validate_directory_ancestors", "cutover rejects symlinked runtime ancestors");
+requireText(cutover, "runtime slot directory is missing or symlinked", "cutover rejects a symlinked runtime slot directory");
 requireText(cutover, '! -L "$slot_dir"', "cutover rejects symlinked slot directories");
 requireText(cutover, '! -L "$slot_dir/release-manifest.json"', "cutover rejects symlinked release manifests");
 requireText(cutover, '! -L "$root_dir/slots"', "cutover rejects a symlinked slot root");
@@ -253,7 +277,8 @@ requireText(cutover, 'exec 8<"$root_dir"', "cutover anchors lock-path creation t
 requireText(cutover, "flock --wait 30 8", "cutover serializes lock-path creation before opening the regular lock");
 requireText(cutover, 'mktemp -d -- "$root_dir/.active-stage.XXXXXX"', "cutover uses PID-independent unique staging");
 requireText(cutover, '[[ -L "$lock_path" ]]', "cutover rejects a symlinked active-link lock");
-requireText(controlServer, "mode := os.FileMode(0o660)", "control sockets are accessible to the protected Caddy group");
+requireText(controlServer, "legacySocketMode = os.FileMode(0o600)", "legacy control sockets remain private");
+requireText(controlServer, "appSocketMode    = os.FileMode(0o660)", "unified app sockets are accessible to the protected Caddy group");
 requireText(linuxSocketListener, "unix.Umask", "Linux socket binding has an old-kernel mode compatibility path");
 requireText(linuxSocketListener, "unix.AT_EMPTY_PATH", "Linux socket mode uses an exact inode operation when supported");
 requireText(cutover, 'ln -- "$lock_seed" "$lock_path"', "cutover atomically creates the active-link lock without following a symlink");

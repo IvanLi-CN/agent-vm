@@ -66,7 +66,46 @@ validate_release_root() {
   [[ "$(readlink -f -- "$root_dir/slots")" == "$root_dir/slots" ]] || die "slot root path is not canonical: $root_dir/slots"
 }
 
+is_macos_var_alias() {
+  local path="$1"
+  local canonical="$2"
+  [[ "$(uname -s)" == "Darwin" ]] || return 1
+  [[ "$path" == /var || "$path" == /var/* ]] || return 1
+  [[ "$canonical" == /private/var || "$canonical" == /private/var/* ]] || return 1
+  [[ "${canonical#/private}" == "$path" ]]
+}
+
+validate_directory_ancestors() {
+  local path="$1"
+  local label="$2"
+  local current="$path"
+  while :; do
+    if [[ -L "$current" ]]; then
+      [[ "$current" == "/var" && "$(uname -s)" == "Darwin" ]] || die "$label contains a symlinked directory: $current"
+    else
+      [[ -d "$current" ]] || die "$label contains a missing or non-directory ancestor: $current"
+    fi
+    [[ "$current" == "/" ]] && break
+    current="$(dirname -- "$current")"
+  done
+}
+
+validate_canonical_directory() {
+  local path="$1"
+  local label="$2"
+  local canonical
+  canonical="$(readlink -f -- "$path")" || die "$label cannot be canonicalized: $path"
+  [[ "$canonical" == "$path" ]] || is_macos_var_alias "$path" "$canonical" || die "$label path is not canonical: $path"
+}
+
+validate_runtime_root() {
+  [[ -d "$runtime_root" && ! -L "$runtime_root" ]] || die "runtime root is missing or symlinked: $runtime_root"
+  validate_directory_ancestors "$runtime_root" "runtime root"
+  validate_canonical_directory "$runtime_root" "runtime root"
+}
+
 validate_release_root
+validate_runtime_root
 
 candidate="$root_dir/slots/$slot"
 candidate_socket="$candidate/app.sock"
@@ -77,11 +116,15 @@ pending_file="$root_dir/.active.cutover.pending"
 validate_slot_layout() {
   local slot_name="$1"
   local slot_dir="$root_dir/slots/$slot_name"
+  local runtime_slot_dir="$runtime_root/$slot_name"
   local socket_link="$slot_dir/app.sock"
   local expected_slot_socket="$runtime_root/$slot_name/app.sock"
   [[ -d "$slot_dir" && ! -L "$slot_dir" ]] || die "slot directory is missing or symlinked: $slot_dir"
   [[ -f "$slot_dir/release-manifest.json" && ! -L "$slot_dir/release-manifest.json" ]] || die "slot release manifest is missing or symlinked: $slot_name"
   [[ "$(readlink -f -- "$slot_dir")" == "$root_dir/slots/$slot_name" ]] || die "slot directory resolves outside the release root: $slot_name"
+  [[ -d "$runtime_slot_dir" && ! -L "$runtime_slot_dir" ]] || die "runtime slot directory is missing or symlinked: $runtime_slot_dir"
+  validate_directory_ancestors "$runtime_slot_dir" "runtime slot"
+  validate_canonical_directory "$runtime_slot_dir" "runtime slot"
   [[ -L "$socket_link" ]] || die "slot socket link is missing: $slot_name"
   [[ "$(readlink -- "$socket_link")" == "$expected_slot_socket" ]] || die "slot socket link is not the expected runtime socket: $slot_name"
 }

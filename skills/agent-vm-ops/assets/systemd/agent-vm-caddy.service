@@ -4,6 +4,10 @@ After=network-online.target agent-vm-rqlite.service agent-vm-native@blue.service
 Wants=network-online.target agent-vm-rqlite.service
 ConditionPathExists=/etc/agent-vm-native/Caddyfile
 ConditionPathExists=/etc/agent-vm-native/caddy.env
+ConditionPathIsSymbolicLink=!/etc
+ConditionPathIsSymbolicLink=!/etc/agent-vm-native
+ConditionPathIsSymbolicLink=!/etc/agent-vm-native/Caddyfile
+ConditionPathIsSymbolicLink=!/etc/agent-vm-native/caddy.env
 RequiresMountsFor=/var/lib/agent-vm-native/active/app.sock
 
 [Service]
@@ -14,10 +18,12 @@ SupplementaryGroups=agent-vm-web
 EnvironmentFile=/etc/agent-vm-native/caddy.env
 ExecStartPre=/usr/bin/test -L /var/lib/agent-vm-native/active
 ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock
+ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/Caddyfile
+ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/caddy.env
+ExecStartPre=/bin/sh -c 'for path in /etc/agent-vm-native/Caddyfile /etc/agent-vm-native/caddy.env; do test "$$(/usr/bin/readlink -f -- "$$path")" = "$$path" || exit 1; done'
 ExecStartPre=+/bin/sh -c 'attempt=0; while [ "$$attempt" -lt 30 ]; do if /usr/bin/curl --fail --silent --show-error --max-time 1 --unix-socket /var/lib/agent-vm-native/active/app.sock http://localhost/internal/v1/health >/dev/null; then exit 0; fi; attempt=$$(($$attempt + 1)); /usr/bin/sleep 0.5; done; exit 1'
 ExecStartPre=/bin/sh -c 'test "$(/usr/bin/stat -c "%%u:%%g:%%a" /etc/agent-vm-native/caddy.env)" = "0:0:600"'
 ExecStart=/usr/local/bin/caddy run --config /etc/agent-vm-native/Caddyfile --adapter caddyfile
-ExecReload=/usr/local/bin/caddy reload --config /etc/agent-vm-native/Caddyfile --adapter caddyfile
 Restart=on-failure
 RestartSec=2s
 TimeoutStartSec=60s

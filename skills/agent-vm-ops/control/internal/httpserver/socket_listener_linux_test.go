@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestOpenUnixSocketParentRejectsSymlinkedAncestor(t *testing.T) {
@@ -53,5 +55,65 @@ func TestListenUnixSocketAnchorsSocketInVerifiedParent(t *testing.T) {
 	}
 	if parentInfo.Mode().Perm() != 0o750 {
 		t.Fatalf("socket parent permissions = %o", parentInfo.Mode().Perm())
+	}
+}
+
+func TestInstallUnixSocketRestoresPreviousAfterValidationFailure(t *testing.T) {
+	root := t.TempDir()
+	socket := filepath.Join(root, "app.sock")
+	previous, err := listenUnixSocket(socket, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := previous.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	parentFD, name, err := openUnixSocketParent(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(parentFD)
+	var before unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &before, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		t.Fatal(err)
+	}
+
+	socketFD, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(socketFD)
+	temporaryName, err := bindTemporaryUnixSocket(parentFD, socketFD, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Unlinkat(parentFD, temporaryName, 0)
+	if err := unix.Listen(socketFD, unixSocketBacklog); err != nil {
+		t.Fatal(err)
+	}
+	if err := chmodUnixSocketAt(parentFD, temporaryName, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	identityFD, err := unix.Dup(socketFD)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(identityFD)
+
+	cleanup, err := installUnixSocketAt(parentFD, temporaryName, name, identityFD, 0o660)
+	if err == nil {
+		t.Fatal("expected the deliberate mode mismatch to fail")
+	}
+	if !cleanup {
+		t.Fatal("failed replacement left the temporary socket in an uncertain location")
+	}
+
+	var after unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &after, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		t.Fatal(err)
+	}
+	if after.Dev != before.Dev || after.Ino != before.Ino {
+		t.Fatalf("previous socket identity changed: before=%d:%d after=%d:%d", before.Dev, before.Ino, after.Dev, after.Ino)
 	}
 }

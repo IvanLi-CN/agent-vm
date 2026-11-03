@@ -132,6 +132,10 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(rqlite).toContain("-http-addr 127.0.0.1:4001");
   expect(rqlite).toContain("-auth /etc/agent-vm-native/rqlite/auth.json");
   expect(rqlite).toContain("ExecStartPre=/usr/bin/test -f /etc/agent-vm-native/rqlite/auth.json");
+  expect(rqlite).toContain("ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/rqlite/auth.json");
+  expect(rqlite).toContain("ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/tls/rqlite/server.crt");
+  expect(rqlite).toContain("ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/tls/rqlite/server.key");
+  expect(rqlite).toContain("/usr/bin/readlink -f");
   expect(rqlite).toContain("agent-vm-rqlite:600");
   expect(rqlite).toContain("/usr/bin/stat");
   expect(rqlite).not.toContain("0.0.0.0");
@@ -142,12 +146,20 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(slot).toContain("--socket /run/agent-vm-native/%i/app.sock");
   expect(slot).toContain("--manifest /opt/agent-vm-native/slots/%i/release-manifest.json");
   expect(slot).not.toContain("BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json");
-  expect(read("skills/agent-vm-ops/control/internal/httpserver/server.go")).toContain("mode := os.FileMode(0o660)");
+  expect(read("skills/agent-vm-ops/control/internal/httpserver/server.go")).toContain("legacySocketMode = os.FileMode(0o600)");
+  expect(read("skills/agent-vm-ops/control/internal/httpserver/server.go")).toContain("appSocketMode    = os.FileMode(0o660)");
   const caddyUnit = read("skills/agent-vm-ops/assets/systemd/agent-vm-caddy.service");
   expect(caddyUnit).toContain("User=caddy");
   expect(caddyUnit).toContain("After=network-online.target");
   expect(caddyUnit).toContain("ConditionPathExists=/etc/agent-vm-native/caddy.env");
   expect(caddyUnit).toContain("EnvironmentFile=/etc/agent-vm-native/caddy.env");
+  expect(caddyUnit).toContain("ConditionPathIsSymbolicLink=!/etc");
+  expect(caddyUnit).toContain("ConditionPathIsSymbolicLink=!/etc/agent-vm-native");
+  expect(caddyUnit).toContain("ConditionPathIsSymbolicLink=!/etc/agent-vm-native/Caddyfile");
+  expect(caddyUnit).toContain("ConditionPathIsSymbolicLink=!/etc/agent-vm-native/caddy.env");
+  expect(caddyUnit).toContain("ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/Caddyfile");
+  expect(caddyUnit).toContain("ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/caddy.env");
+  expect(caddyUnit).toContain("/usr/bin/readlink -f");
   expect(caddyUnit).toContain("ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock");
   expect(caddyUnit).toContain("ExecStartPre=+/bin/sh -c");
   expect(caddyUnit).toContain('while [ "$$attempt" -lt 30 ]');
@@ -157,13 +169,14 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(caddyUnit).toContain("0:0:600");
   expect(caddyUnit).not.toContain("--environ");
   expect(caddyUnit).toContain("ReadWritePaths=/var/lib/agent-vm-native/caddy");
+  expect(caddyUnit).not.toContain("ExecReload=");
   expect(caddyUnit).not.toContain("/etc/agent-vm-native/tls/caddy");
   const sysusers = read("skills/agent-vm-ops/assets/sysusers.d/agent-vm-native.conf");
   expect(sysusers).toContain("u caddy");
   expect(read("skills/agent-vm-ops/assets/tmpfiles.d/agent-vm-native.conf")).toContain("z /etc/agent-vm-native/caddy.env 0600 root root");
 });
 
-test("Caddy build integration requires an explicit v2 release and embeds DNSPod", () => {
+test("Caddy build integration requires an explicit v2 release and embeds DNSPod", { timeout: 30_000 }, () => {
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-caddy-build-test-"));
   try {
     const binDir = join(temporaryRoot, "bin");
@@ -194,14 +207,13 @@ if [ -f "$build_root/fake-xcaddy-mode" ] && [ "$(cat "$build_root/fake-xcaddy-mo
   ln -s "$output.target" "$output"
   exit 0
 fi
-cat > "$output" <<'EOF'
-#!/bin/sh
-case "\${1:-}" in
-  list-modules) printf '%s\\n' 'dns.providers.dnspod' ;;
-  version) printf '%s\\n' 'v2.99.1' ;;
-  *) exit 1 ;;
-esac
-EOF
+fake_arch="\${GOARCH:-amd64}"
+if [ -f "$build_root/fake-xcaddy-mode" ] && [ "$(cat "$build_root/fake-xcaddy-mode")" = wrong-arch ]; then
+  if [ "$fake_arch" = arm64 ]; then fake_arch=amd64; else fake_arch=arm64; fi
+fi
+printf '\\177ELF\\002\\001\\001' > "$output"
+dd if=/dev/zero bs=1 count=11 2>/dev/null >> "$output"
+if [ "$fake_arch" = arm64 ]; then printf '\\267\\000' >> "$output"; else printf '\\076\\000' >> "$output"; fi
 chmod 0755 "$output"
 `, { mode: 0o755 });
     const go = join(binDir, "go");
@@ -253,7 +265,41 @@ exit 1
     const buildReceipt = JSON.parse(new TextDecoder().decode(built.stdout));
     expect(buildReceipt.observed_caddy_version).toBe("v2.10.0");
     expect(buildReceipt.observed_provider_version).toContain("-fb7cc31cc04c");
+    expect(buildReceipt.binary_format).toBe("ELF64-little-endian");
+    expect(buildReceipt.binary_architecture).toBe("amd64");
+    expect(buildReceipt.binary_elf_machine).toBe("EM_X86_64");
     expect(buildReceipt.sha512).toMatch(/^[0-9a-f]{128}$/);
+
+    const arm64Output = join(temporaryRoot, "caddy-arm64");
+    const arm64Built = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/arm64",
+      "--output",
+      arm64Output,
+    ], { env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` } });
+    expect(arm64Built.exitCode).toBe(0);
+    const arm64Receipt = JSON.parse(new TextDecoder().decode(arm64Built.stdout));
+    expect(arm64Receipt.binary_architecture).toBe("arm64");
+    expect(arm64Receipt.binary_elf_machine).toBe("EM_AARCH64");
+
+    writeFileSync(join(temporaryRoot, "fake-xcaddy-mode"), "wrong-arch\n");
+    const wrongArchitecture = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      join(temporaryRoot, "wrong-architecture-caddy"),
+    ], { env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` } });
+    expect(wrongArchitecture.exitCode).not.toBe(0);
+    expect(existsSync(join(temporaryRoot, "wrong-architecture-caddy"))).toBe(false);
+    rmSync(join(temporaryRoot, "fake-xcaddy-mode"));
 
     const existingOutput = join(temporaryRoot, "existing-caddy");
     writeFileSync(existingOutput, "previous-caddy\n");
@@ -392,7 +438,7 @@ exit 1
   }
 });
 
-test("CA generation and state preflight require operator evidence", () => {
+test("CA generation and state preflight require operator evidence", { timeout: 30_000 }, () => {
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-blue-green-test-"));
   try {
     const caDir = join(temporaryRoot, "ca");
@@ -492,6 +538,10 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain("pending_file");
   expect(cutover).toContain("recover_pending_cutover");
   expect(cutover).toContain("validate_candidate_layout");
+  expect(cutover).toContain("validate_runtime_root");
+  expect(cutover).toContain('! -L "$runtime_root"');
+  expect(cutover).toContain("validate_directory_ancestors");
+  expect(cutover).toContain("runtime slot directory is missing or symlinked");
   expect(cutover).toContain('! -L "$slot_dir"');
   expect(cutover).toContain('! -L "$slot_dir/release-manifest.json"');
   expect(cutover).toContain('! -L "$root_dir/slots"');
@@ -505,6 +555,11 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
   expect(cutover).toContain("active target slot is missing");
   expect(cutover).toContain("slot_manifest_digest");
   expect(cutover).toContain("previous_manifest=");
+  const linuxSocketListener = read("skills/agent-vm-ops/control/internal/httpserver/socket_listener_linux.go");
+  expect(linuxSocketListener).toContain("bindTemporaryUnixSocket");
+  expect(linuxSocketListener).toContain("unix.Renameat2");
+  expect(linuxSocketListener).toContain("unix.RENAME_EXCHANGE");
+  expect(linuxSocketListener).toContain("unix.RENAME_NOREPLACE");
   expect(cutover).toContain("candidate_manifest=");
   expect(cutover).toContain('assert_manifest_digest "$previous_record" "$previous_manifest_record"');
   expect(cutover).toContain('assert_manifest_digest "$current_slot" "$pending_previous_manifest"');
@@ -566,6 +621,20 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
     const accepted = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", runtime, "--slot", "blue", "--dry-run"]);
     expect(accepted.exitCode).toBe(0);
     expect(JSON.parse(new TextDecoder().decode(accepted.stdout)).candidate).toBe("blue");
+
+    const symlinkedRuntimeRoot = join(temporaryRoot, "symlinked-runtime");
+    symlinkSync(runtime, symlinkedRuntimeRoot);
+    const symlinkedRuntimeResult = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", symlinkedRuntimeRoot, "--slot", "blue", "--dry-run"]);
+    expect(symlinkedRuntimeResult.exitCode).not.toBe(0);
+
+    const symlinkedRuntimeSlotRoot = join(temporaryRoot, "runtime-slot-target");
+    const symlinkedRuntimeSlot = join(temporaryRoot, "runtime-slot-link");
+    mkdirSync(join(symlinkedRuntimeSlotRoot, "blue"), { recursive: true });
+    mkdirSync(symlinkedRuntimeSlot);
+    symlinkSync(join(symlinkedRuntimeSlotRoot, "blue"), join(symlinkedRuntimeSlot, "blue"));
+    const symlinkedRuntimeSlotResult = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", symlinkedRuntimeSlot, "--slot", "blue", "--dry-run"]);
+    expect(symlinkedRuntimeSlotResult.exitCode).not.toBe(0);
+
     const rejected = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", runtime, "--slot", "red", "--dry-run"]);
     expect(rejected.exitCode).not.toBe(0);
 

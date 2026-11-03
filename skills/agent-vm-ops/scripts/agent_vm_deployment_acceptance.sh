@@ -218,8 +218,11 @@ expected = {
     "observed_caddy_version": requested_version,
     "provider_module": caddy_metadata["provider_module"],
     "provider_module_name": caddy_metadata["provider_module_name"],
+    "binary_format": "ELF64-little-endian",
+    "binary_architecture": "amd64",
+    "binary_elf_machine": "EM_X86_64",
     "target": "linux/amd64",
-    "verification": "go-version-m",
+    "verification": "elf64-target-and-go-version-m",
 }
 receipt = None
 with open(log_path, encoding="utf-8") as handle:
@@ -242,6 +245,9 @@ if receipt.get("provider_ref") != provider_ref:
 receipt_sha512 = receipt.get("sha512")
 if not isinstance(receipt_sha512, str) or len(receipt_sha512) != 128 or any(char not in "0123456789abcdef" for char in receipt_sha512):
     raise SystemExit("Caddy build receipt has no valid SHA-512")
+binary = Path(binary_path).read_bytes()
+if len(binary) < 20 or binary[:4] != b"\x7fELF" or binary[4:7] != b"\x02\x01\x01" or int.from_bytes(binary[18:20], "little") != 0x3e:
+    raise SystemExit("Caddy amd64 binary is not an ELF64 x86-64 Linux executable")
 actual_sha512 = hashlib.sha512(Path(binary_path).read_bytes()).hexdigest()
 if actual_sha512 != receipt_sha512:
     raise SystemExit("Caddy build receipt SHA-512 does not match the installed binary")
@@ -292,8 +298,11 @@ expected = {
     "observed_caddy_version": requested_version,
     "provider_module": caddy_metadata["provider_module"],
     "provider_module_name": caddy_metadata["provider_module_name"],
+    "binary_format": "ELF64-little-endian",
+    "binary_architecture": "arm64",
+    "binary_elf_machine": "EM_AARCH64",
     "target": "linux/arm64",
-    "verification": "go-version-m",
+    "verification": "elf64-target-and-go-version-m",
 }
 for key, value in expected.items():
     if receipt.get(key) != value:
@@ -303,6 +312,9 @@ if receipt.get("provider_ref") != caddy_metadata["provider_ref"]:
 receipt_sha512 = receipt.get("sha512")
 if not isinstance(receipt_sha512, str) or len(receipt_sha512) != 128 or any(char not in "0123456789abcdef" for char in receipt_sha512):
     raise SystemExit("Caddy arm64 build receipt has no valid SHA-512")
+binary = Path(binary_path).read_bytes()
+if len(binary) < 20 or binary[:4] != b"\x7fELF" or binary[4:7] != b"\x02\x01\x01" or int.from_bytes(binary[18:20], "little") != 0xb7:
+    raise SystemExit("Caddy arm64 binary is not an ELF64 AArch64 Linux executable")
 actual_sha512 = hashlib.sha512(Path(binary_path).read_bytes()).hexdigest()
 if actual_sha512 != receipt_sha512:
     raise SystemExit("Caddy arm64 build receipt SHA-512 does not match the built binary")
@@ -420,6 +432,7 @@ systemd_root="$proof_dir/systemd-root"
 mkdir -p -- \
   "$systemd_root/etc/systemd/system" \
   "$systemd_root/etc/agent-vm-native/rqlite" \
+  "$systemd_root/etc/agent-vm-native/tls/rqlite" \
   "$systemd_root/etc/agent-vm-native/slots/test_instance" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/bin" \
   "$systemd_root/bin" \
@@ -430,18 +443,23 @@ touch \
   "$systemd_root/etc/agent-vm-native/Caddyfile" \
   "$systemd_root/etc/agent-vm-native/caddy.env" \
   "$systemd_root/etc/agent-vm-native/rqlite/auth.json" \
+  "$systemd_root/etc/agent-vm-native/tls/rqlite/server.crt" \
+  "$systemd_root/etc/agent-vm-native/tls/rqlite/server.key" \
   "$systemd_root/etc/agent-vm-native/slots/test_instance/config.json" \
   "$systemd_root/opt/agent-vm-native/release-manifest.json" \
   "$systemd_root/opt/agent-vm-native/slots/test_instance/release-manifest.json"
 chmod 0600 \
   "$systemd_root/etc/agent-vm-native/caddy.env" \
   "$systemd_root/etc/agent-vm-native/rqlite/auth.json"
+chmod 0644 "$systemd_root/etc/agent-vm-native/tls/rqlite/server.crt"
+chmod 0600 "$systemd_root/etc/agent-vm-native/tls/rqlite/server.key"
 chown 0:0 "$systemd_root/etc/agent-vm-native/caddy.env"
 chown 994:994 "$systemd_root/etc/agent-vm-native/rqlite/auth.json"
 touch \
   "$systemd_root/bin/sh" \
   "$systemd_root/usr/bin/curl" \
   "$systemd_root/usr/bin/sleep" \
+  "$systemd_root/usr/bin/readlink" \
   "$systemd_root/usr/bin/stat" \
   "$systemd_root/usr/bin/test" \
   "$systemd_root/usr/local/bin/caddy" \
@@ -451,6 +469,7 @@ chmod 0755 \
   "$systemd_root/bin/sh" \
   "$systemd_root/usr/bin/curl" \
   "$systemd_root/usr/bin/sleep" \
+  "$systemd_root/usr/bin/readlink" \
   "$systemd_root/usr/bin/stat" \
   "$systemd_root/usr/bin/test" \
   "$systemd_root/usr/local/bin/caddy" \
@@ -481,7 +500,11 @@ if [ "$1" = "-c" ] && [ "$2" = "%U:%a" ]; then
 fi
 exec /usr/bin/stat "$@"
 EOF
-chmod 0755 "$systemd_root/bin/sh" "$systemd_root/usr/bin/test" "$systemd_root/usr/bin/stat"
+cat >"$systemd_root/usr/bin/readlink" <<'EOF'
+#!/bin/sh
+exec /usr/bin/readlink "$@"
+EOF
+chmod 0755 "$systemd_root/bin/sh" "$systemd_root/usr/bin/test" "$systemd_root/usr/bin/stat" "$systemd_root/usr/bin/readlink"
 printf '%s\n' \
   'root:x:0:0:root:/root:/bin/sh' \
   'caddy:x:995:995:caddy:/var/lib/caddy:/usr/sbin/nologin' \
@@ -517,6 +540,21 @@ systemd-analyze --root="$systemd_root" verify \
 # the systemd-expanded %U metadata format.
 staged_auth="$systemd_root/etc/agent-vm-native/rqlite/auth.json"
 staged_caddy_env="$systemd_root/etc/agent-vm-native/caddy.env"
+staged_caddyfile="$systemd_root/etc/agent-vm-native/Caddyfile"
+staged_rqlite_cert="$systemd_root/etc/agent-vm-native/tls/rqlite/server.crt"
+staged_rqlite_key="$systemd_root/etc/agent-vm-native/tls/rqlite/server.key"
+"$systemd_root/bin/sh" -c '
+  readlink_path="$1"
+  test_path="$2"
+  shift 2
+  for path in "$@"; do
+    "$test_path" ! -L "$path"
+    "$test_path" -f "$path"
+    [ "$("$readlink_path" -f -- "$path")" = "$path" ] || exit 1
+  done
+' _ "$systemd_root/usr/bin/readlink" "$systemd_root/usr/bin/test" \
+  "$staged_auth" "$staged_rqlite_cert" "$staged_rqlite_key" "$staged_caddyfile" "$staged_caddy_env" \
+  || fail "staged credential, TLS and Caddy paths are symlinked or non-canonical"
 "$systemd_root/bin/sh" -c '
   "$3" -f "$1"
   test "$("$2" -c "%U:%a" "$1")" = "agent-vm-rqlite:600"

@@ -8,13 +8,17 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/sys/unix"
 )
 
 const unixSocketBacklog = 128
+
+var unixSocketTempSequence atomic.Uint64
 
 // listenUnixSocket keeps the parent directory anchored by file descriptor
 // before binding. This prevents an ancestor replacement from redirecting the
@@ -36,9 +40,6 @@ func listenUnixSocket(path string, mode os.FileMode) (net.Listener, error) {
 		}
 	}()
 
-	if err := prepareUnixSocketAt(parentFD, name); err != nil {
-		return nil, err
-	}
 	socketFD, err := unix.Socket(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("create control socket: %w", err)
@@ -50,16 +51,31 @@ func listenUnixSocket(path string, mode os.FileMode) (net.Listener, error) {
 		}
 	}()
 
-	bindPath := fmt.Sprintf("/proc/self/fd/%d/%s", parentFD, name)
-	if err := bindUnixSocket(socketFD, bindPath, mode); err != nil {
+	temporaryName, err := bindTemporaryUnixSocket(parentFD, socketFD, mode)
+	if err != nil {
 		return nil, fmt.Errorf("bind control socket: %w", err)
 	}
+	temporaryBound := true
+	cleanupTemporary := func() {
+		if temporaryBound {
+			_ = unix.Unlinkat(parentFD, temporaryName, 0)
+		}
+	}
+	defer cleanupTemporary()
 	if err := unix.Listen(socketFD, unixSocketBacklog); err != nil {
 		return nil, fmt.Errorf("listen on control socket: %w", err)
 	}
-	if err := chmodUnixSocketAt(parentFD, name, mode); err != nil {
+	if err := chmodUnixSocketAt(parentFD, temporaryName, mode); err != nil {
 		return nil, fmt.Errorf("chmod control socket: %w", err)
 	}
+	if err := validateUnixSocketReplacementTarget(parentFD, name); err != nil {
+		return nil, err
+	}
+	identityFD, err := unix.Dup(socketFD)
+	if err != nil {
+		return nil, fmt.Errorf("duplicate control socket identity: %w", err)
+	}
+	defer unix.Close(identityFD)
 
 	file := os.NewFile(uintptr(socketFD), path)
 	if file == nil {
@@ -75,6 +91,16 @@ func listenUnixSocket(path string, mode os.FileMode) (net.Listener, error) {
 		_ = listener.Close()
 		return nil, fmt.Errorf("close control socket descriptor: %w", closeErr)
 	}
+	if err := validateUnixSocketReplacementTarget(parentFD, name); err != nil {
+		_ = listener.Close()
+		return nil, err
+	}
+	if cleanup, err := installUnixSocketAt(parentFD, temporaryName, name, identityFD, mode); err != nil {
+		temporaryBound = cleanup
+		_ = listener.Close()
+		return nil, err
+	}
+	temporaryBound = false
 	parentLocked = false
 	return &lockedUnixListener{Listener: listener, unlock: unlockParent}, nil
 }
@@ -117,6 +143,21 @@ func bindUnixSocket(socketFD int, path string, mode os.FileMode) error {
 	oldUmask := unix.Umask(int(0o777 &^ uint32(mode.Perm())))
 	defer unix.Umask(oldUmask)
 	return unix.Bind(socketFD, &unix.SockaddrUnix{Name: path})
+}
+
+func bindTemporaryUnixSocket(parentFD, socketFD int, mode os.FileMode) (string, error) {
+	for attempt := 0; attempt < 32; attempt++ {
+		name := ".agent-vm-" + strconv.FormatUint(unixSocketTempSequence.Add(1), 36)
+		bindPath := fmt.Sprintf("/proc/self/fd/%d/%s", parentFD, name)
+		if err := bindUnixSocket(socketFD, bindPath, mode); err != nil {
+			if errors.Is(err, unix.EADDRINUSE) || errors.Is(err, unix.EEXIST) {
+				continue
+			}
+			return "", err
+		}
+		return name, nil
+	}
+	return "", errors.New("could not allocate a temporary control socket name")
 }
 
 func openUnixSocketParent(path string) (int, string, error) {
@@ -239,20 +280,107 @@ func chmodUnixSocketAt(parentFD int, name string, mode os.FileMode) error {
 	return nil
 }
 
-func prepareUnixSocketAt(parentFD int, name string) error {
+func unixSocketTargetExists(parentFD int, name string) (bool, error) {
 	var stat unix.Stat_t
 	err := unix.Fstatat(parentFD, name, &stat, unix.AT_SYMLINK_NOFOLLOW)
 	if err != nil {
 		if err == unix.ENOENT {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("inspect control socket: %w", err)
+		return false, fmt.Errorf("inspect control socket: %w", err)
 	}
 	if stat.Mode&unix.S_IFMT != unix.S_IFSOCK {
-		return fmt.Errorf("refusing to replace non-socket control path: %s", name)
+		return false, fmt.Errorf("refusing to replace non-socket control path: %s", name)
 	}
-	if err := unix.Unlinkat(parentFD, name, 0); err != nil {
-		return fmt.Errorf("remove previous control socket: %w", err)
+	return true, nil
+}
+
+func validateUnixSocketReplacementTarget(parentFD int, name string) error {
+	_, err := unixSocketTargetExists(parentFD, name)
+	return err
+}
+
+func verifyUnixSocketAt(parentFD int, name string, identityFD int, mode os.FileMode) error {
+	var identity unix.Stat_t
+	if err := unix.Fstat(identityFD, &identity); err != nil {
+		return fmt.Errorf("inspect prepared control socket: %w", err)
+	}
+	if identity.Mode&unix.S_IFMT != unix.S_IFSOCK {
+		return fmt.Errorf("prepared control path is not a socket: %s", name)
+	}
+	var pathStat unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &pathStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("recheck installed control socket path: %w", err)
+	}
+	if pathStat.Mode&unix.S_IFMT != unix.S_IFSOCK {
+		return fmt.Errorf("installed control path is not a socket: %s", name)
+	}
+	if pathStat.Dev != identity.Dev || pathStat.Ino != identity.Ino {
+		return fmt.Errorf("installed control socket path changed while replacing")
+	}
+	wantedMode := uint32(mode.Perm())
+	if uint32(pathStat.Mode)&0o7777 != wantedMode {
+		return fmt.Errorf("installed control socket path mode is %o, want %o", uint32(pathStat.Mode)&0o7777, wantedMode)
 	}
 	return nil
+}
+
+func unlinkUnixSocketIfSame(parentFD int, name string, identityFD int) error {
+	var pathStat unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &pathStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if err == unix.ENOENT {
+			return nil
+		}
+		return err
+	}
+	var identity unix.Stat_t
+	if err := unix.Fstat(identityFD, &identity); err != nil {
+		return err
+	}
+	if pathStat.Dev != identity.Dev || pathStat.Ino != identity.Ino {
+		return errors.New("control socket path identity changed while cleaning up")
+	}
+	return unix.Unlinkat(parentFD, name, 0)
+}
+
+// installUnixSocketAt swaps a fully prepared socket into place. The boolean
+// reports whether the temporary name still needs cleanup after an error.
+func installUnixSocketAt(parentFD int, temporaryName, name string, identityFD int, mode os.FileMode) (bool, error) {
+	targetExists, err := unixSocketTargetExists(parentFD, name)
+	if err != nil {
+		return true, err
+	}
+	if targetExists {
+		if err := unix.Renameat2(parentFD, temporaryName, parentFD, name, unix.RENAME_EXCHANGE); err != nil {
+			return true, fmt.Errorf("exchange control socket: %w", err)
+		}
+	} else if err := unix.Renameat2(parentFD, temporaryName, parentFD, name, unix.RENAME_NOREPLACE); err != nil {
+		return true, fmt.Errorf("install control socket: %w", err)
+	}
+
+	if err := verifyUnixSocketAt(parentFD, name, identityFD, mode); err != nil {
+		if targetExists {
+			rollbackErr := unix.Renameat2(parentFD, name, parentFD, temporaryName, unix.RENAME_EXCHANGE)
+			if rollbackErr == nil {
+				return true, err
+			}
+			return false, errors.Join(err, fmt.Errorf("restore previous control socket: %w", rollbackErr))
+		}
+		cleanupErr := unlinkUnixSocketIfSame(parentFD, name, identityFD)
+		if cleanupErr == nil {
+			return true, err
+		}
+		return false, errors.Join(err, fmt.Errorf("remove invalid installed control socket: %w", cleanupErr))
+	}
+
+	if targetExists {
+		if err := unix.Unlinkat(parentFD, temporaryName, 0); err != nil {
+			rollbackErr := unix.Renameat2(parentFD, name, parentFD, temporaryName, unix.RENAME_EXCHANGE)
+			if rollbackErr == nil {
+				return true, fmt.Errorf("remove previous control socket: %w", err)
+			}
+			return false, errors.Join(fmt.Errorf("remove previous control socket: %w", err), fmt.Errorf("restore previous control socket: %w", rollbackErr))
+		}
+	}
+	return false, nil
 }
