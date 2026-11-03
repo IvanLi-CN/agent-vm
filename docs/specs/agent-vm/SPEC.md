@@ -200,6 +200,7 @@ TypeScript/Bun synchronization helper 将 tracked、unignored worktree file 传�
 Reason-limit 截图表明，过长输入仍可编辑，直到修正前提交保持禁用。
 Pending-preview 截图延迟 mock response，以展示 recovery control。
 移动端截图使用 `393x852` CSS-pixel viewport；桌面端截图展示完整渲染页面。
+认证入口截图使用受控的 session/API problem response，不连接身份提供方或真实管理服务；它们覆盖 OIDC 回跳失败后的安全提示、未登录深链和 session loss 后保留页面状态的管理台边界。
 
 - [桌面 System 页面](assets/agent-vm-web-system-desktop.png)
 - [移动端 System 页面](assets/agent-vm-web-system-mobile-list.png)
@@ -208,6 +209,9 @@ Pending-preview 截图延迟 mock response，以展示 recovery control。
 - [移动端确认 reason limit](assets/agent-vm-web-system-mobile-dialog-reason-limit.png)
 - [移动端 Token 创建 reason limit](assets/agent-vm-web-system-mobile-create-reason-limit.png)
 - [移动端镜像导入 reason limit](assets/agent-vm-web-images-mobile-import-reason-limit.png)
+- [桌面端 OIDC 回跳失败](assets/agent-vm-auth-gate-desktop.png)
+- [移动端 OIDC 回跳失败](assets/agent-vm-auth-gate-mobile.png)
+- [桌面端 session loss 保留状态](assets/agent-vm-auth-expired-desktop.png)
 
 这里的 owner confirmation 只适用于此处展示的渲染 UI，不代表端到端 backend integration 或 deployment readiness。
 
