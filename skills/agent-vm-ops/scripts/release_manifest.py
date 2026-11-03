@@ -155,13 +155,15 @@ PRODUCT_UNIT_EXEC_START = {
     "agent-vm-native.service": GO_UNIT_EXEC_START["agent-vm-native.service"],
     "agent-vm-native@.service": GO_UNIT_EXEC_START["agent-vm-native@.service"],
     "agent-vm-deployd.service": GO_UNIT_EXEC_START["agent-vm-deployd.service"],
-    "agent-vm-web.service": "ExecStart=/opt/agent-vm-native/bin/agent-vm-control web --config /etc/agent-vm-native/web.json",
 }
 PRODUCT_UNIT_CONTENT_SHA256 = {
     "agent-vm-native.service": GO_UNIT_CONTENT_SHA256["agent-vm-native.service"],
     "agent-vm-native@.service": GO_UNIT_CONTENT_SHA256["agent-vm-native@.service"],
     "agent-vm-deployd.service": GO_UNIT_CONTENT_SHA256["agent-vm-deployd.service"],
-    "agent-vm-web.service": "50eecb2b8dd88f0532b4546fb5555e069f3ef557e9228d45ff84e56e6a356d0d",
+}
+HISTORICAL_PRODUCT_UNIT_EXEC_START = {
+    **PRODUCT_UNIT_EXEC_START,
+    "agent-vm-web.service": "ExecStart=/opt/agent-vm-native/bin/agent-vm-control web --config /etc/agent-vm-native/web.json",
 }
 HISTORICAL_GO_UNIT_CONTENT_SHA256 = {
     "agent-vm-native.service": (
@@ -201,8 +203,9 @@ GO_FIXED_ARTIFACTS = frozenset({
     ("unit:agent-vm-deployd.service", "systemd/agent-vm-deployd.service", "unit", 0o644),
 })
 
-# Format 3 remains a read-only product format. Format 4 adds the management
-# Web package and the state capability declaration.
+# Format 3 remains a read-only product format. Format 4 adds the resident
+# management API and the state capability declaration. The standalone Web
+# unit remains accepted only when re-verifying an older retained release.
 LEGACY_PRODUCT_MANIFEST_FORMAT = 3
 PRODUCT_MANIFEST_FORMAT = 4
 STATE_CAPABILITY_MARKERS = (
@@ -235,6 +238,9 @@ PRODUCT_LINUX_LEGACY_ARTIFACTS = frozenset({
 })
 PRODUCT_LINUX_ARTIFACTS = frozenset({
     *GO_FIXED_ARTIFACTS,
+})
+HISTORICAL_PRODUCT_LINUX_ARTIFACTS = frozenset({
+    *PRODUCT_LINUX_ARTIFACTS,
     ("unit:agent-vm-web.service", "systemd/agent-vm-web.service", "unit", 0o644),
     ("web-config-example", "config/agent-vm-web.json.example", "support", 0o640),
     ("web-assets-manifest", "web-assets.manifest.json", "support", 0o644),
@@ -691,7 +697,15 @@ def validate_product_manifest(
 
     raw_artifacts = root["artifacts"]
     expected_artifacts = PRODUCT_CLIENT_ARTIFACTS if target["os"] == "source" else (PRODUCT_LINUX_LEGACY_ARTIFACTS if format_value == LEGACY_PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_ARTIFACTS)
-    if not isinstance(raw_artifacts, list) or len(raw_artifacts) != len(expected_artifacts):
+    historical_artifacts = (
+        HISTORICAL_PRODUCT_LINUX_ARTIFACTS
+        if allow_historical_web_config_mode and format_value == PRODUCT_MANIFEST_FORMAT and target["os"] == "linux"
+        else None
+    )
+    allowed_lengths = {len(expected_artifacts)}
+    if historical_artifacts is not None:
+        allowed_lengths.add(len(historical_artifacts))
+    if not isinstance(raw_artifacts, list) or len(raw_artifacts) not in allowed_lengths:
         raise _error("manifest_artifact_set_invalid", "product artifact set is incomplete")
     artifacts: list[dict[str, Any]] = []
     names: set[str] = set()
@@ -710,8 +724,9 @@ def validate_product_manifest(
         and format_value == PRODUCT_MANIFEST_FORMAT
         and target["os"] == "linux"
     ):
+        accepted_shapes.add(frozenset(HISTORICAL_PRODUCT_LINUX_ARTIFACTS))
         accepted_shapes.add(frozenset({
-            *expected_artifacts,
+            *HISTORICAL_PRODUCT_LINUX_ARTIFACTS,
             ("web-config-example", "config/agent-vm-web.json.example", "support", 0o644),
         } - {("web-config-example", "config/agent-vm-web.json.example", "support", 0o640)}))
     if frozenset(actual_shape) not in accepted_shapes:

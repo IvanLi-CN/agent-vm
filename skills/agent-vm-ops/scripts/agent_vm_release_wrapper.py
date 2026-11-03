@@ -44,12 +44,14 @@ try:
         GO_UNIT_CONTENT_SHA256,
         HISTORICAL_GO_UNIT_CONTENT_SHA256,
         HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
+        HISTORICAL_PRODUCT_UNIT_EXEC_START,
         GO_UNIT_EXEC_START,
         LEGACY_PRODUCT_MANIFEST_FORMAT,
         PRODUCT_MANIFEST_FORMAT,
         STATE_CAPABILITY_MARKERS,
         PRODUCT_CLIENT_ARTIFACTS,
         PRODUCT_LINUX_ARTIFACTS,
+        HISTORICAL_PRODUCT_LINUX_ARTIFACTS,
         PRODUCT_LINUX_LEGACY_ARTIFACTS,
         PRODUCT_UNIT_CONTENT_SHA256,
         PRODUCT_UNIT_EXEC_START,
@@ -77,12 +79,14 @@ except ModuleNotFoundError:
         GO_UNIT_CONTENT_SHA256,
         HISTORICAL_GO_UNIT_CONTENT_SHA256,
         HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
+        HISTORICAL_PRODUCT_UNIT_EXEC_START,
         GO_UNIT_EXEC_START,
         LEGACY_PRODUCT_MANIFEST_FORMAT,
         PRODUCT_MANIFEST_FORMAT,
         STATE_CAPABILITY_MARKERS,
         PRODUCT_CLIENT_ARTIFACTS,
         PRODUCT_LINUX_ARTIFACTS,
+        HISTORICAL_PRODUCT_LINUX_ARTIFACTS,
         PRODUCT_LINUX_LEGACY_ARTIFACTS,
         PRODUCT_UNIT_CONTENT_SHA256,
         PRODUCT_UNIT_EXEC_START,
@@ -557,6 +561,8 @@ def _require_owned_regular_modes(path: Path, owner_uid: int, modes: tuple[int, .
 def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_historical_content: bool = False) -> None:
     if _is_product_manifest(manifest):
         expected_units = PRODUCT_UNIT_EXEC_START if manifest["format"] == PRODUCT_MANIFEST_FORMAT else {"agent-vm-native.service": PRODUCT_UNIT_EXEC_START["agent-vm-native.service"]}
+        if allow_historical_content and manifest["format"] == PRODUCT_MANIFEST_FORMAT:
+            expected_units = HISTORICAL_PRODUCT_UNIT_EXEC_START
         expected_hashes = PRODUCT_UNIT_CONTENT_SHA256
         historical_hashes = HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256
         for item in manifest["artifacts"]:
@@ -570,9 +576,13 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_hist
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 _fail("unit_unverified", f"unit cannot be read: {name}")
-            accepted_hashes = {expected_hashes[name]}
+            accepted_hashes = set()
+            if name in expected_hashes:
+                accepted_hashes.add(expected_hashes[name])
             if allow_historical_content and name in historical_hashes:
                 accepted_hashes.update(historical_hashes[name])
+            if not accepted_hashes:
+                _fail("unit_unverified", f"product unit has no fixed content policy: {name}")
             if sha256_file(path) not in accepted_hashes:
                 _fail("unit_unverified", f"unit bytes differ from the fixed product policy: {name}")
             if expected_units[name] not in content or "ExecStart=" not in content:
@@ -646,6 +656,12 @@ def _verify_fixed_artifacts(
     declared = {(item["role"], item["path"]) for item in manifest["artifacts"]}
     if _is_product_manifest(manifest):
         expected_values = PRODUCT_LINUX_ARTIFACTS if manifest["format"] == PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_LEGACY_ARTIFACTS
+        if (
+            allow_historical_web_config_mode
+            and manifest["format"] == PRODUCT_MANIFEST_FORMAT
+            and declared == {(role, path) for _, path, role, _ in HISTORICAL_PRODUCT_LINUX_ARTIFACTS}
+        ):
+            expected_values = HISTORICAL_PRODUCT_LINUX_ARTIFACTS
         expected = {(role, path) for _, path, role, _ in expected_values}
         if declared != expected:
             _fail("artifact_unverified", "manifest artifact set differs from the fixed product release allowlist", {"expected": sorted(expected), "actual": sorted(declared)})
@@ -1281,21 +1297,6 @@ def _deactivate_web_runtime() -> None:
     _systemctl("disable", "agent-vm-web.service", allow_missing=True)
 
 
-def _unit_is_enabled(unit: str) -> bool:
-    """Capture whether a unit was enabled before a dependency restart."""
-    try:
-        process = subprocess.run(
-            ["systemctl", "is-enabled", "--quiet", unit],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        _fail("activation_failed", f"systemd enabled-state check could not be verified: {unit}")
-    return process.returncode == 0
-
-
 def _activate_go_runtime(
     config: Mapping[str, Any] | None = None,
     *,
@@ -1333,20 +1334,11 @@ def _activate_go_runtime(
 
 def _activate_product_runtime(
     manifest: Mapping[str, Any],
-    *,
-    web_was_enabled: bool | None = None,
 ) -> None:
-    web_enabled = manifest.get("format") == PRODUCT_MANIFEST_FORMAT
-    if web_enabled and web_was_enabled is None:
-        web_was_enabled = _unit_is_enabled("agent-vm-web.service")
-    # Product format-4 keeps the existing management compatibility path. The
-    # blue-green controller is activated only for format-2 native releases;
-    # starting Deployd here would also pull the retired Web unit's singleton
-    # native service into the same host and create a third scheduler.
-    _activate_go_runtime(web_enabled=web_enabled, deployd_enabled=False)
-    if web_was_enabled:
-        # Requires=agent-vm-native.service stops Web during native restart.
-        _systemctl("start", "agent-vm-web.service", allow_missing=True)
+    # The unified management API is served by the resident Go control process.
+    # The standalone Web unit is retired and must never be restored by a
+    # product activation or rollback.
+    _activate_go_runtime(web_enabled=False, deployd_enabled=False)
 
 
 def _activate_legacy_runtime() -> None:
@@ -1374,11 +1366,7 @@ def _restore_runtime_for_release(config: Mapping[str, Any], current: Path | None
         allow_historical_state_compatibility=True,
     )
     if _is_product_manifest(manifest):
-        snapshot = record.get("web_unit_enabled")
-        _activate_product_runtime(
-            manifest,
-            web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
-        )
+        _activate_product_runtime(manifest)
     elif _is_go_manifest(manifest):
         _activate_go_runtime(config, deployd_enabled=True)
     else:
@@ -1439,7 +1427,7 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
 
 
 def _install_product_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
-    """Install the complete format-4 product without replacing live Web config."""
+    """Install the format-4 product and retire the standalone Web artifacts."""
     owner_uid = int(config["owner_uid"])
     bundle_root = Path(config["control_path"]).parent
     expected_values = PRODUCT_LINUX_ARTIFACTS if manifest["format"] == PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_LEGACY_ARTIFACTS
@@ -1473,7 +1461,7 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
                 _fail("activation_unverified", "product control artifact path is not fixed")
             installed_controls.add(item["path"])
         elif item["role"] == "unit":
-            if item["path"] not in {"systemd/agent-vm-native.service", "systemd/agent-vm-native@.service", "systemd/agent-vm-deployd.service", "systemd/agent-vm-web.service"}:
+            if item["path"] not in {"systemd/agent-vm-native.service", "systemd/agent-vm-native@.service", "systemd/agent-vm-deployd.service"}:
                 _fail("activation_unverified", "product unit artifact path is not fixed")
             name = Path(item["path"]).name
             _copy_atomic(source, Path(config["unit_dir"]) / name, owner_uid, item["mode"])
@@ -1493,23 +1481,22 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
                 _fsync_directory(retired.parent, "activation_failed")
             except OSError:
                 _fail("activation_failed", f"cannot retire the exact old unit: {name}")
-    if manifest["format"] == LEGACY_PRODUCT_MANIFEST_FORMAT:
-        for target in (
-            Path(config["unit_dir"]) / "agent-vm-web.service",
-            bundle_root / "systemd" / "agent-vm-web.service",
-            bundle_root / "config" / "agent-vm-web.json.example",
-            bundle_root / "web-assets.manifest.json",
-        ):
-            if target.exists() or target.is_symlink():
-                if target.name == "agent-vm-web.json.example":
-                    _require_owned_regular_modes(target, owner_uid, (0o640, 0o644))
-                else:
-                    _require_owned_regular(target, owner_uid, 0o644)
-                try:
-                    target.unlink()
-                    _fsync_directory(target.parent, "activation_failed")
-                except OSError:
-                    _fail("activation_failed", f"cannot retire the exact Web artifact: {target.name}")
+    for target in (
+        Path(config["unit_dir"]) / "agent-vm-web.service",
+        bundle_root / "systemd" / "agent-vm-web.service",
+        bundle_root / "config" / "agent-vm-web.json.example",
+        bundle_root / "web-assets.manifest.json",
+    ):
+        if target.exists() or target.is_symlink():
+            if target.name == "agent-vm-web.json.example":
+                _require_owned_regular_modes(target, owner_uid, (0o640, 0o644))
+            else:
+                _require_owned_regular(target, owner_uid, 0o644)
+            try:
+                target.unlink()
+                _fsync_directory(target.parent, "activation_failed")
+            except OSError:
+                _fail("activation_failed", f"cannot retire the exact Web artifact: {target.name}")
     manifest_source = release_root / MANIFEST_NAME
     _require_owned_regular(manifest_source, owner_uid, 0o644)
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
@@ -1651,9 +1638,6 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _verify_retained_release(config, old_current)
     if old_previous is not None:
         _verify_retained_release(config, old_previous)
-    web_unit_enabled = None
-    if _is_product_manifest(candidate_manifest) or _is_go_manifest(candidate_manifest):
-        web_unit_enabled = _unit_is_enabled("agent-vm-web.service")
     _mkdir_private(release_root, 0o755)
     release_dir = release_root / release_id
     if release_dir.exists():
@@ -1687,7 +1671,6 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         "activated": False,
         "activation_phase": "prepared",
         "rollback_attempts": 0,
-        "web_unit_enabled": web_unit_enabled,
     }
     _write_json(activation_path, record)
     runtime_switch_attempted = False
@@ -1708,7 +1691,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _write_json(activation_path, record)
         if _is_product_manifest(manifest):
             runtime_switch_attempted = True
-            _activate_product_runtime(manifest, web_was_enabled=web_unit_enabled)
+            _activate_product_runtime(manifest)
             record["activation_phase"] = "runtime-switched"
             _write_json(activation_path, record)
         elif _is_go_manifest(manifest):
@@ -1772,11 +1755,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 else:
                     assert old_manifest is not None
                     if _is_product_manifest(old_manifest):
-                        snapshot = record.get("web_unit_enabled")
-                        _activate_product_runtime(
-                            old_manifest,
-                            web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
-                        )
+                        _activate_product_runtime(old_manifest)
                     elif _is_go_manifest(old_manifest):
                         _activate_go_runtime(config, deployd_enabled=True)
                     else:

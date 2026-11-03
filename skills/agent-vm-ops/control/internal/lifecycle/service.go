@@ -692,17 +692,19 @@ func (s *Service) WorkerStartAllowed(ctx context.Context, operationID string) er
 	}
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
-	return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
-		worker, _ := response["worker"].(map[string]any)
-		if workerNeedsReconciliation(worker, true) {
-			return errUnresolvedWorker
-		}
-		response["worker"] = map[string]any{
-			"state":           "starting",
-			"start_attempted": true,
-			"prepared_at":     nowString(s.Clock()),
-		}
-		return nil
+	return s.commitMutation(func() error {
+		return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
+			worker, _ := response["worker"].(map[string]any)
+			if workerNeedsReconciliation(worker, true) {
+				return errUnresolvedWorker
+			}
+			response["worker"] = map[string]any{
+				"state":           "starting",
+				"start_attempted": true,
+				"prepared_at":     nowString(s.Clock()),
+			}
+			return nil
+		})
 	})
 }
 
@@ -727,18 +729,20 @@ func (s *Service) updateWorker(ctx context.Context, operationID string, worker m
 	// The bounded background context only covers this small durable update.
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
 	defer cancel()
-	return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
-		if callback != workerCallbackState {
-			if previous, ok := response["worker"].(map[string]any); ok && stringValue(previous["state"]) == "running" {
-				if callback == workerCallbackStarted || callback == workerCallbackStartFailed || !workerIdentityMatches(previous, worker) {
-					// A callback for a new worker must never overwrite an older
-					// identity that has not been reconciled.
-					return errUnresolvedWorker
+	return s.commitMutation(func() error {
+		return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
+			if callback != workerCallbackState {
+				if previous, ok := response["worker"].(map[string]any); ok && stringValue(previous["state"]) == "running" {
+					if callback == workerCallbackStarted || callback == workerCallbackStartFailed || !workerIdentityMatches(previous, worker) {
+						// A callback for a new worker must never overwrite an older
+						// identity that has not been reconciled.
+						return errUnresolvedWorker
+					}
 				}
 			}
-		}
-		response["worker"] = worker
-		return nil
+			response["worker"] = worker
+			return nil
+		})
 	})
 }
 
@@ -926,12 +930,14 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 			if !eligible {
 				continue
 			}
-			if err := s.Store.UpdateOperationResponse(ctx, operation.OperationID, func(response map[string]any) error {
-				if stringValue(response["outcome"]) != "pending" || boolValue(response["_recovery_after_clear_attempted"]) {
-					return errUnresolvedWorker
-				}
-				response["_recovery_after_clear_attempted"] = true
-				return nil
+			if err := s.commitMutation(func() error {
+				return s.Store.UpdateOperationResponse(ctx, operation.OperationID, func(response map[string]any) error {
+					if stringValue(response["outcome"]) != "pending" || boolValue(response["_recovery_after_clear_attempted"]) {
+						return errUnresolvedWorker
+					}
+					response["_recovery_after_clear_attempted"] = true
+					return nil
+				})
 			}); err != nil {
 				return s.sqliteError(err)
 			}
@@ -953,7 +959,9 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 				continue
 			}
 		}
-		if err := s.Store.MarkOperationRecoveryAttempt(ctx, operation.OperationID); err != nil {
+		if err := s.commitMutation(func() error {
+			return s.Store.MarkOperationRecoveryAttempt(ctx, operation.OperationID)
+		}); err != nil {
 			if firstErr == nil {
 				firstErr = s.sqliteError(err)
 			}
@@ -2201,10 +2209,12 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		return nil, s.sqliteError(err)
 	}
 	if operationID := native.WorkerOperationID(ctx); operationID != "" {
-		if err := s.Store.UpdateOperationResponse(ctx, operationID, func(response map[string]any) error {
-			response["_task_id"] = task.TaskID
-			response["_task_generation"] = task.Generation
-			return nil
+		if err := s.commitMutation(func() error {
+			return s.Store.UpdateOperationResponse(ctx, operationID, func(response map[string]any) error {
+				response["_task_id"] = task.TaskID
+				response["_task_generation"] = task.Generation
+				return nil
+			})
 		}); err != nil {
 			return nil, s.sqliteError(err)
 		}

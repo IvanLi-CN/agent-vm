@@ -317,17 +317,17 @@ class WrapperTests(unittest.TestCase):
             WRAPPER._activate_go_runtime(self.loaded, deployd_enabled=True)
         self.assertEqual(failure.exception.code, "activation_unverified")
 
-    def test_product_runtime_restores_an_enabled_web_unit_after_native_restart(self):
+    def test_product_runtime_retire_web_unit_and_keep_resident_control(self):
         with mock.patch.object(
             WRAPPER.subprocess, "run",
             return_value=subprocess.CompletedProcess([], 0, b"", b""),
         ) as run:
             WRAPPER._activate_product_runtime({"format": MANIFEST.PRODUCT_MANIFEST_FORMAT})
         commands = [call.args[0] for call in run.call_args_list]
-        self.assertIn(["systemctl", "is-enabled", "--quiet", "agent-vm-web.service"], commands)
         native_restart = commands.index(["systemctl", "restart", "agent-vm-native.service"])
-        web_start = commands.index(["systemctl", "start", "agent-vm-web.service"])
-        self.assertLess(native_restart, web_start)
+        self.assertIn(["systemctl", "stop", "agent-vm-web.service"], commands)
+        self.assertNotIn(["systemctl", "start", "agent-vm-web.service"], commands)
+        self.assertGreater(native_restart, commands.index(["systemctl", "disable", "agent-vm-web.service"]))
 
     def test_product_runtime_does_not_start_deployd_alongside_legacy_web(self):
         with mock.patch.object(
@@ -339,32 +339,6 @@ class WrapperTests(unittest.TestCase):
         commands = [call.args[0] for call in run.call_args_list]
         self.assertNotIn(["systemctl", "enable", "agent-vm-deployd.service"], commands)
         self.assertIn(["systemctl", "restart", "agent-vm-native.service"], commands)
-
-    def test_product_runtime_does_not_start_a_disabled_web_unit(self):
-        def run(command, **kwargs):
-            if command == ["systemctl", "is-enabled", "--quiet", "agent-vm-web.service"]:
-                return subprocess.CompletedProcess(command, 1, b"", b"")
-            return subprocess.CompletedProcess(command, 0, b"", b"")
-
-        with mock.patch.object(WRAPPER.subprocess, "run", side_effect=run) as process:
-            WRAPPER._activate_product_runtime({"format": MANIFEST.PRODUCT_MANIFEST_FORMAT})
-        commands = [call.args[0] for call in process.call_args_list]
-        self.assertNotIn(["systemctl", "start", "agent-vm-web.service"], commands)
-
-    def test_product_runtime_uses_the_activation_snapshot_after_web_was_disabled(self):
-        def run(command, **kwargs):
-            if command == ["systemctl", "is-enabled", "--quiet", "agent-vm-web.service"]:
-                return subprocess.CompletedProcess(command, 1, b"", b"")
-            return subprocess.CompletedProcess(command, 0, b"", b"")
-
-        with mock.patch.object(WRAPPER.subprocess, "run", side_effect=run) as process:
-            WRAPPER._activate_product_runtime(
-                {"format": MANIFEST.PRODUCT_MANIFEST_FORMAT},
-                web_was_enabled=True,
-            )
-        commands = [call.args[0] for call in process.call_args_list]
-        self.assertNotIn(["systemctl", "is-enabled", "--quiet", "agent-vm-web.service"], commands)
-        self.assertIn(["systemctl", "start", "agent-vm-web.service"], commands)
 
     def test_product_bundle_targets_use_the_control_bundle_root(self):
         targets = WRAPPER._activation_targets(self.loaded)

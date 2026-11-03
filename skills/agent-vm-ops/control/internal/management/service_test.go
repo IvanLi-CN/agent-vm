@@ -1093,6 +1093,51 @@ func TestManagementFinalJournalCommitRequiresControllerLease(t *testing.T) {
 	}
 }
 
+func TestImageMutationReturnsTransitionCommitError(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	fingerprint := strings.Repeat("d", 64)
+	if err := store.InsertManagedImage(context.Background(), state.ManagedImage{
+		Fingerprint:  fingerprint,
+		Architecture: "x86_64",
+		InstanceType: "container",
+		SourceKind:   "local_upload",
+		State:        "available",
+		Integrity:    "passed",
+		Suitability:  "passed",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, Options{})
+	transitionErr := errors.New("transition commit failed")
+	commits := 0
+	service.SetMutationCommit(func(commit func() error) error {
+		commits++
+		if commits == 2 {
+			return transitionErr
+		}
+		return commit()
+	})
+
+	operation, err := service.SelectDefault(context.Background(), "transition-commit-failure", "admin", "test transition failure", fingerprint, "image-selection:revision-1")
+	if !errors.Is(err, transitionErr) {
+		t.Fatalf("transition error = %v, want %v", err, transitionErr)
+	}
+	if operation != nil {
+		t.Fatalf("transition failure returned operation: %#v", operation)
+	}
+	current, err := service.GetOperation(context.Background(), "transition-commit-failure")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current == nil || current.Status != "queued" {
+		t.Fatalf("transition failure journal = %#v, want queued", current)
+	}
+}
+
 func TestRecoverPendingOperationsWaitsForPeerOperationLock(t *testing.T) {
 	root := t.TempDir()
 	path := filepath.Join(root, "state.sqlite3")

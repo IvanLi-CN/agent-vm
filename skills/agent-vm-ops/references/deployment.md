@@ -17,9 +17,9 @@
 | 兼容 bridge | `/opt/agent-vm-native/agent_vm_control_bridge.ts`；format-1 release 可以保留旧版 Bun controller |
 | 控制解释器 | format 2 使用 Go binary；root-owned `/usr/local/bin/bun` 只对 format-1 Bun release 和 client package 保持必需 |
 | 配置 | `/etc/agent-vm-native/config.json` 中由 root-owned 的 JSON |
-| Web 配置 | 启用管理功能时，`/etc/agent-vm-native/web.json` 中由 root-owned 且 `agent-vm-web` group-readable 的 JSON |
+| 管理配置 | 启用管理功能时，使用 `/etc/agent-vm-native/config.json` 中由 root-owned 保护的管理配置；管理 API 由常驻 Go 控制服务提供 |
 | 持久状态 | 配置的本地 state database 和 lock directory |
-| 旧版原生 unit | `agent-vm-native.service` 和 format 4 可选的 `agent-vm-web.service`；format-1 timer unit 仅在兼容支持期间保留 |
+| 旧版原生 unit | `agent-vm-native.service`；format-1 timer unit 仅在兼容支持期间保留，已退役的 `agent-vm-web.service` 不再属于当前发布 |
 | 本机客户端 | 完整的八文件 Bun package 和带依赖 hash 的 `client-release.json`；受保护的 session state 位于运维者选择的 XDG paths |
 
 部署通过复制或派生的 configuration 提供 control alias、Incus project/profile/image、network ACL、control address、guest address pool、host port range、storage path、state database 和 timer directory。
@@ -28,9 +28,9 @@
 安装前必须替换 placeholder；缺失或无效值必须 fail closed。
 
 启用管理功能时，必须在启动 unit 前创建专用的 `agent-vm-web` system group。
-Web configuration 必须以 `root:agent-vm-web`、mode `0640` 安装，所在 directory 保持为 `root:agent-vm-web`、mode `0750`。
-Web unit 启动时会重新应用这些固定的 metadata permissions；它不会授予 Web UID 访问 primary control configuration、SQLite state 或 generic Incus administration 的权限。
-native unit 以 root 运行，并将 `agent-vm-web` 作为 effective group，使专用 authority socket 使用 `root:agent-vm-web`、mode `0660`，位于 `root:agent-vm-web`、mode `0750` 的 runtime directory 中。
+该 group 只用于保护控制 socket、槽位 socket 和 Caddy 的最小访问边界；不存在独立的 Web 服务、Web UID 或 `web.json` 启动配置。
+native、槽位和 Deployd unit 按各自的固定 unit 权限运行，管理 API 由常驻 Go 控制服务提供。
+专用 authority socket 使用 `root:agent-vm-web`、mode `0660`，位于 `root:agent-vm-web`、mode `0750` 的 runtime directory 中。
 
 与部署无关的 Incus project/profile baseline 及其默认只读的 initializer 见[初始化参考（initialization reference）](initialization.md)。
 只能在明确授权且 admission drain 已生效的维护任务中应用它；日常请求绝不修改 project policy。

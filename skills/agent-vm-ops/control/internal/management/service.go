@@ -1392,7 +1392,7 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 		running, claimed, commitErr = s.Store.TransitionManagementOperationUnlessDraining(ctx, operationID, "queued", "native_mutation", "running")
 		return commitErr
 	}); transitionErr != nil {
-		return nil, err
+		return nil, transitionErr
 	}
 	if !claimed {
 		return running, nil
