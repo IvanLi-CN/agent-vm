@@ -1000,7 +1000,7 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 			continue
 		}
 		response["_request_digest"] = responseDigest
-		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil && firstErr == nil {
+		if err := s.recordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil && firstErr == nil {
 			firstErr = s.sqliteError(err)
 		}
 	}
@@ -1429,6 +1429,9 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 	if !s.mutationAllowed() {
 		return protocol.NewError("controller_lease_required", "controller lease is required for startup reconciliation", map[string]any{"admission_ready": false})
 	}
+	mutationCtx, stopMutationWatch, mutationLost := s.mutationContext(ctx)
+	defer stopMutationWatch()
+	ctx = mutationCtx
 	// Startup recovery may inspect and stop a pending native worker. Share the
 	// release-sensitive drain boundary with normal lifecycle actions so one
 	// slot cannot recover a worker that another slot is still starting.
@@ -1515,6 +1518,9 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 	}
 	if blockingPending > 0 {
 		return protocol.NewError("startup_reconcile_required", "pending operations require explicit recovery before admission", map[string]any{"count": blockingPending, "admission_ready": false})
+	}
+	if mutationLost() || !s.mutationAllowed() {
+		return controllerLeaseLostError(nil)
 	}
 	return s.verifyResidentNativeState(ctx)
 }
@@ -1641,7 +1647,7 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 		response := cloneMap(item.operation.Response)
 		response["outcome"] = "error"
 		response["error"] = protocol.NewError("operation_outcome_unknown", "the original outcome is unknown; a later operation superseded its lease", map[string]any{"outcome_verified": false, "lease_state_verified": true, "superseded_by_operation_id": item.witness})
-		if err := s.Store.RecordOperation(ctx, item.operation.OperationID, item.operation.Action, item.operation.SessionID, item.operation.Generation, response); err != nil {
+		if err := s.recordOperation(ctx, item.operation.OperationID, item.operation.Action, item.operation.SessionID, item.operation.Generation, response); err != nil {
 			return s.sqliteError(err)
 		}
 	}
@@ -1785,7 +1791,7 @@ func (s *Service) reconcileOrphanedAcquire(ctx context.Context, operationID stri
 			}),
 			"_request_digest": digest,
 		}
-		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+		if err := s.recordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
 			return s.sqliteError(err)
 		}
 		return nil
@@ -1810,7 +1816,7 @@ func (s *Service) reconcileOrphanedAcquire(ctx context.Context, operationID stri
 		}),
 		"_request_digest": digest,
 	}
-	if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+	if err := s.recordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
 		return s.sqliteError(err)
 	}
 	return nil
@@ -1903,7 +1909,7 @@ func (s *Service) reconcileLegacyCachedStarts(ctx context.Context, operation *st
 	}
 	for _, candidate := range group {
 		response := map[string]any{"outcome": "error", "error": protocol.NewError("startup_reconcile_required", "acquire ended before allocating or advancing a task generation", map[string]any{"outcome_verified": true}), "_request_digest": candidate.Response["_request_digest"]}
-		if err := s.Store.RecordOperation(ctx, candidate.OperationID, candidate.Action, candidate.SessionID, candidate.Generation, response); err != nil {
+		if err := s.recordOperation(ctx, candidate.OperationID, candidate.Action, candidate.SessionID, candidate.Generation, response); err != nil {
 			return s.sqliteError(err)
 		}
 	}
@@ -1991,7 +1997,13 @@ func (s *Service) recordError(ctx context.Context, request protocol.Request, cau
 	control := protocol.AsError(cause)
 	digest, _ := protocol.Digest(request)
 	response := map[string]any{"outcome": "error", "error": control, "_request_digest": digest}
-	return s.Store.RecordOperation(ctx, op, stringValue(request["action"]), optionalString(request["session_id"]), generationPointer(intValue(request["generation"]), request["generation"] != nil), response)
+	return s.recordOperation(ctx, op, stringValue(request["action"]), optionalString(request["session_id"]), generationPointer(intValue(request["generation"]), request["generation"] != nil), response)
+}
+
+func (s *Service) recordOperation(ctx context.Context, operationID, action string, sessionID *string, generation *int64, response map[string]any) error {
+	return s.commitMutation(func() error {
+		return s.Store.RecordOperation(ctx, operationID, action, sessionID, generation, response)
+	})
 }
 
 func (s *Service) recordAudit(ctx context.Context, request protocol.Request, outcome string, cause error, response map[string]any) error {
@@ -2558,7 +2570,7 @@ func (s *Service) cancelPendingAcquireOperations(ctx context.Context, task *stat
 			}),
 			"_request_digest": digest,
 		}
-		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+		if err := s.recordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
 			return s.sqliteError(err)
 		}
 	}
@@ -3728,7 +3740,7 @@ func (s *Service) reconcilePendingAbsentDestroyOne(ctx context.Context, operatio
 			return err
 		}
 	}
-	if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, terminal); err != nil {
+	if err := s.recordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, terminal); err != nil {
 		return s.sqliteError(err)
 	}
 	return nil
@@ -3852,7 +3864,7 @@ func (s *Service) finalizePendingCleanup(ctx context.Context, session string, ge
 		if digest, ok := operation.Response["_request_digest"]; ok {
 			response["_request_digest"] = digest
 		}
-		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
+		if err := s.recordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
 			return s.sqliteError(err)
 		}
 	}

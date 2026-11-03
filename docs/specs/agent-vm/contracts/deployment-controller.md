@@ -154,10 +154,16 @@ timer reconciliation、age-GC 和 scheduler-driven native-mutation 循环前，
 standby 或 retiring 槽位可以提供受保护的就绪状态和只读观测，
 但没有该 role 时 MUST NOT 执行 `StartupReconcile`、`timer-reconcile`、
 `timer-age-gc` 或任何等价的后台 native mutation。
+管理台的镜像导入、镜像选择或删除、VM action、maintenance action
+以及 management operation recovery 同样属于 controller-gated mutation；
+没有该 role 时只能提供管理查询，不能 claim operation、调用 native backend
+或写入终态 journal。
 role 丢失时，必须先 fence 这些循环，槽位才能进入 retiring 或 standby。
 controller role 发生变化时，正在执行的 native mutation 必须收到取消信号。
-如果底层 effect 不能确认已经停止，操作必须保持 pending/unknown，
-不能写入 success。
+如果底层 effect 不能确认已经停止，生命周期或管理操作都必须保持
+pending/unknown，不能写入 success。
+槽位启动后的管理 operation recovery 必须在 controller role 授予后执行，
+不能在 role 尚未建立时由 standby 自行恢复。
 当 Deployd 无法确认观测、部署状态或角色通道时，必须先对两个槽位执行本地
 hard-fence：清除槽位的 controller role 和 traffic role。
 如果角色 socket 不可用，则停止对应 systemd 单元作为兜底。

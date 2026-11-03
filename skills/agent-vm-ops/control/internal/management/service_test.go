@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
@@ -968,6 +969,127 @@ func TestMaintenanceDoesNotBecomeStaleFromItsOwnJournalWrites(t *testing.T) {
 	}
 	if operation.Status != "succeeded" {
 		t.Fatalf("operation = %#v", operation)
+	}
+}
+
+func TestManagementMutationRequiresControllerLease(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	backend := &fakeActionBackend{}
+	gate := controllerrole.New("blue", time.Now)
+	service := New(store, Options{Actions: backend, CurrentSystemVersion: func(context.Context) (string, error) { return "system:initial", nil }})
+	service.SetMutationGate(gate.Valid)
+
+	_, err = service.ExecuteMaintenance(context.Background(), MaintenanceRequest{OperationID: "standby-maintenance", Actor: "admin", Reason: "standby", TargetVersion: "system:initial", Action: "reconcile"})
+	if control := protocol.AsError(err); control.Code != "controller_lease_required" {
+		t.Fatalf("standby mutation error = %v, want controller_lease_required", err)
+	}
+	if backend.maintenanceCalls != 0 {
+		t.Fatalf("standby invoked maintenance backend: %#v", backend)
+	}
+	operation, err := service.GetOperation(context.Background(), "standby-maintenance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation != nil {
+		t.Fatalf("standby claimed management operation: %#v", operation)
+	}
+}
+
+func TestManagementMutationBecomesUnverifiedWhenLeaseIsFenced(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	backend := &blockingActionBackend{entered: make(chan struct{}), release: make(chan struct{})}
+	now := time.Now().UTC()
+	gate := controllerrole.New("blue", func() time.Time { return now })
+	if err := gate.Grant(controllerrole.Lease{Slot: "blue", Term: 1, LeaseID: "management-lease", Nonce: "management-nonce", Expiry: now.Add(time.Minute), Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, Options{Actions: backend, CurrentSystemVersion: func(context.Context) (string, error) { return "system:initial", nil }})
+	service.SetMutationGate(gate.Valid)
+	service.SetMutationFence(gate.Changes)
+	service.SetMutationCommit(gate.WithValid)
+	request := MaintenanceRequest{OperationID: "fenced-maintenance", Actor: "admin", Reason: "fence", TargetVersion: "system:initial", Action: "reconcile"}
+	done := make(chan struct{})
+	var operation *state.ManagementOperation
+	var executionErr error
+	go func() {
+		operation, executionErr = service.ExecuteMaintenance(context.Background(), request)
+		close(done)
+	}()
+	select {
+	case <-backend.entered:
+	case <-time.After(time.Second):
+		t.Fatal("maintenance backend did not start")
+	}
+	gate.Fence()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fenced maintenance did not stop")
+	}
+	if control := protocol.AsError(executionErr); control.Code != "state_unverified" {
+		t.Fatalf("fenced maintenance error = %v, want state_unverified", executionErr)
+	}
+	if operation != nil {
+		t.Fatalf("fenced maintenance returned a finalized operation: %#v", operation)
+	}
+	recovered, err := service.GetOperation(context.Background(), request.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || recovered.Status != "running" {
+		t.Fatalf("fenced maintenance journal = %#v, want running", recovered)
+	}
+}
+
+func TestManagementFinalJournalCommitRequiresControllerLease(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, Options{TrustedImageSourceIDs: []string{"approved"}})
+	request := ImportRequest{OperationID: "fenced-final-commit", Actor: "admin", Reason: "fence", TargetVersion: "image-catalog:revision-1", VersionLabel: "test", Source: ImportSource{Kind: "trusted_remote", SourceID: "approved", ExpectedFingerprint: strings.Repeat("a", 64)}}
+	operation, err := service.StartImageImport(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	running, claimed, err := store.TransitionManagementOperation(context.Background(), operation.OperationID, "queued", "image_import", "running")
+	if err != nil || !claimed {
+		t.Fatalf("claim operation: claimed=%v err=%v", claimed, err)
+	}
+	now := time.Now().UTC()
+	gate := controllerrole.New("blue", func() time.Time { return now })
+	if err := gate.Grant(controllerrole.Lease{Slot: "blue", Term: 1, LeaseID: "final-commit-lease", Nonce: "final-commit-nonce", Expiry: now.Add(time.Minute), Generation: 1}); err != nil {
+		t.Fatal(err)
+	}
+	service.SetMutationCommit(func(commit func() error) error {
+		if err := gate.WithValid(commit); err != nil {
+			return controllerLeaseLostError(err)
+		}
+		return nil
+	})
+	gate.Fence()
+	finished, err := service.finishOperation(context.Background(), running, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
+	if control := protocol.AsError(err); control.Code != "state_unverified" {
+		t.Fatalf("fenced final commit error = %v, want state_unverified", err)
+	}
+	if finished != nil {
+		t.Fatalf("fenced final commit returned operation: %#v", finished)
+	}
+	current, err := service.GetOperation(context.Background(), operation.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current == nil || current.Status != "running" {
+		t.Fatalf("fenced final journal = %#v, want running", current)
 	}
 }
 

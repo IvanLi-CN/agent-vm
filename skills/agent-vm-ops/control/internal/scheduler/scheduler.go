@@ -12,6 +12,7 @@ import (
 type Scheduler struct {
 	Service *lifecycle.Service
 	Gate    LeaseGate
+	Startup func(context.Context) error
 	wake    chan struct{}
 }
 
@@ -20,7 +21,14 @@ type LeaseGate interface {
 }
 
 func New(service *lifecycle.Service, gate LeaseGate) *Scheduler {
-	scheduler := &Scheduler{Service: service, Gate: gate, wake: make(chan struct{}, 1)}
+	return NewWithStartup(service, gate, nil)
+}
+
+// NewWithStartup adds controller-gated startup work that must complete before
+// lifecycle admission is marked ready. The callback runs only after the
+// scheduler has observed a valid controller lease.
+func NewWithStartup(service *lifecycle.Service, gate LeaseGate, startup func(context.Context) error) *Scheduler {
+	scheduler := &Scheduler{Service: service, Gate: gate, Startup: startup, wake: make(chan struct{}, 1)}
 	service.SetWake(scheduler.Wake)
 	return scheduler
 }
@@ -54,7 +62,7 @@ func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInter
 				continue
 			}
 			if !scheduler.Service.Ready() {
-				if err := scheduler.Service.StartupReconcile(ctx); err == nil {
+				if err := scheduler.startupReconcile(ctx); err == nil {
 					scheduler.Service.MarkReady()
 				} else {
 					slog.Warn("startup reconcile failed", "error", err)
@@ -77,7 +85,7 @@ func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInter
 				continue
 			}
 			if !scheduler.Service.Ready() {
-				if err := scheduler.Service.StartupReconcile(ctx); err == nil {
+				if err := scheduler.startupReconcile(ctx); err == nil {
 					scheduler.Service.MarkReady()
 				} else {
 					slog.Warn("startup reconcile failed", "error", err)
@@ -89,6 +97,15 @@ func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInter
 			}
 		}
 	}
+}
+
+func (scheduler *Scheduler) startupReconcile(ctx context.Context) error {
+	if scheduler.Startup != nil {
+		if err := scheduler.Startup(ctx); err != nil {
+			return err
+		}
+	}
+	return scheduler.Service.StartupReconcile(ctx)
 }
 
 func (scheduler *Scheduler) controllerLeaseValid() bool {

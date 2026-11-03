@@ -187,9 +187,7 @@ func serve(args []string) error {
 	}
 	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver(), Memory: observe.NewMemoryObserver(), Release: releaseMetadata, LockDir: filepath.Join(cfg.StoragePath, "locks")})
 	roleGate := controllerrole.New(cfg.Slot, time.Now)
-	service.SetMutationGate(roleGate.Valid)
-	service.SetMutationFence(roleGate.Changes)
-	service.SetMutationCommit(func(commit func() error) error {
+	leaseCommit := func(commit func() error) error {
 		err := roleGate.WithValid(commit)
 		if errors.Is(err, controllerrole.ErrLeaseExpired) || errors.Is(err, controllerrole.ErrLeaseMismatch) {
 			return protocol.NewError("state_unverified", "controller lease was lost during mutation", map[string]any{
@@ -199,7 +197,10 @@ func serve(args []string) error {
 			})
 		}
 		return err
-	})
+	}
+	service.SetMutationGate(roleGate.Valid)
+	service.SetMutationFence(roleGate.Changes)
+	service.SetMutationCommit(leaseCommit)
 	imageBackend := management.NewIncusImageBackend(guest, cfg.Management.Upload.StagingPath, cfg.RequiredGuestTools)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -236,9 +237,9 @@ func serve(args []string) error {
 	var managementService *management.Service
 	if cfg.Management.Enabled {
 		managementService = management.New(store, managementOptions)
-		if err := managementService.RecoverPendingOperations(ctx); err != nil {
-			return fmt.Errorf("recover management operations: %w", err)
-		}
+		managementService.SetMutationGate(roleGate.Valid)
+		managementService.SetMutationFence(roleGate.Changes)
+		managementService.SetMutationCommit(leaseCommit)
 	}
 	if cfg.Management.Enabled {
 		authority, authorityErr := webadmin.NewAuthority(webadmin.AuthorityOptions{
@@ -272,7 +273,11 @@ func serve(args []string) error {
 			}
 		}()
 	}
-	schedulerInstance := scheduler.New(service, roleGate)
+	var startup func(context.Context) error
+	if managementService != nil {
+		startup = managementService.RecoverPendingOperations
+	}
+	schedulerInstance := scheduler.NewWithStartup(service, roleGate, startup)
 	slog.Info("agent vm control started", "socket", cfg.Socket, "database_backend", stateBackend(cfg.StateDB), "slot", cfg.Slot, "controller_lease", "fenced")
 	return schedulerInstance.Run(ctx)
 }

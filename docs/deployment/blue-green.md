@@ -108,9 +108,15 @@ Deployd 的 `/metrics` 只输出最近一次已完成的组合快照，不在 sc
 不得让两个槽位共用一个 metrics 目录，
 否则旧槽位和候选槽位可能相互覆盖 snapshot。
 切换期间两个槽位进程可以同时活跃；
-deployd 一次只授予一个槽位运行 scheduler 和 scheduler-driven native mutation 的权限。
+deployd 一次只授予一个槽位运行 scheduler、scheduler-driven native mutation
+和管理台 native mutation 的权限。
 槽位必须先取得该角色，才能运行 startup reconciliation，
 或启用 timer/reconcile/GC 循环；角色丢失时必须先 fence 这些循环。
+镜像导入、镜像目录变更、VM action、maintenance action
+和管理 operation recovery 也必须经过同一个 controller lease。
+standby 可以提供只读管理查询，但不得 claim 管理 operation、调用 native backend
+或提交终态 journal。
+槽位启动后的管理恢复必须等待 controller lease，不能在未授予角色时执行。
 之后 deployd 排空旧槽位，确认在途请求、pending operation、native worker
 和 scheduler work 都已收敛，再停止旧槽位。
 只有重新观测到旧槽位已经停止、目标槽位仍保持 controller role 和 traffic role，事务才能进入 finalize。
