@@ -278,7 +278,7 @@ func composedFreshUntil(sources map[string]SourceObservation, now time.Time) tim
 	var result time.Time
 	for _, source := range sources {
 		if source.FreshUntil.IsZero() {
-			continue
+			return now
 		}
 		if result.IsZero() || source.FreshUntil.Before(result) {
 			result = source.FreshUntil
@@ -347,11 +347,11 @@ func (runtime *HostRuntime) Stage(ctx context.Context, slot, bundle string) erro
 		return err
 	}
 	if err := runtime.systemctl(ctx, "restart", "agent-vm-native@"+slot+".service"); err != nil {
-		return runtime.restoreAfterStageFailure(ctx, slot, err)
+		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, err)
 	}
 	currentProcess, err := runtime.waitSlotIdentity(ctx, slot, previousProcess, previousProcessOK)
 	if err != nil {
-		return runtime.restoreAfterStageFailure(ctx, slot, err)
+		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, err)
 	}
 	if err := runtime.discardStagedBackup(slot); err != nil {
 		return &UncertainError{Cause: fmt.Errorf("stage completed but previous slot backup could not be removed: %w", err)}
@@ -542,7 +542,7 @@ func restoreStagedSlot(root, slot string) error {
 	return syncDirectory(root)
 }
 
-func (runtime *HostRuntime) restoreAfterStageFailure(ctx context.Context, slot string, cause error) error {
+func (runtime *HostRuntime) restoreAfterStageFailure(ctx context.Context, slot string, previousProcess processIdentity, previousProcessOK bool, cause error) error {
 	if err := runtime.systemctl(ctx, "stop", "agent-vm-native@"+slot+".service"); err != nil {
 		return &UncertainError{Cause: fmt.Errorf("stage failed and slot could not be stopped: %w; original error: %v", err, cause)}
 	}
@@ -555,6 +555,9 @@ func (runtime *HostRuntime) restoreAfterStageFailure(ctx context.Context, slot s
 	}
 	if err := runtime.systemctl(ctx, "restart", "agent-vm-native@"+slot+".service"); err != nil {
 		return &UncertainError{Cause: fmt.Errorf("stage failed and restored slot could not be restarted: %w; original error: %v", err, cause)}
+	}
+	if _, err := runtime.waitSlotIdentity(ctx, slot, previousProcess, previousProcessOK); err != nil {
+		return &UncertainError{Cause: fmt.Errorf("stage failed and restored slot did not satisfy its process contract: %w; original error: %v", err, cause)}
 	}
 	return fmt.Errorf("stage failed and previous slot was restored: %w", cause)
 }

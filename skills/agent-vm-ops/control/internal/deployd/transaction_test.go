@@ -16,6 +16,7 @@ type fakeRuntime struct {
 	active                string
 	observations          map[string]SlotObservation
 	failSwitch            bool
+	stageError            error
 	inconsistent          bool
 	identityError         error
 	stateEpoch            string
@@ -59,13 +60,13 @@ func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 	now := time.Unix(100, 0).UTC()
 	sources := map[string]SourceObservation{}
 	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
-		sources[source] = SourceObservation{Up: true, ObservedAt: now}
+		sources[source] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
 	}
 	return RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: runtime.active, ControllerSlot: runtime.active, Consistent: !runtime.inconsistent, Slots: slots, Sources: sources}, nil
 }
 func (runtime *fakeRuntime) Stage(context.Context, string, string) error {
 	runtime.sequence = append(runtime.sequence, "stage")
-	return nil
+	return runtime.stageError
 }
 func (runtime *fakeRuntime) Verify(context.Context, string, string) error {
 	runtime.sequence = append(runtime.sequence, "verify")
@@ -210,6 +211,34 @@ func TestManagerCompletesBlueGreenTransactionWithOneRuntime(t *testing.T) {
 	}
 	if runtime.active != "green" || len(runtime.sequence) < 8 {
 		t.Fatalf("runtime active=%s sequence=%v", runtime.active, runtime.sequence)
+	}
+}
+
+func TestManagerFencesUncertainStageFailure(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{
+		active:     "blue",
+		stageError: &UncertainError{Cause: errors.New("restored process contract was not verified")},
+		observations: map[string]SlotObservation{
+			"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+			"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+		},
+	}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if _, err := manager.Stage(context.Background(), "green", "/tmp/release.tar"); err == nil {
+		t.Fatal("uncertain stage failure unexpectedly succeeded")
+	}
+	transaction, err := database.ListActive(context.Background())
+	if err != nil || len(transaction) != 1 || transaction[0].State != "needs_recovery" || !transaction[0].RecoveryRequired {
+		t.Fatalf("uncertain stage transaction = %#v err=%v", transaction, err)
+	}
+	if !containsSequence(runtime.sequence, "fence") {
+		t.Fatalf("uncertain stage failure did not fence slots: %v", runtime.sequence)
 	}
 }
 

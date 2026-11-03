@@ -55,6 +55,25 @@ func TestValidObservedAtRejectsFutureTimestamp(t *testing.T) {
 	}
 }
 
+func TestValidObservationRejectsMissingSourceFreshness(t *testing.T) {
+	now := time.Now().UTC()
+	sources := map[string]SourceObservation{}
+	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
+		sources[name] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
+	}
+	sources["systemd"] = SourceObservation{Up: true, ObservedAt: now}
+	observation := RuntimeSnapshot{
+		ObservedAt: now,
+		FreshUntil: now.Add(time.Minute),
+		ActiveSlot: "blue",
+		Consistent: true,
+		Sources:    sources,
+	}
+	if validObservation(observation, now) {
+		t.Fatal("observation with missing source freshness was accepted")
+	}
+}
+
 func TestCompareReleaseTreesRejectsStagedTampering(t *testing.T) {
 	expectedRoot := t.TempDir()
 	actualRoot := t.TempDir()

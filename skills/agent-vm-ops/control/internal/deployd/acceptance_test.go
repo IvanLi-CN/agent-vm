@@ -109,7 +109,7 @@ func (runtime *acceptanceRuntime) Observe(context.Context) (RuntimeSnapshot, err
 	}
 	sources := map[string]SourceObservation{}
 	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
-		sources[source] = SourceObservation{Up: true, ObservedAt: now}
+		sources[source] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(30 * time.Second)}
 	}
 	return RuntimeSnapshot{
 		ObservedAt:     now,

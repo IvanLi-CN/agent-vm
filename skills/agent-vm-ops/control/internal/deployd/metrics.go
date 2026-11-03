@@ -43,11 +43,7 @@ func (metrics *Metrics) Render() string {
 	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		observation := metrics.latest.Sources[source]
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_up{source=%s} %d\n", quote(source), boolInt(observation.Up)))
-		freshUntil := observation.FreshUntil
-		if freshUntil.IsZero() {
-			freshUntil = metrics.latest.FreshUntil
-		}
-		fresh := observation.Up && !observation.ObservedAt.IsZero() && !freshUntil.IsZero() && now.Before(freshUntil)
+		fresh := observation.Up && !observation.ObservedAt.IsZero() && !observation.FreshUntil.IsZero() && now.Before(observation.FreshUntil)
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_fresh{source=%s} %d\n", quote(source), boolInt(fresh)))
 	}
 	output.WriteString("# HELP agent_vm_deployd_observation_timestamp_seconds Unix timestamp of the composed observation.\n")
@@ -175,11 +171,7 @@ func composedSnapshotFresh(snapshot RuntimeSnapshot, now time.Time) bool {
 		if !ok || !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) {
 			return false
 		}
-		freshUntil := source.FreshUntil
-		if freshUntil.IsZero() {
-			freshUntil = snapshot.FreshUntil
-		}
-		if !freshUntil.After(now) {
+		if source.FreshUntil.IsZero() || !source.FreshUntil.After(now) {
 			return false
 		}
 	}

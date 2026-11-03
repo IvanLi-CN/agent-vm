@@ -216,6 +216,9 @@ func (manager *Manager) Stage(ctx context.Context, targetSlot, bundle string) (*
 		return nil, err
 	}
 	if err := manager.Runtime.Stage(ctx, targetSlot, bundle); err != nil {
+		if errors.Is(err, ErrUncertain) {
+			return nil, manager.effectFailure(ctx, transaction.ID, PhaseStage, err)
+		}
 		return nil, manager.failure(ctx, transaction.ID, PhaseStage, err)
 	}
 	if err := manager.transitionAfterEffect(ctx, transaction.ID, PhaseStage, PhaseStandbyValidation, "staged", map[string]any{"target_slot": targetSlot}); err != nil {
@@ -662,9 +665,6 @@ func (manager *Manager) observe(ctx context.Context, transactionID string) (Runt
 	if observation.ObservedAt.IsZero() {
 		observation.ObservedAt = manager.Clock().UTC()
 	}
-	if observation.FreshUntil.IsZero() {
-		observation.FreshUntil = observation.ObservedAt.Add(10 * time.Second)
-	}
 	if observation.Slots == nil {
 		observation.Slots = map[string]SlotObservation{}
 	}
@@ -942,11 +942,7 @@ func validObservation(observation RuntimeSnapshot, now time.Time) bool {
 		return false
 	}
 	for _, source := range observation.Sources {
-		freshUntil := source.FreshUntil
-		if freshUntil.IsZero() {
-			freshUntil = source.ObservedAt.Add(10 * time.Second)
-		}
-		if !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) || !freshUntil.After(now) || source.ObservedAt.Before(observation.ObservedAt.Add(-2*time.Second)) {
+		if !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) || source.FreshUntil.IsZero() || !source.FreshUntil.After(now) || source.ObservedAt.Before(observation.ObservedAt.Add(-2*time.Second)) {
 			return false
 		}
 	}
