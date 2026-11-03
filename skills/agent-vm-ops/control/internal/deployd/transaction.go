@@ -17,6 +17,7 @@ import (
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd/store"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
 const (
@@ -434,13 +435,20 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 		if manager.Migration == nil {
 			return nil, errors.New("migration runtime is unavailable")
 		}
+		if err := manager.Store.ConsumeMigrationRetry(ctx, transaction.ID, manager.Clock().UTC()); err != nil {
+			return nil, err
+		}
 		if err := manager.Migration.FenceLegacy(ctx); err != nil {
 			return nil, err
 		}
 		if err := manager.Migration.StartStateAuthority(ctx); err != nil {
 			return nil, err
 		}
-		result, err := manager.Migration.RetryMigration(ctx, transaction.ID)
+		expectedEvidence, evidencePresent, err := manager.migrationSourceEvidence(ctx, transaction.ID)
+		if err != nil {
+			return nil, manager.migrationFailure(ctx, transaction.ID, transaction.Phase, err, true)
+		}
+		result, err := manager.Migration.RetryMigration(ctx, transaction.ID, expectedEvidence, transaction.Phase == PhaseMigrationStop && !evidencePresent)
 		if err != nil {
 			return nil, &UncertainError{Cause: err}
 		}
@@ -545,6 +553,30 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 	default:
 		return nil, errors.New("recovery action must be rollback or finalize")
 	}
+}
+
+func (manager *Manager) migrationSourceEvidence(ctx context.Context, id string) (state.SQLiteMigrationEvidence, bool, error) {
+	event, err := manager.Store.LatestEvent(ctx, id, PhaseMigrationImport, "source_verified")
+	if err != nil {
+		return state.SQLiteMigrationEvidence{}, false, err
+	}
+	if event == nil {
+		return state.SQLiteMigrationEvidence{}, false, nil
+	}
+	sourceSHA256, sourceOK := event.Evidence["source_sha256"].(string)
+	stateEpoch, epochOK := event.Evidence["state_epoch"].(string)
+	sourceSize, sizeOK := integerValue(event.Evidence["source_size"])
+	fenceID, fenceOK := event.Evidence["fence_id"].(string)
+	if !sourceOK || sourceSHA256 == "" || !epochOK || stateEpoch == "" || !sizeOK || sourceSize < 0 || !fenceOK || fenceID == "" {
+		return state.SQLiteMigrationEvidence{}, true, errors.New("migration source evidence is incomplete")
+	}
+	return state.SQLiteMigrationEvidence{
+		FenceID:      fenceID,
+		SourceSHA256: sourceSHA256,
+		SourceSize:   sourceSize,
+		StateEpoch:   stateEpoch,
+		VerifiedAt:   event.CreatedAt,
+	}, true, nil
 }
 
 func (manager *Manager) RecoverOnStart(ctx context.Context) error {

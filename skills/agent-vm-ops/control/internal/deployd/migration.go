@@ -48,7 +48,7 @@ type MigrationRuntime interface {
 	VerifySQLiteWritersClosed(context.Context) error
 	PrepareMigrationSource(context.Context, string) (MigrationSource, error)
 	ImportMigration(context.Context, MigrationSource) (state.SQLiteMigrationResult, error)
-	RetryMigration(context.Context, string) (state.SQLiteMigrationResult, error)
+	RetryMigration(context.Context, string, state.SQLiteMigrationEvidence, bool) (state.SQLiteMigrationResult, error)
 	FinalizeMigration(context.Context, string, bool, state.SQLiteMigrationResult) error
 	FenceLegacy(context.Context) error
 }

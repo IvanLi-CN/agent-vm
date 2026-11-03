@@ -198,8 +198,8 @@ def _prepare_initial_go_runtime_layout(config: Mapping[str, Any]) -> bool:
     if active.is_symlink() or active.exists():
         _verify_go_runtime_layout(config)
         return False
-    if not Path(STATE_DB_PATH).is_file():
-        _fail("activation_unverified", "Go runtime active pointer is missing and no legacy SQLite state is present")
+    if not Path(STATE_DB_PATH).is_file() and _read_migration_marker(config) is None:
+        _fail("activation_unverified", "Go runtime active pointer is missing and neither legacy SQLite nor migration evidence is present")
     for slot in GO_SLOT_NAMES:
         if not _go_slot_root(config, slot).is_dir():
             _fail("activation_unverified", f"initial Go slot directory is missing: {slot}")
@@ -270,6 +270,23 @@ class WrapperError(Exception):
 
 def _fail(code: str, message: str, detail: Any = None) -> None:
     raise WrapperError(code, message, detail)
+
+
+class _ActivationFenceLease:
+    def __init__(self, path: Path, transaction_id: str, release_id: str):
+        self.path = path
+        self.transaction_id = transaction_id
+        self.release_id = release_id
+        self.retained = False
+
+    def retain_for_recovery(self) -> None:
+        _write_json(self.path, {
+            "format": 1,
+            "transaction_id": self.transaction_id,
+            "release_id": self.release_id,
+            "state": "recovery_required",
+        })
+        self.retained = True
 
 
 def _safe_id(value: Any, label: str) -> str:
@@ -521,6 +538,7 @@ def _fsync_tree(root: Path) -> None:
 def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id: str):
     """Keep control-plane drain exit fenced for the whole activation window."""
     path = Path(config.get("fence_path", RELEASE_FENCE_PATH))
+    lease = _ActivationFenceLease(path, transaction_id, release_id)
     _mkdir_private(path.parent, 0o755)
     if path == RELEASE_FENCE_PATH:
         _require_root_owned_path(path.parent, "release activation fence directory")
@@ -534,12 +552,23 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
         if (path == RELEASE_FENCE_PATH and info.st_uid != 0) or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
             _fail("release_fence_unverified", "release activation fence is not a private regular file")
         existing = _read_json(path, "release_fence_unverified")
-        if (
-            existing.get("format") != 1
-            or existing.get("transaction_id") != transaction_id
-            or existing.get("release_id") != release_id
-        ):
+        same_owner = existing.get("format") == 1 and existing.get("transaction_id") == transaction_id and existing.get("release_id") == release_id
+        recovery_owner = existing.get("format") == 1 and existing.get("state") == "recovery_required"
+        if not same_owner and not recovery_owner:
             _fail("release_activation_in_progress", "another release activation fence is active")
+        if recovery_owner and not same_owner:
+            flags = os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+            try:
+                descriptor = os.open(path, flags)
+                with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                    json.dump({"format": 1, "transaction_id": transaction_id, "release_id": release_id}, handle, sort_keys=True)
+                    handle.write("\n")
+                    handle.flush()
+                    os.fchmod(handle.fileno(), 0o600)
+                    os.fsync(handle.fileno())
+                _fsync_directory(path.parent)
+            except OSError:
+                _fail("release_fence_unavailable", "release activation fence cannot be claimed for recovery")
     else:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
         try:
@@ -555,15 +584,16 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
         except OSError:
             _fail("release_fence_unavailable", "release activation fence cannot be created")
     try:
-        yield
+        yield lease
     finally:
-        try:
-            path.unlink()
-            _fsync_directory(path.parent)
-        except FileNotFoundError:
-            pass
-        except OSError:
-            _fail("release_fence_cleanup_failed", "release activation fence could not be cleared")
+        if not lease.retained:
+            try:
+                path.unlink()
+                _fsync_directory(path.parent)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                _fail("release_fence_cleanup_failed", "release activation fence could not be cleared")
 
 
 def _write_json(path: Path, value: Mapping[str, Any], mode: int = 0o600) -> None:
@@ -1473,6 +1503,8 @@ def _activate_go_runtime(
         _systemctl("stop", unit, allow_missing=True)
         _systemctl("disable", unit, allow_missing=True)
     if deployd_enabled:
+        migration_started = False
+        migration_completed = False
         try:
             # Deployd must be available while the legacy singleton is still
             # the SQLite writer. It fences and drains that writer before any
@@ -1481,7 +1513,9 @@ def _activate_go_runtime(
             _systemctl("enable", "agent-vm-deployd.service")
             _systemctl("restart", "agent-vm-deployd.service")
             _systemctl("is-active", "agent-vm-deployd.service")
+            migration_started = True
             _run_initial_state_migration(config)
+            migration_completed = True
             if bootstrap_active:
                 _atomic_symlink(_go_slot_root(config, "blue"), _go_runtime_root(config) / "active")
             # The blue-green control plane owns the slot instances. Leaving
@@ -1495,7 +1529,7 @@ def _activate_go_runtime(
                 _systemctl("restart", unit)
                 _systemctl("is-active", unit)
             return
-        except WrapperError:
+        except WrapperError as failure:
             # A partial bootstrap must not leave a running slot or Deployd
             # controller behind while the release transaction is fenced.
             for slot in GO_SLOT_NAMES:
@@ -1509,6 +1543,12 @@ def _activate_go_runtime(
                 _systemctl("stop", "agent-vm-deployd.service", allow_missing=True)
             except WrapperError:
                 pass
+            if migration_started and not migration_completed:
+                for action in ("stop", "disable"):
+                    try:
+                        _systemctl(action, "agent-vm-native.service", allow_missing=True)
+                    except WrapperError:
+                        pass
             if bootstrap_active:
                 active = _go_runtime_root(config) / "active"
                 try:
@@ -1517,6 +1557,12 @@ def _activate_go_runtime(
                         _fsync_directory(active.parent, "activation_failed")
                 except OSError:
                     pass
+            if migration_started and not migration_completed:
+                raise WrapperError(
+                    "migration_recovery_required",
+                    "initial state migration did not complete; all runtime effects remain fenced",
+                    {"migration_error": failure.as_dict()},
+                )
             raise
     _systemctl("enable", "agent-vm-native.service")
     _systemctl("restart", "agent-vm-native.service")
@@ -1806,8 +1852,13 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
 
 def activate(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     with _release_lock(config):
-        with _activation_fence(config, transaction_id, release_id):
-            return _activate_unlocked(config, transaction_id, release_id)
+        with _activation_fence(config, transaction_id, release_id) as fence:
+            try:
+                return _activate_unlocked(config, transaction_id, release_id)
+            except WrapperError as failure:
+                if failure.code == "migration_recovery_required":
+                    fence.retain_for_recovery()
+                raise
 
 
 def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
@@ -1902,10 +1953,29 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         failure = raw_failure if isinstance(raw_failure, WrapperError) else WrapperError(
             raw_failure.code, raw_failure.message, raw_failure.detail,
         )
+        migration_fenced = failure.code == "migration_recovery_required"
+        migration_failure_detail = failure.as_dict() if migration_fenced else None
         restored = True
         old_manifest = None
         old_compatibility_error = None
-        if old_current is not None:
+        if migration_fenced:
+            restored = False
+            try:
+                _restore_activation_state(
+                    config,
+                    current_link,
+                    previous_link,
+                    old_current,
+                    old_previous,
+                    target_snapshot,
+                )
+            except WrapperError as restore_error:
+                failure = WrapperError(
+                    "migration_recovery_required",
+                    "migration failed and release state could not be fully restored; runtime remains fenced",
+                    {"migration_error": migration_failure_detail, "restore_error": restore_error.as_dict()},
+                )
+        elif old_current is not None:
             try:
                 old_manifest = load_release_manifest(
                     old_current / MANIFEST_NAME,
@@ -1943,7 +2013,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                     "activation failed and the previous release could not be fully restored",
                     {"activation_error": failure.as_dict(), "restore_error": restore_error.as_dict()},
                 )
-        if runtime_switch_attempted:
+        if runtime_switch_attempted and not migration_fenced:
             try:
                 if not restored or old_current is None:
                     _systemctl("stop", "agent-vm-native.service", allow_missing=True)
@@ -1977,8 +2047,13 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
 
 def rollback(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:
     with _release_lock(config):
-        with _activation_fence(config, transaction_id, release_id):
-            return _rollback_unlocked(config, transaction_id, release_id)
+        with _activation_fence(config, transaction_id, release_id) as fence:
+            try:
+                return _rollback_unlocked(config, transaction_id, release_id)
+            except WrapperError as failure:
+                if failure.code == "migration_recovery_required":
+                    fence.retain_for_recovery()
+                raise
 
 
 def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_id: str) -> dict[str, Any]:

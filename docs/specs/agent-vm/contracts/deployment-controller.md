@@ -202,7 +202,9 @@ CLI 永远不能直接编辑 `active`。响应丢失时，CLI 返回 deployd tra
 
 迁移事务的阶段依次为 `migration_prepare`、`migration_drain`、`migration_quiescence`、`migration_stop`、`migration_source_check`、`migration_import` 和 `migration_finalize`。迁移成功后发布器才创建初始 `active -> slots/blue` 链接并启动蓝、绿槽位；普通 `stage`、`activate` 和 `rollback` 不再执行这条路径，也不替换业务数据库。
 
-任何步骤的结果不明确都必须保持 legacy 服务停止或围栏，并把事务置为 `needs_recovery`。发布器只允许针对该事务自动执行一次 `recover --action retry-migration`；Deployd 重启也不能根据旧状态猜测迁移成功，必须重新验证停止状态、writer 状态和目标 rqlite 内容。
+任何步骤的结果不明确都必须保持 legacy 服务停止或围栏，并把事务置为 `needs_recovery`。发布器的固定 activation fence 在迁移恢复完成前持续存在；Deployd 重启也不能根据旧状态猜测迁移成功，必须重新验证停止状态、writer 状态和目标 rqlite 内容。自动 `recover --action retry-migration` 的次数由迁移事务中的持久计数限制为一次，失败后仍保持 `needs_recovery`，不能通过重新启动发布器绕过限制。
+
+如果 Deployd 在创建源 snapshot 之前重启，且迁移事务仍处于 `migration_stop`、没有 `source_verified` 证据，恢复流程可以在重新确认 legacy 已停止和 writer 已关闭后继续创建这一次 snapshot。只要已经存在源摘要证据，恢复流程就必须复用原 snapshot；snapshot 缺失、被替换或摘要不一致都必须闭锁，禁止重新采样 legacy 数据库。完成标记必须在删除 legacy SQLite 及其 WAL/SHM 文件之前持久化；如果进程在这两个动作之间退出，恢复流程必须验证同一 transaction、源摘要和 rqlite 目标摘要，复用已完成的导入并继续删除和收口，不能再次导入或重新采样。迁移已完成但初始 `active` 链接或槽位启动失败时，后续发布只需验证完成标记、finalized 事务和 rqlite 目标，不得再次要求 legacy SQLite 文件存在。
 
 ## 恢复与验证
 

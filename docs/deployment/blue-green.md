@@ -134,7 +134,7 @@ Deployd 启动候选槽位，验证 manifest、socket、就绪状态、状态能
 
 Deployd SQLite 与业务状态分离。Deployd 的终态事务、阶段事件和失败证据默认保留三十天；活动事务和 `needs_recovery` 事务不会清理。
 
-一次性迁移 snapshot 位于 `/var/lib/agent-vm-native/migration/`，文件名以 `migration-` 开头、以 `.sqlite3` 结尾。迁移正在进行或需要恢复时，Deployd 不删除这些文件；迁移完成后从 finalized 时间开始保留七天，Deployd 每小时按完成标记中的保留截止时间清理过期 snapshot。唯一 finalized 迁移事务和目标摘要永久保留一条，不会随普通三十天历史清理删除，因此清理 snapshot 不会让完成状态失去可验证证据。
+一次性迁移 snapshot 位于 `/var/lib/agent-vm-native/migration/`，文件名以 `migration-` 开头、以 `.sqlite3` 结尾。迁移正在进行或需要恢复时，Deployd 不删除这些文件；迁移完成标记先于 legacy SQLite 清理持久化，清理动作中途退出时会复用标记绑定的 rqlite 目标，不会重复导入或重新采样；迁移完成后从 finalized 时间开始保留七天，Deployd 每小时按完成标记中的保留截止时间清理过期 snapshot。唯一 finalized 迁移事务和目标摘要永久保留一条，不会随普通三十天历史清理删除，因此清理 snapshot 不会让完成状态失去可验证证据。Deployd 在创建 snapshot 前检查目录总预算和文件系统可用空间；临时 snapshot 失败会自动删除，不会留下占用预算的半成品。
 
 清理按实际文件逐个处理，不预分配空间，不设体积下限，也不允许单个迁移源超过 1 GiB。rqlite 的业务 backup/snapshot 不由蓝绿 Deployd 创建或清理，必须由业务状态后端自己的保留策略管理；不能把 rqlite backup 混入蓝绿槽位切换。
 

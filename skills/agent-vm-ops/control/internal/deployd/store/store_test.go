@@ -3,12 +3,61 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
 )
+
+func TestStoreMigratesSchemaVersionOneForMigrationRetryCount(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "deployment.sqlite3")
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = database.Exec(`CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE deployment_transactions (
+  transaction_id TEXT PRIMARY KEY,
+  target_slot TEXT NOT NULL,
+  previous_slot TEXT NOT NULL,
+  bundle TEXT NOT NULL,
+  phase TEXT NOT NULL,
+  state TEXT NOT NULL,
+  generation INTEGER NOT NULL,
+  rollback_used INTEGER NOT NULL DEFAULT 0,
+  recovery_required INTEGER NOT NULL DEFAULT 0,
+  error_code TEXT NOT NULL DEFAULT '',
+  error_message TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+INSERT INTO meta(key, value) VALUES('schema_version', '1');`)
+	if err != nil {
+		_ = database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err := Open(path, time.Hour, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	transaction := Transaction{ID: "migration-retry-schema", TargetSlot: "state", PreviousSlot: "legacy", Bundle: "sqlite-to-rqlite", Phase: "migration_import", State: "needs_recovery", RecoveryRequired: true, Generation: 1}
+	if err := store.Create(context.Background(), transaction, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ConsumeMigrationRetry(context.Background(), transaction.ID, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Get(context.Background(), transaction.ID)
+	if err != nil || loaded == nil || loaded.MigrationRetryCount != 1 {
+		t.Fatalf("migrated retry count = %#v, err=%v", loaded, err)
+	}
+}
 
 func TestStoreRejectsActiveTransactionAcrossStoreInstances(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "deployment.sqlite3")

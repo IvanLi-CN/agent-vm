@@ -20,6 +20,7 @@ import (
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -467,7 +468,29 @@ func (runtime *HostRuntime) checkMigrationBudget(sourceSize int64) error {
 	if count >= maxMigrationSnapshots || sourceSize < 0 || sourceSize > maxMigrationSourceBytes-total {
 		return errors.New("backup_storage_exhausted: migration recovery budget is exhausted")
 	}
+	available, err := availableMigrationStorageBytes(runtime.Config.Migration.RecoveryDirectory)
+	if err != nil {
+		return fmt.Errorf("inspect migration recovery free space: %w", err)
+	}
+	if available < sourceSize {
+		return errors.New("backup_storage_exhausted: migration recovery filesystem has insufficient free space")
+	}
 	return nil
+}
+
+func availableMigrationStorageBytes(path string) (int64, error) {
+	var stat unix.Statfs_t
+	if err := unix.Statfs(path, &stat); err != nil {
+		return 0, err
+	}
+	if stat.Bavail < 0 || stat.Bsize < 0 || uint64(stat.Bavail) > uint64(^uint64(0))/uint64(stat.Bsize) {
+		return 0, errors.New("migration recovery filesystem capacity is out of range")
+	}
+	bytes := uint64(stat.Bavail) * uint64(stat.Bsize)
+	if bytes > uint64(^uint64(0)>>1) {
+		return 0, errors.New("migration recovery filesystem capacity exceeds int64")
+	}
+	return int64(bytes), nil
 }
 
 func (runtime *HostRuntime) PrepareMigrationSource(ctx context.Context, owner string) (MigrationSource, error) {
@@ -506,7 +529,7 @@ func (runtime *HostRuntime) ImportMigration(ctx context.Context, source Migratio
 	return state.MigrateSQLiteToRQLiteWithCA(ctx, source.BackupPath, url, runtime.Config.Migration.RQLiteCAFile, source.Evidence)
 }
 
-func (runtime *HostRuntime) RetryMigration(ctx context.Context, owner string) (state.SQLiteMigrationResult, error) {
+func (runtime *HostRuntime) RetryMigration(ctx context.Context, owner string, expected state.SQLiteMigrationEvidence, allowResnapshot bool) (state.SQLiteMigrationResult, error) {
 	if err := runtime.VerifyLegacyStopped(ctx); err != nil {
 		return state.SQLiteMigrationResult{}, err
 	}
@@ -516,11 +539,44 @@ func (runtime *HostRuntime) RetryMigration(ctx context.Context, owner string) (s
 	if err := runtime.ensureRecoveryDirectory(); err != nil {
 		return state.SQLiteMigrationResult{}, err
 	}
+	if marker, markerErr := runtime.readMigrationMarker(); markerErr == nil {
+		if marker.TransactionID != owner {
+			return state.SQLiteMigrationResult{}, errors.New("migration completion marker belongs to another transaction")
+		}
+		markerEvidence := state.SQLiteMigrationEvidence{
+			SourceSHA256: marker.SourceSHA256,
+			SourceSize:   marker.SourceSize,
+			StateEpoch:   marker.StateEpoch,
+		}
+		if expected.SourceSHA256 != "" {
+			if err := verifyMigrationSourceEvidence(expected, markerEvidence); err != nil {
+				return state.SQLiteMigrationResult{}, err
+			}
+		}
+		if err := runtime.VerifyMigrationTarget(ctx, owner); err != nil {
+			return state.SQLiteMigrationResult{}, fmt.Errorf("verify persisted migration completion: %w", err)
+		}
+		return state.SQLiteMigrationResult{
+			SourceSHA256: marker.SourceSHA256,
+			SourceSize:   marker.SourceSize,
+			StateEpoch:   marker.StateEpoch,
+			TargetSHA256: marker.TargetSHA256,
+		}, nil
+	} else if !errors.Is(markerErr, fs.ErrNotExist) {
+		return state.SQLiteMigrationResult{}, markerErr
+	}
 	backup := filepath.Join(runtime.Config.Migration.RecoveryDirectory, "migration-"+owner+".sqlite3")
 	info, err := os.Lstat(backup)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return state.SQLiteMigrationResult{}, errors.New("verified migration snapshot is missing; retry cannot resample the legacy database")
+			if !allowResnapshot || expected.SourceSHA256 != "" {
+				return state.SQLiteMigrationResult{}, errors.New("verified migration snapshot is missing; retry cannot resample the legacy database")
+			}
+			source, prepareErr := runtime.PrepareMigrationSource(ctx, owner)
+			if prepareErr != nil {
+				return state.SQLiteMigrationResult{}, prepareErr
+			}
+			return runtime.ImportMigration(ctx, source)
 		}
 		return state.SQLiteMigrationResult{}, err
 	}
@@ -534,7 +590,19 @@ func (runtime *HostRuntime) RetryMigration(ctx context.Context, owner string) (s
 	if err != nil {
 		return state.SQLiteMigrationResult{}, err
 	}
+	if expected.SourceSHA256 != "" {
+		if err := verifyMigrationSourceEvidence(expected, evidence); err != nil {
+			return state.SQLiteMigrationResult{}, err
+		}
+	}
 	return runtime.ImportMigration(ctx, MigrationSource{Evidence: evidence, BackupPath: backup})
+}
+
+func verifyMigrationSourceEvidence(expected, actual state.SQLiteMigrationEvidence) error {
+	if expected.SourceSHA256 != actual.SourceSHA256 || expected.SourceSize != actual.SourceSize || expected.StateEpoch != actual.StateEpoch {
+		return errors.New("verified migration snapshot does not match the original migration evidence")
+	}
+	return nil
 }
 
 func (runtime *HostRuntime) rqliteMigrationURL() (string, error) {
@@ -575,12 +643,6 @@ func (runtime *HostRuntime) FinalizeMigration(ctx context.Context, owner string,
 	if err := runtime.VerifySQLiteWritersClosed(ctx); err != nil {
 		return err
 	}
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		path := runtime.Config.Migration.LegacyStateDB + suffix
-		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("remove migrated SQLite source %s: %w", filepath.Base(path), err)
-		}
-	}
 	completedAt := time.Now().UTC()
 	marker := migrationCompletionMarkerData{
 		Format:            2,
@@ -592,6 +654,27 @@ func (runtime *HostRuntime) FinalizeMigration(ctx context.Context, owner string,
 		TargetSHA256:      result.TargetSHA256,
 		RetentionUntil:    completedAt.Add(migrationBackupRetention),
 	}
+	if existing, err := runtime.readMigrationMarker(); err == nil {
+		if existing.TransactionID != marker.TransactionID || existing.SourceSHA256 != marker.SourceSHA256 || existing.SourceSize != marker.SourceSize || existing.StateEpoch != marker.StateEpoch || existing.TargetSHA256 != marker.TargetSHA256 {
+			return errors.New("migration completion marker does not match the finalized migration result")
+		}
+	} else if errors.Is(err, fs.ErrNotExist) {
+		if err := runtime.writeMigrationMarker(marker); err != nil {
+			return err
+		}
+	} else {
+		return err
+	}
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		path := runtime.Config.Migration.LegacyStateDB + suffix
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("remove migrated SQLite source %s: %w", filepath.Base(path), err)
+		}
+	}
+	return nil
+}
+
+func (runtime *HostRuntime) writeMigrationMarker(marker migrationCompletionMarkerData) error {
 	encoded, err := json.Marshal(marker)
 	if err != nil {
 		return fmt.Errorf("encode migration completion marker: %w", err)

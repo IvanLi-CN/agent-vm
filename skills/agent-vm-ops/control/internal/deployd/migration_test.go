@@ -3,6 +3,7 @@ package deployd
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -76,7 +77,7 @@ func (runtime *fakeMigrationRuntime) ImportMigration(context.Context, MigrationS
 	return runtime.result, nil
 }
 
-func (runtime *fakeMigrationRuntime) RetryMigration(context.Context, string) (state.SQLiteMigrationResult, error) {
+func (runtime *fakeMigrationRuntime) RetryMigration(context.Context, string, state.SQLiteMigrationEvidence, bool) (state.SQLiteMigrationResult, error) {
 	runtime.calls = append(runtime.calls, "retry-import")
 	if runtime.failRetry {
 		return state.SQLiteMigrationResult{}, errors.New("retry outcome unknown")
@@ -183,6 +184,37 @@ func TestMigrationRecoveryRetriesOnlyAfterExplicitAction(t *testing.T) {
 	}
 }
 
+func TestAutomaticMigrationRetryIsPersistentlyBounded(t *testing.T) {
+	migration := &fakeMigrationRuntime{
+		failImport: true,
+		failRetry:  true,
+		result: state.SQLiteMigrationResult{
+			SourceSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			SourceSize:   1,
+			StateEpoch:   "epoch-1",
+		},
+	}
+	manager, database := migrationTestManager(t, migration)
+	if _, err := manager.Migrate(context.Background()); !errors.Is(err, ErrUncertain) {
+		t.Fatalf("initial migration error = %v", err)
+	}
+	active, err := database.ListActive(context.Background())
+	if err != nil || len(active) != 1 {
+		t.Fatalf("migration transaction = %#v, err=%v", active, err)
+	}
+	if _, err := manager.Recover(context.Background(), active[0].ID, "retry-migration"); !errors.Is(err, ErrUncertain) {
+		t.Fatalf("failed retry error = %v", err)
+	}
+	active, err = database.ListActive(context.Background())
+	if err != nil || len(active) != 1 || active[0].MigrationRetryCount != 1 {
+		t.Fatalf("retry consumption was not durable: %#v, err=%v", active, err)
+	}
+	migration.failRetry = false
+	if _, err := manager.Recover(context.Background(), active[0].ID, "retry-migration"); err == nil || !strings.Contains(err.Error(), "already been consumed") {
+		t.Fatalf("second automatic retry was accepted: %v", err)
+	}
+}
+
 func TestMigrationFinalizeFailureLeavesNeedsRecovery(t *testing.T) {
 	migration := &fakeMigrationRuntime{failFinalize: true, result: state.SQLiteMigrationResult{SourceSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", SourceSize: 1, StateEpoch: "epoch-1"}}
 	manager, database := migrationTestManager(t, migration)
@@ -215,6 +247,19 @@ func TestMigrationTargetVerificationFailureLeavesNeedsRecovery(t *testing.T) {
 	}
 	if active[0].Phase != PhaseMigrationFinalize || active[0].State != "needs_recovery" || !active[0].RecoveryRequired {
 		t.Fatalf("target verification failure state = %#v", active[0])
+	}
+}
+
+func TestRetryMigrationRequiresTheOriginalSourceEvidence(t *testing.T) {
+	expected := state.SQLiteMigrationEvidence{SourceSHA256: "a", SourceSize: 10, StateEpoch: "epoch-1"}
+	actual := state.SQLiteMigrationEvidence{SourceSHA256: "b", SourceSize: 10, StateEpoch: "epoch-1"}
+	if err := verifyMigrationSourceEvidence(expected, actual); err == nil {
+		t.Fatal("replacement migration snapshot was accepted")
+	}
+	actual.SourceSHA256 = expected.SourceSHA256
+	actual.StateEpoch = "epoch-2"
+	if err := verifyMigrationSourceEvidence(expected, actual); err == nil {
+		t.Fatal("migration snapshot with a changed state epoch was accepted")
 	}
 }
 
