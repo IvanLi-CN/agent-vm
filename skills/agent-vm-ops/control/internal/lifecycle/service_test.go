@@ -22,9 +22,10 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
-func missingInstanceError() error {
+func missingInstanceError(instance string) error {
 	err := exec.Command("false").Run()
-	return &native.CommandError{Result: native.Result{Code: 1, Stderr: []byte("instance not found")}, Cause: err}
+	diagnostic := fmt.Sprintf("Error: Failed to fetch instance %q in projectName %q: Instance not found", instance, "agents")
+	return &native.CommandError{Result: native.Result{Code: 1, Stderr: []byte(diagnostic)}, Cause: err}
 }
 
 type staticCPUObserver struct {
@@ -3354,8 +3355,10 @@ func TestDestroyMissingInstanceDoesNotFinalizeUnresolvedWorker(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	guest := &startupGuest{configErr: missingInstanceError()}
-	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
+	guest := &startupGuest{configErr: missingInstanceError("agent-destroy-unresolved")}
+	cfg := config.Defaults()
+	cfg.Project = "agents"
+	service := New(store, cfg, Options{Guest: guest, Clock: func() time.Time { return now }})
 	_, err = service.releaseUnlocked(context.Background(), protocol.Request{
 		"session_id": "destroy-unresolved-session", "generation": int64(1), "operation_id": "destroy-unresolved-operation",
 	}, true)
@@ -3667,8 +3670,10 @@ func TestStartupReconcileFinalizesOrphanedAcquireWhenNativeIsMissing(t *testing.
 	}); err != nil {
 		t.Fatal(err)
 	}
-	guest := &startupGuest{configErr: missingInstanceError()}
-	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	guest := &startupGuest{configErr: missingInstanceError("agent-vm-" + taskID(session))}
+	cfg := config.Defaults()
+	cfg.Project = "agents"
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
 	if err := service.StartupReconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -3927,8 +3932,10 @@ func TestDestroyFinalizesWhenIncusConfirmsTheInstanceIsMissing(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	guest := &startupGuest{configErr: missingInstanceError()}
-	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
+	guest := &startupGuest{configErr: missingInstanceError("agent-destroy")}
+	cfg := config.Defaults()
+	cfg.Project = "agents"
+	service := New(store, cfg, Options{Guest: guest, Clock: func() time.Time { return now }})
 	response, err := service.Dispatch(context.Background(), protocol.Request{
 		"protocol": protocol.Version, "action": "destroy", "session_id": "destroy-session", "generation": int64(1), "operation_id": "destroy-missing",
 	})
@@ -4068,8 +4075,10 @@ func TestReconcileFinalizesPendingDestroyAfterAbsentCommit(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Code: 1, Stderr: []byte("Error: Instance not found")}, Cause: exec.Command("false").Run()}}
-	service := New(store, config.Defaults(), Options{Guest: guest, Clock: func() time.Time { return now }})
+	guest := &startupGuest{configErr: missingInstanceError("agent-pending-absent-destroy")}
+	cfg := config.Defaults()
+	cfg.Project = "agents"
+	service := New(store, cfg, Options{Guest: guest, Clock: func() time.Time { return now }})
 	if _, err := service.reconcile(ctx, true); err != nil {
 		t.Fatal(err)
 	}
@@ -4112,8 +4121,10 @@ func TestReconcileFinalizesPendingDestroyWithoutTaskRow(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	guest := &startupGuest{configErr: &native.CommandError{Result: native.Result{Code: 1, Stderr: []byte("Error: Instance not found")}, Cause: exec.Command("false").Run()}}
-	service := New(store, config.Defaults(), Options{Guest: guest})
+	guest := &startupGuest{configErr: missingInstanceError("agent-vm-" + taskID(session))}
+	cfg := config.Defaults()
+	cfg.Project = "agents"
+	service := New(store, cfg, Options{Guest: guest})
 	if _, err := service.reconcile(ctx, true); err != nil {
 		t.Fatal(err)
 	}
@@ -4179,11 +4190,13 @@ func TestPendingAbsentDestroyRemainsPendingWithoutSafeEvidence(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			var guest native.Guest = &startupGuest{configErr: missingInstanceError()}
+			var guest native.Guest = &startupGuest{configErr: missingInstanceError("instance-" + mode)}
 			if mode == "no-native" {
 				guest = nil
 			}
-			service := New(store, config.Defaults(), Options{Guest: guest})
+			cfg := config.Defaults()
+			cfg.Project = "agents"
+			service := New(store, cfg, Options{Guest: guest})
 			if mode == "active" {
 				done := service.markOperationActive(operationID)
 				defer done()
@@ -4304,9 +4317,10 @@ func TestAcquireFailedBeforeNativeCreationReclaimsReservation(t *testing.T) {
 	}
 	defer store.Close()
 	cfg := config.Defaults()
+	cfg.Project = "agents"
 	cfg.VMIPStart = "10.0.0.10"
 	cfg.VMIPEnd = "10.0.0.20"
-	guest := &startupGuest{initErr: errors.New("init failed"), configErr: missingInstanceError()}
+	guest := &startupGuest{initErr: errors.New("init failed"), configErr: missingInstanceError("agent-vm-" + taskID("init-absent"))}
 	service := New(store, cfg, Options{Guest: guest})
 	_, err = service.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "init-absent", "generation": int64(0), "operation_id": "init-absent-acquire"})
 	if protocol.AsError(err).Code != "native_failed" {
@@ -4368,9 +4382,10 @@ func TestFailedInitMissingInstanceKeepsUnresolvedWorkerReservation(t *testing.T)
 	}
 	defer store.Close()
 	cfg := config.Defaults()
+	cfg.Project = "agents"
 	cfg.VMIPStart = "10.0.0.10"
 	cfg.VMIPEnd = "10.0.0.20"
-	guest := &startupGuest{initErr: errors.New("uncertain init"), configErr: missingInstanceError()}
+	guest := &startupGuest{initErr: errors.New("uncertain init"), configErr: missingInstanceError("agent-vm-" + taskID("unresolved"))}
 	service := New(store, cfg, Options{Guest: guest})
 	ctx := context.Background()
 	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": "unresolved", "generation": int64(0), "operation_id": "unresolved-acquire"})
@@ -4425,8 +4440,10 @@ func TestStartupDoesNotFinalizeActiveOrphanedAcquire(t *testing.T) {
 	if err := store.RecordOperation(context.Background(), "active-orphan-acquire", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request_digest": digest, "_request": map[string]any(request), "worker": map[string]any{"state": "starting"}}); err != nil {
 		t.Fatal(err)
 	}
-	guest := &startupGuest{configErr: missingInstanceError()}
-	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	guest := &startupGuest{configErr: missingInstanceError("agent-vm-" + taskID("active-orphan"))}
+	cfg := config.Defaults()
+	cfg.Project = "agents"
+	service := New(store, cfg, Options{Guest: guest, Resident: true})
 	finish := service.markOperationActive("active-orphan-acquire")
 	defer finish()
 	if err := service.StartupReconcile(context.Background()); err == nil {
@@ -4901,7 +4918,9 @@ func TestStartupRecoversExplicitlyUnattemptedAcquire(t *testing.T) {
 	if err := store.RecordOperation(context.Background(), "pre-start-acquire", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": map[string]any{"state": "starting", "start_attempted": false}}); err != nil {
 		t.Fatal(err)
 	}
-	service := New(store, config.Defaults(), Options{Guest: &startupGuest{configErr: missingInstanceError()}, Resident: true})
+	cfg := config.Defaults()
+	cfg.Project = "agents"
+	service := New(store, cfg, Options{Guest: &startupGuest{configErr: missingInstanceError("agent-vm-" + taskID(session))}, Resident: true})
 	if err := service.StartupReconcile(context.Background()); err != nil {
 		t.Fatalf("startup: %v", err)
 	}
@@ -5043,7 +5062,9 @@ func TestOrphanAcquireRefusesUnverifiedWorkerOrRequest(t *testing.T) {
 			if err := store.RecordOperation(ctx, mode, "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest, "worker": worker}); err != nil {
 				t.Fatal(err)
 			}
-			service := New(store, config.Defaults(), Options{Guest: &startupGuest{configErr: missingInstanceError()}, Resident: true})
+			cfg := config.Defaults()
+			cfg.Project = "agents"
+			service := New(store, cfg, Options{Guest: &startupGuest{configErr: missingInstanceError("agent-vm-" + taskID(session))}, Resident: true})
 			if err := service.StartupReconcile(ctx); err == nil {
 				t.Fatal("unverified operation was finalized")
 			}
@@ -5117,7 +5138,9 @@ func TestReconcileClosingDestroyFinalizesVerifiedMissingInstance(t *testing.T) {
 	if err := store.RecordOperation(ctx, "closing-missing-op", "destroy", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "exited"}}); err != nil {
 		t.Fatal(err)
 	}
-	service := New(store, config.Defaults(), Options{Guest: &startupGuest{configErr: missingInstanceError()}})
+	cfg := config.Defaults()
+	cfg.Project = "agents"
+	service := New(store, cfg, Options{Guest: &startupGuest{configErr: missingInstanceError("closing-missing-instance")}})
 	if _, err := service.reconcile(ctx, true); err != nil {
 		t.Fatalf("reconcile=%v", err)
 	}
@@ -5395,7 +5418,9 @@ func TestStartupRecoversLegacyNeverAllocatedAcquire(t *testing.T) {
 	if err := store.RecordOperation(ctx, "legacy-never-allocated-op", "acquire", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": map[string]any{"state": "starting"}}); err != nil {
 		t.Fatal(err)
 	}
-	service := New(store, config.Defaults(), Options{Guest: &startupGuest{configErr: missingInstanceError()}, Resident: true})
+	cfg := config.Defaults()
+	cfg.Project = "agents"
+	service := New(store, cfg, Options{Guest: &startupGuest{configErr: missingInstanceError("agent-vm-" + taskID(session))}, Resident: true})
 	if err := service.StartupReconcile(ctx); err != nil {
 		t.Fatalf("startup=%v", err)
 	}
@@ -5434,7 +5459,7 @@ func TestLegacyNeverAllocatedRecoveryRequiresTombstoneAndNativeAbsence(t *testin
 					t.Fatal(err)
 				}
 			}
-			guest := &startupGuest{configErr: missingInstanceError()}
+			guest := &startupGuest{configErr: missingInstanceError("agent-vm-" + taskID(session))}
 			if mode == "native-present" {
 				guest.configErr = nil
 				guest.config = map[string]any{}
@@ -5442,7 +5467,9 @@ func TestLegacyNeverAllocatedRecoveryRequiresTombstoneAndNativeAbsence(t *testin
 			if mode == "native-error" {
 				guest.configErr = errors.New("transport failed")
 			}
-			service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+			cfg := config.Defaults()
+			cfg.Project = "agents"
+			service := New(store, cfg, Options{Guest: guest, Resident: true})
 			if err := service.StartupReconcile(ctx); err == nil {
 				t.Fatal("unsafe pending operation finalized")
 			}

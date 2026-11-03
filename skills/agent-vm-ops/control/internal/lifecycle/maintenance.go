@@ -22,7 +22,11 @@ const (
 )
 
 type maintenancePageResult struct {
-	nextTaskID string
+	nextTaskID             string
+	taskCursorUpdated      bool
+	nextOperationAt        string
+	nextOperationID        string
+	operationCursorUpdated bool
 }
 
 // RunMaintenance is the scheduler-owned maintenance boundary. It is
@@ -67,15 +71,21 @@ func (s *Service) RunMaintenance(ctx context.Context, lane string) error {
 	defer cancel()
 	var page maintenancePageResult
 	if lane == maintenanceReconcileLane {
-		page, err = s.reconcileMaintenancePage(workCtx, laneCursor.ScanAfterTaskID)
+		page, err = s.reconcileMaintenancePageWithCursor(workCtx, laneCursor.ScanAfterTaskID, laneCursor.ScanAfterOperationAt, laneCursor.ScanAfterOperationID)
 	} else {
 		page, err = s.ageGCMaintenancePage(workCtx, laneCursor.ScanAfterTaskID)
 	}
 	if err == nil && (mutationLost() || !s.mutationAllowed()) {
 		err = controllerLeaseLostError(nil)
 	}
-	if err == nil {
+	if page.taskCursorUpdated {
 		laneCursor.ScanAfterTaskID = page.nextTaskID
+	}
+	if page.operationCursorUpdated {
+		laneCursor.ScanAfterOperationAt = page.nextOperationAt
+		laneCursor.ScanAfterOperationID = page.nextOperationID
+	}
+	if err == nil {
 		laneCursor.Attempt = 0
 		laneCursor.NextAttemptAt = nowString(now)
 		laneCursor.LastErrorCode = ""
@@ -132,46 +142,71 @@ func maintenanceBackoff(attempt int) time.Duration {
 }
 
 func (s *Service) reconcileMaintenancePage(ctx context.Context, afterTaskID string) (maintenancePageResult, error) {
-	pending, err := s.Store.PendingOperationsPage(ctx, maintenancePendingPageSize)
+	return s.reconcileMaintenancePageWithCursor(ctx, afterTaskID, "", "")
+}
+
+func (s *Service) reconcileMaintenancePageWithCursor(ctx context.Context, afterTaskID, afterOperationAt, afterOperationID string) (maintenancePageResult, error) {
+	pending, morePending, err := s.Store.PendingOperationsPageAfter(ctx, afterOperationAt, afterOperationID, maintenancePendingPageSize)
 	if err != nil {
 		return maintenancePageResult{}, s.sqliteError(err)
 	}
-	if err := s.reconcilePendingWorkers(ctx, pending); err != nil {
-		return maintenancePageResult{}, err
+	page := maintenancePageResult{operationCursorUpdated: true}
+	var firstErr error
+	for index := range pending {
+		if err := ctx.Err(); err != nil {
+			if firstErr == nil {
+				firstErr = protocol.NewError("maintenance_timeout", "reconcile maintenance budget expired", map[string]any{"phase": maintenanceReconcileLane})
+			}
+			return page, firstErr
+		}
+		one := pending[index : index+1]
+		for _, reconcile := range []func(context.Context, []state.Operation) error{
+			s.reconcilePendingWorkers,
+			s.reconcilePendingAbsentDestroy,
+			s.recoverPending,
+			s.reconcileOrphanedAcquireOperations,
+		} {
+			if reconcileErr := reconcile(ctx, one); reconcileErr != nil && firstErr == nil {
+				firstErr = reconcileErr
+			}
+		}
+		page.nextOperationAt = pending[index].CreatedAt
+		page.nextOperationID = pending[index].OperationID
 	}
-	if err := s.reconcilePendingAbsentDestroy(ctx, pending); err != nil {
-		return maintenancePageResult{}, err
-	}
-	if err := s.recoverPending(ctx, pending); err != nil {
-		return maintenancePageResult{}, err
-	}
-	if err := s.reconcileOrphanedAcquireOperations(ctx, pending); err != nil {
-		return maintenancePageResult{}, err
+	if !morePending {
+		page.nextOperationAt = ""
+		page.nextOperationID = ""
 	}
 
 	tasks, more, err := s.Store.ListTasksPage(ctx, state.TaskPageFilter{AfterTaskID: afterTaskID, Limit: maintenancePageSize})
 	if err != nil {
-		return maintenancePageResult{}, s.sqliteError(err)
+		if firstErr == nil {
+			firstErr = s.sqliteError(err)
+		}
+		return page, firstErr
 	}
 	for _, task := range tasks {
 		if err := ctx.Err(); err != nil {
-			return maintenancePageResult{}, protocol.NewError("maintenance_timeout", "reconcile maintenance budget expired", map[string]any{"phase": maintenanceReconcileLane})
+			if firstErr == nil {
+				firstErr = protocol.NewError("maintenance_timeout", "reconcile maintenance budget expired", map[string]any{"phase": maintenanceReconcileLane})
+			}
+			return page, firstErr
 		}
-		if err := s.reconcileMaintenanceTask(ctx, &task); err != nil {
-			return maintenancePageResult{}, err
+		if reconcileErr := s.reconcileMaintenanceTask(ctx, &task); reconcileErr != nil && firstErr == nil {
+			firstErr = reconcileErr
 		}
+		page.nextTaskID = task.TaskID
+		page.taskCursorUpdated = true
 	}
-	result := maintenancePageResult{}
-	if more && len(tasks) > 0 {
-		result.nextTaskID = tasks[len(tasks)-1].TaskID
+	if !more {
+		page.nextTaskID = ""
 	}
-	return result, nil
+	return page, firstErr
 }
 
 func (s *Service) reconcileMaintenanceTask(ctx context.Context, task *state.Task) error {
 	if (task.State == stateActive || task.State == statePreparing) && !effective(task, s.Clock()) {
-		request := protocol.Request{"protocol": protocol.Version, "action": "timer-expire", "task_id": task.TaskID, "generation": task.Generation}
-		if _, err := s.expire(ctx, request); err != nil {
+		if err := s.maintenanceExpire(ctx, task); err != nil {
 			return err
 		}
 	}
@@ -244,7 +279,13 @@ func (s *Service) maintenanceCleanup(ctx context.Context, task *state.Task, acti
 		defer finishActive()
 	}
 	cleanupCtx := native.WithWorkerRecorder(withInternalCleanup(ctx), operationID, s)
-	result, cleanupErr := s.release(cleanupCtx, request, action == "destroy")
+	cleanup := s.release
+	if isSessionLockHeld(ctx) {
+		cleanup = func(cleanupCtx context.Context, request protocol.Request, destroy bool) (map[string]any, error) {
+			return s.releaseUnlocked(cleanupCtx, request, destroy)
+		}
+	}
+	result, cleanupErr := cleanup(cleanupCtx, request, action == "destroy")
 	if cleanupErr != nil {
 		if !uncertain(cleanupErr) {
 			_ = s.recordError(ctx, request, cleanupErr)
@@ -263,14 +304,59 @@ func (s *Service) maintenanceCleanup(ctx context.Context, task *state.Task, acti
 	return result, nil
 }
 
+func (s *Service) maintenanceExpire(ctx context.Context, task *state.Task) error {
+	operationID := timerExpireOperationID(task.TaskID, task.Generation)
+	request := protocol.Request{"protocol": protocol.Version, "action": "timer-expire", "task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "operation_id": operationID}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		return protocol.NewError("invalid_request", "maintenance expiry request cannot be canonicalized", nil)
+	}
+	pending := map[string]any{
+		"outcome":         "pending",
+		"_request_digest": digest,
+		"_request":        map[string]any(request),
+		"worker":          map[string]any{"state": "starting", "start_attempted": false, "prepared_at": nowString(s.Clock())},
+	}
+	finishActive := s.markOperationActive(operationID)
+	defer finishActive()
+	var existing *state.Operation
+	if err := s.commitMutationContext(ctx, func() error {
+		var claimErr error
+		existing, claimErr = s.Store.ClaimOperation(ctx, operationID, "timer-expire", &task.SessionID, &task.Generation, pending)
+		return claimErr
+	}); err != nil {
+		return s.sqliteError(err)
+	}
+	if existing != nil {
+		_, err := s.replayRecord(request, existing)
+		return err
+	}
+	cleanupCtx := native.WithWorkerRecorder(withInternalCleanup(ctx), operationID, s)
+	result, expireErr := s.expire(cleanupCtx, request)
+	if expireErr != nil {
+		if !uncertain(expireErr) {
+			_ = s.recordError(ctx, request, expireErr)
+		}
+		return expireErr
+	}
+	response := protocol.SuccessWithRelease(request, result, s.Release, nil)
+	response["_request_digest"] = digest
+	return s.recordOperation(ctx, operationID, "timer-expire", &task.SessionID, &task.Generation, response)
+}
+
 func (s *Service) ageGCMaintenancePage(ctx context.Context, afterTaskID string) (maintenancePageResult, error) {
 	tasks, more, err := s.Store.ListTasksPage(ctx, state.TaskPageFilter{AfterTaskID: afterTaskID, Limit: maintenancePageSize})
 	if err != nil {
 		return maintenancePageResult{}, s.sqliteError(err)
 	}
+	page := maintenancePageResult{taskCursorUpdated: true}
+	var firstErr error
 	for _, task := range tasks {
 		if err := ctx.Err(); err != nil {
-			return maintenancePageResult{}, protocol.NewError("maintenance_timeout", "age-gc maintenance budget expired", map[string]any{"phase": maintenanceAgeGCLane})
+			if firstErr == nil {
+				firstErr = protocol.NewError("maintenance_timeout", "age-gc maintenance budget expired", map[string]any{"phase": maintenanceAgeGCLane})
+			}
+			return page, firstErr
 		}
 		if task.State != stateCached || task.CleanupAfter == nil {
 			continue
@@ -282,22 +368,33 @@ func (s *Service) ageGCMaintenancePage(ctx context.Context, afterTaskID string) 
 		gcNow := s.Clock()
 		updated, updateErr := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateCached}, LeaseExpiredAt: &gcNow}, map[string]any{"state": stateDeleting, "updated_at": nowString(gcNow)})
 		if updateErr != nil {
-			return maintenancePageResult{}, s.sqliteError(updateErr)
+			if firstErr == nil {
+				firstErr = s.sqliteError(updateErr)
+			}
+			page.nextTaskID = task.TaskID
+			continue
 		}
 		if !updated {
+			page.nextTaskID = task.TaskID
 			continue
 		}
 		cleanupRequest := protocol.Request{"session_id": task.SessionID, "generation": task.Generation}
 		if _, releaseErr := s.maintenanceCleanup(ctx, &task, "destroy"); releaseErr != nil {
-			return maintenancePageResult{}, releaseErr
+			if firstErr == nil {
+				firstErr = releaseErr
+			}
+			page.nextTaskID = task.TaskID
+			continue
 		}
 		if err := s.deleteDestroyedTask(ctx, cleanupRequest, &task.Generation); err != nil {
-			return maintenancePageResult{}, err
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
+		page.nextTaskID = task.TaskID
 	}
-	result := maintenancePageResult{}
-	if more && len(tasks) > 0 {
-		result.nextTaskID = tasks[len(tasks)-1].TaskID
+	if !more {
+		page.nextTaskID = ""
 	}
-	return result, nil
+	return page, firstErr
 }

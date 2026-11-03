@@ -197,12 +197,14 @@ type Operation struct {
 const MaintenanceCursorMetaKey = "maintenance_cursor"
 
 type MaintenanceLane struct {
-	NextAttemptAt   string `json:"next_attempt_at"`
-	Attempt         int    `json:"attempt"`
-	ScanAfterTaskID string `json:"scan_after_task_id"`
-	LastErrorCode   string `json:"last_error_code"`
-	LastErrorPhase  string `json:"last_error_phase"`
-	UpdatedAt       string `json:"updated_at"`
+	NextAttemptAt        string `json:"next_attempt_at"`
+	Attempt              int    `json:"attempt"`
+	ScanAfterTaskID      string `json:"scan_after_task_id"`
+	ScanAfterOperationAt string `json:"scan_after_operation_at"`
+	ScanAfterOperationID string `json:"scan_after_operation_id"`
+	LastErrorCode        string `json:"last_error_code"`
+	LastErrorPhase       string `json:"last_error_phase"`
+	UpdatedAt            string `json:"updated_at"`
 }
 
 type MaintenanceCursor struct {
@@ -593,8 +595,18 @@ func validateMaintenanceLane(lane MaintenanceLane) error {
 			return errors.New("timestamp is invalid")
 		}
 	}
-	if len(lane.ScanAfterTaskID) > 128 || len(lane.LastErrorCode) > 128 || len(lane.LastErrorPhase) > 128 {
+	if len(lane.ScanAfterTaskID) > 128 || len(lane.ScanAfterOperationAt) > 128 || len(lane.ScanAfterOperationID) > 128 || len(lane.LastErrorCode) > 128 || len(lane.LastErrorPhase) > 128 {
 		return errors.New("cursor field is too long")
+	}
+	if lane.ScanAfterOperationAt != "" {
+		if _, err := time.Parse(time.RFC3339Nano, lane.ScanAfterOperationAt); err != nil {
+			return errors.New("operation cursor timestamp is invalid")
+		}
+		if lane.ScanAfterOperationID == "" {
+			return errors.New("operation cursor ID is missing")
+		}
+	} else if lane.ScanAfterOperationID != "" {
+		return errors.New("operation cursor timestamp is missing")
 	}
 	return nil
 }
@@ -1193,10 +1205,59 @@ func (s *Store) PendingOperations(ctx context.Context) ([]Operation, error) {
 // complete journal. The full PendingOperations query remains available to
 // startup and diagnostic paths that intentionally need a complete snapshot.
 func (s *Store) PendingOperationsPage(ctx context.Context, limit int) ([]Operation, error) {
+	values, _, err := s.PendingOperationsPageAfter(ctx, "", "", limit)
+	return values, err
+}
+
+// PendingOperationsPageAfter returns a bounded keyset page and whether more
+// pending operations remain after it. The cursor is ordered by the durable
+// journal insertion timestamp and operation identity, so unresolved old rows
+// cannot starve later rows across maintenance rounds.
+func (s *Store) PendingOperationsPageAfter(ctx context.Context, afterCreatedAt, afterOperationID string, limit int) ([]Operation, bool, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 25
 	}
-	return s.listObservedOperations(ctx, fmt.Sprintf(`SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending' ORDER BY created_at, operation_id LIMIT %d`, limit))
+	query := `SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending'`
+	args := make([]any, 0, 3)
+	if afterCreatedAt != "" {
+		query += ` AND (created_at > ? OR (created_at = ? AND operation_id > ?))`
+		args = append(args, afterCreatedAt, afterCreatedAt, afterOperationID)
+	}
+	query += ` ORDER BY created_at, operation_id LIMIT ?`
+	args = append(args, limit+1)
+	values, err := s.listObservedOperationsArgs(ctx, query, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	more := len(values) > limit
+	if more {
+		values = values[:limit]
+	}
+	return values, more, nil
+}
+
+// PendingOperationsForIdentity keeps lifecycle cleanup lookup bounded to the
+// session generation and action it is reconciling. Two rows are enough to
+// detect a duplicate journal identity without scanning the whole journal.
+func (s *Store) PendingOperationsForIdentity(ctx context.Context, action, sessionID string, generation int64) ([]Operation, error) {
+	return s.listObservedOperationsArgs(ctx, `SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending' AND action = ? AND session_id = ? AND generation = ? ORDER BY created_at, operation_id LIMIT 2`, action, sessionID, generation)
+}
+
+// PendingOperationsForSessionPage keeps worker-scope checks bounded while
+// failing closed when a session has more pending journal rows than the page.
+func (s *Store) PendingOperationsForSessionPage(ctx context.Context, sessionID string, limit int) ([]Operation, bool, error) {
+	if limit <= 0 || limit > 256 {
+		limit = 128
+	}
+	values, err := s.listObservedOperationsArgs(ctx, `SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending' AND session_id = ? ORDER BY created_at, operation_id LIMIT ?`, sessionID, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	more := len(values) > limit
+	if more {
+		values = values[:limit]
+	}
+	return values, more, nil
 }
 
 // ReconciledUnknownOperations remains observable after a superseded operation
@@ -1206,9 +1267,13 @@ func (s *Store) ReconciledUnknownOperations(ctx context.Context) ([]Operation, e
 }
 
 func (s *Store) listObservedOperations(ctx context.Context, query string) ([]Operation, error) {
+	return s.listObservedOperationsArgs(ctx, query)
+}
+
+func (s *Store) listObservedOperationsArgs(ctx context.Context, query string, args ...any) ([]Operation, error) {
 	var values []Operation
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
-		rows, err := conn.QueryContext(ctx, query)
+		rows, err := conn.QueryContext(ctx, query, args...)
 		if err != nil {
 			return err
 		}

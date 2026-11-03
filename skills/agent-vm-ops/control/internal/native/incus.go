@@ -121,8 +121,8 @@ type CommandError struct {
 }
 
 // IsNotFound reports only an Incus command failure whose diagnostics identify
-// a missing instance. Callers use this to finalize a durable destroy intent;
-// unrelated ownership or transport failures remain unverified.
+// the requested instance and project as missing. Callers use this to finalize
+// a durable destroy intent; generic or unrelated failures remain unverified.
 func IsNotFound(err error, instance, project string) bool {
 	var commandErr *CommandError
 	var exitErr *exec.ExitError
@@ -130,9 +130,6 @@ func IsNotFound(err error, instance, project string) bool {
 		return false
 	}
 	diagnostic := strings.ToLower(strings.TrimSpace(string(commandErr.Result.Stderr)))
-	if diagnostic == "instance not found" || diagnostic == "error: instance not found" {
-		return true
-	}
 	if instance == "" || project == "" {
 		return false
 	}

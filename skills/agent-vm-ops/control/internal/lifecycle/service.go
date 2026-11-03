@@ -58,11 +58,16 @@ func newTimerOperationID(action string) string {
 	return fmt.Sprintf("timer-%s-%s-%d", timerInstanceID, strings.TrimPrefix(action, "timer-"), atomic.AddUint64(&timerOperationSequence, 1))
 }
 
+func timerExpireOperationID(taskID string, generation int64) string {
+	digest := sha256.Sum256([]byte(taskID + "\x00" + strconv.FormatInt(generation, 10)))
+	return "timer-expire-" + hex.EncodeToString(digest[:12])
+}
+
 var (
 	writeActions = map[string]bool{
 		"acquire": true, "renew": true, "release": true, "destroy": true,
 		"restart": true, "resize": true, "port-add": true, "port-remove": true,
-		"drain-enter": true, "drain-exit": true, "admin-reconcile": true, "admin-gc": true,
+		"timer-expire": true, "drain-enter": true, "drain-exit": true, "admin-reconcile": true, "admin-gc": true,
 	}
 	sessionActions = map[string]bool{
 		"status": true, "acquire": true, "renew": true, "release": true,
@@ -104,6 +109,7 @@ type Service struct {
 }
 
 type internalCleanupContextKey struct{}
+type sessionLockHeldContextKey struct{}
 
 type adminStatusProbeResult struct {
 	index    int
@@ -120,6 +126,15 @@ func withInternalCleanup(ctx context.Context) context.Context {
 
 func isInternalCleanup(ctx context.Context) bool {
 	value, _ := ctx.Value(internalCleanupContextKey{}).(bool)
+	return value
+}
+
+func withSessionLockHeld(ctx context.Context) context.Context {
+	return context.WithValue(ctx, sessionLockHeldContextKey{}, true)
+}
+
+func isSessionLockHeld(ctx context.Context) bool {
+	value, _ := ctx.Value(sessionLockHeldContextKey{}).(bool)
 	return value
 }
 
@@ -826,9 +841,19 @@ func (s *Service) updateWorker(ctx context.Context, operationID string, worker m
 }
 
 func (s *Service) pendingWorkerUnresolved(ctx context.Context, sessionID *string, currentOperationID, recoveryCoordinatorID string) (bool, error) {
-	pending, err := s.Store.PendingOperations(ctx)
+	var pending []state.Operation
+	var more bool
+	var err error
+	if sessionID != nil {
+		pending, more, err = s.Store.PendingOperationsForSessionPage(ctx, *sessionID, 128)
+	} else {
+		pending, more, err = s.Store.PendingOperationsPageAfter(ctx, "", "", 128)
+	}
 	if err != nil {
 		return false, err
+	}
+	if more {
+		return true, nil
 	}
 	for _, operation := range pending {
 		if !sameWorkerScope(sessionID, operation.SessionID) {
@@ -1193,7 +1218,7 @@ func activationSafeQueuedPort(operation state.Operation) bool {
 
 func operationHasNativeEffect(action string) bool {
 	switch action {
-	case "acquire", "release", "destroy", "restart", "resize", "port-add", "port-remove", "admin-reconcile", "admin-gc", "timer-reconcile", "timer-age-gc":
+	case "acquire", "release", "destroy", "restart", "resize", "port-add", "port-remove", "timer-expire", "admin-reconcile", "admin-gc", "timer-reconcile", "timer-age-gc":
 		return true
 	default:
 		return false
@@ -1254,6 +1279,22 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		}
 		if request["generation"] == nil {
 			request["generation"] = int64(0)
+		}
+	}
+	if action == "timer-expire" {
+		if request["session_id"] == nil {
+			task, taskErr := s.Store.GetTask(ctx, map[string]any{"task_id": stringValue(request["task_id"])})
+			if taskErr != nil {
+				return nil, s.sqliteError(taskErr)
+			}
+			if task != nil {
+				request = cloneMap(request)
+				request["session_id"] = task.SessionID
+			}
+		}
+		if request["operation_id"] == nil {
+			request = cloneMap(request)
+			request["operation_id"] = timerExpireOperationID(stringValue(request["task_id"]), intValue(request["generation"]))
 		}
 	}
 	if sessionActions[action] && request["session_id"] == nil {
@@ -3762,8 +3803,7 @@ func (s *Service) reconcile(ctx context.Context, apply bool, mode ...string) (ma
 			action := map[string]any{"task_id": task.TaskID, "generation": task.Generation, "action": "close-incomplete-or-expired"}
 			actions = append(actions, action)
 			if apply {
-				request := protocol.Request{"protocol": protocol.Version, "action": "timer-expire", "task_id": task.TaskID, "generation": task.Generation}
-				if _, expireErr := s.expire(ctx, request); expireErr != nil && firstErr == nil {
+				if expireErr := s.maintenanceExpire(ctx, &task); expireErr != nil && firstErr == nil {
 					firstErr = expireErr
 				}
 			}
@@ -3825,18 +3865,34 @@ func (s *Service) reconcileClosing(ctx context.Context, task *state.Task) error 
 		return resourceLockError(lockErr)
 	}
 	defer unlock()
-	pending, err := s.Store.PendingOperations(ctx)
+	releasePending, err := s.Store.PendingOperationsForIdentity(ctx, "release", task.SessionID, task.Generation)
 	if err != nil {
 		return s.sqliteError(err)
 	}
+	destroyPending, err := s.Store.PendingOperationsForIdentity(ctx, "destroy", task.SessionID, task.Generation)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	pending := append(releasePending, destroyPending...)
 	request, operationID, err := s.pendingCleanupRequest(ctx, task.SessionID, task.Generation, "release")
 	if err != nil {
 		return err
 	}
+	action := "release"
+	if operationID == "" {
+		var timerOperationID string
+		request, timerOperationID, err = s.pendingCleanupRequest(ctx, task.SessionID, task.Generation, "timer-expire")
+		if err != nil {
+			return err
+		}
+		if timerOperationID != "" {
+			operationID = timerOperationID
+			action = "timer-expire"
+		}
+	}
 	if operationID != "" && s.operationActive(operationID) {
 		return protocol.NewError("operation_unverified", "pending release is active", nil)
 	}
-	action := "release"
 	for _, op := range pending {
 		if op.Action != "destroy" || op.SessionID == nil || *op.SessionID != task.SessionID || op.Generation == nil || *op.Generation != task.Generation {
 			continue
@@ -3862,6 +3918,10 @@ func (s *Service) reconcileClosing(ctx context.Context, task *state.Task) error 
 		}
 		action = "destroy"
 		operationID = op.OperationID
+	}
+	if operationID == "" {
+		_, err := s.maintenanceCleanup(withSessionLockHeld(ctx), task, "release")
+		return err
 	}
 	if operationID != "" {
 		ctx = native.WithWorkerRecorder(ctx, operationID, s)
@@ -3961,9 +4021,12 @@ func (s *Service) reconcilePendingAbsentDestroyOne(ctx context.Context, operatio
 	} else if unresolved {
 		return protocol.NewError("startup_reconcile_required", "pending absent destroy worker ownership remains unresolved", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
 	}
-	otherPending, err := s.Store.PendingOperations(ctx)
+	otherPending, morePending, err := s.Store.PendingOperationsForSessionPage(ctx, *operation.SessionID, 128)
 	if err != nil {
 		return s.sqliteError(err)
+	}
+	if morePending {
+		return protocol.NewError("startup_reconcile_required", "same-session pending journal exceeds bounded recovery page", map[string]any{"operation_id": operation.OperationID, "admission_ready": false})
 	}
 	for _, other := range otherPending {
 		if other.OperationID == operation.OperationID || other.SessionID == nil || *other.SessionID != *operation.SessionID || !operationHasNativeEffect(other.Action) {
@@ -4034,7 +4097,7 @@ func terminalWorkerVerified(worker map[string]any) (bool, error) {
 }
 
 func (s *Service) pendingCleanupRequest(ctx context.Context, session string, generation int64, action string) (protocol.Request, string, error) {
-	pending, err := s.Store.PendingOperations(ctx)
+	pending, err := s.Store.PendingOperationsForIdentity(ctx, action, session, generation)
 	if err != nil {
 		return nil, "", s.sqliteError(err)
 	}
@@ -4114,7 +4177,7 @@ func (s *Service) deleteDestroyedTask(ctx context.Context, request protocol.Requ
 }
 
 func (s *Service) finalizePendingCleanup(ctx context.Context, session string, generation int64, action string, result map[string]any) error {
-	pending, err := s.Store.PendingOperations(ctx)
+	pending, err := s.Store.PendingOperationsForIdentity(ctx, action, session, generation)
 	if err != nil {
 		return s.sqliteError(err)
 	}
@@ -4197,7 +4260,11 @@ func (s *Service) expire(ctx context.Context, request protocol.Request) (map[str
 	if !marked {
 		return map[string]any{"expired": false}, nil
 	}
-	return s.release(withInternalCleanup(ctx), protocol.Request{"session_id": task.SessionID, "generation": task.Generation}, false)
+	cleanupRequest := protocol.Request{"protocol": protocol.Version, "action": "release", "session_id": task.SessionID, "generation": task.Generation}
+	if operationID := stringValue(request["operation_id"]); operationID != "" {
+		cleanupRequest["operation_id"] = operationID
+	}
+	return s.release(withInternalCleanup(ctx), cleanupRequest, false)
 }
 
 func (s *Service) doctor(ctx context.Context) (map[string]any, error) {
