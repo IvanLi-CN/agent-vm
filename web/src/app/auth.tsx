@@ -12,6 +12,7 @@ import {
 } from "./api";
 import type { ManagementSession } from "./types";
 import { Button, Panel } from "../components/ui";
+import { changeLocale } from "./i18n";
 
 export type ManagementAuthStatus = "loading" | "unauthenticated" | "authenticated" | "suspended" | "error";
 
@@ -111,35 +112,44 @@ export function useManagementAuth(): ManagementAuthContextValue {
 }
 
 export function ManagementAuthBoundary({ children }: { children: ReactNode }) {
-  const { t } = useTranslation();
   const auth = useManagementAuth();
-  const content = <div className={`auth-content ${auth.status === "suspended" ? "auth-preserved-content" : ""}`} aria-hidden={auth.status === "suspended" ? "true" : undefined}>{children}</div>;
-  if (!auth.managed || auth.status === "authenticated") return content;
+  if (!auth.managed || auth.status === "authenticated") return <>{children}</>;
 
   if (auth.status === "suspended") {
-    return <>
-      {content}
-      <AuthGate title={t("shell.sessionExpired")} description={t("shell.sessionExpiredText")} loginLabel={t("shell.signInAgain")} loginHref={auth.loginHref} />
-    </>;
+    return <AuthErrorLayout titleKey="shell.sessionExpired" descriptionKey="shell.sessionExpiredText" loginLabelKey="shell.signInAgain" loginHref={auth.loginHref} />;
   }
-  if (auth.status === "loading") return <AuthGate title={t("shell.sessionPending")} description={t("shell.sessionPendingText")} />;
-  if (auth.status === "error") return <AuthGate title={t("shell.authUnavailable")} description={t("shell.authUnavailableText")} retry={auth.retry} />;
-  return <AuthGate
-    title={auth.authFailure ? t("shell.authFailed") : t("shell.signedOut")}
-    description={auth.authFailure ? t("shell.authFailedText") : t("shell.signInText")}
-    loginLabel={t("shell.signIn")}
+  if (auth.status === "loading") return <AuthErrorLayout titleKey="shell.sessionPending" descriptionKey="shell.sessionPendingText" />;
+  if (auth.status === "error") return <AuthErrorLayout titleKey="shell.authUnavailable" descriptionKey="shell.authUnavailableText" retry={auth.retry} />;
+  return <AuthErrorLayout
+    titleKey={auth.authFailure ? "shell.authFailed" : "shell.signedOut"}
+    descriptionKey={auth.authFailure ? "shell.authFailedText" : "shell.signInText"}
+    loginLabelKey="shell.signInOidc"
     loginHref={auth.loginHref}
   />;
 }
 
-function AuthGate({ title, description, loginLabel, loginHref, retry }: { title: string; description: string; loginLabel?: string; loginHref?: string; retry?: () => void }) {
-  const { t } = useTranslation();
-  return <Panel className="auth-gate" role="status" aria-live="polite">
-    <div className="auth-gate-icon" aria-hidden="true"><ShieldAlert /></div>
-    <div className="auth-gate-copy"><h1>{title}</h1><p>{description}</p></div>
-    <div className="auth-gate-actions">
-      {loginHref && loginLabel ? <a className="ui-button ui-button-primary auth-login-link" href={loginHref}><LogIn aria-hidden="true" /><span>{loginLabel}</span></a> : null}
-      {retry ? <Button variant="ghost" onClick={retry}>{t("common.retry")}</Button> : null}
-    </div>
-  </Panel>;
+function AuthErrorLayout({ titleKey, descriptionKey, loginLabelKey, loginHref, retry }: { titleKey: string; descriptionKey: string; loginLabelKey?: string; loginHref?: string; retry?: () => void }) {
+  const { t, i18n } = useTranslation();
+  const locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
+  const title = t(titleKey);
+  return <div className="auth-page" data-testid="auth-error-layout">
+    <header className="auth-page-header">
+      <div className="auth-page-brand"><div className="auth-page-brand-mark" aria-hidden="true">A</div><div><strong>{t("product")}</strong><span>{t("productSub")}</span></div></div>
+      <div className="auth-page-header-actions">
+        {loginHref && loginLabelKey ? <a className="ui-button ui-button-primary auth-login-link" href={loginHref}><LogIn aria-hidden="true" /><span>{t(loginLabelKey)}</span></a> : null}
+        {retry ? <Button variant="ghost" onClick={retry}>{t("common.retry")}</Button> : null}
+        <div className="auth-page-locale" role="group" aria-label={t("shell.language")}>
+          <button className={locale === "zh-CN" ? "selected" : ""} onClick={() => void changeLocale("zh-CN")}>中</button>
+          <button className={locale === "en" ? "selected" : ""} onClick={() => void changeLocale("en")}>EN</button>
+        </div>
+      </div>
+    </header>
+    <main className="auth-page-main">
+      <Panel className="auth-page-card" role="status" aria-live="polite">
+        <div className="auth-page-icon" aria-hidden="true"><ShieldAlert /></div>
+        <div className="auth-page-copy"><h1>{title}</h1><p>{t(descriptionKey)}</p></div>
+      </Panel>
+    </main>
+    <footer className="auth-page-footer">{t("shell.oidcOnly")}</footer>
+  </div>;
 }

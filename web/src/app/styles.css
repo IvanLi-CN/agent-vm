@@ -343,16 +343,28 @@ svg { flex: none; }
 .empty-state strong { color: var(--text); font-weight: 500; }
 .empty-state p { max-width: 28ch; margin-top: 4px; font-size: 12px; }
 .query-error { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 20px; }
-.auth-gate { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 16px; min-height: 180px; padding: 28px; border-left: 3px solid var(--accent); }
-.auth-gate-icon { display: grid; place-items: center; width: 44px; height: 44px; color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); border-radius: 50%; }
-.auth-gate-icon svg { width: 22px; height: 22px; }
-.auth-gate-copy h1 { margin: 0 0 6px; font-size: 22px; }
-.auth-gate-copy p { max-width: 620px; margin: 0; color: var(--muted); line-height: 1.55; }
-.auth-gate-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; justify-content: flex-end; }
+.auth-page { display: flex; flex-direction: column; min-height: 100vh; background: var(--frame); }
+.auth-page-header { display: flex; align-items: center; justify-content: space-between; min-height: 72px; padding: 16px 28px; }
+.auth-page-brand { display: flex; align-items: center; gap: 10px; }
+.auth-page-brand strong, .auth-page-brand span { display: block; }
+.auth-page-brand strong { font-size: 15px; font-weight: 600; }
+.auth-page-brand span { margin-top: 1px; color: var(--muted); font-size: 12px; }
+.auth-page-brand-mark { display: grid; place-items: center; width: 32px; height: 32px; color: #fff; background: var(--accent); border-radius: 6px; font-weight: 600; }
+.auth-page-header-actions { display: flex; align-items: center; gap: 10px; margin-left: auto; }
+.auth-page-header-actions .ui-button { min-height: 36px; }
+.auth-page-locale { display: flex; gap: 2px; padding: 2px; background: var(--raised); border-radius: 6px; }
+.auth-page-locale button { min-width: 36px; min-height: 32px; padding: 0 8px; color: var(--muted); background: transparent; border: 0; border-radius: 4px; font-size: 12px; }
+.auth-page-locale button.selected { color: var(--text); background: var(--surface); border: 1px solid var(--border); }
+.auth-page-main { display: grid; flex: 1; place-items: center; padding: 56px 24px 72px; }
+.auth-page-card { width: min(560px, 100%); padding: 40px; border-radius: 8px; box-shadow: 0 16px 36px rgba(19,20,22,.08); }
+.auth-page-icon { display: grid; place-items: center; width: 56px; height: 56px; color: var(--accent); background: var(--accent-soft); border-radius: 50%; }
+.auth-page-icon svg { width: 26px; height: 26px; }
+.auth-page-copy { margin-top: 24px; }
+.auth-page-copy h1 { font-size: 28px; line-height: 34px; }
+.auth-page-copy p { max-width: 54ch; margin-top: 10px; color: var(--muted); font-size: 15px; line-height: 1.6; }
 .auth-login-link { display: inline-flex; align-items: center; gap: 8px; text-decoration: none; }
 .auth-login-link svg { width: 16px; height: 16px; }
-.auth-content { display: contents; }
-.auth-content.auth-preserved-content { display: none; }
+.auth-page-footer { padding: 0 24px 24px; color: var(--muted); font-size: 12px; text-align: center; }
 .loading-rows { display: flex; flex-direction: column; gap: 12px; padding: 20px; }
 .loading-rows > span { display: block; height: 16px; background: #e9edef; border-radius: 3px; }
 .loading-rows > span:nth-child(2) { width: 72%; }
@@ -473,8 +485,13 @@ svg { flex: none; }
 }
 
 @media (max-width: 560px) {
-  .auth-gate { grid-template-columns: auto minmax(0, 1fr); align-items: start; padding: 22px; }
-  .auth-gate-actions { grid-column: 1 / -1; justify-content: flex-start; }
+  .auth-page-header { min-height: 64px; padding: 12px 16px; gap: 12px; }
+  .auth-page-header-actions { flex-wrap: wrap; justify-content: flex-end; }
+  .auth-page-main { align-items: start; padding: 36px 16px 52px; }
+  .auth-page-card { padding: 28px 22px; }
+  .auth-page-copy h1 { font-size: 24px; line-height: 30px; }
+  .auth-page-header-actions .ui-button { min-height: 44px; }
+  .auth-page-footer { padding: 0 16px 16px; }
   body { font-size: 14px; }
   h1 { font-size: 20px; line-height: 26px; }
   .ui-button { min-height: 44px; }

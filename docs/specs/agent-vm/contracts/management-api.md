@@ -12,11 +12,11 @@
 
 服务创建不透明浏览器会话，属性为 `Secure`、`HttpOnly`、`SameSite=Strict`、`Path=/` 和有界 TTL。会话元数据在共享状态中保存主体二元组、角色、capability、创建/过期/撤销状态以及会话标识摘要。`GET /api/v1/session` 返回主体、角色、capability 和绑定会话的 CSRF token。每个 `POST` 和 `PUT` 都必须携带 cookie、`X-CSRF-Token`，并携带与配置 HTTPS origin 完全相同的 `Origin`；禁用 CORS。浏览器会话不是 Agent Token，绝不能用于 `/agent/v1/control`。
 
-静态管理入口必须与认证数据面分离。服务可以在没有浏览器会话时返回固定 HTML、JavaScript、CSS 和允许的管理页面深链接；该响应不得包含管理数据，也不能证明浏览器已经认证。SPA 必须先通过认证门面请求 `/api/v1/session`，再展示管理员主体、capability 或受管资源。收到 `authentication_required` 时必须显示本地化登录状态和明确的登录操作，不得形成无界 retry 循环。
+静态管理入口必须与认证数据面分离。服务可以在没有浏览器会话时返回固定 HTML、JavaScript、CSS 和允许的管理页面深链接；该响应不得包含管理数据，也不能证明浏览器已经认证。SPA 必须先通过认证门面请求 `/api/v1/session`，再展示管理员主体、capability 或受管资源。收到 `authentication_required` 时必须显示本地化登录状态和明确的登录操作，不得形成无界 retry 循环。未认证、OIDC 回跳失败或 session loss 时，认证门面必须卸载后台普通 layout，改为独立 auth-error layout；该 layout 不得渲染后台导航、后台数据或管理员身份，并在顶栏提供直接发起 OIDC 的登录按钮。登录按钮必须使用当前 allowlisted `return_to`，不得绕过 OIDC 或自动恢复未确认的 mutation。
 
 `GET /api/v1/auth/oidc/start` 可以接收 `return_to` 路径。服务必须把它限制为同源管理页面允许列表（`/`、`/vms`、`/images`、`/operations` 或 `/system`），拒绝重复参数、未知参数、绝对 URL、协议相对 URL、路径逃逸和其他路径，并存入一次性 OIDC 事务。`oidc_transactions` 的既有列不得改写；回跳路径保存在以 `state_digest` 为键的 `oidc_transaction_return_paths` companion table 中，并由 `oidc-return-path@1` capability marker 表示。旧事务缺少 companion row 时必须按 `/` 处理。会话创建后，成功 callback 跳转到该路径；未提供时跳转到 `/`。provider 拒绝、主体不在 allowlist 或 callback 失败时跳转到 `/?auth=failed`，不得暴露 provider 诊断信息。前端消费该标记并从地址栏清除。
 
-任何管理 API 请求返回 `401 authentication_required` 或 `csrf_invalid` 时，前端集中式 `ManagementAuthState` 必须在 `loading`、`unauthenticated`、`authenticated`、`suspended` 和 `error` 之间转移：真实 API 首先 bootstrap `/api/v1/session`，未认证时不得显示管理员主体、capability 或受管资源；失效时暂停查询和 mutation，保留当前页面路径与已有 operation ID，等待用户明确重新认证。登录成功后重新 bootstrap `/api/v1/session` 并加载页面数据。前端不得自动重放 mutation；已经或可能已经提交的 mutation 必须继续绑定原 operation ID，并通过 operation endpoint reconciliation。
+任何管理 API 请求返回 `401 authentication_required` 或 `csrf_invalid` 时，前端集中式 `ManagementAuthState` 必须在 `loading`、`unauthenticated`、`authenticated`、`suspended` 和 `error` 之间转移：真实 API 首先 bootstrap `/api/v1/session`，未认证时不得显示管理员主体、capability 或受管资源；失效时卸载后台普通 layout，显示独立 auth-error layout，暂停 query 和 mutation，保留当前页面路径与已有 operation ID，等待用户明确重新认证。登录成功后重新 bootstrap `/api/v1/session` 并加载页面数据。前端不得自动重放 mutation；已经或可能已经提交的 mutation 必须继续绑定原 operation ID，并通过 operation endpoint reconciliation。
 
 部署输入必须明确；任何必要配置不完整时，管理 listener 必须关闭：
 

@@ -43,11 +43,13 @@ describe("management authentication gate", () => {
     window.history.replaceState({}, "", "/");
   });
 
-  it("shows an explicit login without rendering protected content", async () => {
+  it("shows a standalone login layout without rendering the management shell", async () => {
     getSessionMock.mockRejectedValue(new ManagementRequestError("authentication_required"));
     renderGate();
 
-    expect(await screen.findByRole("link", { name: "登录管理台" })).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2Fvms");
+    expect(await screen.findByRole("link", { name: "使用 OIDC 登录" })).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2Fvms");
+    expect(screen.getByTestId("auth-error-layout")).toBeInTheDocument();
+    expect(document.querySelector(".app-frame")).not.toBeInTheDocument();
     expect(screen.queryByTestId("protected")).not.toBeInTheDocument();
     expect(screen.queryByText("单一管理员")).not.toBeInTheDocument();
   });
@@ -63,14 +65,15 @@ describe("management authentication gate", () => {
     expect(consumeAuthFailureFlag()).toBe(false);
   });
 
-  it("preserves mounted content while a live session is suspended", async () => {
+  it("removes the management shell when a live session is suspended", async () => {
     getSessionMock.mockResolvedValue({ issuer: "https://issuer.example", subject: "admin@example", role: "administrator", capabilities: ["read"], csrf_token: "csrf", expires_at: "2099-01-01T00:00:00Z" });
     renderGate();
     expect(await screen.findByTestId("protected")).toBeInTheDocument();
 
     emitAuthFailure(new ManagementRequestError("csrf_invalid"));
     expect(await screen.findByText("会话已失效")).toBeInTheDocument();
-    expect(screen.getByTestId("protected")).toBeInTheDocument();
-    await waitFor(() => expect(screen.getByTestId("protected").parentElement).toHaveAttribute("aria-hidden", "true"));
+    await waitFor(() => expect(screen.queryByTestId("protected")).not.toBeInTheDocument());
+    expect(document.querySelector(".app-frame")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "重新使用 OIDC 登录" })).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2Fvms");
   });
 });

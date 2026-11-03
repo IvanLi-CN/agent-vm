@@ -18,10 +18,16 @@ test("shows an explicit login for an unauthenticated deep link", async ({ page }
   await page.goto("/vms");
 
   await expect(page.getByRole("heading", { name: /signed out|未登录/i })).toBeVisible();
-  const login = page.getByRole("link", { name: /sign in to management|登录管理台/i });
+  await expect(page.getByTestId("auth-error-layout")).toBeVisible();
+  await expect(page.locator(".app-frame")).toHaveCount(0);
+  const login = page.getByRole("link", { name: /continue with oidc|使用 oidc 登录/i });
   await expect(login).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2Fvms");
   await expect(page.getByText(/sole administrator|单一管理员/i)).toHaveCount(0);
   await expect(page.getByTestId("vms-page")).toHaveCount(0);
+
+  await page.route("**/api/v1/auth/oidc/start*", (route) => route.fulfill({ status: 200, contentType: "text/html", body: "OIDC start" }));
+  await login.click();
+  await expect(page).toHaveURL(/\/api\/v1\/auth\/oidc\/start\?return_to=%2Fvms/);
 });
 
 test("localizes callback failure and removes the auth marker", async ({ page }) => {
@@ -30,6 +36,7 @@ test("localizes callback failure and removes the auth marker", async ({ page }) 
 
   await expect(page).toHaveURL(/\/vms$/);
   await expect(page.getByRole("heading", { name: /sign-in did not complete|登录未完成/i })).toBeVisible();
+  await expect(page.locator(".app-frame")).toHaveCount(0);
   await expect(page.locator("body")).not.toContainText("error_description");
 });
 
@@ -43,7 +50,8 @@ test("suspends a page after session loss without refetching the resource", async
   await page.goto("/vms");
 
   await expect(page.getByRole("heading", { name: /session expired|会话已失效/i })).toBeVisible();
-  await expect(page.getByRole("link", { name: /sign in again|重新登录/i })).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2Fvms");
+  await expect(page.getByRole("link", { name: /sign in again|重新使用 oidc 登录/i })).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2Fvms");
+  await expect(page.locator(".app-frame")).toHaveCount(0);
   await expect(page.getByText("admin@example", { exact: true })).toHaveCount(0);
   const requestCount = vmRequests;
   await page.waitForTimeout(300);

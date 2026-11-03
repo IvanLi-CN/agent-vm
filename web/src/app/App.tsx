@@ -43,7 +43,7 @@ function ConsoleApp() {
   if (isDemoRuntime() && runtime.bootstrapError) {
     return <div className="demo-boot-error"><div><span className="eyebrow-label">{t("demo.eyebrow")}</span><h1>{t("demo.bootFailed")}</h1><p>{t("demo.bootFailedText")}</p><code>{runtime.bootstrapError}</code></div></div>;
   }
-  return <ManagementAuthProvider><Shell key={`${page}-${runtime.revision}`} page={page}><div className="sr-only" aria-live="polite">{t(`nav.${page}`)}</div><ManagementAuthBoundary>{page === "overview" ? <OverviewPage /> : page === "vms" ? <VMsPage /> : page === "images" ? <ImagesPage /> : page === "operations" ? <OperationsPage /> : <SystemPage />}</ManagementAuthBoundary></Shell></ManagementAuthProvider>;
+  return <ManagementAuthProvider><ManagementAuthBoundary><Shell key={`${page}-${runtime.revision}`} page={page}><div className="sr-only" aria-live="polite">{t(`nav.${page}`)}</div>{page === "overview" ? <OverviewPage /> : page === "vms" ? <VMsPage /> : page === "images" ? <ImagesPage /> : page === "operations" ? <OperationsPage /> : <SystemPage />}</Shell></ManagementAuthBoundary></ManagementAuthProvider>;
 }
 
 export function App({ client = queryClient }: { client?: QueryClient } = {}) {
