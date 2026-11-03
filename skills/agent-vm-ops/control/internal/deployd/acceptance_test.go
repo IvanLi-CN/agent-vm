@@ -63,12 +63,13 @@ func TestServeUDSRefusesLiveAndReplacesStaleSocket(t *testing.T) {
 }
 
 type acceptanceRuntime struct {
-	mu        sync.Mutex
-	active    string
-	slots     map[string]SlotObservation
-	draining  map[string]bool
-	traffic   map[string]bool
-	uncertain bool
+	mu             sync.Mutex
+	active         string
+	slots          map[string]SlotObservation
+	draining       map[string]bool
+	traffic        map[string]bool
+	uncertain      bool
+	stageUncertain bool
 }
 
 func newAcceptanceRuntime() *acceptanceRuntime {
@@ -125,6 +126,9 @@ func (runtime *acceptanceRuntime) Observe(context.Context) (RuntimeSnapshot, err
 func (runtime *acceptanceRuntime) Stage(_ context.Context, slot, _ string) error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
+	if runtime.stageUncertain {
+		return &UncertainError{Cause: errors.New("acceptance stage response was interrupted")}
+	}
 	value := runtime.slots[slot]
 	value.Slot = slot
 	value.ProcessUp = true
@@ -359,6 +363,33 @@ func TestDeploydAgentVMAcceptance(t *testing.T) {
 	runtime.uncertain = false
 	runtime.mu.Unlock()
 	callDeploydJSON(t, client, http.MethodPost, "/v1/recover", map[string]any{"transaction_id": uncertainID, "action": "rollback"})
+
+	runtime.mu.Lock()
+	runtime.stageUncertain = true
+	runtime.mu.Unlock()
+	uncertainStagePayload, uncertainStageStatus, uncertainStageErr := client.Call(ctx, http.MethodPost, "/v1/stage", map[string]any{"target_slot": "green", "bundle": "/verified/green-stage-uncertain.json"})
+	if uncertainStageErr == nil || uncertainStageStatus != http.StatusConflict {
+		t.Fatalf("uncertain stage status=%d err=%v payload=%s", uncertainStageStatus, uncertainStageErr, uncertainStagePayload)
+	}
+	var uncertainStageEnvelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(uncertainStagePayload, &uncertainStageEnvelope); err != nil {
+		t.Fatal(err)
+	}
+	if uncertainStageEnvelope.Error.Code != "state_unverified" {
+		t.Fatalf("uncertain stage error code = %q, want state_unverified", uncertainStageEnvelope.Error.Code)
+	}
+	runtime.mu.Lock()
+	runtime.stageUncertain = false
+	runtime.mu.Unlock()
+	activeTransactions, err := database.ListActive(ctx)
+	if err != nil || len(activeTransactions) != 1 || activeTransactions[0].State != "needs_recovery" {
+		t.Fatalf("uncertain stage transaction = %#v err=%v", activeTransactions, err)
+	}
+	callDeploydJSON(t, client, http.MethodPost, "/v1/recover", map[string]any{"transaction_id": activeTransactions[0].ID, "action": "rollback"})
 
 	restartTransaction := store.Transaction{
 		ID: "tx-restart-acceptance", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/verified/restart.json",

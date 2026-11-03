@@ -236,6 +236,10 @@ func (server *Server) stage(c *gin.Context) {
 	}
 	transaction, err := server.Manager.Stage(c.Request.Context(), value.TargetSlot, value.Bundle)
 	if err != nil {
+		if errors.Is(err, ErrUncertain) {
+			writeError(c, http.StatusConflict, "state_unverified", err.Error())
+			return
+		}
 		writeError(c, http.StatusConflict, "stage_rejected", err.Error())
 		return
 	}
