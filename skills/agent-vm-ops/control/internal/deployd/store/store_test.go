@@ -145,7 +145,8 @@ func TestStoreKeepsNeedsRecoveryTransaction(t *testing.T) {
 	if err := s.Create(context.Background(), transaction, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RecordFailure(context.Background(), transaction.ID, "activate", "state_unverified", "test", "digest", map[string]any{"uncertain": true}, now.Add(-90*time.Minute)); err != nil {
+	payload := map[string]any{"uncertain": true}
+	if err := s.RecordFailure(context.Background(), transaction.ID, "activate", "state_unverified", "test", testPayloadDigest(t, payload), payload, now.Add(-90*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	removed, err := s.Cleanup(context.Background(), now)
@@ -169,7 +170,8 @@ func TestStoreCleansDeterministicallyFailedTransaction(t *testing.T) {
 	if err := s.Create(context.Background(), transaction, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RecordFailure(context.Background(), transaction.ID, "stage", "deployment_failed", "test", "digest", map[string]any{"uncertain": false}, now.Add(-90*time.Minute)); err != nil {
+	payload := map[string]any{"uncertain": false}
+	if err := s.RecordFailure(context.Background(), transaction.ID, "stage", "deployment_failed", "test", testPayloadDigest(t, payload), payload, now.Add(-90*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	active, err := s.ListActive(context.Background())
@@ -201,10 +203,10 @@ func TestStorePersistsFenceTermsAndMakesRecoveryFailuresIdempotent(t *testing.T)
 		t.Fatal(err)
 	}
 	payload := map[string]any{"message": "effect result was lost", "uncertain": true}
-	if err := s.RecordFailure(context.Background(), transaction.ID, transaction.Phase, "state_unverified", "test", "digest-1", payload, now); err != nil {
+	if err := s.RecordFailure(context.Background(), transaction.ID, transaction.Phase, "state_unverified", "test", testPayloadDigest(t, payload), payload, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RecordFailure(context.Background(), transaction.ID, transaction.Phase, "state_unverified", "test", "digest-2", payload, now.Add(time.Second)); err != nil {
+	if err := s.RecordFailure(context.Background(), transaction.ID, transaction.Phase, "state_unverified", "test", testPayloadDigest(t, payload), payload, now.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	current, err := s.Get(context.Background(), transaction.ID)
@@ -233,4 +235,35 @@ func TestStorePersistsFenceTermsAndMakesRecoveryFailuresIdempotent(t *testing.T)
 	if err != nil || second != 2 {
 		t.Fatalf("persisted fencing term = %d err=%v", second, err)
 	}
+}
+
+func TestStoreRejectsFailureEvidenceDigestMismatch(t *testing.T) {
+	now := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	s, err := Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	transaction := Transaction{ID: "tx-bad-failure-digest", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: "stage", Generation: 1, CreatedAt: now, UpdatedAt: now}
+	if err := s.Create(context.Background(), transaction, nil); err != nil {
+		t.Fatal(err)
+	}
+	payload := map[string]any{"message": "stage failed"}
+	if err := s.RecordFailure(context.Background(), transaction.ID, transaction.Phase, "deployment_failed", "test", "wrong-digest", payload, now); err == nil {
+		t.Fatal("mismatched failure evidence digest was accepted")
+	}
+	current, err := s.Get(context.Background(), transaction.ID)
+	if err != nil || current == nil || current.State != "active" {
+		t.Fatalf("transaction after rejected failure evidence = %#v err=%v", current, err)
+	}
+}
+
+func testPayloadDigest(t *testing.T, payload map[string]any) string {
+	t.Helper()
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
 }

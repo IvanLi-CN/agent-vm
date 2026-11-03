@@ -456,6 +456,10 @@ func (s *Store) RecordFailure(ctx context.Context, id, phase, code, source, dige
 	if err != nil {
 		return err
 	}
+	digestValue := sha256.Sum256([]byte(encoded))
+	if digest != hex.EncodeToString(digestValue[:]) {
+		return errors.New("failure evidence digest does not match payload")
+	}
 	return s.write(ctx, func(tx *sql.Tx) error {
 		var currentPhase, currentState string
 		if err := tx.QueryRowContext(ctx, "SELECT phase, state FROM deployment_transactions WHERE transaction_id = ?", id).Scan(&currentPhase, &currentState); err != nil {

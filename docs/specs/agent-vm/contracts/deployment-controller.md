@@ -279,7 +279,7 @@ Deployd 使用独立的本机 SQLite 数据库，路径为
 | --- | --- | --- |
 | `deployment_transactions` | 事务 ID、kind、来源/目标/上一个 release、目标槽位、phase、outcome 和 timestamp。 | 每个 deployment/rollback/recovery transaction 一行；对 deployd workflow phase 具有权威性。 |
 | `deployment_phase_events` | 单调递增的事件序列、phase、transition、source、timestamp、actor 和有界结构化 evidence digest。 | 只追加的事务历史；不包含原始命令输出或凭据。 |
-| `deployment_failure_evidence` | Failure code、phase、source、观测时间、有界 evidence payload 和 digest。 | 保留到事务 finalize 且 retention policy 允许清理为止。 |
+| `deployment_failure_evidence` | Failure code、phase、source、观测时间、有界 evidence payload 和 digest。payload 中的 `cause` 必须经过限长、控制字符清理和私有路径脱敏。 | 保留到事务 finalize 且 retention policy 允许清理为止；写入时必须拒绝与 payload 不匹配的 digest。 |
 | `deployment_observations` | 每个事务最新的有界组合快照、来源时间戳、新鲜度和 digest。 | 每个事务只保留最新快照；不是轮询日志，也不能覆盖运行时事实。 |
 
 已 `finalize` 且不再被恢复流程引用的 `deployment_transactions`、`deployment_phase_events` 和 `deployment_failure_evidence` 默认保留三十天后回收。

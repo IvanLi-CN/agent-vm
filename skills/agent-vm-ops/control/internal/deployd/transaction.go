@@ -756,6 +756,13 @@ func sanitizedFailureCause(cause error) string {
 		return r
 	}, cause.Error())
 	value = strings.Join(strings.Fields(value), " ")
+	fields := strings.Fields(value)
+	for index, field := range fields {
+		if strings.Contains(field, "/") || strings.Contains(field, `\`) {
+			fields[index] = "<private-path>"
+		}
+	}
+	value = strings.Join(fields, " ")
 	const maxLength = 512
 	if len(value) > maxLength {
 		return value[:maxLength] + "..."

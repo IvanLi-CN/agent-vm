@@ -30,7 +30,7 @@ type HostRuntime struct {
 	metrics       map[string]map[string]map[string]string
 	sources       map[string]SourceObservation
 	stagedProcess map[string]processIdentity
-	quiesced      map[string]bool
+	quiesced      map[string]processIdentity
 }
 
 type processIdentity struct {
@@ -41,7 +41,7 @@ type processIdentity struct {
 const deploydDrainSession = "release-agent-vm-deployd"
 
 func NewHostRuntime(config Config) *HostRuntime {
-	return &HostRuntime{Config: config, metrics: map[string]map[string]map[string]string{}, sources: map[string]SourceObservation{}, stagedProcess: map[string]processIdentity{}, quiesced: map[string]bool{}}
+	return &HostRuntime{Config: config, metrics: map[string]map[string]map[string]string{}, sources: map[string]SourceObservation{}, stagedProcess: map[string]processIdentity{}, quiesced: map[string]processIdentity{}}
 }
 
 func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error) {
@@ -86,12 +86,10 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		if requestErr != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) {
 			if requestErr != nil && runtime.systemdSlotStopped(ctx, slot) {
 				runtime.mu.Lock()
-				wasQuiesced := runtime.quiesced[slot]
-				if wasQuiesced {
-					runtime.quiesced[slot] = false
-				}
+				quiescedProcess := runtime.quiesced[slot]
+				runtime.quiesced[slot] = processIdentity{}
 				runtime.mu.Unlock()
-				if wasQuiesced {
+				if quiescedProcess.PID > 0 && quiescedProcess.StartTime != "" {
 					observation.CountersKnown = true
 				}
 				if slot == active {
@@ -115,6 +113,9 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		}
 		processReady, processReadyOK := body["process_ready"].(bool)
 		if !processReadyOK {
+			runtime.mu.Lock()
+			runtime.quiesced[slot] = processIdentity{}
+			runtime.mu.Unlock()
 			slotContractsUp = false
 			snapshot.Consistent = false
 			observation.MetricFamilies = runtime.slotMetrics(slot)
@@ -131,6 +132,9 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		process, processOK := processIdentityFromHealth(body)
 		systemdErr := runtime.systemdProcessMatches(ctx, slot, process)
 		if !processOK || systemdErr != nil {
+			runtime.mu.Lock()
+			runtime.quiesced[slot] = processIdentity{}
+			runtime.mu.Unlock()
 			systemdObservationUp = false
 			slotContractsUp = false
 			snapshot.Consistent = false
@@ -145,7 +149,9 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			continue
 		}
 		runtime.mu.Lock()
-		runtime.quiesced[slot] = false
+		if quiescedProcess := runtime.quiesced[slot]; quiescedProcess.PID > 0 && !sameProcess(quiescedProcess, process) {
+			runtime.quiesced[slot] = processIdentity{}
+		}
 		runtime.mu.Unlock()
 		metrics, metricsAt, metricsErr := runtime.observeSource(ctx, slot, "capacity", "admin-metrics")
 		if metricsErr == nil {
@@ -996,7 +1002,7 @@ func (runtime *HostRuntime) ExitDrain(ctx context.Context, slot string) error {
 		return fmt.Errorf("slot %s rejected drain exit with HTTP %d", slot, status)
 	}
 	runtime.mu.Lock()
-	runtime.quiesced[slot] = false
+	runtime.quiesced[slot] = processIdentity{}
 	runtime.mu.Unlock()
 	return nil
 }
@@ -1006,7 +1012,7 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 		return nil
 	}
 	runtime.mu.Lock()
-	runtime.quiesced[slot] = false
+	runtime.quiesced[slot] = processIdentity{}
 	runtime.mu.Unlock()
 	status, statusCode, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-status"})
 	if err != nil {
@@ -1046,8 +1052,15 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 			return errors.New("old slot quiescence counters are incomplete")
 		}
 		if pending == 0 && inFlight == 0 && unknown == 0 {
+			identity, identityOK := runtime.readProcessIdentity(ctx, slot)
+			if !identityOK {
+				return errors.New("old slot process identity is unavailable after quiescence")
+			}
+			if err := runtime.systemdProcessMatches(ctx, slot, identity); err != nil {
+				return fmt.Errorf("old slot process identity is not verified after quiescence: %w", err)
+			}
 			runtime.mu.Lock()
-			runtime.quiesced[slot] = true
+			runtime.quiesced[slot] = identity
 			runtime.mu.Unlock()
 			return nil
 		}

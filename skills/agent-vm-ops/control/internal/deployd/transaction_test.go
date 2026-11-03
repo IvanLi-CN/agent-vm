@@ -2,6 +2,9 @@ package deployd
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"strings"
@@ -410,7 +413,7 @@ func TestManagerPersistsSanitizedFailureCause(t *testing.T) {
 		t.Fatal(err)
 	}
 	manager := NewManager(database, &fakeRuntime{}, time.Minute, func() time.Time { return now })
-	cause := errors.New("counter proof failed\nslot=green")
+	cause := errors.New("counter proof failed\n/var/lib/agent-vm/private/release.tar")
 	if err := manager.failure(context.Background(), transaction.ID, PhaseStage, cause); !errors.Is(err, cause) {
 		t.Fatalf("failure returned %v, want %v", err, cause)
 	}
@@ -418,7 +421,7 @@ func TestManagerPersistsSanitizedFailureCause(t *testing.T) {
 	if err != nil || evidence == nil {
 		t.Fatalf("failure evidence = %#v err=%v", evidence, err)
 	}
-	if evidence.Payload["cause"] != "counter proof failed slot=green" {
+	if evidence.Payload["cause"] != "counter proof failed <private-path>" {
 		t.Fatalf("failure cause = %#v", evidence.Payload["cause"])
 	}
 	if evidence.Payload["cause_type"] != "*errors.errorString" {
@@ -444,7 +447,13 @@ func TestManagerResumesRollbackAfterRestart(t *testing.T) {
 	if _, err := database.BeginRollback(context.Background(), transaction.ID, transaction.Phase, PhaseRollback, "rollback_started", "test", nil, now); err != nil {
 		t.Fatal(err)
 	}
-	if err := database.RecordFailure(context.Background(), transaction.ID, PhaseRollback, "state_unverified", "test", "digest", map[string]any{"message": "deployment state could not be verified"}, now); err != nil {
+	payload := map[string]any{"message": "deployment state could not be verified"}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(encoded)
+	if err := database.RecordFailure(context.Background(), transaction.ID, PhaseRollback, "state_unverified", "test", hex.EncodeToString(digest[:]), payload, now); err != nil {
 		t.Fatal(err)
 	}
 	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
