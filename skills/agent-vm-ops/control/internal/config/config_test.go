@@ -51,6 +51,22 @@ func TestDefaultsUseSafeDiskWatermarks(t *testing.T) {
 	}
 }
 
+func TestSlotDefaultsUseIsolatedMetricsDirectory(t *testing.T) {
+	value := Defaults()
+	if value.Slot != "blue" || value.MetricsDir != "/run/agent-vm-native/blue/metrics" {
+		t.Fatalf("defaults slot=%q metrics=%q", value.Slot, value.MetricsDir)
+	}
+	value = validConfig()
+	value.Slot = "green"
+	value.MetricsDir = ""
+	if err := value.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if value.MetricsDir != "" {
+		t.Fatalf("explicit empty metrics directory was changed during validation: %q", value.MetricsDir)
+	}
+}
+
 func TestLoadRejectsMissingRawEnvironmentFields(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(path, []byte(`{"state_db":"/tmp/state.sqlite3"}`), 0o600); err != nil {
@@ -117,6 +133,36 @@ func TestLoadPreservesCanonicalAdmissionFields(t *testing.T) {
 		loaded.CreateCostBytes != value.CreateCostBytes || loaded.ResumeCostBytes != value.ResumeCostBytes || loaded.ResizeCostBytes != value.ResizeCostBytes ||
 		loaded.DiskLowBytes != value.DiskLowBytes || loaded.DiskTargetBytes != value.DiskTargetBytes {
 		t.Fatalf("loaded admission policy = %#v", loaded)
+	}
+}
+
+func TestLoadDerivesSlotScopedPathsWhenOmitted(t *testing.T) {
+	value := validConfig()
+	value.Slot = "green"
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	delete(raw, "socket")
+	delete(raw, "metrics_dir")
+	data, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Socket != "/run/agent-vm-native/green/control.sock" || loaded.MetricsDir != "/run/agent-vm-native/green/metrics" {
+		t.Fatalf("derived slot paths = socket:%q metrics:%q", loaded.Socket, loaded.MetricsDir)
 	}
 }
 

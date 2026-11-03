@@ -51,7 +51,11 @@ if (existsSync(output)) throw new Error(`output already exists: ${output}`);
 const clientRoot = resolve(import.meta.dir, "../../agent-vm/scripts");
 const opsRoot = resolve(import.meta.dir, "..");
 const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-go-release-"));
-const binaryPath = join(temporaryRoot, "bin/agent-vm-control");
+const binaryPaths = {
+  control: join(temporaryRoot, "bin/agent-vm-control"),
+  deployd: join(temporaryRoot, "bin/agent-vm-deployd"),
+  deploy: join(temporaryRoot, "bin/agent-vm-deploy"),
+};
 
 function digest(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
@@ -60,22 +64,20 @@ function digest(path: string): string {
 function sourcePath(relative: string): string {
   if (relative === "agent_vm_control_bridge.ts") return join(import.meta.dir, relative);
   if (relative === "systemd/agent-vm-native.service") return join(opsRoot, "assets", relative);
-  if (relative === "bin/agent-vm-control") return binaryPath;
+  if (relative === "systemd/agent-vm-native@.service") return join(opsRoot, "assets", relative);
+  if (relative === "systemd/agent-vm-deployd.service") return join(opsRoot, "assets", relative);
+  if (relative === "bin/agent-vm-control") return binaryPaths.control;
+  if (relative === "bin/agent-vm-deployd") return binaryPaths.deployd;
+  if (relative === "bin/agent-vm-deploy") return binaryPaths.deploy;
   return join(clientRoot, relative);
 }
 
-function buildBinary(): void {
-  mkdirSync(dirname(binaryPath), { recursive: true, mode: 0o750 });
-  const result = Bun.spawnSync(
-    [
-      process.execPath,
-      join(import.meta.dir, "build_go_control.ts"),
-      "--source-revision",
-      revision,
-      "--target",
-      target,
-      "--output",
-      binaryPath,
+function buildBinary(binary: "control" | "deployd" | "deploy"): void {
+  const output = binaryPaths[binary];
+  mkdirSync(dirname(output), { recursive: true, mode: 0o750 });
+  const result = Bun.spawnSync([
+      process.execPath, join(import.meta.dir, "build_go_control.ts"),
+      "--binary", binary, "--source-revision", revision, "--target", target, "--output", output,
     ],
     { stdout: "pipe", stderr: "pipe" },
   );
@@ -85,7 +87,9 @@ function buildBinary(): void {
 }
 
 try {
-  buildBinary();
+  buildBinary("control");
+  buildBinary("deployd");
+  buildBinary("deploy");
   const artifacts: GoArtifact[] = [];
   for (const [name, relative, role, mode] of [...GO_FIXED_ARTIFACTS].sort((left, right) => left[1].localeCompare(right[1]))) {
     const destination = join(temporaryRoot, relative);

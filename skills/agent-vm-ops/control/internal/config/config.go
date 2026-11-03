@@ -73,6 +73,7 @@ type ManagementConfig struct {
 }
 
 type Config struct {
+	Slot                               string           `json:"slot"`
 	StateDB                            string           `json:"state_db"`
 	Socket                             string           `json:"socket"`
 	ImageFingerprint                   string           `json:"image_fingerprint"`
@@ -123,6 +124,7 @@ type WebConfig struct {
 
 func Defaults() Config {
 	return Config{
+		Slot:                               "blue",
 		Socket:                             "/run/agent-vm-native/control.sock",
 		InitialLeaseSeconds:                1800,
 		RenewSeconds:                       900,
@@ -141,7 +143,7 @@ func Defaults() Config {
 		DrainTimeoutSeconds:                8100,
 		ActivationTimeoutSeconds:           300,
 		ReleaseFencePath:                   "/run/agent-vm-native/release-activation.fence",
-		MetricsDir:                         "/run/agent-vm-native/metrics",
+		MetricsDir:                         "/run/agent-vm-native/blue/metrics",
 		TimerDir:                           "/run/agent-vm-native/timers",
 		RequiredGuestTools:                 []string{"bun", "python3", "sshd", "rsync", "docker", "growpart"},
 		Management: ManagementConfig{
@@ -208,6 +210,12 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(encoded, &value); err != nil {
 		return value, fmt.Errorf("config_invalid: %w", err)
 	}
+	if _, exists := raw["socket"]; !exists {
+		value.Socket = "/run/agent-vm-native/" + value.Slot + "/control.sock"
+	}
+	if _, exists := raw["metrics_dir"]; !exists {
+		value.MetricsDir = "/run/agent-vm-native/" + value.Slot + "/metrics"
+	}
 	if err := value.Validate(); err != nil {
 		return value, err
 	}
@@ -215,6 +223,9 @@ func Load(path string) (Config, error) {
 }
 
 func (c Config) Validate() error {
+	if c.Slot != "blue" && c.Slot != "green" {
+		return errors.New("config_invalid: slot must be blue or green")
+	}
 	missing := []string{}
 	for key, value := range map[string]string{
 		"state_db": c.StateDB, "image_alias": c.ImageAlias, "image_fingerprint": c.ImageFingerprint,

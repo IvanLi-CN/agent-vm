@@ -1,15 +1,18 @@
-# Agent VM Memory Reservation Validation
+# Agent VM memory reservation 验证
 
-This record maps the reservation-only memory plan to its evidence boundary. It distinguishes deterministic offline behavior from operating-system and deployment observations; the public repository does not contain the operator-owned control entry, collector, Grafana provisioning source, or live addresses.
+本文记录 reservation-only memory plan 的证据边界。
+它区分确定性的离线行为、操作系统观测和部署观测；公共仓库不包含运维方控制入口、实时部署地址或 Grafana 线上实例。
+Prometheus 的最终采集入口是槽位外 `agent-vm-deployd` 的只读 `/metrics` endpoint。
 
-| Acceptance | Scenario and evidence | Result boundary |
+| 验收项 | 场景与证据 | 结果边界 |
 | --- | --- | --- |
-| A1 | `skills/agent-vm-ops/tests/test_resource_overcommit.py` and `skills/agent-vm-ops/tests/test_live_memory.py` cover pressure-only admission, logical ceiling rejection, missing/contradictory capacity, and unchanged existing-lease operations. | Offline behavior covered; real CT cgroup/LXCFS behavior remains deployment evidence. |
-| A2 | Resource policy fixtures assert `memory_budget_mib=32768`, `memory_overcommit_ratio=2`, CT-visible `32768 MiB`, logical limit `65536 MiB`, and logical remaining derived from reservations. | Offline contract covered. |
-| A3 | Controller and CLI tests cover sessionless `admin-metrics`, read-only rejection of session or operation fields, resource split fields, CT-local memory observations, task/audit/failure summaries, and structured errors. | Offline protocol covered. |
-| A4 | `docs/specs/agent-vm/`, the successor memory ADR, operations references, and Skills are synchronized on one 32/64GiB authority and separate pressure from admission; documentation tests cover the required structure and linkage, while behavior tests cover the numeric policy. | Public contract synchronized. |
-| A5 | The public observability contract specifies the deployment-owned read-only `admin-metrics` scrape bridge, freshness/up failure semantics, fixed 32/64GiB lines, dynamic reservation/remaining/actual/pressure series, and separate disk domains. | Operator-owned collector and Grafana provisioning were applied and checked outside this public repository; the protected operator evidence record is the authority for deployment revision and reload details. The public source records the contract without copying deployment details. |
-| A6 | The required live checks are `agent-vm doctor`, `agent-vm admin status`, `agent-vm admin metrics`, and a Grafana reload observation with Auto refresh retained. | CT-local live checks and the operator-owned Grafana reload were completed through the configured control entry; protected operator evidence records the command outputs and observation. No PVE or guessed host is implied. |
-| A7 | Implementation candidate `f58453a` passed `bun install --frozen-lockfile`, `bun run typecheck`, `bun run check`, `bun run test:repo`, `bun run test:skills`, the Agent VM documentation tests, Python compilation, and `git diff --check` after the absent-resource admission repair. | Validation is bound to implementation candidate `f58453a`; the following documentation-only evidence commit adds no runtime changes, and current-head CI remains a separate release gate. |
+| A1 | `skills/agent-vm-ops/tests/test_resource_overcommit.py` 和 `skills/agent-vm-ops/tests/test_live_memory.py` 覆盖 pressure-only admission、logical ceiling rejection、缺失/矛盾 capacity 以及既有 lease 操作不变。 | 离线行为已覆盖；真实 CT cgroup/LXCFS 行为仍属于部署证据。 |
+| A2 | Resource policy fixture 断言 `memory_budget_mib=32768`、`memory_overcommit_ratio=2`、CT-visible `32768 MiB`、logical limit `65536 MiB`，以及从 reservation 推导的 logical remaining。 | 离线合同已覆盖。 |
+| A3 | Controller 和 CLI 测试覆盖无 session 的 `admin-metrics`、拒绝 session/operation 字段的只读行为、resource split 字段、CT-local memory observation、task/audit/failure summary 和 structured error。 | 离线协议已覆盖。 |
+| A4 | `docs/specs/agent-vm/`、后继 memory ADR、运维引用和 Skills 统一使用 32/64 GiB authority，并把 pressure 与 admission 分开；文档测试覆盖结构与链接，行为测试覆盖数值策略。 | 公共合同已同步。 |
+| A5 | 公共观测合同规定 deployd 读取 `admin-metrics`、通过 `/metrics` 输出稳定 Prometheus families、保留 freshness/up failure 语义、提供固定 32/64 GiB line、动态 reservation/remaining/actual/pressure series，并区分 disk domain。 | 运维方的 deployd、Prometheus scrape 配置和 Grafana provisioning 在本仓库之外部署和检查；受保护的运维证据记录部署 revision 与 reload 结果。公共源文件只记录合同，不复制部署细节。 |
+| A6 | 必要的 live checks 是 `agent-vm doctor`、`agent-vm admin status`、`agent-vm admin metrics`，以及保留 Auto refresh 的 Grafana reload observation。 | CT-local live checks 和运维方 Grafana reload 通过配置的控制入口完成；受保护的运维证据记录命令输出和观测结果，不隐含 PVE 或猜测的主机。 |
+| A7 | Implementation candidate `f58453a` 通过 `bun install --frozen-lockfile`、`bun run typecheck`、`bun run check`、`bun run test:repo`、`bun run test:skills`、Agent VM documentation tests、Python compilation 和 `git diff --check`。 | 验证绑定到 implementation candidate `f58453a`；后续文档变更不包含 runtime change，当前 HEAD 的 CI 仍属于独立 release gate。 |
 
-The logical limit is a reservation ceiling, not a promise that 64GiB of guest RAM can run simultaneously without CT memory pressure or OOM. `MemAvailable`, `memory.current`, and cgroup OOM counters remain observations; they must not be used to replace or reduce the logical reservation calculation.
+Logical limit 是 reservation ceiling，不承诺 64 GiB guest RAM 可以在没有 CT memory pressure 或 OOM 的情况下同时运行。
+`MemAvailable`、`memory.current` 和 cgroup OOM counter 仍然是 observation，不得替代或降低 logical reservation calculation。

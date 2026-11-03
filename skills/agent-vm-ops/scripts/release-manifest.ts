@@ -1405,7 +1405,9 @@ export function load_runtime_manifest(
 }
 
 // Format 3 is retained as a read-only product format. Format 4 adds the
-// management Web package and the state capability declaration.
+// resident management API and the state capability declaration. The Web
+// assets are embedded in the Go control binary; the retired standalone Web
+// unit is not a current release artifact.
 export const LEGACY_PRODUCT_MANIFEST_FORMAT = 3;
 export const PRODUCT_MANIFEST_FORMAT = 4;
 export const PRODUCT_TOOLCHAIN = Object.freeze({ bun: "1.4.4", go: "go1.27.3", cgo_enabled: false });
@@ -1445,6 +1447,15 @@ export const PRODUCT_LINUX_LEGACY_ARTIFACTS: readonly ArtifactTuple[] = Object.f
 
 export const PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ...PRODUCT_LINUX_LEGACY_ARTIFACTS,
+  ["unit:agent-vm-native@.service", "systemd/agent-vm-native@.service", "unit", 0o644],
+  ["agent-vm-deployd", "bin/agent-vm-deployd", "control", 0o755],
+  ["agent-vm-deploy", "bin/agent-vm-deploy", "control", 0o755],
+  ["unit:agent-vm-deployd.service", "systemd/agent-vm-deployd.service", "unit", 0o644],
+]);
+
+/** Format-4 packages retained from the pre-Deployd Web control plane. */
+export const HISTORICAL_PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
+  ...PRODUCT_LINUX_ARTIFACTS,
   ["unit:agent-vm-web.service", "systemd/agent-vm-web.service", "unit", 0o644],
   ["web-config-example", "config/agent-vm-web.json.example", "support", 0o640],
   ["web-assets-manifest", "web-assets.manifest.json", "support", 0o644],
@@ -1513,8 +1524,15 @@ function _product_artifacts(value: unknown, target: ProductTarget, format: 3 | 4
     ? PRODUCT_CLIENT_ARTIFACTS
     : format === LEGACY_PRODUCT_MANIFEST_FORMAT ? PRODUCT_LINUX_LEGACY_ARTIFACTS : PRODUCT_LINUX_ARTIFACTS;
   const actualShape = artifacts.map(({ name, path, role, mode }) => canonical_json([name, path, role, mode])).sort();
-  const expectedShape = expected.map((item) => canonical_json(item)).sort();
-  if (actualShape.length !== expectedShape.length || actualShape.some((item, index) => item !== expectedShape[index])) throw _product_error("manifest_artifact_set_invalid", "product artifact set differs from the fixed target allowlist");
+  const expectedShapes = [expected];
+  if (format === PRODUCT_MANIFEST_FORMAT && target.os === "linux") {
+    expectedShapes.push(HISTORICAL_PRODUCT_LINUX_ARTIFACTS);
+  }
+  const matchesAllowlist = expectedShapes.some((candidate) => {
+    const shape = candidate.map((item) => canonical_json(item)).sort();
+    return actualShape.length === shape.length && actualShape.every((item, index) => item === shape[index]);
+  });
+  if (!matchesAllowlist) throw _product_error("manifest_artifact_set_invalid", "product artifact set differs from the fixed target allowlist");
   return artifacts;
 }
 
@@ -1622,7 +1640,7 @@ export function verify_product_bundle(root: string, manifest: unknown): ProductM
     if (!info.isFile() || info.isSymbolicLink()) throw _product_error("artifact_unverified", `artifact is not a regular file: ${item.path}`);
     if ((info.mode & 0o7777) !== item.mode) throw _product_error("artifact_mode_mismatch", `artifact mode differs: ${item.path}`);
     if (sha256_file(path) !== item.sha256) throw _product_error("artifact_checksum_mismatch", `artifact checksum differs: ${item.path}`);
-    if (item.path === "bin/agent-vm-control") _verify_product_elf(path, checked.target);
+    if (["bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"].includes(item.path)) _verify_product_elf(path, checked.target);
   }
   return checked;
 }

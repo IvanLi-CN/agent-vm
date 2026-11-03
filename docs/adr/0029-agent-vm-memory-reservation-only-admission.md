@@ -15,11 +15,11 @@ The controller reports `allocated`, `reserved`, `allocated_and_reserved`, `remai
 
 The controller continues to observe CT-local `memory.current`, verified LXCfs `MemAvailable`, a pressure threshold and cgroup OOM events. Low `MemAvailable` sets `memory_pressure` and produces a warning for operations and dashboards. It does not reject acquire, resume, restart-resize or memory growth while logical reservation remains.
 
-Missing, malformed or contradictory CT capacity measurements still fail closed with `resource_unverified`. Disk capacity, drain state, native inventory and project-policy conflicts remain independent admission gates. The policy does not increase CT memory, promise simultaneous physical residency of 64 GiB, add a balancer, or introduce a resident metrics service.
+Missing, malformed or contradictory CT capacity measurements still fail closed with `resource_unverified`. Disk capacity, drain state, native inventory and project-policy conflicts remain independent admission gates. The policy does not increase CT memory, promise simultaneous physical residency of 64 GiB, or add a balancer. Prometheus pulls the final metrics from the existing slot-external `agent-vm-deployd` service; this ADR does not introduce a second metrics service.
 
 ## Observability contract
 
-The read-only `admin-metrics` protocol action exposes the policy, split reservation totals, CT-local memory observations, OOM state, task states, operation/failure summaries, warnings and freshness. A deployment-owned collector may invoke this action through the configured control entry and expose stable Prometheus families. Grafana must render the 32 GiB CT capacity and 64 GiB logical limit as separate authoritative lines and display runtime pressure separately.
+The read-only `admin-metrics` protocol action exposes the policy, split reservation totals, CT-local memory observations, OOM state, task states, operation/failure summaries, warnings and freshness. The slot-external `agent-vm-deployd` service invokes this action through the configured control entry and exposes the stable Prometheus families from its read-only `/metrics` endpoint. Grafana must render the 32 GiB CT capacity and 64 GiB logical limit as separate authoritative lines and display runtime pressure separately.
 
 ## Consequences
 

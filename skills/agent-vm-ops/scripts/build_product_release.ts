@@ -75,20 +75,23 @@ function compareDeterministically(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function sourcePath(relative: string, binaryPath: string): string {
+function sourcePath(relative: string, binaryPaths: Record<string, string>): string {
   if (relative === "agent_vm_control_bridge.ts") return join(import.meta.dir, relative);
 	if (relative.startsWith("systemd/")) return join(operationsRoot, "assets", relative);
 	if (relative === "config/agent-vm-web.json.example") return join(operationsRoot, "assets", "web.json.example");
 	if (relative === "web-assets.manifest.json") return webAssetsManifestPath;
-  if (relative === "bin/agent-vm-control") return binaryPath;
+  if (relative === "bin/agent-vm-control") return binaryPaths.control;
+  if (relative === "bin/agent-vm-deployd") return binaryPaths.deployd;
+  if (relative === "bin/agent-vm-deploy") return binaryPaths.deploy;
   return join(clientRoot, relative);
 }
 
-function buildBinary(target: string, binaryPath: string): void {
+function buildBinary(target: string, binary: "control" | "deployd" | "deploy", binaryPath: string): void {
   mkdirSync(dirname(binaryPath), { recursive: true, mode: 0o750 });
   const result = Bun.spawnSync([
     process.execPath,
     join(import.meta.dir, "build_go_control.ts"),
+    "--binary", binary,
     "--version", version,
     "--source-revision", revision,
     "--target", target,
@@ -120,7 +123,11 @@ try {
   const target = (rawTarget === "client"
     ? { os: "source", arch: "any" }
     : { os: "linux", arch: targetMatch![2] }) as ProductTarget;
-  const binaryPath = join(temporaryRoot, "bin/agent-vm-control");
+  const binaryPaths = {
+    control: join(temporaryRoot, "bin/agent-vm-control"),
+    deployd: join(temporaryRoot, "bin/agent-vm-deployd"),
+    deploy: join(temporaryRoot, "bin/agent-vm-deploy"),
+  };
   if (rawTarget !== "client") {
     webAssetsManifestPath = join(temporaryRoot, "web-assets.manifest.json");
     const assetBuild = Bun.spawnSync([
@@ -131,14 +138,16 @@ try {
       "--manifest-output", webAssetsManifestPath,
     ], { stdout: "pipe", stderr: "pipe" });
     if (assetBuild.exitCode !== 0) throw new Error(new TextDecoder().decode(assetBuild.stderr));
-    buildBinary(rawTarget, binaryPath);
+    buildBinary(rawTarget, "control", binaryPaths.control);
+    buildBinary(rawTarget, "deployd", binaryPaths.deployd);
+    buildBinary(rawTarget, "deploy", binaryPaths.deploy);
   }
 
   const artifacts: Artifact[] = [];
-  for (const [name, relative, role, mode] of [...packageFiles(rawTarget as "client" | "linux/amd64" | "linux/arm64", binaryPath)].sort((left, right) => compareDeterministically(left[1], right[1]))) {
+  for (const [name, relative, role, mode] of [...packageFiles(rawTarget as "client" | "linux/amd64" | "linux/arm64", binaryPaths.control)].sort((left, right) => compareDeterministically(left[1], right[1]))) {
     const destination = join(temporaryRoot, relative);
     mkdirSync(dirname(destination), { recursive: true, mode: 0o750 });
-    const source = sourcePath(relative, binaryPath);
+    const source = sourcePath(relative, binaryPaths);
     if (source !== destination) copyFileSync(source, destination);
     chmodSync(destination, mode);
     artifacts.push({ name, path: relative, role, mode, sha256: digest(destination) });

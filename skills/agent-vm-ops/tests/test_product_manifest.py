@@ -70,7 +70,7 @@ class ProductManifestTests(unittest.TestCase):
                 validate_product_manifest(management_client)
             self.assertEqual(failure.exception.code, "manifest_target_format_mismatch")
 
-    def test_format_4_linux_bundle_requires_web_package_contract(self) -> None:
+    def test_format_4_linux_bundle_requires_the_resident_control_contract(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-vm-product-linux-python-") as raw_root:
             root = Path(raw_root)
             artifacts = []
@@ -78,7 +78,7 @@ class ProductManifestTests(unittest.TestCase):
                 payload = root / path
                 payload.parent.mkdir(parents=True, exist_ok=True)
                 data = b"artifact:" + path.encode()
-                if path == "bin/agent-vm-control":
+                if path in {"bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
                     data = bytearray(20)
                     data[:7] = b"\x7fELF\x02\x01\x01"
                     data[18:20] = (62).to_bytes(2, "little")
@@ -105,8 +105,8 @@ class ProductManifestTests(unittest.TestCase):
                 verify_product_bundle(root, manifest)
             self.assertEqual(failure.exception.code, "manifest_transport_unavailable")
             self.assertEqual(manifest["client_view"]["transport"], "https")
-            self.assertIn("systemd/agent-vm-web.service", {item["path"] for item in manifest["artifacts"]})
-            self.assertIn("web-assets.manifest.json", {item["path"] for item in manifest["artifacts"]})
+            self.assertNotIn("systemd/agent-vm-web.service", {item["path"] for item in manifest["artifacts"]})
+            self.assertNotIn("web-assets.manifest.json", {item["path"] for item in manifest["artifacts"]})
 
             legacy = copy.deepcopy(manifest)
             legacy["client_view"]["transport"] = "legacy-bun"
@@ -126,6 +126,23 @@ class ProductManifestTests(unittest.TestCase):
             )
 
             historical = copy.deepcopy(legacy)
+            for name, path, role, mode in (
+                ("unit:agent-vm-web.service", "systemd/agent-vm-web.service", "unit", 0o644),
+                ("web-config-example", "config/agent-vm-web.json.example", "support", 0o640),
+                ("web-assets-manifest", "web-assets.manifest.json", "support", 0o644),
+            ):
+                payload = root / path
+                payload.parent.mkdir(parents=True, exist_ok=True)
+                payload.write_bytes(b"historical-web:" + path.encode())
+                payload.chmod(mode)
+                historical["artifacts"].append({
+                    "name": name,
+                    "path": path,
+                    "role": role,
+                    "sha256": hashlib.sha256(payload.read_bytes()).hexdigest(),
+                    "mode": mode,
+                })
+            self.assertEqual(validate_product_manifest(historical), historical)
             historical_web = next(item for item in historical["artifacts"] if item["path"] == "config/agent-vm-web.json.example")
             historical_web["mode"] = 0o644
             (root / historical_web["path"]).chmod(0o644)

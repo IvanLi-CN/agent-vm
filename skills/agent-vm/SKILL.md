@@ -43,7 +43,7 @@ CPU and RAM use configurable allocation ceilings derived from their budget and o
 
 ## Portable observability bundle
 
-The public observability bundle lives under [references/observability](references/observability/README.md). It contains a parameterized Grafana dashboard template, a file-provider provisioning template, an example configuration, and Bun render/validation commands. Render it into the deployment repository with `scripts/render_observability_dashboard.ts`; keep the rendered JSON, provisioning file, datasource identity, controller job, collector configuration, and host paths in that deployment repository.
+The public observability bundle lives under [references/observability](references/observability/README.md). It contains a parameterized Grafana dashboard template, a file-provider provisioning template, an example configuration, and Bun render/validation commands. Render it into the deployment repository with `scripts/render_observability_dashboard.ts`; keep the rendered JSON, provisioning file, datasource identity, `agent-vm-deployd` scrape configuration, metrics listener configuration, and host paths in that deployment repository.
 
 The template uses a hidden `controller_job` variable for native controller queries, reads CPU capacity from `agent_vm_admission_cpu_capacity_vcpu`, and does not encode a deployment's memory or disk policy as a fixed label. `scripts/validate_observability_dashboard.ts` checks the required metric/panel contract, automatic refresh, datasource replacement, and packet-rate expressions before rendered files are written.
 

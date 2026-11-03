@@ -29,7 +29,7 @@ class GoManifestContractTests(unittest.TestCase):
         for name, path, role, mode in sorted(MANIFEST.GO_FIXED_ARTIFACTS):
             content = (
                 b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42
-                if path == "bin/agent-vm-control"
+                if path in {"bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}
                 else f"{role}:{path}\n".encode()
             )
             target = self.root / path

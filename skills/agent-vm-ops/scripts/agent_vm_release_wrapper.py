@@ -44,12 +44,14 @@ try:
         GO_UNIT_CONTENT_SHA256,
         HISTORICAL_GO_UNIT_CONTENT_SHA256,
         HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
+        HISTORICAL_PRODUCT_UNIT_EXEC_START,
         GO_UNIT_EXEC_START,
         LEGACY_PRODUCT_MANIFEST_FORMAT,
         PRODUCT_MANIFEST_FORMAT,
         STATE_CAPABILITY_MARKERS,
         PRODUCT_CLIENT_ARTIFACTS,
         PRODUCT_LINUX_ARTIFACTS,
+        HISTORICAL_PRODUCT_LINUX_ARTIFACTS,
         PRODUCT_LINUX_LEGACY_ARTIFACTS,
         PRODUCT_UNIT_CONTENT_SHA256,
         PRODUCT_UNIT_EXEC_START,
@@ -77,12 +79,14 @@ except ModuleNotFoundError:
         GO_UNIT_CONTENT_SHA256,
         HISTORICAL_GO_UNIT_CONTENT_SHA256,
         HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
+        HISTORICAL_PRODUCT_UNIT_EXEC_START,
         GO_UNIT_EXEC_START,
         LEGACY_PRODUCT_MANIFEST_FORMAT,
         PRODUCT_MANIFEST_FORMAT,
         STATE_CAPABILITY_MARKERS,
         PRODUCT_CLIENT_ARTIFACTS,
         PRODUCT_LINUX_ARTIFACTS,
+        HISTORICAL_PRODUCT_LINUX_ARTIFACTS,
         PRODUCT_LINUX_LEGACY_ARTIFACTS,
         PRODUCT_UNIT_CONTENT_SHA256,
         PRODUCT_UNIT_EXEC_START,
@@ -103,6 +107,9 @@ RETIRED_CLIENT_NAME = "agent_vm.py"
 CANONICAL_UNIT_DIR = Path("/etc/systemd/system")
 RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
 GO_CONTROL_PATH = Path("/opt/agent-vm-native/bin/agent-vm-control")
+GO_DEPLOYD_PATH = Path("/opt/agent-vm-native/bin/agent-vm-deployd")
+GO_DEPLOY_PATH = Path("/opt/agent-vm-native/bin/agent-vm-deploy")
+GO_SLOT_NAMES = ("blue", "green")
 GO_CONTROL_SOCKET = Path("/run/agent-vm-native/control.sock")
 STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
 LEGACY_EXPIRY_TIMER_RE = re.compile(r"^agent-vm-native-expire-[A-Za-z0-9_.:-]+\.timer$")
@@ -112,7 +119,8 @@ MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_FILE_BYTES = 64 * 1024 * 1024
 FORBIDDEN_CONFIG_NAMES = {"config.json", "state.sqlite3", "control.lock", "authority.lock", "admission.lock"}
 FIXED_UNIT_NAMES = tuple(sorted(set(UNIT_EXEC_START) | {"agent-vm-native-age-gc.timer"}))
-PRODUCT_UNIT_NAMES = ("agent-vm-native.service", "agent-vm-web.service")
+PRODUCT_UNIT_NAMES = ("agent-vm-native.service", "agent-vm-deployd.service", "agent-vm-web.service")
+GO_RUNTIME_UNIT_NAMES = tuple(sorted(GO_UNIT_EXEC_START))
 FIXED_ARTIFACTS = {
     ("client", "agent_vm.ts"),
     ("control", "agent_vm_control.ts"),
@@ -144,6 +152,42 @@ def _go_control_target(config: Mapping[str, Any]) -> Path:
     if configured == CANONICAL_CONTROL_PATH:
         return GO_CONTROL_PATH
     return configured.parent / "bin" / GO_CONTROL_PATH.name
+
+
+def _go_binary_target(config: Mapping[str, Any], canonical: Path) -> Path:
+    configured = Path(config["control_path"])
+    if configured == CANONICAL_CONTROL_PATH:
+        return canonical
+    return configured.parent / "bin" / canonical.name
+
+
+def _go_slot_root(config: Mapping[str, Any], slot: str) -> Path:
+    if slot not in GO_SLOT_NAMES:
+        _fail("wrapper_config_invalid", "Go slot name is not fixed")
+    release_root = Path(config["release_root"])
+    # The production layout keeps release directories and slot directories as
+    # siblings under /var/lib/agent-vm-native. Test layouts use a conventional
+    # releases/ child, so retain the same sibling relationship there.
+    parent = release_root.parent if release_root.name == "releases" else release_root
+    return parent / "slots" / slot
+
+
+def _go_runtime_root(config: Mapping[str, Any]) -> Path:
+    return _go_slot_root(config, GO_SLOT_NAMES[0]).parent.parent
+
+
+def _verify_go_runtime_layout(config: Mapping[str, Any]) -> None:
+    """Require the protected active pointer before starting the Go runtime."""
+    active = _go_runtime_root(config) / "active"
+    if not active.is_symlink():
+        _fail("activation_unverified", "Go runtime active pointer is missing or is not a symlink")
+    try:
+        target = active.resolve(strict=True)
+    except OSError:
+        _fail("activation_unverified", "Go runtime active pointer target is unavailable")
+    allowed = {_go_slot_root(config, slot).resolve(strict=False) for slot in GO_SLOT_NAMES}
+    if target not in allowed:
+        _fail("activation_unverified", "Go runtime active pointer targets an unknown slot")
 
 
 def _go_bridge_target(config: Mapping[str, Any]) -> Path:
@@ -517,6 +561,8 @@ def _require_owned_regular_modes(path: Path, owner_uid: int, modes: tuple[int, .
 def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_historical_content: bool = False) -> None:
     if _is_product_manifest(manifest):
         expected_units = PRODUCT_UNIT_EXEC_START if manifest["format"] == PRODUCT_MANIFEST_FORMAT else {"agent-vm-native.service": PRODUCT_UNIT_EXEC_START["agent-vm-native.service"]}
+        if allow_historical_content and manifest["format"] == PRODUCT_MANIFEST_FORMAT:
+            expected_units = HISTORICAL_PRODUCT_UNIT_EXEC_START
         expected_hashes = PRODUCT_UNIT_CONTENT_SHA256
         historical_hashes = HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256
         for item in manifest["artifacts"]:
@@ -530,9 +576,13 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_hist
                 content = path.read_text(encoding="utf-8")
             except (OSError, UnicodeError):
                 _fail("unit_unverified", f"unit cannot be read: {name}")
-            accepted_hashes = {expected_hashes[name]}
+            accepted_hashes = set()
+            if name in expected_hashes:
+                accepted_hashes.add(expected_hashes[name])
             if allow_historical_content and name in historical_hashes:
                 accepted_hashes.update(historical_hashes[name])
+            if not accepted_hashes:
+                _fail("unit_unverified", f"product unit has no fixed content policy: {name}")
             if sha256_file(path) not in accepted_hashes:
                 _fail("unit_unverified", f"unit bytes differ from the fixed product policy: {name}")
             if expected_units[name] not in content or "ExecStart=" not in content:
@@ -606,6 +656,12 @@ def _verify_fixed_artifacts(
     declared = {(item["role"], item["path"]) for item in manifest["artifacts"]}
     if _is_product_manifest(manifest):
         expected_values = PRODUCT_LINUX_ARTIFACTS if manifest["format"] == PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_LEGACY_ARTIFACTS
+        if (
+            allow_historical_web_config_mode
+            and manifest["format"] == PRODUCT_MANIFEST_FORMAT
+            and declared == {(role, path) for _, path, role, _ in HISTORICAL_PRODUCT_LINUX_ARTIFACTS}
+        ):
+            expected_values = HISTORICAL_PRODUCT_LINUX_ARTIFACTS
         expected = {(role, path) for _, path, role, _ in expected_values}
         if declared != expected:
             _fail("artifact_unverified", "manifest artifact set differs from the fixed product release allowlist", {"expected": sorted(expected), "actual": sorted(declared)})
@@ -860,8 +916,17 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
         *(Path(config["control_path"]).with_name(name) for name in sorted(SUPPORT_ARTIFACT_NAMES)),
         Path(config["control_path"]).with_name(MANIFEST_NAME),
         Path(config["control_path"]).with_name("client-release.json"),
-    ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], "agent-vm-native.service", "agent-vm-web.service")) + (
+    ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], *GO_RUNTIME_UNIT_NAMES, *PRODUCT_UNIT_NAMES)) + tuple(
+        target
+        for slot in GO_SLOT_NAMES
+        for target in (
+            _go_slot_root(config, slot) / "bin" / "agent-vm-control",
+            _go_slot_root(config, slot) / "release-manifest.json",
+        )
+    ) + (
         bundle_root / "systemd" / "agent-vm-native.service",
+        bundle_root / "systemd" / "agent-vm-native@.service",
+        bundle_root / "systemd" / "agent-vm-deployd.service",
         bundle_root / "systemd" / "agent-vm-web.service",
         bundle_root / "config" / "agent-vm-web.json.example",
         bundle_root / "web-assets.manifest.json",
@@ -1232,45 +1297,53 @@ def _deactivate_web_runtime() -> None:
     _systemctl("disable", "agent-vm-web.service", allow_missing=True)
 
 
-def _unit_is_enabled(unit: str) -> bool:
-    """Capture whether a unit was enabled before a dependency restart."""
-    try:
-        process = subprocess.run(
-            ["systemctl", "is-enabled", "--quiet", unit],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        _fail("activation_failed", f"systemd enabled-state check could not be verified: {unit}")
-    return process.returncode == 0
-
-
-def _activate_go_runtime(*, web_enabled: bool = False) -> None:
+def _activate_go_runtime(
+    config: Mapping[str, Any] | None = None,
+    *,
+    web_enabled: bool = False,
+    deployd_enabled: bool = False,
+) -> None:
     """Retire legacy triggers, enable Go, and verify that it is active."""
+    if deployd_enabled:
+        if config is None:
+            _fail("activation_unverified", "Go blue-green activation requires wrapper configuration")
+        _verify_go_runtime_layout(config)
     if not web_enabled:
         _deactivate_web_runtime()
     for unit in (*GO_RETIRED_UNITS, *_legacy_expiry_timers()):
         _systemctl("stop", unit, allow_missing=True)
         _systemctl("disable", unit, allow_missing=True)
+    if deployd_enabled:
+        # The blue-green control plane owns the slot instances. Leaving the
+        # legacy singleton enabled would create a third scheduler process.
+        _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+        _systemctl("disable", "agent-vm-native.service", allow_missing=True)
+        for slot in GO_SLOT_NAMES:
+            unit = f"agent-vm-native@{slot}.service"
+            _systemctl("enable", unit)
+            _systemctl("restart", unit)
+            _systemctl("is-active", unit)
+        _systemctl("enable", "agent-vm-deployd.service")
+        _systemctl("restart", "agent-vm-deployd.service")
+        _systemctl("is-active", "agent-vm-deployd.service")
+        return
     _systemctl("enable", "agent-vm-native.service")
     _systemctl("restart", "agent-vm-native.service")
     _systemctl("is-active", "agent-vm-native.service")
 
 
 def _activate_product_runtime(
+    config: Mapping[str, Any],
     manifest: Mapping[str, Any],
-    *,
-    web_was_enabled: bool | None = None,
 ) -> None:
-    web_enabled = manifest.get("format") == PRODUCT_MANIFEST_FORMAT
-    if web_enabled and web_was_enabled is None:
-        web_was_enabled = _unit_is_enabled("agent-vm-web.service")
-    _activate_go_runtime(web_enabled=web_enabled)
-    if web_was_enabled:
-        # Requires=agent-vm-native.service stops Web during native restart.
-        _systemctl("start", "agent-vm-web.service", allow_missing=True)
+    # The unified management API is served by the resident Go control process.
+    # The standalone Web unit is retired and must never be restored by a
+    # product activation or rollback.
+    _activate_go_runtime(
+        config,
+        web_enabled=False,
+        deployd_enabled=manifest.get("format") == PRODUCT_MANIFEST_FORMAT,
+    )
 
 
 def _activate_legacy_runtime() -> None:
@@ -1286,7 +1359,7 @@ def _activate_legacy_runtime() -> None:
         _systemctl("enable", unit, allow_missing=True)
 
 
-def _restore_runtime_for_release(current: Path | None, record: Mapping[str, Any]) -> None:
+def _restore_runtime_for_release(config: Mapping[str, Any], current: Path | None, record: Mapping[str, Any]) -> None:
     """Make the runtime match the release selected by restored pointers."""
     if current is None:
         _systemctl("stop", "agent-vm-native.service", allow_missing=True)
@@ -1298,13 +1371,9 @@ def _restore_runtime_for_release(current: Path | None, record: Mapping[str, Any]
         allow_historical_state_compatibility=True,
     )
     if _is_product_manifest(manifest):
-        snapshot = record.get("web_unit_enabled")
-        _activate_product_runtime(
-            manifest,
-            web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
-        )
+        _activate_product_runtime(config, manifest)
     elif _is_go_manifest(manifest):
-        _activate_go_runtime()
+        _activate_go_runtime(config, deployd_enabled=True)
     else:
         _activate_legacy_runtime()
 
@@ -1363,7 +1432,7 @@ def _install_release_files(config: Mapping[str, Any], release_root: Path, manife
 
 
 def _install_product_release_files(config: Mapping[str, Any], release_root: Path, manifest: Mapping[str, Any]) -> None:
-    """Install the complete format-4 product without replacing live Web config."""
+    """Install the format-4 product and retire the standalone Web artifacts."""
     owner_uid = int(config["owner_uid"])
     bundle_root = Path(config["control_path"]).parent
     expected_values = PRODUCT_LINUX_ARTIFACTS if manifest["format"] == PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_LEGACY_ARTIFACTS
@@ -1389,17 +1458,24 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
                 _copy_atomic(source, _go_bridge_target(config), owner_uid, item["mode"])
             elif item["path"] == "bin/agent-vm-control":
                 _copy_atomic(source, _go_control_target(config), owner_uid, item["mode"])
+            elif item["path"] == "bin/agent-vm-deployd":
+                _copy_atomic(source, _go_binary_target(config, GO_DEPLOYD_PATH), owner_uid, item["mode"])
+            elif item["path"] == "bin/agent-vm-deploy":
+                _copy_atomic(source, _go_binary_target(config, GO_DEPLOY_PATH), owner_uid, item["mode"])
             else:
                 _fail("activation_unverified", "product control artifact path is not fixed")
             installed_controls.add(item["path"])
         elif item["role"] == "unit":
-            if item["path"] not in {"systemd/agent-vm-native.service", "systemd/agent-vm-web.service"}:
+            if item["path"] not in {"systemd/agent-vm-native.service", "systemd/agent-vm-native@.service", "systemd/agent-vm-deployd.service"}:
                 _fail("activation_unverified", "product unit artifact path is not fixed")
             name = Path(item["path"]).name
             _copy_atomic(source, Path(config["unit_dir"]) / name, owner_uid, item["mode"])
             _copy_atomic(source, bundle_root / item["path"], owner_uid, item["mode"])
     expected_client_support = {path for _, path, role, _ in PRODUCT_CLIENT_ARTIFACTS if role == "support"}
-    if installed_support != expected_support or not expected_client_support.issubset(installed_support) or installed_controls != {"agent_vm_control_bridge.ts", "bin/agent-vm-control"}:
+    expected_controls = {"agent_vm_control_bridge.ts", "bin/agent-vm-control"}
+    if manifest["format"] == PRODUCT_MANIFEST_FORMAT:
+        expected_controls |= {"bin/agent-vm-deployd", "bin/agent-vm-deploy"}
+    if installed_support != expected_support or not expected_client_support.issubset(installed_support) or installed_controls != expected_controls:
         _fail("activation_unverified", "fixed product control artifacts are missing")
     for name in GO_RETIRED_UNITS:
         retired = Path(config["unit_dir"]) / name
@@ -1410,23 +1486,22 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
                 _fsync_directory(retired.parent, "activation_failed")
             except OSError:
                 _fail("activation_failed", f"cannot retire the exact old unit: {name}")
-    if manifest["format"] == LEGACY_PRODUCT_MANIFEST_FORMAT:
-        for target in (
-            Path(config["unit_dir"]) / "agent-vm-web.service",
-            bundle_root / "systemd" / "agent-vm-web.service",
-            bundle_root / "config" / "agent-vm-web.json.example",
-            bundle_root / "web-assets.manifest.json",
-        ):
-            if target.exists() or target.is_symlink():
-                if target.name == "agent-vm-web.json.example":
-                    _require_owned_regular_modes(target, owner_uid, (0o640, 0o644))
-                else:
-                    _require_owned_regular(target, owner_uid, 0o644)
-                try:
-                    target.unlink()
-                    _fsync_directory(target.parent, "activation_failed")
-                except OSError:
-                    _fail("activation_failed", f"cannot retire the exact Web artifact: {target.name}")
+    for target in (
+        Path(config["unit_dir"]) / "agent-vm-web.service",
+        bundle_root / "systemd" / "agent-vm-web.service",
+        bundle_root / "config" / "agent-vm-web.json.example",
+        bundle_root / "web-assets.manifest.json",
+    ):
+        if target.exists() or target.is_symlink():
+            if target.name == "agent-vm-web.json.example":
+                _require_owned_regular_modes(target, owner_uid, (0o640, 0o644))
+            else:
+                _require_owned_regular(target, owner_uid, 0o644)
+            try:
+                target.unlink()
+                _fsync_directory(target.parent, "activation_failed")
+            except OSError:
+                _fail("activation_failed", f"cannot retire the exact Web artifact: {target.name}")
     manifest_source = release_root / MANIFEST_NAME
     _require_owned_regular(manifest_source, owner_uid, 0o644)
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
@@ -1475,14 +1550,20 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
             elif item["path"] == "bin/agent-vm-control":
                 _copy_atomic(source, _go_control_target(config), owner_uid, item["mode"])
                 installed_controls.add(item["path"])
+            elif item["path"] == "bin/agent-vm-deployd":
+                _copy_atomic(source, _go_binary_target(config, GO_DEPLOYD_PATH), owner_uid, item["mode"])
+                installed_controls.add(item["path"])
+            elif item["path"] == "bin/agent-vm-deploy":
+                _copy_atomic(source, _go_binary_target(config, GO_DEPLOY_PATH), owner_uid, item["mode"])
+                installed_controls.add(item["path"])
             else:
                 _fail("activation_unverified", "Go control artifact path is not fixed")
         elif item["role"] == "unit":
-            if item["path"] != "systemd/agent-vm-native.service":
+            if item["path"] not in {"systemd/agent-vm-native.service", "systemd/agent-vm-native@.service", "systemd/agent-vm-deployd.service"}:
                 _fail("activation_unverified", "Go unit artifact path is not fixed")
-            _copy_atomic(source, Path(config["unit_dir"]) / "agent-vm-native.service", owner_uid, item["mode"])
+            _copy_atomic(source, Path(config["unit_dir"]) / Path(item["path"]).name, owner_uid, item["mode"])
             _copy_atomic(source, go_bundle_root / item["path"], owner_uid, item["mode"])
-    if installed_support != expected_support or installed_controls != {"agent_vm_control_bridge.ts", "bin/agent-vm-control"}:
+    if installed_support != expected_support or installed_controls != {"agent_vm_control_bridge.ts", "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
         _fail("activation_unverified", "fixed Go control artifacts are missing")
     for name in GO_RETIRED_UNITS:
         retired = Path(config["unit_dir"]) / name
@@ -1512,6 +1593,12 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
     manifest_source = release_root / MANIFEST_NAME
     _require_owned_regular(manifest_source, owner_uid, 0o644)
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
+    slot_binary = release_root / "bin" / "agent-vm-control"
+    _require_owned_regular(slot_binary, owner_uid, 0o755)
+    for slot in GO_SLOT_NAMES:
+        slot_root = _go_slot_root(config, slot)
+        _copy_atomic(slot_binary, slot_root / "bin" / "agent-vm-control", owner_uid, 0o755)
+        _copy_atomic(manifest_source, slot_root / "release-manifest.json", owner_uid, 0o644)
     client_sidecar = release_root / "client-release.json"
     _require_owned_regular(client_sidecar, owner_uid, 0o644)
     _copy_atomic(client_sidecar, Path(config["control_path"]).with_name("client-release.json"), owner_uid, 0o644)
@@ -1556,9 +1643,6 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _verify_retained_release(config, old_current)
     if old_previous is not None:
         _verify_retained_release(config, old_previous)
-    web_unit_enabled = None
-    if _is_product_manifest(candidate_manifest) or _is_go_manifest(candidate_manifest):
-        web_unit_enabled = _unit_is_enabled("agent-vm-web.service")
     _mkdir_private(release_root, 0o755)
     release_dir = release_root / release_id
     if release_dir.exists():
@@ -1592,7 +1676,6 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         "activated": False,
         "activation_phase": "prepared",
         "rollback_attempts": 0,
-        "web_unit_enabled": web_unit_enabled,
     }
     _write_json(activation_path, record)
     runtime_switch_attempted = False
@@ -1613,12 +1696,12 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         _write_json(activation_path, record)
         if _is_product_manifest(manifest):
             runtime_switch_attempted = True
-            _activate_product_runtime(manifest, web_was_enabled=web_unit_enabled)
+            _activate_product_runtime(config, manifest)
             record["activation_phase"] = "runtime-switched"
             _write_json(activation_path, record)
         elif _is_go_manifest(manifest):
             runtime_switch_attempted = True
-            _activate_go_runtime()
+            _activate_go_runtime(config, deployd_enabled=True)
             record["activation_phase"] = "runtime-switched"
             _write_json(activation_path, record)
         record["activated"] = True
@@ -1677,13 +1760,9 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                 else:
                     assert old_manifest is not None
                     if _is_product_manifest(old_manifest):
-                        snapshot = record.get("web_unit_enabled")
-                        _activate_product_runtime(
-                            old_manifest,
-                            web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
-                        )
+                        _activate_product_runtime(config, old_manifest)
                     elif _is_go_manifest(old_manifest):
-                        _activate_go_runtime()
+                        _activate_go_runtime(config, deployd_enabled=True)
                     else:
                         _activate_legacy_runtime()
             except (WrapperError, ManifestError) as runtime_error:
@@ -1807,9 +1886,9 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             )
         _daemon_reload()
         if _is_product_manifest(previous_manifest):
-            _activate_product_runtime(previous_manifest)
+            _activate_product_runtime(config, previous_manifest)
         elif _is_go_manifest(previous_manifest):
-            _activate_go_runtime()
+            _activate_go_runtime(config, deployd_enabled=True)
         else:
             _activate_legacy_runtime()
     except WrapperError as failure:
@@ -1832,7 +1911,7 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             )
         if restore_error is None:
             try:
-                _restore_runtime_for_release(actual_current, record)
+                _restore_runtime_for_release(config, actual_current, record)
             except (WrapperError, ManifestError) as runtime_error:
                 failure = WrapperError(
                     "activation_restore_failed",

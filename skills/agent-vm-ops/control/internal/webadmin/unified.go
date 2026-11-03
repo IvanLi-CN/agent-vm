@@ -158,6 +158,10 @@ func (server *UnifiedServer) browserAPI(c *gin.Context) {
 				return
 			}
 		}
+		if server.Lifecycle != nil && !server.Lifecycle.Ready() {
+			writeProblem(c.Writer, newAPIError("startup_reconcile_required", "control service is not ready for management mutations", http.StatusServiceUnavailable, "reconciliation", true, ""))
+			return
+		}
 	}
 	if pathValue == "/session" {
 		writeProblem(c.Writer, newAPIError("invalid_request", "session must be established with GET", http.StatusMethodNotAllowed, "request_validation", false, ""))

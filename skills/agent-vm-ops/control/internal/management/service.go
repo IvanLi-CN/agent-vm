@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -50,6 +51,10 @@ type Service struct {
 	imageStorageReserved int64
 	trustedImportLocksMu sync.Mutex
 	trustedImportLocks   map[string]*trustedImportLock
+	mutationMu           sync.RWMutex
+	mutationGate         func() bool
+	mutationChanges      func() <-chan struct{}
+	mutationCommit       func(func() error) error
 }
 
 type trustedImportLock struct {
@@ -181,6 +186,99 @@ func New(store *state.Store, options Options) *Service {
 		clock = time.Now
 	}
 	return &Service{Store: store, Clock: clock, Options: options, trustedImportLocks: make(map[string]*trustedImportLock)}
+}
+
+// SetMutationGate installs the process-local controller lease check. Read-only
+// management queries remain available on a standby slot, while every
+// management operation that can write state or invoke a native backend fails
+// closed without the controller lease.
+func (s *Service) SetMutationGate(gate func() bool) {
+	s.mutationMu.Lock()
+	s.mutationGate = gate
+	s.mutationMu.Unlock()
+}
+
+// SetMutationFence supplies the lease-change notification used to cancel a
+// management native mutation that is still in flight.
+func (s *Service) SetMutationFence(changes func() <-chan struct{}) {
+	s.mutationMu.Lock()
+	s.mutationChanges = changes
+	s.mutationMu.Unlock()
+}
+
+// SetMutationCommit supplies the lease-serialized commit used to finalize a
+// management operation. The callback must cover only the short durable write.
+func (s *Service) SetMutationCommit(commit func(func() error) error) {
+	s.mutationMu.Lock()
+	s.mutationCommit = commit
+	s.mutationMu.Unlock()
+}
+
+func (s *Service) mutationAllowed() bool {
+	s.mutationMu.RLock()
+	gate := s.mutationGate
+	s.mutationMu.RUnlock()
+	return gate == nil || gate()
+}
+
+func (s *Service) requireMutationLease() error {
+	if s.mutationAllowed() {
+		return nil
+	}
+	return protocol.NewError("controller_lease_required", "controller lease is required for management mutation", map[string]any{"outcome_verified": false})
+}
+
+func (s *Service) commitMutation(commit func() error) error {
+	s.mutationMu.RLock()
+	commitGate := s.mutationCommit
+	s.mutationMu.RUnlock()
+	if commitGate == nil {
+		return commit()
+	}
+	return commitGate(commit)
+}
+
+func (s *Service) mutationContext(ctx context.Context) (context.Context, func(), func() bool) {
+	s.mutationMu.RLock()
+	gate := s.mutationGate
+	changes := s.mutationChanges
+	s.mutationMu.RUnlock()
+	if gate == nil && changes == nil {
+		return ctx, func() {}, func() bool { return false }
+	}
+	fencedContext, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	var lost atomic.Bool
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			var changed <-chan struct{}
+			if changes != nil {
+				changed = changes()
+			}
+			select {
+			case <-fencedContext.Done():
+				return
+			case <-changed:
+				lost.Store(true)
+				cancel()
+				return
+			case <-ticker.C:
+				if gate != nil && !gate() {
+					lost.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	stop := func() {
+		cancel()
+		<-done
+	}
+	return fencedContext, stop, lost.Load
 }
 
 // lockTrustedImport serializes the preflight, storage reservation and durable
@@ -328,6 +426,9 @@ func (s *Service) existingOperation(ctx context.Context, operationID, digest str
 }
 
 func (s *Service) StartImageImport(ctx context.Context, request ImportRequest) (*state.ManagementOperation, error) {
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
+	}
 	requestMap := importRequestMap(request)
 	digest, err := protocol.Digest(protocol.Request(requestMap))
 	if err != nil {
@@ -363,7 +464,12 @@ func (s *Service) StartImageImport(ctx context.Context, request ImportRequest) (
 	if request.Source.Kind == "trusted_remote" {
 		operation.Phase, operation.Status = "queued", "queued"
 	}
-	existing, err := s.Store.ClaimManagementOperationWithAudit(ctx, operation, s.auditValue(operation, "accepted", operation.Phase, nil))
+	var existing *state.ManagementOperation
+	err = s.commitMutation(func() error {
+		var commitErr error
+		existing, commitErr = s.Store.ClaimManagementOperationWithAudit(ctx, operation, s.auditValue(operation, "accepted", operation.Phase, nil))
+		return commitErr
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -559,10 +665,15 @@ func (s *Service) beginLocalImageUpload(ctx context.Context, operationID string)
 	if err != nil {
 		return operation, nil, nil, err
 	}
-	running, claimed, err := s.Store.TransitionManagementOperationUnlessDraining(ctx, operationID, "awaiting_upload", "image_import", "running")
-	if err != nil {
+	var running *state.ManagementOperation
+	var claimed bool
+	if commitErr := s.commitMutation(func() error {
+		var transitionErr error
+		running, claimed, transitionErr = s.Store.TransitionManagementOperationUnlessDraining(ctx, operationID, "awaiting_upload", "image_import", "running")
+		return transitionErr
+	}); commitErr != nil {
 		release()
-		return nil, nil, nil, err
+		return nil, nil, nil, commitErr
 	}
 	if !claimed {
 		release()
@@ -572,6 +683,12 @@ func (s *Service) beginLocalImageUpload(ctx context.Context, operationID string)
 }
 
 func (s *Service) UploadImageImport(ctx context.Context, operationID string, metadata, rootfs []byte) (*state.ManagementOperation, error) {
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
+	}
+	mutationCtx, stopMutationWatch, mutationLost := s.mutationContext(ctx)
+	defer stopMutationWatch()
+	ctx = mutationCtx
 	unlock, err := s.lockOperation(ctx, operationID)
 	if err != nil {
 		return nil, err
@@ -606,6 +723,9 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 	s.imageImportMu.Lock()
 	defer s.imageImportMu.Unlock()
 	artifact, err := s.Options.Backend.ImportLocal(ctx, request.Source.Format, metadata, rootfs)
+	if mutationLost() || !s.mutationAllowed() {
+		return nil, controllerLeaseLostError(err)
+	}
 	if err != nil {
 		return s.finishBackendImportFailure(ctx, operation, artifact, err)
 	}
@@ -613,6 +733,12 @@ func (s *Service) UploadImageImport(ctx context.Context, operationID string, met
 }
 
 func (s *Service) UploadImageImportFiles(ctx context.Context, operationID, metadataPath, rootfsPath string) (*state.ManagementOperation, error) {
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
+	}
+	mutationCtx, stopMutationWatch, mutationLost := s.mutationContext(ctx)
+	defer stopMutationWatch()
+	ctx = mutationCtx
 	unlock, err := s.lockOperation(ctx, operationID)
 	if err != nil {
 		return nil, err
@@ -682,7 +808,13 @@ func (s *Service) UploadImageImportFiles(ctx context.Context, operationID, metad
 		artifact, err = s.Options.Backend.ImportLocal(ctx, request.Source.Format, metadata, rootfs)
 	}
 	if err != nil {
+		if mutationLost() || !s.mutationAllowed() {
+			return nil, controllerLeaseLostError(err)
+		}
 		return s.finishBackendImportFailure(ctx, operation, artifact, err)
+	}
+	if mutationLost() || !s.mutationAllowed() {
+		return nil, controllerLeaseLostError(nil)
 	}
 	return s.finishImport(ctx, operation, *request, artifact)
 }
@@ -713,6 +845,9 @@ func validateImportFile(path string, expectedSize int64, expectedDigest string) 
 // FailImageImportUpload durably closes an upload operation when the HTTP
 // stream fails before the bytes can reach the image verifier.
 func (s *Service) FailImageImportUpload(ctx context.Context, operationID string, err error) (*state.ManagementOperation, error) {
+	if leaseErr := s.requireMutationLease(); leaseErr != nil {
+		return nil, leaseErr
+	}
 	unlock, lockErr := s.lockOperation(ctx, operationID)
 	if lockErr != nil {
 		return nil, lockErr
@@ -725,8 +860,13 @@ func (s *Service) FailImageImportUpload(ctx context.Context, operationID string,
 	if operation.Status != "awaiting_upload" {
 		return operation, nil
 	}
-	running, claimed, transitionErr := s.Store.TransitionManagementOperation(ctx, operationID, "awaiting_upload", "upload", "running")
-	if transitionErr != nil {
+	var running *state.ManagementOperation
+	var claimed bool
+	if transitionErr := s.commitMutation(func() error {
+		var commitErr error
+		running, claimed, commitErr = s.Store.TransitionManagementOperation(ctx, operationID, "awaiting_upload", "upload", "running")
+		return commitErr
+	}); transitionErr != nil {
 		return nil, transitionErr
 	}
 	if !claimed {
@@ -743,6 +883,12 @@ func (s *Service) FailImageImportUpload(ctx context.Context, operationID string,
 }
 
 func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) (*state.ManagementOperation, error) {
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
+	}
+	mutationCtx, stopMutationWatch, mutationLost := s.mutationContext(ctx)
+	defer stopMutationWatch()
+	ctx = mutationCtx
 	operationUnlock, err := s.lockOperation(ctx, operationID)
 	if err != nil {
 		return nil, err
@@ -788,10 +934,15 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 	if err != nil {
 		return operation, err
 	}
-	running, claimed, err := s.Store.TransitionManagementOperationUnlessDraining(ctx, operationID, "queued", "image_import", "running")
-	if err != nil {
+	var running *state.ManagementOperation
+	var claimed bool
+	if transitionErr := s.commitMutation(func() error {
+		var commitErr error
+		running, claimed, commitErr = s.Store.TransitionManagementOperationUnlessDraining(ctx, operationID, "queued", "image_import", "running")
+		return commitErr
+	}); transitionErr != nil {
 		release()
-		return nil, err
+		return nil, transitionErr
 	}
 	if !claimed {
 		release()
@@ -802,6 +953,9 @@ func (s *Service) ProcessTrustedImport(ctx context.Context, operationID string) 
 	s.imageImportMu.Lock()
 	defer s.imageImportMu.Unlock()
 	artifact, err := s.Options.Backend.ImportTrusted(ctx, request.Source.SourceID, request.Source.ExpectedFingerprint)
+	if mutationLost() || !s.mutationAllowed() {
+		return nil, controllerLeaseLostError(err)
+	}
 	if err != nil {
 		return s.finishBackendImportFailure(ctx, operation, artifact, err)
 	}
@@ -864,6 +1018,9 @@ func imageUnpackText(value string) bool {
 }
 
 func (s *Service) cleanupImportedImage(ctx context.Context, fingerprint string) string {
+	if err := s.requireMutationLease(); err != nil {
+		return "blocked_controller_lease"
+	}
 	catalogUnlock, lockErr := s.AcquireResourceLock(ctx, "image-catalog")
 	if lockErr != nil {
 		return "blocked_catalog_unverified"
@@ -895,6 +1052,9 @@ func (s *Service) cleanupImportedImage(ctx context.Context, fingerprint string) 
 // recovery path. Running native work is never replayed automatically because
 // the previous executor may still be alive or its result may be uncertain.
 func (s *Service) RecoverOperation(ctx context.Context, operationID string) (*state.ManagementOperation, error) {
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
+	}
 	unlock, err := s.lockOperation(ctx, operationID)
 	if err != nil {
 		return nil, err
@@ -924,6 +1084,9 @@ func (s *Service) RecoverOperation(ctx context.Context, operationID string) (*st
 // when the resident authority stopped. Queued trusted imports remain queued;
 // replaying them would make a restart an implicit native side effect.
 func (s *Service) RecoverPendingOperations(ctx context.Context) error {
+	if err := s.requireMutationLease(); err != nil {
+		return err
+	}
 	operations, err := s.Store.ListAllManagementOperations(ctx)
 	if err != nil {
 		return err
@@ -941,6 +1104,9 @@ func (s *Service) RecoverPendingOperations(ctx context.Context) error {
 }
 
 func (s *Service) finishImport(ctx context.Context, operation *state.ManagementOperation, request ImportRequest, artifact ImageArtifact) (*state.ManagementOperation, error) {
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
+	}
 	findings := []string{}
 	if artifact.Fingerprint != request.Source.ExpectedFingerprint && request.Source.Kind == "trusted_remote" {
 		findings = append(findings, "fingerprint_mismatch")
@@ -984,10 +1150,13 @@ func (s *Service) finishImport(ctx context.Context, operation *state.ManagementO
 	if lockErr != nil {
 		return s.recoverImportedCatalogFailure(ctx, operation, artifact, lockErr)
 	}
-	insertErr := s.Store.InsertManagedImage(ctx, image)
+	insertErr := s.commitMutation(func() error { return s.Store.InsertManagedImage(ctx, image) })
 	catalogUnlock()
 	if insertErr != nil {
 		return s.recoverImportedCatalogFailure(ctx, operation, artifact, insertErr)
+	}
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
 	}
 	return s.finishOperation(ctx, operation, "completed", "succeeded", map[string]any{"fingerprint": artifact.Fingerprint, "state": "available"}, nil)
 }
@@ -1031,6 +1200,9 @@ func (s *Service) recoverImportedCatalogFailure(ctx context.Context, operation *
 }
 
 func (s *Service) failImportWithImage(ctx context.Context, operation *state.ManagementOperation, request ImportRequest, artifact ImageArtifact, integrity, suitability string, findings []string) (*state.ManagementOperation, error) {
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
+	}
 	if !fingerprintPattern.MatchString(artifact.Fingerprint) {
 		return s.finishOperation(ctx, operation, "reconciliation", "outcome_unknown", nil, map[string]any{"code": "internal_error", "retryable": true})
 	}
@@ -1038,10 +1210,15 @@ func (s *Service) failImportWithImage(ctx context.Context, operation *state.Mana
 	if lockErr != nil {
 		return s.recoverImportedCatalogFailure(ctx, operation, artifact, lockErr)
 	}
-	insertErr := s.Store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Architecture: artifact.Architecture, InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID), State: "failed", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none"})
+	insertErr := s.commitMutation(func() error {
+		return s.Store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Architecture: artifact.Architecture, InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID), State: "failed", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none"})
+	})
 	catalogUnlock()
 	if insertErr != nil {
 		return s.recoverImportedCatalogFailure(ctx, operation, artifact, insertErr)
+	}
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
 	}
 	return s.finishOperation(ctx, operation, "completed", "failed", nil, map[string]any{"code": "image_not_applicable", "phase": "suitability_check", "findings": findings})
 }
@@ -1058,12 +1235,26 @@ func (s *Service) finishOperation(ctx context.Context, operation *state.Manageme
 	}
 	finalizeCtx, cancel := context.WithTimeout(context.Background(), operationFinalizeTimeout)
 	defer cancel()
-	return s.Store.FinishManagementOperation(finalizeCtx, operation.OperationID, phase, status, result, failure, s.auditValue(*operation, outcome, phase, failure))
+	var finished *state.ManagementOperation
+	err := s.commitMutation(func() error {
+		var err error
+		finished, err = s.Store.FinishManagementOperation(finalizeCtx, operation.OperationID, phase, status, result, failure, s.auditValue(*operation, outcome, phase, failure))
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return finished, nil
 }
 
 func (s *Service) SelectDefault(ctx context.Context, operationID, actor, reason, fingerprint, targetVersion string) (*state.ManagementOperation, error) {
 	return s.runImageMutation(ctx, operationID, actor, reason, "default_image_select", fingerprint, targetVersion, func() (map[string]any, error) {
-		version, err := s.Store.SelectManagedImage(ctx, fingerprint, targetVersion)
+		var version string
+		err := s.commitMutation(func() error {
+			var commitErr error
+			version, commitErr = s.Store.SelectManagedImage(ctx, fingerprint, targetVersion)
+			return commitErr
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -1078,7 +1269,7 @@ func (s *Service) RetireImage(ctx context.Context, operationID, actor, reason, f
 		if err := s.requireImageVersion(ctx, fingerprint, targetVersion); err != nil {
 			return nil, err
 		}
-		if err := s.Store.RetireManagedImage(ctx, fingerprint); err != nil {
+		if err := s.commitMutation(func() error { return s.Store.RetireManagedImage(ctx, fingerprint) }); err != nil {
 			return nil, err
 		}
 		return map[string]any{"fingerprint": fingerprint, "state": "retired"}, nil
@@ -1111,7 +1302,7 @@ func (s *Service) DeleteImage(ctx context.Context, operationID, actor, reason, f
 		if err := s.Options.Backend.DeleteImage(ctx, fingerprint); err != nil {
 			return nil, err
 		}
-		if err := s.Store.DeleteManagedImage(ctx, fingerprint); err != nil {
+		if err := s.commitMutation(func() error { return s.Store.DeleteManagedImage(ctx, fingerprint) }); err != nil {
 			return nil, nativeStateUncertainError{cause: err}
 		}
 		return map[string]any{"fingerprint": fingerprint, "state": "deleted"}, nil
@@ -1148,6 +1339,12 @@ func (s *Service) requireImageVersion(ctx context.Context, fingerprint, expected
 }
 
 func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reason, action, targetID, targetVersion string, mutate func() (map[string]any, error)) (*state.ManagementOperation, error) {
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
+	}
+	mutationCtx, stopMutationWatch, mutationLost := s.mutationContext(ctx)
+	defer stopMutationWatch()
+	ctx = mutationCtx
 	unlock, err := s.lockOperation(ctx, operationID)
 	if err != nil {
 		return nil, err
@@ -1170,7 +1367,12 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 	req := map[string]any{"action": action, "target_id": targetID, "target_version": targetVersion, "actor": actor, "reason": reason}
 	digest, _ := protocol.Digest(protocol.Request(req))
 	operation := state.ManagementOperation{OperationID: operationID, Action: action, TargetKind: "image", TargetID: targetID, Actor: actor, Reason: reason, Phase: "reference_check", Status: "queued", Request: map[string]any{"_request_digest": digest, "request": req}}
-	existing, err := s.Store.ClaimManagementOperationWithAudit(ctx, operation, s.auditValue(operation, "accepted", operation.Phase, nil))
+	var existing *state.ManagementOperation
+	err = s.commitMutation(func() error {
+		var commitErr error
+		existing, commitErr = s.Store.ClaimManagementOperationWithAudit(ctx, operation, s.auditValue(operation, "accepted", operation.Phase, nil))
+		return commitErr
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -1183,15 +1385,23 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 		}
 		operation = *existing
 	}
-	running, claimed, err := s.Store.TransitionManagementOperationUnlessDraining(ctx, operationID, "queued", "native_mutation", "running")
-	if err != nil {
-		return nil, err
+	var running *state.ManagementOperation
+	var claimed bool
+	if transitionErr := s.commitMutation(func() error {
+		var commitErr error
+		running, claimed, commitErr = s.Store.TransitionManagementOperationUnlessDraining(ctx, operationID, "queued", "native_mutation", "running")
+		return commitErr
+	}); transitionErr != nil {
+		return nil, transitionErr
 	}
 	if !claimed {
 		return running, nil
 	}
 	operation = *running
 	result, mutateErr := mutate()
+	if mutationLost() || !s.mutationAllowed() {
+		return nil, controllerLeaseLostError(mutateErr)
+	}
 	if mutateErr != nil {
 		status := "failed"
 		phase := "native_mutation"
@@ -1204,6 +1414,12 @@ func (s *Service) runImageMutation(ctx context.Context, operationID, actor, reas
 }
 
 func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) (*state.ManagementOperation, error) {
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
+	}
+	mutationCtx, stopMutationWatch, mutationLost := s.mutationContext(ctx)
+	defer stopMutationWatch()
+	ctx = mutationCtx
 	unlock, err := s.lockOperation(ctx, request.OperationID)
 	if err != nil {
 		return nil, err
@@ -1260,9 +1476,14 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	if err != nil {
 		return nil, err
 	}
-	running, claimed, err := s.Store.TransitionManagementOperationUnlessReleaseDraining(ctx, request.OperationID, "queued", "native_action", "running")
-	if err != nil {
-		return nil, err
+	var running *state.ManagementOperation
+	var claimed bool
+	if transitionErr := s.commitMutation(func() error {
+		var commitErr error
+		running, claimed, commitErr = s.Store.TransitionManagementOperationUnlessReleaseDraining(ctx, request.OperationID, "queued", "native_action", "running")
+		return commitErr
+	}); transitionErr != nil {
+		return nil, transitionErr
 	}
 	if !claimed {
 		return running, nil
@@ -1291,6 +1512,9 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 	} else {
 		result, actionErr = s.Options.Actions.ExecuteVMAction(ctx, request.OperationID, request.Action, request.TaskID, request.ExpectedGeneration, request.Parameters)
 	}
+	if mutationLost() || !s.mutationAllowed() {
+		return nil, controllerLeaseLostError(actionErr)
+	}
 	if actionErr != nil {
 		status := "failed"
 		if isUncertain(actionErr) {
@@ -1302,6 +1526,12 @@ func (s *Service) ExecuteVMAction(ctx context.Context, request VMActionRequest) 
 }
 
 func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceRequest) (*state.ManagementOperation, error) {
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
+	}
+	mutationCtx, stopMutationWatch, mutationLost := s.mutationContext(ctx)
+	defer stopMutationWatch()
+	ctx = mutationCtx
 	unlock, err := s.lockOperation(ctx, request.OperationID)
 	if err != nil {
 		return nil, err
@@ -1347,19 +1577,25 @@ func (s *Service) ExecuteMaintenance(ctx context.Context, request MaintenanceReq
 	// fence they must not cross the wrapper's final convergence observation.
 	var running *state.ManagementOperation
 	var claimed bool
-	if request.Action == "reconcile" || request.Action == "gc" {
-		running, claimed, err = s.Store.TransitionManagementOperationUnlessReleaseDraining(ctx, request.OperationID, "queued", "native_action", "running")
-	} else {
-		running, claimed, err = s.Store.TransitionManagementOperation(ctx, request.OperationID, "queued", "native_action", "running")
-	}
-	if err != nil {
-		return nil, err
+	if transitionErr := s.commitMutation(func() error {
+		var commitErr error
+		if request.Action == "reconcile" || request.Action == "gc" {
+			running, claimed, commitErr = s.Store.TransitionManagementOperationUnlessReleaseDraining(ctx, request.OperationID, "queued", "native_action", "running")
+		} else {
+			running, claimed, commitErr = s.Store.TransitionManagementOperation(ctx, request.OperationID, "queued", "native_action", "running")
+		}
+		return commitErr
+	}); transitionErr != nil {
+		return nil, transitionErr
 	}
 	if !claimed {
 		return running, nil
 	}
 	operation = running
 	result, actionErr := s.Options.Actions.ExecuteMaintenance(ctx, request.OperationID, request.Action, request.Parameters)
+	if mutationLost() || !s.mutationAllowed() {
+		return nil, controllerLeaseLostError(actionErr)
+	}
 	if actionErr != nil {
 		status := "failed"
 		if isUncertain(actionErr) {
@@ -1381,8 +1617,12 @@ func (s *Service) claimAction(ctx context.Context, operationID, actor, reason, a
 	request["action"], request["target_kind"], request["target_id"] = action, targetKind, targetID
 	digest, _ := protocol.Digest(protocol.Request(request))
 	operation := state.ManagementOperation{OperationID: operationID, Action: action, TargetKind: targetKind, TargetID: targetID, Actor: actor, Reason: reason, Phase: "native_action", Status: "queued", Request: map[string]any{"_request_digest": digest, "request": request}}
-	existing, err := s.Store.ClaimManagementOperationWithAudit(ctx, operation, s.auditValue(operation, "accepted", operation.Phase, nil))
-	if err != nil {
+	var existing *state.ManagementOperation
+	if err := s.commitMutation(func() error {
+		var commitErr error
+		existing, commitErr = s.Store.ClaimManagementOperationWithAudit(ctx, operation, s.auditValue(operation, "accepted", operation.Phase, nil))
+		return commitErr
+	}); err != nil {
 		return nil, err
 	}
 	if existing != nil {
@@ -1509,8 +1749,16 @@ func safeError(err error) map[string]any {
 	return map[string]any{"code": "internal_error"}
 }
 
+func controllerLeaseLostError(cause error) *protocol.Error {
+	detail := map[string]any{"outcome_verified": false, "phase": "controller-lease"}
+	if cause != nil {
+		detail["cause"] = cause.Error()
+	}
+	return protocol.NewError("state_unverified", "controller lease was lost during management mutation", detail)
+}
+
 func safeCode(code string) string {
-	if contains([]string{"authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "authority_unavailable", "rate_limited", "sqlite_unavailable", "internal_error", "resource_insufficient", "watermarks_unreachable"}, code) {
+	if contains([]string{"authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "authority_unavailable", "rate_limited", "sqlite_unavailable", "internal_error", "resource_insufficient", "watermarks_unreachable", "state_unverified", "controller_lease_required"}, code) {
 		return code
 	}
 	return "internal_error"
