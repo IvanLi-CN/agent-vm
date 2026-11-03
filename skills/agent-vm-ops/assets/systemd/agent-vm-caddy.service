@@ -1,9 +1,13 @@
 [Unit]
 Description=Agent VM Caddy edge proxy
-After=agent-vm-rqlite.service agent-vm-native@blue.service agent-vm-native@green.service
-Wants=agent-vm-rqlite.service
+After=network-online.target agent-vm-rqlite.service agent-vm-native@blue.service agent-vm-native@green.service
+Wants=network-online.target agent-vm-rqlite.service
 ConditionPathExists=/etc/agent-vm-native/Caddyfile
-ConditionPathExists=/var/lib/agent-vm-native/active/app.sock
+ConditionPathExists=/etc/agent-vm-native/caddy.env
+ConditionPathIsSymbolicLink=!/etc
+ConditionPathIsSymbolicLink=!/etc/agent-vm-native
+ConditionPathIsSymbolicLink=!/etc/agent-vm-native/Caddyfile
+ConditionPathIsSymbolicLink=!/etc/agent-vm-native/caddy.env
 RequiresMountsFor=/var/lib/agent-vm-native/active/app.sock
 
 [Service]
@@ -11,11 +15,15 @@ Type=simple
 User=caddy
 Group=caddy
 SupplementaryGroups=agent-vm-web
-EnvironmentFile=-/etc/agent-vm-native/caddy.env
+EnvironmentFile=/etc/agent-vm-native/caddy.env
 ExecStartPre=/usr/bin/test -L /var/lib/agent-vm-native/active
 ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock
-ExecStart=/usr/local/bin/caddy run --environ --config /etc/agent-vm-native/Caddyfile --adapter caddyfile
-ExecReload=/usr/local/bin/caddy reload --config /etc/agent-vm-native/Caddyfile --adapter caddyfile
+ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/Caddyfile
+ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/caddy.env
+ExecStartPre=/bin/sh -c 'for path in /etc/agent-vm-native/Caddyfile /etc/agent-vm-native/caddy.env; do test "$$(/usr/bin/readlink -f -- "$$path")" = "$$path" || exit 1; done'
+ExecStartPre=+/bin/sh -c 'attempt=0; while [ "$$attempt" -lt 30 ]; do if /usr/bin/curl --fail --silent --show-error --max-time 1 --unix-socket /var/lib/agent-vm-native/active/app.sock http://localhost/internal/v1/health >/dev/null; then exit 0; fi; attempt=$$(($$attempt + 1)); /usr/bin/sleep 0.5; done; exit 1'
+ExecStartPre=/bin/sh -c 'test "$(/usr/bin/stat -c "%%u:%%g:%%a" /etc/agent-vm-native/caddy.env)" = "0:0:600"'
+ExecStart=/usr/local/bin/caddy run --config /etc/agent-vm-native/Caddyfile --adapter caddyfile
 Restart=on-failure
 RestartSec=2s
 TimeoutStartSec=60s
@@ -25,7 +33,7 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/var/lib/agent-vm-native/caddy
-ReadOnlyPaths=/etc/agent-vm-native/Caddyfile /etc/agent-vm-native/caddy.env /etc/agent-vm-native/tls/caddy
+ReadOnlyPaths=/etc/agent-vm-native/Caddyfile /etc/agent-vm-native/caddy.env
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_BIND_SERVICE

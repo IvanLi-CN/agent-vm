@@ -1,33 +1,20 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "policy": {
     "source": "official-github-release",
-    "verification": "pinned-checksum",
+    "verification": "component-specific-checksum",
     "automatic_install": false,
     "production_data": false
   },
   "caddy": {
-    "version": "2.11.7",
+    "version_major": 2,
     "repository": "caddyserver/caddy",
-    "release_tag": "v2.11.7",
-    "checksums_url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_checksums.txt",
-    "checksums_sha256": "5d27b76b95f496638d79208c55250317b8755fd9e90005f7466aa32956944a90",
-    "artifacts": [
-      {
-        "os": "linux",
-        "arch": "amd64",
-        "filename": "caddy_2.11.7_linux_amd64.tar.gz",
-        "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_amd64.tar.gz",
-        "sha512": "a7a433a1b133efc3c8d10eb0b99d52a24b5ef5c322dc77f5282182b1c0402139ab83f3a99f0c52409df77d20123fb0b523edad8a66d8f5e49136197bf61ef0e7"
-      },
-      {
-        "os": "linux",
-        "arch": "arm64",
-        "filename": "caddy_2.11.7_linux_arm64.tar.gz",
-        "url": "https://github.com/caddyserver/caddy/releases/download/v2.11.7/caddy_2.11.7_linux_arm64.tar.gz",
-        "sha512": "3db36ba90c7a6e8dda40ee3dd71fa08844c76b5fb08f61b31e5e78d2ed38e71c51dc7baed875e50d1ca1279196e84302967237386ae87c91ae9f2aaceada682e"
-      }
-    ]
+    "version_policy": "operator-selected-v2-release",
+    "builder": "xcaddy",
+    "provider_module": "github.com/caddy-dns/dnspod",
+    "provider_ref": "fb7cc31cc04c68a304b8d2672c3e5d9f2ad3d7ba",
+    "provider_module_name": "dns.providers.dnspod",
+    "artifact_verification": "operator-recorded-sha512"
   },
   "rqlite": {
     "version": "10.5.2",

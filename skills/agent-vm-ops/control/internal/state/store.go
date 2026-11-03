@@ -304,6 +304,13 @@ func OpenForTest(path string) (*Store, error) {
 
 func (s *Store) Path() string { return s.path }
 
+func (s *Store) diagnosticPath() string {
+	if s.remote != nil {
+		return s.remote.diagnosticBaseURL()
+	}
+	return s.path
+}
+
 func (s *Store) Close() error {
 	if s.remote != nil {
 		return s.remote.close()
@@ -355,7 +362,7 @@ func (s *Store) checkReadable(ctx context.Context) error {
 			var value int
 			if err := conn.QueryRowContext(ctx, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&value); err != nil {
 				if errors.Is(err, sql.ErrNoRows) {
-					return fmt.Errorf("database schema missing table %s: %s", table, s.path)
+					return fmt.Errorf("database schema missing table %s: %s", table, s.diagnosticPath())
 				}
 				return fmt.Errorf("database check: %w", err)
 			}

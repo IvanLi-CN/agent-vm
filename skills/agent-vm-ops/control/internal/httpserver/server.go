@@ -21,9 +21,11 @@ import (
 )
 
 const (
-	maxHeaderBytes = 8 * 1024
-	maxBodyBytes   = 2 * 1024 * 1024
-	exitCodeHeader = "X-Agent-VM-Exit-Code"
+	maxHeaderBytes   = 8 * 1024
+	maxBodyBytes     = 2 * 1024 * 1024
+	exitCodeHeader   = "X-Agent-VM-Exit-Code"
+	legacySocketMode = os.FileMode(0o600)
+	appSocketMode    = os.FileMode(0o660)
 )
 
 type peerConn struct {
@@ -186,27 +188,16 @@ func Serve(ctx context.Context, socket string, service *lifecycle.Service, snaps
 	if len(snapshots) > 0 {
 		store = snapshots[0]
 	}
-	return serve(ctx, socket, service, store, nil)
+	return serve(ctx, socket, service, store, nil, legacySocketMode)
 }
 
 func ServeApp(ctx context.Context, socket string, service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler) error {
-	return serve(ctx, socket, service, snapshots, app)
+	return serve(ctx, socket, service, snapshots, app, appSocketMode)
 }
 
-func serve(ctx context.Context, socket string, service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler) error {
-	if err := prepareSocket(socket); err != nil {
-		return err
-	}
-	listener, err := net.Listen("unix", socket)
+func serve(ctx context.Context, socket string, service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler, mode os.FileMode) error {
+	listener, err := listenUnixSocket(socket, mode)
 	if err != nil {
-		return fmt.Errorf("listen on control socket: %w", err)
-	}
-	mode := os.FileMode(0o600)
-	if app != nil {
-		mode = 0o660
-	}
-	if err := os.Chmod(socket, mode); err != nil {
-		_ = listener.Close()
 		return err
 	}
 	wrapped := &peerListener{Listener: listener}

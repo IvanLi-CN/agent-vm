@@ -4,12 +4,12 @@ Requires=agent-vm-rqlite.service
 After=agent-vm-rqlite.service incus.service
 Wants=incus.service
 ConditionPathExists=/opt/agent-vm-native/slots/%i/bin/agent-vm-control
+ConditionPathExists=/opt/agent-vm-native/slots/%i/release-manifest.json
 ConditionPathExists=/etc/agent-vm-native/slots/%i/config.json
 
 [Service]
 Type=simple
-ExecStart=/opt/agent-vm-native/slots/%i/bin/agent-vm-control serve --config /etc/agent-vm-native/slots/%i/config.json --manifest /opt/agent-vm-native/release-manifest.json
-BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json
+ExecStart=/opt/agent-vm-native/slots/%i/bin/agent-vm-control serve --config /etc/agent-vm-native/slots/%i/config.json --slot %i --socket /run/agent-vm-native/%i/app.sock --manifest /opt/agent-vm-native/slots/%i/release-manifest.json
 Restart=on-failure
 RestartSec=2s
 TimeoutStartSec=60s

@@ -217,6 +217,17 @@ func (r *remoteBackend) endpoint(path string, values url.Values) string {
 	return copyURL.String()
 }
 
+func (r *remoteBackend) diagnosticBaseURL() string {
+	if r == nil || r.base == nil {
+		return ""
+	}
+	copyURL := *r.base
+	copyURL.User = nil
+	copyURL.RawQuery = ""
+	copyURL.Fragment = ""
+	return copyURL.String()
+}
+
 func (r *remoteBackend) open(ctx context.Context, allowCreate bool) error {
 	objects, err := r.remoteSchema(ctx)
 	if err != nil {
@@ -246,7 +257,7 @@ func (r *remoteBackend) open(ctx context.Context, allowCreate bool) error {
 	}
 	if err := requireSupportedSchema(ctx, objects); err != nil {
 		if !allowCreate && len(objects) == 0 {
-			return fmt.Errorf("%s: %s", missingDBCode, r.base.String())
+			return fmt.Errorf("%s: %s", missingDBCode, r.diagnosticBaseURL())
 		}
 		return err
 	}
@@ -897,9 +908,24 @@ func remoteResponseError(result remoteResponse) string {
 }
 
 func (r *remoteBackend) do(ctx context.Context, method, path string, values url.Values, body io.Reader) (io.ReadCloser, error) {
-	request, err := http.NewRequestWithContext(ctx, method, r.endpoint(path, values), body)
+	requestURL, err := url.Parse(r.endpoint(path, values))
+	if err != nil {
+		return nil, fmt.Errorf("parse rqlite request URL: %w", err)
+	}
+	username := ""
+	password := ""
+	withBasicAuth := requestURL.User != nil
+	if withBasicAuth {
+		username = requestURL.User.Username()
+		password, _ = requestURL.User.Password()
+		requestURL.User = nil
+	}
+	request, err := http.NewRequestWithContext(ctx, method, requestURL.String(), body)
 	if err != nil {
 		return nil, err
+	}
+	if withBasicAuth {
+		request.SetBasicAuth(username, password)
 	}
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")

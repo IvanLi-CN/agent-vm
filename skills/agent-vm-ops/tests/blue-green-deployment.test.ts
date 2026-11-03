@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -66,17 +66,33 @@ function evidencePayload(source: string, evidenceId: string, overrides: Record<s
   };
 }
 
-test("blue-green deployment metadata and static validator stay pinned", () => {
+test("blue-green deployment metadata and static validator enforce the Caddy v2 DNSPod boundary", () => {
   const metadata = json("skills/agent-vm-ops/assets/blue-green/deployment-components.json");
-  expect(metadata.caddy.version).toBe("2.11.7");
+  expect(metadata.schema_version).toBe(2);
+  expect(metadata.caddy.version_major).toBe(2);
+  expect(metadata.caddy.version_policy).toBe("operator-selected-v2-release");
+  expect(metadata.caddy.builder).toBe("xcaddy");
+  expect(metadata.caddy.provider_module).toBe("github.com/caddy-dns/dnspod");
+  expect(metadata.caddy.provider_module_name).toBe("dns.providers.dnspod");
+  expect(metadata.caddy.provider_ref).toMatch(/^[0-9a-f]{40}$/);
+  expect(metadata.caddy.version).toBeUndefined();
+  expect(read("skills/agent-vm-ops/scripts/build_caddy.ts")).toContain('caddy?.provider_module !== "github.com/caddy-dns/dnspod"');
   expect(metadata.rqlite.version).toBe("10.5.2");
   expect(metadata.rqlite.supported_architectures).toEqual(["amd64", "arm64"]);
   expect(metadata.policy.automatic_install).toBe(false);
-  expect(metadata.caddy.artifacts[0].sha512).toHaveLength(128);
+  expect(metadata.caddy.artifacts).toBeUndefined();
   expect(metadata.rqlite.artifacts).toHaveLength(2);
   expect(metadata.rqlite.artifacts[1].arch).toBe("arm64");
   expect(metadata.rqlite.artifacts[1].sha256).toHaveLength(64);
-  expect(json(".github/release-contract.json").deployment_artifacts.components).toHaveLength(2);
+  const releaseComponents = json(".github/release-contract.json").deployment_artifacts.components;
+  expect(releaseComponents).toHaveLength(2);
+  expect(releaseComponents.find((component: any) => component.name === "caddy")).toMatchObject({
+    version_major: 2,
+    version_policy: "operator-selected-v2-release",
+    builder: "xcaddy",
+    provider_module: "github.com/caddy-dns/dnspod",
+    provider_module_name: "dns.providers.dnspod",
+  });
 
   const result = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/validate_blue_green_deployment.ts")]);
   expect(result.exitCode).toBe(0);
@@ -88,32 +104,341 @@ test("blue-green deployment metadata and static validator stay pinned", () => {
 test("deployment examples keep the edge and state boundaries fail-closed", () => {
   const caddy = read("skills/agent-vm-ops/assets/blue-green/Caddyfile.example");
   expect(caddy).toContain("admin off");
+  expect(caddy).toContain("auto_https off");
+  expect(caddy).toContain("storage file_system /var/lib/agent-vm-native/caddy");
+  expect(caddy).toContain("dns dnspod {env.DNSPOD_TOKEN}");
+  expect(caddy).toContain("force_automate");
   expect(caddy).toContain("\tlog default");
   expect(caddy).toContain("reverse_proxy unix//var/lib/agent-vm-native/active/app.sock");
+  expect(caddy).toContain("header_up -X-Forwarded-User");
+  expect(caddy).not.toContain("header_up X-Forwarded-User");
   expect(caddy).toContain("request>uri regexp");
+  expect(caddy).toContain("request>headers>X-Csrf-Token delete");
   expect(caddy).not.toContain("tls_insecure_skip_verify");
   expect(caddy).toContain("@internal path /internal/v1/*");
+  expect(caddy).toContain("@public path / /index.html /assets/* /api/v1 /api/v1/* /agent/v1/control");
+  expect(caddy).toContain("handle @public");
   expect(caddy).toContain("respond 404");
+  expect(caddy).not.toContain("auto_https disable_redirects");
+  expect(caddy).not.toContain("/etc/agent-vm-native/tls/caddy");
+  expect(caddy).not.toContain("forward_auth");
+  expect(caddy).not.toContain("edgeone");
+  expect(read("docs/deployment/blue-green.md")).toContain("install -o root -g root -m 0600");
+  expect(read("docs/deployment/blue-green.md")).toContain("install -o agent-vm-rqlite -g agent-vm-rqlite -m 0600");
 
   const rqlite = read("skills/agent-vm-ops/assets/systemd/agent-vm-rqlite.service");
   expect(rqlite).toContain("User=agent-vm-rqlite");
   expect(rqlite).toContain("SupplementaryGroups=agent-vm-web");
   expect(rqlite).toContain("-http-addr 127.0.0.1:4001");
   expect(rqlite).toContain("-auth /etc/agent-vm-native/rqlite/auth.json");
+  expect(rqlite).toContain("ExecStartPre=/usr/bin/test -f /etc/agent-vm-native/rqlite/auth.json");
+  expect(rqlite).toContain("ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/rqlite/auth.json");
+  expect(rqlite).toContain("ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/tls/rqlite/server.crt");
+  expect(rqlite).toContain("ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/tls/rqlite/server.key");
+  expect(rqlite).toContain("/usr/bin/readlink -f");
+  expect(rqlite).toContain("agent-vm-rqlite:600");
+  expect(rqlite).toContain("/usr/bin/stat");
   expect(rqlite).not.toContain("0.0.0.0");
 
   const slot = read("skills/agent-vm-ops/assets/systemd/agent-vm-native@.service");
-  expect(slot).toContain("BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json");
-  expect(slot).toContain("--manifest /opt/agent-vm-native/release-manifest.json");
+  expect(slot).toContain("ConditionPathExists=/opt/agent-vm-native/slots/%i/release-manifest.json");
+  expect(slot).toContain("--slot %i");
+  expect(slot).toContain("--socket /run/agent-vm-native/%i/app.sock");
+  expect(slot).toContain("--manifest /opt/agent-vm-native/slots/%i/release-manifest.json");
+  expect(slot).not.toContain("BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json");
+  expect(read("skills/agent-vm-ops/control/internal/httpserver/server.go")).toContain("legacySocketMode = os.FileMode(0o600)");
+  expect(read("skills/agent-vm-ops/control/internal/httpserver/server.go")).toContain("appSocketMode    = os.FileMode(0o660)");
   const caddyUnit = read("skills/agent-vm-ops/assets/systemd/agent-vm-caddy.service");
   expect(caddyUnit).toContain("User=caddy");
-  expect(caddyUnit).toContain("ConditionPathExists=/var/lib/agent-vm-native/active/app.sock");
+  expect(caddyUnit).toContain("After=network-online.target");
+  expect(caddyUnit).toContain("ConditionPathExists=/etc/agent-vm-native/caddy.env");
+  expect(caddyUnit).toContain("EnvironmentFile=/etc/agent-vm-native/caddy.env");
+  expect(caddyUnit).toContain("ConditionPathIsSymbolicLink=!/etc");
+  expect(caddyUnit).toContain("ConditionPathIsSymbolicLink=!/etc/agent-vm-native");
+  expect(caddyUnit).toContain("ConditionPathIsSymbolicLink=!/etc/agent-vm-native/Caddyfile");
+  expect(caddyUnit).toContain("ConditionPathIsSymbolicLink=!/etc/agent-vm-native/caddy.env");
+  expect(caddyUnit).toContain("ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/Caddyfile");
+  expect(caddyUnit).toContain("ExecStartPre=/usr/bin/test ! -L /etc/agent-vm-native/caddy.env");
+  expect(caddyUnit).toContain("/usr/bin/readlink -f");
   expect(caddyUnit).toContain("ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock");
+  expect(caddyUnit).toContain("ExecStartPre=+/bin/sh -c");
+  expect(caddyUnit).toContain('while [ "$$attempt" -lt 30 ]');
+  expect(caddyUnit).toContain("attempt=$$(($$attempt + 1))");
+  expect(caddyUnit).toContain("--unix-socket /var/lib/agent-vm-native/active/app.sock http://localhost/internal/v1/health");
+  expect(caddyUnit).toContain("/usr/bin/stat -c");
+  expect(caddyUnit).toContain("0:0:600");
+  expect(caddyUnit).not.toContain("--environ");
+  expect(caddyUnit).toContain("ReadWritePaths=/var/lib/agent-vm-native/caddy");
+  expect(caddyUnit).not.toContain("ExecReload=");
+  expect(caddyUnit).not.toContain("/etc/agent-vm-native/tls/caddy");
   const sysusers = read("skills/agent-vm-ops/assets/sysusers.d/agent-vm-native.conf");
   expect(sysusers).toContain("u caddy");
+  expect(read("skills/agent-vm-ops/assets/tmpfiles.d/agent-vm-native.conf")).toContain("z /etc/agent-vm-native/caddy.env 0600 root root");
 });
 
-test("CA generation and state preflight require operator evidence", () => {
+test("Caddy build integration requires an explicit v2 release and embeds DNSPod", { timeout: 30_000 }, () => {
+  const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-caddy-build-test-"));
+  try {
+    const binDir = join(temporaryRoot, "bin");
+    mkdirSync(binDir, { recursive: true });
+    const xcaddy = join(binDir, "xcaddy");
+    writeFileSync(xcaddy, `#!/bin/sh
+set -eu
+output=""
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "--output" ]; then
+    output="$argument"
+  fi
+  previous="$argument"
+done
+build_root="$(dirname "$(dirname "$output")")"
+printf '%s\\n' "$@" > "$build_root/xcaddy.args"
+if env | grep -qE '^(DNSPOD_TOKEN|AGENT_VM_DOMAIN)='; then
+  printf '%s\\n' 'deployment environment leaked to xcaddy' >&2
+  exit 23
+fi
+if env | grep -qE '^GOPROXY='; then
+  printf '%s\\n' 'credential-bearing Go proxy environment leaked to xcaddy' >&2
+  exit 24
+fi
+if [ -f "$build_root/fake-xcaddy-mode" ] && [ "$(cat "$build_root/fake-xcaddy-mode")" = symlink ]; then
+  printf '%s\\n' '#!/bin/sh' > "$output.target"
+  ln -s "$output.target" "$output"
+  exit 0
+fi
+fake_arch="\${GOARCH:-amd64}"
+if [ -f "$build_root/fake-xcaddy-mode" ] && [ "$(cat "$build_root/fake-xcaddy-mode")" = wrong-arch ]; then
+  if [ "$fake_arch" = arm64 ]; then fake_arch=amd64; else fake_arch=arm64; fi
+fi
+printf '\\177ELF\\002\\001\\001' > "$output"
+dd if=/dev/zero bs=1 count=11 2>/dev/null >> "$output"
+if [ "$fake_arch" = arm64 ]; then printf '\\267\\000' >> "$output"; else printf '\\076\\000' >> "$output"; fi
+chmod 0755 "$output"
+`, { mode: 0o755 });
+    const go = join(binDir, "go");
+    writeFileSync(go, `#!/bin/sh
+set -eu
+if [ "\$1" = "version" ] && [ "\$2" = "-m" ]; then
+  mode=normal
+  if [ -f "${join(temporaryRoot, "fake-go-mode")}" ]; then
+    mode="\$(cat "${join(temporaryRoot, "fake-go-mode")}")"
+  fi
+  case "\$mode" in
+    version) caddy_version=v2.10.1; provider_version=v0.0.5-0.20260325061251-fb7cc31cc04c ;;
+    provider) caddy_version=v2.10.0; provider_version=v0.0.5-0.20260325061251-000000000000 ;;
+    *) caddy_version=v2.10.0; provider_version=v0.0.5-0.20260325061251-fb7cc31cc04c ;;
+  esac
+  printf '%s\\n' 'path caddy' "mod github.com/caddyserver/caddy/v2 \$caddy_version" "dep github.com/caddy-dns/dnspod \$provider_version"
+  exit 0
+fi
+exit 1
+`, { mode: 0o755 });
+    const output = join(temporaryRoot, "caddy");
+    const built = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      output,
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+        DNSPOD_TOKEN: "test-secret",
+        AGENT_VM_DOMAIN: "test.example",
+        GOPROXY: "https://user:pass@proxy.example.invalid",
+      },
+    });
+    expect(built.exitCode).toBe(0);
+    expect(statSync(output).mode & 0o111).not.toBe(0);
+    const args = readFileSync(join(temporaryRoot, "xcaddy.args"), "utf8").trim().split("\n");
+    expect(args.slice(0, 3)).toEqual(["build", "v2.10.0", "--output"]);
+    expect(args[3]).toMatch(/\/\.caddy-build-[^/]+\/caddy$/);
+    expect(args.slice(4)).toEqual([
+      "--with",
+      "github.com/caddy-dns/dnspod@fb7cc31cc04c68a304b8d2672c3e5d9f2ad3d7ba",
+    ]);
+    const buildReceipt = JSON.parse(new TextDecoder().decode(built.stdout));
+    expect(buildReceipt.observed_caddy_version).toBe("v2.10.0");
+    expect(buildReceipt.observed_provider_version).toContain("-fb7cc31cc04c");
+    expect(buildReceipt.binary_format).toBe("ELF64-little-endian");
+    expect(buildReceipt.binary_architecture).toBe("amd64");
+    expect(buildReceipt.binary_elf_machine).toBe("EM_X86_64");
+    expect(buildReceipt.sha512).toMatch(/^[0-9a-f]{128}$/);
+
+    const arm64Output = join(temporaryRoot, "caddy-arm64");
+    const arm64Built = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/arm64",
+      "--output",
+      arm64Output,
+    ], { env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` } });
+    expect(arm64Built.exitCode).toBe(0);
+    const arm64Receipt = JSON.parse(new TextDecoder().decode(arm64Built.stdout));
+    expect(arm64Receipt.binary_architecture).toBe("arm64");
+    expect(arm64Receipt.binary_elf_machine).toBe("EM_AARCH64");
+
+    writeFileSync(join(temporaryRoot, "fake-xcaddy-mode"), "wrong-arch\n");
+    const wrongArchitecture = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      join(temporaryRoot, "wrong-architecture-caddy"),
+    ], { env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` } });
+    expect(wrongArchitecture.exitCode).not.toBe(0);
+    expect(existsSync(join(temporaryRoot, "wrong-architecture-caddy"))).toBe(false);
+    rmSync(join(temporaryRoot, "fake-xcaddy-mode"));
+
+    const existingOutput = join(temporaryRoot, "existing-caddy");
+    writeFileSync(existingOutput, "previous-caddy\n");
+    const failedReplacement = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      existingOutput,
+      "--expected-sha512",
+      "0".repeat(128),
+    ], { env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` } });
+    expect(failedReplacement.exitCode).not.toBe(0);
+    expect(readFileSync(existingOutput, "utf8")).toBe("previous-caddy\n");
+
+    const symlinkTarget = join(temporaryRoot, "caddy-target");
+    const symlinkOutput = join(temporaryRoot, "symlink-caddy");
+    writeFileSync(symlinkTarget, "protected-caddy\n");
+    symlinkSync(symlinkTarget, symlinkOutput);
+    const rejectedSymlink = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      symlinkOutput,
+    ], { env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` } });
+    expect(rejectedSymlink.exitCode).not.toBe(0);
+    expect(lstatSync(symlinkOutput).isSymbolicLink()).toBe(true);
+    expect(readFileSync(symlinkTarget, "utf8")).toBe("protected-caddy\n");
+
+    const stagingSymlinkOutput = join(temporaryRoot, "staging-symlink-caddy");
+    writeFileSync(join(temporaryRoot, "fake-xcaddy-mode"), "symlink\n");
+    const rejectedStagingSymlink = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      stagingSymlinkOutput,
+    ], { env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` } });
+    expect(rejectedStagingSymlink.exitCode).not.toBe(0);
+    expect(existsSync(stagingSymlinkOutput)).toBe(false);
+    rmSync(join(temporaryRoot, "fake-xcaddy-mode"));
+
+    const linkedOutputTarget = join(temporaryRoot, "linked-output-target");
+    const linkedOutputParent = join(temporaryRoot, "linked-output-parent");
+    mkdirSync(linkedOutputTarget);
+    symlinkSync(linkedOutputTarget, linkedOutputParent);
+    const rejectedLinkedParent = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      join(linkedOutputParent, "caddy"),
+    ], { env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` } });
+    expect(rejectedLinkedParent.exitCode).not.toBe(0);
+    expect(existsSync(join(linkedOutputTarget, "caddy"))).toBe(false);
+
+    writeFileSync(join(temporaryRoot, "fake-go-mode"), "version\n");
+    const mismatchedVersion = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      join(temporaryRoot, "mismatched-version-caddy"),
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      },
+    });
+    expect(mismatchedVersion.exitCode).not.toBe(0);
+
+    writeFileSync(join(temporaryRoot, "fake-go-mode"), "provider\n");
+    const mismatchedProvider = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "v2.10.0",
+      "--target",
+      "linux/amd64",
+      "--output",
+      join(temporaryRoot, "mismatched-provider-caddy"),
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      },
+    });
+    expect(mismatchedProvider.exitCode).not.toBe(0);
+
+    const rejected = run([
+      process.execPath,
+      resolve(root, "skills/agent-vm-ops/scripts/build_caddy.ts"),
+      "--caddy-version",
+      "latest",
+      "--target",
+      "linux/amd64",
+      "--output",
+      join(temporaryRoot, "rejected-caddy"),
+    ], {
+      env: {
+        ...process.env,
+        PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      },
+    });
+    expect(rejected.exitCode).not.toBe(0);
+
+    const acceptance = read("skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh");
+    expect(acceptance).toContain('rqlite_auth_file="$proof_dir/auth.json"');
+    expect(acceptance).toContain('chmod 0600 "$rqlite_auth_file"');
+    expect(acceptance).toContain('rm -f -- "$rqlite_auth_file"');
+    expect(acceptance).toContain('"$proof_dir/ca/ca.key"');
+    expect(acceptance).toContain("Caddy build receipt SHA-512 does not match the installed binary");
+    expect(acceptance).toContain("--target linux/arm64");
+    expect(acceptance).toContain("not-allowed");
+  const caGenerator = read("skills/agent-vm-ops/scripts/generate_deployment_ca.sh");
+  expect(caGenerator).toContain('[[ -L "$output_dir" ]]');
+  expect(caGenerator).toContain('"$output_dir/ca.key"');
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("CA generation and state preflight require operator evidence", { timeout: 30_000 }, () => {
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-blue-green-test-"));
   try {
     const caDir = join(temporaryRoot, "ca");
@@ -121,7 +446,49 @@ test("CA generation and state preflight require operator evidence", () => {
     expect(ca.exitCode).toBe(0);
     expect(existsSync(join(caDir, "ca.crt"))).toBe(true);
     expect(statSync(join(caDir, "ca.key")).mode & 0o777).toBe(0o600);
-    expect(statSync(join(caDir, "caddy/server.key")).mode & 0o777).toBe(0o600);
+    expect(existsSync(join(caDir, "caddy/server.key"))).toBe(false);
+
+    const symlinkTarget = join(temporaryRoot, "ca-target");
+    const symlinkDir = join(temporaryRoot, "ca-link");
+    mkdirSync(symlinkTarget);
+    symlinkSync(symlinkTarget, symlinkDir);
+    const rejectedSymlinkDir = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/generate_deployment_ca.sh"), "--output-dir", symlinkDir, "--hostname", "localhost"]);
+    expect(rejectedSymlinkDir.exitCode).not.toBe(0);
+    expect(existsSync(join(symlinkTarget, "ca.key"))).toBe(false);
+
+    const linkedParentTarget = join(temporaryRoot, "ca-parent-target");
+    const linkedParent = join(temporaryRoot, "ca-parent-link");
+    mkdirSync(linkedParentTarget);
+    symlinkSync(linkedParentTarget, linkedParent);
+    const rejectedLinkedParent = run([
+      "bash",
+      resolve(root, "skills/agent-vm-ops/scripts/generate_deployment_ca.sh"),
+      "--output-dir",
+      join(linkedParent, "ca"),
+      "--hostname",
+      "localhost",
+    ]);
+    expect(rejectedLinkedParent.exitCode).not.toBe(0);
+    expect(existsSync(join(linkedParentTarget, "ca", "ca.key"))).toBe(false);
+
+    const opensslPath = new TextDecoder().decode(run(["sh", "-c", "command -v openssl"]).stdout).trim();
+    const fakeBin = join(temporaryRoot, "fake-bin");
+    mkdirSync(fakeBin);
+    writeFileSync(join(fakeBin, "openssl"), `#!/bin/sh
+set -eu
+if [ "\$1" = req ] && [ "\$2" = -new ]; then
+  exit 42
+fi
+exec "${opensslPath}" "\$@"
+`, { mode: 0o755 });
+    const failedCaDir = join(temporaryRoot, "failed-ca");
+    const failedCa = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/generate_deployment_ca.sh"), "--output-dir", failedCaDir, "--hostname", "localhost"], {
+      env: { ...process.env, PATH: `${fakeBin}:${process.env.PATH ?? ""}` },
+    });
+    expect(failedCa.exitCode).not.toBe(0);
+    expect(existsSync(join(failedCaDir, "ca.key"))).toBe(false);
+    expect(existsSync(join(failedCaDir, "ca.crt"))).toBe(false);
+    expect(existsSync(join(failedCaDir, "rqlite/server.key"))).toBe(false);
 
     const source = join(temporaryRoot, "state.sqlite3");
     const database = run(["python3", "-c", "import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute(\"CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)\"); c.execute(\"CREATE TABLE tasks (session_id TEXT NOT NULL, generation INTEGER NOT NULL)\"); c.execute(\"INSERT INTO meta VALUES ('state_epoch','epoch-1')\"); c.execute(\"INSERT INTO tasks VALUES ('session-1',7)\"); c.commit(); c.close()", source]);
@@ -161,7 +528,88 @@ test("CA generation and state preflight require operator evidence", () => {
 });
 
 test("cutover dry-run accepts only a verified blue or green layout", () => {
-  expect(read("skills/agent-vm-ops/scripts/agent_vm_cutover.sh")).toContain("mv -Tf --");
+  const cutover = read("skills/agent-vm-ops/scripts/agent_vm_cutover.sh");
+  expect(cutover).toContain("mv -Tf --");
+  expect(cutover).toContain('health_check "$active/app.sock"');
+  expect(cutover).toContain("active_candidate_layout_matches");
+  expect(cutover).toContain("post_cutover_check");
+  expect(cutover).toContain("candidate failed post-cutover health");
+  expect(cutover).toContain("rollback_link");
+  expect(cutover).toContain("pending_file");
+  expect(cutover).toContain("recover_pending_cutover");
+  expect(cutover).toContain("validate_candidate_layout");
+  expect(cutover).toContain("validate_runtime_root");
+  expect(cutover).toContain('! -L "$runtime_root"');
+  expect(cutover).toContain("validate_directory_ancestors");
+  expect(cutover).toContain("runtime slot directory is missing or symlinked");
+  expect(cutover).toContain('! -L "$slot_dir"');
+  expect(cutover).toContain('! -L "$slot_dir/release-manifest.json"');
+  expect(cutover).toContain('! -L "$root_dir/slots"');
+  expect(cutover).toContain('[[ -e "$pending_file" || -L "$pending_file" ]]');
+  expect(cutover).toContain('validate_slot_layout "$current_slot"');
+  expect(cutover).toContain('validate_slot_layout "$candidate_record"');
+  expect(cutover).toContain("sync -f");
+  expect(cutover).toContain("candidate_record/app.sock");
+  expect(cutover).toContain("read_current_slot");
+  expect(cutover).toContain("active_matches_current || die");
+  expect(cutover).toContain("active target slot is missing");
+  expect(cutover).toContain("slot_manifest_digest");
+  expect(cutover).toContain("previous_manifest=");
+  const linuxSocketListener = read("skills/agent-vm-ops/control/internal/httpserver/socket_listener_linux.go");
+  expect(linuxSocketListener).toContain("bindTemporaryUnixSocket");
+  expect(linuxSocketListener).toContain("unix.Renameat2");
+  expect(linuxSocketListener).toContain("unix.RENAME_EXCHANGE");
+  expect(linuxSocketListener).toContain("unix.RENAME_NOREPLACE");
+  expect(cutover).toContain("candidate_manifest=");
+  expect(cutover).toContain('assert_manifest_digest "$previous_record" "$previous_manifest_record"');
+  expect(cutover).toContain('assert_manifest_digest "$current_slot" "$pending_previous_manifest"');
+  expect(cutover).toContain('assert_manifest_digest "$slot" "$pending_candidate_manifest"');
+  expect(cutover).toContain('health_check "$root_dir/slots/$previous_record/app.sock"');
+  expect(cutover).toContain("flock --wait 30 9");
+  expect(cutover).toContain('exec 8<"$root_dir"');
+  expect(cutover).toContain("flock --wait 30 8");
+  expect(cutover).toContain("mktemp -d -- \"$root_dir/.active-stage.XXXXXX\"");
+  expect(cutover).toContain('[[ -L "$lock_path" ]]');
+  expect(cutover).toContain('ln -- "$lock_seed" "$lock_path"');
+  expect(cutover).toContain("if ! ln --");
+  expect(cutover).toContain('mktemp "$stage_dir/pending.XXXXXX"');
+  expect(cutover).not.toContain(".active.cutover.pending.$$.tmp");
+  expect(cutover).not.toContain(".active.$$.tmp");
+  expect(cutover).not.toContain('mkdir -- "$lock_dir"');
+  expect(cutover).toContain("Every writer of the protected active link must hold this kernel lock");
+  const acceptance = read("skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh");
+  expect(acceptance).toContain('"$systemd_root/bin/sh"');
+  expect(acceptance).toContain('"$systemd_root/usr/bin/curl"');
+  expect(acceptance).toContain('"$systemd_root/usr/bin/sleep"');
+  expect(acceptance).toContain('"$systemd_root/usr/bin/stat"');
+  expect(acceptance).toContain("env -i");
+  expect(acceptance).toContain("stop_process");
+  expect(acceptance).toContain("process_alive");
+  expect(acceptance).toContain("capture_process_group");
+  expect(acceptance).toContain("kill -KILL");
+  expect(acceptance).toContain("setsid --wait");
+  expect(acceptance).toContain('kill -TERM -- "-$group_id"');
+  expect(acceptance).toContain("process_group_for");
+  expect(acceptance).toContain('wait "$pid"');
+  expect(acceptance).toContain('rm -f -- "$rqlite_auth_file" || cleanup_failed=1');
+  expect(acceptance).toContain('rm -f -- "$rqlite_auth_config" || cleanup_failed=1');
+  expect(acceptance).toContain("exit 1");
+  expect(acceptance).toContain("chown 994:994");
+  expect(acceptance).toContain("staged rqlite auth metadata does not satisfy ExecStartPre");
+  expect(acceptance).toContain("staged Caddy environment metadata does not satisfy ExecStartPre");
+  expect(acceptance).toContain('"$systemd_root/bin/sh" -c');
+  expect(acceptance).toContain('"$2" -c "%U:%a"');
+  expect(acceptance).toContain('failed post-swap health');
+  expect(acceptance).toContain('previous=blue\\ncandidate=green\\nprevious_manifest=%s\\ncandidate_manifest=%s');
+  expect(acceptance).toContain('pending recovery did not restore blue');
+  expect(acceptance).toContain('pending recovery accepted a changed previous manifest');
+  expect(acceptance).toContain('candidate whose manifest changed after swap');
+  const ci = read(".github/workflows/ci.yml");
+  expect(ci).toContain("github.com/caddyserver/xcaddy/cmd/xcaddy@v0.4.4");
+  expect(ci).toContain("skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh");
+  expect(ci).toContain("repos/caddyserver/caddy/releases");
+  expect(ci).toContain("CADDY_VERSION=$caddy_version");
+  expect(ci).not.toContain("CADDY_VERSION: v2.");
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-cutover-test-"));
   try {
     const layout = join(temporaryRoot, "layout");
@@ -173,8 +621,53 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
     const accepted = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", runtime, "--slot", "blue", "--dry-run"]);
     expect(accepted.exitCode).toBe(0);
     expect(JSON.parse(new TextDecoder().decode(accepted.stdout)).candidate).toBe("blue");
+
+    const symlinkedRuntimeRoot = join(temporaryRoot, "symlinked-runtime");
+    symlinkSync(runtime, symlinkedRuntimeRoot);
+    const symlinkedRuntimeResult = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", symlinkedRuntimeRoot, "--slot", "blue", "--dry-run"]);
+    expect(symlinkedRuntimeResult.exitCode).not.toBe(0);
+
+    const symlinkedRuntimeSlotRoot = join(temporaryRoot, "runtime-slot-target");
+    const symlinkedRuntimeSlot = join(temporaryRoot, "runtime-slot-link");
+    mkdirSync(join(symlinkedRuntimeSlotRoot, "blue"), { recursive: true });
+    mkdirSync(symlinkedRuntimeSlot);
+    symlinkSync(join(symlinkedRuntimeSlotRoot, "blue"), join(symlinkedRuntimeSlot, "blue"));
+    const symlinkedRuntimeSlotResult = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", symlinkedRuntimeSlot, "--slot", "blue", "--dry-run"]);
+    expect(symlinkedRuntimeSlotResult.exitCode).not.toBe(0);
+
     const rejected = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", runtime, "--slot", "red", "--dry-run"]);
     expect(rejected.exitCode).not.toBe(0);
+
+    const symlinkedSlotsLayout = join(temporaryRoot, "symlinked-slots-layout");
+    const symlinkedSlots = join(temporaryRoot, "outside-slots");
+    mkdirSync(join(symlinkedSlots, "blue"), { recursive: true });
+    mkdirSync(symlinkedSlotsLayout, { recursive: true });
+    writeFileSync(join(symlinkedSlots, "blue/release-manifest.json"), "{}\n");
+    symlinkSync(join(runtime, "blue/app.sock"), join(symlinkedSlots, "blue/app.sock"));
+    symlinkSync(symlinkedSlots, join(symlinkedSlotsLayout, "slots"));
+    const symlinkedSlotsResult = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", symlinkedSlotsLayout, "--runtime-root", runtime, "--slot", "blue", "--dry-run"]);
+    expect(symlinkedSlotsResult.exitCode).not.toBe(0);
+
+    const symlinkedManifestLayout = join(temporaryRoot, "symlinked-manifest-layout");
+    mkdirSync(join(symlinkedManifestLayout, "slots/blue"), { recursive: true });
+    writeFileSync(join(symlinkedManifestLayout, "slots/blue/manifest-target.json"), "{}\n");
+    symlinkSync(join(symlinkedManifestLayout, "slots/blue/manifest-target.json"), join(symlinkedManifestLayout, "slots/blue/release-manifest.json"));
+    symlinkSync(join(runtime, "blue/app.sock"), join(symlinkedManifestLayout, "slots/blue/app.sock"));
+    const symlinkedManifestResult = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", symlinkedManifestLayout, "--runtime-root", runtime, "--slot", "blue", "--dry-run"]);
+    expect(symlinkedManifestResult.exitCode).not.toBe(0);
+
+    const malformedActiveLayout = join(temporaryRoot, "malformed-active-layout");
+    const malformedActiveRuntime = join(temporaryRoot, "malformed-active-runtime");
+    mkdirSync(join(malformedActiveLayout, "slots/blue"), { recursive: true });
+    mkdirSync(join(malformedActiveLayout, "slots/green"), { recursive: true });
+    mkdirSync(join(malformedActiveRuntime, "blue"), { recursive: true });
+    mkdirSync(join(malformedActiveRuntime, "green"), { recursive: true });
+    writeFileSync(join(malformedActiveLayout, "slots/green/release-manifest.json"), "{}\n");
+    symlinkSync(join(malformedActiveRuntime, "green/app.sock"), join(malformedActiveLayout, "slots/green/app.sock"));
+    symlinkSync(join(malformedActiveRuntime, "blue/app.sock"), join(malformedActiveLayout, "slots/blue/app.sock"));
+    symlinkSync(join(malformedActiveLayout, "slots/blue"), join(malformedActiveLayout, "active"));
+    const malformedActiveResult = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", malformedActiveLayout, "--runtime-root", malformedActiveRuntime, "--slot", "green", "--dry-run"]);
+    expect(malformedActiveResult.exitCode).not.toBe(0);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
