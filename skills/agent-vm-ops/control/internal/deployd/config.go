@@ -169,8 +169,8 @@ func (config MigrationConfig) Validate() error {
 	}
 	if config.RQLiteURL != "" {
 		parsed, err := neturl.Parse(config.RQLiteURL)
-		if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
-			return errors.New("deployd config invalid: migration.rqlite_url must be an HTTP(S) URL")
+		if err != nil || parsed.Host == "" || parsed.Scheme != "https" {
+			return errors.New("deployd config invalid: migration.rqlite_url must be an HTTPS URL")
 		}
 	}
 	if config.DrainTimeoutSeconds <= 0 || config.WriterCheckSeconds <= 0 {

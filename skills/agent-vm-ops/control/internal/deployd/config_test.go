@@ -40,6 +40,18 @@ func TestConfigRejectsNonSingletonLockPath(t *testing.T) {
 	}
 }
 
+func TestConfigRejectsPlaintextMigrationEndpoint(t *testing.T) {
+	config := Defaults()
+	config.Migration.RQLiteURL = "http://127.0.0.1:4001"
+	if err := config.Validate(); err == nil {
+		t.Fatal("plaintext rqlite migration endpoint was accepted")
+	}
+	config.Migration.RQLiteURL = "https://127.0.0.1:4001"
+	if err := config.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestMetricsAddressRequiresTLSTreatsWildcardAsNonLoopback(t *testing.T) {
 	for _, address := range []string{":9911", "0.0.0.0:9911", "[::]:9911", "192.0.2.10:9911"} {
 		if !MetricsAddressRequiresTLS(address) {

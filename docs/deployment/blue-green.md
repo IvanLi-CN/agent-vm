@@ -97,7 +97,7 @@ sudo agent-vm-deploy migrate --timeout 9000 --json
 
 如果 Deployd 返回带事务 ID 的 `state_unverified`，发布器会查询该事务；只有状态为 `needs_recovery` 时，才自动提交一次 `recover --action retry-migration`。重试会复用已验证的迁移 snapshot，并且在 rqlite 已经精确等于源 snapshot 时把丢失响应视为幂等成功；目标不一致时继续围栏，不猜测导入结果。
 
-迁移完成标记经过原子写入、文件同步和目录同步。重复执行 `migrate` 会返回已经完成的最终事务，不会再次替换业务数据库。标记缺失或损坏时，Deployd 拒绝跳过迁移。
+迁移完成标记使用格式 2，经过原子写入、文件同步和目录同步，并携带迁移事务 ID、源摘要、目标 rqlite 摘要、状态纪元和 snapshot 保留截止时间。Deployd 只有在标记、当前 rqlite 目标摘要和仍然保留的唯一 finalized 迁移事务三者一致时，才允许重复执行 `migrate` 返回已完成事务；任何一项缺失、不一致或目标已被重置，都保持围栏，不会再次猜测或替换业务数据库。
 
 ## 一次性状态迁移
 
@@ -105,11 +105,11 @@ sudo agent-vm-deploy migrate --timeout 9000 --json
 
 迁移由一个 Deployd durable transaction 串行记录，阶段为 `migration_prepare`、`migration_drain`、`migration_quiescence`、`migration_stop`、`migration_source_check`、`migration_import` 和 `migration_finalize`。每个阶段转换都写入阶段事件和有限证据，事务 ID 会在失败响应中返回。
 
-迁移的实际顺序固定为：先启动并确认 rqlite，再让旧服务进入 state-write fence；随后轮询 `drain-status` 和 `admin-metrics`，确认没有 pending、unknown、in-flight 或未收敛的 transition task；然后停止旧服务，检查 systemd 状态和 `/proc` 文件描述符，确认没有进程打开 SQLite 主文件、WAL 或 SHM 文件。
+迁移的实际顺序固定为：先启动并确认 rqlite，再让旧服务进入 state-write fence；随后轮询 `drain-status` 和 `admin-metrics`，确认没有 pending、unknown、in-flight 或未收敛的 transition task；然后停止旧服务，立即取得旧状态目录的 `authority.lock` 并在整个检查、snapshot 和导入阶段保持持有，检查 systemd 状态和 `/proc` 文件描述符，确认没有进程打开 SQLite 主文件、WAL 或 SHM 文件。旧服务在这把锁释放前重新启动会使迁移失败闭锁，不会继续启动槽位。
 
 只有 writer 检查通过后，Deployd 才使用 SQLite 自己的 `VACUUM INTO` 创建一致 snapshot，并记录 source hash、大小、state epoch、fence ID 和验证时间。单个源文件允许的最大大小是 1 GiB；没有人为设定的体积下限，空的小数据库也必须按实际大小处理。
 
-导入由 Go state adapter 完成。目标 rqlite 必须为空或处于受支持的 pristine schema；导入使用一次 rqlite request-level transaction，完成后重新读取目标并比较完整 snapshot。源 SQLite 在迁移完成前不修改，迁移成功后才删除旧主文件及其 WAL/SHM，snapshot 作为有限期恢复材料保留。
+导入由 Go state adapter 完成。目标 rqlite 必须为空或处于受支持的 pristine schema；导入使用一次 rqlite request-level transaction，完成后重新读取目标并比较完整 snapshot，同时生成目标摘要。源 SQLite 在迁移完成前不修改，迁移成功后才删除旧主文件及其 WAL/SHM，snapshot 按保留截止时间作为有限期恢复材料保留。
 
 任一 fence、排空、停止、writer 检查、snapshot、导入、验证或状态持久化步骤失败，Deployd 都将旧服务保持停止或围栏状态，事务进入 `needs_recovery`，并拒绝启动蓝绿槽位。Deployd 重启时不会根据旧状态重建 controller role；它先重新执行 legacy fence，再等待显式恢复动作或发布器的受限 `retry-migration`。
 
@@ -134,7 +134,7 @@ Deployd 启动候选槽位，验证 manifest、socket、就绪状态、状态能
 
 Deployd SQLite 与业务状态分离。Deployd 的终态事务、阶段事件和失败证据默认保留三十天；活动事务和 `needs_recovery` 事务不会清理。
 
-一次性迁移 snapshot 位于 `/var/lib/agent-vm-native/migration/`，文件名以 `migration-` 开头、以 `.sqlite3` 结尾。迁移正在进行或需要恢复时，Deployd 不删除这些文件；迁移完成后由 Deployd 每小时清理超过七天的迁移 snapshot。
+一次性迁移 snapshot 位于 `/var/lib/agent-vm-native/migration/`，文件名以 `migration-` 开头、以 `.sqlite3` 结尾。迁移正在进行或需要恢复时，Deployd 不删除这些文件；迁移完成后从 finalized 时间开始保留七天，Deployd 每小时按完成标记中的保留截止时间清理过期 snapshot。唯一 finalized 迁移事务和目标摘要永久保留一条，不会随普通三十天历史清理删除，因此清理 snapshot 不会让完成状态失去可验证证据。
 
 清理按实际文件逐个处理，不预分配空间，不设体积下限，也不允许单个迁移源超过 1 GiB。rqlite 的业务 backup/snapshot 不由蓝绿 Deployd 创建或清理，必须由业务状态后端自己的保留策略管理；不能把 rqlite backup 混入蓝绿槽位切换。
 

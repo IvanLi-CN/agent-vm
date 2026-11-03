@@ -159,6 +159,40 @@ func TestStoreKeepsNeedsRecoveryTransaction(t *testing.T) {
 	}
 }
 
+func TestStoreRetainsTheSingleFinalizedStateMigration(t *testing.T) {
+	now := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
+	s, err := Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	transaction := Transaction{ID: "migration-old", TargetSlot: "state", PreviousSlot: "legacy", Bundle: "sqlite-to-rqlite", Phase: "migration_prepare", Generation: 1, CreatedAt: now.Add(-31 * 24 * time.Hour), UpdatedAt: now.Add(-31 * 24 * time.Hour)}
+	if err := s.Create(context.Background(), transaction, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Transition(context.Background(), transaction.ID, "migration_prepare", "migration_finalize", "active", "imported", "test", nil, transaction.UpdatedAt.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Transition(context.Background(), transaction.ID, "migration_finalize", "finalize", "finalized", "completed", "test", nil, transaction.UpdatedAt.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := s.Cleanup(context.Background(), now)
+	if err != nil || removed != 0 {
+		t.Fatalf("cleanup removed=%d err=%v", removed, err)
+	}
+	kept, err := s.Get(context.Background(), transaction.ID)
+	if err != nil || kept == nil || kept.State != "finalized" {
+		t.Fatalf("finalized state migration = %#v err=%v", kept, err)
+	}
+	duplicate := transaction
+	duplicate.ID = "migration-second"
+	duplicate.CreatedAt = now
+	duplicate.UpdatedAt = now
+	if err := s.Create(context.Background(), duplicate, nil); err == nil {
+		t.Fatal("duplicate state migration transaction was accepted")
+	}
+}
+
 func TestStoreCleansDeterministicallyFailedTransaction(t *testing.T) {
 	now := time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC)
 	s, err := Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), time.Hour, func() time.Time { return now })

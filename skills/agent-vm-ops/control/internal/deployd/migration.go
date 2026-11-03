@@ -49,8 +49,12 @@ type MigrationRuntime interface {
 	PrepareMigrationSource(context.Context, string) (MigrationSource, error)
 	ImportMigration(context.Context, MigrationSource) (state.SQLiteMigrationResult, error)
 	RetryMigration(context.Context, string) (state.SQLiteMigrationResult, error)
-	FinalizeMigration(context.Context, string, bool) error
+	FinalizeMigration(context.Context, string, bool, state.SQLiteMigrationResult) error
 	FenceLegacy(context.Context) error
+}
+
+type migrationTargetVerifier interface {
+	VerifyMigrationTarget(context.Context, string) error
 }
 
 type MigrationError struct {
@@ -97,6 +101,11 @@ func (manager *Manager) Migrate(ctx context.Context) (*store.Transaction, error)
 		}
 		if transaction == nil {
 			return nil, errors.New("migration completion marker has no durable transaction")
+		}
+		if verifier, ok := manager.Migration.(migrationTargetVerifier); ok {
+			if err := verifier.VerifyMigrationTarget(ctx, transaction.ID); err != nil {
+				return nil, fmt.Errorf("verify completed rqlite migration: %w", err)
+			}
 		}
 		return transaction, nil
 	}
@@ -180,11 +189,17 @@ func (manager *Manager) Migrate(ctx context.Context) (*store.Transaction, error)
 		"source_sha256": result.SourceSHA256,
 		"source_size":   result.SourceSize,
 		"state_epoch":   result.StateEpoch,
+		"target_sha256": result.TargetSHA256,
 	}); err != nil {
 		return nil, err
 	}
-	if err := manager.Migration.FinalizeMigration(ctx, transaction.ID, true); err != nil {
+	if err := manager.Migration.FinalizeMigration(ctx, transaction.ID, true, result); err != nil {
 		return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationFinalize, err, true)
+	}
+	if verifier, ok := manager.Migration.(migrationTargetVerifier); ok {
+		if err := verifier.VerifyMigrationTarget(ctx, transaction.ID); err != nil {
+			return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationFinalize, err, true)
+		}
 	}
 	if err := manager.transitionMigration(ctx, transaction.ID, PhaseMigrationFinalize, PhaseFinalize, "migration_completed", map[string]any{
 		"business_authority": "rqlite",

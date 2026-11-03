@@ -27,11 +27,11 @@ Deployd 重启后，先验证服务身份、socket 所有权和数据库权限�
 
 迁移源 SQLite snapshot/export、rqlite backup/snapshot、deployd `deployment.sqlite3` recovery copy（如有）、backup tail、manifest、tail-evidence 和 recovery authorization record 都是恢复材料。蓝绿 `stage`、`activate` 和 `rollback` 只处理服务槽位与流量，不创建、替换或删除状态后端备份。
 
-恢复材料的默认上限是三个已验证恢复点、三十天候选年龄和 1 GiB 总硬上限。1 GiB 是实际占用上限，不是预分配空间，也不存在体积下限；小数据库按实际大小保留。最后两个可验证恢复点始终受保护，迁移源 SQLite snapshot 在迁移完成并通过新的 rqlite restore check 后保留七天。
+恢复材料的默认上限是三个已验证恢复点、三十天候选年龄和 1 GiB 总硬上限。1 GiB 是实际占用上限，不是预分配空间，也不存在体积下限；小数据库按实际大小保留。最后两个可验证恢复点始终受保护；迁移源 SQLite snapshot 在迁移 finalized、目标 rqlite 摘要完成校验后保留七天，完成标记中的保留截止时间是清理依据。
 
 迁移或恢复事务未进入 `finalized` 前禁止删除任何恢复材料。进入 `finalized` 后，只有在新的隔离恢复验证完成、没有 pending/unknown operation 或未解决的 `needs_recovery`、迁移源保留期已到期，并且清理后仍保留两个可验证恢复点时，材料才可进入 `purge_eligible`。
 
-Deployd 只读取、创建和清理自己负责的迁移源 SQLite snapshot；它不读取、创建或删除 rqlite 的业务 backup/snapshot。迁移 snapshot 在迁移完成并通过验证后保留七天，由 Deployd 每小时按文件逐个清理；活动迁移和 `needs_recovery` 事务引用的 snapshot 不得删除。它按数量、年龄或总字节预算任一超限清理最旧的可删除材料。清理后仍无空间时，报告 `backup_storage_exhausted` 并拒绝新的备份或状态迁移，不删除受保护恢复点，也不影响正常蓝绿切换。
+Deployd 只读取、创建和清理自己负责的迁移源 SQLite snapshot；它不读取、创建或删除 rqlite 的业务 backup/snapshot。迁移 snapshot 在迁移完成并通过目标摘要验证后保留七天，由 Deployd 每小时按完成标记的截止时间清理；活动迁移和 `needs_recovery` 事务引用的 snapshot 不得删除。唯一 finalized 迁移事务、完成标记和目标摘要不清理，因此 snapshot 删除后仍可验证 rqlite 是否被重置。它按数量、年龄或总字节预算任一超限清理最旧的可删除材料。清理后仍无空间时，报告 `backup_storage_exhausted` 并拒绝新的备份或状态迁移，不删除受保护恢复点，也不影响正常蓝绿切换。
 
 该上限还要求状态数据库自身有界。 `operations`、`audit`、`management_operations` 和 `management_audit` 中已完成且不再被恢复流程引用的历史记录，默认保留三十天后回收；pending/unknown operation、活动 operation、当前租约、generation、Token 撤销和恢复所需审计不得回收。需要长期保留的审计必须先归档到状态库之外，不能通过放大备份预算解决。
 

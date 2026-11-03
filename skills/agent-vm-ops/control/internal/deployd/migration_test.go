@@ -11,11 +11,13 @@ import (
 )
 
 type fakeMigrationRuntime struct {
-	calls      []string
-	failImport bool
-	failRetry  bool
-	backup     MigrationSource
-	result     state.SQLiteMigrationResult
+	calls        []string
+	failImport   bool
+	failRetry    bool
+	failFinalize bool
+	failTarget   bool
+	backup       MigrationSource
+	result       state.SQLiteMigrationResult
 }
 
 func (runtime *fakeMigrationRuntime) MigrationComplete(context.Context) (bool, error) {
@@ -82,8 +84,19 @@ func (runtime *fakeMigrationRuntime) RetryMigration(context.Context, string) (st
 	return runtime.result, nil
 }
 
-func (runtime *fakeMigrationRuntime) FinalizeMigration(context.Context, string, bool) error {
+func (runtime *fakeMigrationRuntime) FinalizeMigration(context.Context, string, bool, state.SQLiteMigrationResult) error {
 	runtime.calls = append(runtime.calls, "finalize-source")
+	if runtime.failFinalize {
+		return errors.New("finalize outcome unknown")
+	}
+	return nil
+}
+
+func (runtime *fakeMigrationRuntime) VerifyMigrationTarget(context.Context, string) error {
+	runtime.calls = append(runtime.calls, "verify-target")
+	if runtime.failTarget {
+		return errors.New("target verification failed")
+	}
 	return nil
 }
 
@@ -167,6 +180,41 @@ func TestMigrationRecoveryRetriesOnlyAfterExplicitAction(t *testing.T) {
 	}
 	if !containsString(migration.calls, "retry-import") {
 		t.Fatalf("explicit recovery did not retry import: %#v", migration.calls)
+	}
+}
+
+func TestMigrationFinalizeFailureLeavesNeedsRecovery(t *testing.T) {
+	migration := &fakeMigrationRuntime{failFinalize: true, result: state.SQLiteMigrationResult{SourceSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", SourceSize: 1, StateEpoch: "epoch-1"}}
+	manager, database := migrationTestManager(t, migration)
+	if _, err := manager.Migrate(context.Background()); !errors.Is(err, ErrUncertain) {
+		t.Fatalf("migration finalize error = %v", err)
+	}
+	active, err := database.ListActive(context.Background())
+	if err != nil || len(active) != 1 {
+		t.Fatalf("migration transaction = %#v, err=%v", active, err)
+	}
+	if active[0].Phase != PhaseMigrationFinalize || active[0].State != "needs_recovery" || !active[0].RecoveryRequired {
+		t.Fatalf("finalize failure state = %#v", active[0])
+	}
+}
+
+func TestMigrationTargetVerificationFailureLeavesNeedsRecovery(t *testing.T) {
+	migration := &fakeMigrationRuntime{failTarget: true, result: state.SQLiteMigrationResult{
+		SourceSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SourceSize:   1,
+		StateEpoch:   "epoch-1",
+		TargetSHA256: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}}
+	manager, database := migrationTestManager(t, migration)
+	if _, err := manager.Migrate(context.Background()); !errors.Is(err, ErrUncertain) {
+		t.Fatalf("target verification error = %v", err)
+	}
+	active, err := database.ListActive(context.Background())
+	if err != nil || len(active) != 1 {
+		t.Fatalf("migration transaction = %#v, err=%v", active, err)
+	}
+	if active[0].Phase != PhaseMigrationFinalize || active[0].State != "needs_recovery" || !active[0].RecoveryRequired {
+		t.Fatalf("target verification failure state = %#v", active[0])
 	}
 }
 

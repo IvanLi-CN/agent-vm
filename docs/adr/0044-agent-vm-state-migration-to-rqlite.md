@@ -34,7 +34,7 @@ status: accepted
 - `maximum_verified_points = 3`：超过三个恢复点时，优先删除最旧且已通过删除门禁的恢复点。
 - `maximum_age = 30d`：超过三十天的恢复点进入清理候选，但不能因此删除最后两个恢复点。
 - `recovery_max_bytes = 1 GiB`：这是状态后端恢复材料的总硬上限；部署控制面另外对每个自动创建的迁移源 snapshot 执行 1 GiB 文件上限。它不是预分配空间，也不存在体积下限。
-- `migration_source_hold = 7d`：迁移源 SQLite snapshot 在迁移完成后至少保留七天，七天从迁移事务 `finalized` 且新的 rqlite 恢复点通过 restore check 时开始计算。
+- `migration_source_hold = 7d`：迁移源 SQLite snapshot 在迁移完成后至少保留七天，七天从迁移事务 `finalized` 且目标 rqlite 完整 snapshot 摘要验证通过时开始计算；完成标记永久保存目标摘要，snapshot 到期删除后仍可验证目标是否被重置。
 - `state_history_retention = 30d`：终态 operation 和 audit history 在不再被恢复流程引用且完成外部归档（如需要）后，保留三十天。
 
 恢复材料只有同时满足以下条件，才进入 `purge_eligible`：
@@ -42,11 +42,11 @@ status: accepted
 - 活动 rqlite 已通过 schema、capability、摘要、`state_epoch`、generation、journal、Token 撤销、lease 和 native-effect 校验。
 - 一个新的 rqlite backup/snapshot 已在隔离 recovery target 中通过 restore check，并且它的 coverage boundary 和 backup tail 可以覆盖最后可信提交。
 - 没有 pending/unknown operation、未完成的 reconciliation、活动 recovery transaction 或未解决的 `needs_recovery`。
-- 对迁移源 SQLite snapshot，迁移事务已 `finalized` 且新的 rqlite 恢复点已通过 restore check 后，七天恢复保留期已经到期。
+- 对迁移源 SQLite snapshot，迁移事务已 `finalized` 且目标 rqlite 完整 snapshot 摘要已写入完成标记后，七天恢复保留期已经到期。
 - 清理后仍至少保留两个可验证的 rqlite 恢复点。
 - 运维者针对准确的材料 ID 执行带审计记录的 purge；不得使用目录级或全局 cleanup 代替精确删除。
 
-业务状态后端的 retention worker 在每次成功创建恢复点后运行一次，并按“超过最大数量、超过最大年龄或超过总字节预算”的任一条件选择最旧候选，但永远跳过保留期未到、仍被事务引用、或属于最后两个恢复点的材料。Deployd 每小时只清理自己创建的 `migration-*.sqlite3` snapshot，且不会删除 rqlite backup。
+业务状态后端的 retention worker 在每次成功创建恢复点后运行一次，并按“超过最大数量、超过最大年龄或超过总字节预算”的任一条件选择最旧候选，但永远跳过保留期未到、仍被事务引用、或属于最后两个恢复点的材料。Deployd 每小时只清理自己创建的 `migration-*.sqlite3` snapshot，且不会删除 rqlite backup；Deployd 永久保留唯一 finalized 迁移事务、完成标记和目标摘要。
 
 生成新恢复点前必须先清理可删除材料并检查 `recovery_max_bytes`。如果清理后仍没有空间，必须拒绝新的备份或迁移操作并报告 `backup_storage_exhausted`，不能删除受保护恢复点，也不能继续写入导致磁盘无界增长。这个容量失败不改变正常蓝绿槽位，但会阻止依赖新恢复点的状态迁移或灾难恢复流程。
 

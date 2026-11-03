@@ -20,17 +20,19 @@ import (
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	releaseManifest "github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/manifest"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/observe"
 )
 
 type HostRuntime struct {
 	Config Config
 
-	mu            sync.Mutex
-	metrics       map[string]map[string]map[string]string
-	sources       map[string]SourceObservation
-	stagedProcess map[string]processIdentity
-	quiesced      map[string]quiescenceEvidence
+	mu                  sync.Mutex
+	metrics             map[string]map[string]map[string]string
+	sources             map[string]SourceObservation
+	stagedProcess       map[string]processIdentity
+	quiesced            map[string]quiescenceEvidence
+	legacyAuthorityLock *native.AuthorityLock
 }
 
 type processIdentity struct {

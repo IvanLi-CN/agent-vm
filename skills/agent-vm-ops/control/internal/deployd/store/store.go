@@ -273,6 +273,15 @@ func (s *Store) Create(ctx context.Context, transaction Transaction, evidence ma
 		if !errors.Is(activeErr, sql.ErrNoRows) {
 			return activeErr
 		}
+		if transaction.TargetSlot == "state" && transaction.Bundle == "sqlite-to-rqlite" {
+			var migrationCount int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM deployment_transactions WHERE target_slot = 'state' AND bundle = 'sqlite-to-rqlite'`).Scan(&migrationCount); err != nil {
+				return err
+			}
+			if migrationCount != 0 {
+				return errors.New("state migration transaction already exists")
+			}
+		}
 		rollback := boolInt(transaction.RollbackUsed)
 		recovery := boolInt(transaction.RecoveryRequired)
 		if _, err := tx.ExecContext(ctx, `INSERT INTO deployment_transactions
@@ -576,7 +585,7 @@ func (s *Store) Cleanup(ctx context.Context, now time.Time) (int64, error) {
 	cutoff := now.Add(-s.retention)
 	returnValue := int64(0)
 	err := s.write(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, `DELETE FROM deployment_transactions WHERE state IN ('finalized','rolled_back','failed') AND recovery_required = 0 AND updated_at < ?`, formatTime(cutoff))
+		result, err := tx.ExecContext(ctx, `DELETE FROM deployment_transactions WHERE state IN ('finalized','rolled_back','failed') AND recovery_required = 0 AND updated_at < ? AND NOT (target_slot = 'state' AND bundle = 'sqlite-to-rqlite')`, formatTime(cutoff))
 		if err != nil {
 			return err
 		}

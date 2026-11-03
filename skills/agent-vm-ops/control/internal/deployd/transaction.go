@@ -448,15 +448,24 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 			"source_sha256": result.SourceSHA256,
 			"source_size":   result.SourceSize,
 			"state_epoch":   result.StateEpoch,
+			"target_sha256": result.TargetSHA256,
 		}, manager.Clock().UTC())
 		if err != nil {
-			return nil, err
+			return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationFinalize, err, true)
 		}
-		if err := manager.Migration.FinalizeMigration(ctx, transaction.ID, true); err != nil {
-			return nil, &UncertainError{Cause: err}
+		if err := manager.Migration.FinalizeMigration(ctx, transaction.ID, true, result); err != nil {
+			return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationFinalize, err, true)
+		}
+		if verifier, ok := manager.Migration.(migrationTargetVerifier); ok {
+			if err := verifier.VerifyMigrationTarget(ctx, transaction.ID); err != nil {
+				return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationFinalize, err, true)
+			}
 		}
 		updated, err = manager.Store.Transition(ctx, transaction.ID, PhaseMigrationFinalize, PhaseFinalize, stateForPhase(PhaseFinalize), "migration_recovered", "deployd", map[string]any{"business_authority": "rqlite"}, manager.Clock().UTC())
-		return updated, err
+		if err != nil {
+			return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationFinalize, err, true)
+		}
+		return updated, nil
 	}
 	switch action {
 	case "rollback":

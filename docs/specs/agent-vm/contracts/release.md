@@ -88,7 +88,7 @@ Client 只读取 local sidecar client view。Legacy format 1/2 sidecars 具有 e
 
 ### SQLite 到 rqlite 迁移
 
-Initial state migration 由 `agent-vm-deployd` 的 `migrate` API 自动执行，发布器不得把它留成手工 preflight。该事务只允许在没有完成标记时执行一次，并由独立的部署 SQLite 持久化阶段和失败证据。Service 进入 state-write fence、拒绝新的 browser/API/Agent durable mutations、暂停 scheduler/reconciliation/timer durable writes，并排空 in-flight transactions 和 native workers 期间，SQLite 继续作为 sole writer。每个 native worker 必须在 original operation ID 下以 durable result 完成；service 在关闭 SQLite writers 前必须验证其 PID start identity、process-group absence 和 known Incus operation identity 已 quiescent。Pending/unknown native outcome、active worker 或 unverifiable quiescence 会阻止 final export；service 不能只记录它然后继续。只有之后才能创建包含 schema、capability、row-count、generation、journal 和 identity summaries 的 consistent backup/export。Schema/capability preflight 后，目标 rqlite state 通过一个 `POST /db/execute?transaction` request import；migration 不使用 SQL `BEGIN`/`COMMIT`、dual writes、shared SQLite file 或 guessed reverse synchronization。Target 在所有 summaries 和 journal ordering 验证前保持 read-only，然后启动一个 slot 完成 readiness，最后才改变 protected active link。
+Initial state migration 由 `agent-vm-deployd` 的 `migrate` API 自动执行，发布器不得把它留成手工 preflight。该事务只允许创建一条并永久保留唯一的 finalized 迁移记录；完成标记必须绑定这条记录、源摘要和当前 rqlite 目标摘要。Service 进入 state-write fence、拒绝新的 browser/API/Agent durable mutations、暂停 scheduler/reconciliation/timer durable writes，并排空 in-flight transactions 和 native workers 期间，SQLite 继续作为 sole writer。每个 native worker 必须在 original operation ID 下以 durable result 完成；service 在关闭 SQLite writers 前必须验证其 PID start identity、process-group absence 和 known Incus operation identity 已 quiescent。Pending/unknown native outcome、active worker 或 unverifiable quiescence 会阻止 final export；service 不能只记录它然后继续。只有之后才能创建包含 schema、capability、row-count、generation、journal 和 identity summaries 的 consistent backup/export。Schema/capability preflight 后，目标 rqlite state 通过一个 `POST /db/execute?transaction` request import；migration 不使用 SQL `BEGIN`/`COMMIT`、dual writes、shared SQLite file 或 guessed reverse synchronization。Target 在所有 summaries 和 journal ordering 验证前保持 read-only，然后启动一个 slot 完成 readiness，最后才改变 protected active link。
 
 发布器的首次激活顺序固定为：先启动并确认 Deployd，再调用 `/v1/migrate`，迁移成功后写入完成标记、创建初始 active link，最后启动蓝、绿槽位。如果迁移返回 `state_unverified`，发布器只针对返回的 transaction ID 自动尝试一次 `retry-migration`；目标内容不完全匹配时保持 fenced，不猜测成功。
 
@@ -96,7 +96,7 @@ Cutover 后，rqlite 是唯一 live state authority。Critical administrator-aut
 
 ### 状态恢复材料保留
 
-蓝绿发布成功不构成状态备份删除条件。恢复材料保留合同固定为最多三个已验证恢复点、三十天候选年龄，以及同一控制环境内全部恢复材料 1 GiB 的总硬上限。1 GiB 按实际文件大小计算，不是预分配空间，也不存在体积下限。最后两个可验证恢复点不能删除；迁移源 SQLite snapshot 在迁移完成并通过新的 rqlite restore check 后保留七天。只有在没有 pending/unknown operation 或未解决的 `needs_recovery`、对应保留期已到期，且清理后仍保留两个恢复点时，材料才可进入 `purge_eligible`。Deployd 每小时清理自己创建的迁移源 snapshot；rqlite backup/snapshot 仍由业务状态后端的独立保留策略管理，不能由普通蓝绿事务删除。预算不足时必须返回 `backup_storage_exhausted` 并拒绝新的备份或状态迁移；任何删除都必须针对准确的材料 ID 执行并写入审计。状态数据库中的终态操作和审计历史 MUST 默认保留三十天后回收；不得通过放大恢复材料预算替代历史记录回收。
+蓝绿发布成功不构成状态备份删除条件。恢复材料保留合同固定为最多三个已验证恢复点、三十天候选年龄，以及同一控制环境内全部恢复材料 1 GiB 的总硬上限。1 GiB 按实际文件大小计算，不是预分配空间，也不存在体积下限。最后两个可验证恢复点不能删除；迁移源 SQLite snapshot 在迁移 finalized、目标 rqlite 摘要已验证并经过七天保留期后删除。删除 snapshot 不删除唯一 finalized 迁移事务、完成标记或目标摘要；Deployd 每小时清理自己创建的迁移源 snapshot，rqlite backup/snapshot 仍由业务状态后端的独立保留策略管理，不能由普通蓝绿事务删除。预算不足时必须返回 `backup_storage_exhausted` 并拒绝新的备份或状态迁移；任何删除都必须针对准确的材料 ID 执行并写入审计。状态数据库中的终态操作和审计历史 MUST 默认保留三十天后回收；不得通过放大恢复材料预算替代历史记录回收。
 
 ## Wrapper 边界
 

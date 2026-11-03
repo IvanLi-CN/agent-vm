@@ -323,10 +323,40 @@ class WrapperTests(unittest.TestCase):
             (runtime_root / "slots" / slot).mkdir(parents=True)
         legacy_state = runtime_root / "state.sqlite3"
         legacy_state.write_bytes(b"legacy")
+
+        def run(command, *args, **kwargs):
+            if command and command[0] == str(WRAPPER.GO_DEPLOY_PATH):
+                if command[1] == "migrate":
+                    marker_path = WRAPPER._migration_marker_path(self.loaded)
+                    marker_path.parent.mkdir(parents=True, exist_ok=True)
+                    marker_path.write_text(json.dumps({
+                        "format": 2,
+                        "transaction_id": "migration-1",
+                        "business_authority": "rqlite",
+                        "source_sha256": "a" * 64,
+                        "source_size": 1,
+                        "state_epoch": "epoch-1",
+                        "target_sha256": "b" * 64,
+                        "retention_until": "2026-11-11T00:00:00Z",
+                    }), encoding="utf-8")
+                    marker_path.chmod(0o600)
+                    return subprocess.CompletedProcess(command, 0, b"", b"")
+                if command[1] == "transaction":
+                    return subprocess.CompletedProcess(command, 0, json.dumps({
+                        "value": {"transaction": {
+                            "transaction_id": "migration-1",
+                            "target_slot": "state",
+                            "phase": "finalize",
+                            "state": "finalized",
+                            "recovery_required": False,
+                        }},
+                    }).encode(), b"")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
         with mock.patch.object(WRAPPER, "STATE_DB_PATH", legacy_state), mock.patch.object(
             WRAPPER.subprocess,
             "run",
-            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+            side_effect=run,
         ) as run:
             WRAPPER._activate_go_runtime(self.loaded, deployd_enabled=True)
         commands = [call.args[0] for call in run.call_args_list]
@@ -335,12 +365,48 @@ class WrapperTests(unittest.TestCase):
         self.assertLess(migration_index, slot_index)
         self.assertTrue((runtime_root / "active").is_symlink())
 
+    def test_migration_marker_without_finalized_transaction_keeps_runtime_fenced(self):
+        marker_path = WRAPPER._migration_marker_path(self.loaded)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "format": 2,
+            "transaction_id": "migration-1",
+            "business_authority": "rqlite",
+            "source_sha256": "a" * 64,
+            "source_size": 1,
+            "state_epoch": "epoch-1",
+            "target_sha256": "b" * 64,
+            "retention_until": "2026-11-11T00:00:00Z",
+        }), encoding="utf-8")
+        marker_path.chmod(0o600)
+
+        def run(command, *args, **kwargs):
+            if command and command[0] == str(WRAPPER.GO_DEPLOY_PATH):
+                if command[1] == "migrate":
+                    return subprocess.CompletedProcess(command, 0, b"{}", b"")
+                if command[1] == "transaction":
+                    return subprocess.CompletedProcess(command, 0, json.dumps({
+                        "value": {"transaction": {
+                            "transaction_id": "migration-1",
+                            "target_slot": "state",
+                            "phase": "migration_finalize",
+                            "state": "needs_recovery",
+                            "recovery_required": True,
+                        }},
+                    }).encode(), b"")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with mock.patch.object(WRAPPER.subprocess, "run", side_effect=run):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._run_initial_state_migration(self.loaded)
+        self.assertEqual(failure.exception.code, "activation_unverified")
+
     def test_product_runtime_retire_web_unit_and_keep_resident_control(self):
         runtime_root = WRAPPER._go_runtime_root(self.loaded)
         (runtime_root / "slots" / "blue").mkdir(parents=True)
         (runtime_root / "slots" / "green").mkdir(parents=True)
         (runtime_root / "active").symlink_to(runtime_root / "slots" / "blue")
-        with mock.patch.object(
+        with mock.patch.object(WRAPPER, "_run_initial_state_migration"), mock.patch.object(
             WRAPPER.subprocess, "run",
             return_value=subprocess.CompletedProcess([], 0, b"", b""),
         ) as run:
@@ -359,7 +425,7 @@ class WrapperTests(unittest.TestCase):
         (runtime_root / "slots" / "blue").mkdir(parents=True)
         (runtime_root / "slots" / "green").mkdir(parents=True)
         (runtime_root / "active").symlink_to(runtime_root / "slots" / "blue")
-        with mock.patch.object(
+        with mock.patch.object(WRAPPER, "_run_initial_state_migration"), mock.patch.object(
             WRAPPER.subprocess,
             "run",
             return_value=subprocess.CompletedProcess([], 0, b"", b""),
@@ -583,7 +649,7 @@ class WrapperTests(unittest.TestCase):
         WRAPPER.stage(self.loaded, "tx-go", release_id, payload)
         verified = WRAPPER.verify_transaction(self.loaded, "tx-go", release_id)
         self.assertTrue(verified["verified"])
-        with mock.patch.object(
+        with mock.patch.object(WRAPPER, "_run_initial_state_migration"), mock.patch.object(
             WRAPPER.subprocess,
             "run",
             return_value=subprocess.CompletedProcess([], 0, b"", b""),

@@ -2,6 +2,8 @@ package deployd
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,16 +18,29 @@ import (
 	"strings"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
 const (
 	maxMigrationSourceBytes  = int64(1 << 30)
+	maxMigrationSnapshots    = 3
 	migrationBackupRetention = 7 * 24 * time.Hour
 	legacyMigrationSession   = "release-agent-vm-migration-"
 )
 
 const migrationCompletionMarker = ".rqlite-cutover-complete"
+
+type migrationCompletionMarkerData struct {
+	Format            int       `json:"format"`
+	TransactionID     string    `json:"transaction_id"`
+	BusinessAuthority string    `json:"business_authority"`
+	SourceSHA256      string    `json:"source_sha256"`
+	SourceSize        int64     `json:"source_size"`
+	StateEpoch        string    `json:"state_epoch"`
+	TargetSHA256      string    `json:"target_sha256"`
+	RetentionUntil    time.Time `json:"retention_until"`
+}
 
 func (runtime *HostRuntime) migrationMarkerPath() string {
 	return filepath.Join(runtime.Config.Migration.RecoveryDirectory, migrationCompletionMarker)
@@ -37,30 +52,64 @@ func (runtime *HostRuntime) MigrationComplete(ctx context.Context) (bool, error)
 		return false, ctx.Err()
 	default:
 	}
+	if _, err := runtime.readMigrationMarker(); errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (runtime *HostRuntime) readMigrationMarker() (migrationCompletionMarkerData, error) {
 	path := runtime.migrationMarkerPath()
 	info, err := os.Lstat(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		return false, nil
-	}
 	if err != nil {
-		return false, fmt.Errorf("inspect migration completion marker: %w", err)
+		if errors.Is(err, fs.ErrNotExist) {
+			return migrationCompletionMarkerData{}, fs.ErrNotExist
+		}
+		return migrationCompletionMarkerData{}, fmt.Errorf("inspect migration completion marker: %w", err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
-		return false, errors.New("migration completion marker is not a private regular file")
+		return migrationCompletionMarkerData{}, errors.New("migration completion marker is not a private regular file")
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return false, fmt.Errorf("read migration completion marker: %w", err)
+		return migrationCompletionMarkerData{}, fmt.Errorf("read migration completion marker: %w", err)
 	}
-	var marker struct {
-		Format            int    `json:"format"`
-		TransactionID     string `json:"transaction_id"`
-		BusinessAuthority string `json:"business_authority"`
+	var marker migrationCompletionMarkerData
+	if err := json.Unmarshal(data, &marker); err != nil || marker.Format != 2 || marker.TransactionID == "" || marker.BusinessAuthority != "rqlite" || marker.SourceSHA256 == "" || marker.SourceSize < 0 || marker.StateEpoch == "" || marker.RetentionUntil.IsZero() || !validMigrationDigest(marker.TargetSHA256) {
+		return migrationCompletionMarkerData{}, errors.New("migration completion marker is invalid")
 	}
-	if err := json.Unmarshal(data, &marker); err != nil || marker.Format != 1 || marker.TransactionID == "" || marker.BusinessAuthority != "rqlite" {
-		return false, errors.New("migration completion marker is invalid")
+	if !validMigrationDigest(marker.SourceSHA256) {
+		return migrationCompletionMarkerData{}, errors.New("migration completion marker source digest is invalid")
 	}
-	return true, nil
+	return marker, nil
+}
+
+func validMigrationDigest(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+// VerifyMigrationTarget is optional at the interface boundary so fake runtimes
+// can focus on the transaction state machine. HostRuntime always implements it
+// and verifies the durable rqlite contents before migration is considered done.
+func (runtime *HostRuntime) VerifyMigrationTarget(ctx context.Context, owner string) error {
+	marker, err := runtime.readMigrationMarker()
+	if err != nil {
+		return err
+	}
+	if marker.TransactionID != owner {
+		return errors.New("migration completion marker transaction does not match the durable transaction")
+	}
+	url, err := runtime.rqliteMigrationURL()
+	if err != nil {
+		return err
+	}
+	return state.VerifySQLiteMigrationTarget(ctx, url, runtime.Config.Migration.RQLiteCAFile, marker.TargetSHA256)
 }
 
 func (runtime *HostRuntime) PreflightMigration(_ context.Context) error {
@@ -84,11 +133,11 @@ func (runtime *HostRuntime) PreflightMigration(_ context.Context) error {
 	if authInfo.Mode()&os.ModeSymlink != 0 || !authInfo.Mode().IsRegular() || authInfo.Mode().Perm() != 0o600 {
 		return errors.New("rqlite auth file is not a private regular file")
 	}
-	info, err := os.Stat(runtime.Config.Migration.LegacyStateDB)
+	info, err := os.Lstat(runtime.Config.Migration.LegacyStateDB)
 	if err != nil {
 		return fmt.Errorf("inspect legacy SQLite state: %w", err)
 	}
-	if !info.Mode().IsRegular() {
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return errors.New("legacy SQLite state is not a regular file")
 	}
 	if info.Size() > maxMigrationSourceBytes {
@@ -105,7 +154,7 @@ func (runtime *HostRuntime) StartStateAuthority(ctx context.Context) error {
 		return err
 	}
 	parsed, err := url.Parse(runtime.Config.Migration.RQLiteURL)
-	if err != nil || parsed.Host == "" {
+	if err != nil || parsed.Host == "" || parsed.Scheme != "https" {
 		return errors.New("migration.rqlite_url is invalid")
 	}
 	deadline := time.NewTimer(60 * time.Second)
@@ -229,10 +278,20 @@ func (runtime *HostRuntime) legacyQuiescenceSample(ctx context.Context) (Migrati
 }
 
 func (runtime *HostRuntime) StopLegacy(ctx context.Context) error {
-	return runtime.systemctlFixed(ctx, "stop", runtime.Config.Migration.LegacyUnit)
+	if err := runtime.systemctlFixed(ctx, "stop", runtime.Config.Migration.LegacyUnit); err != nil {
+		return err
+	}
+	// The legacy process owns this lock for its lifetime, so it cannot be
+	// acquired before systemd stops that process. Acquire it immediately after
+	// the stop request and keep it through writer verification, snapshot, and
+	// import; a concurrent restart then fails closed at the systemd check.
+	return runtime.acquireLegacyAuthority(ctx)
 }
 
 func (runtime *HostRuntime) VerifyLegacyStopped(ctx context.Context) error {
+	if err := runtime.acquireLegacyAuthority(ctx); err != nil {
+		return err
+	}
 	unit := runtime.Config.Migration.LegacyUnit
 	command := exec.CommandContext(ctx, "systemctl", "show", unit, "--property=LoadState", "--property=ActiveState", "--property=SubState", "--property=MainPID", "--property=FragmentPath")
 	output, err := command.Output()
@@ -270,19 +329,29 @@ func (runtime *HostRuntime) VerifySQLiteWritersClosed(ctx context.Context) error
 
 func (runtime *HostRuntime) findSQLiteWriter() error {
 	base := filepath.Clean(runtime.Config.Migration.LegacyStateDB)
-	for _, entry := range procEntries() {
+	entries, err := procEntries()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
 		pid := entry
 		if pid == os.Getpid() {
 			continue
 		}
 		fds, err := os.ReadDir(filepath.Join("/proc", strconv.Itoa(pid), "fd"))
 		if err != nil {
-			continue
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return fmt.Errorf("inspect SQLite writer process %d: %w", pid, err)
 		}
 		for _, fd := range fds {
 			target, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "fd", fd.Name()))
 			if err != nil {
-				continue
+				if errors.Is(err, fs.ErrNotExist) {
+					continue
+				}
+				return fmt.Errorf("inspect SQLite writer process %d file descriptor: %w", pid, err)
 			}
 			target = strings.TrimSuffix(target, " (deleted)")
 			if target == base || target == base+"-wal" || target == base+"-shm" {
@@ -293,24 +362,10 @@ func (runtime *HostRuntime) findSQLiteWriter() error {
 	return nil
 }
 
-func validateMigrationSnapshotSize(path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return fmt.Errorf("inspect migration snapshot: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return errors.New("migration snapshot is not a regular file")
-	}
-	if info.Size() > maxMigrationSourceBytes {
-		return fmt.Errorf("migration snapshot is %d bytes and exceeds the 1 GiB migration limit", info.Size())
-	}
-	return nil
-}
-
-func procEntries() []int {
+func procEntries() ([]int, error) {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("inspect /proc for SQLite writers: %w", err)
 	}
 	result := make([]int, 0, len(entries))
 	for _, entry := range entries {
@@ -319,15 +374,115 @@ func procEntries() []int {
 			result = append(result, pid)
 		}
 	}
-	return result
+	return result, nil
+}
+
+func (runtime *HostRuntime) acquireLegacyAuthority(ctx context.Context) error {
+	path := filepath.Join(filepath.Dir(runtime.Config.Migration.LegacyStateDB), "authority.lock")
+	for {
+		runtime.mu.Lock()
+		if runtime.legacyAuthorityLock != nil {
+			runtime.mu.Unlock()
+			return nil
+		}
+		runtime.mu.Unlock()
+		lock, err := native.AcquireLock(path, true, true)
+		if err == nil {
+			runtime.mu.Lock()
+			if runtime.legacyAuthorityLock == nil {
+				runtime.legacyAuthorityLock = lock
+				lock = nil
+			}
+			runtime.mu.Unlock()
+			if lock != nil {
+				_ = lock.Close()
+			}
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+func validateMigrationSnapshotSize(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("inspect migration snapshot: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return errors.New("migration snapshot is not a regular file")
+	}
+	if info.Size() > maxMigrationSourceBytes {
+		return fmt.Errorf("migration snapshot is %d bytes and exceeds the 1 GiB migration limit", info.Size())
+	}
+	return nil
+}
+
+func (runtime *HostRuntime) ensureRecoveryDirectory() error {
+	path := runtime.Config.Migration.RecoveryDirectory
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		if err := os.MkdirAll(path, 0o700); err != nil {
+			return fmt.Errorf("prepare migration recovery directory: %w", err)
+		}
+		info, err = os.Lstat(path)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect migration recovery directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm()&0o077 != 0 {
+		return errors.New("migration recovery directory is not a private regular directory")
+	}
+	return nil
+}
+
+func (runtime *HostRuntime) checkMigrationBudget(sourceSize int64) error {
+	entries, err := os.ReadDir(runtime.Config.Migration.RecoveryDirectory)
+	if err != nil {
+		return fmt.Errorf("inspect migration recovery budget: %w", err)
+	}
+	var total int64
+	count := 0
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "migration-") || !strings.HasSuffix(entry.Name(), ".sqlite3") {
+			continue
+		}
+		path := filepath.Join(runtime.Config.Migration.RecoveryDirectory, entry.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("migration recovery entry is not a regular file: %s", entry.Name())
+		}
+		count++
+		if info.Size() > maxMigrationSourceBytes-total {
+			return errors.New("backup_storage_exhausted: migration recovery budget is exhausted")
+		}
+		total += info.Size()
+	}
+	if count >= maxMigrationSnapshots || sourceSize < 0 || sourceSize > maxMigrationSourceBytes-total {
+		return errors.New("backup_storage_exhausted: migration recovery budget is exhausted")
+	}
+	return nil
 }
 
 func (runtime *HostRuntime) PrepareMigrationSource(ctx context.Context, owner string) (MigrationSource, error) {
 	if err := runtime.PreflightMigration(ctx); err != nil {
 		return MigrationSource{}, err
 	}
-	if err := os.MkdirAll(runtime.Config.Migration.RecoveryDirectory, 0o700); err != nil {
-		return MigrationSource{}, fmt.Errorf("prepare migration recovery directory: %w", err)
+	if err := runtime.ensureRecoveryDirectory(); err != nil {
+		return MigrationSource{}, err
+	}
+	legacyInfo, err := os.Lstat(runtime.Config.Migration.LegacyStateDB)
+	if err != nil {
+		return MigrationSource{}, fmt.Errorf("inspect legacy SQLite state: %w", err)
+	}
+	if err := runtime.checkMigrationBudget(legacyInfo.Size()); err != nil {
+		return MigrationSource{}, err
 	}
 	backup := filepath.Join(runtime.Config.Migration.RecoveryDirectory, "migration-"+owner+".sqlite3")
 	if err := state.SnapshotSQLite(ctx, runtime.Config.Migration.LegacyStateDB, backup); err != nil {
@@ -358,16 +513,19 @@ func (runtime *HostRuntime) RetryMigration(ctx context.Context, owner string) (s
 	if err := runtime.VerifySQLiteWritersClosed(ctx); err != nil {
 		return state.SQLiteMigrationResult{}, err
 	}
-	if err := os.MkdirAll(runtime.Config.Migration.RecoveryDirectory, 0o700); err != nil {
+	if err := runtime.ensureRecoveryDirectory(); err != nil {
 		return state.SQLiteMigrationResult{}, err
 	}
 	backup := filepath.Join(runtime.Config.Migration.RecoveryDirectory, "migration-"+owner+".sqlite3")
-	if _, err := os.Stat(backup); errors.Is(err, fs.ErrNotExist) {
-		if err := state.SnapshotSQLite(ctx, runtime.Config.Migration.LegacyStateDB, backup); err != nil {
-			return state.SQLiteMigrationResult{}, err
+	info, err := os.Lstat(backup)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return state.SQLiteMigrationResult{}, errors.New("verified migration snapshot is missing; retry cannot resample the legacy database")
 		}
-	} else if err != nil {
 		return state.SQLiteMigrationResult{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return state.SQLiteMigrationResult{}, errors.New("verified migration snapshot is not a private regular file")
 	}
 	if err := validateMigrationSnapshotSize(backup); err != nil {
 		return state.SQLiteMigrationResult{}, err
@@ -381,7 +539,7 @@ func (runtime *HostRuntime) RetryMigration(ctx context.Context, owner string) (s
 
 func (runtime *HostRuntime) rqliteMigrationURL() (string, error) {
 	parsed, err := url.Parse(runtime.Config.Migration.RQLiteURL)
-	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+	if err != nil || parsed.Host == "" || parsed.Scheme != "https" {
 		return "", errors.New("migration.rqlite_url is invalid")
 	}
 	authData, err := os.ReadFile(runtime.Config.Migration.RQLiteAuthFile)
@@ -404,9 +562,15 @@ func (runtime *HostRuntime) rqliteMigrationURL() (string, error) {
 	return "", errors.New("rqlite auth file has no configured agent-vm-control credential")
 }
 
-func (runtime *HostRuntime) FinalizeMigration(ctx context.Context, owner string, success bool) error {
+func (runtime *HostRuntime) FinalizeMigration(ctx context.Context, owner string, success bool, result state.SQLiteMigrationResult) error {
 	if !success {
 		return nil
+	}
+	if !validMigrationDigest(result.SourceSHA256) || result.SourceSize < 0 || result.StateEpoch == "" || !validMigrationDigest(result.TargetSHA256) {
+		return errors.New("migration completion result is incomplete")
+	}
+	if err := runtime.ensureRecoveryDirectory(); err != nil {
+		return err
 	}
 	if err := runtime.VerifySQLiteWritersClosed(ctx); err != nil {
 		return err
@@ -417,11 +581,16 @@ func (runtime *HostRuntime) FinalizeMigration(ctx context.Context, owner string,
 			return fmt.Errorf("remove migrated SQLite source %s: %w", filepath.Base(path), err)
 		}
 	}
-	marker := map[string]any{
-		"format":             1,
-		"transaction_id":     owner,
-		"business_authority": "rqlite",
-		"completed_at":       time.Now().UTC(),
+	completedAt := time.Now().UTC()
+	marker := migrationCompletionMarkerData{
+		Format:            2,
+		TransactionID:     owner,
+		BusinessAuthority: "rqlite",
+		SourceSHA256:      result.SourceSHA256,
+		SourceSize:        result.SourceSize,
+		StateEpoch:        result.StateEpoch,
+		TargetSHA256:      result.TargetSHA256,
+		RetentionUntil:    completedAt.Add(migrationBackupRetention),
 	}
 	encoded, err := json.Marshal(marker)
 	if err != nil {
@@ -429,6 +598,16 @@ func (runtime *HostRuntime) FinalizeMigration(ctx context.Context, owner string,
 	}
 	path := runtime.migrationMarkerPath()
 	temporary := path + ".tmp"
+	if info, inspectErr := os.Lstat(temporary); inspectErr == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return errors.New("migration completion temporary marker is not a regular file")
+		}
+		if err := os.Remove(temporary); err != nil {
+			return fmt.Errorf("remove stale migration completion marker: %w", err)
+		}
+	} else if !errors.Is(inspectErr, fs.ErrNotExist) {
+		return fmt.Errorf("inspect temporary migration completion marker: %w", inspectErr)
+	}
 	file, err := os.OpenFile(temporary, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return fmt.Errorf("create migration completion marker: %w", err)
@@ -483,15 +662,26 @@ func (runtime *HostRuntime) FenceLegacy(ctx context.Context) error {
 	return nil
 }
 
-func (runtime *HostRuntime) CleanupMigrationBackups(_ context.Context) error {
-	entries, err := os.ReadDir(runtime.Config.Migration.RecoveryDirectory)
+func (runtime *HostRuntime) CleanupMigrationBackups(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := runtime.ensureRecoveryDirectory(); err != nil {
+		return err
+	}
+	marker, err := runtime.readMigrationMarker()
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	cutoff := time.Now().Add(-migrationBackupRetention)
+	entries, err := os.ReadDir(runtime.Config.Migration.RecoveryDirectory)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	cutoff := now.Add(-migrationBackupRetention)
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), "migration-") || !strings.HasSuffix(entry.Name(), ".sqlite3") {
 			continue
@@ -503,6 +693,9 @@ func (runtime *HostRuntime) CleanupMigrationBackups(_ context.Context) error {
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			return fmt.Errorf("migration recovery entry is not a regular file: %s", entry.Name())
+		}
+		if entry.Name() == "migration-"+marker.TransactionID+".sqlite3" && now.Before(marker.RetentionUntil) {
+			continue
 		}
 		if info.ModTime().Before(cutoff) {
 			if err := os.Remove(path); err != nil {

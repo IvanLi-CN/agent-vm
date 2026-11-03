@@ -210,12 +210,12 @@ def _migration_marker_path(config: Mapping[str, Any]) -> Path:
     return _go_runtime_root(config) / "migration" / ".rqlite-cutover-complete"
 
 
-def _migration_marker_is_valid(config: Mapping[str, Any]) -> bool:
+def _read_migration_marker(config: Mapping[str, Any]) -> Mapping[str, Any] | None:
     path = _migration_marker_path(config)
     try:
         info = path.lstat()
     except FileNotFoundError:
-        return False
+        return None
     except OSError:
         _fail("activation_unverified", "migration completion marker cannot be inspected")
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
@@ -224,9 +224,29 @@ def _migration_marker_is_valid(config: Mapping[str, Any]) -> bool:
         marker = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         _fail("activation_unverified", "migration completion marker is invalid")
-    if not isinstance(marker, Mapping) or marker.get("format") != 1 or not marker.get("transaction_id") or marker.get("business_authority") != "rqlite":
+    if (
+        not isinstance(marker, Mapping)
+        or marker.get("format") != 2
+        or not isinstance(marker.get("transaction_id"), str)
+        or not marker.get("transaction_id")
+        or marker.get("business_authority") != "rqlite"
+        or not isinstance(marker.get("source_sha256"), str)
+        or not isinstance(marker.get("target_sha256"), str)
+        or re.fullmatch(r"[0-9a-f]{64}", marker.get("source_sha256", "")) is None
+        or re.fullmatch(r"[0-9a-f]{64}", marker.get("target_sha256", "")) is None
+        or not isinstance(marker.get("source_size"), int)
+        or marker.get("source_size") < 0
+        or not isinstance(marker.get("state_epoch"), str)
+        or not marker.get("state_epoch")
+        or not isinstance(marker.get("retention_until"), str)
+        or not marker.get("retention_until")
+    ):
         _fail("activation_unverified", "migration completion marker is invalid")
-    return True
+    return marker
+
+
+def _migration_marker_is_valid(config: Mapping[str, Any]) -> bool:
+    return _read_migration_marker(config) is not None
 
 
 def _go_bridge_target(config: Mapping[str, Any]) -> Path:
@@ -1330,7 +1350,7 @@ def _run_deployd_cli(command: str, *arguments: str, timeout_seconds: int) -> sub
         _fail("activation_failed", f"Deployd {command} could not be verified")
 
 
-def _needs_migration_recovery() -> str | None:
+def _needs_migration_recovery(expected_transaction_id: str | None = None) -> str | None:
     process = _run_deployd_cli("status", timeout_seconds=30)
     if process.returncode != 0:
         return None
@@ -1344,20 +1364,53 @@ def _needs_migration_recovery() -> str | None:
     for transaction in transactions:
         if not isinstance(transaction, Mapping):
             continue
-        if transaction.get("target_slot") == "state" and transaction.get("state") == "needs_recovery":
+        if (
+            transaction.get("target_slot") == "state"
+            and transaction.get("state") == "needs_recovery"
+            and (expected_transaction_id is None or transaction.get("transaction_id") == expected_transaction_id)
+        ):
             value = transaction.get("transaction_id")
             if isinstance(value, str) and value:
                 return value
     return None
 
 
+def _migration_transaction_is_finalized(transaction_id: str) -> bool:
+    process = _run_deployd_cli("transaction", "--transaction", transaction_id, timeout_seconds=30)
+    if process.returncode != 0:
+        return False
+    try:
+        payload = json.loads(process.stdout.decode("utf-8"))
+        transaction = payload.get("value", {}).get("transaction")
+    except (UnicodeError, json.JSONDecodeError, AttributeError):
+        return False
+    return (
+        isinstance(transaction, Mapping)
+        and transaction.get("transaction_id") == transaction_id
+        and transaction.get("target_slot") == "state"
+        and transaction.get("phase") == "finalize"
+        and transaction.get("state") == "finalized"
+        and transaction.get("recovery_required") is False
+    )
+
+
+def _verify_migration_completion(config: Mapping[str, Any]) -> None:
+    marker = _read_migration_marker(config)
+    if marker is None or not _migration_transaction_is_finalized(marker["transaction_id"]):
+        _fail(
+            "activation_unverified",
+            "migration completion marker is not backed by the finalized Deployd transaction",
+        )
+
+
 def _run_initial_state_migration(config: Mapping[str, Any]) -> None:
-    if _migration_marker_is_valid(config):
-        return
     process = _run_deployd_cli("migrate", timeout_seconds=MIGRATION_TIMEOUT_SECONDS)
     if process.returncode == 0:
+        _verify_migration_completion(config)
         return
-    transaction_id = _needs_migration_recovery()
+    marker = _read_migration_marker(config)
+    expected_transaction_id = marker.get("transaction_id") if marker is not None else None
+    transaction_id = _needs_migration_recovery(expected_transaction_id)
     if transaction_id is not None:
         recovery = _run_deployd_cli(
             "recover",
@@ -1368,6 +1421,7 @@ def _run_initial_state_migration(config: Mapping[str, Any]) -> None:
             timeout_seconds=MIGRATION_TIMEOUT_SECONDS,
         )
         if recovery.returncode == 0:
+            _verify_migration_completion(config)
             return
     _fail("activation_failed", "initial SQLite-to-rqlite migration did not complete; the runtime remains fenced")
 
@@ -1419,25 +1473,51 @@ def _activate_go_runtime(
         _systemctl("stop", unit, allow_missing=True)
         _systemctl("disable", unit, allow_missing=True)
     if deployd_enabled:
-        # Deployd must be available while the legacy singleton is still the
-        # SQLite writer. It fences and drains that writer before any slot is
-        # started, so systemd must not pull slots in as a dependency here.
-        _systemctl("enable", "agent-vm-deployd.service")
-        _systemctl("restart", "agent-vm-deployd.service")
-        _systemctl("is-active", "agent-vm-deployd.service")
-        _run_initial_state_migration(config)
-        if bootstrap_active:
-            _atomic_symlink(_go_slot_root(config, "blue"), _go_runtime_root(config) / "active")
-        # The blue-green control plane owns the slot instances. Leaving the
-        # legacy singleton enabled would create a third scheduler process.
-        _systemctl("stop", "agent-vm-native.service", allow_missing=True)
-        _systemctl("disable", "agent-vm-native.service", allow_missing=True)
-        for slot in GO_SLOT_NAMES:
-            unit = f"agent-vm-native@{slot}.service"
-            _systemctl("enable", unit)
-            _systemctl("restart", unit)
-            _systemctl("is-active", unit)
-        return
+        try:
+            # Deployd must be available while the legacy singleton is still
+            # the SQLite writer. It fences and drains that writer before any
+            # slot is started, so systemd must not pull slots in as a
+            # dependency here.
+            _systemctl("enable", "agent-vm-deployd.service")
+            _systemctl("restart", "agent-vm-deployd.service")
+            _systemctl("is-active", "agent-vm-deployd.service")
+            _run_initial_state_migration(config)
+            if bootstrap_active:
+                _atomic_symlink(_go_slot_root(config, "blue"), _go_runtime_root(config) / "active")
+            # The blue-green control plane owns the slot instances. Leaving
+            # the legacy singleton enabled would create a third scheduler
+            # process.
+            _systemctl("stop", "agent-vm-native.service", allow_missing=True)
+            _systemctl("disable", "agent-vm-native.service", allow_missing=True)
+            for slot in GO_SLOT_NAMES:
+                unit = f"agent-vm-native@{slot}.service"
+                _systemctl("enable", unit)
+                _systemctl("restart", unit)
+                _systemctl("is-active", unit)
+            return
+        except WrapperError:
+            # A partial bootstrap must not leave a running slot or Deployd
+            # controller behind while the release transaction is fenced.
+            for slot in GO_SLOT_NAMES:
+                unit = f"agent-vm-native@{slot}.service"
+                try:
+                    _systemctl("stop", unit, allow_missing=True)
+                    _systemctl("disable", unit, allow_missing=True)
+                except WrapperError:
+                    pass
+            try:
+                _systemctl("stop", "agent-vm-deployd.service", allow_missing=True)
+            except WrapperError:
+                pass
+            if bootstrap_active:
+                active = _go_runtime_root(config) / "active"
+                try:
+                    if active.is_symlink() or active.exists():
+                        active.unlink()
+                        _fsync_directory(active.parent, "activation_failed")
+                except OSError:
+                    pass
+            raise
     _systemctl("enable", "agent-vm-native.service")
     _systemctl("restart", "agent-vm-native.service")
     _systemctl("is-active", "agent-vm-native.service")
