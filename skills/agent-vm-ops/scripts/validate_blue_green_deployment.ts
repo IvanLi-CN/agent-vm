@@ -142,6 +142,8 @@ const realSystemdAcceptance = read(join(import.meta.dir, "agent_vm_deployd_syste
 requireText(realSystemdAcceptance, "assert_exec_start", "real systemd acceptance compares ExecStart argv exactly");
 requireText(realSystemdAcceptance, "refusing filesystem restore while a managed unit remains active", "real systemd acceptance refuses unsafe cleanup");
 requireText(realSystemdAcceptance, "systemctl is-active --quiet \"$unit\"", "real systemd acceptance verifies stopped units during cleanup");
+requireText(realSystemdAcceptance, "real agent-vm-control binary did not pass its version smoke test", "systemd acceptance keeps a real control binary smoke check");
+requireText(realSystemdAcceptance, "slot_runtime\":\"testslot-adapter\"", "systemd acceptance labels its test slot adapter coverage honestly");
 for (const path of scriptPaths) {
   try {
     const mode = statSync(path).mode & 0o777;

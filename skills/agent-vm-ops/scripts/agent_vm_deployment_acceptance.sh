@@ -403,4 +403,4 @@ bash "$repository_root/skills/agent-vm-ops/scripts/agent_vm_deployd_systemd_acce
   fail "real Deployd systemd acceptance failed"
 }
 
-printf '{"schema_version":1,"verdict":"pass","caddy":"2.11.7","rqlite":"10.5.2","checks":["pinned artifact checksums","CA and leaf certificates","Caddy configuration","systemd units","authenticated TLS rqlite","blue-green cutover guard","Deployd dual-slot controller and metrics","real systemd PID/cgroup/UDS","rollback and restart recovery","evidence-gated snapshot","restore admissibility"]}\n'
+printf '{"schema_version":1,"verdict":"pass","caddy":"2.11.7","rqlite":"10.5.2","checks":["pinned artifact checksums","CA and leaf certificates","Caddy configuration","systemd units","authenticated TLS rqlite","blue-green cutover guard","Deployd dual-slot controller and metrics","real systemd Deployd and slot-adapter PID/cgroup/UDS","real control binary version smoke","rollback and restart recovery","evidence-gated snapshot","restore admissibility"]}\n'

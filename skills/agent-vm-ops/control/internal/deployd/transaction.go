@@ -51,6 +51,7 @@ type SlotObservation struct {
 	Ready             bool              `json:"ready"`
 	ControllerOwned   bool              `json:"controller_owned"`
 	TrafficAccepting  bool              `json:"traffic_accepting"`
+	CountersKnown     bool              `json:"counters_known"`
 	InFlightRequests  int64             `json:"in_flight_requests"`
 	NativeWorkers     int64             `json:"native_workers"`
 	PendingOperations int64             `json:"pending_operations"`
@@ -373,7 +374,9 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	}
 	target, ok = observation.Slots[transaction.TargetSlot]
 	old, oldOK := observation.Slots[transaction.PreviousSlot]
-	if !validObservation(observation, manager.Clock().UTC()) || !ok || observation.ActiveSlot != transaction.TargetSlot || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || !target.TrafficAccepting || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch != verifiedStateEpoch || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) || (oldOK && (old.ProcessUp || old.TrafficAccepting || old.InFlightRequests != 0 || old.NativeWorkers != 0 || old.PendingOperations != 0)) {
+	previousSlotRequired := transaction.PreviousSlot != "" && transaction.PreviousSlot != "none"
+	oldNotStopped := previousSlotRequired && (!oldOK || old.ProcessUp || old.ProcessReady || old.Ready || old.ControllerOwned || old.TrafficAccepting || old.InFlightRequests != 0 || old.NativeWorkers != 0 || old.PendingOperations != 0)
+	if !validObservation(observation, manager.Clock().UTC()) || !ok || observation.ActiveSlot != transaction.TargetSlot || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || !target.TrafficAccepting || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch != verifiedStateEpoch || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) || oldNotStopped {
 		return nil, manager.rollbackOrFence(ctx, *transaction, errors.New("final active slot was not verified"))
 	}
 	if err := manager.transitionAfterEffect(ctx, id, PhaseQuiescence, PhaseFinalize, "finalized", map[string]any{"quiescent": true}); err != nil {
@@ -619,6 +622,9 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	if err := manager.Runtime.GrantController(ctx, observation.ActiveSlot, lease); err != nil {
 		return manager.fenceSlots(ctx, errors.New("grant active controller failed; controller roles were fenced"))
 	}
+	if err := manager.waitForReady(ctx, "", observation.ActiveSlot); err != nil {
+		return manager.fenceSlots(ctx, fmt.Errorf("active slot did not become ready after controller grant: %w", err))
+	}
 	if err := manager.Runtime.EnableTraffic(ctx, observation.ActiveSlot); err != nil {
 		disableErr := manager.Runtime.DisableTraffic(ctx, observation.ActiveSlot)
 		fenceErr := manager.fenceSlots(ctx, errors.New("active traffic role could not be established"))
@@ -847,7 +853,9 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)
 	}
 	previous, previousOK := observation.Slots[transaction.PreviousSlot]
-	if !previousOK || !observation.Consistent || observation.ActiveSlot != transaction.PreviousSlot || !previous.ProcessUp || !previous.ProcessReady || !previous.Ready || !previous.ControllerOwned || !previous.TrafficAccepting || previous.StateEpoch != previousStateEpoch || !sameStateCapabilities(previous.StateCapabilities, previousCapabilities) || previous.NativeWorkers != 0 || previous.PendingOperations != 0 || previous.InFlightRequests != 0 {
+	target, targetOK := observation.Slots[transaction.TargetSlot]
+	targetStopped := targetOK && !target.ProcessUp && !target.ProcessReady && !target.Ready && !target.ControllerOwned && !target.TrafficAccepting && target.NativeWorkers == 0 && target.PendingOperations == 0 && target.InFlightRequests == 0
+	if !previousOK || !targetStopped || !observation.Consistent || observation.ActiveSlot != transaction.PreviousSlot || !previous.ProcessUp || !previous.ProcessReady || !previous.Ready || !previous.ControllerOwned || !previous.TrafficAccepting || previous.StateEpoch != previousStateEpoch || !sameStateCapabilities(previous.StateCapabilities, previousCapabilities) || previous.NativeWorkers != 0 || previous.PendingOperations != 0 || previous.InFlightRequests != 0 {
 		failureErr := manager.failure(ctx, transaction.ID, PhaseRollback, errors.New("rollback outcome was not verified"))
 		fenceErr := manager.fenceSlots(ctx, errors.New("rollback verification failed; controller roles were fenced"))
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)
@@ -880,7 +888,11 @@ func recoveryTargetVerified(observation RuntimeSnapshot, transaction store.Trans
 		return false
 	}
 	old, oldOK := observation.Slots[transaction.PreviousSlot]
-	if !oldOK {
+	previousSlotRequired := transaction.PreviousSlot != "" && transaction.PreviousSlot != "none"
+	if previousSlotRequired && !oldOK {
+		return false
+	}
+	if !previousSlotRequired {
 		return true
 	}
 	if old.TrafficAccepting || old.InFlightRequests != 0 || old.NativeWorkers != 0 || old.PendingOperations != 0 {

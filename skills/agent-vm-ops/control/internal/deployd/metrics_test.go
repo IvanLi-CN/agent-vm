@@ -14,7 +14,7 @@ func TestMetricsHaveOneDeploydSeriesPerSlot(t *testing.T) {
 		ObservedAt: time.Unix(100, 0), Consistent: true, ActiveSlot: "green",
 		Sources: map[string]SourceObservation{"active_link": {Up: true, ObservedAt: time.Unix(100, 0)}},
 		Slots: map[string]SlotObservation{
-			"blue":  {ProcessUp: true, ProcessReady: true, ControllerOwned: false, TrafficAccepting: false, InFlightRequests: 2, NativeWorkers: 1, PendingOperations: 1, MetricFamilies: map[string]string{"health": "agent_vm_up 1\n"}},
+			"blue":  {ProcessUp: true, ProcessReady: true, ControllerOwned: false, TrafficAccepting: false, CountersKnown: true, InFlightRequests: 2, NativeWorkers: 1, PendingOperations: 1, MetricFamilies: map[string]string{"health": "agent_vm_up 1\n"}},
 			"green": {ProcessUp: true, ProcessReady: true, ControllerOwned: true, TrafficAccepting: true},
 		},
 	})
@@ -41,6 +41,23 @@ func TestMetricsHaveOneDeploydSeriesPerSlot(t *testing.T) {
 	text = metrics.Render()
 	if !strings.Contains(text, `agent_vm_deployd_transaction_phase{phase="quiescence"} 1`) || !strings.Contains(text, "agent_vm_deployd_recovery_required 1") {
 		t.Fatalf("transaction series missing:\n%s", text)
+	}
+}
+
+func TestMetricsOmitUnknownSlotCounters(t *testing.T) {
+	metrics := NewMetrics(nil)
+	metrics.Set(RuntimeSnapshot{Slots: map[string]SlotObservation{
+		"blue": {ProcessUp: true},
+	}})
+	text := metrics.Render()
+	for _, name := range []string{
+		"agent_vm_deployd_slot_in_flight_requests{slot=\"blue\"}",
+		"agent_vm_deployd_slot_pending_operations{slot=\"blue\"}",
+		"agent_vm_deployd_slot_native_workers{slot=\"blue\"}",
+	} {
+		if strings.Contains(text, name) {
+			t.Fatalf("unknown slot counter was exposed: %s\n%s", name, text)
+		}
 	}
 }
 

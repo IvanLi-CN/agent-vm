@@ -312,6 +312,11 @@ class WrapperTests(unittest.TestCase):
         self.assertIn(["systemctl", "stop", "agent-vm-web.service"], commands)
         self.assertIn(["systemctl", "disable", "agent-vm-web.service"], commands)
 
+    def test_go_blue_green_runtime_requires_a_valid_active_slot_pointer(self):
+        with self.assertRaises(WRAPPER.WrapperError) as failure:
+            WRAPPER._activate_go_runtime(self.loaded, deployd_enabled=True)
+        self.assertEqual(failure.exception.code, "activation_unverified")
+
     def test_product_runtime_restores_an_enabled_web_unit_after_native_restart(self):
         with mock.patch.object(
             WRAPPER.subprocess, "run",
@@ -564,6 +569,10 @@ class WrapperTests(unittest.TestCase):
         payload = self._go_payload(release_id)
         unit_dir = Path(self.loaded["unit_dir"])
         unit_dir.mkdir(parents=True)
+        runtime_root = Path(self.loaded["release_root"]).parent
+        for slot in WRAPPER.GO_SLOT_NAMES:
+            (runtime_root / "slots" / slot).mkdir(parents=True)
+        (runtime_root / "active").symlink_to(Path("slots/blue"))
         for name in MANIFEST.GO_RETIRED_UNITS:
             old = unit_dir / name
             old.write_bytes(b"old unit\n")
@@ -571,9 +580,22 @@ class WrapperTests(unittest.TestCase):
         WRAPPER.stage(self.loaded, "tx-go", release_id, payload)
         verified = WRAPPER.verify_transaction(self.loaded, "tx-go", release_id)
         self.assertTrue(verified["verified"])
-        with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")):
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ) as run:
             activated = WRAPPER.activate(self.loaded, "tx-go", release_id)
         self.assertTrue(activated["activated"])
+        commands = [call.args[0] for call in run.call_args_list]
+        for slot in WRAPPER.GO_SLOT_NAMES:
+            self.assertIn(["systemctl", "restart", f"agent-vm-native@{slot}.service"], commands)
+            self.assertIn(["systemctl", "is-active", f"agent-vm-native@{slot}.service"], commands)
+        self.assertIn(["systemctl", "restart", "agent-vm-deployd.service"], commands)
+        self.assertIn(["systemctl", "is-active", "agent-vm-deployd.service"], commands)
+        for slot in WRAPPER.GO_SLOT_NAMES:
+            self.assertTrue((runtime_root / "slots" / slot / "bin" / "agent-vm-control").is_file())
+            self.assertTrue((runtime_root / "slots" / slot / "release-manifest.json").is_file())
         self.assertEqual(
             (Path(self.loaded["control_path"]).parent / "bin" / "agent-vm-control").read_bytes(),
             b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42,

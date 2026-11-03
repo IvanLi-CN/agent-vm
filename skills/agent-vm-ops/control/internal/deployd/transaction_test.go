@@ -23,6 +23,8 @@ type fakeRuntime struct {
 	invalidCapabilities   bool
 	failRevoke            bool
 	failGrant             bool
+	readyAfterGrant       bool
+	enableRequiresReady   bool
 	sequence              []string
 	traffic               map[string]bool
 	releaseIDs            map[string]string
@@ -79,6 +81,9 @@ func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, _ co
 	}
 	if observation, ok := runtime.observations[slot]; ok {
 		observation.ControllerOwned = true
+		if runtime.readyAfterGrant {
+			observation.Ready = true
+		}
 		runtime.observations[slot] = observation
 	}
 	if runtime.failGrant {
@@ -107,6 +112,9 @@ func (runtime *fakeRuntime) FenceController(_ context.Context, slot string) erro
 }
 func (runtime *fakeRuntime) EnableTraffic(_ context.Context, slot string) error {
 	runtime.sequence = append(runtime.sequence, "traffic")
+	if runtime.enableRequiresReady && !runtime.observations[slot].Ready {
+		return errors.New("slot is not ready")
+	}
 	if runtime.traffic == nil {
 		runtime.traffic = map[string]bool{}
 	}
@@ -151,20 +159,27 @@ func (runtime *fakeRuntime) Stop(_ context.Context, slot string) error {
 	runtime.observations[slot] = value
 	return nil
 }
-func (runtime *fakeRuntime) Rollback(context.Context, string, string, controllerrole.Lease) error {
+func (runtime *fakeRuntime) Rollback(_ context.Context, target, previous string, _ controllerrole.Lease) error {
 	runtime.sequence = append(runtime.sequence, "rollback")
-	runtime.active = "blue"
-	previous := runtime.observations["blue"]
-	previous.ProcessUp = true
-	previous.ProcessReady = true
-	previous.Ready = true
-	previous.ControllerOwned = true
-	runtime.observations["blue"] = previous
+	runtime.active = previous
+	targetObservation := runtime.observations[target]
+	targetObservation.ProcessUp = false
+	targetObservation.ProcessReady = false
+	targetObservation.Ready = false
+	targetObservation.ControllerOwned = false
+	targetObservation.TrafficAccepting = false
+	runtime.observations[target] = targetObservation
+	previousObservation := runtime.observations[previous]
+	previousObservation.ProcessUp = true
+	previousObservation.ProcessReady = true
+	previousObservation.Ready = true
+	previousObservation.ControllerOwned = true
+	runtime.observations[previous] = previousObservation
 	if runtime.traffic == nil {
 		runtime.traffic = map[string]bool{}
 	}
-	runtime.traffic["blue"] = false
-	runtime.traffic["green"] = false
+	runtime.traffic[previous] = true
+	runtime.traffic[target] = false
 	return nil
 }
 
@@ -436,6 +451,26 @@ func TestManagerReconcilesControllerOnlyAfterFreshObservation(t *testing.T) {
 	}
 	if !runtime.traffic["blue"] {
 		t.Fatalf("controller maintenance sequence = %v", runtime.sequence)
+	}
+}
+
+func TestManagerWaitsForReadyAfterGrantBeforeTraffic(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", readyAfterGrant: true, enableRequiresReady: true, observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: false},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if err := manager.MaintainController(context.Background()); err != nil {
+		t.Fatalf("controller maintenance failed after waiting for readiness: %v; sequence=%v", err, runtime.sequence)
+	}
+	if !runtime.traffic["blue"] {
+		t.Fatalf("active traffic was not enabled after readiness: %v", runtime.sequence)
 	}
 }
 

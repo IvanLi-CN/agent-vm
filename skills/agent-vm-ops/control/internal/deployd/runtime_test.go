@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 )
 
 func TestAdminMetricsValidationUsesTopLevelObservationEpoch(t *testing.T) {
@@ -98,6 +100,31 @@ func TestProcessIdentityRequiresStartToken(t *testing.T) {
 	}
 	if sameProcess(processIdentity{PID: 42, StartTime: ""}, processIdentity{PID: 42, StartTime: ""}) {
 		t.Fatal("empty process start token matched another process")
+	}
+}
+
+func TestProcessStartTokenMatchesExactProcessInstance(t *testing.T) {
+	token := controllerrole.ProcessStartToken(os.Getpid())
+	if token == "" {
+		t.Skip("process start tokens are unavailable on this platform")
+	}
+	if !processStartTokenMatches(processIdentity{PID: int64(os.Getpid()), StartTime: token}) {
+		t.Fatal("current process start token did not match")
+	}
+	if processStartTokenMatches(processIdentity{PID: int64(os.Getpid()), StartTime: "stale"}) {
+		t.Fatal("stale process start token matched")
+	}
+}
+
+func TestActiveLinkStableRequiresSameSuccessfulRead(t *testing.T) {
+	if !activeLinkStable("blue", nil, "blue", nil) {
+		t.Fatal("unchanged active link was not considered stable")
+	}
+	if activeLinkStable("blue", nil, "green", nil) {
+		t.Fatal("active link change was considered stable")
+	}
+	if activeLinkStable("blue", nil, "blue", os.ErrNotExist) {
+		t.Fatal("failed final active link read was considered stable")
 	}
 }
 

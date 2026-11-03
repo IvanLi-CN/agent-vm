@@ -105,6 +105,7 @@ RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
 GO_CONTROL_PATH = Path("/opt/agent-vm-native/bin/agent-vm-control")
 GO_DEPLOYD_PATH = Path("/opt/agent-vm-native/bin/agent-vm-deployd")
 GO_DEPLOY_PATH = Path("/opt/agent-vm-native/bin/agent-vm-deploy")
+GO_SLOT_NAMES = ("blue", "green")
 GO_CONTROL_SOCKET = Path("/run/agent-vm-native/control.sock")
 STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
 LEGACY_EXPIRY_TIMER_RE = re.compile(r"^agent-vm-native-expire-[A-Za-z0-9_.:-]+\.timer$")
@@ -154,6 +155,35 @@ def _go_binary_target(config: Mapping[str, Any], canonical: Path) -> Path:
     if configured == CANONICAL_CONTROL_PATH:
         return canonical
     return configured.parent / "bin" / canonical.name
+
+
+def _go_slot_root(config: Mapping[str, Any], slot: str) -> Path:
+    if slot not in GO_SLOT_NAMES:
+        _fail("wrapper_config_invalid", "Go slot name is not fixed")
+    release_root = Path(config["release_root"])
+    # The production layout keeps release directories and slot directories as
+    # siblings under /var/lib/agent-vm-native. Test layouts use a conventional
+    # releases/ child, so retain the same sibling relationship there.
+    parent = release_root.parent if release_root.name == "releases" else release_root
+    return parent / "slots" / slot
+
+
+def _go_runtime_root(config: Mapping[str, Any]) -> Path:
+    return _go_slot_root(config, GO_SLOT_NAMES[0]).parent.parent
+
+
+def _verify_go_runtime_layout(config: Mapping[str, Any]) -> None:
+    """Require the protected active pointer before starting the Go runtime."""
+    active = _go_runtime_root(config) / "active"
+    if not active.is_symlink():
+        _fail("activation_unverified", "Go runtime active pointer is missing or is not a symlink")
+    try:
+        target = active.resolve(strict=True)
+    except OSError:
+        _fail("activation_unverified", "Go runtime active pointer target is unavailable")
+    allowed = {_go_slot_root(config, slot).resolve(strict=False) for slot in GO_SLOT_NAMES}
+    if target not in allowed:
+        _fail("activation_unverified", "Go runtime active pointer targets an unknown slot")
 
 
 def _go_bridge_target(config: Mapping[str, Any]) -> Path:
@@ -870,7 +900,14 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
         *(Path(config["control_path"]).with_name(name) for name in sorted(SUPPORT_ARTIFACT_NAMES)),
         Path(config["control_path"]).with_name(MANIFEST_NAME),
         Path(config["control_path"]).with_name("client-release.json"),
-    ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], *GO_RUNTIME_UNIT_NAMES, *PRODUCT_UNIT_NAMES)) + (
+    ) + tuple(Path(config["unit_dir"]) / name for name in (*config["unit_names"], *GO_RUNTIME_UNIT_NAMES, *PRODUCT_UNIT_NAMES)) + tuple(
+        target
+        for slot in GO_SLOT_NAMES
+        for target in (
+            _go_slot_root(config, slot) / "bin" / "agent-vm-control",
+            _go_slot_root(config, slot) / "release-manifest.json",
+        )
+    ) + (
         bundle_root / "systemd" / "agent-vm-native.service",
         bundle_root / "systemd" / "agent-vm-native@.service",
         bundle_root / "systemd" / "agent-vm-deployd.service",
@@ -1259,8 +1296,17 @@ def _unit_is_enabled(unit: str) -> bool:
     return process.returncode == 0
 
 
-def _activate_go_runtime(*, web_enabled: bool = False, deployd_enabled: bool = False) -> None:
+def _activate_go_runtime(
+    config: Mapping[str, Any] | None = None,
+    *,
+    web_enabled: bool = False,
+    deployd_enabled: bool = False,
+) -> None:
     """Retire legacy triggers, enable Go, and verify that it is active."""
+    if deployd_enabled:
+        if config is None:
+            _fail("activation_unverified", "Go blue-green activation requires wrapper configuration")
+        _verify_go_runtime_layout(config)
     if not web_enabled:
         _deactivate_web_runtime()
     for unit in (*GO_RETIRED_UNITS, *_legacy_expiry_timers()):
@@ -1271,6 +1317,11 @@ def _activate_go_runtime(*, web_enabled: bool = False, deployd_enabled: bool = F
         # legacy singleton enabled would create a third scheduler process.
         _systemctl("stop", "agent-vm-native.service", allow_missing=True)
         _systemctl("disable", "agent-vm-native.service", allow_missing=True)
+        for slot in GO_SLOT_NAMES:
+            unit = f"agent-vm-native@{slot}.service"
+            _systemctl("enable", unit)
+            _systemctl("restart", unit)
+            _systemctl("is-active", unit)
         _systemctl("enable", "agent-vm-deployd.service")
         _systemctl("restart", "agent-vm-deployd.service")
         _systemctl("is-active", "agent-vm-deployd.service")
@@ -1311,7 +1362,7 @@ def _activate_legacy_runtime() -> None:
         _systemctl("enable", unit, allow_missing=True)
 
 
-def _restore_runtime_for_release(current: Path | None, record: Mapping[str, Any]) -> None:
+def _restore_runtime_for_release(config: Mapping[str, Any], current: Path | None, record: Mapping[str, Any]) -> None:
     """Make the runtime match the release selected by restored pointers."""
     if current is None:
         _systemctl("stop", "agent-vm-native.service", allow_missing=True)
@@ -1329,7 +1380,7 @@ def _restore_runtime_for_release(current: Path | None, record: Mapping[str, Any]
             web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
         )
     elif _is_go_manifest(manifest):
-        _activate_go_runtime(deployd_enabled=True)
+        _activate_go_runtime(config, deployd_enabled=True)
     else:
         _activate_legacy_runtime()
 
@@ -1550,6 +1601,12 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
     manifest_source = release_root / MANIFEST_NAME
     _require_owned_regular(manifest_source, owner_uid, 0o644)
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
+    slot_binary = release_root / "bin" / "agent-vm-control"
+    _require_owned_regular(slot_binary, owner_uid, 0o755)
+    for slot in GO_SLOT_NAMES:
+        slot_root = _go_slot_root(config, slot)
+        _copy_atomic(slot_binary, slot_root / "bin" / "agent-vm-control", owner_uid, 0o755)
+        _copy_atomic(manifest_source, slot_root / "release-manifest.json", owner_uid, 0o644)
     client_sidecar = release_root / "client-release.json"
     _require_owned_regular(client_sidecar, owner_uid, 0o644)
     _copy_atomic(client_sidecar, Path(config["control_path"]).with_name("client-release.json"), owner_uid, 0o644)
@@ -1656,7 +1713,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             _write_json(activation_path, record)
         elif _is_go_manifest(manifest):
             runtime_switch_attempted = True
-            _activate_go_runtime(deployd_enabled=True)
+            _activate_go_runtime(config, deployd_enabled=True)
             record["activation_phase"] = "runtime-switched"
             _write_json(activation_path, record)
         record["activated"] = True
@@ -1721,7 +1778,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
                             web_was_enabled=snapshot if isinstance(snapshot, bool) else None,
                         )
                     elif _is_go_manifest(old_manifest):
-                        _activate_go_runtime(deployd_enabled=True)
+                        _activate_go_runtime(config, deployd_enabled=True)
                     else:
                         _activate_legacy_runtime()
             except (WrapperError, ManifestError) as runtime_error:
@@ -1847,7 +1904,7 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         if _is_product_manifest(previous_manifest):
             _activate_product_runtime(previous_manifest)
         elif _is_go_manifest(previous_manifest):
-            _activate_go_runtime(deployd_enabled=True)
+            _activate_go_runtime(config, deployd_enabled=True)
         else:
             _activate_legacy_runtime()
     except WrapperError as failure:
@@ -1870,7 +1927,7 @@ def _rollback_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
             )
         if restore_error is None:
             try:
-                _restore_runtime_for_release(actual_current, record)
+                _restore_runtime_for_release(config, actual_current, record)
             except (WrapperError, ManifestError) as runtime_error:
                 failure = WrapperError(
                     "activation_restore_failed",

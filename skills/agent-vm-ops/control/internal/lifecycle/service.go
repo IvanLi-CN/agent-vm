@@ -98,6 +98,7 @@ type Service struct {
 	ready             bool
 	wake              func()
 	mutationGate      func() bool
+	mutationChanges   func() <-chan struct{}
 	trafficAccepting  atomic.Bool
 }
 
@@ -206,11 +207,70 @@ func (s *Service) SetMutationGate(gate func() bool) {
 	s.mu.Unlock()
 }
 
+// SetMutationFence supplies the lease-change notification used to cancel a
+// native mutation that is still in flight when the controller role changes.
+func (s *Service) SetMutationFence(changes func() <-chan struct{}) {
+	s.mu.Lock()
+	s.mutationChanges = changes
+	s.mu.Unlock()
+}
+
 func (s *Service) mutationAllowed() bool {
 	s.mu.RLock()
 	gate := s.mutationGate
 	s.mu.RUnlock()
 	return gate == nil || gate()
+}
+
+func (s *Service) mutationContext(ctx context.Context) (context.Context, func(), func() bool) {
+	s.mu.RLock()
+	gate := s.mutationGate
+	changes := s.mutationChanges
+	s.mu.RUnlock()
+	if gate == nil && changes == nil {
+		return ctx, func() {}, func() bool { return false }
+	}
+	fencedContext, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	var lost atomic.Bool
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			var changed <-chan struct{}
+			if changes != nil {
+				changed = changes()
+			}
+			select {
+			case <-fencedContext.Done():
+				return
+			case <-changed:
+				lost.Store(true)
+				cancel()
+				return
+			case <-ticker.C:
+				if gate != nil && !gate() {
+					lost.Store(true)
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	stop := func() {
+		cancel()
+		<-done
+	}
+	return fencedContext, stop, lost.Load
+}
+
+func controllerLeaseLostError(cause error) error {
+	detail := map[string]any{"outcome_verified": false, "phase": "controller-lease"}
+	if cause != nil {
+		detail["cause"] = cause.Error()
+	}
+	return protocol.NewError("state_unverified", "controller lease was lost during mutation", detail)
 }
 
 func (s *Service) SetTrafficAccepting(value bool) {
@@ -1157,10 +1217,19 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		ctx = native.WithWorkerRecorder(ctx, operationID, s)
 	}
 	dispatchCtx := ctx
+	stopMutationWatch := func() {}
+	mutationLost := func() bool { return false }
+	if write && !leaseExempt {
+		dispatchCtx, stopMutationWatch, mutationLost = s.mutationContext(ctx)
+		defer stopMutationWatch()
+	}
 	if isReleaseCleanupAction(action) {
-		dispatchCtx = withInternalCleanup(ctx)
+		dispatchCtx = withInternalCleanup(dispatchCtx)
 	}
 	result, err := s.dispatchAction(dispatchCtx, action, request)
+	if write && !leaseExempt && (mutationLost() || !s.mutationAllowed()) {
+		err = controllerLeaseLostError(err)
+	}
 	if err != nil {
 		if s.Snapshots != nil {
 			_ = s.publishSnapshotFailure(action, err)
@@ -1179,6 +1248,9 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	}
 	response := protocol.SuccessWithRelease(request, result, s.Release, warnings)
 	if write {
+		if !leaseExempt && (mutationLost() || !s.mutationAllowed()) {
+			return nil, controllerLeaseLostError(nil)
+		}
 		operationID := stringValue(request["operation_id"])
 		digest, _ := protocol.Digest(request)
 		response["_request_digest"] = digest

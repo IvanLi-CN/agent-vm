@@ -89,9 +89,11 @@ func (metrics *Metrics) Render() string {
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_selected{slot=%s} %d\n", quote(slot), boolInt(metrics.latest.ActiveSlot == slot)))
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_controller_owned{slot=%s} %d\n", quote(slot), boolInt(observation.ControllerOwned)))
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_traffic_accepting{slot=%s} %d\n", quote(slot), boolInt(observation.TrafficAccepting)))
-		output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_in_flight_requests{slot=%s} %d\n", quote(slot), observation.InFlightRequests))
-		output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_pending_operations{slot=%s} %d\n", quote(slot), observation.PendingOperations))
-		output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_native_workers{slot=%s} %d\n", quote(slot), observation.NativeWorkers))
+		if observation.CountersKnown {
+			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_in_flight_requests{slot=%s} %d\n", quote(slot), observation.InFlightRequests))
+			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_pending_operations{slot=%s} %d\n", quote(slot), observation.PendingOperations))
+			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_native_workers{slot=%s} %d\n", quote(slot), observation.NativeWorkers))
+		}
 		for _, family := range sortedFamilies(observation.MetricFamilies) {
 			output.WriteString(withSlotLabel(observation.MetricFamilies[family], slot))
 		}

@@ -32,7 +32,7 @@ runtime_units=(
 )
 
 fail() {
-  echo "deployd systemd acceptance: $*" >&2
+  echo "Deployd systemd adapter acceptance: $*" >&2
   exit 1
 }
 
@@ -120,7 +120,7 @@ restore_environment() {
       restore_status=1
     fi
   else
-    echo "deployd systemd acceptance: refusing filesystem restore while a managed unit remains active" >&2
+    echo "Deployd systemd adapter acceptance: refusing filesystem restore while a managed unit remains active" >&2
   fi
   if [[ "$restore_status" -ne 0 || "$main_status" -ne 0 ]]; then
     keep_proof=1
@@ -197,6 +197,10 @@ bun run "$repository_root/skills/agent-vm-ops/scripts/build_go_release.ts" \
 bundle_root="$test_root/bundle"
 mkdir -p -- "$bundle_root"
 tar -xf "$build_bundle" -C "$bundle_root"
+real_control_binary="$test_root/real-agent-vm-control"
+cp -- "$bundle_root/bin/agent-vm-control" "$real_control_binary"
+chmod 0755 "$real_control_binary"
+"$real_control_binary" version >/dev/null || fail "the real agent-vm-control binary did not pass its version smoke test"
 cp -- "$fake_slot" "$bundle_root/bin/agent-vm-control"
 chmod 0755 "$bundle_root/bin/agent-vm-control"
 python3 - "$bundle_root/release-manifest.json" "$bundle_root/bin/agent-vm-control" <<'PY'
@@ -440,4 +444,4 @@ grep -Fq 'agent_vm_deployd_recovery_required 1' <<<"$recovery_metrics" || fail "
 status_json="$(/opt/agent-vm-native/bin/agent-vm-deploy status --json)"
 assert_status "$status_json" green blue
 
-printf '{"schema_version":1,"verdict":"pass","systemd":"real","slots":"dual-process-and-uds","switch":"green","restart_recovery":"needs_recovery-and-bounded-rollback","metrics":"single-deployd-endpoint"}\n'
+printf '{"schema_version":1,"verdict":"pass","systemd":"real","slot_runtime":"testslot-adapter","real_control_binary":"version-smoke-passed","slots":"dual-process-and-uds","switch":"green","restart_recovery":"needs_recovery-and-bounded-rollback","metrics":"single-deployd-endpoint"}\n'

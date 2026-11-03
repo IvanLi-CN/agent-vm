@@ -136,12 +136,22 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		}
 		metrics, metricsAt, metricsErr := runtime.observeSource(ctx, slot, "capacity", "admin-metrics")
 		if metricsErr == nil {
-			runtime.rememberMetrics(slot, "capacity", observe.MetricsForSnapshot("capacity", metrics))
-			observation.InFlightRequests, _ = integerValue(metrics["in_flight_operations"])
-			observation.PendingOperations, _ = arrayLengthValue(metrics["pending_operations"])
-			observation.NativeWorkers = nativeWorkerCount(metrics["pending_operations"])
-			observation.StateEpoch, _ = metrics["observation_epoch"].(string)
-			sourceTimes["native_observation"] = minTime(sourceTimes["native_observation"], metricsAt)
+			inFlight, inFlightOK := integerValue(metrics["in_flight_operations"])
+			pending, pendingOK := arrayLengthValue(metrics["pending_operations"])
+			stateEpoch, epochOK := metrics["observation_epoch"].(string)
+			if !inFlightOK || !pendingOK || !epochOK || stateEpoch == "" {
+				nativeObservationUp = false
+				runtime.invalidateMetrics(slot, "capacity")
+				snapshot.Consistent = false
+			} else {
+				runtime.rememberMetrics(slot, "capacity", observe.MetricsForSnapshot("capacity", metrics))
+				observation.CountersKnown = true
+				observation.InFlightRequests = inFlight
+				observation.PendingOperations = pending
+				observation.NativeWorkers = nativeWorkerCount(metrics["pending_operations"])
+				observation.StateEpoch = stateEpoch
+				sourceTimes["native_observation"] = minTime(sourceTimes["native_observation"], metricsAt)
+			}
 		} else {
 			nativeObservationUp = false
 			runtime.invalidateMetrics(slot, "capacity")
@@ -197,6 +207,17 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		}
 		observation.MetricFamilies = runtime.slotMetrics(slot)
 		snapshot.Slots[slot] = observation
+	}
+	endActive, endActiveErr := runtime.activeSlot()
+	if !activeLinkStable(active, activeErr, endActive, endActiveErr) {
+		snapshot.Consistent = false
+		if endActiveErr != nil {
+			snapshot.ActiveSlot = "unknown"
+			setSource("active_link", now, false, endActiveErr)
+		} else {
+			snapshot.ActiveSlot = endActive
+			setSource("active_link", now, false, errors.New("active link changed during observation"))
+		}
 	}
 	controllerCount := 0
 	for slot, observation := range snapshot.Slots {
@@ -1351,6 +1372,9 @@ func (runtime *HostRuntime) systemdProcessMatches(ctx context.Context, slot stri
 	if err != nil || mainPID <= 0 || mainPID != identity.PID {
 		return errors.New("systemd main process does not match slot health")
 	}
+	if !processStartTokenMatches(identity) {
+		return errors.New("systemd process start token does not match slot health")
+	}
 	if filepath.Clean(properties["FragmentPath"]) != "/etc/systemd/system/agent-vm-native@.service" {
 		return errors.New("systemd unit template is not the native slot unit")
 	}
@@ -1365,6 +1389,17 @@ func (runtime *HostRuntime) systemdProcessMatches(ctx context.Context, slot stri
 		return errors.New("systemd executable does not match the native slot")
 	}
 	return nil
+}
+
+func processStartTokenMatches(identity processIdentity) bool {
+	if identity.PID <= 0 || identity.StartTime == "" {
+		return false
+	}
+	return controllerrole.ProcessStartToken(int(identity.PID)) == identity.StartTime
+}
+
+func activeLinkStable(start string, startErr error, end string, endErr error) bool {
+	return startErr == nil && endErr == nil && start != "" && start == end
 }
 
 func (runtime *HostRuntime) systemdSlotStopped(ctx context.Context, slot string) bool {
