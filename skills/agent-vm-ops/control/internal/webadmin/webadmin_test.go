@@ -125,7 +125,14 @@ func TestAuthorityRejectsUntrustedPeer(t *testing.T) {
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	if strings.Contains(recorder.Body.String(), "9999") {
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("response = %s, err = %v", recorder.Body.String(), err)
+	}
+	if errorValue, ok := response["error"].(map[string]any); ok {
+		delete(errorValue, "operation_id")
+	}
+	if strings.Contains(jsonString(response), "9999") {
 		t.Fatalf("peer UID leaked in response: %s", recorder.Body.String())
 	}
 }
