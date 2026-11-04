@@ -105,3 +105,26 @@ func TestMetricsMarkComposedSnapshotStaleWhenASourceFails(t *testing.T) {
 		t.Fatal("failed source was exposed as a fresh composed snapshot")
 	}
 }
+
+func TestMetricsRetainCapacityFamiliesWhenInventoryFails(t *testing.T) {
+	now := time.Now().UTC()
+	sources := map[string]SourceObservation{}
+	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation"} {
+		sources[name] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
+	}
+	sources["inventory_observation"] = SourceObservation{Up: false, ObservedAt: now, FreshUntil: now.Add(time.Minute), Error: "observation unavailable"}
+	metrics := NewMetrics(nil)
+	metrics.Set(RuntimeSnapshot{
+		ObservedAt: now, FreshUntil: now.Add(time.Minute), Consistent: false, ActiveSlot: "blue", Sources: sources,
+		Slots: map[string]SlotObservation{
+			"blue": {CountersKnown: true, InFlightRequests: 2, PendingOperations: 3, NativeWorkers: 1, MetricFamilies: map[string]string{"capacity": "agent_vm_capacity 1\n"}},
+		},
+	})
+	text := metrics.Render()
+	if !strings.Contains(text, `agent_vm_deployd_slot_in_flight_requests{slot="blue"} 2`) || !strings.Contains(text, `agent_vm_capacity{slot="blue"} 1`) {
+		t.Fatalf("capacity metrics were removed with failed inventory observation:\n%s", text)
+	}
+	if strings.Contains(text, `agent_vm_deployd_active_slot{slot="blue"}`) {
+		t.Fatal("stale composed active-slot state was exposed")
+	}
+}
