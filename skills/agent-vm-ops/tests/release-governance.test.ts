@@ -106,6 +106,13 @@ test("release preflight is fail-closed and accepts the exact Main gate matrix", 
     { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } },
   ]); } catch { mixedSuiteRejected = true; }
   if (!mixedSuiteRejected) throw new Error("Main gates from different check suites were accepted");
+  const rerunGate = successfulMainGate([
+    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 4, completed_at: "2026-11-05T00:05:00Z", check_suite: { id: 101, updated_at: "2026-11-05T00:06:00Z" }, app: { slug: "github-actions" } },
+    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 3, completed_at: "2026-11-05T00:04:00Z", check_suite: { id: 101, updated_at: "2026-11-05T00:06:00Z" }, app: { slug: "github-actions" } },
+    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, completed_at: "2026-11-04T00:05:00Z", check_suite: { id: 100, updated_at: "2026-11-04T00:06:00Z" }, app: { slug: "github-actions" } },
+    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, completed_at: "2026-11-04T00:04:00Z", check_suite: { id: 100, updated_at: "2026-11-04T00:06:00Z" }, app: { slug: "github-actions" } },
+  ]);
+  if (rerunGate.id !== "3,4") throw new Error(`latest Main gate rerun was not selected: ${rerunGate.id}`);
 });
 
 test("GitHub state refs are append-only and preserve the original identity", async () => {

@@ -143,7 +143,9 @@ paths:
       operationId: getManagementSession
       security:
         - browserSession: []
+      x-required-capabilities: [read]
       summary: Bootstrap the browser session and return its administrator context
+      description: Requires an authenticated administrator browser session with the `read` capability; without it, the management session cannot bootstrap protected reads.
       responses:
         "200":
           description: Authenticated administrator context and CSRF token. The SPA must bootstrap this endpoint before showing administrator identity, capabilities or managed resources; authentication_required and csrf_invalid suspend subsequent queries and mutations until explicit reauthentication.

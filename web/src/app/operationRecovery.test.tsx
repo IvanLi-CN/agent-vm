@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Operation } from "./types";
 
@@ -54,6 +55,16 @@ describe("operation recovery", () => {
 
     await waitFor(() => expect(getOperationMock).toHaveBeenCalledWith(operation.operation_id));
     await waitFor(() => expect(screen.getByTestId("recovery-state")).toHaveTextContent("resolved"));
+  });
+
+  it("reconciles an operation when StrictMode replays the effect", async () => {
+    writeOperationRecovery("/vms", operation.operation_id);
+    getOperationMock.mockResolvedValue(operation);
+
+    render(<StrictMode><Probe /></StrictMode>);
+
+    await waitFor(() => expect(screen.getByTestId("recovery-state")).toHaveTextContent("resolved"));
+    expect(getOperationMock).toHaveBeenCalledWith(operation.operation_id);
   });
 
   it("does not query a newly created operation until a later remount", async () => {

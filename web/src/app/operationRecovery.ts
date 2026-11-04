@@ -132,6 +132,9 @@ export function useOperationRecovery(path: string, enabled = true): [string | nu
     });
     return () => {
       active = false;
+      // React StrictMode replays effects after cleanup. Re-arm the lookup so
+      // the replay cannot leave the recovery state stuck at "checking".
+      if (operationId) shouldReconcile.current = true;
     };
   }, [enabled, operationId, retryCount]);
 

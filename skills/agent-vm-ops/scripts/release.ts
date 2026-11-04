@@ -88,13 +88,33 @@ export function assertPlatformPreconditions(root = repositoryRoot): void {
 export function successfulMainGate(value: unknown): { id: string } {
   if (!Array.isArray(value)) throw new Error("GitHub check-runs response is invalid");
   const namedChecks = value.filter((item: any) => releaseGateNames.includes(item?.name));
-  const checks = new Map(namedChecks.map((item: any) => [item.name, item]));
-  const suiteIds = new Set(namedChecks.map((item: any) => item?.check_suite?.id).filter((id: unknown): id is string | number => typeof id === "string" || typeof id === "number"));
-  if (namedChecks.length !== releaseGateNames.length || checks.size !== releaseGateNames.length || suiteIds.size !== 1 || [...checks.values()].some((item: any) => item.status !== "completed" || item.conclusion !== "success" || item.app?.slug !== "github-actions")) {
-    throw new Error("the required Main gate matrix has not completed successfully for the source commit");
+  const suites = new Map<string, any[]>();
+  for (const item of namedChecks) {
+    const suiteId = item?.check_suite?.id;
+    if (typeof suiteId !== "string" && typeof suiteId !== "number") continue;
+    const key = String(suiteId);
+    suites.set(key, [...(suites.get(key) ?? []), item]);
   }
-  if (value.some((item: any) => releaseGateNames.includes(item?.name) && item.app?.slug !== "github-actions")) {
-    throw new Error("the required Main gate matrix is not owned by GitHub Actions");
+  const timestamp = (item: any): number => {
+    const values = [item?.check_suite?.updated_at, item?.completed_at, item?.updated_at, item?.started_at, item?.check_suite?.created_at]
+      .map((value) => typeof value === "string" ? Date.parse(value) : Number.NaN)
+      .filter((value) => Number.isFinite(value));
+    if (values.length) return Math.max(...values);
+    const suiteId = Number(item?.check_suite?.id);
+    return Number.isFinite(suiteId) ? suiteId : 0;
+  };
+  const latestSuite = [...suites.entries()].sort((left, right) => {
+    const leftTimestamp = Math.max(...left[1].map(timestamp));
+    const rightTimestamp = Math.max(...right[1].map(timestamp));
+    return rightTimestamp - leftTimestamp || right[0].localeCompare(left[0], undefined, { numeric: true });
+  })[0]?.[1] ?? [];
+  const checks = new Map<string, any>();
+  for (const item of latestSuite) {
+    const existing = checks.get(item.name);
+    if (!existing || timestamp(item) >= timestamp(existing)) checks.set(item.name, item);
+  }
+  if (checks.size !== releaseGateNames.length || [...checks.values()].some((item: any) => item.status !== "completed" || item.conclusion !== "success" || item.app?.slug !== "github-actions")) {
+    throw new Error("the required Main gate matrix has not completed successfully for the source commit");
   }
   return { id: releaseGateNames.map((name) => String(checks.get(name)?.id ?? name)).sort().join(",") };
 }
@@ -328,6 +348,9 @@ async function main(): Promise<void> {
   if (operation === "release") return release();
   const version = requireOption("--reservation");
   if (operation === "abandon") {
+    if (process.env.GITHUB_ACTIONS === "true") {
+      assertWorkflowPlatformAttestation(process.env.GITHUB_REF, process.env.RELEASE_REF_PROTECTED);
+    }
     const adapter = new GhGithubAdapter();
     const event = await stateStore(adapter).abandon(version, "manual release recovery abandon");
     console.log(JSON.stringify({ stage: event.stage, version }));
