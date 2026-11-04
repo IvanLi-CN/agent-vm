@@ -194,13 +194,15 @@ def _verify_go_runtime_layout(config: Mapping[str, Any]) -> None:
 
 
 def _prepare_initial_go_runtime_layout(config: Mapping[str, Any]) -> bool:
-    """Allow only the legacy-to-blue-green bootstrap to start without active."""
+    """Allow a legacy or clean-install bootstrap to start without active."""
     active = _go_runtime_root(config) / "active"
     if active.is_symlink() or active.exists():
         _verify_go_runtime_layout(config)
         return False
-    if not Path(STATE_DB_PATH).is_file() and _read_migration_marker(config) is None:
-        _fail("activation_unverified", "Go runtime active pointer is missing and neither legacy SQLite nor migration evidence is present")
+    _read_migration_marker(config)
+    # A clean reinstall has no legacy SQLite yet. The first activation starts
+    # the fixed legacy singleton, which creates an empty source database, and
+    # then lets Deployd migrate that fresh state under its temporary lease.
     for slot in GO_SLOT_NAMES:
         if not _go_slot_root(config, slot).is_dir():
             _fail("activation_unverified", f"initial Go slot directory is missing: {slot}")
@@ -1519,6 +1521,13 @@ def _activate_go_runtime(
         _systemctl("stop", unit, allow_missing=True)
         _systemctl("disable", unit, allow_missing=True)
     if deployd_enabled:
+        if bootstrap_active and not _migration_marker_is_valid(config):
+            # The legacy singleton is the migration source on a clean first
+            # activation. Its controller lease is granted by Deployd before
+            # drain-enter; it is stopped before either slot is started.
+            _systemctl("enable", "agent-vm-native.service")
+            _systemctl("restart", "agent-vm-native.service")
+            _systemctl("is-active", "agent-vm-native.service")
         migration_started = False
         migration_completed = False
         try:

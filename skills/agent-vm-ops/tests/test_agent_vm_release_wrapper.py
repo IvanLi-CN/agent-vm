@@ -380,7 +380,15 @@ class WrapperTests(unittest.TestCase):
         migration_index = next(index for index, command in enumerate(commands) if command[0] == str(WRAPPER.GO_DEPLOY_PATH) and command[1] == "migrate")
         slot_index = next(index for index, command in enumerate(commands) if command == ["systemctl", "restart", "agent-vm-native@blue.service"])
         self.assertLess(migration_index, slot_index)
+        self.assertIn(["systemctl", "restart", "agent-vm-native.service"], commands)
         self.assertTrue((runtime_root / "active").is_symlink())
+
+    def test_clean_go_runtime_allows_bootstrap_without_legacy_sqlite(self):
+        runtime_root = WRAPPER._go_runtime_root(self.loaded)
+        for slot in WRAPPER.GO_SLOT_NAMES:
+            (runtime_root / "slots" / slot).mkdir(parents=True)
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", runtime_root / "state.sqlite3"):
+            self.assertTrue(WRAPPER._prepare_initial_go_runtime_layout(self.loaded))
 
     def test_migration_marker_without_finalized_transaction_keeps_runtime_fenced(self):
         marker_path = WRAPPER._migration_marker_path(self.loaded)

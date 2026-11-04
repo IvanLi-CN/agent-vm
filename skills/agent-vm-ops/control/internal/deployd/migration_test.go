@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd/store"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
@@ -33,6 +34,11 @@ func (runtime *fakeMigrationRuntime) PreflightMigration(context.Context) error {
 
 func (runtime *fakeMigrationRuntime) StartStateAuthority(context.Context) error {
 	runtime.calls = append(runtime.calls, "start-authority")
+	return nil
+}
+
+func (runtime *fakeMigrationRuntime) GrantLegacyController(context.Context, controllerrole.Lease) error {
+	runtime.calls = append(runtime.calls, "grant-legacy-controller")
 	return nil
 }
 
@@ -127,7 +133,7 @@ func TestMigrationIsOneDurableDeploydTransaction(t *testing.T) {
 	if transaction == nil || transaction.Phase != PhaseFinalize || transaction.State != "finalized" {
 		t.Fatalf("final migration transaction = %#v", transaction)
 	}
-	for _, expected := range []string{"preflight", "start-authority", "enter-fence", "quiesce", "stop-legacy", "verify-stopped", "verify-writers", "prepare-source", "import", "finalize-source"} {
+	for _, expected := range []string{"preflight", "start-authority", "grant-legacy-controller", "enter-fence", "quiesce", "stop-legacy", "verify-stopped", "verify-writers", "prepare-source", "import", "finalize-source"} {
 		if !containsString(migration.calls, expected) {
 			t.Fatalf("migration call %q missing: %#v", expected, migration.calls)
 		}

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd/store"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
@@ -41,6 +42,7 @@ type MigrationRuntime interface {
 	MigrationComplete(context.Context) (bool, error)
 	PreflightMigration(context.Context) error
 	StartStateAuthority(context.Context) error
+	GrantLegacyController(context.Context, controllerrole.Lease) error
 	EnterLegacyFence(context.Context, string) error
 	WaitLegacyQuiescence(context.Context) (MigrationQuiescence, error)
 	StopLegacy(context.Context) error
@@ -135,7 +137,21 @@ func (manager *Manager) Migrate(ctx context.Context) (*store.Transaction, error)
 	if err := manager.Migration.StartStateAuthority(ctx); err != nil {
 		return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationPrepare, err, false)
 	}
-	if err := manager.transitionMigration(ctx, transaction.ID, PhaseMigrationPrepare, PhaseMigrationDrain, "state_authority_ready", nil); err != nil {
+	legacyLease, err := manager.newLease(ctx, "blue", transaction.Generation)
+	if err != nil {
+		return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationPrepare, fmt.Errorf("allocate legacy migration controller lease: %w", err), false)
+	}
+	// The legacy singleton is subject to the same lease gate as a normal slot.
+	// Granting this short-lived lease is the only migration-specific exception;
+	// the lease is revoked implicitly when the legacy service is stopped before
+	// the rqlite-backed blue/green slots are started.
+	if err := manager.Migration.GrantLegacyController(ctx, legacyLease); err != nil {
+		return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationPrepare, fmt.Errorf("grant legacy migration controller lease: %w", err), true)
+	}
+	if err := manager.transitionMigration(ctx, transaction.ID, PhaseMigrationPrepare, PhaseMigrationDrain, "state_authority_ready", map[string]any{
+		"legacy_controller_lease_id": legacyLease.LeaseID,
+		"legacy_controller_term":     legacyLease.Term,
+	}); err != nil {
 		return nil, err
 	}
 	if err := manager.Migration.EnterLegacyFence(ctx, transaction.ID); err != nil {

@@ -143,6 +143,13 @@ Deployd 只有在标记、当前 rqlite 目标摘要和仍然保留的唯一 fin
 旧服务的 Bun 入口在创建 SQLite store 前也必须取得同一把排他的 `authority.lock`，因此它在这把锁被 Deployd 持有时不能重新打开数据库。
 旧服务在这把锁释放前重新启动会使迁移失败闭锁，不会继续启动槽位。
 
+迁移开始前，Deployd 会为仍作为 SQLite writer 的 legacy singleton 临时授予
+蓝槽位 controller lease，然后才执行 `drain-enter`。这个 lease 只用于通过
+旧服务已有的写入围栏，不授予流量角色，也不把 legacy singleton 纳入正常的
+双槽位运行；迁移停止 legacy singleton 后，该 lease 随进程消失，发布器才会
+启动蓝、绿两个 rqlite 槽位。全新安装时，legacy SQLite 由本次安装创建，若无
+旧业务数据，它只承载空状态初始化，不会读取或恢复故障硬盘上的旧数据。
+
 只有 writer 检查通过后，Deployd 才使用 SQLite 自己的 `VACUUM INTO` 创建一致 snapshot，并记录 source hash、大小、state epoch、fence ID 和验证时间。
 迁移预算按 SQLite 主库、WAL、SHM 和恢复目录中已登记的 snapshot 文件累计计算，累计上限为 1 GiB；
 没有人为设定的体积下限，空的小数据库也必须按实际大小处理。

@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 	"golang.org/x/sys/unix"
@@ -181,6 +182,26 @@ func (runtime *HostRuntime) StartStateAuthority(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+func (runtime *HostRuntime) GrantLegacyController(ctx context.Context, lease controllerrole.Lease) error {
+	if lease.Slot != "blue" {
+		return errors.New("legacy migration controller lease must target the blue slot")
+	}
+	body, status, err := runtime.slotRequest(ctx, runtime.Config.Migration.LegacySocket, http.MethodPost, "/internal/v1/controller-role", map[string]any{
+		"action": "grant",
+		"lease":  lease,
+	})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK || !responseOK(body) {
+		return fmt.Errorf("legacy service rejected migration controller lease with HTTP %d", status)
+	}
+	if valid, ok := body["valid"].(bool); !ok || !valid {
+		return errors.New("legacy service did not confirm the migration controller lease")
+	}
+	return nil
 }
 
 func (runtime *HostRuntime) EnterLegacyFence(ctx context.Context, owner string) error {

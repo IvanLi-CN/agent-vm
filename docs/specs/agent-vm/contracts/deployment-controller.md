@@ -292,6 +292,12 @@ Deployd 在同一个 durable transaction 中启动 rqlite、让旧服务进入�
 旧服务的 Bun 入口必须在创建 SQLite store 前取得同一把排他的 `authority.lock`；
 如果旧服务在停止后重新启动并竞争这把锁，Deployd 只会闭锁，不会把竞态当成迁移成功。
 
+在 `migration_drain` 之前，Deployd 必须为仍运行的 legacy singleton 授予一枚
+短期蓝槽位 controller lease，随后才允许 legacy 的 `drain-enter` 通过其写入
+围栏。该 lease 只服务于首次迁移，不启用 legacy 流量，也不构成第三个长期运行
+的 scheduler；legacy 停止后 lease 失效，发布器才启动双槽位。全新安装没有旧
+业务数据时，legacy SQLite 只是本次安装生成的空状态输入，不能指向或恢复旧盘。
+
 迁移事务的阶段依次为 `migration_prepare`、`migration_drain`、`migration_quiescence`、`migration_stop`、`migration_source_check`、`migration_import` 和 `migration_finalize`。
 迁移成功后发布器才创建初始 `active -> slots/blue` 链接并启动蓝、绿槽位；
 普通 `stage`、`activate` 和 `rollback` 不再执行这条路径，也不替换业务数据库。
