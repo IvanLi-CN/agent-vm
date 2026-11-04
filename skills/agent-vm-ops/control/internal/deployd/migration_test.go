@@ -206,7 +206,7 @@ func TestAutomaticMigrationRetryIsPersistentlyBounded(t *testing.T) {
 		t.Fatalf("failed retry error = %v", err)
 	}
 	active, err = database.ListActive(context.Background())
-	if err != nil || len(active) != 1 || active[0].MigrationRetryCount != 1 {
+	if err != nil || len(active) != 1 || active[0].MigrationRetryCount != 1 || active[0].MigrationRetryState != "exhausted" {
 		t.Fatalf("retry consumption was not durable: %#v, err=%v", active, err)
 	}
 	migration.failRetry = false

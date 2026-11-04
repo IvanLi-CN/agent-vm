@@ -448,8 +448,12 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 		if err != nil {
 			return nil, manager.migrationFailure(ctx, transaction.ID, transaction.Phase, err, true)
 		}
-		result, err := manager.Migration.RetryMigration(ctx, transaction.ID, expectedEvidence, transaction.Phase == PhaseMigrationStop && !evidencePresent)
+		allowResnapshot := (transaction.Phase == PhaseMigrationStop || transaction.Phase == PhaseMigrationSourceCheck) && !evidencePresent
+		result, err := manager.Migration.RetryMigration(ctx, transaction.ID, expectedEvidence, allowResnapshot)
 		if err != nil {
+			if markErr := manager.Store.FailMigrationRetry(ctx, transaction.ID, manager.Clock().UTC()); markErr != nil {
+				return nil, &UncertainError{Cause: fmt.Errorf("migration retry failed and retry state could not be finalized: %v; %w", err, markErr)}
+			}
 			return nil, &UncertainError{Cause: err}
 		}
 		updated, err := manager.Store.Transition(ctx, transaction.ID, transaction.Phase, PhaseMigrationFinalize, stateForPhase(PhaseMigrationFinalize), "recovery_import_verified", "deployd", map[string]any{

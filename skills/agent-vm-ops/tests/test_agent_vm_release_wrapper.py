@@ -401,6 +401,41 @@ class WrapperTests(unittest.TestCase):
                 WRAPPER._run_initial_state_migration(self.loaded)
         self.assertEqual(failure.exception.code, "activation_unverified")
 
+    def test_migration_preflight_failure_without_transaction_is_not_recovery(self):
+        def run(command, *args, **kwargs):
+            if command and command[0] == str(WRAPPER.GO_DEPLOY_PATH):
+                if command[1] == "migrate":
+                    return subprocess.CompletedProcess(command, 1, b"", b"preflight failed")
+                if command[1] == "status":
+                    return subprocess.CompletedProcess(command, 0, json.dumps({"value": {"transactions": []}}).encode(), b"")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with mock.patch.object(WRAPPER.subprocess, "run", side_effect=run):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._run_initial_state_migration(self.loaded)
+        self.assertEqual(failure.exception.code, "activation_failed")
+
+    def test_migration_recovery_failure_keeps_the_migration_fence_code(self):
+        def run(command, *args, **kwargs):
+            if command and command[0] == str(WRAPPER.GO_DEPLOY_PATH):
+                if command[1] == "migrate":
+                    return subprocess.CompletedProcess(command, 1, b"", b"migration failed")
+                if command[1] == "status":
+                    return subprocess.CompletedProcess(command, 0, json.dumps({"value": {"transactions": [{
+                        "transaction_id": "migration-1",
+                        "target_slot": "state",
+                        "state": "needs_recovery",
+                    }]}}).encode(), b"")
+                if command[1] == "recover":
+                    return subprocess.CompletedProcess(command, 1, b"", b"recovery failed")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with mock.patch.object(WRAPPER.subprocess, "run", side_effect=run):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._run_initial_state_migration(self.loaded)
+        self.assertEqual(failure.exception.code, "migration_recovery_required")
+        self.assertEqual(failure.exception.detail["transaction_id"], "migration-1")
+
     def test_completed_migration_can_bootstrap_without_legacy_sqlite(self):
         runtime_root = WRAPPER._go_runtime_root(self.loaded)
         for slot in WRAPPER.GO_SLOT_NAMES:
@@ -442,7 +477,7 @@ class WrapperTests(unittest.TestCase):
         ) as run:
             with self.assertRaises(WRAPPER.WrapperError) as failure:
                 WRAPPER._activate_go_runtime(self.loaded, deployd_enabled=True)
-        self.assertEqual(failure.exception.code, "migration_recovery_required")
+        self.assertEqual(failure.exception.code, "activation_failed")
         commands = [call.args[0] for call in run.call_args_list]
         self.assertNotIn(["systemctl", "restart", "agent-vm-native@blue.service"], commands)
         self.assertNotIn(["systemctl", "restart", "agent-vm-native@green.service"], commands)
@@ -453,8 +488,12 @@ class WrapperTests(unittest.TestCase):
             lease.retain_for_recovery()
         fence = self.loaded["fence_path"]
         self.assertEqual(json.loads(fence.read_text(encoding="utf-8"))["state"], "recovery_required")
-        with WRAPPER._activation_fence(self.loaded, "tx-new", "b" * 40):
-            self.assertEqual(json.loads(fence.read_text(encoding="utf-8"))["transaction_id"], "tx-new")
+        with self.assertRaises(WRAPPER.WrapperError) as failure:
+            with WRAPPER._activation_fence(self.loaded, "tx-new", "b" * 40):
+                pass
+        self.assertEqual(failure.exception.code, "release_activation_in_progress")
+        with WRAPPER._activation_fence(self.loaded, "tx-old", "a" * 40):
+            self.assertEqual(json.loads(fence.read_text(encoding="utf-8"))["transaction_id"], "tx-old")
         self.assertFalse(fence.exists())
 
     def test_product_runtime_retire_web_unit_and_keep_resident_control(self):

@@ -553,7 +553,12 @@ def _activation_fence(config: Mapping[str, Any], transaction_id: str, release_id
             _fail("release_fence_unverified", "release activation fence is not a private regular file")
         existing = _read_json(path, "release_fence_unverified")
         same_owner = existing.get("format") == 1 and existing.get("transaction_id") == transaction_id and existing.get("release_id") == release_id
-        recovery_owner = existing.get("format") == 1 and existing.get("state") == "recovery_required"
+        recovery_owner = (
+            existing.get("format") == 1
+            and existing.get("state") == "recovery_required"
+            and existing.get("transaction_id") == transaction_id
+            and existing.get("release_id") == release_id
+        )
         if not same_owner and not recovery_owner:
             _fail("release_activation_in_progress", "another release activation fence is active")
         if recovery_owner and not same_owner:
@@ -1453,7 +1458,12 @@ def _run_initial_state_migration(config: Mapping[str, Any]) -> None:
         if recovery.returncode == 0:
             _verify_migration_completion(config)
             return
-    _fail("activation_failed", "initial SQLite-to-rqlite migration did not complete; the runtime remains fenced")
+        _fail(
+            "migration_recovery_required",
+            "automatic initial state migration recovery did not complete; the runtime remains fenced",
+            {"transaction_id": transaction_id},
+        )
+    _fail("activation_failed", "initial state migration preflight did not complete; no recoverable migration transaction exists")
 
 
 def _legacy_expiry_timers() -> tuple[str, ...]:
@@ -1557,12 +1567,6 @@ def _activate_go_runtime(
                         _fsync_directory(active.parent, "activation_failed")
                 except OSError:
                     pass
-            if migration_started and not migration_completed:
-                raise WrapperError(
-                    "migration_recovery_required",
-                    "initial state migration did not complete; all runtime effects remain fenced",
-                    {"migration_error": failure.as_dict()},
-                )
             raise
     _systemctl("enable", "agent-vm-native.service")
     _systemctl("restart", "agent-vm-native.service")

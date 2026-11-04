@@ -54,8 +54,17 @@ INSERT INTO meta(key, value) VALUES('schema_version', '1');`)
 		t.Fatal(err)
 	}
 	loaded, err := store.Get(context.Background(), transaction.ID)
-	if err != nil || loaded == nil || loaded.MigrationRetryCount != 1 {
+	if err != nil || loaded == nil || loaded.MigrationRetryCount != 1 || loaded.MigrationRetryState != "in_progress" {
 		t.Fatalf("migrated retry count = %#v, err=%v", loaded, err)
+	}
+	if err := store.ConsumeMigrationRetry(context.Background(), transaction.ID, time.Now().UTC()); err != nil {
+		t.Fatalf("in-progress retry was not resumable: %v", err)
+	}
+	if err := store.FailMigrationRetry(context.Background(), transaction.ID, time.Now().UTC()); err != nil {
+		t.Fatalf("failed retry was not durably exhausted: %v", err)
+	}
+	if err := store.ConsumeMigrationRetry(context.Background(), transaction.ID, time.Now().UTC()); err == nil {
+		t.Fatal("exhausted retry was accepted")
 	}
 }
 

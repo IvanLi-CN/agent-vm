@@ -2,6 +2,7 @@
 
 import { randomUUID } from "node:crypto";
 import { TextDecoder } from "node:util";
+import { dirname, join } from "node:path";
 
 import { LifecycleControl } from "./control-lifecycle.ts";
 import {
@@ -28,6 +29,7 @@ import {
   type Data,
   type Integer,
 } from "./control-types.ts";
+import { with_lock } from "./control-native.ts";
 
 export { LifecycleControl };
 export * from "./control-types.ts";
@@ -1103,8 +1105,13 @@ export async function main(
     }
 
     const config = load_config();
-    const control = new Control(config);
-    const response = await control.dispatch(request);
+    const response = await with_lock(
+      join(dirname(config.state_db), "authority.lock"),
+      async () => new Control(config).dispatch(request!),
+      true,
+      true,
+      false,
+    );
 
     process.stdout.write(canonical_json(response) + "\n");
     return 0;

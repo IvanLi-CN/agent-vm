@@ -141,8 +141,12 @@ func (runtime *HostRuntime) PreflightMigration(_ context.Context) error {
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return errors.New("legacy SQLite state is not a regular file")
 	}
-	if info.Size() > maxMigrationSourceBytes {
-		return fmt.Errorf("legacy SQLite state is %d bytes and exceeds the 1 GiB migration limit", info.Size())
+	sourceSize, err := sqliteSourceFootprint(runtime.Config.Migration.LegacyStateDB)
+	if err != nil {
+		return err
+	}
+	if sourceSize > maxMigrationSourceBytes {
+		return fmt.Errorf("legacy SQLite source footprint is %d bytes and exceeds the 1 GiB migration limit", sourceSize)
 	}
 	return nil
 }
@@ -422,6 +426,28 @@ func validateMigrationSnapshotSize(path string) error {
 	return nil
 }
 
+func sqliteSourceFootprint(statePath string) (int64, error) {
+	var total int64
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		path := statePath + suffix
+		info, err := os.Lstat(path)
+		if errors.Is(err, fs.ErrNotExist) && suffix != "" {
+			continue
+		}
+		if err != nil {
+			return 0, fmt.Errorf("inspect SQLite source %s: %w", filepath.Base(path), err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return 0, fmt.Errorf("SQLite source %s is not a regular file", filepath.Base(path))
+		}
+		if info.Size() < 0 || total > maxMigrationSourceBytes-info.Size() {
+			return 0, errors.New("legacy SQLite source footprint exceeds the 1 GiB migration limit")
+		}
+		total += info.Size()
+	}
+	return total, nil
+}
+
 func (runtime *HostRuntime) ensureRecoveryDirectory() error {
 	path := runtime.Config.Migration.RecoveryDirectory
 	info, err := os.Lstat(path)
@@ -440,7 +466,82 @@ func (runtime *HostRuntime) ensureRecoveryDirectory() error {
 	return nil
 }
 
+func syncMigrationDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return err
+	}
+	return directory.Close()
+}
+
+func cleanupMigrationSnapshotTemps(directory string) error {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return err
+	}
+	removed := false
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "migration-") || !strings.HasSuffix(entry.Name(), ".sqlite3.tmp") {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		info, err := os.Lstat(path)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("migration temporary entry is not a regular file: %s", entry.Name())
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove incomplete migration snapshot %s: %w", entry.Name(), err)
+		}
+		removed = true
+	}
+	if removed {
+		if err := syncMigrationDirectory(directory); err != nil {
+			return fmt.Errorf("sync migration recovery directory after temporary cleanup: %w", err)
+		}
+	}
+	return nil
+}
+
+func removeMigrationSnapshot(path string) error {
+	removed := false
+	for _, candidate := range []string{path, path + ".tmp"} {
+		info, err := os.Lstat(candidate)
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return fmt.Errorf("migration snapshot is not a regular file: %s", filepath.Base(candidate))
+		}
+		if err := os.Remove(candidate); err != nil {
+			return err
+		}
+		removed = true
+	}
+	if removed {
+		if err := syncMigrationDirectory(filepath.Dir(path)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (runtime *HostRuntime) checkMigrationBudget(sourceSize int64) error {
+	if sourceSize < 0 || sourceSize > maxMigrationSourceBytes {
+		return errors.New("backup_storage_exhausted: legacy SQLite source footprint exceeds the migration budget")
+	}
+	if err := cleanupMigrationSnapshotTemps(runtime.Config.Migration.RecoveryDirectory); err != nil {
+		return fmt.Errorf("clean incomplete migration snapshots: %w", err)
+	}
 	entries, err := os.ReadDir(runtime.Config.Migration.RecoveryDirectory)
 	if err != nil {
 		return fmt.Errorf("inspect migration recovery budget: %w", err)
@@ -465,7 +566,7 @@ func (runtime *HostRuntime) checkMigrationBudget(sourceSize int64) error {
 		}
 		total += info.Size()
 	}
-	if count >= maxMigrationSnapshots || sourceSize < 0 || sourceSize > maxMigrationSourceBytes-total {
+	if count >= maxMigrationSnapshots || sourceSize > maxMigrationSourceBytes-total {
 		return errors.New("backup_storage_exhausted: migration recovery budget is exhausted")
 	}
 	available, err := availableMigrationStorageBytes(runtime.Config.Migration.RecoveryDirectory)
@@ -493,21 +594,38 @@ func availableMigrationStorageBytes(path string) (int64, error) {
 	return int64(bytes), nil
 }
 
-func (runtime *HostRuntime) PrepareMigrationSource(ctx context.Context, owner string) (MigrationSource, error) {
+func (runtime *HostRuntime) PrepareMigrationSource(ctx context.Context, owner string) (source MigrationSource, returnErr error) {
 	if err := runtime.PreflightMigration(ctx); err != nil {
 		return MigrationSource{}, err
 	}
 	if err := runtime.ensureRecoveryDirectory(); err != nil {
 		return MigrationSource{}, err
 	}
-	legacyInfo, err := os.Lstat(runtime.Config.Migration.LegacyStateDB)
+	sourceSize, err := sqliteSourceFootprint(runtime.Config.Migration.LegacyStateDB)
 	if err != nil {
-		return MigrationSource{}, fmt.Errorf("inspect legacy SQLite state: %w", err)
+		return MigrationSource{}, err
 	}
-	if err := runtime.checkMigrationBudget(legacyInfo.Size()); err != nil {
+	if err := runtime.checkMigrationBudget(sourceSize); err != nil {
 		return MigrationSource{}, err
 	}
 	backup := filepath.Join(runtime.Config.Migration.RecoveryDirectory, "migration-"+owner+".sqlite3")
+	if _, err := os.Lstat(backup); err == nil {
+		return MigrationSource{}, errors.New("verified migration snapshot already exists")
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return MigrationSource{}, fmt.Errorf("inspect migration snapshot destination: %w", err)
+	}
+	snapshotStarted := true
+	defer func() {
+		if snapshotStarted {
+			if cleanupErr := removeMigrationSnapshot(backup); cleanupErr != nil {
+				if returnErr == nil {
+					returnErr = fmt.Errorf("migration snapshot cleanup failed: %w", cleanupErr)
+				} else {
+					returnErr = fmt.Errorf("%w; migration snapshot cleanup failed: %v", returnErr, cleanupErr)
+				}
+			}
+		}
+	}()
 	if err := state.SnapshotSQLite(ctx, runtime.Config.Migration.LegacyStateDB, backup); err != nil {
 		return MigrationSource{}, err
 	}
@@ -518,6 +636,7 @@ func (runtime *HostRuntime) PrepareMigrationSource(ctx context.Context, owner st
 	if err != nil {
 		return MigrationSource{}, err
 	}
+	snapshotStarted = false
 	return MigrationSource{Evidence: evidence, BackupPath: backup}, nil
 }
 
@@ -665,10 +784,24 @@ func (runtime *HostRuntime) FinalizeMigration(ctx context.Context, owner string,
 	} else {
 		return err
 	}
+	return removeLegacySQLiteFiles(runtime.Config.Migration.LegacyStateDB)
+}
+
+func removeLegacySQLiteFiles(statePath string) error {
+	removed := false
 	for _, suffix := range []string{"", "-wal", "-shm"} {
-		path := runtime.Config.Migration.LegacyStateDB + suffix
-		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("remove migrated SQLite source %s: %w", filepath.Base(path), err)
+		path := statePath + suffix
+		if err := os.Remove(path); err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("remove migrated SQLite source %s: %w", filepath.Base(path), err)
+			}
+		} else {
+			removed = true
+		}
+	}
+	if removed {
+		if err := syncMigrationDirectory(filepath.Dir(statePath)); err != nil {
+			return fmt.Errorf("sync legacy SQLite directory after cleanup: %w", err)
 		}
 	}
 	return nil
@@ -752,6 +885,9 @@ func (runtime *HostRuntime) CleanupMigrationBackups(ctx context.Context) error {
 	if err := runtime.ensureRecoveryDirectory(); err != nil {
 		return err
 	}
+	if err := cleanupMigrationSnapshotTemps(runtime.Config.Migration.RecoveryDirectory); err != nil {
+		return err
+	}
 	marker, err := runtime.readMigrationMarker()
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -765,6 +901,7 @@ func (runtime *HostRuntime) CleanupMigrationBackups(ctx context.Context) error {
 	}
 	now := time.Now().UTC()
 	cutoff := now.Add(-migrationBackupRetention)
+	removed := false
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), "migration-") || !strings.HasSuffix(entry.Name(), ".sqlite3") {
 			continue
@@ -784,6 +921,12 @@ func (runtime *HostRuntime) CleanupMigrationBackups(ctx context.Context) error {
 			if err := os.Remove(path); err != nil {
 				return err
 			}
+			removed = true
+		}
+	}
+	if removed {
+		if err := syncMigrationDirectory(runtime.Config.Migration.RecoveryDirectory); err != nil {
+			return err
 		}
 	}
 	return nil
