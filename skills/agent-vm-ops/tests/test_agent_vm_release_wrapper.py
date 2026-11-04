@@ -390,6 +390,61 @@ class WrapperTests(unittest.TestCase):
         with mock.patch.object(WRAPPER, "STATE_DB_PATH", runtime_root / "state.sqlite3"):
             self.assertTrue(WRAPPER._prepare_initial_go_runtime_layout(self.loaded))
 
+    def test_activation_snapshot_includes_deployd_control_binaries(self):
+        targets = WRAPPER._activation_targets(self.loaded)
+        bundle_root = Path(self.loaded["control_path"]).parent
+        self.assertIn(bundle_root / "bin" / "agent-vm-deploy", targets)
+        self.assertIn(bundle_root / "bin" / "agent-vm-deployd", targets)
+
+    def test_go_runtime_waits_for_deployd_socket_before_migration(self):
+        runtime_root = WRAPPER._go_runtime_root(self.loaded)
+        for slot in WRAPPER.GO_SLOT_NAMES:
+            (runtime_root / "slots" / slot).mkdir(parents=True)
+        legacy_state = runtime_root / "state.sqlite3"
+        legacy_state.write_bytes(b"legacy")
+
+        def run(command, *args, **kwargs):
+            if command and command[0] == str(WRAPPER.GO_DEPLOY_PATH):
+                if command[1] == "status":
+                    return subprocess.CompletedProcess(command, 0, b"{}", b"")
+                if command[1] == "migrate":
+                    marker_path = WRAPPER._migration_marker_path(self.loaded)
+                    marker_path.parent.mkdir(parents=True, exist_ok=True)
+                    marker_path.write_text(json.dumps({
+                        "format": 2,
+                        "transaction_id": "migration-1",
+                        "business_authority": "rqlite",
+                        "source_sha256": "a" * 64,
+                        "source_size": 1,
+                        "state_epoch": "epoch-1",
+                        "target_sha256": "b" * 64,
+                        "retention_until": "2026-11-11T00:00:00Z",
+                    }), encoding="utf-8")
+                    marker_path.chmod(0o600)
+                    return subprocess.CompletedProcess(command, 0, b"", b"")
+                if command[1] == "transaction":
+                    return subprocess.CompletedProcess(command, 0, json.dumps({
+                        "value": {"transaction": {
+                            "transaction_id": "migration-1",
+                            "target_slot": "state",
+                            "phase": "finalize",
+                            "state": "finalized",
+                            "recovery_required": False,
+                        }},
+                    }).encode(), b"")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", legacy_state), mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            side_effect=run,
+        ) as run:
+            WRAPPER._activate_go_runtime(self.loaded, deployd_enabled=True)
+        commands = [call.args[0] for call in run.call_args_list]
+        ready_index = next(index for index, command in enumerate(commands) if command[0] == str(WRAPPER.GO_DEPLOY_PATH) and command[1] == "status")
+        migration_index = next(index for index, command in enumerate(commands) if command[0] == str(WRAPPER.GO_DEPLOY_PATH) and command[1] == "migrate")
+        self.assertLess(ready_index, migration_index)
+
     def test_migration_marker_without_finalized_transaction_keeps_runtime_fenced(self):
         marker_path = WRAPPER._migration_marker_path(self.loaded)
         marker_path.parent.mkdir(parents=True, exist_ok=True)

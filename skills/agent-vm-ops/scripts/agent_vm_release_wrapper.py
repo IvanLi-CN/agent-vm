@@ -26,6 +26,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 from typing import Any, Mapping
 
 
@@ -115,6 +116,8 @@ GO_ACTIVE_SOCKET = Path("/var/lib/agent-vm-native/active/app.sock")
 GO_DEPLOYD_SOCKET = Path("/run/agent-vm-native/deployd.sock")
 STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
 MIGRATION_TIMEOUT_SECONDS = 9000
+DEPLOYD_READY_TIMEOUT_SECONDS = 30
+DEPLOYD_READY_POLL_SECONDS = 0.1
 LEGACY_EXPIRY_TIMER_RE = re.compile(r"^agent-vm-native-expire-[A-Za-z0-9_.:-]+\.timer$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -1012,6 +1015,8 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
     targets = (
         Path(config["control_path"]),
         _go_control_target(config),
+        _go_binary_target(config, GO_DEPLOYD_PATH),
+        _go_binary_target(config, GO_DEPLOY_PATH),
         Path(config["control_path"]).with_name(RETIRED_CONTROL_NAME),
         Path(config["control_path"]).with_name(RETIRED_CLIENT_NAME),
         Path(config["control_path"]).with_name("agent_vm.ts"),
@@ -1393,6 +1398,18 @@ def _run_deployd_cli(command: str, *arguments: str, timeout_seconds: int) -> sub
         _fail("activation_failed", f"Deployd {command} could not be verified")
 
 
+def _wait_for_deployd_ready() -> None:
+    """Wait until the restarted Deployd accepts requests on its UDS."""
+    deadline = time.monotonic() + DEPLOYD_READY_TIMEOUT_SECONDS
+    while True:
+        process = _run_deployd_cli("status", timeout_seconds=5)
+        if process.returncode == 0:
+            return
+        if time.monotonic() >= deadline:
+            _fail("activation_failed", "Deployd did not become ready on its Unix socket")
+        time.sleep(DEPLOYD_READY_POLL_SECONDS)
+
+
 def _needs_migration_recovery(expected_transaction_id: str | None = None) -> str | None:
     process = _run_deployd_cli("status", timeout_seconds=30)
     if process.returncode != 0:
@@ -1538,6 +1555,7 @@ def _activate_go_runtime(
             _systemctl("enable", "agent-vm-deployd.service")
             _systemctl("restart", "agent-vm-deployd.service")
             _systemctl("is-active", "agent-vm-deployd.service")
+            _wait_for_deployd_ready()
             migration_started = True
             _run_initial_state_migration(config)
             migration_completed = True
