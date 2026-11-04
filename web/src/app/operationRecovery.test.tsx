@@ -31,6 +31,8 @@ function Probe({ path = "/vms" }: { path?: string }) {
     <span data-testid="operation-id">{operationId}</span>
     <span data-testid="recovery-state">{recovery.state}</span>
     <button type="button" onClick={() => setOperationId("50e8400e-ccf8-4c7b-8d1d-14f66c7fb126")}>start</button>
+    <button type="button" onClick={() => setOperationId("50e8400e-ccf8-4c7b-8d1d-14f66c7fb126", false)}>preview</button>
+    <button type="button" onClick={recovery.persist}>persist</button>
   </div>;
 }
 
@@ -59,5 +61,13 @@ describe("operation recovery", () => {
     getOperationMock.mockResolvedValue(operation);
     render(<Probe />);
     await waitFor(() => expect(getOperationMock).toHaveBeenCalledWith(operation.operation_id));
+  });
+
+  it("keeps preview operation ids in memory until submission persists them", () => {
+    render(<Probe />);
+    fireEvent.click(screen.getByRole("button", { name: "preview" }));
+    expect(window.sessionStorage.length).toBe(0);
+    fireEvent.click(screen.getByRole("button", { name: "persist" }));
+    expect(window.sessionStorage.length).toBe(1);
   });
 });

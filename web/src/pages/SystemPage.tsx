@@ -36,16 +36,20 @@ export function SystemPage() {
   const showError = (error: unknown) => setActionError(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
   const mutation = useMutation({
     mutationFn: ({ reason }: { reason: string }) => submitMaintenance(action!, reason, preview!, operationId ?? undefined),
-    onSuccess: () => {
+    onSuccess: (operation) => {
       setAction(null);
       setPreview(null);
-      setOperationId(null);
+      if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null);
+      else operationRecovery.persist();
       setActionError(null);
       setDialogOwner(null);
       void client.invalidateQueries({ queryKey: ["operations"] });
       void client.invalidateQueries({ queryKey: ["system"] });
     },
-    onError: showError,
+    onError: (error) => {
+      if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null);
+      showError(error);
+    },
   });
   const openAction = async (nextAction: MaintenanceAction) => {
     if (operationRecovery.isBlocked) {
@@ -56,12 +60,13 @@ export function SystemPage() {
     setActionError(null);
     setDialogOwner("maintenance");
     setAction(nextAction);
-    setOperationId(createOperationId());
+    setOperationId(createOperationId(), false);
     try {
       setPreview(await previewMaintenance(nextAction, query.data?.resource_version));
     } catch (error) {
       setAction(null);
       setPreview(null);
+      setOperationId(null, false);
       showError(error);
       setDialogOwner(null);
     }
@@ -81,7 +86,7 @@ export function SystemPage() {
       <Panel><PanelHeader title={t("system.source")} /><div className="source-list">{query.data.sources.map((source) => <div className="source-row" key={source.name}><div><strong>{source.name}</strong><span>{source.safe_code ?? "—"}</span></div><StatusBadge state={source.state} /></div>)}</div></Panel>
     </div>
     <TokenManagement dialogBlocked={dialogOwner === "maintenance"} onDialogStateChange={setTokenDialogOpen} />
-    {action && preview ? <ActionDialog preview={preview} actionLabel={actionLabel(action, locale)} target={`${t("system.title")} · ${t("system.maintenance")}`} error={actionError} dangerous={action === "drain_enter" || action === "gc"} busy={mutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null); setActionError(null); setDialogOwner(null); }} onConfirm={(reason) => mutation.mutate({ reason })} /> : null}
+    {action && preview ? <ActionDialog preview={preview} actionLabel={actionLabel(action, locale)} target={`${t("system.title")} · ${t("system.maintenance")}`} error={actionError} dangerous={action === "drain_enter" || action === "gc"} busy={mutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null, false); setActionError(null); setDialogOwner(null); }} onConfirm={(reason) => { operationRecovery.persist(); mutation.mutate({ reason }); }} /> : null}
   </div>;
 }
 

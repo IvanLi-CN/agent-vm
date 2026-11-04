@@ -73,7 +73,7 @@ test("release reservation is append-only and identity-bound", () => {
   }
 });
 
-test("release preflight is fail-closed and accepts every Main gate matrix job", () => {
+test("release preflight is fail-closed and accepts the exact Main gate matrix", () => {
   let blocked = false;
   try {
     assertContractPreconditions(
@@ -87,10 +87,19 @@ test("release preflight is fail-closed and accepts every Main gate matrix job", 
   if (!unprotectedError) throw new Error("workflow preflight accepted an unprotected ref");
   assertWorkflowPlatformAttestation("refs/heads/main", "true");
   const gate = successfulMainGate([
-    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2 },
-    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1 },
+    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, app: { slug: "github-actions" } },
+    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, app: { slug: "github-actions" } },
   ]);
   if (gate.id !== "1,2") throw new Error(`unexpected Main gate identity: ${gate.id}`);
+  let missingMatrixRejected = false;
+  try { successfulMainGate([{ name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, app: { slug: "github-actions" } }]); } catch { missingMatrixRejected = true; }
+  if (!missingMatrixRejected) throw new Error("an incomplete Main gate matrix was accepted");
+  let foreignCheckRejected = false;
+  try { successfulMainGate([
+    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, app: { slug: "third-party" } },
+    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, app: { slug: "github-actions" } },
+  ]); } catch { foreignCheckRejected = true; }
+  if (!foreignCheckRejected) throw new Error("a non-GitHub Actions Main gate was accepted");
 });
 
 test("GitHub state refs are append-only and preserve the original identity", async () => {
@@ -161,5 +170,8 @@ test("draft release lookup accepts an untagged draft only when its target is bou
   let mutablePublishedRejected = false;
   try { verifyReleaseView({ tagName: "v1.0.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: false, assets: [{ name: "package" }] }, "v1.0.0", false, { package: "/tmp/package" }, source); } catch { mutablePublishedRejected = true; }
   if (!mutablePublishedRejected) throw new Error("mutable published release was accepted");
+  let extraAssetRejected = false;
+  try { verifyReleaseView({ tagName: "v1.0.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: true, assets: [{ name: "package" }, { name: "unexpected" }] }, "v1.0.0", false, { package: "/tmp/package" }, source); } catch { extraAssetRejected = true; }
+  if (!extraAssetRejected) throw new Error("an unexpected release asset was accepted");
   verifyReleaseView({ tagName: "v1.0.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: true, assets: [{ name: "package" }] }, "v1.0.0", false, { package: "/tmp/package" }, source);
 });

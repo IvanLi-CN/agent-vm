@@ -147,11 +147,6 @@ paths:
       responses:
         "200":
           description: Authenticated administrator context and CSRF token. The SPA must bootstrap this endpoint before showing administrator identity, capabilities or managed resources; authentication_required and csrf_invalid suspend subsequent queries and mutations until explicit reauthentication.
-          headers:
-            Set-Cookie:
-              description: Opaque session cookie; Secure, HttpOnly, SameSite=Strict, Path=/, Max-Age equal to the configured session TTL.
-              schema:
-                type: string
           content:
             application/json:
               schema:
@@ -288,6 +283,9 @@ paths:
       tags: [Overview]
       operationId: getOverview
       summary: Read the current capacity, admission, pressure and source freshness summary
+      description: Requires the administrator observe_admin capability.
+      security:
+        - browserSession: []
       responses:
         "200":
           description: Current read-only overview.
@@ -307,6 +305,9 @@ paths:
       tags: [VMs]
       operationId: listManagedVMs
       summary: List existing Agent session VMs
+      description: Requires the administrator observe_admin capability.
+      security:
+        - browserSession: []
       parameters:
         - name: state
           in: query
@@ -355,6 +356,9 @@ paths:
       tags: [VMs]
       operationId: getManagedVM
       summary: Read one existing Agent session VM
+      description: Requires the administrator observe_admin capability.
+      security:
+        - browserSession: []
       responses:
         "200":
           description: Current VM state and allowed action names.
@@ -428,6 +432,9 @@ paths:
       tags: [Images]
       operationId: listManagedImages
       summary: List managed image versions and their references
+      description: Requires the administrator observe_admin or manage_images capability.
+      security:
+        - browserSession: []
       parameters:
         - name: state
           in: query
@@ -463,6 +470,9 @@ paths:
       tags: [Images]
       operationId: getManagedImage
       summary: Read one immutable image and all reference classes
+      description: Requires the administrator observe_admin or manage_images capability.
+      security:
+        - browserSession: []
       responses:
         "200":
           description: Current image verification, default and reference state.
@@ -714,6 +724,8 @@ paths:
       operationId: listOperations
       summary: List durable management operations visible to the current principal
       description: The sole administrator receives field-whitelisted operations. The actor is the exact current (issuer, subject) pair, a typed rejected request without administrator authority, or an explicitly marked historical actor whose original value is retained without identity inference.
+      security:
+        - browserSession: []
       parameters:
         - name: status
           in: query
@@ -755,6 +767,8 @@ paths:
       operationId: getOperation
       summary: Read an operation by its durable identity
       description: The sole administrator receives field-whitelisted operation status. Current rejected-request actors and historical actor values remain explicitly non-administrator identities and are never converted into a guessed OIDC identity. Token-create results never contain bearer plaintext.
+      security:
+        - browserSession: []
       responses:
         "200":
           description: Current phase, outcome and safe result or error.
@@ -770,6 +784,9 @@ paths:
       tags: [Audit]
       operationId: listAuditEvents
       summary: Query administrator audit events
+      description: Requires the administrator observe_admin capability.
+      security:
+        - browserSession: []
       parameters:
         - name: actor
           in: query
@@ -824,6 +841,9 @@ paths:
       tags: [System]
       operationId: getSystemStatus
       summary: Read installed product, component readiness and maintenance state
+      description: Requires the administrator observe_admin capability.
+      security:
+        - browserSession: []
       responses:
         "200":
           description: Read-only system status.

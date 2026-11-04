@@ -67,15 +67,19 @@ export function ImagesPage() {
       setImportMessage(`${t("images.importStarted")} · ${operation.operation_id}`);
       setPendingImport(null);
       setReason("");
-      setOperationId(null);
+      if (operation.status === "succeeded") setOperationId(null);
+      else operationRecovery.persist();
       void client.invalidateQueries({ queryKey: ["operations"] });
     },
     onError: (error) => {
-      if (error instanceof ManagementRequestError && importRejectedCodes.has(error.code)) setPendingImport(null);
+      if (error instanceof ManagementRequestError && importRejectedCodes.has(error.code)) {
+        setPendingImport(null);
+        setOperationId(null);
+      }
       setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
     },
   });
-  const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!, operationId ?? undefined), onSuccess: () => { setAction(null); setPreview(null); setOperationId(null); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")) });
+  const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!, operationId ?? undefined), onSuccess: (operation) => { setAction(null); setPreview(null); if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null); else operationRecovery.persist(); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => { if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null); setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")); } });
 
   const submitImport = (submission: ImportSubmission) => {
     if (operationRecovery.isBlocked) {
@@ -130,14 +134,15 @@ export function ImagesPage() {
     }
     if (!selected) return;
     setAction(nextAction);
-    setOperationId(createOperationId());
+    setOperationId(createOperationId(), false);
     const targetVersion = nextAction === "default" ? query.data?.selection_version : selected.resource_version;
-    if (!targetVersion) return;
+    if (!targetVersion) { setOperationId(null, false); return; }
     try {
       setPreview(await previewImageAction(selected.fingerprint, nextAction, targetVersion));
     } catch (error) {
       setAction(null);
       setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
+      setOperationId(null, false);
     }
   };
 
@@ -186,7 +191,7 @@ export function ImagesPage() {
       </div>
       <div className="import-footer"><span id={importReasonTooLong ? "image-import-reason-error" : undefined} role={importReasonTooLong ? "alert" : undefined} className={!importReasonTooLong && (importMessage.includes("created") || importMessage.includes("已创建")) ? "success-copy" : "field-error"}>{importReasonTooLong ? t("common.reasonTooLong") : importMessage}</span><Button variant="primary" icon={<FileUp />} disabled={importMutation.isPending || importReasonTooLong} onClick={startImport}>{importMutation.isPending ? t("common.loading") : t("images.startImport")}</Button></div>
     </Panel>
-    {action && preview && selected ? <ActionDialog preview={preview} actionLabel={actionLabel(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", locale)} target={`${selected.version_label} · ${shortFingerprint(selected.fingerprint)}`} dangerous={action === "delete" || action === "retire"} busy={actionMutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null); }} onConfirm={(actionReason) => actionMutation.mutate({ reason: actionReason })} /> : null}
+    {action && preview && selected ? <ActionDialog preview={preview} actionLabel={actionLabel(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", locale)} target={`${selected.version_label} · ${shortFingerprint(selected.fingerprint)}`} dangerous={action === "delete" || action === "retire"} busy={actionMutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null, false); }} onConfirm={(actionReason) => { operationRecovery.persist(); actionMutation.mutate({ reason: actionReason }); }} /> : null}
   </div>;
 }
 

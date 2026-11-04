@@ -27,7 +27,6 @@ export function OperationRecoveryNotice({ recovery }: { recovery: OperationRecov
     </div>
     {recovery.state !== "resolved" ? <div className="operation-recovery-actions">
       <Button variant="ghost" icon={<RefreshCw />} onClick={recovery.retry}>{t("operationRecovery.retry")}</Button>
-      {recovery.state === "not_found" ? <Button variant="ghost" onClick={recovery.clear}>{t("operationRecovery.clear")}</Button> : null}
     </div> : null}
   </div>;
 }

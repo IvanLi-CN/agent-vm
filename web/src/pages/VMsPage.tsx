@@ -43,8 +43,11 @@ export function VMsPage() {
   const showError = (error: unknown) => setActionError(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
   const submitMutation = useMutation({
     mutationFn: ({ reason }: { reason: string }) => submitVMAction(selected?.task_id ?? "", action ?? "restart", reason, preview!, selected?.generation ?? "", parameters, operationId ?? undefined),
-    onSuccess: () => { setAction(null); setPreview(null); setOperationId(null); setActionError(null); void queryClient.invalidateQueries({ queryKey: ["operations"] }); },
-    onError: showError,
+    onSuccess: (operation) => { setAction(null); setPreview(null); if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null); else operationRecovery.persist(); setActionError(null); void queryClient.invalidateQueries({ queryKey: ["operations"] }); },
+    onError: (error) => {
+      if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null);
+      showError(error);
+    },
   });
 
   const openAction = async (nextAction: string) => {
@@ -55,7 +58,7 @@ export function VMsPage() {
     if (!selected) return;
     setActionError(null);
     setAction(nextAction);
-    setOperationId(createOperationId());
+    setOperationId(createOperationId(), false);
     const initial = nextAction === "resize"
       ? { cpu_vcpu: selected.resources.cpu_vcpu ?? 2, memory_bytes: selected.resources.memory_bytes ?? "4294967296", disk_bytes: selected.resources.disk_bytes ?? "21474836480", live: false, allow_restart: false }
       : nextAction === "port_add"
@@ -67,6 +70,7 @@ export function VMsPage() {
     try {
       setPreview(await previewVMAction(selected.task_id, nextAction, selected, initial));
     } catch (error) {
+      setOperationId(null, false);
       showError(error);
     }
   };
@@ -107,7 +111,7 @@ export function VMsPage() {
       </Panel>
       <VMDetail vm={selected} locale={locale} onAction={openAction} actionError={actionError} />
     </div>}
-    {action && preview && selected ? <ActionDialog preview={preview} actionLabel={actionLabel(action, locale)} target={`${selected.task_id} · ${selected.session_id}`} dangerous={action === "destroy" || action === "release"} busy={submitMutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null); }} onConfirm={(reason) => submitMutation.mutate({ reason })}><VMActionParameters action={action} parameters={parameters} onChange={(next) => void updateParameters(next)} /></ActionDialog> : null}
+    {action && preview && selected ? <ActionDialog preview={preview} actionLabel={actionLabel(action, locale)} target={`${selected.task_id} · ${selected.session_id}`} dangerous={action === "destroy" || action === "release"} busy={submitMutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null, false); }} onConfirm={(reason) => { operationRecovery.persist(); submitMutation.mutate({ reason }); }}><VMActionParameters action={action} parameters={parameters} onChange={(next) => void updateParameters(next)} /></ActionDialog> : null}
   </div>;
 }
 

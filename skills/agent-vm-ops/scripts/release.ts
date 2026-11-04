@@ -27,6 +27,8 @@ const target = option("--target");
 const reservation = option("--reservation");
 const stateRoot = resolve(option("--state-root") ?? "release-state");
 const repositoryRoot = resolve(import.meta.dir, "../../..");
+const releasePolicyFiles = [".github/quality-gates.json", ".github/release-contract.json", ".github/release-failure-notification.json"] as const;
+const releaseGateNames = ["Main gate (macos-latest)", "Main gate (ubuntu-latest)"] as const;
 
 function requireOption(name: string): string {
   const value = option(name);
@@ -75,9 +77,7 @@ export function assertPlatformPreconditions(root = repositoryRoot): void {
   const release = JSON.parse(readFileSync(join(root, ".github/release-contract.json"), "utf8"));
   assertContractPreconditions(quality, release);
   if (process.env.GITHUB_ACTIONS === "true") {
-    // The Actions token cannot read administrator-only protection endpoints.
     assertWorkflowPlatformAttestation(process.env.GITHUB_REF, process.env.RELEASE_REF_PROTECTED);
-    return;
   }
   const repository = process.env.GITHUB_REPOSITORY;
   if (!repository) throw new Error("GITHUB_REPOSITORY is required for the live platform preflight");
@@ -87,11 +87,19 @@ export function assertPlatformPreconditions(root = repositoryRoot): void {
 
 export function successfulMainGate(value: unknown): { id: string } {
   if (!Array.isArray(value)) throw new Error("GitHub check-runs response is invalid");
-  const checks = value.filter((item: any) => item?.name === "Main gate" || /^Main gate \(.+\)$/.test(item?.name ?? ""));
-  if (checks.length === 0 || checks.some((item: any) => item.status !== "completed" || item.conclusion !== "success")) {
-    throw new Error("the fixed Main gate has not completed successfully for the source commit");
+  const namedChecks = value.filter((item: any) => releaseGateNames.includes(item?.name));
+  const checks = new Map(namedChecks.map((item: any) => [item.name, item]));
+  if (namedChecks.length !== releaseGateNames.length || checks.size !== releaseGateNames.length || [...checks.values()].some((item: any) => item.status !== "completed" || item.conclusion !== "success" || item.app?.slug !== "github-actions")) {
+    throw new Error("the required Main gate matrix has not completed successfully for the source commit");
   }
-  return { id: checks.map((item: any) => String(item.id ?? item.name)).sort().join(",") };
+  if (value.some((item: any) => releaseGateNames.includes(item?.name) && item.app?.slug !== "github-actions")) {
+    throw new Error("the required Main gate matrix is not owned by GitHub Actions");
+  }
+  return { id: releaseGateNames.map((name) => String(checks.get(name)?.id ?? name)).sort().join(",") };
+}
+
+function currentPolicyRevision(): string {
+  return policyRevision(releasePolicyFiles.map((path) => readFileSync(join(repositoryRoot, path), "utf8")).join("\n"));
 }
 
 function mergedSourcePull(value: unknown, source: string): { number: string; head: string } {
@@ -132,7 +140,10 @@ export function verifyReleaseView(value: unknown, tag: string, expectedDraft: bo
   if (!expectedDraft && release.isPrerelease === true) throw new Error("published GitHub release is a prerelease");
   if (!expectedDraft && release.immutable !== true) throw new Error("published GitHub release is not immutable");
   const names = new Set(release.assets.flatMap((item: any) => typeof item?.name === "string" ? [item.name] : []));
-  for (const name of Object.keys(assets)) if (!names.has(name)) throw new Error(`GitHub release is missing asset: ${name}`);
+  const expectedNames = new Set(Object.keys(assets));
+  if (names.size !== expectedNames.size || names.size !== release.assets.length || [...names].some((name) => !expectedNames.has(name))) {
+    throw new Error("GitHub release assets do not exactly match the frozen asset set");
+  }
   return release;
 }
 
@@ -187,8 +198,7 @@ async function release(): Promise<void> {
   const sourcePull = mergedSourcePull(await adapter.sourcePulls(source), source);
   const verification = await adapter.json<{ commit?: { verification?: { verified?: boolean } } }>(["api", `repos/${adapter.repository}/commits/${source}`]);
   if (verification.commit?.verification?.verified !== true) throw new Error("source commit signature is not verified");
-  const policyFiles = [".github/quality-gates.json", ".github/release-contract.json", ".github/release-failure-notification.json"];
-  const policyText = policyFiles.map((path) => readFileSync(join(repositoryRoot, path), "utf8")).join("\n");
+  const policyRevisionValue = currentPolicyRevision();
   const baseline = latestFinalEvent(completed);
   if (baseline) {
     const comparison = await adapter.compare(baseline.identity.source_revision, source);
@@ -207,7 +217,7 @@ async function release(): Promise<void> {
     source_pr: sourcePull.number,
     source_pr_head: sourcePull.head,
     signed_commit: true,
-    policy_revision: policyRevision(policyText),
+    policy_revision: policyRevisionValue,
     artifacts: {},
   };
   const claimed = await store.claim(identity);
@@ -257,6 +267,18 @@ async function recover(): Promise<void> {
   }
   if (current.stage === "abandoned" || current.stage === "claimed") throw new Error(`reservation at ${current.stage} cannot be recovered without frozen assets`);
 
+  assertPlatformPreconditions();
+  const source = await adapter.mainHead();
+  if (source !== current.identity.source_revision) throw new Error("recovery source revision no longer matches the reserved identity");
+  if (process.env.GITHUB_SHA && process.env.GITHUB_SHA !== source) throw new Error("GitHub recovery ref moved after source preflight");
+  const gate = successfulMainGate(await adapter.commitChecks(source));
+  if (gate.id !== current.identity.main_gate) throw new Error("recovery Main gate identity no longer matches the reservation");
+  const sourcePull = mergedSourcePull(await adapter.sourcePulls(source), source);
+  if (sourcePull.number !== current.identity.source_pr || sourcePull.head !== current.identity.source_pr_head) throw new Error("recovery source pull identity no longer matches the reservation");
+  const verification = await adapter.json<{ commit?: { verification?: { verified?: boolean } } }>(["api", `repos/${adapter.repository}/commits/${source}`]);
+  if (verification.commit?.verification?.verified !== true) throw new Error("recovery source commit signature is not verified");
+  if (currentPolicyRevision() !== current.identity.policy_revision) throw new Error("recovery policy revision no longer matches the reservation");
+
   const frozen = frozenDetails(current);
   const { artifacts, assets } = frozen;
   const tag = String(current.detail?.tag ?? `v${version}`);
@@ -269,7 +291,6 @@ async function recover(): Promise<void> {
       /* the draft may not have been created before interruption */
     }
     if (!existing) {
-      assertPlatformPreconditions();
       for (const path of Object.values(assets)) if (!existsSync(path)) throw new Error(`recovery is missing frozen asset: ${path}`);
       await assertTagIsAbsentOrBound(adapter, tag, current.identity.source_revision);
       await adapter.createDraft(tag, current.identity.source_revision, Object.values(assets), `Agent VM ${version}`, `Recovered product release ${version} from ${current.identity.source_revision}.`);
@@ -284,7 +305,6 @@ async function recover(): Promise<void> {
     const view = await adapter.viewRelease(tag) as { isDraft?: boolean };
     if (view.isDraft === true) {
       verifyReleaseView(view, tag, true, assets);
-      assertPlatformPreconditions();
       await adapter.publish(tag);
     } else {
       verifyReleaseView(view, tag, false, assets);

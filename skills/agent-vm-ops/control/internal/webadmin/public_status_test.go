@@ -23,6 +23,7 @@ func TestPublicStatusIsAnonymousAndSanitized(t *testing.T) {
 		"admission_ready":        true,
 		"draining":               false,
 		"observation_consistent": true,
+		"default_admission":      map[string]any{"ready": true},
 		"resources": map[string]any{
 			"remaining": map[string]any{"cpu": 2, "memory_mib": 1024},
 		},
@@ -71,6 +72,27 @@ func TestPublicStatusIsAnonymousAndSanitized(t *testing.T) {
 	server.Handler().ServeHTTP(methodRecorder, httptest.NewRequest(http.MethodPost, "/api/v1/public/status", strings.NewReader(`{}`)))
 	if methodRecorder.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("public status method status=%d body=%s", methodRecorder.Code, methodRecorder.Body.String())
+	}
+}
+
+func TestPublicStatusReturnsUnknownWhenCapacitySnapshotIsUnavailable(t *testing.T) {
+	authority, store, cfg := testAuthority(t)
+	authority.Clock = func() time.Time { return time.Date(2026, 11, 4, 8, 0, 0, 0, time.UTC) }
+	server, err := NewUnifiedServer(UnifiedOptions{Config: cfg, Authority: authority, Store: store, Assets: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("index")}}, Clock: authority.Clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/public/status", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("missing public snapshot status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var value map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &value); err != nil {
+		t.Fatal(err)
+	}
+	if value["state"] != "unknown" || value["observation_state"] != "unverified" || value["active_sessions"] != nil || value["observed_at"] != nil {
+		t.Fatalf("missing public snapshot=%#v", value)
 	}
 }
 
@@ -228,6 +250,37 @@ func TestPublicStatusFailsClosedWhenNativeUpIsMalformed(t *testing.T) {
 	}
 	if value["state"] != "unknown" || value["observation_state"] != "unverified" || value["active_sessions"] != nil {
 		t.Fatalf("malformed native up public status=%#v", value)
+	}
+}
+
+func TestPublicStatusFailsClosedForMalformedDefaultAdmission(t *testing.T) {
+	for name, admission := range map[string]any{"missing": nil, "wrong_type": "ready", "missing_ready": map[string]any{}} {
+		t.Run(name, func(t *testing.T) {
+			authority, store, cfg := testAuthority(t)
+			now := time.Date(2026, 11, 4, 8, 0, 0, 0, time.UTC)
+			authority.Clock = func() time.Time { return now }
+			authority.Snapshots = observe.NewSnapshotStore(t.TempDir())
+			metrics := map[string]any{"observed_at": now.Add(-10 * time.Second).Format(time.RFC3339Nano), "up": true, "admission_ready": true, "draining": false, "observation_consistent": true, "task_states": completeTaskStates(2)}
+			if admission != nil {
+				metrics["default_admission"] = admission
+			}
+			if err := authority.Snapshots.Publish("capacity", metrics); err != nil {
+				t.Fatal(err)
+			}
+			server, err := NewUnifiedServer(UnifiedOptions{Config: cfg, Authority: authority, Store: store, Snapshots: authority.Snapshots, Assets: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("index")}}, Clock: authority.Clock})
+			if err != nil {
+				t.Fatal(err)
+			}
+			recorder := httptest.NewRecorder()
+			server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/public/status", nil))
+			var value map[string]any
+			if err := json.Unmarshal(recorder.Body.Bytes(), &value); err != nil {
+				t.Fatal(err)
+			}
+			if value["state"] != "unknown" || value["observation_state"] != "unverified" || value["active_sessions"] != nil {
+				t.Fatalf("malformed default admission=%#v", value)
+			}
+		})
 	}
 }
 

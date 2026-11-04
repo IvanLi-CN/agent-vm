@@ -19,7 +19,7 @@ export type OperationRecovery = {
   errorCode: string | null;
   isBlocked: boolean;
   retry: () => void;
-  clear: () => void;
+  persist: () => void;
 };
 
 function storage(): Storage | null {
@@ -70,7 +70,7 @@ export function writeOperationRecovery(path: string, operationId: string | null)
   }
 }
 
-export function useOperationRecovery(path: string, enabled = true): [string | null, (operationId: string | null) => void, OperationRecovery] {
+export function useOperationRecovery(path: string, enabled = true): [string | null, (operationId: string | null, persist?: boolean) => void, OperationRecovery] {
   const [operationId, setOperationIdState] = useState<string | null>(() => readOperationRecovery(path));
   const shouldReconcile = useRef<boolean | null>(null);
   const wasEnabled = useRef(enabled);
@@ -79,22 +79,24 @@ export function useOperationRecovery(path: string, enabled = true): [string | nu
   const [operation, setOperation] = useState<Operation | null>(null);
   const [errorCode, setErrorCode] = useState<string | null>(null);
 
-  const setOperationId = useCallback((next: string | null) => {
+  const setOperationId = useCallback((next: string | null, persist = true) => {
     shouldReconcile.current = false;
     setOperationIdState(next);
     setState("idle");
     setOperation(null);
     setErrorCode(null);
-    writeOperationRecovery(path, next);
+    if (persist) writeOperationRecovery(path, next);
   }, [path]);
+
+  const persist = useCallback(() => {
+    if (operationId) writeOperationRecovery(path, operationId);
+  }, [operationId, path]);
 
   const retry = useCallback(() => {
     if (!operationId) return;
     shouldReconcile.current = true;
     setRetryCount((count) => count + 1);
   }, [operationId]);
-
-  const clear = useCallback(() => setOperationId(null), [setOperationId]);
 
   useEffect(() => {
     if (!wasEnabled.current && enabled && operationId) shouldReconcile.current = true;
@@ -125,5 +127,5 @@ export function useOperationRecovery(path: string, enabled = true): [string | nu
   }, [enabled, operationId, retryCount]);
 
   const isBlocked = state === "checking" || state === "blocked" || state === "not_found" || state === "error";
-  return [operationId, setOperationId, { operationId, state, operation, errorCode, isBlocked, retry, clear }];
+  return [operationId, setOperationId, { operationId, state, operation, errorCode, isBlocked, retry, persist }];
 }

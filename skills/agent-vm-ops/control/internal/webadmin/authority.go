@@ -213,7 +213,11 @@ func (authority *Authority) getPublicStatus(writer http.ResponseWriter, request 
 	}
 	metrics, err := authority.readPublicCapacityMetrics()
 	if err != nil {
-		writeProblem(writer, problemFromError(err, "request_validation", ""))
+		writer.Header().Set("Cache-Control", "public, max-age=15, stale-while-revalidate=45")
+		writeJSON(writer, http.StatusOK, map[string]any{
+			"state": "unknown", "active_sessions": nil, "observed_at": nil,
+			"observation_state": "unverified", "stale_after_seconds": 60,
+		})
 		return
 	}
 
@@ -334,6 +338,13 @@ func validAdmissionObservation(metrics map[string]any) bool {
 	if _, ok := metrics["draining"].(bool); !ok {
 		return false
 	}
+	defaultAdmission, ok := metrics["default_admission"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if _, ok := defaultAdmission["ready"].(bool); !ok {
+		return false
+	}
 	return true
 }
 
@@ -360,27 +371,34 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	observedAtValid := observedAt != "" && parseErr == nil && !parsedObservedAt.After(now)
 	fresh, observationUnverified := capacityObservation(metrics, now)
 	fieldObservedAt := observedAt
-	if fieldObservedAt == "" {
-		fieldObservedAt = now.Format(time.RFC3339Nano)
+	fieldVerified := observedAtValid && !observationUnverified
+	if !fieldVerified {
+		fieldObservedAt = ""
+	}
+	verifiedValue := func(value any) any {
+		if !fieldVerified {
+			return nil
+		}
+		return value
 	}
 	resources, _ := metrics["resources"].(map[string]any)
 	remaining, _ := resources["remaining"].(map[string]any)
 	ctCPU, _ := metrics["ct_cpu"].(map[string]any)
 	startupBlocked := nestedBool(metrics, "ct_cpu", "startup_pressure", "startup_blocked")
 	capacity := map[string]any{
-		"logical_cpu_remaining_vcpu": observedNumber(numberValue(remaining["cpu"]), fieldObservedAt, fresh),
-		"ct_cpu_capacity_vcpu":       observedNumber(numberValue(ctCPU["capacity_vcpu"]), fieldObservedAt, fresh),
-		"logical_memory_remaining":   observedBytes(decimalBytes(numberValue(remaining["memory_mib"]), 1024*1024), fieldObservedAt, fresh),
+		"logical_cpu_remaining_vcpu": observedNumber(verifiedValue(numberValue(remaining["cpu"])), fieldObservedAt, fresh),
+		"ct_cpu_capacity_vcpu":       observedNumber(verifiedValue(numberValue(ctCPU["capacity_vcpu"])), fieldObservedAt, fresh),
+		"logical_memory_remaining":   observedBytes(verifiedValue(decimalBytes(numberValue(remaining["memory_mib"]), 1024*1024)), fieldObservedAt, fresh),
 		"ct_memory_available":        observedBytes(nil, fieldObservedAt, fresh),
 		// The logical admission budget is not physical disk telemetry. Keep the
 		// physical field unverified until the native snapshot supplies it.
 		"physical_disk_available": observedBytes(nil, fieldObservedAt, fresh),
 	}
 	pressure := map[string]any{
-		"cpu_some_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "some", "avg10"), fieldObservedAt, fresh),
-		"cpu_full_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "full", "avg10"), fieldObservedAt, fresh),
-		"cpu_startup_pressure_threshold_percent": observedNumber(nestedNumber(resources, "policy", "cpu_startup_pressure_full_avg10_percent"), fieldObservedAt, fresh),
-		"cpu_startup_blocked":                    observedBoolean(startupBlocked, fieldObservedAt, fresh),
+		"cpu_some_avg10":                         observedNumber(verifiedValue(nestedNumber(resources, "cpu_pressure", "some", "avg10")), fieldObservedAt, fresh),
+		"cpu_full_avg10":                         observedNumber(verifiedValue(nestedNumber(resources, "cpu_pressure", "full", "avg10")), fieldObservedAt, fresh),
+		"cpu_startup_pressure_threshold_percent": observedNumber(verifiedValue(nestedNumber(resources, "policy", "cpu_startup_pressure_full_avg10_percent")), fieldObservedAt, fresh),
+		"cpu_startup_blocked":                    observedBoolean(verifiedValue(startupBlocked), fieldObservedAt, fresh),
 		"memory_pressure":                        observedBoolean(nil, fieldObservedAt, fresh),
 	}
 	var admissionReady, draining any

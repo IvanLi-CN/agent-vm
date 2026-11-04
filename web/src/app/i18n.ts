@@ -113,7 +113,6 @@ i18n.addResource("zh-CN", "translation", "operationRecovery.blocked", "原操作
 i18n.addResource("zh-CN", "translation", "operationRecovery.notFound", "暂时没有找到原操作的权威结果；请再次查询，确认前不要发起新的操作。");
 i18n.addResource("zh-CN", "translation", "operationRecovery.error", "无法核对原操作；请再次查询，确认前不要发起新的操作。");
 i18n.addResource("zh-CN", "translation", "operationRecovery.retry", "再次查询");
-i18n.addResource("zh-CN", "translation", "operationRecovery.clear", "放弃恢复状态");
 i18n.addResource("zh-CN", "translation", "errors.operationRecoveryRequired", "请先完成原操作核对，再发起新的操作。");
 i18n.addResource("en", "translation", "operationRecovery.title", "Operation recovery");
 i18n.addResource("en", "translation", "operationRecovery.checking", "Checking the original operation to confirm whether it committed before the connection failed.");
@@ -122,7 +121,6 @@ i18n.addResource("en", "translation", "operationRecovery.blocked", "The original
 i18n.addResource("en", "translation", "operationRecovery.notFound", "No authoritative result for the original operation is available. Check again before starting a new action.");
 i18n.addResource("en", "translation", "operationRecovery.error", "The original operation could not be reconciled. Check again before starting a new action.");
 i18n.addResource("en", "translation", "operationRecovery.retry", "Check again");
-i18n.addResource("en", "translation", "operationRecovery.clear", "Discard recovery state");
 i18n.addResource("en", "translation", "errors.operationRecoveryRequired", "Reconcile the original operation before starting a new action.");
 
 export async function changeLocale(locale: Locale): Promise<void> {

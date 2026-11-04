@@ -152,12 +152,23 @@ function ghJson(repository: string, endpoint: string): { ok: true; value: any } 
   try { return { ok: true, value: JSON.parse(new TextDecoder().decode(result.stdout)) }; } catch { return { ok: false }; }
 }
 
+function ghJsonPaged(repository: string, endpoint: string): { ok: true; value: any[] } | { ok: false } {
+  const values: any[] = [];
+  for (let page = 1; page <= 100; page += 1) {
+    const result = ghJson(repository, `${endpoint}?per_page=100&page=${page}`);
+    if (!result.ok || !Array.isArray(result.value)) return { ok: false };
+    values.push(...result.value);
+    if (result.value.length < 100) return { ok: true, value: values };
+  }
+  return { ok: false };
+}
+
 export function auditRepository(repository: string): PlatformAudit {
   const errors: string[] = [];
   const protection = ghJson(repository, "branches/main/protection");
   const signatures = ghJson(repository, "branches/main/protection/required_signatures");
   const rulesets = ghJson(repository, "rulesets?includes_parents=true");
-  const releases = ghJson(repository, "releases?per_page=10");
+  const releases = ghJsonPaged(repository, "releases");
   if (!protection.ok) errors.push("api:branch_protection");
   if (!signatures.ok) errors.push("api:required_signatures");
   if (!rulesets.ok) errors.push("api:rulesets");

@@ -268,6 +268,7 @@ func TestOverviewRedactsInvalidObservationTimestampAndSafeCode(t *testing.T) {
 		"draining":               false,
 		"observation_consistent": true,
 		"task_states":            completeTaskStates(2),
+		"default_admission":      map[string]any{"ready": true},
 	}
 	value, err := authority.overview(metrics, context.Background())
 	if err != nil {
@@ -280,6 +281,10 @@ func TestOverviewRedactsInvalidObservationTimestampAndSafeCode(t *testing.T) {
 	native := sources[1].(map[string]any)
 	if native["observed_at"] != nil || native["state"] != "unverified" || native["safe_code"] != "observation_unverified" {
 		t.Fatalf("native source=%#v", native)
+	}
+	capacity := value["capacity"].(map[string]any)
+	if capacity["logical_cpu_remaining_vcpu"].(map[string]any)["state"] != "unverified" || capacity["logical_cpu_remaining_vcpu"].(map[string]any)["observed_at"] != nil {
+		t.Fatalf("invalid timestamp leaked into capacity observation=%#v", capacity)
 	}
 }
 
