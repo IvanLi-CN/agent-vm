@@ -327,7 +327,7 @@ async function recover(): Promise<void> {
   if (current.stage === "draft") {
     const view = await adapter.viewRelease(tag) as { isDraft?: boolean };
     if (view.isDraft === true) {
-      verifyReleaseView(view, tag, true, assets);
+      verifyReleaseView(view, tag, true, assets, current.identity.source_revision);
       await adapter.publish(tag);
     } else {
       verifyReleaseView(view, tag, false, assets);
@@ -348,9 +348,7 @@ async function main(): Promise<void> {
   if (operation === "release") return release();
   const version = requireOption("--reservation");
   if (operation === "abandon") {
-    if (process.env.GITHUB_ACTIONS === "true") {
-      assertWorkflowPlatformAttestation(process.env.GITHUB_REF, process.env.RELEASE_REF_PROTECTED);
-    }
+    assertPlatformPreconditions();
     const adapter = new GhGithubAdapter();
     const event = await stateStore(adapter).abandon(version, "manual release recovery abandon");
     console.log(JSON.stringify({ stage: event.stage, version }));

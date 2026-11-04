@@ -3,7 +3,7 @@ import i18n from "./i18n";
 import { auditReasonCharacterLength, auditReasonWithinLimit } from "./validation";
 
 const managementErrorCodes = [
-  "authentication_required", "oidc_unavailable", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "token_expired", "token_revoked", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "service_unavailable", "state_unavailable", "rate_limited", "lease_expired", "task_not_active", "draining", "mapping_unverified", "cleanup_incomplete", "resource_unverified", "startup_reconcile_required", "internal_error",
+  "authentication_required", "oidc_unavailable", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "token_expired", "token_revoked", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "resource_insufficient", "watermarks_unreachable", "controller_lease_required", "mapping_unverified", "state_unverified", "precondition_required", "service_unavailable", "state_unavailable", "rate_limited", "lease_expired", "task_not_active", "draining", "cleanup_incomplete", "resource_unverified", "startup_reconcile_required", "internal_error",
 ] as const;
 
 function response(body: unknown, status = 200): Response {

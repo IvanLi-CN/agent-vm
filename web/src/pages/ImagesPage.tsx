@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, ChevronLeft, ChevronRight, FileUp, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { actionLabel, formatDateTime, shortFingerprint } from "../app/format";
 import { ManagementRequestError, createOperationId, listImages, previewImageAction, startImageImport, submitImageAction, uploadImageImportContent } from "../app/api";
@@ -15,7 +15,10 @@ import { CopyButton, EmptyState, Input, Panel, PanelHeader, StatusBadge, Button 
 import { DefinitionList, PageIntro, QueryError } from "../components/PagePrimitives";
 
 type ImageAction = "default" | "delete" | "retire";
-type ImportSubmission = { request: ImageImportRequest; content?: File | { metadata: File; rootfs: File } };
+type ImportContent = File | { metadata: File; rootfs: File };
+type ImportSubmission = { request: ImageImportRequest; content?: ImportContent };
+type ImportContinuation = { operationId: string; content: ImportContent };
+type ImportMutationInput = ImportSubmission | ImportContinuation;
 const importRejectedCodes = new Set(["invalid_request", "source_not_allowed", "permission_denied", "stale_target", "operation_conflict", "not_found", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch"]);
 
 export function ImagesPage() {
@@ -43,17 +46,28 @@ export function ImagesPage() {
   const importReasonTooLong = !auditReasonWithinLimit(reason);
   const [importMessage, setImportMessage] = useState("");
   const [pendingImport, setPendingImport] = useState<ImportSubmission | null>(null);
+  const uploadContinuationRef = useRef<string | null>(null);
   const [action, setAction] = useState<ImageAction | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
   const [operationId, setOperationId, operationRecovery] = useOperationRecovery("/images", auth.isAuthenticated);
   const query = useQuery({ queryKey: ["images", search, cursor], queryFn: () => listImages(search, cursor), enabled: auth.isAuthenticated, refetchInterval: 10_000, refetchIntervalInBackground: false });
   const selected = query.data?.items.find((image) => image.fingerprint === selectedFingerprint) ?? query.data?.items[0] ?? null;
   const importMutation = useMutation({
-    mutationFn: async ({ request, content }: ImportSubmission) => {
+    mutationFn: async (input: ImportMutationInput) => {
+      if ("operationId" in input) {
+        uploadContinuationRef.current = input.operationId;
+        return uploadImageImportContent(input.operationId, input.content);
+      }
+      const { request, content } = input;
       const operation = await startImageImport(request);
-      return content && operation.status === "awaiting_upload" ? uploadImageImportContent(operation.operation_id, content) : operation;
+      if (content && operation.status === "awaiting_upload") {
+        uploadContinuationRef.current = operation.operation_id;
+        return uploadImageImportContent(operation.operation_id, content);
+      }
+      return operation;
     },
     onSuccess: (operation) => {
+      uploadContinuationRef.current = null;
       if (operation.status === "failed") {
         setImportMessage(t(`errors.${operation.error?.code ?? "generic"}`, { defaultValue: t("errors.generic") }));
         setPendingImport(null);
@@ -76,6 +90,7 @@ export function ImagesPage() {
     },
     onError: (error) => {
       if (error instanceof ManagementRequestError && importRejectedCodes.has(error.code)) {
+        uploadContinuationRef.current = null;
         setPendingImport(null);
         setOperationId(null);
       } else {
@@ -97,8 +112,29 @@ export function ImagesPage() {
     importMutation.mutate(submission);
   };
 
+  const selectedUploadContent = (): ImportContent | null => {
+    if (format === "unified") return uploadFile;
+    if (metadataFile && rootfsFile) return { metadata: metadataFile, rootfs: rootfsFile };
+    return null;
+  };
+
   const startImport = () => {
     if (importReasonTooLong) { setImportMessage(t("common.reasonTooLong")); return; }
+    const pendingUploadContent = pendingImport?.content;
+    if (uploadContinuationRef.current && pendingUploadContent) {
+      const recoveredOperationId = uploadContinuationRef.current;
+      setOperationId(recoveredOperationId);
+      importMutation.mutate({ operationId: recoveredOperationId, content: pendingUploadContent });
+      return;
+    }
+    const recoveredOperation = operationRecovery.operation;
+    const recoveredUploadContent = selectedUploadContent();
+    if (!pendingImport && recoveredOperation?.status === "awaiting_upload") {
+      if (!recoveredUploadContent) { setImportMessage(t("images.fileRequired")); return; }
+      setOperationId(recoveredOperation.operation_id);
+      importMutation.mutate({ operationId: recoveredOperation.operation_id, content: recoveredUploadContent });
+      return;
+    }
     if (pendingImport) {
       submitImport(pendingImport);
       return;

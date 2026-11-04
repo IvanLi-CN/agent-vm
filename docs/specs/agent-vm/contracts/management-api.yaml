@@ -1919,7 +1919,6 @@ components:
             - task_not_active
             - draining
             - cleanup_incomplete
-            - resource_unverified
             - startup_reconcile_required
             - internal_error
         phase:
@@ -2141,7 +2140,7 @@ components:
             properties:
               name:
                 type: string
-                enum: [service, caddy, rqlite, incus]
+                enum: [web, authority, observer]
               state:
                 type: string
                 enum: [ready, degraded, unavailable, unknown]
