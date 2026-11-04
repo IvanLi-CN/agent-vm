@@ -17,6 +17,7 @@ import (
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd/store"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
 const (
@@ -108,6 +109,7 @@ type Status struct {
 type Manager struct {
 	Store         *store.Store
 	Runtime       Runtime
+	Migration     MigrationRuntime
 	Clock         func() time.Time
 	LeaseDuration time.Duration
 
@@ -116,13 +118,17 @@ type Manager struct {
 }
 
 func NewManager(database *store.Store, runtime Runtime, leaseDuration time.Duration, clock func() time.Time) *Manager {
+	return NewManagerWithMigration(database, runtime, nil, leaseDuration, clock)
+}
+
+func NewManagerWithMigration(database *store.Store, runtime Runtime, migration MigrationRuntime, leaseDuration time.Duration, clock func() time.Time) *Manager {
 	if clock == nil {
 		clock = time.Now
 	}
 	if leaseDuration <= 0 {
 		leaseDuration = 15 * time.Second
 	}
-	return &Manager{Store: database, Runtime: runtime, Clock: clock, LeaseDuration: leaseDuration}
+	return &Manager{Store: database, Runtime: runtime, Migration: migration, Clock: clock, LeaseDuration: leaseDuration}
 }
 
 func (manager *Manager) Status(ctx context.Context) (Status, error) {
@@ -422,6 +428,57 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 	if !transaction.RecoveryRequired && transaction.State != "needs_recovery" {
 		return nil, errors.New("transaction does not require recovery")
 	}
+	if transaction.TargetSlot == "state" {
+		if action != "retry-migration" {
+			return nil, errors.New("state migration recovery action must be retry-migration")
+		}
+		if manager.Migration == nil {
+			return nil, errors.New("migration runtime is unavailable")
+		}
+		if err := manager.Store.ConsumeMigrationRetry(ctx, transaction.ID, manager.Clock().UTC()); err != nil {
+			return nil, err
+		}
+		if err := manager.Migration.FenceLegacy(ctx); err != nil {
+			return nil, err
+		}
+		if err := manager.Migration.StartStateAuthority(ctx); err != nil {
+			return nil, err
+		}
+		expectedEvidence, evidencePresent, err := manager.migrationSourceEvidence(ctx, transaction.ID)
+		if err != nil {
+			return nil, manager.migrationFailure(ctx, transaction.ID, transaction.Phase, err, true)
+		}
+		allowResnapshot := (transaction.Phase == PhaseMigrationStop || transaction.Phase == PhaseMigrationSourceCheck) && !evidencePresent
+		result, err := manager.Migration.RetryMigration(ctx, transaction.ID, expectedEvidence, allowResnapshot)
+		if err != nil {
+			if markErr := manager.Store.FailMigrationRetry(ctx, transaction.ID, manager.Clock().UTC()); markErr != nil {
+				return nil, &UncertainError{Cause: fmt.Errorf("migration retry failed and retry state could not be finalized: %v; %w", err, markErr)}
+			}
+			return nil, &UncertainError{Cause: err}
+		}
+		updated, err := manager.Store.Transition(ctx, transaction.ID, transaction.Phase, PhaseMigrationFinalize, stateForPhase(PhaseMigrationFinalize), "recovery_import_verified", "deployd", map[string]any{
+			"source_sha256": result.SourceSHA256,
+			"source_size":   result.SourceSize,
+			"state_epoch":   result.StateEpoch,
+			"target_sha256": result.TargetSHA256,
+		}, manager.Clock().UTC())
+		if err != nil {
+			return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationFinalize, err, true)
+		}
+		if err := manager.Migration.FinalizeMigration(ctx, transaction.ID, true, result); err != nil {
+			return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationFinalize, err, true)
+		}
+		if verifier, ok := manager.Migration.(migrationTargetVerifier); ok {
+			if err := verifier.VerifyMigrationTarget(ctx, transaction.ID); err != nil {
+				return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationFinalize, err, true)
+			}
+		}
+		updated, err = manager.Store.Transition(ctx, transaction.ID, PhaseMigrationFinalize, PhaseFinalize, stateForPhase(PhaseFinalize), "migration_recovered", "deployd", map[string]any{"business_authority": "rqlite"}, manager.Clock().UTC())
+		if err != nil {
+			return nil, manager.migrationFailure(ctx, transaction.ID, PhaseMigrationFinalize, err, true)
+		}
+		return updated, nil
+	}
 	switch action {
 	case "rollback":
 		if transaction.RollbackUsed && transaction.Phase != PhaseRollback {
@@ -502,6 +559,30 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 	}
 }
 
+func (manager *Manager) migrationSourceEvidence(ctx context.Context, id string) (state.SQLiteMigrationEvidence, bool, error) {
+	event, err := manager.Store.LatestEvent(ctx, id, PhaseMigrationImport, "source_verified")
+	if err != nil {
+		return state.SQLiteMigrationEvidence{}, false, err
+	}
+	if event == nil {
+		return state.SQLiteMigrationEvidence{}, false, nil
+	}
+	sourceSHA256, sourceOK := event.Evidence["source_sha256"].(string)
+	stateEpoch, epochOK := event.Evidence["state_epoch"].(string)
+	sourceSize, sizeOK := integerValue(event.Evidence["source_size"])
+	fenceID, fenceOK := event.Evidence["fence_id"].(string)
+	if !sourceOK || sourceSHA256 == "" || !epochOK || stateEpoch == "" || !sizeOK || sourceSize < 0 || !fenceOK || fenceID == "" {
+		return state.SQLiteMigrationEvidence{}, true, errors.New("migration source evidence is incomplete")
+	}
+	return state.SQLiteMigrationEvidence{
+		FenceID:      fenceID,
+		SourceSHA256: sourceSHA256,
+		SourceSize:   sourceSize,
+		StateEpoch:   stateEpoch,
+		VerifiedAt:   event.CreatedAt,
+	}, true, nil
+}
+
 func (manager *Manager) RecoverOnStart(ctx context.Context) error {
 	manager.mu.Lock()
 	defer manager.mu.Unlock()
@@ -512,6 +593,12 @@ func (manager *Manager) RecoverOnStart(ctx context.Context) error {
 	}
 	var firstErr error
 	for _, transaction := range transactions {
+		if transaction.TargetSlot == "state" && manager.Migration != nil {
+			if err := manager.recoverMigrationOnStart(ctx, transaction); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
 		_, observeErr := manager.observe(ctx, transaction.ID)
 		cause := &UncertainError{Cause: errors.New("deployd restarted while deployment transaction was active")}
 		if observeErr != nil {

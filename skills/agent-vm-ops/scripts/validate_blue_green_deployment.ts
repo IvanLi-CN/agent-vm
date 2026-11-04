@@ -114,6 +114,20 @@ requireText(deploydUnit, "ReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-
 requireText(deploydUnit, "User=root", "Deployd owns the host deployment boundary");
 forbidText(deploydUnit, "Requires=agent-vm-rqlite.service", "Deployd does not depend on the business state authority");
 
+const deploydConfigText = read(join(assetsRoot, "deployd.json.example"));
+try {
+  const deploydConfig = JSON.parse(deploydConfigText);
+  const migration = deploydConfig.migration;
+  requireCheck(migration?.legacy_unit === "agent-vm-native.service", "migration fences the fixed legacy singleton");
+  requireCheck(migration?.rqlite_unit === "agent-vm-rqlite.service", "migration starts the fixed rqlite unit");
+  requireCheck(migration?.rqlite_url === "https://127.0.0.1:4001", "migration uses the fixed local HTTPS rqlite endpoint");
+  requireCheck(migration?.rqlite_ca_file === "/etc/agent-vm-native/tls/rqlite/server.crt", "migration trusts the configured rqlite certificate");
+  requireCheck(migration?.rqlite_auth_file === "/etc/agent-vm-native/rqlite/auth.json", "migration reads the protected rqlite auth file");
+  requireCheck(migration?.drain_timeout_seconds === 8100, "migration drain budget is bounded at 8100 seconds");
+} catch (error) {
+  errors.push(`deployd config example is invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+}
+
 const caddyUnit = read(join(assetsRoot, "systemd/agent-vm-caddy.service"));
 requireText(caddyUnit, "User=caddy", "Caddy does not run as root");
 requireText(caddyUnit, "SupplementaryGroups=agent-vm-web", "Caddy can access the protected socket group");

@@ -34,13 +34,20 @@ func run(args []string) error {
 	slot := flags.String("slot", "", "target slot")
 	bundle := flags.String("bundle", "", "verified release bundle")
 	action := flags.String("action", "", "recovery action")
+	timeoutSeconds := flags.Int("timeout", 60, "request timeout in seconds")
 	jsonOutput := flags.Bool("json", false, "output JSON")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
 	_ = jsonOutput
-	client := deployd.Client{Socket: *socket, Timeout: 60 * time.Second}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	if command == "migrate" && *timeoutSeconds == 60 {
+		*timeoutSeconds = 9000
+	}
+	if *timeoutSeconds <= 0 {
+		return errors.New("timeout must be positive")
+	}
+	client := deployd.Client{Socket: *socket, Timeout: time.Duration(*timeoutSeconds) * time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeoutSeconds)*time.Second)
 	defer cancel()
 	var method, path string
 	var body any
@@ -76,6 +83,8 @@ func run(args []string) error {
 			return errors.New("recover requires --transaction and --action")
 		}
 		method, path, body = "POST", "/v1/recover", map[string]any{"transaction_id": *id, "action": *action}
+	case "migrate":
+		method, path, body = "POST", "/v1/migrate", map[string]any{}
 	default:
 		return fmt.Errorf("unknown deployd command %q", command)
 	}

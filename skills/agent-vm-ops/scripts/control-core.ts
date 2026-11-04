@@ -47,7 +47,7 @@ export class ControlCore {
   }
   _is_write_action(action: string, request?: Data): boolean { return ControlCore._is_write_action(action, request); }
   _global_lock<T>(fn: () => Promise<T> | T): Promise<T> { return with_lock(this.lock_path, fn); }
-  _authority_lock<T>(fn: () => Promise<T> | T): Promise<T> { return with_lock(this.authority_lock_path, fn, true, false, true); }
+  _authority_lock<T>(fn: () => Promise<T> | T): Promise<T> { return with_lock(this.authority_lock_path, fn, true, true, true); }
   _admission_lock<T>(fn: () => Promise<T> | T): Promise<T> { return with_lock(this.admission_lock_path, fn); }
   _object_lock<T>(identity: string, fn: () => Promise<T> | T, blocking: boolean | Data = true): Promise<T> { return with_lock(object_lock_path(dirname(this.store.path), identity), fn, typeof blocking === "object" ? blocking.blocking !== false : blocking); }
   _native_lock<T>(task: Data, fn: () => Promise<T> | T): Promise<T> { return with_lock(object_lock_path(dirname(this.store.path), "native:" + task.session_id), fn, true, true); }

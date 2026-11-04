@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,6 +17,19 @@ type MetricsTLSConfig struct {
 	Certificate string `json:"certificate"`
 	PrivateKey  string `json:"private_key"`
 	ClientCA    string `json:"client_ca"`
+}
+
+type MigrationConfig struct {
+	LegacySocket        string `json:"legacy_socket"`
+	LegacyUnit          string `json:"legacy_unit"`
+	LegacyStateDB       string `json:"legacy_state_db"`
+	RQLiteURL           string `json:"rqlite_url"`
+	RQLiteUnit          string `json:"rqlite_unit"`
+	RQLiteCAFile        string `json:"rqlite_ca_file"`
+	RQLiteAuthFile      string `json:"rqlite_auth_file"`
+	RecoveryDirectory   string `json:"recovery_directory"`
+	DrainTimeoutSeconds int64  `json:"drain_timeout_seconds"`
+	WriterCheckSeconds  int64  `json:"writer_check_seconds"`
 }
 
 type Config struct {
@@ -32,6 +46,7 @@ type Config struct {
 	LeaseSeconds   int64            `json:"lease_seconds"`
 	RetentionDays  int64            `json:"retention_days"`
 	ObserveSeconds int64            `json:"observe_seconds"`
+	Migration      MigrationConfig  `json:"migration"`
 }
 
 func Defaults() Config {
@@ -47,6 +62,17 @@ func Defaults() Config {
 		LeaseSeconds:   15,
 		RetentionDays:  30,
 		ObserveSeconds: 5,
+		Migration: MigrationConfig{
+			LegacySocket:        "/run/agent-vm-native/app.sock",
+			LegacyUnit:          "agent-vm-native.service",
+			LegacyStateDB:       "/var/lib/agent-vm-native/state.sqlite3",
+			RQLiteUnit:          "agent-vm-rqlite.service",
+			RQLiteCAFile:        "/etc/agent-vm-native/tls/rqlite/server.crt",
+			RQLiteAuthFile:      "/etc/agent-vm-native/rqlite/auth.json",
+			RecoveryDirectory:   "/var/lib/agent-vm-native/migration",
+			DrainTimeoutSeconds: 8100,
+			WriterCheckSeconds:  1,
+		},
 	}
 }
 
@@ -89,6 +115,9 @@ func (config Config) Validate() error {
 	if config.LeaseSeconds < 3 || config.RetentionDays <= 0 || config.ObserveSeconds <= 0 {
 		return errors.New("deployd config invalid: lease, retention and observe intervals are invalid")
 	}
+	if err := config.Migration.Validate(); err != nil {
+		return err
+	}
 	if config.Socket == config.LockPath || config.Socket == config.Database || config.Socket == config.ActivePath || config.LockPath == config.Database || config.LockPath == config.ActivePath {
 		return errors.New("deployd config invalid: socket or lock path collides with a state path")
 	}
@@ -116,6 +145,36 @@ func (config Config) Validate() error {
 	tlsConfigured := config.MetricsTLS.Certificate != "" || config.MetricsTLS.PrivateKey != "" || config.MetricsTLS.ClientCA != ""
 	if tlsConfigured && (config.MetricsTLS.Certificate == "" || config.MetricsTLS.PrivateKey == "" || config.MetricsTLS.ClientCA == "") {
 		return errors.New("deployd config invalid: metrics_tls requires certificate, private_key and client_ca together")
+	}
+	return nil
+}
+
+func (config MigrationConfig) Validate() error {
+	for name, value := range map[string]string{
+		"migration.legacy_socket":      config.LegacySocket,
+		"migration.legacy_state_db":    config.LegacyStateDB,
+		"migration.rqlite_ca_file":     config.RQLiteCAFile,
+		"migration.rqlite_auth_file":   config.RQLiteAuthFile,
+		"migration.recovery_directory": config.RecoveryDirectory,
+	} {
+		if value == "" || !filepath.IsAbs(value) {
+			return fmt.Errorf("deployd config invalid: %s must be an absolute path", name)
+		}
+	}
+	if config.LegacyUnit != "agent-vm-native.service" {
+		return errors.New("deployd config invalid: migration.legacy_unit must be agent-vm-native.service")
+	}
+	if config.RQLiteUnit != "agent-vm-rqlite.service" {
+		return errors.New("deployd config invalid: migration.rqlite_unit must be agent-vm-rqlite.service")
+	}
+	if config.RQLiteURL != "" {
+		parsed, err := neturl.Parse(config.RQLiteURL)
+		if err != nil || parsed.Host == "" || parsed.Scheme != "https" {
+			return errors.New("deployd config invalid: migration.rqlite_url must be an HTTPS URL")
+		}
+	}
+	if config.DrainTimeoutSeconds <= 0 || config.WriterCheckSeconds <= 0 {
+		return errors.New("deployd config invalid: migration timeouts are invalid")
 	}
 	return nil
 }

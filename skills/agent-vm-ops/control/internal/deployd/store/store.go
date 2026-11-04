@@ -17,7 +17,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const schemaVersion = 1
+const schemaVersion = 3
 
 const LatestObservationID = "__latest__"
 
@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS deployment_transactions (
   generation INTEGER NOT NULL,
   rollback_used INTEGER NOT NULL DEFAULT 0,
   recovery_required INTEGER NOT NULL DEFAULT 0,
+  migration_retry_count INTEGER NOT NULL DEFAULT 0,
+  migration_retry_state TEXT NOT NULL DEFAULT 'unused',
   error_code TEXT NOT NULL DEFAULT '',
   error_message TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
@@ -86,19 +88,21 @@ CREATE TABLE IF NOT EXISTS deployment_latest_observation (
 );`
 
 type Transaction struct {
-	ID               string    `json:"transaction_id"`
-	TargetSlot       string    `json:"target_slot"`
-	PreviousSlot     string    `json:"previous_slot"`
-	Bundle           string    `json:"bundle"`
-	Phase            string    `json:"phase"`
-	State            string    `json:"state"`
-	Generation       int64     `json:"generation"`
-	RollbackUsed     bool      `json:"rollback_used"`
-	RecoveryRequired bool      `json:"recovery_required"`
-	ErrorCode        string    `json:"error_code,omitempty"`
-	ErrorMessage     string    `json:"error_message,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
-	UpdatedAt        time.Time `json:"updated_at"`
+	ID                  string    `json:"transaction_id"`
+	TargetSlot          string    `json:"target_slot"`
+	PreviousSlot        string    `json:"previous_slot"`
+	Bundle              string    `json:"bundle"`
+	Phase               string    `json:"phase"`
+	State               string    `json:"state"`
+	Generation          int64     `json:"generation"`
+	RollbackUsed        bool      `json:"rollback_used"`
+	RecoveryRequired    bool      `json:"recovery_required"`
+	MigrationRetryCount int       `json:"migration_retry_count"`
+	MigrationRetryState string    `json:"migration_retry_state"`
+	ErrorCode           string    `json:"error_code,omitempty"`
+	ErrorMessage        string    `json:"error_message,omitempty"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 type PhaseEvent struct {
@@ -203,10 +207,33 @@ func (s *Store) initialize(ctx context.Context) error {
 			_ = tx.Rollback()
 			return fmt.Errorf("write deployment schema version: %w", err)
 		}
+		version = fmt.Sprint(schemaVersion)
 	} else if err != nil {
 		_ = tx.Rollback()
 		return fmt.Errorf("read deployment schema version: %w", err)
-	} else if version != fmt.Sprint(schemaVersion) {
+	} else if version == "1" {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE deployment_transactions ADD COLUMN migration_retry_count INTEGER NOT NULL DEFAULT 0"); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("migrate deployment schema to version 2: %w", err)
+		}
+		version = "2"
+		if _, err := tx.ExecContext(ctx, "UPDATE meta SET value = ? WHERE key = 'schema_version'", version); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("write deployment schema version: %w", err)
+		}
+	}
+	if version == "2" {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE deployment_transactions ADD COLUMN migration_retry_state TEXT NOT NULL DEFAULT 'unused'"); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("migrate deployment schema to version 3: %w", err)
+		}
+		version = fmt.Sprint(schemaVersion)
+		if _, err := tx.ExecContext(ctx, "UPDATE meta SET value = ? WHERE key = 'schema_version'", version); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("write deployment schema version: %w", err)
+		}
+	}
+	if version != fmt.Sprint(schemaVersion) {
 		_ = tx.Rollback()
 		return fmt.Errorf("deployment schema version %s is unsupported", version)
 	}
@@ -273,6 +300,15 @@ func (s *Store) Create(ctx context.Context, transaction Transaction, evidence ma
 		if !errors.Is(activeErr, sql.ErrNoRows) {
 			return activeErr
 		}
+		if transaction.TargetSlot == "state" && transaction.Bundle == "sqlite-to-rqlite" {
+			var migrationCount int
+			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM deployment_transactions WHERE target_slot = 'state' AND bundle = 'sqlite-to-rqlite'`).Scan(&migrationCount); err != nil {
+				return err
+			}
+			if migrationCount != 0 {
+				return errors.New("state migration transaction already exists")
+			}
+		}
 		rollback := boolInt(transaction.RollbackUsed)
 		recovery := boolInt(transaction.RecoveryRequired)
 		if _, err := tx.ExecContext(ctx, `INSERT INTO deployment_transactions
@@ -285,12 +321,12 @@ func (s *Store) Create(ctx context.Context, transaction Transaction, evidence ma
 }
 
 func (s *Store) Get(ctx context.Context, id string) (*Transaction, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,error_code,error_message,created_at,updated_at FROM deployment_transactions WHERE transaction_id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,migration_retry_count,migration_retry_state,error_code,error_message,created_at,updated_at FROM deployment_transactions WHERE transaction_id = ?`, id)
 	return scanTransaction(row)
 }
 
 func (s *Store) ListActive(ctx context.Context) ([]Transaction, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,error_code,error_message,created_at,updated_at FROM deployment_transactions WHERE state NOT IN ('finalized','rolled_back','failed') ORDER BY updated_at DESC`)
+	rows, err := s.db.QueryContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,migration_retry_count,migration_retry_state,error_code,error_message,created_at,updated_at FROM deployment_transactions WHERE state NOT IN ('finalized','rolled_back','failed') ORDER BY updated_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -304,6 +340,22 @@ func (s *Store) ListActive(ctx context.Context) ([]Transaction, error) {
 		result = append(result, *transaction)
 	}
 	return result, rows.Err()
+}
+
+func (s *Store) LatestFinalizedMigration(ctx context.Context) (*Transaction, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,migration_retry_count,migration_retry_state,error_code,error_message,created_at,updated_at
+		FROM deployment_transactions
+		WHERE target_slot = 'state' AND state = 'finalized'
+		ORDER BY updated_at DESC
+		LIMIT 1`)
+	transaction, err := scanTransaction(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return transaction, nil
 }
 
 func (s *Store) LatestEvent(ctx context.Context, transactionID, phase, transition string) (*PhaseEvent, error) {
@@ -394,7 +446,7 @@ func (s *Store) Transition(ctx context.Context, id, expectedPhase, phase, state,
 			return err
 		}
 		var scanErr error
-		result, scanErr = scanTransaction(tx.QueryRowContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,error_code,error_message,created_at,updated_at FROM deployment_transactions WHERE transaction_id = ?`, id))
+		result, scanErr = scanTransaction(tx.QueryRowContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,migration_retry_count,migration_retry_state,error_code,error_message,created_at,updated_at FROM deployment_transactions WHERE transaction_id = ?`, id))
 		return scanErr
 	})
 	if err != nil {
@@ -407,6 +459,72 @@ func (s *Store) SetRollbackUsed(ctx context.Context, id string, now time.Time) e
 	return s.write(ctx, func(tx *sql.Tx) error {
 		_, err := tx.ExecContext(ctx, "UPDATE deployment_transactions SET rollback_used = 1, updated_at = ? WHERE transaction_id = ?", formatTime(now), id)
 		return err
+	})
+}
+
+// ConsumeMigrationRetry starts the single logical automatic migration retry.
+// An in-progress retry may be resumed after a Deployd crash; a retry that has
+// returned a definite failure is exhausted and cannot be started again.
+func (s *Store) ConsumeMigrationRetry(ctx context.Context, id string, now time.Time) error {
+	if now.IsZero() {
+		now = s.clock().UTC()
+	}
+	return s.write(ctx, func(tx *sql.Tx) error {
+		var targetSlot, bundle, state, retryState string
+		var recoveryRequired, retryCount int
+		if err := tx.QueryRowContext(ctx, `SELECT target_slot,bundle,state,recovery_required,migration_retry_count,migration_retry_state
+			FROM deployment_transactions WHERE transaction_id = ?`, id).Scan(&targetSlot, &bundle, &state, &recoveryRequired, &retryCount, &retryState); err != nil {
+			return err
+		}
+		if targetSlot != "state" || bundle != "sqlite-to-rqlite" {
+			return errors.New("transaction is not the initial state migration")
+		}
+		if state != "needs_recovery" && recoveryRequired == 0 {
+			return errors.New("transaction does not require recovery")
+		}
+		if retryCount >= 1 && retryState == "in_progress" {
+			return nil
+		}
+		if retryCount >= 1 || (retryState != "" && retryState != "unused") {
+			return errors.New("automatic migration retry has already been consumed")
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE deployment_transactions
+			SET migration_retry_count = migration_retry_count + 1, migration_retry_state = 'in_progress', updated_at = ?
+			WHERE transaction_id = ? AND migration_retry_count = 0 AND migration_retry_state = 'unused'`, formatTime(now), id)
+		if err != nil {
+			return err
+		}
+		if affected, err := result.RowsAffected(); err != nil {
+			return err
+		} else if affected != 1 {
+			return errors.New("automatic migration retry was consumed concurrently")
+		}
+		return nil
+	})
+}
+
+// FailMigrationRetry closes the logical retry attempt after its runtime
+// action returned a definite failure. A crash before this call leaves the
+// attempt resumable on the next Deployd start.
+func (s *Store) FailMigrationRetry(ctx context.Context, id string, now time.Time) error {
+	if now.IsZero() {
+		now = s.clock().UTC()
+	}
+	return s.write(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE deployment_transactions
+				SET migration_retry_state = 'exhausted', updated_at = ?
+				WHERE transaction_id = ? AND migration_retry_count = 1 AND migration_retry_state = 'in_progress'`, formatTime(now), id)
+		if err != nil {
+			return err
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if affected != 1 {
+			return errors.New("automatic migration retry is not in progress")
+		}
+		return nil
 	})
 }
 
@@ -442,7 +560,7 @@ func (s *Store) BeginRollback(ctx context.Context, id, expectedPhase, phase, tra
 			return err
 		}
 		var scanErr error
-		result, scanErr = scanTransaction(tx.QueryRowContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,error_code,error_message,created_at,updated_at FROM deployment_transactions WHERE transaction_id = ?`, id))
+		result, scanErr = scanTransaction(tx.QueryRowContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,migration_retry_count,migration_retry_state,error_code,error_message,created_at,updated_at FROM deployment_transactions WHERE transaction_id = ?`, id))
 		return scanErr
 	})
 	if err != nil {
@@ -560,7 +678,7 @@ func (s *Store) Cleanup(ctx context.Context, now time.Time) (int64, error) {
 	cutoff := now.Add(-s.retention)
 	returnValue := int64(0)
 	err := s.write(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, `DELETE FROM deployment_transactions WHERE state IN ('finalized','rolled_back','failed') AND recovery_required = 0 AND updated_at < ?`, formatTime(cutoff))
+		result, err := tx.ExecContext(ctx, `DELETE FROM deployment_transactions WHERE state IN ('finalized','rolled_back','failed') AND recovery_required = 0 AND updated_at < ? AND NOT (target_slot = 'state' AND bundle = 'sqlite-to-rqlite')`, formatTime(cutoff))
 		if err != nil {
 			return err
 		}
@@ -597,9 +715,10 @@ type scanner interface{ Scan(dest ...any) error }
 
 func scanTransaction(row scanner) (*Transaction, error) {
 	var value Transaction
-	var rollback, recovery int
+	var rollback, recovery, retryCount int
+	var retryState string
 	var created, updated string
-	if err := row.Scan(&value.ID, &value.TargetSlot, &value.PreviousSlot, &value.Bundle, &value.Phase, &value.State, &value.Generation, &rollback, &recovery, &value.ErrorCode, &value.ErrorMessage, &created, &updated); err != nil {
+	if err := row.Scan(&value.ID, &value.TargetSlot, &value.PreviousSlot, &value.Bundle, &value.Phase, &value.State, &value.Generation, &rollback, &recovery, &retryCount, &retryState, &value.ErrorCode, &value.ErrorMessage, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -616,6 +735,8 @@ func scanTransaction(row scanner) (*Transaction, error) {
 	}
 	value.RollbackUsed = rollback != 0
 	value.RecoveryRequired = recovery != 0
+	value.MigrationRetryCount = retryCount
+	value.MigrationRetryState = retryState
 	return &value, nil
 }
 
