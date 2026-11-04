@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { getOperation, ManagementRequestError } from "./api";
 import type { Operation } from "./types";
 
@@ -74,7 +74,9 @@ export function writeOperationRecovery(path: string, operationId: string | null)
 export function useOperationRecovery(path: string, enabled = true): [string | null, (operationId: string | null, persist?: boolean) => void, OperationRecovery] {
   const [operationId, setOperationIdState] = useState<string | null>(() => readOperationRecovery(path));
   const operationIdRef = useRef(operationId);
-  operationIdRef.current = operationId;
+  useLayoutEffect(() => {
+    operationIdRef.current = operationId;
+  }, [operationId]);
   const shouldReconcile = useRef<boolean | null>(null);
   const wasEnabled = useRef(enabled);
   const [retryCount, setRetryCount] = useState(0);
