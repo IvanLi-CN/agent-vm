@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { LogIn, ShieldAlert } from "lucide-react";
-import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import {
   getManagementLoginHref,
@@ -62,8 +62,10 @@ export function ManagementAuthProvider({ children, enabled = isManagementApiEnab
     retry: false,
     staleTime: 30_000,
   });
-  const sessionRef = useRef<ManagementSession | null>(null);
-  sessionRef.current = sessionQuery.data ?? null;
+  const sessionRef = useRef<ManagementSession | null>(sessionQuery.data ?? null);
+  useLayoutEffect(() => {
+    sessionRef.current = sessionQuery.data ?? null;
+  }, [sessionQuery.data]);
 
   useEffect(() => {
     if (!enabled) return;
