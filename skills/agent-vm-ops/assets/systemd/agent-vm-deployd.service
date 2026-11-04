@@ -20,8 +20,6 @@ ProtectHome=yes
 ReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native
 ReadOnlyPaths=/opt/agent-vm-native /etc/agent-vm-native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-RuntimeDirectory=agent-vm-native
-RuntimeDirectoryMode=0750
 UMask=0077
 
 [Install]
