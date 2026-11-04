@@ -207,31 +207,34 @@ func (authority *Authority) getPublicStatus(writer http.ResponseWriter, request 
 		writeProblem(writer, problemFromError(err, "request_validation", ""))
 		return
 	}
-	overview, err := authority.overview(metrics, request.Context())
-	if err != nil {
-		writeProblem(writer, problemFromError(err, "internal", ""))
-		return
-	}
 
-	admission, _ := overview["admission"].(map[string]any)
-	ready, readyOK := admission["ready"].(bool)
-	draining, _ := admission["draining"].(bool)
+	fresh, observationUnverified := capacityObservation(metrics, authority.Clock().UTC())
 	state := "unknown"
-	if readyOK {
+	if fresh {
+		ready := metrics["admission_ready"].(bool)
+		draining := metrics["draining"].(bool)
 		state = "degraded"
 		if ready && !draining {
 			state = "available"
 		}
+		if up, ok := metrics["up"].(bool); !ok || !up {
+			state = "degraded"
+		}
+		if defaultAdmission, ok := metrics["default_admission"].(map[string]any); ok {
+			if ready, ok := defaultAdmission["ready"].(bool); ok && !ready {
+				state = "degraded"
+			}
+		}
 	}
 	taskStatesValid := validTaskStates(metrics["task_states"])
-	if !taskStatesValid {
+	if !fresh || !taskStatesValid || observationUnverified {
 		state = "unknown"
 	}
 	activeSessions := any(nil)
-	if taskStatesValid {
+	if fresh && taskStatesValid {
 		activeSessions = int64Value(metricsMapValue(metrics, "task_states", "active"))
 	}
-	observationState := publicObservationState(overview["sources"])
+	observationState := publicObservationStateFromMetrics(metrics, fresh, observationUnverified)
 	if !taskStatesValid {
 		observationState = "unverified"
 	}
@@ -268,27 +271,43 @@ func (authority *Authority) readCapacityMetrics() (map[string]any, error) {
 	return envelope, nil
 }
 
-func publicObservationState(raw any) string {
-	sources, _ := raw.([]any)
-	state := "available"
-	for _, rawSource := range sources {
-		source, _ := rawSource.(map[string]any)
-		sourceState := stringValue(source["state"])
-		switch sourceState {
-		case "failed":
-			return "failed"
-		case "stale":
-			state = "stale"
-		case "missing", "unverified":
-			if state == "available" {
-				state = "unverified"
-			}
-		}
-	}
-	if len(sources) == 0 {
+func publicObservationStateFromMetrics(metrics map[string]any, fresh, unverified bool) string {
+	if unverified {
 		return "unverified"
 	}
-	return state
+	if !fresh {
+		return "stale"
+	}
+	return sourceState(metrics["up"])
+}
+
+func capacityObservation(metrics map[string]any, now time.Time) (fresh, unverified bool) {
+	observedAt := stringValue(metrics["observed_at"])
+	observedTime, parseErr := time.Parse(time.RFC3339Nano, observedAt)
+	if observedAt == "" || parseErr != nil || observedTime.After(now.Add(5*time.Second)) || now.Sub(observedTime) > 60*time.Second {
+		return false, false
+	}
+	if !validTaskStates(metrics["task_states"]) || !validAdmissionObservation(metrics) {
+		return false, true
+	}
+	return true, false
+}
+
+func validAdmissionObservation(metrics map[string]any) bool {
+	if _, ok := metrics["admission_ready"].(bool); !ok {
+		return false
+	}
+	if _, ok := metrics["draining"].(bool); !ok {
+		return false
+	}
+	return true
+}
+
+func nativeObservationState(value any, fresh, unverified bool) string {
+	if unverified {
+		return "unverified"
+	}
+	return sourceStateWithFreshness(value, fresh)
 }
 
 func (authority *Authority) overview(metrics map[string]any, ctx context.Context) (map[string]any, error) {
@@ -298,12 +317,7 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	}
 	now := authority.Clock().UTC()
 	observedAt := stringValue(metrics["observed_at"])
-	observedTime, parseErr := time.Parse(time.RFC3339Nano, observedAt)
-	fresh := observedAt != "" && parseErr == nil && !observedTime.After(now.Add(5*time.Second)) && now.Sub(observedTime) <= 60*time.Second
-	observationUnverified := fresh && !validTaskStates(metrics["task_states"])
-	if observationUnverified {
-		fresh = false
-	}
+	fresh, observationUnverified := capacityObservation(metrics, now)
 	if observedAt == "" {
 		observedAt = now.Format(time.RFC3339Nano)
 	}
@@ -330,9 +344,9 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	var admissionReady, draining any
 	admissionBlocked := false
 	if fresh {
-		admissionReady, _ = metrics["admission_ready"].(bool)
-		draining, _ = metrics["draining"].(bool)
-		if value, ok := draining.(bool); ok && value {
+		admissionReady = metrics["admission_ready"].(bool)
+		draining = metrics["draining"].(bool)
+		if draining.(bool) {
 			admissionBlocked = true
 		}
 	}
@@ -418,7 +432,7 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 		"task_counts":      states,
 		"sources": []any{
 			map[string]any{"name": "durable_state", "state": durableState, "observed_at": durableObservedAt, "stale_after_seconds": 60, "safe_code": nil},
-			map[string]any{"name": "native", "state": sourceStateWithFreshness(metrics["up"], fresh), "observed_at": observedAt, "stale_after_seconds": 60, "safe_code": nativeSafeCode},
+			map[string]any{"name": "native", "state": nativeObservationState(metrics["up"], fresh, observationUnverified), "observed_at": observedAt, "stale_after_seconds": 60, "safe_code": nativeSafeCode},
 		},
 	}, nil
 }

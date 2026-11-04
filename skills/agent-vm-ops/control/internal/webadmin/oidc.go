@@ -74,7 +74,7 @@ func (auth *oidcAuthenticator) oidcStart(c *gin.Context) {
 			return
 		}
 		returnTo = values[0]
-		if _, ok := oidcReturnPaths[returnTo]; !ok {
+		if !validOIDCReturnPath(returnTo) {
 			writeProblem(c.Writer, invalidRequest("OIDC return path is invalid"))
 			return
 		}
@@ -213,6 +213,10 @@ func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 		writeProblem(c.Writer, newAPIError("invalid_state", "OIDC login state has already been used or expired", http.StatusBadRequest, "authentication", false, ""))
 		return
 	}
+	if !validOIDCReturnPath(transaction.ReturnTo) {
+		auth.redirectLoginFailure(c.Writer, request, matchedBinding)
+		return
+	}
 	if errorOK {
 		auth.redirectLoginFailure(c.Writer, request, matchedBinding)
 		return
@@ -265,6 +269,11 @@ func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	c.Header("Referrer-Policy", "no-referrer")
 	http.Redirect(c.Writer, request, strings.TrimRight(auth.server.Config.ExternalOrigin, "/")+transaction.ReturnTo, http.StatusFound)
+}
+
+func validOIDCReturnPath(path string) bool {
+	_, ok := oidcReturnPaths[path]
+	return ok
 }
 
 func (auth *oidcAuthenticator) sessionFor(request *http.Request) (unifiedPrincipal, *state.BrowserSession, *APIError) {

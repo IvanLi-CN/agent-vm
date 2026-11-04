@@ -164,6 +164,44 @@ func TestOIDCStartRejectsUnsafeReturnPaths(t *testing.T) {
 	}
 }
 
+func TestOIDCCallbackRejectsPersistedUnsafeReturnPath(t *testing.T) {
+	authority, store, cfg := testAuthority(t)
+	server, err := NewUnifiedServer(UnifiedOptions{Config: cfg, Authority: authority, Store: store, Assets: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("index")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateValue := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{3}, 32))
+	binding := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{4}, 32))
+	nonce := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{5}, 32))
+	verifier := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{6}, 32))
+	sealed, err := server.OIDC.seal(verifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := server.now()
+	if err := store.InsertOIDCTransaction(t.Context(), state.OIDCTransaction{
+		TransactionID:       randomTransactionID(),
+		StateDigest:         digestString(stateValue),
+		NonceDigest:         digestString(nonce),
+		CodeVerifierSealed:  sealed,
+		BindingCookieDigest: digestString(binding),
+		ClientID:            cfg.OIDC.ClientID,
+		RedirectURI:         cfg.OIDC.RedirectURI,
+		ReturnTo:            "@evil.example",
+		CreatedAt:           now.Format(time.RFC3339Nano),
+		ExpiresAt:           now.Add(oidcTransactionTTL).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	callback := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback?error=access_denied&state="+url.QueryEscape(stateValue), nil)
+	callback.AddCookie(&http.Cookie{Name: loginBindingCookie, Value: binding})
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, callback)
+	if recorder.Code != http.StatusFound || recorder.Header().Get("Location") != strings.TrimRight(cfg.ExternalOrigin, "/")+"/?auth=failed" {
+		t.Fatalf("unsafe persisted return path status/location=%d %s", recorder.Code, recorder.Header().Get("Location"))
+	}
+}
+
 func TestOIDCProviderFailureReturnsSafeLocalRedirect(t *testing.T) {
 	var provider *httptest.Server
 	provider = httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
