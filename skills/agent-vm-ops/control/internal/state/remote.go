@@ -2158,6 +2158,117 @@ func rqliteHTTPClient(caPath string) (*http.Client, error) {
 	return &http.Client{Timeout: 30 * time.Second, Transport: transport}, nil
 }
 
+// WaitForRQLiteReady waits for both the HTTP status endpoint and a strong
+// read to succeed. A listening TCP socket is not sufficient: rqlite can
+// accept connections while it is still electing a leader and return HTTP 503
+// for database requests.
+func WaitForRQLiteReady(ctx context.Context, rqliteURL, caPath string) error {
+	if err := validateHTTPSMigrationEndpoint(rqliteURL); err != nil {
+		return err
+	}
+	endpoint, err := url.Parse(rqliteURL)
+	if err != nil {
+		return err
+	}
+	client, err := rqliteHTTPClient(caPath)
+	if err != nil {
+		return err
+	}
+	return waitForRQLiteReady(ctx, endpoint, client)
+}
+
+func waitForRQLiteReady(ctx context.Context, endpoint *url.URL, client *http.Client) error {
+	if endpoint == nil || endpoint.Host == "" {
+		return errors.New("rqlite readiness endpoint is invalid")
+	}
+	if client == nil {
+		return errors.New("rqlite readiness client is missing")
+	}
+	interval := time.NewTicker(100 * time.Millisecond)
+	defer interval.Stop()
+	var lastErr error
+	for {
+		if err := probeRQLiteReady(ctx, endpoint, client); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("rqlite readiness probe failed: %w", lastErr)
+			}
+			return ctx.Err()
+		case <-interval.C:
+		}
+	}
+}
+
+func probeRQLiteReady(ctx context.Context, endpoint *url.URL, client *http.Client) error {
+	statusURL := *endpoint
+	statusURL.User = nil
+	statusURL.Path = "/status"
+	statusURL.RawQuery = ""
+	statusRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL.String(), nil)
+	if err != nil {
+		return err
+	}
+	setRQLiteBasicAuth(statusRequest, endpoint)
+	statusResponse, err := client.Do(statusRequest)
+	if err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, statusResponse.Body)
+	_ = statusResponse.Body.Close()
+	if statusResponse.StatusCode != http.StatusOK {
+		return fmt.Errorf("rqlite status HTTP %d response rejected", statusResponse.StatusCode)
+	}
+
+	queryURL := *endpoint
+	queryURL.User = nil
+	queryURL.Path = "/db/query"
+	queryURL.RawQuery = url.Values{
+		"level": {"strong"},
+		"q":     {"SELECT 1"},
+	}.Encode()
+	queryRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return err
+	}
+	setRQLiteBasicAuth(queryRequest, endpoint)
+	queryResponse, err := client.Do(queryRequest)
+	if err != nil {
+		return err
+	}
+	defer queryResponse.Body.Close()
+	if queryResponse.StatusCode < http.StatusOK || queryResponse.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("rqlite query HTTP %d response rejected", queryResponse.StatusCode)
+	}
+	var response remoteResponse
+	decoder := json.NewDecoder(queryResponse.Body)
+	if err := decoder.Decode(&response); err != nil {
+		return fmt.Errorf("decode rqlite readiness query: %w", err)
+	}
+	if message := remoteResponseError(response); message != "" {
+		return errors.New(message)
+	}
+	if len(response.Results) != 1 {
+		return fmt.Errorf("rqlite readiness query returned %d results, want 1", len(response.Results))
+	}
+	if message := remoteResultError(response.Results[0]); message != "" {
+		return errors.New(message)
+	}
+	return validateRemoteQueryResult(response.Results[0])
+}
+
+func setRQLiteBasicAuth(request *http.Request, endpoint *url.URL) {
+	if endpoint.User == nil {
+		return
+	}
+	password, _ := endpoint.User.Password()
+	request.SetBasicAuth(endpoint.User.Username(), password)
+}
+
 func validateMigrationEvidence(evidence SQLiteMigrationEvidence) error {
 	if evidence.FenceID == "" || evidence.SourceSHA256 == "" || len(evidence.SourceSHA256) != sha256.Size*2 || evidence.SourceSize < 0 || evidence.StateEpoch == "" || evidence.VerifiedAt.IsZero() {
 		return errors.New("SQLite migration evidence is incomplete")
