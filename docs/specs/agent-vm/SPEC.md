@@ -311,6 +311,102 @@ Prometheus MUST 只抓取 deployd 的 `/metrics` endpoint，并使用 `job="agen
 这些规则的固定合同名称是 independent observation lanes、pending or failed inventory read、latest valid capacity metric families、retained source snapshot 和 original observation timestamp；
 它们对应上面的中文语义，不是额外的英文操作说明。
 
+## Requirements
+
+### REQ-AGENT-VM-010 - 分层来源
+
+公共合同 MUST 区分 Codex client、configured control endpoint、CT109 LXC、Incus system container 和 unknown underlying hosting source。
+MUST NOT 将 configured address、CT identifier 或 Incus identity 解释为下一层的事实，并且 MUST 将 private deployment addresses 和 inventories 保留在仓库之外。
+
+### REQ-AGENT-VM-011 - 重建与恢复隔离
+
+Recovery MUST 保留 state database 和 WAL/journals、operation 和 audit records、generations、configuration、protected recovery copies、native timer assets 以及 Incus container data。
+它 MUST 在 drain 下恢复匹配的 components，根据 native identity 和 generations reconcile durable records；
+当 state、provenance、capacity 或 native identity 缺失或不一致时，必须保持 admission closed。
+`native_missing` observation 只有在 exact contextual not-found result 时才能设置，且不得新增 task state 或单独 finalize cleanup。
+Failed acquire cleanup MAY 只清理明确的 pre-native、同 generation、无 worker effect 的 intent；
+terminal absence 还必须有 destroy journal、generation tombstone、worker quiescence 和 exact absence proof。
+MUST NOT invent operation IDs、reset generations、replay uncertain native effects 或执行 broad cleanup。
+
+### REQ-AGENT-VM-012 - 稀疏磁盘故障边界
+
+Disk admission MUST 计算 configured CT-local Incus pool filesystem、request cost、watermarks 和 durable reservations，但不能把每个 configured container rootfs limit 声称为完整 physical reservation。
+Control-plane state 和 container data MUST 作为独立的 logical failure domains；
+ENOSPC 或 I/O failure MUST 保持 conservative state，并在不驱逐 effective lease 的前提下拒绝不安全的新 admission。
+
+### REQ-AGENT-VM-013 - 观测来源
+
+Operational dashboards MUST 区分 CT filesystem capacity、transient image staging、physical Incus pool usage、guest rootfs allocation 和 native admission state。
+MUST NOT 从未设置的 Incus project quota 推断 authoritative native limit，也不得为缺失或 `-1` source 绘制 limit line。
+Dashboard contract MUST 暴露 failure phase、image-unpack failures、admission state 和 scrape freshness，使得无需 host-manager access 也能定位 ENOSPC boundary。
+公共仓库 MUST 提供 sanitized、parameterized dashboard baseline 和 validation path；
+deployment-specific rendered files、datasource identities、Prometheus scrape target 和 metrics listener 配置仍由 deployment owner 管理。
+
+### REQ-AGENT-VM-014 - 控制面更新权限
+
+控制面发布、更新和回滚 MUST 仍是运维者负责的部署操作。
+公共 `agent-vm` CLI MUST 保持为生命周期/请求客户端，MUST NOT 获取 Incus/PVE 管理权限、暴露公共自更新命令，或成为第二个业务控制面。
+槽位外 Go `agent-vm-deployd` 服务 MAY 通过受保护的本机 UDS 协调部署事务，但 MUST NOT 拥有业务生命周期状态，或替代 Go `serve` 成为 Incus operation authority。
+普通蓝绿事务 MUST NOT 写入 rqlite；
+首次部署的固定 `migrate` 事务可以一次性读取 legacy SQLite、写入 rqlite 并完成导入验证，之后不得再次触碰业务状态后端。
+Go `serve` 进程 MUST 保持唯一的业务控制权威；
+legacy Bun control process 仅允许作为已验证的兼容发布或转发桥存在，且 MUST NOT 与 live state 并发运行。
+
+### REQ-AGENT-VM-015 - 方法级兼容性
+
+Release manifest MUST 为每个支持的 operation 声明 protocol、request/response schema、semantic compatibility 和 direction。
+Compatible operation MAY 跨 release revisions 继续运行，并返回 structured warning。
+Unsupported action、incompatible schema 或 semantic change、invalid artifact checksum、或 incompatible protocol MUST 在任何 durable 或 native effect 前被拒绝。
+
+### REQ-AGENT-VM-016 - 发布事务与回滚
+
+发布 MUST 在 drain 前 stage 和 verify 明确的 release，在 activation 前进入 drain，保留 in-flight operation 和 maintenance timer，等待 pending operation 与 task transition 收敛，原子激活产物，并在重新打开 admission 前验证健康状态、reconciliation、控制器主权、流量排空和 timer state。
+槽位外 deployd controller MUST 在独立部署数据库中持久化事务阶段和最新观测证据。
+Pre-activation failure MUST 保持 current release 不变。
+激活后健康检查或 quiescence failure MAY 向上一个已验证 release 执行一次有界 rollback；
+rollback failure MUST 保持部署和业务 admission fenced，不能改写 state、generation 或 uncertain operation。
+
+### REQ-AGENT-VM-017 - 发布范围与权限边界
+
+控制面发布包 MUST 包含本地客户端、远程控制脚本、deployd 和槽位 systemd 资源、发布元数据以及精确产物校验和，同时排除部署配置、凭据、连接材料、业务/部署状态数据库、lock、Incus 容器数据和 guest image。
+发布 MUST 使用受保护的本机 deployd socket，或使用显式配置的旧版控制入口，并配合运维者专用或最小范围的 root-owned deployment authority；
+MUST NOT 增加 PVE、host、guest、额外公共 SSH、HTTP 或 gateway access。
+Unattended control-plane update MUST 默认关闭。
+
+### REQ-AGENT-VM-018 - CPU 启动压力边界
+
+Controller MUST 将 CT-local CPU PSI 与 logical CPU reservation 分开观测。
+当 new acquire、cached resume、restart-capable resize 或 explicit restart 会使 projected CPU allocation 超过 CT-visible CPU capacity，且已验证的 `full.avg10` 达到 configured startup-pressure threshold 时，MUST 在停止或启动 existing guest 前，以 structured `resource_pressure` evidence 拒绝 native boot。
+该 guard MUST NOT 改变 logical CPU allocation ceilings、停止 effective lease，或阻止 read、renewal、retrieval、release 和 live memory-only resize；
+缺失 CPU PSI MUST 保持为显式 observation failure，不得伪造为 zero。
+
+### REQ-AGENT-VM-019 - 容量与清单观测
+
+Read-only observation contract MUST 区分 logical reservation composition、CT-visible capacity、runtime pressure、physical disk headroom、native admission state 和 per-task lifecycle state。
+它 MUST 暴露 `some.avg10`、`full.avg10`、configured startup threshold 和 startup-blocked state，但不得将 PSI 当作 CPU utilization 或 logical remaining capacity。
+批准的 overcommit deployment profile MUST 配置 50 percent full-pressure threshold，并保留 compound projected-capacity gate。
+
+Deployment observation surface MUST 提供独立的 capacity/admission view 和 inventory/operations view。
+Capacity view MUST 在有权威来源时展示 allocated、reserved、allocated-and-reserved、remaining、limit 和 CT-visible capacity，并展示 task-state counts，以及 logical 和当前可启动的 default-container slots 的显式 snapshot estimates。
+Inventory view MUST 覆盖所有 managed task states，使用有界字段，删除 stale rows，并避免暴露 raw errors、credentials 和 deployment paths。
+缺失或为 `-1` 的 native slot limit MUST 保持缺失；
+derived slot estimate MUST NOT 标记为 authoritative slot limit。
+
+`agent-vm-deployd` 的 `/metrics` endpoint MUST 将 `admin-metrics` 和 `admin-status` 调度为独立的 observation lanes。
+Pending 或 failed inventory read MUST NOT 移除最新有效的 capacity metric families；
+pending 或 failed capacity read MUST NOT 保留失败 inventory scrape 中的 task rows。
+Retained source snapshot MUST 保留其原始 observation timestamp，并暴露 source-specific health 或 freshness failure；
+deployd MUST NOT 使用伪造的 zeroes 替换 unavailable values。
+Prometheus MUST 只抓取 deployd 的 `/metrics` endpoint，并使用 `job="agent-vm-deployd"`；
+槽位级 metric series MUST 带 `slot` label，以支持切换期间两个槽位同时存活。
+蓝色和绿色槽位 MUST 使用各自独立的 snapshot 目录；
+共享 snapshot 目录 MUST NOT 用于蓝绿运行。
+`admin-status` MUST use keyset pagination with a default page size of 25 and a maximum of 100, probe no more than 8 tasks concurrently, bound each task probe to 1 second and the page to 5 seconds, and expose `partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out` without treating unknown native state as healthy。
+
+这些规则的固定合同名称是 independent observation lanes、pending or failed inventory read、latest valid capacity metric families、retained source snapshot 和 original observation timestamp；
+它们对应上面的中文语义，不是额外的英文操作说明。
+
+
 ### REQ-AGENT-VM-020 - 认证管理边界
 
 每个蓝绿槽位 MUST 运行一个 Go/Gin Agent VM 服务，提供固定静态 Web 资源、OIDC 回调、同源管理 API 和 `/agent/v1/control`；
@@ -517,6 +613,7 @@ Export 直接向 caller stream tar archive，不创建 server-side archive。
 - `VER-AGENT-VM-029` 覆盖：`REQ-AGENT-VM-029` 通过[系统架构](../../architecture/system.md)的蓝绿章节、[发布合同](contracts/release.md)，以及 active-link、compatibility-window 和 rollback check。该项属于计划目标验证，在目标面和测试存在前保持 pending。
 
 - `VER-AGENT-VM-030` 覆盖：`REQ-AGENT-VM-030` 通过[Web Demo 决策备忘录](../../proposals/agent-vm-web-demo.md)、[Web Demo Inspector UX/UI 合同](contracts/web-demo-inspector.md)、Demo runtime/API isolation test、页面级 browser suite、static build 和现有 management API boundary check。
+- `VER-AGENT-VM-031` 覆盖：`REQ-AGENT-VM-031` 通过[部署控制器合同](contracts/deployment-controller.md)、[发布合同中的部署控制器章节](contracts/release.md#deployment-controller-boundary)、[部署观测合同](contracts/observability.md#deployment-control-observation)、[蓝绿部署资源](../../deployment/blue-green.md)以及隔离的 Go/systemd/双槽位事务和恢复检查。
 
 ## 视觉证据
 
