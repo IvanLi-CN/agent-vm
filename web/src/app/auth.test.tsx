@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import i18n from "./i18n";
 import { ManagementAuthBoundary, ManagementAuthProvider, consumeAuthFailureFlag } from "./auth";
@@ -33,25 +34,45 @@ function renderGate() {
 }
 
 describe("management authentication gate", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     window.history.replaceState({}, "", "/vms");
     getSessionMock.mockReset();
-    void i18n.changeLanguage("zh-CN");
+    await i18n.changeLanguage("zh-CN");
   });
 
   afterEach(() => {
     window.history.replaceState({}, "", "/");
   });
 
-  it("shows a standalone login layout without rendering the management shell", async () => {
+  it("shows the public home for an unauthenticated deep link without rendering the management shell", async () => {
     getSessionMock.mockRejectedValue(new ManagementRequestError("authentication_required"));
     renderGate();
 
-    expect(await screen.findByRole("link", { name: "使用 OIDC 登录" })).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2Fvms");
-    expect(screen.getByTestId("auth-error-layout")).toBeInTheDocument();
+    expect(await screen.findByRole("link", { name: "登录管理台" })).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2F");
+    expect(await screen.findByTestId("public-home")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "中" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "EN" })).toHaveAttribute("aria-pressed", "false");
+    expect(document.title).toBe("Agent VM · 公开状态");
+    await waitFor(() => expect(window.location.pathname).toBe("/"));
     expect(document.querySelector(".app-frame")).not.toBeInTheDocument();
     expect(screen.queryByTestId("protected")).not.toBeInTheDocument();
     expect(screen.queryByText("单一管理员")).not.toBeInTheDocument();
+  });
+
+  it("updates document language and public metadata when the locale changes", async () => {
+    const user = userEvent.setup();
+    getSessionMock.mockRejectedValue(new ManagementRequestError("authentication_required"));
+    renderGate();
+
+    expect(await screen.findByTestId("public-home")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "EN" }));
+
+    await waitFor(() => {
+      expect(document.documentElement.lang).toBe("en");
+      expect(document.title).toBe("Agent VM · Public status");
+      expect(screen.getByRole("button", { name: "EN" })).toHaveAttribute("aria-pressed", "true");
+      expect(screen.getByRole("button", { name: "中" })).toHaveAttribute("aria-pressed", "false");
+    });
   });
 
   it("consumes auth=failed and keeps the URL clean", async () => {
@@ -60,7 +81,7 @@ describe("management authentication gate", () => {
     renderGate();
 
     expect(await screen.findByText("登录未完成")).toBeInTheDocument();
-    expect(window.location.pathname).toBe("/vms");
+    await waitFor(() => expect(window.location.pathname).toBe("/"));
     expect(window.location.search).toBe("");
     expect(consumeAuthFailureFlag()).toBe(false);
   });
@@ -72,8 +93,10 @@ describe("management authentication gate", () => {
 
     emitAuthFailure(new ManagementRequestError("csrf_invalid"));
     expect(await screen.findByText("会话已失效")).toBeInTheDocument();
+    expect(document.title).toBe("Agent VM · 会话已失效");
     await waitFor(() => expect(screen.queryByTestId("protected")).not.toBeInTheDocument());
     expect(document.querySelector(".app-frame")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("public-home")).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "重新使用 OIDC 登录" })).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2Fvms");
   });
 });

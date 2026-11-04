@@ -9,33 +9,45 @@ const session = {
   expires_at: "2099-01-01T00:00:00Z",
 };
 
+const publicStatus = {
+  state: "available",
+  active_sessions: 2,
+  observed_at: "2026-11-04T08:00:00Z",
+  observation_state: "available",
+  stale_after_seconds: 60,
+};
+
 function jsonBody(value: unknown): string {
   return JSON.stringify(value);
 }
 
 test("shows an explicit login for an unauthenticated deep link", async ({ page }) => {
   await page.route("**/api/v1/session", (route) => route.fulfill({ status: 401, contentType: "application/problem+json", body: jsonBody({ error: { code: "authentication_required", phase: "authentication" } }) }));
+  await page.route("**/api/v1/public/status", (route) => route.fulfill({ status: 200, contentType: "application/json", body: jsonBody(publicStatus) }));
   await page.goto("/vms");
 
-  await expect(page.getByRole("heading", { name: /signed out|未登录/i })).toBeVisible();
-  await expect(page.getByTestId("auth-error-layout")).toBeVisible();
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.getByTestId("public-home")).toBeVisible();
+  await expect(page.getByRole("heading", { name: /agent vm/i })).toBeVisible();
   await expect(page.locator(".app-frame")).toHaveCount(0);
-  const login = page.getByRole("link", { name: /continue with oidc|使用 oidc 登录/i });
-  await expect(login).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2Fvms");
+  const login = page.getByRole("link", { name: /sign in to management|登录管理台/i });
+  await expect(login).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2F");
   await expect(page.getByText(/sole administrator|单一管理员/i)).toHaveCount(0);
   await expect(page.getByTestId("vms-page")).toHaveCount(0);
 
   await page.route("**/api/v1/auth/oidc/start*", (route) => route.fulfill({ status: 200, contentType: "text/html", body: "OIDC start" }));
   await login.click();
-  await expect(page).toHaveURL(/\/api\/v1\/auth\/oidc\/start\?return_to=%2Fvms/);
+  await expect(page).toHaveURL(/\/api\/v1\/auth\/oidc\/start\?return_to=%2F/);
 });
 
 test("localizes callback failure and removes the auth marker", async ({ page }) => {
   await page.route("**/api/v1/session", (route) => route.fulfill({ status: 401, contentType: "application/problem+json", body: jsonBody({ error: { code: "authentication_required", phase: "authentication" } }) }));
+  await page.route("**/api/v1/public/status", (route) => route.fulfill({ status: 200, contentType: "application/json", body: jsonBody(publicStatus) }));
   await page.goto("/vms?auth=failed");
 
-  await expect(page).toHaveURL(/\/vms$/);
-  await expect(page.getByRole("heading", { name: /sign-in did not complete|登录未完成/i })).toBeVisible();
+  await expect(page).toHaveURL(/\/$/);
+  await expect(page.getByText(/sign-in did not complete|登录未完成/i)).toBeVisible();
+  await expect(page.getByTestId("public-home")).toBeVisible();
   await expect(page.locator(".app-frame")).toHaveCount(0);
   await expect(page.locator("body")).not.toContainText("error_description");
 });

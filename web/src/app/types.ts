@@ -51,8 +51,17 @@ export interface TokenRevokePreview {
 }
 
 export type ObservationState = "available" | "stale" | "missing" | "failed" | "unverified";
+export type PublicServiceState = "available" | "degraded" | "unknown";
 export type VMState = "preparing" | "active" | "cached" | "closing" | "deleting" | "failed" | "absent";
 export type LeaseState = "effective" | "expired" | "absent" | "unknown";
+
+export interface PublicStatus {
+  state: PublicServiceState;
+  active_sessions: number | null;
+  observed_at: string | null;
+  observation_state: ObservationState;
+  stale_after_seconds: number;
+}
 
 export interface ObservedNumber {
   state: ObservationState;

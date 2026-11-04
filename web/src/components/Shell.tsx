@@ -21,6 +21,9 @@ export function Shell({ page, onNavigate, children }: { page: PageKey; onNavigat
   const [menuOpen, setMenuOpen] = useState(false);
   const locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   useEffect(() => { setMenuOpen(false); }, [page]);
+  useEffect(() => {
+    if (typeof document !== "undefined") document.title = t("shell.managementTitle");
+  }, [i18n.language, t]);
 
   const navigate = (next: PageKey) => {
     onNavigate?.(next);
@@ -53,7 +56,7 @@ export function Shell({ page, onNavigate, children }: { page: PageKey; onNavigat
       <div className="sidebar-footer"><span className="operator-dot" aria-hidden="true" /><div><strong>{identityTitle}</strong><span>{identitySubtitle}</span></div></div>
     </aside>
     <div className="workspace">
-      <header className="topbar"><div className="mobile-brand"><div className="brand-mark" aria-hidden="true">A</div><strong>{t("product")}</strong></div><IconButton label={t("shell.openMenu")} className="mobile-menu-button" onClick={() => setMenuOpen(true)}><Menu /></IconButton><div className="topbar-spacer" /><span className="synthetic-label">{surfaceLabel}</span><div className="language-toggle" role="group" aria-label={t("shell.language")}><button className={locale === "zh-CN" ? "selected" : ""} onClick={() => void changeLocale("zh-CN")}>中</button><button className={locale === "en" ? "selected" : ""} onClick={() => void changeLocale("en")}>EN</button></div></header>
+      <header className="topbar"><div className="mobile-brand"><div className="brand-mark" aria-hidden="true">A</div><strong>{t("product")}</strong></div><IconButton label={t("shell.openMenu")} className="mobile-menu-button" onClick={() => setMenuOpen(true)}><Menu /></IconButton><div className="topbar-spacer" /><span className="synthetic-label">{surfaceLabel}</span><div className="language-toggle" role="group" aria-label={t("shell.language")}><button type="button" className={locale === "zh-CN" ? "selected" : ""} aria-pressed={locale === "zh-CN"} onClick={() => void changeLocale("zh-CN")}>中</button><button type="button" className={locale === "en" ? "selected" : ""} aria-pressed={locale === "en"} onClick={() => void changeLocale("en")}>EN</button></div></header>
       <main className="work-surface">{children}</main>
     </div>
     {menuOpen ? <div className="mobile-menu-layer"><button type="button" className="mobile-menu-backdrop" aria-label={t("shell.closeMenu")} onClick={() => setMenuOpen(false)} /><dialog open className="mobile-menu" aria-labelledby="mobile-menu-title"><div className="mobile-menu-header"><strong id="mobile-menu-title">{t("product")}</strong><IconButton label={t("shell.closeMenu")} onClick={() => setMenuOpen(false)}><X /></IconButton></div>{navItems.map(({ key, icon: Icon }) => <button className={`nav-item ${page === key ? "is-active" : ""}`} key={key} onClick={() => navigate(key)}><Icon aria-hidden="true" /><span>{t(`nav.${key}`)}</span></button>)}<div className="mobile-menu-footer"><Button variant="ghost" icon={<Languages />} onClick={() => void changeLocale(locale === "zh-CN" ? "en" : "zh-CN")}>{locale === "zh-CN" ? "English" : "简体中文"}</Button></div></dialog></div> : null}

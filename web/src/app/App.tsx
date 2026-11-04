@@ -1,17 +1,20 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { lazy, Suspense, useEffect, useState, useSyncExternalStore } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useTranslation } from "react-i18next";
 import type { PageKey } from "./types";
 import { ManagementAuthBoundary, ManagementAuthProvider } from "./auth";
-import { Shell } from "../components/Shell";
-import { ImagesPage } from "../pages/ImagesPage";
-import { OperationsPage } from "../pages/OperationsPage";
-import { OverviewPage } from "../pages/OverviewPage";
-import { SystemPage } from "../pages/SystemPage";
-import { VMsPage } from "../pages/VMsPage";
-import { DemoInspector } from "../demo/DemoInspector";
 import { DemoProvider, getDemoInspectorLayout, isDemoRuntime, saveDemoInspectorLayout, useDemoRuntime, type DemoInspectorLayout } from "../demo/runtime";
+
+const ManagementShell = lazy(() => import("../components/Shell").then(({ Shell }) => ({ default: Shell })));
+const managementPages = {
+  overview: lazy(() => import("../pages/OverviewPage").then(({ OverviewPage }) => ({ default: OverviewPage }))),
+  vms: lazy(() => import("../pages/VMsPage").then(({ VMsPage }) => ({ default: VMsPage }))),
+  images: lazy(() => import("../pages/ImagesPage").then(({ ImagesPage }) => ({ default: ImagesPage }))),
+  operations: lazy(() => import("../pages/OperationsPage").then(({ OperationsPage }) => ({ default: OperationsPage }))),
+  system: lazy(() => import("../pages/SystemPage").then(({ SystemPage }) => ({ default: SystemPage }))),
+};
+const DemoInspector = lazy(() => import("../demo/DemoInspector").then(({ DemoInspector: component }) => ({ default: component })));
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { staleTime: 4_000, retry: 1 } } });
 
@@ -43,7 +46,13 @@ function ConsoleApp() {
   if (isDemoRuntime() && runtime.bootstrapError) {
     return <div className="demo-boot-error"><div><span className="eyebrow-label">{t("demo.eyebrow")}</span><h1>{t("demo.bootFailed")}</h1><p>{t("demo.bootFailedText")}</p><code>{runtime.bootstrapError}</code></div></div>;
   }
-  return <ManagementAuthProvider><ManagementAuthBoundary><Shell key={`${page}-${runtime.revision}`} page={page}><div className="sr-only" aria-live="polite">{t(`nav.${page}`)}</div>{page === "overview" ? <OverviewPage /> : page === "vms" ? <VMsPage /> : page === "images" ? <ImagesPage /> : page === "operations" ? <OperationsPage /> : <SystemPage />}</Shell></ManagementAuthBoundary></ManagementAuthProvider>;
+  return <ManagementAuthProvider><ManagementAuthBoundary><Suspense fallback={<div className="app-route-loading" role="status">{t("common.loading")}</div>}><ManagementSurface page={page} revision={runtime.revision} /></Suspense></ManagementAuthBoundary></ManagementAuthProvider>;
+}
+
+function ManagementSurface({ page, revision }: { page: PageKey; revision: number }) {
+  const { t } = useTranslation();
+  const Page = managementPages[page];
+  return <ManagementShell key={`${page}-${revision}`} page={page}><div className="sr-only" aria-live="polite">{t(`nav.${page}`)}</div><Page /></ManagementShell>;
 }
 
 export function App({ client = queryClient }: { client?: QueryClient } = {}) {

@@ -122,6 +122,18 @@ func (server *UnifiedServer) browserAPI(c *gin.Context) {
 		server.OIDC.oidcCallback(c)
 		return
 	}
+	if pathValue == "/public/status" {
+		if request.Method != http.MethodGet {
+			writeProblem(c.Writer, newAPIError("invalid_request", "method is not supported", http.StatusMethodNotAllowed, "request_validation", false, ""))
+			return
+		}
+		if server.Authority == nil {
+			writeProblem(c.Writer, newAPIError("authority_unavailable", "management authority is unavailable", http.StatusServiceUnavailable, "internal", true, ""))
+			return
+		}
+		server.Authority.getPublicStatus(c.Writer, request)
+		return
+	}
 	principal, session, authErr := server.sessionFor(request)
 	if pathValue == "/session" && request.Method == http.MethodGet {
 		if authErr != nil {

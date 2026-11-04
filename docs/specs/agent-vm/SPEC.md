@@ -118,7 +118,7 @@ Deployment scrape bridge 必须将 `admin-metrics` 和 `admin-status` 调度为�
 
 ### REQ-AGENT-VM-021 - 管理 API 与本地化界面
 
-管理台只能暴露 OpenAPI 合同定义的同源 `/api/v1` 面。它必须拒绝未知字段和不支持的 action，使用有界 cursor pagination，保留准确的 byte 和 generation 值，返回结构化的字段白名单错误，并暴露 source freshness 和 unknown value，不得将其转换成健康的零。UI 必须通过 `/api/v1/session` 启动 authentication gate，之后才能展示管理员 actor、capability 或受管资源。收到 `authentication_required` 时，必须显示本地化登录状态和明确的登录 action，不得形成无界 retry loop。未认证、OIDC 回跳失败或 session loss 时，UI 必须卸载后台普通 layout，显示独立 auth-error layout；该 layout 不得渲染后台导航、后台数据或管理员 actor，并在顶栏提供直接发起 OIDC 的登录 action。任何 management API 返回 `401 authentication_required` 或 `csrf_invalid` 时，UI 必须使本地 session 失效，暂停 query 和 mutation，保留当前页面路径，等待明确的重新认证；成功后重新 bootstrap session 并加载页面 data。不得自动 replay mutation；任何可能已提交的 mutation 必须使用原 operation ID reconciliation。UI 必须支持 `zh-CN` 和 `en`，优先使用已保存选择，其次是浏览器语言，最后回退英文；accessible name、confirmation 和 error 必须翻译，technical identifier 和用户填写的 reason 保持不变。
+管理台只能暴露 OpenAPI 合同定义的同源 `/api/v1` 面。它必须拒绝未知字段和不支持的 action，使用有界 cursor pagination，保留准确的 byte 和 generation 值，返回结构化的字段白名单错误，并暴露 source freshness 和 unknown value，不得将其转换成健康的零。UI 必须通过 `/api/v1/session` 启动 authentication gate，之后才能展示管理员 actor、capability 或受管资源。直接访问没有有效会话时，UI 必须把入口收敛到公开主页 `/`，并可通过无需认证的 `/api/v1/public/status` 展示脱敏、按固定间隔更新的基础状态；该公开响应不得包含管理员身份、capability、容量或压力明细，且不得被当作管理授权或实时事实。公开主页必须提供直接发起 OIDC 的登录 action。收到 `authentication_required` 时，必须显示本地化登录状态和明确的登录 action，不得形成无界 retry loop。OIDC 回跳失败时回到公开主页并显示通用失败提示。已有管理会话发生 session loss 时，UI 必须卸载后台普通 layout，保留当前管理页面路径，显示独立 auth-error layout；该 layout 不得渲染后台导航、后台数据或管理员 actor，并在顶栏提供直接发起 OIDC 的登录 action。任何 management API 返回 `401 authentication_required` 或 `csrf_invalid` 时，UI 必须使本地 session 失效，暂停 query 和 mutation，等待明确的重新认证；成功后重新 bootstrap session 并加载页面 data。不得自动 replay mutation；任何可能已提交的 mutation 必须使用原 operation ID reconciliation。UI 必须支持 `zh-CN` 和 `en`，优先使用已保存选择，其次是浏览器语言，最后回退英文；accessible name、confirmation 和 error 必须翻译，technical identifier 和用户填写的 reason 保持不变。
 
 ### REQ-AGENT-VM-022 - 受管操作与审计恢复
 
@@ -200,7 +200,7 @@ TypeScript/Bun synchronization helper 将 tracked、unignored worktree file 传�
 Reason-limit 截图表明，过长输入仍可编辑，直到修正前提交保持禁用。
 Pending-preview 截图延迟 mock response，以展示 recovery control。
 移动端截图使用 `393x852` CSS-pixel viewport；桌面端截图展示完整渲染页面。
-认证入口截图使用受控的 session/API problem response，不连接身份提供方或真实管理服务；它们覆盖未登录深链、OIDC 登录入口和 session loss 后卸载后台壳的独立认证错误页。
+认证入口截图使用受控的 session/API problem response，不连接身份提供方或真实管理服务；它们覆盖直接访问后的公开主页、脱敏延迟状态、OIDC 登录入口和 session loss 后卸载后台壳的独立认证错误页。
 
 - [桌面 System 页面](assets/agent-vm-web-system-desktop.png)
 - [移动端 System 页面](assets/agent-vm-web-system-mobile-list.png)
@@ -209,8 +209,8 @@ Pending-preview 截图延迟 mock response，以展示 recovery control。
 - [移动端确认 reason limit](assets/agent-vm-web-system-mobile-dialog-reason-limit.png)
 - [移动端 Token 创建 reason limit](assets/agent-vm-web-system-mobile-create-reason-limit.png)
 - [移动端镜像导入 reason limit](assets/agent-vm-web-images-mobile-import-reason-limit.png)
-- [桌面端未登录认证错误页](assets/agent-vm-auth-gate-desktop.png)
-- [移动端未登录认证错误页](assets/agent-vm-auth-gate-mobile.png)
+- [桌面端公开主页](assets/agent-vm-public-home-desktop.png)
+- [移动端公开主页](assets/agent-vm-public-home-mobile.png)
 - [桌面端 session loss 独立认证错误页](assets/agent-vm-auth-expired-desktop.png)
 
 这里的 owner confirmation 只适用于此处展示的渲染 UI，不代表端到端 backend integration 或 deployment readiness。

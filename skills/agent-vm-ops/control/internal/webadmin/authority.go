@@ -184,27 +184,9 @@ func (authority *Authority) getOverview(writer http.ResponseWriter, request *htt
 		writeProblem(writer, problemFromError(errors.New("authority_unavailable: lifecycle service is not configured"), "internal", ""))
 		return
 	}
-	if authority.Snapshots == nil {
-		writeProblem(writer, problemFromError(errors.New("observation_unavailable: capacity snapshot is not configured"), "internal", ""))
-		return
-	}
-	raw, err := authority.Snapshots.Read("capacity")
+	metrics, err := authority.readCapacityMetrics()
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "request_validation", ""))
-		return
-	}
-	var envelope map[string]any
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		writeProblem(writer, problemFromError(errors.New("invalid_state: capacity snapshot is invalid"), "internal", ""))
-		return
-	}
-	metrics, ok := envelope["result"].(map[string]any)
-	if !ok {
-		metrics = envelope
-		ok = true
-	}
-	if !ok {
-		writeProblem(writer, newAPIError("invalid_state", "metrics response is invalid", http.StatusInternalServerError, "internal", true, ""))
 		return
 	}
 	overview, err := authority.overview(metrics, request.Context())
@@ -213,6 +195,89 @@ func (authority *Authority) getOverview(writer http.ResponseWriter, request *htt
 		return
 	}
 	writeJSON(writer, http.StatusOK, overview)
+}
+
+func (authority *Authority) getPublicStatus(writer http.ResponseWriter, request *http.Request) {
+	if err := rejectUnknownQueryKeys(request.URL.Query(), map[string]bool{}); err != nil {
+		writeProblem(writer, invalidRequest(err.Error()))
+		return
+	}
+	metrics, err := authority.readCapacityMetrics()
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "request_validation", ""))
+		return
+	}
+	overview, err := authority.overview(metrics, request.Context())
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "internal", ""))
+		return
+	}
+
+	admission, _ := overview["admission"].(map[string]any)
+	ready, readyOK := admission["ready"].(bool)
+	draining, _ := admission["draining"].(bool)
+	state := "unknown"
+	if readyOK {
+		state = "degraded"
+		if ready && !draining {
+			state = "available"
+		}
+	}
+	taskCounts, _ := overview["task_counts"].(map[string]any)
+	observedAt := stringValue(metrics["observed_at"])
+	var observed any
+	if observedAt != "" {
+		observed = observedAt
+	}
+	writer.Header().Set("Cache-Control", "public, max-age=15, stale-while-revalidate=45")
+	writeJSON(writer, http.StatusOK, map[string]any{
+		"state":               state,
+		"active_sessions":     int64Value(taskCounts["active"]),
+		"observed_at":         observed,
+		"observation_state":   publicObservationState(overview["sources"]),
+		"stale_after_seconds": 60,
+	})
+}
+
+func (authority *Authority) readCapacityMetrics() (map[string]any, error) {
+	if authority.Snapshots == nil {
+		return nil, errors.New("observation_unavailable: capacity snapshot is not configured")
+	}
+	raw, err := authority.Snapshots.Read("capacity")
+	if err != nil {
+		return nil, err
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, errors.New("invalid_state: capacity snapshot is invalid")
+	}
+	if metrics, ok := envelope["result"].(map[string]any); ok {
+		return metrics, nil
+	}
+	return envelope, nil
+}
+
+func publicObservationState(raw any) string {
+	sources, _ := raw.([]any)
+	state := "available"
+	for _, rawSource := range sources {
+		source, _ := rawSource.(map[string]any)
+		sourceState := stringValue(source["state"])
+		switch sourceState {
+		case "failed":
+			return "failed"
+		case "stale":
+			state = "stale"
+		case "missing", "unverified":
+			if state == "available" {
+				state = "unverified"
+			}
+		}
+	}
+	if len(sources) == 0 {
+		return "unverified"
+	}
+	return state
 }
 
 func (authority *Authority) overview(metrics map[string]any, ctx context.Context) (map[string]any, error) {

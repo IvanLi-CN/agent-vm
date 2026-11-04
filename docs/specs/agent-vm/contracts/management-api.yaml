@@ -11,6 +11,7 @@ servers:
     description: Same-origin API served by the installed Agent VM product.
 tags:
   - name: Auth
+  - name: Public
   - name: Session
   - name: Tokens
   - name: Overview
@@ -111,6 +112,28 @@ paths:
               description: Session cookie is set and the one-time login-binding cookie is cleared.
               schema:
                 type: string
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /public/status:
+    get:
+      tags: [Public]
+      operationId: getPublicStatus
+      security: []
+      summary: Read a delayed, sanitized public service status
+      description: Returns only a visitor-facing service state, active session count, observation timestamp and freshness state. It never returns administrator identity, capabilities, resource capacity or pressure details. The response may be cached briefly and must not be treated as management authorization or an authoritative live read.
+      responses:
+        "200":
+          description: Delayed public status.
+          headers:
+            Cache-Control:
+              description: Short public cache window for the delayed observation.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicStatus"
         default:
           $ref: "#/components/responses/Problem"
 
@@ -1266,6 +1289,26 @@ components:
         observed_at:
           type: [string, "null"]
           format: date-time
+    PublicStatus:
+      type: object
+      additionalProperties: false
+      required: [state, active_sessions, observed_at, observation_state, stale_after_seconds]
+      properties:
+        state:
+          type: string
+          enum: [available, degraded, unknown]
+        active_sessions:
+          type: [integer, "null"]
+          minimum: 0
+        observed_at:
+          type: [string, "null"]
+          format: date-time
+        observation_state:
+          type: string
+          enum: [available, stale, missing, failed, unverified]
+        stale_after_seconds:
+          type: integer
+          minimum: 1
     Overview:
       type: object
       additionalProperties: false

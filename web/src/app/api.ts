@@ -1,5 +1,5 @@
 import { emptyReferences, mockState } from "./mockData";
-import type { ActionPreview, AgentToken, AuditEvent, ImageImportRequest, ManagedImage, ManagedVM, ManagementSession, Operation, Overview, SystemStatus, TokenCreateResult, TokenPage, TokenRevokePreview, TokenScope } from "./types";
+import type { ActionPreview, AgentToken, AuditEvent, ImageImportRequest, ManagedImage, ManagedVM, ManagementSession, Operation, Overview, PublicStatus, SystemStatus, TokenCreateResult, TokenPage, TokenRevokePreview, TokenScope } from "./types";
 import { optionalAuditReason } from "./validation";
 import { demoForcedOutcome, demoMutationError, emitDemoChange, getMockState, isDemoRuntime } from "../demo/runtime";
 
@@ -189,6 +189,20 @@ export async function getManagementSession(): Promise<ManagementSession> {
 
 export async function getOverview(): Promise<Overview> {
   return useRealApi ? realRequest<Overview>("/overview") : delay(mockStateForRequest().overview);
+}
+
+export async function getPublicStatus(): Promise<PublicStatus> {
+  if (useRealApi) return requestJSON<PublicStatus>("/public/status", undefined, { contentType: null });
+  const overview = mockStateForRequest().overview;
+  const native = overview.sources.find((source) => source.name === "native");
+  const ready = overview.admission.ready === true && overview.admission.draining !== true;
+  return delay({
+    state: overview.admission.ready === null ? "unknown" : ready ? "available" : "degraded",
+    active_sessions: overview.task_counts.active,
+    observed_at: overview.observed_at,
+    observation_state: native?.state ?? "unverified",
+    stale_after_seconds: native?.stale_after_seconds ?? 60,
+  });
 }
 
 export async function listVMs(filters: { q?: string; state?: string; leaseState?: string; cursor?: string } = {}): Promise<{ items: ManagedVM[]; page: { limit: number; next_cursor: string | null } }> {

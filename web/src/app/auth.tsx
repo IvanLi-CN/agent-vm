@@ -13,6 +13,7 @@ import {
 import type { ManagementSession } from "./types";
 import { Button, Panel } from "../components/ui";
 import { changeLocale } from "./i18n";
+import { PublicHomePage } from "../pages/PublicHomePage";
 
 export type ManagementAuthStatus = "loading" | "unauthenticated" | "authenticated" | "suspended" | "error";
 
@@ -118,37 +119,49 @@ export function ManagementAuthBoundary({ children }: { children: ReactNode }) {
   if (auth.status === "suspended") {
     return <AuthErrorLayout titleKey="shell.sessionExpired" descriptionKey="shell.sessionExpiredText" loginLabelKey="shell.signInAgain" loginHref={auth.loginHref} />;
   }
-  if (auth.status === "loading") return <AuthErrorLayout titleKey="shell.sessionPending" descriptionKey="shell.sessionPendingText" />;
-  if (auth.status === "error") return <AuthErrorLayout titleKey="shell.authUnavailable" descriptionKey="shell.authUnavailableText" retry={auth.retry} />;
-  return <AuthErrorLayout
-    titleKey={auth.authFailure ? "shell.authFailed" : "shell.signedOut"}
-    descriptionKey={auth.authFailure ? "shell.authFailedText" : "shell.signInText"}
-    loginLabelKey="shell.signInOidc"
-    loginHref={auth.loginHref}
-  />;
+  return <PublicHomePage authFailure={auth.authFailure} normalizePath={auth.status !== "loading"} />;
 }
 
 function AuthErrorLayout({ titleKey, descriptionKey, loginLabelKey, loginHref, retry }: { titleKey: string; descriptionKey: string; loginLabelKey?: string; loginHref?: string; retry?: () => void }) {
   const { t, i18n } = useTranslation();
   const locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const title = t(titleKey);
+  useEffect(() => {
+    if (typeof document !== "undefined") document.title = `${t("product")} · ${title}`;
+  }, [i18n.language, t, title]);
   return <div className="auth-page" data-testid="auth-error-layout">
     <header className="auth-page-header">
-      <div className="auth-page-brand"><div className="auth-page-brand-mark" aria-hidden="true">A</div><div><strong>{t("product")}</strong><span>{t("productSub")}</span></div></div>
-      <div className="auth-page-header-actions">
-        {loginHref && loginLabelKey ? <a className="ui-button ui-button-primary auth-login-link" href={loginHref}><LogIn aria-hidden="true" /><span>{t(loginLabelKey)}</span></a> : null}
-        {retry ? <Button variant="ghost" onClick={retry}>{t("common.retry")}</Button> : null}
-        <div className="auth-page-locale" role="group" aria-label={t("shell.language")}>
-          <button className={locale === "zh-CN" ? "selected" : ""} onClick={() => void changeLocale("zh-CN")}>中</button>
-          <button className={locale === "en" ? "selected" : ""} onClick={() => void changeLocale("en")}>EN</button>
+      <div className="auth-page-header-inner">
+        <div className="auth-page-brand"><div className="auth-page-brand-mark" aria-hidden="true">A</div><div><strong>{t("product")}</strong><span>{t("productSub")}</span></div></div>
+        <div className="auth-page-header-actions">
+          {loginHref && loginLabelKey ? <a className="ui-button ui-button-primary auth-login-link" href={loginHref}><LogIn aria-hidden="true" /><span>{t(loginLabelKey)}</span></a> : null}
+          {retry ? <Button variant="ghost" onClick={retry}>{t("common.retry")}</Button> : null}
+          <div className="auth-page-locale" role="group" aria-label={t("shell.language")}>
+            <button type="button" className={locale === "zh-CN" ? "selected" : ""} aria-pressed={locale === "zh-CN"} onClick={() => void changeLocale("zh-CN")}>中</button>
+            <button type="button" className={locale === "en" ? "selected" : ""} aria-pressed={locale === "en"} onClick={() => void changeLocale("en")}>EN</button>
+          </div>
         </div>
       </div>
     </header>
-    <main className="auth-page-main">
-      <Panel className="auth-page-card" role="status" aria-live="polite">
-        <div className="auth-page-icon" aria-hidden="true"><ShieldAlert /></div>
-        <div className="auth-page-copy"><h1>{title}</h1><p>{t(descriptionKey)}</p></div>
-      </Panel>
+    <main className="auth-page-main" aria-labelledby="auth-error-title">
+      <div className="auth-page-layout">
+        <section className="auth-page-statement">
+          <div className="auth-page-signal" aria-hidden="true">
+            <div className="auth-page-icon"><ShieldAlert /></div>
+            <span className="auth-page-signal-line" />
+            <span className="auth-page-signal-code">OIDC</span>
+          </div>
+          <div className="auth-page-copy"><h1 id="auth-error-title">{title}</h1><p>{t(descriptionKey)}</p></div>
+        </section>
+        <Panel className="auth-page-card" role="status" aria-live="polite">
+          <div className="auth-page-card-top"><span className="auth-page-card-label">OIDC</span><span className="auth-page-card-status">{t("shell.oidcOnly")}</span></div>
+          <div className="auth-page-card-copy"><h2>{t("shell.signInOidc")}</h2><p>{t("shell.signInText")}</p></div>
+          <div className="auth-page-card-actions">
+            {loginHref ? <a className="ui-button ui-button-primary auth-page-card-login" href={loginHref}><LogIn aria-hidden="true" /><span>{t("shell.signInOidc")}</span></a> : null}
+            {retry ? <Button variant="secondary" onClick={retry}>{t("common.retry")}</Button> : null}
+          </div>
+        </Panel>
+      </div>
     </main>
     <footer className="auth-page-footer">{t("shell.oidcOnly")}</footer>
   </div>;
