@@ -3,7 +3,7 @@
 <!-- impeccable:product-schema 1 -->
 
 Agent VM 为 Agent 会话提供低成本、受租约约束的工作环境。
-本文保存产品事实与已确认的 Web 管理台目标；控制台尚未实现，现有 CLI、Go 控制服务与部署侧观测继续以各自合同为准。
+本文保存产品事实与 Web 管理台实现/目标；当前检出已提供管理台静态壳、认证门面、公开状态入口和管理界面，生产部署与完整端到端 readiness 继续以各自合同为准。
 
 ## 平台
 
@@ -103,7 +103,7 @@ Logo 未定义，实际组件、字体加载与视觉 token 尚未从实现中�
 - [现行 Agent VM Spec](docs/specs/agent-vm/SPEC.md)、[CLI 合同](docs/specs/agent-vm/contracts/cli.md) 与 [管理台合同](docs/specs/agent-vm/contracts/management-api.md)：现有协议 4 与新增浏览器 API、镜像迁移及回退边界。
 - [观测合同](docs/specs/agent-vm/contracts/observability.md)：资源、压力、准入、来源健康与新鲜度。
 
-目前没有产品内置 Web 组件、已实现设计 token、正式截图或真实浏览器验收。
+当前检出包含产品内置 Web 组件、受控视觉证据和认证 E2E 验收；真实部署地址、凭据、清单、状态库以及生产环境验收仍不属于公开产品证据。
 公开文档不得包含部署地址、凭据、真实清单、状态库或消费方渲染的观测文件，也不得把示例数据当成现网证明。
 
 ## 产品原则

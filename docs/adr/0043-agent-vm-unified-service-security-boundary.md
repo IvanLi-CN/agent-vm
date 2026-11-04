@@ -42,12 +42,6 @@ OIDC 登录事务可以携带一个可选的 `return_to`。服务端只能接受
 
 唯一管理员的 allowlist 和新审计 actor 按完整 `(issuer, subject)` 持久化。管理员的浏览器会话和 Agent Token 按显式 capability/scope 访问所有受管 session；session_id 是工作会话资源标识，不是用户身份或 Token 绑定键。签发包含 `agent:operate` 的机器 Token 时必须同时显式包含 `agent:read`，不得隐式继承；成功的 Token 创建 operation result 必须保留安全元数据和 plaintext disclosure 状态。敏感操作仍需预览、一次性 confirmation token、当前 resource version/generation 和审计；任何管理操作都可提供非空有界 reason，缺失 reason 不得失败。审计保存当前主体二元组、无管理员权限的 typed rejected-request actor，或无法证明时保留原值的显式未知历史 actor，以及 operation 的阶段、可选原因和结果，不保存 Token、授权码或原始 native 诊断。
 
-唯一管理员的 allowlist 和新审计 actor 按完整 `(issuer, subject)` 持久化。
-管理员的浏览器会话和 Agent Token 按显式 capability/scope 访问所有受管 session；session_id 是工作会话资源标识，不是用户身份或 Token 绑定键。
-签发包含 `agent:operate` 的机器 Token 时必须同时显式包含 `agent:read`，不得隐式继承；成功的 Token 创建 operation result 必须保留安全元数据和 plaintext disclosure 状态。
-敏感操作仍需预览、一次性 confirmation token、当前 resource version/generation 和审计；任何管理操作都可提供非空有界 reason，缺失 reason 不得失败。
-审计保存当前主体二元组、无管理员权限的 typed rejected-request actor，或无法证明时保留原值的显式未知历史 actor，以及 operation 的阶段、可选原因和结果，不保存 Token、授权码或原始 native 诊断。
-
 Agent Token 是高熵不透明 Bearer 值，验证摘要存入共享状态，明文只返回一次。
 Token 创建按管理员 actor、operation_id 和 canonical request digest 幂等；服务在同一持久化事务中消费一次性披露 latch 后才发送唯一明文响应，并把 `token_id`、元数据和披露状态写入 operation result。
 管理员的并发或重试只能读取安全元数据，不能再次取得明文；响应丢失时，管理员用原 operation ID 查询、确认 token_id 后显式撤销，再用新 operation ID 创建，服务不得自动重发或猜测 bearer。
