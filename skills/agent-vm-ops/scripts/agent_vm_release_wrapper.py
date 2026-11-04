@@ -116,6 +116,8 @@ GO_ACTIVE_SOCKET = Path("/var/lib/agent-vm-native/active/app.sock")
 GO_DEPLOYD_SOCKET = Path("/run/agent-vm-native/deployd.sock")
 STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
 MIGRATION_TIMEOUT_SECONDS = 9000
+MIGRATION_VERIFY_TIMEOUT_SECONDS = 30
+MIGRATION_VERIFY_POLL_SECONDS = 0.1
 DEPLOYD_READY_TIMEOUT_SECONDS = 30
 DEPLOYD_READY_POLL_SECONDS = 0.1
 LEGACY_EXPIRY_TIMER_RE = re.compile(r"^agent-vm-native-expire-[A-Za-z0-9_.:-]+\.timer$")
@@ -1488,11 +1490,19 @@ def _migration_transaction_is_finalized(transaction_id: str) -> bool:
 
 def _verify_migration_completion(config: Mapping[str, Any]) -> None:
     marker = _read_migration_marker(config)
-    if marker is None or not _migration_transaction_is_finalized(marker["transaction_id"]):
+    if marker is None:
         _fail(
             "activation_unverified",
             "migration completion marker is not backed by the finalized Deployd transaction",
         )
+    deadline = time.monotonic() + MIGRATION_VERIFY_TIMEOUT_SECONDS
+    while not _migration_transaction_is_finalized(marker["transaction_id"]):
+        if time.monotonic() >= deadline:
+            _fail(
+                "activation_unverified",
+                "migration completion marker is not backed by the finalized Deployd transaction",
+            )
+        time.sleep(MIGRATION_VERIFY_POLL_SECONDS)
 
 
 def _run_initial_state_migration(config: Mapping[str, Any]) -> None:

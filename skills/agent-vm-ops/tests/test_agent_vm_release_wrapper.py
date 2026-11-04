@@ -508,6 +508,29 @@ class WrapperTests(unittest.TestCase):
                 WRAPPER._run_initial_state_migration(self.loaded)
         self.assertEqual(failure.exception.code, "activation_unverified")
 
+    def test_migration_completion_verification_retries_a_delayed_finalized_transaction(self):
+        marker_path = WRAPPER._migration_marker_path(self.loaded)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "format": 2,
+            "transaction_id": "migration-1",
+            "business_authority": "rqlite",
+            "source_sha256": "a" * 64,
+            "source_size": 1,
+            "state_epoch": "epoch-1",
+            "target_sha256": "b" * 64,
+            "retention_until": "2026-11-11T00:00:00Z",
+        }), encoding="utf-8")
+        marker_path.chmod(0o600)
+        with mock.patch.object(
+            WRAPPER,
+            "_migration_transaction_is_finalized",
+            side_effect=[False, True],
+        ) as finalized, mock.patch.object(WRAPPER.time, "sleep") as sleep:
+            WRAPPER._verify_migration_completion(self.loaded)
+        self.assertEqual(finalized.call_count, 2)
+        sleep.assert_called_once_with(WRAPPER.MIGRATION_VERIFY_POLL_SECONDS)
+
     def test_migration_preflight_failure_without_transaction_is_not_recovery(self):
         def run(command, *args, **kwargs):
             if command and command[0] == str(WRAPPER.GO_DEPLOY_PATH):
