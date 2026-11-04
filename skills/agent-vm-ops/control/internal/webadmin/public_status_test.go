@@ -72,3 +72,38 @@ func TestPublicStatusIsAnonymousAndSanitized(t *testing.T) {
 		t.Fatalf("public status method status=%d body=%s", methodRecorder.Code, methodRecorder.Body.String())
 	}
 }
+
+func TestPublicStatusDoesNotReportMalformedTaskStatesAsHealthy(t *testing.T) {
+	authority, store, cfg := testAuthority(t)
+	now := time.Date(2026, 11, 4, 8, 0, 0, 0, time.UTC)
+	authority.Clock = func() time.Time { return now }
+	authority.Snapshots = observe.NewSnapshotStore(t.TempDir())
+	if err := authority.Snapshots.Publish("capacity", map[string]any{
+		"observed_at":     now.Add(-10 * time.Second).Format(time.RFC3339Nano),
+		"up":              true,
+		"admission_ready": true,
+		"task_states":     map[string]any{"active": "not-a-count"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewUnifiedServer(UnifiedOptions{
+		Config: cfg, Authority: authority, Store: store, Snapshots: authority.Snapshots,
+		Assets: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("index")}}, Clock: authority.Clock,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/public/status", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("public status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	var value map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &value); err != nil {
+		t.Fatal(err)
+	}
+	if value["state"] != "unknown" || value["active_sessions"] != nil || value["observation_state"] != "unverified" {
+		t.Fatalf("malformed public status=%#v", value)
+	}
+}

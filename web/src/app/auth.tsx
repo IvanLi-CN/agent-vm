@@ -119,6 +119,9 @@ export function ManagementAuthBoundary({ children }: { children: ReactNode }) {
   if (auth.status === "suspended") {
     return <AuthErrorLayout titleKey="shell.sessionExpired" descriptionKey="shell.sessionExpiredText" loginLabelKey="shell.signInAgain" loginHref={auth.loginHref} />;
   }
+  if (auth.status === "error") {
+    return <AuthErrorLayout titleKey="shell.authUnavailable" descriptionKey="shell.authUnavailableText" loginLabelKey="shell.signInAgain" loginHref={auth.loginHref} retry={auth.retry} />;
+  }
   return <PublicHomePage authFailure={auth.authFailure} normalizePath={auth.status !== "loading"} />;
 }
 

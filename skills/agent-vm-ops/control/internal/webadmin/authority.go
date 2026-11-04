@@ -223,7 +223,18 @@ func (authority *Authority) getPublicStatus(writer http.ResponseWriter, request 
 			state = "available"
 		}
 	}
-	taskCounts, _ := overview["task_counts"].(map[string]any)
+	taskStatesValid := validTaskStates(metrics["task_states"])
+	if !taskStatesValid {
+		state = "unknown"
+	}
+	activeSessions := any(nil)
+	if taskStatesValid {
+		activeSessions = int64Value(metricsMapValue(metrics, "task_states", "active"))
+	}
+	observationState := publicObservationState(overview["sources"])
+	if !taskStatesValid {
+		observationState = "unverified"
+	}
 	observedAt := stringValue(metrics["observed_at"])
 	var observed any
 	if observedAt != "" {
@@ -232,9 +243,9 @@ func (authority *Authority) getPublicStatus(writer http.ResponseWriter, request 
 	writer.Header().Set("Cache-Control", "public, max-age=15, stale-while-revalidate=45")
 	writeJSON(writer, http.StatusOK, map[string]any{
 		"state":               state,
-		"active_sessions":     int64Value(taskCounts["active"]),
+		"active_sessions":     activeSessions,
 		"observed_at":         observed,
-		"observation_state":   publicObservationState(overview["sources"]),
+		"observation_state":   observationState,
 		"stale_after_seconds": 60,
 	})
 }
@@ -289,6 +300,10 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	observedAt := stringValue(metrics["observed_at"])
 	observedTime, parseErr := time.Parse(time.RFC3339Nano, observedAt)
 	fresh := observedAt != "" && parseErr == nil && !observedTime.After(now.Add(5*time.Second)) && now.Sub(observedTime) <= 60*time.Second
+	observationUnverified := fresh && !validTaskStates(metrics["task_states"])
+	if observationUnverified {
+		fresh = false
+	}
 	if observedAt == "" {
 		observedAt = now.Format(time.RFC3339Nano)
 	}
@@ -324,6 +339,9 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	reasons := []string{}
 	if !fresh {
 		reasons = append(reasons, "observation_stale")
+	}
+	if observationUnverified {
+		reasons = append(reasons, "observation_unverified")
 	}
 	if defaultAdmission, ok := metrics["default_admission"].(map[string]any); ok {
 		if ready, ok := defaultAdmission["ready"].(bool); ok && !ready {
@@ -2372,6 +2390,49 @@ func metricsMapValue(root map[string]any, first, second string) any {
 		return value[second]
 	}
 	return nil
+}
+
+func validTaskStates(value any) bool {
+	switch states := value.(type) {
+	case map[string]any:
+		for _, raw := range states {
+			if _, ok := nonNegativeInt64(raw); !ok {
+				return false
+			}
+		}
+		return true
+	case map[string]int64:
+		for _, raw := range states {
+			if raw < 0 {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func nonNegativeInt64(value any) (int64, bool) {
+	if value == nil {
+		return 0, false
+	}
+	switch parsed := value.(type) {
+	case int64:
+		return parsed, parsed >= 0
+	case int:
+		return int64(parsed), parsed >= 0
+	case json.Number:
+		result, err := parsed.Int64()
+		return result, err == nil && result >= 0
+	case float64:
+		if parsed < 0 || parsed != math.Trunc(parsed) || parsed > float64(math.MaxInt64) {
+			return 0, false
+		}
+		return int64(parsed), true
+	default:
+		return 0, false
+	}
 }
 
 func int64Value(value any) int64 {

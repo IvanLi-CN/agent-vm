@@ -99,4 +99,14 @@ describe("management authentication gate", () => {
     expect(screen.queryByTestId("public-home")).not.toBeInTheDocument();
     expect(screen.getByRole("link", { name: "重新使用 OIDC 登录" })).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2Fvms");
   });
+
+  it("keeps an unavailable session in the dedicated auth error layout with retry", async () => {
+    getSessionMock.mockRejectedValue(new ManagementRequestError("state_unavailable", "authentication", null, null, true));
+    renderGate();
+
+    expect(await screen.findByText("无法确认会话")).toBeInTheDocument();
+    expect(screen.queryByTestId("public-home")).not.toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: "重试" })).toHaveLength(2);
+    expect(screen.getByRole("link", { name: "重新使用 OIDC 登录" })).toHaveAttribute("href", "/api/v1/auth/oidc/start?return_to=%2Fvms");
+  });
 });

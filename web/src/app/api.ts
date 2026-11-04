@@ -116,6 +116,18 @@ function sessionIsFresh(): boolean {
   return Boolean(csrfToken && managementSession && Date.now() < csrfExpiresAt - 5_000);
 }
 
+function isValidManagementSession(value: unknown): value is ManagementSession {
+  if (!value || typeof value !== "object") return false;
+  const session = value as Partial<ManagementSession>;
+  return typeof session.issuer === "string" && session.issuer.length > 0
+    && typeof session.subject === "string" && session.subject.length > 0
+    && session.role === "administrator"
+    && Array.isArray(session.capabilities) && session.capabilities.every((capability) => typeof capability === "string")
+    && typeof session.csrf_token === "string" && session.csrf_token.length > 0
+    && typeof session.expires_at === "string" && Number.isFinite(Date.parse(session.expires_at))
+    && Date.parse(session.expires_at) > Date.now();
+}
+
 async function loadManagementSession(): Promise<ManagementSession> {
   if (sessionIsFresh() && managementSession) return managementSession;
   csrfToken = null;
@@ -123,10 +135,10 @@ async function loadManagementSession(): Promise<ManagementSession> {
   if (!sessionPromise) {
     sessionPromise = requestJSON<ManagementSession>("/session", undefined)
       .then((session) => {
-        if (!session.csrf_token) throw new ManagementRequestError("authentication_required", "authentication");
+        if (!isValidManagementSession(session)) throw new ManagementRequestError("state_unavailable", "authentication", null, null, true);
         managementSession = session;
         csrfToken = session.csrf_token;
-        csrfExpiresAt = session.expires_at ? Date.parse(session.expires_at) : Date.now() + 14 * 60_000;
+        csrfExpiresAt = Date.parse(session.expires_at);
         managementRequestsEnabled = true;
         return session;
       })
