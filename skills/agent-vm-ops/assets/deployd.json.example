@@ -1,0 +1,24 @@
+{
+  "socket": "/run/agent-vm-native/deployd.sock",
+  "metrics_listen": "127.0.0.1:9911",
+  "database": "/var/lib/agent-vm-native/deployment/deployment.sqlite3",
+  "active_path": "/var/lib/agent-vm-native/active",
+  "release_root": "/var/lib/agent-vm-native",
+  "blue_socket": "/run/agent-vm-native/blue/app.sock",
+  "green_socket": "/run/agent-vm-native/green/app.sock",
+  "lease_seconds": 15,
+  "retention_days": 30,
+  "observe_seconds": 5,
+  "migration": {
+    "legacy_socket": "/run/agent-vm-native/app.sock",
+    "legacy_unit": "agent-vm-native.service",
+    "legacy_state_db": "/var/lib/agent-vm-native/state.sqlite3",
+    "rqlite_url": "https://127.0.0.1:4001",
+    "rqlite_unit": "agent-vm-rqlite.service",
+    "rqlite_ca_file": "/etc/agent-vm-native/tls/rqlite/server.crt",
+    "rqlite_auth_file": "/etc/agent-vm-native/rqlite/auth.json",
+    "recovery_directory": "/var/lib/agent-vm-native/migration",
+    "drain_timeout_seconds": 8100,
+    "writer_check_seconds": 1
+  }
+}

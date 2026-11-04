@@ -1,134 +1,355 @@
-# Agent VM CLI Contract
+# Agent VM CLI 合同
 
-The installed executable is `agent-vm`, a direct TypeScript command line client under installed Bun. The canonical source is [agent_vm.ts](../../../../skills/agent-vm/scripts/agent_vm.ts), with its sibling modules retained for source-linked execution. The client and both supported control transports speak protocol 4. The resident Go implementation is [agent-vm-control](../../../../skills/agent-vm-ops/control/cmd/agent-vm-control/main.go); the fixed Bun bridge is [agent_vm_control_bridge.ts](../../../../skills/agent-vm-ops/scripts/agent_vm_control_bridge.ts). Local Bun must support `bun:ffi`, `Bun.build` and direct TypeScript execution; OpenSSH and Git remain native tools, and sync additionally uses rsync. The public source does not install or download runtimes.
+已安装的 executable 是 `agent-vm`，是在已安装 Bun 下直接运行的 TypeScript command line client。
+规范源码是[agent_vm.ts](../../../../skills/agent-vm/scripts/agent_vm.ts)，其 sibling modules 保留用于 source-linked execution。Client 和两种受支持的 control transports 都使用 protocol 4。常驻 Go 实现是[agent-vm-control](../../../../skills/agent-vm-ops/control/cmd/agent-vm-control/main.go)；固定 Bun bridge 是[agent_vm_control_bridge.ts](../../../../skills/agent-vm-ops/scripts/agent_vm_control_bridge.ts)。
+本机 Bun 必须支持 `bun:ffi`、`Bun.build` 和 direct TypeScript execution；
+OpenSSH 与 Git 仍是 native tools，sync 还使用 rsync。
+公共源码不会安装或下载 runtimes。
 
-## Identity and configuration
+## 身份与配置
 
-Global `--session-id <id>` selects the managed target and is accepted before or after a command, including nested commands. If omitted, `AGENT_VM_SESSION_ID` is used. Explicit input wins. Session-scoped commands fail with JSON error code `missing_session` before local keys/journals or remote writes when neither is present. `version` and local help do not require a target. `doctor` permits an omitted target. `admin metrics` is sessionless, ignores the session environment and rejects an explicit `--session-id`. Tokens after `exec --` or `ssh --` belong to the native command and are never parsed as client identity options.
+Global `--session-id <id>` 选择 managed target，可放在 command 前或后，也可用于 nested commands。
+未提供时使用 `AGENT_VM_SESSION_ID`；
+显式 input 优先。
+两者都缺失时，session-scoped commands 在访问 local keys/journals 或执行 remote writes 前，以 JSON error code `missing_session` 失败。
+`version` 和 local help 不需要 target。
+`doctor` 允许省略 target。
+`admin metrics` 无 session，忽略 session environment，并拒绝显式 `--session-id`。
+`exec --` 或 `ssh --` 后的 tokens 属于 native command，绝不会解析为 client identity options。
 
-The control endpoint is selected from `AGENT_VM_CONTROL_HOST` and the validated local release sidecar. Format 1 uses `AGENT_VM_REMOTE_CONTROL`; format 2 with `transport=go-request` uses the fixed Go target `/opt/agent-vm-native/bin/agent-vm-control` and socket `/run/agent-vm-native/control.sock`, with only deployment-safe test overrides. The Go service reads a JSON file whose environment-specific fields are required: project, profile, image, network, ACL, pool, control address, port range, guest address range, storage path and state database. Missing or invalid values fail closed with `config_missing` or `config_invalid`.
+Control endpoint 从 `AGENT_VM_CONTROL_HOST` 和已验证的 local release sidecar 中选择。
+Format 1 使用 `AGENT_VM_REMOTE_CONTROL`；
+带 `transport=go-request` 的 format 2 使用固定 Go target `/opt/agent-vm-native/bin/agent-vm-control` 和 socket `/run/agent-vm-native/control.sock`，只允许 deployment-safe test overrides。
+Go service 读取 JSON file，其中 environment-specific fields 必须包含 project、profile、image、network、ACL、pool、control address、port range、guest address range、storage path 和 state database。
+缺失或无效值必须以 `config_missing` 或 `config_invalid` fail closed。
 
-Control-plane publication, update, and rollback are operator-owned deployment actions. The public `agent-vm` CLI has no `update` command and does not install remote files, modify deployment configuration, or acquire Incus/PVE authority.
+Control-plane publication、update 和 rollback 都是 operator-owned deployment actions。
+公共 `agent-vm` CLI 没有 `update` command，不安装 remote files、不修改 deployment configuration，也不获取 Incus/PVE authority。
 
-## Commands
+独立的运维可执行程序 `agent-vm-deploy` 是部署控制器客户端，详细合同见[部署控制器合同](deployment-controller.md)。
+它只连接 `agent-vm-deployd.service` 的受保护本机 Unix socket，并提供部署 `status`、`plan`、`verify`、`stage`、`activate`、`rollback`、`recover` 和一次性的 `migrate` 操作。
+它报告事务阶段、选中槽位、进程/就绪状态、控制器主权、流量排空、在途请求、native-worker quiescence、新鲜度和来源。
+它不是公共生命周期客户端；
+普通蓝绿操作不直接调用 rqlite、不写业务状态，也不提供公共 HTTP/TCP 端点。
+首次从 legacy SQLite 部署到蓝绿架构时，`migrate` 只向 Deployd 提交迁移事务，由 Deployd 自动完成排空、停写、快照、导入和验证；
+CLI 不接收 rqlite 地址、数据库路径、SQL 或凭据，也不绕过 Deployd。
 
-| Command | Contract |
+## 命令
+
+| 命令 | 合同 |
 | --- | --- |
-| `version` | Print local protocol and client version without contacting the control host. |
-| `doctor` | Read-only component and admission diagnostics. |
-| `status` | Read-only state for the selected session. |
-| `acquire [--cpu N] [--memory SIZE] [--disk SIZE]` | Create or reuse the selected session-managed container. |
-| `renew` | Extend the current lease within the configured maximum. |
-| `release` | Revoke access, stop the guest and retain an eligible cache. |
-| `resize [--cpu N] [--memory SIZE] [--disk SIZE] [--live] [--allow-restart]` | Apply an explicitly authorized resource change. |
-| `ssh [-- SSH_ARGS]` | Open native SSH with generated strict connection settings. |
-| `exec -- ARGV` | Run an argument-vector command; use `sh -lc` explicitly for shell syntax. |
-| `sync --name NAME` | Transfer the current worktree through the bundled synchronization helper. |
-| `upload SOURCE DESTINATION` / `download SOURCE DESTINATION` | Transfer files online without renewing. |
-| `export PATH` | Stream a tar archive on stdout; diagnostics go to stderr. |
-| `port add NAME --guest-port N [--protocol tcp\|udp] [--host-port N]` | Create an exact native proxy mapping. |
-| `port list` / `port remove NAME` | Inspect or remove an exact mapping. |
-| `admin status` | Read-only native component, maintenance status and bounded per-task inventory. |
-| `admin metrics` | Read-only controller metrics snapshot for authorized scrape bridges; it includes resource allocation, CT memory, disk capacity/admission, task, warning and failure summaries; it does not create a session or mutate state. |
-| `admin drain enter\|status\|exit` | Control admission while allowing safe retrieval and release. |
-| `admin session list` | List managed session records. |
-| `admin reconcile [--apply]` / `admin gc [--apply]` | Preview by default; apply only inside an authorized operations task. |
+| `version` | 不连接 control host，打印 local protocol 和 client version。 |
+| `doctor` | 只读的 component 和 admission diagnostics。 |
+| `status` | 选中 session 的只读 state。 |
+| `acquire [--cpu N] [--memory SIZE] [--disk SIZE]` | 创建或复用选中 session 的 managed container。 |
+| `renew` | 在 configured maximum 内延长当前 lease。 |
+| `release` | 撤销 access、停止 guest，并保留 eligible cache。 |
+| `resize [--cpu N] [--memory SIZE] [--disk SIZE] [--live] [--allow-restart]` | 应用显式授权的 resource change。 |
+| `ssh [-- SSH_ARGS]` | 使用生成的 strict connection settings 打开 native SSH。 |
+| `exec -- ARGV` | 运行 argument-vector command；需要 shell syntax 时显式使用 `sh -lc`。 |
+| `sync --name NAME` | 通过 bundled synchronization helper 传输当前 worktree。 |
+| `upload SOURCE DESTINATION` / `download SOURCE DESTINATION` | 在线传输 files，不 renew lease。 |
+| `export PATH` | 在 stdout stream tar archive；diagnostics 写入 stderr。 |
+| `port add NAME --guest-port N [--protocol tcp\|udp] [--host-port N]` | 创建精确的 native proxy mapping。 |
+| `port list` / `port remove NAME` | 检查或移除精确 mapping。 |
+| `admin status` | 只读的 native component、maintenance status 和有界 per-task inventory。 |
+| `admin metrics` | 面向 `agent-vm-deployd` 的只读 controller metrics snapshot；包含 resource allocation、CT memory、disk capacity/admission、task、warning 和 failure summaries；不创建 session 或改变 state。 |
+| `admin drain enter\|status\|exit` | 在允许安全 retrieval 和 release 的同时控制 admission。 |
+| `admin session list` | 列出 managed session records。 |
+| `admin reconcile [--apply]` / `admin gc [--apply]` | 默认 preview；只在 authorized operations task 内 apply。 |
 
-Cached `acquire` resumes are guarded by the task's recorded `image_fingerprint`. A changed configured default does not invalidate that binding; acquire continues with the recorded image. It returns an explicit cache eligibility error only when that pinned image is missing, retired, or otherwise unverified, before starting, resizing, or exposing the guest.
+`agent-vm-deploy migrate` 是首次部署专用的自动迁移入口。
+发布器在启动双槽位前调用它；
+Deployd 负责检查 legacy 服务、启动并验证固定的 rqlite 单元、执行一次性 SQLite 导入、写入完成标记，并在任何不确定阶段保持 fenced。
+迁移失败时，发布器只允许按原事务身份执行一次受限 retry；
+不能把迁移改成发布后的人工前置，也不能把普通 `stage`、`activate` 或 `rollback` 当作迁移入口。
 
-The `admin-metrics` result has stable top-level fields: `observation_epoch` (durable state epoch for the sampled window), `observation_consistent` (whether the durable epoch was unchanged across the native probe), `observation_attempts` (bounded retry count), `observed_at` (ISO-8601 string), `up`, `draining` and `admission_ready` (booleans), `reclaim_required` (boolean or `null` when disk capacity is unverified), `resources`, `capacity`, `disk_admission`, `default_admission`, `ct_cpu`, `ct_memory`, `instances`, `task_states`, `operations`, `pending_operations`, `image_unpack_failures`, `warnings`, `warning_counts` and `doctor`. `resources` contains `allocated`, `reserved`, `allocated_and_reserved`, `remaining`, `limits`, `ct_capacity`, `memory`, `memory_pressure` and `cpu_pressure`; `default_admission` contains the authoritative default request, physical request cost, readiness, reasons and observations used by read-only bridges to estimate startable default managed containers. `ct_cpu` contains CT-visible `capacity_vcpu`, the verified CPU PSI observation, and the default-request `startup_pressure` result. `ct_memory` contains CT-local `capacity_bytes`, `current_bytes`, `available_bytes`, `pressure_threshold_bytes`, `pressure` and `oom_events`. `pending_operations` is a list of `{operation_id, action, session_id, generation, created_at}` records and distinguishes an uncertain journal from no recent operation. `historical_unknown_operations` uses the same identifying fields for superseded operations whose original outcomes remain unknown after current safety was verified; retries return `operation_outcome_unknown` with `outcome_verified: false` and never replay the original effect. The controller samples native state outside the SQLite lock, then compares the durable epoch before and after the probe; the epoch changes only when a transaction commits a durable SQLite change, not for successful read or no-op transactions. It retries a bounded number of times and sets `observation_consistent=false` with a warning if the state keeps changing. Unverified numeric or boolean observations are `null` or omitted according to the field contract; they are never converted to a healthy zero or false value.
+Cached `acquire` resume 受 task 记录的 `image_fingerprint` 保护。
+Configured default 变化不会使该 binding 失效；
+acquire 继续使用 recorded image。
+只有 pinned image 缺失、retired 或其他原因未验证时，才会在启动、resize 或暴露 guest 前返回明确的 cache eligibility error。
 
-`admin-metrics` is the aggregate source for capacity dashboards. `admin status` is the inventory source and returns bounded task summaries for managed states, including task/instance/session identifiers, lifecycle and native state, guest availability, requested resources, effective-lease state, lease expiry, SSH mapping and structured last-error code/phase. A deployment collector may join the two read-only responses by task ID, but it must not expose raw error text, credentials or deployment filesystem paths. It must remove stale task rows after a successful scrape and report `up=0` with freshness failure when either action cannot be read or parsed.
+`admin-metrics` result 具有稳定的 top-level fields：`observation_epoch`（采样窗口的 durable state epoch）、`observation_consistent`（native probe 前后 durable epoch 是否保持不变）、`observation_attempts`（有界 retry count）、`observed_at`（ISO-8601 string）、`up`、`draining` 和 `admission_ready`（booleans）、`reclaim_required`（boolean；
+disk capacity 未验证时为 `null`）、`resources`、`capacity`、`disk_admission`、`default_admission`、`ct_cpu`、`ct_memory`、`instances`、`task_states`、`operations`、`pending_operations`、`image_unpack_failures`、`warnings`、`warning_counts` 和 `doctor`。
+`resources` 包含 `allocated`、`reserved`、`allocated_and_reserved`、`remaining`、`limits`、`ct_capacity`、`memory`、`memory_pressure` 和 `cpu_pressure`；
+`default_admission` 包含 authoritative default request、physical request cost、readiness、reasons 和 observations，供 deployd 估计可启动的 default managed containers。
+`ct_cpu` 包含 CT-visible `capacity_vcpu`、verified CPU PSI observation 和 default-request `startup_pressure` result。
+`ct_memory` 包含 CT-local `capacity_bytes`、`current_bytes`、`available_bytes`、`pressure_threshold_bytes`、`pressure` 和 `oom_events`。
+`pending_operations` 是 `{operation_id, action, session_id, generation, created_at}` records 列表，用于区分 uncertain journal 与近期没有 operation。
+`historical_unknown_operations` 为 superseded operations 使用相同的 identifying fields；
+当当前 safety 已验证但原始 outcome 仍 unknown 时，retry 返回 `operation_outcome_unknown` 和 `outcome_verified: false`，绝不 replay original effect。
+Controller 在 SQLite lock 外采样 native state，然后比较 probe 前后的 durable epoch；
+只有 transaction commit durable SQLite change 时 epoch 才变化，successful read 或 no-op transaction 不会改变 epoch。
+它会进行有界次数的 retry；
+如果 state 持续变化，则设置 `observation_consistent=false` 并附带 warning。
+未验证的 numeric 或 boolean observations 根据 field contract 设为 `null` 或省略，绝不转换成 healthy zero 或 false value。
 
-Unknown flags and command layouts must be rejected; callers should use `--help` for the installed build.
+`admin-metrics` 是 capacity dashboards 的 aggregate source。
+`admin status` 是 inventory source，返回 managed states 的 bounded task summaries，包括 task/instance/session identifiers、lifecycle 和 native state、guest availability、requested resources、effective-lease state、lease expiry、SSH mapping 以及 structured last-error code/phase。
+Deployd 可以按 task ID join 两个 read-only responses，但不得暴露 raw error text、credentials 或 deployment filesystem paths。
+成功 scrape 后必须移除 stale task rows；
+任一 action 无法读取或解析时，必须报告 `up=0` 和 freshness failure。
 
-## Request and response
+`admin-status` 接受可选的 numeric `limit` 和 task-id `cursor`。
+默认 limit 为 25，最大为 100，超过最大值必须拒绝。
+每页最多 8 个并发 native read，每个 probe deadline 为 1 秒，整页 deadline 为 5 秒。
+结果包含 `limit`、`next_cursor`、`partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out`。
+native observation 不可用或不确定时，task 的 `native_status` 必须为 `unknown`、`verified` 为 false，并计入 `unknown`；
+`native_missing` 仅是 observation detail，不创建 lifecycle state。
 
-Pending operation entries may include the exact task ID bound to an acquire; recovery proofs require that binding in addition to session and generation identity.
+Unknown flags 和 command layouts 必须拒绝；
+调用方应使用已安装 build 的 `--help`。
 
-For `admin-metrics`, `up` is `true` only when the action and its initial Incus version/instance probe succeeded; it is separate from `admission_ready` and runtime pressure.
+## Request 与 response
 
-`observed_at` is the start of the final bounded native sampling window, not the response serialization time; scrape bridges must preserve it when evaluating freshness.
+Pending operation entries 可以包含与 acquire 绑定的 exact task ID；
+recovery proofs 除 session 和 generation identity 外，还要求该 binding。
 
-Session-scoped requests contain `protocol`, `action` and `session_id`; the sessionless read-only `admin-metrics` request omits `session_id` and `operation_id`. Mutations also contain `generation` and `operation_id`. Success envelopes contain `ok`, `protocol`, `server_time`, `action`, `session_id`, `generation`, `operation_id`, `outcome`, `result`, and the action's `response` schema/semantic metadata, and MAY contain a structured `warnings` array; a client MUST match every supplied request identity field, including `generation`, before finalizing a local journal. A legacy control response that omits this metadata is accepted only with a structured compatibility warning. Error diagnostics are JSON on stderr with a nonzero exit status and MUST contain `ok: false`, `protocol`, the request identity fields that were supplied, and a structured `error`; the controller marks `error.detail.outcome_verified` when it has confirmed that no native effect can have occurred, while native-phase or durable-state uncertainty remains pending. The client accepts exactly one matching error envelope; unrelated, duplicate or type-mismatched envelopes leave the journal pending. SSH stderr is retained only within a 64 KiB diagnostic bound; a truncated failure is `remote_failed` and its mutation outcome remains unverified. A transport timeout reports the operation ID without claiming whether the mutation completed. A state-database failure reports `sqlite_unavailable` with `phase`, SQLite code/name, SQL operation category and `state_committed`; `null` means a commit result is unknown and the original operation remains subject to status/reconciliation.
+对于 `admin-metrics`，只有 action 及其 initial Incus version/instance probe 均成功时，`up` 才是 `true`；
+它与 `admission_ready` 和 runtime pressure 独立。
 
-## Control-plane compatibility
+`observed_at` 是 final bounded native sampling window 的开始时间，不是 response serialization time；
+deployd 的 `/metrics` encoder 评估 freshness 时必须保留它。
 
-The release manifest is the authority for product SemVer, source provenance, artifact checksums, protocol, and per-action request/response/semantic compatibility in each direction. Production format 3 carries independent `version` and `source_revision` fields, fixed Bun/Go toolchain metadata, target architecture, and the `legacy-bun|go-request` transport enum. Formats 1 and 2 are read-only migration and necessary rollback inputs. A compatible action MAY run across different source revisions and MUST surface a structured compatibility warning. The client and control process MUST reject incompatible protocol, schema, semantic behavior, unknown action, invalid transport or unverified artifact before any state or native effect; compatibility is never inferred from JSON parseability alone.
+Session-scoped requests 包含 `protocol`、`action` 和 `session_id`；
+sessionless read-only `admin-metrics` request 省略 `session_id` 和 `operation_id`。
+Mutations 还包含 `generation` 和 `operation_id`。
+Success envelopes 包含 `ok`、`protocol`、`server_time`、`action`、`session_id`、`generation`、`operation_id`、`outcome`、`result` 以及该 action 的 `response` schema/semantic metadata，并 MAY 包含 structured `warnings` array；
+Client 在 finalize local journal 前，MUST 匹配每个提供的 request identity field，包括 `generation`。
+省略这些 metadata 的 legacy control response 只有在带 structured compatibility warning 时才接受。
+Error diagnostics 是 stderr 上的 JSON，exit status 非零，并 MUST 包含 `ok: false`、`protocol`、已提供的 request identity fields 和 structured `error`；
+当 controller 确认不可能产生 native effect 时，标记 `error.detail.outcome_verified`，native-phase 或 durable-state uncertainty 仍保持 pending。
+Client 只接受一个 matching error envelope；
+unrelated、duplicate 或 type-mismatched envelopes 会使 journal 保持 pending。
+SSH stderr 只在 64 KiB diagnostic bound 内保留；
+truncated failure 为 `remote_failed`，其 mutation outcome 保持 unverified。
+Transport timeout 报告 operation ID，但不声称 mutation 是否完成。
+State-database failure 使用 `phase`、SQLite code/name、SQL operation category 和 `state_committed` 报告 `sqlite_unavailable`；
+`null` 表示 commit result unknown，original operation 仍需通过 status/reconciliation 处理。
 
-The complete manifest shape, wrapper action allowlist, publisher order, rollback limit, and private deployment boundary are defined in the [control-plane release contract](release.md). The public client only reads its local sidecar and has no update, publish, install, or rollback command.
+## 控制面兼容性
 
-The Bun client sidecar identifies `agent_vm.ts` as its `client_artifact` and declares the complete fixed `client_dependencies` array for `byte-fs.ts`, `client-io.ts`, `client-release.ts`, `client.ts`, `guest-source.ts`, `sync-native.ts` and `sync_worktree.ts`. Each dependency has `name`, sibling-relative `path`, `role: support`, exact `sha256` and fixed numeric `mode` (0755 for `sync_worktree.ts`, 0644 for the other support files). Format 3 adds `version` and keeps `source_revision`; its `client_view.transport` is exactly `legacy-bun` or `go-request`. A present sidecar must verify every module, reject missing/duplicate/extra dependencies, symlinks and altered modes/bytes, and fail before SSH or mutation journaling. The legacy Python artifact declaration is rejected. Missing sidecars retain the explicit legacy protocol-4 warnings. Local state and operation journals keep their existing session hash, paths and request shape; retries send the journaled capability, operation ID and generation even after local release metadata changes. Integer tokens remain exact beyond JavaScript's safe-number range, and fractional tokens are distinct from integer identity fields.
+本节与发布合同（release contract）保持一致；
+该英文短语是仓库链接检查使用的固定合同名称。
 
-## Management API compatibility
+Release manifest 是 product SemVer、source provenance、artifact checksums、protocol 以及各方向 per-action request/response/semantic compatibility 的 authority。
+Production format 3 携带独立的 `version` 和 `source_revision` fields、fixed Bun/Go toolchain metadata、target architecture 和 `legacy-bun|go-request` transport enum。
+Formats 1 和 2 是只读 migration 与必要的 rollback inputs。
+Compatible action MAY 跨不同 source revisions 运行，并 MUST 暴露 structured compatibility warning。
+Client 和 control process MUST 在任何 state 或 native effect 前拒绝 incompatible protocol、schema、semantic behavior、unknown action、invalid transport 或 unverified artifact；
+compatibility 绝不能仅根据 JSON parseability 推断。
 
-Management-enabled packages use product manifest format 4 to declare durable state capabilities. That manifest change does not change protocol 4 or add a public client action; formats 1 through 3 remain pre-management rollback targets and are rejected after management-state markers are present.
+完整的 manifest 结构、封装器动作白名单、发布顺序、回滚限制、部署控制器边界和私有部署边界定义于[控制面发布合同](release.md)。
+公共客户端只读取本地 sidecar，不提供更新、发布、安装或回滚命令；
+`agent-vm-deploy` 是独立的运维入口。
 
-The built-in management console uses the same-origin `/api/v1` contract in [management-api.yaml](management-api.yaml). It does not wrap CLI output, tunnel protocol-4 requests, or add a public `agent-vm` command. OIDC establishes the sole administrator actor as the exact `(issuer, subject)` pair; administrator actions require explicit capability, optional reason when supplied, the contract-defined preview/confirmation, and audit. Existing `status`, `admin status`, `admin session list`, request envelopes and protocol-4 action compatibility remain unchanged.
+具体来说，Bun client sidecar 将 `agent_vm.ts` 标识为 `client_artifact`，并声明 `byte-fs.ts`、`client-io.ts`、`client-release.ts`、`client.ts`、`guest-source.ts`、`sync-native.ts` 和 `sync_worktree.ts` 的完整固定 `client_dependencies` array。
+每个 dependency 包含 `name`、sibling-relative `path`、`role: support`、exact `sha256` 和固定 numeric `mode`（`sync_worktree.ts` 为 0755，其他 support files 为 0644）。
+Format 3 新增 `version` 并保留 `source_revision`；
+其 `client_view.transport` 必须是 `legacy-bun` 或 `go-request`。
+存在的 sidecar 必须验证每个 module，拒绝 missing/duplicate/extra dependencies、symlinks 和 altered modes/bytes，并在 SSH 或 mutation journaling 前失败。
+Legacy Python artifact declaration 必须拒绝。
+缺失 sidecar 时保留显式的 legacy protocol-4 warnings。
+Local state 和 operation journals 保持既有 session hash、paths 和 request shape；
+即使 local release metadata 变化，retry 仍发送 journaled capability、operation ID 和 generation。
+Integer tokens 超出 JavaScript safe-number range 后仍须精确，fractional tokens 与 integer identity fields 不同。
 
-## Agent API transport compatibility
+## Management API 兼容性
 
-The direct HTTPS Agent API is `POST /agent/v1/control` through the stable Caddy entry point. It accepts an opaque Bearer Token from the [Token API](token-api.md) and the same protocol-4 JSON body; it does not accept browser cookies, forwarded identity headers or arbitrary control routes. The service checks Token expiry/revocation, the fixed scope-to-action mapping in the [Agent API contract](agent-api.md), the target session's native identity, generation, operation ID and request digest before dispatching the existing control action. A machine Token is not pre-bound to a session; a valid scope may target any session whose current state passes the existing checks. Sessionless administrative observations require the explicit `agent:observe_admin` scope; unknown actions or scope combinations are rejected before effects.
+Management-enabled packages 使用 product manifest format 4 声明 durable state capabilities。
+该 manifest change 不改变 protocol 4，也不新增 public client action；
+formats 1 到 3 仍是 pre-management rollback targets，在 management-state markers 存在后必须拒绝。
 
-The release manifest declares per-action request, response and semantic compatibility for the `legacy-bun`, `go-request` and direct HTTPS transports. During the blue-green compatibility window, both slots must accept the common protocol-4 set and share Token/session/journal capability markers. SSH remains a compatibility transport until the declared window closes; it is not a second lifecycle authority. A transport or action outside the declared window fails before durable or native effects.
+内置 management console 使用[management-api.yaml](management-api.yaml)中的 same-origin `/api/v1` contract。它不包装 CLI output、不 tunnel protocol-4 requests，也不新增 public `agent-vm` command。OIDC 将唯一 administrator actor 确定为精确的 `(issuer, subject)` pair；administrator actions 要求 explicit capability，提供 reason 时记录该 reason，并遵循 contract-defined preview/confirmation 和 audit。Existing `status`、`admin status`、`admin session list`、request envelopes 以及 protocol-4 action compatibility 保持不变。
 
-For session state, the existing `image_fingerprint` is the immutable image identity pinned to that task. A changed default affects future task creation only; an existing active task or cache is not rewritten. Cached acquire continues with its recorded fingerprint and is rejected only when that exact image cannot be verified or restored. The operator must explicitly destroy the exact session's cache only when that pinned image is unavailable. The browser API uses a separate opaque `resource_version` for compare-and-act and carries the current VM `generation`; neither value replaces the session target or the existing CLI request identity.
+## Agent API transport 兼容性
 
-Management state migrations do not change the protocol-4 request or response schema. SQLite remains the sole writer until a state-write fence rejects new browser/API/Agent durable mutations, drains in-flight transactions and native workers, and requires every native worker to finish with a durable result under its original operation ID plus verified process-group, PID-identity and Incus-operation quiescence. A pending/unknown native result, active worker or unverifiable quiescence blocks the one-time export and import; it cannot be recorded and bypassed. After cutover rqlite is the shared authority and critical administrator-authorization/lease/generation/journal/epoch reads use linearizable consistency. A verified recovery backup must record coverage at or after the last trusted commit, and its tail must be reconciled with the append-only journal and native-effect evidence; internal schema, digest, epoch or journal checks alone are insufficient. If that coverage or tail cannot be proven, stay fenced for administrator-authorized reconciliation. A release that introduces new state capabilities must pass the preflight rules in the [management contract](management-api.md) and [release contract](release.md) before activation or rollback. A state-backend outage keeps the legacy `sqlite_unavailable` label for protocol-4 compatibility even when the active backend is rqlite; new browser/API error documentation uses `state_unavailable`.
+Direct HTTPS Agent API 通过稳定的 Caddy entry point 提供 `POST /agent/v1/control`。
+它接受来自[Token API](token-api.md)的 opaque Bearer Token 和相同的 protocol-4 JSON body；不接受 browser cookies、forwarded identity headers 或 arbitrary control routes。Service 在 dispatch existing control action 前，检查 Token expiry/revocation、[Agent API 合同](agent-api.md)中的 fixed scope-to-action mapping、target session 的 native identity、generation、operation ID 和 request digest。
+Machine Token 不 pre-bound 到 session；
+只要 current state 通过现有 checks，valid scope 可以 target 任意 session。
+Sessionless administrative observations 要求显式 `agent:observe_admin` scope；
+unknown actions 或 scope combinations 必须在 effects 前拒绝。
 
-## Source synchronization transaction
+Release manifest 为 `legacy-bun`、`go-request` 和 direct HTTPS transports 声明 per-action request、response 和 semantic compatibility。
+在 blue-green compatibility window 期间，两个 slots 必须接受 common protocol-4 set，并共享 Token/session/journal capability markers。
+SSH 在声明窗口关闭前继续作为 compatibility transport；
+它不是第二个 lifecycle authority。
+超出声明窗口的 transport 或 action 必须在 durable 或 native effects 前失败。
 
-The maintained local helper is [sync_worktree.ts](../../../../skills/agent-vm/scripts/sync_worktree.ts); [guest-source.ts](../../../../skills/agent-vm/scripts/guest-source.ts) is bundled in memory and run as a one-shot guest action. The helper first inspects the Git index for submodules, then selects tracked/unignored files using NUL-delimited byte paths. It skips tracked deletions and `.git`, refuses the reserved owner filename and symlink parents, hashes regular file bytes, and preserves exact POSIX modes and symlink target bytes. JSON paths use UTF-8 with surrogateescape for invalid bytes, matching the prior manifest representation; native byte-path syscalls avoid runtime string substitution. A local worktree root that cannot be represented exactly in subprocess argv is explicitly unsupported before transport. macOS filesystems may reject invalid UTF-8 names; their codec tests do not establish Linux filesystem behavior.
+对于 session state，现有 `image_fingerprint` 是 pin 到该 task 的 immutable image identity。
+Default 变化只影响 future task creation；
+existing active task 或 cache 不会被改写。
+Cached acquire 使用 recorded fingerprint 继续，只有 exact image 无法 verify 或 restore 时才拒绝。
+只有 pinned image unavailable 时，operator 才必须显式 destroy exact session 的 cache。
+Browser API 使用独立的 opaque `resource_version` 进行 compare-and-act，并携带 current VM `generation`；
+两者都不能替换 session target 或 existing CLI request identity。
 
-Only `/workspace/worktrees/<safe-name>/src`, that workspace's exact transaction stage/record and its lock are helper-owned. Adjacent results and unowned sources remain untouched. Names are one safe segment and transaction IDs are 32 lowercase hex digits. The guest checks canonical real parent directories and opens metadata without following symlinks. Native `flock` serializes begin/commit/cleanup with a maximum 60-second lock wait. Begin exclusively creates the stage and prepared record; it records the source device/inode/transaction baseline. Commit rejects a changed baseline or manifest, fsyncs regular files, ownership metadata and directories, then uses Linux `renameat2(RENAME_NOREPLACE)` for an absent source or `RENAME_EXCHANGE` for replacement. Atomic capability failure preserves the prior source and recovery material; there is no copy/delete replacement fallback. The committed marker and parent directory are durable before the committed record is acknowledged.
+Management state migrations 不改变 protocol-4 request 或 response schema。
+SQLite 在 state-write fence 拒绝新的 browser/API/Agent durable mutations、排空 in-flight transactions 和 native workers，并要求每个 native worker 在 original operation ID 下以 durable result 完成且 process-group、PID-identity 和 Incus-operation quiescence 已验证前，继续作为 sole writer。
+Pending/unknown native result、active worker 或 unverifiable quiescence 会阻止 one-time export/import；
+不能只记录它然后绕过。
+Cutover 后 rqlite 是 shared authority，critical administrator-authorization/lease/generation/journal/epoch reads 使用 linearizable consistency。
+Verified recovery backup 必须记录不早于 last trusted commit 的 coverage，tail 必须与 append-only journal 和 native-effect evidence reconcile；
+仅 internal schema、digest、epoch 或 journal checks 不足以证明覆盖。
+如果无法证明 coverage 或 tail，必须保持 fenced，等待 administrator-authorized reconciliation。
+引入 new state capabilities 的 release 在 activation 或 rollback 前，必须通过[管理合同](management-api.md)和[发布合同](release.md)的 preflight rules。
+即使 active backend 是 rqlite，state-backend outage 仍保留 legacy `sqlite_unavailable` label 以兼容 protocol-4；
+新的 browser/API error documentation 使用 `state_unavailable`。
 
-The Linux managed guest requires installed Bun with `bun:ffi`, libc byte-path calls, `flock` and `renameat2`, plus GNU `timeout` and rsync. Bun/timeout absence fails before staging; native capability resolution precedes parent creation. The SSH command runs `timeout --signal=KILL 180s bun -e <in-memory-bundle>`, with a 240-second client transport budget, bounded stdout/stderr and a 32-MiB guest request limit. No guest service or opportunistic runtime installation exists. Local rsync uses a private mode-0600 NUL listing and SSH configuration, removes temporary configuration on every path, and preserves transfer exit codes. Successful synchronization does not acquire or renew a lease.
+## 源码同步事务
 
-A lost, malformed, truncated or timed-out commit acknowledgement returns exit 75 and retains the exact transaction recovery record; the helper never automatically aborts after commit starts. The source owner marker detects an exchange completed before the record update. `abort` reports `unverified` and retains committed recovery material. A deliberate `finish` confirms the source marker and deletes only the exact owned stage (including its recorded baseline identity after exchange) and record. An unconfirmed finish, foreign stage or superseded source retains evidence. A cleanup failure after confirmed commit reports success with a diagnostic and retained recovery material.
+维护中的本机 helper 是[sync_worktree.ts](../../../../skills/agent-vm/scripts/sync_worktree.ts)；[guest-source.ts](../../../../skills/agent-vm/scripts/guest-source.ts)会以内存 bundle 形式作为 one-shot guest action 运行。
+Helper 首先检查 Git index 中的 submodules，然后使用 NUL-delimited byte paths 选择 tracked/unignored files。
+它跳过 tracked deletions 和 `.git`，拒绝 reserved owner filename 与 symlink parents，计算 regular file bytes 的 hash，并保留 exact POSIX modes 和 symlink target bytes。
+JSON paths 对 invalid bytes 使用带 surrogateescape 的 UTF-8，与之前的 manifest representation 一致；
+native byte-path syscalls 避免 runtime string substitution。
+无法在 subprocess argv 中精确表示的 local worktree root，必须在 transport 前显式视为 unsupported。
+macOS filesystems 可能拒绝 invalid UTF-8 names；
+其 codec tests 不能证明 Linux filesystem behavior。
 
-Compatible evolution keeps protocol 4. A breaking protocol or semantic change may require a coordinated release and an explicit client update. The remote control release is published and health-checked before the local client release is changed, so an older client can continue using compatible actions while the new client is not allowed to assume unsupported remote actions.
+Helper 只拥有 `/workspace/worktrees/<safe-name>/src`、该 workspace 的 exact transaction stage/record 及其 lock。
+Adjacent results 和 unowned sources 保持不变。
+Names 只能是一个 safe segment，transaction IDs 是 32 位 lowercase hex digits。
+Guest 检查 canonical real parent directories，并在不跟随 symlinks 的情况下打开 metadata。
+Native `flock` 以最多 60 秒的 lock wait 串行化 begin/commit/cleanup。
+Begin 独占创建 stage 和 prepared record，并记录 source device/inode/transaction baseline。
+Commit 拒绝 changed baseline 或 manifest，fsync regular files、ownership metadata 和 directories，然后对 absent source 使用 Linux `renameat2(RENAME_NOREPLACE)`，对 replacement 使用 `RENAME_EXCHANGE`。
+Atomic capability failure 保留 prior source 和 recovery material；
+没有 copy/delete replacement fallback。
+Committed marker 和 parent directory 必须在 committed record 被确认前持久化。
 
-Acquire, restart and restart-capable resize use a longer bounded transport timeout. Acquire may spend up to 30 seconds waiting for an unrelated native lease-expiry cleanup to leave its transitional state; only `resource_unverified` with the exact message `transitional native instance blocks admission` is retried, while all other `resource_unverified` errors fail closed immediately. Before native startup, the control process can return `resource_pressure` when projected CPU exceeds CT-visible capacity and verified CPU PSI `full.avg10` reaches or exceeds the configured startup threshold; the approved overcommit deployment profile uses 50 percent. The response includes the observed pressure, threshold, projected CPU and CT capacity, and an existing guest is left untouched. A definitive pre-native `resource_pressure` may be retried with a new operation ID after status confirms that no native effect is active; an uncertain timeout or pending operation must keep its original operation ID and generation. This wait preserves protocol, generation and operation ID and does not create a second intent. No command implicitly renews a lease.
+Linux managed guest 要求已安装的 Bun，且支持 `bun:ffi`、libc byte-path calls、`flock` 和 `renameat2`，以及 GNU `timeout` 和 rsync。
+缺少 Bun/timeout 时必须在 staging 前失败；
+native capability resolution 先于 parent creation。
+SSH command 运行 `timeout --signal=KILL 180s bun -e <in-memory-bundle>`，client transport budget 为 240 秒，stdout/stderr 有界，guest request limit 为 32 MiB。
+不存在 guest service 或 opportunistic runtime installation。
+Local rsync 使用 private mode-0600 NUL listing 和 SSH configuration，在所有路径移除 temporary configuration，并保留 transfer exit codes。
+Successful synchronization 不 acquire 或 renew lease。
 
-Container rootfs growth reports `guest_filesystem` evidence including the compatible `status` (`grown`, `grown_after_retry` or `already_grown`), configured rootfs capacity, observed filesystem capacity, the verification threshold and storage/topology evidence. A rootfs growth failure is `guest_resize_unverified` with bounded diagnostics, the failing phase, command or Incus operation, return code, truncation flags when applicable, process-group cleanup evidence on command timeout, capacity evidence and a bounded attempt/retry chain; acquire cleanup must leave no active lease or exposed SSH mapping, while the durable partial state remains inspectable and retryable.
+Lost、malformed、truncated 或 timed-out commit acknowledgement 返回 exit 75，并保留 exact transaction recovery record；
+helper 在 commit 开始后绝不自动 abort。
+Source owner marker 用于发现 record update 前已完成的 exchange。
+`abort` 报告 `unverified`，并保留 committed recovery material。
+显式 `finish` 确认 source marker，只删除 exact owned stage（包括 exchange 后记录的 baseline identity）和 record。
+Unconfirmed finish、foreign stage 或 superseded source 都保留 evidence。
+Confirmed commit 后的 cleanup failure 报告 success，并附带 diagnostic 和 retained recovery material。
 
-When acquire returns an error after the control side has created a durable task, the client performs one status read and persists the task ID, generation and private-key path only when the status carries either the failed acquire's operation ID in partial-failure evidence or a controller-verified committed acquire operation with the matching generation. The controller records partial-failure operation IDs durably and proves committed operations from its operation journal. A committed operation whose status still reports an effective active lease is an adoptable lease, although the failed acquire invocation does not print it; a partial proof, pending operation, or committed proof without an effective lease is a cleanup handle only. Public `release` and `destroy` remain usable with cleanup-only state so cached, transitional and partially cleaned tasks can be retried, including retrying a durable cache deletion. An absent, stale, concurrent or mismatched status does not create guessed local state.
-Recovery state from a partial failure, pending operation or committed operation without an effective lease is cleanup-only: the client rejects SSH and lease mutations until a successful acquire replaces it, and the controller rejects active mutations while the exact pending acquire remains unresolved. Acquire retries retain the original operation ID and generation; an active lease may converge only pending requests whose recorded resource evidence matches the durable allocation, while missing or conflicting evidence remains pending for explicit release or destruction. When background cleanup advances a failed acquire to a cached task before that status read, the controller retains a task-, generation-, and operation-bound partial-failure marker until a later acquire or explicit destruction supersedes it, so the same cleanup handle remains verifiable.
+Compatible evolution 保留 protocol 4。
+Breaking protocol 或 semantic change 可能要求 coordinated release 和 explicit client update。
+Remote control release 必须先 published 并 health-checked，之后才能改变 local client release；
+因此旧 client 可以继续使用 compatible actions，新 client 则不允许假定 remote 支持 unsupported actions。
 
-## SSH and ports
+Acquire、restart 和 restart-capable resize 使用更长的 bounded transport timeout。
+Acquire 最多等待 30 秒，让无关的 native lease-expiry cleanup 离开 transitional state；
+只有 message 精确为 `transitional native instance blocks admission` 的 `resource_unverified` 才 retry，其他 `resource_unverified` errors 立即 fail closed。
+Native startup 前，当 projected CPU 超过 CT-visible capacity 且 verified CPU PSI `full.avg10` 达到或超过 configured startup threshold 时，control process 可以返回 `resource_pressure`；
+批准的 overcommit deployment profile 使用 50 percent。
+Response 包含 observed pressure、threshold、projected CPU 和 CT capacity，并且不修改 existing guest。
+Definitive pre-native `resource_pressure` 在 status 确认没有 active native effect 后，可以使用新的 operation ID retry；
+uncertain timeout 或 pending operation 必须保留原始 operation ID 和 generation。
+该等待保留 protocol、generation 和 operation ID，不创建 second intent。
+任何 command 都不会隐式 renew lease。
 
-Generated SSH configuration uses the configured control address, leased port, explicit identity and known-host files, a generation-bound host-key alias, `StrictHostKeyChecking yes` and `IdentitiesOnly yes`. It must not disable host checking or introduce a gateway. Port allocation considers listeners, native mappings, forwards, reservations and the configured ephemeral range. Lease cleanup removes mappings and their exact conntrack flows before the guest becomes reusable.
+Container rootfs growth 报告 `guest_filesystem` evidence，包括兼容的 `status`（`grown`、`grown_after_retry` 或 `already_grown`）、configured rootfs capacity、observed filesystem capacity、verification threshold 以及 storage/topology evidence。
+Rootfs growth failure 返回 `guest_resize_unverified`，并包含 bounded diagnostics、failing phase、command 或 Incus operation、return code、适用时的 truncation flags、command timeout 时的 process-group cleanup evidence、capacity evidence 以及 bounded attempt/retry chain；
+acquire cleanup 必须留下 no active lease 或 exposed SSH mapping，而 durable partial state 保持可 inspect 和 retry。
 
-## Capacity and cleanup
+因此，失败后的清理必须明确证明 `no active lease or exposed SSH mapping`，并让 durable partial state 保持 `inspectable and retryable`。
 
-Capacity responses identify their local filesystem scope, observed sources, allocation budgets, allocated and reserved values, logical remaining values and pressure observations. Missing or contradictory capacity measurements refuse new demand without stopping an effective lease. Under reservation-only memory admission, low CT `MemAvailable` is reported as pressure but does not reject a request within the logical memory ceiling. CPU PSI is a separate startup-schedulability guard: it does not reduce logical CPU remaining, and it does not stop a running lease. Manual cleanup is dry-run by default and rechecks ownership, generation and eligibility under object locks before deletion.
+当 acquire 在 control side 创建 durable task 后返回 error，client 执行一次 status read；
+只有 status 携带 failed acquire 的 operation ID（位于 partial-failure evidence 中），或携带 controller-verified 且 generation 匹配的 committed acquire operation 时，才持久化 task ID、generation 和 private-key path。
+Controller 持久化记录 partial-failure operation IDs，并从 operation journal 证明 committed operations。
+Status 仍报告 effective active lease 的 committed operation 是 adoptable lease，虽然 failed acquire invocation 不打印它；
+partial proof、pending operation 或没有 effective lease 的 committed proof 只能作为 cleanup handle。
+Public `release` 和 `destroy` 在 cleanup-only state 下仍可用，因此 cached、transitional 和 partially cleaned tasks 可以 retry，包括 retry durable cache deletion。
+Absent、stale、concurrent 或 mismatched status 不会创建 guessed local state。
+来自 partial failure、pending operation 或无 effective lease 的 committed operation 的 recovery state 都是 cleanup-only：在 successful acquire 替换它之前，client 拒绝 SSH 和 lease mutations；
+exact pending acquire 未解决时，controller 拒绝 active mutations。
+Acquire retry 保留 original operation ID 和 generation；
+active lease 只可收敛那些 recorded resource evidence 与 durable allocation 匹配的 pending requests，缺失或冲突的 evidence 仍保持 pending，等待显式 release 或 destruction。
+如果 background cleanup 在 status read 前将 failed acquire 推进到 cached task，controller 会保留 task、generation 和 operation 绑定的 partial-failure marker，直到后续 acquire 或显式 destruction supersede 它，使相同 cleanup handle 始终可验证。
 
-The dashboard and metric authority rules are defined in the [observability contract](observability.md). Guest rootfs allocation, physical Incus pool usage, CT root/image staging capacity and native admission are separate measurements.
+## SSH 与端口
 
-## Topology and recovery boundary
+命令超时的固定错误字段名是 `process-group cleanup evidence on command timeout`，用于证明超时后的进程组清理结果。
 
-The configured SSH control address is an entrypoint for the one-shot control process. It is not an identity for the underlying host, CT109 LXC, Incus host, storage system or rebuild authority. The public contract does not provide a host or CT rebuild command; see the [topology and recovery runbook](../OPERATIONS.md) for the evidence boundary and stop conditions.
+Generated SSH configuration 使用 configured control address、leased port、explicit identity 和 known-host files、generation-bound host-key alias、`StrictHostKeyChecking yes` 以及 `IdentitiesOnly yes`。
+它不得禁用 host checking 或引入 gateway。
+Port allocation 计算 listeners、native mappings、forwards、reservations 和 configured ephemeral range。
+Guest 可复用前，lease cleanup 移除 mappings 及其 exact conntrack flows。
 
-The control environment is the observed CT109 LXC and owns session-scoped Incus system containers inside that CT. A concrete private address, CT identifier and Incus identity are independent facts. Missing provenance, missing durable state, or an unverified native inventory blocks recovery rather than authorizing a guessed host operation or broad cleanup.
+## 容量与清理
 
-During recovery, preserve the configured state database and WAL/journals, local operation journals, operation/audit records, generations, canonical configuration, protected connection material, native timer assets and Incus container data. Restore matching client/control/unit revisions under drain, then inspect `agent-vm doctor`, `agent-vm admin status`, `agent-vm admin session list` and dry-run `agent-vm admin reconcile` before any apply. `admin reconcile --apply` is limited to confirmed ownership/generation and cleanup/rearm actions, plus repairing malformed or inconsistent nonzero resource/reservation records for an `absent` task after native instance and port absence are confirmed; `admin gc --apply` and destructive cleanup are not recovery shortcuts.
+Capacity responses 标识 local filesystem scope、observed sources、allocation budgets、allocated/reserved values、logical remaining values 和 pressure observations。
+Missing 或 contradictory capacity measurements 会拒绝 new demand，但不会停止 effective lease。
+Reservation-only memory admission 下，low CT `MemAvailable` 报告为 pressure，但不会拒绝 logical memory ceiling 内的 request。
+CPU PSI 是独立的 startup-schedulability guard：不会减少 logical CPU remaining，也不会停止 running lease。
+Manual cleanup 默认 dry-run，并在 deletion 前于 object locks 下重新检查 ownership、generation 和 eligibility。
 
-Remote control-script or unit publication enters drain before activation. Drain blocks new acquisition and restart admission but permits status, retrieval, release, and expiry/reconciliation/cache-cleanup timers; it does not force-kill in-flight operations. Publication waits for pending operations and task transitions to converge, atomically activates verified artifacts, and checks health, reconciliation, and timers before `admin drain exit`. A pre-activation failure leaves the current release untouched; post-activation health failure permits one bounded rollback to the previous verified release, while failed rollback keeps admission drained.
+Dashboard 和 metric authority rules 见[观测合同](observability.md)。
+Guest rootfs allocation、physical Incus pool usage、CT root/image staging capacity 和 native admission 是独立 measurements。
 
-A transport timeout or pending operation is uncertain. Retain the original operation ID, request and generation, inspect status/reconciliation, and never create a new operation ID or reset a generation to make the request fit. If the durable/native state cannot be matched, keep admission drained and stop. Run `agent-vm admin drain exit` only after health, state, generation, timer and CT-local capacity checks pass, then repeat `doctor` and `admin status`.
+## 拓扑与恢复边界
 
-## Reclamation and retry behavior
+Configured SSH control address 是 one-shot control process 的 entrypoint，不是 underlying host、CT109 LXC、Incus host、storage system 或 rebuild authority 的 identity。
+Public contract 不提供 host 或 CT rebuild command；
+证据边界和停止条件见[拓扑与恢复运行手册](../OPERATIONS.md)。
 
-Reconciliation and garbage collection select only records that are expired, released or otherwise eligible under the configured policy. They re-read the record while holding the object lock, verify the session and generation, and remove only resources owned by that record. A failed stop, detach, proxy cleanup or metadata update leaves a retryable record and reports the failed phase; it does not silently mark the resource reusable. The same operation ID is safe to retry after a transport timeout, while a new operation ID is required for a new intent.
+Control environment 是已观测的 CT109 LXC，并拥有该 CT 内按 session 管理的 Incus system containers。
+Concrete private address、CT identifier 和 Incus identity 是独立事实。
+Missing provenance、missing durable state 或 unverified native inventory 会阻止 recovery，而不是授权 guessed host operation 或 broad cleanup。
 
-Acquire and restart are bounded operations that may return an uncertain outcome after transport failure. Callers inspect `status` or reconciliation and retry with the original operation ID and generation. Renewal never occurs implicitly as a side effect of `ssh`, `exec`, `sync`, upload, download or export.
+Recovery 期间保留 configured state database 和 WAL/journals、local operation journals、operation/audit records、generations、canonical configuration、protected connection material、native timer assets 以及 Incus container data。
+在 drain 下恢复匹配的 client/control/unit revisions，然后在任何 apply 前检查 `agent-vm doctor`、`agent-vm admin status`、`agent-vm admin session list` 和 dry-run `agent-vm admin reconcile`。
+`admin reconcile --apply` 只允许 confirmed ownership/generation 与 cleanup/rearm actions；
+在确认 native instance 和 port 不存在后，也可修复 `absent` task 的 malformed 或 inconsistent nonzero resource/reservation records；
+`admin gc --apply` 和 destructive cleanup 不是 recovery shortcuts。
 
-## Resource and live-memory rules
+Remote control-script 或 unit publication 在 activation 前进入 drain。
+Drain 阻止 new acquisition 和 restart admission，但允许 status、retrieval、release 以及 expiry/reconciliation/cache-cleanup timers；
+不会 force-kill in-flight operations。
+Publication 等待 pending operations 和 task transitions 收敛，原子激活 verified artifacts，并在 `admin drain exit` 前检查 health、reconciliation 和 timers。
+Pre-activation failure 保持 current release 不变；
+post-activation health failure 允许向上一个 verified release 执行一次 bounded rollback，rollback failure 则保持 admission drained。
 
-CPU, memory and disk requests are parsed into canonical units before admission. Admission accounts for configured budgets, overcommit ratios and all effective reservations. A request is rejected when capacity measurements are missing or contradictory, when the requested value exceeds the configured logical policy, when disk admission fails, or while draining; memory pressure is reported separately and does not alter logical remaining memory. An existing effective lease remains available for retrieval and release.
+Transport timeout 或 pending operation 都是不确定结果。
+保留 original operation ID、request 和 generation，检查 status/reconciliation，绝不创建 new operation ID 或 reset generation 来适配 request。
+如果 durable/native state 无法匹配，保持 admission drained 并停止。
+只有 health、state、generation、timer 和 CT-local capacity checks 全部通过后，才能运行 `agent-vm admin drain exit`，然后重复执行 `doctor` 和 `admin status`。
 
-`resize --live` is limited to a supported memory-only change. CPU, disk and unsupported live changes fail without falling back to a restart. `--allow-restart` is required for restart-capable changes and uses the longer bounded timeout. A live resize records the requested and observed values in the response so callers can distinguish a pending reconciliation from a completed change.
+## 回收与重试行为
 
-## Output and admission
+Reconciliation 和 garbage collection 只选择 expired、released 或按 configured policy 具备其他 eligible 条件的 records。
+它们在持有 object lock 时重新读取 record，验证 session 和 generation，并且只移除该 record 拥有的 resources。
+Stop、detach、proxy cleanup 或 metadata update 失败时，保留 retryable record 并报告 failed phase；
+不得静默将 resource 标记为 reusable。
+Transport timeout 后可安全使用相同 operation ID retry；
+new intent 必须使用 new operation ID。
 
-Human-readable status is for operators; automation consumes the JSON envelope and checks `protocol`, `action`, `session_id`, `generation`, `operation_id`, `outcome` and `result`. Diagnostics are written to stderr and never mixed into an archive stream from `export`. Admission drain blocks new acquisition and restart admission while permitting status, retrieval and release, and exits only after the control process has durably recorded the new admission state. A restart that has crossed the short admission fence before drain may finish; the native stop/start work does not hold the global admission lock.
+Acquire 和 restart 是有界 operations，transport failure 后可能返回 uncertain outcome。
+Caller 检查 `status` 或 reconciliation，并使用 original operation ID 和 generation retry。
+Renewal 绝不会作为 `ssh`、`exec`、`sync`、upload、download 或 export 的隐式副作用发生。
+
+## 资源与 live-memory 规则
+
+CPU、memory 和 disk requests 在 admission 前解析为 canonical units。
+Admission 计算 configured budgets、overcommit ratios 和所有 effective reservations。
+Capacity measurements missing 或 contradictory、requested value 超过 configured logical policy、disk admission failure 或处于 draining 时，request 被拒绝；
+memory pressure 单独报告，不改变 logical remaining memory。
+Existing effective lease 仍可 retrieval 和 release。
+
+`resize --live` 仅限于受支持的 memory-only change。
+CPU、disk 和其他不支持 live 的 change 必须直接失败，不能 fallback 到 restart。
+可由 restart 完成的 change 必须显式提供 `--allow-restart`，并使用更长的 bounded timeout。
+Live resize 会在 response 中同时记录 requested value 和 observed value，让调用方区分 pending reconciliation 与已完成的 change。
+
+## 输出与 admission
+
+Human-readable status 面向 operators；
+automation 消费 JSON envelope，并检查 `protocol`、`action`、`session_id`、`generation`、`operation_id`、`outcome` 和 `result`。
+Diagnostics 写入 stderr，绝不混入 `export` 的 archive stream。
+Admission drain 阻止 new acquisition 和 restart admission，同时允许 status、retrieval 和 release；
+只有 control process 已 durable record 新 admission state 后才退出。
+Drain 前已跨过 short admission fence 的 restart 可以完成；
+native stop/start work 不持有 global admission lock。

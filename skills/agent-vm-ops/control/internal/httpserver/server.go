@@ -2,6 +2,7 @@ package httpserver
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/observe"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
@@ -52,6 +54,7 @@ type Server struct {
 	Service   *lifecycle.Service
 	Snapshots *observe.SnapshotStore
 	App       http.Handler
+	RoleGate  *controllerrole.Gate
 }
 
 func New(service *lifecycle.Service, snapshots ...*observe.SnapshotStore) *Server {
@@ -64,6 +67,10 @@ func New(service *lifecycle.Service, snapshots ...*observe.SnapshotStore) *Serve
 
 func NewWithApp(service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler) *Server {
 	return &Server{Service: service, Snapshots: snapshots, App: app}
+}
+
+func NewWithRole(service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler, roleGate *controllerrole.Gate) *Server {
+	return &Server{Service: service, Snapshots: snapshots, App: app, RoleGate: roleGate}
 }
 
 func (s *Server) Handler() http.Handler {
@@ -89,6 +96,8 @@ func (s *Server) Handler() http.Handler {
 		c.Next()
 	})
 	router.POST("/internal/v1/control", s.control)
+	router.POST("/internal/v1/controller-role", s.controllerRole)
+	router.POST("/internal/v1/traffic-role", s.trafficRole)
 	router.GET("/internal/v1/health", s.health)
 	router.GET("/internal/v1/snapshots/:source", s.snapshot)
 	router.NoRoute(func(c *gin.Context) {
@@ -124,11 +133,110 @@ func (s *Server) control(c *gin.Context) {
 
 func (s *Server) health(c *gin.Context) {
 	ready := s.Service.Ready()
+	controllerOwned := false
+	var lease any
+	if s.RoleGate != nil {
+		current, valid := s.RoleGate.Snapshot()
+		controllerOwned = valid
+		if valid {
+			lease = current
+		} else {
+			// Lease expiry is a traffic fence as well as a mutation fence.
+			s.Service.SetTrafficAccepting(false)
+		}
+	}
 	status := http.StatusOK
 	if !ready {
 		status = http.StatusServiceUnavailable
 	}
-	c.JSON(status, map[string]any{"ok": true, "ready": ready, "protocol": protocol.Version})
+	processStartTime := controllerrole.ProcessStartToken(os.Getpid())
+	c.JSON(status, map[string]any{
+		"ok": true, "ready": ready, "process_ready": true, "controller_ready": ready,
+		"controller_owned": controllerOwned, "traffic_accepting": s.Service.TrafficAccepting(), "lease": lease, "protocol": protocol.Version,
+		"process_id": os.Getpid(), "process_start_time": processStartTime,
+		"release_id":      releaseValue(s.Service.Release, func(value *protocol.ReleaseMetadata) string { return value.ReleaseID }),
+		"source_revision": releaseValue(s.Service.Release, func(value *protocol.ReleaseMetadata) string { return value.SourceRevision }),
+	})
+}
+
+func (s *Server) trafficRole(c *gin.Context) {
+	reader := http.MaxBytesReader(c.Writer, c.Request.Body, 64*1024)
+	defer c.Request.Body.Close()
+	var command struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(reader).Decode(&command); err != nil || (command.Action != "enable" && command.Action != "disable") {
+		writeJSON(c, http.StatusBadRequest, map[string]any{"ok": false, "error": protocol.NewError("invalid_request", "traffic role action must be enable or disable", nil)}, 2)
+		return
+	}
+	draining, err := s.Service.IsDraining(c.Request.Context())
+	if err != nil {
+		writeJSON(c, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": protocol.NewError("observation_unavailable", "traffic role state is unavailable", nil)}, 2)
+		return
+	}
+	if draining && command.Action == "enable" {
+		writeJSON(c, http.StatusConflict, map[string]any{"ok": false, "error": protocol.NewError("draining", "draining slot cannot accept traffic", nil)}, 2)
+		return
+	}
+	if command.Action == "enable" && (s.RoleGate == nil || !s.RoleGate.Valid()) {
+		writeJSON(c, http.StatusConflict, map[string]any{"ok": false, "error": protocol.NewError("controller_role_required", "controller role is required before enabling traffic", nil)}, 2)
+		return
+	}
+	if command.Action == "enable" && !s.Service.Ready() {
+		writeJSON(c, http.StatusConflict, map[string]any{"ok": false, "error": protocol.NewError("slot_not_ready", "slot must be ready before enabling traffic", nil)}, 2)
+		return
+	}
+	accepting := command.Action == "enable"
+	s.Service.SetTrafficAccepting(accepting)
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true, "traffic_accepting": accepting, "protocol": protocol.Version}, 0)
+}
+
+func releaseValue(value *protocol.ReleaseMetadata, selectValue func(*protocol.ReleaseMetadata) string) string {
+	if value == nil {
+		return ""
+	}
+	return selectValue(value)
+}
+
+func (s *Server) controllerRole(c *gin.Context) {
+	if s.RoleGate == nil {
+		writeJSON(c, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": protocol.NewError("controller_role_unavailable", "controller role endpoint is not configured", nil)}, 2)
+		return
+	}
+	reader := http.MaxBytesReader(c.Writer, c.Request.Body, 64*1024)
+	defer c.Request.Body.Close()
+	var command controllerrole.Command
+	if err := json.NewDecoder(reader).Decode(&command); err != nil {
+		writeJSON(c, http.StatusBadRequest, map[string]any{"ok": false, "error": protocol.NewError("invalid_request", "controller role request is invalid", nil)}, 2)
+		return
+	}
+	var err error
+	switch command.Action {
+	case "grant":
+		err = s.RoleGate.Grant(command.Lease)
+	case "revoke":
+		err = s.RoleGate.Revoke(command.Lease)
+		if err == nil {
+			s.Service.SetTrafficAccepting(false)
+		}
+	case "fence":
+		s.RoleGate.Fence()
+		s.Service.SetTrafficAccepting(false)
+	default:
+		err = protocol.NewError("invalid_request", "controller role action must be grant, revoke or fence", nil)
+	}
+	if err != nil {
+		code := "controller_role_rejected"
+		status := http.StatusConflict
+		if errors.Is(err, controllerrole.ErrInvalidLease) || errors.Is(err, controllerrole.ErrLeaseExpired) {
+			code = "invalid_request"
+			status = http.StatusBadRequest
+		}
+		writeJSON(c, status, map[string]any{"ok": false, "error": protocol.NewError(code, err.Error(), nil)}, 2)
+		return
+	}
+	lease, valid := s.RoleGate.Snapshot()
+	writeJSON(c, http.StatusOK, map[string]any{"ok": true, "lease": lease, "valid": valid}, 0)
 }
 
 func (s *Server) snapshot(c *gin.Context) {
@@ -159,7 +267,7 @@ func writeError(c *gin.Context, err error, request protocol.Request) {
 		if control.Code == "request_too_large" {
 			status = http.StatusRequestEntityTooLarge
 		}
-	case "draining", "operation_conflict", "operation_incomplete", "generation_mismatch", "lease_expired", "task_missing", "task_not_active", "task_transition", "cache_ineligible", "resource_insufficient":
+	case "draining", "operation_conflict", "operation_incomplete", "generation_mismatch", "lease_expired", "controller_lease_required", "task_missing", "task_not_active", "task_transition", "cache_ineligible", "resource_insufficient":
 		status = http.StatusConflict
 	case "startup_reconcile_required", "state_unverified", "sqlite_unavailable", "observation_unavailable", "resource_unverified", "resource_pressure", "mapping_unverified", "ownership_mismatch", "guest_host_key_missing", "watermarks_unreachable":
 		status = http.StatusServiceUnavailable
@@ -186,14 +294,22 @@ func Serve(ctx context.Context, socket string, service *lifecycle.Service, snaps
 	if len(snapshots) > 0 {
 		store = snapshots[0]
 	}
-	return serve(ctx, socket, service, store, nil)
+	return serve(ctx, socket, service, store, nil, nil)
+}
+
+func ServeRole(ctx context.Context, socket string, service *lifecycle.Service, snapshots *observe.SnapshotStore, roleGate *controllerrole.Gate) error {
+	return serve(ctx, socket, service, snapshots, nil, roleGate)
 }
 
 func ServeApp(ctx context.Context, socket string, service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler) error {
-	return serve(ctx, socket, service, snapshots, app)
+	return serve(ctx, socket, service, snapshots, app, nil)
 }
 
-func serve(ctx context.Context, socket string, service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler) error {
+func ServeAppRole(ctx context.Context, socket string, service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler, roleGate *controllerrole.Gate) error {
+	return serve(ctx, socket, service, snapshots, app, roleGate)
+}
+
+func serve(ctx context.Context, socket string, service *lifecycle.Service, snapshots *observe.SnapshotStore, app http.Handler, roleGate *controllerrole.Gate) error {
 	if err := prepareSocket(socket); err != nil {
 		return err
 	}
@@ -210,7 +326,7 @@ func serve(ctx context.Context, socket string, service *lifecycle.Service, snaps
 		return err
 	}
 	wrapped := &peerListener{Listener: listener}
-	server := &http.Server{Handler: NewWithApp(service, snapshots, app).Handler(), ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 600 * time.Second, ReadTimeout: 600 * time.Second, MaxHeaderBytes: maxHeaderBytes, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+	server := &http.Server{Handler: NewWithRole(service, snapshots, app, roleGate).Handler(), ReadHeaderTimeout: 5 * time.Second, WriteTimeout: 600 * time.Second, ReadTimeout: 600 * time.Second, MaxHeaderBytes: maxHeaderBytes, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 		if peer, ok := conn.(*peerConn); ok {
 			return context.WithValue(ctx, peerContextKey{}, peer)
 		}

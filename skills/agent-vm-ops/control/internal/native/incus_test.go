@@ -405,15 +405,15 @@ func TestIsNotFoundRejectsUnrelatedOrUncertainFailures(t *testing.T) {
 	}
 }
 
-func TestIncusConfigClassifiesConfirmedMissingInstance(t *testing.T) {
+func TestIncusConfigRejectsGenericMissingInstance(t *testing.T) {
 	binDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(binDir, "incus"), []byte("#!/bin/sh\necho 'Error: Instance not found' >&2\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	_, err := NewIncusClient(NewRunner(), "agents").Config(context.Background(), "missing")
-	if !IsNotFound(err, "missing", "agents") {
-		t.Fatalf("config error = %v, want confirmed instance missing", err)
+	if IsNotFound(err, "missing", "agents") {
+		t.Fatalf("generic config error = %v, classified as confirmed instance missing", err)
 	}
 }
 

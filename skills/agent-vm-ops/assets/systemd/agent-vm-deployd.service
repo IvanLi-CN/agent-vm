@@ -1,0 +1,28 @@
+[Unit]
+Description=Agent VM Deployd deployment controller
+After=local-fs.target
+ConditionPathExists=/opt/agent-vm-native/bin/agent-vm-deployd
+ConditionPathExists=/etc/agent-vm-native/deployd.json
+
+[Service]
+Type=simple
+ExecStart=/opt/agent-vm-native/bin/agent-vm-deployd --config /etc/agent-vm-native/deployd.json
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=60s
+TimeoutStopSec=30s
+User=root
+Group=agent-vm-web
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+ProtectHome=yes
+ReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native
+ReadOnlyPaths=/opt/agent-vm-native /etc/agent-vm-native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RuntimeDirectory=agent-vm-native
+RuntimeDirectoryMode=0750
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

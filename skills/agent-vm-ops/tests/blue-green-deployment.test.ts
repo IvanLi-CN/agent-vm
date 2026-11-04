@@ -103,8 +103,21 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(rqlite).not.toContain("0.0.0.0");
 
   const slot = read("skills/agent-vm-ops/assets/systemd/agent-vm-native@.service");
-  expect(slot).toContain("BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json");
-  expect(slot).toContain("--manifest /opt/agent-vm-native/release-manifest.json");
+  expect(slot).toContain("ExecStart=/var/lib/agent-vm-native/slots/%i/bin/agent-vm-control");
+  expect(slot).toContain("--manifest /var/lib/agent-vm-native/slots/%i/release-manifest.json");
+  expect(slot).not.toContain("BindReadOnlyPaths=");
+  const deployd = read("skills/agent-vm-ops/assets/systemd/agent-vm-deployd.service");
+  expect(deployd).toContain("agent-vm-deployd --config /etc/agent-vm-native/deployd.json");
+  expect(deployd).toContain("ReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native");
+  expect(deployd).not.toContain("Requires=agent-vm-rqlite.service");
+  expect(deployd).not.toContain("Wants=agent-vm-native@blue.service agent-vm-native@green.service");
+  expect(deployd).not.toContain("After=agent-vm-native@blue.service agent-vm-native@green.service");
+  const deploydConfig = json("skills/agent-vm-ops/assets/deployd.json.example");
+  expect(deploydConfig.migration.legacy_unit).toBe("agent-vm-native.service");
+  expect(deploydConfig.migration.rqlite_unit).toBe("agent-vm-rqlite.service");
+  expect(deploydConfig.migration.rqlite_url).toBe("https://127.0.0.1:4001");
+  expect(deploydConfig.migration.rqlite_ca_file).toBe("/etc/agent-vm-native/tls/rqlite/server.crt");
+  expect(deploydConfig.migration.rqlite_auth_file).toBe("/etc/agent-vm-native/rqlite/auth.json");
   const caddyUnit = read("skills/agent-vm-ops/assets/systemd/agent-vm-caddy.service");
   expect(caddyUnit).toContain("User=caddy");
   expect(caddyUnit).toContain("ConditionPathExists=/var/lib/agent-vm-native/active/app.sock");

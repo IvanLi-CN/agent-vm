@@ -9,12 +9,14 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/observe"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
@@ -136,6 +138,38 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("server did not shut down")
+	}
+}
+
+func TestTrafficRoleStartsFencedAndRequiresControllerLease(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := lifecycle.New(store, config.Defaults(), lifecycle.Options{})
+	gate := controllerrole.New("blue", time.Now)
+	server := NewWithRole(service, nil, nil, gate)
+
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/traffic-role", strings.NewReader(`{"action":"enable"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusConflict || service.TrafficAccepting() {
+		t.Fatalf("traffic enable without lease status=%d accepting=%v", recorder.Code, service.TrafficAccepting())
+	}
+
+	lease := controllerrole.Lease{Slot: "blue", Term: 1, LeaseID: "lease", Nonce: "nonce", Expiry: time.Now().Add(time.Minute)}
+	if err := gate.Grant(lease); err != nil {
+		t.Fatal(err)
+	}
+	service.MarkReady()
+	request = httptest.NewRequest(http.MethodPost, "/internal/v1/traffic-role", strings.NewReader(`{"action":"enable"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder = httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK || !service.TrafficAccepting() {
+		t.Fatalf("traffic enable with lease status=%d accepting=%v", recorder.Code, service.TrafficAccepting())
 	}
 }
 

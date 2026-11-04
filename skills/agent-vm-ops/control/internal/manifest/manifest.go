@@ -104,13 +104,22 @@ var productLegacyArtifacts = []artifactSpec{
 	{name: "unit:agent-vm-native.service", path: "systemd/agent-vm-native.service", role: "unit", mode: 0o644},
 }
 
-var productArtifacts = append(append([]artifactSpec(nil), productLegacyArtifacts...),
+var goArtifacts = append(append([]artifactSpec(nil), productLegacyArtifacts...),
+	artifactSpec{name: "unit:agent-vm-native@.service", path: "systemd/agent-vm-native@.service", role: "unit", mode: 0o644},
+	artifactSpec{name: "agent-vm-deployd", path: "bin/agent-vm-deployd", role: "control", mode: 0o755},
+	artifactSpec{name: "agent-vm-deploy", path: "bin/agent-vm-deploy", role: "control", mode: 0o755},
+	artifactSpec{name: "unit:agent-vm-deployd.service", path: "systemd/agent-vm-deployd.service", role: "unit", mode: 0o644},
+)
+
+var productArtifacts = append([]artifactSpec(nil), goArtifacts...)
+
+var historicalProductArtifacts = append(append([]artifactSpec(nil), productArtifacts...),
 	artifactSpec{name: "unit:agent-vm-web.service", path: "systemd/agent-vm-web.service", role: "unit", mode: 0o644},
 	artifactSpec{name: "web-config-example", path: "config/agent-vm-web.json.example", role: "support", mode: 0o640},
 	artifactSpec{name: "web-assets-manifest", path: "web-assets.manifest.json", role: "support", mode: 0o644},
 )
 
-var fixedArtifacts = productLegacyArtifacts
+var fixedArtifacts = goArtifacts
 
 var artifactNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.:@-]{1,120}$`)
 var revisionPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -341,7 +350,7 @@ func validate(root map[string]any, directory string) error {
 		if digest != artifact.sha256 {
 			return fmt.Errorf("artifact_checksum_mismatch: artifact checksum differs: %s", artifact.path)
 		}
-		if artifact.path == "bin/agent-vm-control" {
+		if isGoBinaryArtifact(artifact.path) {
 			if err := verifyELF(path); err != nil {
 				return err
 			}
@@ -431,13 +440,22 @@ func validateProduct(root map[string]any, directory string) error {
 		if digest != artifact.sha256 {
 			return fmt.Errorf("artifact_checksum_mismatch: artifact checksum differs: %s", artifact.path)
 		}
-		if artifact.path == "bin/agent-vm-control" {
+		if isGoBinaryArtifact(artifact.path) {
 			if err := verifyELF(path); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+func isGoBinaryArtifact(path string) bool {
+	switch path {
+	case "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy":
+		return true
+	default:
+		return false
+	}
 }
 
 func validateProductTarget(value any) error {
@@ -458,21 +476,19 @@ func validateProductToolchain(value any) error {
 
 func validateProductArtifacts(value any, format int64) ([]checkedArtifact, error) {
 	values, ok := value.([]any)
-	expectedArtifacts := productLegacyArtifacts
-	if format == ProductFormat {
-		expectedArtifacts = productArtifacts
-	}
-	if !ok || len(values) != len(expectedArtifacts) {
+	if !ok {
 		return nil, fmt.Errorf("manifest_artifact_set_invalid: product artifact set is incomplete")
 	}
-	expected := make(map[string]artifactSpec, len(expectedArtifacts))
-	for _, artifact := range expectedArtifacts {
-		expected[artifact.name+"\x00"+artifact.path] = artifact
+	type declaration struct {
+		name string
+		path string
+		role string
+		sha  string
+		mode int64
 	}
+	declarations := make([]declaration, 0, len(values))
 	seenNames := make(map[string]bool, len(values))
 	seenPaths := make(map[string]bool, len(values))
-	seen := make(map[string]bool, len(values))
-	result := make([]checkedArtifact, 0, len(values))
 	for index, raw := range values {
 		item, ok := raw.(map[string]any)
 		if !ok || !sameKeys(item, []string{"mode", "name", "path", "role", "sha256"}) {
@@ -487,18 +503,50 @@ func validateProductArtifacts(value any, format int64) ([]checkedArtifact, error
 		if !nameOK || !artifactNamePattern.MatchString(name) || !pathOK || !safeRelativePath(path) || path == "release-manifest.json" || path == "client-release.json" || !roleOK || !validRole || !shaOK || !digestPattern.MatchString(sha) || !modeOK || mode < 0 || mode > 0o777 {
 			return nil, fmt.Errorf("manifest_invalid: artifacts[%d] values are invalid", index)
 		}
-		key := name + "\x00" + path
-		want, exists := expected[key]
-		if seenNames[name] || seenPaths[path] || seen[key] || !exists || want.role != role || want.mode != mode {
+		if seenNames[name] || seenPaths[path] {
 			return nil, fmt.Errorf("manifest_artifact_set_invalid: duplicate product artifact %s", name)
 		}
 		seenNames[name] = true
 		seenPaths[path] = true
-		seen[key] = true
-		result = append(result, checkedArtifact{artifactSpec: want, sha256: sha})
+		declarations = append(declarations, declaration{name: name, path: path, role: role, sha: sha, mode: mode})
 	}
-	if len(seen) != len(expected) {
+	expectedSets := [][]artifactSpec{productLegacyArtifacts}
+	if format == ProductFormat {
+		expectedSets = [][]artifactSpec{productArtifacts, historicalProductArtifacts}
+	}
+	var expectedArtifacts []artifactSpec
+	for _, candidate := range expectedSets {
+		if len(declarations) != len(candidate) {
+			continue
+		}
+		expected := make(map[string]artifactSpec, len(candidate))
+		for _, artifact := range candidate {
+			expected[artifact.name+"\x00"+artifact.path] = artifact
+		}
+		matches := true
+		for _, item := range declarations {
+			want, exists := expected[item.name+"\x00"+item.path]
+			if !exists || want.role != item.role || want.mode != item.mode {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			expectedArtifacts = candidate
+			break
+		}
+	}
+	if expectedArtifacts == nil {
 		return nil, fmt.Errorf("manifest_artifact_set_invalid: product artifact set differs from the fixed allowlist")
+	}
+	expected := make(map[string]artifactSpec, len(expectedArtifacts))
+	for _, artifact := range expectedArtifacts {
+		expected[artifact.name+"\x00"+artifact.path] = artifact
+	}
+	result := make([]checkedArtifact, 0, len(declarations))
+	for _, item := range declarations {
+		want := expected[item.name+"\x00"+item.path]
+		result = append(result, checkedArtifact{artifactSpec: want, sha256: item.sha})
 	}
 	return result, nil
 }

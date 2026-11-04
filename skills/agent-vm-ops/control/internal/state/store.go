@@ -194,6 +194,30 @@ type Operation struct {
 	CreatedAt   string
 }
 
+const MaintenanceCursorMetaKey = "maintenance_cursor"
+
+type MaintenanceLane struct {
+	NextAttemptAt        string `json:"next_attempt_at"`
+	Attempt              int    `json:"attempt"`
+	ScanAfterTaskID      string `json:"scan_after_task_id"`
+	ScanAfterOperationAt string `json:"scan_after_operation_at"`
+	ScanAfterOperationID string `json:"scan_after_operation_id"`
+	LastErrorCode        string `json:"last_error_code"`
+	LastErrorPhase       string `json:"last_error_phase"`
+	UpdatedAt            string `json:"updated_at"`
+}
+
+type MaintenanceCursor struct {
+	Reconcile MaintenanceLane `json:"reconcile"`
+	AgeGC     MaintenanceLane `json:"age_gc"`
+}
+
+func DefaultMaintenanceCursor(now time.Time) MaintenanceCursor {
+	stamp := now.UTC().Format(time.RFC3339Nano)
+	lane := MaintenanceLane{NextAttemptAt: stamp, UpdatedAt: stamp}
+	return MaintenanceCursor{Reconcile: lane, AgeGC: lane}
+}
+
 type AuditSummary struct {
 	Operations          map[string]int64
 	ImageUnpackFailures map[string]int64
@@ -537,6 +561,68 @@ func (s *Store) SetMeta(ctx context.Context, key, value string) error {
 		_, err = tx.exec("INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, value)
 		return err
 	})
+}
+
+func (s *Store) MaintenanceCursor(ctx context.Context) (MaintenanceCursor, error) {
+	raw, found, err := s.Meta(ctx, MaintenanceCursorMetaKey)
+	if err != nil {
+		return MaintenanceCursor{}, err
+	}
+	if !found || strings.TrimSpace(raw) == "" {
+		// An absent additive key is due immediately. The cursor is initialized
+		// lazily by the first maintenance commit, so older state remains valid.
+		return DefaultMaintenanceCursor(time.Unix(0, 0).UTC()), nil
+	}
+	var cursor MaintenanceCursor
+	if err := json.Unmarshal([]byte(raw), &cursor); err != nil {
+		return MaintenanceCursor{}, fmt.Errorf("maintenance cursor: %w", err)
+	}
+	if err := validateMaintenanceLane(cursor.Reconcile); err != nil {
+		return MaintenanceCursor{}, fmt.Errorf("maintenance cursor reconcile: %w", err)
+	}
+	if err := validateMaintenanceLane(cursor.AgeGC); err != nil {
+		return MaintenanceCursor{}, fmt.Errorf("maintenance cursor age-gc: %w", err)
+	}
+	return cursor, nil
+}
+
+func validateMaintenanceLane(lane MaintenanceLane) error {
+	if lane.Attempt < 0 || lane.Attempt > 6 {
+		return errors.New("attempt is outside the bounded retry range")
+	}
+	for _, value := range []string{lane.NextAttemptAt, lane.UpdatedAt} {
+		if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
+			return errors.New("timestamp is invalid")
+		}
+	}
+	if len(lane.ScanAfterTaskID) > 128 || len(lane.ScanAfterOperationAt) > 128 || len(lane.ScanAfterOperationID) > 128 || len(lane.LastErrorCode) > 128 || len(lane.LastErrorPhase) > 128 {
+		return errors.New("cursor field is too long")
+	}
+	if lane.ScanAfterOperationAt != "" {
+		if _, err := time.Parse(time.RFC3339Nano, lane.ScanAfterOperationAt); err != nil {
+			return errors.New("operation cursor timestamp is invalid")
+		}
+		if lane.ScanAfterOperationID == "" {
+			return errors.New("operation cursor ID is missing")
+		}
+	} else if lane.ScanAfterOperationID != "" {
+		return errors.New("operation cursor timestamp is missing")
+	}
+	return nil
+}
+
+func (s *Store) SetMaintenanceCursor(ctx context.Context, cursor MaintenanceCursor) error {
+	if err := validateMaintenanceLane(cursor.Reconcile); err != nil {
+		return fmt.Errorf("maintenance cursor reconcile: %w", err)
+	}
+	if err := validateMaintenanceLane(cursor.AgeGC); err != nil {
+		return fmt.Errorf("maintenance cursor age-gc: %w", err)
+	}
+	raw, err := json.Marshal(cursor)
+	if err != nil {
+		return err
+	}
+	return s.SetMeta(ctx, MaintenanceCursorMetaKey, string(raw))
 }
 
 func generationMetaKey(sessionID string) string {
@@ -947,27 +1033,65 @@ func (s *Store) ClaimOperation(ctx context.Context, operationID, action string, 
 }
 
 func (s *Store) RecordOperation(ctx context.Context, operationID, action string, sessionID *string, generation *int64, response map[string]any) error {
-	raw, err := json.Marshal(response)
-	if err != nil {
-		return err
-	}
 	return s.withWrite(ctx, func(tx *Tx) error {
-		result, err := tx.exec("UPDATE operations SET action = ?, session_id = ?, generation = ?, response_json = ? WHERE operation_id = ? AND json_extract(response_json, '$.outcome') = 'pending'", action, nullableStringArg(sessionID), nullableIntArg(generation), string(raw), operationID)
+		current, scanErr := scanOperation(ctx, tx.conn, operationID)
+		if scanErr == nil {
+			if current.Action != action || !sameNullableString(current.SessionID, sessionID) || !sameNullableInt64(current.Generation, generation) {
+				return errors.New("operation journal identity is immutable")
+			}
+			if outcome, _ := current.Response["outcome"].(string); outcome != "pending" {
+				return errors.New("operation journal is already finalized")
+			}
+			if err := preserveRequestDigest(current.Response, response); err != nil {
+				return err
+			}
+			if _, present := response["worker"]; !present {
+				if worker, hasWorker := current.Response["worker"]; hasWorker {
+					response["worker"] = worker
+				}
+			} else if worker, hasWorker := current.Response["worker"].(map[string]any); hasWorker {
+				incoming, valid := response["worker"].(map[string]any)
+				if !valid {
+					return errors.New("native worker identity is immutable")
+				}
+				if err := preserveWorkerIdentity(worker, incoming); err != nil {
+					return err
+				}
+			}
+			raw, err := json.Marshal(response)
+			if err != nil {
+				return err
+			}
+			_, err = tx.exec("UPDATE operations SET response_json = ? WHERE operation_id = ? AND json_extract(response_json, '$.outcome') = 'pending'", string(raw), operationID)
+			return err
+		}
+		if !errors.Is(scanErr, sql.ErrNoRows) {
+			return scanErr
+		}
+		raw, err := json.Marshal(response)
 		if err != nil {
 			return err
 		}
-		if rows, rowsErr := result.RowsAffected(); rowsErr == nil && rows > 0 {
-			return nil
-		}
-		result, err = tx.exec("INSERT INTO operations(operation_id, action, session_id, generation, response_json, created_at) VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(operation_id) DO NOTHING", operationID, action, nullableStringArg(sessionID), nullableIntArg(generation), string(raw), time.Now().UTC().Format(time.RFC3339Nano))
+		_, err = tx.exec("INSERT INTO operations(operation_id, action, session_id, generation, response_json, created_at) VALUES(?, ?, ?, ?, ?, ?)", operationID, action, nullableStringArg(sessionID), nullableIntArg(generation), string(raw), time.Now().UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
-		}
-		if rows, rowsErr := result.RowsAffected(); rowsErr == nil && rows == 0 {
-			return errors.New("operation journal is already finalized")
 		}
 		return nil
 	})
+}
+
+func sameNullableString(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func sameNullableInt64(left, right *int64) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 // UpdateOperationResponse mutates a pending operation in the same write
@@ -984,8 +1108,21 @@ func (s *Store) UpdateOperationResponse(ctx context.Context, operationID string,
 		if outcome != "pending" {
 			return errors.New("operation journal is already finalized")
 		}
+		previousResponse := map[string]any{}
+		if digest, ok := operation.Response["_request_digest"]; ok {
+			previousResponse["_request_digest"] = digest
+		}
+		previousWorker, _ := operation.Response["worker"].(map[string]any)
 		if err := update(operation.Response); err != nil {
 			return err
+		}
+		if err := preserveRequestDigest(previousResponse, operation.Response); err != nil {
+			return err
+		}
+		if currentWorker, ok := operation.Response["worker"].(map[string]any); ok {
+			if err := preserveWorkerIdentity(previousWorker, currentWorker); err != nil {
+				return err
+			}
 		}
 		raw, err := json.Marshal(operation.Response)
 		if err != nil {
@@ -1004,6 +1141,47 @@ func (s *Store) UpdateOperationResponse(ctx context.Context, operationID string,
 		}
 		return nil
 	})
+}
+
+func preserveRequestDigest(previous, current map[string]any) error {
+	previousDigest, hadPrevious := previous["_request_digest"]
+	currentDigest, hasCurrent := current["_request_digest"]
+	if !hadPrevious {
+		if hasCurrent {
+			delete(current, "_request_digest")
+		}
+		return nil
+	}
+	if !hasCurrent {
+		current["_request_digest"] = previousDigest
+		return nil
+	}
+	previousString, previousOK := previousDigest.(string)
+	currentString, currentOK := currentDigest.(string)
+	if !previousOK || !currentOK || previousString != currentString {
+		return errors.New("operation request digest is immutable")
+	}
+	return nil
+}
+
+func preserveWorkerIdentity(previous, current map[string]any) error {
+	if previous == nil || current == nil {
+		return nil
+	}
+	for _, key := range []string{"pid", "start_time", "process_group"} {
+		oldValue, exists := previous[key]
+		if !exists {
+			continue
+		}
+		newValue, hasNewValue := current[key]
+		if hasNewValue && fmt.Sprint(oldValue) != fmt.Sprint(newValue) {
+			return errors.New("native worker identity is immutable")
+		}
+		if !hasNewValue {
+			current[key] = oldValue
+		}
+	}
+	return nil
 }
 
 func (s *Store) RecordOperationWorker(ctx context.Context, operationID string, worker map[string]any) error {
@@ -1054,6 +1232,65 @@ func (s *Store) PendingOperations(ctx context.Context) ([]Operation, error) {
 	return s.listObservedOperations(ctx, `SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending' ORDER BY created_at, operation_id`)
 }
 
+// PendingOperationsPage keeps bounded maintenance reads from materializing the
+// complete journal. The full PendingOperations query remains available to
+// startup and diagnostic paths that intentionally need a complete snapshot.
+func (s *Store) PendingOperationsPage(ctx context.Context, limit int) ([]Operation, error) {
+	values, _, err := s.PendingOperationsPageAfter(ctx, "", "", limit)
+	return values, err
+}
+
+// PendingOperationsPageAfter returns a bounded keyset page and whether more
+// pending operations remain after it. The cursor is ordered by the durable
+// journal insertion timestamp and operation identity, so unresolved old rows
+// cannot starve later rows across maintenance rounds.
+func (s *Store) PendingOperationsPageAfter(ctx context.Context, afterCreatedAt, afterOperationID string, limit int) ([]Operation, bool, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 25
+	}
+	query := `SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending'`
+	args := make([]any, 0, 3)
+	if afterCreatedAt != "" {
+		query += ` AND (created_at > ? OR (created_at = ? AND operation_id > ?))`
+		args = append(args, afterCreatedAt, afterCreatedAt, afterOperationID)
+	}
+	query += ` ORDER BY created_at, operation_id LIMIT ?`
+	args = append(args, limit+1)
+	values, err := s.listObservedOperationsArgs(ctx, query, args...)
+	if err != nil {
+		return nil, false, err
+	}
+	more := len(values) > limit
+	if more {
+		values = values[:limit]
+	}
+	return values, more, nil
+}
+
+// PendingOperationsForIdentity keeps lifecycle cleanup lookup bounded to the
+// session generation and action it is reconciling. Two rows are enough to
+// detect a duplicate journal identity without scanning the whole journal.
+func (s *Store) PendingOperationsForIdentity(ctx context.Context, action, sessionID string, generation int64) ([]Operation, error) {
+	return s.listObservedOperationsArgs(ctx, `SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending' AND action = ? AND session_id = ? AND generation = ? ORDER BY created_at, operation_id LIMIT 2`, action, sessionID, generation)
+}
+
+// PendingOperationsForSessionPage keeps worker-scope checks bounded while
+// failing closed when a session has more pending journal rows than the page.
+func (s *Store) PendingOperationsForSessionPage(ctx context.Context, sessionID string, limit int) ([]Operation, bool, error) {
+	if limit <= 0 || limit > 256 {
+		limit = 128
+	}
+	values, err := s.listObservedOperationsArgs(ctx, `SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'pending' AND session_id = ? ORDER BY created_at, operation_id LIMIT ?`, sessionID, limit+1)
+	if err != nil {
+		return nil, false, err
+	}
+	more := len(values) > limit
+	if more {
+		values = values[:limit]
+	}
+	return values, more, nil
+}
+
 // ReconciledUnknownOperations remains observable after a superseded operation
 // stops blocking admission, without exposing its saved request or worker data.
 func (s *Store) ReconciledUnknownOperations(ctx context.Context) ([]Operation, error) {
@@ -1061,9 +1298,13 @@ func (s *Store) ReconciledUnknownOperations(ctx context.Context) ([]Operation, e
 }
 
 func (s *Store) listObservedOperations(ctx context.Context, query string) ([]Operation, error) {
+	return s.listObservedOperationsArgs(ctx, query)
+}
+
+func (s *Store) listObservedOperationsArgs(ctx context.Context, query string, args ...any) ([]Operation, error) {
 	var values []Operation
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
-		rows, err := conn.QueryContext(ctx, query)
+		rows, err := conn.QueryContext(ctx, query, args...)
 		if err != nil {
 			return err
 		}

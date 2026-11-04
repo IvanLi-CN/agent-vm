@@ -13,6 +13,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -21,6 +24,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,7 +36,6 @@ import (
 const (
 	remoteWriteAttempts = 8
 	remoteSyncAttempts  = 8
-	remoteHTTPBodyLimit = 8 << 20
 )
 
 type remoteBackend struct {
@@ -126,15 +130,125 @@ type remoteSnapshot struct {
 	AuthEpoch string
 }
 
-// SQLiteMigrationGate is the state-layer test boundary for evidence that a
-// service/deployment coordinator will eventually provide. These booleans do
-// not establish a production fence; the exported migration entry remains
-// disabled until that coordinator supplies real writer, worker and native
-// quiescence evidence.
+// SQLiteMigrationGate is retained by the package-private migration tests. It
+// is not a production API and must never be used by a deployment coordinator.
 type SQLiteMigrationGate struct {
 	StateWriteFenced    bool
 	WorkersQuiescent    bool
 	SQLiteWritersClosed bool
+}
+
+// SQLiteMigrationEvidence binds the import to the exact source observed after
+// the deployment coordinator has established its fence. The state package
+// validates the source identity; the coordinator remains responsible for
+// proving that the fence and quiescence conditions were established.
+type SQLiteMigrationEvidence struct {
+	FenceID      string    `json:"fence_id"`
+	SourceSHA256 string    `json:"source_sha256"`
+	SourceSize   int64     `json:"source_size"`
+	StateEpoch   string    `json:"state_epoch"`
+	VerifiedAt   time.Time `json:"verified_at"`
+}
+
+type SQLiteMigrationResult struct {
+	SourceSHA256 string `json:"source_sha256"`
+	SourceSize   int64  `json:"source_size"`
+	StateEpoch   string `json:"state_epoch"`
+	TargetSHA256 string `json:"target_sha256"`
+}
+
+// SnapshotSQLite creates a consistent, read-only source copy for migration
+// recovery. It uses SQLite's own VACUUM INTO so a committed WAL frame is not
+// lost by copying only the main database file.
+func SnapshotSQLite(ctx context.Context, sourcePath, destinationPath string) (returnErr error) {
+	if sourcePath == "" || destinationPath == "" || !filepath.IsAbs(sourcePath) || !filepath.IsAbs(destinationPath) {
+		return errors.New("SQLite snapshot paths must be absolute")
+	}
+	if info, err := os.Lstat(destinationPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return errors.New("SQLite snapshot destination is not a regular file")
+		}
+		return errors.New("SQLite snapshot destination already exists")
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect SQLite snapshot destination: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(destinationPath), 0o700); err != nil {
+		return fmt.Errorf("create SQLite snapshot directory: %w", err)
+	}
+	temporaryPath := destinationPath + ".tmp"
+	if info, err := os.Lstat(temporaryPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+			return errors.New("SQLite snapshot temporary destination is not a regular file")
+		}
+		if err := os.Remove(temporaryPath); err != nil {
+			return fmt.Errorf("remove stale SQLite snapshot temporary destination: %w", err)
+		}
+		if err := syncDirectory(filepath.Dir(destinationPath)); err != nil {
+			return fmt.Errorf("sync SQLite snapshot directory: %w", err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect SQLite snapshot temporary destination: %w", err)
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		if info, err := os.Lstat(temporaryPath); err == nil {
+			if info.Mode()&os.ModeSymlink == 0 && info.Mode().IsRegular() {
+				if removeErr := os.Remove(temporaryPath); removeErr != nil && returnErr == nil {
+					returnErr = fmt.Errorf("remove incomplete SQLite snapshot: %w", removeErr)
+				} else if removeErr == nil {
+					if syncErr := syncDirectory(filepath.Dir(destinationPath)); syncErr != nil && returnErr == nil {
+						returnErr = fmt.Errorf("sync incomplete SQLite snapshot cleanup: %w", syncErr)
+					}
+				}
+			}
+		}
+	}()
+	source, err := openSQLiteReadOnly(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	if _, err := validatedSQLiteMigrationSnapshot(ctx, source); err != nil {
+		return err
+	}
+	quoted := strings.ReplaceAll(temporaryPath, "'", "''")
+	if _, err := source.ExecContext(ctx, "VACUUM INTO '"+quoted+"'"); err != nil {
+		return fmt.Errorf("create SQLite snapshot: %w", err)
+	}
+	file, err := os.OpenFile(temporaryPath, os.O_RDONLY, 0)
+	if err != nil {
+		return fmt.Errorf("open SQLite snapshot: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync SQLite snapshot: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close SQLite snapshot: %w", err)
+	}
+	if err := os.Chmod(temporaryPath, 0o600); err != nil {
+		return fmt.Errorf("protect SQLite snapshot: %w", err)
+	}
+	if err := os.Rename(temporaryPath, destinationPath); err != nil {
+		return fmt.Errorf("commit SQLite snapshot: %w", err)
+	}
+	committed = true
+	if err := syncDirectory(filepath.Dir(destinationPath)); err != nil {
+		return fmt.Errorf("sync SQLite snapshot directory: %w", err)
+	}
+	return nil
+}
+
+func syncDirectory(path string) error {
+	directory, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer directory.Close()
+	return directory.Sync()
 }
 
 func isRemoteDSN(path string) bool {
@@ -161,6 +275,10 @@ func openRemote(dsn string, allowCreate bool) (*Store, error) {
 // does not probe or mutate the remote database so migration can perform a
 // side-effect-free target preflight first.
 func newRemoteStore(dsn string) (*Store, error) {
+	return newRemoteStoreWithClient(dsn, &http.Client{Timeout: 30 * time.Second})
+}
+
+func newRemoteStoreWithClient(dsn string, client *http.Client) (*Store, error) {
 	parsed, err := url.Parse(dsn)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
 		return nil, fmt.Errorf("state backend URL is invalid")
@@ -180,7 +298,10 @@ func newRemoteStore(dsn string) (*Store, error) {
 	}
 	mirror.SetMaxOpenConns(1)
 	mirror.SetMaxIdleConns(1)
-	backend := &remoteBackend{base: parsed, client: &http.Client{Timeout: 30 * time.Second}, mirror: mirror}
+	if client == nil {
+		client = &http.Client{Timeout: 30 * time.Second}
+	}
+	backend := &remoteBackend{base: parsed, client: client, mirror: mirror}
 	store := &Store{
 		path:   dsn,
 		write:  mirror,
@@ -246,7 +367,7 @@ func (r *remoteBackend) open(ctx context.Context, allowCreate bool) error {
 	}
 	if err := requireSupportedSchema(ctx, objects); err != nil {
 		if !allowCreate && len(objects) == 0 {
-			return fmt.Errorf("%s: %s", missingDBCode, r.base.String())
+			return fmt.Errorf("%s: %s", missingDBCode, redactedURL(r.base))
 		}
 		return err
 	}
@@ -256,6 +377,15 @@ func (r *remoteBackend) open(ctx context.Context, allowCreate bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.syncLocked(ctx)
+}
+
+func redactedURL(value *url.URL) string {
+	if value == nil {
+		return "<invalid-url>"
+	}
+	copyURL := *value
+	copyURL.User = nil
+	return copyURL.String()
 }
 
 func requireCoreSchema(objects []remoteSchemaObject) error {
@@ -905,14 +1035,17 @@ func (r *remoteBackend) do(ctx context.Context, method, path string, values url.
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
+	if r.base.User != nil {
+		password, _ := r.base.User.Password()
+		request.SetBasicAuth(r.base.User.Username(), password)
+	}
 	response, err := r.client.Do(request)
 	if err != nil {
 		return nil, err
 	}
 	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		defer response.Body.Close()
-		message, _ := io.ReadAll(io.LimitReader(response.Body, remoteHTTPBodyLimit))
-		return nil, fmt.Errorf("rqlite HTTP %d: %s", response.StatusCode, strings.TrimSpace(string(message)))
+		_ = response.Body.Close()
+		return nil, fmt.Errorf("rqlite HTTP %d response rejected", response.StatusCode)
 	}
 	return response.Body, nil
 }
@@ -1892,10 +2025,199 @@ func migrationSnapshotsEqual(left, right remoteSnapshot) bool {
 	return snapshotsEqual(left, right)
 }
 
-// MigrateSQLiteToRQLite is intentionally fail-closed until the service and
-// deployment layers provide a real migration fence and quiescence proof.
-func MigrateSQLiteToRQLite(context.Context, string, string, SQLiteMigrationGate) error {
-	return errors.New("state migration is disabled until service/deployment fence evidence is integrated")
+// PrepareSQLiteMigration verifies the source after the caller has established
+// its service fence. It does not write either the source or rqlite.
+func PrepareSQLiteMigration(ctx context.Context, sqlitePath, fenceID string) (SQLiteMigrationEvidence, error) {
+	if fenceID == "" {
+		return SQLiteMigrationEvidence{}, errors.New("state migration fence ID is required")
+	}
+	source, err := openSQLiteReadOnly(sqlitePath)
+	if err != nil {
+		return SQLiteMigrationEvidence{}, err
+	}
+	defer source.Close()
+	snapshot, err := validatedSQLiteMigrationSnapshot(ctx, source)
+	if err != nil {
+		return SQLiteMigrationEvidence{}, err
+	}
+	digest, size, err := sqliteFileDigest(sqlitePath)
+	if err != nil {
+		return SQLiteMigrationEvidence{}, err
+	}
+	return SQLiteMigrationEvidence{
+		FenceID:      fenceID,
+		SourceSHA256: digest,
+		SourceSize:   size,
+		StateEpoch:   snapshot.Epoch,
+		VerifiedAt:   time.Now().UTC(),
+	}, nil
+}
+
+// MigrateSQLiteToRQLite imports a source that was prepared by the deployment
+// coordinator. The target must be pristine and the import is one rqlite
+// request-level transaction. The source remains untouched.
+func MigrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, evidence SQLiteMigrationEvidence) (SQLiteMigrationResult, error) {
+	return MigrateSQLiteToRQLiteWithCA(ctx, sqlitePath, rqliteURL, "", evidence)
+}
+
+// MigrateSQLiteToRQLiteWithCA imports a fenced source using the supplied CA
+// bundle. Migration endpoints must use HTTPS and may carry credentials from a
+// protected deployment config; error messages redact the URL before returning
+// it to callers.
+func MigrateSQLiteToRQLiteWithCA(ctx context.Context, sqlitePath, rqliteURL, caPath string, evidence SQLiteMigrationEvidence) (SQLiteMigrationResult, error) {
+	if err := validateMigrationEvidence(evidence); err != nil {
+		return SQLiteMigrationResult{}, err
+	}
+	if err := validateHTTPSMigrationEndpoint(rqliteURL); err != nil {
+		return SQLiteMigrationResult{}, err
+	}
+	prepared, err := PrepareSQLiteMigration(ctx, sqlitePath, evidence.FenceID)
+	if err != nil {
+		return SQLiteMigrationResult{}, err
+	}
+	if prepared.SourceSHA256 != evidence.SourceSHA256 || prepared.SourceSize != evidence.SourceSize || prepared.StateEpoch != evidence.StateEpoch {
+		return SQLiteMigrationResult{}, errors.New("SQLite migration source changed after fence evidence was prepared")
+	}
+	client, err := rqliteHTTPClient(caPath)
+	if err != nil {
+		return SQLiteMigrationResult{}, err
+	}
+	if err := migrateSQLiteToRQLite(ctx, sqlitePath, rqliteURL, client, SQLiteMigrationGate{
+		StateWriteFenced:    true,
+		WorkersQuiescent:    true,
+		SQLiteWritersClosed: true,
+	}); err != nil {
+		return SQLiteMigrationResult{}, err
+	}
+	targetDigest, err := migrationTargetDigest(ctx, rqliteURL, client)
+	if err != nil {
+		return SQLiteMigrationResult{}, &TransactionError{Phase: "verify", SQLOperation: "rqlite_migration", StateCommitted: nil, Cause: fmt.Errorf("read imported rqlite state: %w", err)}
+	}
+	return SQLiteMigrationResult{
+		SourceSHA256: prepared.SourceSHA256,
+		SourceSize:   prepared.SourceSize,
+		StateEpoch:   prepared.StateEpoch,
+		TargetSHA256: targetDigest,
+	}, nil
+}
+
+// VerifySQLiteMigrationTarget verifies the durable rqlite contents without
+// reading or writing the legacy SQLite source. It is used after the source
+// retention window, when the completion marker's target digest is the only
+// remaining migration proof.
+func VerifySQLiteMigrationTarget(ctx context.Context, rqliteURL, caPath, expectedTargetSHA256 string) error {
+	if len(expectedTargetSHA256) != sha256.Size*2 {
+		return errors.New("rqlite migration target digest is incomplete")
+	}
+	if _, err := hex.DecodeString(expectedTargetSHA256); err != nil {
+		return errors.New("rqlite migration target digest is invalid")
+	}
+	if err := validateHTTPSMigrationEndpoint(rqliteURL); err != nil {
+		return err
+	}
+	client, err := rqliteHTTPClient(caPath)
+	if err != nil {
+		return err
+	}
+	digest, err := migrationTargetDigest(ctx, rqliteURL, client)
+	if err != nil {
+		return err
+	}
+	if digest != expectedTargetSHA256 {
+		return errors.New("rqlite migration target digest does not match the completion evidence")
+	}
+	return nil
+}
+
+func validateHTTPSMigrationEndpoint(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return errors.New("rqlite migration endpoint must be HTTPS")
+	}
+	return nil
+}
+
+func rqliteHTTPClient(caPath string) (*http.Client, error) {
+	transport := &http.Transport{}
+	if caPath != "" {
+		if !filepath.IsAbs(caPath) {
+			return nil, errors.New("rqlite CA path must be absolute")
+		}
+		pemData, err := os.ReadFile(caPath)
+		if err != nil {
+			return nil, fmt.Errorf("read rqlite CA bundle: %w", err)
+		}
+		pool, err := x509.SystemCertPool()
+		if err != nil || pool == nil {
+			pool = x509.NewCertPool()
+		}
+		if !pool.AppendCertsFromPEM(pemData) {
+			return nil, errors.New("rqlite CA bundle contains no certificates")
+		}
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}
+	}
+	return &http.Client{Timeout: 30 * time.Second, Transport: transport}, nil
+}
+
+func validateMigrationEvidence(evidence SQLiteMigrationEvidence) error {
+	if evidence.FenceID == "" || evidence.SourceSHA256 == "" || len(evidence.SourceSHA256) != sha256.Size*2 || evidence.SourceSize < 0 || evidence.StateEpoch == "" || evidence.VerifiedAt.IsZero() {
+		return errors.New("SQLite migration evidence is incomplete")
+	}
+	if _, err := hex.DecodeString(evidence.SourceSHA256); err != nil {
+		return errors.New("SQLite migration source digest is invalid")
+	}
+	if evidence.VerifiedAt.After(time.Now().UTC().Add(time.Minute)) {
+		return errors.New("SQLite migration evidence timestamp is in the future")
+	}
+	return nil
+}
+
+func validatedSQLiteMigrationSnapshot(ctx context.Context, source *sql.DB) (remoteSnapshot, error) {
+	if err := requireSQLiteSchema(ctx, source); err != nil {
+		return remoteSnapshot{}, err
+	}
+	if count, err := countMigrationBlockingOperations(ctx, source); err != nil {
+		return remoteSnapshot{}, err
+	} else if count != 0 {
+		return remoteSnapshot{}, fmt.Errorf("state migration blocked by %d pending or unknown operations", count)
+	}
+	snapshot, err := snapshotDB(ctx, source)
+	if err != nil {
+		return remoteSnapshot{}, fmt.Errorf("snapshot SQLite state: %w", err)
+	}
+	if err := ensureSnapshotStateEpoch(&snapshot); err != nil {
+		return remoteSnapshot{}, fmt.Errorf("initialize SQLite state epoch: %w", err)
+	}
+	if err := ensureSnapshotManagementAuthEpoch(&snapshot); err != nil {
+		return remoteSnapshot{}, fmt.Errorf("initialize SQLite management auth epoch: %w", err)
+	}
+	if err := validateStateEpoch(snapshot.Epoch); err != nil {
+		return remoteSnapshot{}, fmt.Errorf("validate SQLite state epoch: %w", err)
+	}
+	return snapshot, nil
+}
+
+func sqliteFileDigest(path string) (string, int64, error) {
+	if path == "" || !filepath.IsAbs(path) {
+		return "", 0, errors.New("SQLite migration source must be an absolute filesystem path")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", 0, fmt.Errorf("stat SQLite migration source: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return "", 0, errors.New("SQLite migration source must be a regular file")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", 0, fmt.Errorf("open SQLite migration source: %w", err)
+	}
+	defer file.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", 0, fmt.Errorf("hash SQLite migration source: %w", err)
+	}
+	return hex.EncodeToString(hash.Sum(nil)), info.Size(), nil
 }
 
 // migrateSQLiteToRQLite imports a fenced SQLite snapshot into a pristine
@@ -1903,7 +2225,7 @@ func MigrateSQLiteToRQLite(context.Context, string, string, SQLiteMigrationGate)
 // so production callers cannot mistake caller-supplied booleans for a real
 // migration fence. A failed rqlite transaction leaves the target unchanged,
 // while a lost response is returned as an unknown commit.
-func migrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, gate SQLiteMigrationGate) error {
+func migrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, client *http.Client, gate SQLiteMigrationGate) error {
 	if !gate.StateWriteFenced || !gate.WorkersQuiescent || !gate.SQLiteWritersClosed {
 		return errors.New("state migration requires a write fence, quiescent workers, and closed SQLite writers")
 	}
@@ -1934,43 +2256,28 @@ func migrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, ga
 		return fmt.Errorf("validate SQLite state epoch: %w", err)
 	}
 
-	target, err := newRemoteStore(rqliteURL)
+	target, err := newRemoteStoreWithClient(rqliteURL, client)
 	if err != nil {
 		return err
 	}
 	defer target.Close()
 	target.remote.mu.Lock()
 	defer target.remote.mu.Unlock()
-	targetObjects, err := target.remote.remoteSchema(ctx)
+	targetSnapshot, err := readRemoteMigrationSnapshot(ctx, target, true)
 	if err != nil {
-		return fmt.Errorf("probe rqlite target: %w", err)
-	}
-	targetSnapshot := remoteSnapshot{
-		Objects:   make(map[string]remoteSchemaObject),
-		Tables:    make(map[string]remoteTableSnapshot),
-		Epoch:     "initial",
-		AuthEpoch: "initial",
-	}
-	if len(targetObjects) != 0 {
-		if err := requireSupportedSchema(ctx, targetObjects); err != nil {
-			return fmt.Errorf("validate rqlite target schema: %w", err)
-		}
-		if err := target.remote.ensureRemoteEpoch(ctx); err != nil {
-			return fmt.Errorf("validate rqlite epochs: %w", err)
-		}
-		if err := target.remote.syncLocked(ctx); err != nil {
-			return fmt.Errorf("refresh rqlite target: %w", err)
-		}
-		targetSnapshot, err = snapshotDB(ctx, target.remote.mirror)
-		if err != nil {
-			return fmt.Errorf("snapshot rqlite target: %w", err)
-		}
+		return err
 	}
 	pristine, err := pristineRemoteTarget(ctx, targetSnapshot)
 	if err != nil {
 		return fmt.Errorf("validate rqlite target contents: %w", err)
 	}
 	if !pristine {
+		if migrationSnapshotsEqual(sourceSnapshot, targetSnapshot) {
+			// A previous request may have committed successfully while its
+			// response was lost. Exact snapshot equality makes retry idempotent
+			// without accepting an unrelated pre-existing target.
+			return nil
+		}
 		return errors.New("rqlite migration target is not pristine")
 	}
 	applied, err := target.remote.applySnapshot(ctx, targetSnapshot, sourceSnapshot, targetSnapshot.Epoch, sourceSnapshot.Epoch)
@@ -1996,6 +2303,69 @@ func migrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, ga
 		return &TransactionError{Phase: "verify", SQLOperation: "rqlite_migration", StateCommitted: nil, Cause: errors.New("rqlite import verification mismatch")}
 	}
 	return nil
+}
+
+func migrationTargetDigest(ctx context.Context, rqliteURL string, client *http.Client) (string, error) {
+	target, err := newRemoteStoreWithClient(rqliteURL, client)
+	if err != nil {
+		return "", err
+	}
+	defer target.Close()
+	target.remote.mu.Lock()
+	defer target.remote.mu.Unlock()
+	snapshot, err := readRemoteMigrationSnapshot(ctx, target, false)
+	if err != nil {
+		return "", err
+	}
+	return migrationSnapshotDigest(snapshot)
+}
+
+func readRemoteMigrationSnapshot(ctx context.Context, target *Store, initializeEpochs bool) (remoteSnapshot, error) {
+	targetObjects, err := target.remote.remoteSchema(ctx)
+	if err != nil {
+		return remoteSnapshot{}, fmt.Errorf("probe rqlite target: %w", err)
+	}
+	targetSnapshot := remoteSnapshot{
+		Objects:   make(map[string]remoteSchemaObject),
+		Tables:    make(map[string]remoteTableSnapshot),
+		Epoch:     "initial",
+		AuthEpoch: "initial",
+	}
+	if len(targetObjects) == 0 {
+		return targetSnapshot, nil
+	}
+	if err := requireSupportedSchema(ctx, targetObjects); err != nil {
+		return remoteSnapshot{}, fmt.Errorf("validate rqlite target schema: %w", err)
+	}
+	if initializeEpochs {
+		if err := target.remote.ensureRemoteEpoch(ctx); err != nil {
+			return remoteSnapshot{}, fmt.Errorf("validate rqlite epochs: %w", err)
+		}
+	} else {
+		if _, err := target.remote.remoteEpoch(ctx); err != nil {
+			return remoteSnapshot{}, fmt.Errorf("read rqlite state epoch: %w", err)
+		}
+		if _, err := target.remote.remoteAuthEpoch(ctx); err != nil {
+			return remoteSnapshot{}, fmt.Errorf("read rqlite management auth epoch: %w", err)
+		}
+	}
+	if err := target.remote.syncLocked(ctx); err != nil {
+		return remoteSnapshot{}, fmt.Errorf("refresh rqlite target: %w", err)
+	}
+	targetSnapshot, err = snapshotDB(ctx, target.remote.mirror)
+	if err != nil {
+		return remoteSnapshot{}, fmt.Errorf("snapshot rqlite target: %w", err)
+	}
+	return targetSnapshot, nil
+}
+
+func migrationSnapshotDigest(snapshot remoteSnapshot) (string, error) {
+	encoded, err := json.Marshal(snapshot)
+	if err != nil {
+		return "", fmt.Errorf("encode migration target snapshot: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func openSQLiteReadOnly(path string) (*sql.DB, error) {

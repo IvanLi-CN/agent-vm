@@ -101,11 +101,32 @@ requireText(rqliteUnit, "-http-key /etc/agent-vm-native/tls/rqlite/server.key", 
 forbidText(rqliteUnit, "0.0.0.0", "rqlite does not bind to all interfaces");
 
 const slotUnit = read(join(assetsRoot, "systemd/agent-vm-native@.service"));
-requireText(slotUnit, "--manifest /opt/agent-vm-native/release-manifest.json", "slot service uses the fixed manifest path");
-requireText(slotUnit, "BindReadOnlyPaths=/opt/agent-vm-native/slots/%i/release-manifest.json:/opt/agent-vm-native/release-manifest.json", "slot manifest is isolated in the service mount namespace");
+requireText(slotUnit, "ExecStart=/var/lib/agent-vm-native/slots/%i/bin/agent-vm-control", "slot service executes the atomically staged candidate binary");
+requireText(slotUnit, "--manifest /var/lib/agent-vm-native/slots/%i/release-manifest.json", "slot service uses its staged manifest path");
+forbidText(slotUnit, "BindReadOnlyPaths=", "slot service does not alias a candidate manifest over the shared release root");
 requireText(slotUnit, "Group=agent-vm-web", "slot service owns the protected web socket group");
 requireText(slotUnit, "Requires=agent-vm-rqlite.service", "slot service requires the state authority");
 forbidText(slotUnit, "ExecStart=/usr/bin/caddy", "slot service does not start a second proxy");
+
+const deploydUnit = read(join(assetsRoot, "systemd/agent-vm-deployd.service"));
+requireText(deploydUnit, "ExecStart=/opt/agent-vm-native/bin/agent-vm-deployd --config /etc/agent-vm-native/deployd.json", "Deployd unit starts the fixed daemon and config");
+requireText(deploydUnit, "ReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native", "Deployd write paths include the state root required for atomic active replacement");
+requireText(deploydUnit, "User=root", "Deployd owns the host deployment boundary");
+forbidText(deploydUnit, "Requires=agent-vm-rqlite.service", "Deployd does not depend on the business state authority");
+
+const deploydConfigText = read(join(assetsRoot, "deployd.json.example"));
+try {
+  const deploydConfig = JSON.parse(deploydConfigText);
+  const migration = deploydConfig.migration;
+  requireCheck(migration?.legacy_unit === "agent-vm-native.service", "migration fences the fixed legacy singleton");
+  requireCheck(migration?.rqlite_unit === "agent-vm-rqlite.service", "migration starts the fixed rqlite unit");
+  requireCheck(migration?.rqlite_url === "https://127.0.0.1:4001", "migration uses the fixed local HTTPS rqlite endpoint");
+  requireCheck(migration?.rqlite_ca_file === "/etc/agent-vm-native/tls/rqlite/server.crt", "migration trusts the configured rqlite certificate");
+  requireCheck(migration?.rqlite_auth_file === "/etc/agent-vm-native/rqlite/auth.json", "migration reads the protected rqlite auth file");
+  requireCheck(migration?.drain_timeout_seconds === 8100, "migration drain budget is bounded at 8100 seconds");
+} catch (error) {
+  errors.push(`deployd config example is invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
+}
 
 const caddyUnit = read(join(assetsRoot, "systemd/agent-vm-caddy.service"));
 requireText(caddyUnit, "User=caddy", "Caddy does not run as root");
@@ -129,7 +150,14 @@ const scriptPaths = [
   join(import.meta.dir, "generate_deployment_ca.sh"),
   join(import.meta.dir, "agent_vm_cutover.sh"),
   join(import.meta.dir, "agent_vm_state_migration.ts"),
+  join(import.meta.dir, "agent_vm_deployd_systemd_acceptance.sh"),
 ];
+const realSystemdAcceptance = read(join(import.meta.dir, "agent_vm_deployd_systemd_acceptance.sh"));
+requireText(realSystemdAcceptance, "assert_exec_start", "real systemd acceptance compares ExecStart argv exactly");
+requireText(realSystemdAcceptance, "refusing filesystem restore while a managed unit remains active", "real systemd acceptance refuses unsafe cleanup");
+requireText(realSystemdAcceptance, "systemctl is-active --quiet \"$unit\"", "real systemd acceptance verifies stopped units during cleanup");
+requireText(realSystemdAcceptance, "real agent-vm-control binary did not pass its version smoke test", "systemd acceptance keeps a real control binary smoke check");
+requireText(realSystemdAcceptance, "slot_runtime\":\"testslot-adapter\"", "systemd acceptance labels its test slot adapter coverage honestly");
 for (const path of scriptPaths) {
   try {
     const mode = statSync(path).mode & 0o777;

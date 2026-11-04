@@ -105,6 +105,36 @@ func TestUnifiedTokenAPIIsIdempotentAndRevocable(t *testing.T) {
 	}
 }
 
+func TestUnifiedRejectsMutationsBeforeLifecycleReady(t *testing.T) {
+	authority, store, cfg := testAuthority(t)
+	lifecycleService := lifecycle.New(store, testLifecycleConfig(cfg), lifecycle.Options{})
+	authority.Lifecycle = lifecycleService
+	server, err := NewUnifiedServer(UnifiedOptions{Config: cfg, Authority: authority, Lifecycle: lifecycleService, Store: store, Assets: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("index")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := server.now()
+	sessionRaw := "session-secret-before-ready"
+	session := state.BrowserSession{
+		SessionDigest: digestString(sessionRaw), Issuer: cfg.AdminPrincipal.Issuer, Subject: cfg.AdminPrincipal.Subject,
+		CSRFSecretDigest: digestString(server.OIDC.csrfToken(digestString(sessionRaw))), Capabilities: cfg.AdminPrincipal.Capabilities,
+		CreatedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(15 * time.Minute).Format(time.RFC3339Nano),
+	}
+	if err := store.InsertBrowserSession(context.Background(), session); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/tokens", strings.NewReader(`{"operation_id":"60e8400e-ccf8-4c7b-8d1d-14f66c7fb126","scopes":["agent:read"]}`))
+	request.AddCookie(&http.Cookie{Name: managementSessionCookie, Value: sessionRaw})
+	request.Header.Set("Origin", cfg.ExternalOrigin)
+	request.Header.Set("X-CSRF-Token", server.OIDC.csrfToken(session.SessionDigest))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), `"startup_reconcile_required"`) {
+		t.Fatalf("not-ready mutation status/body=%d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestAgentSuccessResponseRedactsNativeDiagnostics(t *testing.T) {
 	value := map[string]any{
 		"result": map[string]any{

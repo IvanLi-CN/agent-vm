@@ -223,6 +223,13 @@ func snapshotMetrics(source string, value any) map[string]string {
 	return result
 }
 
+// MetricsForSnapshot converts one completed controller observation into the
+// existing metric families without publishing files. Deployd uses this helper
+// to compose both slots into its single Prometheus endpoint.
+func MetricsForSnapshot(source string, value any) map[string]string {
+	return snapshotMetrics(source, value)
+}
+
 func addBoolMetricIfPresent(result map[string]string, name string, object map[string]any, key string) {
 	value, ok := object[key].(bool)
 	if !ok {

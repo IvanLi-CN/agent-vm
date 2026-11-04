@@ -1,30 +1,65 @@
-# One-shot control runtime
+# 一次性控制运行时
 
-The resident control implementation is `control/cmd/agent-vm-control/main.go`, built with Go 1.27.3 and invoked as one binary for `serve`, `request` and `native-worker`. Its lifecycle, state, scheduler and native worker packages are one control authority; the TypeScript bridge remains a fixed compatibility adapter during the support window. The guest disk action is `scripts/guest-root-growth.ts`, bundled in memory from the verified release and supplied to `incus exec <instance> -- bun run - <disk-gib>` on stdin. It exits after reporting measured capacity. There is no Python control or disk-growth guest fallback.
+常驻业务控制实现是 `control/cmd/agent-vm-control/main.go`，使用 Go 1.27.3 构建，并以一个二进制文件提供 `serve`、`request` 和 `native-worker`。
+它的生命周期、状态、scheduler 和 native worker 包在每个槽位内构成一个业务控制权威；槽位外的 Deployd（`agent-vm-deployd`）是独立的目标服务，负责部署事务和槽位角色协调，不是第二个生命周期权威。
+TypeScript bridge 在兼容窗口内仍是固定适配器。
+Guest disk action 是 `scripts/guest-root-growth.ts`，从已验证的 release 在内存中打包，并通过 stdin 提供给 `incus exec <instance> -- bun run - <disk-gib>`；它报告测得容量后退出。
+没有 Python control 或 disk-growth guest fallback。
 
-## Prerequisites
+## 前置条件
 
-The native control host and disk-growth guest require Linux with procfs, cgroup v2 where observed, `flock`, child-subreaper support and identity-checked pidfds. The Go worker uses `prctl`, `pidfd_open`, `pidfd_send_signal` and `waitpid` through `x/sys/unix`; glibc 2.36 or newer and Linux 5.3 or newer provide the required interfaces. Capacity observations verify the visible cgroup and LXCfs boundaries before using their data. Missing native ownership or capacity evidence fails closed.
+native 控制宿主和 disk-growth guest 要求 Linux、procfs、观测到的 cgroup v2、`flock`、child-subreaper 支持以及完成 identity check 的 pidfd。
+Go worker 通过 `x/sys/unix` 使用 `prctl`、`pidfd_open`、`pidfd_send_signal` 和 `waitpid`；glibc 2.36 或更新版本以及 Linux 5.3 或更新版本提供所需接口。
+容量观测在使用数据前会验证可见 cgroup 和 LXCfs 边界。
+缺少 native ownership 或容量证据时必须 fail closed。
 
-Install the pinned Go 1.27.3 toolchain when building the resident binary and verify `CGO_ENABLED=0` Linux artifacts before activation. The control host does not install a runtime during a request. Systemd invokes `/opt/agent-vm-native/bin/agent-vm-control`; the compatibility bridge may use the protected Bun runtime only while forwarding to the UDS. The guest must resolve `bun` before any root-device change. The public repository does not download a toolchain at runtime.
+构建常驻二进制文件时安装固定版本的 Go 1.27.3 toolchain，并在激活前验证 `CGO_ENABLED=0` 的 Linux 产物。
+控制宿主不会在请求期间安装 runtime。
+Systemd 调用 `/opt/agent-vm-native/bin/agent-vm-control`；兼容 bridge 仅在转发到 UDS 时使用受保护的 Bun runtime。
+Guest 必须在任何 root-device 变更前解析出 `bun`。
+公共仓库不会在运行时下载 toolchain。
 
-Keep Incus, systemd, OpenSSH, conntrack-tools, `ss` and filesystem-capacity tools available on the control host. Guest growth requires a direct partition-backed ext4 or xfs root and `findmnt`, `lsblk`, `blockdev`, `growpart`, plus `resize2fs` or `xfs_growfs`. Unknown topology, missing tools, stale virtual-disk size and unverifiable post-growth capacity refuse success. Tool success alone is insufficient: disk, partition and filesystem measurements must satisfy the requested size and the existing 95-percent filesystem threshold.
+控制宿主必须提供 Incus、systemd、OpenSSH、conntrack-tools、`ss` 和 filesystem-capacity 工具。
+Guest growth 要求直接由分区承载的 ext4 或 xfs root，以及 `findmnt`、`lsblk`、`blockdev`、`growpart` 和 `resize2fs` 或 `xfs_growfs`。
+拓扑未知、工具缺失、virtual-disk size 过期或增长后的容量无法验证时，不能报告成功。
+工具执行成功本身不足够：disk、partition 和 filesystem 测量必须满足请求大小及现有的 95% filesystem threshold。
 
-The client and guest source transaction run directly in Bun. Deploy the complete client package from the [release contract](../../../docs/specs/agent-vm/contracts/release.md): `agent_vm.ts` and `sync_worktree.ts` at `0755`, with `byte-fs.ts`, `client-io.ts`, `client-release.ts`, `client.ts`, `guest-source.ts` and `sync-native.ts` at `0644`. The local sidecar hashes all eight files. Python remains the manual publisher/wrapper and release-policy tooling boundary; it does not run a client, controller or guest source fallback. Source sync requires Bun FFI, native `flock`, Linux `renameat2`, GNU `timeout`, Git and rsync as specified by the client/source contract. Verify them in the managed image before source staging; do not install a runtime during a request. The controller's generic image prerequisite list may include additional tools, including Python, independently of the Bun source action.
+客户端和 guest source transaction 直接在 Bun 中运行。
+按照[发布合同](../../../docs/specs/agent-vm/contracts/release.md)部署完整客户端包：`agent_vm.ts` 和 `sync_worktree.ts` 使用 `0755`，`byte-fs.ts`、`client-io.ts`、`client-release.ts`、`client.ts`、`guest-source.ts` 和 `sync-native.ts` 使用 `0644`。
+本机 sidecar 对全部八个文件计算 hash。
+Python 仍是人工 publisher/wrapper 和 release-policy tooling 边界；它不运行 client、controller 或 guest source fallback。
+Source sync 依赖 client/source 合同规定的 Bun FFI、native `flock`、Linux `renameat2`、GNU `timeout`、Git 和 rsync。
+源文件暂存前必须在 managed image 中验证这些依赖；不得在请求期间安装 runtime。
+Controller 的通用 image 前置条件可以独立于 Bun source action 额外包含 Python 等工具。
 
-## Durable and transport compatibility
+## 持久化与传输兼容性
 
-Protocol 4, request identity, per-action compatibility windows, generation checks, operation IDs and the 2-MiB management-request limit remain unchanged. The primary request path is HTTP over the protected UDS; the existing SSH entry and TypeScript bridge can forward the same JSON contract for compatibility. Success is JSON on stdout or the UDS response body; structured failures preserve exit status 2 for the request adapter, and unexpected failures use status 3. The client retains its 240-second ordinary and 600-second startup/restart-capable timeout budgets and its bounded output readers.
+Protocol 4、request identity、per-action compatibility window、generation check、operation ID 和 2-MiB management-request limit 保持不变。
+主要请求路径是受保护 UDS 上的 HTTP；现有 SSH 入口和 TypeScript bridge 可以转发同一 JSON 合同以保持兼容。
+成功结果是 stdout 或 UDS response body 中的 JSON；结构化失败对 request adapter 保留 exit status 2，意外失败使用 status 3。
+客户端继续使用普通操作 240 秒、startup/restart-capable 操作 600 秒的 timeout budget，以及有界 output reader。
 
-Existing SQLite task, port, operation, audit and metadata tables are opened in place with WAL and full synchronous durability. Pending records retain their original request, digest and uncertainty; after native worker identity reconciliation, startup may perform one same-operation recovery only for a valid drain transition with no native worker effect. Native worker-bearing operations are never replayed automatically while their effect is uncertain, so admission remains closed until reconciliation is explicit and safe. Integer tokens remain exact beyond JavaScript's safe-number boundary, fractional JSON tokens retain their distinction from integers, and request digests use the existing sorted, ASCII-escaped JSON spelling. SQLite signed-integer limits remain a separate durable-storage boundary. Overcommit ceilings use decimal integer arithmetic and conservative current/target reservations.
+现有业务 SQLite 的 task、port、operation、audit 和 metadata 表原地打开，并使用 WAL 与 full synchronous durability。
+Pending 记录保留原始 request、digest 和不确定性；完成 native worker identity reconciliation 后，启动阶段只有在 drain transition 有效且没有 native worker effect 时，才能执行一次同操作恢复。
+在蓝绿目标中，槽位服务必须先取得 deployd 已认证的 controller role，才能运行 startup reconciliation、scheduler、timer reconciliation、age-GC 或 scheduler-driven native mutation；standby service 可以提供受保护的 readiness 和只读观测，但不得运行这些循环。
+Native worker-bearing operation 在 effect 不确定时永远不能自动 replay，admission 必须保持关闭，直到显式且安全地完成 reconciliation。
+Integer token 必须在 JavaScript safe-number boundary 之外保持精确，fractional JSON token 必须保留与 integer 的区别，request digest 使用既有 sorted、ASCII-escaped JSON spelling。
+SQLite signed-integer limit 仍是独立的持久化存储边界；overcommit ceiling 使用 decimal integer arithmetic 和 conservative current/target reservation。
 
-Native file locks remain visible across independent processes. Session-scoped lifecycle locks and a short maintenance lock coordinate durable transitions without serializing unrelated sessions; native guest waits run outside SQLite transactions and the maintenance lock. Every journaled native command records its PID/start-time identity, and timeout diagnostics distinguish verified process cleanup, leader reaping and pipe drainage from an uncertain outcome. Only identity-verified owned descendants or recovered workers may be killed.
+Native file lock 在独立进程之间保持可见。
+Session-scoped lifecycle lock 和短时 maintenance lock 用于协调持久状态转换，但不会串行化无关 session；native guest wait 在 SQLite transaction 和 maintenance lock 外执行。
+每个写入 journal 的 native command 都记录 PID/start-time identity，timeout diagnostics 区分已验证的 process cleanup、leader reap、pipe drainage 和不确定结果。
+只有 identity 已验证且归属明确的 descendant 或 recovered worker 可以被 kill。
 
-## Validation evidence
+## 验证证据
 
-Fake Incus and guest-command scenarios establish controller behavior without changing infrastructure. Linux tests with real flock, SQLite, procfs, subprocess trees and pipes establish isolated native OS behavior; Agent VM checks additionally exercise systemd and nested Incus system containers without requiring KVM. The reproducible `scripts/agent_vm_native_acceptance.sh` runner additionally checks an installed format-2 bundle, systemd activation, both direct UDS and Bun bridge requests, native-worker cleanup and a nested Incus system container. The nested path is an Incus system container with `security.nesting=true`; it does not require `/dev/kvm` or QEMU. Run it only inside the authorized session Agent VM after installing a candidate bundle.
+Fake Incus 和 guest-command 场景在不改变基础设施的情况下验证 controller 行为。
+使用真实 flock、SQLite、procfs、subprocess tree 和 pipe 的 Linux 测试验证隔离的 native OS 行为；Agent VM 检查还会验证 systemd 和 nested Incus system container，且不要求 KVM。
+可复现的 `scripts/agent_vm_native_acceptance.sh` runner 还会检查已安装的 format-2 bundle、systemd activation、直接 UDS 和 Bun bridge 请求、native-worker cleanup 以及 nested Incus system container。
+Nested 路径使用 `security.nesting=true` 的 Incus system container，不要求 `/dev/kvm` 或 QEMU。
+只有在候选 bundle 安装完成后，才能在已授权的会话 Agent VM 内运行它。
 
-The focused acceptance suite is run from the source checkout with the host's Bun and Python available:
+在 source checkout 中、确保宿主机提供 Bun 和 Python 后运行以下聚焦验收套件：
 
 ```bash
 bun test skills/agent-vm-ops/tests/*.test.ts
@@ -32,11 +67,11 @@ python3 -m unittest discover -s skills/agent-vm-ops/tests -p 'test_*.py'
 go -C skills/agent-vm-ops/control test ./...
 bun test skills/agent-vm/tests/*.test.ts
 
-# Run inside the session Agent VM after candidate installation:
+# 在候选版本安装完成后，于会话 Agent VM 内运行：
 skills/agent-vm-ops/scripts/agent_vm_native_acceptance.sh
 ```
 
-| VM Control contract | Evidence surface |
+| VM 控制合同 | 证据面 |
 | --- | --- |
 | 01: protocol and configuration | `control-lifecycle.test.ts`, `control-process.test.ts` |
 | 02: prior state, digests and idempotence | `fixtures/control-baseline.sql`, `fixtures/control-baseline.json`, `control-kernel.test.ts`, `control-lifecycle.test.ts`, `control-process.test.ts` |
@@ -48,4 +83,6 @@ skills/agent-vm-ops/scripts/agent_vm_native_acceptance.sh
 | 08: current client, release and systemd contracts | `control-process.test.ts`, `control-kernel.test.ts`, complete-package Python release/recovery tests and `skills/agent-vm/tests/transport.test.ts` and `client.test.ts` |
 | 09: installed Linux/systemd/nested-Incus acceptance | `scripts/agent_vm_native_acceptance.sh` |
 
-Linux cases deliberately skip on other platforms; a passing macOS run alone is insufficient evidence for the native control host. The baseline SQL and request fixtures were generated by the accepted predecessor StateStore at the source revision recorded in the SQL fixture. Tests consume those bytes without importing the retired implementation.
+Linux case 会在其他平台上主动跳过；仅 macOS 运行通过不足以证明 native control host 合格。
+基线 SQL 和 request fixture 由已接受的前身 StateStore 在 SQL fixture 记录的 source revision 生成。
+测试直接消费这些字节，不导入已退役的实现。

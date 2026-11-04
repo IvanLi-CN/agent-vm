@@ -5,7 +5,7 @@
 
 ## 1. 目标与当前事实
 
-目标是在控制环境内运行一个 Go 常驻服务，由它独占 Agent VM 的控制状态、原生操作编排和观测采样，最终移除 TS/Bun 控制实现与 operator 侧长期运行的 Python collector。
+目标是在控制环境内运行一个 Go 常驻服务，由它独占 Agent VM 的控制状态、原生操作编排和观测采样，最终移除 TS/Bun 控制实现与 operator 侧旧的长期 Python metrics 进程。
 Go 服务使用 Gin 提供明确的 HTTP API，接收并分发控制请求、健康检查和观测快照读取。
 本地 Bun 客户端仍通过 SSH 发出一次请求并获得一次响应；远端一次性适配器把请求转成 HTTP over UDS 交给 Gin，再把结果映射回现有 CLI envelope，不增加客户端轮询或隐式续租。
 
@@ -19,7 +19,7 @@ Go 服务使用 Gin 提供明确的 HTTP API，接收并分发控制请求、健
 | CLI 合同要求 observation epoch、一致性重试与采样起点时间；当前控制实现尚未完整提供这些行为。 | 测试 fixture 中存在字段，不等于当前实现已经满足合同；桥接阶段需补齐。 |
 | 当前语言政策以 Bun 为 Agent VM 的默认 runtime；根测试发现器尚不发现 Go tests。 | Go 需要明确的语言边界例外、测试接线与发布产物合同。 |
 
-operator collector 的部署拓扑、真实 scrape 配置和宿主服务状态不能由本仓库推断。
+Prometheus target 的部署拓扑、真实 scrape 配置和宿主服务状态不能由本仓库推断。
 以下方案将这些内容保留为上线前核验项，不把本地源代码审阅当作线上证据。
 
 ## 2. Style Playbook 依据
@@ -60,7 +60,7 @@ npx skills add IvanLi-CN/style-playbook-skills --skill persistent-state-migratio
 | Linux 机制 | `golang.org/x/sys/unix` + 标准库 `os/exec`。 | 封装 `flock`、peer credentials、subreaper、pidfd 和精确进程回收；Linux 专属代码与 portable core 分离。 |
 | Incus 集成 | 类型化 adapter 调用现有 `incus` CLI，包括 `incus query`。 | 首轮沿用已验证的原生边界，不同时切换 Incus SDK、认证和控制实现。 |
 | 配置与日志 | 保留 canonical JSON config；标准库 `flag`、`log/slog`，日志进入 journald。 | Gin 中间件复用结构化日志与错误合同；HTTP response、CLI stdout 和日志分离。 |
-| 观测输出 | Prometheus textfile + 现有 node_exporter。 | Go 负责采样与编码；不引入新的 exporter HTTP 服务或 Pushgateway。 |
+| 观测输出 | 槽位 Go 服务生成内部 snapshot，槽位外 `agent-vm-deployd` 通过只读 `GET /metrics` 作为 Prometheus 唯一 scrape target。 | 槽位采样与 deployd 组合输出分层；不引入 Pushgateway，也不把槽位 textfile 作为第二个 scrape target。 |
 | 生命周期 | systemd service + 程序内置 expiry/GC scheduler。 | systemd 启动和重启进程；程序依据持久状态安排到期回收、缓存清理与启动补偿，不依赖外部 expiry timer 或 cron。首轮不使用 socket activation。 |
 | 测试 | Go `testing`、`go test`、`go vet`、Linux race/native tests；保留 Bun/Python 合同测试。 | 将 Go module 显式接入根验证入口，不以 macOS skip 作为 Linux 行为证据。 |
 
@@ -104,7 +104,8 @@ flowchart TB
         db[("SQLite · durable state")]
         worker["Go native-worker<br/>每命令独立进程，回收命令树"]
         incus["Incus CLI → managed LXC containers"]
-        snapshots["原子 textfile snapshots<br/>各来源独立 freshness"]
+        snapshots["原子内部 snapshots<br/>各来源独立 freshness"]
+        deployd["agent-vm-deployd<br/>Deployd<br/>GET /metrics"]
         request <-->|"HTTP/1.1 over UDS<br/>POST /internal/v1/control"| dispatch
         control -->|"唯一写入路径"| db
         db -.->|"持久 deadline · 重建调度"| scheduler
@@ -114,15 +115,14 @@ flowchart TB
         worker --> incus
         observe --> snapshots
     end
-    exporter["现有 node_exporter"]
     monitoring["Prometheus / Grafana"]
     client <-->|"SSH · protocol 4 · 单次请求/响应"| request
     client -.->|"后续：HTTPS + 调用方认证"| dispatch
-    snapshots --> exporter
-    exporter --> monitoring
+    snapshots --> deployd
+    deployd --> monitoring
 ```
 
-图中 textfile 到 node_exporter 表示同 filesystem scope 的默认通路；跨 scope 时插入第 6 节的只读 relay。
+图中槽位 snapshot 到 deployd 表示内部观测材料；Prometheus 只抓取 deployd 的 `/metrics`，不抓取槽位 textfile 或 snapshot 文件。
 实线表示首轮 SSH 兼容通路，客户端到 Gin 的虚线表示后续可独立启用的 HTTPS 替代入口。
 控制与观测共享一份内部资源语义，各自使用有界 lane；worker 是执行隔离进程，SQLite 的写入权仍归 daemon。
 到期清理走 scheduler 到 lifecycle 的内部调用路径，不经过 SSH、请求适配器或 HTTP；systemd service 只负责整个 Go 程序的启动与重启。
@@ -208,21 +208,19 @@ Linux 机制通过 [`golang.org/x/sys/unix`](https://pkg.go.dev/golang.org/x/sys
 
 capacity、inventory、guest filesystem 分别调度、分别限时；建议初始周期为 10 秒、30 秒、15 秒，同一采样未完成时合并或跳过下一次触发。
 `admin metrics` 与 `admin status` 仍按请求进行有界的新采样，复用同一内部 sampler，不能静默改成返回后台旧 cache。
-后台 snapshot 用于 textfile 和 relay，不是第二个 admission 真相源。
+后台 snapshot 是 deployd 的输入材料，不是第二个 admission 真相源。
 
 采样先读取 durable observation epoch，在 SQLite 锁外探测 native state，再读取 epoch；不一致最多尝试三次，最终仍不一致则显式报告。
 epoch 只在实际 durable change 成功提交时递增；读取、no-op、回滚和纯观测不递增。
 `observed_at` 是最后一次采样窗口的起点，缺失或无法验证的数据保持 `null` 或合同规定的省略形式，不能伪装为零或健康值。
 
-textfile 分成 capacity、inventory、health 三类固定文件，每个 metric family 只由一个文件负责；同目录临时文件写完后 atomic rename。
+槽位内部 snapshot 分成 capacity、inventory、health 三类固定来源，每个 metric family 只由一个来源负责；同目录临时文件写完后 atomic rename。
 inventory 失败时更新其独立的 up/freshness 状态，保留有效 capacity；保留的旧 inventory 数值必须能通过 source freshness 判为不可用，下一次成功完整替换 task 集合以移除旧行。
 既有 `agent_vm_up` 保持 capacity source 的含义，inventory 和 filesystem 使用独立健康指标；dashboard 不能用一个来源的成功替另一个来源背书。
-node_exporter textfile 不支持 sample timestamp，因此通过单独的时间 gauge 暴露源采样时间与 freshness，见 [Textfile Collector 文档](https://github.com/prometheus/node_exporter#textfile-collector)。
-
-如果 node_exporter 与父级服务不在同一 filesystem scope，operator 侧增加短生命周期的非特权 Go relay，通过现有 SSH 只取已生成快照并原子落盘。
-relay 调用固定 snapshot 入口，由一次性适配器经 Gin 的只读 snapshot route 取回；快照源采样时间与 freshness 随内容保留。
-relay 不再采样 Incus、不访问控制 DB、不持有租约决策；取回失败必须使 relay freshness 失效，不能以旧快照更新时间冒充源成功。
-真实拓扑核验后再决定是否部署该 relay；Gin snapshot route 与 control route 使用同一受保护 UDS listener。
+Deployd 负责把来源 snapshot 编码为 Prometheus exposition format，并为槽位级 series 加入 `slot` label。
+`/metrics` 只返回最近一次已完成的组合快照，不在 Prometheus scrape 请求中重新采样、不修改 state，也不产生 native effect。
+Prometheus 无法连接 deployd 时由 target `up=0` 表示；deployd 还必须暴露 source-specific health、freshness 和 observation timestamp，不能用旧快照时间冒充当前来源成功。
+Prometheus 与 deployd 的监听地址、访问控制和必要的 TLS 材料由部署仓库管理；本仓库不保存真实 target。
 
 ### 内置到期调度与重启补偿
 
@@ -264,7 +262,7 @@ flowchart TB
     healthy{"Go 控制面、状态与内置清理<br/>核验通过？"}
     observability["验证观测链；失败时原位修复<br/>保持 Go owner 与 drain"]
     client_update["更新客户端，最后退出 drain<br/>本地安装失败独立恢复"]
-    retire["恢复窗口结束且旧入口无调用<br/>删除 TS 控制实现、shim 与长期 Python collector"]
+    retire["恢复窗口结束且旧入口无调用<br/>删除 TS 控制实现、shim 与旧长期 Python metrics 进程"]
     rollback["一次有界程序回退<br/>先停 Go / worker，再恢复 bridge TS 与旧调度"]
     recovered{"bridge 恢复核验通过？"}
     previous["恢复 TS owner，继续恢复检查<br/>通过既有条件后才退出 drain"]
@@ -290,7 +288,7 @@ flowchart TB
 | Activate | 记录旧触发源与恢复信息，按精确目标停用旧 expiry/boot/age-GC 调度，停止旧 owner/worker，确认 authority lock 已释放，原子切换已验证 release，启动 Go 执行 startup reconcile 并恢复内置调度。TS 兼容入口此后只负责转发。 |
 | Verify | 验证 state/generation、journal、原生 inventory、内置 deadline/GC 调度、旧触发源已停用、capacity、epoch、一致性和各观测来源。通过后更新本地客户端，最后退出 drain。 |
 | Recover | 控制面健康失败允许一次有界程序回退；先停止 Go/worker，释放 authority，再恢复已验证 bridge release，由 TS 根据当前 DB 重建 expiry/维护调度。切换中途失败也必须恢复被停用的触发源。回退失败保持 drain；纯观测故障优先修复观测链，不触发控制 owner 来回切换。 |
-| Retire | 确认全部受支持客户端已更新、旧入口无调用且恢复窗口结束，再删除 TS 控制实现、shim、旧 unit 调用和长期 Python collector。不得无限保留双实现。 |
+| Retire | 确认全部受支持客户端已更新、旧入口无调用且恢复窗口结束，再删除 TS 控制实现、shim、旧 unit 调用和旧长期 Python metrics 进程。不得无限保留双实现。 |
 
 Go 写入后的同一份数据库必须能被受支持 bridge TS 读取并完成其支持的操作，才能把程序回退列为可用恢复方式。
 程序回退不恢复切换前数据库、不减少 generation、不清空 journal，也不自动执行 down migration；不满足向后可读约束的后续状态变化必须设计 forward repair。
@@ -312,8 +310,8 @@ Gin 依赖集中在 `httpapi`；CLI HTTP 适配、protocol codec 和业务服务
 | 公共仓库 | Go source、`go.mod`/`go.sum`、行为 fixtures/tests、通用 unit/template、固定 manifest/wrapper/publisher 合同、技术文档。 |
 | 本地客户端 | 保留 Bun client、operation journal、source sync 和 guest helper；仅调整受支持的远端入口及 release metadata。 |
 | Guest | 首轮保留已验证的 Bun guest root-growth/source-sync 行为；guest payload 在构建期生成并受 manifest 验证，不能在控制端临时安装 runtime。 |
-| Operator | 真实 config、inventory、Incus project/pool/image、SSH material、服务安装和 `obs` 部署；dashboard、scrape、告警与 relay 拓扑由 operator 验证。 |
-| Python | 删除被替代的长期 collector；一次性 publisher、manifest/wrapper 管理和必要行为测试可以保留，不把本次迁移扩大为全仓禁用 Python。 |
+| Operator | 真实 config、inventory、Incus project/pool/image、SSH material、服务安装和 `obs` 部署；dashboard、deployd `/metrics` scrape、告警与访问控制由 operator 验证。 |
+| Python | 删除被替代的旧长期 metrics 进程；一次性 publisher、manifest/wrapper 管理和必要行为测试可以保留，不把本次迁移扩大为全仓禁用 Python。 |
 
 实施时需要同批修改以下合同表面，而非在本文中先宣告它们完成：
 
@@ -334,7 +332,7 @@ Gin 依赖集中在 `httpapi`；CLI HTTP 适配、protocol codec 和业务服务
 | Linux native | 真实 flock、并发 worker、逃逸子孙进程、继承 pipe、timeout/kill/reap、daemon crash/restart，不允许残留 worker 被误当成已完成操作。 |
 | Guest | grow-only、filesystem 证据、既有有界 retry/balloon 行为。 |
 | 内置清理 | renew 与到期竞态、旧 generation/deadline 无副作用、提交后唤醒丢失、时钟跳变、清理失败退避、控制队列饱和、停机跨过 deadline 后启动补偿、admission 恢复顺序、age-GC 错过周期合并；HTTP/SSH 不可用时内置清理仍执行。 |
-| Observability | 慢 inventory 不拖垮 capacity/控制、epoch 持续变化、无效值不归零、原子 textfile、无重复 family、旧 task 清除、源与 relay freshness 区分。 |
+| Observability | 慢 inventory 不拖垮 capacity/控制、epoch 持续变化、无效值不归零、原子内部 snapshot、deployd `/metrics` 无重复 family、旧 task 清除、源 freshness 与 Prometheus target freshness 区分。 |
 | Release | manifest 1/2 桥接、未知目标拒绝、候选 artifact 验证、冷 drain、旧调度退出与回退重建、切换中断、激活失败、单次程序回退、回退失败保持 drain、客户端安装失败独立恢复。 |
 
 纯逻辑与协议测试可在 Linux/macOS 运行；Linux native、systemd、真实 Incus 和重型整体验证由会话 Agent VM 承担。
