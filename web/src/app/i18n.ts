@@ -106,6 +106,24 @@ i18n.addResource("en", "translation", "tokens.operationStatus", "Operation statu
 i18n.addResource("en", "translation", "tokens.operationNotFound", "No authoritative operation result is available, so a replacement Token is blocked. Check again later; do not retry until the original operation is confirmed not to have committed.");
 i18n.addResource("en", "translation", "tokens.roleAdministrator", "Administrator");
 i18n.addResource("en", "translation", "common.copyFailed", "Copy failed; copy it manually.");
+i18n.addResource("zh-CN", "translation", "operationRecovery.title", "操作恢复核对");
+i18n.addResource("zh-CN", "translation", "operationRecovery.checking", "正在查询原操作，确认连接中断前是否已经提交。");
+i18n.addResource("zh-CN", "translation", "operationRecovery.resolved", "原操作已确定为{{status}}，现在可以开始新的操作意图。");
+i18n.addResource("zh-CN", "translation", "operationRecovery.blocked", "原操作仍为{{status}}，在得到权威终态前不会允许新的操作。");
+i18n.addResource("zh-CN", "translation", "operationRecovery.notFound", "暂时没有找到原操作的权威结果；请再次查询，确认前不要发起新的操作。");
+i18n.addResource("zh-CN", "translation", "operationRecovery.error", "无法核对原操作；请再次查询，确认前不要发起新的操作。");
+i18n.addResource("zh-CN", "translation", "operationRecovery.retry", "再次查询");
+i18n.addResource("zh-CN", "translation", "operationRecovery.clear", "放弃恢复状态");
+i18n.addResource("zh-CN", "translation", "errors.operationRecoveryRequired", "请先完成原操作核对，再发起新的操作。");
+i18n.addResource("en", "translation", "operationRecovery.title", "Operation recovery");
+i18n.addResource("en", "translation", "operationRecovery.checking", "Checking the original operation to confirm whether it committed before the connection failed.");
+i18n.addResource("en", "translation", "operationRecovery.resolved", "The original operation is confirmed {{status}}. You can start a new intent.");
+i18n.addResource("en", "translation", "operationRecovery.blocked", "The original operation is still {{status}}. New actions stay blocked until an authoritative terminal result exists.");
+i18n.addResource("en", "translation", "operationRecovery.notFound", "No authoritative result for the original operation is available. Check again before starting a new action.");
+i18n.addResource("en", "translation", "operationRecovery.error", "The original operation could not be reconciled. Check again before starting a new action.");
+i18n.addResource("en", "translation", "operationRecovery.retry", "Check again");
+i18n.addResource("en", "translation", "operationRecovery.clear", "Discard recovery state");
+i18n.addResource("en", "translation", "errors.operationRecoveryRequired", "Reconcile the original operation before starting a new action.");
 
 export async function changeLocale(locale: Locale): Promise<void> {
   if (typeof window !== "undefined") window.localStorage.setItem("agent-vm-locale", locale);

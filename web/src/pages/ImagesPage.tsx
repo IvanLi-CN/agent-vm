@@ -9,6 +9,7 @@ import { useOperationRecovery } from "../app/operationRecovery";
 import type { ActionPreview, ImageImportRequest, Locale, ManagedImage } from "../app/types";
 import { auditReasonWithinLimit, optionalAuditReason } from "../app/validation";
 import { ActionDialog } from "../components/ActionDialog";
+import { OperationRecoveryNotice } from "../components/OperationRecoveryNotice";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { CopyButton, EmptyState, Input, Panel, PanelHeader, StatusBadge, Button } from "../components/ui";
 import { DefinitionList, PageIntro, QueryError } from "../components/PagePrimitives";
@@ -44,7 +45,7 @@ export function ImagesPage() {
   const [pendingImport, setPendingImport] = useState<ImportSubmission | null>(null);
   const [action, setAction] = useState<ImageAction | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
-  const [operationId, setOperationId] = useOperationRecovery("/images");
+  const [operationId, setOperationId, operationRecovery] = useOperationRecovery("/images", auth.isAuthenticated);
   const query = useQuery({ queryKey: ["images", search, cursor], queryFn: () => listImages(search, cursor), enabled: auth.isAuthenticated, refetchInterval: 10_000, refetchIntervalInBackground: false });
   const selected = query.data?.items.find((image) => image.fingerprint === selectedFingerprint) ?? query.data?.items[0] ?? null;
   const importMutation = useMutation({
@@ -56,6 +57,7 @@ export function ImagesPage() {
       if (operation.status === "failed") {
         setImportMessage(t(`errors.${operation.error?.code ?? "generic"}`, { defaultValue: t("errors.generic") }));
         setPendingImport(null);
+        setOperationId(null);
         return;
       }
       if (operation.status === "outcome_unknown") {
@@ -65,6 +67,7 @@ export function ImagesPage() {
       setImportMessage(`${t("images.importStarted")} · ${operation.operation_id}`);
       setPendingImport(null);
       setReason("");
+      setOperationId(null);
       void client.invalidateQueries({ queryKey: ["operations"] });
     },
     onError: (error) => {
@@ -75,6 +78,11 @@ export function ImagesPage() {
   const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!, operationId ?? undefined), onSuccess: () => { setAction(null); setPreview(null); setOperationId(null); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")) });
 
   const submitImport = (submission: ImportSubmission) => {
+    if (operationRecovery.isBlocked) {
+      setImportMessage(t("errors.operationRecoveryRequired"));
+      return;
+    }
+    setOperationId(submission.request.operation_id);
     setPendingImport(submission);
     importMutation.mutate(submission);
   };
@@ -116,6 +124,10 @@ export function ImagesPage() {
   };
 
   const openAction = async (nextAction: ImageAction) => {
+    if (operationRecovery.isBlocked) {
+      setImportMessage(t("errors.operationRecoveryRequired"));
+      return;
+    }
     if (!selected) return;
     setAction(nextAction);
     setOperationId(createOperationId());
@@ -131,6 +143,7 @@ export function ImagesPage() {
 
   return <div className="page-stack" data-testid="images-page">
     <PageIntro title={t("images.title")} description={t("images.subtitle")} onRefresh={() => void query.refetch()} refreshing={query.isFetching} />
+    <OperationRecoveryNotice recovery={operationRecovery} />
     <div className="split-layout images-layout">
       <Panel className="list-panel">
         <PanelHeader title={t("images.listTitle")} description={t("images.count", { count: query.data?.items.length ?? 0 })} />

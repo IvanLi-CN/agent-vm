@@ -201,8 +201,8 @@ Console 管理 existing Agent session VMs、managed images、capacity、operatio
 该目标必须只使用 OIDC Authorization Code + PKCE 和 `code_challenge_method=S256`，并执行 exact issuer/subject identity、secure browser sessions、exact Origin validation 和 session-bound CSRF protection。
 目标 direct Agent API 是 `/agent/v1/control`，要求 opaque Bearer Token，绝不接受 browser Cookie。
 如果必需的 OIDC、Token、origin 或 resource-limit configuration 不完整，target listener 必须保持 disabled。
-[管理合同](contracts/management-api.md)、[Token API 合同](contracts/token-api.md)、[Agent API 合同](contracts/agent-api.md)和[OpenAPI 文档](contracts/management-api.yaml)定义目标 wire shapes 与 deployment inputs；
-当前实现证据仍限于已有 compatibility surfaces。
+[管理合同](contracts/management-api.md)、[Token API 合同](contracts/token-api.md)、[Agent API 合同](contracts/agent-api.md)和[OpenAPI 文档](contracts/management-api.yaml)定义当前 wire shapes 与 deployment inputs；
+当前检出包含统一 Web 服务、认证门面、公开状态入口、管理控制台组件、受控视觉证据和认证 E2E；真实部署与隔离环境验收仍由发布门禁决定。
 
 UI 支持 `zh-CN` 和 `en`。
 Saved preference 优先于 browser language；

@@ -315,10 +315,13 @@ func publicObservationStateFromMetrics(metrics map[string]any, fresh, unverified
 func capacityObservation(metrics map[string]any, now time.Time) (fresh, unverified bool) {
 	observedAt := stringValue(metrics["observed_at"])
 	observedTime, parseErr := time.Parse(time.RFC3339Nano, observedAt)
-	if observedAt == "" || parseErr != nil || observedTime.After(now) || now.Sub(observedTime) > 60*time.Second {
+	if observedAt == "" || parseErr != nil || observedTime.After(now) {
+		return false, true
+	}
+	if now.Sub(observedTime) > 60*time.Second {
 		return false, false
 	}
-	if !validTaskStates(metrics["task_states"]) || !validAdmissionObservation(metrics) || !validObservationConsistency(metrics) {
+	if _, ok := metrics["up"].(bool); !ok || !validTaskStates(metrics["task_states"]) || !validAdmissionObservation(metrics) || !validObservationConsistency(metrics) {
 		return false, true
 	}
 	return true, false
@@ -353,29 +356,32 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	}
 	now := authority.Clock().UTC()
 	observedAt := stringValue(metrics["observed_at"])
+	parsedObservedAt, parseErr := time.Parse(time.RFC3339Nano, observedAt)
+	observedAtValid := observedAt != "" && parseErr == nil && !parsedObservedAt.After(now)
 	fresh, observationUnverified := capacityObservation(metrics, now)
-	if observedAt == "" {
-		observedAt = now.Format(time.RFC3339Nano)
+	fieldObservedAt := observedAt
+	if fieldObservedAt == "" {
+		fieldObservedAt = now.Format(time.RFC3339Nano)
 	}
 	resources, _ := metrics["resources"].(map[string]any)
 	remaining, _ := resources["remaining"].(map[string]any)
 	ctCPU, _ := metrics["ct_cpu"].(map[string]any)
 	startupBlocked := nestedBool(metrics, "ct_cpu", "startup_pressure", "startup_blocked")
 	capacity := map[string]any{
-		"logical_cpu_remaining_vcpu": observedNumber(numberValue(remaining["cpu"]), observedAt, fresh),
-		"ct_cpu_capacity_vcpu":       observedNumber(numberValue(ctCPU["capacity_vcpu"]), observedAt, fresh),
-		"logical_memory_remaining":   observedBytes(decimalBytes(numberValue(remaining["memory_mib"]), 1024*1024), observedAt, fresh),
-		"ct_memory_available":        observedBytes(nil, observedAt, fresh),
+		"logical_cpu_remaining_vcpu": observedNumber(numberValue(remaining["cpu"]), fieldObservedAt, fresh),
+		"ct_cpu_capacity_vcpu":       observedNumber(numberValue(ctCPU["capacity_vcpu"]), fieldObservedAt, fresh),
+		"logical_memory_remaining":   observedBytes(decimalBytes(numberValue(remaining["memory_mib"]), 1024*1024), fieldObservedAt, fresh),
+		"ct_memory_available":        observedBytes(nil, fieldObservedAt, fresh),
 		// The logical admission budget is not physical disk telemetry. Keep the
 		// physical field unverified until the native snapshot supplies it.
-		"physical_disk_available": observedBytes(nil, observedAt, fresh),
+		"physical_disk_available": observedBytes(nil, fieldObservedAt, fresh),
 	}
 	pressure := map[string]any{
-		"cpu_some_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "some", "avg10"), observedAt, fresh),
-		"cpu_full_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "full", "avg10"), observedAt, fresh),
-		"cpu_startup_pressure_threshold_percent": observedNumber(nestedNumber(resources, "policy", "cpu_startup_pressure_full_avg10_percent"), observedAt, fresh),
-		"cpu_startup_blocked":                    observedBoolean(startupBlocked, observedAt, fresh),
-		"memory_pressure":                        observedBoolean(nil, observedAt, fresh),
+		"cpu_some_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "some", "avg10"), fieldObservedAt, fresh),
+		"cpu_full_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "full", "avg10"), fieldObservedAt, fresh),
+		"cpu_startup_pressure_threshold_percent": observedNumber(nestedNumber(resources, "policy", "cpu_startup_pressure_full_avg10_percent"), fieldObservedAt, fresh),
+		"cpu_startup_blocked":                    observedBoolean(startupBlocked, fieldObservedAt, fresh),
+		"memory_pressure":                        observedBoolean(nil, fieldObservedAt, fresh),
 	}
 	var admissionReady, draining any
 	admissionBlocked := false
@@ -454,21 +460,27 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	if native, ok := metrics["up"].(bool); !ok || !native {
 		nativeUnavailable = true
 	}
-	if !fresh {
+	if observationUnverified {
+		nativeSafeCode = "observation_unverified"
+	} else if !fresh {
 		nativeSafeCode = "observation_stale"
 	} else if nativeUnavailable {
 		nativeSafeCode = "native_unavailable"
 	}
+	var nativeObservedAt any
+	if observedAtValid {
+		nativeObservedAt = observedAt
+	}
 	return map[string]any{
 		"resource_version": epoch,
-		"observed_at":      observedAt,
+		"observed_at":      nativeObservedAt,
 		"admission":        map[string]any{"ready": admissionReady, "draining": draining, "reasons": reasons},
 		"capacity":         capacity,
 		"pressure":         pressure,
 		"task_counts":      states,
 		"sources": []any{
 			map[string]any{"name": "durable_state", "state": durableState, "observed_at": durableObservedAt, "stale_after_seconds": 60, "safe_code": nil},
-			map[string]any{"name": "native", "state": nativeObservationState(metrics["up"], fresh, observationUnverified), "observed_at": observedAt, "stale_after_seconds": 60, "safe_code": nativeSafeCode},
+			map[string]any{"name": "native", "state": nativeObservationState(metrics["up"], fresh, observationUnverified), "observed_at": nativeObservedAt, "stale_after_seconds": 60, "safe_code": nativeSafeCode},
 		},
 	}, nil
 }

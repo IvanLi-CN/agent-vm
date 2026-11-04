@@ -8,6 +8,7 @@ import { useOperationRecovery } from "../app/operationRecovery";
 import { actionLabel, formatDateTime } from "../app/format";
 import type { ActionPreview, Locale, SystemStatus } from "../app/types";
 import { ActionDialog } from "../components/ActionDialog";
+import { OperationRecoveryNotice } from "../components/OperationRecoveryNotice";
 import { PageIntro, QueryError } from "../components/PagePrimitives";
 import { TokenManagement } from "../components/TokenManagement";
 import { Button, Panel, PanelHeader, StatusBadge } from "../components/ui";
@@ -22,7 +23,7 @@ export function SystemPage() {
   const client = useQueryClient();
   const [action, setAction] = useState<MaintenanceAction | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
-  const [operationId, setOperationId] = useOperationRecovery("/system");
+  const [operationId, setOperationId, operationRecovery] = useOperationRecovery("/system", auth.isAuthenticated);
   const [actionError, setActionError] = useState<string | null>(null);
   const [dialogOwner, setDialogOwner] = useState<ActionDialogOwner>(null);
   const setTokenDialogOpen = useCallback((open: boolean) => {
@@ -47,6 +48,10 @@ export function SystemPage() {
     onError: showError,
   });
   const openAction = async (nextAction: MaintenanceAction) => {
+    if (operationRecovery.isBlocked) {
+      setActionError(t("errors.operationRecoveryRequired"));
+      return;
+    }
     if (dialogOwner) return;
     setActionError(null);
     setDialogOwner("maintenance");
@@ -65,6 +70,7 @@ export function SystemPage() {
   if (query.isError || !query.data) return <><PageIntro title={t("system.title")} description={t("system.subtitle")} /><QueryError onRetry={() => void query.refetch()} /></>;
   return <div className="page-stack" data-testid="system-page">
     <PageIntro title={t("system.title")} description={t("system.subtitle")} onRefresh={() => void query.refetch()} refreshing={query.isFetching} />
+    <OperationRecoveryNotice recovery={operationRecovery} />
     <div className="system-overview">
       <Panel><PanelHeader title={t("system.productVersion")} /><div className="product-version mono">{query.data.product_version}</div><div className="system-meta"><span className="mono">{query.data.resource_version}</span><span>{t("shell.synthetic")}</span></div></Panel>
       <Panel><PanelHeader title={t("system.maintenance")} description={t("system.maintainHint")} /><MaintenanceSummary system={query.data} /><div className="maintenance-actions">{query.data.maintenance.draining ? <p className="maintenance-note">{t("system.releaseManaged")}</p> : <Button variant="secondary" icon={<Wrench />} disabled={dialogOwner !== null} onClick={() => void openAction("drain_enter")}>{t("system.enterDrain")}</Button>}<Button variant="ghost" disabled={dialogOwner !== null} onClick={() => void openAction("reconcile")}>{t("system.reconcile")}</Button><Button variant="ghost" disabled={dialogOwner !== null} onClick={() => void openAction("gc")}>{t("system.gc")}</Button></div>{actionError && !action ? <p className="field-error" role="alert">{actionError}</p> : null}</Panel>

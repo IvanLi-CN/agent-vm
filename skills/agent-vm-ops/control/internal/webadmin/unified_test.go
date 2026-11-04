@@ -135,6 +135,30 @@ func TestUnifiedRejectsMutationsBeforeLifecycleReady(t *testing.T) {
 	}
 }
 
+func TestUnifiedSessionRequiresReadCapability(t *testing.T) {
+	authority, store, cfg := testAuthority(t)
+	server, err := NewUnifiedServer(UnifiedOptions{Config: cfg, Authority: authority, Store: store, Assets: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("index")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionRaw := "session-secret-without-read"
+	now := server.now()
+	if err := store.InsertBrowserSession(context.Background(), state.BrowserSession{
+		SessionDigest: digestString(sessionRaw), Issuer: cfg.AdminPrincipal.Issuer, Subject: cfg.AdminPrincipal.Subject,
+		CSRFSecretDigest: digestString(server.OIDC.csrfToken(digestString(sessionRaw))), Capabilities: []string{"observe_admin"},
+		CreatedAt: now.Format(time.RFC3339Nano), ExpiresAt: now.Add(15 * time.Minute).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/session", nil)
+	request.AddCookie(&http.Cookie{Name: managementSessionCookie, Value: sessionRaw})
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusForbidden || !strings.Contains(recorder.Body.String(), `"permission_denied"`) {
+		t.Fatalf("session status/body=%d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
 func TestAgentSuccessResponseRedactsNativeDiagnostics(t *testing.T) {
 	value := map[string]any{
 		"result": map[string]any{
@@ -252,6 +276,7 @@ func TestUnifiedCapabilityMappingMatchesManagementContract(t *testing.T) {
 	}{
 		{http.MethodGet, "/operations", []string{"read"}},
 		{http.MethodGet, "/operations/op-1", []string{"read"}},
+		{http.MethodGet, "/session", []string{"read"}},
 		{http.MethodGet, "/overview", []string{"observe_admin"}},
 		{http.MethodGet, "/vms", []string{"observe_admin"}},
 		{http.MethodGet, "/images", []string{"observe_admin", "manage_images"}},

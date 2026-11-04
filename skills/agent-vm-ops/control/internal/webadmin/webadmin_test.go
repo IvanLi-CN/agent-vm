@@ -257,6 +257,32 @@ func TestOverviewMarksStaleSourcesAndBlocksUnsafeAdmission(t *testing.T) {
 	}
 }
 
+func TestOverviewRedactsInvalidObservationTimestampAndSafeCode(t *testing.T) {
+	authority, _, _ := testAuthority(t)
+	now := time.Date(2026, 11, 4, 8, 0, 0, 0, time.UTC)
+	authority.Clock = func() time.Time { return now }
+	metrics := map[string]any{
+		"observed_at":            now.Add(time.Second).Format(time.RFC3339Nano),
+		"up":                     true,
+		"admission_ready":        true,
+		"draining":               false,
+		"observation_consistent": true,
+		"task_states":            completeTaskStates(2),
+	}
+	value, err := authority.overview(metrics, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value["observed_at"] != nil {
+		t.Fatalf("top-level observed_at=%#v", value["observed_at"])
+	}
+	sources := value["sources"].([]any)
+	native := sources[1].(map[string]any)
+	if native["observed_at"] != nil || native["state"] != "unverified" || native["safe_code"] != "observation_unverified" {
+		t.Fatalf("native source=%#v", native)
+	}
+}
+
 func TestWebSessionAndWriteBoundary(t *testing.T) {
 	cfg := testManagementConfig(t)
 	server, err := NewWebServer(cfg, NewAuthorityClient(cfg.Authority.SocketPath))

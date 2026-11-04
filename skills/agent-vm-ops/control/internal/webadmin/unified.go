@@ -141,6 +141,10 @@ func (server *UnifiedServer) browserAPI(c *gin.Context) {
 			server.writeRejectedProblem(c.Writer, request, pathValue, authErr)
 			return
 		}
+		if !hasAnyCapability(session.Capabilities, []string{"read"}) {
+			server.writeRejectedProblem(c.Writer, request, pathValue, newAPIError("permission_denied", "the administrator capability is required", http.StatusForbidden, "authorization", false, ""))
+			return
+		}
 		server.writeSession(c.Writer, principal, session)
 		return
 	}
@@ -202,7 +206,7 @@ func isUploadContentPath(method, pathValue string) bool {
 func requiredCapabilities(method, pathValue string) []string {
 	if method == http.MethodGet {
 		switch {
-		case pathValue == "/operations", strings.HasPrefix(pathValue, "/operations/"):
+		case pathValue == "/session", pathValue == "/operations", strings.HasPrefix(pathValue, "/operations/"):
 			return []string{"read"}
 		case pathValue == "/images", strings.HasPrefix(pathValue, "/images/"):
 			return []string{"observe_admin", "manage_images"}

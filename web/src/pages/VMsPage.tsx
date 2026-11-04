@@ -8,6 +8,7 @@ import { useManagementAuth } from "../app/auth";
 import { useOperationRecovery } from "../app/operationRecovery";
 import type { ActionPreview, Locale, ManagedVM } from "../app/types";
 import { ActionDialog } from "../components/ActionDialog";
+import { OperationRecoveryNotice } from "../components/OperationRecoveryNotice";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { CopyButton, EmptyState, Input, Panel, PanelHeader, StatusBadge, Button } from "../components/ui";
 import { DefinitionList, PageIntro, QueryError } from "../components/PagePrimitives";
@@ -30,7 +31,7 @@ export function VMsPage() {
   const [action, setAction] = useState<string | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
   const [parameters, setParameters] = useState<Record<string, unknown>>({});
-  const [operationId, setOperationId] = useOperationRecovery("/vms");
+  const [operationId, setOperationId, operationRecovery] = useOperationRecovery("/vms", auth.isAuthenticated);
   const [actionError, setActionError] = useState<string | null>(null);
   const vmQuery = useQuery({ queryKey: ["vms", q, state, leaseState, cursor], queryFn: () => listVMs({ q, state, leaseState, cursor }), enabled: auth.isAuthenticated, refetchInterval: 10_000, refetchIntervalInBackground: false });
   const selected = vmQuery.data?.items.find((vm) => vm.task_id === selectedId) ?? vmQuery.data?.items[0] ?? null;
@@ -47,6 +48,10 @@ export function VMsPage() {
   });
 
   const openAction = async (nextAction: string) => {
+    if (operationRecovery.isBlocked) {
+      setActionError(t("errors.operationRecoveryRequired"));
+      return;
+    }
     if (!selected) return;
     setActionError(null);
     setAction(nextAction);
@@ -86,6 +91,7 @@ export function VMsPage() {
 
   return <div className="page-stack" data-testid="vms-page">
     <PageIntro title={t("vms.title")} description={t("vms.subtitle")} onRefresh={() => void vmQuery.refetch()} refreshing={vmQuery.isFetching} />
+    <OperationRecoveryNotice recovery={operationRecovery} />
     <Panel className="filter-bar">
       <label className="filter-search"><span className="sr-only">{t("vms.filterSearch")}</span><Input value={q} onChange={(event) => { setQ(event.target.value); resetPage(); }} placeholder={t("vms.filterSearch")} /></label>
       <label className="filter-field"><span>{t("vms.filterState")}</span><Select value={state} onValueChange={(value) => { setState(value); resetPage(); }}><SelectTrigger aria-label={t("vms.filterState")}><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="all">{t("vms.allStates")}</SelectItem><SelectItem value="active">{t("status.active")}</SelectItem><SelectItem value="cached">{t("status.cached")}</SelectItem><SelectItem value="failed">{t("status.failed")}</SelectItem><SelectItem value="preparing">{t("status.preparing")}</SelectItem></SelectGroup></SelectContent></Select></label>

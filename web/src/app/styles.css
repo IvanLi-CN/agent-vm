@@ -473,6 +473,10 @@ svg { flex: none; }
 .status-notice > svg { width: 16px; height: 16px; }
 .status-notice > div { flex: 1; min-width: 0; }
 .status-notice strong { display: block; font-size: 12px; font-weight: 500; }
+.operation-recovery-notice { align-items: flex-start; margin-bottom: 16px; }
+.operation-recovery-notice > div > span { display: block; margin-top: 3px; font-size: 12px; line-height: 18px; }
+.operation-recovery-notice .status-badge { display: inline-flex; margin-top: 7px; }
+.operation-recovery-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
 .notice-code { display: block; margin-top: 2px; }
 .notice-success { color: var(--positive-ink); background: var(--positive-bg); }
 .notice-warning { color: var(--warning); background: var(--warning-bg); }
