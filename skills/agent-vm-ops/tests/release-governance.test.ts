@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 
 import { compareSemVer, parseSemVer, resolveReleaseTarget } from "../scripts/semver.ts";
 import { GhGithubAdapter, GithubReleaseStateStore, ReleaseStateStore, type ReleaseIdentity } from "../scripts/release-coordinator.ts";
-import { assertContractPreconditions, assertWorkflowPlatformAttestation, releaseBuilderCommand, successfulMainGate, verifyReleaseView } from "../scripts/release.ts";
+import { assertContractPreconditions, assertWorkflowPlatformAttestation, releaseBuilderCommand, releaseBuilderEnvironment, successfulMainGate, verifyReleaseView } from "../scripts/release.ts";
 
 const identity = (overrides: Partial<ReleaseIdentity> = {}): ReleaseIdentity => ({
   version: "1.0.0",
@@ -49,6 +49,12 @@ test("release assets select the management-enabled product builder", () => {
   if (!native.some((value) => value.endsWith("build_product_release.ts")) || !native.includes("--version")) throw new Error("native assets did not select the product builder");
 });
 
+test("release builders do not inherit platform credentials", () => {
+  const environment = releaseBuilderEnvironment({ GH_TOKEN: "ghs-secret", GITHUB_TOKEN: "github-secret", RELEASE_PLATFORM_TOKEN: "platform-secret", SAFE_VALUE: "kept" });
+  if ("GH_TOKEN" in environment || "GITHUB_TOKEN" in environment || "RELEASE_PLATFORM_TOKEN" in environment) throw new Error("release credentials leaked into the product builder environment");
+  if (environment.SAFE_VALUE !== "kept") throw new Error("safe builder environment values were not preserved");
+});
+
 test("release reservation is append-only and identity-bound", () => {
   const root = mkdtempSync(join(tmpdir(), "agent-vm-release-state-"));
   try {
@@ -73,7 +79,7 @@ test("release reservation is append-only and identity-bound", () => {
   }
 });
 
-test("release preflight is fail-closed and accepts every Main gate matrix job", () => {
+test("release preflight is fail-closed and accepts the exact Main gate matrix", () => {
   let blocked = false;
   try {
     assertContractPreconditions(
@@ -87,15 +93,37 @@ test("release preflight is fail-closed and accepts every Main gate matrix job", 
   if (!unprotectedError) throw new Error("workflow preflight accepted an unprotected ref");
   assertWorkflowPlatformAttestation("refs/heads/main", "true");
   const gate = successfulMainGate([
-    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2 },
-    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1 },
+    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, check_suite: { id: 99 }, app: { slug: "github-actions" } },
+    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } },
   ]);
   if (gate.id !== "1,2") throw new Error(`unexpected Main gate identity: ${gate.id}`);
+  let missingMatrixRejected = false;
+  try { successfulMainGate([{ name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } }]); } catch { missingMatrixRejected = true; }
+  if (!missingMatrixRejected) throw new Error("an incomplete Main gate matrix was accepted");
+  let foreignCheckRejected = false;
+  try { successfulMainGate([
+    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, check_suite: { id: 99 }, app: { slug: "third-party" } },
+    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } },
+  ]); } catch { foreignCheckRejected = true; }
+  if (!foreignCheckRejected) throw new Error("a non-GitHub Actions Main gate was accepted");
+  let mixedSuiteRejected = false;
+  try { successfulMainGate([
+    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, check_suite: { id: 100 }, app: { slug: "github-actions" } },
+    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } },
+  ]); } catch { mixedSuiteRejected = true; }
+  if (!mixedSuiteRejected) throw new Error("Main gates from different check suites were accepted");
+  const rerunGate = successfulMainGate([
+    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 4, completed_at: "2026-11-05T00:05:00Z", check_suite: { id: 101, updated_at: "2026-11-05T00:06:00Z" }, app: { slug: "github-actions" } },
+    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 3, completed_at: "2026-11-05T00:04:00Z", check_suite: { id: 101, updated_at: "2026-11-05T00:06:00Z" }, app: { slug: "github-actions" } },
+    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, completed_at: "2026-11-04T00:05:00Z", check_suite: { id: 100, updated_at: "2026-11-04T00:06:00Z" }, app: { slug: "github-actions" } },
+    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, completed_at: "2026-11-04T00:04:00Z", check_suite: { id: 100, updated_at: "2026-11-04T00:06:00Z" }, app: { slug: "github-actions" } },
+  ]);
+  if (rerunGate.id !== "3,4") throw new Error(`latest Main gate rerun was not selected: ${rerunGate.id}`);
 });
 
 test("GitHub state refs are append-only and preserve the original identity", async () => {
   const refs = new Map<string, string>();
-  const commits = new Map<string, string>();
+  const commits = new Map<string, { message: string; parents: string[] }>();
   let sequence = 0;
   const fake = {
     repository: "IvanLi-CN/agent-vm",
@@ -108,7 +136,10 @@ test("GitHub state refs are append-only and preserve the original identity", asy
         return { object: { sha } };
       }
       const commitRead = args.find((item) => /\/git\/commits\/[0-9a-z-]+$/.test(item));
-      if (commitRead && !args.includes("--method")) return { message: commits.get(commitRead.split("/git/commits/")[1]) };
+      if (commitRead && !args.includes("--method")) {
+        const commit = commits.get(commitRead.split("/git/commits/")[1]);
+        return commit ? { message: commit.message, parents: commit.parents.map((sha) => ({ sha })) } : undefined;
+      }
       if (args.some((item) => item.endsWith("/git/blobs"))) return { sha: `blob-${++sequence}` };
       if (args.some((item) => item.endsWith("/git/trees"))) {
         if (!args.includes("--input") || input === undefined) throw new Error("tree JSON request body is missing");
@@ -121,7 +152,9 @@ test("GitHub state refs are append-only and preserve the original identity", asy
       }
       if (args.some((item) => item.endsWith("/git/commits"))) {
         const sha = `commit-${++sequence}`;
-        commits.set(sha, args.find((item) => item.startsWith("message="))!.slice("message=".length));
+        const parentIndex = args.indexOf("--field");
+        const parentArg = parentIndex >= 0 ? args[parentIndex + 1] : undefined;
+        commits.set(sha, { message: args.find((item) => item.startsWith("message="))!.slice("message=".length), parents: parentArg?.startsWith("parents[]=") ? [parentArg.slice("parents[]=".length)] : [] });
         return { sha };
       }
       if (args.some((item) => item.endsWith("/git/refs"))) {
@@ -140,9 +173,15 @@ test("GitHub state refs are append-only and preserve the original identity", asy
   const current = await remote.current(source.version);
   const assets = current.detail?.assets as Record<string, string> | undefined;
   if (current.stage !== "prepared" || assets?.package !== "release-state/artifacts/1.0.0/package") throw new Error("remote state did not hydrate the recovery asset path");
+  const orphan = "orphan-commit";
+  commits.set(orphan, { message: `agent-vm release state draft 1.0.0\n\n${JSON.stringify({ stage: "draft", identity: source, at: new Date().toISOString(), detail: { artifacts: { package: "d".repeat(64) }, assets: { package: "package" } } })}`, parents: ["unrelated-parent"] });
+  refs.set("release-state/draft/1.0.0", orphan);
+  let lineageRejected = false;
+  try { await remote.current(source.version); } catch (error) { lineageRejected = String(error).includes("parent chain"); }
+  if (!lineageRejected) throw new Error("a non-descendant higher-stage state ref was accepted");
   let conflict = false;
   try { await remote.claim(identity({ source_revision: "e".repeat(40) })); } catch { conflict = true; }
-  if (!conflict || refs.size !== 2) throw new Error("remote state ref conflict was not fail-closed");
+  if (!conflict || refs.size !== 3) throw new Error("remote state ref conflict was not fail-closed");
 });
 
 test("draft release lookup accepts an untagged draft only when its target is bound", async () => {
@@ -158,5 +197,11 @@ test("draft release lookup accepts an untagged draft only when its target is bou
   let wrongSourceRejected = false;
   try { verifyReleaseView(view, "v1.0.0", true, { package: "/tmp/package" }, "e".repeat(40)); } catch { wrongSourceRejected = true; }
   if (!wrongSourceRejected) throw new Error("draft release target binding was not enforced");
-  verifyReleaseView({ tagName: "v1.0.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: false, assets: [{ name: "package" }] }, "v1.0.0", false, { package: "/tmp/package" }, source);
+  let mutablePublishedRejected = false;
+  try { verifyReleaseView({ tagName: "v1.0.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: false, assets: [{ name: "package" }] }, "v1.0.0", false, { package: "/tmp/package" }, source); } catch { mutablePublishedRejected = true; }
+  if (!mutablePublishedRejected) throw new Error("mutable published release was accepted");
+  let extraAssetRejected = false;
+  try { verifyReleaseView({ tagName: "v1.0.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: true, assets: [{ name: "package" }, { name: "unexpected" }] }, "v1.0.0", false, { package: "/tmp/package" }, source); } catch { extraAssetRejected = true; }
+  if (!extraAssetRejected) throw new Error("an unexpected release asset was accepted");
+  verifyReleaseView({ tagName: "v1.0.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: true, assets: [{ name: "package" }] }, "v1.0.0", false, { package: "/tmp/package" }, source);
 });

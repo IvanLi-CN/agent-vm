@@ -3,6 +3,7 @@ import { AlertTriangle, ChevronLeft, ChevronRight, KeyRound, ShieldCheck, UserRo
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ManagementRequestError, createAgentToken, createOperationId, getManagementSession, getOperation, listTokens, previewTokenRevocation, submitTokenRevocation } from "../app/api";
+import { useManagementAuth } from "../app/auth";
 import { formatDateTime } from "../app/format";
 import type { ActionPreview, AgentToken, Locale, ManagementSession, Operation, TokenCreateResult, TokenRevokePreview, TokenScope } from "../app/types";
 import { auditReasonWithinLimit } from "../app/validation";
@@ -44,6 +45,8 @@ type RevokeRecoverySnapshot = {
 
 const createRecoveryQueryKey = ["token-create-recovery"] as const;
 const revokeRecoveryQueryKey = ["token-revoke-recovery"] as const;
+const tokenRecoveryStoragePrefix = "agent-vm:token-recovery:";
+const tokenRecoveryLifetimeMs = 24 * 60 * 60 * 1000;
 const definitiveCreateFailureCodes = new Set([
   "authentication_required",
   "administrator_required",
@@ -98,6 +101,46 @@ function createOutcomeIsUncertain(error: unknown): boolean {
   return !(error instanceof ManagementRequestError) || error.retryable || !definitiveCreateFailureCodes.has(error.code);
 }
 
+function tokenRecoveryStorage(): Storage | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.sessionStorage;
+  } catch {
+    return null;
+  }
+}
+
+function readTokenRecovery<T>(name: string): T | null {
+  const store = tokenRecoveryStorage();
+  if (!store) return null;
+  try {
+    const raw = store.getItem(`${tokenRecoveryStoragePrefix}${name}`);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as { storedAt?: unknown; snapshot?: T };
+    if (typeof parsed.storedAt !== "number" || Date.now() - parsed.storedAt > tokenRecoveryLifetimeMs || !parsed.snapshot) {
+      store.removeItem(`${tokenRecoveryStoragePrefix}${name}`);
+      return null;
+    }
+    return parsed.snapshot;
+  } catch {
+    return null;
+  }
+}
+
+function writeTokenRecovery<T>(name: string, snapshot: T | null): void {
+  const store = tokenRecoveryStorage();
+  if (!store) return;
+  try {
+    if (!snapshot) {
+      store.removeItem(`${tokenRecoveryStoragePrefix}${name}`);
+      return;
+    }
+    store.setItem(`${tokenRecoveryStoragePrefix}${name}`, JSON.stringify({ storedAt: Date.now(), snapshot }));
+  } catch {
+    // Session storage is an enhancement; the in-memory query cache remains valid.
+  }
+}
+
 type TokenManagementProps = {
   dialogBlocked?: boolean;
   onDialogStateChange?: (open: boolean) => void;
@@ -105,6 +148,7 @@ type TokenManagementProps = {
 
 export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: TokenManagementProps = {}) {
   const { t, i18n } = useTranslation();
+  const auth = useManagementAuth();
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const client = useQueryClient();
   const createRecoveryQuery = useQuery<CreateRecoverySnapshot | null>({
@@ -114,7 +158,7 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
     staleTime: Infinity,
     gcTime: Infinity,
   });
-  const persistedCreateRecovery = createRecoveryQuery.data ?? client.getQueryData<CreateRecoverySnapshot>(createRecoveryQueryKey);
+  const persistedCreateRecovery = createRecoveryQuery.data ?? client.getQueryData<CreateRecoverySnapshot>(createRecoveryQueryKey) ?? readTokenRecovery<CreateRecoverySnapshot>("create");
   const revokeRecoveryQuery = useQuery<RevokeRecoverySnapshot | null>({
     queryKey: revokeRecoveryQueryKey,
     queryFn: () => Promise.resolve(client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey) ?? null),
@@ -122,7 +166,7 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
     staleTime: Infinity,
     gcTime: Infinity,
   });
-  const persistedRevokeRecovery = revokeRecoveryQuery.data ?? client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey);
+  const persistedRevokeRecovery = revokeRecoveryQuery.data ?? client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey) ?? readTokenRecovery<RevokeRecoverySnapshot>("revoke");
   const [scopes, setScopes] = useState<TokenScope[]>(["agent:read"]);
   const [expiresAt, setExpiresAt] = useState(defaultExpiry);
   const [reason, setReason] = useState("");
@@ -151,9 +195,11 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
   const [tokenCursor, setTokenCursor] = useState<string | undefined>();
   const [tokenCursorStack, setTokenCursorStack] = useState<string[]>([]);
 
-  const sessionQuery = useQuery<ManagementSession>({ queryKey: ["management-session"], queryFn: getManagementSession, staleTime: 30_000 });
-  const session = sessionQuery.data;
-  const canManageTokens = session?.capabilities.includes("manage_tokens") ?? false;
+  const sessionQuery = useQuery<ManagementSession>({ queryKey: ["management-session"], queryFn: getManagementSession, enabled: !auth.managed, staleTime: 30_000 });
+  const session = auth.session ?? sessionQuery.data;
+  const sessionPending = auth.managed ? auth.status === "loading" : sessionQuery.isPending;
+  const sessionError = auth.managed ? auth.status === "error" : sessionQuery.isError;
+  const canManageTokens = auth.isAuthenticated && (session?.capabilities.includes("manage_tokens") ?? false);
   const tokensQuery = useQuery({ queryKey: ["tokens", tokenCursor], queryFn: () => listTokens(tokenCursor), enabled: canManageTokens, refetchInterval: 10_000, refetchIntervalInBackground: false });
   const refreshSessionAfterAuthFailure = (error: unknown) => {
     if (error instanceof ManagementRequestError && (error.code === "authentication_required" || error.code === "csrf_invalid")) void client.invalidateQueries({ queryKey: ["management-session"], exact: true });
@@ -174,9 +220,11 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
   const persistCreateRecovery = useCallback((snapshot: CreateRecoverySnapshot | null) => {
     if (snapshot) client.setQueryData(createRecoveryQueryKey, snapshot);
     else client.setQueryData(createRecoveryQueryKey, null);
+    writeTokenRecovery("create", snapshot);
   }, [client]);
-  const persistRevokeRecovery = useCallback((snapshot: RevokeRecoverySnapshot | null) => {
+  const persistRevokeRecovery = useCallback((snapshot: RevokeRecoverySnapshot | null, persist = true) => {
     client.setQueryData(revokeRecoveryQueryKey, snapshot);
+    if (persist) writeTokenRecovery("revoke", snapshot);
     if (mountedRef.current) setRevokeRecovery(snapshot);
   }, [client]);
   const clearRevokeRecovery = useCallback(() => {
@@ -515,13 +563,13 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
     const operationId = createOperationId();
     const initialRecovery: RevokeRecoverySnapshot = { token, preview: null, operationId, auditReason: "", decision: "preview_pending", status: null, errorCode: null, recoveryErrorCode: null };
     setRevokeError(null);
-    persistRevokeRecovery(initialRecovery);
+    persistRevokeRecovery(initialRecovery, false);
     try {
       const preview = await previewTokenRevocation(token.token_id, token.resource_version);
       if (revokePreviewRequestRef.current !== requestId) return;
       const current = client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey);
       if (!current || current.operationId !== operationId || current.decision !== "preview_pending") return;
-      persistRevokeRecovery({ ...initialRecovery, preview, decision: "ready" });
+      persistRevokeRecovery({ ...initialRecovery, preview, decision: "ready" }, false);
     } catch (error) {
       const current = client.getQueryData<RevokeRecoverySnapshot>(revokeRecoveryQueryKey);
       if (revokePreviewRequestRef.current === requestId && current?.operationId === operationId && current.decision === "preview_pending") {
@@ -542,7 +590,7 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
       return;
     }
     const variables = { tokenId: revokeRecovery.token.token_id, preview: revokeRecovery.preview, auditReason, operationId: revokeRecovery.operationId };
-    persistRevokeRecovery({ ...revokeRecovery, auditReason, decision: "check", status: null, errorCode: null, recoveryErrorCode: null });
+    persistRevokeRecovery({ ...revokeRecovery, auditReason, decision: "check", status: null, errorCode: null, recoveryErrorCode: null }, true);
     revokeInFlightRef.current = true;
     setRevokeError(null);
     onDialogStateChange?.(false);
@@ -655,7 +703,7 @@ export function TokenManagement({ dialogBlocked = false, onDialogStateChange }: 
       {revokeError && !revokeDialogOpen && !revokeRecovery ? <p className="field-error" role="alert">{revokeError}</p> : null}
       {revokeRecovery?.decision === "preview_pending" ? <div className="token-recovery" data-testid="token-revoke-preview-recovery"><p className="token-retry-hint">{t("tokens.revokePreviewPending")}</p><div className="token-form-actions"><Button type="button" variant="ghost" onClick={retryRevokePreview}>{t("tokens.retryRevokePreviewButton")}</Button><Button type="button" variant="ghost" onClick={cancelRevoke}>{t("common.cancel")}</Button></div></div> : null}
       {revokeRecovery && revokeRecovery.decision !== "preview_pending" && revokeRecovery.decision !== "ready" ? <div className="token-recovery" data-testid="token-revoke-recovery"><p className="token-retry-hint">{t("tokens.revokeRecoveryHint", { operationId: revokeRecovery.operationId })}</p>{revokeRecovery.errorCode ? <p className="field-error" role="alert">{errorMessageForCode(revokeRecovery.errorCode, t)}</p> : null}{revokeRecovery.recoveryErrorCode ? <p className="field-error" role="alert">{revokeRecovery.recoveryErrorCode === "not_found" ? t("tokens.operationNotFound") : errorMessageForCode(revokeRecovery.recoveryErrorCode, t)}</p> : null}{revokeRecovery.status ? <p className="token-retry-hint" data-testid="token-revoke-operation-status">{t("tokens.operationStatus", { status: t(`status.${revokeRecovery.status.status}`) })}</p> : null}<div className="token-form-actions"><Button type="button" variant="ghost" disabled={revokeCheckPending || revokeMutation.isPending} onClick={() => void checkRevokeOperation()}>{revokeCheckPending ? t("common.loading") : t("tokens.checkOperation")}</Button>{revokeRecovery.decision === "retry_same" ? <Button type="button" variant="secondary" disabled={revokeMutation.isPending} onClick={retryRevoke}>{t("tokens.retryRevokeButton")}</Button> : null}</div></div> : null}
-      {sessionQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : sessionQuery.isError ? <div role="alert"><p className="field-error">{t("errors.generic")}</p><Button variant="ghost" onClick={() => void sessionQuery.refetch()}>{t("common.retry")}</Button></div> : !canManageTokens ? <p className="token-capability-note">{t("tokens.permissionDenied")}</p> : tokensQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : tokensQuery.isError ? <div role="alert"><p className="field-error">{t("errors.generic")}</p><Button variant="ghost" onClick={() => void tokensQuery.refetch()}>{t("common.retry")}</Button></div> : tokens.length ? <div className="token-list" role="list">{tokens.map((token) => <TokenRow key={token.token_id} token={token} locale={locale} revokeDisabled={dialogBlocked || Boolean(revokeRecovery) || revokePreviewPending || revokeMutation.isPending || !canManageTokens} onRevoke={(trigger) => void openRevoke(token, trigger)} />)}</div> : <EmptyState title={t("tokens.noTokens")} />}
+      {sessionPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : sessionError ? <div role="alert"><p className="field-error">{t("errors.generic")}</p><Button variant="ghost" onClick={() => void (auth.managed ? auth.retry() : sessionQuery.refetch())}>{t("common.retry")}</Button></div> : !canManageTokens ? <p className="token-capability-note">{t("tokens.permissionDenied")}</p> : tokensQuery.isPending ? <div className="loading-rows token-loading"><span /><span /><span /></div> : tokensQuery.isError ? <div role="alert"><p className="field-error">{t("errors.generic")}</p><Button variant="ghost" onClick={() => void tokensQuery.refetch()}>{t("common.retry")}</Button></div> : tokens.length ? <div className="token-list" role="list">{tokens.map((token) => <TokenRow key={token.token_id} token={token} locale={locale} revokeDisabled={dialogBlocked || Boolean(revokeRecovery) || revokePreviewPending || revokeMutation.isPending || !canManageTokens} onRevoke={(trigger) => void openRevoke(token, trigger)} />)}</div> : <EmptyState title={t("tokens.noTokens")} />}
       <div className="pagination token-pagination"><span>{tokens.length}</span><div><Button variant="ghost" aria-label={t("common.previous")} disabled={!tokenCursorStack.length} onClick={previousTokenPage} icon={<ChevronLeft />} /><Button variant="ghost" aria-label={t("common.next")} disabled={!tokensQuery.data?.page.next_cursor} onClick={nextTokenPage} icon={<ChevronRight />} /></div></div>
     </div>
     {revokeDialogOpen && revokeToken && revokePreview ? <ActionDialog preview={actionPreview(revokePreview)} actionLabel={t("tokens.revoke")} target={`${t("tokens.tokenId")} · ${revokeToken.token_id}`} dangerous busy={revokeMutation.isPending} error={revokeError} confirmationText={t("tokens.revokeConfirm")} returnFocusTarget={revokeTriggerRef.current} onCancel={cancelRevoke} onConfirm={submitRevoke} /> : null}

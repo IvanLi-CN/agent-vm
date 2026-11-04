@@ -11,6 +11,7 @@ servers:
     description: Same-origin API served by the installed Agent VM product.
 tags:
   - name: Auth
+  - name: Public
   - name: Session
   - name: Tokens
   - name: Overview
@@ -28,7 +29,16 @@ paths:
       operationId: startOidcLogin
       security: []
       summary: Start an OIDC Authorization Code + PKCE login
-      description: The authorization request uses code_challenge_method=S256 only; plain and any other PKCE method are rejected.
+      description: The authorization request uses code_challenge_method=S256 only; plain and any other PKCE method are rejected. An optional return_to value is validated as one of the allowlisted same-origin management page paths /, /vms, /images, /operations or /system and stored in the one-time transaction.
+      parameters:
+        - name: return_to
+          in: query
+          required: false
+          description: Allowlisted same-origin management page path to visit after successful login. Duplicate values, unknown parameters, external URLs, protocol-relative URLs, path traversal and unsupported paths are rejected; a missing value defaults to /.
+          schema:
+            type: string
+            maxLength: 256
+            enum: [/, /vms, /images, /operations, /system]
       responses:
         "302":
           description: Redirect to the configured OIDC authorization endpoint.
@@ -92,7 +102,7 @@ paths:
             maxLength: 2048
       responses:
         "302":
-          description: Redirect to the configured management origin after creating the browser session, or after clearing the binding cookie with a generic localized login-failure state and no session for a provider error.
+          description: Redirect to the validated return_to path after creating the browser session, or to the management origin with auth=failed after clearing the binding cookie and creating no session for a provider error or failed callback.
           headers:
             Location:
               schema:
@@ -105,21 +115,40 @@ paths:
         default:
           $ref: "#/components/responses/Problem"
 
+  /public/status:
+    get:
+      tags: [Public]
+      operationId: getPublicStatus
+      security: []
+      summary: Read a delayed, sanitized public service status
+      description: Returns only a visitor-facing service state, active session count, observation timestamp and freshness state. It never returns administrator identity, capabilities, resource capacity or pressure details. The response may be cached briefly and must not be treated as management authorization or an authoritative live read.
+      responses:
+        "200":
+          description: Delayed public status.
+          headers:
+            Cache-Control:
+              description: Short public cache window for the delayed observation.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicStatus"
+        default:
+          $ref: "#/components/responses/Problem"
+
   /session:
     get:
       tags: [Session]
       operationId: getManagementSession
       security:
         - browserSession: []
-      summary: Establish the browser session and return its administrator context
+      x-required-capabilities: [read]
+      summary: Bootstrap the browser session and return its administrator context
+      description: Requires an authenticated administrator browser session with the `read` capability; without it, the management session cannot bootstrap protected reads.
       responses:
         "200":
-          description: Authenticated administrator context and CSRF token.
-          headers:
-            Set-Cookie:
-              description: Opaque session cookie; Secure, HttpOnly, SameSite=Strict, Path=/, Max-Age equal to the configured session TTL.
-              schema:
-                type: string
+          description: Authenticated administrator context and CSRF token. The SPA must bootstrap this endpoint before showing administrator identity, capabilities or managed resources; authentication_required and csrf_invalid suspend subsequent queries and mutations until explicit reauthentication.
           content:
             application/json:
               schema:
@@ -132,6 +161,7 @@ paths:
       tags: [Tokens]
       operationId: listAgentTokens
       summary: List Token metadata visible to the current principal
+      x-required-capabilities: [manage_tokens]
       security:
         - browserSession: []
       parameters:
@@ -150,6 +180,7 @@ paths:
       tags: [Tokens]
       operationId: createAgentToken
       summary: Create one opaque Agent Token and return its plaintext once
+      x-required-capabilities: [manage_tokens]
       security:
         - browserSession: []
           csrfToken: []
@@ -184,6 +215,7 @@ paths:
       tags: [Tokens]
       operationId: getAgentToken
       summary: Read one Token's metadata without returning its plaintext
+      x-required-capabilities: [manage_tokens]
       security:
         - browserSession: []
       responses:
@@ -204,6 +236,7 @@ paths:
       tags: [Tokens]
       operationId: revokeAgentToken
       summary: Revoke one Token through the administrator preview contract
+      x-required-capabilities: [manage_tokens]
       security:
         - browserSession: []
           csrfToken: []
@@ -232,6 +265,7 @@ paths:
       operationId: previewAgentTokenRevocation
       summary: Preview Token revocation
       description: Requires the administrator Token-management capability; the response binds the exact Token metadata, target version and administrator to a single-use confirmation token.
+      x-required-capabilities: [manage_tokens]
       security:
         - browserSession: []
           csrfToken: []
@@ -256,6 +290,10 @@ paths:
       tags: [Overview]
       operationId: getOverview
       summary: Read the current capacity, admission, pressure and source freshness summary
+      description: Requires the administrator observe_admin capability.
+      x-required-capabilities: [observe_admin]
+      security:
+        - browserSession: []
       responses:
         "200":
           description: Current read-only overview.
@@ -275,6 +313,10 @@ paths:
       tags: [VMs]
       operationId: listManagedVMs
       summary: List existing Agent session VMs
+      description: Requires the administrator observe_admin capability.
+      x-required-capabilities: [observe_admin]
+      security:
+        - browserSession: []
       parameters:
         - name: state
           in: query
@@ -323,6 +365,10 @@ paths:
       tags: [VMs]
       operationId: getManagedVM
       summary: Read one existing Agent session VM
+      description: Requires the administrator observe_admin capability.
+      x-required-capabilities: [observe_admin]
+      security:
+        - browserSession: []
       responses:
         "200":
           description: Current VM state and allowed action names.
@@ -341,6 +387,7 @@ paths:
       tags: [VMs]
       operationId: previewVMAction
       summary: Preview one fixed, supported VM action
+      x-required-capabilities: [operate]
       security:
         - browserSession: []
           csrfToken: []
@@ -368,6 +415,7 @@ paths:
       tags: [VMs]
       operationId: submitVMAction
       summary: Submit a confirmed VM action as a durable operation
+      x-required-capabilities: [operate]
       security:
         - browserSession: []
           csrfToken: []
@@ -396,6 +444,11 @@ paths:
       tags: [Images]
       operationId: listManagedImages
       summary: List managed image versions and their references
+      description: Requires the administrator observe_admin or manage_images capability.
+      x-required-capabilities: [observe_admin, manage_images]
+      x-required-capabilities-mode: any
+      security:
+        - browserSession: []
       parameters:
         - name: state
           in: query
@@ -431,6 +484,11 @@ paths:
       tags: [Images]
       operationId: getManagedImage
       summary: Read one immutable image and all reference classes
+      description: Requires the administrator observe_admin or manage_images capability.
+      x-required-capabilities: [observe_admin, manage_images]
+      x-required-capabilities-mode: any
+      security:
+        - browserSession: []
       responses:
         "200":
           description: Current image verification, default and reference state.
@@ -446,6 +504,7 @@ paths:
       tags: [Images]
       operationId: startImageImport
       summary: Start an import from an allowlisted source or a bounded local upload
+      x-required-capabilities: [manage_images]
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
@@ -483,6 +542,7 @@ paths:
       operationId: uploadImageImportContent
       summary: Stream the declared bytes for an existing local image import operation
       description: The stream is accepted once, must match the declared size and is never resumable.
+      x-required-capabilities: [manage_images]
       security:
         - browserSession: []
           csrfToken: []
@@ -521,6 +581,7 @@ paths:
       tags: [Images]
       operationId: previewDefaultImageChange
       summary: Preview the effect of selecting a new default image
+      x-required-capabilities: [manage_images]
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
@@ -547,6 +608,7 @@ paths:
       tags: [Images]
       operationId: selectDefaultImage
       summary: Select an already verified managed image for new sessions
+      x-required-capabilities: [manage_images]
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
@@ -576,6 +638,7 @@ paths:
       tags: [Images]
       operationId: previewImageRetirement
       summary: Preview retirement of an image version
+      x-required-capabilities: [manage_images]
       security:
         - browserSession: []
           csrfToken: []
@@ -603,6 +666,7 @@ paths:
       tags: [Images]
       operationId: retireManagedImage
       summary: Retire an image so it cannot be selected for new sessions
+      x-required-capabilities: [manage_images]
       security:
         - browserSession: []
           csrfToken: []
@@ -630,6 +694,7 @@ paths:
       tags: [Images]
       operationId: previewImageDeletion
       summary: Preview deletion and show every blocking image reference
+      x-required-capabilities: [manage_images]
       security:
         - browserSession: []
           csrfToken: []
@@ -657,6 +722,7 @@ paths:
       tags: [Images]
       operationId: deleteManagedImage
       summary: Delete an unreferenced, non-default image
+      x-required-capabilities: [manage_images]
       security:
         - browserSession: []
           csrfToken: []
@@ -682,6 +748,9 @@ paths:
       operationId: listOperations
       summary: List durable management operations visible to the current principal
       description: The sole administrator receives field-whitelisted operations. The actor is the exact current (issuer, subject) pair, a typed rejected request without administrator authority, or an explicitly marked historical actor whose original value is retained without identity inference.
+      x-required-capabilities: [read]
+      security:
+        - browserSession: []
       parameters:
         - name: status
           in: query
@@ -723,6 +792,9 @@ paths:
       operationId: getOperation
       summary: Read an operation by its durable identity
       description: The sole administrator receives field-whitelisted operation status. Current rejected-request actors and historical actor values remain explicitly non-administrator identities and are never converted into a guessed OIDC identity. Token-create results never contain bearer plaintext.
+      x-required-capabilities: [read]
+      security:
+        - browserSession: []
       responses:
         "200":
           description: Current phase, outcome and safe result or error.
@@ -738,6 +810,10 @@ paths:
       tags: [Audit]
       operationId: listAuditEvents
       summary: Query administrator audit events
+      description: Requires the administrator observe_admin capability.
+      x-required-capabilities: [observe_admin]
+      security:
+        - browserSession: []
       parameters:
         - name: actor
           in: query
@@ -792,6 +868,10 @@ paths:
       tags: [System]
       operationId: getSystemStatus
       summary: Read installed product, component readiness and maintenance state
+      description: Requires the administrator observe_admin capability.
+      x-required-capabilities: [observe_admin]
+      security:
+        - browserSession: []
       responses:
         "200":
           description: Read-only system status.
@@ -811,6 +891,7 @@ paths:
       tags: [System]
       operationId: previewMaintenance
       summary: Preview a supported maintenance operation
+      x-required-capabilities: [maintain_system]
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
@@ -837,6 +918,7 @@ paths:
       tags: [System]
       operationId: submitMaintenance
       summary: Submit a confirmed drain, reconcile or garbage-collection action
+      x-required-capabilities: [maintain_system]
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
@@ -1068,6 +1150,7 @@ components:
       type: object
       additionalProperties: false
       required: [operation_id, scopes, expires_at]
+      description: Requested machine scopes must be a subset of the authenticated administrator capabilities; manage_tokens alone does not grant agent:read, agent:operate, agent:sync or agent:observe_admin issuance authority.
       allOf:
         - if:
             required: [scopes]
@@ -1257,6 +1340,26 @@ components:
         observed_at:
           type: [string, "null"]
           format: date-time
+    PublicStatus:
+      type: object
+      additionalProperties: false
+      required: [state, active_sessions, observed_at, observation_state, stale_after_seconds]
+      properties:
+        state:
+          type: string
+          enum: [available, degraded, unknown]
+        active_sessions:
+          type: [integer, "null"]
+          minimum: 0
+        observed_at:
+          type: [string, "null"]
+          format: date-time
+        observation_state:
+          type: string
+          enum: [available, stale, missing, failed, unverified]
+        stale_after_seconds:
+          type: integer
+          minimum: 1
     Overview:
       type: object
       additionalProperties: false
@@ -1266,7 +1369,7 @@ components:
           type: string
           minLength: 1
         observed_at:
-          type: string
+          type: [string, "null"]
           format: date-time
         admission:
           type: object
@@ -1804,6 +1907,10 @@ components:
             - admission_denied
             - resource_insufficient
             - watermarks_unreachable
+            - controller_lease_required
+            - mapping_unverified
+            - state_unverified
+            - resource_unverified
             - precondition_required
             - service_unavailable
             - state_unavailable
@@ -1812,8 +1919,8 @@ components:
             - task_not_active
             - draining
             - cleanup_incomplete
-            - resource_unverified
             - startup_reconcile_required
+            - authority_unavailable
             - internal_error
         phase:
           oneOf:
@@ -2034,7 +2141,7 @@ components:
             properties:
               name:
                 type: string
-                enum: [service, caddy, rqlite, incus]
+                enum: [web, authority, observer]
               state:
                 type: string
                 enum: [ready, degraded, unavailable, unknown]

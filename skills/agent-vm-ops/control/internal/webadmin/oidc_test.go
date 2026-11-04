@@ -1,6 +1,7 @@
 package webadmin
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -18,6 +19,45 @@ import (
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
+
+func TestOIDCBindingCookiesAreTransactionScoped(t *testing.T) {
+	firstName := oidcBindingCookieName("first-state")
+	secondName := oidcBindingCookieName("second-state")
+	if firstName == secondName {
+		t.Fatal("transaction binding cookie names must be independent")
+	}
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback", nil)
+	request.AddCookie(&http.Cookie{Name: firstName, Value: "binding"})
+	recorder := httptest.NewRecorder()
+	(&oidcAuthenticator{}).removeBinding(recorder, request, firstName, "binding")
+	var removed *http.Cookie
+	for _, cookie := range recorder.Result().Cookies() {
+		if cookie.Name == firstName {
+			removed = cookie
+		}
+	}
+	if removed == nil || removed.MaxAge >= 0 {
+		t.Fatalf("removed binding cookie=%#v", removed)
+	}
+}
+
+func TestOIDCLegacyBindingCookieRemovesOnlyConsumedBinding(t *testing.T) {
+	first := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+	second := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32))
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback", nil)
+	request.AddCookie(&http.Cookie{Name: loginBindingCookie, Value: first + "." + second})
+	recorder := httptest.NewRecorder()
+	(&oidcAuthenticator{}).removeBinding(recorder, request, loginBindingCookie, first)
+	var updated *http.Cookie
+	for _, cookie := range recorder.Result().Cookies() {
+		if cookie.Name == loginBindingCookie {
+			updated = cookie
+		}
+	}
+	if updated == nil || updated.Value != second || updated.MaxAge <= 0 {
+		t.Fatalf("updated legacy binding cookie=%#v", updated)
+	}
+}
 
 func TestOIDCLoginUsesDurableTransactionAndSession(t *testing.T) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -54,7 +94,7 @@ func TestOIDCLoginUsesDurableTransactionAndSession(t *testing.T) {
 	}
 	server.OIDC.client = provider.Client()
 
-	start := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/start", nil)
+	start := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/start?return_to=%2Fvms", nil)
 	startRecorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(startRecorder, start)
 	if startRecorder.Code != http.StatusFound {
@@ -70,11 +110,11 @@ func TestOIDCLoginUsesDurableTransactionAndSession(t *testing.T) {
 		t.Fatalf("OIDC redirect = %s", location.String())
 	}
 	transaction, err := store.GetOIDCTransaction(t.Context(), digestString(stateValue))
-	if err != nil || transaction == nil || transaction.ConsumedAt != nil || strings.Contains(transaction.CodeVerifierSealed, location.Query().Get("code_challenge")) {
+	if err != nil || transaction == nil || transaction.ConsumedAt != nil || transaction.ReturnTo != "/vms" || strings.Contains(transaction.CodeVerifierSealed, location.Query().Get("code_challenge")) {
 		t.Fatalf("OIDC transaction=%#v err=%v", transaction, err)
 	}
 	cookies := startRecorder.Result().Cookies()
-	if len(cookies) != 1 || cookies[0].Name != loginBindingCookie || !cookies[0].Secure || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
+	if len(cookies) != 1 || cookies[0].Name != oidcBindingCookieName(stateValue) || !cookies[0].Secure || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
 		t.Fatalf("OIDC binding cookie = %#v", cookies)
 	}
 
@@ -109,6 +149,115 @@ func TestOIDCLoginUsesDurableTransactionAndSession(t *testing.T) {
 	server.Handler().ServeHTTP(replayRecorder, replay)
 	if replayRecorder.Code != http.StatusBadRequest || !strings.Contains(replayRecorder.Body.String(), "invalid_state") {
 		t.Fatalf("callback replay status/body=%d %s", replayRecorder.Code, replayRecorder.Body.String())
+	}
+}
+
+func TestOIDCStartRejectsUnsafeReturnPaths(t *testing.T) {
+	provider := httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusNotFound)
+	}))
+	defer provider.Close()
+	authority, store, cfg := testAuthority(t)
+	cfg.OIDC.Issuer = provider.URL
+	cfg.AdminPrincipal.Issuer = provider.URL
+	server, err := NewUnifiedServer(UnifiedOptions{Config: cfg, Authority: authority, Store: store, Assets: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("index")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.OIDC.client = provider.Client()
+	for _, path := range []string{
+		"/api/v1/auth/oidc/start?return_to=https%3A%2F%2Fevil.example",
+		"/api/v1/auth/oidc/start?return_to=%2Fvms&return_to=%2Fimages",
+		"/api/v1/auth/oidc/start?return_to=%2Fvms%2F..%2Fsystem",
+		"/api/v1/auth/oidc/start?next=%2Fvms",
+	} {
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, path, nil))
+		if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "invalid_request") {
+			t.Errorf("unsafe OIDC start %q status/body=%d %s", path, recorder.Code, recorder.Body.String())
+		}
+	}
+}
+
+func TestOIDCCallbackRejectsPersistedUnsafeReturnPath(t *testing.T) {
+	authority, store, cfg := testAuthority(t)
+	server, err := NewUnifiedServer(UnifiedOptions{Config: cfg, Authority: authority, Store: store, Assets: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("index")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateValue := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{3}, 32))
+	binding := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{4}, 32))
+	nonce := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{5}, 32))
+	verifier := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{6}, 32))
+	sealed, err := server.OIDC.seal(verifier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := server.now()
+	if err := store.InsertOIDCTransaction(t.Context(), state.OIDCTransaction{
+		TransactionID:       randomTransactionID(),
+		StateDigest:         digestString(stateValue),
+		NonceDigest:         digestString(nonce),
+		CodeVerifierSealed:  sealed,
+		BindingCookieDigest: digestString(binding),
+		ClientID:            cfg.OIDC.ClientID,
+		RedirectURI:         cfg.OIDC.RedirectURI,
+		ReturnTo:            "@evil.example",
+		CreatedAt:           now.Format(time.RFC3339Nano),
+		ExpiresAt:           now.Add(oidcTransactionTTL).Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	callback := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback?error=access_denied&state="+url.QueryEscape(stateValue), nil)
+	callback.AddCookie(&http.Cookie{Name: oidcBindingCookieName(stateValue), Value: binding})
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, callback)
+	if recorder.Code != http.StatusFound || recorder.Header().Get("Location") != strings.TrimRight(cfg.ExternalOrigin, "/")+"/?auth=failed" {
+		t.Fatalf("unsafe persisted return path status/location=%d %s", recorder.Code, recorder.Header().Get("Location"))
+	}
+}
+
+func TestOIDCProviderFailureReturnsSafeLocalRedirect(t *testing.T) {
+	var provider *httptest.Server
+	provider = httptest.NewTLSServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/.well-known/openid-configuration" {
+			writer.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(writer).Encode(map[string]any{
+			"issuer": provider.URL, "authorization_endpoint": provider.URL + "/authorize", "token_endpoint": provider.URL + "/token", "jwks_uri": provider.URL + "/jwks", "code_challenge_methods_supported": []string{"S256"},
+		})
+	}))
+	defer provider.Close()
+	authority, store, cfg := testAuthority(t)
+	cfg.OIDC.Issuer = provider.URL
+	cfg.AdminPrincipal.Issuer = provider.URL
+	server, err := NewUnifiedServer(UnifiedOptions{Config: cfg, Authority: authority, Store: store, Assets: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("index")}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.OIDC.client = provider.Client()
+	startRecorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(startRecorder, httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/start?return_to=%2Fsystem", nil))
+	if startRecorder.Code != http.StatusFound {
+		t.Fatalf("start status/body=%d %s", startRecorder.Code, startRecorder.Body.String())
+	}
+	location, err := url.Parse(startRecorder.Header().Get("Location"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookies := startRecorder.Result().Cookies()
+	callback := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback?error=access_denied&error_description=provider-secret&state="+url.QueryEscape(location.Query().Get("state")), nil)
+	callback.AddCookie(cookies[0])
+	callbackRecorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(callbackRecorder, callback)
+	if callbackRecorder.Code != http.StatusFound || callbackRecorder.Header().Get("Location") != strings.TrimRight(cfg.ExternalOrigin, "/")+"/?auth=failed" || strings.Contains(callbackRecorder.Header().Get("Location"), "provider-secret") || strings.Contains(callbackRecorder.Body.String(), "provider-secret") {
+		t.Fatalf("provider failure status/location/body=%d %s %s", callbackRecorder.Code, callbackRecorder.Header().Get("Location"), callbackRecorder.Body.String())
+	}
+	for _, cookie := range callbackRecorder.Result().Cookies() {
+		if cookie.Name == managementSessionCookie {
+			t.Fatal("provider failure created a management session")
+		}
 	}
 }
 

@@ -4,8 +4,11 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { actionLabel, formatBytes, formatDateTime, shortFingerprint } from "../app/format";
 import { ManagementRequestError, createOperationId, listVMs, previewVMAction, submitVMAction } from "../app/api";
+import { useManagementAuth } from "../app/auth";
+import { useOperationRecovery } from "../app/operationRecovery";
 import type { ActionPreview, Locale, ManagedVM } from "../app/types";
 import { ActionDialog } from "../components/ActionDialog";
+import { OperationRecoveryNotice } from "../components/OperationRecoveryNotice";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { CopyButton, EmptyState, Input, Panel, PanelHeader, StatusBadge, Button } from "../components/ui";
 import { DefinitionList, PageIntro, QueryError } from "../components/PagePrimitives";
@@ -16,6 +19,7 @@ function vmDisplayName(vm: ManagedVM): string {
 
 export function VMsPage() {
   const { t, i18n } = useTranslation();
+  const auth = useManagementAuth();
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const queryClient = useQueryClient();
   const [q, setQ] = useState("");
@@ -27,9 +31,9 @@ export function VMsPage() {
   const [action, setAction] = useState<string | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
   const [parameters, setParameters] = useState<Record<string, unknown>>({});
-  const [operationId, setOperationId] = useState<string | null>(null);
+  const [operationId, setOperationId, operationRecovery] = useOperationRecovery("/vms", auth.isAuthenticated);
   const [actionError, setActionError] = useState<string | null>(null);
-  const vmQuery = useQuery({ queryKey: ["vms", q, state, leaseState, cursor], queryFn: () => listVMs({ q, state, leaseState, cursor }), refetchInterval: 10_000, refetchIntervalInBackground: false });
+  const vmQuery = useQuery({ queryKey: ["vms", q, state, leaseState, cursor], queryFn: () => listVMs({ q, state, leaseState, cursor }), enabled: auth.isAuthenticated, refetchInterval: 10_000, refetchIntervalInBackground: false });
   const selected = vmQuery.data?.items.find((vm) => vm.task_id === selectedId) ?? vmQuery.data?.items[0] ?? null;
 
   useEffect(() => {
@@ -39,15 +43,23 @@ export function VMsPage() {
   const showError = (error: unknown) => setActionError(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
   const submitMutation = useMutation({
     mutationFn: ({ reason }: { reason: string }) => submitVMAction(selected?.task_id ?? "", action ?? "restart", reason, preview!, selected?.generation ?? "", parameters, operationId ?? undefined),
-    onSuccess: () => { setAction(null); setPreview(null); setOperationId(null); setActionError(null); void queryClient.invalidateQueries({ queryKey: ["operations"] }); },
-    onError: showError,
+    onSuccess: (operation) => { setAction(null); setPreview(null); if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null); else { operationRecovery.persist(); operationRecovery.block(operation); } setActionError(null); void queryClient.invalidateQueries({ queryKey: ["operations"] }); },
+    onError: (error) => {
+      if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null);
+      else { operationRecovery.persist(); operationRecovery.block(); }
+      showError(error);
+    },
   });
 
   const openAction = async (nextAction: string) => {
+    if (operationRecovery.isBlocked) {
+      setActionError(t("errors.operationRecoveryRequired"));
+      return;
+    }
     if (!selected) return;
     setActionError(null);
     setAction(nextAction);
-    setOperationId(createOperationId());
+    setOperationId(createOperationId(), false);
     const initial = nextAction === "resize"
       ? { cpu_vcpu: selected.resources.cpu_vcpu ?? 2, memory_bytes: selected.resources.memory_bytes ?? "4294967296", disk_bytes: selected.resources.disk_bytes ?? "21474836480", live: false, allow_restart: false }
       : nextAction === "port_add"
@@ -59,6 +71,7 @@ export function VMsPage() {
     try {
       setPreview(await previewVMAction(selected.task_id, nextAction, selected, initial));
     } catch (error) {
+      setOperationId(null, false);
       showError(error);
     }
   };
@@ -83,6 +96,7 @@ export function VMsPage() {
 
   return <div className="page-stack" data-testid="vms-page">
     <PageIntro title={t("vms.title")} description={t("vms.subtitle")} onRefresh={() => void vmQuery.refetch()} refreshing={vmQuery.isFetching} />
+    <OperationRecoveryNotice recovery={operationRecovery} />
     <Panel className="filter-bar">
       <label className="filter-search"><span className="sr-only">{t("vms.filterSearch")}</span><Input value={q} onChange={(event) => { setQ(event.target.value); resetPage(); }} placeholder={t("vms.filterSearch")} /></label>
       <label className="filter-field"><span>{t("vms.filterState")}</span><Select value={state} onValueChange={(value) => { setState(value); resetPage(); }}><SelectTrigger aria-label={t("vms.filterState")}><SelectValue /></SelectTrigger><SelectContent><SelectGroup><SelectItem value="all">{t("vms.allStates")}</SelectItem><SelectItem value="active">{t("status.active")}</SelectItem><SelectItem value="cached">{t("status.cached")}</SelectItem><SelectItem value="failed">{t("status.failed")}</SelectItem><SelectItem value="preparing">{t("status.preparing")}</SelectItem></SelectGroup></SelectContent></Select></label>
@@ -98,7 +112,7 @@ export function VMsPage() {
       </Panel>
       <VMDetail vm={selected} locale={locale} onAction={openAction} actionError={actionError} />
     </div>}
-    {action && preview && selected ? <ActionDialog preview={preview} actionLabel={actionLabel(action, locale)} target={`${selected.task_id} · ${selected.session_id}`} dangerous={action === "destroy" || action === "release"} busy={submitMutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null); }} onConfirm={(reason) => submitMutation.mutate({ reason })}><VMActionParameters action={action} parameters={parameters} onChange={(next) => void updateParameters(next)} /></ActionDialog> : null}
+    {action && preview && selected ? <ActionDialog preview={preview} actionLabel={actionLabel(action, locale)} target={`${selected.task_id} · ${selected.session_id}`} dangerous={action === "destroy" || action === "release"} busy={submitMutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null, false); }} onConfirm={(reason) => { operationRecovery.persist(); submitMutation.mutate({ reason }); }}><VMActionParameters action={action} parameters={parameters} onChange={(next) => void updateParameters(next)} /></ActionDialog> : null}
   </div>;
 }
 

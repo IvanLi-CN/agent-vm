@@ -73,6 +73,16 @@ _Avoid_：把排空理解为立即停止进程或强制终止 guest。
 
 _Avoid_：把受管镜像、VM 缓存与 Agent VM 产品发布包统称为“镜像”；把“释放租约”理解为保留访问权的普通关机。
 
+## 身份与入口
+
+**静态入口（Static entry）**：管理台提供的固定 HTML、JavaScript、CSS 和允许的页面深链接。静态入口可访问只证明产品资源可达，不证明浏览器已建立管理会话或获得任何管理权限。
+
+**管理会话（Browser management session）**：由 OIDC 登录成功后创建、由服务端校验并授予管理员 capability 的浏览器身份。它与 Agent Token、OIDC 一次性事务和受管 VM 会话相互独立。
+
+**认证门面（Authentication gate）**：管理台在加载受管数据前确认管理会话、呈现登录或失效状态并控制恢复的用户界面边界。它改善入口和状态表达，但不替代后端认证、授权或 CSRF 校验。
+
+**登录回跳（Login return path）**：OIDC 登录事务中保存的、经过服务端校验的同源管理台页面路径。它只用于登录成功后的界面导航，不改变身份、能力或 API 授权范围。
+
 ## 资源与初始化
 
 **Incus project**：Agent VM 所在的 Incus 隔离与策略边界。

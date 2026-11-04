@@ -1,22 +1,29 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, ChevronLeft, ChevronRight, FileUp, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { actionLabel, formatDateTime, shortFingerprint } from "../app/format";
 import { ManagementRequestError, createOperationId, listImages, previewImageAction, startImageImport, submitImageAction, uploadImageImportContent } from "../app/api";
+import { useManagementAuth } from "../app/auth";
+import { useOperationRecovery } from "../app/operationRecovery";
 import type { ActionPreview, ImageImportRequest, Locale, ManagedImage } from "../app/types";
 import { auditReasonWithinLimit, optionalAuditReason } from "../app/validation";
 import { ActionDialog } from "../components/ActionDialog";
+import { OperationRecoveryNotice } from "../components/OperationRecoveryNotice";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
 import { CopyButton, EmptyState, Input, Panel, PanelHeader, StatusBadge, Button } from "../components/ui";
 import { DefinitionList, PageIntro, QueryError } from "../components/PagePrimitives";
 
 type ImageAction = "default" | "delete" | "retire";
-type ImportSubmission = { request: ImageImportRequest; content?: File | { metadata: File; rootfs: File } };
+type ImportContent = File | { metadata: File; rootfs: File };
+type ImportSubmission = { request: ImageImportRequest; content?: ImportContent };
+type ImportContinuation = { operationId: string; content: ImportContent };
+type ImportMutationInput = ImportSubmission | ImportContinuation;
 const importRejectedCodes = new Set(["invalid_request", "source_not_allowed", "permission_denied", "stale_target", "operation_conflict", "not_found", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch"]);
 
 export function ImagesPage() {
   const { t, i18n } = useTranslation();
+  const auth = useManagementAuth();
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const client = useQueryClient();
   const [search, setSearch] = useState("");
@@ -39,47 +46,97 @@ export function ImagesPage() {
   const importReasonTooLong = !auditReasonWithinLimit(reason);
   const [importMessage, setImportMessage] = useState("");
   const [pendingImport, setPendingImport] = useState<ImportSubmission | null>(null);
+  const uploadContinuationRef = useRef<string | null>(null);
   const [action, setAction] = useState<ImageAction | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
-  const [operationId, setOperationId] = useState<string | null>(null);
-  const query = useQuery({ queryKey: ["images", search, cursor], queryFn: () => listImages(search, cursor), refetchInterval: 10_000, refetchIntervalInBackground: false });
+  const [operationId, setOperationId, operationRecovery] = useOperationRecovery("/images", auth.isAuthenticated);
+  const query = useQuery({ queryKey: ["images", search, cursor], queryFn: () => listImages(search, cursor), enabled: auth.isAuthenticated, refetchInterval: 10_000, refetchIntervalInBackground: false });
   const selected = query.data?.items.find((image) => image.fingerprint === selectedFingerprint) ?? query.data?.items[0] ?? null;
   const importMutation = useMutation({
-    mutationFn: async ({ request, content }: ImportSubmission) => {
+    mutationFn: async (input: ImportMutationInput) => {
+      if ("operationId" in input) {
+        uploadContinuationRef.current = input.operationId;
+        return uploadImageImportContent(input.operationId, input.content);
+      }
+      const { request, content } = input;
       const operation = await startImageImport(request);
-      return content && operation.status === "awaiting_upload" ? uploadImageImportContent(operation.operation_id, content) : operation;
+      if (content && operation.status === "awaiting_upload") {
+        uploadContinuationRef.current = operation.operation_id;
+        return uploadImageImportContent(operation.operation_id, content);
+      }
+      return operation;
     },
     onSuccess: (operation) => {
+      uploadContinuationRef.current = null;
       if (operation.status === "failed") {
         setImportMessage(t(`errors.${operation.error?.code ?? "generic"}`, { defaultValue: t("errors.generic") }));
         setPendingImport(null);
+        setOperationId(null);
         return;
       }
       if (operation.status === "outcome_unknown") {
         setImportMessage(t("errors.authority_unavailable"));
+        operationRecovery.persist();
+        operationRecovery.block(operation);
+        void client.invalidateQueries({ queryKey: ["operations"] });
         return;
       }
       setImportMessage(`${t("images.importStarted")} · ${operation.operation_id}`);
       setPendingImport(null);
       setReason("");
+      if (operation.status === "succeeded") setOperationId(null);
+      else { operationRecovery.persist(); operationRecovery.block(operation); }
       void client.invalidateQueries({ queryKey: ["operations"] });
     },
     onError: (error) => {
-      if (error instanceof ManagementRequestError && importRejectedCodes.has(error.code)) setPendingImport(null);
+      if (error instanceof ManagementRequestError && importRejectedCodes.has(error.code)) {
+        uploadContinuationRef.current = null;
+        setPendingImport(null);
+        setOperationId(null);
+      } else {
+        operationRecovery.persist();
+        operationRecovery.block();
+      }
       setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
     },
   });
-  const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!, operationId ?? undefined), onSuccess: () => { setAction(null); setPreview(null); setOperationId(null); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")) });
+  const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!, operationId ?? undefined), onSuccess: (operation) => { setAction(null); setPreview(null); if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null); else { operationRecovery.persist(); operationRecovery.block(operation); } void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => { if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null); else { operationRecovery.persist(); operationRecovery.block(); } setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")); } });
 
   const submitImport = (submission: ImportSubmission) => {
+    if (operationRecovery.isBlocked) {
+      setImportMessage(t("errors.operationRecoveryRequired"));
+      return;
+    }
+    setOperationId(submission.request.operation_id);
     setPendingImport(submission);
     importMutation.mutate(submission);
   };
 
+  const selectedUploadContent = (): ImportContent | null => {
+    if (format === "unified") return uploadFile;
+    if (metadataFile && rootfsFile) return { metadata: metadataFile, rootfs: rootfsFile };
+    return null;
+  };
+
   const startImport = () => {
     if (importReasonTooLong) { setImportMessage(t("common.reasonTooLong")); return; }
+    const pendingUploadContent = pendingImport?.content;
+    if (uploadContinuationRef.current && pendingUploadContent) {
+      const recoveredOperationId = uploadContinuationRef.current;
+      setOperationId(recoveredOperationId);
+      importMutation.mutate({ operationId: recoveredOperationId, content: pendingUploadContent });
+      return;
+    }
+    const recoveredOperation = operationRecovery.operation;
+    const recoveredUploadContent = selectedUploadContent();
+    if (!pendingImport && recoveredOperation?.status === "awaiting_upload") {
+      if (!recoveredUploadContent) { setImportMessage(t("images.fileRequired")); return; }
+      setOperationId(recoveredOperation.operation_id);
+      importMutation.mutate({ operationId: recoveredOperation.operation_id, content: recoveredUploadContent });
+      return;
+    }
     if (pendingImport) {
-      importMutation.mutate(pendingImport);
+      submitImport(pendingImport);
       return;
     }
     const targetVersion = query.data?.catalog_version;
@@ -113,21 +170,27 @@ export function ImagesPage() {
   };
 
   const openAction = async (nextAction: ImageAction) => {
+    if (operationRecovery.isBlocked) {
+      setImportMessage(t("errors.operationRecoveryRequired"));
+      return;
+    }
     if (!selected) return;
     setAction(nextAction);
-    setOperationId(createOperationId());
+    setOperationId(createOperationId(), false);
     const targetVersion = nextAction === "default" ? query.data?.selection_version : selected.resource_version;
-    if (!targetVersion) return;
+    if (!targetVersion) { setOperationId(null, false); return; }
     try {
       setPreview(await previewImageAction(selected.fingerprint, nextAction, targetVersion));
     } catch (error) {
       setAction(null);
       setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
+      setOperationId(null, false);
     }
   };
 
   return <div className="page-stack" data-testid="images-page">
     <PageIntro title={t("images.title")} description={t("images.subtitle")} onRefresh={() => void query.refetch()} refreshing={query.isFetching} />
+    <OperationRecoveryNotice recovery={operationRecovery} />
     <div className="split-layout images-layout">
       <Panel className="list-panel">
         <PanelHeader title={t("images.listTitle")} description={t("images.count", { count: query.data?.items.length ?? 0 })} />
@@ -170,7 +233,7 @@ export function ImagesPage() {
       </div>
       <div className="import-footer"><span id={importReasonTooLong ? "image-import-reason-error" : undefined} role={importReasonTooLong ? "alert" : undefined} className={!importReasonTooLong && (importMessage.includes("created") || importMessage.includes("已创建")) ? "success-copy" : "field-error"}>{importReasonTooLong ? t("common.reasonTooLong") : importMessage}</span><Button variant="primary" icon={<FileUp />} disabled={importMutation.isPending || importReasonTooLong} onClick={startImport}>{importMutation.isPending ? t("common.loading") : t("images.startImport")}</Button></div>
     </Panel>
-    {action && preview && selected ? <ActionDialog preview={preview} actionLabel={actionLabel(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", locale)} target={`${selected.version_label} · ${shortFingerprint(selected.fingerprint)}`} dangerous={action === "delete" || action === "retire"} busy={actionMutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null); }} onConfirm={(actionReason) => actionMutation.mutate({ reason: actionReason })} /> : null}
+    {action && preview && selected ? <ActionDialog preview={preview} actionLabel={actionLabel(action === "default" ? "default_image_select" : action === "delete" ? "image_delete" : "image_retire", locale)} target={`${selected.version_label} · ${shortFingerprint(selected.fingerprint)}`} dangerous={action === "delete" || action === "retire"} busy={actionMutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null, false); }} onConfirm={(actionReason) => { operationRecovery.persist(); actionMutation.mutate({ reason: actionReason }); }} /> : null}
   </div>;
 }
 

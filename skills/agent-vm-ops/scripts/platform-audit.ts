@@ -10,6 +10,7 @@ export interface PlatformSnapshot {
   required_signatures: any | null;
   rulesets: any[];
   releases: any[];
+  immutable_releases?: any | null;
   errors: string[];
 }
 
@@ -27,6 +28,7 @@ export interface PlatformAudit {
     deletion_blocked: boolean;
     immutable_release_observed: boolean;
     immutable_release_history: boolean;
+    immutable_releases_enabled: boolean;
     required_checks_source_aligned: boolean;
     strict_checks: boolean;
     administrators_enforced: boolean;
@@ -96,10 +98,14 @@ export function evaluatePlatform(
   const deletionBlocked = snapshot.branch_protection?.allow_deletions?.enabled === false || ruleset.deletion;
   const strictChecks = snapshot.branch_protection?.required_status_checks?.strict === true || ruleset.strict;
   const administratorsEnforced = snapshot.branch_protection?.enforce_admins?.enabled === true;
-  const immutableReleaseHistory = snapshot.releases.length > 0 && snapshot.releases.every((release) => release?.immutable === true);
+  const publishedReleases = snapshot.releases.filter((release) => release?.draft !== true);
+  const immutableReleaseHistory = publishedReleases.length > 0 && publishedReleases.every((release) => release?.immutable === true);
+  const immutableReleasesEnabled = snapshot.immutable_releases?.enabled === true;
   // An empty release history is the valid first-release state; immutability is
-  // verified on the first publication and on every subsequent release.
-  const immutableReleaseObserved = snapshot.releases.length === 0 || immutableReleaseHistory;
+  // verified on the first publication and on every subsequent release. GitHub
+  // only applies the repository setting to future releases, so an enabled
+  // setting is the explicit cutover evidence for legacy mutable releases.
+  const immutableReleaseObserved = publishedReleases.length === 0 || immutableReleaseHistory || immutableReleasesEnabled;
   const contractStatus = {
     quality: qualityContract?.platform_alignment?.status,
     release: releaseContract?.platform_preconditions?.status,
@@ -133,6 +139,7 @@ export function evaluatePlatform(
       deletion_blocked: deletionBlocked,
       immutable_release_observed: immutableReleaseObserved,
       immutable_release_history: immutableReleaseHistory,
+    immutable_releases_enabled: immutableReleasesEnabled,
       required_checks_source_aligned: branchSourceAligned || ruleset.matches,
       strict_checks: strictChecks,
       administrators_enforced: administratorsEnforced || ruleset.matches,
@@ -152,16 +159,29 @@ function ghJson(repository: string, endpoint: string): { ok: true; value: any } 
   try { return { ok: true, value: JSON.parse(new TextDecoder().decode(result.stdout)) }; } catch { return { ok: false }; }
 }
 
+function ghJsonPaged(repository: string, endpoint: string): { ok: true; value: any[] } | { ok: false } {
+  const values: any[] = [];
+  for (let page = 1; page <= 100; page += 1) {
+    const result = ghJson(repository, `${endpoint}?per_page=100&page=${page}`);
+    if (!result.ok || !Array.isArray(result.value)) return { ok: false };
+    values.push(...result.value);
+    if (result.value.length < 100) return { ok: true, value: values };
+  }
+  return { ok: false };
+}
+
 export function auditRepository(repository: string): PlatformAudit {
   const errors: string[] = [];
   const protection = ghJson(repository, "branches/main/protection");
   const signatures = ghJson(repository, "branches/main/protection/required_signatures");
   const rulesets = ghJson(repository, "rulesets?includes_parents=true");
-  const releases = ghJson(repository, "releases?per_page=10");
+  const releases = ghJsonPaged(repository, "releases");
+  const immutableReleases = ghJson(repository, "immutable-releases");
   if (!protection.ok) errors.push("api:branch_protection");
   if (!signatures.ok) errors.push("api:required_signatures");
   if (!rulesets.ok) errors.push("api:rulesets");
   if (!releases.ok) errors.push("api:releases");
+  if (!immutableReleases.ok) errors.push("api:immutable_releases");
   const root = resolve(import.meta.dir, "../../..");
   const qualityContract = JSON.parse(readFileSync(join(root, ".github/quality-gates.json"), "utf8"));
   const releaseContract = JSON.parse(readFileSync(join(root, ".github/release-contract.json"), "utf8"));
@@ -170,6 +190,7 @@ export function auditRepository(repository: string): PlatformAudit {
     required_signatures: signatures.ok ? signatures.value : null,
     rulesets: rulesets.ok && Array.isArray(rulesets.value) ? rulesets.value : [],
     releases: releases.ok && Array.isArray(releases.value) ? releases.value : [],
+    immutable_releases: immutableReleases.ok ? immutableReleases.value : null,
     errors,
   }, qualityContract, releaseContract);
 }

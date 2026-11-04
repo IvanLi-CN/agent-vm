@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	loginBindingCookie = "agent_vm_oidc_binding"
-	maxAgentBodyBytes  = 2 * 1024 * 1024
+	loginBindingCookie       = "agent_vm_oidc_binding"
+	loginBindingCookiePrefix = loginBindingCookie + "_"
+	maxAgentBodyBytes        = 2 * 1024 * 1024
 )
 
 type UnifiedOptions struct {
@@ -122,10 +123,26 @@ func (server *UnifiedServer) browserAPI(c *gin.Context) {
 		server.OIDC.oidcCallback(c)
 		return
 	}
+	if pathValue == "/public/status" {
+		if request.Method != http.MethodGet {
+			writeProblem(c.Writer, newAPIError("invalid_request", "method is not supported", http.StatusMethodNotAllowed, "request_validation", false, ""))
+			return
+		}
+		if server.Authority == nil {
+			writeProblem(c.Writer, newAPIError("authority_unavailable", "management authority is unavailable", http.StatusServiceUnavailable, "internal", true, ""))
+			return
+		}
+		server.Authority.getPublicStatus(c.Writer, request)
+		return
+	}
 	principal, session, authErr := server.sessionFor(request)
 	if pathValue == "/session" && request.Method == http.MethodGet {
 		if authErr != nil {
 			server.writeRejectedProblem(c.Writer, request, pathValue, authErr)
+			return
+		}
+		if !hasAnyCapability(session.Capabilities, []string{"read"}) {
+			server.writeRejectedProblem(c.Writer, request, pathValue, newAPIError("permission_denied", "the administrator capability is required", http.StatusForbidden, "authorization", false, ""))
 			return
 		}
 		server.writeSession(c.Writer, principal, session)
@@ -189,7 +206,7 @@ func isUploadContentPath(method, pathValue string) bool {
 func requiredCapabilities(method, pathValue string) []string {
 	if method == http.MethodGet {
 		switch {
-		case pathValue == "/operations", strings.HasPrefix(pathValue, "/operations/"):
+		case pathValue == "/session", pathValue == "/operations", strings.HasPrefix(pathValue, "/operations/"):
 			return []string{"read"}
 		case pathValue == "/images", strings.HasPrefix(pathValue, "/images/"):
 			return []string{"observe_admin", "manage_images"}

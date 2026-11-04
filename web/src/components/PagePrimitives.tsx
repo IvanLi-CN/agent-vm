@@ -4,7 +4,7 @@ import { formatDateTime } from "../app/format";
 import type { Locale } from "../app/types";
 import { Button, LoadingRows, Panel, StatusBadge } from "./ui";
 
-export function PageIntro({ title, description, observedAt, onRefresh, refreshing }: { title: string; description: string; observedAt?: string; onRefresh?: () => void; refreshing?: boolean }) {
+export function PageIntro({ title, description, observedAt, onRefresh, refreshing }: { title: string; description: string; observedAt?: string | null; onRefresh?: () => void; refreshing?: boolean }) {
   const { t, i18n } = useTranslation();
   const locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   return <div className="page-intro"><div><h1>{title}</h1><p>{description}</p></div>{observedAt || onRefresh ? <div className="intro-meta">{observedAt ? <span>{t("shell.lastUpdated", { time: formatDateTime(observedAt, locale) })}</span> : null}{onRefresh ? <Button variant="ghost" icon={<RefreshCw className={refreshing ? "spin-icon" : ""} />} onClick={onRefresh} disabled={refreshing}>{t("shell.refresh")}</Button> : null}</div> : null}</div>;

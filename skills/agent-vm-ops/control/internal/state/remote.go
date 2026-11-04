@@ -481,7 +481,7 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 			// Confirmation records were added after the first durable auth
 			// schema. Keep an already-complete OIDC/session/Token database
 			// open so EnsureManagementSchema can add this table atomically.
-			if authPresent && key == objectKey("table", "management_confirmations") && !actual[key] {
+			if authPresent && (key == objectKey("table", "management_confirmations") || key == objectKey("table", "oidc_transaction_return_paths")) && !actual[key] {
 				continue
 			}
 			if !actual[key] {
@@ -494,7 +494,7 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 
 func isAuthManagementObject(key string) bool {
 	switch key {
-	case objectKey("table", "oidc_transactions"), objectKey("table", "browser_sessions"), objectKey("table", "agent_tokens"), objectKey("table", "management_confirmations"):
+	case objectKey("table", "oidc_transactions"), objectKey("table", "oidc_transaction_return_paths"), objectKey("table", "browser_sessions"), objectKey("table", "agent_tokens"), objectKey("table", "management_confirmations"):
 		return true
 	default:
 		return false
@@ -701,6 +701,7 @@ func (r *remoteBackend) ensureManagementSchema(ctx context.Context) error {
 		{name: "managed-image-catalog", version: 1},
 		{name: "session-image-binding", version: 1},
 		{name: "management-operation-audit", version: 1},
+		{name: "oidc-return-path", version: 1},
 		{name: "principal-identity", version: 1},
 		{name: "token-revocation", version: 1},
 	} {
@@ -1247,7 +1248,7 @@ func orderedTables(objects []remoteSchemaObject) []string {
 			present[object.Name] = true
 		}
 	}
-	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "managed_image_tombstones", "image_references", "management_operations", "management_audit", "oidc_transactions", "browser_sessions", "agent_tokens", "management_confirmations"}
+	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "managed_image_tombstones", "image_references", "management_operations", "management_audit", "oidc_transactions", "oidc_transaction_return_paths", "browser_sessions", "agent_tokens", "management_confirmations"}
 	values := make([]string, 0, len(present))
 	for _, table := range order {
 		if present[table] {

@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
@@ -32,7 +33,10 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
-const maxManagementJSONBytes = 256 * 1024
+const (
+	maxManagementJSONBytes       = 256 * 1024
+	publicStatusSnapshotCacheTTL = time.Second
+)
 
 var managementFingerprintPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
@@ -55,6 +59,11 @@ type Authority struct {
 	ProductVersion string
 	Clock          func() time.Time
 	uploadMu       sync.Mutex
+	publicStatusMu sync.Mutex
+	publicStatusAt time.Time
+	publicStatusOK bool
+	publicMetrics  map[string]any
+	publicErr      error
 }
 
 func NewAuthority(options AuthorityOptions) (*Authority, error) {
@@ -184,27 +193,9 @@ func (authority *Authority) getOverview(writer http.ResponseWriter, request *htt
 		writeProblem(writer, problemFromError(errors.New("authority_unavailable: lifecycle service is not configured"), "internal", ""))
 		return
 	}
-	if authority.Snapshots == nil {
-		writeProblem(writer, problemFromError(errors.New("observation_unavailable: capacity snapshot is not configured"), "internal", ""))
-		return
-	}
-	raw, err := authority.Snapshots.Read("capacity")
+	metrics, err := authority.readCapacityMetrics()
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "request_validation", ""))
-		return
-	}
-	var envelope map[string]any
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		writeProblem(writer, problemFromError(errors.New("invalid_state: capacity snapshot is invalid"), "internal", ""))
-		return
-	}
-	metrics, ok := envelope["result"].(map[string]any)
-	if !ok {
-		metrics = envelope
-		ok = true
-	}
-	if !ok {
-		writeProblem(writer, newAPIError("invalid_state", "metrics response is invalid", http.StatusInternalServerError, "internal", true, ""))
 		return
 	}
 	overview, err := authority.overview(metrics, request.Context())
@@ -215,6 +206,160 @@ func (authority *Authority) getOverview(writer http.ResponseWriter, request *htt
 	writeJSON(writer, http.StatusOK, overview)
 }
 
+func (authority *Authority) getPublicStatus(writer http.ResponseWriter, request *http.Request) {
+	if err := rejectUnknownQueryKeys(request.URL.Query(), map[string]bool{}); err != nil {
+		writeProblem(writer, invalidRequest(err.Error()))
+		return
+	}
+	metrics, err := authority.readPublicCapacityMetrics()
+	if err != nil {
+		writer.Header().Set("Cache-Control", "public, max-age=15, stale-while-revalidate=45")
+		writeJSON(writer, http.StatusOK, map[string]any{
+			"state": "unknown", "active_sessions": nil, "observed_at": nil,
+			"observation_state": "unverified", "stale_after_seconds": 60,
+		})
+		return
+	}
+
+	now := authority.Clock().UTC()
+	fresh, observationUnverified := capacityObservation(metrics, now)
+	state := "unknown"
+	if fresh {
+		ready := metrics["admission_ready"].(bool)
+		draining := metrics["draining"].(bool)
+		state = "degraded"
+		if ready && !draining {
+			state = "available"
+		}
+		if up, ok := metrics["up"].(bool); !ok || !up {
+			state = "degraded"
+		}
+		if defaultAdmission, ok := metrics["default_admission"].(map[string]any); ok {
+			if ready, ok := defaultAdmission["ready"].(bool); ok && !ready {
+				state = "degraded"
+			}
+		}
+	}
+	taskStatesValid := validTaskStates(metrics["task_states"])
+	if !fresh || !taskStatesValid || observationUnverified {
+		state = "unknown"
+	}
+	activeSessions := any(nil)
+	if fresh && taskStatesValid {
+		activeSessions = int64Value(metricsMapValue(metrics, "task_states", "active"))
+	}
+	observationState := publicObservationStateFromMetrics(metrics, fresh, observationUnverified)
+	if !taskStatesValid {
+		observationState = "unverified"
+	}
+	observedAt := stringValue(metrics["observed_at"])
+	var observed any
+	if observedAt != "" {
+		parsed, err := time.Parse(time.RFC3339Nano, observedAt)
+		if err != nil || parsed.After(now) {
+			observedAt = ""
+		}
+	}
+	if observedAt != "" {
+		observed = observedAt
+	}
+	writer.Header().Set("Cache-Control", "public, max-age=15, stale-while-revalidate=45")
+	writeJSON(writer, http.StatusOK, map[string]any{
+		"state":               state,
+		"active_sessions":     activeSessions,
+		"observed_at":         observed,
+		"observation_state":   observationState,
+		"stale_after_seconds": 60,
+	})
+}
+
+func (authority *Authority) readCapacityMetrics() (map[string]any, error) {
+	if authority.Snapshots == nil {
+		return nil, errors.New("observation_unavailable: capacity snapshot is not configured")
+	}
+	raw, err := authority.Snapshots.Read("capacity")
+	if err != nil {
+		return nil, err
+	}
+	var envelope map[string]any
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return nil, errors.New("invalid_state: capacity snapshot is invalid")
+	}
+	if metrics, ok := envelope["result"].(map[string]any); ok {
+		return metrics, nil
+	}
+	return envelope, nil
+}
+
+func (authority *Authority) readPublicCapacityMetrics() (map[string]any, error) {
+	now := authority.Clock().UTC()
+	authority.publicStatusMu.Lock()
+	defer authority.publicStatusMu.Unlock()
+	if authority.publicStatusOK && now.Sub(authority.publicStatusAt) >= 0 && now.Sub(authority.publicStatusAt) < publicStatusSnapshotCacheTTL {
+		return authority.publicMetrics, authority.publicErr
+	}
+	metrics, err := authority.readCapacityMetrics()
+	authority.publicStatusAt = now
+	authority.publicStatusOK = true
+	authority.publicMetrics = metrics
+	authority.publicErr = err
+	return metrics, err
+}
+
+func publicObservationStateFromMetrics(metrics map[string]any, fresh, unverified bool) string {
+	if unverified {
+		return "unverified"
+	}
+	if !fresh {
+		return "stale"
+	}
+	return sourceState(metrics["up"])
+}
+
+func capacityObservation(metrics map[string]any, now time.Time) (fresh, unverified bool) {
+	observedAt := stringValue(metrics["observed_at"])
+	observedTime, parseErr := time.Parse(time.RFC3339Nano, observedAt)
+	if observedAt == "" || parseErr != nil || observedTime.After(now) {
+		return false, true
+	}
+	if now.Sub(observedTime) > 60*time.Second {
+		return false, false
+	}
+	if _, ok := metrics["up"].(bool); !ok || !validTaskStates(metrics["task_states"]) || !validAdmissionObservation(metrics) || !validObservationConsistency(metrics) {
+		return false, true
+	}
+	return true, false
+}
+
+func validAdmissionObservation(metrics map[string]any) bool {
+	if _, ok := metrics["admission_ready"].(bool); !ok {
+		return false
+	}
+	if _, ok := metrics["draining"].(bool); !ok {
+		return false
+	}
+	defaultAdmission, ok := metrics["default_admission"].(map[string]any)
+	if !ok {
+		return false
+	}
+	if _, ok := defaultAdmission["ready"].(bool); !ok {
+		return false
+	}
+	return true
+}
+
+func validObservationConsistency(metrics map[string]any) bool {
+	consistent, ok := metrics["observation_consistent"].(bool)
+	return ok && consistent
+}
+
+func nativeObservationState(value any, fresh, unverified bool) string {
+	if unverified {
+		return "unverified"
+	}
+	return sourceStateWithFreshness(value, fresh)
+}
+
 func (authority *Authority) overview(metrics map[string]any, ctx context.Context) (map[string]any, error) {
 	epoch, err := authority.Store.StateEpoch(ctx)
 	if err != nil {
@@ -222,43 +367,55 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	}
 	now := authority.Clock().UTC()
 	observedAt := stringValue(metrics["observed_at"])
-	observedTime, parseErr := time.Parse(time.RFC3339Nano, observedAt)
-	fresh := observedAt != "" && parseErr == nil && !observedTime.After(now.Add(5*time.Second)) && now.Sub(observedTime) <= 60*time.Second
-	if observedAt == "" {
-		observedAt = now.Format(time.RFC3339Nano)
+	parsedObservedAt, parseErr := time.Parse(time.RFC3339Nano, observedAt)
+	observedAtValid := observedAt != "" && parseErr == nil && !parsedObservedAt.After(now)
+	fresh, observationUnverified := capacityObservation(metrics, now)
+	fieldObservedAt := observedAt
+	fieldVerified := observedAtValid && !observationUnverified
+	if !fieldVerified {
+		fieldObservedAt = ""
+	}
+	verifiedValue := func(value any) any {
+		if !fieldVerified {
+			return nil
+		}
+		return value
 	}
 	resources, _ := metrics["resources"].(map[string]any)
 	remaining, _ := resources["remaining"].(map[string]any)
 	ctCPU, _ := metrics["ct_cpu"].(map[string]any)
 	startupBlocked := nestedBool(metrics, "ct_cpu", "startup_pressure", "startup_blocked")
 	capacity := map[string]any{
-		"logical_cpu_remaining_vcpu": observedNumber(numberValue(remaining["cpu"]), observedAt, fresh),
-		"ct_cpu_capacity_vcpu":       observedNumber(numberValue(ctCPU["capacity_vcpu"]), observedAt, fresh),
-		"logical_memory_remaining":   observedBytes(decimalBytes(numberValue(remaining["memory_mib"]), 1024*1024), observedAt, fresh),
-		"ct_memory_available":        observedBytes(nil, observedAt, fresh),
+		"logical_cpu_remaining_vcpu": observedNumber(verifiedValue(numberValue(remaining["cpu"])), fieldObservedAt, fresh),
+		"ct_cpu_capacity_vcpu":       observedNumber(verifiedValue(numberValue(ctCPU["capacity_vcpu"])), fieldObservedAt, fresh),
+		"logical_memory_remaining":   observedBytes(verifiedValue(decimalBytes(numberValue(remaining["memory_mib"]), 1024*1024)), fieldObservedAt, fresh),
+		"ct_memory_available":        observedBytes(nil, fieldObservedAt, fresh),
 		// The logical admission budget is not physical disk telemetry. Keep the
 		// physical field unverified until the native snapshot supplies it.
-		"physical_disk_available": observedBytes(nil, observedAt, fresh),
+		"physical_disk_available": observedBytes(nil, fieldObservedAt, fresh),
 	}
 	pressure := map[string]any{
-		"cpu_some_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "some", "avg10"), observedAt, fresh),
-		"cpu_full_avg10":                         observedNumber(nestedNumber(resources, "cpu_pressure", "full", "avg10"), observedAt, fresh),
-		"cpu_startup_pressure_threshold_percent": observedNumber(nestedNumber(resources, "policy", "cpu_startup_pressure_full_avg10_percent"), observedAt, fresh),
-		"cpu_startup_blocked":                    observedBoolean(startupBlocked, observedAt, fresh),
-		"memory_pressure":                        observedBoolean(nil, observedAt, fresh),
+		"cpu_some_avg10":                         observedNumber(verifiedValue(nestedNumber(resources, "cpu_pressure", "some", "avg10")), fieldObservedAt, fresh),
+		"cpu_full_avg10":                         observedNumber(verifiedValue(nestedNumber(resources, "cpu_pressure", "full", "avg10")), fieldObservedAt, fresh),
+		"cpu_startup_pressure_threshold_percent": observedNumber(verifiedValue(nestedNumber(resources, "policy", "cpu_startup_pressure_full_avg10_percent")), fieldObservedAt, fresh),
+		"cpu_startup_blocked":                    observedBoolean(verifiedValue(startupBlocked), fieldObservedAt, fresh),
+		"memory_pressure":                        observedBoolean(nil, fieldObservedAt, fresh),
 	}
 	var admissionReady, draining any
 	admissionBlocked := false
 	if fresh {
-		admissionReady, _ = metrics["admission_ready"].(bool)
-		draining, _ = metrics["draining"].(bool)
-		if value, ok := draining.(bool); ok && value {
+		admissionReady = metrics["admission_ready"].(bool)
+		draining = metrics["draining"].(bool)
+		if draining.(bool) {
 			admissionBlocked = true
 		}
 	}
 	reasons := []string{}
 	if !fresh {
 		reasons = append(reasons, "observation_stale")
+	}
+	if observationUnverified {
+		reasons = append(reasons, "observation_unverified")
 	}
 	if defaultAdmission, ok := metrics["default_admission"].(map[string]any); ok {
 		if ready, ok := defaultAdmission["ready"].(bool); ok && !ready {
@@ -321,21 +478,27 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	if native, ok := metrics["up"].(bool); !ok || !native {
 		nativeUnavailable = true
 	}
-	if !fresh {
+	if observationUnverified {
+		nativeSafeCode = "observation_unverified"
+	} else if !fresh {
 		nativeSafeCode = "observation_stale"
 	} else if nativeUnavailable {
 		nativeSafeCode = "native_unavailable"
 	}
+	var nativeObservedAt any
+	if observedAtValid {
+		nativeObservedAt = observedAt
+	}
 	return map[string]any{
 		"resource_version": epoch,
-		"observed_at":      observedAt,
+		"observed_at":      nativeObservedAt,
 		"admission":        map[string]any{"ready": admissionReady, "draining": draining, "reasons": reasons},
 		"capacity":         capacity,
 		"pressure":         pressure,
 		"task_counts":      states,
 		"sources": []any{
 			map[string]any{"name": "durable_state", "state": durableState, "observed_at": durableObservedAt, "stale_after_seconds": 60, "safe_code": nil},
-			map[string]any{"name": "native", "state": sourceStateWithFreshness(metrics["up"], fresh), "observed_at": observedAt, "stale_after_seconds": 60, "safe_code": nativeSafeCode},
+			map[string]any{"name": "native", "state": nativeObservationState(metrics["up"], fresh, observationUnverified), "observed_at": nativeObservedAt, "stale_after_seconds": 60, "safe_code": nativeSafeCode},
 		},
 	}, nil
 }
@@ -2175,8 +2338,8 @@ func safeOperationError(value map[string]any, operationID, fallbackPhase string)
 }
 
 func auditValue(value state.ManagementAudit) map[string]any {
-	var operationID any
-	if value.OperationID != nil {
+	operationID := legacyAuditOperationID(value)
+	if value.OperationID != nil && ensureOperationID(*value.OperationID) == nil {
 		operationID = *value.OperationID
 	}
 	phase := value.Phase
@@ -2197,6 +2360,11 @@ func auditValue(value state.ManagementAudit) map[string]any {
 		result["safe_code"] = nil
 	}
 	return result
+}
+
+func legacyAuditOperationID(value state.ManagementAudit) string {
+	seed := strings.Join([]string{value.EventID, value.Action, value.Actor, value.Outcome, value.Phase, value.OccurredAt}, "\x00")
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("agent-vm:legacy-audit:"+seed)).String()
 }
 
 func actorValue(value string) any {
@@ -2307,6 +2475,70 @@ func metricsMapValue(root map[string]any, first, second string) any {
 		return value[second]
 	}
 	return nil
+}
+
+func validTaskStates(value any) bool {
+	const expectedStateCount = 7
+	expectedStates := map[string]struct{}{
+		"active": {}, "preparing": {}, "cached": {}, "closing": {},
+		"deleting": {}, "failed": {}, "absent": {},
+	}
+	switch states := value.(type) {
+	case map[string]any:
+		if len(states) != expectedStateCount {
+			return false
+		}
+		for _, raw := range states {
+			if _, ok := nonNegativeInt64(raw); !ok {
+				return false
+			}
+		}
+		for name := range states {
+			if _, ok := expectedStates[name]; !ok {
+				return false
+			}
+		}
+		return true
+	case map[string]int64:
+		if len(states) != expectedStateCount {
+			return false
+		}
+		for _, raw := range states {
+			if raw < 0 {
+				return false
+			}
+		}
+		for name := range states {
+			if _, ok := expectedStates[name]; !ok {
+				return false
+			}
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func nonNegativeInt64(value any) (int64, bool) {
+	if value == nil {
+		return 0, false
+	}
+	switch parsed := value.(type) {
+	case int64:
+		return parsed, parsed >= 0
+	case int:
+		return int64(parsed), parsed >= 0
+	case json.Number:
+		result, err := parsed.Int64()
+		return result, err == nil && result >= 0
+	case float64:
+		if parsed < 0 || parsed != math.Trunc(parsed) || parsed >= float64(math.MaxInt64) {
+			return 0, false
+		}
+		return int64(parsed), true
+	default:
+		return 0, false
+	}
 }
 
 func int64Value(value any) int64 {

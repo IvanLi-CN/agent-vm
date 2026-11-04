@@ -19,6 +19,7 @@ type OIDCTransaction struct {
 	BindingCookieDigest string
 	ClientID            string
 	RedirectURI         string
+	ReturnTo            string
 	CreatedAt           string
 	ExpiresAt           string
 	ConsumedAt          *string
@@ -83,6 +84,14 @@ func (s *Store) InsertOIDCTransaction(ctx context.Context, value OIDCTransaction
 	return s.withWrite(ctx, func(tx *Tx) error {
 		_, err := tx.exec(`INSERT INTO oidc_transactions(transaction_id, state_digest, nonce_digest, code_verifier_sealed, binding_cookie_digest, client_id, redirect_uri, created_at, expires_at, consumed_at)
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`, value.TransactionID, value.StateDigest, value.NonceDigest, value.CodeVerifierSealed, value.BindingCookieDigest, value.ClientID, value.RedirectURI, value.CreatedAt, value.ExpiresAt)
+		if err != nil {
+			return err
+		}
+		returnTo := value.ReturnTo
+		if returnTo == "" {
+			returnTo = "/"
+		}
+		_, err = tx.exec(`INSERT INTO oidc_transaction_return_paths(state_digest, return_to) VALUES(?, ?)`, value.StateDigest, returnTo)
 		return err
 	})
 }
@@ -93,7 +102,7 @@ func (s *Store) GetOIDCTransaction(ctx context.Context, stateDigest string) (*OI
 	}
 	var value *OIDCTransaction
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
-		candidate, err := scanOIDCTransaction(conn.QueryRowContext(ctx, `SELECT transaction_id, state_digest, nonce_digest, code_verifier_sealed, binding_cookie_digest, client_id, redirect_uri, created_at, expires_at, consumed_at FROM oidc_transactions WHERE state_digest = ?`, stateDigest))
+		candidate, err := scanOIDCTransaction(conn.QueryRowContext(ctx, oidcTransactionQuery+` WHERE t.state_digest = ?`, stateDigest))
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -118,7 +127,7 @@ func (s *Store) ConsumeOIDCTransaction(ctx context.Context, stateDigest, now str
 		// from the previous speculative attempt before reading the mirror again.
 		value = nil
 		consumed = false
-		candidate, err := scanOIDCTransaction(tx.conn.QueryRowContext(ctx, `SELECT transaction_id, state_digest, nonce_digest, code_verifier_sealed, binding_cookie_digest, client_id, redirect_uri, created_at, expires_at, consumed_at FROM oidc_transactions WHERE state_digest = ?`, stateDigest))
+		candidate, err := scanOIDCTransaction(tx.conn.QueryRowContext(ctx, oidcTransactionQuery+` WHERE t.state_digest = ?`, stateDigest))
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
@@ -139,6 +148,9 @@ func (s *Store) ConsumeOIDCTransaction(ctx context.Context, stateDigest, now str
 		}
 		if changed != 1 {
 			return nil
+		}
+		if _, err := tx.exec(`DELETE FROM oidc_transaction_return_paths WHERE state_digest = ?`, stateDigest); err != nil {
+			return err
 		}
 		consumedAt := now
 		value.ConsumedAt = &consumedAt
@@ -655,15 +667,20 @@ VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, operation.OperationID, operation
 	return &operation, value, changed, nil
 }
 
+const oidcTransactionQuery = `SELECT t.transaction_id, t.state_digest, t.nonce_digest, t.code_verifier_sealed, t.binding_cookie_digest, t.client_id, t.redirect_uri, t.created_at, t.expires_at, t.consumed_at, COALESCE(r.return_to, '/') FROM oidc_transactions t LEFT JOIN oidc_transaction_return_paths r ON r.state_digest = t.state_digest`
+
 const agentTokenSelect = `SELECT token_id, token_digest, operation_id, request_digest, issuer, subject, scopes_json, created_at, expires_at, resource_version, revoked_at, plaintext_disclosure FROM agent_tokens`
 
 func scanOIDCTransaction(row scanner) (*OIDCTransaction, error) {
 	var value OIDCTransaction
 	var consumed sql.NullString
-	if err := row.Scan(&value.TransactionID, &value.StateDigest, &value.NonceDigest, &value.CodeVerifierSealed, &value.BindingCookieDigest, &value.ClientID, &value.RedirectURI, &value.CreatedAt, &value.ExpiresAt, &consumed); err != nil {
+	if err := row.Scan(&value.TransactionID, &value.StateDigest, &value.NonceDigest, &value.CodeVerifierSealed, &value.BindingCookieDigest, &value.ClientID, &value.RedirectURI, &value.CreatedAt, &value.ExpiresAt, &consumed, &value.ReturnTo); err != nil {
 		return nil, err
 	}
 	value.ConsumedAt = nullableString(consumed)
+	if value.ReturnTo == "" {
+		value.ReturnTo = "/"
+	}
 	return &value, nil
 }
 

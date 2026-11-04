@@ -43,14 +43,14 @@ func (metrics *Metrics) Render() string {
 	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		observation := metrics.latest.Sources[source]
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_up{source=%s} %d\n", quote(source), boolInt(observation.Up)))
-		fresh := observation.Up && !observation.ObservedAt.IsZero() && !observation.FreshUntil.IsZero() && now.Before(observation.FreshUntil)
+		fresh := sourceObservationFresh(metrics.latest, source, now)
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_fresh{source=%s} %d\n", quote(source), boolInt(fresh)))
 	}
 	output.WriteString("# HELP agent_vm_deployd_observation_timestamp_seconds Unix timestamp of the composed observation.\n")
 	output.WriteString("# TYPE agent_vm_deployd_observation_timestamp_seconds gauge\n")
 	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		observation := metrics.latest.Sources[source]
-		if !observation.ObservedAt.IsZero() {
+		if !observation.ObservedAt.IsZero() && !observation.ObservedAt.After(now) {
 			output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_timestamp_seconds{source=%s} %d\n", quote(source), observation.ObservedAt.Unix()))
 		}
 	}
@@ -65,6 +65,7 @@ func (metrics *Metrics) Render() string {
 			output.WriteString(fmt.Sprintf("agent_vm_deployd_active_slot{slot=%s} %d\n", quote(slot), value))
 		}
 	}
+	capacityMetricsFresh := sourceObservationFresh(metrics.latest, "native_observation", now)
 	output.WriteString("# HELP agent_vm_deployd_slot_process_up Whether a slot control process responded.\n")
 	output.WriteString("# TYPE agent_vm_deployd_slot_process_up gauge\n")
 	output.WriteString("# HELP agent_vm_deployd_slot_ready Whether a slot is ready for its assigned role.\n")
@@ -89,6 +90,11 @@ func (metrics *Metrics) Render() string {
 			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_selected{slot=%s} %d\n", quote(slot), boolInt(metrics.latest.ActiveSlot == slot)))
 			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_controller_owned{slot=%s} %d\n", quote(slot), boolInt(observation.ControllerOwned)))
 			output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_traffic_accepting{slot=%s} %d\n", quote(slot), boolInt(observation.TrafficAccepting)))
+		}
+	}
+	if capacityMetricsFresh {
+		for _, slot := range []string{"blue", "green"} {
+			observation := metrics.latest.Slots[slot]
 			if observation.CountersKnown {
 				output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_in_flight_requests{slot=%s} %d\n", quote(slot), observation.InFlightRequests))
 				output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_pending_operations{slot=%s} %d\n", quote(slot), observation.PendingOperations))
@@ -163,19 +169,20 @@ func withSlotLabel(content, slot string) string {
 func quote(value string) string { return strconv.Quote(value) }
 
 func composedSnapshotFresh(snapshot RuntimeSnapshot, now time.Time) bool {
-	if !snapshot.Consistent || (snapshot.ActiveSlot != "blue" && snapshot.ActiveSlot != "green") || snapshot.ObservedAt.IsZero() || snapshot.FreshUntil.IsZero() || !snapshot.FreshUntil.After(now) {
+	if !snapshot.Consistent || (snapshot.ActiveSlot != "blue" && snapshot.ActiveSlot != "green") || snapshot.ObservedAt.IsZero() || snapshot.ObservedAt.After(now) || snapshot.FreshUntil.IsZero() || !snapshot.FreshUntil.After(now) {
 		return false
 	}
 	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
-		source, ok := snapshot.Sources[name]
-		if !ok || !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) {
-			return false
-		}
-		if source.FreshUntil.IsZero() || !source.FreshUntil.After(now) {
+		if !sourceObservationFresh(snapshot, name, now) {
 			return false
 		}
 	}
 	return true
+}
+
+func sourceObservationFresh(snapshot RuntimeSnapshot, name string, now time.Time) bool {
+	source, ok := snapshot.Sources[name]
+	return ok && source.Up && !source.ObservedAt.IsZero() && !source.ObservedAt.After(now) && !source.FreshUntil.IsZero() && source.FreshUntil.After(now)
 }
 
 func boolInt(value bool) int {

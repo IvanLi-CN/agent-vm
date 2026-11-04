@@ -2,7 +2,7 @@ import { QueryClient } from "@tanstack/react-query";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import "./i18n";
+import i18n from "./i18n";
 import { App } from "./App";
 
 function renderApp() {
@@ -25,10 +25,14 @@ describe("management console workflow", () => {
   it("switches language without removing the current page", async () => {
     const user = userEvent.setup();
     window.history.replaceState({}, "", "/");
+    await i18n.changeLanguage("zh-CN");
     renderApp();
     expect(await screen.findByTestId("overview-page")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "EN" }));
     expect(await screen.findByRole("heading", { name: "Overview" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "EN" })).toHaveAttribute("aria-pressed", "true");
+    expect(document.documentElement.lang).toBe("en");
+    expect(document.title).toBe("Agent VM · Management desk");
   });
 
   it("moves focus into a controlled action and returns it to the trigger", async () => {

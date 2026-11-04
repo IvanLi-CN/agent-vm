@@ -27,6 +27,8 @@ const target = option("--target");
 const reservation = option("--reservation");
 const stateRoot = resolve(option("--state-root") ?? "release-state");
 const repositoryRoot = resolve(import.meta.dir, "../../..");
+const releasePolicyFiles = [".github/quality-gates.json", ".github/release-contract.json", ".github/release-failure-notification.json"] as const;
+const releaseGateNames = ["Main gate (macos-latest)", "Main gate (ubuntu-latest)"] as const;
 
 function requireOption(name: string): string {
   const value = option(name);
@@ -49,8 +51,16 @@ export function releaseBuilderCommand(version: string, source: string, targetNam
   ];
 }
 
+export function releaseBuilderEnvironment(environment: Record<string, string | undefined>): Record<string, string | undefined> {
+  const sanitized = { ...environment };
+  delete sanitized.GH_TOKEN;
+  delete sanitized.GITHUB_TOKEN;
+  delete sanitized.RELEASE_PLATFORM_TOKEN;
+  return sanitized;
+}
+
 function runBuilder(version: string, source: string, targetName: string, output: string): void {
-  const result = Bun.spawnSync(releaseBuilderCommand(version, source, targetName, output), { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+  const result = Bun.spawnSync(releaseBuilderCommand(version, source, targetName, output), { cwd: repositoryRoot, env: releaseBuilderEnvironment(process.env), stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr).trim() || "product package build failed");
 }
 
@@ -75,9 +85,7 @@ export function assertPlatformPreconditions(root = repositoryRoot): void {
   const release = JSON.parse(readFileSync(join(root, ".github/release-contract.json"), "utf8"));
   assertContractPreconditions(quality, release);
   if (process.env.GITHUB_ACTIONS === "true") {
-    // The Actions token cannot read administrator-only protection endpoints.
     assertWorkflowPlatformAttestation(process.env.GITHUB_REF, process.env.RELEASE_REF_PROTECTED);
-    return;
   }
   const repository = process.env.GITHUB_REPOSITORY;
   if (!repository) throw new Error("GITHUB_REPOSITORY is required for the live platform preflight");
@@ -87,11 +95,40 @@ export function assertPlatformPreconditions(root = repositoryRoot): void {
 
 export function successfulMainGate(value: unknown): { id: string } {
   if (!Array.isArray(value)) throw new Error("GitHub check-runs response is invalid");
-  const checks = value.filter((item: any) => item?.name === "Main gate" || /^Main gate \(.+\)$/.test(item?.name ?? ""));
-  if (checks.length === 0 || checks.some((item: any) => item.status !== "completed" || item.conclusion !== "success")) {
-    throw new Error("the fixed Main gate has not completed successfully for the source commit");
+  const namedChecks = value.filter((item: any) => releaseGateNames.includes(item?.name));
+  const suites = new Map<string, any[]>();
+  for (const item of namedChecks) {
+    const suiteId = item?.check_suite?.id;
+    if (typeof suiteId !== "string" && typeof suiteId !== "number") continue;
+    const key = String(suiteId);
+    suites.set(key, [...(suites.get(key) ?? []), item]);
   }
-  return { id: checks.map((item: any) => String(item.id ?? item.name)).sort().join(",") };
+  const timestamp = (item: any): number => {
+    const values = [item?.check_suite?.updated_at, item?.completed_at, item?.updated_at, item?.started_at, item?.check_suite?.created_at]
+      .map((value) => typeof value === "string" ? Date.parse(value) : Number.NaN)
+      .filter((value) => Number.isFinite(value));
+    if (values.length) return Math.max(...values);
+    const suiteId = Number(item?.check_suite?.id);
+    return Number.isFinite(suiteId) ? suiteId : 0;
+  };
+  const latestSuite = [...suites.entries()].sort((left, right) => {
+    const leftTimestamp = Math.max(...left[1].map(timestamp));
+    const rightTimestamp = Math.max(...right[1].map(timestamp));
+    return rightTimestamp - leftTimestamp || right[0].localeCompare(left[0], undefined, { numeric: true });
+  })[0]?.[1] ?? [];
+  const checks = new Map<string, any>();
+  for (const item of latestSuite) {
+    const existing = checks.get(item.name);
+    if (!existing || timestamp(item) >= timestamp(existing)) checks.set(item.name, item);
+  }
+  if (checks.size !== releaseGateNames.length || [...checks.values()].some((item: any) => item.status !== "completed" || item.conclusion !== "success" || item.app?.slug !== "github-actions")) {
+    throw new Error("the required Main gate matrix has not completed successfully for the source commit");
+  }
+  return { id: releaseGateNames.map((name) => String(checks.get(name)?.id ?? name)).sort().join(",") };
+}
+
+function currentPolicyRevision(): string {
+  return policyRevision(releasePolicyFiles.map((path) => readFileSync(join(repositoryRoot, path), "utf8")).join("\n"));
 }
 
 function mergedSourcePull(value: unknown, source: string): { number: string; head: string } {
@@ -130,8 +167,12 @@ export function verifyReleaseView(value: unknown, tag: string, expectedDraft: bo
   if (release.tagName !== tag || release.isDraft !== expectedDraft || !Array.isArray(release.assets)) throw new Error("GitHub release identity or draft state is invalid");
   if (source !== undefined && release.targetCommitish !== source) throw new Error(`GitHub release target is not bound to ${source}`);
   if (!expectedDraft && release.isPrerelease === true) throw new Error("published GitHub release is a prerelease");
+  if (!expectedDraft && release.immutable !== true) throw new Error("published GitHub release is not immutable");
   const names = new Set(release.assets.flatMap((item: any) => typeof item?.name === "string" ? [item.name] : []));
-  for (const name of Object.keys(assets)) if (!names.has(name)) throw new Error(`GitHub release is missing asset: ${name}`);
+  const expectedNames = new Set(Object.keys(assets));
+  if (names.size !== expectedNames.size || names.size !== release.assets.length || [...names].some((name) => !expectedNames.has(name))) {
+    throw new Error("GitHub release assets do not exactly match the frozen asset set");
+  }
   return release;
 }
 
@@ -186,8 +227,7 @@ async function release(): Promise<void> {
   const sourcePull = mergedSourcePull(await adapter.sourcePulls(source), source);
   const verification = await adapter.json<{ commit?: { verification?: { verified?: boolean } } }>(["api", `repos/${adapter.repository}/commits/${source}`]);
   if (verification.commit?.verification?.verified !== true) throw new Error("source commit signature is not verified");
-  const policyFiles = [".github/quality-gates.json", ".github/release-contract.json", ".github/release-failure-notification.json"];
-  const policyText = policyFiles.map((path) => readFileSync(join(repositoryRoot, path), "utf8")).join("\n");
+  const policyRevisionValue = currentPolicyRevision();
   const baseline = latestFinalEvent(completed);
   if (baseline) {
     const comparison = await adapter.compare(baseline.identity.source_revision, source);
@@ -206,7 +246,7 @@ async function release(): Promise<void> {
     source_pr: sourcePull.number,
     source_pr_head: sourcePull.head,
     signed_commit: true,
-    policy_revision: policyRevision(policyText),
+    policy_revision: policyRevisionValue,
     artifacts: {},
   };
   const claimed = await store.claim(identity);
@@ -256,6 +296,19 @@ async function recover(): Promise<void> {
   }
   if (current.stage === "abandoned" || current.stage === "claimed") throw new Error(`reservation at ${current.stage} cannot be recovered without frozen assets`);
 
+  assertPlatformPreconditions();
+  const currentMainHead = await adapter.mainHead();
+  if (process.env.GITHUB_SHA && process.env.GITHUB_SHA !== currentMainHead) throw new Error("GitHub recovery ref moved after source preflight");
+  if (currentMainHead !== current.identity.source_revision) throw new Error("recovery protected main head no longer matches the reserved source revision");
+  const source = current.identity.source_revision;
+  const gate = successfulMainGate(await adapter.commitChecks(source));
+  if (gate.id !== current.identity.main_gate) throw new Error("recovery Main gate identity no longer matches the reservation");
+  const sourcePull = mergedSourcePull(await adapter.sourcePulls(source), source);
+  if (sourcePull.number !== current.identity.source_pr || sourcePull.head !== current.identity.source_pr_head) throw new Error("recovery source pull identity no longer matches the reservation");
+  const verification = await adapter.json<{ commit?: { verification?: { verified?: boolean } } }>(["api", `repos/${adapter.repository}/commits/${source}`]);
+  if (verification.commit?.verification?.verified !== true) throw new Error("recovery source commit signature is not verified");
+  if (currentPolicyRevision() !== current.identity.policy_revision) throw new Error("recovery policy revision no longer matches the reservation");
+
   const frozen = frozenDetails(current);
   const { artifacts, assets } = frozen;
   const tag = String(current.detail?.tag ?? `v${version}`);
@@ -268,7 +321,6 @@ async function recover(): Promise<void> {
       /* the draft may not have been created before interruption */
     }
     if (!existing) {
-      assertPlatformPreconditions();
       for (const path of Object.values(assets)) if (!existsSync(path)) throw new Error(`recovery is missing frozen asset: ${path}`);
       await assertTagIsAbsentOrBound(adapter, tag, current.identity.source_revision);
       await adapter.createDraft(tag, current.identity.source_revision, Object.values(assets), `Agent VM ${version}`, `Recovered product release ${version} from ${current.identity.source_revision}.`);
@@ -282,8 +334,7 @@ async function recover(): Promise<void> {
   if (current.stage === "draft") {
     const view = await adapter.viewRelease(tag) as { isDraft?: boolean };
     if (view.isDraft === true) {
-      verifyReleaseView(view, tag, true, assets);
-      assertPlatformPreconditions();
+      verifyReleaseView(view, tag, true, assets, current.identity.source_revision);
       await adapter.publish(tag);
     } else {
       verifyReleaseView(view, tag, false, assets);
@@ -304,6 +355,7 @@ async function main(): Promise<void> {
   if (operation === "release") return release();
   const version = requireOption("--reservation");
   if (operation === "abandon") {
+    assertPlatformPreconditions();
     const adapter = new GhGithubAdapter();
     const event = await stateStore(adapter).abandon(version, "manual release recovery abandon");
     console.log(JSON.stringify({ stage: event.stage, version }));

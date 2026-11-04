@@ -18,9 +18,14 @@ func TestOIDCTransactionIsConsumedExactlyOnce(t *testing.T) {
 	if err := store.InsertOIDCTransaction(ctx, OIDCTransaction{
 		TransactionID: "transaction-1", StateDigest: strings.Repeat("a", 64), NonceDigest: strings.Repeat("b", 64),
 		CodeVerifierSealed: "sealed", BindingCookieDigest: strings.Repeat("c", 64), ClientID: "client", RedirectURI: "https://console.example/api/v1/auth/oidc/callback",
+		ReturnTo:  "/vms",
 		CreatedAt: "2026-10-30T00:00:00Z", ExpiresAt: "2026-10-30T00:05:00Z",
 	}); err != nil {
 		t.Fatal(err)
+	}
+	loaded, err := store.GetOIDCTransaction(ctx, strings.Repeat("a", 64))
+	if err != nil || loaded == nil || loaded.ReturnTo != "/vms" {
+		t.Fatalf("loaded OIDC return path = %#v, err=%v", loaded, err)
 	}
 	var wait sync.WaitGroup
 	var mu sync.Mutex
@@ -44,6 +49,30 @@ func TestOIDCTransactionIsConsumedExactlyOnce(t *testing.T) {
 	wait.Wait()
 	if consumed != 1 {
 		t.Fatalf("successful OIDC consumers = %d, want 1", consumed)
+	}
+	loaded, err = store.GetOIDCTransaction(ctx, strings.Repeat("a", 64))
+	if err != nil || loaded == nil || loaded.ReturnTo != "/" {
+		t.Fatalf("consumed OIDC fallback return path = %#v, err=%v", loaded, err)
+	}
+}
+
+func TestOIDCTransactionDefaultsReturnPathForLegacyRows(t *testing.T) {
+	store, err := OpenForTest(t.TempDir() + "/state.sqlite3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.InsertOIDCTransaction(ctx, OIDCTransaction{
+		TransactionID: "transaction-legacy", StateDigest: strings.Repeat("d", 64), NonceDigest: strings.Repeat("e", 64),
+		CodeVerifierSealed: "sealed", BindingCookieDigest: strings.Repeat("f", 64), ClientID: "client", RedirectURI: "https://console.example/api/v1/auth/oidc/callback",
+		CreatedAt: "2026-10-30T00:00:00Z", ExpiresAt: "2026-10-30T00:05:00Z",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	value, err := store.GetOIDCTransaction(ctx, strings.Repeat("d", 64))
+	if err != nil || value == nil || value.ReturnTo != "/" {
+		t.Fatalf("legacy OIDC return path = %#v, err=%v", value, err)
 	}
 }
 

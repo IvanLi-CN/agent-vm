@@ -16,6 +16,8 @@ on:
 permissions:
   contents: write
   actions: read
+  checks: read
+  pull-requests: read
 
 concurrency:
   # queue: max; recovery shares the product release namespace and is non-preemptive.
@@ -33,11 +35,15 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
+      - name: Require platform audit credential
+        env:
+          RELEASE_PLATFORM_TOKEN: ${{ secrets.RELEASE_PLATFORM_TOKEN }}
+        run: test -n "$RELEASE_PLATFORM_TOKEN" || { echo "RELEASE_PLATFORM_TOKEN secret is required for protected-platform audit" >&2; exit 1; }
       - name: Install locked Bun dependencies
         run: bun install --frozen-lockfile
       - name: Retrieve reservation state from a prior release run
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLATFORM_TOKEN }}
           RESERVATION: ${{ inputs.reservation }}
         run: |
           set -eu
@@ -46,7 +52,7 @@ jobs:
           fi
           mkdir -p .recovery
           found=""
-          for run_id in $(gh run list --workflow Release --limit 50 --json databaseId --jq '.[].databaseId'); do
+          for run_id in $(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?per_page=100" --jq '.workflow_runs[].id'); do
             run_root=".recovery/${run_id}"
             mkdir -p "$run_root"
             gh run download "$run_id" --name "release-state-${run_id}" --dir "$run_root" || true
@@ -63,6 +69,6 @@ jobs:
           fi
       - name: Apply recovery operation
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.RELEASE_PLATFORM_TOKEN }}
           RELEASE_REF_PROTECTED: ${{ github.ref_protected }}
         run: bun run skills/agent-vm-ops/scripts/release.ts --operation "${{ inputs.operation }}" --reservation "${{ inputs.reservation }}"
