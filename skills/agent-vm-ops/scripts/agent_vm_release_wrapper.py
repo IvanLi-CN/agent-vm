@@ -27,6 +27,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import uuid
 from typing import Any, Mapping
 
 
@@ -1444,6 +1445,41 @@ def _wait_for_deployd_ready() -> None:
         time.sleep(DEPLOYD_READY_POLL_SECONDS)
 
 
+def _release_initial_migration_drain(config: Mapping[str, Any]) -> None:
+    """Release the one-time migration fence after both slots are running."""
+    marker = _read_migration_marker(config)
+    if marker is None or not ID_RE.fullmatch(marker["transaction_id"]):
+        _fail("activation_unverified", "initial migration fence identity is invalid")
+    request = {
+        "protocol": 4,
+        "action": "drain-exit",
+        "session_id": "release-agent-vm-migration-" + marker["transaction_id"],
+        "generation": 0,
+        "operation_id": "release-migration-drain-exit-" + uuid.uuid4().hex,
+        "preserve_traffic": False,
+    }
+    try:
+        process = subprocess.run(
+            [str(GO_CONTROL_PATH), "request", "--socket", str(GO_ACTIVE_SOCKET), "--timeout", "30s"],
+            input=json.dumps(request).encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            timeout=35,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        _fail("activation_unverified", "initial migration fence release could not be verified")
+    try:
+        response = json.loads(process.stdout)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        _fail("activation_unverified", "initial migration fence response is invalid")
+    if process.returncode != 0 or not isinstance(response, Mapping) or response.get("ok") is not True:
+        _fail("activation_unverified", "initial migration fence release was rejected")
+    result = response.get("result")
+    if not isinstance(result, Mapping) or result.get("draining") is not False:
+        _fail("activation_unverified", "initial migration fence release was not confirmed")
+
+
 def _needs_migration_recovery(expected_transaction_id: str | None = None) -> str | None:
     process = _run_deployd_cli("status", timeout_seconds=30)
     if process.returncode != 0:
@@ -1622,6 +1658,8 @@ def _activate_go_runtime(
                 _systemctl("enable", unit)
                 _systemctl("restart", unit)
                 _systemctl("is-active", unit)
+            if bootstrap_active:
+                _release_initial_migration_drain(config)
             return
         except WrapperError as failure:
             # A partial bootstrap must not leave a running slot or Deployd

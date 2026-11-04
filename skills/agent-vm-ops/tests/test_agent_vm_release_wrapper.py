@@ -395,6 +395,11 @@ class WrapperTests(unittest.TestCase):
                             "recovery_required": False,
                         }},
                     }).encode(), b"")
+            if command and command[0] == str(WRAPPER.GO_CONTROL_PATH):
+                return subprocess.CompletedProcess(command, 0, json.dumps({
+                    "ok": True,
+                    "result": {"draining": False},
+                }).encode(), b"")
             return subprocess.CompletedProcess(command, 0, b"", b"")
 
         with mock.patch.object(WRAPPER, "STATE_DB_PATH", legacy_state), mock.patch.object(
@@ -409,6 +414,8 @@ class WrapperTests(unittest.TestCase):
         self.assertLess(migration_index, slot_index)
         self.assertIn(["systemctl", "restart", "agent-vm-native.service"], commands)
         self.assertTrue((runtime_root / "active").is_symlink())
+        drain_exit = next(call for call in run.call_args_list if call.args[0][0] == str(WRAPPER.GO_CONTROL_PATH))
+        self.assertEqual(json.loads(drain_exit.kwargs["input"])["session_id"], "release-agent-vm-migration-migration-1")
 
     def test_clean_go_runtime_allows_bootstrap_without_legacy_sqlite(self):
         runtime_root = WRAPPER._go_runtime_root(self.loaded)
@@ -459,6 +466,11 @@ class WrapperTests(unittest.TestCase):
                             "recovery_required": False,
                         }},
                     }).encode(), b"")
+            if command and command[0] == str(WRAPPER.GO_CONTROL_PATH):
+                return subprocess.CompletedProcess(command, 0, json.dumps({
+                    "ok": True,
+                    "result": {"draining": False},
+                }).encode(), b"")
             return subprocess.CompletedProcess(command, 0, b"", b"")
 
         with mock.patch.object(WRAPPER, "STATE_DB_PATH", legacy_state), mock.patch.object(
