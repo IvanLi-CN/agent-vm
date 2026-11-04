@@ -54,7 +54,7 @@ describe("image import reason validation", () => {
     else expect(request).not.toHaveProperty("reason");
   });
 
-  it("does not retry a pending import while the edited reason is overlong", async () => {
+  it("blocks a pending import after an uncertain failure until recovery is checked", async () => {
     const user = userEvent.setup();
     listImagesMock.mockReset().mockResolvedValue({ items: [], page: { limit: 25, next_cursor: null }, catalog_version: "catalog:1", selection_version: "selection:1", default_fingerprint: null });
     startImageImportMock.mockReset().mockRejectedValueOnce(new Error("connection lost")).mockResolvedValueOnce({ operation_id: "operation-image-retry", status: "succeeded" });
@@ -67,7 +67,7 @@ describe("image import reason validation", () => {
     fireEvent.change(reason, { target: { value: "original reason" } });
     await user.click(startButton);
     await waitFor(() => expect(startImageImportMock).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(startButton).toBeEnabled());
+    await waitFor(() => expect(screen.getByText(/操作恢复核对|operation recovery/i)).toBeInTheDocument());
 
     const invalidReason = "界".repeat(513);
     fireEvent.change(reason, { target: { value: invalidReason } });
@@ -78,7 +78,6 @@ describe("image import reason validation", () => {
 
     fireEvent.change(reason, { target: { value: "original reason" } });
     await user.click(startButton);
-    await waitFor(() => expect(startImageImportMock).toHaveBeenCalledTimes(2));
-    expect(startImageImportMock.mock.calls[1][0]).toEqual(startImageImportMock.mock.calls[0][0]);
+    expect(startImageImportMock).toHaveBeenCalledTimes(1);
   });
 });

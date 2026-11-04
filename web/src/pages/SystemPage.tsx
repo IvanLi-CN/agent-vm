@@ -48,6 +48,7 @@ export function SystemPage() {
     },
     onError: (error) => {
       if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null);
+      else { operationRecovery.persist(); operationRecovery.block(); }
       showError(error);
     },
   });

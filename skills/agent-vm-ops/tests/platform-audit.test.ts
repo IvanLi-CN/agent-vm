@@ -51,3 +51,10 @@ test("an empty release history is valid for the first immutable publication", ()
   const result = evaluatePlatform(snapshot, quality, release);
   if (result.status !== "aligned" || !result.evidence.immutable_release_observed || result.evidence.immutable_release_history) throw new Error("first-release empty history was treated as a missing precondition");
 });
+
+test("draft releases do not block recovery while published releases remain immutable", () => {
+  const snapshot = alignedSnapshot();
+  snapshot.releases = [{ draft: true, immutable: false }, { draft: false, immutable: true }];
+  const result = evaluatePlatform(snapshot, quality, release);
+  if (result.status !== "aligned" || !result.evidence.immutable_release_observed || !result.evidence.immutable_release_history) throw new Error("a recoverable draft was treated as a mutable published release");
+});

@@ -52,7 +52,7 @@ jobs:
           fi
           mkdir -p .recovery
           found=""
-          for run_id in $(gh run list --workflow Release --limit 50 --json databaseId --jq '.[].databaseId'); do
+          for run_id in $(gh api --paginate "repos/${GITHUB_REPOSITORY}/actions/workflows/release.yml/runs?per_page=100" --jq '.workflow_runs[].id'); do
             run_root=".recovery/${run_id}"
             mkdir -p "$run_root"
             gh run download "$run_id" --name "release-state-${run_id}" --dir "$run_root" || true

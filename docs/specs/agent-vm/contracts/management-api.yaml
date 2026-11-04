@@ -161,6 +161,7 @@ paths:
       tags: [Tokens]
       operationId: listAgentTokens
       summary: List Token metadata visible to the current principal
+      x-required-capabilities: [manage_tokens]
       security:
         - browserSession: []
       parameters:
@@ -179,6 +180,7 @@ paths:
       tags: [Tokens]
       operationId: createAgentToken
       summary: Create one opaque Agent Token and return its plaintext once
+      x-required-capabilities: [manage_tokens]
       security:
         - browserSession: []
           csrfToken: []
@@ -213,6 +215,7 @@ paths:
       tags: [Tokens]
       operationId: getAgentToken
       summary: Read one Token's metadata without returning its plaintext
+      x-required-capabilities: [manage_tokens]
       security:
         - browserSession: []
       responses:
@@ -233,6 +236,7 @@ paths:
       tags: [Tokens]
       operationId: revokeAgentToken
       summary: Revoke one Token through the administrator preview contract
+      x-required-capabilities: [manage_tokens]
       security:
         - browserSession: []
           csrfToken: []
@@ -261,6 +265,7 @@ paths:
       operationId: previewAgentTokenRevocation
       summary: Preview Token revocation
       description: Requires the administrator Token-management capability; the response binds the exact Token metadata, target version and administrator to a single-use confirmation token.
+      x-required-capabilities: [manage_tokens]
       security:
         - browserSession: []
           csrfToken: []
@@ -286,6 +291,7 @@ paths:
       operationId: getOverview
       summary: Read the current capacity, admission, pressure and source freshness summary
       description: Requires the administrator observe_admin capability.
+      x-required-capabilities: [observe_admin]
       security:
         - browserSession: []
       responses:
@@ -308,6 +314,7 @@ paths:
       operationId: listManagedVMs
       summary: List existing Agent session VMs
       description: Requires the administrator observe_admin capability.
+      x-required-capabilities: [observe_admin]
       security:
         - browserSession: []
       parameters:
@@ -359,6 +366,7 @@ paths:
       operationId: getManagedVM
       summary: Read one existing Agent session VM
       description: Requires the administrator observe_admin capability.
+      x-required-capabilities: [observe_admin]
       security:
         - browserSession: []
       responses:
@@ -379,6 +387,7 @@ paths:
       tags: [VMs]
       operationId: previewVMAction
       summary: Preview one fixed, supported VM action
+      x-required-capabilities: [operate]
       security:
         - browserSession: []
           csrfToken: []
@@ -406,6 +415,7 @@ paths:
       tags: [VMs]
       operationId: submitVMAction
       summary: Submit a confirmed VM action as a durable operation
+      x-required-capabilities: [operate]
       security:
         - browserSession: []
           csrfToken: []
@@ -435,6 +445,8 @@ paths:
       operationId: listManagedImages
       summary: List managed image versions and their references
       description: Requires the administrator observe_admin or manage_images capability.
+      x-required-capabilities: [observe_admin, manage_images]
+      x-required-capabilities-mode: any
       security:
         - browserSession: []
       parameters:
@@ -473,6 +485,8 @@ paths:
       operationId: getManagedImage
       summary: Read one immutable image and all reference classes
       description: Requires the administrator observe_admin or manage_images capability.
+      x-required-capabilities: [observe_admin, manage_images]
+      x-required-capabilities-mode: any
       security:
         - browserSession: []
       responses:
@@ -490,6 +504,7 @@ paths:
       tags: [Images]
       operationId: startImageImport
       summary: Start an import from an allowlisted source or a bounded local upload
+      x-required-capabilities: [manage_images]
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
@@ -527,6 +542,7 @@ paths:
       operationId: uploadImageImportContent
       summary: Stream the declared bytes for an existing local image import operation
       description: The stream is accepted once, must match the declared size and is never resumable.
+      x-required-capabilities: [manage_images]
       security:
         - browserSession: []
           csrfToken: []
@@ -565,6 +581,7 @@ paths:
       tags: [Images]
       operationId: previewDefaultImageChange
       summary: Preview the effect of selecting a new default image
+      x-required-capabilities: [manage_images]
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
@@ -591,6 +608,7 @@ paths:
       tags: [Images]
       operationId: selectDefaultImage
       summary: Select an already verified managed image for new sessions
+      x-required-capabilities: [manage_images]
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
@@ -620,6 +638,7 @@ paths:
       tags: [Images]
       operationId: previewImageRetirement
       summary: Preview retirement of an image version
+      x-required-capabilities: [manage_images]
       security:
         - browserSession: []
           csrfToken: []
@@ -647,6 +666,7 @@ paths:
       tags: [Images]
       operationId: retireManagedImage
       summary: Retire an image so it cannot be selected for new sessions
+      x-required-capabilities: [manage_images]
       security:
         - browserSession: []
           csrfToken: []
@@ -674,6 +694,7 @@ paths:
       tags: [Images]
       operationId: previewImageDeletion
       summary: Preview deletion and show every blocking image reference
+      x-required-capabilities: [manage_images]
       security:
         - browserSession: []
           csrfToken: []
@@ -701,6 +722,7 @@ paths:
       tags: [Images]
       operationId: deleteManagedImage
       summary: Delete an unreferenced, non-default image
+      x-required-capabilities: [manage_images]
       security:
         - browserSession: []
           csrfToken: []
@@ -726,6 +748,7 @@ paths:
       operationId: listOperations
       summary: List durable management operations visible to the current principal
       description: The sole administrator receives field-whitelisted operations. The actor is the exact current (issuer, subject) pair, a typed rejected request without administrator authority, or an explicitly marked historical actor whose original value is retained without identity inference.
+      x-required-capabilities: [read]
       security:
         - browserSession: []
       parameters:
@@ -769,6 +792,7 @@ paths:
       operationId: getOperation
       summary: Read an operation by its durable identity
       description: The sole administrator receives field-whitelisted operation status. Current rejected-request actors and historical actor values remain explicitly non-administrator identities and are never converted into a guessed OIDC identity. Token-create results never contain bearer plaintext.
+      x-required-capabilities: [read]
       security:
         - browserSession: []
       responses:
@@ -787,6 +811,7 @@ paths:
       operationId: listAuditEvents
       summary: Query administrator audit events
       description: Requires the administrator observe_admin capability.
+      x-required-capabilities: [observe_admin]
       security:
         - browserSession: []
       parameters:
@@ -844,6 +869,7 @@ paths:
       operationId: getSystemStatus
       summary: Read installed product, component readiness and maintenance state
       description: Requires the administrator observe_admin capability.
+      x-required-capabilities: [observe_admin]
       security:
         - browserSession: []
       responses:
@@ -865,6 +891,7 @@ paths:
       tags: [System]
       operationId: previewMaintenance
       summary: Preview a supported maintenance operation
+      x-required-capabilities: [maintain_system]
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
@@ -891,6 +918,7 @@ paths:
       tags: [System]
       operationId: submitMaintenance
       summary: Submit a confirmed drain, reconcile or garbage-collection action
+      x-required-capabilities: [maintain_system]
       parameters:
         - $ref: "#/components/parameters/Origin"
       security:
@@ -1122,6 +1150,7 @@ components:
       type: object
       additionalProperties: false
       required: [operation_id, scopes, expires_at]
+      description: Requested machine scopes must be a subset of the authenticated administrator capabilities; manage_tokens alone does not grant agent:read, agent:operate, agent:sync or agent:observe_admin issuance authority.
       allOf:
         - if:
             required: [scopes]
@@ -1340,7 +1369,7 @@ components:
           type: string
           minLength: 1
         observed_at:
-          type: string
+          type: [string, "null"]
           format: date-time
         admission:
           type: object
@@ -1878,6 +1907,10 @@ components:
             - admission_denied
             - resource_insufficient
             - watermarks_unreachable
+            - controller_lease_required
+            - mapping_unverified
+            - state_unverified
+            - resource_unverified
             - precondition_required
             - service_unavailable
             - state_unavailable

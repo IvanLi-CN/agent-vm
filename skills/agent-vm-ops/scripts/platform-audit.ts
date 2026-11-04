@@ -96,10 +96,11 @@ export function evaluatePlatform(
   const deletionBlocked = snapshot.branch_protection?.allow_deletions?.enabled === false || ruleset.deletion;
   const strictChecks = snapshot.branch_protection?.required_status_checks?.strict === true || ruleset.strict;
   const administratorsEnforced = snapshot.branch_protection?.enforce_admins?.enabled === true;
-  const immutableReleaseHistory = snapshot.releases.length > 0 && snapshot.releases.every((release) => release?.immutable === true);
+  const publishedReleases = snapshot.releases.filter((release) => release?.draft !== true);
+  const immutableReleaseHistory = publishedReleases.length > 0 && publishedReleases.every((release) => release?.immutable === true);
   // An empty release history is the valid first-release state; immutability is
   // verified on the first publication and on every subsequent release.
-  const immutableReleaseObserved = snapshot.releases.length === 0 || immutableReleaseHistory;
+  const immutableReleaseObserved = publishedReleases.length === 0 || immutableReleaseHistory;
   const contractStatus = {
     quality: qualityContract?.platform_alignment?.status,
     release: releaseContract?.platform_preconditions?.status,

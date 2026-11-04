@@ -78,11 +78,14 @@ export function ImagesPage() {
       if (error instanceof ManagementRequestError && importRejectedCodes.has(error.code)) {
         setPendingImport(null);
         setOperationId(null);
+      } else {
+        operationRecovery.persist();
+        operationRecovery.block();
       }
       setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
     },
   });
-  const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!, operationId ?? undefined), onSuccess: (operation) => { setAction(null); setPreview(null); if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null); else { operationRecovery.persist(); operationRecovery.block(operation); } void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => { if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null); setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")); } });
+  const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!, operationId ?? undefined), onSuccess: (operation) => { setAction(null); setPreview(null); if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null); else { operationRecovery.persist(); operationRecovery.block(operation); } void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => { if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null); else { operationRecovery.persist(); operationRecovery.block(); } setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")); } });
 
   const submitImport = (submission: ImportSubmission) => {
     if (operationRecovery.isBlocked) {
@@ -97,7 +100,7 @@ export function ImagesPage() {
   const startImport = () => {
     if (importReasonTooLong) { setImportMessage(t("common.reasonTooLong")); return; }
     if (pendingImport) {
-      importMutation.mutate(pendingImport);
+      submitImport(pendingImport);
       return;
     }
     const targetVersion = query.data?.catalog_version;

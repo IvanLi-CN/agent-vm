@@ -117,7 +117,7 @@ test("release preflight is fail-closed and accepts the exact Main gate matrix", 
 
 test("GitHub state refs are append-only and preserve the original identity", async () => {
   const refs = new Map<string, string>();
-  const commits = new Map<string, string>();
+  const commits = new Map<string, { message: string; parents: string[] }>();
   let sequence = 0;
   const fake = {
     repository: "IvanLi-CN/agent-vm",
@@ -130,7 +130,10 @@ test("GitHub state refs are append-only and preserve the original identity", asy
         return { object: { sha } };
       }
       const commitRead = args.find((item) => /\/git\/commits\/[0-9a-z-]+$/.test(item));
-      if (commitRead && !args.includes("--method")) return { message: commits.get(commitRead.split("/git/commits/")[1]) };
+      if (commitRead && !args.includes("--method")) {
+        const commit = commits.get(commitRead.split("/git/commits/")[1]);
+        return commit ? { message: commit.message, parents: commit.parents.map((sha) => ({ sha })) } : undefined;
+      }
       if (args.some((item) => item.endsWith("/git/blobs"))) return { sha: `blob-${++sequence}` };
       if (args.some((item) => item.endsWith("/git/trees"))) {
         if (!args.includes("--input") || input === undefined) throw new Error("tree JSON request body is missing");
@@ -143,7 +146,9 @@ test("GitHub state refs are append-only and preserve the original identity", asy
       }
       if (args.some((item) => item.endsWith("/git/commits"))) {
         const sha = `commit-${++sequence}`;
-        commits.set(sha, args.find((item) => item.startsWith("message="))!.slice("message=".length));
+        const parentIndex = args.indexOf("--field");
+        const parentArg = parentIndex >= 0 ? args[parentIndex + 1] : undefined;
+        commits.set(sha, { message: args.find((item) => item.startsWith("message="))!.slice("message=".length), parents: parentArg?.startsWith("parents[]=") ? [parentArg.slice("parents[]=".length)] : [] });
         return { sha };
       }
       if (args.some((item) => item.endsWith("/git/refs"))) {
@@ -162,9 +167,15 @@ test("GitHub state refs are append-only and preserve the original identity", asy
   const current = await remote.current(source.version);
   const assets = current.detail?.assets as Record<string, string> | undefined;
   if (current.stage !== "prepared" || assets?.package !== "release-state/artifacts/1.0.0/package") throw new Error("remote state did not hydrate the recovery asset path");
+  const orphan = "orphan-commit";
+  commits.set(orphan, { message: `agent-vm release state draft 1.0.0\n\n${JSON.stringify({ stage: "draft", identity: source, at: new Date().toISOString(), detail: { artifacts: { package: "d".repeat(64) }, assets: { package: "package" } } })}`, parents: ["unrelated-parent"] });
+  refs.set("release-state/draft/1.0.0", orphan);
+  let lineageRejected = false;
+  try { await remote.current(source.version); } catch (error) { lineageRejected = String(error).includes("parent chain"); }
+  if (!lineageRejected) throw new Error("a non-descendant higher-stage state ref was accepted");
   let conflict = false;
   try { await remote.claim(identity({ source_revision: "e".repeat(40) })); } catch { conflict = true; }
-  if (!conflict || refs.size !== 2) throw new Error("remote state ref conflict was not fail-closed");
+  if (!conflict || refs.size !== 3) throw new Error("remote state ref conflict was not fail-closed");
 });
 
 test("draft release lookup accepts an untagged draft only when its target is bound", async () => {

@@ -105,6 +105,20 @@ func TestUnifiedTokenAPIIsIdempotentAndRevocable(t *testing.T) {
 	}
 }
 
+func TestTokenScopesCannotExceedAdministratorCapabilities(t *testing.T) {
+	if err := authorizeTokenScopes([]string{"agent:read"}, []string{"manage_tokens", "read"}); err != nil {
+		t.Fatalf("read scope was rejected for a read-capable administrator: %v", err)
+	}
+	for _, scope := range []string{"agent:operate", "agent:sync", "agent:observe_admin"} {
+		if err := authorizeTokenScopes([]string{scope}, []string{"manage_tokens", "read"}); err == nil {
+			t.Fatalf("scope %s was accepted without its administrator capability", scope)
+		}
+	}
+	if err := authorizeTokenScopes([]string{"agent:operate", "agent:read"}, []string{"manage_tokens", "read", "operate"}); err != nil {
+		t.Fatalf("operate scope was rejected for an operate-capable administrator: %v", err)
+	}
+}
+
 func TestUnifiedRejectsMutationsBeforeLifecycleReady(t *testing.T) {
 	authority, store, cfg := testAuthority(t)
 	lifecycleService := lifecycle.New(store, testLifecycleConfig(cfg), lifecycle.Options{})

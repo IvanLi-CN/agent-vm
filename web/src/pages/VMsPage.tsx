@@ -46,6 +46,7 @@ export function VMsPage() {
     onSuccess: (operation) => { setAction(null); setPreview(null); if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null); else { operationRecovery.persist(); operationRecovery.block(operation); } setActionError(null); void queryClient.invalidateQueries({ queryKey: ["operations"] }); },
     onError: (error) => {
       if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null);
+      else { operationRecovery.persist(); operationRecovery.block(); }
       showError(error);
     },
   });
