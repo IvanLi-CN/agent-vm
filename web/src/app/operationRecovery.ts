@@ -73,6 +73,8 @@ export function writeOperationRecovery(path: string, operationId: string | null)
 
 export function useOperationRecovery(path: string, enabled = true): [string | null, (operationId: string | null, persist?: boolean) => void, OperationRecovery] {
   const [operationId, setOperationIdState] = useState<string | null>(() => readOperationRecovery(path));
+  const operationIdRef = useRef(operationId);
+  operationIdRef.current = operationId;
   const shouldReconcile = useRef<boolean | null>(null);
   const wasEnabled = useRef(enabled);
   const [retryCount, setRetryCount] = useState(0);
@@ -134,7 +136,7 @@ export function useOperationRecovery(path: string, enabled = true): [string | nu
       active = false;
       // React StrictMode replays effects after cleanup. Re-arm the lookup so
       // the replay cannot leave the recovery state stuck at "checking".
-      if (operationId) shouldReconcile.current = true;
+      if (operationId && operationIdRef.current === operationId) shouldReconcile.current = true;
     };
   }, [enabled, operationId, retryCount]);
 

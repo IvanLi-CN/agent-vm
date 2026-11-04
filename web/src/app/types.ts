@@ -91,7 +91,7 @@ export interface SourceFreshness {
 
 export interface Overview {
   resource_version: string;
-  observed_at: string;
+  observed_at: string | null;
   admission: { ready: boolean | null; draining: boolean | null; reasons: string[] };
   capacity: {
     logical_cpu_remaining_vcpu: ObservedNumber;

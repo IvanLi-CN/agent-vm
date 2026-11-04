@@ -51,8 +51,16 @@ export function releaseBuilderCommand(version: string, source: string, targetNam
   ];
 }
 
+export function releaseBuilderEnvironment(environment: Record<string, string | undefined>): Record<string, string | undefined> {
+  const sanitized = { ...environment };
+  delete sanitized.GH_TOKEN;
+  delete sanitized.GITHUB_TOKEN;
+  delete sanitized.RELEASE_PLATFORM_TOKEN;
+  return sanitized;
+}
+
 function runBuilder(version: string, source: string, targetName: string, output: string): void {
-  const result = Bun.spawnSync(releaseBuilderCommand(version, source, targetName, output), { cwd: repositoryRoot, stdout: "pipe", stderr: "pipe" });
+  const result = Bun.spawnSync(releaseBuilderCommand(version, source, targetName, output), { cwd: repositoryRoot, env: releaseBuilderEnvironment(process.env), stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr).trim() || "product package build failed");
 }
 
@@ -291,8 +299,7 @@ async function recover(): Promise<void> {
   assertPlatformPreconditions();
   const currentMainHead = await adapter.mainHead();
   if (process.env.GITHUB_SHA && process.env.GITHUB_SHA !== currentMainHead) throw new Error("GitHub recovery ref moved after source preflight");
-  const ancestry = await adapter.compare(current.identity.source_revision, currentMainHead);
-  if (ancestry.status !== "ahead" && ancestry.status !== "identical") throw new Error("recovery source revision is not an ancestor of the current protected main head");
+  if (currentMainHead !== current.identity.source_revision) throw new Error("recovery protected main head no longer matches the reserved source revision");
   const source = current.identity.source_revision;
   const gate = successfulMainGate(await adapter.commitChecks(source));
   if (gate.id !== current.identity.main_gate) throw new Error("recovery Main gate identity no longer matches the reservation");

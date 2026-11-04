@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 
 import { compareSemVer, parseSemVer, resolveReleaseTarget } from "../scripts/semver.ts";
 import { GhGithubAdapter, GithubReleaseStateStore, ReleaseStateStore, type ReleaseIdentity } from "../scripts/release-coordinator.ts";
-import { assertContractPreconditions, assertWorkflowPlatformAttestation, releaseBuilderCommand, successfulMainGate, verifyReleaseView } from "../scripts/release.ts";
+import { assertContractPreconditions, assertWorkflowPlatformAttestation, releaseBuilderCommand, releaseBuilderEnvironment, successfulMainGate, verifyReleaseView } from "../scripts/release.ts";
 
 const identity = (overrides: Partial<ReleaseIdentity> = {}): ReleaseIdentity => ({
   version: "1.0.0",
@@ -47,6 +47,12 @@ test("release assets select the management-enabled product builder", () => {
   const native = releaseBuilderCommand("1.0.3", source, "linux/amd64", "/tmp/native.tar");
   if (!client.some((value) => value.endsWith("build_product_release.ts")) || !client.includes("--version")) throw new Error("client assets did not select the product builder");
   if (!native.some((value) => value.endsWith("build_product_release.ts")) || !native.includes("--version")) throw new Error("native assets did not select the product builder");
+});
+
+test("release builders do not inherit platform credentials", () => {
+  const environment = releaseBuilderEnvironment({ GH_TOKEN: "ghs-secret", GITHUB_TOKEN: "github-secret", RELEASE_PLATFORM_TOKEN: "platform-secret", SAFE_VALUE: "kept" });
+  if ("GH_TOKEN" in environment || "GITHUB_TOKEN" in environment || "RELEASE_PLATFORM_TOKEN" in environment) throw new Error("release credentials leaked into the product builder environment");
+  if (environment.SAFE_VALUE !== "kept") throw new Error("safe builder environment values were not preserved");
 });
 
 test("release reservation is append-only and identity-bound", () => {

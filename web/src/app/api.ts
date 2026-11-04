@@ -680,7 +680,7 @@ function byteDelta(previous: string | null, next: string | null): bigint | null 
   }
 }
 
-function adjustObservedBytes(observed: Overview["capacity"]["logical_memory_remaining"], delta: bigint, observedAt: string): Overview["capacity"]["logical_memory_remaining"] {
+function adjustObservedBytes(observed: Overview["capacity"]["logical_memory_remaining"], delta: bigint, observedAt: string | null): Overview["capacity"]["logical_memory_remaining"] {
   if (observed.state !== "available" || observed.value_bytes === null) return observed;
   try {
     const next = BigInt(observed.value_bytes) - delta;

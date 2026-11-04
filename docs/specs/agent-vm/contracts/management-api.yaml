@@ -1920,6 +1920,7 @@ components:
             - draining
             - cleanup_incomplete
             - startup_reconcile_required
+            - authority_unavailable
             - internal_error
         phase:
           oneOf:
