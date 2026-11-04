@@ -25,13 +25,17 @@ const operation: Operation = {
   error: null,
 };
 
+const pendingOperation: Operation = { ...operation, status: "running", phase: "native_action", result: null, error: null };
+
 function Probe({ path = "/vms" }: { path?: string }) {
   const [operationId, setOperationId, recovery] = useOperationRecovery(path);
   return <div>
     <span data-testid="operation-id">{operationId}</span>
     <span data-testid="recovery-state">{recovery.state}</span>
+    <span data-testid="recovery-blocked">{String(recovery.isBlocked)}</span>
     <button type="button" onClick={() => setOperationId("50e8400e-ccf8-4c7b-8d1d-14f66c7fb126")}>start</button>
     <button type="button" onClick={() => setOperationId("50e8400e-ccf8-4c7b-8d1d-14f66c7fb126", false)}>preview</button>
+    <button type="button" onClick={() => recovery.block(pendingOperation)}>block</button>
     <button type="button" onClick={recovery.persist}>persist</button>
   </div>;
 }
@@ -69,5 +73,13 @@ describe("operation recovery", () => {
     expect(window.sessionStorage.length).toBe(0);
     fireEvent.click(screen.getByRole("button", { name: "persist" }));
     expect(window.sessionStorage.length).toBe(1);
+  });
+
+  it("blocks the current page when a submitted operation is nonterminal", () => {
+    render(<Probe />);
+    fireEvent.click(screen.getByRole("button", { name: "start" }));
+    fireEvent.click(screen.getByRole("button", { name: "block" }));
+    expect(screen.getByTestId("recovery-state")).toHaveTextContent("blocked");
+    expect(screen.getByTestId("recovery-blocked")).toHaveTextContent("true");
   });
 });

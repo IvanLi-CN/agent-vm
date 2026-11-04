@@ -40,7 +40,7 @@ export function SystemPage() {
       setAction(null);
       setPreview(null);
       if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null);
-      else operationRecovery.persist();
+      else { operationRecovery.persist(); operationRecovery.block(operation); }
       setActionError(null);
       setDialogOwner(null);
       void client.invalidateQueries({ queryKey: ["operations"] });

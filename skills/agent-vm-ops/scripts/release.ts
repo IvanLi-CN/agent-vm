@@ -89,7 +89,8 @@ export function successfulMainGate(value: unknown): { id: string } {
   if (!Array.isArray(value)) throw new Error("GitHub check-runs response is invalid");
   const namedChecks = value.filter((item: any) => releaseGateNames.includes(item?.name));
   const checks = new Map(namedChecks.map((item: any) => [item.name, item]));
-  if (namedChecks.length !== releaseGateNames.length || checks.size !== releaseGateNames.length || [...checks.values()].some((item: any) => item.status !== "completed" || item.conclusion !== "success" || item.app?.slug !== "github-actions")) {
+  const suiteIds = new Set(namedChecks.map((item: any) => item?.check_suite?.id).filter((id: unknown): id is string | number => typeof id === "string" || typeof id === "number"));
+  if (namedChecks.length !== releaseGateNames.length || checks.size !== releaseGateNames.length || suiteIds.size !== 1 || [...checks.values()].some((item: any) => item.status !== "completed" || item.conclusion !== "success" || item.app?.slug !== "github-actions")) {
     throw new Error("the required Main gate matrix has not completed successfully for the source commit");
   }
   if (value.some((item: any) => releaseGateNames.includes(item?.name) && item.app?.slug !== "github-actions")) {
@@ -268,9 +269,11 @@ async function recover(): Promise<void> {
   if (current.stage === "abandoned" || current.stage === "claimed") throw new Error(`reservation at ${current.stage} cannot be recovered without frozen assets`);
 
   assertPlatformPreconditions();
-  const source = await adapter.mainHead();
-  if (source !== current.identity.source_revision) throw new Error("recovery source revision no longer matches the reserved identity");
-  if (process.env.GITHUB_SHA && process.env.GITHUB_SHA !== source) throw new Error("GitHub recovery ref moved after source preflight");
+  const currentMainHead = await adapter.mainHead();
+  if (process.env.GITHUB_SHA && process.env.GITHUB_SHA !== currentMainHead) throw new Error("GitHub recovery ref moved after source preflight");
+  const ancestry = await adapter.compare(current.identity.source_revision, currentMainHead);
+  if (ancestry.status !== "ahead" && ancestry.status !== "identical") throw new Error("recovery source revision is not an ancestor of the current protected main head");
+  const source = current.identity.source_revision;
   const gate = successfulMainGate(await adapter.commitChecks(source));
   if (gate.id !== current.identity.main_gate) throw new Error("recovery Main gate identity no longer matches the reservation");
   const sourcePull = mergedSourcePull(await adapter.sourcePulls(source), source);

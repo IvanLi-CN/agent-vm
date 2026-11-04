@@ -87,19 +87,25 @@ test("release preflight is fail-closed and accepts the exact Main gate matrix", 
   if (!unprotectedError) throw new Error("workflow preflight accepted an unprotected ref");
   assertWorkflowPlatformAttestation("refs/heads/main", "true");
   const gate = successfulMainGate([
-    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, app: { slug: "github-actions" } },
-    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, app: { slug: "github-actions" } },
+    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, check_suite: { id: 99 }, app: { slug: "github-actions" } },
+    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } },
   ]);
   if (gate.id !== "1,2") throw new Error(`unexpected Main gate identity: ${gate.id}`);
   let missingMatrixRejected = false;
-  try { successfulMainGate([{ name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, app: { slug: "github-actions" } }]); } catch { missingMatrixRejected = true; }
+  try { successfulMainGate([{ name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } }]); } catch { missingMatrixRejected = true; }
   if (!missingMatrixRejected) throw new Error("an incomplete Main gate matrix was accepted");
   let foreignCheckRejected = false;
   try { successfulMainGate([
-    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, app: { slug: "third-party" } },
-    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, app: { slug: "github-actions" } },
+    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, check_suite: { id: 99 }, app: { slug: "third-party" } },
+    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } },
   ]); } catch { foreignCheckRejected = true; }
   if (!foreignCheckRejected) throw new Error("a non-GitHub Actions Main gate was accepted");
+  let mixedSuiteRejected = false;
+  try { successfulMainGate([
+    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, check_suite: { id: 100 }, app: { slug: "github-actions" } },
+    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } },
+  ]); } catch { mixedSuiteRejected = true; }
+  if (!mixedSuiteRejected) throw new Error("Main gates from different check suites were accepted");
 });
 
 test("GitHub state refs are append-only and preserve the original identity", async () => {

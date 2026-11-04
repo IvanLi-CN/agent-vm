@@ -19,6 +19,7 @@ export type OperationRecovery = {
   errorCode: string | null;
   isBlocked: boolean;
   retry: () => void;
+  block: (operation?: Operation | null) => void;
   persist: () => void;
 };
 
@@ -98,6 +99,14 @@ export function useOperationRecovery(path: string, enabled = true): [string | nu
     setRetryCount((count) => count + 1);
   }, [operationId]);
 
+  const block = useCallback((nextOperation: Operation | null = null) => {
+    if (!operationId) return;
+    shouldReconcile.current = false;
+    setOperation(nextOperation);
+    setErrorCode(null);
+    setState("blocked");
+  }, [operationId]);
+
   useEffect(() => {
     if (!wasEnabled.current && enabled && operationId) shouldReconcile.current = true;
     wasEnabled.current = enabled;
@@ -127,5 +136,5 @@ export function useOperationRecovery(path: string, enabled = true): [string | nu
   }, [enabled, operationId, retryCount]);
 
   const isBlocked = state === "checking" || state === "blocked" || state === "not_found" || state === "error";
-  return [operationId, setOperationId, { operationId, state, operation, errorCode, isBlocked, retry, persist }];
+  return [operationId, setOperationId, { operationId, state, operation, errorCode, isBlocked, retry, block, persist }];
 }

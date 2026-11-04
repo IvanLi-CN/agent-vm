@@ -62,13 +62,16 @@ export function ImagesPage() {
       }
       if (operation.status === "outcome_unknown") {
         setImportMessage(t("errors.authority_unavailable"));
+        operationRecovery.persist();
+        operationRecovery.block(operation);
+        void client.invalidateQueries({ queryKey: ["operations"] });
         return;
       }
       setImportMessage(`${t("images.importStarted")} · ${operation.operation_id}`);
       setPendingImport(null);
       setReason("");
       if (operation.status === "succeeded") setOperationId(null);
-      else operationRecovery.persist();
+      else { operationRecovery.persist(); operationRecovery.block(operation); }
       void client.invalidateQueries({ queryKey: ["operations"] });
     },
     onError: (error) => {
@@ -79,7 +82,7 @@ export function ImagesPage() {
       setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
     },
   });
-  const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!, operationId ?? undefined), onSuccess: (operation) => { setAction(null); setPreview(null); if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null); else operationRecovery.persist(); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => { if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null); setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")); } });
+  const actionMutation = useMutation({ mutationFn: ({ reason: actionReason }: { reason: string }) => submitImageAction(selected?.fingerprint ?? "", action!, actionReason, preview!, operationId ?? undefined), onSuccess: (operation) => { setAction(null); setPreview(null); if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null); else { operationRecovery.persist(); operationRecovery.block(operation); } void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: (error) => { if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null); setImportMessage(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic")); } });
 
   const submitImport = (submission: ImportSubmission) => {
     if (operationRecovery.isBlocked) {

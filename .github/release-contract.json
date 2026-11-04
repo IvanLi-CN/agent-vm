@@ -87,6 +87,7 @@
   "platform_preconditions": {
     "protected_main_required": true,
     "required_main_check": "Main gate",
+    "platform_audit_credential": "RELEASE_PLATFORM_TOKEN",
     "status": "enabled"
   }
 }

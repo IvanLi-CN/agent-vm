@@ -4,6 +4,7 @@
 它不是公共的 `agent-vm` 生命周期命令，也不授予 PVE、宿主机管理器、Incus 策略 API、guest 或 HTTP 网关的访问权限。
 产品发布完成的标志是经过验证的 GitHub Release 及其版本化安装包；
 部署是独立且必须显式触发的操作。
+GitHub Actions 发布与恢复 workflow 必须使用仓库 secret `RELEASE_PLATFORM_TOKEN` 执行受保护分支和 release 历史审计；该凭据至少需要 Administration read、Contents write、Actions read、Checks read 和 Pull requests read 权限。缺少该凭据时 workflow 必须在创建 reservation 前失败。
 蓝绿设计使用两个完整的 Agent VM 服务槽位、一个稳定的 Caddy 入口，以及一个位于槽位之外、供运维者使用的 `agent-vm-deployd` 控制器。
 它不增加公共路由、Web/BFF、公共 native 生命周期服务或公共发布封装器；
 下文的 format-1/2 封装器仅作为旧版兼容路径保留。

@@ -43,7 +43,7 @@ export function VMsPage() {
   const showError = (error: unknown) => setActionError(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
   const submitMutation = useMutation({
     mutationFn: ({ reason }: { reason: string }) => submitVMAction(selected?.task_id ?? "", action ?? "restart", reason, preview!, selected?.generation ?? "", parameters, operationId ?? undefined),
-    onSuccess: (operation) => { setAction(null); setPreview(null); if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null); else operationRecovery.persist(); setActionError(null); void queryClient.invalidateQueries({ queryKey: ["operations"] }); },
+    onSuccess: (operation) => { setAction(null); setPreview(null); if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null); else { operationRecovery.persist(); operationRecovery.block(operation); } setActionError(null); void queryClient.invalidateQueries({ queryKey: ["operations"] }); },
     onError: (error) => {
       if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null);
       showError(error);
