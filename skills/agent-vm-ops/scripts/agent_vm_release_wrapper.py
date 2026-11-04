@@ -1833,18 +1833,22 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
     manifest_source = release_root / MANIFEST_NAME
     _require_owned_regular(manifest_source, owner_uid, 0o644)
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
+    client_sidecar = release_root / "client-release.json"
+    _require_owned_regular(client_sidecar, owner_uid, 0o644)
     # Format 4 starts the two slot units immediately after migration. The
     # resident binary is also the slot binary, so install both copies as
     # part of the same activation transaction before systemd is touched.
     if manifest["format"] == PRODUCT_MANIFEST_FORMAT:
-        slot_binary = release_root / "bin" / "agent-vm-control"
-        _require_owned_regular(slot_binary, owner_uid, 0o755)
         for slot in GO_SLOT_NAMES:
             slot_root = _go_slot_root(config, slot)
-            _copy_atomic(slot_binary, slot_root / "bin" / "agent-vm-control", owner_uid, 0o755)
+            for item in manifest["artifacts"]:
+                relative = Path(*PurePosixPath(item["path"]).parts)
+                source = release_root / relative
+                _require_owned_regular(source, owner_uid, item["mode"])
+                _copy_atomic(source, slot_root / relative, owner_uid, item["mode"])
             _copy_atomic(manifest_source, slot_root / "release-manifest.json", owner_uid, 0o644)
-    client_sidecar = release_root / "client-release.json"
-    _require_owned_regular(client_sidecar, owner_uid, 0o644)
+            _copy_atomic(client_sidecar, slot_root / "client-release.json", owner_uid, 0o644)
+            _atomic_symlink(Path("/run/agent-vm-native") / slot / "app.sock", slot_root / "app.sock")
     _copy_atomic(client_sidecar, Path(config["control_path"]).with_name("client-release.json"), owner_uid, 0o644)
     for name in (RETIRED_CONTROL_NAME, RETIRED_CLIENT_NAME):
         retired = Path(config["control_path"]).with_name(name)

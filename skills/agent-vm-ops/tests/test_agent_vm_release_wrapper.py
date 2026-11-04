@@ -913,14 +913,24 @@ class WrapperTests(unittest.TestCase):
 
         runtime_root = WRAPPER._go_runtime_root(self.loaded)
         for slot in WRAPPER.GO_SLOT_NAMES:
+            slot_root = runtime_root / "slots" / slot
             self.assertEqual(
-                (runtime_root / "slots" / slot / "bin" / "agent-vm-control").read_bytes(),
+                (slot_root / "bin" / "agent-vm-control").read_bytes(),
                 (release_root / "bin" / "agent-vm-control").read_bytes(),
             )
             self.assertEqual(
-                (runtime_root / "slots" / slot / "release-manifest.json").read_bytes(),
+                (slot_root / "release-manifest.json").read_bytes(),
                 (release_root / "release-manifest.json").read_bytes(),
             )
+            self.assertEqual(
+                (slot_root / "client-release.json").read_bytes(),
+                (release_root / "client-release.json").read_bytes(),
+            )
+            self.assertEqual(os.readlink(slot_root / "app.sock"), f"/run/agent-vm-native/{slot}/app.sock")
+            for item in manifest["artifacts"]:
+                relative = Path(*item["path"].split("/"))
+                with self.subTest(slot=slot, artifact=item["path"]):
+                    self.assertEqual((slot_root / relative).read_bytes(), (release_root / relative).read_bytes())
         bridge = (release_root / "agent_vm_control_bridge.ts").read_bytes()
         self.assertEqual(Path(self.loaded["control_path"]).read_bytes(), bridge)
         self.assertEqual((Path(self.loaded["control_path"]).parent / "agent_vm_control_bridge.ts").read_bytes(), bridge)
