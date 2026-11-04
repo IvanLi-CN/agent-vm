@@ -58,3 +58,11 @@ test("draft releases do not block recovery while published releases remain immut
   const result = evaluatePlatform(snapshot, quality, release);
   if (result.status !== "aligned" || !result.evidence.immutable_release_observed || !result.evidence.immutable_release_history) throw new Error("a recoverable draft was treated as a mutable published release");
 });
+
+test("enabled immutable releases establish a cutover for legacy published releases", () => {
+  const snapshot = alignedSnapshot();
+  snapshot.releases = [{ draft: false, immutable: false }];
+  snapshot.immutable_releases = { enabled: true };
+  const result = evaluatePlatform(snapshot, quality, release);
+  if (result.status !== "aligned" || !result.evidence.immutable_release_observed || result.evidence.immutable_release_history || !result.evidence.immutable_releases_enabled) throw new Error("immutable release cutover did not accept legacy history with future enforcement");
+});
