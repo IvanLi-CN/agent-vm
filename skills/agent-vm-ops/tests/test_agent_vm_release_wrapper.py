@@ -679,7 +679,7 @@ class WrapperTests(unittest.TestCase):
                     archive.add(path, arcname=path.relative_to(extracted).as_posix(), recursive=False)
         return output.getvalue()
 
-    def _go_payload(self, release_id):
+    def _go_payload(self, release_id, *, product=False):
         extracted = self.root / "go-candidate"
         client_root = ROOT / "skills/agent-vm/scripts"
         ops_root = ROOT / "skills/agent-vm-ops"
@@ -708,12 +708,28 @@ class WrapperTests(unittest.TestCase):
                 "sha256": MANIFEST.sha256_file(path),
                 "mode": mode,
             })
-        manifest = MANIFEST.build_go_manifest(release_id, artifacts)
+        if product:
+            actions = MANIFEST.default_operations()
+            manifest = MANIFEST.validate_product_manifest({
+                "format": MANIFEST.PRODUCT_MANIFEST_FORMAT,
+                "version": "1.2.1",
+                "release_id": release_id,
+                "source_revision": release_id,
+                "protocol": 4,
+                "target": {"os": "linux", "arch": "amd64"},
+                "toolchain": {"bun": MANIFEST.PRODUCT_BUN_TOOLCHAIN, "go": MANIFEST.PRODUCT_GO_TOOLCHAIN, "cgo_enabled": False},
+                "artifacts": artifacts,
+                "actions": actions,
+                "client_view": {"version": "1.2.1", "source_revision": release_id, "protocol": 4, "transport": "go-request", "actions": actions},
+                "state_compatibility": {"reads": list(MANIFEST.STATE_CAPABILITY_MARKERS), "writes": list(MANIFEST.STATE_CAPABILITY_MARKERS)},
+            })
+        else:
+            manifest = MANIFEST.build_go_manifest(release_id, artifacts)
         (extracted / "release-manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
         client_artifact = next(item for item in artifacts if item["role"] == "client")
         sidecar = {
-            "format": 2,
-            "release_id": release_id,
+            "format": MANIFEST.PRODUCT_MANIFEST_FORMAT if product else 2,
+            **({"version": "1.2.1"} if product else {"release_id": release_id}),
             "source_revision": release_id,
             "protocol": 4,
             "client_artifact": client_artifact,
@@ -727,6 +743,26 @@ class WrapperTests(unittest.TestCase):
                 if path.is_file():
                     archive.add(path, arcname=path.relative_to(extracted).as_posix(), recursive=False)
         return output.getvalue()
+
+    def test_format_four_installer_populates_both_slot_runtimes(self):
+        release_id = "d" * 40
+        payload = self._go_payload(release_id, product=True)
+        release_root = self.root / "product-release"
+        WRAPPER.safe_extract_archive(payload, release_root)
+        manifest = MANIFEST.load_release_manifest(release_root / "release-manifest.json")
+
+        WRAPPER._install_product_release_files(self.loaded, release_root, manifest)
+
+        runtime_root = WRAPPER._go_runtime_root(self.loaded)
+        for slot in WRAPPER.GO_SLOT_NAMES:
+            self.assertEqual(
+                (runtime_root / "slots" / slot / "bin" / "agent-vm-control").read_bytes(),
+                (release_root / "bin" / "agent-vm-control").read_bytes(),
+            )
+            self.assertEqual(
+                (runtime_root / "slots" / slot / "release-manifest.json").read_bytes(),
+                (release_root / "release-manifest.json").read_bytes(),
+            )
 
     def test_format_two_installs_go_binary_bridge_and_retires_old_units(self):
         release_id = "a" * 40
