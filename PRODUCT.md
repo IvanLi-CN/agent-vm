@@ -99,7 +99,7 @@ Logo 未定义，实际组件、字体加载与视觉 token 尚未从实现中�
 - [README.md](README.md)：现有客户端、控制服务、内部 HTTP 与运行时边界。
 - [管理台研究备忘录](docs/proposals/agent-vm-web-console.md)：已确认范围、推荐技术与源码调查。
 - [ADR 0041](docs/adr/0041-agent-vm-session-pinned-image-identity.md)：会话固定不可变镜像身份的目标行为。
-- [ADR 0042](docs/adr/0042-agent-vm-web-management-boundary.md)：内置管理台的交付与权限边界。
+- [ADR 0043](docs/adr/0043-agent-vm-unified-service-security-boundary.md)：统一服务边界与内置管理台的权限边界。
 - [现行 Agent VM Spec](docs/specs/agent-vm/SPEC.md)、[CLI 合同](docs/specs/agent-vm/contracts/cli.md) 与 [管理台合同](docs/specs/agent-vm/contracts/management-api.md)：现有协议 4 与新增浏览器 API、镜像迁移及回退边界。
 - [观测合同](docs/specs/agent-vm/contracts/observability.md)：资源、压力、准入、来源健康与新鲜度。
 

@@ -121,12 +121,6 @@ unknown 或 malformed state fail closed。
 | `oidc-return-path@1` | One-time OIDC transactions retain only an allowlisted same-origin return path until callback consumption. |
 | `principal-identity@1` | The configured OIDC issuer/subject is the sole administrator actor; claims and historical user mappings are never guessed. |
 | `token-revocation@1` | Opaque machine-Token digest, resource version, scope, expiry and revocation state are durable across slots. |
-| `legacy-agent-vm-core@1` | Existing protocol-4 tasks、generations、leases、reservations、ports 和 operation journal。 |
-| `managed-image-catalog@1` | Immutable image records、labels、verification、references 和 default selection。 |
-| `session-image-binding@1` | Session 和 cache identity 继续绑定 exact image fingerprint。 |
-| `management-operation-audit@1` | Durable administrator operation identity、current actor、typed rejected-request 或 `legacy_unknown` actor、optional reason、target、phase 和 outcome。 |
-| `principal-identity@1` | Configured OIDC issuer/subject 是 sole administrator actor；绝不猜测 claims 或 historical user mappings。 |
-| `token-revocation@1` | Opaque machine-Token digest、resource version、scope、expiry 和 revocation state 在 slots 间 durable。 |
 
 Format-4 manifest 声明：
 
