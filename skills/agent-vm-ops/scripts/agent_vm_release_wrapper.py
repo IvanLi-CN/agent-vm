@@ -1469,13 +1469,11 @@ def _needs_migration_recovery(expected_transaction_id: str | None = None) -> str
     return None
 
 
-def _migration_transaction_is_finalized(transaction_id: str) -> bool:
-    process = _run_deployd_cli("transaction", "--transaction", transaction_id, timeout_seconds=30)
-    if process.returncode != 0:
-        return False
+def _transaction_payload_is_finalized(payload: bytes, transaction_id: str) -> bool:
     try:
-        payload = json.loads(process.stdout.decode("utf-8"))
-        transaction = payload.get("value", {}).get("transaction")
+        decoded = json.loads(payload.decode("utf-8"))
+        value = decoded.get("value") if isinstance(decoded, Mapping) else None
+        transaction = value.get("transaction", value) if isinstance(value, Mapping) else value
     except (UnicodeError, json.JSONDecodeError, AttributeError):
         return False
     return (
@@ -1488,7 +1486,16 @@ def _migration_transaction_is_finalized(transaction_id: str) -> bool:
     )
 
 
-def _verify_migration_completion(config: Mapping[str, Any]) -> None:
+def _migration_transaction_is_finalized(transaction_id: str, payload: bytes | None = None) -> bool:
+    if payload is not None and _transaction_payload_is_finalized(payload, transaction_id):
+        return True
+    process = _run_deployd_cli("transaction", "--transaction", transaction_id, timeout_seconds=30)
+    if process.returncode != 0:
+        return False
+    return _transaction_payload_is_finalized(process.stdout, transaction_id)
+
+
+def _verify_migration_completion(config: Mapping[str, Any], migration_response: bytes | None = None) -> None:
     marker = _read_migration_marker(config)
     if marker is None:
         _fail(
@@ -1496,7 +1503,9 @@ def _verify_migration_completion(config: Mapping[str, Any]) -> None:
             "migration completion marker is not backed by the finalized Deployd transaction",
         )
     deadline = time.monotonic() + MIGRATION_VERIFY_TIMEOUT_SECONDS
-    while not _migration_transaction_is_finalized(marker["transaction_id"]):
+    first_check = migration_response
+    while not _migration_transaction_is_finalized(marker["transaction_id"], first_check):
+        first_check = None
         if time.monotonic() >= deadline:
             _fail(
                 "activation_unverified",
@@ -1508,7 +1517,7 @@ def _verify_migration_completion(config: Mapping[str, Any]) -> None:
 def _run_initial_state_migration(config: Mapping[str, Any]) -> None:
     process = _run_deployd_cli("migrate", timeout_seconds=MIGRATION_TIMEOUT_SECONDS)
     if process.returncode == 0:
-        _verify_migration_completion(config)
+        _verify_migration_completion(config, process.stdout)
         return
     marker = _read_migration_marker(config)
     expected_transaction_id = marker.get("transaction_id") if marker is not None else None
@@ -1523,7 +1532,7 @@ def _run_initial_state_migration(config: Mapping[str, Any]) -> None:
             timeout_seconds=MIGRATION_TIMEOUT_SECONDS,
         )
         if recovery.returncode == 0:
-            _verify_migration_completion(config)
+            _verify_migration_completion(config, recovery.stdout)
             return
         _fail(
             "migration_recovery_required",

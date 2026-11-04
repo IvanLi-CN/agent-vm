@@ -531,6 +531,34 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(finalized.call_count, 2)
         sleep.assert_called_once_with(WRAPPER.MIGRATION_VERIFY_POLL_SECONDS)
 
+    def test_migration_completion_verification_accepts_the_success_response(self):
+        marker_path = WRAPPER._migration_marker_path(self.loaded)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "format": 2,
+            "transaction_id": "migration-1",
+            "business_authority": "rqlite",
+            "source_sha256": "a" * 64,
+            "source_size": 1,
+            "state_epoch": "epoch-1",
+            "target_sha256": "b" * 64,
+            "retention_until": "2026-11-11T00:00:00Z",
+        }), encoding="utf-8")
+        marker_path.chmod(0o600)
+        response = json.dumps({
+            "ok": True,
+            "value": {
+                "transaction_id": "migration-1",
+                "target_slot": "state",
+                "phase": "finalize",
+                "state": "finalized",
+                "recovery_required": False,
+            },
+        }).encode()
+        with mock.patch.object(WRAPPER, "_run_deployd_cli") as run_deployd:
+            WRAPPER._verify_migration_completion(self.loaded, response)
+        run_deployd.assert_not_called()
+
     def test_migration_preflight_failure_without_transaction_is_not_recovery(self):
         def run(command, *args, **kwargs):
             if command and command[0] == str(WRAPPER.GO_DEPLOY_PATH):
