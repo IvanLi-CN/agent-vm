@@ -139,7 +139,21 @@ func TestMetricsRejectFutureSourceObservationAsFresh(t *testing.T) {
 	metrics := NewMetrics(nil)
 	metrics.Set(RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: "blue", Consistent: true, Sources: sources})
 	text := metrics.Render()
-	if !strings.Contains(text, `agent_vm_deployd_observation_fresh{source="inventory_observation"} 0`) || strings.Contains(text, "agent_vm_deployd_snapshot_fresh 1") {
+	if !strings.Contains(text, `agent_vm_deployd_observation_fresh{source="inventory_observation"} 0`) || strings.Contains(text, "agent_vm_deployd_snapshot_fresh 1") || strings.Contains(text, `agent_vm_deployd_observation_timestamp_seconds{source="inventory_observation"}`) {
 		t.Fatalf("future observation was reported as fresh:\n%s", text)
+	}
+}
+
+func TestMetricsRejectFutureTopLevelObservationAsFresh(t *testing.T) {
+	now := time.Now().UTC()
+	sources := map[string]SourceObservation{}
+	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
+		sources[name] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
+	}
+	metrics := NewMetrics(nil)
+	metrics.Set(RuntimeSnapshot{ObservedAt: now.Add(time.Second), FreshUntil: now.Add(2 * time.Minute), ActiveSlot: "blue", Consistent: true, Sources: sources})
+	text := metrics.Render()
+	if strings.Contains(text, "agent_vm_deployd_snapshot_fresh 1") || strings.Contains(text, `agent_vm_deployd_active_slot{slot="blue"}`) {
+		t.Fatalf("future top-level observation was reported as fresh:\n%s", text)
 	}
 }

@@ -50,7 +50,7 @@ func (metrics *Metrics) Render() string {
 	output.WriteString("# TYPE agent_vm_deployd_observation_timestamp_seconds gauge\n")
 	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		observation := metrics.latest.Sources[source]
-		if !observation.ObservedAt.IsZero() {
+		if !observation.ObservedAt.IsZero() && !observation.ObservedAt.After(now) {
 			output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_timestamp_seconds{source=%s} %d\n", quote(source), observation.ObservedAt.Unix()))
 		}
 	}
@@ -169,7 +169,7 @@ func withSlotLabel(content, slot string) string {
 func quote(value string) string { return strconv.Quote(value) }
 
 func composedSnapshotFresh(snapshot RuntimeSnapshot, now time.Time) bool {
-	if !snapshot.Consistent || (snapshot.ActiveSlot != "blue" && snapshot.ActiveSlot != "green") || snapshot.ObservedAt.IsZero() || snapshot.FreshUntil.IsZero() || !snapshot.FreshUntil.After(now) {
+	if !snapshot.Consistent || (snapshot.ActiveSlot != "blue" && snapshot.ActiveSlot != "green") || snapshot.ObservedAt.IsZero() || snapshot.ObservedAt.After(now) || snapshot.FreshUntil.IsZero() || !snapshot.FreshUntil.After(now) {
 		return false
 	}
 	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {

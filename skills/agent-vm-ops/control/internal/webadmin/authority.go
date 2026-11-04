@@ -217,7 +217,8 @@ func (authority *Authority) getPublicStatus(writer http.ResponseWriter, request 
 		return
 	}
 
-	fresh, observationUnverified := capacityObservation(metrics, authority.Clock().UTC())
+	now := authority.Clock().UTC()
+	fresh, observationUnverified := capacityObservation(metrics, now)
 	state := "unknown"
 	if fresh {
 		ready := metrics["admission_ready"].(bool)
@@ -250,7 +251,8 @@ func (authority *Authority) getPublicStatus(writer http.ResponseWriter, request 
 	observedAt := stringValue(metrics["observed_at"])
 	var observed any
 	if observedAt != "" {
-		if _, err := time.Parse(time.RFC3339Nano, observedAt); err != nil {
+		parsed, err := time.Parse(time.RFC3339Nano, observedAt)
+		if err != nil || parsed.After(now) {
 			observedAt = ""
 		}
 	}
