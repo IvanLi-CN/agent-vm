@@ -48,8 +48,25 @@ func TestUnifiedUnauthenticatedRequestRecordsTypedAudit(t *testing.T) {
 	if got := value["actor"]; !reflect.DeepEqual(got, map[string]any{"kind": "unauthenticated"}) {
 		t.Fatalf("audit actor = %#v", got)
 	}
-	if got := value["operation_id"]; got != audit[0].EventID {
-		t.Fatalf("rejected audit operation_id=%#v event_id=%q", got, audit[0].EventID)
+	operationID, ok := value["operation_id"].(string)
+	if !ok || ensureOperationID(operationID) != nil || audit[0].OperationID == nil || operationID != *audit[0].OperationID {
+		t.Fatalf("rejected audit operation_id=%#v stored=%v", value["operation_id"], audit[0].OperationID)
+	}
+	if !strings.Contains(recorder.Body.String(), `"operation_id":"`+operationID+`"`) {
+		t.Fatalf("rejection response did not expose operation_id=%q: %s", operationID, recorder.Body.String())
+	}
+}
+
+func TestAuditValueUsesStableSyntheticOperationIDForLegacyRecord(t *testing.T) {
+	legacy := state.ManagementAudit{EventID: "legacy-event", Action: "overview_read", Actor: "legacy-admin", Outcome: "rejected", Phase: "reconciliation", OccurredAt: "2026-11-04T00:00:00Z"}
+	first := auditValue(legacy)["operation_id"]
+	second := auditValue(legacy)["operation_id"]
+	if first != second {
+		t.Fatalf("legacy operation ID changed across reads: first=%#v second=%#v", first, second)
+	}
+	operationID, ok := first.(string)
+	if !ok || ensureOperationID(operationID) != nil {
+		t.Fatalf("legacy operation ID=%#v", first)
 	}
 }
 

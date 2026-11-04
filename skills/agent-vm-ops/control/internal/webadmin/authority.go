@@ -2306,12 +2306,9 @@ func safeOperationError(value map[string]any, operationID, fallbackPhase string)
 }
 
 func auditValue(value state.ManagementAudit) map[string]any {
-	operationID := value.EventID
+	operationID := legacyAuditOperationID(value)
 	if value.OperationID != nil && ensureOperationID(*value.OperationID) == nil {
 		operationID = *value.OperationID
-	}
-	if ensureOperationID(operationID) != nil {
-		operationID = uuid.NewString()
 	}
 	phase := value.Phase
 	if phase == "native_mutation" {
@@ -2331,6 +2328,11 @@ func auditValue(value state.ManagementAudit) map[string]any {
 		result["safe_code"] = nil
 	}
 	return result
+}
+
+func legacyAuditOperationID(value state.ManagementAudit) string {
+	seed := strings.Join([]string{value.EventID, value.Action, value.Actor, value.Outcome, value.Phase, value.OccurredAt}, "\x00")
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("agent-vm:legacy-audit:"+seed)).String()
 }
 
 func actorValue(value string) any {

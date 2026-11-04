@@ -47,17 +47,16 @@ func recordRejectedManagementAudit(store *state.Store, clock func() time.Time, r
 	if actorKind == "" {
 		return
 	}
-	action, target := rejectedAuditIdentity(request, pathValue)
-	var operationID *string
-	if apiErr.OperationID != "" && ensureOperationID(apiErr.OperationID) == nil {
-		operationID = &apiErr.OperationID
+	if ensureOperationID(apiErr.OperationID) != nil {
+		apiErr.OperationID = uuid.NewString()
 	}
+	action, target := rejectedAuditIdentity(request, pathValue)
 	if clock == nil {
 		clock = time.Now
 	}
 	audit := state.ManagementAudit{
 		EventID:     uuid.NewString(),
-		OperationID: operationID,
+		OperationID: &apiErr.OperationID,
 		Action:      action,
 		Actor:       rejectedActor(actorKind),
 		Target:      target,

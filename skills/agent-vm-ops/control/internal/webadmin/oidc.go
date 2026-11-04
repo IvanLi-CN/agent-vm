@@ -186,13 +186,14 @@ func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 		writeProblem(c.Writer, newAPIError("invalid_state", "OIDC login binding is invalid", http.StatusBadRequest, "authentication", false, ""))
 		return
 	}
+	bindingValue := bindingCookie.Value
 	transaction, err := auth.server.Store.GetOIDCTransaction(request.Context(), digestString(stateValue))
 	if err != nil {
 		writeProblem(c.Writer, newAPIError("state_unavailable", "OIDC login state could not be read", http.StatusServiceUnavailable, "authentication", true, ""))
 		return
 	}
-	if transaction == nil || subtle.ConstantTimeCompare([]byte(transaction.BindingCookieDigest), []byte(digestString(bindingCookie.Value))) != 1 {
-		bindings := oidcBindingCookieValues(bindingCookie.Value)
+	if transaction == nil || subtle.ConstantTimeCompare([]byte(transaction.BindingCookieDigest), []byte(digestString(bindingValue))) != 1 {
+		bindings := oidcBindingCookieValues(bindingValue)
 		matched := ""
 		if transaction != nil {
 			for _, binding := range bindings {
@@ -206,7 +207,7 @@ func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 			writeProblem(c.Writer, newAPIError("invalid_state", "OIDC login binding is invalid", http.StatusBadRequest, "authentication", false, ""))
 			return
 		}
-		bindingCookie.Value = matched
+		bindingValue = matched
 	}
 	now := auth.server.now()
 	transaction, consumed, err := auth.server.Store.ConsumeOIDCTransaction(request.Context(), digestString(stateValue), now.Format(time.RFC3339Nano))
@@ -219,40 +220,40 @@ func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 		return
 	}
 	if !validOIDCReturnPath(transaction.ReturnTo) {
-		auth.redirectLoginFailure(c.Writer, request, bindingCookieName)
+		auth.redirectLoginFailure(c.Writer, request, bindingCookieName, bindingValue)
 		return
 	}
 	if errorOK {
-		auth.redirectLoginFailure(c.Writer, request, bindingCookieName)
+		auth.redirectLoginFailure(c.Writer, request, bindingCookieName, bindingValue)
 		return
 	}
 	if transaction.ClientID != auth.server.Config.OIDC.ClientID || transaction.RedirectURI != auth.server.Config.OIDC.RedirectURI {
-		auth.redirectLoginFailure(c.Writer, request, bindingCookieName)
+		auth.redirectLoginFailure(c.Writer, request, bindingCookieName, bindingValue)
 		return
 	}
 	verifier, err := auth.unseal(transaction.CodeVerifierSealed)
 	if err != nil {
-		auth.redirectLoginFailure(c.Writer, request, bindingCookieName)
+		auth.redirectLoginFailure(c.Writer, request, bindingCookieName, bindingValue)
 		return
 	}
 	discovery, err := auth.getDiscovery(request.Context())
 	if err != nil {
-		auth.redirectLoginFailure(c.Writer, request, bindingCookieName)
+		auth.redirectLoginFailure(c.Writer, request, bindingCookieName, bindingValue)
 		return
 	}
 	idToken, err := auth.exchangeCode(request.Context(), discovery, codeValue, verifier)
 	if err != nil {
-		auth.redirectLoginFailure(c.Writer, request, bindingCookieName)
+		auth.redirectLoginFailure(c.Writer, request, bindingCookieName, bindingValue)
 		return
 	}
 	issuer, subject, err := auth.verifyIDToken(request.Context(), discovery, idToken, transaction, now)
 	if err != nil || issuer != auth.server.Config.AdminPrincipal.Issuer || subject != auth.server.Config.AdminPrincipal.Subject {
-		auth.redirectLoginFailure(c.Writer, request, bindingCookieName)
+		auth.redirectLoginFailure(c.Writer, request, bindingCookieName, bindingValue)
 		return
 	}
 	sessionRaw, err := randomToken(32)
 	if err != nil {
-		auth.redirectLoginFailure(c.Writer, request, bindingCookieName)
+		auth.redirectLoginFailure(c.Writer, request, bindingCookieName, bindingValue)
 		return
 	}
 	expires := now.Add(time.Duration(auth.server.Config.SessionTTLSeconds) * time.Second)
@@ -266,11 +267,11 @@ func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 		ExpiresAt:        expires.Format(time.RFC3339Nano),
 	}
 	if err := auth.server.Store.InsertBrowserSession(request.Context(), session); err != nil {
-		auth.redirectLoginFailure(c.Writer, request, bindingCookieName)
+		auth.redirectLoginFailure(c.Writer, request, bindingCookieName, bindingValue)
 		return
 	}
 	http.SetCookie(c.Writer, &http.Cookie{Name: managementSessionCookie, Value: sessionRaw, Path: "/", MaxAge: int(auth.server.Config.SessionTTLSeconds), HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
-	auth.removeBinding(c.Writer, request, bindingCookieName)
+	auth.removeBinding(c.Writer, request, bindingCookieName, bindingValue)
 	c.Header("Cache-Control", "no-store")
 	c.Header("Referrer-Policy", "no-referrer")
 	http.Redirect(c.Writer, request, strings.TrimRight(auth.server.Config.ExternalOrigin, "/")+transaction.ReturnTo, http.StatusFound)
@@ -331,12 +332,26 @@ func oidcBindingCookieValues(raw string) []string {
 	return valid
 }
 
-func (auth *oidcAuthenticator) removeBinding(writer http.ResponseWriter, request *http.Request, cookieName string) {
+func (auth *oidcAuthenticator) removeBinding(writer http.ResponseWriter, request *http.Request, cookieName, bindingValue string) {
+	if cookieName == loginBindingCookie {
+		if cookie, err := request.Cookie(cookieName); err == nil {
+			remaining := make([]string, 0, len(oidcBindingCookieValues(cookie.Value)))
+			for _, value := range oidcBindingCookieValues(cookie.Value) {
+				if value != bindingValue {
+					remaining = append(remaining, value)
+				}
+			}
+			if len(remaining) > 0 {
+				http.SetCookie(writer, &http.Cookie{Name: cookieName, Value: strings.Join(remaining, "."), Path: "/api/v1/auth/oidc", MaxAge: int(oidcTransactionTTL / time.Second), HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+				return
+			}
+		}
+	}
 	http.SetCookie(writer, &http.Cookie{Name: cookieName, Value: "", Path: "/api/v1/auth/oidc", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
 }
 
-func (auth *oidcAuthenticator) redirectLoginFailure(writer http.ResponseWriter, request *http.Request, cookieName string) {
-	auth.removeBinding(writer, request, cookieName)
+func (auth *oidcAuthenticator) redirectLoginFailure(writer http.ResponseWriter, request *http.Request, cookieName, bindingValue string) {
+	auth.removeBinding(writer, request, cookieName, bindingValue)
 	writer.Header().Set("Cache-Control", "no-store")
 	http.Redirect(writer, request, strings.TrimRight(auth.server.Config.ExternalOrigin, "/")+"/?auth=failed", http.StatusFound)
 }

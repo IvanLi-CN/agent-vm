@@ -29,7 +29,7 @@ func TestOIDCBindingCookiesAreTransactionScoped(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback", nil)
 	request.AddCookie(&http.Cookie{Name: firstName, Value: "binding"})
 	recorder := httptest.NewRecorder()
-	(&oidcAuthenticator{}).removeBinding(recorder, request, firstName)
+	(&oidcAuthenticator{}).removeBinding(recorder, request, firstName, "binding")
 	var removed *http.Cookie
 	for _, cookie := range recorder.Result().Cookies() {
 		if cookie.Name == firstName {
@@ -38,6 +38,24 @@ func TestOIDCBindingCookiesAreTransactionScoped(t *testing.T) {
 	}
 	if removed == nil || removed.MaxAge >= 0 {
 		t.Fatalf("removed binding cookie=%#v", removed)
+	}
+}
+
+func TestOIDCLegacyBindingCookieRemovesOnlyConsumedBinding(t *testing.T) {
+	first := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+	second := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32))
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback", nil)
+	request.AddCookie(&http.Cookie{Name: loginBindingCookie, Value: first + "." + second})
+	recorder := httptest.NewRecorder()
+	(&oidcAuthenticator{}).removeBinding(recorder, request, loginBindingCookie, first)
+	var updated *http.Cookie
+	for _, cookie := range recorder.Result().Cookies() {
+		if cookie.Name == loginBindingCookie {
+			updated = cookie
+		}
+	}
+	if updated == nil || updated.Value != second || updated.MaxAge <= 0 {
+		t.Fatalf("updated legacy binding cookie=%#v", updated)
 	}
 }
 

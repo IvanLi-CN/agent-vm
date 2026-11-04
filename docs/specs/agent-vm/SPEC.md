@@ -462,6 +462,7 @@ Protocol 4 和 existing CLI request/response behavior MUST 保持不变。
 ### REQ-AGENT-VM-025 - OIDC principal 与 browser session identity
 
 Browser login MUST 只使用 OIDC Authorization Code + PKCE 和 `code_challenge_method=S256`，并使用 one-time `state`、`nonce`、protected code verifier、exact redirect URI、短时 browser-bound login cookie 和 bounded expiry。
+每个新事务 MUST 使用独立的 browser binding cookie；兼容窗口内回退读取 legacy aggregate binding cookie 时，只能移除已消费的 binding，必须保留同一浏览器中其他仍在途的事务。
 Service MUST 在创建 session 前验证 configured discovery issuer、exact ID Token `iss`、`aud`/`azp`、signature/JWKS、`exp`、`iat` policy、authorization-code exchange 和 nonce。
 Service 与 proxy access logs MUST 删除 callback query strings 和 `Referer`；
 application logs MUST NOT 保留 OIDC code、state、nonce 或 verifier values。
@@ -494,6 +495,7 @@ Sensitive actions MUST 要求 explicit capability、impact preview，以及绑�
 optional non-empty bounded reason 在提供时写入 audit，但不是必需项。
 Unified service MUST 在 native effects 前重新检查 authorization 和 state。
 Accepted、rejected、succeeded、failed 和 outcome-unknown attempts MUST 可审计，并保留 current issuer/subject actor、没有 administrator authority 的 typed `unauthenticated` 或 `unauthorized` rejected-request actor，或明确的 unknown historical actor，以及 optional reason、operation ID、target、phase、result 和 safe error code；
+rejected request 的 operation ID MUST 同时出现在 structured error 和对应 audit record 中；历史上缺少 operation ID 的 audit record MUST 使用稳定、可复现的兼容标识，而不是每次读取生成新的值。
 不得包含 Token values、OIDC codes、credentials、raw command output 或 private paths。
 Historical task 和 native records MUST 根据 durable task identity、generation、lease、journal 和 native identity reconcile；
 不允许 user mapping 或 first-login claim。
