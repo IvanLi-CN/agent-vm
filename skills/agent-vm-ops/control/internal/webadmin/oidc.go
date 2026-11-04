@@ -33,8 +33,9 @@ import (
 )
 
 const (
-	oidcTransactionTTL = 5 * time.Minute
-	oidcClockSkew      = 30 * time.Second
+	oidcTransactionTTL    = 5 * time.Minute
+	oidcClockSkew         = 30 * time.Second
+	maxOIDCBindingCookies = 8
 )
 
 var oidcErrorPattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,64}$`)
@@ -144,7 +145,7 @@ func (auth *oidcAuthenticator) oidcStart(c *gin.Context) {
 	values.Set("code_challenge_method", "S256")
 	location := discovery.Authorization + "?" + values.Encode()
 	http.SetCookie(c.Writer, &http.Cookie{
-		Name: loginBindingCookie, Value: binding, Path: "/api/v1/auth/oidc", MaxAge: int(oidcTransactionTTL / time.Second),
+		Name: loginBindingCookie, Value: appendBindingCookie(request, binding), Path: "/api/v1/auth/oidc", MaxAge: int(oidcTransactionTTL / time.Second),
 		HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode,
 	})
 	c.Header("Cache-Control", "no-store")
@@ -185,9 +186,23 @@ func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 		return
 	}
 	if transaction == nil || subtle.ConstantTimeCompare([]byte(transaction.BindingCookieDigest), []byte(digestString(bindingCookie.Value))) != 1 {
-		writeProblem(c.Writer, newAPIError("invalid_state", "OIDC login binding is invalid", http.StatusBadRequest, "authentication", false, ""))
-		return
+		bindings := oidcBindingCookieValues(bindingCookie.Value)
+		matched := ""
+		if transaction != nil {
+			for _, binding := range bindings {
+				if subtle.ConstantTimeCompare([]byte(transaction.BindingCookieDigest), []byte(digestString(binding))) == 1 {
+					matched = binding
+					break
+				}
+			}
+		}
+		if matched == "" {
+			writeProblem(c.Writer, newAPIError("invalid_state", "OIDC login binding is invalid", http.StatusBadRequest, "authentication", false, ""))
+			return
+		}
+		bindingCookie.Value = matched
 	}
+	matchedBinding := bindingCookie.Value
 	now := auth.server.now()
 	transaction, consumed, err := auth.server.Store.ConsumeOIDCTransaction(request.Context(), digestString(stateValue), now.Format(time.RFC3339Nano))
 	if err != nil {
@@ -199,36 +214,36 @@ func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 		return
 	}
 	if errorOK {
-		auth.redirectLoginFailure(c.Writer, request)
+		auth.redirectLoginFailure(c.Writer, request, matchedBinding)
 		return
 	}
 	if transaction.ClientID != auth.server.Config.OIDC.ClientID || transaction.RedirectURI != auth.server.Config.OIDC.RedirectURI {
-		auth.redirectLoginFailure(c.Writer, request)
+		auth.redirectLoginFailure(c.Writer, request, matchedBinding)
 		return
 	}
 	verifier, err := auth.unseal(transaction.CodeVerifierSealed)
 	if err != nil {
-		auth.redirectLoginFailure(c.Writer, request)
+		auth.redirectLoginFailure(c.Writer, request, matchedBinding)
 		return
 	}
 	discovery, err := auth.getDiscovery(request.Context())
 	if err != nil {
-		auth.redirectLoginFailure(c.Writer, request)
+		auth.redirectLoginFailure(c.Writer, request, matchedBinding)
 		return
 	}
 	idToken, err := auth.exchangeCode(request.Context(), discovery, codeValue, verifier)
 	if err != nil {
-		auth.redirectLoginFailure(c.Writer, request)
+		auth.redirectLoginFailure(c.Writer, request, matchedBinding)
 		return
 	}
 	issuer, subject, err := auth.verifyIDToken(request.Context(), discovery, idToken, transaction, now)
 	if err != nil || issuer != auth.server.Config.AdminPrincipal.Issuer || subject != auth.server.Config.AdminPrincipal.Subject {
-		auth.redirectLoginFailure(c.Writer, request)
+		auth.redirectLoginFailure(c.Writer, request, matchedBinding)
 		return
 	}
 	sessionRaw, err := randomToken(32)
 	if err != nil {
-		auth.redirectLoginFailure(c.Writer, request)
+		auth.redirectLoginFailure(c.Writer, request, matchedBinding)
 		return
 	}
 	expires := now.Add(time.Duration(auth.server.Config.SessionTTLSeconds) * time.Second)
@@ -242,11 +257,11 @@ func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 		ExpiresAt:        expires.Format(time.RFC3339Nano),
 	}
 	if err := auth.server.Store.InsertBrowserSession(request.Context(), session); err != nil {
-		auth.redirectLoginFailure(c.Writer, request)
+		auth.redirectLoginFailure(c.Writer, request, matchedBinding)
 		return
 	}
 	http.SetCookie(c.Writer, &http.Cookie{Name: managementSessionCookie, Value: sessionRaw, Path: "/", MaxAge: int(auth.server.Config.SessionTTLSeconds), HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode})
-	auth.clearBinding(c.Writer)
+	auth.removeBinding(c.Writer, request, matchedBinding)
 	c.Header("Cache-Control", "no-store")
 	c.Header("Referrer-Policy", "no-referrer")
 	http.Redirect(c.Writer, request, strings.TrimRight(auth.server.Config.ExternalOrigin, "/")+transaction.ReturnTo, http.StatusFound)
@@ -286,12 +301,48 @@ func (auth *oidcAuthenticator) validCSRF(request *http.Request, session *state.B
 	return subtle.ConstantTimeCompare([]byte(session.CSRFSecretDigest), []byte(digestString(value))) == 1
 }
 
-func (auth *oidcAuthenticator) clearBinding(writer http.ResponseWriter) {
-	http.SetCookie(writer, &http.Cookie{Name: loginBindingCookie, Value: "", Path: "/api/v1/auth/oidc", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+func appendBindingCookie(request *http.Request, binding string) string {
+	values := []string{}
+	if cookie, err := request.Cookie(loginBindingCookie); err == nil {
+		values = oidcBindingCookieValues(cookie.Value)
+	}
+	values = append(values, binding)
+	if len(values) > maxOIDCBindingCookies {
+		values = values[len(values)-maxOIDCBindingCookies:]
+	}
+	return strings.Join(values, ".")
 }
 
-func (auth *oidcAuthenticator) redirectLoginFailure(writer http.ResponseWriter, request *http.Request) {
-	auth.clearBinding(writer)
+func oidcBindingCookieValues(raw string) []string {
+	values := strings.Split(raw, ".")
+	valid := make([]string, 0, len(values))
+	for _, value := range values {
+		decoded, err := base64.RawURLEncoding.DecodeString(value)
+		if err == nil && len(decoded) == 32 {
+			valid = append(valid, value)
+		}
+	}
+	return valid
+}
+
+func (auth *oidcAuthenticator) removeBinding(writer http.ResponseWriter, request *http.Request, matched string) {
+	remaining := []string{}
+	if cookie, err := request.Cookie(loginBindingCookie); err == nil {
+		for _, value := range oidcBindingCookieValues(cookie.Value) {
+			if value != matched {
+				remaining = append(remaining, value)
+			}
+		}
+	}
+	if len(remaining) == 0 {
+		http.SetCookie(writer, &http.Cookie{Name: loginBindingCookie, Value: "", Path: "/api/v1/auth/oidc", MaxAge: -1, HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+		return
+	}
+	http.SetCookie(writer, &http.Cookie{Name: loginBindingCookie, Value: strings.Join(remaining, "."), Path: "/api/v1/auth/oidc", MaxAge: int(oidcTransactionTTL / time.Second), HttpOnly: true, Secure: true, SameSite: http.SameSiteLaxMode})
+}
+
+func (auth *oidcAuthenticator) redirectLoginFailure(writer http.ResponseWriter, request *http.Request, matched string) {
+	auth.removeBinding(writer, request, matched)
 	writer.Header().Set("Cache-Control", "no-store")
 	http.Redirect(writer, request, strings.TrimRight(auth.server.Config.ExternalOrigin, "/")+"/?auth=failed", http.StatusFound)
 }

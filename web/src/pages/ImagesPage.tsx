@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { actionLabel, formatDateTime, shortFingerprint } from "../app/format";
 import { ManagementRequestError, createOperationId, listImages, previewImageAction, startImageImport, submitImageAction, uploadImageImportContent } from "../app/api";
 import { useManagementAuth } from "../app/auth";
+import { useOperationRecovery } from "../app/operationRecovery";
 import type { ActionPreview, ImageImportRequest, Locale, ManagedImage } from "../app/types";
 import { auditReasonWithinLimit, optionalAuditReason } from "../app/validation";
 import { ActionDialog } from "../components/ActionDialog";
@@ -43,7 +44,7 @@ export function ImagesPage() {
   const [pendingImport, setPendingImport] = useState<ImportSubmission | null>(null);
   const [action, setAction] = useState<ImageAction | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
-  const [operationId, setOperationId] = useState<string | null>(null);
+  const [operationId, setOperationId] = useOperationRecovery("/images");
   const query = useQuery({ queryKey: ["images", search, cursor], queryFn: () => listImages(search, cursor), enabled: auth.isAuthenticated, refetchInterval: 10_000, refetchIntervalInBackground: false });
   const selected = query.data?.items.find((image) => image.fingerprint === selectedFingerprint) ?? query.data?.items[0] ?? null;
   const importMutation = useMutation({

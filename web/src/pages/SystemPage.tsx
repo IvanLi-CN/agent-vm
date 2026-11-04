@@ -4,6 +4,7 @@ import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ManagementRequestError, createOperationId, getSystem, previewMaintenance, submitMaintenance } from "../app/api";
 import { useManagementAuth } from "../app/auth";
+import { useOperationRecovery } from "../app/operationRecovery";
 import { actionLabel, formatDateTime } from "../app/format";
 import type { ActionPreview, Locale, SystemStatus } from "../app/types";
 import { ActionDialog } from "../components/ActionDialog";
@@ -21,7 +22,7 @@ export function SystemPage() {
   const client = useQueryClient();
   const [action, setAction] = useState<MaintenanceAction | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
-  const [operationId, setOperationId] = useState<string | null>(null);
+  const [operationId, setOperationId] = useOperationRecovery("/system");
   const [actionError, setActionError] = useState<string | null>(null);
   const [dialogOwner, setDialogOwner] = useState<ActionDialogOwner>(null);
   const setTokenDialogOpen = useCallback((open: boolean) => {

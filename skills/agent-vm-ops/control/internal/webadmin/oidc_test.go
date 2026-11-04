@@ -1,6 +1,7 @@
 package webadmin
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -18,6 +19,30 @@ import (
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
+
+func TestOIDCBindingCookieKeepsOutstandingTransactionsIndependent(t *testing.T) {
+	first := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+	second := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32))
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/start", nil)
+	request.AddCookie(&http.Cookie{Name: loginBindingCookie, Value: first})
+	combined := appendBindingCookie(request, second)
+	if combined != first+"."+second {
+		t.Fatalf("combined binding cookie=%q", combined)
+	}
+	request = httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback", nil)
+	request.AddCookie(&http.Cookie{Name: loginBindingCookie, Value: combined})
+	recorder := httptest.NewRecorder()
+	(&oidcAuthenticator{}).removeBinding(recorder, request, second)
+	var remaining *http.Cookie
+	for _, cookie := range recorder.Result().Cookies() {
+		if cookie.Name == loginBindingCookie {
+			remaining = cookie
+		}
+	}
+	if remaining == nil || remaining.Value != first {
+		t.Fatalf("remaining binding cookie=%#v", remaining)
+	}
+}
 
 func TestOIDCLoginUsesDurableTransactionAndSession(t *testing.T) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)

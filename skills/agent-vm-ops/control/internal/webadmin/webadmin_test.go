@@ -228,7 +228,7 @@ func TestOverviewMarksStaleSourcesAndBlocksUnsafeAdmission(t *testing.T) {
 		"up":                false,
 		"admission_ready":   true,
 		"draining":          false,
-		"task_states":       map[string]any{"active": float64(4)},
+		"task_states":       map[string]any{"active": float64(4), "preparing": float64(0), "cached": float64(0), "closing": float64(0), "deleting": float64(0), "failed": float64(0), "absent": float64(0)},
 		"default_admission": map[string]any{"ready": true, "reasons": []any{}},
 	}
 	value, err := authority.overview(metrics, context.Background())

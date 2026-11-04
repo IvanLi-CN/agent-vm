@@ -2393,17 +2393,38 @@ func metricsMapValue(root map[string]any, first, second string) any {
 }
 
 func validTaskStates(value any) bool {
+	const expectedStateCount = 7
+	expectedStates := map[string]struct{}{
+		"active": {}, "preparing": {}, "cached": {}, "closing": {},
+		"deleting": {}, "failed": {}, "absent": {},
+	}
 	switch states := value.(type) {
 	case map[string]any:
+		if len(states) != expectedStateCount {
+			return false
+		}
 		for _, raw := range states {
 			if _, ok := nonNegativeInt64(raw); !ok {
 				return false
 			}
 		}
+		for name := range states {
+			if _, ok := expectedStates[name]; !ok {
+				return false
+			}
+		}
 		return true
 	case map[string]int64:
+		if len(states) != expectedStateCount {
+			return false
+		}
 		for _, raw := range states {
 			if raw < 0 {
+				return false
+			}
+		}
+		for name := range states {
+			if _, ok := expectedStates[name]; !ok {
 				return false
 			}
 		}
@@ -2426,7 +2447,7 @@ func nonNegativeInt64(value any) (int64, bool) {
 		result, err := parsed.Int64()
 		return result, err == nil && result >= 0
 	case float64:
-		if parsed < 0 || parsed != math.Trunc(parsed) || parsed > float64(math.MaxInt64) {
+		if parsed < 0 || parsed != math.Trunc(parsed) || parsed >= float64(math.MaxInt64) {
 			return 0, false
 		}
 		return int64(parsed), true

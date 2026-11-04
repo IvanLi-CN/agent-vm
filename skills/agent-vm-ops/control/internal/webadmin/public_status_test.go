@@ -26,7 +26,7 @@ func TestPublicStatusIsAnonymousAndSanitized(t *testing.T) {
 			"remaining": map[string]any{"cpu": 2, "memory_mib": 1024},
 		},
 		"ct_cpu":      map[string]any{"capacity_vcpu": 4},
-		"task_states": map[string]any{"active": 2},
+		"task_states": completeTaskStates(2),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -73,6 +73,10 @@ func TestPublicStatusIsAnonymousAndSanitized(t *testing.T) {
 	}
 }
 
+func completeTaskStates(active int) map[string]any {
+	return map[string]any{"active": active, "preparing": 0, "cached": 0, "closing": 0, "deleting": 0, "failed": 0, "absent": 0}
+}
+
 func TestPublicStatusDoesNotReportMalformedTaskStatesAsHealthy(t *testing.T) {
 	authority, store, cfg := testAuthority(t)
 	now := time.Date(2026, 11, 4, 8, 0, 0, 0, time.UTC)
@@ -82,7 +86,7 @@ func TestPublicStatusDoesNotReportMalformedTaskStatesAsHealthy(t *testing.T) {
 		"observed_at":     now.Add(-10 * time.Second).Format(time.RFC3339Nano),
 		"up":              true,
 		"admission_ready": true,
-		"task_states":     map[string]any{"active": "not-a-count"},
+		"task_states":     map[string]any{"active": "not-a-count", "preparing": 0, "cached": 0, "closing": 0, "deleting": 0, "failed": 0, "absent": 0},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -105,5 +109,55 @@ func TestPublicStatusDoesNotReportMalformedTaskStatesAsHealthy(t *testing.T) {
 	}
 	if value["state"] != "unknown" || value["active_sessions"] != nil || value["observation_state"] != "unverified" {
 		t.Fatalf("malformed public status=%#v", value)
+	}
+}
+
+func TestPublicStatusDoesNotReportIncompleteTaskStatesAsHealthy(t *testing.T) {
+	authority, store, cfg := testAuthority(t)
+	authority.Clock = func() time.Time { return time.Date(2026, 11, 4, 8, 0, 0, 0, time.UTC) }
+	authority.Snapshots = observe.NewSnapshotStore(t.TempDir())
+	if err := authority.Snapshots.Publish("capacity", map[string]any{
+		"observed_at": authority.Clock().Add(-10 * time.Second).Format(time.RFC3339Nano), "up": true, "admission_ready": true,
+		"task_states": map[string]any{"active": 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewUnifiedServer(UnifiedOptions{Config: cfg, Authority: authority, Store: store, Snapshots: authority.Snapshots, Assets: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("index")}}, Clock: authority.Clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/public/status", nil))
+	var value map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &value); err != nil {
+		t.Fatal(err)
+	}
+	if value["state"] != "unknown" || value["active_sessions"] != nil || value["observation_state"] != "unverified" {
+		t.Fatalf("incomplete public status=%#v", value)
+	}
+}
+
+func TestPublicStatusDoesNotAcceptOutOfRangeTaskStateCount(t *testing.T) {
+	authority, store, cfg := testAuthority(t)
+	authority.Clock = func() time.Time { return time.Date(2026, 11, 4, 8, 0, 0, 0, time.UTC) }
+	authority.Snapshots = observe.NewSnapshotStore(t.TempDir())
+	if err := authority.Snapshots.Publish("capacity", map[string]any{
+		"observed_at": authority.Clock().Add(-10 * time.Second).Format(time.RFC3339Nano), "up": true, "admission_ready": true,
+		"task_states": map[string]any{"active": float64(9223372036854775808), "preparing": 0, "cached": 0, "closing": 0, "deleting": 0, "failed": 0, "absent": 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server, err := NewUnifiedServer(UnifiedOptions{Config: cfg, Authority: authority, Store: store, Snapshots: authority.Snapshots, Assets: fstest.MapFS{"index.html": &fstest.MapFile{Data: []byte("index")}}, Clock: authority.Clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/public/status", nil))
+	var value map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &value); err != nil {
+		t.Fatal(err)
+	}
+	if value["state"] != "unknown" || value["active_sessions"] != nil || value["observation_state"] != "unverified" {
+		t.Fatalf("out-of-range public status=%#v", value)
 	}
 }

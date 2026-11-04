@@ -5,6 +5,7 @@ import { useTranslation } from "react-i18next";
 import { actionLabel, formatBytes, formatDateTime, shortFingerprint } from "../app/format";
 import { ManagementRequestError, createOperationId, listVMs, previewVMAction, submitVMAction } from "../app/api";
 import { useManagementAuth } from "../app/auth";
+import { useOperationRecovery } from "../app/operationRecovery";
 import type { ActionPreview, Locale, ManagedVM } from "../app/types";
 import { ActionDialog } from "../components/ActionDialog";
 import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "../components/ui/select";
@@ -29,7 +30,7 @@ export function VMsPage() {
   const [action, setAction] = useState<string | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
   const [parameters, setParameters] = useState<Record<string, unknown>>({});
-  const [operationId, setOperationId] = useState<string | null>(null);
+  const [operationId, setOperationId] = useOperationRecovery("/vms");
   const [actionError, setActionError] = useState<string | null>(null);
   const vmQuery = useQuery({ queryKey: ["vms", q, state, leaseState, cursor], queryFn: () => listVMs({ q, state, leaseState, cursor }), enabled: auth.isAuthenticated, refetchInterval: 10_000, refetchIntervalInBackground: false });
   const selected = vmQuery.data?.items.find((vm) => vm.task_id === selectedId) ?? vmQuery.data?.items[0] ?? null;
