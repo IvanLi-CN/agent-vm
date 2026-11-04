@@ -44,8 +44,12 @@ func TestUnifiedUnauthenticatedRequestRecordsTypedAudit(t *testing.T) {
 	if len(audit) != 1 || audit[0].Actor != rejectedActor("unauthenticated") || audit[0].Outcome != "rejected" || audit[0].Detail["code"] != "authentication_required" {
 		t.Fatalf("audit = %#v", audit)
 	}
-	if got := auditValue(audit[0])["actor"]; !reflect.DeepEqual(got, map[string]any{"kind": "unauthenticated"}) {
+	value := auditValue(audit[0])
+	if got := value["actor"]; !reflect.DeepEqual(got, map[string]any{"kind": "unauthenticated"}) {
 		t.Fatalf("audit actor = %#v", got)
+	}
+	if got := value["operation_id"]; got != audit[0].EventID {
+		t.Fatalf("rejected audit operation_id=%#v event_id=%q", got, audit[0].EventID)
 	}
 }
 

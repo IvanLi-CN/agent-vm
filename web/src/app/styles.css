@@ -656,6 +656,12 @@ svg { flex: none; }
   .dialog-actions .ui-button { width: 100%; }
 }
 
+@media (max-width: 360px) {
+  .public-home-header { flex-wrap: wrap; }
+  .public-home-header-actions { width: 100%; justify-content: stretch; margin-left: 0; }
+  .public-home-header-actions .public-login-link { flex: 1; justify-content: center; }
+}
+
 @media (max-width: 860px) {
   .token-row { grid-template-columns: minmax(0, 1fr) auto; }
   .token-row-meta { grid-column: 1 / -1; grid-row: 2; }

@@ -20,27 +20,24 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
-func TestOIDCBindingCookieKeepsOutstandingTransactionsIndependent(t *testing.T) {
-	first := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
-	second := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{2}, 32))
-	request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/start", nil)
-	request.AddCookie(&http.Cookie{Name: loginBindingCookie, Value: first})
-	combined := appendBindingCookie(request, second)
-	if combined != first+"."+second {
-		t.Fatalf("combined binding cookie=%q", combined)
+func TestOIDCBindingCookiesAreTransactionScoped(t *testing.T) {
+	firstName := oidcBindingCookieName("first-state")
+	secondName := oidcBindingCookieName("second-state")
+	if firstName == secondName {
+		t.Fatal("transaction binding cookie names must be independent")
 	}
-	request = httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback", nil)
-	request.AddCookie(&http.Cookie{Name: loginBindingCookie, Value: combined})
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback", nil)
+	request.AddCookie(&http.Cookie{Name: firstName, Value: "binding"})
 	recorder := httptest.NewRecorder()
-	(&oidcAuthenticator{}).removeBinding(recorder, request, second)
-	var remaining *http.Cookie
+	(&oidcAuthenticator{}).removeBinding(recorder, request, firstName)
+	var removed *http.Cookie
 	for _, cookie := range recorder.Result().Cookies() {
-		if cookie.Name == loginBindingCookie {
-			remaining = cookie
+		if cookie.Name == firstName {
+			removed = cookie
 		}
 	}
-	if remaining == nil || remaining.Value != first {
-		t.Fatalf("remaining binding cookie=%#v", remaining)
+	if removed == nil || removed.MaxAge >= 0 {
+		t.Fatalf("removed binding cookie=%#v", removed)
 	}
 }
 
@@ -99,7 +96,7 @@ func TestOIDCLoginUsesDurableTransactionAndSession(t *testing.T) {
 		t.Fatalf("OIDC transaction=%#v err=%v", transaction, err)
 	}
 	cookies := startRecorder.Result().Cookies()
-	if len(cookies) != 1 || cookies[0].Name != loginBindingCookie || !cookies[0].Secure || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
+	if len(cookies) != 1 || cookies[0].Name != oidcBindingCookieName(stateValue) || !cookies[0].Secure || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteLaxMode {
 		t.Fatalf("OIDC binding cookie = %#v", cookies)
 	}
 
@@ -194,7 +191,7 @@ func TestOIDCCallbackRejectsPersistedUnsafeReturnPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	callback := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback?error=access_denied&state="+url.QueryEscape(stateValue), nil)
-	callback.AddCookie(&http.Cookie{Name: loginBindingCookie, Value: binding})
+	callback.AddCookie(&http.Cookie{Name: oidcBindingCookieName(stateValue), Value: binding})
 	recorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(recorder, callback)
 	if recorder.Code != http.StatusFound || recorder.Header().Get("Location") != strings.TrimRight(cfg.ExternalOrigin, "/")+"/?auth=failed" {

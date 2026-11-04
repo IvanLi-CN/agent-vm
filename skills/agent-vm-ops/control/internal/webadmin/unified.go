@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	loginBindingCookie = "agent_vm_oidc_binding"
-	maxAgentBodyBytes  = 2 * 1024 * 1024
+	loginBindingCookie       = "agent_vm_oidc_binding"
+	loginBindingCookiePrefix = loginBindingCookie + "_"
+	maxAgentBodyBytes        = 2 * 1024 * 1024
 )
 
 type UnifiedOptions struct {

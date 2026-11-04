@@ -23,6 +23,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
@@ -32,7 +33,10 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
-const maxManagementJSONBytes = 256 * 1024
+const (
+	maxManagementJSONBytes       = 256 * 1024
+	publicStatusSnapshotCacheTTL = time.Second
+)
 
 var managementFingerprintPattern = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
@@ -55,6 +59,11 @@ type Authority struct {
 	ProductVersion string
 	Clock          func() time.Time
 	uploadMu       sync.Mutex
+	publicStatusMu sync.Mutex
+	publicStatusAt time.Time
+	publicStatusOK bool
+	publicMetrics  map[string]any
+	publicErr      error
 }
 
 func NewAuthority(options AuthorityOptions) (*Authority, error) {
@@ -202,7 +211,7 @@ func (authority *Authority) getPublicStatus(writer http.ResponseWriter, request 
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	metrics, err := authority.readCapacityMetrics()
+	metrics, err := authority.readPublicCapacityMetrics()
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "request_validation", ""))
 		return
@@ -241,6 +250,11 @@ func (authority *Authority) getPublicStatus(writer http.ResponseWriter, request 
 	observedAt := stringValue(metrics["observed_at"])
 	var observed any
 	if observedAt != "" {
+		if _, err := time.Parse(time.RFC3339Nano, observedAt); err != nil {
+			observedAt = ""
+		}
+	}
+	if observedAt != "" {
 		observed = observedAt
 	}
 	writer.Header().Set("Cache-Control", "public, max-age=15, stale-while-revalidate=45")
@@ -271,6 +285,21 @@ func (authority *Authority) readCapacityMetrics() (map[string]any, error) {
 	return envelope, nil
 }
 
+func (authority *Authority) readPublicCapacityMetrics() (map[string]any, error) {
+	now := authority.Clock().UTC()
+	authority.publicStatusMu.Lock()
+	defer authority.publicStatusMu.Unlock()
+	if authority.publicStatusOK && now.Sub(authority.publicStatusAt) >= 0 && now.Sub(authority.publicStatusAt) < publicStatusSnapshotCacheTTL {
+		return authority.publicMetrics, authority.publicErr
+	}
+	metrics, err := authority.readCapacityMetrics()
+	authority.publicStatusAt = now
+	authority.publicStatusOK = true
+	authority.publicMetrics = metrics
+	authority.publicErr = err
+	return metrics, err
+}
+
 func publicObservationStateFromMetrics(metrics map[string]any, fresh, unverified bool) string {
 	if unverified {
 		return "unverified"
@@ -284,10 +313,10 @@ func publicObservationStateFromMetrics(metrics map[string]any, fresh, unverified
 func capacityObservation(metrics map[string]any, now time.Time) (fresh, unverified bool) {
 	observedAt := stringValue(metrics["observed_at"])
 	observedTime, parseErr := time.Parse(time.RFC3339Nano, observedAt)
-	if observedAt == "" || parseErr != nil || observedTime.After(now.Add(5*time.Second)) || now.Sub(observedTime) > 60*time.Second {
+	if observedAt == "" || parseErr != nil || observedTime.After(now) || now.Sub(observedTime) > 60*time.Second {
 		return false, false
 	}
-	if !validTaskStates(metrics["task_states"]) || !validAdmissionObservation(metrics) {
+	if !validTaskStates(metrics["task_states"]) || !validAdmissionObservation(metrics) || !validObservationConsistency(metrics) {
 		return false, true
 	}
 	return true, false
@@ -301,6 +330,11 @@ func validAdmissionObservation(metrics map[string]any) bool {
 		return false
 	}
 	return true
+}
+
+func validObservationConsistency(metrics map[string]any) bool {
+	consistent, ok := metrics["observation_consistent"].(bool)
+	return ok && consistent
 }
 
 func nativeObservationState(value any, fresh, unverified bool) string {
@@ -2272,9 +2306,12 @@ func safeOperationError(value map[string]any, operationID, fallbackPhase string)
 }
 
 func auditValue(value state.ManagementAudit) map[string]any {
-	var operationID any
-	if value.OperationID != nil {
+	operationID := value.EventID
+	if value.OperationID != nil && ensureOperationID(*value.OperationID) == nil {
 		operationID = *value.OperationID
+	}
+	if ensureOperationID(operationID) != nil {
+		operationID = uuid.NewString()
 	}
 	phase := value.Phase
 	if phase == "native_mutation" {

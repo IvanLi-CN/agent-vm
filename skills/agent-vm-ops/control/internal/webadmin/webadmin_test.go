@@ -224,12 +224,13 @@ func TestOverviewMarksStaleSourcesAndBlocksUnsafeAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	metrics := map[string]any{
-		"observed_at":       time.Now().UTC().Format(time.RFC3339Nano),
-		"up":                false,
-		"admission_ready":   true,
-		"draining":          false,
-		"task_states":       map[string]any{"active": float64(4), "preparing": float64(0), "cached": float64(0), "closing": float64(0), "deleting": float64(0), "failed": float64(0), "absent": float64(0)},
-		"default_admission": map[string]any{"ready": true, "reasons": []any{}},
+		"observed_at":            time.Now().UTC().Format(time.RFC3339Nano),
+		"up":                     false,
+		"admission_ready":        true,
+		"draining":               false,
+		"observation_consistent": true,
+		"task_states":            map[string]any{"active": float64(4), "preparing": float64(0), "cached": float64(0), "closing": float64(0), "deleting": float64(0), "failed": float64(0), "absent": float64(0)},
+		"default_admission":      map[string]any{"ready": true, "reasons": []any{}},
 	}
 	value, err := authority.overview(metrics, context.Background())
 	if err != nil {
