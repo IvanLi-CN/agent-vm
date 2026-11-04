@@ -43,7 +43,7 @@ func (metrics *Metrics) Render() string {
 	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		observation := metrics.latest.Sources[source]
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_up{source=%s} %d\n", quote(source), boolInt(observation.Up)))
-		fresh := observation.Up && !observation.ObservedAt.IsZero() && !observation.FreshUntil.IsZero() && now.Before(observation.FreshUntil)
+		fresh := sourceObservationFresh(metrics.latest, source, now)
 		output.WriteString(fmt.Sprintf("agent_vm_deployd_observation_fresh{source=%s} %d\n", quote(source), boolInt(fresh)))
 	}
 	output.WriteString("# HELP agent_vm_deployd_observation_timestamp_seconds Unix timestamp of the composed observation.\n")

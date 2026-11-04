@@ -128,3 +128,18 @@ func TestMetricsRetainCapacityFamiliesWhenInventoryFails(t *testing.T) {
 		t.Fatal("stale composed active-slot state was exposed")
 	}
 }
+
+func TestMetricsRejectFutureSourceObservationAsFresh(t *testing.T) {
+	now := time.Now().UTC()
+	sources := map[string]SourceObservation{}
+	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation"} {
+		sources[name] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
+	}
+	sources["inventory_observation"] = SourceObservation{Up: true, ObservedAt: now.Add(time.Second), FreshUntil: now.Add(2 * time.Minute)}
+	metrics := NewMetrics(nil)
+	metrics.Set(RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: "blue", Consistent: true, Sources: sources})
+	text := metrics.Render()
+	if !strings.Contains(text, `agent_vm_deployd_observation_fresh{source="inventory_observation"} 0`) || strings.Contains(text, "agent_vm_deployd_snapshot_fresh 1") {
+		t.Fatalf("future observation was reported as fresh:\n%s", text)
+	}
+}
