@@ -147,8 +147,8 @@ GO_UNIT_EXEC_START = {
         "ExecStart=/opt/agent-vm-native/bin/agent-vm-deployd --config /etc/agent-vm-native/deployd.json",
 }
 GO_UNIT_CONTENT_SHA256 = {
-    "agent-vm-native.service": "834cd02f2afbc10d463d79375e8a1aa9d1e2e94157bfaed96476295744817cc6",
-    "agent-vm-native@.service": "1312d885549089b96d73190bf7c7c4fe49626d7a0624e87d33b9462334f2fc06",
+    "agent-vm-native.service": "c7537077f0299c259e1f32eb4365db2da07fd2e8911dba0164364481e55396cc",
+    "agent-vm-native@.service": "1c5306d7643fcb0a5c8c570b8d95bf7fe8c1808eb8e7a9db03f753556aeb73e5",
     "agent-vm-deployd.service": "d82ab839539aff06507777f6f77dc8eba83ecabde9e86a3e285534588a5cdd79",
 }
 PRODUCT_UNIT_EXEC_START = {

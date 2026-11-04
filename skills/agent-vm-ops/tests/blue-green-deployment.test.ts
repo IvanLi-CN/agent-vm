@@ -105,6 +105,7 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   const slot = read("skills/agent-vm-ops/assets/systemd/agent-vm-native@.service");
   expect(slot).toContain("ExecStart=/var/lib/agent-vm-native/slots/%i/bin/agent-vm-control");
   expect(slot).toContain("--manifest /var/lib/agent-vm-native/slots/%i/release-manifest.json");
+  expect(slot).toContain("Environment=HOME=/var/lib/agent-vm-native");
   expect(slot).not.toContain("BindReadOnlyPaths=");
   const deployd = read("skills/agent-vm-ops/assets/systemd/agent-vm-deployd.service");
   expect(deployd).toContain("agent-vm-deployd --config /etc/agent-vm-native/deployd.json");

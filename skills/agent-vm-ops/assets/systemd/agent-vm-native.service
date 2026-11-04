@@ -6,6 +6,7 @@ Wants=incus.service
 [Service]
 Type=simple
 ExecStart=/opt/agent-vm-native/bin/agent-vm-control serve --config /etc/agent-vm-native/config.json --manifest /opt/agent-vm-native/release-manifest.json
+Environment=HOME=/var/lib/agent-vm-native
 Restart=on-failure
 RestartSec=2s
 TimeoutStartSec=60s
@@ -14,8 +15,6 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 Group=agent-vm-web
 UMask=0077
-RuntimeDirectory=agent-vm-native
-RuntimeDirectoryMode=0750
 
 [Install]
 WantedBy=multi-user.target
