@@ -111,6 +111,7 @@ GO_DEPLOYD_PATH = Path("/opt/agent-vm-native/bin/agent-vm-deployd")
 GO_DEPLOY_PATH = Path("/opt/agent-vm-native/bin/agent-vm-deploy")
 GO_SLOT_NAMES = ("blue", "green")
 GO_CONTROL_SOCKET = Path("/run/agent-vm-native/control.sock")
+GO_ACTIVE_SOCKET = Path("/var/lib/agent-vm-native/active/app.sock")
 GO_DEPLOYD_SOCKET = Path("/run/agent-vm-native/deployd.sock")
 STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
 MIGRATION_TIMEOUT_SECONDS = 9000
@@ -252,6 +253,11 @@ def _migration_marker_is_valid(config: Mapping[str, Any]) -> bool:
 def _go_bridge_target(config: Mapping[str, Any]) -> Path:
     configured = Path(config["control_path"])
     return configured.with_name("agent_vm_control_bridge.ts")
+
+
+def _go_control_socket() -> Path:
+    """Use the stable active slot path after blue-green activation."""
+    return GO_ACTIVE_SOCKET if os.path.lexists(GO_ACTIVE_SOCKET) else GO_CONTROL_SOCKET
 
 
 class WrapperError(Exception):
@@ -1268,7 +1274,7 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
             _fail("drain_unverified", "installed client release metadata is invalid")
         view = metadata.get("client_view") if isinstance(metadata, Mapping) else None
         if isinstance(metadata, Mapping) and metadata.get("format") in {GO_MANIFEST_FORMAT, LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT} and isinstance(view, Mapping) and view.get("transport") == "go-request":
-            command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
+            command = [str(GO_CONTROL_PATH), "request", "--socket", str(_go_control_socket()), "--timeout", "30s"]
     def control_result(action: str, *, allow_legacy_unknown: bool = False) -> Mapping[str, Any] | None:
         try:
             process = subprocess.run(
@@ -1697,6 +1703,9 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
         elif item["role"] == "control":
             if item["path"] == "agent_vm_control_bridge.ts":
                 _copy_atomic(source, _go_bridge_target(config), owner_uid, item["mode"])
+                legacy_target = Path(config["control_path"])
+                if legacy_target != _go_bridge_target(config):
+                    _copy_atomic(source, legacy_target, owner_uid, item["mode"])
             elif item["path"] == "bin/agent-vm-control":
                 _copy_atomic(source, _go_control_target(config), owner_uid, item["mode"])
             elif item["path"] == "bin/agent-vm-deployd":

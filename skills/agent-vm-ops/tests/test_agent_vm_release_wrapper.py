@@ -101,6 +101,23 @@ class WrapperTests(unittest.TestCase):
         )
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
+    def test_drain_verification_uses_active_slot_socket_after_cutover(self):
+        self.drain_patch.stop()
+        sidecar = Path(self.loaded["control_path"]).with_name("client-release.json")
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"format": 4, "client_view": {"transport": "go-request"}}), encoding="utf-8")
+        response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
+        with mock.patch.object(WRAPPER.os.path, "lexists", return_value=True), mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ) as run:
+            WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [str(WRAPPER.GO_CONTROL_PATH), "request", "--socket", str(WRAPPER.GO_ACTIVE_SOCKET), "--timeout", "30s"],
+        )
+
     def test_drain_verification_rejects_inflight_management_operations(self):
         self.drain_patch.stop()
         responses = [
@@ -763,6 +780,9 @@ class WrapperTests(unittest.TestCase):
                 (runtime_root / "slots" / slot / "release-manifest.json").read_bytes(),
                 (release_root / "release-manifest.json").read_bytes(),
             )
+        bridge = (release_root / "agent_vm_control_bridge.ts").read_bytes()
+        self.assertEqual(Path(self.loaded["control_path"]).read_bytes(), bridge)
+        self.assertEqual((Path(self.loaded["control_path"]).parent / "agent_vm_control_bridge.ts").read_bytes(), bridge)
 
     def test_format_two_installs_go_binary_bridge_and_retires_old_units(self):
         release_id = "a" * 40
