@@ -101,6 +101,33 @@ class WrapperTests(unittest.TestCase):
         )
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
+    def test_clean_activation_accepts_stopped_runtime_without_legacy_drain(self):
+        self.drain_patch.stop()
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 3, b"", b""),
+        ) as run:
+            WRAPPER._ensure_drained(self.loaded, allow_initial=True)
+        self.assertEqual(run.call_count, len((
+            "agent-vm-native.service",
+            "agent-vm-native@blue.service",
+            "agent-vm-native@green.service",
+            "agent-vm-deployd.service",
+        )))
+        self.assertTrue(all(call.args[0][:3] == ["systemctl", "is-active", "--quiet"] for call in run.call_args_list))
+
+    def test_clean_activation_rejects_a_running_runtime_without_legacy_drain(self):
+        self.drain_patch.stop()
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._ensure_drained(self.loaded, allow_initial=True)
+        self.assertEqual(failure.exception.code, "drain_required")
+
     def test_drain_verification_uses_active_slot_socket_after_cutover(self):
         self.drain_patch.stop()
         sidecar = Path(self.loaded["control_path"]).with_name("client-release.json")

@@ -104,16 +104,26 @@ Deployd 迁移使用 `deployd.json` 中的 `migration.rqlite_url` 和 `migration
 
 ## 一键首次部署
 
-首次部署的输入是已经安装好的旧 `agent-vm-native.service`、旧 `/var/lib/agent-vm-native/state.sqlite3`、rqlite 配置、两个槽位配置和已验证的 format-4 发布包。
+首次部署可以从已经安装好的旧 `agent-vm-native.service` 和旧
+`/var/lib/agent-vm-native/state.sqlite3` 开始，也可以从没有业务状态文件的
+全新根目录开始；两种情况都需要 rqlite 配置、两个槽位配置和已验证的
+format-4 发布包。全新安装只会迁移本次启动生成的空 SQLite，不读取被隔离的
+旧根目录或旧盘数据。
 发布器执行 `stage`、`verify`、`activate` 时，按以下顺序自动完成：
 
 1. 校验发布包和两个槽位目录，但不启动新槽位。
-2. 启用并重启 `agent-vm-deployd.service`，确认 Deployd socket 可用。
-3. 调用 Deployd 的 `POST /v1/migrate`，由 Deployd 启动 rqlite、让旧服务进入写围栏、等待请求和 native worker 收敛、停止旧服务、验证 SQLite writer 已关闭、创建一致 snapshot、导入并验证 rqlite。
-4. 迁移成功后写入 `.rqlite-cutover-complete`，再创建初始 `active` 链接、停止并禁用旧单实例、启动蓝绿槽位。
-5. 重新观测两个槽位和共享状态，只有验证通过才报告激活成功。
+2. 读取发布状态；如果没有 current release，确认旧单实例、两个槽位和 Deployd
+   都已停止，不向不存在的旧控制服务发送 drain 请求。
+3. 对已有 current release 执行 admission drain；对全新根目录跳过旧服务
+   drain，但仍由 wrapper 在激活前检查固定运行单元全部停止。
+4. 启用并重启 `agent-vm-deployd.service`，等待其 UDS API 接受 `status` 请求。
+5. 调用 Deployd 的 `POST /v1/migrate`，由 Deployd 启动 rqlite、让旧服务进入写围栏、等待请求和 native worker 收敛、停止旧服务、验证 SQLite writer 已关闭、创建一致 snapshot、导入并验证 rqlite。
+6. 迁移成功后写入 `.rqlite-cutover-complete`，再创建初始 `active` 链接、停止并禁用旧单实例、启动蓝绿槽位。
+7. 重新观测两个槽位和共享状态，只有验证通过才报告激活成功。
 
 发布器不会让槽位先于迁移启动，也不会把 `agent-vm-deploy migrate` 留给人工执行。
+首次发布的健康检查允许新槽位处于未排空状态；这只适用于没有 current
+release 的 clean bootstrap，普通蓝绿发布仍必须在 drain 中完成健康检查。
 直接使用 CLI 时，等价入口是：
 
 ```sh

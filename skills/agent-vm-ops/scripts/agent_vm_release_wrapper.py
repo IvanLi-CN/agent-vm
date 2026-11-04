@@ -1269,8 +1269,40 @@ def _validate_legacy_state_schema(database: sqlite3.Connection) -> None:
             _fail("state_compatibility_unverified", "live state schema is incomplete")
 
 
-def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any] | None = None) -> None:
+def _ensure_drained(
+    config: Mapping[str, Any],
+    target_manifest: Mapping[str, Any] | None = None,
+    *,
+    allow_initial: bool = False,
+) -> None:
     if not config["require_drained"]:
+        return
+    current = _current_target(Path(config["current_link"]), Path(config["release_root"]))
+    if current is None and allow_initial:
+        # A clean installation has no admission owner to drain. It is safe to
+        # activate only when every fixed runtime unit is already stopped; an
+        # existing process without a release pointer would otherwise bypass
+        # the normal drain contract.
+        for unit in (
+            "agent-vm-native.service",
+            "agent-vm-native@blue.service",
+            "agent-vm-native@green.service",
+            "agent-vm-deployd.service",
+        ):
+            try:
+                process = subprocess.run(
+                    ["systemctl", "is-active", "--quiet", unit],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                _fail("drain_unverified", "initial activation runtime state could not be verified")
+            if process.returncode == 0:
+                _fail("drain_required", "initial activation requires the fixed runtime units to be stopped")
+            if process.returncode not in {3, 4, 5}:
+                _fail("drain_unverified", "initial activation runtime state could not be verified")
         return
     command = [BUN_PATH, str(config["control_path"])]
     sidecar = Path(config["control_path"]).with_name("client-release.json")
@@ -1920,7 +1952,6 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         candidate_manifest = load_release_manifest(staged / MANIFEST_NAME)
     except ManifestError as exc:
         _fail(exc.code, exc.message, exc.detail)
-    _ensure_drained(config, candidate_manifest)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
     if activation_path.exists() or activation_path.is_symlink():
         _fail("transaction_exists", "activation record already exists for this transaction")
@@ -1929,6 +1960,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     previous_link = Path(config["previous_link"])
     old_current = _current_target(current_link, release_root)
     old_previous = _current_target(previous_link, release_root)
+    _ensure_drained(config, candidate_manifest, allow_initial=old_current is None)
     if old_current is not None and old_current == old_previous:
         _fail("activation_unverified", "current and previous pointers must not target the same release")
     if old_current is not None:

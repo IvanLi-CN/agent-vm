@@ -286,8 +286,10 @@ CLI 永远不能直接编辑 `active`。
 
 ## 首次状态迁移
 
-首次部署不能要求运维者先手工迁移状态。
-发布器安装并验证 Deployd 后，自动调用 `POST /v1/migrate`；
+首次部署不能要求运维者先手工迁移状态，也不能要求先恢复旧发布版本。
+发布器先读取 wrapper 的 current release 状态；没有 current release 时，它只验证
+固定运行单元全部停止，然后自动激活 clean bootstrap。发布器安装并验证 Deployd
+后，等待 UDS API 接受请求，再自动调用 `POST /v1/migrate`；
 Deployd 在同一个 durable transaction 中启动 rqlite、让旧服务进入写围栏、等待请求和 native worker 收敛、停止旧服务、取得旧状态目录的 `authority.lock` 并保持到迁移完成、确认没有 SQLite writer、创建一致 snapshot、导入并验证 rqlite，最后写入 `.rqlite-cutover-complete`。
 旧服务的 Bun 入口必须在创建 SQLite store 前取得同一把排他的 `authority.lock`；
 如果旧服务在停止后重新启动并竞争这把锁，Deployd 只会闭锁，不会把竞态当成迁移成功。
