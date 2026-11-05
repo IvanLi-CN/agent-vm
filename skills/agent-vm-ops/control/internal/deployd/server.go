@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -297,6 +298,7 @@ func (server *Server) recover(c *gin.Context) {
 	}
 	transaction, err := server.Manager.Recover(c.Request.Context(), value.TransactionID, value.Action)
 	if err != nil {
+		slog.Warn("deployment recovery rejected", "transaction_id", value.TransactionID, "action", value.Action, "error", err)
 		writeError(c, http.StatusConflict, "recover_rejected", err.Error())
 		return
 	}
