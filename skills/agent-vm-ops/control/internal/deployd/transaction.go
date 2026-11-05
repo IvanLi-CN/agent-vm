@@ -372,7 +372,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 		observation, err = manager.observe(ctx, id)
 		previous, previousOK := observation.Slots[transaction.PreviousSlot]
 		if err != nil || !validObservation(observation, manager.Clock().UTC()) || !previousOK || !previous.CountersKnown || previous.TrafficAccepting || previous.InFlightRequests != 0 || previous.NativeWorkers != 0 || previous.PendingOperations != 0 {
-			cause := errors.New("quiescence counters were not verified before stopping the previous slot")
+			cause := quiescenceVerificationError(observation, *transaction, previousOK, manager.Clock().UTC())
 			if err != nil {
 				cause = fmt.Errorf("observe quiescence counters: %w", err)
 			}
@@ -403,6 +403,21 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	}
 	updated, err := manager.Store.Get(ctx, id)
 	return updated, err
+}
+
+func quiescenceVerificationError(observation RuntimeSnapshot, transaction store.Transaction, previousOK bool, now time.Time) error {
+	previous := observation.Slots[transaction.PreviousSlot]
+	return fmt.Errorf("quiescence counters were not verified before stopping the previous slot: active=%s consistent=%t valid=%t previous_present=%t previous={traffic_accepting:%t counters_known:%t workers:%d pending:%d in_flight:%d}",
+		observation.ActiveSlot,
+		observation.Consistent,
+		validObservation(observation, now),
+		previousOK,
+		previous.TrafficAccepting,
+		previous.CountersKnown,
+		previous.NativeWorkers,
+		previous.PendingOperations,
+		previous.InFlightRequests,
+	)
 }
 
 func (manager *Manager) Rollback(ctx context.Context, id string) (*store.Transaction, error) {
