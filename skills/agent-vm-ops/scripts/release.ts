@@ -171,8 +171,34 @@ export function verifyReleaseView(value: unknown, tag: string, expectedDraft: bo
   return release;
 }
 
-async function verifyPublishedRelease(adapter: GhGithubAdapter, tag: string, source: string, assets: Record<string, string>, artifacts: Record<string, string>): Promise<any> {
-  const release = verifyReleaseView(await adapter.viewRelease(tag), tag, false, assets, source);
+export async function waitForImmutableRelease(
+  read: () => Promise<unknown>,
+  tag: string,
+  assets: Record<string, string>,
+  source: string,
+  options: { timeoutMs?: number; pollMs?: number; sleep?: (ms: number) => Promise<void> } = {},
+): Promise<any> {
+  const timeoutMs = options.timeoutMs ?? 30_000;
+  const pollMs = options.pollMs ?? 1_000;
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const deadline = Date.now() + timeoutMs;
+  let lastError = "published GitHub release is not immutable";
+  for (;;) {
+    try {
+      return verifyReleaseView(await read(), tag, false, assets, source);
+    } catch (error) {
+      lastError = String(error);
+      if (!/published GitHub release is not immutable/.test(lastError)) throw error;
+      if (Date.now() >= deadline) throw new Error(`${lastError} after waiting ${timeoutMs}ms`);
+      await sleep(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+    }
+  }
+}
+
+async function verifyPublishedRelease(adapter: GhGithubAdapter, tag: string, source: string, assets: Record<string, string>, artifacts: Record<string, string>, waitForImmutable = false): Promise<any> {
+  const release = waitForImmutable
+    ? await waitForImmutableRelease(() => adapter.viewRelease(tag), tag, assets, source)
+    : verifyReleaseView(await adapter.viewRelease(tag), tag, false, assets, source);
   const tagSource = await adapter.tagCommit(tag);
   if (tagSource !== source) throw new Error(`Git tag ${tag} points to ${tagSource}, expected ${source}`);
   await verifyDownloaded(adapter, tag, artifacts);
@@ -271,7 +297,7 @@ async function release(): Promise<void> {
   verifyReleaseView(await adapter.viewRelease(tag), tag, true, completeAssets, source);
   await verifyDownloaded(adapter, tag, completeDigests);
   await adapter.publish(tag);
-  const publishedView = await verifyPublishedRelease(adapter, tag, source, completeAssets, completeDigests);
+  const publishedView = await verifyPublishedRelease(adapter, tag, source, completeAssets, completeDigests, true);
   const publication = { release_id: String(publishedView.releaseId ?? "unknown"), tag, source_revision: source, immutable: true };
   const published = await store.transition(identity, "published", { artifacts: completeDigests, assets: completeAssets, tag, publication });
   await store.transition(identity, "completed", { artifacts: completeDigests, assets: completeAssets, tag, publication });
@@ -334,7 +360,7 @@ async function recover(): Promise<void> {
     } else {
       verifyReleaseView(view, tag, false, assets);
     }
-    const publishedView = await verifyPublishedRelease(adapter, tag, current.identity.source_revision, assets, artifacts);
+    const publishedView = await verifyPublishedRelease(adapter, tag, current.identity.source_revision, assets, artifacts, true);
     const publication = { release_id: String(publishedView.releaseId ?? "unknown"), tag, source_revision: current.identity.source_revision, immutable: true };
     current = await store.transition(current.identity, "published", { artifacts, assets, tag, publication, recovered: true });
   }
