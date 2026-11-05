@@ -290,7 +290,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 		return nil, manager.failure(ctx, id, transaction.Phase, errors.New("active slot changed outside deployd"))
 	}
 	target, targetOK := observation.Slots[transaction.TargetSlot]
-	if !targetOK || !target.ProcessUp || !target.ProcessReady || !target.Ready || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch != verifiedStateEpoch || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) {
+	if !targetOK || !target.ProcessUp || !target.ProcessReady || target.ControllerOwned || target.TrafficAccepting || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch != verifiedStateEpoch || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) {
 		return nil, manager.failure(ctx, id, transaction.Phase, errors.New("candidate identity or readiness changed after verification"))
 	}
 	var ok bool

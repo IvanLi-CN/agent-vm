@@ -197,9 +197,9 @@ func TestManagerCompletesBlueGreenTransactionWithOneRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
+	runtime := &fakeRuntime{active: "blue", readyAfterGrant: true, observations: map[string]SlotObservation{
 		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
-		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: false},
 	}}
 	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
 	transaction, err := manager.Stage(context.Background(), "green", "/tmp/release.tar")
