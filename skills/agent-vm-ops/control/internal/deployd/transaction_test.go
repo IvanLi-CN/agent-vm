@@ -298,6 +298,31 @@ func TestManagerRejectsStageWhenTargetStillServesTraffic(t *testing.T) {
 	}
 }
 
+func TestManagerVerifiesFencedStandbyCandidate(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true, ReleaseID: "old", SourceRevision: "old", StateEpoch: "epoch", StateCapabilities: []string{"cap@1"}},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: false, ControllerOwned: false, TrafficAccepting: false, ReleaseID: "new", SourceRevision: "new", StateEpoch: "epoch", StateCapabilities: []string{"cap@1"}},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	transaction, err := manager.Stage(context.Background(), "green", "/tmp/release.tar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	verified, err := manager.Verify(context.Background(), transaction.ID)
+	if err != nil {
+		t.Fatalf("verify fenced standby: %v", err)
+	}
+	if verified.Phase != PhaseControllerHandoff || verified.State != "active" {
+		t.Fatalf("verified transaction = %#v", verified)
+	}
+}
+
 func TestManagerFencesWhenQuiescenceCountersAreUnknown(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })

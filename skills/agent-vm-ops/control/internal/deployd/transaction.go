@@ -251,7 +251,7 @@ func (manager *Manager) Verify(ctx context.Context, id string) (*store.Transacti
 		return nil, manager.failure(ctx, id, PhaseStandbyValidation, err)
 	}
 	target, ok := observation.Slots[transaction.TargetSlot]
-	if !validObservation(observation, manager.Clock().UTC()) || !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || target.TrafficAccepting || target.ReleaseID == "" || target.SourceRevision == "" || target.StateEpoch == "" || len(target.StateCapabilities) == 0 {
+	if !validObservation(observation, manager.Clock().UTC()) || !ok || !target.ProcessUp || !target.ProcessReady || target.ControllerOwned || target.TrafficAccepting || target.ReleaseID == "" || target.SourceRevision == "" || target.StateEpoch == "" || len(target.StateCapabilities) == 0 {
 		return nil, manager.failure(ctx, id, PhaseStandbyValidation, errors.New("candidate slot is not process-ready"))
 	}
 	previous, previousOK := observation.Slots[transaction.PreviousSlot]
