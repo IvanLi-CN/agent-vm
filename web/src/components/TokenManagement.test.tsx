@@ -1,10 +1,12 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import "../app/i18n";
 import type { AgentToken, TokenPage } from "../app/types";
+import { session } from "../app/mockData";
 
+const getManagementSessionMock = vi.hoisted(() => vi.fn());
 const listTokensMock = vi.hoisted(() => vi.fn());
 const createAgentTokenMock = vi.hoisted(() => vi.fn());
 const getOperationMock = vi.hoisted(() => vi.fn());
@@ -13,7 +15,7 @@ const submitTokenRevocationMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../app/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../app/api")>();
-  return { ...actual, createAgentToken: createAgentTokenMock, getOperation: getOperationMock, listTokens: listTokensMock, previewTokenRevocation: previewTokenRevocationMock, submitTokenRevocation: submitTokenRevocationMock };
+  return { ...actual, getManagementSession: getManagementSessionMock, createAgentToken: createAgentTokenMock, getOperation: getOperationMock, listTokens: listTokensMock, previewTokenRevocation: previewTokenRevocationMock, submitTokenRevocation: submitTokenRevocationMock };
 });
 
 import { TokenManagement } from "./TokenManagement";
@@ -28,8 +30,26 @@ function renderTokenManagement(client = new QueryClient({ defaultOptions: { quer
 }
 
 describe("TokenManagement pagination", () => {
+  beforeEach(() => {
+    getManagementSessionMock.mockReset().mockResolvedValue(session);
+  });
+
   afterEach(() => {
     window.sessionStorage.clear();
+  });
+
+  it("waits for session authority before requesting token pages", async () => {
+    let resolveSession!: (value: typeof session) => void;
+    getManagementSessionMock.mockImplementationOnce(() => new Promise((resolve) => { resolveSession = resolve; }));
+    listTokensMock.mockReset().mockResolvedValue({ items: [token("tok_after_session")], page: { limit: 25, next_cursor: null } });
+
+    renderTokenManagement();
+    expect(screen.getByRole("button", { name: /下一页|next/i })).toBeDisabled();
+    expect(listTokensMock).not.toHaveBeenCalled();
+    resolveSession(session);
+
+    expect(await screen.findByText("tok_after_session")).toBeInTheDocument();
+    expect(listTokensMock).toHaveBeenCalledWith(undefined);
   });
 
   it("moves through bounded token pages and returns to the first page", async () => {
