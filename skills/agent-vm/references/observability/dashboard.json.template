@@ -1272,17 +1272,6 @@
           "format": "time_series",
           "legendFormat": "CT memory.current",
           "refId": "E"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "__PROMETHEUS_UID__"
-          },
-          "editorMode": "code",
-          "expr": "agent_vm_admission_default_request_memory_bytes{job=\"$controller_job\"}",
-          "format": "time_series",
-          "legendFormat": "Default VM RAM request",
-          "refId": "F"
         }
       ],
       "title": "Agent VM Memory Capacity & Runtime",
@@ -4139,17 +4128,6 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_disk_remaining_bytes{job=\"$controller_job\"}",
-          "instant": true,
-          "legendFormat": "Disk remaining",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "__PROMETHEUS_UID__"
-          },
-          "editorMode": "code",
           "expr": "agent_vm_admission_ready{job=\"$controller_job\"}",
           "instant": true,
           "legendFormat": "Ready",
@@ -4167,7 +4145,7 @@
           "refId": "D"
         }
       ],
-      "title": "Admission headroom",
+      "title": "CPU admission headroom",
       "transparent": true,
       "type": "stat"
     },

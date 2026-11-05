@@ -182,6 +182,18 @@ test("rejects dashboards with duplicate panel ids", () => {
   expect(validateDashboard(dashboard).some((finding) => finding.startsWith("dashboard panel id must be unique:"))).toBe(true);
 });
 
+test("rejects dashboards with duplicate panel titles", () => {
+  const bundle = renderBundle(config);
+  const dashboard = structuredClone(bundle.inventoryDashboard) as Record<string, unknown>;
+  const panels = dashboard.panels as Array<Record<string, unknown>>;
+  panels.push({ ...panels[0], id: 1000 });
+  expect(validateDashboard(dashboard, "prometheus-test", {
+    requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
+    requiredMetrics: INVENTORY_REQUIRED_METRICS,
+    requiredTaskStates: INVENTORY_REQUIRED_TASK_STATES,
+  }).some((finding) => finding.startsWith("dashboard panel title must be unique:"))).toBe(true);
+});
+
 test("refuses unresolved configuration placeholders", () => {
   const root = mkdtempSync(join(Bun.env.TMPDIR ?? "/tmp", "agent-vm-observability-config-"));
   try {

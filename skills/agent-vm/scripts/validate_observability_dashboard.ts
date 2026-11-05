@@ -12,7 +12,7 @@ export const REQUIRED_PANEL_TITLES = [
   "Logical RAM remaining",
   "CT MemAvailable",
   "Runtime pressure",
-  "Admission headroom",
+  "CPU admission headroom",
   "Policy and task snapshot",
   "Disk admission",
   "Managed-container slot admission",
@@ -199,6 +199,15 @@ function panelIds(dashboard: JsonRecord): Map<number, number> {
   return counts;
 }
 
+function panelTitleCounts(dashboard: JsonRecord): Map<string, number> {
+  const counts = new Map<string, number>();
+  walk(dashboard.panels, (value) => {
+    if (typeof value.title !== "string" || value.title.trim() === "") return;
+    counts.set(value.title, (counts.get(value.title) ?? 0) + 1);
+  });
+  return counts;
+}
+
 export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: string, options: DashboardValidationOptions = {}): string[] {
   const findings: string[] = [];
   if (!isRecord(dashboard)) return ["dashboard must be a JSON object"];
@@ -212,6 +221,10 @@ export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: st
 
   for (const [id, count] of panelIds(dashboard)) {
     if (count > 1) findings.push(`dashboard panel id must be unique: ${id}`);
+  }
+
+  for (const [title, count] of panelTitleCounts(dashboard)) {
+    if (count > 1) findings.push(`dashboard panel title must be unique: ${title}`);
   }
 
   const variables = isRecord(dashboard.templating) && Array.isArray(dashboard.templating.list)
