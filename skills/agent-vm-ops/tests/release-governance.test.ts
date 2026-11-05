@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 
 import { compareSemVer, parseSemVer, resolveReleaseTarget } from "../scripts/semver.ts";
 import { GhGithubAdapter, GithubReleaseStateStore, ReleaseStateStore, type ReleaseIdentity } from "../scripts/release-coordinator.ts";
-import { assertContractPreconditions, assertWorkflowPlatformAttestation, releaseBuilderCommand, releaseBuilderEnvironment, successfulMainGate, verifyReleaseView, waitForImmutableRelease } from "../scripts/release.ts";
+import { assertContractPreconditions, assertWorkflowPlatformAttestation, releaseBuilderCommand, releaseBuilderEnvironment, successfulMainGate, verifyHistoricalReleaseView, verifyReleaseView, waitForImmutableRelease } from "../scripts/release.ts";
 
 const identity = (overrides: Partial<ReleaseIdentity> = {}): ReleaseIdentity => ({
   version: "1.0.0",
@@ -217,6 +217,15 @@ test("published release verification waits for immutable propagation without acc
     await waitForImmutableRelease(() => Promise.resolve({ tagName: "v1.3.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: false, assets: [{ name: "package" }] }), "v1.3.0", { package: "/tmp/package" }, source, { timeoutMs: 3, pollMs: 1 });
   } catch (error) { historicalRejected = /after waiting/.test(String(error)); }
   if (!historicalRejected) throw new Error("historical mutable release was not rejected after the bounded wait");
+});
+
+test("historical mutable releases are valid legacy baselines while cutover releases require immutable state", () => {
+  const source = "a".repeat(40);
+  const legacy = { tagName: "v1.3.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: false, assets: [{ name: "package" }] };
+  verifyHistoricalReleaseView(legacy, "v1.3.0", { package: "/tmp/package" }, source);
+  let rejected = false;
+  try { verifyReleaseView(legacy, "v1.4.0", false, { package: "/tmp/package" }, source); } catch { rejected = true; }
+  if (!rejected) throw new Error("cutover release accepted mutable GitHub state");
 });
 
 test("published release verification fails closed on immutable timeout and identity changes", async () => {
