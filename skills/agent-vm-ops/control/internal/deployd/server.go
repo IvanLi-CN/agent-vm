@@ -268,6 +268,7 @@ func (server *Server) activate(c *gin.Context) {
 	}
 	transaction, err := server.Manager.Activate(c.Request.Context(), value.TransactionID)
 	if err != nil {
+		slog.Warn("deployment activation rejected", "transaction_id", value.TransactionID, "error", err)
 		if errors.Is(err, ErrUncertain) {
 			writeError(c, http.StatusConflict, "state_unverified", err.Error())
 			return
