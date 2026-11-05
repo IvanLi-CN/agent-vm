@@ -3192,7 +3192,9 @@ func (s *Service) drain(ctx context.Context, value bool, request protocol.Reques
 		return nil, s.sqliteError(err)
 	}
 	preserveTraffic := !value && requestBool(request, "preserve_traffic")
-	s.SetTrafficAccepting(!value && !preserveTraffic)
+	if !preserveTraffic {
+		s.SetTrafficAccepting(!value)
+	}
 	return map[string]any{"draining": value}, nil
 }
 

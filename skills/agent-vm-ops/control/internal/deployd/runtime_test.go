@@ -1,7 +1,11 @@
 package deployd
 
 import (
+	"context"
 	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -298,5 +302,42 @@ func TestCoherentPartialInventoryIsNotDeploymentReady(t *testing.T) {
 	delete(inventory, "partial")
 	if inventoryObservationCoherent(inventory) {
 		t.Fatal("missing completeness was accepted for recovery")
+	}
+}
+
+func TestSlotRequestPreservesControllerLeaseIdentity(t *testing.T) {
+	directory, err := os.MkdirTemp("", "avm-uds-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	socket := filepath.Join(directory, "app.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := controllerrole.Lease{Slot: "blue", Term: 9007199254740993, Generation: 1793891163387293090, LeaseID: "test-lease", Nonce: "test-nonce", Expiry: time.Now().Add(time.Minute)}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"lease": lease})
+	}))
+	server.Listener.Close()
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+	runtime := &HostRuntime{}
+	body, status, err := runtime.slotRequest(context.Background(), socket, http.MethodGet, "/internal/v1/health", nil)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("health status=%d err=%v", status, err)
+	}
+	encoded, err := json.Marshal(body["lease"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var observed controllerrole.Lease
+	if err := json.Unmarshal(encoded, &observed); err != nil {
+		t.Fatal(err)
+	}
+	if observed.Term != lease.Term || observed.Generation != lease.Generation {
+		t.Fatalf("lease identity lost precision: term=%d generation=%d", observed.Term, observed.Generation)
 	}
 }
