@@ -347,7 +347,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "sum(sum without (slot) ((agent_vm_image_unpack_failures_total{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1))))",
+          "expr": "sum(sum without (slot) ((agent_vm_image_unpack_failures_count{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1))))",
           "instant": true,
           "legendFormat": "Image unpack failures",
           "refId": "B"
