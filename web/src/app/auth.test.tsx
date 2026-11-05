@@ -93,7 +93,7 @@ describe("management authentication gate", () => {
 
     emitAuthFailure(new ManagementRequestError("csrf_invalid"));
     expect(await screen.findByText("会话已失效")).toBeInTheDocument();
-    expect(document.title).toBe("Agent VM · 会话已失效");
+    await waitFor(() => expect(document.title).toBe("Agent VM · 会话已失效"));
     await waitFor(() => expect(screen.queryByTestId("protected")).not.toBeInTheDocument());
     expect(document.querySelector(".app-frame")).not.toBeInTheDocument();
     expect(screen.queryByTestId("public-home")).not.toBeInTheDocument();
