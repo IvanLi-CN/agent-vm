@@ -3507,6 +3507,42 @@ func TestWorkerStartGateRearmsCompletedWorker(t *testing.T) {
 	}
 }
 
+func TestWorkerStartGateRearmsVerifiedWorkerIdentity(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "worker-identity-rearm.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	operationID := "worker-identity-rearm"
+	if err := store.RecordOperation(context.Background(), operationID, "acquire", stringPointer("worker-identity-rearm-session"), nil, map[string]any{
+		"outcome": "pending",
+		"worker":  map[string]any{"state": "starting"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	first := native.WorkerIdentity{PID: 123, StartTime: "first", ProcessGroup: 123}
+	if err := service.WorkerFinished(context.Background(), operationID, first, nil); err != nil {
+		t.Fatalf("first worker completion = %v", err)
+	}
+	if err := service.WorkerStartAllowed(context.Background(), operationID); err != nil {
+		t.Fatalf("next worker admission = %v", err)
+	}
+	second := native.WorkerIdentity{PID: 456, StartTime: "second", ProcessGroup: 456}
+	if err := service.WorkerStarted(context.Background(), operationID, second); err != nil {
+		t.Fatalf("next worker identity = %v", err)
+	}
+	operation, err := store.GetOperation(context.Background(), operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	pid, validPID := protocol.Integer(worker["pid"])
+	if !ok || !validPID || pid != int64(second.PID) || worker["start_time"] != second.StartTime || worker["state"] != "running" {
+		t.Fatalf("rearmed worker = %#v, want second running identity", operation.Response)
+	}
+}
+
 func TestWorkerStartFailedClearsAdmissionBarrier(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "worker-start-failed.sqlite3"))
 	if err != nil {
