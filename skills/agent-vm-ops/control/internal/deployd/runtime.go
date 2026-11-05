@@ -94,7 +94,6 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			if requestErr != nil && runtime.systemdSlotStopped(ctx, slot) {
 				runtime.mu.Lock()
 				evidence := runtime.quiesced[slot]
-				runtime.quiesced[slot] = quiescenceEvidence{}
 				runtime.mu.Unlock()
 				if quiescenceEvidenceProvesStopped(evidence) {
 					observation.CountersKnown = true
