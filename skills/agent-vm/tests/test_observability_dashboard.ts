@@ -39,10 +39,10 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(bundle.inventoryDashboardText).toContain('"options": "Scrape age (s)"');
   expect(bundle.inventoryDashboardText).not.toContain('agent_vm_operations_total{job=\\"$controller_job\\",outcome=\\"failure\\"}) + sum(agent_vm_image_unpack_failures_total');
   expect(bundle.inventoryDashboardText).toContain('"legendFormat": "Image unpack failures"');
-  expect(bundle.inventoryDashboardText).toContain('"expr": "agent_vm_observation_consistent{job=\\"$controller_job\\"}"');
+  expect(bundle.inventoryDashboardText).toContain('agent_vm_observation_consistent{job=\\"$controller_job\\"} and on(job, instance, slot)');
   expect(bundle.inventoryDashboardText).toContain('"text": [\n            "active",\n            "preparing",\n            "closing",\n            "deleting",\n            "failed"');
   expect(bundle.inventoryDashboardText).not.toContain("or vector(0)");
-  expect(bundle.inventoryDashboardText).toContain("time() - agent_vm_scrape_timestamp_seconds");
+  expect(bundle.inventoryDashboardText).toContain("time() - sum without (slot) ((agent_vm_inventory_scrape_timestamp_seconds");
   expect(bundle.dashboardText).toContain('"uid": "prometheus-test"');
   expect(bundle.dashboardText).toContain('"value": "controller-test"');
   expect(bundle.dashboardText).toContain('job=\\"$controller_job\\"');
@@ -52,7 +52,7 @@ test("renders a portable dashboard and provisioning bundle", () => {
   expect(bundle.dashboardText).toContain("agent_vm_admission_default_request_physical_cost_bytes");
   expect(bundle.dashboardText).toContain("agent_vm_task_states");
   expect(bundle.dashboardText).toContain("agent_vm_up");
-  expect(bundle.dashboardText).toContain("agent_vm_scrape_timestamp_seconds");
+  expect(bundle.dashboardText).toContain("agent_vm_inventory_scrape_timestamp_seconds");
   const panels = bundle.dashboard.panels as Array<Record<string, unknown>>;
   const cpuPanel = panels.find((panel) => panel.id === 328);
   const cpuTarget = (cpuPanel?.targets as Array<Record<string, unknown>>).find((target) => target.refId === "C");
@@ -134,6 +134,21 @@ test("requires the rendered provisioning path", () => {
   expect(validateProvisioning(bundle.provisioningText.replace(config.dashboard_path, "/wrong/path"), config.dashboard_path)).toContain(
     `provisioning provider path must be ${config.dashboard_path}`,
   );
+});
+
+test("rejects business totals that combine both live slots", () => {
+  const bundle = renderBundle(config);
+  const dashboard = structuredClone(bundle.inventoryDashboard) as Record<string, unknown>;
+  const panels = dashboard.panels as Array<Record<string, unknown>>;
+  const panel = panels.find((candidate) => candidate.title === "Task state counts") as Record<string, unknown>;
+  const targets = panel.targets as Array<Record<string, unknown>>;
+  targets[0].expr = 'sum(agent_vm_task_states{job="$controller_job"})';
+  expect(validateDashboard(dashboard, "prometheus-test", {
+    requiredPanelTitles: INVENTORY_REQUIRED_PANEL_TITLES,
+    requiredMetrics: INVENTORY_REQUIRED_METRICS,
+  }).some((finding) => finding.includes("must select the active slot before aggregation"))).toBe(true);
+  expect(bundle.inventoryDashboardText).not.toContain("agent_vm_scrape_timestamp_seconds");
+  expect(bundle.inventoryDashboardText).toContain('outcome=~\\"error|failure\\"');
 });
 
 test("requires provisioning path to target the stable current directory", () => {
@@ -335,4 +350,16 @@ test("serializes bundle writes with an output-directory lock", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+
+test("rejects identical business legends split across historical slots", () => {
+  const bundle = renderBundle(config);
+  const dashboard = structuredClone(bundle.dashboard) as Record<string, unknown>;
+  const panels = dashboard.panels as Array<Record<string, unknown>>;
+  const panel = panels.find((candidate) => candidate.id === 328) as Record<string, unknown>;
+  const targets = panel.targets as Array<Record<string, unknown>>;
+  const limit = targets.find((candidate) => candidate.refId === "M")!;
+  limit.expr = '100 * (agent_vm_admission_cpu_limit_vcpu{job="$controller_job"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job="$controller_job"} == 1))';
+  expect(validateDashboard(dashboard, "prometheus-test").some((finding) => finding.includes("must remove the slot dimension"))).toBe(true);
 });

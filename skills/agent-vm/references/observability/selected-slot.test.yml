@@ -1,0 +1,26 @@
+evaluation_interval: 1m
+tests:
+  - interval: 1m
+    input_series:
+      - series: 'agent_vm_task_states{job="agent-vm-deployd",instance="test-controller",slot="blue",state="active"}'
+        values: '1x5'
+      - series: 'agent_vm_task_states{job="agent-vm-deployd",instance="test-controller",slot="green",state="active"}'
+        values: '1x5'
+      - series: 'agent_vm_deployd_slot_selected{job="agent-vm-deployd",instance="test-controller",slot="blue"}'
+        values: '1 1 0 0 0 0'
+      - series: 'agent_vm_deployd_slot_selected{job="agent-vm-deployd",instance="test-controller",slot="green"}'
+        values: '0 0 1 1 0 0'
+    promql_expr_test:
+      - expr: 'sum without (slot) (agent_vm_task_states{job="agent-vm-deployd"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job="agent-vm-deployd"} == 1))'
+        eval_time: 1m
+        exp_samples:
+          - labels: '{job="agent-vm-deployd",instance="test-controller",state="active"}'
+            value: 1
+      - expr: 'sum without (slot) (agent_vm_task_states{job="agent-vm-deployd"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job="agent-vm-deployd"} == 1))'
+        eval_time: 3m
+        exp_samples:
+          - labels: '{job="agent-vm-deployd",instance="test-controller",state="active"}'
+            value: 1
+      - expr: 'sum without (slot) (agent_vm_task_states{job="agent-vm-deployd"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job="agent-vm-deployd"} == 1))'
+        eval_time: 5m
+        exp_samples: []
