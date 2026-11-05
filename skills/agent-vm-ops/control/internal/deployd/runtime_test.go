@@ -285,3 +285,18 @@ func TestActiveSlotRequiresLink(t *testing.T) {
 		t.Fatal("missing active link was treated as a valid slot")
 	}
 }
+
+func TestCoherentPartialInventoryIsNotDeploymentReady(t *testing.T) {
+	inventory := map[string]any{"partial": true, "observation_consistent": true}
+	if !inventoryObservationCoherent(inventory) || inventoryObservationConsistent(inventory) {
+		t.Fatal("coherent partial inventory lost its recovery-only distinction")
+	}
+	inventory["observation_consistent"] = false
+	if inventoryObservationCoherent(inventory) {
+		t.Fatal("inconsistent inventory was accepted for recovery")
+	}
+	delete(inventory, "partial")
+	if inventoryObservationCoherent(inventory) {
+		t.Fatal("missing completeness was accepted for recovery")
+	}
+}

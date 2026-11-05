@@ -48,32 +48,36 @@ func (err *UncertainError) Unwrap() error { return err.Cause }
 func (err *UncertainError) Is(target error) bool { return target == ErrUncertain }
 
 type SlotObservation struct {
-	Slot              string            `json:"slot"`
-	ProcessUp         bool              `json:"process_up"`
-	ProcessReady      bool              `json:"process_ready"`
-	Ready             bool              `json:"ready"`
-	ControllerOwned   bool              `json:"controller_owned"`
-	TrafficAccepting  bool              `json:"traffic_accepting"`
-	CountersKnown     bool              `json:"counters_known"`
-	InFlightRequests  int64             `json:"in_flight_requests"`
-	NativeWorkers     int64             `json:"native_workers"`
-	PendingOperations int64             `json:"pending_operations"`
-	ObservedUnix      int64             `json:"observed_at_seconds"`
-	StateEpoch        string            `json:"state_epoch,omitempty"`
-	ReleaseID         string            `json:"release_id,omitempty"`
-	SourceRevision    string            `json:"source_revision,omitempty"`
-	StateCapabilities []string          `json:"state_capabilities,omitempty"`
-	MetricFamilies    map[string]string `json:"metric_families,omitempty"`
+	Slot                  string                `json:"slot"`
+	ProcessUp             bool                  `json:"process_up"`
+	ProcessReady          bool                  `json:"process_ready"`
+	Ready                 bool                  `json:"ready"`
+	LeaseRenewalSupported bool                  `json:"controller_lease_renewal"`
+	ControllerLease       *controllerrole.Lease `json:"controller_lease,omitempty"`
+	ControllerOwned       bool                  `json:"controller_owned"`
+	TrafficAccepting      bool                  `json:"traffic_accepting"`
+	Draining              bool                  `json:"draining"`
+	CountersKnown         bool                  `json:"counters_known"`
+	InFlightRequests      int64                 `json:"in_flight_requests"`
+	NativeWorkers         int64                 `json:"native_workers"`
+	PendingOperations     int64                 `json:"pending_operations"`
+	ObservedUnix          int64                 `json:"observed_at_seconds"`
+	StateEpoch            string                `json:"state_epoch,omitempty"`
+	ReleaseID             string                `json:"release_id,omitempty"`
+	SourceRevision        string                `json:"source_revision,omitempty"`
+	StateCapabilities     []string              `json:"state_capabilities,omitempty"`
+	MetricFamilies        map[string]string     `json:"metric_families,omitempty"`
 }
 
 type RuntimeSnapshot struct {
-	ObservedAt     time.Time                    `json:"observed_at"`
-	FreshUntil     time.Time                    `json:"fresh_until"`
-	ActiveSlot     string                       `json:"active_slot"`
-	ControllerSlot string                       `json:"controller_slot"`
-	Consistent     bool                         `json:"consistent"`
-	Slots          map[string]SlotObservation   `json:"slots"`
-	Sources        map[string]SourceObservation `json:"sources,omitempty"`
+	ObservedAt             time.Time                    `json:"observed_at"`
+	FreshUntil             time.Time                    `json:"fresh_until"`
+	ActiveSlot             string                       `json:"active_slot"`
+	ControllerSlot         string                       `json:"controller_slot"`
+	Consistent             bool                         `json:"consistent"`
+	ControllerRecoveryOnly bool                         `json:"controller_recovery_only"`
+	Slots                  map[string]SlotObservation   `json:"slots"`
+	Sources                map[string]SourceObservation `json:"sources,omitempty"`
 }
 
 type SourceObservation struct {
@@ -697,12 +701,22 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	if len(transactions) != 0 {
 		return manager.fenceSlots(ctx, errors.New("deployment transaction is active"))
 	}
-	if !observation.Consistent {
+	controllerObservation := observation
+	controllerObservation.Consistent = observation.Consistent || observation.ControllerRecoveryOnly
+	if !validObservation(controllerObservation, manager.Clock().UTC()) {
 		return manager.fenceSlots(ctx, errors.New("slot observation is inconsistent"))
 	}
 	target, ok := observation.Slots[observation.ActiveSlot]
 	if !ok || !target.ProcessUp || !target.ProcessReady || target.StateEpoch == "" || len(target.StateCapabilities) == 0 {
 		return manager.fenceSlots(ctx, errors.New("active slot is not process-ready"))
+	}
+	if observation.ControllerRecoveryOnly && !target.Draining {
+		return manager.fenceSlots(ctx, errors.New("partial inventory requires admission drain before controller recovery"))
+	}
+	if target.Draining {
+		if err := manager.Runtime.DisableTraffic(ctx, observation.ActiveSlot); err != nil {
+			return manager.fenceSlots(ctx, fmt.Errorf("disable draining active traffic: %w", err))
+		}
 	}
 	other := "blue"
 	if observation.ActiveSlot == "blue" {
@@ -727,12 +741,18 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 			break
 		}
 	}
-	lease, err := manager.newLease(ctx, observation.ActiveSlot, generation)
+	lease, err := manager.renewOrAllocateLease(ctx, target, generation)
 	if err != nil {
 		return manager.fenceSlots(ctx, errors.New("allocate active controller lease failed; controller roles were fenced"))
 	}
 	if err := manager.Runtime.GrantController(ctx, observation.ActiveSlot, lease); err != nil {
 		return manager.fenceSlots(ctx, errors.New("grant active controller failed; controller roles were fenced"))
+	}
+	if target.Draining {
+		// A drained controller must retain its lease so startup reconciliation
+		// and explicit maintenance can converge an incomplete inventory. Traffic
+		// stays disabled; strict deployment validation still rejects this view.
+		return nil
 	}
 	if err := manager.waitForReady(ctx, "", observation.ActiveSlot); err != nil {
 		return manager.fenceSlots(ctx, fmt.Errorf("active slot did not become ready after controller grant: %w", err))
@@ -1036,6 +1056,22 @@ func rollbackVerificationError(observation RuntimeSnapshot, transaction store.Tr
 		target.PendingOperations,
 		target.InFlightRequests,
 	)
+}
+
+// Only a freshly observed lease held by this exact Deployd process can be
+// renewed. Persisted snapshots and a previous process incarnation grant nothing.
+func (manager *Manager) renewOrAllocateLease(ctx context.Context, target SlotObservation, generation int64) (controllerrole.Lease, error) {
+	now := manager.Clock()
+	if current := target.ControllerLease; target.LeaseRenewalSupported && target.ControllerOwned && current != nil &&
+		current.Validate(now, target.Slot) == nil && current.OwnerPID == os.Getpid() &&
+		current.OwnerStartTime != "" && current.OwnerStartTime == controllerrole.ProcessStartToken(os.Getpid()) {
+		renewed := *current
+		if expiry := now.Add(manager.LeaseDuration); expiry.After(renewed.Expiry) {
+			renewed.Expiry = expiry
+		}
+		return renewed, nil
+	}
+	return manager.newLease(ctx, target.Slot, generation)
 }
 
 func (manager *Manager) newLease(ctx context.Context, slot string, generation int64) (controllerrole.Lease, error) {

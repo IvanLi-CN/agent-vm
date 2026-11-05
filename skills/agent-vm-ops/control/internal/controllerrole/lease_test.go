@@ -128,3 +128,59 @@ func TestGateCommitSerializesFenceAfterDurableCommit(t *testing.T) {
 		t.Fatal("fenced lease remained valid")
 	}
 }
+
+func TestRenewalPreservesWorkButCannotResurrectFencedAuthority(t *testing.T) {
+	now := time.Now().UTC()
+	gate := New("blue", func() time.Time { return now })
+	lease := Lease{Slot: "blue", Term: 1, LeaseID: "live", Nonce: "nonce", Generation: 1, Expiry: now.Add(time.Second)}
+	if err := gate.Grant(lease); err != nil {
+		t.Fatal(err)
+	}
+	changes := gate.Changes()
+	now = now.Add(500 * time.Millisecond)
+	lease.Expiry = now.Add(time.Second)
+	if err := gate.Grant(lease); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-changes:
+		t.Fatal("renewal canceled in-flight work")
+	default:
+	}
+	now = now.Add(750 * time.Millisecond)
+	if !gate.Valid() {
+		t.Fatal("renewal did not extend authority beyond original expiry")
+	}
+	for _, mutate := range []func(*Lease){
+		func(l *Lease) { l.Nonce = "other" },
+		func(l *Lease) { l.LeaseID = "other" },
+		func(l *Lease) { l.Generation++ },
+		func(l *Lease) { l.OwnerPID++ },
+		func(l *Lease) { l.OwnerStartTime = "other" },
+		func(l *Lease) { l.Expiry = l.Expiry.Add(-time.Millisecond) },
+	} {
+		invalid := lease
+		mutate(&invalid)
+		if err := gate.Grant(invalid); !errors.Is(err, ErrLeaseMismatch) {
+			t.Fatalf("changed identity or shrinking expiry accepted: %v", err)
+		}
+	}
+	now = lease.Expiry.Add(time.Millisecond)
+	lease.Expiry = now.Add(time.Second)
+	if err := gate.Grant(lease); !errors.Is(err, ErrLeaseMismatch) {
+		t.Fatalf("expired authority resurrected: %v", err)
+	}
+	select {
+	case <-changes:
+	default:
+		t.Fatal("expiry did not cancel work")
+	}
+	lease.Term++
+	if err := gate.Grant(lease); err != nil {
+		t.Fatal(err)
+	}
+	gate.Fence()
+	if err := gate.Grant(lease); !errors.Is(err, ErrLeaseMismatch) {
+		t.Fatalf("fenced authority resurrected: %v", err)
+	}
+}

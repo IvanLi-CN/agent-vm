@@ -87,6 +87,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 	systemdObservationUp := true
 	nativeObservationUp := true
 	inventoryObservationUp := true
+	inventoryComplete := true
 	for _, slot := range []string{"blue", "green"} {
 		observation := SlotObservation{Slot: slot, ObservedUnix: now.Unix()}
 		body, status, requestErr := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil)
@@ -132,6 +133,15 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		observation.ProcessReady = processReady
 		observation.Ready, _ = body["ready"].(bool)
 		observation.ControllerOwned, _ = body["controller_owned"].(bool)
+		observation.LeaseRenewalSupported, _ = body["controller_lease_renewal"].(bool)
+		if observation.ControllerOwned {
+			if encoded, err := json.Marshal(body["lease"]); err == nil {
+				var lease controllerrole.Lease
+				if json.Unmarshal(encoded, &lease) == nil && lease.Validate(now, slot) == nil {
+					observation.ControllerLease = &lease
+				}
+			}
+		}
 		observation.TrafficAccepting, _ = body["traffic_accepting"].(bool)
 		observation.ReleaseID, _ = body["release_id"].(string)
 		observation.SourceRevision, _ = body["source_revision"].(string)
@@ -188,11 +198,14 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			runtime.invalidateMetrics(slot, "inventory")
 			snapshot.Consistent = false
 		} else {
-			inventoryConsistent := inventoryObservationConsistent(inventory)
+			inventoryConsistent := inventoryObservationCoherent(inventory)
 			if !inventoryConsistent {
 				snapshot.Consistent = false
 			}
 			if inventoryConsistent {
+				if !inventoryObservationConsistent(inventory) {
+					inventoryComplete = false
+				}
 				runtime.rememberMetrics(slot, "inventory", observe.MetricsForSnapshot("inventory", inventory))
 				sourceTimes["inventory_observation"] = minTime(sourceTimes["inventory_observation"], inventoryAt)
 			} else {
@@ -228,6 +241,13 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			nativeObservationUp = false
 			snapshot.Consistent = false
 		} else if result, ok := drainStatus["result"].(map[string]any); ok {
+			draining, drainingOK := result["draining"].(bool)
+			if !drainingOK {
+				nativeObservationUp = false
+				snapshot.Consistent = false
+			} else {
+				observation.Draining = draining
+			}
 			capabilities := stringSlice(result["state_capabilities"])
 			if len(capabilities) == 0 {
 				nativeObservationUp = false
@@ -285,7 +305,17 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		setSource("inventory_observation", sourceTimes["inventory_observation"], true, nil)
 	}
 	snapshot.FreshUntil = composedFreshUntil(snapshot.Sources, now)
+	if !inventoryComplete {
+		snapshot.ControllerRecoveryOnly = snapshot.Consistent
+		snapshot.Consistent = false
+	}
 	return snapshot, nil
+}
+
+func inventoryObservationCoherent(inventory map[string]any) bool {
+	_, partialOK := inventory["partial"].(bool)
+	consistent, consistentOK := inventory["observation_consistent"].(bool)
+	return partialOK && consistentOK && consistent
 }
 
 func inventoryObservationConsistent(inventory map[string]any) bool {

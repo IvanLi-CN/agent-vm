@@ -70,6 +70,15 @@ func (gate *Gate) Grant(lease Lease) error {
 	}
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
+	if lease.Term == gate.term && gate.validLocked() == nil {
+		current := gate.lease
+		current.Expiry = lease.Expiry
+		if current == lease && !lease.Expiry.Before(gate.lease.Expiry) {
+			// Extending the same live authority must not cancel in-flight work.
+			gate.lease.Expiry = lease.Expiry
+			return nil
+		}
+	}
 	if lease.Term <= gate.term {
 		return fmt.Errorf("%w: term is not newer", ErrLeaseMismatch)
 	}

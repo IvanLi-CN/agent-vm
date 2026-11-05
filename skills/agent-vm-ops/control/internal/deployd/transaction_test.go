@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,6 +22,7 @@ type fakeRuntime struct {
 	failSwitch            bool
 	stageError            error
 	inconsistent          bool
+	partialInventory      bool
 	identityError         error
 	stateEpoch            string
 	capabilities          []string
@@ -34,6 +36,8 @@ type fakeRuntime struct {
 	sequence              []string
 	traffic               map[string]bool
 	releaseIDs            map[string]string
+	legacyGrant           bool
+	grantedLeases         []controllerrole.Lease
 }
 
 func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
@@ -67,7 +71,7 @@ func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		sources[source] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
 	}
-	return RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: runtime.active, ControllerSlot: runtime.active, Consistent: !runtime.inconsistent, Slots: slots, Sources: sources}, nil
+	return RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: runtime.active, ControllerSlot: runtime.active, Consistent: !runtime.inconsistent && !runtime.partialInventory, ControllerRecoveryOnly: runtime.partialInventory && !runtime.inconsistent, Slots: slots, Sources: sources}, nil
 }
 func (runtime *fakeRuntime) Stage(context.Context, string, string) error {
 	runtime.sequence = append(runtime.sequence, "stage")
@@ -81,13 +85,18 @@ func (runtime *fakeRuntime) VerifySlotIdentity(context.Context, string, string, 
 	runtime.sequence = append(runtime.sequence, "verify-identity")
 	return runtime.identityError
 }
-func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, _ controllerrole.Lease) error {
+func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, lease controllerrole.Lease) error {
+	if runtime.legacyGrant && len(runtime.grantedLeases) > 0 && lease.Term <= runtime.grantedLeases[len(runtime.grantedLeases)-1].Term {
+		return controllerrole.ErrLeaseMismatch
+	}
+	runtime.grantedLeases = append(runtime.grantedLeases, lease)
 	runtime.sequence = append(runtime.sequence, "grant")
 	if runtime.mutateContractOnGrant {
 		runtime.capabilities = []string{"changed@1"}
 	}
 	if observation, ok := runtime.observations[slot]; ok {
 		observation.ControllerOwned = true
+		observation.ControllerLease = &lease
 		if runtime.readyAfterGrant {
 			observation.Ready = true
 		}
@@ -926,5 +935,153 @@ func TestManagerRejectsConcurrentDeploymentTransactions(t *testing.T) {
 	}
 	if _, err := manager.Stage(context.Background(), "green", "/tmp/release-b"); err == nil {
 		t.Fatal("concurrent deployment transaction was accepted")
+	}
+}
+
+func TestControllerRecoveryRetainsOnlyDrainedAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name                                     string
+		partial, draining, inconsistent, allowed bool
+	}{
+		{"complete-drain", false, true, false, true},
+		{"partial-drain", true, true, false, true},
+		{"partial-without-drain", true, false, false, false},
+		{"inconsistent-drain", true, true, true, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			runtime := &fakeRuntime{active: "blue", partialInventory: test.partial, inconsistent: test.inconsistent, observations: map[string]SlotObservation{
+				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: false, Draining: test.draining},
+				"green": {Slot: "green", ProcessUp: true, ProcessReady: true, ControllerOwned: true},
+			}}
+			manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+			err = manager.MaintainController(context.Background())
+			if (err == nil) != test.allowed {
+				t.Fatalf("maintenance err=%v; sequence=%v", err, runtime.sequence)
+			}
+			if runtime.traffic["blue"] || runtime.traffic["green"] {
+				t.Fatalf("recovery enabled traffic: %v", runtime.traffic)
+			}
+			if runtime.observations["blue"].ControllerOwned != test.allowed || runtime.observations["green"].ControllerOwned {
+				t.Fatalf("unexpected ownership: %+v", runtime.observations)
+			}
+			snapshot, _ := runtime.Observe(context.Background())
+			if test.partial && validObservation(snapshot, now) {
+				t.Fatal("partial recovery view authorized deployment")
+			}
+			if !test.allowed {
+				return
+			}
+			// Once reconciliation and the operator's drain exit are observed, ordinary
+			// readiness checks may restore traffic without changing active routing.
+			runtime.partialInventory = false
+			active := runtime.observations["blue"]
+			active.Draining = false
+			active.Ready = true
+			runtime.observations["blue"] = active
+			if err := manager.MaintainController(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if !runtime.traffic["blue"] || runtime.traffic["green"] {
+				t.Fatalf("traffic was not restored exclusively: %v", runtime.traffic)
+			}
+		})
+	}
+}
+
+func TestOnlyCurrentProcessLiveLeaseCanBeRenewed(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	manager := NewManager(database, nil, 15*time.Second, func() time.Time { return now })
+	lease, err := manager.newLease(context.Background(), "blue", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.OwnerStartTime == "" {
+		t.Skip("process-incarnation evidence is unavailable on this platform")
+	}
+	now = now.Add(time.Second)
+	target := SlotObservation{Slot: "blue", LeaseRenewalSupported: true, ControllerOwned: true, ControllerLease: &lease}
+	renewed, err := manager.renewOrAllocateLease(context.Background(), target, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := lease
+	expected.Expiry = now.Add(15 * time.Second)
+	if renewed != expected {
+		t.Fatalf("renewal changed authority identity: got %+v want %+v", renewed, expected)
+	}
+	for name, mutate := range map[string]func(*SlotObservation){
+		"foreign process":      func(s *SlotObservation) { s.ControllerLease.OwnerPID++ },
+		"previous incarnation": func(s *SlotObservation) { s.ControllerLease.OwnerStartTime = "previous" },
+		"expired":              func(s *SlotObservation) { s.ControllerLease.Expiry = now },
+		"wrong slot":           func(s *SlotObservation) { s.ControllerLease.Slot = "green" },
+		"not owned":            func(s *SlotObservation) { s.ControllerOwned = false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			copyLease := lease
+			candidate := target
+			candidate.ControllerLease = &copyLease
+			mutate(&candidate)
+			fresh, err := manager.renewOrAllocateLease(context.Background(), candidate, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fresh.Term <= lease.Term || fresh.LeaseID == lease.LeaseID || fresh.Nonce == lease.Nonce {
+				t.Fatal("unowned or stale authority reused")
+			}
+		})
+	}
+}
+
+func TestMaintainControllerNegotiatesLegacyAndRenewalSlots(t *testing.T) {
+	for _, renewal := range []bool{false, true} {
+		t.Run(map[bool]string{false: "legacy", true: "renewal"}[renewal], func(t *testing.T) {
+			if renewal && controllerrole.ProcessStartToken(os.Getpid()) == "" {
+				t.Skip("Linux process-incarnation evidence required")
+			}
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			runtime := &fakeRuntime{active: "blue", legacyGrant: !renewal, partialInventory: true, observations: map[string]SlotObservation{
+				"blue": {Slot: "blue", ProcessUp: true, ProcessReady: true, Draining: true, LeaseRenewalSupported: renewal},
+			}}
+			manager := NewManager(database, runtime, 15*time.Second, func() time.Time { return now })
+			for i := 0; i < 3; i++ {
+				if err := manager.MaintainController(context.Background()); err != nil {
+					t.Fatalf("round %d: %v", i, err)
+				}
+				now = now.Add(time.Second)
+			}
+			if len(runtime.grantedLeases) != 3 {
+				t.Fatalf("grants=%d", len(runtime.grantedLeases))
+			}
+			first, last := runtime.grantedLeases[0], runtime.grantedLeases[2]
+			if renewal {
+				if first.Term != last.Term || first.LeaseID != last.LeaseID || first.Nonce != last.Nonce || !last.Expiry.After(first.Expiry) {
+					t.Fatal("modern renewal replaced authority or failed to extend it")
+				}
+			} else if last.Term <= first.Term {
+				t.Fatal("legacy slot received unsupported same-term renewal")
+			}
+			if runtime.traffic["blue"] {
+				t.Fatal("drained slot accepted traffic")
+			}
+			if strings.Contains(strings.Join(runtime.sequence, ","), "fence") {
+				t.Fatal("continuous maintenance fenced a compatible slot")
+			}
+		})
 	}
 }
