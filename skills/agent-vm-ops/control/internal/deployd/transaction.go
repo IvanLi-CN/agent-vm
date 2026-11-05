@@ -701,6 +701,15 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	if len(transactions) != 0 {
 		return manager.fenceSlots(ctx, errors.New("deployment transaction is active"))
 	}
+	// Normal lifecycle commits can advance the epoch between the separate
+	// metrics/inventory/doctor reads. Re-observe before revoking an otherwise
+	// live controller; never renew from the inconsistent sample itself.
+	for attempt := 1; attempt < 3 && manager.retryableControllerObservation(observation); attempt++ {
+		observation, err = manager.observe(ctx, "")
+		if err != nil {
+			return manager.fenceSlots(ctx, errors.New("slot observation retry could not be persisted; controller roles were fenced"))
+		}
+	}
 	controllerObservation := observation
 	controllerObservation.Consistent = observation.Consistent || observation.ControllerRecoveryOnly
 	if !validObservation(controllerObservation, manager.Clock().UTC()) {
@@ -766,6 +775,33 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 		return fmt.Errorf("enable active traffic: %w; %v", err, fenceErr)
 	}
 	return nil
+}
+
+func (manager *Manager) retryableControllerObservation(observation RuntimeSnapshot) bool {
+	now := manager.Clock().UTC()
+	if observation.Consistent || observation.ControllerRecoveryOnly || observation.ControllerSlot != observation.ActiveSlot {
+		return false
+	}
+	target, ok := observation.Slots[observation.ActiveSlot]
+	if !ok || !target.ProcessUp || !target.ProcessReady || !target.ControllerOwned || !target.LeaseRenewalSupported {
+		return false
+	}
+	lease := target.ControllerLease
+	if lease == nil || lease.Validate(now, target.Slot) != nil || lease.OwnerPID != os.Getpid() || lease.OwnerStartTime == "" || lease.OwnerStartTime != controllerrole.ProcessStartToken(os.Getpid()) {
+		return false
+	}
+	for slot, value := range observation.Slots {
+		if slot != observation.ActiveSlot && value.ControllerOwned {
+			return false
+		}
+	}
+	for _, name := range []string{"active_link", "systemd", "slot_contracts"} {
+		source, present := observation.Sources[name]
+		if !present || !source.Up || source.ObservedAt.IsZero() || source.ObservedAt.After(now) || source.FreshUntil.IsZero() || !source.FreshUntil.After(now) {
+			return false
+		}
+	}
+	return true
 }
 
 func (manager *Manager) fenceSlots(ctx context.Context, cause error) error {

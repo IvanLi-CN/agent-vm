@@ -698,6 +698,100 @@ func TestManagerHardFencesInconsistentObservation(t *testing.T) {
 	}
 }
 
+type changingObservationRuntime struct {
+	*fakeRuntime
+	reads         int
+	unstableReads int
+}
+
+func (runtime *changingObservationRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error) {
+	runtime.reads++
+	snapshot, err := runtime.fakeRuntime.Observe(ctx)
+	if runtime.reads <= runtime.unstableReads {
+		snapshot.Consistent = false
+		source := snapshot.Sources["native_observation"]
+		source.Up = false
+		snapshot.Sources["native_observation"] = source
+	}
+	return snapshot, err
+}
+
+func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testing.T) {
+	if controllerrole.ProcessStartToken(os.Getpid()) == "" {
+		t.Skip("Linux process-incarnation evidence required")
+	}
+	for _, test := range []struct {
+		name      string
+		unstable  int
+		corrupt   string
+		wantReads int
+		wantError bool
+	}{
+		{"one-state-change", 1, "", 3, false},
+		{"two-state-changes", 2, "", 4, false},
+		{"persistent-inconsistency", 10, "", 3, true},
+		{"foreign-owner", 1, "owner", 1, true},
+		{"missing-lease", 1, "lease", 1, true},
+		{"expired-lease", 1, "expired", 1, true},
+		{"second-controller", 1, "second", 1, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			lease := controllerrole.Lease{Slot: "blue", Term: 7, LeaseID: "existing-lease", Nonce: "existing-nonce", Generation: 11, Expiry: now.Add(time.Minute), OwnerPID: os.Getpid(), OwnerStartTime: controllerrole.ProcessStartToken(os.Getpid())}
+			runtime := &changingObservationRuntime{fakeRuntime: &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
+				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true, LeaseRenewalSupported: true, ControllerLease: &lease, NativeWorkers: 1, PendingOperations: 1},
+				"green": {Slot: "green", ProcessUp: true, ProcessReady: true},
+			}}, unstableReads: test.unstable}
+			switch test.corrupt {
+			case "owner":
+				lease.OwnerPID++
+			case "lease":
+				active := runtime.observations["blue"]
+				active.ControllerLease = nil
+				runtime.observations["blue"] = active
+			case "expired":
+				lease.Expiry = now
+			case "second":
+				standby := runtime.observations["green"]
+				standby.ControllerOwned = true
+				runtime.observations["green"] = standby
+			}
+			manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+			err = manager.MaintainController(context.Background())
+			if (err != nil) != test.wantError {
+				t.Fatalf("maintain error=%v sequence=%v", err, runtime.sequence)
+			}
+			if runtime.reads != test.wantReads {
+				t.Fatalf("observation reads=%d want=%d", runtime.reads, test.wantReads)
+			}
+			if test.wantError {
+				if len(runtime.grantedLeases) != 0 {
+					t.Fatal("invalid observation renewed authority")
+				}
+				for _, value := range runtime.observations {
+					if value.ControllerOwned {
+						t.Fatal("unresolved observation retained authority")
+					}
+				}
+				return
+			}
+			if len(runtime.grantedLeases) != 1 || runtime.grantedLeases[0].LeaseID != lease.LeaseID || runtime.grantedLeases[0].Term != lease.Term || runtime.grantedLeases[0].Generation != lease.Generation || runtime.grantedLeases[0].Nonce != lease.Nonce {
+				t.Fatal("retry changed the running mutation's lease identity")
+			}
+			for _, action := range runtime.sequence {
+				if action == "fence" {
+					t.Fatal("normal state change revoked the live controller")
+				}
+			}
+		})
+	}
+}
+
 func TestManagerHardFencesWhenObservationPersistenceFails(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })

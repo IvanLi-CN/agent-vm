@@ -106,6 +106,8 @@ Grafana 面板通过 Prometheus 查询 Deployd 输出，例如：
 
 Deployd 在完成旧槽位 quiescence 后退出共享 drain 时，`preserve_traffic=true` 必须保留调用槽位当前的 traffic role：已单独启用的目标槽位保持启用，仍被关闭的槽位保持关闭。该参数不能强制关闭目标槽位，也不能自动开放 standby。槽位健康响应中的 term 和 generation 必须按整数无损读取，经过观测与续租后仍须匹配原 lease 身份。
 
+正常生命周期写入可能在独立的容量、清单和健康请求之间推进 state epoch。持续协调遇到这种组合观测不一致时，只有当前 active 槽位仍持有同一 Deployd 进程的有效 lease、支持原身份续约、进程与角色来源新鲜且没有第二个 controller，才允许立即重新采样，单次协调最多采样三次。重采样期间不能依据失败样本续约或授予新身份；最终必须取得完整、新鲜且一致的观测，才能按上述原身份规则续约。持续不一致、来源失效、lease 过期、owner 不匹配、第二个 controller 或观测持久化失败仍必须 fencing。部署转换和重启恢复继续使用各自的严格验证条件。
+
 控制器持有排他的宿主级协调锁。槽位 controller role 是进程持有型的；deployd 或持有 role 的槽位失去已认证角色通道后，该 role 立即失效。deployd 重启会使所有尚未验证的交接失效，并要求重新观测后才能授予新的 role。不能根据过期的 SQLite 行重建 role。
 
 维护 CLI 和浏览器均可进入 admission drain。发布事务以 `release-` 开头的 `session_id` 显式接管尚未归属于发布事务的排空状态，包括维护 CLI 会话和浏览器操作；接管只改变排空归属，必须保持 admission 与 traffic 关闭。另一项发布事务、维护 CLI 或浏览器都不能替换已有发布事务的归属。只有当前发布事务能退出 drain，旧维护会话不能在交接后重新开放准入；退出前仍须完成发布健康与收敛检查。
