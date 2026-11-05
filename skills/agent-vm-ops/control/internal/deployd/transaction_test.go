@@ -21,6 +21,7 @@ type fakeRuntime struct {
 	failSwitch            bool
 	stageError            error
 	inconsistent          bool
+	partialInventory      bool
 	identityError         error
 	stateEpoch            string
 	capabilities          []string
@@ -67,7 +68,7 @@ func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 	for _, source := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
 		sources[source] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
 	}
-	return RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: runtime.active, ControllerSlot: runtime.active, Consistent: !runtime.inconsistent, Slots: slots, Sources: sources}, nil
+	return RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: runtime.active, ControllerSlot: runtime.active, Consistent: !runtime.inconsistent && !runtime.partialInventory, ControllerRecoveryOnly: runtime.partialInventory && !runtime.inconsistent, Slots: slots, Sources: sources}, nil
 }
 func (runtime *fakeRuntime) Stage(context.Context, string, string) error {
 	runtime.sequence = append(runtime.sequence, "stage")
@@ -926,5 +927,61 @@ func TestManagerRejectsConcurrentDeploymentTransactions(t *testing.T) {
 	}
 	if _, err := manager.Stage(context.Background(), "green", "/tmp/release-b"); err == nil {
 		t.Fatal("concurrent deployment transaction was accepted")
+	}
+}
+
+func TestControllerRecoveryRetainsOnlyDrainedAuthority(t *testing.T) {
+	for _, test := range []struct {
+		name                                     string
+		partial, draining, inconsistent, allowed bool
+	}{
+		{"complete-drain", false, true, false, true},
+		{"partial-drain", true, true, false, true},
+		{"partial-without-drain", true, false, false, false},
+		{"inconsistent-drain", true, true, true, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			runtime := &fakeRuntime{active: "blue", partialInventory: test.partial, inconsistent: test.inconsistent, observations: map[string]SlotObservation{
+				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: false, Draining: test.draining},
+				"green": {Slot: "green", ProcessUp: true, ProcessReady: true, ControllerOwned: true},
+			}}
+			manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+			err = manager.MaintainController(context.Background())
+			if (err == nil) != test.allowed {
+				t.Fatalf("maintenance err=%v; sequence=%v", err, runtime.sequence)
+			}
+			if runtime.traffic["blue"] || runtime.traffic["green"] {
+				t.Fatalf("recovery enabled traffic: %v", runtime.traffic)
+			}
+			if runtime.observations["blue"].ControllerOwned != test.allowed || runtime.observations["green"].ControllerOwned {
+				t.Fatalf("unexpected ownership: %+v", runtime.observations)
+			}
+			snapshot, _ := runtime.Observe(context.Background())
+			if test.partial && validObservation(snapshot, now) {
+				t.Fatal("partial recovery view authorized deployment")
+			}
+			if !test.allowed {
+				return
+			}
+			// Once reconciliation and the operator's drain exit are observed, ordinary
+			// readiness checks may restore traffic without changing active routing.
+			runtime.partialInventory = false
+			active := runtime.observations["blue"]
+			active.Draining = false
+			active.Ready = true
+			runtime.observations["blue"] = active
+			if err := manager.MaintainController(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if !runtime.traffic["blue"] || runtime.traffic["green"] {
+				t.Fatalf("traffic was not restored exclusively: %v", runtime.traffic)
+			}
+		})
 	}
 }

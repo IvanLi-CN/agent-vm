@@ -54,6 +54,7 @@ type SlotObservation struct {
 	Ready             bool              `json:"ready"`
 	ControllerOwned   bool              `json:"controller_owned"`
 	TrafficAccepting  bool              `json:"traffic_accepting"`
+	Draining          bool              `json:"draining"`
 	CountersKnown     bool              `json:"counters_known"`
 	InFlightRequests  int64             `json:"in_flight_requests"`
 	NativeWorkers     int64             `json:"native_workers"`
@@ -67,13 +68,14 @@ type SlotObservation struct {
 }
 
 type RuntimeSnapshot struct {
-	ObservedAt     time.Time                    `json:"observed_at"`
-	FreshUntil     time.Time                    `json:"fresh_until"`
-	ActiveSlot     string                       `json:"active_slot"`
-	ControllerSlot string                       `json:"controller_slot"`
-	Consistent     bool                         `json:"consistent"`
-	Slots          map[string]SlotObservation   `json:"slots"`
-	Sources        map[string]SourceObservation `json:"sources,omitempty"`
+	ObservedAt             time.Time                    `json:"observed_at"`
+	FreshUntil             time.Time                    `json:"fresh_until"`
+	ActiveSlot             string                       `json:"active_slot"`
+	ControllerSlot         string                       `json:"controller_slot"`
+	Consistent             bool                         `json:"consistent"`
+	ControllerRecoveryOnly bool                         `json:"controller_recovery_only"`
+	Slots                  map[string]SlotObservation   `json:"slots"`
+	Sources                map[string]SourceObservation `json:"sources,omitempty"`
 }
 
 type SourceObservation struct {
@@ -697,12 +699,22 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	if len(transactions) != 0 {
 		return manager.fenceSlots(ctx, errors.New("deployment transaction is active"))
 	}
-	if !observation.Consistent {
+	controllerObservation := observation
+	controllerObservation.Consistent = observation.Consistent || observation.ControllerRecoveryOnly
+	if !validObservation(controllerObservation, manager.Clock().UTC()) {
 		return manager.fenceSlots(ctx, errors.New("slot observation is inconsistent"))
 	}
 	target, ok := observation.Slots[observation.ActiveSlot]
 	if !ok || !target.ProcessUp || !target.ProcessReady || target.StateEpoch == "" || len(target.StateCapabilities) == 0 {
 		return manager.fenceSlots(ctx, errors.New("active slot is not process-ready"))
+	}
+	if observation.ControllerRecoveryOnly && !target.Draining {
+		return manager.fenceSlots(ctx, errors.New("partial inventory requires admission drain before controller recovery"))
+	}
+	if target.Draining {
+		if err := manager.Runtime.DisableTraffic(ctx, observation.ActiveSlot); err != nil {
+			return manager.fenceSlots(ctx, fmt.Errorf("disable draining active traffic: %w", err))
+		}
 	}
 	other := "blue"
 	if observation.ActiveSlot == "blue" {
@@ -733,6 +745,12 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	}
 	if err := manager.Runtime.GrantController(ctx, observation.ActiveSlot, lease); err != nil {
 		return manager.fenceSlots(ctx, errors.New("grant active controller failed; controller roles were fenced"))
+	}
+	if target.Draining {
+		// A drained controller must retain its lease so startup reconciliation
+		// and explicit maintenance can converge an incomplete inventory. Traffic
+		// stays disabled; strict deployment validation still rejects this view.
+		return nil
 	}
 	if err := manager.waitForReady(ctx, "", observation.ActiveSlot); err != nil {
 		return manager.fenceSlots(ctx, fmt.Errorf("active slot did not become ready after controller grant: %w", err))
