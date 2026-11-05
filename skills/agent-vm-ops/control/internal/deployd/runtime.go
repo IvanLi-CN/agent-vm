@@ -1163,7 +1163,10 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 		}
 	}
 	if previous != "" && previous != "none" {
-		if err := runtime.systemctl(ctx, "start", "agent-vm-native@"+previous+".service"); err != nil {
+		// Restart even when systemd still reports the previous process as active:
+		// controller fencing can leave a resident process alive but not ready, and
+		// startup reconciliation is the only supported path back to admission.
+		if err := runtime.systemctl(ctx, "restart", "agent-vm-native@"+previous+".service"); err != nil {
 			return err
 		}
 		if err := runtime.waitSlot(ctx, previous); err != nil {
