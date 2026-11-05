@@ -704,7 +704,12 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	// Normal lifecycle commits can advance the epoch between the separate
 	// metrics/inventory/doctor reads. Re-observe before revoking an otherwise
 	// live controller; never renew from the inconsistent sample itself.
+	var retryLease *controllerrole.Lease
 	for attempt := 1; attempt < 3 && manager.retryableControllerObservation(observation); attempt++ {
+		if retryLease == nil {
+			original := *observation.Slots[observation.ActiveSlot].ControllerLease
+			retryLease = &original
+		}
 		observation, err = manager.observe(ctx, "")
 		if err != nil {
 			return manager.fenceSlots(ctx, errors.New("slot observation retry could not be persisted; controller roles were fenced"))
@@ -750,7 +755,7 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 			break
 		}
 	}
-	lease, err := manager.renewOrAllocateLease(ctx, target, generation)
+	lease, err := manager.renewOrAllocateLease(ctx, target, generation, retryLease)
 	if err != nil {
 		return manager.fenceSlots(ctx, errors.New("allocate active controller lease failed; controller roles were fenced"))
 	}
@@ -1096,16 +1101,26 @@ func rollbackVerificationError(observation RuntimeSnapshot, transaction store.Tr
 
 // Only a freshly observed lease held by this exact Deployd process can be
 // renewed. Persisted snapshots and a previous process incarnation grant nothing.
-func (manager *Manager) renewOrAllocateLease(ctx context.Context, target SlotObservation, generation int64) (controllerrole.Lease, error) {
+func (manager *Manager) renewOrAllocateLease(ctx context.Context, target SlotObservation, generation int64, required *controllerrole.Lease) (controllerrole.Lease, error) {
 	now := manager.Clock()
 	if current := target.ControllerLease; target.LeaseRenewalSupported && target.ControllerOwned && current != nil &&
 		current.Validate(now, target.Slot) == nil && current.OwnerPID == os.Getpid() &&
 		current.OwnerStartTime != "" && current.OwnerStartTime == controllerrole.ProcessStartToken(os.Getpid()) {
+		if required != nil {
+			identity := *required
+			identity.Expiry = current.Expiry
+			if required.Validate(now, target.Slot) != nil || identity != *current {
+				return controllerrole.Lease{}, errors.New("controller lease expired or changed during observation retry")
+			}
+		}
 		renewed := *current
 		if expiry := now.Add(manager.LeaseDuration); expiry.After(renewed.Expiry) {
 			renewed.Expiry = expiry
 		}
 		return renewed, nil
+	}
+	if required != nil {
+		return controllerrole.Lease{}, errors.New("controller lease was lost during observation retry")
 	}
 	return manager.newLease(ctx, target.Slot, generation)
 }

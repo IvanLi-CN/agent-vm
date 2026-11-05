@@ -702,10 +702,14 @@ type changingObservationRuntime struct {
 	*fakeRuntime
 	reads         int
 	unstableReads int
+	onRead        func(int)
 }
 
 func (runtime *changingObservationRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error) {
 	runtime.reads++
+	if runtime.onRead != nil {
+		runtime.onRead(runtime.reads)
+	}
 	snapshot, err := runtime.fakeRuntime.Observe(ctx)
 	if runtime.reads <= runtime.unstableReads {
 		snapshot.Consistent = false
@@ -733,6 +737,8 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 		{"foreign-owner", 1, "owner", 1, true},
 		{"missing-lease", 1, "lease", 1, true},
 		{"expired-lease", 1, "expired", 1, true},
+		{"expiry-during-retry", 1, "expiry-during-retry", 2, true},
+		{"identity-change-during-retry", 1, "identity-during-retry", 2, true},
 		{"second-controller", 1, "second", 1, true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -756,6 +762,19 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 				runtime.observations["blue"] = active
 			case "expired":
 				lease.Expiry = now
+			case "expiry-during-retry":
+				lease.Expiry = now.Add(time.Second)
+				runtime.onRead = func(read int) {
+					if read == 2 {
+						now = now.Add(2 * time.Second)
+					}
+				}
+			case "identity-during-retry":
+				runtime.onRead = func(read int) {
+					if read == 2 {
+						lease.LeaseID = "unexpected-replacement"
+					}
+				}
 			case "second":
 				standby := runtime.observations["green"]
 				standby.ControllerOwned = true
@@ -1105,7 +1124,7 @@ func TestOnlyCurrentProcessLiveLeaseCanBeRenewed(t *testing.T) {
 	}
 	now = now.Add(time.Second)
 	target := SlotObservation{Slot: "blue", LeaseRenewalSupported: true, ControllerOwned: true, ControllerLease: &lease}
-	renewed, err := manager.renewOrAllocateLease(context.Background(), target, 1)
+	renewed, err := manager.renewOrAllocateLease(context.Background(), target, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1126,7 +1145,7 @@ func TestOnlyCurrentProcessLiveLeaseCanBeRenewed(t *testing.T) {
 			candidate := target
 			candidate.ControllerLease = &copyLease
 			mutate(&candidate)
-			fresh, err := manager.renewOrAllocateLease(context.Background(), candidate, 1)
+			fresh, err := manager.renewOrAllocateLease(context.Background(), candidate, 1, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
