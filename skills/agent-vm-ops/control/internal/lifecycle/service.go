@@ -1125,9 +1125,40 @@ func (s *Service) recoverPending(ctx context.Context, pending []state.Operation)
 	return firstErr
 }
 
-// A blocked maintenance operation may receive one more attempt after all task
-// transitions have cleared and its last native worker is confirmed absent.
+// A blocked maintenance operation may receive one more attempt after its
+// safety boundary clears. A drain handoff has no native effect and must
+// preserve an existing admission fence; native maintenance also proves its
+// last worker absent and all task transitions cleared.
 func (s *Service) mayRetryClearedMaintenance(ctx context.Context, operation state.Operation) (bool, error) {
+	if operation.Action == "drain-enter" {
+		if boolValue(operation.Response["_recovery_after_clear_attempted"]) || recoveryAttempts(operation.Response) != 1 {
+			return false, nil
+		}
+		if _, present := operation.Response["worker"]; present {
+			return false, nil
+		}
+		raw, ok := operation.Response["_request"].(map[string]any)
+		if !ok {
+			return false, nil
+		}
+		req := protocol.Request(raw)
+		digest, err := protocol.Digest(req)
+		if err != nil || protocol.ValidateRequest(req) != nil || digest != stringValue(operation.Response["_request_digest"]) || !operationIdentityMatches(&operation, req) || stringValue(req["operation_id"]) != operation.OperationID || operation.Generation == nil || *operation.Generation != 0 || !strings.HasPrefix(stringValue(req["session_id"]), "release-") {
+			return false, nil
+		}
+		draining, _, err := s.Store.Meta(ctx, "draining")
+		if err != nil {
+			return false, s.sqliteError(err)
+		}
+		owner, _, err := s.Store.Meta(ctx, "drain_owner")
+		if err != nil {
+			return false, s.sqliteError(err)
+		}
+		// This is one bounded recovery of a pre-fix owner conflict. It can
+		// only preserve an existing drain and cannot start native work or
+		// replace a different release owner.
+		return draining == "1" && (!strings.HasPrefix(owner, "release-") || owner == stringValue(req["session_id"])), nil
+	}
 	if operation.Action != "admin-reconcile" || boolValue(operation.Response["_recovery_after_clear_attempted"]) {
 		return false, nil
 	}
@@ -3127,15 +3158,14 @@ func (s *Service) drain(ctx context.Context, value bool, request protocol.Reques
 				if err := s.setMeta(ctx, "drain_owner", incoming); err != nil {
 					return nil, s.sqliteError(err)
 				}
-			case strings.HasPrefix(incoming, "release-") && strings.HasPrefix(owner, "operation:"):
-				// A release may explicitly take over a browser-entered drain;
-				// a browser or a different release may never replace an active
-				// release owner.
+			case strings.HasPrefix(incoming, "release-") && !strings.HasPrefix(owner, "release-"):
+				// A release may take over a browser or maintenance CLI drain.
+				// An active release owner cannot be replaced by another caller.
 				if err := s.setMeta(ctx, "drain_owner", incoming); err != nil {
 					return nil, s.sqliteError(err)
 				}
 			default:
-				return nil, protocol.NewError("operation_conflict", "admission drain is owned by another transaction", nil)
+				return nil, protocol.NewError("operation_conflict", "admission drain is owned by another transaction", map[string]any{"outcome_verified": true})
 			}
 		} else if err := s.setMeta(ctx, "drain_owner", incoming); err != nil {
 			return nil, s.sqliteError(err)

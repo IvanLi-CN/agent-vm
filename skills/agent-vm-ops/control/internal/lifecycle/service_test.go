@@ -436,7 +436,42 @@ func TestDrainOwnershipCannotBeReplacedByAnotherCaller(t *testing.T) {
 	}
 }
 
-func TestReleaseMayTakeOverBrowserDrainBeforeActivation(t *testing.T) {
+func TestReleaseMayTakeOverMaintenanceDrainBeforeActivation(t *testing.T) {
+	for name, request := range map[string]protocol.Request{
+		"browser": {"operation_id": "browser-drain"},
+		"cli":     {"session_id": "maintenance-session"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			service := New(store, config.Defaults(), Options{})
+			if _, err := service.drain(ctx, true, request); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.drain(ctx, true, protocol.Request{"session_id": "release-handoff"}); err != nil {
+				t.Fatal(err)
+			}
+			if owner, found, err := store.Meta(ctx, "drain_owner"); err != nil || !found || owner != "release-handoff" {
+				t.Fatalf("drain owner = %q found=%v err=%v", owner, found, err)
+			}
+			if draining, _, err := store.Meta(ctx, "draining"); err != nil || draining != "1" || service.TrafficAccepting() {
+				t.Fatalf("handoff reopened admission: draining=%q err=%v", draining, err)
+			}
+			if _, err := service.drain(ctx, false, request); protocol.AsError(err).Code != "permission_denied" {
+				t.Fatalf("previous owner exit error = %#v", err)
+			}
+			if result, err := service.drain(ctx, false, protocol.Request{"session_id": "release-handoff"}); err != nil || result["draining"] != false || !service.TrafficAccepting() {
+				t.Fatalf("release exit result=%#v err=%v", result, err)
+			}
+		})
+	}
+}
+
+func TestDrainOwnerConflictIsDefinitive(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
 		t.Fatal(err)
@@ -444,14 +479,90 @@ func TestReleaseMayTakeOverBrowserDrainBeforeActivation(t *testing.T) {
 	defer store.Close()
 	ctx := context.Background()
 	service := New(store, config.Defaults(), Options{})
-	if _, err := service.drain(ctx, true, protocol.Request{"operation_id": "browser-drain"}); err != nil {
+	if _, err := service.drain(ctx, true, protocol.Request{"session_id": "release-owner"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.drain(ctx, true, protocol.Request{"session_id": "release-handoff"}); err != nil {
-		t.Fatal(err)
+	_, err = service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": "drain-enter", "session_id": "release-other", "generation": int64(0), "operation_id": "conflicting-drain"})
+	if protocol.AsError(err).Code != "operation_conflict" {
+		t.Fatalf("conflict = %v", err)
 	}
-	if owner, found, err := store.Meta(ctx, "drain_owner"); err != nil || !found || owner != "release-handoff" {
-		t.Fatalf("drain owner = %q found=%v err=%v", owner, found, err)
+	op, err := store.GetOperation(ctx, "conflicting-drain")
+	if err != nil || op == nil || op.Response["outcome"] != "error" {
+		t.Fatalf("operation=%#v err=%v", op, err)
+	}
+}
+
+func TestRecoverPreviouslyBlockedReleaseDrain(t *testing.T) {
+	for _, scenario := range []string{"recover", "bad-digest", "release-owner", "worker-present", "already-retried", "not-draining"} {
+		t.Run(scenario, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			owner := "maintenance-session"
+			if scenario == "release-owner" {
+				owner = "release-other"
+			}
+			if err := store.SetMeta(ctx, "drain_owner", owner); err != nil {
+				t.Fatal(err)
+			}
+			draining := "1"
+			if scenario == "not-draining" {
+				draining = "0"
+			}
+			if err := store.SetMeta(ctx, "draining", draining); err != nil {
+				t.Fatal(err)
+			}
+			req := protocol.Request{"protocol": protocol.Version, "action": "drain-enter", "session_id": "release-handoff", "generation": int64(0), "operation_id": "blocked-drain"}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "bad-digest" {
+				digest = "invalid"
+			}
+			response := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "_recovery_attempts": int64(1)}
+			if scenario == "worker-present" {
+				response["worker"] = map[string]any{"state": "finished"}
+			}
+			if scenario == "already-retried" {
+				response["_recovery_after_clear_attempted"] = true
+			}
+			session := "release-handoff"
+			generation := int64(0)
+			if err := store.RecordOperation(ctx, "blocked-drain", "drain-enter", &session, &generation, response); err != nil {
+				t.Fatal(err)
+			}
+			service := New(store, config.Defaults(), Options{})
+			pending, err := store.PendingOperations(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := service.recoverPending(ctx, pending); err != nil {
+				t.Fatal(err)
+			}
+			op, err := store.GetOperation(ctx, "blocked-drain")
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantOutcome := "pending"
+			wantOwner := owner
+			if scenario == "recover" {
+				wantOutcome = "success"
+				wantOwner = session
+			}
+			if op == nil || op.Response["outcome"] != wantOutcome {
+				t.Fatalf("operation = %#v", op)
+			}
+			if actual, _, err := store.Meta(ctx, "drain_owner"); err != nil || actual != wantOwner {
+				t.Fatalf("owner=%q err=%v", actual, err)
+			}
+			if actual, _, err := store.Meta(ctx, "draining"); err != nil || actual != draining || service.TrafficAccepting() {
+				t.Fatalf("drain=%q traffic=%v err=%v", actual, service.TrafficAccepting(), err)
+			}
+		})
 	}
 }
 
