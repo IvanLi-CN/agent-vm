@@ -315,7 +315,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 		return nil, manager.rollbackOrFence(ctx, *transaction, err)
 	}
 	target, ok = observation.Slots[transaction.TargetSlot]
-	if !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch == "" || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) {
+	if !ok || !target.ProcessUp || !target.ProcessReady || !target.ControllerOwned || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch == "" || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) {
 		return nil, manager.rollbackOrFence(ctx, *transaction, errors.New("candidate controller lease was not observed"))
 	}
 	if err := manager.waitForReady(ctx, id, transaction.TargetSlot); err != nil {
