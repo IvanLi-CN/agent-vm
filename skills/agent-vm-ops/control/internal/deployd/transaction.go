@@ -384,6 +384,9 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 			return nil, manager.effectFailure(ctx, id, PhaseQuiescence, err)
 		}
 	}
+	if err := manager.Runtime.ExitDrain(ctx, transaction.TargetSlot); err != nil {
+		return nil, manager.effectFailure(ctx, id, PhaseQuiescence, fmt.Errorf("exit shared admission drain on active slot: %w", err))
+	}
 	observation, err = manager.observe(ctx, id)
 	if err != nil {
 		return nil, manager.rollbackOrFence(ctx, *transaction, err)
