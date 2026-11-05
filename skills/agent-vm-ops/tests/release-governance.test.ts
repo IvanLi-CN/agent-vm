@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 
 import { compareSemVer, parseSemVer, resolveReleaseTarget } from "../scripts/semver.ts";
 import { GhGithubAdapter, GithubReleaseStateStore, ReleaseStateStore, type ReleaseIdentity } from "../scripts/release-coordinator.ts";
-import { assertContractPreconditions, assertWorkflowPlatformAttestation, releaseBuilderCommand, releaseBuilderEnvironment, successfulMainGate, verifyReleaseView } from "../scripts/release.ts";
+import { assertContractPreconditions, assertWorkflowPlatformAttestation, releaseBuilderCommand, releaseBuilderEnvironment, successfulMainGate, verifyReleaseView, waitForImmutableRelease } from "../scripts/release.ts";
 
 const identity = (overrides: Partial<ReleaseIdentity> = {}): ReleaseIdentity => ({
   version: "1.0.0",
@@ -204,4 +204,31 @@ test("draft release lookup accepts an untagged draft only when its target is bou
   try { verifyReleaseView({ tagName: "v1.0.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: true, assets: [{ name: "package" }, { name: "unexpected" }] }, "v1.0.0", false, { package: "/tmp/package" }, source); } catch { extraAssetRejected = true; }
   if (!extraAssetRejected) throw new Error("an unexpected release asset was accepted");
   verifyReleaseView({ tagName: "v1.0.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: true, assets: [{ name: "package" }] }, "v1.0.0", false, { package: "/tmp/package" }, source);
+});
+
+test("published release verification waits for immutable propagation without accepting historical mutable releases", async () => {
+  const source = "a".repeat(40);
+  let reads = 0;
+  const view = () => Promise.resolve({ tagName: "v1.4.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: ++reads >= 3, assets: [{ name: "package" }] });
+  const verified = await waitForImmutableRelease(view, "v1.4.0", { package: "/tmp/package" }, source, { timeoutMs: 100, pollMs: 1 });
+  if (verified.immutable !== true || reads !== 3) throw new Error("immutable propagation was not awaited");
+  let historicalRejected = false;
+  try {
+    await waitForImmutableRelease(() => Promise.resolve({ tagName: "v1.3.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: false, assets: [{ name: "package" }] }), "v1.3.0", { package: "/tmp/package" }, source, { timeoutMs: 3, pollMs: 1 });
+  } catch (error) { historicalRejected = /after waiting/.test(String(error)); }
+  if (!historicalRejected) throw new Error("historical mutable release was not rejected after the bounded wait");
+});
+
+test("published release verification fails closed on immutable timeout and identity changes", async () => {
+  const source = "a".repeat(40);
+  let timeoutRejected = false;
+  try {
+    await waitForImmutableRelease(() => Promise.resolve({ tagName: "v1.4.0", targetCommitish: source, isDraft: false, isPrerelease: false, immutable: false, assets: [{ name: "package" }] }), "v1.4.0", { package: "/tmp/package" }, source, { timeoutMs: 2, pollMs: 1 });
+  } catch (error) { timeoutRejected = /after waiting/.test(String(error)); }
+  if (!timeoutRejected) throw new Error("immutable timeout was not fail-closed");
+  let identityRejected = false;
+  try {
+    await waitForImmutableRelease(() => Promise.resolve({ tagName: "v1.4.0", targetCommitish: "b".repeat(40), isDraft: false, isPrerelease: false, immutable: false, assets: [{ name: "package" }] }), "v1.4.0", { package: "/tmp/package" }, source, { timeoutMs: 100, pollMs: 1 });
+  } catch (error) { identityRejected = /target is not bound/.test(String(error)); }
+  if (!identityRejected) throw new Error("release identity drift was retried instead of rejected");
 });
