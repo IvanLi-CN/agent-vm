@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
   "transport_selection": {
-    "status": "unselected",
-    "selection_evidence": null,
-    "transport_owner": null,
-    "configuration_owner": null,
+    "status": "selected",
+    "transport": "oidrune-github-oidc",
+    "selection_evidence": "docs/adr/0046-agent-vm-failure-notification-transport.md",
+    "transport_owner": "Oidrune operator",
+    "configuration_owner": "Agent VM repository maintainer",
     "required_secrets": [],
     "when_unselected": "block-rollout",
     "missing_selected_configuration": "fail",

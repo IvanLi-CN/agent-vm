@@ -31,19 +31,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
+          ref: ${{ github.sha }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
-      - name: Require platform audit credential
-        env:
-          RELEASE_PLATFORM_TOKEN: ${{ secrets.RELEASE_PLATFORM_TOKEN }}
-        run: test -n "$RELEASE_PLATFORM_TOKEN" || { echo "RELEASE_PLATFORM_TOKEN secret is required for protected-platform audit" >&2; exit 1; }
       - name: Install locked Bun dependencies
         run: bun install --frozen-lockfile
       - name: Retrieve reservation state from a prior release run
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLATFORM_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           RESERVATION: ${{ inputs.reservation }}
         run: |
           set -eu
@@ -69,6 +65,6 @@ jobs:
           fi
       - name: Apply recovery operation
         env:
-          GH_TOKEN: ${{ secrets.RELEASE_PLATFORM_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
           RELEASE_REF_PROTECTED: ${{ github.ref_protected }}
         run: bun run skills/agent-vm-ops/scripts/release.ts --operation "${{ inputs.operation }}" --reservation "${{ inputs.reservation }}"

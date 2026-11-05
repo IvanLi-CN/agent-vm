@@ -3,28 +3,25 @@ name: Notification smoke
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
-  smoke:
-    name: Notification smoke
+  config:
+    name: Require Oidrune configuration
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          fetch-depth: 1
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.4
-      - name: Prove the selection gate is fail-closed
-        env:
-          FAILED_CONCLUSION: failure
-          FAILED_WORKFLOW: Notification smoke
-          FAILED_REPOSITORY: ${{ github.repository }}
-          FAILED_RUN_ID: ${{ github.run_id }}
-          FAILED_RUN_ATTEMPT: ${{ github.run_attempt }}
-          FAILED_HEAD_SHA: ${{ github.sha }}
-          FAILED_ACTOR: ${{ github.actor }}
-        run: bun run skills/agent-vm-ops/scripts/failure-notification.ts --class generic
+      - env:
+          GATEWAY_URL: ${{ vars.OIDRUNE_GATEWAY_URL }}
+          OIDC_AUDIENCE: ${{ vars.OIDRUNE_OIDC_AUDIENCE }}
+        run: test -n "$GATEWAY_URL" && test -n "$OIDC_AUDIENCE"
+  smoke:
+    name: Oidrune notification smoke
+    needs: config
+    uses: IvanLi-CN/oidrune/.github/workflows/notify.yml@4b5901a8827731ea06a05211dc6edf06e46783bc
+    permissions:
+      contents: none
+      id-token: write
+    with:
+      outcome: failure
+      summary: "Agent VM notification smoke: ${{ github.repository }} run=${{ github.run_id }} attempt=${{ github.run_attempt }}"
+      on_gateway_failure: fail
+      gateway_url: ${{ vars.OIDRUNE_GATEWAY_URL }}
+      oidc_audience: ${{ vars.OIDRUNE_OIDC_AUDIENCE }}

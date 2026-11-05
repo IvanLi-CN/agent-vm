@@ -14,6 +14,18 @@
 
 _Avoid_：用“发布成功”同时指代 GitHub 产物发布与现网部署；用源码 SHA、协议版本或数据库 schema 版本代替产品版本。
 
+## 失败通知
+
+**失败通知（Failure notification）**：由可信默认分支 sidecar 针对预期成功但结论为 failure 的交付工作流生成的 metadata-only 事件。它独立记录排查入口，不改变原 CI、产品发布或部署的结果。
+
+**通知通道选定（Notification transport selection）**：项目明确记录通知 transport、transport owner、configuration owner、所需权限和凭据边界的决策。它表示已经选择方案，不表示外部配置已经完成或真实发送已经验证。
+
+**持久交接（Durable handoff）**：通知事件已经被选定 transport 持久化接收并进入后续投递路径的状态；Oidrune 的 `202 Accepted` 只证明持久交接，不证明 Telegram 已送达。
+_Avoid_：把持久交接称为“通知已送达”或“发布已成功”。
+
+**通知启用（Notification enablement）**：通知通道已经完成选择、外部配置、来源 allowlist 和真实 smoke 验证，生产 sidecar 才被允许发送失败事件的状态。
+_Avoid_：把“已选择”或“CI 绿色”当成通知已启用。
+
 ## 部署控制
 
 **部署控制服务**：位于产品蓝绿槽位之外、代表维护者执行部署事务的控制面。
