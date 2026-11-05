@@ -709,8 +709,8 @@ func extractAndVerifyBundle(bundle, destination string) (map[string]any, error) 
 	if err != nil {
 		return nil, err
 	}
-	if format, ok := manifest["format"].(json.Number); !ok || format.String() != "2" {
-		return nil, errors.New("bundle manifest format must be 2")
+	if format, ok := manifest["format"].(json.Number); !ok || !supportedBundleManifestFormat(format) {
+		return nil, errors.New("bundle manifest format is unsupported")
 	}
 	expected := map[string]struct{}{"release-manifest.json": {}, "client-release.json": {}}
 	artifacts, ok := manifest["artifacts"].([]any)
@@ -751,6 +751,14 @@ func extractAndVerifyBundle(bundle, destination string) (map[string]any, error) 
 		return nil, fmt.Errorf("persist verified release bundle: %w", err)
 	}
 	return manifest, nil
+}
+
+func supportedBundleManifestFormat(format json.Number) bool {
+	value, err := format.Int64()
+	if err != nil {
+		return false
+	}
+	return value == releaseManifest.Format || value == releaseManifest.LegacyProductFormat || value == releaseManifest.ProductFormat
 }
 
 func compareReleaseTrees(expectedRoot, actualRoot string) error {
