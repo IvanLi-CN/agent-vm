@@ -1149,8 +1149,16 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 				if stopErr := runtime.Stop(ctx, target); stopErr != nil {
 					return fmt.Errorf("revoke target controller: %w; stop target after revoke failure: %v", err, stopErr)
 				}
-			} else if err := runtime.Stop(ctx, target); err != nil {
-				return fmt.Errorf("stop target after revoke: %w", err)
+			} else {
+				if err := runtime.Drain(ctx, target); err != nil {
+					return err
+				}
+				if err := runtime.Quiesce(ctx, target); err != nil {
+					return err
+				}
+				if err := runtime.Stop(ctx, target); err != nil {
+					return fmt.Errorf("stop target after revoke: %w", err)
+				}
 			}
 		}
 	}
@@ -1173,17 +1181,6 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 	}
 	if err := runtime.ExitDrain(ctx, previous); err != nil {
 		return fmt.Errorf("exit rollback drain on slot %s: %w", previous, err)
-	}
-	if target != "" && target != "none" && target != previous {
-		if err := runtime.Drain(ctx, target); err != nil {
-			return err
-		}
-		if err := runtime.Quiesce(ctx, target); err != nil {
-			return err
-		}
-		if err := runtime.Stop(ctx, target); err != nil {
-			return err
-		}
 	}
 	return nil
 }
