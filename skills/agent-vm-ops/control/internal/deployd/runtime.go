@@ -913,6 +913,9 @@ func (runtime *HostRuntime) FenceController(ctx context.Context, slot string) er
 	if slot == "" || slot == "none" {
 		return nil
 	}
+	if runtime.systemdSlotStopped(ctx, slot) {
+		return nil
+	}
 	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, "/internal/v1/controller-role", map[string]any{"action": "fence"})
 	if err == nil && status == http.StatusOK && responseOK(body) {
 		if valid, ok := body["valid"].(bool); ok && !valid {
@@ -951,6 +954,9 @@ func (runtime *HostRuntime) DisableTraffic(ctx context.Context, slot string) err
 	}
 	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, "/internal/v1/traffic-role", map[string]any{"action": "disable"})
 	if err != nil {
+		if runtime.systemdSlotStopped(ctx, slot) {
+			return nil
+		}
 		return err
 	}
 	if status != http.StatusOK || !responseOK(body) {

@@ -84,7 +84,7 @@ func (runtime *fakeRuntime) VerifySlotIdentity(context.Context, string, string, 
 func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, _ controllerrole.Lease) error {
 	runtime.sequence = append(runtime.sequence, "grant")
 	if runtime.mutateContractOnGrant {
-		runtime.stateEpoch = "epoch-2"
+		runtime.capabilities = []string{"changed@1"}
 	}
 	if observation, ok := runtime.observations[slot]; ok {
 		observation.ControllerOwned = true
