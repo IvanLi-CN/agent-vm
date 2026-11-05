@@ -385,21 +385,23 @@ func (authority *Authority) overview(metrics map[string]any, ctx context.Context
 	remaining, _ := resources["remaining"].(map[string]any)
 	ctCPU, _ := metrics["ct_cpu"].(map[string]any)
 	startupBlocked := nestedBool(metrics, "ct_cpu", "startup_pressure", "startup_blocked")
+	var physicalDiskAvailable any
+	if verified, _ := nestedBool(metrics, "disk_admission", "verified").(bool); verified {
+		physicalDiskAvailable = decimalBytes(nestedNumber(metrics, "disk_admission", "physical_admission", "free_bytes"), 1)
+	}
 	capacity := map[string]any{
 		"logical_cpu_remaining_vcpu": observedNumber(verifiedValue(numberValue(remaining["cpu"])), fieldObservedAt, fresh),
 		"ct_cpu_capacity_vcpu":       observedNumber(verifiedValue(numberValue(ctCPU["capacity_vcpu"])), fieldObservedAt, fresh),
 		"logical_memory_remaining":   observedBytes(verifiedValue(decimalBytes(numberValue(remaining["memory_mib"]), 1024*1024)), fieldObservedAt, fresh),
-		"ct_memory_available":        observedBytes(nil, fieldObservedAt, fresh),
-		// The logical admission budget is not physical disk telemetry. Keep the
-		// physical field unverified until the native snapshot supplies it.
-		"physical_disk_available": observedBytes(nil, fieldObservedAt, fresh),
+		"ct_memory_available":        observedBytes(verifiedValue(decimalBytes(nestedNumber(metrics, "ct_memory", "available_bytes"), 1)), fieldObservedAt, fresh),
+		"physical_disk_available":    observedBytes(verifiedValue(physicalDiskAvailable), fieldObservedAt, fresh),
 	}
 	pressure := map[string]any{
 		"cpu_some_avg10":                         observedNumber(verifiedValue(nestedNumber(resources, "cpu_pressure", "some", "avg10")), fieldObservedAt, fresh),
 		"cpu_full_avg10":                         observedNumber(verifiedValue(nestedNumber(resources, "cpu_pressure", "full", "avg10")), fieldObservedAt, fresh),
 		"cpu_startup_pressure_threshold_percent": observedNumber(verifiedValue(nestedNumber(resources, "policy", "cpu_startup_pressure_full_avg10_percent")), fieldObservedAt, fresh),
 		"cpu_startup_blocked":                    observedBoolean(verifiedValue(startupBlocked), fieldObservedAt, fresh),
-		"memory_pressure":                        observedBoolean(nil, fieldObservedAt, fresh),
+		"memory_pressure":                        observedBoolean(verifiedValue(nestedBool(metrics, "ct_memory", "pressure")), fieldObservedAt, fresh),
 	}
 	var admissionReady, draining any
 	admissionBlocked := false

@@ -78,7 +78,7 @@ export function SystemPage() {
     <PageIntro title={t("system.title")} description={t("system.subtitle")} onRefresh={() => void query.refetch()} refreshing={query.isFetching} />
     <OperationRecoveryNotice recovery={operationRecovery} />
     <div className="system-overview">
-      <Panel><PanelHeader title={t("system.productVersion")} /><div className="product-version mono">{query.data.product_version}</div><div className="system-meta"><span className="mono">{query.data.resource_version}</span><span>{t("shell.synthetic")}</span></div></Panel>
+      <Panel><PanelHeader title={t("system.productVersion")} /><div className="product-version mono">{query.data.product_version}</div><div className="system-meta"><span className="mono">{query.data.resource_version}</span><span>{auth.managed ? t("shell.controlObservations") : t("shell.synthetic")}</span></div></Panel>
       <Panel><PanelHeader title={t("system.maintenance")} description={t("system.maintainHint")} /><MaintenanceSummary system={query.data} /><div className="maintenance-actions">{query.data.maintenance.draining ? <p className="maintenance-note">{t("system.releaseManaged")}</p> : <Button variant="secondary" icon={<Wrench />} disabled={dialogOwner !== null} onClick={() => void openAction("drain_enter")}>{t("system.enterDrain")}</Button>}<Button variant="ghost" disabled={dialogOwner !== null} onClick={() => void openAction("reconcile")}>{t("system.reconcile")}</Button><Button variant="ghost" disabled={dialogOwner !== null} onClick={() => void openAction("gc")}>{t("system.gc")}</Button></div>{actionError && !action ? <p className="field-error" role="alert">{actionError}</p> : null}</Panel>
     </div>
     <div className="system-grid">
