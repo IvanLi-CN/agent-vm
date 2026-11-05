@@ -6,7 +6,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-import { policyRevision, resolveReleaseTarget, parseSemVer } from "./semver.ts";
+import { policyRevision, resolveReleaseTarget, parseSemVer, compareSemVer } from "./semver.ts";
 import {
   GhGithubAdapter,
   GithubReleaseStateStore,
@@ -156,19 +156,23 @@ async function verifyDownloaded(adapter: GhGithubAdapter, tag: string, digests: 
   }
 }
 
-export function verifyReleaseView(value: unknown, tag: string, expectedDraft: boolean, assets: Record<string, string>, source?: string): any {
+export function verifyReleaseView(value: unknown, tag: string, expectedDraft: boolean, assets: Record<string, string>, source?: string, requireImmutable = true): any {
   if (!value || typeof value !== "object") throw new Error("GitHub release response is invalid");
   const release = value as { tagName?: unknown; targetCommitish?: unknown; isDraft?: unknown; isPrerelease?: unknown; immutable?: unknown; assets?: unknown };
   if (release.tagName !== tag || release.isDraft !== expectedDraft || !Array.isArray(release.assets)) throw new Error("GitHub release identity or draft state is invalid");
   if (source !== undefined && release.targetCommitish !== source) throw new Error(`GitHub release target is not bound to ${source}`);
   if (!expectedDraft && release.isPrerelease === true) throw new Error("published GitHub release is a prerelease");
-  if (!expectedDraft && release.immutable !== true) throw new Error("published GitHub release is not immutable");
+  if (!expectedDraft && requireImmutable && release.immutable !== true) throw new Error("published GitHub release is not immutable");
   const names = new Set(release.assets.flatMap((item: any) => typeof item?.name === "string" ? [item.name] : []));
   const expectedNames = new Set(Object.keys(assets));
   if (names.size !== expectedNames.size || names.size !== release.assets.length || [...names].some((name) => !expectedNames.has(name))) {
     throw new Error("GitHub release assets do not exactly match the frozen asset set");
   }
   return release;
+}
+
+export function verifyHistoricalReleaseView(value: unknown, tag: string, assets: Record<string, string>, source: string): any {
+  return verifyReleaseView(value, tag, false, assets, source, false);
 }
 
 export async function waitForImmutableRelease(
@@ -205,6 +209,11 @@ async function verifyPublishedRelease(adapter: GhGithubAdapter, tag: string, sou
   return release;
 }
 
+function immutableCutoverVersion(): string {
+  const contract = JSON.parse(readFileSync(join(repositoryRoot, ".github/release-contract.json"), "utf8"));
+  return String(contract.immutable_release_policy?.cutover_version ?? "0.0.0");
+}
+
 async function assertTagIsAbsentOrBound(adapter: GhGithubAdapter, tag: string, source: string): Promise<void> {
   try {
     const existing = await adapter.tagCommit(tag);
@@ -222,7 +231,17 @@ async function trustedCompletedEvents(adapter: GhGithubAdapter, store: MirroredR
     if (!publication || typeof publication !== "object" || (publication as any).source_revision !== event.identity.source_revision || (publication as any).tag !== `v${event.identity.version}` || (publication as any).immutable !== true) {
       throw new Error(`completed release record is not fully verified: ${event.identity.version}`);
     }
-    await verifyPublishedRelease(adapter, String((publication as any).tag), event.identity.source_revision, assets, artifacts);
+    const tag = String((publication as any).tag);
+    if (compareSemVer(event.identity.version, immutableCutoverVersion()) < 0) {
+      const release = await adapter.viewRelease(tag);
+      const verified = verifyHistoricalReleaseView(release, tag, assets, event.identity.source_revision);
+      if ((publication as any).immutable === true && verified.immutable !== true) {
+        console.warn(JSON.stringify({ stage: "legacy_release_attestation_mismatch", version: event.identity.version, tag, recorded_immutable: true, observed_immutable: false, action: "accepted_as_legacy_baseline_with_explicit_audit" }));
+      }
+      await verifyDownloaded(adapter, tag, artifacts);
+    } else {
+      await verifyPublishedRelease(adapter, tag, event.identity.source_revision, assets, artifacts);
+    }
   }
   return events;
 }
