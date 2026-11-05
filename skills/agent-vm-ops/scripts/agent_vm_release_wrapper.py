@@ -1272,6 +1272,21 @@ def _validate_legacy_state_schema(database: sqlite3.Connection) -> None:
             _fail("state_compatibility_unverified", "live state schema is incomplete")
 
 
+def _activation_safe_drain_enter(item: Any, metrics: Mapping[str, Any]) -> bool:
+    """A saved drain-enter cannot open admission or launch a native worker."""
+    if not isinstance(item, Mapping) or set(item) - {"operation_id", "action", "session_id", "generation", "created_at"}:
+        return False
+    inflight = metrics.get("in_flight_operations")
+    if type(inflight) is not int or inflight != 0 or item.get("action") != "drain-enter":
+        return False
+    if type(item.get("generation")) is not int or item["generation"] != 0:
+        return False
+    session, operation = item.get("session_id"), item.get("operation_id")
+    return (isinstance(session, str) and session.startswith("release-")
+            and re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", session) is not None
+            and isinstance(operation, str) and re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", operation) is not None)
+
+
 def _ensure_drained(
     config: Mapping[str, Any],
     target_manifest: Mapping[str, Any] | None = None,
@@ -1372,8 +1387,13 @@ def _ensure_drained(
         if not isinstance(pending, list):
             _fail("drain_unverified", "control returned an invalid pending-operation list")
         if pending:
-            safe_ids = _read_activation_safe_pending_ids()
-            unsafe = [item for item in pending if not isinstance(item, Mapping) or item.get("operation_id") not in safe_ids]
+            # The live authority has already confirmed draining=true. Permit
+            # only non-native drain-enter intents with no in-flight work;
+            # keep their original journal records for bounded startup recovery.
+            unsafe = [item for item in pending if not _activation_safe_drain_enter(item, metrics)]
+            if unsafe:
+                safe_ids = _read_activation_safe_pending_ids()
+                unsafe = [item for item in unsafe if not isinstance(item, Mapping) or item.get("operation_id") not in safe_ids]
             if unsafe:
                 _fail("drain_unverified", "release activation requires management operations to converge", {"pending_operations": unsafe[:100]})
 

@@ -160,6 +160,28 @@ class WrapperTests(unittest.TestCase):
                 WRAPPER._ensure_drained(self.loaded)
         self.assertEqual(failure.exception.code, "drain_unverified")
 
+    def test_drain_verification_allows_blocked_drain_enter_without_business_db(self):
+        self.drain_patch.stop()
+        pending = {"action": "drain-enter", "operation_id": "blocked-drain", "session_id": "release-handoff", "generation": 0, "created_at": "2026-11-05T00:00:00Z"}
+        responses = [
+            json.dumps({"ok": True, "result": {"draining": True}}).encode(),
+            json.dumps({"ok": True, "result": {"pending_operations": [pending], "in_flight_operations": 0}}).encode(),
+        ]
+        with mock.patch.object(WRAPPER, "_read_activation_safe_pending_ids", side_effect=AssertionError("business DB must not be opened")), mock.patch.object(WRAPPER.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0, response, b"") for response in responses]):
+            WRAPPER._ensure_drained(self.loaded)
+
+    def test_drain_verification_rejects_unverified_drain_intents(self):
+        self.drain_patch.stop()
+        original = {"action": "drain-enter", "operation_id": "blocked-drain", "session_id": "release-handoff", "generation": 0}
+        for changes, inflight in [({"worker": {}}, 0), ({"action": "drain-exit"}, 0), ({"session_id": "maintenance"}, 0), ({"generation": True}, 0), ({"management": True}, 0), ({}, 1), ({}, None)]:
+            with self.subTest(changes=changes, inflight=inflight):
+                pending = {**original, **changes}
+                responses = [json.dumps({"ok": True, "result": {"draining": True}}).encode(), json.dumps({"ok": True, "result": {"pending_operations": [pending], "in_flight_operations": inflight}}).encode()]
+                with mock.patch.object(WRAPPER, "_read_activation_safe_pending_ids", return_value=set()), mock.patch.object(WRAPPER.subprocess, "run", side_effect=[subprocess.CompletedProcess([], 0, response, b"") for response in responses]):
+                    with self.assertRaises(WRAPPER.WrapperError) as failure:
+                        WRAPPER._ensure_drained(self.loaded)
+                self.assertEqual(failure.exception.code, "drain_unverified")
+
     def test_drain_verification_allows_only_queued_prestart_recovery(self):
         self.drain_patch.stop()
         database_path = self.root / "pending.sqlite3"
