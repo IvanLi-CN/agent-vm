@@ -977,7 +977,7 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 	target, targetOK := observation.Slots[transaction.TargetSlot]
 	targetStopped := targetOK && target.CountersKnown && !target.ProcessUp && !target.ProcessReady && !target.Ready && !target.ControllerOwned && !target.TrafficAccepting && target.NativeWorkers == 0 && target.PendingOperations == 0 && target.InFlightRequests == 0
 	if !previousOK || !previous.CountersKnown || !targetStopped || !observation.Consistent || observation.ActiveSlot != transaction.PreviousSlot || !previous.ProcessUp || !previous.ProcessReady || !previous.Ready || !previous.ControllerOwned || !previous.TrafficAccepting || previous.StateEpoch == "" || !sameStateCapabilities(previous.StateCapabilities, previousCapabilities) || previous.NativeWorkers != 0 || previous.PendingOperations != 0 || previous.InFlightRequests != 0 {
-		failureErr := manager.failure(ctx, transaction.ID, PhaseRollback, errors.New("rollback outcome was not verified"))
+		failureErr := manager.failure(ctx, transaction.ID, PhaseRollback, rollbackVerificationError(observation, transaction, previousOK, targetOK, targetStopped))
 		fenceErr := manager.fenceSlots(ctx, errors.New("rollback verification failed; controller roles were fenced"))
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)
 	}
@@ -986,6 +986,38 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 	}
 	manager.startupFenced = false
 	return nil
+}
+
+func rollbackVerificationError(observation RuntimeSnapshot, transaction store.Transaction, previousOK, targetOK, targetStopped bool) error {
+	previous := observation.Slots[transaction.PreviousSlot]
+	target := observation.Slots[transaction.TargetSlot]
+	return fmt.Errorf("rollback outcome was not verified: active=%s consistent=%t previous_present=%t previous={process_up:%t process_ready:%t ready:%t controller_owned:%t traffic_accepting:%t counters_known:%t state_epoch:%t capabilities:%t workers:%d pending:%d in_flight:%d} target_present=%t target_stopped=%t target={process_up:%t process_ready:%t ready:%t controller_owned:%t traffic_accepting:%t counters_known:%t workers:%d pending:%d in_flight:%d}",
+		observation.ActiveSlot,
+		observation.Consistent,
+		previousOK,
+		previous.ProcessUp,
+		previous.ProcessReady,
+		previous.Ready,
+		previous.ControllerOwned,
+		previous.TrafficAccepting,
+		previous.CountersKnown,
+		previous.StateEpoch != "",
+		len(previous.StateCapabilities) > 0,
+		previous.NativeWorkers,
+		previous.PendingOperations,
+		previous.InFlightRequests,
+		targetOK,
+		targetStopped,
+		target.ProcessUp,
+		target.ProcessReady,
+		target.Ready,
+		target.ControllerOwned,
+		target.TrafficAccepting,
+		target.CountersKnown,
+		target.NativeWorkers,
+		target.PendingOperations,
+		target.InFlightRequests,
+	)
 }
 
 func (manager *Manager) newLease(ctx context.Context, slot string, generation int64) (controllerrole.Lease, error) {
