@@ -1561,6 +1561,11 @@ def _verify_migration_completion(config: Mapping[str, Any], migration_response: 
 
 
 def _run_initial_state_migration(config: Mapping[str, Any]) -> None:
+    marker = _read_migration_marker(config)
+    if marker is not None and _migration_transaction_is_finalized(marker["transaction_id"]):
+        # An ordinary product upgrade must not create a new SQLite-to-rqlite
+        # migration after the original cutover has already finalized.
+        return
     process = _run_deployd_cli("migrate", timeout_seconds=MIGRATION_TIMEOUT_SECONDS)
     if process.returncode == 0:
         _verify_migration_completion(config, process.stdout)

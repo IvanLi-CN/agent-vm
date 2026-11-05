@@ -59,8 +59,8 @@ paths:
       tags: [Auth]
       operationId: completeOidcLogin
       security: []
-      summary: Consume one OIDC authorization response
-      description: "Exactly one callback shape is accepted: a successful response has code and state, or a provider error has error and state without code. The matching S256-bound transaction is consumed once; provider error details are never exposed or logged."
+      summary: 消费一次 OIDC 授权响应
+      description: 成功响应携带 code 和 state，失败响应携带 error 和 state 且没有 code。兼容单值 iss 和 scope；iss 必须与配置的 issuer 完全相同，provider 声明支持 RFC 9207 时成功响应必须携带 iss。scope 不用于授予管理员权限。S256 绑定事务只消费一次，不暴露或记录 provider 错误详情。
       parameters:
         - name: code
           in: query
@@ -99,6 +99,21 @@ paths:
           schema:
             type: string
             format: uri
+            maxLength: 2048
+        - name: iss
+          in: query
+          required: false
+          description: RFC 9207 响应签发方；提供时必须与配置的 issuer 完全一致，discovery 声明支持时必须提供。不得重复。
+          schema:
+            type: string
+            format: uri
+        - name: scope
+          in: query
+          required: false
+          description: 有界的 OAuth scope 元数据，不改变管理员身份或 capability。不得重复。
+          schema:
+            type: string
+            minLength: 1
             maxLength: 2048
       responses:
         "302":

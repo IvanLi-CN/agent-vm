@@ -3770,6 +3770,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				"observation_epoch": endEpoch, "observation_consistent": consistent, "observation_attempts": attempt,
 				"observed_at": start, "up": nativeUp, "draining": draining, "admission_ready": admissionReady,
 				"resources": resourcesValue, "capacity": capacityObservation, "ct_cpu": ctCPU,
+				"filesystems":      observe.Filesystems("/", "/var/lib/incus/images", s.Config.Management.Upload.StagingPath),
 				"reclaim_required": reclaimRequired, "disk_admission": diskAdmission,
 				"default_admission": map[string]any{"requested": defaultRequested, "request_cost_bytes": s.Config.CreateCostBytes, "ready": defaultReady, "reasons": defaultReasons, "reclaim_required": reclaimRequired},
 				"ct_memory":         map[string]any{"capacity_bytes": memoryObservation["limit_bytes"], "current_bytes": memoryObservation["current_bytes"], "available_bytes": memoryObservation["available_bytes"], "pressure_threshold_bytes": memoryObservation["threshold_bytes"], "pressure": memoryObservation["pressure"], "oom_events": memoryObservation["oom_events"]},

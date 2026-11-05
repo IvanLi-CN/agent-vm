@@ -44,11 +44,12 @@ var oidcReturnPaths = map[string]struct{}{
 }
 
 type oidcDiscovery struct {
-	Issuer              string
-	Authorization       string
-	TokenEndpoint       string
-	JWKSURI             string
-	CodeChallengeMethod []string
+	Issuer                  string
+	Authorization           string
+	TokenEndpoint           string
+	JWKSURI                 string
+	CodeChallengeMethod     []string
+	ResponseIssuerSupported bool
 }
 
 type oidcAuthenticator struct {
@@ -155,8 +156,16 @@ func (auth *oidcAuthenticator) oidcStart(c *gin.Context) {
 func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 	request := c.Request
 	query := request.URL.Query()
-	if request.Method != http.MethodGet || !allowedQueryKeys(query, map[string]bool{"code": true, "state": true, "error": true, "error_description": true, "error_uri": true}) {
+	if request.Method != http.MethodGet || !allowedQueryKeys(query, map[string]bool{"code": true, "state": true, "error": true, "error_description": true, "error_uri": true, "iss": true, "scope": true}) {
 		writeProblem(c.Writer, invalidRequest("OIDC callback query is invalid"))
+		return
+	}
+	if values, present := query["iss"]; present && (len(values) != 1 || values[0] != auth.server.Config.OIDC.Issuer) {
+		writeProblem(c.Writer, newAPIError("invalid_state", "OIDC response issuer is invalid", http.StatusBadRequest, "authentication", false, ""))
+		return
+	}
+	if values, present := query["scope"]; present && (len(values) != 1 || !validOIDCResponseScope(values[0])) {
+		writeProblem(c.Writer, invalidRequest("OIDC response scope is invalid"))
 		return
 	}
 	stateValue, stateOK := singleQuery(query, "state")
@@ -241,6 +250,10 @@ func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 		auth.redirectLoginFailure(c.Writer, request, bindingCookieName, bindingValue)
 		return
 	}
+	if discovery.ResponseIssuerSupported && query.Get("iss") == "" {
+		auth.redirectLoginFailure(c.Writer, request, bindingCookieName, bindingValue)
+		return
+	}
 	idToken, err := auth.exchangeCode(request.Context(), discovery, codeValue, verifier)
 	if err != nil {
 		auth.redirectLoginFailure(c.Writer, request, bindingCookieName, bindingValue)
@@ -275,6 +288,20 @@ func (auth *oidcAuthenticator) oidcCallback(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	c.Header("Referrer-Policy", "no-referrer")
 	http.Redirect(c.Writer, request, strings.TrimRight(auth.server.Config.ExternalOrigin, "/")+transaction.ReturnTo, http.StatusFound)
+}
+
+// The response scope is metadata, never a source of administrator capabilities.
+// OAuth scope tokens are visible ASCII except quotation marks and backslash.
+func validOIDCResponseScope(value string) bool {
+	if value == "" || len(value) > 2048 || strings.TrimSpace(value) != value {
+		return false
+	}
+	for _, char := range value {
+		if char < 0x20 || char > 0x7e || char == '"' || char == '\\' {
+			return false
+		}
+	}
+	return true
 }
 
 func validOIDCReturnPath(path string) bool {
@@ -382,11 +409,12 @@ func (auth *oidcAuthenticator) getDiscovery(ctx context.Context) (oidcDiscovery,
 		return oidcDiscovery{}, errors.New("OIDC discovery response is invalid")
 	}
 	var value struct {
-		Issuer              string   `json:"issuer"`
-		Authorization       string   `json:"authorization_endpoint"`
-		TokenEndpoint       string   `json:"token_endpoint"`
-		JWKSURI             string   `json:"jwks_uri"`
-		CodeChallengeMethod []string `json:"code_challenge_methods_supported"`
+		Issuer                  string   `json:"issuer"`
+		Authorization           string   `json:"authorization_endpoint"`
+		TokenEndpoint           string   `json:"token_endpoint"`
+		JWKSURI                 string   `json:"jwks_uri"`
+		CodeChallengeMethod     []string `json:"code_challenge_methods_supported"`
+		ResponseIssuerSupported bool     `json:"authorization_response_iss_parameter_supported"`
 	}
 	if err := json.Unmarshal(body, &value); err != nil || value.Issuer != auth.server.Config.OIDC.Issuer || value.Authorization == "" || value.TokenEndpoint == "" || value.JWKSURI == "" {
 		return oidcDiscovery{}, errors.New("OIDC discovery metadata is invalid")
@@ -394,7 +422,7 @@ func (auth *oidcAuthenticator) getDiscovery(ctx context.Context) (oidcDiscovery,
 	if !httpsURL(value.Authorization) || !httpsURL(value.TokenEndpoint) || !httpsURL(value.JWKSURI) || !containsString(value.CodeChallengeMethod, "S256") {
 		return oidcDiscovery{}, errors.New("OIDC discovery metadata is not compatible")
 	}
-	discovery := oidcDiscovery{Issuer: value.Issuer, Authorization: value.Authorization, TokenEndpoint: value.TokenEndpoint, JWKSURI: value.JWKSURI, CodeChallengeMethod: value.CodeChallengeMethod}
+	discovery := oidcDiscovery{Issuer: value.Issuer, Authorization: value.Authorization, TokenEndpoint: value.TokenEndpoint, JWKSURI: value.JWKSURI, CodeChallengeMethod: value.CodeChallengeMethod, ResponseIssuerSupported: value.ResponseIssuerSupported}
 	auth.mu.Lock()
 	auth.discovery, auth.discovered = discovery, auth.server.now()
 	auth.mu.Unlock()

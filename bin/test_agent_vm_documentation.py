@@ -191,11 +191,11 @@ class AgentVmDocumentationTests(unittest.TestCase):
             "agent_vm_filesystem_available_bytes",
             "incus_project_limit",
             "refresh: \"auto\"",
-            "next managed container",
-            "horizontal dashed line",
-            "image-unpack failures",
-            "must not multiply a `pps` query by `8`",
-            "provisioning source",
+            "下一个受管容器",
+            "水平虚线",
+            "镜像解包失败",
+            "包速率 `pps` 不得乘以 `8`",
+            "provisioning 配置源",
             "grafana/dashboards/incus/incus-agent-vm.json",
             "grafana/provisioning/dashboards/incus.yml",
         ):
@@ -223,7 +223,7 @@ class AgentVmDocumentationTests(unittest.TestCase):
             "agent_vm_admission_default_vm_logical_slots",
             "agent_vm_admission_default_vm_startable_slots",
             "agent_vm_task_info",
-            "snapshot estimate",
+            "快照推导的估算值",
         ):
             self.assertIn(phrase, contract + observability_adr)
         self.assertIn("status: superseded", superseded_cpu_adr)
@@ -242,11 +242,11 @@ class AgentVmDocumentationTests(unittest.TestCase):
         ):
             self.assertTrue(any(phrase in spec for phrase in phrases), phrases)
         for phrase in (
-            "independent sampling lanes",
-            "slow or unavailable `admin-status` call",
-            "erase capacity families",
-            "remove or invalidate task rows",
-            "Source-specific timestamps and health diagnostics",
+            "独立采样通道",
+            "缓慢或不可用的 `admin-status` 请求",
+            "擦除有效容量指标",
+            "移除或失效任务行",
+            "各来源的时间戳与健康诊断",
         ):
             self.assertIn(phrase, contract)
         for phrase in (

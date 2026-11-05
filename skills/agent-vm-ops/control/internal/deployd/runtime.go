@@ -206,7 +206,11 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 				if !inventoryObservationConsistent(inventory) {
 					inventoryComplete = false
 				}
-				runtime.rememberMetrics(slot, "inventory", observe.MetricsForSnapshot("inventory", inventory))
+				families := observe.MetricsForSnapshot("inventory", inventory)
+				// Inventory is paginated; global state totals belong exclusively
+				// to the completed capacity snapshot, including verified zeros.
+				delete(families, "agent_vm_task_states")
+				runtime.rememberMetrics(slot, "inventory", families)
 				sourceTimes["inventory_observation"] = minTime(sourceTimes["inventory_observation"], inventoryAt)
 			} else {
 				inventoryObservationUp = false

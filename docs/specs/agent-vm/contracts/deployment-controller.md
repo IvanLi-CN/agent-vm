@@ -206,6 +206,8 @@ CLI 永远不能直接编辑 `active`。响应丢失时，CLI 返回 deployd tra
 
 首次部署不能要求运维者先手工迁移状态。发布器安装并验证 Deployd 后，自动调用 `POST /v1/migrate`；Deployd 在同一个 durable transaction 中启动 rqlite、让旧服务进入写围栏、等待请求和 native worker 收敛、停止旧服务、取得旧状态目录的 `authority.lock` 并保持到迁移完成、确认没有 SQLite writer、创建一致 snapshot、导入并验证 rqlite，最后写入 `.rqlite-cutover-complete`。旧服务的 Bun 入口必须在创建 SQLite store 前取得同一把排他的 `authority.lock`；如果旧服务在停止后重新启动并竞争这把锁，Deployd 只会闭锁，不会把竞态当成迁移成功。
 
+已有完成标记且其绑定的 Deployd 事务已经 finalized 时，完整产品升级只验证该既有迁移结果，不再调用 `migrate`，也不要求旧 SQLite 服务或旧数据库文件存在。缺失、冲突或未 finalized 的证据不能作为跳过迁移的依据，仍按原有的恢复围栏和有界重试规则处理。
+
 迁移事务的阶段依次为 `migration_prepare`、`migration_drain`、`migration_quiescence`、`migration_stop`、`migration_source_check`、`migration_import` 和 `migration_finalize`。迁移成功后发布器才创建初始 `active -> slots/blue` 链接并启动蓝、绿槽位；普通 `stage`、`activate` 和 `rollback` 不再执行这条路径，也不替换业务数据库。
 
 任何步骤的结果不明确都必须保持 legacy 服务停止或围栏，并把事务置为 `needs_recovery`。发布器的固定 activation fence 在迁移恢复完成前持续存在；Deployd 重启也不能根据旧状态猜测迁移成功，必须重新验证停止状态、writer 状态和目标 rqlite 内容。自动 `recover --action retry-migration` 的次数由迁移事务中的持久计数限制为一次，失败后仍保持 `needs_recovery`，不能通过重新启动发布器绕过限制。
