@@ -585,6 +585,25 @@ class WrapperTests(unittest.TestCase):
                 WRAPPER._run_initial_state_migration(self.loaded)
         self.assertEqual(failure.exception.code, "activation_failed")
 
+    def test_finalized_cutover_upgrade_does_not_start_another_migration(self):
+        marker_path = WRAPPER._migration_marker_path(self.loaded)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "format": 2, "transaction_id": "migration-existing",
+            "business_authority": "rqlite", "source_sha256": "a" * 64,
+            "source_size": 1, "state_epoch": "epoch-existing",
+            "target_sha256": "b" * 64,
+            "retention_until": "2026-11-11T00:00:00Z",
+        }), encoding="utf-8")
+        marker_path.chmod(0o600)
+        response = json.dumps({"value": {"transaction": {
+            "transaction_id": "migration-existing", "target_slot": "state",
+            "phase": "finalize", "state": "finalized", "recovery_required": False,
+        }}}).encode()
+        with mock.patch.object(WRAPPER, "_run_deployd_cli", return_value=subprocess.CompletedProcess([], 0, response, b"")) as run:
+            WRAPPER._run_initial_state_migration(self.loaded)
+        run.assert_called_once_with("transaction", "--transaction", "migration-existing", timeout_seconds=30)
+
     def test_migration_recovery_failure_keeps_the_migration_fence_code(self):
         def run(command, *args, **kwargs):
             if command and command[0] == str(WRAPPER.GO_DEPLOY_PATH):

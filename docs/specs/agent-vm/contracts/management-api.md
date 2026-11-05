@@ -8,6 +8,8 @@
 
 首个版本使用外部 OIDC provider 作为 relying party 身份服务。`GET /api/v1/auth/oidc/start` 创建一次性的 Authorization Code + PKCE 事务，只允许 `code_challenge_method=S256`，并设置短时 `Secure`、`HttpOnly`、`SameSite=Lax` login-binding cookie；`plain` 或其他 PKCE 方法必须拒绝。事务在共享存储中绑定随机 `state`、`nonce`、受保护的 code verifier、浏览器绑定 cookie 的摘要、准确的 redirect URI、client ID、创建/过期时间和消费状态。`GET /api/v1/auth/oidc/callback` 只接受成功响应（`code` + 匹配的 `state`）或 provider 拒绝/错误（`error` + 匹配的 `state` 且没有 `code`）；两种形式都只消费一次事务并清除绑定 cookie。provider 错误不得创建会话或回显 `error_description`/`error_uri`，而是跳转到通用的本地化登录失败状态；格式错误、缺失 state、值不匹配、跨浏览器转移或重放都必须失败关闭。服务必须校验 TLS、授权码交换、redirect URI、discovery issuer、ID Token 签名/JWKS、准确的 `iss`、`aud`/`azp`、`exp`、`iat` 策略和 `nonce`；provider 不可用时必须失败关闭。服务和 Caddy 的访问日志不得记录 callback query string 和 `Referer`，应用日志不得保留 OIDC code、state、nonce、verifier、错误描述或错误 URI。
 
+OIDC callback 兼容签发方返回的单值 `iss` 与 `scope`。存在 `iss` 时必须与配置的 issuer 完全一致；discovery 声明 `authorization_response_iss_parameter_supported=true` 时不得接受缺失 `iss` 的成功响应。重复参数、错误签发方、超长或格式错误的 scope 必须拒绝。响应中的 scope 只作协议元数据，不得授予管理员权限；管理员身份和 capability 仍由已验证 ID Token 与配置的主体二元组决定。其他未知回调参数继续拒绝。
+
 服务以大小写敏感的 `(issuer, subject)` 二元组表示唯一管理员。issuer 必须是配置的 discovery issuer，subject 是 OIDC `sub`；邮箱、显示名、group 和转发头都不是身份键。只有该二元组匹配配置的管理员主体时，登录才可接受，会话才获得配置的管理员 capability。系统不存在普通用户角色、用户到资源关系或历史主体映射；旧 task 和 native 记录通过 task identity、generation、lease、journal 和 native identity 进行 reconciliation。
 
 服务创建不透明浏览器会话，属性为 `Secure`、`HttpOnly`、`SameSite=Strict`、`Path=/` 和有界 TTL。会话元数据在共享状态中保存主体二元组、角色、capability、创建/过期/撤销状态以及会话标识摘要。`GET /api/v1/session` 返回主体、角色、capability 和绑定会话的 CSRF token。每个 `POST` 和 `PUT` 都必须携带 cookie、`X-CSRF-Token`，并携带与配置 HTTPS origin 完全相同的 `Origin`；禁用 CORS。浏览器会话不是 Agent Token，绝不能用于 `/agent/v1/control`。

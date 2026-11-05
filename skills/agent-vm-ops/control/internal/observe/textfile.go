@@ -122,6 +122,33 @@ func snapshotMetrics(source string, value any) map[string]string {
 		"agent_vm_" + source + "_scrape_timestamp_seconds": fmt.Sprintf("agent_vm_%s_scrape_timestamp_seconds %d", source, observed),
 	}
 	if source == "capacity" {
+		if states, ok := objectMap(object["task_states"]); ok && up == 1 && object["observation_consistent"] == true {
+			for _, state := range []string{"absent", "cached", "preparing", "active", "closing", "deleting", "failed"} {
+				count := any(int64(0))
+				if value, exists := states[state]; exists {
+					count = value
+				}
+				addLabeledMetric(result, "agent_vm_task_states", "state="+strconv.Quote(state), count, 1)
+			}
+		}
+		if filesystems, ok := object["filesystems"].([]any); ok {
+			for _, raw := range filesystems {
+				row, ok := objectMap(raw)
+				path, _ := row["mountpoint"].(string)
+				if !ok || path == "" {
+					continue
+				}
+				labels := "mountpoint=" + strconv.Quote(path)
+				up := boolNumber(row["up"], false)
+				result["agent_vm_filesystem_up"] += fmt.Sprintf("agent_vm_filesystem_up{%s} %d\n", labels, up)
+				if up != 1 {
+					continue
+				}
+				for _, field := range []string{"size_bytes", "used_bytes", "available_bytes"} {
+					addLabeledMetric(result, "agent_vm_filesystem_"+field, labels, row[field], 1)
+				}
+			}
+		}
 		addBoolMetricIfPresent(result, "agent_vm_admission_ready", object, "admission_ready")
 		addBoolMetricIfPresent(result, "agent_vm_admission_draining", object, "draining")
 		addBoolMetricIfPresent(result, "agent_vm_observation_consistent", object, "observation_consistent")
@@ -158,6 +185,19 @@ func snapshotMetrics(source string, value any) map[string]string {
 		}
 		if failures, ok := objectMap(object["image_unpack_failures"]); ok {
 			addSummaryMetrics(result, "agent_vm_image_unpack_failures_total", failures, []string{"phase", "reason"})
+			var total float64
+			valid := true
+			for _, raw := range failures {
+				value, numeric := numeric(raw)
+				if !numeric || value < 0 {
+					valid = false
+					break
+				}
+				total += value
+			}
+			if valid {
+				addMetric(result, "agent_vm_image_unpack_failures_count", total, 1)
+			}
 		}
 		if warnings, ok := objectMap(object["warning_counts"]); ok {
 			addSummaryMetrics(result, "agent_vm_warnings_total", warnings, []string{"code"})

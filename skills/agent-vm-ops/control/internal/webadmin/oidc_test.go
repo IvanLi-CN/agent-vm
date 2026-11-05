@@ -71,6 +71,7 @@ func TestOIDCLoginUsesDurableTransactionAndSession(t *testing.T) {
 		case "/.well-known/openid-configuration":
 			_ = json.NewEncoder(writer).Encode(map[string]any{
 				"issuer": provider.URL, "authorization_endpoint": provider.URL + "/authorize", "token_endpoint": provider.URL + "/token", "jwks_uri": provider.URL + "/jwks", "code_challenge_methods_supported": []string{"S256"},
+				"authorization_response_iss_parameter_supported": true,
 			})
 		case "/jwks":
 			n := base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.N.Bytes())
@@ -118,7 +119,20 @@ func TestOIDCLoginUsesDurableTransactionAndSession(t *testing.T) {
 		t.Fatalf("OIDC binding cookie = %#v", cookies)
 	}
 
-	callback := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback?code=one-time-code&state="+url.QueryEscape(stateValue), nil)
+	for _, extra := range []string{"&iss=https%3A%2F%2Fwrong.example", "&iss=", "&iss=" + url.QueryEscape(provider.URL) + "&iss=" + url.QueryEscape(provider.URL), "&scope=openid&scope=email", "&scope=openid%0Aemail"} {
+		invalid := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback?code=one-time-code&state="+url.QueryEscape(stateValue)+extra, nil)
+		invalid.AddCookie(cookies[0])
+		recorder := httptest.NewRecorder()
+		server.Handler().ServeHTTP(recorder, invalid)
+		if recorder.Code != http.StatusBadRequest {
+			t.Fatalf("invalid callback accepted: %q status %d", extra, recorder.Code)
+		}
+		transaction, err := store.GetOIDCTransaction(t.Context(), digestString(stateValue))
+		if err != nil || transaction == nil || transaction.ConsumedAt != nil {
+			t.Fatal("invalid issuer/scope consumed login transaction")
+		}
+	}
+	callback := httptest.NewRequest(http.MethodGet, "/api/v1/auth/oidc/callback?code=one-time-code&state="+url.QueryEscape(stateValue)+"&iss="+url.QueryEscape(provider.URL)+"&scope=openid+profile+email", nil)
 	callback.AddCookie(cookies[0])
 	callbackRecorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(callbackRecorder, callback)
