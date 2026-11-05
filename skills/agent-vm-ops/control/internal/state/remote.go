@@ -1914,6 +1914,17 @@ func sortedSnapshotRowKeys(table remoteTableSnapshot) []string {
 	}
 	sort.Slice(keys, func(left, right int) bool {
 		leftRow, rightRow := table.Rows[keys[left]], table.Rows[keys[right]]
+		// Release the partial unique default-image index before selecting its replacement.
+		// Fingerprint order must not determine whether an otherwise atomic selection succeeds.
+		if table.Name == "managed_images" {
+			if column := indexOf(table.Columns, "is_default"); column >= 0 {
+				leftDefault := fmt.Sprint(leftRow.Values[column]) == "1"
+				rightDefault := fmt.Sprint(rightRow.Values[column]) == "1"
+				if leftDefault != rightDefault {
+					return !leftDefault
+				}
+			}
+		}
 		if table.Name == "operations" && leftRow.RowID != rightRow.RowID {
 			return leftRow.RowID < rightRow.RowID
 		}

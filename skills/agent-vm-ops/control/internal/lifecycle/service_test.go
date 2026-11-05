@@ -388,23 +388,32 @@ func TestReleaseDrainExitClaimsLegacyOwnerlessFence(t *testing.T) {
 	}
 }
 
-func TestDeploydDrainExitCanKeepTrafficFenced(t *testing.T) {
-	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	ctx := context.Background()
-	if err := store.SetMeta(ctx, "draining", "1"); err != nil {
-		t.Fatal(err)
-	}
-	service := New(store, config.Defaults(), Options{})
-	service.SetTrafficAccepting(true)
-	if _, err := service.drain(ctx, false, protocol.Request{"session_id": "release-agent-vm-deployd", "preserve_traffic": true}); err != nil {
-		t.Fatal(err)
-	}
-	if service.TrafficAccepting() {
-		t.Fatal("drain exit reopened traffic while preservation was requested")
+func TestDeploydDrainExitPreservesTrafficRole(t *testing.T) {
+	for _, accepting := range []bool{false, true} {
+		t.Run(fmt.Sprint(accepting), func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			service := New(store, config.Defaults(), Options{})
+			request := protocol.Request{"session_id": "release-agent-vm-deployd", "preserve_traffic": true}
+			if _, err := service.drain(ctx, true, request); err != nil {
+				t.Fatal(err)
+			}
+			// Deployd separately enables only the selected slot before exiting the shared drain.
+			service.SetTrafficAccepting(accepting)
+			if _, err := service.drain(ctx, false, request); err != nil {
+				t.Fatal(err)
+			}
+			if service.TrafficAccepting() != accepting {
+				t.Fatalf("traffic role changed from %t to %t", accepting, service.TrafficAccepting())
+			}
+			if value, _, err := store.Meta(ctx, "draining"); err != nil || value != "0" {
+				t.Fatalf("draining = %q: %v", value, err)
+			}
+		})
 	}
 }
 

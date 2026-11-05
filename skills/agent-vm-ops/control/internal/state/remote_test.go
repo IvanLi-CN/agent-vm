@@ -771,6 +771,17 @@ func TestRemoteManagementBootstrapAndSelectionPreserveReadEpoch(t *testing.T) {
 	if selectedVersion == selectionVersion {
 		t.Fatalf("image selection version did not advance from %q", selectionVersion)
 	}
+	// A replacement whose fingerprint sorts first must release the existing unique default.
+	replacement := strings.Repeat("0", 64)
+	if err := store.InsertManagedImage(ctx, ManagedImage{Fingerprint: replacement, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed", DefaultCompatibility: "none"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SelectManagedImage(ctx, replacement, selectedVersion); err != nil {
+		t.Fatalf("replace existing default through rqlite: %v", err)
+	}
+	if actual, found, err := store.CurrentDefaultImage(ctx); err != nil || !found || actual != replacement {
+		t.Fatalf("replacement default = %q: %v", actual, err)
+	}
 	afterSelection, err := store.StateEpoch(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -1935,5 +1946,68 @@ func TestMigrationRejectsUnknownOperationStateBeforeRemoteWrite(t *testing.T) {
 func TestExportedMigrationEntryFailsClosed(t *testing.T) {
 	if _, err := MigrateSQLiteToRQLite(context.Background(), "source.sqlite3", "http://127.0.0.1:4001", SQLiteMigrationEvidence{}); err == nil || !strings.Contains(err.Error(), "evidence is incomplete") {
 		t.Fatalf("exported migration entry error = %v", err)
+	}
+}
+
+func TestRemoteDefaultImageReplacementPreservesUniqueSelection(t *testing.T) {
+	for _, oldFingerprint := range []string{"a", "z"} {
+		for _, inserted := range []bool{false, true} {
+			t.Run(fmt.Sprintf("old-%s/insert-%t", oldFingerprint, inserted), func(t *testing.T) {
+				db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "remote.sqlite3"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				for _, query := range []string{
+					"CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+					"INSERT INTO meta VALUES ('state_epoch','initial'),('management_auth_epoch','initial')",
+					"CREATE TABLE managed_images(fingerprint TEXT PRIMARY KEY, is_default INTEGER NOT NULL, revision INTEGER NOT NULL)",
+					"CREATE UNIQUE INDEX managed_images_one_default ON managed_images(is_default) WHERE is_default = 1",
+				} {
+					if _, err := db.Exec(query); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if _, err := db.Exec("INSERT INTO managed_images VALUES (?,1,1)", oldFingerprint); err != nil {
+					t.Fatal(err)
+				}
+				before := remoteTableSnapshot{Name: "managed_images", Columns: []string{"fingerprint", "is_default", "revision"}, PrimaryKey: []int{0}, Rows: map[string]remoteRow{oldFingerprint: {Values: []any{oldFingerprint, int64(1), int64(1)}}}}
+				if !inserted {
+					if _, err := db.Exec("INSERT INTO managed_images VALUES ('m',0,1)"); err != nil {
+						t.Fatal(err)
+					}
+					before.Rows["m"] = remoteRow{Values: []any{"m", int64(0), int64(1)}}
+				}
+				after := remoteTableSnapshot{Name: before.Name, Columns: before.Columns, PrimaryKey: before.PrimaryKey, Rows: map[string]remoteRow{oldFingerprint: {Values: []any{oldFingerprint, int64(0), int64(2)}}, "m": {Values: []any{"m", int64(1), int64(2)}}}}
+				var statements []remoteStatement
+				if err := appendTableDiff(&statements, before, true, after, "initial", "initial"); err != nil {
+					t.Fatal(err)
+				}
+				tx, err := db.BeginTx(context.Background(), nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback()
+				for _, statement := range statements {
+					if _, err := tx.Exec(statement.query, statement.args...); err != nil {
+						t.Fatalf("apply default replacement: %v", err)
+					}
+				}
+				if err := tx.Commit(); err != nil {
+					t.Fatal(err)
+				}
+				var selected string
+				if err := db.QueryRow("SELECT fingerprint FROM managed_images WHERE is_default=1").Scan(&selected); err != nil || selected != "m" {
+					t.Fatalf("selected %q: %v", selected, err)
+				}
+				var count, revision int
+				if err := db.QueryRow("SELECT COUNT(*) FROM managed_images").Scan(&count); err != nil || count != 2 {
+					t.Fatalf("rows %d: %v", count, err)
+				}
+				if err := db.QueryRow("SELECT revision FROM managed_images WHERE fingerprint=?", oldFingerprint).Scan(&revision); err != nil || revision != 2 {
+					t.Fatalf("old image revision %d: %v", revision, err)
+				}
+			})
+		}
 	}
 }

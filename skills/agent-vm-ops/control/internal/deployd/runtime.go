@@ -1503,8 +1503,14 @@ func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, pat
 	}
 	var result map[string]any
 	if len(bytes.TrimSpace(payload)) != 0 {
-		if err := json.Unmarshal(payload, &result); err != nil {
+		decoder := json.NewDecoder(bytes.NewReader(payload))
+		decoder.UseNumber()
+		if err := decoder.Decode(&result); err != nil {
 			return nil, response.StatusCode, err
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); err != io.EOF {
+			return nil, response.StatusCode, errors.New("slot response contains trailing JSON")
 		}
 	}
 	if result == nil {
