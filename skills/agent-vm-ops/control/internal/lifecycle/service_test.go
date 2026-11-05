@@ -436,22 +436,38 @@ func TestDrainOwnershipCannotBeReplacedByAnotherCaller(t *testing.T) {
 	}
 }
 
-func TestReleaseMayTakeOverBrowserDrainBeforeActivation(t *testing.T) {
-	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	ctx := context.Background()
-	service := New(store, config.Defaults(), Options{})
-	if _, err := service.drain(ctx, true, protocol.Request{"operation_id": "browser-drain"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := service.drain(ctx, true, protocol.Request{"session_id": "release-handoff"}); err != nil {
-		t.Fatal(err)
-	}
-	if owner, found, err := store.Meta(ctx, "drain_owner"); err != nil || !found || owner != "release-handoff" {
-		t.Fatalf("drain owner = %q found=%v err=%v", owner, found, err)
+func TestReleaseMayTakeOverMaintenanceDrainBeforeActivation(t *testing.T) {
+	for name, request := range map[string]protocol.Request{
+		"browser": {"operation_id": "browser-drain"},
+		"cli":     {"session_id": "maintenance-session"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			service := New(store, config.Defaults(), Options{})
+			if _, err := service.drain(ctx, true, request); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.drain(ctx, true, protocol.Request{"session_id": "release-handoff"}); err != nil {
+				t.Fatal(err)
+			}
+			if owner, found, err := store.Meta(ctx, "drain_owner"); err != nil || !found || owner != "release-handoff" {
+				t.Fatalf("drain owner = %q found=%v err=%v", owner, found, err)
+			}
+			if draining, _, err := store.Meta(ctx, "draining"); err != nil || draining != "1" || service.TrafficAccepting() {
+				t.Fatalf("handoff reopened admission: draining=%q err=%v", draining, err)
+			}
+			if _, err := service.drain(ctx, false, request); protocol.AsError(err).Code != "permission_denied" {
+				t.Fatalf("previous owner exit error = %#v", err)
+			}
+			if result, err := service.drain(ctx, false, protocol.Request{"session_id": "release-handoff"}); err != nil || result["draining"] != false || !service.TrafficAccepting() {
+				t.Fatalf("release exit result=%#v err=%v", result, err)
+			}
+		})
 	}
 }
 

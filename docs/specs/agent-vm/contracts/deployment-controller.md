@@ -106,6 +106,8 @@ Grafana 面板通过 Prometheus 查询 Deployd 输出，例如：
 
 控制器持有排他的宿主级协调锁。槽位 controller role 是进程持有型的；deployd 或持有 role 的槽位失去已认证角色通道后，该 role 立即失效。deployd 重启会使所有尚未验证的交接失效，并要求重新观测后才能授予新的 role。不能根据过期的 SQLite 行重建 role。
 
+维护 CLI 和浏览器均可进入 admission drain。发布事务以 `release-` 开头的 `session_id` 显式接管尚未归属于发布事务的排空状态，包括维护 CLI 会话和浏览器操作；接管只改变排空归属，必须保持 admission 与 traffic 关闭。另一项发布事务、维护 CLI 或浏览器都不能替换已有发布事务的归属。只有当前发布事务能退出 drain，旧维护会话不能在交接后重新开放准入；退出前仍须完成发布健康与收敛检查。
+
 ## 事务状态机
 
 持久化事务阶段为：

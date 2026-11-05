@@ -3127,10 +3127,9 @@ func (s *Service) drain(ctx context.Context, value bool, request protocol.Reques
 				if err := s.setMeta(ctx, "drain_owner", incoming); err != nil {
 					return nil, s.sqliteError(err)
 				}
-			case strings.HasPrefix(incoming, "release-") && strings.HasPrefix(owner, "operation:"):
-				// A release may explicitly take over a browser-entered drain;
-				// a browser or a different release may never replace an active
-				// release owner.
+			case strings.HasPrefix(incoming, "release-") && !strings.HasPrefix(owner, "release-"):
+				// A release may take over a browser or maintenance CLI drain.
+				// An active release owner cannot be replaced by another caller.
 				if err := s.setMeta(ctx, "drain_owner", incoming); err != nil {
 					return nil, s.sqliteError(err)
 				}
