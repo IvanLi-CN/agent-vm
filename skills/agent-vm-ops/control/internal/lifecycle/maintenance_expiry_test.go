@@ -59,6 +59,7 @@ func TestMaintenanceExpiryPreservesLegacyEvidence(t *testing.T) {
 		{"verified-no-effect", "success", "starting", false, false, true},
 		{"pending", "pending", "starting", false, false, false},
 		{"worker-attempted", "success", "starting", true, false, false},
+		{"contradictory-worker", "success", "starting", false, false, false},
 		{"worker-unverified", "success", "starting", nil, false, false},
 		{"result-unverified", "success", "starting", false, nil, false},
 	} {
@@ -83,6 +84,9 @@ func TestMaintenanceExpiryPreservesLegacyEvidence(t *testing.T) {
 			req := protocol.Request{"protocol": protocol.Version, "action": "timer-expire", "task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "operation_id": id}
 			digest, _ := protocol.Digest(req)
 			original := map[string]any{"ok": true, "outcome": scenario.outcome, "_request_digest": digest, "_request": map[string]any(req), "result": map[string]any{"expired": scenario.expired}, "worker": map[string]any{"state": scenario.workerState, "start_attempted": scenario.started}}
+			if scenario.name == "contradictory-worker" {
+				original["worker"].(map[string]any)["pid"] = int64(123)
+			}
 			if err := store.RecordOperation(ctx, id, "timer-expire", &task.SessionID, &task.Generation, original); err != nil {
 				t.Fatal(err)
 			}

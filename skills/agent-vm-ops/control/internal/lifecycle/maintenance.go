@@ -413,7 +413,7 @@ func (s *Service) maintenanceExpire(ctx context.Context, task *state.Task) error
 		}
 		result, _ := previous.Response["result"].(map[string]any)
 		worker, _ := previous.Response["worker"].(map[string]any)
-		if previous.Response["ok"] == true && result["expired"] == false && worker["start_attempted"] == false && worker["state"] == "starting" {
+		if previous.Response["ok"] == true && result["expired"] == false && worker["start_attempted"] == false && worker["state"] == "starting" && worker["pid"] == nil && worker["process_group"] == nil && worker["start_time"] == nil {
 			deadline := "absent"
 			if task.LeaseExpiresAt != nil {
 				parsed, _ := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
