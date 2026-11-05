@@ -514,7 +514,7 @@ func (s *Service) lockActionWithContext(ctx context.Context, action string, requ
 		unlocks = append(unlocks, unlock)
 		return nil
 	}
-	if releaseSensitiveAction(action, request) || action == "drain-enter" || action == "drain-exit" || action == "admin-metrics" {
+	if releaseSensitiveAction(action, request) || action == "drain-enter" || action == "drain-exit" {
 		// Drain ownership is a process-wide release boundary. It must not be
 		// serialized only by the caller's session lock: a release
 		// transaction and a native management action must observe one durable
@@ -636,8 +636,11 @@ func lockWithContext(ctx context.Context, lock *sync.Mutex) error {
 }
 
 func (s *Service) trySessionLock(session string) (func(), bool) {
+	return s.tryNamedActionLock("session:" + session)
+}
+
+func (s *Service) tryNamedActionLock(key string) (func(), bool) {
 	s.lockMu.Lock()
-	key := "session:" + session
 	lock, exists := s.actionLocks[key]
 	if !exists {
 		lock = &sync.Mutex{}
@@ -3398,6 +3401,37 @@ func (s *Service) adminSessionList(ctx context.Context) (map[string]any, error) 
 	return map[string]any{"sessions": items}, nil
 }
 
+// Observations must not wait behind native startup: Deployd needs them to renew
+// the controller running that startup. Sealing alone needs the drain boundary.
+func (s *Service) trySealReleaseDrain(ctx context.Context, observedEpoch string) error {
+	unlock, acquired := s.tryNamedActionLock("drain")
+	if !acquired {
+		return nil
+	}
+	defer unlock()
+	if !s.mutationAllowed() || s.activeOperationCount() != 0 {
+		return nil
+	}
+	owned, err := s.releaseDrainOwned(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if !owned {
+		return nil
+	}
+	epoch, err := s.Store.StateEpoch(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if epoch != observedEpoch {
+		return nil
+	}
+	if err := s.setMeta(ctx, "drain_sealed", "1"); err != nil {
+		return s.sqliteError(err)
+	}
+	return nil
+}
+
 func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 	for attempt := 1; attempt <= 3; attempt++ {
 		start := nowString(s.Clock())
@@ -3592,9 +3626,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				return nil, s.sqliteError(drainErr)
 			}
 			if initialConsistent && len(pendingOperations) == 0 && states[stateClosing] == 0 && states[stateDeleting] == 0 && states[stateFailed] == 0 {
-				if releaseDrain && s.mutationAllowed() {
-					if err := s.setMeta(ctx, "drain_sealed", "1"); err != nil {
-						return nil, s.sqliteError(err)
+				if releaseDrain {
+					if err := s.trySealReleaseDrain(ctx, epoch); err != nil {
+						return nil, err
 					}
 				}
 			}
@@ -3843,7 +3877,7 @@ func (s *Service) reconcile(ctx context.Context, apply bool, mode ...string) (ma
 	actions := make([]any, 0)
 	var firstErr error
 	for _, task := range tasks {
-		if (task.State == stateActive || task.State == statePreparing) && !effective(&task, s.Clock()) {
+		if maintenanceExpiryCandidate(&task, s.Clock()) {
 			action := map[string]any{"task_id": task.TaskID, "generation": task.Generation, "action": "close-incomplete-or-expired"}
 			actions = append(actions, action)
 			if apply {

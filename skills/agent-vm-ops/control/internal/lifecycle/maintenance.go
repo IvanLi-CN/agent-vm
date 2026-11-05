@@ -277,7 +277,7 @@ func (s *Service) recoverLegacyMaintenancePage(ctx context.Context, action strin
 }
 
 func (s *Service) reconcileMaintenanceTask(ctx context.Context, task *state.Task) error {
-	if (task.State == stateActive || task.State == statePreparing) && !effective(task, s.Clock()) {
+	if maintenanceExpiryCandidate(task, s.Clock()) {
 		if err := s.maintenanceExpire(ctx, task); err != nil {
 			return err
 		}
@@ -376,9 +376,54 @@ func (s *Service) maintenanceCleanup(ctx context.Context, task *state.Task, acti
 	return result, nil
 }
 
+func maintenanceExpiryCandidate(task *state.Task, now time.Time) bool {
+	if task.State != stateActive && task.State != statePreparing {
+		return false
+	}
+	if task.LeaseExpiresAt == nil {
+		return true
+	}
+	deadline, err := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
+	// Invalid evidence must reach the fail-closed validation, not be skipped.
+	return err != nil || !deadline.After(now)
+}
+
 func (s *Service) maintenanceExpire(ctx context.Context, task *state.Task) error {
+	// Preparing is not an effective lease, but its deadline still protects startup.
+	if task.LeaseExpiresAt != nil {
+		deadline, err := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
+		if err != nil {
+			return protocol.NewError("state_unverified", "maintenance lease deadline is invalid", map[string]any{"task_id": task.TaskID})
+		}
+		if deadline.After(s.Clock()) {
+			return nil
+		}
+	}
 	operationID := timerExpireOperationID(task.TaskID, task.Generation)
 	request := protocol.Request{"protocol": protocol.Version, "action": "timer-expire", "task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "operation_id": operationID}
+	previous, err := s.Store.GetOperation(ctx, operationID)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if previous != nil {
+		// Preserve the old journal. Only an explicitly verified no-effect result
+		// permits a new intent bound to the deadline that is now due.
+		if _, err := s.replayRecord(request, previous); err != nil {
+			return err
+		}
+		result, _ := previous.Response["result"].(map[string]any)
+		worker, _ := previous.Response["worker"].(map[string]any)
+		if previous.Response["ok"] == true && result["expired"] == false && worker["start_attempted"] == false && worker["state"] == "starting" {
+			deadline := "absent"
+			if task.LeaseExpiresAt != nil {
+				parsed, _ := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
+				deadline = nowString(parsed)
+			}
+			digest := sha256.Sum256([]byte(task.TaskID + "\x00" + strconv.FormatInt(task.Generation, 10) + "\x00" + deadline))
+			operationID = "timer-expire-deadline-" + hex.EncodeToString(digest[:12])
+			request["operation_id"] = operationID
+		}
+	}
 	digest, err := protocol.Digest(request)
 	if err != nil {
 		return protocol.NewError("invalid_request", "maintenance expiry request cannot be canonicalized", nil)
