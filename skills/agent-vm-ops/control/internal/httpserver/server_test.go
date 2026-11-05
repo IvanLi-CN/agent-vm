@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -180,5 +181,52 @@ func TestWriteErrorMapsUnreachableWatermarksToServiceUnavailable(t *testing.T) {
 	writeError(context, protocol.NewError("watermarks_unreachable", "configure reachable CT storage watermarks", nil), nil)
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("watermarks error status = %d", recorder.Code)
+	}
+}
+
+func TestControllerHealthNegotiatesRenewalWithoutCancelingAuthority(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := lifecycle.New(store, config.Defaults(), lifecycle.Options{})
+	gate := controllerrole.New("blue", time.Now)
+	server := NewWithRole(service, nil, nil, gate)
+	lease := controllerrole.Lease{Slot: "blue", Term: 1, LeaseID: "lease", Nonce: "nonce", Generation: 1, Expiry: time.Now().UTC().Add(time.Minute)}
+	grant := func() {
+		body, err := json.Marshal(map[string]any{"action": "grant", "lease": lease})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request := httptest.NewRequest(http.MethodPost, "/internal/v1/controller-role", bytes.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		response := httptest.NewRecorder()
+		server.Handler().ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("grant status=%d body=%s", response.Code, response.Body.String())
+		}
+	}
+	grant()
+	changed := gate.Changes()
+	lease.Expiry = lease.Expiry.Add(time.Minute)
+	grant()
+	select {
+	case <-changed:
+		t.Fatal("HTTP renewal canceled live authority")
+	default:
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/internal/v1/health", nil))
+	var health struct {
+		Renewal bool                 `json:"controller_lease_renewal"`
+		Owned   bool                 `json:"controller_owned"`
+		Lease   controllerrole.Lease `json:"lease"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &health); err != nil {
+		t.Fatal(err)
+	}
+	if !health.Renewal || !health.Owned || health.Lease != lease {
+		t.Fatalf("health negotiation=%+v", health)
 	}
 }

@@ -48,24 +48,25 @@ func (err *UncertainError) Unwrap() error { return err.Cause }
 func (err *UncertainError) Is(target error) bool { return target == ErrUncertain }
 
 type SlotObservation struct {
-	Slot              string                `json:"slot"`
-	ProcessUp         bool                  `json:"process_up"`
-	ProcessReady      bool                  `json:"process_ready"`
-	Ready             bool                  `json:"ready"`
-	ControllerLease   *controllerrole.Lease `json:"controller_lease,omitempty"`
-	ControllerOwned   bool                  `json:"controller_owned"`
-	TrafficAccepting  bool                  `json:"traffic_accepting"`
-	Draining          bool                  `json:"draining"`
-	CountersKnown     bool                  `json:"counters_known"`
-	InFlightRequests  int64                 `json:"in_flight_requests"`
-	NativeWorkers     int64                 `json:"native_workers"`
-	PendingOperations int64                 `json:"pending_operations"`
-	ObservedUnix      int64                 `json:"observed_at_seconds"`
-	StateEpoch        string                `json:"state_epoch,omitempty"`
-	ReleaseID         string                `json:"release_id,omitempty"`
-	SourceRevision    string                `json:"source_revision,omitempty"`
-	StateCapabilities []string              `json:"state_capabilities,omitempty"`
-	MetricFamilies    map[string]string     `json:"metric_families,omitempty"`
+	Slot                  string                `json:"slot"`
+	ProcessUp             bool                  `json:"process_up"`
+	ProcessReady          bool                  `json:"process_ready"`
+	Ready                 bool                  `json:"ready"`
+	LeaseRenewalSupported bool                  `json:"controller_lease_renewal"`
+	ControllerLease       *controllerrole.Lease `json:"controller_lease,omitempty"`
+	ControllerOwned       bool                  `json:"controller_owned"`
+	TrafficAccepting      bool                  `json:"traffic_accepting"`
+	Draining              bool                  `json:"draining"`
+	CountersKnown         bool                  `json:"counters_known"`
+	InFlightRequests      int64                 `json:"in_flight_requests"`
+	NativeWorkers         int64                 `json:"native_workers"`
+	PendingOperations     int64                 `json:"pending_operations"`
+	ObservedUnix          int64                 `json:"observed_at_seconds"`
+	StateEpoch            string                `json:"state_epoch,omitempty"`
+	ReleaseID             string                `json:"release_id,omitempty"`
+	SourceRevision        string                `json:"source_revision,omitempty"`
+	StateCapabilities     []string              `json:"state_capabilities,omitempty"`
+	MetricFamilies        map[string]string     `json:"metric_families,omitempty"`
 }
 
 type RuntimeSnapshot struct {
@@ -1061,7 +1062,7 @@ func rollbackVerificationError(observation RuntimeSnapshot, transaction store.Tr
 // renewed. Persisted snapshots and a previous process incarnation grant nothing.
 func (manager *Manager) renewOrAllocateLease(ctx context.Context, target SlotObservation, generation int64) (controllerrole.Lease, error) {
 	now := manager.Clock()
-	if current := target.ControllerLease; target.ControllerOwned && current != nil &&
+	if current := target.ControllerLease; target.LeaseRenewalSupported && target.ControllerOwned && current != nil &&
 		current.Validate(now, target.Slot) == nil && current.OwnerPID == os.Getpid() &&
 		current.OwnerStartTime != "" && current.OwnerStartTime == controllerrole.ProcessStartToken(os.Getpid()) {
 		renewed := *current

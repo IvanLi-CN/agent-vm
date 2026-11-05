@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -35,6 +36,8 @@ type fakeRuntime struct {
 	sequence              []string
 	traffic               map[string]bool
 	releaseIDs            map[string]string
+	legacyGrant           bool
+	grantedLeases         []controllerrole.Lease
 }
 
 func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
@@ -82,13 +85,18 @@ func (runtime *fakeRuntime) VerifySlotIdentity(context.Context, string, string, 
 	runtime.sequence = append(runtime.sequence, "verify-identity")
 	return runtime.identityError
 }
-func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, _ controllerrole.Lease) error {
+func (runtime *fakeRuntime) GrantController(_ context.Context, slot string, lease controllerrole.Lease) error {
+	if runtime.legacyGrant && len(runtime.grantedLeases) > 0 && lease.Term <= runtime.grantedLeases[len(runtime.grantedLeases)-1].Term {
+		return controllerrole.ErrLeaseMismatch
+	}
+	runtime.grantedLeases = append(runtime.grantedLeases, lease)
 	runtime.sequence = append(runtime.sequence, "grant")
 	if runtime.mutateContractOnGrant {
 		runtime.capabilities = []string{"changed@1"}
 	}
 	if observation, ok := runtime.observations[slot]; ok {
 		observation.ControllerOwned = true
+		observation.ControllerLease = &lease
 		if runtime.readyAfterGrant {
 			observation.Ready = true
 		}
@@ -1002,7 +1010,7 @@ func TestOnlyCurrentProcessLiveLeaseCanBeRenewed(t *testing.T) {
 		t.Skip("process-incarnation evidence is unavailable on this platform")
 	}
 	now = now.Add(time.Second)
-	target := SlotObservation{Slot: "blue", ControllerOwned: true, ControllerLease: &lease}
+	target := SlotObservation{Slot: "blue", LeaseRenewalSupported: true, ControllerOwned: true, ControllerLease: &lease}
 	renewed, err := manager.renewOrAllocateLease(context.Background(), target, 1)
 	if err != nil {
 		t.Fatal(err)
@@ -1030,6 +1038,49 @@ func TestOnlyCurrentProcessLiveLeaseCanBeRenewed(t *testing.T) {
 			}
 			if fresh.Term <= lease.Term || fresh.LeaseID == lease.LeaseID || fresh.Nonce == lease.Nonce {
 				t.Fatal("unowned or stale authority reused")
+			}
+		})
+	}
+}
+
+func TestMaintainControllerNegotiatesLegacyAndRenewalSlots(t *testing.T) {
+	for _, renewal := range []bool{false, true} {
+		t.Run(map[bool]string{false: "legacy", true: "renewal"}[renewal], func(t *testing.T) {
+			if renewal && controllerrole.ProcessStartToken(os.Getpid()) == "" {
+				t.Skip("Linux process-incarnation evidence required")
+			}
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			runtime := &fakeRuntime{active: "blue", legacyGrant: !renewal, partialInventory: true, observations: map[string]SlotObservation{
+				"blue": {Slot: "blue", ProcessUp: true, ProcessReady: true, Draining: true, LeaseRenewalSupported: renewal},
+			}}
+			manager := NewManager(database, runtime, 15*time.Second, func() time.Time { return now })
+			for i := 0; i < 3; i++ {
+				if err := manager.MaintainController(context.Background()); err != nil {
+					t.Fatalf("round %d: %v", i, err)
+				}
+				now = now.Add(time.Second)
+			}
+			if len(runtime.grantedLeases) != 3 {
+				t.Fatalf("grants=%d", len(runtime.grantedLeases))
+			}
+			first, last := runtime.grantedLeases[0], runtime.grantedLeases[2]
+			if renewal {
+				if first.Term != last.Term || first.LeaseID != last.LeaseID || first.Nonce != last.Nonce || !last.Expiry.After(first.Expiry) {
+					t.Fatal("modern renewal replaced authority or failed to extend it")
+				}
+			} else if last.Term <= first.Term {
+				t.Fatal("legacy slot received unsupported same-term renewal")
+			}
+			if runtime.traffic["blue"] {
+				t.Fatal("drained slot accepted traffic")
+			}
+			if strings.Contains(strings.Join(runtime.sequence, ","), "fence") {
+				t.Fatal("continuous maintenance fenced a compatible slot")
 			}
 		})
 	}

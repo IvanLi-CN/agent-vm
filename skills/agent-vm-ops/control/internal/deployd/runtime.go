@@ -133,6 +133,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		observation.ProcessReady = processReady
 		observation.Ready, _ = body["ready"].(bool)
 		observation.ControllerOwned, _ = body["controller_owned"].(bool)
+		observation.LeaseRenewalSupported, _ = body["controller_lease_renewal"].(bool)
 		if observation.ControllerOwned {
 			if encoded, err := json.Marshal(body["lease"]); err == nil {
 				var lease controllerrole.Lease
