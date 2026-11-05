@@ -10,6 +10,10 @@ describe("web demo scenarios", () => {
     expect(capacity.overview.admission.reasons).toContain("physical_disk_staging_low");
     expect(capacity.images[0]?.verification.findings).toContain("staging_capacity_low");
     expect(normal.overview.admission.ready).toBe(true);
+    expect(normal.overview.capacity.physical_disk_available.state).toBe("available");
+    expect(normal.overview.pressure.cpu_full_avg10.value).toBe(0);
+    expect(normal.overview.sources.every((source) => source.state === "available")).toBe(true);
+    expect(capacity.overview.capacity.physical_disk_available.state).toBe("stale");
   });
 
   it("models conflict and empty states as explicit, inspectable outcomes", () => {

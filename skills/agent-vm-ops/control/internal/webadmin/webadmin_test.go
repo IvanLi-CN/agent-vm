@@ -276,6 +276,28 @@ func TestOverviewUsesVerifiedPhysicalObservations(t *testing.T) {
 	}
 }
 
+func TestVMLeaseRequiresActiveState(t *testing.T) {
+	authority, _, _ := testAuthority(t)
+	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	authority.Clock = func() time.Time { return now }
+	for _, taskState := range []string{"active", "preparing", "cached", "closing", "failed"} {
+		t.Run(taskState, func(t *testing.T) {
+			expires := now.Add(time.Minute).Format(time.RFC3339Nano)
+			value, err := authority.vmValue(context.Background(), &state.Task{TaskID: "lease-view", State: taskState, LeaseExpiresAt: &expires, ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: "{}"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "unknown"
+			if taskState == "active" {
+				want = "effective"
+			}
+			if got := value["lease"].(map[string]any)["state"]; got != want {
+				t.Fatalf("lease state = %v, want %s", got, want)
+			}
+		})
+	}
+}
+
 func TestOverviewMarksStaleSourcesAndBlocksUnsafeAdmission(t *testing.T) {
 	authority, store, _ := testAuthority(t)
 	updatedAt := "2026-10-27T00:00:00Z"

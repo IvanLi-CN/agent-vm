@@ -589,7 +589,10 @@ func (authority *Authority) vmValue(ctx context.Context, task *state.Task) (map[
 	} else if parsed, parseErr := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt); parseErr == nil {
 		leaseState = "expired"
 		if parsed.After(authority.Clock().UTC()) {
-			leaseState = "effective"
+			leaseState = "unknown"
+			if task.State == "active" {
+				leaseState = "effective"
+			}
 		}
 	}
 	allowed := []string{}
