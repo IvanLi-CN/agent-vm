@@ -3,7 +3,7 @@
 <!-- impeccable:product-schema 1 -->
 
 Agent VM 为 Agent 会话提供低成本、受租约约束的工作环境。
-本文保存产品事实与已确认的 Web 管理台目标；控制台尚未实现，现有 CLI、Go 控制服务与部署侧观测继续以各自合同为准。
+本文保存产品事实与 Web 管理台实现/目标；当前检出已提供管理台静态壳、认证门面、公开状态入口和管理界面，生产部署与完整端到端 readiness 继续以各自合同为准。
 
 ## 平台
 
@@ -15,9 +15,7 @@ Web 管理台
 生产静态资源嵌入 Go 产品二进制，与控制服务共享产品版本、安装包和回滚单元；不依赖常驻前端开发服务器。
 
 Go `1.27.3`、Gin v1、`database/sql` 与 `modernc.org/sqlite` 是宿主仓库的技术边界。
-每个蓝绿槽位由一个统一 Go/Gin 服务提供业务 Web、管理 API、Agent API、生命周期与 native worker；槽位外的 Go `agent-vm-deployd` 仅通过受保护本机 UDS 协调部署事务，并使用独立部署 SQLite，不写业务状态或 rqlite。
-已有客户端保留 Bun、SSH request adapter 与受保护 control UDS。
-底层仍是嵌套 Incus system container，不引入 KVM、QEMU 或 `/dev/kvm`。
+每个蓝绿槽位由一个统一 Go/Gin 服务提供固定静态资源、OIDC 回调、同源管理 API、Agent API、生命周期与 native worker；槽位外的 Go `agent-vm-deployd` 仅通过受保护本机 UDS 协调部署事务，并使用独立部署 SQLite，不写业务状态或 rqlite。Caddy 只负责 TLS 与固定路径转发，不执行 Forward Auth、身份头注入或资源授权。已有客户端保留 Bun、SSH request adapter 与受保护 control UDS。底层仍是嵌套 Incus system container，不引入 KVM、QEMU 或 `/dev/kvm`。
 
 ## 用户
 
@@ -38,8 +36,7 @@ Agent VM 管理台以会话归属、租约、generation、容量准入和 operat
 
 ## 运行环境
 
-控制台常驻在经过授权的控制环境，通过受保护入口与外部统一认证访问。
-Agent VM 负责管理员身份与操作授权；具体身份提供方、可信代理范围、域名、TLS、allowlist 和部署参数是尚待提供的部署输入。
+控制台常驻在经过授权的控制环境，通过 Caddy 的受保护入口访问；Go 服务作为 OIDC relying party 建立浏览器管理会话，并负责管理员身份与操作授权。未认证浏览器可以取得固定静态入口和允许的页面深链接，但认证门面必须先确认 `/api/v1/session`，后端管理 API 始终独立拒绝无会话请求。具体身份提供方、可信代理范围、域名、TLS、管理员 `(issuer, subject)` allowlist 和其他部署参数是尚待提供的部署输入。
 
 维护者从概览了解当前状态，在 VM 页面定位会话、资源与租约，在镜像页面管理来源、适用性与引用，在操作记录中查询阶段、结果和人工接管原因。
 Grafana 承担历史时序与部署侧观测职责，控制台承担当前资源管理与操作任务。
@@ -102,11 +99,11 @@ Logo 未定义，实际组件、字体加载与视觉 token 尚未从实现中�
 - [README.md](README.md)：现有客户端、控制服务、内部 HTTP 与运行时边界。
 - [管理台研究备忘录](docs/proposals/agent-vm-web-console.md)：已确认范围、推荐技术与源码调查。
 - [ADR 0041](docs/adr/0041-agent-vm-session-pinned-image-identity.md)：会话固定不可变镜像身份的目标行为。
-- [ADR 0042](docs/adr/0042-agent-vm-web-management-boundary.md)：内置管理台的交付与权限边界。
+- [ADR 0043](docs/adr/0043-agent-vm-unified-service-security-boundary.md)：统一服务边界与内置管理台的权限边界。
 - [现行 Agent VM Spec](docs/specs/agent-vm/SPEC.md)、[CLI 合同](docs/specs/agent-vm/contracts/cli.md) 与 [管理台合同](docs/specs/agent-vm/contracts/management-api.md)：现有协议 4 与新增浏览器 API、镜像迁移及回退边界。
 - [观测合同](docs/specs/agent-vm/contracts/observability.md)：资源、压力、准入、来源健康与新鲜度。
 
-目前没有产品内置 Web 组件、已实现设计 token、正式截图或真实浏览器验收。
+当前检出包含产品内置 Web 组件、受控视觉证据和认证 E2E 验收；真实部署地址、凭据、清单、状态库以及生产环境验收仍不属于公开产品证据。
 公开文档不得包含部署地址、凭据、真实清单、状态库或消费方渲染的观测文件，也不得把示例数据当成现网证明。
 
 ## 产品原则

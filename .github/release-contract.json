@@ -34,6 +34,11 @@
     "artifact_overwrite": false,
     "publish_completion": "github-release-and-versioned-assets-verified"
   },
+  "immutable_release_policy": {
+    "cutover_version": "1.4.0",
+    "historical_baseline": "before-cutover-releases-may-be-mutable-and-are-verified-by-identity-assets-and-digests",
+    "state_attestation_mismatch": "explicit-legacy-audit-event-required"
+  },
   "toolchain": {
     "bun": "1.4.4",
     "go": "go1.27.3",

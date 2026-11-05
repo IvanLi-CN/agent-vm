@@ -188,14 +188,17 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			runtime.invalidateMetrics(slot, "inventory")
 			snapshot.Consistent = false
 		} else {
-			if partial, ok := inventory["partial"].(bool); ok && partial {
+			inventoryConsistent := inventoryObservationConsistent(inventory)
+			if !inventoryConsistent {
 				snapshot.Consistent = false
 			}
-			if consistent, ok := inventory["observation_consistent"].(bool); ok && !consistent {
-				snapshot.Consistent = false
+			if inventoryConsistent {
+				runtime.rememberMetrics(slot, "inventory", observe.MetricsForSnapshot("inventory", inventory))
+				sourceTimes["inventory_observation"] = minTime(sourceTimes["inventory_observation"], inventoryAt)
+			} else {
+				inventoryObservationUp = false
+				runtime.invalidateMetrics(slot, "inventory")
 			}
-			runtime.rememberMetrics(slot, "inventory", observe.MetricsForSnapshot("inventory", inventory))
-			sourceTimes["inventory_observation"] = minTime(sourceTimes["inventory_observation"], inventoryAt)
 		}
 		doctor, doctorAt, doctorErr := runtime.observeSource(ctx, slot, "health", "doctor")
 		if doctorErr != nil {
@@ -283,6 +286,12 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 	}
 	snapshot.FreshUntil = composedFreshUntil(snapshot.Sources, now)
 	return snapshot, nil
+}
+
+func inventoryObservationConsistent(inventory map[string]any) bool {
+	partial, partialOK := inventory["partial"].(bool)
+	consistent, consistentOK := inventory["observation_consistent"].(bool)
+	return partialOK && !partial && consistentOK && consistent
 }
 
 func (runtime *HostRuntime) sourceFreshness() time.Duration {

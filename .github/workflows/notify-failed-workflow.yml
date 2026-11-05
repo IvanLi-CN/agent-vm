@@ -1,22 +1,19 @@
 name: Notify failed workflow
-
 on:
   workflow_run:
     workflows: [CI (PR), CI (Main), Release recovery, Demo Deploy]
     types: [completed]
-
 permissions:
   contents: read
-
 concurrency:
   group: notify-workflow-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
   cancel-in-progress: false
-
 jobs:
-  notify:
-    name: Notify failed workflow
+  context:
     if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.repository.full_name == github.repository
     runs-on: ubuntu-latest
+    outputs:
+      summary: ${{ steps.context.outputs.summary }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,7 +22,13 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
+      - name: Require Oidrune gateway configuration
+        env:
+          GATEWAY_URL: ${{ vars.OIDRUNE_GATEWAY_URL }}
+          OIDC_AUDIENCE: ${{ vars.OIDRUNE_OIDC_AUDIENCE }}
+        run: test -n "$GATEWAY_URL" && test -n "$OIDC_AUDIENCE"
       - name: Build trusted failure context
+        id: context
         env:
           FAILED_REPOSITORY: ${{ github.event.workflow_run.repository.full_name }}
           FAILED_WORKFLOW: ${{ github.event.workflow_run.name }}
@@ -39,4 +42,24 @@ jobs:
           FAILED_ACTOR: ${{ github.event.workflow_run.actor.login }}
           FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
           FAILED_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
-        run: bun run skills/agent-vm-ops/scripts/failure-notification.ts --class generic
+        run: |
+          set -euo pipefail
+          summary="$(bun run skills/agent-vm-ops/scripts/failure-notification.ts --class generic)"
+          {
+            echo 'summary<<EOF'
+            echo "$summary"
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
+  notify:
+    needs: context
+    if: always() && needs.context.result == 'success'
+    uses: IvanLi-CN/oidrune/.github/workflows/notify.yml@4b5901a8827731ea06a05211dc6edf06e46783bc
+    permissions:
+      contents: none
+      id-token: write
+    with:
+      outcome: failure
+      summary: ${{ needs.context.outputs.summary }}
+      on_gateway_failure: fail
+      gateway_url: ${{ vars.OIDRUNE_GATEWAY_URL }}
+      oidc_audience: ${{ vars.OIDRUNE_OIDC_AUDIENCE }}

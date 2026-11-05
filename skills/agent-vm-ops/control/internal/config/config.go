@@ -348,6 +348,16 @@ func (c ManagementConfig) Validate(webOnly bool) error {
 			return errors.New("config_invalid: management.admin_principal.capabilities contains an unsupported capability")
 		}
 	}
+	readCapability := false
+	for _, capability := range c.AdminPrincipal.Capabilities {
+		if capability == "read" {
+			readCapability = true
+			break
+		}
+	}
+	if !readCapability {
+		return errors.New("config_invalid: management.admin_principal.capabilities must include read for browser session bootstrap")
+	}
 	if err := validateUniqueIDs("management.trusted_image_source_ids", c.TrustedImageSourceIDs, false); err != nil {
 		return err
 	}

@@ -81,6 +81,21 @@ func TestAdminStatusValidationRetainsPartialObservation(t *testing.T) {
 	}
 }
 
+func TestInventoryObservationConsistencyRejectsPartialSnapshots(t *testing.T) {
+	if !inventoryObservationConsistent(map[string]any{"partial": false, "observation_consistent": true}) {
+		t.Fatal("complete inventory observation was rejected")
+	}
+	for index, value := range []map[string]any{
+		{"partial": true, "observation_consistent": true},
+		{"partial": false, "observation_consistent": false},
+		{"partial": false},
+	} {
+		if inventoryObservationConsistent(value) {
+			t.Fatalf("invalid inventory observation %d was accepted: %#v", index, value)
+		}
+	}
+}
+
 func TestValidObservedAtRejectsFutureTimestamp(t *testing.T) {
 	now := time.Date(2026, time.November, 3, 0, 0, 0, 0, time.UTC)
 	if _, ok := validObservedAt("2026-11-03T00:00:01Z", now); ok {

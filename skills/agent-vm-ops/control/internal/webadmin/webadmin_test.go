@@ -125,7 +125,14 @@ func TestAuthorityRejectsUntrustedPeer(t *testing.T) {
 	if recorder.Code != http.StatusForbidden {
 		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
 	}
-	if strings.Contains(recorder.Body.String(), "9999") {
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatalf("response = %s, err = %v", recorder.Body.String(), err)
+	}
+	if errorValue, ok := response["error"].(map[string]any); ok {
+		delete(errorValue, "operation_id")
+	}
+	if strings.Contains(jsonString(response), "9999") {
 		t.Fatalf("peer UID leaked in response: %s", recorder.Body.String())
 	}
 }
@@ -224,12 +231,13 @@ func TestOverviewMarksStaleSourcesAndBlocksUnsafeAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	metrics := map[string]any{
-		"observed_at":       time.Now().UTC().Format(time.RFC3339Nano),
-		"up":                false,
-		"admission_ready":   true,
-		"draining":          false,
-		"task_states":       map[string]any{"active": float64(4)},
-		"default_admission": map[string]any{"ready": true, "reasons": []any{}},
+		"observed_at":            time.Now().UTC().Format(time.RFC3339Nano),
+		"up":                     false,
+		"admission_ready":        true,
+		"draining":               false,
+		"observation_consistent": true,
+		"task_states":            map[string]any{"active": float64(4), "preparing": float64(0), "cached": float64(0), "closing": float64(0), "deleting": float64(0), "failed": float64(0), "absent": float64(0)},
+		"default_admission":      map[string]any{"ready": true, "reasons": []any{}},
 	}
 	value, err := authority.overview(metrics, context.Background())
 	if err != nil {
@@ -253,6 +261,37 @@ func TestOverviewMarksStaleSourcesAndBlocksUnsafeAdmission(t *testing.T) {
 	durable := sources[0].(map[string]any)
 	if durable["state"] != "available" || durable["safe_code"] != nil {
 		t.Fatalf("durable source = %#v", durable)
+	}
+}
+
+func TestOverviewRedactsInvalidObservationTimestampAndSafeCode(t *testing.T) {
+	authority, _, _ := testAuthority(t)
+	now := time.Date(2026, 11, 4, 8, 0, 0, 0, time.UTC)
+	authority.Clock = func() time.Time { return now }
+	metrics := map[string]any{
+		"observed_at":            now.Add(time.Second).Format(time.RFC3339Nano),
+		"up":                     true,
+		"admission_ready":        true,
+		"draining":               false,
+		"observation_consistent": true,
+		"task_states":            completeTaskStates(2),
+		"default_admission":      map[string]any{"ready": true},
+	}
+	value, err := authority.overview(metrics, context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value["observed_at"] != nil {
+		t.Fatalf("top-level observed_at=%#v", value["observed_at"])
+	}
+	sources := value["sources"].([]any)
+	native := sources[1].(map[string]any)
+	if native["observed_at"] != nil || native["state"] != "unverified" || native["safe_code"] != "observation_unverified" {
+		t.Fatalf("native source=%#v", native)
+	}
+	capacity := value["capacity"].(map[string]any)
+	if capacity["logical_cpu_remaining_vcpu"].(map[string]any)["state"] != "unverified" || capacity["logical_cpu_remaining_vcpu"].(map[string]any)["observed_at"] != nil {
+		t.Fatalf("invalid timestamp leaked into capacity observation=%#v", capacity)
 	}
 }
 

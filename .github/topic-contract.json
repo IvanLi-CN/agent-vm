@@ -29,7 +29,7 @@
   },
   "enablement": {
     "platform_rules": "not-enabled",
-    "notification_transport": "unselected",
+    "notification_transport": "selected",
     "formal_release": "not-run",
     "deployment": "separate-operation"
   }

@@ -199,6 +199,31 @@ export class ReleaseStateStore {
 
 const stateStages: readonly ReleaseStage[] = ["claimed", "prepared", "draft", "published", "completed", "abandoned"];
 
+type RemoteState = { event: ReleaseEvent; sha: string; parents: string[] };
+
+function assertStateLineage(events: Array<{ stage: ReleaseStage; value: RemoteState }>): void {
+  const ordered = [...events].sort((left, right) => stateStages.indexOf(left.stage) - stateStages.indexOf(right.stage));
+  if (ordered[0]?.stage !== "claimed") throw new Error("release state refs do not begin with the claimed identity");
+  const identity = identityKey(ordered[0].value.event.identity);
+  let previous: { stage: ReleaseStage; sha: string } | null = null;
+  for (const item of ordered) {
+    if (item.value.event.stage !== item.stage || identityKey(item.value.event.identity) !== identity) {
+      throw new Error("release state refs contain an identity or stage mismatch");
+    }
+    const expectedParent = previous?.sha;
+    if (expectedParent === undefined) {
+      if (item.value.parents.length !== 0) throw new Error("claimed release state ref unexpectedly has a parent");
+    } else if (item.value.parents.length !== 1 || item.value.parents[0] !== expectedParent) {
+      throw new Error("release state refs do not form an append-only parent chain");
+    }
+    if (previous) {
+      const expectedNext = item.stage === "abandoned" ? previous.stage !== "completed" && previous.stage !== "abandoned" : stateStages.indexOf(item.stage) === stateStages.indexOf(previous.stage) + 1;
+      if (!expectedNext) throw new Error(`release state transition is not valid: ${previous.stage} -> ${item.stage}`);
+    }
+    previous = { stage: item.stage, sha: item.value.sha };
+  }
+}
+
 function stateRef(stage: ReleaseStage, version: string): string {
   return `release-state/${stage}/${fileName(version)}`;
 }
@@ -238,14 +263,15 @@ export class GithubReleaseStateStore {
     return { ...event, detail: { ...event.detail, assets: portableAssets } };
   }
 
-  private async read(stage: ReleaseStage, version: string): Promise<{ event: ReleaseEvent; sha: string } | null> {
+  private async read(stage: ReleaseStage, version: string): Promise<RemoteState | null> {
     const ref = stateRef(stage, version);
     try {
       const reference = await this.adapter.json<{ object?: { sha?: string } }>(["api", `repos/${this.adapter.repository}/git/ref/tags/${ref}`]);
       const sha = reference.object?.sha;
       if (!sha) throw new Error("release state ref has no commit SHA");
-      const commit = await this.adapter.json<{ message?: string }>(["api", `repos/${this.adapter.repository}/git/commits/${sha}`]);
-      return { event: this.hydrate(eventFromCommit(commit.message)), sha };
+      const commit = await this.adapter.json<{ message?: string; parents?: Array<{ sha?: string }> }>(["api", `repos/${this.adapter.repository}/git/commits/${sha}`]);
+      const parents = Array.isArray(commit.parents) ? commit.parents.flatMap((parent) => typeof parent?.sha === "string" ? [parent.sha] : []) : [];
+      return { event: this.hydrate(eventFromCommit(commit.message)), sha, parents };
     } catch (error) {
       if (/404|not found/i.test(String(error))) return null;
       throw error;
@@ -293,15 +319,17 @@ export class GithubReleaseStateStore {
   }
 
   async current(version: string): Promise<ReleaseEvent> {
-    const events = (await Promise.all(stateStages.map(async (stage) => ({ stage, value: await this.read(stage, version) })))).filter((item): item is { stage: ReleaseStage; value: { event: ReleaseEvent; sha: string } } => item.value !== null);
+    const events = (await Promise.all(stateStages.map(async (stage) => ({ stage, value: await this.read(stage, version) })))).filter((item): item is { stage: ReleaseStage; value: RemoteState } => item.value !== null);
     if (!events.length) throw new Error(`release reservation does not exist: ${version}`);
+    assertStateLineage(events);
     events.sort((left, right) => stateStages.indexOf(left.stage) - stateStages.indexOf(right.stage));
     return events.at(-1)!.value.event;
   }
 
   private async currentWithSha(version: string): Promise<{ event: ReleaseEvent; sha: string }> {
-    const events = (await Promise.all(stateStages.map(async (stage) => ({ stage, value: await this.read(stage, version) })))).filter((item): item is { stage: ReleaseStage; value: { event: ReleaseEvent; sha: string } } => item.value !== null);
+    const events = (await Promise.all(stateStages.map(async (stage) => ({ stage, value: await this.read(stage, version) })))).filter((item): item is { stage: ReleaseStage; value: RemoteState } => item.value !== null);
     if (!events.length) throw new Error(`release reservation does not exist: ${version}`);
+    assertStateLineage(events);
     events.sort((left, right) => stateStages.indexOf(left.stage) - stateStages.indexOf(right.stage));
     return events.at(-1)!.value;
   }

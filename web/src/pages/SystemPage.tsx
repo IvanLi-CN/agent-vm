@@ -3,9 +3,12 @@ import { CheckCircle2, Database, Wrench } from "lucide-react";
 import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ManagementRequestError, createOperationId, getSystem, previewMaintenance, submitMaintenance } from "../app/api";
+import { useManagementAuth } from "../app/auth";
+import { useOperationRecovery } from "../app/operationRecovery";
 import { actionLabel, formatDateTime } from "../app/format";
 import type { ActionPreview, Locale, SystemStatus } from "../app/types";
 import { ActionDialog } from "../components/ActionDialog";
+import { OperationRecoveryNotice } from "../components/OperationRecoveryNotice";
 import { PageIntro, QueryError } from "../components/PagePrimitives";
 import { TokenManagement } from "../components/TokenManagement";
 import { Button, Panel, PanelHeader, StatusBadge } from "../components/ui";
@@ -15,11 +18,12 @@ type ActionDialogOwner = "maintenance" | "token" | null;
 
 export function SystemPage() {
   const { t, i18n } = useTranslation();
+  const auth = useManagementAuth();
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const client = useQueryClient();
   const [action, setAction] = useState<MaintenanceAction | null>(null);
   const [preview, setPreview] = useState<ActionPreview | null>(null);
-  const [operationId, setOperationId] = useState<string | null>(null);
+  const [operationId, setOperationId, operationRecovery] = useOperationRecovery("/system", auth.isAuthenticated);
   const [actionError, setActionError] = useState<string | null>(null);
   const [dialogOwner, setDialogOwner] = useState<ActionDialogOwner>(null);
   const setTokenDialogOpen = useCallback((open: boolean) => {
@@ -28,32 +32,42 @@ export function SystemPage() {
       return current === "token" ? null : current;
     });
   }, []);
-  const query = useQuery({ queryKey: ["system"], queryFn: getSystem, refetchInterval: 10_000, refetchIntervalInBackground: false });
+  const query = useQuery({ queryKey: ["system"], queryFn: getSystem, enabled: auth.isAuthenticated, refetchInterval: 10_000, refetchIntervalInBackground: false });
   const showError = (error: unknown) => setActionError(error instanceof ManagementRequestError ? t(`errors.${error.code}`, { defaultValue: t("errors.generic") }) : t("errors.generic"));
   const mutation = useMutation({
     mutationFn: ({ reason }: { reason: string }) => submitMaintenance(action!, reason, preview!, operationId ?? undefined),
-    onSuccess: () => {
+    onSuccess: (operation) => {
       setAction(null);
       setPreview(null);
-      setOperationId(null);
+      if (operation.status === "succeeded" || operation.status === "failed") setOperationId(null);
+      else { operationRecovery.persist(); operationRecovery.block(operation); }
       setActionError(null);
       setDialogOwner(null);
       void client.invalidateQueries({ queryKey: ["operations"] });
       void client.invalidateQueries({ queryKey: ["system"] });
     },
-    onError: showError,
+    onError: (error) => {
+      if (error instanceof ManagementRequestError && !error.retryable) setOperationId(null);
+      else { operationRecovery.persist(); operationRecovery.block(); }
+      showError(error);
+    },
   });
   const openAction = async (nextAction: MaintenanceAction) => {
+    if (operationRecovery.isBlocked) {
+      setActionError(t("errors.operationRecoveryRequired"));
+      return;
+    }
     if (dialogOwner) return;
     setActionError(null);
     setDialogOwner("maintenance");
     setAction(nextAction);
-    setOperationId(createOperationId());
+    setOperationId(createOperationId(), false);
     try {
       setPreview(await previewMaintenance(nextAction, query.data?.resource_version));
     } catch (error) {
       setAction(null);
       setPreview(null);
+      setOperationId(null, false);
       showError(error);
       setDialogOwner(null);
     }
@@ -62,6 +76,7 @@ export function SystemPage() {
   if (query.isError || !query.data) return <><PageIntro title={t("system.title")} description={t("system.subtitle")} /><QueryError onRetry={() => void query.refetch()} /></>;
   return <div className="page-stack" data-testid="system-page">
     <PageIntro title={t("system.title")} description={t("system.subtitle")} onRefresh={() => void query.refetch()} refreshing={query.isFetching} />
+    <OperationRecoveryNotice recovery={operationRecovery} />
     <div className="system-overview">
       <Panel><PanelHeader title={t("system.productVersion")} /><div className="product-version mono">{query.data.product_version}</div><div className="system-meta"><span className="mono">{query.data.resource_version}</span><span>{t("shell.synthetic")}</span></div></Panel>
       <Panel><PanelHeader title={t("system.maintenance")} description={t("system.maintainHint")} /><MaintenanceSummary system={query.data} /><div className="maintenance-actions">{query.data.maintenance.draining ? <p className="maintenance-note">{t("system.releaseManaged")}</p> : <Button variant="secondary" icon={<Wrench />} disabled={dialogOwner !== null} onClick={() => void openAction("drain_enter")}>{t("system.enterDrain")}</Button>}<Button variant="ghost" disabled={dialogOwner !== null} onClick={() => void openAction("reconcile")}>{t("system.reconcile")}</Button><Button variant="ghost" disabled={dialogOwner !== null} onClick={() => void openAction("gc")}>{t("system.gc")}</Button></div>{actionError && !action ? <p className="field-error" role="alert">{actionError}</p> : null}</Panel>
@@ -72,7 +87,7 @@ export function SystemPage() {
       <Panel><PanelHeader title={t("system.source")} /><div className="source-list">{query.data.sources.map((source) => <div className="source-row" key={source.name}><div><strong>{source.name}</strong><span>{source.safe_code ?? "—"}</span></div><StatusBadge state={source.state} /></div>)}</div></Panel>
     </div>
     <TokenManagement dialogBlocked={dialogOwner === "maintenance"} onDialogStateChange={setTokenDialogOpen} />
-    {action && preview ? <ActionDialog preview={preview} actionLabel={actionLabel(action, locale)} target={`${t("system.title")} · ${t("system.maintenance")}`} error={actionError} dangerous={action === "drain_enter" || action === "gc"} busy={mutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null); setActionError(null); setDialogOwner(null); }} onConfirm={(reason) => mutation.mutate({ reason })} /> : null}
+    {action && preview ? <ActionDialog preview={preview} actionLabel={actionLabel(action, locale)} target={`${t("system.title")} · ${t("system.maintenance")}`} error={actionError} dangerous={action === "drain_enter" || action === "gc"} busy={mutation.isPending} onCancel={() => { setAction(null); setPreview(null); setOperationId(null, false); setActionError(null); setDialogOwner(null); }} onConfirm={(reason) => { operationRecovery.persist(); mutation.mutate({ reason }); }} /> : null}
   </div>;
 }
 

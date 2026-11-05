@@ -18,7 +18,7 @@ test("the five project topics have locked local surfaces", () => {
   expect(quality.queue_policy.required_pull_request_events).toEqual(["opened", "synchronize", "reopened", "ready_for_review"]);
   expect(quality.queue_policy.queue).toBe("max");
   expect(json(".github/release-contract.json").product.manifest_format).toBe(4);
-  expect(json(".github/release-failure-notification.json").transport_selection.status).toBe("unselected");
+  expect(json(".github/release-failure-notification.json").transport_selection.status).toBe("selected");
   const topics = json(".github/topic-contract.json").topics;
   expect(Object.keys(topics).sort()).toEqual([
     "github-actions-scheduling",
@@ -64,7 +64,7 @@ test("demo deployment is serialized and never exposes credentials to PR builds",
   expect(names.indexOf("Verify existing EdgeOne project")).toBeLessThan(names.indexOf("Deploy to EdgeOne Makers"));
 });
 
-test("notification routing is metadata-only and fail-closed before transport selection", () => {
+test("notification routing prepares metadata for the selected transport", () => {
   const script = resolve(root, "skills/agent-vm-ops/scripts/failure-notification.ts");
   const result = Bun.spawnSync([process.execPath, script, "--class", "generic"], {
     cwd: root,
@@ -84,12 +84,14 @@ test("notification routing is metadata-only and fail-closed before transport sel
     stdout: "pipe",
     stderr: "pipe",
   });
-  expect(result.exitCode).toBe(78);
-  expect(new TextDecoder().decode(result.stdout)).toContain('"reason":"transport_unselected"');
+  expect(result.exitCode).toBe(0);
+  expect(new TextDecoder().decode(result.stdout)).toContain('"delivery":"prepared"');
   expect(new TextDecoder().decode(result.stdout)).toContain('"event":"pull_request"');
   expect(new TextDecoder().decode(result.stdout)).toContain('"ref":"refs/pull/123/merge"');
   expect(read(".github/workflows/notify-failed-workflow.yml")).toContain("ref: ${{ github.event.repository.default_branch }}");
   expect(read(".github/workflows/notify-failed-release.yml")).toContain("workflows: [Release]");
+  expect(read(".github/workflows/notify-failed-release.yml")).toContain("id-token: write");
+  expect(read(".github/workflows/notify-failed-release.yml")).toContain("oidrune/.github/workflows/notify.yml@4b5901a8827731ea06a05211dc6edf06e46783bc");
   const notification = json(".github/release-failure-notification.json");
   expect(notification.workflow_inventory["Notification smoke"].class).toBe("excluded");
   expect(notification.workflow_inventory["Notify failed workflow"].class).toBe("excluded");

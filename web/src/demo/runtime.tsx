@@ -81,6 +81,7 @@ export function modelForScene(scene: DemoScene, dataMode: DemoDataMode = "full")
     model.images[0].verification.findings = ["staging_capacity_low", "physical_pool_observation_stale"];
   }
   if (scene === "conflict") {
+    const observedAt = model.overview.observed_at ?? "1970-01-01T00:00:00.000Z";
     model.operations.unshift({
       operation_id: "50e8400e-ccf8-4c7b-8d1d-14f66c7fb199",
       action: "destroy",
@@ -89,8 +90,8 @@ export function modelForScene(scene: DemoScene, dataMode: DemoDataMode = "full")
       target: { kind: "vm", id: "task_delta_04" },
       actor: { issuer: model.session.issuer, subject: model.session.subject, role: model.session.role },
       reason: "Simulate an interrupted native action",
-      created_at: model.overview.observed_at,
-      updated_at: model.overview.observed_at,
+      created_at: observedAt,
+      updated_at: observedAt,
       result: null,
       error: { code: "authority_unavailable", phase: "native_action", retryable: true },
     });

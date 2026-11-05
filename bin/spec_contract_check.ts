@@ -16,6 +16,12 @@ const FORBIDDEN_HEADINGS = [
   "open questions", "assumptions", "task orchestration", "execution steps", "current status",
   "milestones", "implementation status", "delivery status", "execution",
 ];
+const REQUIRED_SECTIONS = [
+  { label: "Context and Scope", names: ["Context and Scope", "上下文与范围"] },
+  { label: "Requirements", names: ["Requirements", "需求"] },
+  { label: "Verification", names: ["Verification", "验证"] },
+  { label: "Related ADRs", names: ["Related ADRs", "相关 ADR"] },
+] as const;
 
 export function emit(path: string, code: string, message: string, line?: number): string {
   const suffix = line === undefined ? "" : ` line=${line}`;
@@ -50,6 +56,17 @@ function sectionMap(lines: string[]): Map<string, { start: number; body: string[
   return sections;
 }
 
+function findSection(
+  sections: Map<string, { start: number; body: string[] }>,
+  names: readonly string[],
+): { start: number; body: string[] } | undefined {
+  for (const name of names) {
+    const section = sections.get(name);
+    if (section) return section;
+  }
+  return undefined;
+}
+
 export function check(path: string, root: string = REPO_ROOT): string[] {
   const absolute = resolve(path);
   const rootAbsolute = resolve(root);
@@ -67,9 +84,9 @@ export function check(path: string, root: string = REPO_ROOT): string[] {
 
   const lines = readText(absolute).split("\n").map((line) => line.replace(/\r$/, ""));
   const sections = sectionMap(lines);
-  for (const required of ["Context and Scope", "Requirements", "Verification", "Related ADRs"]) {
-    if (!sections.has(required)) {
-      errors.push(emit(relativePath, "SPEC_SECTION_MISSING", `missing required section: ## ${required}`));
+  for (const required of REQUIRED_SECTIONS) {
+    if (!required.names.some((name) => sections.has(name))) {
+      errors.push(emit(relativePath, "SPEC_SECTION_MISSING", `missing required section: ## ${required.label}`));
     }
   }
   for (const [heading, section] of sections) {
@@ -84,8 +101,8 @@ export function check(path: string, root: string = REPO_ROOT): string[] {
     }
   });
 
-  const requirements = sections.get("Requirements")?.body.join("\n") ?? "";
-  const verification = sections.get("Verification")?.body.join("\n") ?? "";
+  const requirements = findSection(sections, ["Requirements", "需求"])?.body.join("\n") ?? "";
+  const verification = findSection(sections, ["Verification", "验证"])?.body.join("\n") ?? "";
   const reqIds = [...new Set(matchesAll(REQ_RE, requirements))].sort();
   const verIds = [...new Set(matchesAll(VER_RE, verification))].sort();
   if (reqIds.length === 0) {
@@ -98,7 +115,7 @@ export function check(path: string, root: string = REPO_ROOT): string[] {
     errors.push(emit(relativePath, "SPEC_NORMATIVE_BOUNDARY_MISSING", "Requirements must contain normative MUST/SHALL or Chinese normative language"));
   }
   for (const reqId of reqIds) {
-    const pattern = new RegExp(`(?:covers?|覆盖)\\s*[:=]\\s*[^\\n]*\\b${reqId}\\b`, "i");
+    const pattern = new RegExp(`(?:covers?|覆盖)\\s*[:=：]\\s*[^\\n]*\\b${reqId}\\b`, "i");
     if (!pattern.test(verification)) {
       errors.push(emit(relativePath, "SPEC_TRACEABILITY_MISSING", `no VER-* verification explicitly covers ${reqId}`));
     }
@@ -110,7 +127,7 @@ export function check(path: string, root: string = REPO_ROOT): string[] {
     }
   }
 
-  const adrSection = sections.get("Related ADRs");
+  const adrSection = findSection(sections, ["Related ADRs", "相关 ADR"]);
   if (adrSection) {
     const adrLines = adrSection.body.filter((line) => line.trim().length > 0);
     if (adrLines.length === 0) {

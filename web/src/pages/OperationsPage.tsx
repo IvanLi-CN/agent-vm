@@ -3,6 +3,7 @@ import { ChevronLeft, ChevronRight, Clock3, ExternalLink } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { listAudit, listOperations } from "../app/api";
+import { useManagementAuth } from "../app/auth";
 import { actionLabel, formatActor, formatDateTime } from "../app/format";
 import type { Locale, Operation } from "../app/types";
 import { PageIntro, QueryError } from "../components/PagePrimitives";
@@ -14,6 +15,7 @@ const phaseProgress: Record<string, number> = { queued: 12, awaiting_upload: 22,
 
 export function OperationsPage() {
   const { t, i18n } = useTranslation();
+  const auth = useManagementAuth();
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   const [status, setStatus] = useState("all");
   const [tab, setTab] = useState<"operations" | "audit">("operations");
@@ -21,8 +23,8 @@ export function OperationsPage() {
   const [operationCursorStack, setOperationCursorStack] = useState<string[]>([]);
   const [auditCursor, setAuditCursor] = useState<string | undefined>();
   const [auditCursorStack, setAuditCursorStack] = useState<string[]>([]);
-  const operationsQuery = useQuery({ queryKey: ["operations", status, operationCursor], queryFn: () => listOperations(status, operationCursor), refetchInterval: status === "all" || ["queued", "running", "reconciling", "awaiting_upload"].includes(status) ? 2_000 : false, refetchIntervalInBackground: false });
-  const auditQuery = useQuery({ queryKey: ["audit", auditCursor], queryFn: () => listAudit(auditCursor), enabled: tab === "audit" });
+  const operationsQuery = useQuery({ queryKey: ["operations", status, operationCursor], queryFn: () => listOperations(status, operationCursor), enabled: auth.isAuthenticated, refetchInterval: status === "all" || ["queued", "running", "reconciling", "awaiting_upload"].includes(status) ? 2_000 : false, refetchIntervalInBackground: false });
+  const auditQuery = useQuery({ queryKey: ["audit", auditCursor], queryFn: () => listAudit(auditCursor), enabled: auth.isAuthenticated && tab === "audit" });
   const nextOperations = () => { const next = operationsQuery.data?.page.next_cursor; if (!next) return; setOperationCursorStack((stack) => [...stack, operationCursor ?? ""]); setOperationCursor(next); };
   const previousOperations = () => {
     const previous = operationCursorStack[operationCursorStack.length - 1];

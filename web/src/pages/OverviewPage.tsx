@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { CheckCircle2, CircleHelp, Gauge, HardDrive, MemoryStick, Server, TriangleAlert } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { getOverview } from "../app/api";
+import { useManagementAuth } from "../app/auth";
 import { formatBytes, formatNumber } from "../app/format";
 import type { Locale, ObservedBoolean, ObservedBytes, ObservedNumber } from "../app/types";
 import { PageIntro, FreshnessLine, LoadingPanel, QueryError } from "../components/PagePrimitives";
@@ -24,8 +25,9 @@ function metricNumber(locale: Locale, suffix = "") {
 
 export function OverviewPage() {
   const { t, i18n } = useTranslation();
+  const auth = useManagementAuth();
   const locale: Locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
-  const query = useQuery({ queryKey: ["overview"], queryFn: getOverview, refetchInterval: 10_000, refetchIntervalInBackground: false });
+  const query = useQuery({ queryKey: ["overview"], queryFn: getOverview, enabled: auth.isAuthenticated, refetchInterval: 10_000, refetchIntervalInBackground: false });
   if (query.isPending) return <><PageIntro title={t("overview.title")} description={t("overview.subtitle")} /><LoadingPanel /></>;
   if (query.isError || !query.data) return <><PageIntro title={t("overview.title")} description={t("overview.subtitle")} /><QueryError onRetry={() => void query.refetch()} /></>;
   const data = query.data;

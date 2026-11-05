@@ -2,6 +2,7 @@ import { Activity, Boxes, Cpu, Gauge, Languages, Menu, Settings2, X } from "luci
 import type { ReactNode } from "react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useManagementAuth } from "../app/auth";
 import { changeLocale } from "../app/i18n";
 import type { Locale, PageKey } from "../app/types";
 import { Button, IconButton } from "./ui";
@@ -16,9 +17,13 @@ const navItems: Array<{ key: PageKey; icon: typeof Gauge }> = [
 
 export function Shell({ page, onNavigate, children }: { page: PageKey; onNavigate?: (next: PageKey) => void; children: ReactNode }) {
   const { t, i18n } = useTranslation();
+  const auth = useManagementAuth();
   const [menuOpen, setMenuOpen] = useState(false);
   const locale = i18n.language === "zh-CN" ? "zh-CN" : "en";
   useEffect(() => { setMenuOpen(false); }, [page]);
+  useEffect(() => {
+    if (typeof document !== "undefined") document.title = t("shell.managementTitle");
+  }, [i18n.language, t]);
 
   const navigate = (next: PageKey) => {
     onNavigate?.(next);
@@ -28,6 +33,19 @@ export function Shell({ page, onNavigate, children }: { page: PageKey; onNavigat
     window.dispatchEvent(new PopStateEvent("popstate"));
   };
 
+  const identityTitle = auth.managed && auth.status === "authenticated" ? auth.session?.subject ?? t("shell.signedOut") : auth.managed ? t("shell.signedOut") : t("shell.operator");
+  const identitySubtitle = auth.managed && auth.status === "authenticated" ? t("shell.administrator") : auth.managed ? t("shell.signedOut") : t("shell.administrator");
+  const surfaceLabel = !auth.managed
+    ? t("shell.synthetic")
+    : auth.status === "authenticated"
+      ? t("shell.managementSession")
+      : auth.status === "loading"
+        ? t("shell.sessionPending")
+        : auth.status === "suspended"
+          ? t("shell.sessionExpired")
+          : auth.status === "error"
+            ? t("shell.authUnavailable")
+            : t("shell.signedOut");
   return <div className="app-frame">
     <aside className="sidebar" aria-label={t("product")}>
       <div className="brand-lockup"><div className="brand-mark" aria-hidden="true">A</div><div><strong>{t("product")}</strong><span>{t("productSub")}</span></div></div>
@@ -35,10 +53,10 @@ export function Shell({ page, onNavigate, children }: { page: PageKey; onNavigat
       <nav className="primary-nav">
         {navItems.map(({ key, icon: Icon }) => <button className={`nav-item ${page === key ? "is-active" : ""}`} key={key} onClick={() => navigate(key)} aria-current={page === key ? "page" : undefined}><Icon aria-hidden="true" /><span>{t(`nav.${key}`)}</span></button>)}
       </nav>
-      <div className="sidebar-footer"><span className="operator-dot" aria-hidden="true" /><div><strong>{t("shell.operator")}</strong><span>{t("shell.administrator")}</span></div></div>
+      <div className="sidebar-footer"><span className="operator-dot" aria-hidden="true" /><div><strong>{identityTitle}</strong><span>{identitySubtitle}</span></div></div>
     </aside>
     <div className="workspace">
-      <header className="topbar"><div className="mobile-brand"><div className="brand-mark" aria-hidden="true">A</div><strong>{t("product")}</strong></div><IconButton label={t("shell.openMenu")} className="mobile-menu-button" onClick={() => setMenuOpen(true)}><Menu /></IconButton><div className="topbar-spacer" /><span className="synthetic-label">{t("shell.synthetic")}</span><div className="language-toggle" role="group" aria-label={t("shell.language")}><button className={locale === "zh-CN" ? "selected" : ""} onClick={() => void changeLocale("zh-CN")}>中</button><button className={locale === "en" ? "selected" : ""} onClick={() => void changeLocale("en")}>EN</button></div></header>
+      <header className="topbar"><div className="mobile-brand"><div className="brand-mark" aria-hidden="true">A</div><strong>{t("product")}</strong></div><IconButton label={t("shell.openMenu")} className="mobile-menu-button" onClick={() => setMenuOpen(true)}><Menu /></IconButton><div className="topbar-spacer" /><span className="synthetic-label">{surfaceLabel}</span><div className="language-toggle" role="group" aria-label={t("shell.language")}><button type="button" className={locale === "zh-CN" ? "selected" : ""} aria-pressed={locale === "zh-CN"} onClick={() => void changeLocale("zh-CN")}>中</button><button type="button" className={locale === "en" ? "selected" : ""} aria-pressed={locale === "en"} onClick={() => void changeLocale("en")}>EN</button></div></header>
       <main className="work-surface">{children}</main>
     </div>
     {menuOpen ? <div className="mobile-menu-layer"><button type="button" className="mobile-menu-backdrop" aria-label={t("shell.closeMenu")} onClick={() => setMenuOpen(false)} /><dialog open className="mobile-menu" aria-labelledby="mobile-menu-title"><div className="mobile-menu-header"><strong id="mobile-menu-title">{t("product")}</strong><IconButton label={t("shell.closeMenu")} onClick={() => setMenuOpen(false)}><X /></IconButton></div>{navItems.map(({ key, icon: Icon }) => <button className={`nav-item ${page === key ? "is-active" : ""}`} key={key} onClick={() => navigate(key)}><Icon aria-hidden="true" /><span>{t(`nav.${key}`)}</span></button>)}<div className="mobile-menu-footer"><Button variant="ghost" icon={<Languages />} onClick={() => void changeLocale(locale === "zh-CN" ? "en" : "zh-CN")}>{locale === "zh-CN" ? "English" : "简体中文"}</Button></div></dialog></div> : null}

@@ -1,9 +1,11 @@
 import { emptyReferences, mockState } from "./mockData";
-import type { ActionPreview, AgentToken, AuditEvent, ImageImportRequest, ManagedImage, ManagedVM, ManagementSession, Operation, Overview, SystemStatus, TokenCreateResult, TokenPage, TokenRevokePreview, TokenScope } from "./types";
+import type { ActionPreview, AgentToken, AuditEvent, ImageImportRequest, ManagedImage, ManagedVM, ManagementSession, Operation, Overview, PublicStatus, SystemStatus, TokenCreateResult, TokenPage, TokenRevokePreview, TokenScope } from "./types";
 import { optionalAuditReason } from "./validation";
 import { demoForcedOutcome, demoMutationError, emitDemoChange, getMockState, isDemoRuntime } from "../demo/runtime";
 
 const useRealApi = import.meta.env.VITE_MANAGEMENT_API === "real" && !isDemoRuntime();
+export const managementReturnPaths = ["/", "/vms", "/images", "/operations", "/system"] as const;
+const managementReturnPathSet = new Set<string>(managementReturnPaths);
 
 type RealRequestOptions = { contentType?: string | null };
 
@@ -25,10 +27,43 @@ export class ManagementRequestError extends Error {
   }
 }
 
+export function isManagementApiEnabled(): boolean {
+  return useRealApi;
+}
+
+export function normalizeManagementReturnPath(path: string | null | undefined): string {
+  return path && managementReturnPathSet.has(path) ? path : "/";
+}
+
+export function getManagementLoginHref(path?: string): string {
+  const returnTo = normalizeManagementReturnPath(path ?? (typeof window === "undefined" ? "/" : window.location.pathname));
+  return `/api/v1/auth/oidc/start?return_to=${encodeURIComponent(returnTo)}`;
+}
+
+export function subscribeManagementAuthFailures(listener: ManagementAuthFailureListener): () => void {
+  managementAuthFailureListeners.add(listener);
+  return () => managementAuthFailureListeners.delete(listener);
+}
+
+export function isManagementAuthFailure(error: unknown): error is ManagementRequestError {
+  return error instanceof ManagementRequestError && (error.code === "authentication_required" || error.code === "csrf_invalid");
+}
+
+export function clearManagementSession(error?: ManagementRequestError): void {
+  csrfToken = null;
+  csrfExpiresAt = 0;
+  managementSession = null;
+  managementRequestsEnabled = false;
+  if (error) managementAuthFailureListeners.forEach((listener) => listener(error));
+}
+
 let csrfToken: string | null = null;
 let csrfExpiresAt = 0;
 let managementSession: ManagementSession | null = null;
 let sessionPromise: Promise<ManagementSession> | null = null;
+let managementRequestsEnabled = true;
+type ManagementAuthFailureListener = (error: ManagementRequestError) => void;
+const managementAuthFailureListeners = new Set<ManagementAuthFailureListener>();
 const mockTokenCreates = new Map<string, { metadata: AgentToken; request: string }>();
 const mockTokenRevocations = new Map<string, { operation: Operation; request: string }>();
 const mockTokenRevocationPreviews = new Map<string, { tokenId: string; targetVersion: string; expiresAt: string }>();
@@ -81,6 +116,18 @@ function sessionIsFresh(): boolean {
   return Boolean(csrfToken && managementSession && Date.now() < csrfExpiresAt - 5_000);
 }
 
+function isValidManagementSession(value: unknown): value is ManagementSession {
+  if (!value || typeof value !== "object") return false;
+  const session = value as Partial<ManagementSession>;
+  return typeof session.issuer === "string" && session.issuer.length > 0
+    && typeof session.subject === "string" && session.subject.length > 0
+    && session.role === "administrator"
+    && Array.isArray(session.capabilities) && session.capabilities.every((capability) => typeof capability === "string")
+    && typeof session.csrf_token === "string" && session.csrf_token.length > 0
+    && typeof session.expires_at === "string" && Number.isFinite(Date.parse(session.expires_at))
+    && Date.parse(session.expires_at) > Date.now();
+}
+
 async function loadManagementSession(): Promise<ManagementSession> {
   if (sessionIsFresh() && managementSession) return managementSession;
   csrfToken = null;
@@ -88,11 +135,16 @@ async function loadManagementSession(): Promise<ManagementSession> {
   if (!sessionPromise) {
     sessionPromise = requestJSON<ManagementSession>("/session", undefined)
       .then((session) => {
-        if (!session.csrf_token) throw new Error("authentication_required");
+        if (!isValidManagementSession(session)) throw new ManagementRequestError("state_unavailable", "authentication", null, null, true);
         managementSession = session;
         csrfToken = session.csrf_token;
-        csrfExpiresAt = session.expires_at ? Date.parse(session.expires_at) : Date.now() + 14 * 60_000;
+        csrfExpiresAt = Date.parse(session.expires_at);
+        managementRequestsEnabled = true;
         return session;
+      })
+      .catch((error) => {
+        if (isManagementAuthFailure(error)) clearManagementSession(error);
+        throw error;
       })
       .finally(() => {
         sessionPromise = null;
@@ -111,6 +163,7 @@ async function ensureSession(): Promise<string> {
 async function realRequest<T>(path: string, init?: RequestInit, options: RealRequestOptions = {}): Promise<T> {
   const method = (init?.method ?? "GET").toUpperCase();
   if (path === "/session" && method === "GET") return loadManagementSession() as Promise<T>;
+  if (!managementRequestsEnabled) throw new ManagementRequestError("authentication_required", "authentication");
   const headers = new Headers(init?.headers);
   if (method !== "GET" && method !== "HEAD") headers.set("X-CSRF-Token", await ensureSession());
   else await ensureSession();
@@ -118,11 +171,7 @@ async function realRequest<T>(path: string, init?: RequestInit, options: RealReq
     const result = await requestJSON<T>(path, { ...init, headers }, options);
     return result;
   } catch (error) {
-    if (error instanceof ManagementRequestError && (error.code === "authentication_required" || error.code === "csrf_invalid")) {
-      csrfToken = null;
-      csrfExpiresAt = 0;
-      managementSession = null;
-    }
+    if (isManagementAuthFailure(error)) clearManagementSession(error);
     throw error;
   }
 }
@@ -152,6 +201,20 @@ export async function getManagementSession(): Promise<ManagementSession> {
 
 export async function getOverview(): Promise<Overview> {
   return useRealApi ? realRequest<Overview>("/overview") : delay(mockStateForRequest().overview);
+}
+
+export async function getPublicStatus(): Promise<PublicStatus> {
+  if (useRealApi) return requestJSON<PublicStatus>("/public/status", undefined, { contentType: null });
+  const overview = mockStateForRequest().overview;
+  const native = overview.sources.find((source) => source.name === "native");
+  const ready = overview.admission.ready === true && overview.admission.draining !== true;
+  return delay({
+    state: overview.admission.ready === null ? "unknown" : ready ? "available" : "degraded",
+    active_sessions: overview.task_counts.active,
+    observed_at: overview.observed_at,
+    observation_state: native?.state ?? "unverified",
+    stale_after_seconds: native?.stale_after_seconds ?? 60,
+  });
 }
 
 export async function listVMs(filters: { q?: string; state?: string; leaseState?: string; cursor?: string } = {}): Promise<{ items: ManagedVM[]; page: { limit: number; next_cursor: string | null } }> {
@@ -617,7 +680,7 @@ function byteDelta(previous: string | null, next: string | null): bigint | null 
   }
 }
 
-function adjustObservedBytes(observed: Overview["capacity"]["logical_memory_remaining"], delta: bigint, observedAt: string): Overview["capacity"]["logical_memory_remaining"] {
+function adjustObservedBytes(observed: Overview["capacity"]["logical_memory_remaining"], delta: bigint, observedAt: string | null): Overview["capacity"]["logical_memory_remaining"] {
   if (observed.state !== "available" || observed.value_bytes === null) return observed;
   try {
     const next = BigInt(observed.value_bytes) - delta;

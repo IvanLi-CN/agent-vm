@@ -14,6 +14,18 @@
 
 _Avoid_：用“发布成功”同时指代 GitHub 产物发布与现网部署；用源码 SHA、协议版本或数据库 schema 版本代替产品版本。
 
+## 失败通知
+
+**失败通知（Failure notification）**：由可信默认分支 sidecar 针对预期成功但结论为 failure 的交付工作流生成的 metadata-only 事件。它独立记录排查入口，不改变原 CI、产品发布或部署的结果。
+
+**通知通道选定（Notification transport selection）**：项目明确记录通知 transport、transport owner、configuration owner、所需权限和凭据边界的决策。它表示已经选择方案，不表示外部配置已经完成或真实发送已经验证。
+
+**持久交接（Durable handoff）**：通知事件已经被选定 transport 持久化接收并进入后续投递路径的状态；Oidrune 的 `202 Accepted` 只证明持久交接，不证明 Telegram 已送达。
+_Avoid_：把持久交接称为“通知已送达”或“发布已成功”。
+
+**通知启用（Notification enablement）**：通知通道已经完成选择、外部配置、来源 allowlist 和真实 smoke 验证，生产 sidecar 才被允许发送失败事件的状态。
+_Avoid_：把“已选择”或“CI 绿色”当成通知已启用。
+
 ## 部署控制
 
 **部署控制服务**：位于产品蓝绿槽位之外、代表维护者执行部署事务的控制面。
@@ -72,6 +84,16 @@ _Avoid_：把排空理解为立即停止进程或强制终止 guest。
 **maintenance cursor（维护游标）**：`meta` 中 additive 的 JSON 状态，分别保存 reconcile 与 age-GC lane 的下一次尝试时间、退避次数和 task keyset 游标。它只在该轮 durable work 提交后前移，旧数据库没有该 key 时按立即执行处理。
 
 _Avoid_：把受管镜像、VM 缓存与 Agent VM 产品发布包统称为“镜像”；把“释放租约”理解为保留访问权的普通关机。
+
+## 身份与入口
+
+**静态入口（Static entry）**：管理台提供的固定 HTML、JavaScript、CSS 和允许的页面深链接。静态入口可访问只证明产品资源可达，不证明浏览器已建立管理会话或获得任何管理权限。
+
+**管理会话（Browser management session）**：由 OIDC 登录成功后创建、由服务端校验并授予管理员 capability 的浏览器身份。它与 Agent Token、OIDC 一次性事务和受管 VM 会话相互独立。
+
+**认证门面（Authentication gate）**：管理台在加载受管数据前确认管理会话、呈现登录或失效状态并控制恢复的用户界面边界。它改善入口和状态表达，但不替代后端认证、授权或 CSRF 校验。
+
+**登录回跳（Login return path）**：OIDC 登录事务中保存的、经过服务端校验的同源管理台页面路径。它只用于登录成功后的界面导航，不改变身份、能力或 API 授权范围。
 
 ## 资源与初始化
 

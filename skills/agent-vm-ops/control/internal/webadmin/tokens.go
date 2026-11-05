@@ -161,6 +161,10 @@ func (server *UnifiedServer) createToken(writer http.ResponseWriter, request *ht
 		writeJSON(writer, http.StatusOK, map[string]any{"operation_id": payload.OperationID, "metadata": agentTokenValue(*value), "plaintext_disclosure": "consumed"})
 		return
 	}
+	if err := authorizeTokenScopes(scopes, principal.Capabilities); err != nil {
+		writeProblem(writer, newAPIError("permission_denied", err.Error(), http.StatusForbidden, "authorization", false, payload.OperationID))
+		return
+	}
 	if expiresAt, expiresValue, err = server.validateTokenExpiry(expiresValue); err != nil {
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
@@ -364,6 +368,22 @@ func normalizeTokenScopes(values []string) ([]string, error) {
 	}
 	sort.Strings(result)
 	return result, nil
+}
+
+func authorizeTokenScopes(scopes, capabilities []string) error {
+	required := map[string]string{
+		"agent:read":          "read",
+		"agent:operate":       "operate",
+		"agent:sync":          "operate",
+		"agent:observe_admin": "observe_admin",
+	}
+	for _, scope := range scopes {
+		capability, ok := required[scope]
+		if !ok || !containsString(capabilities, capability) {
+			return fmt.Errorf("requested Token scope %s exceeds the administrator capability", scope)
+		}
+	}
+	return nil
 }
 
 func parseTokenExpiry(raw string) (time.Time, string, error) {

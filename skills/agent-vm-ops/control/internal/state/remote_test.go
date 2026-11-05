@@ -349,11 +349,12 @@ func TestRemoteMigrationPreservesStateAndSerializesConcurrentOperations(t *testi
 	if err := first.InsertOIDCTransaction(ctx, OIDCTransaction{
 		TransactionID: "remote-transaction-" + runID, StateDigest: authStateDigest, NonceDigest: "remote-nonce-" + runID,
 		CodeVerifierSealed: "sealed", BindingCookieDigest: "remote-binding-" + runID, ClientID: "client", RedirectURI: "https://console.example/api/v1/auth/oidc/callback",
+		ReturnTo:  "/operations",
 		CreatedAt: "2026-10-29T00:00:00Z", ExpiresAt: "2099-10-29T00:00:00Z",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if transaction, err := second.GetOIDCTransaction(ctx, authStateDigest); err != nil || transaction == nil {
+	if transaction, err := second.GetOIDCTransaction(ctx, authStateDigest); err != nil || transaction == nil || transaction.ReturnTo != "/operations" {
 		t.Fatalf("remote OIDC transaction=%#v err=%v", transaction, err)
 	}
 	if _, consumed, err := second.ConsumeOIDCTransaction(ctx, authStateDigest, "2026-10-29T00:01:00Z"); err != nil || !consumed {

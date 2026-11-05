@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import "../app/i18n";
 import type { AgentToken, TokenPage } from "../app/types";
 
@@ -28,6 +28,10 @@ function renderTokenManagement(client = new QueryClient({ defaultOptions: { quer
 }
 
 describe("TokenManagement pagination", () => {
+  afterEach(() => {
+    window.sessionStorage.clear();
+  });
+
   it("moves through bounded token pages and returns to the first page", async () => {
     const user = userEvent.setup();
     const firstPage: TokenPage = { items: Array.from({ length: 25 }, (_, index) => token(`tok_page_01_${String(index).padStart(2, "0")}`)), page: { limit: 25, next_cursor: "mock-token:25" } };
