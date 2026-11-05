@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -25,6 +27,13 @@ from release_manifest import (  # noqa: E402
 
 
 class ProductManifestTests(unittest.TestCase):
+    def test_python_reader_accepts_typescript_state_capabilities(self) -> None:
+        result = subprocess.run(
+            ["bun", "-e", 'import { STATE_CAPABILITY_MARKERS } from "./skills/agent-vm-ops/scripts/release-manifest.ts"; console.log(JSON.stringify(STATE_CAPABILITY_MARKERS));'],
+            cwd=ROOT, check=True, capture_output=True, text=True,
+        )
+        self.assertEqual(list(STATE_CAPABILITY_MARKERS), json.loads(result.stdout))
+
     def test_format_3_client_manifest_is_python_consumable(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-vm-product-python-") as raw_root:
             root = Path(raw_root)

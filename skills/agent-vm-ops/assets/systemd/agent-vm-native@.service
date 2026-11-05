@@ -10,6 +10,7 @@ ConditionPathExists=/etc/agent-vm-native/slots/%i/config.json
 Type=simple
 ExecStart=/var/lib/agent-vm-native/slots/%i/bin/agent-vm-control serve --config /etc/agent-vm-native/slots/%i/config.json --manifest /var/lib/agent-vm-native/slots/%i/release-manifest.json
 Environment=HOME=/var/lib/agent-vm-native
+CPUWeight=100
 Restart=on-failure
 RestartSec=2s
 TimeoutStartSec=60s

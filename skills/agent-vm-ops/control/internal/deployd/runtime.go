@@ -624,10 +624,19 @@ func (runtime *HostRuntime) ensureSlotSocketLink(root, slot string) error {
 	if err := os.Symlink(runtime.socket(slot), link); err != nil {
 		return fmt.Errorf("create %s app.sock link: %w", slot, err)
 	}
+	// MkdirTemp uses 0700 even when the daemon's group is the proxy read group.
+	// The proxy must traverse the published slot to reach this socket link.
+	if err := os.Chmod(root, 0o750); err != nil {
+		return fmt.Errorf("prepare %s proxy socket traversal: %w", slot, err)
+	}
 	return nil
 }
 
 func (runtime *HostRuntime) verifySlotSocketLink(root, slot string) error {
+	info, err := os.Lstat(root)
+	if err != nil || !info.IsDir() || info.Mode().Perm() != 0o750 {
+		return fmt.Errorf("slot %s directory must allow only owner and proxy read-group traversal", slot)
+	}
 	target, err := os.Readlink(filepath.Join(root, "app.sock"))
 	if err != nil {
 		return fmt.Errorf("slot %s app.sock link is unavailable: %w", slot, err)

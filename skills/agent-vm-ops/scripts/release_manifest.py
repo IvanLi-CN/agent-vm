@@ -148,7 +148,7 @@ GO_UNIT_EXEC_START = {
 }
 GO_UNIT_CONTENT_SHA256 = {
     "agent-vm-native.service": "c7537077f0299c259e1f32eb4365db2da07fd2e8911dba0164364481e55396cc",
-    "agent-vm-native@.service": "1c5306d7643fcb0a5c8c570b8d95bf7fe8c1808eb8e7a9db03f753556aeb73e5",
+    "agent-vm-native@.service": "a014ff37ba6e96d5e7ef0cf2aa6c99b6bb66ebd61bad327afeb510cde02ab887",
     "agent-vm-deployd.service": "d82ab839539aff06507777f6f77dc8eba83ecabde9e86a3e285534588a5cdd79",
 }
 PRODUCT_UNIT_EXEC_START = {
@@ -166,6 +166,9 @@ HISTORICAL_PRODUCT_UNIT_EXEC_START = {
     "agent-vm-web.service": "ExecStart=/opt/agent-vm-native/bin/agent-vm-control web --config /etc/agent-vm-native/web.json",
 }
 HISTORICAL_GO_UNIT_CONTENT_SHA256 = {
+    "agent-vm-native@.service": (
+        "1c5306d7643fcb0a5c8c570b8d95bf7fe8c1808eb8e7a9db03f753556aeb73e5",
+    ),
     "agent-vm-native.service": (
         "b2a51821a26ce6b54f8cd7e1244896de27b08892ec239400b38ed36bfcad44d4",
         "834cd02f2afbc10d463d79375e8a1aa9d1e2e94157bfaed96476295744817cc6",
@@ -179,6 +182,7 @@ HISTORICAL_GO_UNIT_CONTENT_SHA256 = {
     ),
 }
 HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256 = {
+    "agent-vm-native@.service": HISTORICAL_GO_UNIT_CONTENT_SHA256["agent-vm-native@.service"],
     "agent-vm-native.service": HISTORICAL_GO_UNIT_CONTENT_SHA256["agent-vm-native.service"],
     "agent-vm-deployd.service": HISTORICAL_GO_UNIT_CONTENT_SHA256["agent-vm-deployd.service"],
     "agent-vm-web.service": (
@@ -213,6 +217,7 @@ STATE_CAPABILITY_MARKERS = (
     "legacy-agent-vm-core@1",
     "managed-image-catalog@1",
     "management-operation-audit@1",
+    "oidc-return-path@1",
     "principal-identity@1",
     "session-image-binding@1",
     "token-revocation@1",

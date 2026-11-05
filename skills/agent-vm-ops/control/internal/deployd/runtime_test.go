@@ -24,6 +24,28 @@ func TestSupportedBundleManifestFormats(t *testing.T) {
 	}
 }
 
+func TestSlotSocketLinkAllowsProxyTraversalAndRejectsPrivateStage(t *testing.T) {
+	root, err := os.MkdirTemp(t.TempDir(), "stage-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime := &HostRuntime{Config: Defaults()}
+	if err := runtime.ensureSlotSocketLink(root, "blue"); err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.verifySlotSocketLink(root, "blue"); err != nil {
+		t.Fatalf("proxy cannot traverse published slot: %v", err)
+	}
+	for _, mode := range []os.FileMode{0o700, 0o770, 0o755} {
+		if err := os.Chmod(root, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := runtime.verifySlotSocketLink(root, "blue"); err == nil {
+			t.Fatalf("unsafe or inaccessible slot mode %o accepted", mode)
+		}
+	}
+}
+
 func TestAdminMetricsValidationUsesTopLevelObservationEpoch(t *testing.T) {
 	result := map[string]any{
 		"up":                            true,

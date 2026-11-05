@@ -201,8 +201,8 @@ Console 管理 existing Agent session VMs、managed images、capacity、operatio
 该目标必须只使用 OIDC Authorization Code + PKCE 和 `code_challenge_method=S256`，并执行 exact issuer/subject identity、secure browser sessions、exact Origin validation 和 session-bound CSRF protection。
 目标 direct Agent API 是 `/agent/v1/control`，要求 opaque Bearer Token，绝不接受 browser Cookie。
 如果必需的 OIDC、Token、origin 或 resource-limit configuration 不完整，target listener 必须保持 disabled。
-[管理合同](contracts/management-api.md)、[Token API 合同](contracts/token-api.md)、[Agent API 合同](contracts/agent-api.md)和[OpenAPI 文档](contracts/management-api.yaml)定义目标 wire shapes 与 deployment inputs；
-当前实现证据仍限于已有 compatibility surfaces。
+[管理合同](contracts/management-api.md)、[Token API 合同](contracts/token-api.md)、[Agent API 合同](contracts/agent-api.md)和[OpenAPI 文档](contracts/management-api.yaml)定义当前 wire shapes 与 deployment inputs；
+当前检出包含统一 Web 服务、认证门面、公开状态入口、管理控制台组件、受控视觉证据和认证 E2E；真实部署与隔离环境验收仍由发布门禁决定。
 
 UI 支持 `zh-CN` 和 `en`。
 Saved preference 优先于 browser language；
@@ -222,36 +222,24 @@ Operation 和 audit APIs 保留 current administrator actor、没有 administrat
 Uncertain result 必须可 query，且不得使用新的 operation identity 自动 replay。
 
 Image import 仅限于 configured trusted sources 和有大小上限的 local Incus container packages。
-Integrity 与 Agent VM suitability 是两项独立检查。
-Selected default 必须 verified；
-但在 administrator 选择 verified replacement 前，原先已配置的 default 作为可见的 legacy-compatibility default 保留。
-Existing tasks 和 caches 保留其 pinned image fingerprint。
-Authority 串行化 default selection 与 reference changes；
-default 只影响 new sessions，任何 default、active、cached、releasing、pending-creation 或 verification reference 都阻止 deletion。
+Integrity 与 Agent VM suitabil…7831 tokens truncated…slots 的显式 snapshot estimates。
+Inventory view MUST 覆盖所有 managed task states，使用有界字段，删除 stale rows，并避免暴露 raw errors、credentials 和 deployment paths。
+缺失或为 `-1` 的 native slot limit MUST 保持缺失；
+derived slot estimate MUST NOT 标记为 authoritative slot limit。
 
-目标中的首次 management state migration 必须由槽位外 Deployd 自动执行，并且是 additive 且 transactional。
-它保留 tasks、generations、leases、ports、reservations 和 protocol-4 journals。
-SQLite 在 drain 完成且 verified one-time import 使 rqlite 成为 shared authority 之前，继续作为 single writer；
-禁止 dual writes、shared SQLite file access 和 database downgrade。
-Critical reads 使用 linearizable consistency，cross-row changes 使用一个 rqlite transaction。
-[Management contract](contracts/management-api.md)、[state migration ADR](../../adr/0044-agent-vm-state-migration-to-rqlite.md)和[release contract](contracts/release.md)定义 state-capability markers、legacy-default seeding、Deployd 的 `migrate` API、发布器一键激活和 full-package rollback rules。
-当前 checkout 已实现该迁移控制面；
-真实部署是否已执行，仍必须由 Agent VM 验收证据证明。
+`agent-vm-deployd` 的 `/metrics` endpoint MUST 将 `admin-metrics` 和 `admin-status` 调度为独立的 observation lanes。
+Pending 或 failed inventory read MUST NOT 移除最新有效的 capacity metric families；
+pending 或 failed capacity read MUST NOT 保留失败 inventory scrape 中的 task rows。
+Retained source snapshot MUST 保留其原始 observation timestamp，并暴露 source-specific health 或 freshness failure；
+deployd MUST NOT 使用伪造的 zeroes 替换 unavailable values。
+Prometheus MUST 只抓取 deployd 的 `/metrics` endpoint，并使用 `job="agent-vm-deployd"`；
+槽位级 metric series MUST 带 `slot` label，以支持切换期间两个槽位同时存活。
+蓝色和绿色槽位 MUST 使用各自独立的 snapshot 目录；
+共享 snapshot 目录 MUST NOT 用于蓝绿运行。
+`admin-status` MUST use keyset pagination with a default page size of 25 and a maximum of 100, probe no more than 8 tasks concurrently, bound each task probe to 1 second and the page to 5 seconds, and expose `partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out` without treating unknown native state as healthy。
 
-Remote control-script 和 unit publication MUST 使用 configured control SSH entry、operator-only identity 或 narrowly scoped root-owned deployment wrapper、private staging area 和 atomic activation。
-MUST NOT 增加 sshd、HTTP gateway、PVE path 或 Agent VM guest permission。
-Remote publication 必须先 activation 并 verify，再更新 local client；
-仅更新 local client 时不要求 drain。
-
-Remote publication MUST 在 activation 前进入 admission drain，阻止 new acquisition 和 restart admission，保持 expiry/reconciliation/cache-cleanup timers 可用，并允许 in-flight requests 完成而不强制终止。
-它 MUST 等待 pending operations 和 task transitions 收敛，验证 health、reconciliation 和 timer state，并且只有通过 active release transaction 的 release-scoped session 成功验证后才能 exit drain；
-browser maintenance request MUST NOT reopen admission。
-第一个 management-aware release MUST 能够接管 previous protocol-4 controller 留下的 ownerless drain，但不同 release 或 browser request MUST NOT 替换 active release owner。
-尚未越过 native-effect barrier 的 queued management work 可以 retry，并且 drain active 时 MUST 由 durable fence 阻止其启动。
-Pre-activation failure 保持 current release 不变。
-Post-activation health failure 允许向上一个 verified release 执行一次有界 rollback；
-rollback 失败时保持 admission drain，且 MUST NOT 改写 state、generations 或 uncertain operations。
-至少 MUST 保留 current 和 previous verified releases，以及它们的 manifests 和 checksums。
+这些规则的固定合同名称是 independent observation lanes、pending or failed inventory read、latest valid capacity metric families、retained source snapshot 和 original observation timestamp；
+它们对应上面的中文语义，不是额外的英文操作说明。
 
 ## Requirements
 
@@ -348,6 +336,7 @@ Prometheus MUST 只抓取 deployd 的 `/metrics` endpoint，并使用 `job="agen
 这些规则的固定合同名称是 independent observation lanes、pending or failed inventory read、latest valid capacity metric families、retained source snapshot 和 original observation timestamp；
 它们对应上面的中文语义，不是额外的英文操作说明。
 
+
 ### REQ-AGENT-VM-020 - 认证管理边界
 
 每个蓝绿槽位 MUST 运行一个 Go/Gin Agent VM 服务，提供固定静态 Web 资源、OIDC 回调、同源管理 API 和 `/agent/v1/control`；
@@ -403,6 +392,7 @@ Protocol 4 和 existing CLI request/response behavior MUST 保持不变。
 ### REQ-AGENT-VM-025 - OIDC principal 与 browser session identity
 
 Browser login MUST 只使用 OIDC Authorization Code + PKCE 和 `code_challenge_method=S256`，并使用 one-time `state`、`nonce`、protected code verifier、exact redirect URI、短时 browser-bound login cookie 和 bounded expiry。
+每个新事务 MUST 使用独立的 browser binding cookie；兼容窗口内回退读取 legacy aggregate binding cookie 时，只能移除已消费的 binding，必须保留同一浏览器中其他仍在途的事务。
 Service MUST 在创建 session 前验证 configured discovery issuer、exact ID Token `iss`、`aud`/`azp`、signature/JWKS、`exp`、`iat` policy、authorization-code exchange 和 nonce。
 Service 与 proxy access logs MUST 删除 callback query strings 和 `Referer`；
 application logs MUST NOT 保留 OIDC code、state、nonce 或 verifier values。
@@ -435,6 +425,7 @@ Sensitive actions MUST 要求 explicit capability、impact preview，以及绑�
 optional non-empty bounded reason 在提供时写入 audit，但不是必需项。
 Unified service MUST 在 native effects 前重新检查 authorization 和 state。
 Accepted、rejected、succeeded、failed 和 outcome-unknown attempts MUST 可审计，并保留 current issuer/subject actor、没有 administrator authority 的 typed `unauthenticated` 或 `unauthorized` rejected-request actor，或明确的 unknown historical actor，以及 optional reason、operation ID、target、phase、result 和 safe error code；
+rejected request 的 operation ID MUST 同时出现在 structured error 和对应 audit record 中；历史上缺少 operation ID 的 audit record MUST 使用稳定、可复现的兼容标识，而不是每次读取生成新的值。
 不得包含 Token values、OIDC codes、credentials、raw command output 或 private paths。
 Historical task 和 native records MUST 根据 durable task identity、generation、lease、journal 和 native identity reconcile；
 不允许 user mapping 或 first-login claim。
@@ -529,7 +520,32 @@ Uncertain commit 保留 source marker 和 precise recovery record，并返回 ex
 [CLI 合同](contracts/cli.md#source-synchronization-transaction)定义 execution bounds、ownership 和 recovery。
 Export 直接向 caller stream tar archive，不创建 server-side archive。
 
-## Verification
+## 验证
+
+- `VER-AGENT-VM-010` 覆盖：`REQ-AGENT-VM-010` 通过[操作运行手册](OPERATIONS.md)的 topology/provenance 章节、已接受的[拓扑与恢复 ADR](../../adr/0028-agent-vm-topology-recovery-boundary.md)和 `bin/test_agent_vm_documentation.py`。
+- `VER-AGENT-VM-011` 覆盖：`REQ-AGENT-VM-011` 通过[操作运行手册](OPERATIONS.md)的恢复流程、现有 native reconciliation 与 operation-journal behavior test，以及 `bin/test_agent_vm_documentation.py`。
+- `VER-AGENT-VM-012` 覆盖：`REQ-AGENT-VM-012` 通过[操作运行手册](OPERATIONS.md)的 sparse-disk 和 failure-domain 章节、现有 capacity/reclamation test，以及 `bin/test_agent_vm_documentation.py`。
+- `VER-AGENT-VM-013` 覆盖：`REQ-AGENT-VM-013` 通过[观测合同](contracts/observability.md)、[容量与故障 dashboard 方案](../../solutions/agent-vm/observability-dashboard.md)和 `bin/test_agent_vm_documentation.py`。
+- `VER-AGENT-VM-014` 覆盖：`REQ-AGENT-VM-014` 通过[控制面更新 ADR](../../adr/0030-agent-vm-control-plane-update-boundary.md)、[CLI 合同](contracts/cli.md)、[部署边界](../../../skills/agent-vm-ops/references/deployment.md)和公共边界检查。
+- `VER-AGENT-VM-015` 覆盖：`REQ-AGENT-VM-015` 通过[CLI 合同](contracts/cli.md)的兼容性章节、[发布合同](contracts/release.md)、[部署边界](../../../skills/agent-vm-ops/references/deployment.md)中的 release-manifest 规则，以及对支持和拒绝 operation 的兼容行为测试。
+- `VER-AGENT-VM-016` 覆盖：`REQ-AGENT-VM-016` 通过[发布合同](contracts/release.md)、[操作运行手册](OPERATIONS.md)的 publication transaction 和 recovery 章节、[控制面更新 ADR](../../adr/0030-agent-vm-control-plane-update-boundary.md)，以及 staged activation、drain、rollback、immutable published-release verification 和 failure-state behavior test。
+- `VER-AGENT-VM-017` 覆盖：`REQ-AGENT-VM-017` 通过[发布合同](contracts/release.md)、[部署边界](../../../skills/agent-vm-ops/references/deployment.md)、[agent-vm-ops Skill](../../../skills/agent-vm-ops/SKILL.md)、公共边界检查和 release manifest permission test。
+- `VER-AGENT-VM-018` 覆盖：`REQ-AGENT-VM-018` 通过[操作运行手册](OPERATIONS.md)的 CPU startup-pressure 章节、[CLI 合同](contracts/cli.md)、[观测合同](contracts/observability.md)和确定性的 CPU pressure admission test。
+- `VER-AGENT-VM-019` 覆盖：`REQ-AGENT-VM-019` 通过[观测合同](contracts/observability.md)的 capacity 和 inventory 章节、[容量与 inventory 观测 ADR](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)、[dashboard 方案](../../solutions/agent-vm/observability-dashboard.md)和公共 dashboard validator。
+- `VER-AGENT-VM-020` 覆盖：`REQ-AGENT-VM-020` 通过[管理合同](contracts/management-api.md)、[统一服务安全 ADR](../../adr/0043-agent-vm-unified-service-security-boundary.md)、fixed-route、static-entry/API separation、service-boundary、configuration check，以及当前统一服务的浏览器/API boundary tests。
+- `VER-AGENT-VM-021` 覆盖：`REQ-AGENT-VM-021` 通过[OpenAPI 合同](contracts/management-api.yaml)、其共享示例、已同步实现状态的[PRODUCT.md](../../../PRODUCT.md)、[统一服务安全 ADR](../../adr/0043-agent-vm-unified-service-security-boundary.md)、[DESIGN.md](../../../DESIGN.md)，以及 `bun run typecheck`、`bun run test:web` 和 `bun run test:e2e:auth` 对未认证、登录失败、已认证和 session 过期 UI state 的双语/API 合同检查。
+- `VER-AGENT-VM-022` 覆盖：`REQ-AGENT-VM-022` 通过[管理合同](contracts/management-api.md)、OpenAPI operation/error schema、operation recovery、audit check，以及当前 OIDC、管理员 capability 和机器 Token behavior tests。
+- `VER-AGENT-VM-023` 覆盖：`REQ-AGENT-VM-023` 通过[管理合同](contracts/management-api.md)、[session-pinned image ADR](../../adr/0041-agent-vm-session-pinned-image-identity.md)、CLI 合同和 image-reference concurrency check。
+- `VER-AGENT-VM-024` 覆盖：`REQ-AGENT-VM-024` 通过[管理合同](contracts/management-api.md)、[发布合同](contracts/release.md)、[CLI 合同](contracts/cli.md)，以及 migration 和 package-compatibility check。
+- `VER-AGENT-VM-025` 覆盖：`REQ-AGENT-VM-025` 通过[管理合同](contracts/management-api.md)的 OIDC 与 principal 章节、[统一服务安全 ADR](../../adr/0043-agent-vm-unified-service-security-boundary.md)，以及 webadmin OIDC/session tests、state OIDC transaction tests 和 `bun run test:e2e:auth` 对 `return_to` allowlist、一次性 companion state、安全失败回跳、browser binding、session establishment、layout-effect-bound live-session suspension race 和 SPA session-loss recovery 的验证。
+- `VER-AGENT-VM-026` 覆盖：`REQ-AGENT-VM-026` 通过[Token API 合同](contracts/token-api.md)、[Agent API 合同](contracts/agent-api.md)、OpenAPI Token path、Agent API boundary checks 和 protocol-4 request tests。
+- `VER-AGENT-VM-027` 覆盖：`REQ-AGENT-VM-027` 通过[管理合同](contracts/management-api.md)的敏感操作与审计章节、OpenAPI confirmation/error schema、administrator authorization tests、audit tests 和 operation recovery checks。
+- `VER-AGENT-VM-028` 覆盖：`REQ-AGENT-VM-028` 通过[状态迁移 ADR](../../adr/0044-agent-vm-state-migration-to-rqlite.md)、[管理合同](contracts/management-api.md)与[发布合同](contracts/release.md)的迁移章节，以及 `go test -race ./internal/state` 对 companion-table ordering、local/remote schema bootstrap、并发 consume、重启恢复和既有 operation ID 语义的验证。其余发布阶段门禁仍按发布合同执行。
+- `VER-AGENT-VM-029` 覆盖：`REQ-AGENT-VM-029` 通过[系统架构](../../architecture/system.md)的蓝绿章节、[发布合同](contracts/release.md)，以及 active-link、compatibility-window 和 rollback check。该项属于计划目标验证，在目标面和测试存在前保持 pending。
+
+- `VER-AGENT-VM-030` 覆盖：`REQ-AGENT-VM-030` 通过[Web Demo 决策备忘录](../../proposals/agent-vm-web-demo.md)、[Web Demo Inspector UX/UI 合同](contracts/web-demo-inspector.md)、Demo runtime/API isolation test、页面级 browser suite、static build 和现有 management API boundary check。
+- `VER-AGENT-VM-031` 覆盖：`REQ-AGENT-VM-031` 通过[部署控制器合同](contracts/deployment-controller.md)、[发布合同中的部署控制器章节](contracts/release.md#deployment-controller-boundary)、[部署观测合同](contracts/observability.md#deployment-control-observation)、[蓝绿部署资源](../../deployment/blue-green.md)以及隔离的 Go/systemd/双槽位事务和恢复检查。
+
 
 验证映射的机器可读形式使用 ASCII 冒号，以保持仓库检查工具兼容：
 
@@ -555,44 +571,6 @@ Export 直接向 caller stream tar archive，不创建 server-side archive。
 - `VER-AGENT-VM-029` 覆盖: `REQ-AGENT-VM-029`
 - `VER-AGENT-VM-030` 覆盖: `REQ-AGENT-VM-030`
 - `VER-AGENT-VM-031` covers: `REQ-AGENT-VM-031`
-
-- `VER-AGENT-VM-010` 覆盖：`REQ-AGENT-VM-010`，依据[运维手册](OPERATIONS.md)的 topology/provenance sections、已接受的[拓扑与恢复 ADR](../../adr/0028-agent-vm-topology-recovery-boundary.md)以及 `bin/test_agent_vm_documentation.py`。
-- `VER-AGENT-VM-011` 覆盖：`REQ-AGENT-VM-011`，依据[运维手册](OPERATIONS.md)中的 recovery procedure、现有 native reconciliation 和 operation-journal behavior tests，以及 `bin/test_agent_vm_documentation.py`。
-- `VER-AGENT-VM-012` 覆盖：`REQ-AGENT-VM-012`，依据[运维手册](OPERATIONS.md)中的 sparse-disk 和 failure-domain sections、现有 capacity/reclamation tests，以及 `bin/test_agent_vm_documentation.py`。
-- `VER-AGENT-VM-013` 覆盖：`REQ-AGENT-VM-013`，依据[观测合同](contracts/observability.md)、[容量与故障 dashboard 方案](../../solutions/agent-vm/observability-dashboard.md)以及 `bin/test_agent_vm_documentation.py`。
-- `VER-AGENT-VM-014` 覆盖：`REQ-AGENT-VM-014`，依据[控制面更新 ADR](../../adr/0030-agent-vm-control-plane-update-boundary.md)、[CLI 合同](contracts/cli.md)、[部署边界](../../../skills/agent-vm-ops/references/deployment.md)以及 public boundary checks。
-- `VER-AGENT-VM-015` 覆盖：`REQ-AGENT-VM-015`，依据[CLI 合同](contracts/cli.md)的 compatibility section、[发布合同](contracts/release.md)、[部署边界](../../../skills/agent-vm-ops/references/deployment.md)中的 release-manifest rules，以及针对 supported/rejected operations 的 compatibility behavior tests。
-- `VER-AGENT-VM-016` 覆盖：`REQ-AGENT-VM-016`，依据[发布合同](contracts/release.md)、[运维手册](OPERATIONS.md)中的 publication transaction 和 recovery sections、[控制面更新 ADR](../../adr/0030-agent-vm-control-plane-update-boundary.md)，以及 staged activation、drain、rollback 和 failure-state behavior tests。
-- `VER-AGENT-VM-017` 覆盖：`REQ-AGENT-VM-017`，依据[发布合同](contracts/release.md)、[部署边界](../../../skills/agent-vm-ops/references/deployment.md)、[agent-vm-ops Skill](../../../skills/agent-vm-ops/SKILL.md)、public boundary checks 以及 release manifest permission tests。
-- `VER-AGENT-VM-018` 覆盖：`REQ-AGENT-VM-018`，依据[运维手册](OPERATIONS.md)中的 CPU startup-pressure section、[CLI 合同](contracts/cli.md)、[观测合同](contracts/observability.md)以及 deterministic CPU pressure admission tests。
-- `VER-AGENT-VM-019` 覆盖：`REQ-AGENT-VM-019`，依据[观测合同](contracts/observability.md)中的 capacity 和 inventory sections、[容量与清单观测 ADR](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)、[dashboard 方案](../../solutions/agent-vm/observability-dashboard.md)以及 public dashboard validator。
-- `VER-AGENT-VM-020` 覆盖：`REQ-AGENT-VM-020`，依据[管理合同](contracts/management-api.md)、[统一服务安全 ADR](../../adr/0043-agent-vm-unified-service-security-boundary.md)以及 fixed-route、service-boundary 和 configuration checks。
-  现有 checks 只覆盖 legacy Forward Auth/management UDS boundary；
-  target OIDC/unified-service behavior 仍属于 planned validation。
-- `VER-AGENT-VM-021` 覆盖：`REQ-AGENT-VM-021`，依据[OpenAPI 合同](contracts/management-api.yaml)、shared examples、[PRODUCT.md](../../../PRODUCT.md)、[DESIGN.md](../../../DESIGN.md)以及 bilingual/API contract checks。
-- `VER-AGENT-VM-022` 覆盖：`REQ-AGENT-VM-022`，依据[管理合同](contracts/management-api.md)、OpenAPI operation/error schemas 以及 operation recovery 和 audit checks。
-  现有 checks 只覆盖 legacy management behavior；
-  target OIDC、administrator capability 和 machine-Token behavior 仍属于 planned validation。
-- `VER-AGENT-VM-023` 覆盖：`REQ-AGENT-VM-023`，依据[管理合同](contracts/management-api.md)、[session-pinned image ADR](../../adr/0041-agent-vm-session-pinned-image-identity.md)、CLI contract 和 image-reference concurrency checks。
-- `VER-AGENT-VM-024` 覆盖：`REQ-AGENT-VM-024`，依据[管理合同](contracts/management-api.md)、[发布合同](contracts/release.md)、[CLI 合同](contracts/cli.md)以及 migration 和 package-compatibility checks。
-- 以下条目属于 planned target validation，不是 current implementation evidence；
-  在对应 target surfaces 和 tests 存在前保持 pending。
-- `VER-AGENT-VM-025` 覆盖：`REQ-AGENT-VM-025`，依据[管理合同](contracts/management-api.md)的 OIDC 和 principal sections、[统一服务安全 ADR](../../adr/0043-agent-vm-unified-service-security-boundary.md)以及 callback/session validation checks。
-  该项属于 planned target validation，在 target surface 和 tests 存在前保持 pending。
-- `VER-AGENT-VM-026` 覆盖：`REQ-AGENT-VM-026`，依据[Token API 合同](contracts/token-api.md)、[Agent API 合同](contracts/agent-api.md)、OpenAPI Token paths 和 legacy protocol-4 request tests。
-  该项属于 planned target validation，在 target surface 和 tests 存在前保持 pending。
-- `VER-AGENT-VM-027` 覆盖：`REQ-AGENT-VM-027`，依据[管理合同](contracts/management-api.md)的 sensitive-action 和 audit sections、OpenAPI confirmation/error schemas 以及 administrator authorization 和 audit checks。
-  该项属于 planned target validation，在 target surface 和 tests 存在前保持 pending。
-- `VER-AGENT-VM-028` 覆盖：`REQ-AGENT-VM-028`，依据本 SPEC 的状态迁移与恢复合同、[管理合同](contracts/management-api.md)、[发布合同](contracts/release.md)中的 migration sections，以及 transaction/concurrency/recovery checks；[state migration ADR](../../adr/0044-agent-vm-state-migration-to-rqlite.md)只提供决策背景。
-  该项属于 planned target validation，在 target surface 和 tests 存在前保持 pending。
-- `VER-AGENT-VM-029` 覆盖：`REQ-AGENT-VM-029`，依据[system architecture](../../architecture/system.md)的 blue-green sections、[发布合同](contracts/release.md)以及 active-link、compatibility-window 和 rollback checks。
-  该项属于 planned target validation，在 target surface 和 tests 存在前保持 pending。
-
-- `VER-AGENT-VM-030` 覆盖：`REQ-AGENT-VM-030`，依据[Web Demo decision memo](../../proposals/agent-vm-web-demo.md)、[Web Demo Inspector UX/UI 合同](contracts/web-demo-inspector.md)、Demo runtime/API isolation tests、page-level browser suite、static build 以及现有 management API boundary checks。
-- `VER-AGENT-VM-031` 覆盖: `REQ-AGENT-VM-031`：验证本 SPEC 的部署控制器边界、[部署控制器合同](contracts/deployment-controller.md)、[发布合同中的部署控制器章节](contracts/release.md#deployment-controller-boundary)、[部署观测合同](contracts/observability.md#deployment-control-observation)、[蓝绿部署资源](../../deployment/blue-green.md)，以及隔离的 Go/systemd/双槽位事务和恢复检查；[部署控制器 ADR](../../adr/0045-agent-vm-deployment-controller.md)只提供决策背景。
-  当前实现证据包括 `agent-vm-deployd`/`agent-vm-deploy`、controller lease fencing、独立部署 SQLite、双槽位事务/恢复测试、Prometheus exposition 测试、发布清单测试和 Agent VM 隔离验收脚本；
-  真实部署地址、证书、配置和长期 Prometheus/Grafana 实例仍属于部署方验证。
-
 ## 视觉证据
 
 管理台 Web 界面已通过本地 `ui_demo` source 取得 visual evidence。
@@ -603,35 +581,38 @@ Pending-preview capture 延迟 mock response，以展示 recovery controls。
 Mobile captures 使用 `393x852` CSS-pixel viewport；
 desktop capture 展示完整的 rendered page surface。
 
-- [Desktop System page](assets/agent-vm-web-system-desktop.png)
-- [Mobile System page](assets/agent-vm-web-system-mobile-list.png)
-- [Mobile revocation preview dialog](assets/agent-vm-web-system-mobile-revoke-dialog.png)
-- [Mobile pending revocation preview](assets/agent-vm-web-system-mobile-preview-pending.png)
-- [Mobile confirmation reason limit](assets/agent-vm-web-system-mobile-dialog-reason-limit.png)
-- [Mobile Token creation reason limit](assets/agent-vm-web-system-mobile-create-reason-limit.png)
-- [Mobile image import reason limit](assets/agent-vm-web-images-mobile-import-reason-limit.png)
+- [桌面 System 页面](assets/agent-vm-web-system-desktop.png)
+- [移动端 System 页面](assets/agent-vm-web-system-mobile-list.png)
+- [移动端撤销预览对话框](assets/agent-vm-web-system-mobile-revoke-dialog.png)
+- [移动端 pending 撤销预览](assets/agent-vm-web-system-mobile-preview-pending.png)
+- [移动端确认 reason limit](assets/agent-vm-web-system-mobile-dialog-reason-limit.png)
+- [移动端 Token 创建 reason limit](assets/agent-vm-web-system-mobile-create-reason-limit.png)
+- [移动端镜像导入 reason limit](assets/agent-vm-web-images-mobile-import-reason-limit.png)
+- [桌面端公开主页](assets/agent-vm-public-home-desktop.png)
+- [移动端公开主页](assets/agent-vm-public-home-mobile.png)
+- [桌面端 session loss 独立认证错误页](assets/agent-vm-auth-expired-desktop.png)
+- [移动端 session loss 独立认证错误页](assets/agent-vm-auth-expired-mobile.png)
 
+
+- [Web Demo 容量场景，桌面端](assets/web-demo-capacity-desktop.png)
+- [Web Demo 空场景，移动端 393×852 CSS px](assets/web-demo-empty-mobile.png)
+- [带面板级拖动手柄的 Web Demo 浮动 Inspector](assets/web-demo-inspector-panel-handle.png)
+
+这里的 owner confirmation 只适用于此处展示的渲染 UI，不代表端到端 backend integration 或 deployment readiness。
 Owner confirmation 仅适用于此处展示的 rendered UI，不表示 end-to-end backend integration 或 deployment readiness 已得到确认。
-
 ## Related ADRs
 
 - [Agent VM 拓扑与恢复边界](../../adr/0028-agent-vm-topology-recovery-boundary.md)
-- [Agent VM 仅内存预留准入](../../adr/0029-agent-vm-memory-reservation-only-admission.md)
+- [Agent VM 仅按内存 reservation admission](../../adr/0029-agent-vm-memory-reservation-only-admission.md)
 - [Agent VM 控制面更新边界](../../adr/0030-agent-vm-control-plane-update-boundary.md)
 - [Agent VM overcommit 的 CPU 启动压力](../../adr/0032-agent-vm-cpu-startup-pressure-for-overcommit.md)
-- [Agent VM 容量与清单观测](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)
+- [Agent VM 容量与 inventory 观测](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)
 - [Agent VM Go 常驻控制运行时](../../adr/0037-agent-vm-go-control-runtime.md)
-- [Native Incus Agent 容器生命周期](../../adr/0038-native-incus-agent-container-lifecycle.md)
-- [Agent VM session 固定镜像身份](../../adr/0041-agent-vm-session-pinned-image-identity.md)
+- [原生 Incus Agent 容器生命周期](../../adr/0038-native-incus-agent-container-lifecycle.md)
+- [Agent VM session-pinned image identity](../../adr/0041-agent-vm-session-pinned-image-identity.md)
 - [Agent VM 统一服务安全边界](../../adr/0043-agent-vm-unified-service-security-boundary.md)
 - [Agent VM SQLite 到 rqlite 状态迁移](../../adr/0044-agent-vm-state-migration-to-rqlite.md)
-- [Agent VM 部署控制器](../../adr/0045-agent-vm-deployment-controller.md)
-
-## 视觉证据补充
-
-- [Web Demo 容量场景，桌面](assets/web-demo-capacity-desktop.png)
-- [Web Demo 空状态场景，移动端 393×852 CSS px](assets/web-demo-empty-mobile.png)
-- [Web Demo 浮动 Inspector 与面板级拖动手柄](assets/web-demo-inspector-panel-handle.png)
+- [Deployd 与蓝绿事务](../../adr/0045-agent-vm-deployment-controller.md)
 
 ## 相关材料
 
