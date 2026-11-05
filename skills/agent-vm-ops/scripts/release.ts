@@ -7,7 +7,6 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join, resolve } from "node:path";
 
 import { policyRevision, resolveReleaseTarget, parseSemVer } from "./semver.ts";
-import { auditRepository } from "./platform-audit.ts";
 import {
   GhGithubAdapter,
   GithubReleaseStateStore,
@@ -87,10 +86,6 @@ export function assertPlatformPreconditions(root = repositoryRoot): void {
   if (process.env.GITHUB_ACTIONS === "true") {
     assertWorkflowPlatformAttestation(process.env.GITHUB_REF, process.env.RELEASE_REF_PROTECTED);
   }
-  const repository = process.env.GITHUB_REPOSITORY;
-  if (!repository) throw new Error("GITHUB_REPOSITORY is required for the live platform preflight");
-  const audit = auditRepository(repository);
-  if (audit.status !== "aligned") throw new Error(`live platform audit is ${audit.status}: ${audit.reasons.join("; ")}`);
 }
 
 export function successfulMainGate(value: unknown): { id: string } {

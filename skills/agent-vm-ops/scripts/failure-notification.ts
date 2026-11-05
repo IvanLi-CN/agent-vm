@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-/** Build privacy-safe failure context and stop at the transport selection gate. */
+/** Build and validate the privacy-safe failure context for the selected delivery. */
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -135,10 +135,8 @@ try {
   if (Array.isArray(inventory.ref_prefixes) && !inventory.ref_prefixes.some((prefix: unknown) => typeof prefix === "string" && context.ref.startsWith(prefix))) throw new Error(`failure ref is not allowed for ${context.workflow}`);
   if (process.env.GITHUB_REPOSITORY && context.repository !== process.env.GITHUB_REPOSITORY) throw new Error("failure repository does not match the trusted workflow repository");
   if (workflowClass !== (option("--class") ?? "generic")) throw new Error(`workflow class is not declared for ${context.workflow}`);
-  const payload = { schema_version: 1, delivery: "blocked", reason: contract.transport_selection?.status === "unselected" ? "transport_unselected" : "transport_not_ready", context };
-  console.log(JSON.stringify(payload));
-  if (contract.transport_selection?.status !== "selected") process.exitCode = 78;
-  else throw new Error("selected notification transport has no delivery adapter in this repository");
+  if (contract.transport_selection?.status !== "selected") throw new Error("notification transport is not selected");
+  console.log(JSON.stringify({ schema_version: 1, delivery: "prepared", context }));
 } catch (error) {
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;

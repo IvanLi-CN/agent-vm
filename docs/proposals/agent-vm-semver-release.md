@@ -41,7 +41,7 @@ flowchart LR
 `Release` 使用独立的 identity-aware sidecar，只处理经核验的同仓库 Release failure；普通 CI/main 失败仍走项目级 generic 路由。
 发布占用已存在时，通知才可补充经记录验证的版本、tag、source、reservation、已绑定产物与恢复入口；占用前失败不得伪造这些字段。
 通知结果独立记录，按原 run ID 与 attempt 重试，不改变发布状态或重新构建产物。
-transport selection gate 是启用前置条件；缺少选择证据时不得启用通知或整套新发布系统，具体缺口保留在实现状态中。
+transport selection gate 是启用前置条件；本项目已通过 [ADR 0046](../adr/0046-agent-vm-failure-notification-transport.md) 选择 Oidrune GitHub OIDC Relay，但 gateway 配置、来源 allowlist 和真实 smoke 完成前不得启用通知或整套新发布系统，具体缺口保留在实现状态中。
 
 ## 产品版本与源码来源
 

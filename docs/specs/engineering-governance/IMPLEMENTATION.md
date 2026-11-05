@@ -4,7 +4,7 @@
 
 ## Current Status
 
-- Implementation：仓库侧治理候选已实施；平台保护、通知 transport 和正式发版仍未启用。
+- Implementation：仓库侧治理候选已实施；平台保护、通知 transport 和正式发版仍未启用。失败通知 transport 的项目决策已由 [ADR 0046](../../adr/0046-agent-vm-failure-notification-transport.md) 接受，但外部配置、真实 smoke 和生产启用仍未完成。
 - Lifecycle：active。
 - Catalog note：五项 Topic 的项目合同、执行工具和验证入口已进入当前候选；其中 Style Playbook 提供的三个可安装 Policy 已锁定，另外两个 Topic 由仓库合同承载；本 PR 不合并 main、不创建正式 tag/Release、不部署现网。
 
@@ -19,7 +19,7 @@
 - `0.4.0-native` 没有正式发布记录，不是产品版本基线；新生产构建器要求 SemVer，首版只能是 `1.0.0`。
 - format 3 将产品 `version` 与源码 `source_revision` 分开，并显式携带同一 SHA 的 `release_id` 供部署边界和协议兼容复用；旧格式 1/2 只读。
 - 新增统一产品包构建、format 3 跨语言校验、GitHub `release-state/<stage>/<version>` 只创建 ref、append-only reservation/recovery 协调器和 `gh` adapter；平台保护与 immutable Release 仍是启用前置条件。
-- 现有 webhook 不被当作通知 transport；项目合同明确 transport `unselected`，失败 sidecar 在 selection gate 阶段 fail-closed。
+- 现有 webhook 不被当作通知 transport；项目 ADR 已选择 Oidrune，但当前仓库合同仍明确 transport `unselected`，失败 sidecar 在 selection gate 阶段 fail-closed，直到实现与外部配置完成。
 - GitHub Release immutability、main ruleset、required checks、签名提交和真实通知配置没有在本 PR 修改；`platform-audit.ts` 只读报告当前 `unavailable/blocked` 差距，合同状态保留为 `audit-required`。
 - 三个可安装 Policy package 与 `skills-lock.json` 已安装并锁定，quality-gates 本地审计通过；Style Playbook 仓库没有 `manual-version-release-delivery` 或 `github-actions-scheduling` 安装包，因此二者不伪造 lock 记录，分别由发布合同和 Actions workflow 合同承载，映射见 `.github/topic-contract.json`。
 
@@ -36,7 +36,7 @@
 | REQ-ENG-009 | 精确 PR 事件、merge queue 事件、独立 namespace、`cancel-in-progress: false` 和合同测试。 | 真实 required queue/run history 对齐。 |
 | REQ-ENG-010 至 REQ-ENG-014 | SemVer resolver、固定源码 preflight、format 3 builder、append-only state、恢复入口。 | 真实 GitHub Release immutability、发布记录权限和中断恢复实证。 |
 | REQ-ENG-015 | 已有显式部署、drain、激活、健康和恢复工具。 | 只消费已完成发布的版本化产物，明确发布完成与部署结果的独立记录。 |
-| REQ-ENG-016 至 REQ-ENG-020 | 全 workflow 唯一分类、两个 trusted-default-branch sidecars、metadata payload、selection gate。 | 选定 transport、凭据配置和真实 smoke；当前明确未选。 |
+| REQ-ENG-016 至 REQ-ENG-020 | 全 workflow 唯一分类、两个 trusted-default-branch sidecars、metadata payload、selection gate 和 Oidrune transport 决策。 | Oidrune gateway/audience、来源 allowlist、真实 smoke 和生产启用仍待完成。 |
 | REQ-ENG-021 | format 3、新 `version`/`source_revision`、客户端版本输出、Python/Bun/Go 读取适配。 | 旧 SHA 状态 fixture 和 Go runtime format 3 fixture 仍需补齐。 |
 | REQ-ENG-023 | 已有公共边界与部署配置隔离。 | 将目标发布资产与迁移路径纳入同样的边界验证。 |
 
@@ -50,7 +50,7 @@
 | `semver-change-governance` | Policy、公开接口与状态模板、SemVer resolver 和独立 API/state 合同。 | 日常变更的实际影响记录；不自动驱动 target。 |
 | `quality-gates` | Policy、`.github/quality-gates.json`、PR/Main gates、quality checker。 | GitHub ruleset 与 required checks 对齐；当前只读差距审计。 |
 | `github-actions-scheduling` | 所有实际工作流的 events、namespaces、非抢占 concurrency、合同测试。 | live run history 和重跑/跨阶段证据。 |
-| `release-failure-notification` | Policy、notification contract、两个 sidecars、metadata helper、selection gate。 | transport 选择、配置和真实 smoke；当前不发送通知。 |
+| `release-failure-notification` | Policy、notification contract、两个 sidecars、metadata helper、selection gate 和 ADR 0046。 | transport 决策已接受；配置、真实 smoke 和生产发送仍待完成。 |
 
 三个项目 Policy 的安装写入范围为 `.agents/skills/semver-change-governance/`、`.agents/skills/quality-gates/`、`.agents/skills/release-failure-notification/` 及 CLI 管理的 `skills-lock.json`；已在当前候选写入并通过本地 lock/package 校验。`manual-version-release-delivery` 与 `github-actions-scheduling` 在上游 Style Playbook 中不存在可安装 skill，分别通过 `.github/release-contract.json`、`.github/topic-contract.json` 和 `.github/workflows/` 实施，不添加虚假 lock 项。
 
@@ -83,8 +83,9 @@
 
 ## Remaining Gaps
 
-- 通知 transport 尚无项目认可的选择证据；不能从历史 reference、现有 webhook 或默认邮件反推。transport owner、configuration owner 与 required secrets 需随有效选择一并记录。
-- 缺少选择证据时，notifier rollout 与整套新发布系统保持阻断；本 PR 不选择其他通知方案。
+- 通知 transport 已选择 Oidrune GitHub OIDC Relay → operator-controlled Telegram destination；不能从历史 reference、现有 webhook 或默认邮件反推其他方案。transport owner、configuration owner、gateway pair、来源 allowlist 和 required secrets 仍需在实现合同中记录。
+- Oidrune gateway/audience、来源 allowlist、queue/DLQ/operator visibility 和真实 smoke 完成前，notifier rollout 与整套新发布系统保持阻断；本项目不创建调用方静态 Secret。
+- 当前 release workflow、recovery workflow 和 `.github/release-contract.json` 仍包含 `RELEASE_PLATFORM_TOKEN` 依赖；实现阶段必须删除该依赖、移出管理员级平台审计，并恢复 GitHub Actions 内置 token 后才能与 ADR 0046 和发布合同一致。
 - 平台实施前还需落实发布记录创建身份与保护规则，核对发布资产保留、immutable Release 和对应权限；这些属于配置落实，不改变产品版本与发布终点。
 - 适用的状态迁移/恢复 fixture、live PR checks、运行时 Tier 4 review 和最终平台审计仍属于 Step 5 收口证据，不在本地合同通过时提前宣称完成。
 
