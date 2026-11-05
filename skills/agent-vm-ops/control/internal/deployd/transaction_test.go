@@ -985,3 +985,52 @@ func TestControllerRecoveryRetainsOnlyDrainedAuthority(t *testing.T) {
 		})
 	}
 }
+
+func TestOnlyCurrentProcessLiveLeaseCanBeRenewed(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	manager := NewManager(database, nil, 15*time.Second, func() time.Time { return now })
+	lease, err := manager.newLease(context.Background(), "blue", 7)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lease.OwnerStartTime == "" {
+		t.Skip("process-incarnation evidence is unavailable on this platform")
+	}
+	now = now.Add(time.Second)
+	target := SlotObservation{Slot: "blue", ControllerOwned: true, ControllerLease: &lease}
+	renewed, err := manager.renewOrAllocateLease(context.Background(), target, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := lease
+	expected.Expiry = now.Add(15 * time.Second)
+	if renewed != expected {
+		t.Fatalf("renewal changed authority identity: got %+v want %+v", renewed, expected)
+	}
+	for name, mutate := range map[string]func(*SlotObservation){
+		"foreign process":      func(s *SlotObservation) { s.ControllerLease.OwnerPID++ },
+		"previous incarnation": func(s *SlotObservation) { s.ControllerLease.OwnerStartTime = "previous" },
+		"expired":              func(s *SlotObservation) { s.ControllerLease.Expiry = now },
+		"wrong slot":           func(s *SlotObservation) { s.ControllerLease.Slot = "green" },
+		"not owned":            func(s *SlotObservation) { s.ControllerOwned = false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			copyLease := lease
+			candidate := target
+			candidate.ControllerLease = &copyLease
+			mutate(&candidate)
+			fresh, err := manager.renewOrAllocateLease(context.Background(), candidate, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if fresh.Term <= lease.Term || fresh.LeaseID == lease.LeaseID || fresh.Nonce == lease.Nonce {
+				t.Fatal("unowned or stale authority reused")
+			}
+		})
+	}
+}
