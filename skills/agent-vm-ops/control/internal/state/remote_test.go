@@ -141,6 +141,48 @@ func requireSessionOwnedRQLite(t *testing.T) string {
 	return descriptor.URL
 }
 
+func TestWaitForRQLiteReadyRequiresStatusAndStrongQuery(t *testing.T) {
+	var statusAttempts, queryAttempts int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.Header().Set("Content-Type", "application/json")
+		switch request.URL.Path {
+		case "/status":
+			statusAttempts++
+			if statusAttempts == 1 {
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = writer.Write([]byte(`{"ok":true}`))
+		case "/db/query":
+			queryAttempts++
+			if request.URL.Query().Get("level") != "strong" || request.URL.Query().Get("q") != "SELECT 1" {
+				http.Error(writer, "invalid readiness query", http.StatusBadRequest)
+				return
+			}
+			if queryAttempts == 1 {
+				writer.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+			_, _ = writer.Write([]byte(`{"results":[{"columns":["1"],"types":["integer"],"values":[[1]]}]}`))
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+	endpoint, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := waitForRQLiteReady(ctx, endpoint, server.Client()); err != nil {
+		t.Fatalf("waitForRQLiteReady() error = %v", err)
+	}
+	if statusAttempts < 2 || queryAttempts < 2 {
+		t.Fatalf("readiness attempts = status %d query %d, want retries for both probes", statusAttempts, queryAttempts)
+	}
+}
+
 func TestRemoteMigrationPreservesStateAndSerializesConcurrentOperations(t *testing.T) {
 	rqliteURL := requireSessionOwnedRQLite(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)

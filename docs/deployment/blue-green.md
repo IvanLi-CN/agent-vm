@@ -104,16 +104,26 @@ Deployd 迁移使用 `deployd.json` 中的 `migration.rqlite_url` 和 `migration
 
 ## 一键首次部署
 
-首次部署的输入是已经安装好的旧 `agent-vm-native.service`、旧 `/var/lib/agent-vm-native/state.sqlite3`、rqlite 配置、两个槽位配置和已验证的 format-4 发布包。
+首次部署可以从已经安装好的旧 `agent-vm-native.service` 和旧
+`/var/lib/agent-vm-native/state.sqlite3` 开始，也可以从没有业务状态文件的
+全新根目录开始；两种情况都需要 rqlite 配置、两个槽位配置和已验证的
+format-4 发布包。全新安装只会迁移本次启动生成的空 SQLite，不读取被隔离的
+旧根目录或旧盘数据。
 发布器执行 `stage`、`verify`、`activate` 时，按以下顺序自动完成：
 
 1. 校验发布包和两个槽位目录，但不启动新槽位。
-2. 启用并重启 `agent-vm-deployd.service`，确认 Deployd socket 可用。
-3. 调用 Deployd 的 `POST /v1/migrate`，由 Deployd 启动 rqlite、让旧服务进入写围栏、等待请求和 native worker 收敛、停止旧服务、验证 SQLite writer 已关闭、创建一致 snapshot、导入并验证 rqlite。
-4. 迁移成功后写入 `.rqlite-cutover-complete`，再创建初始 `active` 链接、停止并禁用旧单实例、启动蓝绿槽位。
-5. 重新观测两个槽位和共享状态，只有验证通过才报告激活成功。
+2. 读取发布状态；如果没有 current release，确认旧单实例、两个槽位和 Deployd
+   都已停止，不向不存在的旧控制服务发送 drain 请求。
+3. 对已有 current release 执行 admission drain；对全新根目录跳过旧服务
+   drain，但仍由 wrapper 在激活前检查固定运行单元全部停止。
+4. 启用并重启 `agent-vm-deployd.service`，等待其 UDS API 接受 `status` 请求。
+5. 调用 Deployd 的 `POST /v1/migrate`，由 Deployd 启动 rqlite、让旧服务进入写围栏、等待请求和 native worker 收敛、停止旧服务、验证 SQLite writer 已关闭、创建一致 snapshot、导入并验证 rqlite。
+6. 迁移成功后写入 `.rqlite-cutover-complete`，再创建初始 `active` 链接、停止并禁用旧单实例、启动蓝绿槽位。
+7. 重新观测两个槽位和共享状态，只有验证通过才报告激活成功。
 
 发布器不会让槽位先于迁移启动，也不会把 `agent-vm-deploy migrate` 留给人工执行。
+首次发布的健康检查允许新槽位处于未排空状态；这只适用于没有 current
+release 的 clean bootstrap，普通蓝绿发布仍必须在 drain 中完成健康检查。
 直接使用 CLI 时，等价入口是：
 
 ```sh
@@ -142,6 +152,13 @@ Deployd 只有在标记、当前 rqlite 目标摘要和仍然保留的唯一 fin
 然后停止旧服务，立即取得旧状态目录的 `authority.lock` 并在整个检查、snapshot 和导入阶段保持持有，检查 systemd 状态和 `/proc` 文件描述符，确认没有进程打开 SQLite 主文件、WAL 或 SHM 文件。
 旧服务的 Bun 入口在创建 SQLite store 前也必须取得同一把排他的 `authority.lock`，因此它在这把锁被 Deployd 持有时不能重新打开数据库。
 旧服务在这把锁释放前重新启动会使迁移失败闭锁，不会继续启动槽位。
+
+迁移开始前，Deployd 会为仍作为 SQLite writer 的 legacy singleton 临时授予
+蓝槽位 controller lease，然后才执行 `drain-enter`。这个 lease 只用于通过
+旧服务已有的写入围栏，不授予流量角色，也不把 legacy singleton 纳入正常的
+双槽位运行；迁移停止 legacy singleton 后，该 lease 随进程消失，发布器才会
+启动蓝、绿两个 rqlite 槽位。全新安装时，legacy SQLite 由本次安装创建，若无
+旧业务数据，它只承载空状态初始化，不会读取或恢复故障硬盘上的旧数据。
 
 只有 writer 检查通过后，Deployd 才使用 SQLite 自己的 `VACUUM INTO` 创建一致 snapshot，并记录 source hash、大小、state epoch、fence ID 和验证时间。
 迁移预算按 SQLite 主库、WAL、SHM 和恢复目录中已登记的 snapshot 文件累计计算，累计上限为 1 GiB；

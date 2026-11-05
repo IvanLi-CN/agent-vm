@@ -1,6 +1,7 @@
 package deployd
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -8,6 +9,20 @@ import (
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 )
+
+func TestSupportedBundleManifestFormats(t *testing.T) {
+	for _, format := range []string{"2", "3", "4"} {
+		if !supportedBundleManifestFormat(json.Number(format)) {
+			t.Fatalf("manifest format %s was rejected", format)
+		}
+	}
+	if supportedBundleManifestFormat(json.Number("1")) {
+		t.Fatal("unsupported manifest format was accepted")
+	}
+	if supportedBundleManifestFormat(json.Number("not-a-number")) {
+		t.Fatal("malformed manifest format was accepted")
+	}
+}
 
 func TestAdminMetricsValidationUsesTopLevelObservationEpoch(t *testing.T) {
 	result := map[string]any{

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 	"golang.org/x/sys/unix"
@@ -158,29 +158,36 @@ func (runtime *HostRuntime) StartStateAuthority(ctx context.Context) error {
 	if err := runtime.systemctlFixed(ctx, "start", runtime.Config.Migration.RQLiteUnit); err != nil {
 		return err
 	}
-	parsed, err := url.Parse(runtime.Config.Migration.RQLiteURL)
-	if err != nil || parsed.Host == "" || parsed.Scheme != "https" {
-		return errors.New("migration.rqlite_url is invalid")
+	endpoint, err := runtime.rqliteMigrationURL()
+	if err != nil {
+		return err
 	}
-	deadline := time.NewTimer(60 * time.Second)
-	defer deadline.Stop()
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		dialer := net.Dialer{Timeout: 2 * time.Second}
-		connection, dialErr := dialer.DialContext(ctx, "tcp", parsed.Host)
-		if dialErr == nil {
-			_ = connection.Close()
-			return nil
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-deadline.C:
-			return fmt.Errorf("rqlite did not become reachable: %w", dialErr)
-		case <-ticker.C:
-		}
+	readyContext, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	if err := state.WaitForRQLiteReady(readyContext, endpoint, runtime.Config.Migration.RQLiteCAFile); err != nil {
+		return fmt.Errorf("rqlite did not become ready: %w", err)
 	}
+	return nil
+}
+
+func (runtime *HostRuntime) GrantLegacyController(ctx context.Context, lease controllerrole.Lease) error {
+	if lease.Slot != "blue" {
+		return errors.New("legacy migration controller lease must target the blue slot")
+	}
+	body, status, err := runtime.slotRequest(ctx, runtime.Config.Migration.LegacySocket, http.MethodPost, "/internal/v1/controller-role", map[string]any{
+		"action": "grant",
+		"lease":  lease,
+	})
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK || !responseOK(body) {
+		return fmt.Errorf("legacy service rejected migration controller lease with HTTP %d", status)
+	}
+	if valid, ok := body["valid"].(bool); !ok || !valid {
+		return errors.New("legacy service did not confirm the migration controller lease")
+	}
+	return nil
 }
 
 func (runtime *HostRuntime) EnterLegacyFence(ctx context.Context, owner string) error {

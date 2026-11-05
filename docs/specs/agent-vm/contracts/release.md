@@ -4,8 +4,6 @@
 它不是公共的 `agent-vm` 生命周期命令，也不授予 PVE、宿主机管理器、Incus 策略 API、guest 或 HTTP 网关的访问权限。
 产品发布完成的标志是经过验证的 GitHub Release 及其版本化安装包；
 部署是独立且必须显式触发的操作。
-GitHub Actions 发布与恢复 workflow 使用 GitHub Actions 内置 token 完成产品发布所需的最小 GitHub API 操作；管理员级 branch protection/ruleset 审计属于独立的 operator audit，不是产品发布的凭据前置条件。发布 workflow 不得依赖自定义的高权限平台 token。
-启用 GitHub Immutable Releases 是发布前置条件。GitHub 只对启用设置后的 future releases 施加 immutable 保护；因此审计会保留并标识启用前的 legacy mutable release history，但只有在 repository-level immutable enforcement 已启用且当前新 release 发布后验证为 `immutable=true` 时才允许继续发布。
 蓝绿设计使用两个完整的 Agent VM 服务槽位、一个稳定的 Caddy 入口，以及一个位于槽位之外、供运维者使用的 `agent-vm-deployd` 控制器。
 它不增加公共路由、Web/BFF、公共 native 生命周期服务或公共发布封装器；
 下文的 format-1/2 封装器仅作为旧版兼容路径保留。
@@ -116,13 +114,12 @@ unknown 或 malformed state fail closed。
 
 | Capability | 含义 |
 | --- | --- |
-| `legacy-agent-vm-core@1` | Existing protocol-4 tasks, generations, leases, reservations, ports and operation journal. |
-| `managed-image-catalog@1` | Immutable image records, labels, verification, references and default selection. |
-| `session-image-binding@1` | Session and cache identity remains bound to the exact image fingerprint. |
-| `management-operation-audit@1` | Durable administrator operation identity, current, typed rejected-request or `legacy_unknown` actor, optional reason, target, phase and outcome. |
-| `oidc-return-path@1` | One-time OIDC transactions retain only an allowlisted same-origin return path until callback consumption. |
-| `principal-identity@1` | The configured OIDC issuer/subject is the sole administrator actor; claims and historical user mappings are never guessed. |
-| `token-revocation@1` | Opaque machine-Token digest, resource version, scope, expiry and revocation state are durable across slots. |
+| `legacy-agent-vm-core@1` | Existing protocol-4 tasks、generations、leases、reservations、ports 和 operation journal。 |
+| `managed-image-catalog@1` | Immutable image records、labels、verification、references 和 default selection。 |
+| `session-image-binding@1` | Session 和 cache identity 继续绑定 exact image fingerprint。 |
+| `management-operation-audit@1` | Durable administrator operation identity、current actor、typed rejected-request 或 `legacy_unknown` actor、optional reason、target、phase 和 outcome。 |
+| `principal-identity@1` | Configured OIDC issuer/subject 是 sole administrator actor；绝不猜测 claims 或 historical user mappings。 |
+| `token-revocation@1` | Opaque machine-Token digest、resource version、scope、expiry 和 revocation state 在 slots 间 durable。 |
 
 Format-4 manifest 声明：
 
@@ -132,7 +129,6 @@ Format-4 manifest 声明：
     "legacy-agent-vm-core@1",
     "managed-image-catalog@1",
     "management-operation-audit@1",
-    "oidc-return-path@1",
     "principal-identity@1",
     "session-image-binding@1",
     "token-revocation@1"
@@ -141,7 +137,6 @@ Format-4 manifest 声明：
     "legacy-agent-vm-core@1",
     "managed-image-catalog@1",
     "management-operation-audit@1",
-    "oidc-return-path@1",
     "principal-identity@1",
     "session-image-binding@1",
     "token-revocation@1"
@@ -251,7 +246,12 @@ wrapper 不接受 arbitrary destinations、shell commands、configuration paths�
 它拒绝 absolute 或 parent-traversing names、symlinks、hard links、devices、duplicates 和 oversized members。
 `verify` 检查 selected format、exact bytes、regular-file owner 和 mode；
 不执行 candidate binaries，验证 Go target/toolchain 和 retired-unit set，编译 Python support artifacts，使用固定 `/usr/local/bin/bun` 将 manifest-listed TypeScript 作为 data transpile，验证 fixed systemd unit names 和 canonical bytes，并 enforce selected fixed artifact set。
-`activate` 要求 verified transaction 和 admission drain，在 drain check 前创建 fixed activation fence，重新验证 retained current/previous releases，原子保留 current/previous release pointers，安装 complete fixed client package 和 selected control artifacts，并 MAY 运行 `systemctl daemon-reload`；
+`activate` 对已有 current release 要求 verified transaction 和 admission drain，在 drain check 前创建 fixed activation fence，重新验证 retained current/previous releases，原子保留 current/previous release pointers，安装 complete fixed client package 和 selected control artifacts，并 MAY 运行 `systemctl daemon-reload`。
+如果 current release 不存在，`activate` 只允许在固定 legacy、blue、green 和
+Deployd units 都已停止时执行 clean bootstrap；该路径不伪造旧 drain，也不会
+读取旧业务 SQLite。激活失败时，恢复快照必须同时覆盖
+`agent-vm-control`、`agent-vm-deploy`、`agent-vm-deployd`、manifest、bridge、
+slot copies 和 units；
 它不停止或禁用 Go service 的 in-process scheduler。
 `rollback` 使用相同 artifact 和 systemd checks 验证 previous retained release，拒绝 stale transactions，每个 transaction 最多允许一次 automatic attempt（包括 interrupted activation record），绝不重写 durable lifecycle state、generations 或 uncertain operations。
 
@@ -260,7 +260,9 @@ wrapper 不接受 arbitrary destinations、shell commands、configuration paths�
 手工发布器 [`agent_vm_release.py`](../../../../skills/agent-vm-ops/scripts/agent_vm_release.py) 仍是 format-1 发布器和旧版兼容路径，默认构建 legacy format-1 client bundle，并且只能发布通过同一 fixed manifest verifier 的 bundle。Format-2 native package 和 product formats 3/4 由各自的专用 builder 构建，并分别执行其 artifact 和 state checks。Format-2 bundle 构建器是[`build_go_release.ts`](../../../../skills/agent-vm-ops/scripts/build_go_release.ts)；
 它使用 `CGO_ENABLED=0` 为 `linux/amd64` 或 `linux/arm64` 构建三个二进制文件，在不执行候选产物的情况下校验字节和元数据，并同时发布固定 bridge、蓝绿槽位模板、Deployd unit 和兼容的 native unit。
 当前蓝绿生产激活通过 deployd 执行，而该发布器继续负责产物校验和兼容安装包行为。
-发布必须保留本地校验、远端暂存/校验、通过当前客户端传输执行的排空，以及最多每 1 秒一次的 `admin-metrics` 轮询。
+发布必须保留本地校验、远端暂存/校验；已有 current release 时还必须通过当前客户端传输执行排空，以及最多每 1 秒一次的 `admin-metrics` 轮询。
+clean bootstrap 必须先查询 wrapper status，在没有 current release 时跳过旧客户端
+排空，并在激活后以未排空但已 ready 的新槽位完成健康检查。
 Format-2 迁移排空预算默认 8100 秒且不得超过 8100 秒；
 激活另有 300 秒上限。
 它不得停止或禁用 Go 服务 scheduler、强制终止在途 operation，或创建替代 operation ID。

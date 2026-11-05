@@ -214,7 +214,7 @@
           "refId": "B"
         }
       ],
-      "title": "Task state counts",
+      "title": "Task state summary",
       "type": "stat"
     },
     {
@@ -517,7 +517,7 @@
           "refId": "G"
         }
       ],
-      "title": "Managed VM inventory",
+      "title": "Managed VM task details",
       "transformations": [
         {
           "id": "joinByField",

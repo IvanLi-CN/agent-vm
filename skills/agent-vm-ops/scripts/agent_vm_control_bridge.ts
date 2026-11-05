@@ -1,5 +1,7 @@
 #!/usr/bin/env bun
 
+import { lstatSync } from "node:fs";
+
 import { runBounded } from "./client-io.ts";
 
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
@@ -7,6 +9,21 @@ const STDOUT_LIMIT = 2 * 1024 * 1024;
 const STDERR_LIMIT = 64 * 1024;
 const DEFAULT_BINARY = "/opt/agent-vm-native/bin/agent-vm-control";
 const DEFAULT_SOCKET = "/run/agent-vm-native/control.sock";
+const ACTIVE_SOCKET = "/var/lib/agent-vm-native/active/app.sock";
+
+function resolveSocket(): string {
+  const configured = process.env.AGENT_VM_GO_CONTROL_SOCKET;
+  if (configured) return configured;
+  try {
+    // Keep the active path authoritative after the first cutover. lstat also
+    // treats a not-yet-ready socket symlink as present, so we fail closed
+    // instead of falling back to a retired singleton controller.
+    lstatSync(ACTIVE_SOCKET);
+    return ACTIVE_SOCKET;
+  } catch {
+    return DEFAULT_SOCKET;
+  }
+}
 
 async function readRequest(): Promise<Buffer> {
   const chunks: Buffer[] = [];
@@ -24,7 +41,7 @@ async function readRequest(): Promise<Buffer> {
 
 const input = await readRequest();
 const binary = process.env.AGENT_VM_GO_CONTROL_BINARY ?? DEFAULT_BINARY;
-const socket = process.env.AGENT_VM_GO_CONTROL_SOCKET ?? DEFAULT_SOCKET;
+const socket = resolveSocket();
 const timeout = process.env.AGENT_VM_GO_CONTROL_TIMEOUT ?? "240s";
 const timeoutMatch = /^(\d+)(ms|s|m)$/.exec(timeout);
 if (!timeoutMatch || Number(timeoutMatch[1]) <= 0) throw new Error("invalid Go control timeout");

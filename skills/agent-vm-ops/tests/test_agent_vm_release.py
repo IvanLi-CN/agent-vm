@@ -25,7 +25,7 @@ class FakeTransport:
     def __init__(self, *, fail_health_once=False, pending=False, drain_enter=True, unknown_state=False,
                  observation_consistent=True, legacy_metrics=False, malformed_health=False, malformed_reconcile=False, malformed_rollback=False,
                  fail_activation=False, require_legacy_drain_exit=False, missing_pending_operations=False,
-                 fail_health_persistent=False):
+                 fail_health_persistent=False, initial_install=False):
         self.calls = []
         self.fail_health_once = fail_health_once
         self.pending = pending
@@ -40,6 +40,7 @@ class FakeTransport:
         self.require_legacy_drain_exit = require_legacy_drain_exit
         self.missing_pending_operations = missing_pending_operations
         self.fail_health_persistent = fail_health_persistent
+        self.initial_install = initial_install
         self.control_release_ids = []
         self.health_checks = 0
 
@@ -58,8 +59,10 @@ class FakeTransport:
             return {"ok": True, "result": {"rolled_back": True, "release_id": "c" * 40,
                                               "previous_release_id": release_id}}
         if action == "status":
-            return {"ok": True, "result": {"current_release_id": "c" * 40,
-                                              "previous_release_id": release_id}}
+            return {"ok": True, "result": {
+                "current_release_id": None if self.initial_install else "c" * 40,
+                "previous_release_id": None if self.initial_install else release_id,
+            }}
         if action == "stage":
             return {"ok": True, "result": {"staged": True}}
         if action == "verify":
@@ -210,9 +213,20 @@ class ReleasePublisherTests(unittest.TestCase):
         self.assertTrue(target.is_file())
         self.assertTrue((target.parent / "client-release.json").is_file())
         actions = [item[1] for item in transport.calls]
-        self.assertEqual(actions[:3], ["stage", "verify", "drain-enter"])
+        self.assertEqual(actions[:4], ["stage", "verify", "status", "drain-enter"])
         self.assertLess(actions.index("drain-enter"), actions.index("activate"))
         self.assertEqual(actions[-1], "drain-exit")
+
+    def test_publish_bootstraps_a_clean_install_without_legacy_drain(self):
+        transport = FakeTransport(initial_install=True)
+        result = self.publisher(transport).publish(timeout=5, poll=1, transaction_id="tx-initial")
+        self.assertTrue(result["published"])
+        self.assertTrue(result["initial_install"])
+        actions = [item[1] for item in transport.calls]
+        self.assertEqual(actions[:4], ["stage", "verify", "status", "activate"])
+        self.assertNotIn("drain-enter", actions)
+        self.assertNotIn("drain-exit", actions)
+        self.assertEqual(actions[-1], "admin-reconcile")
 
     def test_build_and_install_use_all_bun_files_and_never_python_client_paths(self):
         from release_manifest import verify_typescript_syntax

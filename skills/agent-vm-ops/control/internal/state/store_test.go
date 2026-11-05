@@ -530,5 +530,39 @@ func TestOperationIdentityAndWorkerIdentityRemainImmutable(t *testing.T) {
 	}
 }
 
+func TestOperationWorkerIdentityCanRearmAfterVerifiedFinish(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "operation-worker-rearm.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.RecordOperation(ctx, "rearm-operation", "acquire", stringPointer("rearm-session"), intPointer(1), map[string]any{
+		"outcome": "pending",
+		"worker":  map[string]any{"state": "starting"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first := map[string]any{"state": "finished", "pid": int64(11), "start_time": "start-11", "process_group": int64(11)}
+	if err := store.RecordOperationWorker(ctx, "rearm-operation", first); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperationWorker(ctx, "rearm-operation", map[string]any{"state": "starting"}); err != nil {
+		t.Fatalf("verified worker did not rearm: %v", err)
+	}
+	second := map[string]any{"state": "running", "pid": int64(12), "start_time": "start-12", "process_group": int64(12)}
+	if err := store.RecordOperationWorker(ctx, "rearm-operation", second); err != nil {
+		t.Fatalf("new worker identity was rejected after verified finish: %v", err)
+	}
+	operation, err := store.GetOperation(ctx, "rearm-operation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, ok := operation.Response["worker"].(map[string]any)
+	if !ok || worker["pid"] != json.Number("12") || worker["start_time"] != "start-12" {
+		t.Fatalf("rearmed worker identity = %#v, want second worker", operation.Response)
+	}
+}
+
 func stringPointer(value string) *string { return &value }
 func intPointer(value int64) *int64      { return &value }

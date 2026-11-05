@@ -481,7 +481,7 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 			// Confirmation records were added after the first durable auth
 			// schema. Keep an already-complete OIDC/session/Token database
 			// open so EnsureManagementSchema can add this table atomically.
-			if authPresent && (key == objectKey("table", "management_confirmations") || key == objectKey("table", "oidc_transaction_return_paths")) && !actual[key] {
+			if authPresent && key == objectKey("table", "management_confirmations") && !actual[key] {
 				continue
 			}
 			if !actual[key] {
@@ -494,7 +494,7 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 
 func isAuthManagementObject(key string) bool {
 	switch key {
-	case objectKey("table", "oidc_transactions"), objectKey("table", "oidc_transaction_return_paths"), objectKey("table", "browser_sessions"), objectKey("table", "agent_tokens"), objectKey("table", "management_confirmations"):
+	case objectKey("table", "oidc_transactions"), objectKey("table", "browser_sessions"), objectKey("table", "agent_tokens"), objectKey("table", "management_confirmations"):
 		return true
 	default:
 		return false
@@ -701,7 +701,6 @@ func (r *remoteBackend) ensureManagementSchema(ctx context.Context) error {
 		{name: "managed-image-catalog", version: 1},
 		{name: "session-image-binding", version: 1},
 		{name: "management-operation-audit", version: 1},
-		{name: "oidc-return-path", version: 1},
 		{name: "principal-identity", version: 1},
 		{name: "token-revocation", version: 1},
 	} {
@@ -1248,7 +1247,7 @@ func orderedTables(objects []remoteSchemaObject) []string {
 			present[object.Name] = true
 		}
 	}
-	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "managed_image_tombstones", "image_references", "management_operations", "management_audit", "oidc_transactions", "oidc_transaction_return_paths", "browser_sessions", "agent_tokens", "management_confirmations"}
+	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "managed_image_tombstones", "image_references", "management_operations", "management_audit", "oidc_transactions", "browser_sessions", "agent_tokens", "management_confirmations"}
 	values := make([]string, 0, len(present))
 	for _, table := range order {
 		if present[table] {
@@ -2157,6 +2156,117 @@ func rqliteHTTPClient(caPath string) (*http.Client, error) {
 		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}
 	}
 	return &http.Client{Timeout: 30 * time.Second, Transport: transport}, nil
+}
+
+// WaitForRQLiteReady waits for both the HTTP status endpoint and a strong
+// read to succeed. A listening TCP socket is not sufficient: rqlite can
+// accept connections while it is still electing a leader and return HTTP 503
+// for database requests.
+func WaitForRQLiteReady(ctx context.Context, rqliteURL, caPath string) error {
+	if err := validateHTTPSMigrationEndpoint(rqliteURL); err != nil {
+		return err
+	}
+	endpoint, err := url.Parse(rqliteURL)
+	if err != nil {
+		return err
+	}
+	client, err := rqliteHTTPClient(caPath)
+	if err != nil {
+		return err
+	}
+	return waitForRQLiteReady(ctx, endpoint, client)
+}
+
+func waitForRQLiteReady(ctx context.Context, endpoint *url.URL, client *http.Client) error {
+	if endpoint == nil || endpoint.Host == "" {
+		return errors.New("rqlite readiness endpoint is invalid")
+	}
+	if client == nil {
+		return errors.New("rqlite readiness client is missing")
+	}
+	interval := time.NewTicker(100 * time.Millisecond)
+	defer interval.Stop()
+	var lastErr error
+	for {
+		if err := probeRQLiteReady(ctx, endpoint, client); err == nil {
+			return nil
+		} else {
+			lastErr = err
+		}
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("rqlite readiness probe failed: %w", lastErr)
+			}
+			return ctx.Err()
+		case <-interval.C:
+		}
+	}
+}
+
+func probeRQLiteReady(ctx context.Context, endpoint *url.URL, client *http.Client) error {
+	statusURL := *endpoint
+	statusURL.User = nil
+	statusURL.Path = "/status"
+	statusURL.RawQuery = ""
+	statusRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, statusURL.String(), nil)
+	if err != nil {
+		return err
+	}
+	setRQLiteBasicAuth(statusRequest, endpoint)
+	statusResponse, err := client.Do(statusRequest)
+	if err != nil {
+		return err
+	}
+	_, _ = io.Copy(io.Discard, statusResponse.Body)
+	_ = statusResponse.Body.Close()
+	if statusResponse.StatusCode != http.StatusOK {
+		return fmt.Errorf("rqlite status HTTP %d response rejected", statusResponse.StatusCode)
+	}
+
+	queryURL := *endpoint
+	queryURL.User = nil
+	queryURL.Path = "/db/query"
+	queryURL.RawQuery = url.Values{
+		"level": {"strong"},
+		"q":     {"SELECT 1"},
+	}.Encode()
+	queryRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, queryURL.String(), nil)
+	if err != nil {
+		return err
+	}
+	setRQLiteBasicAuth(queryRequest, endpoint)
+	queryResponse, err := client.Do(queryRequest)
+	if err != nil {
+		return err
+	}
+	defer queryResponse.Body.Close()
+	if queryResponse.StatusCode < http.StatusOK || queryResponse.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf("rqlite query HTTP %d response rejected", queryResponse.StatusCode)
+	}
+	var response remoteResponse
+	decoder := json.NewDecoder(queryResponse.Body)
+	if err := decoder.Decode(&response); err != nil {
+		return fmt.Errorf("decode rqlite readiness query: %w", err)
+	}
+	if message := remoteResponseError(response); message != "" {
+		return errors.New(message)
+	}
+	if len(response.Results) != 1 {
+		return fmt.Errorf("rqlite readiness query returned %d results, want 1", len(response.Results))
+	}
+	if message := remoteResultError(response.Results[0]); message != "" {
+		return errors.New(message)
+	}
+	return validateRemoteQueryResult(response.Results[0])
+}
+
+func setRQLiteBasicAuth(request *http.Request, endpoint *url.URL) {
+	if endpoint.User == nil {
+		return
+	}
+	password, _ := endpoint.User.Password()
+	request.SetBasicAuth(endpoint.User.Username(), password)
 }
 
 func validateMigrationEvidence(evidence SQLiteMigrationEvidence) error {

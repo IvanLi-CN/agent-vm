@@ -1168,6 +1168,15 @@ func preserveWorkerIdentity(previous, current map[string]any) error {
 	if previous == nil || current == nil {
 		return nil
 	}
+	// One logical operation can run several sequential native commands. Once
+	// the previous command has a verified terminal result, the next command
+	// may establish a new identity; unresolved workers remain immutable below.
+	previousState, _ := previous["state"].(string)
+	currentState, _ := current["state"].(string)
+	previousError, _ := previous["error"].(string)
+	if previousState == "finished" && currentState == "starting" && previousError == "" {
+		return nil
+	}
 	for _, key := range []string{"pid", "start_time", "process_group"} {
 		oldValue, exists := previous[key]
 		if !exists {

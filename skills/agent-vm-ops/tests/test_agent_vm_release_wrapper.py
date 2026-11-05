@@ -101,6 +101,50 @@ class WrapperTests(unittest.TestCase):
         )
         self.assertEqual(run.call_args.kwargs["timeout"], 30)
 
+    def test_clean_activation_accepts_stopped_runtime_without_legacy_drain(self):
+        self.drain_patch.stop()
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 3, b"", b""),
+        ) as run:
+            WRAPPER._ensure_drained(self.loaded, allow_initial=True)
+        self.assertEqual(run.call_count, len((
+            "agent-vm-native.service",
+            "agent-vm-native@blue.service",
+            "agent-vm-native@green.service",
+            "agent-vm-deployd.service",
+        )))
+        self.assertTrue(all(call.args[0][:3] == ["systemctl", "is-active", "--quiet"] for call in run.call_args_list))
+
+    def test_clean_activation_rejects_a_running_runtime_without_legacy_drain(self):
+        self.drain_patch.stop()
+        with mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, b"", b""),
+        ):
+            with self.assertRaises(WRAPPER.WrapperError) as failure:
+                WRAPPER._ensure_drained(self.loaded, allow_initial=True)
+        self.assertEqual(failure.exception.code, "drain_required")
+
+    def test_drain_verification_uses_active_slot_socket_after_cutover(self):
+        self.drain_patch.stop()
+        sidecar = Path(self.loaded["control_path"]).with_name("client-release.json")
+        sidecar.parent.mkdir(parents=True, exist_ok=True)
+        sidecar.write_text(json.dumps({"format": 4, "client_view": {"transport": "go-request"}}), encoding="utf-8")
+        response = json.dumps({"ok": True, "result": {"draining": True}}).encode()
+        with mock.patch.object(WRAPPER.os.path, "lexists", return_value=True), mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, response, b""),
+        ) as run:
+            WRAPPER._ensure_drained(self.loaded)
+        self.assertEqual(
+            run.call_args_list[0].args[0],
+            [str(WRAPPER.GO_CONTROL_PATH), "request", "--socket", str(WRAPPER.GO_ACTIVE_SOCKET), "--timeout", "30s"],
+        )
+
     def test_drain_verification_rejects_inflight_management_operations(self):
         self.drain_patch.stop()
         responses = [
@@ -351,6 +395,11 @@ class WrapperTests(unittest.TestCase):
                             "recovery_required": False,
                         }},
                     }).encode(), b"")
+            if command and command[0] == str(WRAPPER.GO_CONTROL_PATH):
+                return subprocess.CompletedProcess(command, 0, json.dumps({
+                    "ok": True,
+                    "result": {"draining": False},
+                }).encode(), b"")
             return subprocess.CompletedProcess(command, 0, b"", b"")
 
         with mock.patch.object(WRAPPER, "STATE_DB_PATH", legacy_state), mock.patch.object(
@@ -363,7 +412,77 @@ class WrapperTests(unittest.TestCase):
         migration_index = next(index for index, command in enumerate(commands) if command[0] == str(WRAPPER.GO_DEPLOY_PATH) and command[1] == "migrate")
         slot_index = next(index for index, command in enumerate(commands) if command == ["systemctl", "restart", "agent-vm-native@blue.service"])
         self.assertLess(migration_index, slot_index)
+        self.assertIn(["systemctl", "restart", "agent-vm-native.service"], commands)
         self.assertTrue((runtime_root / "active").is_symlink())
+        drain_exit = next(call for call in run.call_args_list if call.args[0][0] == str(WRAPPER.GO_CONTROL_PATH))
+        self.assertEqual(json.loads(drain_exit.kwargs["input"])["session_id"], "release-agent-vm-migration-migration-1")
+
+    def test_clean_go_runtime_allows_bootstrap_without_legacy_sqlite(self):
+        runtime_root = WRAPPER._go_runtime_root(self.loaded)
+        for slot in WRAPPER.GO_SLOT_NAMES:
+            (runtime_root / "slots" / slot).mkdir(parents=True)
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", runtime_root / "state.sqlite3"):
+            self.assertTrue(WRAPPER._prepare_initial_go_runtime_layout(self.loaded))
+
+    def test_activation_snapshot_includes_deployd_control_binaries(self):
+        targets = WRAPPER._activation_targets(self.loaded)
+        bundle_root = Path(self.loaded["control_path"]).parent
+        self.assertIn(bundle_root / "bin" / "agent-vm-deploy", targets)
+        self.assertIn(bundle_root / "bin" / "agent-vm-deployd", targets)
+
+    def test_go_runtime_waits_for_deployd_socket_before_migration(self):
+        runtime_root = WRAPPER._go_runtime_root(self.loaded)
+        for slot in WRAPPER.GO_SLOT_NAMES:
+            (runtime_root / "slots" / slot).mkdir(parents=True)
+        legacy_state = runtime_root / "state.sqlite3"
+        legacy_state.write_bytes(b"legacy")
+
+        def run(command, *args, **kwargs):
+            if command and command[0] == str(WRAPPER.GO_DEPLOY_PATH):
+                if command[1] == "status":
+                    return subprocess.CompletedProcess(command, 0, b"{}", b"")
+                if command[1] == "migrate":
+                    marker_path = WRAPPER._migration_marker_path(self.loaded)
+                    marker_path.parent.mkdir(parents=True, exist_ok=True)
+                    marker_path.write_text(json.dumps({
+                        "format": 2,
+                        "transaction_id": "migration-1",
+                        "business_authority": "rqlite",
+                        "source_sha256": "a" * 64,
+                        "source_size": 1,
+                        "state_epoch": "epoch-1",
+                        "target_sha256": "b" * 64,
+                        "retention_until": "2026-11-11T00:00:00Z",
+                    }), encoding="utf-8")
+                    marker_path.chmod(0o600)
+                    return subprocess.CompletedProcess(command, 0, b"", b"")
+                if command[1] == "transaction":
+                    return subprocess.CompletedProcess(command, 0, json.dumps({
+                        "value": {"transaction": {
+                            "transaction_id": "migration-1",
+                            "target_slot": "state",
+                            "phase": "finalize",
+                            "state": "finalized",
+                            "recovery_required": False,
+                        }},
+                    }).encode(), b"")
+            if command and command[0] == str(WRAPPER.GO_CONTROL_PATH):
+                return subprocess.CompletedProcess(command, 0, json.dumps({
+                    "ok": True,
+                    "result": {"draining": False},
+                }).encode(), b"")
+            return subprocess.CompletedProcess(command, 0, b"", b"")
+
+        with mock.patch.object(WRAPPER, "STATE_DB_PATH", legacy_state), mock.patch.object(
+            WRAPPER.subprocess,
+            "run",
+            side_effect=run,
+        ) as run:
+            WRAPPER._activate_go_runtime(self.loaded, deployd_enabled=True)
+        commands = [call.args[0] for call in run.call_args_list]
+        ready_index = next(index for index, command in enumerate(commands) if command[0] == str(WRAPPER.GO_DEPLOY_PATH) and command[1] == "status")
+        migration_index = next(index for index, command in enumerate(commands) if command[0] == str(WRAPPER.GO_DEPLOY_PATH) and command[1] == "migrate")
+        self.assertLess(ready_index, migration_index)
 
     def test_migration_marker_without_finalized_transaction_keeps_runtime_fenced(self):
         marker_path = WRAPPER._migration_marker_path(self.loaded)
@@ -400,6 +519,57 @@ class WrapperTests(unittest.TestCase):
             with self.assertRaises(WRAPPER.WrapperError) as failure:
                 WRAPPER._run_initial_state_migration(self.loaded)
         self.assertEqual(failure.exception.code, "activation_unverified")
+
+    def test_migration_completion_verification_retries_a_delayed_finalized_transaction(self):
+        marker_path = WRAPPER._migration_marker_path(self.loaded)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "format": 2,
+            "transaction_id": "migration-1",
+            "business_authority": "rqlite",
+            "source_sha256": "a" * 64,
+            "source_size": 1,
+            "state_epoch": "epoch-1",
+            "target_sha256": "b" * 64,
+            "retention_until": "2026-11-11T00:00:00Z",
+        }), encoding="utf-8")
+        marker_path.chmod(0o600)
+        with mock.patch.object(
+            WRAPPER,
+            "_migration_transaction_is_finalized",
+            side_effect=[False, True],
+        ) as finalized, mock.patch.object(WRAPPER.time, "sleep") as sleep:
+            WRAPPER._verify_migration_completion(self.loaded)
+        self.assertEqual(finalized.call_count, 2)
+        sleep.assert_called_once_with(WRAPPER.MIGRATION_VERIFY_POLL_SECONDS)
+
+    def test_migration_completion_verification_accepts_the_success_response(self):
+        marker_path = WRAPPER._migration_marker_path(self.loaded)
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(json.dumps({
+            "format": 2,
+            "transaction_id": "migration-1",
+            "business_authority": "rqlite",
+            "source_sha256": "a" * 64,
+            "source_size": 1,
+            "state_epoch": "epoch-1",
+            "target_sha256": "b" * 64,
+            "retention_until": "2026-11-11T00:00:00Z",
+        }), encoding="utf-8")
+        marker_path.chmod(0o600)
+        response = json.dumps({
+            "ok": True,
+            "value": {
+                "transaction_id": "migration-1",
+                "target_slot": "state",
+                "phase": "finalize",
+                "state": "finalized",
+                "recovery_required": False,
+            },
+        }).encode()
+        with mock.patch.object(WRAPPER, "_run_deployd_cli") as run_deployd:
+            WRAPPER._verify_migration_completion(self.loaded, response)
+        run_deployd.assert_not_called()
 
     def test_migration_preflight_failure_without_transaction_is_not_recovery(self):
         def run(command, *args, **kwargs):
@@ -679,7 +849,7 @@ class WrapperTests(unittest.TestCase):
                     archive.add(path, arcname=path.relative_to(extracted).as_posix(), recursive=False)
         return output.getvalue()
 
-    def _go_payload(self, release_id):
+    def _go_payload(self, release_id, *, product=False):
         extracted = self.root / "go-candidate"
         client_root = ROOT / "skills/agent-vm/scripts"
         ops_root = ROOT / "skills/agent-vm-ops"
@@ -708,12 +878,28 @@ class WrapperTests(unittest.TestCase):
                 "sha256": MANIFEST.sha256_file(path),
                 "mode": mode,
             })
-        manifest = MANIFEST.build_go_manifest(release_id, artifacts)
+        if product:
+            actions = MANIFEST.default_operations()
+            manifest = MANIFEST.validate_product_manifest({
+                "format": MANIFEST.PRODUCT_MANIFEST_FORMAT,
+                "version": "1.2.1",
+                "release_id": release_id,
+                "source_revision": release_id,
+                "protocol": 4,
+                "target": {"os": "linux", "arch": "amd64"},
+                "toolchain": {"bun": MANIFEST.PRODUCT_BUN_TOOLCHAIN, "go": MANIFEST.PRODUCT_GO_TOOLCHAIN, "cgo_enabled": False},
+                "artifacts": artifacts,
+                "actions": actions,
+                "client_view": {"version": "1.2.1", "source_revision": release_id, "protocol": 4, "transport": "go-request", "actions": actions},
+                "state_compatibility": {"reads": list(MANIFEST.STATE_CAPABILITY_MARKERS), "writes": list(MANIFEST.STATE_CAPABILITY_MARKERS)},
+            })
+        else:
+            manifest = MANIFEST.build_go_manifest(release_id, artifacts)
         (extracted / "release-manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")
         client_artifact = next(item for item in artifacts if item["role"] == "client")
         sidecar = {
-            "format": 2,
-            "release_id": release_id,
+            "format": MANIFEST.PRODUCT_MANIFEST_FORMAT if product else 2,
+            **({"version": "1.2.1"} if product else {"release_id": release_id}),
             "source_revision": release_id,
             "protocol": 4,
             "client_artifact": client_artifact,
@@ -727,6 +913,39 @@ class WrapperTests(unittest.TestCase):
                 if path.is_file():
                     archive.add(path, arcname=path.relative_to(extracted).as_posix(), recursive=False)
         return output.getvalue()
+
+    def test_format_four_installer_populates_both_slot_runtimes(self):
+        release_id = "d" * 40
+        payload = self._go_payload(release_id, product=True)
+        release_root = self.root / "product-release"
+        WRAPPER.safe_extract_archive(payload, release_root)
+        manifest = MANIFEST.load_release_manifest(release_root / "release-manifest.json")
+
+        WRAPPER._install_product_release_files(self.loaded, release_root, manifest)
+
+        runtime_root = WRAPPER._go_runtime_root(self.loaded)
+        for slot in WRAPPER.GO_SLOT_NAMES:
+            slot_root = runtime_root / "slots" / slot
+            self.assertEqual(
+                (slot_root / "bin" / "agent-vm-control").read_bytes(),
+                (release_root / "bin" / "agent-vm-control").read_bytes(),
+            )
+            self.assertEqual(
+                (slot_root / "release-manifest.json").read_bytes(),
+                (release_root / "release-manifest.json").read_bytes(),
+            )
+            self.assertEqual(
+                (slot_root / "client-release.json").read_bytes(),
+                (release_root / "client-release.json").read_bytes(),
+            )
+            self.assertEqual(os.readlink(slot_root / "app.sock"), f"/run/agent-vm-native/{slot}/app.sock")
+            for item in manifest["artifacts"]:
+                relative = Path(*item["path"].split("/"))
+                with self.subTest(slot=slot, artifact=item["path"]):
+                    self.assertEqual((slot_root / relative).read_bytes(), (release_root / relative).read_bytes())
+        bridge = (release_root / "agent_vm_control_bridge.ts").read_bytes()
+        self.assertEqual(Path(self.loaded["control_path"]).read_bytes(), bridge)
+        self.assertEqual((Path(self.loaded["control_path"]).parent / "agent_vm_control_bridge.ts").read_bytes(), bridge)
 
     def test_format_two_installs_go_binary_bridge_and_retires_old_units(self):
         release_id = "a" * 40

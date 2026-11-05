@@ -147,9 +147,9 @@ GO_UNIT_EXEC_START = {
         "ExecStart=/opt/agent-vm-native/bin/agent-vm-deployd --config /etc/agent-vm-native/deployd.json",
 }
 GO_UNIT_CONTENT_SHA256 = {
-    "agent-vm-native.service": "834cd02f2afbc10d463d79375e8a1aa9d1e2e94157bfaed96476295744817cc6",
-    "agent-vm-native@.service": "1312d885549089b96d73190bf7c7c4fe49626d7a0624e87d33b9462334f2fc06",
-    "agent-vm-deployd.service": "b2f3034f4bcd26172ae046487ca2c2510d79f4e1e13582a7e5a313c1077276cd",
+    "agent-vm-native.service": "c7537077f0299c259e1f32eb4365db2da07fd2e8911dba0164364481e55396cc",
+    "agent-vm-native@.service": "1c5306d7643fcb0a5c8c570b8d95bf7fe8c1808eb8e7a9db03f753556aeb73e5",
+    "agent-vm-deployd.service": "d82ab839539aff06507777f6f77dc8eba83ecabde9e86a3e285534588a5cdd79",
 }
 PRODUCT_UNIT_EXEC_START = {
     "agent-vm-native.service": GO_UNIT_EXEC_START["agent-vm-native.service"],
@@ -175,6 +175,7 @@ HISTORICAL_GO_UNIT_CONTENT_SHA256 = {
         "fd376fdb7733fd7e18503b9681ec8227c39b552107f4bfefae4017c927a0f20c",
         "b2f3034f4bcd26172ae046487ca2c2510d79f4e1e13582a7e5a313c1077276cd",
         "d52f19a9bc53a8cbf66be7e47e02c7586b09d87925497327d6fd1187185d4191",
+        "e967e6ac33ba63adb460ad84b75ad2af6043f89d438a0915477c1e930426d921",
     ),
 }
 HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256 = {
@@ -212,7 +213,6 @@ STATE_CAPABILITY_MARKERS = (
     "legacy-agent-vm-core@1",
     "managed-image-catalog@1",
     "management-operation-audit@1",
-    "oidc-return-path@1",
     "principal-identity@1",
     "session-image-binding@1",
     "token-revocation@1",

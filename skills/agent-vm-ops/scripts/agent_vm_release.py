@@ -840,15 +840,18 @@ class ReleasePublisher:
         doctor: Mapping[str, Any],
         *,
         allow_legacy_observation: bool = False,
+        allow_undrained: bool = False,
     ) -> bool:
         if not isinstance(metrics, Mapping) or not isinstance(doctor, Mapping):
             return False
         observation_ok = metrics.get("observation_consistent") is True
         if allow_legacy_observation and "observation_consistent" not in metrics:
             observation_ok = True
+        draining = metrics.get("draining")
         if (
             metrics.get("up") is not True
-            or metrics.get("draining") is not True
+            or not isinstance(draining, bool)
+            or (not allow_undrained and draining is not True)
             or not observation_ok
         ):
             return False
@@ -876,11 +879,16 @@ class ReleasePublisher:
         manifest: Mapping[str, Any],
         *,
         allow_legacy_observation: bool = False,
+        allow_undrained: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         deadline = self.monotonic() + ACTIVATION_TIMEOUT_SECONDS
         while True:
             try:
-                return self._health(manifest, allow_legacy_observation=allow_legacy_observation)
+                return self._health(
+                    manifest,
+                    allow_legacy_observation=allow_legacy_observation,
+                    allow_undrained=allow_undrained,
+                )
             except ReleaseError as error:
                 detail = error.detail if isinstance(error.detail, Mapping) else {}
                 doctor = detail.get("doctor") if isinstance(detail, Mapping) else None
@@ -997,11 +1005,36 @@ class ReleasePublisher:
                 {"rollback": dict(rollback_result), "status": status, "failed_release_id": failed_release_id},
             )
 
+    def _verify_initial_rollback(
+        self,
+        transaction_id: str,
+        failed_release_id: str,
+        rollback_result: Mapping[str, Any],
+    ) -> None:
+        if (
+            rollback_result.get("rolled_back") is not True
+            or rollback_result.get("release_id") is not None
+            or rollback_result.get("previous_release_id") is not None
+        ):
+            _fail(
+                "rollback_unverified",
+                "initial activation rollback did not remove the candidate release",
+                {"rollback": dict(rollback_result), "failed_release_id": failed_release_id},
+            )
+        status = self._wrapper("status", transaction_id, failed_release_id)
+        if status.get("current_release_id") is not None:
+            _fail(
+                "rollback_unverified",
+                "initial activation rollback left a current release pointer",
+                {"rollback": dict(rollback_result), "status": status, "failed_release_id": failed_release_id},
+            )
+
     def _health(
         self,
         manifest: Mapping[str, Any],
         *,
         allow_legacy_observation: bool = False,
+        allow_undrained: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         doctor = self._control(manifest, "doctor")
         metrics = self._control(manifest, "admin-metrics")
@@ -1012,6 +1045,7 @@ class ReleasePublisher:
             metrics,
             doctor,
             allow_legacy_observation=allow_legacy_observation,
+            allow_undrained=allow_undrained,
         ):
             _fail("remote_health_failed", "remote control health or timer checks failed", {
                 "doctor": {"ready": doctor.get("ready"), "issues": doctor.get("issues")},
@@ -1064,32 +1098,44 @@ class ReleasePublisher:
         verified = self._wrapper("verify", transaction, manifest["release_id"])
         if verified.get("verified") is not True:
             _fail("verification_unverified", "remote wrapper did not confirm release verification")
-        drain = self._control(manifest, "drain-enter", session=session, write=True)
-        if drain.get("draining") is not True:
-            _fail("drain_unverified", "control did not confirm admission drain")
-        self._wait_for_convergence(manifest, timeout, poll)
+        current_status = self._wrapper("status", transaction, manifest["release_id"])
+        current_release_id = current_status.get("current_release_id")
+        if current_release_id is None:
+            initial_install = True
+        elif isinstance(current_release_id, str) and SOURCE_REVISION_RE.fullmatch(current_release_id):
+            initial_install = False
+        else:
+            _fail("wrapper_status_unverified", "remote wrapper returned an invalid current release identity")
+        if not initial_install:
+            drain = self._control(manifest, "drain-enter", session=session, write=True)
+            if drain.get("draining") is not True:
+                _fail("drain_unverified", "control did not confirm admission drain")
+            self._wait_for_convergence(manifest, timeout, poll)
         activation = self._wrapper("activate", transaction, manifest["release_id"])
         if activation.get("activated") is not True:
             _fail("activation_unverified", "remote wrapper did not confirm activation")
         try:
-            self._wait_for_health(manifest)
+            self._wait_for_health(manifest, allow_undrained=initial_install)
         except ReleaseError as health_error:
-            rollback_manifest = legacy_manifest()
             try:
                 rollback_result = self._wrapper("rollback", transaction, manifest["release_id"])
-                self._verify_automatic_rollback(transaction, manifest["release_id"], rollback_result)
-                # The wrapper has switched the control files back to the
-                # retained previous release.  Validate that peer through the
-                # explicit protocol-4 legacy contract, not the failed bundle's
-                # release-specific action window.
-                self._wait_for_health(rollback_manifest, allow_legacy_observation=True)
+                if initial_install:
+                    self._verify_initial_rollback(transaction, manifest["release_id"], rollback_result)
+                else:
+                    self._verify_automatic_rollback(transaction, manifest["release_id"], rollback_result)
+                    rollback_manifest = legacy_manifest()
+                    # The wrapper has switched the control files back to the
+                    # retained previous release. Validate that peer through
+                    # the explicit protocol-4 legacy contract.
+                    self._wait_for_health(rollback_manifest, allow_legacy_observation=True)
             except ReleaseError as rollback_error:
                 raise ReleaseError("rollback_failed", "remote health failed and the single rollback did not restore verified health", {
                     "health_error": health_error.as_dict(),
                     "rollback_error": rollback_error.as_dict(),
-                    "draining": True,
+                    "draining": not initial_install,
                 }) from rollback_error
-            self._control(rollback_manifest, "drain-exit", session=session, write=True)
+            if not initial_install:
+                self._control(legacy_manifest(), "drain-exit", session=session, write=True)
             return {
                 "published": False,
                 "rolled_back": True,
@@ -1097,6 +1143,7 @@ class ReleasePublisher:
                 "release_id": manifest["release_id"],
                 "rollback": rollback_result,
                 "draining": False,
+                "initial_install": initial_install,
             }
         try:
             self._install_local_client(manifest)
@@ -1106,10 +1153,12 @@ class ReleasePublisher:
                 "remote_healthy": True,
                 "remote_release_id": activation.get("release_id", manifest["release_id"]),
                 "transaction_id": transaction,
-                "draining": True,
+                "draining": not initial_install,
+                "initial_install": initial_install,
                 "warnings": [{"code": "local_client_update_failed", "message": local_error.message, "detail": local_error.as_dict()}],
             }
-        self._control(manifest, "drain-exit", session=session, write=True)
+        if not initial_install:
+            self._control(manifest, "drain-exit", session=session, write=True)
         return {
             "published": True,
             "rolled_back": False,
@@ -1117,6 +1166,7 @@ class ReleasePublisher:
             "release_id": manifest["release_id"],
             "local_client_updated": True,
             "draining": False,
+            "initial_install": initial_install,
         }
 
     def rollback(self, *, transaction_id: str, release_id: str) -> dict[str, Any]:

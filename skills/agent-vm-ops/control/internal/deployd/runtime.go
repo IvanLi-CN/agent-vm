@@ -94,7 +94,6 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			if requestErr != nil && runtime.systemdSlotStopped(ctx, slot) {
 				runtime.mu.Lock()
 				evidence := runtime.quiesced[slot]
-				runtime.quiesced[slot] = quiescenceEvidence{}
 				runtime.mu.Unlock()
 				if quiescenceEvidenceProvesStopped(evidence) {
 					observation.CountersKnown = true
@@ -718,8 +717,8 @@ func extractAndVerifyBundle(bundle, destination string) (map[string]any, error) 
 	if err != nil {
 		return nil, err
 	}
-	if format, ok := manifest["format"].(json.Number); !ok || format.String() != "2" {
-		return nil, errors.New("bundle manifest format must be 2")
+	if format, ok := manifest["format"].(json.Number); !ok || !supportedBundleManifestFormat(format) {
+		return nil, errors.New("bundle manifest format is unsupported")
 	}
 	expected := map[string]struct{}{"release-manifest.json": {}, "client-release.json": {}}
 	artifacts, ok := manifest["artifacts"].([]any)
@@ -760,6 +759,14 @@ func extractAndVerifyBundle(bundle, destination string) (map[string]any, error) 
 		return nil, fmt.Errorf("persist verified release bundle: %w", err)
 	}
 	return manifest, nil
+}
+
+func supportedBundleManifestFormat(format json.Number) bool {
+	value, err := format.Int64()
+	if err != nil {
+		return false
+	}
+	return value == releaseManifest.Format || value == releaseManifest.LegacyProductFormat || value == releaseManifest.ProductFormat
 }
 
 func compareReleaseTrees(expectedRoot, actualRoot string) error {
@@ -914,6 +921,9 @@ func (runtime *HostRuntime) FenceController(ctx context.Context, slot string) er
 	if slot == "" || slot == "none" {
 		return nil
 	}
+	if runtime.systemdSlotStopped(ctx, slot) {
+		return nil
+	}
 	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, "/internal/v1/controller-role", map[string]any{"action": "fence"})
 	if err == nil && status == http.StatusOK && responseOK(body) {
 		if valid, ok := body["valid"].(bool); ok && !valid {
@@ -952,6 +962,9 @@ func (runtime *HostRuntime) DisableTraffic(ctx context.Context, slot string) err
 	}
 	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, "/internal/v1/traffic-role", map[string]any{"action": "disable"})
 	if err != nil {
+		if runtime.systemdSlotStopped(ctx, slot) {
+			return nil
+		}
 		return err
 	}
 	if status != http.StatusOK || !responseOK(body) {
@@ -1142,21 +1155,38 @@ func quiescenceEvidenceProvesStopped(evidence quiescenceEvidence) bool {
 
 func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease) error {
 	if target != "" && target != "none" {
-		if !runtime.systemdSlotStopped(ctx, target) {
-			if err := runtime.DisableTraffic(ctx, target); err != nil && !runtime.systemdSlotStopped(ctx, target) {
+		if runtime.systemdSlotStopped(ctx, target) {
+			if err := runtime.systemctl(ctx, "start", "agent-vm-native@"+target+".service"); err != nil {
+				return fmt.Errorf("restart stopped rollback target: %w", err)
+			}
+			if err := runtime.waitSlot(ctx, target); err != nil {
+				return fmt.Errorf("wait for restarted rollback target: %w", err)
+			}
+		}
+		if err := runtime.DisableTraffic(ctx, target); err != nil {
+			return err
+		}
+		if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
+			if stopErr := runtime.Stop(ctx, target); stopErr != nil {
+				return fmt.Errorf("revoke target controller: %w; stop target after revoke failure: %v", err, stopErr)
+			}
+		} else {
+			if err := runtime.Drain(ctx, target); err != nil {
 				return err
 			}
-			if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
-				if stopErr := runtime.Stop(ctx, target); stopErr != nil {
-					return fmt.Errorf("revoke target controller: %w; stop target after revoke failure: %v", err, stopErr)
-				}
-			} else if err := runtime.Stop(ctx, target); err != nil {
+			if err := runtime.Quiesce(ctx, target); err != nil {
+				return err
+			}
+			if err := runtime.Stop(ctx, target); err != nil {
 				return fmt.Errorf("stop target after revoke: %w", err)
 			}
 		}
 	}
 	if previous != "" && previous != "none" {
-		if err := runtime.systemctl(ctx, "start", "agent-vm-native@"+previous+".service"); err != nil {
+		// Restart even when systemd still reports the previous process as active:
+		// controller fencing can leave a resident process alive but not ready, and
+		// startup reconciliation is the only supported path back to admission.
+		if err := runtime.systemctl(ctx, "restart", "agent-vm-native@"+previous+".service"); err != nil {
 			return err
 		}
 		if err := runtime.waitSlot(ctx, previous); err != nil {
@@ -1174,17 +1204,6 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 	}
 	if err := runtime.ExitDrain(ctx, previous); err != nil {
 		return fmt.Errorf("exit rollback drain on slot %s: %w", previous, err)
-	}
-	if target != "" && target != "none" && target != previous {
-		if err := runtime.Drain(ctx, target); err != nil {
-			return err
-		}
-		if err := runtime.Quiesce(ctx, target); err != nil {
-			return err
-		}
-		if err := runtime.Stop(ctx, target); err != nil {
-			return err
-		}
 	}
 	return nil
 }

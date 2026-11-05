@@ -26,6 +26,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
+import uuid
 from typing import Any, Mapping
 
 
@@ -111,9 +113,14 @@ GO_DEPLOYD_PATH = Path("/opt/agent-vm-native/bin/agent-vm-deployd")
 GO_DEPLOY_PATH = Path("/opt/agent-vm-native/bin/agent-vm-deploy")
 GO_SLOT_NAMES = ("blue", "green")
 GO_CONTROL_SOCKET = Path("/run/agent-vm-native/control.sock")
+GO_ACTIVE_SOCKET = Path("/var/lib/agent-vm-native/active/app.sock")
 GO_DEPLOYD_SOCKET = Path("/run/agent-vm-native/deployd.sock")
 STATE_DB_PATH = Path("/var/lib/agent-vm-native/state.sqlite3")
 MIGRATION_TIMEOUT_SECONDS = 9000
+MIGRATION_VERIFY_TIMEOUT_SECONDS = 30
+MIGRATION_VERIFY_POLL_SECONDS = 0.1
+DEPLOYD_READY_TIMEOUT_SECONDS = 30
+DEPLOYD_READY_POLL_SECONDS = 0.1
 LEGACY_EXPIRY_TIMER_RE = re.compile(r"^agent-vm-native-expire-[A-Za-z0-9_.:-]+\.timer$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
 RELEASE_ID_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -193,13 +200,15 @@ def _verify_go_runtime_layout(config: Mapping[str, Any]) -> None:
 
 
 def _prepare_initial_go_runtime_layout(config: Mapping[str, Any]) -> bool:
-    """Allow only the legacy-to-blue-green bootstrap to start without active."""
+    """Allow a legacy or clean-install bootstrap to start without active."""
     active = _go_runtime_root(config) / "active"
     if active.is_symlink() or active.exists():
         _verify_go_runtime_layout(config)
         return False
-    if not Path(STATE_DB_PATH).is_file() and _read_migration_marker(config) is None:
-        _fail("activation_unverified", "Go runtime active pointer is missing and neither legacy SQLite nor migration evidence is present")
+    _read_migration_marker(config)
+    # A clean reinstall has no legacy SQLite yet. The first activation starts
+    # the fixed legacy singleton, which creates an empty source database, and
+    # then lets Deployd migrate that fresh state under its temporary lease.
     for slot in GO_SLOT_NAMES:
         if not _go_slot_root(config, slot).is_dir():
             _fail("activation_unverified", f"initial Go slot directory is missing: {slot}")
@@ -252,6 +261,11 @@ def _migration_marker_is_valid(config: Mapping[str, Any]) -> bool:
 def _go_bridge_target(config: Mapping[str, Any]) -> Path:
     configured = Path(config["control_path"])
     return configured.with_name("agent_vm_control_bridge.ts")
+
+
+def _go_control_socket() -> Path:
+    """Use the stable active slot path after blue-green activation."""
+    return GO_ACTIVE_SOCKET if os.path.lexists(GO_ACTIVE_SOCKET) else GO_CONTROL_SOCKET
 
 
 class WrapperError(Exception):
@@ -1004,6 +1018,8 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
     targets = (
         Path(config["control_path"]),
         _go_control_target(config),
+        _go_binary_target(config, GO_DEPLOYD_PATH),
+        _go_binary_target(config, GO_DEPLOY_PATH),
         Path(config["control_path"]).with_name(RETIRED_CONTROL_NAME),
         Path(config["control_path"]).with_name(RETIRED_CLIENT_NAME),
         Path(config["control_path"]).with_name("agent_vm.ts"),
@@ -1256,8 +1272,40 @@ def _validate_legacy_state_schema(database: sqlite3.Connection) -> None:
             _fail("state_compatibility_unverified", "live state schema is incomplete")
 
 
-def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any] | None = None) -> None:
+def _ensure_drained(
+    config: Mapping[str, Any],
+    target_manifest: Mapping[str, Any] | None = None,
+    *,
+    allow_initial: bool = False,
+) -> None:
     if not config["require_drained"]:
+        return
+    current = _current_target(Path(config["current_link"]), Path(config["release_root"]))
+    if current is None and allow_initial:
+        # A clean installation has no admission owner to drain. It is safe to
+        # activate only when every fixed runtime unit is already stopped; an
+        # existing process without a release pointer would otherwise bypass
+        # the normal drain contract.
+        for unit in (
+            "agent-vm-native.service",
+            "agent-vm-native@blue.service",
+            "agent-vm-native@green.service",
+            "agent-vm-deployd.service",
+        ):
+            try:
+                process = subprocess.run(
+                    ["systemctl", "is-active", "--quiet", unit],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=False,
+                    timeout=30,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                _fail("drain_unverified", "initial activation runtime state could not be verified")
+            if process.returncode == 0:
+                _fail("drain_required", "initial activation requires the fixed runtime units to be stopped")
+            if process.returncode not in {3, 4, 5}:
+                _fail("drain_unverified", "initial activation runtime state could not be verified")
         return
     command = [BUN_PATH, str(config["control_path"])]
     sidecar = Path(config["control_path"]).with_name("client-release.json")
@@ -1268,7 +1316,7 @@ def _ensure_drained(config: Mapping[str, Any], target_manifest: Mapping[str, Any
             _fail("drain_unverified", "installed client release metadata is invalid")
         view = metadata.get("client_view") if isinstance(metadata, Mapping) else None
         if isinstance(metadata, Mapping) and metadata.get("format") in {GO_MANIFEST_FORMAT, LEGACY_PRODUCT_MANIFEST_FORMAT, PRODUCT_MANIFEST_FORMAT} and isinstance(view, Mapping) and view.get("transport") == "go-request":
-            command = [str(GO_CONTROL_PATH), "request", "--socket", str(GO_CONTROL_SOCKET), "--timeout", "30s"]
+            command = [str(GO_CONTROL_PATH), "request", "--socket", str(_go_control_socket()), "--timeout", "30s"]
     def control_result(action: str, *, allow_legacy_unknown: bool = False) -> Mapping[str, Any] | None:
         try:
             process = subprocess.run(
@@ -1385,6 +1433,63 @@ def _run_deployd_cli(command: str, *arguments: str, timeout_seconds: int) -> sub
         _fail("activation_failed", f"Deployd {command} could not be verified")
 
 
+def _wait_for_deployd_ready() -> None:
+    """Wait until the restarted Deployd accepts requests on its UDS."""
+    deadline = time.monotonic() + DEPLOYD_READY_TIMEOUT_SECONDS
+    while True:
+        process = _run_deployd_cli("status", timeout_seconds=5)
+        if process.returncode == 0:
+            return
+        if time.monotonic() >= deadline:
+            _fail("activation_failed", "Deployd did not become ready on its Unix socket")
+        time.sleep(DEPLOYD_READY_POLL_SECONDS)
+
+
+def _release_initial_migration_drain(config: Mapping[str, Any]) -> None:
+    """Release the one-time migration fence after both slots are running."""
+    marker = _read_migration_marker(config)
+    if marker is None or not ID_RE.fullmatch(marker["transaction_id"]):
+        _fail("activation_unverified", "initial migration fence identity is invalid")
+    deadline = time.monotonic() + DEPLOYD_READY_TIMEOUT_SECONDS
+    last_error = "slot control request is not ready"
+    while True:
+        request = {
+            "protocol": 4,
+            "action": "drain-exit",
+            "session_id": "release-agent-vm-migration-" + marker["transaction_id"],
+            "generation": 0,
+            "operation_id": "release-migration-drain-exit-" + uuid.uuid4().hex,
+            "preserve_traffic": False,
+        }
+        try:
+            process = subprocess.run(
+                [str(GO_CONTROL_PATH), "request", "--socket", str(GO_ACTIVE_SOCKET), "--timeout", "5s"],
+                input=json.dumps(request).encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last_error = type(exc).__name__
+        else:
+            try:
+                response = json.loads(process.stdout)
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                last_error = "slot control response is not JSON"
+            else:
+                if process.returncode == 0 and isinstance(response, Mapping) and response.get("ok") is True:
+                    result = response.get("result")
+                    if isinstance(result, Mapping) and result.get("draining") is False:
+                        return
+                    last_error = "initial migration fence release was not confirmed"
+                else:
+                    last_error = "initial migration fence release was rejected"
+        if time.monotonic() >= deadline:
+            _fail("activation_unverified", "initial migration fence release could not be verified", {"last_error": last_error})
+        time.sleep(DEPLOYD_READY_POLL_SECONDS)
+
+
 def _needs_migration_recovery(expected_transaction_id: str | None = None) -> str | None:
     process = _run_deployd_cli("status", timeout_seconds=30)
     if process.returncode != 0:
@@ -1410,13 +1515,11 @@ def _needs_migration_recovery(expected_transaction_id: str | None = None) -> str
     return None
 
 
-def _migration_transaction_is_finalized(transaction_id: str) -> bool:
-    process = _run_deployd_cli("transaction", "--transaction", transaction_id, timeout_seconds=30)
-    if process.returncode != 0:
-        return False
+def _transaction_payload_is_finalized(payload: bytes, transaction_id: str) -> bool:
     try:
-        payload = json.loads(process.stdout.decode("utf-8"))
-        transaction = payload.get("value", {}).get("transaction")
+        decoded = json.loads(payload.decode("utf-8"))
+        value = decoded.get("value") if isinstance(decoded, Mapping) else None
+        transaction = value.get("transaction", value) if isinstance(value, Mapping) else value
     except (UnicodeError, json.JSONDecodeError, AttributeError):
         return False
     return (
@@ -1429,19 +1532,38 @@ def _migration_transaction_is_finalized(transaction_id: str) -> bool:
     )
 
 
-def _verify_migration_completion(config: Mapping[str, Any]) -> None:
+def _migration_transaction_is_finalized(transaction_id: str, payload: bytes | None = None) -> bool:
+    if payload is not None and _transaction_payload_is_finalized(payload, transaction_id):
+        return True
+    process = _run_deployd_cli("transaction", "--transaction", transaction_id, timeout_seconds=30)
+    if process.returncode != 0:
+        return False
+    return _transaction_payload_is_finalized(process.stdout, transaction_id)
+
+
+def _verify_migration_completion(config: Mapping[str, Any], migration_response: bytes | None = None) -> None:
     marker = _read_migration_marker(config)
-    if marker is None or not _migration_transaction_is_finalized(marker["transaction_id"]):
+    if marker is None:
         _fail(
             "activation_unverified",
             "migration completion marker is not backed by the finalized Deployd transaction",
         )
+    deadline = time.monotonic() + MIGRATION_VERIFY_TIMEOUT_SECONDS
+    first_check = migration_response
+    while not _migration_transaction_is_finalized(marker["transaction_id"], first_check):
+        first_check = None
+        if time.monotonic() >= deadline:
+            _fail(
+                "activation_unverified",
+                "migration completion marker is not backed by the finalized Deployd transaction",
+            )
+        time.sleep(MIGRATION_VERIFY_POLL_SECONDS)
 
 
 def _run_initial_state_migration(config: Mapping[str, Any]) -> None:
     process = _run_deployd_cli("migrate", timeout_seconds=MIGRATION_TIMEOUT_SECONDS)
     if process.returncode == 0:
-        _verify_migration_completion(config)
+        _verify_migration_completion(config, process.stdout)
         return
     marker = _read_migration_marker(config)
     expected_transaction_id = marker.get("transaction_id") if marker is not None else None
@@ -1456,7 +1578,7 @@ def _run_initial_state_migration(config: Mapping[str, Any]) -> None:
             timeout_seconds=MIGRATION_TIMEOUT_SECONDS,
         )
         if recovery.returncode == 0:
-            _verify_migration_completion(config)
+            _verify_migration_completion(config, recovery.stdout)
             return
         _fail(
             "migration_recovery_required",
@@ -1513,6 +1635,13 @@ def _activate_go_runtime(
         _systemctl("stop", unit, allow_missing=True)
         _systemctl("disable", unit, allow_missing=True)
     if deployd_enabled:
+        if bootstrap_active and not _migration_marker_is_valid(config):
+            # The legacy singleton is the migration source on a clean first
+            # activation. Its controller lease is granted by Deployd before
+            # drain-enter; it is stopped before either slot is started.
+            _systemctl("enable", "agent-vm-native.service")
+            _systemctl("restart", "agent-vm-native.service")
+            _systemctl("is-active", "agent-vm-native.service")
         migration_started = False
         migration_completed = False
         try:
@@ -1523,6 +1652,7 @@ def _activate_go_runtime(
             _systemctl("enable", "agent-vm-deployd.service")
             _systemctl("restart", "agent-vm-deployd.service")
             _systemctl("is-active", "agent-vm-deployd.service")
+            _wait_for_deployd_ready()
             migration_started = True
             _run_initial_state_migration(config)
             migration_completed = True
@@ -1538,6 +1668,8 @@ def _activate_go_runtime(
                 _systemctl("enable", unit)
                 _systemctl("restart", unit)
                 _systemctl("is-active", unit)
+            if bootstrap_active:
+                _release_initial_migration_drain(config)
             return
         except WrapperError as failure:
             # A partial bootstrap must not leave a running slot or Deployd
@@ -1697,6 +1829,9 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
         elif item["role"] == "control":
             if item["path"] == "agent_vm_control_bridge.ts":
                 _copy_atomic(source, _go_bridge_target(config), owner_uid, item["mode"])
+                legacy_target = Path(config["control_path"])
+                if legacy_target != _go_bridge_target(config):
+                    _copy_atomic(source, legacy_target, owner_uid, item["mode"])
             elif item["path"] == "bin/agent-vm-control":
                 _copy_atomic(source, _go_control_target(config), owner_uid, item["mode"])
             elif item["path"] == "bin/agent-vm-deployd":
@@ -1748,6 +1883,20 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
     client_sidecar = release_root / "client-release.json"
     _require_owned_regular(client_sidecar, owner_uid, 0o644)
+    # Format 4 starts the two slot units immediately after migration. The
+    # resident binary is also the slot binary, so install both copies as
+    # part of the same activation transaction before systemd is touched.
+    if manifest["format"] == PRODUCT_MANIFEST_FORMAT:
+        for slot in GO_SLOT_NAMES:
+            slot_root = _go_slot_root(config, slot)
+            for item in manifest["artifacts"]:
+                relative = Path(*PurePosixPath(item["path"]).parts)
+                source = release_root / relative
+                _require_owned_regular(source, owner_uid, item["mode"])
+                _copy_atomic(source, slot_root / relative, owner_uid, item["mode"])
+            _copy_atomic(manifest_source, slot_root / "release-manifest.json", owner_uid, 0o644)
+            _copy_atomic(client_sidecar, slot_root / "client-release.json", owner_uid, 0o644)
+            _atomic_symlink(Path("/run/agent-vm-native") / slot / "app.sock", slot_root / "app.sock")
     _copy_atomic(client_sidecar, Path(config["control_path"]).with_name("client-release.json"), owner_uid, 0o644)
     for name in (RETIRED_CONTROL_NAME, RETIRED_CLIENT_NAME):
         retired = Path(config["control_path"]).with_name(name)
@@ -1874,7 +2023,6 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
         candidate_manifest = load_release_manifest(staged / MANIFEST_NAME)
     except ManifestError as exc:
         _fail(exc.code, exc.message, exc.detail)
-    _ensure_drained(config, candidate_manifest)
     activation_path = Path(config["state_root"]) / (transaction_id + ".activation.json")
     if activation_path.exists() or activation_path.is_symlink():
         _fail("transaction_exists", "activation record already exists for this transaction")
@@ -1883,6 +2031,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     previous_link = Path(config["previous_link"])
     old_current = _current_target(current_link, release_root)
     old_previous = _current_target(previous_link, release_root)
+    _ensure_drained(config, candidate_manifest, allow_initial=old_current is None)
     if old_current is not None and old_current == old_previous:
         _fail("activation_unverified", "current and previous pointers must not target the same release")
     if old_current is not None:
