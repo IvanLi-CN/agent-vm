@@ -1147,24 +1147,30 @@ func quiescenceEvidenceProvesStopped(evidence quiescenceEvidence) bool {
 
 func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease) error {
 	if target != "" && target != "none" {
-		if !runtime.systemdSlotStopped(ctx, target) {
-			if err := runtime.DisableTraffic(ctx, target); err != nil && !runtime.systemdSlotStopped(ctx, target) {
+		if runtime.systemdSlotStopped(ctx, target) {
+			if err := runtime.systemctl(ctx, "start", "agent-vm-native@"+target+".service"); err != nil {
+				return fmt.Errorf("restart stopped rollback target: %w", err)
+			}
+			if err := runtime.waitSlot(ctx, target); err != nil {
+				return fmt.Errorf("wait for restarted rollback target: %w", err)
+			}
+		}
+		if err := runtime.DisableTraffic(ctx, target); err != nil {
+			return err
+		}
+		if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
+			if stopErr := runtime.Stop(ctx, target); stopErr != nil {
+				return fmt.Errorf("revoke target controller: %w; stop target after revoke failure: %v", err, stopErr)
+			}
+		} else {
+			if err := runtime.Drain(ctx, target); err != nil {
 				return err
 			}
-			if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
-				if stopErr := runtime.Stop(ctx, target); stopErr != nil {
-					return fmt.Errorf("revoke target controller: %w; stop target after revoke failure: %v", err, stopErr)
-				}
-			} else {
-				if err := runtime.Drain(ctx, target); err != nil {
-					return err
-				}
-				if err := runtime.Quiesce(ctx, target); err != nil {
-					return err
-				}
-				if err := runtime.Stop(ctx, target); err != nil {
-					return fmt.Errorf("stop target after revoke: %w", err)
-				}
+			if err := runtime.Quiesce(ctx, target); err != nil {
+				return err
+			}
+			if err := runtime.Stop(ctx, target); err != nil {
+				return fmt.Errorf("stop target after revoke: %w", err)
 			}
 		}
 	}
