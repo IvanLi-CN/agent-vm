@@ -23,3 +23,14 @@ func TestContextMutexCanceledWaitNeverAcquiresLater(t *testing.T) {
 	}
 	lock.Unlock()
 }
+
+func TestManagementSchemaLockWaitHonorsDeadline(t *testing.T) {
+	backend := &remoteBackend{}
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Millisecond)
+	defer cancel()
+	if err := backend.ensureManagementSchema(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("schema lock error=%v", err)
+	}
+}

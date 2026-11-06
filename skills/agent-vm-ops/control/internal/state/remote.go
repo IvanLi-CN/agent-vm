@@ -373,7 +373,9 @@ func (r *remoteBackend) open(ctx context.Context, allowCreate bool) error {
 	if err := r.ensureRemoteEpoch(ctx); err != nil {
 		return err
 	}
-	r.mu.Lock()
+	if err := r.mu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer r.mu.Unlock()
 	return r.syncLocked(ctx)
 }
@@ -684,7 +686,9 @@ func (r *remoteBackend) ensureRemoteEpoch(ctx context.Context) error {
 }
 
 func (r *remoteBackend) ensureManagementSchema(ctx context.Context) error {
-	r.mu.Lock()
+	if err := r.mu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer r.mu.Unlock()
 
 	statements := make([]remoteStatement, 0, 12)
@@ -2386,7 +2390,9 @@ func migrateSQLiteToRQLite(ctx context.Context, sqlitePath, rqliteURL string, cl
 		return err
 	}
 	defer target.Close()
-	target.remote.mu.Lock()
+	if err := target.remote.mu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer target.remote.mu.Unlock()
 	targetSnapshot, err := readRemoteMigrationSnapshot(ctx, target, true)
 	if err != nil {
@@ -2436,7 +2442,9 @@ func migrationTargetDigest(ctx context.Context, rqliteURL string, client *http.C
 		return "", err
 	}
 	defer target.Close()
-	target.remote.mu.Lock()
+	if err := target.remote.mu.LockContext(ctx); err != nil {
+		return "", err
+	}
 	defer target.remote.mu.Unlock()
 	snapshot, err := readRemoteMigrationSnapshot(ctx, target, false)
 	if err != nil {
