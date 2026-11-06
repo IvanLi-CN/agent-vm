@@ -3,6 +3,7 @@ package deployd
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -381,5 +382,47 @@ func TestCapacityHealthRemainsCoherentAcrossLaterCommits(t *testing.T) {
 	}
 	if metrics["observation_epoch"] != "before-later-commit" || health["state_epoch"] != metrics["observation_epoch"] || health["ready"] != true {
 		t.Fatalf("incoherent capacity/health: metrics=%v health=%v", metrics, health)
+	}
+}
+
+func TestInventoryRetriesConcurrentMaintenanceCommit(t *testing.T) {
+	for _, keepsChanging := range []bool{false, true} {
+		t.Run(fmt.Sprint(keepsChanging), func(t *testing.T) {
+			directory, err := os.MkdirTemp("", "avm-inventory-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(directory)
+			socket := filepath.Join(directory, "app.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				consistent := calls > 1 && !keepsChanging
+				json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "action": "admin-status", "result": map[string]any{
+					"up": consistent, "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "partial": !consistent, "observation_consistent": consistent,
+					"unknown": 0, "probed": 0, "verified": 0, "timed_out": 0, "tasks": []any{},
+				}})
+			}))
+			server.Listener.Close()
+			server.Listener = listener
+			server.Start()
+			defer server.Close()
+			runtime := NewHostRuntime(Config{BlueSocket: socket})
+			inventory, _, err := runtime.observeSource(context.Background(), "blue", "inventory", "admin-status")
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCalls := 2
+			if keepsChanging {
+				wantCalls = 3
+			}
+			if calls != wantCalls || inventoryObservationCoherent(inventory) == keepsChanging {
+				t.Fatalf("calls=%d inventory=%v", calls, inventory)
+			}
+		})
 	}
 }

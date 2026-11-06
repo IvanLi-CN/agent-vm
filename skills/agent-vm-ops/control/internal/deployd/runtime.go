@@ -1372,6 +1372,19 @@ func (runtime *HostRuntime) control(ctx context.Context, socket string, request 
 }
 
 func (runtime *HostRuntime) observeSource(ctx context.Context, slot, source, action string) (map[string]any, time.Time, error) {
+	for attempt := 1; ; attempt++ {
+		result, observedAt, err := runtime.observeSourceOnce(ctx, slot, source, action)
+		// Inventory probes run outside state locks. The scheduler persists its
+		// maintenance cursor every second, so a single inventory can legitimately
+		// cross an epoch even without a guest transition. Require a coherent new
+		// sample; never reinterpret an inconsistent sample as healthy.
+		if err != nil || action != "admin-status" || inventoryObservationCoherent(result) || attempt >= 3 || ctx.Err() != nil {
+			return result, observedAt, err
+		}
+	}
+}
+
+func (runtime *HostRuntime) observeSourceOnce(ctx context.Context, slot, source, action string) (map[string]any, time.Time, error) {
 	// The response is the exact sample requested. A later GET of the shared
 	// snapshot can race another reader publishing a different sample.
 	body, status, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": action})
