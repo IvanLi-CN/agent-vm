@@ -6050,7 +6050,18 @@ func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
 
 type quiescentDestroyRecoveryGuest struct {
 	*quiescentStartupGuest
-	deleted bool
+	deleted         bool
+	afterQuiescence func()
+}
+
+func (guest *quiescentDestroyRecoveryGuest) VerifyRecoveryQuiescence(ctx context.Context) error {
+	if err := guest.quiescentStartupGuest.VerifyRecoveryQuiescence(ctx); err != nil {
+		return err
+	}
+	if guest.afterQuiescence != nil {
+		guest.afterQuiescence()
+	}
+	return nil
 }
 
 func (guest *quiescentDestroyRecoveryGuest) Delete(_ context.Context, _ string) error {
@@ -6066,7 +6077,7 @@ func (guest *quiescentDestroyRecoveryGuest) Config(ctx context.Context, name str
 }
 
 func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T) {
-	for _, scenario := range []string{"recover", "recover-identified", "live-identity", "invalid-identity", "not-drained", "ordinary-drain", "not-resident", "bad-digest", "wrong-generation", "not-destroy", "native-busy", "active-operation", "role-lost", "not-startup-fenced", "partial-identity", "already-recovered"} {
+	for _, scenario := range []string{"recover", "recover-identified", "live-identity", "invalid-identity", "not-drained", "ordinary-drain", "not-resident", "bad-digest", "wrong-generation", "not-destroy", "native-busy", "active-operation", "role-lost", "role-lost-after-quiescence", "not-startup-fenced", "partial-identity", "already-recovered"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.WithValue(context.Background(), startupRecoveryFenceContextKey{}, true)
 			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
@@ -6154,13 +6165,35 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 				guest.quiescenceErr = errors.New("native background operations are not clear")
 			}
 			service := New(store, config.Defaults(), Options{Guest: guest, Resident: scenario != "not-resident"})
+			gate := controllerrole.New("green", time.Now)
+			if err := gate.Grant(controllerrole.Lease{Slot: "green", Term: 1, LeaseID: "recovery-lease", Nonce: "recovery-nonce", Generation: 1, Expiry: time.Now().Add(time.Minute)}); err != nil {
+				t.Fatal(err)
+			}
+			service.SetMutationGate(gate.Valid)
+			service.SetMutationFence(gate.Changes)
+			service.SetMutationCommit(gate.WithValid)
+			if scenario == "role-lost-after-quiescence" {
+				guest.afterQuiescence = gate.Fence
+			}
+			step := func(call func() error) error {
+				t.Helper()
+				done := make(chan error, 1)
+				go func() { done <- call() }()
+				select {
+				case err := <-done:
+					return err
+				case <-time.After(2 * time.Second):
+					t.Fatal("recovery blocked while using the real controller commit gate")
+					return nil
+				}
+			}
 			if scenario == "active-operation" {
 				defer service.markOperationActive("other")()
 			}
 			if scenario == "role-lost" {
-				service.SetMutationGate(func() bool { return false })
+				gate.Fence()
 			}
-			err = service.reconcilePendingWorker(ctx, "original-destroy")
+			err = step(func() error { return service.reconcilePendingWorker(ctx, "original-destroy") })
 			operation, loadErr := store.GetOperation(ctx, "original-destroy")
 			if loadErr != nil {
 				t.Fatal(loadErr)
@@ -6169,6 +6202,9 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 			if scenario != "recover" && scenario != "recover-identified" {
 				if err == nil || worker["state"] != "starting" || operation.Response["outcome"] != "pending" {
 					t.Fatalf("unsafe recovery: err=%v record=%#v", err, operation.Response)
+				}
+				if scenario == "role-lost-after-quiescence" && operation.Response["_worker_recovery_evidence"] != nil {
+					t.Fatal("revoked controller committed recovery evidence")
 				}
 				return
 			}
@@ -6189,7 +6225,7 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 			}
 			// Terminal journal recording must retain this verified evidence
 			// even when the later cleanup result does not repeat it.
-			if err := service.StartupReconcile(context.Background()); err != nil {
+			if err := step(func() error { return service.StartupReconcile(context.Background()) }); err != nil {
 				t.Fatal(err)
 			}
 			terminal, err := store.GetOperation(ctx, "original-destroy")
