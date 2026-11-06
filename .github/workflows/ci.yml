@@ -224,7 +224,7 @@ jobs:
         if: (matrix.os == 'macos-latest' && needs.classify.outputs.macos == 'true') || needs.classify.outputs.full != 'true'
         run: bun run test:skills
       - name: Build product packages
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.full == 'true'
+        if: matrix.os == 'ubuntu-latest'
         run: |
           build_root="$(mktemp -d)"
           trap 'rm -rf "$build_root"' EXIT
