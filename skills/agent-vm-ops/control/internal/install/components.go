@@ -11,6 +11,7 @@ import (
 	"hash"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -81,7 +82,11 @@ func fetchComponent(ctx context.Context, name string, a componentArtifact, root 
 	if err != nil {
 		return "", err
 	}
-	client := &http.Client{Timeout: 10 * time.Minute, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.TLSHandshakeTimeout = 30 * time.Second
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Minute, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if req.URL.Scheme != "https" || len(via) > 5 {
 			return errors.New("unsafe dependency redirect")
 		}
@@ -89,7 +94,13 @@ func fetchComponent(ctx context.Context, name string, a componentArtifact, root 
 	}}
 	response, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("download %s failed", name)
+		// Redirect URLs can contain signed query strings. Report the underlying
+		// network cause without copying those URLs into installation logs.
+		var requestError *url.Error
+		if errors.As(err, &requestError) {
+			err = requestError.Err
+		}
+		return "", fmt.Errorf("download %s failed: %w", name, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode != 200 {
