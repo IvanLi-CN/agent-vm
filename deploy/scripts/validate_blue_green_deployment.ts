@@ -103,6 +103,7 @@ forbidText(rqliteUnit, "0.0.0.0", "rqlite does not bind to all interfaces");
 const slotUnit = read(join(assetsRoot, "systemd/agent-vm-native@.service"));
 requireText(slotUnit, "ExecStart=/var/lib/agent-vm-native/slots/%i/bin/agent-vm-control", "slot service executes the atomically staged candidate binary");
 requireText(slotUnit, "--manifest /var/lib/agent-vm-native/slots/%i/release-manifest.json", "slot service uses its staged manifest path");
+requireText(slotUnit, "ExecStartPost=/opt/agent-vm-native/bin/agent-vm-deploy wait-process --slot %i --timeout 55", "slot startup waits only for its fenced process interface");
 forbidText(slotUnit, "BindReadOnlyPaths=", "slot service does not alias a candidate manifest over the shared release root");
 requireText(slotUnit, "Group=agent-vm-web", "slot service owns the protected web socket group");
 requireText(slotUnit, "Requires=agent-vm-rqlite.service", "slot service requires the state authority");
@@ -113,6 +114,8 @@ requireText(deploydUnit, "ExecStart=/opt/agent-vm-native/bin/agent-vm-deployd --
 requireText(deploydUnit, "ReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native", "Deployd write paths include the state root required for atomic active replacement");
 requireText(deploydUnit, "User=root", "Deployd owns the host deployment boundary");
 forbidText(deploydUnit, "Requires=agent-vm-rqlite.service", "Deployd does not depend on the business state authority");
+requireText(deploydUnit, "After=agent-vm-native@blue.service agent-vm-native@green.service", "cold-start jobs expose their role interfaces before Deployd observes them");
+forbidText(deploydUnit, "Wants=agent-vm-native@blue.service", "Deployd does not start slots outside a deployment transaction");
 
 const deploydConfigText = read(join(assetsRoot, "deployd.json.example"));
 try {

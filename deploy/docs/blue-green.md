@@ -45,7 +45,7 @@
 
 `agent-vm-native@.service` 为每个槽位启动一个 Go 服务，并使用该槽位目录中的 manifest。两个槽位可以同时存活并接受只读观测，但没有有效 controller lease 的槽位不得运行 startup reconcile、timer reconcile、age GC 或任何 scheduler-driven native mutation。
 
-`agent-vm-deployd.service` 位于两个槽位之外，是稳定的宿主级部署控制器。它不通过 `Wants=` 或 `After=` 拉起蓝、绿槽位；槽位只能由部署事务在正确阶段显式启动。这样首次状态迁移可以先停止旧 SQLite writer，再启动新槽位，避免迁移期间出现第三个 scheduler 或新的业务 writer。
+`agent-vm-deployd.service` 位于两个槽位之外，是稳定的宿主级部署控制器，不通过 `Wants=` 拉起蓝、绿槽位。槽位由部署事务显式启动，或由已启用的 systemd 开机配置启动；`After=` 只约束已经排队的启动任务，不会创建槽位启动任务。槽位的 `ExecStartPost` 使用 `agent-vm-deploy wait-process` 等待只读进程接口，接受尚无 controller lease 的 `process_ready=true`，不等待业务 readiness；冷启动时 Deployd 在这一步完成后才检查槽位，避免误停尚未创建 socket 的进程。首次迁移仍先停止旧 SQLite writer，再由事务启动新槽位，不会自动启动额外 writer。
 
 启动 unit 前，使用随附的 `sysusers.d` 和 `tmpfiles.d` 条目运行 `systemd-sysusers` 与 `systemd-tmpfiles --create`。这些条目创建专用的 rqlite 用户和非特权 `caddy` 用户；`active` 不由 tmpfiles 创建，因为它必须是原子符号链接。
 

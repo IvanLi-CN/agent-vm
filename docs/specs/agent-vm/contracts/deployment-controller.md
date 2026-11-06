@@ -98,6 +98,8 @@ Grafana 面板通过 Prometheus 查询 Deployd 输出，例如：
 
 支持续租的槽位在 health 中明确声明 `controller_lease_renewal=true`。Deployd 必须先确认该能力；未声明的旧槽位继续使用原有的更高 term 授权路径，不能向其发送同 term 请求而引发周期性拒绝和 hard-fence。旧路径仍有角色更换会中断在途作业的历史限制，因此升级须保持 drain，在新槽位完成验证前不得宣称长操作续租验收通过。对于明确声明续租能力的槽位，持续协调不得通过每次更换 term、lease ID 或 nonce 来续租，否则会取消正在进行的 native mutation。同一 Deployd 进程只能根据新鲜运行时观测延长自己持有的有效 lease 的 expiry，必须保持 slot、term、lease ID、generation、nonce、owner PID 和进程启动标识不变，且不得缩短 expiry。槽位接受这种续租时不触发角色变更通知；真正的撤销、过期、身份变化和 owner 退出仍立即 fencing。已过期或已撤销的 lease 不得复活；Deployd 重启后必须重新观测并分配更高 term，不能从持久化快照恢复身份。缺少进程启动标识时不允许复用旧身份。
 
+冷启动必须区分进程接口就绪与依赖 controller role 的业务就绪。槽位启动任务通过只读 health 验证 `process_ready=true` 后才能完成；此时允许 HTTP 503、业务未就绪且无 controller 或 traffic。Deployd 对已经排队的槽位启动任务仅设置启动顺序，不通过依赖关系额外拉起槽位；必须在进程接口就绪后重新观测并授权，不能把尚未创建 socket 的启动阶段误判为必须停止的失联 controller。等待进程接口最多五十五秒，不授予任何角色，不要求旧槽位支持新的 systemd notify 协议。
+
 首次授予后的就绪等待最多六十秒；等待期间只能通过已验证进程的角色通道延长同一有效 lease，通道失败或身份变化时立即停止并 fencing。持续协调复用本轮完成并持久化的观测更新指标，不为指标发布再次串行采集一遍业务状态；已就绪且身份未变的控制器续租后无需重复等待启动协调。
 
 业务槽位的后台容量、清单和健康采样复用同一次只读状态快照，每十秒完成一轮，单轮最多八秒；不能用三条独立循环重复同步远端状态。部署事务停在 standby validation 或尚未执行的 controller handoff 时，只能续租当前 Deployd 进程已经验证、尚未过期的 previous/active lease，不能因为等待运维者执行下一命令而撤销权限，也不能为过期角色分配新身份。不确定阶段、恢复事务和进程身份不符仍须 fencing。
