@@ -28,15 +28,15 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: 1.27.3
-          cache-dependency-path: skills/agent-vm-ops/control/go.sum
-      - name: Cache Bun downloads
-        uses: actions/cache@v4
-        with:
-          path: ~/.bun/install/cache
-          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
+          cache: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Restore CI caches
+        id: ci_cache
+        uses: ./.github/actions/ci-cache-restore
+        with:
+          role: portable
       - name: Record validation runtimes
         run: |
           bun --version
@@ -81,6 +81,14 @@ jobs:
           bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target client --output "$build_root/client.tar"
           bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target linux/amd64 --output "$build_root/amd64.tar"
           bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target linux/arm64 --output "$build_root/arm64.tar"
+      - name: Finalize CI caches
+        if: always() && steps.ci_cache.outcome == 'success'
+        uses: ./.github/actions/ci-cache-save
+        with:
+          state: ${{ steps.ci_cache.outputs.state }}
+          role: portable
+          publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && job.status == 'success' }}
+
   heavy:
     name: Main Skill and race validation
     strategy:
@@ -100,15 +108,15 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: 1.27.3
-          cache-dependency-path: skills/agent-vm-ops/control/go.sum
-      - name: Cache Bun downloads
-        uses: actions/cache@v4
-        with:
-          path: ~/.bun/install/cache
-          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
+          cache: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
+      - name: Restore CI caches
+        id: ci_cache
+        uses: ./.github/actions/ci-cache-restore
+        with:
+          role: heavy
       - name: Record validation runtimes
         run: |
           bun --version
@@ -124,6 +132,14 @@ jobs:
         working-directory: skills/agent-vm-ops/control
         run: go test -race -count=1 ./...
         if: matrix.os == 'ubuntu-latest'
+      - name: Finalize CI caches
+        if: always() && steps.ci_cache.outcome == 'success'
+        uses: ./.github/actions/ci-cache-save
+        with:
+          state: ${{ steps.ci_cache.outputs.state }}
+          role: heavy
+          publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && job.status == 'success' }}
+
   main-gate:
     name: Main gate
     needs:
