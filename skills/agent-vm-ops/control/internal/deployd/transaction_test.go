@@ -232,6 +232,46 @@ func TestManagerCompletesBlueGreenTransactionWithOneRuntime(t *testing.T) {
 	}
 }
 
+func TestStageDrainedControllerForRecovery(t *testing.T) {
+	for _, mode := range []string{"drained", "not-drained", "in-flight", "worker", "unknown-counters", "no-controller", "target-controller"} {
+		t.Run(mode, func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			active := SlotObservation{Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: false, Draining: true, ControllerOwned: true, PendingOperations: 1}
+			target := SlotObservation{Slot: "green", ProcessUp: true, ProcessReady: true}
+			runtime := &fakeRuntime{active: "blue", traffic: map[string]bool{}, observations: map[string]SlotObservation{}}
+			switch mode {
+			case "not-drained":
+				active.Draining = false
+			case "in-flight":
+				active.InFlightRequests = 1
+			case "worker":
+				active.NativeWorkers = 1
+			case "unknown-counters":
+				runtime.unknownCounters = true
+			case "no-controller":
+				active.ControllerOwned = false
+			case "target-controller":
+				target.ControllerOwned = true
+			}
+			runtime.observations["blue"], runtime.observations["green"] = active, target
+			manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+			transaction, err := manager.Stage(context.Background(), "green", "/tmp/recovery.tar")
+			if mode == "drained" {
+				if err != nil || transaction.Phase != PhaseStandbyValidation {
+					t.Fatalf("stage = %#v, %v", transaction, err)
+				}
+			} else if err == nil || len(runtime.sequence) != 0 {
+				t.Fatalf("unsafe stage: %#v, %v, %v", transaction, err, runtime.sequence)
+			}
+		})
+	}
+}
+
 func TestManagerFencesUncertainStageFailure(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })

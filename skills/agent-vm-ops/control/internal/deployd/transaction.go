@@ -1260,8 +1260,16 @@ func validateStageObservation(observation RuntimeSnapshot, targetSlot string, no
 	}
 	active, activeOK := observation.Slots[observation.ActiveSlot]
 	target, targetOK := observation.Slots[targetSlot]
-	if !activeOK || !active.ProcessUp || !active.ProcessReady || !active.Ready || !active.ControllerOwned || !active.TrafficAccepting {
+	if !activeOK || !active.ProcessUp || !active.ProcessReady || !active.ControllerOwned {
 		return errors.New("active slot controller and traffic role is not verified")
+	}
+	if !active.Ready || !active.TrafficAccepting {
+		// A broken business controller must still be repairable through deployd.
+		// Staging only replaces the inactive slot; the candidate must independently
+		// reconcile all pending business operations before activation can proceed.
+		if !active.Draining || active.TrafficAccepting || !active.CountersKnown || active.InFlightRequests != 0 || active.NativeWorkers != 0 {
+			return errors.New("degraded active slot is not drained and idle for recovery staging")
+		}
 	}
 	if !targetOK {
 		return fmt.Errorf("target slot %s was not observed", targetSlot)
