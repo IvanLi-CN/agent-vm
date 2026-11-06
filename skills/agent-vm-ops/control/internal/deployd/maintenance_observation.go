@@ -69,6 +69,11 @@ func sameLeaseAuthority(a, b controllerrole.Lease) bool { a.Expiry = b.Expiry; r
 // observeRuntime preserves only a live, process-pinned existing authority while
 // slow business probes run. Read-only status calls never enter this path.
 func (manager *Manager) observeRuntime(ctx context.Context) (RuntimeSnapshot, error) {
+	// The enclosing readiness/transaction heartbeat already owns renewal.
+	// A second heartbeat would race its exact expiry proof and fence the owner.
+	if ctx.Value(transactionRenewalKey{}) == true {
+		return manager.Runtime.Observe(ctx)
+	}
 	probe, ok := manager.Runtime.(interface {
 		CurrentOwnedControllerLease(context.Context) (controllerrole.Lease, bool, error)
 	})

@@ -142,3 +142,19 @@ func TestReadOnlyStatusDoesNotHoldRoleWriterLock(t *testing.T) {
 	cancel()
 	<-done
 }
+func TestMaintenanceObservationUsesExistingRenewalOwner(t *testing.T) {
+	runtime := &slowOwnedRuntime{fakeRuntime: &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {Slot: "blue", ProcessUp: true, ProcessReady: true, ControllerOwned: true}}}, lease: controllerrole.Lease{Slot: "blue", Term: 1, LeaseID: "live", Nonce: "nonce", Generation: 1, Expiry: time.Now().Add(300 * time.Millisecond)}}
+	manager := NewManager(nil, runtime, 300*time.Millisecond, time.Now)
+	parent := context.WithValue(context.Background(), controllerMaintenanceKey{}, controllerMaintenancePolicy{})
+	ctx, stop := manager.beginTransactionRenewal(parent, runtime.lease)
+	_, observeErr := manager.observeRuntime(ctx)
+	renewalErr := stop()
+	if observeErr != nil || renewalErr != nil {
+		t.Fatalf("nested observation raced existing renewal: observe=%v renewal=%v", observeErr, renewalErr)
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.renewals < 2 {
+		t.Fatalf("existing owner did not renew: %d", runtime.renewals)
+	}
+}
