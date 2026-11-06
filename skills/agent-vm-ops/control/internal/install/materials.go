@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -86,6 +87,28 @@ func ValidateMaterials(root, revision string) (MaterialsManifest, error) {
 		if info.Mode().Perm() != os.FileMode(entry.Mode) || hex.EncodeToString(hash.Sum(nil)) != entry.SHA256 {
 			return result, fmt.Errorf("material integrity mismatch: %s", entry.Path)
 		}
+	}
+	err = filepath.WalkDir(abs, func(current string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 {
+			return errors.New("unlisted symlink in materials")
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		name, err := filepath.Rel(abs, current)
+		if err != nil {
+			return err
+		}
+		if name != "materials-manifest.json" && !seen[name] {
+			return fmt.Errorf("unlisted deployment material: %s", name)
+		}
+		return nil
+	})
+	if err != nil {
+		return result, err
 	}
 	return result, nil
 }

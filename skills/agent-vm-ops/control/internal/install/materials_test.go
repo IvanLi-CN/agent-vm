@@ -29,6 +29,16 @@ func TestMaterialsRejectRevisionTamperAndLinks(t *testing.T) {
 	if _, err := ValidateMaterials(root, revision); err != nil {
 		t.Fatal(err)
 	}
+	extra := filepath.Join(root, "unlisted-script")
+	if err := os.WriteFile(extra, []byte("unverified"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ValidateMaterials(root, revision); err == nil {
+		t.Fatal("unlisted material accepted")
+	}
+	if err := os.Remove(extra); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := ValidateMaterials(root, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"); err == nil {
 		t.Fatal("revision mismatch accepted")
 	}
