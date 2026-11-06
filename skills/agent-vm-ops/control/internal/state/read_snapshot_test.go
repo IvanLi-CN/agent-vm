@@ -2,6 +2,9 @@ package state
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"testing"
 	"time"
@@ -77,6 +80,42 @@ func TestReadSnapshotCancellationReleasesConnection(t *testing.T) {
 		t.Fatal("cancellation disappeared")
 	}
 	if err := s.SetMeta(context.Background(), "after", "value"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRemoteReadSnapshotReleasesAuthorityLockBeforeProbes(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"results": []any{map[string]any{"columns": []string{"value"}, "types": []string{"text"}, "values": [][]string{{"initial"}}}}})
+	}))
+	defer server.Close()
+	store, err := newRemoteStoreWithClient(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	if _, err := store.remote.mirror.Exec("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT); INSERT INTO meta VALUES('state_epoch','initial'),('management_auth_epoch','initial')"); err != nil {
+		t.Fatal(err)
+	}
+	store.remote.syncedEpoch = "initial"
+	store.remote.syncedAuthEpoch = "initial"
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if err := store.ReadSnapshot(ctx, func(view context.Context) error {
+		if err := store.remote.mu.LockContext(ctx); err != nil {
+			return err
+		}
+		_, err := store.remote.mirror.ExecContext(ctx, "UPDATE meta SET value='later' WHERE key='state_epoch'")
+		store.remote.mu.Unlock()
+		if err != nil {
+			return err
+		}
+		epoch, err := store.StateEpoch(view)
+		if err == nil && epoch != "initial" {
+			t.Fatalf("detached snapshot changed to %s", epoch)
+		}
+		return err
+	}); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -29,7 +29,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -42,7 +41,7 @@ type remoteBackend struct {
 	base            *url.URL
 	client          *http.Client
 	mirror          *sql.DB
-	mu              sync.Mutex
+	mu              contextMutex
 	syncedEpoch     string
 	syncedAuthEpoch string
 }
@@ -734,7 +733,9 @@ func (r *remoteBackend) ensureManagementSchema(ctx context.Context) error {
 }
 
 func (r *remoteBackend) withRead(ctx context.Context, fn func(*sql.Conn) error) error {
-	r.mu.Lock()
+	if err := r.mu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer r.mu.Unlock()
 	if err := r.syncLocked(ctx); err != nil {
 		return &TransactionError{Phase: "connection", SQLOperation: "read", StateCommitted: committed(false), Cause: err}
@@ -751,7 +752,9 @@ func (r *remoteBackend) withRead(ctx context.Context, fn func(*sql.Conn) error) 
 }
 
 func (r *remoteBackend) withWrite(ctx context.Context, fn func(*Tx) error) error {
-	r.mu.Lock()
+	if err := r.mu.LockContext(ctx); err != nil {
+		return err
+	}
 	defer r.mu.Unlock()
 
 	for attempt := 0; attempt < remoteWriteAttempts; attempt++ {
