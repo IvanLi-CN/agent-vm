@@ -1510,3 +1510,40 @@ func TestMaintainControllerRenewsLiveAuthorityDuringPartialInventory(t *testing.
 		})
 	}
 }
+
+func TestWaitingDeploymentRetainsOnlyExistingActiveLease(t *testing.T) {
+	start := controllerrole.ProcessStartToken(os.Getpid())
+	if start == "" {
+		t.Skip("Linux process-incarnation evidence required")
+	}
+	for _, phase := range []string{PhaseStandbyValidation, PhaseControllerHandoff, PhaseActiveSwitch} {
+		t.Run(phase, func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			db, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			tx := store.Transaction{ID: "waiting", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/candidate.tar", Phase: phase, State: "active", Generation: 2, CreatedAt: now, UpdatedAt: now}
+			if err := db.Create(context.Background(), tx, nil); err != nil {
+				t.Fatal(err)
+			}
+			lease := controllerrole.Lease{Slot: "blue", Term: 7, Generation: 1, LeaseID: "live", Nonce: "nonce", Expiry: now.Add(time.Minute), OwnerPID: os.Getpid(), OwnerStartTime: start}
+			runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true, LeaseRenewalSupported: true, ControllerLease: &lease}, "green": {Slot: "green", ProcessUp: true, ProcessReady: true}}}
+			manager := NewManager(db, runtime, time.Minute, func() time.Time { return now })
+			err = manager.MaintainController(context.Background())
+			if phase == PhaseActiveSwitch {
+				if err == nil {
+					t.Fatal("uncertain switch retained authority")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(runtime.grantedLeases) != 1 || runtime.grantedLeases[0].LeaseID != lease.LeaseID || runtime.observations["green"].ControllerOwned {
+				t.Fatalf("waiting transaction changed authority: %+v", runtime.grantedLeases)
+			}
+		})
+	}
+}

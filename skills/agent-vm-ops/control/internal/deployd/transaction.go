@@ -713,7 +713,16 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 		return manager.fenceSlots(ctx, errors.New("deployment transaction state could not be read; controller roles were fenced"))
 	}
 	if len(transactions) != 0 {
-		return manager.fenceSlots(ctx, errors.New("deployment transaction is active"))
+		safeWaiting := len(transactions) == 1
+		for _, transaction := range transactions {
+			phaseSafe := transaction.Phase == PhaseStandbyValidation || transaction.Phase == PhaseControllerHandoff
+			safeWaiting = safeWaiting && transaction.State == "active" && !transaction.RecoveryRequired && phaseSafe && transaction.PreviousSlot == observation.ActiveSlot && transaction.TargetSlot != observation.ActiveSlot
+		}
+		active := observation.Slots[observation.ActiveSlot]
+		lease := active.ControllerLease
+		if !safeWaiting || !active.ControllerOwned || lease == nil || lease.Validate(manager.Clock(), observation.ActiveSlot) != nil || lease.OwnerPID != os.Getpid() || lease.OwnerStartTime != controllerrole.ProcessStartToken(os.Getpid()) {
+			return manager.fenceSlots(ctx, errors.New("deployment transaction cannot retain active controller authority"))
+		}
 	}
 	// Normal lifecycle commits can advance the epoch between the separate
 	// metrics/inventory/doctor reads. Re-observe before revoking an otherwise
