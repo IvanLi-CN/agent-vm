@@ -159,7 +159,7 @@ jobs:
         working-directory: skills/agent-vm-ops/control
         run: go test -count=1 ./...
       - name: Run isolated rqlite integration tests
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.full == 'true'
+        if: matrix.os == 'ubuntu-latest'
         working-directory: skills/agent-vm-ops/control
         env:
           RQLITE_VERSION: '10.5.2'

@@ -57,6 +57,7 @@ test("PR scheduling is bounded and separate from Main", () => {
   expect(pr).toContain("name: Classify PR changes");
   expect(pr).toContain("bun run bin/ci_classify.ts");
   expect(pr).toContain("needs: classify");
+  expect(pr).toContain("name: Run isolated rqlite integration tests\n        if: matrix.os == 'ubuntu-latest'");
 });
 
 test("demo deployment is serialized and never exposes credentials to PR builds", () => {
