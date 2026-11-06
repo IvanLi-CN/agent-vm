@@ -56,7 +56,7 @@ class WrapperTests(unittest.TestCase):
             "fence_path": self.root / "release-activation.fence",
         })
         self.payload = self.bundle.read_bytes()
-        self.drain_patch = mock.patch.object(WRAPPER, "_ensure_drained")
+        self.drain_patch = mock.patch.object(WRAPPER, "_ensure_drained", return_value=None)
         self.drain_patch.start()
         self.addCleanup(self.drain_patch.stop)
         syntax_patch = mock.patch.object(WRAPPER, "verify_typescript_syntax")
@@ -1063,6 +1063,21 @@ class WrapperTests(unittest.TestCase):
             WRAPPER.verify_transaction(self.loaded, "tx-tampered-unit", "b" * 40)
         self.assertEqual(failure.exception.code, "unit_unverified")
 
+    def test_worker_recovery_fencing_is_journaled_before_installation(self):
+        WRAPPER.stage(self.loaded, "tx-worker-recovery", "b" * 40, self.payload)
+        WRAPPER.verify_transaction(self.loaded, "tx-worker-recovery", "b" * 40)
+        pending = WorkerRecoveryBootstrapTests.pending()
+        record_path = Path(self.loaded["state_root"]) / "tx-worker-recovery.activation.json"
+        def fence():
+            record = json.loads(record_path.read_text())
+            self.assertEqual(record["activation_phase"], "worker-recovery-fencing")
+            self.assertEqual(record["worker_recovery_pending"], pending)
+            self.assertFalse(Path(self.loaded["control_path"]).exists())
+        with mock.patch.object(WRAPPER, "_ensure_drained", return_value=pending), mock.patch.object(WRAPPER, "_fence_destroy_recovery_runtime", side_effect=fence) as fenced, mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([],0,b"",b"")):
+            WRAPPER.activate(self.loaded,"tx-worker-recovery","b" * 40)
+        fenced.assert_called_once()
+        self.assertEqual(json.loads(record_path.read_text())["worker_recovery_pending"],pending)
+
     def test_stage_verify_and_activate_only_install_fixed_targets(self):
         staged = WRAPPER.stage(self.loaded, "tx-one", "b" * 40, self.payload)
         self.assertTrue(staged["staged"])
@@ -1391,6 +1406,85 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(Path(self.loaded["current_link"]).resolve().name, "b" * 40)
         record = json.loads((Path(self.loaded["state_root"]) / "tx-runtime-second.activation.json").read_text(encoding="utf-8"))
         self.assertEqual(record["rollback_state"], "failed")
+
+
+class WorkerRecoveryBootstrapTests(unittest.TestCase):
+    @staticmethod
+    def pending():
+        return [{"operation_id": "failed-destroy", "action": "destroy", "session_id": "session", "generation": 2, "worker": {"state": "starting", "start_attempted": True}}]
+
+    def test_installation_exception_requires_recovery_capability_and_keeps_drain(self):
+        pending = self.pending()
+        responses = [
+            {"ok": True, "result": {"draining": True}},
+            {"ok": True, "result": {"pending_operations": pending, "in_flight_operations": 0}},
+            {"unidentified_destroy_start": 1, "requires_release_drain": True},
+        ]
+        with mock.patch.object(WRAPPER, "_current_target", return_value=Path("/retained-release")), mock.patch.object(WRAPPER, "_read_activation_safe_pending_ids", side_effect=AssertionError("must not consult legacy state")), mock.patch.object(WRAPPER, "_systemctl") as systemctl, mock.patch.object(WRAPPER.subprocess, "run", side_effect=[subprocess.CompletedProcess([],0,json.dumps(value).encode(),b"") for value in responses]):
+            result = WRAPPER._ensure_drained({"require_drained":True,"current_link":"/current","release_root":"/releases","control_path":"/client.ts"}, recovery_candidate_root=Path("/verified-candidate"))
+        self.assertEqual(result,pending)
+        systemctl.assert_not_called()
+
+    def test_unknown_worker_requires_exact_bounded_destroy_barrier(self):
+        metrics = {"in_flight_operations": 0}
+        self.assertTrue(WRAPPER._unidentified_destroy_recovery_pending(self.pending(), metrics))
+        for change in ("pid", "generation", "action", "attempted", "duplicate", "inflight"):
+            with self.subTest(change=change):
+                pending, current = self.pending(), dict(metrics)
+                if change == "pid": pending[0]["worker"]["pid"] = 123
+                elif change == "generation": pending[0]["generation"] = True
+                elif change == "action": pending[0]["action"] = "acquire"
+                elif change == "attempted": pending[0]["worker"]["start_attempted"] = False
+                elif change == "duplicate": pending += self.pending()
+                elif change == "inflight": current["in_flight_operations"] = 1
+                self.assertFalse(WRAPPER._unidentified_destroy_recovery_pending(pending, current))
+
+    def test_recovery_fences_all_worker_owners_before_checking_incus(self):
+        calls = []
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if argv[0] == "incus":
+                self.assertEqual(len(calls), 5)
+                return subprocess.CompletedProcess(argv, 0, b"[]", b"")
+            return subprocess.CompletedProcess(argv, 0, b"MainPID=0\nControlGroup=\n", b"")
+        with mock.patch.object(WRAPPER, "_systemctl") as stop, mock.patch.object(WRAPPER, "_verify_stopped_recovery_cgroups") as groups, mock.patch.object(WRAPPER.subprocess, "run", side_effect=run):
+            WRAPPER._fence_destroy_recovery_runtime()
+            self.assertEqual(groups.call_count, 2)
+            self.assertEqual([call.args for call in stop.call_args_list], [("stop", unit) for unit in ("agent-vm-deployd.service", "agent-vm-native@blue.service", "agent-vm-native@green.service", "agent-vm-native.service")])
+
+    def test_recovery_rejects_live_process_or_background_effect(self):
+        for mode in ("process", "native", "malformed"):
+            with self.subTest(mode=mode):
+                def run(argv, **kwargs):
+                    if argv[0] == "incus":
+                        return subprocess.CompletedProcess(argv, 0, b"[{}]" if mode == "native" else b"null", b"")
+                    return subprocess.CompletedProcess(argv, 0, b"MainPID=42\nControlGroup=/still-live\n" if mode == "process" else b"MainPID=0\nControlGroup=\n", b"")
+                with mock.patch.object(WRAPPER, "_systemctl"), mock.patch.object(WRAPPER.subprocess, "run", side_effect=run):
+                    with self.assertRaises(WRAPPER.WrapperError): WRAPPER._fence_destroy_recovery_runtime()
+
+    def test_stopped_cgroup_proof_rejects_surviving_processes_and_children(self):
+        for mode in ("absent", "empty", "process", "child", "symlink", "missing-procs"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                directory = root / "system.slice/agent-vm-native.service"
+                if mode != "absent":
+                    directory.mkdir(parents=True)
+                    if mode != "missing-procs":
+                        (directory / "cgroup.procs").write_text("42\n" if mode == "process" else "")
+                    if mode == "child": (directory / "child").mkdir()
+                    if mode == "symlink":
+                        target = directory.parent / "other"
+                        directory.rename(target)
+                        directory.symlink_to(target, target_is_directory=True)
+                if mode in ("absent", "empty"):
+                    WRAPPER._verify_stopped_recovery_cgroups(root)
+                else:
+                    with self.assertRaises(WRAPPER.WrapperError): WRAPPER._verify_stopped_recovery_cgroups(root)
+
+    def test_old_or_malformed_candidate_cannot_bypass_pending_fence(self):
+        for output in (b"old binary", b"{}", b'{"unidentified_destroy_start":true,"requires_release_drain":true}', b'{"unidentified_destroy_start":1,"requires_release_drain":false}'):
+            with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([],0,output,b"")):
+                with self.assertRaises(WRAPPER.WrapperError): WRAPPER._verify_destroy_recovery_candidate(Path("/verified-candidate"))
 
 
 if __name__ == "__main__":

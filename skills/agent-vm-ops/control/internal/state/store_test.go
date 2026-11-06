@@ -566,3 +566,63 @@ func TestOperationWorkerIdentityCanRearmAfterVerifiedFinish(t *testing.T) {
 
 func stringPointer(value string) *string { return &value }
 func intPointer(value int64) *int64      { return &value }
+
+func TestWorkerRecoveryAuditAndBarrierCommitAtomically(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmtBool(fail), func(t *testing.T) {
+			ctx := context.Background()
+			store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			session, generation := "session", int64(2)
+			if err := store.RecordOperation(ctx, "destroy", "destroy", &session, &generation, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "starting", "start_attempted": true}}); err != nil {
+				t.Fatal(err)
+			}
+			if fail {
+				if err := store.withWrite(ctx, func(tx *Tx) error {
+					_, err := tx.exec("CREATE TRIGGER fail_recovery_audit BEFORE INSERT ON audit BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END")
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err = store.RecoverOperationWorker(ctx, "destroy", "task", func(response map[string]any) error {
+				response["_worker_recovery_evidence"] = map[string]any{"original_worker": response["worker"], "outcome": "unknown"}
+				response["worker"] = map[string]any{"state": "exited", "start_attempted": true}
+				return nil
+			})
+			if (err != nil) != fail {
+				t.Fatalf("recovery error=%v fail=%v", err, fail)
+			}
+			operation, err := store.GetOperation(ctx, "destroy")
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker := operation.Response["worker"].(map[string]any)
+			expected := "exited"
+			if fail {
+				expected = "starting"
+			}
+			if worker["state"] != expected || operation.Response["outcome"] != "pending" {
+				t.Fatalf("non-atomic recovery: %#v", operation.Response)
+			}
+			var count int
+			if err := store.withRead(ctx, func(conn *sql.Conn) error {
+				return conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM audit WHERE outcome = 'unknown' AND json_extract(detail_json, '$.operation_id') = 'destroy'").Scan(&count)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if (count == 1) == fail {
+				t.Fatalf("audit count=%d", count)
+			}
+		})
+	}
+}
+func fmtBool(value bool) string {
+	if value {
+		return "audit-failure"
+	}
+	return "atomic-success"
+}

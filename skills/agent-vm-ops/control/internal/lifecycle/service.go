@@ -119,6 +119,7 @@ type adminStatusProbeResult struct {
 }
 
 type leaseExemptMutationContextKey struct{}
+type startupRecoveryFenceContextKey struct{}
 
 func withInternalCleanup(ctx context.Context) context.Context {
 	return context.WithValue(ctx, internalCleanupContextKey{}, true)
@@ -958,7 +959,7 @@ func (s *Service) reconcilePendingWorker(ctx context.Context, operationID string
 			return nil
 		}
 		if attempted {
-			return protocol.NewError("state_unverified", "pending native worker start has no durable identity", map[string]any{"operation_id": operation.OperationID})
+			return s.recoverUnidentifiedDestroyStart(ctx, operation, worker)
 		}
 	}
 	if stringValue(worker["state"]) != "running" && !(stringValue(worker["state"]) == "finished" && stringValue(worker["error"]) != "") {
@@ -998,6 +999,80 @@ func (s *Service) reconcilePendingWorker(ctx context.Context, operationID string
 		return s.sqliteError(err)
 	}
 	return nil
+}
+
+// recoverUnidentifiedDestroyStart resolves only worker liveness, never the
+// original native outcome. Startup holds the cross-process drain, maintenance
+// and session locks; a live controller must still commit the evidence.
+func (s *Service) recoverUnidentifiedDestroyStart(ctx context.Context, operation *state.Operation, worker map[string]any) error {
+	reject := func() error {
+		return protocol.NewError("state_unverified", "pending native worker start has no durable identity", map[string]any{"operation_id": operation.OperationID})
+	}
+	fenced, _ := ctx.Value(startupRecoveryFenceContextKey{}).(bool)
+	if operation.Response["_worker_recovery_evidence"] != nil || !s.resident || !fenced || !s.mutationAllowed() || s.activeOperationCount() != 0 || native.WorkerOperationID(ctx) != "" || operation.Action != "destroy" || operation.SessionID == nil || operation.Generation == nil {
+		return reject()
+	}
+	drained, err := s.releaseDrainOwned(ctx)
+	if err != nil {
+		return err
+	}
+	if !drained {
+		return reject()
+	}
+	for _, key := range []string{"pid", "start_time", "process_group"} {
+		if _, exists := worker[key]; exists {
+			return reject()
+		}
+	}
+	raw, ok := operation.Response["_request"].(map[string]any)
+	if !ok {
+		return reject()
+	}
+	request := protocol.Request(raw)
+	digest, err := protocol.Digest(request)
+	if err != nil || protocol.ValidateRequest(request) != nil || digest == "" || digest != stringValue(operation.Response["_request_digest"]) || !operationIdentityMatches(operation, request) || stringValue(request["operation_id"]) != operation.OperationID {
+		return reject()
+	}
+	if _, err := protocol.ValidateCompatibility(request, s.Release); err != nil {
+		return reject()
+	}
+	task, err := s.Store.GetTask(ctx, map[string]any{"session_id": *operation.SessionID})
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if task == nil || task.State != stateDeleting || task.Generation != *operation.Generation {
+		return reject()
+	}
+	probe, ok := s.Guest.(recoveryQuiescence)
+	if !ok {
+		return reject()
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+	defer cancel()
+	if err := probe.VerifyRecoveryQuiescence(checkCtx); err != nil {
+		return reject()
+	}
+	original := mustJSON(worker)
+	observedAt := nowString(s.Clock())
+	return s.commitMutationContext(ctx, func() error {
+		if !s.mutationAllowed() {
+			return reject()
+		}
+		return s.Store.RecoverOperationWorker(checkCtx, operation.OperationID, task.TaskID, func(response map[string]any) error {
+			if stringValue(response["outcome"]) != "pending" || mustJSON(response["worker"]) != original || stringValue(response["_request_digest"]) != digest {
+				return errUnresolvedWorker
+			}
+			response["_worker_recovery_evidence"] = map[string]any{"original_worker": response["worker"], "observed_at": observedAt, "basis": "resident-systemd-and-incus-quiescence", "outcome": "unknown"}
+			recovered := make(map[string]any, len(worker)+1)
+			for key, value := range worker {
+				recovered[key] = value
+			}
+			recovered["state"] = "exited"
+			recovered["observed_at"] = observedAt
+			response["worker"] = recovered
+			return nil
+		})
+	})
 }
 
 func (s *Service) recoverPending(ctx context.Context, pending []state.Operation) error {
@@ -1626,6 +1701,7 @@ func (s *Service) StartupReconcile(ctx context.Context) error {
 	if _, err := s.Store.StateEpoch(ctx); err != nil {
 		return s.sqliteError(err)
 	}
+	ctx = context.WithValue(ctx, startupRecoveryFenceContextKey{}, true)
 	_, reconcileErr := s.reconcile(ctx, true, "startup")
 	if reconcileErr != nil && protocol.AsError(reconcileErr).Code != "cleanup_incomplete" {
 		return reconcileErr
