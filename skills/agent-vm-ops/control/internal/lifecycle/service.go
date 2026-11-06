@@ -1885,7 +1885,7 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 		if operation.SessionID == nil || *operation.SessionID != session {
 			continue
 		}
-		if operation.Generation == nil || *operation.Generation > task.Generation || s.operationActive(operation.OperationID) || (operation.Action != "acquire" && operation.Action != "resize" && operation.Action != "restart") {
+		if operation.Generation == nil || *operation.Generation > task.Generation || s.operationActive(operation.OperationID) || !supersedableOperation(operation.Action) {
 			return nil
 		}
 		if taskID, exists := operation.Response["_task_id"]; exists && stringValue(taskID) != task.TaskID {
@@ -1897,19 +1897,22 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 				return nil
 			}
 		}
-		worker, valid := operation.Response["worker"].(map[string]any)
-		if !valid || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
-			return nil
-		}
-		pid, pidOK := protocol.Integer(worker["pid"])
-		pgid, groupOK := protocol.Integer(worker["process_group"])
-		start := stringValue(worker["start_time"])
-		if !pidOK || !groupOK || pid <= 0 || pgid <= 0 || start == "" {
-			return nil
-		}
-		alive, workerErr := native.WorkerAlive(native.WorkerIdentity{PID: int(pid), ProcessGroup: int(pgid), StartTime: start})
-		if workerErr != nil || alive {
-			return nil
+		workerValue, hasWorker := operation.Response["worker"]
+		if operationHasNativeEffect(operation.Action) || hasWorker {
+			worker, valid := workerValue.(map[string]any)
+			if !valid || (stringValue(worker["state"]) != "finished" && stringValue(worker["state"]) != "exited") || workerOwnershipUnresolved(worker) {
+				return nil
+			}
+			pid, pidOK := protocol.Integer(worker["pid"])
+			pgid, groupOK := protocol.Integer(worker["process_group"])
+			start := stringValue(worker["start_time"])
+			if !pidOK || !groupOK || pid <= 0 || pgid <= 0 || start == "" || stringValue(worker["finished_at"]) == "" {
+				return nil
+			}
+			alive, workerErr := native.WorkerAlive(native.WorkerIdentity{PID: int(pid), ProcessGroup: int(pgid), StartTime: start})
+			if workerErr != nil || alive {
+				return nil
+			}
 		}
 		raw, valid := operation.Response["_request"].(map[string]any)
 		if !valid {
@@ -1958,15 +1961,32 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 	return nil
 }
 
+func supersedableOperation(action string) bool {
+	switch action {
+	case "acquire", "renew", "resize", "restart", "release":
+		return true
+	default:
+		return false
+	}
+}
+
 func supersedingOperationMatches(original, completed state.Operation, task *state.Task) bool {
 	if original.Generation == nil || completed.Generation == nil || completed.SessionID == nil || *completed.SessionID != task.SessionID || *completed.Generation < *original.Generation || *completed.Generation > task.Generation {
 		return false
 	}
-	worker, workerOK := original.Response["worker"].(map[string]any)
+	workerValue, hasWorker := original.Response["worker"]
+	worker, workerOK := workerValue.(map[string]any)
 	created, createdErr := time.Parse(time.RFC3339Nano, original.CreatedAt)
-	finished, finishedErr := time.Parse(time.RFC3339Nano, stringValue(worker["finished_at"]))
+	finishedAt := original.CreatedAt
+	if hasWorker {
+		if !workerOK {
+			return false
+		}
+		finishedAt = stringValue(worker["finished_at"])
+	}
+	finished, finishedErr := time.Parse(time.RFC3339Nano, finishedAt)
 	laterCreated, laterErr := time.Parse(time.RFC3339Nano, completed.CreatedAt)
-	if !workerOK || createdErr != nil || finishedErr != nil || laterErr != nil || !laterCreated.After(created) || !laterCreated.After(finished) {
+	if createdErr != nil || finishedErr != nil || laterErr != nil || !laterCreated.After(created) || !laterCreated.After(finished) {
 		return false
 	}
 	response := completed.Response
@@ -1986,6 +2006,15 @@ func supersedingOperationMatches(original, completed state.Operation, task *stat
 	}
 	if completed.Action == "release" && stringValue(result["state"]) == stateCached && !effectiveLease {
 		return original.Action != "acquire" || resultGeneration > *original.Generation
+	}
+	if completed.Action == "timer-expire" && stringValue(result["state"]) == stateCached && !effectiveLease {
+		return original.Action != "acquire" || resultGeneration > *original.Generation
+	}
+	if original.Action == "renew" && completed.Action == "renew" {
+		return resultGeneration == *original.Generation && stringValue(result["state"]) == stateActive && effectiveLease
+	}
+	if original.Action == "renew" && completed.Action == "acquire" {
+		return resultGeneration > *original.Generation && stringValue(result["state"]) == stateActive && effectiveLease
 	}
 	return original.Action == "acquire" && completed.Action == "acquire" && *completed.Generation > *original.Generation && resultGeneration > *original.Generation && stringValue(result["state"]) == stateActive && effectiveLease
 }
@@ -2460,6 +2489,10 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if resourceErr != nil {
 			return nil, protocol.NewError("resource_unverified", "cached task resources cannot be verified", map[string]any{"task_id": task.TaskID, "verified": false})
 		}
+		resources, err = requestedResourcesWithBase(request, cachedResources)
+		if err != nil {
+			return nil, err
+		}
 		if usable, imageErr := s.Store.CachedImageUsable(ctx, task.ImageFingerprint, !s.Config.Management.Enabled); imageErr != nil {
 			return nil, s.sqliteError(imageErr)
 		} else if !usable {
@@ -2621,7 +2654,14 @@ func (s *Service) renew(ctx context.Context, request protocol.Request) (map[stri
 	} else if draining {
 		return nil, protocol.NewError("draining", "renew is refused while draining", nil)
 	}
-	deadline := s.Clock().Add(time.Duration(s.Config.RenewSeconds) * time.Second)
+	if task.LeaseExpiresAt == nil {
+		return nil, protocol.NewError("lease_expired", "task has no active lease deadline", nil)
+	}
+	currentDeadline, err := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
+	if err != nil {
+		return nil, protocol.NewError("state_unverified", "lease deadline is invalid", nil)
+	}
+	deadline := currentDeadline.Add(time.Duration(s.Config.RenewSeconds) * time.Second)
 	max := s.Clock().Add(time.Duration(s.Config.MaxLeaseSeconds) * time.Second)
 	if deadline.After(max) {
 		deadline = max

@@ -100,7 +100,7 @@ Grafana 面板通过 Prometheus 查询 Deployd 输出，例如：
 
 首次授予后的就绪等待最多六十秒；等待期间只能通过已验证进程的角色通道延长同一有效 lease，通道失败或身份变化时立即停止并 fencing。持续协调复用本轮完成并持久化的观测更新指标，不为指标发布再次串行采集一遍业务状态；已就绪且身份未变的控制器续租后无需重复等待启动协调。
 
-当清单观测本身新鲜且一致，但部分任务的原生状态尚未确认时，Deployd 必须区分“观测不完整”和“观测矛盾”。只有其他来源、进程身份、状态纪元和能力均有效，并且活动槽位已经确认 admission drain 时，才允许重新授予唯一 controller lease，使 startup reconciliation 和显式维护能够收敛失败记录。此时 `controller_recovery_only=true`、组合观测仍为 `consistent=false`，业务流量保持关闭，不能用于 stage、activate 或 rollback 的就绪证明。清单不完整且未确认 drain 时不得重新授予 controller。若清单只是部分原生状态未确认、各观测来源仍新鲜且相互一致，活动槽位仍独占持有同一 Deployd 进程的有效 lease，并明确支持原身份续租，则允许只延长该 lease 的 expiry，使正在进行的生命周期操作完成；不得分配新身份、恢复已过期 lease 或等待业务 ready 来决定是否撤销现有权限。此时两个槽位的 traffic admission 均保持关闭，组合观测仍不构成部署就绪证明；清单完整且槽位 ready 后才恢复当前活动槽位的流量。除上述一致但不完整的观测与下述已有 lease 的有界等待外，任何来源缺失、过期、矛盾时仍必须 hard-fence。即使清单完整，drain 期间也必须保留维护所需 lease，并保持 traffic disabled；不能因为启用流量被 drain 拒绝而反复撤销 controller lease。
+当清单观测本身新鲜且一致，但部分任务的原生状态尚未确认时，Deployd 必须区分“观测不完整”和“观测矛盾”。只有其他来源、进程身份、状态纪元和能力均有效，并且活动槽位已经确认 admission drain 时，才允许重新授予唯一 controller lease，使 startup reconciliation 和显式维护能够收敛失败记录。此时 `controller_recovery_only=true`、组合观测仍为 `consistent=false`，业务流量保持关闭，不能用于 stage、activate 或 rollback 的就绪证明。清单不完整且未确认 drain 时不得重新授予 controller。若清单只是部分原生状态未确认、各观测来源仍新鲜且相互一致，活动槽位仍独占持有同一 Deployd 进程的有效 lease，并明确支持原身份续租，则允许只延长该 lease 的 expiry，使正在进行的生命周期操作完成；不得分配新身份、恢复已过期 lease 或等待业务 ready 来决定是否撤销现有权限。此时两个槽位的 traffic admission 均保持关闭，组合观测仍不构成部署就绪证明；清单完整且槽位 ready 后才恢复当前活动槽位的流量。除上述一致但不完整的观测与下述业务快照不一致时的原身份续约外，任何来源缺失、过期、矛盾时仍必须 hard-fence。即使清单完整，drain 期间也必须保留维护所需 lease，并保持 traffic disabled；不能因为启用流量被 drain 拒绝而反复撤销 controller lease。
 
 对于旧版本遗留的 `destroy`，日志明确为 `starting`、`start_attempted=true` 时，发布恢复仅接受两种进程身份：PID、进程组和启动标识全部缺失，或三者完整有效。身份部分缺失、非正整数、无效启动标识必须拒绝。完整身份还必须确认原进程和进程组已不存在；不能向可能已复用的 PID 发送信号。发布器必须验证候选声明 `attempted_destroy_start=1` 和发布排空要求；仅声明旧版无身份恢复能力的候选不能处理完整身份记录。符合这些条件才允许核验原生 worker 的静默状态。此原始恢复对同一 operation 最多执行一次，已有恢复证据时不得覆盖原证据；除下述旧身份携带修复外，不得再次自动解除未知启动屏障。业务控制服务必须持有有效 controller、发布归属的 admission drain，以及跨进程 drain、maintenance 和 session 锁；当前不得存在活动操作。原请求、摘要、operation ID、session 和 generation 必须匹配日志，任务必须仍为同 generation 的 `deleting`。静默检查必须逐一验证旧单服务和蓝绿槽位的 systemd 身份、`KillMode=control-group`、`Delegate=no`、实际 cgroup 和其中的进程，禁止残留子进程，并在 Incus 全项目后台操作为空后重新核验相同进程边界。静默验证只能将 worker 记为已退出，并在同一事务中将原 worker、验证依据和 `unknown` 结果保存到操作日志和既有审计记录；兼容旧版本终结日志时也不能丢失审计证据；原销毁仍为 pending，不能据此声明成功。随后由现有 Incus 清理流程继续原 operation ID，重新核验实例和映射清理结果后才能终结日志。缺失、矛盾、活动操作、角色失效或验证失败时保持 pending 和排空。
 
@@ -108,7 +108,7 @@ Grafana 面板通过 Prometheus 查询 Deployd 输出，例如：
 
 发布封装器只对上述形态且无在途操作的有界 `destroy` 列表提供修复产物安装入口。已验证的候选 binary 必须通过只读 `recovery-capabilities` 声明对应恢复能力；旧候选、其他动作或包含任何不完整进程身份的记录不能使用该入口。安装事务必须先持久化待恢复项，停止 Deployd 和全部业务 unit，核验 MainPID 与 cgroup 均为空、Incus 全项目后台操作为空，再安装并启动完整产品。封装器不修改业务数据库；新业务控制器负责再次核验发布归属和原日志身份，恢复被拒绝时继续排空，不能将安装完成等同于生命周期恢复完成。普通蓝绿转换仍要求既有的严格 quiescence 证明。
 
-如果底层 effect 不能确认已经停止，生命周期或管理操作都必须保持 pending/unknown，不能写入 success。槽位启动后的管理 operation recovery 必须在 controller role 授予后执行，不能在 role 尚未建立时由 standby 自行恢复。除上述一致但不完整清单的原身份续租和下述业务快照不一致时的有界等待外，当 Deployd 无法确认观测、部署状态或角色通道时，必须先对两个槽位执行本地 hard-fence：清除槽位的 controller role 和 traffic role。如果角色 socket 不可用，则停止对应 systemd 单元作为兜底。hard-fence 不依据旧状态重新授予角色，也不分配新的持久化 term。后续恢复必须重新观测，并使用更高的持久化 term 授予新 role。
+如果底层 effect 不能确认已经停止，生命周期或管理操作都必须保持 pending/unknown，不能写入 success。槽位启动后的管理 operation recovery 必须在 controller role 授予后执行，不能在 role 尚未建立时由 standby 自行恢复。除上述一致但不完整清单和下述业务快照不一致时的原身份续约外，当 Deployd 无法确认观测、部署状态或角色通道时，必须先对两个槽位执行本地 hard-fence：清除槽位的 controller role 和 traffic role。如果角色 socket 不可用，则停止对应 systemd 单元作为兜底。hard-fence 不依据旧状态重新授予角色，也不分配新的持久化 term。后续恢复必须重新观测，并使用更高的持久化 term 授予新 role。
 
 槽位进程启动时默认不得接受新流量。只有 Deployd 在新鲜观测通过后授予 controller role，并重新观测到槽位 ready，才能启用当前 `active` 槽位的 traffic role。Deployd 或槽位重启后必须重新观测、授予 role 并启用流量，不能依据旧状态直接恢复。
 
@@ -118,7 +118,7 @@ Deployd 在完成旧槽位 quiescence 后退出共享 drain 时，`preserve_traf
 
 controller 下的维护循环必须按 lease deadline 判断 `active` 和 `preparing` 的到期资格。`preparing` 不表示 effective lease，但未来的 deadline 仍必须保留，不能提前创建到期清理日志。无效 deadline 必须报告状态未验证。旧版已终结的 `timer-expire` 只有请求身份和摘要匹配、明确成功返回 `expired=false`，且 worker 明确为 `starting`、`start_attempted=false` 时，才允许保留原日志并创建绑定当前已到期 deadline 的确定性新清理意图；pending、失败、身份冲突、已尝试启动或证据缺失均不能借此重试或改写。
 
-正常生命周期写入可能在独立的容量、清单和健康请求之间推进 state epoch。持续协调遇到业务快照不一致或业务观测不可用时，只有当前 active 槽位仍持有同一 Deployd 进程的有效 lease、支持原身份续约、进程与角色来源新鲜且没有第二个 controller，才允许立即重新采样，单次协调最多采样三次。重采样期间不能依据失败样本续约或授予新身份；最终必须取得完整、新鲜且一致的观测，才能按上述原身份规则续约。三次采样仍未收敛时，若 `active` 链接、systemd 进程、角色通道均新鲜有效，且该 lease 的完整身份与初次采样完全一致，只关闭两个槽位的 traffic admission，保留原始 expiry 等待下一轮观测；不得延长期限、分配新身份、启用流量或把快照报告为一致。下一轮完整一致的观测才允许按原身份续约并恢复流量；等待持续至原始 expiry、身份变化、双 controller、角色来源缺失或过期、关闭 traffic 失败、观测持久化失败时仍立即 fencing。此有界等待不从旧快照恢复授权，也不延长在途 mutation 的原始期限。部署转换和重启恢复继续使用各自的严格验证条件。
+正常生命周期和维护游标写入可能在容量与清单采样期间推进 state epoch。业务观测不一致时，单次协调最多重新采样三次，失败样本不能授权新的 controller 身份或启用流量。若三次仍未收敛，但当前 active 槽位的 `active` 链接、systemd 进程和角色通道均有新鲜证据，只有一个 controller，且它仍持有同一 Deployd 进程的有效 lease、完整身份与初次采样相同，则关闭两个槽位的 traffic admission，并只续约这份现存 lease，允许在途操作和清理继续。业务快照仍报告不一致；只有取得完整、新鲜且一致的观测后才能恢复流量。租约已经过期、身份变化、出现第二个 controller、角色来源缺失或过期、关闭 traffic 失败、观测持久化失败或续约失败时，仍立即 fencing。不得从旧快照或事务记录重建授权。部署事务也必须在每次新鲜一致的阶段观测后续约同一进程仍持有的候选 lease，不能让多阶段检查耗尽初始角色期限。
 
 控制器持有排他的宿主级协调锁。槽位 controller role 是进程持有型的；deployd 或持有 role 的槽位失去已认证角色通道后，该 role 立即失效。deployd 重启会使所有尚未验证的交接失效，并要求重新观测后才能授予新的 role。不能根据过期的 SQLite 行重建 role。
 
@@ -195,7 +195,7 @@ stage
 }
 ```
 
-`observed_at` 和每个来源的 `source_observed_at` 必须是不晚于当前时间的有效 RFC3339 时间戳。Deployd 必须拒绝未来时间戳，不能用未来时间延长 freshness window。`admin-metrics` 结果还必须明确给出 `observation_consistent=true`；缺失或为 false 时，该来源视为不一致，不能继续授予或续租 controller role。
+`observed_at` 和每个来源的 `source_observed_at` 必须是不晚于当前时间的有效 RFC3339 时间戳。Deployd 必须拒绝未来时间戳，不能用未来时间延长 freshness window。`admin-metrics` 结果必须明确给出 `observation_consistent=true` 才能作为一致业务观测；缺失或为 false 时不能授予新 controller 身份或启用流量。现存 lease 的续约只能使用上述独立、新鲜的进程和唯一主权证据，不能把不一致的业务样本解释为健康。
 
 确切 wire schema 仍由 deployd CLI contract 版本化。响应 MUST 标识 transaction 和 release，区分 selected/process/traffic/controller/native 角色，保留各来源时间戳，并暴露 failure code 和 phase。不得包含原始命令输出、凭据或私有部署路径。Caddy access log 可以辅助证明请求完成，但不能作为在途请求或 quiescence 判断的唯一来源。
 

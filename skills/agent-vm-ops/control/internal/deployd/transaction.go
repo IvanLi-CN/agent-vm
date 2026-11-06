@@ -695,8 +695,8 @@ func (manager *Manager) waitForReady(ctx context.Context, transactionID, slot st
 	}
 }
 
-// MaintainController renews the active slot lease only after a fresh,
-// consistent observation. Persisted transactions never authorize a role
+// MaintainController renews the active slot lease after fresh authority
+// evidence. Business consistency separately gates traffic. Persisted transactions never authorize a role
 // after a Deployd restart; an active recovery transaction fences both slots.
 func (manager *Manager) MaintainController(ctx context.Context) error {
 	manager.mu.Lock()
@@ -717,7 +717,7 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	}
 	// Normal lifecycle commits can advance the epoch between the separate
 	// metrics/inventory/doctor reads. Re-observe before revoking an otherwise
-	// live controller; never renew from the inconsistent sample itself.
+	// live controller; business samples never authorize a new role identity.
 	var retryLease *controllerrole.Lease
 	for attempt := 1; attempt < 3 && manager.retryableControllerObservation(observation); attempt++ {
 		if retryLease == nil {
@@ -732,10 +732,10 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	controllerObservation := observation
 	controllerObservation.Consistent = observation.Consistent || observation.ControllerRecoveryOnly
 	if !validObservation(controllerObservation, manager.Clock().UTC()) {
-		// A changing business snapshot does not invalidate a separately verified,
-		// still-live role. Leave its original deadline unchanged and try again on
-		// the next maintenance tick. This neither renews nor grants authority;
-		// the slot's own expiry fence remains the bound on observation failure.
+		// Business snapshot consistency controls traffic, while fresh process,
+		// singleton and active-link evidence independently verifies the existing
+		// writer. Preserve its exact live identity so in-flight effects and lease
+		// cleanup do not lose authority merely because the business epoch moves.
 		if retryLease != nil && manager.retryableControllerObservation(observation) {
 			current := observation.Slots[observation.ActiveSlot].ControllerLease
 			if current != nil && *current == *retryLease && retryLease.Validate(manager.Clock(), observation.ActiveSlot) == nil {
@@ -744,7 +744,14 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 						return manager.fenceSlots(ctx, errors.New("disable traffic during inconsistent business observation failed"))
 					}
 				}
-				return errors.New("business observation is inconsistent; traffic disabled and existing controller lease left unchanged until expiry")
+				lease, err := manager.renewOrAllocateLease(ctx, observation.Slots[observation.ActiveSlot], retryLease.Generation, retryLease)
+				if err != nil {
+					return manager.fenceSlots(ctx, errors.New("business observation recovery lost the existing controller lease"))
+				}
+				if err := manager.Runtime.GrantController(ctx, observation.ActiveSlot, lease); err != nil {
+					return manager.fenceSlots(ctx, errors.New("business observation recovery could not renew the existing controller lease"))
+				}
+				return errors.New("business observation is inconsistent; traffic disabled and verified existing controller lease renewed")
 			}
 		}
 		return manager.fenceSlots(ctx, errors.New("slot observation is inconsistent"))
@@ -898,6 +905,9 @@ func (manager *Manager) fenceSlots(ctx context.Context, cause error) error {
 
 func (manager *Manager) observe(ctx context.Context, transactionID string) (RuntimeSnapshot, error) {
 	observation, err := manager.Runtime.Observe(ctx)
+	for attempt := 1; transactionID != "" && err == nil && !observation.Consistent && attempt < 3; attempt++ {
+		observation, err = manager.Runtime.Observe(ctx)
+	}
 	if err != nil {
 		return RuntimeSnapshot{}, err
 	}
@@ -906,6 +916,32 @@ func (manager *Manager) observe(ctx context.Context, transactionID string) (Runt
 	}
 	if observation.Slots == nil {
 		observation.Slots = map[string]SlotObservation{}
+	}
+	if transactionID != "" && validObservation(observation, manager.Clock().UTC()) {
+		transaction, readErr := manager.Store.Get(ctx, transactionID)
+		if readErr != nil {
+			return RuntimeSnapshot{}, readErr
+		}
+		if transaction != nil && transaction.State != "finalized" && observation.ControllerSlot == transaction.TargetSlot {
+			target := observation.Slots[transaction.TargetSlot]
+			current := target.ControllerLease
+			if target.ProcessUp && target.ProcessReady && target.ControllerOwned && target.LeaseRenewalSupported && current != nil &&
+				current.Generation == transaction.Generation && current.Validate(manager.Clock(), target.Slot) == nil &&
+				current.OwnerPID == os.Getpid() && current.OwnerStartTime != "" && current.OwnerStartTime == controllerrole.ProcessStartToken(os.Getpid()) {
+				// Deployment phases can outlast a role TTL. Renew only the exact
+				// live candidate authority verified by this fresh observation; an
+				// expired/fenced role is never recreated from the transaction row.
+				lease, renewErr := manager.renewOrAllocateLease(ctx, target, transaction.Generation, current)
+				if renewErr != nil {
+					return RuntimeSnapshot{}, renewErr
+				}
+				if err := manager.Runtime.GrantController(ctx, target.Slot, lease); err != nil {
+					return RuntimeSnapshot{}, &UncertainError{Cause: err}
+				}
+				target.ControllerLease = &lease
+				observation.Slots[target.Slot] = target
+			}
+		}
 	}
 	payload := map[string]any{"active_slot": observation.ActiveSlot, "controller_slot": observation.ControllerSlot, "consistent": observation.Consistent, "observed_at": observation.ObservedAt, "fresh_until": observation.FreshUntil, "slots": observation.Slots, "sources": observation.Sources}
 	encoded, _ := json.Marshal(payload)
@@ -1291,8 +1327,16 @@ func validateStageObservation(observation RuntimeSnapshot, targetSlot string, no
 	}
 	active, activeOK := observation.Slots[observation.ActiveSlot]
 	target, targetOK := observation.Slots[targetSlot]
-	if !activeOK || !active.ProcessUp || !active.ProcessReady || !active.Ready || !active.ControllerOwned || !active.TrafficAccepting {
+	if !activeOK || !active.ProcessUp || !active.ProcessReady || !active.ControllerOwned {
 		return errors.New("active slot controller and traffic role is not verified")
+	}
+	if !active.Ready || !active.TrafficAccepting {
+		// A broken business controller must still be repairable through deployd.
+		// Staging only replaces the inactive slot; the candidate must independently
+		// reconcile all pending business operations before activation can proceed.
+		if !active.Draining || active.TrafficAccepting || !active.CountersKnown || active.InFlightRequests != 0 || active.NativeWorkers != 0 {
+			return errors.New("degraded active slot is not drained and idle for recovery staging")
+		}
 	}
 	if !targetOK {
 		return fmt.Errorf("target slot %s was not observed", targetSlot)
