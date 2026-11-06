@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("ci_cache", Path(__file__).with_name("ci_cache.py"))
 cache = importlib.util.module_from_spec(spec)
@@ -40,6 +41,17 @@ class CacheContractTests(unittest.TestCase):
             self.assertNotEqual(before[name]["key"], after[name]["key"])
             self.assertEqual(before[name]["prefix"], after[name]["prefix"])
         self.assertNotEqual(before["build"]["prefix"], after["build"]["prefix"])
+
+    def test_bun_retains_legacy_path_version_and_reports_expanded_size(self):
+        bun = self.plan()["bun"]
+        self.assertEqual(bun["path"], "~/.bun/install/cache")
+        self.assertEqual(bun["key"], "bun-1.4.4-Linux-X64-lock-a")
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.dict("os.environ", {"HOME": directory}):
+                target = Path(directory) / ".bun/install/cache"
+                target.mkdir(parents=True)
+                (target / "package").write_bytes(b"package" * 1024)
+                self.assertGreater(cache.size_kib(bun["path"]), 0)
 
     def test_cold_exact_partial_and_skipped_save_reports(self):
         with tempfile.TemporaryDirectory() as directory:

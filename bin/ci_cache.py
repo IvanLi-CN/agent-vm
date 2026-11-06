@@ -18,14 +18,16 @@ def cache_plan(role, platform, arch, image, go_version, bun_version, dependency_
     return {
         "module": {"key": module_prefix + dependency_hash, "prefix": module_prefix, "path": paths["GOMODCACHE"]},
         "build": {"key": build_prefix + source_hash, "prefix": build_prefix, "path": paths["GOCACHE"]},
-        "bun": {"key": bun_prefix + lock_hash, "prefix": bun_prefix, "path": str(Path.home() / ".bun/install/cache")},
+        # Cache version hashes the raw path spelling, so preserve the legacy '~'.
+        "bun": {"key": bun_prefix + lock_hash, "prefix": bun_prefix, "path": "~/.bun/install/cache"},
     }
 
 
 def size_kib(path):
-    if not Path(path).exists():
+    expanded = Path(path).expanduser()
+    if not expanded.exists():
         return 0
-    result = subprocess.run(["du", "-sk", path], capture_output=True, text=True, check=True)
+    result = subprocess.run(["du", "-sk", str(expanded)], capture_output=True, text=True, check=True)
     return int(result.stdout.split()[0])
 
 
