@@ -81,29 +81,11 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 每个槽位的 state URL、认证信息和 CA 信任路径必须由部署配置提供，不能写入 release manifest、公开 dashboard 或仓库测试 fixture。Deployd 迁移使用 `deployd.json` 中的 `migration.rqlite_url` 和 `migration.rqlite_unit`，不读取业务 SQLite 之外的隐藏配置。
 
-## 首次部署实现状态
+## 首次安装与已有环境
 
-批准方案要求使用 Go CLI 的 `install` 入口完成只读预检和显式安装，并区分全新环境、旧 SQLite 环境及已有蓝绿安装。目前该入口尚未实现，以下旧发布器行为仅用于说明现有兼容路径，不能作为完整首次部署步骤。
+全新环境使用 Go CLI 的 `install`，按[首次安装步骤](install.md)准备受保护输入，先只读预检，再显式加 `--apply` 安装完整服务栈。安装器通过业务状态层直接初始化空 rqlite，不创建临时业务 SQLite。已有蓝绿安装只核验并指向本手册的升级入口；安装器不覆盖配置、不自动排空或重启有效槽位。
 
-现有发布器要求事先准备 rqlite、槽位配置、Deployd、systemd 资源和已验证的 format-4 发布包；它不会自动完成整个服务栈的安装。它在全新环境中仍会先启动旧单实例创建空 SQLite，再交给 Deployd 迁移。这与批准方案要求的直接初始化 rqlite 不符，是待修复的实现缺口。
-
-## 现有发布器的兼容激活流程
-
-下面描述当前发布器在完成上述人工准备后的行为，不代表批准方案已经实现。
-
-1. 校验发布包和两个槽位目录，但不启动新槽位。
-2. 读取发布状态；没有当前发布时，检查固定运行单元已经停止，不向不存在的旧控制服务发送排空请求。
-3. 已有当前发布时执行准入排空；全新根目录跳过旧服务排空请求，由封装检查激活前状态。
-4. 首次引入共享状态时，按现有兼容实现启动旧单实例，再启动 Deployd 并等待其 UDS API 就绪。
-5. 调用 Deployd 的迁移事务，由其围栏旧服务、等待请求及原生工作进程收敛、停止旧服务，再导入和验证 rqlite。
-6. 迁移成功后记录完成标记，再创建初始活动链接、禁用旧单实例并启动蓝绿槽位。
-7. 重新观测槽位和共享状态，通过检查后报告激活结果。
-
-`agent-vm-deploy migrate` 只提交状态迁移事务，不负责安装完整服务栈，不能作为首次安装的等价命令。
-
-如果 Deployd 返回带事务 ID 的 `state_unverified`，发布器会查询该事务；只有状态为 `needs_recovery` 时，才自动提交一次 `recover --action retry-migration`。重试会复用已验证的迁移 snapshot，并且在 rqlite 已经精确等于源 snapshot 时把丢失响应视为幂等成功；目标不一致时继续围栏，不猜测导入结果。
-
-迁移完成标记使用格式 2，经过原子写入、文件同步和目录同步，并携带迁移事务 ID、源摘要、目标 rqlite 摘要、状态纪元和 snapshot 保留截止时间。Deployd 只有在标记、当前 rqlite 目标摘要和仍然保留的唯一 finalized 迁移事务三者一致时，才允许重复执行 `migrate` 返回已完成事务；任何一项缺失、不一致或目标已被重置，都保持围栏，不会再次猜测或替换业务数据库。
+只有确实存在旧业务 SQLite 的环境才委托既有发布封装及 Deployd 的 `migrate` 事务，具体发布器输入和操作见[兼容发布说明](legacy-release.md)。`migrate` 不负责安装完整服务栈，不能代替 `install`，也不属于普通蓝绿升级。迁移结果不确定时查询原事务并按迁移恢复合同处理，不能删除记录后重试初始化。
 
 ## 一次性状态迁移
 
@@ -113,7 +95,7 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 迁移的实际顺序固定为：先启动并确认 rqlite，再让旧服务进入 state-write fence；随后轮询 `drain-status` 和 `admin-metrics`，确认没有 pending、unknown、in-flight 或未收敛的 transition task；然后停止旧服务，立即取得旧状态目录的 `authority.lock` 并在整个检查、snapshot 和导入阶段保持持有，检查 systemd 状态和 `/proc` 文件描述符，确认没有进程打开 SQLite 主文件、WAL 或 SHM 文件。旧服务的 Bun 入口在创建 SQLite store 前也必须取得同一把排他的 `authority.lock`，因此它在这把锁被 Deployd 持有时不能重新打开数据库。旧服务在这把锁释放前重新启动会使迁移失败闭锁，不会继续启动槽位。
 
-迁移开始前，Deployd 会为仍作为 SQLite writer 的 legacy singleton 临时授予蓝槽位 controller lease，然后才执行 `drain-enter`。这个 lease 只用于通过旧服务已有的写入围栏，不授予流量角色，也不把 legacy singleton 纳入正常的双槽位运行；迁移停止 legacy singleton 后，该 lease 随进程消失，发布器才会启动蓝、绿两个 rqlite 槽位。全新安装时，legacy SQLite 由本次安装创建，若无旧业务数据，它只承载空状态初始化，不会读取或恢复故障硬盘上的旧数据。
+迁移开始前，Deployd 会为仍作为 SQLite writer 的 legacy singleton 临时授予蓝槽位 controller lease，然后才执行 `drain-enter`。这个 lease 只用于通过旧服务已有的写入围栏，不授予流量角色，也不把 legacy singleton 纳入正常的双槽位运行；迁移停止 legacy singleton 后，该 lease 随进程消失，发布器才会启动蓝、绿两个 rqlite 槽位。全新安装不走该路径，也不创建 legacy SQLite。
 
 只有 writer 检查通过后，Deployd 才使用 SQLite 自己的 `VACUUM INTO` 创建一致 snapshot，并记录 source hash、大小、state epoch、fence ID 和验证时间。迁移预算按 SQLite 主库、WAL、SHM 和恢复目录中已登记的 snapshot 文件累计计算，累计上限为 1 GiB；没有人为设定的体积下限，空的小数据库也必须按实际大小处理。snapshot 生成后还会再次检查实际大小，超限材料会被清理并拒绝迁移。
 
@@ -129,12 +111,29 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 sudo agent-vm-deploy stage --slot green --bundle <已验证的发布包>
 sudo agent-vm-deploy verify --transaction <transaction-id>
 sudo agent-vm-deploy activate --transaction <transaction-id>
-sudo agent-vm-deploy status --transaction <transaction-id> --json
+sudo agent-vm-deploy transaction --transaction <transaction-id> --json
 ```
 
-Deployd 启动候选槽位，验证 manifest、socket、就绪状态、状态能力和共享状态纪元；然后授予候选 controller lease，确认 readiness 后启用 traffic role，原子替换 `active`，让旧槽位进入 retiring 并排空。Deployd 必须重新观测旧槽位已停止、目标槽位仍持有唯一 controller lease 且继续接收流量，才能进入 finalize。
+Deployd 启动候选槽位，验证 manifest、socket、就绪状态、状态能力和阶段证据绑定的 `state_authority`；然后授予候选 controller lease，确认 readiness 后启用 traffic role，原子替换 `active`，让旧槽位进入 retiring 并排空。Deployd 必须重新观测旧槽位已停止、目标槽位仍持有唯一 controller lease 且继续接收流量，才能进入 finalize。
 
 切换前失败保持当前槽位和 `active` 不变。切换后健康或 quiescence 失败只允许向上一个已验证槽位执行一次有界 rollback；结果不明确时保持 `needs_recovery` 并对 admission 和槽位主权执行 fencing，不能改写 state、generation 或 uncertain operation。
+
+查询原事务，确认存在已验证的上一槽位且尚未消耗回滚额度后，可以显式执行一次有界回滚；回滚只切换发布和角色，不回退业务数据库：
+
+```sh
+sudo agent-vm-deploy transaction --transaction '<原事务ID>' --json
+sudo agent-vm-deploy rollback --transaction '<原事务ID>'
+sudo agent-vm-deploy status --json
+```
+
+事务进入 `needs_recovery` 时，普通 `activate` 或 `rollback` 不代替恢复动作。保留原 ID，选择回到已验证上一槽位的恢复：
+
+```sh
+sudo agent-vm-deploy recover --transaction '<原事务ID>' --action rollback
+sudo agent-vm-deploy transaction --transaction '<原事务ID>' --json
+```
+
+只有 active 已切到原候选且候选产物、状态权威、进程与旧槽静止证据均可重新验证时，才可选择 `recover --transaction '<原事务ID>' --action finalize` 完成原切换。active 尚不存在的首次初始化使用[首次安装恢复](install.md)中的 `resume-bootstrap`，不能互换。证据不足时保持 fencing，不得手工改写业务状态或部署事务。
 
 `agent_vm_cutover.sh --dry-run` 只用于验证隔离布局和 active-link guard，不是蓝绿事务权威，也不能证明 controller 交接、流量排空或 native quiescence。
 
