@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import i18n from "./i18n";
 import { App } from "./App";
+import { mockState } from "./mockData";
 
 function renderApp() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -11,6 +12,27 @@ function renderApp() {
 }
 
 describe("management console workflow", () => {
+	it("only shows observation warnings when the overview contains those states", async () => {
+		const original = structuredClone(mockState.overview);
+		try {
+			mockState.overview.capacity.physical_disk_available.value_bytes = "53687091200";
+			mockState.overview.pressure.cpu_full_avg10.value = 0;
+			mockState.overview.pressure.cpu_startup_blocked.value = false;
+			for (const field of [...Object.values(mockState.overview.capacity), ...Object.values(mockState.overview.pressure)]) {
+				field.state = "available";
+				field.observed_at = mockState.overview.observed_at;
+			}
+			for (const source of mockState.overview.sources) source.state = "available";
+			window.history.replaceState({}, "", "/");
+			await i18n.changeLanguage("zh-CN");
+			renderApp();
+			expect(await screen.findByTestId("overview-page")).toBeInTheDocument();
+			expect(screen.queryByText("数据源已超过允许新鲜度，数值不以零替代。")).not.toBeInTheDocument();
+			expect(screen.queryByText("观测尚未验证，不能据此判定健康。")).not.toBeInTheDocument();
+		} finally {
+			mockState.overview = original;
+		}
+	});
   it("keeps the selected VM identity visible while the detail changes", async () => {
     const user = userEvent.setup();
     window.history.replaceState({}, "", "/vms");

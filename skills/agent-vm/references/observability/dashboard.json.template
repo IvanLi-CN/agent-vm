@@ -881,7 +881,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "clamp_max(\n  sum(rate(incus_cpu_seconds_total{mode!=\"idle\",job=\"$job\",project=\"$project\"}[$__rate_interval])) * 100,\n  100 * scalar(sum(agent_vm_admission_cpu_capacity_vcpu{job=\"$controller_job\"}))\n)",
+          "expr": "clamp_max(\n  sum(rate(incus_cpu_seconds_total{mode!=\"idle\",job=\"$job\",project=\"$project\"}[$__rate_interval])) * 100,\n  100 * scalar(sum(sum without (slot) ((agent_vm_admission_cpu_capacity_vcpu{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))))\n)",
           "hide": false,
           "interval": "",
           "legendFormat": "CT CPU usage",
@@ -892,7 +892,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "100 * agent_vm_admission_cpu_capacity_vcpu{job=\"$controller_job\"}",
+          "expr": "100 * sum without (slot) ((agent_vm_admission_cpu_capacity_vcpu{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -904,7 +904,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "100 * agent_vm_admission_cpu_limit_vcpu{job=\"$controller_job\"}",
+          "expr": "100 * sum without (slot) ((agent_vm_admission_cpu_limit_vcpu{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -916,7 +916,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "100 * agent_vm_admission_cpu_allocated_vcpu{job=\"$controller_job\"}",
+          "expr": "100 * sum without (slot) ((agent_vm_admission_cpu_allocated_vcpu{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -928,7 +928,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "100 * agent_vm_admission_cpu_reserved_vcpu{job=\"$controller_job\"}",
+          "expr": "100 * sum without (slot) ((agent_vm_admission_cpu_reserved_vcpu{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -940,7 +940,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "100 * agent_vm_admission_cpu_allocated_and_reserved_vcpu{job=\"$controller_job\"}",
+          "expr": "100 * sum without (slot) ((agent_vm_admission_cpu_allocated_and_reserved_vcpu{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -952,7 +952,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_cpu_pressure_some_avg10_percent{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_cpu_pressure_some_avg10_percent{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -964,7 +964,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_cpu_pressure_full_avg10_percent{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_cpu_pressure_full_avg10_percent{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -976,7 +976,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_cpu_startup_pressure_threshold_percent{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_cpu_startup_pressure_threshold_percent{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -988,7 +988,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "100 * agent_vm_cpu_startup_blocked{job=\"$controller_job\"}",
+          "expr": "100 * sum without (slot) ((agent_vm_cpu_startup_blocked{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "hide": false,
           "interval": "",
@@ -1213,7 +1213,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_memory_capacity_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_memory_capacity_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "legendFormat": "CT memory capacity",
           "refId": "A"
@@ -1224,7 +1224,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_memory_limit_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_memory_limit_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "legendFormat": "Logical admission target",
           "refId": "B"
@@ -1235,7 +1235,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_memory_allocated_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_memory_allocated_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "legendFormat": "Allocated VM RAM",
           "refId": "C"
@@ -1246,7 +1246,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_memory_reserved_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_memory_reserved_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "legendFormat": "Reserved VM RAM",
           "refId": "D"
@@ -1257,7 +1257,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_memory_allocated_and_reserved_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_memory_allocated_and_reserved_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "legendFormat": "Allocated + reserved VM RAM",
           "refId": "G"
@@ -1268,7 +1268,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_memory_current_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_memory_current_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "format": "time_series",
           "legendFormat": "CT memory.current",
           "refId": "E"
@@ -3670,7 +3670,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_memory_remaining_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_memory_remaining_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Remaining",
           "refId": "A"
@@ -3681,7 +3681,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "100 * agent_vm_admission_memory_allocated_bytes{job=\"$controller_job\"} / agent_vm_admission_memory_limit_bytes{job=\"$controller_job\"}",
+          "expr": "100 * sum without (slot) ((agent_vm_admission_memory_allocated_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1))) / sum without (slot) ((agent_vm_admission_memory_limit_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Allocated / logical limit",
           "refId": "B"
@@ -3692,7 +3692,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "100 * agent_vm_admission_memory_reserved_bytes{job=\"$controller_job\"} / agent_vm_admission_memory_limit_bytes{job=\"$controller_job\"}",
+          "expr": "100 * sum without (slot) ((agent_vm_admission_memory_reserved_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1))) / sum without (slot) ((agent_vm_admission_memory_limit_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Reserved / logical limit",
           "refId": "C"
@@ -3785,7 +3785,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_memory_available_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_memory_available_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Available",
           "refId": "A"
@@ -3796,7 +3796,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "100 * agent_vm_memory_available_bytes{job=\"$controller_job\"} / agent_vm_admission_memory_capacity_bytes{job=\"$controller_job\"}",
+          "expr": "100 * sum without (slot) ((agent_vm_memory_available_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1))) / sum without (slot) ((agent_vm_admission_memory_capacity_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Available / CT capacity",
           "refId": "B"
@@ -3961,7 +3961,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_memory_pressure{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_memory_pressure{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Pressure",
           "refId": "A"
@@ -3972,7 +3972,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_memory_pressure_threshold_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_memory_pressure_threshold_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Pressure threshold",
           "refId": "B"
@@ -3983,7 +3983,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "sum(agent_vm_memory_oom_events_total{job=\"$controller_job\",kind=\"oom\"})",
+          "expr": "sum(sum without (slot) ((agent_vm_memory_oom_events_total{job=\"$controller_job\",kind=\"oom\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1))))",
           "instant": true,
           "legendFormat": "OOM events",
           "refId": "C"
@@ -4117,7 +4117,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_cpu_remaining_vcpu{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_cpu_remaining_vcpu{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "CPU remaining",
           "refId": "A"
@@ -4128,7 +4128,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_ready{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_ready{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Ready",
           "refId": "C"
@@ -4139,7 +4139,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_observation_consistent{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_observation_consistent{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Snapshot consistent",
           "refId": "D"
@@ -4155,7 +4155,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-      "y": 65
+        "y": 65
       },
       "id": 502,
       "panels": [],
@@ -4243,7 +4243,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_default_request_cpu_vcpu{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_default_request_cpu_vcpu{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "CPU vCPU",
           "refId": "A"
@@ -4254,7 +4254,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_default_request_memory_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_default_request_memory_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "RAM",
           "refId": "B"
@@ -4265,7 +4265,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_default_request_disk_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_default_request_disk_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Disk",
           "refId": "C"
@@ -4276,7 +4276,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_default_request_physical_cost_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_default_request_physical_cost_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Physical cost",
           "refId": "D"
@@ -4329,7 +4329,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_default_vm_logical_slots{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_default_vm_logical_slots{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Logical slots",
           "refId": "A"
@@ -4340,7 +4340,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_default_vm_startable_slots{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_default_vm_startable_slots{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Startable slots",
           "refId": "B"
@@ -4404,7 +4404,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_states{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_task_states{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "{{state}}",
           "refId": "A"
         }
@@ -4502,7 +4502,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_disk_allocated_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_disk_allocated_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "Disk allocated",
           "refId": "A"
         },
@@ -4511,7 +4511,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_disk_reserved_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_disk_reserved_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "Disk reserved",
           "refId": "B"
         },
@@ -4520,7 +4520,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_disk_allocated_and_reserved_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_disk_allocated_and_reserved_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "Disk allocated + reserved",
           "refId": "C"
         },
@@ -4529,7 +4529,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_disk_remaining_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_disk_remaining_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "Disk remaining",
           "refId": "D"
         },
@@ -4538,7 +4538,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_disk_limit_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_disk_limit_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "Disk limit",
           "refId": "E"
         },
@@ -4547,7 +4547,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_disk_capacity_bytes{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_disk_capacity_bytes{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "Disk capacity",
           "refId": "F"
         }
@@ -4632,7 +4632,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_instances_allocated_count{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_instances_allocated_count{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "VMs allocated",
           "refId": "A"
         },
@@ -4641,7 +4641,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_instances_reserved_count{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_instances_reserved_count{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "VMs reserved",
           "refId": "B"
         },
@@ -4650,7 +4650,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_instances_allocated_and_reserved_count{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_instances_allocated_and_reserved_count{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "VMs allocated + reserved",
           "refId": "C"
         },
@@ -4659,7 +4659,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_instances_remaining_count{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_instances_remaining_count{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "Managed-container slots remaining",
           "refId": "D"
         },
@@ -4668,7 +4668,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_instances_limit_count{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_instances_limit_count{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "Managed-container slots limit",
           "refId": "E"
         },
@@ -4677,7 +4677,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_instances_capacity_count{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_instances_capacity_count{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "Managed-container slots capacity",
           "refId": "F"
         }
@@ -4739,7 +4739,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_filesystem_size_bytes{job=\"$controller_job\",mountpoint=~\"/|/var/lib/incus/images\"}",
+          "expr": "sum without (slot) ((agent_vm_filesystem_size_bytes{job=\"$controller_job\",mountpoint=~\"/|/var/lib/incus/images\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "{{mountpoint}} total",
           "refId": "A"
         },
@@ -4748,7 +4748,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_filesystem_used_bytes{job=\"$controller_job\",mountpoint=~\"/|/var/lib/incus/images\"}",
+          "expr": "sum without (slot) ((agent_vm_filesystem_used_bytes{job=\"$controller_job\",mountpoint=~\"/|/var/lib/incus/images\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "{{mountpoint}} used",
           "refId": "B"
         },
@@ -4757,7 +4757,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_filesystem_available_bytes{job=\"$controller_job\",mountpoint=~\"/|/var/lib/incus/images\"}",
+          "expr": "sum without (slot) ((agent_vm_filesystem_available_bytes{job=\"$controller_job\",mountpoint=~\"/|/var/lib/incus/images\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "{{mountpoint}} available",
           "refId": "C"
         }
@@ -4808,7 +4808,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_reclaim_required{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_reclaim_required{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Reclaim required",
           "refId": "A"
@@ -4818,7 +4818,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_admission_draining{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_draining{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Draining",
           "refId": "B"
@@ -4828,7 +4828,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "sum(rate(agent_vm_warnings_total{job=\"$controller_job\"}[5m]))",
+          "expr": "sum((rate(agent_vm_warnings_total{job=\"$controller_job\"}[5m]) and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Warnings / s",
           "refId": "C"
@@ -4838,7 +4838,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "agent_vm_up{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_up{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Collector up",
           "refId": "D"
@@ -4848,7 +4848,7 @@
             "type": "prometheus",
             "uid": "__PROMETHEUS_UID__"
           },
-          "expr": "time() - agent_vm_scrape_timestamp_seconds{job=\"$controller_job\"}",
+          "expr": "time() - sum without (slot) ((agent_vm_inventory_scrape_timestamp_seconds{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Scrape age (s)",
           "refId": "E"

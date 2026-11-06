@@ -224,6 +224,80 @@ func TestPageBoundsContinuesWhenCursorAnchorDisappears(t *testing.T) {
 	}
 }
 
+func TestOverviewUsesVerifiedPhysicalObservations(t *testing.T) {
+	for _, mode := range []string{"fresh", "stale", "missing", "unverified-disk"} {
+		t.Run(mode, func(t *testing.T) {
+			authority, _, _ := testAuthority(t)
+			now := time.Date(2026, 11, 6, 0, 0, 0, 0, time.UTC)
+			authority.Clock = func() time.Time { return now }
+			observedAt := now
+			if mode == "stale" {
+				observedAt = now.Add(-2 * time.Minute)
+			}
+			metrics := map[string]any{
+				"observed_at": observedAt.Format(time.RFC3339Nano), "up": true,
+				"admission_ready": true, "draining": false, "observation_consistent": true,
+				"task_states": completeTaskStates(0), "default_admission": map[string]any{"ready": true},
+				"ct_memory":      map[string]any{"available_bytes": int64(10 << 30), "pressure": false},
+				"disk_admission": map[string]any{"verified": mode != "unverified-disk", "physical_admission": map[string]any{"free_bytes": int64(30 << 30)}},
+				"resources":      map[string]any{"remaining": map[string]any{"disk_gib": 999}},
+			}
+			if mode == "missing" {
+				delete(metrics, "ct_memory")
+				delete(metrics, "disk_admission")
+			}
+			value, err := authority.overview(metrics, context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			capacity := value["capacity"].(map[string]any)
+			pressure := value["pressure"].(map[string]any)
+			for key, expected := range map[string]any{"ct_memory_available": "10737418240", "physical_disk_available": "32212254720", "memory_pressure": false} {
+				fields := capacity
+				if key == "memory_pressure" {
+					fields = pressure
+				}
+				field := fields[key].(map[string]any)
+				property := "value_bytes"
+				if key == "memory_pressure" {
+					property = "value"
+				}
+				state := "available"
+				if mode == "stale" {
+					state, expected = "stale", nil
+				} else if mode == "missing" || mode == "unverified-disk" && key == "physical_disk_available" {
+					state, expected = "unverified", nil
+				}
+				if field["state"] != state || field[property] != expected {
+					t.Fatalf("%s=%#v want state=%s value=%#v", key, field, state, expected)
+				}
+			}
+		})
+	}
+}
+
+func TestVMLeaseRequiresActiveState(t *testing.T) {
+	authority, _, _ := testAuthority(t)
+	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	authority.Clock = func() time.Time { return now }
+	for _, taskState := range []string{"active", "preparing", "cached", "closing", "failed"} {
+		t.Run(taskState, func(t *testing.T) {
+			expires := now.Add(time.Minute).Format(time.RFC3339Nano)
+			value, err := authority.vmValue(context.Background(), &state.Task{TaskID: "lease-view", State: taskState, LeaseExpiresAt: &expires, ImageFingerprint: strings.Repeat("a", 64), ResourcesJSON: "{}"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "unknown"
+			if taskState == "active" {
+				want = "effective"
+			}
+			if got := value["lease"].(map[string]any)["state"]; got != want {
+				t.Fatalf("lease state = %v, want %s", got, want)
+			}
+		})
+	}
+}
+
 func TestOverviewMarksStaleSourcesAndBlocksUnsafeAdmission(t *testing.T) {
 	authority, store, _ := testAuthority(t)
 	updatedAt := "2026-10-27T00:00:00Z"

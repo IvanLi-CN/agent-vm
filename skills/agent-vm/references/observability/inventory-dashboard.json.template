@@ -123,7 +123,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_up{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_up{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Controller up",
           "refId": "A"
@@ -134,7 +134,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_admission_ready{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_admission_ready{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Admission ready",
           "refId": "B"
@@ -145,7 +145,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_observation_consistent{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_observation_consistent{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Snapshot consistent",
           "refId": "C"
@@ -197,7 +197,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "sum(agent_vm_task_states{job=\"$controller_job\"})",
+          "expr": "sum(sum without (slot) ((agent_vm_task_states{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1))))",
           "instant": true,
           "legendFormat": "Managed tasks",
           "refId": "A"
@@ -208,7 +208,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "sum(agent_vm_task_states{job=\"$controller_job\",state=~\"preparing|closing|deleting|failed\"})",
+          "expr": "sum(sum without (slot) ((agent_vm_task_states{job=\"$controller_job\",state=~\"preparing|closing|deleting|failed\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1))))",
           "instant": true,
           "legendFormat": "Pending operations",
           "refId": "B"
@@ -273,7 +273,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_scrape_timestamp_seconds{job=\"$controller_job\"} * 1000",
+          "expr": "sum without (slot) ((agent_vm_inventory_scrape_timestamp_seconds{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1))) * 1000",
           "instant": true,
           "legendFormat": "Last successful scrape",
           "refId": "A"
@@ -284,7 +284,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "time() - agent_vm_scrape_timestamp_seconds{job=\"$controller_job\"}",
+          "expr": "time() - sum without (slot) ((agent_vm_inventory_scrape_timestamp_seconds{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "instant": true,
           "legendFormat": "Scrape age (s)",
           "refId": "B"
@@ -336,7 +336,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "sum(agent_vm_operations_total{job=\"$controller_job\",outcome=\"failure\"})",
+          "expr": "sum(sum without (slot) ((agent_vm_operations_total{job=\"$controller_job\",outcome=~\"error|failure\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1))))",
           "instant": true,
           "legendFormat": "Operation failures",
           "refId": "A"
@@ -347,7 +347,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "sum(agent_vm_image_unpack_failures_total{job=\"$controller_job\"})",
+          "expr": "sum(sum without (slot) ((agent_vm_image_unpack_failures_count{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1))))",
           "instant": true,
           "legendFormat": "Image unpack failures",
           "refId": "B"
@@ -438,7 +438,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "label_join(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(agent_vm_task_info{job=\"$controller_job\",state=~\"$state\"}, \"state_order\", \"1\", \"state\", \"^active$\"), \"state_order\", \"2\", \"state\", \"^preparing$\"), \"state_order\", \"3\", \"state\", \"^failed$\"), \"state_order\", \"4\", \"state\", \"^closing$\"), \"state_order\", \"4\", \"state\", \"^deleting$\"), \"state_order\", \"5\", \"state\", \"^cached$\"), \"state_order\", \"6\", \"state\", \"^absent$\"), \"task_key\", \"|\", \"task_id\", \"state\")",
+          "expr": "label_join(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(label_replace(sum without (slot) ((agent_vm_task_info{job=\"$controller_job\",state=~\"$state\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1))), \"state_order\", \"1\", \"state\", \"^active$\"), \"state_order\", \"2\", \"state\", \"^preparing$\"), \"state_order\", \"3\", \"state\", \"^failed$\"), \"state_order\", \"4\", \"state\", \"^closing$\"), \"state_order\", \"4\", \"state\", \"^deleting$\"), \"state_order\", \"5\", \"state\", \"^cached$\"), \"state_order\", \"6\", \"state\", \"^absent$\"), \"task_key\", \"|\", \"task_id\", \"state\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}}",
@@ -450,7 +450,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "label_join(sum by (task_id, state) (agent_vm_task_cpu_vcpu{job=\"$controller_job\",state=~\"$state\"}), \"task_key\", \"|\", \"task_id\", \"state\")",
+          "expr": "label_join(sum by (task_id, state) (sum without (slot) ((agent_vm_task_cpu_vcpu{job=\"$controller_job\",state=~\"$state\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))), \"task_key\", \"|\", \"task_id\", \"state\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} CPU",
@@ -462,7 +462,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "label_join(sum by (task_id, state) (agent_vm_task_memory_bytes{job=\"$controller_job\",state=~\"$state\"}), \"task_key\", \"|\", \"task_id\", \"state\") / 1073741824",
+          "expr": "label_join(sum by (task_id, state) (sum without (slot) ((agent_vm_task_memory_bytes{job=\"$controller_job\",state=~\"$state\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))), \"task_key\", \"|\", \"task_id\", \"state\") / 1073741824",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} RAM",
@@ -474,7 +474,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "label_join(sum by (task_id, state) (agent_vm_task_disk_bytes{job=\"$controller_job\",state=~\"$state\"}), \"task_key\", \"|\", \"task_id\", \"state\") / 1073741824",
+          "expr": "label_join(sum by (task_id, state) (sum without (slot) ((agent_vm_task_disk_bytes{job=\"$controller_job\",state=~\"$state\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))), \"task_key\", \"|\", \"task_id\", \"state\") / 1073741824",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} disk",
@@ -486,7 +486,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (task_id, state) (agent_vm_task_lease_expires_at_seconds{job=\"$controller_job\",state=~\"$state\"}), \"task_key\", \"|\", \"task_id\", \"state\")",
+          "expr": "label_join(max by (task_id, state) (sum without (slot) ((agent_vm_task_lease_expires_at_seconds{job=\"$controller_job\",state=~\"$state\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))), \"task_key\", \"|\", \"task_id\", \"state\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} lease",
@@ -498,7 +498,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (task_id, state, vm_ip, ssh_host_port) (agent_vm_task_ssh_mapping{job=\"$controller_job\",state=~\"$state\"}), \"task_key\", \"|\", \"task_id\", \"state\")",
+          "expr": "label_join(max by (task_id, state, vm_ip, ssh_host_port) (sum without (slot) ((agent_vm_task_ssh_mapping{job=\"$controller_job\",state=~\"$state\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))), \"task_key\", \"|\", \"task_id\", \"state\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} SSH",
@@ -510,7 +510,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "label_join(max by (task_id, state, code, phase) (agent_vm_task_last_error_info{job=\"$controller_job\",state=~\"$state\"}), \"task_key\", \"|\", \"task_id\", \"state\")",
+          "expr": "label_join(max by (task_id, state, code, phase) (sum without (slot) ((agent_vm_task_last_error_info{job=\"$controller_job\",state=~\"$state\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))), \"task_key\", \"|\", \"task_id\", \"state\")",
           "format": "table",
           "instant": true,
           "legendFormat": "{{task_id}} error",
@@ -633,7 +633,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "agent_vm_task_states{job=\"$controller_job\"}",
+          "expr": "sum without (slot) ((agent_vm_task_states{job=\"$controller_job\"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "{{state}}",
           "refId": "A"
         }
@@ -695,7 +695,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "sum by (outcome, phase) (rate(agent_vm_operations_total{job=\"$controller_job\"}[5m]))",
+          "expr": "sum by (outcome, phase) ((rate(agent_vm_operations_total{job=\"$controller_job\"}[5m]) and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "{{outcome}} / {{phase}}",
           "refId": "A"
         },
@@ -705,7 +705,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "sum by (phase, reason) (rate(agent_vm_image_unpack_failures_total{job=\"$controller_job\"}[5m]))",
+          "expr": "sum by (phase, reason) ((rate(agent_vm_image_unpack_failures_total{job=\"$controller_job\"}[5m]) and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "image {{phase}} / {{reason}}",
           "refId": "B"
         },
@@ -715,7 +715,7 @@
             "uid": "__PROMETHEUS_UID__"
           },
           "editorMode": "code",
-          "expr": "sum by (code) (rate(agent_vm_warnings_total{job=\"$controller_job\"}[5m]))",
+          "expr": "sum by (code) ((rate(agent_vm_warnings_total{job=\"$controller_job\"}[5m]) and on(job, instance, slot) (agent_vm_deployd_slot_selected{job=\"$controller_job\"} == 1)))",
           "legendFormat": "warning {{code}}",
           "refId": "C"
         }

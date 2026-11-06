@@ -71,6 +71,17 @@ function settingsFromLocation(): DemoUrlSettings {
 
 export function modelForScene(scene: DemoScene, dataMode: DemoDataMode = "full"): MockState {
   const model = cloneModel();
+  if (scene === "normal") {
+    const observedAt = model.overview.observed_at;
+    model.overview.capacity.physical_disk_available = { state: "available", value_bytes: "53687091200", observed_at: observedAt };
+    model.overview.pressure.cpu_full_avg10 = { state: "available", value: 0, observed_at: observedAt };
+    model.overview.pressure.cpu_startup_blocked = { state: "available", value: false, observed_at: observedAt };
+    for (const source of model.overview.sources) {
+      source.state = "available";
+      source.observed_at = observedAt;
+      source.safe_code = null;
+    }
+  }
   if (scene === "capacity") {
     model.overview.admission = { ready: false, draining: false, reasons: ["physical_disk_staging_low", "cpu_startup_pressure"] };
     model.overview.capacity.logical_cpu_remaining_vcpu = { state: "failed", value: null, observed_at: null };

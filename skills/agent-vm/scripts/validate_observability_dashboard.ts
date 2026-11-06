@@ -60,7 +60,7 @@ export const REQUIRED_METRICS = [
   "agent_vm_admission_draining",
   "agent_vm_up",
   "agent_vm_observation_consistent",
-  "agent_vm_scrape_timestamp_seconds",
+  "agent_vm_inventory_scrape_timestamp_seconds",
   "agent_vm_filesystem_size_bytes",
   "agent_vm_filesystem_used_bytes",
   "agent_vm_filesystem_available_bytes",
@@ -98,7 +98,7 @@ export const INVENTORY_REQUIRED_METRICS = [
   "agent_vm_task_states",
   "agent_vm_up",
   "agent_vm_observation_consistent",
-  "agent_vm_scrape_timestamp_seconds",
+  "agent_vm_inventory_scrape_timestamp_seconds",
   "agent_vm_operations_total",
   "agent_vm_image_unpack_failures_total",
 ];
@@ -263,6 +263,15 @@ export function validateDashboard(dashboard: unknown, expectedDatasourceUid?: st
   }
 
   for (const [index, expression] of expressions.entries()) {
+    if (/\bagent_vm_(?!deployd_)/.test(expression) && !expression.includes('and on(job, instance, slot) (agent_vm_deployd_slot_selected{job="$controller_job"} == 1)')) {
+      findings.push(`business target ${index + 1} must select the active slot before aggregation`);
+    }
+    if (/\bagent_vm_(?!deployd_)/.test(expression) && !expression.includes("sum without (slot)")) {
+      const aggregate = expression.trim().match(/^sum(?:\s+by\s*\(([^)]*)\))?\s*\(/);
+      if (!aggregate || aggregate[1]?.split(",").some((label) => label.trim() === "slot")) {
+        findings.push(`business target ${index + 1} must remove the slot dimension after active selection`);
+      }
+    }
     if (/incus_network_(?:receive|transmit)_packets_total/.test(expression) && /\*\s*8\b/.test(expression)) {
       findings.push(`packet-rate target ${index + 1} must not multiply by 8`);
     }

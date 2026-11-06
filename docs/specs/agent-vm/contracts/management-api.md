@@ -37,6 +37,8 @@ OIDC callback 兼容签发方返回的单值 `iss` 与 `scope`。存在 `iss` �
 
 ## 授权与敏感操作
 
+VM 清单只有在 task 为 `active` 且租约时间有效时才能显示 `lease.state=effective`，与生命周期接口保持一致。准备中、缓存、收尾或失败记录即使保留未来到期时间，也不能据此宣称有效租约；此时保留时间并显示 `unknown`。已到期、缺失或无法解析的租约分别保留 `expired`、`absent` 或 `unknown`，不推测实例可用性。
+
 唯一管理员使用浏览器会话和 [Token API](token-api.md)。API 没有普通用户或跨主体资源边界：管理员可以检查和管理配置 capability 允许的所有目标。Token 创建必须使用 UUID operation ID 和绑定准确管理员 `(issuer, subject)` 的规范重试身份。请求 `agent:operate` scope 时必须同时显式提供 `agent:read` scope；这是共同要求，不是隐式继承，使同一 Token 能在响应丢失后查询状态和 reconciliation。成功的持久 operation 状态必须暴露 `token_id`、安全元数据和一次性披露状态；成功的 `token_create` 结果不得缺少这些字段，并发或重复请求也不得再次返回明文。创建响应丢失时，管理员查询原 operation，确认并按 ID 撤销 Token，再使用新的 operation ID 创建替代 Token。`agent:observe_admin` 是显式机器 scope，不是用户角色。下方 capability 矩阵是规范性合同：管理员角色不自动包含所有操作 capability，每个 endpoint 都必须拒绝缺少对应 capability 的请求。
 
 | 浏览器 capability | 授权的管理面 | 额外授权规则 |
@@ -112,3 +114,12 @@ API 使用稳定的机器错误码、阶段和少量安全结构化字段白名�
 - `audit-page.json` 覆盖当前 actor、typed rejected-request actor 或显式未知历史 actor，以及可选 reason、目标和结果。
 - `system.json` 覆盖统一服务、Caddy、rqlite 和 Incus readiness。
 - `error.json` 覆盖不包含内部诊断的 stale-target 冲突。
+
+
+## Visual Evidence
+
+以下图片来自无登录、无真实后端依赖的 `ui_demo`，用于核验管理页的观测字段和告警呈现，不代表生产部署、真实容量或 Grafana 验收通过。新鲜观测显示已验证字段，不误报过期；过期或未验证的观测继续保留明确告警，不用零值替代未知数据。
+
+![新鲜观测：显示已验证数据且不误报过期](../assets/management-overview-fresh-desktop.png)
+
+![过期观测：保留新鲜度与未验证告警](../assets/management-overview-stale-desktop.png)
