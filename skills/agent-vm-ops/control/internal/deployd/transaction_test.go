@@ -750,6 +750,63 @@ type changingObservationRuntime struct {
 	invalidRoleSource string
 }
 
+func TestTransactionObservationRenewsOnlyVerifiedLiveCandidate(t *testing.T) {
+	start := controllerrole.ProcessStartToken(os.Getpid())
+	if start == "" {
+		t.Skip("Linux process-incarnation evidence required")
+	}
+	for _, mode := range []string{"live", "transient", "inconsistent", "expired", "other-owner"} {
+		t.Run(mode, func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			transaction := store.Transaction{ID: "tx-observe", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/tmp/recovery.tar", Phase: PhaseQuiescence, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
+			if err := database.Create(context.Background(), transaction, nil); err != nil {
+				t.Fatal(err)
+			}
+			lease := controllerrole.Lease{Slot: "green", Term: 1, Generation: 1, LeaseID: "lease", Nonce: "nonce", OwnerPID: os.Getpid(), OwnerStartTime: start, Expiry: now.Add(time.Second)}
+			if mode == "expired" {
+				lease.Expiry = now.Add(-time.Second)
+			}
+			if mode == "other-owner" {
+				lease.OwnerStartTime = "other"
+			}
+			runtime := &changingObservationRuntime{fakeRuntime: &fakeRuntime{active: "green", observations: map[string]SlotObservation{
+				"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true, LeaseRenewalSupported: true, ControllerLease: &lease},
+				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true},
+			}}}
+			if mode == "transient" {
+				runtime.unstableReads = 1
+			}
+			if mode == "inconsistent" {
+				runtime.unstableReads = 10
+			}
+			manager := NewManager(database, runtime, 15*time.Second, func() time.Time { return now })
+			_, err = manager.observe(context.Background(), transaction.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantGrant := mode == "live" || mode == "transient"
+			if (len(runtime.grantedLeases) == 1) != wantGrant {
+				t.Fatalf("grants=%v reads=%d", runtime.grantedLeases, runtime.reads)
+			}
+			if wantGrant {
+				renewed := runtime.grantedLeases[0]
+				if !renewed.Expiry.Equal(now.Add(15 * time.Second)) {
+					t.Fatalf("expiry=%v", renewed.Expiry)
+				}
+				renewed.Expiry = lease.Expiry
+				if renewed != lease {
+					t.Fatal("renewal changed controller identity")
+				}
+			}
+		})
+	}
+}
+
 func (runtime *changingObservationRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error) {
 	runtime.reads++
 	if runtime.onRead != nil {

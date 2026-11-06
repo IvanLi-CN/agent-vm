@@ -871,6 +871,9 @@ func (manager *Manager) fenceSlots(ctx context.Context, cause error) error {
 
 func (manager *Manager) observe(ctx context.Context, transactionID string) (RuntimeSnapshot, error) {
 	observation, err := manager.Runtime.Observe(ctx)
+	for attempt := 1; transactionID != "" && err == nil && !observation.Consistent && attempt < 3; attempt++ {
+		observation, err = manager.Runtime.Observe(ctx)
+	}
 	if err != nil {
 		return RuntimeSnapshot{}, err
 	}
@@ -879,6 +882,32 @@ func (manager *Manager) observe(ctx context.Context, transactionID string) (Runt
 	}
 	if observation.Slots == nil {
 		observation.Slots = map[string]SlotObservation{}
+	}
+	if transactionID != "" && validObservation(observation, manager.Clock().UTC()) {
+		transaction, readErr := manager.Store.Get(ctx, transactionID)
+		if readErr != nil {
+			return RuntimeSnapshot{}, readErr
+		}
+		if transaction != nil && transaction.State != "finalized" && observation.ControllerSlot == transaction.TargetSlot {
+			target := observation.Slots[transaction.TargetSlot]
+			current := target.ControllerLease
+			if target.ProcessUp && target.ProcessReady && target.ControllerOwned && target.LeaseRenewalSupported && current != nil &&
+				current.Generation == transaction.Generation && current.Validate(manager.Clock(), target.Slot) == nil &&
+				current.OwnerPID == os.Getpid() && current.OwnerStartTime != "" && current.OwnerStartTime == controllerrole.ProcessStartToken(os.Getpid()) {
+				// Deployment phases can outlast a role TTL. Renew only the exact
+				// live candidate authority verified by this fresh observation; an
+				// expired/fenced role is never recreated from the transaction row.
+				lease, renewErr := manager.renewOrAllocateLease(ctx, target, transaction.Generation, current)
+				if renewErr != nil {
+					return RuntimeSnapshot{}, renewErr
+				}
+				if err := manager.Runtime.GrantController(ctx, target.Slot, lease); err != nil {
+					return RuntimeSnapshot{}, &UncertainError{Cause: err}
+				}
+				target.ControllerLease = &lease
+				observation.Slots[target.Slot] = target
+			}
+		}
 	}
 	payload := map[string]any{"active_slot": observation.ActiveSlot, "controller_slot": observation.ControllerSlot, "consistent": observation.Consistent, "observed_at": observation.ObservedAt, "fresh_until": observation.FreshUntil, "slots": observation.Slots, "sources": observation.Sources}
 	encoded, _ := json.Marshal(payload)
