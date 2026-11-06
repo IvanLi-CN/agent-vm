@@ -108,10 +108,10 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 普通切换只处理 release、槽位角色、流量、`active` 链接和 native quiescence：
 
 ```sh
-sudo agent-vm-deploy stage --slot green --bundle <已验证的发布包>
-sudo agent-vm-deploy verify --transaction <transaction-id>
-sudo agent-vm-deploy activate --transaction <transaction-id>
-sudo agent-vm-deploy transaction --transaction <transaction-id> --json
+sudo /opt/agent-vm-native/bin/agent-vm-deploy stage --slot green --bundle '<已验证的发布包>'
+sudo /opt/agent-vm-native/bin/agent-vm-deploy verify --transaction '<transaction-id>'
+sudo /opt/agent-vm-native/bin/agent-vm-deploy activate --transaction '<transaction-id>'
+sudo /opt/agent-vm-native/bin/agent-vm-deploy transaction --transaction '<transaction-id>' --json
 ```
 
 Deployd 启动候选槽位，验证 manifest、socket、就绪状态、状态能力和阶段证据绑定的 `state_authority`；然后授予候选 controller lease，确认 readiness 后启用 traffic role，原子替换 `active`，让旧槽位进入 retiring 并排空。Deployd 必须重新观测旧槽位已停止、目标槽位仍持有唯一 controller lease 且继续接收流量，才能进入 finalize。
@@ -123,16 +123,16 @@ Deployd 启动候选槽位，验证 manifest、socket、就绪状态、状态能
 查询原事务，确认存在已验证的上一槽位且尚未消耗回滚额度后，可以显式执行一次有界回滚；回滚只切换发布和角色，不回退业务数据库：
 
 ```sh
-sudo agent-vm-deploy transaction --transaction '<原事务ID>' --json
-sudo agent-vm-deploy rollback --transaction '<原事务ID>'
-sudo agent-vm-deploy status --json
+sudo /opt/agent-vm-native/bin/agent-vm-deploy transaction --transaction '<原事务ID>' --json
+sudo /opt/agent-vm-native/bin/agent-vm-deploy rollback --transaction '<原事务ID>'
+sudo /opt/agent-vm-native/bin/agent-vm-deploy status --json
 ```
 
 事务进入 `needs_recovery` 时，普通 `activate` 或 `rollback` 不代替恢复动作。保留原 ID，选择回到已验证上一槽位的恢复：
 
 ```sh
-sudo agent-vm-deploy recover --transaction '<原事务ID>' --action rollback
-sudo agent-vm-deploy transaction --transaction '<原事务ID>' --json
+sudo /opt/agent-vm-native/bin/agent-vm-deploy recover --transaction '<原事务ID>' --action rollback
+sudo /opt/agent-vm-native/bin/agent-vm-deploy transaction --transaction '<原事务ID>' --json
 ```
 
 只有 active 已切到原候选且候选产物、状态权威、进程与旧槽静止证据均可重新验证时，才可选择 `recover --transaction '<原事务ID>' --action finalize` 完成原切换。active 尚不存在的首次初始化使用[首次安装恢复](install.md)中的 `resume-bootstrap`，不能互换。证据不足时保持 fencing，不得手工改写业务状态或部署事务。

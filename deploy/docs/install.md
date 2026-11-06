@@ -15,6 +15,17 @@ sudo install -d -m 0700 /var/tmp/agent-vm-install
 
 以下命令假定已验证的产品包位于 `/var/tmp/agent-vm-install/product.tar`，同修订部署资料位于 `/var/tmp/agent-vm-install/materials/`，用于发起安装的已验证 CLI 位于 `/var/tmp/agent-vm-install/agent-vm-deploy`。这些位置属于本次输入，不改变服务器固定安装布局。
 
+将与产品包同版本、已完成摘要校验的部署资料附件放到 `/var/tmp/agent-vm-install/deployment-materials.tar`。在上述受保护目录中执行下面的命令，从产品包只读取 CLI 这一项，并把资料附件展开到全新目录；不要使用正在存放其他文件的目录，也不要跳过前面的制品来源与摘要校验。
+
+```sh
+sudo sh -eu -c 'tar -xOf /var/tmp/agent-vm-install/product.tar bin/agent-vm-deploy > /var/tmp/agent-vm-install/agent-vm-deploy'
+sudo chmod 0700 /var/tmp/agent-vm-install/agent-vm-deploy
+sudo mkdir -m 0700 /var/tmp/agent-vm-install/materials
+sudo tar --extract --file /var/tmp/agent-vm-install/deployment-materials.tar \
+  --directory /var/tmp/agent-vm-install/materials \
+  --no-same-owner --no-same-permissions --keep-old-files
+```
+
 ## 准备受保护输入
 
 将 [`install.json.example`](../assets/install.json.example) 复制到 `/etc/agent-vm-install-inputs/install.json`。它引用的每个文件必须由执行安装的用户拥有、不是符号链接，权限使用 `0600`；文件路径不能包含符号链接父目录。不要把真实输入提交到仓库。
