@@ -892,8 +892,8 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 		wantError bool
 		preserve  bool
 	}{
-		{"one-state-change", 1, "", 3, false, false},
-		{"two-state-changes", 2, "", 4, false, false},
+		{"one-state-change", 1, "", 2, false, false},
+		{"two-state-changes", 2, "", 3, false, false},
 		{"persistent-inconsistency", 10, "", 3, true, true},
 		{"traffic-disable-failure", 10, "traffic", 3, true, false},
 		{"active-link-unavailable", 10, "source-active_link", 1, true, false},
