@@ -1620,3 +1620,25 @@ func TestVerifyUsesAuthorityInsteadOfChangingEpoch(t *testing.T) {
 		})
 	}
 }
+
+func TestVerifyRejectsBothSlotsChangingAuthorityAfterStage(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deploy.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true}, "green": {ProcessUp: true, ProcessReady: true, Ready: true}}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	transaction, err := manager.Stage(context.Background(), "green", "/bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for slot, value := range runtime.observations {
+		value.StateAuthority = "reconfigured-backend"
+		runtime.observations[slot] = value
+	}
+	if _, err := manager.Verify(context.Background(), transaction.ID); err == nil {
+		t.Fatal("verify accepted both slots changing backend after stage")
+	}
+}

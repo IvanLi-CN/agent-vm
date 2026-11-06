@@ -269,7 +269,8 @@ func (manager *Manager) Verify(ctx context.Context, id string) (*store.Transacti
 		return nil, manager.failure(ctx, id, PhaseStandbyValidation, errors.New("candidate slot is not process-ready"))
 	}
 	previous, previousOK := observation.Slots[transaction.PreviousSlot]
-	if previousOK && (previous.StateAuthority == "" || target.StateAuthority == "" || previous.StateAuthority != target.StateAuthority || !sameStateCapabilities(previous.StateCapabilities, target.StateCapabilities)) {
+	_, _, stagedAuthority, _, stagedErr := manager.verifiedPreviousIdentity(ctx, id)
+	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" && (stagedErr != nil || !previousOK || previous.StateAuthority != stagedAuthority || target.StateAuthority != stagedAuthority || !sameStateCapabilities(previous.StateCapabilities, target.StateCapabilities)) {
 		return nil, manager.failure(ctx, id, PhaseStandbyValidation, errors.New("candidate state contract is incompatible with the active slot"))
 	}
 	if err := manager.transitionAfterEffect(ctx, id, PhaseStandbyValidation, PhaseControllerHandoff, "verified", map[string]any{"candidate_ready": true, "release_id": target.ReleaseID, "source_revision": target.SourceRevision, "state_epoch": target.StateEpoch, "state_authority": target.StateAuthority, "state_capabilities": append([]string(nil), target.StateCapabilities...)}); err != nil {
