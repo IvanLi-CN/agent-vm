@@ -1,0 +1,91 @@
+version: 1
+schema: agent-vm-resource-profile-v1
+status: advisory
+calibration: initial-guidance
+
+policy:
+  default_profile: default
+  swap: host-dependent
+  disk_headroom: 30%
+  active_workloads: 1
+
+profiles:
+  default:
+    purpose: "短时脚本、轻量 Bun/Node/Python 检查"
+    cpu:
+      minimum: 2
+      recommended: 2
+    memory:
+      minimum: "4GiB"
+      recommended: "4GiB"
+    disk:
+      minimum: "20GiB"
+      recommended: "20GiB"
+    swap: host-dependent
+    concurrency:
+      max_active_workloads: 1
+      recommended_build_jobs: 2
+
+  standard:
+    purpose: "普通 Go、TypeScript 或小型 Rust 项目测试"
+    cpu:
+      minimum: 2
+      recommended: 4
+    memory:
+      minimum: "6GiB"
+      recommended: "8GiB"
+    disk:
+      minimum: "25GiB"
+      recommended: "30GiB"
+    swap: host-dependent
+    concurrency:
+      max_active_workloads: 1
+      recommended_build_jobs: 4
+
+  rust-build:
+    purpose: "Rust workspace 编译、依赖较多或链接阶段有明显内存峰值"
+    cpu:
+      minimum: 4
+      recommended: 8
+    memory:
+      minimum: "8GiB"
+      recommended: "12GiB"
+    disk:
+      minimum: "30GiB"
+      recommended: "40GiB"
+    swap: host-dependent
+    concurrency:
+      max_active_workloads: 1
+      recommended_build_jobs: 4
+
+  heavy-rust:
+    purpose: "大型 Rust workspace、多个 crate 并行构建、调试符号或重型链接"
+    cpu:
+      minimum: 8
+      recommended: 12
+    memory:
+      minimum: "16GiB"
+      recommended: "24GiB"
+    disk:
+      minimum: "60GiB"
+      recommended: "80GiB"
+    swap: host-dependent
+    concurrency:
+      max_active_workloads: 1
+      recommended_build_jobs: 8
+
+  integration:
+    purpose: "Docker/Compose、数据库、浏览器或多服务集成验证"
+    cpu:
+      minimum: 4
+      recommended: 8
+    memory:
+      minimum: "12GiB"
+      recommended: "16GiB"
+    disk:
+      minimum: "40GiB"
+      recommended: "60GiB"
+    swap: host-dependent
+    concurrency:
+      max_active_workloads: 1
+      recommended_build_jobs: 4

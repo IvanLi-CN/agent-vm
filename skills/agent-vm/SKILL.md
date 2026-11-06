@@ -15,6 +15,8 @@ For a new managed container use `bun "<skill-dir>/scripts/agent_vm.ts" acquire -
 
 The first lease lasts 30 minutes. Explicit `bun "<skill-dir>/scripts/agent_vm.ts" renew` adds 15 minutes up to two hours remaining. Acquire, SSH, queries, execution and transfer never renew; renew before expiry when the task needs more time. Expired renewal fails and lease end closes mappings/flows and stops the VM. There is no promise that expired files can be recovered.
 
+Before selecting resources, read the [resource selection guide](references/resource-guide.md) and its [machine-readable profiles](references/resource-profiles.yaml). The profiles are advisory starting points; actual admission and native limits remain owned by the control service.
+
 Use `bun "<skill-dir>/scripts/agent_vm.ts" ssh` for normal root SSH and `bun "<skill-dir>/scripts/agent_vm.ts" exec -- <argv>` for commands. For shell syntax call a shell explicitly, for example `bun "<skill-dir>/scripts/agent_vm.ts" exec -- sh -lc 'cd /workspace && make test'`. Guest root, ordinary files, background processes and the project's own Docker/Compose workflow are available. This does not authorize CT/PVE maintenance, Incus socket use or management of other sessions.
 
 ## Guest environment readiness
