@@ -862,6 +862,9 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 			}
 			defer database.Close()
 			lease := controllerrole.Lease{Slot: "blue", Term: 7, LeaseID: "existing-lease", Nonce: "existing-nonce", Generation: 11, Expiry: now.Add(time.Minute), OwnerPID: os.Getpid(), OwnerStartTime: controllerrole.ProcessStartToken(os.Getpid())}
+			if test.preserve {
+				lease.Expiry = now.Add(5 * time.Second)
+			}
 			runtime := &changingObservationRuntime{fakeRuntime: &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
 				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true, LeaseRenewalSupported: true, ControllerLease: &lease, NativeWorkers: 1, PendingOperations: 1},
 				"green": {Slot: "green", ProcessUp: true, ProcessReady: true},
@@ -907,8 +910,11 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 				t.Fatalf("observation reads=%d want=%d", runtime.reads, test.wantReads)
 			}
 			if test.preserve {
-				if len(runtime.grantedLeases) != 0 || !runtime.observations["blue"].ControllerOwned || *runtime.observations["blue"].ControllerLease != lease {
-					t.Fatal("inconsistent business reads changed or renewed the live lease")
+				if len(runtime.grantedLeases) != 1 || !runtime.observations["blue"].ControllerOwned || runtime.grantedLeases[0].LeaseID != lease.LeaseID {
+					t.Fatal("business observation failure interrupted the verified live authority")
+				}
+				if !runtime.grantedLeases[0].Expiry.After(lease.Expiry) {
+					t.Fatal("business observation failure did not extend the live writer deadline")
 				}
 				for _, action := range runtime.sequence {
 					if action == "fence" || action == "traffic" {
@@ -919,15 +925,15 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 					t.Fatal("inconsistent business reads left admission open")
 				}
 				// A subsequent coherent sample must recover without changing the
-				// mutation's identity. Prolonged failure remains bounded by expiry.
+				// mutation's identity. Lost process evidence still fences authority.
 				runtime.unstableReads = runtime.reads
 				if err := manager.MaintainController(context.Background()); err != nil {
 					t.Fatalf("coherent next tick did not recover: %v", err)
 				}
-				if len(runtime.grantedLeases) != 1 || runtime.grantedLeases[0].LeaseID != lease.LeaseID {
+				if len(runtime.grantedLeases) != 2 || runtime.grantedLeases[1].LeaseID != lease.LeaseID {
 					t.Fatal("next tick replaced the existing lease")
 				}
-				now = lease.Expiry.Add(time.Second)
+				now = runtime.observations["blue"].ControllerLease.Expiry.Add(time.Second)
 				runtime.unstableReads = runtime.reads + 10
 				if err := manager.MaintainController(context.Background()); err == nil || runtime.observations["blue"].ControllerOwned {
 					t.Fatal("expired lease survived persistent observation failure")

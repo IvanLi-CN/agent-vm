@@ -2487,6 +2487,10 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 		if resourceErr != nil {
 			return nil, protocol.NewError("resource_unverified", "cached task resources cannot be verified", map[string]any{"task_id": task.TaskID, "verified": false})
 		}
+		resources, err = requestedResourcesWithBase(request, cachedResources)
+		if err != nil {
+			return nil, err
+		}
 		if usable, imageErr := s.Store.CachedImageUsable(ctx, task.ImageFingerprint, !s.Config.Management.Enabled); imageErr != nil {
 			return nil, s.sqliteError(imageErr)
 		} else if !usable {
@@ -2648,7 +2652,14 @@ func (s *Service) renew(ctx context.Context, request protocol.Request) (map[stri
 	} else if draining {
 		return nil, protocol.NewError("draining", "renew is refused while draining", nil)
 	}
-	deadline := s.Clock().Add(time.Duration(s.Config.RenewSeconds) * time.Second)
+	if task.LeaseExpiresAt == nil {
+		return nil, protocol.NewError("lease_expired", "task has no active lease deadline", nil)
+	}
+	currentDeadline, err := time.Parse(time.RFC3339Nano, *task.LeaseExpiresAt)
+	if err != nil {
+		return nil, protocol.NewError("state_unverified", "lease deadline is invalid", nil)
+	}
+	deadline := currentDeadline.Add(time.Duration(s.Config.RenewSeconds) * time.Second)
 	max := s.Clock().Add(time.Duration(s.Config.MaxLeaseSeconds) * time.Second)
 	if deadline.After(max) {
 		deadline = max

@@ -594,7 +594,9 @@ func TestCachedAcquireReusesLegacyDefaultAfterMigration(t *testing.T) {
 	req := func(action, op string, generation int64) protocol.Request {
 		return protocol.Request{"protocol": protocol.Version, "action": action, "session_id": "legacy-cache", "generation": generation, "operation_id": op}
 	}
-	if _, err := service.Dispatch(ctx, req("acquire", "legacy-first", 0)); err != nil {
+	first := req("acquire", "legacy-first", 0)
+	first["cpu"], first["memory_mib"], first["disk_gib"] = int64(8), int64(12288), int64(40)
+	if _, err := service.Dispatch(ctx, first); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.Dispatch(ctx, req("release", "legacy-release", 1)); err != nil {
@@ -606,6 +608,42 @@ func TestCachedAcquireReusesLegacyDefaultAfterMigration(t *testing.T) {
 	}
 	if result["result"].(map[string]any)["state"] != stateActive {
 		t.Fatalf("reacquire = %#v", result)
+	}
+	if mustJSON(result["result"].(map[string]any)["resources"]) != mustJSON(map[string]int64{"cpu": 8, "memory_mib": 12288, "disk_gib": 40}) {
+		t.Fatalf("cached resources changed on omitted fields: %#v", result)
+	}
+}
+
+func TestRenewExtendsExistingDeadlineWithoutShortening(t *testing.T) {
+	for _, remaining := range []time.Duration{30 * time.Minute, 119 * time.Minute} {
+		t.Run(remaining.String(), func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			now := time.Now().UTC()
+			deadline := now.Add(remaining)
+			if err := store.InsertTask(context.Background(), state.Task{TaskID: "renew-task", SessionID: "renew-session", Generation: 1, State: stateActive, CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`, LeaseExpiresAt: stringPointer(nowString(deadline))}); err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.Defaults()
+			service := New(store, cfg, Options{Clock: func() time.Time { return now }})
+			if _, err := service.renew(context.Background(), protocol.Request{"session_id": "renew-session", "generation": int64(1)}); err != nil {
+				t.Fatal(err)
+			}
+			task, err := store.GetTask(context.Background(), map[string]any{"session_id": "renew-session"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := deadline.Add(time.Duration(cfg.RenewSeconds) * time.Second)
+			if cap := now.Add(time.Duration(cfg.MaxLeaseSeconds) * time.Second); want.After(cap) {
+				want = cap
+			}
+			if task.LeaseExpiresAt == nil || *task.LeaseExpiresAt != nowString(want) {
+				t.Fatalf("deadline=%v want=%s", task.LeaseExpiresAt, nowString(want))
+			}
+		})
 	}
 }
 

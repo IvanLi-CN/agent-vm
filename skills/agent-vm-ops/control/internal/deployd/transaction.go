@@ -681,8 +681,8 @@ func (manager *Manager) waitForReady(ctx context.Context, transactionID, slot st
 	}
 }
 
-// MaintainController renews the active slot lease only after a fresh,
-// consistent observation. Persisted transactions never authorize a role
+// MaintainController renews the active slot lease after fresh authority
+// evidence. Business consistency separately gates traffic. Persisted transactions never authorize a role
 // after a Deployd restart; an active recovery transaction fences both slots.
 func (manager *Manager) MaintainController(ctx context.Context) error {
 	manager.mu.Lock()
@@ -703,7 +703,7 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	}
 	// Normal lifecycle commits can advance the epoch between the separate
 	// metrics/inventory/doctor reads. Re-observe before revoking an otherwise
-	// live controller; never renew from the inconsistent sample itself.
+	// live controller; business samples never authorize a new role identity.
 	var retryLease *controllerrole.Lease
 	for attempt := 1; attempt < 3 && manager.retryableControllerObservation(observation); attempt++ {
 		if retryLease == nil {
@@ -718,10 +718,10 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	controllerObservation := observation
 	controllerObservation.Consistent = observation.Consistent || observation.ControllerRecoveryOnly
 	if !validObservation(controllerObservation, manager.Clock().UTC()) {
-		// A changing business snapshot does not invalidate a separately verified,
-		// still-live role. Leave its original deadline unchanged and try again on
-		// the next maintenance tick. This neither renews nor grants authority;
-		// the slot's own expiry fence remains the bound on observation failure.
+		// Business snapshot consistency controls traffic, while fresh process,
+		// singleton and active-link evidence independently verifies the existing
+		// writer. Preserve its exact live identity so in-flight effects and lease
+		// cleanup do not lose authority merely because the business epoch moves.
 		if retryLease != nil && manager.retryableControllerObservation(observation) {
 			current := observation.Slots[observation.ActiveSlot].ControllerLease
 			if current != nil && *current == *retryLease && retryLease.Validate(manager.Clock(), observation.ActiveSlot) == nil {
@@ -730,7 +730,14 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 						return manager.fenceSlots(ctx, errors.New("disable traffic during inconsistent business observation failed"))
 					}
 				}
-				return errors.New("business observation is inconsistent; traffic disabled and existing controller lease left unchanged until expiry")
+				lease, err := manager.renewOrAllocateLease(ctx, observation.Slots[observation.ActiveSlot], retryLease.Generation, retryLease)
+				if err != nil {
+					return manager.fenceSlots(ctx, errors.New("business observation recovery lost the existing controller lease"))
+				}
+				if err := manager.Runtime.GrantController(ctx, observation.ActiveSlot, lease); err != nil {
+					return manager.fenceSlots(ctx, errors.New("business observation recovery could not renew the existing controller lease"))
+				}
+				return errors.New("business observation is inconsistent; traffic disabled and verified existing controller lease renewed")
 			}
 		}
 		return manager.fenceSlots(ctx, errors.New("slot observation is inconsistent"))
