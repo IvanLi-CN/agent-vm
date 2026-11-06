@@ -98,9 +98,11 @@ Grafana 面板通过 Prometheus 查询 Deployd 输出，例如：
 
 支持续租的槽位在 health 中明确声明 `controller_lease_renewal=true`。Deployd 必须先确认该能力；未声明的旧槽位继续使用原有的更高 term 授权路径，不能向其发送同 term 请求而引发周期性拒绝和 hard-fence。旧路径仍有角色更换会中断在途作业的历史限制，因此升级须保持 drain，在新槽位完成验证前不得宣称长操作续租验收通过。对于明确声明续租能力的槽位，持续协调不得通过每次更换 term、lease ID 或 nonce 来续租，否则会取消正在进行的 native mutation。同一 Deployd 进程只能根据新鲜运行时观测延长自己持有的有效 lease 的 expiry，必须保持 slot、term、lease ID、generation、nonce、owner PID 和进程启动标识不变，且不得缩短 expiry。槽位接受这种续租时不触发角色变更通知；真正的撤销、过期、身份变化和 owner 退出仍立即 fencing。已过期或已撤销的 lease 不得复活；Deployd 重启后必须重新观测并分配更高 term，不能从持久化快照恢复身份。缺少进程启动标识时不允许复用旧身份。
 
-当清单观测本身新鲜且一致，但部分任务的原生状态尚未确认时，Deployd 必须区分“观测不完整”和“观测矛盾”。只有其他来源、进程身份、状态纪元和能力均有效，并且活动槽位已经确认 admission drain 时，才允许重新授予唯一 controller lease，使 startup reconciliation 和显式维护能够收敛失败记录。此时 `controller_recovery_only=true`、组合观测仍为 `consistent=false`，业务流量保持关闭，不能用于 stage、activate 或 rollback 的就绪证明。清单不完整且未确认 drain，或任何来源缺失、过期、矛盾时仍必须 hard-fence。即使清单完整，drain 期间也必须保留维护所需 lease，并保持 traffic disabled；不能因为启用流量被 drain 拒绝而反复撤销 controller lease。
+业务快照的短暂不一致不能作为更换仍有效 controller 身份的依据。连续重采样仍未收敛时，只有 `active` 链接、systemd 进程、角色通道均新鲜有效，活动槽位仍持有属于当前 Deployd 进程的同一有效 lease，且不存在第二个 controller，才允许关闭两个槽位的 traffic admission，并保留该 lease 的原始 expiry 等待下一轮观测；不得续租、分配新身份、启用流量或把该快照报告为一致。下一轮一致观测才允许按原身份续租并恢复流量；不一致持续至原始 expiry、身份变化、出现双 controller、角色来源缺失或 traffic 关闭失败时立即 fencing。此等待不从持久化快照恢复授权，也不延长在途 mutation 的原始授权期限。
 
-如果底层 effect 不能确认已经停止，生命周期或管理操作都必须保持 pending/unknown，不能写入 success。槽位启动后的管理 operation recovery 必须在 controller role 授予后执行，不能在 role 尚未建立时由 standby 自行恢复。当 Deployd 无法确认观测、部署状态或角色通道时，必须先对两个槽位执行本地 hard-fence：清除槽位的 controller role 和 traffic role。如果角色 socket 不可用，则停止对应 systemd 单元作为兜底。hard-fence 不依据旧状态重新授予角色，也不分配新的持久化 term。后续恢复必须重新观测，并使用更高的持久化 term 授予新 role。
+当清单观测本身新鲜且一致，但部分任务的原生状态尚未确认时，Deployd 必须区分“观测不完整”和“观测矛盾”。只有其他来源、进程身份、状态纪元和能力均有效，并且活动槽位已经确认 admission drain 时，才允许重新授予唯一 controller lease，使 startup reconciliation 和显式维护能够收敛失败记录。此时 `controller_recovery_only=true`、组合观测仍为 `consistent=false`，业务流量保持关闭，不能用于 stage、activate 或 rollback 的就绪证明。清单不完整且未确认 drain 时不得重新授予或续租；除上述已有 lease 的有界等待外，任何来源缺失、过期、矛盾时仍必须 hard-fence。即使清单完整，drain 期间也必须保留维护所需 lease，并保持 traffic disabled；不能因为启用流量被 drain 拒绝而反复撤销 controller lease。
+
+如果底层 effect 不能确认已经停止，生命周期或管理操作都必须保持 pending/unknown，不能写入 success。槽位启动后的管理 operation recovery 必须在 controller role 授予后执行，不能在 role 尚未建立时由 standby 自行恢复。除上述业务快照不一致时的有界等待外，当 Deployd 无法确认观测、部署状态或角色通道时，必须先对两个槽位执行本地 hard-fence：清除槽位的 controller role 和 traffic role。如果角色 socket 不可用，则停止对应 systemd 单元作为兜底。hard-fence 不依据旧状态重新授予角色，也不分配新的持久化 term。后续恢复必须重新观测，并使用更高的持久化 term 授予新 role。
 
 槽位进程启动时默认不得接受新流量。只有 Deployd 在新鲜观测通过后授予 controller role，并重新观测到槽位 ready，才能启用当前 `active` 槽位的 traffic role。Deployd 或槽位重启后必须重新观测、授予 role 并启用流量，不能依据旧状态直接恢复。
 

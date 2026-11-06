@@ -30,6 +30,7 @@ type fakeRuntime struct {
 	invalidCapabilities   bool
 	unknownCounters       bool
 	failRevoke            bool
+	failDisableTraffic    bool
 	failGrant             bool
 	readyAfterGrant       bool
 	enableRequiresReady   bool
@@ -139,6 +140,9 @@ func (runtime *fakeRuntime) EnableTraffic(_ context.Context, slot string) error 
 }
 func (runtime *fakeRuntime) DisableTraffic(_ context.Context, slot string) error {
 	runtime.sequence = append(runtime.sequence, "traffic-disable")
+	if runtime.failDisableTraffic {
+		return errors.New("traffic disable failed")
+	}
 	if runtime.traffic == nil {
 		runtime.traffic = map[string]bool{}
 	}
@@ -730,16 +734,18 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 		corrupt   string
 		wantReads int
 		wantError bool
+		preserve  bool
 	}{
-		{"one-state-change", 1, "", 3, false},
-		{"two-state-changes", 2, "", 4, false},
-		{"persistent-inconsistency", 10, "", 3, true},
-		{"foreign-owner", 1, "owner", 1, true},
-		{"missing-lease", 1, "lease", 1, true},
-		{"expired-lease", 1, "expired", 1, true},
-		{"expiry-during-retry", 1, "expiry-during-retry", 2, true},
-		{"identity-change-during-retry", 1, "identity-during-retry", 2, true},
-		{"second-controller", 1, "second", 1, true},
+		{"one-state-change", 1, "", 3, false, false},
+		{"two-state-changes", 2, "", 4, false, false},
+		{"persistent-inconsistency", 10, "", 3, true, true},
+		{"traffic-disable-failure", 10, "traffic", 3, true, false},
+		{"foreign-owner", 1, "owner", 1, true, false},
+		{"missing-lease", 1, "lease", 1, true, false},
+		{"expired-lease", 1, "expired", 1, true, false},
+		{"expiry-during-retry", 1, "expiry-during-retry", 2, true, false},
+		{"identity-change-during-retry", 1, "identity-during-retry", 2, true, false},
+		{"second-controller", 1, "second", 1, true, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			now := time.Unix(100, 0).UTC()
@@ -754,6 +760,8 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 				"green": {Slot: "green", ProcessUp: true, ProcessReady: true},
 			}}, unstableReads: test.unstable}
 			switch test.corrupt {
+			case "traffic":
+				runtime.failDisableTraffic = true
 			case "owner":
 				lease.OwnerPID++
 			case "lease":
@@ -787,6 +795,34 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 			}
 			if runtime.reads != test.wantReads {
 				t.Fatalf("observation reads=%d want=%d", runtime.reads, test.wantReads)
+			}
+			if test.preserve {
+				if len(runtime.grantedLeases) != 0 || !runtime.observations["blue"].ControllerOwned || *runtime.observations["blue"].ControllerLease != lease {
+					t.Fatal("inconsistent business reads changed or renewed the live lease")
+				}
+				for _, action := range runtime.sequence {
+					if action == "fence" || action == "traffic" {
+						t.Fatalf("inconsistent business reads performed role effects: %v", runtime.sequence)
+					}
+				}
+				if runtime.traffic["blue"] || runtime.traffic["green"] {
+					t.Fatal("inconsistent business reads left admission open")
+				}
+				// A subsequent coherent sample must recover without changing the
+				// mutation's identity. Prolonged failure remains bounded by expiry.
+				runtime.unstableReads = runtime.reads
+				if err := manager.MaintainController(context.Background()); err != nil {
+					t.Fatalf("coherent next tick did not recover: %v", err)
+				}
+				if len(runtime.grantedLeases) != 1 || runtime.grantedLeases[0].LeaseID != lease.LeaseID {
+					t.Fatal("next tick replaced the existing lease")
+				}
+				now = lease.Expiry.Add(time.Second)
+				runtime.unstableReads = runtime.reads + 10
+				if err := manager.MaintainController(context.Background()); err == nil || runtime.observations["blue"].ControllerOwned {
+					t.Fatal("expired lease survived persistent observation failure")
+				}
+				return
 			}
 			if test.wantError {
 				if len(runtime.grantedLeases) != 0 {
