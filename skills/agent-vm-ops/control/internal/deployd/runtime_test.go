@@ -526,6 +526,13 @@ func TestExitDrainDoesNotWriteWhenAdmissionIsAlreadyOpen(t *testing.T) {
 }
 
 func TestRollbackDrainRecoveryRejectsUnprovenIntentAndLiveRoles(t *testing.T) {
+	// The UDS fixture is the process authority in this test. A real stopped
+	// unit on the test host must not bypass its intentionally live role reply.
+	commands := t.TempDir()
+	if err := os.WriteFile(filepath.Join(commands, "systemctl"), []byte("#!/bin/sh\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", commands+":"+os.Getenv("PATH"))
 	for _, scenario := range []string{"recover", "native-action", "wrong-owner", "wrong-id", "wrong-generation", "in-flight", "controller-live", "traffic-live", "mixed"} {
 		t.Run(scenario, func(t *testing.T) {
 			directory, err := os.MkdirTemp("", "avm-drain-resume-")
