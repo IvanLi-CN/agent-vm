@@ -740,7 +740,34 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 		return manager.fenceSlots(ctx, errors.New("active slot is not process-ready"))
 	}
 	if observation.ControllerRecoveryOnly && !target.Draining {
-		return manager.fenceSlots(ctx, errors.New("partial inventory requires admission drain before controller recovery"))
+		// A coherent but incomplete inventory is normal while Incus stops or
+		// deletes a guest. It cannot authorize a new controller, but must not
+		// cancel work owned by this process's still-live controller lease.
+		current := target.ControllerLease
+		if !target.LeaseRenewalSupported || !target.ControllerOwned || current == nil ||
+			current.Validate(manager.Clock(), target.Slot) != nil || current.OwnerPID != os.Getpid() ||
+			current.OwnerStartTime == "" || current.OwnerStartTime != controllerrole.ProcessStartToken(os.Getpid()) {
+			return manager.fenceSlots(ctx, errors.New("partial inventory requires admission drain before controller recovery"))
+		}
+		for slot, value := range observation.Slots {
+			if slot != observation.ActiveSlot && value.ControllerOwned {
+				return manager.fenceSlots(ctx, errors.New("partial inventory has more than one controller"))
+			}
+		}
+		original := *current
+		for _, slot := range []string{"blue", "green"} {
+			if err := manager.Runtime.DisableTraffic(ctx, slot); err != nil {
+				return manager.fenceSlots(ctx, errors.New("disable traffic during partial inventory failed"))
+			}
+		}
+		lease, err := manager.renewOrAllocateLease(ctx, target, original.Generation, &original)
+		if err != nil {
+			return manager.fenceSlots(ctx, errors.New("partial inventory controller lease expired or changed"))
+		}
+		if err := manager.Runtime.GrantController(ctx, observation.ActiveSlot, lease); err != nil {
+			return manager.fenceSlots(ctx, errors.New("partial inventory controller renewal failed"))
+		}
+		return nil
 	}
 	if target.Draining {
 		if err := manager.Runtime.DisableTraffic(ctx, observation.ActiveSlot); err != nil {

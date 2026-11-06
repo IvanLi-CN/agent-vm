@@ -1247,3 +1247,98 @@ func TestMaintainControllerNegotiatesLegacyAndRenewalSlots(t *testing.T) {
 		})
 	}
 }
+
+func TestMaintainControllerRenewsLiveAuthorityDuringPartialInventory(t *testing.T) {
+	if controllerrole.ProcessStartToken(os.Getpid()) == "" {
+		t.Skip("Linux process-incarnation evidence required")
+	}
+	for _, invalid := range []string{"", "expired", "foreign-owner", "old-incarnation", "legacy", "second-controller", "disable-failure", "grant-failure"} {
+		t.Run(invalid, func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			runtime := &fakeRuntime{active: "blue", partialInventory: true, observations: map[string]SlotObservation{
+				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: false, ControllerOwned: true, LeaseRenewalSupported: true, NativeWorkers: 1, PendingOperations: 1},
+				"green": {Slot: "green", ProcessUp: true, ProcessReady: true},
+			}}
+			manager := NewManager(database, runtime, 15*time.Second, func() time.Time { return now })
+			lease, err := manager.newLease(context.Background(), "blue", 7)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch invalid {
+			case "expired":
+				lease.Expiry = now
+			case "foreign-owner":
+				lease.OwnerPID++
+			case "old-incarnation":
+				lease.OwnerStartTime = "old"
+			case "legacy":
+				value := runtime.observations["blue"]
+				value.LeaseRenewalSupported = false
+				runtime.observations["blue"] = value
+			case "disable-failure":
+				runtime.failDisableTraffic = true
+			case "grant-failure":
+				runtime.failGrant = true
+			case "second-controller":
+				value := runtime.observations["green"]
+				value.ControllerOwned = true
+				runtime.observations["green"] = value
+			}
+			value := runtime.observations["blue"]
+			value.ControllerLease = &lease
+			runtime.observations["blue"] = value
+			original := lease
+			now = now.Add(time.Second)
+			err = manager.MaintainController(context.Background())
+			if invalid != "" {
+				if err == nil || (invalid != "grant-failure" && len(runtime.grantedLeases) != 0) || runtime.observations["blue"].ControllerOwned || runtime.observations["green"].ControllerOwned {
+					t.Fatalf("invalid authority retained: err=%v sequence=%v", err, runtime.sequence)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normal in-flight partial inventory cancelled the controller: %v; sequence=%v", err, runtime.sequence)
+			}
+			for round := 0; round < 4; round++ {
+				if runtime.traffic["blue"] || runtime.traffic["green"] {
+					t.Fatal("partial inventory admitted traffic")
+				}
+				current := *runtime.observations["blue"].ControllerLease
+				expected := original
+				expected.Expiry = current.Expiry
+				if current != expected || !current.Expiry.After(original.Expiry) {
+					t.Fatal("renewal replaced authority identity or failed to extend expiry")
+				}
+				if !runtime.observations["blue"].ControllerOwned || runtime.observations["green"].ControllerOwned {
+					t.Fatal("single controller lost")
+				}
+				snapshot, _ := runtime.Observe(context.Background())
+				if validObservation(snapshot, now) {
+					t.Fatal("partial inventory became deployment readiness proof")
+				}
+				now = now.Add(time.Second)
+				if err := manager.MaintainController(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			runtime.partialInventory = false
+			value = runtime.observations["blue"]
+			value.Ready = true
+			runtime.observations["blue"] = value
+			if err := manager.MaintainController(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			if !runtime.traffic["blue"] || runtime.traffic["green"] {
+				t.Fatal("completed inventory did not restore active traffic")
+			}
+			if strings.Contains(strings.Join(runtime.sequence, ","), "fence") {
+				t.Fatal("ordinary lifecycle was fenced")
+			}
+		})
+	}
+}
