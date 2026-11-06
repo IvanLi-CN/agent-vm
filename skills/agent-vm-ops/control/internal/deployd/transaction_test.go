@@ -704,9 +704,10 @@ func TestManagerHardFencesInconsistentObservation(t *testing.T) {
 
 type changingObservationRuntime struct {
 	*fakeRuntime
-	reads         int
-	unstableReads int
-	onRead        func(int)
+	reads             int
+	unstableReads     int
+	onRead            func(int)
+	invalidRoleSource string
 }
 
 func (runtime *changingObservationRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error) {
@@ -715,6 +716,12 @@ func (runtime *changingObservationRuntime) Observe(ctx context.Context) (Runtime
 		runtime.onRead(runtime.reads)
 	}
 	snapshot, err := runtime.fakeRuntime.Observe(ctx)
+	if runtime.invalidRoleSource != "" {
+		snapshot.Consistent = false
+		source := snapshot.Sources[runtime.invalidRoleSource]
+		source.Up = false
+		snapshot.Sources[runtime.invalidRoleSource] = source
+	}
 	if runtime.reads <= runtime.unstableReads {
 		snapshot.Consistent = false
 		source := snapshot.Sources["native_observation"]
@@ -740,6 +747,9 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 		{"two-state-changes", 2, "", 4, false, false},
 		{"persistent-inconsistency", 10, "", 3, true, true},
 		{"traffic-disable-failure", 10, "traffic", 3, true, false},
+		{"active-link-unavailable", 10, "source-active_link", 1, true, false},
+		{"systemd-unavailable", 10, "source-systemd", 1, true, false},
+		{"role-channel-unavailable", 10, "source-slot_contracts", 1, true, false},
 		{"foreign-owner", 1, "owner", 1, true, false},
 		{"missing-lease", 1, "lease", 1, true, false},
 		{"expired-lease", 1, "expired", 1, true, false},
@@ -759,6 +769,9 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true, LeaseRenewalSupported: true, ControllerLease: &lease, NativeWorkers: 1, PendingOperations: 1},
 				"green": {Slot: "green", ProcessUp: true, ProcessReady: true},
 			}}, unstableReads: test.unstable}
+			if strings.HasPrefix(test.corrupt, "source-") {
+				runtime.invalidRoleSource = strings.TrimPrefix(test.corrupt, "source-")
+			}
 			switch test.corrupt {
 			case "traffic":
 				runtime.failDisableTraffic = true
