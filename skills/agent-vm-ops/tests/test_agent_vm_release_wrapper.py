@@ -1075,6 +1075,8 @@ class WrapperTests(unittest.TestCase):
         unit.parent.mkdir(parents=True)
         current = (ROOT / "deploy/assets/systemd/agent-vm-deployd.service").read_bytes()
         historical = current.replace(
+            b"After=agent-vm-native@blue.service agent-vm-native@green.service\n", b"",
+        ).replace(
             b"After=local-fs.target\n",
             b"After=local-fs.target\nWants=agent-vm-native@blue.service agent-vm-native@green.service\n",
         )
