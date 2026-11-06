@@ -93,7 +93,7 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 		for _, slot := range []string{"blue", "green"} {
 			c, e := config.Load(cfg.Files[slot+"_config"])
 			if e != nil {
-				add(fmt.Errorf("invalid %s runtime configuration", slot))
+				add(fmt.Errorf("invalid %s runtime configuration: %w", slot, e))
 				continue
 			}
 			if c.Slot != slot || !strings.HasPrefix(c.StateDB, "https://") || c.Socket != "/run/agent-vm-native/"+slot+"/app.sock" || !c.Management.Enabled {

@@ -303,7 +303,7 @@ func (c Config) Validate() error {
 		if c.Management.ForwardAuth.SocketPath == c.Socket {
 			return errors.New("config_invalid: management.forward_auth.socket_path must be distinct from the control socket")
 		}
-		if c.Management.ForwardAuth.SocketPath == c.Management.Authority.SocketPath {
+		if c.Management.ForwardAuth.SocketPath != "" && c.Management.ForwardAuth.SocketPath == c.Management.Authority.SocketPath {
 			return errors.New("config_invalid: management.forward_auth.socket_path must be distinct from the authority socket")
 		}
 	}

@@ -240,3 +240,24 @@ func TestConfigRejectsUnsafeRequiredGuestTools(t *testing.T) {
 		t.Fatalf("unsafe guest tool error = %v", err)
 	}
 }
+
+func TestUnifiedWebExampleDoesNotRequireLegacyPeerBoundary(t *testing.T) {
+	data, err := os.ReadFile("../../../../../deploy/assets/web.json.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var example WebConfig
+	if err := json.Unmarshal(data, &example); err != nil {
+		t.Fatal(err)
+	}
+	cfg := validConfig()
+	cfg.Management = example.Management
+	cfg.Management.Enabled = true
+	cfg.Management.ExternalOrigin = "https://deployment.example"
+	cfg.Management.OIDC = OIDCConfig{Issuer: "https://identity.example", ClientID: "deployment", ClientSecret: "ephemeral-test-secret", RedirectURI: "https://deployment.example/api/v1/auth/oidc/callback"}
+	cfg.Management.AdminPrincipal.Issuer = cfg.Management.OIDC.Issuer
+	cfg.Management.AdminPrincipal.Subject = "deployment-administrator"
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
