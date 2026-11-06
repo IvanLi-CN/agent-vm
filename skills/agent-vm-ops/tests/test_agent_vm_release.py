@@ -143,11 +143,11 @@ class ReleasePublisherTests(unittest.TestCase):
             if relative in {"bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
                 path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42)
             elif relative == "systemd/agent-vm-native.service":
-                path.write_bytes((ops_root / "assets/systemd/agent-vm-native.service").read_bytes())
+                path.write_bytes((ops_root.parent.parent / "deploy/assets/systemd/agent-vm-native.service").read_bytes())
             elif relative == "systemd/agent-vm-native@.service":
-                path.write_bytes((ops_root / "assets/systemd/agent-vm-native@.service").read_bytes())
+                path.write_bytes((ops_root.parent.parent / "deploy/assets/systemd/agent-vm-native@.service").read_bytes())
             elif relative == "systemd/agent-vm-deployd.service":
-                path.write_bytes((ops_root / "assets/systemd/agent-vm-deployd.service").read_bytes())
+                path.write_bytes((ops_root.parent.parent / "deploy/assets/systemd/agent-vm-deployd.service").read_bytes())
             elif relative == "agent_vm_control_bridge.ts":
                 path.write_bytes((ops_root / "scripts/agent_vm_control_bridge.ts").read_bytes())
             else:
