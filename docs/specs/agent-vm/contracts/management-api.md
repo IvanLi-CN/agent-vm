@@ -114,3 +114,12 @@ API 使用稳定的机器错误码、阶段和少量安全结构化字段白名�
 - `audit-page.json` 覆盖当前 actor、typed rejected-request actor 或显式未知历史 actor，以及可选 reason、目标和结果。
 - `system.json` 覆盖统一服务、Caddy、rqlite 和 Incus readiness。
 - `error.json` 覆盖不包含内部诊断的 stale-target 冲突。
+
+
+## Visual Evidence
+
+以下图片来自无登录、无真实后端依赖的 `ui_demo`，用于核验管理页的观测字段和告警呈现，不代表生产部署、真实容量或 Grafana 验收通过。新鲜观测显示已验证字段，不误报过期；过期或未验证的观测继续保留明确告警，不用零值替代未知数据。
+
+![新鲜观测：显示已验证数据且不误报过期](../assets/management-overview-fresh-desktop.png)
+
+![过期观测：保留新鲜度与未验证告警](../assets/management-overview-stale-desktop.png)
