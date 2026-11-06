@@ -1165,16 +1165,9 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		metrics, metricsCode, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "admin-metrics"})
+		value, err := runtime.quiescenceMetrics(ctx, slot)
 		if err != nil {
 			return err
-		}
-		if metricsCode != http.StatusOK {
-			return fmt.Errorf("slot %s metrics returned HTTP %d", slot, metricsCode)
-		}
-		value, ok := metrics["result"].(map[string]any)
-		if !ok {
-			return errors.New("old slot metrics result is missing")
 		}
 		pending, pendingOK := arrayLengthValue(value["pending_operations"])
 		inFlight, inFlightOK := integerValue(value["in_flight_operations"])

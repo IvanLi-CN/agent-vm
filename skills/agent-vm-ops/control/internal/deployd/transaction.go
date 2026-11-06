@@ -137,8 +137,7 @@ func NewManagerWithMigration(database *store.Store, runtime Runtime, migration M
 }
 
 func (manager *Manager) Status(ctx context.Context) (Status, error) {
-	manager.mu.Lock()
-	defer manager.mu.Unlock()
+	// Read-only probes must not hold the serialized role writer while waiting on business state.
 	observation, err := manager.observe(ctx, "")
 	if err != nil {
 		return Status{}, err
@@ -325,63 +324,79 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	if err := manager.Runtime.GrantController(ctx, transaction.TargetSlot, lease); err != nil {
 		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, err)
 	}
+	parentContext := ctx
+	stopRenewal := func() error { return nil }
+	if _, supported := manager.Runtime.(interface {
+		RenewTransactionLease(context.Context, controllerrole.Lease) (controllerrole.Lease, error)
+	}); supported {
+		ctx, stopRenewal = manager.beginTransactionRenewal(ctx, lease)
+	}
+	defer stopRenewal()
+	failEffect := func(phase string, cause error) error {
+		_ = stopRenewal()
+		return manager.effectFailure(parentContext, id, phase, cause)
+	}
+	failRollback := func(cause error) error {
+		_ = stopRenewal()
+		return manager.rollbackOrFence(parentContext, *transaction, cause)
+	}
 	observation, err = manager.observe(ctx, id)
 	if err != nil {
-		return nil, manager.rollbackOrFence(ctx, *transaction, err)
+		return nil, failRollback(err)
 	}
 	target, ok = observation.Slots[transaction.TargetSlot]
 	if !ok || !target.ProcessUp || !target.ProcessReady || !target.ControllerOwned || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch == "" || target.StateAuthority != verifiedAuthority || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) {
-		return nil, manager.rollbackOrFence(ctx, *transaction, errors.New("candidate controller lease was not observed"))
+		return nil, failRollback(errors.New("candidate controller lease was not observed"))
 	}
 	if err := manager.waitForReady(ctx, id, transaction.TargetSlot); err != nil {
-		return nil, manager.rollbackOrFence(ctx, *transaction, err)
+		return nil, failRollback(err)
 	}
 	if err := manager.transitionAfterEffect(ctx, id, PhaseControllerHandoff, PhaseTrafficEnable, "controller_granted", map[string]any{"lease_id": lease.LeaseID, "term": lease.Term}); err != nil {
 		return nil, err
 	}
 	if err := manager.Runtime.EnableTraffic(ctx, transaction.TargetSlot); err != nil {
-		return nil, manager.effectFailure(ctx, id, PhaseTrafficEnable, err)
+		return nil, failEffect(PhaseTrafficEnable, err)
 	}
 	observation, err = manager.observe(ctx, id)
 	if err != nil {
-		return nil, manager.effectFailure(ctx, id, PhaseTrafficEnable, err)
+		return nil, failEffect(PhaseTrafficEnable, err)
 	}
 	target, ok = observation.Slots[transaction.TargetSlot]
 	if !validObservation(observation, manager.Clock().UTC()) || !ok || !target.ControllerOwned || !target.TrafficAccepting || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch == "" || target.StateAuthority != verifiedAuthority || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) {
-		return nil, manager.effectFailure(ctx, id, PhaseTrafficEnable, errors.New("candidate traffic role was not observed"))
+		return nil, failEffect(PhaseTrafficEnable, errors.New("candidate traffic role was not observed"))
 	}
 	if err := manager.transitionAfterEffect(ctx, id, PhaseTrafficEnable, PhaseActiveSwitch, "traffic_enabled", nil); err != nil {
 		return nil, err
 	}
 	if err := manager.Runtime.SwitchActive(ctx, transaction.TargetSlot); err != nil {
-		return nil, manager.rollbackOrFence(ctx, *transaction, err)
+		return nil, failRollback(err)
 	}
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
 		if err := manager.Runtime.DisableTraffic(ctx, transaction.PreviousSlot); err != nil {
-			return nil, manager.effectFailure(ctx, id, PhaseActiveSwitch, err)
+			return nil, failEffect(PhaseActiveSwitch, err)
 		}
 	}
 	observation, err = manager.observe(ctx, id)
 	if err != nil {
-		return nil, manager.rollbackOrFence(ctx, *transaction, err)
+		return nil, failRollback(err)
 	}
 	target, ok = observation.Slots[transaction.TargetSlot]
 	if !validObservation(observation, manager.Clock().UTC()) || !ok || observation.ActiveSlot != transaction.TargetSlot || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || !target.TrafficAccepting || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch == "" || target.StateAuthority != verifiedAuthority || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) {
-		return nil, manager.rollbackOrFence(ctx, *transaction, errors.New("active switch was not verified"))
+		return nil, failRollback(errors.New("active switch was not verified"))
 	}
 	if err := manager.transitionAfterEffect(ctx, id, PhaseActiveSwitch, PhaseDrainOld, "active_switched", map[string]any{"active_slot": transaction.TargetSlot}); err != nil {
 		return nil, err
 	}
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
 		if err := manager.Runtime.Drain(ctx, transaction.PreviousSlot); err != nil {
-			return nil, manager.effectFailure(ctx, id, PhaseDrainOld, err)
+			return nil, failEffect(PhaseDrainOld, err)
 		}
 	}
 	if err := manager.transitionAfterEffect(ctx, id, PhaseDrainOld, PhaseQuiescence, "drain_started", nil); err != nil {
 		return nil, err
 	}
 	if err := manager.Runtime.Quiesce(ctx, transaction.PreviousSlot); err != nil {
-		return nil, manager.effectFailure(ctx, id, PhaseQuiescence, err)
+		return nil, failEffect(PhaseQuiescence, err)
 	}
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
 		observation, err = manager.observe(ctx, id)
@@ -391,28 +406,32 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 			if err != nil {
 				cause = fmt.Errorf("observe quiescence counters: %w", err)
 			}
-			return nil, manager.effectFailure(ctx, id, PhaseQuiescence, cause)
+			return nil, failEffect(PhaseQuiescence, cause)
 		}
 	}
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
 		if err := manager.Runtime.Stop(ctx, transaction.PreviousSlot); err != nil {
-			return nil, manager.effectFailure(ctx, id, PhaseQuiescence, err)
+			return nil, failEffect(PhaseQuiescence, err)
 		}
 	}
 	if err := manager.Runtime.ExitDrain(ctx, transaction.TargetSlot); err != nil {
-		return nil, manager.effectFailure(ctx, id, PhaseQuiescence, fmt.Errorf("exit shared admission drain on active slot: %w", err))
+		return nil, failEffect(PhaseQuiescence, fmt.Errorf("exit shared admission drain on active slot: %w", err))
 	}
 	observation, err = manager.observe(ctx, id)
 	if err != nil {
-		return nil, manager.rollbackOrFence(ctx, *transaction, err)
+		return nil, failRollback(err)
 	}
 	target, ok = observation.Slots[transaction.TargetSlot]
 	old, oldOK := observation.Slots[transaction.PreviousSlot]
 	previousSlotRequired := transaction.PreviousSlot != "" && transaction.PreviousSlot != "none"
 	oldNotStopped := previousSlotRequired && (!oldOK || !old.CountersKnown || old.ProcessUp || old.ProcessReady || old.Ready || old.ControllerOwned || old.TrafficAccepting || old.InFlightRequests != 0 || old.NativeWorkers != 0 || old.PendingOperations != 0)
 	if !validObservation(observation, manager.Clock().UTC()) || !ok || observation.ActiveSlot != transaction.TargetSlot || !target.ProcessUp || !target.ProcessReady || !target.Ready || !target.ControllerOwned || !target.TrafficAccepting || target.ReleaseID != verifiedReleaseID || target.SourceRevision != verifiedSourceRevision || target.StateEpoch == "" || target.StateAuthority != verifiedAuthority || !sameStateCapabilities(target.StateCapabilities, verifiedCapabilities) || oldNotStopped {
-		return nil, manager.rollbackOrFence(ctx, *transaction, errors.New("final active slot was not verified"))
+		return nil, failRollback(errors.New("final active slot was not verified"))
 	}
+	if err := stopRenewal(); err != nil {
+		return nil, failEffect(PhaseQuiescence, err)
+	}
+	ctx = parentContext
 	if err := manager.transitionAfterEffect(ctx, id, PhaseQuiescence, PhaseFinalize, "finalized", map[string]any{"quiescent": true}); err != nil {
 		return nil, err
 	}

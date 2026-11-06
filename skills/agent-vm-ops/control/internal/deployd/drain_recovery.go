@@ -11,13 +11,9 @@ import (
 // intent after both traffic/controller roles are fenced. It never edits state
 // or resumes an Incus operation; the business service checks the saved digest.
 func (runtime *HostRuntime) resumeRollbackDrainExit(ctx context.Context, slot string) error {
-	body, _, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "admin-metrics"})
+	result, err := runtime.quiescenceMetrics(ctx, slot)
 	if err != nil {
 		return err
-	}
-	result, ok := body["result"].(map[string]any)
-	if !ok {
-		return errors.New("rollback drain metrics missing")
 	}
 	pending, ok := result["pending_operations"].([]any)
 	if !ok {
@@ -55,4 +51,32 @@ func (runtime *HostRuntime) resumeRollbackDrainExit(ctx context.Context, slot st
 		}
 	}
 	return nil
+}
+
+// Reuse the coherent read-only lane. Standalone legacy admin-metrics may make
+// many remote authority round trips and includes an unrelated capacity probe.
+func (runtime *HostRuntime) quiescenceMetrics(ctx context.Context, slot string) (map[string]any, error) {
+	bundle, err := runtime.observeSlotSources(ctx, slot)
+	if err != nil {
+		return nil, err
+	}
+	if bundle != nil {
+		value, ok := bundle["capacity"].(map[string]any)
+		if !ok {
+			return nil, errors.New("quiescence capacity lane missing")
+		}
+		if err := validateSourceResult("admin-metrics", value); err != nil {
+			return nil, err
+		}
+		return value, nil
+	}
+	body, _, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "admin-metrics"})
+	if err != nil {
+		return nil, err
+	}
+	value, ok := body["result"].(map[string]any)
+	if !ok {
+		return nil, errors.New("quiescence counters missing")
+	}
+	return value, nil
 }

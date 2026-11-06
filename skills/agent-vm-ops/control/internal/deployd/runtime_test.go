@@ -554,6 +554,10 @@ func TestRollbackDrainRecoveryRejectsUnprovenIntentAndLiveRoles(t *testing.T) {
 			}
 			writes := 0
 			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/internal/v1/deployment-observation" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
 				if r.Method == http.MethodGet {
 					json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "process_ready": true, "ready": false, "controller_owned": scenario == "controller-live", "traffic_accepting": scenario == "traffic-live", "process_id": 123, "process_start_time": "1"})
 					return
@@ -586,6 +590,48 @@ func TestRollbackDrainRecoveryRejectsUnprovenIntentAndLiveRoles(t *testing.T) {
 				}
 			} else if err == nil || writes != 0 {
 				t.Fatalf("unsafe resume writes=%d err=%v", writes, err)
+			}
+		})
+	}
+}
+
+func TestQuiescenceUsesCoherentLaneAndDoesNotFallbackOnFailure(t *testing.T) {
+	for _, failure := range []bool{false, true} {
+		t.Run(fmt.Sprint(failure), func(t *testing.T) {
+			directory, err := os.MkdirTemp("", "avm-qview-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(directory)
+			socket := filepath.Join(directory, "app.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/internal/v1/deployment-observation" {
+					t.Error("coherent observation fell back to independent probes")
+					w.WriteHeader(500)
+					return
+				}
+				if failure {
+					w.WriteHeader(500)
+					return
+				}
+				json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "result": map[string]any{"capacity": map[string]any{"up": true, "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "observation_consistent": true, "observation_epoch": "epoch", "pending_operations": []any{}, "historical_unknown_operations": []any{}, "in_flight_operations": 0, "doctor": map[string]any{"issues": []any{}}}}})
+			}))
+			server.Listener.Close()
+			server.Listener = listener
+			server.Start()
+			defer server.Close()
+			runtime := NewHostRuntime(Config{BlueSocket: socket})
+			value, err := runtime.quiescenceMetrics(context.Background(), "blue")
+			if failure {
+				if err == nil {
+					t.Fatal("failed snapshot accepted")
+				}
+			} else if err != nil || value["observation_epoch"] != "epoch" {
+				t.Fatalf("coherent lane=%v err=%v", value, err)
 			}
 		})
 	}

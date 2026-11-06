@@ -1642,3 +1642,44 @@ func TestVerifyRejectsBothSlotsChangingAuthorityAfterStage(t *testing.T) {
 		t.Fatal("verify accepted both slots changing backend after stage")
 	}
 }
+
+type slowActivationRuntime struct {
+	*fakeRuntime
+	renewals atomic.Int32
+}
+
+func (r *slowActivationRuntime) Quiesce(ctx context.Context, slot string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(120 * time.Millisecond):
+		return r.fakeRuntime.Quiesce(ctx, slot)
+	}
+}
+func (r *slowActivationRuntime) RenewTransactionLease(ctx context.Context, lease controllerrole.Lease) (controllerrole.Lease, error) {
+	r.renewals.Add(1)
+	return r.fakeRuntime.RenewTransactionLease(ctx, lease)
+}
+func TestActivationRenewsCandidateThroughoutOldSlotQuiescence(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	db, err := store.Open(filepath.Join(t.TempDir(), "deploy.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	r := &slowActivationRuntime{fakeRuntime: &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true}, "green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true}}}}
+	m := NewManager(db, r, 30*time.Millisecond, func() time.Time { return now })
+	tx, err := m.Stage(context.Background(), "green", "bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.Verify(context.Background(), tx.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.Activate(context.Background(), tx.ID); err != nil {
+		t.Fatal(err)
+	}
+	if r.renewals.Load() < 3 {
+		t.Fatalf("candidate renewal stopped during quiescence: %d", r.renewals.Load())
+	}
+}

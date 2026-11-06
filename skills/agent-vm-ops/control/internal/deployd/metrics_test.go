@@ -1,6 +1,11 @@
 package deployd
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -178,5 +183,53 @@ func TestSharedIncusMetricsAreEmittedOnceFromActiveSlot(t *testing.T) {
 	metrics.Set(snapshot)
 	if strings.Contains(metrics.Render(), "incus_cpu_seconds_total{") {
 		t.Fatal("stale shared metrics emitted")
+	}
+}
+
+func TestPublicationKeepsLiveTransactionObservableButFencesRecovery(t *testing.T) {
+	for _, recovery := range []bool{false, true} {
+		t.Run(map[bool]string{false: "active", true: "recovery"}[recovery], func(t *testing.T) {
+			now := time.Now().UTC()
+			ctx := context.Background()
+			db, err := store.Open(filepath.Join(t.TempDir(), "deploy.sqlite3"), 30*24*time.Hour, time.Now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			tx := store.Transaction{ID: "tx-publication", Bundle: "bundle", TargetSlot: "green", PreviousSlot: "blue", Phase: PhaseStandbyValidation, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
+			if recovery {
+				tx.State = "needs_recovery"
+				tx.RecoveryRequired = true
+			}
+			if err := db.Create(ctx, tx, map[string]any{}); err != nil {
+				t.Fatal(err)
+			}
+			sources := map[string]SourceObservation{}
+			for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
+				sources[name] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
+			}
+			snapshot := RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), ActiveSlot: "blue", Consistent: true, Sources: sources, Slots: map[string]SlotObservation{"blue": {Slot: "blue", ProcessUp: true, ControllerOwned: true}, "green": {Slot: "green", ProcessUp: true}}}
+			raw, _ := json.Marshal(snapshot)
+			var payload map[string]any
+			json.Unmarshal(raw, &payload)
+			canonical, _ := json.Marshal(payload)
+			digest := sha256.Sum256(canonical)
+			if err := db.SaveObservation(ctx, store.LatestObservationID, store.Observation{ObservedAt: now, FreshUntil: now.Add(time.Minute), Digest: hex.EncodeToString(digest[:]), Payload: payload}); err != nil {
+				t.Fatal(err)
+			}
+			server := NewServer(NewManager(db, &fakeRuntime{}, time.Second, time.Now), nil)
+			// Publication must not wait for an in-progress transaction writer.
+			server.Manager.mu.Lock()
+			err = server.RestoreLatest(ctx)
+			server.Manager.mu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := server.Metrics.Render()
+			fresh := strings.Contains(text, "agent_vm_deployd_snapshot_fresh 1")
+			if fresh == recovery {
+				t.Fatalf("incorrect publication recovery=%t: %s", recovery, text)
+			}
+		})
 	}
 }

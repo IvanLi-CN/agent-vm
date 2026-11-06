@@ -78,6 +78,7 @@ func run(args []string) error {
 		errorsCh <- deployd.ServeMetrics(ctx, config.MetricsListen, server.MetricsHandler(), config.MetricsTLS, config.NetworkACL)
 	}()
 	go maintenanceLoop(ctx, manager, server, config.ObserveInterval())
+	go publicationLoop(ctx, server, config.ObserveInterval())
 
 	slog.Info("agent vm deployd started", "version", version, "socket", config.Socket, "metrics_listen", config.MetricsListen)
 	select {
@@ -118,6 +119,26 @@ func maintenanceLoop(ctx context.Context, manager *deployd.Manager, server *depl
 			}
 			if err := manager.CleanupMigrationBackups(ctx); err != nil {
 				slog.Warn("migration backup cleanup failed", "error", err)
+			}
+		}
+	}
+}
+
+// Publish only completed persisted observations, independently of the serialized
+// role/transaction writer. This loop never probes slots or grants authority.
+func publicationLoop(ctx context.Context, server *deployd.Server, interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := server.RestoreLatest(ctx); err != nil {
+				slog.Warn("deployd snapshot publication failed", "error", err)
 			}
 		}
 	}

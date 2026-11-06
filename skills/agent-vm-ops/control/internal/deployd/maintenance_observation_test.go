@@ -114,3 +114,31 @@ func TestDaemonRestartCannotRenewWithoutInMemoryProcessPin(t *testing.T) {
 		t.Fatalf("unobserved restarted daemon resumed authority: %v %v", owned, err)
 	}
 }
+
+type blockedStatusRuntime struct {
+	*fakeRuntime
+	entered chan struct{}
+}
+
+func (r *blockedStatusRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error) {
+	close(r.entered)
+	<-ctx.Done()
+	return RuntimeSnapshot{}, ctx.Err()
+}
+func TestReadOnlyStatusDoesNotHoldRoleWriterLock(t *testing.T) {
+	r := &blockedStatusRuntime{fakeRuntime: &fakeRuntime{}, entered: make(chan struct{})}
+	m := NewManager(nil, r, time.Second, time.Now)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = m.Status(ctx) }()
+	<-r.entered
+	if !m.mu.TryLock() {
+		cancel()
+		<-done
+		t.Fatal("slow read-only status blocked controller renewal")
+	}
+	m.mu.Unlock()
+	cancel()
+	<-done
+}

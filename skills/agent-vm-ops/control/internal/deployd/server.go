@@ -173,7 +173,10 @@ func (server *Server) RestoreLatest(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("restore active deployment transactions: %w", err)
 	}
-	if len(transactions) > 0 {
+	for _, transaction := range transactions {
+		if !transaction.RecoveryRequired && transaction.State != "needs_recovery" {
+			continue
+		}
 		// A persisted observation can describe the last healthy state, but it
 		// cannot prove that recovery has completed after a Deployd restart.
 		snapshot.Consistent = false
