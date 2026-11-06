@@ -103,6 +103,7 @@ forbidText(rqliteUnit, "0.0.0.0", "rqlite does not bind to all interfaces");
 const slotUnit = read(join(assetsRoot, "systemd/agent-vm-native@.service"));
 requireText(slotUnit, "ExecStart=/var/lib/agent-vm-native/slots/%i/bin/agent-vm-control", "slot service executes the atomically staged candidate binary");
 requireText(slotUnit, "--manifest /var/lib/agent-vm-native/slots/%i/release-manifest.json", "slot service uses its staged manifest path");
+requireText(slotUnit, "ExecStartPre=/opt/agent-vm-native/bin/agent-vm-deploy wait-authority --slot %i --timeout 55", "slot startup waits for authenticated rqlite strong reads before opening state");
 requireText(slotUnit, "ExecStartPost=/opt/agent-vm-native/bin/agent-vm-deploy wait-process --slot %i --timeout 55", "slot startup waits only for its fenced process interface");
 forbidText(slotUnit, "BindReadOnlyPaths=", "slot service does not alias a candidate manifest over the shared release root");
 requireText(slotUnit, "Group=agent-vm-web", "slot service owns the protected web socket group");

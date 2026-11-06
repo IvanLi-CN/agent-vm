@@ -51,4 +51,9 @@ func TestWaitProcessRejectsMissingProcessAndBoundsStartup(t *testing.T) {
 			t.Fatalf("invalid startup arguments accepted: %v", args)
 		}
 	}
+	for _, args := range [][]string{{"wait-authority"}, {"wait-authority", "--slot", "../blue"}, {"wait-authority", "--slot", "blue", "--timeout", "56"}, {"wait-authority", "--slot", "green", "--timeout", "0"}} {
+		if err := run(args); err == nil {
+			t.Fatalf("invalid authority startup arguments accepted: %v", args)
+		}
+	}
 }

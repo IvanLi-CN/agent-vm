@@ -256,6 +256,8 @@ Deployd 随后验证初始 standby 的 release、状态能力和进程身份，�
 
 首次安装事务在慢速组合观测期间，通过独立的角色通道核验已授予 controller 的进程身份和完整 lease 身份，并只延长仍有效的同一 lease。进程变化、lease 到期、身份不匹配或通道失败均终止续期并进入原事务恢复，不能分配新 term 来掩盖丢失。事务结束或请求取消会停止该续期。UDS 保留 30 秒请求读取预算，响应写入上限为 9000 秒，以覆盖既有迁移事务的最长等待；metrics 监听的短超时不变。
 
+槽位 unit 的 `ExecStartPre` 通过 `agent-vm-deploy wait-authority` 使用该槽位受保护配置中的 HTTPS rqlite 身份，等待状态接口和 `SELECT 1` strong read 均成功；只读检查不打开业务 SQLite、不修改 schema，也不授予角色。rqlite 的 systemd 进程已启动不足以证明内部 store 已打开或 leader 已就绪。前置检查和进程启动共享 unit 的 60 秒总启动预算，不能因检查而无限等待。
+
 槽位启动后的进程身份等待预算为 60 秒，与槽位 systemd unit 的启动预算一致；期间仍须验证实际 PID、进程启动标识及 health 合同，超时进入失败或恢复，不能仅凭 systemd 已启动判定成功。
 
 运行时副作用失败后的证据记录与双槽位 fencing 使用独立的 30 秒收尾预算。请求取消或超时不能取消这段收尾；收尾只保存不确定结果并撤销角色，不能继续激活或重放安装。

@@ -34,6 +34,9 @@ func run(args []string) error {
 	if args[0] == "wait-process" {
 		return runWaitProcess(args[1:])
 	}
+	if args[0] == "wait-authority" {
+		return runWaitAuthority(args[1:])
+	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)

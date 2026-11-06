@@ -148,7 +148,7 @@ GO_UNIT_EXEC_START = {
 }
 GO_UNIT_CONTENT_SHA256 = {
     "agent-vm-native.service": "c7537077f0299c259e1f32eb4365db2da07fd2e8911dba0164364481e55396cc",
-    "agent-vm-native@.service": "2f8b3f360bd43aaf13c7dd30aa2c618aa1f4522b5e179ec3b04a604bddf8455a",
+    "agent-vm-native@.service": "f194a5fbc0f4c1aa42007f94b83b8a58ce30fb2dec06964e0bf600074cbc1083",
     "agent-vm-deployd.service": "9de191f383a3fe40d58b4cb737327e7d16e92f2b624f8fa4efb2d6a9a83e3f09",
 }
 PRODUCT_UNIT_EXEC_START = {
@@ -167,6 +167,7 @@ HISTORICAL_PRODUCT_UNIT_EXEC_START = {
 }
 HISTORICAL_GO_UNIT_CONTENT_SHA256 = {
     "agent-vm-native@.service": (
+        "2f8b3f360bd43aaf13c7dd30aa2c618aa1f4522b5e179ec3b04a604bddf8455a",
         "ca12ae977aca62872921c03ea70795a2864859b8b9c963d2a9024321068fa057",
         "a014ff37ba6e96d5e7ef0cf2aa6c99b6bb66ebd61bad327afeb510cde02ab887",
         "1c5306d7643fcb0a5c8c570b8d95bf7fe8c1808eb8e7a9db03f753556aeb73e5",
