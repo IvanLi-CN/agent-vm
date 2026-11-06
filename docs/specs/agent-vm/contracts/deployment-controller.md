@@ -106,6 +106,10 @@ Grafana 面板通过 Prometheus 查询 Deployd 输出，例如：
 
 Deployd 在完成旧槽位 quiescence 后退出共享 drain 时，`preserve_traffic=true` 必须保留调用槽位当前的 traffic role：已单独启用的目标槽位保持启用，仍被关闭的槽位保持关闭。该参数不能强制关闭目标槽位，也不能自动开放 standby。槽位健康响应中的 term 和 generation 必须按整数无损读取，经过观测与续租后仍须匹配原 lease 身份。
 
+槽位的只读 `admin-metrics` 必须在 native startup、restart 和 cleanup 持有排空边界锁期间继续响应，不能让 controller lease 的续租观测等待同一个长操作锁。发布封存只在该锁可以立即取得、活动操作为零、当前仍由发布事务排空且状态纪元与已完成观测一致时执行；否则跳过本次封存，保留排空并等待后续观测，不能阻塞采样或提前声明 quiescence。
+
+controller 下的维护循环必须按 lease deadline 判断 `active` 和 `preparing` 的到期资格。`preparing` 不表示 effective lease，但未来的 deadline 仍必须保留，不能提前创建到期清理日志。无效 deadline 必须报告状态未验证。旧版已终结的 `timer-expire` 只有请求身份和摘要匹配、明确成功返回 `expired=false`，且 worker 明确为 `starting`、`start_attempted=false` 时，才允许保留原日志并创建绑定当前已到期 deadline 的确定性新清理意图；pending、失败、身份冲突、已尝试启动或证据缺失均不能借此重试或改写。
+
 正常生命周期写入可能在独立的容量、清单和健康请求之间推进 state epoch。持续协调遇到这种组合观测不一致时，只有当前 active 槽位仍持有同一 Deployd 进程的有效 lease、支持原身份续约、进程与角色来源新鲜且没有第二个 controller，才允许立即重新采样，单次协调最多采样三次。重采样期间不能依据失败样本续约或授予新身份；最终必须取得完整、新鲜且一致的观测，才能按上述原身份规则续约。持续不一致、来源失效、lease 过期、owner 不匹配、第二个 controller 或观测持久化失败仍必须 fencing。部署转换和重启恢复继续使用各自的严格验证条件。
 
 控制器持有排他的宿主级协调锁。槽位 controller role 是进程持有型的；deployd 或持有 role 的槽位失去已认证角色通道后，该 role 立即失效。deployd 重启会使所有尚未验证的交接失效，并要求重新观测后才能授予新的 role。不能根据过期的 SQLite 行重建 role。
