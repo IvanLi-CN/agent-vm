@@ -917,7 +917,9 @@ func (manager *Manager) observe(ctx context.Context, transactionID string) (Runt
 	if observation.Slots == nil {
 		observation.Slots = map[string]SlotObservation{}
 	}
-	if transactionID != "" && validObservation(observation, manager.Clock().UTC()) {
+	// A running heartbeat owns expiry updates for its exact lease. A second
+	// observation-driven grant would race it and invalidate its expiry proof.
+	if transactionID != "" && ctx.Value(transactionRenewalKey{}) != true && validObservation(observation, manager.Clock().UTC()) {
 		transaction, readErr := manager.Store.Get(ctx, transactionID)
 		if readErr != nil {
 			return RuntimeSnapshot{}, readErr

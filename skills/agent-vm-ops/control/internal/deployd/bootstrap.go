@@ -230,8 +230,11 @@ func (manager *Manager) resumeBootstrap(ctx context.Context, tx store.Transactio
 // Keep only the already-granted identity alive while the deployment transaction
 // performs slower composed observations. Fast role checks cannot grant a new
 // term, revive an expired lease, or outlive the owning transaction/request.
+type transactionRenewalKey struct{}
+
 func (manager *Manager) beginTransactionRenewal(parent context.Context, lease controllerrole.Lease) (context.Context, func() error) {
 	ctx, cancel := context.WithCancelCause(parent)
+	ctx = context.WithValue(ctx, transactionRenewalKey{}, true)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)

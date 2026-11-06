@@ -807,7 +807,7 @@ func TestTransactionObservationRenewsOnlyVerifiedLiveCandidate(t *testing.T) {
 	if start == "" {
 		t.Skip("Linux process-incarnation evidence required")
 	}
-	for _, mode := range []string{"live", "transient", "inconsistent", "expired", "other-owner"} {
+	for _, mode := range []string{"live", "transient", "guarded", "inconsistent", "expired", "other-owner"} {
 		t.Run(mode, func(t *testing.T) {
 			now := time.Unix(100, 0).UTC()
 			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), time.Hour, func() time.Time { return now })
@@ -837,7 +837,13 @@ func TestTransactionObservationRenewsOnlyVerifiedLiveCandidate(t *testing.T) {
 				runtime.unstableReads = 10
 			}
 			manager := NewManager(database, runtime, 15*time.Second, func() time.Time { return now })
-			_, err = manager.observe(context.Background(), transaction.ID)
+			observationContext := context.Background()
+			if mode == "guarded" {
+				var stop func() error
+				observationContext, stop = manager.beginTransactionRenewal(observationContext, lease)
+				defer stop()
+			}
+			_, err = manager.observe(observationContext, transaction.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
