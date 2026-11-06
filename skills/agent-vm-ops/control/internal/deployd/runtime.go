@@ -1269,7 +1269,7 @@ func (runtime *HostRuntime) waitSlotIdentity(ctx context.Context, slot string, p
 	if err := validSlot(slot); err != nil {
 		return processIdentity{}, err
 	}
-	deadline := time.NewTimer(10 * time.Second)
+	deadline := time.NewTimer(60 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
