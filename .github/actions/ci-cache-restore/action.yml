@@ -1,0 +1,54 @@
+name: Restore CI caches
+description: Restore rebuildable downloads and role-specific compilation data
+inputs:
+  role:
+    description: portable or heavy
+    required: true
+outputs:
+  state:
+    description: Cache identities and exact-hit dispositions for finalization
+    value: ${{ steps.report.outputs.state }}
+runs:
+  using: composite
+  steps:
+    - id: plan
+      shell: bash
+      env:
+        CACHE_ROLE: ${{ inputs.role }}
+        DEPENDENCY_HASH: ${{ hashFiles('skills/agent-vm-ops/control/go.mod', 'skills/agent-vm-ops/control/go.sum') }}
+        SOURCE_HASH: ${{ hashFiles('skills/**', 'web/**', 'bin/**', 'package.json', 'bun.lock', '.github/actions/**', '.github/workflows/ci*.yml') }}
+        LOCK_HASH: ${{ hashFiles('bun.lock') }}
+      run: python3 bin/ci_cache.py plan
+    - id: module
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ fromJSON(steps.plan.outputs.state).caches.module.path }}
+        key: ${{ fromJSON(steps.plan.outputs.state).caches.module.key }}
+        restore-keys: ${{ fromJSON(steps.plan.outputs.state).caches.module.prefix }}
+    - id: build_start
+      shell: bash
+      run: python3 -c 'import time; print("at=" + str(time.time()))' >> "$GITHUB_OUTPUT"
+    - id: build
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ fromJSON(steps.plan.outputs.state).caches.build.path }}
+        key: ${{ fromJSON(steps.plan.outputs.state).caches.build.key }}
+        restore-keys: ${{ fromJSON(steps.plan.outputs.state).caches.build.prefix }}
+    - id: bun_start
+      shell: bash
+      run: python3 -c 'import time; print("at=" + str(time.time()))' >> "$GITHUB_OUTPUT"
+    - id: bun
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ fromJSON(steps.plan.outputs.state).caches.bun.path }}
+        key: ${{ fromJSON(steps.plan.outputs.state).caches.bun.key }}
+        restore-keys: ${{ fromJSON(steps.plan.outputs.state).caches.bun.prefix }}
+    - id: report
+      shell: bash
+      env:
+        CACHE_STATE: ${{ steps.plan.outputs.state }}
+        BUILD_STARTED: ${{ steps.build_start.outputs.at }}
+        BUN_STARTED: ${{ steps.bun_start.outputs.at }}
+        CACHE_RESULTS: >-
+          {"module":{"matched":"${{ steps.module.outputs.cache-matched-key }}"},"build":{"matched":"${{ steps.build.outputs.cache-matched-key }}"},"bun":{"matched":"${{ steps.bun.outputs.cache-matched-key }}"}}
+      run: python3 bin/ci_cache.py restore

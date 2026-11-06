@@ -27,3 +27,32 @@ test('workloads are parallel and stable gates fail closed on all dependencies', 
     }
   }
 });
+
+test('cache ownership preserves cold execution and isolates PR from writes', () => {
+  for (const filename of ['ci.yml', 'ci-main.yml']) {
+    const workflow = parse(readFileSync(new URL(`../.github/workflows/${filename}`, import.meta.url), 'utf8'));
+    for (const [job, role] of [['validation', 'portable'], ['heavy', 'heavy']]) {
+      const steps = workflow.jobs[job].steps;
+      expect(steps.find((s: any) => s.uses === 'actions/setup-go@v5').with.cache).toBe(false);
+      const restore = steps.find((s: any) => s.id === 'ci_cache');
+      expect(restore.with.role).toBe(role);
+      expect(steps.indexOf(restore)).toBeLessThan(steps.findIndex((s: any) => s.run === 'bun install --frozen-lockfile'));
+      const finish = steps.find((s: any) => s.uses === './.github/actions/ci-cache-save');
+      expect(finish.with.publish).toContain("github.event_name == 'push'");
+      expect(finish.with.publish).toContain("github.ref == 'refs/heads/main'");
+      expect(finish.with.publish).toContain("job.status == 'success'");
+      expect(finish.with.role).toBe(role);
+    }
+  }
+  const action = (name: string) => parse(readFileSync(new URL(`../.github/actions/ci-cache-${name}/action.yml`, import.meta.url), 'utf8'));
+  const restore = action('restore').runs.steps;
+  expect(restore.filter((s: any) => s.uses === 'actions/cache/restore@v4')).toHaveLength(3);
+  expect(restore.find((s: any) => s.id === 'plan').env.SOURCE_HASH).toContain("'skills/**'");
+  expect(restore.find((s: any) => s.id === 'plan').env.SOURCE_HASH).toContain("'web/**'");
+  const save = action('save').runs.steps.filter((s: any) => s.uses === 'actions/cache/save@v4');
+  for (const step of save) {
+    expect(step.if).toContain("inputs.publish == 'true'");
+    expect(step.if).toContain('!fromJSON(inputs.state)');
+    if (step.id !== 'build') expect(step.if).toContain("inputs.role == 'portable'");
+  }
+});

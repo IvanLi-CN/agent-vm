@@ -1,0 +1,57 @@
+name: Save CI caches
+description: Publish Main-only cache snapshots and record save outcomes
+inputs:
+  state:
+    description: State returned by ci-cache-restore
+    required: true
+  role:
+    description: portable or heavy; portable owns shared downloads
+    required: true
+  publish:
+    description: True only for a successful Main push job
+    required: true
+runs:
+  using: composite
+  steps:
+    - id: start
+      if: always()
+      shell: bash
+      run: python3 -c 'import time; print("at=" + str(time.time()))' >> "$GITHUB_OUTPUT"
+    - id: module
+      if: ${{ inputs.publish == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && !fromJSON(inputs.state).caches.module.hit && inputs.role == 'portable' }}
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ fromJSON(inputs.state).caches.module.path }}
+        key: ${{ fromJSON(inputs.state).caches.module.key }}
+    - id: build_start
+      if: always()
+      shell: bash
+      run: python3 -c 'import time; print("at=" + str(time.time()))' >> "$GITHUB_OUTPUT"
+    - id: build
+      if: ${{ inputs.publish == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && !fromJSON(inputs.state).caches.build.hit }}
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ fromJSON(inputs.state).caches.build.path }}
+        key: ${{ fromJSON(inputs.state).caches.build.key }}
+    - id: bun_start
+      if: always()
+      shell: bash
+      run: python3 -c 'import time; print("at=" + str(time.time()))' >> "$GITHUB_OUTPUT"
+    - id: bun
+      if: ${{ inputs.publish == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main' && !fromJSON(inputs.state).caches.bun.hit && inputs.role == 'portable' }}
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ fromJSON(inputs.state).caches.bun.path }}
+        key: ${{ fromJSON(inputs.state).caches.bun.key }}
+    - shell: bash
+      if: always()
+      env:
+        CACHE_STATE: ${{ inputs.state }}
+        SAVE_STARTED: ${{ steps.start.outputs.at }}
+        BUILD_STARTED: ${{ steps.build_start.outputs.at }}
+        BUN_STARTED: ${{ steps.bun_start.outputs.at }}
+        CACHE_RESULTS: >-
+          {"module":{"outcome":"${{ steps.module.outcome }}"},"build":{"outcome":"${{ steps.build.outcome }}"},"bun":{"outcome":"${{ steps.bun.outcome }}"}}
+      run: |
+        python3 bin/ci_cache.py save
+        echo 'Save policy: Main success only; portable owns module/Bun downloads; each role owns its build snapshot. Skipped saves are expected for PR, existing keys, and non-owners. Save action success is an attempt outcome; provider upload warnings remain in the action log.' >> "$GITHUB_STEP_SUMMARY"
