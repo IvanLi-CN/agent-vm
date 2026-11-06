@@ -33,9 +33,11 @@ test('release materials archive requires the exact clean revision', async () => 
     const revision=git(['rev-parse','HEAD']);
     const output=join(root,'materials.tar');
     buildMaterialsArchive(source,output,revision);
-    const listing=Bun.spawnSync(['tar','-tf',output],{stdout:'pipe',stderr:'pipe'});
+    // BSD tar hides AppleDouble metadata in its own listing. Inspect raw
+    // members with Python so a macOS-built archive remains valid on Linux.
+    const listing=Bun.spawnSync(['python3','-c','import json,sys,tarfile; print(json.dumps(tarfile.open(sys.argv[1]).getnames()))',output],{stdout:'pipe',stderr:'pipe'});
     expect(listing.exitCode).toBe(0);
-    expect(new TextDecoder().decode(listing.stdout)).toContain('materials-manifest.json');
+    expect(JSON.parse(new TextDecoder().decode(listing.stdout)).sort()).toEqual(['README.md','materials-manifest.json']);
     const manifest=Bun.spawnSync(['tar','-xOf',output,'materials-manifest.json'],{stdout:'pipe',stderr:'pipe'});
     expect(JSON.parse(new TextDecoder().decode(manifest.stdout)).source_revision).toBe(revision);
     writeFileSync(join(source,'deploy','README.md'),'changed');
