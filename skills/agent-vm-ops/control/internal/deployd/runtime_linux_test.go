@@ -33,6 +33,10 @@ func TestQuiesceHistoricalUnknownIsNotRunningWork(t *testing.T) {
 				t.Fatal(err)
 			}
 			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/internal/v1/deployment-observation" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
 				if r.URL.Path == "/internal/v1/health" {
 					json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "process_ready": true, "ready": false, "controller_owned": false, "traffic_accepting": false, "process_id": pid, "process_start_time": controllerrole.ProcessStartToken(pid)})
 					return

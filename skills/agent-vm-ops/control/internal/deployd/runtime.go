@@ -1073,6 +1073,12 @@ func (runtime *HostRuntime) SwitchActive(ctx context.Context, slot string) error
 	if info, err := os.Lstat(runtime.Config.ActivePath); err == nil && info.Mode()&os.ModeSymlink == 0 {
 		return errors.New("active path is not a symlink")
 	}
+	// The selected slot must be part of the next systemd boot before routing
+	// is published. Enabled standby processes still start fenced and cannot
+	// reconstruct a controller role from this boot setting.
+	if err := runtime.systemctl(ctx, "enable", "agent-vm-native@"+slot+".service"); err != nil {
+		return fmt.Errorf("persist selected slot boot activation: %w", err)
+	}
 	temporary := filepath.Join(parent, ".active."+strconv.FormatInt(time.Now().UnixNano(), 10))
 	if err := os.Symlink(target, temporary); err != nil {
 		return err
@@ -1657,7 +1663,7 @@ func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, pat
 }
 
 func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) error {
-	if action != "start" && action != "stop" && action != "restart" {
+	if action != "start" && action != "stop" && action != "restart" && action != "enable" {
 		return errors.New("unsupported systemd action")
 	}
 	if !strings.HasPrefix(unit, "agent-vm-native@") || !strings.HasSuffix(unit, ".service") {

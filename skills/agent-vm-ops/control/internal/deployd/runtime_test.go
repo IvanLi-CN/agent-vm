@@ -636,3 +636,49 @@ func TestQuiescenceUsesCoherentLaneAndDoesNotFallbackOnFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestActiveSwitchRequiresPersistentSlotBootBeforeRouting(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			root := t.TempDir()
+			for _, slot := range []string{"blue", "green"} {
+				if err := os.MkdirAll(filepath.Join(root, "slots", slot), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			active := filepath.Join(root, "active")
+			before := filepath.Join(root, "slots", "blue")
+			if err := os.Symlink(before, active); err != nil {
+				t.Fatal(err)
+			}
+			commands := filepath.Join(root, "commands")
+			os.Mkdir(commands, 0700)
+			log := filepath.Join(root, "systemctl.args")
+			script := "#!/bin/sh\nprintf '%s\n' \"$@\" > " + log + "\n"
+			if fail {
+				script += "exit 1\n"
+			}
+			if err := os.WriteFile(filepath.Join(commands, "systemctl"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", commands)
+			runtime := NewHostRuntime(Config{ReleaseRoot: root, ActivePath: active})
+			err := runtime.SwitchActive(context.Background(), "green")
+			target, readErr := os.Readlink(active)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if fail {
+				if err == nil || target != before {
+					t.Fatalf("routing changed despite boot failure: %s %v", target, err)
+				}
+			} else if err != nil || target != filepath.Join(root, "slots", "green") {
+				t.Fatalf("active=%s err=%v", target, err)
+			}
+			args, err := os.ReadFile(log)
+			if err != nil || string(args) != "enable\nagent-vm-native@green.service\n" {
+				t.Fatalf("boot unit=%q err=%v", args, err)
+			}
+		})
+	}
+}

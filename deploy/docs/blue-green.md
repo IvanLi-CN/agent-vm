@@ -116,6 +116,8 @@ sudo agent-vm-deploy transaction --transaction <transaction-id> --json
 
 Deployd 启动候选槽位，验证 manifest、socket、就绪状态、状态能力和阶段证据绑定的 `state_authority`；然后授予候选 controller lease，确认 readiness 后启用 traffic role，原子替换 `active`，让旧槽位进入 retiring 并排空。Deployd 必须重新观测旧槽位已停止、目标槽位仍持有唯一 controller lease 且继续接收流量，才能进入 finalize。
 
+切换在发布新的 `active` 链接前，必须先成功启用所选槽位的 systemd 开机启动。冷启动可以同时启动已启用的两个槽位，但它们均从 fencing 状态启动；Deployd 重新观测产物、进程和共享状态后，才向当前 active 槽位授予新 lease，不能使用旧部署库记录恢复角色。开机启动配置不授予 controller 或 traffic。
+
 切换前失败保持当前槽位和 `active` 不变。切换后健康或 quiescence 失败只允许向上一个已验证槽位执行一次有界 rollback；结果不明确时保持 `needs_recovery` 并对 admission 和槽位主权执行 fencing，不能改写 state、generation 或 uncertain operation。
 
 查询原事务，确认存在已验证的上一槽位且尚未消耗回滚额度后，可以显式执行一次有界回滚；回滚只切换发布和角色，不回退业务数据库：

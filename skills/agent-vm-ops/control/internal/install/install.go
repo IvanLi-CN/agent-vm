@@ -272,7 +272,7 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-rqlite.service", "agent-vm-deployd.service"); err != nil {
 		return report, err
 	}
-	client := deployd.Client{Socket: "/run/agent-vm-native/deployd.sock", Timeout: 2 * time.Minute}
+	client := deployd.Client{Socket: "/run/agent-vm-native/deployd.sock", Timeout: 30 * time.Minute}
 	if err := waitDaemon(ctx, client); err != nil {
 		return report, err
 	}
