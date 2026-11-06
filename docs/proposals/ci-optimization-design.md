@@ -12,7 +12,7 @@ Run 42084608528 显示 Ubuntu 从 18:28:48 到 18:36:42 执行约 7分54秒，ma
 
 当前 PR 和 Main 都使用同一个两项 OS matrix，且 `max-parallel: 1`，导致同一 run 内 Ubuntu 与 macOS 串行。Ubuntu 关键串行段中，Skill tests 约 2分05–2分20秒，Linux race tests 约 1分05–1分07秒，隔离 rqlite 集成约 49–63秒；其余检查还包含重复的依赖安装、typecheck、Go tests、vet、repository tests 和 policy-like checks。
 
-当前没有证据证明 macOS 是必需门禁。workflow 在 macOS 上执行的是与 Ubuntu 基本相同的通用 Bun、Web、Go 和静态检查，仓库尚未发现明确的 macOS 专属测试、原生系统 API 合同或平台发布产物。因此 macOS 的保留理由必须先通过代码、历史失败日志或真实平台行为验证；不能把“现在有 macOS matrix”当作必要性证据。
+macOS matrix 源自 `ee37de5` 的 portable Bun tooling，验证 Bun FFI、POSIX 进程回收、文件锁与可移植客户端逻辑；例如 `bin/test_runner.ts` 按 Darwin 选择 `libSystem.B.dylib`。它不证明 Linux 控制宿主、systemd 或 Incus 行为。共享脚本、测试、锁文件及未知路径变更保守触发 macOS；仅独立文档和 Web 源码内容允许省略 macOS payload。
 
 ## 需求与目标
 
@@ -65,3 +65,7 @@ macOS 触发前必须完成平台依赖盘点：搜索脚本、原生模块、�
 ## 未决事项
 
 macOS 的真实必要性、路径分层的最终 allowlist、required check 聚合方式、缓存命中率目标和 GitHub runner 配额仍需在实施前由证据确认。付费 runner、自托管 runner、远端仓库设置或质量合同变化属于后续单独决策，不在本文授权范围内。
+
+## 实现与验证边界
+
+PR/Main 的 portable validation 与 Skill/race validation 在同一层并行启动；两个稳定 gate 是轻量聚合 job，任一依赖失败、取消或跳过均不得通过。Main 始终执行两个平台的完整原有 portable 检查；PR 分类失败明确告警并回退全量。Linux rqlite、产品包与 race 严格限制 Ubuntu。Go 缓存仅使用 setup-go，避免二次恢复同一目录；Bun 下载缓存包含运行时版本、OS、架构和 lock hash。当前实现保守地只省略内容变更的 macOS payload，Ubuntu 全量覆盖继续保留。实际执行关键路径的定义是首个验证 job 开始到末个验证 job 完成（包含 job 依赖），不能用最长单个 job 代替；20 次 PR 和 10 次 Main 的目标仍需合并后的真实样本验证，不能为凑样本触发额外 CI。

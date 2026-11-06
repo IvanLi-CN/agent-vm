@@ -4,26 +4,46 @@
     "baseline_policy": "explicit-waiver-required",
     "require_signed_commits": true,
     "branch_protection": {
-      "protected_branches": ["main"],
+      "protected_branches": [
+        "main"
+      ],
       "require_pull_request": true,
       "disallow_direct_pushes": true
     }
   },
-  "required_checks": ["PR gate (ubuntu-latest)", "PR gate (macos-latest)"],
-  "informational_checks": ["Main gate (ubuntu-latest)", "Main gate (macos-latest)", "Build demo artifact"],
+  "required_checks": [
+    "PR gate (ubuntu-latest)",
+    "PR gate (macos-latest)"
+  ],
+  "informational_checks": [
+    "Main gate (ubuntu-latest)",
+    "Main gate (macos-latest)",
+    "Build demo artifact"
+  ],
   "waivers": [],
   "expected_pr_workflows": [
     {
       "workflow": "CI (PR)",
-      "jobs": ["PR gate (ubuntu-latest)", "PR gate (macos-latest)"]
+      "jobs": [
+        "PR gate (ubuntu-latest)",
+        "PR gate (macos-latest)"
+      ]
     }
   ],
-  "release_checks": ["Main gate (ubuntu-latest)", "Main gate (macos-latest)"],
+  "release_checks": [
+    "Main gate (ubuntu-latest)",
+    "Main gate (macos-latest)"
+  ],
   "queue_policy": {
     "queue": "max",
-    "required_pull_request_events": ["opened", "synchronize", "reopened", "ready_for_review"],
+    "required_pull_request_events": [
+      "opened",
+      "synchronize",
+      "reopened",
+      "ready_for_review"
+    ],
     "max_concurrency": 1,
-    "cancel_in_progress": false,
+    "cancel_in_progress": true,
     "namespace": "pr"
   },
   "platform_alignment": {

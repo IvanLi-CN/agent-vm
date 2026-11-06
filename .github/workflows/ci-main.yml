@@ -1,25 +1,22 @@
 name: CI (Main)
-
 on:
   push:
-    branches: [main]
-
+    branches:
+      - main
 permissions:
   contents: read
-
 concurrency:
-  # queue: max; Main has its own non-preemptive namespace.
   group: main
   cancel-in-progress: false
-
 jobs:
-  main-gate:
-    name: Main gate
+  validation:
+    name: Main portable validation
     strategy:
       fail-fast: false
-      max-parallel: 2
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os:
+          - ubuntu-latest
+          - macos-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -30,23 +27,16 @@ jobs:
           bun-version: 1.4.4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27.3'
+          go-version: 1.27.3
           cache-dependency-path: skills/agent-vm-ops/control/go.sum
       - name: Cache Bun downloads
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock') }}
-      - name: Cache Go build and module data
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-          key: go-${{ runner.os }}-${{ hashFiles('skills/agent-vm-ops/control/go.sum') }}
+          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.13'
+          python-version: "3.13"
       - name: Record validation runtimes
         run: |
           bun --version
@@ -82,8 +72,6 @@ jobs:
         run: bun run check
       - name: Run repository tests
         run: bun run test:repo
-      - name: Run Skill tests
-        run: bun run test:skills
       - name: Build product packages
         if: matrix.os == 'ubuntu-latest'
         run: |
@@ -93,7 +81,70 @@ jobs:
           bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target client --output "$build_root/client.tar"
           bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target linux/amd64 --output "$build_root/amd64.tar"
           bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target linux/arm64 --output "$build_root/arm64.tar"
+  heavy:
+    name: Main Skill and race validation
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.27.3
+          cache-dependency-path: skills/agent-vm-ops/control/go.sum
+      - name: Cache Bun downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-1.4.4-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('bun.lock') }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Record validation runtimes
+        run: |
+          bun --version
+          go version
+          python3 --version
+          git --version
+          uname -s
+      - name: Install locked Bun dependencies
+        run: bun install --frozen-lockfile
+      - name: Run Skill tests
+        run: bun run test:skills
       - name: Run Linux race tests
-        if: matrix.os == 'ubuntu-latest'
         working-directory: skills/agent-vm-ops/control
         run: go test -race -count=1 ./...
+        if: matrix.os == 'ubuntu-latest'
+  main-gate:
+    name: Main gate
+    needs:
+      - validation
+      - heavy
+    if: always()
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce validation results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |-
+          python3 - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          for name, value in results.items():
+              print(f"{name}: {value['result']}")
+          assert all(value['result'] == 'success' for value in results.values()), results
+          PY
