@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"time"
 
+	"encoding/json"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd/store"
 )
 
@@ -64,8 +68,9 @@ func (manager *Manager) Bootstrap(ctx context.Context, id, bundle string) (*stor
 
 func (manager *Manager) finishBootstrap(ctx context.Context, tx store.Transaction) (*store.Transaction, error) {
 	id, bundle := tx.ID, tx.Bundle
+	failureContext := ctx
 	fail := func(phase string, cause error) (*store.Transaction, error) {
-		return nil, manager.effectFailure(ctx, id, phase, cause)
+		return nil, manager.effectFailure(failureContext, id, phase, cause)
 	}
 	if err := manager.Runtime.Verify(ctx, "blue", bundle); err != nil {
 		return fail(PhaseBootstrap, err)
@@ -89,6 +94,9 @@ func (manager *Manager) finishBootstrap(ctx context.Context, tx store.Transactio
 	if err := manager.Runtime.GrantController(ctx, "blue", lease); err != nil {
 		return fail(PhaseControllerHandoff, err)
 	}
+	parentContext := ctx
+	ctx, stopRenewal := manager.beginBootstrapRenewal(ctx, lease)
+	defer stopRenewal()
 	if err := manager.waitForReady(ctx, id, "blue"); err != nil {
 		return fail(PhaseControllerHandoff, err)
 	}
@@ -109,6 +117,10 @@ func (manager *Manager) finishBootstrap(ctx context.Context, tx store.Transactio
 	if err != nil || !validObservation(snapshot, manager.Clock().UTC()) || snapshot.ActiveSlot != "blue" || !current.Ready || !current.ControllerOwned || !current.TrafficAccepting || current.ReleaseID != target.ReleaseID || current.SourceRevision != target.SourceRevision || current.StateEpoch == "" || !sameStateCapabilities(current.StateCapabilities, target.StateCapabilities) {
 		return fail(PhaseActiveSwitch, errors.New("initial active controller was not verified"))
 	}
+	if err := stopRenewal(); err != nil {
+		return fail(PhaseActiveSwitch, err)
+	}
+	ctx = parentContext
 	if err := manager.transitionAfterEffect(ctx, id, PhaseActiveSwitch, PhaseFinalize, "installed", map[string]any{"business_authority": "rqlite"}); err != nil {
 		return nil, err
 	}
@@ -209,4 +221,93 @@ func (manager *Manager) resumeBootstrap(ctx context.Context, tx store.Transactio
 	}
 	tx.Phase = PhaseBootstrap
 	return manager.finishBootstrap(ctx, tx)
+}
+
+// Keep only the already-granted identity alive while the initial transaction
+// performs slower composed observations. Fast role checks cannot grant a new
+// term, revive an expired lease, or outlive the owning transaction/request.
+func (manager *Manager) beginBootstrapRenewal(parent context.Context, lease controllerrole.Lease) (context.Context, func() error) {
+	ctx, cancel := context.WithCancelCause(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		renewer, ok := manager.Runtime.(interface {
+			RenewBootstrapLease(context.Context, controllerrole.Lease) (controllerrole.Lease, error)
+		})
+		if !ok {
+			cancel(errors.New("initial controller renewal channel unavailable"))
+			return
+		}
+		ticker := time.NewTicker(manager.LeaseDuration / 3)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				checkCtx, stop := context.WithTimeout(ctx, manager.LeaseDuration/3)
+				renewed, err := renewer.RenewBootstrapLease(checkCtx, lease)
+				stop()
+				if err != nil {
+					cancel(err)
+					return
+				}
+				identity := renewed
+				identity.Expiry = lease.Expiry
+				if identity != lease || !renewed.Expiry.After(lease.Expiry) {
+					cancel(errors.New("initial renewal changed authority identity"))
+					return
+				}
+				lease = renewed
+			}
+		}
+	}()
+	return ctx, func() error {
+		cause := context.Cause(ctx)
+		cancel(context.Canceled)
+		<-done
+		if cause == nil {
+			cause = context.Cause(ctx)
+		}
+		if errors.Is(cause, context.Canceled) && parent.Err() == nil {
+			return nil
+		}
+		return cause
+	}
+}
+
+func (runtime *HostRuntime) RenewBootstrapLease(ctx context.Context, original controllerrole.Lease) (controllerrole.Lease, error) {
+	if err := original.Validate(time.Now(), "blue"); err != nil {
+		return original, err
+	}
+	body, status, err := runtime.slotRequest(ctx, runtime.socket("blue"), http.MethodGet, "/internal/v1/health", nil)
+	if err != nil {
+		return original, err
+	}
+	encoded, _ := json.Marshal(body["lease"])
+	var current controllerrole.Lease
+	process, processOK := processIdentityFromHealth(body)
+	runtime.mu.Lock()
+	staged, stagedOK := runtime.stagedProcess["blue"]
+	runtime.mu.Unlock()
+	if (status != http.StatusOK && status != http.StatusServiceUnavailable) || body["process_ready"] != true || body["controller_owned"] != true || !processOK || !stagedOK || process != staged || json.Unmarshal(encoded, &current) != nil || !sameBootstrapLease(current, original) {
+		return original, errors.New("initial controller process or lease identity changed")
+	}
+	if err := original.Validate(time.Now(), "blue"); err != nil {
+		return original, err
+	}
+	renewed := original
+	renewed.Expiry = time.Now().Add(time.Duration(runtime.Config.LeaseSeconds) * time.Second)
+	if err := runtime.GrantController(ctx, "blue", renewed); err != nil {
+		return original, err
+	}
+	return renewed, nil
+}
+
+func sameBootstrapLease(observed, expected controllerrole.Lease) bool {
+	if !observed.Expiry.Equal(expected.Expiry) {
+		return false
+	}
+	observed.Expiry = expected.Expiry
+	return observed == expected
 }

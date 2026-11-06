@@ -341,3 +341,62 @@ func TestSlotRequestPreservesControllerLeaseIdentity(t *testing.T) {
 		t.Fatalf("lease identity lost precision: term=%d generation=%d", observed.Term, observed.Generation)
 	}
 }
+
+func TestBootstrapRenewalRequiresLiveMatchingProcessAndLease(t *testing.T) {
+	for _, scenario := range []string{"not-ready-live", "expired", "changed-lease", "changed-process"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir, err := os.MkdirTemp("", "avm-bootstrap-uds-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(dir)
+			socket := filepath.Join(dir, "app.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease := controllerrole.Lease{Slot: "blue", Term: 3, Generation: 1, LeaseID: "original", Nonce: "original-nonce", Expiry: time.Now().Add(5 * time.Second)}
+			if scenario == "expired" {
+				lease.Expiry = time.Now().Add(-time.Second)
+			}
+			observed := lease
+			if scenario == "changed-lease" {
+				observed.Nonce = "different"
+			}
+			process := processIdentity{PID: 123, StartTime: "456"}
+			if scenario == "changed-process" {
+				process.StartTime = "457"
+			}
+			grants := 0
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					json.NewEncoder(w).Encode(map[string]any{"ok": true, "process_ready": true, "controller_owned": true, "ready": false, "lease": observed, "process_id": process.PID, "process_start_time": process.StartTime})
+				} else {
+					grants++
+					json.NewEncoder(w).Encode(map[string]any{"ok": true, "valid": true})
+				}
+			}))
+			server.Listener.Close()
+			server.Listener = listener
+			server.Start()
+			defer server.Close()
+			cfg := Defaults()
+			cfg.BlueSocket = socket
+			runtime := NewHostRuntime(cfg)
+			runtime.stagedProcess["blue"] = processIdentity{PID: 123, StartTime: "456"}
+			renewed, err := runtime.RenewBootstrapLease(context.Background(), lease)
+			if scenario == "not-ready-live" {
+				if err != nil || grants != 1 || !renewed.Expiry.After(lease.Expiry) {
+					t.Fatalf("valid startup renewal: %+v %v grants=%d", renewed, err, grants)
+				}
+				renewed.Expiry = lease.Expiry
+				if renewed != lease {
+					t.Fatal("renewal changed identity")
+				}
+			} else if err == nil || grants != 0 {
+				t.Fatal("invalid authority renewed")
+			}
+		})
+	}
+}

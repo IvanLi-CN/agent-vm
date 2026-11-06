@@ -247,3 +247,5 @@ CLI 永远不能直接编辑 `active`。响应丢失时，CLI 返回 deployd tra
 Deployd 随后验证初始 standby 的 release、状态能力和进程身份，分配持久化 fencing term，通过既有角色通道授予 blue 唯一 controller lease，观测 ready 后开启 traffic 并原子切换 active。最终新鲜一致观测通过后才终结事务，安装器最后启动 Caddy。同一安装事务的重复请求只允许返回已完成结果；其他阶段不得自动重放。
 
 初始化或切换结果不确定时必须保留原事务并 fencing。active 尚不存在时，只能显式使用 `recover --transaction <原ID> --action resume-bootstrap`：首先再次确认没有 active 或旧 SQLite，停止槽位，在业务状态层验证现有 rqlite 的受支持 schema 且没有 VM task 或生命周期 operation 后恢复初始化，不替换或清空数据库。active 已存在时拒绝该动作，使用既有 `finalize` 恢复合同重新验证原候选。安装记录只保存阶段、修订、摘要和原事务 ID，不作为角色授权来源。
+
+首次安装事务在慢速组合观测期间，通过独立的角色通道核验已授予 controller 的进程身份和完整 lease 身份，并只延长仍有效的同一 lease。进程变化、lease 到期、身份不匹配或通道失败均终止续期并进入原事务恢复，不能分配新 term 来掩盖丢失。事务结束或请求取消会停止该续期。UDS 保留 30 秒请求读取预算，响应写入上限为 9000 秒，以覆盖既有迁移事务的最长等待；metrics 监听的短超时不变。

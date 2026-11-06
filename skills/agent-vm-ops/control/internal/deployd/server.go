@@ -457,7 +457,7 @@ func ServeUDS(ctx context.Context, socket string, handler http.Handler) error {
 		}
 	}()
 	wrapped := &peerListener{Listener: listener}
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, MaxHeaderBytes: 8 * 1024, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 9000 * time.Second, MaxHeaderBytes: 8 * 1024, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 		if peer, ok := conn.(*peerConn); ok {
 			return context.WithValue(ctx, peerContextKey{}, peer)
 		}

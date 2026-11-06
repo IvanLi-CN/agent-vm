@@ -3,6 +3,7 @@ package deployd
 import (
 	"context"
 	"errors"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd/store"
 	"path/filepath"
 	"testing"
@@ -26,7 +27,7 @@ func (r *bootstrapFake) PrepareBootstrap(context.Context, string) error {
 	if r.prepareErr != nil {
 		return r.prepareErr
 	}
-	r.observations["blue"] = SlotObservation{ProcessUp: true, ProcessReady: true, Ready: true}
+	r.observations["blue"] = SlotObservation{Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, LeaseRenewalSupported: true}
 	return nil
 }
 func TestBootstrapJournalAndNoReplay(t *testing.T) {
@@ -88,4 +89,12 @@ func TestBootstrapExplicitRecoveryRetainsOriginalTransaction(t *testing.T) {
 	if err != nil || tx == nil || tx.ID != id || tx.State != "finalized" {
 		t.Fatalf("explicit recovery: %+v %v", tx, err)
 	}
+}
+
+func (r *bootstrapFake) RenewBootstrapLease(ctx context.Context, lease controllerrole.Lease) (controllerrole.Lease, error) {
+	if err := lease.Validate(time.Now(), "blue"); err != nil {
+		return lease, err
+	}
+	lease.Expiry = time.Now().Add(time.Second)
+	return lease, nil
 }
