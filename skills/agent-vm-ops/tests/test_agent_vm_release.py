@@ -820,5 +820,25 @@ class ReleasePublisherTests(unittest.TestCase):
             os.close(descriptor)
 
 
+class LocalInstallTransportTests(unittest.TestCase):
+    def test_local_adapter_keeps_fixed_privilege_boundaries_and_transaction_identity(self):
+        import agent_vm_release_wrapper as wrapper
+        with mock.patch.object(RELEASE.os, "geteuid", return_value=0), mock.patch.object(wrapper, "load_config", return_value={}) as config:
+            adapter = RELEASE.LocalInstallTransport()
+        config.assert_called_once_with()
+        with mock.patch.object(wrapper, "stage", return_value={"ok": True}) as stage:
+            adapter.wrapper("local", RELEASE.CANONICAL_REMOTE_WRAPPER, "stage", "original-tx", "release-id", b"verified-bundle")
+        stage.assert_called_once_with({}, "original-tx", "release-id", b"verified-bundle")
+        with self.assertRaises(RELEASE.ReleaseError):
+            adapter.wrapper("local", "/tmp/another-wrapper", "stage", "original-tx", "release-id")
+        with self.assertRaises(RELEASE.ReleaseError):
+            adapter.control("local", "/tmp/another-control", {})
+
+    def test_local_adapter_rejects_unprivileged_invocation(self):
+        with mock.patch.object(RELEASE.os, "geteuid", return_value=1000):
+            with self.assertRaises(RELEASE.ReleaseError):
+                RELEASE.LocalInstallTransport()
+
+
 if __name__ == "__main__":
     unittest.main()
