@@ -67,7 +67,7 @@ function evidencePayload(source: string, evidenceId: string, overrides: Record<s
 }
 
 test("blue-green deployment metadata and static validator stay pinned", () => {
-  const metadata = json("skills/agent-vm-ops/assets/blue-green/deployment-components.json");
+  const metadata = json("deploy/assets/blue-green/deployment-components.json");
   expect(metadata.caddy.version).toBe("2.11.7");
   expect(metadata.rqlite.version).toBe("10.5.2");
   expect(metadata.rqlite.supported_architectures).toEqual(["amd64", "arm64"]);
@@ -86,7 +86,7 @@ test("blue-green deployment metadata and static validator stay pinned", () => {
 });
 
 test("deployment examples keep the edge and state boundaries fail-closed", () => {
-  const caddy = read("skills/agent-vm-ops/assets/blue-green/Caddyfile.example");
+  const caddy = read("deploy/assets/blue-green/Caddyfile.example");
   expect(caddy).toContain("admin off");
   expect(caddy).toContain("\tlog default");
   expect(caddy).toContain("reverse_proxy unix//var/lib/agent-vm-native/active/app.sock");
@@ -95,36 +95,36 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(caddy).toContain("@internal path /internal/v1/*");
   expect(caddy).toContain("respond 404");
 
-  const rqlite = read("skills/agent-vm-ops/assets/systemd/agent-vm-rqlite.service");
+  const rqlite = read("deploy/assets/systemd/agent-vm-rqlite.service");
   expect(rqlite).toContain("User=agent-vm-rqlite");
   expect(rqlite).toContain("SupplementaryGroups=agent-vm-web");
   expect(rqlite).toContain("-http-addr 127.0.0.1:4001");
   expect(rqlite).toContain("-auth /etc/agent-vm-native/rqlite/auth.json");
   expect(rqlite).not.toContain("0.0.0.0");
 
-  const slot = read("skills/agent-vm-ops/assets/systemd/agent-vm-native@.service");
+  const slot = read("deploy/assets/systemd/agent-vm-native@.service");
   expect(slot).toContain("ExecStart=/var/lib/agent-vm-native/slots/%i/bin/agent-vm-control");
   expect(slot).toContain("--manifest /var/lib/agent-vm-native/slots/%i/release-manifest.json");
   expect(slot).toContain("Environment=HOME=/var/lib/agent-vm-native");
   expect(slot).not.toContain("BindReadOnlyPaths=");
-  const deployd = read("skills/agent-vm-ops/assets/systemd/agent-vm-deployd.service");
+  const deployd = read("deploy/assets/systemd/agent-vm-deployd.service");
   expect(deployd).toContain("agent-vm-deployd --config /etc/agent-vm-native/deployd.json");
   expect(deployd).toContain("ReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native");
   expect(deployd).not.toContain("Requires=agent-vm-rqlite.service");
   expect(deployd).not.toContain("RuntimeDirectory=agent-vm-native");
   expect(deployd).not.toContain("Wants=agent-vm-native@blue.service agent-vm-native@green.service");
   expect(deployd).not.toContain("After=agent-vm-native@blue.service agent-vm-native@green.service");
-  const deploydConfig = json("skills/agent-vm-ops/assets/deployd.json.example");
+  const deploydConfig = json("deploy/assets/deployd.json.example");
   expect(deploydConfig.migration.legacy_unit).toBe("agent-vm-native.service");
   expect(deploydConfig.migration.rqlite_unit).toBe("agent-vm-rqlite.service");
   expect(deploydConfig.migration.rqlite_url).toBe("https://127.0.0.1:4001");
   expect(deploydConfig.migration.rqlite_ca_file).toBe("/etc/agent-vm-native/tls/rqlite/server.crt");
   expect(deploydConfig.migration.rqlite_auth_file).toBe("/etc/agent-vm-native/rqlite/auth.json");
-  const caddyUnit = read("skills/agent-vm-ops/assets/systemd/agent-vm-caddy.service");
+  const caddyUnit = read("deploy/assets/systemd/agent-vm-caddy.service");
   expect(caddyUnit).toContain("User=caddy");
   expect(caddyUnit).toContain("ConditionPathExists=/var/lib/agent-vm-native/active/app.sock");
   expect(caddyUnit).toContain("ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock");
-  const sysusers = read("skills/agent-vm-ops/assets/sysusers.d/agent-vm-native.conf");
+  const sysusers = read("deploy/assets/sysusers.d/agent-vm-native.conf");
   expect(sysusers).toContain("u caddy");
 });
 

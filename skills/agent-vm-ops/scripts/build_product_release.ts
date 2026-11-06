@@ -77,8 +77,8 @@ function compareDeterministically(left: string, right: string): number {
 
 function sourcePath(relative: string, binaryPaths: Record<string, string>): string {
   if (relative === "agent_vm_control_bridge.ts") return join(import.meta.dir, relative);
-	if (relative.startsWith("systemd/")) return join(operationsRoot, "assets", relative);
-	if (relative === "config/agent-vm-web.json.example") return join(operationsRoot, "assets", "web.json.example");
+	if (relative.startsWith("systemd/")) return join(repositoryRoot, "deploy", "assets", relative);
+	if (relative === "config/agent-vm-web.json.example") return join(repositoryRoot, "deploy", "assets", "web.json.example");
 	if (relative === "web-assets.manifest.json") return webAssetsManifestPath;
   if (relative === "bin/agent-vm-control") return binaryPaths.control;
   if (relative === "bin/agent-vm-deployd") return binaryPaths.deployd;

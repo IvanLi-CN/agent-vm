@@ -4,7 +4,7 @@ import { readFileSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const repositoryRoot = resolve(import.meta.dir, "../../..");
-const assetsRoot = join(repositoryRoot, "skills/agent-vm-ops/assets");
+const assetsRoot = join(repositoryRoot, "deploy/assets");
 const blueGreenRoot = join(assetsRoot, "blue-green");
 const errors: string[] = [];
 const checks: string[] = [];

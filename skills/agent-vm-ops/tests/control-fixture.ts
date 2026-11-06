@@ -651,7 +651,7 @@ export class NativeCommands extends CommandRunner {
     if (path === "/1.0/network-acls/agent-vm-isolation") {
       return parse_json(
         readFileSync(
-          new URL("../assets/network-acl.json", import.meta.url),
+          new URL("../../../deploy/assets/network-acl.json", import.meta.url),
         ),
       );
     }

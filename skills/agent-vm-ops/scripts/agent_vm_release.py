@@ -128,10 +128,10 @@ SOURCE_ARTIFACTS = (
         (name, f"skills/{'agent-vm' if name in CLIENT_DEPENDENCY_MODES else 'agent-vm-ops'}/scripts/{name}", "support", SUPPORT_ARTIFACT_MODES[name])
         for name in sorted(SUPPORT_ARTIFACT_NAMES)
     ),
-    ("systemd/agent-vm-native-age-gc.service", "skills/agent-vm-ops/assets/systemd/agent-vm-native-age-gc.service", "unit", 0o644),
-    ("systemd/agent-vm-native-age-gc.timer", "skills/agent-vm-ops/assets/systemd/agent-vm-native-age-gc.timer", "unit", 0o644),
-    ("systemd/agent-vm-native-expire@.service", "skills/agent-vm-ops/assets/systemd/agent-vm-native-expire@.service", "unit", 0o644),
-    ("systemd/agent-vm-native-reconcile.service", "skills/agent-vm-ops/assets/systemd/agent-vm-native-reconcile.service", "unit", 0o644),
+    ("systemd/agent-vm-native-age-gc.service", "deploy/assets/systemd/agent-vm-native-age-gc.service", "unit", 0o644),
+    ("systemd/agent-vm-native-age-gc.timer", "deploy/assets/systemd/agent-vm-native-age-gc.timer", "unit", 0o644),
+    ("systemd/agent-vm-native-expire@.service", "deploy/assets/systemd/agent-vm-native-expire@.service", "unit", 0o644),
+    ("systemd/agent-vm-native-reconcile.service", "deploy/assets/systemd/agent-vm-native-reconcile.service", "unit", 0o644),
 )
 
 

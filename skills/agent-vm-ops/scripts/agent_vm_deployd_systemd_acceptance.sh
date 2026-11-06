@@ -266,9 +266,9 @@ cat > /etc/agent-vm-native/deployd.json <<EOF
 }
 EOF
 
-cp -- "$repository_root/skills/agent-vm-ops/assets/systemd/agent-vm-native@.service" \
+cp -- "$repository_root/deploy/assets/systemd/agent-vm-native@.service" \
   /etc/systemd/system/agent-vm-native@.service
-cp -- "$repository_root/skills/agent-vm-ops/assets/systemd/agent-vm-deployd.service" \
+cp -- "$repository_root/deploy/assets/systemd/agent-vm-deployd.service" \
   /etc/systemd/system/agent-vm-deployd.service
 sleep_binary="$(command -v sleep)"
 cat >/etc/systemd/system/agent-vm-rqlite.service <<EOF

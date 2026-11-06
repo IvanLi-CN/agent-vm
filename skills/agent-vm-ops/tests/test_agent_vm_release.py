@@ -199,7 +199,7 @@ class ReleasePublisherTests(unittest.TestCase):
                     continue
                 destination = root / path
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                source = ROOT / "skills/agent-vm-ops/assets" / path
+                source = ROOT / "deploy/assets" / path
                 destination.write_bytes(source.read_bytes())
                 destination.chmod(mode)
                 unit_artifacts.append({"name": name, "path": path, "role": role, "mode": mode})

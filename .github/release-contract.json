@@ -46,7 +46,7 @@
     "targets": ["linux/amd64", "linux/arm64"]
   },
   "deployment_artifacts": {
-    "metadata": "skills/agent-vm-ops/assets/blue-green/deployment-components.json",
+    "metadata": "deploy/assets/blue-green/deployment-components.json",
     "automatic_install": false,
     "components": [
       {

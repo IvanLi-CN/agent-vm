@@ -1767,7 +1767,7 @@ describe("release-manifest: identity, integrity and compatibility", () => {
       Manifest.UNIT_CONTENT_SHA256,
     )) {
       const path = fileURLToPath(new URL(
-        `../assets/systemd/${name}`,
+        `../../../deploy/assets/systemd/${name}`,
         import.meta.url,
       ));
       const content = readFileSync(path, "utf8");

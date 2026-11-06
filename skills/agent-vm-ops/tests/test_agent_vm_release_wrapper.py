@@ -1031,7 +1031,7 @@ class WrapperTests(unittest.TestCase):
         )
         self.assertEqual(
             (Path(self.loaded["control_path"]).parent / "systemd" / "agent-vm-native.service").read_bytes(),
-            (ROOT / "skills/agent-vm-ops/assets/systemd/agent-vm-native.service").read_bytes(),
+            (ROOT / "deploy/assets/systemd/agent-vm-native.service").read_bytes(),
         )
         self.assertTrue((unit_dir / "agent-vm-native.service").is_file())
         for name in MANIFEST.GO_RETIRED_UNITS:
@@ -1041,7 +1041,7 @@ class WrapperTests(unittest.TestCase):
         root = self.root / "historical-product"
         unit = root / "systemd/agent-vm-deployd.service"
         unit.parent.mkdir(parents=True)
-        current = (ROOT / "skills/agent-vm-ops/assets/systemd/agent-vm-deployd.service").read_bytes()
+        current = (ROOT / "deploy/assets/systemd/agent-vm-deployd.service").read_bytes()
         historical = current.replace(
             b"After=local-fs.target\n",
             b"After=local-fs.target\nWants=agent-vm-native@blue.service agent-vm-native@green.service\n",

@@ -73,7 +73,7 @@ caddy_config="$proof_dir/Caddyfile"
 sed \
   -e "s#/etc/agent-vm-native/tls/caddy/server.crt#$ca_dir/caddy/server.crt#g" \
   -e "s#/etc/agent-vm-native/tls/caddy/server.key#$ca_dir/caddy/server.key#g" \
-  "$repository_root/skills/agent-vm-ops/assets/blue-green/Caddyfile.example" >"$caddy_config"
+  "$repository_root/deploy/assets/blue-green/Caddyfile.example" >"$caddy_config"
 AGENT_VM_DOMAIN="localhost:8443" "$caddy_binary" validate --config "$caddy_config" --adapter caddyfile >"$proof_dir/caddy-validate.json" 2>&1
 
 backend_socket="$proof_dir/backend.sock"
@@ -146,7 +146,7 @@ kill -TERM "$backend_pid" 2>/dev/null || true
 wait "$backend_pid" 2>/dev/null || true
 backend_pid=""
 
-unit_dir="$repository_root/skills/agent-vm-ops/assets/systemd"
+unit_dir="$repository_root/deploy/assets/systemd"
 systemd_root="$proof_dir/systemd-root"
 mkdir -p -- \
   "$systemd_root/etc/systemd/system" \
