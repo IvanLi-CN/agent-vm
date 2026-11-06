@@ -962,6 +962,47 @@ func (r *remoteBackend) query(ctx context.Context, statement string) (remoteResu
 	return result.Results[0], nil
 }
 
+// queryBatch keeps strong consistency while avoiding a separate Raft round
+// trip per table. Request-level transactions give the batch one database view;
+// syncLocked still fences the schema/data load with both authority epochs.
+func (r *remoteBackend) queryBatch(ctx context.Context, statements []string) ([]remoteResult, error) {
+	if len(statements) == 0 {
+		return nil, nil
+	}
+	body, err := json.Marshal(statements)
+	if err != nil {
+		return nil, err
+	}
+	response, err := r.do(ctx, http.MethodPost, "/db/query", url.Values{"level": {"strong"}, "transaction": {""}}, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	defer response.Close()
+	result, err := decodeRemoteResponse(response, "rqlite query batch")
+	if err != nil {
+		return nil, err
+	}
+	if message := remoteResponseError(result); message != "" {
+		return nil, errors.New(message)
+	}
+	if len(result.Results) != len(statements) {
+		return nil, fmt.Errorf("rqlite query batch returned %d results, want %d", len(result.Results), len(statements))
+	}
+	for index := range result.Results {
+		item := &result.Results[index]
+		if message := remoteResultError(*item); message != "" {
+			return nil, &remoteStatementError{Index: index, Message: message}
+		}
+		if err := validateRemoteQueryResult(*item); err != nil {
+			return nil, fmt.Errorf("rqlite query batch result %d: %w", index, err)
+		}
+		if item.Values == nil {
+			item.Values = [][]any{}
+		}
+	}
+	return result.Results, nil
+}
+
 func validateRemoteQueryResult(result remoteResult) error {
 	if result.Columns == nil || result.Types == nil {
 		return errors.New("rqlite query result is missing columns or types")
@@ -1216,8 +1257,22 @@ func (r *remoteBackend) rebuildMirror(ctx context.Context, objects []remoteSchem
 	if err != nil {
 		return err
 	}
-	for _, table := range orderedTables(objects) {
-		if err := r.loadTable(ctx, loadTx, table); err != nil {
+	tables := orderedTables(objects)
+	queries := make([]string, len(tables))
+	for index, table := range tables {
+		columns := "*"
+		if table == "operations" {
+			columns = "rowid, *"
+		}
+		queries[index] = "SELECT " + columns + " FROM " + quoteIdentifier(table) + " ORDER BY rowid"
+	}
+	results, err := r.queryBatch(ctx, queries)
+	if err != nil {
+		_ = loadTx.Rollback()
+		return err
+	}
+	for index, table := range tables {
+		if err := loadTableResult(ctx, loadTx, table, results[index]); err != nil {
 			_ = loadTx.Rollback()
 			return err
 		}
@@ -1271,23 +1326,17 @@ func orderedTables(objects []remoteSchemaObject) []string {
 	return values
 }
 
-func (r *remoteBackend) loadTable(ctx context.Context, transaction *sql.Tx, table string) error {
+func loadTableResult(ctx context.Context, transaction *sql.Tx, table string, result remoteResult) error {
 	columns, err := tableColumns(ctx, transaction, table)
 	if err != nil {
 		return err
 	}
-	selectColumns := "*"
 	insertColumns := make([]string, 0, len(columns)+1)
 	if table == "operations" {
-		selectColumns = "rowid, *"
 		insertColumns = append(insertColumns, "rowid")
 	}
 	for _, column := range columns {
 		insertColumns = append(insertColumns, column.Name)
-	}
-	result, err := r.query(ctx, "SELECT "+selectColumns+" FROM "+quoteIdentifier(table)+" ORDER BY rowid")
-	if err != nil {
-		return err
 	}
 	if len(result.Values) == 0 {
 		return nil
