@@ -130,6 +130,30 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 	if !json.Valid(snapshot) {
 		t.Fatal("snapshot response is not JSON")
 	}
+	before, err := store.StateEpoch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	combined, err := client.Get("http://unix/internal/v1/deployment-observation")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var combinedEnvelope struct {
+		OK       bool                      `json:"ok"`
+		Protocol int                       `json:"protocol"`
+		Result   map[string]map[string]any `json:"result"`
+	}
+	err = json.NewDecoder(combined.Body).Decode(&combinedEnvelope)
+	combined.Body.Close()
+	if err != nil || combined.StatusCode != http.StatusOK || !combinedEnvelope.OK || combinedEnvelope.Protocol != 4 {
+		t.Fatalf("combined observation: status=%d value=%+v err=%v", combined.StatusCode, combinedEnvelope, err)
+	}
+	if len(combinedEnvelope.Result) != 3 || combinedEnvelope.Result["capacity"]["observation_epoch"] != before || combinedEnvelope.Result["health"]["state_epoch"] != before || combinedEnvelope.Result["inventory"]["observation_consistent"] != true {
+		t.Fatalf("combined state view was not coherent: %+v", combinedEnvelope.Result)
+	}
+	if after, err := store.StateEpoch(context.Background()); err != nil || after != before {
+		t.Fatalf("observation mutated state: %s -> %s, %v", before, after, err)
+	}
 
 	cancel()
 	select {

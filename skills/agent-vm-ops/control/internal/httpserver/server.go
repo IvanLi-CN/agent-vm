@@ -99,6 +99,7 @@ func (s *Server) Handler() http.Handler {
 	router.POST("/internal/v1/controller-role", s.controllerRole)
 	router.POST("/internal/v1/traffic-role", s.trafficRole)
 	router.GET("/internal/v1/health", s.health)
+	router.GET("/internal/v1/deployment-observation", s.deploymentObservation)
 	router.GET("/internal/v1/snapshots/:source", s.snapshot)
 	router.NoRoute(func(c *gin.Context) {
 		if s.App != nil {
@@ -108,6 +109,17 @@ func (s *Server) Handler() http.Handler {
 		c.Status(http.StatusNotFound)
 	})
 	return router
+}
+
+func (s *Server) deploymentObservation(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 8*time.Second)
+	defer cancel()
+	value, err := s.Service.DeploymentObservation(ctx)
+	if err != nil {
+		writeError(c, err, nil)
+		return
+	}
+	c.JSON(http.StatusOK, map[string]any{"ok": true, "protocol": protocol.Version, "result": value})
 }
 
 func (s *Server) control(c *gin.Context) {

@@ -34,6 +34,32 @@ func TestMetricsRemainsAvailableDuringNativeMutation(t *testing.T) {
 	}
 }
 
+func TestDeploymentObservationDoesNotSealOrMutateReleaseDrain(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	service := New(store, config.Defaults(), Options{})
+	ctx := context.Background()
+	if _, err := service.drain(ctx, true, protocol.Request{"session_id": "release-owner"}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.StateEpoch(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.DeploymentObservation(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if sealed, _, err := store.Meta(ctx, "drain_sealed"); err != nil || sealed == "1" {
+		t.Fatalf("read-only observation sealed release: %q %v", sealed, err)
+	}
+	if after, err := store.StateEpoch(ctx); err != nil || before != after {
+		t.Fatalf("observation changed state: %s -> %s %v", before, after, err)
+	}
+}
+
 func TestReleaseSealRequiresUnlockedCurrentDrain(t *testing.T) {
 	for _, scenario := range []string{"busy", "changed-epoch", "owner-exited", "quiescent"} {
 		t.Run(scenario, func(t *testing.T) {

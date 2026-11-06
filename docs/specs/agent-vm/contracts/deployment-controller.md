@@ -257,3 +257,5 @@ Deployd 随后验证初始 standby 的 release、状态能力和进程身份，�
 `recover finalize` 在重新授予 controller lease 前要求目标进程就绪、观测新鲜一致且发布身份和状态能力已验证，不要求依赖 controller role 的业务就绪。授予新 lease 后必须完成 startup reconciliation 并验证业务就绪，才能开放 traffic；fenced 槽位的业务未就绪不能形成恢复授权的循环依赖。
 
 恢复路径重新验证原事务包及目标实际进程后，在业务就绪和最终组合观测期间使用与首次安装相同的 lease 身份连续性检查。blue 和 green 均适用；任何失败先停止事务内续租，再保存证据并 fencing，不能因事务锁阻止常规协调而让恢复中的 lease 自行耗尽。
+
+槽位通过受保护 UDS 的只读 `GET /internal/v1/deployment-observation` 一次返回 capacity、inventory 和 health。三类观测在同一个业务状态只读事务中生成；rqlite 权威同步一次后，进程内镜像在读取期间保持同一视图。该路径不授予角色、不封存 drain、不写业务状态，也不对外暴露指标。八秒内无法完成时整组失败，不能拼接部分成功的结果。Deployd 仍验证每类结果、时间戳、状态纪元和完整性，再发布已完成快照；旧槽位明确返回 404 或 405 时保留原采样兼容路径，其他错误不能降级为成功。

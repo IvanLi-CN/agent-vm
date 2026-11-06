@@ -3752,7 +3752,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				return nil, s.sqliteError(drainErr)
 			}
 			if initialConsistent && len(pendingOperations) == 0 && states[stateClosing] == 0 && states[stateDeleting] == 0 && states[stateFailed] == 0 {
-				if releaseDrain {
+				if releaseDrain && ctx.Value(deploymentObservationKey{}) != true {
 					if err := s.trySealReleaseDrain(ctx, epoch); err != nil {
 						return nil, err
 					}

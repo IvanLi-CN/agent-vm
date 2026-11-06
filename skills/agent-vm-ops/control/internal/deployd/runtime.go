@@ -169,7 +169,28 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			runtime.quiesced[slot] = quiescenceEvidence{}
 		}
 		runtime.mu.Unlock()
-		metrics, metricsAt, metricsErr := runtime.observeSource(ctx, slot, "capacity", "admin-metrics")
+		bundle, bundleErr := runtime.observeSlotSources(ctx, slot)
+		readSource := func(source, action string) (map[string]any, time.Time, error) {
+			if bundleErr != nil {
+				return nil, time.Time{}, bundleErr
+			}
+			if bundle == nil {
+				return runtime.observeSource(ctx, slot, source, action)
+			}
+			value, ok := bundle[source].(map[string]any)
+			if !ok {
+				return nil, time.Time{}, errors.New("deployment observation lane missing")
+			}
+			if err := validateSourceResult(action, value); err != nil {
+				return nil, time.Time{}, err
+			}
+			at, ok := validObservedAt(value["observed_at"], time.Now().UTC())
+			if !ok {
+				return nil, time.Time{}, errors.New("deployment observation timestamp invalid")
+			}
+			return value, at, nil
+		}
+		metrics, metricsAt, metricsErr := readSource("capacity", "admin-metrics")
 		if metricsErr == nil {
 			inFlight, inFlightOK := integerValue(metrics["in_flight_operations"])
 			pending, pendingOK := arrayLengthValue(metrics["pending_operations"])
@@ -192,7 +213,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			runtime.invalidateMetrics(slot, "capacity")
 			snapshot.Consistent = false
 		}
-		inventory, inventoryAt, inventoryErr := runtime.observeSource(ctx, slot, "inventory", "admin-status")
+		inventory, inventoryAt, inventoryErr := readSource("inventory", "admin-status")
 		if inventoryErr != nil {
 			inventoryObservationUp = false
 			runtime.invalidateMetrics(slot, "inventory")
@@ -217,7 +238,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 				runtime.invalidateMetrics(slot, "inventory")
 			}
 		}
-		doctor, doctorAt, doctorErr := runtime.observeSource(ctx, slot, "health", "doctor")
+		doctor, doctorAt, doctorErr := readSource("health", "doctor")
 		if doctorErr != nil {
 			nativeObservationUp = false
 			runtime.invalidateMetrics(slot, "health")
@@ -1383,6 +1404,25 @@ func (runtime *HostRuntime) control(ctx context.Context, socket string, request 
 		return nil, status, errors.New("slot control response result is missing")
 	}
 	return body, status, nil
+}
+
+func (runtime *HostRuntime) observeSlotSources(ctx context.Context, slot string) (map[string]any, error) {
+	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/deployment-observation", nil)
+	if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	version, ok := integerValue(body["protocol"])
+	if status != http.StatusOK || !responseOK(body) || !ok || version != 4 {
+		return nil, errors.New("deployment observation envelope invalid")
+	}
+	result, ok := body["result"].(map[string]any)
+	if !ok {
+		return nil, errors.New("deployment observation result missing")
+	}
+	return result, nil
 }
 
 func (runtime *HostRuntime) observeSource(ctx context.Context, slot, source, action string) (map[string]any, time.Time, error) {
