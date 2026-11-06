@@ -1067,7 +1067,7 @@ func (s *Store) RecordOperation(ctx context.Context, operationID, action string,
 					return err
 				}
 			}
-			for _, evidenceKey := range []string{"_worker_recovery_evidence", "_worker_rearm_recovery_evidence"} {
+			for _, evidenceKey := range []string{"_worker_recovery_evidence", "_worker_rearm_recovery_evidence", "_recovery_attempts"} {
 				if evidence, exists := current.Response[evidenceKey]; exists {
 					if incoming, supplied := response[evidenceKey]; supplied {
 						previousJSON, previousErr := json.Marshal(evidence)

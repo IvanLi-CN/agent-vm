@@ -1532,8 +1532,19 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 			return nil, s.sqliteError(err)
 		}
 		if existing != nil {
-			finishActive()
-			return s.replayRecord(request, existing, warnings)
+			_, hasWorker := existing.Response["worker"]
+			resumeDrain := action == "drain-exit" && leaseExempt && !hasWorker && stringValue(existing.Response["outcome"]) == "pending" && operationIdentityMatches(existing, request) && stringValue(existing.Response["_request_digest"]) == digest && strings.HasPrefix(stringValue(request["session_id"]), "release-")
+			if !resumeDrain {
+				finishActive()
+				return s.replayRecord(request, existing, warnings)
+			}
+			// The cross-process drain resource lock is held. This exact
+			// administrative intent has no native effects and retains the
+			// original identity; drain ownership is revalidated by dispatch.
+			if err := s.commitMutationContext(ctx, func() error { return s.Store.MarkOperationRecoveryAttempt(ctx, operationID) }); err != nil {
+				finishActive()
+				return nil, s.sqliteError(err)
+			}
 		}
 		defer finishActive()
 		ctx = native.WithWorkerRecorder(ctx, operationID, s)

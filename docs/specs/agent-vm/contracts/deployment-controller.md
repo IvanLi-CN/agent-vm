@@ -269,3 +269,5 @@ Deployd 随后验证初始 standby 的 release、状态能力和进程身份，�
 槽位健康观测提供 `state_authority`，其值为去除凭据后的业务后端配置指纹；它不是数据库内容标识。Deployd 验证候选时比较双方指纹与状态能力，并将指纹写入部署阶段证据；激活、恢复和回滚继续绑定该证据。`state_epoch` 仅证明单次快照内的一致性，不能作为跨时刻后端身份。没有指纹的旧阶段证据不得授权角色转换。正常蓝绿部署仍禁止数据库替换。
 
 Incus 项目级共享 `incus_*` 指标由槽位只读采样，Deployd 只输出活动槽位的新鲜一份，保留原生标签且不附加 `slot`；槽位级 `agent_vm_*` 指标继续附加 `slot`。`agent_vm_incus_metrics_up` 标明各槽位该采样是否成功，失败或过期不得补造容器指标，Prometheus 不增加第二个 target。
+
+回滚遇到原 Deployd 的未完成 `drain-exit` 时，仅在两个槽位的 controller 与 traffic 均已 fencing、没有在途操作、全部待处理记录都是 Deployd 的零代 metadata drain-exit 时，才可通过业务 API 重放原 operation ID。业务服务再次校验原请求摘要、不可变身份、无 native worker 标记及 drain 所有权，保留恢复尝试证据；随后重新进入 drain 并证明 quiescence。未知记录、native mutation 或其他所有者仍保持 `needs_recovery`，Deployd 不直接修改业务数据库。drain 控制请求使用既有 240 秒控制请求预算；健康、角色与指标请求仍使用短超时。

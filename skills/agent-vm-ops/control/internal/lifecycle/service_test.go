@@ -6418,3 +6418,74 @@ func TestWorkerJournalSurvivesCommitQueueAndCanceledAction(t *testing.T) {
 		t.Fatalf("worker identity lost: %#v", worker)
 	}
 }
+
+func TestPendingReleaseDrainExitReplaysOnlyExactMetadataIntent(t *testing.T) {
+	for _, scenario := range []string{"recover", "bad-digest", "worker-marker", "wrong-owner", "different-request"} {
+		t.Run(scenario, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			service := New(store, config.Defaults(), Options{})
+			service.SetMutationGate(func() bool { return false })
+			service.SetTrafficAccepting(false)
+			session := "release-agent-vm-deployd"
+			generation := int64(0)
+			owner := session
+			if scenario == "wrong-owner" {
+				owner = "release-other"
+			}
+			for key, value := range map[string]string{"draining": "1", "drain_owner": owner} {
+				if err := store.SetMeta(ctx, key, value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			req := protocol.Request{"protocol": protocol.Version, "action": "drain-exit", "session_id": session, "operation_id": "deployd-drain-exit-original", "generation": generation, "preserve_traffic": true}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "bad-digest" {
+				digest = "wrong"
+			}
+			pending := map[string]any{"outcome": "pending", "_request_digest": digest, "_request": map[string]any(req)}
+			if scenario == "worker-marker" {
+				pending["worker"] = map[string]any{}
+			}
+			if err := store.RecordOperation(ctx, stringValue(req["operation_id"]), "drain-exit", &session, &generation, pending); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "different-request" {
+				req["preserve_traffic"] = false
+			}
+			result, err := service.Dispatch(ctx, req)
+			if scenario == "recover" {
+				if err != nil || result["ok"] != true {
+					t.Fatalf("recovery: result=%v err=%v", result, err)
+				}
+				if value, _, err := store.Meta(ctx, "draining"); err != nil || value != "0" {
+					t.Fatalf("drain=%s err=%v", value, err)
+				}
+				op, err := store.GetOperation(ctx, stringValue(req["operation_id"]))
+				if err != nil || op.Response["outcome"] != "success" || recoveryAttempts(op.Response) != 1 {
+					t.Fatalf("recovery evidence=%v err=%v", op, err)
+				}
+				if _, err := service.Dispatch(ctx, req); err != nil {
+					t.Fatalf("finished replay: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("unsafe replay accepted: %v", result)
+				}
+				if value, _, err := store.Meta(ctx, "draining"); err != nil || value != "1" {
+					t.Fatalf("changed fenced drain=%s err=%v", value, err)
+				}
+			}
+			if service.TrafficAccepting() {
+				t.Fatal("metadata recovery opened slot traffic")
+			}
+		})
+	}
+}

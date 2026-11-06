@@ -1110,6 +1110,21 @@ func (runtime *HostRuntime) ExitDrain(ctx context.Context, slot string) error {
 	if slot == "" || slot == "none" {
 		return nil
 	}
+	body, _, checkErr := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-status"})
+	if checkErr != nil {
+		return checkErr
+	}
+	result, validResult := body["result"].(map[string]any)
+	draining, validDraining := result["draining"].(bool)
+	if !validResult || !validDraining {
+		return errors.New("drain state was not verified")
+	}
+	if !draining {
+		runtime.mu.Lock()
+		runtime.quiesced[slot] = quiescenceEvidence{}
+		runtime.mu.Unlock()
+		return nil
+	}
 	_, status, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-exit", "session_id": deploydDrainSession, "operation_id": "deployd-drain-exit-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0), "preserve_traffic": true})
 	if err != nil {
 		return err
@@ -1255,6 +1270,9 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 				return fmt.Errorf("revoke target controller: %w; stop target after revoke failure: %v", err, stopErr)
 			}
 		} else {
+			if err := runtime.resumeRollbackDrainExit(ctx, target); err != nil {
+				return err
+			}
 			if err := runtime.Drain(ctx, target); err != nil {
 				return err
 			}
@@ -1281,6 +1299,14 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 		if err != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) || body["process_ready"] != true || observedAuthority != authority || authority == "" {
 			return errors.New("rollback state authority was not verified before granting controller")
 		}
+		process, processOK := processIdentityFromHealth(body)
+		if !processOK {
+			return errors.New("rollback process identity is invalid")
+		}
+		runtime.mu.Lock()
+		runtime.stagedProcess[previous] = process
+		runtime.mu.Unlock()
+		lease.Expiry = time.Now().Add(runtime.Config.LeaseDuration())
 		if err := runtime.GrantController(ctx, previous, lease); err != nil {
 			return err
 		}
@@ -1392,6 +1418,23 @@ func (runtime *HostRuntime) activeSlot() (string, error) {
 }
 
 func (runtime *HostRuntime) control(ctx context.Context, socket string, request map[string]any) (map[string]any, int, error) {
+	action, _ := request["action"].(string)
+	if (action == "drain-enter" || action == "drain-exit") && ctx.Value(transactionRenewalKey{}) != true {
+		lease, owned, err := runtime.CurrentOwnedControllerLease(ctx)
+		if err != nil {
+			return nil, 0, err
+		}
+		if owned {
+			manager := NewManager(nil, runtime, runtime.Config.LeaseDuration(), time.Now)
+			renewalCtx, stop := manager.beginTransactionRenewal(ctx, lease)
+			body, status, err := runtime.controlOnce(renewalCtx, socket, request)
+			return body, status, errors.Join(err, stop())
+		}
+	}
+	return runtime.controlOnce(ctx, socket, request)
+}
+
+func (runtime *HostRuntime) controlOnce(ctx context.Context, socket string, request map[string]any) (map[string]any, int, error) {
 	body, status, err := runtime.slotRequest(ctx, socket, http.MethodPost, "/internal/v1/control", request)
 	if err != nil {
 		return nil, status, err
@@ -1584,7 +1627,13 @@ func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, pat
 	if value != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	response, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Do(request)
+	timeout := 10 * time.Second
+	if path == "/internal/v1/control" {
+		if input, ok := value.(map[string]any); ok && (input["action"] == "drain-enter" || input["action"] == "drain-exit") {
+			timeout = 240 * time.Second
+		}
+	}
+	response, err := (&http.Client{Transport: transport, Timeout: timeout}).Do(request)
 	if err != nil {
 		return nil, 0, err
 	}

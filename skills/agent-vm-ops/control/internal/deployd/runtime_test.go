@@ -489,3 +489,104 @@ func TestInventoryRetriesConcurrentMaintenanceCommit(t *testing.T) {
 		})
 	}
 }
+
+func TestExitDrainDoesNotWriteWhenAdmissionIsAlreadyOpen(t *testing.T) {
+	directory, err := os.MkdirTemp("", "avm-drain-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	socket := filepath.Join(directory, "app.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var input map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			t.Error(err)
+			return
+		}
+		if input["action"] != "drain-status" {
+			t.Errorf("already-open admission caused mutation: %v", input["action"])
+			w.WriteHeader(500)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "action": "drain-status", "result": map[string]any{"draining": false}})
+	}))
+	server.Listener.Close()
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+	runtime := NewHostRuntime(Config{BlueSocket: socket})
+	if err := runtime.ExitDrain(context.Background(), "blue"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRollbackDrainRecoveryRejectsUnprovenIntentAndLiveRoles(t *testing.T) {
+	for _, scenario := range []string{"recover", "native-action", "wrong-owner", "wrong-id", "wrong-generation", "in-flight", "controller-live", "traffic-live", "mixed"} {
+		t.Run(scenario, func(t *testing.T) {
+			directory, err := os.MkdirTemp("", "avm-drain-resume-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(directory)
+			socket := filepath.Join(directory, "app.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row := map[string]any{"action": "drain-exit", "session_id": deploydDrainSession, "operation_id": "deployd-drain-exit-original", "generation": 0}
+			switch scenario {
+			case "native-action":
+				row["action"] = "destroy"
+			case "wrong-owner":
+				row["session_id"] = "release-other"
+			case "wrong-id":
+				row["operation_id"] = "foreign"
+			case "wrong-generation":
+				row["generation"] = 1
+			}
+			pending := []any{row}
+			if scenario == "mixed" {
+				pending = append(pending, map[string]any{"action": "destroy"})
+			}
+			writes := 0
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "process_ready": true, "ready": false, "controller_owned": scenario == "controller-live", "traffic_accepting": scenario == "traffic-live", "process_id": 123, "process_start_time": "1"})
+					return
+				}
+				var request map[string]any
+				json.NewDecoder(r.Body).Decode(&request)
+				if request["action"] == "admin-metrics" {
+					flight := 0
+					if scenario == "in-flight" {
+						flight = 1
+					}
+					json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "action": "admin-metrics", "result": map[string]any{"pending_operations": pending, "in_flight_operations": flight}})
+					return
+				}
+				writes++
+				if request["operation_id"] != "deployd-drain-exit-original" || request["preserve_traffic"] != true {
+					t.Errorf("wrong replay: %v", request)
+				}
+				json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "action": request["action"], "result": map[string]any{}})
+			}))
+			server.Listener.Close()
+			server.Listener = listener
+			server.Start()
+			defer server.Close()
+			runtime := NewHostRuntime(Config{BlueSocket: socket, GreenSocket: socket})
+			err = runtime.resumeRollbackDrainExit(context.Background(), "green")
+			if scenario == "recover" {
+				if err != nil || writes != 1 {
+					t.Fatalf("recovery writes=%d err=%v", writes, err)
+				}
+			} else if err == nil || writes != 0 {
+				t.Fatalf("unsafe resume writes=%d err=%v", writes, err)
+			}
+		})
+	}
+}
