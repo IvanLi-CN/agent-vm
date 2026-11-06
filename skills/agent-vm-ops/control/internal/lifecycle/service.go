@@ -1961,7 +1961,7 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 
 func supersedableOperation(action string) bool {
 	switch action {
-	case "acquire", "renew", "resize", "restart":
+	case "acquire", "renew", "resize", "restart", "release":
 		return true
 	default:
 		return false

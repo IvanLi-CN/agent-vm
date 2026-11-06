@@ -5903,7 +5903,7 @@ func (guest *quiescentStartupGuest) VerifyRecoveryQuiescence(context.Context) er
 }
 
 func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
-	for _, action := range []string{"acquire", "renew", "resize", "restart"} {
+	for _, action := range []string{"acquire", "renew", "resize", "restart", "release"} {
 		t.Run(action, func(t *testing.T) {
 			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 			if err != nil {
@@ -6016,92 +6016,96 @@ func TestPendingRenewWithoutLaterLeaseEvidenceRemainsBlocked(t *testing.T) {
 }
 
 func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
-	for _, mode := range []string{"native-busy", "worker-missing", "no-witness", "wrong-session", "wrong-task", "missing-lease", "unverified-cache", "other-pending", "active", "late-worker", "bad-witness-digest", "bound-task-mismatch"} {
-		t.Run(mode, func(t *testing.T) {
-			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer store.Close()
-			ctx := context.Background()
-			session, generation := "superseded-negative-"+mode, int64(1)
-			now := nowString(time.Now())
-			task := state.Task{TaskID: "task", SessionID: session, Generation: generation, State: stateCached, InstanceName: "instance", CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
-			if err := store.InsertTask(ctx, task); err != nil {
-				t.Fatal(err)
-			}
-			req := protocol.Request{"protocol": protocol.Version, "action": "restart", "session_id": session, "generation": generation, "operation_id": "original"}
-			digest, err := protocol.Digest(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			worker := map[string]any{"state": "exited", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "finished_at": nowString(time.Now())}
-			if mode == "worker-missing" {
-				delete(worker, "process_group")
-			}
-			if mode == "late-worker" {
-				worker["finished_at"] = nowString(time.Now().Add(time.Hour))
-			}
-			originalResponse := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": worker}
-			if mode == "bound-task-mismatch" {
-				originalResponse["_task_id"] = "different"
-			}
-			if err := store.RecordOperation(ctx, "original", "restart", &session, &generation, originalResponse); err != nil {
-				t.Fatal(err)
-			}
-			if mode != "no-witness" {
-				laterReq := protocol.Request{"protocol": protocol.Version, "action": "release", "session_id": session, "generation": generation, "operation_id": "later"}
-				result := map[string]any{"task_id": task.TaskID, "session_id": session, "generation": generation, "state": stateCached, "effective_lease": false}
-				if mode == "wrong-session" {
-					result["session_id"] = "different"
-				}
-				if mode == "wrong-task" {
-					result["task_id"] = "different"
-				}
-				if mode == "missing-lease" {
-					delete(result, "effective_lease")
-				}
-				later := protocol.SuccessWithRelease(laterReq, result, nil, nil)
-				laterDigest, err := protocol.Digest(laterReq)
-				if err != nil {
-					t.Fatal(err)
-				}
-				later["_request_digest"] = laterDigest
-				if mode == "bad-witness-digest" {
-					later["_request_digest"] = "invalid"
-				}
-				if err := store.RecordOperation(ctx, "later", "release", &session, &generation, later); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if mode == "other-pending" {
-				if err := store.RecordOperation(ctx, "other", "destroy", &session, &generation, map[string]any{"outcome": "pending"}); err != nil {
-					t.Fatal(err)
-				}
-			}
-			nativeTask := task.TaskID
-			if mode == "unverified-cache" {
-				nativeTask = "different"
-			}
-			guest := &quiescentStartupGuest{startupGuest: &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": nativeTask, "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}}
-			if mode == "native-busy" {
-				guest.quiescenceErr = errors.New("native work remains")
-			}
-			service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
-			if mode == "active" {
-				finish := service.markOperationActive("original")
-				defer finish()
-			}
-			pending, err := store.PendingOperations(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := service.reconcileSupersededOperations(ctx, pending); (err != nil) != (mode == "native-busy") {
-				t.Fatalf("reconciliation error = %v", err)
-			}
-			original, err := store.GetOperation(ctx, "original")
-			if err != nil || original == nil || original.Response["outcome"] != "pending" {
-				t.Fatalf("original = %#v, error = %v", original, err)
+	for _, action := range []string{"restart", "release"} {
+		t.Run(action, func(t *testing.T) {
+			for _, mode := range []string{"native-busy", "worker-missing", "no-witness", "wrong-session", "wrong-task", "missing-lease", "unverified-cache", "other-pending", "active", "late-worker", "bad-witness-digest", "bound-task-mismatch"} {
+				t.Run(mode, func(t *testing.T) {
+					store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer store.Close()
+					ctx := context.Background()
+					session, generation := "superseded-negative-"+mode, int64(1)
+					now := nowString(time.Now())
+					task := state.Task{TaskID: "task", SessionID: session, Generation: generation, State: stateCached, InstanceName: "instance", CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+					if err := store.InsertTask(ctx, task); err != nil {
+						t.Fatal(err)
+					}
+					req := protocol.Request{"protocol": protocol.Version, "action": action, "session_id": session, "generation": generation, "operation_id": "original"}
+					digest, err := protocol.Digest(req)
+					if err != nil {
+						t.Fatal(err)
+					}
+					worker := map[string]any{"state": "exited", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "finished_at": nowString(time.Now())}
+					if mode == "worker-missing" {
+						delete(worker, "process_group")
+					}
+					if mode == "late-worker" {
+						worker["finished_at"] = nowString(time.Now().Add(time.Hour))
+					}
+					originalResponse := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": worker}
+					if mode == "bound-task-mismatch" {
+						originalResponse["_task_id"] = "different"
+					}
+					if err := store.RecordOperation(ctx, "original", action, &session, &generation, originalResponse); err != nil {
+						t.Fatal(err)
+					}
+					if mode != "no-witness" {
+						laterReq := protocol.Request{"protocol": protocol.Version, "action": "release", "session_id": session, "generation": generation, "operation_id": "later"}
+						result := map[string]any{"task_id": task.TaskID, "session_id": session, "generation": generation, "state": stateCached, "effective_lease": false}
+						if mode == "wrong-session" {
+							result["session_id"] = "different"
+						}
+						if mode == "wrong-task" {
+							result["task_id"] = "different"
+						}
+						if mode == "missing-lease" {
+							delete(result, "effective_lease")
+						}
+						later := protocol.SuccessWithRelease(laterReq, result, nil, nil)
+						laterDigest, err := protocol.Digest(laterReq)
+						if err != nil {
+							t.Fatal(err)
+						}
+						later["_request_digest"] = laterDigest
+						if mode == "bad-witness-digest" {
+							later["_request_digest"] = "invalid"
+						}
+						if err := store.RecordOperation(ctx, "later", "release", &session, &generation, later); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if mode == "other-pending" {
+						if err := store.RecordOperation(ctx, "other", "destroy", &session, &generation, map[string]any{"outcome": "pending"}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					nativeTask := task.TaskID
+					if mode == "unverified-cache" {
+						nativeTask = "different"
+					}
+					guest := &quiescentStartupGuest{startupGuest: &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": nativeTask, "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}}
+					if mode == "native-busy" {
+						guest.quiescenceErr = errors.New("native work remains")
+					}
+					service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+					if mode == "active" {
+						finish := service.markOperationActive("original")
+						defer finish()
+					}
+					pending, err := store.PendingOperations(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := service.reconcileSupersededOperations(ctx, pending); (err != nil) != (mode == "native-busy") {
+						t.Fatalf("reconciliation error = %v", err)
+					}
+					original, err := store.GetOperation(ctx, "original")
+					if err != nil || original == nil || original.Response["outcome"] != "pending" {
+						t.Fatalf("original = %#v, error = %v", original, err)
+					}
+				})
 			}
 		})
 	}

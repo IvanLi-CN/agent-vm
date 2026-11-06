@@ -341,3 +341,45 @@ func TestSlotRequestPreservesControllerLeaseIdentity(t *testing.T) {
 		t.Fatalf("lease identity lost precision: term=%d generation=%d", observed.Term, observed.Generation)
 	}
 }
+
+func TestCapacityHealthRemainsCoherentAcrossLaterCommits(t *testing.T) {
+	directory, err := os.MkdirTemp("", "avm-observe-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	socket := filepath.Join(directory, "app.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			return
+		}
+		if request["action"] != "admin-metrics" {
+			t.Errorf("unexpected separate observation: %v", request)
+			w.WriteHeader(500)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "action": "admin-metrics", "result": map[string]any{
+			"up": true, "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "observation_consistent": true, "observation_epoch": "before-later-commit",
+			"pending_operations": []any{}, "historical_unknown_operations": []any{}, "in_flight_operations": 0,
+			"doctor": map[string]any{"ready": true, "issues": []any{}},
+		}})
+	}))
+	server.Listener.Close()
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+	runtime := NewHostRuntime(Config{BlueSocket: socket})
+	metrics, health, _, err := runtime.observeCapacityHealth(context.Background(), "blue")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metrics["observation_epoch"] != "before-later-commit" || health["state_epoch"] != metrics["observation_epoch"] || health["ready"] != true {
+		t.Fatalf("incoherent capacity/health: metrics=%v health=%v", metrics, health)
+	}
+}
