@@ -138,7 +138,7 @@ func NewManagerWithMigration(database *store.Store, runtime Runtime, migration M
 
 func (manager *Manager) Status(ctx context.Context) (Status, error) {
 	// Read-only probes must not hold the serialized role writer while waiting on business state.
-	observation, err := manager.observe(ctx, "")
+	observation, err := manager.Runtime.Observe(ctx)
 	if err != nil {
 		return Status{}, err
 	}
@@ -1140,6 +1140,10 @@ func (manager *Manager) transitionAfterEffect(ctx context.Context, id, expected,
 }
 
 func (manager *Manager) rollbackOrFence(ctx context.Context, transaction store.Transaction, cause error) error {
+	if ctx.Err() != nil {
+		return manager.effectFailure(ctx, transaction.ID, transaction.Phase, &UncertainError{Cause: cause})
+	}
+
 	if current, err := manager.Store.Get(ctx, transaction.ID); err != nil {
 		fenceErr := manager.fenceSlots(ctx, errors.New("transaction state could not be read before fencing"))
 		return fmt.Errorf("read transaction before failure: %w; %v", err, fenceErr)

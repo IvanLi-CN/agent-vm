@@ -1683,3 +1683,58 @@ func TestActivationRenewsCandidateThroughoutOldSlotQuiescence(t *testing.T) {
 		t.Fatalf("candidate renewal stopped during quiescence: %d", r.renewals.Load())
 	}
 }
+
+func TestCancelledActivationCompensationPersistsAndFencesWithoutRollback(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	db, err := store.Open(filepath.Join(t.TempDir(), "deploy.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	r := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true}, "green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true}}}
+	m := NewManager(db, r, time.Second, func() time.Time { return now })
+	tx, err := m.Stage(context.Background(), "green", "bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.rollbackOrFence(ctx, *tx, context.Canceled); err == nil {
+		t.Fatal("cancelled activation reported success")
+	}
+	saved, err := db.Get(context.Background(), tx.ID)
+	if err != nil || saved.State != "needs_recovery" || saved.RollbackUsed {
+		t.Fatalf("cancelled compensation=%v err=%v", saved, err)
+	}
+	for _, value := range r.observations {
+		if value.ControllerOwned {
+			t.Fatal("cancelled request left controller active")
+		}
+	}
+}
+func TestReadOnlyStatusDoesNotReplacePublishedLatestObservation(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	db, err := store.Open(filepath.Join(t.TempDir(), "deploy.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	r := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {Slot: "blue", ProcessUp: true}, "green": {Slot: "green", ProcessUp: true}}}
+	m := NewManager(db, r, time.Second, func() time.Time { return now })
+	if _, err := m.observe(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.Observation(context.Background(), store.LatestObservationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.active = "green"
+	status, err := m.Status(context.Background())
+	if err != nil || status.Observed.ActiveSlot != "green" {
+		t.Fatalf("status=%v err=%v", status, err)
+	}
+	after, err := db.Observation(context.Background(), store.LatestObservationID)
+	if err != nil || after.Digest != before.Digest {
+		t.Fatalf("read-only status replaced published observation: %v", err)
+	}
+}
