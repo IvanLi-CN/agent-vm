@@ -6,7 +6,7 @@
 
 `agent-vm-deployd.service` 是位于蓝、绿槽位之外的稳定宿主级服务。它在槽位切换期间保持不变，并且一次只负责一个部署事务。CLI 通过 `/run/agent-vm-native/deployd.sock` 连接。Caddy、浏览器、Agent Token、公共 `agent-vm` CLI 和槽位业务 API，都不能访问这个 socket。
 
-首次部署由发布器创建并验证受保护的槽位目录，并在初始化完成后创建 `/var/lib/agent-vm-native/active -> slots/blue`。已有部署必须验证当前 `active` 指向 blue 或 green，不能覆盖断裂或指向未知目标的链接。
+全新安装由 Go 安装器与 Deployd 的首次安装事务创建并验证受保护的槽位目录，并在初始化、角色及就绪验证完成后创建 `/var/lib/agent-vm-native/active -> slots/blue`。已有部署必须验证当前 `active` 指向 blue 或 green，不能覆盖断裂或指向未知目标的链接。
 
 Deployd 可以读取或协调以下部署事实：
 
@@ -237,3 +237,13 @@ CLI 永远不能直接编辑 `active`。响应丢失时，CLI 返回 deployd tra
 启动时，deployd 加载最近事务，验证数据库 schema，并重新观测每个运行时来源。只有再次观测到对应运行时证据，记录的 phase 才能视为完成。如果无法证明该 phase，deployd 进入 `needs_recovery`，保持部署和受影响的 admission fenced，并保留证据。只有运维者确认事务标识且必需来源新鲜、相互一致后，恢复流程才能 resume、rollback 或 finalize。执行 recovery finalize 时，deployd 必须先确认目标槽位仍然是已验证的 active 槽位，撤销旧槽位的 controller role 和 traffic role，完成 drain/quiescence，并停止旧槽位。只有重新观测到旧槽位已经停止、目标槽位重新持有 controller role 且可以接受流量后，才能把事务写成 `finalize`。撤销、停止或重新观测任一步失败，都必须保持 `needs_recovery`，并对两个槽位执行 hard-fence，不能猜测恢复已经完成。
 
 目标验证覆盖 Go unit 和 socket permissions、SQLite migration 和 crash recovery、重复协调器防护、双槽位进程存活、唯一 controller leadership、候选槽位验证、原子 active switch、traffic drain、在途请求完成、native-worker quiescence、有界 rollback，以及守护进程在每个不可幂等阶段重启时的行为。验证在当前会话拥有的 Agent VM 中运行，不修改开发机或现网部署。
+
+## 全新安装事务
+
+`agent-vm-deploy install --config <受保护输入> --bundle <产品包> --materials <同修订资料目录>` 默认只执行只读预检，不创建安装记录、锁、解包目录或系统资源；显式 `--apply` 才执行本机安装。安装输入只引用受保护的配置与证书文件，不内联凭据。安装器固定目标路径，拒绝替换不匹配的已有文件；已有蓝绿安装只核验就绪并指向升级入口。
+
+全新安装使用受保护 UDS 的 `POST /v1/bootstrap`，请求包含安装器先行持久化的 `transaction_id=install-<32位小写十六进制>` 和已验证产品包的绝对路径。Deployd 必须先确认 active 链接和旧业务 SQLite 均不存在、两个已安装槽位 unit 均已停止，再创建部署事务。Deployd 通过已验证 blue 槽位的 `agent-vm-control initialize-state` 委托业务状态层直接初始化空 rqlite，不生成 SQLite 迁移源。该入口不授予角色，也不启动 scheduler。
+
+Deployd 随后验证初始 standby 的 release、状态能力和进程身份，分配持久化 fencing term，通过既有角色通道授予 blue 唯一 controller lease，观测 ready 后开启 traffic 并原子切换 active。最终新鲜一致观测通过后才终结事务，安装器最后启动 Caddy。同一安装事务的重复请求只允许返回已完成结果；其他阶段不得自动重放。
+
+初始化或切换结果不确定时必须保留原事务并 fencing。active 尚不存在时，只能显式使用 `recover --transaction <原ID> --action resume-bootstrap`：首先再次确认没有 active 或旧 SQLite，停止槽位，在业务状态层验证现有 rqlite 的受支持 schema 且没有 VM task 或生命周期 operation 后恢复初始化，不替换或清空数据库。active 已存在时拒绝该动作，使用既有 `finalize` 恢复合同重新验证原候选。安装记录只保存阶段、修订、摘要和原事务 ID，不作为角色授权来源。

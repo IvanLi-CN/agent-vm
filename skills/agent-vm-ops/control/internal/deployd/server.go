@@ -110,6 +110,7 @@ func (server *Server) Handler() http.Handler {
 	router.POST("/v1/rollback", server.rollback)
 	router.POST("/v1/recover", server.recover)
 	router.POST("/v1/migrate", server.migrate)
+	router.POST("/v1/bootstrap", server.bootstrap)
 	router.NoRoute(func(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "not_found", "deployd endpoint was not found")
 	})
@@ -540,3 +541,16 @@ func MetricsAddressRequiresTLS(address string) bool {
 }
 
 func statusCode(value int) string { return strconv.Itoa(value) }
+
+func (server *Server) bootstrap(c *gin.Context) {
+	var value request
+	if !decodeRequest(c, &value) {
+		return
+	}
+	transaction, err := server.Manager.Bootstrap(c.Request.Context(), value.TransactionID, value.Bundle)
+	if err != nil {
+		writeError(c, http.StatusConflict, "state_unverified", err.Error())
+		return
+	}
+	writeOK(c, publicTransaction(*transaction))
+}

@@ -13,7 +13,7 @@
 | Caddy | 2.11.7 | HTTPS 边缘代理 | 已验证 SHA-512 的 Linux amd64 和 arm64 压缩包 |
 | rqlite | 10.5.2 | 共享业务状态权威 | 已验证 SHA-256 的 Linux amd64 和 arm64 压缩包 |
 
-自动下载和自动安装已关闭。运维者必须先验证固定校验和，才能把二进制文件放置到 `/usr/local/bin/caddy` 或 `/usr/local/bin/rqlited`。
+默认预检不会下载或安装组件。全新安装显式使用 `agent-vm-deploy install --apply` 后，安装器按固定清单下载并验证组件，再安装到 `/usr/local/bin/caddy` 和 `/usr/local/bin/rqlited`；操作步骤见[首次安装](install.md)。
 
 ## 资源布局
 

@@ -2,7 +2,7 @@
 
 本目录保存 Agent VM 部署专用资料的唯一源码。Go 控制服务、Deployd 和 CLI 的实现仍位于原 Go 模块，服务器上的固定安装路径不随源码目录调整而变化。
 
-从[简明部署指南](../docs/deployment.md)开始阅读；槽位布局、角色隔离、状态迁移、观测和恢复细节见[蓝绿部署手册](docs/blue-green.md)。长期约束由[Agent VM 规范](../docs/specs/agent-vm/SPEC.md)及其合同定义。
+从[简明部署指南](../docs/deployment.md)开始阅读；全新环境的输入准备、预检、安装与重试见[首次安装步骤](docs/install.md)。槽位布局、角色隔离、状态迁移、观测和恢复细节见[蓝绿部署手册](docs/blue-green.md)。长期约束由[Agent VM 规范](../docs/specs/agent-vm/SPEC.md)及其合同定义。
 
 ## 目录
 
@@ -22,4 +22,4 @@
 bun deploy/scripts/build-materials.ts --source-revision "$(git rev-parse HEAD)" --output /tmp/agent-vm-deployment-materials
 ```
 
-此命令只生成资料目录与清单，不执行安装，不表示正式发布附件已生成。后续自动安装入口与完整隔离验收尚待完成。
+此命令只生成资料目录与清单，不执行安装，不表示正式发布附件已生成。Go 安装入口已提供，完整隔离验收尚待完成，不能将构建资料视为验收通过。

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/install"
 )
 
 var version = "agent-vm-deploy/dev"
@@ -25,6 +27,9 @@ func run(args []string) error {
 	if len(args) == 0 || args[0] == "version" || args[0] == "--version" {
 		fmt.Println(version)
 		return nil
+	}
+	if args[0] == "install" {
+		return runInstall(args[1:])
 	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -101,4 +106,32 @@ func run(args []string) error {
 		_, _ = os.Stdout.Write([]byte("\n"))
 	}
 	return nil
+}
+
+func runInstall(args []string) error {
+	flags := flag.NewFlagSet("install", flag.ContinueOnError)
+	config := flags.String("config", "", "protected installation input JSON")
+	bundle := flags.String("bundle", "", "verified product tar archive")
+	materials := flags.String("materials", "", "matching verified deployment materials directory")
+	apply := flags.Bool("apply", false, "apply installation after preflight")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *config == "" || *bundle == "" || *materials == "" {
+		return errors.New("install requires --config, --bundle and --materials; --apply enables changes")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	input := install.Inputs{Config: *config, Bundle: *bundle, Materials: *materials}
+	var report install.Report
+	var err error
+	if *apply {
+		report, err = install.Apply(ctx, input)
+	} else {
+		report, err = install.Preflight(ctx, input)
+	}
+	if encodeErr := json.NewEncoder(os.Stdout).Encode(report); encodeErr != nil {
+		return encodeErr
+	}
+	return err
 }

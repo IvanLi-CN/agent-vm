@@ -501,6 +501,9 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 		}
 		return updated, nil
 	}
+	if action == "resume-bootstrap" {
+		return manager.resumeBootstrap(ctx, *transaction)
+	}
 	switch action {
 	case "rollback":
 		if transaction.RollbackUsed && transaction.Phase != PhaseRollback {
