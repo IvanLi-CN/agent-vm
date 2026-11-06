@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -678,6 +679,49 @@ func TestActiveSwitchRequiresPersistentSlotBootBeforeRouting(t *testing.T) {
 			args, err := os.ReadFile(log)
 			if err != nil || string(args) != "enable\nagent-vm-native@green.service\n" {
 				t.Fatalf("boot unit=%q err=%v", args, err)
+			}
+		})
+	}
+}
+
+func TestBootstrapRecoveryClearsFailedUnitsBeforeStoppedProof(t *testing.T) {
+	for _, resetFails := range []bool{false, true} {
+		t.Run(fmt.Sprint(resetFails), func(t *testing.T) {
+			root := t.TempDir()
+			log := filepath.Join(root, "calls")
+			commands := filepath.Join(root, "commands")
+			os.Mkdir(commands, 0700)
+			script := "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" >> " + log + "\n"
+			if resetFails {
+				script += "if [ \"$1\" = reset-failed ]; then exit 9; fi\n"
+			}
+			script += "if [ \"$1\" = show ]; then printf 'LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nFragmentPath=/etc/systemd/system/agent-vm-native@.service\n'; fi\n"
+			if err := os.WriteFile(filepath.Join(commands, "systemctl"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", commands)
+			cfg := Defaults()
+			cfg.ActivePath = filepath.Join(root, "active")
+			cfg.Migration.LegacyStateDB = filepath.Join(root, "legacy.sqlite3")
+			cfg.ReleaseRoot = root
+			runtime := NewHostRuntime(cfg)
+			err := runtime.ResumeBootstrap(context.Background(), filepath.Join(root, "missing-bundle.tar"))
+			if err == nil {
+				t.Fatal("missing bundle accepted")
+			}
+			calls, e := os.ReadFile(log)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if resetFails {
+				if string(calls) != "reset-failed agent-vm-native@blue.service\n" || !strings.Contains(err.Error(), "reset-failed") {
+					t.Fatalf("reset failure continued: %s %v", calls, err)
+				}
+				return
+			}
+			want := "reset-failed agent-vm-native@blue.service\nreset-failed agent-vm-native@green.service\nshow agent-vm-native@blue.service\nshow agent-vm-native@green.service\n"
+			if string(calls) != want {
+				t.Fatalf("stopped proof not rechecked after reset: %q err=%v", calls, err)
 			}
 		})
 	}

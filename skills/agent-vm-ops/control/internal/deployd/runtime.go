@@ -1663,8 +1663,11 @@ func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, pat
 }
 
 func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) error {
-	if action != "start" && action != "stop" && action != "restart" && action != "enable" {
+	if action != "start" && action != "stop" && action != "restart" && action != "enable" && action != "reset-failed" {
 		return errors.New("unsupported systemd action")
+	}
+	if action == "reset-failed" && unit != "agent-vm-native@blue.service" && unit != "agent-vm-native@green.service" {
+		return errors.New("unsupported bootstrap recovery unit")
 	}
 	if !strings.HasPrefix(unit, "agent-vm-native@") || !strings.HasSuffix(unit, ".service") {
 		return errors.New("unsupported systemd unit")
