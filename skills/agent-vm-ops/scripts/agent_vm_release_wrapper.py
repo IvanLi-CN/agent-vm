@@ -1320,6 +1320,30 @@ def _verify_destroy_recovery_candidate(candidate_root: Path) -> None:
         _fail("drain_unverified", "candidate does not prove native worker recovery support")
 
 
+def _verify_stopped_recovery_cgroups(root: Path = Path("/sys/fs/cgroup")) -> None:
+    groups = (
+        "system.slice/agent-vm-deployd.service",
+        "system.slice/agent-vm-native.service",
+        r"system.slice/system-agent\x2dvm\x2dnative.slice/agent-vm-native@blue.service",
+        r"system.slice/system-agent\x2dvm\x2dnative.slice/agent-vm-native@green.service",
+    )
+    for group in groups:
+        directory = root / group
+        try:
+            if directory.is_symlink():
+                _fail("drain_unverified", "worker recovery cgroup is unverified")
+            entries = list(directory.iterdir())
+        except FileNotFoundError:
+            continue
+        except OSError:
+            _fail("drain_unverified", "worker recovery cgroup cannot be inspected")
+        try:
+            if any(entry.is_dir() or entry.is_symlink() for entry in entries) or (directory / "cgroup.procs").read_text().strip():
+                _fail("drain_unverified", "worker recovery cgroup still owns processes")
+        except OSError:
+            _fail("drain_unverified", "worker recovery processes cannot be inspected")
+
+
 def _fence_destroy_recovery_runtime() -> None:
     # Stop the role owner first, then all possible native worker owners. A
     # stopped CLI does not prove the Incus server's asynchronous effect ended.
@@ -1334,6 +1358,7 @@ def _fence_destroy_recovery_runtime() -> None:
         lines = result.stdout.decode("utf-8", errors="replace").splitlines()
         if result.returncode != 0 or len(lines) != 2 or set(lines) != {"MainPID=0", "ControlGroup="}:
             _fail("drain_unverified", "worker recovery process fencing is unverified")
+    _verify_stopped_recovery_cgroups()
     try:
         result = subprocess.run(["incus", "operation", "list", "--all-projects", "--format=json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=30)
         operations = json.loads(result.stdout)
@@ -1341,6 +1366,7 @@ def _fence_destroy_recovery_runtime() -> None:
         _fail("drain_unverified", "native background operations cannot be verified")
     if result.returncode != 0 or operations != []:
         _fail("drain_unverified", "native background operations remain during worker recovery")
+    _verify_stopped_recovery_cgroups()
 
 
 def _ensure_drained(

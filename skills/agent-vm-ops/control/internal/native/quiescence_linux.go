@@ -45,7 +45,7 @@ func (c *IncusClient) VerifyRecoveryQuiescence(ctx context.Context) error {
 			if err != nil || result.Code != 0 || result.StdoutTruncated || result.StderrTruncated {
 				return errors.New("control service identity cannot be verified")
 			}
-			group, pid, err := recoveryUnitGroup(result.Stdout, groups[unit])
+			_, pid, err := recoveryUnitGroup(result.Stdout, groups[unit])
 			if err != nil {
 				return err
 			}
@@ -58,10 +58,8 @@ func (c *IncusClient) VerifyRecoveryQuiescence(ctx context.Context) error {
 			if ownUnit == "agent-vm-native.service" && unit != ownUnit && pid != 0 {
 				return errors.New("slot processes still exist during singleton recovery")
 			}
-			if pid != 0 {
-				if err := checkRecoveryCgroup(filepath.Join("/sys/fs/cgroup", group), pid); err != nil {
-					return err
-				}
+			if err := checkRecoveryCgroup(filepath.Join("/sys/fs/cgroup", groups[unit]), pid); err != nil {
+				return err
 			}
 			identity := string(result.Stdout)
 			if !initial && identities[unit] != identity {
@@ -132,6 +130,13 @@ func recoveryOperationsClear(output []byte) error {
 }
 
 func checkRecoveryCgroup(directory string, self int) error {
+	info, err := os.Lstat(directory)
+	if errors.Is(err, os.ErrNotExist) && self == 0 {
+		return nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return errors.New("control cgroup directory is unverified")
+	}
 	entries, err := os.ReadDir(directory)
 	if err != nil {
 		return fmt.Errorf("cannot inspect control cgroup: %w", err)
@@ -146,7 +151,10 @@ func checkRecoveryCgroup(directory string, self int) error {
 		return fmt.Errorf("cannot inspect control processes: %w", err)
 	}
 	ids := strings.Fields(string(raw))
-	if len(ids) != 1 || ids[0] != strconv.Itoa(self) {
+	if self == 0 && len(ids) == 0 {
+		return nil
+	}
+	if self == 0 || len(ids) != 1 || ids[0] != strconv.Itoa(self) {
 		return errors.New("control cgroup contains other processes")
 	}
 	return nil

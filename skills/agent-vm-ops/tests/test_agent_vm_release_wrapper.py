@@ -1447,8 +1447,9 @@ class WorkerRecoveryBootstrapTests(unittest.TestCase):
                 self.assertEqual(len(calls), 5)
                 return subprocess.CompletedProcess(argv, 0, b"[]", b"")
             return subprocess.CompletedProcess(argv, 0, b"MainPID=0\nControlGroup=\n", b"")
-        with mock.patch.object(WRAPPER, "_systemctl") as stop, mock.patch.object(WRAPPER.subprocess, "run", side_effect=run):
+        with mock.patch.object(WRAPPER, "_systemctl") as stop, mock.patch.object(WRAPPER, "_verify_stopped_recovery_cgroups") as groups, mock.patch.object(WRAPPER.subprocess, "run", side_effect=run):
             WRAPPER._fence_destroy_recovery_runtime()
+            self.assertEqual(groups.call_count, 2)
             self.assertEqual([call.args for call in stop.call_args_list], [("stop", unit) for unit in ("agent-vm-deployd.service", "agent-vm-native@blue.service", "agent-vm-native@green.service", "agent-vm-native.service")])
 
     def test_recovery_rejects_live_process_or_background_effect(self):
@@ -1460,6 +1461,25 @@ class WorkerRecoveryBootstrapTests(unittest.TestCase):
                     return subprocess.CompletedProcess(argv, 0, b"MainPID=42\nControlGroup=/still-live\n" if mode == "process" else b"MainPID=0\nControlGroup=\n", b"")
                 with mock.patch.object(WRAPPER, "_systemctl"), mock.patch.object(WRAPPER.subprocess, "run", side_effect=run):
                     with self.assertRaises(WRAPPER.WrapperError): WRAPPER._fence_destroy_recovery_runtime()
+
+    def test_stopped_cgroup_proof_rejects_surviving_processes_and_children(self):
+        for mode in ("absent", "empty", "process", "child", "symlink", "missing-procs"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                directory = root / "system.slice/agent-vm-native.service"
+                if mode != "absent":
+                    directory.mkdir(parents=True)
+                    if mode != "missing-procs":
+                        (directory / "cgroup.procs").write_text("42\n" if mode == "process" else "")
+                    if mode == "child": (directory / "child").mkdir()
+                    if mode == "symlink":
+                        target = directory.parent / "other"
+                        directory.rename(target)
+                        directory.symlink_to(target, target_is_directory=True)
+                if mode in ("absent", "empty"):
+                    WRAPPER._verify_stopped_recovery_cgroups(root)
+                else:
+                    with self.assertRaises(WRAPPER.WrapperError): WRAPPER._verify_stopped_recovery_cgroups(root)
 
     def test_old_or_malformed_candidate_cannot_bypass_pending_fence(self):
         for output in (b"old binary", b"{}", b'{"unidentified_destroy_start":true,"requires_release_drain":true}', b'{"unidentified_destroy_start":1,"requires_release_drain":false}'):

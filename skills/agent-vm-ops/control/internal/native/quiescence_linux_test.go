@@ -105,3 +105,42 @@ func TestRecoverySlotBoundaryRejectsUnverifiedPeers(t *testing.T) {
 		})
 	}
 }
+
+func TestInactiveRecoveryCgroupRequiresNoSurvivingProcesses(t *testing.T) {
+	for _, mode := range []string{"absent", "empty", "process", "child", "symlink", "missing-procs"} {
+		t.Run(mode, func(t *testing.T) {
+			root := t.TempDir()
+			dir := filepath.Join(root, "unit")
+			if mode != "absent" {
+				if err := os.Mkdir(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if mode != "missing-procs" {
+					procs := ""
+					if mode == "process" {
+						procs = "42\n"
+					}
+					if err := os.WriteFile(filepath.Join(dir, "cgroup.procs"), []byte(procs), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if mode == "child" {
+					if err := os.Mkdir(filepath.Join(dir, "child"), 0700); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if mode == "symlink" {
+					link := filepath.Join(root, "link")
+					if err := os.Symlink(dir, link); err != nil {
+						t.Fatal(err)
+					}
+					dir = link
+				}
+			}
+			err := checkRecoveryCgroup(dir, 0)
+			if (err == nil) != (mode == "absent" || mode == "empty") {
+				t.Fatalf("unexpected recovery proof: %v", err)
+			}
+		})
+	}
+}
