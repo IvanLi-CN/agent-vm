@@ -79,21 +79,25 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 每个槽位的 state URL、认证信息和 CA 信任路径必须由部署配置提供，不能写入 release manifest、公开 dashboard 或仓库测试 fixture。Deployd 迁移使用 `deployd.json` 中的 `migration.rqlite_url` 和 `migration.rqlite_unit`，不读取业务 SQLite 之外的隐藏配置。
 
-## 一键首次部署
+## 首次部署实现状态
 
-首次部署可以从已经安装好的旧 `agent-vm-native.service` 和旧`/var/lib/agent-vm-native/state.sqlite3` 开始，也可以从没有业务状态文件的全新根目录开始；两种情况都需要 rqlite 配置、两个槽位配置和已验证的format-4 发布包。全新安装只会迁移本次启动生成的空 SQLite，不读取被隔离的旧根目录或旧盘数据。发布器执行 `stage`、`verify`、`activate` 时，按以下顺序自动完成：
+批准方案要求使用 Go CLI 的 `install` 入口完成只读预检和显式安装，并区分全新环境、旧 SQLite 环境及已有蓝绿安装。目前该入口尚未实现，以下旧发布器行为仅用于说明现有兼容路径，不能作为完整首次部署步骤。
 
-1. 校验发布包和两个槽位目录，但不启动新槽位。2. 读取发布状态；如果没有 current release，确认旧单实例、两个槽位和 Deployd
-   都已停止，不向不存在的旧控制服务发送 drain 请求。
-3. 对已有 current release 执行 admission drain；对全新根目录跳过旧服务
-   drain，但仍由 wrapper 在激活前检查固定运行单元全部停止。
-4. 启用并重启 `agent-vm-deployd.service`，等待其 UDS API 接受 `status` 请求。5. 调用 Deployd 的 `POST /v1/migrate`，由 Deployd 启动 rqlite、让旧服务进入写围栏、等待请求和 native worker 收敛、停止旧服务、验证 SQLite writer 已关闭、创建一致 snapshot、导入并验证 rqlite。6. 迁移成功后写入 `.rqlite-cutover-complete`，再创建初始 `active` 链接、停止并禁用旧单实例、启动蓝绿槽位。7. 重新观测两个槽位和共享状态，只有验证通过才报告激活成功。
+现有发布器要求事先准备 rqlite、槽位配置、Deployd、systemd 资源和已验证的 format-4 发布包；它不会自动完成整个服务栈的安装。它在全新环境中仍会先启动旧单实例创建空 SQLite，再交给 Deployd 迁移。这与批准方案要求的直接初始化 rqlite 不符，是待修复的实现缺口。
 
-发布器不会让槽位先于迁移启动，也不会把 `agent-vm-deploy migrate` 留给人工执行。首次发布的健康检查允许新槽位处于未排空状态；这只适用于没有 currentrelease 的 clean bootstrap，普通蓝绿发布仍必须在 drain 中完成健康检查。直接使用 CLI 时，等价入口是：
+## 现有发布器的兼容激活流程
 
-```sh
-sudo agent-vm-deploy migrate --timeout 9000 --json
-```
+下面描述当前发布器在完成上述人工准备后的行为，不代表批准方案已经实现。
+
+1. 校验发布包和两个槽位目录，但不启动新槽位。
+2. 读取发布状态；没有当前发布时，检查固定运行单元已经停止，不向不存在的旧控制服务发送排空请求。
+3. 已有当前发布时执行准入排空；全新根目录跳过旧服务排空请求，由封装检查激活前状态。
+4. 首次引入共享状态时，按现有兼容实现启动旧单实例，再启动 Deployd 并等待其 UDS API 就绪。
+5. 调用 Deployd 的迁移事务，由其围栏旧服务、等待请求及原生工作进程收敛、停止旧服务，再导入和验证 rqlite。
+6. 迁移成功后记录完成标记，再创建初始活动链接、禁用旧单实例并启动蓝绿槽位。
+7. 重新观测槽位和共享状态，通过检查后报告激活结果。
+
+`agent-vm-deploy migrate` 只提交状态迁移事务，不负责安装完整服务栈，不能作为首次安装的等价命令。
 
 如果 Deployd 返回带事务 ID 的 `state_unverified`，发布器会查询该事务；只有状态为 `needs_recovery` 时，才自动提交一次 `recover --action retry-migration`。重试会复用已验证的迁移 snapshot，并且在 rqlite 已经精确等于源 snapshot 时把丢失响应视为幂等成功；目标不一致时继续围栏，不猜测导入结果。
 
