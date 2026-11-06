@@ -33,20 +33,25 @@ test("the five project topics have locked local surfaces", () => {
   }
 });
 
-test("PR scheduling is exact, non-preemptive, and separate from Main", () => {
+test("PR scheduling is bounded and separate from Main", () => {
   const pr = read(".github/workflows/ci.yml");
   const main = read(".github/workflows/ci-main.yml");
   expect(pr).toContain("name: CI (PR)");
-  expect(pr).toContain("types: [opened, synchronize, reopened, ready_for_review]");
-  expect(pr).toContain("types: [checks_requested]");
-  expect(pr).toContain("group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}");
-  expect(pr).toContain("cancel-in-progress: false");
-  expect(pr).toContain("name: PR gate");
-  expect(main).toContain("name: CI (Main)");
-  expect(main).toContain("branches: [main]");
-  expect(main).toContain("name: Main gate");
-  expect(main).toContain("group: main");
-  expect(main).toContain("max-parallel: 1");
+  const pw = parse(pr);
+  const mw = parse(main);
+  expect(pw.on.pull_request.types).toEqual(["opened", "synchronize", "reopened", "ready_for_review"]);
+  expect(pw.on.merge_group.types).toEqual(["checks_requested"]);
+  expect(pw.concurrency["cancel-in-progress"]).toBe("${{ github.event_name == 'pull_request' }}");
+  expect(mw.concurrency["cancel-in-progress"]).toBe(false);
+  expect(pw.jobs["pr-gate"].name).toBe("PR gate");
+  expect(mw.jobs["main-gate"].name).toBe("Main gate");
+  expect(pw.jobs.classify.steps.some((s: any) => s.uses === "oven-sh/setup-bun@v2")).toBe(true);
+  for (const workflow of [pw, mw]) {
+    expect(workflow.jobs.validation.strategy.matrix.os).toEqual(["ubuntu-latest", "macos-latest"]);
+    expect(workflow.jobs.heavy.steps.some((s: any) => s.run === "bun run test:skills")).toBe(true);
+    expect(workflow.jobs.validation.steps.find((s: any) => s.name === "Build product packages").if).toBe("matrix.os == 'ubuntu-latest'");
+    expect(JSON.stringify(workflow)).not.toContain("Cache Go build and module data");
+  }
 });
 
 test("demo deployment is serialized and never exposes credentials to PR builds", () => {

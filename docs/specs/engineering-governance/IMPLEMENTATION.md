@@ -13,7 +13,7 @@
 以下事实对应本次候选开发基线 `cef5bd8a62f2856ddd817355dde701685404619c`；平台项仍需在真实 PR 和启用阶段重新核验。
 
 - 默认分支为 `main`，仓库公开；当时没有产品 tag 或 GitHub Release 历史。
-- 仓库现在声明 `CI (PR)`、`CI (Main)`、`Release`、`Release recovery`、两个失败通知 sidecar 和 `Notification smoke`；PR/Main gate 具有独立的非抢占 concurrency。
+- 仓库现在声明 `CI (PR)`、`CI (Main)`、`Release`、`Release recovery`、两个失败通知 sidecar 和 `Notification smoke`；PR/Main gate 使用独立 concurrency，PR 允许取消旧 candidate，Main 保持非抢占。
 - 现有检查包含 Ubuntu/macOS、Bun 类型检查、仓库检查、两套 Bun 测试、Go tests/vet、Linux amd64/arm64 构建和 Ubuntu race 检查。
 - `main` 当时未启用分支保护或 ruleset，无平台强制 required checks 或签名提交要求；基线提交本身的有效签名不能代替分支政策。
 - `0.4.0-native` 没有正式发布记录，不是产品版本基线；新生产构建器要求 SemVer，首版只能是 `1.0.0`。
@@ -58,7 +58,7 @@
 
 | Workflow name | 事件与职责 | 并发边界 | 通知分类 |
 | --- | --- | --- | --- |
-| `CI (PR)` | 面向 main 的 opened、synchronize、reopened、ready_for_review；产生 `PR gate`。 | per-PR required namespace，`queue: max`，不抢占。 | generic |
+| `CI (PR)` | 面向 main 的 opened、synchronize、reopened、ready_for_review；产生 `PR gate`。 | per-PR required namespace，取消旧 PR candidate；merge_group 不抢占。 | generic |
 | `CI (Main)` | main push；在实际 merge SHA 产生 `Main gate`。 | 独立 main namespace，`queue: max`，不抢占。 | generic |
 | `Release` | main 上显式 dispatch；固定事件 source，完成产物发布。 | 产品级 release 状态写入 namespace，`queue: max`，不抢占。 | Release-specific |
 | `Notify failed workflow` | generic allowlist 的 completed workflow_run，显式 guard failure。 | 原 run ID 与 attempt；不与产品发布共享 group。 | selection-gated |

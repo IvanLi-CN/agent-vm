@@ -90,7 +90,7 @@ Go race、原生进程树等针对性验证仍按实际触及的合同执行；�
 
 每个实际工作流必须声明事件、head SHA、并发 namespace、取消条件、稳定 check name 和运行身份。
 required PR gate 只能监听 `opened`、`synchronize`、`reopened`、`ready_for_review`，不得监听 `pull_request.edited`。
-required gate 必须使用 per-PR 非抢占队列，`queue: max` 与 `cancel-in-progress: false`；PR、main、release、deploy 和其他手工操作不得共享宽泛的可取消 group。
+required PR gate 使用独立 per-PR namespace，允许新 candidate 取消过期 PR 运行；merge_group、main、release、deploy 保持非抢占，且不得共享宽泛的可取消 group。
 只有完全可被新运行替代的普通 candidate/preview 才可在独立 per-PR namespace 取消过期运行；不因存在此规则而新增这类工作流。
 required check 不得因 workflow-level path/event filter 缺席；排队后的结果必须仍对应被评估的提交，重跑必须保留 run ID 与 attempt。
 队列容量有界，按进入等待的时间处理，不得承诺无限容量或 dispatch 时刻的严格顺序；版本正确性不得依赖队列代替原子占用。
@@ -228,7 +228,7 @@ Topic 不提供默认 transport、地址或 reusable notifier；reference、现�
 
 - covers: `REQ-ENG-009`
 - 方法：核验 workflow 事件与并发合同、实际 run history、required check 配置及同 PR/跨 PR/跨阶段的排队与重跑案例。
-- 通过条件：required gate 非抢占且不缺席，无 metadata 事件误取消、跨阶段互相取消或错认 SHA/attempt，容量与顺序说明符合平台语义。
+- 通过条件：required gate 不缺席，PR 可取消过期 candidate 且 main/release 非抢占，无 metadata 事件误取消、跨阶段互相取消或错认 SHA/attempt，容量与顺序说明符合平台语义。
 
 ### VER-ENG-007 — 版本政策与固定来源
 
