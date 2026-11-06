@@ -1073,9 +1073,8 @@ func (s *Service) recoverAttemptedDestroyStart(ctx context.Context, operation *s
 	original := mustJSON(worker)
 	observedAt := nowString(s.Clock())
 	return s.commitMutationContext(ctx, func() error {
-		if !s.mutationAllowed() {
-			return reject()
-		}
+		// The commit gate validates the lease while holding its lock. Calling
+		// mutationAllowed here would reacquire that lock and deadlock recovery.
 		return s.Store.RecoverOperationWorker(checkCtx, operation.OperationID, task.TaskID, func(response map[string]any) error {
 			if stringValue(response["outcome"]) != "pending" || mustJSON(response["worker"]) != original || stringValue(response["_request_digest"]) != digest {
 				return errUnresolvedWorker
