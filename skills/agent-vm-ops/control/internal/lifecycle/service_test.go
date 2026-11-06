@@ -6045,3 +6045,129 @@ func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
 		})
 	}
 }
+
+type quiescentDestroyRecoveryGuest struct {
+	*quiescentStartupGuest
+	deleted bool
+}
+
+func (guest *quiescentDestroyRecoveryGuest) Delete(_ context.Context, _ string) error {
+	guest.deleteCalls++
+	guest.deleted = true
+	return nil
+}
+func (guest *quiescentDestroyRecoveryGuest) Config(ctx context.Context, name string) (map[string]any, error) {
+	if guest.deleted {
+		return nil, missingInstanceError(name)
+	}
+	return guest.startupGuest.Config(ctx, name)
+}
+
+func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T) {
+	for _, scenario := range []string{"recover", "not-drained", "ordinary-drain", "not-resident", "bad-digest", "wrong-generation", "not-destroy", "native-busy", "active-operation", "role-lost", "not-startup-fenced", "partial-identity", "already-recovered"} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx := context.WithValue(context.Background(), startupRecoveryFenceContextKey{}, true)
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			if scenario == "not-startup-fenced" {
+				ctx = context.Background()
+			}
+			session, generation := "interrupted-destroy", int64(2)
+			req := protocol.Request{"protocol": protocol.Version, "action": "destroy", "session_id": session, "generation": generation, "operation_id": "original-destroy"}
+			digest, _ := protocol.Digest(req)
+			if scenario == "bad-digest" {
+				digest = "invalid"
+			}
+			taskGeneration := generation
+			if scenario == "wrong-generation" {
+				taskGeneration++
+			}
+			task := state.Task{TaskID: taskID(session), SessionID: session, Generation: taskGeneration, State: stateDeleting, InstanceName: "agent-vm-" + taskID(session), CreatedAt: nowString(time.Now()), UpdatedAt: nowString(time.Now()), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+			if err := store.InsertTask(ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			action := "destroy"
+			if scenario == "not-destroy" {
+				action = "restart"
+			}
+			original := map[string]any{"state": "starting", "start_attempted": true, "prepared_at": "2026-11-06T02:46:06Z"}
+			if scenario == "partial-identity" {
+				original["pid"] = 123
+			}
+			if err := store.RecordOperation(ctx, "original-destroy", action, &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": original}); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "already-recovered" {
+				if err := store.UpdateOperationResponse(ctx, "original-destroy", func(response map[string]any) error {
+					response["_worker_recovery_evidence"] = map[string]any{"outcome": "unknown"}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if scenario != "not-drained" {
+				if err := store.SetMeta(ctx, "draining", "1"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			owner := "release-test"
+			if scenario == "ordinary-drain" {
+				owner = "maintenance-test"
+			}
+			if err := store.SetMeta(ctx, "drain_owner", owner); err != nil {
+				t.Fatal(err)
+			}
+			guest := &quiescentDestroyRecoveryGuest{quiescentStartupGuest: &quiescentStartupGuest{startupGuest: &startupGuest{status: "Stopped", config: map[string]any{"devices": map[string]any{}, "expanded_devices": map[string]any{}, "config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": "2"}}}}}
+			if scenario == "native-busy" {
+				guest.quiescenceErr = errors.New("native background operations are not clear")
+			}
+			service := New(store, config.Defaults(), Options{Guest: guest, Resident: scenario != "not-resident"})
+			if scenario == "active-operation" {
+				defer service.markOperationActive("other")()
+			}
+			if scenario == "role-lost" {
+				service.SetMutationGate(func() bool { return false })
+			}
+			err = service.reconcilePendingWorker(ctx, "original-destroy")
+			operation, loadErr := store.GetOperation(ctx, "original-destroy")
+			if loadErr != nil {
+				t.Fatal(loadErr)
+			}
+			worker, _ := operation.Response["worker"].(map[string]any)
+			if scenario != "recover" {
+				if err == nil || worker["state"] != "starting" || operation.Response["outcome"] != "pending" {
+					t.Fatalf("unsafe recovery: err=%v record=%#v", err, operation.Response)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if worker["state"] != "exited" || worker["start_attempted"] != true || operation.Response["outcome"] != "pending" {
+				t.Fatalf("recovery invented operation completion: %#v", operation.Response)
+			}
+			if operation.Response["_worker_recovery_evidence"] == nil {
+				t.Fatal("original unknown worker evidence was lost")
+			}
+			if guest.deleteCalls != 0 || guest.startCalls != 0 {
+				t.Fatal("quiescence recovery executed native mutation")
+			}
+			if err := store.RecordOperation(ctx, "original-destroy", action, &session, &generation, map[string]any{"outcome": "success", "_request_digest": digest, "_worker_recovery_evidence": map[string]any{"outcome": "invented"}}); err == nil {
+				t.Fatal("terminal journal accepted replacement recovery evidence")
+			}
+			// Terminal journal recording must retain this verified evidence
+			// even when the later cleanup result does not repeat it.
+			if err := service.StartupReconcile(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			terminal, err := store.GetOperation(ctx, "original-destroy")
+			if err != nil || terminal.Response["outcome"] != "success" || terminal.Response["_worker_recovery_evidence"] == nil || guest.deleteCalls != 1 {
+				t.Fatal("terminal journal discarded recovery evidence")
+			}
+
+		})
+	}
+}

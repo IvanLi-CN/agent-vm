@@ -1287,12 +1287,69 @@ def _activation_safe_drain_enter(item: Any, metrics: Mapping[str, Any]) -> bool:
             and isinstance(operation, str) and re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", operation) is not None)
 
 
+def _unidentified_destroy_recovery_pending(pending: list[Any], metrics: Mapping[str, Any]) -> bool:
+    if not pending or len(pending) > 100 or type(metrics.get("in_flight_operations")) is not int or metrics["in_flight_operations"] != 0:
+        return False
+    identifiers: set[str] = set()
+    sessions: set[str] = set()
+    for item in pending:
+        if not isinstance(item, Mapping) or item.get("action") != "destroy":
+            return False
+        if type(item.get("generation")) is not int or item["generation"] <= 0:
+            return False
+        for key in ("operation_id", "session_id"):
+            if not isinstance(item.get(key), str) or not re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", item[key]):
+                return False
+        if item["operation_id"] in identifiers or item["session_id"] in sessions:
+            return False
+        identifiers.add(item["operation_id"])
+        sessions.add(item["session_id"])
+        worker = item.get("worker")
+        if not isinstance(worker, Mapping) or worker.get("state") != "starting" or worker.get("start_attempted") is not True or any(key in worker for key in ("pid", "start_time", "process_group")):
+            return False
+    return True
+
+
+def _verify_destroy_recovery_candidate(candidate_root: Path) -> None:
+    try:
+        result = subprocess.run([str(candidate_root / "bin/agent-vm-control"), "recovery-capabilities"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=10)
+        capabilities = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, json.JSONDecodeError):
+        _fail("drain_unverified", "candidate does not prove native worker recovery support")
+    if result.returncode != 0 or not isinstance(capabilities, Mapping) or type(capabilities.get("unidentified_destroy_start")) is not int or capabilities != {"unidentified_destroy_start": 1, "requires_release_drain": True}:
+        _fail("drain_unverified", "candidate does not prove native worker recovery support")
+
+
+def _fence_destroy_recovery_runtime() -> None:
+    # Stop the role owner first, then all possible native worker owners. A
+    # stopped CLI does not prove the Incus server's asynchronous effect ended.
+    units = ("agent-vm-deployd.service", "agent-vm-native@blue.service", "agent-vm-native@green.service", "agent-vm-native.service")
+    for unit in units:
+        _systemctl("stop", unit, allow_missing=True)
+    for unit in units:
+        try:
+            result = subprocess.run(["systemctl", "show", unit, "--property=MainPID", "--property=ControlGroup"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            _fail("drain_unverified", "worker recovery process fencing is unverified")
+        lines = result.stdout.decode("utf-8", errors="replace").splitlines()
+        if result.returncode != 0 or len(lines) != 2 or set(lines) != {"MainPID=0", "ControlGroup="}:
+            _fail("drain_unverified", "worker recovery process fencing is unverified")
+    try:
+        result = subprocess.run(["incus", "operation", "list", "--all-projects", "--format=json"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=30)
+        operations = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, json.JSONDecodeError):
+        _fail("drain_unverified", "native background operations cannot be verified")
+    if result.returncode != 0 or operations != []:
+        _fail("drain_unverified", "native background operations remain during worker recovery")
+
+
 def _ensure_drained(
     config: Mapping[str, Any],
     target_manifest: Mapping[str, Any] | None = None,
     *,
     allow_initial: bool = False,
-) -> None:
+    recovery_candidate_root: Path | None = None,
+) -> list[Mapping[str, Any]] | None:
     if not config["require_drained"]:
         return
     current = _current_target(Path(config["current_link"]), Path(config["release_root"]))
@@ -1390,6 +1447,12 @@ def _ensure_drained(
             # The live authority has already confirmed draining=true. Permit
             # only non-native drain-enter intents with no in-flight work;
             # keep their original journal records for bounded startup recovery.
+            if recovery_candidate_root is not None and _unidentified_destroy_recovery_pending(pending, metrics):
+                # Installation stays admission-fenced. Only the new business
+                # authority can verify the saved request and release owner,
+                # and it must not open admission if recovery is refused.
+                _verify_destroy_recovery_candidate(recovery_candidate_root)
+                return pending
             unsafe = [item for item in pending if not _activation_safe_drain_enter(item, metrics)]
             if unsafe:
                 safe_ids = _read_activation_safe_pending_ids()
@@ -2056,7 +2119,7 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     previous_link = Path(config["previous_link"])
     old_current = _current_target(current_link, release_root)
     old_previous = _current_target(previous_link, release_root)
-    _ensure_drained(config, candidate_manifest, allow_initial=old_current is None)
+    recovery_pending = _ensure_drained(config, candidate_manifest, allow_initial=old_current is None, recovery_candidate_root=staged)
     if old_current is not None and old_current == old_previous:
         _fail("activation_unverified", "current and previous pointers must not target the same release")
     if old_current is not None:
@@ -2100,6 +2163,14 @@ def _activate_unlocked(config: Mapping[str, Any], transaction_id: str, release_i
     _write_json(activation_path, record)
     runtime_switch_attempted = False
     try:
+        if recovery_pending:
+            record["activation_phase"] = "worker-recovery-fencing"
+            record["worker_recovery_pending"] = recovery_pending
+            _write_json(activation_path, record)
+            runtime_switch_attempted = True
+            _fence_destroy_recovery_runtime()
+            record["activation_phase"] = "worker-recovery-fenced"
+            _write_json(activation_path, record)
         manifest = load_release_manifest(release_dir / MANIFEST_NAME)
         _install_release_files(config, release_dir, manifest)
         record["activation_phase"] = "files-installed"

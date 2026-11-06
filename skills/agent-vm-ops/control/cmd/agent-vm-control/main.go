@@ -70,6 +70,11 @@ func run(args []string) error {
 		return nil
 	}
 	switch args[0] {
+	case "recovery-capabilities":
+		if len(args) != 1 {
+			return errors.New("recovery-capabilities accepts no arguments")
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"unidentified_destroy_start": 1, "requires_release_drain": true})
 	case "serve":
 		return serve(args[1:])
 	case "request":

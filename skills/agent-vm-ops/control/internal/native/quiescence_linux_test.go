@@ -80,3 +80,28 @@ func TestRecoveryOperationsRequireEmptyValidList(t *testing.T) {
 		}
 	}
 }
+
+func TestRecoverySlotBoundaryRejectsUnverifiedPeers(t *testing.T) {
+	group := `/system.slice/system-agent\x2dvm\x2dnative.slice/agent-vm-native@green.service`
+	valid := "MainPID=42\nControlGroup=" + group + "\nDelegate=no\nKillMode=control-group\n"
+	for _, tc := range []struct {
+		name, output string
+		ok           bool
+	}{
+		{"slot", valid, true},
+		{"inactive", "MainPID=0\nControlGroup=\nDelegate=no\nKillMode=control-group\n", true},
+		{"dead-pid-with-group", strings.Replace(valid, "MainPID=42", "MainPID=0", 1), false},
+		{"unexpected-group", strings.Replace(valid, "@green.service", "@blue.service", 1), false},
+		{"delegated", strings.Replace(valid, "Delegate=no", "Delegate=yes", 1), false},
+		{"wrong-kill-mode", strings.Replace(valid, "KillMode=control-group", "KillMode=process", 1), false},
+		{"missing", strings.Replace(valid, "Delegate=no\n", "", 1), false},
+		{"duplicate", valid + "MainPID=42\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := recoveryUnitGroup([]byte(tc.output), group)
+			if (err == nil) != tc.ok {
+				t.Fatalf("unexpected boundary validation: %v", err)
+			}
+		})
+	}
+}

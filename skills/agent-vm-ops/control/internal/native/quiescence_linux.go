@@ -20,29 +20,87 @@ func (c *IncusClient) VerifyRecoveryQuiescence(ctx context.Context) error {
 	if c == nil || c.Runner == nil || WorkerOperationID(ctx) != "" {
 		return errors.New("recovery quiescence requires the resident authority")
 	}
-	result, err := c.Runner.Run(ctx, []string{"systemctl", "show", "agent-vm-native.service", "--property=MainPID", "--property=ControlGroup", "--property=KillMode", "--property=Delegate"}, nil)
-	if err != nil || result.Code != 0 || result.StdoutTruncated || result.StderrTruncated {
-		return errors.New("control service identity cannot be verified")
-	}
-	group, err := recoveryServiceGroup(result.Stdout, os.Getpid())
-	if err != nil {
-		return err
-	}
 	current, err := os.ReadFile("/proc/self/cgroup")
-	if err != nil || !recoveryCgroupMatches(current, group) {
+	if err != nil {
 		return errors.New("control process cgroup is unverified")
 	}
-	if err := checkRecoveryCgroup(filepath.Join("/sys/fs/cgroup", group), os.Getpid()); err != nil {
+	groups := map[string]string{
+		"agent-vm-native.service":       "/system.slice/agent-vm-native.service",
+		"agent-vm-native@blue.service":  `/system.slice/system-agent\x2dvm\x2dnative.slice/agent-vm-native@blue.service`,
+		"agent-vm-native@green.service": `/system.slice/system-agent\x2dvm\x2dnative.slice/agent-vm-native@green.service`,
+	}
+	ownUnit := ""
+	for unit, group := range groups {
+		if recoveryCgroupMatches(current, group) {
+			ownUnit = unit
+		}
+	}
+	if ownUnit == "" {
+		return errors.New("control process cgroup is unverified")
+	}
+	identities := make(map[string]string)
+	verify := func(initial bool) error {
+		for _, unit := range []string{"agent-vm-native.service", "agent-vm-native@blue.service", "agent-vm-native@green.service"} {
+			result, err := c.Runner.Run(ctx, []string{"systemctl", "show", unit, "--property=MainPID", "--property=ControlGroup", "--property=KillMode", "--property=Delegate"}, nil)
+			if err != nil || result.Code != 0 || result.StdoutTruncated || result.StderrTruncated {
+				return errors.New("control service identity cannot be verified")
+			}
+			group, pid, err := recoveryUnitGroup(result.Stdout, groups[unit])
+			if err != nil {
+				return err
+			}
+			if unit == ownUnit && pid != os.Getpid() {
+				return errors.New("control service owner changed")
+			}
+			if ownUnit != "agent-vm-native.service" && unit == "agent-vm-native.service" && pid != 0 {
+				return errors.New("legacy singleton still owns processes")
+			}
+			if ownUnit == "agent-vm-native.service" && unit != ownUnit && pid != 0 {
+				return errors.New("slot processes still exist during singleton recovery")
+			}
+			if pid != 0 {
+				if err := checkRecoveryCgroup(filepath.Join("/sys/fs/cgroup", group), pid); err != nil {
+					return err
+				}
+			}
+			identity := string(result.Stdout)
+			if !initial && identities[unit] != identity {
+				return errors.New("control service identity changed during recovery")
+			}
+			identities[unit] = identity
+		}
+		return nil
+	}
+	if err := verify(true); err != nil {
 		return err
 	}
-	result, err = c.Runner.Run(ctx, []string{"incus", "operation", "list", "--all-projects", "--format=json"}, nil)
+	result, err := c.Runner.Run(ctx, []string{"incus", "operation", "list", "--all-projects", "--format=json"}, nil)
 	if err != nil || result.Code != 0 || result.StdoutTruncated || result.StderrTruncated {
 		return errors.New("native background operations cannot be verified")
 	}
 	if err := recoveryOperationsClear(result.Stdout); err != nil {
 		return err
 	}
-	return checkRecoveryCgroup(filepath.Join("/sys/fs/cgroup", group), os.Getpid())
+	return verify(false)
+}
+
+// recoveryUnitGroup accepts only a fixed systemd unit's protected process
+// boundary. An inactive unit must have neither a PID nor a remaining cgroup.
+func recoveryUnitGroup(output []byte, expectedGroup string) (string, int, error) {
+	properties := make(map[string]string)
+	for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if _, exists := properties[key]; !ok || exists {
+			return "", 0, errors.New("invalid control service identity")
+		}
+		properties[key] = value
+	}
+	pid, err := strconv.Atoi(properties["MainPID"])
+	group := properties["ControlGroup"]
+	if len(properties) != 4 || err != nil || pid < 0 || properties["KillMode"] != "control-group" || properties["Delegate"] != "no" || (pid == 0 && group != "") || (pid != 0 && group != expectedGroup) {
+		return "", 0, errors.New("control service process boundary is unverified")
+	}
+	return group, pid, nil
 }
 
 func recoveryServiceGroup(output []byte, self int) (string, error) {

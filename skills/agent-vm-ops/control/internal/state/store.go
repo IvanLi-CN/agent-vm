@@ -1058,6 +1058,16 @@ func (s *Store) RecordOperation(ctx context.Context, operationID, action string,
 					return err
 				}
 			}
+			if evidence, exists := current.Response["_worker_recovery_evidence"]; exists {
+				if incoming, supplied := response["_worker_recovery_evidence"]; supplied {
+					previousJSON, previousErr := json.Marshal(evidence)
+					incomingJSON, incomingErr := json.Marshal(incoming)
+					if previousErr != nil || incomingErr != nil || string(previousJSON) != string(incomingJSON) {
+						return errors.New("worker recovery evidence is immutable")
+					}
+				}
+				response["_worker_recovery_evidence"] = evidence
+			}
 			raw, err := json.Marshal(response)
 			if err != nil {
 				return err
@@ -1099,6 +1109,20 @@ func sameNullableInt64(left, right *int64) bool {
 // and bounded restart recovery metadata without introducing a second state
 // store or changing the existing operations table.
 func (s *Store) UpdateOperationResponse(ctx context.Context, operationID string, update func(map[string]any) error) error {
+	return s.updateOperationResponse(ctx, operationID, "", update, false)
+}
+
+// RecoverOperationWorker retains recovery evidence in the append-only audit
+// and the pending journal in the same transaction. Older compatible binaries
+// may finalize the journal without copying extension fields; the audit remains.
+func (s *Store) RecoverOperationWorker(ctx context.Context, operationID, taskID string, update func(map[string]any) error) error {
+	s.auditSummaryMu.Lock()
+	defer s.auditSummaryMu.Unlock()
+	s.auditSummaryReady = false
+	return s.updateOperationResponse(ctx, operationID, taskID, update, true)
+}
+
+func (s *Store) updateOperationResponse(ctx context.Context, operationID, taskID string, update func(map[string]any) error, recovery bool) error {
 	return s.withWrite(ctx, func(tx *Tx) error {
 		operation, err := scanOperation(ctx, tx.conn, operationID)
 		if err != nil {
@@ -1111,6 +1135,9 @@ func (s *Store) UpdateOperationResponse(ctx context.Context, operationID string,
 		previousResponse := map[string]any{}
 		if digest, ok := operation.Response["_request_digest"]; ok {
 			previousResponse["_request_digest"] = digest
+		}
+		if recovery && operation.Response["_worker_recovery_evidence"] != nil {
+			return errors.New("worker recovery was already attempted")
 		}
 		previousWorker, _ := operation.Response["worker"].(map[string]any)
 		if err := update(operation.Response); err != nil {
@@ -1138,6 +1165,19 @@ func (s *Store) UpdateOperationResponse(ctx context.Context, operationID string,
 		}
 		if rows != 1 {
 			return errors.New("operation journal is already finalized")
+		}
+		if recovery {
+			evidence, ok := operation.Response["_worker_recovery_evidence"].(map[string]any)
+			if !ok || outcome != "pending" || operation.Response["outcome"] != "pending" {
+				return errors.New("worker recovery evidence is missing")
+			}
+			detail, err := json.Marshal(map[string]any{"phase": "native-worker-quiescence", "operation_id": operationID, "worker_recovery": evidence})
+			if err != nil {
+				return err
+			}
+			if _, err := tx.exec("INSERT INTO audit(action, task_id, session_id, generation, outcome, detail_json, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)", operation.Action, nullableStringArg(stringPointerIfNonEmpty(taskID)), nullableStringArg(operation.SessionID), nullableIntArg(operation.Generation), "unknown", string(detail), time.Now().UTC().Format(time.RFC3339)); err != nil {
+				return err
+			}
 		}
 		return nil
 	})
