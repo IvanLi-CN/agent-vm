@@ -718,6 +718,21 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	controllerObservation := observation
 	controllerObservation.Consistent = observation.Consistent || observation.ControllerRecoveryOnly
 	if !validObservation(controllerObservation, manager.Clock().UTC()) {
+		// A changing business snapshot does not invalidate a separately verified,
+		// still-live role. Leave its original deadline unchanged and try again on
+		// the next maintenance tick. This neither renews nor grants authority;
+		// the slot's own expiry fence remains the bound on observation failure.
+		if retryLease != nil && manager.retryableControllerObservation(observation) {
+			current := observation.Slots[observation.ActiveSlot].ControllerLease
+			if current != nil && *current == *retryLease && retryLease.Validate(manager.Clock(), observation.ActiveSlot) == nil {
+				for _, slot := range []string{"blue", "green"} {
+					if err := manager.Runtime.DisableTraffic(ctx, slot); err != nil {
+						return manager.fenceSlots(ctx, errors.New("disable traffic during inconsistent business observation failed"))
+					}
+				}
+				return errors.New("business observation is inconsistent; traffic disabled and existing controller lease left unchanged until expiry")
+			}
+		}
 		return manager.fenceSlots(ctx, errors.New("slot observation is inconsistent"))
 	}
 	target, ok := observation.Slots[observation.ActiveSlot]
