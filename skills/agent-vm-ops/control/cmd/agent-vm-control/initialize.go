@@ -34,6 +34,9 @@ func initializeState(args []string) error {
 	if err != nil {
 		return err
 	}
+	if cfg.Slot != "blue" {
+		return errors.New("initialize-state requires initial blue slot identity")
+	}
 	if !remoteStateDSN(cfg.StateDB) {
 		return errors.New("initialize-state requires rqlite; SQLite initialization is forbidden")
 	}

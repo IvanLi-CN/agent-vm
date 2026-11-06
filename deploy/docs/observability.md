@@ -40,4 +40,4 @@ scrape_configs:
 
 活动槽位选择指标为 `agent_vm_deployd_slot_selected{slot="blue|green"}`。容量、任务等共享业务数据使用相同 job 与 instance 下的 selected 槽位过滤；不能对蓝绿镜像的同一业务数据求和。角色与进程面板必须保留两个槽位，不能用活动过滤掩盖 standby 失联。新鲜度与来源失败按[观测合同](../../docs/specs/agent-vm/contracts/observability.md)显示，不能把缺失序列补成健康零值。
 
-模板与渲染命令见[观测模板说明](../../skills/agent-vm/references/observability/README.md)。渲染后的 datasource UID、部署地址和 provisioning 文件属于部署环境，不提交本仓库。加载后必须以真实任务核对图例、数据与唯一 target，不能仅凭 JSON 通过检查认定看板正常。
+模板与渲染命令见[观测模板说明](../observability/README.md)。渲染后的 datasource UID、部署地址和 provisioning 文件属于部署环境，不提交本仓库。加载后必须以真实任务核对图例、数据与唯一 target，不能仅凭 JSON 通过检查认定看板正常。

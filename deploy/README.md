@@ -10,6 +10,8 @@
 - `assets/sysusers.d/`、`assets/tmpfiles.d/`：专用用户和目录配置。
 - `assets/blue-green/`：Caddy、rqlite 配置示例及固定组件清单。
 - `assets/*.example`：控制服务、Deployd 和 Web 的配置示例。
+- `scripts/`：部署发布器、受限封装、证书、校验、验收及观测渲染脚本；旧路径只保留兼容转发。
+- `observability/`：Grafana 看板与 provisioning 的唯一模板、示例和查询回归。
 - `docs/`：部署操作细节。
 
 示例中的占位符必须由部署方替换。真实地址、证书私钥、凭据、数据库和渲染后的观测配置不得提交到仓库。资料目录存在不代表自动安装或隔离验收已经完成。
@@ -23,3 +25,15 @@ bun deploy/scripts/build-materials.ts --source-revision "$(git rev-parse HEAD)" 
 ```
 
 此命令只生成资料目录与清单，不执行安装，不表示正式发布附件已生成。Go 安装入口已提供，完整隔离验收尚待完成，不能将构建资料视为验收通过。
+
+## 发布附件
+
+正式发布流程将同修订资料作为 `agent-vm-<version>-deployment-materials.tar` 附件，与产品包一并列入 `SHA256SUMS` 和发布 provenance。产品 tar 的格式及内部路径保持不变。资料附件包含组件清单、脚本、模板、文档及 `materials-manifest.json`，安装时解包为 `--materials` 指定的资料目录。
+
+可在干净且 HEAD 匹配的源码 checkout 生成候选附件：
+
+```sh
+bun deploy/scripts/build-materials.ts --archive --source-revision "$(git rev-parse HEAD)" --output /tmp/agent-vm-deployment-materials.tar
+```
+
+本命令只生成本地候选；它不发布 GitHub Release，也不安装到生产环境。

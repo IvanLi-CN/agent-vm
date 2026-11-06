@@ -110,11 +110,6 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	if os.Geteuid() != 0 {
 		return report, errors.New("--apply requires local root")
 	}
-	// Legacy releases retain their established fenced migration/publisher path;
-	// never overwrite a running singleton with bootstrap files.
-	if report.Mode == "legacy" {
-		return report, errors.New("legacy installation requires the existing release-wrapper migration transaction; fresh bootstrap is forbidden")
-	}
 	if err := safeParents("/var/lib/agent-vm-native/deployment"); err != nil {
 		return report, err
 	}
@@ -124,7 +119,7 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	}
 	defer lock.Close()
 	if report.Mode == "installed" {
-		return finishExisting(ctx, report)
+		return finishExisting(ctx, report, input)
 	}
 	// Recheck after locking: a concurrent installer may have completed preflight.
 	if _, err := os.Lstat("/var/lib/agent-vm-native/active"); !errors.Is(err, os.ErrNotExist) {
@@ -158,7 +153,7 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	} else {
 		return report, err
 	}
-	if r.Phase == "bootstrap_requested" {
+	if r.Phase == "bootstrap_requested" || r.Phase == "migration_requested" {
 		report.Next = "query agent-vm-deploy transaction --transaction " + r.TransactionID + "; resolve needs_recovery with recover before retrying installation"
 		return report, errors.New("bootstrap was already requested; uncertain effects will not be replayed")
 	}
@@ -217,6 +212,9 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		}
 	}
 	for _, name := range []string{"agent-vm-deployd", "agent-vm-deploy"} {
+		if report.Mode == "legacy" {
+			continue
+		}
 		if err := copyInstall(filepath.Join(product, "bin", name), filepath.Join("/opt/agent-vm-native/bin", name), 0755, ""); err != nil {
 			return report, err
 		}
@@ -248,6 +246,29 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	if err := command(ctx, "systemctl", "daemon-reload"); err != nil {
 		return report, err
 	}
+	if report.Mode == "legacy" {
+		if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-rqlite.service"); err != nil {
+			return report, err
+		}
+		r.Phase = "migration_requested"
+		if err := saveRecord(r); err != nil {
+			return report, err
+		}
+		if err := command(ctx, "python3", filepath.Join(input.Materials, "scripts/agent_vm_release.py"), "install-local", "--bundle", cachedBundle, "--transaction-id", r.TransactionID); err != nil {
+			report.Next = "inspect original wrapper transaction " + r.TransactionID + " and Deployd migrate/recover before retrying"
+			return report, err
+		}
+		if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-caddy.service"); err != nil {
+			return report, err
+		}
+		r.Phase = "complete"
+		if err := saveRecord(r); err != nil {
+			return report, err
+		}
+		report.Mode = "installed"
+		report.Next = "verify migrated state and VM lifecycle using deploy/docs/acceptance.md"
+		return report, nil
+	}
 	if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-rqlite.service", "agent-vm-deployd.service"); err != nil {
 		return report, err
 	}
@@ -278,7 +299,7 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	return report, nil
 }
 
-func finishExisting(ctx context.Context, report Report) (Report, error) {
+func finishExisting(ctx context.Context, report Report, input Inputs) (Report, error) {
 	client := deployd.Client{Socket: "/run/agent-vm-native/deployd.sock", Timeout: 30 * time.Second}
 	payload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
 	if err != nil {
@@ -286,7 +307,8 @@ func finishExisting(ctx context.Context, report Report) (Report, error) {
 	}
 	var status struct {
 		Value struct {
-			Observation deployd.RuntimeSnapshot `json:"observation"`
+			Observation  deployd.RuntimeSnapshot `json:"observation"`
+			Transactions []json.RawMessage       `json:"transactions"`
 		} `json:"value"`
 	}
 	if err := json.Unmarshal(payload, &status); err != nil {
@@ -294,7 +316,7 @@ func finishExisting(ctx context.Context, report Report) (Report, error) {
 	}
 	snapshot := status.Value.Observation
 	active, ok := snapshot.Slots[snapshot.ActiveSlot]
-	if !ok || !snapshot.Consistent || !snapshot.FreshUntil.After(time.Now()) || snapshot.ControllerSlot != snapshot.ActiveSlot || !active.Ready || !active.ControllerOwned || !active.TrafficAccepting {
+	if len(status.Value.Transactions) != 0 || !ok || !snapshot.Consistent || !snapshot.FreshUntil.After(time.Now()) || snapshot.ControllerSlot != snapshot.ActiveSlot || !active.Ready || !active.ControllerOwned || !active.TrafficAccepting {
 		return report, errors.New("existing installation is not verified ready; inspect Deployd status and recovery transactions")
 	}
 	data, err := protectedRead(recordPath)
@@ -310,6 +332,14 @@ func finishExisting(ctx context.Context, report Report) (Report, error) {
 		return report, err
 	}
 	if r.Phase != "complete" {
+		cfg, err := LoadConfig(input.Config)
+		if err != nil {
+			return report, err
+		}
+		digest, err := inputDigest(cfg)
+		if err != nil || digest != r.InputsSHA256 {
+			return report, errors.New("unfinished installation protected inputs differ")
+		}
 		if r.SourceRevision != report.SourceRevision || r.BundleSHA256 != report.BundleSHA256 {
 			return report, errors.New("unfinished installation inputs differ")
 		}

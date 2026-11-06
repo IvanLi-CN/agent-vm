@@ -24,7 +24,7 @@
 
 | 事实 | 代码或合同证据 | 对方案的影响 |
 | --- | --- | --- |
-| 仓库没有内置 Web 应用；已有 Grafana dashboard 模板与部署侧渲染合同。 | `README.md`；`skills/agent-vm/references/observability/README.md`；`docs/specs/agent-vm/contracts/observability.md`。 | 新建产品操作面；历史时序与部署观测继续由 Grafana 承担。 |
+| 仓库没有内置 Web 应用；已有 Grafana dashboard 模板与部署侧渲染合同。 | `README.md`；`deploy/observability/README.md`；`docs/specs/agent-vm/contracts/observability.md`。 | 新建产品操作面；历史时序与部署观测继续由 Grafana 承担。 |
 | Gin 当前只有 control、health、固定 snapshot 三类内部路由，监听受保护 UDS。 | `skills/agent-vm-ops/control/internal/httpserver/server.go:64`、`:171`。 | 需要新增浏览器访问与认证边界，不能直接公开内部 handler。 |
 | 当前 peer UID 校验依赖 Unix 连接 context，socket 和父目录权限分别为 `0600`、`0700`。 | `internal/httpserver/server.go:71`、`:175`、`:205`，路径均相对于 Go control module。 | 把现有 handler 原样挂 TCP 会失去这套认证假设。 |
 | 单一 Go authority 独占 SQLite、生命周期、native worker 与 scheduler。 | `control/cmd/agent-vm-control/main.go:95`；`control/internal/lifecycle/service.go:354`。 | Web 不得建立第二个 SQLite writer 或 Incus 控制权威。 |

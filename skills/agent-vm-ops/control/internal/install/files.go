@@ -9,6 +9,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"syscall"
 )
 
 // installFile never replaces an existing file. An equal owned regular file is
@@ -29,7 +30,8 @@ func installFile(path string, data []byte, mode os.FileMode, group string) error
 		}
 	}
 	if info, err := os.Lstat(path); err == nil {
-		if !info.Mode().IsRegular() || info.Mode().Perm() != mode {
+		owner, owned := info.Sys().(*syscall.Stat_t)
+		if !owned || owner.Uid != 0 || int(owner.Gid) != gid || !info.Mode().IsRegular() || info.Mode().Perm() != mode {
 			return fmt.Errorf("refusing to replace existing installation path: %s", path)
 		}
 		existing, err := os.ReadFile(path)
@@ -88,7 +90,8 @@ func safeParents(path string) error {
 	if err != nil {
 		return err
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0022 != 0 {
+	owner, owned := info.Sys().(*syscall.Stat_t)
+	if !owned || owner.Uid != 0 || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0022 != 0 {
 		return fmt.Errorf("unsafe installation parent: %s", path)
 	}
 	return nil

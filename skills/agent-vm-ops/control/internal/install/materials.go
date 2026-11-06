@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 )
 
 type Material struct {
@@ -121,6 +122,13 @@ func materialFile(root, name string) (*os.File, error) {
 		info, err := os.Lstat(current)
 		if err != nil {
 			return nil, err
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok || (int(st.Uid) != 0 && int(st.Uid) != os.Geteuid()) {
+			return nil, errors.New("material path is not owned by the invoking user or root")
+		}
+		if info.Mode().Perm()&0022 != 0 && !(current != full && info.IsDir() && info.Mode()&os.ModeSticky != 0 && st.Uid == 0) {
+			return nil, errors.New("material path is writable by other users")
 		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			return nil, errors.New("material path traverses a symlink")

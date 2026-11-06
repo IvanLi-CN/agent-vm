@@ -18,7 +18,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location(
-    "agent_vm_release_manifest", ROOT / "skills/agent-vm-ops/scripts/release_manifest.py"
+    "agent_vm_release_manifest", ROOT / "deploy/scripts/release_manifest.py"
 )
 assert SPEC and SPEC.loader
 MANIFEST = importlib.util.module_from_spec(SPEC)

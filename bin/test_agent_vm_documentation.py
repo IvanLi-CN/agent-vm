@@ -16,7 +16,7 @@ RELEASE_CONTRACT = ROOT / "docs/specs/agent-vm/contracts/release.md"
 ADR = ROOT / "docs/adr/0028-agent-vm-topology-recovery-boundary.md"
 OPS_SKILL = ROOT / "skills/agent-vm-ops/SKILL.md"
 AGENT_SKILL = ROOT / "skills/agent-vm/SKILL.md"
-DEPLOYMENT = ROOT / "skills/agent-vm-ops/references/deployment.md"
+DEPLOYMENT = ROOT / "deploy/docs/legacy-release.md"
 INITIALIZATION = ROOT / "skills/agent-vm-ops/references/initialization.md"
 INITIALIZATION_SCRIPT = ROOT / "skills/agent-vm-ops/scripts/agent_vm_incus_init.ts"
 INCUS_INITIALIZATION_ADR = ROOT / "docs/adr/0041-agent-vm-incus-project-initialization.md"
@@ -109,7 +109,7 @@ class AgentVmDocumentationTests(unittest.TestCase):
         self.assertIn("../OPERATIONS.md", cli_contract)
         self.assertIn("0028-agent-vm-topology-recovery-boundary.md", spec)
         self.assertIn("../../docs/specs/agent-vm/OPERATIONS.md", ops_skill)
-        self.assertIn("../../../docs/specs/agent-vm/OPERATIONS.md", deployment)
+        self.assertIn("../../docs/specs/agent-vm/OPERATIONS.md", deployment)
         self.assertIn("references/initialization.md", ops_skill)
         self.assertIn("initialization reference", deployment)
         self.assertTrue(INITIALIZATION_SCRIPT.is_file())

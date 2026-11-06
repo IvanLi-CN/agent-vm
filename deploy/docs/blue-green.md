@@ -151,7 +151,7 @@ Deployd SQLite 与业务状态分离。Deployd 的终态事务、阶段事件和
 重型验收必须在当前会话拥有的 Agent VM 中运行，不在开发机上运行：
 
 ```sh
-AGENT_VM_REAL_SYSTEMD=1 bash skills/agent-vm-ops/scripts/agent_vm_deployment_acceptance.sh
+AGENT_VM_REAL_SYSTEMD=1 bash deploy/scripts/agent_vm_deployment_acceptance.sh
 ```
 
 验收必须证明两个槽位可以同时观测、同一时刻只有一个 controller lease、Deployd 只有一个 Prometheus pull 出口、迁移失败保持 `needs_recovery`、Deployd 重启不会猜测角色、普通切换能够执行有限 rollback，并且迁移 snapshot 会按保留期清理。

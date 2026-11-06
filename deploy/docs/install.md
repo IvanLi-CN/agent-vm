@@ -74,4 +74,4 @@ sudo /opt/agent-vm-native/bin/agent-vm-deploy transaction --transaction '<原事
 
 active 尚不存在时，可以显式请求 `recover --transaction '<原事务ID>' --action resume-bootstrap`，它会重新验证无业务任务的初始 rqlite，保留原事务身份。active 已存在时，此动作会被拒绝，按[蓝绿手册](blue-green.md)的 `finalize` 合同恢复。原事务完成后，再次运行相同安装命令以完成尚未启动的 Caddy。不要删除安装记录、Deployd 数据库或业务状态来绕过恢复。
 
-已有蓝绿安装只核验并指向升级入口，不覆盖配置、不排空实例；升级命令见[蓝绿手册](blue-green.md)。存在旧业务 SQLite 时必须走既有发布封装与 `migrate` 事务，不能当作空环境初始化；该环境分流尚未接入 Go 安装器，当前会明确拒绝 `--apply`，不得宣称自动迁移完成。
+已有蓝绿安装只核验并指向升级入口，不覆盖配置、不排空实例；升级命令见[蓝绿手册](blue-green.md)。存在旧业务 SQLite 时必须走既有发布封装与 `migrate` 事务，不能当作空环境初始化；Go 安装器识别 `mode=legacy` 后，通过本机发布适配器委托既有发布封装和 Deployd 迁移事务，保留已有配置、原事务和不确定结果证据；必须已经存在受保护的 `/etc/agent-vm-native/release-wrapper.json`。迁移结果不确定时不会自动重放，先查询该原始发布事务和 Deployd 的迁移事务。

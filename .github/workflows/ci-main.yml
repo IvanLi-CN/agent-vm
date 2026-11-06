@@ -81,6 +81,7 @@ jobs:
           bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target client --output "$build_root/client.tar"
           bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target linux/amd64 --output "$build_root/amd64.tar"
           bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target linux/arm64 --output "$build_root/arm64.tar"
+          bun run deploy/scripts/build-materials.ts --archive --source-revision "$GITHUB_SHA" --output "$build_root/deployment-materials.tar"
       - name: Finalize CI caches
         if: always() && steps.ci_cache.outcome == 'success'
         uses: ./.github/actions/ci-cache-save

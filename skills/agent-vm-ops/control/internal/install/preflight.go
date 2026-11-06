@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -39,7 +40,7 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 	}
 	cfg, configErr := LoadConfig(input.Config)
 	add(configErr)
-	f, err := os.Open(input.Bundle)
+	f, err := materialFile(filepath.Dir(input.Bundle), filepath.Base(input.Bundle))
 	if err != nil {
 		add(errors.New("product bundle unavailable"))
 	} else {
@@ -63,9 +64,19 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 	if report.Mode == "fresh" {
 		if _, err := os.Lstat("/var/lib/agent-vm-native/state.sqlite3"); err == nil {
 			report.Mode = "legacy"
-			report.Next = "delegate the existing migration transaction through the release wrapper"
+			report.Next = "--apply delegates the existing migration transaction through the local release wrapper"
 		} else if !errors.Is(err, os.ErrNotExist) {
 			add(errors.New("legacy state cannot be inspected"))
+		}
+	}
+	if report.Mode == "legacy" {
+		if _, e := protectedRead("/etc/agent-vm-native/release-wrapper.json"); e != nil {
+			add(errors.New("legacy migration requires the existing protected release-wrapper configuration"))
+		}
+		for _, name := range []string{"python3", "bun"} {
+			if _, e := exec.LookPath(name); e != nil {
+				add(fmt.Errorf("legacy migration missing prerequisite: %s", name))
+			}
 		}
 	}
 	for _, name := range []string{"systemctl", "systemd-sysusers", "systemd-tmpfiles", "incus"} {

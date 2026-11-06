@@ -14,7 +14,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[3]
-SCRIPTS = ROOT / "skills/agent-vm-ops/scripts"
+SCRIPTS = ROOT / "deploy/scripts"
 if str(SCRIPTS) not in os.sys.path:
     os.sys.path.insert(0, str(SCRIPTS))
 import agent_vm_release as RELEASE  # noqa: E402

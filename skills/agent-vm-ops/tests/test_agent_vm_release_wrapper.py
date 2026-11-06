@@ -17,7 +17,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[3]
-SCRIPTS = ROOT / "skills/agent-vm-ops/scripts"
+SCRIPTS = ROOT / "deploy/scripts"
 if str(SCRIPTS) not in os.sys.path:
     os.sys.path.insert(0, str(SCRIPTS))
 import agent_vm_release as RELEASE  # noqa: E402
@@ -1095,7 +1095,7 @@ class WrapperTests(unittest.TestCase):
         for name in WRAPPER.SUPPORT_ARTIFACT_NAMES:
             with self.subTest(support=name):
                 installed = Path(self.loaded["control_path"]).with_name(name)
-                source_scripts = ROOT / "skills/agent-vm/scripts" if name in WRAPPER.CLIENT_PACKAGE_MODES else SCRIPTS
+                source_scripts = ROOT / "skills/agent-vm/scripts" if name in WRAPPER.CLIENT_PACKAGE_MODES else (SCRIPTS if name == "release_manifest.py" else ROOT / "skills/agent-vm-ops/scripts")
                 self.assertEqual(installed.read_bytes(), (source_scripts / name).read_bytes())
                 self.assertEqual(stat.S_IMODE(installed.stat().st_mode), WRAPPER.SUPPORT_ARTIFACT_MODES[name])
                 self.assertEqual(installed.stat().st_uid, os.getuid())
