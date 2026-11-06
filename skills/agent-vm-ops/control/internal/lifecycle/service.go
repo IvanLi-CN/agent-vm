@@ -788,9 +788,9 @@ func (s *Service) WorkerStartAllowed(ctx context.Context, operationID string) er
 	if workerNeedsReconciliation(previous, true) {
 		return errUnresolvedWorker
 	}
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-	defer cancel()
 	return s.commitMutationContext(ctx, func() error {
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
 		return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
 			worker, _ := response["worker"].(map[string]any)
 			if workerNeedsReconciliation(worker, true) {
@@ -824,10 +824,12 @@ func (s *Service) updateWorker(ctx context.Context, operationID string, worker m
 		return nil
 	}
 	// A worker must remain journaled even when its action context has timed out.
-	// The bounded background context only covers this small durable update.
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-	defer cancel()
+	// Start its bounded persistence budget after the controller commit gate is
+	// acquired. Remote epoch synchronization and concurrent observation can take
+	// longer than a local SQLite update; retain a ten-second bound for that I/O.
 	return s.commitMutationContext(ctx, func() error {
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
 		return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
 			if callback != workerCallbackState {
 				if previous, ok := response["worker"].(map[string]any); ok && stringValue(previous["state"]) == "running" {

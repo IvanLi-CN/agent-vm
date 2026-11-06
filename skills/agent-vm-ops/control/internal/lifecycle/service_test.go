@@ -6300,3 +6300,39 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 		})
 	}
 }
+
+func TestWorkerJournalSurvivesCommitQueueAndCanceledAction(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "queued-worker.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.RecordOperation(ctx, "queued-worker", "acquire", stringPointer("queued-session"), nil, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "starting"}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	entered, release := make(chan struct{}), make(chan struct{})
+	service.SetMutationCommit(func(commit func() error) error { close(entered); <-release; return commit() })
+	actionCtx, cancel := context.WithCancel(ctx)
+	result := make(chan error, 1)
+	identity := native.WorkerIdentity{PID: 123, StartTime: "queued-start", ProcessGroup: 123}
+	go func() { result <- service.WorkerStarted(actionCtx, "queued-worker", identity) }()
+	<-entered
+	cancel()
+	// A real remote-backed commit can queue behind a coherent observation for
+	// longer than the old two-second local-only journal deadline.
+	time.Sleep(2100 * time.Millisecond)
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(ctx, "queued-worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := operation.Response["worker"].(map[string]any)
+	if worker["state"] != "running" || intValue(worker["pid"]) != 123 {
+		t.Fatalf("worker identity lost: %#v", worker)
+	}
+}
