@@ -70,9 +70,7 @@ func (manager *Manager) finishBootstrap(ctx context.Context, tx store.Transactio
 	id, bundle := tx.ID, tx.Bundle
 	failureContext := ctx
 	fail := func(phase string, cause error) (*store.Transaction, error) {
-		cleanup, cancel := context.WithTimeout(context.WithoutCancel(failureContext), 30*time.Second)
-		defer cancel()
-		return nil, manager.effectFailure(cleanup, id, phase, cause)
+		return nil, manager.effectFailure(failureContext, id, phase, cause)
 	}
 	if err := manager.Runtime.Verify(ctx, "blue", bundle); err != nil {
 		return fail(PhaseBootstrap, err)

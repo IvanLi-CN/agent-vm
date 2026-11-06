@@ -998,6 +998,10 @@ func failureMessage(phase, code string) string {
 }
 
 func (manager *Manager) effectFailure(ctx context.Context, id, phase string, cause error) error {
+	// A request timeout cannot cancel recording an uncertain runtime effect or
+	// revoking its roles. Cleanup remains bounded and never resumes deployment.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
 	failureErr := manager.failure(ctx, id, phase, &UncertainError{Cause: cause})
 	fenceErr := manager.fenceSlots(ctx, errors.New("deployment runtime effect failed; controller roles were fenced"))
 	if fenceErr != nil {

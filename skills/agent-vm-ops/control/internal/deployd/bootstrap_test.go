@@ -16,6 +16,61 @@ type bootstrapFake struct {
 	preparations int
 }
 
+type canceledBootstrapRuntime struct {
+	*bootstrapFake
+	cancel context.CancelFunc
+	fenced map[string]bool
+}
+
+func (r *canceledBootstrapRuntime) PrepareBootstrap(ctx context.Context, _ string) error {
+	r.cancel()
+	return ctx.Err()
+}
+
+func (r *canceledBootstrapRuntime) DisableTraffic(ctx context.Context, slot string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return r.fakeRuntime.DisableTraffic(ctx, slot)
+}
+
+func (r *canceledBootstrapRuntime) FenceController(ctx context.Context, slot string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		return errors.New("cleanup must have a deadline")
+	}
+	r.fenced[slot] = true
+	return r.fakeRuntime.FenceController(ctx, slot)
+}
+
+func TestBootstrapCancellationPreservesEvidenceAndFencesBothSlots(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runtime := &canceledBootstrapRuntime{
+		bootstrapFake: &bootstrapFake{fakeRuntime: &fakeRuntime{active: "none", observations: map[string]SlotObservation{"blue": {}, "green": {}}, traffic: map[string]bool{}}},
+		cancel:        cancel, fenced: map[string]bool{},
+	}
+	manager := NewManager(db, runtime, time.Minute, time.Now)
+	id := "install-0123456789abcdef0123456789abcdef"
+	if _, err := manager.Bootstrap(ctx, id, "/bundle.tar"); err == nil {
+		t.Fatal("canceled preparation succeeded")
+	}
+	tx, err := db.Get(context.Background(), id)
+	if err != nil || tx == nil || tx.State != "needs_recovery" || !tx.RecoveryRequired {
+		t.Fatalf("uncertain effect was not recorded: %+v %v", tx, err)
+	}
+	if !runtime.fenced["blue"] || !runtime.fenced["green"] {
+		t.Fatalf("canceled request prevented fencing: %v", runtime.fenced)
+	}
+}
+
 func (r *bootstrapFake) CheckBootstrap(context.Context) error {
 	if r.active != "none" {
 		return errors.New("already installed")

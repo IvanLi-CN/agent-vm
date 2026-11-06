@@ -24,7 +24,7 @@
 bun deploy/scripts/build-materials.ts --source-revision "$(git rev-parse HEAD)" --output /tmp/agent-vm-deployment-materials
 ```
 
-此命令只生成资料目录与清单，不执行安装，不表示正式发布附件已生成。Go 安装入口已提供，完整隔离验收尚待完成，不能将构建资料视为验收通过。
+此命令只生成资料目录与清单，不执行安装，不表示正式发布附件已生成。生成资料后仍须按[验收说明](docs/acceptance.md)核验完整流程，不能将构建资料视为验收通过。
 
 ## 发布附件
 
