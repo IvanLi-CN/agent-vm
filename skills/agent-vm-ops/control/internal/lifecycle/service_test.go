@@ -9,8 +9,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -6064,7 +6066,7 @@ func (guest *quiescentDestroyRecoveryGuest) Config(ctx context.Context, name str
 }
 
 func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T) {
-	for _, scenario := range []string{"recover", "not-drained", "ordinary-drain", "not-resident", "bad-digest", "wrong-generation", "not-destroy", "native-busy", "active-operation", "role-lost", "not-startup-fenced", "partial-identity", "already-recovered"} {
+	for _, scenario := range []string{"recover", "recover-identified", "live-identity", "invalid-identity", "not-drained", "ordinary-drain", "not-resident", "bad-digest", "wrong-generation", "not-destroy", "native-busy", "active-operation", "role-lost", "not-startup-fenced", "partial-identity", "already-recovered"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.WithValue(context.Background(), startupRecoveryFenceContextKey{}, true)
 			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
@@ -6096,6 +6098,33 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 			original := map[string]any{"state": "starting", "start_attempted": true, "prepared_at": "2026-11-06T02:46:06Z"}
 			if scenario == "partial-identity" {
 				original["pid"] = 123
+			}
+			if scenario == "recover-identified" || scenario == "invalid-identity" {
+				original["pid"] = 1000000000
+				original["process_group"] = 1000000000
+				original["start_time"] = "16837775"
+				if scenario == "invalid-identity" {
+					original["start_time"] = "invalid"
+				}
+			}
+			if scenario == "live-identity" {
+				if runtime.GOOS != "linux" {
+					t.Skip("real worker process identity requires Linux procfs")
+				}
+				child := exec.Command("sleep", "30")
+				child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+				if err := child.Start(); err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = child.Process.Kill(); _ = child.Wait() }()
+				raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", child.Process.Pid))
+				if err != nil {
+					t.Fatal(err)
+				}
+				fields := strings.Fields(string(raw)[strings.LastIndexByte(string(raw), ')')+1:])
+				original["pid"] = child.Process.Pid
+				original["process_group"] = child.Process.Pid
+				original["start_time"] = fields[19]
 			}
 			if err := store.RecordOperation(ctx, "original-destroy", action, &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": original}); err != nil {
 				t.Fatal(err)
@@ -6137,7 +6166,7 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 				t.Fatal(loadErr)
 			}
 			worker, _ := operation.Response["worker"].(map[string]any)
-			if scenario != "recover" {
+			if scenario != "recover" && scenario != "recover-identified" {
 				if err == nil || worker["state"] != "starting" || operation.Response["outcome"] != "pending" {
 					t.Fatalf("unsafe recovery: err=%v record=%#v", err, operation.Response)
 				}

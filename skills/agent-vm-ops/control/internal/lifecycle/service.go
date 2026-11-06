@@ -959,7 +959,7 @@ func (s *Service) reconcilePendingWorker(ctx context.Context, operationID string
 			return nil
 		}
 		if attempted {
-			return s.recoverUnidentifiedDestroyStart(ctx, operation, worker)
+			return s.recoverAttemptedDestroyStart(ctx, operation, worker)
 		}
 	}
 	if stringValue(worker["state"]) != "running" && !(stringValue(worker["state"]) == "finished" && stringValue(worker["error"]) != "") {
@@ -1001,12 +1001,12 @@ func (s *Service) reconcilePendingWorker(ctx context.Context, operationID string
 	return nil
 }
 
-// recoverUnidentifiedDestroyStart resolves only worker liveness, never the
+// recoverAttemptedDestroyStart resolves only worker liveness, never the
 // original native outcome. Startup holds the cross-process drain, maintenance
 // and session locks; a live controller must still commit the evidence.
-func (s *Service) recoverUnidentifiedDestroyStart(ctx context.Context, operation *state.Operation, worker map[string]any) error {
+func (s *Service) recoverAttemptedDestroyStart(ctx context.Context, operation *state.Operation, worker map[string]any) error {
 	reject := func() error {
-		return protocol.NewError("state_unverified", "pending native worker start has no durable identity", map[string]any{"operation_id": operation.OperationID})
+		return protocol.NewError("state_unverified", "pending native worker start requires verified recovery", map[string]any{"operation_id": operation.OperationID})
 	}
 	fenced, _ := ctx.Value(startupRecoveryFenceContextKey{}).(bool)
 	if operation.Response["_worker_recovery_evidence"] != nil || !s.resident || !fenced || !s.mutationAllowed() || s.activeOperationCount() != 0 || native.WorkerOperationID(ctx) != "" || operation.Action != "destroy" || operation.SessionID == nil || operation.Generation == nil {
@@ -1019,10 +1019,20 @@ func (s *Service) recoverUnidentifiedDestroyStart(ctx context.Context, operation
 	if !drained {
 		return reject()
 	}
-	for _, key := range []string{"pid", "start_time", "process_group"} {
-		if _, exists := worker[key]; exists {
+	_, hasPID := worker["pid"]
+	_, hasStart := worker["start_time"]
+	_, hasGroup := worker["process_group"]
+	identified := hasPID || hasStart || hasGroup
+	var identity native.WorkerIdentity
+	if identified {
+		pid, pidOK := protocol.Integer(worker["pid"])
+		group, groupOK := protocol.Integer(worker["process_group"])
+		start, startOK := worker["start_time"].(string)
+		startValue, startErr := strconv.ParseUint(start, 10, 64)
+		if !hasPID || !hasStart || !hasGroup || !pidOK || !groupOK || !startOK || pid <= 0 || group <= 0 || startErr != nil || startValue == 0 {
 			return reject()
 		}
+		identity = native.WorkerIdentity{PID: int(pid), ProcessGroup: int(group), StartTime: start}
 	}
 	raw, ok := operation.Response["_request"].(map[string]any)
 	if !ok {
@@ -1051,6 +1061,14 @@ func (s *Service) recoverUnidentifiedDestroyStart(ctx context.Context, operation
 	defer cancel()
 	if err := probe.VerifyRecoveryQuiescence(checkCtx); err != nil {
 		return reject()
+	}
+	if identified {
+		// A stored starting identity is not proof that a worker became
+		// running. Never signal a possibly reused PID during this recovery.
+		alive, err := native.WorkerAlive(identity)
+		if err != nil || alive {
+			return reject()
+		}
 	}
 	original := mustJSON(worker)
 	observedAt := nowString(s.Clock())

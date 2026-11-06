@@ -1418,7 +1418,7 @@ class WorkerRecoveryBootstrapTests(unittest.TestCase):
         responses = [
             {"ok": True, "result": {"draining": True}},
             {"ok": True, "result": {"pending_operations": pending, "in_flight_operations": 0}},
-            {"unidentified_destroy_start": 1, "requires_release_drain": True},
+            {"attempted_destroy_start": 1, "requires_release_drain": True},
         ]
         with mock.patch.object(WRAPPER, "_current_target", return_value=Path("/retained-release")), mock.patch.object(WRAPPER, "_read_activation_safe_pending_ids", side_effect=AssertionError("must not consult legacy state")), mock.patch.object(WRAPPER, "_systemctl") as systemctl, mock.patch.object(WRAPPER.subprocess, "run", side_effect=[subprocess.CompletedProcess([],0,json.dumps(value).encode(),b"") for value in responses]):
             result = WRAPPER._ensure_drained({"require_drained":True,"current_link":"/current","release_root":"/releases","control_path":"/client.ts"}, recovery_candidate_root=Path("/verified-candidate"))
@@ -1427,7 +1427,7 @@ class WorkerRecoveryBootstrapTests(unittest.TestCase):
 
     def test_unknown_worker_requires_exact_bounded_destroy_barrier(self):
         metrics = {"in_flight_operations": 0}
-        self.assertTrue(WRAPPER._unidentified_destroy_recovery_pending(self.pending(), metrics))
+        self.assertTrue(WRAPPER._attempted_destroy_recovery_pending(self.pending(), metrics))
         for change in ("pid", "generation", "action", "attempted", "duplicate", "inflight"):
             with self.subTest(change=change):
                 pending, current = self.pending(), dict(metrics)
@@ -1437,7 +1437,16 @@ class WorkerRecoveryBootstrapTests(unittest.TestCase):
                 elif change == "attempted": pending[0]["worker"]["start_attempted"] = False
                 elif change == "duplicate": pending += self.pending()
                 elif change == "inflight": current["in_flight_operations"] = 1
-                self.assertFalse(WRAPPER._unidentified_destroy_recovery_pending(pending, current))
+                self.assertFalse(WRAPPER._attempted_destroy_recovery_pending(pending, current))
+
+    def test_complete_starting_identity_can_install_recovery_but_partial_cannot(self):
+        pending = self.pending()
+        pending[0]["worker"].update(pid=1000000000, process_group=1000000000, start_time="16837775")
+        self.assertTrue(WRAPPER._attempted_destroy_recovery_pending(pending, {"in_flight_operations": 0}))
+        for key,value in (("pid", True),("pid",0),("process_group",0),("start_time","invalid"),("start_time","0")):
+            with self.subTest(key=key,value=value):
+                modified=json.loads(json.dumps(pending));modified[0]["worker"][key]=value
+                self.assertFalse(WRAPPER._attempted_destroy_recovery_pending(modified, {"in_flight_operations":0}))
 
     def test_recovery_fences_all_worker_owners_before_checking_incus(self):
         calls = []
@@ -1482,7 +1491,7 @@ class WorkerRecoveryBootstrapTests(unittest.TestCase):
                     with self.assertRaises(WRAPPER.WrapperError): WRAPPER._verify_stopped_recovery_cgroups(root)
 
     def test_old_or_malformed_candidate_cannot_bypass_pending_fence(self):
-        for output in (b"old binary", b"{}", b'{"unidentified_destroy_start":true,"requires_release_drain":true}', b'{"unidentified_destroy_start":1,"requires_release_drain":false}'):
+        for output in (b'{"unidentified_destroy_start":1,"requires_release_drain":true}', b"old binary", b"{}", b'{"attempted_destroy_start":true,"requires_release_drain":true}', b'{"attempted_destroy_start":1,"requires_release_drain":false}'):
             with mock.patch.object(WRAPPER.subprocess, "run", return_value=subprocess.CompletedProcess([],0,output,b"")):
                 with self.assertRaises(WRAPPER.WrapperError): WRAPPER._verify_destroy_recovery_candidate(Path("/verified-candidate"))
 

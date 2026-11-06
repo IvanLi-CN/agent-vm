@@ -1287,7 +1287,7 @@ def _activation_safe_drain_enter(item: Any, metrics: Mapping[str, Any]) -> bool:
             and isinstance(operation, str) and re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", operation) is not None)
 
 
-def _unidentified_destroy_recovery_pending(pending: list[Any], metrics: Mapping[str, Any]) -> bool:
+def _attempted_destroy_recovery_pending(pending: list[Any], metrics: Mapping[str, Any]) -> bool:
     if not pending or len(pending) > 100 or type(metrics.get("in_flight_operations")) is not int or metrics["in_flight_operations"] != 0:
         return False
     identifiers: set[str] = set()
@@ -1305,8 +1305,17 @@ def _unidentified_destroy_recovery_pending(pending: list[Any], metrics: Mapping[
         identifiers.add(item["operation_id"])
         sessions.add(item["session_id"])
         worker = item.get("worker")
-        if not isinstance(worker, Mapping) or worker.get("state") != "starting" or worker.get("start_attempted") is not True or any(key in worker for key in ("pid", "start_time", "process_group")):
+        if not isinstance(worker, Mapping) or worker.get("state") != "starting" or worker.get("start_attempted") is not True:
             return False
+        identity_keys = ("pid", "start_time", "process_group")
+        if any(key in worker for key in identity_keys):
+            if not all(key in worker for key in identity_keys):
+                return False
+            if any(type(worker[key]) is not int or worker[key] <= 0 for key in ("pid", "process_group")):
+                return False
+            start = worker["start_time"]
+            if not isinstance(start, str) or re.fullmatch(r"[0-9]{1,20}", start) is None or not 0 < int(start) <= 18446744073709551615:
+                return False
     return True
 
 
@@ -1316,7 +1325,7 @@ def _verify_destroy_recovery_candidate(candidate_root: Path) -> None:
         capabilities = json.loads(result.stdout)
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, json.JSONDecodeError):
         _fail("drain_unverified", "candidate does not prove native worker recovery support")
-    if result.returncode != 0 or not isinstance(capabilities, Mapping) or type(capabilities.get("unidentified_destroy_start")) is not int or capabilities != {"unidentified_destroy_start": 1, "requires_release_drain": True}:
+    if result.returncode != 0 or not isinstance(capabilities, Mapping) or type(capabilities.get("attempted_destroy_start")) is not int or capabilities != {"attempted_destroy_start": 1, "requires_release_drain": True}:
         _fail("drain_unverified", "candidate does not prove native worker recovery support")
 
 
@@ -1473,7 +1482,7 @@ def _ensure_drained(
             # The live authority has already confirmed draining=true. Permit
             # only non-native drain-enter intents with no in-flight work;
             # keep their original journal records for bounded startup recovery.
-            if recovery_candidate_root is not None and _unidentified_destroy_recovery_pending(pending, metrics):
+            if recovery_candidate_root is not None and _attempted_destroy_recovery_pending(pending, metrics):
                 # Installation stays admission-fenced. Only the new business
                 # authority can verify the saved request and release owner,
                 # and it must not open admission if recovery is refused.
