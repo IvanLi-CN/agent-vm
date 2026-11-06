@@ -1287,6 +1287,22 @@ def _activation_safe_drain_enter(item: Any, metrics: Mapping[str, Any]) -> bool:
             and isinstance(operation, str) and re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", operation) is not None)
 
 
+def _activation_safe_pending_renew(item: Any, metrics: Mapping[str, Any]) -> bool:
+    """A pending renew has no native effect; the candidate must reconcile it."""
+    required = {"operation_id", "action", "session_id", "generation", "created_at"}
+    if not isinstance(item, Mapping) or set(item) != required:
+        return False
+    inflight = metrics.get("in_flight_operations")
+    if type(inflight) is not int or inflight != 0 or item.get("action") != "renew":
+        return False
+    if type(item.get("generation")) is not int or item["generation"] < 0:
+        return False
+    session, operation, created_at = item.get("session_id"), item.get("operation_id"), item.get("created_at")
+    return (isinstance(session, str) and re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", session) is not None
+            and isinstance(operation, str) and re.fullmatch(r"[A-Za-z0-9_.:@/-]{1,160}", operation) is not None
+            and isinstance(created_at, str) and bool(created_at))
+
+
 def _attempted_destroy_recovery_pending(pending: list[Any], metrics: Mapping[str, Any]) -> bool:
     if not pending or len(pending) > 100 or type(metrics.get("in_flight_operations")) is not int or metrics["in_flight_operations"] != 0:
         return False
@@ -1480,15 +1496,21 @@ def _ensure_drained(
             _fail("drain_unverified", "control returned an invalid pending-operation list")
         if pending:
             # The live authority has already confirmed draining=true. Permit
-            # only non-native drain-enter intents with no in-flight work;
-            # keep their original journal records for bounded startup recovery.
+            # only non-native intents with no in-flight work; keep their
+            # original journal records for bounded startup recovery. Renew is
+            # safe here because it never crosses the native effect barrier;
+            # the candidate still has to prove and reconcile its outcome.
             if recovery_candidate_root is not None and _attempted_destroy_recovery_pending(pending, metrics):
                 # Installation stays admission-fenced. Only the new business
                 # authority can verify the saved request and release owner,
                 # and it must not open admission if recovery is refused.
                 _verify_destroy_recovery_candidate(recovery_candidate_root)
                 return pending
-            unsafe = [item for item in pending if not _activation_safe_drain_enter(item, metrics)]
+            unsafe = [
+                item
+                for item in pending
+                if not (_activation_safe_drain_enter(item, metrics) or _activation_safe_pending_renew(item, metrics))
+            ]
             if unsafe:
                 safe_ids = _read_activation_safe_pending_ids()
                 unsafe = [item for item in unsafe if not isinstance(item, Mapping) or item.get("operation_id") not in safe_ids]
