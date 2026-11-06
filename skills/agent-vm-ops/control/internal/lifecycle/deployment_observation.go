@@ -1,6 +1,10 @@
 package lifecycle
 
-import "context"
+import (
+	"context"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
+	"time"
+)
 
 type deploymentObservationKey struct{}
 
@@ -28,6 +32,17 @@ func (s *Service) DeploymentObservation(ctx context.Context) (map[string]any, er
 	})
 	if err != nil {
 		return nil, err
+	}
+	capacity := result["capacity"].(map[string]any)
+	capacity["incus_metrics_up"] = false
+	if probe, ok := s.Guest.(native.MetricsProbe); ok {
+		probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		text, err := probe.PrometheusMetrics(probeCtx)
+		cancel()
+		if err == nil {
+			capacity["incus_metrics"] = text
+			capacity["incus_metrics_up"] = true
+		}
 	}
 	return result, nil
 }

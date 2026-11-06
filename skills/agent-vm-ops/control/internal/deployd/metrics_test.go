@@ -157,3 +157,26 @@ func TestMetricsRejectFutureTopLevelObservationAsFresh(t *testing.T) {
 		t.Fatalf("future top-level observation was reported as fresh:\n%s", text)
 	}
 }
+
+func TestSharedIncusMetricsAreEmittedOnceFromActiveSlot(t *testing.T) {
+	now := time.Now().UTC()
+	sources := map[string]SourceObservation{}
+	for _, name := range []string{"active_link", "systemd", "slot_contracts", "native_observation", "inventory_observation"} {
+		sources[name] = SourceObservation{Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
+	}
+	snapshot := RuntimeSnapshot{ObservedAt: now, FreshUntil: now.Add(time.Minute), Consistent: true, ActiveSlot: "green", Sources: sources, Slots: map[string]SlotObservation{
+		"blue":  {MetricFamilies: map[string]string{"incus_cpu_seconds_total": "incus_cpu_seconds_total{project=\"test\"} 1\n"}},
+		"green": {MetricFamilies: map[string]string{"incus_cpu_seconds_total": "incus_cpu_seconds_total{project=\"test\"} 2\n"}},
+	}}
+	metrics := NewMetrics(nil)
+	metrics.Set(snapshot)
+	text := metrics.Render()
+	if strings.Count(text, "incus_cpu_seconds_total{") != 1 || !strings.Contains(text, "incus_cpu_seconds_total{project=\"test\"} 2\n") {
+		t.Fatalf("shared metrics duplicated or wrong slot:\n%s", text)
+	}
+	snapshot.FreshUntil = now.Add(-time.Second)
+	metrics.Set(snapshot)
+	if strings.Contains(metrics.Render(), "incus_cpu_seconds_total{") {
+		t.Fatal("stale shared metrics emitted")
+	}
+}

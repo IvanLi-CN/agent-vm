@@ -432,3 +432,25 @@ func TestIncusConfigRecognizesContextualMissingInstance(t *testing.T) {
 		t.Fatal("unrelated instance or project classified as absent")
 	}
 }
+
+func TestIncusMetricsUsesBoundedProjectQuery(t *testing.T) {
+	binDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "argv")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$INCUS_ARGV_LOG\"\nprintf '%s\\n' 'incus_cpu_seconds_total{project=\"agents\"} 1'\n"
+	if err := os.WriteFile(filepath.Join(binDir, "incus"), []byte(script), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("INCUS_ARGV_LOG", logPath)
+	text, err := NewIncusClient(NewRunner(), "agents & restricted").PrometheusMetrics(context.Background())
+	if err != nil || !strings.Contains(text, "incus_cpu_seconds_total") {
+		t.Fatalf("metrics: %q %v", text, err)
+	}
+	args, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(args) != "query\n/1.0/metrics?project=agents+%26+restricted\n" {
+		t.Fatalf("unexpected metrics command: %s", args)
+	}
+}

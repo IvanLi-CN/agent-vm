@@ -101,6 +101,12 @@ func (metrics *Metrics) Render() string {
 				output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_native_workers{slot=%s} %d\n", quote(slot), observation.NativeWorkers))
 			}
 			for _, family := range sortedFamilies(observation.MetricFamilies) {
+				if strings.HasPrefix(family, "incus_") {
+					if snapshotFresh && slot == metrics.latest.ActiveSlot {
+						output.WriteString(observation.MetricFamilies[family])
+					}
+					continue
+				}
 				output.WriteString(withSlotLabel(observation.MetricFamilies[family], slot))
 			}
 		}

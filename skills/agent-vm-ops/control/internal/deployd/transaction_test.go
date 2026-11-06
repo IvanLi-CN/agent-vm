@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -60,7 +61,12 @@ func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 			value.ReleaseID = releaseID
 		}
 		value.SourceRevision = "revision-1"
-		value.StateEpoch = runtime.stateEpoch
+		if value.StateAuthority == "" {
+			value.StateAuthority = "authority-1"
+		}
+		if runtime.stateEpoch != "" {
+			value.StateEpoch = runtime.stateEpoch
+		}
 		if value.StateEpoch == "" {
 			value.StateEpoch = "epoch-1"
 		}
@@ -185,7 +191,7 @@ func (runtime *fakeRuntime) Stop(_ context.Context, slot string) error {
 	runtime.observations[slot] = value
 	return nil
 }
-func (runtime *fakeRuntime) Rollback(_ context.Context, target, previous string, _ controllerrole.Lease) error {
+func (runtime *fakeRuntime) Rollback(_ context.Context, target, previous string, _ controllerrole.Lease, _ string) error {
 	runtime.sequence = append(runtime.sequence, "rollback")
 	runtime.active = previous
 	targetObservation := runtime.observations[target]
@@ -454,9 +460,9 @@ func TestManagerFencesWhenRollbackStateCannotBePersisted(t *testing.T) {
 	}}
 	transaction := store.Transaction{ID: "tx-rollback-persist-failure", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseFinalize, State: "finalized", Generation: 1, CreatedAt: now, UpdatedAt: now}
 	if err := database.Create(context.Background(), transaction, map[string]any{
-		"previous_release_id":         "release-blue",
-		"previous_source_revision":    "revision-1",
-		"previous_state_epoch":        "epoch-1",
+		"previous_release_id":      "release-blue",
+		"previous_source_revision": "revision-1",
+		"previous_state_authority": "authority-1", "previous_state_epoch": "epoch-1",
 		"previous_state_capabilities": []string{"reads@1", "writes@1"},
 	}); err != nil {
 		t.Fatal(err)
@@ -525,7 +531,7 @@ func TestManagerResumesRollbackAfterRestart(t *testing.T) {
 		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
 	}}
 	transaction := store.Transaction{ID: "tx-resume-rollback", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseActiveSwitch, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
-	if err := database.Create(context.Background(), transaction, map[string]any{"previous_release_id": "release-blue", "previous_source_revision": "revision-1", "previous_state_epoch": "epoch-1", "previous_state_capabilities": []string{"reads@1", "writes@1"}}); err != nil {
+	if err := database.Create(context.Background(), transaction, map[string]any{"previous_release_id": "release-blue", "previous_source_revision": "revision-1", "previous_state_authority": "authority-1", "previous_state_epoch": "epoch-1", "previous_state_capabilities": []string{"reads@1", "writes@1"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.BeginRollback(context.Background(), transaction.ID, transaction.Phase, PhaseRollback, "rollback_started", "test", nil, now); err != nil {
@@ -1571,5 +1577,46 @@ func TestStagingEffectKeepsExistingControllerLeaseRenewed(t *testing.T) {
 	}
 	if runtime.renewals.Load() < 2 {
 		t.Fatalf("slow staging lost heartbeat: renewals=%d", runtime.renewals.Load())
+	}
+}
+
+func TestVerifyUsesAuthorityInsteadOfChangingEpoch(t *testing.T) {
+	for _, differentAuthority := range []bool{false, true} {
+		t.Run(fmt.Sprint(differentAuthority), func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deploy.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true, StateEpoch: "epoch-before"}, "green": {ProcessUp: true, ProcessReady: true, Ready: true, StateEpoch: "epoch-after"}}}
+			if differentAuthority {
+				v := runtime.observations["green"]
+				v.StateAuthority = "different-backend"
+				runtime.observations["green"] = v
+			}
+			manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+			transaction, err := manager.Stage(context.Background(), "green", "/bundle")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = manager.Verify(context.Background(), transaction.ID)
+			if (err != nil) != differentAuthority {
+				t.Fatalf("verify differentAuthority=%v: %v", differentAuthority, err)
+			}
+			if !differentAuthority {
+				v := runtime.observations["green"]
+				v.StateAuthority = "replaced-after-verify"
+				runtime.observations["green"] = v
+				if _, err := manager.Activate(context.Background(), transaction.ID); err == nil {
+					t.Fatal("activation accepted changed authority")
+				}
+				for _, step := range runtime.sequence {
+					if step == "grant" || step == "revoke" {
+						t.Fatal("authority mismatch caused role mutation")
+					}
+				}
+			}
+		})
 	}
 }

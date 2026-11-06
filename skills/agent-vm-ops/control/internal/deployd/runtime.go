@@ -145,6 +145,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		observation.TrafficAccepting, _ = body["traffic_accepting"].(bool)
 		observation.ReleaseID, _ = body["release_id"].(string)
 		observation.SourceRevision, _ = body["source_revision"].(string)
+		observation.StateAuthority, _ = body["state_authority"].(string)
 		process, processOK := processIdentityFromHealth(body)
 		systemdErr := runtime.systemdProcessMatches(ctx, slot, process)
 		if !processOK || systemdErr != nil {
@@ -1236,7 +1237,7 @@ func quiescenceEvidenceProvesStopped(evidence quiescenceEvidence) bool {
 	return evidence.StopRequested && evidence.Process.PID > 0 && evidence.Process.StartTime != ""
 }
 
-func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease) error {
+func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease, authority string) error {
 	if target != "" && target != "none" {
 		if runtime.systemdSlotStopped(ctx, target) {
 			if err := runtime.systemctl(ctx, "start", "agent-vm-native@"+target+".service"); err != nil {
@@ -1274,6 +1275,11 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 		}
 		if err := runtime.waitSlot(ctx, previous); err != nil {
 			return err
+		}
+		body, status, err := runtime.slotRequest(ctx, runtime.socket(previous), http.MethodGet, "/internal/v1/health", nil)
+		observedAuthority, _ := body["state_authority"].(string)
+		if err != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) || body["process_ready"] != true || observedAuthority != authority || authority == "" {
+			return errors.New("rollback state authority was not verified before granting controller")
 		}
 		if err := runtime.GrantController(ctx, previous, lease); err != nil {
 			return err

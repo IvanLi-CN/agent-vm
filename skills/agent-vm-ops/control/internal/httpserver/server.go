@@ -164,6 +164,7 @@ func (s *Server) health(c *gin.Context) {
 	processStartTime := controllerrole.ProcessStartToken(os.Getpid())
 	c.JSON(status, map[string]any{
 		"ok": true, "ready": ready, "process_ready": true, "controller_ready": ready,
+		"state_authority":          s.Service.Store.AuthorityIdentity(),
 		"controller_lease_renewal": true, "controller_owned": controllerOwned, "traffic_accepting": s.Service.TrafficAccepting(), "lease": lease, "protocol": protocol.Version,
 		"process_id": os.Getpid(), "process_start_time": processStartTime,
 		"release_id":      releaseValue(s.Service.Release, func(value *protocol.ReleaseMetadata) string { return value.ReleaseID }),

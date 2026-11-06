@@ -67,6 +67,8 @@ scrape_configs:
       - targets: ["<部署方提供的 Deployd 指标地址>"]
 ```
 
+槽位观测通过 Incus 的只读 `/1.0/metrics?project=…` 获取该项目的容器 CPU、内存、磁盘和网络指标；采样超时或解析失败时输出 `agent_vm_incus_metrics_up=0`，不伪造零值，也不影响 controller lease。Deployd 仅从活动槽位的一份新鲜快照输出共享的 `incus_*` 指标，保留 Incus 原有标签，不添加槽位标签；槽位自身的 `agent_vm_*` 指标仍区分 `slot`，因此 Prometheus 仍只有一个 target，切换时不会重复统计容器。
+
 Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fresh`、`agent_vm_deployd_slot_selected`、`agent_vm_deployd_slot_ready`、`agent_vm_deployd_slot_controller_owned`、`agent_vm_deployd_transaction_phase`、`agent_vm_deployd_recovery_required`、`agent_vm_deployd_observation_up` 和 `agent_vm_deployd_observation_fresh`。
 
 所有槽位指标都带 `slot="blue|green"`；观测来源指标带 `source`。槽位内部的 `capacity`、`inventory` 和 `health` snapshot 分别写入 `/run/agent-vm-native/blue/metrics` 与 `/run/agent-vm-native/green/metrics`，这些目录只供 Deployd 采样，不能注册为 Prometheus 的第二个 target。
@@ -157,3 +159,5 @@ AGENT_VM_REAL_SYSTEMD=1 bash deploy/scripts/agent_vm_deployment_acceptance.sh
 验收必须证明两个槽位可以同时观测、同一时刻只有一个 controller lease、Deployd 只有一个 Prometheus pull 出口、迁移失败保持 `needs_recovery`、Deployd 重启不会猜测角色、普通切换能够执行有限 rollback，并且迁移 snapshot 会按保留期清理。
 
 真实 Agent VM 验收还必须启动真实 `agent-vm-control` 槽位进程，复验 PID、启动令牌、scheduler fencing、active switch、旧槽位 quiescence、Deployd 重启恢复和 Prometheus 指标；静态检查不能替代这些运行证据。
+
+蓝绿校验使用去除凭据后计算的 `state_authority` 后端配置指纹和 `state_capabilities`，并在激活、恢复及回滚时复核。`state_epoch` 随业务写入和维护游标变化，仅用于单次快照一致性及诊断，不能要求两个槽位在不同采样时刻的值相等。配置指纹不能证明后端数据库未被替换；正常蓝绿流程禁止恢复、替换或重建业务数据库，也不会执行此类操作。缺少新验证证据的旧部署事务保持拒绝，不根据旧 epoch 猜测后端身份。
