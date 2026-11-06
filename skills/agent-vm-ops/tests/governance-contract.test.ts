@@ -33,20 +33,30 @@ test("the five project topics have locked local surfaces", () => {
   }
 });
 
-test("PR scheduling is exact, non-preemptive, and separate from Main", () => {
+test("PR scheduling is bounded and separate from Main", () => {
   const pr = read(".github/workflows/ci.yml");
   const main = read(".github/workflows/ci-main.yml");
   expect(pr).toContain("name: CI (PR)");
   expect(pr).toContain("types: [opened, synchronize, reopened, ready_for_review]");
   expect(pr).toContain("types: [checks_requested]");
   expect(pr).toContain("group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}");
-  expect(pr).toContain("cancel-in-progress: false");
+  expect(pr).toContain("cancel-in-progress: ${{ github.event_name == 'pull_request' }}");
   expect(pr).toContain("name: PR gate");
   expect(main).toContain("name: CI (Main)");
   expect(main).toContain("branches: [main]");
   expect(main).toContain("name: Main gate");
   expect(main).toContain("group: main");
-  expect(main).toContain("max-parallel: 1");
+  expect(pr).toContain("max-parallel: 2");
+  expect(main).toContain("max-parallel: 2");
+  for (const workflow of [pr, main]) {
+    expect(workflow).toContain("Cache Bun downloads");
+    expect(workflow).toContain("Cache Go build and module data");
+    expect(workflow).toContain("hashFiles('bun.lock')");
+    expect(workflow).toContain("hashFiles('skills/agent-vm-ops/control/go.sum')");
+  }
+  expect(pr).toContain("name: Classify PR changes");
+  expect(pr).toContain("bun run bin/ci_classify.ts");
+  expect(pr).toContain("needs: classify");
 });
 
 test("demo deployment is serialized and never exposes credentials to PR builds", () => {
