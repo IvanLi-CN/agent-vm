@@ -1058,15 +1058,17 @@ func (s *Store) RecordOperation(ctx context.Context, operationID, action string,
 					return err
 				}
 			}
-			if evidence, exists := current.Response["_worker_recovery_evidence"]; exists {
-				if incoming, supplied := response["_worker_recovery_evidence"]; supplied {
-					previousJSON, previousErr := json.Marshal(evidence)
-					incomingJSON, incomingErr := json.Marshal(incoming)
-					if previousErr != nil || incomingErr != nil || string(previousJSON) != string(incomingJSON) {
-						return errors.New("worker recovery evidence is immutable")
+			for _, evidenceKey := range []string{"_worker_recovery_evidence", "_worker_rearm_recovery_evidence"} {
+				if evidence, exists := current.Response[evidenceKey]; exists {
+					if incoming, supplied := response[evidenceKey]; supplied {
+						previousJSON, previousErr := json.Marshal(evidence)
+						incomingJSON, incomingErr := json.Marshal(incoming)
+						if previousErr != nil || incomingErr != nil || string(previousJSON) != string(incomingJSON) {
+							return errors.New("worker recovery evidence is immutable")
+						}
 					}
+					response[evidenceKey] = evidence
 				}
-				response["_worker_recovery_evidence"] = evidence
 			}
 			raw, err := json.Marshal(response)
 			if err != nil {
@@ -1109,20 +1111,30 @@ func sameNullableInt64(left, right *int64) bool {
 // and bounded restart recovery metadata without introducing a second state
 // store or changing the existing operations table.
 func (s *Store) UpdateOperationResponse(ctx context.Context, operationID string, update func(map[string]any) error) error {
-	return s.updateOperationResponse(ctx, operationID, "", update, false)
+	return s.updateOperationResponse(ctx, operationID, "", update, "")
 }
 
 // RecoverOperationWorker retains recovery evidence in the append-only audit
 // and the pending journal in the same transaction. Older compatible binaries
 // may finalize the journal without copying extension fields; the audit remains.
 func (s *Store) RecoverOperationWorker(ctx context.Context, operationID, taskID string, update func(map[string]any) error) error {
+	return s.recoverOperationWorker(ctx, operationID, taskID, update, "_worker_recovery_evidence")
+}
+
+// RecoverOperationWorkerRearm records one repair of a legacy carried identity,
+// retaining the original recovery evidence and a separate atomic audit entry.
+func (s *Store) RecoverOperationWorkerRearm(ctx context.Context, operationID, taskID string, update func(map[string]any) error) error {
+	return s.recoverOperationWorker(ctx, operationID, taskID, update, "_worker_rearm_recovery_evidence")
+}
+
+func (s *Store) recoverOperationWorker(ctx context.Context, operationID, taskID string, update func(map[string]any) error, evidenceKey string) error {
 	s.auditSummaryMu.Lock()
 	defer s.auditSummaryMu.Unlock()
 	s.auditSummaryReady = false
-	return s.updateOperationResponse(ctx, operationID, taskID, update, true)
+	return s.updateOperationResponse(ctx, operationID, taskID, update, evidenceKey)
 }
 
-func (s *Store) updateOperationResponse(ctx context.Context, operationID, taskID string, update func(map[string]any) error, recovery bool) error {
+func (s *Store) updateOperationResponse(ctx context.Context, operationID, taskID string, update func(map[string]any) error, evidenceKey string) error {
 	return s.withWrite(ctx, func(tx *Tx) error {
 		operation, err := scanOperation(ctx, tx.conn, operationID)
 		if err != nil {
@@ -1136,8 +1148,11 @@ func (s *Store) updateOperationResponse(ctx context.Context, operationID, taskID
 		if digest, ok := operation.Response["_request_digest"]; ok {
 			previousResponse["_request_digest"] = digest
 		}
-		if recovery && operation.Response["_worker_recovery_evidence"] != nil {
+		if evidenceKey != "" && operation.Response[evidenceKey] != nil {
 			return errors.New("worker recovery was already attempted")
+		}
+		if evidenceKey == "_worker_rearm_recovery_evidence" && operation.Response["_worker_recovery_evidence"] == nil {
+			return errors.New("original worker recovery evidence is missing")
 		}
 		previousWorker, _ := operation.Response["worker"].(map[string]any)
 		if err := update(operation.Response); err != nil {
@@ -1166,12 +1181,12 @@ func (s *Store) updateOperationResponse(ctx context.Context, operationID, taskID
 		if rows != 1 {
 			return errors.New("operation journal is already finalized")
 		}
-		if recovery {
-			evidence, ok := operation.Response["_worker_recovery_evidence"].(map[string]any)
+		if evidenceKey != "" {
+			evidence, ok := operation.Response[evidenceKey].(map[string]any)
 			if !ok || outcome != "pending" || operation.Response["outcome"] != "pending" {
 				return errors.New("worker recovery evidence is missing")
 			}
-			detail, err := json.Marshal(map[string]any{"phase": "native-worker-quiescence", "operation_id": operationID, "worker_recovery": evidence})
+			detail, err := json.Marshal(map[string]any{"phase": "native-worker-quiescence", "operation_id": operationID, "recovery_kind": evidenceKey, "worker_recovery": evidence})
 			if err != nil {
 				return err
 			}
@@ -1214,7 +1229,7 @@ func preserveWorkerIdentity(previous, current map[string]any) error {
 	previousState, _ := previous["state"].(string)
 	currentState, _ := current["state"].(string)
 	previousError, _ := previous["error"].(string)
-	if previousState == "finished" && currentState == "starting" && previousError == "" {
+	if currentState == "starting" && (previousState == "exited" || previousState == "finished" && previousError == "") {
 		return nil
 	}
 	for _, key := range []string{"pid", "start_time", "process_group"} {

@@ -568,8 +568,9 @@ func stringPointer(value string) *string { return &value }
 func intPointer(value int64) *int64      { return &value }
 
 func TestWorkerRecoveryAuditAndBarrierCommitAtomically(t *testing.T) {
-	for _, fail := range []bool{false, true} {
-		t.Run(fmtBool(fail), func(t *testing.T) {
+	for _, scenario := range []string{"original-success", "original-failure", "rearm-success", "rearm-failure"} {
+		t.Run(scenario, func(t *testing.T) {
+			fail, rearm := strings.HasSuffix(scenario, "failure"), strings.HasPrefix(scenario, "rearm")
 			ctx := context.Background()
 			store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 			if err != nil {
@@ -580,6 +581,18 @@ func TestWorkerRecoveryAuditAndBarrierCommitAtomically(t *testing.T) {
 			if err := store.RecordOperation(ctx, "destroy", "destroy", &session, &generation, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "starting", "start_attempted": true}}); err != nil {
 				t.Fatal(err)
 			}
+			evidenceKey := "_worker_recovery_evidence"
+			recoverWorker := store.RecoverOperationWorker
+			if rearm {
+				evidenceKey = "_worker_rearm_recovery_evidence"
+				recoverWorker = store.RecoverOperationWorkerRearm
+				if err := store.UpdateOperationResponse(ctx, "destroy", func(response map[string]any) error {
+					response["_worker_recovery_evidence"] = map[string]any{"outcome": "unknown"}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if fail {
 				if err := store.withWrite(ctx, func(tx *Tx) error {
 					_, err := tx.exec("CREATE TRIGGER fail_recovery_audit BEFORE INSERT ON audit BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END")
@@ -588,8 +601,8 @@ func TestWorkerRecoveryAuditAndBarrierCommitAtomically(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			err = store.RecoverOperationWorker(ctx, "destroy", "task", func(response map[string]any) error {
-				response["_worker_recovery_evidence"] = map[string]any{"original_worker": response["worker"], "outcome": "unknown"}
+			err = recoverWorker(ctx, "destroy", "task", func(response map[string]any) error {
+				response[evidenceKey] = map[string]any{"original_worker": response["worker"], "outcome": "unknown"}
 				response["worker"] = map[string]any{"state": "exited", "start_attempted": true}
 				return nil
 			})
@@ -616,6 +629,17 @@ func TestWorkerRecoveryAuditAndBarrierCommitAtomically(t *testing.T) {
 			}
 			if (count == 1) == fail {
 				t.Fatalf("audit count=%d", count)
+			}
+			if (operation.Response[evidenceKey] == nil) != fail {
+				t.Fatal("recovery evidence did not commit with audit")
+			}
+			if !fail {
+				if err := recoverWorker(ctx, "destroy", "task", func(map[string]any) error { return nil }); err == nil {
+					t.Fatal("repeat recovery accepted")
+				}
+				if err := store.RecordOperation(ctx, "destroy", "destroy", &session, &generation, map[string]any{"outcome": "success", evidenceKey: map[string]any{"outcome": "invented"}}); err == nil {
+					t.Fatal("recovery evidence replacement accepted")
+				}
 			}
 		})
 	}

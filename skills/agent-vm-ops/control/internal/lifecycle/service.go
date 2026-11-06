@@ -1009,7 +1009,11 @@ func (s *Service) recoverAttemptedDestroyStart(ctx context.Context, operation *s
 		return protocol.NewError("state_unverified", "pending native worker start requires verified recovery", map[string]any{"operation_id": operation.OperationID})
 	}
 	fenced, _ := ctx.Value(startupRecoveryFenceContextKey{}).(bool)
-	if operation.Response["_worker_recovery_evidence"] != nil || !s.resident || !fenced || !s.mutationAllowed() || s.activeOperationCount() != 0 || native.WorkerOperationID(ctx) != "" || operation.Action != "destroy" || operation.SessionID == nil || operation.Generation == nil {
+	rearm := operation.Response["_worker_recovery_evidence"] != nil
+	if rearm && !carriedRecoveryWorker(operation.Response, worker) {
+		return reject()
+	}
+	if !s.resident || !fenced || !s.mutationAllowed() || s.activeOperationCount() != 0 || native.WorkerOperationID(ctx) != "" || operation.Action != "destroy" || operation.SessionID == nil || operation.Generation == nil {
 		return reject()
 	}
 	drained, err := s.releaseDrainOwned(ctx)
@@ -1071,15 +1075,22 @@ func (s *Service) recoverAttemptedDestroyStart(ctx context.Context, operation *s
 		}
 	}
 	original := mustJSON(worker)
+	originalEvidence := mustJSON(operation.Response["_worker_recovery_evidence"])
+	evidenceKey, basis := "_worker_recovery_evidence", "resident-systemd-and-incus-quiescence"
+	recordRecovery := s.Store.RecoverOperationWorker
+	if rearm {
+		evidenceKey, basis = "_worker_rearm_recovery_evidence", "resident-systemd-and-incus-rearm-quiescence"
+		recordRecovery = s.Store.RecoverOperationWorkerRearm
+	}
 	observedAt := nowString(s.Clock())
 	return s.commitMutationContext(ctx, func() error {
 		// The commit gate validates the lease while holding its lock. Calling
 		// mutationAllowed here would reacquire that lock and deadlock recovery.
-		return s.Store.RecoverOperationWorker(checkCtx, operation.OperationID, task.TaskID, func(response map[string]any) error {
-			if stringValue(response["outcome"]) != "pending" || mustJSON(response["worker"]) != original || stringValue(response["_request_digest"]) != digest {
+		return recordRecovery(checkCtx, operation.OperationID, task.TaskID, func(response map[string]any) error {
+			if stringValue(response["outcome"]) != "pending" || mustJSON(response["worker"]) != original || stringValue(response["_request_digest"]) != digest || mustJSON(response["_worker_recovery_evidence"]) != originalEvidence {
 				return errUnresolvedWorker
 			}
-			response["_worker_recovery_evidence"] = map[string]any{"original_worker": response["worker"], "observed_at": observedAt, "basis": "resident-systemd-and-incus-quiescence", "outcome": "unknown"}
+			response[evidenceKey] = map[string]any{"original_worker": response["worker"], "observed_at": observedAt, "basis": basis, "outcome": "unknown"}
 			recovered := make(map[string]any, len(worker)+1)
 			for key, value := range worker {
 				recovered[key] = value
@@ -1090,6 +1101,28 @@ func (s *Service) recoverAttemptedDestroyStart(ctx context.Context, operation *s
 			return nil
 		})
 	})
+}
+
+// carriedRecoveryWorker recognizes only the old exited-to-starting carryover
+// bug. A second unknown worker or an already repaired marker stays fenced.
+func carriedRecoveryWorker(response, worker map[string]any) bool {
+	if response["_worker_rearm_recovery_evidence"] != nil || len(worker) != 6 || stringValue(worker["state"]) != "starting" || worker["start_attempted"] != true {
+		return false
+	}
+	evidence, ok := response["_worker_recovery_evidence"].(map[string]any)
+	if !ok || stringValue(evidence["basis"]) != "resident-systemd-and-incus-quiescence" || stringValue(evidence["outcome"]) != "unknown" {
+		return false
+	}
+	original, ok := evidence["original_worker"].(map[string]any)
+	if !ok || stringValue(original["state"]) != "starting" || original["start_attempted"] != true {
+		return false
+	}
+	if !workerIdentityMatches(original, worker) {
+		return false
+	}
+	observed, observedErr := time.Parse(time.RFC3339Nano, stringValue(evidence["observed_at"]))
+	prepared, preparedErr := time.Parse(time.RFC3339Nano, stringValue(worker["prepared_at"]))
+	return observedErr == nil && preparedErr == nil && prepared.After(observed)
 }
 
 func (s *Service) recoverPending(ctx context.Context, pending []state.Operation) error {
