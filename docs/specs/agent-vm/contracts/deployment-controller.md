@@ -253,3 +253,5 @@ Deployd 随后验证初始 standby 的 release、状态能力和进程身份，�
 槽位启动后的进程身份等待预算为 60 秒，与槽位 systemd unit 的启动预算一致；期间仍须验证实际 PID、进程启动标识及 health 合同，超时进入失败或恢复，不能仅凭 systemd 已启动判定成功。
 
 运行时副作用失败后的证据记录与双槽位 fencing 使用独立的 30 秒收尾预算。请求取消或超时不能取消这段收尾；收尾只保存不确定结果并撤销角色，不能继续激活或重放安装。
+
+`recover finalize` 在重新授予 controller lease 前要求目标进程就绪、观测新鲜一致且发布身份和状态能力已验证，不要求依赖 controller role 的业务就绪。授予新 lease 后必须完成 startup reconciliation 并验证业务就绪，才能开放 traffic；fenced 槽位的业务未就绪不能形成恢复授权的循环依赖。

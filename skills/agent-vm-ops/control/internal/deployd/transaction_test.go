@@ -952,6 +952,13 @@ func TestManagerRecoveryFinalizeReestablishesControllerAfterRestart(t *testing.T
 	}
 	runtime.active = "green"
 	runtime.traffic = map[string]bool{"blue": false, "green": false}
+	// A fenced process exposes its process contract, but scheduler startup and
+	// admission readiness require the new controller grant first.
+	target := runtime.observations["green"]
+	target.Ready = false
+	runtime.observations["green"] = target
+	runtime.readyAfterGrant = true
+	runtime.enableRequiresReady = true
 	updated, err := manager.Recover(context.Background(), transaction.ID, "finalize")
 	if err != nil {
 		t.Fatal(err)

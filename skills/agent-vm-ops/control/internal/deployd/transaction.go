@@ -1191,7 +1191,7 @@ func recoveryTargetVerified(observation RuntimeSnapshot, transaction store.Trans
 		return false
 	}
 	target, ok := observation.Slots[transaction.TargetSlot]
-	if !ok || !target.ProcessUp || !target.ProcessReady || !target.Ready || target.StateEpoch == "" || !sameStateCapabilities(target.StateCapabilities, capabilities) || target.ReleaseID != releaseID || target.SourceRevision != sourceRevision || (requireTraffic && !target.TrafficAccepting) || (requireController && !target.ControllerOwned) {
+	if !ok || !target.ProcessUp || !target.ProcessReady || ((requireTraffic || requireController) && !target.Ready) || target.StateEpoch == "" || !sameStateCapabilities(target.StateCapabilities, capabilities) || target.ReleaseID != releaseID || target.SourceRevision != sourceRevision || (requireTraffic && !target.TrafficAccepting) || (requireController && !target.ControllerOwned) {
 		return false
 	}
 	old, oldOK := observation.Slots[transaction.PreviousSlot]
