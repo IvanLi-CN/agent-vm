@@ -107,7 +107,9 @@ func maintenanceLoop(ctx context.Context, manager *deployd.Manager, server *depl
 			if err := manager.MaintainController(ctx); err != nil {
 				slog.Warn("controller lease maintenance failed", "error", err)
 			}
-			if err := server.Sample(ctx); err != nil {
+			// Maintenance already persisted a completed live observation. Reuse
+			// it instead of making a second slow round trip before the next lease.
+			if err := server.RestoreLatest(ctx); err != nil {
 				slog.Warn("deployd observation failed", "error", err)
 			}
 		case <-cleanupTicker.C:

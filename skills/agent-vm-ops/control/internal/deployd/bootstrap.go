@@ -280,6 +280,32 @@ func (manager *Manager) beginTransactionRenewal(parent context.Context, lease co
 	}
 }
 
+// PrepareControllerRenewal binds a fresh live observation after daemon startup
+// to the verified on-disk release and systemd process. Persisted IDs never pin it.
+func (runtime *HostRuntime) PrepareControllerRenewal(ctx context.Context, target SlotObservation) error {
+	runtime.mu.Lock()
+	expected, pinned := runtime.stagedProcess[target.Slot]
+	runtime.mu.Unlock()
+	body, status, err := runtime.slotRequest(ctx, runtime.socket(target.Slot), http.MethodGet, "/internal/v1/health", nil)
+	process, ok := processIdentityFromHealth(body)
+	if err != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !ok || body["process_ready"] != true || body["release_id"] != target.ReleaseID || body["source_revision"] != target.SourceRevision {
+		return errors.New("observed controller process changed")
+	}
+	if pinned && expected == process {
+		return nil
+	}
+	if err := runtime.VerifySlotIdentity(ctx, target.Slot, target.ReleaseID, target.SourceRevision, target.StateCapabilities); err != nil {
+		return err
+	}
+	if err := runtime.systemdProcessMatches(ctx, target.Slot, process); err != nil {
+		return err
+	}
+	runtime.mu.Lock()
+	runtime.stagedProcess[target.Slot] = process
+	runtime.mu.Unlock()
+	return nil
+}
+
 func (runtime *HostRuntime) RenewTransactionLease(ctx context.Context, original controllerrole.Lease) (controllerrole.Lease, error) {
 	if err := original.Validate(time.Now(), original.Slot); err != nil {
 		return original, err

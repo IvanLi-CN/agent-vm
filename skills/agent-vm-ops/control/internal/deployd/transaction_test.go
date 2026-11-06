@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -675,6 +676,52 @@ func TestManagerWaitsForReadyAfterGrantBeforeTraffic(t *testing.T) {
 	}
 	if !runtime.traffic["blue"] {
 		t.Fatalf("active traffic was not enabled after readiness: %v", runtime.sequence)
+	}
+}
+
+type delayedControllerRuntime struct {
+	*fakeRuntime
+	renewals atomic.Int32
+}
+
+func (runtime *delayedControllerRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error) {
+	snapshot, err := runtime.fakeRuntime.Observe(ctx)
+	if snapshot.Slots["blue"].ControllerOwned {
+		timer := time.NewTimer(90 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return RuntimeSnapshot{}, ctx.Err()
+		case <-timer.C:
+		}
+		value := snapshot.Slots["blue"]
+		value.Ready = true
+		snapshot.Slots["blue"] = value
+	}
+	return snapshot, err
+}
+
+func (runtime *delayedControllerRuntime) RenewTransactionLease(ctx context.Context, lease controllerrole.Lease) (controllerrole.Lease, error) {
+	runtime.renewals.Add(1)
+	return runtime.fakeRuntime.RenewTransactionLease(ctx, lease)
+}
+
+func TestControllerMaintenanceRenewsWhileWaitingForReadiness(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &delayedControllerRuntime{fakeRuntime: &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
+		"blue": {Slot: "blue", ProcessUp: true, ProcessReady: true},
+	}}}
+	manager := NewManager(database, runtime, 30*time.Millisecond, func() time.Time { return now })
+	if err := manager.MaintainController(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.renewals.Load() < 2 || !runtime.traffic["blue"] {
+		t.Fatalf("readiness did not retain its granted authority: renewals=%d traffic=%v", runtime.renewals.Load(), runtime.traffic)
 	}
 }
 

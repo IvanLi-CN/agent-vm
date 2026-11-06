@@ -669,7 +669,7 @@ func (manager *Manager) ensureNoActiveTransaction(ctx context.Context) error {
 }
 
 func (manager *Manager) waitForReady(ctx context.Context, transactionID, slot string) error {
-	deadline := time.NewTimer(15 * time.Second)
+	deadline := time.NewTimer(60 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -815,6 +815,13 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	if err != nil {
 		return manager.fenceSlots(ctx, errors.New("allocate active controller lease failed; controller roles were fenced"))
 	}
+	if preparer, ok := manager.Runtime.(interface {
+		PrepareControllerRenewal(context.Context, SlotObservation) error
+	}); ok {
+		if err := preparer.PrepareControllerRenewal(ctx, target); err != nil {
+			return manager.fenceSlots(ctx, errors.New("active controller process identity could not be pinned"))
+		}
+	}
 	if err := manager.Runtime.GrantController(ctx, observation.ActiveSlot, lease); err != nil {
 		return manager.fenceSlots(ctx, errors.New("grant active controller failed; controller roles were fenced"))
 	}
@@ -824,16 +831,22 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 		// stays disabled; strict deployment validation still rejects this view.
 		return nil
 	}
-	if err := manager.waitForReady(ctx, "", observation.ActiveSlot); err != nil {
-		return manager.fenceSlots(ctx, fmt.Errorf("active slot did not become ready after controller grant: %w", err))
+	// A live ready controller only needs its lease extended. Starting another
+	// full business observation here needlessly delays the next renewal.
+	if current := target.ControllerLease; target.Ready && target.TrafficAccepting && target.ControllerOwned && current != nil && current.Term == lease.Term && current.LeaseID == lease.LeaseID {
+		return nil
 	}
-	if err := manager.Runtime.EnableTraffic(ctx, observation.ActiveSlot); err != nil {
-		disableErr := manager.Runtime.DisableTraffic(ctx, observation.ActiveSlot)
-		fenceErr := manager.fenceSlots(ctx, errors.New("active traffic role could not be established"))
-		if disableErr != nil {
-			return fmt.Errorf("enable active traffic: %w; disable after failure: %v; %v", err, disableErr, fenceErr)
-		}
-		return fmt.Errorf("enable active traffic: %w; %v", err, fenceErr)
+	readyContext, stopRenewal := manager.beginTransactionRenewal(ctx, lease)
+	readyErr := manager.waitForReady(readyContext, "", observation.ActiveSlot)
+	if readyErr == nil {
+		readyErr = manager.Runtime.EnableTraffic(readyContext, observation.ActiveSlot)
+	}
+	renewalErr := stopRenewal()
+	if readyErr != nil {
+		return manager.fenceSlots(ctx, fmt.Errorf("active controller readiness or traffic failed: %w", readyErr))
+	}
+	if renewalErr != nil {
+		return manager.fenceSlots(ctx, fmt.Errorf("active controller renewal failed: %w", renewalErr))
 	}
 	return nil
 }
