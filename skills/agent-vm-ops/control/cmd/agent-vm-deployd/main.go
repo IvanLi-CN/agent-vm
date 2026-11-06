@@ -77,7 +77,7 @@ func run(args []string) error {
 	go func() {
 		errorsCh <- deployd.ServeMetrics(ctx, config.MetricsListen, server.MetricsHandler(), config.MetricsTLS, config.NetworkACL)
 	}()
-	go maintenanceLoop(ctx, manager, server, config.ObserveInterval())
+	go maintenanceLoop(ctx, manager, config.ObserveInterval())
 	go publicationLoop(ctx, server, config.ObserveInterval())
 
 	slog.Info("agent vm deployd started", "version", version, "socket", config.Socket, "metrics_listen", config.MetricsListen)
@@ -92,7 +92,7 @@ func run(args []string) error {
 	}
 }
 
-func maintenanceLoop(ctx context.Context, manager *deployd.Manager, server *deployd.Server, interval time.Duration) {
+func maintenanceLoop(ctx context.Context, manager *deployd.Manager, interval time.Duration) {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
@@ -107,11 +107,6 @@ func maintenanceLoop(ctx context.Context, manager *deployd.Manager, server *depl
 		case <-sampleTicker.C:
 			if err := manager.MaintainController(ctx); err != nil {
 				slog.Warn("controller lease maintenance failed", "error", err)
-			}
-			// Maintenance already persisted a completed live observation. Reuse
-			// it instead of making a second slow round trip before the next lease.
-			if err := server.RestoreLatest(ctx); err != nil {
-				slog.Warn("deployd observation failed", "error", err)
 			}
 		case <-cleanupTicker.C:
 			if err := manager.Cleanup(ctx); err != nil {
@@ -137,9 +132,10 @@ func publicationLoop(ctx context.Context, server *deployd.Server, interval time.
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := server.RestoreLatest(ctx); err != nil {
-				slog.Warn("deployd snapshot publication failed", "error", err)
-			}
+		case <-server.Manager.Store.ObservationUpdates():
+		}
+		if err := server.RestoreLatest(ctx); err != nil {
+			slog.Warn("deployd snapshot publication failed", "error", err)
 		}
 	}
 }
