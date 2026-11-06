@@ -344,3 +344,26 @@ func sameTransactionLease(observed, expected controllerrole.Lease) bool {
 	observed.Expiry = expected.Expiry
 	return observed == expected
 }
+
+// Preserve the existing controller while a synchronous staging or verification
+// effect holds manager.mu. Failure stops renewal before its caller fences roles.
+func (manager *Manager) withControllerRenewal(ctx context.Context, target SlotObservation, effect func(context.Context) error) error {
+	if target.ControllerLease == nil || !target.LeaseRenewalSupported {
+		return effect(ctx)
+	}
+	lease := *target.ControllerLease
+	if !target.ControllerOwned || lease.Validate(manager.Clock(), target.Slot) != nil || lease.OwnerPID != os.Getpid() || lease.OwnerStartTime != controllerrole.ProcessStartToken(os.Getpid()) {
+		return errors.New("staging controller lease is not live and owned")
+	}
+	if preparer, ok := manager.Runtime.(interface {
+		PrepareControllerRenewal(context.Context, SlotObservation) error
+	}); ok {
+		if err := preparer.PrepareControllerRenewal(ctx, target); err != nil {
+			return err
+		}
+	}
+	renewalContext, stop := manager.beginTransactionRenewal(ctx, lease)
+	effectErr := effect(renewalContext)
+	renewalErr := stop()
+	return errors.Join(effectErr, renewalErr)
+}

@@ -224,7 +224,9 @@ func (manager *Manager) Stage(ctx context.Context, targetSlot, bundle string) (*
 	if err := manager.Store.Create(ctx, transaction, createdEvidence); err != nil {
 		return nil, err
 	}
-	if err := manager.Runtime.Stage(ctx, targetSlot, bundle); err != nil {
+	if err := manager.withControllerRenewal(ctx, observation.Slots[observation.ActiveSlot], func(stageContext context.Context) error {
+		return manager.Runtime.Stage(stageContext, targetSlot, bundle)
+	}); err != nil {
 		if errors.Is(err, ErrUncertain) {
 			return nil, manager.effectFailure(ctx, transaction.ID, PhaseStage, err)
 		}
@@ -247,7 +249,13 @@ func (manager *Manager) Verify(ctx context.Context, id string) (*store.Transacti
 	if transaction.Phase != PhaseStandbyValidation {
 		return nil, fmt.Errorf("transaction %s is in phase %s", id, transaction.Phase)
 	}
-	if err := manager.Runtime.Verify(ctx, transaction.TargetSlot, transaction.Bundle); err != nil {
+	before, err := manager.observe(ctx, "")
+	if err != nil {
+		return nil, err
+	}
+	if err := manager.withControllerRenewal(ctx, before.Slots[transaction.PreviousSlot], func(verifyContext context.Context) error {
+		return manager.Runtime.Verify(verifyContext, transaction.TargetSlot, transaction.Bundle)
+	}); err != nil {
 		return nil, manager.failure(ctx, id, PhaseStandbyValidation, err)
 	}
 	observation, err := manager.observe(ctx, id)

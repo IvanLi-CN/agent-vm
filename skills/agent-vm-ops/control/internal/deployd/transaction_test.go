@@ -1547,3 +1547,29 @@ func TestWaitingDeploymentRetainsOnlyExistingActiveLease(t *testing.T) {
 		})
 	}
 }
+
+func TestStagingEffectKeepsExistingControllerLeaseRenewed(t *testing.T) {
+	start := controllerrole.ProcessStartToken(os.Getpid())
+	if start == "" {
+		t.Skip("Linux process-incarnation evidence required")
+	}
+	now := time.Unix(100, 0).UTC()
+	runtime := &delayedControllerRuntime{fakeRuntime: &fakeRuntime{}}
+	manager := NewManager(nil, runtime, 30*time.Millisecond, func() time.Time { return now })
+	lease := controllerrole.Lease{Slot: "blue", Term: 1, Generation: 1, LeaseID: "staging", Nonce: "nonce", Expiry: now.Add(time.Minute), OwnerPID: os.Getpid(), OwnerStartTime: start}
+	target := SlotObservation{Slot: "blue", ControllerOwned: true, LeaseRenewalSupported: true, ControllerLease: &lease}
+	err := manager.withControllerRenewal(t.Context(), target, func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(90 * time.Millisecond):
+			return nil
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.renewals.Load() < 2 {
+		t.Fatalf("slow staging lost heartbeat: renewals=%d", runtime.renewals.Load())
+	}
+}
