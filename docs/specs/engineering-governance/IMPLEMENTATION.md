@@ -105,4 +105,4 @@ PR/Main 共用 `.github/actions/ci-cache-restore` 与 `ci-cache-save`，由 `bin
 
 PR/merge_group 仅恢复缓存，Main push 的成功 portable job 是各平台 module/Bun 下载缓存的唯一写入者；portable/heavy 各自写自己的编译缓存。Bun 精确 key 绑定 lockfile，前缀回退限定 Bun 版本、OS 与架构，安装始终执行 `--frozen-lockfile`。冷启动各 job 独立执行，不增加缓存 producer 串行依赖。恢复与保存摘要记录 key、精确/前缀/未命中、耗时、目录 KiB 和保存 action outcome；目录大小不是压缩传输字节，action success 不是 provider 确认上传，provider 告警仍需查日志。
 
-缓存没有独立 TTL，受 GitHub 容量与淘汰策略管理；按构建输入生成新编译快照会增加条目数，需结合实际容量和恢复/上传耗时评估，不自动清理其他任务的缓存。新 namespace 首轮 PR 是冷缓存；Main 建立缓存后才能观察共享热缓存收益，不能用配置存在代替实测命中。rqlite 当前步骤耗时混合下载、服务启动与集成测试，尚无独立下载成本证据，因此本轮保留下载及 SHA256 校验，不增加安装包缓存。
+缓存没有独立 TTL，受 GitHub 容量与淘汰策略管理；按构建输入生成新编译快照会增加条目数，需结合实际容量和恢复/上传耗时评估，不自动清理其他任务的缓存。Go 拆分后的新 namespace 首轮 PR 是冷缓存；Bun 保留已有 key 兼容现存 Main 下载缓存。Main 建立 Go 缓存后才能观察共享热缓存收益，不能用配置存在代替实测命中。rqlite 当前步骤耗时混合下载、服务启动与集成测试，尚无独立下载成本证据，因此本轮保留下载及 SHA256 校验，不增加安装包缓存。

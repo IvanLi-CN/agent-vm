@@ -14,6 +14,7 @@ runs:
   using: composite
   steps:
     - id: start
+      if: always()
       shell: bash
       run: python3 -c 'import time; print("at=" + str(time.time()))' >> "$GITHUB_OUTPUT"
     - id: module
@@ -23,6 +24,7 @@ runs:
         path: ${{ fromJSON(inputs.state).caches.module.path }}
         key: ${{ fromJSON(inputs.state).caches.module.key }}
     - id: build_start
+      if: always()
       shell: bash
       run: python3 -c 'import time; print("at=" + str(time.time()))' >> "$GITHUB_OUTPUT"
     - id: build
@@ -32,6 +34,7 @@ runs:
         path: ${{ fromJSON(inputs.state).caches.build.path }}
         key: ${{ fromJSON(inputs.state).caches.build.key }}
     - id: bun_start
+      if: always()
       shell: bash
       run: python3 -c 'import time; print("at=" + str(time.time()))' >> "$GITHUB_OUTPUT"
     - id: bun

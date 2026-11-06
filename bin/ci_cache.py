@@ -14,7 +14,7 @@ def cache_plan(role, platform, arch, image, go_version, bun_version, dependency_
     identity = f"{platform}-{arch}-{image}-{go_version}"
     module_prefix = f"go-mod-v2-{identity}-"
     build_prefix = f"go-build-v2-{identity}-{role}-{dependency_hash}-"
-    bun_prefix = f"bun-download-v2-{bun_version}-{platform}-{arch}-"
+    bun_prefix = f"bun-{bun_version}-{platform}-{arch}-"
     return {
         "module": {"key": module_prefix + dependency_hash, "prefix": module_prefix, "path": paths["GOMODCACHE"]},
         "build": {"key": build_prefix + source_hash, "prefix": build_prefix, "path": paths["GOCACHE"]},
