@@ -169,7 +169,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			runtime.quiesced[slot] = quiescenceEvidence{}
 		}
 		runtime.mu.Unlock()
-		metrics, metricsAt, metricsErr := runtime.observeSource(ctx, slot, "capacity", "admin-metrics")
+		metrics, doctor, metricsAt, metricsErr := runtime.observeCapacityHealth(ctx, slot)
 		if metricsErr == nil {
 			inFlight, inFlightOK := integerValue(metrics["in_flight_operations"])
 			pending, pendingOK := arrayLengthValue(metrics["pending_operations"])
@@ -217,8 +217,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 				runtime.invalidateMetrics(slot, "inventory")
 			}
 		}
-		doctor, doctorAt, doctorErr := runtime.observeSource(ctx, slot, "health", "doctor")
-		if doctorErr != nil {
+		if metricsErr != nil {
 			nativeObservationUp = false
 			runtime.invalidateMetrics(slot, "health")
 			snapshot.Consistent = false
@@ -238,7 +237,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			if doctorValid {
 				runtime.rememberMetrics(slot, "health", observe.MetricsForSnapshot("health", health))
 			}
-			sourceTimes["native_observation"] = minTime(sourceTimes["native_observation"], doctorAt)
+			sourceTimes["native_observation"] = minTime(sourceTimes["native_observation"], metricsAt)
 		}
 		drainStatus, _, drainErr := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-status"})
 		if drainErr != nil {
@@ -1125,11 +1124,14 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 		}
 		pending, pendingOK := arrayLengthValue(value["pending_operations"])
 		inFlight, inFlightOK := integerValue(value["in_flight_operations"])
-		unknown, unknownOK := arrayLengthValue(value["historical_unknown_operations"])
+		_, unknownOK := arrayLengthValue(value["historical_unknown_operations"])
 		if !pendingOK || !inFlightOK || !unknownOK {
 			return errors.New("old slot quiescence counters are incomplete")
 		}
-		if pending == 0 && inFlight == 0 && unknown == 0 {
+		// Reconciled historical outcomes remain unknown for audit, but their
+		// current safety is verified. Only pending and in-flight work prevents
+		// quiescence; historical records must not make deployment impossible.
+		if pending == 0 && inFlight == 0 {
 			identity, identityOK := runtime.readProcessIdentity(ctx, slot)
 			if !identityOK {
 				return errors.New("old slot process identity is unavailable after quiescence")
@@ -1370,10 +1372,22 @@ func (runtime *HostRuntime) control(ctx context.Context, socket string, request 
 }
 
 func (runtime *HostRuntime) observeSource(ctx context.Context, slot, source, action string) (map[string]any, time.Time, error) {
-	if _, _, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": action}); err != nil {
-		return nil, time.Time{}, err
+	for attempt := 1; ; attempt++ {
+		result, observedAt, err := runtime.observeSourceOnce(ctx, slot, source, action)
+		// Inventory probes run outside state locks. The scheduler persists its
+		// maintenance cursor every second, so a single inventory can legitimately
+		// cross an epoch even without a guest transition. Require a coherent new
+		// sample; never reinterpret an inconsistent sample as healthy.
+		if err != nil || action != "admin-status" || inventoryObservationCoherent(result) || attempt >= 3 || ctx.Err() != nil {
+			return result, observedAt, err
+		}
 	}
-	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/snapshots/"+source, nil)
+}
+
+func (runtime *HostRuntime) observeSourceOnce(ctx context.Context, slot, source, action string) (map[string]any, time.Time, error) {
+	// The response is the exact sample requested. A later GET of the shared
+	// snapshot can race another reader publishing a different sample.
+	body, status, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": action})
 	if err != nil {
 		return nil, time.Time{}, err
 	}
@@ -1396,6 +1410,24 @@ func (runtime *HostRuntime) observeSource(ctx context.Context, slot, source, act
 		return nil, time.Time{}, fmt.Errorf("%s observation timestamp is missing", source)
 	}
 	return result, observedAt, nil
+}
+
+func (runtime *HostRuntime) observeCapacityHealth(ctx context.Context, slot string) (map[string]any, map[string]any, time.Time, error) {
+	metrics, observedAt, err := runtime.observeSource(ctx, slot, "capacity", "admin-metrics")
+	if err != nil {
+		return nil, nil, time.Time{}, err
+	}
+	// admin-metrics already verifies its starting and ending state epoch and
+	// includes health from that sample. A separate doctor request after native
+	// inventory can legitimately observe a later lifecycle commit.
+	health := cloneMap(metrics["doctor"].(map[string]any))
+	health["up"] = metrics["up"]
+	health["observed_at"] = metrics["observed_at"]
+	health["state_epoch"] = metrics["observation_epoch"]
+	if err := validateSourceResult("doctor", health); err != nil {
+		return nil, nil, time.Time{}, err
+	}
+	return metrics, health, observedAt, nil
 }
 
 func validateSourceResult(action string, result map[string]any) error {

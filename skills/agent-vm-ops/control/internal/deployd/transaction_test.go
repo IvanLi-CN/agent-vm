@@ -232,6 +232,46 @@ func TestManagerCompletesBlueGreenTransactionWithOneRuntime(t *testing.T) {
 	}
 }
 
+func TestStageDrainedControllerForRecovery(t *testing.T) {
+	for _, mode := range []string{"drained", "not-drained", "in-flight", "worker", "unknown-counters", "no-controller", "target-controller"} {
+		t.Run(mode, func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			active := SlotObservation{Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: false, Draining: true, ControllerOwned: true, PendingOperations: 1}
+			target := SlotObservation{Slot: "green", ProcessUp: true, ProcessReady: true}
+			runtime := &fakeRuntime{active: "blue", traffic: map[string]bool{}, observations: map[string]SlotObservation{}}
+			switch mode {
+			case "not-drained":
+				active.Draining = false
+			case "in-flight":
+				active.InFlightRequests = 1
+			case "worker":
+				active.NativeWorkers = 1
+			case "unknown-counters":
+				runtime.unknownCounters = true
+			case "no-controller":
+				active.ControllerOwned = false
+			case "target-controller":
+				target.ControllerOwned = true
+			}
+			runtime.observations["blue"], runtime.observations["green"] = active, target
+			manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+			transaction, err := manager.Stage(context.Background(), "green", "/tmp/recovery.tar")
+			if mode == "drained" {
+				if err != nil || transaction.Phase != PhaseStandbyValidation {
+					t.Fatalf("stage = %#v, %v", transaction, err)
+				}
+			} else if err == nil || len(runtime.sequence) != 0 {
+				t.Fatalf("unsafe stage: %#v, %v, %v", transaction, err, runtime.sequence)
+			}
+		})
+	}
+}
+
 func TestManagerFencesUncertainStageFailure(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
@@ -710,6 +750,63 @@ type changingObservationRuntime struct {
 	invalidRoleSource string
 }
 
+func TestTransactionObservationRenewsOnlyVerifiedLiveCandidate(t *testing.T) {
+	start := controllerrole.ProcessStartToken(os.Getpid())
+	if start == "" {
+		t.Skip("Linux process-incarnation evidence required")
+	}
+	for _, mode := range []string{"live", "transient", "inconsistent", "expired", "other-owner"} {
+		t.Run(mode, func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			transaction := store.Transaction{ID: "tx-observe", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/tmp/recovery.tar", Phase: PhaseQuiescence, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
+			if err := database.Create(context.Background(), transaction, nil); err != nil {
+				t.Fatal(err)
+			}
+			lease := controllerrole.Lease{Slot: "green", Term: 1, Generation: 1, LeaseID: "lease", Nonce: "nonce", OwnerPID: os.Getpid(), OwnerStartTime: start, Expiry: now.Add(time.Second)}
+			if mode == "expired" {
+				lease.Expiry = now.Add(-time.Second)
+			}
+			if mode == "other-owner" {
+				lease.OwnerStartTime = "other"
+			}
+			runtime := &changingObservationRuntime{fakeRuntime: &fakeRuntime{active: "green", observations: map[string]SlotObservation{
+				"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true, LeaseRenewalSupported: true, ControllerLease: &lease},
+				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true},
+			}}}
+			if mode == "transient" {
+				runtime.unstableReads = 1
+			}
+			if mode == "inconsistent" {
+				runtime.unstableReads = 10
+			}
+			manager := NewManager(database, runtime, 15*time.Second, func() time.Time { return now })
+			_, err = manager.observe(context.Background(), transaction.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantGrant := mode == "live" || mode == "transient"
+			if (len(runtime.grantedLeases) == 1) != wantGrant {
+				t.Fatalf("grants=%v reads=%d", runtime.grantedLeases, runtime.reads)
+			}
+			if wantGrant {
+				renewed := runtime.grantedLeases[0]
+				if !renewed.Expiry.Equal(now.Add(15 * time.Second)) {
+					t.Fatalf("expiry=%v", renewed.Expiry)
+				}
+				renewed.Expiry = lease.Expiry
+				if renewed != lease {
+					t.Fatal("renewal changed controller identity")
+				}
+			}
+		})
+	}
+}
+
 func (runtime *changingObservationRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error) {
 	runtime.reads++
 	if runtime.onRead != nil {
@@ -765,6 +862,9 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 			}
 			defer database.Close()
 			lease := controllerrole.Lease{Slot: "blue", Term: 7, LeaseID: "existing-lease", Nonce: "existing-nonce", Generation: 11, Expiry: now.Add(time.Minute), OwnerPID: os.Getpid(), OwnerStartTime: controllerrole.ProcessStartToken(os.Getpid())}
+			if test.preserve {
+				lease.Expiry = now.Add(5 * time.Second)
+			}
 			runtime := &changingObservationRuntime{fakeRuntime: &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
 				"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true, LeaseRenewalSupported: true, ControllerLease: &lease, NativeWorkers: 1, PendingOperations: 1},
 				"green": {Slot: "green", ProcessUp: true, ProcessReady: true},
@@ -810,8 +910,11 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 				t.Fatalf("observation reads=%d want=%d", runtime.reads, test.wantReads)
 			}
 			if test.preserve {
-				if len(runtime.grantedLeases) != 0 || !runtime.observations["blue"].ControllerOwned || *runtime.observations["blue"].ControllerLease != lease {
-					t.Fatal("inconsistent business reads changed or renewed the live lease")
+				if len(runtime.grantedLeases) != 1 || !runtime.observations["blue"].ControllerOwned || runtime.grantedLeases[0].LeaseID != lease.LeaseID {
+					t.Fatal("business observation failure interrupted the verified live authority")
+				}
+				if !runtime.grantedLeases[0].Expiry.After(lease.Expiry) {
+					t.Fatal("business observation failure did not extend the live writer deadline")
 				}
 				for _, action := range runtime.sequence {
 					if action == "fence" || action == "traffic" {
@@ -822,15 +925,15 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 					t.Fatal("inconsistent business reads left admission open")
 				}
 				// A subsequent coherent sample must recover without changing the
-				// mutation's identity. Prolonged failure remains bounded by expiry.
+				// mutation's identity. Lost process evidence still fences authority.
 				runtime.unstableReads = runtime.reads
 				if err := manager.MaintainController(context.Background()); err != nil {
 					t.Fatalf("coherent next tick did not recover: %v", err)
 				}
-				if len(runtime.grantedLeases) != 1 || runtime.grantedLeases[0].LeaseID != lease.LeaseID {
+				if len(runtime.grantedLeases) != 2 || runtime.grantedLeases[1].LeaseID != lease.LeaseID {
 					t.Fatal("next tick replaced the existing lease")
 				}
-				now = lease.Expiry.Add(time.Second)
+				now = runtime.observations["blue"].ControllerLease.Expiry.Add(time.Second)
 				runtime.unstableReads = runtime.reads + 10
 				if err := manager.MaintainController(context.Background()); err == nil || runtime.observations["blue"].ControllerOwned {
 					t.Fatal("expired lease survived persistent observation failure")

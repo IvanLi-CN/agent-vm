@@ -77,14 +77,10 @@ Legacy unbound requests 要求匹配当前或紧接之前的 generation。
 Legacy starting acquire 只有在同 session 的所有 pending operations 同样处于 pre-transition 状态时才可在 transition 前 finalize；
 已完成的 older-generation acquire 仍独立保持 pending，并且必须满足以下条件之一：其 cached task 保留 request generation 且 identity/state 已验证，或者不存在 task/generation tombstone 且已确认 native instance 缺失。
 先前被阻塞的 maintenance reconciliation 只有在 transitional tasks 清空且其 worker 已验证不存在后才可 retry 一次。
-Superseded acquire、resize 或 restart 只有在后续成功的同 session operation 满足以下条件后才能停止阻塞 admission：journal order 和 timestamps 证明该 operation 发生在保存的 worker 完成之后；
-当前 cached task 已验证为 stopped 且 identity 正确；
-所有保存的 worker identities 均已确认不存在；
-control service cgroup 和 Incus background operations 均已 quiescent。
-Original request 和 worker evidence 必须继续记录，retry 返回明确的 unknown historical outcome，不得 replay original native operation。
+Superseded acquire、renew、release、resize 或 restart 只有在后续成功的同 session operation 满足以下条件后才能停止阻塞 admission：journal order 和 timestamps 证明该 operation 发生在历史请求之后，含 native worker 时还必须晚于保存的 worker 完成时间；当前 cached task 已验证为 stopped 且 identity 正确；所有保存的 worker identities 均已确认不存在；control service cgroup 和 Incus background operations 均已 quiescent。无 native effect 的 renew 可以不含 worker，含 worker 时仍须完成相同身份与退出验证。Original request 和 worker evidence 必须继续记录，retry 返回明确的 unknown historical outcome，不得 replay original native operation。
 标记为 finished with an error 的 legacy worker records，只有在 identity 和 process-group 验证通过后，recovery 才能将其视为 exited。
 
-Renewal 必须显式且有界。
+Renewal 必须显式且有界，以当前有效 deadline 为基础增加续租时长，并受从当前时间计算的 configured maximum 限制，不得因提前续租而缩短 lease。复用 cached task 的 acquire 未指定某项资源时必须保留该项已记录的资源值，不能将其重置为新建任务的默认值。
 Acquire、status、SSH、execution 和 transfer 都不会 renew lease。
 Generation 变化或 lease 过期会拒绝迟到的 readiness 和 native results。
 Durable state、locks 和 timers 让重复 request 保持幂等，同时不会隐藏 partial cleanup。
@@ -520,7 +516,7 @@ Uncertain commit 保留 source marker 和 precise recovery record，并返回 ex
 [CLI 合同](contracts/cli.md#source-synchronization-transaction)定义 execution bounds、ownership 和 recovery。
 Export 直接向 caller stream tar archive，不创建 server-side archive。
 
-## 验证
+## Verification
 
 - `VER-AGENT-VM-010` 覆盖：`REQ-AGENT-VM-010` 通过[操作运行手册](OPERATIONS.md)的 topology/provenance 章节、已接受的[拓扑与恢复 ADR](../../adr/0028-agent-vm-topology-recovery-boundary.md)和 `bin/test_agent_vm_documentation.py`。
 - `VER-AGENT-VM-011` 覆盖：`REQ-AGENT-VM-011` 通过[操作运行手册](OPERATIONS.md)的恢复流程、现有 native reconciliation 与 operation-journal behavior test，以及 `bin/test_agent_vm_documentation.py`。

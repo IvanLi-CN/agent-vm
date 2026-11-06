@@ -1393,13 +1393,15 @@ func (s *Store) listObservedOperationsArgs(ctx context.Context, query string, ar
 }
 
 // LaterSuccessfulSessionOperations uses the journal's insertion order, not
-// wall-clock timestamps, to find completed operations serialized after an intent.
+// wall-clock timestamps, to find completed lease operations serialized after an
+// intent. A later renew, release, expiry, or reacquire can fence an earlier
+// uncertain lease operation without replaying it.
 func (s *Store) LaterSuccessfulSessionOperations(ctx context.Context, operationID string) ([]Operation, error) {
 	var values []Operation
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
 		rows, err := conn.QueryContext(ctx, `SELECT later.operation_id, later.action, later.session_id, later.generation, later.response_json, later.created_at
 			FROM operations AS original JOIN operations AS later ON later.session_id = original.session_id AND later.rowid > original.rowid
-			WHERE original.operation_id = ? AND later.action IN ('acquire', 'release') AND json_extract(later.response_json, '$.outcome') = 'success' ORDER BY later.rowid`, operationID)
+			WHERE original.operation_id = ? AND later.action IN ('acquire', 'renew', 'release', 'timer-expire') AND json_extract(later.response_json, '$.outcome') = 'success' ORDER BY later.rowid`, operationID)
 		if err != nil {
 			return err
 		}

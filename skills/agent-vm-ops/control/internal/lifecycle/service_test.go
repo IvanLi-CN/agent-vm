@@ -594,7 +594,9 @@ func TestCachedAcquireReusesLegacyDefaultAfterMigration(t *testing.T) {
 	req := func(action, op string, generation int64) protocol.Request {
 		return protocol.Request{"protocol": protocol.Version, "action": action, "session_id": "legacy-cache", "generation": generation, "operation_id": op}
 	}
-	if _, err := service.Dispatch(ctx, req("acquire", "legacy-first", 0)); err != nil {
+	first := req("acquire", "legacy-first", 0)
+	first["cpu"], first["memory_mib"], first["disk_gib"] = int64(8), int64(12288), int64(40)
+	if _, err := service.Dispatch(ctx, first); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := service.Dispatch(ctx, req("release", "legacy-release", 1)); err != nil {
@@ -606,6 +608,42 @@ func TestCachedAcquireReusesLegacyDefaultAfterMigration(t *testing.T) {
 	}
 	if result["result"].(map[string]any)["state"] != stateActive {
 		t.Fatalf("reacquire = %#v", result)
+	}
+	if mustJSON(result["result"].(map[string]any)["resources"]) != mustJSON(map[string]int64{"cpu": 8, "memory_mib": 12288, "disk_gib": 40}) {
+		t.Fatalf("cached resources changed on omitted fields: %#v", result)
+	}
+}
+
+func TestRenewExtendsExistingDeadlineWithoutShortening(t *testing.T) {
+	for _, remaining := range []time.Duration{30 * time.Minute, 119 * time.Minute} {
+		t.Run(remaining.String(), func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			now := time.Now().UTC()
+			deadline := now.Add(remaining)
+			if err := store.InsertTask(context.Background(), state.Task{TaskID: "renew-task", SessionID: "renew-session", Generation: 1, State: stateActive, CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`, LeaseExpiresAt: stringPointer(nowString(deadline))}); err != nil {
+				t.Fatal(err)
+			}
+			cfg := config.Defaults()
+			service := New(store, cfg, Options{Clock: func() time.Time { return now }})
+			if _, err := service.renew(context.Background(), protocol.Request{"session_id": "renew-session", "generation": int64(1)}); err != nil {
+				t.Fatal(err)
+			}
+			task, err := store.GetTask(context.Background(), map[string]any{"session_id": "renew-session"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := deadline.Add(time.Duration(cfg.RenewSeconds) * time.Second)
+			if cap := now.Add(time.Duration(cfg.MaxLeaseSeconds) * time.Second); want.After(cap) {
+				want = cap
+			}
+			if task.LeaseExpiresAt == nil || *task.LeaseExpiresAt != nowString(want) {
+				t.Fatalf("deadline=%v want=%s", task.LeaseExpiresAt, nowString(want))
+			}
+		})
 	}
 }
 
@@ -5903,7 +5941,7 @@ func (guest *quiescentStartupGuest) VerifyRecoveryQuiescence(context.Context) er
 }
 
 func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
-	for _, action := range []string{"acquire", "resize", "restart"} {
+	for _, action := range []string{"acquire", "renew", "resize", "restart", "release"} {
 		t.Run(action, func(t *testing.T) {
 			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 			if err != nil {
@@ -5927,11 +5965,19 @@ func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
 				t.Fatal(err)
 			}
 			worker := map[string]any{"state": "finished", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "finished_at": nowString(time.Now())}
-			if err := store.RecordOperation(ctx, "original", action, &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": worker}); err != nil {
+			originalResponse := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest}
+			if action != "renew" {
+				originalResponse["worker"] = worker
+			}
+			if err := store.RecordOperation(ctx, "original", action, &session, &generation, originalResponse); err != nil {
 				t.Fatal(err)
 			}
 			laterAction, laterGeneration := "release", taskGeneration
 			result := map[string]any{"task_id": task.TaskID, "session_id": session, "generation": taskGeneration, "state": stateCached, "effective_lease": false}
+			if action == "renew" {
+				laterAction = "renew"
+				result["state"], result["effective_lease"] = stateActive, true
+			}
 			if action == "acquire" {
 				laterAction, laterGeneration = "acquire", int64(2)
 				result["state"], result["effective_lease"] = stateActive, true
@@ -5952,7 +5998,7 @@ func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
 				t.Fatalf("startup: %v", err)
 			}
 			original, err := store.GetOperation(ctx, "original")
-			if err != nil || original == nil || original.Response["outcome"] != "error" || original.Response["_request"] == nil || original.Response["worker"] == nil {
+			if err != nil || original == nil || original.Response["outcome"] != "error" || original.Response["_request"] == nil || (action != "renew" && original.Response["worker"] == nil) {
 				t.Fatalf("original = %#v, error = %v", original, err)
 			}
 			_, err = service.replayRecord(req, original)
@@ -5975,93 +6021,129 @@ func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
 	}
 }
 
+func TestPendingRenewWithoutLaterLeaseEvidenceRemainsBlocked(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session, generation := "pending-renew-without-witness", int64(1)
+	now := nowString(time.Now())
+	task := state.Task{TaskID: "pending-renew-task", SessionID: session, Generation: generation, State: stateCached, InstanceName: "pending-renew-instance", CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	req := protocol.Request{"protocol": protocol.Version, "action": "renew", "session_id": session, "generation": generation, "operation_id": "pending-renew"}
+	digest, err := protocol.Digest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "pending-renew", "renew", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &quiescentStartupGuest{startupGuest: &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": fmt.Sprint(generation)}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(ctx); protocol.AsError(err).Code != "startup_reconcile_required" {
+		t.Fatalf("startup error = %#v", err)
+	}
+	operation, err := store.GetOperation(ctx, "pending-renew")
+	if err != nil || operation == nil || operation.Response["outcome"] != "pending" {
+		t.Fatalf("operation = %#v, error = %v", operation, err)
+	}
+}
+
 func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
-	for _, mode := range []string{"native-busy", "worker-missing", "no-witness", "wrong-session", "wrong-task", "missing-lease", "unverified-cache", "other-pending", "active", "late-worker", "bad-witness-digest", "bound-task-mismatch"} {
-		t.Run(mode, func(t *testing.T) {
-			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer store.Close()
-			ctx := context.Background()
-			session, generation := "superseded-negative-"+mode, int64(1)
-			now := nowString(time.Now())
-			task := state.Task{TaskID: "task", SessionID: session, Generation: generation, State: stateCached, InstanceName: "instance", CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
-			if err := store.InsertTask(ctx, task); err != nil {
-				t.Fatal(err)
-			}
-			req := protocol.Request{"protocol": protocol.Version, "action": "restart", "session_id": session, "generation": generation, "operation_id": "original"}
-			digest, err := protocol.Digest(req)
-			if err != nil {
-				t.Fatal(err)
-			}
-			worker := map[string]any{"state": "exited", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "finished_at": nowString(time.Now())}
-			if mode == "worker-missing" {
-				delete(worker, "process_group")
-			}
-			if mode == "late-worker" {
-				worker["finished_at"] = nowString(time.Now().Add(time.Hour))
-			}
-			originalResponse := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": worker}
-			if mode == "bound-task-mismatch" {
-				originalResponse["_task_id"] = "different"
-			}
-			if err := store.RecordOperation(ctx, "original", "restart", &session, &generation, originalResponse); err != nil {
-				t.Fatal(err)
-			}
-			if mode != "no-witness" {
-				laterReq := protocol.Request{"protocol": protocol.Version, "action": "release", "session_id": session, "generation": generation, "operation_id": "later"}
-				result := map[string]any{"task_id": task.TaskID, "session_id": session, "generation": generation, "state": stateCached, "effective_lease": false}
-				if mode == "wrong-session" {
-					result["session_id"] = "different"
-				}
-				if mode == "wrong-task" {
-					result["task_id"] = "different"
-				}
-				if mode == "missing-lease" {
-					delete(result, "effective_lease")
-				}
-				later := protocol.SuccessWithRelease(laterReq, result, nil, nil)
-				laterDigest, err := protocol.Digest(laterReq)
-				if err != nil {
-					t.Fatal(err)
-				}
-				later["_request_digest"] = laterDigest
-				if mode == "bad-witness-digest" {
-					later["_request_digest"] = "invalid"
-				}
-				if err := store.RecordOperation(ctx, "later", "release", &session, &generation, later); err != nil {
-					t.Fatal(err)
-				}
-			}
-			if mode == "other-pending" {
-				if err := store.RecordOperation(ctx, "other", "destroy", &session, &generation, map[string]any{"outcome": "pending"}); err != nil {
-					t.Fatal(err)
-				}
-			}
-			nativeTask := task.TaskID
-			if mode == "unverified-cache" {
-				nativeTask = "different"
-			}
-			guest := &quiescentStartupGuest{startupGuest: &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": nativeTask, "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}}
-			if mode == "native-busy" {
-				guest.quiescenceErr = errors.New("native work remains")
-			}
-			service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
-			if mode == "active" {
-				finish := service.markOperationActive("original")
-				defer finish()
-			}
-			pending, err := store.PendingOperations(ctx)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := service.reconcileSupersededOperations(ctx, pending); (err != nil) != (mode == "native-busy") {
-				t.Fatalf("reconciliation error = %v", err)
-			}
-			original, err := store.GetOperation(ctx, "original")
-			if err != nil || original == nil || original.Response["outcome"] != "pending" {
-				t.Fatalf("original = %#v, error = %v", original, err)
+	for _, action := range []string{"restart", "release"} {
+		t.Run(action, func(t *testing.T) {
+			for _, mode := range []string{"native-busy", "worker-missing", "no-witness", "wrong-session", "wrong-task", "missing-lease", "unverified-cache", "other-pending", "active", "late-worker", "bad-witness-digest", "bound-task-mismatch"} {
+				t.Run(mode, func(t *testing.T) {
+					store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer store.Close()
+					ctx := context.Background()
+					session, generation := "superseded-negative-"+mode, int64(1)
+					now := nowString(time.Now())
+					task := state.Task{TaskID: "task", SessionID: session, Generation: generation, State: stateCached, InstanceName: "instance", CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+					if err := store.InsertTask(ctx, task); err != nil {
+						t.Fatal(err)
+					}
+					req := protocol.Request{"protocol": protocol.Version, "action": action, "session_id": session, "generation": generation, "operation_id": "original"}
+					digest, err := protocol.Digest(req)
+					if err != nil {
+						t.Fatal(err)
+					}
+					worker := map[string]any{"state": "exited", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "finished_at": nowString(time.Now())}
+					if mode == "worker-missing" {
+						delete(worker, "process_group")
+					}
+					if mode == "late-worker" {
+						worker["finished_at"] = nowString(time.Now().Add(time.Hour))
+					}
+					originalResponse := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": worker}
+					if mode == "bound-task-mismatch" {
+						originalResponse["_task_id"] = "different"
+					}
+					if err := store.RecordOperation(ctx, "original", action, &session, &generation, originalResponse); err != nil {
+						t.Fatal(err)
+					}
+					if mode != "no-witness" {
+						laterReq := protocol.Request{"protocol": protocol.Version, "action": "release", "session_id": session, "generation": generation, "operation_id": "later"}
+						result := map[string]any{"task_id": task.TaskID, "session_id": session, "generation": generation, "state": stateCached, "effective_lease": false}
+						if mode == "wrong-session" {
+							result["session_id"] = "different"
+						}
+						if mode == "wrong-task" {
+							result["task_id"] = "different"
+						}
+						if mode == "missing-lease" {
+							delete(result, "effective_lease")
+						}
+						later := protocol.SuccessWithRelease(laterReq, result, nil, nil)
+						laterDigest, err := protocol.Digest(laterReq)
+						if err != nil {
+							t.Fatal(err)
+						}
+						later["_request_digest"] = laterDigest
+						if mode == "bad-witness-digest" {
+							later["_request_digest"] = "invalid"
+						}
+						if err := store.RecordOperation(ctx, "later", "release", &session, &generation, later); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if mode == "other-pending" {
+						if err := store.RecordOperation(ctx, "other", "destroy", &session, &generation, map[string]any{"outcome": "pending"}); err != nil {
+							t.Fatal(err)
+						}
+					}
+					nativeTask := task.TaskID
+					if mode == "unverified-cache" {
+						nativeTask = "different"
+					}
+					guest := &quiescentStartupGuest{startupGuest: &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": nativeTask, "user.agent-vm.session": session, "user.agent-vm.generation": "1"}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}}
+					if mode == "native-busy" {
+						guest.quiescenceErr = errors.New("native work remains")
+					}
+					service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+					if mode == "active" {
+						finish := service.markOperationActive("original")
+						defer finish()
+					}
+					pending, err := store.PendingOperations(ctx)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := service.reconcileSupersededOperations(ctx, pending); (err != nil) != (mode == "native-busy") {
+						t.Fatalf("reconciliation error = %v", err)
+					}
+					original, err := store.GetOperation(ctx, "original")
+					if err != nil || original == nil || original.Response["outcome"] != "pending" {
+						t.Fatalf("original = %#v, error = %v", original, err)
+					}
+				})
 			}
 		})
 	}
