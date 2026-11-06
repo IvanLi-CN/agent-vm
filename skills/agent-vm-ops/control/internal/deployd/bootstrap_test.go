@@ -153,3 +153,57 @@ func (r *bootstrapFake) RenewTransactionLease(ctx context.Context, lease control
 	lease.Expiry = time.Now().Add(time.Second)
 	return lease, nil
 }
+
+// A crash before ExecStart leaves no UDS. Explicit initial recovery must use
+// hard process stops, while a failed stop must prevent any initialization.
+type unavailableBootstrapRoles struct {
+	*bootstrapFake
+	stopErr error
+	stopped []string
+}
+
+func (r *unavailableBootstrapRoles) DisableTraffic(context.Context, string) error {
+	return errors.New("role socket absent")
+}
+func (r *unavailableBootstrapRoles) FenceController(context.Context, string) error {
+	return errors.New("role socket absent")
+}
+func (r *unavailableBootstrapRoles) Stop(ctx context.Context, slot string) error {
+	if r.stopErr != nil {
+		return r.stopErr
+	}
+	r.stopped = append(r.stopped, slot)
+	return r.fakeRuntime.Stop(ctx, slot)
+}
+func TestBootstrapRecoveryWithoutRoleSocketsRequiresBothStops(t *testing.T) {
+	for _, failStop := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stopped", true: "stop-failed"}[failStop], func(t *testing.T) {
+			clock := func() time.Time { return time.Unix(100, 0).UTC() }
+			db, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, clock)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			r := &unavailableBootstrapRoles{bootstrapFake: &bootstrapFake{fakeRuntime: &fakeRuntime{active: "none", observations: map[string]SlotObservation{"blue": {}, "green": {}}, traffic: map[string]bool{}, readyAfterGrant: true}, prepareErr: errors.New("initialization interrupted")}}
+			m := NewManager(db, r, time.Minute, clock)
+			id := "install-0123456789abcdef0123456789abcdef"
+			if _, err = m.Bootstrap(context.Background(), id, "/bundle.tar"); err == nil {
+				t.Fatal("expected interrupted bootstrap")
+			}
+			r.prepareErr = nil
+			if failStop {
+				r.stopErr = errors.New("unit stop failed")
+			}
+			tx, err := m.Recover(context.Background(), id, "resume-bootstrap")
+			if failStop {
+				if err == nil || r.preparations != 1 {
+					t.Fatalf("failed stop replayed initialization: %v %d", err, r.preparations)
+				}
+				return
+			}
+			if err != nil || tx == nil || tx.ID != id || tx.State != "finalized" || len(r.stopped) != 2 || r.stopped[0] != "blue" || r.stopped[1] != "green" {
+				t.Fatalf("recovery: %+v %v stopped=%v", tx, err, r.stopped)
+			}
+		})
+	}
+}

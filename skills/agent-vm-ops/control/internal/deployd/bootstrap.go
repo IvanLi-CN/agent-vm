@@ -159,6 +159,17 @@ func (runtime *HostRuntime) PrepareBootstrap(ctx context.Context, bundle string)
 	return runtime.prepareBootstrap(ctx, bundle, false)
 }
 func (runtime *HostRuntime) ResumeBootstrap(ctx context.Context, bundle string) error {
+	if err := runtime.CheckBootstrapRecovery(ctx); err != nil {
+		return err
+	}
+	// A failed ExecStartPre leaves a stopped unit in failed/failed. Clear only
+	// these fixed initial-install units, after the manager has stopped both;
+	// prepareBootstrap still requires fresh inactive/dead process proof.
+	for _, slot := range []string{"blue", "green"} {
+		if err := runtime.systemctl(ctx, "reset-failed", "agent-vm-native@"+slot+".service"); err != nil {
+			return err
+		}
+	}
 	return runtime.prepareBootstrap(ctx, bundle, true)
 }
 func (runtime *HostRuntime) prepareBootstrap(ctx context.Context, bundle string, resume bool) error {
@@ -208,10 +219,8 @@ func (manager *Manager) resumeBootstrap(ctx context.Context, tx store.Transactio
 	}
 	// Recovery is explicit, uses the original identity, and stops both processes
 	// before validating the existing authority. It never restores a database.
-	cause := errors.New("explicit initial installation recovery")
-	if err := manager.fenceSlots(ctx, cause); err != cause {
-		return nil, err
-	}
+	// Stopping the fixed units is the hard fence here: the initial slot may
+	// not have created its role socket yet. Do not require a role RPC first.
 	for _, slot := range []string{"blue", "green"} {
 		if err := manager.Runtime.Stop(ctx, slot); err != nil {
 			return nil, err
