@@ -3666,6 +3666,25 @@ func TestWorkerStartGateRearmsVerifiedWorkerIdentity(t *testing.T) {
 	}
 }
 
+func TestWorkerStartGateRearmsExitedWorkerIdentity(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "exited-rearm.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.RecordOperation(ctx, "rearm-exited", "destroy", stringPointer("rearm-session"), nil, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "exited", "pid": 123, "start_time": "123", "process_group": 123}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	if err := service.WorkerStartAllowed(ctx, "rearm-exited"); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.WorkerStarted(ctx, "rearm-exited", native.WorkerIdentity{PID: 456, StartTime: "456", ProcessGroup: 456}); err != nil {
+		t.Fatalf("new worker could not replace verified exited identity: %v", err)
+	}
+}
+
 func TestWorkerStartFailedClearsAdmissionBarrier(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "worker-start-failed.sqlite3"))
 	if err != nil {
@@ -6052,6 +6071,7 @@ type quiescentDestroyRecoveryGuest struct {
 	*quiescentStartupGuest
 	deleted         bool
 	afterQuiescence func()
+	nativeDelete    bool
 }
 
 func (guest *quiescentDestroyRecoveryGuest) VerifyRecoveryQuiescence(ctx context.Context) error {
@@ -6064,8 +6084,17 @@ func (guest *quiescentDestroyRecoveryGuest) VerifyRecoveryQuiescence(ctx context
 	return nil
 }
 
-func (guest *quiescentDestroyRecoveryGuest) Delete(_ context.Context, _ string) error {
+func (guest *quiescentDestroyRecoveryGuest) Delete(ctx context.Context, _ string) error {
 	guest.deleteCalls++
+	if guest.nativeDelete {
+		result, err := native.NewRunner().Run(ctx, []string{"sh", "-c", "sleep 0.05"}, nil)
+		if err != nil {
+			return err
+		}
+		if result.Code != 0 {
+			return fmt.Errorf("native child exited %d", result.Code)
+		}
+	}
 	guest.deleted = true
 	return nil
 }
@@ -6077,7 +6106,7 @@ func (guest *quiescentDestroyRecoveryGuest) Config(ctx context.Context, name str
 }
 
 func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T) {
-	for _, scenario := range []string{"recover", "recover-identified", "live-identity", "invalid-identity", "not-drained", "ordinary-drain", "not-resident", "bad-digest", "wrong-generation", "not-destroy", "native-busy", "active-operation", "role-lost", "role-lost-after-quiescence", "not-startup-fenced", "partial-identity", "already-recovered"} {
+	for _, scenario := range []string{"recover", "recover-identified", "recover-native", "recover-carried-native", "carried-changed-identity", "carried-not-later", "carried-already-repaired", "carried-busy", "carried-revoked", "live-identity", "invalid-identity", "not-drained", "ordinary-drain", "not-resident", "bad-digest", "wrong-generation", "not-destroy", "native-busy", "active-operation", "role-lost", "role-lost-after-quiescence", "not-startup-fenced", "partial-identity", "already-recovered"} {
 		t.Run(scenario, func(t *testing.T) {
 			ctx := context.WithValue(context.Background(), startupRecoveryFenceContextKey{}, true)
 			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
@@ -6110,7 +6139,7 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 			if scenario == "partial-identity" {
 				original["pid"] = 123
 			}
-			if scenario == "recover-identified" || scenario == "invalid-identity" {
+			if scenario == "recover-identified" || scenario == "recover-native" || strings.Contains(scenario, "carried") || scenario == "invalid-identity" {
 				original["pid"] = 1000000000
 				original["process_group"] = 1000000000
 				original["start_time"] = "16837775"
@@ -6137,7 +6166,25 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 				original["process_group"] = child.Process.Pid
 				original["start_time"] = fields[19]
 			}
-			if err := store.RecordOperation(ctx, "original-destroy", action, &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": original}); err != nil {
+			response := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": original}
+			if strings.Contains(scenario, "carried") {
+				first := map[string]any{}
+				for key, value := range original {
+					first[key] = value
+				}
+				response["_worker_recovery_evidence"] = map[string]any{"original_worker": first, "observed_at": "2026-11-06T05:43:30Z", "basis": "resident-systemd-and-incus-quiescence", "outcome": "unknown"}
+				original["prepared_at"] = "2026-11-06T05:43:31Z"
+				if scenario == "carried-changed-identity" {
+					original["pid"] = 1000000001
+				}
+				if scenario == "carried-not-later" {
+					original["prepared_at"] = "2026-11-06T05:43:30Z"
+				}
+				if scenario == "carried-already-repaired" {
+					response["_worker_rearm_recovery_evidence"] = map[string]any{"outcome": "unknown"}
+				}
+			}
+			if err := store.RecordOperation(ctx, "original-destroy", action, &session, &generation, response); err != nil {
 				t.Fatal(err)
 			}
 			if scenario == "already-recovered" {
@@ -6161,7 +6208,8 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 				t.Fatal(err)
 			}
 			guest := &quiescentDestroyRecoveryGuest{quiescentStartupGuest: &quiescentStartupGuest{startupGuest: &startupGuest{status: "Stopped", config: map[string]any{"devices": map[string]any{}, "expanded_devices": map[string]any{}, "config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": "2"}}}}}
-			if scenario == "native-busy" {
+			guest.nativeDelete = scenario == "recover-native" || scenario == "recover-carried-native"
+			if scenario == "native-busy" || scenario == "carried-busy" {
 				guest.quiescenceErr = errors.New("native background operations are not clear")
 			}
 			service := New(store, config.Defaults(), Options{Guest: guest, Resident: scenario != "not-resident"})
@@ -6172,7 +6220,7 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 			service.SetMutationGate(gate.Valid)
 			service.SetMutationFence(gate.Changes)
 			service.SetMutationCommit(gate.WithValid)
-			if scenario == "role-lost-after-quiescence" {
+			if scenario == "role-lost-after-quiescence" || scenario == "carried-revoked" {
 				guest.afterQuiescence = gate.Fence
 			}
 			step := func(call func() error) error {
@@ -6199,12 +6247,15 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 				t.Fatal(loadErr)
 			}
 			worker, _ := operation.Response["worker"].(map[string]any)
-			if scenario != "recover" && scenario != "recover-identified" {
+			if scenario != "recover" && scenario != "recover-identified" && scenario != "recover-native" && scenario != "recover-carried-native" {
 				if err == nil || worker["state"] != "starting" || operation.Response["outcome"] != "pending" {
 					t.Fatalf("unsafe recovery: err=%v record=%#v", err, operation.Response)
 				}
 				if scenario == "role-lost-after-quiescence" && operation.Response["_worker_recovery_evidence"] != nil {
 					t.Fatal("revoked controller committed recovery evidence")
+				}
+				if strings.Contains(scenario, "carried") && mustJSON(operation.Response) != mustJSON(response) {
+					t.Fatal("rejected carried identity repair changed the journal")
 				}
 				return
 			}
@@ -6216,6 +6267,9 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 			}
 			if operation.Response["_worker_recovery_evidence"] == nil {
 				t.Fatal("original unknown worker evidence was lost")
+			}
+			if scenario == "recover-carried-native" && (operation.Response["_worker_rearm_recovery_evidence"] == nil || mustJSON(operation.Response["_worker_recovery_evidence"]) != mustJSON(response["_worker_recovery_evidence"])) {
+				t.Fatal("carried identity recovery lost original evidence or missing bounded repair evidence")
 			}
 			if guest.deleteCalls != 0 || guest.startCalls != 0 {
 				t.Fatal("quiescence recovery executed native mutation")
@@ -6231,6 +6285,16 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 			terminal, err := store.GetOperation(ctx, "original-destroy")
 			if err != nil || terminal.Response["outcome"] != "success" || terminal.Response["_worker_recovery_evidence"] == nil || guest.deleteCalls != 1 {
 				t.Fatal("terminal journal discarded recovery evidence")
+			}
+			if scenario == "recover-carried-native" && terminal.Response["_worker_rearm_recovery_evidence"] == nil {
+				t.Fatal("terminal journal discarded rearm evidence")
+			}
+			if guest.nativeDelete {
+				finalWorker, _ := terminal.Response["worker"].(map[string]any)
+				pid, validPID := protocol.Integer(finalWorker["pid"])
+				if !validPID || pid <= 0 || pid == 1000000000 || stringValue(finalWorker["state"]) != "finished" {
+					t.Fatal("real Runner did not replace and finish the old worker identity")
+				}
 			}
 
 		})
