@@ -486,6 +486,22 @@ func (runtime *HostRuntime) Verify(ctx context.Context, slot, bundle string) err
 	return nil
 }
 
+// Recovery must bind its new grant to the live process and reverify the exact
+// original bundle. A persisted process ID never restores this binding.
+func (runtime *HostRuntime) PrepareRecoveryController(ctx context.Context, slot, bundle string) error {
+	if err := validSlot(slot); err != nil {
+		return err
+	}
+	process, err := runtime.waitSlotIdentity(ctx, slot, processIdentity{}, false)
+	if err != nil {
+		return err
+	}
+	runtime.mu.Lock()
+	runtime.stagedProcess[slot] = process
+	runtime.mu.Unlock()
+	return runtime.Verify(ctx, slot, bundle)
+}
+
 func (runtime *HostRuntime) VerifySlotIdentity(_ context.Context, slot, releaseID, sourceRevision string, capabilities []string) error {
 	if err := validSlot(slot); err != nil {
 		return err

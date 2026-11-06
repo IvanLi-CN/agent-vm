@@ -549,6 +549,13 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 			}
 			return nil, manager.effectFailure(ctx, id, transaction.Phase, cause)
 		}
+		if verifier, ok := manager.Runtime.(interface {
+			PrepareRecoveryController(context.Context, string, string) error
+		}); ok {
+			if err := verifier.PrepareRecoveryController(ctx, transaction.TargetSlot, transaction.Bundle); err != nil {
+				return nil, manager.effectFailure(ctx, id, transaction.Phase, err)
+			}
+		}
 		lease, err := manager.newLease(ctx, transaction.TargetSlot, transaction.Generation)
 		if err != nil {
 			return nil, fmt.Errorf("allocate recovery controller lease: %w", err)
@@ -556,26 +563,30 @@ func (manager *Manager) Recover(ctx context.Context, id, action string) (*store.
 		if err := manager.Runtime.GrantController(ctx, transaction.TargetSlot, lease); err != nil {
 			return nil, manager.effectFailure(ctx, id, transaction.Phase, fmt.Errorf("regrant the selected controller before recovery finalize: %w", err))
 		}
+		parentContext := ctx
+		ctx, stopRenewal := manager.beginTransactionRenewal(ctx, lease)
+		defer stopRenewal()
+		fail := func(cause error) (*store.Transaction, error) {
+			_ = stopRenewal()
+			return nil, manager.effectFailure(parentContext, id, transaction.Phase, cause)
+		}
 		if err := manager.waitForReady(ctx, id, transaction.TargetSlot); err != nil {
-			failureErr := manager.failure(ctx, id, transaction.Phase, &UncertainError{Cause: err})
-			fenceErr := manager.fenceSlots(ctx, errors.New("recovery finalize readiness was not verified"))
-			return nil, fmt.Errorf("%w; %v", failureErr, fenceErr)
+			return fail(fmt.Errorf("recovery finalize readiness was not verified: %w", err))
 		}
 		if err := manager.Runtime.EnableTraffic(ctx, transaction.TargetSlot); err != nil {
-			failureErr := manager.failure(ctx, id, transaction.Phase, &UncertainError{Cause: err})
-			fenceErr := manager.fenceSlots(ctx, errors.New("recovery finalize traffic role was not restored"))
-			return nil, fmt.Errorf("%w; %v", failureErr, fenceErr)
+			return fail(fmt.Errorf("recovery finalize traffic role was not restored: %w", err))
 		}
 		observation, observeErr = manager.observe(ctx, id)
 		if observeErr != nil || !recoveryTargetVerified(observation, *transaction, manager.Clock().UTC(), true, true, true, verifiedReleaseID, verifiedSourceRevision, verifiedStateEpoch, verifiedCapabilities) {
-			failureErr := manager.failure(ctx, id, transaction.Phase, &UncertainError{Cause: errors.New("recovery finalize controller evidence was not verified")})
-			fenceErr := manager.fenceSlots(ctx, errors.New("recovery finalize was fenced"))
-			return nil, fmt.Errorf("%w; %v", failureErr, fenceErr)
+			return fail(errors.New("recovery finalize controller evidence was not verified"))
 		}
+		if err := stopRenewal(); err != nil {
+			return fail(err)
+		}
+		ctx = parentContext
 		updated, err := manager.transition(ctx, id, transaction.Phase, PhaseFinalize, "recovered_finalize", map[string]any{"verified": true, "active_slot": transaction.TargetSlot, "lease_id": lease.LeaseID})
 		if err != nil {
-			fenceErr := manager.fenceSlots(ctx, errors.New("recovery finalize persistence failed; controller roles were fenced"))
-			return nil, fmt.Errorf("%w; %v", err, fenceErr)
+			return fail(fmt.Errorf("recovery finalize persistence failed: %w", err))
 		}
 		manager.startupFenced = false
 		return updated, nil

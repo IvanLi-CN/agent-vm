@@ -41,6 +41,11 @@ type fakeRuntime struct {
 	grantedLeases         []controllerrole.Lease
 }
 
+func (runtime *fakeRuntime) RenewTransactionLease(_ context.Context, lease controllerrole.Lease) (controllerrole.Lease, error) {
+	lease.Expiry = lease.Expiry.Add(time.Minute)
+	return lease, nil
+}
+
 func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 	slots := make(map[string]SlotObservation, len(runtime.observations))
 	for slot, value := range runtime.observations {

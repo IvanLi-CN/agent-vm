@@ -342,8 +342,8 @@ func TestSlotRequestPreservesControllerLeaseIdentity(t *testing.T) {
 	}
 }
 
-func TestBootstrapRenewalRequiresLiveMatchingProcessAndLease(t *testing.T) {
-	for _, scenario := range []string{"not-ready-live", "expired", "changed-lease", "changed-process"} {
+func TestTransactionRenewalRequiresLiveMatchingProcessAndLease(t *testing.T) {
+	for _, scenario := range []string{"not-ready-live", "green-not-ready-live", "expired", "changed-lease", "changed-process"} {
 		t.Run(scenario, func(t *testing.T) {
 			dir, err := os.MkdirTemp("", "avm-bootstrap-uds-")
 			if err != nil {
@@ -356,6 +356,9 @@ func TestBootstrapRenewalRequiresLiveMatchingProcessAndLease(t *testing.T) {
 				t.Fatal(err)
 			}
 			lease := controllerrole.Lease{Slot: "blue", Term: 3, Generation: 1, LeaseID: "original", Nonce: "original-nonce", Expiry: time.Now().Add(5 * time.Second)}
+			if scenario == "green-not-ready-live" {
+				lease.Slot = "green"
+			}
 			if scenario == "expired" {
 				lease.Expiry = time.Now().Add(-time.Second)
 			}
@@ -383,10 +386,11 @@ func TestBootstrapRenewalRequiresLiveMatchingProcessAndLease(t *testing.T) {
 			defer server.Close()
 			cfg := Defaults()
 			cfg.BlueSocket = socket
+			cfg.GreenSocket = socket
 			runtime := NewHostRuntime(cfg)
-			runtime.stagedProcess["blue"] = processIdentity{PID: 123, StartTime: "456"}
-			renewed, err := runtime.RenewBootstrapLease(context.Background(), lease)
-			if scenario == "not-ready-live" {
+			runtime.stagedProcess[lease.Slot] = processIdentity{PID: 123, StartTime: "456"}
+			renewed, err := runtime.RenewTransactionLease(context.Background(), lease)
+			if scenario == "not-ready-live" || scenario == "green-not-ready-live" {
 				if err != nil || grants != 1 || !renewed.Expiry.After(lease.Expiry) {
 					t.Fatalf("valid startup renewal: %+v %v grants=%d", renewed, err, grants)
 				}

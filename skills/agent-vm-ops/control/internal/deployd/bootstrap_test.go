@@ -146,7 +146,7 @@ func TestBootstrapExplicitRecoveryRetainsOriginalTransaction(t *testing.T) {
 	}
 }
 
-func (r *bootstrapFake) RenewBootstrapLease(ctx context.Context, lease controllerrole.Lease) (controllerrole.Lease, error) {
+func (r *bootstrapFake) RenewTransactionLease(ctx context.Context, lease controllerrole.Lease) (controllerrole.Lease, error) {
 	if err := lease.Validate(time.Now(), "blue"); err != nil {
 		return lease, err
 	}

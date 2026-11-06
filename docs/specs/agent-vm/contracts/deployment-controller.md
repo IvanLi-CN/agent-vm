@@ -255,3 +255,5 @@ Deployd 随后验证初始 standby 的 release、状态能力和进程身份，�
 运行时副作用失败后的证据记录与双槽位 fencing 使用独立的 30 秒收尾预算。请求取消或超时不能取消这段收尾；收尾只保存不确定结果并撤销角色，不能继续激活或重放安装。
 
 `recover finalize` 在重新授予 controller lease 前要求目标进程就绪、观测新鲜一致且发布身份和状态能力已验证，不要求依赖 controller role 的业务就绪。授予新 lease 后必须完成 startup reconciliation 并验证业务就绪，才能开放 traffic；fenced 槽位的业务未就绪不能形成恢复授权的循环依赖。
+
+恢复路径重新验证原事务包及目标实际进程后，在业务就绪和最终组合观测期间使用与首次安装相同的 lease 身份连续性检查。blue 和 green 均适用；任何失败先停止事务内续租，再保存证据并 fencing，不能因事务锁阻止常规协调而让恢复中的 lease 自行耗尽。
