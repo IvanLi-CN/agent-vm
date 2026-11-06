@@ -1443,7 +1443,7 @@ class WorkerRecoveryBootstrapTests(unittest.TestCase):
         pending = self.pending()
         pending[0]["worker"].update(pid=1000000000, process_group=1000000000, start_time="16837775")
         self.assertTrue(WRAPPER._attempted_destroy_recovery_pending(pending, {"in_flight_operations": 0}))
-        for key,value in (("pid", True),("pid",0),("process_group",0),("start_time","invalid"),("start_time","0")):
+        for key,value in (("pid", True),("pid",0),("pid",2**63),("process_group",0),("process_group",2**63),("start_time","invalid"),("start_time","0")):
             with self.subTest(key=key,value=value):
                 modified=json.loads(json.dumps(pending));modified[0]["worker"][key]=value
                 self.assertFalse(WRAPPER._attempted_destroy_recovery_pending(modified, {"in_flight_operations":0}))

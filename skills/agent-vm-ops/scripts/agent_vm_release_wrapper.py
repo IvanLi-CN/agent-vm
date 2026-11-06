@@ -1311,7 +1311,7 @@ def _attempted_destroy_recovery_pending(pending: list[Any], metrics: Mapping[str
         if any(key in worker for key in identity_keys):
             if not all(key in worker for key in identity_keys):
                 return False
-            if any(type(worker[key]) is not int or worker[key] <= 0 for key in ("pid", "process_group")):
+            if any(type(worker[key]) is not int or not 0 < worker[key] <= 9223372036854775807 for key in ("pid", "process_group")):
                 return False
             start = worker["start_time"]
             if not isinstance(start, str) or re.fullmatch(r"[0-9]{1,20}", start) is None or not 0 < int(start) <= 18446744073709551615:
