@@ -44,7 +44,8 @@ export function buildMaterialsArchive(repository: string, output: string, revisi
     buildMaterials(join(repository, 'deploy'), directory, revision);
     const manifest = JSON.parse(readFileSync(join(directory, 'materials-manifest.json'), 'utf8')) as {files: {path: string}[]};
     const archive = join(temporary, 'materials.tar');
-    const result = Bun.spawnSync(['tar', '-cf', archive, '-C', directory, '--no-recursion', 'materials-manifest.json', ...manifest.files.map(file => file.path)], {stdout:'pipe',stderr:'pipe',env:{...process.env,COPYFILE_DISABLE:'1'}});
+    const ownership = process.platform === 'darwin' ? ['--uid','0','--gid','0','--uname','root','--gname','root'] : ['--owner=0','--group=0','--numeric-owner'];
+    const result = Bun.spawnSync(['tar', '--format=ustar', '--no-xattrs', ...ownership, '-cf', archive, '-C', directory, '--no-recursion', 'materials-manifest.json', ...manifest.files.map(file => file.path)], {stdout:'pipe',stderr:'pipe',env:{...process.env,COPYFILE_DISABLE:'1'}});
     if (result.exitCode !== 0) throw new Error('deployment materials archive failed');
     writeFileSync(output, readFileSync(archive), {flag:'wx',mode:0o644});
   } finally {rmSync(temporary, {recursive:true,force:true});}

@@ -35,7 +35,7 @@ test('release materials archive requires the exact clean revision', async () => 
     buildMaterialsArchive(source,output,revision);
     // BSD tar hides AppleDouble metadata in its own listing. Inspect raw
     // members with Python so a macOS-built archive remains valid on Linux.
-    const listing=Bun.spawnSync(['python3','-c','import json,sys,tarfile; print(json.dumps(tarfile.open(sys.argv[1]).getnames()))',output],{stdout:'pipe',stderr:'pipe'});
+    const listing=Bun.spawnSync(['python3','-c','import json,sys,tarfile; t=tarfile.open(sys.argv[1]); assert all(m.uid==0 and m.gid==0 and not m.pax_headers for m in t.getmembers()); print(json.dumps(t.getnames()))',output],{stdout:'pipe',stderr:'pipe'});
     expect(listing.exitCode).toBe(0);
     expect(JSON.parse(new TextDecoder().decode(listing.stdout)).sort()).toEqual(['README.md','materials-manifest.json']);
     const manifest=Bun.spawnSync(['tar','-xOf',output,'materials-manifest.json'],{stdout:'pipe',stderr:'pipe'});
