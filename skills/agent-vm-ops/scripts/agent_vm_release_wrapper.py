@@ -1290,8 +1290,28 @@ def _activation_safe_drain_enter(item: Any, metrics: Mapping[str, Any]) -> bool:
 def _activation_safe_pending_renew(item: Any, metrics: Mapping[str, Any]) -> bool:
     """A pending renew has no native effect; the candidate must reconcile it."""
     required = {"operation_id", "action", "session_id", "generation", "created_at"}
-    if not isinstance(item, Mapping) or set(item) != required:
+    if not isinstance(item, Mapping) or set(item) not in (required, required | {"worker"}):
         return False
+    if "worker" in item:
+        worker = item["worker"]
+        if not isinstance(worker, Mapping) or set(worker) != {"state", "pid", "process_group", "start_time", "finished_at"}:
+            return False
+        if worker["state"] not in {"finished", "exited"}:
+            return False
+        if any(type(worker[key]) is not int or not 0 < worker[key] <= 9223372036854775807 for key in ("pid", "process_group")):
+            return False
+        if not isinstance(worker["start_time"], str) or re.fullmatch(r"[1-9][0-9]{0,19}", worker["start_time"]) is None:
+            return False
+        if not isinstance(worker["finished_at"], str) or not worker["finished_at"] or not Path("/proc/self/stat").is_file():
+            return False
+        try:
+            (Path("/proc") / str(worker["pid"])).lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return False
+        else:
+            return False
     inflight = metrics.get("in_flight_operations")
     if type(inflight) is not int or inflight != 0 or item.get("action") != "renew":
         return False

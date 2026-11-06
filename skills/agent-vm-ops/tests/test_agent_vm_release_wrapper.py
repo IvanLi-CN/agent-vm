@@ -192,6 +192,16 @@ class WrapperTests(unittest.TestCase):
                         WRAPPER._ensure_drained(self.loaded)
                 self.assertEqual(failure.exception.code, "drain_unverified")
 
+    def test_pending_renew_requires_terminal_worker_and_absent_process(self):
+        item = {"action": "renew", "operation_id": "renew", "session_id": "session", "generation": 1, "created_at": "2026-11-06T00:00:00Z", "worker": {"state": "finished", "pid": 123, "process_group": 123, "start_time": "1234", "finished_at": "2026-11-06T00:00:01Z"}}
+        with mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(Path, "lstat", side_effect=FileNotFoundError):
+            self.assertTrue(WRAPPER._activation_safe_pending_renew(item, {"in_flight_operations": 0}))
+            item["worker"]["state"] = "running"
+            self.assertFalse(WRAPPER._activation_safe_pending_renew(item, {"in_flight_operations": 0}))
+        item["worker"]["state"] = "finished"
+        with mock.patch.object(Path, "is_file", return_value=True), mock.patch.object(Path, "lstat", return_value=mock.Mock()):
+            self.assertFalse(WRAPPER._activation_safe_pending_renew(item, {"in_flight_operations": 0}))
+
     def test_drain_verification_rejects_unverified_drain_intents(self):
         self.drain_patch.stop()
         original = {"action": "drain-enter", "operation_id": "blocked-drain", "session_id": "release-handoff", "generation": 0}
