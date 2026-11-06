@@ -120,7 +120,7 @@ func runInstall(args []string) error {
 	if flags.NArg() != 0 || *config == "" || *bundle == "" || *materials == "" {
 		return errors.New("install requires --config, --bundle and --materials; --apply enables changes")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	input := install.Inputs{Config: *config, Bundle: *bundle, Materials: *materials}
 	var report install.Report

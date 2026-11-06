@@ -56,6 +56,8 @@ sudo /var/tmp/agent-vm-install/agent-vm-deploy install \
 
 安装器验证固定版本 Caddy 和 rqlite 的下载摘要，安装专用用户、目录、配置、二进制与 systemd 资源，再启动 rqlite 和 Deployd。Deployd 的首次安装事务委托控制服务直接初始化空 rqlite，验证 blue 后授予唯一 controller lease、启用 traffic 并原子创建 active；Caddy 最后启动。Deployd 的部署 SQLite 位于独立部署目录，不能将它误认为业务 SQLite。
 
+安装命令的总时限为三十分钟，每个固定组件的下载时限为十分钟，下载内容仍必须通过清单摘要验证。下载超时发生在服务启动前，可使用相同输入重试，保留原安装事务身份；超时不会放宽摘要或路径校验。
+
 ## 核验与重试
 
 ```sh

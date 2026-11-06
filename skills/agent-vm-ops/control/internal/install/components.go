@@ -81,7 +81,7 @@ func fetchComponent(ctx context.Context, name string, a componentArtifact, root 
 	if err != nil {
 		return "", err
 	}
-	client := &http.Client{Timeout: 3 * time.Minute, CheckRedirect: func(req *http.Request, via []*http.Request) error {
+	client := &http.Client{Timeout: 10 * time.Minute, CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		if req.URL.Scheme != "https" || len(via) > 5 {
 			return errors.New("unsafe dependency redirect")
 		}
@@ -109,7 +109,7 @@ func fetchComponent(ctx context.Context, name string, a componentArtifact, root 
 	n, err := io.Copy(io.MultiWriter(f, checksum), io.LimitReader(response.Body, 256<<20+1))
 	closeErr := f.Close()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("download %s body: %w", name, err)
 	}
 	if closeErr != nil {
 		return "", closeErr
