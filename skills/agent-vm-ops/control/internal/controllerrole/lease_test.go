@@ -184,3 +184,60 @@ func TestRenewalPreservesWorkButCannotResurrectFencedAuthority(t *testing.T) {
 		t.Fatalf("fenced authority resurrected: %v", err)
 	}
 }
+
+func TestDurableCommitAllowsExactRenewalAndHealthButBlocksNewAuthority(t *testing.T) {
+	gate := New("blue", time.Now)
+	lease := Lease{Slot: "blue", Term: 1, LeaseID: "current", Nonce: "nonce", Generation: 1, Expiry: time.Now().Add(time.Minute)}
+	if err := gate.Grant(lease); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() { done <- gate.WithValid(func() error { close(entered); <-release; return nil }) }()
+	<-entered
+	defer func() {
+		close(release)
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}()
+	renewed := lease
+	renewed.Expiry = lease.Expiry.Add(time.Minute)
+	ready := make(chan error, 1)
+	go func() {
+		if err := gate.Grant(renewed); err != nil {
+			ready <- err
+			return
+		}
+		observed, valid := gate.Snapshot()
+		if !valid || observed != renewed {
+			ready <- errors.New("health did not observe renewed lease")
+			return
+		}
+		ready <- nil
+	}()
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("remote commit blocked renewal or health")
+	}
+	next := lease
+	next.Term = 2
+	next.LeaseID = "next"
+	granted := make(chan error, 1)
+	go func() { granted <- gate.Grant(next) }()
+	select {
+	case err := <-granted:
+		t.Fatalf("new authority overtook commit: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	// The deferred release completes the old commit; check the new grant in cleanup.
+	t.Cleanup(func() {
+		if err := <-granted; err != nil {
+			t.Error(err)
+		}
+	})
+}
