@@ -1,223 +1,230 @@
 # 原生 Incus Agent VM
 
-本文是 Agent VM 主题的规范设计文档和长期需求合同。 状态后端迁移、恢复材料保留和蓝绿边界以 `REQ-AGENT-VM-028` 及其关联合同为准，部署控制器边界以 `REQ-AGENT-VM-031` 及其关联合同为准。 相关 ADR 只记录决策背景、技术取舍和被否决方案，不替代本 SPEC，也不是本主题的设计规范来源。
+本文是 Agent VM 主题的规范设计文档和长期需求合同。状态后端迁移、恢复材料保留和蓝绿边界以 `REQ-AGENT-VM-028` 及其关联合同为准，部署控制器边界以 `REQ-AGENT-VM-031` 及其关联合同为准。相关 ADR 只记录决策背景、技术取舍和被否决方案，不替代本规范。
 
-## Context and Scope
+## 上下文与范围
 
-本文定义在已配置 Incus 宿主上管理 Linux 容器所需的客户端和控制进程。 公共仓库记录生命周期合同并提供实现； 部署通过显式配置提供自己的 Incus project、容器镜像、网络、地址池、存储路径、状态数据库和控制地址。
+本文定义在已配置的 Incus 控制环境中管理 Linux 容器所需的客户端和控制进程。公共仓库记录生命周期合同并提供实现；部署方通过显式配置提供 Incus 项目、容器镜像、网络、地址池、存储路径、状态数据库和控制地址。
 
-设计排除公共 broker、任意 HTTP 网关、客户端轮询、隐式 keepalive、共享宿主工作区、导出归档，以及跨 lease expiry 仍然有效的保证。 目标控制环境在每个蓝绿槽位运行一个受保护的 Go 常驻服务，并在槽位外运行一个 Go Deployd（`agent-vm-deployd`）； 它们的内部 UDS API 都是实现边界，不是公共客户端入口。 槽位服务拥有业务生命周期状态和 native operation； Deployd 只拥有部署事务、槽位观测以及控制器/流量协调。 普通蓝绿事务永远不写业务状态或 rqlite，只有首次部署的固定 `migrate` 事务可以一次性完成 legacy SQLite 到 rqlite 的导入。 内置管理控制台和 direct Agent API 是 active service 通过项目 Caddy 入口提供的目标入口，二者都不得暴露任意内部控制路由。 当前 checkout 已实现 protocol-4/UDS、双槽位 Go 服务、槽位外 deployd 和 SSH 兼容路径； 具体 OIDC、Caddy、浏览器 API、direct Agent API、地址、证书和 rqlite 运行拓扑仍由部署配置提供，不能从仓库实现推断为已部署。
+设计不包含公共代理服务、任意 HTTP 网关、客户端轮询、隐式保活、共享宿主工作区、导出归档，也不保证租约到期后资源仍然有效。目标控制环境在每个蓝绿槽位运行一个受保护的 Go 常驻服务，并在槽位外运行 Deployd（`agent-vm-deployd`）；它们的内部 UDS API 都是实现边界，不是公共客户端入口。槽位服务拥有业务生命周期状态和原生操作；Deployd 只负责部署事务、槽位观测以及控制器和流量协调。普通蓝绿事务不写业务状态或 rqlite，只有首次部署的固定 `migrate` 事务可以一次性将旧版 SQLite 状态导入 rqlite。内置管理控制台和 Agent 直连接口由活动服务通过项目 Caddy 入口提供，二者都不得暴露任意内部控制路由。当前检出已实现协议 4、UDS、双槽位 Go 服务、槽位外 Deployd 和 SSH 兼容路径；具体 OIDC、Caddy、浏览器 API、Agent 直连接口、地址、证书和 rqlite 运行拓扑仍由部署配置提供，不能从仓库实现推断为已部署。
 
-部署拓扑是分层的：本机 Codex client 访问已配置的 Agent VM control endpoint； control environment 运行在已观测的 CT109 LXC 内； control environment 拥有按 session 管理的 Incus system containers； CT109 下方的物理或虚拟来源不属于已验证的公共边界。 control endpoint 只是进入路径，不是底层宿主机或其重建权限的证据。 具体地址和 live inventory 保存在受保护的部署记录中。
+部署拓扑分为四层：本机 Codex 客户端访问已配置的 Agent VM 控制入口；控制环境运行在已观测的 CT109 LXC 内；控制环境通过 Incus 管理按会话分配的系统容器；CT109 下方的物理或虚拟承载来源不属于已验证的公共边界。控制入口只是访问路径，不能证明底层宿主机身份，也不代表拥有其重建权限。具体地址和实时资源清单保存在受保护的部署记录中。
 
-## Session 与 transport
+## 会话与传输
 
-按 session 作用域的 request 携带 `session_id`； 无 session 的只读 `admin-metrics` request 不携带它，并拒绝 `session_id` 和 `operation_id`。 对于按 session 作用域的 action，CLI 优先从显式 `--session-id`，其次从 `AGENT_VM_SESSION_ID` 选择 session。 缺少该值时，任何 remote write 发生前都返回 `missing_session`。 Session identity 用于选择 managed resource，不是 authentication，也不是 user-resource relation。 Client 通过 configured control path 发送一个带版本的 JSON request，并输出一个 JSON response； diagnostics 写入 stderr。 Format-1 client view 使用 legacy Bun control entry。 Format-2 client view 选择固定的 `legacy-bun` 或 `go-request` transport； `go-request` 保留 SSH 作为 compatibility adapter，同时远端 Go request process 通过受保护的 control UDS 发送相同 body。
+按会话作用域发送的请求必须携带 `session_id`；无会话的只读 `admin-metrics` 请求不携带该字段，并拒绝 `session_id` 和 `operation_id`。对于会话操作，CLI 优先使用显式的 `--session-id`，其次使用 `AGENT_VM_SESSION_ID`。缺少会话标识时，必须在任何远程写入前返回 `missing_session`。会话标识用于选择受管资源，不承担身份认证或用户与资源的归属关系。客户端通过配置的控制路径发送带版本的 JSON 请求，并输出 JSON 响应；诊断信息写入标准错误流。格式 1 客户端使用旧版 Bun 控制入口。格式 2 客户端选择固定的 `legacy-bun` 或 `go-request` 传输方式；`go-request` 保留 SSH 兼容适配器，由远端 Go 请求进程通过受保护的控制 UDS 发送同一请求体。
 
-Client 和 control 都必须使用 Protocol 4。 Mutation 包含 operation ID 和 lease generation。 Control 持久化 request 与 outcome，拒绝不兼容或冲突的 retry，并且绝不自动 replay uncertain native mutation。 目标 direct HTTPS transport 是 `POST /agent/v1/control`，使用 opaque Bearer Token 和相同的 protocol-4 body； 目标 unified service 还通过[管理 API](contracts/management-api.yaml)和[Token API](contracts/token-api.md)提供独立版本的 browser contract。 加入这些目标 API 不会改变 CLI protocol 4； 本规范出现这些内容也不表示当前 checkout 已提供这些服务。
+客户端和控制服务都必须使用协议 4。变更请求包含操作 ID 和租约代次。控制服务持久化请求与结果，拒绝不兼容或冲突的重试，绝不自动重放结果不确定的原生变更。目标 HTTPS 直连入口是 `POST /agent/v1/control`，使用不透明的 Bearer Token 和相同的协议 4 请求体；统一服务还通过[管理 API](contracts/management-api.yaml)和[Token API](contracts/token-api.md)提供独立版本的浏览器合同。增加这些 API 不改变 CLI 协议 4；规范中的目标描述本身也不能证明当前检出已经提供对应服务。
 
 ## 生命周期
 
-每个 session 至多拥有一个 managed-container slot，包括 preparing、stopping、deleting 和 cached 状态。 每个 task 记录用于创建 guest 的 pinned container-image fingerprint。 只有 fingerprint 仍匹配当前 pinned image 时，Acquire 才会创建或复用 stopped cache； stale cache 会在 native effect 前返回 `cache_stale`，运维者必须显式 destroy 它，之后新的 acquire 才能使用当前 image 创建 guest。 Acquire 记录新的 generation，并在一个有界的 monotonic budget 内等待 container 进入 running 且 IPv4-ready。 如果无关的 lease-expiry cleanup 短暂暴露 transitional native instance，acquire 会在单独的、有界 30 秒 admission-convergence budget 内等待，每次 polling 间隔不少于 250 毫秒，并保持同一个 operation pending； 只有这个精确的 transitional condition 可 retry，其他所有未验证状态都必须 fail closed。 Lease expiry 和 release 会撤销 access，只移除属于该 task/session 的 mappings，并在 slot 可复用前停止 guest。 Stopped container root filesystem 可以作为 disposable cache 保留，但不提供 recovery guarantee。
+每个会话至多占用一个受管容器槽位，包括 `preparing`、`stopping`、`deleting` 和 `cached` 状态。每个任务记录创建来宾时固定的容器镜像指纹。只有指纹仍与当前固定镜像一致时，`acquire` 才能创建来宾或复用已停止的缓存；缓存过时时，必须在产生原生影响前返回 `cache_stale`，由运维者显式执行 `destroy`，后续 `acquire` 才能用当前镜像创建来宾。`acquire` 记录新的代次，并在有界的单调时钟时间预算内等待容器运行且 IPv4 就绪。如果无关的租约到期清理短暂暴露过渡状态的原生实例，`acquire` 可以在独立的 30 秒准入收敛预算内等待，轮询间隔不少于 250 毫秒，并让同一操作保持待完成状态；只有这一明确的过渡条件允许重试，其他未验证状态都必须拒绝继续。租约到期和 `release` 会撤销访问权，只移除属于该任务和会话的映射，并在槽位可复用前停止来宾。已停止容器的根文件系统可以作为可回收缓存保留，但不提供恢复保证。
 
-新创建的 guest 会在 native initialization request 中接收 managed、task、session 和 generation identity metadata。 Initialization 失败或结果 uncertain 时，不得据此认领已有的未标记 instance。 只有在确认 instance 缺失且验证同 session 的 native workers 已清空后，recovery 才能回收失败的 initialization； contextual native not-found result 必须标识 requested instance 和 project，uncertain 或无关的 query failure 不能证明资源不存在； identity、generation 或 native query 不确定时，必须保留 task 和 reservation。 清理仍存在的 instance 之前，也必须等待未解决的同 session workers。 Cached guest 必须携带当前 generation； 已验证的 previous-generation guest 要保留 reservation，直到该 generation discrepancy 可以安全 reconcile。 每次 acquire 都要在 native work 前记录 durable task identity 和 generation，使 recovery 能区分 recreated session 与 older operation。 已验证的独立 acquire records 可以在其他 task 仍 blocked 时 reconcile，但不得重新开放 admission。 Active acquire 不能由 orphan recovery finalize； bound pending acquire 必须匹配该 identity 和 generation。 当 task 正在关闭时，recovery 在通过相同 worker 和 identity checks 后保留 verified pending destroy intent。 Legacy unbound requests 要求匹配当前或紧接之前的 generation。 Legacy starting acquire 只有在同 session 的所有 pending operations 同样处于 pre-transition 状态时才可在 transition 前 finalize； 已完成的 older-generation acquire 仍独立保持 pending，并且必须满足以下条件之一：其 cached task 保留 request generation 且 identity/state 已验证，或者不存在 task/generation tombstone 且已确认 native instance 缺失。 先前被阻塞的 maintenance reconciliation 只有在 transitional tasks 清空且其 worker 已验证不存在后才可 retry 一次。 Superseded acquire、resize 或 restart 只有在后续成功的同 session operation 满足以下条件后才能停止阻塞 admission：journal order 和 timestamps 证明该 operation 发生在保存的 worker 完成之后； 当前 cached task 已验证为 stopped 且 identity 正确； 所有保存的 worker identities 均已确认不存在； control service cgroup 和 Incus background operations 均已 quiescent。 Original request 和 worker evidence 必须继续记录，retry 返回明确的 unknown historical outcome，不得 replay original native operation。 标记为 finished with an error 的 legacy worker records，只有在 identity 和 process-group 验证通过后，recovery 才能将其视为 exited。
+新建来宾在原生初始化请求中接收受管标记、任务、会话和代次等身份元数据。初始化失败或结果不确定时，不得据此认领已有的未标记实例。只有确认实例不存在，且同一会话的原生工作进程已经清空后，恢复流程才能回收失败的初始化；原生不存在响应必须明确标识请求的实例和项目，不确定或无关的查询失败不能证明资源不存在。身份、代次或原生查询不确定时，必须保留任务和资源预留。清理仍存在的实例前，也必须等待同一会话中尚未确认结束的工作进程。缓存来宾必须携带当前代次；已验证但属于前一代次的来宾必须保留资源预留，直到代次差异得到安全核对。每次 `acquire` 都要在原生工作开始前持久化任务身份和代次，以区分重建的会话与旧操作。已验证且相互独立的获取记录可以在其他任务仍被阻塞时完成核对，但不得因此重新开放准入。正在执行的 `acquire` 不能由孤立操作恢复流程完成；绑定的待完成获取操作必须匹配其身份和代次。任务关闭期间，恢复流程通过相同的工作进程和身份检查后，保留已验证的待完成销毁意图。旧版未绑定请求必须匹配当前或紧接之前的代次。旧版启动中的获取操作，只有在同一会话的全部待完成操作也都尚未进入状态转换时，才能在转换前完成。已完成但属于更旧代次的获取操作仍独立保持待完成，并满足以下条件之一：缓存任务保留请求代次且身份和状态已经验证；或不存在任务及代次墓碑，且原生实例已确认不存在。此前被阻塞的维护核对，只有在过渡任务清空且相关工作进程已验证不存在后，才可重试一次。被后续操作取代的获取、调整或重启操作，只有在后续成功的同会话操作满足以下全部条件后，才可停止阻塞准入：日志顺序和时间戳证明后续操作发生在已保存工作进程结束之后；当前缓存任务已验证停止且身份正确；所有已保存工作进程身份均已确认不存在；控制服务 cgroup 和 Incus 后台操作均已静止。原始请求和工作进程证据必须继续保留，重试应明确返回未知的历史结果，不得重放原始原生操作。对于标记为出错结束的旧版工作进程记录，恢复流程必须先验证身份和进程组，才能认定其已经退出。
 
-Renewal 必须显式且有界。 Acquire、status、SSH、execution 和 transfer 都不会 renew lease。 Generation 变化或 lease 过期会拒绝迟到的 readiness 和 native results。 Durable state、locks 和 timers 让重复 request 保持幂等，同时不会隐藏 partial cleanup。
+续租必须显式执行并具有上限。获取、状态查询、SSH、执行和传输都不会自动续租。代次变化或租约到期后，必须拒绝迟到的就绪响应和原生结果。持久状态、锁和定时器应保证重复请求幂等，同时明确暴露未完成的清理。
 
-Native process observation 必须容忍 race：如果 tracked process 在 `/proc` enumeration 与 identity reads 之间退出，controller 将其视为 gone，并继续正常的有界 cleanup path。 没有 process-group ID 的 Linux worker identities 保持 unverified，并继续阻塞 reconciliation。 Process-group discovery 仍由 worker PID start time fence 保护； root 消失后，只能保留 root identity 存在时观测到的 members 或已观测 member 的 descendants，unexpected same-group member 会让 state 保持 unverified。 正常 reaped 且确认 group 为空的 root 可以接受； 仍存在或无法验证的 observed group 会保持 state unverified。 有界 cleanup 在 empty scan 后执行 final observation，并在成功前确认 kernel process-group absence。 Worker root 消失时，cleanup 仍必须在声明 worker gone 前检查其 process group，包括在 procfs snapshot 后执行 kernel group-presence check。 Group cleanup 以 root pidfd 作为 identity anchor； 每次 non-atomic process-table scan 后重新检查 root identity，在 root 前 signal 已验证的 members，并且只有通过已验证 member 才能接纳新观测到的 root-less descendants。 第一次 root-less scan 绝不认领没有 anchor 的 numeric process group； 复用的 numeric PID 或 process group 绝不构成 ownership claim。 Zombie-only snapshots 仍要刷新并经过 kernel group-presence probe； 只有 identity-verified root 或 members 才能 reap，因此只有 procfs 和 kernel evidence 一致表明 group 不再 live 时，才能认定其 non-live。 Native worker start 在 admission 前以 `starting` journal，并记录显式的 unattempted marker； 每次 admission 只记录一次 start attempt。 带显式 unattempted marker 且没有 identity 的 inactive workers 可以恢复为 exited； 没有该 marker 的 legacy records 保持 unverified。 后续同 operation 的每次 start 都重新 armed 该 durable barrier； 已确认的 pre-spawn failure 记录为 `exited`，使 operation 可以 retry。 Nested maintenance recovery 只能绕过 active coordinator 的 unattempted preparation marker； 已经 attempted 或带 identity 的 worker 仍然阻塞。 Attempted 但未 journal 的 start 仍保持 blocked。 带 error 的 native worker completion 仍以 running 状态 journal，使 startup reconciliation 不能把 uncertain ownership 当作 finished； 在 identity reconcile 前，禁止该 operation 或其 session 下的后续 native worker starts。 只有在所有同 session worker journal entries（包括 destroy worker 本身，以及已经记录 attempted worker 的 pending acquire journals）都验证清空后，missing native instances 才能 finalize destroy。 Absent task 的 pending destroy 要求确认 native absence、terminal worker record，以及 task 或 retained tombstone 中的相同 generation； missing native access、active request、unverified worker 或 generation uncertainty 都会让它继续 pending。 Reconciliation 验证 identity 已 exited 后，可 retry recoverable maintenance operations。 没有 delegated cgroup tracking 时，isolated process group 也构成 reparented descendants 的 ownership boundary。 其他 process-table read errors 仍然是 failure。
+原生进程观测必须容忍并发退出：被跟踪进程在 `/proc` 枚举与身份读取之间退出时，控制器应将其视为已消失，并继续有界清理。缺少进程组 ID 的 Linux 工作进程身份仍视为未验证，并继续阻塞核对。进程组发现仍受工作进程 PID 启动时间围栏保护；根进程消失后，只能保留根身份仍存在时观测到的成员，或已观测成员的后代。出现意外的同组成员时，状态必须保持未验证。正常回收且确认进程组为空的根进程可以接受；仍存在或无法验证的已观测进程组必须保持未验证。有界清理在空扫描后还要执行最终观测，并在成功前确认内核中的进程组已不存在。工作根进程消失后，也必须检查其进程组，包括在 procfs 快照之后执行内核进程组存在性检查，才能宣告工作进程消失。进程组清理以根进程的 pidfd 为身份锚点；每次非原子的进程表扫描后重新检查根身份，先向已验证成员发送信号，再处理根进程；只能通过已验证成员接纳新发现的根进程已消失的后代进程。首次无根扫描绝不认领缺少锚点的数字进程组；复用的数字 PID 或进程组也不能证明归属。快照中只有僵尸进程时，仍要刷新并执行内核进程组存在性探测；只有身份已经验证的根进程或成员才能被回收，且只有 procfs 与内核证据一致证明进程组不再存活时，才能认定其结束。原生工作进程启动前，必须先在准入之前以 `starting` 写入日志，并记录尚未尝试启动的显式标记；每次准入只记录一次启动尝试。带该标记、没有身份且不在活动中的工作进程，可以恢复为已退出；缺少标记的旧记录仍保持未验证。同一操作的每次后续启动都必须重新设置这一持久屏障；已确认的创建进程前失败记录为 `exited`，使操作可以重试。嵌套维护恢复只能绕过活动协调器尚未尝试启动的准备标记；已经尝试启动或带有身份的工作进程仍然阻塞。已经尝试但未记入日志的启动仍保持阻塞。出错的原生工作进程完成结果仍以运行状态记入日志，防止启动核对把归属不确定误认成已经结束；身份核对完成前，禁止该操作或同会话后续原生工作进程启动。只有同会话全部工作进程日志均已验证清空，包括销毁工作进程本身及已记录启动尝试的待完成获取日志，原生实例不存在的任务才能完成销毁。任务已不存在时，待完成销毁仍要求确认原生资源不存在、工作进程记录已终结，并且任务或保留的墓碑具有相同代次；缺少原生访问证据、请求仍活动、工作进程未验证或代次不确定，都会使其继续待完成。核对确认身份对应的进程已经退出后，可以重试可恢复的维护操作。没有委派的 cgroup 跟踪时，隔离进程组同时界定重新托管后代进程的归属。其他进程表读取错误仍视为失败。
 
 ## 访问与隔离
 
-Deployment configuration 提供 control address 和 host port range。 Proxy NAT 使用 configured host address、leased port 和 fixed guest address。 SSH 必须使用 explicit identity 和 known-host files，并保持 host-key verification enabled。 Managed Incus project 必须允许所需的 proxy devices； configured ACL 必须在 admission 前证明 peer isolation 和 host isolation。 Mapping cleanup 时移除精确的 conntrack entries。
+部署配置提供控制地址和宿主端口范围。代理 NAT 使用已配置的宿主地址、租用端口和固定的来宾地址。SSH 必须使用显式指定的身份文件和已知主机文件，并始终启用主机密钥校验。受管 Incus 项目必须允许所需的代理设备；配置的 ACL 必须在准入前证明对等实例隔离和宿主隔离有效。映射清理只移除精确匹配的 conntrack 条目。
 
 ## 容量与调整
 
-Capacity observation 仅限于 configured Incus pool filesystem，以及 control environment 可见的 CPU 和 memory boundaries。 不支持 external storage probes 或 infrastructure-manager inspection。 CPU 和 memory allocation ceilings 使用分别配置的 overselling ratios； stopped caches 只消耗 disk。 当 capacity measurements 缺失或无效、超过 logical reservation ceiling、disk admission 失败、处于 draining，或新的 native boot 会在已验证的严重 CT-local CPU scheduler pressure 下运行时，拒绝新的 demand。 批准的 overcommit deployment profile 将 `cpu_startup_pressure_full_avg10_percent` 设为 `50`； CPU startup guard 仅在 projected CPU allocation 超过 CT-visible CPU capacity 且已验证的 `full.avg10` 达到该 threshold 时生效。 它不会改变 logical CPU ceiling，也不会停止 effective lease。 Reservation-only memory admission 下的 low CT memory headroom 只是 observation 和 warning； 它不会减少 logical remaining memory，也不会拒绝 logical ceiling 内的 request。 Pressure 期间仍可执行 existing lease queries、retrieval、renewal 和 release。
+容量观测仅限于已配置的 Incus 池文件系统，以及控制环境可见的 CPU 和内存边界。不支持外部存储探测或基础设施管理器检查。CPU 和内存的逻辑分配上限分别使用各自配置的超售比例；已停止的缓存只消耗磁盘。当容量测量缺失或无效、超过逻辑预留上限、磁盘准入失败、正在排空，或新的原生启动会遭遇已验证的严重 CT 本地 CPU 调度压力时，必须拒绝新增资源需求。已批准的超售部署配置将 `cpu_startup_pressure_full_avg10_percent` 设为 `50`；CPU 启动保护仅在预计分配超过 CT 可见 CPU 容量，且已验证的 `full.avg10` 达到该阈值时生效。它不会改变逻辑 CPU 上限，也不会停止有效租约。仅按预留额度执行内存准入时，CT 剩余内存偏低只产生观测和告警，不减少逻辑剩余额度，也不拒绝逻辑上限内的请求。压力期间仍允许已有租约查询、取回、续租和释放。
 
-Rootfs allocation change 要求显式 restart allowance，并且只能 grow。 Container rootfs growth 是独立的 post-check：它根据 requested allocation 验证 Incus root device 和 container-visible rootfs capacity； 如果 rootfs 已达到 requested capacity 的至少 95%，则视为幂等成功； 如果 selected storage/profile 无法提供这些 evidence，则 fail closed。 只有在 Incus root device 和 container rootfs capacity 都验证通过后，才释放 old reservation。 对于文档化的 native balloon timeout，允许一次有界 convergence retry； 不存在 polling loop 或第三次尝试。 部分 native 或 rootfs growth change 必须保留 conservative reservations 和 structured recovery state。
+根文件系统分配调整要求显式允许重启，且只允许扩容。容器根文件系统扩容具有独立的后置检查：根据请求容量验证 Incus 根设备和容器可见的根文件系统容量；实际容量达到请求值的至少 95% 时，视为幂等成功。选定的存储或配置无法提供这些证据时，必须拒绝继续。只有 Incus 根设备和容器根文件系统容量都验证通过后，才能释放旧预留。对于已有文档说明的原生 balloon 超时，允许一次有界收敛重试，不允许轮询循环或第三次尝试。原生调整或根文件系统扩容部分完成时，必须保留保守的资源预留和结构化恢复状态。
 
 ## 回收与运维操作
 
-Manual garbage collection 默认是 dry-run，并且只选择没有 effective lease 且 access cleanup 已确认的 stopped managed caches。 Age timer 和 capacity admission 可以使用不同的有界 selection policies，但都不能删除 valid lease、transition、resize target 或 unknown resource。 Infrastructure operations 要求单独的显式授权，并使用相同的 configured paths 和 identity checks。
+手工垃圾回收默认只预览，不执行修改，且只选择没有有效租约、访问清理已确认完成的受管停止缓存。按时间回收的定时器和容量准入可以采用不同的有界筛选策略，但都不能删除有效租约资源、过渡资源、调整目标或状态未知的资源。基础设施操作要求单独明确授权，并使用相同的配置路径和身份检查。
 
 ## 控制面发布与兼容性
 
-Go control service 继续是 Incus operations、durable lifecycle state、lease generations、capacity admission、native mappings、observation snapshots 和 maintenance 的唯一 authority。 其 in-process scheduler 负责 lease expiry、startup compensation、bounded retries 和 cache age-GC； systemd 只负责启动和重启 service，不是 durable scheduler。 Scheduled reconcile 和 age-GC 使用独立的 single-flight lane、additive `maintenance_cursor` meta key、每轮最多 16 个 task 或 2 秒，以及 2/4/8/16/32/60 秒的 bounded retry backoff。 Cursor 只有在 task/native journal commit 已 durable 后才前移； 失败 round 记录 phase 和 error，但不前移失败 task。 历史 `timer-reconcile` 和 `timer-age-gc` journal rows 仍可读取和恢复，但 scheduler tick 不创建新的 timer operation。 本机 `agent-vm` CLI 仍是带版本的 request client； publication、update 和 rollback 属于 operator-owned deployment actions，不是 public CLI lifecycle commands。 Unattended control-plane updates 默认关闭。
+Go 控制服务继续作为 Incus 操作、持久生命周期状态、租约代次、容量准入、原生映射、观测快照和维护操作的唯一权威。进程内调度器负责租约到期、启动补偿、有界重试和缓存按时间回收；systemd 只负责启动和重启服务，不承担持久调度。定时核对和缓存回收分别使用同一时刻只执行一个任务的独立通道、增量的 `maintenance_cursor` 元数据键，每轮最多处理 16 个任务或执行 2 秒，并采用 2/4/8/16/32/60 秒的有界重试退避。游标只在任务和原生日志提交持久化后前移；失败轮次记录阶段与错误，但不越过失败任务。历史 `timer-reconcile` 和 `timer-age-gc` 日志行仍可读取和恢复，调度器周期不创建新的定时器操作。本机 `agent-vm` CLI 仍是带版本的请求客户端；发布、更新和回滚是运维者负责的部署行为，不属于公共 CLI 生命周期命令。无人值守控制面更新默认关闭。
 
-Control-plane release 是一个 logical compatibility unit，包含 local client、compatibility bridge 或 Go control binary、systemd unit assets、固定的 Caddy-facing service assets 和 release manifest。 Production format 3 记录一个 product SemVer、精确的 `source_revision`、target/toolchain、artifact checksums 和 modes、protocol 4，以及每个支持方向上的 per-operation request/response/semantic compatibility。 启用管理功能的 package 使用 format 4，新增声明的 durable state read/write capabilities、OIDC/Token/API compatibility 和内置 management assets。 Formats 1 到 3 仍作为只读迁移输入和必要的 rollback inputs； 它们不是新的 management-enabled production output。 Deployment configuration、credentials、connection material、state database 及 WAL/journals、locks、Incus container data 和 guest images 不属于 release。
+控制面发布是一个逻辑兼容单元，包含本地客户端、兼容桥或 Go 控制二进制、systemd 单元资源、固定的 Caddy 入口服务资源和发布清单。生产格式 3 记录产品 SemVer、准确的 `source_revision`、目标平台和工具链、产物校验和与权限、协议 4，以及每个支持方向上各操作的请求、响应与语义兼容性。启用管理功能的包使用格式 4，增加持久状态读写能力、OIDC/Token/API 兼容性声明和内置管理资源。格式 1 至 3 仍可作为只读迁移输入及必要的回滚输入，但不能作为新管理功能的生产输出。部署配置、凭据、连接材料、状态数据库及 WAL/日志、锁、Incus 容器数据和来宾镜像不属于发布包。
 
-Compatible operations 可以跨不同 release revisions 继续使用，并返回 structured warning。 不能根据 parseability 推断 compatibility：unsupported action、incompatible schema 或 semantic change、invalid checksum、或 incompatible protocol MUST 在任何 durable 或 native effect 之前失败。 兼容演进必须保留已建立的 protocol contract； breaking evolution 可能需要新 protocol 和显式 client update。
+兼容操作可以跨不同发布修订版本继续使用，并返回结构化警告。不能根据请求能够解析就推断兼容：不支持的动作、不兼容的结构或语义变化、无效校验和或不兼容协议，必须在任何持久写入或原生影响之前失败。兼容演进必须保留既有协议合同；破坏性演进可能需要新协议和显式客户端更新。
 
-Management state 使用带版本的 capability markers。 Release 只有声明支持 read/write 当前存在的每一个 marker 时，才能对 database activation。 Formats 1 到 3 仅表示支持 pre-management state。 Incompatible package rollback 必须在 pointer activation 或 service start 前拒绝； 不得降级 database 来制造旧 package 兼容的假象。
+管理状态使用带版本的能力标记。发布包只有声明支持读写数据库中当前存在的每个标记时，才能激活。格式 1 至 3 只表示支持管理功能引入前的状态。不兼容的包回滚必须在切换指针或启动服务前被拒绝，不得通过数据库降级制造兼容假象。
 
 ## 管理控制台与 API
 
-Console 管理 existing Agent session VMs、managed images、capacity、operation history、audit 和固定的 system-maintenance actions。 它不提供 manual VM creation、generic Incus、host/PVE、shell 或 Web terminal surface。 它包含五个页面：Overview、VMs、Images、Operations & Audit 和 System。 首次认证后的 view 是 Overview。
+管理台负责已有 Agent 会话 VM、受管镜像、容量、操作历史、审计和固定系统维护动作。它不提供手工创建 VM、通用 Incus 管理、宿主或 PVE 管理、Shell 或 Web 终端入口。五个页面分别为概览、VM、镜像、操作与审计、系统；首次认证后进入概览。
 
-目标 browser API 是 same-origin `/api/v1`，独立于 protocol 4。 该目标必须只使用 OIDC Authorization Code + PKCE 和 `code_challenge_method=S256`，并执行 exact issuer/subject identity、secure browser sessions、exact Origin validation 和 session-bound CSRF protection。 目标 direct Agent API 是 `/agent/v1/control`，要求 opaque Bearer Token，绝不接受 browser Cookie。 如果必需的 OIDC、Token、origin 或 resource-limit configuration 不完整，target listener 必须保持 disabled。 [管理合同](contracts/management-api.md)、[Token API 合同](contracts/token-api.md)、[Agent API 合同](contracts/agent-api.md)和[OpenAPI 文档](contracts/management-api.yaml)定义当前 wire shapes 与 deployment inputs； 当前检出包含统一 Web 服务、认证门面、公开状态入口、管理控制台组件、受控视觉证据和认证 E2E；真实部署与隔离环境验收仍由发布门禁决定。
+目标浏览器 API 为同源 `/api/v1`，独立于协议 4。登录只允许 OIDC 授权码加 PKCE 流程，且 `code_challenge_method=S256`，并要求精确的签发方和主体身份、安全浏览器会话、准确的 Origin 校验以及绑定会话的 CSRF 防护。Agent 直连接口为 `/agent/v1/control`，使用不透明的 Bearer Token，绝不接受浏览器 Cookie。必需的 OIDC、Token、来源或资源限制配置不完整时，监听器必须保持禁用。[管理合同](contracts/management-api.md)、[Token API 合同](contracts/token-api.md)、[Agent API 合同](contracts/agent-api.md)和[OpenAPI 文档](contracts/management-api.yaml)定义报文结构与部署输入。当前检出包含统一 Web 服务、认证门面、公开状态入口、管理控制台组件、受控视觉证据和认证端到端测试；真实部署与隔离验收仍由发布门禁决定。
 
-UI 支持 `zh-CN` 和 `en`。 Saved preference 优先于 browser language； English 是 fallback。 所有 interface 和 accessible copy 都必须本地化。 Identifiers、fingerprints、stable error codes 和 user-authored reasons 保持不变。 API 返回 locale-neutral values，保留 observation freshness，并将 unknown measurements 表示为 unknown，而不是 zero。
+界面支持 `zh-CN` 和 `en`，优先使用已保存的偏好，其次使用浏览器语言，最后回退到英文。所有界面文案和无障碍文案都必须本地化；标识符、指纹、稳定错误码和用户填写的原因保持不变。API 返回与语言无关的值，保留观测新鲜度，将未知测量明确表示为未知，不能转换为零。
 
-唯一 administrator 使用 browser session，machine Tokens 则是独立的 Bearer credentials。 每个 Agent request 都重新检查 Token expiry/revocation、scope、target session、generation 和 native state； machine Token 不要求 pre-bound session，并可以 acquire 任意允许的 target。 Administrator mutations 使用 UUID operation identity； 对 existing resources 的 mutation 使用 resource version，VM actions 还携带 exact session generation。 Operator reason 是可选的，提供时必须有界并记录到 audit，但任何 operation 都不要求它。 Sensitive changes 使用 preview-bound confirmation token，unified service 在产生 effect 前重新验证所有 preconditions。 Operation 和 audit APIs 保留 current administrator actor、没有 administrator authority 的 typed rejected-request actor，或明确的 unknown historical actor，以及 target、optional reason、phase 和 outcome。 Uncertain result 必须可 query，且不得使用新的 operation identity 自动 replay。
+唯一管理员使用浏览器会话，机器 Token 则是独立的 Bearer 凭据。每个 Agent 请求都重新检查 Token 到期与撤销状态、作用域、目标会话、代次和原生状态；机器 Token 不预先绑定会话，可以对任意允许的目标执行获取。管理员变更使用 UUID 操作标识；已有资源变更必须携带资源版本，VM 动作还必须携带准确的会话代次。操作原因可选，提供时必须有界并写入审计，任何操作都不得强制要求提供原因。敏感变更使用绑定预览的确认令牌，统一服务在产生影响前重新验证全部前置条件。操作与审计接口保留当前管理员操作者、不具有管理员权限的带类型拒绝请求操作者，或明确标识的未知历史操作者，以及目标、可选原因、阶段和结果。不确定结果必须可查询，不得换用新的操作标识自动重放。
 
-Image import 仅限于 configured trusted sources 和有大小上限的 local Incus container packages。 Integrity 与 Agent VM suitabil…7831 tokens truncated…slots 的显式 snapshot estimates。 Inventory view MUST 覆盖所有 managed task states，使用有界字段，删除 stale rows，并避免暴露 raw errors、credentials 和 deployment paths。 缺失或为 `-1` 的 native slot limit MUST 保持缺失； derived slot estimate MUST NOT 标记为 authoritative slot limit。
+镜像导入只允许已配置的可信来源，以及具有大小上限的本地 Incus 容器包。完整性和 Agent VM 适用性必须独立检查。选定的默认镜像必须已经验证；管理员选择已验证的替代镜像前，原有配置中的默认镜像作为可见的旧版兼容默认值保留。已有任务与缓存保留固定的镜像指纹。控制服务必须串行处理默认选择与引用变化；默认选择只影响新会话，默认、活动、缓存、释放中、待创建或验证中的任一引用都会阻止删除。
 
-`agent-vm-deployd` 的 `/metrics` endpoint MUST 将 `admin-metrics` 和 `admin-status` 调度为独立的 observation lanes。 Pending 或 failed inventory read MUST NOT 移除最新有效的 capacity metric families； pending 或 failed capacity read MUST NOT 保留失败 inventory scrape 中的 task rows。 Retained source snapshot MUST 保留其原始 observation timestamp，并暴露 source-specific health 或 freshness failure； deployd MUST NOT 使用伪造的 zeroes 替换 unavailable values。 Prometheus MUST 只抓取 deployd 的 `/metrics` endpoint，并使用 `job="agent-vm-deployd"`； 槽位级 metric series MUST 带 `slot` label，以支持切换期间两个槽位同时存活。 蓝色和绿色槽位 MUST 使用各自独立的 snapshot 目录； 共享 snapshot 目录 MUST NOT 用于蓝绿运行。 `admin-status` MUST use keyset pagination with a default page size of 25 and a maximum of 100, probe no more than 8 tasks concurrently, bound each task probe to 1 second and the page to 5 seconds, and expose `partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out` without treating unknown native state as healthy。
+首次管理状态迁移必须由槽位外 Deployd 自动执行，并且采用增量、事务方式，保留任务、代次、租约、端口、预留和协议 4 日志。排空完成且经验证的一次性导入使 rqlite 成为共享权威前，SQLite 继续作为唯一写入者；禁止双写、共享 SQLite 文件并发访问和数据库降级。关键读取使用线性一致性，跨行变更使用单个 rqlite 事务。[管理合同](contracts/management-api.md)、[状态迁移 ADR](../../adr/0044-agent-vm-state-migration-to-rqlite.md)和[发布合同](contracts/release.md)定义状态能力标记、旧默认值初始化、Deployd 的 `migrate` API、发布器一键激活和整包回滚规则。当前检出已经实现该迁移控制面；真实部署是否执行，仍须以 Agent VM 验收证据证明。
 
-这些规则的固定合同名称是 independent observation lanes、pending or failed inventory read、latest valid capacity metric families、retained source snapshot 和 original observation timestamp； 它们对应上面的中文语义，不是额外的英文操作说明。
+远程控制脚本和单元发布必须使用配置的 SSH 控制入口、运维者专用身份或权限范围受限且由 root 拥有的部署封装、私有暂存区和原子激活。不得新增 sshd、HTTP 网关、PVE 路径或来宾权限。远程发布必须先激活并验证，再更新本地客户端；仅更新本地客户端时不要求排空。
 
-## Requirements
+远程发布必须在激活前进入准入排空，阻止新获取和重启准入，保持到期处理、状态核对与缓存清理定时器可用，并允许在途请求完成，不强制终止。必须等待待完成操作和任务转换收敛，验证健康、核对结果和定时器状态；只有活动发布事务对应的发布专用会话验证成功后，才能退出排空，浏览器维护请求不得重新开放准入。首个支持管理功能的发布必须能够接管旧协议 4 控制器留下的无主排空状态，但其他发布或浏览器请求不得替换活动发布的拥有者。尚未越过原生影响屏障的排队管理工作可以重试，且排空期间必须由持久围栏阻止其启动。激活前失败应保留当前发布不变。激活后健康失败允许向上一个已验证发布执行一次有界回滚；回滚失败时保持准入排空，不得改写状态、代次或结果不确定的操作。至少保留当前与上一个已验证发布，以及对应清单和校验和。
 
+只读观测必须区分逻辑预留组成、CT 可见容量、运行时压力、物理磁盘余量、原生准入和逐任务生命周期。部署观测界面分别提供容量与准入看板、清单与操作看板；容量看板明确标识逻辑和当前可启动的默认容器槽位估算值。清单看板覆盖全部受管任务状态，限制字段大小、移除过期行，不暴露原始错误、凭据或部署路径。缺失或为 `-1` 的原生槽位上限必须保持缺失，推导出的估算值不得标记为权威上限。
+
+`agent-vm-deployd` 的 `/metrics` 接口必须将 `admin-metrics` 与 `admin-status` 调度为独立观测通道。待完成或失败的清单读取不得擦除最近有效的容量指标族；容量读取待完成或失败时，也不得保留失败清单采样中的任务行。保留的来源快照必须保留原始观测时间戳，并暴露各来源的健康或新鲜度失败；Deployd 不得用伪造的零值替换不可用数据。Prometheus 只抓取 Deployd 的 `/metrics`，使用 `job="agent-vm-deployd"`；槽位级指标必须带 `slot` 标签，以支持切换期间两个槽位同时存活。蓝、绿槽位必须使用各自独立的快照目录，不得共享。`admin-status` 必须采用键集分页，默认每页 25 条、最多 100 条，并发探测不超过 8 个任务，每个任务探测上限 1 秒、整页上限 5 秒；返回 `partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out`，不得将未知的原生状态当成健康。
+
+这些观测约束的术语分别为独立观测通道、待完成或失败的清单读取、最近有效的容量指标族、保留的来源快照和原始观测时间戳。
+
+## 需求
+## 需求
 ### REQ-AGENT-VM-010 - 分层来源
 
-公共合同 MUST 区分 Codex client、configured control endpoint、CT109 LXC、Incus system container 和 unknown underlying hosting source。 MUST NOT 将 configured address、CT identifier 或 Incus identity 解释为下一层的事实，并且 MUST 将 private deployment addresses 和 inventories 保留在仓库之外。
+公共合同必须区分 Codex 客户端、配置的控制入口、CT109 LXC、Incus 系统容器和未知的底层承载来源。不得把配置地址、CT 标识或 Incus 身份解释为下一层的事实，私有部署地址和资源清单必须保留在仓库之外。
 
 ### REQ-AGENT-VM-011 - 重建与恢复隔离
 
-Recovery MUST 保留 state database 和 WAL/journals、operation 和 audit records、generations、configuration、protected recovery copies、native timer assets 以及 Incus container data。 它 MUST 在 drain 下恢复匹配的 components，根据 native identity 和 generations reconcile durable records； 当 state、provenance、capacity 或 native identity 缺失或不一致时，必须保持 admission closed。 `native_missing` observation 只有在 exact contextual not-found result 时才能设置，且不得新增 task state 或单独 finalize cleanup。 Failed acquire cleanup MAY 只清理明确的 pre-native、同 generation、无 worker effect 的 intent； terminal absence 还必须有 destroy journal、generation tombstone、worker quiescence 和 exact absence proof。 MUST NOT invent operation IDs、reset generations、replay uncertain native effects 或执行 broad cleanup。
+恢复必须保留状态数据库及 WAL/日志、操作与审计记录、代次、配置、受保护恢复副本、原生定时器资源和 Incus 容器数据。恢复流程必须在排空状态下恢复匹配的组件，并按原生身份和代次核对持久记录；状态、来源、容量或原生身份缺失或不一致时，准入必须保持关闭。只有精确且带目标上下文的不存在响应才能设置 `native_missing` 观测；不得为此增加任务状态，也不得只凭该观测结束清理。失败获取的清理只可处理明确处于原生影响之前、同代次且无工作进程影响的意图；确认终态不存在还必须具有销毁日志、代次墓碑、工作进程静止和精确的不存在证据。不得编造操作 ID、重置代次、重放不确定的原生影响或执行宽泛清理。
 
 ### REQ-AGENT-VM-012 - 稀疏磁盘故障边界
 
-Disk admission MUST 计算 configured CT-local Incus pool filesystem、request cost、watermarks 和 durable reservations，但不能把每个 configured container rootfs limit 声称为完整 physical reservation。 Control-plane state 和 container data MUST 作为独立的 logical failure domains； ENOSPC 或 I/O failure MUST 保持 conservative state，并在不驱逐 effective lease 的前提下拒绝不安全的新 admission。
+磁盘准入必须计算已配置的 CT 本地 Incus 池文件系统、请求成本、水位线和持久资源预留，但不得把配置的容器根文件系统上限声称为完整的物理空间预留。控制面状态与容器数据必须视为独立的逻辑故障域；遇到 ENOSPC 或 I/O 失败时，必须保留保守状态，并在不驱逐有效租约的前提下拒绝不安全的新准入。
 
 ### REQ-AGENT-VM-013 - 观测来源
 
-Operational dashboards MUST 区分 CT filesystem capacity、transient image staging、physical Incus pool usage、guest rootfs allocation 和 native admission state。 MUST NOT 从未设置的 Incus project quota 推断 authoritative native limit，也不得为缺失或 `-1` source 绘制 limit line。 Dashboard contract MUST 暴露 failure phase、image-unpack failures、admission state 和 scrape freshness，使得无需 host-manager access 也能定位 ENOSPC boundary。 公共仓库 MUST 提供 sanitized、parameterized dashboard baseline 和 validation path； deployment-specific rendered files、datasource identities、Prometheus scrape target 和 metrics listener 配置仍由 deployment owner 管理。
+运维看板必须区分 CT 文件系统容量、临时镜像暂存、Incus 池物理用量、来宾根文件系统分配与原生准入状态。不得从未设置的 Incus 项目配额推断权威限制，也不得为缺失或 `-1` 的来源绘制上限线。看板合同必须暴露失败阶段、镜像解包失败、准入状态和采样新鲜度，使运维者无需访问宿主管理器也能定位 ENOSPC 边界。公共仓库必须提供脱敏、参数化的看板基线和验证入口；具体部署的渲染文件、数据源身份、Prometheus 采集目标和指标监听配置由部署方管理。
 
 ### REQ-AGENT-VM-014 - 控制面更新权限
 
-控制面发布、更新和回滚 MUST 仍是运维者负责的部署操作。 公共 `agent-vm` CLI MUST 保持为生命周期/请求客户端，MUST NOT 获取 Incus/PVE 管理权限、暴露公共自更新命令，或成为第二个业务控制面。 槽位外 Go `agent-vm-deployd` 服务 MAY 通过受保护的本机 UDS 协调部署事务，但 MUST NOT 拥有业务生命周期状态，或替代 Go `serve` 成为 Incus operation authority。 普通蓝绿事务 MUST NOT 写入 rqlite； 首次部署的固定 `migrate` 事务可以一次性读取 legacy SQLite、写入 rqlite 并完成导入验证，之后不得再次触碰业务状态后端。 Go `serve` 进程 MUST 保持唯一的业务控制权威； legacy Bun control process 仅允许作为已验证的兼容发布或转发桥存在，且 MUST NOT 与 live state 并发运行。
+控制面发布、更新和回滚必须继续由运维者负责。公共 `agent-vm` CLI 必须保持为生命周期和请求客户端，不得获得 Incus/PVE 管理权限、提供公共自更新命令或成为第二个业务控制面。槽位外 Go 服务 `agent-vm-deployd` 可以通过受保护的本机 UDS 协调部署事务，但不得拥有业务生命周期状态，也不得替代 Go `serve` 成为 Incus 操作权威。普通蓝绿事务不得写入 rqlite；首次部署的固定 `migrate` 事务可以一次性读取旧版 SQLite、写入 rqlite 并验证导入，此后不得再次触碰业务状态后端。Go `serve` 进程必须保持唯一业务控制权威；旧版 Bun 控制进程只能作为已验证的兼容发布或转发桥存在，不得与活动状态并发运行。
 
 ### REQ-AGENT-VM-015 - 方法级兼容性
 
-Release manifest MUST 为每个支持的 operation 声明 protocol、request/response schema、semantic compatibility 和 direction。 Compatible operation MAY 跨 release revisions 继续运行，并返回 structured warning。 Unsupported action、incompatible schema 或 semantic change、invalid artifact checksum、或 incompatible protocol MUST 在任何 durable 或 native effect 前被拒绝。
+发布清单必须为每个支持的操作声明协议、请求与响应结构、语义兼容性和方向。兼容操作可以跨发布修订版本运行，并返回结构化警告。不支持的动作、不兼容的结构或语义变化、无效产物校验和或不兼容协议，必须在任何持久写入或原生影响之前被拒绝。
 
 ### REQ-AGENT-VM-016 - 发布事务与回滚
 
-发布 MUST 在 drain 前 stage 和 verify 明确的 release，在 activation 前进入 drain，保留 in-flight operation 和 maintenance timer，等待 pending operation 与 task transition 收敛，原子激活产物，并在重新打开 admission 前验证健康状态、reconciliation、控制器主权、流量排空和 timer state。 槽位外 deployd controller MUST 在独立部署数据库中持久化事务阶段和最新观测证据。 Pre-activation failure MUST 保持 current release 不变。 激活后健康检查或 quiescence failure MAY 向上一个已验证 release 执行一次有界 rollback； rollback failure MUST 保持部署和业务 admission fenced，不能改写 state、generation 或 uncertain operation。
+发布必须在排空前暂存并验证明确的发布版本，在激活前进入排空，保留在途操作和维护定时器，等待待完成操作及任务转换收敛，原子激活产物，并在重新开放准入前验证健康、状态核对、控制器主权、流量排空和定时器状态。槽位外 Deployd 必须在独立部署数据库中持久化事务阶段及最新观测证据。激活前失败必须保持当前发布不变。激活后健康检查或静止验证失败时，可以向上一个已验证发布执行一次有界回滚；回滚失败必须继续对部署和业务准入实施围栏，不得改写状态、代次或不确定操作。
 
 ### REQ-AGENT-VM-017 - 发布范围与权限边界
 
-控制面发布包 MUST 包含本地客户端、远程控制脚本、deployd 和槽位 systemd 资源、发布元数据以及精确产物校验和，同时排除部署配置、凭据、连接材料、业务/部署状态数据库、lock、Incus 容器数据和 guest image。 发布 MUST 使用受保护的本机 deployd socket，或使用显式配置的旧版控制入口，并配合运维者专用或最小范围的 root-owned deployment authority； MUST NOT 增加 PVE、host、guest、额外公共 SSH、HTTP 或 gateway access。 Unattended control-plane update MUST 默认关闭。
+控制面发布包必须包含本地客户端、远程控制脚本、Deployd 和槽位 systemd 资源、发布元数据及准确的产物校验和，同时排除部署配置、凭据、连接材料、业务与部署状态数据库、锁、Incus 容器数据和来宾镜像。发布必须使用受保护的本机 Deployd socket，或显式配置的旧版控制入口，并配合运维者专用身份或权限范围最小、由 root 拥有的部署封装；不得增加 PVE、宿主、来宾或额外公共 SSH、HTTP、网关访问权。无人值守控制面更新默认必须关闭。
 
 ### REQ-AGENT-VM-018 - CPU 启动压力边界
 
-Controller MUST 将 CT-local CPU PSI 与 logical CPU reservation 分开观测。 当 new acquire、cached resume、restart-capable resize 或 explicit restart 会使 projected CPU allocation 超过 CT-visible CPU capacity，且已验证的 `full.avg10` 达到 configured startup-pressure threshold 时，MUST 在停止或启动 existing guest 前，以 structured `resource_pressure` evidence 拒绝 native boot。 该 guard MUST NOT 改变 logical CPU allocation ceilings、停止 effective lease，或阻止 read、renewal、retrieval、release 和 live memory-only resize； 缺失 CPU PSI MUST 保持为显式 observation failure，不得伪造为 zero。
+控制器必须分别观测 CT 本地 CPU PSI 和逻辑 CPU 预留。当新的获取、缓存恢复、允许重启的资源调整或显式重启会使预计 CPU 分配超过 CT 可见容量，且已验证的 `full.avg10` 达到配置的启动压力阈值时，必须在停止或启动已有来宾前，携带结构化 `resource_pressure` 证据拒绝原生启动。该保护不得改变逻辑 CPU 分配上限、停止有效租约，或阻止读取、续租、取回、释放和运行中仅调整内存的操作；缺失 CPU PSI 必须明确表示为观测失败，不得伪造为零。
 
 ### REQ-AGENT-VM-019 - 容量与清单观测
 
-Read-only observation contract MUST 区分 logical reservation composition、CT-visible capacity、runtime pressure、physical disk headroom、native admission state 和 per-task lifecycle state。 它 MUST 暴露 `some.avg10`、`full.avg10`、configured startup threshold 和 startup-blocked state，但不得将 PSI 当作 CPU utilization 或 logical remaining capacity。 批准的 overcommit deployment profile MUST 配置 50 percent full-pressure threshold，并保留 compound projected-capacity gate。
+只读观测合同必须区分逻辑预留组成、CT 可见容量、运行时压力、物理磁盘余量、原生准入状态和逐任务生命周期状态。它必须暴露 `some.avg10`、`full.avg10`、配置的启动阈值和启动受阻状态，不得把 PSI 当成 CPU 利用率或逻辑剩余容量。已批准的超售部署配置必须使用 50% 的完整压力阈值，并保留预计分配超出容量这一组合触发条件。
 
-Deployment observation surface MUST 提供独立的 capacity/admission view 和 inventory/operations view。 Capacity view MUST 在有权威来源时展示 allocated、reserved、allocated-and-reserved、remaining、limit 和 CT-visible capacity，并展示 task-state counts，以及 logical 和当前可启动的 default-container slots 的显式 snapshot estimates。 Inventory view MUST 覆盖所有 managed task states，使用有界字段，删除 stale rows，并避免暴露 raw errors、credentials 和 deployment paths。 缺失或为 `-1` 的 native slot limit MUST 保持缺失； derived slot estimate MUST NOT 标记为 authoritative slot limit。
+部署观测界面必须分别提供容量与准入视图、清单与操作视图。存在权威来源时，容量视图必须展示已分配、已预留、分配与预留合计、剩余、上限和 CT 可见容量，并显示任务状态计数，以及逻辑和当前可启动默认容器槽位的显式快照估算。清单视图必须覆盖全部受管任务状态，限制字段大小，移除过期行，避免暴露原始错误、凭据和部署路径。缺失或为 `-1` 的原生槽位上限必须保持缺失，推导估算不得标记为权威槽位上限。
 
-`agent-vm-deployd` 的 `/metrics` endpoint MUST 将 `admin-metrics` 和 `admin-status` 调度为独立的 observation lanes。 Pending 或 failed inventory read MUST NOT 移除最新有效的 capacity metric families； pending 或 failed capacity read MUST NOT 保留失败 inventory scrape 中的 task rows。 Retained source snapshot MUST 保留其原始 observation timestamp，并暴露 source-specific health 或 freshness failure； deployd MUST NOT 使用伪造的 zeroes 替换 unavailable values。 Prometheus MUST 只抓取 deployd 的 `/metrics` endpoint，并使用 `job="agent-vm-deployd"`； 槽位级 metric series MUST 带 `slot` label，以支持切换期间两个槽位同时存活。 蓝色和绿色槽位 MUST 使用各自独立的 snapshot 目录； 共享 snapshot 目录 MUST NOT 用于蓝绿运行。 `admin-status` MUST use keyset pagination with a default page size of 25 and a maximum of 100, probe no more than 8 tasks concurrently, bound each task probe to 1 second and the page to 5 seconds, and expose `partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out` without treating unknown native state as healthy。
+`agent-vm-deployd` 的 `/metrics` 接口必须将 `admin-metrics` 与 `admin-status` 调度为独立观测通道。待完成或失败的清单读取不得擦除最近有效的容量指标族；容量读取待完成或失败时，也不得保留失败清单采样中的任务行。保留的来源快照必须保留原始观测时间戳，并暴露各来源的健康或新鲜度失败；Deployd 不得用伪造的零值替换不可用数据。Prometheus 只抓取 Deployd 的 `/metrics`，使用 `job="agent-vm-deployd"`；槽位级指标必须带 `slot` 标签，以支持切换期间两个槽位同时存活。蓝、绿槽位必须使用各自独立的快照目录，不得共享。`admin-status` 必须采用键集分页，默认每页 25 条、最多 100 条，并发探测不超过 8 个任务，每个任务探测上限 1 秒、整页上限 5 秒；返回 `partial`、`unknown`、`observation_consistent`、`probed`、`verified` 和 `timed_out`，不得将未知的原生状态当成健康。
 
-这些规则的固定合同名称是 independent observation lanes、pending or failed inventory read、latest valid capacity metric families、retained source snapshot 和 original observation timestamp； 它们对应上面的中文语义，不是额外的英文操作说明。
-
+这些观测约束的术语分别为独立观测通道、待完成或失败的清单读取、最近有效的容量指标族、保留的来源快照和原始观测时间戳。
 
 ### REQ-AGENT-VM-020 - 认证管理边界
 
-每个蓝绿槽位 MUST 运行一个 Go/Gin Agent VM 服务，提供固定静态 Web 资源、OIDC 回调、同源管理 API 和 `/agent/v1/control`； 业务边界 MUST NOT 增加独立 Web 进程、Forward Auth 身份标头、公共管理 UDS、路由器、Web/BFF、公共 native 生命周期服务或公共 TCP 绕过路径。 独立的运维者专用 deployd UDS 位于业务管理 API 之外，MUST 对 Caddy 和浏览器不可访问。 Caddy MUST 只执行 TLS 和固定路径的 active-slot 路由。 统一服务 MUST 执行受限的方法/路径/ 输入、OIDC/session/Token 授权、Origin/CSRF、target-session、generation 和 journal 检查； 必需的 OIDC、origin、Token、upload 或 staging configuration 不完整时，MUST 保持 listener disabled。
+每个蓝绿槽位必须运行一个 Go/Gin Agent VM 服务，提供固定静态 Web 资源、OIDC 回调、同源管理 API 和 `/agent/v1/control`。业务边界不得增加独立 Web 进程、Forward Auth 身份头、公共管理 UDS、路由器、Web/BFF、公共原生生命周期服务或公共 TCP 绕过路径。独立的运维专用 Deployd UDS 位于业务管理 API 之外，Caddy 和浏览器不得访问。Caddy 只负责 TLS 和活动槽位的固定路径路由。统一服务必须限制方法、路径和输入，执行 OIDC、会话、Token 授权、Origin/CSRF、目标会话、代次和日志检查；必需的 OIDC、来源、Token、上传或暂存配置不完整时，必须禁用监听器。
 
 ### REQ-AGENT-VM-021 - 管理 API 与本地化界面
 
-Management console MUST 只暴露 OpenAPI contract 定义的 same-origin `/api/v1` surface。 它 MUST 拒绝 unknown fields 和 unsupported actions，使用 bounded cursor pagination，保留 exact byte 和 generation values，返回 structured field-whitelisted errors，并暴露 source freshness 和 unknown values，不得把它们强制转换为 healthy zeroes。 UI MUST 支持 `zh-CN` 和 `en`，优先使用 saved choice，其次 browser language，最后 English fallback； accessible names、confirmations 和 errors MUST 翻译，technical identifiers 和 user-entered reasons 保持不变。
+管理台只允许暴露 OpenAPI 合同定义的同源 `/api/v1` 接口。必须拒绝未知字段和不支持的动作，采用有界游标分页，准确保留字节数与代次值，返回具有字段白名单的结构化错误，并暴露来源新鲜度与未知值，不得将其转换为表示健康的零值。界面必须支持 `zh-CN` 和 `en`，优先使用保存的选择，其次使用浏览器语言，最后回退英文；无障碍名称、确认和错误必须翻译，技术标识符与用户填写的原因保持不变。
 
 ### REQ-AGENT-VM-022 - 管理操作与审计恢复
 
-Existing management resource 的每次 mutation MUST 携带 UUID operation ID 和 current target version； 每次 durable create 或 Token issuance MUST 携带 UUID operation ID 和 canonical retry identity； VM actions 还 MUST 携带 expected generation。 Request MAY 包含有界的 non-empty reason，但缺少 reason MUST 被接受并表示为 absent。 Administrator-sensitive submission MUST 使用绑定 authenticated subject、exact target、action、parameters 和 target version 的 confirmation token； authority MUST 在产生 effects 前重新检查 authorization 和 state。 Token creation 是 durable-create exception，不要求单独 preview。 Identical operation retries MUST 解析到同一个 durable operation； conflicting reuse MUST failure。 Token create 在 durable operation 和 metadata layer 上必须幂等：第一笔 transaction 原子消费 one-time plaintext disclosure latch，只有该 response 可以携带 bearer，后续或并发 retry 返回相同的 `token_id`/metadata，不返回 plaintext。 Uncertain native outcomes MUST 保持可 query，且 MUST NOT 自动 replay。 Audit records MUST 保留 current administrator actor、没有 administrator authority 的 typed rejected-request actor，或带 original raw value 的明确 unknown historical actor，并保留 optional reason、target、phase 和 outcome； 不得暴露 raw command diagnostics、credentials 或 private paths。
+对已有管理资源的每次变更，必须携带 UUID 操作 ID 和当前目标版本；每次持久创建或 Token 签发必须携带 UUID 操作 ID 和规范化重试身份，VM 动作还必须携带预期代次。请求可以包含有界、非空的原因，缺少原因时必须接受并标识为未提供。管理员敏感提交必须使用绑定已认证主体、准确目标、动作、参数和目标版本的确认令牌；控制服务必须在产生影响前重新检查授权与状态。Token 创建属于持久创建例外，不要求独立预览。相同操作重试必须对应同一持久操作，冲突复用必须失败。Token 创建在持久操作和元数据层必须幂等：首个事务原子消费一次性明文披露标记，仅该响应可以携带 Bearer 明文，后续及并发重试返回相同的 `token_id` 和元数据，不返回明文。不确定的原生结果必须可查询，不得自动重放。审计必须保留当前管理员操作者、不具有管理员权限的带类型拒绝请求操作者，或带原始值且明确标识为未知的历史操作者，并保留可选原因、目标、阶段和结果；不得暴露原始命令诊断、凭据或私有路径。
 
-### REQ-AGENT-VM-023 - Managed image 安全与 session pinning
+### REQ-AGENT-VM-023 - 受管镜像安全与会话固定
 
-Managed images MUST 使用 immutable fingerprints、allowlisted source identities、有界的 local package uploads、独立的 integrity 和 suitability results，以及 explicit reference counts。 Configured legacy default MUST 在迁移期间保留，并在替换前显示为 unverified； 只有 fully verified image 才能通过 management API 被选中。 Default selection MUST 只影响 new sessions。 Existing tasks 和 caches MUST 保留 exact fingerprint。 Default、active、cached、releasing、pending-creation 和 verification references MUST 阻止 deletion； reference checks 必须与 image operations 串行化。
+受管镜像必须使用不可变指纹、白名单来源身份、有界的本地包上传、独立的完整性与适用性结果，以及显式引用计数。配置中的旧版默认镜像必须在迁移期间保留，替换前显示为未验证；只有完全验证的镜像才能通过管理 API 选为默认值。默认选择只影响新会话，已有任务与缓存必须保留准确指纹。默认、活动、缓存、释放中、待创建及验证中引用都必须阻止删除；引用检查必须与镜像操作串行执行。
 
 ### REQ-AGENT-VM-024 - 管理状态与回滚兼容性
 
-Management schema changes MUST 是 additive、transactional，并由 versioned state-capability markers 记录。 Migration MUST 保留 task identity、generations、leases、ports、reservations 和 existing protocol-4 journal state。 Package 只有声明支持 read/write state database 中每个 capability marker 时才能 activation。 没有 capability declaration 的 package MUST 仅视为支持 pre-management state。 Incompatible rollback MUST 在改变 active package pointers 或启动 target 前被拒绝； MUST NOT 降级或重建 databases 来强行兼容。 Protocol 4 和 existing CLI request/response behavior MUST 保持不变。
+管理状态结构变更必须采用增量、事务方式，并记录带版本的状态能力标记。迁移必须保留任务身份、代次、租约、端口、预留和已有协议 4 日志状态。包只有声明支持读写状态数据库中每个能力标记时才能激活。没有能力声明的包只能视为支持管理功能引入前的状态。不兼容回滚必须在改变活动包指针或启动目标前被拒绝，不得降级或重建数据库来强行兼容。协议 4 及现有 CLI 请求、响应行为必须保持不变。
 
-### REQ-AGENT-VM-025 - OIDC principal 与 browser session identity
+### REQ-AGENT-VM-025 - OIDC 主体与浏览器会话身份
 
-Browser login MUST 只使用 OIDC Authorization Code + PKCE 和 `code_challenge_method=S256`，并使用 one-time `state`、`nonce`、protected code verifier、exact redirect URI、短时 browser-bound login cookie 和 bounded expiry。 每个新事务 MUST 使用独立的 browser binding cookie；兼容窗口内回退读取 legacy aggregate binding cookie 时，只能移除已消费的 binding，必须保留同一浏览器中其他仍在途的事务。 Service MUST 在创建 session 前验证 configured discovery issuer、exact ID Token `iss`、`aud`/`azp`、signature/JWKS、`exp`、`iat` policy、authorization-code exchange 和 nonce。 Service 与 proxy access logs MUST 删除 callback query strings 和 `Referer`； application logs MUST NOT 保留 OIDC code、state、nonce 或 verifier values。 Durable principal MUST 是精确且区分大小写的 `(issuer, subject)` pair； 只有 configured pair 是 administrator actor，email、display name、group claims 和 forwarded identity headers MUST NOT 建立 authorization。 Replayed、expired、cross-browser 或 unverified callback MUST 被拒绝； non-allowlisted login MUST NOT 创建 session 或 administrator capability。
+浏览器登录只允许 OIDC 授权码加 PKCE 流程，且 `code_challenge_method=S256`，并使用一次性的 `state`、`nonce`、受保护的授权码校验器、准确回跳 URI、短时且绑定浏览器的登录 Cookie 和有界到期时间。每个新事务必须使用独立的浏览器绑定 Cookie；兼容窗口内回退读取旧版聚合绑定 Cookie 时，只能移除已消费的绑定，必须保留同浏览器其他在途事务。服务创建会话前，必须验证配置的发现签发方、准确的 ID Token `iss`、`aud`/`azp`、签名与 JWKS、`exp`、`iat` 策略、授权码交换和 nonce。服务及代理访问日志必须移除回调查询串和 `Referer`；应用日志不得保留 OIDC 授权码、state、nonce 或校验器值。持久主体必须是准确且区分大小写的 `(issuer, subject)` 二元组；只有配置的二元组才是管理员，邮箱、显示名、组声明和转发身份头都不能建立授权。重放、过期、跨浏览器或未验证回调必须拒绝；白名单外登录不得创建会话或管理员能力。
 
-### REQ-AGENT-VM-026 - Machine Token 与 Agent API
+### REQ-AGENT-VM-026 - 机器 Token 与 Agent API
 
-Sole administrator MUST 是唯一允许 issue、list、read 和 revoke opaque machine Tokens 的 browser actor。 Token metadata MUST 包含 opaque `resource_version`、scopes、expiry 和 revocation state，但 MUST NOT 包含 user-owner field 或 pre-bound session set； plaintext MUST 只返回一次，service 只存储 validation digest 和 one-time disclosure state。 Token creation MUST 要求 operation ID 和 canonical request identity； requested `agent:operate` scope MUST 同时显式包含 `agent:read` scope，不允许 implicit scope inheritance。 成功的 `token_create` operation MUST 通过 safe metadata 和 durable plaintext disclosure state 包含 Token ID。 Retry 或 concurrent request MUST 返回 durable operation 的 `token_id`、metadata、`resource_version` 和 disclosure state，不得重新签发 plaintext； 响应丢失后，administrator MUST query original operation、确认 Token ID、显式 revoke 该 Token，并使用新的 operation ID 创建 replacement。 Token revocation MUST 要求 current preview `target_version` 和 single-use confirmation token，在 acknowledgment 前 commit，推进 `resource_version`； Agent authorization MUST 通过 linearizable read 观察到 revocation。 `POST /agent/v1/control` MUST 只接受 valid Bearer Token 和 existing protocol-4 body，并且每个 request 都 MUST 重新检查 Token expiry/revocation、scope、target session、generation、operation ID 和 request digest。 带 allowed scope 的 valid Token MAY acquire 任意 target session； MUST NOT 要求预先绑定该 session。 Sessionless administrative observation MUST 要求显式 `agent:observe_admin` scope。
+只有唯一管理员可以通过浏览器签发、列出、读取和撤销不透明的机器 Token。Token 元数据必须包含不透明的 `resource_version`、作用域、到期时间和撤销状态，但不得包含用户拥有者字段或预绑定会话集合；明文只返回一次，服务只保存验证摘要及一次性披露状态。创建必须携带操作 ID 和规范化请求身份；申请 `agent:operate` 时必须同时显式包含 `agent:read`，不允许隐式继承作用域。成功的 `token_create` 操作必须在安全元数据和持久明文披露状态中包含 Token ID。重试及并发请求返回持久操作的 `token_id`、元数据、`resource_version` 和披露状态，不得重新签发明文。响应丢失后，管理员必须查询原操作、确认 Token ID、显式撤销该 Token，再用新操作 ID 创建替代 Token。撤销要求当前预览的 `target_version` 和一次性确认令牌，在确认响应前提交并推进 `resource_version`；Agent 授权必须通过线性一致读取观察到撤销。`POST /agent/v1/control` 只接受有效 Bearer Token 和现有协议 4 请求体，每个请求都必须重新检查 Token 到期与撤销、作用域、目标会话、代次、操作 ID 和请求摘要。具有允许作用域的有效 Token 可以获取任意目标会话，不得要求预先绑定。无会话的管理观测必须要求显式的 `agent:observe_admin` 作用域。
 
-### REQ-AGENT-VM-027 - Administrator 敏感操作与审计
+### REQ-AGENT-VM-027 - 管理员敏感操作与审计
 
-Administrator capabilities MUST 只根据 configured exact `(issuer, subject)` pair 解析，MUST NOT 从 email 或 group claims 推断。 Sensitive actions MUST 要求 explicit capability、impact preview，以及绑定 actor、exact target、parameters、target version 和 generation 的 one-time confirmation token； optional non-empty bounded reason 在提供时写入 audit，但不是必需项。 Unified service MUST 在 native effects 前重新检查 authorization 和 state。 Accepted、rejected、succeeded、failed 和 outcome-unknown attempts MUST 可审计，并保留 current issuer/subject actor、没有 administrator authority 的 typed `unauthenticated` 或 `unauthorized` rejected-request actor，或明确的 unknown historical actor，以及 optional reason、operation ID、target、phase、result 和 safe error code； rejected request 的 operation ID MUST 同时出现在 structured error 和对应 audit record 中；历史上缺少 operation ID 的 audit record MUST 使用稳定、可复现的兼容标识，而不是每次读取生成新的值。 不得包含 Token values、OIDC codes、credentials、raw command output 或 private paths。 Historical task 和 native records MUST 根据 durable task identity、generation、lease、journal 和 native identity reconcile； 不允许 user mapping 或 first-login claim。
+管理员能力只能按配置中准确的 `(issuer, subject)` 二元组解析，不得从邮箱或组声明推断。敏感动作必须要求显式能力、影响预览，以及绑定操作者、准确目标、参数、目标版本和代次的一次性确认令牌；可选原因必须非空且有界，提供时写入审计，但不得强制要求。统一服务必须在原生影响发生前重新检查授权与状态。接受、拒绝、成功、失败和结果未知的尝试都必须可审计，保留当前签发方与主体操作者、没有管理员权限且类型为 `unauthenticated` 或 `unauthorized` 的拒绝请求操作者，或明确标识为未知的历史操作者，以及可选原因、操作 ID、目标、阶段、结果和安全错误码。被拒请求的操作 ID 必须同时出现在结构化错误和对应审计中；历史审计缺少操作 ID 时，必须使用稳定、可复现的兼容标识，不得每次读取都重新生成。不得包含 Token 值、OIDC 授权码、凭据、原始命令输出或私有路径。历史任务和原生记录必须按持久任务身份、代次、租约、日志及原生身份核对，不允许用户映射或首次登录认领。
 
-### REQ-AGENT-VM-028 - 保守的 SQLite-to-rqlite 迁移与原子并发
+### REQ-AGENT-VM-028 - 保守的 SQLite 至 rqlite 迁移与原子并发
 
-首次部署 MUST 由发布器自动调用槽位外 Deployd 的 `POST /v1/migrate`，不得把旧 SQLite 的停止、snapshot、导入或验证留给人工前置步骤。 Deployd MUST 将这次迁移作为单一 durable transaction 持久化，并在结果不明确时返回 transaction ID、进入 `needs_recovery`、保持 legacy 服务停止或 fenced； 发布器只可对该 transaction 自动执行一次 `retry-migration`。
+首次部署必须由发布器自动调用槽位外 Deployd 的 `POST /v1/migrate`，不得把旧 SQLite 的停止、快照、导入或验证留给人工前置步骤。Deployd 必须将迁移作为单一持久事务记录；结果不明确时返回事务 ID、进入 `needs_recovery`，并使旧服务保持停止或围栏状态。发布器只可对该事务自动执行一次 `retry-migration`。
 
-SQLite MUST 在 state-write fence 拒绝新的 browser/API/Agent durable mutations、暂停 scheduler/reconciliation/timer durable writes、排空 in-flight transactions 和 native workers，并要求每个 native worker 在其 original operation ID 下以 durable result 完成，同时验证 process-group、PID-identity 和 Incus-operation quiescence； 在此之前继续作为 sole writer。 Pending/unknown native result、active worker 或 unverified quiescence MUST 阻止 final export； migration MUST NOT 只记录它然后继续。 Migration MUST 保留 protocol 4、schema、generation、`state_epoch`、operation journal、audit、session、Token 和 capability semantics； MUST NOT dual-write、从两个 slots 打开 shared SQLite file、reverse-sync guessed state、downgrade schema 或为 rollback recreate state。 Cutover 后，rqlite MUST 是 sole shared authority； critical administrator-authorization、lease、generation、journal、Token-revocation、capability 和 epoch reads MUST 使用 linearizable consistency，cross-row compare-and-act changes MUST 使用一个带 conditional updates 或 unique constraints 的 rqlite transaction。 如果需要 rqlite recovery，verified backup MUST 记录不早于 last trusted commit 的 coverage boundary，且该 boundary 之后的 backup tail MUST 与 trusted append-only journal 和 native-effect evidence reconcile； 仅 schema、digest、epoch 或 journal checks 不能作为 coverage proof。 如果无法证明 tail 或任意 post-cutover write，service MUST 保持 fenced，等待 administrator-authorized journal/native reconciliation。 只有证据证明 post-cutover 没有任何 writes 和 effects 时，pre-cutover SQLite snapshot 才可采用。 Native unknown outcomes MUST 保持 pending，MUST NOT 使用新的 operation ID replay。
+在状态写入围栏拒绝新的浏览器、API 和 Agent 持久变更，暂停调度器、状态核对和定时器的持久写入，排空在途事务与原生工作进程之前，SQLite 必须继续作为唯一写入者。每个原生工作进程都必须在原操作 ID 下以持久结果完成，并验证进程组、PID 身份和 Incus 操作已静止。原生结果仍待完成或未知、工作进程仍活动或静止状态未验证时，必须阻止最终导出，不能只记录问题后继续迁移。迁移必须保留协议 4、状态结构、代次、`state_epoch`、操作日志、审计、会话、Token 和能力语义；不得双写、从两个槽位打开共享 SQLite 文件、反向同步猜测状态、降级结构，或为回滚重建状态。切换后，rqlite 必须是唯一共享权威；关键管理员授权、租约、代次、日志、Token 撤销、能力和纪元读取必须采用线性一致性，跨行比较并更新必须使用带条件更新或唯一约束的单个 rqlite 事务。需要恢复 rqlite 时，已验证备份必须记录不早于最后可信提交的覆盖边界，并将边界之后的备份尾部与可信追加式日志及原生影响证据核对；只验证结构、摘要、纪元或日志不足以证明覆盖完整。无法证明尾部或任意切换后写入时，服务必须保持围栏，等待管理员授权的日志与原生资源核对。只有证据证明切换后没有任何写入或影响时，才可使用切换前 SQLite 快照。原生未知结果必须保持待完成，不得换用新的操作 ID 重放。
 
-状态恢复材料 MUST 使用有界保留：最多三个已验证恢复点、至少保留最后两个恢复点，超过三十天的恢复点进入清理候选，同一控制环境内全部恢复材料的总大小硬上限为 1 GiB。 1 GiB MUST 按实际文件大小计算，不得预分配，也不得设置恢复材料体积下限。 迁移源 SQLite snapshot 在迁移完成并通过新的 rqlite restore check 后 MUST 保留七天。 只有在没有 pending/unknown operation 或未解决的 `needs_recovery`、对应保留期到期，并且清理后仍保留两个恢复点时，材料才可以删除。 达到容量预算且没有可删除材料时，系统 MUST 返回 `backup_storage_exhausted`，拒绝新的备份或状态迁移，不得删除受保护恢复点。 状态数据库中的终态操作和审计历史 MUST 默认保留三十天后回收； 需要长期保留的审计 MUST 先归档到状态库之外，不能通过扩大恢复材料预算替代历史记录回收。
+状态恢复材料必须有界保留：最多三个已验证恢复点，至少保护最后两个；超过三十天的恢复点进入清理候选，同一控制环境内全部恢复材料总大小硬上限为 1 GiB。1 GiB 按实际文件大小计算，不得预分配，也不得设置体积下限。迁移源 SQLite 快照在迁移完成并通过新的 rqlite 恢复检查后，必须保留七天。只有不存在待完成或未知操作、没有未解决的 `needs_recovery`、保留期到期，且清理后仍有两个恢复点时，才可删除材料。达到预算且没有可删除材料时，系统必须返回 `backup_storage_exhausted`，拒绝新备份或状态迁移，不得删除受保护恢复点。状态数据库中的终态操作与审计历史默认保留三十天后回收；需要长期保留的审计必须先归档到状态库之外，不能扩大恢复材料预算来替代历史回收。
 
 ### REQ-AGENT-VM-029 - 蓝绿兼容窗口
 
-Release contract MUST 至少保留 current 和 previous verified package 及 fixed static resources，覆盖一小时的 API/state compatibility。 每个 release MUST 声明 protocol、request/response/semantic windows、OIDC/Token/management API compatibility 和 state capability read/write sets。 只有 target readiness 和 shared-state checks 通过后，active link 才能原子改变； Caddy MUST NOT replay writes。 无法 read/write 每个现有 capability 的 slot 或 rollback target MUST 在 activation 前被拒绝； 超出 compatibility window 的 browser asset MUST 收到显式 refresh result，不得静默使用不匹配的 API 或 state semantics。
+发布合同必须至少保留当前和上一个已验证包及其固定静态资源，覆盖一小时的 API 与状态兼容窗口。每个发布必须声明协议、请求、响应和语义兼容窗口、OIDC/Token/管理 API 兼容性，以及状态能力读写集合。只有目标就绪和共享状态检查通过后，才能原子替换活动链接；Caddy 不得重放写请求。无法读写每个现有能力的槽位或回滚目标，必须在激活前拒绝；超出兼容窗口的浏览器资源必须收到明确的刷新结果，不得静默使用不匹配的 API 或状态语义。
 
 ### REQ-AGENT-VM-030 - 安全 Web Demo 边界
 
-仓库 MAY 提供复用 management console 五个页面、route suffixes 和 API-shaped view model 的静态 Web Demo，但 Demo MUST 使用显式 demo build 和 in-memory transport。 Demo bootstrap MUST 在 console rendering 前完成，并且如果失败 MUST fail closed，不能 fallback 到真实 `/api/v1` transport。 Demo reads 和 mutations MUST NOT 调用真实 API、读取或上传 user files、访问 deployment credentials，或持久化 simulated results。 Share links MAY 只包含文档化的 `demo` 和 `d_*` scenario settings； reasons、file metadata、credentials 和其他 sensitive values MUST 排除。 Demo MUST 保持明显的 synthetic 属性，MUST NOT 作为 authenticated production management boundary 已部署的证据。
+仓库可以提供复用管理台五个页面、路由后缀和 API 视图模型的静态 Web Demo，但必须使用显式演示构建和内存传输。演示初始化必须在管理台渲染前完成；失败时必须拒绝继续，不得回退到真实 `/api/v1` 传输。演示读取与变更不得调用真实 API、读取或上传用户文件、访问部署凭据或持久化模拟结果。分享链接只能包含文档化的 `demo` 和 `d_*` 场景设置，必须排除原因、文件元数据、凭据和其他敏感值。演示必须明确展示模拟性质，不得作为已部署认证生产管理边界的证据。
 
-Standalone Demo MUST 使用 origin root 作为 entry、assets、page routes 和 share links 的根路径。 Static hosting MUST 对 unknown page paths 返回 Demo entry，以支持 direct navigation 和 refresh。 原 `/demo/` route 不是 supported compatibility path。
+独立 Demo 必须以站点根路径作为入口、资源、页面路由和分享链接的根路径。静态托管对未知页面路径必须返回演示入口，以支持直接访问和刷新。原 `/demo/` 路由不是受支持的兼容路径。
 
-Demo deployment pipeline MUST 为 current revision 构建单一 static artifact，并且只能从 trusted main-branch runs 将该 artifact 部署到现有 EdgeOne Makers project。 Pull request runs MUST 只 build，不得 deploy 或访问 deployment credentials。 Deployment credentials MUST 保留在 hosting repository 的 secret store； local 或 manual artifact upload 不是 authorized deployment path。
+Demo 部署流水线必须为当前修订构建单一静态产物，且只能从可信主干运行部署到现有 EdgeOne Makers 项目。拉取请求运行只能构建，不得部署或访问部署凭据。凭据必须留在代码托管仓库的秘密存储中；本地或手工上传产物不是获准的部署路径。
 
-Demo Inspector MUST 遵循[Web Demo Inspector UX/UI 合同](contracts/web-demo-inspector.md)：其 structure、responsive layout、position-menu semantics、explicit floating drag handle、keyboard movement alternative、focus behavior、touch targets 和 visual evidence requirements 都属于 Demo contract。 单击 position control MUST 应用 viewport default，MUST NOT 打开 menu； right-click、long-press 和 `Shift+F10` MAY 打开 menu。 Floating Inspector MUST 暴露可见的 `Drag`/`拖动` handle，并且 MUST 让 panel 保持在 viewport 内，不得将 coordinates 持久化到 share URL。
+Demo 场景检查面板必须遵循[Web Demo 检查面板交互合同](contracts/web-demo-inspector.md)，包括结构、响应式布局、位置菜单语义、显式浮动拖动手柄、键盘移动替代操作、焦点行为、触摸目标和视觉证据要求。单击位置控件必须应用视口默认位置，不得打开菜单；右键、长按及 `Shift+F10` 可以打开菜单。浮动面板必须暴露可见的 `Drag`/`拖动` 手柄，并保持在视口内，不得把坐标持久化到分享 URL。
 
 ### REQ-AGENT-VM-031 - 槽位外部署控制器
 
-部署控制器 MUST 作为稳定的 Go 服务运行在蓝绿槽位外，并且在任一槽位处于 staged、active、retiring 或 rollback 时保持可用。 它 MUST 向运维 CLI 暴露受保护的本机 Unix socket，并向 Prometheus 暴露仅限内部管理网络访问的只读 `GET /metrics` endpoint。 该 endpoint MUST NOT 成为公共 TCP/HTTP 路由或业务 API； deployd 仍 MUST NOT 获取 Incus/PVE 管理权限或拥有业务状态。 普通蓝绿事务 MUST NOT 写入 rqlite 或访问业务状态数据库； 首次部署的固定 `migrate` 事务是一次性例外，必须受固定 source path、target URL、systemd unit 和阶段状态机约束。 它的独立 SQLite 数据库 MUST 保存部署事务标识、阶段事件、失败证据和最新观测快照，但 MUST NOT 保存 session、lease、generation、operation journal 或业务资源状态。 它 MUST 区分 selected 槽位、进程健康、就绪状态、控制器主权、流量角色、在途请求和 native-worker quiescence，并包含来源新鲜度与来源信息。 `/metrics` MUST 返回最近一次已完成的观测快照，不得在 scrape 请求中触发部署变更、槽位采样或 native effect。 Prometheus scrape target 的 job 名称 MUST 为 `agent-vm-deployd`； deployd 输出的槽位级指标 MUST 带 `slot="blue"|"green"`，不得因双槽位同时存活而产生重复时间序列。 切换期间两个槽位进程 MAY 同时存活，但恰好一个槽位 MUST 持有运行 scheduler、reconciliation、age GC 和 scheduler-driven native mutation 所需的控制器主权。 槽位在取得已认证 role 前 MUST NOT 运行 startup reconciliation 或这些后台 mutation loop，失去 role 时 MUST fence 它们。 缺失或矛盾的观测 MUST fail closed，并让事务保持可恢复，而不是当成成功。
+部署控制器必须作为稳定的 Go 服务运行在蓝绿槽位外，在任一槽位处于暂存、活动、退役或回滚阶段时保持可用。它必须向运维 CLI 提供受保护的本机 Unix socket，并向 Prometheus 提供仅内部管理网络可访问的只读 `GET /metrics` 接口。该接口不得成为公共 TCP/HTTP 路由或业务 API；Deployd 不得获取 Incus/PVE 管理权限或拥有业务状态。普通蓝绿事务不得写入 rqlite 或访问业务状态数据库；首次部署的固定 `migrate` 事务是一次性例外，必须受固定源路径、目标 URL、systemd 单元和阶段状态机约束。独立 SQLite 数据库必须保存部署事务标识、阶段事件、失败证据和最新观测快照，不得保存会话、租约、代次、操作日志或业务资源状态。它必须分别观测选定槽位、进程健康、就绪、控制器主权、流量角色、在途请求及原生工作进程静止状态，并提供来源及新鲜度。`/metrics` 必须返回最近一次完成的观测快照，不得在采集请求中触发部署变更、槽位采样或原生影响。Prometheus 采集任务名必须为 `agent-vm-deployd`，槽位级指标必须携带 `slot="blue"|"green"`，不得因双槽位同时存活而产生重复序列。切换期间两个槽位可以同时存活，但必须恰好一个持有调度器、状态核对、按时间垃圾回收及调度器驱动原生变更所需的控制器主权。槽位取得已认证角色前不得运行启动核对或这些后台变更循环；失去角色时必须立即围栏。观测缺失或矛盾时，必须拒绝继续并使事务保持可恢复，不得认定成功。
 
 ### REQ-AGENT-VM-032 - 集中的部署资料与完整部署入口
 
-项目根目录 MUST 提供 `deploy/`，集中保存部署专用脚本、配置示例、systemd 及相关安装资源、依赖组件清单和 Prometheus/Grafana 模板的唯一源码。部署资料从既有路径迁入时 MUST 同步修改构建、发布打包、校验、测试和文档引用，不得留下需要分别维护的副本。Go 控制服务、Deployd 和 CLI 的实现 MUST 保留在现有 Go 模块，产品构建与制品发布流程 MUST 保留各自职责；源码目录整理不得改变服务器安装布局、既有发布包格式或已发布产物。
+项目根目录必须提供 `deploy/`，集中保存部署专用脚本、配置示例、systemd 及相关安装资源、依赖组件清单和 Prometheus/Grafana 模板的唯一源码。部署资料从既有路径迁入时必须同步修改构建、发布打包、校验、测试和文档引用，不得留下需要分别维护的副本。Go 控制服务、Deployd 和 CLI 的实现必须保留在现有 Go 模块，产品构建与制品发布流程必须保留各自职责；源码目录整理不得改变服务器安装布局、既有发布包格式或已发布产物。
 
-`docs/deployment.md` MUST 是简明部署入口，只说明拓扑、前置条件、必填输入、最短操作路径和验收入口，并链接到 `deploy/README.md` 及 `deploy/docs/` 的对应细节。`deploy/` 内的文档 MUST 解释资料布局、配置字段、组件安装、证书与权限、首次部署、蓝绿升级、有限回滚、失败恢复和观测接入。既有部署操作说明 MUST 迁移到这一文档层次，旧入口可以提供跳转说明，但不得继续保存另一份独立流程。Spec 保留行为约束，ADR 保留已有决策依据，不复制操作步骤。面向人的文档 MUST 以简体中文为主，保留必要术语，每个普通段落在 Markdown 源文件中保持单一物理行。
+`docs/deployment.md` 必须是简明部署入口，只说明拓扑、前置条件、必填输入、最短操作路径和验收入口，并链接到 `deploy/README.md` 及 `deploy/docs/` 的对应细节。`deploy/` 内的文档必须解释资料布局、配置字段、组件安装、证书与权限、首次部署、蓝绿升级、有限回滚、失败恢复和观测接入。既有部署操作说明必须迁移到这一文档层次，旧入口可以提供跳转说明，但不得继续保存另一份独立流程。Spec 保留行为约束，ADR 保留已有决策依据，不复制操作步骤。面向人的文档必须以简体中文为主，保留必要术语，每个普通段落在 Markdown 源文件中保持单一物理行。
 
-完整性标准 MUST 覆盖在已经具备 Incus 运行条件的干净控制环境中完成首次部署，以及后续升级、回滚、恢复和验收。首次部署入口 MUST 根据显式输入安装并校验 Agent VM、槽位外 Deployd、Caddy 和 rqlite，安装对应 systemd 资源，并验证组件就绪、唯一控制器主权和服务入口；依赖下载 MUST 使用受控组件清单并验证校验和，不能把服务栈内的依赖安装或首次状态初始化留作未说明的人工前置。现有状态的迁移与全新安装 MUST 分别给出适用条件，普通蓝绿升级不得迁移、替换或重建业务数据库。
+完整性标准必须覆盖在已经具备 Incus 运行条件的干净控制环境中完成首次部署，以及后续升级、回滚、恢复和验收。首次部署入口必须根据显式输入安装并校验 Agent VM、槽位外 Deployd、Caddy 和 rqlite，安装对应 systemd 资源，并验证组件就绪、唯一控制器主权和服务入口；依赖下载必须使用受控组件清单并验证校验和，不能把服务栈内的依赖安装或首次状态初始化留作未说明的人工前置。现有状态的迁移与全新安装必须分别给出适用条件，普通蓝绿升级不得迁移、替换或重建业务数据库。
 
-Incus 运行环境、域名及 OIDC 注册 MUST 作为明确前置条件；部署入口不得接管 PVE、改变 CT 特权模式或挂载布局。外部 Prometheus/Grafana MUST 提供接入示例和验证方法，服务栈安装器不得接管其生命周期。Prometheus MUST 拉取 Deployd 的单一指标出口，Grafana MUST 仅查询 Prometheus；跨主机指标监听 MUST 展示 mTLS 与网络访问控制的配置方法。
+Incus 运行环境、域名及 OIDC 注册必须作为明确前置条件；部署入口不得接管 PVE、改变 CT 特权模式或挂载布局。外部 Prometheus/Grafana 必须提供接入示例和验证方法，服务栈安装器不得接管其生命周期。Prometheus 必须拉取 Deployd 的单一指标出口，Grafana 必须仅查询 Prometheus；跨主机指标监听必须展示 mTLS 与网络访问控制的配置方法。
 
-示例 MUST 提供一套相互匹配的控制服务、蓝绿槽位、Deployd、Web/OIDC、Caddy、rqlite 和观测输入，并明确变量替换、执行位置、必需权限、输入产物、成功标准及失败后的查询入口。仓库 MUST 只提交可复用模板和占位符；真实部署配置、地址、凭据、私钥、数据库、实时清单和消费者渲染产物 MUST 保留在受保护的部署位置。文档 MUST 区分已有入口、需要部署方提供的输入和待实现能力，不能用示例命令代替缺失实现或声称未运行的验收通过。
+示例必须提供一套相互匹配的控制服务、蓝绿槽位、Deployd、Web/OIDC、Caddy、rqlite 和观测输入，并明确变量替换、执行位置、必需权限、输入产物、成功标准及失败后的查询入口。仓库必须只提交可复用模板和占位符；真实部署配置、地址、凭据、私钥、数据库、实时清单和消费者渲染产物必须保留在受保护的部署位置。文档必须区分已有入口、需要部署方提供的输入和待实现能力，不能用示例命令代替缺失实现或声称未运行的验收通过。
 
-预检 MUST 保持只读，实际安装、升级和恢复 MUST 显式执行并继续由既有发布器与 Deployd 协调。部署资料整理、示例验证和隔离验收 MUST NOT 排空或重启正在使用的生产服务、终止有效租约、销毁或重建用户 VM；VM 生命周期 MUST 始终由 Incus 与现有控制服务管控，不引入旁路执行器。升级与恢复 MUST 保留事务身份、有效租约和不确定操作证据，遇到冲突或无法验证的状态时停止并给出原事务查询入口，不得自动重放或伪造成功。
+预检必须保持只读，实际安装、升级和恢复必须显式执行并继续由既有发布器与 Deployd 协调。部署资料整理、示例验证和隔离验收不得排空或重启正在使用的生产服务、终止有效租约、销毁或重建用户 VM；VM 生命周期必须始终由 Incus 与现有控制服务管控，不引入旁路执行器。升级与恢复必须保留事务身份、有效租约和不确定操作证据，遇到冲突或无法验证的状态时停止并给出原事务查询入口，不得自动重放或伪造成功。
 
 ## 同步与取回
 
-TypeScript/Bun synchronization helper 将 tracked、unignored worktree files 传输到自己的 guest source directory，并且只原子替换 helper-owned content。 Git selection、manifests 和 native filesystem access 保留 byte paths、symlink targets、modes 和 hashes； 不支持的 local root-path representation 必须显式失败。 传输前拒绝 submodules、symlink parents、reserved ownership filenames 和 unsafe names。 Guest transaction 是受 managed image runtime/native prerequisites 和 external execution deadline 保护的 in-memory Bun action； 缺少 Bun 或 atomic capability 时 fail closed。 Native locks、exclusive preparation、baseline identity comparison、fsync 和 atomic directory exchange 在冲突和失败中保留 current source 与 adjacent results。 Uncertain commit 保留 source marker 和 precise recovery record，并返回 exit 75，而不是推断 rollback。 [CLI 合同](contracts/cli.md#source-synchronization-transaction)定义 execution bounds、ownership 和 recovery。 Export 直接向 caller stream tar archive，不创建 server-side archive。
+TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输到所属来宾源码目录，只原子替换助手拥有的内容。Git 文件选择、清单和原生文件系统访问必须保留路径字节、符号链接目标、权限和哈希；不支持的本地根路径表示必须明确失败。传输前拒绝子模块、符号链接父目录、保留的归属文件名和不安全名称。来宾事务是内存中的 Bun 操作，受受管镜像运行时、原生前置条件和外部执行期限保护；缺少 Bun 或原子操作能力时必须拒绝继续。原生锁、独占准备、基线身份比较、fsync 和原子目录交换，在冲突与失败时必须保留当前源码及相邻结果。提交结果不确定时，保留源码标记和准确恢复记录，返回退出码 75，不得推断已经回滚。[CLI 合同](contracts/cli.md#source-synchronization-transaction)定义执行边界、归属和恢复。导出直接向调用方流式发送 tar 归档，不创建服务端归档。
 
 ## 验证
 
-- `VER-AGENT-VM-010` 覆盖：`REQ-AGENT-VM-010` 通过[操作运行手册](OPERATIONS.md)的 topology/provenance 章节、已接受的[拓扑与恢复 ADR](../../adr/0028-agent-vm-topology-recovery-boundary.md)和 `bin/test_agent_vm_documentation.py`。
-- `VER-AGENT-VM-011` 覆盖：`REQ-AGENT-VM-011` 通过[操作运行手册](OPERATIONS.md)的恢复流程、现有 native reconciliation 与 operation-journal behavior test，以及 `bin/test_agent_vm_documentation.py`。
-- `VER-AGENT-VM-012` 覆盖：`REQ-AGENT-VM-012` 通过[操作运行手册](OPERATIONS.md)的 sparse-disk 和 failure-domain 章节、现有 capacity/reclamation test，以及 `bin/test_agent_vm_documentation.py`。
-- `VER-AGENT-VM-013` 覆盖：`REQ-AGENT-VM-013` 通过[观测合同](contracts/observability.md)、[容量与故障 dashboard 方案](../../solutions/agent-vm/observability-dashboard.md)和 `bin/test_agent_vm_documentation.py`。
+- `VER-AGENT-VM-010` 覆盖：`REQ-AGENT-VM-010` 通过[操作运行手册](OPERATIONS.md)的拓扑与来源章节、已接受的[拓扑与恢复 ADR](../../adr/0028-agent-vm-topology-recovery-boundary.md)和 `bin/test_agent_vm_documentation.py`。
+- `VER-AGENT-VM-011` 覆盖：`REQ-AGENT-VM-011` 通过[操作运行手册](OPERATIONS.md)的恢复流程、现有原生状态核对与操作日志行为测试，以及 `bin/test_agent_vm_documentation.py`。
+- `VER-AGENT-VM-012` 覆盖：`REQ-AGENT-VM-012` 通过[操作运行手册](OPERATIONS.md)的稀疏磁盘和故障域章节、现有容量与回收测试，以及 `bin/test_agent_vm_documentation.py`。
+- `VER-AGENT-VM-013` 覆盖：`REQ-AGENT-VM-013` 通过[观测合同](contracts/observability.md)、[容量与故障看板方案](../../solutions/agent-vm/observability-dashboard.md)和 `bin/test_agent_vm_documentation.py`。
 - `VER-AGENT-VM-014` 覆盖：`REQ-AGENT-VM-014` 通过[控制面更新 ADR](../../adr/0030-agent-vm-control-plane-update-boundary.md)、[CLI 合同](contracts/cli.md)、[部署边界](../../../skills/agent-vm-ops/references/deployment.md)和公共边界检查。
-- `VER-AGENT-VM-015` 覆盖：`REQ-AGENT-VM-015` 通过[CLI 合同](contracts/cli.md)的兼容性章节、[发布合同](contracts/release.md)、[部署边界](../../../skills/agent-vm-ops/references/deployment.md)中的 release-manifest 规则，以及对支持和拒绝 operation 的兼容行为测试。
-- `VER-AGENT-VM-016` 覆盖：`REQ-AGENT-VM-016` 通过[发布合同](contracts/release.md)、[操作运行手册](OPERATIONS.md)的 publication transaction 和 recovery 章节、[控制面更新 ADR](../../adr/0030-agent-vm-control-plane-update-boundary.md)，以及 staged activation、drain、rollback、immutable published-release verification 和 failure-state behavior test。
-- `VER-AGENT-VM-017` 覆盖：`REQ-AGENT-VM-017` 通过[发布合同](contracts/release.md)、[部署边界](../../../skills/agent-vm-ops/references/deployment.md)、[agent-vm-ops Skill](../../../skills/agent-vm-ops/SKILL.md)、公共边界检查和 release manifest permission test。
-- `VER-AGENT-VM-018` 覆盖：`REQ-AGENT-VM-018` 通过[操作运行手册](OPERATIONS.md)的 CPU startup-pressure 章节、[CLI 合同](contracts/cli.md)、[观测合同](contracts/observability.md)和确定性的 CPU pressure admission test。
-- `VER-AGENT-VM-019` 覆盖：`REQ-AGENT-VM-019` 通过[观测合同](contracts/observability.md)的 capacity 和 inventory 章节、[容量与 inventory 观测 ADR](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)、[dashboard 方案](../../solutions/agent-vm/observability-dashboard.md)和公共 dashboard validator。
-- `VER-AGENT-VM-020` 覆盖：`REQ-AGENT-VM-020` 通过[管理合同](contracts/management-api.md)、[统一服务安全 ADR](../../adr/0043-agent-vm-unified-service-security-boundary.md)、fixed-route、static-entry/API separation、service-boundary、configuration check，以及当前统一服务的浏览器/API boundary tests。
-- `VER-AGENT-VM-021` 覆盖：`REQ-AGENT-VM-021` 通过[OpenAPI 合同](contracts/management-api.yaml)、其共享示例、已同步实现状态的[PRODUCT.md](../../../PRODUCT.md)、[统一服务安全 ADR](../../adr/0043-agent-vm-unified-service-security-boundary.md)、[DESIGN.md](../../../DESIGN.md)，以及 `bun run typecheck`、`bun run test:web` 和 `bun run test:e2e:auth` 对未认证、登录失败、已认证和 session 过期 UI state 的双语/API 合同检查。
-- `VER-AGENT-VM-022` 覆盖：`REQ-AGENT-VM-022` 通过[管理合同](contracts/management-api.md)、OpenAPI operation/error schema、operation recovery、audit check，以及当前 OIDC、管理员 capability 和机器 Token behavior tests。
-- `VER-AGENT-VM-023` 覆盖：`REQ-AGENT-VM-023` 通过[管理合同](contracts/management-api.md)、[session-pinned image ADR](../../adr/0041-agent-vm-session-pinned-image-identity.md)、CLI 合同和 image-reference concurrency check。
-- `VER-AGENT-VM-024` 覆盖：`REQ-AGENT-VM-024` 通过[管理合同](contracts/management-api.md)、[发布合同](contracts/release.md)、[CLI 合同](contracts/cli.md)，以及 migration 和 package-compatibility check。
-- `VER-AGENT-VM-025` 覆盖：`REQ-AGENT-VM-025` 通过[管理合同](contracts/management-api.md)的 OIDC 与 principal 章节、[统一服务安全 ADR](../../adr/0043-agent-vm-unified-service-security-boundary.md)，以及 webadmin OIDC/session tests、state OIDC transaction tests 和 `bun run test:e2e:auth` 对 `return_to` allowlist、一次性 companion state、安全失败回跳、browser binding、session establishment、layout-effect-bound live-session suspension race 和 SPA session-loss recovery 的验证。
-- `VER-AGENT-VM-026` 覆盖：`REQ-AGENT-VM-026` 通过[Token API 合同](contracts/token-api.md)、[Agent API 合同](contracts/agent-api.md)、OpenAPI Token path、Agent API boundary checks 和 protocol-4 request tests。
-- `VER-AGENT-VM-027` 覆盖：`REQ-AGENT-VM-027` 通过[管理合同](contracts/management-api.md)的敏感操作与审计章节、OpenAPI confirmation/error schema、administrator authorization tests、audit tests 和 operation recovery checks。
-- `VER-AGENT-VM-028` 覆盖：`REQ-AGENT-VM-028` 通过[状态迁移 ADR](../../adr/0044-agent-vm-state-migration-to-rqlite.md)、[管理合同](contracts/management-api.md)与[发布合同](contracts/release.md)的迁移章节，以及 `go test -race ./internal/state` 对 companion-table ordering、local/remote schema bootstrap、并发 consume、重启恢复和既有 operation ID 语义的验证。其余发布阶段门禁仍按发布合同执行。
-- `VER-AGENT-VM-029` 覆盖：`REQ-AGENT-VM-029` 通过[系统架构](../../architecture/system.md)的蓝绿章节、[发布合同](contracts/release.md)，以及 active-link、compatibility-window 和 rollback check。该项属于计划目标验证，在目标面和测试存在前保持 pending。
+- `VER-AGENT-VM-015` 覆盖：`REQ-AGENT-VM-015` 通过[CLI 合同](contracts/cli.md)的兼容性章节、[发布合同](contracts/release.md)、[部署边界](../../../skills/agent-vm-ops/references/deployment.md)中的发布清单规则，以及对支持和拒绝操作的兼容行为测试。
+- `VER-AGENT-VM-016` 覆盖：`REQ-AGENT-VM-016` 通过[发布合同](contracts/release.md)、[操作运行手册](OPERATIONS.md)的发布事务和恢复章节、[控制面更新 ADR](../../adr/0030-agent-vm-control-plane-update-boundary.md)，以及暂存激活、排空、回滚、已发布产物不可变验证和失败状态行为测试。
+- `VER-AGENT-VM-017` 覆盖：`REQ-AGENT-VM-017` 通过[发布合同](contracts/release.md)、[部署边界](../../../skills/agent-vm-ops/references/deployment.md)、[agent-vm-ops Skill](../../../skills/agent-vm-ops/SKILL.md)、公共边界检查和发布清单权限测试。
+- `VER-AGENT-VM-018` 覆盖：`REQ-AGENT-VM-018` 通过[操作运行手册](OPERATIONS.md)的 CPU 启动压力章节、[CLI 合同](contracts/cli.md)、[观测合同](contracts/observability.md)和确定性的 CPU 压力准入测试。
+- `VER-AGENT-VM-019` 覆盖：`REQ-AGENT-VM-019` 通过[观测合同](contracts/observability.md)的容量和清单章节、[容量与清单观测 ADR](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)、[看板方案](../../solutions/agent-vm/observability-dashboard.md)和公共看板验证器。
+- `VER-AGENT-VM-020` 覆盖：`REQ-AGENT-VM-020` 通过[管理合同](contracts/management-api.md)、[统一服务安全 ADR](../../adr/0043-agent-vm-unified-service-security-boundary.md)、固定路由、静态入口与 API 隔离、服务边界、配置检查，以及当前统一服务的浏览器/API 边界测试。
+- `VER-AGENT-VM-021` 覆盖：`REQ-AGENT-VM-021` 通过[OpenAPI 合同](contracts/management-api.yaml)、其共享示例、已同步实现状态的[PRODUCT.md](../../../PRODUCT.md)、[统一服务安全 ADR](../../adr/0043-agent-vm-unified-service-security-boundary.md)、[DESIGN.md](../../../DESIGN.md)，以及 `bun run typecheck`、`bun run test:web` 和 `bun run test:e2e:auth` 对未认证、登录失败、已认证和会话过期界面状态的双语/API 合同检查。
+- `VER-AGENT-VM-022` 覆盖：`REQ-AGENT-VM-022` 通过[管理合同](contracts/management-api.md)、OpenAPI 操作与错误结构、操作恢复、审计检查，以及当前 OIDC、管理员能力和机器 Token 行为测试。
+- `VER-AGENT-VM-023` 覆盖：`REQ-AGENT-VM-023` 通过[管理合同](contracts/management-api.md)、[会话固定镜像 ADR](../../adr/0041-agent-vm-session-pinned-image-identity.md)、CLI 合同和镜像引用并发检查。
+- `VER-AGENT-VM-024` 覆盖：`REQ-AGENT-VM-024` 通过[管理合同](contracts/management-api.md)、[发布合同](contracts/release.md)、[CLI 合同](contracts/cli.md)，以及迁移和包兼容性检查。
+- `VER-AGENT-VM-025` 覆盖：`REQ-AGENT-VM-025` 通过[管理合同](contracts/management-api.md)的 OIDC 与主体章节、[统一服务安全 ADR](../../adr/0043-agent-vm-unified-service-security-boundary.md)，以及管理服务 OIDC 与会话测试、状态层 OIDC 事务测试和 `bun run test:e2e:auth` 对 `return_to` 白名单、一次性关联状态、安全失败回跳、浏览器绑定、会话建立、布局副作用中活动会话暂停的并发竞争和 SPA 会话失效恢复的验证。
+- `VER-AGENT-VM-026` 覆盖：`REQ-AGENT-VM-026` 通过[Token API 合同](contracts/token-api.md)、[Agent API 合同](contracts/agent-api.md)、OpenAPI Token 路径、Agent API 边界检查和协议 4 请求测试。
+- `VER-AGENT-VM-027` 覆盖：`REQ-AGENT-VM-027` 通过[管理合同](contracts/management-api.md)的敏感操作与审计章节、OpenAPI 确认与错误结构、管理员授权测试、审计测试和操作恢复检查。
+- `VER-AGENT-VM-028` 覆盖：`REQ-AGENT-VM-028` 通过[状态迁移 ADR](../../adr/0044-agent-vm-state-migration-to-rqlite.md)、[管理合同](contracts/management-api.md)与[发布合同](contracts/release.md)的迁移章节，以及 `go test -race ./internal/state` 对关联表排序、本地与远程状态结构初始化、并发消费、重启恢复和既有操作 ID 语义的验证。其余发布阶段门禁仍按发布合同执行。
+- `VER-AGENT-VM-029` 覆盖：`REQ-AGENT-VM-029` 通过[系统架构](../../architecture/system.md)的蓝绿章节、[发布合同](contracts/release.md)，以及活动链接、兼容窗口和回滚检查。该项属于计划目标验证，在目标面和测试存在前保持待完成。
 
-- `VER-AGENT-VM-030` 覆盖：`REQ-AGENT-VM-030` 通过[Web Demo 决策备忘录](../../proposals/agent-vm-web-demo.md)、[Web Demo Inspector UX/UI 合同](contracts/web-demo-inspector.md)、Demo runtime/API isolation test、页面级 browser suite、static build 和现有 management API boundary check。
+- `VER-AGENT-VM-030` 覆盖：`REQ-AGENT-VM-030` 通过[Web Demo 决策备忘录](../../proposals/agent-vm-web-demo.md)、[Web Demo 检查面板交互合同](contracts/web-demo-inspector.md)、演示运行时与 API 隔离测试、页面级浏览器测试集、静态构建和现有管理 API 边界检查。
 - `VER-AGENT-VM-031` 覆盖：`REQ-AGENT-VM-031` 通过[部署控制器合同](contracts/deployment-controller.md)、[发布合同中的部署控制器章节](contracts/release.md#deployment-controller-boundary)、[部署观测合同](contracts/observability.md#deployment-control-observation)、[蓝绿部署资源](../../deployment/blue-green.md)以及隔离的 Go/systemd/双槽位事务和恢复检查。
 
- 验证映射的机器可读形式使用 ASCII 冒号，以保持仓库检查工具兼容：
+验证映射的机器可读形式使用 ASCII 冒号，以保持仓库检查工具兼容：
 
 - `VER-AGENT-VM-010` 覆盖: `REQ-AGENT-VM-010`
 - `VER-AGENT-VM-011` 覆盖: `REQ-AGENT-VM-011`
@@ -240,42 +247,41 @@ TypeScript/Bun synchronization helper 将 tracked、unignored worktree files 传
 - `VER-AGENT-VM-028` 覆盖: `REQ-AGENT-VM-028`
 - `VER-AGENT-VM-029` 覆盖: `REQ-AGENT-VM-029`
 - `VER-AGENT-VM-030` 覆盖: `REQ-AGENT-VM-030`
-- `VER-AGENT-VM-031` covers: `REQ-AGENT-VM-031`
+- `VER-AGENT-VM-031` 覆盖: `REQ-AGENT-VM-031`
 - `VER-AGENT-VM-032` 覆盖: `REQ-AGENT-VM-032`，通过部署资料唯一来源与路径引用检查、发布包布局兼容检查、示例配置与文档链接校验，以及隔离 Incus/systemd 环境中的全新安装、蓝绿升级、有限回滚、失败恢复和 Prometheus/Grafana 接入验收；隔离验收必须确认有效租约与用户 VM 不被强制中断，缺失观测和不确定结果保持明确失败。
 
 ## 视觉证据
 
-管理台 Web 界面已通过本地 `ui_demo` source 取得 visual evidence。 Captures 使用 mock data，不包含 backend、login、credentials 或 live deployment。 它们覆盖 Token management、pending revocation-preview recovery，以及 Token creation、confirmation dialogs 和 image import 中的 512-character reason limit。 Reason-limit captures 表明 overlong input 仍可编辑，直到修正前 submission 保持 disabled。 Pending-preview capture 延迟 mock response，以展示 recovery controls。 Mobile captures 使用 `393x852` CSS-pixel viewport； desktop capture 展示完整的 rendered page surface。
+管理台 Web 界面已通过本地 `ui_demo` 取得视觉证据。截图使用模拟数据，不包含真实后端、登录、凭据或线上部署。覆盖 Token 管理、待完成撤销预览的恢复，以及 Token 创建、确认对话框和镜像导入中 512 字符原因上限。原因超限时输入仍可编辑，修正前提交保持禁用。待完成预览截图通过延迟模拟响应展示恢复控件。移动端使用 `393x852` CSS 像素视口，桌面端展示完整渲染页面。
 
-- [桌面 System 页面](assets/agent-vm-web-system-desktop.png)
-- [移动端 System 页面](assets/agent-vm-web-system-mobile-list.png)
+- [桌面系统页面](assets/agent-vm-web-system-desktop.png)
+- [移动端系统页面](assets/agent-vm-web-system-mobile-list.png)
 - [移动端撤销预览对话框](assets/agent-vm-web-system-mobile-revoke-dialog.png)
-- [移动端 pending 撤销预览](assets/agent-vm-web-system-mobile-preview-pending.png)
-- [移动端确认 reason limit](assets/agent-vm-web-system-mobile-dialog-reason-limit.png)
-- [移动端 Token 创建 reason limit](assets/agent-vm-web-system-mobile-create-reason-limit.png)
-- [移动端镜像导入 reason limit](assets/agent-vm-web-images-mobile-import-reason-limit.png)
+- [移动端待完成撤销预览](assets/agent-vm-web-system-mobile-preview-pending.png)
+- [移动端确认原因长度上限](assets/agent-vm-web-system-mobile-dialog-reason-limit.png)
+- [移动端 Token 创建原因长度上限](assets/agent-vm-web-system-mobile-create-reason-limit.png)
+- [移动端镜像导入原因长度上限](assets/agent-vm-web-images-mobile-import-reason-limit.png)
 - [桌面端公开主页](assets/agent-vm-public-home-desktop.png)
 - [移动端公开主页](assets/agent-vm-public-home-mobile.png)
-- [桌面端 session loss 独立认证错误页](assets/agent-vm-auth-expired-desktop.png)
-- [移动端 session loss 独立认证错误页](assets/agent-vm-auth-expired-mobile.png)
-
+- [桌面端会话失效独立认证错误页](assets/agent-vm-auth-expired-desktop.png)
+- [移动端会话失效独立认证错误页](assets/agent-vm-auth-expired-mobile.png)
 
 - [Web Demo 容量场景，桌面端](assets/web-demo-capacity-desktop.png)
 - [Web Demo 空场景，移动端 393×852 CSS px](assets/web-demo-empty-mobile.png)
-- [带面板级拖动手柄的 Web Demo 浮动 Inspector](assets/web-demo-inspector-panel-handle.png)
+- [带面板级拖动手柄的 Web Demo 浮动检查面板](assets/web-demo-inspector-panel-handle.png)
 
-这里的 owner confirmation 只适用于此处展示的渲染 UI，不代表端到端 backend integration 或 deployment readiness。 Owner confirmation 仅适用于此处展示的 rendered UI，不表示 end-to-end backend integration 或 deployment readiness 已得到确认。
+此处用户确认仅认可已展示的界面渲染，不代表端到端后端集成或部署就绪已经通过验证。
 
 ## Related ADRs
 
 - [Agent VM 拓扑与恢复边界](../../adr/0028-agent-vm-topology-recovery-boundary.md)
-- [Agent VM 仅按内存 reservation admission](../../adr/0029-agent-vm-memory-reservation-only-admission.md)
+- [Agent VM 仅按内存预留准入](../../adr/0029-agent-vm-memory-reservation-only-admission.md)
 - [Agent VM 控制面更新边界](../../adr/0030-agent-vm-control-plane-update-boundary.md)
-- [Agent VM overcommit 的 CPU 启动压力](../../adr/0032-agent-vm-cpu-startup-pressure-for-overcommit.md)
-- [Agent VM 容量与 inventory 观测](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)
+- [Agent VM 超售的 CPU 启动压力](../../adr/0032-agent-vm-cpu-startup-pressure-for-overcommit.md)
+- [Agent VM 容量与清单观测](../../adr/0033-agent-vm-capacity-and-inventory-observability.md)
 - [Agent VM Go 常驻控制运行时](../../adr/0037-agent-vm-go-control-runtime.md)
 - [原生 Incus Agent 容器生命周期](../../adr/0038-native-incus-agent-container-lifecycle.md)
-- [Agent VM session-pinned image identity](../../adr/0041-agent-vm-session-pinned-image-identity.md)
+- [Agent VM 会话固定镜像身份](../../adr/0041-agent-vm-session-pinned-image-identity.md)
 - [Agent VM 统一服务安全边界](../../adr/0043-agent-vm-unified-service-security-boundary.md)
 - [Agent VM SQLite 到 rqlite 状态迁移](../../adr/0044-agent-vm-state-migration-to-rqlite.md)
 - [Deployd 与蓝绿事务](../../adr/0045-agent-vm-deployment-controller.md)
@@ -288,7 +294,7 @@ TypeScript/Bun synchronization helper 将 tracked、unignored worktree files 传
 - [管理实现合同](contracts/management-api.md)
 - [Token API](contracts/token-api.md)
 - [Agent API](contracts/agent-api.md)
-- [Web Demo Inspector UX/UI 合同](contracts/web-demo-inspector.md)
+- [Web Demo 检查面板交互合同](contracts/web-demo-inspector.md)
 - [回收设计](RECLAMATION-DESIGN.md)
 - [保留设计](RETENTION-DESIGN.md)
 - [观测合同](contracts/observability.md)

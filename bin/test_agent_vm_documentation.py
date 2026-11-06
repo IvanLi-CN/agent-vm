@@ -235,9 +235,9 @@ class AgentVmDocumentationTests(unittest.TestCase):
         solution = OBSERVABILITY_SOLUTION.read_text(encoding="utf-8")
         for phrases in (
             ("independent observation lanes", "独立观测 lane", "独立观测通道"),
-            ("pending or failed inventory read", "Inventory read pending 或失败"),
-            ("latest valid capacity metric families", "最近有效的 capacity metric family"),
-            ("retained source snapshot", "保留的 source snapshot"),
+            ("pending or failed inventory read", "Inventory read pending 或失败", "待完成或失败的清单读取"),
+            ("latest valid capacity metric families", "最近有效的 capacity metric family", "最近有效的容量指标族"),
+            ("retained source snapshot", "保留的 source snapshot", "保留的来源快照"),
             ("original observation timestamp", "原始观测时间戳"),
         ):
             self.assertTrue(any(phrase in spec for phrase in phrases), phrases)
