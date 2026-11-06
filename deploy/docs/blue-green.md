@@ -161,3 +161,5 @@ AGENT_VM_REAL_SYSTEMD=1 bash deploy/scripts/agent_vm_deployment_acceptance.sh
 真实 Agent VM 验收还必须启动真实 `agent-vm-control` 槽位进程，复验 PID、启动令牌、scheduler fencing、active switch、旧槽位 quiescence、Deployd 重启恢复和 Prometheus 指标；静态检查不能替代这些运行证据。
 
 蓝绿校验使用去除凭据后计算的 `state_authority` 后端配置指纹和 `state_capabilities`，并在激活、恢复及回滚时复核。`state_epoch` 随业务写入和维护游标变化，仅用于单次快照一致性及诊断，不能要求两个槽位在不同采样时刻的值相等。配置指纹不能证明后端数据库未被替换；正常蓝绿流程禁止恢复、替换或重建业务数据库，也不会执行此类操作。缺少新验证证据的旧部署事务保持拒绝，不根据旧 epoch 猜测后端身份。
+
+普通维护采集业务快照期间，Deployd 通过独立角色通道续租已在当前进程内绑定的同一份有效 controller lease；每次核验 active 链接、systemd 进程身份和另一槽位无 controller。它不从持久化快照重新授予租约，不改变租约身份，不延长业务观测的新鲜期；业务探测失败仍关闭流量准入。`status` 等只读请求不触发续租。角色通道失败、进程变化或租约过期仍立即 fencing。

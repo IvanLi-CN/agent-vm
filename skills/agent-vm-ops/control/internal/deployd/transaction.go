@@ -715,6 +715,22 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 	if manager.startupFenced {
 		return manager.fenceSlots(ctx, errors.New("deployd startup recovery is unresolved"))
 	}
+	waiting, policyErr := manager.Store.ListActive(ctx)
+	if policyErr != nil {
+		return manager.fenceSlots(ctx, errors.New("deployment transaction state could not be read before renewal"))
+	}
+	policy := controllerMaintenancePolicy{}
+	if len(waiting) > 0 {
+		if len(waiting) != 1 {
+			return manager.fenceSlots(ctx, errors.New("multiple active transactions cannot retain controller"))
+		}
+		transaction := waiting[0]
+		if transaction.State != "active" || transaction.RecoveryRequired || (transaction.Phase != PhaseStandbyValidation && transaction.Phase != PhaseControllerHandoff) || transaction.PreviousSlot == "" || transaction.PreviousSlot == "none" || transaction.TargetSlot == transaction.PreviousSlot {
+			return manager.fenceSlots(ctx, errors.New("deployment transaction cannot retain controller before observation"))
+		}
+		policy.Slot = transaction.PreviousSlot
+	}
+	ctx = context.WithValue(ctx, controllerMaintenanceKey{}, policy)
 	observation, err := manager.observe(ctx, "")
 	if err != nil {
 		return manager.fenceSlots(ctx, errors.New("slot observation could not be persisted; controller roles were fenced"))
@@ -745,6 +761,10 @@ func (manager *Manager) MaintainController(ctx context.Context) error {
 			retryLease = &original
 		}
 		observation, err = manager.observe(ctx, "")
+		if current := observation.Slots[observation.ActiveSlot].ControllerLease; current != nil && sameLeaseAuthority(*current, *retryLease) && !current.Expiry.Before(retryLease.Expiry) {
+			updated := *current
+			retryLease = &updated
+		}
 		if err != nil {
 			return manager.fenceSlots(ctx, errors.New("slot observation retry could not be persisted; controller roles were fenced"))
 		}
@@ -924,9 +944,9 @@ func (manager *Manager) fenceSlots(ctx context.Context, cause error) error {
 }
 
 func (manager *Manager) observe(ctx context.Context, transactionID string) (RuntimeSnapshot, error) {
-	observation, err := manager.Runtime.Observe(ctx)
+	observation, err := manager.observeRuntime(ctx)
 	for attempt := 1; transactionID != "" && err == nil && !observation.Consistent && attempt < 3; attempt++ {
-		observation, err = manager.Runtime.Observe(ctx)
+		observation, err = manager.observeRuntime(ctx)
 	}
 	if err != nil {
 		return RuntimeSnapshot{}, err
