@@ -5903,7 +5903,7 @@ func (guest *quiescentStartupGuest) VerifyRecoveryQuiescence(context.Context) er
 }
 
 func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
-	for _, action := range []string{"acquire", "resize", "restart"} {
+	for _, action := range []string{"acquire", "renew", "resize", "restart"} {
 		t.Run(action, func(t *testing.T) {
 			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 			if err != nil {
@@ -5927,11 +5927,19 @@ func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
 				t.Fatal(err)
 			}
 			worker := map[string]any{"state": "finished", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "finished_at": nowString(time.Now())}
-			if err := store.RecordOperation(ctx, "original", action, &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest, "worker": worker}); err != nil {
+			originalResponse := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest}
+			if action != "renew" {
+				originalResponse["worker"] = worker
+			}
+			if err := store.RecordOperation(ctx, "original", action, &session, &generation, originalResponse); err != nil {
 				t.Fatal(err)
 			}
 			laterAction, laterGeneration := "release", taskGeneration
 			result := map[string]any{"task_id": task.TaskID, "session_id": session, "generation": taskGeneration, "state": stateCached, "effective_lease": false}
+			if action == "renew" {
+				laterAction = "renew"
+				result["state"], result["effective_lease"] = stateActive, true
+			}
 			if action == "acquire" {
 				laterAction, laterGeneration = "acquire", int64(2)
 				result["state"], result["effective_lease"] = stateActive, true
@@ -5952,7 +5960,7 @@ func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
 				t.Fatalf("startup: %v", err)
 			}
 			original, err := store.GetOperation(ctx, "original")
-			if err != nil || original == nil || original.Response["outcome"] != "error" || original.Response["_request"] == nil || original.Response["worker"] == nil {
+			if err != nil || original == nil || original.Response["outcome"] != "error" || original.Response["_request"] == nil || (action != "renew" && original.Response["worker"] == nil) {
 				t.Fatalf("original = %#v, error = %v", original, err)
 			}
 			_, err = service.replayRecord(req, original)
@@ -5972,6 +5980,38 @@ func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
 				t.Fatalf("historical unknown operations = %#v", metrics["historical_unknown_operations"])
 			}
 		})
+	}
+}
+
+func TestPendingRenewWithoutLaterLeaseEvidenceRemainsBlocked(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session, generation := "pending-renew-without-witness", int64(1)
+	now := nowString(time.Now())
+	task := state.Task{TaskID: "pending-renew-task", SessionID: session, Generation: generation, State: stateCached, InstanceName: "pending-renew-instance", CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+	if err := store.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	req := protocol.Request{"protocol": protocol.Version, "action": "renew", "session_id": session, "generation": generation, "operation_id": "pending-renew"}
+	digest, err := protocol.Digest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOperation(ctx, "pending-renew", "renew", &session, &generation, map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest}); err != nil {
+		t.Fatal(err)
+	}
+	guest := &quiescentStartupGuest{startupGuest: &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": fmt.Sprint(generation)}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}}
+	service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+	if err := service.StartupReconcile(ctx); protocol.AsError(err).Code != "startup_reconcile_required" {
+		t.Fatalf("startup error = %#v", err)
+	}
+	operation, err := store.GetOperation(ctx, "pending-renew")
+	if err != nil || operation == nil || operation.Response["outcome"] != "pending" {
+		t.Fatalf("operation = %#v, error = %v", operation, err)
 	}
 }
 
