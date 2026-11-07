@@ -133,8 +133,13 @@ func IsNotFound(err error, instance, project string) bool {
 	if instance == "" || project == "" {
 		return false
 	}
-	contextual := fmt.Sprintf("error: failed to fetch instance %q in projectname %q: instance not found", instance, project)
-	return diagnostic == strings.ToLower(contextual)
+	for _, label := range []string{"project", "projectname"} {
+		contextual := fmt.Sprintf("error: failed to fetch instance %q in %s %q: instance not found", instance, label, project)
+		if diagnostic == strings.ToLower(contextual) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsImageNotFound is the image-specific counterpart used by idempotent
