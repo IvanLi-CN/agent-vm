@@ -266,6 +266,9 @@ TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输
 - [桌面端会话失效独立认证错误页](assets/agent-vm-auth-expired-desktop.png)
 - [移动端会话失效独立认证错误页](assets/agent-vm-auth-expired-mobile.png)
 
+- [部署容量看板](assets/deployment-capacity.png)
+- [部署清单与操作看板](assets/deployment-inventory.png)
+- [Deployd 双槽位看板](assets/deployment-deployd.png)
 - [Web Demo 容量场景，桌面端](assets/web-demo-capacity-desktop.png)
 - [Web Demo 空场景，移动端 393×852 CSS px](assets/web-demo-empty-mobile.png)
 - [带面板级拖动手柄的 Web Demo 浮动检查面板](assets/web-demo-inspector-panel-handle.png)
