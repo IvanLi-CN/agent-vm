@@ -1986,13 +1986,19 @@ func supersedableOperation(action string) bool {
 // completion callback could not persist finished_at. All identity, liveness,
 // cached-state, later-witness and native quiescence checks still apply.
 func workerExitTime(worker map[string]any) string {
-	if finished := stringValue(worker["finished_at"]); finished != "" {
-		return finished
+	value, hasCompletion := worker["finished_at"]
+	if !hasCompletion {
+		if stringValue(worker["state"]) != "exited" {
+			return ""
+		}
+		value = worker["observed_at"]
 	}
-	if stringValue(worker["state"]) == "exited" {
-		return stringValue(worker["observed_at"])
+	stamp := stringValue(value)
+	exit, err := time.Parse(time.RFC3339Nano, stamp)
+	if err != nil || exit.After(time.Now()) {
+		return ""
 	}
-	return ""
+	return stamp
 }
 
 func supersedingOperationMatches(original, completed state.Operation, task *state.Task) bool {

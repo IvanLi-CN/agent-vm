@@ -101,3 +101,51 @@ func TestSnapshotBindsConsumedInputsDespiteOriginalReplacement(t *testing.T) {
 		t.Fatal("replacement symlink accepted on retry")
 	}
 }
+
+func TestSnapshotAcceptsEmptyOptionalMetricsInputs(t *testing.T) {
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{SchemaVersion: 1, Files: map[string]string{}}
+	for name := range targets {
+		if len(name) >= 8 && name[:8] == "metrics_" {
+			cfg.Files[name] = ""
+			continue
+		}
+		p := filepath.Join(root, name)
+		if err := os.WriteFile(p, []byte(name), 0600); err != nil {
+			t.Fatal(err)
+		}
+		cfg.Files[name] = p
+	}
+	input := Inputs{Config: filepath.Join(root, "install.json"), Bundle: filepath.Join(root, "product.tar"), Materials: filepath.Join(root, "materials")}
+	data, _ := json.Marshal(cfg)
+	if err := os.WriteFile(input.Config, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadConfig(input.Config); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(input.Bundle, []byte("product"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(input.Materials, 0700); err != nil {
+		t.Fatal(err)
+	}
+	snap, cleanup, err := snapshotInputs(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	captured, err := LoadConfig(snap.Config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(captured.Files) != len(targets)-3 {
+		t.Fatal("empty optional inputs were not normalized to omission")
+	}
+	if _, err := inputDigest(captured); err != nil {
+		t.Fatal(err)
+	}
+}

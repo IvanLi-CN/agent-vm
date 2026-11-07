@@ -28,6 +28,13 @@ func snapshotInputs(input Inputs) (Inputs, func(), error) {
 		return fail(err)
 	}
 	for name, source := range cfg.Files {
+		// LoadConfig already proved that only optional metrics may be empty.
+		// Normalize their accepted empty representation to omission before
+		// copying or hashing protected input bytes.
+		if source == "" {
+			delete(cfg.Files, name)
+			continue
+		}
 		data, err := protectedRead(source)
 		if err != nil {
 			return fail(err)

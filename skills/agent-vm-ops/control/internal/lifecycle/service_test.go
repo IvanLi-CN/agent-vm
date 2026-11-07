@@ -6287,6 +6287,33 @@ func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
 	}
 }
 
+func TestWorkerExitTimeRejectsMalformedCompletionField(t *testing.T) {
+	for _, value := range []any{nil, 123, "", "invalid"} {
+		worker := map[string]any{"state": "exited", "finished_at": value, "observed_at": nowString(time.Now().Add(-time.Minute))}
+		if got := workerExitTime(worker); got != "" {
+			t.Fatalf("malformed completion %v accepted: %s", value, got)
+		}
+	}
+}
+
+func TestSupersedingWitnessCannotValidateFutureExitObservation(t *testing.T) {
+	now := time.Now()
+	session, generation := "future-exit", int64(1)
+	task := &state.Task{TaskID: "task", SessionID: session, Generation: generation}
+	original := state.Operation{Generation: &generation, CreatedAt: nowString(now.Add(-time.Hour)), Response: map[string]any{"worker": map[string]any{"state": "exited", "observed_at": nowString(now.Add(time.Hour))}}}
+	req := protocol.Request{"protocol": protocol.Version, "action": "release", "session_id": session, "generation": generation, "operation_id": "witness"}
+	response := protocol.SuccessWithRelease(req, map[string]any{"task_id": task.TaskID, "session_id": session, "generation": generation, "state": stateCached, "effective_lease": false}, nil, nil)
+	digest, err := protocol.Digest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response["_request_digest"] = digest
+	witness := state.Operation{OperationID: "witness", Action: "release", SessionID: &session, Generation: &generation, CreatedAt: nowString(now.Add(2 * time.Hour)), Response: response}
+	if supersedingOperationMatches(original, witness, task) {
+		t.Fatal("future witness accepted future exit observation")
+	}
+}
+
 type quiescentDestroyRecoveryGuest struct {
 	*quiescentStartupGuest
 	deleted         bool
