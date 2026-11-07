@@ -724,6 +724,36 @@ func TestWaitForGuestReadyPollsUntilIPv4IsVisible(t *testing.T) {
 	}
 }
 
+func TestGuestIPv4UsesOnlyManagedInterface(t *testing.T) {
+	iface := func(address string) map[string]any {
+		return map[string]any{"addresses": []any{map[string]any{"family": "inet", "address": address}}}
+	}
+	value := map[string]any{"network": map[string]any{"docker0": iface("172.17.0.1"), "eth1": iface("192.0.2.10"), "eth0": iface("10.250.19.20")}}
+	for i := 0; i < 1000; i++ {
+		if got := guestIPv4(value); got != "10.250.19.20" {
+			t.Fatalf("unmanaged address selected: %s", got)
+		}
+	}
+	delete(value["network"].(map[string]any), "eth0")
+	if got := guestIPv4(value); got != "" {
+		t.Fatalf("unmanaged address used without eth0: %s", got)
+	}
+}
+
+func TestWaitForGuestReadyIgnoresDockerBridgeBeforeManagedIPv4(t *testing.T) {
+	bridge := map[string]any{"addresses": []any{map[string]any{"family": "inet", "address": "172.17.0.1"}}}
+	guest := &startupGuest{statuses: []map[string]any{
+		{"status": "Running", "network": map[string]any{"docker0": bridge}},
+		{"status": "Running", "network": map[string]any{"docker0": bridge, "eth0": map[string]any{"addresses": []any{map[string]any{"family": "inet", "address": "10.250.19.20"}}}}},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ip, err := waitForGuestReady(ctx, guest, "agent-ready")
+	if err != nil || ip != "10.250.19.20" || guest.statusCalls != 2 {
+		t.Fatalf("ip=%q calls=%d err=%v", ip, guest.statusCalls, err)
+	}
+}
+
 func TestConfigureNetworkMatchesManagedContainerContract(t *testing.T) {
 	guest := &startupGuest{config: map[string]any{"expanded_devices": map[string]any{
 		"eth0": map[string]any{

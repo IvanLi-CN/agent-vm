@@ -5013,23 +5013,23 @@ func guestIPv4(value map[string]any) string {
 	if !ok {
 		return ""
 	}
-	for _, rawInterface := range network {
-		iface, ok := rawInterface.(map[string]any)
-		if !ok {
+	// Incus configures the fixed address on eth0. Other interfaces (notably
+	// docker0) can be ready earlier and must never satisfy guest readiness.
+	iface, ok := network["eth0"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	addresses, ok := iface["addresses"].([]any)
+	if !ok {
+		return ""
+	}
+	for _, rawAddress := range addresses {
+		address, ok := rawAddress.(map[string]any)
+		if !ok || address["family"] != "inet" {
 			continue
 		}
-		addresses, ok := iface["addresses"].([]any)
-		if !ok {
-			continue
-		}
-		for _, rawAddress := range addresses {
-			address, ok := rawAddress.(map[string]any)
-			if !ok || address["family"] != "inet" {
-				continue
-			}
-			if value, ok := address["address"].(string); ok && value != "" && value != "127.0.0.1" {
-				return value
-			}
+		if value, ok := address["address"].(string); ok && value != "" && value != "127.0.0.1" {
+			return value
 		}
 	}
 	return ""
