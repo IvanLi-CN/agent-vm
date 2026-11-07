@@ -67,6 +67,8 @@ CLI 不接收 rqlite 地址、数据库路径、SQL 或凭据，也不绕过 Dep
 
 Apply 与全局维护共享 process-independent maintenance fence，并在精确 session lock 内重新检查 generation/deadline/ownership。它先保存不可变的原始 worker/request evidence，再通过既有 worker reconciliation 和 expiry-release 路径移除目标 mappings、停止过期 container、保留同 generation cache，最后将指定 acquire 标记为 `lease_released`。Cleanup 不确定时保留 pending journal 和恢复证据，不宣告成功。重复同 operation ID 使用既有 journal replay；不同 target 或 generation 不得复用该 intent。
 
+Apply 的 ownership preflight 只发送固定的 Incus GET query；它保留取消和 process-tree tracking，但不得占用或替换 mutation worker identity。后续 mapping removal 和 stop 仍必须通过原有 worker journal 与启动围栏。新 intent 仅接受 active、preparing 或 closing 目标；已缓存目标和未确认的 cleanup 结果不得伪装成此次恢复成功。
+
 该 action 不访问全局 pending recovery 列表、不推进维护 cursor、不唤醒全局 scheduler，也不取消其他 acquire。它不会自动部署自身；控制器升级的 startup reconciliation 仍是独立的全局行为，必须单独核对部署授权范围。
 
 `agent-vm-deploy migrate` 是首次部署专用的自动迁移入口。

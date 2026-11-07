@@ -153,6 +153,7 @@ Container rootfs growth 是独立的 post-check：它根据 requested allocation
 
 精确过期恢复使用独立 `admin-reconcile-session` action，绑定 session、task、generation 和单个 pending acquire；只接受 request digest 与 ownership 一致且明确未尝试启动的 worker，拒绝未到期租约及同 session 的其他 pending intent。
 Preview 必须只读，apply 必须持有既有跨进程维护与 session 围栏，保留原始 worker/request evidence，沿既有 release 路径关闭目标 mapping、停止 container 并保留 cache，不得重放 acquire、处理其他 session 或推进全局 maintenance cursor。
+Ownership preflight 的固定只读查询必须保留 process-tree tracking，且不得占用 mutation worker identity；实际清理仍必须经过原有 native worker 启动与持久化围栏，只有确认留下 cache 才能终结目标 pending acquire。
 运维恢复可显式以 `serve --defer-maintenance` 暂停自动 startup recovery、reconciliation、expiry 和 age-GC，同时保留 controller lease 与请求围栏；该模式不得标记 admission ready，也不得作为健康候选绕过正常部署门禁。
 暂停期间到期的其他租约不会自动清理，维护范围必须包含这一影响；恢复正常启动前必须重新核对全局 reconciliation 范围。
 
