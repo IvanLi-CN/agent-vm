@@ -3,8 +3,6 @@ package scheduler
 import (
 	"context"
 	"path/filepath"
-	"reflect"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,55 +12,6 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
-
-func TestDeferredStartupNeverRecoversOrExpiresPeers(t *testing.T) {
-	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "deferred.sqlite3"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	now := time.Now().UTC()
-	service := lifecycle.New(store, config.Defaults(), lifecycle.Options{Clock: func() time.Time { return now }})
-	for _, session := range []string{"expired-peer", "active-peer"} {
-		if _, err := service.Dispatch(context.Background(), protocol.Request{"protocol": protocol.Version, "action": "acquire", "session_id": session, "generation": int64(0), "operation_id": "acquire-" + session}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	task, _ := store.GetTask(context.Background(), map[string]any{"session_id": "expired-peer"})
-	if err := store.UpdateTask(context.Background(), task.TaskID, map[string]any{"lease_expires_at": now.Add(-time.Second).Format(time.RFC3339Nano)}); err != nil {
-		t.Fatal(err)
-	}
-	before, _ := store.ListTasks(context.Background())
-	cursor, _ := store.MaintenanceCursor(context.Background())
-	gate := controllerrole.New("blue", func() time.Time { return now })
-	if err := gate.Grant(controllerrole.Lease{Slot: "blue", Term: 1, LeaseID: "deferred-test", Expiry: now.Add(time.Hour), Generation: 1, Nonce: "deferred-test"}); err != nil {
-		t.Fatal(err)
-	}
-	var startups atomic.Int32
-	instance := NewWithStartup(service, gate, func(context.Context) error { startups.Add(1); return nil })
-	service.MarkReady()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- instance.RunDeferred(ctx) }()
-	deadline := time.Now().Add(time.Second)
-	for service.Ready() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
-	instance.Wake()
-	time.Sleep(30 * time.Millisecond)
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
-	}
-	if service.Ready() || startups.Load() != 0 {
-		t.Fatal("deferred startup enabled admission or ran recovery")
-	}
-	after, _ := store.ListTasks(context.Background())
-	afterCursor, _ := store.MaintenanceCursor(context.Background())
-	if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(cursor, afterCursor) {
-		t.Fatal("deferred startup mutated peers or maintenance cursor")
-	}
-}
 
 func TestSchedulerReconcilesExpiryAndAgeGC(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "scheduler.sqlite3"))

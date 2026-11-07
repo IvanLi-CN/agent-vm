@@ -95,7 +95,6 @@ func serve(args []string) error {
 	flags.SetOutput(io.Discard)
 	configPath := flags.String("config", "/etc/agent-vm-native/config.json", "configuration path")
 	manifestPath := flags.String("manifest", installedManifestPath, "validated release manifest path")
-	deferMaintenance := flags.Bool("defer-maintenance", false, "keep admission closed and defer automatic startup reconciliation, expiry and GC for operator recovery")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -287,10 +286,6 @@ func serve(args []string) error {
 	}
 	schedulerInstance := scheduler.NewWithStartup(service, roleGate, startup)
 	slog.Info("agent vm control started", "socket", cfg.Socket, "database_backend", stateBackend(cfg.StateDB), "slot", cfg.Slot, "controller_lease", "fenced")
-	if *deferMaintenance {
-		slog.Warn("automatic lifecycle maintenance deferred; admission remains closed until a normal restart")
-		return schedulerInstance.RunDeferred(ctx)
-	}
 	return schedulerInstance.Run(ctx)
 }
 

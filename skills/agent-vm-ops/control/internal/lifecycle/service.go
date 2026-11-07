@@ -2460,6 +2460,9 @@ func (s *Service) status(ctx context.Context, session string) (map[string]any, e
 }
 
 func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[string]any, error) {
+	if err := s.maintenanceAdmission(ctx); err != nil {
+		return nil, err
+	}
 	if s.resident && !s.Ready() {
 		return nil, protocol.NewError("startup_reconcile_required", "control service is not ready for admission", map[string]any{"outcome_verified": true})
 	}
@@ -3006,6 +3009,9 @@ func operationIDs(operations []state.Operation) []string {
 }
 
 func (s *Service) restart(ctx context.Context, request protocol.Request) (map[string]any, error) {
+	if err := s.maintenanceAdmission(ctx); err != nil {
+		return nil, err
+	}
 	if draining, err := s.isDraining(ctx); err != nil {
 		return nil, s.sqliteError(err)
 	} else if draining {
@@ -3879,6 +3885,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			resourcesValue := map[string]any{"allocated": allocated, "reserved": reserved, "allocated_and_reserved": allocatedAndReserved, "limits": limits, "remaining": remaining, "policy": map[string]any{"cpu_overcommit_ratio": s.Config.CPUOvercommitRatio, "memory_overcommit_ratio": s.Config.MemoryOvercommitRatio, "cpu_startup_pressure_full_avg10_percent": s.Config.CPUStartupPressureFullAvg10Percent}, "memory": memoryObservation, "memory_pressure": memoryObservation["pressure"]}
 			ctCPU := map[string]any{"capacity_vcpu": nil, "pressure": nil, "startup_pressure": nil}
 			defaultReasons := []any{}
+			if maintenanceErr := s.maintenanceAdmission(ctx); maintenanceErr != nil {
+				defaultReasons = append(defaultReasons, map[string]any{"code": protocol.AsError(maintenanceErr).Code, "message": "lifecycle maintenance is not healthy"})
+			}
 			if !s.Ready() {
 				defaultReasons = append(defaultReasons, map[string]any{"code": "startup_reconcile_required", "message": "control service is not ready for admission"})
 			}
@@ -4050,6 +4059,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 }
 
 func (s *Service) reconcile(ctx context.Context, apply bool, mode ...string) (map[string]any, error) {
+	var firstErr error
 	if apply {
 		pending, pendingErr := s.Store.PendingOperations(ctx)
 		if pendingErr != nil {
@@ -4064,10 +4074,13 @@ func (s *Service) reconcile(ctx context.Context, apply bool, mode ...string) (ma
 		if err := s.recoverPending(ctx, pending); err != nil {
 			return nil, err
 		}
+		if err := s.reconcileCachedReleases(ctx, pending); err != nil {
+			firstErr = err
+		}
 		startup := len(mode) > 0 && mode[0] == "startup"
 		if !startup {
 			if err := s.reconcileOrphanedAcquireOperations(ctx, pending); err != nil {
-				return nil, err
+				firstErr = err
 			}
 		}
 	}
@@ -4076,7 +4089,6 @@ func (s *Service) reconcile(ctx context.Context, apply bool, mode ...string) (ma
 		return nil, s.sqliteError(err)
 	}
 	actions := make([]any, 0)
-	var firstErr error
 	for _, task := range tasks {
 		if maintenanceExpiryCandidate(&task, s.Clock()) {
 			action := map[string]any{"task_id": task.TaskID, "generation": task.Generation, "action": "close-incomplete-or-expired"}
@@ -4555,7 +4567,12 @@ func (s *Service) doctor(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	return map[string]any{"up": true, "ready": s.Ready(), "observed_at": nowString(s.Clock()), "issues": []any{}, "draining": draining, "state_epoch": epoch, "transport": "http-over-uds"}, nil
+	issues := []any{}
+	maintenanceErr := s.maintenanceAdmission(ctx)
+	if maintenanceErr != nil {
+		issues = append(issues, map[string]any{"code": protocol.AsError(maintenanceErr).Code, "message": "lifecycle maintenance is not healthy"})
+	}
+	return map[string]any{"up": true, "ready": s.Ready() && maintenanceErr == nil, "observed_at": nowString(s.Clock()), "issues": issues, "draining": draining, "state_epoch": epoch, "transport": "http-over-uds"}, nil
 }
 
 func (s *Service) sshInfo(ctx context.Context, request protocol.Request) (map[string]any, error) {

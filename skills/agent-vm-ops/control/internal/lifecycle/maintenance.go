@@ -89,8 +89,10 @@ func (s *Service) RunMaintenance(ctx context.Context, lane string) error {
 	if err == nil {
 		laneCursor.Attempt = 0
 		laneCursor.NextAttemptAt = nowString(completedAt)
-		laneCursor.LastErrorCode = ""
-		laneCursor.LastErrorPhase = ""
+		if lane != maintenanceReconcileLane {
+			laneCursor.LastErrorCode = ""
+			laneCursor.LastErrorPhase = ""
+		}
 	} else {
 		laneCursor.Attempt++
 		if laneCursor.Attempt > 6 {
@@ -100,6 +102,26 @@ func (s *Service) RunMaintenance(ctx context.Context, lane string) error {
 		control := protocol.AsError(err)
 		laneCursor.LastErrorCode = control.Code
 		laneCursor.LastErrorPhase = lane
+	}
+	if lane == maintenanceReconcileLane {
+		if err != nil {
+			laneCursor.CycleFailed = true
+		}
+		if page.taskCursorUpdated && page.nextTaskID == "" {
+			laneCursor.TaskCycleComplete = true
+		}
+		if page.operationCursorUpdated && page.nextOperationID == "" {
+			laneCursor.OperationCycleComplete = true
+		}
+		if laneCursor.TaskCycleComplete && laneCursor.OperationCycleComplete {
+			if !laneCursor.CycleFailed {
+				laneCursor.LastErrorCode = ""
+				laneCursor.LastErrorPhase = ""
+			}
+			laneCursor.CycleFailed = false
+			laneCursor.TaskCycleComplete = false
+			laneCursor.OperationCycleComplete = false
+		}
 	}
 	laneCursor.UpdatedAt = nowString(completedAt)
 	if mutationLost() || !s.mutationAllowed() {
@@ -153,32 +175,40 @@ func (s *Service) reconcileMaintenancePageWithCursor(ctx context.Context, afterT
 	}
 	page := maintenancePageResult{}
 	var firstErr error
+	pendingCtx, cancelPending := context.WithTimeout(ctx, maintenanceBudget/2)
+	defer cancelPending()
 	for index := range pending {
-		if err := ctx.Err(); err != nil {
+		if err := pendingCtx.Err(); err != nil {
 			if firstErr == nil {
 				firstErr = protocol.NewError("maintenance_timeout", "reconcile maintenance budget expired", map[string]any{"phase": maintenanceReconcileLane})
 			}
-			return page, firstErr
+			break
 		}
 		one := pending[index : index+1]
 		for _, reconcile := range []func(context.Context, []state.Operation) error{
 			s.reconcilePendingWorkers,
 			s.reconcilePendingAbsentDestroy,
 			s.recoverPending,
+			s.reconcileCachedReleases,
 			s.reconcileOrphanedAcquireOperations,
 		} {
-			if reconcileErr := reconcile(ctx, one); reconcileErr != nil {
-				return page, reconcileErr
+			if reconcileErr := reconcile(pendingCtx, one); reconcileErr != nil {
+				if firstErr == nil {
+					firstErr = reconcileErr
+				}
+				break
 			}
 		}
-		if err := s.ensureMaintenanceOperationResolved(ctx, pending[index].OperationID); err != nil {
-			return page, err
+		if err := s.ensureMaintenanceOperationResolved(pendingCtx, pending[index].OperationID); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
 		}
 		page.nextOperationAt = pending[index].CreatedAt
 		page.nextOperationID = pending[index].OperationID
 		page.operationCursorUpdated = true
 	}
-	if !morePending {
+	if !morePending && (len(pending) == 0 || page.nextOperationID == pending[len(pending)-1].OperationID) {
 		page.nextOperationAt = ""
 		page.nextOperationID = ""
 		page.operationCursorUpdated = true
@@ -186,7 +216,9 @@ func (s *Service) reconcileMaintenancePageWithCursor(ctx context.Context, afterT
 
 	tasksPage, err := s.reconcileMaintenanceTaskPage(ctx, afterTaskID)
 	if err != nil {
-		return page, err
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
 	page.nextTaskID = tasksPage.nextTaskID
 	page.taskCursorUpdated = tasksPage.taskCursorUpdated
@@ -199,12 +231,15 @@ func (s *Service) reconcileMaintenanceTaskPage(ctx context.Context, afterTaskID 
 		return maintenancePageResult{}, s.sqliteError(err)
 	}
 	page := maintenancePageResult{}
+	var firstErr error
 	for _, task := range tasks {
 		if err := ctx.Err(); err != nil {
 			return page, protocol.NewError("maintenance_timeout", "reconcile maintenance budget expired", map[string]any{"phase": maintenanceReconcileLane})
 		}
 		if reconcileErr := s.reconcileMaintenanceTask(ctx, &task); reconcileErr != nil {
-			return page, reconcileErr
+			if firstErr == nil {
+				firstErr = reconcileErr
+			}
 		}
 		page.nextTaskID = task.TaskID
 		page.taskCursorUpdated = true
@@ -213,7 +248,7 @@ func (s *Service) reconcileMaintenanceTaskPage(ctx context.Context, afterTaskID 
 		page.nextTaskID = ""
 		page.taskCursorUpdated = true
 	}
-	return page, nil
+	return page, firstErr
 }
 
 func (s *Service) ensureMaintenanceOperationResolved(ctx context.Context, operationID string) error {
@@ -222,7 +257,7 @@ func (s *Service) ensureMaintenanceOperationResolved(ctx context.Context, operat
 		return s.sqliteError(err)
 	}
 	if operation != nil && stringValue(operation.Response["outcome"]) == "pending" {
-		return protocol.NewError("operation_unverified", "maintenance operation remains pending; cursor was not advanced", map[string]any{"operation_id": operationID})
+		return protocol.NewError("operation_unverified", "maintenance operation remains pending and will be revisited", map[string]any{"operation_id": operationID})
 	}
 	return nil
 }
@@ -511,4 +546,17 @@ func (s *Service) ageGCMaintenancePage(ctx context.Context, afterTaskID string) 
 		page.taskCursorUpdated = true
 	}
 	return page, firstErr
+}
+
+// Keep scheduler startup readiness separate: a failed maintenance round must
+// close new admission while still allowing later bounded repair rounds.
+func (s *Service) maintenanceAdmission(ctx context.Context) error {
+	cursor, err := s.Store.MaintenanceCursor(ctx)
+	if err != nil {
+		return s.sqliteError(err)
+	}
+	if cursor.Reconcile.LastErrorCode != "" {
+		return protocol.NewError("maintenance_unhealthy", "lifecycle maintenance requires recovery before admission", map[string]any{"phase": cursor.Reconcile.LastErrorPhase, "cause_code": cursor.Reconcile.LastErrorCode, "admission_ready": false})
+	}
+	return nil
 }
