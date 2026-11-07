@@ -11,7 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / "skills/agent-vm-ops/scripts"))
+sys.path.insert(0, str(ROOT / "deploy/scripts"))
 
 from release_manifest import (  # noqa: E402
     LEGACY_PRODUCT_MANIFEST_FORMAT,

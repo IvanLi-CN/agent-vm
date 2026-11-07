@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,6 +43,11 @@ type fakeRuntime struct {
 	grantedLeases         []controllerrole.Lease
 }
 
+func (runtime *fakeRuntime) RenewTransactionLease(_ context.Context, lease controllerrole.Lease) (controllerrole.Lease, error) {
+	lease.Expiry = lease.Expiry.Add(time.Minute)
+	return lease, nil
+}
+
 func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 	slots := make(map[string]SlotObservation, len(runtime.observations))
 	for slot, value := range runtime.observations {
@@ -54,7 +61,12 @@ func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 			value.ReleaseID = releaseID
 		}
 		value.SourceRevision = "revision-1"
-		value.StateEpoch = runtime.stateEpoch
+		if value.StateAuthority == "" {
+			value.StateAuthority = "authority-1"
+		}
+		if runtime.stateEpoch != "" {
+			value.StateEpoch = runtime.stateEpoch
+		}
 		if value.StateEpoch == "" {
 			value.StateEpoch = "epoch-1"
 		}
@@ -179,7 +191,7 @@ func (runtime *fakeRuntime) Stop(_ context.Context, slot string) error {
 	runtime.observations[slot] = value
 	return nil
 }
-func (runtime *fakeRuntime) Rollback(_ context.Context, target, previous string, _ controllerrole.Lease) error {
+func (runtime *fakeRuntime) Rollback(_ context.Context, target, previous string, _ controllerrole.Lease, _ string) error {
 	runtime.sequence = append(runtime.sequence, "rollback")
 	runtime.active = previous
 	targetObservation := runtime.observations[target]
@@ -448,9 +460,9 @@ func TestManagerFencesWhenRollbackStateCannotBePersisted(t *testing.T) {
 	}}
 	transaction := store.Transaction{ID: "tx-rollback-persist-failure", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseFinalize, State: "finalized", Generation: 1, CreatedAt: now, UpdatedAt: now}
 	if err := database.Create(context.Background(), transaction, map[string]any{
-		"previous_release_id":         "release-blue",
-		"previous_source_revision":    "revision-1",
-		"previous_state_epoch":        "epoch-1",
+		"previous_release_id":      "release-blue",
+		"previous_source_revision": "revision-1",
+		"previous_state_authority": "authority-1", "previous_state_epoch": "epoch-1",
 		"previous_state_capabilities": []string{"reads@1", "writes@1"},
 	}); err != nil {
 		t.Fatal(err)
@@ -519,7 +531,7 @@ func TestManagerResumesRollbackAfterRestart(t *testing.T) {
 		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
 	}}
 	transaction := store.Transaction{ID: "tx-resume-rollback", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseActiveSwitch, State: "active", Generation: 1, CreatedAt: now, UpdatedAt: now}
-	if err := database.Create(context.Background(), transaction, map[string]any{"previous_release_id": "release-blue", "previous_source_revision": "revision-1", "previous_state_epoch": "epoch-1", "previous_state_capabilities": []string{"reads@1", "writes@1"}}); err != nil {
+	if err := database.Create(context.Background(), transaction, map[string]any{"previous_release_id": "release-blue", "previous_source_revision": "revision-1", "previous_state_authority": "authority-1", "previous_state_epoch": "epoch-1", "previous_state_capabilities": []string{"reads@1", "writes@1"}}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := database.BeginRollback(context.Background(), transaction.ID, transaction.Phase, PhaseRollback, "rollback_started", "test", nil, now); err != nil {
@@ -713,6 +725,52 @@ func TestManagerWaitsForReadyAfterGrantBeforeTraffic(t *testing.T) {
 	}
 }
 
+type delayedControllerRuntime struct {
+	*fakeRuntime
+	renewals atomic.Int32
+}
+
+func (runtime *delayedControllerRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error) {
+	snapshot, err := runtime.fakeRuntime.Observe(ctx)
+	if snapshot.Slots["blue"].ControllerOwned {
+		timer := time.NewTimer(90 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return RuntimeSnapshot{}, ctx.Err()
+		case <-timer.C:
+		}
+		value := snapshot.Slots["blue"]
+		value.Ready = true
+		snapshot.Slots["blue"] = value
+	}
+	return snapshot, err
+}
+
+func (runtime *delayedControllerRuntime) RenewTransactionLease(ctx context.Context, lease controllerrole.Lease) (controllerrole.Lease, error) {
+	runtime.renewals.Add(1)
+	return runtime.fakeRuntime.RenewTransactionLease(ctx, lease)
+}
+
+func TestControllerMaintenanceRenewsWhileWaitingForReadiness(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &delayedControllerRuntime{fakeRuntime: &fakeRuntime{active: "blue", observations: map[string]SlotObservation{
+		"blue": {Slot: "blue", ProcessUp: true, ProcessReady: true},
+	}}}
+	manager := NewManager(database, runtime, 30*time.Millisecond, func() time.Time { return now })
+	if err := manager.MaintainController(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.renewals.Load() < 2 || !runtime.traffic["blue"] {
+		t.Fatalf("readiness did not retain its granted authority: renewals=%d traffic=%v", runtime.renewals.Load(), runtime.traffic)
+	}
+}
+
 func TestManagerHardFencesInconsistentObservation(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
@@ -755,7 +813,7 @@ func TestTransactionObservationRenewsOnlyVerifiedLiveCandidate(t *testing.T) {
 	if start == "" {
 		t.Skip("Linux process-incarnation evidence required")
 	}
-	for _, mode := range []string{"live", "transient", "inconsistent", "expired", "other-owner"} {
+	for _, mode := range []string{"live", "transient", "guarded", "inconsistent", "expired", "other-owner"} {
 		t.Run(mode, func(t *testing.T) {
 			now := time.Unix(100, 0).UTC()
 			database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), time.Hour, func() time.Time { return now })
@@ -785,7 +843,13 @@ func TestTransactionObservationRenewsOnlyVerifiedLiveCandidate(t *testing.T) {
 				runtime.unstableReads = 10
 			}
 			manager := NewManager(database, runtime, 15*time.Second, func() time.Time { return now })
-			_, err = manager.observe(context.Background(), transaction.ID)
+			observationContext := context.Background()
+			if mode == "guarded" {
+				var stop func() error
+				observationContext, stop = manager.beginTransactionRenewal(observationContext, lease)
+				defer stop()
+			}
+			_, err = manager.observe(observationContext, transaction.ID)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -840,8 +904,8 @@ func TestMaintainControllerRetriesChangingStateBeforeRevokingLiveLease(t *testin
 		wantError bool
 		preserve  bool
 	}{
-		{"one-state-change", 1, "", 3, false, false},
-		{"two-state-changes", 2, "", 4, false, false},
+		{"one-state-change", 1, "", 2, false, false},
+		{"two-state-changes", 2, "", 3, false, false},
 		{"persistent-inconsistency", 10, "", 3, true, true},
 		{"traffic-disable-failure", 10, "traffic", 3, true, false},
 		{"active-link-unavailable", 10, "source-active_link", 1, true, false},
@@ -1055,6 +1119,13 @@ func TestManagerRecoveryFinalizeReestablishesControllerAfterRestart(t *testing.T
 	}
 	runtime.active = "green"
 	runtime.traffic = map[string]bool{"blue": false, "green": false}
+	// A fenced process exposes its process contract, but scheduler startup and
+	// admission readiness require the new controller grant first.
+	target := runtime.observations["green"]
+	target.Ready = false
+	runtime.observations["green"] = target
+	runtime.readyAfterGrant = true
+	runtime.enableRequiresReady = true
 	updated, err := manager.Recover(context.Background(), transaction.ID, "finalize")
 	if err != nil {
 		t.Fatal(err)
@@ -1443,5 +1514,227 @@ func TestMaintainControllerRenewsLiveAuthorityDuringPartialInventory(t *testing.
 				t.Fatal("ordinary lifecycle was fenced")
 			}
 		})
+	}
+}
+
+func TestWaitingDeploymentRetainsOnlyExistingActiveLease(t *testing.T) {
+	start := controllerrole.ProcessStartToken(os.Getpid())
+	if start == "" {
+		t.Skip("Linux process-incarnation evidence required")
+	}
+	for _, phase := range []string{PhaseStandbyValidation, PhaseControllerHandoff, PhaseActiveSwitch} {
+		t.Run(phase, func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			db, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			tx := store.Transaction{ID: "waiting", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/candidate.tar", Phase: phase, State: "active", Generation: 2, CreatedAt: now, UpdatedAt: now}
+			if err := db.Create(context.Background(), tx, nil); err != nil {
+				t.Fatal(err)
+			}
+			lease := controllerrole.Lease{Slot: "blue", Term: 7, Generation: 1, LeaseID: "live", Nonce: "nonce", Expiry: now.Add(time.Minute), OwnerPID: os.Getpid(), OwnerStartTime: start}
+			runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true, LeaseRenewalSupported: true, ControllerLease: &lease}, "green": {Slot: "green", ProcessUp: true, ProcessReady: true}}}
+			manager := NewManager(db, runtime, time.Minute, func() time.Time { return now })
+			err = manager.MaintainController(context.Background())
+			if phase == PhaseActiveSwitch {
+				if err == nil {
+					t.Fatal("uncertain switch retained authority")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(runtime.grantedLeases) != 1 || runtime.grantedLeases[0].LeaseID != lease.LeaseID || runtime.observations["green"].ControllerOwned {
+				t.Fatalf("waiting transaction changed authority: %+v", runtime.grantedLeases)
+			}
+		})
+	}
+}
+
+func TestStagingEffectKeepsExistingControllerLeaseRenewed(t *testing.T) {
+	start := controllerrole.ProcessStartToken(os.Getpid())
+	if start == "" {
+		t.Skip("Linux process-incarnation evidence required")
+	}
+	now := time.Unix(100, 0).UTC()
+	runtime := &delayedControllerRuntime{fakeRuntime: &fakeRuntime{}}
+	manager := NewManager(nil, runtime, 30*time.Millisecond, func() time.Time { return now })
+	lease := controllerrole.Lease{Slot: "blue", Term: 1, Generation: 1, LeaseID: "staging", Nonce: "nonce", Expiry: now.Add(time.Minute), OwnerPID: os.Getpid(), OwnerStartTime: start}
+	target := SlotObservation{Slot: "blue", ControllerOwned: true, LeaseRenewalSupported: true, ControllerLease: &lease}
+	err := manager.withControllerRenewal(t.Context(), target, func(ctx context.Context) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(90 * time.Millisecond):
+			return nil
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.renewals.Load() < 2 {
+		t.Fatalf("slow staging lost heartbeat: renewals=%d", runtime.renewals.Load())
+	}
+}
+
+func TestVerifyUsesAuthorityInsteadOfChangingEpoch(t *testing.T) {
+	for _, differentAuthority := range []bool{false, true} {
+		t.Run(fmt.Sprint(differentAuthority), func(t *testing.T) {
+			now := time.Unix(100, 0).UTC()
+			database, err := store.Open(filepath.Join(t.TempDir(), "deploy.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true, StateEpoch: "epoch-before"}, "green": {ProcessUp: true, ProcessReady: true, Ready: true, StateEpoch: "epoch-after"}}}
+			if differentAuthority {
+				v := runtime.observations["green"]
+				v.StateAuthority = "different-backend"
+				runtime.observations["green"] = v
+			}
+			manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+			transaction, err := manager.Stage(context.Background(), "green", "/bundle")
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = manager.Verify(context.Background(), transaction.ID)
+			if (err != nil) != differentAuthority {
+				t.Fatalf("verify differentAuthority=%v: %v", differentAuthority, err)
+			}
+			if !differentAuthority {
+				v := runtime.observations["green"]
+				v.StateAuthority = "replaced-after-verify"
+				runtime.observations["green"] = v
+				if _, err := manager.Activate(context.Background(), transaction.ID); err == nil {
+					t.Fatal("activation accepted changed authority")
+				}
+				for _, step := range runtime.sequence {
+					if step == "grant" || step == "revoke" {
+						t.Fatal("authority mismatch caused role mutation")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestVerifyRejectsBothSlotsChangingAuthorityAfterStage(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deploy.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true}, "green": {ProcessUp: true, ProcessReady: true, Ready: true}}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	transaction, err := manager.Stage(context.Background(), "green", "/bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for slot, value := range runtime.observations {
+		value.StateAuthority = "reconfigured-backend"
+		runtime.observations[slot] = value
+	}
+	if _, err := manager.Verify(context.Background(), transaction.ID); err == nil {
+		t.Fatal("verify accepted both slots changing backend after stage")
+	}
+}
+
+type slowActivationRuntime struct {
+	*fakeRuntime
+	renewals atomic.Int32
+}
+
+func (r *slowActivationRuntime) Quiesce(ctx context.Context, slot string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(120 * time.Millisecond):
+		return r.fakeRuntime.Quiesce(ctx, slot)
+	}
+}
+func (r *slowActivationRuntime) RenewTransactionLease(ctx context.Context, lease controllerrole.Lease) (controllerrole.Lease, error) {
+	r.renewals.Add(1)
+	return r.fakeRuntime.RenewTransactionLease(ctx, lease)
+}
+func TestActivationRenewsCandidateThroughoutOldSlotQuiescence(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	db, err := store.Open(filepath.Join(t.TempDir(), "deploy.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	r := &slowActivationRuntime{fakeRuntime: &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true}, "green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true}}}}
+	m := NewManager(db, r, 30*time.Millisecond, func() time.Time { return now })
+	tx, err := m.Stage(context.Background(), "green", "bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.Verify(context.Background(), tx.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = m.Activate(context.Background(), tx.ID); err != nil {
+		t.Fatal(err)
+	}
+	if r.renewals.Load() < 3 {
+		t.Fatalf("candidate renewal stopped during quiescence: %d", r.renewals.Load())
+	}
+}
+
+func TestCancelledActivationCompensationPersistsAndFencesWithoutRollback(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	db, err := store.Open(filepath.Join(t.TempDir(), "deploy.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	r := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true}, "green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true}}}
+	m := NewManager(db, r, time.Second, func() time.Time { return now })
+	tx, err := m.Stage(context.Background(), "green", "bundle")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.rollbackOrFence(ctx, *tx, context.Canceled); err == nil {
+		t.Fatal("cancelled activation reported success")
+	}
+	saved, err := db.Get(context.Background(), tx.ID)
+	if err != nil || saved.State != "needs_recovery" || saved.RollbackUsed {
+		t.Fatalf("cancelled compensation=%v err=%v", saved, err)
+	}
+	for _, value := range r.observations {
+		if value.ControllerOwned {
+			t.Fatal("cancelled request left controller active")
+		}
+	}
+}
+func TestReadOnlyStatusDoesNotReplacePublishedLatestObservation(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	db, err := store.Open(filepath.Join(t.TempDir(), "deploy.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	r := &fakeRuntime{active: "blue", observations: map[string]SlotObservation{"blue": {Slot: "blue", ProcessUp: true}, "green": {Slot: "green", ProcessUp: true}}}
+	m := NewManager(db, r, time.Second, func() time.Time { return now })
+	if _, err := m.observe(context.Background(), ""); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.Observation(context.Background(), store.LatestObservationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.active = "green"
+	status, err := m.Status(context.Background())
+	if err != nil || status.Observed.ActiveSlot != "green" {
+		t.Fatalf("status=%v err=%v", status, err)
+	}
+	after, err := db.Observation(context.Background(), store.LatestObservationID)
+	if err != nil || after.Digest != before.Digest {
+		t.Fatalf("read-only status replaced published observation: %v", err)
 	}
 }

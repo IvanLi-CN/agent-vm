@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 test('only isolated content changes may omit macOS payload', () => {
   expect(classifyChanges(['docs/example.md']).macos).toBe(false);
   expect(classifyChanges(['web/src/App.tsx']).macos).toBe(false);
-  for (const files of [[], ['bun.lock'], ['package.json'], ['web/vite.config.ts'], ['skills/agent-vm/scripts/client.ts'], ['bin/test_runner.ts'], ['.github/workflows/ci.yml'], ['unknown'], ['docs/example.md', 'skills/example.ts']]) {
+  for (const files of [[], ['bun.lock'], ['package.json'], ['web/vite.config.ts'], ['skills/agent-vm/scripts/client.ts'], ['bin/test_runner.ts'], ['.github/workflows/ci.yml'], ['unknown'], ['deploy/assets/config.json.example'], ['docs/example.md', 'skills/example.ts']]) {
     expect(classifyChanges(files).macos).toBe(true);
   }
 });

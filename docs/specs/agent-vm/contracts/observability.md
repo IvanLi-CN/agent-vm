@@ -144,7 +144,7 @@ CPU 视图区分逻辑预留组成、控制环境可见容量、`some.avg10`、`
 
 ## Provisioning 边界
 
-公共仓库维护[脱敏、参数化的看板模板与校验器](../../../../skills/agent-vm/references/observability/README.md)。Grafana 数据库不是配置权威。公共模板不包含部署地址、凭据、真实 datasource、任务名、监听路径或使用方导出的 JSON。
+公共仓库维护[脱敏、参数化的看板模板与校验器](../../../../deploy/observability/README.md)。Grafana 数据库不是配置权威。公共模板不包含部署地址、凭据、真实 datasource、任务名、监听路径或使用方导出的 JSON。
 
 部署仓库通过显式参数生成 JSON、provisioning、Prometheus 拉取和 Deployd 监听配置。生成前必须替换 organization ID、datasource UID、controller job、看板 UID/标题/文件夹和容器内路径。生成结果写入版本目录，并原子替换稳定的 `current` 符号链接；provisioning YAML 原子替换。原生查询通过 `controller_job` 变量选择目标，CPU 容量来自 `agent_vm_admission_cpu_capacity_vcpu`，资源上限线只来自权威指标。
 

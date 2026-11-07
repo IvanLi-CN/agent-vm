@@ -48,10 +48,11 @@ type Gate struct {
 	slot  string
 	clock func() time.Time
 
-	mu    sync.RWMutex
-	lease Lease
-	valid bool
-	term  uint64
+	commitMu sync.Mutex
+	mu       sync.RWMutex
+	lease    Lease
+	valid    bool
+	term     uint64
 
 	changed chan struct{}
 }
@@ -64,20 +65,26 @@ func New(slot string, clock func() time.Time) *Gate {
 }
 
 func (gate *Gate) Grant(lease Lease) error {
-	now := gate.clock()
-	if err := lease.Validate(now, gate.slot); err != nil {
+	if err := lease.Validate(gate.clock(), gate.slot); err != nil {
 		return err
 	}
+	// Extending the exact live authority must remain available while a remote
+	// durable commit is in progress. A different authority must wait for it.
+	gate.mu.Lock()
+	if gate.renewLocked(lease) {
+		gate.mu.Unlock()
+		return nil
+	}
+	gate.mu.Unlock()
+	gate.commitMu.Lock()
+	defer gate.commitMu.Unlock()
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
-	if lease.Term == gate.term && gate.validLocked() == nil {
-		current := gate.lease
-		current.Expiry = lease.Expiry
-		if current == lease && !lease.Expiry.Before(gate.lease.Expiry) {
-			// Extending the same live authority must not cancel in-flight work.
-			gate.lease.Expiry = lease.Expiry
-			return nil
-		}
+	if err := lease.Validate(gate.clock(), gate.slot); err != nil {
+		return err
+	}
+	if gate.renewLocked(lease) {
+		return nil
 	}
 	if lease.Term <= gate.term {
 		return fmt.Errorf("%w: term is not newer", ErrLeaseMismatch)
@@ -89,7 +96,22 @@ func (gate *Gate) Grant(lease Lease) error {
 	return nil
 }
 
+func (gate *Gate) renewLocked(lease Lease) bool {
+	if lease.Term != gate.term || gate.validLocked() != nil {
+		return false
+	}
+	current := gate.lease
+	current.Expiry = lease.Expiry
+	if current != lease || lease.Expiry.Before(gate.lease.Expiry) {
+		return false
+	}
+	gate.lease.Expiry = lease.Expiry
+	return true
+}
+
 func (gate *Gate) Revoke(lease Lease) error {
+	gate.commitMu.Lock()
+	defer gate.commitMu.Unlock()
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
 	if lease.Slot != gate.slot || lease.Term == 0 {
@@ -117,6 +139,8 @@ func (gate *Gate) Revoke(lease Lease) error {
 // accepted term. The deployd hard-fence path uses this when durable fencing
 // state is unavailable; future grants still require a newer persisted term.
 func (gate *Gate) Fence() {
+	gate.commitMu.Lock()
+	defer gate.commitMu.Unlock()
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
 	if !gate.valid {
@@ -135,14 +159,18 @@ func (gate *Gate) Valid() bool {
 
 // WithValid serializes a short durable commit with lease revocation. The
 // callback is the commit linearization point: a fence that starts after the
-// callback acquires the gate lock cannot precede the callback's result.
+// callback acquires the commit lock cannot precede the callback's result.
+// Health checks and exact-identity renewal never wait for remote commit I/O.
 func (gate *Gate) WithValid(commit func() error) error {
 	if commit == nil {
 		return ErrInvalidLease
 	}
+	gate.commitMu.Lock()
+	defer gate.commitMu.Unlock()
 	gate.mu.Lock()
-	defer gate.mu.Unlock()
-	if err := gate.validLocked(); err != nil {
+	err := gate.validLocked()
+	gate.mu.Unlock()
+	if err != nil {
 		return err
 	}
 	return commit()

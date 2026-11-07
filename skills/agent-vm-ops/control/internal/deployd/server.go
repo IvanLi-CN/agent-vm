@@ -110,6 +110,7 @@ func (server *Server) Handler() http.Handler {
 	router.POST("/v1/rollback", server.rollback)
 	router.POST("/v1/recover", server.recover)
 	router.POST("/v1/migrate", server.migrate)
+	router.POST("/v1/bootstrap", server.bootstrap)
 	router.NoRoute(func(c *gin.Context) {
 		writeError(c, http.StatusNotFound, "not_found", "deployd endpoint was not found")
 	})
@@ -172,7 +173,10 @@ func (server *Server) RestoreLatest(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("restore active deployment transactions: %w", err)
 	}
-	if len(transactions) > 0 {
+	for _, transaction := range transactions {
+		if !transaction.RecoveryRequired && transaction.State != "needs_recovery" {
+			continue
+		}
 		// A persisted observation can describe the last healthy state, but it
 		// cannot prove that recovery has completed after a Deployd restart.
 		snapshot.Consistent = false
@@ -456,7 +460,7 @@ func ServeUDS(ctx context.Context, socket string, handler http.Handler) error {
 		}
 	}()
 	wrapped := &peerListener{Listener: listener}
-	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, MaxHeaderBytes: 8 * 1024, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
+	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 9000 * time.Second, MaxHeaderBytes: 8 * 1024, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 		if peer, ok := conn.(*peerConn); ok {
 			return context.WithValue(ctx, peerContextKey{}, peer)
 		}
@@ -540,3 +544,16 @@ func MetricsAddressRequiresTLS(address string) bool {
 }
 
 func statusCode(value int) string { return strconv.Itoa(value) }
+
+func (server *Server) bootstrap(c *gin.Context) {
+	var value request
+	if !decodeRequest(c, &value) {
+		return
+	}
+	transaction, err := server.Manager.Bootstrap(c.Request.Context(), value.TransactionID, value.Bundle)
+	if err != nil {
+		writeError(c, http.StatusConflict, "state_unverified", err.Error())
+		return
+	}
+	writeOK(c, publicTransaction(*transaction))
+}

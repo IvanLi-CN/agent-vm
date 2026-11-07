@@ -114,6 +114,7 @@ func serve(config configuration, manifest releaseManifest) error {
 			"ok":                 true,
 			"protocol":           protocol,
 			"process_ready":      true,
+			"state_authority":    "authority-1",
 			"ready":              true,
 			"controller_owned":   controller,
 			"traffic_accepting":  traffic && !draining,

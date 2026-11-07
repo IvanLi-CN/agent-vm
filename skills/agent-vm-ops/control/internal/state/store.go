@@ -420,6 +420,12 @@ func configure(conn *sql.Conn, ctx context.Context) error {
 }
 
 func (s *Store) withRead(ctx context.Context, fn func(*sql.Conn) error) error {
+	if view, ok := ctx.Value(readSnapshotKey{}).(*readSnapshot); ok && view.store == s {
+		if !view.active.Load() {
+			return errors.New("read snapshot is closed")
+		}
+		return fn(view.conn)
+	}
 	if s.remote != nil {
 		return s.remote.withRead(ctx, fn)
 	}
@@ -436,6 +442,9 @@ func (s *Store) withRead(ctx context.Context, fn func(*sql.Conn) error) error {
 }
 
 func (s *Store) withWrite(ctx context.Context, fn func(*Tx) error) error {
+	if view, ok := ctx.Value(readSnapshotKey{}).(*readSnapshot); ok && view.store == s {
+		return errors.New("mutation is forbidden in a read snapshot")
+	}
 	if s.remote != nil {
 		return s.remote.withWrite(ctx, fn)
 	}
@@ -1058,7 +1067,7 @@ func (s *Store) RecordOperation(ctx context.Context, operationID, action string,
 					return err
 				}
 			}
-			for _, evidenceKey := range []string{"_worker_recovery_evidence", "_worker_rearm_recovery_evidence"} {
+			for _, evidenceKey := range []string{"_worker_recovery_evidence", "_worker_rearm_recovery_evidence", "_recovery_attempts"} {
 				if evidence, exists := current.Response[evidenceKey]; exists {
 					if incoming, supplied := response[evidenceKey]; supplied {
 						previousJSON, previousErr := json.Marshal(evidence)
@@ -1558,12 +1567,16 @@ func (s *Store) Audit(ctx context.Context, action, taskID, sessionID, outcome st
 }
 
 func (s *Store) AuditSummary(ctx context.Context) (AuditSummary, error) {
-	s.auditSummaryMu.Lock()
-	defer s.auditSummaryMu.Unlock()
+	view, _ := ctx.Value(readSnapshotKey{}).(*readSnapshot)
+	useCache := s.remote == nil && (view == nil || view.store != s)
+	if useCache {
+		s.auditSummaryMu.Lock()
+		defer s.auditSummaryMu.Unlock()
+	}
 	// A remote store must synchronize its mirror before every summary read;
 	// the process-local cache cannot observe audit rows committed by the peer
 	// slot. Local SQLite keeps the existing cache for the hot path.
-	if s.remote == nil && s.auditSummaryReady {
+	if useCache && s.auditSummaryReady {
 		return cloneAuditSummary(s.auditSummary), nil
 	}
 	result := AuditSummary{
@@ -1626,11 +1639,15 @@ func (s *Store) AuditSummary(ctx context.Context) (AuditSummary, error) {
 		return managementRows.Err()
 	})
 	if err != nil {
-		s.auditSummaryReady = false
+		if useCache {
+			s.auditSummaryReady = false
+		}
 		return AuditSummary{}, err
 	}
-	s.auditSummary = cloneAuditSummary(result)
-	s.auditSummaryReady = true
+	if useCache {
+		s.auditSummary = cloneAuditSummary(result)
+		s.auditSummaryReady = true
+	}
 	return cloneAuditSummary(result), nil
 }
 

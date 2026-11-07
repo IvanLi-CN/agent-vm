@@ -77,7 +77,8 @@ func run(args []string) error {
 	go func() {
 		errorsCh <- deployd.ServeMetrics(ctx, config.MetricsListen, server.MetricsHandler(), config.MetricsTLS, config.NetworkACL)
 	}()
-	go maintenanceLoop(ctx, manager, server, config.ObserveInterval())
+	go maintenanceLoop(ctx, manager, config.ObserveInterval())
+	go publicationLoop(ctx, server, config.ObserveInterval())
 
 	slog.Info("agent vm deployd started", "version", version, "socket", config.Socket, "metrics_listen", config.MetricsListen)
 	select {
@@ -91,7 +92,7 @@ func run(args []string) error {
 	}
 }
 
-func maintenanceLoop(ctx context.Context, manager *deployd.Manager, server *deployd.Server, interval time.Duration) {
+func maintenanceLoop(ctx context.Context, manager *deployd.Manager, interval time.Duration) {
 	if interval <= 0 {
 		interval = 5 * time.Second
 	}
@@ -107,9 +108,6 @@ func maintenanceLoop(ctx context.Context, manager *deployd.Manager, server *depl
 			if err := manager.MaintainController(ctx); err != nil {
 				slog.Warn("controller lease maintenance failed", "error", err)
 			}
-			if err := server.Sample(ctx); err != nil {
-				slog.Warn("deployd observation failed", "error", err)
-			}
 		case <-cleanupTicker.C:
 			if err := manager.Cleanup(ctx); err != nil {
 				slog.Warn("deployd retention cleanup failed", "error", err)
@@ -117,6 +115,27 @@ func maintenanceLoop(ctx context.Context, manager *deployd.Manager, server *depl
 			if err := manager.CleanupMigrationBackups(ctx); err != nil {
 				slog.Warn("migration backup cleanup failed", "error", err)
 			}
+		}
+	}
+}
+
+// Publish only completed persisted observations, independently of the serialized
+// role/transaction writer. This loop never probes slots or grants authority.
+func publicationLoop(ctx context.Context, server *deployd.Server, interval time.Duration) {
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		case <-server.Manager.Store.ObservationUpdates():
+		}
+		if err := server.RestoreLatest(ctx); err != nil {
+			slog.Warn("deployd snapshot publication failed", "error", err)
 		}
 	}
 }

@@ -94,6 +94,7 @@ func (runtime *acceptanceRuntime) Observe(context.Context) (RuntimeSnapshot, err
 		value.ReleaseID = "release-" + slot
 		value.SourceRevision = "revision-1"
 		value.StateEpoch = "epoch-1"
+		value.StateAuthority = "authority-1"
 		value.StateCapabilities = []string{"reads@1", "writes@1"}
 		value.CountersKnown = true
 		value.ObservedUnix = now.Unix()
@@ -228,7 +229,7 @@ func (runtime *acceptanceRuntime) Stop(_ context.Context, slot string) error {
 	return nil
 }
 
-func (runtime *acceptanceRuntime) Rollback(_ context.Context, target, previous string, _ controllerrole.Lease) error {
+func (runtime *acceptanceRuntime) Rollback(_ context.Context, target, previous string, _ controllerrole.Lease, _ string) error {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
 	previousValue := runtime.slots[previous]

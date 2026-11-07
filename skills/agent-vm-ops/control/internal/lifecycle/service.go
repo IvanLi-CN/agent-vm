@@ -788,9 +788,9 @@ func (s *Service) WorkerStartAllowed(ctx context.Context, operationID string) er
 	if workerNeedsReconciliation(previous, true) {
 		return errUnresolvedWorker
 	}
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-	defer cancel()
 	return s.commitMutationContext(ctx, func() error {
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
 		return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
 			worker, _ := response["worker"].(map[string]any)
 			if workerNeedsReconciliation(worker, true) {
@@ -824,10 +824,12 @@ func (s *Service) updateWorker(ctx context.Context, operationID string, worker m
 		return nil
 	}
 	// A worker must remain journaled even when its action context has timed out.
-	// The bounded background context only covers this small durable update.
-	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
-	defer cancel()
+	// Start its bounded persistence budget after the controller commit gate is
+	// acquired. Remote epoch synchronization and concurrent observation can take
+	// longer than a local SQLite update; retain a ten-second bound for that I/O.
 	return s.commitMutationContext(ctx, func() error {
+		persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
 		return s.Store.UpdateOperationResponse(persistCtx, operationID, func(response map[string]any) error {
 			if callback != workerCallbackState {
 				if previous, ok := response["worker"].(map[string]any); ok && stringValue(previous["state"]) == "running" {
@@ -1530,8 +1532,19 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 			return nil, s.sqliteError(err)
 		}
 		if existing != nil {
-			finishActive()
-			return s.replayRecord(request, existing, warnings)
+			_, hasWorker := existing.Response["worker"]
+			resumeDrain := action == "drain-exit" && leaseExempt && !hasWorker && stringValue(existing.Response["outcome"]) == "pending" && operationIdentityMatches(existing, request) && stringValue(existing.Response["_request_digest"]) == digest && strings.HasPrefix(stringValue(request["session_id"]), "release-")
+			if !resumeDrain {
+				finishActive()
+				return s.replayRecord(request, existing, warnings)
+			}
+			// The cross-process drain resource lock is held. This exact
+			// administrative intent has no native effects and retains the
+			// original identity; drain ownership is revalidated by dispatch.
+			if err := s.commitMutationContext(ctx, func() error { return s.Store.MarkOperationRecoveryAttempt(ctx, operationID) }); err != nil {
+				finishActive()
+				return nil, s.sqliteError(err)
+			}
 		}
 		defer finishActive()
 		ctx = native.WithWorkerRecorder(ctx, operationID, s)
@@ -1904,7 +1917,7 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 			pid, pidOK := protocol.Integer(worker["pid"])
 			pgid, groupOK := protocol.Integer(worker["process_group"])
 			start := stringValue(worker["start_time"])
-			if !pidOK || !groupOK || pid <= 0 || pgid <= 0 || start == "" || stringValue(worker["finished_at"]) == "" {
+			if !pidOK || !groupOK || pid <= 0 || pgid <= 0 || start == "" || workerExitTime(worker) == "" {
 				return nil
 			}
 			alive, workerErr := native.WorkerAlive(native.WorkerIdentity{PID: int(pid), ProcessGroup: int(pgid), StartTime: start})
@@ -1968,6 +1981,26 @@ func supersedableOperation(action string) bool {
 	}
 }
 
+// workerExitTime is only an ordering boundary, not evidence of native success.
+// A reconciler confirms a dead worker using exited/observed_at when a normal
+// completion callback could not persist finished_at. All identity, liveness,
+// cached-state, later-witness and native quiescence checks still apply.
+func workerExitTime(worker map[string]any) string {
+	value, hasCompletion := worker["finished_at"]
+	if !hasCompletion {
+		if stringValue(worker["state"]) != "exited" {
+			return ""
+		}
+		value = worker["observed_at"]
+	}
+	stamp := stringValue(value)
+	exit, err := time.Parse(time.RFC3339Nano, stamp)
+	if err != nil || exit.After(time.Now()) {
+		return ""
+	}
+	return stamp
+}
+
 func supersedingOperationMatches(original, completed state.Operation, task *state.Task) bool {
 	if original.Generation == nil || completed.Generation == nil || completed.SessionID == nil || *completed.SessionID != task.SessionID || *completed.Generation < *original.Generation || *completed.Generation > task.Generation {
 		return false
@@ -1980,7 +2013,7 @@ func supersedingOperationMatches(original, completed state.Operation, task *stat
 		if !workerOK {
 			return false
 		}
-		finishedAt = stringValue(worker["finished_at"])
+		finishedAt = workerExitTime(worker)
 	}
 	finished, finishedErr := time.Parse(time.RFC3339Nano, finishedAt)
 	laterCreated, laterErr := time.Parse(time.RFC3339Nano, completed.CreatedAt)
@@ -3794,7 +3827,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 				return nil, s.sqliteError(drainErr)
 			}
 			if initialConsistent && len(pendingOperations) == 0 && states[stateClosing] == 0 && states[stateDeleting] == 0 && states[stateFailed] == 0 {
-				if releaseDrain {
+				if releaseDrain && ctx.Value(deploymentObservationKey{}) != true {
 					if err := s.trySealReleaseDrain(ctx, epoch); err != nil {
 						return nil, err
 					}
@@ -5006,23 +5039,23 @@ func guestIPv4(value map[string]any) string {
 	if !ok {
 		return ""
 	}
-	for _, rawInterface := range network {
-		iface, ok := rawInterface.(map[string]any)
-		if !ok {
+	// Incus configures the fixed address on eth0. Other interfaces (notably
+	// docker0) can be ready earlier and must never satisfy guest readiness.
+	iface, ok := network["eth0"].(map[string]any)
+	if !ok {
+		return ""
+	}
+	addresses, ok := iface["addresses"].([]any)
+	if !ok {
+		return ""
+	}
+	for _, rawAddress := range addresses {
+		address, ok := rawAddress.(map[string]any)
+		if !ok || address["family"] != "inet" {
 			continue
 		}
-		addresses, ok := iface["addresses"].([]any)
-		if !ok {
-			continue
-		}
-		for _, rawAddress := range addresses {
-			address, ok := rawAddress.(map[string]any)
-			if !ok || address["family"] != "inet" {
-				continue
-			}
-			if value, ok := address["address"].(string); ok && value != "" && value != "127.0.0.1" {
-				return value
-			}
+		if value, ok := address["address"].(string); ok && value != "" && value != "127.0.0.1" {
+			return value
 		}
 	}
 	return ""

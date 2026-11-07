@@ -363,3 +363,14 @@ test("rejects identical business legends split across historical slots", () => {
   limit.expr = '100 * (agent_vm_admission_cpu_limit_vcpu{job="$controller_job"} and on(job, instance, slot) (agent_vm_deployd_slot_selected{job="$controller_job"} == 1))';
   expect(validateDashboard(dashboard, "prometheus-test").some((finding) => finding.includes("must remove the slot dimension"))).toBe(true);
 });
+
+test("publishes a distinct Deployd role dashboard without selecting away standby", () => {
+  const bundle = renderBundle(config);
+  expect(bundle.deploydDashboard.uid).toBe(`${config.dashboard_uid}-deployd`);
+  expect(bundle.deploydDashboardFilename).toBe("agent-vm-deployd.json");
+  expect(bundle.deploydDashboardText).toContain("agent_vm_deployd_slot_controller_owned");
+  expect(bundle.deploydDashboardText).toContain("agent_vm_deployd_snapshot_fresh");
+  expect(bundle.deploydDashboardText).not.toContain("and on(job, instance, slot)");
+  const titles=(bundle.deploydDashboard.panels as Array<{title:string}>).map(panel=>panel.title);
+  expect(new Set(titles).size).toBe(titles.length);
+});

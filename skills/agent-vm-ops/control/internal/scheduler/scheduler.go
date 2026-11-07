@@ -58,9 +58,9 @@ func (scheduler *Scheduler) RunDeferred(ctx context.Context) error {
 }
 
 func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInterval time.Duration) error {
-	go scheduler.sampleLoop(ctx, "admin-metrics", "capacity", 10*time.Second)
-	go scheduler.sampleLoop(ctx, "admin-status", "inventory", 30*time.Second)
-	go scheduler.sampleLoop(ctx, "doctor", "health", 15*time.Second)
+	if scheduler.Service.Snapshots != nil {
+		go scheduler.sampleObservationLoop(ctx)
+	}
 	ticker := time.NewTicker(reconcileInterval)
 	defer ticker.Stop()
 	ageTicker := time.NewTicker(ageInterval)
@@ -137,29 +137,27 @@ func (scheduler *Scheduler) controllerLeaseValid() bool {
 	return scheduler.Gate != nil && scheduler.Gate.Valid()
 }
 
-func (scheduler *Scheduler) sampleLoop(ctx context.Context, action, source string, interval time.Duration) {
-	scheduler.sample(ctx, action, source)
-	ticker := time.NewTicker(interval)
+// Sample related read-only lanes once, instead of competing for the remote
+// mirror with three independent epoch-synchronizing observation loops.
+func (scheduler *Scheduler) sampleObservationLoop(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 	for {
+		sampleCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		lanes, err := scheduler.Service.DeploymentObservation(sampleCtx)
+		cancel()
+		for _, source := range []string{"capacity", "inventory", "health"} {
+			value := lanes[source]
+			if err != nil {
+				control := protocol.AsError(err)
+				value = map[string]any{"up": false, "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "error": map[string]any{"code": control.Code, "message": control.Message}}
+			}
+			_ = scheduler.Service.Snapshots.Publish(source, value)
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			scheduler.sample(ctx, action, source)
 		}
 	}
-}
-
-func (scheduler *Scheduler) sample(ctx context.Context, action, source string) {
-	_, err := scheduler.Service.Dispatch(ctx, protocol.Request{"protocol": protocol.Version, "action": action})
-	if err == nil || scheduler.Service.Snapshots == nil {
-		return
-	}
-	control := protocol.AsError(err)
-	_ = scheduler.Service.Snapshots.Publish(source, map[string]any{
-		"up":          false,
-		"observed_at": time.Now().UTC().Format(time.RFC3339Nano),
-		"error":       map[string]any{"code": control.Code, "message": control.Message},
-	})
 }

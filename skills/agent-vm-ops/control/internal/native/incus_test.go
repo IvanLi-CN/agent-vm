@@ -440,17 +440,49 @@ func TestIncusConfigRejectsGenericMissingInstance(t *testing.T) {
 }
 
 func TestIncusConfigRecognizesContextualMissingInstance(t *testing.T) {
+	for _, label := range []string{"project", "projectName"} {
+		t.Run(label, func(t *testing.T) {
+			binDir := t.TempDir()
+			diagnostic := `Error: Failed to fetch instance "missing" in ` + label + ` "agents": Instance not found`
+			script := "#!/bin/sh\necho '" + diagnostic + "' >&2\nexit 1\n"
+			if err := os.WriteFile(filepath.Join(binDir, "incus"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			_, err := NewIncusClient(NewRunner(), "agents").Config(context.Background(), "missing")
+			if !IsNotFound(err, "missing", "agents") {
+				t.Fatalf("contextual not-found not recognized: %v", err)
+			}
+			if IsNotFound(err, "other", "agents") || IsNotFound(err, "missing", "other") {
+				t.Fatal("unrelated instance or project classified as absent")
+			}
+			for _, truncated := range []Result{{Code: 1, Stderr: []byte(diagnostic), StderrTruncated: true}, {Code: 1, Stderr: []byte("Error: Instance not found")}} {
+				if IsNotFound(&CommandError{Result: truncated, Cause: exec.Command("false").Run()}, "missing", "agents") {
+					t.Fatal("uncertain diagnostic classified as absent")
+				}
+			}
+		})
+	}
+}
+
+func TestIncusMetricsUsesBoundedProjectQuery(t *testing.T) {
 	binDir := t.TempDir()
-	script := "#!/bin/sh\necho 'Error: Failed to fetch instance \"missing\" in projectName \"agents\": Instance not found' >&2\nexit 1\n"
-	if err := os.WriteFile(filepath.Join(binDir, "incus"), []byte(script), 0o755); err != nil {
+	logPath := filepath.Join(t.TempDir(), "argv")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$INCUS_ARGV_LOG\"\nprintf '%s\\n' 'incus_cpu_seconds_total{project=\"agents\"} 1'\n"
+	if err := os.WriteFile(filepath.Join(binDir, "incus"), []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	_, err := NewIncusClient(NewRunner(), "agents").Config(context.Background(), "missing")
-	if !IsNotFound(err, "missing", "agents") {
-		t.Fatalf("contextual not-found not recognized: %v", err)
+	t.Setenv("INCUS_ARGV_LOG", logPath)
+	text, err := NewIncusClient(NewRunner(), "agents & restricted").PrometheusMetrics(context.Background())
+	if err != nil || !strings.Contains(text, "incus_cpu_seconds_total") {
+		t.Fatalf("metrics: %q %v", text, err)
 	}
-	if IsNotFound(err, "other", "agents") || IsNotFound(err, "missing", "other") {
-		t.Fatal("unrelated instance or project classified as absent")
+	args, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(args) != "query\n/1.0/metrics?project=agents+%26+restricted\n" {
+		t.Fatalf("unexpected metrics command: %s", args)
 	}
 }

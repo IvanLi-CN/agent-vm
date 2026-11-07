@@ -1,0 +1,310 @@
+{
+  "uid": "__DASHBOARD_UID__",
+  "title": "__DASHBOARD_TITLE__",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "auto",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "服务与抓取状态",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "up{job=\"$controller_job\"}",
+          "legendFormat": "抓取",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "agent_vm_deployd_up{job=\"$controller_job\"}",
+          "legendFormat": "Deployd",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 2,
+      "title": "双槽位角色",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "agent_vm_deployd_slot_selected{job=\"$controller_job\"}",
+          "legendFormat": "{{slot}} / selected",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "agent_vm_deployd_slot_controller_owned{job=\"$controller_job\"}",
+          "legendFormat": "{{slot}} / controller",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          }
+        },
+        {
+          "refId": "C",
+          "expr": "agent_vm_deployd_slot_traffic_accepting{job=\"$controller_job\"}",
+          "legendFormat": "{{slot}} / traffic",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          }
+        },
+        {
+          "refId": "D",
+          "expr": "agent_vm_deployd_slot_ready{job=\"$controller_job\"}",
+          "legendFormat": "{{slot}} / ready",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 3,
+      "title": "快照新鲜度",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "agent_vm_deployd_snapshot_fresh{job=\"$controller_job\"}",
+          "legendFormat": "最近完成快照",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "观测来源",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 8
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "agent_vm_deployd_observation_up{job=\"$controller_job\"}",
+          "legendFormat": "{{source}} / up",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          }
+        },
+        {
+          "refId": "B",
+          "expr": "agent_vm_deployd_observation_fresh{job=\"$controller_job\"}",
+          "legendFormat": "{{source}} / fresh",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 5,
+      "title": "部署阶段",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "agent_vm_deployd_transaction_phase{job=\"$controller_job\"}",
+          "legendFormat": "{{phase}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    },
+    {
+      "id": 6,
+      "title": "恢复阻塞",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "__PROMETHEUS_UID__"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "agent_vm_deployd_recovery_required{job=\"$controller_job\"}",
+          "legendFormat": "needs_recovery",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "__PROMETHEUS_UID__"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom"
+        }
+      }
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "controller_job",
+        "type": "custom",
+        "hide": 2,
+        "query": "__CONTROLLER_JOB__",
+        "current": {
+          "text": "__CONTROLLER_JOB__",
+          "value": "__CONTROLLER_JOB__"
+        }
+      }
+    ]
+  },
+  "tags": [
+    "agent-vm",
+    "deployd"
+  ]
+}

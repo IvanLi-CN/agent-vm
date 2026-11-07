@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "files": {
+    "blue_config": "/etc/agent-vm-install-inputs/blue.json",
+    "green_config": "/etc/agent-vm-install-inputs/green.json",
+    "deployd_config": "/etc/agent-vm-install-inputs/deployd.json",
+    "caddy_config": "/etc/agent-vm-install-inputs/Caddyfile",
+    "caddy_environment": "/etc/agent-vm-install-inputs/caddy.env",
+    "rqlite_auth": "/etc/agent-vm-install-inputs/rqlite-auth.json",
+    "rqlite_certificate": "/etc/agent-vm-install-inputs/rqlite.crt",
+    "rqlite_private_key": "/etc/agent-vm-install-inputs/rqlite.key",
+    "caddy_certificate": "/etc/agent-vm-install-inputs/caddy.crt",
+    "caddy_private_key": "/etc/agent-vm-install-inputs/caddy.key"
+  }
+}

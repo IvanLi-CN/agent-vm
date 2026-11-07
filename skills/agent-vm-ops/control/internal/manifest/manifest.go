@@ -360,6 +360,38 @@ func validate(root map[string]any, directory string) error {
 }
 
 func validateProduct(root map[string]any, directory string) error {
+	return validateProductUsing(root, func(artifacts []checkedArtifact) error {
+		for _, artifact := range artifacts {
+			path := filepath.Join(directory, filepath.FromSlash(artifact.path))
+			info, err := os.Lstat(path)
+			if err != nil {
+				return fmt.Errorf("artifact_missing: %s: %w", artifact.path, err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+				return fmt.Errorf("artifact_unverified: artifact is not a regular file: %s", artifact.path)
+			}
+			if int64(info.Mode().Perm()) != artifact.mode {
+				return fmt.Errorf("artifact_mode_mismatch: artifact mode differs: %s", artifact.path)
+			}
+			digest, err := fileDigest(path)
+			if err != nil {
+				return fmt.Errorf("artifact_unverified: cannot read %s: %w", artifact.path, err)
+			}
+			if digest != artifact.sha256 {
+				return fmt.Errorf("artifact_checksum_mismatch: artifact checksum differs: %s", artifact.path)
+			}
+			if isGoBinaryArtifact(artifact.path) {
+				if err := verifyELF(path); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+
+	})
+}
+
+func validateProductUsing(root map[string]any, verify func([]checkedArtifact) error) error {
 	format, formatOK := integerValue(root["format"])
 	if !formatOK || (format != LegacyProductFormat && format != ProductFormat) {
 		return fmt.Errorf("manifest_format_unsupported: manifest format must be %d or %d", LegacyProductFormat, ProductFormat)
@@ -421,32 +453,7 @@ func validateProduct(root map[string]any, directory string) error {
 			return err
 		}
 	}
-	for _, artifact := range artifacts {
-		path := filepath.Join(directory, filepath.FromSlash(artifact.path))
-		info, err := os.Lstat(path)
-		if err != nil {
-			return fmt.Errorf("artifact_missing: %s: %w", artifact.path, err)
-		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return fmt.Errorf("artifact_unverified: artifact is not a regular file: %s", artifact.path)
-		}
-		if int64(info.Mode().Perm()) != artifact.mode {
-			return fmt.Errorf("artifact_mode_mismatch: artifact mode differs: %s", artifact.path)
-		}
-		digest, err := fileDigest(path)
-		if err != nil {
-			return fmt.Errorf("artifact_unverified: cannot read %s: %w", artifact.path, err)
-		}
-		if digest != artifact.sha256 {
-			return fmt.Errorf("artifact_checksum_mismatch: artifact checksum differs: %s", artifact.path)
-		}
-		if isGoBinaryArtifact(artifact.path) {
-			if err := verifyELF(path); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return verify(artifacts)
 }
 
 func isGoBinaryArtifact(path string) bool {
@@ -819,6 +826,13 @@ func verifyELF(path string) error {
 	header := make([]byte, 20)
 	if _, err := io.ReadFull(file, header); err != nil {
 		return fmt.Errorf("binary_format_mismatch: Go control artifact is not ELF64")
+	}
+	return verifyELFHeader(header)
+}
+
+func verifyELFHeader(header []byte) error {
+	if len(header) < 20 {
+		return fmt.Errorf("binary_format_mismatch: truncated ELF")
 	}
 	if header[0] != 0x7f || string(header[1:4]) != "ELF" || header[4] != 2 || header[5] != 1 {
 		return fmt.Errorf("binary_format_mismatch: Go control artifact must be little-endian ELF64")

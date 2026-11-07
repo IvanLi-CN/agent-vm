@@ -6,6 +6,8 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
+import { buildMaterialsArchive } from "../../../deploy/scripts/build-materials.ts";
+
 import { policyRevision, resolveReleaseTarget, parseSemVer, compareSemVer } from "./semver.ts";
 import {
   GhGithubAdapter,
@@ -294,12 +296,15 @@ async function release(): Promise<void> {
   const artifactRoot = join(stateRoot, "artifacts", version);
   mkdirSync(artifactRoot, { recursive: true, mode: 0o750 });
   const assets = {
+    [`agent-vm-${version}-deployment-materials.tar`]: join(artifactRoot, `agent-vm-${version}-deployment-materials.tar`),
     [`agent-vm-${version}-client.tar`]: join(artifactRoot, `agent-vm-${version}-client.tar`),
     [`agent-vm-${version}-linux-amd64.tar`]: join(artifactRoot, `agent-vm-${version}-linux-amd64.tar`),
     [`agent-vm-${version}-linux-arm64.tar`]: join(artifactRoot, `agent-vm-${version}-linux-arm64.tar`),
   };
   const targets: Record<string, string> = { client: assets[`agent-vm-${version}-client.tar`], "linux/amd64": assets[`agent-vm-${version}-linux-amd64.tar`], "linux/arm64": assets[`agent-vm-${version}-linux-arm64.tar`] };
   for (const [targetName, output] of Object.entries(targets)) if (!existsSync(output)) runBuilder(version, source, targetName, output);
+  const materialsArchive = assets[`agent-vm-${version}-deployment-materials.tar`];
+  if (!existsSync(materialsArchive)) buildMaterialsArchive(repositoryRoot, materialsArchive, source);
   const packageDigests = Object.fromEntries(Object.entries(assets).map(([name, path]) => [name, sha256(path)]));
   const provenancePath = join(artifactRoot, "release-provenance.json");
   writeFileSync(provenancePath, `${JSON.stringify({ schema_version: 1, format: 4, version, source_revision: source, policy_revision: identity.policy_revision, toolchain: { bun: "1.4.4", go: "go1.27.3", cgo_enabled: false }, packages: packageDigests }, null, 2)}\n`, { mode: 0o644 });

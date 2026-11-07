@@ -145,6 +145,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		observation.TrafficAccepting, _ = body["traffic_accepting"].(bool)
 		observation.ReleaseID, _ = body["release_id"].(string)
 		observation.SourceRevision, _ = body["source_revision"].(string)
+		observation.StateAuthority, _ = body["state_authority"].(string)
 		process, processOK := processIdentityFromHealth(body)
 		systemdErr := runtime.systemdProcessMatches(ctx, slot, process)
 		if !processOK || systemdErr != nil {
@@ -169,7 +170,28 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			runtime.quiesced[slot] = quiescenceEvidence{}
 		}
 		runtime.mu.Unlock()
-		metrics, doctor, metricsAt, metricsErr := runtime.observeCapacityHealth(ctx, slot)
+		bundle, bundleErr := runtime.observeSlotSources(ctx, slot)
+		readSource := func(source, action string) (map[string]any, time.Time, error) {
+			if bundleErr != nil {
+				return nil, time.Time{}, bundleErr
+			}
+			if bundle == nil {
+				return runtime.observeSource(ctx, slot, source, action)
+			}
+			value, ok := bundle[source].(map[string]any)
+			if !ok {
+				return nil, time.Time{}, errors.New("deployment observation lane missing")
+			}
+			if err := validateSourceResult(action, value); err != nil {
+				return nil, time.Time{}, err
+			}
+			at, ok := validObservedAt(value["observed_at"], time.Now().UTC())
+			if !ok {
+				return nil, time.Time{}, errors.New("deployment observation timestamp invalid")
+			}
+			return value, at, nil
+		}
+		metrics, metricsAt, metricsErr := readSource("capacity", "admin-metrics")
 		if metricsErr == nil {
 			inFlight, inFlightOK := integerValue(metrics["in_flight_operations"])
 			pending, pendingOK := arrayLengthValue(metrics["pending_operations"])
@@ -192,7 +214,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			runtime.invalidateMetrics(slot, "capacity")
 			snapshot.Consistent = false
 		}
-		inventory, inventoryAt, inventoryErr := runtime.observeSource(ctx, slot, "inventory", "admin-status")
+		inventory, inventoryAt, inventoryErr := readSource("inventory", "admin-status")
 		if inventoryErr != nil {
 			inventoryObservationUp = false
 			runtime.invalidateMetrics(slot, "inventory")
@@ -217,7 +239,8 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 				runtime.invalidateMetrics(slot, "inventory")
 			}
 		}
-		if metricsErr != nil {
+		doctor, doctorAt, doctorErr := readSource("health", "doctor")
+		if doctorErr != nil {
 			nativeObservationUp = false
 			runtime.invalidateMetrics(slot, "health")
 			snapshot.Consistent = false
@@ -237,7 +260,7 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 			if doctorValid {
 				runtime.rememberMetrics(slot, "health", observe.MetricsForSnapshot("health", health))
 			}
-			sourceTimes["native_observation"] = minTime(sourceTimes["native_observation"], metricsAt)
+			sourceTimes["native_observation"] = minTime(sourceTimes["native_observation"], doctorAt)
 		}
 		drainStatus, _, drainErr := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-status"})
 		if drainErr != nil {
@@ -483,6 +506,22 @@ func (runtime *HostRuntime) Verify(ctx context.Context, slot, bundle string) err
 		return fmt.Errorf("slot %s process identity was not verified after restart", slot)
 	}
 	return nil
+}
+
+// Recovery must bind its new grant to the live process and reverify the exact
+// original bundle. A persisted process ID never restores this binding.
+func (runtime *HostRuntime) PrepareRecoveryController(ctx context.Context, slot, bundle string) error {
+	if err := validSlot(slot); err != nil {
+		return err
+	}
+	process, err := runtime.waitSlotIdentity(ctx, slot, processIdentity{}, false)
+	if err != nil {
+		return err
+	}
+	runtime.mu.Lock()
+	runtime.stagedProcess[slot] = process
+	runtime.mu.Unlock()
+	return runtime.Verify(ctx, slot, bundle)
 }
 
 func (runtime *HostRuntime) VerifySlotIdentity(_ context.Context, slot, releaseID, sourceRevision string, capabilities []string) error {
@@ -1034,6 +1073,12 @@ func (runtime *HostRuntime) SwitchActive(ctx context.Context, slot string) error
 	if info, err := os.Lstat(runtime.Config.ActivePath); err == nil && info.Mode()&os.ModeSymlink == 0 {
 		return errors.New("active path is not a symlink")
 	}
+	// The selected slot must be part of the next systemd boot before routing
+	// is published. Enabled standby processes still start fenced and cannot
+	// reconstruct a controller role from this boot setting.
+	if err := runtime.systemctl(ctx, "enable", "agent-vm-native@"+slot+".service"); err != nil {
+		return fmt.Errorf("persist selected slot boot activation: %w", err)
+	}
 	temporary := filepath.Join(parent, ".active."+strconv.FormatInt(time.Now().UnixNano(), 10))
 	if err := os.Symlink(target, temporary); err != nil {
 		return err
@@ -1069,6 +1114,21 @@ func (runtime *HostRuntime) Drain(ctx context.Context, slot string) error {
 
 func (runtime *HostRuntime) ExitDrain(ctx context.Context, slot string) error {
 	if slot == "" || slot == "none" {
+		return nil
+	}
+	body, _, checkErr := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-status"})
+	if checkErr != nil {
+		return checkErr
+	}
+	result, validResult := body["result"].(map[string]any)
+	draining, validDraining := result["draining"].(bool)
+	if !validResult || !validDraining {
+		return errors.New("drain state was not verified")
+	}
+	if !draining {
+		runtime.mu.Lock()
+		runtime.quiesced[slot] = quiescenceEvidence{}
+		runtime.mu.Unlock()
 		return nil
 	}
 	_, status, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-exit", "session_id": deploydDrainSession, "operation_id": "deployd-drain-exit-" + strconv.FormatInt(time.Now().UnixNano(), 10), "generation": int64(0), "preserve_traffic": true})
@@ -1111,16 +1171,9 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		metrics, metricsCode, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "admin-metrics"})
+		value, err := runtime.quiescenceMetrics(ctx, slot)
 		if err != nil {
 			return err
-		}
-		if metricsCode != http.StatusOK {
-			return fmt.Errorf("slot %s metrics returned HTTP %d", slot, metricsCode)
-		}
-		value, ok := metrics["result"].(map[string]any)
-		if !ok {
-			return errors.New("old slot metrics result is missing")
 		}
 		pending, pendingOK := arrayLengthValue(value["pending_operations"])
 		inFlight, inFlightOK := integerValue(value["in_flight_operations"])
@@ -1198,7 +1251,7 @@ func quiescenceEvidenceProvesStopped(evidence quiescenceEvidence) bool {
 	return evidence.StopRequested && evidence.Process.PID > 0 && evidence.Process.StartTime != ""
 }
 
-func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease) error {
+func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease, authority string) error {
 	if target != "" && target != "none" {
 		if runtime.systemdSlotStopped(ctx, target) {
 			if err := runtime.systemctl(ctx, "start", "agent-vm-native@"+target+".service"); err != nil {
@@ -1216,6 +1269,9 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 				return fmt.Errorf("revoke target controller: %w; stop target after revoke failure: %v", err, stopErr)
 			}
 		} else {
+			if err := runtime.resumeRollbackDrainExit(ctx, target); err != nil {
+				return err
+			}
 			if err := runtime.Drain(ctx, target); err != nil {
 				return err
 			}
@@ -1237,6 +1293,19 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 		if err := runtime.waitSlot(ctx, previous); err != nil {
 			return err
 		}
+		body, status, err := runtime.slotRequest(ctx, runtime.socket(previous), http.MethodGet, "/internal/v1/health", nil)
+		observedAuthority, _ := body["state_authority"].(string)
+		if err != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) || body["process_ready"] != true || observedAuthority != authority || authority == "" {
+			return errors.New("rollback state authority was not verified before granting controller")
+		}
+		process, processOK := processIdentityFromHealth(body)
+		if !processOK {
+			return errors.New("rollback process identity is invalid")
+		}
+		runtime.mu.Lock()
+		runtime.stagedProcess[previous] = process
+		runtime.mu.Unlock()
+		lease.Expiry = time.Now().Add(runtime.Config.LeaseDuration())
 		if err := runtime.GrantController(ctx, previous, lease); err != nil {
 			return err
 		}
@@ -1271,7 +1340,7 @@ func (runtime *HostRuntime) waitSlotIdentity(ctx context.Context, slot string, p
 	if err := validSlot(slot); err != nil {
 		return processIdentity{}, err
 	}
-	deadline := time.NewTimer(10 * time.Second)
+	deadline := time.NewTimer(60 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
@@ -1348,6 +1417,23 @@ func (runtime *HostRuntime) activeSlot() (string, error) {
 }
 
 func (runtime *HostRuntime) control(ctx context.Context, socket string, request map[string]any) (map[string]any, int, error) {
+	action, _ := request["action"].(string)
+	if (action == "drain-enter" || action == "drain-exit") && ctx.Value(transactionRenewalKey{}) != true {
+		lease, owned, err := runtime.CurrentOwnedControllerLease(ctx)
+		if err != nil {
+			return nil, 0, err
+		}
+		if owned {
+			manager := NewManager(nil, runtime, runtime.Config.LeaseDuration(), time.Now)
+			renewalCtx, stop := manager.beginTransactionRenewal(ctx, lease)
+			body, status, err := runtime.controlOnce(renewalCtx, socket, request)
+			return body, status, errors.Join(err, stop())
+		}
+	}
+	return runtime.controlOnce(ctx, socket, request)
+}
+
+func (runtime *HostRuntime) controlOnce(ctx context.Context, socket string, request map[string]any) (map[string]any, int, error) {
 	body, status, err := runtime.slotRequest(ctx, socket, http.MethodPost, "/internal/v1/control", request)
 	if err != nil {
 		return nil, status, err
@@ -1369,6 +1455,25 @@ func (runtime *HostRuntime) control(ctx context.Context, socket string, request 
 		return nil, status, errors.New("slot control response result is missing")
 	}
 	return body, status, nil
+}
+
+func (runtime *HostRuntime) observeSlotSources(ctx context.Context, slot string) (map[string]any, error) {
+	body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/deployment-observation", nil)
+	if status == http.StatusNotFound || status == http.StatusMethodNotAllowed {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	version, ok := integerValue(body["protocol"])
+	if status != http.StatusOK || !responseOK(body) || !ok || version != 4 {
+		return nil, errors.New("deployment observation envelope invalid")
+	}
+	result, ok := body["result"].(map[string]any)
+	if !ok {
+		return nil, errors.New("deployment observation result missing")
+	}
+	return result, nil
 }
 
 func (runtime *HostRuntime) observeSource(ctx context.Context, slot, source, action string) (map[string]any, time.Time, error) {
@@ -1521,7 +1626,13 @@ func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, pat
 	if value != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
-	response, err := (&http.Client{Transport: transport, Timeout: 10 * time.Second}).Do(request)
+	timeout := 10 * time.Second
+	if path == "/internal/v1/control" {
+		if input, ok := value.(map[string]any); ok && (input["action"] == "drain-enter" || input["action"] == "drain-exit") {
+			timeout = 240 * time.Second
+		}
+	}
+	response, err := (&http.Client{Transport: transport, Timeout: timeout}).Do(request)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1552,8 +1663,11 @@ func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, pat
 }
 
 func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) error {
-	if action != "start" && action != "stop" && action != "restart" {
+	if action != "start" && action != "stop" && action != "restart" && action != "enable" && action != "reset-failed" {
 		return errors.New("unsupported systemd action")
+	}
+	if action == "reset-failed" && unit != "agent-vm-native@blue.service" && unit != "agent-vm-native@green.service" {
+		return errors.New("unsupported bootstrap recovery unit")
 	}
 	if !strings.HasPrefix(unit, "agent-vm-native@") || !strings.HasSuffix(unit, ".service") {
 		return errors.New("unsupported systemd unit")
