@@ -30,6 +30,19 @@ test("missing identity and malformed CLI fail before keys, journals or remote wr
   await expect(dispatch(selected(["sync", "--name", "../escape"]), f.client)).rejects.toMatchObject({ code: "invalid_name" });
 });
 
+test("scoped reconciliation pins identity and dry run has no operation intent or acquire", async () => {
+  const f = fixture();
+  const args = ["admin", "reconcile-session", "--task-id", "avm-target", "--generation", "2", "--pending-operation-id", "pending-target"];
+  await dispatch(selected(args), f.client);
+  expect(f.requests[0]).toMatchObject({ action: "admin-reconcile-session", session_id: "explicit", task_id: "avm-target", generation: 2, pending_operation_id: "pending-target", apply: false });
+  expect(f.requests[0].operation_id).toBeUndefined();
+  await dispatch(selected([...args, "--apply", "--operation-id", "precise-recovery"]), f.client);
+  expect(f.requests[1]).toMatchObject({ action: "admin-reconcile-session", generation: 2, apply: true, operation_id: "precise-recovery" });
+  expect(f.requests.map(r => r.action)).toEqual(["admin-reconcile-session", "admin-reconcile-session"]);
+  await expect(dispatch(selected(["admin", "reconcile-session", "--apply"]), f.client)).rejects.toMatchObject({ code: "invalid_request" });
+  expect(f.requests).toHaveLength(2);
+});
+
 test("resource canonicalization, live fencing and native command selection", async () => {
   expect(parseSize("12GiB", true)).toBe(12288); expect(parseSize("512M", true)).toBe(512); expect(parseSize("40G", false)).toBe(40);
   expect(() => parseSize("12GB", true)).toThrow(); expect(parseSize("9007199254740993GiB", false)).toBe(9007199254740993n);

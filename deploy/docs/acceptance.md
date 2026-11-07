@@ -30,3 +30,9 @@ bun skills/agent-vm/scripts/agent_vm.ts status --session-id deployment-acceptanc
 按[观测接入](observability.md)启动本次专属 Prometheus/Grafana，验证只有一个 Deployd target，容量和清单来自活动槽位，角色面板显示两个槽位。生成真实 VM 任务后检查容量与任务序列；缺失数据必须定位来源，不能作为成功证据。跨主机示例必须分别验证有效客户端证书成功、缺少或错误证书失败、ACL 外来源失败、Caddy 不提供 `/metrics`。
 
 验收记录应绑定候选 SHA、运行环境身份、命令、退出码、事务 ID 与时间范围。标注静态检查、测试适配器和完整实证的区别；任何未运行或失败项都不能填写为通过。
+
+## 生命周期恢复回归
+
+控制服务候选必须覆盖旧 pending journal 与缓存释放收尾；不得用清空数据库或放宽 worker 围栏通过验证。`go test ./internal/lifecycle` 包含跨页维护公平性、错误 binding、缓存释放拒绝条件和维护故障准入测试。
+
+真实 Incus 回归使用会话自有 Linux 来宾中的独立嵌套项目。`AGENT_VM_SCOPED_INCUS_PROJECT` 必须以 `scoped-reconcile-test-` 开头，三个 fixture `instance-target`、`instance-expired-peer`、`instance-active-peer` 必须实际 Running，并具有测试规定的受管 session/task/generation 和 proxy。未提供项目时测试会跳过，跳过不算原生验收通过。运行 `TestScopedReconcileIsolatedIncus` 验证精确恢复；重新建立相同 Running fixture 后设置 `AGENT_VM_SCOPED_INCUS_MODE=maintenance` 验证普通 scheduler 在未知历史 journal 下仍清理过期对象、保留有效租约并核验 cached release。两种模式不能复用前一模式已经停止的初始实例状态。

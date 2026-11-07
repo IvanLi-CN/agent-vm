@@ -67,12 +67,12 @@ var (
 	writeActions = map[string]bool{
 		"acquire": true, "renew": true, "release": true, "destroy": true,
 		"restart": true, "resize": true, "port-add": true, "port-remove": true,
-		"timer-expire": true, "drain-enter": true, "drain-exit": true, "admin-reconcile": true, "admin-gc": true,
+		"timer-expire": true, "drain-enter": true, "drain-exit": true, "admin-reconcile": true, "admin-reconcile-session": true, "admin-gc": true,
 	}
 	sessionActions = map[string]bool{
 		"status": true, "acquire": true, "renew": true, "release": true,
 		"destroy": true, "restart": true, "resize": true, "ssh-info": true,
-		"port-add": true, "port-list": true, "port-remove": true,
+		"port-add": true, "port-list": true, "port-remove": true, "admin-reconcile-session": true,
 	}
 )
 
@@ -524,7 +524,7 @@ func (s *Service) lockActionWithContext(ctx context.Context, action string, requ
 			return func() {}, err
 		}
 	}
-	if action == "acquire" || action == "release" || action == "destroy" || action == "resize" {
+	if action == "acquire" || action == "release" || action == "destroy" || action == "resize" || (action == "admin-reconcile-session" && requestBool(request, "apply")) {
 		if err := acquire("management-resource:image-storage"); err != nil {
 			for index := len(unlocks) - 1; index >= 0; index-- {
 				unlocks[index]()
@@ -532,7 +532,7 @@ func (s *Service) lockActionWithContext(ctx context.Context, action string, requ
 			return func() {}, err
 		}
 	}
-	if action == "admin-reconcile" || action == "timer-reconcile" || action == "admin-gc" || action == "timer-age-gc" {
+	if action == "admin-reconcile" || action == "admin-reconcile-session" || action == "timer-reconcile" || action == "admin-gc" || action == "timer-age-gc" {
 		if err := acquire("maintenance"); err != nil {
 			for index := len(unlocks) - 1; index >= 0; index-- {
 				unlocks[index]()
@@ -552,7 +552,7 @@ func (s *Service) lockActionWithContext(ctx context.Context, action string, requ
 		}
 	}
 	key := ""
-	if action != "drain-enter" && action != "drain-exit" && !releaseSensitiveAction(action, request) {
+	if action != "drain-enter" && action != "drain-exit" && action != "admin-reconcile-session" && !releaseSensitiveAction(action, request) {
 		if session := stringValue(request["session_id"]); session != "" {
 			key = "session:" + session
 		} else if taskID := stringValue(request["task_id"]); taskID != "" {
@@ -1335,7 +1335,7 @@ func (s *Service) mayRetryClearedMaintenance(ctx context.Context, operation stat
 
 func recoverableOperation(action string) bool {
 	switch action {
-	case "drain-enter", "drain-exit", "timer-expire", "admin-reconcile", "admin-gc", "timer-reconcile", "timer-age-gc":
+	case "drain-enter", "drain-exit", "timer-expire", "admin-reconcile", "admin-reconcile-session", "admin-gc", "timer-reconcile", "timer-age-gc":
 		return true
 	default:
 		return false
@@ -1385,7 +1385,7 @@ func activationSafeQueuedPort(operation state.Operation) bool {
 
 func operationHasNativeEffect(action string) bool {
 	switch action {
-	case "acquire", "release", "destroy", "restart", "resize", "port-add", "port-remove", "timer-expire", "admin-reconcile", "admin-gc", "timer-reconcile", "timer-age-gc":
+	case "acquire", "release", "destroy", "restart", "resize", "port-add", "port-remove", "timer-expire", "admin-reconcile", "admin-reconcile-session", "admin-gc", "timer-reconcile", "timer-age-gc":
 		return true
 	default:
 		return false
@@ -1396,7 +1396,7 @@ func releaseSensitiveAction(action string, request protocol.Request) bool {
 	switch action {
 	case "acquire", "renew", "release", "destroy", "restart", "resize", "port-add", "port-remove", "timer-expire":
 		return true
-	case "admin-reconcile", "timer-reconcile":
+	case "admin-reconcile", "admin-reconcile-session", "timer-reconcile":
 		return requestBool(request, "apply")
 	case "admin-gc", "timer-age-gc":
 		return true
@@ -1470,7 +1470,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if action == "admin-metrics" && (request["session_id"] != nil || request["operation_id"] != nil) {
 		return nil, protocol.NewError("invalid_request", "admin-metrics is sessionless and read-only", nil)
 	}
-	write := (writeActions[action] || isJournaledTimerAction(action, request)) && !(action == "admin-reconcile" && requestBool(request, "apply") == false && request["operation_id"] == nil)
+	write := (writeActions[action] || isJournaledTimerAction(action, request)) && !((action == "admin-reconcile" || action == "admin-reconcile-session") && requestBool(request, "apply") == false && request["operation_id"] == nil)
 	leaseExempt := action == "drain-enter" || action == "drain-exit"
 	if write && !leaseExempt && !s.mutationAllowed() {
 		return nil, protocol.NewError("controller_lease_required", "controller lease is required for mutation", map[string]any{"admission_ready": false})
@@ -1613,7 +1613,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if s.Snapshots != nil {
 		_ = s.publishSnapshot(action, response)
 	}
-	if write && !isJournaledTimerAction(action, request) {
+	if write && action != "admin-reconcile-session" && !isJournaledTimerAction(action, request) {
 		s.wakeScheduler()
 	}
 	return response, nil
@@ -2424,6 +2424,8 @@ func (s *Service) dispatchAction(ctx context.Context, action string, request pro
 		return s.adminSessionList(ctx)
 	case "admin-metrics":
 		return s.adminMetrics(ctx)
+	case "admin-reconcile-session":
+		return s.reconcileSession(ctx, request)
 	case "admin-reconcile", "timer-reconcile":
 		return s.reconcile(ctx, requestBool(request, "apply"))
 	case "admin-gc", "timer-age-gc":
@@ -2458,6 +2460,9 @@ func (s *Service) status(ctx context.Context, session string) (map[string]any, e
 }
 
 func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[string]any, error) {
+	if err := s.maintenanceAdmission(ctx); err != nil {
+		return nil, err
+	}
 	if s.resident && !s.Ready() {
 		return nil, protocol.NewError("startup_reconcile_required", "control service is not ready for admission", map[string]any{"outcome_verified": true})
 	}
@@ -3004,6 +3009,9 @@ func operationIDs(operations []state.Operation) []string {
 }
 
 func (s *Service) restart(ctx context.Context, request protocol.Request) (map[string]any, error) {
+	if err := s.maintenanceAdmission(ctx); err != nil {
+		return nil, err
+	}
 	if draining, err := s.isDraining(ctx); err != nil {
 		return nil, s.sqliteError(err)
 	} else if draining {
@@ -3877,6 +3885,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			resourcesValue := map[string]any{"allocated": allocated, "reserved": reserved, "allocated_and_reserved": allocatedAndReserved, "limits": limits, "remaining": remaining, "policy": map[string]any{"cpu_overcommit_ratio": s.Config.CPUOvercommitRatio, "memory_overcommit_ratio": s.Config.MemoryOvercommitRatio, "cpu_startup_pressure_full_avg10_percent": s.Config.CPUStartupPressureFullAvg10Percent}, "memory": memoryObservation, "memory_pressure": memoryObservation["pressure"]}
 			ctCPU := map[string]any{"capacity_vcpu": nil, "pressure": nil, "startup_pressure": nil}
 			defaultReasons := []any{}
+			if maintenanceErr := s.maintenanceAdmission(ctx); maintenanceErr != nil {
+				defaultReasons = append(defaultReasons, map[string]any{"code": protocol.AsError(maintenanceErr).Code, "message": "lifecycle maintenance is not healthy"})
+			}
 			if !s.Ready() {
 				defaultReasons = append(defaultReasons, map[string]any{"code": "startup_reconcile_required", "message": "control service is not ready for admission"})
 			}
@@ -4048,6 +4059,7 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 }
 
 func (s *Service) reconcile(ctx context.Context, apply bool, mode ...string) (map[string]any, error) {
+	var firstErr error
 	if apply {
 		pending, pendingErr := s.Store.PendingOperations(ctx)
 		if pendingErr != nil {
@@ -4062,10 +4074,13 @@ func (s *Service) reconcile(ctx context.Context, apply bool, mode ...string) (ma
 		if err := s.recoverPending(ctx, pending); err != nil {
 			return nil, err
 		}
+		if err := s.reconcileCachedReleases(ctx, pending); err != nil {
+			firstErr = err
+		}
 		startup := len(mode) > 0 && mode[0] == "startup"
 		if !startup {
 			if err := s.reconcileOrphanedAcquireOperations(ctx, pending); err != nil {
-				return nil, err
+				firstErr = err
 			}
 		}
 	}
@@ -4074,7 +4089,6 @@ func (s *Service) reconcile(ctx context.Context, apply bool, mode ...string) (ma
 		return nil, s.sqliteError(err)
 	}
 	actions := make([]any, 0)
-	var firstErr error
 	for _, task := range tasks {
 		if maintenanceExpiryCandidate(&task, s.Clock()) {
 			action := map[string]any{"task_id": task.TaskID, "generation": task.Generation, "action": "close-incomplete-or-expired"}
@@ -4553,7 +4567,12 @@ func (s *Service) doctor(ctx context.Context) (map[string]any, error) {
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	return map[string]any{"up": true, "ready": s.Ready(), "observed_at": nowString(s.Clock()), "issues": []any{}, "draining": draining, "state_epoch": epoch, "transport": "http-over-uds"}, nil
+	issues := []any{}
+	maintenanceErr := s.maintenanceAdmission(ctx)
+	if maintenanceErr != nil {
+		issues = append(issues, map[string]any{"code": protocol.AsError(maintenanceErr).Code, "message": "lifecycle maintenance is not healthy"})
+	}
+	return map[string]any{"up": true, "ready": s.Ready() && maintenanceErr == nil, "observed_at": nowString(s.Clock()), "issues": issues, "draining": draining, "state_epoch": epoch, "transport": "http-over-uds"}, nil
 }
 
 func (s *Service) sshInfo(ctx context.Context, request protocol.Request) (map[string]any, error) {
@@ -4814,6 +4833,10 @@ func (s *Service) configureNetwork(ctx context.Context, task *state.Task) error 
 
 func (s *Service) verifyOwnership(ctx context.Context, task *state.Task) (map[string]any, error) {
 	info, err := s.Guest.Config(ctx, task.InstanceName)
+	return s.verifyOwnershipInfo(task, info, err)
+}
+
+func (s *Service) verifyOwnershipInfo(task *state.Task, info map[string]any, err error) (map[string]any, error) {
 	if err != nil {
 		detail := map[string]any{"cause": err.Error(), "outcome_verified": false}
 		if native.IsNotFound(err, task.InstanceName, s.Config.Project) {

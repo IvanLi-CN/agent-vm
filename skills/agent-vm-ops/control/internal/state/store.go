@@ -197,14 +197,17 @@ type Operation struct {
 const MaintenanceCursorMetaKey = "maintenance_cursor"
 
 type MaintenanceLane struct {
-	NextAttemptAt        string `json:"next_attempt_at"`
-	Attempt              int    `json:"attempt"`
-	ScanAfterTaskID      string `json:"scan_after_task_id"`
-	ScanAfterOperationAt string `json:"scan_after_operation_at"`
-	ScanAfterOperationID string `json:"scan_after_operation_id"`
-	LastErrorCode        string `json:"last_error_code"`
-	LastErrorPhase       string `json:"last_error_phase"`
-	UpdatedAt            string `json:"updated_at"`
+	CycleFailed            bool   `json:"cycle_failed,omitempty"`
+	TaskCycleComplete      bool   `json:"task_cycle_complete,omitempty"`
+	OperationCycleComplete bool   `json:"operation_cycle_complete,omitempty"`
+	NextAttemptAt          string `json:"next_attempt_at"`
+	Attempt                int    `json:"attempt"`
+	ScanAfterTaskID        string `json:"scan_after_task_id"`
+	ScanAfterOperationAt   string `json:"scan_after_operation_at"`
+	ScanAfterOperationID   string `json:"scan_after_operation_id"`
+	LastErrorCode          string `json:"last_error_code"`
+	LastErrorPhase         string `json:"last_error_phase"`
+	UpdatedAt              string `json:"updated_at"`
 }
 
 type MaintenanceCursor struct {
@@ -1827,4 +1830,14 @@ func newEpoch() string {
 		return fmt.Sprintf("%032x", uint64(time.Now().UnixNano()))
 	}
 	return hex.EncodeToString(value[:])
+}
+
+// HasLaterSuccessfulSessionOperation bounds the cached-release recovery probe
+// to one boolean; recovery must not materialize an entire session history.
+func (s *Store) HasLaterSuccessfulSessionOperation(ctx context.Context, operationID string) (bool, error) {
+	var found bool
+	err := s.withRead(ctx, func(conn *sql.Conn) error {
+		return conn.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM operations AS original JOIN operations AS later ON later.session_id = original.session_id AND later.rowid > original.rowid WHERE original.operation_id = ? AND later.action IN ('acquire', 'renew', 'release', 'timer-expire') AND json_extract(later.response_json, '$.outcome') = 'success')`, operationID).Scan(&found)
+	})
+	return found, err
 }

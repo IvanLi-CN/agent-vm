@@ -50,7 +50,7 @@ export const ACTION_NAMES: readonly string[] = Object.freeze([
   "acquire",
   "admin-gc",
   "admin-metrics",
-  "admin-reconcile",
+  "admin-reconcile", "admin-reconcile-session",
   "admin-session-list",
   "admin-status",
   "destroy",

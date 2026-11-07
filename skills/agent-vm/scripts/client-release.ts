@@ -7,7 +7,7 @@ export const VERSION = "dev";
 export const LEGACY_PRODUCT_FORMAT = 3;
 export const PRODUCT_FORMAT = 4;
 export const LEGACY = "legacy-protocol-4";
-export const ACTIONS = ["acquire", "admin-gc", "admin-metrics", "admin-reconcile", "admin-session-list", "admin-status", "destroy", "doctor", "drain-enter", "drain-exit", "drain-status", "port-add", "port-list", "port-remove", "release", "renew", "resize", "restart", "ssh-info", "status", "timer-age-gc", "timer-expire", "timer-reconcile"];
+export const ACTIONS = ["acquire", "admin-gc", "admin-metrics", "admin-reconcile", "admin-reconcile-session", "admin-session-list", "admin-status", "destroy", "doctor", "drain-enter", "drain-exit", "drain-status", "port-add", "port-list", "port-remove", "release", "renew", "resize", "restart", "ssh-info", "status", "timer-age-gc", "timer-expire", "timer-reconcile"];
 export const CLIENT_DEPENDENCIES: ReadonlyArray<readonly [string, number]> = [["byte-fs.ts", 0o644], ["client-io.ts", 0o644], ["client-release.ts", 0o644], ["client.ts", 0o644], ["guest-source.ts", 0o644], ["sync-native.ts", 0o644], ["sync_worktree.ts", 0o755]];
 export const warning = (code: string, message: string, action?: string): Data => ({ code, message, ...(action === undefined ? {} : { action }) });
 export const shape = (v: any, keys: string[]): boolean => record(v) && Object.keys(v).sort().join(",") === [...keys].sort().join(",");

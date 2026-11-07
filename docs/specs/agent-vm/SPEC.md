@@ -2,7 +2,7 @@
 
 本文是 Agent VM 主题的规范设计文档和长期需求合同。状态后端迁移、恢复材料保留和蓝绿边界以 `REQ-AGENT-VM-028` 及其关联合同为准，部署控制器边界以 `REQ-AGENT-VM-031` 及其关联合同为准。相关 ADR 只记录决策背景、技术取舍和被否决方案，不替代本规范。
 
-## 上下文与范围
+## Context and Scope
 
 本文定义在已配置的 Incus 控制环境中管理 Linux 容器所需的客户端和控制进程。公共仓库记录生命周期合同并提供实现；部署方通过显式配置提供 Incus 项目、容器镜像、网络、地址池、存储路径、状态数据库和控制地址。
 
@@ -38,7 +38,13 @@
 
 ## 回收与运维操作
 
+
+精确过期恢复使用独立 `admin-reconcile-session` action，绑定 session、task、generation 和单个 pending acquire；只接受 request digest 与 ownership 一致且明确未尝试启动的 worker，拒绝未到期租约及同 session 的其他 pending intent。
+Preview 必须只读，apply 必须持有既有跨进程维护与 session 围栏，保留原始 worker/request evidence，沿既有 release 路径关闭目标 mapping、停止 container 并保留 cache，不得重放 acquire、处理其他 session 或推进全局 maintenance cursor。
+Ownership preflight 的固定只读查询必须保留 process-tree tracking，且不得占用 mutation worker identity；实际清理仍必须经过原有 native worker 启动与持久化围栏，只有确认留下 cache 才能终结目标 pending acquire。
+
 手工垃圾回收默认只预览，不执行修改，且只选择没有有效租约、访问清理已确认完成的受管停止缓存。按时间回收的定时器和容量准入可以采用不同的有界筛选策略，但都不能删除有效租约资源、过渡资源、调整目标或状态未知的资源。基础设施操作要求单独明确授权，并使用相同的配置路径和身份检查。
+
 
 ## 控制面发布与兼容性
 
@@ -74,7 +80,7 @@ Go 控制服务继续作为 Incus 操作、持久生命周期状态、租约代�
 
 这些观测约束的术语分别为独立观测通道、待完成或失败的清单读取、最近有效的容量指标族、保留的来源快照和原始观测时间戳。
 
-## 需求
+## Requirements
 
 ### REQ-AGENT-VM-010 - 分层来源
 
@@ -194,11 +200,17 @@ Incus 运行环境、域名及 OIDC 注册必须作为明确前置条件；部�
 
 预检必须保持只读，实际安装、升级和恢复必须显式执行并继续由既有发布器与 Deployd 协调。部署资料整理、示例验证和隔离验收不得排空或重启正在使用的生产服务、终止有效租约、销毁或重建用户 VM；VM 生命周期必须始终由 Incus 与现有控制服务管控，不引入旁路执行器。升级与恢复必须保留事务身份、有效租约和不确定操作证据，遇到冲突或无法验证的状态时停止并给出原事务查询入口，不得自动重放或伪造成功。
 
+### REQ-AGENT-VM-033 - 有界维护进展与缓存释放恢复
+
+Reconcile 必须在既有两秒、四条 pending 和十六条 task 的有界预算内公平推进扫描。未知 journal 或单个 task 的失败必须保留并持续报告，但不能永久饿死其他会话的过期清理；游标表示尝试位置，回绕后必须重试未解决对象。维护失败必须持久影响 doctor、admission_ready 与新 acquire/restart 准入；读取、取回、续租、释放和 scheduler 清理保持可用，只有 pending/task 两个扫描均完成无失败周期后才清除故障。已经同代 cached 的 release 必须先验证保存请求、digest、代次、可选 binding、worker/进程组静止、原生 ownership/Stopped、无 lease/预留/端口/proxy，才能保留原 evidence 并终结 journal，不得重放原生 release。手工全局 reconcile 对单个 orphan acquire 的校验失败仍须返回失败，同时允许清理其他会话的已到期任务。
+
 ## 同步与取回
 
 TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输到所属来宾源码目录，只原子替换助手拥有的内容。Git 文件选择、清单和原生文件系统访问必须保留路径字节、符号链接目标、权限和哈希；不支持的本地根路径表示必须明确失败。传输前拒绝子模块、符号链接父目录、保留的归属文件名和不安全名称。来宾事务是内存中的 Bun 操作，受受管镜像运行时、原生前置条件和外部执行期限保护；缺少 Bun 或原子操作能力时必须拒绝继续。原生锁、独占准备、基线身份比较、fsync 和原子目录交换，在冲突与失败时必须保留当前源码及相邻结果。提交结果不确定时，保留源码标记和准确恢复记录，返回退出码 75，不得推断已经回滚。[CLI 合同](contracts/cli.md#source-synchronization-transaction)定义执行边界、归属和恢复。导出直接向调用方流式发送 tar 归档，不创建服务端归档。
 
 ## Verification
+
+- `VER-AGENT-VM-033` 覆盖: `REQ-AGENT-VM-033`，通过 maintenance recovery、cached release、admission health 回归及隔离 Incus 的 scheduler/有效租约保护验证；`TestLegacyTimerRecoveryUsesBoundedTaskPage` 验证旧维护日志只恢复一页任务时，持久故障及扫描周期标志保持不变，新服务实例仍拒绝新准入。
 
 - `VER-AGENT-VM-010` 覆盖：`REQ-AGENT-VM-010` 通过[操作运行手册](OPERATIONS.md)的拓扑与来源章节、已接受的[拓扑与恢复 ADR](../../adr/0028-agent-vm-topology-recovery-boundary.md)和 `bin/test_agent_vm_documentation.py`。
 - `VER-AGENT-VM-011` 覆盖：`REQ-AGENT-VM-011` 通过[操作运行手册](OPERATIONS.md)的恢复流程、现有原生状态核对与操作日志行为测试，以及 `bin/test_agent_vm_documentation.py`。
@@ -288,6 +300,8 @@ TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输
 - [Agent VM 统一服务安全边界](../../adr/0043-agent-vm-unified-service-security-boundary.md)
 - [Agent VM SQLite 到 rqlite 状态迁移](../../adr/0044-agent-vm-state-migration-to-rqlite.md)
 - [Deployd 与蓝绿事务](../../adr/0045-agent-vm-deployment-controller.md)
+
+- [维护扫描进展与缓存释放收尾](../../adr/0047-agent-vm-maintenance-progress-and-recovery.md)
 
 ## 相关材料
 

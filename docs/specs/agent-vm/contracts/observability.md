@@ -163,3 +163,7 @@ CPU 视图区分逻辑预留组成、控制环境可见容量、`some.avg10`、`
 - [Agent VM 仅内存预留 admission ADR](../../../adr/0029-agent-vm-memory-reservation-only-admission.md)
 - [Agent VM overcommit 的 CPU 启动压力 ADR](../../../adr/0032-agent-vm-cpu-startup-pressure-for-overcommit.md)
 - [Agent VM 容量与清单观测 ADR](../../../adr/0033-agent-vm-capacity-and-inventory-observability.md)
+
+## 维护故障与准入
+
+`doctor.ready` 和 `admin-metrics.admission_ready` 必须反映持久 reconcile 故障；默认准入原因包含 `maintenance_unhealthy`，不得仅因为控制进程可响应或 startup 曾完成就报告可准入。scheduler 的内部启动就绪与维护健康分离，故障期间继续有界修复，读取、取回、续租和释放仍受原有合同保护。故障只有在 pending 与 task 两个扫描均完成无失败周期后才清除，不能由无关页的一次成功覆盖。

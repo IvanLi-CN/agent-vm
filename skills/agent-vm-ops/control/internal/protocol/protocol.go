@@ -27,7 +27,7 @@ var (
 )
 
 var Actions = map[string]struct{}{
-	"acquire": {}, "admin-gc": {}, "admin-metrics": {}, "admin-reconcile": {},
+	"acquire": {}, "admin-gc": {}, "admin-metrics": {}, "admin-reconcile": {}, "admin-reconcile-session": {},
 	"admin-session-list": {}, "admin-status": {}, "destroy": {}, "doctor": {},
 	"drain-enter": {}, "drain-exit": {}, "drain-status": {}, "port-add": {},
 	"port-list": {}, "port-remove": {}, "release": {}, "renew": {}, "resize": {},
@@ -453,6 +453,19 @@ func ValidateRequest(request Request) *Error {
 	if _, exists := request["generation"]; exists {
 		if value, ok := integer(request["generation"]); !ok || value < 0 {
 			return NewError("invalid_request", "generation must be a non-negative integer", nil)
+		}
+	}
+	if action == "admin-reconcile-session" {
+		generation, valid := integer(request["generation"])
+		session, sessionOK := request["session_id"].(string)
+		task, taskOK := request["task_id"].(string)
+		pending, pendingOK := request["pending_operation_id"].(string)
+		_, applyOK := request["apply"].(bool)
+		if !valid || generation < 1 || !sessionOK || !SessionIDPattern.MatchString(session) || !taskOK || !TaskIDPattern.MatchString(task) || !pendingOK || !SessionIDPattern.MatchString(pending) || !applyOK || pending == request["operation_id"] {
+			return NewError("invalid_request", "scoped reconciliation requires exact session_id, task_id, positive generation, pending_operation_id and boolean apply", nil)
+		}
+		if request["apply"] == false && request["operation_id"] != nil {
+			return NewError("invalid_request", "scoped reconciliation dry run must not create an operation intent", nil)
 		}
 	}
 	return nil
