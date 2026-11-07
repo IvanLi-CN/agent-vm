@@ -300,8 +300,12 @@ func (s *Service) recoverLegacyMaintenancePage(ctx context.Context, action strin
 	completedAt := s.Clock().UTC()
 	laneCursor.Attempt = 0
 	laneCursor.NextAttemptAt = nowString(completedAt)
-	laneCursor.LastErrorCode = ""
-	laneCursor.LastErrorPhase = ""
+	// A legacy reconcile only scans one task page. It cannot prove that
+	// both pending and task scans completed a clean cycle.
+	if lane != maintenanceReconcileLane {
+		laneCursor.LastErrorCode = ""
+		laneCursor.LastErrorPhase = ""
+	}
 	laneCursor.UpdatedAt = nowString(completedAt)
 	if err := s.commitMutationContext(ctx, func() error {
 		return s.Store.SetMaintenanceCursor(ctx, cursor)

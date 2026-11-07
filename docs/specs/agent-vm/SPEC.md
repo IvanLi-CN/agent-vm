@@ -210,7 +210,7 @@ TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输
 
 ## Verification
 
-- `VER-AGENT-VM-033` 覆盖: `REQ-AGENT-VM-033`，通过 maintenance recovery、cached release、admission health 回归及隔离 Incus 的 scheduler/有效租约保护验证。
+- `VER-AGENT-VM-033` 覆盖: `REQ-AGENT-VM-033`，通过 maintenance recovery、cached release、admission health 回归及隔离 Incus 的 scheduler/有效租约保护验证；`TestLegacyTimerRecoveryUsesBoundedTaskPage` 验证旧维护日志只恢复一页任务时，持久故障及扫描周期标志保持不变，新服务实例仍拒绝新准入。
 
 - `VER-AGENT-VM-010` 覆盖：`REQ-AGENT-VM-010` 通过[操作运行手册](OPERATIONS.md)的拓扑与来源章节、已接受的[拓扑与恢复 ADR](../../adr/0028-agent-vm-topology-recovery-boundary.md)和 `bin/test_agent_vm_documentation.py`。
 - `VER-AGENT-VM-011` 覆盖：`REQ-AGENT-VM-011` 通过[操作运行手册](OPERATIONS.md)的恢复流程、现有原生状态核对与操作日志行为测试，以及 `bin/test_agent_vm_documentation.py`。

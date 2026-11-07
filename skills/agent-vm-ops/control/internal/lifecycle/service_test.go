@@ -3531,6 +3531,16 @@ func TestLegacyTimerRecoveryUsesBoundedTaskPage(t *testing.T) {
 	}
 	defer store.Close()
 	ctx := context.Background()
+	initialCursor, err := store.MaintenanceCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialCursor.Reconcile.LastErrorCode = "operation_unverified"
+	initialCursor.Reconcile.LastErrorPhase = maintenanceReconcileLane
+	initialCursor.Reconcile.CycleFailed = true
+	if err := store.SetMaintenanceCursor(ctx, initialCursor); err != nil {
+		t.Fatal(err)
+	}
 	now := time.Date(2026, 11, 3, 0, 0, 0, 0, time.UTC)
 	future := now.Add(time.Hour).Format(time.RFC3339Nano)
 	for index := 0; index < 17; index++ {
@@ -3556,6 +3566,12 @@ func TestLegacyTimerRecoveryUsesBoundedTaskPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	blockedSession, blockedGeneration := "unknown-history", int64(1)
+	if err := store.RecordOperation(ctx, "unknown-history", "release", &blockedSession, &blockedGeneration, map[string]any{
+		"outcome": "pending", "worker": map[string]any{"state": "exited", "start_attempted": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	if err := service.recoverPending(ctx, pending); err != nil {
 		t.Fatal(err)
 	}
@@ -3572,6 +3588,17 @@ func TestLegacyTimerRecoveryUsesBoundedTaskPage(t *testing.T) {
 	}
 	if cursor.Reconcile.ScanAfterTaskID != "legacy-task-15" {
 		t.Fatalf("legacy timer cursor = %#v", cursor)
+	}
+	if cursor.Reconcile.LastErrorCode != "operation_unverified" || cursor.Reconcile.LastErrorPhase != maintenanceReconcileLane || !cursor.Reconcile.CycleFailed || cursor.Reconcile.TaskCycleComplete || cursor.Reconcile.OperationCycleComplete {
+		t.Fatalf("legacy task page cleared health without clean scan cycles: %#v", cursor.Reconcile)
+	}
+	restarted := New(store, config.Defaults(), Options{Clock: func() time.Time { return now }})
+	if err := restarted.maintenanceAdmission(ctx); protocol.AsError(err).Code != "maintenance_unhealthy" {
+		t.Fatalf("legacy recovery reopened admission: %v", err)
+	}
+	blocked, err := store.GetOperation(ctx, "unknown-history")
+	if err != nil || blocked == nil || blocked.Response["outcome"] != "pending" {
+		t.Fatalf("unknown intent was discarded: %#v %v", blocked, err)
 	}
 }
 
