@@ -2,6 +2,7 @@ package native
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -10,6 +11,27 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestOwnershipObservationDoesNotClaimMutationWorkerOrUnfenceStop(t *testing.T) {
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "incus"), []byte("#!/bin/sh\nprintf '%s\\n' '{\"config\":{\"user.agent-vm.managed\":\"native-v1\"}}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	client := NewIncusClient(NewRunner(), "agents")
+	blocked := errors.New("pending worker barrier")
+	recorder := &blockingWorkerRecorder{err: blocked}
+	ctx := WithWorkerRecorder(context.Background(), "maintenance", recorder)
+	if _, err := client.ObserveConfig(ctx, "instance-target"); err != nil {
+		t.Fatal(err)
+	}
+	if len(recorder.started) != 0 || len(recorder.finished) != 0 {
+		t.Fatal("read-only probe replaced mutation worker evidence")
+	}
+	if err := client.Stop(ctx, "instance-target"); !errors.Is(err, blocked) {
+		t.Fatalf("observation unfenced a mutation: %v", err)
+	}
+}
 
 func TestIncusInitUsesSystemContainerArguments(t *testing.T) {
 	binDir := t.TempDir()

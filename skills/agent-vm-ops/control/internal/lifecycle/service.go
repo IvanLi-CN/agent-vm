@@ -4783,6 +4783,10 @@ func (s *Service) configureNetwork(ctx context.Context, task *state.Task) error 
 
 func (s *Service) verifyOwnership(ctx context.Context, task *state.Task) (map[string]any, error) {
 	info, err := s.Guest.Config(ctx, task.InstanceName)
+	return s.verifyOwnershipInfo(task, info, err)
+}
+
+func (s *Service) verifyOwnershipInfo(task *state.Task, info map[string]any, err error) (map[string]any, error) {
 	if err != nil {
 		detail := map[string]any{"cause": err.Error(), "outcome_verified": false}
 		if native.IsNotFound(err, task.InstanceName, s.Config.Project) {

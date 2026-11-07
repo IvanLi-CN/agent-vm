@@ -717,6 +717,13 @@ func (c *IncusClient) Config(ctx context.Context, name string) (map[string]any, 
 	return c.json(ctx, "query", "/1.0/instances/"+name)
 }
 
+// ObserveConfig is a read-only ownership probe before an uncertain operation
+// is reconciled. Keep cancellation and process-tree tracking, but do not claim
+// or replace a mutation worker identity for this fixed GET query.
+func (c *IncusClient) ObserveConfig(ctx context.Context, name string) (map[string]any, error) {
+	return c.Config(context.WithValue(ctx, workerContextKey{}, workerBinding{}), name)
+}
+
 func (c *IncusClient) queryList(ctx context.Context, path, project string) ([]any, error) {
 	endpoint, err := url.Parse(path)
 	if err != nil {

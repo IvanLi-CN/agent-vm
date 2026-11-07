@@ -21,7 +21,7 @@ func (s *Service) reconcileSession(ctx context.Context, request protocol.Request
 		if task.TaskID == "" || task.TaskID != stringValue(request["task_id"]) {
 			return nil, protocol.NewError("stale_target", "reconciliation task identity does not match", nil)
 		}
-		if task.State != stateActive && task.State != statePreparing && task.State != stateClosing && task.State != stateCached {
+		if task.State != stateActive && task.State != statePreparing && task.State != stateClosing {
 			return nil, protocol.NewError("task_transition", "task is outside bounded expiry reconciliation", nil)
 		}
 		if task.LeaseExpiresAt != nil {
@@ -74,24 +74,20 @@ func (s *Service) reconcileSession(ctx context.Context, request protocol.Request
 		if s.Guest == nil {
 			return nil, protocol.NewError("native_unavailable", "scoped reconciliation requires native ownership verification", nil)
 		}
-		info, err := s.verifyOwnership(ctx, task)
+		var info map[string]any
+		if observer, ok := s.Guest.(interface {
+			ObserveConfig(context.Context, string) (map[string]any, error)
+		}); ok {
+			observed, probeErr := observer.ObserveConfig(ctx, task.InstanceName)
+			info, err = s.verifyOwnershipInfo(task, observed, probeErr)
+		} else {
+			info, err = s.verifyOwnership(ctx, task)
+		}
 		if err != nil {
 			return nil, err
 		}
 		if info["config"].(map[string]any)["user.agent-vm.generation"] != strconv.FormatInt(task.Generation, 10) {
 			return nil, protocol.NewError("ownership_mismatch", "scoped reconciliation requires the exact native generation", nil)
-		}
-		if task.State == stateCached {
-			if err := s.verifyCachedGuest(ctx, task); err != nil {
-				return nil, err
-			}
-			ports, err := s.Store.ListPorts(ctx, task.TaskID)
-			if err != nil {
-				return nil, s.sqliteError(err)
-			}
-			if len(ports) != 0 {
-				return nil, protocol.NewError("mapping_unverified", "cached target still has durable mappings", nil)
-			}
 		}
 		result := map[string]any{"dry_run": !requestBool(request, "apply"), "task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "pending_operation_id": pendingID, "previous_worker": cloneMap(worker), "action": "close-expired-and-retain-cache"}
 		if !requestBool(request, "apply") {
@@ -121,6 +117,9 @@ func (s *Service) reconcileSession(ctx context.Context, request protocol.Request
 		closed, err := s.releaseUnlocked(withInternalCleanup(ctx), cleanup, false)
 		if err != nil {
 			return nil, err
+		}
+		if closed["state"] != stateCached {
+			return nil, protocol.NewError("state_unverified", "expiry cleanup did not leave the expected cache", map[string]any{"outcome_verified": false})
 		}
 		terminal := map[string]any{"outcome": "error", "_request_digest": digest, "error": protocol.NewError("lease_released", "expired lease cleanup cancelled the unstarted acquire", map[string]any{"task_id": task.TaskID, "task_generation": task.Generation, "outcome_verified": true})}
 		if err := s.recordOperation(ctx, pendingID, pending.Action, pending.SessionID, pending.Generation, terminal); err != nil {

@@ -223,6 +223,11 @@ func TestScopedReconcileRefusesUnsafeOrStaleTargetBeforeEffects(t *testing.T) {
 		}},
 		{"wrong-generation", func(f *scopedFixture) { f.request["generation"] = int64(1) }},
 		{"wrong-task", func(f *scopedFixture) { f.request["task_id"] = "expired-peer" }},
+		{"foreign-native-generation", func(f *scopedFixture) {
+			task := f.guest.tasks["instance-target"]
+			task.Generation = 3
+			f.guest.tasks["instance-target"] = task
+		}},
 		{"missing-lease-deadline", func(f *scopedFixture) {
 			_ = f.store.UpdateTask(context.Background(), "target", map[string]any{"lease_expires_at": nil})
 		}},
