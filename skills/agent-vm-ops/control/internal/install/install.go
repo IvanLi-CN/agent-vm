@@ -103,6 +103,16 @@ func waitDaemon(ctx context.Context, client deployd.Client) error {
 }
 
 func Apply(ctx context.Context, input Inputs) (Report, error) {
+	if os.Geteuid() != 0 {
+		return Report{}, errors.New("--apply requires local root")
+	}
+	// Every later consumer, including the legacy wrapper, uses only this private
+	// copy. Preflight validates the bytes actually installed, not mutable paths.
+	input, cleanup, err := snapshotInputs(input)
+	if err != nil {
+		return Report{}, err
+	}
+	defer cleanup()
 	report, err := Preflight(ctx, input)
 	if err != nil {
 		return report, err

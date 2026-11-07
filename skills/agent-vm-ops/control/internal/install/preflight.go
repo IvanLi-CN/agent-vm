@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -104,10 +103,7 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 			} else if c.StateDB != blue.StateDB || c.Project != blue.Project || c.Network != blue.Network || c.Pool != blue.Pool || c.ImageFingerprint != blue.ImageFingerprint {
 				add(errors.New("blue and green must share the same business authority and Incus environment"))
 			}
-			parsed, e := url.Parse(c.StateDB)
-			if e != nil || parsed.Hostname() != "127.0.0.1" || parsed.Port() != "4001" || parsed.User == nil || parsed.RawQuery != "" {
-				add(errors.New("initial installation requires the authenticated loopback rqlite endpoint"))
-			}
+			add(config.ValidateInstallationAuthority(c.StateDB))
 		}
 		d, e := deployd.Load(cfg.Files["deployd_config"])
 		if e != nil {
@@ -118,6 +114,7 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 			if d.Socket != defaults.Socket || d.Database != defaults.Database || d.ActivePath != defaults.ActivePath || d.ReleaseRoot != defaults.ReleaseRoot || d.BlueSocket != defaults.BlueSocket || d.GreenSocket != defaults.GreenSocket {
 				add(errors.New("installer requires fixed Deployd paths"))
 			}
+			add(validateMigrationLayout(d.Migration, defaults.Migration))
 			if deployd.MetricsAddressRequiresTLS(d.MetricsListen) {
 				if cfg.Files["metrics_certificate"] == "" || d.MetricsTLS.Certificate != targets["metrics_certificate"].path || d.MetricsTLS.PrivateKey != targets["metrics_private_key"].path || d.MetricsTLS.ClientCA != targets["metrics_client_ca"].path {
 					add(errors.New("non-loopback metrics requires the complete fixed metrics TLS input set"))
@@ -145,4 +142,13 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 		return report, errors.New("installation preflight blocked")
 	}
 	return report, nil
+}
+
+// The general daemon supports custom layouts; the installer owns only the
+// fixed service stack and must never redirect migration reads or deletions.
+func validateMigrationLayout(got, want deployd.MigrationConfig) error {
+	if got.LegacySocket != want.LegacySocket || got.LegacyUnit != want.LegacyUnit || got.LegacyStateDB != want.LegacyStateDB || got.RQLiteUnit != want.RQLiteUnit || got.RQLiteCAFile != want.RQLiteCAFile || got.RQLiteAuthFile != want.RQLiteAuthFile || got.RecoveryDirectory != want.RecoveryDirectory || got.RQLiteURL != "https://127.0.0.1:4001" {
+		return errors.New("installer requires fixed local migration paths and rqlite authority")
+	}
+	return nil
 }

@@ -40,6 +40,14 @@ test('release materials archive requires the exact clean revision', async () => 
     expect(JSON.parse(new TextDecoder().decode(listing.stdout)).sort()).toEqual(['README.md','materials-manifest.json']);
     const manifest=Bun.spawnSync(['tar','-xOf',output,'materials-manifest.json'],{stdout:'pipe',stderr:'pipe'});
     expect(JSON.parse(new TextDecoder().decode(manifest.stdout)).source_revision).toBe(revision);
+    // Execute the documented extraction flags under a strict operator umask.
+    const extracted=join(root,'extracted');mkdirSync(extracted);
+    const extraction=Bun.spawnSync(['python3','-c',
+      'import os,subprocess,sys; os.umask(0o077); subprocess.run(["tar","--extract","--file",sys.argv[1],"--directory",sys.argv[2],"--no-same-owner","--same-permissions","--keep-old-files"],check=True)',output,extracted],{stdout:'pipe',stderr:'pipe'});
+    expect(extraction.exitCode).toBe(0);
+    const permissions=Bun.spawnSync(['python3','-c',
+      'import json,pathlib,sys; p=pathlib.Path(sys.argv[1]); m=json.loads((p/"materials-manifest.json").read_text()); assert all((p/f["path"]).stat().st_mode & 0o777 == f["mode"] for f in m["files"])',extracted],{stdout:'pipe',stderr:'pipe'});
+    expect(permissions.exitCode).toBe(0);
     writeFileSync(join(source,'deploy','README.md'),'changed');
     expect(()=>buildMaterialsArchive(source,join(root,'dirty.tar'),revision)).toThrow('clean matching source revision');
   } finally {rmSync(root,{recursive:true,force:true});}

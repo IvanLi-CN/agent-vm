@@ -23,7 +23,7 @@ sudo chmod 0700 /var/tmp/agent-vm-install/agent-vm-deploy
 sudo mkdir -m 0700 /var/tmp/agent-vm-install/materials
 sudo tar --extract --file /var/tmp/agent-vm-install/deployment-materials.tar \
   --directory /var/tmp/agent-vm-install/materials \
-  --no-same-owner --no-same-permissions --keep-old-files
+  --no-same-owner --same-permissions --keep-old-files
 ```
 
 ## 准备受保护输入
@@ -65,7 +65,7 @@ sudo /var/tmp/agent-vm-install/agent-vm-deploy install \
   --apply
 ```
 
-安装器验证固定版本 Caddy 和 rqlite 的下载摘要，安装专用用户、目录、配置、二进制与 systemd 资源，再启动 rqlite 和 Deployd。Deployd 的首次安装事务委托控制服务直接初始化空 rqlite，验证 blue 后授予唯一 controller lease、启用 traffic 并原子创建 active；Caddy 最后启动。Deployd 的部署 SQLite 位于独立部署目录，不能将它误认为业务 SQLite。
+安装器先把产品包、部署资料及受保护配置复制到仅本次安装进程可读写的临时目录，再验证实际使用的副本；安装记录绑定的配置摘要与后续安装使用同一份字节，原始输入后续变化不会改变本次执行。迁移配置必须保留示例中的固定本机路径与 `https://127.0.0.1:4001` 地址。安装器验证固定版本 Caddy 和 rqlite 的下载摘要，安装专用用户、目录、配置、二进制与 systemd 资源，再启动 rqlite 和 Deployd。Deployd 的首次安装事务委托控制服务直接初始化空 rqlite，验证 blue 后授予唯一 controller lease、启用 traffic 并原子创建 active；Caddy 最后启动。Deployd 的部署 SQLite 位于独立部署目录，不能将它误认为业务 SQLite。
 
 冷启动时，槽位先通过受保护 HTTPS 接口验证 rqlite 状态与 strong read，再启动控制进程；进程健康接口建立后 Deployd 才开始组合观测。仅有 rqlite 进程或端口不代表后端就绪，检查失败会让 unit 启动失败并保留恢复证据。
 
