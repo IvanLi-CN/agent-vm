@@ -67,12 +67,12 @@ var (
 	writeActions = map[string]bool{
 		"acquire": true, "renew": true, "release": true, "destroy": true,
 		"restart": true, "resize": true, "port-add": true, "port-remove": true,
-		"timer-expire": true, "drain-enter": true, "drain-exit": true, "admin-reconcile": true, "admin-gc": true,
+		"timer-expire": true, "drain-enter": true, "drain-exit": true, "admin-reconcile": true, "admin-reconcile-session": true, "admin-gc": true,
 	}
 	sessionActions = map[string]bool{
 		"status": true, "acquire": true, "renew": true, "release": true,
 		"destroy": true, "restart": true, "resize": true, "ssh-info": true,
-		"port-add": true, "port-list": true, "port-remove": true,
+		"port-add": true, "port-list": true, "port-remove": true, "admin-reconcile-session": true,
 	}
 )
 
@@ -524,7 +524,7 @@ func (s *Service) lockActionWithContext(ctx context.Context, action string, requ
 			return func() {}, err
 		}
 	}
-	if action == "acquire" || action == "release" || action == "destroy" || action == "resize" {
+	if action == "acquire" || action == "release" || action == "destroy" || action == "resize" || (action == "admin-reconcile-session" && requestBool(request, "apply")) {
 		if err := acquire("management-resource:image-storage"); err != nil {
 			for index := len(unlocks) - 1; index >= 0; index-- {
 				unlocks[index]()
@@ -532,7 +532,7 @@ func (s *Service) lockActionWithContext(ctx context.Context, action string, requ
 			return func() {}, err
 		}
 	}
-	if action == "admin-reconcile" || action == "timer-reconcile" || action == "admin-gc" || action == "timer-age-gc" {
+	if action == "admin-reconcile" || action == "admin-reconcile-session" || action == "timer-reconcile" || action == "admin-gc" || action == "timer-age-gc" {
 		if err := acquire("maintenance"); err != nil {
 			for index := len(unlocks) - 1; index >= 0; index-- {
 				unlocks[index]()
@@ -552,7 +552,7 @@ func (s *Service) lockActionWithContext(ctx context.Context, action string, requ
 		}
 	}
 	key := ""
-	if action != "drain-enter" && action != "drain-exit" && !releaseSensitiveAction(action, request) {
+	if action != "drain-enter" && action != "drain-exit" && action != "admin-reconcile-session" && !releaseSensitiveAction(action, request) {
 		if session := stringValue(request["session_id"]); session != "" {
 			key = "session:" + session
 		} else if taskID := stringValue(request["task_id"]); taskID != "" {
@@ -1333,7 +1333,7 @@ func (s *Service) mayRetryClearedMaintenance(ctx context.Context, operation stat
 
 func recoverableOperation(action string) bool {
 	switch action {
-	case "drain-enter", "drain-exit", "timer-expire", "admin-reconcile", "admin-gc", "timer-reconcile", "timer-age-gc":
+	case "drain-enter", "drain-exit", "timer-expire", "admin-reconcile", "admin-reconcile-session", "admin-gc", "timer-reconcile", "timer-age-gc":
 		return true
 	default:
 		return false
@@ -1383,7 +1383,7 @@ func activationSafeQueuedPort(operation state.Operation) bool {
 
 func operationHasNativeEffect(action string) bool {
 	switch action {
-	case "acquire", "release", "destroy", "restart", "resize", "port-add", "port-remove", "timer-expire", "admin-reconcile", "admin-gc", "timer-reconcile", "timer-age-gc":
+	case "acquire", "release", "destroy", "restart", "resize", "port-add", "port-remove", "timer-expire", "admin-reconcile", "admin-reconcile-session", "admin-gc", "timer-reconcile", "timer-age-gc":
 		return true
 	default:
 		return false
@@ -1394,7 +1394,7 @@ func releaseSensitiveAction(action string, request protocol.Request) bool {
 	switch action {
 	case "acquire", "renew", "release", "destroy", "restart", "resize", "port-add", "port-remove", "timer-expire":
 		return true
-	case "admin-reconcile", "timer-reconcile":
+	case "admin-reconcile", "admin-reconcile-session", "timer-reconcile":
 		return requestBool(request, "apply")
 	case "admin-gc", "timer-age-gc":
 		return true
@@ -1468,7 +1468,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if action == "admin-metrics" && (request["session_id"] != nil || request["operation_id"] != nil) {
 		return nil, protocol.NewError("invalid_request", "admin-metrics is sessionless and read-only", nil)
 	}
-	write := (writeActions[action] || isJournaledTimerAction(action, request)) && !(action == "admin-reconcile" && requestBool(request, "apply") == false && request["operation_id"] == nil)
+	write := (writeActions[action] || isJournaledTimerAction(action, request)) && !((action == "admin-reconcile" || action == "admin-reconcile-session") && requestBool(request, "apply") == false && request["operation_id"] == nil)
 	leaseExempt := action == "drain-enter" || action == "drain-exit"
 	if write && !leaseExempt && !s.mutationAllowed() {
 		return nil, protocol.NewError("controller_lease_required", "controller lease is required for mutation", map[string]any{"admission_ready": false})
@@ -1600,7 +1600,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if s.Snapshots != nil {
 		_ = s.publishSnapshot(action, response)
 	}
-	if write && !isJournaledTimerAction(action, request) {
+	if write && action != "admin-reconcile-session" && !isJournaledTimerAction(action, request) {
 		s.wakeScheduler()
 	}
 	return response, nil
@@ -2391,6 +2391,8 @@ func (s *Service) dispatchAction(ctx context.Context, action string, request pro
 		return s.adminSessionList(ctx)
 	case "admin-metrics":
 		return s.adminMetrics(ctx)
+	case "admin-reconcile-session":
+		return s.reconcileSession(ctx, request)
 	case "admin-reconcile", "timer-reconcile":
 		return s.reconcile(ctx, requestBool(request, "apply"))
 	case "admin-gc", "timer-age-gc":

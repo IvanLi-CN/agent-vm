@@ -44,6 +44,19 @@ func (scheduler *Scheduler) Run(ctx context.Context) error {
 	return scheduler.run(ctx, time.Second, 15*time.Minute)
 }
 
+// RunDeferred keeps the normal authority and request boundary alive for
+// explicitly scoped operator recovery. It never marks admission ready, runs
+// the startup callback, advances maintenance cursors, expires leases, or runs
+// GC. A normal restart is required to restore automatic lifecycle maintenance.
+func (scheduler *Scheduler) RunDeferred(ctx context.Context) error {
+	scheduler.Service.MarkNotReady()
+	go scheduler.sampleLoop(ctx, "admin-metrics", "capacity", 10*time.Second)
+	go scheduler.sampleLoop(ctx, "admin-status", "inventory", 30*time.Second)
+	go scheduler.sampleLoop(ctx, "doctor", "health", 15*time.Second)
+	<-ctx.Done()
+	return nil
+}
+
 func (scheduler *Scheduler) run(ctx context.Context, reconcileInterval, ageInterval time.Duration) error {
 	go scheduler.sampleLoop(ctx, "admin-metrics", "capacity", 10*time.Second)
 	go scheduler.sampleLoop(ctx, "admin-status", "inventory", 30*time.Second)

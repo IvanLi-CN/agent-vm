@@ -13,7 +13,8 @@ const HELP = `Usage: agent-vm [--session-id ID] COMMAND [OPTIONS]
 Commands: version, help, doctor, status, acquire, renew, release, destroy, restart,
   resize, ssh-info, ssh, exec -- ARGV, sync --name NAME, upload SOURCE DESTINATION,
   download SOURCE DESTINATION, export PATH, port add|list|remove,
-  admin status|metrics|session list|drain enter|status|exit|reconcile|gc.
+  admin status|metrics|session list|drain enter|status|exit|reconcile|reconcile-session|gc.
+Scoped reconciliation: --session-id ID --task-id ID --generation N --pending-operation-id ID [--apply].
 Mutation options: --operation-id ID. Resource options: --cpu N --memory SIZE --disk SIZE.
 Resize: --live (memory only) or --allow-restart. Use COMMAND --help for options.
 `;
@@ -27,6 +28,7 @@ const paths: Record<string, string[]> = {
   "admin status": [], "admin metrics": [], "admin session list": [],
   "admin drain enter": [], "admin drain status": [], "admin drain exit": [],
   "admin reconcile": ["apply", "operation-id"], "admin gc": ["apply", "operation-id"],
+  "admin reconcile-session": ["task-id", "generation", "pending-operation-id", "apply", "operation-id"],
 };
 export interface Args { command: string; options: Data; positional: string[]; rest: string[]; }
 export function parseArgs(argv: string[]): Args {
@@ -114,6 +116,12 @@ export async function dispatch(args: Args, client = new Client(), native = inher
   }
   if (cmd.startsWith("admin ")) {
     const action = cmd.slice(6);
+    if (action === "reconcile-session") {
+      if (typeof o["generation"] !== "string" || !/^[1-9]\d*$/.test(o["generation"]) || typeof o["task-id"] !== "string" || !/^[a-z0-9][a-z0-9-]{0,47}$/.test(o["task-id"]) || typeof o["pending-operation-id"] !== "string" || !/^[A-Za-z0-9_.:@/-]{1,160}$/.test(o["pending-operation-id"])) fail("invalid_request", "scoped reconciliation requires --task-id, positive --generation and --pending-operation-id");
+      const fields = { task_id: o["task-id"], pending_operation_id: o["pending-operation-id"], apply: !!o.apply };
+      if (!o.apply && o["operation-id"] !== undefined) fail("invalid_request", "dry run does not accept --operation-id");
+      return client.request("admin-reconcile-session", { session, generation: BigInt(o.generation), write: !!o.apply, operationId: o["operation-id"], fields });
+    }
     if (action === "status" || action === "session list") return client.request(action === "status" ? "admin-status" : "admin-session-list", { session });
     if (action.startsWith("drain ")) { const drain = action.slice(6); return drain === "status" ? client.request("drain-status", { session }) : mutate("drain-" + drain, {}, 0); }
     return mutate("admin-" + action, { apply: !!o.apply }, 0);

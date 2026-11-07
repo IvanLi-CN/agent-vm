@@ -52,6 +52,15 @@ native、槽位和 Deployd unit 按各自的固定 unit 权限运行，管理 AP
 
 ## 控制面发布
 
+### 延迟自动维护的恢复启动
+
+`agent-vm-control serve --defer-maintenance` 保留正常的单一 Go 控制权威、controller lease、受保护 UDS、请求 journal 和 native worker 围栏，但不执行 startup recovery callback、全局 startup reconciliation、expiry 或 age-GC，也不标记 admission ready。
+该模式用于明确的临时运维恢复；已有有效租约的 read、renew 和 release 仍通过原有请求合同处理，精确恢复使用 `admin-reconcile-session`，不触发全局 scheduler wake。
+其他 session 的实例与映射不会因后台循环改变，但暂停期间到期的租约也不会自动关闭映射或停止实例，必须把这一期限影响列入维护范围并限定维护窗口。
+健康响应保持 not ready；该模式不能伪装成正常发布的 healthy candidate，不能绕过 deployd 的 activation、角色交接或 quiescence 检查。
+使用正常受控安装路径无法进入该模式时，应提交精确产物与维护启动方案供审查，不得用第二个 Go authority、直接改数据库或临时脚本代替。
+恢复自动维护需要正常模式重启；重启前重新预览全局 reconciliation 范围，不能把精确 action 的授权扩展成其他 session 的 cleanup 授权。
+
 control-plane release 是一个逻辑 compatibility unit，包含 local client、Go control service 或 legacy bridge、systemd assets、release metadata 和 exact artifact checksums。
 它排除 deployment configuration、credentials、connection material、state databases 及 WAL/journals、locks、Incus container data 和 guest images。
 release manifest 声明 protocol、source revision、artifact integrity、适用时的 target/toolchain，以及每个支持方向上的 per-operation request/response/semantic compatibility。

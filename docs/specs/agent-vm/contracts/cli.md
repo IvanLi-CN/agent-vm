@@ -57,6 +57,17 @@ CLI 不接收 rqlite 地址、数据库路径、SQL 或凭据，也不绕过 Dep
 | `admin drain enter\|status\|exit` | 在允许安全 retrieval 和 release 的同时控制 admission。 |
 | `admin session list` | 列出 managed session records。 |
 | `admin reconcile [--apply]` / `admin gc [--apply]` | 默认 preview；只在 authorized operations task 内 apply。 |
+| `admin reconcile-session --task-id ID --generation N --pending-operation-id ID [--apply]` | 仅对选中 session 的指定 task/generation 和单个未启动 acquire 做过期清理，保留 cache；默认只读 preview。 |
+
+### 精确 session reconciliation
+
+`admin-reconcile-session` 是独立的 Go control action，不降级为全局 `admin-reconcile`；不支持该 action 的 peer 必须在 effect 前拒绝。请求必须同时指定 `session_id`、`task_id`、正整数 `generation`、`pending_operation_id` 和 boolean `apply`。默认 preview 不携带 `operation_id`，不创建 operation intent；apply 使用自己的幂等 operation ID，且不得与目标 pending ID 相同。
+
+该入口仅接受目标 generation 的 inactive、pending acquire：保存的 request identity/digest 必须一致，worker 必须明确为 `starting` 或 `exited`、`start_attempted=false`，且不存在 PID、process group 或 start-time identity。有效或尚未到期的 lease、外部 operation、其他同 session pending intent、未知 native ownership 和矛盾 worker evidence 均拒绝；不重放 acquire，不启动、续租、resize 或删除 container。
+
+Apply 与全局维护共享 process-independent maintenance fence，并在精确 session lock 内重新检查 generation/deadline/ownership。它先保存不可变的原始 worker/request evidence，再通过既有 worker reconciliation 和 expiry-release 路径移除目标 mappings、停止过期 container、保留同 generation cache，最后将指定 acquire 标记为 `lease_released`。Cleanup 不确定时保留 pending journal 和恢复证据，不宣告成功。重复同 operation ID 使用既有 journal replay；不同 target 或 generation 不得复用该 intent。
+
+该 action 不访问全局 pending recovery 列表、不推进维护 cursor、不唤醒全局 scheduler，也不取消其他 acquire。它不会自动部署自身；控制器升级的 startup reconciliation 仍是独立的全局行为，必须单独核对部署授权范围。
 
 `agent-vm-deploy migrate` 是首次部署专用的自动迁移入口。
 发布器在启动双槽位前调用它；
