@@ -6051,6 +6051,100 @@ func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
 	}
 }
 
+func TestSupersededOperationsConsumeReconciledExitEvidence(t *testing.T) {
+	for _, action := range []string{"acquire", "renew", "resize", "restart", "release"} {
+		t.Run(action, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			session, generation := "superseded-"+action, int64(1)
+			taskGeneration := generation
+			if action == "acquire" {
+				taskGeneration = 3
+			}
+			now := nowString(time.Now())
+			task := state.Task{TaskID: "superseded-task", SessionID: session, Generation: taskGeneration, State: stateCached, InstanceName: "superseded-instance", CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+			if err := store.InsertTask(ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			req := protocol.Request{"protocol": protocol.Version, "action": action, "session_id": session, "generation": generation, "operation_id": "original"}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker := map[string]any{"state": "running", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1"}
+			originalResponse := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest}
+			if action != "renew" {
+				originalResponse["worker"] = worker
+			}
+			if err := store.RecordOperation(ctx, "original", action, &session, &generation, originalResponse); err != nil {
+				t.Fatal(err)
+			}
+			guest := &quiescentStartupGuest{startupGuest: &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": fmt.Sprint(taskGeneration)}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}}
+			service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+			if err := service.reconcilePendingWorker(ctx, "original"); err != nil {
+				t.Fatal(err)
+			}
+			before, err := store.GetOperation(ctx, "original")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if action != "renew" {
+				exit := before.Response["worker"].(map[string]any)
+				if exit["state"] != "exited" || exit["observed_at"] == nil || exit["finished_at"] != nil {
+					t.Fatalf("not actual reconciler shape: %#v", exit)
+				}
+			}
+			laterAction, laterGeneration := "release", taskGeneration
+			result := map[string]any{"task_id": task.TaskID, "session_id": session, "generation": taskGeneration, "state": stateCached, "effective_lease": false}
+			if action == "renew" {
+				laterAction = "renew"
+				result["state"], result["effective_lease"] = stateActive, true
+			}
+			if action == "acquire" {
+				laterAction, laterGeneration = "acquire", int64(2)
+				result["state"], result["effective_lease"] = stateActive, true
+			}
+			laterReq := protocol.Request{"protocol": protocol.Version, "action": laterAction, "session_id": session, "generation": laterGeneration, "operation_id": "later"}
+			later := protocol.SuccessWithRelease(laterReq, result, nil, nil)
+			laterDigest, err := protocol.Digest(laterReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			later["_request_digest"] = laterDigest
+			if err := store.RecordOperation(ctx, "later", laterAction, &session, &laterGeneration, later); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.StartupReconcile(ctx); err != nil {
+				t.Fatalf("startup: %v", err)
+			}
+			original, err := store.GetOperation(ctx, "original")
+			if err != nil || original == nil || original.Response["outcome"] != "error" || original.Response["_request"] == nil || (action != "renew" && original.Response["worker"] == nil) {
+				t.Fatalf("original = %#v, error = %v", original, err)
+			}
+			_, err = service.replayRecord(req, original)
+			if control := protocol.AsError(err); control.Code != "operation_outcome_unknown" {
+				t.Fatalf("replay = %#v", control)
+			}
+			detail, _ := protocol.AsError(err).Detail.(map[string]any)
+			if detail["outcome_verified"] != false || detail["lease_state_verified"] != true {
+				t.Fatalf("detail = %#v", detail)
+			}
+			metrics, err := service.adminMetrics(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			unknown, ok := metrics["historical_unknown_operations"].([]any)
+			if !ok || len(unknown) != 1 || unknown[0].(map[string]any)["operation_id"] != "original" {
+				t.Fatalf("historical unknown operations = %#v", metrics["historical_unknown_operations"])
+			}
+		})
+	}
+}
+
 func TestPendingRenewWithoutLaterLeaseEvidenceRemainsBlocked(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -6086,7 +6180,7 @@ func TestPendingRenewWithoutLaterLeaseEvidenceRemainsBlocked(t *testing.T) {
 func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
 	for _, action := range []string{"restart", "release"} {
 		t.Run(action, func(t *testing.T) {
-			for _, mode := range []string{"native-busy", "worker-missing", "no-witness", "wrong-session", "wrong-task", "missing-lease", "unverified-cache", "other-pending", "active", "late-worker", "bad-witness-digest", "bound-task-mismatch"} {
+			for _, mode := range []string{"native-busy", "worker-missing", "no-witness", "wrong-session", "wrong-task", "missing-lease", "unverified-cache", "other-pending", "active", "late-worker", "bad-witness-digest", "bound-task-mismatch", "missing-exit-time", "malformed-exit-observation", "late-exit-observation", "observation-without-exited"} {
 				t.Run(mode, func(t *testing.T) {
 					store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 					if err != nil {
@@ -6106,6 +6200,20 @@ func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
 						t.Fatal(err)
 					}
 					worker := map[string]any{"state": "exited", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "finished_at": nowString(time.Now())}
+					switch mode {
+					case "missing-exit-time":
+						delete(worker, "finished_at")
+					case "malformed-exit-observation":
+						delete(worker, "finished_at")
+						worker["observed_at"] = "not-a-timestamp"
+					case "late-exit-observation":
+						delete(worker, "finished_at")
+						worker["observed_at"] = nowString(time.Now().Add(time.Hour))
+					case "observation-without-exited":
+						delete(worker, "finished_at")
+						worker["observed_at"] = nowString(time.Now())
+						worker["state"] = "finished"
+					}
 					if mode == "worker-missing" {
 						delete(worker, "process_group")
 					}

@@ -1917,7 +1917,7 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 			pid, pidOK := protocol.Integer(worker["pid"])
 			pgid, groupOK := protocol.Integer(worker["process_group"])
 			start := stringValue(worker["start_time"])
-			if !pidOK || !groupOK || pid <= 0 || pgid <= 0 || start == "" || stringValue(worker["finished_at"]) == "" {
+			if !pidOK || !groupOK || pid <= 0 || pgid <= 0 || start == "" || workerExitTime(worker) == "" {
 				return nil
 			}
 			alive, workerErr := native.WorkerAlive(native.WorkerIdentity{PID: int(pid), ProcessGroup: int(pgid), StartTime: start})
@@ -1981,6 +1981,20 @@ func supersedableOperation(action string) bool {
 	}
 }
 
+// workerExitTime is only an ordering boundary, not evidence of native success.
+// A reconciler confirms a dead worker using exited/observed_at when a normal
+// completion callback could not persist finished_at. All identity, liveness,
+// cached-state, later-witness and native quiescence checks still apply.
+func workerExitTime(worker map[string]any) string {
+	if finished := stringValue(worker["finished_at"]); finished != "" {
+		return finished
+	}
+	if stringValue(worker["state"]) == "exited" {
+		return stringValue(worker["observed_at"])
+	}
+	return ""
+}
+
 func supersedingOperationMatches(original, completed state.Operation, task *state.Task) bool {
 	if original.Generation == nil || completed.Generation == nil || completed.SessionID == nil || *completed.SessionID != task.SessionID || *completed.Generation < *original.Generation || *completed.Generation > task.Generation {
 		return false
@@ -1993,7 +2007,7 @@ func supersedingOperationMatches(original, completed state.Operation, task *stat
 		if !workerOK {
 			return false
 		}
-		finishedAt = stringValue(worker["finished_at"])
+		finishedAt = workerExitTime(worker)
 	}
 	finished, finishedErr := time.Parse(time.RFC3339Nano, finishedAt)
 	laterCreated, laterErr := time.Parse(time.RFC3339Nano, completed.CreatedAt)
