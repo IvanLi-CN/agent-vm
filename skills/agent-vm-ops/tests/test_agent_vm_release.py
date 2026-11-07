@@ -14,7 +14,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[3]
-SCRIPTS = ROOT / "skills/agent-vm-ops/scripts"
+SCRIPTS = ROOT / "deploy/scripts"
 if str(SCRIPTS) not in os.sys.path:
     os.sys.path.insert(0, str(SCRIPTS))
 import agent_vm_release as RELEASE  # noqa: E402
@@ -143,11 +143,11 @@ class ReleasePublisherTests(unittest.TestCase):
             if relative in {"bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
                 path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42)
             elif relative == "systemd/agent-vm-native.service":
-                path.write_bytes((ops_root / "assets/systemd/agent-vm-native.service").read_bytes())
+                path.write_bytes((ops_root.parent.parent / "deploy/assets/systemd/agent-vm-native.service").read_bytes())
             elif relative == "systemd/agent-vm-native@.service":
-                path.write_bytes((ops_root / "assets/systemd/agent-vm-native@.service").read_bytes())
+                path.write_bytes((ops_root.parent.parent / "deploy/assets/systemd/agent-vm-native@.service").read_bytes())
             elif relative == "systemd/agent-vm-deployd.service":
-                path.write_bytes((ops_root / "assets/systemd/agent-vm-deployd.service").read_bytes())
+                path.write_bytes((ops_root.parent.parent / "deploy/assets/systemd/agent-vm-deployd.service").read_bytes())
             elif relative == "agent_vm_control_bridge.ts":
                 path.write_bytes((ops_root / "scripts/agent_vm_control_bridge.ts").read_bytes())
             else:
@@ -199,7 +199,7 @@ class ReleasePublisherTests(unittest.TestCase):
                     continue
                 destination = root / path
                 destination.parent.mkdir(parents=True, exist_ok=True)
-                source = ROOT / "skills/agent-vm-ops/assets" / path
+                source = ROOT / "deploy/assets" / path
                 destination.write_bytes(source.read_bytes())
                 destination.chmod(mode)
                 unit_artifacts.append({"name": name, "path": path, "role": role, "mode": mode})
@@ -818,6 +818,26 @@ class ReleasePublisherTests(unittest.TestCase):
             self.assertFalse(target.exists())
         finally:
             os.close(descriptor)
+
+
+class LocalInstallTransportTests(unittest.TestCase):
+    def test_local_adapter_keeps_fixed_privilege_boundaries_and_transaction_identity(self):
+        import agent_vm_release_wrapper as wrapper
+        with mock.patch.object(RELEASE.os, "geteuid", return_value=0), mock.patch.object(wrapper, "load_config", return_value={}) as config:
+            adapter = RELEASE.LocalInstallTransport()
+        config.assert_called_once_with()
+        with mock.patch.object(wrapper, "stage", return_value={"ok": True}) as stage:
+            adapter.wrapper("local", RELEASE.CANONICAL_REMOTE_WRAPPER, "stage", "original-tx", "release-id", b"verified-bundle")
+        stage.assert_called_once_with({}, "original-tx", "release-id", b"verified-bundle")
+        with self.assertRaises(RELEASE.ReleaseError):
+            adapter.wrapper("local", "/tmp/another-wrapper", "stage", "original-tx", "release-id")
+        with self.assertRaises(RELEASE.ReleaseError):
+            adapter.control("local", "/tmp/another-control", {})
+
+    def test_local_adapter_rejects_unprivileged_invocation(self):
+        with mock.patch.object(RELEASE.os, "geteuid", return_value=1000):
+            with self.assertRaises(RELEASE.ReleaseError):
+                RELEASE.LocalInstallTransport()
 
 
 if __name__ == "__main__":

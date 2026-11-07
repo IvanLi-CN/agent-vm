@@ -724,6 +724,36 @@ func TestWaitForGuestReadyPollsUntilIPv4IsVisible(t *testing.T) {
 	}
 }
 
+func TestGuestIPv4UsesOnlyManagedInterface(t *testing.T) {
+	iface := func(address string) map[string]any {
+		return map[string]any{"addresses": []any{map[string]any{"family": "inet", "address": address}}}
+	}
+	value := map[string]any{"network": map[string]any{"docker0": iface("172.17.0.1"), "eth1": iface("192.0.2.10"), "eth0": iface("10.250.19.20")}}
+	for i := 0; i < 1000; i++ {
+		if got := guestIPv4(value); got != "10.250.19.20" {
+			t.Fatalf("unmanaged address selected: %s", got)
+		}
+	}
+	delete(value["network"].(map[string]any), "eth0")
+	if got := guestIPv4(value); got != "" {
+		t.Fatalf("unmanaged address used without eth0: %s", got)
+	}
+}
+
+func TestWaitForGuestReadyIgnoresDockerBridgeBeforeManagedIPv4(t *testing.T) {
+	bridge := map[string]any{"addresses": []any{map[string]any{"family": "inet", "address": "172.17.0.1"}}}
+	guest := &startupGuest{statuses: []map[string]any{
+		{"status": "Running", "network": map[string]any{"docker0": bridge}},
+		{"status": "Running", "network": map[string]any{"docker0": bridge, "eth0": map[string]any{"addresses": []any{map[string]any{"family": "inet", "address": "10.250.19.20"}}}}},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	ip, err := waitForGuestReady(ctx, guest, "agent-ready")
+	if err != nil || ip != "10.250.19.20" || guest.statusCalls != 2 {
+		t.Fatalf("ip=%q calls=%d err=%v", ip, guest.statusCalls, err)
+	}
+}
+
 func TestConfigureNetworkMatchesManagedContainerContract(t *testing.T) {
 	guest := &startupGuest{config: map[string]any{"expanded_devices": map[string]any{
 		"eth0": map[string]any{
@@ -6021,6 +6051,100 @@ func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
 	}
 }
 
+func TestSupersededOperationsConsumeReconciledExitEvidence(t *testing.T) {
+	for _, action := range []string{"acquire", "renew", "resize", "restart", "release"} {
+		t.Run(action, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			session, generation := "superseded-"+action, int64(1)
+			taskGeneration := generation
+			if action == "acquire" {
+				taskGeneration = 3
+			}
+			now := nowString(time.Now())
+			task := state.Task{TaskID: "superseded-task", SessionID: session, Generation: taskGeneration, State: stateCached, InstanceName: "superseded-instance", CreatedAt: now, UpdatedAt: now, ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+			if err := store.InsertTask(ctx, task); err != nil {
+				t.Fatal(err)
+			}
+			req := protocol.Request{"protocol": protocol.Version, "action": action, "session_id": session, "generation": generation, "operation_id": "original"}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			worker := map[string]any{"state": "running", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1"}
+			originalResponse := map[string]any{"outcome": "pending", "_request": map[string]any(req), "_request_digest": digest}
+			if action != "renew" {
+				originalResponse["worker"] = worker
+			}
+			if err := store.RecordOperation(ctx, "original", action, &session, &generation, originalResponse); err != nil {
+				t.Fatal(err)
+			}
+			guest := &quiescentStartupGuest{startupGuest: &startupGuest{status: "Stopped", config: map[string]any{"config": map[string]any{"user.agent-vm.managed": "native-v1", "user.agent-vm.task": task.TaskID, "user.agent-vm.session": session, "user.agent-vm.generation": fmt.Sprint(taskGeneration)}, "devices": map[string]any{}, "expanded_devices": map[string]any{}}}}
+			service := New(store, config.Defaults(), Options{Guest: guest, Resident: true})
+			if err := service.reconcilePendingWorker(ctx, "original"); err != nil {
+				t.Fatal(err)
+			}
+			before, err := store.GetOperation(ctx, "original")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if action != "renew" {
+				exit := before.Response["worker"].(map[string]any)
+				if exit["state"] != "exited" || exit["observed_at"] == nil || exit["finished_at"] != nil {
+					t.Fatalf("not actual reconciler shape: %#v", exit)
+				}
+			}
+			laterAction, laterGeneration := "release", taskGeneration
+			result := map[string]any{"task_id": task.TaskID, "session_id": session, "generation": taskGeneration, "state": stateCached, "effective_lease": false}
+			if action == "renew" {
+				laterAction = "renew"
+				result["state"], result["effective_lease"] = stateActive, true
+			}
+			if action == "acquire" {
+				laterAction, laterGeneration = "acquire", int64(2)
+				result["state"], result["effective_lease"] = stateActive, true
+			}
+			laterReq := protocol.Request{"protocol": protocol.Version, "action": laterAction, "session_id": session, "generation": laterGeneration, "operation_id": "later"}
+			later := protocol.SuccessWithRelease(laterReq, result, nil, nil)
+			laterDigest, err := protocol.Digest(laterReq)
+			if err != nil {
+				t.Fatal(err)
+			}
+			later["_request_digest"] = laterDigest
+			if err := store.RecordOperation(ctx, "later", laterAction, &session, &laterGeneration, later); err != nil {
+				t.Fatal(err)
+			}
+			if err := service.StartupReconcile(ctx); err != nil {
+				t.Fatalf("startup: %v", err)
+			}
+			original, err := store.GetOperation(ctx, "original")
+			if err != nil || original == nil || original.Response["outcome"] != "error" || original.Response["_request"] == nil || (action != "renew" && original.Response["worker"] == nil) {
+				t.Fatalf("original = %#v, error = %v", original, err)
+			}
+			_, err = service.replayRecord(req, original)
+			if control := protocol.AsError(err); control.Code != "operation_outcome_unknown" {
+				t.Fatalf("replay = %#v", control)
+			}
+			detail, _ := protocol.AsError(err).Detail.(map[string]any)
+			if detail["outcome_verified"] != false || detail["lease_state_verified"] != true {
+				t.Fatalf("detail = %#v", detail)
+			}
+			metrics, err := service.adminMetrics(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			unknown, ok := metrics["historical_unknown_operations"].([]any)
+			if !ok || len(unknown) != 1 || unknown[0].(map[string]any)["operation_id"] != "original" {
+				t.Fatalf("historical unknown operations = %#v", metrics["historical_unknown_operations"])
+			}
+		})
+	}
+}
+
 func TestPendingRenewWithoutLaterLeaseEvidenceRemainsBlocked(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -6056,7 +6180,7 @@ func TestPendingRenewWithoutLaterLeaseEvidenceRemainsBlocked(t *testing.T) {
 func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
 	for _, action := range []string{"restart", "release"} {
 		t.Run(action, func(t *testing.T) {
-			for _, mode := range []string{"native-busy", "worker-missing", "no-witness", "wrong-session", "wrong-task", "missing-lease", "unverified-cache", "other-pending", "active", "late-worker", "bad-witness-digest", "bound-task-mismatch"} {
+			for _, mode := range []string{"native-busy", "worker-missing", "no-witness", "wrong-session", "wrong-task", "missing-lease", "unverified-cache", "other-pending", "active", "late-worker", "bad-witness-digest", "bound-task-mismatch", "missing-exit-time", "malformed-exit-observation", "late-exit-observation", "observation-without-exited"} {
 				t.Run(mode, func(t *testing.T) {
 					store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 					if err != nil {
@@ -6076,6 +6200,20 @@ func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
 						t.Fatal(err)
 					}
 					worker := map[string]any{"state": "exited", "pid": int64(1 << 30), "process_group": int64(1 << 30), "start_time": "1", "finished_at": nowString(time.Now())}
+					switch mode {
+					case "missing-exit-time":
+						delete(worker, "finished_at")
+					case "malformed-exit-observation":
+						delete(worker, "finished_at")
+						worker["observed_at"] = "not-a-timestamp"
+					case "late-exit-observation":
+						delete(worker, "finished_at")
+						worker["observed_at"] = nowString(time.Now().Add(time.Hour))
+					case "observation-without-exited":
+						delete(worker, "finished_at")
+						worker["observed_at"] = nowString(time.Now())
+						worker["state"] = "finished"
+					}
 					if mode == "worker-missing" {
 						delete(worker, "process_group")
 					}
@@ -6146,6 +6284,33 @@ func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestWorkerExitTimeRejectsMalformedCompletionField(t *testing.T) {
+	for _, value := range []any{nil, 123, "", "invalid"} {
+		worker := map[string]any{"state": "exited", "finished_at": value, "observed_at": nowString(time.Now().Add(-time.Minute))}
+		if got := workerExitTime(worker); got != "" {
+			t.Fatalf("malformed completion %v accepted: %s", value, got)
+		}
+	}
+}
+
+func TestSupersedingWitnessCannotValidateFutureExitObservation(t *testing.T) {
+	now := time.Now()
+	session, generation := "future-exit", int64(1)
+	task := &state.Task{TaskID: "task", SessionID: session, Generation: generation}
+	original := state.Operation{Generation: &generation, CreatedAt: nowString(now.Add(-time.Hour)), Response: map[string]any{"worker": map[string]any{"state": "exited", "observed_at": nowString(now.Add(time.Hour))}}}
+	req := protocol.Request{"protocol": protocol.Version, "action": "release", "session_id": session, "generation": generation, "operation_id": "witness"}
+	response := protocol.SuccessWithRelease(req, map[string]any{"task_id": task.TaskID, "session_id": session, "generation": generation, "state": stateCached, "effective_lease": false}, nil, nil)
+	digest, err := protocol.Digest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response["_request_digest"] = digest
+	witness := state.Operation{OperationID: "witness", Action: "release", SessionID: &session, Generation: &generation, CreatedAt: nowString(now.Add(2 * time.Hour)), Response: response}
+	if supersedingOperationMatches(original, witness, task) {
+		t.Fatal("future witness accepted future exit observation")
 	}
 }
 
@@ -6379,6 +6544,113 @@ func TestUnidentifiedDestroyStartRequiresReleaseDrainAndQuiescence(t *testing.T)
 				}
 			}
 
+		})
+	}
+}
+
+func TestWorkerJournalSurvivesCommitQueueAndCanceledAction(t *testing.T) {
+	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "queued-worker.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	if err := store.RecordOperation(ctx, "queued-worker", "acquire", stringPointer("queued-session"), nil, map[string]any{"outcome": "pending", "worker": map[string]any{"state": "starting"}}); err != nil {
+		t.Fatal(err)
+	}
+	service := New(store, config.Defaults(), Options{})
+	entered, release := make(chan struct{}), make(chan struct{})
+	service.SetMutationCommit(func(commit func() error) error { close(entered); <-release; return commit() })
+	actionCtx, cancel := context.WithCancel(ctx)
+	result := make(chan error, 1)
+	identity := native.WorkerIdentity{PID: 123, StartTime: "queued-start", ProcessGroup: 123}
+	go func() { result <- service.WorkerStarted(actionCtx, "queued-worker", identity) }()
+	<-entered
+	cancel()
+	// A real remote-backed commit can queue behind a coherent observation for
+	// longer than the old two-second local-only journal deadline.
+	time.Sleep(2100 * time.Millisecond)
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(ctx, "queued-worker")
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, _ := operation.Response["worker"].(map[string]any)
+	if worker["state"] != "running" || intValue(worker["pid"]) != 123 {
+		t.Fatalf("worker identity lost: %#v", worker)
+	}
+}
+
+func TestPendingReleaseDrainExitReplaysOnlyExactMetadataIntent(t *testing.T) {
+	for _, scenario := range []string{"recover", "bad-digest", "worker-marker", "wrong-owner", "different-request"} {
+		t.Run(scenario, func(t *testing.T) {
+			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close()
+			ctx := context.Background()
+			service := New(store, config.Defaults(), Options{})
+			service.SetMutationGate(func() bool { return false })
+			service.SetTrafficAccepting(false)
+			session := "release-agent-vm-deployd"
+			generation := int64(0)
+			owner := session
+			if scenario == "wrong-owner" {
+				owner = "release-other"
+			}
+			for key, value := range map[string]string{"draining": "1", "drain_owner": owner} {
+				if err := store.SetMeta(ctx, key, value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			req := protocol.Request{"protocol": protocol.Version, "action": "drain-exit", "session_id": session, "operation_id": "deployd-drain-exit-original", "generation": generation, "preserve_traffic": true}
+			digest, err := protocol.Digest(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "bad-digest" {
+				digest = "wrong"
+			}
+			pending := map[string]any{"outcome": "pending", "_request_digest": digest, "_request": map[string]any(req)}
+			if scenario == "worker-marker" {
+				pending["worker"] = map[string]any{}
+			}
+			if err := store.RecordOperation(ctx, stringValue(req["operation_id"]), "drain-exit", &session, &generation, pending); err != nil {
+				t.Fatal(err)
+			}
+			if scenario == "different-request" {
+				req["preserve_traffic"] = false
+			}
+			result, err := service.Dispatch(ctx, req)
+			if scenario == "recover" {
+				if err != nil || result["ok"] != true {
+					t.Fatalf("recovery: result=%v err=%v", result, err)
+				}
+				if value, _, err := store.Meta(ctx, "draining"); err != nil || value != "0" {
+					t.Fatalf("drain=%s err=%v", value, err)
+				}
+				op, err := store.GetOperation(ctx, stringValue(req["operation_id"]))
+				if err != nil || op.Response["outcome"] != "success" || recoveryAttempts(op.Response) != 1 {
+					t.Fatalf("recovery evidence=%v err=%v", op, err)
+				}
+				if _, err := service.Dispatch(ctx, req); err != nil {
+					t.Fatalf("finished replay: %v", err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("unsafe replay accepted: %v", result)
+				}
+				if value, _, err := store.Meta(ctx, "draining"); err != nil || value != "1" {
+					t.Fatalf("changed fenced drain=%s err=%v", value, err)
+				}
+			}
+			if service.TrafficAccepting() {
+				t.Fatal("metadata recovery opened slot traffic")
+			}
 		})
 	}
 }

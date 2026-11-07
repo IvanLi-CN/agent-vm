@@ -122,6 +122,18 @@ func snapshotMetrics(source string, value any) map[string]string {
 		"agent_vm_" + source + "_scrape_timestamp_seconds": fmt.Sprintf("agent_vm_%s_scrape_timestamp_seconds %d", source, observed),
 	}
 	if source == "capacity" {
+		incusUp := false
+		if object["incus_metrics_up"] == true {
+			if raw, ok := object["incus_metrics"].(string); ok {
+				if families, err := ParseIncusMetrics(raw); err == nil {
+					incusUp = true
+					for name, samples := range families {
+						result[name] = samples
+					}
+				}
+			}
+		}
+		result["agent_vm_incus_metrics_up"] = fmt.Sprintf("agent_vm_incus_metrics_up %d", boolNumber(incusUp, false))
 		if states, ok := objectMap(object["task_states"]); ok && up == 1 && object["observation_consistent"] == true {
 			for _, state := range []string{"absent", "cached", "preparing", "active", "closing", "deleting", "failed"} {
 				count := any(int64(0))

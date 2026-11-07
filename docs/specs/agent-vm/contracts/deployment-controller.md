@@ -6,7 +6,7 @@
 
 `agent-vm-deployd.service` 是位于蓝、绿槽位之外的稳定宿主级服务。它在槽位切换期间保持不变，并且一次只负责一个部署事务。CLI 通过 `/run/agent-vm-native/deployd.sock` 连接。Caddy、浏览器、Agent Token、公共 `agent-vm` CLI 和槽位业务 API，都不能访问这个 socket。
 
-首次部署由发布器创建并验证受保护的槽位目录，并在初始化完成后创建 `/var/lib/agent-vm-native/active -> slots/blue`。已有部署必须验证当前 `active` 指向 blue 或 green，不能覆盖断裂或指向未知目标的链接。
+全新安装由 Go 安装器与 Deployd 的首次安装事务创建并验证受保护的槽位目录，并在初始化、角色及就绪验证完成后创建 `/var/lib/agent-vm-native/active -> slots/blue`。已有部署必须验证当前 `active` 指向 blue 或 green，不能覆盖断裂或指向未知目标的链接。
 
 Deployd 可以读取或协调以下部署事实：
 
@@ -97,6 +97,12 @@ Grafana 面板通过 Prometheus 查询 Deployd 输出，例如：
 槽位 Go 服务 MUST 在运行 startup reconciliation，或启用 scheduler、timer reconciliation、age-GC 和 scheduler-driven native-mutation 循环前，先获取并认证 deployd 授予的 controller role。standby 或 retiring 槽位可以提供受保护的就绪状态和只读观测，但没有该 role 时 MUST NOT 执行 `StartupReconcile`、`timer-reconcile`、 `timer-age-gc` 或任何等价的后台 native mutation。管理台的镜像导入、镜像选择或删除、VM action、maintenance action 以及 management operation recovery 同样属于 controller-gated mutation；没有该 role 时只能提供管理查询，不能 claim operation、调用 native backend 或写入终态 journal。role 丢失时，必须先 fence 这些循环，槽位才能进入 retiring 或 standby。controller role 发生变化时，正在执行的 native mutation 必须收到取消信号。
 
 支持续租的槽位在 health 中明确声明 `controller_lease_renewal=true`。Deployd 必须先确认该能力；未声明的旧槽位继续使用原有的更高 term 授权路径，不能向其发送同 term 请求而引发周期性拒绝和 hard-fence。旧路径仍有角色更换会中断在途作业的历史限制，因此升级须保持 drain，在新槽位完成验证前不得宣称长操作续租验收通过。对于明确声明续租能力的槽位，持续协调不得通过每次更换 term、lease ID 或 nonce 来续租，否则会取消正在进行的 native mutation。同一 Deployd 进程只能根据新鲜运行时观测延长自己持有的有效 lease 的 expiry，必须保持 slot、term、lease ID、generation、nonce、owner PID 和进程启动标识不变，且不得缩短 expiry。槽位接受这种续租时不触发角色变更通知；真正的撤销、过期、身份变化和 owner 退出仍立即 fencing。已过期或已撤销的 lease 不得复活；Deployd 重启后必须重新观测并分配更高 term，不能从持久化快照恢复身份。缺少进程启动标识时不允许复用旧身份。
+
+冷启动必须区分进程接口就绪与依赖 controller role 的业务就绪。槽位启动任务通过只读 health 验证 `process_ready=true` 后才能完成；此时允许 HTTP 503、业务未就绪且无 controller 或 traffic。Deployd 对已经排队的槽位启动任务仅设置启动顺序，不通过依赖关系额外拉起槽位；必须在进程接口就绪后重新观测并授权，不能把尚未创建 socket 的启动阶段误判为必须停止的失联 controller。等待进程接口最多五十五秒，不授予任何角色，不要求旧槽位支持新的 systemd notify 协议。
+
+首次授予后的就绪等待最多六十秒；等待期间只能通过已验证进程的角色通道延长同一有效 lease，通道失败或身份变化时立即停止并 fencing。持续协调复用本轮完成并持久化的观测更新指标，不为指标发布再次串行采集一遍业务状态；已就绪且身份未变的控制器续租后无需重复等待启动协调。
+
+业务槽位的后台容量、清单和健康采样复用同一次只读状态快照，每十秒完成一轮，单轮最多八秒；不能用三条独立循环重复同步远端状态。部署事务停在 standby validation 或尚未执行的 controller handoff 时，只能续租当前 Deployd 进程已经验证、尚未过期的 previous/active lease，不能因为等待运维者执行下一命令而撤销权限，也不能为过期角色分配新身份。不确定阶段、恢复事务和进程身份不符仍须 fencing。
 
 当清单观测本身新鲜且一致，但部分任务的原生状态尚未确认时，Deployd 必须区分“观测不完整”和“观测矛盾”。只有其他来源、进程身份、状态纪元和能力均有效，并且活动槽位已经确认 admission drain 时，才允许重新授予唯一 controller lease，使 startup reconciliation 和显式维护能够收敛失败记录。此时 `controller_recovery_only=true`、组合观测仍为 `consistent=false`，业务流量保持关闭，不能用于 stage、activate 或 rollback 的就绪证明。清单不完整且未确认 drain 时不得重新授予 controller。若清单只是部分原生状态未确认、各观测来源仍新鲜且相互一致，活动槽位仍独占持有同一 Deployd 进程的有效 lease，并明确支持原身份续租，则允许只延长该 lease 的 expiry，使正在进行的生命周期操作完成；不得分配新身份、恢复已过期 lease 或等待业务 ready 来决定是否撤销现有权限。此时两个槽位的 traffic admission 均保持关闭，组合观测仍不构成部署就绪证明；清单完整且槽位 ready 后才恢复当前活动槽位的流量。除上述一致但不完整的观测与下述业务快照不一致时的原身份续约外，任何来源缺失、过期、矛盾时仍必须 hard-fence。即使清单完整，drain 期间也必须保留维护所需 lease，并保持 traffic disabled；不能因为启用流量被 drain 拒绝而反复撤销 controller lease。
 
@@ -237,3 +243,39 @@ CLI 永远不能直接编辑 `active`。响应丢失时，CLI 返回 deployd tra
 启动时，deployd 加载最近事务，验证数据库 schema，并重新观测每个运行时来源。只有再次观测到对应运行时证据，记录的 phase 才能视为完成。如果无法证明该 phase，deployd 进入 `needs_recovery`，保持部署和受影响的 admission fenced，并保留证据。只有运维者确认事务标识且必需来源新鲜、相互一致后，恢复流程才能 resume、rollback 或 finalize。执行 recovery finalize 时，deployd 必须先确认目标槽位仍然是已验证的 active 槽位，撤销旧槽位的 controller role 和 traffic role，完成 drain/quiescence，并停止旧槽位。只有重新观测到旧槽位已经停止、目标槽位重新持有 controller role 且可以接受流量后，才能把事务写成 `finalize`。撤销、停止或重新观测任一步失败，都必须保持 `needs_recovery`，并对两个槽位执行 hard-fence，不能猜测恢复已经完成。
 
 目标验证覆盖 Go unit 和 socket permissions、SQLite migration 和 crash recovery、重复协调器防护、双槽位进程存活、唯一 controller leadership、候选槽位验证、原子 active switch、traffic drain、在途请求完成、native-worker quiescence、有界 rollback，以及守护进程在每个不可幂等阶段重启时的行为。验证在当前会话拥有的 Agent VM 中运行，不修改开发机或现网部署。
+
+## 全新安装事务
+
+`agent-vm-deploy install --config <受保护输入> --bundle <产品包> --materials <同修订资料目录>` 默认只执行只读预检，不创建安装记录、锁、解包目录或系统资源；显式 `--apply` 才执行本机安装。安装输入只引用受保护的配置与证书文件，不内联凭据。安装器固定目标路径，拒绝替换不匹配的已有文件；已有蓝绿安装只核验就绪并指向升级入口。
+
+全新安装使用受保护 UDS 的 `POST /v1/bootstrap`，请求包含安装器先行持久化的 `transaction_id=install-<32位小写十六进制>` 和已验证产品包的绝对路径。Deployd 必须先确认 active 链接和旧业务 SQLite 均不存在、两个已安装槽位 unit 均已停止，再创建部署事务。Deployd 通过已验证 blue 槽位的 `agent-vm-control initialize-state` 委托业务状态层直接初始化空 rqlite，不生成 SQLite 迁移源。该入口不授予角色，也不启动 scheduler。
+
+Deployd 随后验证初始 standby 的 release、状态能力和进程身份，分配持久化 fencing term，通过既有角色通道授予 blue 唯一 controller lease，观测 ready 后开启 traffic 并原子切换 active。最终新鲜一致观测通过后才终结事务，安装器最后启动 Caddy。同一安装事务的重复请求只允许返回已完成结果；其他阶段不得自动重放。
+
+初始化或切换结果不确定时必须保留原事务并 fencing。active 尚不存在时，只能显式使用 `recover --transaction <原ID> --action resume-bootstrap`：首先再次确认没有 active 或旧 SQLite，停止槽位，在业务状态层验证现有 rqlite 的受支持 schema 且没有 VM task 或生命周期 operation 后恢复初始化，不替换或清空数据库。active 已存在时拒绝该动作，使用既有 `finalize` 恢复合同重新验证原候选。安装记录只保存阶段、修订、摘要和原事务 ID，不作为角色授权来源。
+
+首次安装事务在慢速组合观测期间，通过独立的角色通道核验已授予 controller 的进程身份和完整 lease 身份，并只延长仍有效的同一 lease。进程变化、lease 到期、身份不匹配或通道失败均终止续期并进入原事务恢复，不能分配新 term 来掩盖丢失。事务结束或请求取消会停止该续期。UDS 保留 30 秒请求读取预算，响应写入上限为 9000 秒，以覆盖既有迁移事务的最长等待；metrics 监听的短超时不变。
+
+槽位 unit 的 `ExecStartPre` 通过 `agent-vm-deploy wait-authority` 使用该槽位受保护配置中的 HTTPS rqlite 身份，等待状态接口和 `SELECT 1` strong read 均成功；只读检查不打开业务 SQLite、不修改 schema，也不授予角色。rqlite 的 systemd 进程已启动不足以证明内部 store 已打开或 leader 已就绪。前置检查和进程启动共享 unit 的 60 秒总启动预算，不能因检查而无限等待。
+
+槽位启动后的进程身份等待预算为 60 秒，与槽位 systemd unit 的启动预算一致；期间仍须验证实际 PID、进程启动标识及 health 合同，超时进入失败或恢复，不能仅凭 systemd 已启动判定成功。
+
+运行时副作用失败后的证据记录与双槽位 fencing 使用独立的 30 秒收尾预算。请求取消或超时不能取消这段收尾；收尾只保存不确定结果并撤销角色，不能继续激活或重放安装。
+
+`recover finalize` 在重新授予 controller lease 前要求目标进程就绪、观测新鲜一致且发布身份和状态能力已验证，不要求依赖 controller role 的业务就绪。授予新 lease 后必须完成 startup reconciliation 并验证业务就绪，才能开放 traffic；fenced 槽位的业务未就绪不能形成恢复授权的循环依赖。
+
+恢复路径重新验证原事务包及目标实际进程后，在业务就绪和最终组合观测期间使用与首次安装相同的 lease 身份连续性检查。blue 和 green 均适用；任何失败先停止事务内续租，再保存证据并 fencing，不能因事务锁阻止常规协调而让恢复中的 lease 自行耗尽。
+
+槽位通过受保护 UDS 的只读 `GET /internal/v1/deployment-observation` 一次返回 capacity、inventory 和 health。三类观测在同一个业务状态只读事务中生成；rqlite 权威同步一次后，进程内镜像在读取期间保持同一视图。该路径不授予角色、不封存 drain、不写业务状态，也不对外暴露指标。八秒内无法完成时整组失败，不能拼接部分成功的结果。Deployd 仍验证每类结果、时间戳、状态纪元和完整性，再发布已完成快照；旧槽位明确返回 404 或 405 时保留原采样兼容路径，其他错误不能降级为成功。
+
+### 状态后端与共享原生指标的验证
+
+槽位健康观测提供 `state_authority`，其值为去除凭据后的业务后端配置指纹；它不是数据库内容标识。Deployd 验证候选时比较双方指纹与状态能力，并将指纹写入部署阶段证据；激活、恢复和回滚继续绑定该证据。`state_epoch` 仅证明单次快照内的一致性，不能作为跨时刻后端身份。没有指纹的旧阶段证据不得授权角色转换。正常蓝绿部署仍禁止数据库替换。
+
+Incus 项目级共享 `incus_*` 指标由槽位只读采样，Deployd 只输出活动槽位的新鲜一份，保留原生标签且不附加 `slot`；槽位级 `agent_vm_*` 指标继续附加 `slot`。`agent_vm_incus_metrics_up` 标明各槽位该采样是否成功，失败或过期不得补造容器指标，Prometheus 不增加第二个 target。
+
+回滚遇到原 Deployd 的未完成 `drain-exit` 时，仅在两个槽位的 controller 与 traffic 均已 fencing、没有在途操作、全部待处理记录都是 Deployd 的零代 metadata drain-exit 时，才可通过业务 API 重放原 operation ID。业务服务再次校验原请求摘要、不可变身份、无 native worker 标记及 drain 所有权，保留恢复尝试证据；随后重新进入 drain 并证明 quiescence。未知记录、native mutation 或其他所有者仍保持 `needs_recovery`，Deployd 不直接修改业务数据库。drain 控制请求使用既有 240 秒控制请求预算；健康、角色与指标请求仍使用短超时。
+
+激活自授予候选 controller 起，直到旧槽静止、停止和最终验证结束，必须持续通过角色通道核验并续期同一 lease；补偿回滚或 fencing 前先停止续期。旧槽静止计数复用组合只读观测的 capacity lane，仅在明确不支持该端点时兼容旧查询，不能因请求失败降级。只读 status 不持有角色写入锁，指标发布独立读取最近完成的持久化快照，新快照提交成功后以可合并的进程内通知立即唤醒唯一发布器，周期读取仅作兜底，不能等待角色协调的后续写入或下一个轮询周期才更新；正常活动事务不能被误判为恢复失败，只有明确 `needs_recovery` 或恢复标记才强制不一致。所有快照仍保留原始新鲜度边界，发布器不延长时间戳、不执行观测或角色授权。
+
+只读 status 返回本次观测但不覆盖用于指标发布的 latest 记录，避免并发的旧观测覆盖较新部署证据。激活请求取消后，不继续补偿切换；使用独立的三十秒有界清理上下文记录不确定结果并 fencing，保留原事务等待显式恢复。

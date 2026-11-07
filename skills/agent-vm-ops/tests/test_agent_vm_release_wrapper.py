@@ -17,7 +17,7 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[3]
-SCRIPTS = ROOT / "skills/agent-vm-ops/scripts"
+SCRIPTS = ROOT / "deploy/scripts"
 if str(SCRIPTS) not in os.sys.path:
     os.sys.path.insert(0, str(SCRIPTS))
 import agent_vm_release as RELEASE  # noqa: E402
@@ -934,11 +934,11 @@ class WrapperTests(unittest.TestCase):
                 # Minimal little-endian ELF64 header for the amd64 target.
                 path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42)
             elif relative == "systemd/agent-vm-native.service":
-                path.write_bytes((ops_root / "assets/systemd/agent-vm-native.service").read_bytes())
+                path.write_bytes((ops_root.parent.parent / "deploy/assets/systemd/agent-vm-native.service").read_bytes())
             elif relative == "systemd/agent-vm-native@.service":
-                path.write_bytes((ops_root / "assets/systemd/agent-vm-native@.service").read_bytes())
+                path.write_bytes((ops_root.parent.parent / "deploy/assets/systemd/agent-vm-native@.service").read_bytes())
             elif relative == "systemd/agent-vm-deployd.service":
-                path.write_bytes((ops_root / "assets/systemd/agent-vm-deployd.service").read_bytes())
+                path.write_bytes((ops_root.parent.parent / "deploy/assets/systemd/agent-vm-deployd.service").read_bytes())
             elif relative == "agent_vm_control_bridge.ts":
                 path.write_bytes((ops_root / "scripts/agent_vm_control_bridge.ts").read_bytes())
             else:
@@ -1063,7 +1063,7 @@ class WrapperTests(unittest.TestCase):
         )
         self.assertEqual(
             (Path(self.loaded["control_path"]).parent / "systemd" / "agent-vm-native.service").read_bytes(),
-            (ROOT / "skills/agent-vm-ops/assets/systemd/agent-vm-native.service").read_bytes(),
+            (ROOT / "deploy/assets/systemd/agent-vm-native.service").read_bytes(),
         )
         self.assertTrue((unit_dir / "agent-vm-native.service").is_file())
         for name in MANIFEST.GO_RETIRED_UNITS:
@@ -1073,8 +1073,10 @@ class WrapperTests(unittest.TestCase):
         root = self.root / "historical-product"
         unit = root / "systemd/agent-vm-deployd.service"
         unit.parent.mkdir(parents=True)
-        current = (ROOT / "skills/agent-vm-ops/assets/systemd/agent-vm-deployd.service").read_bytes()
+        current = (ROOT / "deploy/assets/systemd/agent-vm-deployd.service").read_bytes()
         historical = current.replace(
+            b"After=agent-vm-native@blue.service agent-vm-native@green.service\n", b"",
+        ).replace(
             b"After=local-fs.target\n",
             b"After=local-fs.target\nWants=agent-vm-native@blue.service agent-vm-native@green.service\n",
         )
@@ -1127,7 +1129,7 @@ class WrapperTests(unittest.TestCase):
         for name in WRAPPER.SUPPORT_ARTIFACT_NAMES:
             with self.subTest(support=name):
                 installed = Path(self.loaded["control_path"]).with_name(name)
-                source_scripts = ROOT / "skills/agent-vm/scripts" if name in WRAPPER.CLIENT_PACKAGE_MODES else SCRIPTS
+                source_scripts = ROOT / "skills/agent-vm/scripts" if name in WRAPPER.CLIENT_PACKAGE_MODES else (SCRIPTS if name == "release_manifest.py" else ROOT / "skills/agent-vm-ops/scripts")
                 self.assertEqual(installed.read_bytes(), (source_scripts / name).read_bytes())
                 self.assertEqual(stat.S_IMODE(installed.stat().st_mode), WRAPPER.SUPPORT_ARTIFACT_MODES[name])
                 self.assertEqual(installed.stat().st_uid, os.getuid())

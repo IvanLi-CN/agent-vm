@@ -131,11 +131,12 @@ type Observation struct {
 }
 
 type Store struct {
-	db        *sql.DB
-	path      string
-	retention time.Duration
-	clock     func() time.Time
-	mu        sync.Mutex
+	observationUpdates chan struct{}
+	db                 *sql.DB
+	path               string
+	retention          time.Duration
+	clock              func() time.Time
+	mu                 sync.Mutex
 }
 
 func Open(path string, retention time.Duration, clock func() time.Time) (*Store, error) {
@@ -154,7 +155,7 @@ func Open(path string, retention time.Duration, clock func() time.Time) (*Store,
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	store := &Store{db: db, path: path, retention: retention, clock: clock}
+	store := &Store{db: db, path: path, retention: retention, clock: clock, observationUpdates: make(chan struct{}, 1)}
 	if err := store.configure(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("configure deployment sqlite: %w", err)
@@ -167,6 +168,10 @@ func Open(path string, retention time.Duration, clock func() time.Time) (*Store,
 }
 
 func (s *Store) Path() string { return s.path }
+
+// ObservationUpdates wakes the single snapshot publisher after durable commit.
+// Notifications coalesce; consumers must read the latest committed snapshot.
+func (s *Store) ObservationUpdates() <-chan struct{} { return s.observationUpdates }
 
 func (s *Store) Close() error {
 	if s == nil || s.db == nil {
@@ -626,7 +631,7 @@ func (s *Store) SaveObservation(ctx context.Context, id string, observation Obse
 	if err != nil {
 		return err
 	}
-	return s.write(ctx, func(tx *sql.Tx) error {
+	err = s.write(ctx, func(tx *sql.Tx) error {
 		if id == LatestObservationID {
 			_, err := tx.ExecContext(ctx, `INSERT INTO deployment_latest_observation(id,observed_at,fresh_until,digest,payload_json)
 				VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET observed_at=excluded.observed_at,fresh_until=excluded.fresh_until,digest=excluded.digest,payload_json=excluded.payload_json`, formatTime(observation.ObservedAt), formatTime(observation.FreshUntil), observation.Digest, payload)
@@ -636,6 +641,13 @@ func (s *Store) SaveObservation(ctx context.Context, id string, observation Obse
 			VALUES(?,?,?,?,?) ON CONFLICT(transaction_id) DO UPDATE SET observed_at=excluded.observed_at,fresh_until=excluded.fresh_until,digest=excluded.digest,payload_json=excluded.payload_json`, id, formatTime(observation.ObservedAt), formatTime(observation.FreshUntil), observation.Digest, payload)
 		return err
 	})
+	if err == nil && id == LatestObservationID {
+		select {
+		case s.observationUpdates <- struct{}{}:
+		default:
+		}
+	}
+	return err
 }
 
 func (s *Store) Observation(ctx context.Context, id string) (*Observation, error) {

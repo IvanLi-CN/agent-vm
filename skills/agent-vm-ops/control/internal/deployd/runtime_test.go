@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -343,6 +344,69 @@ func TestSlotRequestPreservesControllerLeaseIdentity(t *testing.T) {
 	}
 }
 
+func TestTransactionRenewalRequiresLiveMatchingProcessAndLease(t *testing.T) {
+	for _, scenario := range []string{"not-ready-live", "green-not-ready-live", "expired", "changed-lease", "changed-process"} {
+		t.Run(scenario, func(t *testing.T) {
+			dir, err := os.MkdirTemp("", "avm-bootstrap-uds-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(dir)
+			socket := filepath.Join(dir, "app.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lease := controllerrole.Lease{Slot: "blue", Term: 3, Generation: 1, LeaseID: "original", Nonce: "original-nonce", Expiry: time.Now().Add(5 * time.Second)}
+			if scenario == "green-not-ready-live" {
+				lease.Slot = "green"
+			}
+			if scenario == "expired" {
+				lease.Expiry = time.Now().Add(-time.Second)
+			}
+			observed := lease
+			if scenario == "changed-lease" {
+				observed.Nonce = "different"
+			}
+			process := processIdentity{PID: 123, StartTime: "456"}
+			if scenario == "changed-process" {
+				process.StartTime = "457"
+			}
+			grants := 0
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					json.NewEncoder(w).Encode(map[string]any{"ok": true, "process_ready": true, "controller_owned": true, "ready": false, "lease": observed, "process_id": process.PID, "process_start_time": process.StartTime})
+				} else {
+					grants++
+					json.NewEncoder(w).Encode(map[string]any{"ok": true, "valid": true})
+				}
+			}))
+			server.Listener.Close()
+			server.Listener = listener
+			server.Start()
+			defer server.Close()
+			cfg := Defaults()
+			cfg.BlueSocket = socket
+			cfg.GreenSocket = socket
+			runtime := NewHostRuntime(cfg)
+			runtime.stagedProcess[lease.Slot] = processIdentity{PID: 123, StartTime: "456"}
+			renewed, err := runtime.RenewTransactionLease(context.Background(), lease)
+			if scenario == "not-ready-live" || scenario == "green-not-ready-live" {
+				if err != nil || grants != 1 || !renewed.Expiry.After(lease.Expiry) {
+					t.Fatalf("valid startup renewal: %+v %v grants=%d", renewed, err, grants)
+				}
+				renewed.Expiry = lease.Expiry
+				if renewed != lease {
+					t.Fatal("renewal changed identity")
+				}
+			} else if err == nil || grants != 0 {
+				t.Fatal("invalid authority renewed")
+			}
+		})
+	}
+}
+
 func TestCapacityHealthRemainsCoherentAcrossLaterCommits(t *testing.T) {
 	directory, err := os.MkdirTemp("", "avm-observe-")
 	if err != nil {
@@ -422,6 +486,249 @@ func TestInventoryRetriesConcurrentMaintenanceCommit(t *testing.T) {
 			}
 			if calls != wantCalls || inventoryObservationCoherent(inventory) == keepsChanging {
 				t.Fatalf("calls=%d inventory=%v", calls, inventory)
+			}
+		})
+	}
+}
+
+func TestExitDrainDoesNotWriteWhenAdmissionIsAlreadyOpen(t *testing.T) {
+	directory, err := os.MkdirTemp("", "avm-drain-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(directory)
+	socket := filepath.Join(directory, "app.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var input map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			t.Error(err)
+			return
+		}
+		if input["action"] != "drain-status" {
+			t.Errorf("already-open admission caused mutation: %v", input["action"])
+			w.WriteHeader(500)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "action": "drain-status", "result": map[string]any{"draining": false}})
+	}))
+	server.Listener.Close()
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+	runtime := NewHostRuntime(Config{BlueSocket: socket})
+	if err := runtime.ExitDrain(context.Background(), "blue"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRollbackDrainRecoveryRejectsUnprovenIntentAndLiveRoles(t *testing.T) {
+	// The UDS fixture is the process authority in this test. A real stopped
+	// unit on the test host must not bypass its intentionally live role reply.
+	commands := t.TempDir()
+	if err := os.WriteFile(filepath.Join(commands, "systemctl"), []byte("#!/bin/sh\nexit 1\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", commands+":"+os.Getenv("PATH"))
+	for _, scenario := range []string{"recover", "native-action", "wrong-owner", "wrong-id", "wrong-generation", "in-flight", "controller-live", "traffic-live", "mixed"} {
+		t.Run(scenario, func(t *testing.T) {
+			directory, err := os.MkdirTemp("", "avm-drain-resume-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(directory)
+			socket := filepath.Join(directory, "app.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			row := map[string]any{"action": "drain-exit", "session_id": deploydDrainSession, "operation_id": "deployd-drain-exit-original", "generation": 0}
+			switch scenario {
+			case "native-action":
+				row["action"] = "destroy"
+			case "wrong-owner":
+				row["session_id"] = "release-other"
+			case "wrong-id":
+				row["operation_id"] = "foreign"
+			case "wrong-generation":
+				row["generation"] = 1
+			}
+			pending := []any{row}
+			if scenario == "mixed" {
+				pending = append(pending, map[string]any{"action": "destroy"})
+			}
+			writes := 0
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/internal/v1/deployment-observation" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				if r.Method == http.MethodGet {
+					json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "process_ready": true, "ready": false, "controller_owned": scenario == "controller-live", "traffic_accepting": scenario == "traffic-live", "process_id": 123, "process_start_time": "1"})
+					return
+				}
+				var request map[string]any
+				json.NewDecoder(r.Body).Decode(&request)
+				if request["action"] == "admin-metrics" {
+					flight := 0
+					if scenario == "in-flight" {
+						flight = 1
+					}
+					json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "action": "admin-metrics", "result": map[string]any{"pending_operations": pending, "in_flight_operations": flight}})
+					return
+				}
+				writes++
+				if request["operation_id"] != "deployd-drain-exit-original" || request["preserve_traffic"] != true {
+					t.Errorf("wrong replay: %v", request)
+				}
+				json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "action": request["action"], "result": map[string]any{}})
+			}))
+			server.Listener.Close()
+			server.Listener = listener
+			server.Start()
+			defer server.Close()
+			runtime := NewHostRuntime(Config{BlueSocket: socket, GreenSocket: socket})
+			err = runtime.resumeRollbackDrainExit(context.Background(), "green")
+			if scenario == "recover" {
+				if err != nil || writes != 1 {
+					t.Fatalf("recovery writes=%d err=%v", writes, err)
+				}
+			} else if err == nil || writes != 0 {
+				t.Fatalf("unsafe resume writes=%d err=%v", writes, err)
+			}
+		})
+	}
+}
+
+func TestQuiescenceUsesCoherentLaneAndDoesNotFallbackOnFailure(t *testing.T) {
+	for _, failure := range []bool{false, true} {
+		t.Run(fmt.Sprint(failure), func(t *testing.T) {
+			directory, err := os.MkdirTemp("", "avm-qview-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(directory)
+			socket := filepath.Join(directory, "app.sock")
+			listener, err := net.Listen("unix", socket)
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/internal/v1/deployment-observation" {
+					t.Error("coherent observation fell back to independent probes")
+					w.WriteHeader(500)
+					return
+				}
+				if failure {
+					w.WriteHeader(500)
+					return
+				}
+				json.NewEncoder(w).Encode(map[string]any{"ok": true, "protocol": 4, "result": map[string]any{"capacity": map[string]any{"up": true, "observed_at": time.Now().UTC().Format(time.RFC3339Nano), "observation_consistent": true, "observation_epoch": "epoch", "pending_operations": []any{}, "historical_unknown_operations": []any{}, "in_flight_operations": 0, "doctor": map[string]any{"issues": []any{}}}}})
+			}))
+			server.Listener.Close()
+			server.Listener = listener
+			server.Start()
+			defer server.Close()
+			runtime := NewHostRuntime(Config{BlueSocket: socket})
+			value, err := runtime.quiescenceMetrics(context.Background(), "blue")
+			if failure {
+				if err == nil {
+					t.Fatal("failed snapshot accepted")
+				}
+			} else if err != nil || value["observation_epoch"] != "epoch" {
+				t.Fatalf("coherent lane=%v err=%v", value, err)
+			}
+		})
+	}
+}
+
+func TestActiveSwitchRequiresPersistentSlotBootBeforeRouting(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprint(fail), func(t *testing.T) {
+			root := t.TempDir()
+			for _, slot := range []string{"blue", "green"} {
+				if err := os.MkdirAll(filepath.Join(root, "slots", slot), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			active := filepath.Join(root, "active")
+			before := filepath.Join(root, "slots", "blue")
+			if err := os.Symlink(before, active); err != nil {
+				t.Fatal(err)
+			}
+			commands := filepath.Join(root, "commands")
+			os.Mkdir(commands, 0700)
+			log := filepath.Join(root, "systemctl.args")
+			script := "#!/bin/sh\nprintf '%s\n' \"$@\" > " + log + "\n"
+			if fail {
+				script += "exit 1\n"
+			}
+			if err := os.WriteFile(filepath.Join(commands, "systemctl"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", commands)
+			runtime := NewHostRuntime(Config{ReleaseRoot: root, ActivePath: active})
+			err := runtime.SwitchActive(context.Background(), "green")
+			target, readErr := os.Readlink(active)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if fail {
+				if err == nil || target != before {
+					t.Fatalf("routing changed despite boot failure: %s %v", target, err)
+				}
+			} else if err != nil || target != filepath.Join(root, "slots", "green") {
+				t.Fatalf("active=%s err=%v", target, err)
+			}
+			args, err := os.ReadFile(log)
+			if err != nil || string(args) != "enable\nagent-vm-native@green.service\n" {
+				t.Fatalf("boot unit=%q err=%v", args, err)
+			}
+		})
+	}
+}
+
+func TestBootstrapRecoveryClearsFailedUnitsBeforeStoppedProof(t *testing.T) {
+	for _, resetFails := range []bool{false, true} {
+		t.Run(fmt.Sprint(resetFails), func(t *testing.T) {
+			root := t.TempDir()
+			log := filepath.Join(root, "calls")
+			commands := filepath.Join(root, "commands")
+			os.Mkdir(commands, 0700)
+			script := "#!/bin/sh\nprintf '%s %s\\n' \"$1\" \"$2\" >> " + log + "\n"
+			if resetFails {
+				script += "if [ \"$1\" = reset-failed ]; then exit 9; fi\n"
+			}
+			script += "if [ \"$1\" = show ]; then printf 'LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nFragmentPath=/etc/systemd/system/agent-vm-native@.service\n'; fi\n"
+			if err := os.WriteFile(filepath.Join(commands, "systemctl"), []byte(script), 0700); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", commands)
+			cfg := Defaults()
+			cfg.ActivePath = filepath.Join(root, "active")
+			cfg.Migration.LegacyStateDB = filepath.Join(root, "legacy.sqlite3")
+			cfg.ReleaseRoot = root
+			runtime := NewHostRuntime(cfg)
+			err := runtime.ResumeBootstrap(context.Background(), filepath.Join(root, "missing-bundle.tar"))
+			if err == nil {
+				t.Fatal("missing bundle accepted")
+			}
+			calls, e := os.ReadFile(log)
+			if e != nil {
+				t.Fatal(e)
+			}
+			if resetFails {
+				if string(calls) != "reset-failed agent-vm-native@blue.service\n" || !strings.Contains(err.Error(), "reset-failed") {
+					t.Fatalf("reset failure continued: %s %v", calls, err)
+				}
+				return
+			}
+			want := "reset-failed agent-vm-native@blue.service\nreset-failed agent-vm-native@green.service\nshow agent-vm-native@blue.service\nshow agent-vm-native@green.service\n"
+			if string(calls) != want {
+				t.Fatalf("stopped proof not rechecked after reset: %q err=%v", calls, err)
 			}
 		})
 	}

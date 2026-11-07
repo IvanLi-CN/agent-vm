@@ -174,7 +174,7 @@ jobs:
         run: bun run check
       - name: Validate blue-green deployment assets
         if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
-        run: bun run skills/agent-vm-ops/scripts/validate_blue_green_deployment.ts
+        run: bun run deploy/scripts/validate_blue_green_deployment.ts
       - name: Run repository tests
         if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
         run: bun run test:repo
@@ -187,6 +187,7 @@ jobs:
           bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target client --output "$build_root/client.tar"
           bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target linux/amd64 --output "$build_root/amd64.tar"
           bun run skills/agent-vm-ops/scripts/build_product_release.ts --version "$version" --source-revision "$GITHUB_SHA" --target linux/arm64 --output "$build_root/arm64.tar"
+          bun run deploy/scripts/build-materials.ts --archive --source-revision "$GITHUB_SHA" --output "$build_root/deployment-materials.tar"
       - name: Finalize CI caches
         if: always() && steps.ci_cache.outcome == 'success'
         uses: ./.github/actions/ci-cache-save

@@ -359,3 +359,46 @@ func testPayloadDigest(t *testing.T, payload map[string]any) string {
 	digest := sha256.Sum256(encoded)
 	return hex.EncodeToString(digest[:])
 }
+
+func TestLatestObservationNotificationsCoalesceAndExcludeFailedCommits(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), time.Hour, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	payload := map[string]any{"active_slot": "blue"}
+	encoded, _ := json.Marshal(payload)
+	digest := sha256.Sum256(encoded)
+	now := time.Now().UTC()
+	observation := Observation{ObservedAt: now, FreshUntil: now.Add(time.Minute), Digest: hex.EncodeToString(digest[:]), Payload: payload}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := s.SaveObservation(canceled, LatestObservationID, observation); err == nil {
+		t.Fatal("canceled write succeeded")
+	}
+	select {
+	case <-s.ObservationUpdates():
+		t.Fatal("failed commit notified publisher")
+	default:
+	}
+	// An unconsumed notification must not block the next durable write.
+	for i := 0; i < 3; i++ {
+		if err := s.SaveObservation(context.Background(), LatestObservationID, observation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-s.ObservationUpdates():
+	default:
+		t.Fatal("committed latest snapshot did not notify publisher")
+	}
+	select {
+	case <-s.ObservationUpdates():
+		t.Fatal("notifications did not coalesce")
+	default:
+	}
+	got, err := s.Observation(context.Background(), LatestObservationID)
+	if err != nil || got == nil || got.Digest != observation.Digest {
+		t.Fatalf("notification lacked committed snapshot: %#v %v", got, err)
+	}
+}

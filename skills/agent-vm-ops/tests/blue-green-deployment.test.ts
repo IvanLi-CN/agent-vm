@@ -67,7 +67,7 @@ function evidencePayload(source: string, evidenceId: string, overrides: Record<s
 }
 
 test("blue-green deployment metadata and static validator stay pinned", () => {
-  const metadata = json("skills/agent-vm-ops/assets/blue-green/deployment-components.json");
+  const metadata = json("deploy/assets/blue-green/deployment-components.json");
   expect(metadata.caddy.version).toBe("2.11.7");
   expect(metadata.rqlite.version).toBe("10.5.2");
   expect(metadata.rqlite.supported_architectures).toEqual(["amd64", "arm64"]);
@@ -78,7 +78,7 @@ test("blue-green deployment metadata and static validator stay pinned", () => {
   expect(metadata.rqlite.artifacts[1].sha256).toHaveLength(64);
   expect(json(".github/release-contract.json").deployment_artifacts.components).toHaveLength(2);
 
-  const result = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/validate_blue_green_deployment.ts")]);
+  const result = run([process.execPath, resolve(root, "deploy/scripts/validate_blue_green_deployment.ts")]);
   expect(result.exitCode).toBe(0);
   const output = JSON.parse(new TextDecoder().decode(result.stdout));
   expect(output.verdict).toBe("pass");
@@ -86,7 +86,7 @@ test("blue-green deployment metadata and static validator stay pinned", () => {
 });
 
 test("deployment examples keep the edge and state boundaries fail-closed", () => {
-  const caddy = read("skills/agent-vm-ops/assets/blue-green/Caddyfile.example");
+  const caddy = read("deploy/assets/blue-green/Caddyfile.example");
   expect(caddy).toContain("admin off");
   expect(caddy).toContain("\tlog default");
   expect(caddy).toContain("reverse_proxy unix//var/lib/agent-vm-native/active/app.sock");
@@ -95,36 +95,38 @@ test("deployment examples keep the edge and state boundaries fail-closed", () =>
   expect(caddy).toContain("@internal path /internal/v1/*");
   expect(caddy).toContain("respond 404");
 
-  const rqlite = read("skills/agent-vm-ops/assets/systemd/agent-vm-rqlite.service");
+  const rqlite = read("deploy/assets/systemd/agent-vm-rqlite.service");
   expect(rqlite).toContain("User=agent-vm-rqlite");
   expect(rqlite).toContain("SupplementaryGroups=agent-vm-web");
   expect(rqlite).toContain("-http-addr 127.0.0.1:4001");
   expect(rqlite).toContain("-auth /etc/agent-vm-native/rqlite/auth.json");
   expect(rqlite).not.toContain("0.0.0.0");
 
-  const slot = read("skills/agent-vm-ops/assets/systemd/agent-vm-native@.service");
+  const slot = read("deploy/assets/systemd/agent-vm-native@.service");
   expect(slot).toContain("ExecStart=/var/lib/agent-vm-native/slots/%i/bin/agent-vm-control");
   expect(slot).toContain("--manifest /var/lib/agent-vm-native/slots/%i/release-manifest.json");
   expect(slot).toContain("Environment=HOME=/var/lib/agent-vm-native");
   expect(slot).not.toContain("BindReadOnlyPaths=");
-  const deployd = read("skills/agent-vm-ops/assets/systemd/agent-vm-deployd.service");
+  const deployd = read("deploy/assets/systemd/agent-vm-deployd.service");
   expect(deployd).toContain("agent-vm-deployd --config /etc/agent-vm-native/deployd.json");
   expect(deployd).toContain("ReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native");
   expect(deployd).not.toContain("Requires=agent-vm-rqlite.service");
   expect(deployd).not.toContain("RuntimeDirectory=agent-vm-native");
   expect(deployd).not.toContain("Wants=agent-vm-native@blue.service agent-vm-native@green.service");
-  expect(deployd).not.toContain("After=agent-vm-native@blue.service agent-vm-native@green.service");
-  const deploydConfig = json("skills/agent-vm-ops/assets/deployd.json.example");
+  expect(deployd).toContain("After=agent-vm-native@blue.service agent-vm-native@green.service");
+  expect(slot).toContain("ExecStartPre=/opt/agent-vm-native/bin/agent-vm-deploy wait-authority --slot %i --timeout 55");
+  expect(slot).toContain("ExecStartPost=/opt/agent-vm-native/bin/agent-vm-deploy wait-process --slot %i --timeout 55");
+  const deploydConfig = json("deploy/assets/deployd.json.example");
   expect(deploydConfig.migration.legacy_unit).toBe("agent-vm-native.service");
   expect(deploydConfig.migration.rqlite_unit).toBe("agent-vm-rqlite.service");
   expect(deploydConfig.migration.rqlite_url).toBe("https://127.0.0.1:4001");
   expect(deploydConfig.migration.rqlite_ca_file).toBe("/etc/agent-vm-native/tls/rqlite/server.crt");
   expect(deploydConfig.migration.rqlite_auth_file).toBe("/etc/agent-vm-native/rqlite/auth.json");
-  const caddyUnit = read("skills/agent-vm-ops/assets/systemd/agent-vm-caddy.service");
+  const caddyUnit = read("deploy/assets/systemd/agent-vm-caddy.service");
   expect(caddyUnit).toContain("User=caddy");
   expect(caddyUnit).toContain("ConditionPathExists=/var/lib/agent-vm-native/active/app.sock");
   expect(caddyUnit).toContain("ExecStartPre=/usr/bin/test -S /var/lib/agent-vm-native/active/app.sock");
-  const sysusers = read("skills/agent-vm-ops/assets/sysusers.d/agent-vm-native.conf");
+  const sysusers = read("deploy/assets/sysusers.d/agent-vm-native.conf");
   expect(sysusers).toContain("u caddy");
 });
 
@@ -132,7 +134,7 @@ test("CA generation and state preflight require operator evidence", () => {
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-blue-green-test-"));
   try {
     const caDir = join(temporaryRoot, "ca");
-    const ca = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/generate_deployment_ca.sh"), "--output-dir", caDir, "--hostname", "localhost"]);
+    const ca = run(["bash", resolve(root, "deploy/scripts/generate_deployment_ca.sh"), "--output-dir", caDir, "--hostname", "localhost"]);
     expect(ca.exitCode).toBe(0);
     expect(existsSync(join(caDir, "ca.crt"))).toBe(true);
     expect(statSync(join(caDir, "ca.key")).mode & 0o777).toBe(0o600);
@@ -144,7 +146,7 @@ test("CA generation and state preflight require operator evidence", () => {
     const signer = createEvidenceSigner(temporaryRoot);
     const invalidEvidence = join(temporaryRoot, "invalid.json");
     signedEvidence(invalidEvidence, evidencePayload(source, "invalid-0001", { workers_quiescent: false }), signer.privateKey);
-    const rejected = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", invalidEvidence, "--evidence-public-key", signer.publicKey, "--output-dir", join(temporaryRoot, "rejected")]);
+    const rejected = run([process.execPath, resolve(root, "deploy/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", invalidEvidence, "--evidence-public-key", signer.publicKey, "--output-dir", join(temporaryRoot, "rejected")]);
     expect(rejected.exitCode).not.toBe(0);
 
     const evidence = join(temporaryRoot, "evidence.json");
@@ -153,10 +155,10 @@ test("CA generation and state preflight require operator evidence", () => {
     const tampered = JSON.parse(readFileSync(evidence, "utf8"));
     tampered.payload.trusted_commit = "forged-commit";
     writeFileSync(tamperedEvidence, JSON.stringify(tampered), { mode: 0o600 });
-    const tamperedResult = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", tamperedEvidence, "--evidence-public-key", signer.publicKey, "--output-dir", join(temporaryRoot, "tampered-output")]);
+    const tamperedResult = run([process.execPath, resolve(root, "deploy/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", tamperedEvidence, "--evidence-public-key", signer.publicKey, "--output-dir", join(temporaryRoot, "tampered-output")]);
     expect(tamperedResult.exitCode).not.toBe(0);
     const migrationDir = join(temporaryRoot, "migration");
-    const preflight = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", evidence, "--evidence-public-key", signer.publicKey, "--output-dir", migrationDir]);
+    const preflight = run([process.execPath, resolve(root, "deploy/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", evidence, "--evidence-public-key", signer.publicKey, "--output-dir", migrationDir]);
     expect(preflight.exitCode).toBe(0);
     expect(existsSync(join(migrationDir, "state.sqlite3"))).toBe(true);
     const manifest = JSON.parse(readFileSync(join(migrationDir, "snapshot-manifest.json"), "utf8"));
@@ -168,7 +170,7 @@ test("CA generation and state preflight require operator evidence", () => {
     expect(blockedDatabase.exitCode).toBe(0);
     const blockedEvidence = join(temporaryRoot, "blocked-evidence.json");
     signedEvidence(blockedEvidence, evidencePayload(blockedSource, "blocked-0001"), signer.privateKey);
-    const blocked = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/agent_vm_state_migration.ts"), "preflight", "--source", blockedSource, "--evidence", blockedEvidence, "--evidence-public-key", signer.publicKey, "--output-dir", join(temporaryRoot, "blocked-output")]);
+    const blocked = run([process.execPath, resolve(root, "deploy/scripts/agent_vm_state_migration.ts"), "preflight", "--source", blockedSource, "--evidence", blockedEvidence, "--evidence-public-key", signer.publicKey, "--output-dir", join(temporaryRoot, "blocked-output")]);
     expect(blocked.exitCode).not.toBe(0);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
@@ -176,7 +178,7 @@ test("CA generation and state preflight require operator evidence", () => {
 });
 
 test("cutover dry-run accepts only a verified blue or green layout", () => {
-  expect(read("skills/agent-vm-ops/scripts/agent_vm_cutover.sh")).toContain("mv -Tf --");
+  expect(read("deploy/scripts/agent_vm_cutover.sh")).toContain("mv -Tf --");
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-cutover-test-"));
   try {
     const layout = join(temporaryRoot, "layout");
@@ -185,10 +187,10 @@ test("cutover dry-run accepts only a verified blue or green layout", () => {
     mkdirSync(join(runtime, "blue"), { recursive: true });
     writeFileSync(join(layout, "slots/blue/release-manifest.json"), "{}\n");
     symlinkSync(join(runtime, "blue/app.sock"), join(layout, "slots/blue/app.sock"));
-    const accepted = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", runtime, "--slot", "blue", "--dry-run"]);
+    const accepted = run(["bash", resolve(root, "deploy/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", runtime, "--slot", "blue", "--dry-run"]);
     expect(accepted.exitCode).toBe(0);
     expect(JSON.parse(new TextDecoder().decode(accepted.stdout)).candidate).toBe("blue");
-    const rejected = run(["bash", resolve(root, "skills/agent-vm-ops/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", runtime, "--slot", "red", "--dry-run"]);
+    const rejected = run(["bash", resolve(root, "deploy/scripts/agent_vm_cutover.sh"), "--root", layout, "--runtime-root", runtime, "--slot", "red", "--dry-run"]);
     expect(rejected.exitCode).not.toBe(0);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });

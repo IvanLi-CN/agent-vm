@@ -63,9 +63,9 @@ function digest(path: string): string {
 
 function sourcePath(relative: string): string {
   if (relative === "agent_vm_control_bridge.ts") return join(import.meta.dir, relative);
-  if (relative === "systemd/agent-vm-native.service") return join(opsRoot, "assets", relative);
-  if (relative === "systemd/agent-vm-native@.service") return join(opsRoot, "assets", relative);
-  if (relative === "systemd/agent-vm-deployd.service") return join(opsRoot, "assets", relative);
+  if (relative === "systemd/agent-vm-native.service") return join(opsRoot, "..", "..", "deploy", "assets", relative);
+  if (relative === "systemd/agent-vm-native@.service") return join(opsRoot, "..", "..", "deploy", "assets", relative);
+  if (relative === "systemd/agent-vm-deployd.service") return join(opsRoot, "..", "..", "deploy", "assets", relative);
   if (relative === "bin/agent-vm-control") return binaryPaths.control;
   if (relative === "bin/agent-vm-deployd") return binaryPaths.deployd;
   if (relative === "bin/agent-vm-deploy") return binaryPaths.deploy;

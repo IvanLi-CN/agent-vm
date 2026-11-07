@@ -101,13 +101,19 @@ func (metrics *Metrics) Render() string {
 				output.WriteString(fmt.Sprintf("agent_vm_deployd_slot_native_workers{slot=%s} %d\n", quote(slot), observation.NativeWorkers))
 			}
 			for _, family := range sortedFamilies(observation.MetricFamilies) {
+				if strings.HasPrefix(family, "incus_") {
+					if snapshotFresh && slot == metrics.latest.ActiveSlot {
+						output.WriteString(observation.MetricFamilies[family])
+					}
+					continue
+				}
 				output.WriteString(withSlotLabel(observation.MetricFamilies[family], slot))
 			}
 		}
 	}
 	output.WriteString("# HELP agent_vm_deployd_transaction_phase Current deployment transaction phase.\n")
 	output.WriteString("# TYPE agent_vm_deployd_transaction_phase gauge\n")
-	phases := []string{PhaseStage, PhaseStandbyValidation, PhaseControllerHandoff, PhaseTrafficEnable, PhaseActiveSwitch, PhaseDrainOld, PhaseQuiescence, PhaseRollback, PhaseMigrationPrepare, PhaseMigrationDrain, PhaseMigrationQuiescence, PhaseMigrationStop, PhaseMigrationSourceCheck, PhaseMigrationImport, PhaseMigrationFinalize, PhaseFinalize}
+	phases := []string{PhaseBootstrap, PhaseStage, PhaseStandbyValidation, PhaseControllerHandoff, PhaseTrafficEnable, PhaseActiveSwitch, PhaseDrainOld, PhaseQuiescence, PhaseRollback, PhaseMigrationPrepare, PhaseMigrationDrain, PhaseMigrationQuiescence, PhaseMigrationStop, PhaseMigrationSourceCheck, PhaseMigrationImport, PhaseMigrationFinalize, PhaseFinalize}
 	currentPhase := ""
 	if len(metrics.transactions) > 0 {
 		currentPhase = metrics.transactions[0].Phase
