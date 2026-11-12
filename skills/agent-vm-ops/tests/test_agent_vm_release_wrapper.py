@@ -1452,7 +1452,7 @@ class WorkerRecoveryBootstrapTests(unittest.TestCase):
         responses = [
             {"ok": True, "result": {"draining": True}},
             {"ok": True, "result": {"pending_operations": pending, "in_flight_operations": 0}},
-            {"attempted_destroy_start": 1, "requires_release_drain": True},
+            {"attempted_destroy_start": 1, "maintenance_operation_recovery": 1, "requires_release_drain": True},
         ]
         with mock.patch.object(WRAPPER, "_current_target", return_value=Path("/retained-release")), mock.patch.object(WRAPPER, "_read_activation_safe_pending_ids", side_effect=AssertionError("must not consult legacy state")), mock.patch.object(WRAPPER, "_systemctl") as systemctl, mock.patch.object(WRAPPER.subprocess, "run", side_effect=[subprocess.CompletedProcess([],0,json.dumps(value).encode(),b"") for value in responses]):
             result = WRAPPER._ensure_drained({"require_drained":True,"current_link":"/current","release_root":"/releases","control_path":"/client.ts"}, recovery_candidate_root=Path("/verified-candidate"))
@@ -1472,6 +1472,15 @@ class WorkerRecoveryBootstrapTests(unittest.TestCase):
                 elif change == "duplicate": pending += self.pending()
                 elif change == "inflight": current["in_flight_operations"] = 1
                 self.assertFalse(WRAPPER._attempted_destroy_recovery_pending(pending, current))
+
+    def test_maintenance_recovery_accepts_finished_port_and_unstarted_restart_workers(self):
+        metrics = {"in_flight_operations": 0, "native_workers": 0}
+        port_remove = {"operation_id": "port-remove", "action": "port-remove", "session_id": "session", "generation": 7, "worker": {"state": "finished", "pid": 12, "process_group": 12, "start_time": "123", "finished_at": "2026-01-01T00:00:00Z"}}
+        restart = {"operation_id": "restart", "action": "restart", "session_id": "session", "generation": 7, "worker": {"state": "exited", "start_attempted": False}}
+        self.assertTrue(WRAPPER._activation_safe_pending_maintenance(port_remove, metrics))
+        self.assertTrue(WRAPPER._activation_safe_pending_maintenance(restart, metrics))
+        metrics["in_flight_operations"] = 1
+        self.assertFalse(WRAPPER._activation_safe_pending_maintenance(port_remove, metrics))
 
     def test_complete_starting_identity_can_install_recovery_but_partial_cannot(self):
         pending = self.pending()

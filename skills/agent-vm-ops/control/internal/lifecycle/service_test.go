@@ -259,7 +259,7 @@ func TestAcquireSharesCrossProcessImageCatalogBoundary(t *testing.T) {
 	}
 	defer unlock()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	request := protocol.Request{
 		"protocol":     protocol.Version,

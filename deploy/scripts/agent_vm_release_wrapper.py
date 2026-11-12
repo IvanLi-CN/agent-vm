@@ -1361,8 +1361,37 @@ def _verify_destroy_recovery_candidate(candidate_root: Path) -> None:
         capabilities = json.loads(result.stdout)
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, json.JSONDecodeError):
         _fail("drain_unverified", "candidate does not prove native worker recovery support")
-    if result.returncode != 0 or not isinstance(capabilities, Mapping) or type(capabilities.get("attempted_destroy_start")) is not int or capabilities != {"attempted_destroy_start": 1, "requires_release_drain": True}:
+    valid_legacy = isinstance(capabilities, Mapping) and type(capabilities.get("attempted_destroy_start")) is int and capabilities.get("attempted_destroy_start") == 1 and capabilities.get("requires_release_drain") is True and set(capabilities) == {"attempted_destroy_start", "requires_release_drain"}
+    valid_current = isinstance(capabilities, Mapping) and type(capabilities.get("attempted_destroy_start")) is int and type(capabilities.get("maintenance_operation_recovery")) is int and capabilities.get("attempted_destroy_start") == 1 and capabilities.get("maintenance_operation_recovery") == 1 and capabilities.get("requires_release_drain") is True and set(capabilities) == {"attempted_destroy_start", "maintenance_operation_recovery", "requires_release_drain"}
+    if result.returncode != 0 or not (valid_legacy or valid_current):
         _fail("drain_unverified", "candidate does not prove native worker recovery support")
+
+
+def _verify_maintenance_recovery_candidate(candidate_root: Path) -> None:
+    try:
+        result = subprocess.run([str(candidate_root / "bin/agent-vm-control"), "recovery-capabilities"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=10)
+        capabilities = json.loads(result.stdout)
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, json.JSONDecodeError):
+        _fail("drain_unverified", "candidate does not prove maintenance operation recovery support")
+    if result.returncode != 0 or not isinstance(capabilities, Mapping) or type(capabilities.get("attempted_destroy_start")) is not int or type(capabilities.get("maintenance_operation_recovery")) is not int or capabilities != {"attempted_destroy_start": 1, "maintenance_operation_recovery": 1, "requires_release_drain": True}:
+        _fail("drain_unverified", "candidate does not prove maintenance operation recovery support")
+
+
+def _activation_safe_pending_maintenance(item: Any, metrics: Mapping[str, Any]) -> bool:
+    if not isinstance(item, Mapping) or item.get("action") not in {"restart", "port-add", "port-remove"}:
+        return False
+    if metrics.get("in_flight_operations") != 0 or metrics.get("native_workers") not in (None, 0):
+        return False
+    if not isinstance(item.get("operation_id"), str) or not isinstance(item.get("session_id"), str):
+        return False
+    if type(item.get("generation")) is not int or item["generation"] <= 0:
+        return False
+    worker = item.get("worker")
+    if item["action"] == "restart":
+        return isinstance(worker, Mapping) and worker.get("state") == "exited" and worker.get("start_attempted") is False
+    if not isinstance(worker, Mapping) or worker.get("state") != "finished":
+        return False
+    return all(isinstance(worker.get(key), str) and worker[key] for key in ("start_time", "finished_at")) and all(type(worker.get(key)) is int and worker[key] > 0 for key in ("pid", "process_group"))
 
 
 def _verify_stopped_recovery_cgroups(root: Path = Path("/sys/fs/cgroup")) -> None:
@@ -1525,6 +1554,9 @@ def _ensure_drained(
                 # authority can verify the saved request and release owner,
                 # and it must not open admission if recovery is refused.
                 _verify_destroy_recovery_candidate(recovery_candidate_root)
+                return pending
+            if recovery_candidate_root is not None and all(_activation_safe_pending_maintenance(item, metrics) for item in pending):
+                _verify_maintenance_recovery_candidate(recovery_candidate_root)
                 return pending
             unsafe = [
                 item
