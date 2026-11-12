@@ -1343,7 +1343,7 @@ func recoverableOperation(action string) bool {
 }
 
 func recoverableBeforeNativeStart(action string, worker map[string]any) bool {
-	if action != "timer-expire" && action != "timer-reconcile" && action != "timer-age-gc" && action != "port-add" && action != "port-remove" {
+	if action != "timer-expire" && action != "timer-reconcile" && action != "timer-age-gc" && action != "port-add" && action != "port-remove" && action != "restart" {
 		return false
 	}
 	if stringValue(worker["state"]) != "starting" && stringValue(worker["state"]) != "exited" {
@@ -1480,6 +1480,23 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	}
 	if write && request["generation"] == nil {
 		return nil, protocol.NewError("invalid_request", "write request requires generation", nil)
+	}
+	if action == "acquire" || action == "restart" {
+		// Existing operation IDs are idempotent replays. Resolve them before
+		// the maintenance fence so completed operations remain replayable while
+		// newer maintenance failures block new dispatches.
+		if operationID := stringValue(request["operation_id"]); operationID != "" {
+			existing, err := s.Store.GetOperation(ctx, operationID)
+			if err != nil {
+				return nil, s.sqliteError(err)
+			}
+			if existing != nil {
+				return s.replayRecord(request, existing, warnings)
+			}
+		}
+		if err := s.maintenanceAdmission(ctx); err != nil {
+			return nil, err
+		}
 	}
 	unlock, lockErr := s.lockActionWithContext(ctx, action, request)
 	if lockErr != nil {
@@ -1880,12 +1897,33 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 	if err != nil {
 		return s.sqliteError(err)
 	}
-	if task == nil || task.State != stateCached || task.LeaseExpiresAt != nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
-		return nil
-	}
 	pending, err := s.Store.PendingOperations(ctx)
 	if err != nil {
 		return s.sqliteError(err)
+	}
+	taskMissing := task == nil
+	if taskMissing {
+		// destroy removes the task row before its successful journal entry can
+		// witness older port operations. Reconstruct only the identity and
+		// highest generation needed for the narrow port recovery proof.
+		lastGeneration, exists, generationErr := s.Store.LastGeneration(ctx, session)
+		if generationErr != nil {
+			return s.sqliteError(generationErr)
+		}
+		if !exists {
+			return nil
+		}
+		task = &state.Task{SessionID: session, Generation: lastGeneration, State: stateAbsent, ResourceReservationJSON: "{}", ResourcesJSON: "{}"}
+		for _, operation := range pending {
+			if operation.SessionID == nil || *operation.SessionID != session || operation.Generation == nil {
+				continue
+			}
+			if operation.Action != "port-add" && operation.Action != "port-remove" {
+				return nil
+			}
+		}
+	} else if task.State != stateCached || task.LeaseExpiresAt != nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
+		return nil
 	}
 	type superseded struct {
 		operation state.Operation
@@ -1899,8 +1937,10 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 		if operation.Generation == nil || *operation.Generation > task.Generation || s.operationActive(operation.OperationID) || !supersedableOperation(operation.Action) {
 			return nil
 		}
-		if taskID, exists := operation.Response["_task_id"]; exists && stringValue(taskID) != task.TaskID {
-			return nil
+		if !taskMissing {
+			if taskID, exists := operation.Response["_task_id"]; exists && stringValue(taskID) != task.TaskID {
+				return nil
+			}
 		}
 		if boundGeneration, exists := operation.Response["_task_generation"]; exists {
 			value, valid := protocol.Integer(boundGeneration)
@@ -1955,8 +1995,10 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 	defer cancel()
-	if err := s.verifyCachedGuest(checkCtx, task); err != nil {
-		return nil
+	if !taskMissing {
+		if err := s.verifyCachedGuest(checkCtx, task); err != nil {
+			return nil
+		}
 	}
 	if err := probe.VerifyRecoveryQuiescence(checkCtx); err != nil {
 		return protocol.NewError("startup_reconcile_required", "historical operation quiescence could not be verified", map[string]any{"admission_ready": false, "cause": err.Error()})
@@ -1974,7 +2016,7 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 
 func supersedableOperation(action string) bool {
 	switch action {
-	case "acquire", "renew", "resize", "restart", "release":
+	case "acquire", "renew", "resize", "restart", "release", "port-add", "port-remove":
 		return true
 	default:
 		return false
@@ -2027,12 +2069,18 @@ func supersedingOperationMatches(original, completed state.Operation, task *stat
 		return false
 	}
 	result, ok := response["result"].(map[string]any)
-	if !ok || stringValue(result["task_id"]) != task.TaskID || stringValue(result["session_id"]) != task.SessionID {
+	if !ok || stringValue(result["session_id"]) != task.SessionID {
 		return false
 	}
 	resultGeneration, validGeneration := protocol.Integer(result["generation"])
 	effectiveLease, validLease := result["effective_lease"].(bool)
-	if !validGeneration || !validLease || resultGeneration < *completed.Generation || resultGeneration > task.Generation {
+	if !validLease {
+		return false
+	}
+	if completed.Action == "destroy" && stringValue(result["state"]) == stateAbsent && !effectiveLease {
+		return validGeneration && (resultGeneration == 0 || (resultGeneration >= *completed.Generation && resultGeneration <= task.Generation))
+	}
+	if !validGeneration || stringValue(result["task_id"]) != task.TaskID || resultGeneration < *completed.Generation || resultGeneration > task.Generation {
 		return false
 	}
 	if completed.Action == "release" && stringValue(result["state"]) == stateCached && !effectiveLease {
@@ -3121,6 +3169,20 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 	task.ResourceReservationJSON = reservationJSON
 	if requestBool(request, "allow_restart") && s.Guest != nil {
 		if result, restartErr := s.restart(ctx, request); restartErr != nil {
+			if protocol.AsError(restartErr).Code == "maintenance_unhealthy" {
+				rollbackNow := s.Clock()
+				rolledBack, rollbackErr := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &rollbackNow}, map[string]any{
+					"resource_reservation_json": previousReservationJSON,
+					"reservation_bytes":         task.ReservationBytes,
+					"updated_at":                nowString(rollbackNow),
+				})
+				if rollbackErr != nil {
+					return nil, s.sqliteError(rollbackErr)
+				}
+				if !rolledBack {
+					return nil, protocol.NewError("resize_partial", "lease or generation changed while rolling back resize reservation", map[string]any{"phase": "durable-fence", "outcome_verified": false})
+				}
+			}
 			return nil, restartErr
 		} else {
 			_ = result
@@ -3884,8 +3946,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			resourcesValue := map[string]any{"allocated": allocated, "reserved": reserved, "allocated_and_reserved": allocatedAndReserved, "limits": limits, "remaining": remaining, "policy": map[string]any{"cpu_overcommit_ratio": s.Config.CPUOvercommitRatio, "memory_overcommit_ratio": s.Config.MemoryOvercommitRatio, "cpu_startup_pressure_full_avg10_percent": s.Config.CPUStartupPressureFullAvg10Percent}, "memory": memoryObservation, "memory_pressure": memoryObservation["pressure"]}
 			ctCPU := map[string]any{"capacity_vcpu": nil, "pressure": nil, "startup_pressure": nil}
+			maintenanceErr := s.maintenanceAdmission(ctx)
 			defaultReasons := []any{}
-			if maintenanceErr := s.maintenanceAdmission(ctx); maintenanceErr != nil {
+			if maintenanceErr != nil {
 				defaultReasons = append(defaultReasons, map[string]any{"code": protocol.AsError(maintenanceErr).Code, "message": "lifecycle maintenance is not healthy"})
 			}
 			if !s.Ready() {
@@ -4010,6 +4073,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			defaultReady := consistent && len(defaultReasons) == 0
 			admissionReady := s.Ready() && nativeUp && defaultReady
 			doctorIssues := []any{}
+			if maintenanceErr != nil {
+				doctorIssues = append(doctorIssues, map[string]any{"code": protocol.AsError(maintenanceErr).Code, "message": "lifecycle maintenance is not healthy"})
+			}
 			if !s.Ready() {
 				doctorIssues = append(doctorIssues, map[string]any{"code": "startup_reconcile_required", "message": "control service is not ready"})
 			}
@@ -4346,7 +4412,7 @@ func (s *Service) reconcilePendingAbsentDestroyOne(ctx context.Context, operatio
 			return protocol.NewError("startup_reconcile_required", "pending absent destroy native absence could not be verified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": ownershipErr.Error()})
 		}
 	}
-	response := map[string]any{"state": stateAbsent, "session_id": *operation.SessionID, "effective_lease": false}
+	response := map[string]any{"state": stateAbsent, "session_id": *operation.SessionID, "generation": int64(0), "effective_lease": false}
 	if rowExists {
 		var summaryErr error
 		response, summaryErr = s.summary(ctx, task)
@@ -5996,7 +6062,7 @@ func uncertain(err error) bool {
 	switch control.Code {
 	case "acquire_partial", "resize_partial", "restart_partial", "cleanup_incomplete", "operation_unverified", "native_failed":
 		return true
-	case "invalid_request", "missing_session", "generation_mismatch", "lease_expired", "draining", "permission_denied", "cache_stale", "task_missing", "task_not_active", "resource_pressure", "resource_insufficient", "resource_unverified", "watermarks_unreachable":
+	case "invalid_request", "missing_session", "generation_mismatch", "lease_expired", "draining", "maintenance_unhealthy", "permission_denied", "cache_stale", "task_missing", "task_not_active", "resource_pressure", "resource_insufficient", "resource_unverified", "watermarks_unreachable":
 		return false
 	default:
 		return true

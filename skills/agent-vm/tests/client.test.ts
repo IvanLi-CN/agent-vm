@@ -91,7 +91,7 @@ for (const [label, patch, code] of [
 });
 
 for (const [label, change, outcome] of [
-  ["verified preflight", {}, "error"], ["unrelated", { session_id: "other" }, "pending"], ["bool generation", { generation: true }, "pending"], ["fractional generation", { generation: new FloatToken("1.0") }, "pending"], ["unknown code", { error: { code: "internal_error", message: "unknown" } }, "pending"], ["native phase", { error: { code: "generation_mismatch", message: "native phase", detail: { phase: "native-start" } } }, "pending"],
+  ["verified preflight", {}, "error"], ["maintenance admission fence", { error: { code: "maintenance_unhealthy", message: "maintenance" } }, "error"], ["unrelated", { session_id: "other" }, "pending"], ["bool generation", { generation: true }, "pending"], ["fractional generation", { generation: new FloatToken("1.0") }, "pending"], ["unknown code", { error: { code: "internal_error", message: "unknown" } }, "pending"], ["native phase", { error: { code: "generation_mismatch", message: "native phase", detail: { phase: "native-start" } } }, "pending"],
 ] as const) test(`error envelope ${label} preserves journal outcome and exact exit`, async () => {
   const f = fixture(); f.handler = r => result("", 23, { ...r, ok: false, error: { code: "resource_pressure", message: "preflight" }, ...change });
   await expect(f.client.request("renew", { session: "s", generation: 1, operationId: "test", write: true })).rejects.toMatchObject({ exitCode: 23 });

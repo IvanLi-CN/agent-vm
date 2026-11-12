@@ -1413,7 +1413,7 @@ func (s *Store) LaterSuccessfulSessionOperations(ctx context.Context, operationI
 	err := s.withRead(ctx, func(conn *sql.Conn) error {
 		rows, err := conn.QueryContext(ctx, `SELECT later.operation_id, later.action, later.session_id, later.generation, later.response_json, later.created_at
 			FROM operations AS original JOIN operations AS later ON later.session_id = original.session_id AND later.rowid > original.rowid
-			WHERE original.operation_id = ? AND later.action IN ('acquire', 'renew', 'release', 'timer-expire') AND json_extract(later.response_json, '$.outcome') = 'success' ORDER BY later.rowid`, operationID)
+			WHERE original.operation_id = ? AND later.action IN ('acquire', 'renew', 'release', 'destroy', 'timer-expire') AND json_extract(later.response_json, '$.outcome') = 'success' ORDER BY later.rowid`, operationID)
 		if err != nil {
 			return err
 		}

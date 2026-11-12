@@ -208,6 +208,9 @@ func (s *Service) reconcileMaintenancePageWithCursor(ctx context.Context, afterT
 		page.nextOperationID = pending[index].OperationID
 		page.operationCursorUpdated = true
 	}
+	if reconcileErr := s.reconcileSupersededOperations(ctx, pending); reconcileErr != nil && firstErr == nil {
+		firstErr = reconcileErr
+	}
 	if !morePending && (len(pending) == 0 || page.nextOperationID == pending[len(pending)-1].OperationID) {
 		page.nextOperationAt = ""
 		page.nextOperationID = ""
