@@ -939,7 +939,7 @@ def _verify_retained_release(config: Mapping[str, Any], target: Path) -> dict[st
             allow_historical_state_compatibility=True,
         )
         if _is_go_manifest(manifest):
-            verify_go_bundle(target, manifest)
+            verify_go_bundle(target, manifest, allow_historical_action_set=True)
         elif _is_product_manifest(manifest):
             from release_manifest import verify_product_bundle
             verify_product_bundle(

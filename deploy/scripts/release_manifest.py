@@ -927,12 +927,20 @@ def verify_bundle(root: Path, manifest: Mapping[str, Any] | None = None) -> dict
     return checked
 
 
-def verify_go_bundle(root: Path, manifest: Mapping[str, Any] | None = None) -> dict[str, Any]:
+def verify_go_bundle(
+    root: Path,
+    manifest: Mapping[str, Any] | None = None,
+    *,
+    allow_historical_action_set: bool = False,
+) -> dict[str, Any]:
     """Verify format-2 Go artifacts without executing the candidate binary."""
     root = root.resolve()
     if not root.is_dir():
         raise _error("bundle_invalid", "bundle root is not a directory")
-    checked = validate_go_manifest(manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME))
+    checked = validate_go_manifest(
+        manifest if manifest is not None else load_release_manifest(root / MANIFEST_NAME),
+        allow_historical_action_set=allow_historical_action_set,
+    )
     if checked["client_view"]["transport"] == "https":
         raise _error("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE)
     for item in checked["artifacts"]:
