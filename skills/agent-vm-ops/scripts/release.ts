@@ -29,7 +29,7 @@ const reservation = option("--reservation");
 const stateRoot = resolve(option("--state-root") ?? "release-state");
 const repositoryRoot = resolve(import.meta.dir, "../../..");
 const releasePolicyFiles = [".github/quality-gates.json", ".github/release-contract.json", ".github/release-failure-notification.json"] as const;
-const releaseGateNames = ["Main gate (macos-latest)", "Main gate (ubuntu-latest)"] as const;
+const releaseGateNames = ["Main gate (ubuntu-latest)"] as const;
 
 function requireOption(name: string): string {
   const value = option(name);

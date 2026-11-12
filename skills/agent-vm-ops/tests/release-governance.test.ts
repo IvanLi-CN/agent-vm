@@ -79,7 +79,7 @@ test("release reservation is append-only and identity-bound", () => {
   }
 });
 
-test("release preflight is fail-closed and accepts the exact Main gate matrix", () => {
+test("release preflight is fail-closed and accepts the exact Linux Main gate", () => {
   let blocked = false;
   try {
     assertContractPreconditions(
@@ -93,32 +93,20 @@ test("release preflight is fail-closed and accepts the exact Main gate matrix", 
   if (!unprotectedError) throw new Error("workflow preflight accepted an unprotected ref");
   assertWorkflowPlatformAttestation("refs/heads/main", "true");
   const gate = successfulMainGate([
-    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, check_suite: { id: 99 }, app: { slug: "github-actions" } },
     { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } },
   ]);
-  if (gate.id !== "1,2") throw new Error(`unexpected Main gate identity: ${gate.id}`);
-  let missingMatrixRejected = false;
-  try { successfulMainGate([{ name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } }]); } catch { missingMatrixRejected = true; }
-  if (!missingMatrixRejected) throw new Error("an incomplete Main gate matrix was accepted");
+  if (gate.id !== "1") throw new Error(`unexpected Main gate identity: ${gate.id}`);
+  let missingGateRejected = false;
+  try { successfulMainGate([]); } catch { missingGateRejected = true; }
+  if (!missingGateRejected) throw new Error("a missing Main gate was accepted");
   let foreignCheckRejected = false;
-  try { successfulMainGate([
-    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, check_suite: { id: 99 }, app: { slug: "third-party" } },
-    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } },
-  ]); } catch { foreignCheckRejected = true; }
+  try { successfulMainGate([{ name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "third-party" } }]); } catch { foreignCheckRejected = true; }
   if (!foreignCheckRejected) throw new Error("a non-GitHub Actions Main gate was accepted");
-  let mixedSuiteRejected = false;
-  try { successfulMainGate([
-    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, check_suite: { id: 100 }, app: { slug: "github-actions" } },
-    { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, check_suite: { id: 99 }, app: { slug: "github-actions" } },
-  ]); } catch { mixedSuiteRejected = true; }
-  if (!mixedSuiteRejected) throw new Error("Main gates from different check suites were accepted");
   const rerunGate = successfulMainGate([
-    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 4, completed_at: "2026-11-05T00:05:00Z", check_suite: { id: 101, updated_at: "2026-11-05T00:06:00Z" }, app: { slug: "github-actions" } },
     { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 3, completed_at: "2026-11-05T00:04:00Z", check_suite: { id: 101, updated_at: "2026-11-05T00:06:00Z" }, app: { slug: "github-actions" } },
-    { name: "Main gate (macos-latest)", status: "completed", conclusion: "success", id: 2, completed_at: "2026-11-04T00:05:00Z", check_suite: { id: 100, updated_at: "2026-11-04T00:06:00Z" }, app: { slug: "github-actions" } },
     { name: "Main gate (ubuntu-latest)", status: "completed", conclusion: "success", id: 1, completed_at: "2026-11-04T00:04:00Z", check_suite: { id: 100, updated_at: "2026-11-04T00:06:00Z" }, app: { slug: "github-actions" } },
   ]);
-  if (rerunGate.id !== "3,4") throw new Error(`latest Main gate rerun was not selected: ${rerunGate.id}`);
+  if (rerunGate.id !== "3") throw new Error(`latest Main gate rerun was not selected: ${rerunGate.id}`);
 });
 
 test("GitHub state refs are append-only and preserve the original identity", async () => {

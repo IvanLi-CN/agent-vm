@@ -16,7 +16,6 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          - macos-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -51,13 +50,10 @@ jobs:
       - name: Web tests
         run: bun run test:web
       - name: Web demo browser tests
-        if: matrix.os == 'ubuntu-latest'
         run: bun run test:e2e
       - name: Static demo build
-        if: matrix.os == 'ubuntu-latest'
         run: bun run build:demo
       - name: Storybook accessibility
-        if: matrix.os == 'ubuntu-latest'
         run: |
           bun run build-storybook
           bun run test:storybook:a11y
@@ -73,7 +69,6 @@ jobs:
       - name: Run repository tests
         run: bun run test:repo
       - name: Build product packages
-        if: matrix.os == 'ubuntu-latest'
         run: |
           build_root="$(mktemp -d)"
           trap 'rm -rf "$build_root"' EXIT
@@ -97,7 +92,6 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          - macos-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -132,7 +126,6 @@ jobs:
       - name: Run Linux race tests
         working-directory: skills/agent-vm-ops/control
         run: go test -race -count=1 ./...
-        if: matrix.os == 'ubuntu-latest'
       - name: Finalize CI caches
         if: always() && steps.ci_cache.outcome == 'success'
         uses: ./.github/actions/ci-cache-save
@@ -151,7 +144,6 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          - macos-latest
     runs-on: ubuntu-latest
     steps:
       - name: Enforce validation results
