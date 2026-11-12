@@ -1482,6 +1482,18 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		return nil, protocol.NewError("invalid_request", "write request requires generation", nil)
 	}
 	if action == "acquire" || action == "restart" {
+		// Existing operation IDs are idempotent replays. Resolve them before
+		// the maintenance fence so completed operations remain replayable while
+		// newer maintenance failures block new dispatches.
+		if operationID := stringValue(request["operation_id"]); operationID != "" {
+			existing, err := s.Store.GetOperation(ctx, operationID)
+			if err != nil {
+				return nil, s.sqliteError(err)
+			}
+			if existing != nil {
+				return s.replayRecord(request, existing, warnings)
+			}
+		}
 		if err := s.maintenanceAdmission(ctx); err != nil {
 			return nil, err
 		}
@@ -2039,6 +2051,9 @@ func supersedingOperationMatches(original, completed state.Operation, task *stat
 	effectiveLease, validLease := result["effective_lease"].(bool)
 	if !validGeneration || !validLease || resultGeneration < *completed.Generation || resultGeneration > task.Generation {
 		return false
+	}
+	if completed.Action == "destroy" && stringValue(result["state"]) == stateAbsent && !effectiveLease {
+		return true
 	}
 	if completed.Action == "release" && stringValue(result["state"]) == stateCached && !effectiveLease {
 		return original.Action != "acquire" || resultGeneration > *original.Generation
@@ -3126,6 +3141,20 @@ func (s *Service) resize(ctx context.Context, request protocol.Request) (map[str
 	task.ResourceReservationJSON = reservationJSON
 	if requestBool(request, "allow_restart") && s.Guest != nil {
 		if result, restartErr := s.restart(ctx, request); restartErr != nil {
+			if protocol.AsError(restartErr).Code == "maintenance_unhealthy" {
+				rollbackNow := s.Clock()
+				rolledBack, rollbackErr := s.updateTaskIf(ctx, task.TaskID, state.TaskCondition{Generation: &task.Generation, States: []string{stateActive}, LeaseActiveAfter: &rollbackNow}, map[string]any{
+					"resource_reservation_json": previousReservationJSON,
+					"reservation_bytes":         task.ReservationBytes,
+					"updated_at":                nowString(rollbackNow),
+				})
+				if rollbackErr != nil {
+					return nil, s.sqliteError(rollbackErr)
+				}
+				if !rolledBack {
+					return nil, protocol.NewError("resize_partial", "lease or generation changed while rolling back resize reservation", map[string]any{"phase": "durable-fence", "outcome_verified": false})
+				}
+			}
 			return nil, restartErr
 		} else {
 			_ = result

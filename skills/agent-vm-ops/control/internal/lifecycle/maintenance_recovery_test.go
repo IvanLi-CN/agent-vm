@@ -253,6 +253,71 @@ func TestRecoveryFinalizesUnattemptedRestartBehindMaintenanceFence(t *testing.T)
 	}
 }
 
+func TestResizeAllowRestartRollsBackReservationWhenMaintenanceIsUnhealthy(t *testing.T) {
+	f := newScopedFixture(t)
+	f.service.Config.StoragePath = ""
+	ctx := context.Background()
+	cursor, err := f.store.MaintenanceCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor.Reconcile.LastErrorCode = "operation_unverified"
+	cursor.Reconcile.LastErrorPhase = maintenanceReconcileLane
+	cursor.Reconcile.CycleFailed = true
+	if err := f.store.SetMaintenanceCursor(ctx, cursor); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = f.service.resize(ctx, protocol.Request{
+		"session_id": "active-peer", "generation": int64(2), "allow_restart": true,
+		"memory_mib": int64(10240),
+	})
+	if protocol.AsError(err).Code != "maintenance_unhealthy" {
+		t.Fatalf("resize error = %v", err)
+	}
+	task, err := f.store.GetTask(ctx, map[string]any{"session_id": "active-peer"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.ResourceReservationJSON != "{}" || task.ReservationBytes != 0 {
+		t.Fatalf("maintenance-fenced resize left reservation: %#v", task)
+	}
+}
+
+func TestMaintenanceFenceAllowsExistingOperationReplay(t *testing.T) {
+	f := newScopedFixture(t)
+	ctx := context.Background()
+	cursor, err := f.store.MaintenanceCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor.Reconcile.LastErrorCode = "operation_unverified"
+	cursor.Reconcile.LastErrorPhase = maintenanceReconcileLane
+	cursor.Reconcile.CycleFailed = true
+	if err := f.store.SetMaintenanceCursor(ctx, cursor); err != nil {
+		t.Fatal(err)
+	}
+	request := protocol.Request{"protocol": protocol.Version, "action": "restart", "session_id": "active-peer", "generation": int64(2), "operation_id": "replay-restart"}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := map[string]any{"task_id": "active-peer", "session_id": "active-peer", "generation": int64(2), "state": stateActive, "effective_lease": true}
+	response := protocol.Success(request, result)
+	response["_request"] = map[string]any(request)
+	response["_request_digest"] = digest
+	if err := f.store.RecordOperation(ctx, "replay-restart", "restart", stringPointer("active-peer"), generationPointer(2, true), response); err != nil {
+		t.Fatal(err)
+	}
+	got, err := f.service.Dispatch(ctx, request)
+	if err != nil {
+		t.Fatalf("existing operation replay was fenced: %v", err)
+	}
+	if got["operation_id"] != "replay-restart" || got["outcome"] != "replayed" {
+		t.Fatalf("unexpected replay response: %#v", got)
+	}
+}
+
 func TestCachedReleaseRecoveryRejectsUnverifiedEvidence(t *testing.T) {
 	for _, scenario := range []string{"digest", "binding", "request", "worker", "generation", "running", "lease", "reservation", "ports", "native-owner", "native-unavailable", "native-proxy"} {
 		t.Run(scenario, func(t *testing.T) {
