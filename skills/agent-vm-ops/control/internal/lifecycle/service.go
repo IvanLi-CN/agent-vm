@@ -1921,9 +1921,6 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 			if operation.Action != "port-add" && operation.Action != "port-remove" {
 				return nil
 			}
-			if *operation.Generation > task.Generation {
-				task.Generation = *operation.Generation
-			}
 		}
 	} else if task.State != stateCached || task.LeaseExpiresAt != nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
 		return nil
