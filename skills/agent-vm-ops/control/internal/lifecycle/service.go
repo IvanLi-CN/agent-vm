@@ -2074,7 +2074,7 @@ func supersedingOperationMatches(original, completed state.Operation, task *stat
 		return false
 	}
 	if completed.Action == "destroy" && stringValue(result["state"]) == stateAbsent && !effectiveLease {
-		return !validGeneration || resultGeneration == 0 || (resultGeneration >= *completed.Generation && resultGeneration <= task.Generation)
+		return validGeneration && (resultGeneration == 0 || (resultGeneration >= *completed.Generation && resultGeneration <= task.Generation))
 	}
 	if !validGeneration || stringValue(result["task_id"]) != task.TaskID || resultGeneration < *completed.Generation || resultGeneration > task.Generation {
 		return false
@@ -4408,7 +4408,7 @@ func (s *Service) reconcilePendingAbsentDestroyOne(ctx context.Context, operatio
 			return protocol.NewError("startup_reconcile_required", "pending absent destroy native absence could not be verified", map[string]any{"operation_id": operation.OperationID, "admission_ready": false, "outcome_verified": false, "cause": ownershipErr.Error()})
 		}
 	}
-	response := map[string]any{"state": stateAbsent, "session_id": *operation.SessionID, "effective_lease": false}
+	response := map[string]any{"state": stateAbsent, "session_id": *operation.SessionID, "generation": int64(0), "effective_lease": false}
 	if rowExists {
 		var summaryErr error
 		response, summaryErr = s.summary(ctx, task)
