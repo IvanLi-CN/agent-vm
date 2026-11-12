@@ -1897,12 +1897,29 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 	if err != nil {
 		return s.sqliteError(err)
 	}
-	if task == nil || task.State != stateCached || task.LeaseExpiresAt != nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
-		return nil
-	}
 	pending, err := s.Store.PendingOperations(ctx)
 	if err != nil {
 		return s.sqliteError(err)
+	}
+	taskMissing := task == nil
+	if taskMissing {
+		// destroy removes the task row before its successful journal entry can
+		// witness older port operations. Reconstruct only the identity and
+		// highest generation needed for the narrow port recovery proof.
+		task = &state.Task{SessionID: session, Generation: 0, State: stateAbsent, ResourceReservationJSON: "{}", ResourcesJSON: "{}"}
+		for _, operation := range pending {
+			if operation.SessionID == nil || *operation.SessionID != session || operation.Generation == nil {
+				continue
+			}
+			if operation.Action != "port-add" && operation.Action != "port-remove" {
+				return nil
+			}
+			if *operation.Generation > task.Generation {
+				task.Generation = *operation.Generation
+			}
+		}
+	} else if task.State != stateCached || task.LeaseExpiresAt != nil || task.ReservationBytes != 0 || task.ResourceReservationJSON != "{}" {
+		return nil
 	}
 	type superseded struct {
 		operation state.Operation
@@ -1916,8 +1933,10 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 		if operation.Generation == nil || *operation.Generation > task.Generation || s.operationActive(operation.OperationID) || !supersedableOperation(operation.Action) {
 			return nil
 		}
-		if taskID, exists := operation.Response["_task_id"]; exists && stringValue(taskID) != task.TaskID {
-			return nil
+		if !taskMissing {
+			if taskID, exists := operation.Response["_task_id"]; exists && stringValue(taskID) != task.TaskID {
+				return nil
+			}
 		}
 		if boundGeneration, exists := operation.Response["_task_generation"]; exists {
 			value, valid := protocol.Integer(boundGeneration)
@@ -1972,8 +1991,10 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
 	defer cancel()
-	if err := s.verifyCachedGuest(checkCtx, task); err != nil {
-		return nil
+	if !taskMissing {
+		if err := s.verifyCachedGuest(checkCtx, task); err != nil {
+			return nil
+		}
 	}
 	if err := probe.VerifyRecoveryQuiescence(checkCtx); err != nil {
 		return protocol.NewError("startup_reconcile_required", "historical operation quiescence could not be verified", map[string]any{"admission_ready": false, "cause": err.Error()})
