@@ -6329,6 +6329,28 @@ func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
 	}
 }
 
+func TestDestroyWitnessSupersedesPortOperation(t *testing.T) {
+	created := time.Date(2026, 11, 7, 8, 40, 0, 0, time.UTC)
+	task := &state.Task{TaskID: "task", SessionID: "session", Generation: 1}
+	original := state.Operation{
+		OperationID: "original", Action: "port-add", SessionID: stringPointer("session"), Generation: generationPointer(1, true), CreatedAt: created.Format(time.RFC3339Nano),
+		Response: map[string]any{
+			"outcome": "pending", "_request": map[string]any{"protocol": protocol.Version, "action": "port-add", "session_id": "session", "generation": int64(1), "operation_id": "original"}, "_request_digest": strings.Repeat("a", 64),
+			"worker": map[string]any{"state": "finished", "pid": int64(1), "process_group": int64(1), "start_time": "original", "finished_at": created.Add(time.Second).Format(time.RFC3339Nano)},
+		},
+	}
+	completed := state.Operation{
+		OperationID: "destroy", Action: "destroy", SessionID: stringPointer("session"), Generation: generationPointer(1, true), CreatedAt: created.Add(2 * time.Second).Format(time.RFC3339Nano),
+		Response: map[string]any{
+			"outcome": "success", "ok": true, "protocol": protocol.Version, "operation_id": "destroy", "action": "destroy", "session_id": "session", "generation": int64(1), "_request_digest": strings.Repeat("b", 64),
+			"result": map[string]any{"session_id": "session", "generation": int64(0), "state": stateAbsent, "effective_lease": false},
+		},
+	}
+	if !supersedingOperationMatches(original, completed, task) {
+		t.Fatal("destroy witness did not supersede a pending port operation")
+	}
+}
+
 func TestWorkerExitTimeRejectsMalformedCompletionField(t *testing.T) {
 	for _, value := range []any{nil, 123, "", "invalid"} {
 		worker := map[string]any{"state": "exited", "finished_at": value, "observed_at": nowString(time.Now().Add(-time.Minute))}

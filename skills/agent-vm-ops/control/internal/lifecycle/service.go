@@ -2044,16 +2044,19 @@ func supersedingOperationMatches(original, completed state.Operation, task *stat
 		return false
 	}
 	result, ok := response["result"].(map[string]any)
-	if !ok || stringValue(result["task_id"]) != task.TaskID || stringValue(result["session_id"]) != task.SessionID {
+	if !ok || stringValue(result["session_id"]) != task.SessionID {
 		return false
 	}
 	resultGeneration, validGeneration := protocol.Integer(result["generation"])
 	effectiveLease, validLease := result["effective_lease"].(bool)
-	if !validGeneration || !validLease || resultGeneration < *completed.Generation || resultGeneration > task.Generation {
+	if !validLease {
 		return false
 	}
 	if completed.Action == "destroy" && stringValue(result["state"]) == stateAbsent && !effectiveLease {
-		return true
+		return !validGeneration || resultGeneration == 0 || (resultGeneration >= *completed.Generation && resultGeneration <= task.Generation)
+	}
+	if !validGeneration || stringValue(result["task_id"]) != task.TaskID || resultGeneration < *completed.Generation || resultGeneration > task.Generation {
+		return false
 	}
 	if completed.Action == "release" && stringValue(result["state"]) == stateCached && !effectiveLease {
 		return original.Action != "acquire" || resultGeneration > *original.Generation
