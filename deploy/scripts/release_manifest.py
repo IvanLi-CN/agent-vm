@@ -741,7 +741,10 @@ def validate_product_manifest(
     if frozenset(actual_shape) not in accepted_shapes:
         raise _error("manifest_artifact_set_invalid", "product artifact set differs from the fixed target allowlist", {"expected": sorted(expected_artifacts), "actual": sorted(actual_shape)})
 
-    actions = _validate_go_actions(root["actions"])
+    actions = _validate_go_actions(
+        root["actions"],
+        allow_historical_action_set=allow_historical_state_compatibility,
+    )
     client_view = _require_mapping(root["client_view"], "client_view")
     if set(client_view) != {"version", "source_revision", "protocol", "transport", "actions"}:
         raise _error("manifest_invalid", "product client_view has an unexpected shape")
