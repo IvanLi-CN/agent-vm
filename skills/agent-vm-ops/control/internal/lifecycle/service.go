@@ -1906,7 +1906,14 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 		// destroy removes the task row before its successful journal entry can
 		// witness older port operations. Reconstruct only the identity and
 		// highest generation needed for the narrow port recovery proof.
-		task = &state.Task{SessionID: session, Generation: 0, State: stateAbsent, ResourceReservationJSON: "{}", ResourcesJSON: "{}"}
+		lastGeneration, exists, generationErr := s.Store.LastGeneration(ctx, session)
+		if generationErr != nil {
+			return s.sqliteError(generationErr)
+		}
+		if !exists {
+			return nil
+		}
+		task = &state.Task{SessionID: session, Generation: lastGeneration, State: stateAbsent, ResourceReservationJSON: "{}", ResourcesJSON: "{}"}
 		for _, operation := range pending {
 			if operation.SessionID == nil || *operation.SessionID != session || operation.Generation == nil {
 				continue
