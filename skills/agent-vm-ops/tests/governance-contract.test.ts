@@ -14,7 +14,9 @@ test("the five project topics have locked local surfaces", () => {
     expect(read(`.agents/skills/${slug}/SKILL.md`)).toContain(`slug: ${slug}`);
   }
   const quality = json(".github/quality-gates.json");
-  expect(quality.required_checks).toEqual(["PR gate (ubuntu-latest)", "PR gate (macos-latest)"]);
+  expect(quality.required_checks).toEqual(["PR gate (ubuntu-latest)"]);
+  expect(quality.informational_checks).toEqual(["Main gate (ubuntu-latest)", "Build demo artifact"]);
+  expect(quality.release_checks).toEqual(["Main gate (ubuntu-latest)"]);
   expect(quality.queue_policy.required_pull_request_events).toEqual(["opened", "synchronize", "reopened", "ready_for_review"]);
   expect(quality.queue_policy.queue).toBe("max");
   expect(json(".github/release-contract.json").product.manifest_format).toBe(4);
@@ -37,6 +39,8 @@ test("PR scheduling is bounded and separate from Main", () => {
   const pr = read(".github/workflows/ci.yml");
   const main = read(".github/workflows/ci-main.yml");
   expect(pr).toContain("name: CI (PR)");
+  expect(pr).not.toContain("macos-latest");
+  expect(main).not.toContain("macos-latest");
   const pw = parse(pr);
   const mw = parse(main);
   expect(pw.on.pull_request.types).toEqual(["opened", "synchronize", "reopened", "ready_for_review"]);
@@ -45,13 +49,17 @@ test("PR scheduling is bounded and separate from Main", () => {
   expect(mw.concurrency["cancel-in-progress"]).toBe(false);
   expect(pw.jobs["pr-gate"].name).toBe("PR gate");
   expect(mw.jobs["main-gate"].name).toBe("Main gate");
-  expect(pw.jobs.classify.steps.some((s: any) => s.uses === "oven-sh/setup-bun@v2")).toBe(true);
+  expect(pw.jobs["pr-gate"].strategy.matrix.os).toEqual(["ubuntu-latest"]);
+  expect(mw.jobs["main-gate"].strategy.matrix.os).toEqual(["ubuntu-latest"]);
+  expect(pw.jobs.validation["runs-on"]).toBe("ubuntu-latest");
+  expect(pw.jobs.heavy["runs-on"]).toBe("ubuntu-latest");
   for (const workflow of [pw, mw]) {
-    expect(workflow.jobs.validation.strategy.matrix.os).toEqual(["ubuntu-latest", "macos-latest"]);
     expect(workflow.jobs.heavy.steps.some((s: any) => s.run === "bun run test:skills")).toBe(true);
-    expect(workflow.jobs.validation.steps.find((s: any) => s.name === "Build product packages").if).toBe("matrix.os == 'ubuntu-latest'");
+    expect(workflow.jobs.validation.steps.find((s: any) => s.name === "Build product packages").if).toBeUndefined();
     expect(JSON.stringify(workflow)).not.toContain("Cache Go build and module data");
   }
+  expect(mw.jobs.validation.strategy.matrix.os).toEqual(["ubuntu-latest"]);
+  expect(mw.jobs.heavy.strategy.matrix.os).toEqual(["ubuntu-latest"]);
 });
 
 test("demo deployment is serialized and never exposes credentials to PR builds", () => {

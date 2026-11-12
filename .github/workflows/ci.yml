@@ -15,69 +15,25 @@ concurrency:
   group: pr-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
-  classify:
-    name: Classify PR changes
-    runs-on: ubuntu-latest
-    outputs:
-      full: ${{ steps.classify.outputs.full }}
-      macos: ${{ steps.classify.outputs.macos }}
-      reason: ${{ steps.classify.outputs.reason }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: 1.4.4
-      - name: Classify changed paths
-        id: classify
-        env:
-          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
-          GITHUB_SHA: ${{ github.sha }}
-        run: bun run bin/ci_classify.ts
-      - name: Summarize classification
-        env:
-          FULL: ${{ steps.classify.outputs.full }}
-          MACOS: ${{ steps.classify.outputs.macos }}
-          REASON: ${{ steps.classify.outputs.reason }}
-        run: |
-          {
-            echo "### CI path classification"
-            echo "- full checks: ${FULL}"
-            echo "- macOS checks: ${MACOS}"
-            echo "- reason: ${REASON}"
-          } >> "$GITHUB_STEP_SUMMARY"
   validation:
     name: PR portable validation
-    needs: classify
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-    runs-on: ${{ matrix.os == 'macos-latest' && needs.classify.outputs.macos != 'true' && 'ubuntu-latest' || matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
       - uses: actions/setup-go@v5
         with:
           go-version: 1.27.3
           cache: false
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
       - name: Restore CI caches
         id: ci_cache
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
         uses: ./.github/actions/ci-cache-restore
         with:
           role: portable
@@ -88,36 +44,26 @@ jobs:
           python3 --version
           git --version
           uname -s
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
       - name: Install locked Bun dependencies
         run: bun install --frozen-lockfile
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
       - name: Typecheck
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
         run: bun run typecheck
       - name: Web tests
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
         run: bun run test:web
       - name: Web demo browser tests
-        if: matrix.os == 'ubuntu-latest'
         run: bun run test:e2e
       - name: Static demo build
-        if: matrix.os == 'ubuntu-latest'
         run: bun run build:demo
       - name: Storybook accessibility
-        if: matrix.os == 'ubuntu-latest'
         run: |
           bun run build-storybook
           bun run test:storybook:a11y
       - name: React Doctor
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
         run: bun run react-doctor:web:ci
       - name: Go control tests
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
         working-directory: skills/agent-vm-ops/control
         run: go test -count=1 ./...
       - name: Run isolated rqlite integration tests
-        if: matrix.os == 'ubuntu-latest'
         working-directory: skills/agent-vm-ops/control
         env:
           RQLITE_VERSION: 10.5.2
@@ -167,19 +113,14 @@ jobs:
           AGENT_VM_RQLITE_DESCRIPTOR="${proof_dir}/descriptor.json" \
             go test -race -count=1 ./internal/state -run '^TestRemote'
       - name: Go control vet
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
         run: go -C skills/agent-vm-ops/control vet ./...
       - name: Run repository checks
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
         run: bun run check
       - name: Validate blue-green deployment assets
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
         run: bun run deploy/scripts/validate_blue_green_deployment.ts
       - name: Run repository tests
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
         run: bun run test:repo
       - name: Build product packages
-        if: matrix.os == 'ubuntu-latest'
         run: |
           build_root="$(mktemp -d)"
           trap 'rm -rf "$build_root"' EXIT
@@ -198,35 +139,23 @@ jobs:
 
   heavy:
     name: PR Skill and race validation
-    needs: classify
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-    runs-on: ${{ matrix.os == 'macos-latest' && needs.classify.outputs.macos != 'true' && 'ubuntu-latest' || matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-        if: (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true') && (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true')
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
-        if: (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true') && (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true')
       - uses: actions/setup-go@v5
         with:
           go-version: 1.27.3
           cache: false
-        if: (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true') && (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true')
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-        if: (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true') && (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true')
       - name: Restore CI caches
         id: ci_cache
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
         uses: ./.github/actions/ci-cache-restore
         with:
           role: heavy
@@ -237,17 +166,13 @@ jobs:
           python3 --version
           git --version
           uname -s
-        if: (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true') && (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true')
       - name: Install locked Bun dependencies
         run: bun install --frozen-lockfile
-        if: (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true') && (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true')
       - name: Run Skill tests
         run: bun run test:skills
-        if: matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true'
       - name: Run Linux race tests
         working-directory: skills/agent-vm-ops/control
         run: go test -race -count=1 ./...
-        if: (matrix.os == 'ubuntu-latest') && (matrix.os == 'ubuntu-latest' || needs.classify.outputs.macos == 'true')
       - name: Finalize CI caches
         if: always() && steps.ci_cache.outcome == 'success'
         uses: ./.github/actions/ci-cache-save
@@ -259,7 +184,6 @@ jobs:
   pr-gate:
     name: PR gate
     needs:
-      - classify
       - validation
       - heavy
     if: always()
@@ -267,7 +191,6 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
-          - macos-latest
     runs-on: ubuntu-latest
     steps:
       - name: Enforce validation results
@@ -281,8 +204,3 @@ jobs:
               print(f"{name}: {value['result']}")
           assert all(value['result'] == 'success' for value in results.values()), results
           PY
-      - name: Record platform disposition
-        env:
-          MACOS: ${{ needs.classify.outputs.macos }}
-          REASON: ${{ needs.classify.outputs.reason }}
-        run: 'echo "Platform validation: macOS=${MACOS}; reason=${REASON}. Non-macOS changes use skipped-success for macOS payload; Main retains all portable checks. Linux-only rqlite, packages and race remain on Ubuntu." >> "$GITHUB_STEP_SUMMARY"'

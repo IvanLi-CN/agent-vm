@@ -3,7 +3,7 @@ import { test } from "bun:test";
 import { evaluatePlatform, type PlatformSnapshot } from "../scripts/platform-audit.ts";
 
 const quality = {
-  required_checks: ["PR gate (ubuntu-latest)", "PR gate (macos-latest)"],
+  required_checks: ["PR gate (ubuntu-latest)"],
   platform_alignment: { status: "enabled" },
 };
 const release = { platform_preconditions: { status: "enabled" } };
@@ -13,7 +13,6 @@ const alignedSnapshot = (): PlatformSnapshot => ({
     required_pull_request_reviews: {},
     required_status_checks: { strict: true, checks: [
       { context: "PR gate (ubuntu-latest)", app_id: 15368 },
-      { context: "PR gate (macos-latest)", app_id: 15368 },
     ] },
     enforce_admins: { enabled: true },
     allow_force_pushes: { enabled: false },
@@ -37,7 +36,6 @@ test("platform audit rejects an untrusted or bypassable branch configuration", (
     strict: false,
     checks: [
       { context: "PR gate (ubuntu-latest)", app_id: -1 },
-      { context: "PR gate (macos-latest)", app_id: -1 },
     ],
   };
   invalid.branch_protection.enforce_admins = { enabled: false };
