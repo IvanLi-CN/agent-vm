@@ -80,6 +80,16 @@ class GoManifestContractTests(unittest.TestCase):
         self.assertEqual(failure.exception.code, "manifest_invalid")
         self.assertEqual(MANIFEST.load_release_manifest(path)["format"], 2)
 
+    def test_retained_go_release_accepts_only_the_known_historical_action_set(self) -> None:
+        historical = copy.deepcopy(self.manifest)
+        historical["actions"].pop("admin-reconcile-session")
+        with self.assertRaises(MANIFEST.ManifestError):
+            MANIFEST.validate_go_manifest(historical)
+        self.assertEqual(
+            MANIFEST.validate_go_manifest(historical, allow_historical_action_set=True),
+            historical,
+        )
+
     def test_transport_target_and_artifact_path_are_fixed(self) -> None:
         for mutate in (
             lambda value: value["client_view"].update(transport="unknown"),
