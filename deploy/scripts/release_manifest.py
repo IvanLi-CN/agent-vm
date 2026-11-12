@@ -93,6 +93,7 @@ ACTION_NAMES = (
     "timer-expire",
     "timer-reconcile",
 )
+HISTORICAL_GO_ACTION_NAMES = tuple(action for action in ACTION_NAMES if action != "admin-reconcile-session")
 
 UNIT_EXEC_START = {
     "agent-vm-native-age-gc.service":
@@ -572,13 +573,14 @@ def validate_manifest(value: Any) -> dict[str, Any]:
     return result
 
 
-def _validate_go_actions(value: Any) -> dict[str, dict[str, Any]]:
+def _validate_go_actions(value: Any, *, allow_historical_action_set: bool = False) -> dict[str, dict[str, Any]]:
     raw_actions = _require_mapping(value, "actions")
-    if set(raw_actions) != set(ACTION_NAMES):
+    accepted_actions = HISTORICAL_GO_ACTION_NAMES if allow_historical_action_set else ACTION_NAMES
+    if set(raw_actions) != set(accepted_actions):
         raise _error(
             "manifest_action_set_invalid",
             "Go manifest action set differs from the fixed control surface",
-            {"expected": list(ACTION_NAMES), "actual": sorted(raw_actions)},
+            {"expected": list(accepted_actions), "actual": sorted(raw_actions)},
         )
     actions: dict[str, dict[str, Any]] = {}
     expected = {"request", "response", "client_to_control", "control_to_client"}
@@ -616,7 +618,7 @@ def _go_artifact(value: Any, index: int) -> dict[str, Any]:
     return {"name": name, "path": path, "role": role, "sha256": digest, "mode": mode}
 
 
-def validate_go_manifest(value: Any) -> dict[str, Any]:
+def validate_go_manifest(value: Any, *, allow_historical_action_set: bool = False) -> dict[str, Any]:
     """Validate a format-2 Go control manifest without running its artifacts."""
     root = _require_mapping(value, "manifest")
     required = {"format", "release_id", "source_revision", "protocol", "target", "toolchain", "artifacts", "actions", "client_view", "retired_units"}
@@ -648,7 +650,7 @@ def validate_go_manifest(value: Any) -> dict[str, Any]:
     if len({item["name"] for item in artifacts}) != len(artifacts) or len({item["path"] for item in artifacts}) != len(artifacts):
         raise _error("manifest_invalid", "Go artifact names and paths must be unique")
 
-    actions = _validate_go_actions(root["actions"])
+    actions = _validate_go_actions(root["actions"], allow_historical_action_set=allow_historical_action_set)
     client_view = _require_mapping(root["client_view"], "client_view")
     if set(client_view) != {"release_id", "source_revision", "protocol", "transport", "actions"}:
         raise _error("manifest_invalid", "Go client_view has an unexpected shape")
@@ -856,7 +858,7 @@ def load_release_manifest(
             allow_historical_state_compatibility=allow_historical_state_compatibility,
         )
     if isinstance(value, Mapping) and value.get("format") == GO_MANIFEST_FORMAT:
-        return validate_go_manifest(value)
+        return validate_go_manifest(value, allow_historical_action_set=allow_historical_state_compatibility)
     return validate_manifest(value)
 
 
