@@ -134,6 +134,16 @@ class ProductManifestTests(unittest.TestCase):
                 historical_state,
             )
 
+            historical_actions = copy.deepcopy(legacy)
+            historical_actions["actions"].pop("admin-reconcile-session")
+            with self.assertRaises(ManifestError) as failure:
+                validate_product_manifest(historical_actions)
+            self.assertEqual(failure.exception.code, "manifest_action_set_invalid")
+            self.assertEqual(
+                validate_product_manifest(historical_actions, allow_historical_state_compatibility=True),
+                historical_actions,
+            )
+
             historical = copy.deepcopy(legacy)
             for name, path, role, mode in (
                 ("unit:agent-vm-web.service", "systemd/agent-vm-web.service", "unit", 0o644),
