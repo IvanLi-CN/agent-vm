@@ -115,6 +115,14 @@ func TestMaintenanceFailureClosesAdmissionAndKeepsRepairRunning(t *testing.T) {
 	if err != nil || health["ready"] != false || !f.service.Ready() {
 		t.Fatalf("health must fail without resetting scheduler startup: %#v %v", health, err)
 	}
+	metrics, err := f.service.adminMetrics(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doctor, ok := metrics["doctor"].(map[string]any)
+	if !ok || doctor["ready"] != false {
+		t.Fatalf("admin metrics doctor health ignored maintenance failure: %#v", metrics["doctor"])
+	}
 	_, err = f.service.acquire(ctx, protocol.Request{"session_id": "new", "generation": 0})
 	if protocol.AsError(err).Code != "maintenance_unhealthy" {
 		t.Fatalf("new admission was not fenced: %v", err)
@@ -140,6 +148,108 @@ func TestMaintenanceFailureClosesAdmissionAndKeepsRepairRunning(t *testing.T) {
 	}
 	if err := f.service.maintenanceAdmission(ctx); err != nil {
 		t.Fatalf("clean repair cycles did not restore admission: %v", err)
+	}
+}
+
+func TestMaintenanceAdmissionFencePreventsDispatchJournal(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		action     string
+		session    string
+		generation int64
+	}{
+		{name: "acquire", action: "acquire", session: "new", generation: 0},
+		{name: "restart", action: "restart", session: "active-peer", generation: 2},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			f := newScopedFixture(t)
+			ctx := context.Background()
+			cursor, err := f.store.MaintenanceCursor(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cursor.Reconcile.LastErrorCode = "operation_unverified"
+			cursor.Reconcile.LastErrorPhase = maintenanceReconcileLane
+			cursor.Reconcile.CycleFailed = true
+			if err := f.store.SetMaintenanceCursor(ctx, cursor); err != nil {
+				t.Fatal(err)
+			}
+
+			operationID := "blocked-" + testCase.name
+			request := protocol.Request{
+				"protocol":     protocol.Version,
+				"action":       testCase.action,
+				"session_id":   testCase.session,
+				"generation":   testCase.generation,
+				"operation_id": operationID,
+			}
+			_, err = f.service.Dispatch(ctx, request)
+			if protocol.AsError(err).Code != "maintenance_unhealthy" {
+				t.Fatalf("dispatch error = %v", err)
+			}
+			operation, err := f.store.GetOperation(ctx, operationID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if operation != nil {
+				t.Fatalf("maintenance fence claimed an operation: %#v", operation)
+			}
+		})
+	}
+}
+
+func TestRecoveryFinalizesUnattemptedRestartBehindMaintenanceFence(t *testing.T) {
+	f := newScopedFixture(t)
+	ctx := context.Background()
+	cursor, err := f.store.MaintenanceCursor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cursor.Reconcile.LastErrorCode = "operation_unverified"
+	cursor.Reconcile.LastErrorPhase = maintenanceReconcileLane
+	cursor.Reconcile.CycleFailed = true
+	if err := f.store.SetMaintenanceCursor(ctx, cursor); err != nil {
+		t.Fatal(err)
+	}
+
+	session, generation, operationID := "active-peer", int64(2), "old-restart"
+	request := protocol.Request{
+		"protocol":     protocol.Version,
+		"action":       "restart",
+		"session_id":   session,
+		"generation":   generation,
+		"operation_id": operationID,
+	}
+	digest, err := protocol.Digest(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.RecordOperation(ctx, operationID, "restart", &session, &generation, map[string]any{
+		"outcome": "pending", "_request": map[string]any(request), "_request_digest": digest,
+		"worker": map[string]any{"state": "starting", "start_attempted": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.service.reconcilePendingWorker(ctx, operationID); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := f.store.PendingOperations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.service.recoverPending(ctx, pending); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := f.store.GetOperation(ctx, operationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if operation == nil || operation.Response["outcome"] != "error" {
+		t.Fatalf("unattempted restart remained unresolved: %#v", operation)
+	}
+	control, ok := operation.Response["error"].(map[string]any)
+	if !ok || control["code"] != "maintenance_unhealthy" {
+		t.Fatalf("recovered restart error = %#v", operation.Response["error"])
 	}
 }
 

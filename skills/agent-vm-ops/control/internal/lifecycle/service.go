@@ -1343,7 +1343,7 @@ func recoverableOperation(action string) bool {
 }
 
 func recoverableBeforeNativeStart(action string, worker map[string]any) bool {
-	if action != "timer-expire" && action != "timer-reconcile" && action != "timer-age-gc" && action != "port-add" && action != "port-remove" {
+	if action != "timer-expire" && action != "timer-reconcile" && action != "timer-age-gc" && action != "port-add" && action != "port-remove" && action != "restart" {
 		return false
 	}
 	if stringValue(worker["state"]) != "starting" && stringValue(worker["state"]) != "exited" {
@@ -1480,6 +1480,11 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	}
 	if write && request["generation"] == nil {
 		return nil, protocol.NewError("invalid_request", "write request requires generation", nil)
+	}
+	if action == "acquire" || action == "restart" {
+		if err := s.maintenanceAdmission(ctx); err != nil {
+			return nil, err
+		}
 	}
 	unlock, lockErr := s.lockActionWithContext(ctx, action, request)
 	if lockErr != nil {
@@ -1974,7 +1979,7 @@ func (s *Service) reconcileSupersededSession(ctx context.Context, session string
 
 func supersedableOperation(action string) bool {
 	switch action {
-	case "acquire", "renew", "resize", "restart", "release":
+	case "acquire", "renew", "resize", "restart", "release", "port-add", "port-remove":
 		return true
 	default:
 		return false
@@ -3884,8 +3889,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			}
 			resourcesValue := map[string]any{"allocated": allocated, "reserved": reserved, "allocated_and_reserved": allocatedAndReserved, "limits": limits, "remaining": remaining, "policy": map[string]any{"cpu_overcommit_ratio": s.Config.CPUOvercommitRatio, "memory_overcommit_ratio": s.Config.MemoryOvercommitRatio, "cpu_startup_pressure_full_avg10_percent": s.Config.CPUStartupPressureFullAvg10Percent}, "memory": memoryObservation, "memory_pressure": memoryObservation["pressure"]}
 			ctCPU := map[string]any{"capacity_vcpu": nil, "pressure": nil, "startup_pressure": nil}
+			maintenanceErr := s.maintenanceAdmission(ctx)
 			defaultReasons := []any{}
-			if maintenanceErr := s.maintenanceAdmission(ctx); maintenanceErr != nil {
+			if maintenanceErr != nil {
 				defaultReasons = append(defaultReasons, map[string]any{"code": protocol.AsError(maintenanceErr).Code, "message": "lifecycle maintenance is not healthy"})
 			}
 			if !s.Ready() {
@@ -4010,6 +4016,9 @@ func (s *Service) adminMetrics(ctx context.Context) (map[string]any, error) {
 			defaultReady := consistent && len(defaultReasons) == 0
 			admissionReady := s.Ready() && nativeUp && defaultReady
 			doctorIssues := []any{}
+			if maintenanceErr != nil {
+				doctorIssues = append(doctorIssues, map[string]any{"code": protocol.AsError(maintenanceErr).Code, "message": "lifecycle maintenance is not healthy"})
+			}
 			if !s.Ready() {
 				doctorIssues = append(doctorIssues, map[string]any{"code": "startup_reconcile_required", "message": "control service is not ready"})
 			}
@@ -5996,7 +6005,7 @@ func uncertain(err error) bool {
 	switch control.Code {
 	case "acquire_partial", "resize_partial", "restart_partial", "cleanup_incomplete", "operation_unverified", "native_failed":
 		return true
-	case "invalid_request", "missing_session", "generation_mismatch", "lease_expired", "draining", "permission_denied", "cache_stale", "task_missing", "task_not_active", "resource_pressure", "resource_insufficient", "resource_unverified", "watermarks_unreachable":
+	case "invalid_request", "missing_session", "generation_mismatch", "lease_expired", "draining", "maintenance_unhealthy", "permission_denied", "cache_stale", "task_missing", "task_not_active", "resource_pressure", "resource_insufficient", "resource_unverified", "watermarks_unreachable":
 		return false
 	default:
 		return true

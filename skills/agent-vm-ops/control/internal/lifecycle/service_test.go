@@ -5998,7 +5998,7 @@ func (guest *quiescentStartupGuest) VerifyRecoveryQuiescence(context.Context) er
 }
 
 func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
-	for _, action := range []string{"acquire", "renew", "resize", "restart", "release"} {
+	for _, action := range []string{"acquire", "renew", "resize", "restart", "release", "port-add", "port-remove"} {
 		t.Run(action, func(t *testing.T) {
 			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 			if err != nil {
@@ -6017,6 +6017,11 @@ func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
 				t.Fatal(err)
 			}
 			req := protocol.Request{"protocol": protocol.Version, "action": action, "session_id": session, "generation": generation, "operation_id": "original"}
+			if action == "port-add" {
+				req["name"], req["port_protocol"], req["host_port"], req["vm_port"] = "web", "tcp", int64(20006), int64(8080)
+			} else if action == "port-remove" {
+				req["name"], req["port_protocol"] = "web", "tcp"
+			}
 			digest, err := protocol.Digest(req)
 			if err != nil {
 				t.Fatal(err)
@@ -6079,7 +6084,7 @@ func TestSupersededOperationsRetainUnknownHistoricalOutcomes(t *testing.T) {
 }
 
 func TestSupersededOperationsConsumeReconciledExitEvidence(t *testing.T) {
-	for _, action := range []string{"acquire", "renew", "resize", "restart", "release"} {
+	for _, action := range []string{"acquire", "renew", "resize", "restart", "release", "port-add", "port-remove"} {
 		t.Run(action, func(t *testing.T) {
 			store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 			if err != nil {
@@ -6098,6 +6103,11 @@ func TestSupersededOperationsConsumeReconciledExitEvidence(t *testing.T) {
 				t.Fatal(err)
 			}
 			req := protocol.Request{"protocol": protocol.Version, "action": action, "session_id": session, "generation": generation, "operation_id": "original"}
+			if action == "port-add" {
+				req["name"], req["port_protocol"], req["host_port"], req["vm_port"] = "web", "tcp", int64(20006), int64(8080)
+			} else if action == "port-remove" {
+				req["name"], req["port_protocol"] = "web", "tcp"
+			}
 			digest, err := protocol.Digest(req)
 			if err != nil {
 				t.Fatal(err)
@@ -6205,7 +6215,7 @@ func TestPendingRenewWithoutLaterLeaseEvidenceRemainsBlocked(t *testing.T) {
 }
 
 func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
-	for _, action := range []string{"restart", "release"} {
+	for _, action := range []string{"restart", "release", "port-add", "port-remove"} {
 		t.Run(action, func(t *testing.T) {
 			for _, mode := range []string{"native-busy", "worker-missing", "no-witness", "wrong-session", "wrong-task", "missing-lease", "unverified-cache", "other-pending", "active", "late-worker", "bad-witness-digest", "bound-task-mismatch", "missing-exit-time", "malformed-exit-observation", "late-exit-observation", "observation-without-exited"} {
 				t.Run(mode, func(t *testing.T) {
@@ -6222,6 +6232,11 @@ func TestSupersededOperationsRequireQuiescenceAndLaterEvidence(t *testing.T) {
 						t.Fatal(err)
 					}
 					req := protocol.Request{"protocol": protocol.Version, "action": action, "session_id": session, "generation": generation, "operation_id": "original"}
+					if action == "port-add" {
+						req["name"], req["port_protocol"], req["host_port"], req["vm_port"] = "web", "tcp", int64(20006), int64(8080)
+					} else if action == "port-remove" {
+						req["name"], req["port_protocol"] = "web", "tcp"
+					}
 					digest, err := protocol.Digest(req)
 					if err != nil {
 						t.Fatal(err)
