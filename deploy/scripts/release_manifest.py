@@ -575,12 +575,14 @@ def validate_manifest(value: Any) -> dict[str, Any]:
 
 def _validate_go_actions(value: Any, *, allow_historical_action_set: bool = False) -> dict[str, dict[str, Any]]:
     raw_actions = _require_mapping(value, "actions")
-    accepted_actions = HISTORICAL_GO_ACTION_NAMES if allow_historical_action_set else ACTION_NAMES
-    if set(raw_actions) != set(accepted_actions):
+    accepted_action_sets = [set(ACTION_NAMES)]
+    if allow_historical_action_set:
+        accepted_action_sets.append(set(HISTORICAL_GO_ACTION_NAMES))
+    if set(raw_actions) not in accepted_action_sets:
         raise _error(
             "manifest_action_set_invalid",
             "Go manifest action set differs from the fixed control surface",
-            {"expected": list(accepted_actions), "actual": sorted(raw_actions)},
+            {"expected": list(ACTION_NAMES), "actual": sorted(raw_actions)},
         )
     actions: dict[str, dict[str, Any]] = {}
     expected = {"request", "response", "client_to_control", "control_to_client"}
@@ -741,7 +743,10 @@ def validate_product_manifest(
     if frozenset(actual_shape) not in accepted_shapes:
         raise _error("manifest_artifact_set_invalid", "product artifact set differs from the fixed target allowlist", {"expected": sorted(expected_artifacts), "actual": sorted(actual_shape)})
 
-    actions = _validate_go_actions(root["actions"])
+    actions = _validate_go_actions(
+        root["actions"],
+        allow_historical_action_set=allow_historical_state_compatibility,
+    )
     client_view = _require_mapping(root["client_view"], "client_view")
     if set(client_view) != {"version", "source_revision", "protocol", "transport", "actions"}:
         raise _error("manifest_invalid", "product client_view has an unexpected shape")
