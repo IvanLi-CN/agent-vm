@@ -74,7 +74,11 @@ func run(args []string) error {
 		if len(args) != 1 {
 			return errors.New("recovery-capabilities accepts no arguments")
 		}
-		return json.NewEncoder(os.Stdout).Encode(map[string]any{"attempted_destroy_start": 1, "requires_release_drain": true})
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{
+			"attempted_destroy_start":       1,
+			"maintenance_operation_recovery": 1,
+			"requires_release_drain":        true,
+		})
 	case "initialize-state":
 		return initializeState(args[1:])
 	case "serve":

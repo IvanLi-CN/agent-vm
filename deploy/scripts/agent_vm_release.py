@@ -963,6 +963,20 @@ class ReleasePublisher:
                 return False
         return True
 
+    @staticmethod
+    def _maintenance_recovery_pending(value: Any) -> bool:
+        if not isinstance(value, Mapping) or value.get("action") not in {"restart", "port-add", "port-remove"}:
+            return False
+        worker = value.get("worker")
+        if value["action"] == "restart":
+            return isinstance(worker, Mapping) and worker.get("state") == "exited" and worker.get("start_attempted") is False
+        return (
+            isinstance(worker, Mapping)
+            and worker.get("state") == "finished"
+            and all(isinstance(worker.get(key), str) and worker[key] for key in ("start_time", "finished_at"))
+            and all(type(worker.get(key)) is int and worker[key] > 0 for key in ("pid", "process_group"))
+        )
+
     def _wait_for_convergence(self, manifest: Mapping[str, Any], timeout: float, poll: float) -> dict[str, Any]:
         deadline = self.monotonic() + timeout
         last: dict[str, Any] = {}
@@ -997,6 +1011,16 @@ class ReleasePublisher:
                     and states.get(state, 0) == 0
                     for state in CONTROL_TRANSITION_STATES
                 )
+            elif (
+                isinstance(pending, list)
+                and pending
+                and last.get("in_flight_operations") == 0
+                and all(self._maintenance_recovery_pending(item) for item in pending)
+            ):
+                # The candidate wrapper performs the matching capability proof
+                # immediately before activation; these journal entries are safe
+                # to carry across the fence because no native effect is live.
+                converged = True
             elif "pending_operations" not in last and isinstance(states, Mapping):
                 # Older active releases do not expose the pending-operation
                 # list. Keep the drain and transition checks here; the
