@@ -1045,6 +1045,11 @@ def verify_client_sidecar(
             allow_historical_web_config_mode=allow_historical_web_config_mode,
             allow_historical_state_compatibility=allow_historical_state_compatibility,
         )
+    elif isinstance(candidate, Mapping) and candidate.get("format") == GO_MANIFEST_FORMAT:
+        checked = validate_go_manifest(
+            candidate,
+            allow_historical_action_set=allow_historical_state_compatibility,
+        )
     else:
         checked = validate_release_manifest(candidate)
     sidecar_path = _resolve_regular(root, CLIENT_SIDECAR_NAME)
