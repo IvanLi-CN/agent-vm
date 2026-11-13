@@ -55,7 +55,7 @@ CLI 不接收 rqlite 地址、数据库路径、SQL 或凭据，也不绕过 Dep
 | `port list` / `port remove NAME [--explain]` | 检查或移除精确 mapping。 |
 | `admin status` | 只读的 native component、maintenance status 和有界 per-task inventory。 |
 | `admin metrics` | 面向 `agent-vm-deployd` 的只读 controller metrics snapshot；包含 resource allocation、CT memory、disk capacity/admission、task、warning 和 failure summaries；不创建 session 或改变 state。 |
-| `admin drain enter\|status\|exit [--explain]` | 在允许安全 retrieval 和 release 的同时控制 admission；变更失败时提供 bounded diagnosis。 |
+| `admin drain enter [--explain]\|status\|exit [--explain]` | 在允许安全 retrieval 和 release 的同时控制 admission；变更失败时提供 bounded diagnosis。 |
 | `admin session list` | 列出 managed session records。 |
 | `admin reconcile [--apply] [--explain]` / `admin gc [--apply] [--explain]` | 默认 preview；只在 authorized operations task 内 apply，preview 保持纯 read-only。 |
 | `admin reconcile-session --task-id ID --generation N --pending-operation-id ID [--apply] [--explain]` | 仅对选中 session 的指定 task/generation 和单个未启动 acquire 做过期清理，保留 cache；默认只读 preview，错误时可显式附带有界诊断。 |
