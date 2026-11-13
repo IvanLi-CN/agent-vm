@@ -84,7 +84,11 @@ export async function dispatch(args: Args, client = new Client(), native = inher
     }
   };
   const resources = (): Data => ({ ...(o.cpu === undefined ? {} : { cpu: o.cpu }), ...(o.memory === undefined ? {} : { memory_mib: parseSize(o.memory, true) }), ...(o.disk === undefined ? {} : { disk_gib: parseSize(o.disk, false) }) });
-  if (["doctor", "status"].includes(cmd)) return client.request(cmd, { session });
+  if (["doctor", "status"].includes(cmd)) {
+    const response = await client.request(cmd, { session });
+    if (cmd === "status") client.reconcileServerState(session!, response.result);
+    return response;
+  }
   if (cmd === "acquire") {
     const [key, publicKey] = await client.key(session!);
     const acquireOperationId = o["operation-id"] || randomUUID();

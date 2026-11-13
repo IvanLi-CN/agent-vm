@@ -1750,7 +1750,7 @@ func safeError(err error) map[string]any {
 }
 
 func controllerLeaseLostError(cause error) *protocol.Error {
-	detail := map[string]any{"outcome_verified": false, "phase": "controller-lease"}
+	detail := map[string]any{"outcome_verified": false, "phase": "controller-lease", "state": "unknown", "lease_expires_at": nil, "native_status": "unknown", "worker": map[string]any{"state": "unknown", "evidence": "retained_in_operation_journal"}, "recovery_blocker": "lease_lost_during_management_mutation", "next_action": "inspect the original operation status; do not replay with a new operation ID"}
 	if cause != nil {
 		detail["cause"] = cause.Error()
 	}

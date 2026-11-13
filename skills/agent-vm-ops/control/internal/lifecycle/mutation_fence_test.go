@@ -6,7 +6,33 @@ import (
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 )
+
+func TestControllerLeaseLostErrorRetainsOperationIdentityAndEvidenceLocation(t *testing.T) {
+	request := protocol.Request{
+		"operation_id": "op-lease-loss", "session_id": "session-1", "task_id": "avm-task",
+		"generation": int64(7),
+	}
+	err := controllerLeaseLostError(context.Canceled, request)
+	control := protocol.AsError(err)
+	if control.Code != "state_unverified" {
+		t.Fatalf("code = %q, want state_unverified", control.Code)
+	}
+	detail, ok := control.Detail.(map[string]any)
+	if !ok {
+		t.Fatalf("detail = %#v, want object", control.Detail)
+	}
+	for key, want := range map[string]any{
+		"operation_id": "op-lease-loss", "session_id": "session-1", "task_id": "avm-task",
+		"generation": int64(7), "outcome_verified": false, "phase": "controller-lease",
+		"journal_state": "pending", "worker_evidence": "retained_in_operation_journal",
+	} {
+		if detail[key] != want {
+			t.Errorf("detail[%q] = %#v, want %#v", key, detail[key], want)
+		}
+	}
+}
 
 func TestMutationContextCancelsWhenControllerLeaseChanges(t *testing.T) {
 	now := time.Now().UTC()

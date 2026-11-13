@@ -379,8 +379,22 @@ func (s *Service) mutationContext(ctx context.Context) (context.Context, func(),
 	return fencedContext, stop, lost.Load
 }
 
-func controllerLeaseLostError(cause error) error {
-	detail := map[string]any{"outcome_verified": false, "phase": "controller-lease"}
+func controllerLeaseLostError(cause error, request ...protocol.Request) error {
+	detail := map[string]any{"outcome_verified": false, "phase": "controller-lease", "journal_state": "pending", "state": "unknown", "lease_expires_at": nil, "native_status": "unknown", "worker": map[string]any{"state": "unknown", "evidence": "retained_in_operation_journal"}, "worker_evidence": "retained_in_operation_journal", "recovery_blocker": "lease_lost_during_mutation", "next_action": "inspect the original operation status; do not replay with a new operation ID"}
+	if len(request) > 0 {
+		if operationID := stringValue(request[0]["operation_id"]); operationID != "" {
+			detail["operation_id"] = operationID
+		}
+		if sessionID := stringValue(request[0]["session_id"]); sessionID != "" {
+			detail["session_id"] = sessionID
+		}
+		if taskID := stringValue(request[0]["task_id"]); taskID != "" {
+			detail["task_id"] = taskID
+		}
+		if generation, ok := request[0]["generation"]; ok {
+			detail["generation"] = generation
+		}
+	}
 	if cause != nil {
 		detail["cause"] = cause.Error()
 	}
@@ -1578,7 +1592,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	}
 	result, err := s.dispatchAction(dispatchCtx, action, request)
 	if write && !leaseExempt && (mutationLost() || !s.mutationAllowed()) {
-		err = controllerLeaseLostError(err)
+		err = controllerLeaseLostError(err, request)
 	}
 	if err != nil {
 		if s.Snapshots != nil {
@@ -1599,14 +1613,14 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	response := protocol.SuccessWithRelease(request, result, s.Release, warnings)
 	if write {
 		if !leaseExempt && (mutationLost() || !s.mutationAllowed()) {
-			return nil, controllerLeaseLostError(nil)
+			return nil, controllerLeaseLostError(nil, request)
 		}
 		operationID := stringValue(request["operation_id"])
 		digest, _ := protocol.Digest(request)
 		response["_request_digest"] = digest
 		recordErr := s.commitMutationContext(ctx, func() error {
 			if !leaseExempt && mutationLost() {
-				return controllerLeaseLostError(nil)
+				return controllerLeaseLostError(nil, request)
 			}
 			return s.Store.RecordOperation(ctx, operationID, stringValue(request["action"]), optionalString(request["session_id"]), generationPointer(intValue(request["generation"]), request["generation"] != nil), response)
 		})
@@ -2973,7 +2987,13 @@ func acquireOperationMatchesTask(operation state.Operation, task *state.Task) bo
 		generation, valid := protocol.Integer(rawGeneration)
 		return valid && generation == task.Generation && rawTask == task.TaskID
 	}
-	return *operation.Generation == task.Generation || task.Generation > 0 && *operation.Generation == task.Generation-1
+	if *operation.Generation == task.Generation {
+		return true
+	}
+	if task.Generation == 1 && *operation.Generation == 0 && task.PreviousGeneration == nil {
+		return true
+	}
+	return task.PreviousGeneration != nil && *operation.Generation == *task.PreviousGeneration && task.Generation > *task.PreviousGeneration
 }
 
 func (s *Service) pendingAcquireOperations(ctx context.Context, task *state.Task) ([]state.Operation, error) {
@@ -4727,7 +4747,11 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	result := map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": nil, "verified": false}
+	pendingOperations, morePending, pendingErr := s.Store.PendingOperationsForSessionPage(ctx, task.SessionID, 128)
+	if pendingErr != nil {
+		return nil, s.sqliteError(pendingErr)
+	}
+	result := map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": nil, "verified": false, "pending_operation_count": len(pendingOperations), "pending_operations_complete": !morePending}
 	if resourceState != nil {
 		result["resource_state"] = resourceState
 	}

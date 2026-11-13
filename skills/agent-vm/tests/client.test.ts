@@ -299,6 +299,26 @@ test("local recovery state is locked, monotonic and cleanup-only safe", () => {
   })).toBe(false);
 });
 
+test("authoritative cached status marks local generation stale before later mutation", async () => {
+  const f = fixture(); f.state("explicit", 7);
+  f.handler = request => result(response(request, {
+    result: { session_id: "explicit", task_id: "avm-abc", generation: 7, state: "cached", effective_lease: false, guest_available: false, lease_expires_at: null, pending_operation_count: 0, pending_operations_complete: true },
+  }));
+  await dispatch(selected(["status"]), f.client);
+  expect(f.client.state("explicit")).toMatchObject({ generation: 7, task_id: "avm-abc", cleanup_only: true, stale: true });
+  expect(() => f.client.generation("explicit")).toThrow("cleanup-only");
+  expect(f.client.generation("explicit", true)).toBe(7);
+});
+
+test("diagnosis status also reconciles authoritative stale local state", async () => {
+  const f = fixture(); f.state("explicit", 7);
+  f.handler = request => result(response(request, {
+    result: { session_id: "explicit", task_id: "avm-abc", generation: 7, state: "cached", effective_lease: false, guest_available: false, pending_operation_count: 0, pending_operations_complete: true },
+  }));
+  await attachDiagnosis(new CliError("startup_reconcile_required", "recovery required"), f.client, "explicit", "pending", false);
+  expect(f.client.state("explicit")).toMatchObject({ cleanup_only: true, stale: true });
+});
+
 test("recovery state requires an exact committed or partial operation proof", async () => {
   const f = fixture();
   const key = f.key();

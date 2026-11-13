@@ -24,6 +24,8 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
+func int64Pointer(value int64) *int64 { return &value }
+
 func missingInstanceError(instance string) error {
 	err := exec.Command("false").Run()
 	diagnostic := fmt.Sprintf("Error: Failed to fetch instance %q in projectName %q: Instance not found", instance, "agents")
@@ -4245,7 +4247,7 @@ func TestStartupReconcileCancelsAcquireForCachedStoppedTask(t *testing.T) {
 	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
 	session := "cached-pending-acquire-session"
 	if err := store.InsertTask(context.Background(), state.Task{
-		TaskID: "cached-pending-task", SessionID: session, Generation: 2, State: stateCached,
+		TaskID: "cached-pending-task", SessionID: session, Generation: 2, PreviousGeneration: int64Pointer(1), State: stateCached,
 		InstanceName: "agent-cached-pending", CreatedAt: nowString(now), UpdatedAt: nowString(now),
 		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
 	}); err != nil {
@@ -4296,7 +4298,7 @@ func TestReconcileFinalizesOrphanedAcquireWithoutReplay(t *testing.T) {
 	now := time.Date(2026, 10, 26, 0, 0, 0, 0, time.UTC)
 	session := "periodic-cached-pending-acquire-session"
 	if err := store.InsertTask(ctx, state.Task{
-		TaskID: "periodic-cached-pending-task", SessionID: session, Generation: 2, State: stateCached,
+		TaskID: "periodic-cached-pending-task", SessionID: session, Generation: 2, PreviousGeneration: int64Pointer(1), State: stateCached,
 		InstanceName: "agent-periodic-cached-pending", CreatedAt: nowString(now), UpdatedAt: nowString(now),
 		ResourcesJSON: `{"cpu":2,"memory_mib":4096,"disk_gib":20}`, ResourceReservationJSON: `{}`,
 	}); err != nil {
@@ -5597,7 +5599,11 @@ func TestOrphanRecoveryContinuesAfterStaleGeneration(t *testing.T) {
 		taskGen    int64
 		requestGen int64
 	}{{"stale", 5, 1}, {"valid", 2, 1}} {
-		task := state.Task{TaskID: item.session + "-task", SessionID: item.session, Generation: item.taskGen, State: stateCached, InstanceName: item.session + "-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
+		previous := item.requestGen
+		if item.session == "stale" {
+			previous = item.taskGen - 1
+		}
+		task := state.Task{TaskID: item.session + "-task", SessionID: item.session, Generation: item.taskGen, PreviousGeneration: &previous, State: stateCached, InstanceName: item.session + "-instance", CreatedAt: nowString(now), UpdatedAt: nowString(now), ResourcesJSON: `{}`, ResourceReservationJSON: `{}`}
 		if err := store.InsertTask(ctx, task); err != nil {
 			t.Fatal(err)
 		}

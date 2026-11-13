@@ -5,6 +5,7 @@
 它不是宿主机清单，也不声称知道观测到的 CT 下方的物理或虚拟来源。
 
 本手册描述目标蓝绿部署控制器，同时保留蓝绿部署前的 SSH/SQLite 恢复基线。
+session lifecycle、lease 丢失和 operation journal 的状态约束见[控制面生命周期与恢复设计](CONTROL-PLANE-LIFECYCLE-RECOVERY.md)；本手册只规定运行和恢复步骤。
 目标部署使用槽位外 Go `agent-vm-deployd` 服务、统一 Agent VM 服务、稳定的项目 Caddy 和共享 rqlite，具体见[系统架构](../../architecture/system.md)、[部署控制器 ADR](../../adr/0045-agent-vm-deployment-controller.md) 以及[ADR 0044](../../adr/0044-agent-vm-state-migration-to-rqlite.md)。
 Deployd SQLite 是独立的部署状态；
 不得把它作为业务状态打开，也不得在迁移后用它替代 rqlite。

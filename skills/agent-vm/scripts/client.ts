@@ -167,7 +167,7 @@ function boundedDiagnosticString(value: string): string {
 
 function boundedStatus(value: any): Data {
   if (!record(value)) return {};
-  return Object.fromEntries(["session_id", "task_id", "generation", "state", "effective_lease", "lease_expires_at", "native_status", "guest_available", "verified", "last_error", "guest_error", "resource_state"].filter(key => key in value).map(key => [key, boundedDiagnosticValue(value[key])]));
+  return Object.fromEntries(["session_id", "task_id", "generation", "state", "effective_lease", "lease_expires_at", "native_status", "guest_available", "verified", "last_error", "guest_error", "resource_state", "pending_operation_count", "pending_operations_complete"].filter(key => key in value).map(key => [key, boundedDiagnosticValue(value[key])]));
 }
 
 function boundedMetrics(value: any): Data {
@@ -190,6 +190,7 @@ export async function attachDiagnosis(error: any, client: Client, session: strin
     const statusResponse = await client.request("status", { session, fields: diagnosisOperationId ? { operation_id: diagnosisOperationId } : {} });
     const status = boundedStatus(statusResponse.result);
     diagnosis.status = status;
+    client.reconcileServerState(session, statusResponse.result);
     diagnosis.diagnosis_completeness = Object.keys(status).length ? "full" : "partial";
     if (explain) {
       try {
@@ -215,9 +216,11 @@ export async function attachDiagnosis(error: any, client: Client, session: strin
     diagnosis.diagnosis_completeness = "partial";
     diagnosis.status = { outcome: "unavailable" };
   }
+  const blocker = typeof existing.recovery_blocker === "string" ? existing.recovery_blocker : undefined;
   const nextAction = cliError.code === "startup_reconcile_required"
     ? diagnosisOperationId ? "inspect the bounded diagnosis, then run the exact admin reconcile-session dry run before any apply" : "inspect status and reconcile the pending operation explicitly"
-    : cliError.code === "stale_target" ? "wait until lease_expires_at, then retry the read-only reconciliation preview"
+    : cliError.code === "stale_target" && blocker === "lease_unexpired" ? "wait until lease_expires_at, then retry the read-only reconciliation preview"
+    : cliError.code === "stale_target" && blocker === "task_identity_mismatch" ? "refresh status and use the current task identity; do not retry the stale target"
     : cliError.code === "remote_timeout" ? "retry the same operation ID only after checking status; the outcome is still pending"
     : undefined;
   const merged = boundedDiagnosticValue({ ...existing, ...diagnosis, ...(nextAction ? { next_action: nextAction } : {}) });
@@ -244,14 +247,15 @@ export class Client {
     if (!record(candidate) || candidate.session_id !== session ||
       typeof candidate.task_id !== "string" || !/^avm-[a-z0-9-]+$/.test(candidate.task_id) ||
       !integer(candidate.generation) || candidate.generation < 1 ||
-      "cleanup_only" in candidate && typeof candidate.cleanup_only !== "boolean") return false;
+      "cleanup_only" in candidate && typeof candidate.cleanup_only !== "boolean" ||
+      "stale" in candidate && typeof candidate.stale !== "boolean") return false;
     if (current === null) return true;
     if (!record(current) || current.session_id !== session || !integer(current.generation) || current.generation < 1 ||
       typeof current.task_id !== "string" || !/^avm-[a-z0-9-]+$/.test(current.task_id)) return false;
     if (current.generation > candidate.generation) return false;
     if (equal(current.generation, candidate.generation)) {
       if (current.task_id !== candidate.task_id) return false;
-      if (current.cleanup_only === false && candidate.cleanup_only === true) return false;
+      if (current.cleanup_only === false && candidate.cleanup_only === true && candidate.stale !== true) return false;
     }
     return true;
   }
@@ -283,11 +287,25 @@ export class Client {
   }
   generation(session: string, allowCleanupOnly = false): number | bigint {
     const state = this.state(session);
-    if (state.cleanup_only === true && !allowCleanupOnly)
+    if ((state.cleanup_only === true || state.stale === true) && !allowCleanupOnly)
       fail("lease_unavailable", "local recovery state is cleanup-only; release or destroy the session first");
     const n = state.generation;
     if (!integer(n) || n < 1) fail("local_state_invalid", "local session state has no valid generation");
     return n;
+  }
+  reconcileServerState(session: string, result: Data): boolean {
+    if (!record(result) || result.session_id !== session ||
+      typeof result.task_id !== "string" || !/^avm-[a-z0-9-]+$/.test(result.task_id) ||
+      !integer(result.generation) || result.generation < 1 ||
+      result.state !== "cached" || result.effective_lease === true || result.guest_available === true || result.pending_operation_count !== 0 || result.pending_operations_complete !== true) return false;
+    let current: Data;
+    try { current = this.state(session); } catch { return false; }
+    if (current.task_id !== result.task_id && equal(current.generation, result.generation)) return false;
+    if (integer(current.generation) && current.generation > result.generation) return false;
+    return this.saveState(session, {
+      session_id: session, task_id: result.task_id, generation: result.generation,
+      private_key: current.private_key, cleanup_only: true, stale: true,
+    });
   }
   persistRecoveryState(session: string, privateKey: string, result: any, operationId: string, expectedGeneration: number | bigint): boolean {
     if (!record(result) || result.session_id !== session || result.state === "absent" ||
