@@ -61,6 +61,19 @@ func TestManualReconcileBadCachedAcquireDoesNotPreventExpiry(t *testing.T) {
 	}
 }
 
+func TestGlobalGarbageCollectionPreviewDoesNotRequireOperation(t *testing.T) {
+	f := newScopedFixture(t)
+	response, err := f.service.Dispatch(context.Background(), protocol.Request{
+		"protocol": protocol.Version, "action": "admin-gc", "session_id": "operator", "generation": int64(0), "apply": false,
+	})
+	if err != nil {
+		t.Fatalf("read-only admin gc preview failed: %v", err)
+	}
+	if response == nil {
+		t.Fatal("read-only admin gc preview returned no response")
+	}
+}
+
 func newCachedReleaseFixture(t *testing.T, mutations ...func(map[string]any)) *scopedFixture {
 	f := newScopedFixture(t)
 	ctx := context.Background()

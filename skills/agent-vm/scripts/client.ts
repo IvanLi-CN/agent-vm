@@ -137,9 +137,34 @@ function nonEnvelopeDiagnostics(raw: Buffer, request: Data): Buffer {
 }
 export interface RequestOptions { session: string | null; generation?: number | bigint; write?: boolean; operationId?: string; fields?: Data; }
 
+const DIAGNOSTIC_MAX_DEPTH = 3;
+const DIAGNOSTIC_MAX_KEYS = 32;
+const DIAGNOSTIC_MAX_ITEMS = 16;
+const DIAGNOSTIC_MAX_STRING = 512;
+
+function boundedDiagnosticValue(value: any, depth = 0): any {
+  if (typeof value === "string") return value.length > DIAGNOSTIC_MAX_STRING ? `${value.slice(0, DIAGNOSTIC_MAX_STRING)}…` : value;
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (typeof value === "bigint") return value.toString();
+  if (depth >= DIAGNOSTIC_MAX_DEPTH) return "[truncated]";
+  if (Array.isArray(value)) {
+    const result = value.slice(0, DIAGNOSTIC_MAX_ITEMS).map(item => boundedDiagnosticValue(item, depth + 1));
+    if (value.length > DIAGNOSTIC_MAX_ITEMS) result.push(`[${value.length - DIAGNOSTIC_MAX_ITEMS} items truncated]`);
+    return result;
+  }
+  if (record(value)) {
+    const entries = Object.entries(value);
+    const result: Data = Object.create(null);
+    for (const [key, item] of entries.slice(0, DIAGNOSTIC_MAX_KEYS)) result[key.slice(0, DIAGNOSTIC_MAX_STRING)] = boundedDiagnosticValue(item, depth + 1);
+    if (entries.length > DIAGNOSTIC_MAX_KEYS) result._truncated_fields = entries.length - DIAGNOSTIC_MAX_KEYS;
+    return result;
+  }
+  return String(value).slice(0, DIAGNOSTIC_MAX_STRING);
+}
+
 function boundedStatus(value: any): Data {
   if (!record(value)) return {};
-  return Object.fromEntries(["session_id", "task_id", "generation", "state", "effective_lease", "lease_expires_at", "native_status", "guest_available", "verified", "last_error", "guest_error", "resource_state"].filter(key => key in value).map(key => [key, value[key]]));
+  return Object.fromEntries(["session_id", "task_id", "generation", "state", "effective_lease", "lease_expires_at", "native_status", "guest_available", "verified", "last_error", "guest_error", "resource_state"].filter(key => key in value).map(key => [key, boundedDiagnosticValue(value[key])]));
 }
 
 function boundedMetrics(value: any): Data {
@@ -177,9 +202,9 @@ export async function attachDiagnosis(error: any, client: Client, session: strin
           const preview = await client.request("admin-reconcile-session", {
             session, generation, fields: { task_id: taskId, pending_operation_id: diagnosisOperationId, apply: false },
           });
-          diagnosis.recovery_preview = preview.result;
+          diagnosis.recovery_preview = boundedDiagnosticValue(preview.result);
         } catch (previewError) {
-          diagnosis.recovery_preview = { outcome: "unavailable", error: previewError instanceof CliError ? { code: previewError.code, message: previewError.message, detail: previewError.detail } : { code: "unknown", message: "preview failed" } };
+          diagnosis.recovery_preview = boundedDiagnosticValue({ outcome: "unavailable", error: previewError instanceof CliError ? { code: previewError.code, message: previewError.message, detail: previewError.detail } : { code: "unknown", message: "preview failed" }});
         }
       }
     }
@@ -192,7 +217,7 @@ export async function attachDiagnosis(error: any, client: Client, session: strin
     : cliError.code === "stale_target" ? "wait until lease_expires_at, then retry the read-only reconciliation preview"
     : cliError.code === "remote_timeout" ? "retry the same operation ID only after checking status; the outcome is still pending"
     : undefined;
-  const merged = { ...existing, ...diagnosis, ...(nextAction ? { next_action: nextAction } : {}) };
+  const merged = boundedDiagnosticValue({ ...existing, ...diagnosis, ...(nextAction ? { next_action: nextAction } : {}) });
   return new CliError(cliError.code, cliError.message, merged, cliError.exitCode);
 }
 

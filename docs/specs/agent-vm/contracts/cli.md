@@ -42,21 +42,22 @@ CLI 不接收 rqlite 地址、数据库路径、SQL 或凭据，也不绕过 Dep
 | `doctor` | 只读的 component 和 admission diagnostics。 |
 | `status` | 选中 session 的只读 state。 |
 | `acquire [--cpu N] [--memory SIZE] [--disk SIZE] [--explain]` | 创建或复用选中 session 的 managed container；遇到 startup recovery 错误时附带有界只读诊断。 |
-| `renew` | 在 configured maximum 内延长当前 lease。 |
-| `release` | 撤销 access、停止 guest，并保留 eligible cache。 |
-| `resize [--cpu N] [--memory SIZE] [--disk SIZE] [--live] [--allow-restart]` | 应用显式授权的 resource change。 |
+| `renew [--explain]` | 在 configured maximum 内延长当前 lease；失败时可增加 bounded metrics 与 read-only recovery preview。 |
+| `release [--explain]` | 撤销 access、停止 guest，并保留 eligible cache；失败时可增加 bounded metrics 与 read-only recovery preview。 |
+| `destroy [--explain]` / `restart [--explain]` | 执行显式授权的生命周期动作，并在失败时提供 bounded diagnosis。 |
+| `resize [--cpu N] [--memory SIZE] [--disk SIZE] [--live] [--allow-restart] [--explain]` | 应用显式授权的 resource change。 |
 | `ssh [-- SSH_ARGS]` | 使用生成的 strict connection settings 打开 native SSH。 |
 | `exec -- ARGV` | 运行 argument-vector command；需要 shell syntax 时显式使用 `sh -lc`。 |
 | `sync --name NAME` | 通过 bundled synchronization helper 传输当前 worktree。 |
 | `upload SOURCE DESTINATION` / `download SOURCE DESTINATION` | 在线传输 files，不 renew lease。 |
 | `export PATH` | 在 stdout stream tar archive；diagnostics 写入 stderr。 |
-| `port add NAME --guest-port N [--protocol tcp\|udp] [--host-port N]` | 创建精确的 native proxy mapping。 |
-| `port list` / `port remove NAME` | 检查或移除精确 mapping。 |
+| `port add NAME --guest-port N [--protocol tcp\|udp] [--host-port N] [--explain]` | 创建精确的 native proxy mapping，并在失败时提供 bounded diagnosis。 |
+| `port list` / `port remove NAME [--explain]` | 检查或移除精确 mapping。 |
 | `admin status` | 只读的 native component、maintenance status 和有界 per-task inventory。 |
 | `admin metrics` | 面向 `agent-vm-deployd` 的只读 controller metrics snapshot；包含 resource allocation、CT memory、disk capacity/admission、task、warning 和 failure summaries；不创建 session 或改变 state。 |
-| `admin drain enter\|status\|exit` | 在允许安全 retrieval 和 release 的同时控制 admission。 |
+| `admin drain enter\|status\|exit [--explain]` | 在允许安全 retrieval 和 release 的同时控制 admission；变更失败时提供 bounded diagnosis。 |
 | `admin session list` | 列出 managed session records。 |
-| `admin reconcile [--apply]` / `admin gc [--apply]` | 默认 preview；只在 authorized operations task 内 apply。 |
+| `admin reconcile [--apply] [--explain]` / `admin gc [--apply] [--explain]` | 默认 preview；只在 authorized operations task 内 apply，preview 保持纯 read-only。 |
 | `admin reconcile-session --task-id ID --generation N --pending-operation-id ID [--apply] [--explain]` | 仅对选中 session 的指定 task/generation 和单个未启动 acquire 做过期清理，保留 cache；默认只读 preview，错误时可显式附带有界诊断。 |
 
 所有 session-scoped mutation 支持显式 `--explain`；默认错误返回 bounded status diagnosis，`--explain` 才增加 bounded metrics summary 和 read-only recovery preview。`--apply` 是唯一允许 reconciliation 创建 operation intent 和 local mutation journal 的路径。
