@@ -43,6 +43,35 @@ test("scoped reconciliation pins identity and dry run has no operation intent or
   expect(f.requests).toHaveLength(2);
 });
 
+test("global reconcile and gc previews are read-only while apply journals", async () => {
+  const f = fixture(); f.state();
+  await dispatch(selected(["admin", "reconcile"]), f.client);
+  await dispatch(selected(["admin", "gc"]), f.client);
+  expect(f.requests.slice(0, 2)).toMatchObject([{ action: "admin-reconcile", apply: false }, { action: "admin-gc", apply: false }]);
+  expect(f.requests[0].operation_id).toBeUndefined();
+  expect(f.requests[1].operation_id).toBeUndefined();
+  expect(() => readdirSync(join(f.client.sessionDir("explicit"), "operations"))).toThrow();
+  await dispatch(selected(["admin", "reconcile", "--apply", "--operation-id", "global-recovery"]), f.client);
+  expect(f.requests[2]).toMatchObject({ action: "admin-reconcile", apply: true, operation_id: "global-recovery" });
+  expect(readJson(f.client.operationPath("explicit", "global-recovery")).outcome).toBe("success");
+});
+
+test("remote matching error envelope is rendered once and keeps non-JSON diagnostics", async () => {
+  const f = fixture(); f.state();
+  f.handler = r => r.action === "renew" ? result("", 2, json({ ...r, ok: false, error: { code: "draining", message: "drain" } }) + "\nwarning: bounded peer diagnostic\n") : result(response(r));
+  await expect(dispatch(selected(["renew"]), f.client)).rejects.toMatchObject({ code: "draining", detail: { operation_id: expect.any(String) } });
+  expect(f.diagnostics).toEqual([Buffer.from("warning: bounded peer diagnostic\n")]);
+});
+
+test("mutation failures receive bounded status diagnosis through the shared path", async () => {
+  const f = fixture(); f.state();
+  f.handler = r => r.action === "renew"
+    ? result("", 2, { ...r, ok: false, error: { code: "native_unavailable", message: "native status unavailable" } })
+    : result(response(r, { result: { session_id: "explicit", task_id: "avm-abc", generation: 7, state: "active", effective_lease: true, native_status: "unknown", verified: false } }));
+  await expect(dispatch(selected(["renew"]), f.client)).rejects.toMatchObject({ code: "native_unavailable", detail: { diagnosis_completeness: "full", status: { task_id: "avm-abc", native_status: "unknown", verified: false } } });
+  expect(f.requests.map(r => r.action)).toEqual(["renew", "status"]);
+});
+
 test("acquire startup recovery adds bounded status diagnosis and preserves pending safety", async () => {
   const f = fixture();
   f.client.key = async () => [f.key(), "ssh-ed25519 YWJj fixture"];

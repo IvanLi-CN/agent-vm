@@ -59,6 +59,8 @@ CLI 不接收 rqlite 地址、数据库路径、SQL 或凭据，也不绕过 Dep
 | `admin reconcile [--apply]` / `admin gc [--apply]` | 默认 preview；只在 authorized operations task 内 apply。 |
 | `admin reconcile-session --task-id ID --generation N --pending-operation-id ID [--apply] [--explain]` | 仅对选中 session 的指定 task/generation 和单个未启动 acquire 做过期清理，保留 cache；默认只读 preview，错误时可显式附带有界诊断。 |
 
+所有 session-scoped mutation 支持显式 `--explain`；默认错误返回 bounded status diagnosis，`--explain` 才增加 bounded metrics summary 和 read-only recovery preview。`--apply` 是唯一允许 reconciliation 创建 operation intent 和 local mutation journal 的路径。
+
 ### 精确 session reconciliation
 
 `admin-reconcile-session` 是独立的 Go control action，不降级为全局 `admin-reconcile`；不支持该 action 的 peer 必须在 effect 前拒绝。请求必须同时指定 `session_id`、`task_id`、正整数 `generation`、`pending_operation_id` 和 boolean `apply`。默认 preview 不携带 `operation_id`，不创建 operation intent；apply 使用自己的幂等 operation ID，且不得与目标 pending ID 相同。
@@ -130,7 +132,7 @@ Mutations 还包含 `generation` 和 `operation_id`。
 Success envelopes 包含 `ok`、`protocol`、`server_time`、`action`、`session_id`、`generation`、`operation_id`、`outcome`、`result` 以及该 action 的 `response` schema/semantic metadata，并 MAY 包含 structured `warnings` array；
 Client 在 finalize local journal 前，MUST 匹配每个提供的 request identity field，包括 `generation`。
 省略这些 metadata 的 legacy control response 只有在带 structured compatibility warning 时才接受。
-Error diagnostics 是 stderr 上的 JSON，exit status 非零，并 MUST 包含 `ok: false`、`protocol`、已提供的 request identity fields 和 structured `error`；CLI 默认只附带 status、task、generation、lease、native verification 和 recovery blocker 等高价值字段；`--explain` 才请求有界 metrics summary 和 scoped reconciliation preview。诊断字段缺失或旧 peer 不支持时，必须标记 `diagnosis_completeness: partial`，不能据此宣告恢复成功。`stale_target` 因 lease 未到期拒绝时，control plane 的 `error.detail.diagnosis` 是权威来源，包含 `recovery_allowed=false`、`recovery_blocker=lease_unexpired`、`lease_expires_at`、目标 task/session/generation 和 `retry_condition`；
+Error diagnostics 是 stderr 上的单个 JSON，exit status 非零，并 MUST 包含 `ok: false`、`protocol`、已提供的 request identity fields 和 structured `error`；matching JSON envelope 不得被 SSH stderr 重复打印，非 JSON diagnostics 仍受既有 bound 限制。所有 session-scoped mutation 默认附带 status、task、generation、lease、native verification 和 recovery blocker 等高价值字段；`--explain` 才请求有界 metrics summary 和 scoped reconciliation preview。诊断字段缺失或旧 peer 不支持时，必须标记 `diagnosis_completeness: partial`，不能据此宣告恢复成功。`admin reconcile` 和 `admin gc` 的默认 preview 必须不携带 operation intent 或 local journal，只有 `--apply` 才创建 mutation journal。`stale_target` 因 lease 未到期拒绝时，control plane 的 `error.detail.diagnosis` 是权威来源，包含 `recovery_allowed=false`、`recovery_blocker=lease_unexpired`、`lease_expires_at`、目标 task/session/generation 和 `retry_condition`；
 当 controller 确认不可能产生 native effect 时，标记 `error.detail.outcome_verified`，native-phase 或 durable-state uncertainty 仍保持 pending。
 Client 只接受一个 matching error envelope；
 unrelated、duplicate 或 type-mismatched envelopes 会使 journal 保持 pending。
