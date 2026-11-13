@@ -106,6 +106,15 @@ test("legacy peer diagnosis is explicitly partial and never claims recovery", as
   await expect(attachDiagnosis(new CliError("startup_reconcile_required", "recovery required"), f.client, "explicit", "pending", false)).resolves.toMatchObject({ detail: { diagnosis_completeness: "partial", status: {} } });
 });
 
+test("diagnosis bounds non-object details and remote messages", async () => {
+  const f = fixture();
+  f.handler = r => r.action === "status" ? result(response(r, { result: {} })) : result({ ...r, ok: false, error: { code: "native_unavailable", message: "m".repeat(2048), detail: "d".repeat(2048) } }, 2);
+  const error = await attachDiagnosis(new CliError("native_unavailable", "m".repeat(2048), ["raw", { nested: "value" }]), f.client, "explicit", undefined, false);
+  expect(error.message.length).toBeLessThanOrEqual(513);
+  expect(error.detail).toMatchObject({ original_error_detail: ["raw", { nested: "value" }] });
+  expect(JSON.stringify(error.detail).length).toBeLessThan(5000);
+});
+
 test("stale lease diagnosis retains authoritative blocker and bounded status", async () => {
   const f = fixture();
   f.handler = r => r.action === "status" ? result(response(r, { result: { task_id: "avm-target", generation: 2, state: "active", lease_expires_at: "2026-11-13T01:00:00Z", effective_lease: true } })) : result({ ...r, ok: false, error: { code: "stale_target", message: "reconciliation refuses an unexpired lease", detail: { diagnosis: { recovery_allowed: false, recovery_blocker: "lease_unexpired", lease_expires_at: "2026-11-13T01:00:00Z" } } } }, 2);

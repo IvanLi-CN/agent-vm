@@ -161,6 +161,9 @@ function boundedDiagnosticValue(value: any, depth = 0): any {
   }
   return String(value).slice(0, DIAGNOSTIC_MAX_STRING);
 }
+function boundedDiagnosticString(value: string): string {
+  return value.length > DIAGNOSTIC_MAX_STRING ? `${value.slice(0, DIAGNOSTIC_MAX_STRING)}…` : value;
+}
 
 function boundedStatus(value: any): Data {
   if (!record(value)) return {};
@@ -180,7 +183,7 @@ function boundedMetrics(value: any): Data {
 
 export async function attachDiagnosis(error: any, client: Client, session: string, operationId?: string, explain = false, target?: { taskId?: string; generation?: number | bigint }): Promise<CliError> {
   const cliError = error instanceof CliError ? error : new CliError("client_failed", error instanceof Error ? error.message : String(error));
-  const existing = record(cliError.detail) ? cliError.detail : {};
+  const existing = record(cliError.detail) ? cliError.detail : cliError.detail === undefined ? {} : { original_error_detail: boundedDiagnosticValue(cliError.detail) };
   const diagnosisOperationId = operationId ?? (typeof existing.operation_id === "string" ? existing.operation_id : undefined);
   const diagnosis: Data = { diagnosis_completeness: "partial" };
   try {
@@ -218,7 +221,7 @@ export async function attachDiagnosis(error: any, client: Client, session: strin
     : cliError.code === "remote_timeout" ? "retry the same operation ID only after checking status; the outcome is still pending"
     : undefined;
   const merged = boundedDiagnosticValue({ ...existing, ...diagnosis, ...(nextAction ? { next_action: nextAction } : {}) });
-  return new CliError(cliError.code, cliError.message, merged, cliError.exitCode);
+  return new CliError(cliError.code, boundedDiagnosticString(cliError.message), merged, cliError.exitCode);
 }
 
 export class Client {
