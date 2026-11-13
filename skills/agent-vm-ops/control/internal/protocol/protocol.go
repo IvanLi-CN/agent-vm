@@ -27,7 +27,7 @@ var (
 )
 
 var Actions = map[string]struct{}{
-	"acquire": {}, "admin-gc": {}, "admin-metrics": {}, "admin-reconcile": {}, "admin-reconcile-session": {},
+	"acquire": {}, "admin-gc": {}, "admin-metrics": {}, "admin-reconcile": {}, "admin-reconcile-session": {}, "admin-reconcile-history": {},
 	"admin-session-list": {}, "admin-status": {}, "destroy": {}, "doctor": {},
 	"drain-enter": {}, "drain-exit": {}, "drain-status": {}, "port-add": {},
 	"port-list": {}, "port-remove": {}, "release": {}, "renew": {}, "resize": {},

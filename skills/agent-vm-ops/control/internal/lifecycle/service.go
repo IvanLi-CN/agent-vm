@@ -67,7 +67,7 @@ var (
 	writeActions = map[string]bool{
 		"acquire": true, "renew": true, "release": true, "destroy": true,
 		"restart": true, "resize": true, "port-add": true, "port-remove": true,
-		"timer-expire": true, "drain-enter": true, "drain-exit": true, "admin-reconcile": true, "admin-reconcile-session": true, "admin-gc": true,
+		"timer-expire": true, "drain-enter": true, "drain-exit": true, "admin-reconcile": true, "admin-reconcile-session": true, "admin-reconcile-history": true, "admin-gc": true,
 	}
 	sessionActions = map[string]bool{
 		"status": true, "acquire": true, "renew": true, "release": true,
@@ -1410,7 +1410,7 @@ func releaseSensitiveAction(action string, request protocol.Request) bool {
 	switch action {
 	case "acquire", "renew", "release", "destroy", "restart", "resize", "port-add", "port-remove", "timer-expire":
 		return true
-	case "admin-reconcile", "admin-reconcile-session", "timer-reconcile":
+	case "admin-reconcile", "admin-reconcile-session", "admin-reconcile-history", "timer-reconcile":
 		return requestBool(request, "apply")
 	case "admin-gc", "timer-age-gc":
 		return true
@@ -1484,7 +1484,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if action == "admin-metrics" && (request["session_id"] != nil || request["operation_id"] != nil) {
 		return nil, protocol.NewError("invalid_request", "admin-metrics is sessionless and read-only", nil)
 	}
-	write := (writeActions[action] || isJournaledTimerAction(action, request)) && !((action == "admin-reconcile" || action == "admin-reconcile-session" || action == "admin-gc") && requestBool(request, "apply") == false && request["operation_id"] == nil)
+	write := (writeActions[action] || isJournaledTimerAction(action, request)) && !((action == "admin-reconcile" || action == "admin-reconcile-session" || action == "admin-reconcile-history" || action == "admin-gc") && requestBool(request, "apply") == false && request["operation_id"] == nil)
 	leaseExempt := action == "drain-enter" || action == "drain-exit"
 	if write && !leaseExempt && !s.mutationAllowed() {
 		return nil, protocol.NewError("controller_lease_required", "controller lease is required for mutation", map[string]any{"admission_ready": false})
@@ -2488,6 +2488,8 @@ func (s *Service) dispatchAction(ctx context.Context, action string, request pro
 		return s.adminMetrics(ctx)
 	case "admin-reconcile-session":
 		return s.reconcileSession(ctx, request)
+	case "admin-reconcile-history":
+		return s.reconcileHistoricalUnknown(ctx, request)
 	case "admin-reconcile", "timer-reconcile":
 		return s.reconcile(ctx, requestBool(request, "apply"))
 	case "admin-gc", "timer-age-gc":
@@ -4233,6 +4235,74 @@ func (s *Service) reconcile(ctx context.Context, apply bool, mode ...string) (ma
 	}
 	result := map[string]any{"dry_run": !apply, "actions": actions}
 	return result, firstErr
+}
+
+// reconcileHistoricalUnknown archives explicitly selected historical unknown
+// journal entries after proving the resident native boundary is quiescent. It
+// preserves each original response and never replays or deletes an operation.
+func (s *Service) reconcileHistoricalUnknown(ctx context.Context, request protocol.Request) (map[string]any, error) {
+	rawIDs, ok := request["operation_ids"].([]any)
+	if !ok || len(rawIDs) == 0 || len(rawIDs) > 32 {
+		return nil, protocol.NewError("invalid_request", "operation_ids must contain between 1 and 32 operation IDs", nil)
+	}
+	reason := stringValue(request["reason"])
+	if reason == "" || len(reason) > 500 {
+		return nil, protocol.NewError("invalid_request", "reason is required and must be at most 500 characters", nil)
+	}
+	ids := make([]string, 0, len(rawIDs))
+	seen := make(map[string]struct{}, len(rawIDs))
+	for _, raw := range rawIDs {
+		id, valid := raw.(string)
+		if !valid || id == "" || len(id) > 160 {
+			return nil, protocol.NewError("invalid_request", "operation_ids contains an invalid operation ID", nil)
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return nil, protocol.NewError("invalid_request", "operation_ids contains duplicates", map[string]any{"operation_id": id})
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	pending, err := s.Store.PendingOperations(ctx)
+	if err != nil {
+		return nil, s.sqliteError(err)
+	}
+	if len(pending) != 0 || s.activeOperationCount() != 0 {
+		return nil, protocol.NewError("operation_unverified", "historical unknown cleanup requires no pending or in-flight operations", map[string]any{"pending": len(pending), "in_flight": s.activeOperationCount(), "outcome_verified": false})
+	}
+	probe, ok := s.Guest.(recoveryQuiescence)
+	if !ok {
+		return nil, protocol.NewError("native_unavailable", "historical unknown cleanup requires native quiescence evidence", nil)
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, time.Duration(s.Config.WorkerTimeoutSeconds)*time.Second)
+	defer cancel()
+	if err := probe.VerifyRecoveryQuiescence(checkCtx); err != nil {
+		return nil, protocol.NewError("operation_unverified", "native quiescence could not be verified", map[string]any{"cause": err.Error(), "outcome_verified": false})
+	}
+	for _, id := range ids {
+		operation, getErr := s.Store.GetOperation(ctx, id)
+		if getErr != nil {
+			return nil, s.sqliteError(getErr)
+		}
+		if operation == nil || operation.Response["outcome"] != "error" {
+			return nil, protocol.NewError("operation_unverified", "selected operation is not a finalized error", map[string]any{"operation_id": id, "outcome_verified": false})
+		}
+		control, valid := operation.Response["error"].(map[string]any)
+		if !valid || control["code"] != "operation_outcome_unknown" {
+			return nil, protocol.NewError("operation_unverified", "selected operation is not historical unknown", map[string]any{"operation_id": id, "outcome_verified": false})
+		}
+	}
+	result := map[string]any{"dry_run": !requestBool(request, "apply"), "operation_ids": ids, "reason": reason, "native_quiescence_verified": true}
+	if !requestBool(request, "apply") {
+		return result, nil
+	}
+	evidence := map[string]any{"status": "reconciled", "reason": reason, "basis": "operator-authorized-native-quiescence", "reconciled_at": nowString(s.Clock()), "operation_ids": ids}
+	for _, id := range ids {
+		if err := s.Store.MarkHistoricalUnknownReconciled(ctx, id, evidence); err != nil {
+			return nil, s.sqliteError(err)
+		}
+	}
+	result["reconciled"] = len(ids)
+	return result, nil
 }
 
 // A pending destroy remains authoritative even if earlier recovery left the task closing.

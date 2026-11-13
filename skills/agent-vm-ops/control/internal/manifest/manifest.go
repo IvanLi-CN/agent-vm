@@ -38,7 +38,7 @@ var stateCapabilityMarkers = []string{
 }
 
 var actionNames = []string{
-	"acquire", "admin-gc", "admin-metrics", "admin-reconcile", "admin-reconcile-session", "admin-session-list", "admin-status",
+	"acquire", "admin-gc", "admin-metrics", "admin-reconcile", "admin-reconcile-session", "admin-reconcile-history", "admin-session-list", "admin-status",
 	"destroy", "doctor", "drain-enter", "drain-exit", "drain-status", "port-add", "port-list",
 	"port-remove", "release", "renew", "resize", "restart", "ssh-info", "status", "timer-age-gc",
 	"timer-expire", "timer-reconcile",
