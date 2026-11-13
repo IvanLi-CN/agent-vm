@@ -2987,7 +2987,13 @@ func acquireOperationMatchesTask(operation state.Operation, task *state.Task) bo
 		generation, valid := protocol.Integer(rawGeneration)
 		return valid && generation == task.Generation && rawTask == task.TaskID
 	}
-	return *operation.Generation == task.Generation || task.Generation > 0 && *operation.Generation == task.Generation-1
+	if *operation.Generation == task.Generation {
+		return true
+	}
+	if task.Generation == 1 && *operation.Generation == 0 && task.PreviousGeneration == nil {
+		return true
+	}
+	return task.PreviousGeneration != nil && *operation.Generation == *task.PreviousGeneration && task.Generation > *task.PreviousGeneration
 }
 
 func (s *Service) pendingAcquireOperations(ctx context.Context, task *state.Task) ([]state.Operation, error) {

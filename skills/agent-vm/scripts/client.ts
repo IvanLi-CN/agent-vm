@@ -190,6 +190,7 @@ export async function attachDiagnosis(error: any, client: Client, session: strin
     const statusResponse = await client.request("status", { session, fields: diagnosisOperationId ? { operation_id: diagnosisOperationId } : {} });
     const status = boundedStatus(statusResponse.result);
     diagnosis.status = status;
+    client.reconcileServerState(session, statusResponse.result);
     diagnosis.diagnosis_completeness = Object.keys(status).length ? "full" : "partial";
     if (explain) {
       try {
