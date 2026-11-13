@@ -167,7 +167,7 @@ function boundedDiagnosticString(value: string): string {
 
 function boundedStatus(value: any): Data {
   if (!record(value)) return {};
-  return Object.fromEntries(["session_id", "task_id", "generation", "state", "effective_lease", "lease_expires_at", "native_status", "guest_available", "verified", "last_error", "guest_error", "resource_state"].filter(key => key in value).map(key => [key, boundedDiagnosticValue(value[key])]));
+  return Object.fromEntries(["session_id", "task_id", "generation", "state", "effective_lease", "lease_expires_at", "native_status", "guest_available", "verified", "last_error", "guest_error", "resource_state", "pending_operation_count", "pending_operations_complete"].filter(key => key in value).map(key => [key, boundedDiagnosticValue(value[key])]));
 }
 
 function boundedMetrics(value: any): Data {
@@ -215,9 +215,11 @@ export async function attachDiagnosis(error: any, client: Client, session: strin
     diagnosis.diagnosis_completeness = "partial";
     diagnosis.status = { outcome: "unavailable" };
   }
+  const blocker = typeof existing.recovery_blocker === "string" ? existing.recovery_blocker : undefined;
   const nextAction = cliError.code === "startup_reconcile_required"
     ? diagnosisOperationId ? "inspect the bounded diagnosis, then run the exact admin reconcile-session dry run before any apply" : "inspect status and reconcile the pending operation explicitly"
-    : cliError.code === "stale_target" ? "wait until lease_expires_at, then retry the read-only reconciliation preview"
+    : cliError.code === "stale_target" && blocker === "lease_unexpired" ? "wait until lease_expires_at, then retry the read-only reconciliation preview"
+    : cliError.code === "stale_target" && blocker === "task_identity_mismatch" ? "refresh status and use the current task identity; do not retry the stale target"
     : cliError.code === "remote_timeout" ? "retry the same operation ID only after checking status; the outcome is still pending"
     : undefined;
   const merged = boundedDiagnosticValue({ ...existing, ...diagnosis, ...(nextAction ? { next_action: nextAction } : {}) });
@@ -294,7 +296,7 @@ export class Client {
     if (!record(result) || result.session_id !== session ||
       typeof result.task_id !== "string" || !/^avm-[a-z0-9-]+$/.test(result.task_id) ||
       !integer(result.generation) || result.generation < 1 ||
-      result.state !== "cached" || result.effective_lease === true || result.guest_available === true) return false;
+      result.state !== "cached" || result.effective_lease === true || result.guest_available === true || result.pending_operation_count !== 0 || result.pending_operations_complete !== true) return false;
     let current: Data;
     try { current = this.state(session); } catch { return false; }
     if (current.task_id !== result.task_id && equal(current.generation, result.generation)) return false;

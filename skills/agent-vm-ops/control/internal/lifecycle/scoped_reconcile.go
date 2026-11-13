@@ -19,7 +19,7 @@ func (s *Service) reconcileSession(ctx context.Context, request protocol.Request
 			return nil, err
 		}
 		if task.TaskID == "" || task.TaskID != stringValue(request["task_id"]) {
-			return nil, protocol.NewError("stale_target", "reconciliation task identity does not match", nil)
+			return nil, protocol.NewError("stale_target", "reconciliation task identity does not match", map[string]any{"diagnosis": map[string]any{"recovery_allowed": false, "recovery_blocker": "task_identity_mismatch", "next_action": "refresh status and use the current task identity", "task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation}})
 		}
 		if task.State != stateActive && task.State != statePreparing && task.State != stateClosing {
 			return nil, protocol.NewError("task_transition", "task is outside bounded expiry reconciliation", nil)
@@ -51,7 +51,7 @@ func (s *Service) reconcileSession(ctx context.Context, request protocol.Request
 		if err != nil {
 			return nil, s.sqliteError(err)
 		}
-		if pending == nil || pending.Action != "acquire" || pending.SessionID == nil || *pending.SessionID != task.SessionID || pending.Generation == nil || *pending.Generation != task.Generation || !acquireOperationMatchesTask(*pending, task) || stringValue(pending.Response["outcome"]) != "pending" || s.operationActive(pendingID) {
+		if pending == nil || pending.Action != "acquire" || pending.SessionID == nil || *pending.SessionID != task.SessionID || !acquireOperationMatchesTask(*pending, task) || stringValue(pending.Response["outcome"]) != "pending" || s.operationActive(pendingID) {
 			return nil, protocol.NewError("operation_unverified", "target is not an inactive pending acquire of this exact task generation", nil)
 		}
 		saved, savedOK := pending.Response["_request"].(map[string]any)

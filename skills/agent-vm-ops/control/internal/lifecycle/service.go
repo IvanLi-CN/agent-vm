@@ -380,7 +380,7 @@ func (s *Service) mutationContext(ctx context.Context) (context.Context, func(),
 }
 
 func controllerLeaseLostError(cause error, request ...protocol.Request) error {
-	detail := map[string]any{"outcome_verified": false, "phase": "controller-lease", "journal_state": "pending", "worker_evidence": "retained_in_operation_journal", "next_action": "inspect the original operation status; do not replay with a new operation ID"}
+	detail := map[string]any{"outcome_verified": false, "phase": "controller-lease", "journal_state": "pending", "state": "unknown", "lease_expires_at": nil, "native_status": "unknown", "worker": map[string]any{"state": "unknown", "evidence": "retained_in_operation_journal"}, "worker_evidence": "retained_in_operation_journal", "recovery_blocker": "lease_lost_during_mutation", "next_action": "inspect the original operation status; do not replay with a new operation ID"}
 	if len(request) > 0 {
 		if operationID := stringValue(request[0]["operation_id"]); operationID != "" {
 			detail["operation_id"] = operationID
@@ -4741,7 +4741,11 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	result := map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": nil, "verified": false}
+	pendingOperations, morePending, pendingErr := s.Store.PendingOperationsForSessionPage(ctx, task.SessionID, 128)
+	if pendingErr != nil {
+		return nil, s.sqliteError(pendingErr)
+	}
+	result := map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": nil, "verified": false, "pending_operation_count": len(pendingOperations), "pending_operations_complete": !morePending}
 	if resourceState != nil {
 		result["resource_state"] = resourceState
 	}

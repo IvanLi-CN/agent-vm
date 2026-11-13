@@ -57,13 +57,13 @@ cached ── acquire ──> preparing ── native verified ──> active
 
 ## Generation 与本地 journal 对账
 
-控制面返回的 `generation`、`state`、`lease_expires_at` 和 `pending_operations` 优先于客户端本地缓存。客户端发现 local generation 小于 server generation 时，必须标记 local journal stale，保留原始文件供审计，但不得据此发送旧 generation mutation。
+控制面返回的 `generation`、`state`、`lease_expires_at` 和 `pending_operation_count` 优先于客户端本地缓存。只有在 status 明确证明 task 为 `cached`、没有有效 lease、guest 不可用、pending operation count 为零且该计数完整时，客户端才可标记 local state stale；客户端发现 local generation 小于 server generation 时，也必须标记 local journal stale，保留原始文件供审计，但不得据此发送旧 generation mutation。
 
 客户端发现 server 已处于 `cached`、`effective_lease=false`、`guest_available=false` 且没有 pending operation 时，可以将本地旧 pending 记录标记为 superseded；不能把它改写成 success，也不能删除原始 evidence。
 
 ## Recovery 准入
 
-`admin-reconcile-session` 必须同时匹配 `session_id`、`task_id`、正整数 `generation`、权威 `pending_operation_id`、request digest 和 worker evidence。以下任一条件成立时必须拒绝 apply：lease 未到期、generation 不匹配、operation 不存在或不匹配、worker 已产生 effect、native ownership 不确定、存在同 session 的其他 pending intent、task 已经进入 `cached` 或已经完成其他终态转换。
+`admin-reconcile-session` 必须同时匹配 `session_id`、`task_id`、正整数 task `generation`、权威 `pending_operation_id`、request digest 和 worker evidence。Acquire operation 的请求 generation 可以是 task generation 的前一代（初始 acquire 为 0，缓存复用时为旧 generation）；必须通过 durable task binding 或这个唯一的 predecessor 关系精确绑定，不能仅凭数值相等放宽范围。以下任一条件成立时必须拒绝 apply：lease 未到期、generation 不匹配、operation 不存在或不匹配、worker 已产生 effect、native ownership 不确定、存在同 session 的其他 pending intent、task 已经进入 `cached` 或已经完成其他终态转换。
 
 Preview 必须纯只读，不创建 operation intent、local journal、worker intent 或 mutation audit。Apply 必须使用独立 operation ID、持有维护与 session fence，并沿原有 cleanup worker 路径完成证据闭合。
 

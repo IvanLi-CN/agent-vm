@@ -302,7 +302,7 @@ test("local recovery state is locked, monotonic and cleanup-only safe", () => {
 test("authoritative cached status marks local generation stale before later mutation", async () => {
   const f = fixture(); f.state("explicit", 7);
   f.handler = request => result(response(request, {
-    result: { session_id: "explicit", task_id: "avm-abc", generation: 7, state: "cached", effective_lease: false, guest_available: false, lease_expires_at: null },
+    result: { session_id: "explicit", task_id: "avm-abc", generation: 7, state: "cached", effective_lease: false, guest_available: false, lease_expires_at: null, pending_operation_count: 0, pending_operations_complete: true },
   }));
   await dispatch(selected(["status"]), f.client);
   expect(f.client.state("explicit")).toMatchObject({ generation: 7, task_id: "avm-abc", cleanup_only: true, stale: true });
