@@ -419,6 +419,14 @@ func (s *Service) activeOperationCount() int {
 	return count
 }
 
+func (s *Service) activeOperationCountExcluding(operationID string) int {
+	count := s.activeOperationCount()
+	if operationID != "" && s.operationActive(operationID) && count > 0 {
+		return count - 1
+	}
+	return count
+}
+
 // ReservePhysicalStorage serializes an external pool consumer, such as an
 // image import, with lifecycle admission. The reservation remains in the
 // physical admission snapshot until the returned release function is called.
@@ -1485,7 +1493,17 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		return nil, protocol.NewError("invalid_request", "admin-metrics is sessionless and read-only", nil)
 	}
 	write := (writeActions[action] || isJournaledTimerAction(action, request)) && !((action == "admin-reconcile" || action == "admin-reconcile-session" || action == "admin-reconcile-history" || action == "admin-gc") && requestBool(request, "apply") == false && request["operation_id"] == nil)
-	leaseExempt := action == "drain-enter" || action == "drain-exit"
+	historyCleanupFenced := action == "admin-reconcile-history" && requestBool(request, "apply") && !s.mutationAllowed()
+	if historyCleanupFenced {
+		draining, drainErr := s.isDraining(ctx)
+		if drainErr != nil {
+			return nil, s.sqliteError(drainErr)
+		}
+		if !draining {
+			return nil, protocol.NewError("controller_lease_required", "fenced historical cleanup requires the shared control plane to be draining", map[string]any{"admission_ready": false})
+		}
+	}
+	leaseExempt := action == "drain-enter" || action == "drain-exit" || historyCleanupFenced
 	if write && !leaseExempt && !s.mutationAllowed() {
 		return nil, protocol.NewError("controller_lease_required", "controller lease is required for mutation", map[string]any{"admission_ready": false})
 	}
@@ -1523,7 +1541,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if leaseExempt {
 		ctx = withLeaseExemptMutation(ctx)
 	}
-	if releaseSensitiveAction(action, request) && !isInternalCleanup(ctx) {
+	if releaseSensitiveAction(action, request) && !isInternalCleanup(ctx) && !historyCleanupFenced {
 		releaseDrain, drainErr := s.releaseDrainOwned(ctx)
 		if drainErr != nil {
 			return nil, s.sqliteError(drainErr)
@@ -4266,8 +4284,17 @@ func (s *Service) reconcileHistoricalUnknown(ctx context.Context, request protoc
 	if err != nil {
 		return nil, s.sqliteError(err)
 	}
-	if len(pending) != 0 || s.activeOperationCount() != 0 {
-		return nil, protocol.NewError("operation_unverified", "historical unknown cleanup requires no pending or in-flight operations", map[string]any{"pending": len(pending), "in_flight": s.activeOperationCount(), "outcome_verified": false})
+	currentID := stringValue(request["operation_id"])
+	filteredPending := pending[:0]
+	for _, operation := range pending {
+		if operation.OperationID != currentID {
+			filteredPending = append(filteredPending, operation)
+		}
+	}
+	pending = filteredPending
+	inFlight := s.activeOperationCountExcluding(currentID)
+	if len(pending) != 0 || inFlight != 0 {
+		return nil, protocol.NewError("operation_unverified", "historical unknown cleanup requires no pending or in-flight operations", map[string]any{"pending": len(pending), "in_flight": inFlight, "outcome_verified": false})
 	}
 	probe, ok := s.Guest.(recoveryQuiescence)
 	if !ok {
