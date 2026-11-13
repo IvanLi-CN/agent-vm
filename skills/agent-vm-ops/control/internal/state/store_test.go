@@ -650,3 +650,41 @@ func fmtBool(value bool) string {
 	}
 	return "atomic-success"
 }
+
+func TestMarkHistoricalUnknownReconciledPreservesJournal(t *testing.T) {
+	store, err := OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	ctx := context.Background()
+	session, generation := "history-session", int64(3)
+	response := map[string]any{
+		"outcome":         "error",
+		"error":           map[string]any{"code": "operation_outcome_unknown", "message": "original outcome is unknown"},
+		"_request_digest": "digest",
+	}
+	if err := store.RecordOperation(ctx, "history-op", "acquire", &session, &generation, response); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkHistoricalUnknownReconciled(ctx, "history-op", map[string]any{"status": "reconciled", "reason": "operator evidence"}); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := store.GetOperation(ctx, "history-op")
+	if err != nil || operation == nil {
+		t.Fatalf("operation=%#v err=%v", operation, err)
+	}
+	if operation.Response["outcome"] != "error" || operation.Response["_request_digest"] != "digest" {
+		t.Fatalf("journal was rewritten: %#v", operation.Response)
+	}
+	if marker, ok := operation.Response["_historical_reconciled"].(map[string]any); !ok || marker["status"] != "reconciled" {
+		t.Fatalf("missing reconciliation marker: %#v", operation.Response)
+	}
+	unknown, err := store.ReconciledUnknownOperations(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unknown) != 0 {
+		t.Fatalf("reconciled operation remains a startup blocker: %#v", unknown)
+	}
+}

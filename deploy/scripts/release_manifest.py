@@ -72,7 +72,7 @@ ACTION_NAMES = (
     "acquire",
     "admin-gc",
     "admin-metrics",
-    "admin-reconcile", "admin-reconcile-session",
+    "admin-reconcile", "admin-reconcile-session", "admin-reconcile-history",
     "admin-session-list",
     "admin-status",
     "destroy",

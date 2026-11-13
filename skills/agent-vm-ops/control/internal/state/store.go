@@ -1370,7 +1370,38 @@ func (s *Store) PendingOperationsForSessionPage(ctx context.Context, sessionID s
 // ReconciledUnknownOperations remains observable after a superseded operation
 // stops blocking admission, without exposing its saved request or worker data.
 func (s *Store) ReconciledUnknownOperations(ctx context.Context) ([]Operation, error) {
-	return s.listObservedOperations(ctx, `SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'error' AND json_extract(response_json, '$.error.code') = 'operation_outcome_unknown' ORDER BY created_at, operation_id`)
+	return s.listObservedOperations(ctx, `SELECT operation_id, action, session_id, generation, response_json, created_at FROM operations WHERE json_extract(response_json, '$.outcome') = 'error' AND json_extract(response_json, '$.error.code') = 'operation_outcome_unknown' AND json_extract(response_json, '$._historical_reconciled') IS NULL ORDER BY created_at, operation_id`)
+}
+
+// MarkHistoricalUnknownReconciled preserves an uncertain operation and adds an
+// operator evidence marker so it no longer blocks startup quiescence. It never
+// changes the original outcome or deletes the journal record.
+func (s *Store) MarkHistoricalUnknownReconciled(ctx context.Context, operationID string, evidence map[string]any) error {
+	return s.withWrite(ctx, func(tx *Tx) error {
+		operation, err := scanOperation(ctx, tx.conn, operationID)
+		if err != nil {
+			return err
+		}
+		outcome, _ := operation.Response["outcome"].(string)
+		if outcome != "error" {
+			return errors.New("operation is not finalized as an error")
+		}
+		control, ok := operation.Response["error"].(map[string]any)
+		code, _ := control["code"].(string)
+		if !ok || code != "operation_outcome_unknown" {
+			return errors.New("operation is not historical unknown")
+		}
+		if _, already := operation.Response["_historical_reconciled"]; already {
+			return nil
+		}
+		operation.Response["_historical_reconciled"] = evidence
+		raw, err := json.Marshal(operation.Response)
+		if err != nil {
+			return err
+		}
+		_, err = tx.exec("UPDATE operations SET response_json = ? WHERE operation_id = ?", string(raw), operationID)
+		return err
+	})
 }
 
 func (s *Store) listObservedOperations(ctx context.Context, query string) ([]Operation, error) {
