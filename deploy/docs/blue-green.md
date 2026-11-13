@@ -105,7 +105,14 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 ## 普通蓝绿切换
 
-普通切换只处理 release、槽位角色、流量、`active` 链接和 native quiescence：
+普通切换只处理 release、槽位角色、流量、`active` 链接和 native quiescence。线上 Agent 通过 SSH 在目标服务器上调用 `agent-vm-deploy update`；该命令在服务器本地按 `GOOS/GOARCH` 获取并验证正式 release，再编排下面的 deployd 事务。Agent 工作站不下载或上传产品 bundle：
+
+```sh
+ssh <configured-control-alias> agent-vm-deploy update \
+  --version <semver> --source-revision <40-char-source-sha>
+```
+
+恢复或诊断时仍可直接查询原事务并执行受限阶段命令：
 
 ```sh
 sudo /opt/agent-vm-native/bin/agent-vm-deploy stage --slot green --bundle '<已验证的发布包>'

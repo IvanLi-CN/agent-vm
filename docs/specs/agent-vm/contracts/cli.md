@@ -27,7 +27,7 @@ Control-plane publication、update 和 rollback 都是 operator-owned deployment
 公共 `agent-vm` CLI 没有 `update` command，不安装 remote files、不修改 deployment configuration，也不获取 Incus/PVE authority。
 
 独立的运维可执行程序 `agent-vm-deploy` 是部署控制器客户端，详细合同见[部署控制器合同](deployment-controller.md)。
-它只连接 `agent-vm-deployd.service` 的受保护本机 Unix socket，并提供部署 `status`、`plan`、`verify`、`stage`、`activate`、`rollback`、`recover` 和一次性的 `migrate` 操作。
+它只连接 `agent-vm-deployd.service` 的受保护本机 Unix socket，并提供部署 `status`、`plan`、`verify`、`stage`、`activate`、`rollback`、`recover` 和一次性的 `migrate` 操作；`update --version <semver> --source-revision <sha>` 是服务器侧升级编排入口，先由该命令按目标主机架构获取并验证 release，再提交同一组 blue-green 操作。Agent 工作站不得下载或上传产品 bundle。
 它报告事务阶段、选中槽位、进程/就绪状态、控制器主权、流量排空、在途请求、native-worker quiescence、新鲜度和来源。
 它不是公共生命周期客户端；
 普通蓝绿操作不直接调用 rqlite、不写业务状态，也不提供公共 HTTP/TCP 端点。
