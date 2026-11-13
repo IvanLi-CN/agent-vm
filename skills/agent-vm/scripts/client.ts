@@ -124,11 +124,50 @@ export function remoteError(raw: Buffer, request: Data): Data | null {
   }
   return matches.length === 1 ? matches[0] : null;
 }
+function nonEnvelopeDiagnostics(raw: Buffer, request: Data): Buffer {
+  const lines = raw.toString("utf8").split(/\r?\n/);
+  const kept = lines.filter(line => {
+    if (!line.trim()) return true;
+    let value: any;
+    try { value = parseJson(line); } catch { return true; }
+    if (!record(value) || value.ok !== false || value.protocol !== PROTOCOL || ["action", "session_id", "generation", "operation_id"].some(k => k in request && (!(k in value) || !equal(value[k], request[k])))) return true;
+    return !(record(value.error) && typeof value.error.code === "string" && value.error.code && typeof value.error.message === "string" && value.error.message);
+  });
+  return Buffer.from(kept.join("\n"));
+}
 export interface RequestOptions { session: string | null; generation?: number | bigint; write?: boolean; operationId?: string; fields?: Data; }
+
+const DIAGNOSTIC_MAX_DEPTH = 3;
+const DIAGNOSTIC_MAX_KEYS = 32;
+const DIAGNOSTIC_MAX_ITEMS = 16;
+const DIAGNOSTIC_MAX_STRING = 512;
+
+function boundedDiagnosticValue(value: any, depth = 0): any {
+  if (typeof value === "string") return value.length > DIAGNOSTIC_MAX_STRING ? `${value.slice(0, DIAGNOSTIC_MAX_STRING)}…` : value;
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (typeof value === "bigint") return value.toString();
+  if (depth >= DIAGNOSTIC_MAX_DEPTH) return "[truncated]";
+  if (Array.isArray(value)) {
+    const result = value.slice(0, DIAGNOSTIC_MAX_ITEMS).map(item => boundedDiagnosticValue(item, depth + 1));
+    if (value.length > DIAGNOSTIC_MAX_ITEMS) result.push(`[${value.length - DIAGNOSTIC_MAX_ITEMS} items truncated]`);
+    return result;
+  }
+  if (record(value)) {
+    const entries = Object.entries(value);
+    const result: Data = Object.create(null);
+    for (const [key, item] of entries.slice(0, DIAGNOSTIC_MAX_KEYS)) result[key.slice(0, DIAGNOSTIC_MAX_STRING)] = boundedDiagnosticValue(item, depth + 1);
+    if (entries.length > DIAGNOSTIC_MAX_KEYS) result._truncated_fields = entries.length - DIAGNOSTIC_MAX_KEYS;
+    return result;
+  }
+  return String(value).slice(0, DIAGNOSTIC_MAX_STRING);
+}
+function boundedDiagnosticString(value: string): string {
+  return value.length > DIAGNOSTIC_MAX_STRING ? `${value.slice(0, DIAGNOSTIC_MAX_STRING)}…` : value;
+}
 
 function boundedStatus(value: any): Data {
   if (!record(value)) return {};
-  return Object.fromEntries(["session_id", "task_id", "generation", "state", "effective_lease", "lease_expires_at", "native_status", "guest_available", "verified", "last_error", "guest_error", "resource_state"].filter(key => key in value).map(key => [key, value[key]]));
+  return Object.fromEntries(["session_id", "task_id", "generation", "state", "effective_lease", "lease_expires_at", "native_status", "guest_available", "verified", "last_error", "guest_error", "resource_state"].filter(key => key in value).map(key => [key, boundedDiagnosticValue(value[key])]));
 }
 
 function boundedMetrics(value: any): Data {
@@ -144,10 +183,11 @@ function boundedMetrics(value: any): Data {
 
 export async function attachDiagnosis(error: any, client: Client, session: string, operationId?: string, explain = false, target?: { taskId?: string; generation?: number | bigint }): Promise<CliError> {
   const cliError = error instanceof CliError ? error : new CliError("client_failed", error instanceof Error ? error.message : String(error));
-  const existing = record(cliError.detail) ? cliError.detail : {};
+  const existing = record(cliError.detail) ? cliError.detail : cliError.detail === undefined ? {} : { original_error_detail: boundedDiagnosticValue(cliError.detail) };
+  const diagnosisOperationId = operationId ?? (typeof existing.operation_id === "string" ? existing.operation_id : undefined);
   const diagnosis: Data = { diagnosis_completeness: "partial" };
   try {
-    const statusResponse = await client.request("status", { session, fields: operationId ? { operation_id: operationId } : {} });
+    const statusResponse = await client.request("status", { session, fields: diagnosisOperationId ? { operation_id: diagnosisOperationId } : {} });
     const status = boundedStatus(statusResponse.result);
     diagnosis.status = status;
     diagnosis.diagnosis_completeness = Object.keys(status).length ? "full" : "partial";
@@ -160,14 +200,14 @@ export async function attachDiagnosis(error: any, client: Client, session: strin
       }
       const taskId = target?.taskId ?? status.task_id;
       const generation = target?.generation ?? status.generation;
-      if (typeof taskId === "string" && integer(generation) && operationId) {
+      if (typeof taskId === "string" && integer(generation) && diagnosisOperationId) {
         try {
           const preview = await client.request("admin-reconcile-session", {
-            session, generation, fields: { task_id: taskId, pending_operation_id: operationId, apply: false },
+            session, generation, fields: { task_id: taskId, pending_operation_id: diagnosisOperationId, apply: false },
           });
-          diagnosis.recovery_preview = preview.result;
+          diagnosis.recovery_preview = boundedDiagnosticValue(preview.result);
         } catch (previewError) {
-          diagnosis.recovery_preview = { outcome: "unavailable", error: previewError instanceof CliError ? { code: previewError.code, message: previewError.message, detail: previewError.detail } : { code: "unknown", message: "preview failed" } };
+          diagnosis.recovery_preview = boundedDiagnosticValue({ outcome: "unavailable", error: previewError instanceof CliError ? { code: previewError.code, message: previewError.message, detail: previewError.detail } : { code: "unknown", message: "preview failed" }});
         }
       }
     }
@@ -176,12 +216,12 @@ export async function attachDiagnosis(error: any, client: Client, session: strin
     diagnosis.status = { outcome: "unavailable" };
   }
   const nextAction = cliError.code === "startup_reconcile_required"
-    ? operationId ? "inspect the bounded diagnosis, then run the exact admin reconcile-session dry run before any apply" : "inspect status and reconcile the pending operation explicitly"
+    ? diagnosisOperationId ? "inspect the bounded diagnosis, then run the exact admin reconcile-session dry run before any apply" : "inspect status and reconcile the pending operation explicitly"
     : cliError.code === "stale_target" ? "wait until lease_expires_at, then retry the read-only reconciliation preview"
     : cliError.code === "remote_timeout" ? "retry the same operation ID only after checking status; the outcome is still pending"
     : undefined;
-  const merged = { ...existing, ...diagnosis, ...(nextAction ? { next_action: nextAction } : {}) };
-  return new CliError(cliError.code, cliError.message, merged, cliError.exitCode);
+  const merged = boundedDiagnosticValue({ ...existing, ...diagnosis, ...(nextAction ? { next_action: nextAction } : {}) });
+  return new CliError(cliError.code, boundedDiagnosticString(cliError.message), merged, cliError.exitCode);
 }
 
 export class Client {
@@ -353,7 +393,6 @@ export class Client {
       : await this.run(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", this.env.AGENT_VM_CONTROL_HOST ?? "agent-vm-host", remoteCommand], { input: json(request), timeoutMs: timeout * 1000, stdoutLimit: STDOUT_LIMIT, stderrLimit: STDERR_LIMIT, env: this.env });
     const detail = { operation_id: request.operation_id ?? null, generation: request.generation ?? null, transport, stream_cleanup_verified: result.streamCleanupVerified, ...(!result.streamCleanupVerified ? { stream_cleanup_error: "reader_cancelled_before_eof" } : {}) };
     if (result.timedOut) fail("remote_timeout", "control outcome is uncertain; retry the same operation ID", detail);
-    if (result.stderr.length) this.diagnostics(result.stderr);
     if (!result.streamCleanupVerified) fail("remote_failed", "control response stream cleanup is not verified", detail, result.code || 1);
     if (result.stdoutTruncated || result.stderrTruncated) fail("remote_failed", "control response was truncated; control outcome is uncertain; retry the same operation ID", { ...detail, stdout_truncated: result.stdoutTruncated, stderr_truncated: result.stderrTruncated, stdout_limit_bytes: STDOUT_LIMIT, stderr_limit_bytes: STDERR_LIMIT }, result.code || 1);
     if (result.code) {
@@ -361,12 +400,18 @@ export class Client {
       if (errorMatches.length > 1) fail("invalid_remote_response", "control returned multiple matching error envelopes", { operation_id: request.operation_id ?? null }, result.code);
       const error = errorMatches[0];
       if (error) {
+        const diagnostics = nonEnvelopeDiagnostics(result.stderr, request);
+        if (diagnostics.length) this.diagnostics(diagnostics);
         const safeError = secret === undefined ? error : redactSecret(error, secret);
+        const safeDetail = record(safeError.detail) ? { ...safeError.detail } : {};
+        if (request.operation_id !== undefined && safeDetail.operation_id === undefined) safeDetail.operation_id = request.operation_id;
         if (op && !uncertain(error, action)) this.finalize(op, request, { outcome: "error", error: safeError });
-        fail(safeError.code, safeError.message, safeError.detail, result.code);
+        fail(safeError.code, safeError.message, Object.keys(safeDetail).length ? safeDetail : safeError.detail, result.code);
       }
+      if (result.stderr.length) this.diagnostics(result.stderr);
       fail("remote_failed", "remote request failed; control outcome is not verified", { operation_id: request.operation_id ?? null }, result.code);
     }
+    if (result.stderr.length) this.diagnostics(result.stderr);
     let response;
     try { response = parseJson(new TextDecoder("utf-8", { fatal: true }).decode(result.stdout)); } catch { fail("invalid_remote_response", "control did not return JSON", detail); }
     if (!record(response) || response.protocol !== PROTOCOL || response.action !== action || (response.session_id ?? null) !== session) fail("protocol_mismatch", "response protocol or request identity differs");

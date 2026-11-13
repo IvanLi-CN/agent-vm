@@ -1470,7 +1470,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if action == "admin-metrics" && (request["session_id"] != nil || request["operation_id"] != nil) {
 		return nil, protocol.NewError("invalid_request", "admin-metrics is sessionless and read-only", nil)
 	}
-	write := (writeActions[action] || isJournaledTimerAction(action, request)) && !((action == "admin-reconcile" || action == "admin-reconcile-session") && requestBool(request, "apply") == false && request["operation_id"] == nil)
+	write := (writeActions[action] || isJournaledTimerAction(action, request)) && !((action == "admin-reconcile" || action == "admin-reconcile-session" || action == "admin-gc") && requestBool(request, "apply") == false && request["operation_id"] == nil)
 	leaseExempt := action == "drain-enter" || action == "drain-exit"
 	if write && !leaseExempt && !s.mutationAllowed() {
 		return nil, protocol.NewError("controller_lease_required", "controller lease is required for mutation", map[string]any{"admission_ready": false})

@@ -17,18 +17,18 @@ Commands: version, help, doctor, status, acquire, renew, release, destroy, resta
 Scoped reconciliation: --session-id ID --task-id ID --generation N --pending-operation-id ID [--apply].
 Mutation options: --operation-id ID. Resource options: --cpu N --memory SIZE --disk SIZE.
 Resize: --live (memory only) or --allow-restart. Use COMMAND --help for options.
-Recovery errors include bounded status guidance; add --explain to acquire or admin reconcile-session for a bounded metrics summary and read-only recovery preview.
+Recovery errors include bounded status guidance; add --explain to a session mutation or reconciliation command for a bounded metrics summary and read-only recovery preview.
 `;
 const paths: Record<string, string[]> = {
   version: [], help: [], doctor: [], status: [],
   acquire: ["ssh-host-port", "cpu", "memory", "disk", "operation-id", "explain"],
-  renew: ["operation-id"], release: ["operation-id"], destroy: ["operation-id"], restart: ["operation-id"],
-  resize: ["cpu", "memory", "disk", "live", "allow-restart", "operation-id"],
+  renew: ["operation-id", "explain"], release: ["operation-id", "explain"], destroy: ["operation-id", "explain"], restart: ["operation-id", "explain"],
+  resize: ["cpu", "memory", "disk", "live", "allow-restart", "operation-id", "explain"],
   "ssh-info": ["format"], ssh: [], exec: [], sync: ["name"], upload: [], download: [], export: [],
-  "port add": ["guest-port", "protocol", "host-port", "operation-id"], "port list": [], "port remove": ["protocol", "operation-id"],
+  "port add": ["guest-port", "protocol", "host-port", "operation-id", "explain"], "port list": [], "port remove": ["protocol", "operation-id", "explain"],
   "admin status": [], "admin metrics": [], "admin session list": [],
-  "admin drain enter": [], "admin drain status": [], "admin drain exit": [],
-  "admin reconcile": ["apply", "operation-id"], "admin gc": ["apply", "operation-id"],
+  "admin drain enter": ["explain"], "admin drain status": [], "admin drain exit": ["explain"],
+  "admin reconcile": ["apply", "operation-id", "explain"], "admin gc": ["apply", "operation-id", "explain"],
   "admin reconcile-session": ["task-id", "generation", "pending-operation-id", "apply", "operation-id", "explain"],
 };
 export interface Args { command: string; options: Data; positional: string[]; rest: string[]; }
@@ -75,7 +75,14 @@ export async function dispatch(args: Args, client = new Client(), native = inher
   if (cmd === "version") { const [release, warnings] = loadRelease(client.sidecar); return { version: release.version ?? VERSION, protocol: PROTOCOL, release, warnings }; }
   if (cmd === "admin metrics") { if (o["session-id"] !== undefined) fail("invalid_request", "admin metrics does not accept --session-id"); return client.request("admin-metrics", { session: null }); }
   const session = sessionId(o["session-id"], !["doctor", "admin metrics"].includes(cmd), client.env);
-  const mutate = async (action: string, fields: Data = {}, generation?: number | bigint, operationId?: string): Promise<Data> => client.request(action, { session, generation: generation ?? (["acquire", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"].includes(action) ? 0 : client.generation(session!)), write: true, operationId: operationId ?? o["operation-id"], fields });
+  const mutate = async (action: string, fields: Data = {}, generation?: number | bigint, operationId?: string): Promise<Data> => {
+    try {
+      return await client.request(action, { session, generation: generation ?? (["acquire", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"].includes(action) ? 0 : client.generation(session!)), write: true, operationId: operationId ?? o["operation-id"], fields });
+    } catch (error) {
+      if (action === "acquire") throw error;
+      throw await attachDiagnosis(error, client, session!, operationId ?? o["operation-id"], !!o.explain);
+    }
+  };
   const resources = (): Data => ({ ...(o.cpu === undefined ? {} : { cpu: o.cpu }), ...(o.memory === undefined ? {} : { memory_mib: parseSize(o.memory, true) }), ...(o.disk === undefined ? {} : { disk_gib: parseSize(o.disk, false) }) });
   if (["doctor", "status"].includes(cmd)) return client.request(cmd, { session });
   if (cmd === "acquire") {
@@ -127,6 +134,15 @@ export async function dispatch(args: Args, client = new Client(), native = inher
         return await client.request("admin-reconcile-session", { session, generation: BigInt(o.generation), write: !!o.apply, operationId: o["operation-id"], fields });
       } catch (error) {
         throw await attachDiagnosis(error, client, session!, o["pending-operation-id"], !!o.explain, { taskId: o["task-id"], generation: BigInt(o.generation) });
+      }
+    }
+    if (action === "reconcile" || action === "gc") {
+      const apply = !!o.apply;
+      if (!apply && o["operation-id"] !== undefined) fail("invalid_request", "dry run does not accept --operation-id");
+      try {
+        return await client.request("admin-" + action, { session, generation: 0, write: apply, operationId: apply ? o["operation-id"] : undefined, fields: { apply } });
+      } catch (error) {
+        throw await attachDiagnosis(error, client, session!, apply ? o["operation-id"] : undefined, !!o.explain);
       }
     }
     if (action === "status" || action === "session list") return client.request(action === "status" ? "admin-status" : "admin-session-list", { session });
