@@ -8,10 +8,12 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/install"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/releasefetch"
 )
 
 var version = "agent-vm-deploy/dev"
@@ -36,6 +38,9 @@ func run(args []string) error {
 	}
 	if args[0] == "wait-authority" {
 		return runWaitAuthority(args[1:])
+	}
+	if args[0] == "update" {
+		return runUpdate(args[1:])
 	}
 	command := args[0]
 	flags := flag.NewFlagSet(command, flag.ContinueOnError)
@@ -106,6 +111,77 @@ func run(args []string) error {
 			_, _ = os.Stderr.Write([]byte("\n"))
 		}
 		return err
+	}
+	_, _ = os.Stdout.Write(payload)
+	if len(payload) == 0 || payload[len(payload)-1] != '\n' {
+		_, _ = os.Stdout.Write([]byte("\n"))
+	}
+	return nil
+}
+
+func runUpdate(args []string) error {
+	flags := flag.NewFlagSet("update", flag.ContinueOnError)
+	version := flags.String("version", "", "published release SemVer without v")
+	source := flags.String("source-revision", "", "expected 40-character source revision")
+	socket := flags.String("socket", "/run/agent-vm-native/deployd.sock", "deployd Unix socket")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *version == "" || *source == "" {
+		return errors.New("update requires --version and --source-revision")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	directory, err := os.MkdirTemp("/var/lib/agent-vm-native/release-staging", ".update-")
+	if err != nil {
+		return fmt.Errorf("create release staging directory: %w", err)
+	}
+	bundle, err := releasefetch.Fetch(ctx, *version, *source, directory)
+	if err != nil {
+		return err
+	}
+	client := deployd.Client{Socket: *socket, Timeout: 15 * time.Minute}
+	statusPayload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
+	if err != nil {
+		return err
+	}
+	var status struct {
+		Value struct {
+			Observation struct {
+				ActiveSlot string `json:"active_slot"`
+			} `json:"observation"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(statusPayload, &status); err != nil || (status.Value.Observation.ActiveSlot != "blue" && status.Value.Observation.ActiveSlot != "green") {
+		return errors.New("status response missing active slot")
+	}
+	targetSlot := "blue"
+	if status.Value.Observation.ActiveSlot == "blue" {
+		targetSlot = "green"
+	}
+	var result struct {
+		Value struct {
+			Transaction struct {
+				ID string `json:"transaction_id"`
+			} `json:"transaction"`
+		} `json:"value"`
+	}
+	payload, _, err := client.Call(ctx, "POST", "/v1/stage", map[string]any{"target_slot": targetSlot, "bundle": filepath.Clean(bundle)})
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(payload, &result); err != nil {
+		return fmt.Errorf("stage response invalid: %w", err)
+	}
+	id := result.Value.Transaction.ID
+	if id == "" {
+		return errors.New("stage response missing transaction ID")
+	}
+	for _, action := range []string{"verify", "activate"} {
+		payload, _, err = client.Call(ctx, "POST", "/v1/"+action, map[string]any{"transaction_id": id})
+		if err != nil {
+			return err
+		}
 	}
 	_, _ = os.Stdout.Write(payload)
 	if len(payload) == 0 || payload[len(payload)-1] != '\n' {

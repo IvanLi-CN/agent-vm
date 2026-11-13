@@ -35,9 +35,11 @@ Format-1 release 可以保留 `agent_vm_control.ts`；format-2 client 通过既�
 每个槽位保持一个 Go 业务控制权威，并通过 deployd 只向一个槽位授予 scheduler/native-mutation role；不得让 legacy Bun authority 并发运行。
 只有 deployd 报告新鲜的槽位健康状态、控制器主权、流量排空、startup reconciliation、expiry/GC 和 storage admission 证据后，才能退出 drain。
 
-控制面发布是运维者负责的人工 release operation，不是公共 `agent-vm` CLI command。
+控制面发布是运维者负责的人工 release operation，入口是目标服务器上的 `agent-vm-deploy update`，不是公共 `agent-vm` 生命周期 command。Agent 只通过已配置的 SSH alias 提交版本和 source revision；release 下载、目标架构选择、provenance/checksum 校验和 blue-green transaction 都在目标服务器上完成。不得从 Agent 工作站下载 release、使用 `scp`/`rsync` 上传 release bundle，或依据 Agent 工作站架构选择 native package。
 遵循[部署参考](references/deployment.md)和[发布合同](../../docs/specs/agent-vm/contracts/release.md)中的 release manifest、兼容性、staging、drain、原子 activation、rollback 和权限规则；兼容 action 可以跨 release revision 继续使用并返回结构化 warning，不兼容 action 必须在产生 native effect 前失败。
 自动更新默认保持关闭。
+
+`agent-vm` skill 中的 `upload`、`download`、`export` 和源码同步只服务于 guest/source 工作流；不得把这些通用传输能力用于发布或部署。正常线上更新使用 `ssh <configured-control-alias> agent-vm-deploy update --version <semver> --source-revision <sha>`，低层 `stage`、`verify`、`activate` 和 `recover` 仅用于事务诊断和受限恢复。
 
 Client/control 使用 protocol 4，并增加显式的 live memory-only adjustment；不兼容的旧 peer 必须在产生 effect 前失败。
 升级前保留 database、generation 和 journal。
