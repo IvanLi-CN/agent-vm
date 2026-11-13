@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs, parseSize, dispatch } from "../scripts/agent_vm.ts";
-import { sessionId, uncertain } from "../scripts/client.ts";
+import { attachDiagnosis, sessionId, uncertain } from "../scripts/client.ts";
 import { CliError, equal, FloatToken, json, parseJson, readJson, sha256 } from "../scripts/client-io.ts";
 import { ACTIONS, CLIENT_DEPENDENCIES, capability, loadRelease } from "../scripts/client-release.ts";
 import { Fixture, response, result } from "./support.ts";
@@ -41,6 +41,46 @@ test("scoped reconciliation pins identity and dry run has no operation intent or
   expect(f.requests.map(r => r.action)).toEqual(["admin-reconcile-session", "admin-reconcile-session"]);
   await expect(dispatch(selected(["admin", "reconcile-session", "--apply"]), f.client)).rejects.toMatchObject({ code: "invalid_request" });
   expect(f.requests).toHaveLength(2);
+});
+
+test("acquire startup recovery adds bounded status diagnosis and preserves pending safety", async () => {
+  const f = fixture();
+  f.client.key = async () => [f.key(), "ssh-ed25519 YWJj fixture"];
+  f.handler = r => {
+    if (r.action === "status") return result(response(r, { result: { session_id: "explicit", task_id: "avm-target", generation: 3, state: "preparing", effective_lease: false, lease_expires_at: "2026-11-13T01:00:00Z", native_status: "unknown", guest_available: null, verified: false } }));
+    if (r.action === "acquire") return result({ ...r, ok: false, error: { code: "startup_reconcile_required", message: "pending operation recovery remains uncertain", detail: { operation_id: r.operation_id, outcome_verified: false } } }, 2);
+    return result(response(r));
+  };
+  await expect(dispatch(selected(["acquire"]), f.client)).rejects.toMatchObject({ code: "startup_reconcile_required", detail: { diagnosis_completeness: "full", status: { task_id: "avm-target", state: "preparing" }, next_action: expect.stringContaining("reconcile") } });
+  expect(f.requests.map(r => r.action)).toEqual(["status", "acquire", "status"]);
+  expect(f.requests.filter(r => r.action === "admin-reconcile-session")).toHaveLength(0);
+});
+
+test("explain adds bounded metrics and read-only recovery preview", async () => {
+  const f = fixture();
+  f.client.key = async () => [f.key(), "ssh-ed25519 YWJj fixture"];
+  f.handler = r => {
+    if (r.action === "status") return result(response(r, { result: { session_id: "explicit", task_id: "avm-target", generation: 3, state: "preparing", effective_lease: false, verified: false } }));
+    if (r.action === "acquire") return result({ ...r, ok: false, error: { code: "startup_reconcile_required", message: "recovery required", detail: { operation_id: r.operation_id, outcome_verified: false } } }, 2);
+    if (r.action === "admin-metrics") return result(response(r, { result: { admission_ready: false, pending_operations: [{ operation_id: "redact-me" }], warnings: ["bounded"] } }));
+    if (r.action === "admin-reconcile-session") return result(response(r, { result: { dry_run: true, action: "close-expired-and-retain-cache" } }));
+    return result(response(r));
+  };
+  await expect(dispatch(selected(["acquire", "--explain"]), f.client)).rejects.toMatchObject({ detail: { metrics_summary: { admission_ready: false, pending_operations: { item_count: 1 } }, recovery_preview: { dry_run: true } } });
+  expect(f.requests.map(r => r.action)).toEqual(["status", "acquire", "status", "admin-metrics", "admin-reconcile-session"]);
+  expect(f.requests.find(r => r.action === "admin-reconcile-session")?.apply).toBe(false);
+});
+
+test("legacy peer diagnosis is explicitly partial and never claims recovery", async () => {
+  const f = fixture();
+  f.handler = r => r.action === "status" ? result(response(r, { result: {} })) : result({ ...r, ok: false, error: { code: "startup_reconcile_required", message: "recovery required", detail: { outcome_verified: false } } }, 2);
+  await expect(attachDiagnosis(new CliError("startup_reconcile_required", "recovery required"), f.client, "explicit", "pending", false)).resolves.toMatchObject({ detail: { diagnosis_completeness: "partial", status: {} } });
+});
+
+test("stale lease diagnosis retains authoritative blocker and bounded status", async () => {
+  const f = fixture();
+  f.handler = r => r.action === "status" ? result(response(r, { result: { task_id: "avm-target", generation: 2, state: "active", lease_expires_at: "2026-11-13T01:00:00Z", effective_lease: true } })) : result({ ...r, ok: false, error: { code: "stale_target", message: "reconciliation refuses an unexpired lease", detail: { diagnosis: { recovery_allowed: false, recovery_blocker: "lease_unexpired", lease_expires_at: "2026-11-13T01:00:00Z" } } } }, 2);
+  await expect(dispatch(selected(["admin", "reconcile-session", "--task-id", "avm-target", "--generation", "2", "--pending-operation-id", "pending"]), f.client)).rejects.toMatchObject({ code: "stale_target", detail: { diagnosis: { recovery_allowed: false, recovery_blocker: "lease_unexpired" }, diagnosis_completeness: "full" } });
 });
 
 test("resource canonicalization, live fencing and native command selection", async () => {

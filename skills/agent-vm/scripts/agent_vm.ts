@@ -3,7 +3,7 @@
 import { readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { resolve, join } from "node:path";
-import { Client, inherited, sessionId } from "./client.ts";
+import { Client, attachDiagnosis, inherited, sessionId } from "./client.ts";
 import { CliError, Data, fail, integer, json, readJson, shellJoin } from "./client-io.ts";
 import { PROTOCOL, VERSION, loadRelease } from "./client-release.ts";
 import { sync, SyncFailure } from "./sync_worktree.ts";
@@ -17,10 +17,11 @@ Commands: version, help, doctor, status, acquire, renew, release, destroy, resta
 Scoped reconciliation: --session-id ID --task-id ID --generation N --pending-operation-id ID [--apply].
 Mutation options: --operation-id ID. Resource options: --cpu N --memory SIZE --disk SIZE.
 Resize: --live (memory only) or --allow-restart. Use COMMAND --help for options.
+Recovery errors include bounded status guidance; add --explain to acquire or admin reconcile-session for a bounded metrics summary and read-only recovery preview.
 `;
 const paths: Record<string, string[]> = {
   version: [], help: [], doctor: [], status: [],
-  acquire: ["ssh-host-port", "cpu", "memory", "disk", "operation-id"],
+  acquire: ["ssh-host-port", "cpu", "memory", "disk", "operation-id", "explain"],
   renew: ["operation-id"], release: ["operation-id"], destroy: ["operation-id"], restart: ["operation-id"],
   resize: ["cpu", "memory", "disk", "live", "allow-restart", "operation-id"],
   "ssh-info": ["format"], ssh: [], exec: [], sync: ["name"], upload: [], download: [], export: [],
@@ -28,12 +29,12 @@ const paths: Record<string, string[]> = {
   "admin status": [], "admin metrics": [], "admin session list": [],
   "admin drain enter": [], "admin drain status": [], "admin drain exit": [],
   "admin reconcile": ["apply", "operation-id"], "admin gc": ["apply", "operation-id"],
-  "admin reconcile-session": ["task-id", "generation", "pending-operation-id", "apply", "operation-id"],
+  "admin reconcile-session": ["task-id", "generation", "pending-operation-id", "apply", "operation-id", "explain"],
 };
 export interface Args { command: string; options: Data; positional: string[]; rest: string[]; }
 export function parseArgs(argv: string[]): Args {
   const words: string[] = [], options: Data = Object.create(null), rest: string[] = [];
-  const flags = new Set(["live", "allow-restart", "apply"]);
+  const flags = new Set(["live", "allow-restart", "apply", "explain"]);
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
     if (token === "--") { rest.push(...argv.slice(i)); break; }
@@ -90,8 +91,10 @@ export async function dispatch(args: Args, client = new Client(), native = inher
     try {
       response = await mutate(cmd, { public_key: publicKey, ...resources(), ...(o["ssh-host-port"] === undefined ? {} : { ssh_host_port: o["ssh-host-port"] }) }, generation, acquireOperationId);
     } catch (error) {
-      await client.recoverAcquireState(session!, key, acquireOperationId, generation);
-      throw error;
+      let diagnosis;
+      try { diagnosis = await attachDiagnosis(error, client, session!, acquireOperationId, !!o.explain); } catch { diagnosis = error; }
+      await client.recoverAcquireState(session!, key, acquireOperationId, generation, diagnosis instanceof Error && "detail" in diagnosis && (diagnosis as any).detail?.status ? { result: (diagnosis as any).detail.status } : undefined);
+      throw diagnosis;
     }
     const current = "current_state" in response ? response.current_state : response.result;
     if (!current?.effective_lease) {
@@ -120,7 +123,11 @@ export async function dispatch(args: Args, client = new Client(), native = inher
       if (typeof o["generation"] !== "string" || !/^[1-9]\d*$/.test(o["generation"]) || typeof o["task-id"] !== "string" || !/^[a-z0-9][a-z0-9-]{0,47}$/.test(o["task-id"]) || typeof o["pending-operation-id"] !== "string" || !/^[A-Za-z0-9_.:@/-]{1,160}$/.test(o["pending-operation-id"])) fail("invalid_request", "scoped reconciliation requires --task-id, positive --generation and --pending-operation-id");
       const fields = { task_id: o["task-id"], pending_operation_id: o["pending-operation-id"], apply: !!o.apply };
       if (!o.apply && o["operation-id"] !== undefined) fail("invalid_request", "dry run does not accept --operation-id");
-      return client.request("admin-reconcile-session", { session, generation: BigInt(o.generation), write: !!o.apply, operationId: o["operation-id"], fields });
+      try {
+        return await client.request("admin-reconcile-session", { session, generation: BigInt(o.generation), write: !!o.apply, operationId: o["operation-id"], fields });
+      } catch (error) {
+        throw await attachDiagnosis(error, client, session!, o["pending-operation-id"], !!o.explain, { taskId: o["task-id"], generation: BigInt(o.generation) });
+      }
     }
     if (action === "status" || action === "session list") return client.request(action === "status" ? "admin-status" : "admin-session-list", { session });
     if (action.startsWith("drain ")) { const drain = action.slice(6); return drain === "status" ? client.request("drain-status", { session }) : mutate("drain-" + drain, {}, 0); }

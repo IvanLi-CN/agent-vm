@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isIPv4 } from "node:net";
 import { randomUUID } from "node:crypto";
-import { Data, fail, record, integer, json, parseJson, equal, sha256, readJson, durable, fsyncDir, privateDir, Runner, runBounded, shellJoin, inherited } from "./client-io.ts";
+import { CliError, Data, fail, record, integer, json, parseJson, equal, sha256, readJson, durable, fsyncDir, privateDir, Runner, runBounded, shellJoin, inherited } from "./client-io.ts";
 import { PROTOCOL, capability, loadRelease, responseMetadata } from "./client-release.ts";
 import { nativeCapabilities } from "./sync-native.ts";
 
@@ -125,6 +125,65 @@ export function remoteError(raw: Buffer, request: Data): Data | null {
   return matches.length === 1 ? matches[0] : null;
 }
 export interface RequestOptions { session: string | null; generation?: number | bigint; write?: boolean; operationId?: string; fields?: Data; }
+
+function boundedStatus(value: any): Data {
+  if (!record(value)) return {};
+  return Object.fromEntries(["session_id", "task_id", "generation", "state", "effective_lease", "lease_expires_at", "native_status", "guest_available", "verified", "last_error", "guest_error", "resource_state"].filter(key => key in value).map(key => [key, value[key]]));
+}
+
+function boundedMetrics(value: any): Data {
+  if (!record(value)) return {};
+  const result: Data = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string" || typeof item === "number" || typeof item === "boolean" || item === null) result[key] = item;
+    else if (Array.isArray(item)) result[key] = { item_count: item.length };
+    else if (record(item)) result[key] = { field_count: Object.keys(item).length };
+  }
+  return result;
+}
+
+export async function attachDiagnosis(error: any, client: Client, session: string, operationId?: string, explain = false, target?: { taskId?: string; generation?: number | bigint }): Promise<CliError> {
+  const cliError = error instanceof CliError ? error : new CliError("client_failed", error instanceof Error ? error.message : String(error));
+  const existing = record(cliError.detail) ? cliError.detail : {};
+  const diagnosis: Data = { diagnosis_completeness: "partial" };
+  try {
+    const statusResponse = await client.request("status", { session, fields: operationId ? { operation_id: operationId } : {} });
+    const status = boundedStatus(statusResponse.result);
+    diagnosis.status = status;
+    diagnosis.diagnosis_completeness = Object.keys(status).length ? "full" : "partial";
+    if (explain) {
+      try {
+        const metrics = await client.request("admin-metrics", { session: null });
+        diagnosis.metrics_summary = boundedMetrics(metrics.result);
+      } catch (metricsError) {
+        diagnosis.metrics_summary_error = metricsError instanceof CliError ? metricsError.code : "unavailable";
+      }
+      const taskId = target?.taskId ?? status.task_id;
+      const generation = target?.generation ?? status.generation;
+      if (typeof taskId === "string" && integer(generation) && operationId) {
+        try {
+          const preview = await client.request("admin-reconcile-session", {
+            session, generation, fields: { task_id: taskId, pending_operation_id: operationId, apply: false },
+          });
+          diagnosis.recovery_preview = preview.result;
+        } catch (previewError) {
+          diagnosis.recovery_preview = { outcome: "unavailable", error: previewError instanceof CliError ? { code: previewError.code, message: previewError.message, detail: previewError.detail } : { code: "unknown", message: "preview failed" } };
+        }
+      }
+    }
+  } catch {
+    diagnosis.diagnosis_completeness = "partial";
+    diagnosis.status = { outcome: "unavailable" };
+  }
+  const nextAction = cliError.code === "startup_reconcile_required"
+    ? operationId ? "inspect the bounded diagnosis, then run the exact admin reconcile-session dry run before any apply" : "inspect status and reconcile the pending operation explicitly"
+    : cliError.code === "stale_target" ? "wait until lease_expires_at, then retry the read-only reconciliation preview"
+    : cliError.code === "remote_timeout" ? "retry the same operation ID only after checking status; the outcome is still pending"
+    : undefined;
+  const merged = { ...existing, ...diagnosis, ...(nextAction ? { next_action: nextAction } : {}) };
+  return new CliError(cliError.code, cliError.message, merged, cliError.exitCode);
+}
+
 export class Client {
   stateRoot: string; configRoot: string; sidecar: string;
   httpsTimeoutMs?: number;
@@ -211,9 +270,9 @@ export class Client {
       cleanup_only: !(committed && result.state === "active" && result.effective_lease === true),
     });
   }
-  async recoverAcquireState(session: string, privateKey: string, operationId: string, expectedGeneration: number | bigint): Promise<boolean> {
+  async recoverAcquireState(session: string, privateKey: string, operationId: string, expectedGeneration: number | bigint, statusResponse?: Data): Promise<boolean> {
     try {
-      const response = await this.request("status", { session, fields: { operation_id: operationId } });
+      const response = statusResponse ?? await this.request("status", { session, fields: { operation_id: operationId } });
       return this.persistRecoveryState(session, privateKey, response.result, operationId, expectedGeneration);
     } catch {
       return false;

@@ -30,7 +30,18 @@ func (s *Service) reconcileSession(ctx context.Context, request protocol.Request
 				return nil, protocol.NewError("state_unverified", "reconciliation lease deadline is invalid", nil)
 			}
 			if deadline.After(s.Clock()) {
-				return nil, protocol.NewError("stale_target", "reconciliation refuses an unexpired lease", nil)
+				return nil, protocol.NewError("stale_target", "reconciliation refuses an unexpired lease", map[string]any{
+					"diagnosis": map[string]any{
+						"recovery_allowed": false,
+						"recovery_blocker": "lease_unexpired",
+						"retry_condition":  "retry after lease_expires_at",
+						"lease_expires_at": *task.LeaseExpiresAt,
+						"task_id":          task.TaskID,
+						"session_id":       task.SessionID,
+						"generation":       task.Generation,
+						"state":            task.State,
+					},
+				})
 			}
 		} else if task.State == stateActive || task.State == statePreparing {
 			return nil, protocol.NewError("state_unverified", "active or preparing task has no verified lease deadline", nil)

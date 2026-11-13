@@ -145,6 +145,30 @@ func (f *scopedFixture) snapshot(t *testing.T) string {
 	return mustJSON(map[string]any{"tasks": tasks, "pending": operations, "cursor": cursor})
 }
 
+func TestScopedReconcileRejectsUnexpiredLeaseWithAuthoritativeDiagnosis(t *testing.T) {
+	f := newScopedFixture(t)
+	request := cloneMap(f.request)
+	request["task_id"] = "active-peer"
+	request["session_id"] = "active-peer"
+	request["pending_operation_id"] = "pending-target"
+	err := func() error {
+		_, err := f.service.Dispatch(context.Background(), protocol.Request(request))
+		return err
+	}()
+	control := protocol.AsError(err)
+	if control.Code != "stale_target" {
+		t.Fatalf("code=%s want stale_target", control.Code)
+	}
+	detail, ok := control.Detail.(map[string]any)
+	if !ok {
+		t.Fatalf("detail=%#v", control.Detail)
+	}
+	diagnosis, ok := detail["diagnosis"].(map[string]any)
+	if !ok || diagnosis["recovery_allowed"] != false || diagnosis["recovery_blocker"] != "lease_unexpired" || diagnosis["lease_expires_at"] != nowString(f.now.Add(time.Hour)) {
+		t.Fatalf("diagnosis=%#v", detail["diagnosis"])
+	}
+}
+
 func TestScopedReconcileDryRunApplyAndReplayKeepPeerAndCursor(t *testing.T) {
 	f := newScopedFixture(t)
 	ctx := context.Background()
