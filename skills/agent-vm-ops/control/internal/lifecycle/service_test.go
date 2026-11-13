@@ -26,6 +26,16 @@ import (
 
 func int64Pointer(value int64) *int64 { return &value }
 
+func TestActiveOperationCountExcludingCurrentOperation(t *testing.T) {
+	service := &Service{activeOps: map[string]int{"history-cleanup": 1, "other": 2}}
+	if got := service.activeOperationCountExcluding("history-cleanup"); got != 2 {
+		t.Fatalf("active operation count excluding current operation = %d, want 2", got)
+	}
+	if got := service.activeOperationCountExcluding("missing"); got != 3 {
+		t.Fatalf("active operation count excluding missing operation = %d, want 3", got)
+	}
+}
+
 func missingInstanceError(instance string) error {
 	err := exec.Command("false").Run()
 	diagnostic := fmt.Sprintf("Error: Failed to fetch instance %q in projectName %q: Instance not found", instance, "agents")
