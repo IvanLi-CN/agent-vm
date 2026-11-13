@@ -379,8 +379,22 @@ func (s *Service) mutationContext(ctx context.Context) (context.Context, func(),
 	return fencedContext, stop, lost.Load
 }
 
-func controllerLeaseLostError(cause error) error {
-	detail := map[string]any{"outcome_verified": false, "phase": "controller-lease"}
+func controllerLeaseLostError(cause error, request ...protocol.Request) error {
+	detail := map[string]any{"outcome_verified": false, "phase": "controller-lease", "journal_state": "pending", "worker_evidence": "retained_in_operation_journal", "next_action": "inspect the original operation status; do not replay with a new operation ID"}
+	if len(request) > 0 {
+		if operationID := stringValue(request[0]["operation_id"]); operationID != "" {
+			detail["operation_id"] = operationID
+		}
+		if sessionID := stringValue(request[0]["session_id"]); sessionID != "" {
+			detail["session_id"] = sessionID
+		}
+		if taskID := stringValue(request[0]["task_id"]); taskID != "" {
+			detail["task_id"] = taskID
+		}
+		if generation, ok := request[0]["generation"]; ok {
+			detail["generation"] = generation
+		}
+	}
 	if cause != nil {
 		detail["cause"] = cause.Error()
 	}
@@ -1578,7 +1592,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	}
 	result, err := s.dispatchAction(dispatchCtx, action, request)
 	if write && !leaseExempt && (mutationLost() || !s.mutationAllowed()) {
-		err = controllerLeaseLostError(err)
+		err = controllerLeaseLostError(err, request)
 	}
 	if err != nil {
 		if s.Snapshots != nil {
@@ -1599,14 +1613,14 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	response := protocol.SuccessWithRelease(request, result, s.Release, warnings)
 	if write {
 		if !leaseExempt && (mutationLost() || !s.mutationAllowed()) {
-			return nil, controllerLeaseLostError(nil)
+			return nil, controllerLeaseLostError(nil, request)
 		}
 		operationID := stringValue(request["operation_id"])
 		digest, _ := protocol.Digest(request)
 		response["_request_digest"] = digest
 		recordErr := s.commitMutationContext(ctx, func() error {
 			if !leaseExempt && mutationLost() {
-				return controllerLeaseLostError(nil)
+				return controllerLeaseLostError(nil, request)
 			}
 			return s.Store.RecordOperation(ctx, operationID, stringValue(request["action"]), optionalString(request["session_id"]), generationPointer(intValue(request["generation"]), request["generation"] != nil), response)
 		})

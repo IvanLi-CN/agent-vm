@@ -299,6 +299,17 @@ test("local recovery state is locked, monotonic and cleanup-only safe", () => {
   })).toBe(false);
 });
 
+test("authoritative cached status marks local generation stale before later mutation", async () => {
+  const f = fixture(); f.state("explicit", 7);
+  f.handler = request => result(response(request, {
+    result: { session_id: "explicit", task_id: "avm-abc", generation: 7, state: "cached", effective_lease: false, guest_available: false, lease_expires_at: null },
+  }));
+  await dispatch(selected(["status"]), f.client);
+  expect(f.client.state("explicit")).toMatchObject({ generation: 7, task_id: "avm-abc", cleanup_only: true, stale: true });
+  expect(() => f.client.generation("explicit")).toThrow("cleanup-only");
+  expect(f.client.generation("explicit", true)).toBe(7);
+});
+
 test("recovery state requires an exact committed or partial operation proof", async () => {
   const f = fixture();
   const key = f.key();

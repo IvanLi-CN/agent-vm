@@ -9,5 +9,5 @@
 
 | Topic | Lifecycle | Implementation | Spec | Successor | Notes |
 | --- | --- | --- | --- | --- | --- |
-| Native Incus Agent VM | active | 已有实现，覆盖未在本次重评 | [agent-vm/SPEC.md](agent-vm/SPEC.md) | - | 运行期能力、协议与原生资源边界。 |
+| Native Incus Agent VM | active | 已有实现，覆盖未在本次重评 | [agent-vm/SPEC.md](agent-vm/SPEC.md)；[控制面生命周期与恢复设计](agent-vm/CONTROL-PLANE-LIFECYCLE-RECOVERY.md) | - | 运行期能力、协议、lease、operation journal 与 native recovery 边界。 |
 | Agent VM 项目工程治理 | active | 仓库侧候选已实施；平台保护、通知 transport 和正式发布未启用 | [engineering-governance/SPEC.md](engineering-governance/SPEC.md) | [IMPLEMENTATION.md](engineering-governance/IMPLEMENTATION.md) | 五项必需 Topic 覆盖日常变更、门禁、调度、通知和手动发布。 |
