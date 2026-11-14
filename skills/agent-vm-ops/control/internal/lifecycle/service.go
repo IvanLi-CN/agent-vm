@@ -1596,7 +1596,9 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 			}
 		}
 		defer finishActive()
-		ctx = native.WithWorkerRecorder(ctx, operationID, s)
+		if action != "admin-reconcile-history" {
+			ctx = native.WithWorkerRecorder(ctx, operationID, s)
+		}
 	}
 	dispatchCtx := ctx
 	stopMutationWatch := func() {}
