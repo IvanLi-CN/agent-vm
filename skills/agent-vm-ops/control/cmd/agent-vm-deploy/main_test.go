@@ -20,3 +20,18 @@ func TestUpdateRequiresReleaseIdentity(t *testing.T) {
 		}
 	}
 }
+
+func TestTransactionAcknowledgementAcceptsCurrentAndLegacyEnvelopes(t *testing.T) {
+	fixtures := []string{
+		`{"ok":true,"value":{"transaction_id":"tx-1","phase":"standby_validation","state":"active"}}`,
+		`{"ok":true,"transaction_id":"tx-1","phase":"standby_validation","state":"active"}`,
+	}
+	for _, fixture := range fixtures {
+		if !validTransactionAcknowledgement([]byte(fixture), "tx-1", "standby_validation", "active") {
+			t.Fatalf("acknowledgement rejected: %s", fixture)
+		}
+	}
+	if validTransactionAcknowledgement([]byte(`{"ok":true,"transaction_id":"tx-1","phase":"standby_validation","state":"active"}`), "tx-2", "standby_validation", "active") {
+		t.Fatal("acknowledgement accepted a mismatched transaction")
+	}
+}

@@ -201,11 +201,6 @@ func runUpdate(args []string) error {
 	if status.Value.Observation.ActiveSlot == "blue" {
 		targetSlot = "green"
 	}
-	var result struct {
-		Value struct {
-			ID string `json:"transaction_id"`
-		} `json:"value"`
-	}
 	payload, _, err := client.Call(ctx, "POST", "/v1/stage", map[string]any{"target_slot": targetSlot, "bundle": filepath.Clean(bundle)})
 	if err != nil {
 		// Any failed transaction call may have crossed the native-effect barrier;
@@ -220,12 +215,13 @@ func runUpdate(args []string) error {
 		}
 		return err
 	}
-	if err := json.Unmarshal(payload, &result); err != nil {
+	acknowledgement, decoded := decodeTransactionAcknowledgement(payload)
+	if !decoded {
 		preserveStaging = true
 		writeUpdateRecoveryHint(ctx, client, "")
-		return fmt.Errorf("stage response invalid: %w", err)
+		return errors.New("stage response invalid")
 	}
-	id := result.Value.ID
+	id := acknowledgement.ID
 	if id == "" || !validTransactionAcknowledgement(payload, id, "standby_validation", "active") {
 		preserveStaging = true
 		writeUpdateRecoveryHint(ctx, client, id)
@@ -375,18 +371,43 @@ func publicError(err error) string {
 }
 
 func validTransactionAcknowledgement(payload []byte, expectedID, expectedPhase, expectedState string) bool {
+	acknowledgement, ok := decodeTransactionAcknowledgement(payload)
+	return ok && acknowledgement.OK && acknowledgement.ID == expectedID && acknowledgement.Phase == expectedPhase && acknowledgement.State == expectedState
+}
+
+type transactionAcknowledgement struct {
+	OK    bool
+	ID    string
+	Phase string
+	State string
+}
+
+// decodeTransactionAcknowledgement accepts the current response envelope and
+// the legacy top-level transaction shape. This lets an older server-side CLI
+// finish a transaction created by a newer Deployd without treating a valid
+// transaction as missing merely because the envelope moved under value.
+func decodeTransactionAcknowledgement(payload []byte) (transactionAcknowledgement, bool) {
 	var response struct {
-		OK    bool `json:"ok"`
-		Value struct {
+		OK            bool   `json:"ok"`
+		TransactionID string `json:"transaction_id"`
+		Phase         string `json:"phase"`
+		State         string `json:"state"`
+		Value         struct {
 			ID    string `json:"transaction_id"`
 			Phase string `json:"phase"`
 			State string `json:"state"`
 		} `json:"value"`
 	}
 	if json.Unmarshal(payload, &response) != nil {
-		return false
+		return transactionAcknowledgement{}, false
 	}
-	return response.OK && response.Value.ID == expectedID && response.Value.Phase == expectedPhase && response.Value.State == expectedState
+	acknowledgement := transactionAcknowledgement{OK: response.OK, ID: response.Value.ID, Phase: response.Value.Phase, State: response.Value.State}
+	if acknowledgement.ID == "" {
+		acknowledgement.ID = response.TransactionID
+		acknowledgement.Phase = response.Phase
+		acknowledgement.State = response.State
+	}
+	return acknowledgement, true
 }
 
 func writePayload(out *os.File, payload []byte) {
