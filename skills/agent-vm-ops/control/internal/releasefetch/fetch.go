@@ -204,7 +204,7 @@ func metadata(ctx context.Context, client *http.Client, version string) (*http.R
 				return nil, validationError("release_network_error", "release_metadata_lookup", "transport_error", "retry_update")
 			}
 			if err := retryDelay(ctx, time.Second*time.Duration(attempt+1)); err != nil {
-				return nil, err
+				return nil, validationError("release_network_error", "release_metadata_lookup", "retry_wait_cancelled", "retry_update")
 			}
 			continue
 		}
@@ -218,7 +218,7 @@ func metadata(ctx context.Context, client *http.Client, version string) (*http.R
 		}
 		response.Body.Close()
 		if err := retryDelay(ctx, retryAfter(classified, time.Second*time.Duration(attempt+1))); err != nil {
-			return nil, err
+			return nil, validationError("release_network_error", "release_metadata_lookup", "retry_wait_cancelled", "retry_update")
 		}
 	}
 	return nil, validationError("release_network_error", "release_metadata_lookup", "retry_exhausted", "retry_update")
@@ -273,7 +273,7 @@ func classify(response *http.Response) error {
 	if response.StatusCode == http.StatusNotFound {
 		code, reason, next = "release_not_found", "release_not_found", "check_version"
 	}
-	if response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusForbidden && response.Header.Get("X-RateLimit-Remaining") == "0" {
+	if response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusForbidden && (response.Header.Get("X-RateLimit-Remaining") == "0" || response.Header.Get("Retry-After") != "") {
 		code, reason, next, retryable = "release_rate_limited", "api_rate_limited", "wait_or_configure_release_read_credential", true
 	}
 	if response.StatusCode >= 500 {
@@ -326,7 +326,7 @@ func download(ctx context.Context, client *http.Client, url, path, token string)
 				return validationError("release_network_error", "asset_download", "asset_transport_error", "retry_update")
 			}
 			if err := retryDelay(ctx, time.Second*time.Duration(attempt+1)); err != nil {
-				return err
+				return validationError("release_network_error", "asset_download", "retry_wait_cancelled", "retry_update")
 			}
 			continue
 		}
@@ -336,12 +336,17 @@ func download(ctx context.Context, client *http.Client, url, path, token string)
 			res.Body.Close()
 			if classifiedValue != nil {
 				classifiedValue.Phase = "asset_download"
+				if res.StatusCode == http.StatusNotFound {
+					classifiedValue.Code = "release_asset_not_found"
+					classifiedValue.Reason = "asset_not_found"
+					classifiedValue.NextAction = "check_release_assets"
+				}
 			}
 			if !isRetryable(classified) || attempt == 2 {
 				return classified
 			}
 			if err := retryDelay(ctx, retryAfter(classified, time.Second*time.Duration(attempt+1))); err != nil {
-				return err
+				return validationError("release_network_error", "asset_download", "retry_wait_cancelled", "retry_update")
 			}
 			continue
 		}

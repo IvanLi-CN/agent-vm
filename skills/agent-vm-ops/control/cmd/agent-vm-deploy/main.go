@@ -212,6 +212,10 @@ func runUpdate(args []string) error {
 			writePayload(os.Stderr, payload)
 			return err
 		}
+		if !validTransactionAcknowledgement(payload, id) {
+			preserveStaging = true
+			return errors.New("deployd acknowledgement is incomplete")
+		}
 	}
 	if err := os.RemoveAll(directory); err != nil {
 		preserveStaging = true
@@ -223,6 +227,21 @@ func runUpdate(args []string) error {
 		_, _ = os.Stdout.Write([]byte("\n"))
 	}
 	return nil
+}
+
+func validTransactionAcknowledgement(payload []byte, expectedID string) bool {
+	var response struct {
+		OK    bool `json:"ok"`
+		Value struct {
+			ID    string `json:"transaction_id"`
+			Phase string `json:"phase"`
+			State string `json:"state"`
+		} `json:"value"`
+	}
+	if json.Unmarshal(payload, &response) != nil {
+		return false
+	}
+	return response.OK && response.Value.ID == expectedID && response.Value.Phase != "" && response.Value.State != ""
 }
 
 func writePayload(out *os.File, payload []byte) {

@@ -246,7 +246,7 @@ func (server *Server) stage(c *gin.Context) {
 			writeTransactionError(c, http.StatusConflict, "state_unverified", err)
 			return
 		}
-		writeError(c, http.StatusConflict, "stage_rejected", err.Error())
+		writeTransactionError(c, http.StatusConflict, "stage_rejected", err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -259,7 +259,11 @@ func (server *Server) verify(c *gin.Context) {
 	}
 	transaction, err := server.Manager.Verify(c.Request.Context(), value.TransactionID)
 	if err != nil {
-		writeTransactionError(c, http.StatusConflict, "verify_rejected", err)
+		code := "verify_rejected"
+		if errors.Is(err, ErrUncertain) {
+			code = "state_unverified"
+		}
+		writeTransactionError(c, http.StatusConflict, code, err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -290,7 +294,11 @@ func (server *Server) rollback(c *gin.Context) {
 	}
 	transaction, err := server.Manager.Rollback(c.Request.Context(), value.TransactionID)
 	if err != nil {
-		writeTransactionError(c, http.StatusConflict, "rollback_rejected", err)
+		code := "rollback_rejected"
+		if errors.Is(err, ErrUncertain) {
+			code = "state_unverified"
+		}
+		writeTransactionError(c, http.StatusConflict, code, err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -304,7 +312,11 @@ func (server *Server) recover(c *gin.Context) {
 	transaction, err := server.Manager.Recover(c.Request.Context(), value.TransactionID, value.Action)
 	if err != nil {
 		slog.Warn("deployment recovery rejected", "transaction_id", value.TransactionID, "action", value.Action, "error", err)
-		writeTransactionError(c, http.StatusConflict, "recover_rejected", err)
+		code := "recover_rejected"
+		if errors.Is(err, ErrUncertain) {
+			code = "state_unverified"
+		}
+		writeTransactionError(c, http.StatusConflict, code, err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))

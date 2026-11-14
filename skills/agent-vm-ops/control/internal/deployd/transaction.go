@@ -331,7 +331,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
 		term, termErr := manager.nextFenceTerm(ctx)
 		if termErr != nil {
-			return nil, fmt.Errorf("allocate controller fencing term: %w", termErr)
+			return nil, manager.failure(ctx, id, PhaseControllerHandoff, fmt.Errorf("allocate controller fencing term: %w", termErr))
 		}
 		if err := manager.Runtime.RevokeController(ctx, transaction.PreviousSlot, term); err != nil {
 			return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, err)
@@ -339,7 +339,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	}
 	lease, err := manager.newLease(ctx, transaction.TargetSlot, transaction.Generation)
 	if err != nil {
-		return nil, fmt.Errorf("allocate candidate controller lease: %w", err)
+		return nil, manager.failure(ctx, id, PhaseControllerHandoff, fmt.Errorf("allocate candidate controller lease: %w", err))
 	}
 	if err := manager.Runtime.GrantController(ctx, transaction.TargetSlot, lease); err != nil {
 		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, err)
