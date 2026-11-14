@@ -586,6 +586,9 @@ svg { flex: none; }
   .demo-inspector-backdrop { position: fixed; z-index: 25; inset: 0; display: block; width: 100%; height: 100%; background: rgba(19,20,22,.28); border: 0; border-radius: 0; }
   .demo-inspector { top: auto; right: 8px; bottom: 8px; left: 8px !important; width: auto; max-height: min(78vh, 620px); padding: 0 16px 18px; border-radius: 12px; box-shadow: 0 18px 44px rgba(19,20,22,.2); }
   .demo-inspector-close { display: inline-grid; }
+  .demo-inspector-header { align-items: center; }
+  .demo-inspector-header-actions { align-items: center; }
+  .demo-inspector-close, .demo-layout-button { width: 44px; min-width: 44px; height: 44px; min-height: 44px; place-items: center; }
   .demo-inspector-panel-handle-group { width: calc(100% + 32px) !important; margin-right: -16px; margin-left: -16px; }
 }
 
