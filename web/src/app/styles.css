@@ -109,7 +109,7 @@ svg { flex: none; }
 .language-toggle button { min-width: 31px; height: 26px; padding: 0 7px; color: var(--muted); background: transparent; border: 0; border-radius: 4px; font-size: 12px; }
 .language-toggle button.selected { color: var(--text); background: var(--surface); border: 1px solid var(--border); }
 .work-surface { min-height: calc(100vh - 56px); margin: 0 8px 8px 0; background: var(--surface); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; }
-.page-stack { display: flex; flex-direction: column; gap: 20px; max-width: 1500px; padding: 28px 32px 48px; }
+.page-stack { display: flex; flex-direction: column; gap: 20px; width: 100%; padding: 28px 32px 48px; }
 .page-intro { display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; }
 .page-intro p { margin-top: 4px; max-width: 70ch; }
 .intro-meta { display: flex; align-items: center; gap: 12px; padding-top: 2px; color: var(--muted); font-size: 12px; white-space: nowrap; }
