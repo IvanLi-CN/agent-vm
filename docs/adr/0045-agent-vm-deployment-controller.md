@@ -14,6 +14,9 @@ Agent VM 的蓝绿部署需要在同一控制环境内持续观察两个并行�
 
 ## 决策
 
+- Deployd 与槽位 control 使用独立的 `deployment_contract` v1，而不是把 Deployd 版本与 protocol 4 或产品 SemVer 绑定。所有仍受支持的 v1 control 都必须被同一个 Deployd 接受；字段和 capabilities 采用可忽略的增量扩展。候选 manifest 的 major 在 stage 前预检，缺失字段按 legacy v1 基线兼容，major 不兼容走独立的 controller upgrade transaction。
+- 普通蓝绿事务分层保存候选角色、previous-slot quiescence 和最终全局一致性证据。controller lease 从 handoff 持续到 finalize；响应中断或观测过期时复用原 transaction 进入 recovery，不创建新事务猜测结果。
+
 - `agent-vm-deployd.service` 是稳定的宿主级部署控制器，不随蓝绿槽位切换。
   蓝色和绿色槽位只提供受保护的 readiness、controller-role、traffic-role、请求计数和 native-operation 观测/控制合同。
 - deployd 在受保护的 Unix socket 之外，提供仅限内部管理网络访问的只读 `GET /metrics` endpoint。

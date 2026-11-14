@@ -110,6 +110,19 @@ type ReleaseMetadata struct {
 	Actions           map[string]ActionCompatibility
 }
 
+// DeploymentContract is the stable Deployd <-> slot-control contract. The
+// major remains compatible across product releases; new fields are additive.
+type DeploymentContract struct {
+	Name         string
+	Major        int64
+	Revision     int64
+	Capabilities []string
+}
+
+const DeploymentContractName = "agent-vm-control"
+const DeploymentContractMajor int64 = 1
+const DeploymentContractRevision int64 = 1
+
 func Decode(data []byte) (Request, error) {
 	value, err := DecodeValue(data)
 	if err != nil {

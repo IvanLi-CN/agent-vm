@@ -243,14 +243,18 @@ func TestControllerHealthNegotiatesRenewalWithoutCancelingAuthority(t *testing.T
 	response := httptest.NewRecorder()
 	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/internal/v1/health", nil))
 	var health struct {
-		Renewal bool                 `json:"controller_lease_renewal"`
-		Owned   bool                 `json:"controller_owned"`
-		Lease   controllerrole.Lease `json:"lease"`
+		Renewal  bool                 `json:"controller_lease_renewal"`
+		Owned    bool                 `json:"controller_owned"`
+		Lease    controllerrole.Lease `json:"lease"`
+		Contract struct {
+			Name  string `json:"name"`
+			Major int64  `json:"major"`
+		} `json:"deployment_contract"`
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &health); err != nil {
 		t.Fatal(err)
 	}
-	if !health.Renewal || !health.Owned || health.Lease != lease {
+	if !health.Renewal || !health.Owned || health.Lease != lease || health.Contract.Name != protocol.DeploymentContractName || health.Contract.Major != protocol.DeploymentContractMajor {
 		t.Fatalf("health negotiation=%+v", health)
 	}
 }

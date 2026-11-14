@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { build_go_manifest, GO_FIXED_ARTIFACTS, validate_go_manifest, verify_go_bundle } from "../scripts/go-release-manifest.ts";
+import { build_go_manifest, DEPLOYMENT_CONTRACT, GO_FIXED_ARTIFACTS, validate_go_manifest, verify_go_bundle } from "../scripts/go-release-manifest.ts";
 
 const artifacts = GO_FIXED_ARTIFACTS.map(([name, path, role, mode]) => ({ name, path, role, mode, sha256: "a".repeat(64) }));
 
@@ -12,7 +12,18 @@ test("format-2 manifest fixes the Go target, toolchain, transport enum and retir
   expect(manifest.toolchain).toEqual({ go: "go1.27.3", cgo_enabled: false });
   expect(manifest.client_view.transport).toBe("go-request");
   expect(manifest.retired_units).toContain("agent-vm-native-expire@.service");
+  expect(manifest.deployment_contract).toEqual({ ...DEPLOYMENT_CONTRACT, capabilities: [...DEPLOYMENT_CONTRACT.capabilities] });
   expect(validate_go_manifest(manifest)).toEqual(manifest);
+});
+
+test("format-2 deployment contract remains additive and rejects a breaking major", () => {
+  const manifest = build_go_manifest("a".repeat(40), artifacts);
+  const legacy = structuredClone(manifest);
+  delete legacy.deployment_contract;
+  expect(validate_go_manifest(legacy).deployment_contract).toEqual({ ...DEPLOYMENT_CONTRACT, capabilities: [...DEPLOYMENT_CONTRACT.capabilities] });
+
+  expect(() => validate_go_manifest({ ...manifest, deployment_contract: { ...manifest.deployment_contract!, major: 2 } })).toThrow("incompatible");
+  expect(() => validate_go_manifest({ ...manifest, deployment_contract: { ...manifest.deployment_contract!, capabilities: ["unknown@1"] } })).toThrow("incompatible");
 });
 
 test("format-2 validation accepts HTTPS while builders and bundle verification fail closed", () => {
