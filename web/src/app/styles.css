@@ -588,6 +588,7 @@ svg { flex: none; }
   .demo-inspector-close { display: inline-grid; }
   .demo-inspector-header { align-items: center; }
   .demo-inspector-header-actions { align-items: center; }
+  .demo-inspector-header-actions .demo-layout-menu { display: none; }
   .demo-inspector-close, .demo-layout-button { width: 44px; min-width: 44px; height: 44px; min-height: 44px; place-items: center; }
   .demo-inspector-panel-handle-group { width: calc(100% + 32px) !important; margin-right: -16px; margin-left: -16px; }
 }
