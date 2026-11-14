@@ -4287,9 +4287,14 @@ func (s *Service) reconcileHistoricalUnknown(ctx context.Context, request protoc
 		return nil, s.sqliteError(err)
 	}
 	currentID := stringValue(request["operation_id"])
+	var staleCleanup []state.Operation
 	filteredPending := pending[:0]
 	for _, operation := range pending {
 		if operation.OperationID != currentID {
+			if operation.Action == "admin-reconcile-history" {
+				staleCleanup = append(staleCleanup, operation)
+				continue
+			}
 			filteredPending = append(filteredPending, operation)
 		}
 	}
@@ -4327,6 +4332,14 @@ func (s *Service) reconcileHistoricalUnknown(ctx context.Context, request protoc
 	evidence := map[string]any{"status": "reconciled", "reason": reason, "basis": "operator-authorized-native-quiescence", "reconciled_at": nowString(s.Clock()), "operation_ids": ids}
 	for _, id := range ids {
 		if err := s.Store.MarkHistoricalUnknownReconciled(ctx, id, evidence); err != nil {
+			return nil, s.sqliteError(err)
+		}
+	}
+	for _, operation := range staleCleanup {
+		response := cloneMap(operation.Response)
+		response["outcome"] = "error"
+		response["error"] = protocol.NewError("operation_superseded", "a later operator cleanup superseded this incomplete cleanup attempt", map[string]any{"superseded_by_operation_id": currentID})
+		if err := s.Store.RecordOperation(ctx, operation.OperationID, operation.Action, operation.SessionID, operation.Generation, response); err != nil {
 			return nil, s.sqliteError(err)
 		}
 	}
