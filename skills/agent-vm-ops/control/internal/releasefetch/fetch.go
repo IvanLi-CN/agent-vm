@@ -104,7 +104,10 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 	if err := os.MkdirAll(directory, 0o750); err != nil {
 		return "", validationError("release_staging_unavailable", "staging_prepare", "staging_directory_unavailable", "check_target_storage")
 	}
-	var required int64 = 64 << 20
+	// Reserve the downloaded bundle, Deployd's extracted candidate and the
+	// retained rollback copy at their bounded maximums. Metadata sizes alone
+	// cannot prove this peak because the archive is expanded during staging.
+	var required int64 = 3 * (128 << 20)
 	for _, name := range []string{assetName, "release-provenance.json", "SHA256SUMS"} {
 		limit := int64(1 << 20)
 		if name == assetName {

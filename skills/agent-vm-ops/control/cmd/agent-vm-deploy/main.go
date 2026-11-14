@@ -170,13 +170,15 @@ func runUpdate(args []string) error {
 		return err
 	}
 	var status struct {
+		OK    bool `json:"ok"`
 		Value struct {
 			Observation struct {
 				ActiveSlot string `json:"active_slot"`
 			} `json:"observation"`
 		} `json:"value"`
 	}
-	if err := json.Unmarshal(statusPayload, &status); err != nil || (status.Value.Observation.ActiveSlot != "blue" && status.Value.Observation.ActiveSlot != "green") {
+	if err := json.Unmarshal(statusPayload, &status); err != nil || !status.OK || (status.Value.Observation.ActiveSlot != "blue" && status.Value.Observation.ActiveSlot != "green") {
+		writeUpdateRecoveryHint(ctx, client, "")
 		return errors.New("status response missing active slot")
 	}
 	targetSlot := "blue"
@@ -202,11 +204,13 @@ func runUpdate(args []string) error {
 	}
 	if err := json.Unmarshal(payload, &result); err != nil {
 		preserveStaging = true
+		writeUpdateRecoveryHint(ctx, client, "")
 		return fmt.Errorf("stage response invalid: %w", err)
 	}
 	id := result.Value.ID
 	if id == "" || !validTransactionAcknowledgement(payload, id, "standby_validation", "active") {
 		preserveStaging = true
+		writeUpdateRecoveryHint(ctx, client, id)
 		return errors.New("stage acknowledgement is incomplete")
 	}
 	preserveStaging = true
@@ -228,6 +232,7 @@ func runUpdate(args []string) error {
 		}
 		if !validTransactionAcknowledgement(payload, id, step.phase, step.state) {
 			preserveStaging = true
+			writeUpdateRecoveryHint(ctx, client, id)
 			return errors.New("deployd acknowledgement is incomplete")
 		}
 	}
