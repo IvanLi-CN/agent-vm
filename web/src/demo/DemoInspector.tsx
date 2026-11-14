@@ -1,4 +1,4 @@
-import { Check, Clipboard, Minimize2, Move, PanelLeft, PanelRight, RotateCcw, Wifi, WifiOff } from "lucide-react";
+import { Check, Clipboard, Minimize2, Move, PanelLeft, PanelRight, RotateCcw, Wifi, WifiOff, X } from "lucide-react";
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type PointerEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { demoShareUrl, getDemoInspectorExpandedLayout, getDemoInspectorPosition, saveDemoInspectorExpandedLayout, saveDemoInspectorPosition, setDemoControl, useDemoRuntime, type DemoDataMode, type DemoInspectorLayout, type DemoInspectorPosition, type DemoPersona, type DemoRuntimeState, type DemoScene } from "./runtime";
@@ -199,11 +199,12 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
 
   return <TooltipProvider delayDuration={350}><div className={`demo-inspector-shell demo-inspector-shell--${layout} ${isMinimized ? "is-closed" : "is-open"}`}>
     <ShadcnButton type="button" variant="outline" size="icon-lg" className={`demo-bubble ${isMinimized ? "" : "is-open"}`} aria-label={t("demo.openInspector")} onClick={restoreLayout}><PanelRight aria-hidden="true" /></ShadcnButton>
-    {!isMinimized ? <aside ref={inspectorRef} className={`demo-inspector ${layout === "floating" ? "demo-inspector--floating" : ""} ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.inspector")} style={layout === "floating" && floatingPosition ? { left: `${floatingPosition.left}px`, top: `${floatingPosition.top}px`, right: "auto", bottom: "auto" } : undefined}>
+    {!isMinimized ? <><ShadcnButton type="button" variant="ghost" size="icon-lg" className="demo-inspector-backdrop" aria-label={t("demo.closeInspector")} onClick={() => changeLayout("minimized")} /><aside ref={inspectorRef} className={`demo-inspector ${layout === "floating" ? "demo-inspector--floating" : ""} ${dragging ? "is-dragging" : ""}`} aria-label={t("demo.inspector")} style={layout === "floating" && floatingPosition ? { left: `${floatingPosition.left}px`, top: `${floatingPosition.top}px`, right: "auto", bottom: "auto" } : undefined}>
       {layout === "floating" ? <ResizablePanelGroup orientation="vertical" className="demo-inspector-panel-handle-group" aria-label={t("demo.dragHandle")}><ResizablePanel defaultSize={50} disabled style={{ position: "absolute", inset: 0, pointerEvents: "none" }} /><Tooltip><TooltipTrigger asChild><ResizableHandle withHandle className={cn("demo-inspector-panel-handle bg-transparent aria-[orientation=horizontal]:after:inset-y-auto aria-[orientation=horizontal]:after:top-1/2 aria-[orientation=horizontal]:after:-translate-y-1/2 touch-none cursor-grab", dragging && "cursor-grabbing")} aria-label={t("demo.dragHandle")} aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown" onPointerDown={handleDragStart} onPointerMove={handleDragMove} onPointerUp={finishDrag} onPointerCancel={finishDrag} onKeyDown={handleDragKeyDown} /></TooltipTrigger><TooltipContent side="bottom">{t("demo.dragInspector")}</TooltipContent></Tooltip><ResizablePanel defaultSize={50} disabled style={{ position: "absolute", inset: 0, pointerEvents: "none" }} /></ResizablePanelGroup> : null}
       <div className="demo-inspector-header">
         <div className="demo-inspector-heading"><h2>{t("demo.inspector")}</h2></div>
         <div className="demo-inspector-header-actions">
+          <ShadcnButton type="button" variant="ghost" size="icon-lg" className="demo-inspector-close" aria-label={t("demo.closeInspector")} onClick={() => changeLayout("minimized")}><X aria-hidden="true" /></ShadcnButton>
           <div className="demo-layout-menu">
             <ContextMenu>
               <DropdownMenu open={longPressMenuOpen} onOpenChange={setLongPressMenuOpen}>
@@ -233,6 +234,6 @@ export function DemoInspector({ layout: controlledLayout, onLayoutChange }: Demo
       <div className="demo-actions"><Button variant="primary" icon={copied ? <Check /> : <Clipboard />} onClick={() => void copyLink()}>{copied ? t("demo.copied") : copyFailed ? t("demo.copyFailed") : t("demo.copyShare")}</Button><Button variant="ghost" icon={<RotateCcw />} onClick={() => setDemoControl({ scene: runtime.scene, persona: runtime.persona, network: runtime.network, dataMode: runtime.dataMode })}>{t("demo.reset")}</Button></div>
       {copyFailed ? <p className="demo-copy-error" role="status">{t("demo.copyFailedText")}</p> : null}
       <p className="demo-footnote">{t("demo.urlHint")}</p>
-    </aside> : null}
+    </aside></> : null}
   </div></TooltipProvider>;
 }
