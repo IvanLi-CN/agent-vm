@@ -163,10 +163,11 @@ svg { flex: none; }
 .resource-section .metric-grid { padding-top: 0; }
 
 @media (min-width: 861px) {
-  .resource-section:first-of-type .metric-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-  .resource-section:first-of-type .metric-grid .metric-cell { grid-column: span 2; }
-  .resource-section:first-of-type .metric-grid .metric-cell:nth-child(4) { grid-column: 2 / span 2; border-left: 0; padding-left: 0; }
-  .resource-section:first-of-type .metric-grid .metric-cell:nth-child(5) { grid-column: 4 / span 2; }
+  .resource-section:first-of-type .metric-cell { min-height: 112px; }
+}
+
+@media (min-width: 1280px) {
+  .resource-section:first-of-type .metric-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 }
 .overview-lower, .system-grid, .system-overview { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(280px, .75fr); align-items: start; gap: 16px; }
 .workload-list, .source-list, .component-list, .capability-list { padding: 0 20px 14px; }
@@ -666,7 +667,7 @@ svg { flex: none; }
   .admission-panel { align-items: flex-start; flex-wrap: wrap; padding: 14px 16px; }
   .admission-panel > .status-badge { margin-left: 46px; }
   .metric-grid, .metric-grid-compact { grid-template-columns: 1fr 1fr; padding: 2px 16px 16px; }
-  .resource-section:first-of-type .metric-grid .metric-cell { grid-column: auto; }
+  .resource-section:first-of-type .metric-cell { min-height: 0; }
   .metric-cell { padding: 12px 10px 0 0; }
   .metric-cell + .metric-cell { padding-left: 10px; }
   .metric-cell:nth-child(odd) { border-left: 0; padding-left: 0; }
