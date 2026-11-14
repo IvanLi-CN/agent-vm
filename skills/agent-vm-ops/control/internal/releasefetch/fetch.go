@@ -113,11 +113,9 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 		if sizes[name] < 0 || sizes[name] > limit {
 			return "", validationError("release_asset_too_large", "release_metadata_validation", "asset_size_invalid", "inspect_release")
 		}
-		if sizes[name] > 0 {
-			required += sizes[name]
-		} else {
-			required += limit
-		}
+		// GitHub metadata is advisory; reserve the full bounded download
+		// allowance so a mismatched response cannot bypass the preflight.
+		required += limit
 	}
 	if err := checkCapacity(directory, required); err != nil {
 		return "", err

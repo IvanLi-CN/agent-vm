@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
@@ -132,7 +134,9 @@ func runUpdate(args []string) error {
 	if flags.NArg() != 0 || *version == "" || *source == "" {
 		return errors.New("update requires --version and --source-revision")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	baseContext, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignal()
+	ctx, cancel := context.WithTimeout(baseContext, 15*time.Minute)
 	defer cancel()
 	updateLock, err := native.AcquireLock("/run/agent-vm-native/release-update.lock", true, true)
 	if err != nil {
@@ -189,8 +193,11 @@ func runUpdate(args []string) error {
 		// Any failed transaction call may have crossed the native-effect barrier;
 		// retain the candidate until the transaction is queried and explicitly
 		// recovered, even when the response is malformed or incomplete.
-		preserveStaging = true
+		preserveStaging = errorMayNeedRecovery(payload)
 		writePayload(os.Stderr, payload)
+		if preserveStaging && !hasStructuredError(payload) {
+			writeUpdateRecoveryHint(ctx, client, "")
+		}
 		return err
 	}
 	if err := json.Unmarshal(payload, &result); err != nil {
@@ -214,6 +221,9 @@ func runUpdate(args []string) error {
 			// verify/activate failure.
 			preserveStaging = true
 			writePayload(os.Stderr, payload)
+			if !hasStructuredError(payload) {
+				writeUpdateRecoveryHint(ctx, client, id)
+			}
 			return err
 		}
 		if !validTransactionAcknowledgement(payload, id, step.phase, step.state) {
@@ -234,6 +244,56 @@ func runUpdate(args []string) error {
 		_, _ = os.Stdout.Write([]byte("\n"))
 	}
 	return nil
+}
+
+func errorMayNeedRecovery(payload []byte) bool {
+	if len(payload) == 0 {
+		return true
+	}
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(payload, &envelope) != nil || envelope.Error.Code == "" {
+		return true
+	}
+	return envelope.Error.Code == "state_unverified"
+}
+
+func hasStructuredError(payload []byte) bool {
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	return json.Unmarshal(payload, &envelope) == nil && envelope.Error.Code != ""
+}
+
+func writeUpdateRecoveryHint(ctx context.Context, client deployd.Client, knownID string) {
+	id, phase := knownID, "unknown"
+	if id == "" {
+		statusPayload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
+		if err == nil {
+			var status struct {
+				Value struct {
+					Transactions []struct {
+						ID    string `json:"transaction_id"`
+						Phase string `json:"phase"`
+					} `json:"transactions"`
+				} `json:"value"`
+			}
+			if json.Unmarshal(statusPayload, &status) == nil && len(status.Value.Transactions) == 1 {
+				id, phase = status.Value.Transactions[0].ID, status.Value.Transactions[0].Phase
+			}
+		}
+	}
+	if id == "" {
+		fmt.Fprintln(os.Stderr, `{"code":"deployment_outcome_uncertain","phase":"unknown","recovery_required":true,"next_action":"query_deployd_status"}`)
+		return
+	}
+	encoded, _ := json.Marshal(map[string]any{"code": "deployment_outcome_uncertain", "transaction_id": id, "phase": phase, "recovery_required": true, "next_action": "query_deployd_transaction"})
+	_, _ = os.Stderr.Write(append(encoded, '\n'))
 }
 
 func publicError(err error) string {
