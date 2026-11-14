@@ -259,7 +259,7 @@ func (server *Server) verify(c *gin.Context) {
 	}
 	transaction, err := server.Manager.Verify(c.Request.Context(), value.TransactionID)
 	if err != nil {
-		writeError(c, http.StatusConflict, "verify_rejected", err.Error())
+		writeTransactionError(c, http.StatusConflict, "verify_rejected", err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -274,10 +274,10 @@ func (server *Server) activate(c *gin.Context) {
 	if err != nil {
 		slog.Warn("deployment activation rejected", "transaction_id", value.TransactionID, "error", err)
 		if errors.Is(err, ErrUncertain) {
-			writeError(c, http.StatusConflict, "state_unverified", err.Error())
+			writeTransactionError(c, http.StatusConflict, "state_unverified", err)
 			return
 		}
-		writeError(c, http.StatusConflict, "activate_rejected", err.Error())
+		writeTransactionError(c, http.StatusConflict, "activate_rejected", err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -290,7 +290,7 @@ func (server *Server) rollback(c *gin.Context) {
 	}
 	transaction, err := server.Manager.Rollback(c.Request.Context(), value.TransactionID)
 	if err != nil {
-		writeError(c, http.StatusConflict, "rollback_rejected", err.Error())
+		writeTransactionError(c, http.StatusConflict, "rollback_rejected", err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -304,7 +304,7 @@ func (server *Server) recover(c *gin.Context) {
 	transaction, err := server.Manager.Recover(c.Request.Context(), value.TransactionID, value.Action)
 	if err != nil {
 		slog.Warn("deployment recovery rejected", "transaction_id", value.TransactionID, "action", value.Action, "error", err)
-		writeError(c, http.StatusConflict, "recover_rejected", err.Error())
+		writeTransactionError(c, http.StatusConflict, "recover_rejected", err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))

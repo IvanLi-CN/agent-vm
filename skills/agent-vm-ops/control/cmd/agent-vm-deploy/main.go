@@ -202,16 +202,26 @@ func runUpdate(args []string) error {
 	for _, action := range []string{"verify", "activate"} {
 		payload, _, err = client.Call(ctx, "POST", "/v1/"+action, map[string]any{"transaction_id": id})
 		if err != nil {
+			var envelope struct {
+				Error struct {
+					Code string `json:"code"`
+				} `json:"error"`
+			}
+			_ = json.Unmarshal(payload, &envelope)
+			preserveStaging = len(payload) == 0 || envelope.Error.Code == "state_unverified"
 			writePayload(os.Stderr, payload)
 			return err
 		}
 	}
+	if err := os.RemoveAll(directory); err != nil {
+		preserveStaging = true
+		return errors.New("release staging cleanup failed")
+	}
+	preserveStaging = false
 	_, _ = os.Stdout.Write(payload)
 	if len(payload) == 0 || payload[len(payload)-1] != '\n' {
 		_, _ = os.Stdout.Write([]byte("\n"))
 	}
-	_ = os.RemoveAll(directory)
-	preserveStaging = false
 	return nil
 }
 
