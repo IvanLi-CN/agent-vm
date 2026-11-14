@@ -13,10 +13,26 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
+	"time"
 )
 
 const Repository = "IvanLi-CN/agent-vm"
+const credentialFile = "/etc/agent-vm-native/release-fetch.env"
+
+type Error struct {
+	Code              string `json:"code"`
+	Phase             string `json:"phase"`
+	HTTPStatus        int    `json:"http_status,omitempty"`
+	Retryable         bool   `json:"retryable"`
+	Reason            string `json:"reason"`
+	NextAction        string `json:"next_action"`
+	RequestID         string `json:"request_id,omitempty"`
+	RetryAfterSeconds *int   `json:"retry_after_seconds"`
+}
+
+func (e *Error) Error() string { b, _ := json.Marshal(e); return string(b) }
 
 type release struct {
 	TagName    string `json:"tag_name"`
@@ -57,13 +73,16 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 	}
 	request.Header.Set("Accept", "application/vnd.github+json")
 	request.Header.Set("User-Agent", "agent-vm-deploy")
+	if token := readToken(); token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
 	response, err := client.Do(request)
 	if err != nil {
-		return "", fmt.Errorf("release lookup failed: %w", err)
+		return "", &Error{Code: "release_network_error", Phase: "release_metadata_lookup", Retryable: true, Reason: "transport_error", NextAction: "retry_update"}
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("release lookup returned HTTP %d", response.StatusCode)
+		return "", classify(response)
 	}
 	var value release
 	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&value); err != nil {
@@ -123,6 +142,46 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 		return "", err
 	}
 	return files[assetName], nil
+}
+
+func readToken() string {
+	b, err := os.ReadFile(credentialFile)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.HasPrefix(line, "GITHUB_TOKEN=") {
+			return strings.TrimSpace(strings.TrimPrefix(line, "GITHUB_TOKEN="))
+		}
+	}
+	return ""
+}
+
+func classify(response *http.Response) error {
+	code, reason, next, retryable := "release_access_denied", "access_denied", "configure_release_read_credential", false
+	if response.StatusCode == http.StatusNotFound {
+		code, reason, next = "release_not_found", "release_not_found", "check_version"
+	}
+	if response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusForbidden && response.Header.Get("X-RateLimit-Remaining") == "0" {
+		code, reason, next, retryable = "release_rate_limited", "api_rate_limited", "wait_or_configure_release_read_credential", true
+	}
+	if response.StatusCode >= 500 {
+		code, reason, next, retryable = "release_network_error", "upstream_server_error", "retry_update", true
+	}
+	var retryAfter *int
+	value := response.Header.Get("Retry-After")
+	if value == "" && response.Header.Get("X-RateLimit-Reset") != "" {
+		if epoch, err := strconv.ParseInt(response.Header.Get("X-RateLimit-Reset"), 10, 64); err == nil {
+			seconds := int(time.Until(time.Unix(epoch, 0)).Seconds())
+			if seconds < 0 {
+				seconds = 0
+			}
+			retryAfter = &seconds
+		}
+	} else if seconds, err := strconv.Atoi(value); err == nil {
+		retryAfter = &seconds
+	}
+	return &Error{Code: code, Phase: "release_metadata_lookup", HTTPStatus: response.StatusCode, Retryable: retryable, Reason: reason, NextAction: next, RequestID: response.Header.Get("X-GitHub-Request-Id"), RetryAfterSeconds: retryAfter}
 }
 
 func download(ctx context.Context, client *http.Client, url, path string) error {

@@ -34,6 +34,10 @@ Control-plane publication、update 和 rollback 都是 operator-owned deployment
 首次从 legacy SQLite 部署到蓝绿架构时，`migrate` 只向 Deployd 提交迁移事务，由 Deployd 自动完成排空、停写、快照、导入和验证；
 CLI 不接收 rqlite 地址、数据库路径、SQL 或凭据，也不绕过 Deployd。
 
+`agent-vm-deploy update` 的 release metadata lookup 可以匿名执行，也可以读取目标主机 root-only 的 release read credential。失败响应必须保留 `code`、`phase`、`http_status`、`retryable`、`reason`、`next_action`、`request_id` 和 `retry_after_seconds`；不得输出 token、完整第三方响应或私有部署路径。匿名 API 限流返回 `release_rate_limited`，权限拒绝返回 `release_access_denied`，网络与 5xx 使用有界重试，查询和校验未完成前不得进入 Deployd。
+
+`update` 不得直接替换 slot、复制候选二进制、编辑 `active` 或授予 controller lease。Deployd 接管失败时，CLI 必须报告具体的 process identity、systemd unit、socket link、manifest、active slot、controller lease 或 observation freshness blocker，并保留 transaction/phase 查询入口。
+
 ## 命令
 
 | 命令 | 合同 |

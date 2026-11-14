@@ -136,6 +136,12 @@ func runUpdate(args []string) error {
 	if err != nil {
 		return fmt.Errorf("create release staging directory: %w", err)
 	}
+	keepStaging := false
+	defer func() {
+		if !keepStaging {
+			_ = os.RemoveAll(directory)
+		}
+	}()
 	bundle, err := releasefetch.Fetch(ctx, *version, *source, directory)
 	if err != nil {
 		return err
@@ -187,6 +193,7 @@ func runUpdate(args []string) error {
 	if len(payload) == 0 || payload[len(payload)-1] != '\n' {
 		_, _ = os.Stdout.Write([]byte("\n"))
 	}
+	keepStaging = true
 	return nil
 }
 
