@@ -147,6 +147,8 @@ func runUpdate(args []string) error {
 	if err := os.MkdirAll(stagingRoot, 0o750); err != nil {
 		return fmt.Errorf("create release staging root: %w", err)
 	}
+	client := deployd.Client{Socket: *socket, Timeout: 15 * time.Minute}
+	cleanupOrphanStaging(ctx, client, stagingRoot)
 	directory, err := os.MkdirTemp(stagingRoot, ".update-")
 	if err != nil {
 		return fmt.Errorf("create release staging directory: %w", err)
@@ -161,7 +163,6 @@ func runUpdate(args []string) error {
 	if err != nil {
 		return err
 	}
-	client := deployd.Client{Socket: *socket, Timeout: 15 * time.Minute}
 	statusPayload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
 	if err != nil {
 		// statusPayload is intentionally bounded by deployd.Client and preserves
@@ -249,6 +250,53 @@ func runUpdate(args []string) error {
 		_, _ = os.Stdout.Write([]byte("\n"))
 	}
 	return nil
+}
+
+const orphanStagingAge = 24 * time.Hour
+
+func cleanupOrphanStaging(ctx context.Context, client deployd.Client, root string) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	statusPayload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
+	if err != nil {
+		return
+	}
+	var status struct {
+		OK    bool `json:"ok"`
+		Value struct {
+			Transactions []struct {
+				StagingID string `json:"staging_id"`
+			} `json:"transactions"`
+		} `json:"value"`
+	}
+	if json.Unmarshal(statusPayload, &status) != nil || !status.OK {
+		return
+	}
+	protected := make(map[string]struct{}, len(status.Value.Transactions))
+	for _, transaction := range status.Value.Transactions {
+		if transaction.StagingID == "" {
+			// A legacy active transaction cannot be safely matched to a local
+			// directory, so skip the entire reap pass.
+			return
+		}
+		protected[transaction.StagingID] = struct{}{}
+	}
+	now := time.Now()
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".update-") {
+			continue
+		}
+		if _, ok := protected[entry.Name()]; ok {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || now.Sub(info.ModTime()) < orphanStagingAge {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(root, entry.Name()))
+	}
 }
 
 func errorMayNeedRecovery(payload []byte) bool {

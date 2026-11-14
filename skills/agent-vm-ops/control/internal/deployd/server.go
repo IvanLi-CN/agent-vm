@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -445,7 +446,19 @@ func publicTransaction(transaction store.Transaction) map[string]any {
 		"error_message":     publicErrorMessage(transaction.ErrorCode, transaction.ErrorMessage),
 		"created_at":        transaction.CreatedAt,
 		"updated_at":        transaction.UpdatedAt,
+		"staging_id":        transactionStagingID(transaction.Bundle),
 	}
+}
+
+func transactionStagingID(bundle string) string {
+	if bundle == "" {
+		return ""
+	}
+	directory := filepath.Base(filepath.Dir(bundle))
+	if strings.HasPrefix(directory, ".update-") {
+		return directory
+	}
+	return ""
 }
 
 func ServeUDS(ctx context.Context, socket string, handler http.Handler) error {
