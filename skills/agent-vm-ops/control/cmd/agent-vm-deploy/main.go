@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
@@ -20,7 +21,7 @@ var version = "agent-vm-deploy/dev"
 
 func main() {
 	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, publicError(err))
 		os.Exit(1)
 	}
 }
@@ -218,15 +219,26 @@ func runUpdate(args []string) error {
 		}
 	}
 	if err := os.RemoveAll(directory); err != nil {
-		preserveStaging = true
-		return errors.New("release staging cleanup failed")
+		// The Deployd transaction is already finalized. Keep the successful
+		// acknowledgement as the command result and surface cleanup separately.
+		fmt.Fprintln(os.Stderr, `{"code":"release_staging_cleanup_failed","phase":"staging_cleanup","retryable":true,"reason":"staging_cleanup_failed","next_action":"remove_staging_after_verification"}`)
 	}
-	preserveStaging = false
+	if _, statErr := os.Stat(directory); os.IsNotExist(statErr) {
+		preserveStaging = false
+	}
 	_, _ = os.Stdout.Write(payload)
 	if len(payload) == 0 || payload[len(payload)-1] != '\n' {
 		_, _ = os.Stdout.Write([]byte("\n"))
 	}
 	return nil
+}
+
+func publicError(err error) string {
+	value := err.Error()
+	for _, path := range []string{"/var/lib/agent-vm-native", "/run/agent-vm-native", "/etc/agent-vm-native"} {
+		value = strings.ReplaceAll(value, path, "<private-path>")
+	}
+	return value
 }
 
 func validTransactionAcknowledgement(payload []byte, expectedID string) bool {
