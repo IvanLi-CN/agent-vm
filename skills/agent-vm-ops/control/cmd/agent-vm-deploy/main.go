@@ -140,9 +140,9 @@ func runUpdate(args []string) error {
 	if err != nil {
 		return fmt.Errorf("create release staging directory: %w", err)
 	}
-	stageAttempted := false
+	preserveStaging := false
 	defer func() {
-		if !stageAttempted {
+		if !preserveStaging {
 			_ = os.RemoveAll(directory)
 		}
 	}()
@@ -153,6 +153,9 @@ func runUpdate(args []string) error {
 	client := deployd.Client{Socket: *socket, Timeout: 15 * time.Minute}
 	statusPayload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
 	if err != nil {
+		// statusPayload is intentionally bounded by deployd.Client and preserves
+		// the structured blocker for operators.
+		writePayload(os.Stderr, statusPayload)
 		return err
 	}
 	var status struct {
@@ -174,19 +177,28 @@ func runUpdate(args []string) error {
 			ID string `json:"transaction_id"`
 		} `json:"value"`
 	}
-	stageAttempted = true
 	payload, _, err := client.Call(ctx, "POST", "/v1/stage", map[string]any{"target_slot": targetSlot, "bundle": filepath.Clean(bundle)})
 	if err != nil {
+		var envelope struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(payload, &envelope)
+		preserveStaging = len(payload) == 0 || envelope.Error.Code == "state_unverified"
 		writePayload(os.Stderr, payload)
 		return err
 	}
 	if err := json.Unmarshal(payload, &result); err != nil {
+		preserveStaging = true
 		return fmt.Errorf("stage response invalid: %w", err)
 	}
 	id := result.Value.ID
 	if id == "" {
+		preserveStaging = true
 		return errors.New("stage response missing transaction ID")
 	}
+	preserveStaging = true
 	for _, action := range []string{"verify", "activate"} {
 		payload, _, err = client.Call(ctx, "POST", "/v1/"+action, map[string]any{"transaction_id": id})
 		if err != nil {
@@ -199,6 +211,7 @@ func runUpdate(args []string) error {
 		_, _ = os.Stdout.Write([]byte("\n"))
 	}
 	_ = os.RemoveAll(directory)
+	preserveStaging = false
 	return nil
 }
 

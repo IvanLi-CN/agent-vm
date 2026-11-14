@@ -316,6 +316,7 @@ func download(ctx context.Context, client *http.Client, url, path, token string)
 			return validationError("release_asset_request_invalid", "asset_download", "asset_request_creation_failed", "inspect_release")
 		}
 		req.Header.Set("User-Agent", "agent-vm-deploy")
+		req.Header.Set("Accept", "application/octet-stream")
 		if token != "" {
 			req.Header.Set("Authorization", "Bearer "+token)
 		}

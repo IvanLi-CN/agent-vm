@@ -243,7 +243,7 @@ func (server *Server) stage(c *gin.Context) {
 	transaction, err := server.Manager.Stage(c.Request.Context(), value.TargetSlot, value.Bundle)
 	if err != nil {
 		if errors.Is(err, ErrUncertain) {
-			writeError(c, http.StatusConflict, "state_unverified", err.Error())
+			writeTransactionError(c, http.StatusConflict, "state_unverified", err)
 			return
 		}
 		writeError(c, http.StatusConflict, "stage_rejected", err.Error())
@@ -350,6 +350,17 @@ func writeOK(c *gin.Context, value any) {
 
 func writeError(c *gin.Context, status int, code, message string) {
 	c.JSON(status, map[string]any{"ok": false, "error": map[string]any{"code": code, "message": publicErrorMessage(code, message)}})
+}
+
+func writeTransactionError(c *gin.Context, status int, code string, cause error) {
+	detail := map[string]any{"code": code, "message": publicErrorMessage(code, cause.Error())}
+	var transactionErr *TransactionError
+	if errors.As(cause, &transactionErr) {
+		detail["transaction_id"] = transactionErr.ID
+		detail["phase"] = transactionErr.Phase
+		detail["recovery_required"] = code == "state_unverified"
+	}
+	c.JSON(status, map[string]any{"ok": false, "error": detail})
 }
 
 func writeMigrationError(c *gin.Context, status int, code string, cause error) {

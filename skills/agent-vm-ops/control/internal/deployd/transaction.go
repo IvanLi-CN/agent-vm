@@ -34,6 +34,26 @@ const (
 
 var ErrUncertain = errors.New("deployment outcome is uncertain")
 
+type TransactionError struct {
+	ID    string
+	Phase string
+	Cause error
+}
+
+func (err *TransactionError) Error() string {
+	if err == nil || err.Cause == nil {
+		return "deployment transaction failed"
+	}
+	return err.Cause.Error()
+}
+
+func (err *TransactionError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Cause
+}
+
 type UncertainError struct{ Cause error }
 
 func (err *UncertainError) Error() string {
@@ -1074,7 +1094,7 @@ func (manager *Manager) failure(ctx context.Context, id, phase string, cause err
 	if err := manager.Store.RecordFailure(ctx, id, phase, code, "deployd", hex.EncodeToString(digest[:]), payload, manager.Clock().UTC()); err != nil {
 		return fmt.Errorf("%w; record deployment failure: %v", cause, err)
 	}
-	return cause
+	return &TransactionError{ID: id, Phase: phase, Cause: cause}
 }
 
 func sanitizedFailureCause(cause error) string {
