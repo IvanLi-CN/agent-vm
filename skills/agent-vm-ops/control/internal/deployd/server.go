@@ -368,6 +368,9 @@ func writeTransactionError(c *gin.Context, status int, code string, cause error)
 	detail := map[string]any{"code": code, "message": publicErrorMessage(code, cause.Error())}
 	var transactionErr *TransactionError
 	if errors.As(cause, &transactionErr) {
+		if transactionErr.Phase == PhaseRollback {
+			code = "state_unverified"
+		}
 		detail["transaction_id"] = transactionErr.ID
 		detail["phase"] = transactionErr.Phase
 		detail["recovery_required"] = code == "state_unverified"

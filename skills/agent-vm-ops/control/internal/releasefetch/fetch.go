@@ -26,12 +26,14 @@ const credentialFile = "/etc/agent-vm-native/release-fetch.env"
 type Error struct {
 	Code              string `json:"code"`
 	Phase             string `json:"phase"`
-	HTTPStatus        int    `json:"http_status,omitempty"`
+	HTTPStatus        int    `json:"http_status"`
 	Retryable         bool   `json:"retryable"`
 	Reason            string `json:"reason"`
 	NextAction        string `json:"next_action"`
-	RequestID         string `json:"request_id,omitempty"`
+	RequestID         string `json:"request_id"`
 	RetryAfterSeconds *int   `json:"retry_after_seconds"`
+	AvailableBytes    int64  `json:"available_bytes"`
+	RequiredBytes     int64  `json:"required_bytes"`
 }
 
 func (e *Error) Error() string { b, _ := json.Marshal(e); return string(b) }
@@ -102,13 +104,19 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 	if err := os.MkdirAll(directory, 0o750); err != nil {
 		return "", validationError("release_staging_unavailable", "staging_prepare", "staging_directory_unavailable", "check_target_storage")
 	}
-	var required int64 = 3*256<<20 + 64<<20
+	var required int64 = 64 << 20
 	for _, name := range []string{assetName, "release-provenance.json", "SHA256SUMS"} {
-		if sizes[name] < 0 || sizes[name] > 256<<20 {
+		limit := int64(1 << 20)
+		if name == assetName {
+			limit = 128 << 20
+		}
+		if sizes[name] < 0 || sizes[name] > limit {
 			return "", validationError("release_asset_too_large", "release_metadata_validation", "asset_size_invalid", "inspect_release")
 		}
-		if sizes[name] > 0 && sizes[name]+64<<20 > required {
-			required = sizes[name] + 64<<20
+		if sizes[name] > 0 {
+			required += sizes[name]
+		} else {
+			required += limit
 		}
 	}
 	if err := checkCapacity(directory, required); err != nil {
@@ -263,7 +271,10 @@ func checkCapacity(directory string, required int64) error {
 	}
 	available := uint64(stat.Bavail) * uint64(stat.Bsize)
 	if required > 0 && available < uint64(required) {
-		return validationError("staging_capacity_low", "staging_prepare", "insufficient_staging_capacity", "free_target_storage")
+		err := validationError("staging_capacity_low", "staging_preflight", "insufficient_staging_capacity", "free_target_storage").(*Error)
+		err.AvailableBytes = int64(available)
+		err.RequiredBytes = required
+		return err
 	}
 	return nil
 }
@@ -355,7 +366,7 @@ func download(ctx context.Context, client *http.Client, url, path, token string)
 			res.Body.Close()
 			return validationError("release_staging_unavailable", "asset_download", "staging_file_unavailable", "check_target_storage")
 		}
-		limited := io.LimitReader(res.Body, 256<<20+1)
+		limited := io.LimitReader(res.Body, 128<<20+1)
 		written, copyErr := io.Copy(file, limited)
 		closeErr := file.Close()
 		res.Body.Close()
@@ -369,7 +380,7 @@ func download(ctx context.Context, client *http.Client, url, path, token string)
 			}
 			return &Error{Code: "release_network_error", Phase: "asset_download", Retryable: true, Reason: "asset_read_failed", NextAction: "retry_update"}
 		}
-		if written > 256<<20 {
+		if written > 128<<20 {
 			return validationError("release_asset_too_large", "asset_download", "asset_exceeds_size_limit", "inspect_release")
 		}
 		return nil

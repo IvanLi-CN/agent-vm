@@ -200,8 +200,11 @@ func runUpdate(args []string) error {
 		return errors.New("stage response missing transaction ID")
 	}
 	preserveStaging = true
-	for _, action := range []string{"verify", "activate"} {
-		payload, _, err = client.Call(ctx, "POST", "/v1/"+action, map[string]any{"transaction_id": id})
+	for _, step := range []struct{ action, phase, state string }{
+		{action: "verify", phase: "controller_handoff", state: "active"},
+		{action: "activate", phase: "finalize", state: "finalized"},
+	} {
+		payload, _, err = client.Call(ctx, "POST", "/v1/"+step.action, map[string]any{"transaction_id": id})
 		if err != nil {
 			var envelope struct {
 				Error struct {
@@ -213,7 +216,7 @@ func runUpdate(args []string) error {
 			writePayload(os.Stderr, payload)
 			return err
 		}
-		if !validTransactionAcknowledgement(payload, id) {
+		if !validTransactionAcknowledgement(payload, id, step.phase, step.state) {
 			preserveStaging = true
 			return errors.New("deployd acknowledgement is incomplete")
 		}
@@ -241,7 +244,7 @@ func publicError(err error) string {
 	return value
 }
 
-func validTransactionAcknowledgement(payload []byte, expectedID string) bool {
+func validTransactionAcknowledgement(payload []byte, expectedID, expectedPhase, expectedState string) bool {
 	var response struct {
 		OK    bool `json:"ok"`
 		Value struct {
@@ -253,7 +256,7 @@ func validTransactionAcknowledgement(payload []byte, expectedID string) bool {
 	if json.Unmarshal(payload, &response) != nil {
 		return false
 	}
-	return response.OK && response.Value.ID == expectedID && response.Value.Phase != "" && response.Value.State != ""
+	return response.OK && response.Value.ID == expectedID && response.Value.Phase == expectedPhase && response.Value.State == expectedState
 }
 
 func writePayload(out *os.File, payload []byte) {
