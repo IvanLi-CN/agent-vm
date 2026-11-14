@@ -15,6 +15,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -42,6 +43,7 @@ type release struct {
 	Assets     []struct {
 		Name string `json:"name"`
 		URL  string `json:"browser_download_url"`
+		Size int64  `json:"size"`
 	} `json:"assets"`
 }
 
@@ -67,46 +69,43 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 	}
 	assetName := fmt.Sprintf("agent-vm-%s-linux-%s.tar", version, arch)
 	client := &http.Client{}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/"+Repository+"/releases/tags/v"+version, nil)
+	response, err := metadata(ctx, client, version)
 	if err != nil {
 		return "", err
 	}
-	request.Header.Set("Accept", "application/vnd.github+json")
-	request.Header.Set("User-Agent", "agent-vm-deploy")
-	if token := readToken(); token != "" {
-		request.Header.Set("Authorization", "Bearer "+token)
-	}
-	response, err := client.Do(request)
-	if err != nil {
-		return "", &Error{Code: "release_network_error", Phase: "release_metadata_lookup", Retryable: true, Reason: "transport_error", NextAction: "retry_update"}
-	}
 	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return "", classify(response)
-	}
 	var value release
 	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&value); err != nil {
-		return "", fmt.Errorf("release metadata invalid: %w", err)
+		return "", validationError("release_metadata_invalid", "release_metadata_lookup", "metadata_json_invalid", "check_release_endpoint")
 	}
 	if value.TagName != "v"+version || value.Draft || value.Prerelease || !value.Immutable {
-		return "", errors.New("release is not a published immutable candidate")
+		return "", validationError("release_not_immutable", "release_metadata_validation", "release_is_not_published_immutable", "check_version")
 	}
 	urls := map[string]string{}
+	sizes := map[string]int64{}
 	for _, asset := range value.Assets {
 		urls[asset.Name] = asset.URL
+		sizes[asset.Name] = asset.Size
 	}
 	for _, name := range []string{assetName, "release-provenance.json", "SHA256SUMS"} {
 		if urls[name] == "" {
-			return "", fmt.Errorf("release asset missing: %s", name)
+			return "", validationError("release_asset_missing", "release_metadata_validation", "required_asset_missing", "check_release_assets")
 		}
 	}
 	if err := os.MkdirAll(directory, 0o750); err != nil {
+		return "", validationError("release_staging_unavailable", "staging_prepare", "staging_directory_unavailable", "check_target_storage")
+	}
+	var required int64 = 64 << 20
+	for _, name := range []string{assetName, "release-provenance.json", "SHA256SUMS"} {
+		required += sizes[name]
+	}
+	if err := checkCapacity(directory, required); err != nil {
 		return "", err
 	}
 	files := map[string]string{}
 	for _, name := range []string{assetName, "release-provenance.json", "SHA256SUMS"} {
 		path := filepath.Join(directory, name)
-		if err := download(ctx, client, urls[name], path); err != nil {
+		if err := download(ctx, client, urls[name], path, readToken()); err != nil {
 			return "", err
 		}
 		files[name] = path
@@ -114,7 +113,7 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 	var proof provenance
 	proofFile, err := os.Open(files["release-provenance.json"])
 	if err != nil {
-		return "", err
+		return "", validationError("release_provenance_invalid", "release_validation", "provenance_json_invalid", "inspect_release")
 	}
 	err = json.NewDecoder(proofFile).Decode(&proof)
 	proofFile.Close()
@@ -123,7 +122,7 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 	}
 	sums, err := os.ReadFile(files["SHA256SUMS"])
 	if err != nil {
-		return "", fmt.Errorf("release checksums unreadable: %w", err)
+		return "", validationError("release_checksums_invalid", "release_validation", "checksums_unreadable", "inspect_release")
 	}
 	checksum := strings.Fields(string(sums))
 	checksumFound := false
@@ -133,18 +132,25 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 		}
 	}
 	if !checksumFound {
-		return "", errors.New("release checksum does not match requested asset")
+		return "", validationError("release_checksum_mismatch", "release_validation", "requested_asset_checksum_mismatch", "inspect_release")
 	}
 	if proof.Version != version || proof.SourceRevision != sourceRevision || proof.Packages[assetName] != digest(files[assetName]) {
-		return "", errors.New("release provenance does not match requested candidate")
+		return "", validationError("release_provenance_mismatch", "release_validation", "provenance_does_not_match_candidate", "inspect_release")
 	}
 	if err := verifyTarget(files[assetName], runtime.GOOS, arch, sourceRevision); err != nil {
-		return "", err
+		return "", validationError("release_manifest_invalid", "release_validation", "manifest_target_or_source_mismatch", "inspect_release")
 	}
 	return files[assetName], nil
 }
 
 func readToken() string {
+	info, err := os.Lstat(credentialFile)
+	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return ""
+	}
+	if stat, ok := info.Sys().(*syscall.Stat_t); !ok || stat.Uid != 0 {
+		return ""
+	}
 	b, err := os.ReadFile(credentialFile)
 	if err != nil {
 		return ""
@@ -155,6 +161,87 @@ func readToken() string {
 		}
 	}
 	return ""
+}
+
+func metadata(ctx context.Context, client *http.Client, version string) (*http.Response, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/"+Repository+"/releases/tags/v"+version, nil)
+		if err != nil {
+			return nil, validationError("release_network_error", "release_metadata_lookup", "request_creation_failed", "retry_update")
+		}
+		request.Header.Set("Accept", "application/vnd.github+json")
+		request.Header.Set("User-Agent", "agent-vm-deploy")
+		if token := readToken(); token != "" {
+			request.Header.Set("Authorization", "Bearer "+token)
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			if attempt == 2 {
+				return nil, validationError("release_network_error", "release_metadata_lookup", "transport_error", "retry_update")
+			}
+			if err := retryDelay(ctx, time.Second*time.Duration(attempt+1)); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if response.StatusCode == http.StatusOK {
+			return response, nil
+		}
+		classified := classify(response)
+		if !isRetryable(classified) || attempt == 2 {
+			response.Body.Close()
+			return nil, classified
+		}
+		response.Body.Close()
+		if err := retryDelay(ctx, retryAfter(classified, time.Second*time.Duration(attempt+1))); err != nil {
+			return nil, err
+		}
+	}
+	return nil, validationError("release_network_error", "release_metadata_lookup", "retry_exhausted", "retry_update")
+}
+
+func validationError(code, phase, reason, next string) error {
+	return &Error{Code: code, Phase: phase, Retryable: false, Reason: reason, NextAction: next}
+}
+
+func isRetryable(err error) bool {
+	value, ok := err.(*Error)
+	return ok && value.Retryable
+}
+
+func retryAfter(err error, fallback time.Duration) time.Duration {
+	value, ok := err.(*Error)
+	if !ok || value.RetryAfterSeconds == nil {
+		return fallback
+	}
+	seconds := *value.RetryAfterSeconds
+	if seconds > 60 {
+		seconds = 60
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func retryDelay(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func checkCapacity(directory string, required int64) error {
+	var stat syscall.Statfs_t
+	if err := syscall.Statfs(directory, &stat); err != nil {
+		return validationError("staging_capacity_unknown", "staging_prepare", "staging_capacity_unavailable", "check_target_storage")
+	}
+	available := uint64(stat.Bavail) * uint64(stat.Bsize)
+	if required > 0 && available < uint64(required) {
+		return validationError("staging_capacity_low", "staging_prepare", "insufficient_staging_capacity", "free_target_storage")
+	}
+	return nil
 }
 
 func classify(response *http.Response) error {
@@ -184,30 +271,59 @@ func classify(response *http.Response) error {
 	return &Error{Code: code, Phase: "release_metadata_lookup", HTTPStatus: response.StatusCode, Retryable: retryable, Reason: reason, NextAction: next, RequestID: response.Header.Get("X-GitHub-Request-Id"), RetryAfterSeconds: retryAfter}
 }
 
-func download(ctx context.Context, client *http.Client, url, path string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
+func download(ctx context.Context, client *http.Client, url, path, token string) error {
+	for attempt := 0; attempt < 3; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return validationError("release_asset_request_invalid", "asset_download", "asset_request_creation_failed", "inspect_release")
+		}
+		req.Header.Set("User-Agent", "agent-vm-deploy")
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		res, err := client.Do(req)
+		if err != nil {
+			if attempt == 2 {
+				return validationError("release_network_error", "asset_download", "asset_transport_error", "retry_update")
+			}
+			if err := retryDelay(ctx, time.Second*time.Duration(attempt+1)); err != nil {
+				return err
+			}
+			continue
+		}
+		if res.StatusCode != http.StatusOK {
+			classified := classify(res)
+			classifiedValue, _ := classified.(*Error)
+			res.Body.Close()
+			if classifiedValue != nil {
+				classifiedValue.Phase = "asset_download"
+			}
+			if !isRetryable(classified) || attempt == 2 {
+				return classified
+			}
+			if err := retryDelay(ctx, retryAfter(classified, time.Second*time.Duration(attempt+1))); err != nil {
+				return err
+			}
+			continue
+		}
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+		if err != nil {
+			res.Body.Close()
+			return validationError("release_staging_unavailable", "asset_download", "staging_file_unavailable", "check_target_storage")
+		}
+		limited := io.LimitReader(res.Body, 256<<20+1)
+		written, copyErr := io.Copy(file, limited)
+		closeErr := file.Close()
+		res.Body.Close()
+		if copyErr != nil || closeErr != nil {
+			return validationError("release_asset_truncated", "asset_download", "asset_read_failed", "retry_update")
+		}
+		if written > 256<<20 {
+			return validationError("release_asset_too_large", "asset_download", "asset_exceeds_size_limit", "inspect_release")
+		}
+		return nil
 	}
-	req.Header.Set("User-Agent", "agent-vm-deploy")
-	res, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("asset download failed: %w", err)
-	}
-	defer res.Body.Close()
-	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("asset download returned HTTP %d", res.StatusCode)
-	}
-	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
-	if err != nil {
-		return err
-	}
-	_, copyErr := io.Copy(file, io.LimitReader(res.Body, 256<<20))
-	closeErr := file.Close()
-	if copyErr != nil {
-		return copyErr
-	}
-	return closeErr
+	return validationError("release_network_error", "asset_download", "retry_exhausted", "retry_update")
 }
 func digest(path string) string {
 	file, err := os.Open(path)

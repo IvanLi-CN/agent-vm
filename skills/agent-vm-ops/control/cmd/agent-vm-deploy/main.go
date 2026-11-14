@@ -132,13 +132,18 @@ func runUpdate(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	directory, err := os.MkdirTemp("/var/lib/agent-vm-native/release-staging", ".update-")
+	const stagingRoot = "/var/lib/agent-vm-native/release-staging"
+	if err := os.MkdirAll(stagingRoot, 0o750); err != nil {
+		return fmt.Errorf("create release staging root: %w", err)
+	}
+	directory, err := os.MkdirTemp(stagingRoot, ".update-")
 	if err != nil {
 		return fmt.Errorf("create release staging directory: %w", err)
 	}
+	transactionStarted := false
 	keepStaging := false
 	defer func() {
-		if !keepStaging {
+		if !keepStaging && !transactionStarted {
 			_ = os.RemoveAll(directory)
 		}
 	}()
@@ -167,25 +172,26 @@ func runUpdate(args []string) error {
 	}
 	var result struct {
 		Value struct {
-			Transaction struct {
-				ID string `json:"transaction_id"`
-			} `json:"transaction"`
+			ID string `json:"transaction_id"`
 		} `json:"value"`
 	}
 	payload, _, err := client.Call(ctx, "POST", "/v1/stage", map[string]any{"target_slot": targetSlot, "bundle": filepath.Clean(bundle)})
 	if err != nil {
+		writePayload(os.Stderr, payload)
 		return err
 	}
 	if err := json.Unmarshal(payload, &result); err != nil {
 		return fmt.Errorf("stage response invalid: %w", err)
 	}
-	id := result.Value.Transaction.ID
+	id := result.Value.ID
 	if id == "" {
 		return errors.New("stage response missing transaction ID")
 	}
+	transactionStarted = true
 	for _, action := range []string{"verify", "activate"} {
 		payload, _, err = client.Call(ctx, "POST", "/v1/"+action, map[string]any{"transaction_id": id})
 		if err != nil {
+			writePayload(os.Stderr, payload)
 			return err
 		}
 	}
@@ -195,6 +201,16 @@ func runUpdate(args []string) error {
 	}
 	keepStaging = true
 	return nil
+}
+
+func writePayload(out *os.File, payload []byte) {
+	if len(payload) == 0 {
+		return
+	}
+	_, _ = out.Write(payload)
+	if payload[len(payload)-1] != '\n' {
+		_, _ = out.Write([]byte("\n"))
+	}
 }
 
 func runInstall(args []string) error {
