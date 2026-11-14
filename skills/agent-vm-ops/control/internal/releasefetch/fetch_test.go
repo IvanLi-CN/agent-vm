@@ -47,6 +47,7 @@ func TestClassifyStableErrorEnvelope(t *testing.T) {
 		{name: "unauthorized", status: http.StatusUnauthorized, code: "release_access_denied", nextAction: "configure_release_read_credential"},
 		{name: "forbidden", status: http.StatusForbidden, header: http.Header{"X-RateLimit-Remaining": []string{"12"}}, code: "release_access_denied", nextAction: "configure_release_read_credential"},
 		{name: "too many requests", status: http.StatusTooManyRequests, header: http.Header{"Retry-After": []string{"7"}}, code: "release_rate_limited", retryable: true, nextAction: "wait_or_configure_release_read_credential"},
+		{name: "rate limit without wait", status: http.StatusTooManyRequests, code: "release_rate_limited", retryable: false, nextAction: "wait_or_configure_release_read_credential"},
 		{name: "upstream", status: http.StatusBadGateway, code: "release_network_error", retryable: true, nextAction: "retry_update"},
 	}
 	for _, tc := range cases {
@@ -100,7 +101,7 @@ func TestDownloadUsesBoundedAuthenticatedAssetRequest(t *testing.T) {
 	defer server.Close()
 
 	path := filepath.Join(t.TempDir(), "bundle.tar")
-	if err := download(context.Background(), server.Client(), server.URL, path, "test-token"); err != nil {
+	if err := download(context.Background(), server.Client(), server.URL, path, "test-token", 1<<20); err != nil {
 		t.Fatalf("download: %v", err)
 	}
 	content, err := os.ReadFile(path)

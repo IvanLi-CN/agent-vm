@@ -1092,7 +1092,10 @@ func (manager *Manager) failure(ctx context.Context, id, phase string, cause err
 	encoded, _ := json.Marshal(payload)
 	digest := sha256.Sum256(encoded)
 	if err := manager.Store.RecordFailure(ctx, id, phase, code, "deployd", hex.EncodeToString(digest[:]), payload, manager.Clock().UTC()); err != nil {
-		return fmt.Errorf("%w; record deployment failure: %v", cause, err)
+		// Preserve the transaction identity even when durable failure evidence
+		// itself cannot be written. The caller must still have a recovery query
+		// handle and must fail closed.
+		return &TransactionError{ID: id, Phase: phase, Cause: fmt.Errorf("%w; record deployment failure: %v", cause, err)}
 	}
 	return &TransactionError{ID: id, Phase: phase, Cause: cause}
 }

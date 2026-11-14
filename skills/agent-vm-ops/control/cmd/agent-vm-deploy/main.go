@@ -14,6 +14,7 @@ import (
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/install"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/releasefetch"
 )
 
@@ -133,6 +134,11 @@ func runUpdate(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
+	updateLock, err := native.AcquireLock("/run/agent-vm-native/release-update.lock", true, true)
+	if err != nil {
+		return errors.New("another release update is already in progress")
+	}
+	defer updateLock.Close()
 	const stagingRoot = "/var/lib/agent-vm-native/release-staging"
 	if err := os.MkdirAll(stagingRoot, 0o750); err != nil {
 		return fmt.Errorf("create release staging root: %w", err)
@@ -180,13 +186,10 @@ func runUpdate(args []string) error {
 	}
 	payload, _, err := client.Call(ctx, "POST", "/v1/stage", map[string]any{"target_slot": targetSlot, "bundle": filepath.Clean(bundle)})
 	if err != nil {
-		var envelope struct {
-			Error struct {
-				Code string `json:"code"`
-			} `json:"error"`
-		}
-		_ = json.Unmarshal(payload, &envelope)
-		preserveStaging = len(payload) == 0 || envelope.Error.Code == "state_unverified"
+		// Any failed transaction call may have crossed the native-effect barrier;
+		// retain the candidate until the transaction is queried and explicitly
+		// recovered, even when the response is malformed or incomplete.
+		preserveStaging = true
 		writePayload(os.Stderr, payload)
 		return err
 	}
@@ -195,9 +198,9 @@ func runUpdate(args []string) error {
 		return fmt.Errorf("stage response invalid: %w", err)
 	}
 	id := result.Value.ID
-	if id == "" {
+	if id == "" || !validTransactionAcknowledgement(payload, id, "standby_validation", "active") {
 		preserveStaging = true
-		return errors.New("stage response missing transaction ID")
+		return errors.New("stage acknowledgement is incomplete")
 	}
 	preserveStaging = true
 	for _, step := range []struct{ action, phase, state string }{
@@ -206,13 +209,10 @@ func runUpdate(args []string) error {
 	} {
 		payload, _, err = client.Call(ctx, "POST", "/v1/"+step.action, map[string]any{"transaction_id": id})
 		if err != nil {
-			var envelope struct {
-				Error struct {
-					Code string `json:"code"`
-				} `json:"error"`
-			}
-			_ = json.Unmarshal(payload, &envelope)
-			preserveStaging = len(payload) == 0 || envelope.Error.Code == "state_unverified"
+			// A non-empty error payload is not proof that the operation did not
+			// take effect. Keep the bundle for transaction recovery on every
+			// verify/activate failure.
+			preserveStaging = true
 			writePayload(os.Stderr, payload)
 			return err
 		}

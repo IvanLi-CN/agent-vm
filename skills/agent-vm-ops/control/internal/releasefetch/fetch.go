@@ -125,7 +125,11 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 	files := map[string]string{}
 	for _, name := range []string{assetName, "release-provenance.json", "SHA256SUMS"} {
 		path := filepath.Join(directory, name)
-		if err := download(ctx, client, urls[name], path, readToken()); err != nil {
+		limit := int64(1 << 20)
+		if name == assetName {
+			limit = 128 << 20
+		}
+		if err := download(ctx, client, urls[name], path, readToken(), limit); err != nil {
 			return "", err
 		}
 		files[name] = path
@@ -289,7 +293,7 @@ func classify(response *http.Response) error {
 		code, reason, next = "release_not_found", "release_not_found", "check_version"
 	}
 	if response.StatusCode == http.StatusTooManyRequests || response.StatusCode == http.StatusForbidden && (response.Header.Get("X-RateLimit-Remaining") == "0" || response.Header.Get("Retry-After") != "") {
-		code, reason, next, retryable = "release_rate_limited", "api_rate_limited", "wait_or_configure_release_read_credential", true
+		code, reason, next = "release_rate_limited", "api_rate_limited", "wait_or_configure_release_read_credential"
 	}
 	if response.StatusCode >= 500 {
 		code, reason, next, retryable = "release_network_error", "upstream_server_error", "retry_update", true
@@ -313,6 +317,9 @@ func classify(response *http.Response) error {
 		}
 		retryAfter = &seconds
 	}
+	if code == "release_rate_limited" && retryAfter != nil {
+		retryable = true
+	}
 	return &Error{Code: code, Phase: "release_metadata_lookup", HTTPStatus: response.StatusCode, Retryable: retryable, Reason: reason, NextAction: next, RequestID: response.Header.Get("X-GitHub-Request-Id"), RetryAfterSeconds: retryAfter}
 }
 
@@ -324,7 +331,10 @@ func validateAssetURL(raw string) error {
 	return nil
 }
 
-func download(ctx context.Context, client *http.Client, url, path, token string) error {
+func download(ctx context.Context, client *http.Client, url, path, token string, maxBytes int64) error {
+	if maxBytes <= 0 {
+		return validationError("release_asset_too_large", "asset_download", "asset_size_limit_invalid", "inspect_release")
+	}
 	for attempt := 0; attempt < 3; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
@@ -370,7 +380,7 @@ func download(ctx context.Context, client *http.Client, url, path, token string)
 			res.Body.Close()
 			return validationError("release_staging_unavailable", "asset_download", "staging_file_unavailable", "check_target_storage")
 		}
-		limited := io.LimitReader(res.Body, 128<<20+1)
+		limited := io.LimitReader(res.Body, maxBytes+1)
 		written, copyErr := io.Copy(file, limited)
 		closeErr := file.Close()
 		res.Body.Close()
@@ -384,7 +394,7 @@ func download(ctx context.Context, client *http.Client, url, path, token string)
 			}
 			return &Error{Code: "release_network_error", Phase: "asset_download", Retryable: true, Reason: "asset_read_failed", NextAction: "retry_update"}
 		}
-		if written > 128<<20 {
+		if written > maxBytes {
 			return validationError("release_asset_too_large", "asset_download", "asset_exceeds_size_limit", "inspect_release")
 		}
 		return nil
