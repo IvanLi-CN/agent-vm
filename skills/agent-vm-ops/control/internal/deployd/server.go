@@ -263,7 +263,7 @@ func (server *Server) verify(c *gin.Context) {
 		if errors.Is(err, ErrUncertain) {
 			code = "state_unverified"
 		}
-		writeTransactionError(c, http.StatusConflict, code, err)
+		writeTransactionErrorForID(c, http.StatusConflict, code, value.TransactionID, err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -278,10 +278,10 @@ func (server *Server) activate(c *gin.Context) {
 	if err != nil {
 		slog.Warn("deployment activation rejected", "transaction_id", value.TransactionID, "error", err)
 		if errors.Is(err, ErrUncertain) {
-			writeTransactionError(c, http.StatusConflict, "state_unverified", err)
+			writeTransactionErrorForID(c, http.StatusConflict, "state_unverified", value.TransactionID, err)
 			return
 		}
-		writeTransactionError(c, http.StatusConflict, "activate_rejected", err)
+		writeTransactionErrorForID(c, http.StatusConflict, "activate_rejected", value.TransactionID, err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -298,7 +298,7 @@ func (server *Server) rollback(c *gin.Context) {
 		if errors.Is(err, ErrUncertain) {
 			code = "state_unverified"
 		}
-		writeTransactionError(c, http.StatusConflict, code, err)
+		writeTransactionErrorForID(c, http.StatusConflict, code, value.TransactionID, err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -316,7 +316,7 @@ func (server *Server) recover(c *gin.Context) {
 		if errors.Is(err, ErrUncertain) {
 			code = "state_unverified"
 		}
-		writeTransactionError(c, http.StatusConflict, code, err)
+		writeTransactionErrorForID(c, http.StatusConflict, code, value.TransactionID, err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -365,13 +365,25 @@ func writeError(c *gin.Context, status int, code, message string) {
 }
 
 func writeTransactionError(c *gin.Context, status int, code string, cause error) {
-	detail := map[string]any{"code": code, "message": publicErrorMessage(code, cause.Error())}
+	writeTransactionErrorForID(c, status, code, "", cause)
+}
+
+func writeTransactionErrorForID(c *gin.Context, status int, code, requestID string, cause error) {
+	detail := map[string]any{"code": code, "message": publicErrorMessage(code, cause.Error()), "recovery_required": code == "state_unverified"}
+	if requestID != "" {
+		detail["transaction_id"] = requestID
+		detail["phase"] = "unknown"
+	}
 	var transactionErr *TransactionError
 	if errors.As(cause, &transactionErr) {
 		if transactionErr.Phase == PhaseRollback {
 			code = "state_unverified"
+			detail["code"] = code
+			detail["message"] = publicErrorMessage(code, cause.Error())
 		}
-		detail["transaction_id"] = transactionErr.ID
+		if transactionErr.ID != "" {
+			detail["transaction_id"] = transactionErr.ID
+		}
 		detail["phase"] = transactionErr.Phase
 		detail["recovery_required"] = code == "state_unverified"
 	}

@@ -196,14 +196,18 @@ func readToken() string {
 }
 
 func metadata(ctx context.Context, client *http.Client, version string) (*http.Response, error) {
+	return metadataFromEndpoint(ctx, client, "https://api.github.com/repos/"+Repository+"/releases/tags/v"+version, readToken())
+}
+
+func metadataFromEndpoint(ctx context.Context, client *http.Client, endpoint, token string) (*http.Response, error) {
 	for attempt := 0; attempt < 3; attempt++ {
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.github.com/repos/"+Repository+"/releases/tags/v"+version, nil)
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
 			return nil, validationError("release_network_error", "release_metadata_lookup", "request_creation_failed", "retry_update")
 		}
 		request.Header.Set("Accept", "application/vnd.github+json")
 		request.Header.Set("User-Agent", "agent-vm-deploy")
-		if token := readToken(); token != "" {
+		if token != "" {
 			request.Header.Set("Authorization", "Bearer "+token)
 		}
 		response, err := client.Do(request)
