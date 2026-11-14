@@ -69,6 +69,13 @@ func run(args []string) error {
 	client := deployd.Client{Socket: *socket, Timeout: time.Duration(*timeoutSeconds) * time.Second}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeoutSeconds)*time.Second)
 	defer cancel()
+	if commandMutatesDeployment(command) {
+		updateLock, lockErr := native.AcquireLock("/run/agent-vm-native/release-update.lock", true, true)
+		if lockErr != nil {
+			return errors.New("another release update is already in progress")
+		}
+		defer updateLock.Close()
+	}
 	var method, path string
 	var body any
 	switch command {
@@ -111,8 +118,7 @@ func run(args []string) error {
 	payload, _, err := client.Call(ctx, method, path, body)
 	if err != nil {
 		if len(payload) > 0 {
-			_, _ = os.Stderr.Write(payload)
-			_, _ = os.Stderr.Write([]byte("\n"))
+			writePayload(os.Stderr, payload)
 		}
 		return err
 	}
@@ -121,6 +127,15 @@ func run(args []string) error {
 		_, _ = os.Stdout.Write([]byte("\n"))
 	}
 	return nil
+}
+
+func commandMutatesDeployment(command string) bool {
+	switch command {
+	case "plan", "stage", "verify", "activate", "rollback", "recover", "migrate":
+		return true
+	default:
+		return false
+	}
 }
 
 func runUpdate(args []string) error {
