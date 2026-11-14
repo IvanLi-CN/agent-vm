@@ -34,6 +34,26 @@ const (
 
 var ErrUncertain = errors.New("deployment outcome is uncertain")
 
+type TransactionError struct {
+	ID    string
+	Phase string
+	Cause error
+}
+
+func (err *TransactionError) Error() string {
+	if err == nil || err.Cause == nil {
+		return "deployment transaction failed"
+	}
+	return err.Cause.Error()
+}
+
+func (err *TransactionError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Cause
+}
+
 type UncertainError struct{ Cause error }
 
 func (err *UncertainError) Error() string {
@@ -311,7 +331,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
 		term, termErr := manager.nextFenceTerm(ctx)
 		if termErr != nil {
-			return nil, fmt.Errorf("allocate controller fencing term: %w", termErr)
+			return nil, manager.failure(ctx, id, PhaseControllerHandoff, fmt.Errorf("allocate controller fencing term: %w", termErr))
 		}
 		if err := manager.Runtime.RevokeController(ctx, transaction.PreviousSlot, term); err != nil {
 			return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, err)
@@ -319,7 +339,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	}
 	lease, err := manager.newLease(ctx, transaction.TargetSlot, transaction.Generation)
 	if err != nil {
-		return nil, fmt.Errorf("allocate candidate controller lease: %w", err)
+		return nil, manager.failure(ctx, id, PhaseControllerHandoff, fmt.Errorf("allocate candidate controller lease: %w", err))
 	}
 	if err := manager.Runtime.GrantController(ctx, transaction.TargetSlot, lease); err != nil {
 		return nil, manager.effectFailure(ctx, id, PhaseControllerHandoff, err)
@@ -1072,9 +1092,12 @@ func (manager *Manager) failure(ctx context.Context, id, phase string, cause err
 	encoded, _ := json.Marshal(payload)
 	digest := sha256.Sum256(encoded)
 	if err := manager.Store.RecordFailure(ctx, id, phase, code, "deployd", hex.EncodeToString(digest[:]), payload, manager.Clock().UTC()); err != nil {
-		return fmt.Errorf("%w; record deployment failure: %v", cause, err)
+		// Preserve the transaction identity even when durable failure evidence
+		// itself cannot be written. The caller must still have a recovery query
+		// handle and must fail closed.
+		return &TransactionError{ID: id, Phase: phase, Cause: fmt.Errorf("%w; record deployment failure: %v", cause, err)}
 	}
-	return cause
+	return &TransactionError{ID: id, Phase: phase, Cause: cause}
 }
 
 func sanitizedFailureCause(cause error) string {

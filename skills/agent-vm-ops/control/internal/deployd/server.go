@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -243,10 +244,10 @@ func (server *Server) stage(c *gin.Context) {
 	transaction, err := server.Manager.Stage(c.Request.Context(), value.TargetSlot, value.Bundle)
 	if err != nil {
 		if errors.Is(err, ErrUncertain) {
-			writeError(c, http.StatusConflict, "state_unverified", err.Error())
+			writeTransactionError(c, http.StatusConflict, "state_unverified", err)
 			return
 		}
-		writeError(c, http.StatusConflict, "stage_rejected", err.Error())
+		writeTransactionError(c, http.StatusConflict, "stage_rejected", err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -259,7 +260,11 @@ func (server *Server) verify(c *gin.Context) {
 	}
 	transaction, err := server.Manager.Verify(c.Request.Context(), value.TransactionID)
 	if err != nil {
-		writeError(c, http.StatusConflict, "verify_rejected", err.Error())
+		code := "verify_rejected"
+		if errors.Is(err, ErrUncertain) {
+			code = "state_unverified"
+		}
+		writeTransactionErrorForID(c, http.StatusConflict, code, value.TransactionID, err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -274,10 +279,10 @@ func (server *Server) activate(c *gin.Context) {
 	if err != nil {
 		slog.Warn("deployment activation rejected", "transaction_id", value.TransactionID, "error", err)
 		if errors.Is(err, ErrUncertain) {
-			writeError(c, http.StatusConflict, "state_unverified", err.Error())
+			writeTransactionErrorForID(c, http.StatusConflict, "state_unverified", value.TransactionID, err)
 			return
 		}
-		writeError(c, http.StatusConflict, "activate_rejected", err.Error())
+		writeTransactionErrorForID(c, http.StatusConflict, "activate_rejected", value.TransactionID, err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -290,7 +295,11 @@ func (server *Server) rollback(c *gin.Context) {
 	}
 	transaction, err := server.Manager.Rollback(c.Request.Context(), value.TransactionID)
 	if err != nil {
-		writeError(c, http.StatusConflict, "rollback_rejected", err.Error())
+		code := "rollback_rejected"
+		if errors.Is(err, ErrUncertain) {
+			code = "state_unverified"
+		}
+		writeTransactionErrorForID(c, http.StatusConflict, code, value.TransactionID, err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -304,7 +313,11 @@ func (server *Server) recover(c *gin.Context) {
 	transaction, err := server.Manager.Recover(c.Request.Context(), value.TransactionID, value.Action)
 	if err != nil {
 		slog.Warn("deployment recovery rejected", "transaction_id", value.TransactionID, "action", value.Action, "error", err)
-		writeError(c, http.StatusConflict, "recover_rejected", err.Error())
+		code := "recover_rejected"
+		if errors.Is(err, ErrUncertain) {
+			code = "state_unverified"
+		}
+		writeTransactionErrorForID(c, http.StatusConflict, code, value.TransactionID, err)
 		return
 	}
 	writeOK(c, publicTransaction(*transaction))
@@ -350,6 +363,32 @@ func writeOK(c *gin.Context, value any) {
 
 func writeError(c *gin.Context, status int, code, message string) {
 	c.JSON(status, map[string]any{"ok": false, "error": map[string]any{"code": code, "message": publicErrorMessage(code, message)}})
+}
+
+func writeTransactionError(c *gin.Context, status int, code string, cause error) {
+	writeTransactionErrorForID(c, status, code, "", cause)
+}
+
+func writeTransactionErrorForID(c *gin.Context, status int, code, requestID string, cause error) {
+	detail := map[string]any{"code": code, "message": publicErrorMessage(code, cause.Error()), "recovery_required": code == "state_unverified"}
+	if requestID != "" {
+		detail["transaction_id"] = requestID
+		detail["phase"] = "unknown"
+	}
+	var transactionErr *TransactionError
+	if errors.As(cause, &transactionErr) {
+		if transactionErr.Phase == PhaseRollback {
+			code = "state_unverified"
+			detail["code"] = code
+			detail["message"] = publicErrorMessage(code, cause.Error())
+		}
+		if transactionErr.ID != "" {
+			detail["transaction_id"] = transactionErr.ID
+		}
+		detail["phase"] = transactionErr.Phase
+		detail["recovery_required"] = code == "state_unverified"
+	}
+	c.JSON(status, map[string]any{"ok": false, "error": detail})
 }
 
 func writeMigrationError(c *gin.Context, status int, code string, cause error) {
@@ -407,7 +446,19 @@ func publicTransaction(transaction store.Transaction) map[string]any {
 		"error_message":     publicErrorMessage(transaction.ErrorCode, transaction.ErrorMessage),
 		"created_at":        transaction.CreatedAt,
 		"updated_at":        transaction.UpdatedAt,
+		"staging_id":        transactionStagingID(transaction.Bundle),
 	}
+}
+
+func transactionStagingID(bundle string) string {
+	if bundle == "" {
+		return ""
+	}
+	directory := filepath.Base(filepath.Dir(bundle))
+	if strings.HasPrefix(directory, ".update-") {
+		return directory
+	}
+	return ""
 }
 
 func ServeUDS(ctx context.Context, socket string, handler http.Handler) error {
