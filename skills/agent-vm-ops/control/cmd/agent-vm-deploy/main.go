@@ -196,7 +196,9 @@ func runUpdate(args []string) error {
 		// Any failed transaction call may have crossed the native-effect barrier;
 		// retain the candidate until the transaction is queried and explicitly
 		// recovered, even when the response is malformed or incomplete.
-		preserveStaging = errorMayNeedRecovery(payload)
+		// A structured stage rejection can still race with transaction creation;
+		// leave cleanup to the status-aware orphan reaper.
+		preserveStaging = true
 		writePayload(os.Stderr, payload)
 		if preserveStaging && !hasStructuredError(payload) {
 			writeUpdateRecoveryHint(ctx, client, "")
@@ -379,6 +381,9 @@ func writePayload(out *os.File, payload []byte) {
 	const maxDiagnosticBytes = 64 << 10
 	if len(payload) > maxDiagnosticBytes {
 		payload = append(append([]byte(nil), payload[:maxDiagnosticBytes]...), []byte("\n[diagnostic truncated]\n")...)
+	}
+	for _, path := range []string{"/var/lib/agent-vm-native", "/run/agent-vm-native", "/etc/agent-vm-native"} {
+		payload = []byte(strings.ReplaceAll(string(payload), path, "<private-path>"))
 	}
 	_, _ = out.Write(payload)
 	if payload[len(payload)-1] != '\n' {

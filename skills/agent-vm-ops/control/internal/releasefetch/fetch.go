@@ -107,7 +107,7 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 	// Reserve the downloaded bundle, Deployd's extracted candidate and the
 	// retained rollback copy at their bounded maximums. Metadata sizes alone
 	// cannot prove this peak because the archive is expanded during staging.
-	var required int64 = 3 * (128 << 20)
+	var required int64 = 3*(128<<20) + 2*(1<<20)
 	for _, name := range []string{assetName, "release-provenance.json", "SHA256SUMS"} {
 		limit := int64(1 << 20)
 		if name == assetName {
@@ -116,9 +116,8 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 		if sizes[name] < 0 || sizes[name] > limit {
 			return "", validationError("release_asset_too_large", "release_metadata_validation", "asset_size_invalid", "inspect_release")
 		}
-		// GitHub metadata is advisory; reserve the full bounded download
-		// allowance so a mismatched response cannot bypass the preflight.
-		required += limit
+		// GitHub metadata is advisory; the fixed reserve above covers the
+		// bounded download and Deployd extraction peak.
 	}
 	if err := checkCapacity(directory, required); err != nil {
 		return "", err
