@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -42,6 +43,7 @@ type release struct {
 	Immutable  bool   `json:"immutable"`
 	Assets     []struct {
 		Name string `json:"name"`
+		ID   int64  `json:"id"`
 		URL  string `json:"browser_download_url"`
 		Size int64  `json:"size"`
 	} `json:"assets"`
@@ -84,20 +86,30 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 	urls := map[string]string{}
 	sizes := map[string]int64{}
 	for _, asset := range value.Assets {
-		urls[asset.Name] = asset.URL
+		if asset.ID > 0 {
+			urls[asset.Name] = fmt.Sprintf("https://api.github.com/repos/%s/releases/assets/%d", Repository, asset.ID)
+		}
 		sizes[asset.Name] = asset.Size
 	}
 	for _, name := range []string{assetName, "release-provenance.json", "SHA256SUMS"} {
 		if urls[name] == "" {
 			return "", validationError("release_asset_missing", "release_metadata_validation", "required_asset_missing", "check_release_assets")
 		}
+		if err := validateAssetURL(urls[name]); err != nil {
+			return "", err
+		}
 	}
 	if err := os.MkdirAll(directory, 0o750); err != nil {
 		return "", validationError("release_staging_unavailable", "staging_prepare", "staging_directory_unavailable", "check_target_storage")
 	}
-	var required int64 = 64 << 20
+	var required int64 = 3*256<<20 + 64<<20
 	for _, name := range []string{assetName, "release-provenance.json", "SHA256SUMS"} {
-		required += sizes[name]
+		if sizes[name] < 0 || sizes[name] > 256<<20 {
+			return "", validationError("release_asset_too_large", "release_metadata_validation", "asset_size_invalid", "inspect_release")
+		}
+		if sizes[name] > 0 && sizes[name]+64<<20 > required {
+			required = sizes[name] + 64<<20
+		}
 	}
 	if err := checkCapacity(directory, required); err != nil {
 		return "", err
@@ -115,14 +127,26 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 	if err != nil {
 		return "", validationError("release_provenance_invalid", "release_validation", "provenance_json_invalid", "inspect_release")
 	}
-	err = json.NewDecoder(proofFile).Decode(&proof)
+	decoder := json.NewDecoder(io.LimitReader(proofFile, 1<<20))
+	err = decoder.Decode(&proof)
+	if err == nil {
+		var trailing any
+		if trailingErr := decoder.Decode(&trailing); trailingErr != io.EOF {
+			err = errors.New("trailing data")
+		}
+	}
 	proofFile.Close()
 	if err != nil {
-		return "", fmt.Errorf("release provenance invalid: %w", err)
+		return "", validationError("release_provenance_invalid", "release_validation", "provenance_json_invalid", "inspect_release")
 	}
-	sums, err := os.ReadFile(files["SHA256SUMS"])
+	sumFile, err := os.Open(files["SHA256SUMS"])
 	if err != nil {
 		return "", validationError("release_checksums_invalid", "release_validation", "checksums_unreadable", "inspect_release")
+	}
+	sums, err := io.ReadAll(io.LimitReader(sumFile, 1<<20+1))
+	sumFile.Close()
+	if err != nil || len(sums) > 1<<20 {
+		return "", validationError("release_checksums_invalid", "release_validation", "checksums_truncated", "inspect_release")
 	}
 	checksum := strings.Fields(string(sums))
 	checksumFound := false
@@ -267,8 +291,22 @@ func classify(response *http.Response) error {
 		}
 	} else if seconds, err := strconv.Atoi(value); err == nil {
 		retryAfter = &seconds
+	} else if parsed, err := http.ParseTime(value); err == nil {
+		seconds := int(time.Until(parsed).Seconds())
+		if seconds < 0 {
+			seconds = 0
+		}
+		retryAfter = &seconds
 	}
 	return &Error{Code: code, Phase: "release_metadata_lookup", HTTPStatus: response.StatusCode, Retryable: retryable, Reason: reason, NextAction: next, RequestID: response.Header.Get("X-GitHub-Request-Id"), RetryAfterSeconds: retryAfter}
+}
+
+func validateAssetURL(raw string) error {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.Host != "api.github.com" || parsed.User != nil {
+		return validationError("release_asset_url_invalid", "release_metadata_validation", "asset_url_outside_github", "inspect_release")
+	}
+	return nil
 }
 
 func download(ctx context.Context, client *http.Client, url, path, token string) error {
@@ -316,7 +354,14 @@ func download(ctx context.Context, client *http.Client, url, path, token string)
 		closeErr := file.Close()
 		res.Body.Close()
 		if copyErr != nil || closeErr != nil {
-			return validationError("release_asset_truncated", "asset_download", "asset_read_failed", "retry_update")
+			_ = os.Remove(path)
+			if attempt < 2 {
+				if err := retryDelay(ctx, time.Second*time.Duration(attempt+1)); err != nil {
+					return validationError("release_network_error", "asset_download", "asset_retry_cancelled", "retry_update")
+				}
+				continue
+			}
+			return &Error{Code: "release_network_error", Phase: "asset_download", Retryable: true, Reason: "asset_read_failed", NextAction: "retry_update"}
 		}
 		if written > 256<<20 {
 			return validationError("release_asset_too_large", "asset_download", "asset_exceeds_size_limit", "inspect_release")

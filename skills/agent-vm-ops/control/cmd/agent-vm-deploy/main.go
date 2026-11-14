@@ -140,10 +140,9 @@ func runUpdate(args []string) error {
 	if err != nil {
 		return fmt.Errorf("create release staging directory: %w", err)
 	}
-	transactionStarted := false
-	keepStaging := false
+	stageAttempted := false
 	defer func() {
-		if !keepStaging && !transactionStarted {
+		if !stageAttempted {
 			_ = os.RemoveAll(directory)
 		}
 	}()
@@ -175,6 +174,7 @@ func runUpdate(args []string) error {
 			ID string `json:"transaction_id"`
 		} `json:"value"`
 	}
+	stageAttempted = true
 	payload, _, err := client.Call(ctx, "POST", "/v1/stage", map[string]any{"target_slot": targetSlot, "bundle": filepath.Clean(bundle)})
 	if err != nil {
 		writePayload(os.Stderr, payload)
@@ -187,7 +187,6 @@ func runUpdate(args []string) error {
 	if id == "" {
 		return errors.New("stage response missing transaction ID")
 	}
-	transactionStarted = true
 	for _, action := range []string{"verify", "activate"} {
 		payload, _, err = client.Call(ctx, "POST", "/v1/"+action, map[string]any{"transaction_id": id})
 		if err != nil {
@@ -199,13 +198,17 @@ func runUpdate(args []string) error {
 	if len(payload) == 0 || payload[len(payload)-1] != '\n' {
 		_, _ = os.Stdout.Write([]byte("\n"))
 	}
-	keepStaging = true
+	_ = os.RemoveAll(directory)
 	return nil
 }
 
 func writePayload(out *os.File, payload []byte) {
 	if len(payload) == 0 {
 		return
+	}
+	const maxDiagnosticBytes = 64 << 10
+	if len(payload) > maxDiagnosticBytes {
+		payload = append(append([]byte(nil), payload[:maxDiagnosticBytes]...), []byte("\n[diagnostic truncated]\n")...)
 	}
 	_, _ = out.Write(payload)
 	if payload[len(payload)-1] != '\n' {
