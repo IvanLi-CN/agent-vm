@@ -137,7 +137,7 @@ svg { flex: none; }
 .freshness-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 5px; color: var(--muted); font-size: 11px; }
 .freshness-line .status-badge { min-height: 19px; padding: 0 6px; font-size: 11px; }
 
-.overview-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.35fr); gap: 16px; }
+.overview-grid { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 16px; }
 .admission-panel { grid-column: 1 / -1; display: flex; align-items: center; gap: 14px; padding: 16px 20px; }
 .admission-panel > div:nth-child(2) { flex: 1; }
 .admission-panel strong { display: block; font-size: 17px; font-weight: 500; }
@@ -152,7 +152,7 @@ svg { flex: none; }
 .metric-label svg { width: 14px; height: 14px; }
 .metric-cell strong { display: block; margin-top: 2px; font-size: 24px; line-height: 28px; font-weight: 400; font-variant-numeric: tabular-nums; }
 .metric-unknown { color: var(--muted); }
-.overview-lower, .system-grid, .system-overview { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+.overview-lower, .system-grid, .system-overview { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(280px, .75fr); gap: 16px; }
 .workload-list, .source-list, .component-list, .capability-list { padding: 0 20px 14px; }
 .workload-row, .source-row, .component-row { display: flex; align-items: center; justify-content: space-between; min-height: 42px; gap: 16px; border-bottom: 1px solid var(--rule); }
 .workload-row:last-child, .source-row:last-child, .component-row:last-child { border-bottom: 0; }
