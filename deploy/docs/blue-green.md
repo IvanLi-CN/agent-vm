@@ -105,7 +105,7 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 ## 普通蓝绿切换
 
-普通切换只处理 release、槽位角色、流量、`active` 链接和 native quiescence。线上 Agent 通过 SSH 在目标服务器上调用 `agent-vm-deploy update`；该命令在服务器本地按 `GOOS/GOARCH` 获取并验证正式 release，再编排下面的 deployd 事务。Agent 工作站不下载或上传产品 bundle：
+普通切换只处理 release、槽位角色、流量、`active` 链接和 native quiescence。候选 release 的 `deployment_contract` major 在 stage 前由 Deployd 对 manifest 预检；缺失字段按 legacy v1 兼容，v1 新字段只能增量扩展，major 不兼容时不创建事务、不启动候选。候选角色、旧槽位 quiescence 和最终全局一致性分别验证，controller lease 从 handoff 持续到 finalize。线上 Agent 通过 SSH 在目标服务器上调用 `agent-vm-deploy update`；该命令在服务器本地按 `GOOS/GOARCH` 获取并验证正式 release，再编排下面的 deployd 事务。Agent 工作站不下载或上传产品 bundle：
 
 ```sh
 ssh <configured-control-alias> agent-vm-deploy update \

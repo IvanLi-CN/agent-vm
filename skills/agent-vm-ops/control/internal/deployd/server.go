@@ -247,6 +247,11 @@ func (server *Server) stage(c *gin.Context) {
 			writeTransactionError(c, http.StatusConflict, "state_unverified", err)
 			return
 		}
+		var compatibilityErr *DeploymentCompatibilityError
+		if errors.As(err, &compatibilityErr) {
+			writeTransactionError(c, http.StatusConflict, "deployment_compatibility_blocked", err)
+			return
+		}
 		writeTransactionError(c, http.StatusConflict, "stage_rejected", err)
 		return
 	}

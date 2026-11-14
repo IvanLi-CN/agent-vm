@@ -23,6 +23,8 @@ type fakeRuntime struct {
 	observations          map[string]SlotObservation
 	failSwitch            bool
 	stageError            error
+	preflightError        error
+	preflightCalls        int
 	inconsistent          bool
 	partialInventory      bool
 	identityError         error
@@ -89,6 +91,10 @@ func (runtime *fakeRuntime) Observe(context.Context) (RuntimeSnapshot, error) {
 func (runtime *fakeRuntime) Stage(context.Context, string, string) error {
 	runtime.sequence = append(runtime.sequence, "stage")
 	return runtime.stageError
+}
+func (runtime *fakeRuntime) Preflight(context.Context, string, string) error {
+	runtime.preflightCalls++
+	return runtime.preflightError
 }
 func (runtime *fakeRuntime) Verify(context.Context, string, string) error {
 	runtime.sequence = append(runtime.sequence, "verify")
@@ -241,6 +247,33 @@ func TestManagerCompletesBlueGreenTransactionWithOneRuntime(t *testing.T) {
 	}
 	if runtime.active != "green" || len(runtime.sequence) < 8 {
 		t.Fatalf("runtime active=%s sequence=%v", runtime.active, runtime.sequence)
+	}
+}
+
+func TestManagerRejectsIncompatibleCandidateBeforeCreatingTransaction(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := &fakeRuntime{active: "blue", preflightError: &DeploymentCompatibilityError{Cause: errors.New("deployment contract major 2 is incompatible with Deployd v1")}, observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true},
+	}}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if _, err := manager.Stage(context.Background(), "green", "/tmp/incompatible.tar"); !errors.As(err, new(*DeploymentCompatibilityError)) {
+		t.Fatalf("stage error = %v, want deployment compatibility blocker", err)
+	}
+	active, err := database.ListActive(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("active transactions = %#v, want none", active)
+	}
+	if runtime.preflightCalls != 1 || len(runtime.sequence) != 0 {
+		t.Fatalf("preflight calls=%d runtime sequence=%v, want one preflight and no effects", runtime.preflightCalls, runtime.sequence)
 	}
 }
 
@@ -414,6 +447,26 @@ func TestManagerFencesWhenQuiescenceCountersAreUnknown(t *testing.T) {
 	current, err := database.Get(context.Background(), transaction.ID)
 	if err != nil || current == nil || current.State != "needs_recovery" || !current.RecoveryRequired {
 		t.Fatalf("unknown-counter transaction = %#v err=%v", current, err)
+	}
+}
+
+func TestQuiescenceEvidenceAllowsTransientGlobalInconsistency(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	snapshot := RuntimeSnapshot{
+		ObservedAt: now,
+		FreshUntil: now.Add(time.Minute),
+		Consistent: false,
+		Sources: map[string]SourceObservation{
+			"active_link":    {Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)},
+			"slot_contracts": {Up: true, ObservedAt: now, FreshUntil: now.Add(time.Minute)},
+		},
+	}
+	if !quiescenceObservationValid(snapshot, now) {
+		t.Fatal("fresh source evidence should be sufficient for previous-slot quiescence")
+	}
+	snapshot.Sources["slot_contracts"] = SourceObservation{Up: false, ObservedAt: now, FreshUntil: now.Add(time.Minute)}
+	if quiescenceObservationValid(snapshot, now) {
+		t.Fatal("down source must invalidate quiescence evidence")
 	}
 }
 

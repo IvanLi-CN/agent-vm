@@ -19,13 +19,18 @@ import (
 )
 
 const (
-	Format              = 2
-	LegacyProductFormat = 3
-	ProductFormat       = 4
-	Protocol            = 4
-	GoToolchain         = "go1.27.3"
-	maxBytes            = 2 * 1024 * 1024
+	Format                           = 2
+	LegacyProductFormat              = 3
+	ProductFormat                    = 4
+	Protocol                         = 4
+	GoToolchain                      = "go1.27.3"
+	maxBytes                         = 2 * 1024 * 1024
+	DeploymentContractName           = "agent-vm-control"
+	DeploymentContractMajor    int64 = 1
+	DeploymentContractRevision int64 = 1
 )
+
+var deploymentContractCapabilities = []string{"controller_lease_v1", "quiescence_evidence_v1", "transaction_envelope_v1"}
 
 var stateCapabilityMarkers = []string{
 	"legacy-agent-vm-core@1",
@@ -78,16 +83,25 @@ type ActionMetadata struct {
 }
 
 type Metadata struct {
-	Version           string
-	ReleaseID         string
-	SourceRevision    string
-	Protocol          int64
-	Transport         string
-	Actions           map[string]ActionMetadata
-	ManifestPresent   bool
-	ArtifactsVerified bool
-	StateReads        []string
-	StateWrites       []string
+	Version            string
+	ReleaseID          string
+	SourceRevision     string
+	Protocol           int64
+	Transport          string
+	Actions            map[string]ActionMetadata
+	ManifestPresent    bool
+	ArtifactsVerified  bool
+	StateReads         []string
+	StateWrites        []string
+	DeploymentContract DeploymentContract
+}
+
+type DeploymentContract struct {
+	Name         string
+	Major        int64
+	Revision     int64
+	Capabilities []string
+	Present      bool
 }
 
 var productLegacyArtifacts = []artifactSpec{
@@ -236,7 +250,14 @@ func metadataFromRoot(root map[string]any) (Metadata, error) {
 		}
 		actions[action] = ActionMetadata{Request: request, Response: response, RequestWindow: requestWindow, ResponseWindow: responseWindow}
 	}
-	metadata := Metadata{Version: version, ReleaseID: releaseID, SourceRevision: sourceRevision, Protocol: Protocol, Transport: transport, Actions: actions}
+	metadata := Metadata{Version: version, ReleaseID: releaseID, SourceRevision: sourceRevision, Protocol: Protocol, Transport: transport, Actions: actions, DeploymentContract: legacyDeploymentContract()}
+	if raw, present := root["deployment_contract"]; present {
+		contract, err := deploymentContract(raw)
+		if err != nil {
+			return Metadata{}, fmt.Errorf("manifest_invalid: deployment_contract: %w", err)
+		}
+		metadata.DeploymentContract = contract
+	}
 	if format == ProductFormat {
 		reads, writes, err := stateCompatibility(root["state_compatibility"])
 		if err != nil {
@@ -246,6 +267,36 @@ func metadataFromRoot(root map[string]any) (Metadata, error) {
 		metadata.StateWrites = writes
 	}
 	return metadata, nil
+}
+
+func legacyDeploymentContract() DeploymentContract {
+	return DeploymentContract{Name: DeploymentContractName, Major: DeploymentContractMajor, Revision: DeploymentContractRevision, Capabilities: append([]string(nil), deploymentContractCapabilities...)}
+}
+
+func deploymentContract(value any) (DeploymentContract, error) {
+	object, ok := value.(map[string]any)
+	if !ok {
+		return DeploymentContract{}, fmt.Errorf("contract is not an object")
+	}
+	name, nameOK := object["name"].(string)
+	major, majorOK := integerValue(object["major"])
+	revision, revisionOK := integerValue(object["revision"])
+	rawCapabilities, capabilitiesOK := object["capabilities"].([]any)
+	if !nameOK || !majorOK || !revisionOK || !capabilitiesOK || name != DeploymentContractName || major != DeploymentContractMajor || revision < 1 {
+		return DeploymentContract{}, fmt.Errorf("contract identity is invalid")
+	}
+	capabilities := make([]string, len(rawCapabilities))
+	for index, raw := range rawCapabilities {
+		value, ok := raw.(string)
+		if !ok {
+			return DeploymentContract{}, fmt.Errorf("capabilities[%d] is invalid", index)
+		}
+		capabilities[index] = value
+	}
+	if !reflect.DeepEqual(capabilities, deploymentContractCapabilities) {
+		return DeploymentContract{}, fmt.Errorf("capabilities differ from the supported contract")
+	}
+	return DeploymentContract{Name: name, Major: major, Revision: revision, Capabilities: capabilities, Present: true}, nil
 }
 
 func metadataSchema(value any) (Schema, error) {
@@ -282,7 +333,11 @@ func supportedTransport(value string) bool {
 }
 
 func validate(root map[string]any, directory string) error {
-	if !sameKeys(root, []string{"actions", "artifacts", "client_view", "format", "protocol", "release_id", "retired_units", "source_revision", "target", "toolchain"}) {
+	keys := []string{"actions", "artifacts", "client_view", "format", "protocol", "release_id", "retired_units", "source_revision", "target", "toolchain"}
+	if _, present := root["deployment_contract"]; present {
+		keys = append(keys, "deployment_contract")
+	}
+	if !sameKeys(root, keys) {
 		return fmt.Errorf("manifest_invalid: manifest shape is incomplete or contains extra fields")
 	}
 	if value, ok := integerValue(root["format"]); !ok || value != Format {
@@ -290,6 +345,11 @@ func validate(root map[string]any, directory string) error {
 	}
 	if value, ok := integerValue(root["protocol"]); !ok || value != Protocol {
 		return fmt.Errorf("manifest_protocol_mismatch: manifest protocol must be %d", Protocol)
+	}
+	if raw, present := root["deployment_contract"]; present {
+		if _, err := deploymentContract(raw); err != nil {
+			return fmt.Errorf("manifest_invalid: deployment_contract: %w", err)
+		}
 	}
 	source, ok := root["source_revision"].(string)
 	if !ok || !revisionPattern.MatchString(source) || root["release_id"] != source {

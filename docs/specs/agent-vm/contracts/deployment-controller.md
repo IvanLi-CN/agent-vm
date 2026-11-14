@@ -2,6 +2,8 @@
 
 本文定义 Deployd（进程名 `agent-vm-deployd`）及其运维 CLI `agent-vm-deploy` 的目标合同。Deployd 负责部署协调和部署观测，但不是第二个 Agent VM 生命周期权威、业务状态后端或公共业务 HTTP 服务。发布包提供该服务、CLI 和槽位模板 unit。format-4 发布器负责把已验证的控制二进制和 manifest 安装到蓝、绿两个槽位。实际配置、状态后端凭据和运行目录仍由部署方提供。
 
+Deployd 与槽位 `agent-vm-control` 使用独立的 `deployment_contract` v1。该合同与 protocol 4 分开：protocol 4 约束 Agent 请求，deployment contract 约束槽位角色、controller lease、quiescence 和事务观测。Deployd v1 必须兼容所有仍受支持的 v1 control；新增 health 字段和能力只能增量加入，未知字段必须忽略。缺失合同的 legacy control 按 v1 基础合同处理；不匹配的 major 必须在 stage 前拒绝。Deployd breaking contract 变更必须走独立的 controller upgrade transaction，不能混入普通 blue-green update。
+
 ## 边界
 
 `agent-vm-deployd.service` 是位于蓝、绿槽位之外的稳定宿主级服务。它在槽位切换期间保持不变，并且一次只负责一个部署事务。CLI 通过 `/run/agent-vm-native/deployd.sock` 连接。Caddy、浏览器、Agent Token、公共 `agent-vm` CLI 和槽位业务 API，都不能访问这个 socket。

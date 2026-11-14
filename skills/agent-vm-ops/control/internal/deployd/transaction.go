@@ -67,6 +67,22 @@ func (err *UncertainError) Unwrap() error { return err.Cause }
 
 func (err *UncertainError) Is(target error) bool { return target == ErrUncertain }
 
+type DeploymentCompatibilityError struct{ Cause error }
+
+func (err *DeploymentCompatibilityError) Error() string {
+	if err == nil || err.Cause == nil {
+		return "deployment contract is incompatible"
+	}
+	return err.Cause.Error()
+}
+
+func (err *DeploymentCompatibilityError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.Cause
+}
+
 type SlotObservation struct {
 	Slot                  string                `json:"slot"`
 	ProcessUp             bool                  `json:"process_up"`
@@ -124,6 +140,10 @@ type Runtime interface {
 	Quiesce(context.Context, string) error
 	Stop(context.Context, string) error
 	Rollback(context.Context, string, string, controllerrole.Lease, string) error
+}
+
+type RuntimePreflight interface {
+	Preflight(context.Context, string, string) error
 }
 
 type Status struct {
@@ -227,6 +247,11 @@ func (manager *Manager) Stage(ctx context.Context, targetSlot, bundle string) (*
 	}
 	if err := validateStageObservation(observation, targetSlot, manager.Clock().UTC()); err != nil {
 		return nil, err
+	}
+	if preflight, ok := manager.Runtime.(RuntimePreflight); ok {
+		if err := preflight.Preflight(ctx, targetSlot, bundle); err != nil {
+			return nil, err
+		}
 	}
 	createdEvidence := map[string]any{"active_slot": observation.ActiveSlot}
 	if observation.ActiveSlot != "none" {
@@ -421,7 +446,7 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	if transaction.PreviousSlot != "" && transaction.PreviousSlot != "none" {
 		observation, err = manager.observe(ctx, id)
 		previous, previousOK := observation.Slots[transaction.PreviousSlot]
-		if err != nil || !validObservation(observation, manager.Clock().UTC()) || !previousOK || !previous.CountersKnown || previous.TrafficAccepting || previous.InFlightRequests != 0 || previous.NativeWorkers != 0 || previous.PendingOperations != 0 {
+		if err != nil || !quiescenceObservationValid(observation, manager.Clock().UTC()) || !previousOK || !previous.CountersKnown || previous.TrafficAccepting || previous.InFlightRequests != 0 || previous.NativeWorkers != 0 || previous.PendingOperations != 0 {
 			cause := quiescenceVerificationError(observation, *transaction, previousOK, manager.Clock().UTC())
 			if err != nil {
 				cause = fmt.Errorf("observe quiescence counters: %w", err)
@@ -457,6 +482,21 @@ func (manager *Manager) Activate(ctx context.Context, id string) (*store.Transac
 	}
 	updated, err := manager.Store.Get(ctx, id)
 	return updated, err
+}
+
+// Quiescence only needs fresh source evidence for the previous slot. During
+// active handoff the global controller/active snapshot may be transiently
+// inconsistent; finalization still requires validObservation.
+func quiescenceObservationValid(observation RuntimeSnapshot, now time.Time) bool {
+	if observation.ObservedAt.IsZero() || observation.FreshUntil.IsZero() || !now.Before(observation.FreshUntil) {
+		return false
+	}
+	for _, source := range observation.Sources {
+		if !source.Up || source.ObservedAt.IsZero() || !now.Before(source.FreshUntil) {
+			return false
+		}
+	}
+	return true
 }
 
 func quiescenceVerificationError(observation RuntimeSnapshot, transaction store.Transaction, previousOK bool, now time.Time) error {

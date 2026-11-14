@@ -169,6 +169,12 @@ func (s *Server) health(c *gin.Context) {
 		"process_id": os.Getpid(), "process_start_time": processStartTime,
 		"release_id":      releaseValue(s.Service.Release, func(value *protocol.ReleaseMetadata) string { return value.ReleaseID }),
 		"source_revision": releaseValue(s.Service.Release, func(value *protocol.ReleaseMetadata) string { return value.SourceRevision }),
+		"deployment_contract": map[string]any{
+			"name":         protocol.DeploymentContractName,
+			"major":        protocol.DeploymentContractMajor,
+			"revision":     protocol.DeploymentContractRevision,
+			"capabilities": []string{"controller_lease_v1", "quiescence_evidence_v1", "transaction_envelope_v1"},
+		},
 	})
 }
 

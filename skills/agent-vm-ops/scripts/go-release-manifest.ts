@@ -10,6 +10,12 @@ import { ControlError, canonical_json, type Data } from "./control-types.ts";
 export const GO_MANIFEST_FORMAT = 2;
 export const GO_TOOLCHAIN = "go1.27.3";
 export const GO_TARGETS = Object.freeze(["linux/amd64", "linux/arm64"]);
+export const DEPLOYMENT_CONTRACT = Object.freeze({
+  name: "agent-vm-control",
+  major: 1,
+  revision: 1,
+  capabilities: Object.freeze(["controller_lease_v1", "quiescence_evidence_v1", "transaction_envelope_v1"]),
+});
 export { CLIENT_TRANSPORTS };
 export type { ClientTransport };
 export const RETIRED_UNITS = Object.freeze([
@@ -63,6 +69,7 @@ export interface GoReleaseManifest {
     actions: Record<string, OperationSpec>;
   };
   retired_units: string[];
+  deployment_contract?: { name: string; major: number; revision: number; capabilities: string[] };
 }
 
 export class GoManifestError extends ControlError {}
@@ -165,6 +172,7 @@ export function build_go_manifest(sourceRevision: string, artifacts: readonly Go
     actions,
     client_view: { release_id: revisionValue, source_revision: revisionValue, protocol: 4, transport, actions },
     retired_units: [...RETIRED_UNITS],
+    deployment_contract: DEPLOYMENT_CONTRACT,
   });
 }
 
@@ -172,13 +180,25 @@ export function validate_go_manifest(value: unknown): GoReleaseManifest {
   if (!value || typeof value !== "object" || Array.isArray(value)) error("manifest must be an object");
   const root = value as Data;
   const required = ["actions", "artifacts", "client_view", "format", "protocol", "release_id", "retired_units", "source_revision", "target", "toolchain"];
-  if (Object.keys(root).sort().join(",") !== required.sort().join(",")) error("manifest has an unexpected shape");
+  const withContract = [...required, "deployment_contract"];
+  const keys = Object.keys(root).sort().join(",");
+  const legacyKeys = required.sort().join(",");
+  const contractKeys = withContract.sort().join(",");
+  if (keys !== legacyKeys && keys !== contractKeys) error("manifest has an unexpected shape");
   if (root.format !== GO_MANIFEST_FORMAT) throw new GoManifestError("manifest_format_unsupported", "manifest format must be 2");
   const sourceRevision = revision(root.source_revision, "source_revision");
   if (root.release_id !== sourceRevision || root.protocol !== 4) error("manifest identity or protocol is invalid");
   const checkedTarget = target(root.target);
   if (!root.toolchain || typeof root.toolchain !== "object" || root.toolchain.go !== GO_TOOLCHAIN || root.toolchain.cgo_enabled !== false) error("Go toolchain declaration is invalid");
   if (!Array.isArray(root.retired_units) || canonical_json(root.retired_units) !== canonical_json(RETIRED_UNITS)) error("retired unit set differs from the fixed transition set");
+  let deploymentContract: NonNullable<GoReleaseManifest["deployment_contract"]> = { name: DEPLOYMENT_CONTRACT.name, major: DEPLOYMENT_CONTRACT.major, revision: DEPLOYMENT_CONTRACT.revision, capabilities: [...DEPLOYMENT_CONTRACT.capabilities] };
+  if (root.deployment_contract !== undefined) {
+    const contract = root.deployment_contract;
+    if (!contract || typeof contract !== "object" || Array.isArray(contract) || Object.keys(contract).sort().join(",") !== "capabilities,major,name,revision") error("deployment_contract has an unexpected shape");
+    const item = contract as Data;
+    if (item.name !== DEPLOYMENT_CONTRACT.name || item.major !== DEPLOYMENT_CONTRACT.major || !Number.isInteger(item.revision) || (item.revision as number) < 1 || canonical_json(item.capabilities) !== canonical_json(DEPLOYMENT_CONTRACT.capabilities)) error("deployment_contract is incompatible");
+    deploymentContract = { name: item.name as string, major: item.major as number, revision: item.revision as number, capabilities: [...(item.capabilities as string[])] };
+  }
   if (!Array.isArray(root.artifacts) || root.artifacts.length !== GO_FIXED_ARTIFACTS.length) error("artifact set is incomplete");
   const artifacts = (root.artifacts as unknown[]).map((item, index) => artifact(item, index));
   const actual = artifacts.map((item): ArtifactTuple => [item.name, item.path, item.role, item.mode]).sort((a: ArtifactTuple, b: ArtifactTuple) => canonical_json(a).localeCompare(canonical_json(b)));
@@ -189,7 +209,7 @@ export function validate_go_manifest(value: unknown): GoReleaseManifest {
   if (!view || typeof view !== "object" || Array.isArray(view) || Object.keys(view).sort().join(",") !== "actions,protocol,release_id,source_revision,transport") error("client_view has an unexpected shape");
   if (view.release_id !== sourceRevision || view.source_revision !== sourceRevision || view.protocol !== 4 || !CLIENT_TRANSPORTS.includes(view.transport)) error("client_view identity or transport is invalid");
   if (canonical_json(view.actions) !== canonical_json(actions)) error("client_view actions differ from manifest actions");
-  return { format: 2, release_id: sourceRevision, source_revision: sourceRevision, protocol: 4, target: checkedTarget, toolchain: { go: GO_TOOLCHAIN, cgo_enabled: false }, artifacts, actions, client_view: { release_id: sourceRevision, source_revision: sourceRevision, protocol: 4, transport: view.transport, actions }, retired_units: [...RETIRED_UNITS] };
+  return { format: 2, release_id: sourceRevision, source_revision: sourceRevision, protocol: 4, target: checkedTarget, toolchain: { go: GO_TOOLCHAIN, cgo_enabled: false }, artifacts, actions, client_view: { release_id: sourceRevision, source_revision: sourceRevision, protocol: 4, transport: view.transport, actions }, retired_units: [...RETIRED_UNITS], deployment_contract: deploymentContract };
 }
 
 export function verify_go_bundle(root: string, manifest: unknown): GoReleaseManifest {

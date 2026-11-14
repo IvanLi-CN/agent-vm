@@ -35,6 +35,39 @@ type HostRuntime struct {
 	legacyAuthorityLock *native.AuthorityLock
 }
 
+const deploymentContractMajor = 1
+
+func (runtime *HostRuntime) Preflight(ctx context.Context, slot, bundle string) error {
+	if err := validSlot(slot); err != nil {
+		return err
+	}
+	temporary, err := os.MkdirTemp("", "agent-vm-deployd-preflight-")
+	if err != nil {
+		return fmt.Errorf("create deployment preflight directory: %w", err)
+	}
+	defer os.RemoveAll(temporary)
+	manifest, err := extractAndVerifyBundle(bundle, temporary)
+	if err != nil {
+		return err
+	}
+	if raw, present := manifest["deployment_contract"]; present {
+		contract, ok := raw.(map[string]any)
+		if !ok {
+			return &DeploymentCompatibilityError{Cause: errors.New("deployment contract is not an object")}
+		}
+		name, nameOK := contract["name"].(string)
+		major, majorOK := contract["major"].(json.Number)
+		if !nameOK || name != "agent-vm-control" || !majorOK {
+			return &DeploymentCompatibilityError{Cause: errors.New("deployment contract identity is invalid")}
+		}
+		majorValue, parseErr := major.Int64()
+		if parseErr != nil || majorValue != deploymentContractMajor {
+			return &DeploymentCompatibilityError{Cause: fmt.Errorf("deployment contract major %q is incompatible with Deployd v%d", major.String(), deploymentContractMajor)}
+		}
+	}
+	return nil
+}
+
 type processIdentity struct {
 	PID       int64
 	StartTime string
@@ -145,6 +178,18 @@ func (runtime *HostRuntime) Observe(ctx context.Context) (RuntimeSnapshot, error
 		observation.TrafficAccepting, _ = body["traffic_accepting"].(bool)
 		observation.ReleaseID, _ = body["release_id"].(string)
 		observation.SourceRevision, _ = body["source_revision"].(string)
+		if contract, ok := body["deployment_contract"].(map[string]any); ok {
+			name, nameOK := contract["name"].(string)
+			major, majorOK := contract["major"].(json.Number)
+			majorValue, majorErr := major.Int64()
+			if !nameOK || name != "agent-vm-control" || !majorOK || majorErr != nil || majorValue != deploymentContractMajor {
+				slotContractsUp = false
+				snapshot.Consistent = false
+				observation.MetricFamilies = runtime.slotMetrics(slot)
+				snapshot.Slots[slot] = observation
+				continue
+			}
+		}
 		observation.StateAuthority, _ = body["state_authority"].(string)
 		process, processOK := processIdentityFromHealth(body)
 		systemdErr := runtime.systemdProcessMatches(ctx, slot, process)
