@@ -174,13 +174,9 @@ test("supports a mobile inspector drawer and fail-closed bootstrap", async ({ pa
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto("?demo=empty");
   await expect(page.getByTestId("overview-page")).toBeVisible();
-  const mobilePositionButton = page.getByRole("button", { name: "Inspector position" });
-  await mobilePositionButton.click({ button: "right" });
-  await page.getByRole("menuitemradio", { name: "Right rail" }).click();
-  await mobilePositionButton.click();
+  await expect(page.getByRole("button", { name: "Inspector position" })).toBeHidden();
   await expect(page.getByRole("menu")).toHaveCount(0);
-  await page.getByRole("button", { name: "Inspector position" }).click({ button: "right" });
-  await page.getByRole("menuitemradio", { name: "Minimize" }).click();
+  await page.getByRole("button", { name: "Close demo inspector" }).click();
   await expect(page.getByRole("button", { name: "Open demo inspector" })).toBeVisible();
   await page.getByRole("button", { name: "Open demo inspector" }).click();
   await expect(page.getByRole("heading", { name: "Demo inspector" })).toBeVisible();
