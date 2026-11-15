@@ -43,7 +43,7 @@ export const MANIFEST_NAME = "release-manifest.json";
 export const CLIENT_SIDECAR_NAME = "client-release.json";
 export const CLIENT_DEPENDENCY_NAMES = new Set([
   "byte-fs.ts", "client-io.ts", "client-release.ts", "client.ts",
-  "guest-source.ts", "sync-native.ts", "sync_worktree.ts",
+  "guest-source.ts", "host-config.ts", "sync-native.ts", "sync_worktree.ts",
 ]);
 
 export const ACTION_NAMES: readonly string[] = Object.freeze([
@@ -123,7 +123,7 @@ export const FIXED_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze(
       ["client-io.ts", "client-io.ts", "support", 0o644],
       ["client-release.ts", "client-release.ts", "support", 0o644],
       ["client.ts", "client.ts", "support", 0o644],
-      ["guest-source.ts", "guest-source.ts", "support", 0o644],
+      ["guest-source.ts", "guest-source.ts", "support", 0o644], ["host-config.ts", "host-config.ts", "support", 0o644],
       ["sync-native.ts", "sync-native.ts", "support", 0o644],
       ["agent_vm_control.ts", "agent_vm_control.ts", "control", 0o755],
       ["release_manifest.py", "release_manifest.py", "support", 0o644],
@@ -1427,7 +1427,7 @@ const PRODUCT_CLIENT_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["client-io.ts", "client-io.ts", "support", 0o644],
   ["client-release.ts", "client-release.ts", "support", 0o644],
   ["client.ts", "client.ts", "support", 0o644],
-  ["guest-source.ts", "guest-source.ts", "support", 0o644],
+  ["guest-source.ts", "guest-source.ts", "support", 0o644], ["host-config.ts", "host-config.ts", "support", 0o644],
   ["sync-native.ts", "sync-native.ts", "support", 0o644],
   ["sync_worktree.ts", "sync_worktree.ts", "support", 0o755],
 ]);
@@ -1438,7 +1438,7 @@ export const PRODUCT_LINUX_LEGACY_ARTIFACTS: readonly ArtifactTuple[] = Object.f
   ["client-io.ts", "client-io.ts", "support", 0o644],
   ["client-release.ts", "client-release.ts", "support", 0o644],
   ["client.ts", "client.ts", "support", 0o644],
-  ["guest-source.ts", "guest-source.ts", "support", 0o644],
+  ["guest-source.ts", "guest-source.ts", "support", 0o644], ["host-config.ts", "host-config.ts", "support", 0o644],
   ["sync-native.ts", "sync-native.ts", "support", 0o644],
   ["sync_worktree.ts", "sync_worktree.ts", "support", 0o755],
   ["agent_vm_control_bridge.ts", "agent_vm_control_bridge.ts", "control", 0o755],

@@ -14,8 +14,8 @@ CLI 见[命令合同](../../docs/specs/agent-vm/contracts/cli.md)；生命周期
 
 ## 检查与维护
 
-先运行 `agent-vm doctor`、`agent-vm admin status`、`agent-vm admin session list` 和 `ssh -G <configured-control-alias>`。
-Alias 和 address 必须来自明确的运维配置；日常 VM SSH 使用 task connection information。
+先运行 `agent-vm --host <alias> doctor`、`agent-vm --host <alias> admin status`、`agent-vm --host <alias> admin session list` 和 `ssh -G <configured-control-alias>`。`agent_vm_incus_init.ts` 同样接受 `--host <alias>`，并从共享宿主配置解析 SSH control entry。
+Alias 和 address 必须来自明确的运维配置；日常 VM SSH 使用 task connection information。Mutation 的记录应保留解析出的 alias、transport 和目标身份。
 Mutation 前检查精确的 candidate revision/checksum、component version、native unit、Incus project/pool/network/profile 和 CT-local filesystem capacity。
 
 计划维护时进入 `agent-vm admin drain enter`，检查 drain status，等待 effective lease 结束，并确认 cleanup 已关闭 NAT/flow 且停止 container。

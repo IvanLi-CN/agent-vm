@@ -11,7 +11,7 @@ test("format-3 client manifest fixes product identity, source and action windows
   try {
     const specs: Array<[string, "client" | "support", number]> = [
       ["agent_vm.ts", "client", 0o755], ["byte-fs.ts", "support", 0o644], ["client-io.ts", "support", 0o644],
-      ["client-release.ts", "support", 0o644], ["client.ts", "support", 0o644], ["guest-source.ts", "support", 0o644],
+      ["client-release.ts", "support", 0o644], ["client.ts", "support", 0o644], ["guest-source.ts", "support", 0o644], ["host-config.ts", "support", 0o644],
       ["sync-native.ts", "support", 0o644], ["sync_worktree.ts", "support", 0o755],
     ];
     const artifacts: Artifact[] = specs.map(([name, role, mode]) => {

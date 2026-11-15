@@ -37,7 +37,7 @@ class ProductManifestTests(unittest.TestCase):
     def test_format_3_client_manifest_is_python_consumable(self) -> None:
         with tempfile.TemporaryDirectory(prefix="agent-vm-product-python-") as raw_root:
             root = Path(raw_root)
-            specs = [("agent_vm.ts", "client", 0o755), ("byte-fs.ts", "support", 0o644), ("client-io.ts", "support", 0o644), ("client-release.ts", "support", 0o644), ("client.ts", "support", 0o644), ("guest-source.ts", "support", 0o644), ("sync-native.ts", "support", 0o644), ("sync_worktree.ts", "support", 0o755)]
+            specs = [("agent_vm.ts", "client", 0o755), ("byte-fs.ts", "support", 0o644), ("client-io.ts", "support", 0o644), ("client-release.ts", "support", 0o644), ("client.ts", "support", 0o644), ("guest-source.ts", "support", 0o644), ("host-config.ts", "support", 0o644), ("sync-native.ts", "support", 0o644), ("sync_worktree.ts", "support", 0o755)]
             artifacts = []
             for name, role, mode in specs:
                 payload = root / name

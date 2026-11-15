@@ -10,7 +10,7 @@ native 控制宿主和 disk-growth guest 要求 Linux、procfs、观测到的 cg
 
 控制宿主必须提供 Incus、systemd、OpenSSH、conntrack-tools、`ss` 和 filesystem-capacity 工具。 Guest growth 要求直接由分区承载的 ext4 或 xfs root，以及 `findmnt`、`lsblk`、`blockdev`、`growpart` 和 `resize2fs` 或 `xfs_growfs`。拓扑未知、工具缺失、virtual-disk size 过期或增长后的容量无法验证时，不能报告成功。工具执行成功本身不足够：disk、partition 和 filesystem 测量必须满足请求大小及现有的 95% filesystem threshold。
 
-客户端和 guest source transaction 直接在 Bun 中运行。按照[发布合同](../../../docs/specs/agent-vm/contracts/release.md)部署完整客户端包：`agent_vm.ts` 和 `sync_worktree.ts` 使用 `0755`，`byte-fs.ts`、`client-io.ts`、`client-release.ts`、`client.ts`、`guest-source.ts` 和 `sync-native.ts` 使用 `0644`。本机 sidecar 对全部八个文件计算 hash。 Python 仍是人工 publisher/wrapper 和 release-policy tooling 边界；它不运行 client、controller 或 guest source fallback。 Source sync 依赖 client/source 合同规定的 Bun FFI、native `flock`、Linux `renameat2`、GNU `timeout`、Git 和 rsync。源文件暂存前必须在 managed image 中验证这些依赖；不得在请求期间安装 runtime。 Controller 的通用 image 前置条件可以独立于 Bun source action 额外包含 Python 等工具。
+客户端和 guest source transaction 直接在 Bun 中运行。按照[发布合同](../../../docs/specs/agent-vm/contracts/release.md)部署完整客户端包：`agent_vm.ts` 和 `sync_worktree.ts` 使用 `0755`，其余支持模块（包括 `host-config.ts`）使用 `0644`。本机 sidecar 对全部九个文件计算 hash。 Python 仍是人工 publisher/wrapper 和 release-policy tooling 边界；它不运行 client、controller 或 guest source fallback。 Source sync 依赖 client/source 合同规定的 Bun FFI、native `flock`、Linux `renameat2`、GNU `timeout`、Git 和 rsync。源文件暂存前必须在 managed image 中验证这些依赖；不得在请求期间安装 runtime。 Controller 的通用 image 前置条件可以独立于 Bun source action 额外包含 Python 等工具。
 
 ## 持久化与传输兼容性
 

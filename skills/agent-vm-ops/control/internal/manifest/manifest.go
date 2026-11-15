@@ -111,6 +111,7 @@ var productLegacyArtifacts = []artifactSpec{
 	{name: "client-release.ts", path: "client-release.ts", role: "support", mode: 0o644},
 	{name: "client.ts", path: "client.ts", role: "support", mode: 0o644},
 	{name: "guest-source.ts", path: "guest-source.ts", role: "support", mode: 0o644},
+	{name: "host-config.ts", path: "host-config.ts", role: "support", mode: 0o644},
 	{name: "sync-native.ts", path: "sync-native.ts", role: "support", mode: 0o644},
 	{name: "sync_worktree.ts", path: "sync_worktree.ts", role: "support", mode: 0o755},
 	{name: "agent_vm_control_bridge.ts", path: "agent_vm_control_bridge.ts", role: "control", mode: 0o755},
