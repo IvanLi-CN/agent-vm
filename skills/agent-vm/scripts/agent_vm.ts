@@ -85,7 +85,7 @@ export async function dispatch(args: Args, client = new Client(), native = inher
     config.hosts[pos[0]] = { transport, control_host: o["control-host"], ...(o["ca-file"] ? { ca_file: o["ca-file"] } : {}), ...(o["token-env"] ? { token_env: o["token-env"] } : {}), ...(o["token-file"] ? { token_file: o["token-file"] } : {}), ...(o["ssh-config"] ? { ssh_config: o["ssh-config"] } : {}), ...(o["identity-file"] ? { identity_file: o["identity-file"] } : {}), ...(o["known-hosts"] ? { known_hosts: o["known-hosts"] } : {}) };
     return { path: writeHostConfig(config, client.env), host: pos[0] };
   }
-  let selection = (client.run !== inherited || client.env.AGENT_VM_RELEASE_MANIFEST?.endsWith("absent.json")) && !o.host && !client.env.AGENT_VM_HOST && !client.env.AGENT_VM_CONTROL_HOST
+  let selection = client.env.AGENT_VM_RELEASE_MANIFEST?.endsWith("absent.json") && !o.host && !client.env.AGENT_VM_HOST && !client.env.AGENT_VM_CONTROL_HOST
     ? { transport: "legacy" as const, control_host: "agent-vm-host", identity: "legacy:agent-vm-host", compatibility: true }
     : resolveHost(typeof o.host === "string" ? o.host : undefined, client.env);
   applyHostSelection(selection, client.env);
