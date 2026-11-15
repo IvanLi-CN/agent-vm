@@ -6,7 +6,7 @@
 
 控制环境必须已经运行 systemd 和 Incus，并具备专属项目、profile、网络、network ACL、存储池及已验证的容器镜像。安装器只读取和校验这些条件，不安装 Incus，不改动 PVE、CT 权限、挂载或配额。域名、OIDC 应用及回调地址须事先注册，提供对应 TLS 证书。缺失条件会汇总为预检阻塞项。
 
-准备相同 `source_revision` 的 Linux 产品 tar 包和部署资料目录。产品包包含 `bin/agent-vm-deploy`；资料目录包含 `materials-manifest.json`。执行发布方提供的摘要校验后，将制品放入 root 拥有且其他用户不可写的目录。不要通过运行未验证的二进制来代替摘要校验。匹配资料的生成方法见 [资料入口](../README.md)。
+准备相同 `source_revision` 的 Linux 产品 tar 包和部署资料目录。产品包必须同时包含槽位控制服务 `bin/agent-vm-control`、槽位外控制器 `bin/agent-vm-deployd`、部署 CLI `bin/agent-vm-deploy`、format-2 客户端支持文件、`release-manifest.json` 和 systemd 资源；资料目录包含 `materials-manifest.json`。安装完成后，`/opt/agent-vm-native/bin/agent-vm-control` 是本机固定 request adapter 的必需文件，不能只安装两个 Deployd 二进制或只把控制服务放在 `/var/lib/agent-vm-native/slots/*/bin/`。执行发布方提供的摘要校验后，将制品放入 root 拥有且其他用户不可写的目录。不要通过运行未验证的二进制来代替摘要校验。匹配资料的生成方法见 [资料入口](../README.md)。
 
 ```sh
 sudo install -d -m 0700 /etc/agent-vm-install-inputs
@@ -77,9 +77,12 @@ sudo /var/tmp/agent-vm-install/agent-vm-deploy install \
 sudo /opt/agent-vm-native/bin/agent-vm-deploy status --json
 sudo systemctl is-active agent-vm-rqlite.service agent-vm-deployd.service agent-vm-native@blue.service agent-vm-caddy.service
 curl --fail http://127.0.0.1:9911/metrics
+test -x /opt/agent-vm-native/bin/agent-vm-control
+test -f /opt/agent-vm-native/release-manifest.json
+test -f /opt/agent-vm-native/client-release.json
 ```
 
-成功结果必须同时包含新鲜一致观测、`active_slot=blue`、blue 就绪且拥有 controller 与 traffic、green 不拥有角色，以及没有恢复中的事务。再按[验收说明](acceptance.md)验证 VM 的创建、执行、续租、释放和销毁。服务进程启动不等于 VM 功能通过。
+成功结果必须同时包含新鲜一致观测、`active_slot=blue`、blue 就绪且拥有 controller 与 traffic、green 不拥有角色、没有恢复中的事务，以及固定 request adapter、release manifest 和 client sidecar 均存在。再按[验收说明](acceptance.md)验证 VM 的创建、执行、续租、释放和销毁。服务进程启动不等于 VM 功能通过。
 
 安装记录为 `/var/lib/agent-vm-native/deployment/install.json`，仅保存阶段、修订、摘要和原事务 ID。文件安装失败后可使用完全相同的输入重试；不匹配的已有文件不会被覆盖。已发送首次启动请求而结果不确定时，安装器不会重放，请先查询原事务：
 
