@@ -10,6 +10,10 @@ Agent VM 在已具备 Incus 运行条件的 Linux 控制环境中运行。Caddy 
 
 从[首次安装步骤](../deploy/docs/install.md)准备受保护输入，运行 `agent-vm-deploy install --config <输入> --bundle <产品包> --materials <资料目录>` 进行只读预检，确认无阻塞后以相同输入加 `--apply` 执行安装。已有安装的线上升级由目标服务器上的 `agent-vm-deploy update --version <semver> --source-revision <sha>` 完成；该命令在服务器本地选择架构、下载并校验正式 release，再把候选交给 deployd 执行 blue-green 事务。Agent 不下载或上传产品 bundle。部署资料布局与配置示例见 [deploy/README.md](../deploy/README.md)。安装路径、双槽位角色、旧状态迁移、升级、有限回滚及恢复细节见[蓝绿部署手册](../deploy/docs/blue-green.md)。全新安装和旧环境迁移必须区别处理，普通蓝绿升级不能替换业务数据库。
 
+## 固定安装布局
+
+Format-2 部署必须同时安装槽位控制服务和槽位外固定控制入口：`/opt/agent-vm-native/bin/agent-vm-control`、`/opt/agent-vm-native/bin/agent-vm-deployd`、`/opt/agent-vm-native/bin/agent-vm-deploy`、`/opt/agent-vm-native/client-release.json`、`/opt/agent-vm-native/release-manifest.json` 及客户端支持文件。槽位目录中的 `agent-vm-control` 只负责蓝绿业务服务，不能替代 `/opt` 下供 SSH request adapter 使用的固定二进制。安装完成后必须逐项检查这些路径；缺失任一项时应保持部署未验收，并使用同一正式 bundle 修复。
+
 ## 验收
 
 检查服务入口、唯一 controller lease、两个槽位观测、新鲜度及 Prometheus 单一 target；还必须在隔离环境验证 VM 创建、执行、续租、释放与销毁。安装、重启和切换记录应能查询原部署事务。缺失数据或结果未知不能视为验收通过，不得通过中断正在使用的生产 VM 来替代隔离验收。
