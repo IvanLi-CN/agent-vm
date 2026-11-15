@@ -112,7 +112,7 @@ try {
     source_revision: revision,
     protocol: 4,
     client_artifact: clientArtifact,
-    client_dependencies: artifacts.filter((item) => ["byte-fs.ts", "client-io.ts", "client-release.ts", "client.ts", "guest-source.ts", "sync-native.ts", "sync_worktree.ts"].includes(item.path)),
+    client_dependencies: artifacts.filter((item) => ["byte-fs.ts", "client-io.ts", "client-release.ts", "client.ts", "guest-source.ts", "host-config.ts", "sync-native.ts", "sync_worktree.ts"].includes(item.path)),
     client_view: manifest.client_view,
   };
   writeFileSync(join(temporaryRoot, "client-release.json"), `${JSON.stringify(sidecar, null, 2)}\n`, { mode: 0o644 });

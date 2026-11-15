@@ -225,7 +225,7 @@ PY
 real_bundle="$test_root/acceptance.tar"
 bundle_members=(
   release-manifest.json client-release.json
-  agent_vm.ts byte-fs.ts client-io.ts client-release.ts client.ts guest-source.ts sync-native.ts sync_worktree.ts
+  agent_vm.ts byte-fs.ts client-io.ts client-release.ts client.ts guest-source.ts host-config.ts sync-native.ts sync_worktree.ts
   agent_vm_control_bridge.ts
   bin/agent-vm-control bin/agent-vm-deployd bin/agent-vm-deploy
   systemd/agent-vm-native.service systemd/agent-vm-native@.service systemd/agent-vm-deployd.service
