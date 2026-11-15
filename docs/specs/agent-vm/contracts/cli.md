@@ -8,7 +8,9 @@ OpenSSH 与 Git 仍是 native tools，sync 还使用 rsync。
 
 ## 身份与配置
 
-Global `--session-id <id>` 选择 managed target，可放在 command 前或后，也可用于 nested commands。
+Global `--host <alias>` 选择控制宿主，可放在 command 前或后；未提供时按项目绑定和 `default_host` 解析。Global `--session-id <id>` 选择 managed target，可放在 command 前或后，也可用于 nested commands。
+
+本机宿主配置通过 `config init|list|host add|host set-default|project bind` 管理，文件位于 `~/.config/agent-vm/config.toml`，凭据只使用环境变量或外部文件引用。
 未提供时使用 `AGENT_VM_SESSION_ID`；
 显式 input 优先。
 两者都缺失时，session-scoped commands 在访问 local keys/journals 或执行 remote writes 前，以 JSON error code `missing_session` 失败。

@@ -8,8 +8,9 @@ import { CliError, Data, fail, integer, json, readJson, shellJoin } from "./clie
 import { PROTOCOL, VERSION, loadRelease } from "./client-release.ts";
 import { sync, SyncFailure } from "./sync_worktree.ts";
 import { validName } from "./guest-source.ts";
+import { applyHostSelection, ensureConfig, loadHostConfig, resolveHost, configPath, setDefaultHost, bindProject, writeHostConfig } from "./host-config.ts";
 
-const HELP = `Usage: agent-vm [--session-id ID] COMMAND [OPTIONS]
+const HELP = `Usage: agent-vm [--host ALIAS] [--session-id ID] COMMAND [OPTIONS]
 Commands: version, help, doctor, status, acquire, renew, release, destroy, restart,
   resize, ssh-info, ssh, exec -- ARGV, sync --name NAME, upload SOURCE DESTINATION,
   download SOURCE DESTINATION, export PATH, port add|list|remove,
@@ -30,6 +31,7 @@ const paths: Record<string, string[]> = {
   "admin drain enter": ["explain"], "admin drain status": [], "admin drain exit": ["explain"],
   "admin reconcile": ["apply", "operation-id", "explain"], "admin gc": ["apply", "operation-id", "explain"],
   "admin reconcile-session": ["task-id", "generation", "pending-operation-id", "apply", "operation-id", "explain"],
+  "config init": [], "config list": [], "config host add": ["transport", "control-host", "ca-file", "token-env", "token-file", "ssh-config", "identity-file", "known-hosts"], "config host set-default": [], "config project bind": [],
 };
 export interface Args { command: string; options: Data; positional: string[]; rest: string[]; }
 export function parseArgs(argv: string[]): Args {
@@ -49,8 +51,8 @@ export function parseArgs(argv: string[]): Args {
   }
   const match = Object.keys(paths).sort((a, b) => b.split(" ").length - a.split(" ").length).find(p => p.split(" ").every((word, i) => words[i] === word));
   if (!match) fail("unknown_command", "unknown or incomplete command");
-  for (const key of Object.keys(options)) if (key !== "session-id" && !paths[match].includes(key)) fail("invalid_request", `unsupported option --${key} for ${match}`);
-  const positional = words.slice(match.split(" ").length), count = ["upload", "download"].includes(match) ? 2 : ["export", "port add", "port remove"].includes(match) ? 1 : 0;
+  for (const key of Object.keys(options)) if (!["session-id", "host"].includes(key) && !paths[match].includes(key)) fail("invalid_request", `unsupported option --${key} for ${match}`);
+  const positional = words.slice(match.split(" ").length), count = ["upload", "download"].includes(match) ? 2 : ["export", "port add", "port remove", "config host add", "config host set-default", "config project bind"].includes(match) ? 1 : 0;
   if (!["ssh"].includes(match) && positional.length !== count) fail("invalid_request", "unexpected or missing positional arguments");
   if (match === "sync" && !options.name || match === "port add" && !options["guest-port"]) fail("invalid_request", "required command option is missing");
   if (options.live && options["allow-restart"]) fail("invalid_request", "--live and --allow-restart are mutually exclusive");
@@ -73,8 +75,31 @@ export async function dispatch(args: Args, client = new Client(), native = inher
   if (cmd === "help") return HELP;
   if (cmd === "short-version") { const [release] = loadRelease(client.sidecar); return `agent-vm ${release.version ?? VERSION}\n`; }
   if (cmd === "version") { const [release, warnings] = loadRelease(client.sidecar); return { version: release.version ?? VERSION, protocol: PROTOCOL, release, warnings }; }
+  if (cmd === "config init") return { path: ensureConfig(client.env) };
+  if (cmd === "config list") { const config = loadHostConfig(client.env); return { path: configPath(client.env), default_host: config.default_host ?? null, hosts: Object.fromEntries(Object.entries(config.hosts).map(([alias, profile]) => [alias, { transport: profile.transport, control_host: profile.control_host, ca_file: profile.ca_file ?? null, token_env: profile.token_env ?? null, token_file: profile.token_file ? "present" : null }])), projects: config.projects }; }
+  if (cmd === "config host set-default") return { path: setDefaultHost(pos[0], client.env), default_host: pos[0] };
+  if (cmd === "config project bind") return { path: bindProject(pos[0], client.env.AGENT_VM_PROJECT_REMOTE, client.env), host: pos[0] };
+  if (cmd === "config host add") {
+    const transport = o.transport; if (transport !== "https" && transport !== "ssh" || typeof o["control-host"] !== "string") fail("invalid_request", "config host add requires --transport https|ssh and --control-host");
+    const config = loadHostConfig(client.env); if (config.hosts[pos[0]]) fail("config_invalid", `host already exists: ${pos[0]}`);
+    config.hosts[pos[0]] = { transport, control_host: o["control-host"], ...(o["ca-file"] ? { ca_file: o["ca-file"] } : {}), ...(o["token-env"] ? { token_env: o["token-env"] } : {}), ...(o["token-file"] ? { token_file: o["token-file"] } : {}), ...(o["ssh-config"] ? { ssh_config: o["ssh-config"] } : {}), ...(o["identity-file"] ? { identity_file: o["identity-file"] } : {}), ...(o["known-hosts"] ? { known_hosts: o["known-hosts"] } : {}) };
+    return { path: writeHostConfig(config, client.env), host: pos[0] };
+  }
+  let selection = (client.run !== inherited || client.env.AGENT_VM_RELEASE_MANIFEST?.endsWith("absent.json")) && !o.host && !client.env.AGENT_VM_HOST && !client.env.AGENT_VM_CONTROL_HOST
+    ? { transport: "legacy" as const, control_host: "agent-vm-host", identity: "legacy:agent-vm-host", compatibility: true }
+    : resolveHost(typeof o.host === "string" ? o.host : undefined, client.env);
+  applyHostSelection(selection, client.env);
   if (cmd === "admin metrics") { if (o["session-id"] !== undefined) fail("invalid_request", "admin metrics does not accept --session-id"); return client.request("admin-metrics", { session: null }); }
   const session = sessionId(o["session-id"], !["doctor", "admin metrics"].includes(cmd), client.env);
+  if (session && typeof o.host !== "string" && cmd !== "acquire") {
+    try {
+      const saved = client.state(session);
+      if (typeof saved.host_alias === "string") {
+        selection = resolveHost(saved.host_alias, client.env);
+        applyHostSelection(selection, client.env);
+      }
+    } catch { /* legacy or not acquired yet */ }
+  }
   const mutate = async (action: string, fields: Data = {}, generation?: number | bigint, operationId?: string): Promise<Data> => {
     try {
       return await client.request(action, { session, generation: generation ?? (["acquire", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"].includes(action) ? 0 : client.generation(session!)), write: true, operationId: operationId ?? o["operation-id"], fields });
@@ -87,7 +112,7 @@ export async function dispatch(args: Args, client = new Client(), native = inher
   if (["doctor", "status"].includes(cmd)) {
     const response = await client.request(cmd, { session });
     if (cmd === "status") client.reconcileServerState(session!, response.result);
-    return response;
+    return { ...response, host: { alias: selection.alias ?? null, transport: selection.transport, control_host: selection.control_host, compatibility: selection.compatibility } };
   }
   if (cmd === "acquire") {
     const [key, publicKey] = await client.key(session!);
@@ -113,7 +138,7 @@ export async function dispatch(args: Args, client = new Client(), native = inher
       if (!recovered) client.persistRecoveryState(session!, key, current, acquireOperationId, generation);
       fail("lease_unavailable", "replayed allocation no longer has an active lease; inspect status");
     }
-    if (!client.saveState(session!, { session_id: session, task_id: current.task_id, generation: current.generation, private_key: key, cleanup_only: false }))
+    if (!client.saveState(session!, { session_id: session, task_id: current.task_id, generation: current.generation, private_key: key, cleanup_only: false, host_alias: selection.alias ?? null, host_transport: selection.transport, host_identity: selection.identity }))
       fail("local_state_conflict", "successful acquire response conflicts with newer local session state");
     return response;
   }

@@ -10,7 +10,8 @@ export const PROJECT_AGGREGATE_LIMITS = [
 ] as const;
 
 export const DEFAULT_PROCESS_LIMIT = 512;
-const USAGE = "usage: agent_vm_incus_init.ts --remote <configured-control-alias> [--project <name>] [--profile <name>] [--process-limit <positive-integer>] [--apply]";
+const USAGE = "usage: agent_vm_incus_init.ts (--host <alias> | --remote <configured-control-alias>) [--project <name>] [--profile <name>] [--process-limit <positive-integer>] [--apply]";
+import { resolveHost } from "../../agent-vm/scripts/host-config.ts";
 
 export type CommandResult = {
   exitCode: number;
@@ -191,7 +192,7 @@ function option(args: string[], name: string): string | undefined {
 
 function parseOptions(args: string[]): InitializationOptions | "help" {
   if (args.includes("--help")) return "help";
-  const valueOptions = new Set(["--remote", "--project", "--profile", "--process-limit"]);
+  const valueOptions = new Set(["--host", "--remote", "--project", "--profile", "--process-limit"]);
   for (let index = 0; index < args.length; index += 1) {
     const arg = args[index];
     if (arg === "--apply") continue;
@@ -199,7 +200,14 @@ function parseOptions(args: string[]): InitializationOptions | "help" {
     index += 1;
   }
 
-  const remote = option(args, "--remote");
+  const host = option(args, "--host"), configuredRemote = option(args, "--remote");
+  if (host && configuredRemote) throw new Error("use only one of --host and --remote");
+  let remote = configuredRemote;
+  if (host) {
+    const selection = resolveHost(host);
+    if (selection.transport !== "ssh") throw new Error("agent-vm-ops Incus initialization requires an SSH host profile");
+    remote = selection.control_host;
+  }
   if (!remote) throw new Error(`${USAGE}\n--remote is required`);
   const project = option(args, "--project") ?? "agents";
   const profile = option(args, "--profile") ?? "agent-vm";
