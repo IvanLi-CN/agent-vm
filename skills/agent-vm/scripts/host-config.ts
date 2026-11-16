@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { CliError, Data, fail, record } from "./client-io.ts";
 
 export type HostTransport = "https" | "ssh";
-export type HostProfile = { transport: HostTransport; control_host: string; ca_file?: string; token_env?: string; token_file?: string; ssh_config?: string; identity_file?: string; known_hosts?: string };
+export type HostProfile = { transport: HostTransport; control_host: string; ca_file?: string; token_env?: string; token_file?: string; ssh_config?: string; identity_file?: string; known_hosts?: string; remote_request?: string; remote_socket?: string };
 export type HostConfig = { default_host?: string; hosts: Record<string, HostProfile>; projects: Record<string, string> };
 export type HostSelection = { alias?: string; transport: HostTransport | "legacy"; control_host: string; identity: string; compatibility: boolean; profile?: HostProfile };
 
@@ -15,7 +15,7 @@ function expand(value: string): string { return value.startsWith("~/") ? join(ho
 function parseProfile(value: unknown, alias: string): HostProfile {
   if (!record(value) || (value.transport !== "https" && value.transport !== "ssh") || typeof value.control_host !== "string" || !value.control_host.trim()) fail("config_invalid", `host ${alias} must define transport and control_host`);
   const profile: HostProfile = { transport: value.transport, control_host: value.control_host };
-  for (const key of ["ca_file", "token_env", "token_file", "ssh_config", "identity_file", "known_hosts"] as const) if (value[key] !== undefined) {
+  for (const key of ["ca_file", "token_env", "token_file", "ssh_config", "identity_file", "known_hosts", "remote_request", "remote_socket"] as const) if (value[key] !== undefined) {
     if (typeof value[key] !== "string" || !value[key].trim()) fail("config_invalid", `host ${alias}.${key} must be a non-empty string`);
     profile[key] = expand(value[key]);
   }
@@ -67,6 +67,8 @@ export function applyHostSelection(selection: HostSelection, env: Record<string,
   if (profile?.token_env) { if (!env[profile.token_env]) fail("config_missing", `credential environment variable ${profile.token_env} is missing`); env.AGENT_VM_CONTROL_TOKEN = env[profile.token_env]; }
   if (profile?.token_file) { try { env.AGENT_VM_CONTROL_TOKEN = readFileSync(profile.token_file, "utf8").trim(); } catch { fail("config_missing", `credential file is missing for host ${selection.alias}`); } }
   if (profile?.ssh_config) env.AGENT_VM_SSH_CONFIG = profile.ssh_config;
+  if (profile?.remote_request) env.AGENT_VM_REMOTE_REQUEST = profile.remote_request;
+  if (profile?.remote_socket) env.AGENT_VM_REMOTE_SOCKET = profile.remote_socket;
   return env;
 }
 export function ensureConfig(env: Record<string, string | undefined> = process.env): string {
@@ -80,7 +82,7 @@ export function writeHostConfig(config: HostConfig, env: Record<string, string |
   if (config.default_host) lines.push(`default_host = ${quote(config.default_host)}`, "");
   for (const [alias, profile] of Object.entries(config.hosts)) {
     lines.push(`[hosts.${alias}]`, `transport = ${quote(profile.transport)}`, `control_host = ${quote(profile.control_host)}`);
-    for (const key of ["ca_file", "token_env", "token_file", "ssh_config", "identity_file", "known_hosts"] as const) if (profile[key]) lines.push(`${key} = ${quote(profile[key]!)}`);
+    for (const key of ["ca_file", "token_env", "token_file", "ssh_config", "identity_file", "known_hosts", "remote_request", "remote_socket"] as const) if (profile[key]) lines.push(`${key} = ${quote(profile[key]!)}`);
     lines.push("");
   }
   for (const [remote, alias] of Object.entries(config.projects)) lines.push(`[projects.${quote(remote)}]`, `host = ${quote(alias)}`, "");

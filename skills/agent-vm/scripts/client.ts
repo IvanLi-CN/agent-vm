@@ -402,7 +402,7 @@ export class Client {
       }
     }
     const timeout = timeoutSeconds(action, fields);
-    const transport = selectedTransport ?? "legacy-bun";
+    const transport = selectedTransport === "ssh" ? "go-request" : selectedTransport ?? "legacy-bun";
     const secret = https?.token;
     const remoteCommand = transport === "go-request"
       ? shellJoin([this.env.AGENT_VM_REMOTE_REQUEST ?? "/opt/agent-vm-native/bin/agent-vm-control", "request", "--socket", this.env.AGENT_VM_REMOTE_SOCKET ?? "/run/agent-vm-native/control.sock", "--timeout", `${timeout}s`])
