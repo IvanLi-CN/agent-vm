@@ -41,13 +41,14 @@ function sha256(path: string): string {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
-export function releaseBuilderCommand(version: string, source: string, targetName: string, output: string): string[] {
+export function releaseBuilderCommand(version: string, source: string, targetName: string, output: string, bootstrap = false): string[] {
   const builder = "build_product_release.ts";
   const builderArgs = ["--version", version, "--source-revision", source, "--target", targetName];
   return [
     process.execPath,
     join(import.meta.dir, builder),
     ...builderArgs,
+    ...(bootstrap ? ["--bootstrap"] : []),
     "--output", output,
   ];
 }
@@ -298,11 +299,19 @@ async function release(): Promise<void> {
   const assets = {
     [`agent-vm-${version}-deployment-materials.tar`]: join(artifactRoot, `agent-vm-${version}-deployment-materials.tar`),
     [`agent-vm-${version}-client.tar`]: join(artifactRoot, `agent-vm-${version}-client.tar`),
-    [`agent-vm-${version}-linux-amd64.tar`]: join(artifactRoot, `agent-vm-${version}-linux-amd64.tar`),
-    [`agent-vm-${version}-linux-arm64.tar`]: join(artifactRoot, `agent-vm-${version}-linux-arm64.tar`),
+    [`agent-vm-native-${version}-linux-amd64.tar`]: join(artifactRoot, `agent-vm-native-${version}-linux-amd64.tar`),
+    [`agent-vm-native-${version}-linux-arm64.tar`]: join(artifactRoot, `agent-vm-native-${version}-linux-arm64.tar`),
+    [`agent-vm-native-bootstrap-${version}-linux-amd64.tar`]: join(artifactRoot, `agent-vm-native-bootstrap-${version}-linux-amd64.tar`),
+    [`agent-vm-native-bootstrap-${version}-linux-arm64.tar`]: join(artifactRoot, `agent-vm-native-bootstrap-${version}-linux-arm64.tar`),
   };
-  const targets: Record<string, string> = { client: assets[`agent-vm-${version}-client.tar`], "linux/amd64": assets[`agent-vm-${version}-linux-amd64.tar`], "linux/arm64": assets[`agent-vm-${version}-linux-arm64.tar`] };
+  const targets: Record<string, string> = { client: assets[`agent-vm-${version}-client.tar`], "linux/amd64": assets[`agent-vm-native-${version}-linux-amd64.tar`], "linux/arm64": assets[`agent-vm-native-${version}-linux-arm64.tar`] };
   for (const [targetName, output] of Object.entries(targets)) if (!existsSync(output)) runBuilder(version, source, targetName, output);
+  for (const [targetName, output] of [["linux/amd64", assets[`agent-vm-native-bootstrap-${version}-linux-amd64.tar`]], ["linux/arm64", assets[`agent-vm-native-bootstrap-${version}-linux-arm64.tar`]]] as const) {
+    if (!existsSync(output)) {
+      const result = Bun.spawnSync(releaseBuilderCommand(version, source, targetName, output, true), { cwd: repositoryRoot, env: releaseBuilderEnvironment(process.env), stdout: "pipe", stderr: "pipe" });
+      if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr).trim() || "bootstrap package build failed");
+    }
+  }
   const materialsArchive = assets[`agent-vm-${version}-deployment-materials.tar`];
   if (!existsSync(materialsArchive)) buildMaterialsArchive(repositoryRoot, materialsArchive, source);
   const packageDigests = Object.fromEntries(Object.entries(assets).map(([name, path]) => [name, sha256(path)]));

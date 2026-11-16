@@ -19,7 +19,8 @@ import { tmpdir } from "node:os";
 
 import {
   build_product_manifest,
-  PRODUCT_LINUX_ARTIFACTS,
+  PRODUCT_LINUX_LEGACY_ARTIFACTS,
+  PRODUCT_NATIVE_LINUX_ARTIFACTS,
   PRODUCT_MANIFEST_FORMAT,
   verify_client_sidecar,
   verify_product_bundle,
@@ -41,8 +42,10 @@ const version = value("--version");
 const revision = value("--source-revision");
 if (!/^[0-9a-f]{40}$/.test(revision)) throw new Error("source revision must be a 40-character lowercase Git revision");
 const rawTarget = value("--target");
+const bootstrap = args.includes("--bootstrap");
 const targetMatch = /^(linux)\/(amd64|arm64)$/.exec(rawTarget);
 if (rawTarget !== "client" && !targetMatch) throw new Error("target must be client or linux/amd64 or linux/arm64");
+if (bootstrap && rawTarget === "client") throw new Error("bootstrap assets require a Linux target");
 const defaultTransport: ClientTransport = "go-request";
 const rawTransport = args.includes("--transport") ? value("--transport") : defaultTransport;
 if (rawTransport === "https") throw new Error("https transport is validation-only until bundled client HTTPS support is integrated");
@@ -105,7 +108,7 @@ function packageFiles(target: "client" | "linux/amd64" | "linux/arm64", binaryPa
       ...CLIENT_DEPENDENCIES.map(([name, mode]) => [name, name, "support", mode] as const),
     ];
   }
-  return [...PRODUCT_LINUX_ARTIFACTS];
+  return bootstrap ? [...PRODUCT_LINUX_LEGACY_ARTIFACTS] : [...PRODUCT_NATIVE_LINUX_ARTIFACTS];
 }
 
 let webAssetsManifestPath = "";
@@ -151,14 +154,15 @@ try {
   }
 
   const manifest = build_product_manifest(version, revision, artifacts, {
-    format: rawTarget === "client" ? 3 : PRODUCT_MANIFEST_FORMAT,
+    format: rawTarget === "client" || bootstrap ? 3 : PRODUCT_MANIFEST_FORMAT,
     target,
     transport,
   });
   writeFileSync(join(temporaryRoot, "release-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });
-  const clientArtifact = artifacts.find((item) => item.role === "client");
-  if (!clientArtifact) throw new Error("product manifest has no client artifact");
-  const sidecar = {
+  if (rawTarget === "client" || bootstrap) {
+    const clientArtifact = artifacts.find((item) => item.role === "client");
+    if (!clientArtifact) throw new Error("product manifest has no client artifact");
+    const sidecar = {
     format: manifest.format,
     version,
     source_revision: revision,
@@ -166,15 +170,16 @@ try {
     client_artifact: clientArtifact,
     client_dependencies: artifacts.filter((item) => CLIENT_DEPENDENCIES.some(([name]) => name === item.path)),
     client_view: manifest.client_view,
-  };
-  writeFileSync(join(temporaryRoot, "client-release.json"), `${JSON.stringify(sidecar, null, 2)}\n`, { mode: 0o644 });
+    };
+    writeFileSync(join(temporaryRoot, "client-release.json"), `${JSON.stringify(sidecar, null, 2)}\n`, { mode: 0o644 });
+  }
   verify_product_bundle(temporaryRoot, manifest);
-  verify_client_sidecar(temporaryRoot, manifest);
+  if (rawTarget === "client" || bootstrap) verify_client_sidecar(temporaryRoot, manifest);
 
   mkdirSync(dirname(output), { recursive: true, mode: 0o750 });
   const temporaryArchive = `${output}.tmp-${process.pid}`;
   rmSync(temporaryArchive, { force: true });
-  const members = ["release-manifest.json", "client-release.json", ...artifacts.map((item) => item.path)];
+  const members = ["release-manifest.json", ...(rawTarget === "client" || bootstrap ? ["client-release.json"] : []), ...artifacts.map((item) => item.path)];
   const tar = Bun.spawnSync(["tar", "-cf", temporaryArchive, "-C", temporaryRoot, "--no-recursion", ...members], {
     stdout: "pipe",
     stderr: "pipe",

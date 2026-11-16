@@ -71,7 +71,7 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 	if runtime.GOOS != "linux" || (arch != "amd64" && arch != "arm64") {
 		return "", fmt.Errorf("unsupported deployment target %s/%s", runtime.GOOS, arch)
 	}
-	assetName := fmt.Sprintf("agent-vm-%s-linux-%s.tar", version, arch)
+	assetName := fmt.Sprintf("agent-vm-native-%s-linux-%s.tar", version, arch)
 	client := &http.Client{}
 	response, err := metadata(ctx, client, version)
 	if err != nil {

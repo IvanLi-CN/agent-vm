@@ -111,7 +111,6 @@ var productLegacyArtifacts = []artifactSpec{
 	{name: "client-release.ts", path: "client-release.ts", role: "support", mode: 0o644},
 	{name: "client.ts", path: "client.ts", role: "support", mode: 0o644},
 	{name: "guest-source.ts", path: "guest-source.ts", role: "support", mode: 0o644},
-	{name: "host-config.ts", path: "host-config.ts", role: "support", mode: 0o644},
 	{name: "sync-native.ts", path: "sync-native.ts", role: "support", mode: 0o644},
 	{name: "sync_worktree.ts", path: "sync_worktree.ts", role: "support", mode: 0o755},
 	{name: "agent_vm_control_bridge.ts", path: "agent_vm_control_bridge.ts", role: "control", mode: 0o755},
@@ -127,6 +126,15 @@ var goArtifacts = append(append([]artifactSpec(nil), productLegacyArtifacts...),
 )
 
 var productArtifacts = append([]artifactSpec(nil), goArtifacts...)
+
+var nativeArtifacts = []artifactSpec{
+	{name: "agent-vm-control", path: "bin/agent-vm-control", role: "control", mode: 0o755},
+	{name: "agent-vm-deployd", path: "bin/agent-vm-deployd", role: "control", mode: 0o755},
+	{name: "agent-vm-deploy", path: "bin/agent-vm-deploy", role: "control", mode: 0o755},
+	{name: "unit:agent-vm-native@.service", path: "systemd/agent-vm-native@.service", role: "unit", mode: 0o644},
+	{name: "unit:agent-vm-native.service", path: "systemd/agent-vm-native.service", role: "unit", mode: 0o644},
+	{name: "unit:agent-vm-deployd.service", path: "systemd/agent-vm-deployd.service", role: "unit", mode: 0o644},
+}
 
 var historicalProductArtifacts = append(append([]artifactSpec(nil), productArtifacts...),
 	artifactSpec{name: "unit:agent-vm-web.service", path: "systemd/agent-vm-web.service", role: "unit", mode: 0o644},
@@ -578,9 +586,19 @@ func validateProductArtifacts(value any, format int64) ([]checkedArtifact, error
 		seenPaths[path] = true
 		declarations = append(declarations, declaration{name: name, path: path, role: role, sha: sha, mode: mode})
 	}
+	nativeOnly := true
+	for _, raw := range values {
+		if item, ok := raw.(map[string]any); ok && item["role"] == "client" {
+			nativeOnly = false
+			break
+		}
+	}
 	expectedSets := [][]artifactSpec{productLegacyArtifacts}
 	if format == ProductFormat {
 		expectedSets = [][]artifactSpec{productArtifacts, historicalProductArtifacts}
+		if nativeOnly {
+			expectedSets = [][]artifactSpec{nativeArtifacts}
+		}
 	}
 	var expectedArtifacts []artifactSpec
 	for _, candidate := range expectedSets {
