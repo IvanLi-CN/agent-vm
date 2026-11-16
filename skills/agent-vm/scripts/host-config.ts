@@ -7,7 +7,7 @@ import { CliError, Data, fail, record } from "./client-io.ts";
 export type HostTransport = "https" | "ssh";
 export type HostProfile = { transport: HostTransport; control_host: string; ca_file?: string; token_env?: string; token_file?: string; ssh_config?: string; identity_file?: string; known_hosts?: string; remote_request?: string; remote_socket?: string };
 export type HostConfig = { default_host?: string; hosts: Record<string, HostProfile>; projects: Record<string, string> };
-export type HostSelection = { alias?: string; transport: HostTransport | "legacy"; control_host: string; identity: string; compatibility: boolean; profile?: HostProfile };
+export type HostSelection = { alias: string; transport: HostTransport; control_host: string; identity: string; compatibility: false; profile: HostProfile };
 
 const ALIAS = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 export function configPath(env: Record<string, string | undefined> = process.env): string { return join(env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "agent-vm", "config.toml"); }
@@ -50,17 +50,14 @@ export function normalizeRemote(remote: string): string {
 }
 export function resolveHost(explicit?: string, env: Record<string, string | undefined> = process.env): HostSelection {
   const config = loadHostConfig(env), alias = explicit ?? env.AGENT_VM_HOST ?? (projectRemote(env) ? config.projects[normalizeRemote(projectRemote(env)!)] : undefined) ?? config.default_host;
-  if (!alias) {
-    if (env.AGENT_VM_CONTROL_HOST) return { transport: (env.AGENT_VM_TRANSPORT as HostTransport) ?? "legacy", control_host: env.AGENT_VM_CONTROL_HOST, identity: `${env.AGENT_VM_TRANSPORT ?? "legacy"}:${env.AGENT_VM_CONTROL_HOST}`, compatibility: true };
-    fail("host_selection_required", "select an Agent VM host with --host or configure default_host");
-  }
+  if (!alias) fail("host_selection_required", "select an Agent VM host with --host or configure default_host");
   if (!ALIAS.test(alias) || !config.hosts[alias]) fail("config_invalid", `unknown Agent VM host alias: ${alias}`);
   const profile = config.hosts[alias];
   return { alias, transport: profile.transport, control_host: profile.control_host, identity: `${profile.transport}:${profile.control_host}`, compatibility: false, profile };
 }
 export function applyHostSelection(selection: HostSelection, env: Record<string, string | undefined>): Record<string, string | undefined> {
   env.AGENT_VM_CONTROL_HOST = selection.control_host;
-  if (selection.transport !== "legacy") env.AGENT_VM_TRANSPORT = selection.transport;
+  env.AGENT_VM_TRANSPORT = selection.transport;
   const profile = selection.profile;
   if (profile?.ca_file) env.AGENT_VM_CONTROL_CA = profile.ca_file;
   if (profile?.transport === "https" && !profile.token_env && !profile.token_file) fail("config_missing", `HTTPS host ${selection.alias} has no credential reference`);
@@ -69,6 +66,8 @@ export function applyHostSelection(selection: HostSelection, env: Record<string,
   if (profile?.ssh_config) env.AGENT_VM_SSH_CONFIG = profile.ssh_config;
   if (profile?.remote_request) env.AGENT_VM_REMOTE_REQUEST = profile.remote_request;
   if (profile?.remote_socket) env.AGENT_VM_REMOTE_SOCKET = profile.remote_socket;
+  if (profile?.identity_file) env.AGENT_VM_SSH_IDENTITY = profile.identity_file;
+  if (profile?.known_hosts) env.AGENT_VM_SSH_KNOWN_HOSTS = profile.known_hosts;
   return env;
 }
 export function ensureConfig(env: Record<string, string | undefined> = process.env): string {

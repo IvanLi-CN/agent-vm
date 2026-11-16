@@ -18,9 +18,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
-  CLIENT_TRANSPORTS,
   build_product_manifest,
-  LEGACY_PRODUCT_MANIFEST_FORMAT,
   PRODUCT_LINUX_ARTIFACTS,
   PRODUCT_MANIFEST_FORMAT,
   verify_client_sidecar,
@@ -31,7 +29,7 @@ import {
 } from "./product-manifest.ts";
 import { CLIENT_DEPENDENCIES } from "../../agent-vm/scripts/client-release.ts";
 
-const usage = "usage: build_product_release.ts --version <semver> --source-revision <40-hex> --target <client|linux/amd64|linux/arm64> --output <absolute-path> [--transport <legacy-bun|go-request|https>]";
+const usage = "usage: build_product_release.ts --version <semver> --source-revision <40-hex> --target <client|linux/amd64|linux/arm64> --output <absolute-path> [--transport <go-request>]";
 const args = process.argv.slice(2);
 const value = (name: string): string => {
   const index = args.indexOf(name);
@@ -45,10 +43,9 @@ if (!/^[0-9a-f]{40}$/.test(revision)) throw new Error("source revision must be a
 const rawTarget = value("--target");
 const targetMatch = /^(linux)\/(amd64|arm64)$/.exec(rawTarget);
 if (rawTarget !== "client" && !targetMatch) throw new Error("target must be client or linux/amd64 or linux/arm64");
-const defaultTransport: ClientTransport = rawTarget === "client" ? "legacy-bun" : "go-request";
+const defaultTransport: ClientTransport = "go-request";
 const rawTransport = args.includes("--transport") ? value("--transport") : defaultTransport;
-if (!CLIENT_TRANSPORTS.includes(rawTransport as ClientTransport)) throw new Error("transport must be legacy-bun, go-request, or https");
-if (rawTarget !== "client" && rawTransport === "legacy-bun") throw new Error("Linux product releases require go-request or https transport");
+if (rawTransport !== "go-request") throw new Error("product releases require go-request transport");
 if (rawTransport === "https") throw new Error("https transport is validation-only until bundled client HTTPS support is integrated");
 const transport = rawTransport as ClientTransport;
 const rawOutput = value("--output");
@@ -154,7 +151,7 @@ try {
   }
 
   const manifest = build_product_manifest(version, revision, artifacts, {
-    format: rawTarget === "client" ? LEGACY_PRODUCT_MANIFEST_FORMAT : PRODUCT_MANIFEST_FORMAT,
+    format: rawTarget === "client" ? 3 : PRODUCT_MANIFEST_FORMAT,
     target,
     transport,
   });

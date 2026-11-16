@@ -13,9 +13,8 @@ test("host profiles resolve explicit, project and global defaults", () => {
   expect(resolveHost(undefined, { ...e, AGENT_VM_PROJECT_REMOTE: "github.com/other/repo" }).alias).toBe("109");
 });
 
-test("legacy control host remains an explicit compatibility path", () => {
-  const selection = resolveHost(undefined, { XDG_CONFIG_HOME: `/tmp/no-${crypto.randomUUID()}`, AGENT_VM_CONTROL_HOST: "legacy-host" });
-  expect(selection.compatibility).toBe(true); expect(selection.control_host).toBe("legacy-host");
+test("legacy control host environment fallback is rejected", () => {
+  expect(() => resolveHost(undefined, { XDG_CONFIG_HOME: `/tmp/no-${crypto.randomUUID()}`, AGENT_VM_CONTROL_HOST: "legacy-host" })).toThrow("select an Agent VM host");
 });
 
 test("project remotes normalize and config shape is read without secrets", () => {

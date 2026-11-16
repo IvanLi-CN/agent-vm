@@ -128,7 +128,7 @@ test("format-2 release CLI rejects HTTPS before creating an archive", () => {
       { cwd: new URL("../", import.meta.url).pathname, stdout: "pipe", stderr: "pipe" },
     );
     expect(result.exitCode).not.toBe(0);
-    expect(new TextDecoder().decode(result.stderr)).toContain("validation-only");
+    expect(new TextDecoder().decode(result.stderr)).toContain("go-request transport");
     expect(existsSync(output)).toBe(false);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });

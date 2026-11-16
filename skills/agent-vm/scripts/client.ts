@@ -389,6 +389,7 @@ export class Client {
     const [metadata, warnings] = loadRelease(this.sidecar);
     request.compatibility = capability(action, metadata);
     const selectedTransport = this.env.AGENT_VM_TRANSPORT ?? metadata.transport;
+    if (selectedTransport !== "https" && selectedTransport !== "go-request" && selectedTransport !== "ssh") fail("release_metadata_invalid", "release metadata must select go-request or https transport");
     const https = selectedTransport === "https" ? httpsConfig(this.env) : undefined;
     let op: string | undefined;
     if (write) {
@@ -402,15 +403,15 @@ export class Client {
       }
     }
     const timeout = timeoutSeconds(action, fields);
-    const transport = selectedTransport === "ssh" ? "go-request" : selectedTransport ?? "legacy-bun";
+    const transport = selectedTransport === "ssh" ? "go-request" : selectedTransport;
     const secret = https?.token;
     const remoteCommand = transport === "go-request"
       ? shellJoin([this.env.AGENT_VM_REMOTE_REQUEST ?? "/opt/agent-vm-native/bin/agent-vm-control", "request", "--socket", this.env.AGENT_VM_REMOTE_SOCKET ?? "/run/agent-vm-native/control.sock", "--timeout", `${timeout}s`])
-      : shellJoin(["bun", this.env.AGENT_VM_REMOTE_CONTROL ?? "/opt/agent-vm-native/agent_vm_control.ts"]);
+      : undefined;
     const sshOptions = this.env.AGENT_VM_SSH_CONFIG ? ["-F", this.env.AGENT_VM_SSH_CONFIG] : [];
     const result = transport === "https"
       ? await this.httpsRequest(request, timeout, https!)
-      : await this.run(["ssh", ...sshOptions, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", this.env.AGENT_VM_CONTROL_HOST ?? "agent-vm-host", remoteCommand], { input: json(request), timeoutMs: timeout * 1000, stdoutLimit: STDOUT_LIMIT, stderrLimit: STDERR_LIMIT, env: this.env });
+      : await this.run(["ssh", ...sshOptions, "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", this.env.AGENT_VM_CONTROL_HOST!, remoteCommand!], { input: json(request), timeoutMs: timeout * 1000, stdoutLimit: STDOUT_LIMIT, stderrLimit: STDERR_LIMIT, env: this.env });
     const detail = { operation_id: request.operation_id ?? null, generation: request.generation ?? null, transport, stream_cleanup_verified: result.streamCleanupVerified, ...(!result.streamCleanupVerified ? { stream_cleanup_error: "reader_cancelled_before_eof" } : {}) };
     if (result.timedOut) fail("remote_timeout", "control outcome is uncertain; retry the same operation ID", detail);
     if (!result.streamCleanupVerified) fail("remote_failed", "control response stream cleanup is not verified", detail, result.code || 1);

@@ -18,7 +18,6 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 import {
-  CLIENT_TRANSPORTS,
   GO_FIXED_ARTIFACTS,
   build_go_manifest,
   verify_go_bundle,
@@ -26,7 +25,7 @@ import {
   type GoArtifact,
 } from "./go-release-manifest.ts";
 
-const usage = "usage: build_go_release.ts --source-revision <40-hex> --target <linux/amd64|linux/arm64> --output <absolute-path> [--transport <legacy-bun|go-request|https>]";
+const usage = "usage: build_go_release.ts --source-revision <40-hex> --target <linux/amd64|linux/arm64> --output <absolute-path> [--transport <go-request>]";
 const args = process.argv.slice(2);
 const value = (name: string): string => {
   const index = args.indexOf(name);
@@ -40,8 +39,7 @@ const target = value("--target");
 const targetMatch = /^(linux)\/(amd64|arm64)$/.exec(target);
 if (!targetMatch) throw new Error("target must be linux/amd64 or linux/arm64");
 const transport = args.includes("--transport") ? value("--transport") : "go-request";
-if (!CLIENT_TRANSPORTS.includes(transport as ClientTransport)) throw new Error("transport must be legacy-bun, go-request, or https");
-if (transport === "legacy-bun") throw new Error("Linux Go releases require go-request or https transport");
+if (transport !== "go-request") throw new Error("Linux Go releases require go-request transport");
 if (transport === "https") throw new Error("https transport is validation-only until bundled client HTTPS support is integrated");
 const rawOutput = value("--output");
 if (!isAbsolute(rawOutput)) throw new Error("output must be absolute");
