@@ -598,27 +598,31 @@ def _recover_local_client_install(client_path: Path, sidecar_path: Path) -> None
     _fsync_directory(directory)
 
 
-def _client_selfcheck(directory: Path, release_id: str) -> None:
-    bun = shutil.which("bun")
-    if bun is None:
-        _fail("local_client_selfcheck_failed", "Bun is required to self-check the complete client package")
+def _client_selfcheck(directory: Path, release_id: str, manifest: Mapping[str, Any] | None = None) -> None:
     try:
-        process = subprocess.run(
-            [bun, "--no-macros", str(directory / "agent_vm.ts"), "version"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=30,
-            cwd="/", env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")},
-        )
-        value = json.loads(process.stdout)
-        if (process.returncode != 0 or value.get("protocol") != PROTOCOL_VERSION
-                or value.get("release", {}).get("release_id") != release_id
-                or value.get("release", {}).get("artifacts_verified") is not True
-                or value.get("warnings") != []):
-            raise ValueError("client did not verify the expected complete package")
-    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, AttributeError):
-        _fail("local_client_selfcheck_failed", "Bun client package self-check failed")
+        if manifest is not None:
+            checked = verify_client_sidecar(directory, manifest)
+            if checked.get("protocol") != PROTOCOL_VERSION or checked.get("release_id") != release_id:
+                raise ValueError("client sidecar did not verify the expected complete package")
+        else:
+            with (directory / CLIENT_SIDECAR_NAME).open("r", encoding="utf-8") as handle:
+                sidecar = json.load(handle)
+            if (not isinstance(sidecar.get("format"), int)
+                    or sidecar.get("protocol") != PROTOCOL_VERSION
+                    or sidecar.get("release_id") != release_id
+                    or not isinstance(sidecar.get("client_dependencies"), list)):
+                raise ValueError("client sidecar identity is invalid")
+            for item in [sidecar.get("client_artifact"), *sidecar["client_dependencies"]]:
+                if not isinstance(item, Mapping) or not isinstance(item.get("path"), str):
+                    raise ValueError("client sidecar artifact is invalid")
+                path = directory / item["path"]
+                if not path.is_file() or path.is_symlink():
+                    raise ValueError("client sidecar artifact is missing")
+    except (OSError, ValueError, TypeError, AttributeError):
+        _fail("local_client_selfcheck_failed", "client package self-check failed")
 
 
-def _install_client_package(root: Path, client_path: Path, release_id: str) -> None:
+def _install_client_package(root: Path, client_path: Path, release_id: str, manifest: Mapping[str, Any] | None = None) -> None:
     directory = client_path.parent
     directory.mkdir(mode=0o755, parents=True, exist_ok=True)
     # The lock is a fixed private regular file, never a caller-supplied pathname.
@@ -653,7 +657,7 @@ def _install_client_package(root: Path, client_path: Path, release_id: str) -> N
         try:
             for name, mode in LOCAL_PACKAGE_MODES.items():
                 _write_atomic(staging / name, _read_regular(root / name), mode)
-            _client_selfcheck(staging, release_id)
+            _client_selfcheck(staging, release_id, manifest)
             target = {name: {"exists": True, "sha256": sha256_file(staging / name), "mode": mode}
                       for name, mode in LOCAL_PACKAGE_MODES.items()}
             record = {"format": 2, "phase": "installing", "client_path": str(client_path),
@@ -1141,7 +1145,7 @@ class ReleasePublisher:
         try:
             if checked != manifest:
                 _fail("bundle_invalid", "bundle changed before local package installation")
-            _install_client_package(root, client_path, manifest["release_id"])
+            _install_client_package(root, client_path, manifest["release_id"], manifest)
         except OSError:
             _fail("local_client_install_failed", "local client package could not be installed")
         finally:
