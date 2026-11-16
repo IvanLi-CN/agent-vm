@@ -45,6 +45,7 @@ const targetMatch = /^(linux)\/(amd64|arm64)$/.exec(rawTarget);
 if (rawTarget !== "client" && !targetMatch) throw new Error("target must be client or linux/amd64 or linux/arm64");
 const defaultTransport: ClientTransport = "go-request";
 const rawTransport = args.includes("--transport") ? value("--transport") : defaultTransport;
+if (rawTransport === "https") throw new Error("https transport is validation-only until bundled client HTTPS support is integrated");
 if (rawTransport !== "go-request") throw new Error("product releases require go-request transport");
 const transport = rawTransport as ClientTransport;
 const rawOutput = value("--output");
