@@ -846,7 +846,8 @@ func extractAndVerifyBundle(bundle, destination string) (map[string]any, error) 
 	if format, ok := manifest["format"].(json.Number); !ok || !supportedBundleManifestFormat(format) {
 		return nil, errors.New("bundle manifest format is unsupported")
 	}
-	expected := map[string]struct{}{"release-manifest.json": {}, "client-release.json": {}}
+	expected := map[string]struct{}{"release-manifest.json": {}}
+	clientSidecarRequired := false
 	artifacts, ok := manifest["artifacts"].([]any)
 	if !ok {
 		return nil, errors.New("bundle manifest artifacts are invalid")
@@ -861,12 +862,20 @@ func extractAndVerifyBundle(bundle, destination string) (map[string]any, error) 
 			return nil, errors.New("bundle manifest artifact path is invalid")
 		}
 		expected[path] = struct{}{}
+		if role, ok := artifact["role"].(string); ok && role == "client" {
+			clientSidecarRequired = true
+		}
+	}
+	if clientSidecarRequired {
+		expected["client-release.json"] = struct{}{}
 	}
 	if _, ok := members["release-manifest.json"]; !ok {
 		return nil, errors.New("release bundle is missing release-manifest.json")
 	}
-	if _, ok := members["client-release.json"]; !ok {
-		return nil, errors.New("release bundle is missing client-release.json")
+	if clientSidecarRequired {
+		if _, ok := members["client-release.json"]; !ok {
+			return nil, errors.New("release bundle is missing client-release.json")
+		}
 	}
 	for path := range expected {
 		if _, ok := members[path]; !ok {
