@@ -1427,7 +1427,8 @@ const PRODUCT_CLIENT_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["client-io.ts", "client-io.ts", "support", 0o644],
   ["client-release.ts", "client-release.ts", "support", 0o644],
   ["client.ts", "client.ts", "support", 0o644],
-  ["guest-source.ts", "guest-source.ts", "support", 0o644], ["host-config.ts", "host-config.ts", "support", 0o644],
+  ["guest-source.ts", "guest-source.ts", "support", 0o644],
+  ["host-config.ts", "host-config.ts", "support", 0o644],
   ["sync-native.ts", "sync-native.ts", "support", 0o644],
   ["sync_worktree.ts", "sync_worktree.ts", "support", 0o755],
 ]);
@@ -1438,7 +1439,7 @@ export const PRODUCT_LINUX_LEGACY_ARTIFACTS: readonly ArtifactTuple[] = Object.f
   ["client-io.ts", "client-io.ts", "support", 0o644],
   ["client-release.ts", "client-release.ts", "support", 0o644],
   ["client.ts", "client.ts", "support", 0o644],
-  ["guest-source.ts", "guest-source.ts", "support", 0o644], ["host-config.ts", "host-config.ts", "support", 0o644],
+  ["guest-source.ts", "guest-source.ts", "support", 0o644],
   ["sync-native.ts", "sync-native.ts", "support", 0o644],
   ["sync_worktree.ts", "sync_worktree.ts", "support", 0o755],
   ["agent_vm_control_bridge.ts", "agent_vm_control_bridge.ts", "control", 0o755],
@@ -1451,6 +1452,16 @@ export const PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["unit:agent-vm-native@.service", "systemd/agent-vm-native@.service", "unit", 0o644],
   ["agent-vm-deployd", "bin/agent-vm-deployd", "control", 0o755],
   ["agent-vm-deploy", "bin/agent-vm-deploy", "control", 0o755],
+  ["unit:agent-vm-deployd.service", "systemd/agent-vm-deployd.service", "unit", 0o644],
+]);
+
+/** Native-only control-plane artifacts. Client TypeScript is a separate asset. */
+export const PRODUCT_NATIVE_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
+  ["agent-vm-control", "bin/agent-vm-control", "control", 0o755],
+  ["agent-vm-deployd", "bin/agent-vm-deployd", "control", 0o755],
+  ["agent-vm-deploy", "bin/agent-vm-deploy", "control", 0o755],
+  ["unit:agent-vm-native@.service", "systemd/agent-vm-native@.service", "unit", 0o644],
+  ["unit:agent-vm-native.service", "systemd/agent-vm-native.service", "unit", 0o644],
   ["unit:agent-vm-deployd.service", "systemd/agent-vm-deployd.service", "unit", 0o644],
 ]);
 
@@ -1521,9 +1532,10 @@ function _product_artifacts(value: unknown, target: ProductTarget, format: 3 | 4
     names.add(name); paths.add(path);
     return { name, path, role, sha256, mode };
   });
+  const nativeOnly = target.os === "linux" && !artifacts.some((item) => item.role === "client");
   const expected = target.os === "source"
     ? PRODUCT_CLIENT_ARTIFACTS
-    : format === LEGACY_PRODUCT_MANIFEST_FORMAT ? PRODUCT_LINUX_LEGACY_ARTIFACTS : PRODUCT_LINUX_ARTIFACTS;
+    : nativeOnly ? PRODUCT_NATIVE_LINUX_ARTIFACTS : format === LEGACY_PRODUCT_MANIFEST_FORMAT ? PRODUCT_LINUX_LEGACY_ARTIFACTS : PRODUCT_LINUX_ARTIFACTS;
   const actualShape = artifacts.map(({ name, path, role, mode }) => canonical_json([name, path, role, mode])).sort();
   const expectedShapes = [expected];
   if (format === PRODUCT_MANIFEST_FORMAT && target.os === "linux") {
