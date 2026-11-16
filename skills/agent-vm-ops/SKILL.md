@@ -29,10 +29,10 @@ Drain 拒绝新的 lease 和 restart admission，允许在线 retrieval/release�
 
 只部署来自同一 revision 的正式候选版本：包括[Go 控制服务](control/cmd/agent-vm-control/main.go)、槽位外的 deployd 服务、[format-2 bridge](scripts/agent_vm_control_bridge.ts)、完整客户端包和[systemd 资源](assets/systemd/)。
 路径和验证遵循[部署参考](references/deployment.md)，Incus project/profile policy 遵循[初始化参考](references/initialization.md)，native OS 和 guest prerequisite 遵循[运行时合同](references/control-runtime.md)。
-Format-1 release 可以保留 `agent_vm_control.ts`；format-2 client 通过既有 SSH entry 调用固定的 Go `request` adapter，adapter 使用受保护 UDS。
+当前 release 只允许 Go native control 与固定的 Go `request` adapter；SSH 入口通过受保护 UDS 转发请求。历史格式仅由离线迁移工具读取。
 修改 client 前先 build、verify 和 publish matching manifest。
 八个客户端文件和依赖哈希 sidecar 必须作为一个可恢复 package 安装；更新受保护的连接材料时不得同步任何 consumer runtime home。
-每个槽位保持一个 Go 业务控制权威，并通过 deployd 只向一个槽位授予 scheduler/native-mutation role；不得让 legacy Bun authority 并发运行。
+每个槽位保持一个 Go 业务控制权威，并通过 deployd 只向一个槽位授予 scheduler/native-mutation role；不得发布或启动 legacy Bun authority。
 只有 deployd 报告新鲜的槽位健康状态、控制器主权、流量排空、startup reconciliation、expiry/GC 和 storage admission 证据后，才能退出 drain。
 
 控制面发布是运维者负责的人工 release operation，入口是目标服务器上的 `agent-vm-deploy update`，不是公共 `agent-vm` 生命周期 command。Agent 只通过已配置的 SSH alias 提交版本和 source revision；release 下载、目标架构选择、provenance/checksum 校验和 blue-green transaction 都在目标服务器上完成。不得从 Agent 工作站下载 release、使用 `scp`/`rsync` 上传 release bundle，或依据 Agent 工作站架构选择 native package。

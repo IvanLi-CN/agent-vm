@@ -1,4 +1,4 @@
-/** Format-2 release contract for the Go control service and compatibility client. */
+/** Current Go release contract for the native control service and client. */
 
 import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
@@ -35,7 +35,6 @@ export const GO_FIXED_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["guest-source.ts", "guest-source.ts", "support", 0o644],
   ["sync-native.ts", "sync-native.ts", "support", 0o644],
   ["sync_worktree.ts", "sync_worktree.ts", "support", 0o755],
-  ["agent_vm_control_bridge.ts", "agent_vm_control_bridge.ts", "control", 0o755],
   ["agent-vm-control", "bin/agent-vm-control", "control", 0o755],
   ["agent-vm-deployd", "bin/agent-vm-deployd", "control", 0o755],
   ["agent-vm-deploy", "bin/agent-vm-deploy", "control", 0o755],
@@ -156,11 +155,8 @@ export function build_go_manifest(sourceRevision: string, artifacts: readonly Go
   const revisionValue = revision(sourceRevision, "source_revision");
   const actions = options.operations ?? default_operations();
   const transport = options.transport ?? "go-request";
-  if (!CLIENT_TRANSPORTS.includes(transport)) error("client transport is unsupported");
-  if (transport === "legacy-bun") error("native Linux releases require go-request or https transport");
-  if (transport === "https") {
-    throw new GoManifestError("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE);
-  }
+  if (transport === "https") throw new GoManifestError("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE);
+  if (transport !== "go-request") error("native Linux releases require go-request transport");
   return validate_go_manifest({
     format: GO_MANIFEST_FORMAT,
     release_id: revisionValue,

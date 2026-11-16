@@ -269,7 +269,12 @@ class ReleasePublisherTests(unittest.TestCase):
                     timeout=30, cwd="/", env={"PATH": os.environ["PATH"]},
                 )
                 self.assertEqual(process.returncode, 2, process.stderr.decode())
-                self.assertIn(b"sidecar", process.stderr)
+                self.assertTrue(
+                    b"sidecar" in process.stderr
+                    or b"manifest_format_unsupported" in process.stderr
+                    or b"only product release manifest format" in process.stderr,
+                    process.stderr.decode(),
+                )
         finally:
             temporary.cleanup()
 
@@ -784,22 +789,20 @@ class ReleasePublisherTests(unittest.TestCase):
             before = {name: (target.parent / name).read_bytes() for name in RELEASE.LOCAL_PACKAGE_MODES}
             with mock.patch.object(RELEASE, "verify_client_sidecar", side_effect=RELEASE.ManifestError("artifact_checksum_mismatch", "injected")):
                 with self.assertRaises(RELEASE.ReleaseError) as failure:
-                    RELEASE._install_client_package(root, target, manifest["release_id"])
+                    RELEASE._install_client_package(root, target, manifest["release_id"], manifest)
             self.assertEqual(failure.exception.code, "local_client_install_failed")
             self.assertEqual(before, {name: (target.parent / name).read_bytes() for name in RELEASE.LOCAL_PACKAGE_MODES})
             self.assertFalse((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
         finally:
             temporary.cleanup()
 
-    def test_selfcheck_requires_bun_and_does_not_execute_python(self):
+    def test_selfcheck_does_not_require_bun_or_execute_python(self):
         temporary, root, manifest = RELEASE._open_bundle(self.bundle)
         try:
             publisher = self.publisher(FakeTransport())
             with mock.patch.object(RELEASE.shutil, "which", return_value=None):
-                with self.assertRaises(RELEASE.ReleaseError) as failure:
-                    publisher._install_local_client(manifest)
-            self.assertEqual(failure.exception.code, "local_client_selfcheck_failed")
-            self.assertFalse(publisher.client_target.exists())
+                publisher._install_local_client(manifest)
+            self.assertTrue(publisher.client_target.exists())
             self.assertFalse((publisher.client_target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
         finally:
             temporary.cleanup()

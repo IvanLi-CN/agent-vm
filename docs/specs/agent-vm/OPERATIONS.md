@@ -204,7 +204,7 @@ SSH 仍是旧版兼容传输，不是当前部署事务的权威。
 正常事务依次为 `stage`、`standby_validation`、`controller_handoff`、`traffic_enable`、`active_switch`、`drain_old`、`quiescence` 和 `finalize`。
 普通蓝绿阶段只处理服务产物、槽位角色、流量和 native worker 收敛；
 不执行状态迁移、rqlite backup restore、业务数据库替换或状态后端 endpoint 切换。
-只有首次部署的独立 `migrate` 事务执行一次 legacy SQLite 到 rqlite 的自动切换。
+只有首次部署的独立 `migrate` 事务执行一次历史 SQLite 到 rqlite 的自动切换；运行时不再提供 SQLite 回滚路径。
 候选槽位在当前槽位保持 active 时启动并验证。
 交接期间两个槽位进程可以存活，但只能有一个槽位持有控制器主权。
 排空会停止旧槽位的新流量，并等待在途请求、pending operation、native worker 和 scheduler work 收敛；

@@ -229,23 +229,11 @@ test.skipIf(!LINUX)("an independent expiry closes access while another real cont
   }
 }, 20000);
 
-test("Bun client transports protocol requests to an actual Bun controller", async () => {
+test("client fails closed when the current release sidecar is absent", async () => {
   const f = new Fixture();
-  const script = worker(f);
   const { Client } = await import("../../agent-vm/scripts/client.ts");
-  const { runBounded } = await import("../../agent-vm/scripts/client-io.ts");
-  const client = new Client({ ...process.env, AGENT_VM_RELEASE_MANIFEST: join(f.root, "absent.json") }, async (argv, options) => {
-    expect(argv[0]).toBe("ssh");
-    expect(argv.at(-1)).toBe("bun /opt/agent-vm-native/agent_vm_control.ts");
-    expect(options?.timeoutMs).toBe(240000);
-    return runBounded([process.execPath, script, join(f.root, "config.json")], {
-      ...options, env: { ...process.env, NOW: f.now.toISOString() },
-    });
-  }, () => {});
+  const client = new Client({ ...process.env, AGENT_VM_RELEASE_MANIFEST: join(f.root, "absent.json") }, async () => { throw new Error("remote request must not run"); }, () => {});
   try {
-    const response = await client.request("status", { session: "transport-smoke" });
-    expect(response.ok).toBe(true);
-    expect(response.result.state).toBe("absent");
-    await expect(client.request("unknown", { session: "transport-smoke" })).rejects.toMatchObject({ code: "unknown_action" });
+    await expect(client.request("status", { session: "transport-smoke" })).rejects.toMatchObject({ code: "manifest_missing" });
   } finally { f.close(); }
 });

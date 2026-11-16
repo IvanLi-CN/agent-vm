@@ -11,12 +11,12 @@
 | Deployd | `/opt/agent-vm-native/bin/agent-vm-deployd`，由两个槽位外的 `agent-vm-deployd.service` 启动；Prometheus 从其内部管理监听的 `GET /metrics` 拉取指标 |
 | 槽位观测目录 | `/run/agent-vm-native/{blue,green}/metrics`；每个槽位独占自己的 snapshot 目录，deployd 按槽位读取 |
 | 目标部署状态 | `/var/lib/agent-vm-native/deployment/deployment.sqlite3`，独立于业务状态和 rqlite |
-| 兼容 bridge | `/opt/agent-vm-native/agent_vm_control_bridge.ts`；format-1 release 可以保留旧版 Bun controller |
-| 控制解释器 | format 2 使用 Go binary；root-owned `/usr/local/bin/bun` 只对 format-1 Bun release 和 client package 保持必需 |
+| 当前控制入口 | Go `agent-vm-control` request adapter 与受保护 control socket |
+| 控制解释器 | 当前发布使用 Go binary；Bun 仅作为客户端构建工具保留 |
 | 配置 | `/etc/agent-vm-native/config.json` 中由 root-owned 的 JSON |
 | 管理配置 | 启用管理功能时，使用 `/etc/agent-vm-native/config.json` 中由 root-owned 保护的管理配置；管理 API 由常驻 Go 控制服务提供 |
 | 持久状态 | 配置的本地 state database 和 lock directory |
-| 旧版原生 unit | `agent-vm-native.service`；format-1 timer unit 仅在兼容支持期间保留，已退役的 `agent-vm-web.service` 不再属于当前发布 |
+| 原生 unit | `agent-vm-native@.service` 与 `agent-vm-deployd.service` |
 | 本机客户端 | 完整的八文件 Bun package 和带依赖 hash 的 `client-release.json`；受保护的 session state 位于运维者选择的 XDG paths |
 
 部署通过复制或派生的 configuration 提供 control alias、Incus project/profile/image、network ACL、control address、guest address pool、host port range、storage path、state database 和 timer directory。 `config.json.example` 是通用 schema/template，不是部署证据；对于锁定的部署策略，已安装 configuration 必须设置 `memory_budget_mib=32768`、`memory_overcommit_ratio=2` 和 `cpu_startup_pressure_full_avg10_percent=50`。后者是 startup-schedulability threshold，不是 logical CPU ceiling。安装前必须替换 placeholder；缺失或无效值必须 fail closed。
@@ -25,7 +25,7 @@
 
 与部署无关的 Incus project/profile baseline 及其默认只读的 initializer 见[初始化参考（initialization reference）](../../skills/agent-vm-ops/references/initialization.md)。只能在明确授权且 admission drain 已生效的维护任务中应用它；日常请求绝不修改 project policy。
 
-控制服务和兼容请求适配器读取同一个规范路径：`/etc/agent-vm-native/config.json`。部署通过在该路径安装受保护 JSON 来选择 Incus project、image、network、address pool、port range、storage、state database 和 ACL；其他运行时配置路径明确不支持。在单服务基线中，Go 服务根据 SQLite deadline 负责 expiry、reconciliation、retry 和 age-GC scheduling。在目标蓝绿布局中，这些后台循环只有持有 deployd 已认证 controller role 的槽位才能启用；standby 和 retiring 槽位必须保持 scheduler-driven native mutation fenced。 `timer_dir` 仅为 format-1 兼容和历史记录保留。静态 release unit 校验始终使用 `/etc/systemd/system`。
+控制服务和兼容请求适配器读取同一个规范路径：`/etc/agent-vm-native/config.json`。部署通过在该路径安装受保护 JSON 来选择 Incus project、image、network、address pool、port range、storage、state database 和 ACL；其他运行时配置路径明确不支持。在单服务基线中，Go 服务根据 SQLite deadline 负责 expiry、reconciliation、retry 和 age-GC scheduling。在目标蓝绿布局中，这些后台循环只有持有 deployd 已认证 controller role 的槽位才能启用；standby 和 retiring 槽位必须保持 scheduler-driven native mutation fenced。 `timer_dir` 仅供离线历史审计使用。静态 release unit 校验始终使用 `/etc/systemd/system`。
 
 任何 mutation 前，检查实际的 Incus identity、proxy permission、ACL ownership、guest isolation、本机 filesystem capacity、service readiness、UDS peer policy 和 protocol version。凭据和 connection material 必须放在 source 之外。受保护 UDS 是内部 control boundary，不是 public gateway。
 
@@ -47,7 +47,7 @@ remote control release 必须先激活并完成 health check，之后才能修�
 
 活动的 format-2 runtime 包含 Go binary、fixed Bun client package、bridge、sidecar、manifest 和 `agent-vm-native.service`；只有 startup reconciliation 就绪后才会 retire 旧的 expiry/reconcile units。 Activation 仅在旧版 `agent_vm.py` 和 `agent_vm_control.py` 存在于原固定 target 时才会 snapshot 并移除；activation 失败时，整个 fixed package 会恢复它们原有的 bytes、owner 和 mode。无关的 operator files 和保留的 release directories 不是 cleanup target。历史 Python-only control path 不能作为任一 format 的 fallback。
 
-通用 format-1 流程是 `python3 deploy/scripts/agent_vm_release.py build --source-root <source> --output <bundle>`、本地 `verify`，然后 `publish`；format 2 使用 `bun skills/agent-vm-ops/scripts/build_go_release.ts --source-revision <revision> --target <linux/amd64|linux/arm64> --output <bundle>` 和同一个受保护 wrapper transaction。保留旧调用时，可选的 legacy `--wrapper` argument 必须等于 `/usr/local/sbin/agent-vm-release-wrapper`；Go binary、bridge 或 socket 不接受 publisher override。 `rollback` 是绑定 transaction 和 release identity 的独立 operator action；它的 bundle 会在 drain exit 前恢复匹配的八文件 client package 和 control artifacts。本地安装需要用于 client package 的 Bun、受限的 staged `version` self-check、私有的 complete-package recovery record 和 exclusive lock。 sidecar 最后安装；recovery pending 时 clients fail closed，中断安装会恢复整个 previous package。固定 mode、exact owned paths 和 hash-validated recovery 见 release contract。 format-2 client 通过 SSH 调用 Go `request` adapter，保留 protocol 4、受限的 stdin/stdout/stderr 和 action-specific timeouts。 wrapper 的 fixed command set 是唯一的 remote activation interface。
+通用 历史格式离线迁移流程是 `python3 deploy/scripts/agent_vm_release.py build --source-root <source> --output <bundle>`、本地 `verify`，然后 `publish`；format 2 使用 `bun skills/agent-vm-ops/scripts/build_go_release.ts --source-revision <revision> --target <linux/amd64|linux/arm64> --output <bundle>` 和同一个受保护 wrapper transaction。仅在离线迁移审计中，可选的 legacy `--wrapper` argument 必须等于 `/usr/local/sbin/agent-vm-release-wrapper`；Go binary、bridge 或 socket 不接受 publisher override。 `rollback` 是绑定 transaction 和 release identity 的独立 operator action；它的 bundle 会在 drain exit 前恢复匹配的八文件 client package 和 control artifacts。本地安装需要用于 client package 的 Bun、受限的 staged `version` self-check、私有的 complete-package recovery record 和 exclusive lock。 sidecar 最后安装；recovery pending 时 clients fail closed，中断安装会恢复整个 previous package。固定 mode、exact owned paths 和 hash-validated recovery 见 release contract。 current client 通过 SSH 调用 Go `request` adapter，保留 protocol 4、受限的 stdin/stdout/stderr 和 action-specific timeouts。 wrapper 的 fixed command set 是唯一的 remote activation interface。
 
 ## 观测边界
 

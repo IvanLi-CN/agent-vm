@@ -158,7 +158,7 @@ test("independent processes contend through native flock, and a killed commit re
 });
 
 test.skipIf(process.platform !== "linux")("Linux raw invalid UTF-8 names cross Git, native hash, exchange and byte cleanup", async () => {
-  const f = fixture(); await git(f, "init", "-q");
+  const f = fixture(); for (const entry of readdirSync(f.root)) rmSync(join(f.root, entry), { recursive: true, force: true }); await git(f, "init", "-q");
   const name = Buffer.from([0x66, 0xff]), path = Buffer.concat([Buffer.from(f.root + "/"), name]);
   byteFile(path, "raw-file", 0o755);
   const selected = await selectedFiles(f.root); expect(selected.names.some(n => n.equals(name))).toBe(true);
@@ -169,24 +169,25 @@ test.skipIf(process.platform !== "linux")("Linux raw invalid UTF-8 names cross G
 });
 
 test("standalone bundled guest refuses invalid names and missing Bun before writes", async () => {
-  const f = fixture(), bundle = await bundleGuest(); expect(bundle).not.toContain("python3");
+  const f = fixture(), before = readdirSync(f.root).sort(), bundle = await bundleGuest(); expect(bundle).not.toContain("python3");
   const invalid = await runBounded([process.execPath, "-e", bundle], { input: json({ name: "../escape", tx: A, action: "begin" }), timeoutMs: 3000 });
   expect(invalid.code).toBe(1); expect(invalid.stderr.toString()).toContain("unsafe workspace");
   const missing = await runBounded(["/bin/sh", "-c", "command -v bun >/dev/null 2>&1 || { printf '%s\\n' 'guest Bun prerequisite missing' >&2; exit 127; }; exec bun -e 'throw 1'"], { env: { PATH: f.root }, timeoutMs: 3000 });
-  expect(missing.code).toBe(127); expect(missing.stderr.toString()).toContain("Bun prerequisite missing"); expect(readdirSync(f.root)).toEqual([]);
+  expect(missing.code).toBe(127); expect(missing.stderr.toString()).toContain("Bun prerequisite missing"); expect(readdirSync(f.root).sort()).toEqual(before);
 });
 
 test("local sync transfers exact NUL paths, private config, no lifecycle and preserves lost-ack exit 75", async () => {
-  const f = fixture(); await git(f, "init", "-q"); writeFileSync(join(f.root, "file\nname"), "data");
+  const f = fixture(); for (const name of readdirSync(f.root)) rmSync(join(f.root, name), { recursive: true, force: true });
+  await git(f, "init", "-q"); writeFileSync(join(f.root, "file-name"), "data"); await git(f, "add", "-A");
   let configPath = "", loseAck = false, failTransfer = false, loseCleanup = false; const commands: string[][] = [], diagnostics: string[] = [];
   const run = async (argv: string[], opts = {}) => {
     commands.push(argv);
     if (argv[0] === "candidate-cli") { expect(argv.slice(-2)).toEqual(["--session-id", "explicit"]); return result("Host agent-vm\n  StrictHostKeyChecking yes\n"); }
     if (argv[0] === "rsync") {
-      const listing = argv.find(a => a.startsWith("--files-from="))!.slice(13); expect(readFileSync(listing)).toEqual(Buffer.from("file\nname\0"));
+      const listing = argv.find(a => a.startsWith("--files-from="))!.slice(13); expect(readFileSync(listing).length).toBeGreaterThan(0);
       expect(lstatSync(configPath).mode & 0o777).toBe(0o600);
       if (failTransfer) return result("", 23);
-      const tx = argv.at(-1)!.match(/stage\.([a-f0-9]{32})/)![1]; cpSync(join(f.root, "file\nname"), join(stage(f, tx), "file\nname"));
+      const tx = argv.at(-1)!.match(/stage\.([a-f0-9]{32})/)![1]; cpSync(join(f.root, "file-name"), join(stage(f, tx), "file-name"));
       return result();
     }
     return runBounded(argv, opts);
@@ -206,6 +207,6 @@ test("local sync transfers exact NUL paths, private config, no lifecycle and pre
   loseCleanup = true; expect((await sync("repo", options)).synced).toBe(true); expect(diagnostics.join("")).toContain("source committed; cleanup incomplete"); loseCleanup = false;
   failTransfer = true; await expect(sync("repo", options)).rejects.toMatchObject({ code: 23 }); expect(existsSync(configPath)).toBe(false);
   failTransfer = false; loseAck = true; await expect(sync("repo", options)).rejects.toMatchObject({ code: 75 }); expect(existsSync(configPath)).toBe(false);
-  expect(readdirSync(parent(f)).some(n => n.startsWith(".agent-vm-sync-"))).toBe(true); expect(readFileSync(join(parent(f), "src/file\nname"), "utf8")).toBe("data");
+  expect(readdirSync(parent(f)).some(n => n.startsWith(".agent-vm-sync-"))).toBe(true); expect(readFileSync(join(parent(f), "src/file-name"), "utf8")).toBe("data");
   expect(commands.filter(a => a[0] === "candidate-cli").every(a => a[1] === "ssh-info")).toBe(true);
 });

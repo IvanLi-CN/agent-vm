@@ -151,7 +151,7 @@ test("product release CLI preserves target-specific default transports", { timeo
   const revision = new TextDecoder().decode(revisionResult.stdout).trim();
   const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-product-release-defaults-test-"));
   try {
-    for (const [target, expectedTransport] of [["client", "legacy-bun"], ["linux/amd64", "go-request"]] as const) {
+    for (const [target, expectedTransport] of [["client", "go-request"], ["linux/amd64", "go-request"]] as const) {
       const output = join(temporaryRoot, `${target.replace("/", "-")}.tar`);
       const result = Bun.spawnSync(
         [

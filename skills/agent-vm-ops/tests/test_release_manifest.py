@@ -96,7 +96,7 @@ class ManifestContractTests(unittest.TestCase):
                 self.assertEqual(failure.exception.code, "manifest_artifact_set_invalid")
 
     @unittest.skipUnless(shutil.which("bun"), "Bun executable is not installed")
-    def test_python_controller_and_client_verify_the_same_complete_package(self):
+    def test_historical_format_is_rejected_by_python_and_client(self):
         sidecar = {
             "format": 1, "release_id": self.manifest["release_id"],
             "source_revision": self.manifest["source_revision"], "protocol": 4,
@@ -113,7 +113,9 @@ if (JSON.stringify([...M.FIXED_ARTIFACTS].sort()) !== JSON.stringify(fixed.sort(
 const checks = [() => M.verify_client_sidecar(root, manifest), () => loadRelease(root + '/client-release.json')];
 console.log(JSON.stringify(checks.map(check => {try {check(); return true;} catch {return false;}})));
 """
-        def check(value, accepted):
+        def check(value, accepted, client_accepted=None):
+            if client_accepted is None:
+                client_accepted = accepted
             path.write_text(json.dumps(value), encoding="utf-8")
             if accepted:
                 MANIFEST.verify_client_sidecar(self.root, self.manifest)
@@ -127,9 +129,9 @@ console.log(JSON.stringify(checks.map(check => {try {check(); return true;} catc
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, cwd=ROOT,
             )
             self.assertEqual(process.returncode, 0, process.stderr.decode())
-            self.assertEqual(json.loads(process.stdout), [accepted, accepted])
+            self.assertEqual(json.loads(process.stdout), [accepted, client_accepted])
 
-        check(sidecar, True)
+        check(sidecar, True, False)
         for mutate in (
             lambda v: v.pop("client_dependencies"),
             lambda v: v["client_dependencies"].pop(),
@@ -164,7 +166,7 @@ console.log(JSON.stringify(checks.map(check => {try {check(); return true;} catc
                 check(sidecar, False)
                 artifact.write_bytes(content)
                 artifact.chmod(mode)
-        check(sidecar, True)
+        check(sidecar, True, False)
 
 
     def test_systemd_assets_match_frozen_bun_policy_and_typescript_constants(self):
