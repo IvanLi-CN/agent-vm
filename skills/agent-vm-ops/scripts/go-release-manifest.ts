@@ -157,9 +157,6 @@ export function build_go_manifest(sourceRevision: string, artifacts: readonly Go
   const transport = options.transport ?? "go-request";
   if (transport === "https") throw new GoManifestError("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE);
   if (transport !== "go-request") error("native Linux releases require go-request transport");
-  if (transport === "https") {
-    throw new GoManifestError("manifest_transport_unavailable", HTTPS_TRANSPORT_UNAVAILABLE);
-  }
   return validate_go_manifest({
     format: GO_MANIFEST_FORMAT,
     release_id: revisionValue,
