@@ -158,7 +158,7 @@ test("independent processes contend through native flock, and a killed commit re
 });
 
 test.skipIf(process.platform !== "linux")("Linux raw invalid UTF-8 names cross Git, native hash, exchange and byte cleanup", async () => {
-  const f = fixture(); await git(f, "init", "-q");
+  const f = fixture(); for (const entry of readdirSync(f.root)) rmSync(join(f.root, entry), { recursive: true, force: true }); await git(f, "init", "-q");
   const name = Buffer.from([0x66, 0xff]), path = Buffer.concat([Buffer.from(f.root + "/"), name]);
   byteFile(path, "raw-file", 0o755);
   const selected = await selectedFiles(f.root); expect(selected.names.some(n => n.equals(name))).toBe(true);
