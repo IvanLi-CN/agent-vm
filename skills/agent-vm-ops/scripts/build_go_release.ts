@@ -40,7 +40,6 @@ const targetMatch = /^(linux)\/(amd64|arm64)$/.exec(target);
 if (!targetMatch) throw new Error("target must be linux/amd64 or linux/arm64");
 const transport = args.includes("--transport") ? value("--transport") : "go-request";
 if (transport !== "go-request") throw new Error("Linux Go releases require go-request transport");
-if (transport === "https") throw new Error("https transport is validation-only until bundled client HTTPS support is integrated");
 const rawOutput = value("--output");
 if (!isAbsolute(rawOutput)) throw new Error("output must be absolute");
 const output = resolve(rawOutput);

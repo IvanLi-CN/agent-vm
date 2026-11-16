@@ -46,7 +46,6 @@ if (rawTarget !== "client" && !targetMatch) throw new Error("target must be clie
 const defaultTransport: ClientTransport = "go-request";
 const rawTransport = args.includes("--transport") ? value("--transport") : defaultTransport;
 if (rawTransport !== "go-request") throw new Error("product releases require go-request transport");
-if (rawTransport === "https") throw new Error("https transport is validation-only until bundled client HTTPS support is integrated");
 const transport = rawTransport as ClientTransport;
 const rawOutput = value("--output");
 if (!isAbsolute(rawOutput)) throw new Error("output must be absolute");
