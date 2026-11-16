@@ -6,13 +6,18 @@ import { Fixture as ClientFixture, result } from "./support.ts";
 import { Fixture as ControlFixture } from "../../agent-vm-ops/tests/control-fixture.ts";
 import { canonical_json, parse_json } from "../../agent-vm-ops/scripts/control-types.ts";
 
-test("Bun client and canonical controller interoperate across actual serialization and old journal replay", async () => {
+test("Bun client and canonical controller interoperate across native request serialization and journal replay", async () => {
   const local = new ClientFixture(), remote = new ControlFixture();
   const sent: Data[] = [];
   const client = new Client(local.env, async (argv, opts) => {
-    expect(argv.at(-1)).toBe("bun /opt/agent-vm-native/agent_vm_control.ts");
+    expect(argv.slice(0, -1)).toEqual(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", "fixture-host"]);
+    expect(argv.at(-1)).toMatch(/^\/opt\/agent-vm-native\/bin\/agent-vm-control request --socket \/run\/agent-vm-native\/control\.sock --timeout \d+s$/);
     const request = parse_json(String(opts!.input)); sent.push(request);
-    try { return result(canonical_json(await remote.control.dispatch(request))); }
+    try {
+      const response = await remote.control.dispatch(request);
+      response.release = { release_id: "a".repeat(40), source_revision: "a".repeat(40), protocol: 4, version: "1.0.0", manifest_present: true, artifacts_verified: true };
+      return result(canonical_json(response));
+    }
     catch (error: any) { return result("", 2, canonical_json({ ok: false, ...Object.fromEntries(["protocol", "action", "session_id", "generation", "operation_id"].filter(k => k in request).map(k => [k, request[k]])), error: { code: error.code, message: error.message, detail: error.detail ?? {} } })); }
   }, () => {});
   // Only the real public-key generation process is substituted; no private material is logged.
