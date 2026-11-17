@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { test, expect, type Page } from '@playwright/test';
 
 async function navigation(page: Page) {
@@ -27,8 +28,9 @@ test('home leads directly to real documents and their build snapshots', async ({
 test('original diagrams, sections and links support reading', async ({ page }) => {
   await page.goto('/docs/docs-site-design');
   await expect(page.getByRole('img', { name: '设计流程图' }).locator('svg')).toBeVisible();
-  const toc = page.getByRole('navigation', { name: '页内目录' });
-  if (page.viewportSize()!.width <= 1100) await toc.locator('summary').click();
+  const compact = page.viewportSize()!.width < 1280;
+  if (compact) await page.getByRole('button', { name: '本页目录', exact: true }).click();
+  const toc = page.locator(compact ? '[data-toc-popover-content]' : '#nd-toc');
   await toc.getByRole('link', { name: '单源展示流程' }).click();
   await expect(page.locator('article h2').filter({ hasText: '单源展示流程' })).toBeInViewport();
   expect(new URL(page.url()).hash).not.toBe('');
@@ -40,7 +42,7 @@ test('original diagrams, sections and links support reading', async ({ page }) =
     await expect.poll(() => diagram.evaluate(el => el.scrollLeft)).toBeGreaterThan(0);
   }
   await page.getByText('图表源码', { exact: true }).click();
-  await expect(page.locator('figure details pre')).toContainText('flowchart');
+  await expect(page.locator('.diagram pre')).toContainText('flowchart');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
 
@@ -115,4 +117,24 @@ test('native folders share controls and open the current document ancestry', asy
   if (page.viewportSize()!.width < 768) await expect(page.locator('#nd-sidebar-mobile')).toBeHidden();
   nav = await navigation(page);
   await expect(nav.locator('a[aria-current="page"]')).toHaveText('内容来源与适配');
+});
+
+test('library disclosure and copy controls retain accurate source content', async ({ page, context }) => {
+  await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+  await page.goto('/docs/docs-site-design');
+  const footer = page.locator('.site-footer');
+  const source = footer.getByRole('button', { name: '文档来源', exact: true });
+  await source.focus();
+  await page.keyboard.press('Enter');
+  await expect(source).toHaveAttribute('aria-expanded', 'true');
+  await expect(footer).toContainText('内容');
+  await footer.getByRole('button', { name: '复制页面链接', exact: true }).click();
+  await expect(footer.getByRole('status')).toHaveText('页面链接已复制');
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(page.url());
+  await page.goto('/source?path=README.md&line=5');
+  await expect(page.locator('#L5')).toBeInViewport();
+  await page.getByRole('button', { name: '复制代码', exact: true }).click();
+  await expect(page.getByRole('button', { name: '代码已复制', exact: true })).toBeVisible();
+  const snapshots = JSON.parse(readFileSync(new URL('../.generated/source.json', import.meta.url), 'utf8')).snapshots;
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(snapshots['README.md']);
 });

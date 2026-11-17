@@ -6,7 +6,7 @@
 
 ## 技术组合
 
-采用 Fumadocs Radix UI、Fumadocs MDX、React、TypeScript、Vite 和 React Router。站点外壳使用 Fumadocs `DocsLayout`，来源清单通过 `app/page-tree.ts` 转换为 `fumadocs-core/page-tree`；框架负责一致的目录层级、展开、当前页、移动端导航和主题切换。Bun workspace `docs-site/` 共用根锁文件；React Router 关闭运行时 SSR，枚举页面预渲染，交付静态资源。具体锁定版本见 `docs-site/package.json` 与根 `bun.lock`。
+采用 Fumadocs Radix UI、Fumadocs MDX、React、TypeScript、Vite 和 React Router。站点外壳使用 Fumadocs `DocsLayout`，来源清单通过 `app/page-tree.ts` 转换为 `fumadocs-core/page-tree`；框架负责一致的目录层级、展开、当前页、移动端导航和主题切换。正文及响应式页内目录使用 `DocsPage`／`DocsBody`，折叠、代码块、提示和按钮使用库内组件或公开样式原语；先复用完整能力，再实现库中缺失的项目逻辑。Bun workspace `docs-site/` 共用根锁文件；React Router 关闭运行时 SSR，枚举页面预渲染，交付静态资源。具体锁定版本见 `docs-site/package.json` 与根 `bun.lock`。
 
 选型考虑正文组件复用、MDX 表现力及与现有工具链接近。Vite 属于减少工具链差异的工程偏好。实际兼容性、构建测量和待验收项见[实现说明](../specs/documentation-review/IMPLEMENTATION.md)。
 
@@ -29,7 +29,7 @@ docs-site/
 
 首页按读者任务提供“开始使用”和“开发文档”。侧导航以统一的目录树提供项目概览、CLI、系统架构与术语，文档站自身材料收在开发文档下的“文档站”主题中；导航标题不直接照搬源文件标题，不使用任务名称或材料数量作为站点组织方式。
 
-页内目录定位章节，正文保留代码、表格、引用和图表。顶层分组默认展开，当前文档的祖先目录自动展开；目录折叠和页面链接使用框架标准控件。窄屏通过框架的导航抽屉访问同一棵目录树，章节目录默认收起，正文保持自然文档流。来源身份收在页尾可展开信息中，源码入口作为辅助信息。清单的稳定 slug 同时驱动相对链接与预渲染页面，避免依赖来源数组序号。
+页内目录定位章节，正文保留代码、表格、引用和图表。顶层分组默认展开，当前文档的祖先目录自动展开；目录折叠和页面链接使用框架标准控件。窄屏通过框架的导航抽屉访问同一棵目录树，章节目录使用框架自带的响应式浮层，正文保持自然文档流。来源身份收在页尾可展开信息中，源码入口作为辅助信息。清单的稳定 slug 同时驱动相对链接与预渲染页面，避免依赖来源数组序号。
 
 ## 单源展示流程
 

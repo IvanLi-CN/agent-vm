@@ -1,6 +1,8 @@
 import { Link } from 'react-router';
+import { DocsBody } from 'fumadocs-ui/layouts/docs/page';
+import { Page } from '../components/page';
 export default function Home() {
-  return <div className="docs-home">
+  return <Page breadcrumb={{ enabled: false }}><DocsBody className="docs-home">
     <h1>Agent VM 文档</h1>
     <p className="lead">为 Agent 会话提供受租约约束的工作环境。</p>
     <p>了解如何使用客户端与会话容器，以及控制服务的架构、接口和设计约束。</p>
@@ -13,5 +15,5 @@ export default function Home() {
       <li><Link to="/docs/glossary">领域术语</Link><p>区分会话、容器、租约、镜像与产品发布等核心概念。</p></li>
       <li><Link to="/docs/docs-site-design">文档工程</Link><p>文档站的技术方案、内容适配与构建维护。</p></li>
     </ul></section>
-  </div>;
+  </DocsBody></Page>;
 }
