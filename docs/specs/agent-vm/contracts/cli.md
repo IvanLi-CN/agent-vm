@@ -61,12 +61,14 @@ CLI 不接收 rqlite 地址、数据库路径、SQL 或凭据，也不绕过 Dep
 | `port list` / `port remove NAME [--explain]` | 检查或移除精确 mapping。 |
 | `admin status` | 只读的 native component、maintenance status 和有界 per-task inventory。 |
 | `admin metrics` | 面向 `agent-vm-deployd` 的只读 controller metrics snapshot；包含 resource allocation、CT memory、disk capacity/admission、task、warning 和 failure summaries；不创建 session 或改变 state。 |
-| `admin drain enter [--explain]\|status\|exit [--explain]` | 在允许安全 retrieval 和 release 的同时控制 admission；变更失败时提供 bounded diagnosis。 |
+| `admin drain enter [--explain]\|status\|exit [--explain]` | 在允许安全 retrieval 和 release 的同时控制 admission；退出要求 `release-` 前缀的 session 匹配已保存的 drain owner；变更失败时提供 bounded diagnosis。 |
 | `admin session list` | 列出 managed session records。 |
 | `admin reconcile [--apply] [--explain]` / `admin gc [--apply] [--explain]` | 默认 preview；只在 authorized operations task 内 apply，preview 保持纯 read-only。 |
 | `admin reconcile-session --task-id ID --generation N --pending-operation-id ID [--apply] [--explain]` | 仅对选中 session 的指定 task/generation 和单个未启动 acquire 做过期清理，保留 cache；默认只读 preview，错误时可显式附带有界诊断。 |
 
 所有 session-scoped mutation 支持显式 `--explain`；默认错误返回 bounded status diagnosis，`--explain` 才增加 bounded metrics summary 和 read-only recovery preview。`--apply` 是唯一允许 reconciliation 创建 operation intent 和 local mutation journal 的路径。
+
+独立维护的 owner 会话、健康前提、普通会话无法退出时的受限接管与准入复查见[维护手册](../../../../deploy/docs/maintenance.md)。`drain-enter` 成功不证明同一普通会话有权执行 `drain-exit`；不得覆盖其他发布事务的 owner，也不得通过直接改写状态清除暂停。
 
 ### 精确 session reconciliation
 
