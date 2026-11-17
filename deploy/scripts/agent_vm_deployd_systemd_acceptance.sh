@@ -288,6 +288,10 @@ Description=Deployd acceptance state-authority stub
 Type=simple
 ExecStart=$sleep_binary 3600
 EOF
+# The testslot adapter has no database; authority startup itself is covered by wait-authority and TLS/rqlite acceptance.
+for slot in blue green; do
+  printf '[Service]\nExecStartPre=\n' >"/etc/systemd/system/agent-vm-native@$slot.service.d/05-test-authority.conf"
+done
 systemctl daemon-reload
 
 debug_unit() {

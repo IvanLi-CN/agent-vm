@@ -115,6 +115,7 @@ func testOIDCLoginUsesDurableTransactionAndSession(t *testing.T, remoteStore *st
 	startRecorder := httptest.NewRecorder()
 	server.Handler().ServeHTTP(startRecorder, start)
 	if startRecorder.Code != http.StatusFound {
+
 		t.Fatalf("start status=%d body=%s", startRecorder.Code, startRecorder.Body.String())
 	}
 	location, err := url.Parse(startRecorder.Header().Get("Location"))
@@ -462,7 +463,7 @@ func TestRemoteOIDCLoginAfterAdditiveSchemaChange(t *testing.T) {
 	defer store.Close()
 	// Keep the Store open before a newer binary adds state and advances its epoch.
 	table := fmt.Sprintf("future_oidc_%d", time.Now().UnixNano())
-	payload, _ := json.Marshal([]any{"CREATE TABLE " + table + "(value TEXT)", "INSERT INTO " + table + " VALUES('preserved')", "UPDATE meta SET value='" + table + "' WHERE key='state_epoch'"})
+	payload, _ := json.Marshal([]any{"CREATE TABLE " + table + "(value TEXT)", "INSERT INTO " + table + " VALUES('preserved')", "UPDATE meta SET value='" + fmt.Sprint(time.Now().UnixNano()) + "' WHERE key='state_epoch'"})
 	response, err := http.Post(descriptor.URL+"/db/execute?transaction", "application/json", bytes.NewReader(payload))
 	if err != nil {
 		t.Fatal(err)
