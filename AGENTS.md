@@ -20,6 +20,10 @@ manifest, systemd assets and behavior contracts versioned together.
 
 ## Validation
 
+新增或调整文档时，先按 [文档组织与编写规范](docs/README.md)选择唯一来源与目录，并同步索引及必要网页入口。
+
+文档站或进入 Web 展示的设计材料发生变化时，读取项目级 [documentation-review Skill](.agents/skills/documentation-review/SKILL.md)，按当前合同检查来源、阅读体验与验收边界。
+
 Keep tests beside the contract they prove. Run `bun run check`, both Bun test
 scopes and `go -C skills/agent-vm-ops/control test ./...` locally. Run Go race,
 native process-tree and isolated Incus/systemd checks in the session-owned
