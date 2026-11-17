@@ -1,0 +1,73 @@
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+from stage_release_assets import stage, SUMS, SUFFIXES
+from verify_assets import digest, verify
+
+
+class ReleaseImageStagingTest(unittest.TestCase):
+    def fixture(self, root):
+        for language in ['go', 'rust', 'java']:
+            for mode in ['privileged', 'unprivileged']:
+                directory = root / ('guest-image-' + language + '-' + mode)
+                directory.mkdir(parents=True)
+                name = 'agent-vm-ubuntu24-' + language + '-' + mode + '-amd64'
+                (directory / (name + '.tar.gz')).write_bytes(name.encode())
+                manifest = dict(schema=1, name=name, profile=language, variant=mode,
+                                architecture='amd64', source_revision='a' * 40,
+                                image_fingerprint='b' * 64,
+                                runtime_config={'security.privileged': str(mode == 'privileged').lower(), 'security.nesting': 'true'},
+                                sha256=digest(directory / (name + '.tar.gz')))
+                report = dict(ready=True, ssh_ed25519=True, database_clients=True,
+                              docker={key: True for key in ['docker_build', 'overlay2_whiteout', 'docker_run', 'compose', 'volume_persistence', 'dns_network', 'daemon_restart']})
+                for suffix, value in [('manifest.json', manifest), ('readiness.json', report), ('sbom.json', {'packages': [{'name': 'example', 'version': '1'}]})]:
+                    (directory / (name + '.' + suffix)).write_text(json.dumps(value))
+                self.checksums(directory)
+
+    def checksums(self, directory):
+        (directory / SUMS).write_text(''.join(digest(path) + '  ' + path.name + '\n' for path in sorted(directory.iterdir()) if path.name != SUMS))
+
+    def test_stages_complete_set_for_immutable_release_and_recovery(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); source = root / 'input'; output = root / 'frozen'
+            self.fixture(source)
+            assets = stage(source, output, 'a' * 40)
+            self.assertEqual(len(assets), 25)
+            self.assertEqual(len(verify(output, 'a' * 40)), 6)
+            self.assertEqual(assets, stage(source, output, 'a' * 40))
+            self.assertEqual(len((output / SUMS).read_text().splitlines()), 24)
+
+    def test_rejects_incomplete_corrupt_or_foreign_inputs_before_staging(self):
+        for fault in ['missing', 'tamper', 'source', 'foreign', 'symlink', 'wrong_slot']:
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary); source = root / 'input'; output = root / 'frozen'
+                self.fixture(source)
+                directory = source / 'guest-image-go-privileged'
+                archive = next(directory.glob('*.tar.gz'))
+                if fault == 'missing': archive.unlink()
+                elif fault == 'tamper': archive.write_bytes(b'tampered')
+                elif fault == 'foreign': (directory / 'foreign').write_text('unexpected')
+                elif fault == 'symlink': archive.unlink(); archive.symlink_to('/etc/hosts')
+                else:
+                    path = next(directory.glob('*.manifest.json')); value = json.loads(path.read_text())
+                    value['source_revision' if fault == 'source' else 'profile'] = 'c' * 40 if fault == 'source' else 'rust'
+                    path.write_text(json.dumps(value)); self.checksums(directory)
+                with self.assertRaises((ValueError, FileNotFoundError)):
+                    stage(source, output, 'a' * 40)
+                self.assertFalse(output.exists())
+
+    def test_never_overwrites_frozen_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); source = root / 'input'; output = root / 'frozen'
+            self.fixture(source); assets = stage(source, output, 'a' * 40)
+            path = Path(next(value for key, value in assets.items() if key.endswith('.tar.gz')))
+            path.write_bytes(b'frozen-different-bytes')
+            with self.assertRaises(ValueError): stage(source, output, 'a' * 40)
+            self.assertEqual(path.read_bytes(), b'frozen-different-bytes')
+
+
+if __name__ == '__main__': unittest.main()

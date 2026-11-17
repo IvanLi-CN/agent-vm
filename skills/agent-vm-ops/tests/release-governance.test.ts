@@ -79,6 +79,28 @@ test("release reservation is append-only and identity-bound", () => {
   }
 });
 
+test("immutable release freezes independent image files with product assets", () => {
+  const products = { "agent-vm-native-1.0.0-linux-amd64.tar": "/native.tar" };
+  const images = { "agent-vm-ubuntu24-go-privileged-amd64.tar.gz": "/image.tar.gz" };
+  const assets = { ...products, ...images };
+  const view = { tagName: "v1.0.0", targetCommitish: "a".repeat(40), isDraft: false, immutable: true, assets: Object.keys(assets).map(name => ({ name })) };
+  verifyReleaseView(view, "v1.0.0", false, assets, "a".repeat(40));
+  for (const names of [Object.keys(products), [...Object.keys(assets), "late-image.tar.gz"]]) {
+    let rejected = false;
+    try { verifyReleaseView({ ...view, assets: names.map(name => ({ name })) }, "v1.0.0", false, assets); } catch { rejected = true; }
+    if (!rejected) throw new Error("published image set differed from frozen reservation");
+  }
+  const root = mkdtempSync(join(tmpdir(), "agent-vm-image-release-state-"));
+  try {
+    const store = new ReleaseStateStore(root); const source = identity();
+    const artifacts = Object.fromEntries(Object.keys(assets).map(name => [name, "d".repeat(64)]));
+    store.claim(source); store.transition(source, "prepared", { assets, artifacts });
+    let rejected = false;
+    try { store.transition(source, "draft", { assets: products, artifacts: { [Object.keys(products)[0]!]: "d".repeat(64) } }); } catch { rejected = true; }
+    if (!rejected) throw new Error("recovery dropped the frozen image asset");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("release preflight is fail-closed and accepts the exact Linux Main gate", () => {
   let blocked = false;
   try {

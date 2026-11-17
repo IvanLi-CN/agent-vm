@@ -30,7 +30,8 @@
     "docs:build": "bun run --cwd docs-site build",
     "docs:preview": "bun run --cwd docs-site preview",
     "docs:check": "bun run --cwd docs-site check",
-    "docs:test:e2e": "bun run --cwd docs-site test:e2e"
+    "docs:test:e2e": "bun run --cwd docs-site test:e2e",
+    "images:build": "bun images/scripts/build_images.ts"
   },
   "devDependencies": {
     "@edgeone/makers-sdk": "0.1.0",

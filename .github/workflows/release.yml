@@ -20,8 +20,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  guest-images:
+    uses: ./.github/workflows/image-preview.yml
+    with:
+      source_ref: ${{ github.sha }}
   release:
     name: Release
+    needs: guest-images
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,10 +37,15 @@ jobs:
           bun-version: 1.4.4
       - name: Install locked Bun dependencies
         run: bun install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: guest-image-*
+          path: ${{ runner.temp }}/agent-vm-release-images
       - name: Resolve, claim, build, verify, and publish
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_REF_PROTECTED: ${{ github.ref_protected }}
+          AGENT_VM_RELEASE_IMAGE_INPUT: ${{ runner.temp }}/agent-vm-release-images
         run: bun run skills/agent-vm-ops/scripts/release.ts --target "${{ inputs.target }}"
       - name: Preserve release state for recovery
         if: always()
