@@ -1460,7 +1460,10 @@ export const HISTORICAL_PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Obje
 export function consolidated_artifacts(legacy: readonly ArtifactTuple[]): readonly ArtifactTuple[] {
  return Object.freeze(legacy.filter(item => item[1] !== "bin/agent-vm-deployd").map((item): ArtifactTuple => item[1] === "bin/agent-vm-control" ? ["agent-vm-server", "bin/agent-vm-server", item[2], item[3]] : item));
 }
-export const PRODUCT_LINUX_ARTIFACTS = consolidated_artifacts(LEGACY_RESIDENT_LINUX_ARTIFACTS);
+export const PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
+  ...consolidated_artifacts(LEGACY_RESIDENT_LINUX_ARTIFACTS),
+  ["host-config.ts", "host-config.ts", "support", 0o644],
+]);
 export const PRODUCT_NATIVE_LINUX_ARTIFACTS = consolidated_artifacts(LEGACY_NATIVE_LINUX_ARTIFACTS);
 
 export type ProductTarget =
