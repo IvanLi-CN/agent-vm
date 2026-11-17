@@ -1523,6 +1523,35 @@ func TestSQLiteSchemaAcceptsExtensionsAndRejectsMissingCore(t *testing.T) {
 	}
 }
 
+func TestSnapshotPreservesNullableKeysAndShadowedRowID(t *testing.T) {
+	source, err := OpenForTest(filepath.Join(t.TempDir(), "source.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	_, err = source.write.Exec(`CREATE TABLE nullable_keys(k TEXT PRIMARY KEY, value TEXT); INSERT INTO nullable_keys(rowid,k,value) VALUES(9,NULL,'a'),(22,NULL,'b'); CREATE TABLE shadowed(rowid INTEGER, payload TEXT, _rowid_ TEXT GENERATED ALWAYS AS (payload) VIRTUAL); INSERT INTO shadowed(oid,rowid,payload) VALUES(12,5,'x'),(35,5,'y')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := snapshotDB(context.Background(), source.write)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, alias := range map[string]string{"nullable_keys": "rowid", "shadowed": "oid"} {
+		table := snapshot.Tables[name]
+		if len(table.Rows) != 2 || table.RowIDName != alias {
+			t.Fatalf("%s snapshot: %+v", name, table)
+		}
+		for _, row := range table.Rows {
+			where, args := rowPredicate(table, row)
+			var count int
+			if err := source.write.QueryRow("SELECT count(*) FROM "+quoteIdentifier(name)+" WHERE "+where, args...).Scan(&count); err != nil || count != 1 {
+				t.Fatalf("%s predicate count=%d error=%v", name, count, err)
+			}
+		}
+	}
+}
+
 func TestMigrationRejectsPartialManagementSchemaBeforeRemoteWrite(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "source.sqlite3")
 	source, err := OpenForTest(sourcePath)
@@ -2152,11 +2181,16 @@ func TestRemoteCompatibleExtensionsAcrossEpochRefresh(t *testing.T) {
 	defer old.Close()
 	prefix := "future_" + randomHex(6)
 	parent, child, events := prefix+"_zparent", prefix+"_achild", prefix+"_events"
+	nullable, shadowed := prefix+"_nullable", prefix+"_shadowed"
 	statements := []remoteStatement{
 		{query: "CREATE TABLE " + parent + "(id TEXT PRIMARY KEY, computed TEXT GENERATED ALWAYS AS (upper(id)) STORED) WITHOUT ROWID"},
 		{query: "CREATE TABLE " + child + "(id INTEGER PRIMARY KEY, parent TEXT REFERENCES " + parent + "(id))"},
 		{query: "CREATE INDEX " + prefix + "_idx ON " + child + "(parent)"},
 		{query: "CREATE TABLE " + events + "(message TEXT)"},
+		{query: "CREATE TABLE " + nullable + "(k TEXT PRIMARY KEY, value TEXT)"},
+		{query: "INSERT INTO " + nullable + "(rowid,k,value) VALUES(9,NULL,'a'),(22,NULL,'b')"},
+		{query: "CREATE TABLE " + shadowed + "(rowid INTEGER, payload TEXT, _rowid_ TEXT GENERATED ALWAYS AS (payload) VIRTUAL)"},
+		{query: "INSERT INTO " + shadowed + "(oid,rowid,payload) VALUES(12,5,'x'),(35,5,'y')"},
 		{query: "INSERT INTO " + parent + "(id) VALUES('p')"},
 		{query: "INSERT INTO " + child + "(id,parent) VALUES(1,'p')"},
 		{query: "INSERT INTO " + events + "(rowid,message) VALUES(9,'first'),(22,'second')"},
@@ -2172,6 +2206,9 @@ func TestRemoteCompatibleExtensionsAcrossEpochRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := old.withWrite(ctx, func(tx *Tx) error {
+		if _, err := tx.conn.ExecContext(ctx, "UPDATE "+nullable+" SET value='updated' WHERE rowid=22; DELETE FROM "+shadowed+" WHERE oid=12; INSERT INTO "+shadowed+"(oid,rowid,payload) VALUES(70,5,'new')"); err != nil {
+			return err
+		}
 		if _, err := tx.conn.ExecContext(ctx, "INSERT INTO "+child+"(id,parent) VALUES(2,'p')"); err != nil {
 			return err
 		}
@@ -2192,6 +2229,13 @@ func TestRemoteCompatibleExtensionsAcrossEpochRefresh(t *testing.T) {
 		}
 		if count != 3 {
 			return fmt.Errorf("trigger replay or data loss: got %d events", count)
+		}
+		var countPreserved int
+		if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM "+nullable+" WHERE (rowid=9 AND value='a') OR (rowid=22 AND value='updated')").Scan(&countPreserved); err != nil || countPreserved != 2 {
+			return fmt.Errorf("nullable PK rows lost: %d %v", countPreserved, err)
+		}
+		if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM "+shadowed+" WHERE rowid=5 AND ((oid=35 AND payload='y') OR (oid=70 AND payload='new'))").Scan(&countPreserved); err != nil || countPreserved != 2 {
+			return fmt.Errorf("shadowed rowid delta incorrect: %d %v", countPreserved, err)
 		}
 		var computed string
 		if err := conn.QueryRowContext(ctx, "SELECT computed FROM "+parent).Scan(&computed); err != nil {

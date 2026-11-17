@@ -296,4 +296,4 @@ Incus 项目级共享 `incus_*` 指标由槽位只读采样，Deployd 只输出�
 
 新发布包仅提供 `agent-vm-server` 与 `agent-vm-deploy`。Deployd 的配置、UDS、systemd unit 和指标 job 身份不因二进制整合改变。启动 `agent-vm-deploy serve --config /etc/agent-vm-native/deployd.json` 才会创建部署状态库连接、获取单例锁和启动后台维护；普通 CLI 仍通过 UDS 调用，不启动这些资源。
 
-槽位启动路径来自已验证的完整 manifest 布局。Deployd 为蓝绿槽位生成 `/run/systemd/system/agent-vm-native@<slot>.service.d/10-release.conf`，并在启动前刷新 systemd；历史包使用自己的 `agent-vm-control`，新包使用 `agent-vm-server`。新包不生成旧名别名。回退启动期间禁用该槽位的 systemd 自动重启，由部署事务在每次启动前持久记录尝试；首次启动及两次重试均失败后停止该回退，部署服务重启不清零预算。启动成功后恢复通常的 systemd 重启策略。原有身份、authority 和事务检查不变，不额外增加旧槽烟测步骤。
+槽位启动路径来自已验证的完整 manifest 布局。Deployd 为蓝绿槽位生成 `/etc/systemd/system/agent-vm-native@<slot>.service.d/10-release.conf`，并在启动前刷新 systemd；历史包使用自己的 `agent-vm-control`，新包使用 `agent-vm-server`。新包不生成旧名别名。回退启动期间禁用该槽位的 systemd 自动重启，由部署事务在每次启动前持久记录尝试；首次启动及两次重试均失败后停止该回退，部署服务重启不清零预算。启动成功后恢复通常的 systemd 重启策略。原有身份、authority 和事务检查不变，不额外增加旧槽烟测步骤。
