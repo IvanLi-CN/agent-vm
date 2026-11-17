@@ -10,7 +10,7 @@ status: accepted
 
 ## 决策
 
-Rust、Java、Go 每族提供 privileged 与 unprivileged 两种变体，默认构建六个产物。每种模式有独立公共层缓存、名称和 manifest；构建容器显式设置 security.privileged 与 security.nesting，镜像内保存运行配置记录，创建端必须使用对应参数。
+Rust、Java、Go 每族提供 privileged 与 unprivileged 两种变体，默认构建六个产物。Java 变体包含锁定版本的 Azul Zulu JDK 与 Apache Maven。每种模式有独立公共层缓存、名称和 manifest；构建容器显式设置 security.privileged 与 security.nesting，镜像内保存运行配置记录，创建端必须使用对应参数。
 
 非特权构建需要宿主提供嵌套 UID/GID 映射能力。任一模式启动或 readiness 失败应停止并报告，不得自动转换为另一模式，不得修改外层宿主权限。每种模式都要验证 SSH 与 guest 内 Docker；脚本测试通过不代表真实镜像验收通过。
 

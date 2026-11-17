@@ -9,7 +9,7 @@ bun --version | grep -Fx "$BUN_VERSION"
 node --version | grep -Fx "v$NODE_VERSION"
 case "$IMAGE_PROFILE" in
  rust) rustc --version | grep -F "rustc $RUST_VERSION "; cargo --version ;;
- java) java -version 2>&1 | grep -F "$ZULU_VERSION"; javac -version ;;
+ java) java -version 2>&1 | grep -F "$ZULU_VERSION"; javac -version; mvn -version | grep -F "Apache Maven $MAVEN_VERSION " ;;
  go) go version | grep -F "go$GO_VERSION " ;;
 esac
 jq -n --slurpfile docker /etc/agent-vm-image/docker-readiness.json '{ready:true,ssh_ed25519:true,database_clients:true,docker:$docker[0]}' > /etc/agent-vm-image/readiness.json

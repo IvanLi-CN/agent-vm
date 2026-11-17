@@ -44,7 +44,7 @@ for (const group of ["ubuntu", "docker"]) {
  for (const [name, item] of Object.entries(aptLock[group]!)) if (!/^[a-z0-9][a-z0-9+.-]*$/.test(name) || !/^[a-zA-Z0-9.+:~_-]+$/.test(item.version) || !/^[0-9a-f]{64}$/.test(item.sha256)) fail(`invalid APT package lock: ${name}`);
 }
 if (lock.schema !== 1 || lock.architecture !== "amd64" || lock.base.source !== "images:ubuntu/24.04" || !lock.base.require_fingerprint || !/^[0-9a-f]{64}$/.test(lock.base.fingerprint)) fail("a pinned Ubuntu 24.04 amd64 base is required");
-for (const name of ["bun", "node", "go", "rust", "zulu"]) {
+for (const name of ["bun", "node", "go", "rust", "zulu", "maven"]) {
   const item = lock.downloads[name];
   if (!item || !item.url.startsWith("https://") || !/^[0-9a-f]{64}$/.test(item.sha256)) fail(`download ${name} requires HTTPS and SHA256`);
 }
