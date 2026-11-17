@@ -78,7 +78,7 @@ test("format-4 management manifest requires the Linux product target", () => {
     ]);
     expect(verify_product_bundle(root, manifest)).toEqual(manifest);
     const historical = structuredClone(manifest);
-    historical.artifacts = historical.artifacts.filter(a => a.path !== "bin/agent-vm-server");
+    historical.artifacts = historical.artifacts.filter(a => HISTORICAL_PRODUCT_LINUX_ARTIFACTS.some(([, path]) => path === a.path));
     for (const [name, relative, role, mode] of HISTORICAL_PRODUCT_LINUX_ARTIFACTS.filter(
       ([, path]) => !PRODUCT_LINUX_ARTIFACTS.some(([, currentPath]) => currentPath === path),
     )) {
