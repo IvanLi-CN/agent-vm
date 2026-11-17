@@ -1,2 +1,3 @@
-import type {Config} from '@react-router/dev/config';
-export default {ssr:false,prerender:['/','/source',...Array.from({length:7},(_,i)=>'/docs/'+i)]} satisfies Config;
+import type { Config } from '@react-router/dev/config';
+import { catalog } from './content/catalog';
+export default { ssr: false, prerender: ['/', '/source', ...catalog.map(doc => '/docs/' + doc.slug)] } satisfies Config;

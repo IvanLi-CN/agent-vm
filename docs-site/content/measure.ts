@@ -20,7 +20,7 @@ try{
   const marker=`docs-recompile-probe-${Date.now()}`,start=performance.now();
   await writeFile(path,original+'\n\n'+marker+'\n');
   for(let i=0;i<100;i++){
-    const response=await fetch(url+'/.generated/content/2.md?import');
+    const response=await fetch(url+'/.generated/content/docs-site-background.md?import');
     if(response.ok&&(await response.text()).includes(marker)){singleDocumentRecompileMs=Math.round(performance.now()-start);break;}
     await Bun.sleep(50);
   }

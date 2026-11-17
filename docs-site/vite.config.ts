@@ -7,10 +7,10 @@ import { resolve } from 'node:path';
 function sourceWatch(): Plugin {
   return { name: 'documentation-source-watch', configureServer(server) {
     const root = resolve(import.meta.dirname, '..');
-    server.watcher.add([resolve(root, 'docs'), resolve(root, 'GLOSSARY.md')]);
+    server.watcher.add([resolve(root, 'docs'), resolve(root, 'GLOSSARY.md'), resolve(root, 'README.md')]);
     let timer: ReturnType<typeof setTimeout>;
     server.watcher.on('all', (_, path) => {
-      if (!path.startsWith(resolve(root, 'docs') + '/') && path !== resolve(root, 'GLOSSARY.md')) return;
+      if (!path.startsWith(resolve(root, 'docs') + '/') && path !== resolve(root, 'GLOSSARY.md') && path !== resolve(root, 'README.md')) return;
       clearTimeout(timer);
       timer = setTimeout(() => {
         try { execFileSync('bun', ['content/generate.ts'], { cwd: import.meta.dirname, stdio: 'inherit' }); server.ws.send({ type: 'full-reload' }); }

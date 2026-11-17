@@ -1,6 +1,6 @@
 # Agent VM 文档内容来源与适配
 
-原始 Markdown／MDX 正文保持唯一可编辑来源。首期来源清单位于 `docs-site/content/generate.ts`，接入本主题 Spec、实现说明、背景、三份设计材料和术语表。
+原始 Markdown／MDX 正文保持唯一可编辑来源。来源清单位于 `docs-site/content/catalog.ts`，明确维护路径、稳定 slug、标题与导航分组。最小集接入项目 README、CLI、系统架构、术语以及文档站主题的六份材料；`content/generate.ts` 负责构建适配。
 
 构建使用语法树识别链接，只修改原始目标跨度，保留正文、代码围栏与 Markdown／MDX 区别。选入站点的材料使用内部页面链接，其他未修改文档引用固定 Git 提交，修改中的必要引用使用实际构建快照；资源使用内容摘要命名。
 

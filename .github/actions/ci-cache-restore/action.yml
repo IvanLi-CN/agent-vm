@@ -16,7 +16,7 @@ runs:
       env:
         CACHE_ROLE: ${{ inputs.role }}
         DEPENDENCY_HASH: ${{ hashFiles('skills/agent-vm-ops/control/go.mod', 'skills/agent-vm-ops/control/go.sum') }}
-        SOURCE_HASH: ${{ hashFiles('skills/**', 'web/**', 'docs-site/**', 'docs/**', 'GLOSSARY.md', 'bin/**', 'package.json', 'bun.lock', '.github/actions/**', '.github/workflows/ci*.yml') }}
+        SOURCE_HASH: ${{ hashFiles('skills/**', 'web/**', 'docs-site/**', 'docs/**', 'GLOSSARY.md', 'README.md', 'bin/**', 'package.json', 'bun.lock', '.github/actions/**', '.github/workflows/ci*.yml') }}
         LOCK_HASH: ${{ hashFiles('bun.lock') }}
       run: python3 bin/ci_cache.py plan
     - id: module

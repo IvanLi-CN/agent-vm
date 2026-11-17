@@ -2,13 +2,13 @@ import { mkdir, readFile, writeFile, readdir, rm } from 'node:fs/promises';
 import { resolve, extname } from 'node:path';
 import { realpath } from 'node:fs/promises';
 import { repositoryIdentity } from './identity';
+import { catalog } from './catalog';
 import { prepareBody } from './prepare';
 import { adaptLinks, contentDigest, headings } from './source';
 const root = resolve(import.meta.dir, '../..'), out = resolve(import.meta.dir, '../.generated');
-export const paths = ['docs/specs/documentation-review/SPEC.md', 'docs/specs/documentation-review/IMPLEMENTATION.md', 'docs/specs/documentation-review/HISTORY.md', 'docs/proposals/agent-vm-documentation-review.md', 'docs/proposals/agent-vm-documentation-source.md', 'docs/proposals/agent-vm-documentation-stack.md', 'GLOSSARY.md'];
-const documents = await Promise.all(paths.map(async (path, index) => {
-  const text = await readFile(resolve(root, path), 'utf8');
-  return { path, text, slug: String(index), toc: headings(text) };
+const documents = await Promise.all(catalog.map(async entry => {
+  const text = await readFile(resolve(root, entry.path), 'utf8');
+  return { ...entry, text, toc: headings(text) };
 }));
 const {revision,dirty,modified} = repositoryIdentity(root);
 const snapshots: Record<string, string> = Object.fromEntries(documents.map(d => [d.path, d.text]));
