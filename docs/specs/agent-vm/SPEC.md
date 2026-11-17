@@ -316,9 +316,6 @@ TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输
 
 ## Related ADRs
 
-- [客户端运行与发布校验边界](../../adr/0052-client-runtime-release-boundary.md)
-- [镜像名称与单操作固定](../../adr/0053-image-names-and-operation-pinning.md)
-
 - [Agent VM 拓扑与恢复边界](../../adr/0028-agent-vm-topology-recovery-boundary.md)
 - [Agent VM 仅按内存预留准入](../../adr/0029-agent-vm-memory-reservation-only-admission.md)
 - [Agent VM 控制面更新边界](../../adr/0030-agent-vm-control-plane-update-boundary.md)
@@ -330,10 +327,10 @@ TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输
 - [Agent VM 统一服务安全边界](../../adr/0043-agent-vm-unified-service-security-boundary.md)
 - [Agent VM SQLite 到 rqlite 状态迁移](../../adr/0044-agent-vm-state-migration-to-rqlite.md)
 - [Deployd 与蓝绿事务](../../adr/0045-agent-vm-deployment-controller.md)
-
 - [维护扫描进展与缓存释放收尾](../../adr/0047-agent-vm-maintenance-progress-and-recovery.md)
-
 - [Agent VM 镜像运行变体](../../adr/0051-agent-vm-image-runtime-variants.md)
+- [客户端运行与发布校验边界](../../adr/0052-client-runtime-release-boundary.md)
+- [镜像名称与单操作固定](../../adr/0053-image-names-and-operation-pinning.md)
 
 ## 相关材料
 
