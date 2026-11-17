@@ -44,6 +44,8 @@
   "immutable_release_policy": {
     "cutover_version": "1.4.0",
     "historical_baseline": "before-cutover-releases-may-be-mutable-and-are-verified-by-identity-assets-and-digests",
+    "repository_api_check": "GET /repos/{owner}/{repo}/immutable-releases",
+    "repository_api_credential": "RELEASE_PLATFORM_TOKEN with Administration: read",
     "state_attestation_mismatch": "explicit-legacy-audit-event-required"
   },
   "toolchain": {

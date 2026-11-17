@@ -28,8 +28,10 @@ test("guest image publication is manual and waits for the parallel build matrix"
   expect(release.on.workflow_dispatch.inputs.confirm_immutable_releases.default).toBe(false);
   expect(release.jobs["validate-dispatch"]).toBeDefined();
   expect(release.jobs["validate-dispatch"].steps.some((step: { run?: string }) => step.run?.includes("IMMUTABLE_RELEASES_CONFIRMED"))).toBe(true);
+  expect(release.jobs["validate-dispatch"].steps.some((step: { run?: string; env?: Record<string, string> }) => step.run?.includes("immutable-releases") && step.env?.GH_TOKEN === "${{ secrets.RELEASE_PLATFORM_TOKEN }}")).toBe(true);
   expect(release.jobs["build-images"].needs).toBe("validate-dispatch");
   expect(release.jobs.publish.steps.some((step: { name?: string }) => step.name === "Require protected main dispatch")).toBe(true);
+  expect(release.jobs.publish.steps.some((step: { run?: string; env?: Record<string, string> }) => step.run?.includes("immutable-releases") && step.env?.GH_TOKEN === "${{ secrets.RELEASE_PLATFORM_TOKEN }}")).toBe(true);
   expect(release.jobs["build-images"].uses).toBe("./.github/workflows/image-preview.yml");
   expect(release.jobs.publish.needs).toBe("build-images");
   expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes("releases/${IMAGE_RELEASE_ID}") && step.run?.includes("draft=false"))).toBe(true);
@@ -41,6 +43,9 @@ test("guest image publication is manual and waits for the parallel build matrix"
   expect(read(".github/workflows/image-release.yml")).toContain("IMAGE_RELEASE_ALREADY_PUBLISHED");
   expect(read(".github/workflows/image-release.yml")).toContain("IMAGE_TAG_WAS_EXISTING");
   expect(read(".github/workflows/image-release.yml")).toContain("git/refs");
+  expect(read(".github/workflows/image-release.yml")).toContain("verify_source_tag");
+  expect(read(".github/workflows/image-release.yml")).toContain("expected_assets");
+  expect(read(".github/workflows/image-release.yml")).toContain("grep -Fqx --");
   expect(read(".github/workflows/image-release.yml")).toContain(".prerelease");
   expect(read(".github/workflows/image-release.yml")).toContain("IMAGE_RELEASE_UPLOAD_URL");
   expect(read(".github/workflows/image-release.yml")).toContain("verify_assets.py");

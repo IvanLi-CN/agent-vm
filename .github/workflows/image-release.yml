@@ -29,6 +29,13 @@ jobs:
           REF_PROTECTED: ${{ github.ref_protected }}
           IMMUTABLE_RELEASES_CONFIRMED: ${{ inputs.confirm_immutable_releases }}
         run: test "$DISPATCH_REF" = "refs/heads/main" && test "$REF_PROTECTED" = "true" && test "$IMMUTABLE_RELEASES_CONFIRMED" = "true"
+      - name: Require repository immutable releases before building
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLATFORM_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq '.enabled')" = "true"
 
   build-images:
     name: Build and verify guest images
@@ -48,6 +55,13 @@ jobs:
           REF_PROTECTED: ${{ github.ref_protected }}
           IMMUTABLE_RELEASES_CONFIRMED: ${{ inputs.confirm_immutable_releases }}
         run: test "$DISPATCH_REF" = "refs/heads/main" && test "$REF_PROTECTED" = "true" && test "$IMMUTABLE_RELEASES_CONFIRMED" = "true"
+      - name: Recheck repository immutable releases before staging
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLATFORM_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN"
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq '.enabled')" = "true"
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -130,6 +144,21 @@ jobs:
             gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
               --jq '.[] | [.id, .tag_name, .draft, (.immutable // false), .prerelease] | @tsv'
           } | awk -F '\t' -v image_tag="$IMAGE_TAG" '$2 == image_tag { print; count += 1 } END { if (count > 1) exit 2 }')"
+          verify_source_tag() {
+            local tag_value tag_sha tag_type
+            tag_value="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${IMAGE_TAG}" --jq '.object.sha + "\t" + .object.type')"
+            tag_sha="${tag_value%%$'\t'*}"
+            tag_type="${tag_value#*$'\t'}"
+            for _ in 1 2 3 4; do
+              [ "$tag_type" = "commit" ] && break
+              test "$tag_type" = "tag"
+              tag_value="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.object.sha + "\t" + .object.type')"
+              tag_sha="${tag_value%%$'\t'*}"
+              tag_type="${tag_value#*$'\t'}"
+            done
+            test "$tag_type" = "commit"
+            test "$tag_sha" = "$SOURCE_REVISION"
+          }
           if [ -z "$release_list" ]; then
             if [ "$IMAGE_TAG_WAS_EXISTING" != "true" ]; then
               set +e
@@ -142,6 +171,7 @@ jobs:
                 printf '%s\n' "$tag_create_response" >&2
               fi
             fi
+            verify_source_tag
             release_response="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
               -f "tag_name=${IMAGE_TAG}" \
               -f "target_commitish=${SOURCE_REVISION}" \
@@ -167,19 +197,7 @@ jobs:
             echo "existing image release is public but not immutable: ${IMAGE_TAG}" >&2
             exit 1
           fi
-          tag_endpoint="repos/${GITHUB_REPOSITORY}/git/ref/tags/${IMAGE_TAG}"
-          tag_value="$(gh api "$tag_endpoint" --jq '.object.sha + "\t" + .object.type')"
-          tag_sha="${tag_value%%$'\t'*}"
-          tag_type="${tag_value#*$'\t'}"
-          for _ in 1 2 3 4; do
-            [ "$tag_type" = "commit" ] && break
-            test "$tag_type" = "tag"
-            tag_value="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.object.sha + "\t" + .object.type')"
-            tag_sha="${tag_value%%$'\t'*}"
-            tag_type="${tag_value#*$'\t'}"
-          done
-          test "$tag_type" = "commit"
-          test "$tag_sha" = "$SOURCE_REVISION"
+          verify_source_tag
           release_endpoint="repos/${GITHUB_REPOSITORY}/releases/${release_id}"
           upload_url="$(gh api "$release_endpoint" --jq '.upload_url')"
           test -n "$upload_url"
@@ -196,6 +214,13 @@ jobs:
           upload_url="${IMAGE_RELEASE_UPLOAD_URL%\{?name,label\}}"
           test -n "$upload_url"
           existing_assets="$(gh api --paginate "${asset_endpoint}?per_page=100" --jq '.[] | [.id, .name] | @tsv')"
+          expected_assets="$(cd "$IMAGE_ROOT" && find . -maxdepth 1 -type f -printf '%f\n' | sort)"
+          while IFS=$'\t' read -r asset_id asset_name; do
+            [ -n "$asset_id" ] || continue
+            if ! printf '%s\n' "$expected_assets" | grep -Fqx -- "$asset_name"; then
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" >/dev/null
+            fi
+          done <<< "$existing_assets"
           for path in "$IMAGE_ROOT"/*; do
             name="$(basename "$path")"
             asset_id="$(printf '%s\n' "$existing_assets" | awk -F '\t' -v asset_name="$name" '$2 == asset_name { print $1; exit }')"
