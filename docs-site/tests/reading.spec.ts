@@ -145,6 +145,7 @@ test('architecture diagrams fit by default, zoom and follow theme changes', asyn
   await expect(svg).toHaveAttribute('data-theme', 'dark');
   await expect.poll(async () => page.locator('.diagram-viewport img:not([data-theme="dark"])').count()).toBe(0);
   expect(await svg.getAttribute('src')).not.toBe(originalImage);
+  await page.evaluate(async () => { await Promise.allSettled(document.getAnimations().map(animation => animation.finished)); });
   await diagram.scrollIntoViewIfNeeded();
   if (process.env.DOCS_CAPTURE) await page.screenshot({ path: testInfo.outputPath('architecture-dark.png'), animations: 'disabled' });
   await page.locator('.diagram').first().getByRole('button', { name: '放大图表' }).click();
@@ -157,6 +158,7 @@ test('architecture diagrams fit by default, zoom and follow theme changes', asyn
   await nav.getByRole('button', { name: '切换明暗' }).click();
   if (page.viewportSize()!.width < 768) await page.keyboard.press('Escape');
   await expect(svg).toHaveAttribute('data-theme', 'light');
+  await page.evaluate(async () => { await Promise.allSettled(document.getAnimations().map(animation => animation.finished)); });
   await diagram.scrollIntoViewIfNeeded();
   if (process.env.DOCS_CAPTURE) await page.screenshot({ path: testInfo.outputPath('architecture-light.png'), animations: 'disabled' });
 });
