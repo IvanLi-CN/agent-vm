@@ -65,7 +65,10 @@ jobs:
       - name: Build and verify image
         run: sudo env PATH="$PATH" AGENT_VM_IMAGE_NETWORK=avm-build-br bun run images:build -- --profile "${{ matrix.language }}" --variant "${{ matrix.variant }}"
       - name: Verify exported checksums
-        run: cd dist && sha256sum -c agent-vm-ubuntu24-SHA256SUMS
+        run: |
+          cd dist && sha256sum -c agent-vm-ubuntu24-SHA256SUMS
+          cd ..
+          python3 images/scripts/verify_assets.py --directory dist --source-revision "$(git rev-parse HEAD)"
       - uses: actions/upload-artifact@v4
         with:
           name: guest-image-${{ matrix.language }}-${{ matrix.variant }}

@@ -46,7 +46,7 @@ go -C skills/agent-vm-ops/control test ./internal/native \
 
 PR 预览在 GitHub 托管 Ubuntu runner 分别构建六套镜像，无需自托管 runner。产品正式 Release 存在后，在合并修订上运行 `Guest image release` 并指定同一不可变 tag；镜像作为独立资产附加到该 Release，不进入控制服务或 Deployd 的二进制包。不覆盖已有 Release 资产。
 
-在目标服务器用 `gh release download` 下载对应语言/模式的 tar、manifest、SBOM、readiness 和 SHA256SUMS，按完整清单下载其余资产或提取并验证所选四条清单；核对 manifest 的 `source_revision` 等于正式 Release 修订、模式匹配且 readiness 全通过。然后通过现有管理端本地包上传或配置的可信镜像来源登记到 catalog，并等待完整性和适用性通过；单独 `incus image import` 不会完成网页 catalog 登记。
+在目标服务器用 `gh release download` 下载对应语言/模式的 tar、manifest、SBOM、readiness 和 SHA256SUMS，在目标服务器运行 `python3 images/scripts/verify_assets.py --directory "$DOWNLOAD_DIR" --source-revision "$RELEASE_SHA"` 验证所下载的镜像及四类 sidecar；核对 manifest 的 `source_revision` 等于正式 Release 修订、模式匹配且 readiness 全通过。然后通过现有管理端本地包上传或配置的可信镜像来源登记到 catalog，并等待完整性和适用性通过；单独 `incus image import` 不会完成网页 catalog 登记。
 
 先在一个目标完成导入和实际 Agent VM acquire/SSH/release，再处理另一个目标。两者通过后才由运维者选择新默认镜像；已有 task/cache 保持原 fingerprint。旧裸镜像按 catalog 退役流程保留已有引用。失败时保留旧默认，不自动删除旧镜像、缓存或现有会话。部署地址、凭据及实际 fingerprint 库存仅记录在受保护运维环境。
 
