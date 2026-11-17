@@ -23,6 +23,12 @@ bun skills/agent-vm/scripts/agent_vm.ts status --session-id deployment-acceptanc
 
 确认释放后无有效租约、端口映射关闭，且实例进入 stopped/cache 状态。仅对本次专属测试实例，在明确允许丢弃其数据的隔离验收中执行 `destroy`，确认 Incus 实例与残留映射均已删除。不能对用户实例执行这些测试。
 
+## 嵌套权限覆盖
+
+容器内运行 Incus 时，按[嵌套权限手册](nested-incus.md)检查每层 UID/GID 坐标与授权，保存 expanded config、实际映射和各阶段启动日志。声明支持非特权 guest 时，必须用独立存储池和显式 `security.privileged=false` 的测试实例完成启动；不要继承待验收的特权 profile。需要 Docker 的部署还必须运行实际 Docker 容器，验证 root 与高位非 root 用户、可写层和所需网络能力，不能只检查 daemon 的 `docker version`。
+
+将 AppArmor stacking、seccomp 与 BPF device 过滤的观测单独记录；启动或 smoke test 成功不等于完整隔离通过，声明所需安全能力缺失时保持该项未通过。缺少范围或授权时，应定位为环境前提失败，不自动改为特权模式或将镜像判为损坏。保存临时资源 owner、配置备份和回退哈希，确认测试资源清理及[维护准入恢复](maintenance.md)后才能结束验收。
+
 ## 蓝绿与观测
 
 以另一个有效候选包执行 `stage`、`verify`、`activate`，记录原事务、两槽进程身份、controller term、active 链接、旧槽 drain 和 quiescence。切换期间必须能同时观测两槽，且最多一个槽持有有效 controller lease。验证一次有界 rollback、Deployd 重启与不确定阶段 fencing；普通切换前后业务权威必须是同一 rqlite，不得执行数据库替换。

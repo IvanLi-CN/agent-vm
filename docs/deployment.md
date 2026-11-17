@@ -6,6 +6,8 @@ Agent VM 在已具备 Incus 运行条件的 Linux 控制环境中运行。Caddy 
 
 部署方提供 Incus 项目、网络隔离、存储池、已验证容器镜像、域名、OIDC 注册、TLS 证书和受保护配置。安装不接管 PVE、CT 权限、挂载或外部观测服务。组件必须使用[固定清单](../deploy/assets/blue-green/deployment-components.json)及其校验和。
 
+控制环境本身是容器时，先完成[嵌套 Incus 权限准备与排查](../deploy/docs/nested-incus.md)：核对外层有效 UID/GID 范围、内层 subordinate ID 授权与显式权限模式，并实际验证声明支持的非特权 guest 和 Docker。安装预检通过、Incus 资源存在或特权 guest 成功均不能替代这项验收。维护时按[维护 drain 与恢复](../deploy/docs/maintenance.md)保存同一 owner 会话，避免普通会话进入后无法退出暂停。
+
 ## 操作入口
 
 从[首次安装步骤](../deploy/docs/install.md)准备受保护输入，运行 `agent-vm-deploy install --config <输入> --bundle <产品包> --materials <资料目录>` 进行只读预检，确认无阻塞后以相同输入加 `--apply` 执行安装。已有安装的线上升级由目标服务器上的 `agent-vm-deploy update --version <semver> --source-revision <sha>` 完成；该命令在服务器本地选择架构、下载并校验正式 release，再把候选交给 deployd 执行 blue-green 事务。Agent 不下载或上传产品 bundle。部署资料布局与配置示例见 [deploy/README.md](../deploy/README.md)。安装路径、双槽位角色、旧状态迁移、升级、有限回滚及恢复细节见[蓝绿部署手册](../deploy/docs/blue-green.md)。全新安装和旧环境迁移必须区别处理，普通蓝绿升级不能替换业务数据库。
