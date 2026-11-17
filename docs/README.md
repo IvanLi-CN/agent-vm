@@ -10,7 +10,7 @@
 | 已接受的关键决定 | [ADR 目录](adr/)，每份文件记录特定决策及状态；当前统一服务安全边界见 [ADR 0043](adr/0043-agent-vm-unified-service-security-boundary.md)，状态迁移见 [ADR 0044](adr/0044-agent-vm-state-migration-to-rqlite.md)，部署事务与双槽位协调见 [ADR 0045](adr/0045-agent-vm-deployment-controller.md)。 |
 | 日常操作与恢复 | [Agent VM 运维手册](specs/agent-vm/OPERATIONS.md)和部署方自己的受保护记录。 |
 | 设计研究和建议 | [proposals](proposals/) 保存决策备忘录，是否已采纳以对应 ADR、Spec 和实现为准。 |
-| 文档站与设计审阅建设 | [需求合同](specs/documentation-review/SPEC.md)定义首期范围与验收，[实现覆盖](specs/documentation-review/IMPLEMENTATION.md)区分设计与实际能力；[内容研究](proposals/agent-vm-documentation-source.md)和[技术方案](proposals/agent-vm-documentation-stack.md)记录内容接入依据、已确认选型及其取舍。 |
+| 独立文档站建设 | [需求合同](specs/documentation-review/SPEC.md)定义首期范围与验收，[实现覆盖](specs/documentation-review/IMPLEMENTATION.md)区分设计与实际能力；[内容研究](proposals/agent-vm-documentation-source.md)和[技术方案](proposals/agent-vm-documentation-stack.md)记录内容接入依据、已确认选型及其取舍。 |
 | 可复用工程经验 | [solutions](solutions/agent-vm/) 保存特定问题的解释与处理经验。 |
 | 界面视觉与交互 | 根目录 [DESIGN.md](../DESIGN.md) 是界面设计系统，不是系统架构；[Web 表面简报](../.impeccable/surfaces/web.md)记录界面方向。 |
 

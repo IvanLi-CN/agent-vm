@@ -1,45 +1,48 @@
-# Agent VM 文档审阅实现覆盖
+# Agent VM 独立文档站实现覆盖
 
 > 长期需求以 [SPEC.md](SPEC.md) 为准；本文件记录实现及验证事实。
 
 ## Current Status
 
-- Implementation：独立 Fumadocs 静态站、单源适配、追溯索引、问题预览、来源快照与组件状态已实现。
+- Implementation：独立 Fumadocs 静态站、单源正文适配、文档阅读、Mermaid 与来源快照已实现；已按负责人反馈移除独立审阅页、需求追溯和关联维护要求。
 - Lifecycle：active。
-- 当前候选尚待项目负责人实际审阅及截图确认；未取得人工验收，未宣称 merge-ready。
-- PR/Main 文档作业已接入既有 gate；当前没有远端 CI 或正式 PR 审查结论。
+- 修正后的自动化已复验；候选尚待负责人实际阅读确认；不宣称 merge-ready。
+- PR/Main 文档作业已接入既有 gate；尚无远端 CI 或正式 PR 审查结论。
 
 ## Implementation Coverage
 
 | 需求 | 实现依据 | 验证与缺口 |
 | --- | --- | --- |
-| REQ-DOCS-001、REQ-DOCS-002 | `docs-site/content/generate.ts` 明确接入七份来源，正文单源维护；设计列表声明读取到追溯索引。 | 来源、追溯与身份单测通过；没有第二份手工规范正文。 |
-| REQ-DOCS-003、REQ-DOCS-004 | 独立 Bun workspace；Fumadocs MDX/UI、React Router 静态预渲染；导航、目录、明暗主题、代码与 Mermaid。 | 选定版本组合构建通过，页面与章节链接浏览器测试通过。 |
-| REQ-DOCS-005、REQ-DOCS-006 | 需求关键词筛选、设计与验收依据展开、来源行定位；异常示例与诊断筛选；严格检查独立于可容错预览。 | 完整、缺失、损坏、无法解析、重复 ID 具有自动测试；桌面与窄屏键盘流程通过。 |
-| REQ-DOCS-007 | 基准提交、修改状态、输入摘要、实际正文快照；外部引用固定提交，修改中的引用使用快照。 | 干净／修改／未跟踪身份测试及摘要测试通过；最终候选冻结后仍需重建确认。 |
-| REQ-DOCS-008 | 真实需求审阅入口与独立异常示例；构建测量脚本。 | 下方记录实测；负责人确认交互价值仍待完成，自动化不代替人工确认。 |
-| REQ-DOCS-009 | 首期站点与管理台、Go 服务和部署独立；项目级 Skill 提供维护入口。 | 未增加管理台嵌入、共享文档包、公开托管或产品发布。 |
+| REQ-DOCS-001、REQ-DOCS-002 | 来源清单接入七份原始材料，首页直接引导阅读；无规范正文副本及额外关联标记。 | 来源适配单测覆盖原始内容、链接、资源及 Markdown／MDX 差异；9 项来源、身份和正文单测通过。 |
+| REQ-DOCS-003、REQ-DOCS-004 | 独立 Bun workspace，Fumadocs MDX/UI、React Router 静态预渲染；导航、目录、主题、代码及 Mermaid。 | 浏览器检查已调整为正文阅读、图表源码、章节跳转、来源和键盘；桌面、1024px 与 393×852 共 12 项浏览器检查通过，含显式证据捕获。 |
+| REQ-DOCS-007 | 来源提交、修改状态、输入摘要与正文快照；固定提交外部引用及修改来源快照。 | 身份测试覆盖干净、修改和未跟踪输入；最终候选仍需重建绑定。 |
+| REQ-DOCS-008 | 真实文档阅读入口与构建测量脚本。 | 性能实测见下；负责人的当前候选阅读确认待完成，旧追溯界面的验收不再适用。 |
+| REQ-DOCS-009 | 文档站与管理台、Go 服务及部署独立；项目 Skill 明确展示文档的职责。 | 移除独立审阅路由、追溯组件、索引及示例；未引入后续嵌入、托管或发布。 |
 
 ## Validation
 
-本地已完成 `bun run docs:check`、`bun run docs:build`、`bun test docs-site/content`、独立 Storybook 构建与桌面／`1024px` 中间宽度／`393×852` Playwright 检查；当前包含 14 项来源单测和 21 项浏览器检查（含显式证据捕获）。浏览器覆盖需求筛选、设计及验收入口、构建来源、异常诊断、键盘操作、章节链接和 Mermaid。
+修正后已通过 `docs:check`、静态构建、9 项来源单测、独立 Storybook 构建和三种尺寸的 12 项 Playwright 检查。浏览器覆盖正文与来源快照、行定位、Mermaid、图表源码、章节链接、窄屏图表及键盘滚动、明暗主题和页面宽度。
 
-仓库 `bun run check`、`bun run test:repo`、`bun run test:skills` 与 Go 测试通过。Skill 测试在干净候选提交上重跑，发布打包保护正常通过。质量门禁声明检查通过，保留既有必需 gate 名称，新增文档作业作为依赖。
+仓库 `bun run check`、`bun run test:repo`、Go 测试、Spec 合同与 10 项文档检查通过。Skill 测试包含要求干净提交的发布打包保护，应在候选提交上运行；不绕过该保护。
+
+修正前的追溯交互测试不作为当前验收证据。人工验收检查文档本身的阅读和定位，仍待负责人确认。
 
 ### 构建测量
 
-环境为 macOS arm64、Apple M4、Bun `1.4.4`、Node `24.12.0`，依赖已安装。测量基准为干净提交 `7ea08c362b8231aa8bd449def6390b20cb0068fd`，输入摘要 `500b99a33344672c5f891289ade4c69481481ada6d84c0cbd67946d44ba75d85`；该摘要对应测量时的正文与配置，不冒充后续候选的摘要。
+测量入口为 `DOCS_PORT=<leased-port> bun docs-site/content/measure.ts`，结果保存在忽略的 `.generated/performance.json`。测量冷构建、完整预渲染及单文档开发重编译，并记录环境和实际输入摘要。不预设性能阈值。
+
+2026-11-17 的一次实测环境为 macOS arm64、Apple M4、Bun 1.4.4、Node 24.12.0，依赖已安装。来源基准为 `b16c5d95f1d9bafced8f6489fd44aba548a81ac4`，包含本次修正中的本地修改；实际输入摘要为 `b9d2ac88aeedc873fa5b9c0b43020815ebebcfe7823740e1a3ac00cbcaf8f6ee`。该摘要描述测量时输入，不冒充之后更新实现记录的最终候选。
 
 | 项目 | 实测 | 方法 |
 | --- | --- | --- |
-| 冷构建 | 5,917 ms | 清除该子项目 `.source/` 和 `build/` 后，完成生成、编译与静态预渲染。 |
-| 完整预渲染构建 | 4,422 ms | 相同来源再次运行完整构建。 |
-| 单文档开发重编译 | 441 ms | 从原始 Markdown 写入到生成模块经 Vite 转换的 HTTP 响应；临时探针随后恢复。 |
+| 冷构建 | 5,020 ms | 清除子项目 `.source/` 和 `build/` 后完整构建。 |
+| 完整预渲染 | 2,203 ms | 对相同来源重复静态构建。 |
+| 单文档开发重编译 | 590 ms | 原文写入至生成模块经 Vite 转换的响应；探针随后恢复。 |
 
-测量入口为 `DOCS_PORT=<leased-port> bun docs-site/content/measure.ts`，结果输出到忽略的 `.generated/performance.json`。没有预设性能阈值；以上为一次环境绑定观察，不能推断其他机器或全量项目文档的性能。开发循环没有重建 Go。
+开发循环没有构建 Go。这是环境绑定的单次观察，不能推断其他机器或全量文档的性能。
 
 ## References
 
 - [需求合同](SPEC.md)
 - [主题背景](HISTORY.md)
-- [站点维护命令](../../../docs-site/README.md)
+- [维护命令](../../../docs-site/README.md)

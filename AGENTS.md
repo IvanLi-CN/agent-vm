@@ -20,7 +20,7 @@ manifest, systemd assets and behavior contracts versioned together.
 
 ## Validation
 
-文档站、进入 Web 审阅流程的设计材料或需求追溯发生变化时，读取项目级 [documentation-review Skill](.agents/skills/documentation-review/SKILL.md)，按当前合同检查来源、关联与验收边界。
+文档站或进入 Web 展示的设计材料发生变化时，读取项目级 [documentation-review Skill](.agents/skills/documentation-review/SKILL.md)，按当前合同检查来源、阅读体验与验收边界。
 
 Keep tests beside the contract they prove. Run `bun run check`, both Bun test
 scopes and `go -C skills/agent-vm-ops/control test ./...` locally. Run Go race,

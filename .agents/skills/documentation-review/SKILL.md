@@ -1,32 +1,24 @@
 ---
 name: documentation-review
-description: "维护 Agent VM 独立文档站、进入 Web 审阅流程的设计材料及需求追溯，检查单源内容、异常预览和审阅验收边界。"
+description: "维护 Agent VM 独立文档站及设计文档展示，检查单源正文、阅读体验、来源身份和当前交付边界。"
 ---
 
-# 文档站与设计审阅
+# 文档展示与维护
 
-## 读取当前合同
+读取 [SPEC](../../../docs/specs/documentation-review/SPEC.md)、[实现说明](../../../docs/specs/documentation-review/IMPLEMENTATION.md) 与 [站点命令](../../../docs-site/README.md)。本 Skill 保留原入口名称，负责文档展示维护，不授权新增审阅产品。
 
-以仓库根目录为基准，读取 [文档审阅 Spec](../../../docs/specs/documentation-review/SPEC.md) 和 [实现覆盖](../../../docs/specs/documentation-review/IMPLEMENTATION.md)。需求与验收由 Spec 定义，实现覆盖记录已经存在的能力和证据；本 Skill 只约束 Agent 的工作过程。
+## 内容与范围
 
-设计范围或工程边界变化时，读取[需求收敛说明](../../../docs/proposals/agent-vm-documentation-review.md)与[技术方案](../../../docs/proposals/agent-vm-documentation-stack.md)，区分已确认选择、推荐实现和后续范围。普通文档修改不因此触发全量站点迁移或新的设计访谈。
+- 文档站以文档阅读为主入口；方便检查设计通过清晰正文、目录、链接、图表和按需交互实现。不要将其解释成独立审阅页、需求追溯工具或需求管理工作台。
+- 修改原始 Markdown／MDX，保持唯一可编辑正文；不编辑 `.generated/`，不维护同义副本，不要求作者增加 design-id、设计 covers 或 trace-note。已有 Spec 编号和验收 covers 是原文内容，不驱动站点追溯界面。
+- 来源清单在 `docs-site/content/generate.ts`。检查相对链接、资源、标题和来源身份；本地修改不得伪装成远端提交。
+- 正文使用自然文档流，只有源码使用预格式。外壳样式使用专属类名，避免污染 Fumadocs 组件。验证桌面、中间宽度、窄屏与键盘导航。
+- 管理台嵌入、全量文档迁移、公开托管与文档批注属于后续范围；范围变更以用户授权及当前 Spec 为准，不自动扩大功能。
 
-## 修改材料
+## 验证
 
-1. 找到唯一可编辑正文和现有稳定标识，直接修改来源；检查原始相对链接、显式锚点及验收 `covers:` 的受影响关系。接入 Web 的范围以当前来源清单为准，尚无清单时以本主题首期范围为准。
-2. 新增或改变关联时，在原始设计材料中维护必要声明，让站点生成索引；按 Spec 的 REQ-DOCS-002、REQ-DOCS-005 检查作者维护成本。设计标题下使用普通列表项 `- design-id: \`DESIGN-DOCS-SOURCE\`` 与 `- covers: \`REQ-DOCS-002\`, \`REQ-DOCS-007\``；缺口原因仅在原始需求段落内写 `- trace-note: 原因`。不要编辑 `.generated/` 或复制规范正文到站点组件。
-3. 检查问题预览与首期完成验收各自的条件，按 REQ-DOCS-006 区分缺少关联、引用损坏和解析失败。保留诊断和来源；链接存在、需求被接受、代码实现与验收通过分别报告。
-4. 若本次任务包含设计收敛，维护决策树，每轮仅询问前提已经确定的全部未决选择，给出推荐答案并等待回复；及时记录已确认结论，在分支处理完后请求最终共同理解确认。未决选择留在收敛说明，最终确认前不宣称设计已经收敛。局部文档修正沿用已确认结论。
-5. 新领域概念按仓库术语表检查；新增 ADR 前按当前可用的 `domain-modeling` Skill 检查准入。选型被接受本身不构成创建 ADR 的理由。框架、阶段和目录变化先同步其规范来源，再更新本 Skill 的入口或流程。
+运行 `bun run docs:check`、`bun test docs-site/content`、`bun run docs:build`；页面检查使用 `DOCS_PORT=<leased-port> bun run docs:test:e2e`。组件状态构建使用 `bun run --cwd docs-site build:storybook`；首次测试按 README 安装 Chromium。本地启动前取得端口租约。
 
-## 验证并交接
+修改本主题 Spec 时执行 `bun run bin/spec_contract_check.ts --path docs/specs/documentation-review/SPEC.md`，并检查 `python3 bin/test_agent_vm_documentation.py`。同步实现覆盖与已退出的要求，不保留会误导后续 Agent 的旧交付条件。
 
-从仓库配置发现当前可用的检查入口；修改本主题 Spec 时运行 `bun run bin/spec_contract_check.ts --path docs/specs/documentation-review/SPEC.md`，相关文档合同运行 `python3 bin/test_agent_vm_documentation.py`。检查修改材料的链接、锚点和来源声明；检查结果说明覆盖范围。
-
-涉及站点实现时，运行 `bun run docs:check`、`bun test docs-site/content` 和 `bun run docs:build`；浏览器检查使用 `DOCS_PORT=<leased-port> DOCS_STORYBOOK_PORT=<gallery-leased-port> bun run docs:test:e2e`，首次按站点 README 安装 Chromium。组件状态使用 `bun run --cwd docs-site build:storybook`。本地开发和静态预览分别使用 `docs:dev`、`docs:preview`，启动前按项目端口租约约束提供 `DOCS_PORT`。命令与来源清单见 [docs-site/README.md](../../../docs-site/README.md) 和 `docs-site/content/generate.ts`。
-
-默认预览保留缺失、失效和无法解析诊断；严格检查不得放过失效引用或没有说明的关联缺失。检查页面展示的基准提交、修改状态、内容摘要与来源快照，不能把本地修改链接伪装成远端提交。按 Spec 的 Verification 保存真实结果；人工审阅按 REQ-DOCS-008 的真实路径交给项目负责人确认，设计共识、截图和自动测试不能替代此项确认。
-
-排版修改时区分正常文档流和原始源码：格式化 MDX 摘录不继承 `pre-wrap` 或固定高度滚动，源码查看才保留预格式；站点壳样式使用专属类名，避免全局 `header`、`nav`、`aside` 规则污染 Fumadocs 组件。检查桌面、中间宽度及窄屏的正文宽度与选择顺序。
-
-交接说明变更的来源、受影响关联、已运行检查及未解决问题。设计确认、文档检查和站点实现是不同事实；是否继续实现、发布或嵌入管理台，以当前用户授权范围为准。
+交接记录实际测试与未完成的人工阅读确认。漂亮页面与构建成功不等于读者已经理解设计；人工验收检查真实内容阅读与定位，不再要求走需求追溯或异常关联路径。

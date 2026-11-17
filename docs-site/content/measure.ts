@@ -28,6 +28,6 @@ try{
 }finally{await writeFile(path,original);try{process.kill(-dev.pid,'SIGTERM');}catch{}await dev.exited;}
 // Restore static output after the transient, fully restored source probe.
 await build('restored');
-const source=JSON.parse(await readFile(resolve(root,'docs-site/.generated/review.json'),'utf8'));
+const source=JSON.parse(await readFile(resolve(root,'docs-site/.generated/source.json'),'utf8'));
 const result={measuredAt:new Date().toISOString(),environment:{bun:Bun.version,node:Bun.spawnSync(['node','--version']).stdout.toString().trim(),platform:platform(),arch:arch(),cpu:cpus()[0]?.model},source:source.identity,coldBuildMs,fullPrerenderMs,singleDocumentRecompileMs,method:'cold: cleared docs-site .source/build; full: repeat static prerender; edit: source write through generated MDX Vite module response; dependencies installed; no Go build'};
 await writeFile(resolve(root,'docs-site/.generated/performance.json'),JSON.stringify(result,null,2));console.log(JSON.stringify(result,null,2));
