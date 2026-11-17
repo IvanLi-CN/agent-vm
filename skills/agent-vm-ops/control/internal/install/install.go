@@ -186,7 +186,7 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	if err != nil {
 		return report, err
 	}
-	metadata, err := manifest.LoadMetadata(filepath.Join(product, "release-manifest.json"))
+	_, err = manifest.LoadMetadata(filepath.Join(product, "release-manifest.json"))
 	if err != nil {
 		return report, err
 	}
@@ -222,18 +222,12 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 			return report, err
 		}
 	}
-	deployBinaries := []string{"agent-vm-deploy"}
-	if metadata.ServerBinary == "agent-vm-control" {
-		deployBinaries = append(deployBinaries, "agent-vm-deployd")
-	}
-	for _, name := range deployBinaries {
-		if report.Mode == "legacy" {
-			continue
-		}
-		if err := copyInstall(filepath.Join(product, "bin", name), filepath.Join("/opt/agent-vm-native/bin", name), 0755, ""); err != nil {
+	if report.Mode != "legacy" {
+		if err := installProductFiles(product, "/opt/agent-vm-native"); err != nil {
 			return report, err
 		}
 	}
+
 	for name, source := range binaries {
 		binary := name
 		if name == "rqlite" {
@@ -389,4 +383,31 @@ func finishExisting(ctx context.Context, report Report, input Inputs) (Report, e
 	}
 	report.Next = "existing installation verified; use stage/verify/activate for upgrades"
 	return report, nil
+}
+
+// installProductFiles publishes only declared, verified files; the manifest is
+// installed last so the fixed request adapter never accepts an incomplete tree.
+func installProductFiles(product, destination string) error {
+	if _, err := manifest.LoadMetadata(filepath.Join(product, "release-manifest.json")); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(filepath.Join(product, "release-manifest.json"))
+	if err != nil {
+		return err
+	}
+	var release struct {
+		Artifacts []struct {
+			Path string `json:"path"`
+			Mode uint32 `json:"mode"`
+		} `json:"artifacts"`
+	}
+	if err := json.Unmarshal(data, &release); err != nil {
+		return err
+	}
+	for _, artifact := range release.Artifacts {
+		if err := copyInstall(filepath.Join(product, filepath.FromSlash(artifact.Path)), filepath.Join(destination, filepath.FromSlash(artifact.Path)), os.FileMode(artifact.Mode), ""); err != nil {
+			return err
+		}
+	}
+	return copyInstall(filepath.Join(product, "release-manifest.json"), filepath.Join(destination, "release-manifest.json"), 0644, "")
 }
