@@ -42,7 +42,9 @@ func TestClientImageSelectionIsolatedIncus(t *testing.T) {
 	}
 	root := t.TempDir()
 	cfg.StateDB = filepath.Join(root, "state.db")
-	cfg.StoragePath = filepath.Join(root, "storage")
+	if cfg.StoragePath == "" {
+		t.Fatal("test pool storage path is required")
+	}
 	cfg.TimerDir = filepath.Join(root, "timers")
 	cfg.ReleaseFencePath = filepath.Join(root, "release.fence")
 	cfg.MetricsDir = filepath.Join(root, "metrics")
