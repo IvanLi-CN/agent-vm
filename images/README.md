@@ -47,7 +47,7 @@ go -C skills/agent-vm-ops/control test ./internal/native \
 
 ## 发布与目标服务器导入
 
-PR 预览由 `Guest image preview` 在 GitHub 托管 Ubuntu runner 上验证镜像，无需自托管 runner；它只产生短期 CI artifact，不是生产镜像来源。CI 先并行构建 privileged 和 unprivileged 两种 common base，分别上传带源码修订与 lock 摘要的短期 artifact；随后八个 Base/Rust/Java/Go 最终镜像槽位下载对应 variant 的 common base，再按最多三个并行任务派生和验收。`Guest image release` 是唯一的镜像发布入口，只接受从受保护 `main` dispatch 的手动运行，以该 dispatch SHA 作为精确源码身份；它复用相同的锁校验、common-base producer 和最终镜像矩阵，完成完整矩阵、源码身份、checksum 和 readiness 验证后，将 32 个镜像文件与独立的 `SHA256SUMS` 发布到 `agent-vm-images-<source-sha>` Release。常规产品 `Release` 不构建、不下载也不发布 guest images；镜像不进入控制服务、客户端或 Deployd 的二进制包，发布后不得追加或覆盖资产。
+PR 预览由 `Guest image preview` 在 GitHub 托管 Ubuntu runner 上验证镜像，无需自托管 runner；它只产生短期 CI artifact，不是生产镜像来源。CI 先并行构建 privileged 和 unprivileged 两种 common base，分别上传带源码修订与 lock 摘要的短期 artifact；随后八个 Base/Rust/Java/Go 最终镜像槽位下载对应 variant 的 common base，再按最多八个并行任务派生和验收。`Guest image release` 是唯一的镜像发布入口，只接受从受保护 `main` dispatch 的手动运行，以该 dispatch SHA 作为精确源码身份；它复用相同的锁校验、common-base producer 和最终镜像矩阵，完成完整矩阵、源码身份、checksum 和 readiness 验证后，将 32 个镜像文件与独立的 `SHA256SUMS` 发布到 `agent-vm-images-<source-sha>` Release。常规产品 `Release` 不构建、不下载也不发布 guest images；镜像不进入控制服务、客户端或 Deployd 的二进制包，发布后不得追加或覆盖资产。
 
 在目标服务器用 `gh release download "agent-vm-images-$IMAGE_SOURCE_REVISION"` 下载对应语言/模式的 tar、manifest、SBOM、readiness 和 `SHA256SUMS`，再运行 `python3 images/scripts/verify_assets.py --directory "$DOWNLOAD_DIR" --source-revision "$IMAGE_SOURCE_REVISION"` 验证所下载的镜像及四类 sidecar；核对 manifest 的 `source_revision` 等于镜像 Release 修订、模式匹配且 readiness 全通过。然后通过现有管理端本地包上传或配置的可信镜像来源登记到 catalog，并等待完整性和适用性通过；单独 `incus image import` 不会完成网页 catalog 登记。
 
