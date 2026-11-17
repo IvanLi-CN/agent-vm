@@ -61,7 +61,6 @@ func TestIncusInitUsesSystemContainerArguments(t *testing.T) {
 		"--project", "agents", "init", "images:debian/13", "container-check",
 		"--profile", "agent-vm", "--network", "agentsbr0", "--storage", "agents",
 		"--config", "boot.autostart=false",
-		"--config", "security.privileged=true", "--config", "security.nesting=true",
 		"--config", "user.agent-vm.generation=1", "--config", "user.agent-vm.managed=native-v1",
 		"--config", "user.agent-vm.session=session", "--config", "user.agent-vm.task=task",
 	}
@@ -267,10 +266,10 @@ func TestStorageCapacityRejectsInvalidBlockCountsAndMultiplicationOverflow(t *te
 	}
 }
 
-func TestIncusVerificationInitUsesPrivilegedNestingWithoutProductionProfile(t *testing.T) {
+func TestIncusVerificationInitCopiesOnlyRuntimeSettingsWithoutProductionDevices(t *testing.T) {
 	binDir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "incus-argv")
-	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$INCUS_ARGV_LOG\"\n"
+	script := "#!/bin/sh\nif [ \"$1\" = query ]; then printf '%s\\n' '{\"config\":{\"security.privileged\":\"false\",\"security.nesting\":\"true\",\"security.idmap.base\":\"65536\",\"security.idmap.size\":\"65536\",\"raw.lxc\":\"must-not-copy\"},\"devices\":{\"secret\":{\"type\":\"disk\"}}}'; exit 0; fi\nprintf '%s\\n' \"$@\" > \"$INCUS_ARGV_LOG\"\n"
 	if err := os.WriteFile(filepath.Join(binDir, "incus"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -286,7 +285,7 @@ func TestIncusVerificationInitUsesPrivilegedNestingWithoutProductionProfile(t *t
 		t.Fatal(err)
 	}
 	got := strings.Split(strings.TrimSpace(string(data)), "\n")
-	want := []string{"--project", "agents", "init", "image-fingerprint", "image-check", "--no-profiles", "--storage", "agents", "--config", "boot.autostart=false", "--config", "security.privileged=true", "--config", "security.nesting=true"}
+	want := []string{"--project", "agents", "init", "image-fingerprint", "image-check", "--no-profiles", "--storage", "agents", "--config", "boot.autostart=false", "--config", "security.privileged=false", "--config", "security.nesting=true", "--config", "security.idmap.base=65536", "--config", "security.idmap.size=65536"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("incus argv = %#v, want %#v", got, want)
 	}
@@ -485,5 +484,28 @@ func TestIncusMetricsUsesBoundedProjectQuery(t *testing.T) {
 	}
 	if string(args) != "query\n/1.0/metrics?project=agents+%26+restricted\n" {
 		t.Fatalf("unexpected metrics command: %s", args)
+	}
+}
+
+func TestIncusVerificationRuntimeProfileFailureDoesNotCreateContainer(t *testing.T) {
+	for _, output := range []string{"not-json", `{}`, `{"config":{"security.privileged":true}}`} {
+		t.Run(output, func(t *testing.T) {
+			dir := t.TempDir()
+			log := filepath.Join(dir, "mutation")
+			script := "#!/bin/sh\nif [ \"$1\" = query ]; then printf '%s\\n' \"$PROFILE_RESPONSE\"; exit 0; fi\nprintf mutation > \"$MUTATION_LOG\"\n"
+			if err := os.WriteFile(filepath.Join(dir, "incus"), []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			t.Setenv("PROFILE_RESPONSE", output)
+			t.Setenv("MUTATION_LOG", log)
+			client := NewIncusClient(NewRunner(), "agents", ClientOptions{Profile: "runtime", Pool: "pool"})
+			if err := client.InitVerification(context.Background(), "image", "check"); err == nil {
+				t.Fatal("invalid runtime profile must fail")
+			}
+			if _, err := os.Stat(log); !os.IsNotExist(err) {
+				t.Fatalf("invalid profile caused native mutation: %v", err)
+			}
+		})
 	}
 }

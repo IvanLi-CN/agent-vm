@@ -295,13 +295,15 @@ cached row 默认折叠，并提供 state filter。
 
 ## 镜像验收运行模式
 
-正式 guest 创建和临时镜像验收均显式设置 `security.privileged=true`、`security.nesting=true`。验收使用 `--no-profiles`，仅附带自己的 root disk，不继承生产网卡、宿主挂载或凭据；不得通过改成非特权容器来表达这些资源隔离要求。
+正式 guest 创建采用配置的 lifecycle profile；临时镜像验收从该 profile 仅读取特权、nesting、UID/GID 映射及 mknod/setxattr interception 设置。验收使用 `--no-profiles`，仅附带自己的 root disk，不继承生产网卡、宿主挂载或凭据；不得通过隐式切换运行模式来表达资源隔离。不同部署可以选择特权或非特权 profile，均应按相同模式完成镜像适用性与 Docker/SSH 验收。
 
 在明确授权的 Linux/Incus 运维环境执行以下集成测试。project、pool 和逗号分隔的镜像完整 fingerprint 必须由该环境的真实配置提供。测试只创建和清理自己的临时验收实例，不修改默认镜像或应用镜像目录。
 
 ```sh
 AGENT_VM_TEST_INCUS_PROJECT="$IMAGE_TEST_PROJECT" \
 AGENT_VM_TEST_INCUS_POOL="$IMAGE_TEST_POOL" \
+AGENT_VM_TEST_INCUS_PROFILE="$IMAGE_TEST_PROFILE" \
+AGENT_VM_TEST_PRIVILEGED="$IMAGE_TEST_PRIVILEGED" \
 AGENT_VM_TEST_IMAGE_FINGERPRINTS="$IMAGE_TEST_FINGERPRINTS" \
 go -C skills/agent-vm-ops/control test ./internal/native \
   -run '^TestIncusImageVerificationIntegration$' -v -timeout 10m

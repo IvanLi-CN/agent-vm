@@ -20,7 +20,15 @@ func TestIncusImageVerificationIntegration(t *testing.T) {
 	if project == "" || pool == "" {
 		t.Fatal("explicit AGENT_VM_TEST_INCUS_PROJECT and AGENT_VM_TEST_INCUS_POOL are required")
 	}
-	client := NewIncusClient(NewRunner(), project, ClientOptions{Pool: pool})
+	profile := os.Getenv("AGENT_VM_TEST_INCUS_PROFILE")
+	if profile == "" {
+		t.Fatal("explicit AGENT_VM_TEST_INCUS_PROFILE is required")
+	}
+	client := NewIncusClient(NewRunner(), project, ClientOptions{Pool: pool, Profile: profile})
+	expected := os.Getenv("AGENT_VM_TEST_PRIVILEGED")
+	if expected != "true" && expected != "false" {
+		t.Fatal("explicit AGENT_VM_TEST_PRIVILEGED=true|false is required")
+	}
 	for _, fingerprint := range strings.Split(fingerprints, ",") {
 		t.Run(fingerprint, func(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
@@ -44,7 +52,7 @@ func TestIncusImageVerificationIntegration(t *testing.T) {
 				t.Fatal(err)
 			}
 			settings, ok := config["config"].(map[string]any)
-			if !ok || settings["security.privileged"] != "true" || settings["security.nesting"] != "true" || settings["boot.autostart"] != "false" {
+			if !ok || settings["security.privileged"] != expected || settings["security.nesting"] != "true" || settings["boot.autostart"] != "false" {
 				t.Fatalf("verification execution mode was not explicitly configured: %#v", settings)
 			}
 			profiles, ok := config["profiles"].([]any)

@@ -289,7 +289,7 @@ func (c *IncusClient) Init(ctx context.Context, image, name string, ownership ma
 	if c.Pool != "" {
 		args = append(args, "--storage", c.Pool)
 	}
-	args = append(args, "--config", "boot.autostart=false", "--config", "security.privileged=true", "--config", "security.nesting=true")
+	args = append(args, "--config", "boot.autostart=false")
 	keys := make([]string, 0, len(ownership))
 	for key := range ownership {
 		keys = append(keys, key)
@@ -301,16 +301,37 @@ func (c *IncusClient) Init(ctx context.Context, image, name string, ownership ma
 	return c.run(ctx, args...)
 }
 
-// InitVerification creates a privileged nested container without profiles or
-// network devices, matching the managed guest execution mode.
-// Image suitability checks must not inherit production mounts, credentials or
-// network access from the lifecycle profile.
+// InitVerification copies only namespace-related settings from the configured
+// lifecycle profile. It never inherits its devices, mounts or network access.
 func (c *IncusClient) InitVerification(ctx context.Context, image, name string) error {
+	profile := c.Profile
+	if profile == "" {
+		profile = "default"
+	}
+	value, err := c.jsonQuery(ctx, "/1.0/profiles/"+url.PathEscape(profile), c.Project)
+	if err != nil {
+		return fmt.Errorf("read verification runtime profile: %w", err)
+	}
+	settings, ok := value["config"].(map[string]any)
+	if !ok {
+		return errors.New("verification runtime profile has no config object")
+	}
 	args := []string{"init", image, name, "--no-profiles"}
 	if c.Pool != "" {
 		args = append(args, "--storage", c.Pool)
 	}
-	args = append(args, "--config", "boot.autostart=false", "--config", "security.privileged=true", "--config", "security.nesting=true")
+	args = append(args, "--config", "boot.autostart=false")
+	for _, key := range []string{"security.privileged", "security.nesting", "security.idmap.base", "security.idmap.size", "security.idmap.isolated", "security.syscalls.intercept.mknod", "security.syscalls.intercept.setxattr"} {
+		if value, exists := settings[key]; exists {
+			text, ok := value.(string)
+			if !ok {
+				return fmt.Errorf("verification runtime profile %s must be a string", key)
+			}
+			args = append(args, "--config", key+"="+text)
+		} else if key == "security.privileged" || key == "security.nesting" {
+			args = append(args, "--config", key+"=false")
+		}
+	}
 	return c.run(ctx, args...)
 }
 

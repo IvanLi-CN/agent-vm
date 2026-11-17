@@ -1,0 +1,73 @@
+name: Guest image preview
+
+on:
+  pull_request:
+    paths:
+      - "images/**"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/image-*.yml"
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      source_ref:
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: guest-images-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lock-check:
+    name: Validate image lock
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: bun run images:build -- --all --check
+      - run: bun test images/tests
+
+  build:
+    name: Image ${{ matrix.language }} / ${{ matrix.variant }}
+    needs: lock-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        language: [go, rust, java]
+        variant: [privileged, unprivileged]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - name: Prepare isolated Incus runner
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y incus incus-client
+          sudo systemctl start incus
+          sudo incus admin init --minimal
+          sudo incus network create avm-build-br ipv4.address=auto ipv6.address=none
+      - name: Build and verify image
+        run: sudo env PATH="$PATH" AGENT_VM_IMAGE_NETWORK=avm-build-br bun run images:build -- --profile "${{ matrix.language }}" --variant "${{ matrix.variant }}"
+      - name: Verify exported checksums
+        run: cd dist && sha256sum -c agent-vm-ubuntu24-SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-image-${{ matrix.language }}-${{ matrix.variant }}
+          path: dist/agent-vm-ubuntu24-*
+          if-no-files-found: error
