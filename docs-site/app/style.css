@@ -4,7 +4,9 @@
 
 body { margin: 0; }
 a { text-underline-offset: .2em; }
-::selection { background: var(--color-fd-accent); color: var(--color-fd-accent-foreground); }
+:root { --selection-background: #1d4ed8; --selection-foreground: #ffffff; }
+.dark { --selection-background: #93c5fd; --selection-foreground: #17212b; }
+::selection { background: var(--selection-background); color: var(--selection-foreground); fill: var(--selection-foreground); }
 input { caret-color: var(--color-fd-primary); }
 a[href='#nd-page']:focus { position: fixed; z-index: 60; width: auto; height: auto; clip-path: none; overflow: visible; padding: .5rem 1rem; background: var(--color-fd-background); top: .5rem; left: 1rem; }
 .prose { overflow-wrap: anywhere; }
@@ -17,16 +19,26 @@ a[href='#nd-page']:focus { position: fixed; z-index: 60; width: auto; height: au
 .document-list p { color: var(--color-fd-muted-foreground); font-size: .875rem; }
 .document-source { font-size: .75rem; color: var(--color-fd-muted-foreground); }
 .diagram { min-width: 0; max-width: 100%; margin: 1.5rem 0; }
-.diagram-viewport { max-width: 100%; overflow: auto; padding: 1rem; border: 1px solid var(--color-fd-border); border-radius: .75rem; background: var(--color-fd-background); }
-.diagram-viewport:focus-visible { outline: 2px solid var(--color-fd-ring); outline-offset: 3px; }
-.diagram-viewport img { width: 100%; height: auto; cursor: zoom-in; }
+.diagram-viewport { position: relative; max-width: 100%; overflow: hidden; padding: 3rem 1rem 1rem; border: 1px solid var(--color-fd-border); border-radius: .75rem; background: var(--color-fd-background); }
+.diagram-canvas:focus-visible { outline: 2px solid var(--color-fd-ring); outline-offset: 3px; }
+.diagram-svg { width: 100%; height: 100%; user-select: text; }
+.diagram-svg > svg { display: block; width: 100%; height: 100%; max-width: none !important; }
+.diagram-svg :is(.nodeLabel, .edgeLabel, text, tspan) { cursor: text; user-select: text; }
+.diagram-canvas { cursor: grab; }
+.diagram-canvas:active { cursor: grabbing; }
+.diagram-controls { display: flex; align-items: center; position: absolute; z-index: 1; top: .375rem; right: .5rem; background: var(--color-fd-background); border: 1px solid var(--color-fd-border); border-radius: .5rem; }
+.diagram-controls button { min-width: 2.25rem; font-variant-numeric: tabular-nums; }
 .site-footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--color-fd-border); color: var(--color-fd-muted-foreground); font-size: .75rem; }
 .source-line { display: block; min-height: 1.5em; }
 .source-line.selected { background: var(--color-fd-accent); }
 .source-line::before { content: attr(data-line-number); display: inline-block; width: 4em; user-select: none; color: var(--color-fd-muted-foreground); }
-/* Fumadocs hides ImageZoom's default buttons; expose the library trigger for
-   keyboard users while retaining its zoom and focus behavior. */
-.diagram [data-rmiz-btn-zoom] { display: grid; place-items: center; position: absolute; top: .5rem; right: .5rem; width: 2rem; height: 2rem; pointer-events: auto; cursor: zoom-in; background: var(--color-fd-background); color: var(--color-fd-foreground); border: 1px solid var(--color-fd-border); border-radius: .375rem; }
-.diagram [data-rmiz-btn-zoom] svg { width: 1rem; height: 1rem; }
-
 .diagram-source { margin-top: .25rem; }
+
+.diagram-overlay { position: fixed; inset: 0; z-index: 70; background: rgb(0 0 0 / .6); }
+.diagram-expanded { position: fixed; inset: 1rem; z-index: 71; outline: none; }
+.diagram-expanded > .diagram-viewport { height: 100%; }
+@media (max-width: 767px) { .diagram-expanded { inset: .5rem; } }
+
+.docs-sidebar-tools { display: flex; align-items: center; gap: .5rem; flex: 1; min-width: 0; }
+.docs-version { padding-inline: .5rem; font-size: .75rem; font-variant-numeric: tabular-nums; color: var(--color-fd-muted-foreground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 767px) { .docs-sidebar-tools { flex: 0 0 auto; } }
