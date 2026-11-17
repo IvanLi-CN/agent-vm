@@ -1,7 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, chmodSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { spawnSync } from "node:child_process";
 import { CliError, Data, fail, record } from "./client-io.ts";
 
 export type HostTransport = "https" | "ssh";
@@ -42,14 +41,15 @@ export function loadHostConfig(env: Record<string, string | undefined> = process
 }
 function projectRemote(env: Record<string, string | undefined>): string | undefined {
   if (env.AGENT_VM_PROJECT_REMOTE) return env.AGENT_VM_PROJECT_REMOTE;
-  const result = spawnSync("git", ["remote", "get-url", "origin"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-  return result.status === 0 && result.stdout.trim() ? result.stdout.trim() : undefined;
+  return undefined;
 }
 export function normalizeRemote(remote: string): string {
   return remote.trim().replace(/^git@([^:]+):/, "$1/").replace(/^https?:\/\//, "").replace(/\.git$/, "").replace(/\/+$/, "");
 }
 export function resolveHost(explicit?: string, env: Record<string, string | undefined> = process.env): HostSelection {
-  const config = loadHostConfig(env), alias = explicit ?? env.AGENT_VM_HOST ?? (projectRemote(env) ? config.projects[normalizeRemote(projectRemote(env)!)] : undefined) ?? config.default_host;
+  const config = loadHostConfig(env), project = projectRemote(env);
+  if (!explicit && !env.AGENT_VM_HOST && project && !config.projects[normalizeRemote(project)]) fail("config_invalid", "explicit project has no host binding");
+  const alias = explicit ?? env.AGENT_VM_HOST ?? (project ? config.projects[normalizeRemote(project)] : undefined) ?? config.default_host;
   if (!alias) fail("host_selection_required", "select an Agent VM host with --host or configure default_host");
   if (!ALIAS.test(alias) || !config.hosts[alias]) fail("config_invalid", `unknown Agent VM host alias: ${alias}`);
   const profile = config.hosts[alias];
@@ -91,5 +91,5 @@ export function setDefaultHost(alias: string, env: Record<string, string | undef
   const config = loadHostConfig(env); if (!config.hosts[alias]) fail("config_invalid", `unknown Agent VM host alias: ${alias}`); config.default_host = alias; return writeHostConfig(config, env);
 }
 export function bindProject(alias: string, remote: string | undefined, env: Record<string, string | undefined> = process.env): string {
-  const config = loadHostConfig(env); if (!config.hosts[alias]) fail("config_invalid", `unknown Agent VM host alias: ${alias}`); const key = normalizeRemote(remote ?? projectRemote(env) ?? ""); if (!key) fail("config_missing", "current directory has no Git origin remote"); config.projects[key] = alias; return writeHostConfig(config, env);
+  const config = loadHostConfig(env); if (!config.hosts[alias]) fail("config_invalid", `unknown Agent VM host alias: ${alias}`); const key = normalizeRemote(remote ?? projectRemote(env) ?? ""); if (!key) fail("config_missing", "provide an explicit project identifier through AGENT_VM_PROJECT_REMOTE"); config.projects[key] = alias; return writeHostConfig(config, env);
 }

@@ -10,7 +10,8 @@ test("host profiles resolve explicit, project and global defaults", () => {
   const e = env(root); writeHostConfig({ default_host: "109", hosts: { "105": { transport: "https", control_host: "https://105.example" }, "109": { transport: "ssh", control_host: "host-109" } }, projects: { "github.com/IvanLi-CN/agent-vm": "105" } }, e);
   expect(resolveHost(undefined, { ...e }).alias).toBe("105");
   expect(resolveHost("109", e).control_host).toBe("host-109");
-  expect(resolveHost(undefined, { ...e, AGENT_VM_PROJECT_REMOTE: "github.com/other/repo" }).alias).toBe("109");
+  expect(() => resolveHost(undefined, { ...e, AGENT_VM_PROJECT_REMOTE: "github.com/other/repo" })).toThrow("no host binding");
+ const noProject = {...e}; delete (noProject as any).AGENT_VM_PROJECT_REMOTE; expect(resolveHost(undefined,noProject).alias).toBe("109");
 });
 
 test("legacy control host environment fallback is rejected", () => {

@@ -33,6 +33,8 @@ import {
 } from "./control-types.ts";
 import { parseSemVer } from "./semver.ts";
 
+import { ACTIONS as RUNTIME_ACTIONS, runtimeActions } from "../../agent-vm/scripts/client-release.ts";
+
 export const MANIFEST_FORMAT = 1;
 export const PROTOCOL_VERSION = 4;
 export const SOURCE_REVISION_RE = /^[0-9a-f]{40}$/;
@@ -46,31 +48,7 @@ export const CLIENT_DEPENDENCY_NAMES = new Set([
   "guest-source.ts", "host-config.ts", "sync-native.ts", "sync_worktree.ts",
 ]);
 
-export const ACTION_NAMES: readonly string[] = Object.freeze([
-  "acquire",
-  "admin-gc",
-  "admin-metrics",
-  "admin-reconcile", "admin-reconcile-session", "admin-reconcile-history",
-  "admin-session-list",
-  "admin-status",
-  "destroy",
-  "doctor",
-  "drain-enter",
-  "drain-exit",
-  "drain-status",
-  "port-add",
-  "port-list",
-  "port-remove",
-  "release",
-  "renew",
-  "resize",
-  "restart",
-  "ssh-info",
-  "status",
-  "timer-age-gc",
-  "timer-expire",
-  "timer-reconcile",
-]);
+export const ACTION_NAMES: readonly string[] = Object.freeze([...RUNTIME_ACTIONS]);
 
 const ACTION_SET: ReadonlySet<string> = new Set(ACTION_NAMES);
 
@@ -463,7 +441,7 @@ export function operation_spec(
 
 export function default_operations(): Record<string, OperationSpec> {
   return Object.fromEntries(
-    ACTION_NAMES.map((action) => [action, operation_spec()]),
+    ACTION_NAMES.map((action) => [action, runtimeActions()[action] as OperationSpec]),
   );
 }
 

@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, readFileSync, readdirSync, unlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs, parseSize, dispatch } from "../scripts/agent_vm.ts";
 import { attachDiagnosis, sessionId, uncertain } from "../scripts/client.ts";
@@ -201,7 +201,7 @@ test("responses require release and compatibility metadata; deterministic failur
   expect(uncertain({ code: "command_failed", detail: { phase: [] } }, "renew")).toBe(true);
 });
 
-test("sidecar shape, complete actions, exact client artifact, checksum and mode fail closed", async () => {
+test("publication verifier rejects bad sidecars while runtime remains independent", async () => {
   const f = fixture(), client = join(f.root, "agent_vm.ts"), path = join(f.root, "client-release.json");
   writeFileSync(client, "client", { mode: 0o755 });
   const schema = { schema: 1, semantic_revision: 1 }, window = { schema_min: 1, schema_max: 1, semantic_min: 1, semantic_max: 1 };
@@ -214,7 +214,8 @@ test("sidecar shape, complete actions, exact client artifact, checksum and mode 
     (v: any) => { v.client_dependencies[0].path = "../escape.ts"; }, (v: any) => { v.client_dependencies[0].mode = 0o777; },
     (v: any) => { v.client_dependencies[0].sha256 = "0".repeat(64); }]) {
     const copy = structuredClone(sidecar); change(copy); writeFileSync(path, json(copy)); f.client.sidecar = path;
-    await expect(f.client.request("status", { session: "s" })).rejects.toBeInstanceOf(CliError); expect(f.commands).toHaveLength(0);
+    expect(() => loadRelease(path)).toThrow();
+ await expect(f.client.request("status", { session: "s" })).resolves.toBeDefined();
   }
   writeFileSync(path, json(sidecar)); chmodSync(client, 0o644); expect(() => loadRelease(path)).toThrow("mode differs"); chmodSync(client, 0o755);
   writeFileSync(join(f.root, "guest-source.ts"), "tampered"); expect(() => loadRelease(path)).toThrow("checksum differs");
@@ -347,4 +348,27 @@ test("recovery state requires an exact committed or partial operation proof", as
   }));
   expect(await f.client.recoverAcquireState("explicit", key, "remote-op", 10)).toBe(false);
   expect(f.client.state("explicit")).toMatchObject({ generation: 10, cleanup_only: true });
+});
+
+
+test("portable client help, version and control work without manifest or Git", async () => {
+ const f=fixture();unlinkSync(f.env.AGENT_VM_RELEASE_MANIFEST);
+ for(const args of [["--help"],["version"]]) {
+  const process=Bun.spawnSync([globalThis.process.execPath,join(f.root,"agent_vm.ts"),...args],{cwd:f.root,env:{...f.env,PATH:"/nonexistent"},stdout:"pipe",stderr:"pipe"});
+  expect(process.exitCode).toBe(0);if(args[0]==="version")expect(process.stdout.toString()).toContain("dev");
+ }
+ await dispatch(parseArgs(["image","list"]),f.client);
+ expect(f.requests[0]).toMatchObject({action:"image-list",compatibility:{release_id:"legacy-protocol-4"}});
+ expect(f.requests[0].session_id).toBeUndefined();
+ await dispatch(selected(["status"]),f.client);expect(f.requests[1].action).toBe("status");
+});
+
+test("explicit images declare revision 2 and reject an unverified selected fingerprint",async()=>{
+ const f=fixture(),fingerprint="d".repeat(64);
+ f.handler=request=>result(response(request,{result:{image_fingerprint:fingerprint}}));
+ await f.client.request("acquire",{session:"chosen",write:true,operationId:"choose",generation:0,fields:{image:"debian"}});
+ expect(f.requests[0]).toMatchObject({image:"debian",compatibility:{request:{schema:1,semantic_revision:2}}});
+ f.handler=request=>result(response(request,{result:{image_fingerprint:"e".repeat(64)}}));
+ await expect(f.client.request("acquire",{session:"exact",write:true,operationId:"exact",generation:0,fields:{image:fingerprint}})).rejects.toMatchObject({code:"invalid_remote_response"});
+ expect(readJson(f.client.operationPath("exact","exact")).outcome).toBe("pending");
 });

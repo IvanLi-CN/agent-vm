@@ -6,7 +6,26 @@ export const PROTOCOL = 4;
 export const VERSION = "dev";
 export const PRODUCT_FORMAT = 4;
 export const CLIENT_PRODUCT_FORMAT = 3;
-export const ACTIONS = ["acquire", "admin-gc", "admin-metrics", "admin-reconcile", "admin-reconcile-session", "admin-reconcile-history", "admin-session-list", "admin-status", "destroy", "doctor", "drain-enter", "drain-exit", "drain-status", "port-add", "port-list", "port-remove", "release", "renew", "resize", "restart", "ssh-info", "status", "timer-age-gc", "timer-expire", "timer-reconcile"];
+export const ACTIONS = ["acquire", "admin-gc", "admin-metrics", "admin-reconcile", "admin-reconcile-session", "admin-reconcile-history", "admin-session-list", "admin-status", "destroy", "doctor", "drain-enter", "drain-exit", "drain-status", "port-add", "port-list", "port-remove", "release", "renew", "resize", "restart", "ssh-info", "status", "image-list", "timer-age-gc", "timer-expire", "timer-reconcile"];
+// @agent-vm-build-identity: replaced only in staged release artifacts.
+export const BUILD_IDENTITY: { version: string; source_revision: string | null } = { version: "dev", source_revision: null };
+export function runtimeActions(): Record<string, Data> {
+  return Object.fromEntries(ACTIONS.map(action => [action, {
+    request: { schema: 1, semantic_revision: 1 }, response: { schema: 1, semantic_revision: 1 },
+    client_to_control: { schema_min: 1, schema_max: 1, semantic_min: 1, semantic_max: action === "acquire" ? 2 : 1 },
+    control_to_client: { schema_min: 1, schema_max: 1, semantic_min: 1, semantic_max: 1 },
+  }]));
+}
+export function runtimeRelease(): Data {
+  return { version: BUILD_IDENTITY.version, source_revision: BUILD_IDENTITY.source_revision, release_id: BUILD_IDENTITY.source_revision ?? "legacy-protocol-4", protocol: PROTOCOL, manifest_present: false, artifacts_verified: false, transport: "go-request", actions: runtimeActions() };
+}
+export function assertInstallationReady(path: string): void {
+  for (const directory of new Set([dirname(path), import.meta.dir])) {
+    try { lstatSync(join(directory, ".agent-vm-client-install.json")); }
+    catch (e: any) { if (e.code === "ENOENT") continue; throw e; }
+    fail("local_client_install_pending", "complete-package installation or recovery is pending; retain its recovery material");
+  }
+}
 export const CLIENT_DEPENDENCIES: ReadonlyArray<readonly [string, number]> = [["byte-fs.ts", 0o644], ["client-io.ts", 0o644], ["client-release.ts", 0o644], ["client.ts", 0o644], ["guest-source.ts", 0o644], ["host-config.ts", 0o644], ["sync-native.ts", 0o644], ["sync_worktree.ts", 0o755]];
 export const warning = (code: string, message: string, action?: string): Data => ({ code, message, ...(action === undefined ? {} : { action }) });
 export const shape = (v: any, keys: string[]): boolean => record(v) && Object.keys(v).sort().join(",") === [...keys].sort().join(",");

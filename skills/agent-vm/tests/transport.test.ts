@@ -15,6 +15,7 @@ test("HTTPS endpoint accepts a bare hostname with an explicit port", () => {
 });
 
 function httpsSidecar(f: Fixture): void {
+ f.client.env.AGENT_VM_TRANSPORT="https";
   const revision = "c".repeat(40), schema = { schema: 1, semantic_revision: 1 }, window = { schema_min: 1, schema_max: 1, semantic_min: 1, semantic_max: 1 };
   const client = readFileSync(new URL("../scripts/agent_vm.ts", import.meta.url));
   writeFileSync(join(f.root, "agent_vm.ts"), client, { mode: 0o755 });
