@@ -1,8 +1,7 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import { Accordion, Accordions } from 'fumadocs-ui/components/accordion';
 import { CodeBlock, Pre } from 'fumadocs-ui/components/codeblock';
-import { Tabs } from 'fumadocs-ui/components/ui/tabs';
-import { TabsList, TabsTrigger, TabsContent } from 'fumadocs-ui/components/tabs';
+import { ImageZoom } from 'fumadocs-ui/components/image-zoom';
 import { Callout } from 'fumadocs-ui/components/callout';
 
 // Mermaid's configuration is global; keep initialization and rendering together
@@ -10,9 +9,9 @@ import { Callout } from 'fumadocs-ui/components/callout';
 let renderQueue: Promise<unknown> = Promise.resolve();
 
 export function Mermaid({ code }: { code: string }) {
-  const ref = useRef<HTMLDivElement>(null), id = useId().replace(/[^a-z0-9]/gi, '');
+  const id = useId().replace(/[^a-z0-9]/gi, '');
+  const [image, setImage] = useState<{ src: string; width: number; height: number; theme: string }>();
   const [error, setError] = useState('');
-  const [view, setView] = useState('detail');
   const [dark, setDark] = useState<boolean | null>(null);
   useEffect(() => {
     const update = () => setDark(document.documentElement.classList.contains('dark'));
@@ -46,24 +45,22 @@ export function Mermaid({ code }: { code: string }) {
         },
       });
       const { svg } = await mermaid.render(`diagram${id}`, code);
-      if (cancelled || !ref.current) return;
-      ref.current.innerHTML = svg;
-      const element = ref.current.querySelector('svg');
-      if (element) {
-        // Preserve Mermaid's natural text size instead of shrinking a wide
-        // architecture diagram to the article width; the viewport scrolls.
-        element.style.width = `${Math.ceil(element.viewBox.baseVal.width)}px`;
-        element.style.maxWidth = 'none';
-        element.dataset.theme = dark ? 'dark' : 'light';
-      }
+      if (cancelled) return;
+      const container = document.createElement('div');
+      container.innerHTML = svg;
+      const element = container.querySelector('svg')!;
+      const { width, height } = element.viewBox.baseVal;
+      element.setAttribute('width', String(width));
+      element.setAttribute('height', String(height));
+      setImage({ src: 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(new XMLSerializer().serializeToString(element)), width, height, theme: dark ? 'dark' : 'light' });
     };
     renderQueue = renderQueue.catch(() => {}).then(render).catch(() => {
       if (!cancelled) {
-        ref.current?.replaceChildren();
+        setImage(undefined);
         setError('图表无法呈现，请检查构建来源中的 Mermaid 语法。');
       }
     });
     return () => { cancelled = true; };
   }, [code, dark, id]);
-  return <figure className="diagram"><Tabs value={view} onValueChange={setView}><TabsList aria-label="图表显示方式"><TabsTrigger value="detail">阅读细节</TabsTrigger><TabsTrigger value="overview">完整概览</TabsTrigger></TabsList><TabsContent value={view}><div className="diagram-viewport" data-view={view} ref={ref} role="img" aria-label="设计流程图" tabIndex={0}/></TabsContent></Tabs><figcaption className="diagram-hint">较宽图表可横向滚动；键盘聚焦后可用方向键移动。</figcaption>{error && <Callout type="error" role="alert">{error}</Callout>}<Accordions type="single" collapsible><Accordion title="图表源码" value="code"><CodeBlock title="Mermaid"><Pre><code>{code}</code></Pre></CodeBlock></Accordion></Accordions></figure>;
+  return <figure className="diagram"><div className="diagram-viewport">{image && <ImageZoom key={image.src} src={image.src} width={image.width} height={image.height} data-theme={image.theme} alt="设计流程图" rmiz={{ children: null, a11yNameButtonZoom: '放大图表', a11yNameButtonUnzoom: '关闭图表放大' }}/>}</div><figcaption className="diagram-hint">点击图表放大查看；按 Esc 返回正文。</figcaption>{error && <Callout type="error" role="alert">{error}</Callout>}<Accordions type="single" collapsible><Accordion title="图表源码" value="code"><CodeBlock title="Mermaid"><Pre><code>{code}</code></Pre></CodeBlock></Accordion></Accordions></figure>;
 }

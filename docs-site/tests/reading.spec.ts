@@ -27,20 +27,13 @@ test('home leads directly to real documents and their build snapshots', async ({
 
 test('original diagrams, sections and links support reading', async ({ page }) => {
   await page.goto('/docs/docs-site-design');
-  await expect(page.getByRole('img', { name: '设计流程图' }).locator('svg')).toBeVisible();
+  await expect(page.locator('.diagram-viewport img')).toBeVisible();
   const compact = page.viewportSize()!.width < 1280;
   if (compact) await page.getByRole('button', { name: '本页目录', exact: true }).click();
   const toc = page.locator(compact ? '[data-toc-popover-content]' : '#nd-toc');
   await toc.getByRole('link', { name: '单源展示流程' }).click();
   await expect(page.locator('article h2').filter({ hasText: '单源展示流程' })).toBeInViewport();
   expect(new URL(page.url()).hash).not.toBe('');
-  if (page.viewportSize()!.width < 700) {
-    const diagram = page.locator('.diagram-viewport');
-    expect(await diagram.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);
-    await diagram.focus();
-    await page.keyboard.press('ArrowRight');
-    await expect.poll(() => diagram.evaluate(el => el.scrollLeft)).toBeGreaterThan(0);
-  }
   await page.getByText('图表源码', { exact: true }).click();
   await expect(page.locator('.diagram pre')).toContainText('flowchart');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -71,7 +64,7 @@ test('captures actual document reading when requested', async ({ page }, testInf
   await page.goto('/');
   await page.screenshot({ path: testInfo.outputPath('home.png'), fullPage: true });
   await page.goto('/docs/docs-site-design');
-  await expect(page.locator('.diagram-viewport svg')).toBeVisible();
+  await expect(page.locator('.diagram-viewport img')).toBeVisible();
   const nav = await navigation(page);
   await expect(nav.locator('a[aria-current="page"]')).toHaveText('文档站工程方案');
   await page.screenshot({ path: testInfo.outputPath('tree.png'), animations: 'disabled' });
@@ -93,7 +86,7 @@ test('project navigation connects usage and architecture with an active page', a
   nav = await navigation(page);
   await expect(nav.locator('a[aria-current="page"]')).toHaveText('系统架构');
   if (page.viewportSize()!.width < 768) await page.keyboard.press('Escape');
-  await expect(page.locator('.diagram-viewport svg')).toHaveCount(await page.locator('.diagram-viewport').count());
+  await expect(page.locator('.diagram-viewport img')).toHaveCount(await page.locator('.diagram-viewport').count());
   await expect(page.locator('.diagram [role=alert]')).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
 });
@@ -139,37 +132,27 @@ test('library disclosure and copy controls retain accurate source content', asyn
   expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(snapshots['README.md']);
 });
 
-test('architecture diagrams retain readable size and follow theme changes', async ({ page }, testInfo) => {
+test('architecture diagrams fit by default, zoom and follow theme changes', async ({ page }, testInfo) => {
   await page.goto('/docs/architecture');
   const diagram = page.locator('.diagram-viewport').first();
-  const svg = diagram.locator('svg');
+  const svg = diagram.locator('img');
   await expect(svg).toHaveAttribute('data-theme', 'light');
-  expect(await svg.evaluate(el => el.getBoundingClientRect().width / (el as SVGSVGElement).viewBox.baseVal.width)).toBeGreaterThanOrEqual(0.99);
-  expect(await diagram.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);
-  const stroke = await svg.locator('.flowchart-link').first().evaluate(el => getComputedStyle(el).stroke);
+  expect(await diagram.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+  const originalImage = await svg.getAttribute('src');
   let nav = await navigation(page);
   await nav.getByRole('button', { name: '切换明暗' }).click();
   if (page.viewportSize()!.width < 768) await page.keyboard.press('Escape');
   await expect(svg).toHaveAttribute('data-theme', 'dark');
-  await expect.poll(async () => page.locator('.diagram-viewport > svg:not([data-theme="dark"])').count()).toBe(0);
-  expect(await svg.locator('.flowchart-link').first().evaluate(el => getComputedStyle(el).stroke)).not.toBe(stroke);
-  const contrast = await svg.locator('.flowchart-link').first().evaluate(el => {
-    const luminance = (color: string) => {
-      const channels = color.match(/[\d.]+/g)!.slice(0, 3).map(Number).map(v => { const s = v / 255; return s <= .04045 ? s / 12.92 : ((s + .055) / 1.055) ** 2.4; });
-      return .2126 * channels[0] + .7152 * channels[1] + .0722 * channels[2];
-    };
-    const line = luminance(getComputedStyle(el).stroke);
-    const background = luminance(getComputedStyle(el.closest('.diagram-viewport')!).backgroundColor);
-    return (Math.max(line, background) + .05) / (Math.min(line, background) + .05);
-  });
-  expect(contrast).toBeGreaterThanOrEqual(3);
+  await expect.poll(async () => page.locator('.diagram-viewport img:not([data-theme="dark"])').count()).toBe(0);
+  expect(await svg.getAttribute('src')).not.toBe(originalImage);
   await diagram.scrollIntoViewIfNeeded();
   if (process.env.DOCS_CAPTURE) await page.screenshot({ path: testInfo.outputPath('architecture-dark.png'), animations: 'disabled' });
-  const figure = page.locator('.diagram').first();
-  await figure.getByRole('tab', { name: '完整概览' }).click();
-  expect(await diagram.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
-  await figure.getByRole('tab', { name: '阅读细节' }).click();
-  expect(await diagram.evaluate(el => el.scrollWidth > el.clientWidth)).toBe(true);
+  await page.locator('.diagram').first().getByRole('button', { name: '放大图表' }).click();
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await expect(page.getByRole('dialog').locator('img').first()).toBeVisible();
+  if (process.env.DOCS_CAPTURE) await page.screenshot({ path: testInfo.outputPath('architecture-zoom.png'), animations: 'disabled' });
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('dialog')).not.toBeVisible();
   nav = await navigation(page);
   await nav.getByRole('button', { name: '切换明暗' }).click();
   if (page.viewportSize()!.width < 768) await page.keyboard.press('Escape');
