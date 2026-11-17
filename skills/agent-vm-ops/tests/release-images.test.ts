@@ -31,7 +31,13 @@ test("guest image publication is manual and waits for the parallel build matrix"
 
   expect(preview.on.pull_request).toBeDefined();
   expect(preview.on.workflow_call).toBeDefined();
-  expect(preview.jobs.build.needs).toBe("lock-check");
+  expect(preview.jobs["common-base"].needs).toBe("lock-check");
+  expect(preview.jobs["common-base"].strategy.matrix.variant).toEqual(["privileged", "unprivileged"]);
+  expect(preview.jobs["common-base"].strategy["max-parallel"]).toBe(2);
+  expect(preview.jobs["common-base"].steps.some((step: { run?: string }) => step.run?.includes("--base-only"))).toBe(true);
+  expect(preview.jobs["common-base"].steps.some((step: { with?: { name?: string } }) => step.with?.name === "guest-common-base-${{ matrix.variant }}")).toBe(true);
+  expect(preview.jobs.build.needs).toEqual(["lock-check", "common-base"]);
+  expect(preview.jobs.build.steps.some((step: { uses?: string }) => step.uses === "actions/download-artifact@v4")).toBe(true);
   expect(preview.jobs.build.strategy["fail-fast"]).toBe(false);
   expect(preview.jobs.build.strategy["max-parallel"]).toBe(3);
 });
