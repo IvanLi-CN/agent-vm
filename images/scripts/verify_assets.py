@@ -2,6 +2,7 @@
 """Verify downloaded image assets before a target-server catalog import."""
 import argparse, hashlib, json, re
 from pathlib import Path
+from verify_image_archive import verify_archive
 
 def digest(path):
     value=hashlib.sha256()
@@ -24,6 +25,7 @@ def verify(directory, revision):
         for suffix in ['tar.gz','manifest.json','sbom.json','readiness.json']:
             name=asset+'.'+suffix
             if name not in checks or digest(directory/name)!=checks[name]:raise ValueError('checksum mismatch: '+name)
+        verify_archive(directory/(asset+'.tar.gz'))
         manifest=json.loads(path.read_text())
         mode=manifest.get('variant')
         if manifest.get('schema')!=1 or manifest.get('name')!=asset or manifest.get('source_revision')!=revision or manifest.get('architecture')!='amd64' or mode not in ['privileged','unprivileged']:raise ValueError('invalid image provenance or runtime variant')

@@ -1,4 +1,6 @@
 import json
+import shutil
+import tarfile
 import sys
 import tempfile
 import unittest
@@ -11,12 +13,13 @@ from verify_assets import digest, verify
 
 class ReleaseImageStagingTest(unittest.TestCase):
     def fixture(self, root):
-        for language in ['go', 'rust', 'java']:
+        for language in ['base', 'go', 'rust', 'java']:
             for mode in ['privileged', 'unprivileged']:
                 directory = root / ('guest-image-' + language + '-' + mode)
                 directory.mkdir(parents=True)
                 name = 'agent-vm-ubuntu24-' + language + '-' + mode + '-amd64'
-                (directory / (name + '.tar.gz')).write_bytes(name.encode())
+                with tarfile.open(directory / (name + '.tar.gz'), 'w:gz') as archive:
+                    archive.addfile(tarfile.TarInfo('metadata.yaml'))
                 manifest = dict(schema=1, name=name, profile=language, variant=mode,
                                 architecture='amd64', source_revision='a' * 40,
                                 image_fingerprint='b' * 64,
@@ -36,19 +39,24 @@ class ReleaseImageStagingTest(unittest.TestCase):
             root = Path(temporary); source = root / 'input'; output = root / 'frozen'
             self.fixture(source)
             assets = stage(source, output, 'a' * 40)
-            self.assertEqual(len(assets), 25)
-            self.assertEqual(len(verify(output, 'a' * 40)), 6)
+            self.assertEqual(len(assets), 33)
+            self.assertEqual(len(verify(output, 'a' * 40)), 8)
             self.assertEqual(assets, stage(source, output, 'a' * 40))
-            self.assertEqual(len((output / SUMS).read_text().splitlines()), 24)
+            self.assertEqual(len((output / SUMS).read_text().splitlines()), 32)
 
     def test_rejects_incomplete_corrupt_or_foreign_inputs_before_staging(self):
-        for fault in ['missing', 'tamper', 'source', 'foreign', 'symlink', 'wrong_slot']:
+        for fault in ['missing_base', 'missing', 'tamper', 'source', 'foreign', 'symlink', 'wrong_slot', 'device']:
             with self.subTest(fault=fault), tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary); source = root / 'input'; output = root / 'frozen'
                 self.fixture(source)
                 directory = source / 'guest-image-go-privileged'
                 archive = next(directory.glob('*.tar.gz'))
-                if fault == 'missing': archive.unlink()
+                if fault == 'missing_base': shutil.rmtree(source / 'guest-image-base-privileged')
+                elif fault == 'missing': archive.unlink()
+                elif fault == 'device':
+                    with tarfile.open(archive, 'w:gz') as tar:
+                        node=tarfile.TarInfo('rootfs/var/lib/docker/volumes/backingFsBlockDev'); node.type=tarfile.BLKTYPE; tar.addfile(node)
+                    path=next(directory.glob('*.manifest.json')); value=json.loads(path.read_text()); value['sha256']=digest(archive); path.write_text(json.dumps(value)); self.checksums(directory)
                 elif fault == 'tamper': archive.write_bytes(b'tampered')
                 elif fault == 'foreign': (directory / 'foreign').write_text('unexpected')
                 elif fault == 'symlink': archive.unlink(); archive.symlink_to('/etc/hosts')
@@ -68,6 +76,20 @@ class ReleaseImageStagingTest(unittest.TestCase):
             path.write_bytes(b'frozen-different-bytes')
             with self.assertRaises(ValueError): stage(source, output, 'a' * 40)
             self.assertEqual(path.read_bytes(), b'frozen-different-bytes')
+
+    def test_conflicting_checksum_target_is_checked_before_any_asset_copy(self):
+        for symlink in [False, True]:
+            with self.subTest(symlink=symlink), tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary); source=root/'input'; output=root/'frozen'
+                self.fixture(source); output.mkdir()
+                if symlink:
+                    sentinel=root/'sentinel'; sentinel.write_text('keep')
+                    (output/SUMS).symlink_to(sentinel)
+                else:
+                    (output/SUMS).write_text('different frozen checksums')
+                with self.assertRaises(ValueError): stage(source, output, 'a'*40)
+                self.assertEqual({path.name for path in output.iterdir()}, {SUMS})
+                if symlink: self.assertEqual(sentinel.read_text(), 'keep')
 
 
 if __name__ == '__main__': unittest.main()

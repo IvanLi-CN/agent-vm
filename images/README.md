@@ -1,11 +1,12 @@
 # Ubuntu 24.04 Agent VM 语言镜像
 
-在 Linux/Incus 上执行一条命令，构建 Rust、Java、Go 各自的 privileged/unprivileged 变体，共六个镜像。每种模式先构建并缓存公共层，再派生语言层。工具链采用官方二进制；不在宿主编译 Rust、Java 或 Go，不预装浏览器自动化依赖。
+在 Linux/Incus 上执行一条命令，构建 Base、Rust、Java、Go 各自的 privileged/unprivileged 变体，共八个镜像。每种模式先构建并缓存已封装的公共层，再派生 Base 发布包和语言层。Base 包含公共工具，不安装 Rust、Zulu Java 或 Go 专用工具链。工具链采用官方二进制；不在宿主编译 Rust、Java 或 Go，不预装浏览器自动化依赖。
 
 构建宿主必须支持当前 runc 的 nested Docker 工作负载。Ubuntu 24.04 初始发行的 Incus 6.0.0 缺少 nesting/AppArmor 修复；CI 使用 [Incus 官方安装文档](https://linuxcontainers.org/incus/docs/main/installing/)列出的 Zabbly 7.0 LTS 二进制软件源，并核对签名公钥指纹。不要通过关闭 AppArmor 或降低 Docker/runc 版本绕过验收。
 
 ```sh
 bun run images:build -- --all
+bun run images:build -- --profile base --variant both
 bun run images:build -- --profile go --variant unprivileged
 bun run images:build -- --all --check
 ```
@@ -26,7 +27,7 @@ bun run images:build -- --all
 
 每个镜像输出 `.tar.gz`、`.manifest.json`、`.sbom.json` 和 `.readiness.json`，总清单 `agent-vm-ubuntu24-SHA256SUMS` 覆盖全部文件。manifest 包含源码修订、lock 摘要、不可变镜像 fingerprint 和运行配置。SBOM 列出实际 Debian 包库存；语言/Node/Bun 二进制的版本、来源与摘要由 manifest 和锁补充。
 
-Docker 验收使用 Ubuntu 的 busybox-static 创建本地 scratch 镜像，执行多层 build、删除文件、root/非 root run、Compose、DNS/HTTP、命名卷持久化和 daemon 重启。固定经典 overlay2 后端，避免新安装的 containerd snapshotter 默认值改变合同；只重启本次拥有的可丢弃 guest 的 Docker。导出前移除构建期 SSH host key 和 machine-id，配置独立的 multi-user.target 开机任务，在首次 SSH 连接前重新生成 host key，兼容 ssh.socket 激活。构建器必须从 sealed 镜像创建全新实例，先观察自动生成的 ed25519 key，再完成实际严格 SSH 登录和 Docker 工作负载验收；失败不得输出成功 manifest。导出的镜像仍须在最终环境完成实际 SSH 登录检查。
+Docker 验收使用 Ubuntu 的 busybox-static 创建本地 scratch 镜像，执行多层 build、删除文件、root/非 root run、Compose、DNS/HTTP、命名卷持久化和 daemon 重启。固定经典 overlay2 后端，避免新安装的 containerd snapshotter 默认值改变合同；只重启本次拥有的可丢弃 guest 的 Docker。公共缓存层和最终镜像封装前均停止 Docker socket、daemon 和 containerd，确认服务已停止且数据目录没有挂载后清空 `/var/lib/docker`、`/var/lib/containerd`，保留二进制、服务及配置；新实例启动时重新初始化运行状态。导出包必须拒绝块/字符设备节点、Docker/containerd 运行残留和不安全路径，目标下载验证及 Release 冻结也执行同一检查。导出前移除构建期 SSH host key 和 machine-id，配置独立的 multi-user.target 开机任务，在首次 SSH 连接前重新生成 host key，兼容 ssh.socket 激活。构建器必须从 sealed 镜像创建全新实例，先观察自动生成的 ed25519 key，再完成实际严格 SSH 登录和 Docker 工作负载验收；失败不得输出成功 manifest。导出的镜像仍须在最终环境完成实际 SSH 登录检查。
 
 ## 管理端验收
 
@@ -46,7 +47,7 @@ go -C skills/agent-vm-ops/control test ./internal/native \
 
 ## 发布与目标服务器导入
 
-PR 预览在 GitHub 托管 Ubuntu runner 分别构建六套镜像，无需自托管 runner。正式 `Release` workflow 在同一源码修订构建六套镜像，验证完整矩阵、源码身份、checksum 和 readiness 后，将镜像及 sidecar 作为独立资产纳入既有 prepared/draft 冻结清单，再一并发布不可变 Release。镜像不进入控制服务、客户端或 Deployd 的二进制包；发布后不得追加或覆盖资产。恢复流程复用冻结资产，不重新构建镜像。
+PR 预览在 GitHub 托管 Ubuntu runner 分别构建八套镜像，无需自托管 runner。正式 `Release` workflow 在同一源码修订构建八套镜像，验证完整矩阵、源码身份、checksum 和 readiness 后，将镜像及 sidecar 作为独立资产纳入既有 prepared/draft 冻结清单，再一并发布不可变 Release。镜像不进入控制服务、客户端或 Deployd 的二进制包；发布后不得追加或覆盖资产。恢复流程复用冻结资产，不重新构建镜像。
 
 在目标服务器用 `gh release download` 下载对应语言/模式的 tar、manifest、SBOM、readiness 和 SHA256SUMS，在目标服务器运行 `python3 images/scripts/verify_assets.py --directory "$DOWNLOAD_DIR" --source-revision "$RELEASE_SHA"` 验证所下载的镜像及四类 sidecar；核对 manifest 的 `source_revision` 等于正式 Release 修订、模式匹配且 readiness 全通过。然后通过现有管理端本地包上传或配置的可信镜像来源登记到 catalog，并等待完整性和适用性通过；单独 `incus image import` 不会完成网页 catalog 登记。
 

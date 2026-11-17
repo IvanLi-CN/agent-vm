@@ -12,7 +12,7 @@ describe("guest image builder", () => {
     expect(result.exitCode).toBe(0);
     const value = JSON.parse(new TextDecoder().decode(result.stdout));
     expect(value.architecture).toBe("amd64");
-    expect(value.profiles).toEqual(["rust", "java", "go"]);
+    expect(value.profiles).toEqual(["base", "rust", "java", "go"]);
   });
 
   test("keeps the required language families and runtime versions in the lock", () => {
@@ -37,7 +37,7 @@ test("builds both runtime variants with separate commands and artifacts", () => 
   try {
     const log = join(temp, "commands.jsonl");
     writeFileSync(join(temp, "incus"), `#!/usr/bin/env python3
-import hashlib,json,os,sys,subprocess,time
+import hashlib,json,os,sys,subprocess,time,tarfile,io
 args=sys.argv[1:]
 if args and args[0]=="query" and "--project" in args:sys.exit(43)
 if "--project" in args:
@@ -53,13 +53,18 @@ if args[:2]==["file","push"]:
  assert script.startswith("set -euo pipefail"+chr(10)), "missing real newline"
  assert "docker build --network=none" in script
  assert "systemctl restart docker" in script
+ if "avm-build-common-" not in args[3]:
+  assert script.index("timeout 90 bash") < script.index("verify_ssh()"), "sealed guest validation raced first boot"
  subprocess.run(["bash","-n",args[2]],check=True)
 if args[:2]==["file","pull"]:
  with open(args[3],"w") as f:f.write('{"ready":true}')
 if args[0]=="query" and os.environ.get("IMAGE_TEST_FAIL_QUERY")=="1":sys.exit(44)
 if args[0]=="query":print(json.dumps({"target":hashlib.sha256(args[1].encode()).hexdigest()}))
 if args[:2]==["image","export"]:
- with open(args[3]+".tar.gz","wb") as f:f.write(args[2].encode())
+ with tarfile.open(args[3]+".tar.gz","w:gz") as f:
+  item=tarfile.TarInfo("metadata.yaml");data=args[2].encode();item.size=len(data);f.addfile(item,io.BytesIO(data))
+  if os.environ.get("IMAGE_TEST_DEVICE_NODE")=="1":
+   item=tarfile.TarInfo("rootfs/var/lib/docker/volumes/backingFsBlockDev");item.type=tarfile.BLKTYPE;item.devmajor=8;item.devminor=1;f.addfile(item)
 `, { mode: 0o755 });
     const output = join(temp, "output");
     const result = Bun.spawnSync([process.execPath, builder, "--all"], {
@@ -70,18 +75,18 @@ if args[:2]==["image","export"]:
     expect(result.exitCode).toBe(0);
     const commands = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
     const init = commands.filter(args => args[0] === "init");
-    expect(init).toHaveLength(14);
-    expect(init.filter(args => args.includes("security.privileged=true"))).toHaveLength(7);
-    expect(init.filter(args => args.includes("security.privileged=false"))).toHaveLength(7);
+    expect(init).toHaveLength(18);
+    expect(init.filter(args => args.includes("security.privileged=true"))).toHaveLength(9);
+    expect(init.filter(args => args.includes("security.privileged=false"))).toHaveLength(9);
     for (const args of init) expect(args).toContain("security.nesting=true");
     const manifests = readdirSync(output).filter(name => name.endsWith(".manifest.json"));
-    expect(manifests).toHaveLength(6);
+    expect(manifests).toHaveLength(8);
     for (const name of manifests) {
       const manifest = JSON.parse(readFileSync(join(output, name), "utf8"));
       expect(manifest.runtime_config["security.privileged"]).toBe(String(manifest.variant === "privileged"));
       expect(name).toContain(`-${manifest.variant}-`);
     }
-    expect(readFileSync(join(output, "agent-vm-ubuntu24-SHA256SUMS"), "utf8").trim().split("\n")).toHaveLength(24);
+    expect(readFileSync(join(output, "agent-vm-ubuntu24-SHA256SUMS"), "utf8").trim().split("\n")).toHaveLength(32);
     const failureLog = join(temp, "failure.jsonl");
     const failed = Bun.spawnSync([process.execPath, builder, "--all", "--variant", "unprivileged"], {
       env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, IMAGE_TEST_LOG: failureLog, IMAGE_TEST_FAIL_START: "1", AGENT_VM_IMAGE_OUTPUT: join(temp, "failure-output") },
@@ -122,6 +127,13 @@ if args[:2]==["image","export"]:
     expect(readyCommands.some(args => args[0] === "delete" && args[1] === fresh)).toBe(true);
     expect(readyCommands.some(args => args.slice(0, 3).join(" ") === "image alias delete")).toBe(true);
     expect(readdirSync(readyOutput).some(name => name.endsWith(".manifest.json") || name.endsWith("SHA256SUMS"))).toBe(false);
+    const deviceOutput = join(temp, "device-output");
+    const deviceFailure = Bun.spawnSync([process.execPath, builder, "--profile", "go", "--variant", "privileged"], {
+      env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, IMAGE_TEST_LOG: join(temp, "device.jsonl"), IMAGE_TEST_DEVICE_NODE: "1", AGENT_VM_IMAGE_OUTPUT: deviceOutput }, stdout: "pipe", stderr: "pipe",
+    });
+    expect(deviceFailure.exitCode).not.toBe(0);
+    expect(new TextDecoder().decode(deviceFailure.stderr)).toContain("build-host device in guest image");
+    expect(readdirSync(deviceOutput).some(name => name.endsWith(".manifest.json") || name.endsWith("SHA256SUMS"))).toBe(false);
   } finally { rmSync(temp, { recursive: true, force: true }); }
 }, 30_000);
 
