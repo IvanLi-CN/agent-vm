@@ -141,12 +141,13 @@ async function buildMode(mode: string) {
         await incus(["file", "pull", `${name}/etc/agent-vm-image/${guestFile}`, join(output, `${asset}.${suffix}`)]);
       }
       await incus(["stop", name]);
-      await incus(["publish", name, "--alias", name, "--format", "unified"]);
+      await incus(["publish", name, "--alias", name, "--format", "unified", "--compression", "gzip"]);
       publishedAlias = true;
       const published = await incus(["query", `/1.0/images/aliases/${name}?project=${encodeURIComponent(project)}`], true);
       imageFingerprint = JSON.parse(published.text).target;
       if (!/^[0-9a-f]{64}$/.test(imageFingerprint)) fail("publish did not return an immutable fingerprint");
-      await incus(["image", "export", imageFingerprint, join(output, `${asset}.tar`)]);
+      // Incus appends the full archive suffix (.tar.gz) to this prefix.
+      await incus(["image", "export", imageFingerprint, join(output, asset)]);
       const tar = join(output, `${asset}.tar.gz`);
       if (!existsSync(tar)) fail("Incus did not export a unified .tar.gz image");
       const manifest = { schema: 1, name: asset, profile, variant: mode, runtime_config: runtimeConfig(mode), architecture: "amd64", source_revision: sourceRevision, lock_sha256: lockSha, image_fingerprint: imageFingerprint, base: lock.base, versions: lock.versions, sha256: await digest(tar) };

@@ -58,7 +58,7 @@ if args[:2]==["file","pull"]:
 if args[0]=="query" and os.environ.get("IMAGE_TEST_FAIL_QUERY")=="1":sys.exit(44)
 if args[0]=="query":print(json.dumps({"target":hashlib.sha256(args[1].encode()).hexdigest()}))
 if args[:2]==["image","export"]:
- with open(args[3]+".gz","wb") as f:f.write(args[2].encode())
+ with open(args[3]+".tar.gz","wb") as f:f.write(args[2].encode())
 `, { mode: 0o755 });
     const output = join(temp, "output");
     const result = Bun.spawnSync([process.execPath, builder, "--all"], {
