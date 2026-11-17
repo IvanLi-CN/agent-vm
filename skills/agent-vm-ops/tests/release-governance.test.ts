@@ -79,25 +79,22 @@ test("release reservation is append-only and identity-bound", () => {
   }
 });
 
-test("immutable release freezes independent image files with product assets", () => {
+test("product release verification rejects guest image assets", () => {
   const products = { "agent-vm-native-1.0.0-linux-amd64.tar": "/native.tar" };
   const images = { "agent-vm-ubuntu24-go-privileged-amd64.tar.gz": "/image.tar.gz" };
-  const assets = { ...products, ...images };
-  const view = { tagName: "v1.0.0", targetCommitish: "a".repeat(40), isDraft: false, immutable: true, assets: Object.keys(assets).map(name => ({ name })) };
-  verifyReleaseView(view, "v1.0.0", false, assets, "a".repeat(40));
-  for (const names of [Object.keys(products), [...Object.keys(assets), "late-image.tar.gz"]]) {
-    let rejected = false;
-    try { verifyReleaseView({ ...view, assets: names.map(name => ({ name })) }, "v1.0.0", false, assets); } catch { rejected = true; }
-    if (!rejected) throw new Error("published image set differed from frozen reservation");
-  }
+  const view = { tagName: "v1.0.0", targetCommitish: "a".repeat(40), isDraft: false, immutable: true, assets: Object.keys(products).map(name => ({ name })) };
+  verifyReleaseView(view, "v1.0.0", false, products, "a".repeat(40));
+  let imageAccepted = true;
+  try { verifyReleaseView({ ...view, assets: Object.keys({ ...products, ...images }).map(name => ({ name })) }, "v1.0.0", false, products, "a".repeat(40)); } catch { imageAccepted = false; }
+  if (imageAccepted) throw new Error("product release accepted a guest image asset");
   const root = mkdtempSync(join(tmpdir(), "agent-vm-image-release-state-"));
   try {
     const store = new ReleaseStateStore(root); const source = identity();
-    const artifacts = Object.fromEntries(Object.keys(assets).map(name => [name, "d".repeat(64)]));
-    store.claim(source); store.transition(source, "prepared", { assets, artifacts });
+    const artifacts = Object.fromEntries(Object.keys(products).map(name => [name, "d".repeat(64)]));
+    store.claim(source); store.transition(source, "prepared", { assets: products, artifacts });
     let rejected = false;
-    try { store.transition(source, "draft", { assets: products, artifacts: { [Object.keys(products)[0]!]: "d".repeat(64) } }); } catch { rejected = true; }
-    if (!rejected) throw new Error("recovery dropped the frozen image asset");
+    try { store.transition(source, "draft", { assets: { ...products, ...images }, artifacts: { ...artifacts, [Object.keys(images)[0]!]: "e".repeat(64) } }); } catch { rejected = true; }
+    if (!rejected) throw new Error("product recovery accepted a guest image asset");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 

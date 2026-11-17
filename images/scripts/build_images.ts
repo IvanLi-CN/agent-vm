@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { parse } from "yaml";
 
 type Lock = {
@@ -21,11 +21,15 @@ function option(name: string, fallback: string) {
   if (!value || value.startsWith("--")) fail(`missing ${name} value`);
   return value;
 }
+const baseOnly = args.includes("--base-only");
+const commonBaseArchive = option("--common-base-archive", process.env.AGENT_VM_IMAGE_COMMON_BASE_ARCHIVE ?? "");
 for (let i = 0; i < args.length; i++) {
-  if (["--profile", "--variant"].includes(args[i]!)) { i++; continue; }
-  if (!["--all", "--check"].includes(args[i]!)) fail(`unknown argument: ${args[i]}`);
+  if (["--profile", "--variant", "--common-base-archive"].includes(args[i]!)) { i++; continue; }
+  if (!["--all", "--base-only", "--check"].includes(args[i]!)) fail(`unknown argument: ${args[i]}`);
 }
-const profiles = args.includes("--all") ? ["base", "rust", "java", "go"] : [option("--profile", "base")];
+if (baseOnly && (args.includes("--all") || args.includes("--profile"))) fail("--base-only cannot be combined with --all or --profile");
+if (baseOnly && commonBaseArchive) fail("--base-only cannot consume a common base archive");
+const profiles = baseOnly ? ["base"] : args.includes("--all") ? ["base", "rust", "java", "go"] : [option("--profile", "base")];
 const variant = option("--variant", "both");
 if (!["both", "privileged", "unprivileged"].includes(variant)) fail("--variant must be both, privileged or unprivileged");
 const variants = variant === "both" ? ["privileged", "unprivileged"] : [variant];
@@ -123,21 +127,66 @@ async function verifyPublished(image: string, mode: string, profile: string, rep
 const sourceRevision = process.env.AGENT_VM_IMAGE_SOURCE_REVISION ?? Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: root }).stdout.toString().trim();
 if (!/^[0-9a-f]{40}$/.test(sourceRevision)) fail("build requires a full source revision");
 const lockSha = createHash("sha256").update(lockText).digest("hex");
+function commonAssetName(mode: string) { return `${lock.name}-common-${mode}-amd64`; }
+function commonSumsName(mode: string) { return `${lock.name}-common-${mode}-SHA256SUMS`; }
+async function validateCommonBaseArchive(mode: string, archive: string) {
+  const archivePath = resolve(archive);
+  const expectedArchive = `${commonAssetName(mode)}.tar.gz`;
+  if (basename(archivePath) !== expectedArchive || !existsSync(archivePath)) fail(`common base archive is missing or has an unexpected name: ${archivePath}`);
+  const manifestPath = archivePath.slice(0, -".tar.gz".length) + ".manifest.json";
+  const sumsPath = join(dirname(archivePath), commonSumsName(mode));
+  if (!existsSync(manifestPath) || !existsSync(sumsPath)) fail("common base archive is missing its manifest or checksum file");
+  let manifest: Record<string, any>;
+  try { manifest = JSON.parse(readFileSync(manifestPath, "utf8")); } catch { fail("common base manifest is invalid JSON"); }
+  if (manifest.schema !== 1 || manifest.kind !== "common_base" || manifest.name !== commonAssetName(mode) || manifest.architecture !== "amd64" || manifest.variant !== mode || manifest.source_revision !== sourceRevision || manifest.lock_sha256 !== lockSha || JSON.stringify(manifest.runtime_config) !== JSON.stringify(runtimeConfig(mode)) || !/^[0-9a-f]{64}$/.test(manifest.image_fingerprint ?? "")) fail("common base manifest does not match this build");
+  const archiveSha = await digest(archivePath);
+  if (manifest.sha256 !== archiveSha) fail("common base archive digest does not match its manifest");
+  const manifestSha = await digest(manifestPath);
+  const expectedSums = `${archiveSha}  ${basename(archivePath)}\n${manifestSha}  ${basename(manifestPath)}\n`;
+  if (readFileSync(sumsPath, "utf8") !== expectedSums) fail("common base checksums do not match its inputs");
+  return { archivePath, fingerprint: manifest.image_fingerprint as string };
+}
 async function buildMode(mode: string) {
-  const layerHash = createHash("sha256").update(header + buildNetwork + base + docker + readiness + seal + aptText + aptInstaller + JSON.stringify(packages) + JSON.stringify(runtimeConfig(mode)) + lock.base.fingerprint).digest("hex").slice(0, 20);
+  const layerHash = createHash("sha256").update(sourceRevision + header + buildNetwork + base + docker + readiness + seal + aptText + aptInstaller + JSON.stringify(packages) + JSON.stringify(runtimeConfig(mode)) + lock.base.fingerprint).digest("hex").slice(0, 20);
   const commonAlias = `${lock.name}-${mode}-common-${layerHash}`;
   const runtimeRecord = `install -d /etc/agent-vm-image\nprintf '%s\\n' '${JSON.stringify({ variant: mode, runtime_config: runtimeConfig(mode) })}' > /etc/agent-vm-image/runtime-config.json\n`;
-  if ((await incus(["image", "info", commonAlias], true, true)).code) {
-    const name = `avm-build-common-${mode}-${crypto.randomUUID().slice(0, 8)}`;
-    let created = false;
-    try {
-      const local = await incus(["image", "info", lock.base.fingerprint], true, true);
-      await init(local.code ? `images:${lock.base.fingerprint}` : lock.base.fingerprint, name, mode); created = true;
-      await incus(["start", name]);
-      await provision(name, `${header}${buildNetwork}IMAGE_PROFILE=base\napt-get update\ncommand -v python3 >/dev/null || apt-get install -y --no-install-recommends python3=${aptLock.ubuntu!.python3!.version}\npython3 /root/.agent-vm-apt-install.py ubuntu\n${base}\n${docker}\n${runtimeRecord}${readiness}\n${seal}\n`);
-      await incus(["stop", name]);
-      await incus(["publish", name, "--alias", commonAlias]);
-    } finally { if (created) await remove(name); }
+  const commonArchive = commonBaseArchive ? await validateCommonBaseArchive(mode, commonBaseArchive) : null;
+  const commonExists = !(await incus(["image", "info", commonAlias], true, true)).code;
+  if (!commonExists) {
+    if (commonArchive) {
+      await incus(["image", "import", commonArchive.archivePath, "--alias", commonAlias]);
+    } else {
+      const name = `avm-build-common-${mode}-${crypto.randomUUID().slice(0, 8)}`;
+      let created = false;
+      try {
+        const local = await incus(["image", "info", lock.base.fingerprint], true, true);
+        await init(local.code ? `images:${lock.base.fingerprint}` : lock.base.fingerprint, name, mode); created = true;
+        await incus(["start", name]);
+        await provision(name, `${header}${buildNetwork}IMAGE_PROFILE=base\napt-get update\ncommand -v python3 >/dev/null || apt-get install -y --no-install-recommends python3=${aptLock.ubuntu!.python3!.version}\npython3 /root/.agent-vm-apt-install.py ubuntu\n${base}\n${docker}\n${runtimeRecord}${readiness}\n${seal}\n`);
+        await incus(["stop", name]);
+        await incus(["publish", name, "--alias", commonAlias, "--format", "unified", "--compression", "gzip"]);
+      } finally { if (created) await remove(name); }
+    }
+  }
+  if (commonArchive) {
+    const published = await incus(["query", `/1.0/images/aliases/${commonAlias}?project=${encodeURIComponent(project)}`], true);
+    const fingerprint = JSON.parse(published.text).target;
+    if (fingerprint !== commonArchive.fingerprint) fail("common base fingerprint does not match its manifest");
+  }
+  if (baseOnly) {
+    const published = await incus(["query", `/1.0/images/aliases/${commonAlias}?project=${encodeURIComponent(project)}`], true);
+    const fingerprint = JSON.parse(published.text).target;
+    if (!/^[0-9a-f]{64}$/.test(fingerprint)) fail("common base publication did not return an immutable fingerprint");
+    const asset = commonAssetName(mode);
+    const outputPrefix = join(output, asset);
+    await incus(["image", "export", fingerprint, outputPrefix]);
+    const archivePath = `${outputPrefix}.tar.gz`;
+    if (!existsSync(archivePath)) fail("Incus did not export the common base archive");
+    const manifestPath = join(output, `${asset}.manifest.json`);
+    writeFileSync(manifestPath, JSON.stringify({ schema: 1, kind: "common_base", name: asset, variant: mode, runtime_config: runtimeConfig(mode), architecture: "amd64", source_revision: sourceRevision, lock_sha256: lockSha, image_fingerprint: fingerprint, sha256: await digest(archivePath) }, null, 2) + "\n");
+    const manifestSha = await digest(manifestPath);
+    writeFileSync(join(output, commonSumsName(mode)), `${await digest(archivePath)}  ${basename(archivePath)}\n${manifestSha}  ${basename(manifestPath)}\n`);
+    return;
   }
   for (const profile of profiles) {
     const name = `avm-build-${profile}-${mode}-${crypto.randomUUID().slice(0, 8)}`;

@@ -47,9 +47,9 @@ go -C skills/agent-vm-ops/control test ./internal/native \
 
 ## 发布与目标服务器导入
 
-PR 预览在 GitHub 托管 Ubuntu runner 分别构建八套镜像，无需自托管 runner。正式 `Release` workflow 在同一源码修订构建八套镜像，验证完整矩阵、源码身份、checksum 和 readiness 后，将镜像及 sidecar 作为独立资产纳入既有 prepared/draft 冻结清单，再一并发布不可变 Release。镜像不进入控制服务、客户端或 Deployd 的二进制包；发布后不得追加或覆盖资产。恢复流程复用冻结资产，不重新构建镜像。
+PR 预览由 `Guest image preview` 在 GitHub 托管 Ubuntu runner 上验证镜像，无需自托管 runner；它只产生短期 CI artifact，不是生产镜像来源。CI 先并行构建 privileged 和 unprivileged 两种 common base，分别上传带源码修订与 lock 摘要的短期 artifact；随后八个 Base/Rust/Java/Go 最终镜像槽位下载对应 variant 的 common base，再按最多三个并行任务派生和验收。`Guest image release` 是唯一的镜像发布入口，只接受从受保护 `main` dispatch 的手动运行，以该 dispatch SHA 作为精确源码身份；它复用相同的锁校验、common-base producer 和最终镜像矩阵，完成完整矩阵、源码身份、checksum 和 readiness 验证后，将 32 个镜像文件与独立的 `SHA256SUMS` 发布到 `agent-vm-images-<source-sha>` Release。常规产品 `Release` 不构建、不下载也不发布 guest images；镜像不进入控制服务、客户端或 Deployd 的二进制包，发布后不得追加或覆盖资产。
 
-在目标服务器用 `gh release download` 下载对应语言/模式的 tar、manifest、SBOM、readiness 和 SHA256SUMS，在目标服务器运行 `python3 images/scripts/verify_assets.py --directory "$DOWNLOAD_DIR" --source-revision "$RELEASE_SHA"` 验证所下载的镜像及四类 sidecar；核对 manifest 的 `source_revision` 等于正式 Release 修订、模式匹配且 readiness 全通过。然后通过现有管理端本地包上传或配置的可信镜像来源登记到 catalog，并等待完整性和适用性通过；单独 `incus image import` 不会完成网页 catalog 登记。
+在目标服务器用 `gh release download "agent-vm-images-$IMAGE_SOURCE_REVISION"` 下载对应语言/模式的 tar、manifest、SBOM、readiness 和 `SHA256SUMS`，再运行 `python3 images/scripts/verify_assets.py --directory "$DOWNLOAD_DIR" --source-revision "$IMAGE_SOURCE_REVISION"` 验证所下载的镜像及四类 sidecar；核对 manifest 的 `source_revision` 等于镜像 Release 修订、模式匹配且 readiness 全通过。然后通过现有管理端本地包上传或配置的可信镜像来源登记到 catalog，并等待完整性和适用性通过；单独 `incus image import` 不会完成网页 catalog 登记。
 
 先在一个目标完成导入和实际 Agent VM acquire/SSH/release，再处理另一个目标。两者通过后才由运维者选择新默认镜像；已有 task/cache 保持原 fingerprint。旧裸镜像按 catalog 退役流程保留已有引用。失败时保留旧默认，不自动删除旧镜像、缓存或现有会话。部署地址、凭据及实际 fingerprint 库存仅记录在受保护运维环境。
 

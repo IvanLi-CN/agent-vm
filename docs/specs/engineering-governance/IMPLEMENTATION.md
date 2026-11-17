@@ -20,7 +20,7 @@
 - format 3 将产品 `version` 与源码 `source_revision` 分开，并显式携带同一 SHA 的 `release_id` 供部署边界和协议兼容复用；旧格式 1/2 只读。
 - 新增统一产品包构建、format 3 跨语言校验、GitHub `release-state/<stage>/<version>` 只创建 ref、append-only reservation/recovery 协调器和 `gh` adapter；平台保护与 immutable Release 仍是启用前置条件。
 - 现有 webhook 不被当作通知 transport；项目 ADR 已选择 Oidrune，但当前仓库合同仍明确 transport `unselected`，失败 sidecar 在 selection gate 阶段 fail-closed，直到实现与外部配置完成。
-- GitHub Release immutability、main ruleset、required checks、签名提交和真实通知配置没有在本 PR 修改；`platform-audit.ts` 只读报告当前 `unavailable/blocked` 差距，合同状态保留为 `audit-required`。
+- GitHub Release immutability、main ruleset、required checks、签名提交和真实通知配置没有在本 PR 修改；guest-image workflow 在构建前使用仅有 `Administration: read` 的 `RELEASE_PLATFORM_TOKEN` 读取 repository immutable-releases 状态，并同时要求操作者显式确认，在暂存前再次校验，发布后校验 `immutable=true`，`platform-audit.ts` 仍只读报告当前 `unavailable/blocked` 差距，合同状态保留为 `audit-required`。
 - 三个可安装 Policy package 与 `skills-lock.json` 已安装并锁定，quality-gates 本地审计通过；Style Playbook 仓库没有 `manual-version-release-delivery` 或 `github-actions-scheduling` 安装包，因此二者不伪造 lock 记录，分别由发布合同和 Actions workflow 合同承载，映射见 `.github/topic-contract.json`。
 
 ## Implementation Coverage
@@ -34,7 +34,7 @@
 | REQ-ENG-007 | 基线提交有有效签名。 | 平台 PR-only、required checks、签名、最新分支要求、禁止删除/force push 与例外核验。 |
 | REQ-ENG-008 | 条件原生验收边界已写入 release contract；本轮不执行 Incus/systemd 安装运行。 | 命中 Incus/systemd/deployment 变更时的独立验收。 |
 | REQ-ENG-009 | 精确 PR 事件、merge queue 事件、独立 namespace、`cancel-in-progress: false` 和合同测试。 | 真实 required queue/run history 对齐。 |
-| REQ-ENG-010 至 REQ-ENG-014 | SemVer resolver、固定源码 preflight、format 3 builder、append-only state、恢复入口。 | 真实 GitHub Release immutability、发布记录权限和中断恢复实证。 |
+| REQ-ENG-010 至 REQ-ENG-014 | SemVer resolver、固定源码 preflight、format 3 builder、append-only state、恢复入口；guest image release 在构建前和暂存前使用 `Administration: read` 平台凭据校验 immutable-release policy，同时要求操作者确认，缺失 tag 时显式按 source SHA 创建并在创建 Release 前复核，已有 tag 按其实际 ref 校验，draft 按 release ID 续跑并清理额外旧 asset，资产通过 Release 的 `upload_url` 上传，发布前后重新校验远端 asset bytes，并在同一步骤连续执行最终复核与不可逆发布，已发布重跑只验证冻结资产。 | 真实 GitHub Release immutability、发布记录权限和中断恢复实证。 |
 | REQ-ENG-015 | 已有显式部署、drain、激活、健康和恢复工具。 | 只消费已完成发布的版本化产物，明确发布完成与部署结果的独立记录。 |
 | REQ-ENG-016 至 REQ-ENG-020 | 全 workflow 唯一分类、两个 trusted-default-branch sidecars、metadata payload、selection gate 和 Oidrune transport 决策。 | Oidrune gateway/audience、来源 allowlist、真实 smoke 和生产启用仍待完成。 |
 | REQ-ENG-021 | format 3、新 `version`/`source_revision`、客户端版本输出、Python/Bun/Go 读取适配。 | 旧 SHA 状态 fixture 和 Go runtime format 3 fixture 仍需补齐。 |
@@ -49,7 +49,7 @@
 | `manual-version-release-delivery` | `.github/release-contract.json`、`Release`/`Release recovery`、format 3 builder、受 identity 保护的本地镜像与 GitHub state refs。 | GitHub 平台不可变记录和真实发布/恢复仍待启用阶段。 |
 | `semver-change-governance` | Policy、公开接口与状态模板、SemVer resolver 和独立 API/state 合同。 | 日常变更的实际影响记录；不自动驱动 target。 |
 | `quality-gates` | Policy、`.github/quality-gates.json`、PR/Main gates、quality checker。 | GitHub ruleset 与 required checks 对齐；当前只读差距审计。 |
-| `github-actions-scheduling` | 所有实际工作流的 events、namespaces、非抢占 concurrency、合同测试。 | live run history 和重跑/跨阶段证据。 |
+| `github-actions-scheduling` | 所有实际工作流的 events、namespaces、非抢占 concurrency、common-base/final matrix DAG、source SHA 固定、合同测试。 | live run history 和重跑/跨阶段证据。 |
 | `release-failure-notification` | Policy、notification contract、两个 sidecars、metadata helper、selection gate 和 ADR 0046。 | transport 决策已接受；配置、真实 smoke 和生产发送仍待完成。 |
 
 三个项目 Policy 的安装写入范围为 `.agents/skills/semver-change-governance/`、`.agents/skills/quality-gates/`、`.agents/skills/release-failure-notification/` 及 CLI 管理的 `skills-lock.json`；已在当前候选写入并通过本地 lock/package 校验。`manual-version-release-delivery` 与 `github-actions-scheduling` 在上游 Style Playbook 中不存在可安装 skill，分别通过 `.github/release-contract.json`、`.github/topic-contract.json` 和 `.github/workflows/` 实施，不添加虚假 lock 项。
@@ -60,7 +60,9 @@
 | --- | --- | --- | --- |
 | `CI (PR)` | 面向 main 的 opened、synchronize、reopened、ready_for_review；产生 `PR gate`。 | per-PR required namespace，取消旧 PR candidate；merge_group 不抢占。 | generic |
 | `CI (Main)` | main push；在实际 merge SHA 产生 `Main gate`。 | 独立 main namespace，`queue: max`，不抢占。 | generic |
-| `Release` | main 上显式 dispatch；固定事件 source，完成产物发布。 | 产品级 release 状态写入 namespace，`queue: max`，不抢占。 | Release-specific |
+| `Release` | main 上显式 dispatch；固定事件 source，只发布产品资产，不构建或发布 guest images。 | 产品级 release 状态写入 namespace，`queue: max`，不抢占。 | Release-specific |
+| `Guest image preview` | PR 或手动 dispatch；先固定一次 source SHA，并行构建两种 common base，再由八个最终镜像槽位消费对应 artifact 并上传短期 CI artifact，不发布生产镜像。 | per-ref preview namespace；PR 可取消过期 candidate，手动运行不抢占。 | generic |
+| `Guest image release` | 仅手动 dispatch；在构建矩阵前和暂存前使用 `Administration: read` 平台凭据校验 immutable releases，并要求 immutable policy 操作者确认，复用 common-base producer 和最终镜像矩阵，缺失 tag 时显式绑定 source SHA 并在创建 Release 前复核，按 release ID 续跑 draft、清理额外旧 asset，使用 Release `upload_url` 上传并校验 33 项资产、非 prerelease、source-bound tag、发布前后的 immutable 状态与远端 asset bytes，最后发布独立 image Release。 | 独立 image-release namespace，不抢占；不与产品 Release 共享 group。 | generic |
 | `Notify failed workflow` | generic allowlist 的 completed workflow_run，显式 guard failure。 | 原 run ID 与 attempt；不与产品发布共享 group。 | selection-gated |
 | `Notify failed release` | Release 的 completed workflow_run，额外核验发布 identity。 | 原 run ID 与 attempt；不与产品发布共享 group。 | selection-gated |
 | `Notification smoke` | transport 选择后的独立手动发送验证；当前只证明 gate fail-closed。 | 独立 manual namespace。 | selection-gated |
@@ -70,7 +72,7 @@
 
 ## 验证入口
 
-当前验证入口为 `bun run test:policy-audit`、`bun run test:platform-audit`、`bun run check`、`bun run test:repo`、`bun run test:skills` 和 `go -C skills/agent-vm-ops/control test ./...`；`bun skills/agent-vm-ops/scripts/platform-audit.ts --repository IvanLi-CN/agent-vm` 是只读 live 审计入口，PR/Main workflow 还声明双架构 format 3 构建与 Linux race。
+当前验证入口为 `bun run test:policy-audit`、`bun run test:platform-audit`、`bun run check`、`bun run test:repo`、`bun run test:skills`、`python3 -m unittest discover -s images/tests -p 'test_*.py'` 和 `go -C skills/agent-vm-ops/control test ./...`；`bun skills/agent-vm-ops/scripts/platform-audit.ts --repository IvanLi-CN/agent-vm` 是只读 live 审计入口，PR/Main workflow 还声明双架构 format 3 构建与 Linux race。
 这些仓库证据不等于 GitHub ruleset、真实通知发送、正式发版或部署已启用。
 目标合同还需要 SPEC 中 VER-ENG-001 至 VER-ENG-012 的验证，具体可执行入口在实现时补齐，不以占位命令冒充已有检查。
 重型、原生进程树或 Incus/systemd 验证使用会话所属隔离环境，不在文档整理期间运行。

@@ -8,6 +8,11 @@ on:
       - "bun.lock"
       - ".github/workflows/image-*.yml"
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: branch, tag, or commit to validate; defaults to the dispatch ref
+        required: false
+        type: string
   workflow_call:
     inputs:
       source_ref:
@@ -22,14 +27,28 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Build provenance uses the exact PR head, or the caller-bound release SHA.
-  lock-check:
-    name: Validate image lock
+  resolve-source:
+    name: Resolve source revision
     runs-on: ubuntu-24.04
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+      - id: source
+        run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # Build provenance uses the exact PR head, or the caller-bound source SHA.
+  lock-check:
+    name: Validate image lock
+    needs: resolve-source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.revision }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
@@ -38,21 +57,20 @@ jobs:
       - run: bun test images/tests
       - run: python3 -m unittest discover -s images/tests -p 'test_*.py'
 
-  build:
-    name: Image ${{ matrix.language }} / ${{ matrix.variant }}
-    needs: lock-check
+  common-base:
+    name: Build common base / ${{ matrix.variant }}
+    needs: [resolve-source, lock-check]
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 2
       matrix:
-        language: [base, go, rust, java]
         variant: [privileged, unprivileged]
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.resolve-source.outputs.revision }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
@@ -76,8 +94,62 @@ jobs:
           # Permit only traffic from this disposable build bridge and its replies.
           sudo iptables -I FORWARD -i avm-build-br -j ACCEPT
           sudo iptables -I FORWARD -o avm-build-br -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+      - name: Build common base
+        run: sudo env PATH="$PATH" AGENT_VM_IMAGE_NETWORK=avm-build-br AGENT_VM_IMAGE_SOURCE_REVISION="$(git rev-parse HEAD)" bun run images:build -- --base-only --variant "${{ matrix.variant }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-common-base-${{ matrix.variant }}
+          path: dist/agent-vm-ubuntu24-common-${{ matrix.variant }}-*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 3
+
+  build:
+    name: Image ${{ matrix.language }} / ${{ matrix.variant }}
+    needs: [resolve-source, lock-check, common-base]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        language: [base, go, rust, java]
+        variant: [privileged, unprivileged]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.revision }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - name: Prepare isolated Incus runner
+        run: |
+          # Ubuntu 24.04's original Incus 6.0.0 lacks the nesting/AppArmor fix
+          # needed by current runc. Use the documented supported LTS binaries.
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://pkgs.zabbly.com/key.asc -o /tmp/zabbly.asc
+          test "$(gpg --show-keys --with-colons /tmp/zabbly.asc | awk -F: '$1 == "fpr" {print $10; exit}')" = 4EFC590696CB15B87C73A3AD82CC8797C838DCFD
+          sudo install -m 0644 /tmp/zabbly.asc /etc/apt/keyrings/zabbly.asc
+          printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/zabbly.asc] https://pkgs.zabbly.com/incus/lts-7.0 noble main' | sudo tee /etc/apt/sources.list.d/zabbly-incus.list
+          sudo apt-get update
+          sudo apt-get install -y incus incus-client
+          sudo systemctl start incus
+          sudo incus version
+          sudo incus admin init --minimal
+          sudo incus network create avm-build-br ipv4.address=auto ipv6.address=none
+          # Hosted runners also run Docker, whose FORWARD policy can block Incus.
+          # Permit only traffic from this disposable build bridge and its replies.
+          sudo iptables -I FORWARD -i avm-build-br -j ACCEPT
+          sudo iptables -I FORWARD -o avm-build-br -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest-common-base-${{ matrix.variant }}
+          path: ${{ runner.temp }}/agent-vm-common-base
       - name: Build and verify image
-        run: sudo env PATH="$PATH" AGENT_VM_IMAGE_NETWORK=avm-build-br AGENT_VM_IMAGE_SOURCE_REVISION="$(git rev-parse HEAD)" bun run images:build -- --profile "${{ matrix.language }}" --variant "${{ matrix.variant }}"
+        env:
+          AGENT_VM_IMAGE_COMMON_BASE_ARCHIVE: ${{ runner.temp }}/agent-vm-common-base/agent-vm-ubuntu24-common-${{ matrix.variant }}-amd64.tar.gz
+        run: sudo env PATH="$PATH" AGENT_VM_IMAGE_NETWORK=avm-build-br AGENT_VM_IMAGE_SOURCE_REVISION="$(git rev-parse HEAD)" AGENT_VM_IMAGE_COMMON_BASE_ARCHIVE="$AGENT_VM_IMAGE_COMMON_BASE_ARCHIVE" bun run images:build -- --profile "${{ matrix.language }}" --variant "${{ matrix.variant }}"
       - name: Verify exported checksums
         run: |
           cd dist && sha256sum -c agent-vm-ubuntu24-SHA256SUMS

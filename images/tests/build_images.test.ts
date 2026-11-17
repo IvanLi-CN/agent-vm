@@ -87,6 +87,30 @@ if args[:2]==["image","export"]:
       expect(name).toContain(`-${manifest.variant}-`);
     }
     expect(readFileSync(join(output, "agent-vm-ubuntu24-SHA256SUMS"), "utf8").trim().split("\n")).toHaveLength(32);
+    const commonOutput = join(temp, "common-output");
+    const commonLog = join(temp, "common.jsonl");
+    const common = Bun.spawnSync([process.execPath, builder, "--base-only", "--variant", "privileged"], {
+      env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, IMAGE_TEST_LOG: commonLog, AGENT_VM_IMAGE_OUTPUT: commonOutput },
+      stdout: "pipe", stderr: "pipe",
+    });
+    expect(new TextDecoder().decode(common.stderr)).toBe("");
+    expect(common.exitCode).toBe(0);
+    const commonArchive = join(commonOutput, "agent-vm-ubuntu24-common-privileged-amd64.tar.gz");
+    expect(readdirSync(commonOutput)).toEqual(expect.arrayContaining([
+      "agent-vm-ubuntu24-common-privileged-amd64.manifest.json",
+      "agent-vm-ubuntu24-common-privileged-SHA256SUMS",
+    ]));
+    const importedLog = join(temp, "imported.jsonl");
+    const importedOutput = join(temp, "imported-output");
+    const imported = Bun.spawnSync([process.execPath, builder, "--profile", "go", "--variant", "privileged", "--common-base-archive", commonArchive], {
+      env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, IMAGE_TEST_LOG: importedLog, AGENT_VM_IMAGE_OUTPUT: importedOutput },
+      stdout: "pipe", stderr: "pipe",
+    });
+    expect(new TextDecoder().decode(imported.stderr)).toBe("");
+    expect(imported.exitCode).toBe(0);
+    const importedCommands = readFileSync(importedLog, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
+    expect(importedCommands.some(args => args[0] === "image" && args[1] === "import")).toBe(true);
+    expect(importedCommands.some(args => args[0] === "publish")).toBe(true);
     const failureLog = join(temp, "failure.jsonl");
     const failed = Bun.spawnSync([process.execPath, builder, "--all", "--variant", "unprivileged"], {
       env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, IMAGE_TEST_LOG: failureLog, IMAGE_TEST_FAIL_START: "1", AGENT_VM_IMAGE_OUTPUT: join(temp, "failure-output") },
