@@ -254,7 +254,7 @@ TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输
 - `VER-AGENT-VM-029` 覆盖：`REQ-AGENT-VM-029` 通过[系统架构](../../architecture/system.md)的蓝绿章节、[发布合同](contracts/release.md)，以及活动链接、兼容窗口和回滚检查。该项属于计划目标验证，在目标面和测试存在前保持待完成。
 
 - `VER-AGENT-VM-030` 覆盖：`REQ-AGENT-VM-030` 通过[Web Demo 决策备忘录](../../proposals/agent-vm-web-demo.md)、[Web Demo 检查面板交互合同](contracts/web-demo-inspector.md)、演示运行时与 API 隔离测试、页面级浏览器测试集、静态构建和现有管理 API 边界检查。
-- `VER-AGENT-VM-031` 覆盖：`REQ-AGENT-VM-031` 通过[部署控制器合同](contracts/deployment-controller.md)、[发布合同中的部署控制器章节](contracts/release.md#deployment-controller-boundary)、[部署观测合同](contracts/observability.md#deployment-control-observation)、[蓝绿部署资源](../../deployment/blue-green.md)以及隔离的 Go/systemd/双槽位事务和恢复检查。
+- `VER-AGENT-VM-031` 覆盖：`REQ-AGENT-VM-031` 通过[部署控制器合同](contracts/deployment-controller.md)、[发布合同中的部署控制器章节](contracts/release.md#deployment-controller-boundary)、[部署观测合同](contracts/observability.md#deployment-control-observation)、[蓝绿部署资源](../../deployment/blue-green.md)以及隔离的 Go/systemd/双槽位事务和恢复检查。 新增结构兼容回归必须覆盖 epoch 刷新后的完整 OIDC 登录，以及无主键行、无 rowid 表、生成列、外键与触发器的数据完整性；原生验收必须覆盖新旧槽位路径、持久化启动配置和三次启动失败预算，并在结束时清理该验收自身留下的 failed unit 状态。
 
 验证映射的机器可读形式使用 ASCII 冒号，以保持仓库检查工具兼容：
 
