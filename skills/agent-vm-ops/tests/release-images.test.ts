@@ -66,5 +66,5 @@ test("guest image publication is manual and waits for the parallel build matrix"
   expect(preview.jobs.build.steps.some((step: { with?: { ref?: string } }) => step.with?.ref === "${{ needs.resolve-source.outputs.revision }}")).toBe(true);
   expect(preview.jobs.build.steps.some((step: { uses?: string }) => step.uses === "actions/download-artifact@v4")).toBe(true);
   expect(preview.jobs.build.strategy["fail-fast"]).toBe(false);
-  expect(preview.jobs.build.strategy["max-parallel"]).toBe(3);
+  expect(preview.jobs.build.strategy["max-parallel"]).toBe(8);
 });
