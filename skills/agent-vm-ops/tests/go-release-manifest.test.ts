@@ -134,3 +134,15 @@ test("format-2 release CLI rejects HTTPS before creating an archive", () => {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
 });
+
+test("format-2 retained reader accepts historical actions without upgrading their windows", () => {
+  const historical = build_go_manifest("a".repeat(40), artifacts);
+  delete historical.actions["image-list"];
+  historical.actions.acquire.client_to_control.semantic_max = 1;
+  historical.client_view.actions = structuredClone(historical.actions);
+  expect(validate_go_manifest(historical)).toEqual(historical);
+  const incomplete = structuredClone(historical);
+  delete incomplete.actions.status;
+  incomplete.client_view.actions = structuredClone(incomplete.actions);
+  expect(() => validate_go_manifest(incomplete)).toThrow("actions differ");
+});

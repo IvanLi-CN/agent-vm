@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { join, posix } from "node:path";
 
-import { ACTION_NAMES, CLIENT_TRANSPORTS, default_operations, type ArtifactRole, type ClientTransport, type OperationSpec } from "./release-manifest.ts";
+import { ACTION_NAMES, LEGACY_ACTION_NAMES, CLIENT_TRANSPORTS, default_operations, type ArtifactRole, type ClientTransport, type OperationSpec } from "./release-manifest.ts";
 import { ControlError, canonical_json, type Data } from "./control-types.ts";
 
 export const GO_MANIFEST_FORMAT = 2;
@@ -116,9 +116,10 @@ function window(value: unknown, label: string): { schema_min: number; schema_max
 function operationMap(value: unknown): Record<string, OperationSpec> {
   if (!value || typeof value !== "object" || Array.isArray(value)) error("actions must be an object");
   const object = value as Record<string, unknown>;
-  if (Object.keys(object).sort().join(",") !== [...ACTION_NAMES].sort().join(",")) error("actions differ from the protocol-4 control surface");
+  const keys = Object.keys(object).sort().join(",");
+  if (keys !== [...ACTION_NAMES].sort().join(",") && keys !== [...LEGACY_ACTION_NAMES].sort().join(",")) error("actions differ from the protocol-4 control surface");
   const actions: Record<string, OperationSpec> = {};
-  for (const action of ACTION_NAMES) {
+  for (const action of Object.keys(object)) {
     const raw = object[action];
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) error(`actions.${action} must be an object`);
     const item = raw as Data;

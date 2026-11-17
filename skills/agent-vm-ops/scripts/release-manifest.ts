@@ -1535,9 +1535,9 @@ function _product_artifacts(value: unknown, target: ProductTarget, format: 3 | 4
 
 function _product_actions(value: unknown): Record<string, OperationSpec> {
   const raw = _require_mapping(value, "actions");
-  if (!_same_keys(raw, ACTION_NAMES)) throw _product_error("manifest_action_set_invalid", "product action set differs from protocol 4");
+  if (!_same_keys(raw, ACTION_NAMES) && !_same_keys(raw, LEGACY_ACTION_NAMES)) throw _product_error("manifest_action_set_invalid", "product action set differs from protocol 4");
   const actions: Record<string, OperationSpec> = {};
-  for (const action of ACTION_NAMES) {
+  for (const action of Object.keys(raw)) {
     const spec = _require_mapping(raw[action], `actions.${action}`);
     if (!_same_keys(spec, ["request", "response", "client_to_control", "control_to_client"])) throw _product_error("manifest_invalid", `actions.${action} has an unexpected shape`);
     const request = _schema(spec.request, `actions.${action}.request`);

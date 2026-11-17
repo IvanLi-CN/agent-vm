@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { build_product_manifest, HISTORICAL_PRODUCT_LINUX_ARTIFACTS, PRODUCT_LINUX_ARTIFACTS, validate_product_manifest, verify_product_bundle, type Artifact } from "../scripts/product-manifest.ts";
+import { build_product_manifest, HISTORICAL_PRODUCT_LINUX_ARTIFACTS, PRODUCT_LINUX_ARTIFACTS, PRODUCT_LINUX_LEGACY_ARTIFACTS, validate_product_manifest, verify_product_bundle, type Artifact } from "../scripts/product-manifest.ts";
 import { default_operations } from "../scripts/release-manifest.ts";
 
 test("format-3 client manifest fixes product identity, source and action windows", () => {
@@ -176,5 +176,20 @@ test("product release CLI preserves target-specific default transports", { timeo
     }
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
+test("product retained readers accept exact historical actions in formats 3 and 4", () => {
+  for (const format of [3, 4] as const) {
+    const artifacts: Artifact[] = (format === 3 ? PRODUCT_LINUX_LEGACY_ARTIFACTS : PRODUCT_LINUX_ARTIFACTS).map(([name, path, role, mode]) => ({name, path, role, mode, sha256:"a".repeat(64)}));
+    const historical = build_product_manifest("1.5.4", "b".repeat(40), artifacts, {format, target:{os:"linux",arch:"amd64"}, transport:"go-request"});
+    delete historical.actions["image-list"];
+    historical.actions.acquire.client_to_control.semantic_max = 1;
+    historical.client_view.actions = structuredClone(historical.actions);
+    expect(validate_product_manifest(historical)).toEqual(historical);
+    const incomplete = structuredClone(historical);
+    delete incomplete.actions.status;
+    incomplete.client_view.actions = structuredClone(incomplete.actions);
+    expect(() => validate_product_manifest(incomplete)).toThrow("product action set differs");
   }
 });

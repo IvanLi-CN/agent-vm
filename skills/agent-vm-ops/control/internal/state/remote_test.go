@@ -1466,7 +1466,7 @@ func TestSupportedSchemaAcceptsDurableAuthBeforeCompanionBootstrap(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, missing := range [][]string{{"management_confirmations"}, {"oidc_transaction_return_paths"}, {"management_confirmations", "oidc_transaction_return_paths"}} {
+	for _, missing := range [][]string{{"image_names"}, {"management_confirmations"}, {"oidc_transaction_return_paths"}, {"management_confirmations", "oidc_transaction_return_paths"}} {
 		t.Run(strings.Join(missing, "+"), func(t *testing.T) {
 			objects := make([]remoteSchemaObject, 0, len(core)+len(management))
 			for _, object := range core {
@@ -2062,5 +2062,90 @@ func TestRemoteImageNamesAndPinnedIntentAcrossMirrors(t *testing.T) {
 	selected, err := second.ImageFingerprintForName(ctx, name)
 	if err != nil || selected == nil || *selected != b {
 		t.Fatalf("name: %v %v", selected, err)
+	}
+}
+
+func TestRemoteExistingManagementSchemaBootstrapsImageNames(t *testing.T) {
+	endpoint := requireSessionOwnedRQLite(t)
+	ctx := context.Background()
+	original, err := OpenForTest(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	suffix := randomHex(8)
+	fp, label := strings.Repeat("e", 48)+suffix, "upgrade-"+suffix
+	if err := original.InsertManagedImage(ctx, ManagedImage{Fingerprint: fp, VersionLabel: &label, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
+		t.Fatal(err)
+	}
+	session := "upgrade-session-" + suffix
+	task := Task{TaskID: "upgrade-task-" + suffix, SessionID: session, Generation: 1, State: "cached", InstanceName: "upgrade-instance-" + suffix, CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z", ImageFingerprint: fp, ResourcesJSON: "{}", ResourceReservationJSON: "{}"}
+	if err := original.InsertTask(ctx, task); err != nil {
+		t.Fatal(err)
+	}
+	opID := "upgrade-operation-" + suffix
+	if _, err := original.ClaimOperation(ctx, opID, "acquire", &session, nil, map[string]any{"outcome": "success"}); err != nil {
+		t.Fatal(err)
+	}
+	beforeTask, err := original.GetTask(ctx, map[string]any{"session_id": session})
+	if err != nil || beforeTask == nil {
+		t.Fatalf("read original task: %v", err)
+	}
+	beforeOperation, err := original.GetOperation(ctx, opID)
+	if err != nil || beforeOperation == nil {
+		t.Fatalf("read original operation: %v", err)
+	}
+	beforeImages, err := original.ListManagedImages(ctx, ImageFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Recreate the supported pre-feature database, inside the verified session-owned test server.
+	if _, err := original.remote.request(ctx, []remoteStatement{{query: "DROP TABLE image_names"}, {query: "DELETE FROM meta WHERE key='image_names_migrated'"}}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := original.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Match production startup: Open must succeed before EnsureManagementSchema runs.
+	upgraded, err := Open(endpoint, false)
+	if err != nil {
+		t.Fatalf("open supported existing management schema: %v", err)
+	}
+	defer upgraded.Close()
+	if err := upgraded.EnsureManagementSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	selected, err := upgraded.ImageFingerprintForName(ctx, label)
+	if err != nil || selected == nil || *selected != fp {
+		t.Fatalf("migrated name = %v: %v", selected, err)
+	}
+	afterTask, err := upgraded.GetTask(ctx, map[string]any{"session_id": session})
+	if err != nil || afterTask == nil {
+		t.Fatalf("read upgraded task: %v", err)
+	}
+	afterOperation, err := upgraded.GetOperation(ctx, opID)
+	if err != nil || afterOperation == nil {
+		t.Fatalf("read upgraded operation: %v", err)
+	}
+	before, _ := json.Marshal([]any{beforeTask, beforeOperation})
+	after, _ := json.Marshal([]any{afterTask, afterOperation})
+	if string(before) != string(after) {
+		t.Fatalf("task or journal changed: before=%s after=%s", before, after)
+	}
+	for _, image := range beforeImages {
+		current, err := upgraded.GetManagedImage(ctx, image.Fingerprint)
+		if err != nil || current == nil || current.IsDefault != image.IsDefault {
+			t.Fatalf("default changed for %s: %v", image.Fingerprint, err)
+		}
+	}
+	version, err := upgraded.ImageCatalogVersion(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := upgraded.EnsureManagementSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	repeated, err := upgraded.ImageCatalogVersion(ctx)
+	if err != nil || repeated != version {
+		t.Fatalf("migration not reentrant: %s != %s: %v", repeated, version, err)
 	}
 }

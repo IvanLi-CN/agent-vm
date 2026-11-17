@@ -472,6 +472,11 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 			actual[objectKey(object.Type, object.Name)] = true
 		}
 		for key := range management {
+			// Image names are an additive migration. Existing supported catalogs
+			// must open before EnsureManagementSchema can create and populate them.
+			if key == objectKey("table", "image_names") && !actual[key] {
+				continue
+			}
 			// The principal/session/Token tables were added after the original
 			// management schema. An existing remote database may still expose
 			// the complete legacy management set; EnsureManagementSchema adds
