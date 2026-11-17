@@ -297,6 +297,8 @@ TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输
 
 管理端验收按配置的 lifecycle profile 复制特权、nesting、UID/GID 映射和 mknod/setxattr interception 白名单，不继承生产设备、网络或凭据。版本资产在 GitHub Release 独立发布，部署地址和实际库存不进入仓库。新镜像在目标服务器下载校验、登记并通过同模式验收后才能成为默认值；导入失败时默认值和已有会话 fingerprint 不变。旧裸镜像退役后仅保留已有引用。
 
+构建时软件源索引更新失败必须立即阻断安装，不得沿用旧索引继续产出。CI 构建宿主使用支持当前 nested Docker/runc 的受维护 Incus 二进制版本；不得通过关闭宿主安全机制、降低工具版本或跳过工作负载测试制造通过结果。临时构建网络设置不进入公开镜像，失败路径必须清理本次拥有的实例和发布 alias。
+
 ## Related ADRs
 
 - [Agent VM 拓扑与恢复边界](../../adr/0028-agent-vm-topology-recovery-boundary.md)

@@ -57,9 +57,17 @@ jobs:
       - run: bun install --frozen-lockfile
       - name: Prepare isolated Incus runner
         run: |
+          # Ubuntu 24.04's original Incus 6.0.0 lacks the nesting/AppArmor fix
+          # needed by current runc. Use the documented supported LTS binaries.
+          sudo install -d -m 0755 /etc/apt/keyrings
+          curl -fsSL https://pkgs.zabbly.com/key.asc -o /tmp/zabbly.asc
+          test "$(gpg --show-keys --with-colons /tmp/zabbly.asc | awk -F: '$1 == "fpr" {print $10; exit}')" = 4EFC590696CB15B87C73A3AD82CC8797C838DCFD
+          sudo install -m 0644 /tmp/zabbly.asc /etc/apt/keyrings/zabbly.asc
+          printf '%s\n' 'deb [arch=amd64 signed-by=/etc/apt/keyrings/zabbly.asc] https://pkgs.zabbly.com/incus/lts-7.0 noble main' | sudo tee /etc/apt/sources.list.d/zabbly-incus.list
           sudo apt-get update
           sudo apt-get install -y incus incus-client
           sudo systemctl start incus
+          sudo incus version
           sudo incus admin init --minimal
           sudo incus network create avm-build-br ipv4.address=auto ipv6.address=none
           # Hosted runners also run Docker, whose FORWARD policy can block Incus.
