@@ -87,6 +87,7 @@ restore_environment() {
     fi
   done
   if [[ "$restore_status" -eq 0 ]]; then
+    systemctl reset-failed agent-vm-native@blue.service agent-vm-native@green.service >/dev/null 2>&1 || true
     for path in "${test_paths[@]}"; do
       if [[ -e "$path" || -L "$path" ]]; then
         rm -rf -- "$path"
