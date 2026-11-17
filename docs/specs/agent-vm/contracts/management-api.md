@@ -86,7 +86,7 @@ API 使用稳定的机器错误码、阶段和少量安全结构化字段白名�
 
 镜像由不可变的 Incus fingerprint 标识。版本标签和配置的 source ID 是元数据，不是身份。可信远程导入只接受已配置的 `source_id` 和预期 fingerprint，不接受任意 URL、alias 或 credential。本地上传在流开始前声明其包格式、准确字节数和 SHA-256。上传必须符合配置的最大值和 staging 预留，只接收一次且不可续传。过短、超大、摘要不匹配或中断的流都必须成为可查询的失败 operation，并清理不完整的 staging 数据。
 
-完整性和 Agent VM 适用性是分开的结果。验证使用有界、隔离的临时 system container，不携带生产凭据、不挂载宿主目录、也不接入生产网络。只有完整性和适用性都通过的镜像才能被选为新默认值。选择变更只影响新会话；已有 task 和 cache 继续固定到存储的 fingerprint。退役镜像不得被新选择，但不使已有绑定失效。镜像为默认值，或存在 active、cached、releasing、pending-creation、verification 任一引用时，都必须拒绝删除；引用检查必须与镜像操作串行化。
+完整性和 Agent VM 适用性是分开的结果。验证使用有界、隔离的临时 system container，显式设置 `security.privileged=true` 和 `security.nesting=true`，与镜像构建和正式 guest 创建的运行模式一致。验收通过 `--no-profiles` 禁止继承生产 profile，不携带生产凭据、不挂载宿主目录、也不接入生产网络；隔离资源不得隐式改变为非特权运行模式。只有完整性和适用性都通过的镜像才能被选为新默认值。选择变更只影响新会话；已有 task 和 cache 继续固定到存储的 fingerprint。退役镜像不得被新选择，但不使已有绑定失效。镜像为默认值，或存在 active、cached、releasing、pending-creation、verification 任一引用时，都必须拒绝删除；引用检查必须与镜像操作串行化。
 
 ## 状态迁移与包回滚
 

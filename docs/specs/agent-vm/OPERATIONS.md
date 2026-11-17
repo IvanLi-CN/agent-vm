@@ -293,6 +293,22 @@ cached row 默认折叠，并提供 state filter。
 每次成功 scrape 后删除 stale per-task series；
 任一只读来源无法读取或解析时，暴露 `up=0` 和 freshness failure。
 
+## 镜像验收运行模式
+
+正式 guest 创建和临时镜像验收均显式设置 `security.privileged=true`、`security.nesting=true`。验收使用 `--no-profiles`，仅附带自己的 root disk，不继承生产网卡、宿主挂载或凭据；不得通过改成非特权容器来表达这些资源隔离要求。
+
+在明确授权的 Linux/Incus 运维环境执行以下集成测试。project、pool 和逗号分隔的镜像完整 fingerprint 必须由该环境的真实配置提供。测试只创建和清理自己的临时验收实例，不修改默认镜像或应用镜像目录。
+
+```sh
+AGENT_VM_TEST_INCUS_PROJECT="$IMAGE_TEST_PROJECT" \
+AGENT_VM_TEST_INCUS_POOL="$IMAGE_TEST_POOL" \
+AGENT_VM_TEST_IMAGE_FINGERPRINTS="$IMAGE_TEST_FINGERPRINTS" \
+go -C skills/agent-vm-ops/control test ./internal/native \
+  -run '^TestIncusImageVerificationIntegration$' -v -timeout 10m
+```
+
+测试检查实际实例的权限、nesting、autostart、空 profile 和仅 root disk 的设备集合，再调用管理端的 `VerifyImage` 执行有界启动和工具适用性检查。此测试不替代 SSH 登录和 guest 内 Docker 工作负载验收，也不构成外层宿主权限变更授权。
+
 ## 相关合同
 
 - [Native Incus Agent VM 规格](SPEC.md)

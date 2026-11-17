@@ -289,7 +289,7 @@ func (c *IncusClient) Init(ctx context.Context, image, name string, ownership ma
 	if c.Pool != "" {
 		args = append(args, "--storage", c.Pool)
 	}
-	args = append(args, "--config", "boot.autostart=false")
+	args = append(args, "--config", "boot.autostart=false", "--config", "security.privileged=true", "--config", "security.nesting=true")
 	keys := make([]string, 0, len(ownership))
 	for key := range ownership {
 		keys = append(keys, key)
@@ -301,7 +301,8 @@ func (c *IncusClient) Init(ctx context.Context, image, name string, ownership ma
 	return c.run(ctx, args...)
 }
 
-// InitVerification creates a container without profiles or network devices.
+// InitVerification creates a privileged nested container without profiles or
+// network devices, matching the managed guest execution mode.
 // Image suitability checks must not inherit production mounts, credentials or
 // network access from the lifecycle profile.
 func (c *IncusClient) InitVerification(ctx context.Context, image, name string) error {
@@ -309,7 +310,7 @@ func (c *IncusClient) InitVerification(ctx context.Context, image, name string) 
 	if c.Pool != "" {
 		args = append(args, "--storage", c.Pool)
 	}
-	args = append(args, "--config", "boot.autostart=false")
+	args = append(args, "--config", "boot.autostart=false", "--config", "security.privileged=true", "--config", "security.nesting=true")
 	return c.run(ctx, args...)
 }
 

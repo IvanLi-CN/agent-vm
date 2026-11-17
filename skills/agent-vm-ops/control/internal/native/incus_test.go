@@ -61,6 +61,7 @@ func TestIncusInitUsesSystemContainerArguments(t *testing.T) {
 		"--project", "agents", "init", "images:debian/13", "container-check",
 		"--profile", "agent-vm", "--network", "agentsbr0", "--storage", "agents",
 		"--config", "boot.autostart=false",
+		"--config", "security.privileged=true", "--config", "security.nesting=true",
 		"--config", "user.agent-vm.generation=1", "--config", "user.agent-vm.managed=native-v1",
 		"--config", "user.agent-vm.session=session", "--config", "user.agent-vm.task=task",
 	}
@@ -266,7 +267,7 @@ func TestStorageCapacityRejectsInvalidBlockCountsAndMultiplicationOverflow(t *te
 	}
 }
 
-func TestIncusVerificationInitDisablesProfilesAndNetwork(t *testing.T) {
+func TestIncusVerificationInitUsesPrivilegedNestingWithoutProductionProfile(t *testing.T) {
 	binDir := t.TempDir()
 	logPath := filepath.Join(t.TempDir(), "incus-argv")
 	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$INCUS_ARGV_LOG\"\n"
@@ -285,7 +286,7 @@ func TestIncusVerificationInitDisablesProfilesAndNetwork(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := strings.Split(strings.TrimSpace(string(data)), "\n")
-	want := []string{"--project", "agents", "init", "image-fingerprint", "image-check", "--no-profiles", "--storage", "agents", "--config", "boot.autostart=false"}
+	want := []string{"--project", "agents", "init", "image-fingerprint", "image-check", "--no-profiles", "--storage", "agents", "--config", "boot.autostart=false", "--config", "security.privileged=true", "--config", "security.nesting=true"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("incus argv = %#v, want %#v", got, want)
 	}
