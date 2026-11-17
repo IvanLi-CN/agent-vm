@@ -1,5 +1,7 @@
 # 原生 Incus Agent VM
 
+客户端组件的职责、依赖与待审查问题见[客户端设计与审查](CLIENT.md)；命令行接口见[客户端 CLI 接口](contracts/cli.md)，双方协议的中文阅读入口见[客户端与控制端通信协议](contracts/control-protocol.md)。审查问题不等同于已经实现或批准的需求变更。
+
 本文是 Agent VM 主题的规范设计文档和长期需求合同。状态后端迁移、恢复材料保留和蓝绿边界以 `REQ-AGENT-VM-028` 及其关联合同为准，部署控制器边界以 `REQ-AGENT-VM-031` 及其关联合同为准。相关 ADR 只记录决策背景、技术取舍和被否决方案，不替代本规范。
 
 ## Context and Scope

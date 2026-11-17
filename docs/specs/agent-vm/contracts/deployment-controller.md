@@ -281,3 +281,13 @@ Incus 项目级共享 `incus_*` 指标由槽位只读采样，Deployd 只输出�
 激活自授予候选 controller 起，直到旧槽静止、停止和最终验证结束，必须持续通过角色通道核验并续期同一 lease；补偿回滚或 fencing 前先停止续期。旧槽静止计数复用组合只读观测的 capacity lane，仅在明确不支持该端点时兼容旧查询，不能因请求失败降级。只读 status 不持有角色写入锁，指标发布独立读取最近完成的持久化快照，新快照提交成功后以可合并的进程内通知立即唤醒唯一发布器，周期读取仅作兜底，不能等待角色协调的后续写入或下一个轮询周期才更新；正常活动事务不能被误判为恢复失败，只有明确 `needs_recovery` 或恢复标记才强制不一致。所有快照仍保留原始新鲜度边界，发布器不延长时间戳、不执行观测或角色授权。
 
 只读 status 返回本次观测但不覆盖用于指标发布的 latest 记录，避免并发的旧观测覆盖较新部署证据。激活请求取消后，不继续补偿切换；使用独立的三十秒有界清理上下文记录不确定结果并 fencing，保留原事务等待显式恢复。
+
+## 运维命令与发布获取诊断
+
+独立程序 `agent-vm-deploy` 只连接部署控制器受保护的本机 Unix socket，提供 `status`、`plan`、`verify`、`stage`、`activate`、`rollback`、`recover` 和首次迁移 `migrate`。`update --version <semver> --source-revision <sha>` 在目标服务器按该服务器架构获取并验证发布产物，再提交同一组蓝绿事务；Agent 工作站不得代替目标服务器下载或上传控制面部署包。
+
+发布元数据查询可以匿名执行，也可以读取目标主机上仅 root 可读的最小权限发布凭据。失败响应保留 `code`、`phase`、`http_status`、`retryable`、`reason`、`next_action`、`request_id` 和 `retry_after_seconds`；不得输出 Token、完整第三方响应或私有部署路径。匿名 API 限流返回 `release_rate_limited`，权限拒绝返回 `release_access_denied`，网络和 5xx 故障只进行有限重试。查询与校验完成前，不能向 Deployd 提交事务。
+
+命令行程序不得自行替换槽位、复制候选二进制、编辑 `active` 链接或授予控制器租约。接管失败时，应区分进程身份、systemd 单元、socket 链接、清单、活动槽位、控制器租约和观测新鲜度问题，并保留按事务和阶段查询的入口。
+
+首次迁移由发布器在启动双槽位前提交给 Deployd，由其自动排空、阻止写入、创建快照、导入和验证。命令行程序不接收 rqlite 地址、数据库路径、SQL 或凭据来绕过 Deployd。迁移失败只允许沿原事务身份执行一次受限重试；不能用普通 `stage`、`activate` 或 `rollback` 替代迁移，也不能将迁移变成发布后的人工前置步骤。
