@@ -16,7 +16,8 @@
     "CI (Main)": "generic",
     "Release": "release-specific",
     "Release recovery": "generic",
-    "Demo Deploy": "generic"
+    "Demo Deploy": "generic",
+    "Guest image preview": "generic"
   },
   "excluded_workflows": ["Notification smoke", "Notify failed workflow", "Notify failed release"],
   "workflow_inventory": {
@@ -25,6 +26,7 @@
     "Release": {"class": "release-specific", "sidecar": "Notify failed release", "events": ["workflow_dispatch"], "ref_prefixes": ["refs/heads/"]},
     "Release recovery": {"class": "generic", "sidecar": "Notify failed workflow", "events": ["workflow_dispatch"], "ref_prefixes": ["refs/heads/"]},
     "Demo Deploy": {"class": "generic", "sidecar": "Notify failed workflow", "events": ["pull_request", "push", "workflow_dispatch"], "ref_prefixes": ["refs/pull/", "refs/heads/"]},
+    "Guest image preview": {"class": "generic", "sidecar": "Notify failed workflow", "events": ["pull_request", "workflow_dispatch", "workflow_call"], "ref_prefixes": ["refs/pull/", "refs/heads/", "refs/tags/"]},
     "Notification smoke": {"class": "excluded", "sidecar": null},
     "Notify failed workflow": {"class": "excluded", "sidecar": null},
     "Notify failed release": {"class": "excluded", "sidecar": null}

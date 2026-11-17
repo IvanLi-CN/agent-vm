@@ -22,6 +22,12 @@ Python release tools 使用[`release_manifest.py`](../../../../deploy/scripts/re
 
 每个 action 声明 `request.schema`、`request.semantic_revision`、`response.schema`、`response.semantic_revision`，以及包含 `schema_min`、`schema_max`、`semantic_min` 和 `semantic_max` 的 explicit `client_to_control` 和 `control_to_client` objects。 JSON parseability 不是 compatibility evidence。 Control process 在 journal record、native handler 或 timer preemption 前检查 protocol、action、request window、response window 和所有 artifact bytes。
 
+## 来宾镜像发布资产
+
+正式 Release 在同一源码修订完成 Rust、Java、Go 的 privileged/unprivileged 六套 amd64 镜像构建。草稿创建前必须验证六个矩阵槽位、精确 source revision、镜像身份、readiness、SBOM 和摘要，并将 24 个镜像文件及独立镜像 SHA256SUMS 纳入既有 prepared 冻结清单和顶层 SHA256SUMS。缺失、额外、被篡改或修订不匹配的输入不得进入发布。镜像是独立下载资产，不进入 client/native/bootstrap 产品包，也不扩大组件更新的下载或验证范围。
+
+不可变 Release 发布后不得追加镜像；恢复事务只复用 reservation 中冻结的文件和摘要，不重新选择源码或构建镜像。发布状态快照必须包含这些文件，便于既有 recovery workflow 继续验证相同资产集合。
+
 ## 蓝绿兼容窗口
 
 Publisher 在 slot switch 后至少保留 current 和 previous verified package、static resource manifest 及 state capability declaration 一小时。每个 candidate 声明 common protocol-4 action set、direct HTTPS Agent API transport、Token API 和 browser management API 的 request/response/semantic windows。 Candidate 只有在能够 read/write shared state 中每个 present capability，且 OIDC issuer/client/redirect configuration compatible 时，才可成为 active。 Caddy 只切换受保护的 `active` link；绝不 retry write，也不根据 external request 选择 slot。

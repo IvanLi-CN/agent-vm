@@ -1,0 +1,12 @@
+config:
+  security.nesting: "true"
+  security.privileged: "false"
+  security.syscalls.intercept.mknod: "true"
+  security.syscalls.intercept.setxattr: "true"
+  boot.autostart: "false"
+description: Agent VM unprivileged nested Docker profile
+devices:
+  root:
+    path: /
+    pool: agent-vm
+    type: disk
