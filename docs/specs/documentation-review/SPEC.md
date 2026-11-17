@@ -93,3 +93,11 @@ None
 - [范围说明](../../proposals/agent-vm-documentation-review.md)
 - [内容适配](../../proposals/agent-vm-documentation-source.md)
 - [工程方案](../../proposals/agent-vm-documentation-stack.md)
+
+## Visual Evidence
+
+负责人分别接受文档阅读与图表呈现，以及新增的文档组织规范入口。以下为对应的受控静态页面证据。
+
+![架构图完整展示与紧凑源码入口](assets/diagram-compact.png)
+
+![文档组织与编写规范](assets/documentation-guide.png)
