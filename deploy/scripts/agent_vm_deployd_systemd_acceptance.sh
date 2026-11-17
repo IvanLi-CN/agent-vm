@@ -76,6 +76,9 @@ restore_environment() {
   local unit path backup
   set +e +u
   for unit in "${runtime_units[@]}"; do
+    if [[ "$(systemctl show "$unit" --property=LoadState --value)" == not-found ]]; then
+      continue
+    fi
     if ! systemctl stop "$unit" >/dev/null 2>&1; then
       restore_status=1
     fi
@@ -167,6 +170,9 @@ for unit in "${runtime_units[@]}"; do
   fi
 done
 for unit in "${runtime_units[@]}"; do
+  if [[ "$(systemctl show "$unit" --property=LoadState --value)" == not-found ]]; then
+    continue
+  fi
   systemctl stop "$unit" >/dev/null 2>&1 || fail "could not stop pre-existing unit $unit"
   if systemctl is-active --quiet "$unit"; then
     fail "pre-existing unit $unit remained active after stop"

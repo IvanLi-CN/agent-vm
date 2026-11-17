@@ -203,7 +203,7 @@ class ReleasePublisherTests(unittest.TestCase):
                 destination.write_bytes(source.read_bytes())
                 destination.chmod(mode)
                 unit_artifacts.append({"name": name, "path": path, "role": role, "mode": mode})
-            RELEASE._verify_unit_contents(root, {"format": MANIFEST.PRODUCT_MANIFEST_FORMAT, "artifacts": unit_artifacts})
+            RELEASE._verify_unit_contents(root, {"format": MANIFEST.PRODUCT_MANIFEST_FORMAT, "artifacts": manifest["artifacts"]})
 
     def test_publish_is_remote_first_and_exits_drain_after_local_client(self):
         transport = FakeTransport()
