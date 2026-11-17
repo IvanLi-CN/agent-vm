@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"net"
 	"net/http"
 	"os"
@@ -104,7 +105,7 @@ func serve(config configuration, manifest releaseManifest) error {
 	}()
 
 	state := &runtimeState{}
-	startToken := time.Now().UTC().Format(time.RFC3339Nano)
+	startToken := controllerrole.ProcessStartToken(os.Getpid())
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/health", func(writer http.ResponseWriter, _ *http.Request) {
 		state.Lock()

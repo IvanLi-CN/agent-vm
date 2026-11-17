@@ -397,6 +397,7 @@ PY
 }
 
 status_json="$(/opt/agent-vm-native/bin/agent-vm-deploy status --json)"
+printf '%s\n' "$status_json" >"$test_root/initial-status.json"
 python3 - "$status_json" <<'PY'
 import json
 import sys
