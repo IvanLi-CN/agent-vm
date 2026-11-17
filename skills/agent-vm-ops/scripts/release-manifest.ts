@@ -51,7 +51,7 @@ export const CLIENT_DEPENDENCY_NAMES = new Set([
 export const ACTION_NAMES: readonly string[] = Object.freeze([...RUNTIME_ACTIONS]);
 
 // Format 1 is a frozen compatibility bridge, without image-selection semantics.
-const LEGACY_ACTION_NAMES = ACTION_NAMES.filter(action => action !== "image-list");
+export const LEGACY_ACTION_NAMES = ACTION_NAMES.filter(action => action !== "image-list");
 const ACTION_SET: ReadonlySet<string> = new Set(LEGACY_ACTION_NAMES);
 
 const HTTPS_TRANSPORT_UNAVAILABLE =

@@ -75,7 +75,7 @@ func TestClientImageSelectionIsolatedIncus(t *testing.T) {
 	if len(revision) != 40 {
 		t.Fatal("candidate SHA required")
 	}
-	release := &protocol.ReleaseMetadata{ReleaseID: revision, SourceRevision: revision, Version: "dev", Protocol: protocol.Version, Actions: actions}
+	release := &protocol.ReleaseMetadata{ReleaseID: revision, SourceRevision: revision, Version: "0.0.0-acceptance", Protocol: protocol.Version, Actions: actions}
 	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Release: release, LockDir: filepath.Join(root, "locks")})
 	service.MarkReady()
 	// Cleanup is scoped to tasks created by this store, including partial failures.
