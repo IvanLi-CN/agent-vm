@@ -23,7 +23,7 @@
 
 优先检查已安装 Fumadocs 的公开 API，先复用完整布局，再组合组件和样式原语。正文的标题、表格、列表、引用与代码采用 `DocsBody` 及默认 MDX 组件；移除自制正文排版、响应式目录状态、原生折叠和全局 pre 样式。复制页面链接采用库的 `buttonVariants` 与 `useCopyButton`，补充剪贴板失败反馈；此版本提供按钮样式函数，没有独立 Button 组件。
 
-保留的项目逻辑仅包括来源内容适配、构建身份、快照行锚点和 Mermaid 渲染：Fumadocs CodeBlock 提供代码外壳及复制，未提供与本项目快照参数对应的行定位；已安装 UI 包没有导出 Mermaid 渲染组件。行号使用 CSS 伪元素，复制结果保留原始文本。图表源码和来源身份均由库的 Accordion 展开，图表错误使用 Callout。没有新增 UI 依赖或第二套组件系统。Mermaid 使用 base 主题及显式明暗配色，随站点主题重新渲染；全局初始化和渲染串行执行，避免多图互相覆盖配置。图表默认完整适配正文宽度，使用 Fumadocs ImageZoom 放大查看 SVG，Esc 返回正文；主题切换重新绑定查看组件。
+保留的项目逻辑仅包括来源内容适配、构建身份、快照行锚点和 Mermaid 渲染：Fumadocs CodeBlock 提供代码外壳及复制，未提供与本项目快照参数对应的行定位；已安装 UI 包没有导出 Mermaid 渲染组件。行号使用 CSS 伪元素，复制结果保留原始文本。图表源码由库的 Collapsible 与小尺寸 ghost 按钮展开，来源身份由 Accordion 展开，图表错误使用 Callout。没有新增 UI 依赖或第二套组件系统。Mermaid 使用 base 主题及显式明暗配色，随站点主题重新渲染；全局初始化和渲染串行执行，避免多图互相覆盖配置。图表默认完整适配正文宽度，使用 Fumadocs ImageZoom 放大查看 SVG，Esc 返回正文；主题切换重新绑定查看组件。
 
 组件状态由 Diagram 和 DocumentActions 的 autodocs 展示，覆盖有效／无效图表、干净／修改来源及复制失败；交互故事覆盖源码展开、来源展开和复制反馈；五个状态已在静态 Storybook 浏览器中执行检查，未出现页面异常。
 

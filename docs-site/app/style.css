@@ -20,7 +20,6 @@ a[href='#nd-page']:focus { position: fixed; z-index: 60; width: auto; height: au
 .diagram-viewport { max-width: 100%; overflow: auto; padding: 1rem; border: 1px solid var(--color-fd-border); border-radius: .75rem; background: var(--color-fd-background); }
 .diagram-viewport:focus-visible { outline: 2px solid var(--color-fd-ring); outline-offset: 3px; }
 .diagram-viewport img { width: 100%; height: auto; cursor: zoom-in; }
-.diagram-hint { margin-top: .5rem; color: var(--color-fd-muted-foreground); font-size: .75rem; }
 .site-footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--color-fd-border); color: var(--color-fd-muted-foreground); font-size: .75rem; }
 .source-line { display: block; min-height: 1.5em; }
 .source-line.selected { background: var(--color-fd-accent); }
@@ -29,3 +28,5 @@ a[href='#nd-page']:focus { position: fixed; z-index: 60; width: auto; height: au
    keyboard users while retaining its zoom and focus behavior. */
 .diagram [data-rmiz-btn-zoom] { display: grid; place-items: center; position: absolute; top: .5rem; right: .5rem; width: 2rem; height: 2rem; pointer-events: auto; cursor: zoom-in; background: var(--color-fd-background); color: var(--color-fd-foreground); border: 1px solid var(--color-fd-border); border-radius: .375rem; }
 .diagram [data-rmiz-btn-zoom] svg { width: 1rem; height: 1rem; }
+
+.diagram-source { margin-top: .25rem; }

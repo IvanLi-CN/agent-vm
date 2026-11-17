@@ -1,5 +1,6 @@
 import { useEffect, useId, useState } from 'react';
-import { Accordion, Accordions } from 'fumadocs-ui/components/accordion';
+import { Collapsible, CollapsibleTrigger, CollapsibleContent } from 'fumadocs-ui/components/ui/collapsible';
+import { buttonVariants } from 'fumadocs-ui/components/ui/button';
 import { CodeBlock, Pre } from 'fumadocs-ui/components/codeblock';
 import { ImageZoom } from 'fumadocs-ui/components/image-zoom';
 import { Callout } from 'fumadocs-ui/components/callout';
@@ -62,5 +63,5 @@ export function Mermaid({ code }: { code: string }) {
     });
     return () => { cancelled = true; };
   }, [code, dark, id]);
-  return <figure className="diagram"><div className="diagram-viewport">{image && <ImageZoom key={image.src} src={image.src} width={image.width} height={image.height} data-theme={image.theme} alt="设计流程图" rmiz={{ children: null, a11yNameButtonZoom: '放大图表', a11yNameButtonUnzoom: '关闭图表放大' }}/>}</div><figcaption className="diagram-hint">点击图表放大查看；按 Esc 返回正文。</figcaption>{error && <Callout type="error" role="alert">{error}</Callout>}<Accordions type="single" collapsible><Accordion title="图表源码" value="code"><CodeBlock title="Mermaid"><Pre><code>{code}</code></Pre></CodeBlock></Accordion></Accordions></figure>;
+  return <figure className="diagram"><div className="diagram-viewport">{image && <ImageZoom key={image.src} src={image.src} width={image.width} height={image.height} data-theme={image.theme} alt="设计流程图" rmiz={{ children: null, a11yNameButtonZoom: '放大图表', a11yNameButtonUnzoom: '关闭图表放大' }}/>}</div>{error && <Callout type="error" role="alert">{error}</Callout>}<Collapsible className="diagram-source"><CollapsibleTrigger className={buttonVariants({ variant: 'ghost', size: 'sm' })}>图表源码</CollapsibleTrigger><CollapsibleContent><CodeBlock title="Mermaid"><Pre><code>{code}</code></Pre></CodeBlock></CollapsibleContent></Collapsible></figure>;
 }
