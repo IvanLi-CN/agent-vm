@@ -248,33 +248,27 @@ class ReleasePublisherTests(unittest.TestCase):
             self.assertFalse((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
             marker = target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME
             marker.write_text("{}")
-            for arguments in ([str(target), "version"], [str(target.parent / "sync_worktree.ts"), "--name", "demo"]):
-                process = RELEASE.subprocess.run(
-                    [RELEASE.shutil.which("bun"), "--no-macros", *arguments],
+            environment = {"PATH": os.environ["PATH"], "AGENT_VM_RELEASE_MANIFEST": str(self.root / "absent.json")}
+            def run_client(*arguments):
+                return RELEASE.subprocess.run(
+                    [RELEASE.shutil.which("bun"), "--no-macros", str(target), *arguments],
                     stdout=RELEASE.subprocess.PIPE, stderr=RELEASE.subprocess.PIPE,
-                    timeout=30, cwd="/", env={"PATH": os.environ["PATH"], "AGENT_VM_RELEASE_MANIFEST": str(self.root / "absent.json")},
+                    timeout=30, cwd="/", env=environment,
                 )
-                self.assertEqual(process.returncode, 2, process.stderr.decode())
-                self.assertIn(b"recovery is pending", process.stderr)
+            self.assertEqual(run_client("version").returncode, 0)
+            self.assertEqual(run_client("--help").returncode, 0)
+            process = run_client("doctor")
+            self.assertEqual(process.returncode, 2, process.stderr.decode())
+            self.assertIn(b"recovery is pending", process.stderr)
             marker.unlink()
-            # Both public entrypoints reject the former Python-only sidecar,
-            # even when direct sync would otherwise select a separate CLI.
+            # Runtime identity is independent from the installer-only sidecar.
+            # The standalone bundle verifier must still reject a damaged package.
             del sidecar["client_dependencies"]
             sidecar["client_artifact"].update(name="agent_vm.py", path="agent_vm.py")
             (target.parent / "client-release.json").write_text(json.dumps(sidecar))
-            for arguments in ([str(target), "version"], [str(target.parent / "sync_worktree.ts"), "--name", "demo"]):
-                process = RELEASE.subprocess.run(
-                    [RELEASE.shutil.which("bun"), "--no-macros", *arguments],
-                    stdout=RELEASE.subprocess.PIPE, stderr=RELEASE.subprocess.PIPE,
-                    timeout=30, cwd="/", env={"PATH": os.environ["PATH"]},
-                )
-                self.assertEqual(process.returncode, 2, process.stderr.decode())
-                self.assertTrue(
-                    b"sidecar" in process.stderr
-                    or b"manifest_format_unsupported" in process.stderr
-                    or b"only product release manifest format" in process.stderr,
-                    process.stderr.decode(),
-                )
+            self.assertEqual(run_client("version").returncode, 0)
+            with self.assertRaises(Exception):
+                RELEASE._client_selfcheck(target.parent, manifest["release_id"])
         finally:
             temporary.cleanup()
 
