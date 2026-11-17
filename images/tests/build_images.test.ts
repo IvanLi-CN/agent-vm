@@ -21,13 +21,24 @@ describe("guest image builder", () => {
       expect(text).toContain("architecture: amd64");
       expect(text).toContain("require_fingerprint: true");
       expect(text).toContain("zulu: \"25.0.1\"");
+      expect(text).toContain("maven: \"3.10.1\"");
       expect(text).toContain("postgresql-client-16");
       expect(text).toContain("mysql-client");
       expect(text).toContain("https://nodejs.org/dist/v24.11.1/");
       expect(text).toContain("https://go.dev/dl/go1.25.4.linux-amd64.tar.gz");
       expect(text).toContain("https://static.rust-lang.org/dist/rust-1.91.1-");
+      expect(text).toContain("https://dlcdn.apache.org/maven/maven-3/3.10.1/binaries/apache-maven-3.10.1-bin.tar.gz");
       expect(text).not.toContain("playwright");
     });
+  });
+
+  test("installs Maven only in the Java profile and checks its version", async () => {
+    const language = await Bun.file(join(root, "provisioning/60-language.sh")).text();
+    const readiness = await Bun.file(join(root, "provisioning/50-readiness.sh")).text();
+    expect(language).toContain('download_verify "$MAVEN_URL" "$MAVEN_SHA256" "$work/maven.tar.gz"');
+    expect(language).toContain("/opt/maven");
+    expect(language).toContain("mvn -version");
+    expect(readiness).toContain('mvn -version | grep -F "Apache Maven $MAVEN_VERSION "');
   });
 });
 
