@@ -1488,46 +1488,38 @@ func TestSupportedSchemaAcceptsDurableAuthBeforeCompanionBootstrap(t *testing.T)
 	}
 }
 
-func TestMigrationRejectsUnsupportedSourceSchemaBeforeRemoteWrite(t *testing.T) {
+func TestSQLiteSchemaAcceptsExtensionsAndRejectsMissingCore(t *testing.T) {
 	sourcePath := filepath.Join(t.TempDir(), "source.sqlite3")
 	source, err := OpenForTest(sourcePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := source.Close(); err != nil {
+	defer source.Close()
+	ctx := context.Background()
+	if _, err := source.write.Exec(`CREATE TABLE future_values(value TEXT); INSERT INTO future_values(rowid,value) VALUES(9,'first'),(22,'second'); CREATE TABLE future_keyed(key TEXT PRIMARY KEY, value TEXT GENERATED ALWAYS AS (upper(key)) STORED) WITHOUT ROWID; INSERT INTO future_keyed(key) VALUES('hello')`); err != nil {
 		t.Fatal(err)
 	}
-	db, err := sql.Open("sqlite", sourcePath)
+	if err := requireSQLiteSchema(ctx, source.write); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := snapshotDB(ctx, source.write)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec("CREATE TABLE unsupported_source_state(value TEXT)"); err != nil {
-		db.Close()
+	if len(snapshot.Tables["future_values"].Rows) != 2 {
+		t.Fatal("extension rows lost")
+	}
+	if _, exists := snapshot.Tables["future_values"].Rows["rowid:22"]; !exists {
+		t.Fatal("rowid lost")
+	}
+	if len(snapshot.Tables["future_keyed"].Columns) != 1 {
+		t.Fatal("generated column must not be written")
+	}
+	if _, err := source.write.Exec("DROP TABLE ports"); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	var posts int
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method == http.MethodPost {
-			posts++
-		}
-		writer.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(writer).Encode(remoteResponse{Results: []remoteResult{}})
-	}))
-	defer server.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if err := migrateSQLiteToRQLite(ctx, sourcePath, server.URL, nil, SQLiteMigrationGate{
-		StateWriteFenced:    true,
-		WorkersQuiescent:    true,
-		SQLiteWritersClosed: true,
-	}); err == nil || !strings.Contains(err.Error(), "unsupported object") {
-		t.Fatalf("unsupported source schema error = %v", err)
-	}
-	if posts != 0 {
-		t.Fatalf("unsupported source schema issued %d remote writes", posts)
+	if err := requireSQLiteSchema(ctx, source.write); err == nil {
+		t.Fatal("missing core accepted")
 	}
 }
 
@@ -2147,5 +2139,75 @@ func TestRemoteExistingManagementSchemaBootstrapsImageNames(t *testing.T) {
 	repeated, err := upgraded.ImageCatalogVersion(ctx)
 	if err != nil || repeated != version {
 		t.Fatalf("migration not reentrant: %s != %s: %v", repeated, version, err)
+	}
+}
+
+func TestRemoteCompatibleExtensionsAcrossEpochRefresh(t *testing.T) {
+	endpoint := requireSessionOwnedRQLite(t)
+	ctx := context.Background()
+	old, err := OpenForTest(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	prefix := "future_" + randomHex(6)
+	parent, child, events := prefix+"_zparent", prefix+"_achild", prefix+"_events"
+	statements := []remoteStatement{
+		{query: "CREATE TABLE " + parent + "(id TEXT PRIMARY KEY, computed TEXT GENERATED ALWAYS AS (upper(id)) STORED) WITHOUT ROWID"},
+		{query: "CREATE TABLE " + child + "(id INTEGER PRIMARY KEY, parent TEXT REFERENCES " + parent + "(id))"},
+		{query: "CREATE INDEX " + prefix + "_idx ON " + child + "(parent)"},
+		{query: "CREATE TABLE " + events + "(message TEXT)"},
+		{query: "INSERT INTO " + parent + "(id) VALUES('p')"},
+		{query: "INSERT INTO " + child + "(id,parent) VALUES(1,'p')"},
+		{query: "INSERT INTO " + events + "(rowid,message) VALUES(9,'first'),(22,'second')"},
+		{query: "CREATE TRIGGER " + prefix + "_trigger AFTER INSERT ON " + child + " BEGIN INSERT INTO " + events + "(message) VALUES('inserted'); END"},
+		{query: "UPDATE meta SET value=? WHERE key='state_epoch'", args: []any{newEpoch()}},
+	}
+	if _, err := old.remote.request(ctx, statements, true); err != nil {
+		t.Fatal(err)
+	}
+	// Exercise real business writes through the store opened BEFORE the extension.
+	op := "extension-" + prefix
+	if _, err := old.ClaimOperation(ctx, op, "acquire", nil, nil, map[string]any{"outcome": "success"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.withWrite(ctx, func(tx *Tx) error {
+		if _, err := tx.conn.ExecContext(ctx, "INSERT INTO "+child+"(id,parent) VALUES(2,'p')"); err != nil {
+			return err
+		}
+		tx.changed = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := Open(endpoint, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if err := fresh.withRead(ctx, func(conn *sql.Conn) error {
+		var count int
+		if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM "+events).Scan(&count); err != nil {
+			return err
+		}
+		if count != 3 {
+			return fmt.Errorf("trigger replay or data loss: got %d events", count)
+		}
+		var computed string
+		if err := conn.QueryRowContext(ctx, "SELECT computed FROM "+parent).Scan(&computed); err != nil {
+			return err
+		}
+		if computed != "P" {
+			return fmt.Errorf("generated value %q", computed)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := old.withWrite(ctx, func(tx *Tx) error {
+		_, err := tx.conn.ExecContext(ctx, "INSERT INTO "+child+"(id,parent) VALUES(3,'missing')")
+		return err
+	}); err == nil {
+		t.Fatal("foreign key violation accepted")
 	}
 }

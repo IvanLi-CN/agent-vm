@@ -51,7 +51,7 @@ test("format-4 management manifest requires the Linux product target", () => {
   try {
     const artifacts: Artifact[] = PRODUCT_LINUX_ARTIFACTS.map(([name, relative, role, mode]) => {
       const path = join(root, relative);
-      const content = ["bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"].includes(relative)
+      const content = ["bin/agent-vm-server", "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"].includes(relative)
         ? (() => {
           const bytes = new Uint8Array(20);
           bytes.set([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]);
@@ -78,11 +78,12 @@ test("format-4 management manifest requires the Linux product target", () => {
     ]);
     expect(verify_product_bundle(root, manifest)).toEqual(manifest);
     const historical = structuredClone(manifest);
+    historical.artifacts = historical.artifacts.filter(a => a.path !== "bin/agent-vm-server");
     for (const [name, relative, role, mode] of HISTORICAL_PRODUCT_LINUX_ARTIFACTS.filter(
       ([, path]) => !PRODUCT_LINUX_ARTIFACTS.some(([, currentPath]) => currentPath === path),
     )) {
       const path = join(root, relative);
-      const content = new TextEncoder().encode(`// historical ${relative}\n`);
+      const content = relative.startsWith("bin/") ? Uint8Array.from([0x7f,0x45,0x4c,0x46,2,1,1,0,...Array(10).fill(0),0x3e,0,...Array(42).fill(0)]) : new TextEncoder().encode(`// historical ${relative}\n`);
       const parent = path.slice(0, path.lastIndexOf("/"));
       if (parent !== root) mkdirSync(parent, { recursive: true, mode: 0o755 });
       writeFileSync(path, content, { mode });

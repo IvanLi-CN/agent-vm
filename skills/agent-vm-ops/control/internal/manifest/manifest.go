@@ -98,6 +98,7 @@ type ActionMetadata struct {
 }
 
 type Metadata struct {
+	ServerBinary       string
 	Version            string
 	ReleaseID          string
 	SourceRevision     string
@@ -157,6 +158,25 @@ var historicalProductArtifacts = append(append([]artifactSpec(nil), productArtif
 	artifactSpec{name: "web-assets-manifest", path: "web-assets.manifest.json", role: "support", mode: 0o644},
 )
 
+func consolidatedArtifacts(legacy []artifactSpec) []artifactSpec {
+	result := make([]artifactSpec, 0, len(legacy)-1)
+	for _, a := range legacy {
+		if a.path == "bin/agent-vm-deployd" {
+			continue
+		}
+		if a.path == "bin/agent-vm-control" {
+			a.name = "agent-vm-server"
+			a.path = "bin/agent-vm-server"
+		}
+		result = append(result, a)
+	}
+	return result
+}
+
+var consolidatedGoArtifacts = consolidatedArtifacts(goArtifacts)
+var consolidatedProductArtifacts = consolidatedArtifacts(productArtifacts)
+var consolidatedNativeArtifacts = consolidatedArtifacts(nativeArtifacts)
+
 var fixedArtifacts = goArtifacts
 
 var artifactNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.:@-]{1,120}$`)
@@ -194,6 +214,7 @@ func LoadMetadata(path string) (Metadata, error) {
 	if err != nil {
 		return Metadata{}, err
 	}
+	metadata.ServerBinary = ServerBinary(root)
 	metadata.ManifestPresent = true
 	metadata.ArtifactsVerified = true
 	return metadata, nil
@@ -542,7 +563,7 @@ func validateProductUsing(root map[string]any, verify func([]checkedArtifact) er
 
 func isGoBinaryArtifact(path string) bool {
 	switch path {
-	case "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy":
+	case "bin/agent-vm-server", "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy":
 		return true
 	default:
 		return false
@@ -608,11 +629,11 @@ func validateProductArtifacts(value any, format int64) ([]checkedArtifact, error
 			break
 		}
 	}
-	expectedSets := [][]artifactSpec{productLegacyArtifacts}
+	expectedSets := [][]artifactSpec{productLegacyArtifacts, consolidatedProductArtifacts}
 	if format == ProductFormat {
-		expectedSets = [][]artifactSpec{productArtifacts, historicalProductArtifacts}
+		expectedSets = [][]artifactSpec{consolidatedProductArtifacts, productArtifacts, historicalProductArtifacts}
 		if nativeOnly {
-			expectedSets = [][]artifactSpec{nativeArtifacts}
+			expectedSets = [][]artifactSpec{consolidatedNativeArtifacts, nativeArtifacts}
 		}
 	}
 	var expectedArtifacts []artifactSpec
@@ -725,11 +746,15 @@ type checkedArtifact struct {
 
 func validateArtifacts(value any) ([]checkedArtifact, error) {
 	values, ok := value.([]any)
-	if !ok || len(values) != len(fixedArtifacts) {
+	selected := fixedArtifacts
+	if len(values) == len(consolidatedGoArtifacts) {
+		selected = consolidatedGoArtifacts
+	}
+	if !ok || len(values) != len(selected) {
 		return nil, fmt.Errorf("manifest_artifact_set_invalid: artifact set is incomplete")
 	}
-	expected := make(map[string]artifactSpec, len(fixedArtifacts))
-	for _, artifact := range fixedArtifacts {
+	expected := make(map[string]artifactSpec, len(selected))
+	for _, artifact := range selected {
 		expected[artifact.name+"\x00"+artifact.path] = artifact
 	}
 	seen := make(map[string]bool, len(values))
@@ -940,4 +965,16 @@ func verifyELFHeader(header []byte) error {
 		return fmt.Errorf("binary_arch_mismatch: Go control artifact architecture differs from this binary")
 	}
 	return nil
+}
+
+// ServerBinary selects an executable only from an already validated complete manifest.
+func ServerBinary(root map[string]any) string {
+	if artifacts, ok := root["artifacts"].([]any); ok {
+		for _, raw := range artifacts {
+			if a, ok := raw.(map[string]any); ok && a["path"] == "bin/agent-vm-server" {
+				return "agent-vm-server"
+			}
+		}
+	}
+	return "agent-vm-control"
 }

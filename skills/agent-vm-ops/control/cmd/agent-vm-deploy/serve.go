@@ -16,17 +16,8 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
 )
 
-var version = "agent-vm-deployd/dev"
-
-func main() {
-	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-}
-
-func run(args []string) error {
-	flags := flag.NewFlagSet("agent-vm-deployd", flag.ContinueOnError)
+func runServe(args []string) error {
+	flags := flag.NewFlagSet("agent-vm-deploy serve", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	configPath := flags.String("config", "/etc/agent-vm-native/deployd.json", "deployd configuration path")
 	if err := flags.Parse(args); err != nil {
@@ -37,7 +28,7 @@ func run(args []string) error {
 		return nil
 	}
 	if flags.NArg() != 0 {
-		return errors.New("agent-vm-deployd does not accept positional arguments")
+		return errors.New("agent-vm-deploy serve does not accept positional arguments")
 	}
 	config, err := deployd.Load(*configPath)
 	if err != nil {

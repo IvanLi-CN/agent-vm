@@ -456,7 +456,8 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 		}
 		expected, exists := management[key]
 		if !exists {
-			return fmt.Errorf("database schema contains unsupported object %s", key)
+			// Extensions owned by another compatible release are not a reason to reject state.
+			continue
 		}
 		managementPresent = true
 		if isAuthManagementObject(key) {
@@ -1247,6 +1248,9 @@ func (r *remoteBackend) rebuildMirror(ctx context.Context, objects []remoteSchem
 		}
 	}
 	for _, object := range sortedSchemaObjects(objects) {
+		if object.Type != "table" {
+			continue
+		}
 		if _, err := transaction.ExecContext(ctx, object.SQL); err != nil {
 			return rollback(err)
 		}
@@ -1254,10 +1258,6 @@ func (r *remoteBackend) rebuildMirror(ctx context.Context, objects []remoteSchem
 	if err := transaction.Commit(); err != nil {
 		return err
 	}
-	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
-		return err
-	}
-
 	loadTx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1265,11 +1265,16 @@ func (r *remoteBackend) rebuildMirror(ctx context.Context, objects []remoteSchem
 	tables := orderedTables(objects)
 	queries := make([]string, len(tables))
 	for index, table := range tables {
-		columns := "*"
-		if table == "operations" {
-			columns = "rowid, *"
+		columns, err := tableColumns(ctx, loadTx, table)
+		if err != nil {
+			_ = loadTx.Rollback()
+			return err
 		}
-		queries[index] = "SELECT " + columns + " FROM " + quoteIdentifier(table) + " ORDER BY rowid"
+		names := writableColumnNames(columns)
+		if preserveRowID(table, columns) {
+			names = append([]string{"rowid"}, names...)
+		}
+		queries[index] = "SELECT " + joinIdentifiers(names) + " FROM " + quoteIdentifier(table)
 	}
 	results, err := r.queryBatch(ctx, queries)
 	if err != nil {
@@ -1282,7 +1287,32 @@ func (r *remoteBackend) rebuildMirror(ctx context.Context, objects []remoteSchem
 			return err
 		}
 	}
-	return loadTx.Commit()
+	for _, object := range sortedSchemaObjects(objects) {
+		if object.Type == "table" {
+			continue
+		}
+		if _, err := loadTx.ExecContext(ctx, object.SQL); err != nil {
+			_ = loadTx.Rollback()
+			return err
+		}
+	}
+	rows, err := loadTx.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		_ = loadTx.Rollback()
+		return err
+	}
+	invalid := rows.Next()
+	checkErr := rows.Err()
+	_ = rows.Close()
+	if invalid || checkErr != nil {
+		_ = loadTx.Rollback()
+		return fmt.Errorf("rqlite snapshot violates foreign keys: %v", checkErr)
+	}
+	if err := loadTx.Commit(); err != nil {
+		return err
+	}
+	_, err = conn.ExecContext(ctx, "PRAGMA foreign_keys = ON")
+	return err
 }
 
 func sortedSchemaObjects(objects []remoteSchemaObject) []remoteSchemaObject {
@@ -1337,7 +1367,7 @@ func loadTableResult(ctx context.Context, transaction *sql.Tx, table string, res
 		return err
 	}
 	insertColumns := make([]string, 0, len(columns)+1)
-	if table == "operations" {
+	if preserveRowID(table, columns) {
 		insertColumns = append(insertColumns, "rowid")
 	}
 	for _, column := range columns {
@@ -1357,12 +1387,12 @@ func loadTableResult(ctx context.Context, transaction *sql.Tx, table string, res
 		}
 		args := make([]any, len(row))
 		for index, value := range row {
-			if table == "operations" && index == 0 {
+			if preserveRowID(table, columns) && index == 0 {
 				args[index] = normalizeRemoteRowID(value)
 				continue
 			}
 			columnIndex := index
-			if table == "operations" {
+			if preserveRowID(table, columns) {
 				columnIndex--
 			}
 			args[index] = normalizeRemoteValue(value, columns[columnIndex].Type)
@@ -1549,10 +1579,11 @@ func snapshotConn(ctx context.Context, conn *sql.Conn) (remoteSnapshot, error) {
 		sort.Slice(primaryKey, func(left, right int) bool {
 			return columns[primaryKey[left]].PK < columns[primaryKey[right]].PK
 		})
-		query := "SELECT * FROM " + quoteIdentifier(table)
-		if table == "operations" {
-			query = "SELECT rowid, * FROM " + quoteIdentifier(table)
+		names := append([]string(nil), columnNames...)
+		if preserveRowID(table, columns) {
+			names = append([]string{"rowid"}, names...)
 		}
+		query := "SELECT " + joinIdentifiers(names) + " FROM " + quoteIdentifier(table)
 		rows, err := conn.QueryContext(ctx, query)
 		if err != nil {
 			return remoteSnapshot{}, err
@@ -1590,7 +1621,7 @@ func scanSnapshotRows(rows *sql.Rows, table string, columnCount int, primaryKey 
 			dest[index] = &values[index]
 		}
 		var rowID int64
-		if table == "operations" {
+		if table == "operations" || len(primaryKey) == 0 {
 			if err := rows.Scan(append([]any{&rowID}, dest...)...); err != nil {
 				return nil, err
 			}
@@ -1749,8 +1780,17 @@ func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteS
 			return false, fmt.Errorf("rqlite schema removal is not supported for %s", key)
 		}
 	}
+	// The mirror already evaluated trigger effects. Suspend existing triggers only
+	// inside this request-level transaction, then restore the exact definitions.
+	for _, object := range sortedSchemaObjects(snapshotObjects(before)) {
+		if object.Type == "trigger" {
+			statements = append(statements, remoteStatement{query: "DROP TRIGGER " + quoteIdentifier(object.Name)})
+		}
+	}
 	for _, object := range sortedSchemaObjects(afterObjectsMissing(before.Objects, after.Objects)) {
-		statements = append(statements, remoteStatement{query: object.SQL})
+		if object.Type != "trigger" {
+			statements = append(statements, remoteStatement{query: object.SQL})
+		}
 	}
 	for key, object := range before.Objects {
 		other, exists := after.Objects[key]
@@ -1806,6 +1846,11 @@ func (r *remoteBackend) applySnapshot(ctx context.Context, before, after remoteS
 		},
 		remoteStatement{query: "DELETE FROM meta WHERE key IN (?, ?, ?)", args: []any{guardKey, stateProofKey, authProofKey}},
 	)
+	for _, object := range sortedSchemaObjects(snapshotObjects(after)) {
+		if object.Type == "trigger" {
+			statements = append(statements, remoteStatement{query: object.SQL})
+		}
+	}
 	if _, err := r.request(ctx, statements, true); err != nil {
 		return false, err
 	}
@@ -2732,4 +2777,31 @@ func pristineRemoteTarget(ctx context.Context, snapshot remoteSnapshot) (bool, e
 		}
 	}
 	return true, nil
+}
+
+// table_info omits generated columns, which SQLite computes when rows are loaded.
+func writableColumnNames(columns []remoteColumn) []string {
+	names := make([]string, len(columns))
+	for i, c := range columns {
+		names[i] = c.Name
+	}
+	return names
+}
+func preserveRowID(table string, columns []remoteColumn) bool {
+	if table == "operations" {
+		return true
+	}
+	for _, c := range columns {
+		if c.PK > 0 {
+			return false
+		}
+	}
+	return true
+}
+func snapshotObjects(snapshot remoteSnapshot) []remoteSchemaObject {
+	objects := make([]remoteSchemaObject, 0, len(snapshot.Objects))
+	for _, object := range snapshot.Objects {
+		objects = append(objects, object)
+	}
+	return objects
 }

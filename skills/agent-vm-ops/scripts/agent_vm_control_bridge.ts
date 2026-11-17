@@ -7,7 +7,7 @@ import { runBounded } from "./client-io.ts";
 const MAX_REQUEST_BYTES = 2 * 1024 * 1024;
 const STDOUT_LIMIT = 2 * 1024 * 1024;
 const STDERR_LIMIT = 64 * 1024;
-const DEFAULT_BINARY = "/opt/agent-vm-native/bin/agent-vm-control";
+const DEFAULT_BINARY = "/opt/agent-vm-native/bin/agent-vm-server";
 const DEFAULT_SOCKET = "/run/agent-vm-native/control.sock";
 const ACTIVE_SOCKET = "/var/lib/agent-vm-native/active/app.sock";
 

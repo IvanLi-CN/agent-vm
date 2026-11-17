@@ -140,7 +140,7 @@ class ReleasePublisherTests(unittest.TestCase):
         for name, relative, role, mode in sorted(MANIFEST.GO_FIXED_ARTIFACTS):
             path = extracted / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            if relative in {"bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
+            if relative in {"bin/agent-vm-server", "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
                 path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42)
             elif relative == "systemd/agent-vm-native.service":
                 path.write_bytes((ops_root.parent.parent / "deploy/assets/systemd/agent-vm-native.service").read_bytes())
@@ -179,7 +179,7 @@ class ReleasePublisherTests(unittest.TestCase):
         try:
             self.assertEqual(manifest["format"], 2)
             self.assertEqual(manifest["client_view"]["transport"], "go-request")
-            self.assertTrue((root / "bin/agent-vm-control").is_file())
+            self.assertTrue((root / "bin/agent-vm-server").is_file())
             self.assertTrue(RELEASE.verify_release(bundle)["verified"])
         finally:
             temporary.cleanup()

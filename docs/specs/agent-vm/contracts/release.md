@@ -121,7 +121,7 @@ Cutover 后，rqlite 是唯一 live state authority。 Critical administrator-au
 
 Format 4 client sidecars 使用与 format 3 相同的 exact product identity 和 client-view fields，只是 `format: 4`。它们不携带 server database 的 `state_compatibility` declaration；该 declaration 只属于 complete product release manifest，并由 installer enforce。
 
-Operator 在固定 path `/usr/local/sbin/agent-vm-release-wrapper` 预安装 root-owned narrow wrapper，并提供 protected deployment configuration。 Format 1 使用 `/opt/agent-vm-native/agent_vm_control.ts` 和 `/usr/local/bin/bun`； format 2 安装 `/opt/agent-vm-native/bin/agent-vm-control`、`agent-vm-deployd`、`agent-vm-deploy`、fixed bridge、蓝绿槽位模板和 Deployd unit。 Systemd target directory 固定为 `/etc/systemd/system`，activation fence 固定为 `/run/agent-vm-native/release-activation.fence`； wrapper configuration 不能 redirect 这些 targets。其 fixed actions 是 `stage`、`verify`、`activate`、`rollback` 和 `status`。 Callers 只提供 transaction/release identity 和 structured action； wrapper 不接受 arbitrary destinations、shell commands、configuration paths、state database paths 或 VM paths。
+Operator 在固定 path `/usr/local/sbin/agent-vm-release-wrapper` 预安装 root-owned narrow wrapper，并提供 protected deployment configuration。 Format 1 使用 `/opt/agent-vm-native/agent_vm_control.ts` 和 `/usr/local/bin/bun`； format 2 安装 `/opt/agent-vm-native/bin/agent-vm-server`、`agent-vm-deployd`、`agent-vm-deploy`、fixed bridge、蓝绿槽位模板和 Deployd unit。 Systemd target directory 固定为 `/etc/systemd/system`，activation fence 固定为 `/run/agent-vm-native/release-activation.fence`； wrapper configuration 不能 redirect 这些 targets。其 fixed actions 是 `stage`、`verify`、`activate`、`rollback` 和 `status`。 Callers 只提供 transaction/release identity 和 structured action； wrapper 不接受 arbitrary destinations、shell commands、configuration paths、state database paths 或 VM paths。
 
 `stage` 从 standard input 读取 private bundle，只将 regular files 解包到 transaction staging。它拒绝 absolute 或 parent-traversing names、symlinks、hard links、devices、duplicates 和 oversized members。 `verify` 检查 selected format、exact bytes、regular-file owner 和 mode；不执行 candidate binaries，验证 Go target/toolchain 和 retired-unit set，编译 Python support artifacts，使用固定 `/usr/local/bin/bun` 将 manifest-listed TypeScript 作为 data transpile，验证 fixed systemd unit names 和 canonical bytes，并 enforce selected fixed artifact set。 `activate` 要求 verified transaction 和 admission drain，在 drain check 前创建 fixed activation fence，重新验证 retained current/previous releases，原子保留 current/previous release pointers，安装 complete fixed client package 和 selected control artifacts，并 MAY 运行 `systemctl daemon-reload`；它不停止或禁用 Go service 的 in-process scheduler。 `rollback` 使用相同 artifact 和 systemd checks 验证 previous retained release，拒绝 stale transactions，每个 transaction 最多允许一次 automatic attempt（包括 interrupted activation record），绝不重写 durable lifecycle state、generations 或 uncertain operations。
 
@@ -138,3 +138,9 @@ Activation timeout 为 300 seconds，default poll interval 为 1 second，migrat
 ## 公共与私有记录
 
 Public manifests、tests 和 documents 只包含 relative source paths 和 neutral deployment placeholders。 Live SSH alias、identity、credentials、release root、wrapper configuration、target paths、state database、timer inventory 和 controlled staging observations 都是 operator-owned records，保留在本仓库之外。
+
+## 服务端二进制命名
+
+当前 Linux 产品包采用 `agent-vm-server` 与 `agent-vm-deploy` 两个项目二进制；bootstrap 包也使用新名称。部署守护职责由 `agent-vm-deploy serve` 提供，unit/config/socket 名称不变。format 4 和 protocol 4 的身份不变，`deployment_contract.name` 仍为 `agent-vm-control`。读取器兼容历史完整布局，但不接受新旧布局混搭或缺件；布局选择必须绑定已验证 manifest，不能猜测文件是否存在。
+
+数据库读取不得因为新增未知 schema 对象而整体失败。镜像复制与提交必须保留扩展数据，避免重复触发副作用；回退继续使用共享数据库，不执行降级迁移。已经发布的旧程序不会被新 reader 追溯修复，其自身的 schema 检查行为与历史包路径兼容分别验证。

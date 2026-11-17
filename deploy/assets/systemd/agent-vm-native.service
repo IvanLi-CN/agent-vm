@@ -5,7 +5,7 @@ Wants=incus.service
 
 [Service]
 Type=simple
-ExecStart=/opt/agent-vm-native/bin/agent-vm-control serve --config /etc/agent-vm-native/config.json --manifest /opt/agent-vm-native/release-manifest.json
+ExecStart=/opt/agent-vm-native/bin/agent-vm-server serve --config /etc/agent-vm-native/config.json --manifest /opt/agent-vm-native/release-manifest.json
 Environment=HOME=/var/lib/agent-vm-native
 Restart=on-failure
 RestartSec=2s

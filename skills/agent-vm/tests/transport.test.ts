@@ -197,7 +197,7 @@ test("SSH transport uses the canonical Go request adapter and budgets", async ()
     await f.client.request(action, { session: "transport-test", fields });
     expect(timeoutSeconds(action, fields)).toBe(timeout);
   }
-  expect(f.commands[0].at(-1)).toContain("/opt/agent-vm-native/bin/agent-vm-control request");
+  expect(f.commands[0].at(-1)).toContain("/opt/agent-vm-native/bin/agent-vm-server request");
   expect(budgets).toEqual([600000, 600000, 600000, 240000, 240000]);
   expect(STDOUT_LIMIT).toBe(2097152); expect(STDERR_LIMIT).toBe(65536);
 });
@@ -226,7 +226,7 @@ test("fresh consumer source link runs standalone CLI through fake SSH and preser
   const env = { ...process.env, ...f.env, PATH: bin + ":" + process.env.PATH, CAPTURE: capture };
   const command = [process.execPath, join(linked, "scripts/agent_vm.ts"), "status", "--session-id", "explicit"];
   const good = await runBounded(command, { cwd: f.root, env }); expect(good.code).toBe(0); expect(parseJson(good.stdout.toString()).session_id).toBe("explicit");
-  const seen = JSON.parse(readFileSync(capture, "utf8")); expect(seen.argv.at(-1)).toContain("/opt/agent-vm-native/bin/agent-vm-control request"); expect(seen.request.session_id).toBe("explicit");
+  const seen = JSON.parse(readFileSync(capture, "utf8")); expect(seen.argv.at(-1)).toContain("/opt/agent-vm-native/bin/agent-vm-server request"); expect(seen.request.session_id).toBe("explicit");
   const failed = await runBounded(command, { cwd: f.root, env: { ...env, FAIL: "1" } }); expect(failed.code).toBe(27); expect(failed.stdout.length).toBe(0); expect(failed.stderr.toString()).toContain('"remote_failed"');
 });
 

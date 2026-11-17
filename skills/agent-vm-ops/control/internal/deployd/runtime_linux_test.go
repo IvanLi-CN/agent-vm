@@ -21,6 +21,7 @@ func TestQuiesceHistoricalUnknownIsNotRunningWork(t *testing.T) {
 			root := t.TempDir()
 			cfg := Defaults()
 			cfg.ReleaseRoot = root
+			installLayoutFixture(t, root, "blue", false)
 			cfg.BlueSocket = filepath.Join(root, "app.sock")
 			pid := os.Getpid()
 			script := fmt.Sprintf("#!/bin/sh\ncat <<'PROPERTIES'\nActiveState=active\nSubState=running\nMainPID=%d\nFragmentPath=/etc/systemd/system/agent-vm-native@.service\nControlGroup=/system.slice/agent-vm-native@blue.service\nExecStart={ argv[]=%s/slots/blue/bin/agent-vm-control serve --config /etc/agent-vm-native/slots/blue/config.json --manifest %s/slots/blue/release-manifest.json ; }\nPROPERTIES\n", pid, root, root)

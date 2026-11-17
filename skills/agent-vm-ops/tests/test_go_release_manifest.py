@@ -29,7 +29,7 @@ class GoManifestContractTests(unittest.TestCase):
         for name, path, role, mode in sorted(MANIFEST.GO_FIXED_ARTIFACTS):
             content = (
                 b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42
-                if path in {"bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}
+                if path in {"bin/agent-vm-server", "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}
                 else f"{role}:{path}\n".encode()
             )
             target = self.root / path
@@ -44,6 +44,19 @@ class GoManifestContractTests(unittest.TestCase):
                 "mode": mode,
             })
         self.manifest = MANIFEST.build_go_manifest("b" * 40, artifacts)
+
+    def test_complete_historical_layout_and_invalid_mixed_layout(self) -> None:
+        historical = copy.deepcopy(self.manifest)
+        historical["artifacts"] = [dict(name=name, path=path, role=role, mode=mode, sha256="a" * 64) for name, path, role, mode in MANIFEST.LEGACY_GO_ARTIFACTS]
+        self.assertEqual(MANIFEST.validate_go_manifest(historical), historical)
+        mixed = copy.deepcopy(self.manifest)
+        mixed["artifacts"].append(next(a for a in historical["artifacts"] if a["name"] == "agent-vm-deployd"))
+        with self.assertRaises(MANIFEST.ManifestError):
+            MANIFEST.validate_go_manifest(mixed)
+        incomplete = copy.deepcopy(self.manifest)
+        incomplete["artifacts"].pop()
+        with self.assertRaises(MANIFEST.ManifestError):
+            MANIFEST.validate_go_manifest(incomplete)
 
     def test_format_two_bundle_is_accepted_without_running_binary(self) -> None:
         checked = MANIFEST.verify_go_bundle(self.root, self.manifest)

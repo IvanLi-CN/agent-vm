@@ -1,6 +1,6 @@
 # Agent VM 客户端 CLI 接口
 
-本文特指用户运行的 `agent-vm` 客户端命令行接口，不包含独立部署工具 `agent-vm-deploy`、控制服务 `agent-vm-control serve` 或浏览器管理接口。客户端职责、依赖及审查问题见[客户端设计与审查](../CLIENT.md)，双方共同的请求、响应和恢复边界见[客户端与控制端通信协议](control-protocol.md)。
+本文特指用户运行的 `agent-vm` 客户端命令行接口，不包含独立部署工具 `agent-vm-deploy`、控制服务 `agent-vm-server serve` 或浏览器管理接口。客户端职责、依赖及审查问题见[客户端设计与审查](../CLIENT.md)，双方共同的请求、响应和恢复边界见[客户端与控制端通信协议](control-protocol.md)。
 
 规范入口是 [agent_vm.ts](../../../../skills/agent-vm/scripts/agent_vm.ts)，由已安装的 Bun 直接执行，支持保留相邻模块的源码链接方式。客户端不是常驻服务，不直接运行 Incus，也不自动下载安装运行时。
 
@@ -36,7 +36,7 @@
 
 主机配置选择 SSH 或 HTTPS 传输，认证材料随所选主机配置解析。当前实现仍强制读取发布清单；这是[客户端设计审查](../CLIENT.md#发布信息与运行时通信)指出的耦合问题，不应将清单误当作连接配置。
 
-SSH 控制传输调用远端固定的 Go 请求适配器 `/opt/agent-vm-native/bin/agent-vm-control request`，再由适配器连接受保护的 Unix socket。默认 socket 为 `/run/agent-vm-native/control.sock`；实际路径可以由部署配置指定。旧版清单格式及旧控制入口仅用于历史兼容，其适用范围见[产品发布与部署合同](release.md)。控制服务自己的镜像、存储、网络和数据库配置不属于客户端配置。
+SSH 控制传输调用远端固定的 Go 请求适配器 `/opt/agent-vm-native/bin/agent-vm-server request`，再由适配器连接受保护的 Unix socket。默认 socket 为 `/run/agent-vm-native/control.sock`；实际路径可以由部署配置指定。旧版清单格式及旧控制入口仅用于历史兼容，其适用范围见[产品发布与部署合同](release.md)。控制服务自己的镜像、存储、网络和数据库配置不属于客户端配置。
 
 `agent-vm` 没有 `update` 命令，不安装远端文件，不修改部署配置，也不获得 Incus 或 PVE 运维权限。独立程序 `agent-vm-deploy` 的升级、迁移、事务诊断及回滚规则见[部署控制器合同](deployment-controller.md)和[产品发布与部署合同](release.md)。
 

@@ -1266,7 +1266,8 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 			return fmt.Errorf("persist rollback state: %w; %v", err, fenceErr)
 		}
 	}
-	if err := manager.Runtime.Rollback(ctx, transaction.TargetSlot, transaction.PreviousSlot, lease, previousAuthority); err != nil {
+	rollbackCtx := context.WithValue(ctx, rollbackStartKey{}, func() error { return manager.Store.ConsumeRollbackStart(ctx, transaction.ID) })
+	if err := manager.Runtime.Rollback(rollbackCtx, transaction.TargetSlot, transaction.PreviousSlot, lease, previousAuthority); err != nil {
 		failureErr := manager.failure(ctx, transaction.ID, PhaseRollback, err)
 		fenceErr := manager.fenceSlots(ctx, errors.New("rollback did not reach a verified outcome"))
 		return fmt.Errorf("%w; %v", failureErr, fenceErr)

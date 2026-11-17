@@ -930,7 +930,7 @@ class WrapperTests(unittest.TestCase):
         for name, relative, role, mode in sorted(MANIFEST.GO_FIXED_ARTIFACTS):
             path = extracted / relative
             path.parent.mkdir(parents=True, exist_ok=True)
-            if relative in {"bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
+            if relative in {"bin/agent-vm-server", "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
                 # Minimal little-endian ELF64 header for the amd64 target.
                 path.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42)
             elif relative == "systemd/agent-vm-native.service":

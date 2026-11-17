@@ -186,7 +186,8 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	if err != nil {
 		return report, err
 	}
-	if _, err := manifest.LoadMetadata(filepath.Join(product, "release-manifest.json")); err != nil {
+	metadata, err := manifest.LoadMetadata(filepath.Join(product, "release-manifest.json"))
+	if err != nil {
 		return report, err
 	}
 	binaries := map[string]string{}
@@ -221,7 +222,11 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 			return report, err
 		}
 	}
-	for _, name := range []string{"agent-vm-deployd", "agent-vm-deploy"} {
+	deployBinaries := []string{"agent-vm-deploy"}
+	if metadata.ServerBinary == "agent-vm-control" {
+		deployBinaries = append(deployBinaries, "agent-vm-deployd")
+	}
+	for _, name := range deployBinaries {
 		if report.Mode == "legacy" {
 			continue
 		}
@@ -239,7 +244,11 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		}
 	}
 	for _, unit := range []string{"agent-vm-native@.service", "agent-vm-deployd.service", "agent-vm-rqlite.service", "agent-vm-caddy.service"} {
-		if err := copyInstall(filepath.Join(input.Materials, "assets/systemd", unit), filepath.Join("/etc/systemd/system", unit), 0644, ""); err != nil {
+		source := filepath.Join(input.Materials, "assets/systemd", unit)
+		if unit == "agent-vm-native@.service" || unit == "agent-vm-deployd.service" {
+			source = filepath.Join(product, "systemd", unit)
+		}
+		if err := copyInstall(source, filepath.Join("/etc/systemd/system", unit), 0644, ""); err != nil {
 			return report, err
 		}
 	}

@@ -4,7 +4,7 @@ import { chmodSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 const moduleRoot = resolve(import.meta.dir, "../control");
-const usage = "usage: build_go_control.ts --source-revision <40-hex> --target <linux/amd64|linux/arm64> --output <absolute-path> [--binary <control|deployd|deploy>] [--version <semver>] [--with-web-assets]";
+const usage = "usage: build_go_control.ts --source-revision <40-hex> --target <linux/amd64|linux/arm64> --output <absolute-path> [--binary <server|deploy>] [--version <semver>] [--with-web-assets]";
 const args = process.argv.slice(2);
 const value = (name: string): string => {
   const index = args.indexOf(name);
@@ -26,13 +26,12 @@ const rawOutput = value("--output");
 if (!isAbsolute(rawOutput)) throw new Error("output must be absolute");
 const output = resolve(rawOutput);
 const withWebAssets = args.includes("--with-web-assets");
-const binary = optional("--binary", "control");
+const binary = optional("--binary", "server");
 const packages: Record<string, string> = {
-  control: "./cmd/agent-vm-control",
-  deployd: "./cmd/agent-vm-deployd",
+  server: "./cmd/agent-vm-server",
   deploy: "./cmd/agent-vm-deploy",
 };
-if (!(binary in packages)) throw new Error("binary must be control, deployd, or deploy");
+if (!(binary in packages)) throw new Error("binary must be server or deploy");
 mkdirSync(dirname(output), { recursive: true, mode: 0o750 });
 const temporary = `${output}.tmp-${process.pid}`;
 rmSync(temporary, { force: true });
@@ -43,7 +42,7 @@ const result = Bun.spawnSync(
     "-trimpath",
     "-buildvcs=false",
 	    ...(withWebAssets ? ["-tags=releaseassets"] : []),
-    `-ldflags=-X main.version=agent-vm-${binary === "control" ? "control" : binary}/${version}`,
+    `-ldflags=-X main.version=agent-vm-${binary}/${version}`,
     "-o",
     temporary,
     packages[binary],

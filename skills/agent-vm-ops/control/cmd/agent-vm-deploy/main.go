@@ -34,6 +34,9 @@ func run(args []string) error {
 		fmt.Println(version)
 		return nil
 	}
+	if args[0] == "serve" {
+		return runServe(args[1:])
+	}
 	if args[0] == "install" {
 		return runInstall(args[1:])
 	}

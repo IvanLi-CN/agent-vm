@@ -101,7 +101,7 @@ requireText(rqliteUnit, "-http-key /etc/agent-vm-native/tls/rqlite/server.key", 
 forbidText(rqliteUnit, "0.0.0.0", "rqlite does not bind to all interfaces");
 
 const slotUnit = read(join(assetsRoot, "systemd/agent-vm-native@.service"));
-requireText(slotUnit, "ExecStart=/var/lib/agent-vm-native/slots/%i/bin/agent-vm-control", "slot service executes the atomically staged candidate binary");
+requireText(slotUnit, "ExecStart=/var/lib/agent-vm-native/slots/%i/bin/agent-vm-server", "slot service executes the atomically staged candidate binary");
 requireText(slotUnit, "--manifest /var/lib/agent-vm-native/slots/%i/release-manifest.json", "slot service uses its staged manifest path");
 requireText(slotUnit, "ExecStartPre=/opt/agent-vm-native/bin/agent-vm-deploy wait-authority --slot %i --timeout 55", "slot startup waits for authenticated rqlite strong reads before opening state");
 requireText(slotUnit, "ExecStartPost=/opt/agent-vm-native/bin/agent-vm-deploy wait-process --slot %i --timeout 55", "slot startup waits only for its fenced process interface");
@@ -111,7 +111,7 @@ requireText(slotUnit, "Requires=agent-vm-rqlite.service", "slot service requires
 forbidText(slotUnit, "ExecStart=/usr/bin/caddy", "slot service does not start a second proxy");
 
 const deploydUnit = read(join(assetsRoot, "systemd/agent-vm-deployd.service"));
-requireText(deploydUnit, "ExecStart=/opt/agent-vm-native/bin/agent-vm-deployd --config /etc/agent-vm-native/deployd.json", "Deployd unit starts the fixed daemon and config");
+requireText(deploydUnit, "ExecStart=/opt/agent-vm-native/bin/agent-vm-deploy serve --config /etc/agent-vm-native/deployd.json", "Deployd unit starts the fixed daemon and config");
 requireText(deploydUnit, "ReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native", "Deployd write paths include the state root required for atomic active replacement");
 requireText(deploydUnit, "User=root", "Deployd owns the host deployment boundary");
 forbidText(deploydUnit, "Requires=agent-vm-rqlite.service", "Deployd does not depend on the business state authority");

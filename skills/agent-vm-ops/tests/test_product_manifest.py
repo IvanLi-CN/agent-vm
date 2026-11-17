@@ -87,7 +87,7 @@ class ProductManifestTests(unittest.TestCase):
                 payload = root / path
                 payload.parent.mkdir(parents=True, exist_ok=True)
                 data = b"artifact:" + path.encode()
-                if path in {"bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
+                if path in {"bin/agent-vm-server", "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
                     data = bytearray(20)
                     data[:7] = b"\x7fELF\x02\x01\x01"
                     data[18:20] = (62).to_bytes(2, "little")

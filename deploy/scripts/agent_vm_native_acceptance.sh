@@ -2,7 +2,7 @@
 set -eu
 
 CONTROL_ROOT=/opt/agent-vm-native
-CONTROL="$CONTROL_ROOT/bin/agent-vm-control"
+CONTROL="$CONTROL_ROOT/bin/agent-vm-server"
 BRIDGE="$CONTROL_ROOT/agent_vm_control_bridge.ts"
 CLIENT="$CONTROL_ROOT/agent_vm.ts"
 SOCKET=/run/agent-vm-native/control.sock

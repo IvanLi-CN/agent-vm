@@ -35,3 +35,15 @@ func TestTransactionAcknowledgementAcceptsCurrentAndLegacyEnvelopes(t *testing.T
 		t.Fatal("acknowledgement accepted a mismatched transaction")
 	}
 }
+
+func TestServeDispatchAndLazyCLI(t *testing.T) {
+	if err := run([]string{"version"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := run([]string{"serve", "--config", t.TempDir() + "/missing.json"}); err == nil || !strings.Contains(err.Error(), "deployd config missing") {
+		t.Fatalf("serve dispatch = %v", err)
+	}
+	if err := run([]string{"status", "--socket", t.TempDir() + "/missing.sock", "--timeout", "1"}); err == nil || strings.Contains(err.Error(), "deployd config missing") {
+		t.Fatalf("CLI started daemon resources: %v", err)
+	}
+}

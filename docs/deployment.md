@@ -14,8 +14,14 @@ Agent VM 在已具备 Incus 运行条件的 Linux 控制环境中运行。Caddy 
 
 ## 固定安装布局
 
-Format-2 部署必须同时安装槽位控制服务和槽位外固定控制入口：`/opt/agent-vm-native/bin/agent-vm-control`、`/opt/agent-vm-native/bin/agent-vm-deployd`、`/opt/agent-vm-native/bin/agent-vm-deploy`、`/opt/agent-vm-native/client-release.json`、`/opt/agent-vm-native/release-manifest.json` 及客户端支持文件。槽位目录中的 `agent-vm-control` 只负责蓝绿业务服务，不能替代 `/opt` 下供 SSH request adapter 使用的固定二进制。安装完成后必须逐项检查这些路径；缺失任一项时应保持部署未验收，并使用同一正式 bundle 修复。
+当前服务端包仅提供 `/opt/agent-vm-native/bin/agent-vm-server` 与 `/opt/agent-vm-native/bin/agent-vm-deploy`；后者以 `serve` 子命令运行槽位外部署服务。既有 `agent-vm-deployd.service`、配置和 socket 名称不变，新包没有旧名称别名。历史完整包保留读取能力，槽位按已验证 manifest 选择自己的可执行路径。槽位外的 server request adapter 与槽位业务服务使用各自的 manifest，不可只替换其中一个路径。
 
 ## 验收
 
 检查服务入口、唯一 controller lease、两个槽位观测、新鲜度及 Prometheus 单一 target；还必须在隔离环境验证 VM 创建、执行、续租、释放与销毁。安装、重启和切换记录应能查询原部署事务。缺失数据或结果未知不能视为验收通过，不得通过中断正在使用的生产 VM 来替代隔离验收。
+
+## 命令名称迁移
+
+`agent-vm-control` 的命令改用 `agent-vm-server`；独立 `agent-vm-deployd --config <文件>` 改用 `agent-vm-deploy serve --config <文件>`。本次按维护者明确指定发布 Minor，此命令路径硬切换是兼容性例外，已有脚本及客户端配置中的显式 `remote_request` 必须同步调整。
+
+旧部署管理程序的固定 artifact 校验不会自动认识新布局。因此，首次采用新布局时，运维者须在显式宿主维护中，从同一已验证 Release 更新槽位外部署二进制、固定 request adapter、对应 manifest、unit 和 tmpfiles（创建两个槽位的持久 drop-in 目录），再使用蓝绿更新命令；不能把新包直接交给旧 reader 并期待它自行升级。该步骤使用同一正式版本，不要求额外过渡发布。升级前保留原程序与配置副本；旧管理程序尚在运行或恢复路径尚未准备好时，不删除其文件。生产环境操作必须另行授权。

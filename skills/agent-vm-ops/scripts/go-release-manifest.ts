@@ -4,7 +4,7 @@ import { createHash } from "node:crypto";
 import { lstatSync, readFileSync } from "node:fs";
 import { join, posix } from "node:path";
 
-import { ACTION_NAMES, LEGACY_ACTION_NAMES, CLIENT_TRANSPORTS, default_operations, type ArtifactRole, type ClientTransport, type OperationSpec } from "./release-manifest.ts";
+import { consolidated_artifacts, ACTION_NAMES, LEGACY_ACTION_NAMES, CLIENT_TRANSPORTS, default_operations, type ArtifactRole, type ClientTransport, type OperationSpec } from "./release-manifest.ts";
 import { ControlError, canonical_json, type Data } from "./control-types.ts";
 
 export const GO_MANIFEST_FORMAT = 2;
@@ -26,7 +26,7 @@ export const RETIRED_UNITS = Object.freeze([
 ]);
 
 type ArtifactTuple = readonly [string, string, ArtifactRole, number];
-export const GO_FIXED_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
+export const LEGACY_GO_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["agent_vm.ts", "agent_vm.ts", "client", 0o755],
   ["byte-fs.ts", "byte-fs.ts", "support", 0o644],
   ["client-io.ts", "client-io.ts", "support", 0o644],
@@ -42,6 +42,8 @@ export const GO_FIXED_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["unit:agent-vm-native@.service", "systemd/agent-vm-native@.service", "unit", 0o644],
   ["unit:agent-vm-deployd.service", "systemd/agent-vm-deployd.service", "unit", 0o644],
 ]);
+
+export const GO_FIXED_ARTIFACTS = consolidated_artifacts(LEGACY_GO_ARTIFACTS);
 
 export interface GoArtifact {
   name: string;
@@ -196,11 +198,12 @@ export function validate_go_manifest(value: unknown): GoReleaseManifest {
     if (item.name !== DEPLOYMENT_CONTRACT.name || item.major !== DEPLOYMENT_CONTRACT.major || !Number.isInteger(item.revision) || (item.revision as number) < 1 || canonical_json(item.capabilities) !== canonical_json(DEPLOYMENT_CONTRACT.capabilities)) error("deployment_contract is incompatible");
     deploymentContract = { name: item.name as string, major: item.major as number, revision: item.revision as number, capabilities: [...(item.capabilities as string[])] };
   }
-  if (!Array.isArray(root.artifacts) || root.artifacts.length !== GO_FIXED_ARTIFACTS.length) error("artifact set is incomplete");
+  if (!Array.isArray(root.artifacts) || ![GO_FIXED_ARTIFACTS.length, LEGACY_GO_ARTIFACTS.length].includes(root.artifacts.length)) error("artifact set is incomplete");
   const artifacts = (root.artifacts as unknown[]).map((item, index) => artifact(item, index));
   const actual = artifacts.map((item): ArtifactTuple => [item.name, item.path, item.role, item.mode]).sort((a: ArtifactTuple, b: ArtifactTuple) => canonical_json(a).localeCompare(canonical_json(b)));
   const expected = [...GO_FIXED_ARTIFACTS].sort((a, b) => canonical_json(a).localeCompare(canonical_json(b)));
-  if (canonical_json(actual) !== canonical_json(expected)) error("artifact set differs from the fixed Go release allowlist");
+  const legacyExpected = [...LEGACY_GO_ARTIFACTS].sort((a, b) => canonical_json(a).localeCompare(canonical_json(b)));
+  if (canonical_json(actual) !== canonical_json(expected) && canonical_json(actual) !== canonical_json(legacyExpected)) error("artifact set differs from the fixed Go release allowlist");
   const actions = operationMap(root.actions);
   const view = root.client_view;
   if (!view || typeof view !== "object" || Array.isArray(view) || Object.keys(view).sort().join(",") !== "actions,protocol,release_id,source_revision,transport") error("client_view has an unexpected shape");
@@ -222,7 +225,7 @@ export function verify_go_bundle(root: string, manifest: unknown): GoReleaseMani
     if ((info.mode & 0o7777) !== item.mode) throw new GoManifestError("artifact_mode_mismatch", `artifact mode differs: ${item.path}`);
     const digest = createHash("sha256").update(readFileSync(path)).digest("hex");
     if (digest !== item.sha256) throw new GoManifestError("artifact_checksum_mismatch", `artifact checksum differs: ${item.path}`);
-    if (["bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"].includes(item.path)) verifyElfTarget(path, checked.target);
+    if (["bin/agent-vm-server", "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"].includes(item.path)) verifyElfTarget(path, checked.target);
   }
   return checked;
 }
