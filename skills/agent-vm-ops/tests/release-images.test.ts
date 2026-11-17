@@ -23,16 +23,24 @@ test("guest image publication is manual and waits for the parallel build matrix"
 
   expect(release.on.pull_request).toBeUndefined();
   expect(release.on.workflow_dispatch).toBeDefined();
+  expect(release.on.workflow_dispatch.inputs.confirm_immutable_releases.type).toBe("boolean");
+  expect(release.on.workflow_dispatch.inputs.confirm_immutable_releases.required).toBe(true);
+  expect(release.on.workflow_dispatch.inputs.confirm_immutable_releases.default).toBe(false);
   expect(release.jobs["validate-dispatch"]).toBeDefined();
+  expect(release.jobs["validate-dispatch"].steps.some((step: { run?: string }) => step.run?.includes("IMMUTABLE_RELEASES_CONFIRMED"))).toBe(true);
   expect(release.jobs["build-images"].needs).toBe("validate-dispatch");
   expect(release.jobs.publish.steps.some((step: { name?: string }) => step.name === "Require protected main dispatch")).toBe(true);
   expect(release.jobs["build-images"].uses).toBe("./.github/workflows/image-preview.yml");
   expect(release.jobs.publish.needs).toBe("build-images");
-  expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes("gh release edit"))).toBe(true);
-  expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes("gh release upload") && step.run?.includes("--clobber"))).toBe(true);
-  expect(read(".github/workflows/image-release.yml")).toContain("immutable-releases");
+  expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes("releases/${IMAGE_RELEASE_ID}") && step.run?.includes("draft=false"))).toBe(true);
+  expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes("make_latest=false"))).toBe(true);
+  expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes("releases/${IMAGE_RELEASE_ID}/assets") && step.run?.includes("--method POST"))).toBe(true);
   expect(read(".github/workflows/image-release.yml")).toContain("verify_release_assets.py");
+  expect(read(".github/workflows/image-release.yml")).toContain("releases?per_page=100");
+  expect(read(".github/workflows/image-release.yml")).toContain("IMAGE_RELEASE_ID");
   expect(read(".github/workflows/image-release.yml")).toContain("IMAGE_RELEASE_ALREADY_PUBLISHED");
+  expect(read(".github/workflows/image-release.yml")).toContain("verify_assets.py");
+  expect(read(".github/workflows/image-release.yml")).toContain("Revalidate draft immediately before publication");
   expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes('= "33"'))).toBe(true);
 
   expect(preview.on.pull_request).toBeDefined();
