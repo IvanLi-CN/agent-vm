@@ -17,6 +17,8 @@ The initialization baseline is intentionally narrow:
 
 Leaving the project-level aggregate process quota unset prevents stopped cache instances from consuming a second, implicit process budget. The profile-level process limit remains the per-instance protection. This does not increase the control service's logical CPU or memory ceilings.
 
+容器内运行 Incus 时，先按[嵌套权限手册](../../../deploy/docs/nested-incus.md)检查外层有效 UID/GID、内层 subordinate ID 授权、helper 和安全能力，并独立验收声明支持的 guest 模式。此初始化器不会检查或修改 `security.privileged`、`security.nesting`、`security.idmap.*`、`raw.idmap` 或 `/etc/subuid`、`/etc/subgid`；`aligned` 只表示本文列出的配额基线一致，不代表非特权嵌套可用。
+
 ## Preconditions
 
 Use this procedure only for an explicitly authorized infrastructure task.
@@ -24,7 +26,7 @@ Use this procedure only for an explicitly authorized infrastructure task.
 1. Read the configured control alias from the protected deployment configuration. Do not copy the alias, address or credentials into this repository.
 2. Run `agent-vm doctor`, `agent-vm admin status`, `agent-vm admin session list` and `ssh -G <configured-control-alias>`.
 3. Inspect the exact Incus project and profile identities, native service health, pending operations and current task leases.
-4. Enter maintenance drain with `agent-vm admin drain enter`. Wait for effective leases and pending transitions to converge before applying policy changes.
+4. 按[维护 drain 与恢复](../../../deploy/docs/maintenance.md)确认没有活动发布或未知 owner，使用本次唯一的 `release-maintenance-<unique-id>` 会话执行 `agent-vm --session-id <该会话> admin drain enter`。保存同一会话直到退出；普通会话进入成功不保证其有权退出。等待有效租约和 pending transition 收敛后才能应用策略修改。
 5. Keep a protected maintenance record of the preview output and the operator, time and deployment identity.
 
 Do not combine initialization with broad reconcile, garbage collection, instance deletion, image replacement, network changes, storage changes or state-database edits.
@@ -58,7 +60,7 @@ After successful verification:
 
 1. Re-run the initializer without `--apply`; it must report `aligned` with no actions.
 2. Re-run `agent-vm doctor` and `agent-vm admin metrics`; confirm admission is ready and drain is still the only expected maintenance state.
-3. Exit drain with `agent-vm admin drain exit` only after service health, reconciliation, expiry/GC and storage admission checks are sound.
+3. 只有 service health、reconciliation、expiry/GC 和 storage admission 检查通过后，才按维护手册用原 owner 会话执行 `agent-vm --session-id <原会话> admin drain exit`；立即确认 `draining=false`、完整一致的 task 观测及活动槽位 traffic 已恢复。退出失败时保留原身份和证据，不能直接修改数据库或覆盖他人的 drain。
 4. Keep the preview, apply result and post-check evidence in protected operations records, not in the repository.
 
 This procedure does not repair historical failed or closing task journals. Reconcile those records only as a separately authorized operation with an exact identity and evidence review.

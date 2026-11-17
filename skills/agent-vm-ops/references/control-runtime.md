@@ -24,6 +24,8 @@ Native file lock 在独立进程之间保持可见。 Session-scoped lifecycle l
 
 Fake Incus 和 guest-command 场景在不改变基础设施的情况下验证 controller 行为。使用真实 flock、SQLite、procfs、subprocess tree 和 pipe 的 Linux 测试验证隔离的 native OS 行为；Agent VM 检查还会验证 systemd 和 nested Incus system container，且不要求 KVM。可复现的 `scripts/agent_vm_native_acceptance.sh` runner 还会检查已安装的 format-2 bundle、systemd activation、直接 UDS 和 Bun bridge 请求、native-worker cleanup 以及 nested Incus system container。 Nested 路径使用 `security.nesting=true` 的 Incus system container，不要求 `/dev/kvm` 或 QEMU。只有在候选 bundle 安装完成后，才能在已授权的会话 Agent VM 内运行它。
 
+该 runner 的 `incus init` 会继承默认 profile，未显式设置 `security.privileged=false`；通过结果只能证明其实际生效的权限模式。非特权嵌套的范围、subordinate ID 授权及 Docker 验收必须按[嵌套权限手册](../../../deploy/docs/nested-incus.md)另外执行，保存 expanded config 和实际映射，不能用继承特权 profile 的结果替代。
+
 在 source checkout 中、确保宿主机提供 Bun 和 Python 后运行以下聚焦验收套件：
 
 ```bash

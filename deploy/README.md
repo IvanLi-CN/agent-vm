@@ -4,6 +4,8 @@
 
 从[简明部署指南](../docs/deployment.md)开始阅读；全新环境的输入准备、预检、安装与重试见[首次安装步骤](docs/install.md)。槽位布局、角色隔离、状态迁移、观测和恢复细节见[蓝绿部署手册](docs/blue-green.md)。长期约束由[Agent VM 规范](../docs/specs/agent-vm/SPEC.md)及其合同定义。
 
+容器内运行 Incus 的权限前置条件与独立验证步骤见[嵌套权限手册](docs/nested-incus.md)；获授权维护的暂停、owner 会话及准入恢复见[维护手册](docs/maintenance.md)。
+
 ## 目录
 
 - `assets/systemd/`：服务与兼容定时器资源。

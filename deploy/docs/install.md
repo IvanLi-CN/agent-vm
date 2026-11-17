@@ -6,6 +6,8 @@
 
 控制环境必须已经运行 systemd 和 Incus，并具备专属项目、profile、网络、network ACL、存储池及已验证的容器镜像。安装器只读取和校验这些条件，不安装 Incus，不改动 PVE、CT 权限、挂载或配额。域名、OIDC 应用及回调地址须事先注册，提供对应 TLS 证书。缺失条件会汇总为预检阻塞项。
 
+嵌套控制环境还须按[权限准备手册](nested-incus.md)验证 UID/GID 范围、subordinate ID 授权、helper 权限和目标 guest 模式。安装器的 Incus 检查只确认项目、profile、网络、存储池和镜像可查询，不启动测试 guest，也不校验嵌套映射覆盖关系。项目/profile 初始化器的 `aligned` 同样不包含权限验收。声明支持非特权 guest 时，应保存显式 `security.privileged=false` 的启动和 Docker 实证，不能用特权 profile 的成功替代。权限准备缺失时，先完成获授权的环境维护，不能把安装预检无阻塞解释为所有运行前提均已满足。
+
 准备相同 `source_revision` 的 Linux 产品 tar 包和部署资料目录。产品包必须同时包含槽位控制服务 `bin/agent-vm-control`、槽位外控制器 `bin/agent-vm-deployd`、部署 CLI `bin/agent-vm-deploy`、format-2 客户端支持文件、`release-manifest.json` 和 systemd 资源；资料目录包含 `materials-manifest.json`。安装完成后，`/opt/agent-vm-native/bin/agent-vm-control` 是本机固定 request adapter 的必需文件，不能只安装两个 Deployd 二进制或只把控制服务放在 `/var/lib/agent-vm-native/slots/*/bin/`。执行发布方提供的摘要校验后，将制品放入 root 拥有且其他用户不可写的目录。不要通过运行未验证的二进制来代替摘要校验。匹配资料的生成方法见 [资料入口](../README.md)。
 
 ```sh

@@ -179,7 +179,7 @@ Transport timeout 或 `outcome: pending` 表示 native effect 不确定，绝不
   不得静默忽略 pending operation、generation mismatch、unknown resource、partial resize 或 cleanup transition。
 - 已恢复 generation 的必需 timer 和 expiry/reconciliation behavior 已验证，不能用猜测的 host 或 storage provenance 替代缺失证据。
 
-只有这样，获授权的运维者才能运行 `agent-vm admin drain exit`，并立即重复 `agent-vm doctor` 和 `agent-vm admin status`。
+只有这样，获授权的运维者才能按[维护 drain 与恢复](../../../deploy/docs/maintenance.md)以原 owner 会话运行 `agent-vm admin drain exit`，并立即重复 `agent-vm doctor` 和 `agent-vm admin status`。当前控制器要求退出会话以 `release-` 开头并匹配保存的 owner；独立维护应在进入时就保存唯一的 `release-maintenance-<unique-id>`，不能假定普通会话可自行退出。发布事务持有的 drain 必须由原事务恢复；来源不明或 owner 冲突时不得换名接管。退出后还要确认 Deployd 观测新鲜一致、活动槽位 `traffic_accepting=true` 且 `draining=false`。
 任何检查失败都必须保持 admission drained。
 `admin gc --apply`、`destroy`、cache deletion 或大范围 port/conntrack cleanup 都不能替代 state recovery。
 
