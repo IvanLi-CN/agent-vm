@@ -72,7 +72,7 @@ async function incus(argv: string[], capture = false, allowFailure = false) {
 async function digest(path: string) { const hash = createHash("sha256"); for await (const chunk of createReadStream(path)) hash.update(chunk); return hash.digest("hex"); }
 const imageRoot = join(root, "images");
 const read = (name: string) => readFileSync(join(imageRoot, "provisioning", name), "utf8");
-const base = read("00-base.sh"), docker = read("30-docker.sh"), language = read("60-language.sh");
+const base = read("00-base.sh"), docker = read("30-docker.sh"), language = read("60-language.sh"), seal = read("70-seal.sh");
 const aptInstaller = read("10-apt-lock.py");
 const readiness = read("40-ssh-readiness.sh") + "\n" + read("45-docker-readiness.sh") + "\n" + read("50-readiness.sh");
 const header = `set -euo pipefail\nexport DEBIAN_FRONTEND=noninteractive\ncat > /root/.agent-vm-apt-lock.json <<'APTLOCK'\n${aptText}\nAPTLOCK\ncat > /root/.agent-vm-apt-install.py <<'APTINSTALL'\n${aptInstaller}\nAPTINSTALL\n` + Object.entries(lock.versions).map(([key, value]) => `${key.toUpperCase()}_VERSION='${value}'\n`).join("") + Object.entries(lock.downloads).map(([key, item]) => `${key.toUpperCase()}_URL='${item.url}'\n${key.toUpperCase()}_SHA256='${item.sha256}'\n`).join("");
@@ -121,7 +121,7 @@ async function buildMode(mode: string) {
     try {
       await init(commonAlias, name, mode); created = true;
       await incus(["start", name]);
-      await provision(name, `${header}IMAGE_PROFILE=${profile}\n${language}\n${readiness}\n`);
+      await provision(name, `${header}IMAGE_PROFILE=${profile}\n${language}\n${readiness}\n${seal}\n`);
       for (const [guestFile, suffix] of [["readiness.json", "readiness.json"], ["sbom.json", "sbom.json"]]) {
         await incus(["file", "pull", `${name}/etc/agent-vm-image/${guestFile}`, join(output, `${asset}.${suffix}`)]);
       }

@@ -24,7 +24,7 @@ bun run images:build -- --all
 
 每个镜像输出 `.tar.gz`、`.manifest.json`、`.sbom.json` 和 `.readiness.json`，总清单 `agent-vm-ubuntu24-SHA256SUMS` 覆盖全部文件。manifest 包含源码修订、lock 摘要、不可变镜像 fingerprint 和运行配置。SBOM 列出实际 Debian 包库存；语言/Node/Bun 二进制的版本、来源与摘要由 manifest 和锁补充。
 
-Docker 验收使用 Ubuntu 的 busybox-static 创建本地 scratch 镜像，执行多层 build、删除文件、root/非 root run、Compose、DNS/HTTP、命名卷持久化和 daemon 重启。固定经典 overlay2 后端，避免新安装的 containerd snapshotter 默认值改变合同；只重启本次拥有的可丢弃 guest 的 Docker。导出的镜像仍须在最终环境完成实际 SSH 登录检查，不能仅凭服务 active 判定成功。
+Docker 验收使用 Ubuntu 的 busybox-static 创建本地 scratch 镜像，执行多层 build、删除文件、root/非 root run、Compose、DNS/HTTP、命名卷持久化和 daemon 重启。固定经典 overlay2 后端，避免新安装的 containerd snapshotter 默认值改变合同；只重启本次拥有的可丢弃 guest 的 Docker。导出前移除构建期 SSH host key 和 machine-id，配置 systemd 在首次启动时重新生成 host key。导出的镜像仍须在最终环境完成实际 SSH 登录检查，不能仅凭服务 active 判定成功。
 
 ## 管理端验收
 

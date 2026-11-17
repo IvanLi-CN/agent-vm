@@ -293,7 +293,7 @@ TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输
 
 提供 Ubuntu 24.04 amd64 的 Rust、Java、Go 三个语言镜像族，每族包含 privileged 和 unprivileged 两种 nested Docker 运行变体。一条命令构建全部六个产物；按模式复用公共工具层，再安装已锁定的官方语言二进制，不在构建宿主编译工具链。镜像包含 OpenSSH、Bun、Node.js、guest 内 Docker daemon/Compose、PG/MySQL 客户端和系统工具，不预装浏览器自动化依赖。
 
-版本锁固定基础 fingerprint、官方二进制 URL/SHA256 及 Ubuntu/Docker APT 包的版本/SHA256。缺少锁、下载不可用或摘要不匹配必须失败，不得浮动升级或切换权限模式。相同锁固定输入与软件版本；SSH host key、文件时间和压缩元数据不构成逐字节可重复构建保证。每个产物输出 unified tar、manifest、SBOM、readiness 报告和 SHA256SUMS；manifest 记录构建源码修订、运行模式和不可变镜像指纹。两种模式均须实际验证 Docker build/run、Compose、网络、卷持久化、daemon 重启及 ed25519 SSH。
+版本锁固定基础 fingerprint、官方二进制 URL/SHA256 及 Ubuntu/Docker APT 包的版本/SHA256。缺少锁、下载不可用或摘要不匹配必须失败，不得浮动升级或切换权限模式。相同锁固定输入与软件版本；SSH host key、文件时间和压缩元数据不构成逐字节可重复构建保证。每个产物输出 unified tar、manifest、SBOM、readiness 报告和 SHA256SUMS；manifest 记录构建源码修订、运行模式和不可变镜像指纹。公开产物不得携带构建期 SSH 私钥或机器身份，首次启动必须在 SSH 服务之前重新生成 host key。两种模式均须实际验证 Docker build/run、Compose、网络、卷持久化、daemon 重启及 ed25519 SSH。
 
 管理端验收按配置的 lifecycle profile 复制特权、nesting、UID/GID 映射和 mknod/setxattr interception 白名单，不继承生产设备、网络或凭据。版本资产在 GitHub Release 独立发布，部署地址和实际库存不进入仓库。新镜像在目标服务器下载校验、登记并通过同模式验收后才能成为默认值；导入失败时默认值和已有会话 fingerprint 不变。旧裸镜像退役后仅保留已有引用。
 
