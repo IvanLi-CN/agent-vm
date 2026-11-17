@@ -17,12 +17,12 @@ a[href='#nd-page']:focus { position: fixed; z-index: 60; width: auto; height: au
 .document-list p { color: var(--color-fd-muted-foreground); font-size: .875rem; }
 .document-source { font-size: .75rem; color: var(--color-fd-muted-foreground); }
 .diagram { min-width: 0; max-width: 100%; margin: 1.5rem 0; }
-.diagram-viewport { max-width: 100%; overflow: auto; }
+.diagram-viewport { max-width: 100%; overflow: auto; padding: 1rem; border: 1px solid var(--color-fd-border); border-radius: .75rem; background: var(--color-fd-background); }
 .diagram-viewport:focus-visible { outline: 2px solid var(--color-fd-ring); outline-offset: 3px; }
 .diagram-viewport svg { min-width: 36rem; height: auto; }
-.diagram-hint { display: none; color: var(--color-fd-muted-foreground); font-size: .75rem; }
+.diagram-viewport[data-view="overview"] svg { width: 100% !important; min-width: 0; }
+.diagram-hint { margin-top: .5rem; color: var(--color-fd-muted-foreground); font-size: .75rem; }
 .site-footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--color-fd-border); color: var(--color-fd-muted-foreground); font-size: .75rem; }
 .source-line { display: block; min-height: 1.5em; }
 .source-line.selected { background: var(--color-fd-accent); }
 .source-line::before { content: attr(data-line-number); display: inline-block; width: 4em; user-select: none; color: var(--color-fd-muted-foreground); }
-@media (max-width: 767px) { .diagram-hint { display: block; } }

@@ -6,3 +6,7 @@ export default meta;
 type Story = StoryObj<typeof meta>;
 export const ContentFlow: Story = { args: { code: 'flowchart LR\n  A[原始文档] --> B[内容适配] --> C[文档页面]' }, play: async ({ canvasElement }) => { const canvas = within(canvasElement); await userEvent.click(canvas.getByRole('button', { name: '图表源码' })); await expect(await canvas.findByText(/flowchart LR/)).toBeVisible(); } };
 export const InvalidSyntax: Story = { args: { code: 'not-a-valid-diagram' } };
+
+// Use the actual source diagram so the wide production case stays represented.
+import architecture from '../../../docs/architecture/system.md?raw';
+export const Architecture: Story = { args: { code: architecture.split('```mermaid\n')[1].split('```')[0] } };
