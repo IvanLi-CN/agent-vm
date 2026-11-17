@@ -108,6 +108,7 @@ async function provision(name: string, script: string) {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 async function remove(name: string) { await incus(["delete", name, "--force"]); }
+const sealedBoot = `timeout 90 bash -c 'until test -s /etc/ssh/ssh_host_ed25519_key.pub && (systemctl is-active --quiet ssh || systemctl is-active --quiet ssh.socket); do sleep 1; done'\n`;
 async function verifyPublished(image: string, mode: string, profile: string, report: string) {
   const name = `avm-ready-${profile}-${mode}-${crypto.randomUUID().slice(0, 8)}`;
   let created = false;
@@ -115,8 +116,7 @@ async function verifyPublished(image: string, mode: string, profile: string, rep
     await init(image, name, mode); created = true;
     await incus(["start", name]);
     // Observe autonomous first-boot key generation before making any SSH request.
-    const boot = `timeout 90 bash -c 'until test -s /etc/ssh/ssh_host_ed25519_key.pub && (systemctl is-active --quiet ssh || systemctl is-active --quiet ssh.socket); do sleep 1; done'\n`;
-    await provision(name, `${header}IMAGE_PROFILE=${profile}\n${boot}${readiness}\n`);
+    await provision(name, `${header}IMAGE_PROFILE=${profile}\n${sealedBoot}${readiness}\n`);
     await incus(["file", "pull", `${name}/etc/agent-vm-image/readiness.json`, report]);
   } finally { if (created) await remove(name); }
 }
@@ -148,7 +148,7 @@ async function buildMode(mode: string) {
     try {
       await init(commonAlias, name, mode); created = true;
       await incus(["start", name]);
-      await provision(name, `${header}IMAGE_PROFILE=${profile}\n${language}\n${readiness}\n${seal}\n`);
+      await provision(name, `${header}IMAGE_PROFILE=${profile}\n${sealedBoot}${language}\n${readiness}\n${seal}\n`);
       for (const [guestFile, suffix] of [["readiness.json", "readiness.json"], ["sbom.json", "sbom.json"]]) {
         await incus(["file", "pull", `${name}/etc/agent-vm-image/${guestFile}`, join(output, `${asset}.${suffix}`)]);
       }

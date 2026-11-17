@@ -53,6 +53,8 @@ if args[:2]==["file","push"]:
  assert script.startswith("set -euo pipefail"+chr(10)), "missing real newline"
  assert "docker build --network=none" in script
  assert "systemctl restart docker" in script
+ if "avm-build-common-" not in args[3]:
+  assert script.index("timeout 90 bash") < script.index("verify_ssh()"), "sealed guest validation raced first boot"
  subprocess.run(["bash","-n",args[2]],check=True)
 if args[:2]==["file","pull"]:
  with open(args[3],"w") as f:f.write('{"ready":true}')
