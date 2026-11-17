@@ -181,11 +181,53 @@ jobs:
           role: heavy
           publish: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && job.status == 'success' }}
 
+  documentation:
+    name: PR documentation validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.12.0
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+      - name: Check content and types
+        run: bun run docs:check
+      - name: Source and trace tests
+        run: bun test docs-site/content
+      - name: Static documentation build
+        run: bun run docs:build
+      - name: Build isolated component gallery
+        run: bun run --cwd docs-site build:storybook
+      - name: Install Chromium
+        run: bunx playwright install --with-deps chromium
+      - name: Documentation browser tests
+        env:
+          DOCS_PORT: 22860
+          DOCS_STORYBOOK_PORT: 22861
+        run: bun run docs:test:e2e
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: documentation-preview
+          path: |
+            docs-site/build/client
+            docs-site/.generated/*.json
+            docs-site/test-results
+            docs-site/playwright-report
+            docs-site/storybook-static
+
   pr-gate:
     name: PR gate
     needs:
       - validation
       - heavy
+      - documentation
     if: always()
     strategy:
       matrix:

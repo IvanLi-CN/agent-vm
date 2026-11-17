@@ -1,0 +1,3 @@
+import {Link} from 'react-router';
+import data from '../data';
+export default function Home(){return <><p className="eyebrow">AGENT VM / DESIGN REVIEW</p><h1>让设计关系清楚可查</h1><p className="lead">阅读本次文档站设计，沿需求查看设计依据和验收方法。</p><p>这是候选设计的审阅入口。关联存在，代表材料可追溯；实现与实际验收以各自证据为准。</p><Link className="primary" to="/review">开始审阅 {data.requirements.length} 项需求 →</Link><section><h2>从哪里开始</h2><p><Link to="/docs/0">需求与验收合同</Link>定义本阶段要完成什么。</p><p><Link to="/docs/5">技术方案</Link>解释单源接入和独立工程组织。</p><p><Link to="/docs/1">实现覆盖</Link>说明已经存在的能力和验证缺口。</p><p><Link to="/review/examples">检查关联异常示例</Link>，了解缺口和损坏引用如何呈现。</p></section></>}

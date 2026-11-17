@@ -38,3 +38,12 @@ release-state/
 test-results/
 web/dist-demo/
 web/storybook-static/
+
+# Independent documentation build inputs and artifacts.
+docs-site/.generated/
+docs-site/.source/
+docs-site/.react-router/
+docs-site/storybook-static/
+docs-site/public/assets/sources/
+docs-site/test-results/
+docs-site/playwright-report/
