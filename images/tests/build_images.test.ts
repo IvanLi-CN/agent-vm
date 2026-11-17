@@ -37,13 +37,15 @@ test("builds both runtime variants with separate commands and artifacts", () => 
   try {
     const log = join(temp, "commands.jsonl");
     writeFileSync(join(temp, "incus"), `#!/usr/bin/env python3
-import hashlib,json,os,sys,subprocess
+import hashlib,json,os,sys,subprocess,time
 args=sys.argv[1:]
 if "--project" in args:
  i=args.index("--project");del args[i:i+2]
 with open(os.environ["IMAGE_TEST_LOG"],"a") as f:f.write(json.dumps(args)+"\\n")
 if args[:2]==["image","info"]:sys.exit(1)
-if os.environ.get("IMAGE_TEST_FAIL_START")=="1" and args[0]=="start":sys.exit(42)
+if os.environ.get("IMAGE_TEST_FAIL_START")=="1" and args[0]=="start":
+ if "unprivileged" in args[1]:time.sleep(0.3)
+ sys.exit(42)
 if args[:2]==["file","push"]:
  with open(args[2]) as f:script=f.read()
  assert script.startswith("set -euo pipefail"+chr(10)), "missing real newline"
@@ -89,6 +91,14 @@ if args[:2]==["image","export"]:
     expect(failedCommands.some(args => args[0] === "publish")).toBe(false);
     expect(failedCommands.some(args => args[0] === "delete")).toBe(true);
     expect(readdirSync(join(temp, "failure-output"))).toHaveLength(0);
+    const concurrentLog = join(temp, "concurrent-failure.jsonl");
+    const concurrent = Bun.spawnSync([process.execPath, builder, "--all"], {
+      env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, IMAGE_TEST_LOG: concurrentLog, IMAGE_TEST_FAIL_START: "1", AGENT_VM_IMAGE_OUTPUT: join(temp, "concurrent-output") }, stdout: "pipe", stderr: "pipe",
+    });
+    expect(concurrent.exitCode).not.toBe(0);
+    const concurrentCommands = readFileSync(concurrentLog, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
+    expect(concurrentCommands.filter(args => args[0] === "delete")).toHaveLength(2);
+    expect(concurrentCommands.some(args => args[0] === "publish")).toBe(false);
   } finally { rmSync(temp, { recursive: true, force: true }); }
 });
 

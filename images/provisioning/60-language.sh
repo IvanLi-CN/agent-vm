@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
-work=$(mktemp -d)
+work=$(mktemp -d /root/agent-vm-language.XXXXXX)
 trap 'rm -r -- "$work"' EXIT
 download_verify() {
-  curl --retry 3 --connect-timeout 30 -fsSL "$1" -o "$3"
+  host="${1#https://}"; host="${host%%/*}"
+  timeout 60 bash -c 'until getent ahostsv4 "$1" >/dev/null; do sleep 1; done' -- "$host"
+  curl --retry 3 --connect-timeout 30 --max-time 600 -fsSL "$1" -o "$3"
   printf '%s  %s\n' "$2" "$3" | sha256sum -c -
 }
 case "$IMAGE_PROFILE" in

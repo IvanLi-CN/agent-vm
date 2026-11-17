@@ -80,7 +80,7 @@ const checksums: string[] = [];
 const commonProfile = lock.profiles.base!;
 const packages = Array.isArray(commonProfile) ? commonProfile : commonProfile.packages;
 async function init(image: string, name: string, mode: string) {
-  await incus(["init", image, name, "--no-profiles", "--storage", pool, "--network", network, ...Object.entries(runtimeConfig(mode)).flatMap(([key, value]) => ["--config", `${key}=${value}`]), "--config", "limits.cpu=2", "--config", "limits.memory=2GiB"]);
+  await incus(["init", image, name, "--no-profiles", "--storage", pool, "--network", network, ...Object.entries(runtimeConfig(mode)).flatMap(([key, value]) => ["--config", `${key}=${value}`]), "--config", "limits.cpu=2", "--config", "limits.memory=2GiB", "--config", `user.agent-vm.image-build=${sourceRevision}`]);
 }
 async function provision(name: string, script: string) {
   const dir = mkdtempSync("/tmp/agent-vm-image-script-");
@@ -142,5 +142,7 @@ async function buildMode(mode: string) {
     }
   }
 }
-await Promise.all(variants.map(buildMode));
+const outcomes = await Promise.allSettled(variants.map(buildMode));
+const failures = outcomes.filter((outcome): outcome is PromiseRejectedResult => outcome.status === "rejected");
+if (failures.length) throw new AggregateError(failures.map(outcome => outcome.reason), "image builds failed after all owned workers cleaned up");
 writeFileSync(join(output, "agent-vm-ubuntu24-SHA256SUMS"), checksums.sort().join("\n") + "\n");
