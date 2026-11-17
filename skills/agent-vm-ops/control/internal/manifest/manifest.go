@@ -16,6 +16,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 )
 
 const (
@@ -42,12 +44,25 @@ var stateCapabilityMarkers = []string{
 	"token-revocation@1",
 }
 
-var actionNames = []string{
-	"acquire", "admin-gc", "admin-metrics", "admin-reconcile", "admin-reconcile-session", "admin-reconcile-history", "admin-session-list", "admin-status",
-	"destroy", "doctor", "drain-enter", "drain-exit", "drain-status", "port-add", "port-list",
-	"port-remove", "release", "renew", "resize", "restart", "ssh-info", "status", "timer-age-gc",
-	"timer-expire", "timer-reconcile",
-}
+var actionNames = func() []string {
+	names := make([]string, 0, len(protocol.Actions))
+	for action := range protocol.Actions {
+		names = append(names, action)
+	}
+	sort.Strings(names)
+	return names
+}()
+
+// Supported releases before image selection retain their original capability set.
+var historicalActionNames = func() []string {
+	names := make([]string, 0, len(actionNames)-1)
+	for _, action := range actionNames {
+		if action != "image-list" {
+			names = append(names, action)
+		}
+	}
+	return names
+}()
 
 var retiredUnits = []string{
 	"agent-vm-native-age-gc.service",
@@ -752,10 +767,10 @@ func validateArtifacts(value any) ([]checkedArtifact, error) {
 
 func validateOperationMap(value any, label string) error {
 	object, ok := value.(map[string]any)
-	if !ok || !sameKeys(object, actionNames) {
+	if !ok || (!sameKeys(object, actionNames) && !sameKeys(object, historicalActionNames)) {
 		return fmt.Errorf("manifest_action_set_invalid: %s differs from the fixed control surface", label)
 	}
-	for _, action := range actionNames {
+	for action := range object {
 		item, ok := object[action].(map[string]any)
 		if !ok || !sameKeys(item, []string{"client_to_control", "control_to_client", "request", "response"}) {
 			return fmt.Errorf("manifest_invalid: %s.%s shape is invalid", label, action)

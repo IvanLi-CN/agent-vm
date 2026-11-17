@@ -243,7 +243,7 @@ export async function listImages(query = "", cursor?: string): Promise<{ items: 
   if (useRealApi) return realRequest(`/images?limit=25${query ? `&q=${encodeURIComponent(query)}` : ""}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
   const normalized = query.toLowerCase();
   const state = mockStateForRequest();
-  const items = state.images.filter((image) => !normalized || `${image.version_label} ${image.fingerprint}`.toLowerCase().includes(normalized));
+  const items = state.images.filter((image) => !normalized || `${image.name??""} ${image.version_label} ${image.fingerprint}`.toLowerCase().includes(normalized));
   return delay({ items, page: { limit: 25, next_cursor: null }, default_fingerprint: state.images.find((image) => image.is_default)?.fingerprint ?? null, selection_version: state.image_selection_version, catalog_version: state.image_catalog_version });
 }
 
@@ -747,4 +747,27 @@ function continueMockUploadOperation(operationId: string): Operation {
 
 function createMockAudit(operation: Operation): void {
   mockState.audits.unshift({ event_id: createOperationId(), operation_id: operation.operation_id, action: operation.action, actor: operation.actor, reason: operation.reason, target: operation.target, outcome: operation.status === "succeeded" ? "succeeded" : operation.status === "failed" ? "failed" : operation.status === "outcome_unknown" ? "outcome_unknown" : "accepted", phase: operation.phase, occurred_at: operation.updated_at, safe_code: operation.error?.code ?? null });
+}
+
+export async function previewImageName(fingerprint: string, name: string | null, targetVersion: string): Promise<ActionPreview> {
+ if (useRealApi) return realRequest(`/images/${encodeURIComponent(fingerprint)}/name/preview`, {method:"POST",body:JSON.stringify({name,target_version:targetVersion})});
+ const state=mockStateForRequest(); const image=state.images.find(image=>image.fingerprint===fingerprint);
+ if (!image) throw new ManagementRequestError("image_not_found","precondition");
+ if (targetVersion!==state.image_catalog_version) throw new ManagementRequestError("stale_target","precondition");
+ if (image.name && name!==null && image.name!==name) throw new ManagementRequestError("image_name_conflict","precondition");
+ const previous=name===null?image:state.images.find(image=>image.name===name);
+ return delay({target_version:targetVersion,confirmation_token:createOperationId(),expires_at:new Date(Date.now()+60_000).toISOString(),impact:{summary_code:"image_name",affected_session_count:0,affected_image_references:{default:0,active:0,cached:0,releasing:0,pending_creation:0,verification:0},changes:[{code:"previous_fingerprint",count:null,value:previous?.fingerprint??null},{code:"new_fingerprint",count:null,value:name===null?null:fingerprint}]}});
+}
+
+export async function submitImageName(fingerprint: string, name: string | null, reason: string, preview: ActionPreview, operationId: string): Promise<Operation> {
+ const body={name,reason,target_version:preview.target_version,operation_id:operationId,confirmation_token:preview.confirmation_token};
+ if(useRealApi) return realRequest(`/images/${encodeURIComponent(fingerprint)}/name`,{method:"POST",body:JSON.stringify(body)});
+ assertMockMutationAllowed();const state=getMockState();
+ const prior=state.operations.find(operation=>operation.operation_id===operationId);if(prior)return delay(cloneOperation(prior));
+ if(state.image_catalog_version!==preview.target_version)throw new ManagementRequestError("stale_target","precondition");
+ const image=state.images.find(image=>image.fingerprint===fingerprint);if(!image)throw new ManagementRequestError("image_not_found","precondition");
+ if(image.name && name!==null && image.name!==name)throw new ManagementRequestError("image_name_conflict","precondition");
+ if(name!==null){const previous=state.images.find(image=>image.name===name);if(previous)previous.name=null;}
+ image.name=name;state.image_catalog_version=advanceMockVersion(state.image_catalog_version,operationId);
+ const operation=createMockOperation("image_name",{kind:"image",id:fingerprint},reason,"succeeded",operationId);createMockAudit(operation);return delay(cloneOperation(operation));
 }

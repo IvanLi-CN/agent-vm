@@ -229,11 +229,11 @@ test.skipIf(!LINUX)("an independent expiry closes access while another real cont
   }
 }, 20000);
 
-test("client fails closed when the current release sidecar is absent", async () => {
+test("client reaches transport without a release sidecar", async () => {
   const f = new Fixture();
   const { Client } = await import("../../agent-vm/scripts/client.ts");
-  const client = new Client({ ...process.env, AGENT_VM_RELEASE_MANIFEST: join(f.root, "absent.json") }, async () => { throw new Error("remote request must not run"); }, () => {});
+  const client = new Client({ ...process.env, AGENT_VM_RELEASE_MANIFEST: join(f.root, "absent.json") }, async () => { throw new Error("transport reached without sidecar"); }, () => {});
   try {
-    await expect(client.request("status", { session: "transport-smoke" })).rejects.toMatchObject({ code: "manifest_missing" });
+    await expect(client.request("status", { session: "transport-smoke" })).rejects.toThrow("transport reached without sidecar");
   } finally { f.close(); }
 });

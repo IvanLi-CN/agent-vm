@@ -4,7 +4,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isIPv4 } from "node:net";
 import { randomUUID } from "node:crypto";
 import { CliError, Data, fail, record, integer, json, parseJson, equal, sha256, readJson, durable, fsyncDir, privateDir, Runner, runBounded, shellJoin, inherited } from "./client-io.ts";
-import { PROTOCOL, capability, loadRelease, responseMetadata } from "./client-release.ts";
+import { PROTOCOL, capability, runtimeRelease, assertInstallationReady, responseMetadata } from "./client-release.ts";
 import { nativeCapabilities } from "./sync-native.ts";
 
 export const STDOUT_LIMIT = 2 * 1024 * 1024, STDERR_LIMIT = 64 * 1024;
@@ -105,7 +105,7 @@ export function sessionId(explicit?: string, required = true, env = process.env)
   if (!/^[A-Za-z0-9_.:@/-]{1,160}$/.test(value)) fail("invalid_session", "AGENT_VM_SESSION_ID contains unsupported characters");
   return value;
 }
-const deterministic = new Set("artifact_checksum_mismatch artifact_missing artifact_mode_mismatch artifact_path_invalid artifact_unverified bundle_invalid cache_ineligible config_invalid config_missing compatibility_action_mismatch compatibility_invalid capacity_insufficient client_sidecar_invalid draining generation_mismatch invalid_request maintenance_unhealthy manifest_action_unsupported manifest_format_unsupported manifest_invalid manifest_missing manifest_path_invalid manifest_self_reference manifest_unverified operation_conflict protocol_mismatch protocol_unsupported request_schema_incompatible request_semantic_incompatible response_schema_incompatible response_semantic_incompatible resource_insufficient resource_pressure resource_budget_invalid resource_unverified lease_window_short task_missing task_not_active unknown_action".split(" "));
+const deterministic = new Set("image_conflict image_not_found image_unavailable image_name_invalid artifact_checksum_mismatch artifact_missing artifact_mode_mismatch artifact_path_invalid artifact_unverified bundle_invalid cache_ineligible config_invalid config_missing compatibility_action_mismatch compatibility_invalid capacity_insufficient client_sidecar_invalid draining generation_mismatch invalid_request maintenance_unhealthy manifest_action_unsupported manifest_format_unsupported manifest_invalid manifest_missing manifest_path_invalid manifest_self_reference manifest_unverified operation_conflict protocol_mismatch protocol_unsupported request_schema_incompatible request_semantic_incompatible response_schema_incompatible response_semantic_incompatible resource_insufficient resource_pressure resource_budget_invalid resource_unverified lease_window_short task_missing task_not_active unknown_action".split(" "));
 export function uncertain(error: Data, action: string): boolean {
   const d = error.detail;
   if (error.code === "sqlite_unavailable") return !record(d) || d.state_committed !== false;
@@ -386,8 +386,10 @@ export class Client {
     const { session, generation, write = false, operationId, fields = {} } = options;
     if (write && session === null) fail("missing_session", "AGENT_VM_SESSION_ID is required");
     let request: Data = { protocol: PROTOCOL, action, ...(session === null ? {} : { session_id: session }), ...(generation === undefined ? {} : { generation }), ...(write ? { operation_id: operationId || randomUUID() } : {}), ...fields };
-    const [metadata, warnings] = loadRelease(this.sidecar);
+    assertInstallationReady(this.sidecar);
+    const metadata = runtimeRelease(), warnings: Data[] = [];
     request.compatibility = capability(action, metadata);
+    if (action === "acquire" && fields.image !== undefined) request.compatibility.request = { schema: 1, semantic_revision: 2 };
     const selectedTransport = this.env.AGENT_VM_TRANSPORT ?? metadata.transport;
     if (selectedTransport !== "https" && selectedTransport !== "go-request" && selectedTransport !== "ssh") fail("release_metadata_invalid", "release metadata must select go-request or https transport");
     const https = selectedTransport === "https" ? httpsConfig(this.env) : undefined;
@@ -439,6 +441,10 @@ export class Client {
     if ("generation" in request && !equal(response.generation, request.generation)) fail("protocol_mismatch", "response generation differs");
     if ("operation_id" in request && response.operation_id !== request.operation_id) fail("protocol_mismatch", "operation identity differs");
     responseMetadata(response, request, warnings);
+    if (action === "acquire" && fields.image !== undefined) {
+      const fingerprint = response.result?.image_fingerprint;
+      if (typeof fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(fingerprint) || (/^[a-f0-9]{64}$/.test(String(fields.image)) && fingerprint !== fields.image)) fail("invalid_remote_response", "control did not verify the selected image fingerprint", detail);
+    }
     const safeResponse = secret === undefined ? response : redactSecret(response, secret);
     if (op) this.finalize(op, request, { outcome: "success", response: safeResponse });
     return safeResponse;

@@ -31,7 +31,7 @@ var Actions = map[string]struct{}{
 	"admin-session-list": {}, "admin-status": {}, "destroy": {}, "doctor": {},
 	"drain-enter": {}, "drain-exit": {}, "drain-status": {}, "port-add": {},
 	"port-list": {}, "port-remove": {}, "release": {}, "renew": {}, "resize": {},
-	"restart": {}, "ssh-info": {}, "status": {}, "timer-age-gc": {},
+	"restart": {}, "ssh-info": {}, "status": {}, "image-list": {}, "timer-age-gc": {},
 	"timer-expire": {}, "timer-reconcile": {},
 }
 
@@ -452,6 +452,18 @@ func ValidateRequest(request Request) *Error {
 	}
 	if _, ok := Actions[action]; !ok {
 		return NewError("unknown_action", "unknown action: "+action, nil)
+	}
+	if image, exists := request["image"]; exists {
+		value, valid := image.(string)
+		if action != "acquire" || !valid || strings.TrimSpace(value) == "" {
+			return NewError("invalid_request", "image is only valid as a non-empty acquire selector", nil)
+		}
+		compatibility, _ := request["compatibility"].(map[string]any)
+		declaration, _ := compatibility["request"].(map[string]any)
+		revision, valid := integer(declaration["semantic_revision"])
+		if !valid || revision != 2 {
+			return NewError("compatibility_invalid", "explicit image requires acquire semantic revision 2", nil)
+		}
 	}
 	if session, exists := request["session_id"]; exists {
 		if value, ok := session.(string); !ok || !SessionIDPattern.MatchString(value) {

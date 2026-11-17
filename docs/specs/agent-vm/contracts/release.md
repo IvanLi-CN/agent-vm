@@ -1,6 +1,6 @@
 # Agent VM 产品发布与部署合同
 
-本文覆盖客户端与控制环境的发布产物、校验、安装和部署边界；它不是客户端运行设计。客户端职责见[客户端设计与审查](../CLIENT.md)，用户命令见[客户端 CLI 接口](cli.md)，协议语义见[通信协议](control-protocol.md)。`client-release.json` 的产物校验用途与当前客户端运行时强制读取它的行为应分别审查，不能由发布合同自动推导出核心命令必须依赖 Git 或发布清单。
+本文覆盖客户端与控制环境的发布产物、校验、安装和部署边界；它不是客户端运行设计。客户端职责见[客户端设计与审查](../CLIENT.md)，用户命令见[客户端 CLI 接口](cli.md)，协议语义见[通信协议](control-protocol.md)。`client-release.json` 用于发布和安装时的产物校验；客户端核心命令使用源码中的协议与能力声明，不读取该清单、不散列自身文件，也不要求 Git。正式打包向源码注入可验证的来源身份，直接使用源码时如实报告开发或未知身份。
 
 本文定义 Agent VM 客户端和控制环境的人工发布边界。它不是公共的 `agent-vm` 生命周期命令，也不授予 PVE、宿主机管理器、Incus 策略 API、guest 或 HTTP 网关的访问权限。产品发布完成的标志是经过验证的 GitHub Release 及其版本化安装包；部署是独立且必须显式触发的操作。 GitHub Actions 发布与恢复 workflow 使用 GitHub Actions 内置 token 完成产品发布所需的最小 GitHub API 操作；管理员级 branch protection/ruleset 审计属于独立的 operator audit，不是产品发布的凭据前置条件。发布 workflow 不得依赖自定义的高权限平台 token。启用 GitHub Immutable Releases 是发布前置条件。GitHub 只对启用设置后的 future releases 施加 immutable 保护；因此审计会保留并标识启用前的 legacy mutable release history，但只有在 repository-level immutable enforcement 已启用且当前新 release 发布后验证为 `immutable=true` 时才允许继续发布。蓝绿设计使用两个完整的 Agent VM 服务槽位、一个稳定的 Caddy 入口，以及一个位于槽位之外、供运维者使用的 `agent-vm-deployd` 控制器。它不增加公共路由、Web/BFF、公共 native 生命周期服务或公共发布封装器；下文的 format-1/2 封装器仅作为旧版兼容路径保留。
 
@@ -13,6 +13,8 @@ Client product package 使用 `release-manifest.json` format 3 和一个 product
 `release_id` 不是第二个 product version。它是 legacy protocol-4 peer capability field，仍然是 Git SHA；绝不能填入 SemVer product version。 Format 1 仍是 read-only legacy input，format 2 是 native deployment 和 rollback format，format 3 是 read-only product/rollback input，management-enabled production builders 写入 format 4。
 
 安装有效 format-3 或 format-4 sidecar 时，client 打印 package SemVer； development 或没有 product version 的 legacy installations 打印 `dev`。 Go control response 对 format-3 和 format-4 product manifests 包含 `version`，同时保留 SHA-derived `release_id` 和 `source_revision` compatibility fields。
+
+Format 1 兼容桥接包保持原有动作与语义窗口，不宣称支持镜像列表或显式镜像选择。现代 Go 和产品发布包从客户端源码合同生成完整能力声明。Go 启动校验必须接受包含 `image-list` 的现代完整动作集合，并保留此前不含该动作的完整集合；读取旧清单不会补写或升级其兼容窗口。构建器与实际 Go 清单消费端之间必须有回归验证。
 
 ## 发布清单
 
@@ -97,7 +99,7 @@ Format-4 manifest 声明：
 
 Installer 在改变 active pointers 或启动 services 前执行 candidate package 的 preflight check。 Rollback preflight 对 rollback target 执行同样的 comparison。 Compatible rollback 恢复完整的 earlier product package，并继续使用同一 database。 Incompatible target 必须在 activation 或 service start 前拒绝； current package 保持 selected，admission 保持 drained，等待 operator recovery。 Installer 绝不丢弃 capability markers、downgrade schema、recreate database，或让 older process 针对其无法 read/write 的 state 启动。 Post-migration health failure 不能绕过该 check。
 
-Client 只读取 local sidecar client view。 Legacy format 1/2 sidecars 具有 exact top-level fields `format`、`release_id`、`source_revision`、`protocol`、`client_artifact`、`client_dependencies` 和 `client_view`； format 3 将 product identity portion 替换为 `format`、`version`、`source_revision`、`protocol`、`client_artifact`、`client_dependencies` 和 `client_view`。 `client_artifact` 以 role `client` 标识 `agent_vm.ts`； `client_dependencies` 以 role `support` 列出其他七个 fixed client files。每个 entry 恰好有 `name`、`path`、`role`、`sha256` 和 `mode`，sidecar 旁只允许 basename-only paths。 Missing、duplicate、extra 或 changed dependencies 必须在 SSH 前失败。 View 包含 complete fixed action set 和 explicit request/response compatibility windows。 Missing sidecar 选择 explicit `legacy-protocol-4` capability 并返回 structured warning，不会静默声称 current release。 Present 但 malformed、path-invalid、mode-invalid 或 checksum-invalid 的 sidecar fail closed，包括 old Python-only sidecar。不同 revisions 间的 compatible action 成功时返回 top-level warning，write-operation replay 保留该 warning。
+客户端运行时不读取发布 sidecar，也不校验自身源文件摘要。sidecar 属于发布及安装完整性校验材料：校验工具验证身份、固定文件集合、路径、权限和摘要，损坏或缺失材料不得通过完整包安装；明确的安装中断标记仍在远端请求前阻断客户端。未知来源的客户端使用 `legacy-protocol-4` 互操作标识并发送源码中的完整兼容能力，不伪造发布身份。兼容窗口不匹配仍须拒绝请求；不同来源的兼容请求可返回版本警告，写操作重放保留服务端提供的警告。保留的 Bun 和 Go 清单读取入口接受完整的历史 25 动作集合或当前 26 动作集合，逐项保留输入声明的窗口，不向旧清单补充镜像能力。
 
 ### SQLite 到 rqlite 迁移
 

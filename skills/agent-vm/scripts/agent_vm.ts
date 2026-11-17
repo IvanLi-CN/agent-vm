@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import { resolve, join } from "node:path";
 import { Client, attachDiagnosis, inherited, sessionId } from "./client.ts";
 import { CliError, Data, fail, integer, json, readJson, shellJoin } from "./client-io.ts";
-import { PROTOCOL, VERSION, loadRelease } from "./client-release.ts";
+import { PROTOCOL, VERSION, runtimeRelease } from "./client-release.ts";
 import { sync, SyncFailure } from "./sync_worktree.ts";
 import { validName } from "./guest-source.ts";
 import { applyHostSelection, ensureConfig, loadHostConfig, resolveHost, configPath, setDefaultHost, bindProject, writeHostConfig } from "./host-config.ts";
@@ -16,13 +16,14 @@ Commands: version, help, doctor, status, acquire, renew, release, destroy, resta
   download SOURCE DESTINATION, export PATH, port add|list|remove,
   admin status|metrics|session list|drain enter|status|exit|reconcile|reconcile-session|gc.
 Scoped reconciliation: --session-id ID --task-id ID --generation N --pending-operation-id ID [--apply].
+Image selection: acquire --image NAME_OR_FULL_FINGERPRINT; image list.
 Mutation options: --operation-id ID. Resource options: --cpu N --memory SIZE --disk SIZE.
 Resize: --live (memory only) or --allow-restart. Use COMMAND --help for options.
 Recovery errors include bounded status guidance; add --explain to a session mutation or reconciliation command for a bounded metrics summary and read-only recovery preview.
 `;
 const paths: Record<string, string[]> = {
-  version: [], help: [], doctor: [], status: [],
-  acquire: ["ssh-host-port", "cpu", "memory", "disk", "operation-id", "explain"],
+  version: [], help: [], doctor: [], status: [], "image list": [],
+  acquire: ["image", "ssh-host-port", "cpu", "memory", "disk", "operation-id", "explain"],
   renew: ["operation-id", "explain"], release: ["operation-id", "explain"], destroy: ["operation-id", "explain"], restart: ["operation-id", "explain"],
   resize: ["cpu", "memory", "disk", "live", "allow-restart", "operation-id", "explain"],
   "ssh-info": ["format"], ssh: [], exec: [], sync: ["name"], upload: [], download: [], export: [],
@@ -73,8 +74,8 @@ export function parseSize(value: string, memory: boolean): number | bigint {
 export async function dispatch(args: Args, client = new Client(), native = inherited): Promise<Data | string | number> {
   const { command: cmd, options: o, positional: pos, rest } = args;
   if (cmd === "help") return HELP;
-  if (cmd === "short-version") { const [release] = loadRelease(client.sidecar); return `agent-vm ${release.version ?? VERSION}\n`; }
-  if (cmd === "version") { const [release, warnings] = loadRelease(client.sidecar); return { version: release.version ?? VERSION, protocol: PROTOCOL, release, warnings }; }
+  if (cmd === "short-version") { const release = runtimeRelease(); return `agent-vm ${release.version ?? VERSION}\n`; }
+  if (cmd === "version") { const release = runtimeRelease(), warnings: Data[] = []; return { version: release.version ?? VERSION, protocol: PROTOCOL, release, warnings }; }
   if (cmd === "config init") return { path: ensureConfig(client.env) };
   if (cmd === "config list") { const config = loadHostConfig(client.env); return { path: configPath(client.env), default_host: config.default_host ?? null, hosts: Object.fromEntries(Object.entries(config.hosts).map(([alias, profile]) => [alias, { transport: profile.transport, control_host: profile.control_host, ca_file: profile.ca_file ?? null, token_env: profile.token_env ?? null, token_file: profile.token_file ? "present" : null }])), projects: config.projects }; }
   if (cmd === "config host set-default") return { path: setDefaultHost(pos[0], client.env), default_host: pos[0] };
@@ -87,6 +88,7 @@ export async function dispatch(args: Args, client = new Client(), native = inher
   }
   let selection = resolveHost(typeof o.host === "string" ? o.host : undefined, client.env);
   applyHostSelection(selection, client.env);
+  if (cmd === "image list") { if (o["session-id"] !== undefined) fail("invalid_request", "image list does not accept --session-id"); return client.request("image-list", { session: null }); }
   if (cmd === "admin metrics") { if (o["session-id"] !== undefined) fail("invalid_request", "admin metrics does not accept --session-id"); return client.request("admin-metrics", { session: null }); }
   const session = sessionId(o["session-id"], !["doctor", "admin metrics"].includes(cmd), client.env);
   if (session && typeof o.host !== "string" && cmd !== "acquire") {
@@ -123,7 +125,7 @@ export async function dispatch(args: Args, client = new Client(), native = inher
     }
     let response: Data;
     try {
-      response = await mutate(cmd, { public_key: publicKey, ...resources(), ...(o["ssh-host-port"] === undefined ? {} : { ssh_host_port: o["ssh-host-port"] }) }, generation, acquireOperationId);
+      response = await mutate(cmd, { public_key: publicKey, ...resources(), ...(o.image === undefined ? {} : { image: o.image }), ...(o["ssh-host-port"] === undefined ? {} : { ssh_host_port: o["ssh-host-port"] }) }, generation, acquireOperationId);
     } catch (error) {
       let diagnosis;
       try { diagnosis = await attachDiagnosis(error, client, session!, acquireOperationId, !!o.explain); } catch { diagnosis = error; }

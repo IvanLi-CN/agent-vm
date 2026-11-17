@@ -1023,13 +1023,9 @@ func (s *Store) GetOperation(ctx context.Context, operationID string) (*Operatio
 // ClaimOperation atomically inserts the pending journal intent or returns the
 // already durable record. This is the database fence for retries that race or
 // arrive after a service restart.
-func (s *Store) ClaimOperation(ctx context.Context, operationID, action string, sessionID *string, generation *int64, response map[string]any) (*Operation, error) {
-	raw, err := json.Marshal(response)
-	if err != nil {
-		return nil, err
-	}
+func (s *Store) ClaimOperation(ctx context.Context, operationID, action string, sessionID *string, generation *int64, response map[string]any, selections ...AcquireImageSelection) (*Operation, error) {
 	var existing *Operation
-	err = s.withWrite(ctx, func(tx *Tx) error {
+	err := s.withWrite(ctx, func(tx *Tx) error {
 		current, scanErr := scanOperation(ctx, tx.conn, operationID)
 		if scanErr == nil {
 			existing = current
@@ -1037,6 +1033,15 @@ func (s *Store) ClaimOperation(ctx context.Context, operationID, action string, 
 		}
 		if !errors.Is(scanErr, sql.ErrNoRows) {
 			return scanErr
+		}
+		if action == "acquire" && len(selections) > 0 {
+			if err := pinAcquireImage(ctx, tx, sessionID, response, selections[0]); err != nil {
+				return err
+			}
+		}
+		raw, err := json.Marshal(response)
+		if err != nil {
+			return err
 		}
 		_, insertErr := tx.exec("INSERT INTO operations(operation_id, action, session_id, generation, response_json, created_at) VALUES(?, ?, ?, ?, ?, ?)", operationID, action, nullableStringArg(sessionID), nullableIntArg(generation), string(raw), time.Now().UTC().Format(time.RFC3339Nano))
 		return insertErr
@@ -1070,7 +1075,7 @@ func (s *Store) RecordOperation(ctx context.Context, operationID, action string,
 					return err
 				}
 			}
-			for _, evidenceKey := range []string{"_worker_recovery_evidence", "_worker_rearm_recovery_evidence", "_recovery_attempts"} {
+			for _, evidenceKey := range []string{"_image_fingerprint", "_worker_recovery_evidence", "_worker_rearm_recovery_evidence", "_recovery_attempts"} {
 				if evidence, exists := current.Response[evidenceKey]; exists {
 					if incoming, supplied := response[evidenceKey]; supplied {
 						previousJSON, previousErr := json.Marshal(evidence)

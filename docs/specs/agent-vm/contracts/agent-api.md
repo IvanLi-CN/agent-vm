@@ -40,3 +40,5 @@ The Agent API returns a structured state-backend failure during migration. The l
 The release manifest declares per-action request, response and semantic compatibility for `legacy-bun`, `go-request` and direct HTTPS transport. During the blue-green window, both slots must accept their shared protocol-4 compatibility set and the active release must retain the previous verified package for at least one hour of static-resource/API compatibility. SSH remains a compatibility transport while the declared window is open; it is not a second control authority.
 
 The direct HTTPS transport does not alter session selection, generation, operation identity, journal ordering, image binding, lease or native-worker recovery rules. An incompatible transport or action is rejected before durable or native effects, and a release that cannot read/write the shared state capabilities is not eligible for activation or rollback.
+
+`image-list` 需要 `agent:read`，属于无会话的镜像选择目录；普通 Token 不得调用管理 API 修改镜像名称。显式镜像创建仍需要 `agent:operate`。

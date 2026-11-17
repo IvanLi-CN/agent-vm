@@ -112,7 +112,7 @@ export function ActionDialog({ preview, actionLabel, target, onCancel, onConfirm
       <div className="dialog-heading"><div className={`dialog-icon ${dangerous ? "danger" : ""}`} aria-hidden="true">{dangerous ? <AlertTriangle /> : <ShieldCheck />}</div><div><h2 id="action-dialog-title">{t("vms.actionConfirm", { action: actionLabel })}</h2><p>{target}</p></div></div>
       <div className="dialog-target-row"><span>{t("dialog.preview")}</span><span className="mono">{preview.target_version}</span></div>
       <div className="impact-grid"><div><span>{t("dialog.impactSessions")}</span><strong>{preview.impact.affected_session_count}</strong></div><div><span>{t("dialog.impactRefs")}</span><strong>{Object.values(preview.impact.affected_image_references).reduce((total, value) => total + value, 0)}</strong></div></div>
-      <div className="dialog-changes"><span>{t("dialog.changes")}</span>{preview.impact.changes.map((change) => <div key={change.code}><span className="change-code">{change.code}</span><span>{change.value ?? change.count ?? t("dialog.noImpact")}</span></div>)}</div>
+      <div className="dialog-changes"><span>{t("dialog.changes")}</span>{preview.impact.changes.map((change) => <div key={change.code}><span className="change-code">{change.code === "previous_fingerprint" ? t("images.oldTarget") : change.code === "new_fingerprint" ? t("images.newTarget") : change.code}</span><span>{change.value ?? change.count ?? t("dialog.noImpact")}</span></div>)}</div>
       {children}
       {error ? <p className="field-error" role="alert">{error}</p> : null}
       <p className="dialog-expiry">{t("dialog.expires", { time: formatDateTime(preview.expires_at, locale) })}</p>

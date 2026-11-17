@@ -149,6 +149,10 @@ try {
     mkdirSync(dirname(destination), { recursive: true, mode: 0o750 });
     const source = sourcePath(relative, binaryPaths);
     if (source !== destination) copyFileSync(source, destination);
+    if (relative === "client-release.ts") {
+      const staged = readFileSync(destination, "utf8").replace(/export const BUILD_IDENTITY:.*? = .*?;/, `export const BUILD_IDENTITY: { version: string; source_revision: string | null } = ${JSON.stringify({ version, source_revision: revision })};`);
+      writeFileSync(destination, staged);
+    }
     chmodSync(destination, mode);
     artifacts.push({ name, path: relative, role, mode, sha256: digest(destination) });
   }

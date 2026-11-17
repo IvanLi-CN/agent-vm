@@ -1502,7 +1502,7 @@ describe("release-manifest: identity, integrity and compatibility", () => {
       ).toEqual(manifest);
       expect(Manifest.verify_bundle(root)).toEqual(manifest);
       expect(Object.keys(manifest.actions).sort()).toEqual(
-        [...Manifest.ACTION_NAMES].sort(),
+        [...Manifest.LEGACY_ACTION_NAMES].sort(),
       );
       expect(manifest.artifacts.find((item) => item.role === "control")?.path)
         .toBe("agent_vm_control.ts");

@@ -33,6 +33,8 @@ import {
 } from "./control-types.ts";
 import { parseSemVer } from "./semver.ts";
 
+import { ACTIONS as RUNTIME_ACTIONS, runtimeActions } from "../../agent-vm/scripts/client-release.ts";
+
 export const MANIFEST_FORMAT = 1;
 export const PROTOCOL_VERSION = 4;
 export const SOURCE_REVISION_RE = /^[0-9a-f]{40}$/;
@@ -46,33 +48,11 @@ export const CLIENT_DEPENDENCY_NAMES = new Set([
   "guest-source.ts", "host-config.ts", "sync-native.ts", "sync_worktree.ts",
 ]);
 
-export const ACTION_NAMES: readonly string[] = Object.freeze([
-  "acquire",
-  "admin-gc",
-  "admin-metrics",
-  "admin-reconcile", "admin-reconcile-session", "admin-reconcile-history",
-  "admin-session-list",
-  "admin-status",
-  "destroy",
-  "doctor",
-  "drain-enter",
-  "drain-exit",
-  "drain-status",
-  "port-add",
-  "port-list",
-  "port-remove",
-  "release",
-  "renew",
-  "resize",
-  "restart",
-  "ssh-info",
-  "status",
-  "timer-age-gc",
-  "timer-expire",
-  "timer-reconcile",
-]);
+export const ACTION_NAMES: readonly string[] = Object.freeze([...RUNTIME_ACTIONS]);
 
-const ACTION_SET: ReadonlySet<string> = new Set(ACTION_NAMES);
+// Format 1 is a frozen compatibility bridge, without image-selection semantics.
+export const LEGACY_ACTION_NAMES = ACTION_NAMES.filter(action => action !== "image-list");
+const ACTION_SET: ReadonlySet<string> = new Set(LEGACY_ACTION_NAMES);
 
 const HTTPS_TRANSPORT_UNAVAILABLE =
   "https transport is validation-only until bundled client HTTPS support is integrated";
@@ -463,12 +443,16 @@ export function operation_spec(
 
 export function default_operations(): Record<string, OperationSpec> {
   return Object.fromEntries(
-    ACTION_NAMES.map((action) => [action, operation_spec()]),
+    ACTION_NAMES.map((action) => [action, runtimeActions()[action] as OperationSpec]),
   );
 }
 
+function legacy_operations(): Record<string, OperationSpec> {
+  return Object.fromEntries(LEGACY_ACTION_NAMES.map(action => [action, operation_spec()]));
+}
+
 export function legacy_manifest(): ReleaseManifest {
-  const actions = default_operations();
+  const actions = legacy_operations();
   return {
     format: MANIFEST_FORMAT,
     release_id: "0".repeat(40),
@@ -503,7 +487,7 @@ export function build_manifest(
   const operations =
     options.operations != null && Object.keys(options.operations).length > 0
       ? options.operations
-      : default_operations();
+      : legacy_operations();
   const actions = Object.fromEntries(
     Object.entries(operations).map(([key, value]) => [key, { ...value }]),
   );
@@ -662,11 +646,11 @@ export function validate_manifest(value: unknown): ReleaseManifest {
       { actions: unsupported_actions },
     );
   }
-  if (!_same_keys(raw_actions, ACTION_NAMES)) {
+  if (!_same_keys(raw_actions, LEGACY_ACTION_NAMES)) {
     throw _error(
       "manifest_action_set_invalid",
       "manifest action set differs from the fixed control surface",
-      { expected: [...ACTION_NAMES], actual: action_keys.sort() },
+      { expected: [...LEGACY_ACTION_NAMES], actual: action_keys.sort() },
     );
   }
 
@@ -1551,9 +1535,9 @@ function _product_artifacts(value: unknown, target: ProductTarget, format: 3 | 4
 
 function _product_actions(value: unknown): Record<string, OperationSpec> {
   const raw = _require_mapping(value, "actions");
-  if (!_same_keys(raw, ACTION_NAMES)) throw _product_error("manifest_action_set_invalid", "product action set differs from protocol 4");
+  if (!_same_keys(raw, ACTION_NAMES) && !_same_keys(raw, LEGACY_ACTION_NAMES)) throw _product_error("manifest_action_set_invalid", "product action set differs from protocol 4");
   const actions: Record<string, OperationSpec> = {};
-  for (const action of ACTION_NAMES) {
+  for (const action of Object.keys(raw)) {
     const spec = _require_mapping(raw[action], `actions.${action}`);
     if (!_same_keys(spec, ["request", "response", "client_to_control", "control_to_client"])) throw _product_error("manifest_invalid", `actions.${action} has an unexpected shape`);
     const request = _schema(spec.request, `actions.${action}.request`);

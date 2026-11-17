@@ -129,7 +129,7 @@ console.log(JSON.stringify(checks.map(check => {try {check(); return true;} catc
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, cwd=ROOT,
             )
             self.assertEqual(process.returncode, 0, process.stderr.decode())
-            self.assertEqual(json.loads(process.stdout), [accepted, client_accepted])
+            self.assertEqual(json.loads(process.stdout), [accepted, client_accepted], json.dumps(value))
 
         check(sidecar, True, False)
         for mutate in (

@@ -645,6 +645,62 @@ paths:
         default:
           $ref: "#/components/responses/Problem"
 
+  /images/{fingerprint}/name/preview:
+    parameters:
+      - $ref: "#/components/parameters/FingerprintPath"
+      - $ref: "#/components/parameters/Origin"
+    post:
+      tags: [Images]
+      operationId: previewImageName
+      summary: 预览镜像名称设置、清除或改绑
+      x-required-capabilities: [manage_images]
+      security:
+        - browserSession: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImageNamePreview"
+      responses:
+        "200":
+          description: 已确认的名称变更结果。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionPreview"
+        default:
+          $ref: "#/components/responses/Problem"
+
+  /images/{fingerprint}/name:
+    parameters:
+      - $ref: "#/components/parameters/FingerprintPath"
+      - $ref: "#/components/parameters/Origin"
+    post:
+      tags: [Images]
+      operationId: setImageName
+      summary: 设置、清除或改绑唯一镜像名称
+      x-required-capabilities: [manage_images]
+      security:
+        - browserSession: []
+          csrfToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImageNameRequest"
+      responses:
+        "200":
+          description: 已确认的名称变更结果。
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Operation"
+        default:
+          $ref: "#/components/responses/Problem"
+
   /images/{fingerprint}/retire/preview:
     parameters:
       - $ref: "#/components/parameters/FingerprintPath"
@@ -1529,7 +1585,7 @@ components:
           uniqueItems: true
           items:
             type: string
-            enum: [restart, resize, release, destroy, port_add, port_remove]
+            enum: [image_name, restart, resize, release, destroy, port_add, port_remove]
     VMPage:
       type: object
       additionalProperties: false
@@ -1552,11 +1608,44 @@ components:
         releasing: { type: integer, minimum: 0, description: Tasks in closing, deleting or failed cleanup states that still pin the image. }
         pending_creation: { type: integer, minimum: 0 }
         verification: { type: integer, minimum: 0 }
+    ImageNamePreview:
+      type: object
+      additionalProperties: false
+      required: [name, target_version]
+      properties:
+        name:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 128
+        target_version:
+          type: string
+    ImageNameRequest:
+      type: object
+      additionalProperties: false
+      required: [name, target_version, operation_id, confirmation_token]
+      properties:
+        name:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 128
+        target_version:
+          type: string
+        operation_id:
+          type: string
+        confirmation_token:
+          type: string
+        reason:
+          type: string
+          maxLength: 512
     ManagedImage:
       type: object
       additionalProperties: false
-      required: [fingerprint, resource_version, version_label, architecture, instance_type, source, state, verification, is_default, default_compatibility, references, created_at]
+      required: [name, fingerprint, resource_version, version_label, architecture, instance_type, source, state, verification, is_default, default_compatibility, references, created_at]
       properties:
+        name:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 128
         fingerprint:
           $ref: "#/components/schemas/Fingerprint"
         resource_version:
@@ -1803,6 +1892,10 @@ components:
       additionalProperties: false
       required: [operation_id, target_version, source]
       properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
         operation_id:
           type: string
           format: uuid
@@ -1915,6 +2008,9 @@ components:
             - upload_too_large
             - staging_capacity_low
             - fingerprint_mismatch
+            - image_name_invalid
+            - image_name_conflict
+            - image_not_found
             - image_not_applicable
             - image_referenced
             - default_image_required

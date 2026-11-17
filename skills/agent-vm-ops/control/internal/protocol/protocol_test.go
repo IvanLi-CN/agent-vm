@@ -191,3 +191,30 @@ func TestSuccessIncludesServerTimeForFormatTwoClients(t *testing.T) {
 		t.Fatalf("server_time = %#v", response["server_time"])
 	}
 }
+
+func TestImageSelectionRevisionRejectsOldControlAndPreservesLegacyWindow(t *testing.T) {
+	request := Request{"protocol": Version, "action": "acquire", "image": "ubuntu-rust", "compatibility": map[string]any{"release_id": "legacy-protocol-4", "protocol": Version, "action": "acquire", "request": map[string]any{"schema": 1, "semantic_revision": 2}, "accepted_response": map[string]any{"schema_min": 1, "schema_max": 1, "semantic_min": 1, "semantic_max": 1}}}
+	if err := ValidateRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	old := testRelease()
+	_, err := ValidateCompatibility(request, old)
+	if err == nil || err.Code != "request_semantic_incompatible" {
+		t.Fatalf("old control accepted explicit image: %v", err)
+	}
+	compatible := old.Actions["acquire"]
+	compatible.RequestWindow.SemanticMax = 2
+	old.Actions["acquire"] = compatible
+	if _, err := ValidateCompatibility(request, old); err != nil {
+		t.Fatalf("new control rejects selector: %v", err)
+	}
+	delete(request, "image")
+	request["compatibility"].(map[string]any)["request"].(map[string]any)["semantic_revision"] = 1
+	if _, err := ValidateCompatibility(request, old); err != nil {
+		t.Fatalf("legacy acquire rejected: %v", err)
+	}
+	request["image"] = "ubuntu-rust"
+	if err := ValidateRequest(request); err == nil {
+		t.Fatal("image with old semantic revision accepted")
+	}
+}

@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS managed_images (
   updated_at TEXT NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS managed_images_one_default ON managed_images(is_default) WHERE is_default = 1;
+CREATE TABLE IF NOT EXISTS image_names (
+ name TEXT PRIMARY KEY,
+ fingerprint TEXT NOT NULL UNIQUE REFERENCES managed_images(fingerprint) ON DELETE CASCADE
+);
 CREATE TABLE IF NOT EXISTS managed_image_tombstones (
   fingerprint TEXT PRIMARY KEY,
   deleted_at TEXT NOT NULL
@@ -146,6 +150,7 @@ func (c ImageReferenceCounts) Total() int {
 
 type ManagedImage struct {
 	Fingerprint          string
+	Name                 *string
 	VersionLabel         *string
 	Architecture         string
 	InstanceType         string
@@ -246,7 +251,7 @@ func (err *ImageReferenceError) Error() string {
 	return "image_referenced"
 }
 
-func (s *Store) EnsureManagementSchema(ctx context.Context) error {
+func (s *Store) ensureManagementBaseSchema(ctx context.Context) error {
 	if s.remote != nil {
 		return s.remote.ensureManagementSchema(ctx)
 	}
@@ -342,6 +347,9 @@ func (s *Store) SeedLegacyImage(ctx context.Context, fingerprint string) error {
 VALUES(?, ?, ?, 'container', 'legacy_config', NULL, 'available', 'legacy_unverified', 'not_assessed', '[]', 0, 'legacy_unverified', 1, ?, ?)`, candidate, label, "x86_64", now, now); err != nil {
 					return err
 				}
+				if err := allocateImageName(ctx, tx, candidate, label); err != nil {
+					return err
+				}
 			}
 		}
 		var current string
@@ -421,8 +429,10 @@ i.state, i.integrity, i.suitability, i.findings_json, i.is_default, i.default_co
  SELECT t.task_id AS reference_id FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state = 'preparing'
  UNION
  SELECT r.reference_id FROM image_references r WHERE r.fingerprint = i.fingerprint AND r.reference_kind = 'pending_creation'
+ UNION SELECT o.operation_id FROM operations o WHERE o.action='acquire' AND json_extract(o.response_json,'$.outcome')='pending' AND json_extract(o.response_json,'$._image_fingerprint')=i.fingerprint
 )),
-(SELECT COUNT(*) FROM image_references r WHERE r.fingerprint = i.fingerprint AND r.reference_kind = 'verification')
+(SELECT COUNT(*) FROM image_references r WHERE r.fingerprint = i.fingerprint AND r.reference_kind = 'verification'),
+(SELECT name FROM image_names n WHERE n.fingerprint=i.fingerprint)
 FROM managed_images i`
 		conditions := []string{}
 		args := []any{}
@@ -435,10 +445,10 @@ FROM managed_images i`
 			args = append(args, filter.Architecture)
 		}
 		if filter.Query != "" {
-			conditions = append(conditions, "(i.fingerprint LIKE ? ESCAPE '\\' OR COALESCE(i.version_label, '') LIKE ? ESCAPE '\\')")
+			conditions = append(conditions, "(i.fingerprint LIKE ? ESCAPE '\\' OR COALESCE(i.version_label, '') LIKE ? ESCAPE '\\' OR COALESCE((SELECT name FROM image_names n WHERE n.fingerprint=i.fingerprint),'') LIKE ? ESCAPE '\\')")
 			literal := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(filter.Query)
 			like := "%" + literal + "%"
-			args = append(args, like, like)
+			args = append(args, like, like, like)
 		}
 		if len(conditions) > 0 {
 			query += " WHERE " + strings.Join(conditions, " AND ")
@@ -479,10 +489,10 @@ func (s *Store) ListManagedImagesPage(ctx context.Context, filter ImageFilter) (
 		args = append(args, filter.Architecture)
 	}
 	if filter.Query != "" {
-		conditions = append(conditions, "(i.fingerprint LIKE ? ESCAPE '\\' OR COALESCE(i.version_label, '') LIKE ? ESCAPE '\\')")
+		conditions = append(conditions, "(i.fingerprint LIKE ? ESCAPE '\\' OR COALESCE(i.version_label, '') LIKE ? ESCAPE '\\' OR COALESCE((SELECT name FROM image_names n WHERE n.fingerprint=i.fingerprint),'') LIKE ? ESCAPE '\\')")
 		literal := strings.NewReplacer("\\", "\\\\", "%", "\\%", "_", "\\_").Replace(filter.Query)
 		like := "%" + literal + "%"
-		args = append(args, like, like)
+		args = append(args, like, like, like)
 	}
 	if filter.AfterCreatedAt != "" || filter.AfterFingerprint != "" {
 		conditions = append(conditions, "(i.created_at < ? OR (i.created_at = ? AND i.fingerprint > ?))")
@@ -497,8 +507,10 @@ i.state, i.integrity, i.suitability, i.findings_json, i.is_default, i.default_co
  SELECT t.task_id AS reference_id FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state = 'preparing'
  UNION
  SELECT r.reference_id FROM image_references r WHERE r.fingerprint = i.fingerprint AND r.reference_kind = 'pending_creation'
+ UNION SELECT o.operation_id FROM operations o WHERE o.action='acquire' AND json_extract(o.response_json,'$.outcome')='pending' AND json_extract(o.response_json,'$._image_fingerprint')=i.fingerprint
 )),
-(SELECT COUNT(*) FROM image_references r WHERE r.fingerprint = i.fingerprint AND r.reference_kind = 'verification')
+(SELECT COUNT(*) FROM image_references r WHERE r.fingerprint = i.fingerprint AND r.reference_kind = 'verification'),
+(SELECT name FROM image_names n WHERE n.fingerprint=i.fingerprint)
 FROM managed_images i`
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
@@ -543,8 +555,10 @@ i.state, i.integrity, i.suitability, i.findings_json, i.is_default, i.default_co
  SELECT t.task_id AS reference_id FROM tasks t WHERE t.image_fingerprint = i.fingerprint AND t.state = 'preparing'
  UNION
  SELECT r.reference_id FROM image_references r WHERE r.fingerprint = i.fingerprint AND r.reference_kind = 'pending_creation'
+ UNION SELECT o.operation_id FROM operations o WHERE o.action='acquire' AND json_extract(o.response_json,'$.outcome')='pending' AND json_extract(o.response_json,'$._image_fingerprint')=i.fingerprint
 )),
-(SELECT COUNT(*) FROM image_references r WHERE r.fingerprint = i.fingerprint AND r.reference_kind = 'verification')
+(SELECT COUNT(*) FROM image_references r WHERE r.fingerprint = i.fingerprint AND r.reference_kind = 'verification'),
+(SELECT name FROM image_names n WHERE n.fingerprint=i.fingerprint)
 FROM managed_images i WHERE i.fingerprint = ?`, fingerprint)
 		image, err := scanManagedImage(row)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -590,16 +604,17 @@ func (s *Store) CachedImageUsable(ctx context.Context, fingerprint string, allow
 
 func scanManagedImage(row scanner) (*ManagedImage, error) {
 	var value ManagedImage
-	var label, sourceID sql.NullString
+	var label, sourceID, name sql.NullString
 	var findings string
 	var isDefault int
 	var active, cached, releasing, pending, verification int
 	if err := row.Scan(&value.Fingerprint, &label, &value.Architecture, &value.InstanceType, &value.SourceKind, &sourceID,
 		&value.State, &value.Integrity, &value.Suitability, &findings, &isDefault, &value.DefaultCompatibility, &value.Revision, &value.CreatedAt, &value.UpdatedAt,
-		&active, &cached, &releasing, &pending, &verification); err != nil {
+		&active, &cached, &releasing, &pending, &verification, &name); err != nil {
 		return nil, err
 	}
 	value.VersionLabel = nullableString(label)
+	value.Name = nullableString(name)
 	value.SourceID = nullableString(sourceID)
 	value.IsDefault = isDefault != 0
 	if err := json.Unmarshal([]byte(findings), &value.Findings); err != nil {
@@ -639,6 +654,30 @@ func (s *Store) InsertManagedImage(ctx context.Context, value ManagedImage) erro
 VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, value.Fingerprint, nullableStringArg(value.VersionLabel), value.Architecture, value.InstanceType, value.SourceKind, nullableStringArg(value.SourceID), value.State, value.Integrity, value.Suitability, string(findings), boolInt(value.IsDefault), value.DefaultCompatibility, value.Revision, now, updated)
 		if err != nil {
 			return err
+		}
+		if value.Name != nil {
+			normalized, err := NormalizeImageName(*value.Name)
+			if err != nil {
+				return err
+			}
+			var count int
+			if err := tx.conn.QueryRowContext(ctx, "SELECT COUNT(*) FROM image_names WHERE name=?", normalized).Scan(&count); err != nil {
+				return err
+			}
+			if count != 0 {
+				return imageError("image_name_conflict", "name already belongs to an image")
+			}
+			if _, err := tx.exec("INSERT INTO image_names(name,fingerprint) VALUES(?,?)", normalized, value.Fingerprint); err != nil {
+				return err
+			}
+		} else {
+			label := ""
+			if value.VersionLabel != nil {
+				label = *value.VersionLabel
+			}
+			if err := allocateImageName(ctx, tx, value.Fingerprint, label); err != nil {
+				return err
+			}
 		}
 		return bumpImageCatalogRevision(tx)
 	})
@@ -766,8 +805,9 @@ func (s *Store) DeleteManagedImage(ctx context.Context, fingerprint string) erro
  SELECT task_id AS reference_id FROM tasks WHERE image_fingerprint = ? AND state = 'preparing'
  UNION
  SELECT reference_id FROM image_references WHERE fingerprint = ? AND reference_kind = 'pending_creation'
+ UNION SELECT operation_id FROM operations WHERE action='acquire' AND json_extract(response_json,'$.outcome')='pending' AND json_extract(response_json,'$._image_fingerprint')=?
 )),
-			(SELECT COUNT(*) FROM image_references WHERE fingerprint = ? AND reference_kind = 'verification')`, fingerprint, fingerprint, fingerprint, fingerprint, fingerprint, fingerprint).Scan(&counts.Active, &counts.Cached, &counts.Releasing, &counts.PendingCreation, &counts.Verification); err != nil {
+			(SELECT COUNT(*) FROM image_references WHERE fingerprint = ? AND reference_kind = 'verification')`, fingerprint, fingerprint, fingerprint, fingerprint, fingerprint, fingerprint, fingerprint).Scan(&counts.Active, &counts.Cached, &counts.Releasing, &counts.PendingCreation, &counts.Verification); err != nil {
 			return err
 		}
 		if counts.Total() > 0 {

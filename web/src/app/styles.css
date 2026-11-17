@@ -736,3 +736,6 @@ svg { flex: none; }
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; transition-delay: 0s !important; }
   .public-status-spinner, .spin-icon { animation: none; }
 }
+
+.image-name-editor .ui-button { margin-top: 8px; margin-right: 8px; }
+.dialog-changes > div > span:last-child { min-width: 0; overflow-wrap: anywhere; text-align: right; }

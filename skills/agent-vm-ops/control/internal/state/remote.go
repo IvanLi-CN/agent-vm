@@ -472,6 +472,11 @@ func requireSupportedSchema(ctx context.Context, objects []remoteSchemaObject) e
 			actual[objectKey(object.Type, object.Name)] = true
 		}
 		for key := range management {
+			// Image names are an additive migration. Existing supported catalogs
+			// must open before EnsureManagementSchema can create and populate them.
+			if key == objectKey("table", "image_names") && !actual[key] {
+				continue
+			}
 			// The principal/session/Token tables were added after the original
 			// management schema. An existing remote database may still expose
 			// the complete legacy management set; EnsureManagementSchema adds
@@ -1310,7 +1315,7 @@ func orderedTables(objects []remoteSchemaObject) []string {
 			present[object.Name] = true
 		}
 	}
-	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "managed_image_tombstones", "image_references", "management_operations", "management_audit", "oidc_transactions", "oidc_transaction_return_paths", "browser_sessions", "agent_tokens", "management_confirmations"}
+	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "image_names", "managed_image_tombstones", "image_references", "management_operations", "management_audit", "oidc_transactions", "oidc_transaction_return_paths", "browser_sessions", "agent_tokens", "management_confirmations"}
 	values := make([]string, 0, len(present))
 	for _, table := range order {
 		if present[table] {
