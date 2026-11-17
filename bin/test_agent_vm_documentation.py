@@ -124,7 +124,7 @@ class AgentVmDocumentationTests(unittest.TestCase):
             self.assertIn(phrase, initialization)
             self.assertIn(phrase, incus_initialization_adr + initialization)
         self.assertIn("contracts/release.md", spec)
-        self.assertIn("release contract", cli_contract)
+        self.assertIn("[产品发布与部署合同](release.md)", cli_contract)
         for phrase in (
             "release-manifest.json",
             "legacy-protocol-4",
@@ -174,11 +174,11 @@ class AgentVmDocumentationTests(unittest.TestCase):
         for phrase in (
             "guest_filesystem",
             "guest_resize_unverified",
-            "configured rootfs capacity",
-            "storage/topology evidence",
-            "no active lease or exposed SSH mapping",
-            "inspectable and retryable",
-            "process-group cleanup evidence on command timeout",
+            "配置的根文件系统容量",
+            "存储与拓扑证据",
+            "没有有效租约或暴露的 SSH 映射",
+            "能检查和重试",
+            "超时后的进程组清理证据",
         ):
             self.assertIn(phrase, cli_contract)
 

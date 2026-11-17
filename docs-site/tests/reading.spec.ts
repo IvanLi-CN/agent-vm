@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { test, expect, type Page } from '@playwright/test';
 
+const cliTitle = readFileSync(new URL('../../docs/specs/agent-vm/contracts/cli.md', import.meta.url), 'utf8').match(/^# (.+)$/m)![1];
+
 async function navigation(page: Page) {
   if (page.viewportSize()!.width < 768) {
     await expect(page.locator('#nd-sidebar-mobile')).toBeHidden();
@@ -59,7 +61,7 @@ test('keyboard navigation, theme and reading widths remain usable', async ({ pag
 test('captures actual document reading when requested', async ({ page }, testInfo) => {
   test.skip(!process.env.DOCS_CAPTURE, 'Explicit evidence capture only');
   await page.goto('/docs/cli');
-  await expect(page.locator('article h1')).toContainText('Agent VM CLI');
+  await expect(page.locator('article h1')).toContainText(cliTitle);
   await page.screenshot({ path: testInfo.outputPath('reading.png'), fullPage: false });
   await page.goto('/');
   await page.screenshot({ path: testInfo.outputPath('home.png'), fullPage: true });
@@ -78,7 +80,7 @@ test('project navigation connects usage and architecture with an active page', a
   let nav = await navigation(page);
   await nav.getByRole('link', { name: 'CLI 使用与命令', exact: true }).click();
   await expect(page).toHaveTitle('CLI 使用与命令 | Agent VM 文档');
-  await expect(page.locator('article h1')).toContainText('Agent VM CLI 合同');
+  await expect(page.locator('article h1')).toContainText(cliTitle);
   nav = await navigation(page);
   await nav.getByRole('link', { name: '系统架构', exact: true }).click();
   await expect(page).toHaveURL(/\/docs\/architecture$/);
