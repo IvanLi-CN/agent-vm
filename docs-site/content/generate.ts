@@ -10,7 +10,7 @@ const documents = await Promise.all(catalog.map(async entry => {
   const text = await readFile(resolve(root, entry.path), 'utf8');
   return { ...entry, text, toc: headings(text) };
 }));
-const {revision,dirty,modified} = repositoryIdentity(root);
+const {revision,dirty,modified,version} = repositoryIdentity(root);
 const snapshots: Record<string, string> = Object.fromEntries(documents.map(d => [d.path, d.text]));
 const inputs: Record<string, string | Uint8Array> = { ...snapshots };
 const contentDiagnostics: { path: string; message: string }[] = [];
@@ -46,7 +46,7 @@ async function addInputs(dir: string) {
 await addInputs('docs-site');
 for (const path of ['bun.lock', 'package.json']) inputs[path] = await readFile(resolve(root, path));
 const sourceId = contentDigest(inputs);
-await writeFile(resolve(out, 'source.json'), JSON.stringify({ documents, identity: { revision, dirty, sourceId }, snapshots, contentDiagnostics }, null, 2));
+await writeFile(resolve(out, 'source.json'), JSON.stringify({ documents, identity: { revision, dirty, sourceId, version }, snapshots, contentDiagnostics }, null, 2));
 console.log(`Documentation: ${documents.length} sources, ${contentDiagnostics.length} diagnostics; ${sourceId.slice(0, 12)}${dirty ? ' +modified' : ''}`);
 if (process.argv.includes('--strict') && contentDiagnostics.length) {
   console.error(contentDiagnostics);
