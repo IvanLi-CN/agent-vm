@@ -55,7 +55,7 @@ export function stageGuestImageAssets(inputRoot: string, artifactRoot: string, s
   const result = Bun.spawnSync(["python3", join(repositoryRoot, "images/scripts/stage_release_assets.py"), "--input-root", inputRoot, "--output", artifactRoot, "--source-revision", source], { stdout: "pipe", stderr: "pipe" });
   if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr).trim() || "guest image release validation failed");
   const value = JSON.parse(new TextDecoder().decode(result.stdout));
-  if (!value.assets || typeof value.assets !== "object" || Object.keys(value.assets).length !== 25) throw new Error("guest image release must stage 24 assets and their checksum list");
+  if (!value.assets || typeof value.assets !== "object" || Object.keys(value.assets).length !== 33) throw new Error("guest image release must stage 32 assets and their checksum list");
   return value.assets;
 }
 
@@ -315,7 +315,7 @@ async function release(): Promise<void> {
   const artifactRoot = join(stateRoot, "artifacts", version);
   mkdirSync(artifactRoot, { recursive: true, mode: 0o750 });
   const imageInput = process.env.AGENT_VM_RELEASE_IMAGE_INPUT;
-  if (!imageInput) throw new Error("AGENT_VM_RELEASE_IMAGE_INPUT is required for the six verified guest image artifacts");
+  if (!imageInput) throw new Error("AGENT_VM_RELEASE_IMAGE_INPUT is required for the eight verified guest image artifacts");
   const imageAssets = stageGuestImageAssets(imageInput, artifactRoot, source);
   const assets = {
     [`agent-vm-${version}-deployment-materials.tar`]: join(artifactRoot, `agent-vm-${version}-deployment-materials.tar`),

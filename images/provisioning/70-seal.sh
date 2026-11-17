@@ -15,7 +15,7 @@ from pathlib import Path
 
 mounts = [line.split()[4] for line in Path('/proc/self/mountinfo').read_text().splitlines()]
 for path in (Path('/var/lib/docker'), Path('/var/lib/containerd')):
-    if path.is_symlink() or any(mount == str(path) or mount.startswith(str(path) + '/') for mount in mounts):
+    if path.resolve() != path or any(mount == str(path) or mount.startswith(str(path) + '/') for mount in mounts):
         raise SystemExit('refusing to clean mounted or linked Docker state: ' + str(path))
     if path.exists():
         shutil.rmtree(path)

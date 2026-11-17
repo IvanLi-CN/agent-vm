@@ -77,5 +77,19 @@ class ReleaseImageStagingTest(unittest.TestCase):
             with self.assertRaises(ValueError): stage(source, output, 'a' * 40)
             self.assertEqual(path.read_bytes(), b'frozen-different-bytes')
 
+    def test_conflicting_checksum_target_is_checked_before_any_asset_copy(self):
+        for symlink in [False, True]:
+            with self.subTest(symlink=symlink), tempfile.TemporaryDirectory() as temporary:
+                root=Path(temporary); source=root/'input'; output=root/'frozen'
+                self.fixture(source); output.mkdir()
+                if symlink:
+                    sentinel=root/'sentinel'; sentinel.write_text('keep')
+                    (output/SUMS).symlink_to(sentinel)
+                else:
+                    (output/SUMS).write_text('different frozen checksums')
+                with self.assertRaises(ValueError): stage(source, output, 'a'*40)
+                self.assertEqual({path.name for path in output.iterdir()}, {SUMS})
+                if symlink: self.assertEqual(sentinel.read_text(), 'keep')
+
 
 if __name__ == '__main__': unittest.main()

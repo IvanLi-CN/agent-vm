@@ -38,14 +38,14 @@ def stage(input_root, output, revision):
         target = output / name
         if target.is_symlink() or (target.exists() and digest(target) != digest(source)):
             raise ValueError('refusing to overwrite a different staged image asset: ' + name)
+    sums = ''.join(digest(sources[name]) + '  ' + name + '\n' for name in sorted(sources))
+    sums_path = output / SUMS
+    if sums_path.is_symlink() or (sums_path.exists() and sums_path.read_text() != sums):
+        raise ValueError('refusing to change staged image checksums')
     for name, source in sources.items():
         target = output / name
         if not target.exists():
             shutil.copyfile(source, target)
-    sums = ''.join(digest(output / name) + '  ' + name + '\n' for name in sorted(sources))
-    sums_path = output / SUMS
-    if sums_path.is_symlink() or (sums_path.exists() and sums_path.read_text() != sums):
-        raise ValueError('refusing to change staged image checksums')
     sums_path.write_text(sums)
     return {name: str((output / name).resolve()) for name in sorted([*sources, SUMS])}
 
