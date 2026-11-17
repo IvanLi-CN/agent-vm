@@ -63,7 +63,7 @@ jobs:
           sudo incus admin init --minimal
           sudo incus network create avm-build-br ipv4.address=auto ipv6.address=none
       - name: Build and verify image
-        run: sudo env PATH="$PATH" AGENT_VM_IMAGE_NETWORK=avm-build-br bun run images:build -- --profile "${{ matrix.language }}" --variant "${{ matrix.variant }}"
+        run: sudo env PATH="$PATH" AGENT_VM_IMAGE_NETWORK=avm-build-br AGENT_VM_IMAGE_SOURCE_REVISION="$(git rev-parse HEAD)" bun run images:build -- --profile "${{ matrix.language }}" --variant "${{ matrix.variant }}"
       - name: Verify exported checksums
         run: |
           cd dist && sha256sum -c agent-vm-ubuntu24-SHA256SUMS

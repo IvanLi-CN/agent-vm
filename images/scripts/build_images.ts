@@ -95,6 +95,7 @@ async function provision(name: string, script: string) {
 }
 async function remove(name: string) { await incus(["delete", name, "--force"]); }
 const sourceRevision = process.env.AGENT_VM_IMAGE_SOURCE_REVISION ?? Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: root }).stdout.toString().trim();
+if (!/^[0-9a-f]{40}$/.test(sourceRevision)) fail("build requires a full source revision");
 const lockSha = createHash("sha256").update(lockText).digest("hex");
 async function buildMode(mode: string) {
   const layerHash = createHash("sha256").update(header + base + docker + readiness + aptText + aptInstaller + JSON.stringify(packages) + JSON.stringify(runtimeConfig(mode)) + lock.base.fingerprint).digest("hex").slice(0, 20);
