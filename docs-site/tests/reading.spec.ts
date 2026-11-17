@@ -1,4 +1,13 @@
-import { test, expect } from '@playwright/test';
+import { test, expect, type Page } from '@playwright/test';
+
+async function navigation(page: Page) {
+  if (page.viewportSize()!.width < 768) {
+    await expect(page.locator('#nd-sidebar-mobile')).toBeHidden();
+    await page.locator('#nd-subnav').getByRole('button', { name: '打开文档导航' }).click();
+    return page.locator('#nd-sidebar-mobile');
+  }
+  return page.locator('#nd-sidebar');
+}
 
 test('home leads directly to real documents and their build snapshots', async ({ page }) => {
   await page.goto('/');
@@ -40,17 +49,16 @@ test('keyboard navigation, theme and reading widths remain usable', async ({ pag
   await page.keyboard.press('Tab');
   await expect(page.getByRole('link', { name: '跳到正文' })).toBeFocused();
   await page.keyboard.press('Enter');
-  await expect(page).toHaveURL(/#main-content$/);
-  await page.getByRole('button', { name: '切换明暗' }).click();
+  await expect(page).toHaveURL(/#nd-page$/);
+  let nav = await navigation(page);
+  await nav.getByRole('button', { name: '切换明暗' }).click();
   await expect(page.locator('html')).toHaveClass(/dark/);
-  await page.getByRole('button', { name: '切换明暗' }).click();
+  await nav.getByRole('button', { name: '切换明暗' }).click();
   await expect(page.locator('html')).not.toHaveClass(/dark/);
+  if (page.viewportSize()!.width < 768) await page.keyboard.press('Escape');
   await expect(page.locator('article')).toHaveCSS('white-space', 'normal');
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
-  if (page.viewportSize()!.width < 700) {
-    await page.locator('.mobile-materials > summary').click();
-    await expect(page.locator('.mobile-materials a').first()).toBeVisible();
-  }
+
 });
 
 test('captures actual document reading when requested', async ({ page }, testInfo) => {
@@ -60,18 +68,51 @@ test('captures actual document reading when requested', async ({ page }, testInf
   await page.screenshot({ path: testInfo.outputPath('reading.png'), fullPage: false });
   await page.goto('/');
   await page.screenshot({ path: testInfo.outputPath('home.png'), fullPage: true });
+  await page.goto('/docs/docs-site-design');
+  await expect(page.locator('.diagram-viewport svg')).toBeVisible();
+  const nav = await navigation(page);
+  await expect(nav.locator('a[aria-current="page"]')).toHaveText('文档站工程方案');
+  await page.screenshot({ path: testInfo.outputPath('tree.png'), animations: 'disabled' });
+  await nav.getByRole('button', { name: '切换明暗' }).click();
+  await expect(page.locator('html')).toHaveClass(/dark/);
+  await page.screenshot({ path: testInfo.outputPath('tree-dark.png'), animations: 'disabled' });
 });
 
 test('project navigation connects usage and architecture with an active page', async ({ page }) => {
   await page.goto('/');
-  await page.getByRole('navigation', { name: '主导航' }).getByRole('link', { name: '使用指南' }).click();
+  let nav = await navigation(page);
+  await nav.getByRole('link', { name: 'CLI 使用与命令', exact: true }).click();
   await expect(page).toHaveTitle('CLI 使用与命令 | Agent VM 文档');
   await expect(page.locator('article h1')).toContainText('Agent VM CLI 合同');
-  await page.getByRole('navigation', { name: '主导航' }).getByRole('link', { name: '开发文档' }).click();
+  nav = await navigation(page);
+  await nav.getByRole('link', { name: '系统架构', exact: true }).click();
   await expect(page).toHaveURL(/\/docs\/architecture$/);
   await expect(page.locator('article h1')).toContainText('Agent VM 系统架构');
-  await expect(page.locator('.site-sidebar a[aria-current="page"]')).toHaveText('系统架构');
+  nav = await navigation(page);
+  await expect(nav.locator('a[aria-current="page"]')).toHaveText('系统架构');
+  if (page.viewportSize()!.width < 768) await page.keyboard.press('Escape');
   await expect(page.locator('.diagram-viewport svg')).toHaveCount(await page.locator('.diagram-viewport').count());
   await expect(page.locator('.diagram [role=alert]')).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+});
+
+test('native folders share controls and open the current document ancestry', async ({ page }) => {
+  await page.goto('/docs/docs-site-design');
+  let nav = await navigation(page);
+  for (const name of ['开始使用', '开发文档', '文档站']) {
+    await expect(nav.getByRole('button', { name, exact: true })).toHaveAttribute('aria-expanded', 'true');
+  }
+  await expect(nav.locator('a[aria-current="page"]')).toHaveText('文档站工程方案');
+  const folder = nav.getByRole('button', { name: '文档站', exact: true });
+  await folder.focus();
+  await page.keyboard.press('Space');
+  await expect(folder).toHaveAttribute('aria-expanded', 'false');
+  await expect(nav.getByRole('link', { name: '文档站工程方案', exact: true })).toBeHidden();
+  await page.keyboard.press('Enter');
+  await expect(folder).toHaveAttribute('aria-expanded', 'true');
+  await nav.getByRole('link', { name: '内容来源与适配', exact: true }).click();
+  await expect(page).toHaveURL(/\/docs\/docs-site-content$/);
+  if (page.viewportSize()!.width < 768) await expect(page.locator('#nd-sidebar-mobile')).toBeHidden();
+  nav = await navigation(page);
+  await expect(nav.locator('a[aria-current="page"]')).toHaveText('内容来源与适配');
 });

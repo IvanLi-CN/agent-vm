@@ -23,7 +23,7 @@ DOCS_PORT=<leased-port> bun run --cwd docs-site storybook
 
 ## 内容维护
 
-`content/catalog.ts` 维护来源路径、稳定页面 slug、读者可见标题和导航分组；`content/generate.ts` 负责适配与快照。当前最小内容集接入项目 README、CLI、系统架构、术语和文档站主题，共十份材料，原始正文在仓库既有位置维护。完整项目文档迁移仍为后续工作。`.generated/`、`.source/`、`.react-router/` 和构建目录是忽略的生成输入，不手工编辑。开发服务器监听来源变动并重新生成正文。
+`content/catalog.ts` 维护来源路径、稳定页面 slug、读者可见标题和导航分组；`content/generate.ts` 负责适配与快照。当前最小内容集接入项目 README、CLI、系统架构、术语和文档站主题，共十份材料，原始正文在仓库既有位置维护。完整项目文档迁移仍为后续工作。`app/page-tree.ts` 将同一清单组织为 Fumadocs 页面树，`DocsLayout` 负责目录、移动端抽屉及主题；项目样式主要用于正文，不另写侧栏折叠逻辑。`.generated/`、`.source/`、`.react-router/` 和构建目录是忽略的生成输入，不手工编辑。开发服务器监听来源变动并重新生成正文。
 
 Markdown 保持 Markdown 解析语义；MDX 用于确有必要的正文交互。适配层处理标题元数据、锚点、相对链接、资源和 Mermaid。无需增加设计关联、需求追溯标记或另一份 MDX 正文。图表支持查看源码，章节可通过目录及锚点定位。
 

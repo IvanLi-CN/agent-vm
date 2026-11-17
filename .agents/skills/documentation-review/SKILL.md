@@ -13,6 +13,7 @@ description: "维护 Agent VM 独立文档站及设计文档展示，检查单�
 - 修改原始 Markdown／MDX，保持唯一可编辑正文；不编辑 `.generated/`，不维护同义副本，不要求作者增加 design-id、设计 covers 或 trace-note。已有 Spec 编号和验收 covers 是原文内容，不驱动站点追溯界面。
 - 站点以项目和读者任务组织导航，不以当前开发任务组织导航。首页提供使用指南和开发文档；文档站自身材料属于开发文档下的主题，不得以“本次设计”“来源材料”作为站点主导航。
 - 来源清单、标题、分组和稳定 slug 在 `docs-site/content/catalog.ts`，生成逻辑在 `docs-site/content/generate.ts`。检查相对链接、资源、标题和来源身份；本地修改不得伪装成远端提交。
+- 文档站 UI 使用已选定的 Fumadocs Radix UI。外壳与导航复用 `DocsLayout` 和 `fumadocs-core/page-tree`；目录分组共用框架的折叠、缩进、当前页和移动端行为，不单独拼接原生 details 模拟侧栏。
 - 正文使用自然文档流，只有源码使用预格式。外壳样式使用专属类名，避免污染 Fumadocs 组件。验证桌面、中间宽度、窄屏与键盘导航。
 - 管理台嵌入、全量文档迁移、公开托管与文档批注属于后续范围；范围变更以用户授权及当前 Spec 为准，不自动扩大功能。
 
