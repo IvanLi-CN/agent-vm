@@ -1310,7 +1310,7 @@ func orderedTables(objects []remoteSchemaObject) []string {
 			present[object.Name] = true
 		}
 	}
-	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "managed_image_tombstones", "image_references", "management_operations", "management_audit", "oidc_transactions", "oidc_transaction_return_paths", "browser_sessions", "agent_tokens", "management_confirmations"}
+	order := []string{"meta", "tasks", "ports", "operations", "audit", "state_capabilities", "managed_images", "image_names", "managed_image_tombstones", "image_references", "management_operations", "management_audit", "oidc_transactions", "oidc_transaction_return_paths", "browser_sessions", "agent_tokens", "management_confirmations"}
 	values := make([]string, 0, len(present))
 	for _, table := range order {
 		if present[table] {

@@ -1489,7 +1489,7 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 	if sessionActions[action] && request["session_id"] == nil {
 		return nil, protocol.NewError("missing_session", "session_id is required for this action", nil)
 	}
-	if action == "admin-metrics" && (request["session_id"] != nil || request["operation_id"] != nil) {
+	if (action == "admin-metrics" || action == "image-list") && (request["session_id"] != nil || request["operation_id"] != nil) {
 		return nil, protocol.NewError("invalid_request", "admin-metrics is sessionless and read-only", nil)
 	}
 	write := (writeActions[action] || isJournaledTimerAction(action, request)) && !((action == "admin-reconcile" || action == "admin-reconcile-session" || action == "admin-reconcile-history" || action == "admin-gc") && requestBool(request, "apply") == false && request["operation_id"] == nil)
@@ -1573,11 +1573,19 @@ func (s *Service) Dispatch(ctx context.Context, request protocol.Request) (map[s
 		var existing *state.Operation
 		err = s.commitMutationContext(ctx, func() error {
 			var commitErr error
-			existing, commitErr = s.Store.ClaimOperation(ctx, operationID, action, session, generationPointer(generation, request["generation"] != nil), pending)
+			var selections []state.AcquireImageSelection
+			if action == "acquire" {
+				selections = []state.AcquireImageSelection{{DefaultFingerprint: s.Config.ImageFingerprint, AllowLegacy: !s.Config.Management.Enabled}}
+			}
+			existing, commitErr = s.Store.ClaimOperation(ctx, operationID, action, session, generationPointer(generation, request["generation"] != nil), pending, selections...)
 			return commitErr
 		})
 		if err != nil {
 			finishActive()
+			var selectionErr *state.ImageSelectionError
+			if errors.As(err, &selectionErr) {
+				return nil, protocol.NewError(selectionErr.Code, selectionErr.Message, nil)
+			}
 			return nil, s.sqliteError(err)
 		}
 		if existing != nil {
@@ -2474,6 +2482,8 @@ func (s *Service) recordAudit(ctx context.Context, request protocol.Request, out
 
 func (s *Service) dispatchAction(ctx context.Context, action string, request protocol.Request) (any, error) {
 	switch action {
+	case "image-list":
+		return s.Store.CreatableImages(ctx)
 	case "status":
 		return s.status(ctx, stringValue(request["session_id"]))
 	case "acquire":
@@ -2560,10 +2570,18 @@ func (s *Service) acquire(ctx context.Context, request protocol.Request) (map[st
 	unlockImageSelection := s.Store.LockImageSelection()
 	defer unlockImageSelection()
 	selectedFingerprint := s.Config.ImageFingerprint
-	if managedFingerprint, found, selectionErr := s.Store.CurrentDefaultImage(ctx); selectionErr != nil {
+	operation, selectionErr := s.Store.GetOperation(ctx, stringValue(request["operation_id"]))
+	if selectionErr != nil {
 		return nil, s.sqliteError(selectionErr)
+	}
+	if operation != nil {
+		if pinned, ok := operation.Response["_image_fingerprint"].(string); ok {
+			selectedFingerprint = pinned
+		}
+	} else if managed, found, err := s.Store.CurrentDefaultImage(ctx); err != nil {
+		return nil, s.sqliteError(err)
 	} else if found {
-		selectedFingerprint = managedFingerprint
+		selectedFingerprint = managed
 	}
 	resources, err := requestedResources(request)
 	if err != nil {
@@ -4863,7 +4881,7 @@ func (s *Service) summary(ctx context.Context, task *state.Task) (map[string]any
 	if pendingErr != nil {
 		return nil, s.sqliteError(pendingErr)
 	}
-	result := map[string]any{"task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": nil, "verified": false, "pending_operation_count": len(pendingOperations), "pending_operations_complete": !morePending}
+	result := map[string]any{"image_fingerprint": task.ImageFingerprint, "task_id": task.TaskID, "session_id": task.SessionID, "generation": task.Generation, "state": task.State, "instance_name": task.InstanceName, "vm_ip": task.VMIP, "ssh_host_port": task.SSHHostPort, "lease_expires_at": task.LeaseExpiresAt, "inactive_since": task.InactiveSince, "cleanup_after": task.CleanupAfter, "resources": resources, "resource_reservation": reservation, "reservation_bytes": task.ReservationBytes, "ports": ports, "last_error": task.LastError, "effective_lease": effective(task, s.Clock()), "native_status": "unverified", "guest_available": nil, "verified": false, "pending_operation_count": len(pendingOperations), "pending_operations_complete": !morePending}
 	if resourceState != nil {
 		result["resource_state"] = resourceState
 	}

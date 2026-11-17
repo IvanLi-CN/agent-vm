@@ -157,6 +157,7 @@ type ImportRequest struct {
 	Reason        string
 	TargetVersion string
 	VersionLabel  string
+	Name          *string
 	Source        ImportSource
 }
 
@@ -483,6 +484,17 @@ func (s *Service) StartImageImport(ctx context.Context, request ImportRequest) (
 }
 
 func (s *Service) ValidateImport(request ImportRequest) error {
+	if request.Name != nil {
+		normalized, err := state.NormalizeImageName(*request.Name)
+		if err != nil {
+			return err
+		}
+		if current, err := s.Store.ImageFingerprintForName(context.Background(), normalized); err != nil {
+			return err
+		} else if current != nil {
+			return errors.New("image_name_conflict: name belongs to another image")
+		}
+	}
 	if request.OperationID == "" || request.Actor == "" {
 		return errors.New("invalid_request: operation_id and actor are required")
 	}
@@ -1142,7 +1154,7 @@ func (s *Service) finishImport(ctx context.Context, operation *state.ManagementO
 		return s.failImportWithImage(ctx, operation, request, artifact, integrity, suitability, findings)
 	}
 	image := state.ManagedImage{
-		Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Architecture: artifact.Architecture,
+		Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Name: request.Name, Architecture: artifact.Architecture,
 		InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID),
 		State: "available", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none",
 	}
@@ -1211,7 +1223,7 @@ func (s *Service) failImportWithImage(ctx context.Context, operation *state.Mana
 		return s.recoverImportedCatalogFailure(ctx, operation, artifact, lockErr)
 	}
 	insertErr := s.commitMutation(func() error {
-		return s.Store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Architecture: artifact.Architecture, InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID), State: "failed", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none"})
+		return s.Store.InsertManagedImage(ctx, state.ManagedImage{Fingerprint: artifact.Fingerprint, VersionLabel: stringPointer(request.VersionLabel), Name: request.Name, Architecture: artifact.Architecture, InstanceType: artifact.InstanceType, SourceKind: request.Source.Kind, SourceID: stringPointerIfNonEmpty(request.Source.SourceID), State: "failed", Integrity: integrity, Suitability: suitability, Findings: findings, DefaultCompatibility: "none"})
 	})
 	catalogUnlock()
 	if insertErr != nil {
@@ -1698,7 +1710,7 @@ func importRequestMap(request ImportRequest) map[string]any {
 		source["metadata"] = map[string]any{"expected_sha256": request.Source.Metadata.ExpectedSHA256, "expected_size_bytes": request.Source.Metadata.ExpectedSize}
 		source["rootfs"] = map[string]any{"expected_sha256": request.Source.Rootfs.ExpectedSHA256, "expected_size_bytes": request.Source.Rootfs.ExpectedSize}
 	}
-	return map[string]any{"operation_id": request.OperationID, "actor": request.Actor, "reason": request.Reason, "target_version": request.TargetVersion, "version_label": request.VersionLabel, "source": source}
+	return map[string]any{"operation_id": request.OperationID, "actor": request.Actor, "reason": request.Reason, "target_version": request.TargetVersion, "version_label": request.VersionLabel, "name": nullableName(request.Name), "source": source}
 }
 
 func importRequestFromOperation(operation *state.ManagementOperation) (ImportRequest, error) {
@@ -1707,6 +1719,9 @@ func importRequestFromOperation(operation *state.ManagementOperation) (ImportReq
 		return ImportRequest{}, errors.New("invalid_state: import operation request is missing")
 	}
 	request := ImportRequest{OperationID: stringValue(requestValue["operation_id"]), Actor: stringValue(requestValue["actor"]), Reason: stringValue(requestValue["reason"]), TargetVersion: stringValue(requestValue["target_version"]), VersionLabel: stringValue(requestValue["version_label"])}
+	if name, ok := requestValue["name"].(string); ok {
+		request.Name = &name
+	}
 	sourceValue, ok := requestValue["source"].(map[string]any)
 	if !ok {
 		return ImportRequest{}, errors.New("invalid_state: import source is missing")
@@ -1799,4 +1814,29 @@ func contains(values []string, candidate string) bool {
 		}
 	}
 	return false
+}
+
+// SetImageName keeps the controller lease fence around the catalog transaction.
+func (s *Service) SetImageName(ctx context.Context, fingerprint string, name *string, targetVersion, operationID, actor, reason string) (*state.ManagementOperation, error) {
+	if err := s.requireMutationLease(); err != nil {
+		return nil, err
+	}
+	if err := s.rejectNewManagementAction(ctx); err != nil {
+		return nil, err
+	}
+	err := s.commitMutation(func() error {
+		_, err := s.Store.SetImageName(ctx, fingerprint, name, targetVersion, operationID, actor, reason)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return s.Store.GetManagementOperation(ctx, operationID)
+}
+
+func nullableName(name *string) any {
+	if name == nil {
+		return nil
+	}
+	return *name
 }

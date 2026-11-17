@@ -1,6 +1,6 @@
 # Agent VM 产品发布与部署合同
 
-本文覆盖客户端与控制环境的发布产物、校验、安装和部署边界；它不是客户端运行设计。客户端职责见[客户端设计与审查](../CLIENT.md)，用户命令见[客户端 CLI 接口](cli.md)，协议语义见[通信协议](control-protocol.md)。`client-release.json` 的产物校验用途与当前客户端运行时强制读取它的行为应分别审查，不能由发布合同自动推导出核心命令必须依赖 Git 或发布清单。
+本文覆盖客户端与控制环境的发布产物、校验、安装和部署边界；它不是客户端运行设计。客户端职责见[客户端设计与审查](../CLIENT.md)，用户命令见[客户端 CLI 接口](cli.md)，协议语义见[通信协议](control-protocol.md)。`client-release.json` 用于发布和安装时的产物校验；客户端核心命令使用源码中的协议与能力声明，不读取该清单、不散列自身文件，也不要求 Git。正式打包向源码注入可验证的来源身份，直接使用源码时如实报告开发或未知身份。
 
 本文定义 Agent VM 客户端和控制环境的人工发布边界。它不是公共的 `agent-vm` 生命周期命令，也不授予 PVE、宿主机管理器、Incus 策略 API、guest 或 HTTP 网关的访问权限。产品发布完成的标志是经过验证的 GitHub Release 及其版本化安装包；部署是独立且必须显式触发的操作。 GitHub Actions 发布与恢复 workflow 使用 GitHub Actions 内置 token 完成产品发布所需的最小 GitHub API 操作；管理员级 branch protection/ruleset 审计属于独立的 operator audit，不是产品发布的凭据前置条件。发布 workflow 不得依赖自定义的高权限平台 token。启用 GitHub Immutable Releases 是发布前置条件。GitHub 只对启用设置后的 future releases 施加 immutable 保护；因此审计会保留并标识启用前的 legacy mutable release history，但只有在 repository-level immutable enforcement 已启用且当前新 release 发布后验证为 `immutable=true` 时才允许继续发布。蓝绿设计使用两个完整的 Agent VM 服务槽位、一个稳定的 Caddy 入口，以及一个位于槽位之外、供运维者使用的 `agent-vm-deployd` 控制器。它不增加公共路由、Web/BFF、公共 native 生命周期服务或公共发布封装器；下文的 format-1/2 封装器仅作为旧版兼容路径保留。
 

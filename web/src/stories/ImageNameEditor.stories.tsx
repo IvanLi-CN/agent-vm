@@ -1,0 +1,14 @@
+import type { Meta, StoryObj } from "@storybook/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { expect, userEvent, within } from "@storybook/test";
+import "../app/i18n";
+import { images } from "../app/mockData";
+import { ImageNameEditor } from "../components/ImageNameEditor";
+const meta = { title: "Agent VM/Image Name", component: ImageNameEditor, tags: ["autodocs"], parameters: { layout: "padded" }, decorators: [Story => <QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}><div data-evidence-surface="image-name" style={{ padding: 24, width: "min(480px, 100%)" }}><Story /></div></QueryClientProvider>], args: { image: { ...images[1], name: null }, catalogVersion: "image-catalog:revision-12" } } satisfies Meta<typeof ImageNameEditor>;
+export default meta;
+type Story = StoryObj<typeof meta>;
+export const Unnamed: Story = {};
+export const Named: Story = { args: { image: { ...images[1], name: "ubuntu-rust" } } };
+export const CatalogUnavailable: Story = { args: { catalogVersion: undefined } };
+export const Input: Story = { play: async ({ canvasElement }) => { const canvas = within(canvasElement); const input = canvas.getByRole("textbox"); await userEvent.type(input, "debian-build"); await expect(input).toHaveValue("debian-build"); await expect(canvas.getByRole("button", { name: /设置或改绑|Set or rebind/ })).toBeEnabled(); } };
+export const RebindConfirmation: Story = { beforeEach: async () => { const { mockState } = await import("../app/mockData"); mockState.images[1].name = null; mockState.images[0].name = "build-base"; }, play: async ({ canvasElement }) => { const canvas = within(canvasElement); await userEvent.type(canvas.getByRole("textbox"), "build-base"); await userEvent.click(canvas.getByRole("button", { name: /设置或改绑|Set or rebind/ })); const dialog = await within(document.body).findByRole("dialog"); await expect(within(dialog).getByText(images[0].fingerprint)).toBeVisible(); await expect(within(dialog).getByText(images[1].fingerprint)).toBeVisible(); } };

@@ -138,6 +138,7 @@ export interface ImageReferenceCounts {
 }
 
 export interface ManagedImage {
+ name?: string | null;
   fingerprint: string;
   resource_version: string;
   version_label: string | null;
@@ -158,7 +159,7 @@ export interface ManagedImage {
 
 export type OperationStatus = "awaiting_upload" | "queued" | "running" | "reconciling" | "succeeded" | "failed" | "outcome_unknown";
 export type OperationPhase = "queued" | "awaiting_upload" | "upload" | "integrity_check" | "image_import" | "suitability_check" | "reference_check" | "token_creation" | "token_revocation" | "native_action" | "reconciliation" | "cleanup" | "completed";
-export type ManagementAction = "restart" | "resize" | "release" | "destroy" | "port_add" | "port_remove" | "image_import" | "default_image_select" | "image_retire" | "image_delete" | "drain_enter" | "reconcile" | "gc" | "token_create" | "token_revoke";
+export type ManagementAction = "image_name" | "restart" | "resize" | "release" | "destroy" | "port_add" | "port_remove" | "image_import" | "default_image_select" | "image_retire" | "image_delete" | "drain_enter" | "reconcile" | "gc" | "token_create" | "token_revoke";
 
 export interface SafeError {
   code: string;
@@ -227,6 +228,7 @@ export interface ActionPreview {
 }
 
 export interface ImageImportRequest {
+ name?: string;
   operation_id: string;
   reason?: string;
   target_version: string;

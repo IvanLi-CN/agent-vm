@@ -104,6 +104,8 @@ func rejectedAuditIdentity(request *http.Request, pathValue string) (string, map
 		return "token_create", map[string]any{"kind": "token", "id": "unknown"}
 	case pathValue == "/images/imports" || strings.HasPrefix(pathValue, "/images/imports/"):
 		return "image_import", map[string]any{"kind": "image_catalog", "id": "image-catalog"}
+	case strings.HasPrefix(pathValue, "/images/") && (strings.HasSuffix(pathValue, "/name") || strings.HasSuffix(pathValue, "/name/preview")):
+		return "image_name", rejectedImageTarget(pathValue, "/name/preview", "/name")
 	case pathValue == "/images/default" || pathValue == "/images/default/preview":
 		return "default_image_select", map[string]any{"kind": "image_catalog", "id": "image-catalog"}
 	case strings.HasPrefix(pathValue, "/images/") && strings.HasSuffix(pathValue, "/retire") || strings.HasPrefix(pathValue, "/images/") && strings.HasSuffix(pathValue, "/retire/preview"):

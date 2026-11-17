@@ -151,6 +151,10 @@ func (authority *Authority) route(writer http.ResponseWriter, request *http.Requ
 		authority.listImages(writer, request)
 	case request.Method == http.MethodGet && strings.HasPrefix(path, "/images/") && !strings.Contains(strings.TrimPrefix(path, "/images/"), "/"):
 		authority.getImage(writer, request, strings.TrimPrefix(path, "/images/"))
+	case request.Method == http.MethodPost && strings.HasPrefix(path, "/images/") && strings.HasSuffix(path, "/name/preview"):
+		authority.previewImageName(writer, request, strings.TrimSuffix(strings.TrimPrefix(path, "/images/"), "/name/preview"), actor)
+	case request.Method == http.MethodPost && strings.HasPrefix(path, "/images/") && strings.HasSuffix(path, "/name"):
+		authority.setImageName(writer, request, strings.TrimSuffix(strings.TrimPrefix(path, "/images/"), "/name"), actor)
 	case request.Method == http.MethodPost && path == "/images/imports":
 		authority.startImageImport(writer, request, actor)
 	case request.Method == http.MethodPut && strings.HasPrefix(path, "/images/imports/") && strings.HasSuffix(path, "/content"):
@@ -990,6 +994,7 @@ type imageImportPayload struct {
 	Reason        string          `json:"reason"`
 	TargetVersion string          `json:"target_version"`
 	VersionLabel  string          `json:"version_label"`
+	Name          *string         `json:"name"`
 	Source        json.RawMessage `json:"source"`
 }
 
@@ -1043,7 +1048,7 @@ func (authority *Authority) startImageImport(writer http.ResponseWriter, request
 		writeProblem(writer, invalidRequest(err.Error()))
 		return
 	}
-	operation, err := authority.Management.StartImageImport(request.Context(), management.ImportRequest{OperationID: payload.OperationID, Actor: actor, Reason: payload.Reason, TargetVersion: payload.TargetVersion, VersionLabel: payload.VersionLabel, Source: source})
+	operation, err := authority.Management.StartImageImport(request.Context(), management.ImportRequest{OperationID: payload.OperationID, Actor: actor, Reason: payload.Reason, TargetVersion: payload.TargetVersion, VersionLabel: payload.VersionLabel, Name: payload.Name, Source: source})
 	if err != nil {
 		writeProblem(writer, problemFromError(err, "request_validation", payload.OperationID))
 		return
@@ -2168,7 +2173,7 @@ func validateOperationQuery(query url.Values) error {
 	if value := query.Get("status"); value != "" && !containsString([]string{"awaiting_upload", "queued", "running", "reconciling", "succeeded", "failed", "outcome_unknown"}, value) {
 		return errors.New("status is invalid")
 	}
-	if value := query.Get("action"); value != "" && !containsString([]string{"restart", "resize", "release", "destroy", "port_add", "port_remove", "image_import", "default_image_select", "image_retire", "image_delete", "drain_enter", "reconcile", "gc"}, value) {
+	if value := query.Get("action"); value != "" && !containsString([]string{"image_name", "restart", "resize", "release", "destroy", "port_add", "port_remove", "image_import", "default_image_select", "image_retire", "image_delete", "drain_enter", "reconcile", "gc"}, value) {
 		return errors.New("action is invalid")
 	}
 	return nil
@@ -2227,7 +2232,7 @@ func imagePageKey(image state.ManagedImage) string {
 
 func imageValue(image state.ManagedImage) map[string]any {
 	return map[string]any{
-		"fingerprint": image.Fingerprint, "resource_version": "image:" + image.Fingerprint + ":revision-" + strconv.FormatInt(image.Revision, 10), "version_label": image.VersionLabel,
+		"fingerprint": image.Fingerprint, "resource_version": "image:" + image.Fingerprint + ":revision-" + strconv.FormatInt(image.Revision, 10), "version_label": image.VersionLabel, "name": image.Name,
 		"architecture": image.Architecture, "instance_type": image.InstanceType, "source": map[string]any{"kind": image.SourceKind, "source_id": image.SourceID}, "state": image.State,
 		"verification": map[string]any{"integrity": image.Integrity, "suitability": image.Suitability, "findings": safeFindings(image.Findings)}, "is_default": image.IsDefault, "default_compatibility": image.DefaultCompatibility,
 		"references": map[string]any{"default": image.References.Default, "active": image.References.Active, "cached": image.References.Cached, "releasing": image.References.Releasing, "pending_creation": image.References.PendingCreation, "verification": image.References.Verification}, "created_at": image.CreatedAt,
@@ -2622,4 +2627,144 @@ func minInt(a, b int) int {
 
 func errorsAPI(code, message string, status int, phase, operationID string) *APIError {
 	return newAPIError(code, message, status, phase, false, operationID)
+}
+
+func (authority *Authority) setImageName(writer http.ResponseWriter, request *http.Request, fingerprint, actor string) {
+	var payload struct {
+		ConfirmationToken string          `json:"confirmation_token"`
+		Name              json.RawMessage `json:"name"`
+		TargetVersion     string          `json:"target_version"`
+		OperationID       string          `json:"operation_id"`
+		Reason            string          `json:"reason"`
+	}
+	if err := decodeJSON(request, &payload); err != nil {
+		writeProblem(writer, invalidRequest(err.Error()))
+		return
+	}
+	if len(payload.Name) == 0 {
+		writeProblem(writer, invalidRequest("name is required; use null to clear"))
+		return
+	}
+	var name *string
+	if err := json.Unmarshal(payload.Name, &name); err != nil {
+		writeProblem(writer, invalidRequest("name must be a string or null"))
+		return
+	}
+	for _, err := range []error{validateFingerprint(fingerprint), ensureOperationID(payload.OperationID), validateReason(payload.Reason), validateTargetVersion(payload.TargetVersion)} {
+		if err != nil {
+			writeProblem(writer, invalidRequest(err.Error()))
+			return
+		}
+	}
+	if name != nil {
+		normalized, err := state.NormalizeImageName(*name)
+		if err != nil {
+			writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
+			return
+		}
+		name = &normalized
+	}
+	existing, err := authority.Store.GetManagementOperation(request.Context(), payload.OperationID)
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
+		return
+	}
+	if existing == nil {
+		if err := consumeDurableConfirmation(request.Context(), authority.Store, authority.Clock(), payload.ConfirmationToken, actor, "image_name", "image:"+fingerprint, payload.TargetVersion, map[string]any{"name": nameValue(name)}); err != nil {
+			writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
+			return
+		}
+	}
+	operation, err := authority.Management.SetImageName(request.Context(), fingerprint, name, payload.TargetVersion, payload.OperationID, actor, payload.Reason)
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "precondition", payload.OperationID))
+		return
+	}
+	writeJSON(writer, http.StatusOK, operationValue(*operation))
+}
+
+func nameValue(name *string) any {
+	if name == nil {
+		return nil
+	}
+	return *name
+}
+func (authority *Authority) previewImageName(writer http.ResponseWriter, request *http.Request, fingerprint, actor string) {
+	var payload struct {
+		Name          json.RawMessage `json:"name"`
+		TargetVersion string          `json:"target_version"`
+	}
+	if err := decodeJSON(request, &payload); err != nil {
+		writeProblem(writer, invalidRequest(err.Error()))
+		return
+	}
+	if len(payload.Name) == 0 {
+		writeProblem(writer, invalidRequest("name is required"))
+		return
+	}
+	var name *string
+	if err := json.Unmarshal(payload.Name, &name); err != nil {
+		writeProblem(writer, invalidRequest("name must be string or null"))
+		return
+	}
+	if name != nil {
+		normalized, err := state.NormalizeImageName(*name)
+		if err != nil {
+			writeProblem(writer, problemFromError(err, "precondition", ""))
+			return
+		}
+		name = &normalized
+	}
+	if err := validateFingerprint(fingerprint); err != nil {
+		writeProblem(writer, invalidRequest(err.Error()))
+		return
+	}
+	image, err := authority.Store.GetManagedImage(request.Context(), fingerprint)
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "precondition", ""))
+		return
+	}
+	if image == nil {
+		writeProblem(writer, problemFromError(errors.New("image_not_found: image does not exist"), "precondition", ""))
+		return
+	}
+	current, err := authority.Store.ImageCatalogVersion(request.Context())
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "internal", ""))
+		return
+	}
+	if current != payload.TargetVersion {
+		writeProblem(writer, problemFromError(errors.New("stale_target: catalog changed"), "precondition", ""))
+		return
+	}
+	if name != nil && image.Name != nil && *name != *image.Name {
+		writeProblem(writer, problemFromError(errors.New("image_name_conflict: clear target name first"), "precondition", ""))
+		return
+	}
+	var previous any
+	if name != nil {
+		images, err := authority.Store.ListManagedImages(request.Context(), state.ImageFilter{})
+		if err != nil {
+			writeProblem(writer, problemFromError(err, "internal", ""))
+			return
+		}
+		for _, candidate := range images {
+			if candidate.Name != nil && *candidate.Name == *name {
+				previous = candidate.Fingerprint
+			}
+		}
+	} else {
+		previous = fingerprint
+	}
+	token, expires, err := issueDurableConfirmation(request.Context(), authority.Store, authority.Clock(), actor, "image_name", "image:"+fingerprint, current, map[string]any{"name": nameValue(name)})
+	if err != nil {
+		writeProblem(writer, problemFromError(err, "internal", ""))
+		return
+	}
+	var next any
+	if name != nil {
+		next = fingerprint
+	}
+	impact := map[string]any{"summary_code": "image_name", "affected_session_count": 0, "affected_image_references": state.ImageReferenceCounts{}, "changes": []map[string]any{{"code": "previous_fingerprint", "count": nil, "value": previous}, {"code": "new_fingerprint", "count": nil, "value": next}}}
+	writeJSON(writer, http.StatusOK, actionPreviewValue(current, token, expires, impact))
 }

@@ -123,3 +123,14 @@ API 使用稳定的机器错误码、阶段和少量安全结构化字段白名�
 ![新鲜观测：显示已验证数据且不误报过期](../assets/management-overview-fresh-desktop.png)
 
 ![过期观测：保留新鲜度与未验证告警](../assets/management-overview-stale-desktop.png)
+
+
+## 镜像唯一名称
+
+镜像 `name` 可空；`version_label` 继续用于展示。名称与完整指纹各自唯一，每镜像至多一名。名称 NFC 规范化并去掉首尾空白，区分大小写，长度 1–128 个 Unicode 字符，拒绝控制字符、斜杠、反斜杠和完整指纹形式。名称只决定后续新建，不改变默认值或已有任务。
+
+`POST /api/v1/images/{fingerprint}/name/preview` 接收 `name`（字符串或 null）和 `target_version`（镜像目录版本），返回既有确认结构，包含原目标和新目标完整指纹。`POST /api/v1/images/{fingerprint}/name` 另需 `operation_id`、可选 `reason` 和 `confirmation_token`，在既有管理员权限、CSRF、确认及控制器租约边界内执行。
+
+`name=null` 显式清除。非空名称可从旧镜像改绑；目标已有其他名称返回 `image_name_conflict`，不得覆盖。目录 CAS 保护所有受影响绑定；同操作同意图重试返回原结果，不同意图返回 `operation_conflict`。变更与管理操作结果、操作者和审计在同一事务提交。
+
+迁移按创建时间、完整指纹稳定排序，预留所有原名称后为重名追加最小可用自然序号。空名使用 `image-<完整指纹>`；非法字符替换短横线，超长值截断并为序号预留空间。迁移标记和唯一约束保证重入不改名；保留标签、默认镜像与全部任务指纹。导入可指定 `name`，显式冲突拒绝；省略时按标签和自然序号分配。

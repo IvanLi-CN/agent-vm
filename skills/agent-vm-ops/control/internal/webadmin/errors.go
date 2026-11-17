@@ -46,11 +46,11 @@ func problemFromError(cause error, phase, operationID string) *APIError {
 		status = http.StatusUnauthorized
 	case "administrator_required", "permission_denied", "csrf_invalid", "origin_invalid":
 		status = http.StatusForbidden
-	case "invalid_request", "invalid_state", "unsupported_action", "source_not_allowed":
+	case "image_name_invalid", "invalid_request", "invalid_state", "unsupported_action", "source_not_allowed":
 		status = http.StatusBadRequest
-	case "not_found":
+	case "not_found", "image_not_found":
 		status = http.StatusNotFound
-	case "stale_target", "operation_conflict", "precondition_required", "controller_lease_required", "image_referenced", "default_image_required", "fingerprint_mismatch", "image_not_applicable", "lease_expired", "task_not_active", "draining", "mapping_unverified", "cleanup_incomplete", "admission_denied", "resource_insufficient":
+	case "image_name_conflict", "stale_target", "operation_conflict", "precondition_required", "controller_lease_required", "image_referenced", "default_image_required", "fingerprint_mismatch", "image_not_applicable", "lease_expired", "task_not_active", "draining", "mapping_unverified", "cleanup_incomplete", "admission_denied", "resource_insufficient":
 		status = http.StatusConflict
 	case "upload_too_large":
 		status = http.StatusRequestEntityTooLarge
@@ -86,7 +86,7 @@ func safeErrorCode(cause error) string {
 
 func safeCode(value string) string {
 	switch value {
-	case "authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "controller_lease_required", "authority_unavailable", "rate_limited", "sqlite_unavailable", "state_unavailable", "state_unverified", "oidc_unavailable", "token_expired", "token_revoked", "internal_error", "lease_expired", "task_not_active", "draining", "mapping_unverified", "cleanup_incomplete", "resource_unverified", "startup_reconcile_required", "resource_insufficient", "watermarks_unreachable":
+	case "image_not_found", "image_name_invalid", "image_name_conflict", "authentication_required", "administrator_required", "csrf_invalid", "origin_invalid", "invalid_request", "invalid_state", "stale_target", "operation_conflict", "not_found", "unsupported_action", "permission_denied", "source_not_allowed", "upload_too_large", "staging_capacity_low", "fingerprint_mismatch", "image_not_applicable", "image_referenced", "default_image_required", "capacity_unverified", "admission_denied", "precondition_required", "controller_lease_required", "authority_unavailable", "rate_limited", "sqlite_unavailable", "state_unavailable", "state_unverified", "oidc_unavailable", "token_expired", "token_revoked", "internal_error", "lease_expired", "task_not_active", "draining", "mapping_unverified", "cleanup_incomplete", "resource_unverified", "startup_reconcile_required", "resource_insufficient", "watermarks_unreachable":
 		return value
 	default:
 		return "internal_error"
@@ -98,7 +98,7 @@ func phaseForCode(code, fallback string) string {
 		return normalizePhase(fallback)
 	}
 	switch code {
-	case "authentication_required", "administrator_required", "csrf_invalid", "origin_invalid":
+	case "image_not_found", "image_name_invalid", "image_name_conflict", "authentication_required", "administrator_required", "csrf_invalid", "origin_invalid":
 		return "authentication"
 	case "stale_target", "precondition_required":
 		return "precondition"

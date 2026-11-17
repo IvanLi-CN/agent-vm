@@ -2011,3 +2011,56 @@ func TestRemoteDefaultImageReplacementPreservesUniqueSelection(t *testing.T) {
 		}
 	}
 }
+
+func TestRemoteImageNamesAndPinnedIntentAcrossMirrors(t *testing.T) {
+	url := requireSessionOwnedRQLite(t)
+	ctx := context.Background()
+	first, err := OpenForTest(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := OpenForTest(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	suffix := randomHex(8)
+	a := strings.Repeat("1", 48) + suffix
+	b := strings.Repeat("2", 48) + suffix
+	name := "native-" + suffix
+	for _, fp := range []string{a, b} {
+		if err := first.InsertManagedImage(ctx, ManagedImage{Fingerprint: fp, Architecture: "x86_64", InstanceType: "container", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	version, _ := first.ImageCatalogVersion(ctx)
+	if _, err := first.SetImageName(ctx, a, nil, version, "clear-a-"+suffix, "admin", ""); err != nil {
+		t.Fatal(err)
+	}
+	version, _ = first.ImageCatalogVersion(ctx)
+	if _, err := first.SetImageName(ctx, a, &name, version, "set-a-"+suffix, "admin", ""); err != nil {
+		t.Fatal(err)
+	}
+	session := "select-" + suffix
+	pending := map[string]any{"outcome": "pending", "_request": map[string]any{"image": name}}
+	if _, err := second.ClaimOperation(ctx, "pin-"+suffix, "acquire", &session, nil, pending, AcquireImageSelection{}); err != nil {
+		t.Fatal(err)
+	}
+	version, _ = first.ImageCatalogVersion(ctx)
+	if _, err := first.SetImageName(ctx, b, nil, version, "clear-b-"+suffix, "admin", ""); err != nil {
+		t.Fatal(err)
+	}
+	version, _ = first.ImageCatalogVersion(ctx)
+	if _, err := first.SetImageName(ctx, b, &name, version, "rebind-"+suffix, "admin", ""); err != nil {
+		t.Fatal(err)
+	}
+	operation, err := second.GetOperation(ctx, "pin-"+suffix)
+	if err != nil || operation.Response["_image_fingerprint"] != a {
+		t.Fatalf("pin: %#v %v", operation, err)
+	}
+	selected, err := second.ImageFingerprintForName(ctx, name)
+	if err != nil || selected == nil || *selected != b {
+		t.Fatalf("name: %v %v", selected, err)
+	}
+}

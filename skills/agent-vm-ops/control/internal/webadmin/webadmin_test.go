@@ -642,3 +642,83 @@ func TestDecimalInputsRemainCanonical(t *testing.T) {
 		}
 	}
 }
+
+func TestImageNameRequiresConfirmationAndKeepsReplayAndAudit(t *testing.T) {
+	authority, store, cfg := testAuthority(t)
+	ctx := context.Background()
+	fp := strings.Repeat("a", 64)
+	version, _ := store.ImageCatalogVersion(ctx)
+	call := func(path string, value map[string]any) *httptest.ResponseRecorder {
+		raw, _ := json.Marshal(value)
+		req := httptest.NewRequest(http.MethodPost, "/internal/v1/management"+path, strings.NewReader(string(raw)))
+		req = req.WithContext(WithPeerUID(req.Context(), cfg.WebUID))
+		req.Header.Set(forwardedActorHeader, "admin@example")
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		authority.Handler().ServeHTTP(rec, req)
+		return rec
+	}
+	operationID := "11111111-1111-4111-8111-111111111111"
+	body := map[string]any{"name": nil, "target_version": version, "operation_id": operationID, "reason": "clear old alias"}
+	denied := call("/images/"+fp+"/name", body)
+	if denied.Code != http.StatusConflict {
+		t.Fatalf("confirmation missing: %d %s", denied.Code, denied.Body.String())
+	}
+	preview := call("/images/"+fp+"/name/preview", map[string]any{"name": nil, "target_version": version})
+	if preview.Code != http.StatusOK {
+		t.Fatalf("preview: %d %s", preview.Code, preview.Body.String())
+	}
+	var value map[string]any
+	if err := json.Unmarshal(preview.Body.Bytes(), &value); err != nil {
+		t.Fatal(err)
+	}
+	body["confirmation_token"] = value["confirmation_token"]
+	result := call("/images/"+fp+"/name", body)
+	if result.Code != http.StatusOK {
+		t.Fatalf("set: %d %s", result.Code, result.Body.String())
+	}
+	if replay := call("/images/"+fp+"/name", body); replay.Code != http.StatusOK {
+		t.Fatalf("replay: %s", replay.Body.String())
+	}
+	current, _ := store.ImageName(ctx, fp)
+	if current != nil {
+		t.Fatalf("name not cleared: %v", current)
+	}
+	audit, err := store.ListManagementAudit(ctx, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := 0
+	for _, event := range audit {
+		if event.Action == "image_name" && event.Outcome == "success" {
+			found++
+			if event.Actor != "admin@example" {
+				t.Fatal("actor not authenticated")
+			}
+		}
+	}
+	if found != 1 {
+		t.Fatalf("audit entries: %d", found)
+	}
+	missing := call("/images/"+fp+"/name", map[string]any{"target_version": version})
+	if missing.Code != http.StatusBadRequest {
+		t.Fatal("missing name cleared binding")
+	}
+}
+
+func TestImageListTokenScopeAndSafeSelectionErrors(t *testing.T) {
+	if !agentTokenAllows([]string{"agent:read"}, "image-list") {
+		t.Fatal("read token cannot discover images")
+	}
+	if agentTokenAllows([]string{"agent:read"}, "acquire") {
+		t.Fatal("read token may create")
+	}
+	for _, code := range []string{"image_conflict", "image_not_found", "image_unavailable", "image_name_invalid"} {
+		if safeAgentCode(code) != code {
+			t.Fatalf("image error hidden: %s", code)
+		}
+		if agentErrorStatus(code) >= 500 {
+			t.Fatalf("deterministic refusal became internal error: %s", code)
+		}
+	}
+}
