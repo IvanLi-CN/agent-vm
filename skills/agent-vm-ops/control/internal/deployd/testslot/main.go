@@ -34,6 +34,7 @@ type releaseManifest struct {
 type runtimeState struct {
 	sync.Mutex
 	controller bool
+	lease      controllerrole.Lease
 	traffic    bool
 	draining   bool
 }
@@ -109,20 +110,22 @@ func serve(config configuration, manifest releaseManifest) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/internal/v1/health", func(writer http.ResponseWriter, _ *http.Request) {
 		state.Lock()
-		controller, traffic, draining := state.controller, state.traffic, state.draining
+		controller, traffic, draining, lease := state.controller, state.traffic, state.draining, state.lease
 		state.Unlock()
 		writeJSON(writer, map[string]any{
-			"ok":                 true,
-			"protocol":           protocol,
-			"process_ready":      true,
-			"state_authority":    "authority-1",
-			"ready":              true,
-			"controller_owned":   controller,
-			"traffic_accepting":  traffic && !draining,
-			"release_id":         manifest.ReleaseID,
-			"source_revision":    manifest.SourceRevision,
-			"process_id":         os.Getpid(),
-			"process_start_time": startToken,
+			"ok":                       true,
+			"protocol":                 protocol,
+			"process_ready":            true,
+			"state_authority":          "authority-1",
+			"ready":                    true,
+			"controller_owned":         controller,
+			"controller_lease_renewal": true,
+			"lease":                    lease,
+			"traffic_accepting":        traffic && !draining,
+			"release_id":               manifest.ReleaseID,
+			"source_revision":          manifest.SourceRevision,
+			"process_id":               os.Getpid(),
+			"process_start_time":       startToken,
 		})
 	})
 	mux.HandleFunc("/internal/v1/control", func(writer http.ResponseWriter, request *http.Request) {
@@ -165,7 +168,8 @@ func serve(config configuration, manifest releaseManifest) error {
 	})
 	mux.HandleFunc("/internal/v1/controller-role", func(writer http.ResponseWriter, request *http.Request) {
 		var payload struct {
-			Action string `json:"action"`
+			Action string               `json:"action"`
+			Lease  controllerrole.Lease `json:"lease"`
 		}
 		if err := json.NewDecoder(request.Body).Decode(&payload); err != nil {
 			writeJSONStatus(writer, http.StatusBadRequest, map[string]any{"ok": false, "error": "invalid request"})
@@ -175,6 +179,7 @@ func serve(config configuration, manifest releaseManifest) error {
 		switch payload.Action {
 		case "grant":
 			state.controller = true
+			state.lease = payload.Lease
 		case "revoke", "fence":
 			state.controller = false
 		default:
