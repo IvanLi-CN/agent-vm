@@ -22,7 +22,11 @@ export function ImageNameEditor({ image, catalogVersion }: {
     const [name, setName] = useState("");
     const [intent, setIntent] = useState<Intent | null>(null);
     const preview = useMutation({ mutationFn: async (value: string | null) => ({ name: value, operationId: createOperationId(), preview: await previewImageName(image.fingerprint, value, catalogVersion!) }), onSuccess: next => { setOperationId(next.operationId, false); setIntent(next); } });
-    const submit = useMutation({ mutationFn: async (reason: string) => submitImageName(image.fingerprint, intent!.name, reason, intent!.preview, intent!.operationId), onSuccess: () => { setOperationId(null); setIntent(null); setName(""); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: error => { const rejected = error instanceof ManagementRequestError && ["stale_target", "image_name_conflict", "image_name_invalid", "image_not_found", "invalid_request", "operation_conflict", "precondition_required"].includes(error.code); if (!rejected) {
+    const submit = useMutation({ mutationFn: async (reason: string) => submitImageName(image.fingerprint, intent!.name, reason, intent!.preview, intent!.operationId), onSuccess: () => { setOperationId(null); setIntent(null); setName(""); void client.invalidateQueries({ queryKey: ["images"] }); void client.invalidateQueries({ queryKey: ["operations"] }); }, onError: error => { const rejected = error instanceof ManagementRequestError && ["stale_target", "image_name_conflict", "image_name_invalid", "image_not_found", "invalid_request", "operation_conflict", "precondition_required"].includes(error.code); if (rejected) {
+            setOperationId(null);
+            setIntent(null);
+            void client.invalidateQueries({ queryKey: ["images"] });
+        } else {
             recovery.persist();
             recovery.block();
             setIntent(null);

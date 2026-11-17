@@ -248,7 +248,11 @@ class ReleasePublisherTests(unittest.TestCase):
             self.assertFalse((target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME).exists())
             marker = target.parent / RELEASE.LOCAL_INSTALL_RECORD_NAME
             marker.write_text("{}")
-            environment = {"PATH": os.environ["PATH"], "AGENT_VM_RELEASE_MANIFEST": str(self.root / "absent.json")}
+            config_home = self.root / "isolated-config"
+            profile = config_home / "agent-vm" / "config.toml"
+            profile.parent.mkdir(parents=True)
+            profile.write_text('default_host = "fixture"\n[hosts.fixture]\ntransport = "ssh"\ncontrol_host = "fixture.invalid"\n')
+            environment = {"PATH": os.environ["PATH"], "XDG_CONFIG_HOME": str(config_home), "AGENT_VM_RELEASE_MANIFEST": str(self.root / "absent.json")}
             def run_client(*arguments):
                 return RELEASE.subprocess.run(
                     [RELEASE.shutil.which("bun"), "--no-macros", str(target), *arguments],

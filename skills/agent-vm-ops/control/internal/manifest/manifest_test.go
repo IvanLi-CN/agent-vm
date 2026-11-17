@@ -5,7 +5,9 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -278,5 +280,76 @@ func rewriteTransport(t *testing.T, manifestPath, transport string) {
 	}
 	if err := os.WriteFile(manifestPath, append(encoded, '\n'), 0o644); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The producer's source contract must reach the actual Go startup verifier;
+// fixtures derived only from this package's allowlist cannot detect drift.
+func TestSourceGeneratedActionsLoadInGoConsumer(t *testing.T) {
+	bun, err := exec.LookPath("bun")
+	if err != nil {
+		t.Skip("Bun is required to exercise the release producer")
+	}
+	_, file, _, _ := runtime.Caller(0)
+	producer := filepath.Clean(filepath.Join(filepath.Dir(file), "../../../scripts/release-manifest.ts"))
+	command := exec.Command(bun, "--eval", `const m=await import(process.argv[1]);console.log(JSON.stringify(m.default_operations()));`, producer)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("release producer: %v %s", err, output)
+	}
+	var generated map[string]any
+	if err := json.Unmarshal(output, &generated); err != nil {
+		t.Fatal(err)
+	}
+	for _, format := range []int64{Format, LegacyProductFormat, ProductFormat} {
+		t.Run(fmt.Sprint(format), func(t *testing.T) {
+			var path string
+			if format == Format {
+				path, _ = validManifest(t)
+			} else {
+				path = validProductManifestFormat(t, format, "go-request")
+			}
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var value map[string]any
+			if err = json.Unmarshal(raw, &value); err != nil {
+				t.Fatal(err)
+			}
+			for _, historical := range []bool{false, true} {
+				actions := map[string]any{}
+				for action, spec := range generated {
+					if !historical || action != "image-list" {
+						if historical {
+							actions[action] = operationSpec()
+						} else {
+							actions[action] = spec
+						}
+					}
+				}
+				value["actions"] = actions
+				value["client_view"].(map[string]any)["actions"] = actions
+				raw, err = json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err = os.WriteFile(path, raw, 0644); err != nil {
+					t.Fatal(err)
+				}
+				metadata, err := LoadMetadata(path)
+				if err != nil {
+					t.Fatalf("historical=%t: %v", historical, err)
+				}
+				_, hasImageList := metadata.Actions["image-list"]
+				wantMaximum := int64(2)
+				if historical {
+					wantMaximum = 1
+				}
+				if hasImageList == historical || metadata.Actions["acquire"].RequestWindow.SemanticMax != wantMaximum {
+					t.Fatalf("wrong generated capabilities: %#v", metadata.Actions)
+				}
+			}
+		})
 	}
 }

@@ -26,3 +26,36 @@ it("confirms the full old/new targets before rebinding and keeps the operation i
     expect(api.submit.mock.calls[0]).toEqual([next, "build", "", preview, expect.any(String)]);
 });
 it("requires clearing an already named target before rebinding", () => { mount(true); expect(screen.getByRole("textbox")).toBeDisabled(); expect(screen.getByRole("button", { name: /设置或改绑|Set or rebind/ })).toBeDisabled(); expect(screen.getByRole("button", { name: /清除名称|Clear name/ })).toBeEnabled(); });
+
+for (const code of ["stale_target", "precondition_required"]) {
+  it(`clears determinate ${code} recovery before reloading the editor`, async () => {
+    const { ManagementRequestError } = await import("../app/api");
+    const user = userEvent.setup();
+    api.preview.mockResolvedValue({ target_version: "catalog:1", confirmation_token: "confirm", expires_at: "2099-01-01T00:00:00Z", impact: { summary_code: "image_name", affected_session_count: 0, affected_image_references: {}, changes: [] } });
+    api.submit.mockRejectedValue(new ManagementRequestError(code, "precondition"));
+    const rendered = mount();
+    await user.type(screen.getByRole("textbox"), "build");
+    await user.click(screen.getByRole("button", { name: /设置或改绑|Set or rebind/ }));
+    await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: /确认提交|Confirm and submit/ }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(window.sessionStorage.getItem(`agent-vm:operation-recovery:/images/name/${images[1].fingerprint}`)).toBeNull();
+    rendered.unmount();
+    mount();
+    expect(screen.getByRole("textbox")).toBeEnabled();
+    await user.type(screen.getByRole("textbox"), "retry");
+    expect(screen.getByRole("button", { name: /设置或改绑|Set or rebind/ })).toBeEnabled();
+  });
+}
+
+it("retains recovery and blocks another write after an unknown submit outcome", async () => {
+  const user = userEvent.setup();
+  api.preview.mockResolvedValue({ target_version: "catalog:1", confirmation_token: "confirm", expires_at: "2099-01-01T00:00:00Z", impact: { summary_code: "image_name", affected_session_count: 0, affected_image_references: {}, changes: [] } });
+  api.submit.mockRejectedValue(new Error("transport interrupted"));
+  mount();
+  await user.type(screen.getByRole("textbox"), "build");
+  await user.click(screen.getByRole("button", { name: /设置或改绑|Set or rebind/ }));
+  await user.click(within(await screen.findByRole("dialog")).getByRole("button", { name: /确认提交|Confirm and submit/ }));
+  await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+  expect(window.sessionStorage.getItem(`agent-vm:operation-recovery:/images/name/${images[1].fingerprint}`)).not.toBeNull();
+  expect(screen.getByRole("textbox")).toBeDisabled();
+});
