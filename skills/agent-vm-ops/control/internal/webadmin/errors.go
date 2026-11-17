@@ -98,9 +98,9 @@ func phaseForCode(code, fallback string) string {
 		return normalizePhase(fallback)
 	}
 	switch code {
-	case "image_not_found", "image_name_invalid", "image_name_conflict", "authentication_required", "administrator_required", "csrf_invalid", "origin_invalid":
+	case "authentication_required", "administrator_required", "csrf_invalid", "origin_invalid":
 		return "authentication"
-	case "stale_target", "precondition_required":
+	case "image_not_found", "image_name_invalid", "image_name_conflict", "stale_target", "precondition_required":
 		return "precondition"
 	case "controller_lease_required":
 		return "controller-lease"

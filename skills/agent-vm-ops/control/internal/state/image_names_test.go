@@ -146,3 +146,20 @@ func TestExplicitImageConflictDoesNotClaimOperation(t *testing.T) {
 		t.Fatalf("implicit reuse changed image: %#v %v", pending, err)
 	}
 }
+
+func TestAcquireRejectsVirtualMachineImageBeforeJournalClaim(t *testing.T) {
+	s := nameStore(t)
+	ctx := context.Background()
+	fp := strings.Repeat("9", 64)
+	if err := s.InsertManagedImage(ctx, ManagedImage{Fingerprint: fp, InstanceType: "virtual-machine", Architecture: "x86_64", SourceKind: "local_upload", State: "available", Integrity: "passed", Suitability: "passed"}); err != nil {
+		t.Fatal(err)
+	}
+	session := "container-only"
+	generation := int64(0)
+	_, err := s.ClaimOperation(ctx, "vm-image-refusal", "acquire", &session, &generation, map[string]any{"_request": map[string]any{"image": fp}, "outcome": "pending"}, AcquireImageSelection{})
+	expectImageCode(t, err, "image_unavailable")
+	operation, err := s.GetOperation(ctx, "vm-image-refusal")
+	if err != nil || operation != nil {
+		t.Fatalf("refused selector created journal: %#v %v", operation, err)
+	}
+}

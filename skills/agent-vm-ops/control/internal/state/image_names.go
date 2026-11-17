@@ -311,8 +311,8 @@ func pinAcquireImage(ctx context.Context, tx *Tx, sessionID *string, response ma
 			response["_image_fingerprint"] = existing
 			return nil
 		}
-		var status, integrity, suitability, compat, source string
-		err := tx.conn.QueryRowContext(ctx, "SELECT state,integrity,suitability,default_compatibility,source_kind FROM managed_images WHERE fingerprint=?", fp).Scan(&status, &integrity, &suitability, &compat, &source)
+		var status, integrity, suitability, compat, source, instanceType string
+		err := tx.conn.QueryRowContext(ctx, "SELECT state,integrity,suitability,default_compatibility,source_kind,instance_type FROM managed_images WHERE fingerprint=?", fp).Scan(&status, &integrity, &suitability, &compat, &source, &instanceType)
 		if err != nil {
 			if !(selection.AllowLegacy && !explicit && (errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no such table"))) {
 				if errors.Is(err, sql.ErrNoRows) {
@@ -320,6 +320,8 @@ func pinAcquireImage(ctx context.Context, tx *Tx, sessionID *string, response ma
 				}
 				return err
 			}
+		} else if instanceType != "container" {
+			return imageError("image_unavailable", "only system container images can be selected")
 		} else if status != "available" || integrity != "passed" || suitability != "passed" {
 			if !(selection.AllowLegacy && !explicit && status == "available" && integrity == "legacy_unverified" && suitability == "not_assessed" && compat == "legacy_unverified" && source == "legacy_config") {
 				return imageError("image_unavailable", "image is retired or not verified for creation")
