@@ -23,3 +23,4 @@ for algorithm in rsa ecdsa ed25519; do
   rm -f -- "/etc/ssh/ssh_host_${algorithm}_key" "/etc/ssh/ssh_host_${algorithm}_key.pub"
 done
 : > /etc/machine-id
+rm -f -- /etc/apt/apt.conf.d/80-agent-vm-build-network

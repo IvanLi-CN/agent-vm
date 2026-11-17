@@ -63,7 +63,9 @@ const output = resolve(process.env.AGENT_VM_IMAGE_OUTPUT ?? join(root, "dist"));
 mkdirSync(output, { recursive: true });
 async function incus(argv: string[], capture = false, allowFailure = false) {
   console.log(JSON.stringify({ incus: argv }));
-  const process = Bun.spawn(["incus", ...argv, "--project", project], { cwd: root, stdout: capture ? "pipe" : "inherit", stderr: "inherit" });
+  // query takes project in its API URL and rejects the CLI --project flag.
+  const scoped = argv[0] === "query" ? argv : [...argv, "--project", project];
+  const process = Bun.spawn(["incus", ...scoped], { cwd: root, stdout: capture ? "pipe" : "inherit", stderr: "inherit" });
   const text = capture ? await new Response(process.stdout).text() : "";
   const code = await process.exited;
   if (code && !allowFailure) fail(`incus ${argv[0]} failed (${code})`);
@@ -77,6 +79,18 @@ const aptInstaller = read("10-apt-lock.py");
 const readiness = read("40-ssh-readiness.sh") + "\n" + read("45-docker-readiness.sh") + "\n" + read("50-readiness.sh");
 const header = `set -euo pipefail\nexport DEBIAN_FRONTEND=noninteractive\ncat > /root/.agent-vm-apt-lock.json <<'APTLOCK'\n${aptText}\nAPTLOCK\ncat > /root/.agent-vm-apt-install.py <<'APTINSTALL'\n${aptInstaller}\nAPTINSTALL\n` + Object.entries(lock.versions).map(([key, value]) => `${key.toUpperCase()}_VERSION='${value}'\n`).join("") + Object.entries(lock.downloads).map(([key, item]) => `${key.toUpperCase()}_URL='${item.url}'\n${key.toUpperCase()}_SHA256='${item.sha256}'\n`).join("");
 const checksums: string[] = [];
+const buildNetwork = `install -d /etc/apt/apt.conf.d
+cat > /etc/apt/apt.conf.d/80-agent-vm-build-network <<'APTNETWORK'
+Acquire::ForceIPv4 "true";
+Acquire::Retries "3";
+Acquire::http::Timeout "30";
+Acquire::https::Timeout "30";
+APT::Update::Error-Mode "any";
+APTNETWORK
+for host in archive.ubuntu.com security.ubuntu.com; do
+  timeout 90 bash -c 'until getent ahostsv4 "$1" >/dev/null; do sleep 2; done' -- "$host"
+done
+`;
 const commonProfile = lock.profiles.base!;
 const packages = Array.isArray(commonProfile) ? commonProfile : commonProfile.packages;
 async function init(image: string, name: string, mode: string) {
@@ -98,7 +112,7 @@ const sourceRevision = process.env.AGENT_VM_IMAGE_SOURCE_REVISION ?? Bun.spawnSy
 if (!/^[0-9a-f]{40}$/.test(sourceRevision)) fail("build requires a full source revision");
 const lockSha = createHash("sha256").update(lockText).digest("hex");
 async function buildMode(mode: string) {
-  const layerHash = createHash("sha256").update(header + base + docker + readiness + aptText + aptInstaller + JSON.stringify(packages) + JSON.stringify(runtimeConfig(mode)) + lock.base.fingerprint).digest("hex").slice(0, 20);
+  const layerHash = createHash("sha256").update(header + buildNetwork + base + docker + readiness + aptText + aptInstaller + JSON.stringify(packages) + JSON.stringify(runtimeConfig(mode)) + lock.base.fingerprint).digest("hex").slice(0, 20);
   const commonAlias = `${lock.name}-${mode}-common-${layerHash}`;
   const runtimeRecord = `install -d /etc/agent-vm-image\nprintf '%s\\n' '${JSON.stringify({ variant: mode, runtime_config: runtimeConfig(mode) })}' > /etc/agent-vm-image/runtime-config.json\n`;
   if ((await incus(["image", "info", commonAlias], true, true)).code) {
@@ -108,7 +122,7 @@ async function buildMode(mode: string) {
       const local = await incus(["image", "info", lock.base.fingerprint], true, true);
       await init(local.code ? `images:${lock.base.fingerprint}` : lock.base.fingerprint, name, mode); created = true;
       await incus(["start", name]);
-      await provision(name, `${header}IMAGE_PROFILE=base\napt-get update\ncommand -v python3 >/dev/null || apt-get install -y --no-install-recommends python3=${aptLock.ubuntu!.python3!.version}\npython3 /root/.agent-vm-apt-install.py ubuntu\n${base}\n${docker}\n${runtimeRecord}${readiness}\n`);
+      await provision(name, `${header}${buildNetwork}IMAGE_PROFILE=base\napt-get update\ncommand -v python3 >/dev/null || apt-get install -y --no-install-recommends python3=${aptLock.ubuntu!.python3!.version}\npython3 /root/.agent-vm-apt-install.py ubuntu\n${base}\n${docker}\n${runtimeRecord}${readiness}\n`);
       await incus(["stop", name]);
       await incus(["publish", name, "--alias", commonAlias]);
     } finally { if (created) await remove(name); }
@@ -118,6 +132,7 @@ async function buildMode(mode: string) {
     const asset = `${lock.name}-${profile}-${mode}-amd64`;
     let created = false;
     let imageFingerprint = "";
+    let publishedAlias = false;
     try {
       await init(commonAlias, name, mode); created = true;
       await incus(["start", name]);
@@ -127,6 +142,7 @@ async function buildMode(mode: string) {
       }
       await incus(["stop", name]);
       await incus(["publish", name, "--alias", name, "--format", "unified"]);
+      publishedAlias = true;
       const published = await incus(["query", `/1.0/images/aliases/${name}?project=${encodeURIComponent(project)}`], true);
       imageFingerprint = JSON.parse(published.text).target;
       if (!/^[0-9a-f]{64}$/.test(imageFingerprint)) fail("publish did not return an immutable fingerprint");
@@ -137,8 +153,8 @@ async function buildMode(mode: string) {
       writeFileSync(join(output, `${asset}.manifest.json`), JSON.stringify(manifest, null, 2) + "\n");
       for (const suffix of ["tar.gz", "manifest.json", "sbom.json", "readiness.json"]) { const file = `${asset}.${suffix}`; checksums.push(`${await digest(join(output, file))}  ${file}`); }
     } finally {
-      if (imageFingerprint) await incus(["image", "alias", "delete", name]);
-      if (created) await remove(name);
+      try { if (publishedAlias) await incus(["image", "alias", "delete", name]); }
+      finally { if (created) await remove(name); }
     }
   }
 }

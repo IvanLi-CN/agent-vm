@@ -62,6 +62,10 @@ jobs:
           sudo systemctl start incus
           sudo incus admin init --minimal
           sudo incus network create avm-build-br ipv4.address=auto ipv6.address=none
+          # Hosted runners also run Docker, whose FORWARD policy can block Incus.
+          # Permit only traffic from this disposable build bridge and its replies.
+          sudo iptables -I FORWARD -i avm-build-br -j ACCEPT
+          sudo iptables -I FORWARD -o avm-build-br -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
       - name: Build and verify image
         run: sudo env PATH="$PATH" AGENT_VM_IMAGE_NETWORK=avm-build-br AGENT_VM_IMAGE_SOURCE_REVISION="$(git rev-parse HEAD)" bun run images:build -- --profile "${{ matrix.language }}" --variant "${{ matrix.variant }}"
       - name: Verify exported checksums

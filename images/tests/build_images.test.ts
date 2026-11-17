@@ -39,6 +39,7 @@ test("builds both runtime variants with separate commands and artifacts", () => 
     writeFileSync(join(temp, "incus"), `#!/usr/bin/env python3
 import hashlib,json,os,sys,subprocess,time
 args=sys.argv[1:]
+if args and args[0]=="query" and "--project" in args:sys.exit(43)
 if "--project" in args:
  i=args.index("--project");del args[i:i+2]
 with open(os.environ["IMAGE_TEST_LOG"],"a") as f:f.write(json.dumps(args)+"\\n")
@@ -54,6 +55,7 @@ if args[:2]==["file","push"]:
  subprocess.run(["bash","-n",args[2]],check=True)
 if args[:2]==["file","pull"]:
  with open(args[3],"w") as f:f.write('{"ready":true}')
+if args[0]=="query" and os.environ.get("IMAGE_TEST_FAIL_QUERY")=="1":sys.exit(44)
 if args[0]=="query":print(json.dumps({"target":hashlib.sha256(args[1].encode()).hexdigest()}))
 if args[:2]==["image","export"]:
  with open(args[3]+".gz","wb") as f:f.write(args[2].encode())
@@ -91,6 +93,15 @@ if args[:2]==["image","export"]:
     expect(failedCommands.some(args => args[0] === "publish")).toBe(false);
     expect(failedCommands.some(args => args[0] === "delete")).toBe(true);
     expect(readdirSync(join(temp, "failure-output"))).toHaveLength(0);
+    const queryLog = join(temp, "query-failure.jsonl");
+    const queryFailure = Bun.spawnSync([process.execPath, builder, "--profile", "go", "--variant", "privileged"], {
+      env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, IMAGE_TEST_LOG: queryLog, IMAGE_TEST_FAIL_QUERY: "1", AGENT_VM_IMAGE_OUTPUT: join(temp, "query-failure-output") }, stdout: "pipe", stderr: "pipe",
+    });
+    expect(queryFailure.exitCode).not.toBe(0);
+    const queryCommands = readFileSync(queryLog, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
+    const ownedAlias = queryCommands.find(args => args[0] === "query")![1]!.split("/aliases/")[1]!.split("?")[0]!;
+    expect(queryCommands.filter(args => args.slice(0, 3).join(" ") === "image alias delete").map(args => args[3])).toEqual([ownedAlias]);
+    expect(queryCommands.filter(args => args[0] === "delete").map(args => args[1])).toContain(ownedAlias);
     const concurrentLog = join(temp, "concurrent-failure.jsonl");
     const concurrent = Bun.spawnSync([process.execPath, builder, "--all"], {
       env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, IMAGE_TEST_LOG: concurrentLog, IMAGE_TEST_FAIL_START: "1", AGENT_VM_IMAGE_OUTPUT: join(temp, "concurrent-output") }, stdout: "pipe", stderr: "pipe",
