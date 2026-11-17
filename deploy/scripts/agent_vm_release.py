@@ -47,6 +47,7 @@ try:
         PRODUCT_UNIT_CONTENT_SHA256,
         PRODUCT_UNIT_EXEC_START,
         GO_UNIT_EXEC_START,
+        LEGACY_GO_UNIT_EXEC_START,
         GO_UNIT_CONTENT_SHA256,
         HISTORICAL_GO_UNIT_CONTENT_SHA256,
         HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
@@ -83,6 +84,7 @@ except ModuleNotFoundError:
         PRODUCT_UNIT_CONTENT_SHA256,
         PRODUCT_UNIT_EXEC_START,
         GO_UNIT_EXEC_START,
+        LEGACY_GO_UNIT_EXEC_START,
         GO_UNIT_CONTENT_SHA256,
         HISTORICAL_GO_UNIT_CONTENT_SHA256,
         HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
@@ -315,6 +317,8 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any]) -> None:
         if sha256_file(path) not in accepted:
             _fail("unit_unverified", f"unit bytes differ from the fixed policy: {name}")
         required = expected_exec.get(name, "Unit=agent-vm-native-age-gc.service")
+        if format_value in {2, 3, 4} and not any(a["path"] == "bin/agent-vm-server" for a in manifest["artifacts"]):
+            required = LEGACY_GO_UNIT_EXEC_START.get(name, required)
         if required not in content or (name != "agent-vm-native-age-gc.timer" and "ExecStart=" not in content):
             _fail("unit_unverified", f"unit does not contain its fixed ExecStart: {name}")
         if any(token in content for token in ("systemctl stop", "systemctl disable", "ExecStop=", "ssh ", "curl ", "wget ")):

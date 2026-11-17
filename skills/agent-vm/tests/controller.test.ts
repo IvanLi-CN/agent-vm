@@ -11,7 +11,7 @@ test("Bun client and canonical controller interoperate across native request ser
   const sent: Data[] = [];
   const client = new Client(local.env, async (argv, opts) => {
     expect(argv.slice(0, -1)).toEqual(["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes", "--", "fixture-host"]);
-    expect(argv.at(-1)).toMatch(/^\/opt\/agent-vm-native\/bin\/agent-vm-control request --socket \/run\/agent-vm-native\/control\.sock --timeout \d+s$/);
+    expect(argv.at(-1)).toMatch(/^\/opt\/agent-vm-native\/bin\/agent-vm-server request --socket \/run\/agent-vm-native\/control\.sock --timeout \d+s$/);
     const request = parse_json(String(opts!.input)); sent.push(request);
     try {
       const response = await remote.control.dispatch(request);

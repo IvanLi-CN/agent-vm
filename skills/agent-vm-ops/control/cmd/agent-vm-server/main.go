@@ -33,7 +33,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-var version = "agent-vm-control/dev"
+var version = "agent-vm-server/dev"
 
 const installedManifestPath = "/opt/agent-vm-native/release-manifest.json"
 
@@ -75,9 +75,9 @@ func run(args []string) error {
 			return errors.New("recovery-capabilities accepts no arguments")
 		}
 		return json.NewEncoder(os.Stdout).Encode(map[string]any{
-			"attempted_destroy_start":       1,
+			"attempted_destroy_start":        1,
 			"maintenance_operation_recovery": 1,
-			"requires_release_drain":        true,
+			"requires_release_drain":         true,
 		})
 	case "initialize-state":
 		return initializeState(args[1:])
@@ -311,7 +311,7 @@ func slotManifestPath(slot string) string {
 
 func web(args []string) error {
 	_ = args
-	return errors.New("management web command is retired; use agent-vm-control serve")
+	return errors.New("management web command is retired; use agent-vm-server serve")
 }
 
 func availableStagingBytes(path string) (int64, error) {

@@ -84,6 +84,14 @@ Go 控制服务继续作为 Incus 操作、持久生命周期状态、租约代�
 
 这些观测约束的术语分别为独立观测通道、待完成或失败的清单读取、最近有效的容量指标族、保留的来源快照和原始观测时间戳。
 
+### 服务程序与新增状态结构兼容
+
+服务端发布包仅包含两个项目二进制：长期运行的主服务 `agent-vm-server`，以及由 `agent-vm-deploy serve` 承担部署守护职责的 `agent-vm-deploy`。新包不提供 `agent-vm-control`、`agent-vm-deployd` 命令别名；既有 unit、配置和 socket 名称及协议 4 的逻辑部署合同身份不变。历史完整包按原有布局读取与启动，不能接受混搭或缺件。
+
+安装器必须将固定 request adapter、其完整已验证 artifact 集合与 manifest 一起安装，bootstrap 包必须包含客户端实际导入的完整依赖，并通过 Go/TS/Python 的同一完整布局校验，客户端 sidecar 必须与该 manifest 一致并一同安装，最后公布 manifest；普通部署 CLI 命令不初始化守护进程监听或维护循环。槽位持久化 systemd 配置按自身 manifest 选择新旧程序路径，重启宿主后仍保留该选择。
+
+SQLite 和 rqlite 状态读取不得仅因新增未知表、视图、索引或触发器而拒绝整个状态层。状态镜像必须保留新增结构及数据，正确处理无主键行、可空主键的多行 NULL、用户列遮蔽 rowid、无 rowid 表和生成列；装载快照不得重放触发器副作用，并须先恢复视图再恢复其 INSTEAD OF 触发器。必需结构缺失、真实约束冲突、代次及操作日志错误继续按原合同处理。回退不得降级共享数据库，不增设旧槽独立烟测；旧实例首次启动及两次重试均失败后停止该回退，重试计数跨部署服务重启保留。
+
 ## Requirements
 
 ### REQ-AGENT-VM-010 - 分层来源
@@ -246,7 +254,7 @@ TypeScript/Bun 同步助手将受 Git 跟踪且未忽略的工作树文件传输
 - `VER-AGENT-VM-029` 覆盖：`REQ-AGENT-VM-029` 通过[系统架构](../../architecture/system.md)的蓝绿章节、[发布合同](contracts/release.md)，以及活动链接、兼容窗口和回滚检查。该项属于计划目标验证，在目标面和测试存在前保持待完成。
 
 - `VER-AGENT-VM-030` 覆盖：`REQ-AGENT-VM-030` 通过[Web Demo 决策备忘录](../../proposals/agent-vm-web-demo.md)、[Web Demo 检查面板交互合同](contracts/web-demo-inspector.md)、演示运行时与 API 隔离测试、页面级浏览器测试集、静态构建和现有管理 API 边界检查。
-- `VER-AGENT-VM-031` 覆盖：`REQ-AGENT-VM-031` 通过[部署控制器合同](contracts/deployment-controller.md)、[发布合同中的部署控制器章节](contracts/release.md#deployment-controller-boundary)、[部署观测合同](contracts/observability.md#deployment-control-observation)、[蓝绿部署资源](../../deployment/blue-green.md)以及隔离的 Go/systemd/双槽位事务和恢复检查。
+- `VER-AGENT-VM-031` 覆盖：`REQ-AGENT-VM-031` 通过[部署控制器合同](contracts/deployment-controller.md)、[发布合同中的部署控制器章节](contracts/release.md#deployment-controller-boundary)、[部署观测合同](contracts/observability.md#deployment-control-observation)、[蓝绿部署资源](../../deployment/blue-green.md)以及隔离的 Go/systemd/双槽位事务和恢复检查。 新增结构兼容回归必须覆盖 epoch 刷新后的完整 OIDC 登录，以及无主键行、无 rowid 表、生成列、外键与触发器的数据完整性；原生验收必须覆盖新旧槽位路径、持久化启动配置和三次启动失败预算，并在结束时清理该验收自身留下的 failed unit 状态。
 
 验证映射的机器可读形式使用 ASCII 冒号，以保持仓库检查工具兼容：
 

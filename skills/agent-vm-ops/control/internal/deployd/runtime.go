@@ -25,7 +25,8 @@ import (
 )
 
 type HostRuntime struct {
-	Config Config
+	Config   Config
+	unitRoot string
 
 	mu                  sync.Mutex
 	metrics             map[string]map[string]map[string]string
@@ -620,7 +621,7 @@ func inspectBundle(bundle string) (map[string]any, []byte, []byte, os.FileMode, 
 	if err != nil {
 		return nil, nil, nil, 0, fmt.Errorf("read verified bundle manifest: %w", err)
 	}
-	controlPath := filepath.Join(temporary, "bin", "agent-vm-control")
+	controlPath := filepath.Join(temporary, "bin", releaseManifest.ServerBinary(manifest))
 	controlInfo, err := os.Stat(controlPath)
 	if err != nil {
 		return nil, nil, nil, 0, fmt.Errorf("stat verified control binary: %w", err)
@@ -1341,10 +1342,7 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 		// Restart even when systemd still reports the previous process as active:
 		// controller fencing can leave a resident process alive but not ready, and
 		// startup reconciliation is the only supported path back to admission.
-		if err := runtime.systemctl(ctx, "restart", "agent-vm-native@"+previous+".service"); err != nil {
-			return err
-		}
-		if err := runtime.waitSlot(ctx, previous); err != nil {
+		if err := runtime.startRollbackPrevious(ctx, previous); err != nil {
 			return err
 		}
 		body, status, err := runtime.slotRequest(ctx, runtime.socket(previous), http.MethodGet, "/internal/v1/health", nil)
@@ -1399,6 +1397,13 @@ func (runtime *HostRuntime) waitSlotIdentity(ctx context.Context, slot string, p
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if rollback, _ := ctx.Value(rollbackUnitKey{}).(bool); rollback {
+			output, err := exec.CommandContext(ctx, "systemctl", "show", "agent-vm-native@"+slot+".service", "--property=ActiveState", "--property=MainPID").Output()
+			properties := parseSystemdProperties(string(output))
+			if err == nil && properties["MainPID"] == "0" && (properties["ActiveState"] == "failed" || properties["ActiveState"] == "inactive") {
+				return processIdentity{}, fmt.Errorf("rollback slot %s exited during start", slot)
+			}
+		}
 		body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil)
 		if err == nil && (status == http.StatusOK || status == http.StatusServiceUnavailable) && healthEnvelopeValid(body) {
 			if identity, ok := processIdentityFromHealth(body); ok && (!requireChanged || !sameProcess(identity, previous)) {
@@ -1726,6 +1731,13 @@ func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) 
 	if !strings.HasPrefix(unit, "agent-vm-native@") || !strings.HasSuffix(unit, ".service") {
 		return errors.New("unsupported systemd unit")
 	}
+	if action == "start" || action == "restart" {
+		slot := strings.TrimSuffix(strings.TrimPrefix(unit, "agent-vm-native@"), ".service")
+		rollback, _ := ctx.Value(rollbackUnitKey{}).(bool)
+		if err := runtime.configureSlotUnit(ctx, slot, rollback); err != nil {
+			return err
+		}
+	}
 	command := exec.CommandContext(ctx, "systemctl", action, unit)
 	output, err := command.CombinedOutput()
 	if err != nil {
@@ -1764,7 +1776,11 @@ func (runtime *HostRuntime) systemdProcessMatches(ctx context.Context, slot stri
 	if !strings.HasSuffix(properties["ControlGroup"], "/agent-vm-native@"+slot+".service") {
 		return errors.New("systemd cgroup does not match the native slot unit")
 	}
-	expectedBinary := filepath.Join(runtime.Config.ReleaseRoot, "slots", slot, "bin", "agent-vm-control")
+	metadata, err := releaseManifest.LoadMetadata(filepath.Join(runtime.Config.ReleaseRoot, "slots", slot, "release-manifest.json"))
+	if err != nil {
+		return err
+	}
+	expectedBinary := filepath.Join(runtime.Config.ReleaseRoot, "slots", slot, "bin", metadata.ServerBinary)
 	expectedConfig := filepath.Join("/etc/agent-vm-native/slots", slot, "config.json")
 	expectedManifest := filepath.Join(runtime.Config.ReleaseRoot, "slots", slot, "release-manifest.json")
 	expectedCommand := expectedBinary + " serve --config " + expectedConfig + " --manifest " + expectedManifest
@@ -1944,4 +1960,80 @@ func nativeWorkerCount(value any) int64 {
 		}
 	}
 	return count
+}
+
+func (runtime *HostRuntime) configureSlotUnit(ctx context.Context, slot string, rollback bool) error {
+	if err := validSlot(slot); err != nil {
+		return err
+	}
+	manifestPath := filepath.Join(runtime.Config.ReleaseRoot, "slots", slot, "release-manifest.json")
+	metadata, err := releaseManifest.LoadMetadata(manifestPath)
+	if err != nil {
+		return err
+	}
+	binary := filepath.Join(runtime.Config.ReleaseRoot, "slots", slot, "bin", metadata.ServerBinary)
+	// Systemd escaping is unnecessary for the fixed production paths; reject unsafe custom roots.
+	for _, path := range []string{binary, manifestPath} {
+		if strings.ContainsAny(path, " \t\r\n%\\\"") {
+			return errors.New("unsafe slot unit path")
+		}
+	}
+	root := runtime.unitRoot
+	if root == "" {
+		root = "/etc/systemd/system"
+	}
+	dir := filepath.Join(root, "agent-vm-native@"+slot+".service.d")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	restart := "on-failure"
+	if rollback {
+		restart = "no"
+	}
+	content := "[Unit]\nConditionPathExists=\nConditionPathExists=" + binary + "\nConditionPathExists=/etc/agent-vm-native/slots/" + slot + "/config.json\n[Service]\nExecStart=\nExecStart=" + binary + " serve --config /etc/agent-vm-native/slots/" + slot + "/config.json --manifest " + manifestPath + "\nRestart=" + restart + "\n"
+	target := filepath.Join(dir, "10-release.conf")
+	if existing, err := os.ReadFile(target); err == nil && string(existing) == content {
+		return nil
+	}
+	if err := os.WriteFile(target+".tmp", []byte(content), 0644); err != nil {
+		return err
+	}
+	if err := os.Rename(target+".tmp", target); err != nil {
+		return err
+	}
+	return exec.CommandContext(ctx, "systemctl", "daemon-reload").Run()
+}
+
+type rollbackStartKey struct{}
+type rollbackUnitKey struct{}
+
+func (runtime *HostRuntime) startRollbackPrevious(ctx context.Context, slot string) error {
+	claim, ok := ctx.Value(rollbackStartKey{}).(func() error)
+	if !ok {
+		return errors.New("rollback start requires a persisted attempt budget")
+	}
+	var last error
+	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := claim(); err != nil {
+			return err
+		}
+		startCtx := context.WithValue(ctx, rollbackUnitKey{}, true)
+		last = runtime.systemctl(startCtx, "restart", "agent-vm-native@"+slot+".service")
+		if last == nil {
+			last = runtime.waitSlot(startCtx, slot)
+		}
+		if last == nil {
+			return runtime.configureSlotUnit(ctx, slot, false)
+		}
+		// Retry only a process proven to have exited, never an unavailable live service.
+		output, err := exec.CommandContext(ctx, "systemctl", "show", "agent-vm-native@"+slot+".service", "--property=ActiveState", "--property=MainPID").Output()
+		properties := parseSystemdProperties(string(output))
+		if err != nil || properties["MainPID"] != "0" || (properties["ActiveState"] != "failed" && properties["ActiveState"] != "inactive") {
+			return last
+		}
+	}
+	return fmt.Errorf("rollback previous version failed after three starts: %w", last)
 }

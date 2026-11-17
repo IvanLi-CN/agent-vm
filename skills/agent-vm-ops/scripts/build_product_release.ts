@@ -20,6 +20,7 @@ import { tmpdir } from "node:os";
 import {
   build_product_manifest,
   PRODUCT_LINUX_LEGACY_ARTIFACTS,
+  PRODUCT_LINUX_ARTIFACTS,
   PRODUCT_NATIVE_LINUX_ARTIFACTS,
   PRODUCT_MANIFEST_FORMAT,
   verify_client_sidecar,
@@ -80,13 +81,12 @@ function sourcePath(relative: string, binaryPaths: Record<string, string>): stri
 	if (relative.startsWith("systemd/")) return join(repositoryRoot, "deploy", "assets", relative);
 	if (relative === "config/agent-vm-web.json.example") return join(repositoryRoot, "deploy", "assets", "web.json.example");
 	if (relative === "web-assets.manifest.json") return webAssetsManifestPath;
-  if (relative === "bin/agent-vm-control") return binaryPaths.control;
-  if (relative === "bin/agent-vm-deployd") return binaryPaths.deployd;
+  if (relative === "bin/agent-vm-server") return binaryPaths.server;
   if (relative === "bin/agent-vm-deploy") return binaryPaths.deploy;
   return join(clientRoot, relative);
 }
 
-function buildBinary(target: string, binary: "control" | "deployd" | "deploy", binaryPath: string): void {
+function buildBinary(target: string, binary: "server" | "deploy", binaryPath: string): void {
   mkdirSync(dirname(binaryPath), { recursive: true, mode: 0o750 });
   const result = Bun.spawnSync([
     process.execPath,
@@ -108,7 +108,7 @@ function packageFiles(target: "client" | "linux/amd64" | "linux/arm64", binaryPa
       ...CLIENT_DEPENDENCIES.map(([name, mode]) => [name, name, "support", mode] as const),
     ];
   }
-  return bootstrap ? [...PRODUCT_LINUX_LEGACY_ARTIFACTS] : [...PRODUCT_NATIVE_LINUX_ARTIFACTS];
+  return bootstrap ? [...PRODUCT_LINUX_ARTIFACTS] : [...PRODUCT_NATIVE_LINUX_ARTIFACTS];
 }
 
 let webAssetsManifestPath = "";
@@ -124,8 +124,7 @@ try {
     ? { os: "source", arch: "any" }
     : { os: "linux", arch: targetMatch![2] }) as ProductTarget;
   const binaryPaths = {
-    control: join(temporaryRoot, "bin/agent-vm-control"),
-    deployd: join(temporaryRoot, "bin/agent-vm-deployd"),
+    server: join(temporaryRoot, "bin/agent-vm-server"),
     deploy: join(temporaryRoot, "bin/agent-vm-deploy"),
   };
   if (rawTarget !== "client") {
@@ -138,13 +137,12 @@ try {
       "--manifest-output", webAssetsManifestPath,
     ], { stdout: "pipe", stderr: "pipe" });
     if (assetBuild.exitCode !== 0) throw new Error(new TextDecoder().decode(assetBuild.stderr));
-    buildBinary(rawTarget, "control", binaryPaths.control);
-    buildBinary(rawTarget, "deployd", binaryPaths.deployd);
+    buildBinary(rawTarget, "server", binaryPaths.server);
     buildBinary(rawTarget, "deploy", binaryPaths.deploy);
   }
 
   const artifacts: Artifact[] = [];
-  for (const [name, relative, role, mode] of [...packageFiles(rawTarget as "client" | "linux/amd64" | "linux/arm64", binaryPaths.control)].sort((left, right) => compareDeterministically(left[1], right[1]))) {
+  for (const [name, relative, role, mode] of [...packageFiles(rawTarget as "client" | "linux/amd64" | "linux/arm64", binaryPaths.server)].sort((left, right) => compareDeterministically(left[1], right[1]))) {
     const destination = join(temporaryRoot, relative);
     mkdirSync(dirname(destination), { recursive: true, mode: 0o750 });
     const source = sourcePath(relative, binaryPaths);

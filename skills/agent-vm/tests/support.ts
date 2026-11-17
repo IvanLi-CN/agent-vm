@@ -28,7 +28,7 @@ export class Fixture {
     writeFileSync(join(this.root, "agent_vm.ts"), client, { mode: 0o755 });
     const dependencies = CLIENT_DEPENDENCIES.map(([name, mode]) => { const bytes = readFileSync(new URL(`../scripts/${name}`, import.meta.url)); writeFileSync(join(this.root, name), bytes, { mode }); return { name, path: name, role: "support", mode, sha256: sha256(bytes) }; });
     writeFileSync(this.env.AGENT_VM_RELEASE_MANIFEST, json({ format: 4, version: "1.0.0", source_revision: revision, protocol: 4, client_artifact: { name: "agent_vm.ts", path: "agent_vm.ts", role: "client", mode: 0o755, sha256: sha256(client) }, client_dependencies: dependencies, client_view: { version: "1.0.0", source_revision: revision, protocol: 4, transport: "go-request", actions: Object.fromEntries(ACTIONS.map(action => [action, { request: schema, response: schema, client_to_control: window, control_to_client: window }])) } }), { mode: 0o600 });
-    writeFileSync(join(this.root, "config", "agent-vm", "config.toml"), `default_host = "fixture"\n[hosts.fixture]\ntransport = "ssh"\ncontrol_host = "fixture-host"\nremote_request = "/opt/agent-vm-native/bin/agent-vm-control"\nremote_socket = "/run/agent-vm-native/control.sock"\n`, { mode: 0o600 });
+    writeFileSync(join(this.root, "config", "agent-vm", "config.toml"), `default_host = "fixture"\n[hosts.fixture]\ntransport = "ssh"\ncontrol_host = "fixture-host"\nremote_request = "/opt/agent-vm-native/bin/agent-vm-server"\nremote_socket = "/run/agent-vm-native/control.sock"\n`, { mode: 0o600 });
     this.client = new Client(this.env, this.runner, b => this.diagnostics.push(b));
   }
   close(): void { rmSync(this.root, { recursive: true, force: true }); }

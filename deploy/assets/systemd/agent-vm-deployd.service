@@ -2,12 +2,12 @@
 Description=Agent VM Deployd deployment controller
 After=local-fs.target
 After=agent-vm-native@blue.service agent-vm-native@green.service
-ConditionPathExists=/opt/agent-vm-native/bin/agent-vm-deployd
+ConditionPathExists=/opt/agent-vm-native/bin/agent-vm-deploy
 ConditionPathExists=/etc/agent-vm-native/deployd.json
 
 [Service]
 Type=simple
-ExecStart=/opt/agent-vm-native/bin/agent-vm-deployd --config /etc/agent-vm-native/deployd.json
+ExecStart=/opt/agent-vm-native/bin/agent-vm-deploy serve --config /etc/agent-vm-native/deployd.json
 Restart=on-failure
 RestartSec=2s
 TimeoutStartSec=60s
@@ -18,7 +18,7 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=yes
-ReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native
+ReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native /etc/systemd/system/agent-vm-native@blue.service.d /etc/systemd/system/agent-vm-native@green.service.d
 ReadOnlyPaths=/opt/agent-vm-native /etc/agent-vm-native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 UMask=0077

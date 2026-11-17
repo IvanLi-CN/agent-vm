@@ -8,11 +8,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
+	deploymentStore "github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd/store"
 )
 
 func TestQuiesceHistoricalUnknownIsNotRunningWork(t *testing.T) {
@@ -21,6 +24,7 @@ func TestQuiesceHistoricalUnknownIsNotRunningWork(t *testing.T) {
 			root := t.TempDir()
 			cfg := Defaults()
 			cfg.ReleaseRoot = root
+			installLayoutFixture(t, root, "blue", false)
 			cfg.BlueSocket = filepath.Join(root, "app.sock")
 			pid := os.Getpid()
 			script := fmt.Sprintf("#!/bin/sh\ncat <<'PROPERTIES'\nActiveState=active\nSubState=running\nMainPID=%d\nFragmentPath=/etc/systemd/system/agent-vm-native@.service\nControlGroup=/system.slice/agent-vm-native@blue.service\nExecStart={ argv[]=%s/slots/blue/bin/agent-vm-control serve --config /etc/agent-vm-native/slots/blue/config.json --manifest %s/slots/blue/release-manifest.json ; }\nPROPERTIES\n", pid, root, root)
@@ -71,5 +75,72 @@ func TestQuiesceHistoricalUnknownIsNotRunningWork(t *testing.T) {
 				t.Fatal("process ownership was not verified")
 			}
 		})
+	}
+}
+
+func TestRealSystemdRollbackCrashBudget(t *testing.T) {
+	if os.Getenv("AGENT_VM_ROLLBACK_CRASH_TEST") != "1" {
+		t.Skip("owned systemd acceptance only")
+	}
+	root, err := os.MkdirTemp("/var/lib/agent-vm-native", "rollback-crash-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	installLayoutFixture(t, root, "blue", true)
+	// The verified ELF header has no executable program: systemd must observe an actual startup crash.
+	extra := "/etc/systemd/system/agent-vm-native@blue.service.d/20-crash-test.conf"
+	if err := os.WriteFile(extra, []byte("[Service]\nExecStartPre=\nExecStartPost=\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = exec.Command("systemctl", "stop", "agent-vm-native@blue.service").Run()
+		_ = os.Remove(extra)
+		_ = exec.Command("systemctl", "daemon-reload").Run()
+	}()
+	cfg := Defaults()
+	cfg.ReleaseRoot = root
+	cfg.BlueSocket = filepath.Join(root, "missing.sock")
+	runtime := NewHostRuntime(cfg)
+	path := filepath.Join(root, "attempts.sqlite3")
+	db, err := deploymentStore.Open(path, time.Hour, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	ctx := context.Background()
+	if err := db.Create(ctx, deploymentStore.Transaction{ID: "crash", TargetSlot: "green", PreviousSlot: "blue", Bundle: "verified", Generation: 1, Phase: "rollback", State: "active"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	claimed := 0
+	claim := func() error {
+		if claimed == 1 { // Reopen the durable journal between first start and retry.
+			if err := db.Close(); err != nil {
+				return err
+			}
+			db, err = deploymentStore.Open(path, time.Hour, time.Now)
+			if err != nil {
+				return err
+			}
+		}
+		if err := db.ConsumeRollbackStart(ctx, "crash"); err != nil {
+			return err
+		}
+		claimed++
+		return nil
+	}
+	ctx = context.WithValue(ctx, rollbackStartKey{}, claim)
+	if err := runtime.startRollbackPrevious(ctx, "blue"); err == nil || !strings.Contains(err.Error(), "three starts") {
+		t.Fatalf("rollback result: %v", err)
+	}
+	if claimed != 3 {
+		t.Fatalf("starts=%d, want 3", claimed)
+	}
+	if err := runtime.startRollbackPrevious(ctx, "blue"); err == nil || claimed != 3 {
+		t.Fatalf("exhausted retry budget restarted old slot: %d %v", claimed, err)
+	}
+	output, err := exec.Command("systemctl", "show", "agent-vm-native@blue.service", "--property=Restart", "--property=MainPID").Output()
+	if err != nil || !strings.Contains(string(output), "Restart=no") || !strings.Contains(string(output), "MainPID=0") {
+		t.Fatalf("crashing slot not stopped: %s %v", output, err)
 	}
 }

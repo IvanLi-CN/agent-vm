@@ -50,8 +50,7 @@ const clientRoot = resolve(import.meta.dir, "../../agent-vm/scripts");
 const opsRoot = resolve(import.meta.dir, "..");
 const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-go-release-"));
 const binaryPaths = {
-  control: join(temporaryRoot, "bin/agent-vm-control"),
-  deployd: join(temporaryRoot, "bin/agent-vm-deployd"),
+  server: join(temporaryRoot, "bin/agent-vm-server"),
   deploy: join(temporaryRoot, "bin/agent-vm-deploy"),
 };
 
@@ -64,13 +63,12 @@ function sourcePath(relative: string): string {
   if (relative === "systemd/agent-vm-native.service") return join(opsRoot, "..", "..", "deploy", "assets", relative);
   if (relative === "systemd/agent-vm-native@.service") return join(opsRoot, "..", "..", "deploy", "assets", relative);
   if (relative === "systemd/agent-vm-deployd.service") return join(opsRoot, "..", "..", "deploy", "assets", relative);
-  if (relative === "bin/agent-vm-control") return binaryPaths.control;
-  if (relative === "bin/agent-vm-deployd") return binaryPaths.deployd;
+  if (relative === "bin/agent-vm-server") return binaryPaths.server;
   if (relative === "bin/agent-vm-deploy") return binaryPaths.deploy;
   return join(clientRoot, relative);
 }
 
-function buildBinary(binary: "control" | "deployd" | "deploy"): void {
+function buildBinary(binary: "server" | "deploy"): void {
   const output = binaryPaths[binary];
   mkdirSync(dirname(output), { recursive: true, mode: 0o750 });
   const result = Bun.spawnSync([
@@ -85,8 +83,7 @@ function buildBinary(binary: "control" | "deployd" | "deploy"): void {
 }
 
 try {
-  buildBinary("control");
-  buildBinary("deployd");
+  buildBinary("server");
   buildBinary("deploy");
   const artifacts: GoArtifact[] = [];
   for (const [name, relative, role, mode] of [...GO_FIXED_ARTIFACTS].sort((left, right) => left[1].localeCompare(right[1]))) {

@@ -87,7 +87,7 @@ class ProductManifestTests(unittest.TestCase):
                 payload = root / path
                 payload.parent.mkdir(parents=True, exist_ok=True)
                 data = b"artifact:" + path.encode()
-                if path in {"bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
+                if path in {"bin/agent-vm-server", "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
                     data = bytearray(20)
                     data[:7] = b"\x7fELF\x02\x01\x01"
                     data[18:20] = (62).to_bytes(2, "little")
@@ -145,6 +145,17 @@ class ProductManifestTests(unittest.TestCase):
             )
 
             historical = copy.deepcopy(legacy)
+            historical["artifacts"] = [a for a in historical["artifacts"] if a["path"] != "bin/agent-vm-server"]
+            for name, path, role, mode in __import__("release_manifest").LEGACY_GO_ARTIFACTS:
+                if any(a["path"] == path for a in historical["artifacts"]):
+                    continue
+                payload = root / path
+                payload.parent.mkdir(parents=True, exist_ok=True)
+                content = b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42
+                payload.write_bytes(content)
+                payload.chmod(mode)
+                historical["artifacts"].append(dict(name=name, path=path, role=role, mode=mode, sha256=hashlib.sha256(content).hexdigest()))
+
             for name, path, role, mode in (
                 ("unit:agent-vm-web.service", "systemd/agent-vm-web.service", "unit", 0o644),
                 ("web-config-example", "config/agent-vm-web.json.example", "support", 0o640),

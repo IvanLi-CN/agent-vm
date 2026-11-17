@@ -11,6 +11,8 @@ declare -A unit_was_active
 group_created=0
 
 test_paths=(
+  /etc/systemd/system/agent-vm-native@blue.service.d
+  /etc/systemd/system/agent-vm-native@green.service.d
   /etc/agent-vm-native
   /opt/agent-vm-native
   /var/lib/agent-vm-native
@@ -74,6 +76,9 @@ restore_environment() {
   local unit path backup
   set +e +u
   for unit in "${runtime_units[@]}"; do
+    if [[ "$(systemctl show "$unit" --property=LoadState --value)" == not-found ]]; then
+      continue
+    fi
     if ! systemctl stop "$unit" >/dev/null 2>&1; then
       restore_status=1
     fi
@@ -82,6 +87,7 @@ restore_environment() {
     fi
   done
   if [[ "$restore_status" -eq 0 ]]; then
+    systemctl reset-failed agent-vm-native@blue.service agent-vm-native@green.service >/dev/null 2>&1 || true
     for path in "${test_paths[@]}"; do
       if [[ -e "$path" || -L "$path" ]]; then
         rm -rf -- "$path"
@@ -165,6 +171,9 @@ for unit in "${runtime_units[@]}"; do
   fi
 done
 for unit in "${runtime_units[@]}"; do
+  if [[ "$(systemctl show "$unit" --property=LoadState --value)" == not-found ]]; then
+    continue
+  fi
   systemctl stop "$unit" >/dev/null 2>&1 || fail "could not stop pre-existing unit $unit"
   if systemctl is-active --quiet "$unit"; then
     fail "pre-existing unit $unit remained active after stop"
@@ -182,6 +191,8 @@ if ! getent group agent-vm-web >/dev/null 2>&1; then
   group_created=1
 fi
 
+mkdir -p /etc/systemd/system/agent-vm-native@blue.service.d /etc/systemd/system/agent-vm-native@green.service.d
+
 fake_slot="$test_root/testslot"
 go -C "$control_root" build -o "$fake_slot" ./internal/deployd/testslot
 
@@ -198,12 +209,12 @@ bundle_root="$test_root/bundle"
 mkdir -p -- "$bundle_root"
 tar -xf "$build_bundle" -C "$bundle_root"
 real_control_binary="$test_root/real-agent-vm-control"
-cp -- "$bundle_root/bin/agent-vm-control" "$real_control_binary"
+cp -- "$bundle_root/bin/agent-vm-server" "$real_control_binary"
 chmod 0755 "$real_control_binary"
 "$real_control_binary" version >/dev/null || fail "the real agent-vm-control binary did not pass its version smoke test"
-cp -- "$fake_slot" "$bundle_root/bin/agent-vm-control"
-chmod 0755 "$bundle_root/bin/agent-vm-control"
-python3 - "$bundle_root/release-manifest.json" "$bundle_root/bin/agent-vm-control" <<'PY'
+cp -- "$fake_slot" "$bundle_root/bin/agent-vm-server"
+chmod 0755 "$bundle_root/bin/agent-vm-server"
+python3 - "$bundle_root/release-manifest.json" "$bundle_root/bin/agent-vm-server" <<'PY'
 import hashlib
 import json
 import sys
@@ -213,7 +224,7 @@ with open(manifest_path, encoding="utf-8") as handle:
     manifest = json.load(handle)
 digest = hashlib.sha256(open(control_path, "rb").read()).hexdigest()
 for artifact in manifest["artifacts"]:
-    if artifact["path"] == "bin/agent-vm-control":
+    if artifact["path"] == "bin/agent-vm-server":
         artifact["sha256"] = digest
         break
 else:
@@ -227,7 +238,7 @@ bundle_members=(
   release-manifest.json client-release.json
   agent_vm.ts byte-fs.ts client-io.ts client-release.ts client.ts guest-source.ts host-config.ts sync-native.ts sync_worktree.ts
   agent_vm_control_bridge.ts
-  bin/agent-vm-control bin/agent-vm-deployd bin/agent-vm-deploy
+  bin/agent-vm-server bin/agent-vm-deploy
   systemd/agent-vm-native.service systemd/agent-vm-native@.service systemd/agent-vm-deployd.service
 )
 tar -cf "$real_bundle" -C "$bundle_root" "${bundle_members[@]}"
@@ -235,14 +246,16 @@ tar -cf "$real_bundle" -C "$bundle_root" "${bundle_members[@]}"
 install -d -m 0750 /etc/agent-vm-native/slots /opt/agent-vm-native/bin \
   /var/lib/agent-vm-native/slots /var/lib/agent-vm-native/deployment \
   /run/agent-vm-native/blue /run/agent-vm-native/green
-cp -- "$bundle_root/bin/agent-vm-deployd" /opt/agent-vm-native/bin/agent-vm-deployd
+cp -- "$real_bundle" /var/lib/agent-vm-native/deployment/acceptance.tar
+real_bundle=/var/lib/agent-vm-native/deployment/acceptance.tar
 cp -- "$bundle_root/bin/agent-vm-deploy" /opt/agent-vm-native/bin/agent-vm-deploy
-chmod 0755 /opt/agent-vm-native/bin/agent-vm-deployd /opt/agent-vm-native/bin/agent-vm-deploy
+chmod 0755 /opt/agent-vm-native/bin/agent-vm-deploy
 
 for slot in blue green; do
   slot_root="/var/lib/agent-vm-native/slots/$slot"
-  mkdir -p -- "$slot_root"
+  mkdir -p -- "$slot_root" "/etc/agent-vm-native/slots/$slot"
   tar -xf "$real_bundle" -C "$slot_root"
+  chmod 0750 "$slot_root"
   ln -s "/run/agent-vm-native/$slot/app.sock" "$slot_root/app.sock"
   cat >"/etc/agent-vm-native/slots/$slot/config.json" <<EOF
 {"slot":"$slot","socket":"/run/agent-vm-native/$slot/app.sock"}
@@ -279,6 +292,10 @@ Description=Deployd acceptance state-authority stub
 Type=simple
 ExecStart=$sleep_binary 3600
 EOF
+# The testslot adapter has no database; authority startup itself is covered by wait-authority and TLS/rqlite acceptance.
+for slot in blue green; do
+  printf '[Service]\nExecStartPre=\n' >"/etc/systemd/system/agent-vm-native@$slot.service.d/05-test-authority.conf"
+done
 systemctl daemon-reload
 
 debug_unit() {
@@ -331,7 +348,7 @@ for slot in blue green; do
   [[ "$main_pid" =~ ^[1-9][0-9]*$ ]] || fail "$slot MainPID was not verified"
   [[ "$control_group" == */agent-vm-native@"$slot".service ]] || fail "$slot cgroup was not verified"
   [[ "$fragment_path" == /etc/systemd/system/agent-vm-native@.service ]] || fail "$slot fragment path was not verified"
-  assert_exec_start "$exec_start" "/var/lib/agent-vm-native/slots/$slot/bin/agent-vm-control serve --config /etc/agent-vm-native/slots/$slot/config.json --manifest /var/lib/agent-vm-native/slots/$slot/release-manifest.json" "$slot ExecStart" || fail "$slot ExecStart was not verified"
+  assert_exec_start "$exec_start" "/var/lib/agent-vm-native/slots/$slot/bin/agent-vm-server serve --config /etc/agent-vm-native/slots/$slot/config.json --manifest /var/lib/agent-vm-native/slots/$slot/release-manifest.json" "$slot ExecStart" || fail "$slot ExecStart was not verified"
 done
 
 systemctl start agent-vm-deployd.service
@@ -353,7 +370,7 @@ deployd_exec="$(systemctl show agent-vm-deployd.service --property=ExecStart --v
 [[ "$deployd_pid" =~ ^[1-9][0-9]*$ ]] || fail "Deployd MainPID was not verified"
 [[ "$deployd_group" == */agent-vm-deployd.service ]] || fail "Deployd cgroup was not verified"
 [[ "$deployd_fragment" == /etc/systemd/system/agent-vm-deployd.service ]] || fail "Deployd fragment path was not verified"
-assert_exec_start "$deployd_exec" "/opt/agent-vm-native/bin/agent-vm-deployd --config /etc/agent-vm-native/deployd.json" "Deployd ExecStart" || fail "Deployd ExecStart was not verified"
+assert_exec_start "$deployd_exec" "/opt/agent-vm-native/bin/agent-vm-deploy serve --config /etc/agent-vm-native/deployd.json" "Deployd ExecStart" || fail "Deployd ExecStart was not verified"
 
 assert_status() {
   local payload="$1"
@@ -384,6 +401,7 @@ PY
 }
 
 status_json="$(/opt/agent-vm-native/bin/agent-vm-deploy status --json)"
+printf '%s\n' "$status_json" >"$test_root/initial-status.json"
 python3 - "$status_json" <<'PY'
 import json
 import sys
@@ -443,5 +461,9 @@ grep -Fq 'agent_vm_deployd_recovery_required 1' <<<"$recovery_metrics" || fail "
 /opt/agent-vm-native/bin/agent-vm-deploy recover --transaction "$recovery_transaction" --action rollback --json >/dev/null
 status_json="$(/opt/agent-vm-native/bin/agent-vm-deploy status --json)"
 assert_status "$status_json" green blue
+
+# Run the crash budget against real systemd after the normal switch/recovery proof.
+systemctl stop agent-vm-deployd.service agent-vm-native@blue.service agent-vm-native@green.service
+AGENT_VM_ROLLBACK_CRASH_TEST=1 go -C "$control_root" test -count=1 ./internal/deployd -run '^TestRealSystemdRollbackCrashBudget$' -v
 
 printf '{"schema_version":1,"verdict":"pass","systemd":"real","slot_runtime":"testslot-adapter","real_control_binary":"version-smoke-passed","slots":"dual-process-and-uds","switch":"green","restart_recovery":"needs_recovery-and-bounded-rollback","metrics":"single-deployd-endpoint"}\n'

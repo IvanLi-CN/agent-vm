@@ -6,12 +6,12 @@
 
 | 面 | 部署输入 |
 | --- | --- |
-| 旧版 format-2 控制服务 | `/opt/agent-vm-native/bin/agent-vm-control`，由 `agent-vm-native.service` 启动 |
-| 目标蓝绿槽位服务 | `/var/lib/agent-vm-native/slots/{blue,green}/bin/agent-vm-control`，由 `agent-vm-native@{blue,green}.service` 启动 |
-| Deployd | `/opt/agent-vm-native/bin/agent-vm-deployd`，由两个槽位外的 `agent-vm-deployd.service` 启动；Prometheus 从其内部管理监听的 `GET /metrics` 拉取指标 |
+| 旧版 format-2 控制服务 | `/opt/agent-vm-native/bin/agent-vm-server`，由 `agent-vm-native.service` 启动 |
+| 目标蓝绿槽位服务 | `/var/lib/agent-vm-native/slots/{blue,green}/bin/agent-vm-server`，由 `agent-vm-native@{blue,green}.service` 启动 |
+| Deployd | `/opt/agent-vm-native/bin/agent-vm-deploy serve`，由两个槽位外的 `agent-vm-deployd.service` 启动；Prometheus 从其内部管理监听的 `GET /metrics` 拉取指标 |
 | 槽位观测目录 | `/run/agent-vm-native/{blue,green}/metrics`；每个槽位独占自己的 snapshot 目录，deployd 按槽位读取 |
 | 目标部署状态 | `/var/lib/agent-vm-native/deployment/deployment.sqlite3`，独立于业务状态和 rqlite |
-| 当前控制入口 | Go `agent-vm-control` request adapter 与受保护 control socket |
+| 当前控制入口 | Go `agent-vm-server` request adapter 与受保护 control socket |
 | 控制解释器 | 当前发布使用 Go binary；Bun 仅作为客户端构建工具保留 |
 | 配置 | `/etc/agent-vm-native/config.json` 中由 root-owned 的 JSON |
 | 管理配置 | 启用管理功能时，使用 `/etc/agent-vm-native/config.json` 中由 root-owned 保护的管理配置；管理 API 由常驻 Go 控制服务提供 |

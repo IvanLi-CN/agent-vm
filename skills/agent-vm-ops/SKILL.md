@@ -27,7 +27,7 @@ Drain 拒绝新的 lease 和 restart admission，允许在线 retrieval/release�
 升级后检查 native Incus/systemd/OpenSSH 行为。
 本 Skill 不授权外部宿主机生命周期变更、自动重启控制环境或大范围 cleanup。
 
-只部署来自同一 revision 的正式候选版本：包括[Go 控制服务](control/cmd/agent-vm-control/main.go)、槽位外的 deployd 服务、[format-2 bridge](scripts/agent_vm_control_bridge.ts)、完整客户端包和[systemd 资源](assets/systemd/)。
+只部署来自同一 revision 的正式候选版本：包括[Go 控制服务](control/cmd/agent-vm-server/main.go)、槽位外的 deployd 服务、[format-2 bridge](scripts/agent_vm_control_bridge.ts)、完整客户端包和[systemd 资源](assets/systemd/)。
 路径和验证遵循[部署参考](references/deployment.md)，Incus project/profile policy 遵循[初始化参考](references/initialization.md)，native OS 和 guest prerequisite 遵循[运行时合同](references/control-runtime.md)。
 当前 release 只允许 Go native control 与固定的 Go `request` adapter；SSH 入口通过受保护 UDS 转发请求。历史格式仅由离线迁移工具读取。
 修改 client 前先 build、verify 和 publish matching manifest。

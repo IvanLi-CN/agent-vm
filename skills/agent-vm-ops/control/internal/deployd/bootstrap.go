@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	releaseManifest "github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/manifest"
 	"net/http"
 	"os"
 	"os/exec"
@@ -179,7 +180,11 @@ func (runtime *HostRuntime) prepareBootstrap(ctx context.Context, bundle string,
 	if err := runtime.stageBundle("blue", bundle); err != nil {
 		return err
 	}
-	binary := filepath.Join(runtime.Config.ReleaseRoot, "slots", "blue", "bin", "agent-vm-control")
+	metadata, err := releaseManifest.LoadMetadata(filepath.Join(runtime.Config.ReleaseRoot, "slots", "blue", "release-manifest.json"))
+	if err != nil {
+		return err
+	}
+	binary := filepath.Join(runtime.Config.ReleaseRoot, "slots", "blue", "bin", metadata.ServerBinary)
 	// The business service owns schema creation; Deployd never opens business state.
 	args := []string{"initialize-state"}
 	if resume {

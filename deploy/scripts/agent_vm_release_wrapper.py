@@ -48,6 +48,7 @@ try:
         HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
         HISTORICAL_PRODUCT_UNIT_EXEC_START,
         GO_UNIT_EXEC_START,
+        LEGACY_GO_UNIT_EXEC_START,
         LEGACY_PRODUCT_MANIFEST_FORMAT,
         PRODUCT_MANIFEST_FORMAT,
         STATE_CAPABILITY_MARKERS,
@@ -83,6 +84,7 @@ except ModuleNotFoundError:
         HISTORICAL_PRODUCT_UNIT_CONTENT_SHA256,
         HISTORICAL_PRODUCT_UNIT_EXEC_START,
         GO_UNIT_EXEC_START,
+        LEGACY_GO_UNIT_EXEC_START,
         LEGACY_PRODUCT_MANIFEST_FORMAT,
         PRODUCT_MANIFEST_FORMAT,
         STATE_CAPABILITY_MARKERS,
@@ -108,7 +110,7 @@ RETIRED_CONTROL_NAME = "agent_vm_control.py"
 RETIRED_CLIENT_NAME = "agent_vm.py"
 CANONICAL_UNIT_DIR = Path("/etc/systemd/system")
 RELEASE_FENCE_PATH = Path("/run/agent-vm-native/release-activation.fence")
-GO_CONTROL_PATH = Path("/opt/agent-vm-native/bin/agent-vm-control")
+GO_CONTROL_PATH = Path("/opt/agent-vm-native/bin/agent-vm-server")
 GO_DEPLOYD_PATH = Path("/opt/agent-vm-native/bin/agent-vm-deployd")
 GO_DEPLOY_PATH = Path("/opt/agent-vm-native/bin/agent-vm-deploy")
 GO_SLOT_NAMES = ("blue", "green")
@@ -156,11 +158,11 @@ def _manifest_release_id(manifest: Mapping[str, Any]) -> str:
     return str(manifest["source_revision"] if _is_product_manifest(manifest) else manifest["release_id"])
 
 
-def _go_control_target(config: Mapping[str, Any]) -> Path:
+def _go_control_target(config: Mapping[str, Any], name: str = "agent-vm-server") -> Path:
     configured = Path(config["control_path"])
     if configured == CANONICAL_CONTROL_PATH:
-        return GO_CONTROL_PATH
-    return configured.parent / "bin" / GO_CONTROL_PATH.name
+        return GO_CONTROL_PATH.with_name(name)
+    return configured.parent / "bin" / name
 
 
 def _go_binary_target(config: Mapping[str, Any], canonical: Path) -> Path:
@@ -693,7 +695,8 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_hist
                 _fail("unit_unverified", f"product unit has no fixed content policy: {name}")
             if sha256_file(path) not in accepted_hashes:
                 _fail("unit_unverified", f"unit bytes differ from the fixed product policy: {name}")
-            if expected_units[name] not in content or "ExecStart=" not in content:
+            required = expected_units[name] if any(a["path"] == "bin/agent-vm-server" for a in manifest["artifacts"]) else LEGACY_GO_UNIT_EXEC_START.get(name, expected_units[name])
+            if required not in content or "ExecStart=" not in content:
                 _fail("unit_unverified", f"unit does not contain its fixed ExecStart: {name}")
             if any(token in content for token in ("systemctl stop", "systemctl disable", "ExecStop=", "ssh ", "curl ", "wget ")):
                 _fail("unit_unverified", f"unit contains a forbidden control path: {name}")
@@ -715,7 +718,8 @@ def _verify_unit_contents(root: Path, manifest: Mapping[str, Any], *, allow_hist
                 accepted_hashes.update(HISTORICAL_GO_UNIT_CONTENT_SHA256[name])
             if sha256_file(path) not in accepted_hashes:
                 _fail("unit_unverified", f"unit bytes differ from the fixed Go policy: {name}")
-            if GO_UNIT_EXEC_START[name] not in content or "ExecStart=" not in content:
+            required = GO_UNIT_EXEC_START[name] if any(a["path"] == "bin/agent-vm-server" for a in manifest["artifacts"]) else LEGACY_GO_UNIT_EXEC_START[name]
+            if required not in content or "ExecStart=" not in content:
                 _fail("unit_unverified", f"unit does not contain its fixed ExecStart: {name}")
             if any(token in content for token in ("systemctl stop", "systemctl disable", "ExecStop=", "ssh ", "curl ", "wget ")):
                 _fail("unit_unverified", f"unit contains a forbidden control path: {name}")
@@ -763,7 +767,7 @@ def _verify_fixed_artifacts(
 ) -> None:
     declared = {(item["role"], item["path"]) for item in manifest["artifacts"]}
     if _is_product_manifest(manifest):
-        expected_values = PRODUCT_LINUX_ARTIFACTS if manifest["format"] == PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_LEGACY_ARTIFACTS
+        expected_values = {(a["name"], a["path"], a["role"], a["mode"]) for a in manifest["artifacts"]}
         if (
             allow_historical_web_config_mode
             and manifest["format"] == PRODUCT_MANIFEST_FORMAT
@@ -1018,6 +1022,7 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
     targets = (
         Path(config["control_path"]),
         _go_control_target(config),
+        _go_control_target(config, "agent-vm-control"),
         _go_binary_target(config, GO_DEPLOYD_PATH),
         _go_binary_target(config, GO_DEPLOY_PATH),
         Path(config["control_path"]).with_name(RETIRED_CONTROL_NAME),
@@ -1031,6 +1036,7 @@ def _activation_targets(config: Mapping[str, Any]) -> tuple[Path, ...]:
         for slot in GO_SLOT_NAMES
         for target in (
             _go_slot_root(config, slot) / "bin" / "agent-vm-control",
+            _go_slot_root(config, slot) / "bin" / "agent-vm-server",
             _go_slot_root(config, slot) / "release-manifest.json",
         )
     ) + (
@@ -1357,7 +1363,7 @@ def _attempted_destroy_recovery_pending(pending: list[Any], metrics: Mapping[str
 
 def _verify_destroy_recovery_candidate(candidate_root: Path) -> None:
     try:
-        result = subprocess.run([str(candidate_root / "bin/agent-vm-control"), "recovery-capabilities"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=10)
+        result = subprocess.run([str(candidate_root / "bin" / _release_server_name(candidate_root)), "recovery-capabilities"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=10)
         capabilities = json.loads(result.stdout)
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, json.JSONDecodeError):
         _fail("drain_unverified", "candidate does not prove native worker recovery support")
@@ -1369,7 +1375,7 @@ def _verify_destroy_recovery_candidate(candidate_root: Path) -> None:
 
 def _verify_maintenance_recovery_candidate(candidate_root: Path) -> None:
     try:
-        result = subprocess.run([str(candidate_root / "bin/agent-vm-control"), "recovery-capabilities"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=10)
+        result = subprocess.run([str(candidate_root / "bin" / _release_server_name(candidate_root)), "recovery-capabilities"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False, timeout=10)
         capabilities = json.loads(result.stdout)
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError, json.JSONDecodeError):
         _fail("drain_unverified", "candidate does not prove maintenance operation recovery support")
@@ -2005,7 +2011,7 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
     """Install the format-4 product and retire the standalone Web artifacts."""
     owner_uid = int(config["owner_uid"])
     bundle_root = Path(config["control_path"]).parent
-    expected_values = PRODUCT_LINUX_ARTIFACTS if manifest["format"] == PRODUCT_MANIFEST_FORMAT else PRODUCT_LINUX_LEGACY_ARTIFACTS
+    expected_values = {(a["name"], a["path"], a["role"], a["mode"]) for a in manifest["artifacts"]}
     expected_support = {path for _, path, role, _ in expected_values if role == "support"}
     installed_support: set[str] = set()
     installed_controls: set[str] = set()
@@ -2029,8 +2035,8 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
                 legacy_target = Path(config["control_path"])
                 if legacy_target != _go_bridge_target(config):
                     _copy_atomic(source, legacy_target, owner_uid, item["mode"])
-            elif item["path"] == "bin/agent-vm-control":
-                _copy_atomic(source, _go_control_target(config), owner_uid, item["mode"])
+            elif item["path"] in {"bin/agent-vm-control", "bin/agent-vm-server"}:
+                _copy_atomic(source, _go_control_target(config, Path(item["path"]).name), owner_uid, item["mode"])
             elif item["path"] == "bin/agent-vm-deployd":
                 _copy_atomic(source, _go_binary_target(config, GO_DEPLOYD_PATH), owner_uid, item["mode"])
             elif item["path"] == "bin/agent-vm-deploy":
@@ -2045,9 +2051,7 @@ def _install_product_release_files(config: Mapping[str, Any], release_root: Path
             _copy_atomic(source, Path(config["unit_dir"]) / name, owner_uid, item["mode"])
             _copy_atomic(source, bundle_root / item["path"], owner_uid, item["mode"])
     expected_client_support = {path for _, path, role, _ in PRODUCT_CLIENT_ARTIFACTS if role == "support"}
-    expected_controls = {"agent_vm_control_bridge.ts", "bin/agent-vm-control"}
-    if manifest["format"] == PRODUCT_MANIFEST_FORMAT:
-        expected_controls |= {"bin/agent-vm-deployd", "bin/agent-vm-deploy"}
+    expected_controls = {a["path"] for a in manifest["artifacts"] if a["role"] == "control"}
     if installed_support != expected_support or not expected_client_support.issubset(installed_support) or installed_controls != expected_controls:
         _fail("activation_unverified", "fixed product control artifacts are missing")
     for name in GO_RETIRED_UNITS:
@@ -2134,8 +2138,8 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
                 if legacy_target != _go_bridge_target(config):
                     _copy_atomic(source, legacy_target, owner_uid, item["mode"])
                 installed_controls.add(item["path"])
-            elif item["path"] == "bin/agent-vm-control":
-                _copy_atomic(source, _go_control_target(config), owner_uid, item["mode"])
+            elif item["path"] in {"bin/agent-vm-control", "bin/agent-vm-server"}:
+                _copy_atomic(source, _go_control_target(config, Path(item["path"]).name), owner_uid, item["mode"])
                 installed_controls.add(item["path"])
             elif item["path"] == "bin/agent-vm-deployd":
                 _copy_atomic(source, _go_binary_target(config, GO_DEPLOYD_PATH), owner_uid, item["mode"])
@@ -2150,7 +2154,7 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
                 _fail("activation_unverified", "Go unit artifact path is not fixed")
             _copy_atomic(source, Path(config["unit_dir"]) / Path(item["path"]).name, owner_uid, item["mode"])
             _copy_atomic(source, go_bundle_root / item["path"], owner_uid, item["mode"])
-    if installed_support != expected_support or installed_controls != {"agent_vm_control_bridge.ts", "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"}:
+    if installed_support != expected_support or installed_controls != {a["path"] for a in manifest["artifacts"] if a["role"] == "control"}:
         _fail("activation_unverified", "fixed Go control artifacts are missing")
     for name in GO_RETIRED_UNITS:
         retired = Path(config["unit_dir"]) / name
@@ -2180,11 +2184,11 @@ def _install_go_release_files(config: Mapping[str, Any], release_root: Path, man
     manifest_source = release_root / MANIFEST_NAME
     _require_owned_regular(manifest_source, owner_uid, 0o644)
     _copy_atomic(manifest_source, Path(config["control_path"]).with_name(MANIFEST_NAME), owner_uid, 0o644)
-    slot_binary = release_root / "bin" / "agent-vm-control"
+    slot_binary = release_root / "bin" / _release_server_name(release_root)
     _require_owned_regular(slot_binary, owner_uid, 0o755)
     for slot in GO_SLOT_NAMES:
         slot_root = _go_slot_root(config, slot)
-        _copy_atomic(slot_binary, slot_root / "bin" / "agent-vm-control", owner_uid, 0o755)
+        _copy_atomic(slot_binary, slot_root / "bin" / slot_binary.name, owner_uid, 0o755)
         _copy_atomic(manifest_source, slot_root / "release-manifest.json", owner_uid, 0o644)
     client_sidecar = release_root / "client-release.json"
     _require_owned_regular(client_sidecar, owner_uid, 0o644)
@@ -2642,6 +2646,14 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         sys.stderr.write(json.dumps({"ok": False, "error": {"code": "internal_error", "message": type(exc).__name__}}, sort_keys=True) + "\n")
         return 3
+
+
+
+def _release_server_name(root: Path) -> str:
+    # Callers have verified this manifest and its complete artifact layout.
+    with (root / MANIFEST_NAME).open(encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    return "agent-vm-server" if any(a["path"] == "bin/agent-vm-server" for a in manifest["artifacts"]) else "agent-vm-control"
 
 
 if __name__ == "__main__":

@@ -402,3 +402,34 @@ func TestLatestObservationNotificationsCoalesceAndExcludeFailedCommits(t *testin
 		t.Fatalf("notification lacked committed snapshot: %#v %v", got, err)
 	}
 }
+
+func TestRollbackStartBudgetSurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "deployment.sqlite3")
+	db, err := Open(path, time.Hour, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(ctx, Transaction{ID: "retry", TargetSlot: "green", PreviousSlot: "blue", Bundle: "verified", Generation: 1, Phase: "rollback", State: "active"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := db.ConsumeRollbackStart(ctx, "retry"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, time.Hour, time.Now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.ConsumeRollbackStart(ctx, "retry"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ConsumeRollbackStart(ctx, "retry"); err == nil {
+		t.Fatal("fourth rollback start allowed")
+	}
+}

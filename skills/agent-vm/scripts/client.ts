@@ -408,7 +408,7 @@ export class Client {
     const transport = selectedTransport === "ssh" ? "go-request" : selectedTransport;
     const secret = https?.token;
     const remoteCommand = transport === "go-request"
-      ? shellJoin([this.env.AGENT_VM_REMOTE_REQUEST ?? "/opt/agent-vm-native/bin/agent-vm-control", "request", "--socket", this.env.AGENT_VM_REMOTE_SOCKET ?? "/run/agent-vm-native/control.sock", "--timeout", `${timeout}s`])
+      ? shellJoin([this.env.AGENT_VM_REMOTE_REQUEST ?? "/opt/agent-vm-native/bin/agent-vm-server", "request", "--socket", this.env.AGENT_VM_REMOTE_SOCKET ?? "/run/agent-vm-native/control.sock", "--timeout", `${timeout}s`])
       : undefined;
     const sshOptions = this.env.AGENT_VM_SSH_CONFIG ? ["-F", this.env.AGENT_VM_SSH_CONFIG] : [];
     const result = transport === "https"

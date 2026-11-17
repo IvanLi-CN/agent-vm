@@ -229,7 +229,7 @@ test("format-4 client view selects the fixed Go request adapter", async () => {
   const sidecar = { format: 4, version: "1.0.0", source_revision: "b".repeat(40), protocol: 4, client_artifact: { name: "agent_vm.ts", path: "agent_vm.ts", role: "client", mode: 0o755, sha256: sha256("client") }, client_dependencies: dependencies, client_view: { version: "1.0.0", source_revision: "b".repeat(40), protocol: 4, transport: "go-request", actions: Object.fromEntries(ACTIONS.map(a => [a, { request: schema, response: schema, client_to_control: window, control_to_client: window }])) } };
   writeFileSync(path, json(sidecar)); f.client.sidecar = path;
   await f.client.request("status", { session: "s" });
-  expect(f.commands[0].at(-1)).toContain("/opt/agent-vm-native/bin/agent-vm-control request");
+  expect(f.commands[0].at(-1)).toContain("/opt/agent-vm-native/bin/agent-vm-server request");
 });
 
 test("pending complete-package installation fails before legacy fallback, SSH or journal writes", async () => {

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { build_go_manifest, DEPLOYMENT_CONTRACT, GO_FIXED_ARTIFACTS, validate_go_manifest, verify_go_bundle } from "../scripts/go-release-manifest.ts";
+import { build_go_manifest, DEPLOYMENT_CONTRACT, GO_FIXED_ARTIFACTS, LEGACY_GO_ARTIFACTS, validate_go_manifest, verify_go_bundle } from "../scripts/go-release-manifest.ts";
 
 const artifacts = GO_FIXED_ARTIFACTS.map(([name, path, role, mode]) => ({ name, path, role, mode, sha256: "a".repeat(64) }));
 
@@ -145,4 +145,16 @@ test("format-2 retained reader accepts historical actions without upgrading thei
   delete incomplete.actions.status;
   incomplete.client_view.actions = structuredClone(incomplete.actions);
   expect(() => validate_go_manifest(incomplete)).toThrow("actions differ");
+});
+
+
+test("binary layouts accept complete historic bundles and reject mixed or incomplete sets", () => {
+  const current = build_go_manifest("a".repeat(40), artifacts);
+  const historical = structuredClone(current);
+  historical.artifacts = LEGACY_GO_ARTIFACTS.map(([name, path, role, mode]) => ({ name, path, role, mode, sha256: "b".repeat(64) }));
+  expect(validate_go_manifest(historical)).toEqual(historical);
+  expect(() => validate_go_manifest({ ...current, artifacts: current.artifacts.slice(1) })).toThrow();
+  const mixed = structuredClone(current);
+  mixed.artifacts.push(historical.artifacts.find((a) => a.name === "agent-vm-deployd")!);
+  expect(() => validate_go_manifest(mixed)).toThrow();
 });

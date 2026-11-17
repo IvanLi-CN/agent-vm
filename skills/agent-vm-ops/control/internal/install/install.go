@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"time"
 
@@ -186,7 +187,8 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	if err != nil {
 		return report, err
 	}
-	if _, err := manifest.LoadMetadata(filepath.Join(product, "release-manifest.json")); err != nil {
+	_, err = manifest.LoadMetadata(filepath.Join(product, "release-manifest.json"))
+	if err != nil {
 		return report, err
 	}
 	binaries := map[string]string{}
@@ -221,14 +223,12 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 			return report, err
 		}
 	}
-	for _, name := range []string{"agent-vm-deployd", "agent-vm-deploy"} {
-		if report.Mode == "legacy" {
-			continue
-		}
-		if err := copyInstall(filepath.Join(product, "bin", name), filepath.Join("/opt/agent-vm-native/bin", name), 0755, ""); err != nil {
+	if report.Mode != "legacy" {
+		if err := installProductFiles(product, "/opt/agent-vm-native"); err != nil {
 			return report, err
 		}
 	}
+
 	for name, source := range binaries {
 		binary := name
 		if name == "rqlite" {
@@ -239,7 +239,11 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		}
 	}
 	for _, unit := range []string{"agent-vm-native@.service", "agent-vm-deployd.service", "agent-vm-rqlite.service", "agent-vm-caddy.service"} {
-		if err := copyInstall(filepath.Join(input.Materials, "assets/systemd", unit), filepath.Join("/etc/systemd/system", unit), 0644, ""); err != nil {
+		source := filepath.Join(input.Materials, "assets/systemd", unit)
+		if unit == "agent-vm-native@.service" || unit == "agent-vm-deployd.service" {
+			source = filepath.Join(product, "systemd", unit)
+		}
+		if err := copyInstall(source, filepath.Join("/etc/systemd/system", unit), 0644, ""); err != nil {
 			return report, err
 		}
 	}
@@ -380,4 +384,80 @@ func finishExisting(ctx context.Context, report Report, input Inputs) (Report, e
 	}
 	report.Next = "existing installation verified; use stage/verify/activate for upgrades"
 	return report, nil
+}
+
+// installProductFiles publishes only declared, verified files; the manifest is
+// installed last so the fixed request adapter never accepts an incomplete tree.
+func installProductFiles(product, destination string) error {
+	if _, err := manifest.LoadMetadata(filepath.Join(product, "release-manifest.json")); err != nil {
+		return err
+	}
+	data, err := os.ReadFile(filepath.Join(product, "release-manifest.json"))
+	if err != nil {
+		return err
+	}
+	var release struct {
+		Artifacts []struct {
+			Path string `json:"path"`
+			Mode uint32 `json:"mode"`
+		} `json:"artifacts"`
+	}
+	if err := json.Unmarshal(data, &release); err != nil {
+		return err
+	}
+	for _, artifact := range release.Artifacts {
+		if err := copyInstall(filepath.Join(product, filepath.FromSlash(artifact.Path)), filepath.Join(destination, filepath.FromSlash(artifact.Path)), os.FileMode(artifact.Mode), ""); err != nil {
+			return err
+		}
+	}
+	// The client sidecar is derived metadata, not a manifest artifact. Verify it
+	// against the already-verified manifest before publishing either metadata file.
+	sidecar, err := verifiedProductSidecar(product, data)
+	if err != nil {
+		return err
+	}
+	if sidecar != nil {
+		if err := installFile(filepath.Join(destination, "client-release.json"), sidecar, 0644, ""); err != nil {
+			return err
+		}
+	}
+	return copyInstall(filepath.Join(product, "release-manifest.json"), filepath.Join(destination, "release-manifest.json"), 0644, "")
+}
+
+func verifiedProductSidecar(product string, manifestBytes []byte) ([]byte, error) {
+	var release map[string]any
+	if err := json.Unmarshal(manifestBytes, &release); err != nil {
+		return nil, err
+	}
+	artifacts, _ := release["artifacts"].([]any)
+	var client any
+	dependencies := []any{}
+	for _, item := range artifacts {
+		artifact, ok := item.(map[string]any)
+		if !ok {
+			return nil, errors.New("invalid product artifact")
+		}
+		if artifact["role"] == "client" {
+			client = item
+		}
+		if artifact["role"] == "support" {
+			dependencies = append(dependencies, item)
+		}
+	}
+	if client == nil {
+		return nil, nil
+	}
+	data, err := os.ReadFile(filepath.Join(product, "client-release.json"))
+	if err != nil {
+		return nil, err
+	}
+	var actual map[string]any
+	if err := json.Unmarshal(data, &actual); err != nil {
+		return nil, err
+	}
+	expected := map[string]any{"format": release["format"], "version": release["version"], "source_revision": release["source_revision"], "protocol": release["protocol"], "client_artifact": client, "client_dependencies": dependencies, "client_view": release["client_view"]}
+	if !reflect.DeepEqual(actual, expected) {
+		return nil, errors.New("client sidecar does not match verified product manifest")
+	}
+	return data, nil
 }

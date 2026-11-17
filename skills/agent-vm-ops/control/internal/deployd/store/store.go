@@ -759,3 +759,28 @@ func boolInt(value bool) int {
 	}
 	return 0
 }
+
+// ConsumeRollbackStart journals a start BEFORE its effect; daemon crashes cannot
+// reset the three-attempt budget. No shared business schema is changed.
+func (s *Store) ConsumeRollbackStart(ctx context.Context, id string) error {
+	return s.write(ctx, func(tx *sql.Tx) error {
+		var phase, state string
+		if err := tx.QueryRowContext(ctx, "SELECT phase,state FROM deployment_transactions WHERE transaction_id=?", id).Scan(&phase, &state); err != nil {
+			return err
+		}
+		if phase != "rollback" || (state != "active" && state != "needs_recovery") {
+			return errors.New("rollback is not active")
+		}
+		var attempts, sequence int64
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM deployment_phase_events WHERE transaction_id=? AND transition='rollback_start_attempt'", id).Scan(&attempts); err != nil {
+			return err
+		}
+		if attempts >= 3 {
+			return errors.New("rollback previous version failed to start after three attempts")
+		}
+		if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(sequence),0)+1 FROM deployment_phase_events WHERE transaction_id=?", id).Scan(&sequence); err != nil {
+			return err
+		}
+		return insertEvent(ctx, tx, id, sequence, phase, "rollback_start_attempt", "deployd", map[string]any{"attempt": attempts + 1}, s.clock().UTC())
+	})
+}

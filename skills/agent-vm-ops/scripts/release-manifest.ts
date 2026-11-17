@@ -1431,7 +1431,7 @@ export const PRODUCT_LINUX_LEGACY_ARTIFACTS: readonly ArtifactTuple[] = Object.f
   ["unit:agent-vm-native.service", "systemd/agent-vm-native.service", "unit", 0o644],
 ]);
 
-export const PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
+export const LEGACY_RESIDENT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ...PRODUCT_LINUX_LEGACY_ARTIFACTS,
   ["unit:agent-vm-native@.service", "systemd/agent-vm-native@.service", "unit", 0o644],
   ["agent-vm-deployd", "bin/agent-vm-deployd", "control", 0o755],
@@ -1440,7 +1440,7 @@ export const PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
 ]);
 
 /** Native-only control-plane artifacts. Client TypeScript is a separate asset. */
-export const PRODUCT_NATIVE_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
+export const LEGACY_NATIVE_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["agent-vm-control", "bin/agent-vm-control", "control", 0o755],
   ["agent-vm-deployd", "bin/agent-vm-deployd", "control", 0o755],
   ["agent-vm-deploy", "bin/agent-vm-deploy", "control", 0o755],
@@ -1451,11 +1451,20 @@ export const PRODUCT_NATIVE_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.f
 
 /** Format-4 packages retained from the pre-Deployd Web control plane. */
 export const HISTORICAL_PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
-  ...PRODUCT_LINUX_ARTIFACTS,
+  ...LEGACY_RESIDENT_LINUX_ARTIFACTS,
   ["unit:agent-vm-web.service", "systemd/agent-vm-web.service", "unit", 0o644],
   ["web-config-example", "config/agent-vm-web.json.example", "support", 0o640],
   ["web-assets-manifest", "web-assets.manifest.json", "support", 0o644],
 ]);
+
+export function consolidated_artifacts(legacy: readonly ArtifactTuple[]): readonly ArtifactTuple[] {
+ return Object.freeze(legacy.filter(item => item[1] !== "bin/agent-vm-deployd").map((item): ArtifactTuple => item[1] === "bin/agent-vm-control" ? ["agent-vm-server", "bin/agent-vm-server", item[2], item[3]] : item));
+}
+export const PRODUCT_LINUX_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
+  ...consolidated_artifacts(LEGACY_RESIDENT_LINUX_ARTIFACTS),
+  ["host-config.ts", "host-config.ts", "support", 0o644],
+]);
+export const PRODUCT_NATIVE_LINUX_ARTIFACTS = consolidated_artifacts(LEGACY_NATIVE_LINUX_ARTIFACTS);
 
 export type ProductTarget =
   | { os: "source"; arch: "any" }
@@ -1522,8 +1531,10 @@ function _product_artifacts(value: unknown, target: ProductTarget, format: 3 | 4
     : nativeOnly ? PRODUCT_NATIVE_LINUX_ARTIFACTS : format === LEGACY_PRODUCT_MANIFEST_FORMAT ? PRODUCT_LINUX_LEGACY_ARTIFACTS : PRODUCT_LINUX_ARTIFACTS;
   const actualShape = artifacts.map(({ name, path, role, mode }) => canonical_json([name, path, role, mode])).sort();
   const expectedShapes = [expected];
+  if (nativeOnly) expectedShapes.push(LEGACY_NATIVE_LINUX_ARTIFACTS);
+  if (format === LEGACY_PRODUCT_MANIFEST_FORMAT && target.os === "linux") expectedShapes.push(PRODUCT_LINUX_ARTIFACTS);
   if (format === PRODUCT_MANIFEST_FORMAT && target.os === "linux") {
-    expectedShapes.push(HISTORICAL_PRODUCT_LINUX_ARTIFACTS);
+    expectedShapes.push(LEGACY_RESIDENT_LINUX_ARTIFACTS, HISTORICAL_PRODUCT_LINUX_ARTIFACTS);
   }
   const matchesAllowlist = expectedShapes.some((candidate) => {
     const shape = candidate.map((item) => canonical_json(item)).sort();
@@ -1637,7 +1648,7 @@ export function verify_product_bundle(root: string, manifest: unknown): ProductM
     if (!info.isFile() || info.isSymbolicLink()) throw _product_error("artifact_unverified", `artifact is not a regular file: ${item.path}`);
     if ((info.mode & 0o7777) !== item.mode) throw _product_error("artifact_mode_mismatch", `artifact mode differs: ${item.path}`);
     if (sha256_file(path) !== item.sha256) throw _product_error("artifact_checksum_mismatch", `artifact checksum differs: ${item.path}`);
-    if (["bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"].includes(item.path)) _verify_product_elf(path, checked.target);
+    if (["bin/agent-vm-server", "bin/agent-vm-control", "bin/agent-vm-deployd", "bin/agent-vm-deploy"].includes(item.path)) _verify_product_elf(path, checked.target);
   }
   return checked;
 }

@@ -1,8 +1,8 @@
 # Deployd 合同
 
-本文定义 Deployd（进程名 `agent-vm-deployd`）及其运维 CLI `agent-vm-deploy` 的目标合同。Deployd 负责部署协调和部署观测，但不是第二个 Agent VM 生命周期权威、业务状态后端或公共业务 HTTP 服务。发布包提供该服务、CLI 和槽位模板 unit。format-4 发布器负责把已验证的控制二进制和 manifest 安装到蓝、绿两个槽位。实际配置、状态后端凭据和运行目录仍由部署方提供。
+本文定义 Deployd（由 `agent-vm-deploy serve` 运行）及同一二进制的运维 CLI 的目标合同。Deployd 负责部署协调和部署观测，但不是第二个 Agent VM 生命周期权威、业务状态后端或公共业务 HTTP 服务。发布包提供该服务、CLI 和槽位模板 unit。format-4 发布器负责把已验证的控制二进制和 manifest 安装到蓝、绿两个槽位。实际配置、状态后端凭据和运行目录仍由部署方提供。
 
-Deployd 与槽位 `agent-vm-control` 使用独立的 `deployment_contract` v1。该合同与 protocol 4 分开：protocol 4 约束 Agent 请求，deployment contract 约束槽位角色、controller lease、quiescence 和事务观测。Deployd v1 必须兼容所有仍受支持的 v1 control；新增 health 字段和能力只能增量加入，未知字段必须忽略。缺失合同的 legacy control 按 v1 基础合同处理；不匹配的 major 必须在 stage 前拒绝。Deployd breaking contract 变更必须走独立的 controller upgrade transaction，不能混入普通 blue-green update。
+Deployd 与槽位 `agent-vm-server` 使用独立的 `deployment_contract` v1。该合同与 protocol 4 分开：protocol 4 约束 Agent 请求，deployment contract 约束槽位角色、controller lease、quiescence 和事务观测。Deployd v1 必须兼容所有仍受支持的 v1 control；新增 health 字段和能力只能增量加入，未知字段必须忽略。缺失合同的 legacy control 按 v1 基础合同处理；不匹配的 major 必须在 stage 前拒绝。Deployd breaking contract 变更必须走独立的 controller upgrade transaction，不能混入普通 blue-green update。
 
 ## 边界
 
@@ -250,7 +250,7 @@ CLI 永远不能直接编辑 `active`。响应丢失时，CLI 返回 deployd tra
 
 `agent-vm-deploy install --config <受保护输入> --bundle <产品包> --materials <同修订资料目录>` 默认只执行只读预检，不创建安装记录、锁、解包目录或系统资源；显式 `--apply` 才执行本机安装。安装输入只引用受保护的配置与证书文件，不内联凭据。安装器固定目标路径，拒绝替换不匹配的已有文件；已有蓝绿安装只核验就绪并指向升级入口。
 
-全新安装使用受保护 UDS 的 `POST /v1/bootstrap`，请求包含安装器先行持久化的 `transaction_id=install-<32位小写十六进制>` 和已验证产品包的绝对路径。Deployd 必须先确认 active 链接和旧业务 SQLite 均不存在、两个已安装槽位 unit 均已停止，再创建部署事务。Deployd 通过已验证 blue 槽位的 `agent-vm-control initialize-state` 委托业务状态层直接初始化空 rqlite，不生成 SQLite 迁移源。该入口不授予角色，也不启动 scheduler。
+全新安装使用受保护 UDS 的 `POST /v1/bootstrap`，请求包含安装器先行持久化的 `transaction_id=install-<32位小写十六进制>` 和已验证产品包的绝对路径。Deployd 必须先确认 active 链接和旧业务 SQLite 均不存在、两个已安装槽位 unit 均已停止，再创建部署事务。Deployd 通过已验证 blue 槽位的 `agent-vm-server initialize-state` 委托业务状态层直接初始化空 rqlite，不生成 SQLite 迁移源。该入口不授予角色，也不启动 scheduler。
 
 Deployd 随后验证初始 standby 的 release、状态能力和进程身份，分配持久化 fencing term，通过既有角色通道授予 blue 唯一 controller lease，观测 ready 后开启 traffic 并原子切换 active。最终新鲜一致观测通过后才终结事务，安装器最后启动 Caddy。同一安装事务的重复请求只允许返回已完成结果；其他阶段不得自动重放。
 
@@ -291,3 +291,9 @@ Incus 项目级共享 `incus_*` 指标由槽位只读采样，Deployd 只输出�
 命令行程序不得自行替换槽位、复制候选二进制、编辑 `active` 链接或授予控制器租约。接管失败时，应区分进程身份、systemd 单元、socket 链接、清单、活动槽位、控制器租约和观测新鲜度问题，并保留按事务和阶段查询的入口。
 
 首次迁移由发布器在启动双槽位前提交给 Deployd，由其自动排空、阻止写入、创建快照、导入和验证。命令行程序不接收 rqlite 地址、数据库路径、SQL 或凭据来绕过 Deployd。迁移失败只允许沿原事务身份执行一次受限重试；不能用普通 `stage`、`activate` 或 `rollback` 替代迁移，也不能将迁移变成发布后的人工前置步骤。
+
+## 可执行文件布局与有界回退启动
+
+新发布包仅提供 `agent-vm-server` 与 `agent-vm-deploy`。Deployd 的配置、UDS、systemd unit 和指标 job 身份不因二进制整合改变。启动 `agent-vm-deploy serve --config /etc/agent-vm-native/deployd.json` 才会创建部署状态库连接、获取单例锁和启动后台维护；普通 CLI 仍通过 UDS 调用，不启动这些资源。
+
+槽位启动路径来自已验证的完整 manifest 布局。Deployd 为蓝绿槽位生成 `/etc/systemd/system/agent-vm-native@<slot>.service.d/10-release.conf`，并在启动前刷新 systemd；历史包使用自己的 `agent-vm-control`，新包使用 `agent-vm-server`。新包不生成旧名别名。回退启动期间禁用该槽位的 systemd 自动重启，由部署事务在每次启动前持久记录尝试；首次启动及两次重试均失败后停止该回退，部署服务重启不清零预算。启动成功后恢复通常的 systemd 重启策略。原有身份、authority 和事务检查不变，不额外增加旧槽烟测步骤。
