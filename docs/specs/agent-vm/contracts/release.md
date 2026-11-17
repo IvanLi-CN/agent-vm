@@ -28,9 +28,9 @@ Python release tools 使用[`release_manifest.py`](../../../../deploy/scripts/re
 
 ## 来宾镜像发布资产
 
-正式 Release 在同一源码修订完成 Base、Rust、Java、Go 的 privileged/unprivileged 八套 amd64 镜像构建。草稿创建前必须验证八个矩阵槽位、精确 source revision、镜像身份、readiness、SBOM 和摘要，并将 32 个镜像文件及独立镜像 SHA256SUMS 纳入既有 prepared 冻结清单和顶层 SHA256SUMS。缺失、额外、被篡改或修订不匹配的输入不得进入发布。Release 入口必须接受八套镜像的 32 个文件及总校验清单，共 33 项；复制前须完成全部输出文件及冻结校验清单的冲突检查。Base 两种模式必须以独立资产发布；所有镜像归档均不得包含块/字符设备节点或 Docker/containerd 构建运行数据，即使其摘要与 manifest 相符也必须拒绝。镜像是独立下载资产，不进入 client/native/bootstrap 产品包，也不扩大组件更新的下载或验证范围。
+来宾镜像是独立于产品版本的发布面。`Guest image preview` 可以在 PR 或手动触发时执行验证，但只产生短期 CI artifact；唯一的镜像发布入口是手动 `Guest image release` workflow。该 workflow 只接受受保护 `main` 上的 `workflow_dispatch`，以 dispatch 绑定的精确 checkout revision 为来源，完成 Base、Rust、Java、Go 的 privileged/unprivileged 八套 amd64 镜像构建，验证八个矩阵槽位、镜像身份、readiness、SBOM 和摘要，将 32 个镜像文件及独立镜像 `SHA256SUMS` 作为 33 项资产发布到 `agent-vm-images-<source-sha>` Release。缺失、额外、被篡改或修订不匹配的输入不得发布；Base 两种模式必须以独立资产发布；所有镜像归档均不得包含块/字符设备节点或 Docker/containerd 构建运行数据，即使其摘要与 manifest 相符也必须拒绝。常规产品 `Release` 只发布 client/native/bootstrap 和部署材料，不构建、冻结或发布 guest images。
 
-不可变 Release 发布后不得追加镜像；恢复事务只复用 reservation 中冻结的文件和摘要，不重新选择源码或构建镜像。发布状态快照必须包含这些文件，便于既有 recovery workflow 继续验证相同资产集合。
+镜像 Release 发布后不得追加镜像；同一源码修订使用固定的镜像 tag 和完整资产集合。产品 Release 的 reservation 与 recovery 不持有镜像文件，也不得因为产品恢复重新选择源码或构建镜像。
 
 ## 蓝绿兼容窗口
 

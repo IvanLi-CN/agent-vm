@@ -1,0 +1,106 @@
+name: Guest image release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  # Image publication is manual and non-preemptive; product Release has its own namespace.
+  group: guest-image-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-images:
+    name: Build and verify guest images
+    uses: ./.github/workflows/image-preview.yml
+    with:
+      source_ref: ${{ github.sha }}
+
+  publish:
+    name: Publish guest image release
+    needs: build-images
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require protected main dispatch
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: test "$DISPATCH_REF" = "refs/heads/main" && test "$REF_PROTECTED" = "true"
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: guest-image-*
+          path: ${{ runner.temp }}/agent-vm-image-input
+      - id: source
+        name: Resolve exact source revision
+        run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Stage and verify image release assets
+        env:
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+          INPUT_ROOT: ${{ runner.temp }}/agent-vm-image-input
+          OUTPUT_ROOT: ${{ runner.temp }}/agent-vm-image-release
+        run: |
+          set -euo pipefail
+          python3 images/scripts/stage_release_assets.py \
+            --input-root "$INPUT_ROOT" \
+            --output "$OUTPUT_ROOT" \
+            --source-revision "$SOURCE_REVISION"
+          (
+            cd "$OUTPUT_ROOT"
+            sha256sum -c agent-vm-ubuntu24-SHA256SUMS
+          )
+          python3 images/scripts/verify_assets.py \
+            --directory "$OUTPUT_ROOT" \
+            --source-revision "$SOURCE_REVISION"
+      - name: Check image release identity is unused
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          set -euo pipefail
+          image_tag="agent-vm-images-${SOURCE_REVISION}"
+          if gh api --silent "repos/${GITHUB_REPOSITORY}/git/ref/tags/${image_tag}"; then
+            echo "image tag already exists: ${image_tag}" >&2
+            exit 1
+          fi
+          echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
+      - name: Create draft image release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+          IMAGE_ROOT: ${{ runner.temp }}/agent-vm-image-release
+        run: |
+          set -euo pipefail
+          gh release create "$IMAGE_TAG" "$IMAGE_ROOT"/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_REVISION" \
+            --title "Agent VM images ${SOURCE_REVISION}" \
+            --notes "Independent Agent VM guest image release for source ${SOURCE_REVISION}. Product Release does not rebuild or publish guest images." \
+            --draft
+      - name: Verify draft image release asset set
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_ROOT: ${{ runner.temp }}/agent-vm-image-release
+        run: |
+          set -euo pipefail
+          test "$(gh release view "$IMAGE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = "true"
+          test "$(gh release view "$IMAGE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')" = "33"
+          expected="$(cd "$IMAGE_ROOT" && printf '%s\n' * | sort)"
+          actual="$(gh release view "$IMAGE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)"
+          test "$actual" = "$expected"
+      - name: Publish image release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$IMAGE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
+      - name: Verify immutable image release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${IMAGE_TAG}" --jq '.immutable // false')" = "true"

@@ -1,26 +1,37 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { stageGuestImageAssets } from "../scripts/release.ts";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { parse } from "yaml";
 
-test("release caller accepts all eight real staged slots and refuses missing Base", () => {
-  const temp = mkdtempSync(join(tmpdir(), "release-eight-images-"));
-  try {
-    const source = join(temp, "input");
-    const fixture = Bun.spawnSync(["python3", "-c", `
-import sys
-from pathlib import Path
-sys.path.insert(0, sys.argv[2])
-from test_stage_release_assets import ReleaseImageStagingTest
-ReleaseImageStagingTest().fixture(Path(sys.argv[1]))
-`, source, resolve(import.meta.dir, "../../../images/tests")], { stdout: "pipe", stderr: "pipe" });
-    expect(fixture.exitCode).toBe(0);
-    const assets = stageGuestImageAssets(source, join(temp, "output"), "a".repeat(40));
-    expect(Object.keys(assets)).toHaveLength(33);
-    expect(assets["agent-vm-ubuntu24-base-privileged-amd64.tar.gz"]).toBeDefined();
-    expect(assets["agent-vm-ubuntu24-base-unprivileged-amd64.tar.gz"]).toBeDefined();
-    rmSync(join(source, "guest-image-base-privileged"), { recursive: true });
-    expect(() => stageGuestImageAssets(source, join(temp, "incomplete"), "a".repeat(40))).toThrow("exactly eight");
-  } finally { rmSync(temp, { recursive: true, force: true }); }
+const root = resolve(import.meta.dir, "../../..");
+const read = (path: string) => readFileSync(resolve(root, path), "utf8");
+
+test("product release does not build or publish guest images", () => {
+  const workflow = parse(read(".github/workflows/release.yml"));
+  const script = read("skills/agent-vm-ops/scripts/release.ts");
+
+  expect(workflow.jobs["guest-images"]).toBeUndefined();
+  expect(workflow.jobs.release.needs).toBeUndefined();
+  expect(read(".github/workflows/release.yml")).not.toContain("image-preview.yml");
+  expect(script).not.toContain("AGENT_VM_RELEASE_IMAGE_INPUT");
+  expect(script).not.toContain("stageGuestImageAssets");
+});
+
+test("guest image publication is manual and waits for the parallel build matrix", () => {
+  const release = parse(read(".github/workflows/image-release.yml"));
+  const preview = parse(read(".github/workflows/image-preview.yml"));
+
+  expect(release.on.pull_request).toBeUndefined();
+  expect(release.on.workflow_dispatch).toBeDefined();
+  expect(release.jobs.publish.steps.some((step: { name?: string }) => step.name === "Require protected main dispatch")).toBe(true);
+  expect(release.jobs["build-images"].uses).toBe("./.github/workflows/image-preview.yml");
+  expect(release.jobs.publish.needs).toBe("build-images");
+  expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes("gh release edit"))).toBe(true);
+  expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes('= "33"'))).toBe(true);
+
+  expect(preview.on.pull_request).toBeDefined();
+  expect(preview.on.workflow_call).toBeDefined();
+  expect(preview.jobs.build.needs).toBe("lock-check");
+  expect(preview.jobs.build.strategy["fail-fast"]).toBe(false);
+  expect(preview.jobs.build.strategy["max-parallel"]).toBe(3);
 });

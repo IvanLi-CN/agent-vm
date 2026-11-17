@@ -60,7 +60,9 @@
 | --- | --- | --- | --- |
 | `CI (PR)` | 面向 main 的 opened、synchronize、reopened、ready_for_review；产生 `PR gate`。 | per-PR required namespace，取消旧 PR candidate；merge_group 不抢占。 | generic |
 | `CI (Main)` | main push；在实际 merge SHA 产生 `Main gate`。 | 独立 main namespace，`queue: max`，不抢占。 | generic |
-| `Release` | main 上显式 dispatch；固定事件 source，完成产物发布。 | 产品级 release 状态写入 namespace，`queue: max`，不抢占。 | Release-specific |
+| `Release` | main 上显式 dispatch；固定事件 source，只发布产品资产，不构建或发布 guest images。 | 产品级 release 状态写入 namespace，`queue: max`，不抢占。 | Release-specific |
+| `Guest image preview` | PR 或手动 dispatch；验证八个镜像矩阵槽位并上传短期 CI artifact，不发布生产镜像。 | per-ref preview namespace；PR 可取消过期 candidate，手动运行不抢占。 | generic |
+| `Guest image release` | 仅手动 dispatch；复用镜像矩阵，校验 33 项资产并发布独立的 source-bound image Release。 | 独立 image-release namespace，不抢占；不与产品 Release 共享 group。 | generic |
 | `Notify failed workflow` | generic allowlist 的 completed workflow_run，显式 guard failure。 | 原 run ID 与 attempt；不与产品发布共享 group。 | selection-gated |
 | `Notify failed release` | Release 的 completed workflow_run，额外核验发布 identity。 | 原 run ID 与 attempt；不与产品发布共享 group。 | selection-gated |
 | `Notification smoke` | transport 选择后的独立手动发送验证；当前只证明 gate fail-closed。 | 独立 manual namespace。 | selection-gated |

@@ -24,6 +24,13 @@
     "source": "validated-main-head",
     "automatic_pr_on_merge": false
   },
+  "guest_image_release": {
+    "mode": "manual",
+    "workflow": "Guest image release",
+    "tag_prefix": "agent-vm-images-",
+    "source": "protected_main_dispatch_revision",
+    "included_in_product_release": false
+  },
   "identity_and_recovery": {
     "claim_before_freeze": true,
     "state": "append-only",

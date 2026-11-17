@@ -17,7 +17,8 @@
     "Release": "release-specific",
     "Release recovery": "generic",
     "Demo Deploy": "generic",
-    "Guest image preview": "generic"
+    "Guest image preview": "generic",
+    "Guest image release": "generic"
   },
   "excluded_workflows": ["Notification smoke", "Notify failed workflow", "Notify failed release"],
   "workflow_inventory": {
@@ -27,6 +28,7 @@
     "Release recovery": {"class": "generic", "sidecar": "Notify failed workflow", "events": ["workflow_dispatch"], "ref_prefixes": ["refs/heads/"]},
     "Demo Deploy": {"class": "generic", "sidecar": "Notify failed workflow", "events": ["pull_request", "push", "workflow_dispatch"], "ref_prefixes": ["refs/pull/", "refs/heads/"]},
     "Guest image preview": {"class": "generic", "sidecar": "Notify failed workflow", "events": ["pull_request", "workflow_dispatch", "workflow_call"], "ref_prefixes": ["refs/pull/", "refs/heads/", "refs/tags/"]},
+    "Guest image release": {"class": "generic", "sidecar": "Notify failed workflow", "events": ["workflow_dispatch"], "ref_prefixes": ["refs/heads/", "refs/tags/"]},
     "Notification smoke": {"class": "excluded", "sidecar": null},
     "Notify failed workflow": {"class": "excluded", "sidecar": null},
     "Notify failed release": {"class": "excluded", "sidecar": null}

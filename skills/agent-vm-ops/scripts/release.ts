@@ -51,14 +51,6 @@ function sha256(path: string): string {
   return hash.digest("hex");
 }
 
-export function stageGuestImageAssets(inputRoot: string, artifactRoot: string, source: string): Record<string, string> {
-  const result = Bun.spawnSync(["python3", join(repositoryRoot, "images/scripts/stage_release_assets.py"), "--input-root", inputRoot, "--output", artifactRoot, "--source-revision", source], { stdout: "pipe", stderr: "pipe" });
-  if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr).trim() || "guest image release validation failed");
-  const value = JSON.parse(new TextDecoder().decode(result.stdout));
-  if (!value.assets || typeof value.assets !== "object" || Object.keys(value.assets).length !== 33) throw new Error("guest image release must stage 32 assets and their checksum list");
-  return value.assets;
-}
-
 export function releaseBuilderCommand(version: string, source: string, targetName: string, output: string, bootstrap = false): string[] {
   const builder = "build_product_release.ts";
   const builderArgs = ["--version", version, "--source-revision", source, "--target", targetName];
@@ -314,9 +306,6 @@ async function release(): Promise<void> {
   if (claimed.stage !== "claimed") throw new Error(`release reservation already progressed to ${claimed.stage}; use recovery`);
   const artifactRoot = join(stateRoot, "artifacts", version);
   mkdirSync(artifactRoot, { recursive: true, mode: 0o750 });
-  const imageInput = process.env.AGENT_VM_RELEASE_IMAGE_INPUT;
-  if (!imageInput) throw new Error("AGENT_VM_RELEASE_IMAGE_INPUT is required for the eight verified guest image artifacts");
-  const imageAssets = stageGuestImageAssets(imageInput, artifactRoot, source);
   const assets = {
     [`agent-vm-${version}-deployment-materials.tar`]: join(artifactRoot, `agent-vm-${version}-deployment-materials.tar`),
     [`agent-vm-${version}-client.tar`]: join(artifactRoot, `agent-vm-${version}-client.tar`),
@@ -339,9 +328,7 @@ async function release(): Promise<void> {
   const provenancePath = join(artifactRoot, "release-provenance.json");
   writeFileSync(provenancePath, `${JSON.stringify({ schema_version: 1, format: 4, version, source_revision: source, policy_revision: identity.policy_revision, toolchain: { bun: "1.4.4", go: "go1.27.3", cgo_enabled: false }, packages: packageDigests }, null, 2)}\n`, { mode: 0o644 });
   const sumsPath = join(artifactRoot, "SHA256SUMS");
-  // Image files are release-level assets; product package manifests stay scoped
-  // to the client/native component selected by the consumer.
-  const completeAssets = { ...assets, ...imageAssets, "release-provenance.json": provenancePath, SHA256SUMS: sumsPath };
+  const completeAssets = { ...assets, "release-provenance.json": provenancePath, SHA256SUMS: sumsPath };
   const digests = Object.fromEntries(Object.entries(completeAssets).filter(([name]) => name !== "SHA256SUMS").map(([name, path]) => [name, sha256(path)]));
   writeFileSync(sumsPath, `${Object.entries(digests).map(([name, digest]) => `${digest}  ${name}`).join("\n")}\n`, { mode: 0o644 });
   const completeDigests = { ...digests, SHA256SUMS: sha256(sumsPath) };

@@ -8,6 +8,11 @@ on:
       - "bun.lock"
       - ".github/workflows/image-*.yml"
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: branch, tag, or commit to validate; defaults to the dispatch ref
+        required: false
+        type: string
   workflow_call:
     inputs:
       source_ref:
@@ -22,7 +27,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Build provenance uses the exact PR head, or the caller-bound release SHA.
+  # Build provenance uses the exact PR head, or the caller-bound source SHA.
   lock-check:
     name: Validate image lock
     runs-on: ubuntu-24.04
