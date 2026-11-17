@@ -1,7 +1,7 @@
 name: Notify failed workflow
 on:
   workflow_run:
-    workflows: [CI (PR), CI (Main), Release recovery, Demo Deploy, Guest image preview, Guest image release]
+    workflows: [CI (PR), CI (Main), Release recovery, Demo Deploy, Guest image preview]
     types: [completed]
 permissions:
   contents: read

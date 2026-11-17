@@ -108,6 +108,18 @@ async function provision(name: string, script: string) {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 async function remove(name: string) { await incus(["delete", name, "--force"]); }
+async function verifyPublished(image: string, mode: string, profile: string, report: string) {
+  const name = `avm-ready-${profile}-${mode}-${crypto.randomUUID().slice(0, 8)}`;
+  let created = false;
+  try {
+    await init(image, name, mode); created = true;
+    await incus(["start", name]);
+    // Observe autonomous first-boot key generation before making any SSH request.
+    const boot = `timeout 90 bash -c 'until test -s /etc/ssh/ssh_host_ed25519_key.pub && (systemctl is-active --quiet ssh || systemctl is-active --quiet ssh.socket); do sleep 1; done'\n`;
+    await provision(name, `${header}IMAGE_PROFILE=${profile}\n${boot}${readiness}\n`);
+    await incus(["file", "pull", `${name}/etc/agent-vm-image/readiness.json`, report]);
+  } finally { if (created) await remove(name); }
+}
 const sourceRevision = process.env.AGENT_VM_IMAGE_SOURCE_REVISION ?? Bun.spawnSync(["git", "rev-parse", "HEAD"], { cwd: root }).stdout.toString().trim();
 if (!/^[0-9a-f]{40}$/.test(sourceRevision)) fail("build requires a full source revision");
 const lockSha = createHash("sha256").update(lockText).digest("hex");
@@ -150,6 +162,7 @@ async function buildMode(mode: string) {
       await incus(["image", "export", imageFingerprint, join(output, asset)]);
       const tar = join(output, `${asset}.tar.gz`);
       if (!existsSync(tar)) fail("Incus did not export a unified .tar.gz image");
+      await verifyPublished(imageFingerprint, mode, profile, join(output, `${asset}.readiness.json`));
       const manifest = { schema: 1, name: asset, profile, variant: mode, runtime_config: runtimeConfig(mode), architecture: "amd64", source_revision: sourceRevision, lock_sha256: lockSha, image_fingerprint: imageFingerprint, base: lock.base, versions: lock.versions, sha256: await digest(tar) };
       writeFileSync(join(output, `${asset}.manifest.json`), JSON.stringify(manifest, null, 2) + "\n");
       for (const suffix of ["tar.gz", "manifest.json", "sbom.json", "readiness.json"]) { const file = `${asset}.${suffix}`; checksums.push(`${await digest(join(output, file))}  ${file}`); }

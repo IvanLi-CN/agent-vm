@@ -2,7 +2,7 @@
 set -euo pipefail
 verify_ssh() (
   set -euo pipefail
-  systemctl is-active --quiet ssh
+  systemctl is-active --quiet ssh || systemctl is-active --quiet ssh.socket
   test -s /etc/ssh/ssh_host_ed25519_key.pub
   work=$(mktemp -d /root/agent-vm-ssh-check.XXXXXX)
   install -d -m 700 /root/.ssh

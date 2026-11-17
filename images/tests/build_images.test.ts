@@ -47,6 +47,7 @@ if args[:2]==["image","info"]:sys.exit(1)
 if os.environ.get("IMAGE_TEST_FAIL_START")=="1" and args[0]=="start":
  if "unprivileged" in args[1]:time.sleep(0.3)
  sys.exit(42)
+if os.environ.get("IMAGE_TEST_FAIL_READY")=="1" and args[0]=="start" and args[1].startswith("avm-ready-"):sys.exit(45)
 if args[:2]==["file","push"]:
  with open(args[2]) as f:script=f.read()
  assert script.startswith("set -euo pipefail"+chr(10)), "missing real newline"
@@ -69,9 +70,9 @@ if args[:2]==["image","export"]:
     expect(result.exitCode).toBe(0);
     const commands = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
     const init = commands.filter(args => args[0] === "init");
-    expect(init).toHaveLength(8);
-    expect(init.filter(args => args.includes("security.privileged=true"))).toHaveLength(4);
-    expect(init.filter(args => args.includes("security.privileged=false"))).toHaveLength(4);
+    expect(init).toHaveLength(14);
+    expect(init.filter(args => args.includes("security.privileged=true"))).toHaveLength(7);
+    expect(init.filter(args => args.includes("security.privileged=false"))).toHaveLength(7);
     for (const args of init) expect(args).toContain("security.nesting=true");
     const manifests = readdirSync(output).filter(name => name.endsWith(".manifest.json"));
     expect(manifests).toHaveLength(6);
@@ -110,8 +111,19 @@ if args[:2]==["image","export"]:
     const concurrentCommands = readFileSync(concurrentLog, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
     expect(concurrentCommands.filter(args => args[0] === "delete")).toHaveLength(2);
     expect(concurrentCommands.some(args => args[0] === "publish")).toBe(false);
+    const readyLog = join(temp, "ready-failure.jsonl");
+    const readyOutput = join(temp, "ready-failure-output");
+    const readyFailure = Bun.spawnSync([process.execPath, builder, "--profile", "go", "--variant", "privileged"], {
+      env: { ...process.env, PATH: `${temp}:${process.env.PATH}`, IMAGE_TEST_LOG: readyLog, IMAGE_TEST_FAIL_READY: "1", AGENT_VM_IMAGE_OUTPUT: readyOutput }, stdout: "pipe", stderr: "pipe",
+    });
+    expect(readyFailure.exitCode).not.toBe(0);
+    const readyCommands = readFileSync(readyLog, "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]);
+    const fresh = readyCommands.find(args => args[0] === "init" && args[2]!.startsWith("avm-ready-"))![2]!;
+    expect(readyCommands.some(args => args[0] === "delete" && args[1] === fresh)).toBe(true);
+    expect(readyCommands.some(args => args.slice(0, 3).join(" ") === "image alias delete")).toBe(true);
+    expect(readdirSync(readyOutput).some(name => name.endsWith(".manifest.json") || name.endsWith("SHA256SUMS"))).toBe(false);
   } finally { rmSync(temp, { recursive: true, force: true }); }
-});
+}, 30_000);
 
 test("supports selecting one variant and rejects invalid modes", () => {
   for (const variant of ["privileged", "unprivileged"]) {

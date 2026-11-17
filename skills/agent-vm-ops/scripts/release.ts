@@ -3,7 +3,7 @@
 /** Manual, fail-closed GitHub product release entrypoint. */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import { buildMaterialsArchive } from "../../../deploy/scripts/build-materials.ts";
@@ -38,7 +38,25 @@ function requireOption(name: string): string {
 }
 
 function sha256(path: string): string {
-  return createHash("sha256").update(readFileSync(path)).digest("hex");
+  const hash = createHash("sha256");
+  const descriptor = openSync(path, "r");
+  const buffer = Buffer.alloc(1024 * 1024);
+  try {
+    for (;;) {
+      const count = readSync(descriptor, buffer, 0, buffer.length, null);
+      if (!count) break;
+      hash.update(buffer.subarray(0, count));
+    }
+  } finally { closeSync(descriptor); }
+  return hash.digest("hex");
+}
+
+export function stageGuestImageAssets(inputRoot: string, artifactRoot: string, source: string): Record<string, string> {
+  const result = Bun.spawnSync(["python3", join(repositoryRoot, "images/scripts/stage_release_assets.py"), "--input-root", inputRoot, "--output", artifactRoot, "--source-revision", source], { stdout: "pipe", stderr: "pipe" });
+  if (result.exitCode !== 0) throw new Error(new TextDecoder().decode(result.stderr).trim() || "guest image release validation failed");
+  const value = JSON.parse(new TextDecoder().decode(result.stdout));
+  if (!value.assets || typeof value.assets !== "object" || Object.keys(value.assets).length !== 25) throw new Error("guest image release must stage 24 assets and their checksum list");
+  return value.assets;
 }
 
 export function releaseBuilderCommand(version: string, source: string, targetName: string, output: string, bootstrap = false): string[] {
@@ -296,6 +314,9 @@ async function release(): Promise<void> {
   if (claimed.stage !== "claimed") throw new Error(`release reservation already progressed to ${claimed.stage}; use recovery`);
   const artifactRoot = join(stateRoot, "artifacts", version);
   mkdirSync(artifactRoot, { recursive: true, mode: 0o750 });
+  const imageInput = process.env.AGENT_VM_RELEASE_IMAGE_INPUT;
+  if (!imageInput) throw new Error("AGENT_VM_RELEASE_IMAGE_INPUT is required for the six verified guest image artifacts");
+  const imageAssets = stageGuestImageAssets(imageInput, artifactRoot, source);
   const assets = {
     [`agent-vm-${version}-deployment-materials.tar`]: join(artifactRoot, `agent-vm-${version}-deployment-materials.tar`),
     [`agent-vm-${version}-client.tar`]: join(artifactRoot, `agent-vm-${version}-client.tar`),
@@ -318,7 +339,9 @@ async function release(): Promise<void> {
   const provenancePath = join(artifactRoot, "release-provenance.json");
   writeFileSync(provenancePath, `${JSON.stringify({ schema_version: 1, format: 4, version, source_revision: source, policy_revision: identity.policy_revision, toolchain: { bun: "1.4.4", go: "go1.27.3", cgo_enabled: false }, packages: packageDigests }, null, 2)}\n`, { mode: 0o644 });
   const sumsPath = join(artifactRoot, "SHA256SUMS");
-  const completeAssets = { ...assets, "release-provenance.json": provenancePath, SHA256SUMS: sumsPath };
+  // Image files are release-level assets; product package manifests stay scoped
+  // to the client/native component selected by the consumer.
+  const completeAssets = { ...assets, ...imageAssets, "release-provenance.json": provenancePath, SHA256SUMS: sumsPath };
   const digests = Object.fromEntries(Object.entries(completeAssets).filter(([name]) => name !== "SHA256SUMS").map(([name, path]) => [name, sha256(path)]));
   writeFileSync(sumsPath, `${Object.entries(digests).map(([name, digest]) => `${digest}  ${name}`).join("\n")}\n`, { mode: 0o644 });
   const completeDigests = { ...digests, SHA256SUMS: sha256(sumsPath) };
