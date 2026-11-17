@@ -1,5 +1,5 @@
 import { test, expect } from 'bun:test';
-import { adaptLinks, contentDigest, headings } from './source';
+import { adaptLinks, contentDigest, headings, sourceAnchorLine } from './source';
 test('identity is order independent and changes with source or configuration', () => {
   expect(contentDigest({a:'文档',b:'config'})).toBe(contentDigest({b:'config',a:'文档'}));
   expect(contentDigest({a:'文档',b:'config'})).not.toBe(contentDigest({a:'文档修改',b:'config'}));
@@ -23,6 +23,17 @@ test('missing and escaping references are diagnosed without reading outside root
 });
 test('Chinese and duplicate heading anchors are deterministic',()=>{
   expect(headings('# 中文\n## 中文').map(h=>h.anchor)).toEqual(['中文','中文-1']);
+});
+test('modified snapshot fragments resolve to real source lines', async () => {
+  const text = '# 中文\n\n## 中文\n\n<a id="details"></a>\n\n```html\n<a id="fake"></a>\n```';
+  expect(sourceAnchorLine(text, '中文-1')).toBe(3);
+  expect(sourceAnchorLine(text, 'details')).toBe(5);
+  expect(sourceAnchorLine(text, 'fake')).toBeUndefined();
+  const source = {path:'docs/a.md', text:'[章节](draft.md#%E4%B8%AD%E6%96%87-1)\n[显式](draft.md#details)', slug:'a'};
+  const result = await adaptLinks(source, [source], 'abc', '/repo', async () => new TextEncoder().encode(text), () => true);
+  expect(result.text).toContain('/source?path=docs%2Fdraft.md&line=3');
+  expect(result.text).toContain('/source?path=docs%2Fdraft.md&line=5');
+  expect(result.diagnostics).toEqual([]);
 });
 test('asset references use content-addressed outputs and retain bytes',async()=>{
  const source={path:'docs/a.md',text:'![图](image.svg)',slug:'0'};

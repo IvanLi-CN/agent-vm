@@ -74,6 +74,7 @@
         "remark-parse": "^11.0.0",
         "unified": "^11.0.5",
         "unist-util-visit": "^5.0.0",
+        "vfile-message": "4.0.4",
       },
       "devDependencies": {
         "@react-router/dev": "8.5.1",

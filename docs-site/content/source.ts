@@ -22,7 +22,19 @@ export function contentDigest(inputs: Record<string, string | Uint8Array>) {
 export function headings(text: string) {
   const tree = unified().use(parse).use(gfm).parse(text);
   const slugger = new GithubSlugger();
-  return tree.children.flatMap(node => node.type === 'heading' ? [{ title: toString(node), anchor: slugger.slug(toString(node)), depth: node.depth }] : []);
+  return tree.children.flatMap(node => node.type === 'heading' ? [{ title: toString(node), anchor: slugger.slug(toString(node)), depth: node.depth, line: node.position?.start.line }] : []);
+}
+export function sourceAnchorLine(text: string, anchor: string) {
+  const heading = headings(text).find(item => item.anchor === anchor);
+  if (heading) return heading.line;
+  const tree = unified().use(parse).use(gfm).use(frontmatter, ['yaml']).parse(text);
+  let line: number | undefined;
+  visit(tree, 'html', node => {
+    for (const match of node.value.matchAll(/\b(?:id|name)\s*=\s*(["'])(.*?)\1/g)) {
+      if (match[2] === anchor && line === undefined) line = (node.position?.start.line ?? 1) + node.value.slice(0, match.index).split('\n').length - 1;
+    }
+  });
+  return line;
 }
 // Change URL fields in the syntax tree by their original spans. This preserves MD/MDX
 // bodies verbatim, including JSX, explicit anchors, code fences and reference links.
@@ -57,7 +69,14 @@ export async function adaptLinks(source: Source, sources: Source[], revision: st
       url = `/assets/sources/${asset}${suffix}`;
     } else if (isModified(path)) {
       snapshots[path] = new TextDecoder().decode(bytes);
-      url = `/source?path=${encodeURIComponent(path)}${suffix.startsWith('#') ? '&anchor=' + encodeURIComponent(suffix.slice(1)) : ''}`;
+      url = `/source?path=${encodeURIComponent(path)}`;
+      if (suffix.startsWith('#')) {
+        let anchor = suffix.slice(1);
+        try { anchor = decodeURIComponent(anchor); } catch { /* Retain the literal malformed fragment. */ }
+        const line = sourceAnchorLine(snapshots[path]!, anchor);
+        if (line !== undefined) url += `&line=${line}`;
+        else diagnostics.push(`Missing source anchor: ${path}#${anchor}`);
+      }
     } else url = `https://github.com/IvanLi-CN/agent-vm/blob/${revision}/${path.split('/').map(encodeURIComponent).join('/')}${suffix}`;
     const start = node.position.start.offset, end = node.position.end.offset;
     const span = source.text.slice(start, end);
