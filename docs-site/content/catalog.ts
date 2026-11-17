@@ -4,6 +4,7 @@ export const catalog = [
   { path: 'docs/specs/agent-vm/contracts/cli.md', slug: 'cli', title: 'CLI 使用与命令', section: '开始使用' },
   { path: 'docs/architecture/system.md', slug: 'architecture', title: '系统架构', section: '开发文档' },
   { path: 'GLOSSARY.md', slug: 'glossary', title: '领域术语', section: '开发文档' },
+  { path: 'docs/README.md', slug: 'documentation-guide', title: '文档组织与编写规范', section: '开发文档' },
   { path: 'docs/proposals/agent-vm-documentation-stack.md', slug: 'docs-site-design', title: '文档站工程方案', section: '文档工程' },
   { path: 'docs/proposals/agent-vm-documentation-source.md', slug: 'docs-site-content', title: '内容来源与适配', section: '文档工程' },
   { path: 'docs/specs/documentation-review/SPEC.md', slug: 'docs-site-requirements', title: '文档站需求与验收', section: '文档工程' },
