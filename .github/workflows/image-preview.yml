@@ -22,6 +22,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Build provenance uses the exact PR head, or the caller-bound release SHA.
   lock-check:
     name: Validate image lock
     runs-on: ubuntu-24.04
