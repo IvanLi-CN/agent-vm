@@ -1338,10 +1338,12 @@ func sortedSchemaObjects(objects []remoteSchemaObject) []remoteSchemaObject {
 				return 0
 			case "index":
 				return 1
-			case "trigger":
+			case "view":
 				return 2
-			default:
+			case "trigger":
 				return 3
+			default:
+				return 4
 			}
 		}
 		if rank(values[left].Type) != rank(values[right].Type) {

@@ -2187,6 +2187,7 @@ func TestRemoteCompatibleExtensionsAcrossEpochRefresh(t *testing.T) {
 		{query: "CREATE TABLE " + child + "(id INTEGER PRIMARY KEY, parent TEXT REFERENCES " + parent + "(id))"},
 		{query: "CREATE INDEX " + prefix + "_idx ON " + child + "(parent)"},
 		{query: "CREATE VIEW " + prefix + "_view AS SELECT id FROM " + parent},
+		{query: "CREATE TRIGGER " + prefix + "_view_insert INSTEAD OF INSERT ON " + prefix + "_view BEGIN INSERT INTO " + parent + "(id) VALUES(NEW.id); END"},
 		{query: "CREATE TABLE " + events + "(message TEXT)"},
 		{query: "CREATE TABLE " + nullable + "(k TEXT PRIMARY KEY, value TEXT)"},
 		{query: "INSERT INTO " + nullable + "(rowid,k,value) VALUES(9,NULL,'a'),(22,NULL,'b')"},
@@ -2207,6 +2208,9 @@ func TestRemoteCompatibleExtensionsAcrossEpochRefresh(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := old.withWrite(ctx, func(tx *Tx) error {
+		if _, err := tx.conn.ExecContext(ctx, "INSERT INTO "+prefix+"_view(id) VALUES('q')"); err != nil {
+			return err
+		}
 		if _, err := tx.conn.ExecContext(ctx, "UPDATE "+nullable+" SET value='updated' WHERE rowid=22; DELETE FROM "+shadowed+" WHERE oid=12; INSERT INTO "+shadowed+"(oid,rowid,payload) VALUES(70,5,'new')"); err != nil {
 			return err
 		}
@@ -2245,11 +2249,14 @@ func TestRemoteCompatibleExtensionsAcrossEpochRefresh(t *testing.T) {
 			return fmt.Errorf("shadowed rowid delta incorrect: %d %v", countPreserved, err)
 		}
 		var computed string
-		if err := conn.QueryRowContext(ctx, "SELECT computed FROM "+parent).Scan(&computed); err != nil {
+		if err := conn.QueryRowContext(ctx, "SELECT computed FROM "+parent+" WHERE id='p'").Scan(&computed); err != nil {
 			return err
 		}
 		if computed != "P" {
 			return fmt.Errorf("generated value %q", computed)
+		}
+		if err := conn.QueryRowContext(ctx, "SELECT count(*) FROM "+prefix+"_view WHERE id='q'").Scan(&countPreserved); err != nil || countPreserved != 1 {
+			return fmt.Errorf("view trigger write lost or replayed: %d %v", countPreserved, err)
 		}
 		return nil
 	}); err != nil {
