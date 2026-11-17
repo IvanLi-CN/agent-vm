@@ -250,7 +250,7 @@ chmod 0755 /opt/agent-vm-native/bin/agent-vm-deploy
 
 for slot in blue green; do
   slot_root="/var/lib/agent-vm-native/slots/$slot"
-  mkdir -p -- "$slot_root"
+  mkdir -p -- "$slot_root" "/etc/agent-vm-native/slots/$slot"
   tar -xf "$real_bundle" -C "$slot_root"
   ln -s "/run/agent-vm-native/$slot/app.sock" "$slot_root/app.sock"
   cat >"/etc/agent-vm-native/slots/$slot/config.json" <<EOF
