@@ -453,4 +453,8 @@ grep -Fq 'agent_vm_deployd_recovery_required 1' <<<"$recovery_metrics" || fail "
 status_json="$(/opt/agent-vm-native/bin/agent-vm-deploy status --json)"
 assert_status "$status_json" green blue
 
+# Run the crash budget against real systemd after the normal switch/recovery proof.
+systemctl stop agent-vm-deployd.service agent-vm-native@blue.service agent-vm-native@green.service
+AGENT_VM_ROLLBACK_CRASH_TEST=1 go -C "$control_root" test -count=1 ./internal/deployd -run '^TestRealSystemdRollbackCrashBudget$' -v
+
 printf '{"schema_version":1,"verdict":"pass","systemd":"real","slot_runtime":"testslot-adapter","real_control_binary":"version-smoke-passed","slots":"dual-process-and-uds","switch":"green","restart_recovery":"needs_recovery-and-bounded-rollback","metrics":"single-deployd-endpoint"}\n'

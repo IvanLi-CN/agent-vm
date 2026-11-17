@@ -173,8 +173,8 @@ func consolidatedArtifacts(legacy []artifactSpec) []artifactSpec {
 	return result
 }
 
-var consolidatedGoArtifacts = consolidatedArtifacts(goArtifacts)
-var consolidatedProductArtifacts = consolidatedArtifacts(productArtifacts)
+var consolidatedGoArtifacts = append(consolidatedArtifacts(goArtifacts), artifactSpec{name: "host-config.ts", path: "host-config.ts", role: "support", mode: 0o644})
+var consolidatedProductArtifacts = append(consolidatedArtifacts(productArtifacts), artifactSpec{name: "host-config.ts", path: "host-config.ts", role: "support", mode: 0o644})
 var consolidatedNativeArtifacts = consolidatedArtifacts(nativeArtifacts)
 
 var fixedArtifacts = goArtifacts
@@ -747,7 +747,7 @@ type checkedArtifact struct {
 func validateArtifacts(value any) ([]checkedArtifact, error) {
 	values, ok := value.([]any)
 	selected := fixedArtifacts
-	if len(values) == len(consolidatedGoArtifacts) {
+	if ServerBinary(map[string]any{"artifacts": values}) == "agent-vm-server" {
 		selected = consolidatedGoArtifacts
 	}
 	if !ok || len(values) != len(selected) {

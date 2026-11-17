@@ -43,7 +43,7 @@ export const LEGACY_GO_ARTIFACTS: readonly ArtifactTuple[] = Object.freeze([
   ["unit:agent-vm-deployd.service", "systemd/agent-vm-deployd.service", "unit", 0o644],
 ]);
 
-export const GO_FIXED_ARTIFACTS = consolidated_artifacts(LEGACY_GO_ARTIFACTS);
+export const GO_FIXED_ARTIFACTS = consolidated_artifacts([...LEGACY_GO_ARTIFACTS, ["host-config.ts", "host-config.ts", "support", 0o644], ["agent_vm_control_bridge.ts", "agent_vm_control_bridge.ts", "control", 0o755]]);
 
 export interface GoArtifact {
   name: string;

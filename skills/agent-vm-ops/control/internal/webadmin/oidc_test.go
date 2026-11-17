@@ -9,14 +9,18 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/management"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
@@ -60,6 +64,10 @@ func TestOIDCLegacyBindingCookieRemovesOnlyConsumedBinding(t *testing.T) {
 }
 
 func TestOIDCLoginUsesDurableTransactionAndSession(t *testing.T) {
+	testOIDCLoginUsesDurableTransactionAndSession(t, nil)
+}
+
+func testOIDCLoginUsesDurableTransactionAndSession(t *testing.T, remoteStore *state.Store) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
@@ -86,6 +94,14 @@ func TestOIDCLoginUsesDurableTransactionAndSession(t *testing.T) {
 	}))
 	defer provider.Close()
 	authority, store, cfg := testAuthority(t)
+	if remoteStore != nil {
+		store = remoteStore
+		authority, err = NewAuthority(AuthorityOptions{Config: cfg, Store: store, Management: management.New(store, management.Options{}), ProductVersion: "test"})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	cfg.OIDC.Issuer = provider.URL
 	cfg.OIDC.RedirectURI = "https://console.example/api/v1/auth/oidc/callback"
 	cfg.AdminPrincipal.Issuer = provider.URL
@@ -407,4 +423,67 @@ func bigIntBytes(value int64) []byte {
 		value >>= 8
 	}
 	return result
+}
+
+// The endpoint is admitted only when it belongs to this Linux test session.
+func TestRemoteOIDCLoginAfterAdditiveSchemaChange(t *testing.T) {
+	descriptorPath := os.Getenv("AGENT_VM_RQLITE_DESCRIPTOR")
+	if descriptorPath == "" {
+		t.Skip("session-owned rqlite descriptor required")
+	}
+	data, err := os.ReadFile(descriptorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var descriptor struct {
+		SessionID string `json:"session_id"`
+		URL       string `json:"url"`
+		PID       int    `json:"pid"`
+		DataDir   string `json:"data_dir"`
+	}
+	if err := json.Unmarshal(data, &descriptor); err != nil {
+		t.Fatal(err)
+	}
+	if descriptor.SessionID == "" || descriptor.SessionID != os.Getenv("AGENT_VM_SESSION_ID") || descriptor.PID <= 0 || !filepath.IsAbs(descriptor.DataDir) {
+		t.Fatal("unowned rqlite descriptor")
+	}
+	endpoint, err := url.Parse(descriptor.URL)
+	if err != nil || (endpoint.Hostname() != "127.0.0.1" && endpoint.Hostname() != "localhost") {
+		t.Fatal("rqlite must be loopback")
+	}
+	cmdline, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", descriptor.PID))
+	if err != nil || !bytes.Contains(cmdline, []byte(descriptor.DataDir)) {
+		t.Fatal("rqlite process identity mismatch")
+	}
+	store, err := state.OpenForTest(descriptor.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	// Keep the Store open before a newer binary adds state and advances its epoch.
+	table := fmt.Sprintf("future_oidc_%d", time.Now().UnixNano())
+	payload, _ := json.Marshal([]any{"CREATE TABLE " + table + "(value TEXT)", "INSERT INTO " + table + " VALUES('preserved')", "UPDATE meta SET value='" + table + "' WHERE key='state_epoch'"})
+	response, err := http.Post(descriptor.URL+"/db/execute?transaction", "application/json", bytes.NewReader(payload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var result struct {
+		Results []struct {
+			Error string `json:"error"`
+		} `json:"results"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || result.Error != "" || len(result.Results) != 3 {
+		t.Fatalf("extend schema: %#v", result)
+	}
+	for _, statement := range result.Results {
+		if statement.Error != "" {
+			t.Fatal(statement.Error)
+		}
+	}
+	testOIDCLoginUsesDurableTransactionAndSession(t, store)
 }

@@ -111,7 +111,7 @@ jobs:
             "${GITHUB_RUN_ID}" "${GITHUB_RUN_ATTEMPT}" "${base_url}" "${rqlited_pid}" "${data_dir}" >"${proof_dir}/descriptor.json"
           AGENT_VM_SESSION_ID="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
           AGENT_VM_RQLITE_DESCRIPTOR="${proof_dir}/descriptor.json" \
-            go test -race -count=1 ./internal/state -run '^TestRemote'
+            go test -race -count=1 ./internal/state ./internal/webadmin -run '^TestRemote'
       - name: Go control vet
         run: go -C skills/agent-vm-ops/control vet ./...
       - name: Run repository checks

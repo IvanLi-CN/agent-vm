@@ -1397,6 +1397,13 @@ func (runtime *HostRuntime) waitSlotIdentity(ctx context.Context, slot string, p
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if rollback, _ := ctx.Value(rollbackUnitKey{}).(bool); rollback {
+			output, err := exec.CommandContext(ctx, "systemctl", "show", "agent-vm-native@"+slot+".service", "--property=ActiveState", "--property=MainPID").Output()
+			properties := parseSystemdProperties(string(output))
+			if err == nil && properties["MainPID"] == "0" && (properties["ActiveState"] == "failed" || properties["ActiveState"] == "inactive") {
+				return processIdentity{}, fmt.Errorf("rollback slot %s exited during start", slot)
+			}
+		}
 		body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil)
 		if err == nil && (status == http.StatusOK || status == http.StatusServiceUnavailable) && healthEnvelopeValid(body) {
 			if identity, ok := processIdentityFromHealth(body); ok && (!requireChanged || !sameProcess(identity, previous)) {
@@ -2016,7 +2023,7 @@ func (runtime *HostRuntime) startRollbackPrevious(ctx context.Context, slot stri
 		startCtx := context.WithValue(ctx, rollbackUnitKey{}, true)
 		last = runtime.systemctl(startCtx, "restart", "agent-vm-native@"+slot+".service")
 		if last == nil {
-			last = runtime.waitSlot(ctx, slot)
+			last = runtime.waitSlot(startCtx, slot)
 		}
 		if last == nil {
 			return runtime.configureSlotUnit(ctx, slot, false)

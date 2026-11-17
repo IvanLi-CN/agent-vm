@@ -1000,8 +1000,8 @@ class WrapperTests(unittest.TestCase):
         for slot in WRAPPER.GO_SLOT_NAMES:
             slot_root = runtime_root / "slots" / slot
             self.assertEqual(
-                (slot_root / "bin" / "agent-vm-control").read_bytes(),
-                (release_root / "bin" / "agent-vm-control").read_bytes(),
+                (slot_root / "bin" / "agent-vm-server").read_bytes(),
+                (release_root / "bin" / "agent-vm-server").read_bytes(),
             )
             self.assertEqual(
                 (slot_root / "release-manifest.json").read_bytes(),
@@ -1050,10 +1050,10 @@ class WrapperTests(unittest.TestCase):
         self.assertIn(["systemctl", "restart", "agent-vm-deployd.service"], commands)
         self.assertIn(["systemctl", "is-active", "agent-vm-deployd.service"], commands)
         for slot in WRAPPER.GO_SLOT_NAMES:
-            self.assertTrue((runtime_root / "slots" / slot / "bin" / "agent-vm-control").is_file())
+            self.assertTrue((runtime_root / "slots" / slot / "bin" / "agent-vm-server").is_file())
             self.assertTrue((runtime_root / "slots" / slot / "release-manifest.json").is_file())
         self.assertEqual(
-            (Path(self.loaded["control_path"]).parent / "bin" / "agent-vm-control").read_bytes(),
+            (Path(self.loaded["control_path"]).parent / "bin" / "agent-vm-server").read_bytes(),
             b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 10 + b"\x3e\x00" + b"\x00" * 42,
         )
         self.assertEqual(Path(self.loaded["control_path"]).read_bytes(), (ROOT / "skills/agent-vm-ops/scripts/agent_vm_control_bridge.ts").read_bytes())
@@ -1073,7 +1073,7 @@ class WrapperTests(unittest.TestCase):
         root = self.root / "historical-product"
         unit = root / "systemd/agent-vm-deployd.service"
         unit.parent.mkdir(parents=True)
-        current = (ROOT / "deploy/assets/systemd/agent-vm-deployd.service").read_bytes()
+        current = b'[Unit]\nDescription=Agent VM Deployd deployment controller\nAfter=local-fs.target\nAfter=agent-vm-native@blue.service agent-vm-native@green.service\nConditionPathExists=/opt/agent-vm-native/bin/agent-vm-deployd\nConditionPathExists=/etc/agent-vm-native/deployd.json\n\n[Service]\nType=simple\nExecStart=/opt/agent-vm-native/bin/agent-vm-deployd --config /etc/agent-vm-native/deployd.json\nRestart=on-failure\nRestartSec=2s\nTimeoutStartSec=60s\nTimeoutStopSec=30s\nUser=root\nGroup=agent-vm-web\nNoNewPrivileges=yes\nPrivateTmp=yes\nProtectSystem=full\nProtectHome=yes\nReadWritePaths=/var/lib/agent-vm-native /run/agent-vm-native\nReadOnlyPaths=/opt/agent-vm-native /etc/agent-vm-native\nRestrictAddressFamilies=AF_UNIX AF_INET AF_INET6\nUMask=0077\n\n[Install]\nWantedBy=multi-user.target\n'
         historical = current.replace(
             b"After=agent-vm-native@blue.service agent-vm-native@green.service\n", b"",
         ).replace(
@@ -1454,7 +1454,7 @@ class WorkerRecoveryBootstrapTests(unittest.TestCase):
             {"ok": True, "result": {"pending_operations": pending, "in_flight_operations": 0}},
             {"attempted_destroy_start": 1, "maintenance_operation_recovery": 1, "requires_release_drain": True},
         ]
-        with mock.patch.object(WRAPPER, "_current_target", return_value=Path("/retained-release")), mock.patch.object(WRAPPER, "_read_activation_safe_pending_ids", side_effect=AssertionError("must not consult legacy state")), mock.patch.object(WRAPPER, "_systemctl") as systemctl, mock.patch.object(WRAPPER.subprocess, "run", side_effect=[subprocess.CompletedProcess([],0,json.dumps(value).encode(),b"") for value in responses]):
+        with mock.patch.object(WRAPPER, "_release_server_name", return_value="agent-vm-server"), mock.patch.object(WRAPPER, "_current_target", return_value=Path("/retained-release")), mock.patch.object(WRAPPER, "_read_activation_safe_pending_ids", side_effect=AssertionError("must not consult legacy state")), mock.patch.object(WRAPPER, "_systemctl") as systemctl, mock.patch.object(WRAPPER.subprocess, "run", side_effect=[subprocess.CompletedProcess([],0,json.dumps(value).encode(),b"") for value in responses]):
             result = WRAPPER._ensure_drained({"require_drained":True,"current_link":"/current","release_root":"/releases","control_path":"/client.ts"}, recovery_candidate_root=Path("/verified-candidate"))
         self.assertEqual(result,pending)
         systemctl.assert_not_called()
