@@ -22,19 +22,19 @@
 
 ## Validation
 
-本地已完成 `bun run docs:check`、`bun run docs:build`、`bun test docs-site/content`、独立 Storybook 构建与桌面／`393×852` Playwright 检查。浏览器覆盖需求筛选、设计及验收入口、构建来源、异常诊断、键盘操作、章节链接和 Mermaid。
+本地已完成 `bun run docs:check`、`bun run docs:build`、`bun test docs-site/content`、独立 Storybook 构建与桌面／`1024px` 中间宽度／`393×852` Playwright 检查；当前包含 14 项来源单测和 21 项浏览器检查（含显式证据捕获）。浏览器覆盖需求筛选、设计及验收入口、构建来源、异常诊断、键盘操作、章节链接和 Mermaid。
 
-仓库 `bun run check`、`bun run test:repo` 与 Go 测试通过；`bun run test:skills` 的发布打包测试因未提交工作区被既有保护拒绝，形成干净候选提交后重跑。质量门禁声明检查通过，保留既有必需 gate 名称，新增文档作业作为依赖。
+仓库 `bun run check`、`bun run test:repo`、`bun run test:skills` 与 Go 测试通过。Skill 测试在干净候选提交上重跑，发布打包保护正常通过。质量门禁声明检查通过，保留既有必需 gate 名称，新增文档作业作为依赖。
 
 ### 构建测量
 
-环境为 macOS arm64、Apple M4、Bun `1.4.4`、Node `24.12.0`，依赖已安装。测量基准为提交 `3d90cf34375d058b5b03d2635aca0b17b3a1d887` 加当前实现草稿，输入摘要 `c600f94cf5a52af0356bbe65e237ce28af9bdffd803489ce85318193df8f9e94`；该摘要对应测量时的正文与配置，不冒充后续候选的摘要。
+环境为 macOS arm64、Apple M4、Bun `1.4.4`、Node `24.12.0`，依赖已安装。测量基准为干净提交 `7ea08c362b8231aa8bd449def6390b20cb0068fd`，输入摘要 `500b99a33344672c5f891289ade4c69481481ada6d84c0cbd67946d44ba75d85`；该摘要对应测量时的正文与配置，不冒充后续候选的摘要。
 
 | 项目 | 实测 | 方法 |
 | --- | --- | --- |
-| 冷构建 | 3,923 ms | 清除该子项目 `.source/` 和 `build/` 后，完成生成、编译与静态预渲染。 |
-| 完整预渲染构建 | 3,855 ms | 相同来源再次运行完整构建。 |
-| 单文档开发重编译 | 368 ms | 从原始 Markdown 写入到生成模块经 Vite 转换的 HTTP 响应；临时探针随后恢复。 |
+| 冷构建 | 5,917 ms | 清除该子项目 `.source/` 和 `build/` 后，完成生成、编译与静态预渲染。 |
+| 完整预渲染构建 | 4,422 ms | 相同来源再次运行完整构建。 |
+| 单文档开发重编译 | 441 ms | 从原始 Markdown 写入到生成模块经 Vite 转换的 HTTP 响应；临时探针随后恢复。 |
 
 测量入口为 `DOCS_PORT=<leased-port> bun docs-site/content/measure.ts`，结果输出到忽略的 `.generated/performance.json`。没有预设性能阈值；以上为一次环境绑定观察，不能推断其他机器或全量项目文档的性能。开发循环没有重建 Go。
 

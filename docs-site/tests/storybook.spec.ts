@@ -4,7 +4,7 @@ test('isolated review gallery exercises filtering and problem states',async({pag
  await page.goto(storybook+'/iframe.html?id=documentation-requirement-review--filter&viewMode=story');
  await expect(page.getByRole('status')).toContainText('1 项需求');
  await page.goto(storybook+'/iframe.html?id=documentation-requirement-review--problems&viewMode=story');
- await expect(page.getByText('broken ·',{exact:false})).toBeVisible();
+ await expect(page.locator('[data-kind=broken]')).toBeVisible();
  const surface=page.locator('[data-evidence-surface="review-component"]');
  const presentation=await surface.evaluate(el=>{const s=getComputedStyle(el);return {padding:s.padding,background:s.backgroundColor};});
  expect(presentation.padding).toBe('32px');expect(presentation.background).not.toBe('rgba(0, 0, 0, 0)');

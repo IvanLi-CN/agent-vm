@@ -1,11 +1,11 @@
 import {test,expect} from '@playwright/test';
-test('review navigation and source snapshots',async({page})=>{await page.goto('/review');await expect(page.getByRole('heading',{name:'需求追溯',exact:true})).toBeVisible();await page.getByPlaceholder('编号或关键词').fill('REQ-DOCS-002');await expect(page.getByRole('status')).toContainText('1 项需求');await page.locator('.detail summary').first().click();await page.getByRole('link',{name:'构建来源'}).first().click();await expect(page.getByRole('heading',{name:'构建来源'})).toBeVisible();await expect(page.locator('pre')).toContainText('design-id');});
+test('review navigation and source snapshots',async({page})=>{await page.goto('/review');await expect(page.getByRole('heading',{name:'需求追溯',exact:true})).toBeVisible();await page.getByPlaceholder('编号或关键词').fill('REQ-DOCS-002');await expect(page.getByRole('status')).toContainText('1 项需求');await page.locator('.detail summary').first().click();await expect(page.locator('.rendered-excerpt').first()).toHaveCSS('white-space','normal');await expect(page.locator('.rendered-excerpt').first()).toHaveCSS('overflow-y','visible');await page.getByRole('link',{name:'构建来源'}).first().click();await expect(page.getByRole('heading',{name:'构建来源'})).toBeVisible();await expect(page.locator('pre')).toContainText('design-id');});
 test('source headings can be linked',async({page})=>{await page.goto('/docs/0');await expect(page.getByRole('heading',{name:/REQ-DOCS-001/})).toBeVisible();});
 test('keyboard, missing associations and diagnostics remain usable',async({page})=>{
   await page.goto('/review/examples');
   await expect(page.getByText('尚未关联。',{exact:false})).toBeVisible();
-  await expect(page.getByText('broken ·',{exact:false})).toBeVisible();
-  await expect(page.getByText('unparseable ·',{exact:false})).toBeVisible();
+  await expect(page.locator('[data-kind=broken]')).toBeVisible();
+  await expect(page.locator('[data-kind=unparseable]')).toBeVisible();
   const input=page.getByPlaceholder('编号或关键词');await input.focus();
   await page.keyboard.type('REQ-EXAMPLE-003');
   await expect(page.getByRole('status')).toContainText('1 项需求');
@@ -26,4 +26,20 @@ test('captures controlled review evidence when requested',async({page},testInfo)
  await page.screenshot({path:testInfo.outputPath('review.png'),fullPage:true});
  await page.goto('/review/examples');
  await page.screenshot({path:testInfo.outputPath('problems.png'),fullPage:true});
+});
+test('layout keeps detail readable at intermediate widths and supports empty filters',async({page})=>{
+ await page.goto('/review');
+ const compact=page.locator('.compact-picker');
+ if(page.viewportSize()!.width<1150){
+  await expect(compact).toBeVisible();
+  await compact.locator('select').selectOption('REQ-DOCS-007');
+  await expect(page.locator('.detail-heading')).toContainText('REQ-DOCS-007');
+ }else{
+  await expect(compact).toBeHidden();
+  expect((await page.locator('.detail').boundingBox())!.width).toBeGreaterThan(600);
+ }
+ expect(await page.evaluate(()=>document.documentElement.scrollWidth<=window.innerWidth)).toBe(true);
+ await page.getByPlaceholder('编号或关键词').fill('no-matching-requirement');
+ await expect(page.getByRole('status')).toContainText('0 项需求');
+ await expect(page.getByRole('heading',{name:'没有匹配的需求'})).toBeVisible();
 });
