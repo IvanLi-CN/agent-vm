@@ -1,6 +1,6 @@
 # Ubuntu 24.04 Agent VM 语言镜像
 
-在 Linux/Incus 上执行一条命令，构建 Base、Rust、Java、Go 各自的 privileged/unprivileged 变体，共八个镜像。每种模式先构建并缓存已封装的公共层，再派生 Base 发布包和语言层。Base 包含公共工具，不安装 Rust、Zulu Java 或 Go 专用工具链。工具链采用官方二进制；不在宿主编译 Rust、Java 或 Go，不预装浏览器自动化依赖。
+在 Linux/Incus 上执行一条命令，构建 Base、Rust、Java、Go 各自的 privileged/unprivileged 变体，共八个镜像。每种模式先构建并缓存已封装的公共层，再派生 Base 发布包和语言层。Base 包含公共工具，不安装 Rust、Zulu Java、Maven 或 Go 专用工具链。工具链采用官方二进制；Java 镜像提供锁定版本的 Zulu JDK 和 Maven，不在宿主编译 Rust、Java 或 Go，不预装浏览器自动化依赖。
 
 构建宿主必须支持当前 runc 的 nested Docker 工作负载。Ubuntu 24.04 初始发行的 Incus 6.0.0 缺少 nesting/AppArmor 修复；CI 使用 [Incus 官方安装文档](https://linuxcontainers.org/incus/docs/main/installing/)列出的 Zabbly 7.0 LTS 二进制软件源，并核对签名公钥指纹。不要通过关闭 AppArmor 或降低 Docker/runc 版本绕过验收。
 

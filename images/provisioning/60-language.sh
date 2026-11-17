@@ -22,9 +22,16 @@ case "$IMAGE_PROFILE" in
     install -d /opt/zulu
     tar -xzf "$work/zulu.tar.gz" -C /opt/zulu --strip-components=1
     for tool in /opt/zulu/bin/*; do ln -sfn "$tool" "/usr/local/bin/$(basename "$tool")"; done
-    printf '%s\n' 'export JAVA_HOME=/opt/zulu' > /etc/profile.d/agent-vm-java.sh
+    download_verify "$MAVEN_URL" "$MAVEN_SHA256" "$work/maven.tar.gz"
+    install -d /opt/maven
+    tar -xzf "$work/maven.tar.gz" -C /opt/maven --strip-components=1
+    for tool in /opt/maven/bin/*; do
+      if test -x "$tool"; then ln -sfn "$tool" "/usr/local/bin/$(basename "$tool")"; fi
+    done
+    printf '%s\n' 'export JAVA_HOME=/opt/zulu' 'export MAVEN_HOME=/opt/maven' > /etc/profile.d/agent-vm-java.sh
     java -version
     javac -version
+    mvn -version
     ;;
   go)
     download_verify "$GO_URL" "$GO_SHA256" "$work/go.tar.gz"
