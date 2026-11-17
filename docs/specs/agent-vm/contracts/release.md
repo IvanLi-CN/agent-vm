@@ -14,7 +14,7 @@ Client product package 使用 `release-manifest.json` format 3 和一个 product
 
 安装有效 format-3 或 format-4 sidecar 时，client 打印 package SemVer； development 或没有 product version 的 legacy installations 打印 `dev`。 Go control response 对 format-3 和 format-4 product manifests 包含 `version`，同时保留 SHA-derived `release_id` 和 `source_revision` compatibility fields。
 
-Format 1 兼容桥接包保持原有动作与语义窗口，不宣称支持镜像列表或显式镜像选择。现代 Go 和产品发布包从客户端源码合同生成完整能力声明。
+Format 1 兼容桥接包保持原有动作与语义窗口，不宣称支持镜像列表或显式镜像选择。现代 Go 和产品发布包从客户端源码合同生成完整能力声明。Go 启动校验必须接受包含 `image-list` 的现代完整动作集合，并保留此前不含该动作的完整集合；读取旧清单不会补写或升级其兼容窗口。构建器与实际 Go 清单消费端之间必须有回归验证。
 
 ## 发布清单
 
