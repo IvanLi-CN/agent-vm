@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage six verified guest images before freezing an immutable product release."""
+"""Stage eight verified guest images before freezing an immutable product release."""
 import argparse
 import json
 import shutil
@@ -12,11 +12,11 @@ SUFFIXES = ['tar.gz', 'manifest.json', 'sbom.json', 'readiness.json']
 
 
 def stage(input_root, output, revision):
-    combinations = [(language, mode) for language in ['go', 'rust', 'java']
+    combinations = [(language, mode) for language in ['base', 'go', 'rust', 'java']
                     for mode in ['privileged', 'unprivileged']]
     directories = {'guest-image-' + language + '-' + mode for language, mode in combinations}
     if not input_root.is_dir() or {p.name for p in input_root.iterdir()} != directories:
-        raise ValueError('release requires exactly six language/runtime artifacts')
+        raise ValueError('release requires exactly eight profile/runtime artifacts')
     sources = {}
     for language, mode in combinations:
         directory = input_root / ('guest-image-' + language + '-' + mode)

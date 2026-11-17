@@ -25,7 +25,7 @@ for (let i = 0; i < args.length; i++) {
   if (["--profile", "--variant"].includes(args[i]!)) { i++; continue; }
   if (!["--all", "--check"].includes(args[i]!)) fail(`unknown argument: ${args[i]}`);
 }
-const profiles = args.includes("--all") ? ["rust", "java", "go"] : [option("--profile", "base")];
+const profiles = args.includes("--all") ? ["base", "rust", "java", "go"] : [option("--profile", "base")];
 const variant = option("--variant", "both");
 if (!["both", "privileged", "unprivileged"].includes(variant)) fail("--variant must be both, privileged or unprivileged");
 const variants = variant === "both" ? ["privileged", "unprivileged"] : [variant];
@@ -124,7 +124,7 @@ const sourceRevision = process.env.AGENT_VM_IMAGE_SOURCE_REVISION ?? Bun.spawnSy
 if (!/^[0-9a-f]{40}$/.test(sourceRevision)) fail("build requires a full source revision");
 const lockSha = createHash("sha256").update(lockText).digest("hex");
 async function buildMode(mode: string) {
-  const layerHash = createHash("sha256").update(header + buildNetwork + base + docker + readiness + aptText + aptInstaller + JSON.stringify(packages) + JSON.stringify(runtimeConfig(mode)) + lock.base.fingerprint).digest("hex").slice(0, 20);
+  const layerHash = createHash("sha256").update(header + buildNetwork + base + docker + readiness + seal + aptText + aptInstaller + JSON.stringify(packages) + JSON.stringify(runtimeConfig(mode)) + lock.base.fingerprint).digest("hex").slice(0, 20);
   const commonAlias = `${lock.name}-${mode}-common-${layerHash}`;
   const runtimeRecord = `install -d /etc/agent-vm-image\nprintf '%s\\n' '${JSON.stringify({ variant: mode, runtime_config: runtimeConfig(mode) })}' > /etc/agent-vm-image/runtime-config.json\n`;
   if ((await incus(["image", "info", commonAlias], true, true)).code) {
@@ -134,7 +134,7 @@ async function buildMode(mode: string) {
       const local = await incus(["image", "info", lock.base.fingerprint], true, true);
       await init(local.code ? `images:${lock.base.fingerprint}` : lock.base.fingerprint, name, mode); created = true;
       await incus(["start", name]);
-      await provision(name, `${header}${buildNetwork}IMAGE_PROFILE=base\napt-get update\ncommand -v python3 >/dev/null || apt-get install -y --no-install-recommends python3=${aptLock.ubuntu!.python3!.version}\npython3 /root/.agent-vm-apt-install.py ubuntu\n${base}\n${docker}\n${runtimeRecord}${readiness}\n`);
+      await provision(name, `${header}${buildNetwork}IMAGE_PROFILE=base\napt-get update\ncommand -v python3 >/dev/null || apt-get install -y --no-install-recommends python3=${aptLock.ubuntu!.python3!.version}\npython3 /root/.agent-vm-apt-install.py ubuntu\n${base}\n${docker}\n${runtimeRecord}${readiness}\n${seal}\n`);
       await incus(["stop", name]);
       await incus(["publish", name, "--alias", commonAlias]);
     } finally { if (created) await remove(name); }
@@ -162,6 +162,8 @@ async function buildMode(mode: string) {
       await incus(["image", "export", imageFingerprint, join(output, asset)]);
       const tar = join(output, `${asset}.tar.gz`);
       if (!existsSync(tar)) fail("Incus did not export a unified .tar.gz image");
+      const portability = Bun.spawn(["python3", join(imageRoot, "scripts/verify_image_archive.py"), tar], { stdout: "inherit", stderr: "inherit" });
+      if (await portability.exited) fail("exported image contains non-portable build state");
       await verifyPublished(imageFingerprint, mode, profile, join(output, `${asset}.readiness.json`));
       const manifest = { schema: 1, name: asset, profile, variant: mode, runtime_config: runtimeConfig(mode), architecture: "amd64", source_revision: sourceRevision, lock_sha256: lockSha, image_fingerprint: imageFingerprint, base: lock.base, versions: lock.versions, sha256: await digest(tar) };
       writeFileSync(join(output, `${asset}.manifest.json`), JSON.stringify(manifest, null, 2) + "\n");

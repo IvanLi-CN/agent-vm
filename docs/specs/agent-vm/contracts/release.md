@@ -24,7 +24,7 @@ Python release tools 使用[`release_manifest.py`](../../../../deploy/scripts/re
 
 ## 来宾镜像发布资产
 
-正式 Release 在同一源码修订完成 Rust、Java、Go 的 privileged/unprivileged 六套 amd64 镜像构建。草稿创建前必须验证六个矩阵槽位、精确 source revision、镜像身份、readiness、SBOM 和摘要，并将 24 个镜像文件及独立镜像 SHA256SUMS 纳入既有 prepared 冻结清单和顶层 SHA256SUMS。缺失、额外、被篡改或修订不匹配的输入不得进入发布。镜像是独立下载资产，不进入 client/native/bootstrap 产品包，也不扩大组件更新的下载或验证范围。
+正式 Release 在同一源码修订完成 Base、Rust、Java、Go 的 privileged/unprivileged 八套 amd64 镜像构建。草稿创建前必须验证八个矩阵槽位、精确 source revision、镜像身份、readiness、SBOM 和摘要，并将 32 个镜像文件及独立镜像 SHA256SUMS 纳入既有 prepared 冻结清单和顶层 SHA256SUMS。缺失、额外、被篡改或修订不匹配的输入不得进入发布。Base 两种模式必须以独立资产发布；所有镜像归档均不得包含块/字符设备节点或 Docker/containerd 构建运行数据，即使其摘要与 manifest 相符也必须拒绝。镜像是独立下载资产，不进入 client/native/bootstrap 产品包，也不扩大组件更新的下载或验证范围。
 
 不可变 Release 发布后不得追加镜像；恢复事务只复用 reservation 中冻结的文件和摘要，不重新选择源码或构建镜像。发布状态快照必须包含这些文件，便于既有 recovery workflow 继续验证相同资产集合。
 
