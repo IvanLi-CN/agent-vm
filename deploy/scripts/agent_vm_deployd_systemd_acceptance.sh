@@ -245,6 +245,8 @@ tar -cf "$real_bundle" -C "$bundle_root" "${bundle_members[@]}"
 install -d -m 0750 /etc/agent-vm-native/slots /opt/agent-vm-native/bin \
   /var/lib/agent-vm-native/slots /var/lib/agent-vm-native/deployment \
   /run/agent-vm-native/blue /run/agent-vm-native/green
+cp -- "$real_bundle" /var/lib/agent-vm-native/deployment/acceptance.tar
+real_bundle=/var/lib/agent-vm-native/deployment/acceptance.tar
 cp -- "$bundle_root/bin/agent-vm-deploy" /opt/agent-vm-native/bin/agent-vm-deploy
 chmod 0755 /opt/agent-vm-native/bin/agent-vm-deploy
 
