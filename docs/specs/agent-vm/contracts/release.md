@@ -14,6 +14,8 @@ Client product package 使用 `release-manifest.json` format 3 和一个 product
 
 安装有效 format-3 或 format-4 sidecar 时，client 打印 package SemVer； development 或没有 product version 的 legacy installations 打印 `dev`。 Go control response 对 format-3 和 format-4 product manifests 包含 `version`，同时保留 SHA-derived `release_id` 和 `source_revision` compatibility fields。
 
+Format 1 兼容桥接包保持原有动作与语义窗口，不宣称支持镜像列表或显式镜像选择。现代 Go 和产品发布包从客户端源码合同生成完整能力声明。
+
 ## 发布清单
 
 Python release tools 使用[`release_manifest.py`](../../../../deploy/scripts/release_manifest.py)验证 format-1/2 migration、native format-2 package 和 product formats 3/4；Bun controller 使用[`release-manifest.ts`](../../../../skills/agent-vm-ops/scripts/release-manifest.ts)验证 runtime manifests、product manifests 和 artifact bytes。 Format 2 仍是 native deployment path； format 3 是 read-only product compatibility path； format 4 是由 Bun、Python 和 Go 消费的 management-enabled product path。 Bun 和 Go test suites 覆盖 isolated package 和 transaction behavior； native Linux/Incus evidence 仍以 deployment-boundary change 为条件，不属于当前 governance candidate。

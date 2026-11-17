@@ -576,7 +576,7 @@ def validate_manifest(value: Any) -> dict[str, Any]:
 
 def _validate_go_actions(value: Any, *, allow_historical_action_set: bool = False) -> dict[str, dict[str, Any]]:
     raw_actions = _require_mapping(value, "actions")
-    accepted_action_sets = [set(ACTION_NAMES)]
+    accepted_action_sets = [set(ACTION_NAMES), set(ACTION_NAMES) | {"image-list"}]
     if allow_historical_action_set:
         accepted_action_sets.append(set(HISTORICAL_GO_ACTION_NAMES))
     if set(raw_actions) not in accepted_action_sets:

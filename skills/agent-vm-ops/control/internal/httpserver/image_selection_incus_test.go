@@ -152,6 +152,10 @@ func TestClientImageSelectionIsolatedIncus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v %#v", err, list)
 	}
+	listed := list["result"].(map[string]any)["images"].([]any)
+	if len(listed) != 2 {
+		t.Fatalf("unexpected client image list: %#v", list)
+	}
 	first := acquire("accept-one", "accept-create-one", "selection-0")
 	second := acquire("accept-two", "accept-create-two", fingerprints[1])
 	if first["image_fingerprint"] != fingerprints[0] || second["image_fingerprint"] != fingerprints[1] {

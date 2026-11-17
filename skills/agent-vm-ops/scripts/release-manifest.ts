@@ -50,7 +50,9 @@ export const CLIENT_DEPENDENCY_NAMES = new Set([
 
 export const ACTION_NAMES: readonly string[] = Object.freeze([...RUNTIME_ACTIONS]);
 
-const ACTION_SET: ReadonlySet<string> = new Set(ACTION_NAMES);
+// Format 1 is a frozen compatibility bridge, without image-selection semantics.
+const LEGACY_ACTION_NAMES = ACTION_NAMES.filter(action => action !== "image-list");
+const ACTION_SET: ReadonlySet<string> = new Set(LEGACY_ACTION_NAMES);
 
 const HTTPS_TRANSPORT_UNAVAILABLE =
   "https transport is validation-only until bundled client HTTPS support is integrated";
@@ -445,8 +447,12 @@ export function default_operations(): Record<string, OperationSpec> {
   );
 }
 
+function legacy_operations(): Record<string, OperationSpec> {
+  return Object.fromEntries(LEGACY_ACTION_NAMES.map(action => [action, operation_spec()]));
+}
+
 export function legacy_manifest(): ReleaseManifest {
-  const actions = default_operations();
+  const actions = legacy_operations();
   return {
     format: MANIFEST_FORMAT,
     release_id: "0".repeat(40),
@@ -481,7 +487,7 @@ export function build_manifest(
   const operations =
     options.operations != null && Object.keys(options.operations).length > 0
       ? options.operations
-      : default_operations();
+      : legacy_operations();
   const actions = Object.fromEntries(
     Object.entries(operations).map(([key, value]) => [key, { ...value }]),
   );
@@ -640,11 +646,11 @@ export function validate_manifest(value: unknown): ReleaseManifest {
       { actions: unsupported_actions },
     );
   }
-  if (!_same_keys(raw_actions, ACTION_NAMES)) {
+  if (!_same_keys(raw_actions, LEGACY_ACTION_NAMES)) {
     throw _error(
       "manifest_action_set_invalid",
       "manifest action set differs from the fixed control surface",
-      { expected: [...ACTION_NAMES], actual: action_keys.sort() },
+      { expected: [...LEGACY_ACTION_NAMES], actual: action_keys.sort() },
     );
   }
 

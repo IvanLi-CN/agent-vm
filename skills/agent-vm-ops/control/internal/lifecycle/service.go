@@ -2483,7 +2483,8 @@ func (s *Service) recordAudit(ctx context.Context, request protocol.Request, out
 func (s *Service) dispatchAction(ctx context.Context, action string, request protocol.Request) (any, error) {
 	switch action {
 	case "image-list":
-		return s.Store.CreatableImages(ctx)
+		images, err := s.Store.CreatableImages(ctx)
+		return map[string]any{"images": images}, err
 	case "status":
 		return s.status(ctx, stringValue(request["session_id"]))
 	case "acquire":
