@@ -34,7 +34,7 @@
 | REQ-ENG-007 | 基线提交有有效签名。 | 平台 PR-only、required checks、签名、最新分支要求、禁止删除/force push 与例外核验。 |
 | REQ-ENG-008 | 条件原生验收边界已写入 release contract；本轮不执行 Incus/systemd 安装运行。 | 命中 Incus/systemd/deployment 变更时的独立验收。 |
 | REQ-ENG-009 | 精确 PR 事件、merge queue 事件、独立 namespace、`cancel-in-progress: false` 和合同测试。 | 真实 required queue/run history 对齐。 |
-| REQ-ENG-010 至 REQ-ENG-014 | SemVer resolver、固定源码 preflight、format 3 builder、append-only state、恢复入口；guest image release 在构建前校验 protected main 和操作者对 immutable-release policy 的显式确认，按 source SHA 绑定 tag，draft 按 release ID 可续跑，发布前后重新校验远端 asset bytes，已发布重跑只验证冻结资产。 | 真实 GitHub Release immutability、发布记录权限和中断恢复实证。 |
+| REQ-ENG-010 至 REQ-ENG-014 | SemVer resolver、固定源码 preflight、format 3 builder、append-only state、恢复入口；guest image release 在构建前校验 protected main 和操作者对 immutable-release policy 的显式确认，缺失 tag 时显式按 source SHA 创建，已有 tag 按其实际 ref 校验，draft 按 release ID 可续跑，资产通过 Release 的 `upload_url` 上传，发布前后重新校验远端 asset bytes，并在同一步骤连续执行最终复核与不可逆发布，已发布重跑只验证冻结资产。 | 真实 GitHub Release immutability、发布记录权限和中断恢复实证。 |
 | REQ-ENG-015 | 已有显式部署、drain、激活、健康和恢复工具。 | 只消费已完成发布的版本化产物，明确发布完成与部署结果的独立记录。 |
 | REQ-ENG-016 至 REQ-ENG-020 | 全 workflow 唯一分类、两个 trusted-default-branch sidecars、metadata payload、selection gate 和 Oidrune transport 决策。 | Oidrune gateway/audience、来源 allowlist、真实 smoke 和生产启用仍待完成。 |
 | REQ-ENG-021 | format 3、新 `version`/`source_revision`、客户端版本输出、Python/Bun/Go 读取适配。 | 旧 SHA 状态 fixture 和 Go runtime format 3 fixture 仍需补齐。 |
@@ -62,7 +62,7 @@
 | `CI (Main)` | main push；在实际 merge SHA 产生 `Main gate`。 | 独立 main namespace，`queue: max`，不抢占。 | generic |
 | `Release` | main 上显式 dispatch；固定事件 source，只发布产品资产，不构建或发布 guest images。 | 产品级 release 状态写入 namespace，`queue: max`，不抢占。 | Release-specific |
 | `Guest image preview` | PR 或手动 dispatch；先固定一次 source SHA，并行构建两种 common base，再由八个最终镜像槽位消费对应 artifact 并上传短期 CI artifact，不发布生产镜像。 | per-ref preview namespace；PR 可取消过期 candidate，手动运行不抢占。 | generic |
-| `Guest image release` | 仅手动 dispatch；在构建矩阵前校验 protected main 与 immutable policy 操作者确认，复用 common-base producer 和最终镜像矩阵，按 release ID 续跑 draft，校验 33 项资产、source-bound tag、发布前后的 immutable 状态与远端 asset bytes，并发布独立 image Release。 | 独立 image-release namespace，不抢占；不与产品 Release 共享 group。 | generic |
+| `Guest image release` | 仅手动 dispatch；在构建矩阵前校验 protected main 与 immutable policy 操作者确认，复用 common-base producer 和最终镜像矩阵，缺失 tag 时显式绑定 source SHA，按 release ID 续跑 draft，使用 Release `upload_url` 上传并校验 33 项资产、非 prerelease、source-bound tag、发布前后的 immutable 状态与远端 asset bytes，最后发布独立 image Release。 | 独立 image-release namespace，不抢占；不与产品 Release 共享 group。 | generic |
 | `Notify failed workflow` | generic allowlist 的 completed workflow_run，显式 guard failure。 | 原 run ID 与 attempt；不与产品发布共享 group。 | selection-gated |
 | `Notify failed release` | Release 的 completed workflow_run，额外核验发布 identity。 | 原 run ID 与 attempt；不与产品发布共享 group。 | selection-gated |
 | `Notification smoke` | transport 选择后的独立手动发送验证；当前只证明 gate fail-closed。 | 独立 manual namespace。 | selection-gated |

@@ -94,9 +94,11 @@ jobs:
             404)
               test "$tag_exit" -ne 0
               echo "image tag is absent and may be created: ${image_tag}"
+              echo "IMAGE_TAG_WAS_EXISTING=false" >> "$GITHUB_ENV"
               ;;
             200)
               test "$tag_exit" -eq 0
+              echo "IMAGE_TAG_WAS_EXISTING=true" >> "$GITHUB_ENV"
               tag_value="$(gh api "$tag_endpoint" --jq '.object.sha + "\t" + .object.type')"
               tag_sha="${tag_value%%$'\t'*}"
               tag_type="${tag_value#*$'\t'}"
@@ -126,23 +128,34 @@ jobs:
           set -euo pipefail
           release_list="$({
             gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-              --jq '.[] | [.id, .tag_name, .draft, (.immutable // false), .target_commitish] | @tsv'
+              --jq '.[] | [.id, .tag_name, .draft, (.immutable // false), .prerelease] | @tsv'
           } | awk -F '\t' -v image_tag="$IMAGE_TAG" '$2 == image_tag { print; count += 1 } END { if (count > 1) exit 2 }')"
           if [ -z "$release_list" ]; then
+            if [ "$IMAGE_TAG_WAS_EXISTING" != "true" ]; then
+              set +e
+              tag_create_response="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                -f "ref=refs/tags/${IMAGE_TAG}" \
+                -f "sha=${SOURCE_REVISION}" 2>&1)"
+              tag_create_exit=$?
+              set -e
+              if [ "$tag_create_exit" -ne 0 ]; then
+                printf '%s\n' "$tag_create_response" >&2
+              fi
+            fi
             release_response="$(gh api --method POST "repos/${GITHUB_REPOSITORY}/releases" \
               -f "tag_name=${IMAGE_TAG}" \
               -f "target_commitish=${SOURCE_REVISION}" \
               -f "name=Agent VM images ${SOURCE_REVISION}" \
               -f "body=Independent Agent VM guest image release for source ${SOURCE_REVISION}. Product Release does not rebuild or publish guest images." \
               -F draft=true)"
-            release_state="$(printf '%s' "$release_response" | jq -er '[.id, .tag_name, .draft, (.immutable // false), .target_commitish] | @tsv')"
+            release_state="$(printf '%s' "$release_response" | jq -er '[.id, .tag_name, .draft, (.immutable // false), .prerelease] | @tsv')"
           else
             release_state="$release_list"
           fi
-          IFS=$'\t' read -r release_id release_tag is_draft is_immutable target_commitish <<< "$release_state"
+          IFS=$'\t' read -r release_id release_tag is_draft is_immutable is_prerelease <<< "$release_state"
           test -n "$release_id"
           test "$release_tag" = "$IMAGE_TAG"
-          test "$target_commitish" = "$SOURCE_REVISION"
+          test "$is_prerelease" = "false"
           echo "IMAGE_RELEASE_ID=${release_id}" >> "$GITHUB_ENV"
           if [ "$is_draft" = "true" ]; then
             echo "resuming existing source-bound draft release: ${IMAGE_TAG}"
@@ -167,6 +180,10 @@ jobs:
           done
           test "$tag_type" = "commit"
           test "$tag_sha" = "$SOURCE_REVISION"
+          release_endpoint="repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+          upload_url="$(gh api "$release_endpoint" --jq '.upload_url')"
+          test -n "$upload_url"
+          echo "IMAGE_RELEASE_UPLOAD_URL=${upload_url}" >> "$GITHUB_ENV"
 
       - name: Upload staged image assets to draft
         if: env.IMAGE_RELEASE_ALREADY_PUBLISHED != 'true'
@@ -176,6 +193,8 @@ jobs:
         run: |
           set -euo pipefail
           asset_endpoint="repos/${GITHUB_REPOSITORY}/releases/${IMAGE_RELEASE_ID}/assets"
+          upload_url="${IMAGE_RELEASE_UPLOAD_URL%\{?name,label\}}"
+          test -n "$upload_url"
           existing_assets="$(gh api --paginate "${asset_endpoint}?per_page=100" --jq '.[] | [.id, .name] | @tsv')"
           for path in "$IMAGE_ROOT"/*; do
             name="$(basename "$path")"
@@ -183,9 +202,13 @@ jobs:
             if [ -n "$asset_id" ]; then
               gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" >/dev/null
             fi
-            gh api --method POST "${asset_endpoint}?name=${name}" \
+            name_query="$(jq -rn --arg name "$name" '$name | @uri')"
+            curl --fail --location --silent --show-error \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H 'Accept: application/vnd.github+json' \
               -H 'Content-Type: application/octet-stream' \
-              --input "$path" >/dev/null
+              --data-binary "@${path}" \
+              "${upload_url}?name=${name_query}" >/dev/null
           done
 
       - name: Verify draft image release and remote asset bytes
@@ -198,11 +221,11 @@ jobs:
         run: |
           set -euo pipefail
           release_endpoint="repos/${GITHUB_REPOSITORY}/releases/${IMAGE_RELEASE_ID}"
-          release_state="$(gh api "$release_endpoint" --jq '[.draft, .tag_name, .target_commitish] | @tsv')"
-          IFS=$'\t' read -r is_draft release_tag target_commitish <<< "$release_state"
+          release_state="$(gh api "$release_endpoint" --jq '[.draft, .tag_name, .prerelease] | @tsv')"
+          IFS=$'\t' read -r is_draft release_tag is_prerelease <<< "$release_state"
           test "$is_draft" = "true"
           test "$release_tag" = "$IMAGE_TAG"
-          test "$target_commitish" = "$SOURCE_REVISION"
+          test "$is_prerelease" = "false"
           tag_value="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${IMAGE_TAG}" --jq '.object.sha + "\t" + .object.type')"
           tag_sha="${tag_value%%$'\t'*}"
           tag_type="${tag_value#*$'\t'}"
@@ -246,11 +269,11 @@ jobs:
         run: |
           set -euo pipefail
           release_endpoint="repos/${GITHUB_REPOSITORY}/releases/${IMAGE_RELEASE_ID}"
-          release_state="$(gh api "$release_endpoint" --jq '[.draft, .tag_name, .target_commitish] | @tsv')"
-          IFS=$'\t' read -r is_draft release_tag target_commitish <<< "$release_state"
+          release_state="$(gh api "$release_endpoint" --jq '[.draft, .tag_name, .prerelease] | @tsv')"
+          IFS=$'\t' read -r is_draft release_tag is_prerelease <<< "$release_state"
           test "$is_draft" = "true"
           test "$release_tag" = "$IMAGE_TAG"
-          test "$target_commitish" = "$SOURCE_REVISION"
+          test "$is_prerelease" = "false"
           tag_value="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${IMAGE_TAG}" --jq '.object.sha + "\t" + .object.type')"
           tag_sha="${tag_value%%$'\t'*}"
           tag_type="${tag_value#*$'\t'}"
@@ -283,12 +306,10 @@ jobs:
             --local-directory "$IMAGE_ROOT" \
             --remote-directory "$REMOTE_ROOT" \
             --source-revision "$SOURCE_REVISION"
-
-      - name: Publish image release
-        if: env.IMAGE_RELEASE_ALREADY_PUBLISHED != 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${IMAGE_RELEASE_ID}" -F draft=false -f make_latest=false >/dev/null
+          # Keep the irreversible transition in this same process as the final draft verification.
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${IMAGE_RELEASE_ID}" \
+            -F draft=false \
+            -f make_latest=false >/dev/null
 
       - name: Verify immutable image release and final asset bytes
         env:
@@ -301,13 +322,13 @@ jobs:
           release_endpoint="repos/${GITHUB_REPOSITORY}/releases/${IMAGE_RELEASE_ID}"
           release_state=""
           for _ in $(seq 1 30); do
-            release_state="$(gh api "$release_endpoint" --jq '[.draft, (.immutable // false), .target_commitish, .tag_name] | @tsv' 2>/dev/null | tr -d '\n' || true)"
-            if [ "$release_state" = $'false\ttrue\t'"${SOURCE_REVISION}"$'\t'"${IMAGE_TAG}" ]; then
+            release_state="$(gh api "$release_endpoint" --jq '[.draft, (.immutable // false), .tag_name, .prerelease] | @tsv' 2>/dev/null | tr -d '\n' || true)"
+            if [ "$release_state" = $'false\ttrue\t'"${IMAGE_TAG}"$'\tfalse' ]; then
               break
             fi
             sleep 1
           done
-          test "$release_state" = $'false\ttrue\t'"${SOURCE_REVISION}"$'\t'"${IMAGE_TAG}"
+          test "$release_state" = $'false\ttrue\t'"${IMAGE_TAG}"$'\tfalse'
           tag_value="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${IMAGE_TAG}" --jq '.object.sha + "\t" + .object.type')"
           tag_sha="${tag_value%%$'\t'*}"
           tag_type="${tag_value#*$'\t'}"

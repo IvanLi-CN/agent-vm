@@ -34,11 +34,15 @@ test("guest image publication is manual and waits for the parallel build matrix"
   expect(release.jobs.publish.needs).toBe("build-images");
   expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes("releases/${IMAGE_RELEASE_ID}") && step.run?.includes("draft=false"))).toBe(true);
   expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes("make_latest=false"))).toBe(true);
-  expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes("releases/${IMAGE_RELEASE_ID}/assets") && step.run?.includes("--method POST"))).toBe(true);
+  expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes("IMAGE_RELEASE_UPLOAD_URL") && step.run?.includes("--data-binary"))).toBe(true);
   expect(read(".github/workflows/image-release.yml")).toContain("verify_release_assets.py");
   expect(read(".github/workflows/image-release.yml")).toContain("releases?per_page=100");
   expect(read(".github/workflows/image-release.yml")).toContain("IMAGE_RELEASE_ID");
   expect(read(".github/workflows/image-release.yml")).toContain("IMAGE_RELEASE_ALREADY_PUBLISHED");
+  expect(read(".github/workflows/image-release.yml")).toContain("IMAGE_TAG_WAS_EXISTING");
+  expect(read(".github/workflows/image-release.yml")).toContain("git/refs");
+  expect(read(".github/workflows/image-release.yml")).toContain(".prerelease");
+  expect(read(".github/workflows/image-release.yml")).toContain("IMAGE_RELEASE_UPLOAD_URL");
   expect(read(".github/workflows/image-release.yml")).toContain("verify_assets.py");
   expect(read(".github/workflows/image-release.yml")).toContain("Revalidate draft immediately before publication");
   expect(release.jobs.publish.steps.some((step: { run?: string }) => step.run?.includes('= "33"'))).toBe(true);
