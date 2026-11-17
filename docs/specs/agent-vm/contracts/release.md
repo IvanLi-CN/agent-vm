@@ -28,7 +28,7 @@ Python release tools 使用[`release_manifest.py`](../../../../deploy/scripts/re
 
 ## 来宾镜像发布资产
 
-来宾镜像是独立于产品版本的发布面。`Guest image preview` 可以在 PR 或手动触发时执行验证，但只产生短期 CI artifact；唯一的镜像发布入口是手动 `Guest image release` workflow。该 workflow 只接受受保护 `main` 上的 `workflow_dispatch`，以 dispatch 绑定的精确 checkout revision 为来源，先并行构建 privileged 和 unprivileged 两种 common base，再由八个 Base、Rust、Java、Go 的 privileged/unprivileged 最终镜像槽位下载对应 common base 并派生构建；最终镜像槽位最多三个并行。流程验证 common-base artifact、八个最终镜像身份、readiness、SBOM 和摘要，将 32 个镜像文件及独立镜像 `SHA256SUMS` 作为 33 项资产发布到 `agent-vm-images-<source-sha>` Release。缺失、额外、被篡改或修订不匹配的输入不得发布；Base 两种模式必须以独立资产发布；所有镜像归档均不得包含块/字符设备节点或 Docker/containerd 构建运行数据，即使其摘要与 manifest 相符也必须拒绝。常规产品 `Release` 只发布 client/native/bootstrap 和部署材料，不构建、冻结或发布 guest images。
+来宾镜像是独立于产品版本的发布面。`Guest image preview` 可以在 PR 或手动触发时执行验证，但只产生短期 CI artifact；唯一的镜像发布入口是手动 `Guest image release` workflow。该 workflow 在构建矩阵启动前拒绝非受保护 `main` dispatch，以 dispatch 绑定的精确 checkout revision 为来源，并由 preview workflow 先解析一次 source SHA，所有 job 复用该 SHA；流程先并行构建 privileged 和 unprivileged 两种 common base，再由八个 Base、Rust、Java、Go 的 privileged/unprivileged 最终镜像槽位下载对应 common base 并派生构建，最终镜像槽位最多三个并行。发布前必须确认仓库启用了 immutable releases，image tag 只能缺失或已经精确指向 source SHA；同一 source 的 draft release 可以续跑，上传后和发布后都必须重新下载并逐文件校验 32 个镜像文件及 `SHA256SUMS`。流程验证 common-base artifact、八个最终镜像身份、readiness、SBOM 和摘要，将 32 个镜像文件及独立镜像 `SHA256SUMS` 作为 33 项资产发布到 `agent-vm-images-<source-sha>` Release。缺失、额外、被篡改或修订不匹配的输入不得发布；Base 两种模式必须以独立资产发布；所有镜像归档均不得包含块/字符设备节点或 Docker/containerd 构建运行数据，即使其摘要与 manifest 相符也必须拒绝。常规产品 `Release` 只发布 client/native/bootstrap 和部署材料，不构建、冻结或发布 guest images。
 
 镜像 Release 发布后不得追加镜像；同一源码修订使用固定的镜像 tag 和完整资产集合。产品 Release 的 reservation 与 recovery 不持有镜像文件，也不得因为产品恢复重新选择源码或构建镜像。
 

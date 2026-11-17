@@ -27,14 +27,28 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # Build provenance uses the exact PR head, or the caller-bound source SHA.
-  lock-check:
-    name: Validate image lock
+  resolve-source:
+    name: Resolve source revision
     runs-on: ubuntu-24.04
+    outputs:
+      revision: ${{ steps.source.outputs.revision }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+      - id: source
+        run: echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # Build provenance uses the exact PR head, or the caller-bound source SHA.
+  lock-check:
+    name: Validate image lock
+    needs: resolve-source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve-source.outputs.revision }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
@@ -45,7 +59,7 @@ jobs:
 
   common-base:
     name: Build common base / ${{ matrix.variant }}
-    needs: lock-check
+    needs: [resolve-source, lock-check]
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     strategy:
@@ -56,7 +70,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.resolve-source.outputs.revision }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4
@@ -92,7 +106,7 @@ jobs:
 
   build:
     name: Image ${{ matrix.language }} / ${{ matrix.variant }}
-    needs: [lock-check, common-base]
+    needs: [resolve-source, lock-check, common-base]
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     strategy:
@@ -104,7 +118,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ needs.resolve-source.outputs.revision }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.4

@@ -13,8 +13,19 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate-dispatch:
+    name: Validate protected main dispatch
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require protected main dispatch before building
+        env:
+          DISPATCH_REF: ${{ github.ref }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: test "$DISPATCH_REF" = "refs/heads/main" && test "$REF_PROTECTED" = "true"
+
   build-images:
     name: Build and verify guest images
+    needs: validate-dispatch
     uses: ./.github/workflows/image-preview.yml
     with:
       source_ref: ${{ github.sha }}
@@ -58,49 +69,177 @@ jobs:
           python3 images/scripts/verify_assets.py \
             --directory "$OUTPUT_ROOT" \
             --source-revision "$SOURCE_REVISION"
-      - name: Check image release identity is unused
+      - name: Check release policy and image identity
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_REVISION: ${{ steps.source.outputs.revision }}
         run: |
           set -euo pipefail
           image_tag="agent-vm-images-${SOURCE_REVISION}"
-          if gh api --silent "repos/${GITHUB_REPOSITORY}/git/ref/tags/${image_tag}"; then
-            echo "image tag already exists: ${image_tag}" >&2
-            exit 1
-          fi
+          policy="$(gh api "repos/${GITHUB_REPOSITORY}/immutable-releases" --jq '.enabled // false')"
+          test "$policy" = "true"
+          tag_endpoint="repos/${GITHUB_REPOSITORY}/git/ref/tags/${image_tag}"
+          set +e
+          tag_response="$(gh api --include "$tag_endpoint" 2>&1)"
+          tag_exit=$?
+          set -e
+          tag_status="$(printf '%s\n' "$tag_response" | awk '$1 ~ /^HTTP/ {code=$2} END {print code}')"
+          case "$tag_status" in
+            404)
+              test "$tag_exit" -ne 0
+              echo "image tag is absent and may be created: ${image_tag}"
+              ;;
+            200)
+              test "$tag_exit" -eq 0
+              tag_value="$(gh api "$tag_endpoint" --jq '.object.sha + "\t" + .object.type')"
+              tag_sha="${tag_value%%$'\t'*}"
+              tag_type="${tag_value#*$'\t'}"
+              for _ in 1 2 3 4; do
+                [ "$tag_type" = "commit" ] && break
+                test "$tag_type" = "tag"
+                tag_value="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.object.sha + "\t" + .object.type')"
+                tag_sha="${tag_value%%$'\t'*}"
+                tag_type="${tag_value#*$'\t'}"
+              done
+              test "$tag_type" = "commit"
+              test "$tag_sha" = "$SOURCE_REVISION"
+              echo "existing image tag is bound to the requested source: ${image_tag}"
+              ;;
+            *)
+              echo "unable to prove image tag state (HTTP ${tag_status:-unknown}, exit ${tag_exit})" >&2
+              exit 1
+              ;;
+          esac
           echo "IMAGE_TAG=${image_tag}" >> "$GITHUB_ENV"
-      - name: Create draft image release
+          echo "IMAGE_RELEASE_ALREADY_PUBLISHED=false" >> "$GITHUB_ENV"
+
+      - name: Ensure resumable draft image release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+        run: |
+          set -euo pipefail
+          release_endpoint="repos/${GITHUB_REPOSITORY}/releases/tags/${IMAGE_TAG}"
+          set +e
+          release_response="$(gh api --include "$release_endpoint" 2>&1)"
+          release_exit=$?
+          set -e
+          release_status="$(printf '%s\n' "$release_response" | awk '$1 ~ /^HTTP/ {code=$2} END {print code}')"
+          case "$release_status" in
+            404)
+              test "$release_exit" -ne 0
+              gh release create "$IMAGE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --target "$SOURCE_REVISION" \
+                --title "Agent VM images ${SOURCE_REVISION}" \
+                --notes "Independent Agent VM guest image release for source ${SOURCE_REVISION}. Product Release does not rebuild or publish guest images." \
+                --draft
+              ;;
+            200)
+              test "$release_exit" -eq 0
+              release_state="$(gh api "$release_endpoint" --jq '[.draft, (.immutable // false), .target_commitish] | @tsv')"
+              IFS=$'\t' read -r is_draft is_immutable target_commitish <<< "$release_state"
+              test "$target_commitish" = "$SOURCE_REVISION"
+              if [ "$is_draft" = "true" ]; then
+                echo "resuming existing source-bound draft release: ${IMAGE_TAG}"
+              elif [ "$is_immutable" = "true" ]; then
+                echo "source-bound immutable release already exists: ${IMAGE_TAG}"
+                echo "IMAGE_RELEASE_ALREADY_PUBLISHED=true" >> "$GITHUB_ENV"
+              else
+                echo "existing image release is public but not immutable: ${IMAGE_TAG}" >&2
+                exit 1
+              fi
+              ;;
+            *)
+              echo "unable to prove image release state (HTTP ${release_status:-unknown}, exit ${release_exit})" >&2
+              exit 1
+              ;;
+          esac
+
+      - name: Upload staged image assets to draft
+        if: env.IMAGE_RELEASE_ALREADY_PUBLISHED != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_ROOT: ${{ runner.temp }}/agent-vm-image-release
+        run: gh release upload "$IMAGE_TAG" "$IMAGE_ROOT"/* --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Verify draft image release and remote asset bytes
+        if: env.IMAGE_RELEASE_ALREADY_PUBLISHED != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_REVISION: ${{ steps.source.outputs.revision }}
           IMAGE_ROOT: ${{ runner.temp }}/agent-vm-image-release
+          REMOTE_ROOT: ${{ runner.temp }}/agent-vm-image-remote
         run: |
           set -euo pipefail
-          gh release create "$IMAGE_TAG" "$IMAGE_ROOT"/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$SOURCE_REVISION" \
-            --title "Agent VM images ${SOURCE_REVISION}" \
-            --notes "Independent Agent VM guest image release for source ${SOURCE_REVISION}. Product Release does not rebuild or publish guest images." \
-            --draft
-      - name: Verify draft image release asset set
-        env:
-          GH_TOKEN: ${{ github.token }}
-          IMAGE_ROOT: ${{ runner.temp }}/agent-vm-image-release
-        run: |
-          set -euo pipefail
-          test "$(gh release view "$IMAGE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = "true"
-          test "$(gh release view "$IMAGE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets | length')" = "33"
-          expected="$(cd "$IMAGE_ROOT" && printf '%s\n' * | sort)"
-          actual="$(gh release view "$IMAGE_TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name' | sort)"
+          release_endpoint="repos/${GITHUB_REPOSITORY}/releases/tags/${IMAGE_TAG}"
+          test "$(gh api "$release_endpoint" --jq '.draft')" = "true"
+          test "$(gh api "$release_endpoint" --jq '.target_commitish')" = "$SOURCE_REVISION"
+          tag_value="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${IMAGE_TAG}" --jq '.object.sha + "\t" + .object.type')"
+          tag_sha="${tag_value%%$'\t'*}"
+          tag_type="${tag_value#*$'\t'}"
+          for _ in 1 2 3 4; do
+            [ "$tag_type" = "commit" ] && break
+            test "$tag_type" = "tag"
+            tag_value="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.object.sha + "\t" + .object.type')"
+            tag_sha="${tag_value%%$'\t'*}"
+            tag_type="${tag_value#*$'\t'}"
+          done
+          test "$tag_type" = "commit"
+          test "$tag_sha" = "$SOURCE_REVISION"
+          release_id="$(gh api "$release_endpoint" --jq '.id')"
+          expected="$(cd "$IMAGE_ROOT" && find . -maxdepth 1 -type f -printf '%f\n' | sort)"
+          actual="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases/${release_id}/assets?per_page=100" --jq '.[].name' | sort)"
+          test "$(printf '%s\n' "$actual" | sed '/^$/d' | wc -l | tr -d ' ')" = "33"
           test "$actual" = "$expected"
+          rm -rf "$REMOTE_ROOT"
+          mkdir -p "$REMOTE_ROOT"
+          gh release download "$IMAGE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$REMOTE_ROOT" --pattern '*' --clobber
+          python3 images/scripts/verify_release_assets.py \
+            --local-directory "$IMAGE_ROOT" \
+            --remote-directory "$REMOTE_ROOT" \
+            --source-revision "$SOURCE_REVISION"
+
       - name: Publish image release
+        if: env.IMAGE_RELEASE_ALREADY_PUBLISHED != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release edit "$IMAGE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false
-      - name: Verify immutable image release
+
+      - name: Verify immutable image release and final asset bytes
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+          IMAGE_ROOT: ${{ runner.temp }}/agent-vm-image-release
+          REMOTE_ROOT: ${{ runner.temp }}/agent-vm-image-remote-final
         run: |
           set -euo pipefail
-          test "$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${IMAGE_TAG}" --jq '.immutable // false')" = "true"
+          release_endpoint="repos/${GITHUB_REPOSITORY}/releases/tags/${IMAGE_TAG}"
+          release_state=""
+          for _ in $(seq 1 30); do
+            release_state="$(gh api "$release_endpoint" --jq '[.draft, (.immutable // false), .target_commitish]' 2>/dev/null | tr -d '\n' || true)"
+            if [ "$release_state" = "[false,true,\"${SOURCE_REVISION}\"]" ]; then
+              break
+            fi
+            sleep 1
+          done
+          test "$release_state" = "[false,true,\"${SOURCE_REVISION}\"]"
+          tag_value="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${IMAGE_TAG}" --jq '.object.sha + "\t" + .object.type')"
+          tag_sha="${tag_value%%$'\t'*}"
+          tag_type="${tag_value#*$'\t'}"
+          for _ in 1 2 3 4; do
+            [ "$tag_type" = "commit" ] && break
+            test "$tag_type" = "tag"
+            tag_value="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${tag_sha}" --jq '.object.sha + "\t" + .object.type')"
+            tag_sha="${tag_value%%$'\t'*}"
+            tag_type="${tag_value#*$'\t'}"
+          done
+          test "$tag_type" = "commit"
+          test "$tag_sha" = "$SOURCE_REVISION"
+          rm -rf "$REMOTE_ROOT"
+          mkdir -p "$REMOTE_ROOT"
+          gh release download "$IMAGE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$REMOTE_ROOT" --pattern '*' --clobber
+          python3 images/scripts/verify_release_assets.py \
+            --local-directory "$IMAGE_ROOT" \
+            --remote-directory "$REMOTE_ROOT" \
+            --source-revision "$SOURCE_REVISION"
