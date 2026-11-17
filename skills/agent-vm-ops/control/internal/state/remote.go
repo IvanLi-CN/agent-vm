@@ -1235,6 +1235,13 @@ func (r *remoteBackend) rebuildMirror(ctx context.Context, objects []remoteSchem
 		}
 	}
 	for _, object := range localObjects {
+		if object.Type == "view" {
+			if _, err := transaction.ExecContext(ctx, "DROP VIEW "+quoteIdentifier(object.Name)); err != nil {
+				return rollback(err)
+			}
+		}
+	}
+	for _, object := range localObjects {
 		if object.Type == "index" && !strings.HasPrefix(object.Name, "sqlite_autoindex_") {
 			if _, err := transaction.ExecContext(ctx, "DROP INDEX "+quoteIdentifier(object.Name)); err != nil {
 				return rollback(err)

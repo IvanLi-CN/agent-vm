@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"time"
 
@@ -409,5 +410,54 @@ func installProductFiles(product, destination string) error {
 			return err
 		}
 	}
+	// The client sidecar is derived metadata, not a manifest artifact. Verify it
+	// against the already-verified manifest before publishing either metadata file.
+	sidecar, err := verifiedProductSidecar(product, data)
+	if err != nil {
+		return err
+	}
+	if sidecar != nil {
+		if err := installFile(filepath.Join(destination, "client-release.json"), sidecar, 0644, ""); err != nil {
+			return err
+		}
+	}
 	return copyInstall(filepath.Join(product, "release-manifest.json"), filepath.Join(destination, "release-manifest.json"), 0644, "")
+}
+
+func verifiedProductSidecar(product string, manifestBytes []byte) ([]byte, error) {
+	var release map[string]any
+	if err := json.Unmarshal(manifestBytes, &release); err != nil {
+		return nil, err
+	}
+	artifacts, _ := release["artifacts"].([]any)
+	var client any
+	dependencies := []any{}
+	for _, item := range artifacts {
+		artifact, ok := item.(map[string]any)
+		if !ok {
+			return nil, errors.New("invalid product artifact")
+		}
+		if artifact["role"] == "client" {
+			client = item
+		}
+		if artifact["role"] == "support" {
+			dependencies = append(dependencies, item)
+		}
+	}
+	if client == nil {
+		return nil, nil
+	}
+	data, err := os.ReadFile(filepath.Join(product, "client-release.json"))
+	if err != nil {
+		return nil, err
+	}
+	var actual map[string]any
+	if err := json.Unmarshal(data, &actual); err != nil {
+		return nil, err
+	}
+	expected := map[string]any{"format": release["format"], "version": release["version"], "source_revision": release["source_revision"], "protocol": release["protocol"], "client_artifact": client, "client_dependencies": dependencies, "client_view": release["client_view"]}
+	if !reflect.DeepEqual(actual, expected) {
+		return nil, errors.New("client sidecar does not match verified product manifest")
+	}
+	return data, nil
 }

@@ -81,10 +81,9 @@ sudo systemctl is-active agent-vm-rqlite.service agent-vm-deployd.service agent-
 curl --fail http://127.0.0.1:9911/metrics
 test -x /opt/agent-vm-native/bin/agent-vm-server
 test -f /opt/agent-vm-native/release-manifest.json
-test -f /opt/agent-vm-native/client-release.json
 ```
 
-成功结果必须同时包含新鲜一致观测、`active_slot=blue`、blue 就绪且拥有 controller 与 traffic、green 不拥有角色、没有恢复中的事务，以及固定 request adapter、release manifest 和 client sidecar 均存在。再按[验收说明](acceptance.md)验证 VM 的创建、执行、续租、释放和销毁。服务进程启动不等于 VM 功能通过。
+成功结果必须同时包含新鲜一致观测、`active_slot=blue`、blue 就绪且拥有 controller 与 traffic、green 不拥有角色、没有恢复中的事务，以及固定 request adapter 与 release manifest 均存在。若安装输入为包含 Bun 客户端的 bootstrap 包，还须确认 `/opt/agent-vm-native/client-release.json` 存在。再按[验收说明](acceptance.md)验证 VM 的创建、执行、续租、释放和销毁。服务进程启动不等于 VM 功能通过。
 
 安装记录为 `/var/lib/agent-vm-native/deployment/install.json`，仅保存阶段、修订、摘要和原事务 ID。文件安装失败后可使用完全相同的输入重试；不匹配的已有文件不会被覆盖。已发送首次启动请求而结果不确定时，安装器不会重放，请先查询原事务：
 

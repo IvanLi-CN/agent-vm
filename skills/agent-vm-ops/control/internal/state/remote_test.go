@@ -2186,6 +2186,7 @@ func TestRemoteCompatibleExtensionsAcrossEpochRefresh(t *testing.T) {
 		{query: "CREATE TABLE " + parent + "(id TEXT PRIMARY KEY, computed TEXT GENERATED ALWAYS AS (upper(id)) STORED) WITHOUT ROWID"},
 		{query: "CREATE TABLE " + child + "(id INTEGER PRIMARY KEY, parent TEXT REFERENCES " + parent + "(id))"},
 		{query: "CREATE INDEX " + prefix + "_idx ON " + child + "(parent)"},
+		{query: "CREATE VIEW " + prefix + "_view AS SELECT id FROM " + parent},
 		{query: "CREATE TABLE " + events + "(message TEXT)"},
 		{query: "CREATE TABLE " + nullable + "(k TEXT PRIMARY KEY, value TEXT)"},
 		{query: "INSERT INTO " + nullable + "(rowid,k,value) VALUES(9,NULL,'a'),(22,NULL,'b')"},
@@ -2215,6 +2216,12 @@ func TestRemoteCompatibleExtensionsAcrossEpochRefresh(t *testing.T) {
 		tx.changed = true
 		return nil
 	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.remote.request(ctx, []remoteStatement{{query: "UPDATE meta SET value=? WHERE key='state_epoch'", args: []any{newEpoch()}}}, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.ClaimOperation(ctx, op+"-after-view-refresh", "acquire", nil, nil, map[string]any{"outcome": "success"}); err != nil {
 		t.Fatal(err)
 	}
 	fresh, err := Open(endpoint, false)
