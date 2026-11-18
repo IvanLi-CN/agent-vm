@@ -190,14 +190,27 @@ func (runtime *HostRuntime) prepareBootstrap(ctx context.Context, bundle string,
 	}
 	binary := filepath.Join(runtime.Config.ReleaseRoot, "slots", "blue", "bin", metadata.ServerBinary)
 	// The business service owns schema creation; Deployd never opens business state.
-	args := []string{"initialize-state"}
-	if resume {
-		args = append(args, "--resume")
-	}
-	cmd := exec.CommandContext(ctx, binary, args...)
-	cmd.Env = append(os.Environ(), "SSL_CERT_FILE=/etc/agent-vm-native/tls/rqlite/server.crt")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("initialize fresh business authority: %w", err)
+	if isDeployAccount(os.Geteuid()) {
+		if runtime.Config.ReleaseRoot != Defaults().ReleaseRoot || metadata.ServerBinary != "agent-vm-server" {
+			return errors.New("unprivileged bootstrap requires the installed blue server binary")
+		}
+		action := "initialize"
+		if resume {
+			action = "resume-initialize"
+		}
+		if err := dispatchHostAction(ctx, hostAction{Action: action, Slot: "blue"}); err != nil {
+			return fmt.Errorf("initialize fresh business authority: %w", err)
+		}
+	} else {
+		args := []string{"initialize-state"}
+		if resume {
+			args = append(args, "--resume")
+		}
+		cmd := exec.CommandContext(ctx, binary, args...)
+		cmd.Env = append(os.Environ(), "SSL_CERT_FILE=/etc/agent-vm-native/tls/rqlite/server.crt")
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("initialize fresh business authority: %w", err)
+		}
 	}
 	if err := runtime.systemctl(ctx, "start", "agent-vm-native@blue.service"); err != nil {
 		return err

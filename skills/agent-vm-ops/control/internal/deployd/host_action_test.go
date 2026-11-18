@@ -8,12 +8,14 @@ import (
 
 func TestHostActionRejectsUntrustedOperations(t *testing.T) {
 	for name, input := range map[string]string{
-		"unknown unit":       `{"action":"stop","slot":"sshd.service"}`,
-		"unknown action":     `{"action":"daemon-reload","slot":"blue"}`,
-		"arbitrary path":     `{"action":"start","slot":"blue","layout":"/bin/sh"}`,
-		"arbitrary argument": `{"action":"stop","slot":"blue","unit":"sshd.service"}`,
-		"second request":     `{"action":"stop","slot":"green"}{}`,
-		"oversized request":  `{"action":"stop","slot":"green"}` + strings.Repeat(" ", 512),
+		"unknown unit":        `{"action":"stop","slot":"sshd.service"}`,
+		"unknown action":      `{"action":"daemon-reload","slot":"blue"}`,
+		"arbitrary path":      `{"action":"start","slot":"blue","layout":"/bin/sh"}`,
+		"arbitrary argument":  `{"action":"stop","slot":"blue","unit":"sshd.service"}`,
+		"non-bootstrap slot":  `{"action":"initialize","slot":"green"}`,
+		"arbitrary init mode": `{"action":"resume-initialize","slot":"blue","layout":"control"}`,
+		"second request":      `{"action":"stop","slot":"green"}{}`,
+		"oversized request":   `{"action":"stop","slot":"green"}` + strings.Repeat(" ", 512),
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := handleHostAction(t.Context(), strings.NewReader(input), func(context.Context, hostAction) error {

@@ -42,6 +42,10 @@ func (action hostAction) validate() error {
 		if action.Layout != "" || action.Rollback {
 			return errors.New("unexpected host action properties")
 		}
+	case "initialize", "resume-initialize":
+		if action.Slot != "blue" || action.Layout != "" || action.Rollback {
+			return errors.New("initialization requires the fixed blue slot")
+		}
 	default:
 		return errors.New("invalid host action")
 	}
@@ -51,6 +55,8 @@ func (action hostAction) validate() error {
 func isDeployAccount(uid int) bool {
 	return isServiceAccount(uid, deployUser)
 }
+
+func IsServerAccount(uid int) bool { return isServiceAccount(uid, slotUser) }
 
 func isServiceAccount(uid int, name string) bool {
 	if uid == 0 {
@@ -197,6 +203,18 @@ func dispatchHostAction(ctx context.Context, action hostAction) error {
 func applyHostAction(ctx context.Context, action hostAction) error {
 	if err := action.validate(); err != nil {
 		return err
+	}
+	if action.Action == "initialize" || action.Action == "resume-initialize" {
+		args := []string{"--quiet", "--wait", "--collect", "--unit=agent-vm-native-initialize.service", "--service-type=oneshot",
+			"--uid=" + slotUser, "--gid=agent-vm-web", "--property=SupplementaryGroups=" + slotUser,
+			"--property=NoNewPrivileges=yes", "--property=ProtectSystem=strict", "--property=ProtectHome=yes", "--property=PrivateTmp=yes",
+			"--property=TimeoutStartSec=50s",
+			"--setenv=SSL_CERT_FILE=" + ServerAuthorityCA,
+			"/var/lib/agent-vm-native/slots/blue/bin/agent-vm-server", "initialize-state"}
+		if action.Action == "resume-initialize" {
+			args = append(args, "--resume")
+		}
+		return exec.CommandContext(ctx, "/usr/bin/systemd-run", args...).Run()
 	}
 	unit := "agent-vm-native@" + action.Slot + ".service"
 	run := func(args ...string) error {

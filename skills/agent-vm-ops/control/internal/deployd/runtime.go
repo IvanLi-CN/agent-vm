@@ -748,12 +748,17 @@ func (runtime *HostRuntime) ensureSlotSocketLink(root, slot string) error {
 	if err := os.Symlink(runtime.socket(slot), link); err != nil {
 		return fmt.Errorf("create %s app.sock link: %w", slot, err)
 	}
-	// MkdirTemp uses 0700 even when the daemon's group is the proxy read group.
-	// The proxy must traverse the published slot to reach this socket link.
-	if err := os.Chmod(root, 0o750); err != nil {
-		return fmt.Errorf("prepare %s proxy socket traversal: %w", slot, err)
-	}
-	return nil
+	// Extraction runs with a private umask. Once verified, the server must be
+	// able to traverse the published directories as a different account.
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || !entry.IsDir() {
+			return err
+		}
+		if err := os.Chmod(path, 0o750); err != nil {
+			return fmt.Errorf("prepare %s slot directory traversal: %w", slot, err)
+		}
+		return nil
+	})
 }
 
 func (runtime *HostRuntime) verifySlotSocketLink(root, slot string) error {

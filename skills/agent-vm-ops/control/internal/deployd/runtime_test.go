@@ -35,12 +35,19 @@ func TestSlotSocketLinkAllowsProxyTraversalAndRejectsPrivateStage(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	bin := filepath.Join(root, "bin")
+	if err := os.Mkdir(bin, 0700); err != nil {
+		t.Fatal(err)
+	}
 	runtime := &HostRuntime{Config: Defaults()}
 	if err := runtime.ensureSlotSocketLink(root, "blue"); err != nil {
 		t.Fatal(err)
 	}
 	if err := runtime.verifySlotSocketLink(root, "blue"); err != nil {
 		t.Fatalf("proxy cannot traverse published slot: %v", err)
+	}
+	if info, err := os.Stat(bin); err != nil || info.Mode().Perm() != 0750 {
+		t.Fatalf("server account cannot traverse staged bin directory: %v, %v", info, err)
 	}
 	for _, mode := range []os.FileMode{0o700, 0o770, 0o755} {
 		if err := os.Chmod(root, mode); err != nil {

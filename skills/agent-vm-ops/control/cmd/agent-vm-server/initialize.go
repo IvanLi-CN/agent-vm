@@ -41,8 +41,8 @@ func initializeState(args []string) error {
 	if err := config.ValidateInstallationAuthority(cfg.StateDB); err != nil {
 		return err
 	}
-	if os.Geteuid() != 0 {
-		return errors.New("initialize-state requires local root")
+	if os.Geteuid() != 0 && !deployd.IsServerAccount(os.Geteuid()) {
+		return errors.New("initialize-state requires the server account or local root")
 	}
 	defaults := deployd.Defaults()
 	activePath, err := deployd.EffectiveActivePath(defaults.ActivePath)
