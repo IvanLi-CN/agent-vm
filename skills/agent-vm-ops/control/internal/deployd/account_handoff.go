@@ -15,7 +15,7 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 )
 
-const accountHandoffFile = "/etc/agent-vm-native/deploy-account-handoff.json"
+const AccountHandoffFile = "/etc/agent-vm-native/deploy-account-handoff.json"
 
 type AccountHandoff struct {
 	Lease          controllerrole.Lease `json:"lease"`
@@ -27,11 +27,11 @@ func ReadAccountHandoff() (AccountHandoff, error) {
 	if !isDeployAccount(os.Geteuid()) {
 		return result, errors.New("account handoff startup requires the dedicated deployment user")
 	}
-	fd, err := syscall.Open(accountHandoffFile, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	fd, err := syscall.Open(AccountHandoffFile, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
 		return result, errors.New("cannot open account handoff evidence")
 	}
-	file := os.NewFile(uintptr(fd), accountHandoffFile)
+	file := os.NewFile(uintptr(fd), AccountHandoffFile)
 	defer file.Close()
 	info, err := file.Stat()
 	if err != nil {
