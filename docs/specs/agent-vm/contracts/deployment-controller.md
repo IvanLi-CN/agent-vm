@@ -224,6 +224,8 @@ Deployd 使用独立的本机 SQLite 数据库，路径为 `/var/lib/agent-vm-na
 
 ## 本机 API 与授权
 
+root SSH 业务请求使用独立的 `/run/agent-vm-native/control.sock`，由 `agent-vm-request.socket` 以 root、`0600` 管理。按需入口只接受 root Unix 对端和固定 `POST /internal/v1/control`，请求与响应上限均为 2 MiB。它从受保护的活跃路由选择 blue 或 green，只接受 socket 的 root 或主服务账户身份，再以该 UID 运行同一受保护二进制的转发子进程。调用方不能提供槽位、路径、URL、unit 或命令。迁移前允许转发到历史 root 槽，完成降权后业务连接使用主服务 UID；未知身份、符号链接 socket 和缺失路由均拒绝。入口不访问状态、不获取 controller role、不自动重试，完整保留后端 HTTP 状态、退出码及协议响应。部署服务本身的 API 和权限不因此增加；其账户不能通过此入口执行业务动作。见 [ADR 0055](../../../adr/0055-root-ssh-request-identity.md)。
+
 安装器使用被固定服务端证书保护的 Incus TLS 身份，核对本机信任记录仅授权目标项目，再只读验证目标项目及其实例可读、默认项目对象返回 403。实例集合可以对无权访问的项目返回过滤后的空列表，不能用集合的成功响应证明越权或拒绝；默认项目对象可读、缺失或授权探测失败时仍拒绝安装。
 
 Unix-socket API 提供只读的 `status`、`transaction` 和 `plan` 操作，以及需要授权的 `verify`、`stage`、`activate`、`rollback`、`recover` 和一次性的 `migrate` 操作。每个变更请求都要携带或创建 transaction ID、release/bundle 标识、明确的目标槽位，并在提供时携带操作原因。Socket 检查 peer credentials，服务在产生文件系统、systemd 或 slot-role effect 前完成运维授权。不存在任意 shell、path、SQL 或 Incus passthrough。`migrate` 不是通用 rqlite passthrough；它只接受固定的首次迁移流程，不能由调用方提交任意 SQL、URL、文件路径或 systemd unit。

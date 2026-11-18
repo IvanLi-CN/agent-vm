@@ -1,0 +1,15 @@
+[Unit]
+Description=Agent VM root SSH request entry
+
+[Socket]
+ListenStream=/run/agent-vm-native/control.sock
+DirectoryMode=0750
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+Accept=yes
+MaxConnections=64
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

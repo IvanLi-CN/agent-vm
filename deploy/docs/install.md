@@ -78,6 +78,8 @@ sudo /var/tmp/agent-vm-install/agent-vm-deploy install \
 
 ## 核验与重试
 
+SSH 管理连接使用固定请求适配器和 `/run/agent-vm-native/control.sock`。`agent-vm-request.socket` 由 root 持有、模式为 `0600`，按请求启动同一部署二进制中的转发入口；入口核对 root 对端，并以活跃槽 socket 的实际 UID 连接业务服务。它不执行生命周期操作、不持有部署角色、不访问数据库，也不自动重放请求。主服务与部署控制服务仍使用各自的专用账户，root 转发进程只在该请求期间存在。不要把 SSH 入口配置为槽位的 `app.sock`；Caddy 和部署控制服务继续使用各自原有入口。
+
 ```sh
 sudo /opt/agent-vm-native/bin/agent-vm-deploy status --json
 sudo systemctl is-active agent-vm-rqlite.service agent-vm-deployd.service agent-vm-native@blue.service agent-vm-caddy.service

@@ -110,6 +110,10 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 ## 普通蓝绿切换
 
+账户迁移会在准备候选槽时先启用 root 专用 SSH 请求入口 `/run/agent-vm-native/control.sock`。该入口按活跃槽的真实 UID 转发，所以迁移前的 root 槽、新账户槽和回退后的历史槽使用同一 protocol 4。固定请求适配器及历史包无需改写。若 SSH 连接资料曾显式使用 `/var/lib/agent-vm-native/active/app.sock`，须在新入口已就绪、现役槽仍在服务时将 `remote_socket` 改为 `/run/agent-vm-native/control.sock`，并用普通 `status` 请求核验；只看 `doctor` 或部署健康检查不能证明业务请求权限正确。保留原连接资料用于维护恢复，不放宽槽位对 root 或部署账户的业务授权。
+
+转发入口不更改 operation ID、generation 或请求正文；读取或传输失败时不重发。客户端继续按原 operation ID 查询不确定的变更结果。回退验证必须包含 root SSH 普通业务请求，而非仅以服务账户直接访问槽位。
+
 目标宿主须用 `agent-vm-deploy` 专用账户运行部署服务，并为两个槽位配置 `agent-vm-server` 专用账户。旧安装仍以 root 运行时，普通 `update` 会在获取产物或修改槽位前拒绝。不要用底层阶段命令绕过账户迁移，也不要在旧槽仍以 root 运行时把该槽的程序目录交给常驻账户写入。
 
 对已有安装，可使用同一正式版本的 `agent-vm-deploy install --config <输入> --bundle <产品包> --materials <资料目录> --check-account-migration` 进行只读预检。预检返回候选包摘要、现役槽位和上一版本源码修订；它要求现役槽健康且独占控制权、没有未完成部署事务、现场程序与清单一致，并且候选沿用同一 rqlite 和 Incus 环境。预检不能与 `--apply` 一起使用，通过预检也不能替代旧版在专用账户下的隔离回退验证。

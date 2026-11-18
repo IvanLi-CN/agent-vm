@@ -62,6 +62,9 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot string, input In
 			return err
 		}
 	}
+	if err := prepareRequestEntry(ctx, materials, true); err != nil {
+		return err
+	}
 	if err := prepareMigrationObserver(ctx, materials); err != nil {
 		return err
 	}
@@ -215,7 +218,7 @@ func migrationObserverUnit(service []byte) ([]byte, error) {
 
 func migrationHelperUnit(service []byte, action string) ([]byte, error) {
 	switch action {
-	case "host-observe", "host-action", "slot-relay":
+	case "host-observe", "host-action", "slot-relay", "request-relay":
 	default:
 		return nil, errors.New("invalid migration helper action")
 	}
@@ -288,7 +291,44 @@ func prepareFreshAccounts(ctx context.Context, materials string) error {
 	if err := copyInstall(filepath.Join(materials, "assets/tmpfiles.d", name), target, 0644, ""); err != nil {
 		return err
 	}
-	return command(ctx, "systemd-tmpfiles", "--create", target)
+	if err := command(ctx, "systemd-tmpfiles", "--create", target); err != nil {
+		return err
+	}
+	return prepareRequestEntry(ctx, materials, false)
+}
+
+// Publish the root-only SSH entry before starting the candidate. Historical
+// request binaries continue to work; neither their files nor their manifest
+// need to be rewritten during account migration.
+func prepareRequestEntry(ctx context.Context, materials string, migration bool) error {
+	if _, err := os.Lstat(deployd.RequestRelaySocket); err == nil {
+		if err := command(ctx, "/usr/bin/systemctl", "is-active", "--quiet", "agent-vm-request.socket"); err != nil {
+			return errors.New("SSH request socket is already occupied; retain the current service")
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	units := filepath.Join(materials, "assets/systemd")
+	service, err := os.ReadFile(filepath.Join(units, "agent-vm-request@.service"))
+	if err != nil {
+		return err
+	}
+	if migration {
+		service, err = migrationHelperUnit(service, "request-relay")
+		if err != nil {
+			return err
+		}
+	}
+	if err := installFile("/etc/systemd/system/agent-vm-request@.service", service, 0644, ""); err != nil {
+		return err
+	}
+	if err := copyInstall(filepath.Join(units, "agent-vm-request.socket"), "/etc/systemd/system/agent-vm-request.socket", 0644, ""); err != nil {
+		return err
+	}
+	if err := command(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
+		return err
+	}
+	return command(ctx, "/usr/bin/systemctl", "enable", "--now", "agent-vm-request.socket")
 }
 
 func stoppedAccountSlot(status string) bool {
