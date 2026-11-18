@@ -98,6 +98,11 @@ func TestRealSystemdRollbackCrashBudget(t *testing.T) {
 		_ = os.Remove(extra)
 		_ = exec.Command("systemctl", "daemon-reload").Run()
 	}()
+	// Earlier acceptance stages reuse this unit; its start-rate history must
+	// not reject the deliberately crashing executable before it runs.
+	if output, err := exec.Command("systemctl", "reset-failed", "agent-vm-native@blue.service").CombinedOutput(); err != nil {
+		t.Fatalf("reset test unit start-rate history: %s: %v", output, err)
+	}
 	cfg := Defaults()
 	cfg.ReleaseRoot = root
 	cfg.BlueSocket = filepath.Join(root, "missing.sock")
@@ -142,5 +147,10 @@ func TestRealSystemdRollbackCrashBudget(t *testing.T) {
 	output, err := exec.Command("systemctl", "show", "agent-vm-native@blue.service", "--property=Restart", "--property=MainPID").Output()
 	if err != nil || !strings.Contains(string(output), "Restart=no") || !strings.Contains(string(output), "MainPID=0") {
 		t.Fatalf("crashing slot not stopped: %s %v", output, err)
+	}
+	executable := filepath.Join(root, "slots", "blue", "bin", "agent-vm-server")
+	journal, err := exec.Command("journalctl", "-u", "agent-vm-native@blue.service", "--no-pager", "--output=cat", "--grep="+executable).Output()
+	if count := strings.Count(string(journal), "Failed to execute "+executable); err != nil || count != 3 {
+		t.Fatalf("observed %d real execution failures, want three: %s %v", count, journal, err)
 	}
 }
