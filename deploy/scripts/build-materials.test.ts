@@ -66,8 +66,10 @@ test('release materials project moved observability sources into the legacy pack
       ['skills/agent-vm-ops/scripts/agent_vm_state_migration.ts', 'ops migration\n'],
       ['skills/agent-vm-ops/scripts/render_observability_dashboard.ts', 'ops renderer\n'],
       ['skills/agent-vm-ops/scripts/validate_observability_dashboard.ts', 'ops validator\n'],
-      ['skills/agent-vm-ops/references/observability.md', 'ops reference\n'],
+      ['skills/agent-vm-ops/references/observability.md', 'see [config](../assets/observability/observability.config.json.example) and [rules](../assets/observability/selected-slot.test.yml)\n'],
       ['skills/agent-vm-ops/assets/observability/dashboard.json.template', 'ops dashboard\n'],
+      ['skills/agent-vm-ops/assets/observability/observability.config.json.example', '{}\n'],
+      ['skills/agent-vm-ops/assets/observability/selected-slot.test.yml', 'rule fixture\n'],
     ];
     for (const [relative, content] of files) {
       const path = join(root, relative);
@@ -90,6 +92,8 @@ test('release materials project moved observability sources into the legacy pack
       'materials-manifest.json',
       'observability/README.md',
       'observability/dashboard.json.template',
+      'observability/observability.config.json.example',
+      'observability/selected-slot.test.yml',
       'scripts/agent_vm_state_migration.ts',
       'scripts/keep.sh',
       'scripts/render_observability_dashboard.ts',
@@ -97,6 +101,14 @@ test('release materials project moved observability sources into the legacy pack
     ]);
     const projected=Bun.spawnSync(['tar','-xOf',output,'scripts/render_observability_dashboard.ts'],{stdout:'pipe',stderr:'pipe'});
     expect(new TextDecoder().decode(projected.stdout)).toBe('ops renderer\n');
+    const projectedReadme=Bun.spawnSync(['tar','-xOf',output,'observability/README.md'],{stdout:'pipe',stderr:'pipe'});
+    const readmeText=new TextDecoder().decode(projectedReadme.stdout);
+    expect(readmeText).toContain('./observability.config.json.example');
+    expect(readmeText).toContain('./selected-slot.test.yml');
+    expect(readmeText).not.toContain('../assets/observability/');
+    const extracted=join(root,'extracted');mkdirSync(extracted);
+    expect(Bun.spawnSync(['tar','-xf',output,'-C',extracted],{stdout:'pipe',stderr:'pipe'}).exitCode).toBe(0);
+    for (const link of ['observability.config.json.example','selected-slot.test.yml']) expect(existsSync(join(extracted,'observability',link))).toBe(true);
     const manifest=JSON.parse(new TextDecoder().decode(Bun.spawnSync(['tar','-xOf',output,'materials-manifest.json'],{stdout:'pipe',stderr:'pipe'}).stdout));
     expect(manifest.source_revision).toBe(revision);
     expect(manifest.files.map((file:{path:string})=>file.path).sort()).toEqual(members.filter((member)=>member!=='materials-manifest.json').sort());

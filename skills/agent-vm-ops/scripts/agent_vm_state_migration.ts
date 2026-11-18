@@ -10,8 +10,8 @@
  */
 
 import { createHash, createVerify } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { dirname, isAbsolute, resolve } from "node:path";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 const usage = `usage:
   agent_vm_state_migration.ts preflight --source <sqlite-path> --evidence <json-path> --evidence-public-key <pem-path> --output-dir <empty-dir>
@@ -127,6 +127,39 @@ function runPython(script: string, args: string[]): Record<string, unknown> {
   }
 }
 
+function reserveOutputDirectory(outputDir: string): string {
+  const reservationPath = join(outputDir, ".agent-vm-state-migration.lock");
+  if (existsSync(outputDir)) {
+    if (!statSync(outputDir).isDirectory()) fail("output-dir must be a directory");
+    if (existsSync(reservationPath)) fail("output-dir is already reserved by another migration preflight");
+    if (readdirSync(outputDir).length > 0) fail("output-dir must be empty");
+  } else {
+    mkdirSync(outputDir, { recursive: true, mode: 0o700 });
+  }
+  chmodSync(outputDir, 0o700);
+  try {
+    writeFileSync(
+      reservationPath,
+      `${JSON.stringify({ pid: process.pid, reserved_at: new Date().toISOString() })}\n`,
+      { flag: "wx", mode: 0o600 },
+    );
+  } catch (error) {
+    const code = typeof error === "object" && error !== null && "code" in error ? String((error as { code?: unknown }).code) : undefined;
+    if (code === "EEXIST") fail("output-dir is already reserved by another migration preflight");
+    fail(`cannot reserve output-dir: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return reservationPath;
+}
+
+function releaseOutputDirectory(reservationPath: string): void {
+  try {
+    unlinkSync(reservationPath);
+  } catch (error) {
+    const code = typeof error === "object" && error !== null && "code" in error ? String((error as { code?: unknown }).code) : undefined;
+    if (code !== "ENOENT") console.error(`state migration: cannot remove output reservation ${reservationPath}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 const sqliteInspection = String.raw`
 import hashlib
 import json
@@ -208,27 +241,29 @@ function preflight(args: string[]): void {
   const sourceStat = lstatSync(source, { throwIfNoEntry: false });
   if (!sourceStat) fail("source does not exist");
   if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) fail("source must be a regular SQLite file");
-  if (existsSync(outputDir)) {
-    if (!statSync(outputDir).isDirectory()) fail("output-dir must be a directory");
-    if (readdirSync(outputDir).length > 0) fail("output-dir must be empty");
-  } else {
-    mkdirSync(outputDir, { recursive: true, mode: 0o700 });
-  }
-  chmodSync(outputDir, 0o700);
-  const evidence = requireSignedEvidence(evidencePath, publicKeyPath);
-  const inspection = runPython(sqliteInspection, [source]);
-  if (inspection.integrity !== "ok") fail("SQLite integrity is not ok");
-  if (inspection.pending_operation_count !== 0) fail("management operation journal contains unresolved operations");
-  const sourceHash = createHash("sha256").update(readFileSync(source)).digest("hex");
-  if (evidence.source_sha256 !== sourceHash || evidence.source_size !== sourceStat.size) {
-    fail("fence evidence does not describe the exact SQLite source");
-  }
-  if (evidence.state_epoch !== inspection.state_epoch || evidence.state_generation !== inspection.state_generation) {
-    fail("fence evidence does not describe the observed SQLite state epoch and generation");
-  }
+  const reservationPath = reserveOutputDirectory(outputDir);
+  let released = false;
+  const release = (): void => {
+    if (released) return;
+    released = true;
+    releaseOutputDirectory(reservationPath);
+  };
+  process.once("exit", release);
+  try {
+    const evidence = requireSignedEvidence(evidencePath, publicKeyPath);
+    const inspection = runPython(sqliteInspection, [source]);
+    if (inspection.integrity !== "ok") fail("SQLite integrity is not ok");
+    if (inspection.pending_operation_count !== 0) fail("management operation journal contains unresolved operations");
+    const sourceHash = createHash("sha256").update(readFileSync(source)).digest("hex");
+    if (evidence.source_sha256 !== sourceHash || evidence.source_size !== sourceStat.size) {
+      fail("fence evidence does not describe the exact SQLite source");
+    }
+    if (evidence.state_epoch !== inspection.state_epoch || evidence.state_generation !== inspection.state_generation) {
+      fail("fence evidence does not describe the observed SQLite state epoch and generation");
+    }
 
-  const backupPath = `${outputDir}/state.sqlite3`;
-  const backupResult = Bun.spawnSync(["python3", "-c", String.raw`
+    const backupPath = `${outputDir}/state.sqlite3`;
+    const backupResult = Bun.spawnSync(["python3", "-c", String.raw`
 import sqlite3
 import sys
 source, target = sys.argv[1], sys.argv[2]
@@ -239,32 +274,36 @@ try:
 finally:
     destination.close()
     connection.close()
-`, source, backupPath], { stdout: "pipe", stderr: "pipe" });
-  if (backupResult.exitCode !== 0) fail(new TextDecoder().decode(backupResult.stderr).trim() || "SQLite backup failed");
-  chmodSync(backupPath, 0o600);
-  const manifest = {
-    schema_version: 1,
-    kind: "sqlite-state-snapshot",
-    source_path: source,
-    backup_path: backupPath,
-    evidence_id: evidence.evidence_id,
-    fence: {
-      state_write_fenced: evidence.state_write_fenced,
-      workers_quiescent: evidence.workers_quiescent,
-      sqlite_writers_closed: evidence.sqlite_writers_closed,
-      release_fence_path: evidence.release_fence_path,
-      fence_generation: evidence.fence_generation,
-    },
-    inspection,
-    backup_sha256: createHash("sha256").update(readFileSync(backupPath)).digest("hex"),
-    trusted_commit: evidence.trusted_commit,
-    state_epoch: evidence.state_epoch,
-    state_generation: evidence.state_generation,
-    evidence_payload_sha256: createHash("sha256").update(canonicalJson(evidence)).digest("hex"),
-  };
-  const manifestPath = `${outputDir}/snapshot-manifest.json`;
-  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
-  console.log(JSON.stringify({ verdict: "preflight_ready", manifest: manifestPath, backup: backupPath, evidence_id: evidence.evidence_id }));
+    `, source, backupPath], { stdout: "pipe", stderr: "pipe" });
+    if (backupResult.exitCode !== 0) fail(new TextDecoder().decode(backupResult.stderr).trim() || "SQLite backup failed");
+    chmodSync(backupPath, 0o600);
+    const manifest = {
+      schema_version: 1,
+      kind: "sqlite-state-snapshot",
+      source_path: source,
+      backup_path: backupPath,
+      evidence_id: evidence.evidence_id,
+      fence: {
+        state_write_fenced: evidence.state_write_fenced,
+        workers_quiescent: evidence.workers_quiescent,
+        sqlite_writers_closed: evidence.sqlite_writers_closed,
+        release_fence_path: evidence.release_fence_path,
+        fence_generation: evidence.fence_generation,
+      },
+      inspection,
+      backup_sha256: createHash("sha256").update(readFileSync(backupPath)).digest("hex"),
+      trusted_commit: evidence.trusted_commit,
+      state_epoch: evidence.state_epoch,
+      state_generation: evidence.state_generation,
+      evidence_payload_sha256: createHash("sha256").update(canonicalJson(evidence)).digest("hex"),
+    };
+    const manifestPath = `${outputDir}/snapshot-manifest.json`;
+    writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
+    console.log(JSON.stringify({ verdict: "preflight_ready", manifest: manifestPath, backup: backupPath, evidence_id: evidence.evidence_id }));
+  } finally {
+    release();
+    process.removeListener("exit", release);
+  }
 }
 
 function restoreCheck(args: string[]): void {

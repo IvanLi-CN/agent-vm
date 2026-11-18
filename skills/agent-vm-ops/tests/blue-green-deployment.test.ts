@@ -151,6 +151,12 @@ test("CA generation and state preflight require operator evidence", () => {
 
     const evidence = join(temporaryRoot, "evidence.json");
     signedEvidence(evidence, evidencePayload(source, "valid-0001"), signer.privateKey);
+    const reservedOutput = join(temporaryRoot, "reserved-output");
+    mkdirSync(reservedOutput);
+    writeFileSync(join(reservedOutput, ".agent-vm-state-migration.lock"), '{"pid":1}\n', { mode: 0o600 });
+    const reserved = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", evidence, "--evidence-public-key", signer.publicKey, "--output-dir", reservedOutput]);
+    expect(reserved.exitCode).not.toBe(0);
+    expect(new TextDecoder().decode(reserved.stderr)).toContain("output-dir is already reserved");
     const tamperedEvidence = join(temporaryRoot, "tampered-evidence.json");
     const tampered = JSON.parse(readFileSync(evidence, "utf8"));
     tampered.payload.trusted_commit = "forged-commit";
@@ -161,6 +167,7 @@ test("CA generation and state preflight require operator evidence", () => {
     const preflight = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", evidence, "--evidence-public-key", signer.publicKey, "--output-dir", migrationDir]);
     expect(preflight.exitCode).toBe(0);
     expect(existsSync(join(migrationDir, "state.sqlite3"))).toBe(true);
+    expect(existsSync(join(migrationDir, ".agent-vm-state-migration.lock"))).toBe(false);
     const manifest = JSON.parse(readFileSync(join(migrationDir, "snapshot-manifest.json"), "utf8"));
     expect(manifest.fence.sqlite_writers_closed).toBe(true);
     expect(manifest.state_epoch).toBe("epoch-1");

@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync, lstatSync, mkdtempSync, rmSync } from 'node:fs';
 import { join, resolve, relative, isAbsolute, dirname } from 'node:path';
 
-type MaterialEntry = { source: string; path: string };
+type MaterialEntry = { source: string; path: string; content?: Uint8Array; mode?: number };
 type MaterialFile = { path: string; sha256: string; mode: number };
 
 function collectMaterialEntries(directory: string, prefix: string, entries: MaterialEntry[]): void {
@@ -24,20 +24,23 @@ function buildMaterialsFromEntries(entries: MaterialEntry[], output: string, rev
   if (!isAbsolute(output) || existsSync(output)) throw new Error('output must be an absent absolute directory');
   const paths = new Set<string>();
   const files: MaterialFile[] = [];
-  const sources = new Map<string, string>();
+  const sources = new Map<string, { content: Uint8Array; mode: number }>();
   for (const entry of [...entries].sort((left, right) => left.path.localeCompare(right.path))) {
     if (paths.has(entry.path)) throw new Error(`deployment materials contain duplicate path: ${entry.path}`);
     paths.add(entry.path);
     const info = lstatSync(entry.source, { throwIfNoEntry: false });
     if (!info || info.isSymbolicLink() || !info.isFile()) throw new Error(`deployment materials source is not a regular file: ${entry.path}`);
-    sources.set(entry.path, entry.source);
-    files.push({ path: entry.path, sha256: createHash('sha256').update(readFileSync(entry.source)).digest('hex'), mode: info.mode & 0o777 });
+    const content = entry.content ?? readFileSync(entry.source);
+    const mode = entry.mode ?? (info.mode & 0o777);
+    sources.set(entry.path, { content, mode });
+    files.push({ path: entry.path, sha256: createHash('sha256').update(content).digest('hex'), mode });
   }
   mkdirSync(output, { mode: 0o750 });
   for (const entry of files) {
     const destination = join(output, entry.path);
     mkdirSync(resolve(destination, '..'), { recursive: true, mode: 0o750 });
-    writeFileSync(destination, readFileSync(sources.get(entry.path)!), { mode: entry.mode });
+    const source = sources.get(entry.path)!;
+    writeFileSync(destination, source.content, { mode: source.mode });
     chmodSync(destination, entry.mode);
   }
   writeFileSync(join(output, 'materials-manifest.json'), JSON.stringify({ schema_version: 1, source_revision: revision, files }, null, 2) + '\n', { mode: 0o644 });
@@ -57,6 +60,10 @@ const PROJECTED_DEPLOYMENT_SCRIPTS = new Set([
   'scripts/validate_observability_dashboard.ts',
 ]);
 
+function projectObservabilityReference(source: string): Uint8Array {
+  return Buffer.from(readFileSync(source, 'utf8').replaceAll('../assets/observability/', './'), 'utf8');
+}
+
 function deploymentMaterialEntries(repository: string): MaterialEntry[] {
   const deployRoot = join(repository, 'deploy');
   const opsRoot = join(repository, 'skills', 'agent-vm-ops');
@@ -68,13 +75,13 @@ function deploymentMaterialEntries(repository: string): MaterialEntry[] {
     entries.push(entry);
   }
 
-  const projected: Array<[string, string]> = [
+  const projected: Array<[string, string, Uint8Array?]> = [
     ['scripts/agent_vm_state_migration.ts', join(opsRoot, 'scripts', 'agent_vm_state_migration.ts')],
     ['scripts/render_observability_dashboard.ts', join(opsRoot, 'scripts', 'render_observability_dashboard.ts')],
     ['scripts/validate_observability_dashboard.ts', join(opsRoot, 'scripts', 'validate_observability_dashboard.ts')],
-    ['observability/README.md', join(opsRoot, 'references', 'observability.md')],
+    ['observability/README.md', join(opsRoot, 'references', 'observability.md'), projectObservabilityReference(join(opsRoot, 'references', 'observability.md'))],
   ];
-  entries.push(...projected.map(([path, source]) => ({ path, source })));
+  entries.push(...projected.map(([path, source, content]) => ({ path, source, content })));
 
   const assetsRoot = join(opsRoot, 'assets', 'observability');
   const assetEntries: MaterialEntry[] = [];

@@ -236,7 +236,7 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function acquireOutputLock(directory: string): OutputLock {
+function acquireOutputLock(directory: string, renameDirectory: RenameFile = renameSync): OutputLock {
   const lockPath = join(directory, ".agent-vm-observability.lock");
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const token = randomUUID();
@@ -264,8 +264,16 @@ function acquireOutputLock(directory: string): OutputLock {
     const owner = readLockOwner(lockPath);
     if (!owner) throw new Error(`output directory is locked: ${directory}; owner metadata is unavailable`);
     if (isProcessAlive(owner.pid)) throw new Error(`output directory is locked: ${directory}; owner pid ${owner.pid} is alive`);
+    const stalePath = join(directory, `.agent-vm-observability.lock.stale-${randomUUID()}`);
     try {
-      rmSync(lockPath, { recursive: true, force: false });
+      renameDirectory(lockPath, stalePath);
+    } catch (error) {
+      const code = isRecord(error) && typeof error.code === "string" ? error.code : undefined;
+      if (code === "ENOENT") continue;
+      throw new Error(`output directory is locked: ${directory}; stale lock cannot be reclaimed: ${String(error)}`);
+    }
+    try {
+      rmSync(stalePath, { recursive: true, force: false });
     } catch (error) {
       throw new Error(`output directory is locked: ${directory}; stale lock cannot be reclaimed: ${String(error)}`);
     }
@@ -306,7 +314,7 @@ export function writeBundle(
   let previousCurrentTarget: string | undefined;
   let preserveActiveRelease = false;
   try {
-    outputLock = acquireOutputLock(directory);
+    outputLock = acquireOutputLock(directory, renameFile);
     const activeStat = existsSync(activeDirectory) ? lstatSync(activeDirectory) : undefined;
     if (activeStat && !activeStat.isSymbolicLink()) {
       throw new Error(`active bundle path must be a symlink: ${activeDirectory}; migrate the existing dashboard directory before rendering`);
