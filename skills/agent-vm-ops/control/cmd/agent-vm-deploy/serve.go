@@ -54,6 +54,9 @@ func runServe(args []string) error {
 	if err := manager.MaintainController(ctx); err != nil {
 		slog.Warn("initial controller lease was not granted", "error", err)
 	}
+	if err := runtime.ReconcileRecoveryPoints(); err != nil {
+		slog.Warn("recovery point reconciliation failed", "error", err)
+	}
 	metrics := deployd.NewMetrics(manager)
 	server := deployd.NewServer(manager, metrics)
 	if err := server.RestoreLatest(ctx); err != nil {

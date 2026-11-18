@@ -251,6 +251,17 @@ real_bundle=/var/lib/agent-vm-native/deployment/acceptance.tar
 cp -- "$bundle_root/bin/agent-vm-deploy" /opt/agent-vm-native/bin/agent-vm-deploy
 chmod 0755 /opt/agent-vm-native/bin/agent-vm-deploy
 
+recovery_fixture="${AGENT_VM_TEST_RECOVERY_RQLITE_URL:-}"
+state_authority="authority-1"
+migration_config=""
+if [[ -n "$recovery_fixture" ]]; then
+  [[ "$recovery_fixture" =~ ^https://127\.0\.0\.1:[0-9]+$ ]] || fail "rqlite fixture must be on a dedicated loopback port"
+  install -m 0644 "$AGENT_VM_TEST_RECOVERY_RQLITE_CA" /etc/agent-vm-native/recovery-ca.crt
+  install -m 0640 "$AGENT_VM_TEST_RECOVERY_RQLITE_AUTH" /etc/agent-vm-native/recovery-auth.json
+  state_authority="$(printf 'rqlite:%s/' "$recovery_fixture" | sha256sum | cut -d ' ' -f 1)"
+  migration_config=", \"migration\": {\"rqlite_url\": \"$recovery_fixture\", \"rqlite_ca_file\": \"/etc/agent-vm-native/recovery-ca.crt\", \"rqlite_auth_file\": \"/etc/agent-vm-native/recovery-auth.json\"}"
+fi
+
 for slot in blue green; do
   slot_root="/var/lib/agent-vm-native/slots/$slot"
   mkdir -p -- "$slot_root" "/etc/agent-vm-native/slots/$slot"
@@ -258,7 +269,7 @@ for slot in blue green; do
   chmod 0750 "$slot_root"
   ln -s "/run/agent-vm-native/$slot/app.sock" "$slot_root/app.sock"
   cat >"/etc/agent-vm-native/slots/$slot/config.json" <<EOF
-{"slot":"$slot","socket":"/run/agent-vm-native/$slot/app.sock"}
+{"slot":"$slot","socket":"/run/agent-vm-native/$slot/app.sock","authority":"$state_authority"}
 EOF
 done
 ln -s /var/lib/agent-vm-native/slots/blue /var/lib/agent-vm-native/active
@@ -275,7 +286,7 @@ cat > /etc/agent-vm-native/deployd.json <<EOF
   "green_socket": "/run/agent-vm-native/green/app.sock",
   "lease_seconds": 15,
   "retention_days": 30,
-  "observe_seconds": 1
+  "observe_seconds": 1$migration_config
 }
 EOF
 
@@ -436,6 +447,31 @@ grep -Fq 'agent_vm_deployd_observation_up{source="systemd"} 1' <<<"$metrics" || 
 grep -Fq 'agent_vm_deployd_slot_selected{slot="green"} 1' <<<"$metrics" || fail "green selected metric was not exported"
 grep -Fq 'agent_vm_deployd_slot_controller_owned{slot="green"} 1' <<<"$metrics" || fail "green controller metric was not exported"
 
+if [[ -n "$recovery_fixture" ]]; then
+  recovery_root=/var/lib/agent-vm-native/migration
+  points="$(find "$recovery_root/rqlite-recovery" -mindepth 1 -maxdepth 1 -type d -name 'point-*' | wc -l)"
+  [[ "$points" == 1 ]] || fail "first switch did not register one verified rqlite recovery point"
+  budget_fixture="$recovery_root/migration-test-capacity.sqlite3"
+  truncate -s 1073741824 "$budget_fixture"
+  for command in stage rollback; do
+    if [[ "$command" == stage ]]; then
+      args=(--slot blue --bundle "$real_bundle")
+    else
+      args=(--transaction "$transaction_id")
+    fi
+    if rejected="$(/opt/agent-vm-native/bin/agent-vm-deploy "$command" "${args[@]}" --json 2>&1)"; then
+      fail "$command bypassed the rqlite recovery capacity gate"
+    fi
+    grep -Fq '"code":"backup_storage_exhausted"' <<<"$rejected" || fail "$command did not report exhausted recovery storage"
+    status_json="$(/opt/agent-vm-native/bin/agent-vm-deploy status --json)"
+    assert_status "$status_json" green blue
+    curl --fail --silent --show-error --cacert "$AGENT_VM_TEST_RECOVERY_RQLITE_CA" \
+      --user "agent-vm-control:$AGENT_VM_TEST_RECOVERY_RQLITE_CONTROL" -H 'Content-Type: application/json' \
+      --data '["INSERT INTO recovery_acceptance(value) VALUES(123)"]' "$recovery_fixture/db/execute" | grep -Fq '"rows_affected":1'
+  done
+  rm -- "$budget_fixture"
+fi
+
 stage_json="$(/opt/agent-vm-native/bin/agent-vm-deploy stage --slot blue --bundle "$real_bundle" --json)"
 recovery_transaction="$(python3 - "$stage_json" <<'PY'
 import json
@@ -461,6 +497,12 @@ grep -Fq 'agent_vm_deployd_recovery_required 1' <<<"$recovery_metrics" || fail "
 /opt/agent-vm-native/bin/agent-vm-deploy recover --transaction "$recovery_transaction" --action rollback --json >/dev/null
 status_json="$(/opt/agent-vm-native/bin/agent-vm-deploy status --json)"
 assert_status "$status_json" green blue
+
+if [[ -n "$recovery_fixture" ]]; then
+  points="$(find /var/lib/agent-vm-native/migration/rqlite-recovery -mindepth 1 -maxdepth 1 -type d -name 'point-*' | wc -l)"
+  [[ "$points" == 2 ]] || fail "recovery did not reuse the original rqlite recovery point"
+  printf '%s\n' 'systemd rqlite recovery gate kept the active slot serving and reused the interrupted transaction point'
+fi
 
 # Run the crash budget against real systemd after the normal switch/recovery proof.
 systemctl stop agent-vm-deployd.service agent-vm-native@blue.service agent-vm-native@green.service

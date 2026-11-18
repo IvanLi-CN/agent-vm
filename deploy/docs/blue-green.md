@@ -105,12 +105,14 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 ## 普通蓝绿切换
 
-普通切换只处理 release、槽位角色、流量、`active` 链接和 native quiescence。候选 release 的 `deployment_contract` major 在 stage 前由 Deployd 对 manifest 预检；缺失字段按 legacy v1 兼容，v1 新字段只能增量扩展，major 不兼容时不创建事务、不启动候选。候选角色、旧槽位 quiescence 和最终全局一致性分别验证，controller lease 从 handoff 持续到 finalize。线上 Agent 通过 SSH 在目标服务器上调用 `agent-vm-deploy update`；该命令在服务器本地按 `GOOS/GOARCH` 获取并验证正式 release，再编排下面的 deployd 事务。Agent 工作站不下载或上传产品 bundle：
+候选包的 `deployment_contract` major 在 stage 前由部署控制服务预检；缺失字段按 legacy v1 兼容，major 不兼容时不创建事务、不启动候选。日常更新通过 SSH 在控制宿主调用 `agent-vm-deploy update`，默认在控制宿主下载并核对当前架构的正式发布包：
 
 ```sh
 ssh <configured-control-alias> agent-vm-deploy update \
   --version <semver> --source-revision <40-char-source-sha>
 ```
+
+需要指定文件时，在控制宿主的受保护目录放置正式完整包，并给同一命令添加 `--bundle /protected/path/release.tar`。若同时使用 `--server-file /protected/path/agent-vm-server`，该文件须与包内产物字节一致。两种输入都核对正式发布摘要、版本、源码和架构。使用[发布合同](../../docs/specs/agent-vm/contracts/release.md)中的恢复点门禁；收到 `backup_storage_exhausted` 时现役槽继续服务，不绕过门禁切换或回退。
 
 恢复或诊断时仍可直接查询原事务并执行受限阶段命令：
 

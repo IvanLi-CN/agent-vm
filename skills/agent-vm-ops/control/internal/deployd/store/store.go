@@ -347,6 +347,17 @@ func (s *Store) ListActive(ctx context.Context) ([]Transaction, error) {
 	return result, rows.Err()
 }
 
+func (s *Store) LatestRollbackTarget(ctx context.Context) (string, error) {
+	var id string
+	err := s.db.QueryRowContext(ctx, `SELECT transaction_id FROM deployment_transactions
+		WHERE state = 'finalized' AND target_slot IN ('blue','green')
+		ORDER BY generation DESC LIMIT 1`).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
+}
+
 func (s *Store) LatestFinalizedMigration(ctx context.Context) (*Transaction, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT transaction_id,target_slot,previous_slot,bundle,phase,state,generation,rollback_used,recovery_required,migration_retry_count,migration_retry_state,error_code,error_message,created_at,updated_at
 		FROM deployment_transactions
@@ -690,7 +701,9 @@ func (s *Store) Cleanup(ctx context.Context, now time.Time) (int64, error) {
 	cutoff := now.Add(-s.retention)
 	returnValue := int64(0)
 	err := s.write(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, `DELETE FROM deployment_transactions WHERE state IN ('finalized','rolled_back','failed') AND recovery_required = 0 AND updated_at < ? AND NOT (target_slot = 'state' AND bundle = 'sqlite-to-rqlite')`, formatTime(cutoff))
+		result, err := tx.ExecContext(ctx, `DELETE FROM deployment_transactions WHERE state IN ('finalized','rolled_back','failed') AND recovery_required = 0 AND updated_at < ? AND NOT (target_slot = 'state' AND bundle = 'sqlite-to-rqlite')
+			AND transaction_id NOT IN (SELECT transaction_id FROM deployment_transactions
+			  WHERE state = 'finalized' AND target_slot IN ('blue','green') ORDER BY generation DESC LIMIT 1)`, formatTime(cutoff))
 		if err != nil {
 			return err
 		}

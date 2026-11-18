@@ -15,9 +15,11 @@ import (
 	"sort"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/manifest"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/native"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
 const recordPath = "/var/lib/agent-vm-native/deployment/install.json"
@@ -84,20 +86,21 @@ func command(ctx context.Context, name string, args ...string) error {
 	}
 	return nil
 }
-func waitDaemon(ctx context.Context, client deployd.Client) error {
-	timer := time.NewTimer(30 * time.Second)
-	defer timer.Stop()
+func waitDaemon(ctx context.Context, client deployd.Client, timeout time.Duration) error {
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if _, _, err := client.Call(ctx, "GET", "/v1/status", nil); err == nil {
+		if _, _, err := client.Call(readyCtx, "GET", "/v1/status", nil); err == nil {
 			return nil
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-			return errors.New("Deployd readiness timed out")
+		case <-readyCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("Deployd readiness timed out: %w", readyCtx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -287,8 +290,25 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		return report, err
 	}
 	client := deployd.Client{Socket: "/run/agent-vm-native/deployd.sock", Timeout: 30 * time.Minute}
-	if err := waitDaemon(ctx, client); err != nil {
+	if err := waitDaemon(ctx, client, 30*time.Second); err != nil {
 		return report, err
+	}
+	// A running rqlite unit can still be electing a leader. Keep the install
+	// journal at services until a read succeeds, so a timeout is safe to retry.
+	blue, err := config.Load(targets["blue_config"].path)
+	if err != nil {
+		return report, errors.New("installed blue slot configuration is unavailable")
+	}
+	readyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	err = state.WaitForRQLiteReady(readyCtx, blue.StateDB, targets["rqlite_certificate"].path)
+	readyErr := readyCtx.Err()
+	cancel()
+	if err != nil {
+		report.Next = "check agent-vm-rqlite.service and rerun install --apply with the same inputs"
+		if readyErr != nil {
+			return report, fmt.Errorf("rqlite was not ready before fresh bootstrap: %w", readyErr)
+		}
+		return report, errors.New("rqlite readiness probe configuration failed before fresh bootstrap")
 	}
 	r.Phase = "bootstrap_requested"
 	if err := saveRecord(r); err != nil {

@@ -39,7 +39,7 @@ Drain 拒绝新的 lease 和 restart admission，允许在线 retrieval/release�
 遵循[部署参考](references/deployment.md)和[发布合同](../../docs/specs/agent-vm/contracts/release.md)中的 release manifest、兼容性、staging、drain、原子 activation、rollback 和权限规则；兼容 action 可以跨 release revision 继续使用并返回结构化 warning，不兼容 action 必须在产生 native effect 前失败。
 自动更新默认保持关闭。
 
-`agent-vm` skill 中的 `upload`、`download`、`export` 和源码同步只服务于 guest/source 工作流；不得把这些通用传输能力用于发布或部署。正常线上更新使用 `ssh <configured-control-alias> agent-vm-deploy update --version <semver> --source-revision <sha>`，低层 `stage`、`verify`、`activate` 和 `recover` 仅用于事务诊断和受限恢复。
+`agent-vm` skill 的 guest/source 传输不负责控制宿主部署。日常更新在控制宿主执行 `agent-vm-deploy update --version <semver> --source-revision <sha>`。维护者明确选择指定文件部署时，按[蓝绿手册](../../deploy/docs/blue-green.md)将正式完整包放到控制宿主的受保护目录并传 `--bundle`；`--server-file` 只能随完整包使用，并须与包内 `agent-vm-server` 字节一致。遇到 `backup_storage_exhausted` 停止本次操作；现役槽继续服务。低层 `stage`、`verify`、`activate` 和 `recover` 仅用于诊断和受限恢复。
 
 Client/control 使用 protocol 4，并增加显式的 live memory-only adjustment；不兼容的旧 peer 必须在产生 effect 前失败。
 升级前保留 database、generation 和 journal。

@@ -145,12 +145,17 @@ func runUpdate(args []string) error {
 	flags := flag.NewFlagSet("update", flag.ContinueOnError)
 	version := flags.String("version", "", "published release SemVer without v")
 	source := flags.String("source-revision", "", "expected 40-character source revision")
+	localBundle := flags.String("bundle", "", "protected local copy of the published bundle")
+	serverFile := flags.String("server-file", "", "protected local file identical to the published server")
 	socket := flags.String("socket", "/run/agent-vm-native/deployd.sock", "deployd Unix socket")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 || *version == "" || *source == "" {
 		return errors.New("update requires --version and --source-revision")
+	}
+	if *serverFile != "" && *localBundle == "" {
+		return errors.New("--server-file requires --bundle")
 	}
 	baseContext, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
@@ -177,7 +182,7 @@ func runUpdate(args []string) error {
 			_ = os.RemoveAll(directory)
 		}
 	}()
-	bundle, err := releasefetch.Fetch(ctx, *version, *source, directory)
+	bundle, err := releasefetch.Prepare(ctx, *version, *source, directory, *localBundle, *serverFile)
 	if err != nil {
 		return err
 	}
