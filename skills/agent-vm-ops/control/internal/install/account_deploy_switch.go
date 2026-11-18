@@ -37,11 +37,17 @@ func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, 
 	if err := prepareHandoffSockets(ctx, materials); err != nil {
 		return err
 	}
+	if err := finalizeSlotAccounts(ctx, input, handoff.Lease.Slot); err != nil {
+		return err
+	}
 	steady, adopt := deploymentAccountDropIns(account)
 	const directory = "/etc/systemd/system/" + deploymentUnit + ".d"
 	active := filepath.Join(directory, "20-service-account.conf")
 	temporary := filepath.Join(directory, "21-account-handoff.conf")
 	if err := switchDeploymentAccount(ctx, handoff, func(ctx context.Context) error {
+		if err := transferDeploymentPaths(ctx, materials, handoff.Lease.Slot); err != nil {
+			return err
+		}
 		// Publish the startup-only instruction first. Neither file takes
 		// effect until the following daemon-reload.
 		if err := installFile(temporary, adopt, 0644, ""); err != nil {
@@ -64,6 +70,23 @@ func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, 
 		return fmt.Errorf("controller adopted; systemd configuration reload failed: %w", err)
 	}
 	return nil
+}
+
+func transferDeploymentPaths(ctx context.Context, materials, active string) error {
+	if err := deployd.VerifyUnprivilegedSlots(ctx); err != nil {
+		return err
+	}
+	cfg := deployd.Defaults()
+	slots := filepath.Join(cfg.ReleaseRoot, "slots")
+	route, err := deployd.EffectiveActivePath(cfg.ActivePath)
+	if err != nil || validateAccountMigrationRoute(route, filepath.Join(slots, active)) != nil {
+		return errors.New("active route changed before transferring deployment paths")
+	}
+	if err := adoptActiveRoute(cfg.ActivePath, deployd.ManagedRoute, slots); err != nil {
+		return err
+	}
+	return command(ctx, "/usr/bin/systemd-tmpfiles", "--create", "--prefix="+slots,
+		filepath.Join(materials, "assets/tmpfiles.d/agent-vm-fresh-accounts.conf"))
 }
 
 func prepareHandoffAccount(ctx context.Context, input Inputs) error {
@@ -99,7 +122,10 @@ func removeAccountHandoffDropIn(path string, expected []byte) error {
 		return err
 	}
 	info, err := os.Lstat(path)
-	if err != nil || !rootProtected(info, 0) || !info.Mode().IsRegular() || info.Mode().Perm() != 0644 {
+	if err != nil {
+		return err
+	}
+	if !rootProtected(info, 0) || !info.Mode().IsRegular() || info.Mode().Perm() != 0644 {
 		return errors.New("startup-only unit configuration is not a protected root-owned file")
 	}
 	actual, err := os.ReadFile(path)

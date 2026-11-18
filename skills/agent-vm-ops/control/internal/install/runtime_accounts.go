@@ -53,19 +53,73 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot string, input In
 		return err
 	}
 	dir := filepath.Join("/etc/systemd/system", unit+".d")
-	account, err := os.ReadFile(filepath.Join(materials, "assets/systemd", "fresh-slot-account.conf"))
+	_, dropIn, err := slotAccountDropIns(materials)
 	if err != nil {
 		return err
 	}
-	access, err := os.ReadFile(filepath.Join(materials, "assets/systemd", "legacy-slot-access.conf"))
-	if err != nil {
-		return err
-	}
-	dropIn := append(append(account, '\n'), access...)
 	if err := installFile(filepath.Join(dir, "19-account-migration.conf"), dropIn, 0644, ""); err != nil {
 		return err
 	}
 	return command(ctx, "/usr/bin/systemctl", "daemon-reload")
+}
+
+func slotAccountDropIns(materials string) (account, migration []byte, err error) {
+	account, err = os.ReadFile(filepath.Join(materials, "assets/systemd", "fresh-slot-account.conf"))
+	if err != nil {
+		return nil, nil, err
+	}
+	access, err := os.ReadFile(filepath.Join(materials, "assets/systemd", "legacy-slot-access.conf"))
+	if err != nil {
+		return nil, nil, err
+	}
+	return account, append(append(bytes.Clone(account), '\n'), access...), nil
+}
+
+// finalizeSlotAccounts is called after successful activation, while the old
+// coordinator still owns the live lease and deployment updates are excluded.
+func finalizeSlotAccounts(ctx context.Context, input Inputs, active string) error {
+	var rollback string
+	switch active {
+	case "blue":
+		rollback = "green"
+	case "green":
+		rollback = "blue"
+	default:
+		return errors.New("slot account finalization requires a verified active slot")
+	}
+	cfg := deployd.Defaults()
+	route, err := deployd.EffectiveActivePath(cfg.ActivePath)
+	if err != nil || validateAccountMigrationRoute(route, filepath.Join(cfg.ReleaseRoot, "slots", active)) != nil {
+		return errors.New("active route changed before account finalization")
+	}
+	stopped, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", "agent-vm-native@"+rollback+".service", "--property=ActiveState", "--property=MainPID").Output()
+	if err != nil || !stoppedAccountSlot(string(stopped)) {
+		return errors.New("old slot must be stopped before applying its account configuration")
+	}
+	if err := prepareCandidateAccess(ctx, rollback, input); err != nil {
+		return err
+	}
+	if err := PrepareLegacySlotAccess(rollback); err != nil {
+		return err
+	}
+	account, migration, err := slotAccountDropIns(input.Materials)
+	if err != nil {
+		return err
+	}
+	for _, slot := range []string{rollback, active} {
+		dir := filepath.Join("/etc/systemd/system", "agent-vm-native@"+slot+".service.d")
+		if err := installFile(filepath.Join(dir, "20-service-account.conf"), account, 0644, ""); err != nil {
+			return err
+		}
+	}
+	dir := filepath.Join("/etc/systemd/system", "agent-vm-native@"+active+".service.d")
+	if err := removeAccountHandoffDropIn(filepath.Join(dir, "19-account-migration.conf"), migration); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	if err := command(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
+		return err
+	}
+	return deployd.VerifyUnprivilegedSlots(ctx)
 }
 
 func prepareMigrationObserver(ctx context.Context, materials string) error {

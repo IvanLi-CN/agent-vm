@@ -93,6 +93,12 @@ func verifyUnprivilegedSlots(ctx context.Context) error {
 	return nil
 }
 
+// VerifyUnprivilegedSlots guards host account migration before it transfers
+// ownership of the directories from which systemd launches the slot binaries.
+func VerifyUnprivilegedSlots(ctx context.Context) error {
+	return verifyUnprivilegedSlots(ctx)
+}
+
 func unprivilegedSlotPID(output string) (int, error) {
 	values := make(map[string]string, 2)
 	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
