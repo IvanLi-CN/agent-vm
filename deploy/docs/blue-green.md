@@ -127,11 +127,13 @@ agent-vm-deploy install --config <输入> --bundle <正式产品包> \
 
 命令先核对正式发布和验收记录，再使用现有蓝绿事务准备并激活候选槽。命令返回事务 ID 后如果报错，先用 `agent-vm-deploy transaction --transaction <ID>` 检查原事务和当前槽位，避免重新发起切换。只有部署控制服务已用专用账户接管并确认新槽持有原状态权威，命令才报告迁移完成。
 
-候选包的 `deployment_contract` major 在 stage 前由部署控制服务预检；缺失字段按 legacy v1 兼容，major 不兼容时不创建事务、不启动候选。日常更新通过 SSH 在控制宿主调用 `agent-vm-deploy update`，默认在控制宿主下载并核对当前架构的正式发布包：
+候选包的 `deployment_contract` major 在 stage 前由部署控制服务预检；缺失字段按 legacy v1 兼容，major 不兼容时不创建事务、不启动候选。普通更新和后续事务操作都使用部署控制服务对应的 CLI：全新安装使用 `/opt/agent-vm-native/bin/agent-vm-deploy`；完成旧安装账户迁移后使用 `/opt/agent-vm-native/maintenance/agent-vm-deploy`。以下命令在控制宿主执行，先按安装方式设置 `deploy_cli`。默认由控制宿主下载并核对当前架构的正式发布包：
 
 ```sh
-ssh <configured-control-alias> agent-vm-deploy update \
-  --version <semver> --source-revision <40-char-source-sha>
+deploy_cli=/opt/agent-vm-native/bin/agent-vm-deploy
+# 完成旧安装账户迁移后，改用：
+# deploy_cli=/opt/agent-vm-native/maintenance/agent-vm-deploy
+sudo "$deploy_cli" update --version '<semver>' --source-revision '<40-char-source-sha>'
 ```
 
 需要指定文件时，在控制宿主的受保护目录放置正式完整包，并给同一命令添加 `--bundle /protected/path/release.tar`。若同时使用 `--server-file /protected/path/agent-vm-server`，该文件须与包内产物字节一致。两种输入都核对正式发布摘要、版本、源码和架构。使用[发布合同](../../docs/specs/agent-vm/contracts/release.md)中的恢复点门禁；收到 `backup_storage_exhausted` 时现役槽继续服务，不绕过门禁切换或回退。
@@ -139,10 +141,10 @@ ssh <configured-control-alias> agent-vm-deploy update \
 恢复或诊断时仍可直接查询原事务并执行受限阶段命令：
 
 ```sh
-sudo /opt/agent-vm-native/bin/agent-vm-deploy stage --slot green --bundle '<已验证的发布包>'
-sudo /opt/agent-vm-native/bin/agent-vm-deploy verify --transaction '<transaction-id>'
-sudo /opt/agent-vm-native/bin/agent-vm-deploy activate --transaction '<transaction-id>'
-sudo /opt/agent-vm-native/bin/agent-vm-deploy transaction --transaction '<transaction-id>' --json
+sudo "$deploy_cli" stage --slot green --bundle '<已验证的发布包>'
+sudo "$deploy_cli" verify --transaction '<transaction-id>'
+sudo "$deploy_cli" activate --transaction '<transaction-id>'
+sudo "$deploy_cli" transaction --transaction '<transaction-id>' --json
 ```
 
 Deployd 启动候选槽位，验证 manifest、socket、就绪状态、状态能力和阶段证据绑定的 `state_authority`；然后授予候选 controller lease，确认 readiness 后启用 traffic role，原子替换 `active`，让旧槽位进入 retiring 并排空。Deployd 必须重新观测旧槽位已停止、目标槽位仍持有唯一 controller lease 且继续接收流量，才能进入 finalize。
@@ -154,9 +156,9 @@ Deployd 启动候选槽位，验证 manifest、socket、就绪状态、状态能
 查询原事务，确认存在已验证的上一槽位且尚未消耗回滚额度后，可以显式执行一次有界回滚；回滚只切换发布和角色，不回退业务数据库：
 
 ```sh
-sudo /opt/agent-vm-native/bin/agent-vm-deploy transaction --transaction '<原事务ID>' --json
-sudo /opt/agent-vm-native/bin/agent-vm-deploy rollback --transaction '<原事务ID>'
-sudo /opt/agent-vm-native/bin/agent-vm-deploy status --json
+sudo "$deploy_cli" transaction --transaction '<原事务ID>' --json
+sudo "$deploy_cli" rollback --transaction '<原事务ID>'
+sudo "$deploy_cli" status --json
 ```
 
 回滚先在后台启动上一版本，现役槽继续接流。上一版本能接手后，部署控制服务交接唯一控制权和流量，再排空并停止原现役进程。上一版本首启加两次重试均失败，且现役槽仍经确认持有唯一控制权并正常接流时，本次回滚以 `rollback_previous_unavailable` 结束，现役槽继续服务。启动次数写入原部署事务；部署控制服务重启不会清零，也不会尝试更早的版本。
@@ -164,8 +166,8 @@ sudo /opt/agent-vm-native/bin/agent-vm-deploy status --json
 事务进入 `needs_recovery` 时，普通 `activate` 或 `rollback` 不代替恢复动作。保留原 ID，选择回到已验证上一槽位的恢复：
 
 ```sh
-sudo /opt/agent-vm-native/bin/agent-vm-deploy recover --transaction '<原事务ID>' --action rollback
-sudo /opt/agent-vm-native/bin/agent-vm-deploy transaction --transaction '<原事务ID>' --json
+sudo "$deploy_cli" recover --transaction '<原事务ID>' --action rollback
+sudo "$deploy_cli" transaction --transaction '<原事务ID>' --json
 ```
 
 只有 active 已切到原候选且候选产物、状态权威、进程与旧槽静止证据均可重新验证时，才可选择 `recover --transaction '<原事务ID>' --action finalize` 完成原切换。active 尚不存在的首次初始化使用[首次安装恢复](install.md)中的 `resume-bootstrap`，不能互换。证据不足时保持 fencing，不得手工改写业务状态或部署事务。
