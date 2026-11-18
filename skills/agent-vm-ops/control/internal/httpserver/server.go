@@ -31,7 +31,9 @@ const (
 
 type peerConn struct {
 	net.Conn
-	uid int
+	uid        int
+	pid        int
+	startToken string
 }
 
 type peerListener struct{ net.Listener }
@@ -41,12 +43,16 @@ func (listener *peerListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	uid, uidErr := peerUID(conn)
+	uid, pid, uidErr := peerIdentity(conn)
 	if uidErr != nil {
 		_ = conn.Close()
 		return nil, uidErr
 	}
-	return &peerConn{Conn: conn, uid: uid}, nil
+	peer := &peerConn{Conn: conn, uid: uid, pid: pid}
+	if uid == 0 && pid > 0 {
+		peer.startToken = controllerrole.ProcessStartToken(pid)
+	}
+	return peer, nil
 }
 
 type peerContextKey struct{}
@@ -255,6 +261,13 @@ func (s *Server) controllerRole(c *gin.Context) {
 	}
 	var err error
 	switch command.Action {
+	case "witness-handoff":
+		peer, ok := c.Request.Context().Value(peerContextKey{}).(*peerConn)
+		if !ok || peer.uid != 0 || peer.pid <= 0 {
+			writeJSON(c, http.StatusForbidden, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("peer_unauthorized", "handoff requires a local root maintenance process", nil)}, 2)
+			return
+		}
+		err = s.RoleGate.WitnessHandoff(command.Lease, peer.pid, peer.startToken)
 	case "grant":
 		err = s.RoleGate.Grant(command.Lease)
 	case "revoke":
@@ -266,7 +279,7 @@ func (s *Server) controllerRole(c *gin.Context) {
 		s.RoleGate.Fence()
 		s.Service.SetTrafficAccepting(false)
 	default:
-		err = protocol.NewError("invalid_request", "controller role action must be grant, revoke or fence", nil)
+		err = protocol.NewError("invalid_request", "unrecognized controller role action", nil)
 	}
 	if err != nil {
 		code := "controller_role_rejected"

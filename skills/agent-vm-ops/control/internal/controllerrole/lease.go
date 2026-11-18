@@ -53,6 +53,13 @@ type Gate struct {
 	term     uint64
 
 	changed chan struct{}
+	witness ownerWitness
+}
+
+type ownerWitness struct {
+	pid      int
+	start    string
+	deadline time.Time
 }
 
 func New(slot string, clock func() time.Time) *Gate {
@@ -88,9 +95,41 @@ func (gate *Gate) Grant(lease Lease) error {
 		return fmt.Errorf("%w: term is not newer", ErrLeaseMismatch)
 	}
 	gate.lease = lease
+	gate.witness = ownerWitness{}
 	gate.valid = true
 	gate.term = lease.Term
 	gate.signalLocked()
+	return nil
+}
+
+// WitnessHandoff pins a maintenance process to the exact live lease without
+// extending its original deadline.
+func (gate *Gate) WitnessHandoff(expected Lease, pid int, start string) error {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if pid <= 0 || pid == expected.OwnerPID || start == "" || expected.OwnerPID <= 0 || expected.OwnerStartTime == "" ||
+		!ownerAlive(pid, start) || !ownerAlive(expected.OwnerPID, expected.OwnerStartTime) {
+		return ErrInvalidLease
+	}
+	if err := gate.validLocked(); err != nil {
+		return err
+	}
+	// Created times can cross JSON with a different time.Location.
+	current := gate.lease
+	if !current.Expiry.Equal(expected.Expiry) {
+		return ErrLeaseMismatch
+	}
+	current.Expiry = expected.Expiry
+	if current != expected {
+		return ErrLeaseMismatch
+	}
+	if gate.witness.pid != 0 {
+		if gate.witness.pid == pid && gate.witness.start == start {
+			return nil
+		}
+		return ErrLeaseMismatch
+	}
+	gate.witness = ownerWitness{pid: pid, start: start, deadline: expected.Expiry}
 	return nil
 }
 
@@ -126,6 +165,7 @@ func (gate *Gate) Revoke(lease Lease) error {
 	}
 	gate.valid = false
 	gate.lease = Lease{}
+	gate.witness = ownerWitness{}
 	if lease.Term > gate.term {
 		gate.term = lease.Term
 	}
@@ -146,6 +186,7 @@ func (gate *Gate) Fence() {
 	}
 	gate.valid = false
 	gate.lease = Lease{}
+	gate.witness = ownerWitness{}
 	gate.signalLocked()
 }
 
@@ -178,9 +219,12 @@ func (gate *Gate) validLocked() error {
 	if !gate.valid {
 		return ErrLeaseExpired
 	}
-	if !gate.lease.Expiry.After(gate.clock()) || !ownerAlive(gate.lease.OwnerPID, gate.lease.OwnerStartTime) {
+	now := gate.clock()
+	if !gate.lease.Expiry.After(now) || (!ownerAlive(gate.lease.OwnerPID, gate.lease.OwnerStartTime) &&
+		!(gate.witness.pid != 0 && gate.witness.deadline.After(now) && ownerAlive(gate.witness.pid, gate.witness.start))) {
 		gate.valid = false
 		gate.lease = Lease{}
+		gate.witness = ownerWitness{}
 		gate.signalLocked()
 		return ErrLeaseExpired
 	}

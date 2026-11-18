@@ -7,4 +7,4 @@ import (
 	"os"
 )
 
-func peerUID(_ net.Conn) (int, error) { return os.Getuid(), nil }
+func peerIdentity(_ net.Conn) (int, int, error) { return os.Getuid(), 0, nil }

@@ -195,6 +195,22 @@ func TestDeployPeerCannotDispatchGuestMutations(t *testing.T) {
 	}
 }
 
+func TestMaintenanceHandoffRequiresAuthenticatedRootPeer(t *testing.T) {
+	const deployUID = 22001
+	handler := (&Server{RoleGate: controllerrole.New("blue", time.Now)}).handlerWithDeployUID(deployUID)
+	for _, peer := range []*peerConn{nil, {uid: deployUID, pid: os.Getpid()}, {uid: 0}} {
+		req := httptest.NewRequest(http.MethodPost, "/internal/v1/controller-role", strings.NewReader(`{"action":"witness-handoff"}`))
+		if peer != nil {
+			req = req.WithContext(context.WithValue(req.Context(), peerContextKey{}, peer))
+		}
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusForbidden || !strings.Contains(resp.Body.String(), "peer_unauthorized") {
+			t.Fatalf("expected root peer denial: %d %s", resp.Code, resp.Body)
+		}
+	}
+}
+
 func TestTrafficRoleStartsFencedAndRequiresControllerLease(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
