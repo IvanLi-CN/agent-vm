@@ -25,8 +25,9 @@ import (
 )
 
 type HostRuntime struct {
-	Config   Config
-	unitRoot string
+	Config         Config
+	unitRoot       string
+	recoveryMarker func(context.Context, string) error
 
 	mu                  sync.Mutex
 	metrics             map[string]map[string]map[string]string

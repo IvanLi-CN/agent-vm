@@ -575,6 +575,21 @@ func (s *Store) SetMeta(ctx context.Context, key, value string) error {
 	})
 }
 
+// WriteRecoveryMarker binds a recovery point to the current persisted epoch.
+func (s *Store) WriteRecoveryMarker(ctx context.Context, id string) error {
+	return s.withWrite(ctx, func(tx *Tx) error {
+		var epoch string
+		if err := tx.conn.QueryRowContext(ctx, "SELECT value FROM meta WHERE key = 'state_epoch'").Scan(&epoch); err != nil {
+			return err
+		}
+		if epoch == "" {
+			return errors.New("state epoch unavailable for recovery marker")
+		}
+		_, err := tx.exec("INSERT INTO meta(key, value) VALUES('deployment_recovery_marker', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", epoch+":"+id)
+		return err
+	})
+}
+
 func (s *Store) MaintenanceCursor(ctx context.Context) (MaintenanceCursor, error) {
 	raw, found, err := s.Meta(ctx, MaintenanceCursorMetaKey)
 	if err != nil {

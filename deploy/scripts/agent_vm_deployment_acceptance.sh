@@ -410,6 +410,7 @@ go -C "$repository_root/skills/agent-vm-ops/control" test ./internal/deployd -ru
 }
 
 [[ "${AGENT_VM_REAL_SYSTEMD:-0}" == 1 ]] || fail "real Agent VM acceptance requires AGENT_VM_REAL_SYSTEMD=1"
+AGENT_VM_TEST_RECOVERY_RQLITE_LEGACY_AUTH="$proof_dir/auth.json" \
 AGENT_VM_TEST_RECOVERY_RQLITE_URL="$rqlite_base" \
 AGENT_VM_TEST_RECOVERY_RQLITE_CA="$ca_dir/ca.crt" \
 AGENT_VM_TEST_RECOVERY_RQLITE_AUTH="$proof_dir/backup-auth.json" \

@@ -157,20 +157,7 @@ func (runtime *HostRuntime) CreateRecoveryPoint(ctx context.Context, operation, 
 		return err
 	}
 	defer client.CloseIdleConnections()
-	writer, err := runtime.rqliteMigrationURL()
-	if err != nil {
-		return err
-	}
-	writerURL, err := url.Parse(writer)
-	if err != nil {
-		return errors.New("rqlite control credential is invalid")
-	}
-	controlPassword, _ := writerURL.User.Password()
-	statement := []any{[]any{
-		"INSERT INTO meta(key,value) SELECT 'deployment_recovery_marker', value || ':' || ? FROM meta WHERE key='state_epoch' ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-		point.ID,
-	}}
-	if _, err := recoverySQL(ctx, client, endpoint, "/db/execute", "agent-vm-control", controlPassword, statement); err != nil {
+	if err := runtime.writeRecoveryMarker(ctx, client, endpoint, point.ID); err != nil {
 		return err
 	}
 	result, err := recoverySQL(ctx, client, endpoint, "/db/query?level=linearizable", "agent-vm-backup", password, []string{recoveryMarkerQuery})
@@ -201,6 +188,40 @@ func (runtime *HostRuntime) CreateRecoveryPoint(ctx context.Context, operation, 
 		return err
 	}
 	return syncMigrationDirectory(root)
+}
+
+func (runtime *HostRuntime) writeRecoveryMarker(ctx context.Context, client *http.Client, endpoint, id string) error {
+	if runtime.recoveryMarker != nil {
+		return runtime.recoveryMarker(ctx, id)
+	}
+	if os.Geteuid() != 0 {
+		slot, err := runtime.activeSlot()
+		if err != nil {
+			return err
+		}
+		body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, "/internal/v1/recovery-marker", map[string]string{"id": id})
+		if err != nil || status != http.StatusOK || !responseOK(body) {
+			return errors.New("active slot cannot persist the recovery coverage marker")
+		}
+		return nil
+	}
+	// The root-run controller still handles installations whose active release
+	// predates the marker route. This credential is never opened by the
+	// dedicated deployment account.
+	writer, err := runtime.rqliteMigrationURL()
+	if err != nil {
+		return err
+	}
+	writerURL, err := url.Parse(writer)
+	if err != nil {
+		return errors.New("rqlite control credential is invalid")
+	}
+	password, _ := writerURL.User.Password()
+	_, err = recoverySQL(ctx, client, endpoint, "/db/execute", "agent-vm-control", password, []any{[]any{
+		"INSERT INTO meta(key,value) SELECT 'deployment_recovery_marker', value || ':' || ? FROM meta WHERE key='state_epoch' ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+		id,
+	}})
+	return err
 }
 
 func loadRecoveryPoints(root string) ([]recoveryPoint, error) {

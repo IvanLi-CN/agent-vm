@@ -242,7 +242,7 @@ CLI 永远不能直接编辑 `active`。响应丢失时，CLI 返回 deployd tra
 
 ## 恢复与验证
 
-创建蓝绿部署恢复点时，部署控制服务使用安装器导出的独立 rqlite 备份凭据与受保护的 CA，保留线性一致覆盖验证。该凭据只包含备份身份的密码；预检拒绝具备业务写权限或与其他身份复用密码的备份账号。此身份与一次性 SQLite 导入使用的凭据分离。配置路径和源文件见[蓝绿部署手册](../../../../deploy/docs/blue-green.md#rqlite-配置)。
+创建蓝绿部署恢复点时，部署控制服务使用安装器导出的独立 rqlite 备份凭据与受保护的 CA，保留线性一致覆盖验证。该凭据只包含备份身份的密码；预检拒绝具备业务写权限或与其他身份复用密码的备份账号。以专用账户运行时，由持有有效控制权的槽位写入覆盖标记，部署控制服务仅查询并验证标记。仍以 root 运行的兼容路径可以为不支持此接口的现役版本代写标记。配置路径和源文件见[蓝绿部署手册](../../../../deploy/docs/blue-green.md#rqlite-配置)。
 
 启动时，deployd 加载最近事务，验证数据库 schema，并重新观测每个运行时来源。只有再次观测到对应运行时证据，记录的 phase 才能视为完成。如果无法证明该 phase，deployd 进入 `needs_recovery`，保持部署和受影响的 admission fenced，并保留证据。只有运维者确认事务标识且必需来源新鲜、相互一致后，恢复流程才能 resume、rollback 或 finalize。执行 recovery finalize 时，deployd 必须先确认目标槽位仍然是已验证的 active 槽位，撤销旧槽位的 controller role 和 traffic role，完成 drain/quiescence，并停止旧槽位。只有重新观测到旧槽位已经停止、目标槽位重新持有 controller role 且可以接受流量后，才能把事务写成 `finalize`。撤销、停止或重新观测任一步失败，都必须保持 `needs_recovery`，并对两个槽位执行 hard-fence，不能猜测恢复已经完成。
 

@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -76,6 +77,12 @@ func NewWithRole(service *lifecycle.Service, snapshots *observe.SnapshotStore, a
 func (s *Server) Handler() http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
+	deployUID := -1
+	if account, err := user.Lookup("agent-vm-deploy"); err == nil {
+		if uid, err := strconv.Atoi(account.Uid); err == nil && uid > 0 {
+			deployUID = uid
+		}
+	}
 	router.Use(gin.CustomRecovery(func(c *gin.Context, _ any) {
 		writeJSON(c, http.StatusInternalServerError, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("internal_error", "internal control server failure", nil)}, 3)
 		c.Abort()
@@ -87,7 +94,8 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			uid := os.Getuid()
-			if (uid == 0 && conn.uid != 0) || (uid != 0 && conn.uid != uid) {
+			markerPeer := c.Request.URL.Path == "/internal/v1/recovery-marker" && conn.uid == deployUID
+			if uid != conn.uid && !markerPeer {
 				writeJSON(c, http.StatusForbidden, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("peer_unauthorized", "Unix peer credentials are not authorized", nil)}, 2)
 				c.Abort()
 				return
@@ -96,6 +104,7 @@ func (s *Server) Handler() http.Handler {
 		c.Next()
 	})
 	router.POST("/internal/v1/control", s.control)
+	router.POST("/internal/v1/recovery-marker", s.recoveryMarker)
 	router.POST("/internal/v1/controller-role", s.controllerRole)
 	router.POST("/internal/v1/traffic-role", s.trafficRole)
 	router.GET("/internal/v1/health", s.health)
