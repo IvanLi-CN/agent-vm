@@ -72,25 +72,50 @@ func isServiceAccount(uid int, name string) bool {
 // Staging can replace binaries by renaming slot directories. These paths must
 // no longer be used by a root slot when writable by the deployment account.
 func verifyUnprivilegedSlots(ctx context.Context) error {
+	for _, slot := range []string{"blue", "green"} {
+		if err := verifySlotAccount(ctx, slot, false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// VerifyRunningSlotAccount checks systemd's active process, not just the unit.
+func VerifyRunningSlotAccount(ctx context.Context, slot string) error {
+	return verifySlotAccount(ctx, slot, true)
+}
+
+func verifySlotAccount(ctx context.Context, slot string, requireRunning bool) error {
+	if err := validSlot(slot); err != nil {
+		return err
+	}
 	account, err := user.Lookup(slotUser)
 	if err != nil || account.Uid == "0" {
 		return errors.New("slot account missing; complete host permission maintenance before staging")
 	}
-	for _, slot := range []string{"blue", "green"} {
-		unit := "agent-vm-native@" + slot + ".service"
-		output, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property=User", "--property=MainPID").Output()
-		if err != nil {
-			return fmt.Errorf("cannot verify systemd identity of slot %s", slot)
+	unit := "agent-vm-native@" + slot + ".service"
+	identity := func() ([]byte, error) {
+		return exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property=User", "--property=MainPID").Output()
+	}
+	output, err := identity()
+	if err != nil {
+		return fmt.Errorf("cannot verify systemd identity of slot %s", slot)
+	}
+	pid, err := unprivilegedSlotPID(string(output))
+	if err != nil {
+		return fmt.Errorf("slot %s: %w", slot, err)
+	}
+	if pid == 0 && requireRunning {
+		return fmt.Errorf("slot %s has no running systemd main process", slot)
+	}
+	if pid != 0 {
+		status, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+		if err != nil || !processUsesSlotUID(string(status), account.Uid) {
+			return fmt.Errorf("slot %s process identity is unverified; complete host permission maintenance before staging", slot)
 		}
-		pid, err := unprivilegedSlotPID(string(output))
-		if err != nil {
-			return fmt.Errorf("slot %s: %w", slot, err)
-		}
-		if pid != 0 {
-			status, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
-			if err != nil || !processUsesSlotUID(string(status), account.Uid) {
-				return fmt.Errorf("slot %s process identity is unverified; complete host permission maintenance before staging", slot)
-			}
+		current, err := identity()
+		if err != nil || string(current) != string(output) {
+			return fmt.Errorf("slot %s main process changed during identity verification", slot)
 		}
 	}
 	return nil

@@ -57,6 +57,8 @@ func PreflightAccountMigration(ctx context.Context, input Inputs) (Report, error
 		return fail(errors.New("active release artifacts do not match the live process identity"))
 	}
 	report.PreviousSource = metadata.SourceRevision
+	report.previousAuthority = active.StateAuthority
+	report.previousReleaseID = metadata.ReleaseID
 	previous, err := config.Load(targets[snapshot.ActiveSlot+"_config"].path)
 	if err != nil {
 		return fail(err)

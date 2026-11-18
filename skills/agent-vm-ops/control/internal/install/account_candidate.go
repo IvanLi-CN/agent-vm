@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 )
@@ -29,24 +31,72 @@ func prepareAccountCandidate(ctx context.Context, input Inputs, product string, 
 	}
 	staging := filepath.Join(deployd.Defaults().ReleaseRoot, "release-staging")
 	bundle, stagingID, err := stageAccountBundle(staging, input.Bundle, report.BundleSHA256)
+	var receipt deployd.UpdateReceipt
 	if err != nil {
-		if errors.Is(err, os.ErrExist) {
-			prior := filepath.Join(staging, stagingID)
-			if err := verifyReservedAccountBundle(prior, report.BundleSHA256); err != nil {
-				return deployd.UpdateReceipt{}, err
-			}
-			return client.ResumeBlueGreenPreparation(ctx, stagingID, report.ActiveSlot, target, "")
+		if !errors.Is(err, os.ErrExist) {
+			return receipt, err
 		}
-		return deployd.UpdateReceipt{}, err
+		if err := verifyReservedAccountBundle(filepath.Join(staging, stagingID), report.BundleSHA256); err != nil {
+			return receipt, err
+		}
+		receipt, err = client.ResumeBlueGreenPreparation(ctx, stagingID, report.ActiveSlot, target, "")
+	} else {
+		if err := prepareLegacyCandidateUnit(ctx, report.ActiveSlot, input, product, report.SourceRevision); err != nil {
+			return receipt, fmt.Errorf("prepare account candidate in %s: %w", stagingID, err)
+		}
+		receipt, err = client.PrepareBlueGreen(ctx, target, bundle)
 	}
-	if err := prepareLegacyCandidateUnit(ctx, report.ActiveSlot, input, product, report.SourceRevision); err != nil {
-		return deployd.UpdateReceipt{}, fmt.Errorf("prepare account candidate in %s: %w", stagingID, err)
-	}
-	receipt, err := client.PrepareBlueGreen(ctx, target, bundle)
 	if err != nil {
 		return receipt, fmt.Errorf("inspect original deployment transaction for staging ID %s before retrying: %w", stagingID, err)
 	}
+	if err := deployd.VerifyRunningSlotAccount(ctx, target); err != nil {
+		return receipt, err
+	}
+	payload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
+	if err != nil {
+		return receipt, err
+	}
+	if err := checkPreparedAccountCandidate(payload, receipt.ID, stagingID, report, target, time.Now()); err != nil {
+		return receipt, err
+	}
 	return receipt, nil
+}
+
+func checkPreparedAccountCandidate(data []byte, id, stagingID string, report Report, target string, now time.Time) error {
+	var status struct {
+		OK    bool `json:"ok"`
+		Value struct {
+			Observation  deployd.RuntimeSnapshot `json:"observation"`
+			Transactions []struct {
+				ID               string `json:"transaction_id"`
+				StagingID        string `json:"staging_id"`
+				Previous         string `json:"previous_slot"`
+				Target           string `json:"target_slot"`
+				State            string `json:"state"`
+				Phase            string `json:"phase"`
+				RecoveryRequired bool   `json:"recovery_required"`
+			} `json:"transactions"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(data, &status); err != nil || !status.OK || len(status.Value.Transactions) != 1 {
+		return errors.New("cannot verify the original prepared account migration transaction")
+	}
+	tx := status.Value.Transactions[0]
+	if id == "" || stagingID == "" || tx.ID != id || tx.StagingID != stagingID || tx.Previous != report.ActiveSlot ||
+		tx.Target != target || tx.State != "active" || tx.Phase != deployd.PhaseControllerHandoff || tx.RecoveryRequired {
+		return errors.New("prepared account migration transaction changed")
+	}
+	snapshot := status.Value.Observation
+	active, standby := snapshot.Slots[report.ActiveSlot], snapshot.Slots[target]
+	if !snapshot.Consistent || !snapshot.FreshUntil.After(now) || snapshot.ActiveSlot != report.ActiveSlot ||
+		snapshot.ControllerSlot != report.ActiveSlot || !active.ProcessUp || !active.Ready || !active.ControllerOwned ||
+		!active.TrafficAccepting || active.Draining || active.SourceRevision != report.PreviousSource ||
+		active.ReleaseID != report.previousReleaseID || report.previousAuthority == "" || active.StateAuthority != report.previousAuthority ||
+		!standby.ProcessUp || !standby.ProcessReady || standby.ControllerOwned || standby.TrafficAccepting ||
+		standby.SourceRevision != report.SourceRevision || standby.StateAuthority != report.previousAuthority {
+		return errors.New("prepared account migration no longer has a serving incumbent and a fenced candidate on the same state backend")
+	}
+	return nil
 }
 
 func verifyReservedAccountBundle(directory, expected string) error {
