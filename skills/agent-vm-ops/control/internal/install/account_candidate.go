@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -62,28 +63,104 @@ func prepareAccountCandidate(ctx context.Context, input Inputs, product string, 
 	return receipt, nil
 }
 
-func checkPreparedAccountCandidate(data []byte, id, stagingID string, report Report, target string, now time.Time) error {
-	var status struct {
+// activateAccountCandidate leaves the incumbent deploy daemon responsible for
+// the existing transaction, including its ordinary activation compensation.
+func activateAccountCandidate(ctx context.Context, client deployd.Client, prepared deployd.UpdateReceipt, report Report) (deployd.AccountHandoff, error) {
+	var empty deployd.AccountHandoff
+	target := "blue"
+	if report.ActiveSlot == "blue" {
+		target = "green"
+	}
+	stagingID := AccountMigrationStagingPrefix + report.BundleSHA256
+	payload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
+	if err != nil {
+		return empty, err
+	}
+	if err := checkPreparedAccountCandidate(payload, prepared.ID, stagingID, report, target, time.Now()); err != nil {
+		return empty, err
+	}
+	if err := deployd.VerifyRunningSlotAccount(ctx, target); err != nil {
+		return empty, err
+	}
+	if _, err := client.ActivateBlueGreen(ctx, prepared); err != nil {
+		return empty, fmt.Errorf("activation of %s was not acknowledged; inspect the original deployment transaction before continuing: %w", prepared.ID, err)
+	}
+	journal, _, err := client.Call(ctx, "GET", "/v1/transactions/"+url.PathEscape(prepared.ID), nil)
+	if err != nil {
+		return empty, err
+	}
+	status, _, err := client.Call(ctx, "GET", "/v1/status", nil)
+	if err != nil {
+		return empty, err
+	}
+	return accountHandoffAfterActivation(journal, status, prepared.ID, stagingID, target, report, time.Now())
+}
+
+type accountMigrationTransaction struct {
+	ID               string `json:"transaction_id"`
+	StagingID        string `json:"staging_id"`
+	Previous         string `json:"previous_slot"`
+	Target           string `json:"target_slot"`
+	State            string `json:"state"`
+	Phase            string `json:"phase"`
+	Generation       int64  `json:"generation"`
+	RecoveryRequired bool   `json:"recovery_required"`
+	RollbackUsed     bool   `json:"rollback_used"`
+}
+
+func (tx accountMigrationTransaction) matches(id, stagingID, previous, target string) bool {
+	return id != "" && stagingID != "" && tx.ID == id && tx.StagingID == stagingID &&
+		tx.Previous == previous && tx.Target == target && !tx.RecoveryRequired && !tx.RollbackUsed &&
+		((previous == "blue" && target == "green") || (previous == "green" && target == "blue"))
+}
+
+type accountMigrationStatus struct {
+	OK    bool `json:"ok"`
+	Value struct {
+		Observation  deployd.RuntimeSnapshot       `json:"observation"`
+		Transactions []accountMigrationTransaction `json:"transactions"`
+		Dedicated    bool                          `json:"dedicated_service_account"`
+	} `json:"value"`
+}
+
+func accountHandoffAfterActivation(journal, payload []byte, id, stagingID, target string, report Report, now time.Time) (deployd.AccountHandoff, error) {
+	var transaction struct {
 		OK    bool `json:"ok"`
 		Value struct {
-			Observation  deployd.RuntimeSnapshot `json:"observation"`
-			Transactions []struct {
-				ID               string `json:"transaction_id"`
-				StagingID        string `json:"staging_id"`
-				Previous         string `json:"previous_slot"`
-				Target           string `json:"target_slot"`
-				State            string `json:"state"`
-				Phase            string `json:"phase"`
-				RecoveryRequired bool   `json:"recovery_required"`
-			} `json:"transactions"`
+			Transaction accountMigrationTransaction `json:"transaction"`
 		} `json:"value"`
 	}
-	if err := json.Unmarshal(data, &status); err != nil || !status.OK || len(status.Value.Transactions) != 1 {
+	var status accountMigrationStatus
+	if json.Unmarshal(journal, &transaction) != nil || !transaction.OK ||
+		json.Unmarshal(payload, &status) != nil || !status.OK {
+		return deployd.AccountHandoff{}, errors.New("activation journal or live observation is unavailable")
+	}
+	tx := transaction.Value.Transaction
+	if !tx.matches(id, stagingID, report.ActiveSlot, target) || tx.Phase != deployd.PhaseFinalize ||
+		tx.State != "finalized" || tx.Generation <= 0 || status.Value.Dedicated || len(status.Value.Transactions) != 0 {
+		return deployd.AccountHandoff{}, errors.New("original activation is not finalized by the incumbent deployment service")
+	}
+	snapshot := status.Value.Observation
+	active, old := snapshot.Slots[target], snapshot.Slots[report.ActiveSlot]
+	lease := active.ControllerLease
+	if !snapshot.Consistent || !snapshot.FreshUntil.After(now) || snapshot.ActiveSlot != target || snapshot.ControllerSlot != target ||
+		!active.ProcessUp || !active.ProcessReady || !active.Ready || !active.ControllerOwned || !active.TrafficAccepting || active.Draining ||
+		active.SourceRevision != report.SourceRevision || report.previousAuthority == "" || active.StateAuthority != report.previousAuthority ||
+		lease == nil || lease.Validate(now, target) != nil || lease.Generation != tx.Generation || lease.OwnerPID <= 0 || lease.OwnerStartTime == "" ||
+		!old.CountersKnown || old.ProcessUp || old.ProcessReady || old.Ready || old.ControllerOwned || old.TrafficAccepting ||
+		old.InFlightRequests != 0 || old.NativeWorkers != 0 || old.PendingOperations != 0 {
+		return deployd.AccountHandoff{}, errors.New("live slots do not confirm the finalized account migration")
+	}
+	return deployd.AccountHandoff{Lease: *lease, StateAuthority: active.StateAuthority}, nil
+}
+
+func checkPreparedAccountCandidate(data []byte, id, stagingID string, report Report, target string, now time.Time) error {
+	var status accountMigrationStatus
+	if err := json.Unmarshal(data, &status); err != nil || !status.OK || status.Value.Dedicated || len(status.Value.Transactions) != 1 {
 		return errors.New("cannot verify the original prepared account migration transaction")
 	}
 	tx := status.Value.Transactions[0]
-	if id == "" || stagingID == "" || tx.ID != id || tx.StagingID != stagingID || tx.Previous != report.ActiveSlot ||
-		tx.Target != target || tx.State != "active" || tx.Phase != deployd.PhaseControllerHandoff || tx.RecoveryRequired {
+	if !tx.matches(id, stagingID, report.ActiveSlot, target) || tx.State != "active" || tx.Phase != deployd.PhaseControllerHandoff {
 		return errors.New("prepared account migration transaction changed")
 	}
 	snapshot := status.Value.Observation

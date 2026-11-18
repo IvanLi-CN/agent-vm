@@ -5,11 +5,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 )
 
 func TestPreparedAccountCandidateKeepsIncumbentServing(t *testing.T) {
-	now := time.Now()
+	now := time.Now().UTC()
 	report := Report{
 		ActiveSlot: "blue", PreviousSource: "previous", SourceRevision: "candidate",
 		previousAuthority: "rqlite", previousReleaseID: "previous-release",
@@ -71,6 +72,60 @@ func TestPreparedAccountCandidateKeepsIncumbentServing(t *testing.T) {
 			err = checkPreparedAccountCandidate(payload, "original", ".update-account-expected", report, "green", now)
 			if (err != nil) != (tt.mutate != nil) {
 				t.Fatalf("unexpected verification result: %v", err)
+			}
+		})
+	}
+}
+
+func TestAccountHandoffRequiresFinalizedActivationAndMatchingLiveLease(t *testing.T) {
+	now := time.Now().UTC()
+	report := Report{ActiveSlot: "blue", SourceRevision: "candidate", previousAuthority: "rqlite"}
+	const id, staging = "tx-original", ".update-account-expected"
+	for _, scenario := range []string{"verified", "unfinished", "wrong transaction", "compensated", "recovery pending", "stale lease generation", "previous still running", "wrong backend"} {
+		t.Run(scenario, func(t *testing.T) {
+			lease := &controllerrole.Lease{Slot: "green", Term: 2, LeaseID: "lease", Nonce: "nonce", Generation: 10,
+				Expiry: now.Add(time.Minute), OwnerPID: 42, OwnerStartTime: "start"}
+			tx := accountMigrationTransaction{
+				ID: id, StagingID: staging, Previous: "blue", Target: "green", State: "finalized", Phase: deployd.PhaseFinalize, Generation: 10,
+			}
+			active := deployd.SlotObservation{ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true,
+				TrafficAccepting: true, SourceRevision: report.SourceRevision, StateAuthority: report.previousAuthority, ControllerLease: lease}
+			old := deployd.SlotObservation{CountersKnown: true}
+			switch scenario {
+			case "unfinished":
+				tx.State, tx.Phase = "active", deployd.PhaseControllerHandoff
+			case "wrong transaction":
+				tx.ID = "another"
+			case "compensated":
+				tx.RollbackUsed = true
+			case "recovery pending":
+				tx.RecoveryRequired = true
+			case "stale lease generation":
+				lease.Generation--
+			case "previous still running":
+				old.ProcessUp = true
+			case "wrong backend":
+				active.StateAuthority = "another"
+			}
+			journal, err := json.Marshal(map[string]any{"ok": true, "value": map[string]any{"transaction": tx}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var status accountMigrationStatus
+			status.OK = true
+			status.Value.Observation = deployd.RuntimeSnapshot{Consistent: true, ActiveSlot: "green", ControllerSlot: "green",
+				FreshUntil: now.Add(time.Second), Slots: map[string]deployd.SlotObservation{"green": active, "blue": old}}
+			payload, err := json.Marshal(status)
+			if err != nil {
+				t.Fatal(err)
+			}
+			handoff, err := accountHandoffAfterActivation(journal, payload, id, staging, "green", report, now)
+			if scenario == "verified" {
+				if err != nil || handoff.Lease != *lease || handoff.StateAuthority != report.previousAuthority {
+					t.Fatalf("handoff=%+v, err=%v", handoff, err)
+				}
+			} else if err == nil {
+				t.Fatal("unverified activation produced handoff credentials")
 			}
 		})
 	}

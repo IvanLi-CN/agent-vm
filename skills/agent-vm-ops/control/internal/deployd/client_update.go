@@ -103,6 +103,11 @@ func activateBlueGreen(ctx context.Context, call updateCall, prepared UpdateRece
 	return blueGreenStep(ctx, call, prepared.ID, "activate", PhaseFinalize, "finalized", map[string]any{"transaction_id": prepared.ID})
 }
 
+// ActivateBlueGreen activates the original verified transaction.
+func (client Client) ActivateBlueGreen(ctx context.Context, prepared UpdateReceipt) (UpdateReceipt, error) {
+	return activateBlueGreen(ctx, client.Call, prepared)
+}
+
 type updateCall func(context.Context, string, string, any) ([]byte, int, error)
 
 func blueGreenStep(ctx context.Context, call updateCall, id, action, phase, state string, input any) (UpdateReceipt, error) {
