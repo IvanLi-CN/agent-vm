@@ -199,7 +199,7 @@ func (server *Server) status(c *gin.Context) {
 	for index := range status.Transactions {
 		transactions = append(transactions, publicTransaction(status.Transactions[index]))
 	}
-	writeOK(c, map[string]any{"observation": status.Observed, "transactions": transactions})
+	writeOK(c, map[string]any{"observation": status.Observed, "transactions": transactions, "dedicated_service_account": isDeployAccount(os.Geteuid())})
 }
 
 func (server *Server) transaction(c *gin.Context) {

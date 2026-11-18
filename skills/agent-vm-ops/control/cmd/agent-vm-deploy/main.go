@@ -184,11 +184,21 @@ func runUpdate(args []string) error {
 		return errors.New("another release update is already in progress")
 	}
 	defer updateLock.Close()
+	client := deployd.Client{Socket: *socket, Timeout: 15 * time.Minute}
+	if *socket == deployd.Defaults().Socket {
+		payload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
+		if err != nil {
+			writePayload(os.Stderr, payload)
+			return err
+		}
+		if !dedicatedUpdateReady(payload) {
+			return errors.New("host permission migration required before updating; see deploy/docs/blue-green.md")
+		}
+	}
 	const stagingRoot = "/var/lib/agent-vm-native/release-staging"
 	if err := os.MkdirAll(stagingRoot, 0o750); err != nil {
 		return fmt.Errorf("create release staging root: %w", err)
 	}
-	client := deployd.Client{Socket: *socket, Timeout: 15 * time.Minute}
 	cleanupOrphanStaging(ctx, client, stagingRoot)
 	directory, err := os.MkdirTemp(stagingRoot, ".update-")
 	if err != nil {

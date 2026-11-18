@@ -1,12 +1,23 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
 )
+
+func dedicatedUpdateReady(payload []byte) bool {
+	var status struct {
+		OK    bool `json:"ok"`
+		Value struct {
+			Dedicated bool `json:"dedicated_service_account"`
+		} `json:"value"`
+	}
+	return json.Unmarshal(payload, &status) == nil && status.OK && status.Value.Dedicated
+}
 
 func exposeVerifiedBundle(directory, bundle string) error {
 	if os.Geteuid() != 0 {
