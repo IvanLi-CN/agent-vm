@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { test, expect, type Page } from '@playwright/test';
 
 const cliTitle = readFileSync(new URL('../../docs/specs/agent-vm/contracts/cli.md', import.meta.url), 'utf8').match(/^# (.+)$/m)![1];
-const sourceIdentity = JSON.parse(readFileSync(new URL('../.generated/source.json', import.meta.url), 'utf8')).identity as { revision: string };
+const sourceIdentity = JSON.parse(readFileSync(new URL('../.generated/source.json', import.meta.url), 'utf8')).identity as { revision: string; modifiedPaths: string[] };
 
 async function navigation(page: Page) {
   if (page.viewportSize()!.width < 768) {
@@ -22,6 +22,7 @@ test('home leads directly to real documents and their GitHub source', async ({ p
   await expect(page).toHaveTitle('项目概览 | Agent VM 文档');
   await expect(page.locator('article h1')).toContainText('Agent VM');
   await expect(page.locator('.document-path code')).toHaveText('README.md');
+  expect(sourceIdentity.modifiedPaths).not.toContain('README.md');
   const githubLink = page.getByRole('link', { name: '在 GitHub 查看', exact: true });
   await expect(githubLink).toHaveAttribute('target', '_blank');
   await expect(githubLink).toHaveAttribute('href', `https://github.com/IvanLi-CN/agent-vm/blob/${sourceIdentity.revision}/README.md`);

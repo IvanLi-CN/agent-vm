@@ -28,7 +28,7 @@ export function DocumentActions({ identity, copyLink = () => navigator.clipboard
     </footer>;
 }
 
-export function DocumentPath({ path, githubHref }: { path: string; githubHref: string }) {
+export function DocumentPath({ path, githubHref }: { path: string; githubHref?: string }) {
   const [copyError, setCopyError] = useState(false);
   const [copied, copy] = useCopyButton(async () => {
     setCopyError(false);
@@ -41,9 +41,9 @@ export function DocumentPath({ path, githubHref }: { path: string; githubHref: s
       <code title={path}>{path}</code>
     </div>
     <div className="document-path-actions">
-      <a className={buttonVariants({ variant: 'ghost', size: 'sm' })} href={githubHref} target="_blank" rel="noreferrer">
+      {githubHref ? <a className={buttonVariants({ variant: 'ghost', size: 'sm' })} href={githubHref} target="_blank" rel="noreferrer">
         <ExternalLink aria-hidden="true" size={15}/><span>在 GitHub 查看</span>
-      </a>
+      </a> : <span className="document-path-status" title="当前工作区内容尚未同步到 GitHub">本地修改未同步到 GitHub</span>}
       <button type="button" className={buttonVariants({ variant: 'ghost', size: 'sm' })} onClick={copy} aria-label="复制文档路径" title="复制文档路径">
         {copied ? <Check aria-hidden="true" size={15}/> : <Copy aria-hidden="true" size={15}/>}<span>{copyError ? '复制失败，请重试' : copied ? '已复制' : '复制路径'}</span>
       </button>

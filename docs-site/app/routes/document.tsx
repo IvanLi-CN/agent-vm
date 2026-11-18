@@ -22,8 +22,9 @@ export default function Document() {
   const Content = doc && modules[`../../.generated/content/${slug}${doc.path.slice(doc.path.lastIndexOf('.'))}`]?.default;
   if (!doc || !Content) return <Page><Callout type="error" role="alert">找不到此文档。</Callout></Page>;
   const toc = doc.toc.filter(h => h.depth > 1 && h.depth < 4).map(h => ({ title: h.title, url: '#' + h.anchor, depth: h.depth }));
+  const isModified = data.identity.modifiedPaths.includes(doc.path);
   return <Page key={slug} toc={toc} tableOfContentPopover={{ trigger: { 'aria-label': '本页目录' } }}>
-    <DocumentPath path={doc.path} githubHref={githubSourceUrl(doc.path)} />
+    <DocumentPath path={doc.path} githubHref={isModified ? undefined : githubSourceUrl(doc.path)} />
     <DocsBody><Content components={{ ...defaultComponents, Mermaid }}/></DocsBody>
   </Page>;
 }

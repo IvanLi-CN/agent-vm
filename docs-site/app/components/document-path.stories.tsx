@@ -17,3 +17,12 @@ export const CopyPath: Story = { play: async ({ canvasElement }) => {
   await userEvent.click(canvas.getByRole('button', { name: '复制文档路径' }));
   await expect(await canvas.findByRole('status')).toHaveTextContent('文档路径已复制');
 } };
+
+export const ModifiedSource: Story = {
+  args: { githubHref: undefined },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(canvas.getByText('本地修改未同步到 GitHub')).toBeVisible();
+    await expect(canvas.queryByRole('link', { name: '在 GitHub 查看' })).toBeNull();
+  },
+};

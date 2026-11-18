@@ -1,2 +1,3 @@
 import generated from '../.generated/source.json';
-export default generated as Omit<typeof generated,'snapshots'|'contentDiagnostics'> & {snapshots:Record<string,string>;contentDiagnostics:{path:string;message:string}[]};
+type Identity = Omit<typeof generated.identity, 'modifiedPaths'> & { modifiedPaths: string[] };
+export default generated as Omit<typeof generated,'snapshots'|'contentDiagnostics'|'identity'> & { identity: Identity; snapshots:Record<string,string>;contentDiagnostics:{path:string;message:string}[] };
