@@ -136,6 +136,7 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 			}
 		}
 		if blue.Project != "" {
+			add(checkIncusCredentials(ctx, cfg, blue.Project))
 			for _, args := range [][]string{{"project", "show", blue.Project}, {"profile", "show", blue.Profile, "--project", blue.Project}, {"network", "show", blue.Network, "--project", blue.Project}, {"storage", "show", blue.Pool}, {"image", "info", blue.ImageFingerprint, "--project", blue.Project}} {
 				if e := exec.CommandContext(ctx, "incus", args...).Run(); e != nil {
 					add(fmt.Errorf("Incus prerequisite failed: %s %s", args[0], args[1]))

@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"os"
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
@@ -28,5 +30,9 @@ func runWaitAuthority(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeout)*time.Second)
 	defer cancel()
-	return state.WaitForRQLiteReady(ctx, cfg.StateDB, "/etc/agent-vm-native/tls/rqlite/server.crt")
+	ca := "/etc/agent-vm-native/tls/rqlite/server.crt"
+	if os.Geteuid() != 0 {
+		ca = deployd.ServerAuthorityCA
+	}
+	return state.WaitForRQLiteReady(ctx, cfg.StateDB, ca)
 }

@@ -20,6 +20,7 @@ import (
 const hostActionSocket = "/run/agent-vm-deploy-host/action.sock"
 const slotUser = "agent-vm-server"
 const deployUser = "agent-vm-deploy"
+const ServerAuthorityCA = "/etc/agent-vm-native/tls/server-authority.crt"
 
 type hostAction struct {
 	Action   string `json:"action"`
@@ -219,6 +220,8 @@ func applyHostAction(ctx context.Context, action hostAction) error {
 		}
 		contents := "[Unit]\nConditionPathExists=\nConditionPathExists=" + binary +
 			"\nConditionPathExists=" + cfg + "\n[Service]\nUser=" + slotUser +
+			"\nSupplementaryGroups=agent-vm-server\nEnvironment=INCUS_CONF=/etc/agent-vm-native/incus" +
+			"\nEnvironment=SSL_CERT_FILE=" + ServerAuthorityCA +
 			"\nExecStart=\nExecStart=" + binary + " serve --config " + cfg +
 			" --manifest " + dirname + "/release-manifest.json\nRestart=" + restart + "\n"
 		if err := writeHostUnit(dir, contents); err != nil {

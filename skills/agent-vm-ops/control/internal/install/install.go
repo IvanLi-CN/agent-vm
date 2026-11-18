@@ -232,6 +232,17 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	if err := installBackupInputs(cfg); err != nil {
 		return report, err
 	}
+	blueRuntime, err := config.Load(cfg.Files["blue_config"])
+	if err != nil {
+		return report, errors.New("cannot prepare Incus client configuration from the blue slot")
+	}
+	incusConfig, err := incusCLIConfig(blueRuntime.Project)
+	if err != nil {
+		return report, err
+	}
+	if err := installFile("/etc/agent-vm-native/incus/config.yml", incusConfig, 0640, "agent-vm-server"); err != nil {
+		return report, err
+	}
 	if report.Mode != "legacy" {
 		if err := installProductFiles(product, "/opt/agent-vm-native"); err != nil {
 			return report, err
@@ -361,6 +372,9 @@ func installBackupInputs(cfg Config) error {
 	}
 	migration := deployd.Defaults().Migration
 	if err := installFile(migration.RQLiteBackupAuth, credential, 0640, "agent-vm-deploy"); err != nil {
+		return err
+	}
+	if err := installFile(deployd.ServerAuthorityCA, ca, 0640, "agent-vm-server"); err != nil {
 		return err
 	}
 	return installFile(migration.RQLiteBackupCA, ca, 0640, "agent-vm-deploy")
