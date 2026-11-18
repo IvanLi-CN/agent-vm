@@ -228,6 +228,10 @@ cat >"$proof_dir/auth.json" <<EOF
 ]
 EOF
 chmod 0600 "$proof_dir/auth.json"
+(
+  umask 077
+  printf '{"password":"%s"}\n' "$backup_secret" >"$proof_dir/backup-auth.json"
+)
 http_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 raft_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
 rqlite_data="$proof_dir/rqlite-data"
@@ -262,7 +266,7 @@ fi
 
 AGENT_VM_TEST_RECOVERY_RQLITE_URL="$rqlite_base" \
 AGENT_VM_TEST_RECOVERY_RQLITE_CA="$ca_dir/ca.crt" \
-AGENT_VM_TEST_RECOVERY_RQLITE_AUTH="$proof_dir/auth.json" \
+AGENT_VM_TEST_RECOVERY_RQLITE_AUTH="$proof_dir/backup-auth.json" \
 AGENT_VM_TEST_RECOVERY_RQLITE_CONTROL="$control_secret" \
 AGENT_VM_TEST_RECOVERY_RQLITED="$rqlited" \
   go -C "$repository_root/skills/agent-vm-ops/control" test ./internal/deployd -run '^TestRealRQLiteRecoveryPoint$' -count=1
@@ -406,9 +410,10 @@ go -C "$repository_root/skills/agent-vm-ops/control" test ./internal/deployd -ru
 }
 
 [[ "${AGENT_VM_REAL_SYSTEMD:-0}" == 1 ]] || fail "real Agent VM acceptance requires AGENT_VM_REAL_SYSTEMD=1"
+AGENT_VM_TEST_RECOVERY_RQLITE_LEGACY_AUTH="$proof_dir/auth.json" \
 AGENT_VM_TEST_RECOVERY_RQLITE_URL="$rqlite_base" \
 AGENT_VM_TEST_RECOVERY_RQLITE_CA="$ca_dir/ca.crt" \
-AGENT_VM_TEST_RECOVERY_RQLITE_AUTH="$proof_dir/auth.json" \
+AGENT_VM_TEST_RECOVERY_RQLITE_AUTH="$proof_dir/backup-auth.json" \
 AGENT_VM_TEST_RECOVERY_RQLITE_CONTROL="$control_secret" \
   bash "$repository_root/deploy/scripts/agent_vm_deployd_systemd_acceptance.sh" >"$proof_dir/deployd-systemd-acceptance.json" 2>&1 || {
   cat "$proof_dir/deployd-systemd-acceptance.json" >&2

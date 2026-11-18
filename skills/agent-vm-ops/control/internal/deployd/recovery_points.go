@@ -157,20 +157,7 @@ func (runtime *HostRuntime) CreateRecoveryPoint(ctx context.Context, operation, 
 		return err
 	}
 	defer client.CloseIdleConnections()
-	writer, err := runtime.rqliteMigrationURL()
-	if err != nil {
-		return err
-	}
-	writerURL, err := url.Parse(writer)
-	if err != nil {
-		return errors.New("rqlite control credential is invalid")
-	}
-	controlPassword, _ := writerURL.User.Password()
-	statement := []any{[]any{
-		"INSERT INTO meta(key,value) SELECT 'deployment_recovery_marker', value || ':' || ? FROM meta WHERE key='state_epoch' ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-		point.ID,
-	}}
-	if _, err := recoverySQL(ctx, client, endpoint, "/db/execute", "agent-vm-control", controlPassword, statement); err != nil {
+	if err := runtime.writeRecoveryMarker(ctx, client, endpoint, point.ID); err != nil {
 		return err
 	}
 	result, err := recoverySQL(ctx, client, endpoint, "/db/query?level=linearizable", "agent-vm-backup", password, []string{recoveryMarkerQuery})
@@ -201,6 +188,49 @@ func (runtime *HostRuntime) CreateRecoveryPoint(ctx context.Context, operation, 
 		return err
 	}
 	return syncMigrationDirectory(root)
+}
+
+func (runtime *HostRuntime) writeRecoveryMarker(ctx context.Context, client *http.Client, endpoint, id string) error {
+	if runtime.recoveryMarker != nil {
+		return runtime.recoveryMarker(ctx, id)
+	}
+	if os.Geteuid() != 0 {
+		slot, err := runtime.activeSlot()
+		if err != nil {
+			return err
+		}
+		body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, recoveryMarkerRoute, map[string]string{"id": id})
+		defaults := Defaults()
+		if missingRecoveryMarkerRoute(status) && runtime.Config.BlueSocket == defaults.BlueSocket && runtime.Config.GreenSocket == defaults.GreenSocket {
+			payload, _ := json.Marshal(map[string]string{"id": id})
+			body, status, err = requestSlotRelay(ctx, slotRelayRequest{Slot: slot, Method: http.MethodPost, Path: recoveryMarkerRoute, Body: payload}, 10*time.Second)
+		}
+		if err != nil || status != http.StatusOK || !responseOK(body) {
+			return errors.New("active slot cannot persist the recovery coverage marker")
+		}
+		return nil
+	}
+	// The root-run controller still handles installations whose active release
+	// predates the marker route. This credential is never opened by the
+	// dedicated deployment account.
+	writer, err := runtime.rqliteMigrationURL()
+	if err != nil {
+		return err
+	}
+	writerURL, err := url.Parse(writer)
+	if err != nil {
+		return errors.New("rqlite control credential is invalid")
+	}
+	password, _ := writerURL.User.Password()
+	return writeRecoveryMarkerSQL(ctx, client, endpoint, "agent-vm-control", password, id)
+}
+
+func writeRecoveryMarkerSQL(ctx context.Context, client *http.Client, endpoint, user, password, id string) error {
+	_, err := recoverySQL(ctx, client, endpoint, "/db/execute", user, password, []any{[]any{
+		"INSERT INTO meta(key,value) SELECT 'deployment_recovery_marker', value || ':' || ? FROM meta WHERE key='state_epoch' ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+		id,
+	}})
+	return err
 }
 
 func loadRecoveryPoints(root string) ([]recoveryPoint, error) {
@@ -346,36 +376,120 @@ func (runtime *HostRuntime) recoveryClient() (*http.Client, string, string, erro
 		(endpoint.Path != "" && endpoint.Path != "/") || endpoint.RawQuery != "" || endpoint.Fragment != "" {
 		return nil, "", "", errors.New("rqlite recovery requires the configured HTTPS authority address")
 	}
-	ca, err := readRecoveryConfig(config.RQLiteCAFile, false)
+	ca, err := readRecoveryConfig(config.RQLiteBackupCA, false)
 	if err != nil {
 		return nil, "", "", err
 	}
+	auth, err := readRecoveryConfig(config.RQLiteBackupAuth, true)
+	if err != nil {
+		return nil, "", "", err
+	}
+	client, password, err := newRecoveryClient(ca, auth)
+	return client, strings.TrimRight(endpoint.String(), "/"), password, err
+}
+
+// ProbeInstalledBackupReader verifies that the supplied credentials and CA
+// work against the live, local authority without changing business state.
+func ProbeInstalledBackupReader(ctx context.Context, ca, auth []byte) error {
+	client, password, err := newRecoveryClient(ca, auth)
+	if err != nil {
+		return err
+	}
+	defer client.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	const expected = "agent-vm-backup-preflight"
+	got, err := recoverySQL(ctx, client, "https://127.0.0.1:4001", "/db/query?level=linearizable",
+		"agent-vm-backup", password, []string{"SELECT '" + expected + "'"})
+	if err != nil || len(got.Values) != 1 || len(got.Values[0]) != 1 || got.Values[0][0] != expected {
+		return errors.New("live rqlite did not confirm the restricted backup identity over TLS")
+	}
+	return nil
+}
+
+func newRecoveryClient(ca, auth []byte) (*http.Client, string, error) {
+	client, err := recoveryTLSClient(ca)
+	if err != nil {
+		return nil, "", err
+	}
+	var credential backupCredential
+	if json.Unmarshal(auth, &credential) != nil || !validBackupPassword(credential.Password) {
+		return nil, "", errors.New("rqlite recovery credential is invalid")
+	}
+	return client, credential.Password, nil
+}
+
+func recoveryTLSClient(ca []byte) (*http.Client, error) {
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(ca) {
-		return nil, "", "", errors.New("rqlite recovery CA is invalid")
+		return nil, errors.New("rqlite recovery CA is invalid")
 	}
-	auth, err := readRecoveryConfig(config.RQLiteAuthFile, true)
-	if err != nil {
-		return nil, "", "", err
+	return &http.Client{
+		Transport:     &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Timeout:       5 * time.Minute,
+	}, nil
+}
+
+type backupCredential struct {
+	Password string `json:"password"`
+}
+
+func validBackupPassword(value string) bool {
+	return strings.TrimSpace(value) != "" && !strings.HasPrefix(value, "<")
+}
+
+// ExportBackupCredential selects only the identity used by the backup client.
+func ExportBackupCredential(auth []byte) ([]byte, error) {
+	var users []struct {
+		Username string   `json:"username"`
+		Password string   `json:"password"`
+		Perms    []string `json:"perms"`
 	}
-	var users []struct{ Username, Password string }
 	if json.Unmarshal(auth, &users) != nil {
-		return nil, "", "", errors.New("rqlite recovery credentials are invalid")
+		return nil, errors.New("invalid rqlite authentication input")
+	}
+	var selected string
+	for _, user := range users {
+		if user.Username != "agent-vm-backup" {
+			continue
+		}
+		if selected != "" || !validBackupPassword(user.Password) {
+			return nil, errors.New("invalid or duplicate rqlite backup credential")
+		}
+		perms := make(map[string]bool)
+		for _, perm := range user.Perms {
+			switch perm {
+			case "backup", "query", "ready", "status":
+				perms[perm] = true
+			default:
+				return nil, errors.New("rqlite backup identity exceeds permitted access")
+			}
+		}
+		if !perms["backup"] || !perms["query"] {
+			return nil, errors.New("rqlite backup identity needs backup and query permissions")
+		}
+		selected = user.Password
+	}
+	if selected == "" {
+		return nil, errors.New("rqlite backup credential is missing")
 	}
 	for _, user := range users {
-		if user.Username == "agent-vm-backup" && user.Password != "" && !strings.HasPrefix(user.Password, "<") {
-			return &http.Client{
-				Transport:     &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
-				CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-				Timeout:       5 * time.Minute,
-			}, strings.TrimRight(endpoint.String(), "/"), user.Password, nil
+		if user.Username != "agent-vm-backup" && user.Password == selected {
+			return nil, errors.New("rqlite backup password must not be shared with another identity")
 		}
 	}
-	return nil, "", "", errors.New("rqlite backup credential is missing")
+	return json.Marshal(backupCredential{Password: selected})
 }
 
 func readRecoveryConfig(path string, secret bool) ([]byte, error) {
-	info, err := os.Lstat(path)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, errors.New("cannot open protected rqlite recovery configuration")
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 ||
 		(secret && info.Mode().Perm()&0o037 != 0) || info.Size() > 1<<20 {
 		return nil, errors.New("rqlite recovery configuration is not a protected regular file")
@@ -384,7 +498,11 @@ func readRecoveryConfig(path string, secret bool) ([]byte, error) {
 	if !ok || stat.Uid != 0 && stat.Uid != uint32(os.Geteuid()) {
 		return nil, errors.New("rqlite recovery configuration has an untrusted owner")
 	}
-	return os.ReadFile(path)
+	data, err := io.ReadAll(io.LimitReader(file, 1<<20+1))
+	if err == nil && len(data) > 1<<20 {
+		return nil, errors.New("rqlite recovery configuration is too large")
+	}
+	return data, err
 }
 
 const recoveryMarkerQuery = "SELECT value FROM meta WHERE key='deployment_recovery_marker'"

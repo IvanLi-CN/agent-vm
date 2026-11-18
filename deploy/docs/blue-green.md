@@ -24,6 +24,7 @@
   Caddyfile
   caddy.env
   rqlite/auth.json
+  backup/{auth.json,ca.crt}
   tls/caddy/{server.crt,server.key}
   tls/rqlite/{server.crt,server.key}
   deployd.json
@@ -46,6 +47,8 @@
 `agent-vm-native@.service` 为每个槽位启动一个 Go 服务，并使用该槽位目录中的 manifest。两个槽位可以同时存活并接受只读观测，但没有有效 controller lease 的槽位不得运行 startup reconcile、timer reconcile、age GC 或任何 scheduler-driven native mutation。
 
 `agent-vm-deployd.service` 位于两个槽位之外，是稳定的宿主级部署控制器，不通过 `Wants=` 拉起蓝、绿槽位。槽位由部署事务显式启动，或由已启用的 systemd 开机配置启动；`After=` 只约束已经排队的启动任务，不会创建槽位启动任务。槽位的 `ExecStartPost` 使用 `agent-vm-deploy wait-process` 等待只读进程接口，接受尚无 controller lease 的 `process_ready=true`，不等待业务 readiness；冷启动时 Deployd 在这一步完成后才检查槽位，避免误停尚未创建 socket 的进程。首次迁移仍先停止旧 SQLite writer，再由事务启动新槽位，不会自动启动额外 writer。
+
+全新安装保留 `/var/lib/agent-vm-native/active/app.sock` 作为 Caddy 和请求适配器的入口。公开的 `active` 链接由 root 持有，指向 `routing/active`；部署事务在 `routing` 内原子更新槽位选择。历史安装的直接链接仍可识别。专用部署账户下由 systemd 持有 `/run/agent-vm-native/deployd.sock`，部署服务重启不会替换监听路径，root 运维 CLI 继续使用原路径。
 
 启动 unit 前，使用随附的 `sysusers.d` 和 `tmpfiles.d` 条目运行 `systemd-sysusers` 与 `systemd-tmpfiles --create`。这些条目创建专用的 rqlite 用户和非特权 `caddy` 用户；`active` 不由 tmpfiles 创建，因为它必须是原子符号链接。
 
@@ -79,6 +82,8 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 将 `rqlite-auth.json.example` 复制为受保护的 `/etc/agent-vm-native/rqlite/auth.json`，再由部署方填入 secret。rqlite unit 将 HTTP 和 Raft 绑定到回环地址，并启用 HTTPS 与 HTTP authentication。
 
+恢复点客户端只读取 `migration.rqlite_backup_auth_file` 和 `migration.rqlite_backup_ca_file`；独立凭据文件只包含 `agent-vm-backup` 的密码，由安装器从认证输入导出。备份账号必须有 `backup` 和 `query`，不能有 `execute`，且不能与业务账号复用密码。旧 SQLite 导入仍使用其受保护的原有认证配置。
+
 每个槽位的 state URL、认证信息和 CA 信任路径必须由部署配置提供，不能写入 release manifest、公开 dashboard 或仓库测试 fixture。Deployd 迁移使用 `deployd.json` 中的 `migration.rqlite_url` 和 `migration.rqlite_unit`，不读取业务 SQLite 之外的隐藏配置。
 
 ## 首次安装与已有环境
@@ -105,11 +110,30 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 ## 普通蓝绿切换
 
-候选包的 `deployment_contract` major 在 stage 前由部署控制服务预检；缺失字段按 legacy v1 兼容，major 不兼容时不创建事务、不启动候选。日常更新通过 SSH 在控制宿主调用 `agent-vm-deploy update`，默认在控制宿主下载并核对当前架构的正式发布包：
+目标宿主须用 `agent-vm-deploy` 专用账户运行部署服务，并为两个槽位配置 `agent-vm-server` 专用账户。旧安装仍以 root 运行时，普通 `update` 会在获取产物或修改槽位前拒绝。不要用底层阶段命令绕过账户迁移，也不要在旧槽仍以 root 运行时把该槽的程序目录交给常驻账户写入。
+
+对已有安装，可使用同一正式版本的 `agent-vm-deploy install --config <输入> --bundle <产品包> --materials <资料目录> --check-account-migration` 进行只读预检。预检返回候选包摘要、现役槽位和上一版本源码修订；它要求现役槽健康且独占控制权、没有未完成部署事务、现场程序与清单一致，并且候选沿用同一 rqlite 和 Incus 环境。预检不能与 `--apply` 一起使用，通过预检也不能替代旧版在专用账户下的隔离回退验证。
+
+候选槽的配置输入须与该槽宿主上已安装的配置逐字节一致；账户迁移只调整服务账户的读取权限。预检还核对输入中的专用备份身份与宿主已安装的 rqlite 认证配置一致，并用提供的 TLS 证书对现役 rqlite 执行一次线性一致的只读查询。这一步不创建恢复点，也不变更 rqlite 权限。
+
+账户迁移为两槽配置私有挂载，使任一槽运行旧版时都能使用同一个共享锁目录。预检要求两个槽的 Incus 存储路径及已有锁目录均由 root 保护，路径中不能有符号链接。部署不授予主服务对 Incus 存储池的写权限。
+
+只有在隔离 Linux 主机上用相同产物完成账户迁移、连续登录和业务读写检查，并证明原版本能以专用账户回退后，才将该次验收的身份记录作为宿主维护输入。记录是 root 持有的 JSON 文件，`schema_version` 为 1；`previous_source_revision`、`previous_release_id`、`candidate_source_revision`、`candidate_bundle_sha256`、`materials_manifest_sha256` 分别绑定验收使用的版本和产物。不要用生产预检结果代替隔离验收。
 
 ```sh
-ssh <configured-control-alias> agent-vm-deploy update \
-  --version <semver> --source-revision <40-char-source-sha>
+agent-vm-deploy install --config <输入> --bundle <正式产品包> \
+  --materials <资料目录> --apply --account-migration-proof <验收记录>
+```
+
+命令先核对正式发布和验收记录，再使用现有蓝绿事务准备并激活候选槽。命令返回事务 ID 后如果报错，先用 `agent-vm-deploy transaction --transaction <ID>` 检查原事务和当前槽位，避免重新发起切换。只有部署控制服务已用专用账户接管并确认新槽持有原状态权威，命令才报告迁移完成。
+
+候选包的 `deployment_contract` major 在 stage 前由部署控制服务预检；缺失字段按 legacy v1 兼容，major 不兼容时不创建事务、不启动候选。普通更新和后续事务操作都使用部署控制服务对应的 CLI：全新安装使用 `/opt/agent-vm-native/bin/agent-vm-deploy`；完成旧安装账户迁移后使用 `/opt/agent-vm-native/maintenance/agent-vm-deploy`。以下命令在控制宿主执行，先按安装方式设置 `deploy_cli`。默认由控制宿主下载并核对当前架构的正式发布包：
+
+```sh
+deploy_cli=/opt/agent-vm-native/bin/agent-vm-deploy
+# 完成旧安装账户迁移后，改用：
+# deploy_cli=/opt/agent-vm-native/maintenance/agent-vm-deploy
+sudo "$deploy_cli" update --version '<semver>' --source-revision '<40-char-source-sha>'
 ```
 
 需要指定文件时，在控制宿主的受保护目录放置正式完整包，并给同一命令添加 `--bundle /protected/path/release.tar`。若同时使用 `--server-file /protected/path/agent-vm-server`，该文件须与包内产物字节一致。两种输入都核对正式发布摘要、版本、源码和架构。使用[发布合同](../../docs/specs/agent-vm/contracts/release.md)中的恢复点门禁；收到 `backup_storage_exhausted` 时现役槽继续服务，不绕过门禁切换或回退。
@@ -117,10 +141,10 @@ ssh <configured-control-alias> agent-vm-deploy update \
 恢复或诊断时仍可直接查询原事务并执行受限阶段命令：
 
 ```sh
-sudo /opt/agent-vm-native/bin/agent-vm-deploy stage --slot green --bundle '<已验证的发布包>'
-sudo /opt/agent-vm-native/bin/agent-vm-deploy verify --transaction '<transaction-id>'
-sudo /opt/agent-vm-native/bin/agent-vm-deploy activate --transaction '<transaction-id>'
-sudo /opt/agent-vm-native/bin/agent-vm-deploy transaction --transaction '<transaction-id>' --json
+sudo "$deploy_cli" stage --slot green --bundle '<已验证的发布包>'
+sudo "$deploy_cli" verify --transaction '<transaction-id>'
+sudo "$deploy_cli" activate --transaction '<transaction-id>'
+sudo "$deploy_cli" transaction --transaction '<transaction-id>' --json
 ```
 
 Deployd 启动候选槽位，验证 manifest、socket、就绪状态、状态能力和阶段证据绑定的 `state_authority`；然后授予候选 controller lease，确认 readiness 后启用 traffic role，原子替换 `active`，让旧槽位进入 retiring 并排空。Deployd 必须重新观测旧槽位已停止、目标槽位仍持有唯一 controller lease 且继续接收流量，才能进入 finalize。
@@ -132,16 +156,18 @@ Deployd 启动候选槽位，验证 manifest、socket、就绪状态、状态能
 查询原事务，确认存在已验证的上一槽位且尚未消耗回滚额度后，可以显式执行一次有界回滚；回滚只切换发布和角色，不回退业务数据库：
 
 ```sh
-sudo /opt/agent-vm-native/bin/agent-vm-deploy transaction --transaction '<原事务ID>' --json
-sudo /opt/agent-vm-native/bin/agent-vm-deploy rollback --transaction '<原事务ID>'
-sudo /opt/agent-vm-native/bin/agent-vm-deploy status --json
+sudo "$deploy_cli" transaction --transaction '<原事务ID>' --json
+sudo "$deploy_cli" rollback --transaction '<原事务ID>'
+sudo "$deploy_cli" status --json
 ```
+
+回滚先在后台启动上一版本，现役槽继续接流。上一版本能接手后，部署控制服务交接唯一控制权和流量，再排空并停止原现役进程。上一版本首启加两次重试均失败，且现役槽仍经确认持有唯一控制权并正常接流时，本次回滚以 `rollback_previous_unavailable` 结束，现役槽继续服务。启动次数写入原部署事务；部署控制服务重启不会清零，也不会尝试更早的版本。
 
 事务进入 `needs_recovery` 时，普通 `activate` 或 `rollback` 不代替恢复动作。保留原 ID，选择回到已验证上一槽位的恢复：
 
 ```sh
-sudo /opt/agent-vm-native/bin/agent-vm-deploy recover --transaction '<原事务ID>' --action rollback
-sudo /opt/agent-vm-native/bin/agent-vm-deploy transaction --transaction '<原事务ID>' --json
+sudo "$deploy_cli" recover --transaction '<原事务ID>' --action rollback
+sudo "$deploy_cli" transaction --transaction '<原事务ID>' --json
 ```
 
 只有 active 已切到原候选且候选产物、状态权威、进程与旧槽静止证据均可重新验证时，才可选择 `recover --transaction '<原事务ID>' --action finalize` 完成原切换。active 尚不存在的首次初始化使用[首次安装恢复](install.md)中的 `resume-bootstrap`，不能互换。证据不足时保持 fencing，不得手工改写业务状态或部署事务。

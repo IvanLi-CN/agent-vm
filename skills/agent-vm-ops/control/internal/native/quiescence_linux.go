@@ -72,14 +72,24 @@ func (c *IncusClient) VerifyRecoveryQuiescence(ctx context.Context) error {
 	if err := verify(true); err != nil {
 		return err
 	}
+	var clearErr error
+	if c.HostObservationSlot != "" {
+		_, clearErr = c.readHostObservation(ctx, "incus-quiet")
+	} else {
+		clearErr = c.verifyIncusOperationsClear(ctx)
+	}
+	if clearErr != nil {
+		return clearErr
+	}
+	return verify(false)
+}
+
+func (c *IncusClient) verifyIncusOperationsClear(ctx context.Context) error {
 	result, err := c.Runner.Run(ctx, []string{"incus", "operation", "list", "--all-projects", "--format=json"}, nil)
 	if err != nil || result.Code != 0 || result.StdoutTruncated || result.StderrTruncated {
 		return errors.New("native background operations cannot be verified")
 	}
-	if err := recoveryOperationsClear(result.Stdout); err != nil {
-		return err
-	}
-	return verify(false)
+	return recoveryOperationsClear(result.Stdout)
 }
 
 // recoveryUnitGroup accepts only a fixed systemd unit's protected process
@@ -127,6 +137,14 @@ func recoveryOperationsClear(output []byte) error {
 		return errors.New("native background operations are not clear")
 	}
 	return nil
+}
+
+func VerifyStoppedSlotCgroup(slot string) error {
+	if slot != "blue" && slot != "green" {
+		return errors.New("invalid control slot")
+	}
+	group := filepath.Join(`/sys/fs/cgroup/system.slice/system-agent\x2dvm\x2dnative.slice`, "agent-vm-native@"+slot+".service")
+	return checkRecoveryCgroup(group, 0)
 }
 
 func checkRecoveryCgroup(directory string, self int) error {

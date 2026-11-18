@@ -25,8 +25,9 @@ import (
 )
 
 type HostRuntime struct {
-	Config   Config
-	unitRoot string
+	Config         Config
+	unitRoot       string
+	recoveryMarker func(context.Context, string) error
 
 	mu                  sync.Mutex
 	metrics             map[string]map[string]map[string]string
@@ -34,6 +35,10 @@ type HostRuntime struct {
 	stagedProcess       map[string]processIdentity
 	quiesced            map[string]quiescenceEvidence
 	legacyAuthorityLock *native.AuthorityLock
+	legacyRelayMu       sync.Mutex
+	legacyRelayConn     net.Conn
+	legacyRelayOwner    legacyLeaseOwner
+	legacyRelayGrants   map[string]controllerrole.Lease
 }
 
 const deploymentContractMajor = 1
@@ -484,19 +489,31 @@ func (runtime *HostRuntime) Stage(ctx context.Context, slot, bundle string) erro
 	if active == slot {
 		return fmt.Errorf("cannot stage over active slot %s", slot)
 	}
+	target := filepath.Join(runtime.Config.ReleaseRoot, "slots", slot)
+	_, targetErr := os.Lstat(target)
+	if targetErr != nil && !errors.Is(targetErr, os.ErrNotExist) {
+		return targetErr
+	}
+	previousFiles := targetErr == nil
+	if !previousFiles {
+		_, backupErr := os.Lstat(filepath.Join(filepath.Dir(target), "."+slot+".previous-stage"))
+		if !errors.Is(backupErr, os.ErrNotExist) {
+			return errors.New("vacant slot has an unresolved previous stage backup")
+		}
+	}
 	previousProcess, previousProcessOK := runtime.readProcessIdentity(ctx, slot)
-	if err := runtime.stageBundle(slot, bundle); err != nil {
+	if err := runtime.stageBundle(ctx, slot, bundle); err != nil {
 		return err
 	}
 	if err := runtime.systemctl(ctx, "restart", "agent-vm-native@"+slot+".service"); err != nil {
-		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, err)
+		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, previousFiles, err)
 	}
 	currentProcess, err := runtime.waitSlotIdentity(ctx, slot, previousProcess, previousProcessOK)
 	if err != nil {
-		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, err)
+		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, previousFiles, err)
 	}
 	if err := runtime.ExitDrain(ctx, slot); err != nil {
-		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, err)
+		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, previousFiles, err)
 	}
 	if err := runtime.discardStagedBackup(slot); err != nil {
 		return &UncertainError{Cause: fmt.Errorf("stage completed but previous slot backup could not be removed: %w", err)}
@@ -633,7 +650,12 @@ func inspectBundle(bundle string) (map[string]any, []byte, []byte, os.FileMode, 
 	return manifest, manifestBytes, controlBytes, controlInfo.Mode().Perm(), nil
 }
 
-func (runtime *HostRuntime) stageBundle(slot, bundle string) error {
+func (runtime *HostRuntime) stageBundle(ctx context.Context, slot, bundle string) error {
+	if isDeployAccount(os.Geteuid()) {
+		if err := verifyUnprivilegedSlots(ctx); err != nil {
+			return err
+		}
+	}
 	root := filepath.Join(runtime.Config.ReleaseRoot, "slots")
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return fmt.Errorf("prepare slot root: %w", err)
@@ -703,7 +725,7 @@ func restoreStagedSlot(root, slot string) error {
 	return syncDirectory(root)
 }
 
-func (runtime *HostRuntime) restoreAfterStageFailure(ctx context.Context, slot string, previousProcess processIdentity, previousProcessOK bool, cause error) error {
+func (runtime *HostRuntime) restoreAfterStageFailure(ctx context.Context, slot string, previousProcess processIdentity, previousProcessOK, previousFiles bool, cause error) error {
 	if err := runtime.systemctl(ctx, "stop", "agent-vm-native@"+slot+".service"); err != nil {
 		return &UncertainError{Cause: fmt.Errorf("stage failed and slot could not be stopped: %w; original error: %v", err, cause)}
 	}
@@ -711,6 +733,15 @@ func (runtime *HostRuntime) restoreAfterStageFailure(ctx context.Context, slot s
 		return &UncertainError{Cause: fmt.Errorf("stage failed but slot stop was not verified; original error: %v", cause)}
 	}
 	root := filepath.Join(runtime.Config.ReleaseRoot, "slots")
+	if !previousFiles {
+		if err := os.RemoveAll(filepath.Join(root, slot)); err != nil {
+			return &UncertainError{Cause: fmt.Errorf("stage failed and vacant slot could not be restored: %w; original error: %v", err, cause)}
+		}
+		if err := syncDirectory(root); err != nil {
+			return &UncertainError{Cause: fmt.Errorf("stage failed and vacant slot restoration could not be synced: %w; original error: %v", err, cause)}
+		}
+		return fmt.Errorf("stage failed and vacant slot was restored: %w", cause)
+	}
 	if err := restoreStagedSlot(root, slot); err != nil {
 		return &UncertainError{Cause: fmt.Errorf("stage failed and previous slot could not be restored: %w; original error: %v", err, cause)}
 	}
@@ -742,12 +773,17 @@ func (runtime *HostRuntime) ensureSlotSocketLink(root, slot string) error {
 	if err := os.Symlink(runtime.socket(slot), link); err != nil {
 		return fmt.Errorf("create %s app.sock link: %w", slot, err)
 	}
-	// MkdirTemp uses 0700 even when the daemon's group is the proxy read group.
-	// The proxy must traverse the published slot to reach this socket link.
-	if err := os.Chmod(root, 0o750); err != nil {
-		return fmt.Errorf("prepare %s proxy socket traversal: %w", slot, err)
-	}
-	return nil
+	// Extraction runs with a private umask. Once verified, the server must be
+	// able to traverse the published directories as a different account.
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || !entry.IsDir() {
+			return err
+		}
+		if err := os.Chmod(path, 0o750); err != nil {
+			return fmt.Errorf("prepare %s slot directory traversal: %w", slot, err)
+		}
+		return nil
+	})
 }
 
 func (runtime *HostRuntime) verifySlotSocketLink(root, slot string) error {
@@ -1121,11 +1157,18 @@ func (runtime *HostRuntime) SwitchActive(ctx context.Context, slot string) error
 	if err != nil || !info.IsDir() {
 		return fmt.Errorf("slot directory is not available: %s", target)
 	}
-	parent := filepath.Dir(runtime.Config.ActivePath)
+	activePath, err := EffectiveActivePath(runtime.Config.ActivePath)
+	if err != nil {
+		return err
+	}
+	if isDeployAccount(os.Geteuid()) && activePath != ManagedRoute {
+		return errors.New("managed routing path missing; complete host permission maintenance before switching traffic")
+	}
+	parent := filepath.Dir(activePath)
 	if err := os.MkdirAll(parent, 0o750); err != nil {
 		return err
 	}
-	if info, err := os.Lstat(runtime.Config.ActivePath); err == nil && info.Mode()&os.ModeSymlink == 0 {
+	if info, err := os.Lstat(activePath); err == nil && info.Mode()&os.ModeSymlink == 0 {
 		return errors.New("active path is not a symlink")
 	}
 	// The selected slot must be part of the next systemd boot before routing
@@ -1139,7 +1182,7 @@ func (runtime *HostRuntime) SwitchActive(ctx context.Context, slot string) error
 		return err
 	}
 	defer os.Remove(temporary)
-	if err := os.Rename(temporary, runtime.Config.ActivePath); err != nil {
+	if err := os.Rename(temporary, activePath); err != nil {
 		return &UncertainError{Cause: err}
 	}
 	directory, err := os.Open(parent)
@@ -1203,9 +1246,6 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 	if slot == "" || slot == "none" {
 		return nil
 	}
-	runtime.mu.Lock()
-	runtime.quiesced[slot] = quiescenceEvidence{}
-	runtime.mu.Unlock()
 	status, statusCode, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-status"})
 	if err != nil {
 		return err
@@ -1221,6 +1261,13 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 	if !ok || !draining {
 		return errors.New("old slot is not fenced for drain")
 	}
+	return runtime.waitForSlotQuiescence(ctx, slot)
+}
+
+func (runtime *HostRuntime) waitForSlotQuiescence(ctx context.Context, slot string) error {
+	runtime.mu.Lock()
+	delete(runtime.quiesced, slot)
+	runtime.mu.Unlock()
 	deadline := time.NewTimer(15 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -1306,72 +1353,72 @@ func quiescenceEvidenceProvesStopped(evidence quiescenceEvidence) bool {
 	return evidence.StopRequested && evidence.Process.PID > 0 && evidence.Process.StartTime != ""
 }
 
-func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease, authority string) error {
-	if target != "" && target != "none" {
-		if runtime.systemdSlotStopped(ctx, target) {
-			if err := runtime.systemctl(ctx, "start", "agent-vm-native@"+target+".service"); err != nil {
-				return fmt.Errorf("restart stopped rollback target: %w", err)
-			}
-			if err := runtime.waitSlot(ctx, target); err != nil {
-				return fmt.Errorf("wait for restarted rollback target: %w", err)
-			}
-		}
-		if err := runtime.DisableTraffic(ctx, target); err != nil {
-			return err
-		}
-		if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
-			if stopErr := runtime.Stop(ctx, target); stopErr != nil {
-				return fmt.Errorf("revoke target controller: %w; stop target after revoke failure: %v", err, stopErr)
-			}
-		} else {
-			if err := runtime.resumeRollbackDrainExit(ctx, target); err != nil {
-				return err
-			}
-			if err := runtime.Drain(ctx, target); err != nil {
-				return err
-			}
-			if err := runtime.Quiesce(ctx, target); err != nil {
-				return err
-			}
-			if err := runtime.Stop(ctx, target); err != nil {
-				return fmt.Errorf("stop target after revoke: %w", err)
-			}
-		}
-	}
-	if previous != "" && previous != "none" {
-		// Restart even when systemd still reports the previous process as active:
-		// controller fencing can leave a resident process alive but not ready, and
-		// startup reconciliation is the only supported path back to admission.
+func (runtime *HostRuntime) PrepareRollback(ctx context.Context, previous string, authority string, active SlotObservation) error {
+	// An interrupted handoff may already have left the previous version serving.
+	// Otherwise boot it fenced while the selected slot keeps its existing lease.
+	if active.Slot != previous || !active.ControllerOwned || !active.TrafficAccepting {
 		if err := runtime.startRollbackPrevious(ctx, previous); err != nil {
 			return err
 		}
-		body, status, err := runtime.slotRequest(ctx, runtime.socket(previous), http.MethodGet, "/internal/v1/health", nil)
-		observedAuthority, _ := body["state_authority"].(string)
-		if err != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) || body["process_ready"] != true || observedAuthority != authority || authority == "" {
-			return errors.New("rollback state authority was not verified before granting controller")
+	}
+	body, status, err := runtime.slotRequest(ctx, runtime.socket(previous), http.MethodGet, "/internal/v1/health", nil)
+	if err != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) || body["process_ready"] != true || authority == "" || body["state_authority"] != authority {
+		return errors.New("rollback state authority was not verified before granting controller")
+	}
+	process, processOK := processIdentityFromHealth(body)
+	if !processOK {
+		return errors.New("rollback process identity is invalid")
+	}
+	runtime.mu.Lock()
+	runtime.stagedProcess[previous] = process
+	runtime.mu.Unlock()
+	return nil
+}
+
+func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease, _ string) error {
+	retire := target != "" && target != "none" && !runtime.systemdSlotStopped(ctx, target)
+	if retire {
+		if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
+			return err
 		}
-		process, processOK := processIdentityFromHealth(body)
-		if !processOK {
-			return errors.New("rollback process identity is invalid")
-		}
-		runtime.mu.Lock()
-		runtime.stagedProcess[previous] = process
-		runtime.mu.Unlock()
-		lease.Expiry = time.Now().Add(runtime.Config.LeaseDuration())
-		if err := runtime.GrantController(ctx, previous, lease); err != nil {
+		if err := runtime.resumeRollbackDrainExit(ctx, target); err != nil {
 			return err
 		}
 	}
-	if previous == "" || previous == "none" {
-		return nil
+	lease.Expiry = time.Now().Add(runtime.Config.LeaseDuration())
+	if err := runtime.GrantController(ctx, previous, lease); err != nil {
+		return err
+	}
+	manager := NewManager(nil, runtime, runtime.Config.LeaseDuration(), time.Now)
+	ctx, stop := manager.beginTransactionRenewal(ctx, lease)
+	defer stop()
+	if err := runtime.ExitDrain(ctx, previous); err != nil {
+		return fmt.Errorf("exit rollback drain on slot %s: %w", previous, err)
+	}
+	waitReady, ok := ctx.Value(rollbackReadyKey{}).(func(context.Context, string) error)
+	if !ok {
+		return errors.New("rollback requires a readiness wait before enabling traffic")
+	}
+	if err := waitReady(ctx, previous); err != nil {
+		return err
+	}
+	if err := runtime.EnableTraffic(ctx, previous); err != nil {
+		return err
 	}
 	if err := runtime.SwitchActive(ctx, previous); err != nil {
 		return err
 	}
-	if err := runtime.ExitDrain(ctx, previous); err != nil {
-		return fmt.Errorf("exit rollback drain on slot %s: %w", previous, err)
+	if retire {
+		// This process already lost its controller lease. Wait for its
+		// remaining work without changing shared admission on the new slot.
+		if err := runtime.waitForSlotQuiescence(ctx, target); err != nil {
+			return err
+		}
+		if err := runtime.Stop(ctx, target); err != nil {
+			return fmt.Errorf("stop retired slot after rollback: %w", err)
+		}
 	}
-	return nil
+	return stop()
 }
 
 func (runtime *HostRuntime) waitSlot(ctx context.Context, slot string) error {
@@ -1456,7 +1503,11 @@ func (runtime *HostRuntime) socket(slot string) string {
 }
 
 func (runtime *HostRuntime) activeSlot() (string, error) {
-	target, err := os.Readlink(runtime.Config.ActivePath)
+	activePath, err := EffectiveActivePath(runtime.Config.ActivePath)
+	if err != nil {
+		return "", err
+	}
+	target, err := os.Readlink(activePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", errors.New("active link is missing")
 	}
@@ -1465,7 +1516,7 @@ func (runtime *HostRuntime) activeSlot() (string, error) {
 	}
 	target = filepath.Clean(target)
 	if !filepath.IsAbs(target) {
-		target = filepath.Join(filepath.Dir(runtime.Config.ActivePath), target)
+		target = filepath.Join(filepath.Dir(activePath), target)
 	}
 	for _, slot := range []string{"blue", "green"} {
 		if target == filepath.Join(runtime.Config.ReleaseRoot, "slots", slot) {
@@ -1665,25 +1716,13 @@ func validateSourceResult(action string, result map[string]any) error {
 }
 
 func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, path string, value any) (map[string]any, int, error) {
-	var body io.Reader
+	var body json.RawMessage
 	if value != nil {
 		encoded, err := json.Marshal(value)
 		if err != nil {
 			return nil, 0, err
 		}
-		body = bytes.NewReader(encoded)
-	}
-	transport := &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, "unix", socket)
-	}}
-	defer transport.CloseIdleConnections()
-	request, err := http.NewRequestWithContext(ctx, method, "http://unix"+path, body)
-	if err != nil {
-		return nil, 0, err
-	}
-	if value != nil {
-		request.Header.Set("Content-Type", "application/json")
+		body = encoded
 	}
 	timeout := 10 * time.Second
 	if path == "/internal/v1/control" {
@@ -1691,7 +1730,43 @@ func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, pat
 			timeout = 240 * time.Second
 		}
 	}
-	response, err := (&http.Client{Transport: transport, Timeout: timeout}).Do(request)
+	result, status, err := callSlot(ctx, socket, method, path, body, timeout, -1)
+	if err == nil && status == http.StatusForbidden && isDeployAccount(os.Geteuid()) && runtime.Config.BlueSocket == Defaults().BlueSocket && runtime.Config.GreenSocket == Defaults().GreenSocket {
+		failure, _ := result["error"].(map[string]any)
+		if failure["code"] == "peer_unauthorized" {
+			for _, slot := range []string{"blue", "green"} {
+				request := slotRelayRequest{Slot: slot, Method: method, Path: path, Body: body}
+				if runtime.socket(slot) == socket && request.valid() {
+					return runtime.relayHistoricalSlot(ctx, request, timeout)
+				}
+			}
+		}
+	}
+	return result, status, err
+}
+
+func callSlot(ctx context.Context, socket, method, path string, body json.RawMessage, timeout time.Duration, expectedUID int) (map[string]any, int, error) {
+	transport := &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var dialer net.Dialer
+		conn, err := dialer.DialContext(ctx, "unix", socket)
+		if err == nil && expectedUID >= 0 {
+			uid, peerErr := peerUID(conn)
+			if peerErr != nil || uid != expectedUID {
+				_ = conn.Close()
+				return nil, errors.New("slot socket is not owned by the server account")
+			}
+		}
+		return conn, err
+	}}
+	defer transport.CloseIdleConnections()
+	request, err := http.NewRequestWithContext(ctx, method, "http://unix"+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(body) != 0 {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	response, err := (&http.Client{Transport: transport, Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Do(request)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -1722,7 +1797,7 @@ func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, pat
 }
 
 func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) error {
-	if action != "start" && action != "stop" && action != "restart" && action != "enable" && action != "reset-failed" {
+	if action != "start" && action != "stop" && action != "restart" && action != "enable" && action != "reset-failed" && action != "restore-restart-policy" {
 		return errors.New("unsupported systemd action")
 	}
 	if action == "reset-failed" && unit != "agent-vm-native@blue.service" && unit != "agent-vm-native@green.service" {
@@ -1731,8 +1806,39 @@ func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) 
 	if !strings.HasPrefix(unit, "agent-vm-native@") || !strings.HasSuffix(unit, ".service") {
 		return errors.New("unsupported systemd unit")
 	}
+	slot := strings.TrimSuffix(strings.TrimPrefix(unit, "agent-vm-native@"), ".service")
+	if err := validSlot(slot); err != nil {
+		return err
+	}
+	if isDeployAccount(os.Geteuid()) {
+		defaults := Defaults()
+		if runtime.Config.ReleaseRoot != defaults.ReleaseRoot {
+			return errors.New("deployment host actions require the installed release root")
+		}
+		request := hostAction{Action: action, Slot: slot}
+		if action == "start" || action == "restart" || action == "restore-restart-policy" {
+			metadata, err := releaseManifest.LoadMetadata(filepath.Join(runtime.Config.ReleaseRoot, "slots", slot, "release-manifest.json"))
+			if err != nil {
+				return err
+			}
+			switch metadata.ServerBinary {
+			case "agent-vm-server":
+				request.Layout = "server"
+			case "agent-vm-control":
+				request.Layout = "control"
+			default:
+				return errors.New("unsupported slot layout")
+			}
+			if action != "restore-restart-policy" {
+				request.Rollback, _ = ctx.Value(rollbackUnitKey{}).(bool)
+			}
+		}
+		return dispatchHostAction(ctx, request)
+	}
+	if action == "restore-restart-policy" {
+		return runtime.configureSlotUnit(ctx, slot, false)
+	}
 	if action == "start" || action == "restart" {
-		slot := strings.TrimSuffix(strings.TrimPrefix(unit, "agent-vm-native@"), ".service")
 		rollback, _ := ctx.Value(rollbackUnitKey{}).(bool)
 		if err := runtime.configureSlotUnit(ctx, slot, rollback); err != nil {
 			return err
@@ -1814,6 +1920,27 @@ func (runtime *HostRuntime) systemdSlotStopped(ctx context.Context, slot string)
 		return false
 	}
 	return systemdSlotStoppedProperties(parseSystemdProperties(string(output)))
+}
+
+func (runtime *HostRuntime) verifyFailedRollbackSlotStopped(ctx context.Context, slot string) bool {
+	if validSlot(slot) != nil {
+		return false
+	}
+	unit := "agent-vm-native@" + slot + ".service"
+	stopped := func() bool {
+		output, err := exec.CommandContext(ctx, "systemctl", "show", unit,
+			"--property=LoadState", "--property=ActiveState", "--property=SubState",
+			"--property=MainPID", "--property=FragmentPath", "--property=Slice",
+			"--property=ControlGroup", "--property=KillMode", "--property=Delegate").Output()
+		properties := parseSystemdProperties(string(output))
+		const slice = `system-agent\x2dvm\x2dnative.slice`
+		group := "/system.slice/" + slice + "/" + unit
+		return err == nil && systemdSlotStoppedProperties(properties) &&
+			properties["Slice"] == slice && properties["Delegate"] == "no" &&
+			properties["KillMode"] == "control-group" &&
+			(properties["ControlGroup"] == "" || properties["ControlGroup"] == group)
+	}
+	return stopped() && native.VerifyStoppedSlotCgroup(slot) == nil && stopped()
 }
 
 func systemdSlotStoppedProperties(properties map[string]string) bool {
@@ -2018,7 +2145,10 @@ func (runtime *HostRuntime) configureSlotUnit(ctx context.Context, slot string, 
 }
 
 type rollbackStartKey struct{}
+type rollbackReadyKey struct{}
 type rollbackUnitKey struct{}
+
+var errRollbackStartsExhausted = errors.New("rollback previous version failed after three starts")
 
 func (runtime *HostRuntime) startRollbackPrevious(ctx context.Context, slot string) error {
 	claim, ok := ctx.Value(rollbackStartKey{}).(func() error)
@@ -2039,7 +2169,7 @@ func (runtime *HostRuntime) startRollbackPrevious(ctx context.Context, slot stri
 			last = runtime.waitSlot(startCtx, slot)
 		}
 		if last == nil {
-			return runtime.configureSlotUnit(ctx, slot, false)
+			return runtime.systemctl(ctx, "restore-restart-policy", "agent-vm-native@"+slot+".service")
 		}
 		// Retry only a process proven to have exited, never an unavailable live service.
 		output, err := exec.CommandContext(ctx, "systemctl", "show", "agent-vm-native@"+slot+".service", "--property=ActiveState", "--property=MainPID").Output()
@@ -2048,5 +2178,8 @@ func (runtime *HostRuntime) startRollbackPrevious(ctx context.Context, slot stri
 			return last
 		}
 	}
-	return fmt.Errorf("rollback previous version failed after three starts: %w", last)
+	if err := runtime.systemctl(ctx, "reset-failed", "agent-vm-native@"+slot+".service"); err != nil {
+		return errors.Join(last, err)
+	}
+	return errors.Join(errRollbackStartsExhausted, last)
 }

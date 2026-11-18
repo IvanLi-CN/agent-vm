@@ -26,19 +26,22 @@ type target struct {
 }
 
 var targets = map[string]target{
-	"metrics_certificate": {"/etc/agent-vm-native/tls/metrics/server.crt", "agent-vm-web", 0640},
-	"metrics_private_key": {"/etc/agent-vm-native/tls/metrics/server.key", "agent-vm-web", 0640},
-	"metrics_client_ca":   {"/etc/agent-vm-native/tls/metrics/client-ca.crt", "agent-vm-web", 0640},
-	"blue_config":         {"/etc/agent-vm-native/slots/blue/config.json", "agent-vm-web", 0640},
-	"green_config":        {"/etc/agent-vm-native/slots/green/config.json", "agent-vm-web", 0640},
-	"deployd_config":      {"/etc/agent-vm-native/deployd.json", "agent-vm-web", 0640},
-	"caddy_config":        {"/etc/agent-vm-native/Caddyfile", "agent-vm-web", 0640},
-	"caddy_environment":   {"/etc/agent-vm-native/caddy.env", "agent-vm-web", 0640},
-	"rqlite_auth":         {"/etc/agent-vm-native/rqlite/auth.json", "agent-vm-rqlite", 0640},
-	"rqlite_certificate":  {"/etc/agent-vm-native/tls/rqlite/server.crt", "agent-vm-rqlite", 0640},
-	"rqlite_private_key":  {"/etc/agent-vm-native/tls/rqlite/server.key", "agent-vm-rqlite", 0640},
-	"caddy_certificate":   {"/etc/agent-vm-native/tls/caddy/server.crt", "agent-vm-web", 0640},
-	"caddy_private_key":   {"/etc/agent-vm-native/tls/caddy/server.key", "agent-vm-web", 0640},
+	"incus_client_certificate": {"/etc/agent-vm-native/incus/client.crt", "agent-vm-server", 0640},
+	"incus_client_private_key": {"/etc/agent-vm-native/incus/client.key", "agent-vm-server", 0640},
+	"incus_server_certificate": {"/etc/agent-vm-native/incus/servercerts/agent-vm.crt", "agent-vm-server", 0640},
+	"metrics_certificate":      {"/etc/agent-vm-native/tls/metrics/server.crt", "agent-vm-web", 0640},
+	"metrics_private_key":      {"/etc/agent-vm-native/tls/metrics/server.key", "agent-vm-deploy", 0640},
+	"metrics_client_ca":        {"/etc/agent-vm-native/tls/metrics/client-ca.crt", "agent-vm-web", 0640},
+	"blue_config":              {"/etc/agent-vm-native/slots/blue/config.json", "agent-vm-server", 0640},
+	"green_config":             {"/etc/agent-vm-native/slots/green/config.json", "agent-vm-server", 0640},
+	"deployd_config":           {"/etc/agent-vm-native/deployd.json", "agent-vm-deploy", 0640},
+	"caddy_config":             {"/etc/agent-vm-native/Caddyfile", "agent-vm-web", 0640},
+	"caddy_environment":        {"/etc/agent-vm-native/caddy.env", "agent-vm-web", 0640},
+	"rqlite_auth":              {"/etc/agent-vm-native/rqlite/auth.json", "agent-vm-rqlite", 0640},
+	"rqlite_certificate":       {"/etc/agent-vm-native/tls/rqlite/server.crt", "agent-vm-rqlite", 0640},
+	"rqlite_private_key":       {"/etc/agent-vm-native/tls/rqlite/server.key", "agent-vm-rqlite", 0640},
+	"caddy_certificate":        {"/etc/agent-vm-native/tls/caddy/server.crt", "agent-vm-web", 0640},
+	"caddy_private_key":        {"/etc/agent-vm-native/tls/caddy/server.key", "agent-vm-web", 0640},
 }
 
 func LoadConfig(path string) (Config, error) {

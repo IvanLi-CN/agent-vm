@@ -228,6 +228,16 @@ Unix-socket API 提供只读的 `status`、`transaction` 和 `plan` 操作，以
 
 CLI 永远不能直接编辑 `active`。响应丢失时，CLI 返回 deployd transaction ID 和 status；不能创建新事务来猜测 activation 或 rollback 是否发生。
 
+服务账户分离时，部署控制服务通过槽位 Unix socket 读取健康和部署观察、协调角色、管理部署自身的排空标记以及请求写入恢复点覆盖标记。槽位按 peer UID 和操作授权；部署账户不能执行实例变更或读取槽位任意快照。root 仍可运行运维 CLI。主服务通过独立的只读宿主 socket 获取目录池容量、镜像存储余量、共享网桥租约以及跨项目 Incus 操作是否静默。辅助入口从受保护的槽位配置读取目标，不接受调用方提供的路径、Incus 命令或项目名。观察失败时，依赖该证据的操作按原有规则拒绝继续。
+
+对于只接受同 UID 请求的历史槽位，部署控制服务在收到明确的 `peer_unauthorized` 后，可通过 systemd 按需启动的非 root 转接入口重发同一请求。入口只接受部署账户，只能访问固定蓝绿槽位，并确认目标进程使用主服务 UID。允许的方法和动作与当前槽位的跨账户接口一致；业务错误不会触发转接。
+
+历史程序无法核验不同 UID 的部署进程时，转接入口以主服务 UID 持有专用连接，提供历史程序可核验的租约进程身份。部署服务只承认该连接下已确认且身份完整匹配的租约；部署进程关闭连接或退出后，见证进程退出，历史槽位沿用原有的进程失效检查。
+
+历史槽位调用 Incus CLI 时，兼容入口只把与该槽位配置完全匹配的共享网桥租约、存储和后台操作静默查询映射到只读宿主 socket。缺少宿主证据时返回错误。其余命令仍直接使用项目受限凭据；历史槽位不会因此获得跨项目访问权限。
+
+部署控制服务使用独立的 root 辅助 socket 执行固定蓝绿槽位的启停、开机启动设置与回退重试策略。入口核对对端为部署账户，只接受预定义操作、固定槽位和已知历史程序布局。启动、重启和设置开机启动前均需确认 systemd 配置使用主服务账户；辅助程序、unit 及其配置路径由 root 管理。槽位产物路径改由部署账户写入前，必须解除旧 root 槽位对同一路径的执行依赖。
+
 ## 首次状态迁移
 
 首次部署不能要求运维者先手工迁移状态。发布器安装并验证 Deployd 后，自动调用 `POST /v1/migrate`；Deployd 在同一个 durable transaction 中启动 rqlite、让旧服务进入写围栏、等待请求和 native worker 收敛、停止旧服务、取得旧状态目录的 `authority.lock` 并保持到迁移完成、确认没有 SQLite writer、创建一致 snapshot、导入并验证 rqlite，最后写入 `.rqlite-cutover-complete`。旧服务的 Bun 入口必须在创建 SQLite store 前取得同一把排他的 `authority.lock`；如果旧服务在停止后重新启动并竞争这把锁，Deployd 只会闭锁，不会把竞态当成迁移成功。
@@ -241,6 +251,8 @@ CLI 永远不能直接编辑 `active`。响应丢失时，CLI 返回 deployd tra
 如果 Deployd 在创建源 snapshot 之前重启，且迁移事务仍处于 `migration_stop` 或 `migration_source_check`、没有 `source_verified` 证据，恢复流程可以在重新确认 legacy 已停止和 writer 已关闭后继续创建这一次 snapshot。只要已经存在源摘要证据，恢复流程就必须复用原 snapshot；snapshot 缺失、被替换或摘要不一致都必须闭锁，禁止重新采样 legacy 数据库。完成标记必须在删除 legacy SQLite 及其 WAL/SHM 文件之前持久化；如果进程在这两个动作之间退出，恢复流程必须验证同一 transaction、源摘要和 rqlite 目标摘要，复用已完成的导入并继续删除和收口，不能再次导入或重新采样。迁移已完成但初始 `active` 链接或槽位启动失败时，后续发布只需验证完成标记、finalized 事务和 rqlite 目标，不得再次要求 legacy SQLite 文件存在。迁移恢复的自动重试是一个可恢复的逻辑尝试：额度提交后如果 Deployd 在实际导入前退出，重启可以继续这一次尝试；只有导入返回明确失败后才耗尽额度，不能因进程退出窗口把尚未执行的恢复永久锁死。
 
 ## 恢复与验证
+
+创建蓝绿部署恢复点时，部署控制服务使用安装器导出的独立 rqlite 备份凭据与受保护的 CA，保留线性一致覆盖验证。该凭据只包含备份身份的密码；预检拒绝具备业务写权限或与其他身份复用密码的备份账号。以专用账户运行时，由持有有效控制权的槽位写入覆盖标记，部署控制服务仅查询并验证标记。仍以 root 运行的兼容路径可以为不支持此接口的现役版本代写标记。配置路径和源文件见[蓝绿部署手册](../../../../deploy/docs/blue-green.md#rqlite-配置)。
 
 启动时，deployd 加载最近事务，验证数据库 schema，并重新观测每个运行时来源。只有再次观测到对应运行时证据，记录的 phase 才能视为完成。如果无法证明该 phase，deployd 进入 `needs_recovery`，保持部署和受影响的 admission fenced，并保留证据。只有运维者确认事务标识且必需来源新鲜、相互一致后，恢复流程才能 resume、rollback 或 finalize。执行 recovery finalize 时，deployd 必须先确认目标槽位仍然是已验证的 active 槽位，撤销旧槽位的 controller role 和 traffic role，完成 drain/quiescence，并停止旧槽位。只有重新观测到旧槽位已经停止、目标槽位重新持有 controller role 且可以接受流量后，才能把事务写成 `finalize`。撤销、停止或重新观测任一步失败，都必须保持 `needs_recovery`，并对两个槽位执行 hard-fence，不能猜测恢复已经完成。
 

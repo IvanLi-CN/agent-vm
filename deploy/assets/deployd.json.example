@@ -17,6 +17,8 @@
     "rqlite_unit": "agent-vm-rqlite.service",
     "rqlite_ca_file": "/etc/agent-vm-native/tls/rqlite/server.crt",
     "rqlite_auth_file": "/etc/agent-vm-native/rqlite/auth.json",
+    "rqlite_backup_auth_file": "/etc/agent-vm-native/backup/auth.json",
+    "rqlite_backup_ca_file": "/etc/agent-vm-native/backup/ca.crt",
     "recovery_directory": "/var/lib/agent-vm-native/migration",
     "drain_timeout_seconds": 8100,
     "writer_check_seconds": 1

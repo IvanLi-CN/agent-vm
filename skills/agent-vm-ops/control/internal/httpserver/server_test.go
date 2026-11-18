@@ -166,6 +166,51 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 	}
 }
 
+func TestDeployPeerCannotDispatchGuestMutations(t *testing.T) {
+	// Deliberately leave the business service nil: denied requests must never
+	// reach dispatch or a role handler.
+	const deployedUID = 22001
+	handler := (&Server{}).handlerWithDeployUID(deployedUID)
+	for _, tc := range []struct {
+		name, method, path, body string
+		uid                      int
+	}{
+		{"ordinary peer", http.MethodPost, "/internal/v1/traffic-role", `{"action":"disable"}`, 22002},
+		{"guest mutation", http.MethodPost, "/internal/v1/control", `{"protocol":4,"action":"destroy","session_id":"other","generation":1,"operation_id":"test"}`, deployedUID},
+		{"unrelated drain owner", http.MethodPost, "/internal/v1/control", `{"protocol":4,"action":"drain-exit","session_id":"other","generation":0,"operation_id":"test"}`, deployedUID},
+		{"snapshot access", http.MethodGet, "/internal/v1/snapshots/health", ``, deployedUID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.uid == os.Getuid() {
+				t.Skip("fixture UID equals test process UID")
+			}
+			req := httptest.NewRequest(tc.method, tc.path, strings.NewReader(tc.body))
+			req = req.WithContext(context.WithValue(req.Context(), peerContextKey{}, &peerConn{uid: tc.uid}))
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "peer_unauthorized") {
+				t.Fatalf("expected peer denial, got %d: %s", rec.Code, rec.Body)
+			}
+		})
+	}
+}
+
+func TestMaintenanceHandoffRequiresAuthenticatedRootPeer(t *testing.T) {
+	const deployUID = 22001
+	handler := (&Server{RoleGate: controllerrole.New("blue", time.Now)}).handlerWithDeployUID(deployUID)
+	for _, peer := range []*peerConn{nil, {uid: deployUID, pid: os.Getpid()}, {uid: 0}} {
+		req := httptest.NewRequest(http.MethodPost, "/internal/v1/controller-role", strings.NewReader(`{"action":"witness-handoff"}`))
+		if peer != nil {
+			req = req.WithContext(context.WithValue(req.Context(), peerContextKey{}, peer))
+		}
+		resp := httptest.NewRecorder()
+		handler.ServeHTTP(resp, req)
+		if resp.Code != http.StatusForbidden || !strings.Contains(resp.Body.String(), "peer_unauthorized") {
+			t.Fatalf("expected root peer denial: %d %s", resp.Code, resp.Body)
+		}
+	}
+}
+
 func TestTrafficRoleStartsFencedAndRequiresControllerLease(t *testing.T) {
 	store, err := state.OpenForTest(filepath.Join(t.TempDir(), "state.sqlite3"))
 	if err != nil {
@@ -175,11 +220,21 @@ func TestTrafficRoleStartsFencedAndRequiresControllerLease(t *testing.T) {
 	service := lifecycle.New(store, config.Defaults(), lifecycle.Options{})
 	gate := controllerrole.New("blue", time.Now)
 	server := NewWithRole(service, nil, nil, gate)
+	const deployUID = 22001
+	if deployUID == os.Getuid() {
+		t.Skip("fixture UID equals test process UID")
+	}
+	handler := server.handlerWithDeployUID(deployUID)
+	enableTraffic := func() *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/internal/v1/traffic-role", strings.NewReader(`{"action":"enable"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request = request.WithContext(context.WithValue(request.Context(), peerContextKey{}, &peerConn{uid: deployUID}))
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, request)
+		return recorder
+	}
 
-	request := httptest.NewRequest(http.MethodPost, "/internal/v1/traffic-role", strings.NewReader(`{"action":"enable"}`))
-	request.Header.Set("Content-Type", "application/json")
-	recorder := httptest.NewRecorder()
-	server.Handler().ServeHTTP(recorder, request)
+	recorder := enableTraffic()
 	if recorder.Code != http.StatusConflict || service.TrafficAccepting() {
 		t.Fatalf("traffic enable without lease status=%d accepting=%v", recorder.Code, service.TrafficAccepting())
 	}
@@ -189,10 +244,7 @@ func TestTrafficRoleStartsFencedAndRequiresControllerLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	service.MarkReady()
-	request = httptest.NewRequest(http.MethodPost, "/internal/v1/traffic-role", strings.NewReader(`{"action":"enable"}`))
-	request.Header.Set("Content-Type", "application/json")
-	recorder = httptest.NewRecorder()
-	server.Handler().ServeHTTP(recorder, request)
+	recorder = enableTraffic()
 	if recorder.Code != http.StatusOK || !service.TrafficAccepting() {
 		t.Fatalf("traffic enable with lease status=%d accepting=%v", recorder.Code, service.TrafficAccepting())
 	}

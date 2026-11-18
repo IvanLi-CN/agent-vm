@@ -20,6 +20,7 @@ func runServe(args []string) error {
 	flags := flag.NewFlagSet("agent-vm-deploy serve", flag.ContinueOnError)
 	flags.SetOutput(os.Stderr)
 	configPath := flags.String("config", "/etc/agent-vm-native/deployd.json", "deployd configuration path")
+	adopt := flags.Bool("adopt-account-handoff", false, "adopt the live slot during service account maintenance")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -34,25 +35,47 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	listener, err := inheritedDeploySocket(config.Socket)
+	if err != nil {
+		return err
+	}
+	if listener != nil {
+		defer listener.Close()
+	}
 	processLock, err := native.AcquireLock(config.LockPath, true, true)
 	if err != nil {
 		return fmt.Errorf("acquire deployd singleton lock: %w", err)
 	}
 	defer processLock.Close()
+	if err := config.SelectRuntimeDatabase(os.Geteuid()); err != nil {
+		return err
+	}
 	database, err := store.Open(config.Database, config.Retention(), time.Now)
 	if err != nil {
 		return err
 	}
 	defer database.Close()
 	runtime := deployd.NewHostRuntime(config)
+	defer runtime.CloseLegacyLeaseOwner()
 	manager := deployd.NewManagerWithMigration(database, runtime, runtime, config.LeaseDuration(), time.Now)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	if *adopt {
+		handoff, err := deployd.ReadAccountHandoff()
+		if err != nil {
+			return err
+		}
+		if err := manager.AdoptAccountHandoff(ctx, handoff.Lease, handoff.StateAuthority); err != nil {
+			return fmt.Errorf("adopt account handoff: %w", err)
+		}
+	}
 	if err := manager.RecoverOnStart(ctx); err != nil {
 		slog.Error("deployd recovery observation failed", "error", err)
 	}
-	if err := manager.MaintainController(ctx); err != nil {
-		slog.Warn("initial controller lease was not granted", "error", err)
+	if !*adopt {
+		if err := manager.MaintainController(ctx); err != nil {
+			slog.Warn("initial controller lease was not granted", "error", err)
+		}
 	}
 	if err := runtime.ReconcileRecoveryPoints(); err != nil {
 		slog.Warn("recovery point reconciliation failed", "error", err)
@@ -67,7 +90,13 @@ func runServe(args []string) error {
 	}
 
 	errorsCh := make(chan error, 2)
-	go func() { errorsCh <- deployd.ServeUDS(ctx, config.Socket, server.Handler()) }()
+	go func() {
+		if listener != nil {
+			errorsCh <- deployd.ServeUDSListener(ctx, listener, server.Handler())
+		} else {
+			errorsCh <- deployd.ServeUDS(ctx, config.Socket, server.Handler())
+		}
+	}()
 	go func() {
 		errorsCh <- deployd.ServeMetrics(ctx, config.MetricsListen, server.MetricsHandler(), config.MetricsTLS, config.NetworkACL)
 	}()

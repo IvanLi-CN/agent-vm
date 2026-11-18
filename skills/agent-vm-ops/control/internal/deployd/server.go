@@ -95,7 +95,7 @@ func (server *Server) Handler() http.Handler {
 			return
 		}
 		uid := os.Getuid()
-		if (uid == 0 && peer.uid != 0) || (uid != 0 && peer.uid != uid) {
+		if peer.uid != 0 && peer.uid != uid {
 			writeError(c, http.StatusForbidden, "peer_unauthorized", "Unix peer credentials are not authorized")
 			c.Abort()
 			return
@@ -199,7 +199,7 @@ func (server *Server) status(c *gin.Context) {
 	for index := range status.Transactions {
 		transactions = append(transactions, publicTransaction(status.Transactions[index]))
 	}
-	writeOK(c, map[string]any{"observation": status.Observed, "transactions": transactions})
+	writeOK(c, map[string]any{"observation": status.Observed, "transactions": transactions, "dedicated_service_account": isDeployAccount(os.Geteuid())})
 }
 
 func (server *Server) transaction(c *gin.Context) {
@@ -386,7 +386,11 @@ func writeTransactionErrorForID(c *gin.Context, status int, code, requestID stri
 	}
 	var transactionErr *TransactionError
 	if errors.As(cause, &transactionErr) {
-		if transactionErr.Phase == PhaseRollback {
+		if errors.Is(cause, errRollbackStartsExhausted) && !errors.Is(cause, ErrUncertain) {
+			code = "rollback_previous_unavailable"
+			detail["code"] = code
+			detail["message"] = "previous version failed to start after three attempts; current slot remains active"
+		} else if transactionErr.Phase == PhaseRollback {
 			code = "state_unverified"
 			detail["code"] = code
 			detail["message"] = publicErrorMessage(code, cause.Error())
@@ -521,6 +525,13 @@ func ServeUDS(ctx context.Context, socket string, handler http.Handler) error {
 			_ = os.Remove(socket)
 		}
 	}()
+	return ServeUDSListener(ctx, listener, handler)
+}
+
+// ServeUDSListener owns the listener for the lifetime of this server. For a
+// systemd-owned socket it closes only this process's descriptor.
+func ServeUDSListener(ctx context.Context, listener net.Listener, handler http.Handler) error {
+	defer listener.Close()
 	wrapped := &peerListener{Listener: listener}
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 9000 * time.Second, MaxHeaderBytes: 8 * 1024, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 		if peer, ok := conn.(*peerConn); ok {
@@ -529,9 +540,7 @@ func ServeUDS(ctx context.Context, socket string, handler http.Handler) error {
 		return ctx
 	}}
 	go shutdownOnCancel(ctx, server)
-	err = server.Serve(wrapped)
-	_ = listener.Close()
-	return err
+	return server.Serve(wrapped)
 }
 
 func ServeMetrics(ctx context.Context, address string, handler http.Handler, tlsConfig MetricsTLSConfig, networkACL ...string) error {

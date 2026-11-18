@@ -136,7 +136,11 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		return finishExisting(ctx, report, input)
 	}
 	// Recheck after locking: a concurrent installer may have completed preflight.
-	if _, err := os.Lstat("/var/lib/agent-vm-native/active"); !errors.Is(err, os.ErrNotExist) {
+	activePath, err := deployd.EffectiveActivePath(deployd.Defaults().ActivePath)
+	if err != nil {
+		return report, err
+	}
+	if _, err := os.Lstat(activePath); !errors.Is(err, os.ErrNotExist) {
 		return report, errors.New("installation changed after preflight; rerun read-only preflight")
 	}
 	cfg, err := LoadConfig(input.Config)
@@ -202,11 +206,14 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		}
 		binaries[name] = binary
 	}
-	if err := copyInstall(filepath.Join(input.Materials, "assets/sysusers.d/agent-vm-native.conf"), "/etc/sysusers.d/agent-vm-native.conf", 0644, ""); err != nil {
-		return report, err
-	}
-	if err := command(ctx, "systemd-sysusers", "/etc/sysusers.d/agent-vm-native.conf"); err != nil {
-		return report, err
+	for _, name := range []string{"agent-vm-native.conf", "agent-vm-server.conf"} {
+		target := filepath.Join("/etc/sysusers.d", name)
+		if err := copyInstall(filepath.Join(input.Materials, "assets/sysusers.d", name), target, 0644, ""); err != nil {
+			return report, err
+		}
+		if err := command(ctx, "systemd-sysusers", target); err != nil {
+			return report, err
+		}
 	}
 	if err := copyInstall(filepath.Join(input.Materials, "assets/tmpfiles.d/agent-vm-native.conf"), "/etc/tmpfiles.d/agent-vm-native.conf", 0644, ""); err != nil {
 		return report, err
@@ -226,6 +233,20 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 			return report, err
 		}
 	}
+	if err := installBackupInputs(cfg); err != nil {
+		return report, err
+	}
+	blueRuntime, err := config.Load(cfg.Files["blue_config"])
+	if err != nil {
+		return report, errors.New("cannot prepare Incus client configuration from the blue slot")
+	}
+	incusConfig, err := incusCLIConfig(blueRuntime.Project)
+	if err != nil {
+		return report, err
+	}
+	if err := installFile("/etc/agent-vm-native/incus/config.yml", incusConfig, 0640, "agent-vm-server"); err != nil {
+		return report, err
+	}
 	if report.Mode != "legacy" {
 		if err := installProductFiles(product, "/opt/agent-vm-native"); err != nil {
 			return report, err
@@ -241,7 +262,12 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 			return report, err
 		}
 	}
-	for _, unit := range []string{"agent-vm-native@.service", "agent-vm-deployd.service", "agent-vm-rqlite.service", "agent-vm-caddy.service"} {
+	for _, unit := range []string{
+		"agent-vm-native@.service", "agent-vm-deployd.service", "agent-vm-rqlite.service", "agent-vm-caddy.service",
+		"agent-vm-observe.socket", "agent-vm-observe@.service", "agent-vm-deploy-host.socket", "agent-vm-deploy-host@.service",
+		"agent-vm-slot-relay.socket", "agent-vm-slot-relay@.service",
+		"agent-vm-deployd.socket",
+	} {
 		source := filepath.Join(input.Materials, "assets/systemd", unit)
 		if unit == "agent-vm-native@.service" || unit == "agent-vm-deployd.service" {
 			source = filepath.Join(product, "systemd", unit)
@@ -250,7 +276,14 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 			return report, err
 		}
 	}
-	if err := copyInstall(input.Bundle, cachedBundle, 0600, ""); err != nil {
+	bundleMode, bundleGroup := os.FileMode(0600), ""
+	if report.Mode == "fresh" {
+		bundleMode, bundleGroup = 0640, "agent-vm-deploy"
+		if err := prepareFreshAccounts(ctx, input.Materials); err != nil {
+			return report, err
+		}
+	}
+	if err := copyInstall(input.Bundle, cachedBundle, bundleMode, bundleGroup); err != nil {
 		return report, err
 	}
 	if hash, err := digestFile(cachedBundle); err != nil || hash != r.BundleSHA256 {
@@ -261,6 +294,9 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		return report, err
 	}
 	if err := command(ctx, "systemctl", "daemon-reload"); err != nil {
+		return report, err
+	}
+	if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-observe.socket", "agent-vm-deploy-host.socket", "agent-vm-slot-relay.socket"); err != nil {
 		return report, err
 	}
 	if report.Mode == "legacy" {
@@ -286,7 +322,10 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		report.Next = "verify migrated state and VM lifecycle using deploy/docs/acceptance.md"
 		return report, nil
 	}
-	if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-rqlite.service", "agent-vm-deployd.service"); err != nil {
+	if err := prepareFreshRoute(deployd.Defaults().ActivePath, deployd.ManagedRoute); err != nil {
+		return report, err
+	}
+	if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-rqlite.service", "agent-vm-deployd.socket", "agent-vm-deployd.service"); err != nil {
 		return report, err
 	}
 	client := deployd.Client{Socket: "/run/agent-vm-native/deployd.sock", Timeout: 30 * time.Minute}
@@ -331,6 +370,29 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	report.Mode = "installed"
 	report.Next = "verify VM lifecycle and Prometheus integration using deploy/docs/acceptance.md"
 	return report, nil
+}
+
+func installBackupInputs(cfg Config) error {
+	auth, err := protectedRead(cfg.Files["rqlite_auth"])
+	if err != nil {
+		return err
+	}
+	credential, err := deployd.ExportBackupCredential(auth)
+	if err != nil {
+		return err
+	}
+	ca, err := protectedRead(cfg.Files["rqlite_certificate"])
+	if err != nil {
+		return err
+	}
+	migration := deployd.Defaults().Migration
+	if err := installFile(migration.RQLiteBackupAuth, credential, 0640, "agent-vm-deploy"); err != nil {
+		return err
+	}
+	if err := installFile(deployd.ServerAuthorityCA, ca, 0640, "agent-vm-server"); err != nil {
+		return err
+	}
+	return installFile(migration.RQLiteBackupCA, ca, 0640, "agent-vm-deploy")
 }
 
 func finishExisting(ctx context.Context, report Report, input Inputs) (Report, error) {

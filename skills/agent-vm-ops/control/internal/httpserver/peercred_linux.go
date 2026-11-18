@@ -9,15 +9,16 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func peerUID(conn net.Conn) (int, error) {
+func peerIdentity(conn net.Conn) (int, int, error) {
 	unixConn, ok := conn.(*net.UnixConn)
 	if !ok {
-		return os.Getuid(), nil
+		return os.Getuid(), 0, nil
 	}
 	var uid int = os.Getuid()
+	var pid int
 	raw, err := unixConn.SyscallConn()
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	var controlErr error
 	if err := raw.Control(func(fd uintptr) {
@@ -27,8 +28,9 @@ func peerUID(conn net.Conn) (int, error) {
 			return
 		}
 		uid = int(credential.Uid)
+		pid = int(credential.Pid)
 	}); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
-	return uid, controlErr
+	return uid, pid, controlErr
 }

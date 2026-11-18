@@ -3,6 +3,9 @@
   "files": {
     "blue_config": "/etc/agent-vm-install-inputs/blue.json",
     "green_config": "/etc/agent-vm-install-inputs/green.json",
+    "incus_client_certificate": "/etc/agent-vm-install-inputs/incus-client.crt",
+    "incus_client_private_key": "/etc/agent-vm-install-inputs/incus-client.key",
+    "incus_server_certificate": "/etc/agent-vm-install-inputs/incus-server.crt",
     "deployd_config": "/etc/agent-vm-install-inputs/deployd.json",
     "caddy_config": "/etc/agent-vm-install-inputs/Caddyfile",
     "caddy_environment": "/etc/agent-vm-install-inputs/caddy.env",

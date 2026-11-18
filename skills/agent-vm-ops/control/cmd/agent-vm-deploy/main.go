@@ -37,6 +37,33 @@ func run(args []string) error {
 	if args[0] == "serve" {
 		return runServe(args[1:])
 	}
+	if args[0] == "host-action" {
+		if len(args) != 1 {
+			return errors.New("host-action is a systemd socket handler")
+		}
+		return deployd.RunHostAction(os.Stdin)
+	}
+	if args[0] == "host-observe" {
+		if len(args) != 1 {
+			return errors.New("host-observe is a systemd socket handler")
+		}
+		return deployd.RunHostObservation(os.Stdin)
+	}
+	if args[0] == "legacy-incus" {
+		return runLegacyIncus(args[1:])
+	}
+	if args[0] == "prepare-legacy-slot-access" {
+		if len(args) != 2 {
+			return errors.New("prepare-legacy-slot-access requires one fixed slot")
+		}
+		return install.PrepareLegacySlotAccess(args[1])
+	}
+	if args[0] == "slot-relay" {
+		if len(args) != 1 {
+			return errors.New("slot-relay is a systemd socket handler")
+		}
+		return deployd.RunSlotRelay(os.Stdin)
+	}
 	if args[0] == "install" {
 		return runInstall(args[1:])
 	}
@@ -57,14 +84,23 @@ func run(args []string) error {
 	slot := flags.String("slot", "", "target slot")
 	bundle := flags.String("bundle", "", "verified release bundle")
 	action := flags.String("action", "", "recovery action")
-	timeoutSeconds := flags.Int("timeout", 60, "request timeout in seconds")
+	timeoutSeconds := flags.Int("timeout", 0, "request timeout in seconds (defaults to the command's operation budget)")
 	jsonOutput := flags.Bool("json", false, "output JSON")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
 	_ = jsonOutput
-	if command == "migrate" && *timeoutSeconds == 60 {
-		*timeoutSeconds = 9000
+	explicitTimeout := false
+	flags.Visit(func(option *flag.Flag) { explicitTimeout = explicitTimeout || option.Name == "timeout" })
+	if !explicitTimeout {
+		switch {
+		case command == "migrate":
+			*timeoutSeconds = 9000
+		case command == "rollback" || (command == "recover" && *action == "rollback"):
+			*timeoutSeconds = 480
+		default:
+			*timeoutSeconds = 60
+		}
 	}
 	if *timeoutSeconds <= 0 {
 		return errors.New("timeout must be positive")
@@ -166,11 +202,21 @@ func runUpdate(args []string) error {
 		return errors.New("another release update is already in progress")
 	}
 	defer updateLock.Close()
+	client := deployd.Client{Socket: *socket, Timeout: 15 * time.Minute}
+	if *socket == deployd.Defaults().Socket {
+		payload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
+		if err != nil {
+			writePayload(os.Stderr, payload)
+			return err
+		}
+		if !dedicatedUpdateReady(payload) {
+			return errors.New("host permission migration required before updating; see deploy/docs/blue-green.md")
+		}
+	}
 	const stagingRoot = "/var/lib/agent-vm-native/release-staging"
 	if err := os.MkdirAll(stagingRoot, 0o750); err != nil {
 		return fmt.Errorf("create release staging root: %w", err)
 	}
-	client := deployd.Client{Socket: *socket, Timeout: 15 * time.Minute}
 	cleanupOrphanStaging(ctx, client, stagingRoot)
 	directory, err := os.MkdirTemp(stagingRoot, ".update-")
 	if err != nil {
@@ -184,6 +230,9 @@ func runUpdate(args []string) error {
 	}()
 	bundle, err := releasefetch.Prepare(ctx, *version, *source, directory, *localBundle, *serverFile)
 	if err != nil {
+		return err
+	}
+	if err := exposeVerifiedBundle(directory, bundle); err != nil {
 		return err
 	}
 	statusPayload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
@@ -209,54 +258,16 @@ func runUpdate(args []string) error {
 	if status.Value.Observation.ActiveSlot == "blue" {
 		targetSlot = "green"
 	}
-	payload, _, err := client.Call(ctx, "POST", "/v1/stage", map[string]any{"target_slot": targetSlot, "bundle": filepath.Clean(bundle)})
+	// Keep candidate bytes after any request that may have crossed the effect barrier.
+	preserveStaging = true
+	receipt, err := client.RunBlueGreen(ctx, targetSlot, bundle)
+	payload := receipt.Payload
 	if err != nil {
-		// Any failed transaction call may have crossed the native-effect barrier;
-		// retain the candidate until the transaction is queried and explicitly
-		// recovered, even when the response is malformed or incomplete.
-		// A structured stage rejection can still race with transaction creation;
-		// leave cleanup to the status-aware orphan reaper.
-		preserveStaging = true
 		writePayload(os.Stderr, payload)
-		if preserveStaging && !hasStructuredError(payload) {
-			writeUpdateRecoveryHint(ctx, client, "")
+		if !hasStructuredError(payload) {
+			writeUpdateRecoveryHint(ctx, client, receipt.ID)
 		}
 		return err
-	}
-	acknowledgement, decoded := decodeTransactionAcknowledgement(payload)
-	if !decoded {
-		preserveStaging = true
-		writeUpdateRecoveryHint(ctx, client, "")
-		return errors.New("stage response invalid")
-	}
-	id := acknowledgement.ID
-	if id == "" || !validTransactionAcknowledgement(payload, id, "standby_validation", "active") {
-		preserveStaging = true
-		writeUpdateRecoveryHint(ctx, client, id)
-		return errors.New("stage acknowledgement is incomplete")
-	}
-	preserveStaging = true
-	for _, step := range []struct{ action, phase, state string }{
-		{action: "verify", phase: "controller_handoff", state: "active"},
-		{action: "activate", phase: "finalize", state: "finalized"},
-	} {
-		payload, _, err = client.Call(ctx, "POST", "/v1/"+step.action, map[string]any{"transaction_id": id})
-		if err != nil {
-			// A non-empty error payload is not proof that the operation did not
-			// take effect. Keep the bundle for transaction recovery on every
-			// verify/activate failure.
-			preserveStaging = true
-			writePayload(os.Stderr, payload)
-			if !hasStructuredError(payload) {
-				writeUpdateRecoveryHint(ctx, client, id)
-			}
-			return err
-		}
-		if !validTransactionAcknowledgement(payload, id, step.phase, step.state) {
-			preserveStaging = true
-			writeUpdateRecoveryHint(ctx, client, id)
-			return errors.New("deployd acknowledgement is incomplete")
-		}
 	}
 	if err := os.RemoveAll(directory); err != nil {
 		// The Deployd transaction is already finalized. Keep the successful
@@ -306,7 +317,8 @@ func cleanupOrphanStaging(ctx context.Context, client deployd.Client, root strin
 	}
 	now := time.Now()
 	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".update-") {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".update-") ||
+			strings.HasPrefix(entry.Name(), install.AccountMigrationStagingPrefix) {
 			continue
 		}
 		if _, ok := protected[entry.Name()]; ok {
@@ -378,46 +390,6 @@ func publicError(err error) string {
 	return value
 }
 
-func validTransactionAcknowledgement(payload []byte, expectedID, expectedPhase, expectedState string) bool {
-	acknowledgement, ok := decodeTransactionAcknowledgement(payload)
-	return ok && acknowledgement.OK && acknowledgement.ID == expectedID && acknowledgement.Phase == expectedPhase && acknowledgement.State == expectedState
-}
-
-type transactionAcknowledgement struct {
-	OK    bool
-	ID    string
-	Phase string
-	State string
-}
-
-// decodeTransactionAcknowledgement accepts the current response envelope and
-// the legacy top-level transaction shape. This lets an older server-side CLI
-// finish a transaction created by a newer Deployd without treating a valid
-// transaction as missing merely because the envelope moved under value.
-func decodeTransactionAcknowledgement(payload []byte) (transactionAcknowledgement, bool) {
-	var response struct {
-		OK            bool   `json:"ok"`
-		TransactionID string `json:"transaction_id"`
-		Phase         string `json:"phase"`
-		State         string `json:"state"`
-		Value         struct {
-			ID    string `json:"transaction_id"`
-			Phase string `json:"phase"`
-			State string `json:"state"`
-		} `json:"value"`
-	}
-	if json.Unmarshal(payload, &response) != nil {
-		return transactionAcknowledgement{}, false
-	}
-	acknowledgement := transactionAcknowledgement{OK: response.OK, ID: response.Value.ID, Phase: response.Value.Phase, State: response.Value.State}
-	if acknowledgement.ID == "" {
-		acknowledgement.ID = response.TransactionID
-		acknowledgement.Phase = response.Phase
-		acknowledgement.State = response.State
-	}
-	return acknowledgement, true
-}
-
 func writePayload(out *os.File, payload []byte) {
 	if len(payload) == 0 {
 		return
@@ -441,18 +413,30 @@ func runInstall(args []string) error {
 	bundle := flags.String("bundle", "", "verified product tar archive")
 	materials := flags.String("materials", "", "matching verified deployment materials directory")
 	apply := flags.Bool("apply", false, "apply installation after preflight")
+	checkAccounts := flags.Bool("check-account-migration", false, "check the existing host before a service account migration")
+	accountProof := flags.String("account-migration-proof", "", "protected acceptance record authorizing service account migration")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if flags.NArg() != 0 || *config == "" || *bundle == "" || *materials == "" {
 		return errors.New("install requires --config, --bundle and --materials; --apply enables changes")
 	}
+	if *apply && *checkAccounts {
+		return errors.New("--check-account-migration is read-only and cannot be combined with --apply")
+	}
+	if *accountProof != "" && !*apply {
+		return errors.New("--account-migration-proof requires --apply")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	input := install.Inputs{Config: *config, Bundle: *bundle, Materials: *materials}
 	var report install.Report
 	var err error
-	if *apply {
+	if *checkAccounts {
+		report, err = install.PreflightAccountMigration(ctx, input)
+	} else if *accountProof != "" {
+		report, err = install.ApplyAccountMigration(ctx, input, *accountProof)
+	} else if *apply {
 		report, err = install.Apply(ctx, input)
 	} else {
 		report, err = install.Preflight(ctx, input)

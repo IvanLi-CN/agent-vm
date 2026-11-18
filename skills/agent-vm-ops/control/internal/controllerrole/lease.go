@@ -3,9 +3,7 @@ package controllerrole
 import (
 	"errors"
 	"fmt"
-	"os"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -55,6 +53,13 @@ type Gate struct {
 	term     uint64
 
 	changed chan struct{}
+	witness ownerWitness
+}
+
+type ownerWitness struct {
+	pid      int
+	start    string
+	deadline time.Time
 }
 
 func New(slot string, clock func() time.Time) *Gate {
@@ -90,10 +95,44 @@ func (gate *Gate) Grant(lease Lease) error {
 		return fmt.Errorf("%w: term is not newer", ErrLeaseMismatch)
 	}
 	gate.lease = lease
+	gate.witness = ownerWitness{}
 	gate.valid = true
 	gate.term = lease.Term
 	gate.signalLocked()
 	return nil
+}
+
+// WitnessHandoff pins a maintenance process to the live lease without
+// extending its deadline. The incumbent may have renewed the same lease.
+func (gate *Gate) WitnessHandoff(expected Lease, pid int, start string) (Lease, error) {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	if pid <= 0 || pid == expected.OwnerPID || start == "" || expected.OwnerPID <= 0 || expected.OwnerStartTime == "" ||
+		!ownerAlive(pid, start) || !ownerAlive(expected.OwnerPID, expected.OwnerStartTime) {
+		return Lease{}, ErrInvalidLease
+	}
+	if err := gate.validLocked(); err != nil {
+		return Lease{}, err
+	}
+	// Created times can cross JSON with a different time.Location.
+	current := gate.lease
+	if current.Expiry.Before(expected.Expiry) {
+		return Lease{}, ErrLeaseMismatch
+	}
+	deadline := current.Expiry
+	current.Expiry = expected.Expiry
+	if current != expected {
+		return Lease{}, ErrLeaseMismatch
+	}
+	if gate.witness.pid != 0 && gate.witness.deadline.After(gate.clock()) && ownerAlive(gate.witness.pid, gate.witness.start) {
+		if gate.witness.pid == pid && gate.witness.start == start {
+			current.Expiry = gate.witness.deadline
+			return current, nil
+		}
+		return Lease{}, ErrLeaseMismatch
+	}
+	gate.witness = ownerWitness{pid: pid, start: start, deadline: deadline}
+	return gate.lease, nil
 }
 
 func (gate *Gate) renewLocked(lease Lease) bool {
@@ -128,6 +167,7 @@ func (gate *Gate) Revoke(lease Lease) error {
 	}
 	gate.valid = false
 	gate.lease = Lease{}
+	gate.witness = ownerWitness{}
 	if lease.Term > gate.term {
 		gate.term = lease.Term
 	}
@@ -148,6 +188,7 @@ func (gate *Gate) Fence() {
 	}
 	gate.valid = false
 	gate.lease = Lease{}
+	gate.witness = ownerWitness{}
 	gate.signalLocked()
 }
 
@@ -180,9 +221,12 @@ func (gate *Gate) validLocked() error {
 	if !gate.valid {
 		return ErrLeaseExpired
 	}
-	if !gate.lease.Expiry.After(gate.clock()) || !ownerAlive(gate.lease.OwnerPID, gate.lease.OwnerStartTime) {
+	now := gate.clock()
+	if !gate.lease.Expiry.After(now) || (!ownerAlive(gate.lease.OwnerPID, gate.lease.OwnerStartTime) &&
+		!(gate.witness.pid != 0 && gate.witness.deadline.After(now) && ownerAlive(gate.witness.pid, gate.witness.start))) {
 		gate.valid = false
 		gate.lease = Lease{}
+		gate.witness = ownerWitness{}
 		gate.signalLocked()
 		return ErrLeaseExpired
 	}
@@ -193,17 +237,7 @@ func ownerAlive(pid int, startTime string) bool {
 	if pid <= 0 {
 		return true
 	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	if process.Signal(syscall.Signal(0)) != nil {
-		return false
-	}
-	if startTime == "" {
-		return true
-	}
-	return processStartToken(pid) == startTime
+	return liveProcessMatches(pid, startTime)
 }
 
 // ProcessStartToken identifies a process instance, not just its PID. Linux

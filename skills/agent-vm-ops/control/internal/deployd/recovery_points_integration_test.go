@@ -7,11 +7,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
 // The deployment acceptance script supplies its own TLS authority and binary.
@@ -24,8 +27,8 @@ func TestRealRQLiteRecoveryPoint(t *testing.T) {
 	defer cancel()
 	config := Defaults()
 	config.Migration.RQLiteURL = endpoint
-	config.Migration.RQLiteCAFile = os.Getenv("AGENT_VM_TEST_RECOVERY_RQLITE_CA")
-	config.Migration.RQLiteAuthFile = os.Getenv("AGENT_VM_TEST_RECOVERY_RQLITE_AUTH")
+	config.Migration.RQLiteBackupCA = os.Getenv("AGENT_VM_TEST_RECOVERY_RQLITE_CA")
+	config.Migration.RQLiteBackupAuth = os.Getenv("AGENT_VM_TEST_RECOVERY_RQLITE_AUTH")
 	config.Migration.RecoveryDirectory = filepath.Join(t.TempDir(), "recovery")
 	runtime := NewHostRuntime(config)
 	client, _, _, err := runtime.recoveryClient()
@@ -34,13 +37,23 @@ func TestRealRQLiteRecoveryPoint(t *testing.T) {
 	}
 	defer client.CloseIdleConnections()
 	control := os.Getenv("AGENT_VM_TEST_RECOVERY_RQLITE_CONTROL")
+	target, err := url.Parse(endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target.User = url.UserPassword("agent-vm-control", control)
+	t.Setenv("SSL_CERT_FILE", config.Migration.RQLiteBackupCA)
+	store, err := state.OpenFreshRQLite(ctx, target.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	runtime.recoveryMarker = func(ctx context.Context, id string) error { return store.WriteRecoveryMarker(ctx, id) }
 	execute := func(ctx context.Context, statement string) error {
 		_, err := recoverySQL(ctx, client, endpoint, "/db/execute", "agent-vm-control", control, []string{statement})
 		return err
 	}
 	for _, q := range []string{
-		"CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
-		"INSERT INTO meta VALUES('state_epoch','acceptance-epoch') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
 		"CREATE TABLE IF NOT EXISTS recovery_acceptance (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
 		"INSERT INTO recovery_acceptance(value) VALUES('trusted-before-backup')",
 	} {

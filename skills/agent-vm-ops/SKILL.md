@@ -27,8 +27,9 @@ Drain 拒绝新的 lease 和 restart admission，允许在线 retrieval/release�
 升级后检查 native Incus/systemd/OpenSSH 行为。
 本 Skill 不授权外部宿主机生命周期变更、自动重启控制环境或大范围 cleanup。
 
-只部署来自同一 revision 的正式候选版本：包括 Go 控制服务、槽位外的 deployd 服务、[format-2 bridge](scripts/agent_vm_control_bridge.ts)、完整客户端包和 systemd 资源。实现与资源必须来自同一 release package。
+只部署来自同一 revision 的正式候选版本：包括主服务、部署控制服务、[format-2 bridge](scripts/agent_vm_control_bridge.ts)、完整客户端包和 systemd 资源。实现与资源必须来自同一 release package。两个常驻服务分别使用 `agent-vm-server` 和 `agent-vm-deploy` 账户；root 只执行安装、运维 CLI 和固定宿主操作。权限变化后须核对实际进程身份和项目限制，不能授予常驻服务通用 sudo 或 Incus 管理权限。
 路径和验证遵循[部署参考](references/deployment.md)，Incus project/profile policy 遵循[初始化参考](references/initialization.md)，native OS 和 guest prerequisite 遵循[运行时合同](references/control-runtime.md)。
+常规更新由目标宿主下载；需要指定文件时，使用同一 `agent-vm-deploy update` 命令的 `--bundle` 入口，仍使用正式完整包，具体参数和现有安装的账户前置条件见[蓝绿手册](../../deploy/docs/blue-green.md#普通蓝绿切换)。
 当前 release 只允许 Go native control 与固定的 Go `request` adapter；SSH 入口通过受保护 UDS 转发请求。历史格式仅由离线迁移工具读取。
 修改 client 前先 build、verify 和 publish matching manifest。
 八个客户端文件和依赖哈希 sidecar 必须作为一个可恢复 package 安装；更新受保护的连接材料时不得同步任何 consumer runtime home。

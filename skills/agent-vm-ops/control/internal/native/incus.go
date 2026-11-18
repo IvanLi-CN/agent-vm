@@ -97,19 +97,21 @@ func (err *UncertainError) Unwrap() error   { return err.Cause }
 func (err *UncertainError) Uncertain() bool { return true }
 
 type IncusClient struct {
-	Runner      *Runner
-	Project     string
-	Profile     string
-	Network     string
-	Pool        string
-	StoragePath string
+	Runner              *Runner
+	Project             string
+	Profile             string
+	Network             string
+	Pool                string
+	StoragePath         string
+	HostObservationSlot string
 }
 
 type ClientOptions struct {
-	Profile     string
-	Network     string
-	Pool        string
-	StoragePath string
+	Profile             string
+	Network             string
+	Pool                string
+	StoragePath         string
+	HostObservationSlot string
 }
 
 // CommandError carries the bounded result of a failed Incus invocation. The
@@ -188,6 +190,7 @@ func NewIncusClient(runner *Runner, project string, options ...ClientOptions) *I
 	client := &IncusClient{Runner: runner, Project: project}
 	if len(options) > 0 {
 		client.Profile, client.Network, client.Pool, client.StoragePath = options[0].Profile, options[0].Network, options[0].Pool, options[0].StoragePath
+		client.HostObservationSlot = options[0].HostObservationSlot
 	}
 	return client
 }
@@ -376,6 +379,13 @@ func (c *IncusClient) StoragePoolAvailableBytes(ctx context.Context) (int64, err
 	if c == nil || c.Pool == "" {
 		return 0, errors.New("storage pool is not configured")
 	}
+	if c.HostObservationSlot != "" {
+		value, err := c.readHostObservation(ctx, "image-storage")
+		if err != nil {
+			return 0, err
+		}
+		return *value.Available, nil
+	}
 	value, err := c.json(ctx, "query", "/1.0/storage-pools/"+url.PathEscape(c.Pool)+"/resources")
 	if err != nil {
 		return 0, err
@@ -386,6 +396,12 @@ func (c *IncusClient) StoragePoolAvailableBytes(ctx context.Context) (int64, err
 				return bytes, nil
 			}
 		}
+	}
+	space := nestedMap(value, "space")
+	total, totalOK := integerValue(space["total"])
+	used, usedOK := integerValue(space["used"])
+	if totalOK && usedOK && total > 0 && used >= 0 && used <= total {
+		return total - used, nil
 	}
 	return 0, errors.New("incus storage pool response has no available capacity")
 }
@@ -400,6 +416,10 @@ func (c *IncusClient) StoragePoolCapacity(ctx context.Context) (StorageCapacity,
 	}
 	if c.StoragePath == "" {
 		return StorageCapacity{}, errors.New("storage pool source path is not configured")
+	}
+	if c.HostObservationSlot != "" {
+		value, err := c.readHostObservation(ctx, "pool-capacity")
+		return value.Capacity, err
 	}
 	value, err := c.jsonWithProject(ctx, "/1.0/storage-pools/"+url.PathEscape(c.Pool), "default")
 	if err != nil {
@@ -719,10 +739,32 @@ func (c *IncusClient) NetworkIPs(ctx context.Context) (map[string]struct{}, erro
 			}
 		}
 	}
+	var addresses []string
+	if c.HostObservationSlot != "" {
+		value, err := c.readHostObservation(ctx, "network-leases")
+		if err != nil {
+			return nil, err
+		}
+		addresses = value.Addresses
+	} else {
+		var err error
+		addresses, err = c.networkLeases(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, address := range addresses {
+		used[address] = struct{}{}
+	}
+	return used, nil
+}
+
+func (c *IncusClient) networkLeases(ctx context.Context) ([]string, error) {
 	leases, err := c.queryList(ctx, "/1.0/networks/"+url.PathEscape(c.Network)+"/leases", "default")
 	if err != nil {
 		return nil, err
 	}
+	addresses := make([]string, 0, len(leases))
 	for _, raw := range leases {
 		lease, ok := raw.(map[string]any)
 		if !ok {
@@ -730,10 +772,10 @@ func (c *IncusClient) NetworkIPs(ctx context.Context) (map[string]struct{}, erro
 		}
 		address, _ := lease["address"].(string)
 		if address != "" {
-			used[address] = struct{}{}
+			addresses = append(addresses, address)
 		}
 	}
-	return used, nil
+	return addresses, nil
 }
 
 func (c *IncusClient) Status(ctx context.Context, name string) (map[string]any, error) {

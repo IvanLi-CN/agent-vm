@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -30,7 +31,9 @@ const (
 
 type peerConn struct {
 	net.Conn
-	uid int
+	uid        int
+	pid        int
+	startToken string
 }
 
 type peerListener struct{ net.Listener }
@@ -40,12 +43,16 @@ func (listener *peerListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	uid, uidErr := peerUID(conn)
+	uid, pid, uidErr := peerIdentity(conn)
 	if uidErr != nil {
 		_ = conn.Close()
 		return nil, uidErr
 	}
-	return &peerConn{Conn: conn, uid: uid}, nil
+	peer := &peerConn{Conn: conn, uid: uid, pid: pid}
+	if uid == 0 && pid > 0 {
+		peer.startToken = controllerrole.ProcessStartToken(pid)
+	}
+	return peer, nil
 }
 
 type peerContextKey struct{}
@@ -74,6 +81,16 @@ func NewWithRole(service *lifecycle.Service, snapshots *observe.SnapshotStore, a
 }
 
 func (s *Server) Handler() http.Handler {
+	deployUID := -1
+	if account, err := user.Lookup("agent-vm-deploy"); err == nil {
+		if uid, err := strconv.Atoi(account.Uid); err == nil && uid > 0 {
+			deployUID = uid
+		}
+	}
+	return s.handlerWithDeployUID(deployUID)
+}
+
+func (s *Server) handlerWithDeployUID(deployUID int) http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.New()
 	router.Use(gin.CustomRecovery(func(c *gin.Context, _ any) {
@@ -87,15 +104,20 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			uid := os.Getuid()
-			if (uid == 0 && conn.uid != 0) || (uid != 0 && conn.uid != uid) {
+			deploymentRequest := protocol.DeploymentSlotRoute(c.Request.Method, c.Request.URL.Path)
+			if uid != conn.uid && (!deploymentRequest || (conn.uid != deployUID && conn.uid != 0)) {
 				writeJSON(c, http.StatusForbidden, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("peer_unauthorized", "Unix peer credentials are not authorized", nil)}, 2)
 				c.Abort()
 				return
+			}
+			if uid != conn.uid && c.Request.URL.Path == "/internal/v1/control" {
+				c.Set("deployment_slot_control", true)
 			}
 		}
 		c.Next()
 	})
 	router.POST("/internal/v1/control", s.control)
+	router.POST("/internal/v1/recovery-marker", s.recoveryMarker)
 	router.POST("/internal/v1/controller-role", s.controllerRole)
 	router.POST("/internal/v1/traffic-role", s.trafficRole)
 	router.GET("/internal/v1/health", s.health)
@@ -123,7 +145,11 @@ func (s *Server) deploymentObservation(c *gin.Context) {
 }
 
 func (s *Server) control(c *gin.Context) {
-	reader := http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+	limit := int64(maxBodyBytes)
+	if c.GetBool("deployment_slot_control") {
+		limit = protocol.DeploymentSlotBodyLimit
+	}
+	reader := http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 	defer c.Request.Body.Close()
 	body, err := io.ReadAll(reader)
 	if err != nil {
@@ -133,6 +159,10 @@ func (s *Server) control(c *gin.Context) {
 	request, err := protocol.Decode(body)
 	if err != nil {
 		writeError(c, err, nil)
+		return
+	}
+	if c.GetBool("deployment_slot_control") && !protocol.DeploymentSlotAction(request) {
+		writeJSON(c, http.StatusForbidden, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("peer_unauthorized", "Unix peer credentials are not authorized for this action", nil)}, 2)
 		return
 	}
 	response, dispatchErr := s.Service.Dispatch(c.Request.Context(), request)
@@ -231,6 +261,18 @@ func (s *Server) controllerRole(c *gin.Context) {
 	}
 	var err error
 	switch command.Action {
+	case "witness-handoff":
+		peer, ok := c.Request.Context().Value(peerContextKey{}).(*peerConn)
+		if !ok || peer.uid != 0 || peer.pid <= 0 {
+			writeJSON(c, http.StatusForbidden, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("peer_unauthorized", "handoff requires a local root maintenance process", nil)}, 2)
+			return
+		}
+		var lease controllerrole.Lease
+		lease, err = s.RoleGate.WitnessHandoff(command.Lease, peer.pid, peer.startToken)
+		if err == nil {
+			writeJSON(c, http.StatusOK, map[string]any{"ok": true, "lease": lease, "valid": true}, 0)
+			return
+		}
 	case "grant":
 		err = s.RoleGate.Grant(command.Lease)
 	case "revoke":
@@ -242,7 +284,7 @@ func (s *Server) controllerRole(c *gin.Context) {
 		s.RoleGate.Fence()
 		s.Service.SetTrafficAccepting(false)
 	default:
-		err = protocol.NewError("invalid_request", "controller role action must be grant, revoke or fence", nil)
+		err = protocol.NewError("invalid_request", "unrecognized controller role action", nil)
 	}
 	if err != nil {
 		code := "controller_role_rejected"

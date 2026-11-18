@@ -4,7 +4,7 @@
 
 ## 准备环境与制品
 
-控制环境必须已经运行 systemd 和 Incus，并具备专属项目、profile、网络、network ACL、存储池及已验证的容器镜像。安装器只读取和校验这些条件，不安装 Incus，不改动 PVE、CT 权限、挂载或配额。域名、OIDC 应用及回调地址须事先注册，提供对应 TLS 证书。缺失条件会汇总为预检阻塞项。
+控制环境必须已经运行 systemd 和 Incus，提供发行版安装的 `/usr/bin/incus`，并具备专属项目、profile、网络、network ACL、存储池及已验证的容器镜像。安装器只读取和校验这些条件，不安装 Incus，不改动 PVE、CT 权限、挂载或配额。域名、OIDC 应用及回调地址须事先注册，提供对应 TLS 证书。缺失条件会汇总为预检阻塞项。
 
 嵌套控制环境还须按[权限准备手册](nested-incus.md)验证 UID/GID 范围、subordinate ID 授权、helper 权限和目标 guest 模式。安装器的 Incus 检查只确认项目、profile、网络、存储池和镜像可查询，不启动测试 guest，也不校验嵌套映射覆盖关系。项目/profile 初始化器的 `aligned` 同样不包含权限验收。声明支持非特权 guest 时，应保存显式 `security.privileged=false` 的启动和 Docker 实证，不能用特权 profile 的成功替代。权限准备缺失时，先完成获授权的环境维护，不能把安装预检无阻塞解释为所有运行前提均已满足。
 
@@ -37,13 +37,14 @@ sudo tar --extract --file /var/tmp/agent-vm-install/deployment-materials.tar \
 | `blue.json`、`green.json` | 以 [`config.json.example`](../assets/config.json.example) 为字段示例，填入同一套已验证 Incus 条件，分别设置 `slot=blue`、`slot=green`，`socket` 分别为 `/run/agent-vm-native/blue/app.sock` 和 `/run/agent-vm-native/green/app.sock`；两个槽位共享同一 `state_db`，使用带 HTTP Basic authentication 的 `https://<username>:<URL编码password>@127.0.0.1:4001`，不得使用示例中的旧 SQLite 路径。 |
 | Web/OIDC | 在两个槽位配置的 `management` 中启用 Web，使用 [`web.json.example`](../assets/web.json.example) 的 `management` 子树，填写实际 issuer、client ID、secret、external origin、redirect URI 和管理员主体；具体字段以 [Web 合同](../../docs/specs/agent-vm/contracts/management-api.md) 为准。 |
 | `deployd.json` | 以 [`deployd.json.example`](../assets/deployd.json.example) 为基础，保留固定状态、socket、slot 和 active 路径；本机观测使用 loopback 监听，跨主机接入另见[观测说明](observability.md)。 |
+| `incus-client.crt`、`incus-client.key`、`incus-server.crt` | Incus TLS 专用客户端证书、匹配的私钥，以及用于固定服务端身份的证书。Incus HTTPS 必须监听 `127.0.0.1:8443`。本机信任记录必须将该客户端证书限制到配置中的唯一非默认项目；安装预检验证该项目可读且默认项目返回拒绝。 |
 | `Caddyfile`、`caddy.env` | 复制 [`Caddyfile.example`](../assets/blue-green/Caddyfile.example) 和 [`caddy.env.example`](../assets/blue-green/caddy.env.example)，填写已注册域名。Caddy 只代理 active 槽位，不代理指标。 |
-| `rqlite-auth.json` | 根据 [`rqlite-auth.json.example`](../assets/blue-green/rqlite-auth.json.example) 设置独立的 control 和 backup 凭据；control 凭据必须与两个槽位的 `state_db` 一致。 |
+| `rqlite-auth.json` | 根据 [`rqlite-auth.json.example`](../assets/blue-green/rqlite-auth.json.example) 设置独立的 control 和 backup 凭据；control 凭据必须与两个槽位的 `state_db` 一致。安装器只向备份客户端导出 backup 密码，拒绝给该账号授予普通业务写权限。 |
 | `rqlite.crt`、`rqlite.key` | 匹配的服务端证书与私钥；证书必须包含 IP SAN `127.0.0.1`。槽位和初始化命令通过固定 `SSL_CERT_FILE` 信任该证书。 |
 | `caddy.crt`、`caddy.key` | 覆盖已注册域名的匹配证书与私钥。 |
 
 ```sh
-sudo chmod 0600 /etc/agent-vm-install-inputs/install.json /etc/agent-vm-install-inputs/blue.json /etc/agent-vm-install-inputs/green.json /etc/agent-vm-install-inputs/deployd.json /etc/agent-vm-install-inputs/Caddyfile /etc/agent-vm-install-inputs/caddy.env /etc/agent-vm-install-inputs/rqlite-auth.json /etc/agent-vm-install-inputs/rqlite.crt /etc/agent-vm-install-inputs/rqlite.key /etc/agent-vm-install-inputs/caddy.crt /etc/agent-vm-install-inputs/caddy.key
+sudo chmod 0600 /etc/agent-vm-install-inputs/install.json /etc/agent-vm-install-inputs/blue.json /etc/agent-vm-install-inputs/green.json /etc/agent-vm-install-inputs/deployd.json /etc/agent-vm-install-inputs/Caddyfile /etc/agent-vm-install-inputs/caddy.env /etc/agent-vm-install-inputs/rqlite-auth.json /etc/agent-vm-install-inputs/rqlite.crt /etc/agent-vm-install-inputs/rqlite.key /etc/agent-vm-install-inputs/caddy.crt /etc/agent-vm-install-inputs/caddy.key /etc/agent-vm-install-inputs/incus-client.crt /etc/agent-vm-install-inputs/incus-client.key /etc/agent-vm-install-inputs/incus-server.crt
 ```
 
 ## 预检与安装
@@ -68,6 +69,8 @@ sudo /var/tmp/agent-vm-install/agent-vm-deploy install \
 ```
 
 安装器先把产品包、部署资料及受保护配置复制到仅本次安装进程可读写的临时目录，再验证实际使用的副本；安装记录绑定的配置摘要与后续安装使用同一份字节，原始输入后续变化不会改变本次执行。迁移配置必须保留示例中的固定本机路径与 `https://127.0.0.1:4001` 地址。安装器验证固定版本 Caddy 和 rqlite 的下载摘要，安装专用用户、目录、配置、二进制与 systemd 资源，再启动 rqlite 和 Deployd。Deployd 的首次安装事务委托控制服务直接初始化空 rqlite，验证 blue 后授予唯一 controller lease、启用 traffic 并原子创建 active；Caddy 最后启动。Deployd 的部署 SQLite 位于独立部署目录，不能将它误认为业务 SQLite。
+
+全新安装为主服务和部署服务分别启用 `agent-vm-server` 和 `agent-vm-deploy` 专用账户。部署服务的事务数据库在 `/var/lib/agent-vm-native/deployment/runtime/`，安装账本仍由 root 持有。辅助入口只执行[部署合同](../../docs/specs/agent-vm/contracts/deployment-controller.md#本机-api-与授权)列出的固定操作；请勿开放 Incus 管理 socket、添加宽泛 sudo 规则或放宽 root 执行路径的写权限。
 
 全新安装在请求部署事务前最多等待 30 秒，通过受保护 HTTPS 接口确认 rqlite 状态与 strong read 均正常。若这一步超时，检查 `agent-vm-rqlite.service` 后用相同输入重新运行 `install --apply` 即可，无需执行事务恢复。冷启动时，槽位也会验证 rqlite 状态与 strong read，再启动控制进程；进程健康接口建立后 Deployd 才开始组合观测。
 

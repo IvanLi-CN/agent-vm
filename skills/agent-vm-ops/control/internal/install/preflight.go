@@ -18,11 +18,18 @@ import (
 
 type Inputs struct{ Config, Bundle, Materials string }
 type Report struct {
-	Mode           string   `json:"mode"`
-	SourceRevision string   `json:"source_revision,omitempty"`
-	BundleSHA256   string   `json:"bundle_sha256,omitempty"`
-	Blockers       []string `json:"blockers"`
-	Next           string   `json:"next"`
+	Mode              string   `json:"mode"`
+	Version           string   `json:"version,omitempty"`
+	SourceRevision    string   `json:"source_revision,omitempty"`
+	BundleSHA256      string   `json:"bundle_sha256,omitempty"`
+	MaterialsSHA256   string   `json:"materials_manifest_sha256,omitempty"`
+	TransactionID     string   `json:"transaction_id,omitempty"`
+	ActiveSlot        string   `json:"active_slot,omitempty"`
+	PreviousSource    string   `json:"previous_source_revision,omitempty"`
+	PreviousReleaseID string   `json:"previous_release_id,omitempty"`
+	Blockers          []string `json:"blockers"`
+	Next              string   `json:"next"`
+	previousAuthority string
 }
 
 // Preflight never creates directories, records, locks or extracted artifacts.
@@ -47,14 +54,22 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 		f.Close()
 		add(e)
 		if e == nil {
+			report.Version = metadata.Version
 			report.SourceRevision = metadata.SourceRevision
 			_, e = ValidateMaterials(input.Materials, metadata.SourceRevision)
 			add(e)
+			if e == nil {
+				report.MaterialsSHA256, e = digestFile(filepath.Join(input.Materials, "materials-manifest.json"))
+				add(e)
+			}
 		}
 		report.BundleSHA256, e = digestFile(input.Bundle)
 		add(e)
 	}
-	if _, err := os.Lstat("/var/lib/agent-vm-native/active"); err == nil {
+	activePath, activePathErr := deployd.EffectiveActivePath(deployd.Defaults().ActivePath)
+	if activePathErr != nil {
+		add(errors.New("active installation path cannot be inspected"))
+	} else if _, err := os.Lstat(activePath); err == nil {
 		report.Mode = "installed"
 		report.Next = "use agent-vm-deploy stage, verify and activate for upgrades"
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -84,10 +99,18 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 			add(fmt.Errorf("missing prerequisite: %s", name))
 		}
 	}
+	if info, err := os.Stat("/usr/bin/incus"); err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+		add(errors.New("historical slot compatibility requires the packaged /usr/bin/incus executable"))
+	}
 	if _, err := os.Stat("/run/systemd/system"); err != nil {
 		add(errors.New("running systemd is required"))
 	}
 	if configErr == nil {
+		if auth, err := protectedRead(cfg.Files["rqlite_auth"]); err != nil {
+			add(err)
+		} else if _, err := deployd.ExportBackupCredential(auth); err != nil {
+			add(err)
+		}
 		var blue config.Config
 		for _, slot := range []string{"blue", "green"} {
 			c, e := config.Load(cfg.Files[slot+"_config"])
@@ -131,6 +154,7 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 			}
 		}
 		if blue.Project != "" {
+			add(checkIncusCredentials(ctx, cfg, blue.Project))
 			for _, args := range [][]string{{"project", "show", blue.Project}, {"profile", "show", blue.Profile, "--project", blue.Project}, {"network", "show", blue.Network, "--project", blue.Project}, {"storage", "show", blue.Pool}, {"image", "info", blue.ImageFingerprint, "--project", blue.Project}} {
 				if e := exec.CommandContext(ctx, "incus", args...).Run(); e != nil {
 					add(fmt.Errorf("Incus prerequisite failed: %s %s", args[0], args[1]))
@@ -147,7 +171,7 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 // The general daemon supports custom layouts; the installer owns only the
 // fixed service stack and must never redirect migration reads or deletions.
 func validateMigrationLayout(got, want deployd.MigrationConfig) error {
-	if got.LegacySocket != want.LegacySocket || got.LegacyUnit != want.LegacyUnit || got.LegacyStateDB != want.LegacyStateDB || got.RQLiteUnit != want.RQLiteUnit || got.RQLiteCAFile != want.RQLiteCAFile || got.RQLiteAuthFile != want.RQLiteAuthFile || got.RecoveryDirectory != want.RecoveryDirectory || got.RQLiteURL != "https://127.0.0.1:4001" {
+	if got.LegacySocket != want.LegacySocket || got.LegacyUnit != want.LegacyUnit || got.LegacyStateDB != want.LegacyStateDB || got.RQLiteUnit != want.RQLiteUnit || got.RQLiteCAFile != want.RQLiteCAFile || got.RQLiteAuthFile != want.RQLiteAuthFile || got.RQLiteBackupAuth != want.RQLiteBackupAuth || got.RQLiteBackupCA != want.RQLiteBackupCA || got.RecoveryDirectory != want.RecoveryDirectory || got.RQLiteURL != "https://127.0.0.1:4001" {
 		return errors.New("installer requires fixed local migration paths and rqlite authority")
 	}
 	return nil

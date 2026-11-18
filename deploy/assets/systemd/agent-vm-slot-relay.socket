@@ -1,0 +1,15 @@
+[Unit]
+Description=Agent VM historical slot relay socket
+
+[Socket]
+ListenStream=/run/agent-vm-slot-relay/relay.sock
+DirectoryMode=0755
+SocketUser=root
+SocketGroup=agent-vm-deploy
+SocketMode=0660
+Accept=yes
+MaxConnections=8
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target
