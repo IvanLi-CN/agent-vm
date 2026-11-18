@@ -87,6 +87,9 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 			add(fmt.Errorf("missing prerequisite: %s", name))
 		}
 	}
+	if info, err := os.Stat("/usr/bin/incus"); err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+		add(errors.New("historical slot compatibility requires the packaged /usr/bin/incus executable"))
+	}
 	if _, err := os.Stat("/run/systemd/system"); err != nil {
 		add(errors.New("running systemd is required"))
 	}

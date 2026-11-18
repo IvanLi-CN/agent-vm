@@ -18,6 +18,9 @@ func prepareFreshAccounts(ctx context.Context, materials string) error {
 			return errors.New("fresh account setup requires both slots stopped")
 		}
 	}
+	if err := installFile("/opt/agent-vm-native/compat-incus/incus", []byte("#!/bin/sh\nexec /opt/agent-vm-native/bin/agent-vm-deploy legacy-incus \"$AGENT_VM_LEGACY_SLOT\" \"$@\"\n"), 0755, ""); err != nil {
+		return err
+	}
 	for _, unit := range []string{"agent-vm-native@blue.service", "agent-vm-native@green.service", "agent-vm-deployd.service"} {
 		name := "fresh-slot-account.conf"
 		if unit == "agent-vm-deployd.service" {

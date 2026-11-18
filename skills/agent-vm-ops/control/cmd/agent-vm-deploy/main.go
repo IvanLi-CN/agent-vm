@@ -49,6 +49,9 @@ func run(args []string) error {
 		}
 		return deployd.RunHostObservation(os.Stdin)
 	}
+	if args[0] == "legacy-incus" {
+		return runLegacyIncus(args[1:])
+	}
 	if args[0] == "slot-relay" {
 		if len(args) != 1 {
 			return errors.New("slot-relay is a systemd socket handler")

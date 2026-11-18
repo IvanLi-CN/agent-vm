@@ -240,6 +240,8 @@ func applyHostAction(ctx context.Context, action hostAction) error {
 			"\nConditionPathExists=" + cfg + "\n[Service]\nUser=" + slotUser +
 			"\nSupplementaryGroups=agent-vm-server\nEnvironment=INCUS_CONF=/etc/agent-vm-native/incus" +
 			"\nEnvironment=SSL_CERT_FILE=" + ServerAuthorityCA +
+			"\nEnvironment=AGENT_VM_LEGACY_SLOT=" + action.Slot +
+			"\nEnvironment=PATH=/opt/agent-vm-native/compat-incus:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" +
 			"\nExecStart=\nExecStart=" + binary + " serve --config " + cfg +
 			" --manifest " + dirname + "/release-manifest.json\nRestart=" + restart + "\n"
 		if err := writeHostUnit(dir, contents); err != nil {

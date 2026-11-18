@@ -37,7 +37,10 @@ type HostObservationResult struct {
 }
 
 func (c *IncusClient) readHostObservation(ctx context.Context, operation string) (HostObservationResult, error) {
-	request := HostObservationRequest{Slot: c.HostObservationSlot, Operation: operation}
+	return ReadHostObservation(ctx, HostObservationRequest{Slot: c.HostObservationSlot, Operation: operation})
+}
+
+func ReadHostObservation(ctx context.Context, request HostObservationRequest) (HostObservationResult, error) {
 	if err := request.Validate(); err != nil {
 		return HostObservationResult{}, err
 	}
@@ -61,7 +64,7 @@ func (c *IncusClient) readHostObservation(ctx context.Context, operation string)
 	if err != nil || len(data) > hostObservationLimit || json.Unmarshal(data, &value) != nil || value == nil {
 		return HostObservationResult{}, errors.New("host observation could not be verified")
 	}
-	switch operation {
+	switch request.Operation {
 	case "pool-capacity":
 		if value.Capacity.TotalBytes <= 0 || value.Capacity.FreeBytes < 0 || value.Capacity.FreeBytes > value.Capacity.TotalBytes {
 			return HostObservationResult{}, errors.New("invalid host pool capacity")

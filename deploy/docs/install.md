@@ -4,7 +4,7 @@
 
 ## 准备环境与制品
 
-控制环境必须已经运行 systemd 和 Incus，并具备专属项目、profile、网络、network ACL、存储池及已验证的容器镜像。安装器只读取和校验这些条件，不安装 Incus，不改动 PVE、CT 权限、挂载或配额。域名、OIDC 应用及回调地址须事先注册，提供对应 TLS 证书。缺失条件会汇总为预检阻塞项。
+控制环境必须已经运行 systemd 和 Incus，提供发行版安装的 `/usr/bin/incus`，并具备专属项目、profile、网络、network ACL、存储池及已验证的容器镜像。安装器只读取和校验这些条件，不安装 Incus，不改动 PVE、CT 权限、挂载或配额。域名、OIDC 应用及回调地址须事先注册，提供对应 TLS 证书。缺失条件会汇总为预检阻塞项。
 
 嵌套控制环境还须按[权限准备手册](nested-incus.md)验证 UID/GID 范围、subordinate ID 授权、helper 权限和目标 guest 模式。安装器的 Incus 检查只确认项目、profile、网络、存储池和镜像可查询，不启动测试 guest，也不校验嵌套映射覆盖关系。项目/profile 初始化器的 `aligned` 同样不包含权限验收。声明支持非特权 guest 时，应保存显式 `security.privileged=false` 的启动和 Docker 实证，不能用特权 profile 的成功替代。权限准备缺失时，先完成获授权的环境维护，不能把安装预检无阻塞解释为所有运行前提均已满足。
 
