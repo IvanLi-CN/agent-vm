@@ -18,7 +18,8 @@ const migrationDeployBinary = "/opt/agent-vm-native/maintenance/agent-vm-deploy"
 // prepareLegacyCandidateUnit is called with privately staged and validated
 // installation inputs under the release-update lock, before the incumbent daemon
 // receives a stage request.
-func prepareLegacyCandidateUnit(ctx context.Context, activeSlot, materials, product, revision string) error {
+func prepareLegacyCandidateUnit(ctx context.Context, activeSlot string, input Inputs, product, revision string) error {
+	materials := input.Materials
 	var candidate string
 	switch activeSlot {
 	case "blue":
@@ -41,6 +42,9 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot, materials, prod
 	status, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property=ActiveState", "--property=MainPID").Output()
 	if err != nil || !stoppedAccountSlot(string(status)) {
 		return errors.New("account migration requires the candidate slot to be stopped")
+	}
+	if err := prepareCandidateAccess(ctx, candidate, input); err != nil {
+		return err
 	}
 	if err := copyInstall(filepath.Join(product, "bin", "agent-vm-deploy"), migrationDeployBinary, 0700, ""); err != nil {
 		return err

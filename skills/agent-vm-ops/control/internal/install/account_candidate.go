@@ -30,7 +30,7 @@ func prepareAccountCandidate(ctx context.Context, input Inputs, product string, 
 	if err != nil {
 		return deployd.UpdateReceipt{}, err
 	}
-	if err := prepareLegacyCandidateUnit(ctx, report.ActiveSlot, input.Materials, product, report.SourceRevision); err != nil {
+	if err := prepareLegacyCandidateUnit(ctx, report.ActiveSlot, input, product, report.SourceRevision); err != nil {
 		return deployd.UpdateReceipt{}, fmt.Errorf("prepare account candidate in %s: %w", stagingID, err)
 	}
 	receipt, err := client.PrepareBlueGreen(ctx, target, bundle)

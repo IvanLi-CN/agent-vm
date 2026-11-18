@@ -62,6 +62,14 @@ func PreflightAccountMigration(ctx context.Context, input Inputs) (Report, error
 			return fail(err)
 		}
 	}
+	candidate := "green"
+	if snapshot.ActiveSlot == "green" {
+		candidate = "blue"
+	}
+	name := candidate + "_config"
+	if _, err := matchingCandidateConfig(targets[name].path, cfg.Files[name]); err != nil {
+		return fail(err)
+	}
 	if err := checkInstalledBackupReader(ctx, cfg, paths.Migration); err != nil {
 		return fail(err)
 	}
