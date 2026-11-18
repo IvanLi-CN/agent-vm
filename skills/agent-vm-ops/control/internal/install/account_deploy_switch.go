@@ -82,6 +82,18 @@ func transferDeploymentPaths(ctx context.Context, materials, active string) erro
 	if err != nil || validateAccountMigrationRoute(route, filepath.Join(slots, active)) != nil {
 		return errors.New("active route changed before transferring deployment paths")
 	}
+	if err := safeParents(slots); err != nil {
+		return err
+	}
+	uid, _, err := dedicatedDeploymentIDs()
+	if err != nil {
+		return err
+	}
+	for _, slot := range []string{"blue", "green"} {
+		if err := transferLegacySlotDirectories(filepath.Join(slots, slot), filepath.Join("/run/agent-vm-native", slot, "app.sock"), uid); err != nil {
+			return fmt.Errorf("transfer %s slot directories: %w", slot, err)
+		}
+	}
 	if err := adoptActiveRoute(cfg.ActivePath, deployd.ManagedRoute, slots); err != nil {
 		return err
 	}

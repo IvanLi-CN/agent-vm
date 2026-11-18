@@ -85,3 +85,40 @@ func openLegacySlotDirectories(directory, socket string, uid, gid uint32) error 
 	}
 	return nil
 }
+
+func transferLegacySlotDirectories(directory, socket string, deployUID int) error {
+	var directories []string
+	err := filepath.WalkDir(directory, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path == filepath.Join(directory, "app.sock") && entry.Type()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil || target != socket {
+				return errors.New("slot socket link does not point to its own socket")
+			}
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if !rootProtected(info, 0) || (!info.IsDir() && (!info.Mode().IsRegular() || info.Mode()&os.ModeSetgid != 0)) {
+			return errors.New("slot tree contains an unprotected entry")
+		}
+		if info.IsDir() {
+			directories = append(directories, path)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// Transfer children before the parent can be modified by the deploy user.
+	for i := len(directories) - 1; i >= 0; i-- {
+		if err := os.Lchown(directories[i], deployUID, -1); err != nil {
+			return err
+		}
+	}
+	return nil
+}

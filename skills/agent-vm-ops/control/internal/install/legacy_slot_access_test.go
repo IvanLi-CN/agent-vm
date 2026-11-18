@@ -49,3 +49,31 @@ func TestLegacySlotAccessOpensOnlyProtectedDirectories(t *testing.T) {
 	assertMode(dir, 0750)
 	assertMode(program, 0755)
 }
+
+func TestTransferLegacySlotDirectoriesLeavesReleaseFilesRootOwned(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("requires root to exercise directory ownership transfer")
+	}
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	program := filepath.Join(bin, "agent-vm-server")
+	if err := os.Mkdir(bin, 0750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(program, []byte("release artifact"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	const deployUID = 65534
+	if err := transferLegacySlotDirectories(root, "/run/agent-vm-native/blue/app.sock", deployUID); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]uint32{root: deployUID, bin: deployUID, program: 0} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Sys().(*syscall.Stat_t).Uid; got != want {
+			t.Errorf("%s owner = %d, want %d", path, got, want)
+		}
+	}
+}
