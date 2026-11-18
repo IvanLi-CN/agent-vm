@@ -1,6 +1,6 @@
 # Agent VM 管理 API 合同
 
-内置管理台使用由 [management-api.yaml](management-api.yaml) 及其[合成共享示例](management/examples/)定义的同源 `/api/v1` 接口。API 由当前活动的蓝色或绿色 Agent VM 服务提供。它管理已有的 Agent VM 资源，并独立于 protocol 4 的 [Agent API](agent-api.md)、[Token API](token-api.md) 和部署观测桥接。
+内置管理台使用由 [management-api.yaml](management-api.yaml) 及其接口示例引用定义的同源 `/api/v1` 接口。API 由当前活动的蓝色或绿色 Agent VM 服务提供。它管理已有的 Agent VM 资源，并独立于 protocol 4 的 [Agent API](agent-api.md)、[Token API](token-api.md) 和部署观测桥接。
 
 ## 认证、身份与服务边界
 

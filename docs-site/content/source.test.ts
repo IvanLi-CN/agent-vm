@@ -13,6 +13,7 @@ test('links use pages, fixed commits and modified snapshots without rewriting co
   expect(output.text).toContain('blob/abc/docs/clean.md');
   expect(output.text).toContain('[fake](secret.md)');
   expect(output.snapshots['docs/draft.md']).toBe('draft');
+  expect(output.diagnostics).toContain('Missing page anchor: docs/other.md#章节');
 });
 test('missing and escaping references are diagnosed without reading outside root', async () => {
   const source={path:'docs/a.md',text:'[escape](../../secret.md)\n[missing](absent.md)',slug:'0'};

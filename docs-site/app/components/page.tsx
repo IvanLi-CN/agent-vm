@@ -4,6 +4,7 @@ import { Accordion, Accordions } from 'fumadocs-ui/components/accordion';
 import { Callout } from 'fumadocs-ui/components/callout';
 import { buttonVariants } from 'fumadocs-ui/components/ui/button';
 import { useCopyButton } from 'fumadocs-ui/utils/use-copy-button';
+import { Check, Copy, ExternalLink } from 'lucide-react';
 import data from '../data';
 
 interface DocumentActionsProps {
@@ -25,6 +26,30 @@ export function DocumentActions({ identity, copyLink = () => navigator.clipboard
         <Accordion title="文档来源" value="source"><p>{identity.revision.slice(0, 12)} · {identity.dirty ? '包含本地修改' : '干净提交'} · 内容 {identity.sourceId.slice(0, 12)}</p></Accordion>
       </Accordions>
     </footer>;
+}
+
+export function DocumentPath({ path, githubHref }: { path: string; githubHref?: string }) {
+  const [copyError, setCopyError] = useState(false);
+  const [copied, copy] = useCopyButton(async () => {
+    setCopyError(false);
+    try { await navigator.clipboard.writeText(path); }
+    catch { setCopyError(true); }
+  });
+  return <div className="document-path" aria-label="文档来源文件">
+    <div className="document-path-value">
+      <span className="document-path-label">来源文件</span>
+      <code title={path}>{path}</code>
+    </div>
+    <div className="document-path-actions">
+      {githubHref ? <a className={buttonVariants({ variant: 'ghost', size: 'sm' })} href={githubHref} target="_blank" rel="noreferrer">
+        <ExternalLink aria-hidden="true" size={15}/><span>在 GitHub 查看</span>
+      </a> : <span className="document-path-status" title="当前工作区内容尚未同步到 GitHub">本地修改未同步到 GitHub</span>}
+      <button type="button" className={buttonVariants({ variant: 'ghost', size: 'sm' })} onClick={copy} aria-label="复制文档路径" title="复制文档路径">
+        {copied ? <Check aria-hidden="true" size={15}/> : <Copy aria-hidden="true" size={15}/>}<span>{copyError ? '复制失败，请重试' : copied ? '已复制' : '复制路径'}</span>
+      </button>
+    </div>
+    <span className="sr-only" role="status">{copyError ? '无法访问剪贴板，请重试。' : copied ? '文档路径已复制' : ''}</span>
+  </div>;
 }
 
 export function Page({ children, ...props }: ComponentProps<typeof DocsPage>) {

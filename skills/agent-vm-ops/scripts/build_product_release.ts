@@ -29,7 +29,7 @@ import {
   type ClientTransport,
   type ProductTarget,
 } from "./product-manifest.ts";
-import { CLIENT_DEPENDENCIES } from "../../agent-vm/scripts/client-release.ts";
+import { CLIENT_DEPENDENCIES } from "./client-release.ts";
 
 const usage = "usage: build_product_release.ts --version <semver> --source-revision <40-hex> --target <client|linux/amd64|linux/arm64> --output <absolute-path> [--transport <go-request>]";
 const args = process.argv.slice(2);
@@ -58,7 +58,7 @@ const output = resolve(rawOutput);
 if (existsSync(output)) throw new Error(`output already exists: ${output}`);
 
 const repositoryRoot = resolve(import.meta.dir, "../../..");
-const clientRoot = resolve(import.meta.dir, "../../agent-vm/scripts");
+const clientRoot = resolve(import.meta.dir, ".");
 const operationsRoot = resolve(import.meta.dir, "..");
 const temporaryRoot = mkdtempSync(join(tmpdir(), "agent-vm-product-release-"));
 

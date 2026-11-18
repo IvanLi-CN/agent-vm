@@ -49,7 +49,7 @@ require_command systemctl
 require_command go
 
 static_result="$proof_dir/static.json"
-bun run "$repository_root/skills/agent-vm-ops/scripts/validate_blue_green_deployment.ts" >"$static_result" || {
+bun run "$repository_root/deploy/scripts/validate_blue_green_deployment.ts" >"$static_result" || {
   cat "$static_result" >&2
   fail "static deployment validation failed"
 }
@@ -66,7 +66,7 @@ caddy_binary="$proof_dir/caddy/caddy"
 "$caddy_binary" version | grep -q '2.11.7' || fail "Caddy version is not 2.11.7"
 
 ca_dir="$proof_dir/ca"
-bash "$repository_root/skills/agent-vm-ops/scripts/generate_deployment_ca.sh" \
+bash "$repository_root/deploy/scripts/generate_deployment_ca.sh" \
   --output-dir "$ca_dir" --hostname deployment-test.local >"$proof_dir/ca.json"
 
 caddy_config="$proof_dir/Caddyfile"
@@ -278,10 +278,10 @@ printf '{"slot":"blue"}\n' >"$layout_root/slots/blue/release-manifest.json"
 printf '{"slot":"green"}\n' >"$layout_root/slots/green/release-manifest.json"
 ln -s "$runtime_root/blue/app.sock" "$layout_root/slots/blue/app.sock"
 ln -s "$runtime_root/green/app.sock" "$layout_root/slots/green/app.sock"
-bash "$repository_root/skills/agent-vm-ops/scripts/agent_vm_cutover.sh" \
+bash "$repository_root/deploy/scripts/agent_vm_cutover.sh" \
   --root "$layout_root" --runtime-root "$runtime_root" --slot green --dry-run >"$proof_dir/cutover.json"
 ln -s "$layout_root/slots/blue" "$layout_root/active"
-if bash "$repository_root/skills/agent-vm-ops/scripts/agent_vm_cutover.sh" \
+if bash "$repository_root/deploy/scripts/agent_vm_cutover.sh" \
   --root "$layout_root" --runtime-root "$runtime_root" --slot red --dry-run >/dev/null 2>&1; then
   fail "cutover accepted an unknown slot"
 fi
@@ -380,7 +380,7 @@ state_generation="6728b2001bc842af236929770c506c5dca42faca834859e693d7b9ff7d969c
 invalid_evidence="$proof_dir/invalid-evidence.json"
 write_evidence_payload "$proof_dir/invalid-payload.json" invalid-deployment-0001 false "$sqlite_source_sha256" "$sqlite_source_size" commit-1 epoch-1 "$state_generation" - -
 sign_evidence "$proof_dir/invalid-payload.json" "$invalid_evidence"
-if bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.ts" \
+if bun run "$repository_root/deploy/scripts/agent_vm_state_migration.ts" \
   preflight --source "$sqlite_source" --evidence "$invalid_evidence" --evidence-public-key "$evidence_public_key" --output-dir "$proof_dir/invalid-output" >/dev/null 2>&1; then
   fail "migration preflight accepted incomplete fence evidence"
 fi
@@ -388,7 +388,7 @@ evidence="$proof_dir/evidence.json"
 write_evidence_payload "$proof_dir/evidence-payload.json" isolated-deployment-0001 true "$sqlite_source_sha256" "$sqlite_source_size" commit-1 epoch-1 "$state_generation" - -
 sign_evidence "$proof_dir/evidence-payload.json" "$evidence"
 migration_dir="$proof_dir/migration"
-bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.ts" \
+bun run "$repository_root/deploy/scripts/agent_vm_state_migration.ts" \
   preflight --source "$sqlite_source" --evidence "$evidence" --evidence-public-key "$evidence_public_key" --output-dir "$migration_dir" >"$proof_dir/migration.json"
 backup_sha256="$(python3 - "$migration_dir/snapshot-manifest.json" <<'PY'
 import json
@@ -400,7 +400,7 @@ PY
 tail_evidence="$proof_dir/tail-evidence.json"
 write_evidence_payload "$proof_dir/tail-payload.json" isolated-deployment-0002 true - - commit-1 epoch-1 "$state_generation" true "$backup_sha256"
 sign_evidence "$proof_dir/tail-payload.json" "$tail_evidence"
-bun run "$repository_root/skills/agent-vm-ops/scripts/agent_vm_state_migration.ts" \
+bun run "$repository_root/deploy/scripts/agent_vm_state_migration.ts" \
   restore-check --backup-manifest "$migration_dir/snapshot-manifest.json" \
   --tail-evidence "$tail_evidence" --evidence-public-key "$evidence_public_key" --output "$proof_dir/restore.json" >"$proof_dir/restore-result.json"
 
@@ -415,7 +415,7 @@ AGENT_VM_TEST_RECOVERY_RQLITE_URL="$rqlite_base" \
 AGENT_VM_TEST_RECOVERY_RQLITE_CA="$ca_dir/ca.crt" \
 AGENT_VM_TEST_RECOVERY_RQLITE_AUTH="$proof_dir/backup-auth.json" \
 AGENT_VM_TEST_RECOVERY_RQLITE_CONTROL="$control_secret" \
-  bash "$repository_root/skills/agent-vm-ops/scripts/agent_vm_deployd_systemd_acceptance.sh" >"$proof_dir/deployd-systemd-acceptance.json" 2>&1 || {
+  bash "$repository_root/deploy/scripts/agent_vm_deployd_systemd_acceptance.sh" >"$proof_dir/deployd-systemd-acceptance.json" 2>&1 || {
   cat "$proof_dir/deployd-systemd-acceptance.json" >&2
   fail "real Deployd systemd acceptance failed"
 }
