@@ -59,16 +59,12 @@ func PreflightAccountMigration(ctx context.Context, input Inputs) (Report, error
 	report.PreviousSource = metadata.SourceRevision
 	report.previousAuthority = active.StateAuthority
 	report.PreviousReleaseID = metadata.ReleaseID
-	previous, err := config.Load(targets[snapshot.ActiveSlot+"_config"].path)
-	if err != nil {
-		return fail(err)
-	}
-	if _, err := legacySlotLockMount(previous.StoragePath); err != nil {
-		return fail(err)
-	}
 	for _, slot := range []string{"blue", "green"} {
 		if err := checkAccountMigrationConfig(slot, cfg.Files[slot+"_config"], active.StateAuthority); err != nil {
 			return fail(err)
+		}
+		if _, err := installedSlotLockMount(slot); err != nil {
+			return fail(fmt.Errorf("%s slot: %w", slot, err))
 		}
 	}
 	candidate := "green"

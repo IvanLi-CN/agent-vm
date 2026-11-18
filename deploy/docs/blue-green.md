@@ -116,7 +116,7 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 候选槽的配置输入须与该槽宿主上已安装的配置逐字节一致；账户迁移只调整服务账户的读取权限。预检还核对输入中的专用备份身份与宿主已安装的 rqlite 认证配置一致，并用提供的 TLS 证书对现役 rqlite 执行一次线性一致的只读查询。这一步不创建恢复点，也不变更 rqlite 权限。
 
-旧版回退槽通过该服务的私有挂载读取和写入共享锁目录。预检要求 Incus 存储路径及已有锁目录均由 root 保护，路径中不能有符号链接。部署不授予主服务对 Incus 存储池的写权限。
+账户迁移为两槽配置私有挂载，使任一槽运行旧版时都能使用同一个共享锁目录。预检要求两个槽的 Incus 存储路径及已有锁目录均由 root 保护，路径中不能有符号链接。部署不授予主服务对 Incus 存储池的写权限。
 
 只有在隔离 Linux 主机上用相同产物完成账户迁移、连续登录和业务读写检查，并证明原版本能以专用账户回退后，才将该次验收的身份记录作为宿主维护输入。记录是 root 持有的 JSON 文件，`schema_version` 为 1；`previous_source_revision`、`previous_release_id`、`candidate_source_revision`、`candidate_bundle_sha256`、`materials_manifest_sha256` 分别绑定验收使用的版本和产物。不要用生产预检结果代替隔离验收。
 

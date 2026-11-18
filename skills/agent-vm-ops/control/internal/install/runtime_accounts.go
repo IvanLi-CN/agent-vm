@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -124,20 +125,18 @@ func finalizeSlotAccounts(ctx context.Context, input Inputs, active string) erro
 	if err != nil {
 		return err
 	}
-	previous, err := config.Load(targets[rollback+"_config"].path)
-	if err != nil {
-		return err
-	}
-	legacyMount, err := legacySlotLockMount(previous.StoragePath)
-	if err != nil {
-		return err
+	// Either slot can receive a historical release in a later update.
+	mounts := make(map[string][]byte, 2)
+	for _, slot := range []string{rollback, active} {
+		mount, err := installedSlotLockMount(slot)
+		if err != nil {
+			return fmt.Errorf("%s slot: %w", slot, err)
+		}
+		mounts[slot] = mount
 	}
 	for _, slot := range []string{rollback, active} {
 		dir := filepath.Join("/etc/systemd/system", "agent-vm-native@"+slot+".service.d")
-		content := account
-		if slot == rollback {
-			content = append(append(bytes.Clone(account), '\n'), legacyMount...)
-		}
+		content := append(append(bytes.Clone(account), '\n'), mounts[slot]...)
 		if err := installFile(filepath.Join(dir, "20-service-account.conf"), content, 0644, ""); err != nil {
 			return err
 		}
@@ -153,6 +152,14 @@ func finalizeSlotAccounts(ctx context.Context, input Inputs, active string) erro
 }
 
 var systemdStoragePath = regexp.MustCompile(`^(/[A-Za-z0-9._-]+)+$`)
+
+func installedSlotLockMount(slot string) ([]byte, error) {
+	current, err := config.Load(targets[slot+"_config"].path)
+	if err != nil {
+		return nil, err
+	}
+	return legacySlotLockMount(current.StoragePath)
+}
 
 func legacySlotLockMount(storagePath string) ([]byte, error) {
 	if !systemdStoragePath.MatchString(storagePath) || filepath.Clean(storagePath) != storagePath {
