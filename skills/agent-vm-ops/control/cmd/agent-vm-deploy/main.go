@@ -204,6 +204,9 @@ func runUpdate(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := exposeVerifiedBundle(directory, bundle); err != nil {
+		return err
+	}
 	statusPayload, _, err := client.Call(ctx, "GET", "/v1/status", nil)
 	if err != nil {
 		// statusPayload is intentionally bounded by deployd.Client and preserves

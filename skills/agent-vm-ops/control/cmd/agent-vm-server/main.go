@@ -19,6 +19,7 @@ import (
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/httpserver"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/lifecycle"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/management"
@@ -130,6 +131,13 @@ func serve(args []string) error {
 	}
 	defer store.Close()
 	managementStateSupported := len(release.StateReads) > 0 && len(release.StateWrites) > 0
+	lockDir := filepath.Join(cfg.StoragePath, "locks")
+	if deployd.IsServerAccount(os.Geteuid()) {
+		lockDir = filepath.Join(deployd.ServerRuntimeHome, "locks")
+		if cfg.Management.Upload.Enabled {
+			cfg.Management.Upload.StagingPath = filepath.Join(deployd.ServerRuntimeHome, "image-staging")
+		}
+	}
 	if cfg.Management.Enabled && !managementStateSupported {
 		return errors.New("management_disabled: installed release does not declare management state compatibility")
 	}
@@ -140,7 +148,7 @@ func serve(args []string) error {
 		// SQLite is single-writer, but the staging directory is also shared by
 		// the two resident services. Hold the same resource lock used by the
 		// upload path before removing files left by a crashed peer.
-		stagingLock, err := native.AcquireNamedLock(context.Background(), filepath.Join(cfg.StoragePath, "locks"), "management-resource:image-staging")
+		stagingLock, err := native.AcquireNamedLock(context.Background(), lockDir, "management-resource:image-staging")
 		if err != nil {
 			return fmt.Errorf("lock upload staging: %w", err)
 		}
@@ -200,7 +208,7 @@ func serve(args []string) error {
 			Actions: actions,
 		}
 	}
-	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver(), Memory: observe.NewMemoryObserver(), Release: releaseMetadata, LockDir: filepath.Join(cfg.StoragePath, "locks")})
+	service := lifecycle.New(store, cfg, lifecycle.Options{Guest: guest, Resident: true, Snapshots: snapshots, CPU: observe.NewCPUObserver(), Memory: observe.NewMemoryObserver(), Release: releaseMetadata, LockDir: lockDir})
 	roleGate := controllerrole.New(cfg.Slot, time.Now)
 	leaseCommit := func(commit func() error) error {
 		err := roleGate.WithValid(commit)
@@ -242,7 +250,7 @@ func serve(args []string) error {
 		Clock:            time.Now,
 		Backend:          imageBackend,
 		Actions:          &webadmin.LifecycleActions{Service: service, Store: store},
-		OperationLockDir: filepath.Join(cfg.StoragePath, "locks"),
+		OperationLockDir: lockDir,
 	}
 	if cfg.Management.Upload.Enabled {
 		managementOptions.AvailableStagingBytes = func() (int64, error) {

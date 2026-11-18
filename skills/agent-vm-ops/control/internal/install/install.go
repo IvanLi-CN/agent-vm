@@ -276,7 +276,14 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 			return report, err
 		}
 	}
-	if err := copyInstall(input.Bundle, cachedBundle, 0600, ""); err != nil {
+	bundleMode, bundleGroup := os.FileMode(0600), ""
+	if report.Mode == "fresh" {
+		bundleMode, bundleGroup = 0640, "agent-vm-deploy"
+		if err := prepareFreshAccounts(ctx, input.Materials); err != nil {
+			return report, err
+		}
+	}
+	if err := copyInstall(input.Bundle, cachedBundle, bundleMode, bundleGroup); err != nil {
 		return report, err
 	}
 	if hash, err := digestFile(cachedBundle); err != nil || hash != r.BundleSHA256 {
@@ -315,10 +322,10 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		report.Next = "verify migrated state and VM lifecycle using deploy/docs/acceptance.md"
 		return report, nil
 	}
-	if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-rqlite.service", "agent-vm-deployd.service"); err != nil {
+	if err := prepareFreshRoute(deployd.Defaults().ActivePath, deployd.ManagedRoute); err != nil {
 		return report, err
 	}
-	if err := prepareFreshRoute(deployd.Defaults().ActivePath, deployd.ManagedRoute); err != nil {
+	if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-rqlite.service", "agent-vm-deployd.socket", "agent-vm-deployd.service"); err != nil {
 		return report, err
 	}
 	client := deployd.Client{Socket: "/run/agent-vm-native/deployd.sock", Timeout: 30 * time.Minute}

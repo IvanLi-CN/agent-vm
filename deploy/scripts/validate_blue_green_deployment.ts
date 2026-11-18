@@ -147,7 +147,8 @@ requireText(sysusers, "u caddy", "the edge proxy user is declared");
 
 const tmpfiles = read(join(assetsRoot, "tmpfiles.d/agent-vm-native.conf"));
 forbidText(tmpfiles, "/var/lib/agent-vm-native/active 0750", "tmpfiles does not pre-create the active symlink as a directory");
-requireText(tmpfiles, "/var/lib/agent-vm-native/slots 0750", "slot storage has a fixed owner and mode");
+const accountTmpfiles = read(join(assetsRoot, "tmpfiles.d/agent-vm-fresh-accounts.conf"));
+requireText(accountTmpfiles, "/var/lib/agent-vm-native/slots 2750 agent-vm-deploy agent-vm-web", "fresh slot storage is writable by deployment and readable by the slot group");
 requireText(tmpfiles, "/var/lib/agent-vm-native/rqlite 0700", "rqlite data has private mode");
 
 const scriptPaths = [

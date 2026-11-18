@@ -51,6 +51,15 @@ type Config struct {
 	Migration      MigrationConfig  `json:"migration"`
 }
 
+const DedicatedDatabase = "/var/lib/agent-vm-native/deployment/runtime/deployment.sqlite3"
+const ServerRuntimeHome = "/var/lib/agent-vm-native/server"
+
+func (config *Config) SelectRuntimeDatabase(uid int) {
+	if isDeployAccount(uid) && config.Database == Defaults().Database {
+		config.Database = DedicatedDatabase
+	}
+}
+
 func Defaults() Config {
 	return Config{
 		Socket:         "/run/agent-vm-native/deployd.sock",
