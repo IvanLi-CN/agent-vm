@@ -42,3 +42,22 @@ func TestBlueGreenRetainsOriginalTransactionAcrossCoordinatorEnvelopes(t *testin
 		})
 	}
 }
+
+func TestBlueGreenPrepareDoesNotActivate(t *testing.T) {
+	var calls []string
+	result, err := prepareBlueGreen(t.Context(), func(_ context.Context, _, path string, _ any) ([]byte, int, error) {
+		calls = append(calls, path)
+		switch path {
+		case "/v1/stage":
+			return []byte(`{"ok":true,"transaction_id":"tx-1","phase":"standby_validation","state":"active"}`), 200, nil
+		case "/v1/verify":
+			return []byte(`{"ok":true,"transaction_id":"tx-1","phase":"controller_handoff","state":"active"}`), 200, nil
+		default:
+			t.Fatalf("unexpected request: %s", path)
+			return nil, 0, nil
+		}
+	}, "green", "/protected/bundle.tar")
+	if err != nil || result.ID != "tx-1" || result.Action != "verify" || strings.Join(calls, " ") != "/v1/stage /v1/verify" {
+		t.Fatalf("receipt=%+v calls=%v err=%v", result, calls, err)
+	}
+}

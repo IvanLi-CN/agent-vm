@@ -308,7 +308,8 @@ func cleanupOrphanStaging(ctx context.Context, client deployd.Client, root strin
 	}
 	now := time.Now()
 	for _, entry := range entries {
-		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".update-") {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), ".update-") ||
+			strings.HasPrefix(entry.Name(), install.AccountMigrationStagingPrefix) {
 			continue
 		}
 		if _, ok := protected[entry.Name()]; ok {
