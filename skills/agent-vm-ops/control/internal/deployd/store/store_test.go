@@ -179,6 +179,13 @@ func TestStoreTransitionsAndCleansOnlyFinalizedHistory(t *testing.T) {
 	if _, err := s.Transition(context.Background(), transaction.ID, "standby_validation", "finalize", "finalized", "finalized", "test", nil, transaction.UpdatedAt.Add(2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
+	current := transaction
+	current.ID, current.TargetSlot, current.PreviousSlot = "tx-current", "blue", "green"
+	current.Generation++
+	current.Phase, current.State = "finalize", "finalized"
+	if err := s.Create(context.Background(), current, nil); err != nil {
+		t.Fatal(err)
+	}
 	removed, err := s.Cleanup(context.Background(), now)
 	if err != nil || removed != 1 {
 		t.Fatalf("cleanup removed=%d err=%v", removed, err)
@@ -189,6 +196,9 @@ func TestStoreTransitionsAndCleansOnlyFinalizedHistory(t *testing.T) {
 	}
 	if missing != nil {
 		t.Fatalf("finalized transaction was retained: %#v", missing)
+	}
+	if retained, err := s.LatestRollbackTarget(context.Background()); err != nil || retained != current.ID {
+		t.Fatalf("latest rollback target = %q, err=%v", retained, err)
 	}
 }
 

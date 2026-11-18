@@ -58,6 +58,17 @@ type provenance struct {
 }
 
 func Fetch(ctx context.Context, version, sourceRevision, directory string) (string, error) {
+	return Prepare(ctx, version, sourceRevision, directory, "", "")
+}
+
+func Prepare(ctx context.Context, version, sourceRevision, directory, localBundle, serverFile string) (string, error) {
+	return prepare(ctx, &http.Client{}, runtime.GOOS, runtime.GOARCH, version, sourceRevision, directory, localBundle, serverFile)
+}
+
+func prepare(ctx context.Context, client *http.Client, targetOS, arch, version, sourceRevision, directory, localBundle, serverFile string) (string, error) {
+	if serverFile != "" && localBundle == "" {
+		return "", errors.New("server file requires a complete release bundle")
+	}
 	if version == "" || strings.HasPrefix(version, "v") || strings.ContainsAny(version, " /\\") {
 		return "", errors.New("version must be a release SemVer without v")
 	}
@@ -67,12 +78,10 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 	if _, err := hex.DecodeString(sourceRevision); err != nil {
 		return "", errors.New("source revision must be hexadecimal")
 	}
-	arch := runtime.GOARCH
-	if runtime.GOOS != "linux" || (arch != "amd64" && arch != "arm64") {
-		return "", fmt.Errorf("unsupported deployment target %s/%s", runtime.GOOS, arch)
+	if targetOS != "linux" || (arch != "amd64" && arch != "arm64") {
+		return "", fmt.Errorf("unsupported deployment target %s/%s", targetOS, arch)
 	}
 	assetName := fmt.Sprintf("agent-vm-native-%s-linux-%s.tar", version, arch)
-	client := &http.Client{}
 	response, err := metadata(ctx, client, version)
 	if err != nil {
 		return "", err
@@ -129,7 +138,13 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 		if name == assetName {
 			limit = 128 << 20
 		}
-		if err := download(ctx, client, urls[name], path, readToken(), limit); err != nil {
+		var err error
+		if name == assetName && localBundle != "" {
+			err = copyProtected(localBundle, path, limit)
+		} else {
+			err = download(ctx, client, urls[name], path, readToken(), limit)
+		}
+		if err != nil {
 			return "", err
 		}
 		files[name] = path
@@ -161,20 +176,35 @@ func Fetch(ctx context.Context, version, sourceRevision, directory string) (stri
 		return "", validationError("release_checksums_invalid", "release_validation", "checksums_truncated", "inspect_release")
 	}
 	checksum := strings.Fields(string(sums))
+	bundleDigest := digest(files[assetName])
 	checksumFound := false
 	for index := 0; index+1 < len(checksum); index += 2 {
-		if checksum[index+1] == assetName && checksum[index] == digest(files[assetName]) {
+		if checksum[index+1] == assetName && bundleDigest != "" && checksum[index] == bundleDigest {
 			checksumFound = true
 		}
 	}
 	if !checksumFound {
 		return "", validationError("release_checksum_mismatch", "release_validation", "requested_asset_checksum_mismatch", "inspect_release")
 	}
-	if proof.Version != version || proof.SourceRevision != sourceRevision || proof.Packages[assetName] != digest(files[assetName]) {
+	if proof.Version != version || proof.SourceRevision != sourceRevision || proof.Packages[assetName] != bundleDigest {
 		return "", validationError("release_provenance_mismatch", "release_validation", "provenance_does_not_match_candidate", "inspect_release")
 	}
-	if err := verifyTarget(files[assetName], runtime.GOOS, arch, sourceRevision); err != nil {
+	if err := verifyTarget(files[assetName], targetOS, arch, sourceRevision, version); err != nil {
 		return "", validationError("release_manifest_invalid", "release_validation", "manifest_target_or_source_mismatch", "inspect_release")
+	}
+	if serverFile != "" {
+		const maxServerBytes = 128 << 20
+		if err := checkCapacity(directory, maxServerBytes); err != nil {
+			return "", err
+		}
+		stagedServer := filepath.Join(directory, ".specified-server")
+		if err := copyProtected(serverFile, stagedServer, maxServerBytes); err != nil {
+			return "", err
+		}
+		defer os.Remove(stagedServer)
+		if err := verifyServer(files[assetName], stagedServer); err != nil {
+			return "", err
+		}
 	}
 	return files[assetName], nil
 }
@@ -413,7 +443,7 @@ func digest(path string) string {
 	}
 	return hex.EncodeToString(sum.Sum(nil))
 }
-func verifyTarget(path, wantOS, wantArch, source string) error {
+func verifyTarget(path, wantOS, wantArch, source, version string) error {
 	file, err := os.Open(path)
 	if err != nil {
 		return err
@@ -433,6 +463,7 @@ func verifyTarget(path, wantOS, wantArch, source string) error {
 		}
 		var manifest struct {
 			SourceRevision string `json:"source_revision"`
+			Version        string `json:"version"`
 			Target         struct {
 				OS   string `json:"os"`
 				Arch string `json:"arch"`
@@ -441,7 +472,7 @@ func verifyTarget(path, wantOS, wantArch, source string) error {
 		if err := json.NewDecoder(io.LimitReader(reader, 1<<20)).Decode(&manifest); err != nil {
 			return err
 		}
-		if manifest.SourceRevision != source || manifest.Target.OS != wantOS || manifest.Target.Arch != wantArch {
+		if manifest.SourceRevision != source || manifest.Version != version || manifest.Target.OS != wantOS || manifest.Target.Arch != wantArch {
 			return errors.New("release manifest target or source mismatch")
 		}
 		return nil

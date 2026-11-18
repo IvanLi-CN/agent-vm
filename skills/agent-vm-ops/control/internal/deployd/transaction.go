@@ -254,6 +254,10 @@ func (manager *Manager) Stage(ctx context.Context, targetSlot, bundle string) (*
 		}
 	}
 	createdEvidence := map[string]any{"active_slot": observation.ActiveSlot}
+	backupBeforeStage := manager.usesRecoveryPoints() && observation.ActiveSlot != "none"
+	if backupBeforeStage {
+		createdEvidence["backup_before_stage"] = true
+	}
 	if observation.ActiveSlot != "none" {
 		previous, ok := observation.Slots[observation.ActiveSlot]
 		if !ok || previous.ReleaseID == "" || previous.SourceRevision == "" || previous.StateEpoch == "" || previous.StateAuthority == "" || len(previous.StateCapabilities) == 0 {
@@ -269,6 +273,15 @@ func (manager *Manager) Stage(ctx context.Context, targetSlot, bundle string) (*
 	transaction := store.Transaction{ID: newID("tx"), TargetSlot: targetSlot, PreviousSlot: observation.ActiveSlot, Bundle: bundle, Phase: PhaseStage, State: "active", Generation: now.UnixNano(), CreatedAt: now, UpdatedAt: now}
 	if err := manager.Store.Create(ctx, transaction, createdEvidence); err != nil {
 		return nil, err
+	}
+	if err := manager.prepareRecoveryPoint(ctx, transaction, "stage", observation.Slots[observation.ActiveSlot]); err != nil {
+		// This failure precedes anything that can change either slot's roles.
+		return nil, manager.failure(context.WithoutCancel(ctx), transaction.ID, PhaseStage, err)
+	}
+	if backupBeforeStage {
+		if _, err := manager.Store.Transition(ctx, transaction.ID, PhaseStage, PhaseStage, "active", "stage_effect_started", "deployd", nil, manager.Clock().UTC()); err != nil {
+			return nil, err
+		}
 	}
 	if err := manager.withControllerRenewal(ctx, observation.Slots[observation.ActiveSlot], func(stageContext context.Context) error {
 		return manager.Runtime.Stage(stageContext, targetSlot, bundle)
@@ -524,6 +537,28 @@ func (manager *Manager) Rollback(ctx context.Context, id string) (*store.Transac
 	if transaction.RollbackUsed && transaction.Phase != PhaseRollback {
 		return nil, errors.New("transaction rollback is already used")
 	}
+	if transaction.State == "finalized" && manager.usesRecoveryPoints() {
+		if err := manager.ensureNoActiveTransaction(ctx); err != nil {
+			return nil, err
+		}
+		observation, err := manager.observe(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if !validObservation(observation, manager.Clock().UTC()) || observation.ActiveSlot != transaction.TargetSlot {
+			return nil, errors.New("rollback requires the currently active deployment")
+		}
+		latest, err := manager.Store.LatestRollbackTarget(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if latest != id {
+			return nil, errors.New("rollback requires the latest deployment transaction")
+		}
+		if err := manager.prepareRecoveryPoint(ctx, *transaction, "rollback", observation.Slots[observation.ActiveSlot]); err != nil {
+			return nil, err
+		}
+	}
 	if err := manager.rollback(ctx, *transaction); err != nil {
 		return nil, err
 	}
@@ -719,6 +754,16 @@ func (manager *Manager) RecoverOnStart(ctx context.Context) error {
 	}
 	var firstErr error
 	for _, transaction := range transactions {
+		if transaction.Phase == PhaseStage {
+			created, startErr := manager.Store.LatestEventByTransition(ctx, transaction.ID, "created")
+			started, effectErr := manager.Store.LatestEventByTransition(ctx, transaction.ID, "stage_effect_started")
+			if startErr == nil && effectErr == nil && created != nil && created.Evidence["backup_before_stage"] == true && started == nil {
+				if _, err := manager.Store.Transition(ctx, transaction.ID, PhaseStage, PhaseStage, "failed", "backup_interrupted", "deployd", nil, manager.Clock().UTC()); err != nil && firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+		}
 		if transaction.TargetSlot == "state" && manager.Migration != nil {
 			if err := manager.recoverMigrationOnStart(ctx, transaction); err != nil && firstErr == nil {
 				firstErr = err
@@ -1121,6 +1166,9 @@ func (manager *Manager) verifiedPreviousIdentity(ctx context.Context, id string)
 
 func (manager *Manager) failure(ctx context.Context, id, phase string, cause error) error {
 	code := "deployment_failed"
+	if errors.Is(cause, errBackupStorageExhausted) {
+		code = "backup_storage_exhausted"
+	}
 	if phase == PhaseRollback || errors.Is(cause, ErrUncertain) {
 		code = "state_unverified"
 	}

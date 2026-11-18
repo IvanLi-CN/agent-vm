@@ -284,7 +284,7 @@ Incus 项目级共享 `incus_*` 指标由槽位只读采样，Deployd 只输出�
 
 ## 运维命令与发布获取诊断
 
-独立程序 `agent-vm-deploy` 只连接部署控制器受保护的本机 Unix socket，提供 `status`、`plan`、`verify`、`stage`、`activate`、`rollback`、`recover` 和首次迁移 `migrate`。`update --version <semver> --source-revision <sha>` 在目标服务器按该服务器架构获取并验证发布产物，再提交同一组蓝绿事务；Agent 工作站不得代替目标服务器下载或上传控制面部署包。
+`agent-vm-deploy serve` 启动部署控制服务。同一二进制的操作命令连接受保护的本机 Unix socket。`update --version <semver> --source-revision <sha>` 默认在控制宿主下载正式完整包；`--bundle <path>` 使用控制宿主上的正式完整包，并在宿主上核对同一份正式发布的摘要、版本、源码和架构。`--server-file <path>` 需要同时提供 `--bundle`，且文件必须与包内 `agent-vm-server` 字节一致。两个输入路径提交同一组蓝绿事务。
 
 发布元数据查询可以匿名执行，也可以读取目标主机上仅 root 可读的最小权限发布凭据。失败响应保留 `code`、`phase`、`http_status`、`retryable`、`reason`、`next_action`、`request_id` 和 `retry_after_seconds`；不得输出 Token、完整第三方响应或私有部署路径。匿名 API 限流返回 `release_rate_limited`，权限拒绝返回 `release_access_denied`，网络和 5xx 故障只进行有限重试。查询与校验完成前，不能向 Deployd 提交事务。
 

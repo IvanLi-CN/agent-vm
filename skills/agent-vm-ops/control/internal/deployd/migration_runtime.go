@@ -553,7 +553,10 @@ func (runtime *HostRuntime) checkMigrationBudget(sourceSize int64) error {
 	if err != nil {
 		return fmt.Errorf("inspect migration recovery budget: %w", err)
 	}
-	var total int64
+	total, err := recoveryMaterialBytes(runtime.Config.Migration.RecoveryDirectory)
+	if err != nil {
+		return err
+	}
 	count := 0
 	for _, entry := range entries {
 		if !strings.HasPrefix(entry.Name(), "migration-") || !strings.HasSuffix(entry.Name(), ".sqlite3") {
@@ -568,10 +571,6 @@ func (runtime *HostRuntime) checkMigrationBudget(sourceSize int64) error {
 			return fmt.Errorf("migration recovery entry is not a regular file: %s", entry.Name())
 		}
 		count++
-		if info.Size() > maxMigrationSourceBytes-total {
-			return errors.New("backup_storage_exhausted: migration recovery budget is exhausted")
-		}
-		total += info.Size()
 	}
 	if count >= maxMigrationSnapshots || sourceSize > maxMigrationSourceBytes-total {
 		return errors.New("backup_storage_exhausted: migration recovery budget is exhausted")

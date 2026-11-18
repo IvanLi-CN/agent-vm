@@ -375,6 +375,10 @@ func writeTransactionError(c *gin.Context, status int, code string, cause error)
 }
 
 func writeTransactionErrorForID(c *gin.Context, status int, code, requestID string, cause error) {
+	if errors.Is(cause, errBackupStorageExhausted) {
+		status = http.StatusInsufficientStorage
+		code = "backup_storage_exhausted"
+	}
 	detail := map[string]any{"code": code, "message": publicErrorMessage(code, cause.Error()), "recovery_required": code == "state_unverified"}
 	if requestID != "" {
 		detail["transaction_id"] = requestID
@@ -408,6 +412,8 @@ func writeMigrationError(c *gin.Context, status int, code string, cause error) {
 
 func publicErrorMessage(code, fallback string) string {
 	switch code {
+	case "backup_storage_exhausted":
+		return "database recovery point storage is exhausted; deployment roles were not changed"
 	case "observation_unavailable":
 		return "deployment observation is unavailable"
 	case "transaction_not_found":
