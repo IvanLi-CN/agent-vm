@@ -54,9 +54,9 @@ func RunRequestRelay(input *os.File) error {
 	if err != nil {
 		return writeRelayFailure(conn, err)
 	}
-	slot := filepath.Base(active)
-	if validSlot(slot) != nil || active != filepath.Join(Defaults().ReleaseRoot, "slots", slot) {
-		return writeRelayFailure(conn, errors.New("active request slot is unavailable"))
+	slot, err := requestRouteSlot(active, filepath.Join(Defaults().ReleaseRoot, "slots"))
+	if err != nil {
+		return writeRelayFailure(conn, err)
 	}
 	credential, err := requestSlotCredential(slot)
 	if err != nil {
@@ -82,6 +82,21 @@ func RunRequestRelay(input *os.File) error {
 		return writeRelayFailure(conn, err)
 	}
 	return child.Wait()
+}
+
+func requestRouteSlot(route, slotRoot string) (string, error) {
+	target, err := os.Readlink(route)
+	if err != nil {
+		return "", errors.New("active request route is unavailable")
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(filepath.Dir(route), target)
+	}
+	slot := filepath.Base(target)
+	if validSlot(slot) != nil || target != filepath.Join(slotRoot, slot) {
+		return "", errors.New("active request slot is unavailable")
+	}
+	return slot, nil
 }
 
 func requestSlotCredential(slot string) (*syscall.Credential, error) {

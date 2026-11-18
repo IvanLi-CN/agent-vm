@@ -68,9 +68,13 @@ func TestNativeRequestRelayRejectUnknownOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	target, err := os.Readlink(active)
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	assertNativeSSHRejectsUnknownOwner(t, ctx, filepath.Base(active))
+	assertNativeSSHRejectsUnknownOwner(t, ctx, filepath.Base(target))
 	assertNativeSSHRequest(t, ctx)
 }
 

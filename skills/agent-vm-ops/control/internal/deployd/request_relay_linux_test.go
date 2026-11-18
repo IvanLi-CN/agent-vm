@@ -10,12 +10,34 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func TestRequestRelayResolvesOnlySlotRouteTargets(t *testing.T) {
+	root := t.TempDir()
+	slots := filepath.Join(root, "slots")
+	for index, tc := range []struct{ target, want string }{
+		{"slots/blue", "blue"},
+		{filepath.Join(slots, "green"), "green"},
+		{"../elsewhere/blue", ""},
+		{filepath.Join(slots, "other"), ""},
+		{filepath.Join(root, "blue"), ""},
+	} {
+		route := filepath.Join(root, fmt.Sprintf("route-%d", index))
+		if err := os.Symlink(tc.target, route); err != nil {
+			t.Fatal(err)
+		}
+		got, err := requestRouteSlot(route, slots)
+		if got != tc.want || (err == nil) != (tc.want != "") {
+			t.Fatalf("%s: slot=%s err=%v", tc.target, got, err)
+		}
+	}
+}
 
 func TestRequestRelayAcceptsOnlyBoundedControlRequests(t *testing.T) {
 	body := `{"protocol":4,"action":"status","session_id":"relay-proof"}`
