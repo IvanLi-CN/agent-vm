@@ -161,14 +161,16 @@ func switchDeploymentAccount(ctx context.Context, handoff deployd.AccountHandoff
 		return errors.New("active lease is not owned by the incumbent deployment unit")
 	}
 	cfg := deployd.Defaults()
+	lease, err = deployd.WitnessAccountHandoff(ctx, lease.Slot, lease)
+	if err != nil {
+		return err
+	}
+	handoff.Lease = lease
 	body, err := json.Marshal(handoff)
 	if err != nil {
 		return err
 	}
 	if err := installFile(deployd.AccountHandoffFile, body, 0640, "agent-vm-deploy"); err != nil {
-		return err
-	}
-	if err := deployd.WitnessAccountHandoff(ctx, lease.Slot, lease); err != nil {
 		return err
 	}
 	if !lease.Expiry.After(time.Now().Add(5 * time.Second)) {

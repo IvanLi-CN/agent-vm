@@ -102,35 +102,37 @@ func (gate *Gate) Grant(lease Lease) error {
 	return nil
 }
 
-// WitnessHandoff pins a maintenance process to the exact live lease without
-// extending its original deadline.
-func (gate *Gate) WitnessHandoff(expected Lease, pid int, start string) error {
+// WitnessHandoff pins a maintenance process to the live lease without
+// extending its deadline. The incumbent may have renewed the same lease.
+func (gate *Gate) WitnessHandoff(expected Lease, pid int, start string) (Lease, error) {
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
 	if pid <= 0 || pid == expected.OwnerPID || start == "" || expected.OwnerPID <= 0 || expected.OwnerStartTime == "" ||
 		!ownerAlive(pid, start) || !ownerAlive(expected.OwnerPID, expected.OwnerStartTime) {
-		return ErrInvalidLease
+		return Lease{}, ErrInvalidLease
 	}
 	if err := gate.validLocked(); err != nil {
-		return err
+		return Lease{}, err
 	}
 	// Created times can cross JSON with a different time.Location.
 	current := gate.lease
-	if !current.Expiry.Equal(expected.Expiry) {
-		return ErrLeaseMismatch
+	if current.Expiry.Before(expected.Expiry) {
+		return Lease{}, ErrLeaseMismatch
 	}
+	deadline := current.Expiry
 	current.Expiry = expected.Expiry
 	if current != expected {
-		return ErrLeaseMismatch
+		return Lease{}, ErrLeaseMismatch
 	}
-	if gate.witness.pid != 0 {
+	if gate.witness.pid != 0 && gate.witness.deadline.After(gate.clock()) && ownerAlive(gate.witness.pid, gate.witness.start) {
 		if gate.witness.pid == pid && gate.witness.start == start {
-			return nil
+			current.Expiry = gate.witness.deadline
+			return current, nil
 		}
-		return ErrLeaseMismatch
+		return Lease{}, ErrLeaseMismatch
 	}
-	gate.witness = ownerWitness{pid: pid, start: start, deadline: expected.Expiry}
-	return nil
+	gate.witness = ownerWitness{pid: pid, start: start, deadline: deadline}
+	return gate.lease, nil
 }
 
 func (gate *Gate) renewLocked(lease Lease) bool {

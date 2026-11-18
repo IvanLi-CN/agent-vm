@@ -267,7 +267,12 @@ func (s *Server) controllerRole(c *gin.Context) {
 			writeJSON(c, http.StatusForbidden, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("peer_unauthorized", "handoff requires a local root maintenance process", nil)}, 2)
 			return
 		}
-		err = s.RoleGate.WitnessHandoff(command.Lease, peer.pid, peer.startToken)
+		var lease controllerrole.Lease
+		lease, err = s.RoleGate.WitnessHandoff(command.Lease, peer.pid, peer.startToken)
+		if err == nil {
+			writeJSON(c, http.StatusOK, map[string]any{"ok": true, "lease": lease, "valid": true}, 0)
+			return
+		}
 	case "grant":
 		err = s.RoleGate.Grant(command.Lease)
 	case "revoke":

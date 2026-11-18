@@ -127,34 +127,36 @@ func (runtime *HostRuntime) VerifyAccountHandoff(ctx context.Context, lease cont
 
 // WitnessAccountHandoff arms the current root maintenance process as a bounded
 // witness. The incumbent remains the deployment writer until it exits.
-func WitnessAccountHandoff(ctx context.Context, fixedSlot string, expected controllerrole.Lease) error {
+func WitnessAccountHandoff(ctx context.Context, fixedSlot string, expected controllerrole.Lease) (controllerrole.Lease, error) {
+	var empty controllerrole.Lease
 	if os.Geteuid() != 0 || validSlot(fixedSlot) != nil || expected.Validate(time.Now(), fixedSlot) != nil {
-		return errors.New("account handoff requires root and a current lease for a fixed slot")
+		return empty, errors.New("account handoff requires root and a current lease for a fixed slot")
 	}
 	account, err := user.Lookup(slotUser)
 	if err != nil {
-		return err
+		return empty, err
 	}
 	uid, err := strconv.Atoi(account.Uid)
 	if err != nil || uid <= 0 {
-		return errors.New("account handoff requires a dedicated server UID")
+		return empty, errors.New("account handoff requires a dedicated server UID")
 	}
 	payload, err := json.Marshal(controllerrole.Command{Action: "witness-handoff", Lease: expected})
 	if err != nil {
-		return err
+		return empty, err
 	}
 	runtime := NewHostRuntime(Defaults())
 	result, status, err := callSlot(ctx, runtime.socket(fixedSlot), http.MethodPost, "/internal/v1/controller-role", payload, 3*time.Second, uid)
 	if err != nil {
-		return err
+		return empty, err
 	}
 	if status != http.StatusOK || !responseOK(result) || result["valid"] != true {
-		return errors.New("active slot did not confirm the account handoff witness")
+		return empty, errors.New("active slot did not confirm the account handoff witness")
 	}
 	encoded, err := json.Marshal(result["lease"])
 	var observed controllerrole.Lease
-	if err != nil || json.Unmarshal(encoded, &observed) != nil || !sameLeaseAuthority(expected, observed) || !observed.Expiry.Equal(expected.Expiry) {
-		return errors.New("active slot returned a different lease for the account handoff")
+	if err != nil || json.Unmarshal(encoded, &observed) != nil || !sameLeaseAuthority(expected, observed) ||
+		observed.Validate(time.Now(), fixedSlot) != nil || observed.Expiry.Before(expected.Expiry) {
+		return empty, errors.New("active slot returned a different lease for the account handoff")
 	}
-	return nil
+	return observed, nil
 }

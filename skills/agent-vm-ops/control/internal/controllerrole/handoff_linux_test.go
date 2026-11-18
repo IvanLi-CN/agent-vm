@@ -29,29 +29,34 @@ func TestMaintenanceWitnessBridgesOwnerExitOnlyUntilOriginalExpiry(t *testing.T)
 	pid, start := os.Getpid(), ProcessStartToken(os.Getpid())
 	mismatched := lease
 	mismatched.Nonce = "other"
-	if err := gate.WitnessHandoff(mismatched, pid, start); !errors.Is(err, ErrLeaseMismatch) {
+	if _, err := gate.WitnessHandoff(mismatched, pid, start); !errors.Is(err, ErrLeaseMismatch) {
 		t.Fatalf("mismatched lease: %v", err)
-	}
-	if err := gate.WitnessHandoff(lease, pid, start); err != nil {
-		t.Fatal(err)
 	}
 	renewed := lease
 	renewed.Expiry = lease.Expiry.Add(time.Minute)
 	if err := gate.Grant(renewed); err != nil {
 		t.Fatal(err)
 	}
+	if observed, err := gate.WitnessHandoff(lease, pid, start); err != nil || observed != renewed {
+		t.Fatalf("witness must return the exact renewal it protects: %v", err)
+	}
+	later := renewed
+	later.Expiry = renewed.Expiry.Add(time.Minute)
+	if err := gate.Grant(later); err != nil {
+		t.Fatal(err)
+	}
 	if err := owner.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
 	_ = owner.Wait()
-	if leaseAfterExit, ok := gate.Snapshot(); !ok || leaseAfterExit != renewed {
+	if leaseAfterExit, ok := gate.Snapshot(); !ok || leaseAfterExit != later {
 		t.Fatalf("original authority did not survive owner exit: lease=%+v live=%v", leaseAfterExit, ok)
 	}
-	now = lease.Expiry
+	now = renewed.Expiry
 	if gate.Valid() {
 		t.Fatal("witness extended maintenance beyond the deadline")
 	}
-	successor := renewed
+	successor := later
 	successor.Term++
 	successor.OwnerPID, successor.OwnerStartTime = pid, start
 	if err := gate.Grant(successor); err != nil || !gate.Valid() {
