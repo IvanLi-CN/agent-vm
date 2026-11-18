@@ -243,54 +243,16 @@ func runUpdate(args []string) error {
 	if status.Value.Observation.ActiveSlot == "blue" {
 		targetSlot = "green"
 	}
-	payload, _, err := client.Call(ctx, "POST", "/v1/stage", map[string]any{"target_slot": targetSlot, "bundle": filepath.Clean(bundle)})
+	// Keep candidate bytes after any request that may have crossed the effect barrier.
+	preserveStaging = true
+	receipt, err := client.RunBlueGreen(ctx, targetSlot, bundle)
+	payload := receipt.Payload
 	if err != nil {
-		// Any failed transaction call may have crossed the native-effect barrier;
-		// retain the candidate until the transaction is queried and explicitly
-		// recovered, even when the response is malformed or incomplete.
-		// A structured stage rejection can still race with transaction creation;
-		// leave cleanup to the status-aware orphan reaper.
-		preserveStaging = true
 		writePayload(os.Stderr, payload)
-		if preserveStaging && !hasStructuredError(payload) {
-			writeUpdateRecoveryHint(ctx, client, "")
+		if !hasStructuredError(payload) {
+			writeUpdateRecoveryHint(ctx, client, receipt.ID)
 		}
 		return err
-	}
-	acknowledgement, decoded := decodeTransactionAcknowledgement(payload)
-	if !decoded {
-		preserveStaging = true
-		writeUpdateRecoveryHint(ctx, client, "")
-		return errors.New("stage response invalid")
-	}
-	id := acknowledgement.ID
-	if id == "" || !validTransactionAcknowledgement(payload, id, "standby_validation", "active") {
-		preserveStaging = true
-		writeUpdateRecoveryHint(ctx, client, id)
-		return errors.New("stage acknowledgement is incomplete")
-	}
-	preserveStaging = true
-	for _, step := range []struct{ action, phase, state string }{
-		{action: "verify", phase: "controller_handoff", state: "active"},
-		{action: "activate", phase: "finalize", state: "finalized"},
-	} {
-		payload, _, err = client.Call(ctx, "POST", "/v1/"+step.action, map[string]any{"transaction_id": id})
-		if err != nil {
-			// A non-empty error payload is not proof that the operation did not
-			// take effect. Keep the bundle for transaction recovery on every
-			// verify/activate failure.
-			preserveStaging = true
-			writePayload(os.Stderr, payload)
-			if !hasStructuredError(payload) {
-				writeUpdateRecoveryHint(ctx, client, id)
-			}
-			return err
-		}
-		if !validTransactionAcknowledgement(payload, id, step.phase, step.state) {
-			preserveStaging = true
-			writeUpdateRecoveryHint(ctx, client, id)
-			return errors.New("deployd acknowledgement is incomplete")
-		}
 	}
 	if err := os.RemoveAll(directory); err != nil {
 		// The Deployd transaction is already finalized. Keep the successful
@@ -410,46 +372,6 @@ func publicError(err error) string {
 		value = strings.ReplaceAll(value, path, "<private-path>")
 	}
 	return value
-}
-
-func validTransactionAcknowledgement(payload []byte, expectedID, expectedPhase, expectedState string) bool {
-	acknowledgement, ok := decodeTransactionAcknowledgement(payload)
-	return ok && acknowledgement.OK && acknowledgement.ID == expectedID && acknowledgement.Phase == expectedPhase && acknowledgement.State == expectedState
-}
-
-type transactionAcknowledgement struct {
-	OK    bool
-	ID    string
-	Phase string
-	State string
-}
-
-// decodeTransactionAcknowledgement accepts the current response envelope and
-// the legacy top-level transaction shape. This lets an older server-side CLI
-// finish a transaction created by a newer Deployd without treating a valid
-// transaction as missing merely because the envelope moved under value.
-func decodeTransactionAcknowledgement(payload []byte) (transactionAcknowledgement, bool) {
-	var response struct {
-		OK            bool   `json:"ok"`
-		TransactionID string `json:"transaction_id"`
-		Phase         string `json:"phase"`
-		State         string `json:"state"`
-		Value         struct {
-			ID    string `json:"transaction_id"`
-			Phase string `json:"phase"`
-			State string `json:"state"`
-		} `json:"value"`
-	}
-	if json.Unmarshal(payload, &response) != nil {
-		return transactionAcknowledgement{}, false
-	}
-	acknowledgement := transactionAcknowledgement{OK: response.OK, ID: response.Value.ID, Phase: response.Value.Phase, State: response.Value.State}
-	if acknowledgement.ID == "" {
-		acknowledgement.ID = response.TransactionID
-		acknowledgement.Phase = response.Phase
-		acknowledgement.State = response.State
-	}
-	return acknowledgement, true
 }
 
 func writePayload(out *os.File, payload []byte) {
