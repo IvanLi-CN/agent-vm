@@ -168,7 +168,11 @@ func serve(args []string) error {
 		}
 	}
 	runner := native.NewRunner()
-	guest := native.NewIncusClient(runner, cfg.Project, native.ClientOptions{Profile: cfg.Profile, Network: cfg.Network, Pool: cfg.Pool, StoragePath: cfg.StoragePath})
+	incusOptions := native.ClientOptions{Profile: cfg.Profile, Network: cfg.Network, Pool: cfg.Pool, StoragePath: cfg.StoragePath}
+	if os.Geteuid() != 0 {
+		incusOptions.HostObservationSlot = cfg.Slot
+	}
+	guest := native.NewIncusClient(runner, cfg.Project, incusOptions)
 	var snapshots *observe.SnapshotStore
 	if cfg.MetricsDir != "" {
 		snapshots = observe.NewSnapshotStore(cfg.MetricsDir)

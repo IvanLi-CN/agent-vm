@@ -202,11 +202,14 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		}
 		binaries[name] = binary
 	}
-	if err := copyInstall(filepath.Join(input.Materials, "assets/sysusers.d/agent-vm-native.conf"), "/etc/sysusers.d/agent-vm-native.conf", 0644, ""); err != nil {
-		return report, err
-	}
-	if err := command(ctx, "systemd-sysusers", "/etc/sysusers.d/agent-vm-native.conf"); err != nil {
-		return report, err
+	for _, name := range []string{"agent-vm-native.conf", "agent-vm-server.conf"} {
+		target := filepath.Join("/etc/sysusers.d", name)
+		if err := copyInstall(filepath.Join(input.Materials, "assets/sysusers.d", name), target, 0644, ""); err != nil {
+			return report, err
+		}
+		if err := command(ctx, "systemd-sysusers", target); err != nil {
+			return report, err
+		}
 	}
 	if err := copyInstall(filepath.Join(input.Materials, "assets/tmpfiles.d/agent-vm-native.conf"), "/etc/tmpfiles.d/agent-vm-native.conf", 0644, ""); err != nil {
 		return report, err
@@ -244,7 +247,10 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 			return report, err
 		}
 	}
-	for _, unit := range []string{"agent-vm-native@.service", "agent-vm-deployd.service", "agent-vm-rqlite.service", "agent-vm-caddy.service"} {
+	for _, unit := range []string{
+		"agent-vm-native@.service", "agent-vm-deployd.service", "agent-vm-rqlite.service", "agent-vm-caddy.service",
+		"agent-vm-observe.socket", "agent-vm-observe@.service", "agent-vm-deploy-host.socket", "agent-vm-deploy-host@.service",
+	} {
 		source := filepath.Join(input.Materials, "assets/systemd", unit)
 		if unit == "agent-vm-native@.service" || unit == "agent-vm-deployd.service" {
 			source = filepath.Join(product, "systemd", unit)
@@ -264,6 +270,9 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		return report, err
 	}
 	if err := command(ctx, "systemctl", "daemon-reload"); err != nil {
+		return report, err
+	}
+	if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-observe.socket", "agent-vm-deploy-host.socket"); err != nil {
 		return report, err
 	}
 	if report.Mode == "legacy" {

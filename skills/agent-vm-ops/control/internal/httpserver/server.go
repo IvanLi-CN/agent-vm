@@ -75,14 +75,18 @@ func NewWithRole(service *lifecycle.Service, snapshots *observe.SnapshotStore, a
 }
 
 func (s *Server) Handler() http.Handler {
-	gin.SetMode(gin.ReleaseMode)
-	router := gin.New()
 	deployUID := -1
 	if account, err := user.Lookup("agent-vm-deploy"); err == nil {
 		if uid, err := strconv.Atoi(account.Uid); err == nil && uid > 0 {
 			deployUID = uid
 		}
 	}
+	return s.handlerWithDeployUID(deployUID)
+}
+
+func (s *Server) handlerWithDeployUID(deployUID int) http.Handler {
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
 	router.Use(gin.CustomRecovery(func(c *gin.Context, _ any) {
 		writeJSON(c, http.StatusInternalServerError, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("internal_error", "internal control server failure", nil)}, 3)
 		c.Abort()
@@ -94,11 +98,14 @@ func (s *Server) Handler() http.Handler {
 				return
 			}
 			uid := os.Getuid()
-			markerPeer := c.Request.URL.Path == "/internal/v1/recovery-marker" && conn.uid == deployUID
-			if uid != conn.uid && !markerPeer {
+			deploymentRequest := deploymentSlotRoute(c.Request.Method, c.Request.URL.Path)
+			if uid != conn.uid && (!deploymentRequest || (conn.uid != deployUID && conn.uid != 0)) {
 				writeJSON(c, http.StatusForbidden, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("peer_unauthorized", "Unix peer credentials are not authorized", nil)}, 2)
 				c.Abort()
 				return
+			}
+			if uid != conn.uid && c.Request.URL.Path == "/internal/v1/control" {
+				c.Set("deployment_slot_control", true)
 			}
 		}
 		c.Next()
@@ -132,7 +139,11 @@ func (s *Server) deploymentObservation(c *gin.Context) {
 }
 
 func (s *Server) control(c *gin.Context) {
-	reader := http.MaxBytesReader(c.Writer, c.Request.Body, maxBodyBytes)
+	limit := int64(maxBodyBytes)
+	if c.GetBool("deployment_slot_control") {
+		limit = 4096
+	}
+	reader := http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 	defer c.Request.Body.Close()
 	body, err := io.ReadAll(reader)
 	if err != nil {
@@ -144,12 +155,39 @@ func (s *Server) control(c *gin.Context) {
 		writeError(c, err, nil)
 		return
 	}
+	if c.GetBool("deployment_slot_control") && !deploymentSlotAction(request) {
+		writeJSON(c, http.StatusForbidden, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("peer_unauthorized", "Unix peer credentials are not authorized for this action", nil)}, 2)
+		return
+	}
 	response, dispatchErr := s.Service.Dispatch(c.Request.Context(), request)
 	if dispatchErr != nil {
 		writeError(c, dispatchErr, request)
 		return
 	}
 	writeJSON(c, http.StatusOK, response, 0)
+}
+
+func deploymentSlotRoute(method, path string) bool {
+	switch path {
+	case "/internal/v1/health", "/internal/v1/deployment-observation":
+		return method == http.MethodGet
+	case "/internal/v1/controller-role", "/internal/v1/traffic-role", "/internal/v1/recovery-marker", "/internal/v1/control":
+		return method == http.MethodPost
+	default:
+		return false
+	}
+}
+
+func deploymentSlotAction(request protocol.Request) bool {
+	action, _ := request["action"].(string)
+	switch action {
+	case "admin-metrics", "admin-status", "doctor", "drain-status":
+		return true
+	case "drain-enter", "drain-exit":
+		return request["session_id"] == "release-agent-vm-deployd"
+	default:
+		return false
+	}
 }
 
 func (s *Server) health(c *gin.Context) {

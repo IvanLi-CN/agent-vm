@@ -228,6 +228,8 @@ Unix-socket API 提供只读的 `status`、`transaction` 和 `plan` 操作，以
 
 CLI 永远不能直接编辑 `active`。响应丢失时，CLI 返回 deployd transaction ID 和 status；不能创建新事务来猜测 activation 或 rollback 是否发生。
 
+服务账户分离时，部署控制服务通过槽位 Unix socket 读取健康和部署观察、协调角色、管理部署自身的排空标记以及请求写入恢复点覆盖标记。槽位按 peer UID 和操作授权；部署账户不能执行实例变更或读取槽位任意快照。root 仍可运行运维 CLI。主服务通过独立的只读宿主 socket 获取目录池容量、镜像存储余量、共享网桥租约以及跨项目 Incus 操作是否静默。辅助入口从受保护的槽位配置读取目标，不接受调用方提供的路径、Incus 命令或项目名。观察失败时，依赖该证据的操作按原有规则拒绝继续。
+
 ## 首次状态迁移
 
 首次部署不能要求运维者先手工迁移状态。发布器安装并验证 Deployd 后，自动调用 `POST /v1/migrate`；Deployd 在同一个 durable transaction 中启动 rqlite、让旧服务进入写围栏、等待请求和 native worker 收敛、停止旧服务、取得旧状态目录的 `authority.lock` 并保持到迁移完成、确认没有 SQLite writer、创建一致 snapshot、导入并验证 rqlite，最后写入 `.rqlite-cutover-complete`。旧服务的 Bun 入口必须在创建 SQLite store 前取得同一把排他的 `authority.lock`；如果旧服务在停止后重新启动并竞争这把锁，Deployd 只会闭锁，不会把竞态当成迁移成功。

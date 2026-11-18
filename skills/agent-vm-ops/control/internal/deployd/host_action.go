@@ -48,10 +48,14 @@ func (action hostAction) validate() error {
 }
 
 func isDeployAccount(uid int) bool {
+	return isServiceAccount(uid, deployUser)
+}
+
+func isServiceAccount(uid int, name string) bool {
 	if uid == 0 {
 		return false
 	}
-	account, err := user.Lookup(deployUser)
+	account, err := user.Lookup(name)
 	return err == nil && account.Uid == strconv.Itoa(uid)
 }
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=Agent VM read-only host observation
+
+[Service]
+Type=exec
+User=root
+ExecStart=/opt/agent-vm-native/bin/agent-vm-deploy host-observe
+StandardInput=socket
+StandardOutput=journal
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin:/usr/local/bin
+Environment=INCUS_CONF=/tmp/agent-vm-incus
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RuntimeMaxSec=12s

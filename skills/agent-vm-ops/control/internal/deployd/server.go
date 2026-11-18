@@ -95,7 +95,7 @@ func (server *Server) Handler() http.Handler {
 			return
 		}
 		uid := os.Getuid()
-		if (uid == 0 && peer.uid != 0) || (uid != 0 && peer.uid != uid) {
+		if peer.uid != 0 && peer.uid != uid {
 			writeError(c, http.StatusForbidden, "peer_unauthorized", "Unix peer credentials are not authorized")
 			c.Abort()
 			return
