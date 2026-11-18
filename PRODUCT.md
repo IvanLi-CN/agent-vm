@@ -5,6 +5,54 @@
 Agent VM 为 Agent 会话提供低成本、受租约约束的工作环境。
 本文保存产品事实与 Web 管理台实现/目标；当前检出已提供管理台静态壳、认证门面、公开状态入口和管理界面，生产部署与完整端到端 readiness 继续以各自合同为准。
 
+## 项目级产品定义
+
+Agent VM 把一次性客户端、受保护控制服务、嵌套 Incus 工作环境和部署运维合同组合成一个可恢复的产品单元。用户通过客户端获得可连接、可同步、受租约约束的工作环境；维护者通过管理台观察资源和执行有审计的维护；部署人员通过受保护的发布与恢复流程维护控制面；开发者通过合同、架构和测试保持这些边界一致。
+
+### 角色
+
+| 角色 | 主要目标 | 主要入口 |
+| --- | --- | --- |
+| Agent 或客户端用户 | 获取工作环境、连接来宾、同步文件并在结束后释放资源 | 客户端 CLI、控制协议、来宾 SSH |
+| 维护者 | 观察容量、定位会话、管理镜像并处理受授权的维护动作 | Web 管理台、管理 API、运维手册 |
+| 部署人员 | 安装、切换、回滚和恢复控制面及其依赖 | `agent-vm-deploy`、systemd、Caddy、部署合同 |
+| 开发者 | 修改客户端、Go 服务、协议、前端和文档，并验证兼容性 | 源码、Spec、架构、测试与贡献指南 |
+
+### 核心场景
+
+1. 用户配置控制主机并获取会话，确认租约和连接材料后进入来宾，使用同步与文件传输完成工作，最后导出结果并释放租约。
+2. 维护者从概览判断容量和数据新鲜度，定位 session 和 generation，预览影响、提交有原因的维护动作，并通过 operation 和审计记录确认结果。
+3. 部署人员在 admission drain 和受保护事务边界内安装或切换控制面，验证 readiness、能力、状态后端和观测，再决定是否退出 drain 或执行有界回滚。
+4. 开发者先在合同和架构中确认边界，再修改实现、测试和对应文档；不以旧提案或单个健康指标推断产品终态。
+
+### 能力地图
+
+| 能力 | 产品职责 | 主要文档 |
+| --- | --- | --- |
+| 客户端与会话 | 配置连接、获取/续租/释放会话、连接来宾和同步文件 | [快速开始](docs/usage/quickstart.md)、[客户端合同](docs/specs/agent-vm/contracts/cli.md) |
+| 控制服务 | 准入、租约、generation、镜像绑定、原生操作和恢复证据 | [Agent VM Spec](docs/specs/agent-vm/SPEC.md)、[控制协议](docs/specs/agent-vm/contracts/control-protocol.md) |
+| 管理台 | 观察资源、管理已有 VM 和镜像、记录有授权的操作 | [管理台 PRD](docs/specs/management-console/PRD.md)、[管理 API](docs/specs/agent-vm/contracts/management-api.md) |
+| 部署与运维 | 蓝绿事务、安装、升级、回滚、状态后端恢复和观测 | [部署入口](docs/deployment.md)、[运维手册](docs/specs/agent-vm/OPERATIONS.md) |
+| 镜像 | 锁定来源、完整性、适用性、fingerprint 和安全导入 | [镜像指南](docs/usage/images.md)、[镜像材料](images/README.md) |
+| 文档与工程 | 按读者任务发布唯一来源，保留合同、决策和实现事实 | [文档规范](docs/README.md)、[发布索引](docs/DOCUMENTATION-INDEX.md) |
+
+### 产品边界
+
+Agent VM 不把任意 Incus 资源包装成浏览器对象，不提供宿主机/PVE 管理、Web terminal、通用网络或存储管理、自动镜像构建、自动控制面部署或持久化数据保证。客户端不直接访问 Incus、控制端数据库或调度器；管理台不建立第二套生命周期权威；部署输入、凭据、库存、状态库和消费方渲染的观测文件不属于公开产品证据。
+
+### 成功标准
+
+- 用户可以在不阅读实现源码的情况下完成配置、获取、连接、同步和释放，并在超时后保留可恢复的操作身份。
+- 维护者可以区分容量、压力、准入、健康、新鲜度、租约和操作结果，明确知道一次维护动作的影响及审计记录。
+- 部署人员可以在固定的权限、状态后端、版本和事务边界内完成安装、切换、回滚或恢复，不通过手工改写活动指针和业务数据库解决问题。
+- 开发者可以从项目级 PRD、主题 Spec、架构、合同和实现覆盖定位长期要求与当前事实，文档站的正文来自唯一来源并能通过目录和链接阅读。
+
+### 阅读路线
+
+- 第一次使用：先看[快速开始](docs/usage/quickstart.md)，再看[连接与认证](docs/usage/connections.md)和[日常工作流](docs/usage/workflows.md)。
+- 维护和部署：先看[管理台使用](docs/usage/console.md)、[镜像管理](docs/usage/images.md)和[故障排查](docs/usage/troubleshooting.md)，再进入部署和运维合同。
+- 理解设计：按[文档组织规范](docs/README.md)、[系统架构](docs/architecture/system.md)、[Spec 索引](docs/specs/README.md)和[文档发布索引](docs/DOCUMENTATION-INDEX.md)阅读。
+
 ## 平台
 
 Web 管理台

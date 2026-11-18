@@ -62,7 +62,14 @@ export async function adaptLinks(source: Source, sources: Source[], revision: st
     try { bytes = await read(path); } catch { diagnostics.push(`Missing reference: ${path}`); continue; }
     const page = sources.find(s => s.path === path);
     let url: string;
-    if (page) url = `/docs/${page.slug}${suffix}`;
+    if (page) {
+      url = `/docs/${page.slug}${suffix}`;
+      if (suffix.startsWith('#')) {
+        let anchor = suffix.slice(1);
+        try { anchor = decodeURIComponent(anchor); } catch { /* Retain the literal malformed fragment. */ }
+        if (sourceAnchorLine(page.text, anchor) === undefined) diagnostics.push(`Missing page anchor: ${path}#${anchor}`);
+      }
+    }
     else if (!['.md', '.mdx'].includes(extname(path))) {
       const asset = `${contentDigest({ [path]: bytes }).slice(0, 16)}${extname(path)}`;
       assets[asset] = bytes;

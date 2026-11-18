@@ -16,7 +16,7 @@ test('home leads directly to real documents and their build snapshots', async ({
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Agent VM 文档', exact: true })).toBeVisible();
   await expect(page.locator('.docs-home')).not.toContainText('本次设计');
-  await page.locator('.document-list a').first().click();
+  await page.locator('.document-list a').filter({ hasText: '项目概览' }).click();
   await expect(page).toHaveURL(/\/docs\/overview$/);
   await expect(page).toHaveTitle('项目概览 | Agent VM 文档');
   await expect(page.locator('article h1')).toContainText('Agent VM');

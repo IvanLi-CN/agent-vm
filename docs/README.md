@@ -7,15 +7,19 @@
 本页是项目文档放置与维护规则的统一入口。文件系统按材料职责组织，网页导航按读者任务组织；两者不必逐级对应，但网页正文必须直接来自仓库中的唯一来源。
 
 ```text
-README.md、PRODUCT.md       项目入口、产品范围
+README.md                  项目入口与阅读路线
+PRODUCT.md                 项目级产品需求（PRD）
+CONTRIBUTING.md             本地开发、测试与贡献
 GLOSSARY.md                 领域术语
 DESIGN.md                   界面设计系统
 docs/
   README.md                 本规范与文档导航
   architecture/             当前系统结构、边界与实现状态
+  usage/                    首次使用、连接、日常工作、管理台、镜像与故障入口
   deployment.md             部署入口
   deployment/               专题部署指南
   specs/<topic>/            稳定主题的长期需求与行为合同
+    PRD.md                  按需展开的主题产品需求
     SPEC.md                 需求、范围与验收条件
     IMPLEMENTATION.md       实现覆盖、启用情况与验证事实
     HISTORY.md              背景、兼容性与主题演进
@@ -26,6 +30,8 @@ docs/
   solutions/<topic>/        可复用的问题诊断与解决经验
   templates/                文档与治理记录的可复用模板
 docs-site/                  站点应用、来源清单与展示组件
+deploy/docs/                安装、升级、嵌套权限、维护、观测与部署验收正文
+images/README.md            镜像构建、验证、发布资产与导入说明
 .agents/skills/             Agent 专项操作指引
 ```
 
@@ -39,6 +45,14 @@ docs-site/                  站点应用、来源清单与展示组件
 4. 使用、部署或运维说明放对应的现有项目入口；可复用故障经验放 `docs/solutions/<topic>/<slug>.md`。实际实现和验证事实更新主题的 `IMPLEMENTATION.md`，背景保留在 `HISTORY.md`，执行计划和临时日志不写入长期需求正文。
 5. 图片与示例就近归属主题并使用相对链接；主题验收图片放其 `assets/`。生成输入、构建产物和临时截图留在忽略目录；部署地址、凭据和运行状态留在仓库外的受保护记录。
 6. 新增材料同步相关索引和正文链接。确需新增目录职责时，同时更新本规范；不临时发明与既有职责重复的目录。
+
+项目级 PRD 以 `PRODUCT.md` 为唯一来源，回答用户、问题、场景、能力、产品边界和成功标准。需要展开的主题使用 `docs/specs/<topic>/PRD.md`；PRD 不重复协议字段和行为合同，SPEC 不替代产品问题与场景说明。不为每个主题机械创建 PRD，也不因为文档角色调整立即拆迁现有合同。
+
+使用教程放在 `docs/usage/`，流程解释链接相应 CLI、协议和接口合同，避免复制完整参数表。部署正文复用 `deploy/docs/`，`docs/deployment.md` 负责入口，`docs/deployment/blue-green.md` 保留既有跳转职责；不在两个目录维护同义部署手册。镜像选择与日常管理属于使用指南，构建、发布资产与验收细节以 `images/README.md` 为来源。
+
+复杂主题的富交互正文可以直接使用 `.mdx`，仍放在该内容所属目录；同一主题正文不得同时维护同义 `.md` 与 `.mdx`。站点展示组件放在 `docs-site/app/components/`，共享合同和示例数据保持单源。图片和受控示例就近保存，不能为了网页展示将规范正文搬入站点应用。
+
+全仓库整理逐项记录文档处置、网页发布状态及理由。当前读者需要的指南、产品与设计正文在站内阅读；ADR 和历史提案通过标明状态的索引访问。合并或迁移必须检查入站引用，尽可能保留既有网页 slug 与章节入口。重复 ADR 编号按完整文件名区分，不能仅靠编号指代或为整理目录静默改写历史决策。
 
 ## 网页发布与单源维护
 
@@ -69,3 +83,5 @@ docs-site/                  站点应用、来源清单与展示组件
 ADR 0042 是被 0043 替代的历史决策，不能作为当前服务边界依据。
 
 `skills/**/SKILL.md` 是 Agent 操作说明，不属于项目设计文档；设计审查以本导航中的项目文档、对应合同和实现证据为依据。
+
+全项目文件级处置、网页发布状态和排除理由见[项目文档发布索引](DOCUMENTATION-INDEX.md)。第一次使用从[快速开始](usage/quickstart.md)开始；维护者可继续阅读[管理台使用](usage/console.md)、[镜像管理](usage/images.md)和[故障排查](usage/troubleshooting.md)。管理台主题产品需求见[管理台 PRD](specs/management-console/PRD.md)，项目级产品需求统一保存在根目录 [PRODUCT.md](../PRODUCT.md)。

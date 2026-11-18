@@ -10,5 +10,6 @@
 | Topic | Lifecycle | Implementation | Spec | Successor | Notes |
 | --- | --- | --- | --- | --- | --- |
 | Native Incus Agent VM | active | 已有实现，覆盖未在本次重评 | [agent-vm/SPEC.md](agent-vm/SPEC.md)；[控制面生命周期与恢复设计](agent-vm/CONTROL-PLANE-LIFECYCLE-RECOVERY.md) | - | 运行期能力、协议、lease、operation journal 与 native recovery 边界。 |
+| Agent VM 管理台 | active | 项目内置 Web 管理台的产品范围和 API 合同已分开维护 | [management-console/PRD.md](management-console/PRD.md)；[管理 API](agent-vm/contracts/management-api.md) | - | 维护者观察、镜像管理、受控操作和审计；不建立第二套生命周期权威。 |
 | Agent VM 项目工程治理 | active | 仓库侧候选已实施；平台保护、通知 transport 和正式发布未启用 | [engineering-governance/SPEC.md](engineering-governance/SPEC.md) | [IMPLEMENTATION.md](engineering-governance/IMPLEMENTATION.md) | 五项必需 Topic 覆盖日常变更、门禁、调度、通知和手动发布。 |
-| 最小独立文档站 | active | 文档阅读与自动化已修正；待人工阅读及 PR 验证 | [documentation-review/SPEC.md](documentation-review/SPEC.md) | - | 首期内容、单源构建、阅读表达及可复现预览；实现覆盖见 [IMPLEMENTATION.md](documentation-review/IMPLEMENTATION.md)。 |
+| 项目文档与独立文档站 | active | 最小站点已有实现；全项目整理与分层发布尚未实现 | [documentation-review/SPEC.md](documentation-review/SPEC.md) | - | 产品目标见 [PRD.md](documentation-review/PRD.md)，实现覆盖见 [IMPLEMENTATION.md](documentation-review/IMPLEMENTATION.md)。 |
