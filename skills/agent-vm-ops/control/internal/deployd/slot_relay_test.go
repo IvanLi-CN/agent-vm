@@ -40,6 +40,9 @@ func TestSlotRelayOnlyAllowsDeploymentOperations(t *testing.T) {
 		want bool
 	}{
 		{"health", slotRelayRequest{Slot: "blue", Method: http.MethodGet, Path: "/internal/v1/health"}, true},
+		{"fixed coverage marker", slotRelayRequest{Slot: "blue", Method: http.MethodPost, Path: recoveryMarkerRoute, Body: []byte(`{"id":"point-0123456789abcdef0123456789abcdef"}`)}, true},
+		{"extra coverage operation", slotRelayRequest{Slot: "blue", Method: http.MethodPost, Path: recoveryMarkerRoute, Body: []byte(`{"id":"point-0123456789abcdef0123456789abcdef","sql":"SELECT 1"}`)}, false},
+		{"invalid coverage marker", slotRelayRequest{Slot: "blue", Method: http.MethodPost, Path: recoveryMarkerRoute, Body: []byte(`{"id":"arbitrary"}`)}, false},
 		{"deployment drain", slotRelayRequest{Slot: "green", Method: http.MethodPost, Path: "/internal/v1/control", Body: []byte(`{"protocol":4,"action":"drain-exit","session_id":"release-agent-vm-deployd","generation":0,"operation_id":"test"}`)}, true},
 		{"other drain", slotRelayRequest{Slot: "green", Method: http.MethodPost, Path: "/internal/v1/control", Body: []byte(`{"protocol":4,"action":"drain-exit","session_id":"other","generation":0,"operation_id":"test"}`)}, false},
 		{"guest destroy", slotRelayRequest{Slot: "blue", Method: http.MethodPost, Path: "/internal/v1/control", Body: []byte(`{"protocol":4,"action":"destroy","session_id":"guest","generation":1,"operation_id":"test"}`)}, false},

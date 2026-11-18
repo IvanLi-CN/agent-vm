@@ -8,9 +8,14 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
+	"regexp"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 )
@@ -18,6 +23,9 @@ import (
 const slotRelaySocket = "/run/agent-vm-slot-relay/relay.sock"
 const slotRelayRequestLimit = 2 * protocol.DeploymentSlotBodyLimit
 const slotRelayResponseLimit = 4 * 1024 * 1024
+const recoveryMarkerRoute = "/internal/v1/recovery-marker"
+
+var legacyMarkerID = regexp.MustCompile(`^point-[a-f0-9]{32}$`)
 
 type slotRelayRequest struct {
 	Slot, Method, Path string
@@ -41,7 +49,20 @@ func (request slotRelayRequest) valid() bool {
 		control, err := protocol.Decode(request.Body)
 		return err == nil && protocol.DeploymentSlotAction(control)
 	}
+	if request.Path == recoveryMarkerRoute {
+		return request.recoveryMarkerID() != ""
+	}
 	return true
+}
+
+func (request slotRelayRequest) recoveryMarkerID() string {
+	var marker struct {
+		ID string `json:"id"`
+	}
+	if request.Method != http.MethodPost || readSlotRelayMessage(bytes.NewReader(request.Body), 256, &marker) != nil || !legacyMarkerID.MatchString(marker.ID) {
+		return ""
+	}
+	return marker.ID
 }
 
 func RunSlotRelay(input *os.File) error {
@@ -82,10 +103,49 @@ func RunSlotRelay(input *os.File) error {
 		request.Body = nil
 	}
 	result, status, err := callSlot(ctx, runtime.socket(request.Slot), request.Method, request.Path, request.Body, 240*time.Second, os.Getuid())
+	if request.Path == recoveryMarkerRoute && status == http.StatusNotFound {
+		if err := runtime.writeHistoricalRecoveryMarker(ctx, request.Slot, request.recoveryMarkerID()); err != nil {
+			return err
+		}
+		result, status, err = map[string]any{"ok": true}, http.StatusOK, nil
+	}
 	if err != nil {
 		return err
 	}
 	return json.NewEncoder(conn).Encode(slotRelayResponse{Body: result, Status: status})
+}
+
+// Historical slots have no marker route. Reuse the server identity and only
+// the fixed coverage write, after checking that this slot still owns traffic.
+func (runtime *HostRuntime) writeHistoricalRecoveryMarker(ctx context.Context, slot, id string) error {
+	if validSlot(slot) != nil || !legacyMarkerID.MatchString(id) {
+		return errors.New("invalid historical recovery marker request")
+	}
+	selected, err := runtime.activeSlot()
+	if err != nil || selected != slot {
+		return errors.New("historical recovery marker requires the selected slot")
+	}
+	health, status, err := callSlot(ctx, runtime.socket(slot), http.MethodGet, "/internal/v1/health", nil, 3*time.Second, os.Getuid())
+	if err != nil || status != http.StatusOK || !healthEnvelopeValid(health) || health["controller_owned"] != true ||
+		health["traffic_accepting"] != true || health["ready"] != true {
+		return errors.New("historical recovery marker requires a serving controller")
+	}
+	cfg, err := config.Load(filepath.Join("/etc/agent-vm-native/slots", slot, "config.json"))
+	if err != nil || cfg.Slot != slot || config.ValidateInstallationAuthority(cfg.StateDB) != nil {
+		return errors.New("invalid historical slot state authority")
+	}
+	dsn, _ := url.Parse(cfg.StateDB)
+	password, _ := dsn.User.Password()
+	ca, err := readRecoveryConfig(ServerAuthorityCA, false)
+	if err != nil {
+		return err
+	}
+	client, err := recoveryTLSClient(ca)
+	if err != nil {
+		return err
+	}
+	defer client.CloseIdleConnections()
+	return writeRecoveryMarkerSQL(ctx, client, "https://127.0.0.1:4001", dsn.User.Username(), password, id)
 }
 
 type legacyLeaseOwner struct {

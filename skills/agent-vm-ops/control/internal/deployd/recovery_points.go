@@ -199,7 +199,12 @@ func (runtime *HostRuntime) writeRecoveryMarker(ctx context.Context, client *htt
 		if err != nil {
 			return err
 		}
-		body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, "/internal/v1/recovery-marker", map[string]string{"id": id})
+		body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, recoveryMarkerRoute, map[string]string{"id": id})
+		defaults := Defaults()
+		if status == http.StatusNotFound && runtime.Config.BlueSocket == defaults.BlueSocket && runtime.Config.GreenSocket == defaults.GreenSocket {
+			payload, _ := json.Marshal(map[string]string{"id": id})
+			body, status, err = requestSlotRelay(ctx, slotRelayRequest{Slot: slot, Method: http.MethodPost, Path: recoveryMarkerRoute, Body: payload}, 10*time.Second)
+		}
 		if err != nil || status != http.StatusOK || !responseOK(body) {
 			return errors.New("active slot cannot persist the recovery coverage marker")
 		}
@@ -217,7 +222,11 @@ func (runtime *HostRuntime) writeRecoveryMarker(ctx context.Context, client *htt
 		return errors.New("rqlite control credential is invalid")
 	}
 	password, _ := writerURL.User.Password()
-	_, err = recoverySQL(ctx, client, endpoint, "/db/execute", "agent-vm-control", password, []any{[]any{
+	return writeRecoveryMarkerSQL(ctx, client, endpoint, "agent-vm-control", password, id)
+}
+
+func writeRecoveryMarkerSQL(ctx context.Context, client *http.Client, endpoint, user, password, id string) error {
+	_, err := recoverySQL(ctx, client, endpoint, "/db/execute", user, password, []any{[]any{
 		"INSERT INTO meta(key,value) SELECT 'deployment_recovery_marker', value || ':' || ? FROM meta WHERE key='state_epoch' ON CONFLICT(key) DO UPDATE SET value=excluded.value",
 		id,
 	}})
@@ -399,19 +408,27 @@ func ProbeInstalledBackupReader(ctx context.Context, ca, auth []byte) error {
 }
 
 func newRecoveryClient(ca, auth []byte) (*http.Client, string, error) {
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(ca) {
-		return nil, "", errors.New("rqlite recovery CA is invalid")
+	client, err := recoveryTLSClient(ca)
+	if err != nil {
+		return nil, "", err
 	}
 	var credential backupCredential
 	if json.Unmarshal(auth, &credential) != nil || !validBackupPassword(credential.Password) {
 		return nil, "", errors.New("rqlite recovery credential is invalid")
 	}
+	return client, credential.Password, nil
+}
+
+func recoveryTLSClient(ca []byte) (*http.Client, error) {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(ca) {
+		return nil, errors.New("rqlite recovery CA is invalid")
+	}
 	return &http.Client{
 		Transport:     &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Timeout:       5 * time.Minute,
-	}, credential.Password, nil
+	}, nil
 }
 
 type backupCredential struct {
