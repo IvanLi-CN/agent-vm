@@ -3,9 +3,7 @@ package controllerrole
 import (
 	"errors"
 	"fmt"
-	"os"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -193,17 +191,7 @@ func ownerAlive(pid int, startTime string) bool {
 	if pid <= 0 {
 		return true
 	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	if process.Signal(syscall.Signal(0)) != nil {
-		return false
-	}
-	if startTime == "" {
-		return true
-	}
-	return processStartToken(pid) == startTime
+	return liveProcessMatches(pid, startTime)
 }
 
 // ProcessStartToken identifies a process instance, not just its PID. Linux
