@@ -489,19 +489,31 @@ func (runtime *HostRuntime) Stage(ctx context.Context, slot, bundle string) erro
 	if active == slot {
 		return fmt.Errorf("cannot stage over active slot %s", slot)
 	}
+	target := filepath.Join(runtime.Config.ReleaseRoot, "slots", slot)
+	_, targetErr := os.Lstat(target)
+	if targetErr != nil && !errors.Is(targetErr, os.ErrNotExist) {
+		return targetErr
+	}
+	previousFiles := targetErr == nil
+	if !previousFiles {
+		_, backupErr := os.Lstat(filepath.Join(filepath.Dir(target), "."+slot+".previous-stage"))
+		if !errors.Is(backupErr, os.ErrNotExist) {
+			return errors.New("vacant slot has an unresolved previous stage backup")
+		}
+	}
 	previousProcess, previousProcessOK := runtime.readProcessIdentity(ctx, slot)
 	if err := runtime.stageBundle(ctx, slot, bundle); err != nil {
 		return err
 	}
 	if err := runtime.systemctl(ctx, "restart", "agent-vm-native@"+slot+".service"); err != nil {
-		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, err)
+		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, previousFiles, err)
 	}
 	currentProcess, err := runtime.waitSlotIdentity(ctx, slot, previousProcess, previousProcessOK)
 	if err != nil {
-		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, err)
+		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, previousFiles, err)
 	}
 	if err := runtime.ExitDrain(ctx, slot); err != nil {
-		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, err)
+		return runtime.restoreAfterStageFailure(ctx, slot, previousProcess, previousProcessOK, previousFiles, err)
 	}
 	if err := runtime.discardStagedBackup(slot); err != nil {
 		return &UncertainError{Cause: fmt.Errorf("stage completed but previous slot backup could not be removed: %w", err)}
@@ -713,7 +725,7 @@ func restoreStagedSlot(root, slot string) error {
 	return syncDirectory(root)
 }
 
-func (runtime *HostRuntime) restoreAfterStageFailure(ctx context.Context, slot string, previousProcess processIdentity, previousProcessOK bool, cause error) error {
+func (runtime *HostRuntime) restoreAfterStageFailure(ctx context.Context, slot string, previousProcess processIdentity, previousProcessOK, previousFiles bool, cause error) error {
 	if err := runtime.systemctl(ctx, "stop", "agent-vm-native@"+slot+".service"); err != nil {
 		return &UncertainError{Cause: fmt.Errorf("stage failed and slot could not be stopped: %w; original error: %v", err, cause)}
 	}
@@ -721,6 +733,15 @@ func (runtime *HostRuntime) restoreAfterStageFailure(ctx context.Context, slot s
 		return &UncertainError{Cause: fmt.Errorf("stage failed but slot stop was not verified; original error: %v", cause)}
 	}
 	root := filepath.Join(runtime.Config.ReleaseRoot, "slots")
+	if !previousFiles {
+		if err := os.RemoveAll(filepath.Join(root, slot)); err != nil {
+			return &UncertainError{Cause: fmt.Errorf("stage failed and vacant slot could not be restored: %w; original error: %v", err, cause)}
+		}
+		if err := syncDirectory(root); err != nil {
+			return &UncertainError{Cause: fmt.Errorf("stage failed and vacant slot restoration could not be synced: %w; original error: %v", err, cause)}
+		}
+		return fmt.Errorf("stage failed and vacant slot was restored: %w", cause)
+	}
 	if err := restoreStagedSlot(root, slot); err != nil {
 		return &UncertainError{Cause: fmt.Errorf("stage failed and previous slot could not be restored: %w; original error: %v", err, cause)}
 	}
