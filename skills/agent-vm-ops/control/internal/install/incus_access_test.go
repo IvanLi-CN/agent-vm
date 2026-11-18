@@ -1,10 +1,59 @@
 package install
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func TestIncusProjectAccessUsesProjectAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name                        string
+		instances, project, outside int
+		wantErr                     bool
+	}{
+		{"filtered outside collection", http.StatusOK, http.StatusOK, http.StatusForbidden, false},
+		{"outside project readable", http.StatusOK, http.StatusOK, http.StatusOK, true},
+		{"outside project missing", http.StatusOK, http.StatusOK, http.StatusNotFound, true},
+		{"outside authorization unavailable", http.StatusOK, http.StatusOK, http.StatusServiceUnavailable, true},
+		{"selected instances denied", http.StatusForbidden, http.StatusOK, http.StatusForbidden, true},
+		{"selected project denied", http.StatusOK, http.StatusForbidden, http.StatusForbidden, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("permission probe attempted %s", r.Method)
+					w.WriteHeader(http.StatusMethodNotAllowed)
+					return
+				}
+				switch r.URL.Path {
+				case "/1.0/instances":
+					if r.URL.Query().Get("project") == "agents" {
+						w.WriteHeader(tc.instances)
+					} else {
+						// A successful empty collection does not grant access to
+						// the project; this is the real Incus response at issue.
+						w.WriteHeader(http.StatusOK)
+					}
+					_, _ = w.Write([]byte(`{"metadata":[]}`))
+				case "/1.0/projects/agents":
+					w.WriteHeader(tc.project)
+				case "/1.0/projects/default":
+					w.WriteHeader(tc.outside)
+				default:
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer server.Close()
+			err := verifyIncusProjectAccess(t.Context(), server.Client(), server.URL, "agents")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("permission probe error = %v, wantErr = %v", err, tc.wantErr)
+			}
+		})
+	}
+}
 
 func TestIncusTrustRequiresExactlyOneProject(t *testing.T) {
 	for _, raw := range []string{

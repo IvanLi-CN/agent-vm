@@ -101,11 +101,16 @@ func verifyIncusTrust(raw []byte, project string) error {
 
 func verifyIncusProjectAccess(ctx context.Context, client *http.Client, base, project string) error {
 	for _, item := range []struct {
-		project string
-		status  int
-	}{{project, http.StatusOK}, {"default", http.StatusForbidden}} {
-		query := url.Values{"project": {item.project}}
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/1.0/instances?"+query.Encode(), nil)
+		path   string
+		status int
+	}{
+		{"/1.0/instances?" + url.Values{"project": {project}}.Encode(), http.StatusOK},
+		{"/1.0/projects/" + url.PathEscape(project), http.StatusOK},
+		// Incus can return an empty, filtered collection for an inaccessible
+		// project's instances. Probe the project itself to prove denial.
+		{"/1.0/projects/default", http.StatusForbidden},
+	} {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+item.path, nil)
 		if err != nil {
 			return err
 		}
@@ -116,7 +121,7 @@ func verifyIncusProjectAccess(ctx context.Context, client *http.Client, base, pr
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 1<<20))
 		_ = response.Body.Close()
 		if response.StatusCode != item.status {
-			return fmt.Errorf("Incus scoped access for project %q returned HTTP %d, expected %d", item.project, response.StatusCode, item.status)
+			return fmt.Errorf("Incus scoped access for %q returned HTTP %d, expected %d", item.path, response.StatusCode, item.status)
 		}
 	}
 	return nil
