@@ -501,6 +501,58 @@ func TestManagerRollsBackFinalizedTransaction(t *testing.T) {
 	}
 }
 
+type crashingRollbackRuntime struct{ *fakeRuntime }
+
+func (runtime crashingRollbackRuntime) PrepareRollback(ctx context.Context, _ string, _ string, active SlotObservation) error {
+	if active.Slot != "green" || !active.ControllerOwned || !active.TrafficAccepting {
+		return errors.New("active slot lost its role before the previous version started")
+	}
+	claim := ctx.Value(rollbackStartKey{}).(func() error)
+	for range 3 {
+		if err := claim(); err != nil {
+			return err
+		}
+	}
+	return errRollbackStartsExhausted
+}
+
+func TestRollbackStopsAfterThreeFailedStartsWithoutFencingActiveSlot(t *testing.T) {
+	now := time.Unix(100, 0).UTC()
+	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	runtime := crashingRollbackRuntime{&fakeRuntime{active: "green", observations: map[string]SlotObservation{
+		"blue":  {Slot: "blue"},
+		"green": {Slot: "green", ProcessUp: true, ProcessReady: true, Ready: true, ControllerOwned: true},
+	}}}
+	tx := store.Transaction{ID: "tx-three-crashes", TargetSlot: "green", PreviousSlot: "blue", Bundle: "/bundle", Phase: PhaseFinalize, State: "finalized", Generation: 1, CreatedAt: now, UpdatedAt: now}
+	ctx := t.Context()
+	if err := database.Create(ctx, tx, map[string]any{
+		"previous_release_id": "release-blue", "previous_source_revision": "revision-1",
+		"previous_state_authority": "authority-1", "previous_state_epoch": "epoch-1",
+		"previous_state_capabilities": []string{"reads@1", "writes@1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(database, runtime, time.Minute, func() time.Time { return now })
+	if _, err := manager.Rollback(ctx, tx.ID); !errors.Is(err, errRollbackStartsExhausted) {
+		t.Fatalf("rollback error = %v", err)
+	}
+	persisted, err := database.Get(ctx, tx.ID)
+	if err != nil || persisted.State != "failed" || !persisted.RollbackUsed || persisted.RecoveryRequired {
+		t.Fatalf("rollback should be terminal: %#v, %v", persisted, err)
+	}
+	if _, err := manager.Rollback(ctx, tx.ID); err == nil {
+		t.Fatal("terminal rollback was retried")
+	}
+	if runtime.active != "green" || !runtime.observations["green"].ControllerOwned ||
+		strings.Join(runtime.sequence, ",") != "verify-identity" {
+		t.Fatalf("active slot was affected: active=%s, effects=%v", runtime.active, runtime.sequence)
+	}
+}
+
 func TestManagerFencesWhenRollbackStateCannotBePersisted(t *testing.T) {
 	now := time.Unix(100, 0).UTC()
 	database, err := store.Open(filepath.Join(t.TempDir(), "deployment.sqlite3"), 30*24*time.Hour, func() time.Time { return now })

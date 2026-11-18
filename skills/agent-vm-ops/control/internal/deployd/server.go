@@ -386,7 +386,11 @@ func writeTransactionErrorForID(c *gin.Context, status int, code, requestID stri
 	}
 	var transactionErr *TransactionError
 	if errors.As(cause, &transactionErr) {
-		if transactionErr.Phase == PhaseRollback {
+		if errors.Is(cause, errRollbackStartsExhausted) && !errors.Is(cause, ErrUncertain) {
+			code = "rollback_previous_unavailable"
+			detail["code"] = code
+			detail["message"] = "previous version failed to start after three attempts; current slot remains active"
+		} else if transactionErr.Phase == PhaseRollback {
 			code = "state_unverified"
 			detail["code"] = code
 			detail["message"] = publicErrorMessage(code, cause.Error())

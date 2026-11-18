@@ -148,6 +148,8 @@ sudo /opt/agent-vm-native/bin/agent-vm-deploy rollback --transaction '<原事务
 sudo /opt/agent-vm-native/bin/agent-vm-deploy status --json
 ```
 
+回滚先在后台启动上一版本，现役槽继续接流。上一版本能接手后，部署控制服务交接唯一控制权和流量，再排空并停止原现役进程。上一版本首启加两次重试均失败，且现役槽仍经确认持有唯一控制权并正常接流时，本次回滚以 `rollback_previous_unavailable` 结束，现役槽继续服务。启动次数写入原部署事务；部署控制服务重启不会清零，也不会尝试更早的版本。
+
 事务进入 `needs_recovery` 时，普通 `activate` 或 `rollback` 不代替恢复动作。保留原 ID，选择回到已验证上一槽位的恢复：
 
 ```sh

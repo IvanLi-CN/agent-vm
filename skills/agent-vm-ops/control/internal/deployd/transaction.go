@@ -1289,6 +1289,9 @@ func (manager *Manager) rollbackOrFence(ctx context.Context, transaction store.T
 }
 
 func (manager *Manager) rollback(ctx context.Context, transaction store.Transaction) error {
+	if transaction.State == "failed" && transaction.RollbackUsed {
+		return errors.New("rollback is already finished")
+	}
 	if transaction.PreviousSlot == "" || transaction.PreviousSlot == "none" {
 		return errors.New("rollback requires a previous active slot")
 	}
@@ -1315,6 +1318,38 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 		}
 	}
 	rollbackCtx := context.WithValue(ctx, rollbackStartKey{}, func() error { return manager.Store.ConsumeRollbackStart(ctx, transaction.ID) })
+	if preparer, ok := manager.Runtime.(interface {
+		PrepareRollback(context.Context, string, string, SlotObservation) error
+	}); ok {
+		observation, err := manager.observe(ctx, transaction.ID)
+		if err != nil {
+			return manager.effectFailure(ctx, transaction.ID, PhaseRollback, err)
+		}
+		active := observation.Slots[observation.ActiveSlot]
+		err = manager.withControllerRenewal(rollbackCtx, active, func(preparation context.Context) error {
+			return preparer.PrepareRollback(preparation, transaction.PreviousSlot, previousAuthority, active)
+		})
+		if err != nil {
+			if errors.Is(err, errRollbackStartsExhausted) {
+				current, observeErr := manager.observe(ctx, transaction.ID)
+				incumbent := current.Slots[transaction.TargetSlot]
+				standby := current.Slots[transaction.PreviousSlot]
+				if observeErr == nil && validObservation(current, manager.Clock().UTC()) &&
+					current.ActiveSlot == transaction.TargetSlot && current.ControllerSlot == transaction.TargetSlot &&
+					incumbent.Ready && incumbent.ControllerOwned && incumbent.TrafficAccepting &&
+					incumbent.StateAuthority == previousAuthority && standby.CountersKnown &&
+					!standby.ProcessUp && !standby.ControllerOwned && !standby.TrafficAccepting {
+					_, recordErr := manager.Store.Transition(ctx, transaction.ID, PhaseRollback, PhaseRollback, "failed",
+						"rollback_start_attempts_exhausted", "deployd", map[string]any{"active_slot": current.ActiveSlot}, manager.Clock().UTC())
+					if recordErr == nil {
+						return &TransactionError{ID: transaction.ID, Phase: PhaseRollback, Cause: err}
+					}
+					err = errors.Join(err, recordErr)
+				}
+			}
+			return manager.effectFailure(ctx, transaction.ID, PhaseRollback, err)
+		}
+	}
 	if err := manager.Runtime.Rollback(rollbackCtx, transaction.TargetSlot, transaction.PreviousSlot, lease, previousAuthority); err != nil {
 		failureErr := manager.failure(ctx, transaction.ID, PhaseRollback, err)
 		fenceErr := manager.fenceSlots(ctx, errors.New("rollback did not reach a verified outcome"))

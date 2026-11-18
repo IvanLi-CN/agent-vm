@@ -1225,9 +1225,6 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 	if slot == "" || slot == "none" {
 		return nil
 	}
-	runtime.mu.Lock()
-	runtime.quiesced[slot] = quiescenceEvidence{}
-	runtime.mu.Unlock()
 	status, statusCode, err := runtime.control(ctx, runtime.socket(slot), map[string]any{"protocol": 4, "action": "drain-status"})
 	if err != nil {
 		return err
@@ -1243,6 +1240,13 @@ func (runtime *HostRuntime) Quiesce(ctx context.Context, slot string) error {
 	if !ok || !draining {
 		return errors.New("old slot is not fenced for drain")
 	}
+	return runtime.waitForSlotQuiescence(ctx, slot)
+}
+
+func (runtime *HostRuntime) waitForSlotQuiescence(ctx context.Context, slot string) error {
+	runtime.mu.Lock()
+	delete(runtime.quiesced, slot)
+	runtime.mu.Unlock()
 	deadline := time.NewTimer(15 * time.Second)
 	defer deadline.Stop()
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -1328,72 +1332,65 @@ func quiescenceEvidenceProvesStopped(evidence quiescenceEvidence) bool {
 	return evidence.StopRequested && evidence.Process.PID > 0 && evidence.Process.StartTime != ""
 }
 
-func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease, authority string) error {
-	if target != "" && target != "none" {
-		if runtime.systemdSlotStopped(ctx, target) {
-			if err := runtime.systemctl(ctx, "start", "agent-vm-native@"+target+".service"); err != nil {
-				return fmt.Errorf("restart stopped rollback target: %w", err)
-			}
-			if err := runtime.waitSlot(ctx, target); err != nil {
-				return fmt.Errorf("wait for restarted rollback target: %w", err)
-			}
-		}
-		if err := runtime.DisableTraffic(ctx, target); err != nil {
-			return err
-		}
-		if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
-			if stopErr := runtime.Stop(ctx, target); stopErr != nil {
-				return fmt.Errorf("revoke target controller: %w; stop target after revoke failure: %v", err, stopErr)
-			}
-		} else {
-			if err := runtime.resumeRollbackDrainExit(ctx, target); err != nil {
-				return err
-			}
-			if err := runtime.Drain(ctx, target); err != nil {
-				return err
-			}
-			if err := runtime.Quiesce(ctx, target); err != nil {
-				return err
-			}
-			if err := runtime.Stop(ctx, target); err != nil {
-				return fmt.Errorf("stop target after revoke: %w", err)
-			}
-		}
-	}
-	if previous != "" && previous != "none" {
-		// Restart even when systemd still reports the previous process as active:
-		// controller fencing can leave a resident process alive but not ready, and
-		// startup reconciliation is the only supported path back to admission.
+func (runtime *HostRuntime) PrepareRollback(ctx context.Context, previous string, authority string, active SlotObservation) error {
+	// An interrupted handoff may already have left the previous version serving.
+	// Otherwise boot it fenced while the selected slot keeps its existing lease.
+	if active.Slot != previous || !active.ControllerOwned || !active.TrafficAccepting {
 		if err := runtime.startRollbackPrevious(ctx, previous); err != nil {
 			return err
 		}
-		body, status, err := runtime.slotRequest(ctx, runtime.socket(previous), http.MethodGet, "/internal/v1/health", nil)
-		observedAuthority, _ := body["state_authority"].(string)
-		if err != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) || body["process_ready"] != true || observedAuthority != authority || authority == "" {
-			return errors.New("rollback state authority was not verified before granting controller")
+	}
+	body, status, err := runtime.slotRequest(ctx, runtime.socket(previous), http.MethodGet, "/internal/v1/health", nil)
+	if err != nil || (status != http.StatusOK && status != http.StatusServiceUnavailable) || !healthEnvelopeValid(body) || body["process_ready"] != true || authority == "" || body["state_authority"] != authority {
+		return errors.New("rollback state authority was not verified before granting controller")
+	}
+	process, processOK := processIdentityFromHealth(body)
+	if !processOK {
+		return errors.New("rollback process identity is invalid")
+	}
+	runtime.mu.Lock()
+	runtime.stagedProcess[previous] = process
+	runtime.mu.Unlock()
+	return nil
+}
+
+func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous string, lease controllerrole.Lease, _ string) error {
+	retire := target != "" && target != "none" && !runtime.systemdSlotStopped(ctx, target)
+	if retire {
+		if err := runtime.RevokeController(ctx, target, lease.Term); err != nil {
+			return err
 		}
-		process, processOK := processIdentityFromHealth(body)
-		if !processOK {
-			return errors.New("rollback process identity is invalid")
-		}
-		runtime.mu.Lock()
-		runtime.stagedProcess[previous] = process
-		runtime.mu.Unlock()
-		lease.Expiry = time.Now().Add(runtime.Config.LeaseDuration())
-		if err := runtime.GrantController(ctx, previous, lease); err != nil {
+		if err := runtime.resumeRollbackDrainExit(ctx, target); err != nil {
 			return err
 		}
 	}
-	if previous == "" || previous == "none" {
-		return nil
+	lease.Expiry = time.Now().Add(runtime.Config.LeaseDuration())
+	if err := runtime.GrantController(ctx, previous, lease); err != nil {
+		return err
+	}
+	manager := NewManager(nil, runtime, runtime.Config.LeaseDuration(), time.Now)
+	ctx, stop := manager.beginTransactionRenewal(ctx, lease)
+	defer stop()
+	if err := runtime.ExitDrain(ctx, previous); err != nil {
+		return fmt.Errorf("exit rollback drain on slot %s: %w", previous, err)
+	}
+	if err := runtime.EnableTraffic(ctx, previous); err != nil {
+		return err
 	}
 	if err := runtime.SwitchActive(ctx, previous); err != nil {
 		return err
 	}
-	if err := runtime.ExitDrain(ctx, previous); err != nil {
-		return fmt.Errorf("exit rollback drain on slot %s: %w", previous, err)
+	if retire {
+		// This process already lost its controller lease. Wait for its
+		// remaining work without changing shared admission on the new slot.
+		if err := runtime.waitForSlotQuiescence(ctx, target); err != nil {
+			return err
+		}
+		if err := runtime.Stop(ctx, target); err != nil {
+			return fmt.Errorf("stop retired slot after rollback: %w", err)
+		}
 	}
-	return nil
+	return stop()
 }
 
 func (runtime *HostRuntime) waitSlot(ctx context.Context, slot string) error {
@@ -2101,6 +2098,8 @@ func (runtime *HostRuntime) configureSlotUnit(ctx context.Context, slot string, 
 type rollbackStartKey struct{}
 type rollbackUnitKey struct{}
 
+var errRollbackStartsExhausted = errors.New("rollback previous version failed after three starts")
+
 func (runtime *HostRuntime) startRollbackPrevious(ctx context.Context, slot string) error {
 	claim, ok := ctx.Value(rollbackStartKey{}).(func() error)
 	if !ok {
@@ -2129,5 +2128,8 @@ func (runtime *HostRuntime) startRollbackPrevious(ctx context.Context, slot stri
 			return last
 		}
 	}
-	return fmt.Errorf("rollback previous version failed after three starts: %w", last)
+	if err := runtime.systemctl(ctx, "reset-failed", "agent-vm-native@"+slot+".service"); err != nil {
+		return errors.Join(last, err)
+	}
+	return errors.Join(errRollbackStartsExhausted, last)
 }
