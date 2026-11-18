@@ -48,6 +48,8 @@
 
 `agent-vm-deployd.service` 位于两个槽位之外，是稳定的宿主级部署控制器，不通过 `Wants=` 拉起蓝、绿槽位。槽位由部署事务显式启动，或由已启用的 systemd 开机配置启动；`After=` 只约束已经排队的启动任务，不会创建槽位启动任务。槽位的 `ExecStartPost` 使用 `agent-vm-deploy wait-process` 等待只读进程接口，接受尚无 controller lease 的 `process_ready=true`，不等待业务 readiness；冷启动时 Deployd 在这一步完成后才检查槽位，避免误停尚未创建 socket 的进程。首次迁移仍先停止旧 SQLite writer，再由事务启动新槽位，不会自动启动额外 writer。
 
+全新安装保留 `/var/lib/agent-vm-native/active/app.sock` 作为 Caddy 和请求适配器的入口。公开的 `active` 链接由 root 持有，指向 `routing/active`；部署事务在 `routing` 内原子更新槽位选择。历史安装的直接链接仍可识别。专用部署账户下由 systemd 持有 `/run/agent-vm-native/deployd.sock`，部署服务重启不会替换监听路径，root 运维 CLI 继续使用原路径。
+
 启动 unit 前，使用随附的 `sysusers.d` 和 `tmpfiles.d` 条目运行 `systemd-sysusers` 与 `systemd-tmpfiles --create`。这些条目创建专用的 rqlite 用户和非特权 `caddy` 用户；`active` 不由 tmpfiles 创建，因为它必须是原子符号链接。
 
 首次从旧单实例切换时，如果 `active` 尚不存在但旧 `state.sqlite3` 存在，发布器会在迁移成功后自动创建 `/var/lib/agent-vm-native/active -> slots/blue`。如果已经完成迁移而 `active` 缺失、断裂或指向蓝绿以外的路径，发布器拒绝猜测并保持失败围栏。

@@ -34,6 +34,13 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	listener, err := inheritedDeploySocket(config.Socket)
+	if err != nil {
+		return err
+	}
+	if listener != nil {
+		defer listener.Close()
+	}
 	processLock, err := native.AcquireLock(config.LockPath, true, true)
 	if err != nil {
 		return fmt.Errorf("acquire deployd singleton lock: %w", err)
@@ -67,7 +74,13 @@ func runServe(args []string) error {
 	}
 
 	errorsCh := make(chan error, 2)
-	go func() { errorsCh <- deployd.ServeUDS(ctx, config.Socket, server.Handler()) }()
+	go func() {
+		if listener != nil {
+			errorsCh <- deployd.ServeUDSListener(ctx, listener, server.Handler())
+		} else {
+			errorsCh <- deployd.ServeUDS(ctx, config.Socket, server.Handler())
+		}
+	}()
 	go func() {
 		errorsCh <- deployd.ServeMetrics(ctx, config.MetricsListen, server.MetricsHandler(), config.MetricsTLS, config.NetworkACL)
 	}()

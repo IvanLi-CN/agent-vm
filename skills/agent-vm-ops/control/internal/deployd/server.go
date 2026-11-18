@@ -521,6 +521,13 @@ func ServeUDS(ctx context.Context, socket string, handler http.Handler) error {
 			_ = os.Remove(socket)
 		}
 	}()
+	return ServeUDSListener(ctx, listener, handler)
+}
+
+// ServeUDSListener owns the listener for the lifetime of this server. For a
+// systemd-owned socket it closes only this process's descriptor.
+func ServeUDSListener(ctx context.Context, listener net.Listener, handler http.Handler) error {
+	defer listener.Close()
 	wrapped := &peerListener{Listener: listener}
 	server := &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 9000 * time.Second, MaxHeaderBytes: 8 * 1024, ConnContext: func(ctx context.Context, conn net.Conn) context.Context {
 		if peer, ok := conn.(*peerConn); ok {
@@ -529,9 +536,7 @@ func ServeUDS(ctx context.Context, socket string, handler http.Handler) error {
 		return ctx
 	}}
 	go shutdownOnCancel(ctx, server)
-	err = server.Serve(wrapped)
-	_ = listener.Close()
-	return err
+	return server.Serve(wrapped)
 }
 
 func ServeMetrics(ctx context.Context, address string, handler http.Handler, tlsConfig MetricsTLSConfig, networkACL ...string) error {

@@ -54,7 +54,10 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 		report.BundleSHA256, e = digestFile(input.Bundle)
 		add(e)
 	}
-	if _, err := os.Lstat("/var/lib/agent-vm-native/active"); err == nil {
+	activePath, activePathErr := deployd.EffectiveActivePath(deployd.Defaults().ActivePath)
+	if activePathErr != nil {
+		add(errors.New("active installation path cannot be inspected"))
+	} else if _, err := os.Lstat(activePath); err == nil {
 		report.Mode = "installed"
 		report.Next = "use agent-vm-deploy stage, verify and activate for upgrades"
 	} else if !errors.Is(err, os.ErrNotExist) {

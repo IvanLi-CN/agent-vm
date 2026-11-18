@@ -1127,11 +1127,18 @@ func (runtime *HostRuntime) SwitchActive(ctx context.Context, slot string) error
 	if err != nil || !info.IsDir() {
 		return fmt.Errorf("slot directory is not available: %s", target)
 	}
-	parent := filepath.Dir(runtime.Config.ActivePath)
+	activePath, err := EffectiveActivePath(runtime.Config.ActivePath)
+	if err != nil {
+		return err
+	}
+	if isDeployAccount(os.Geteuid()) && activePath != ManagedRoute {
+		return errors.New("managed routing path missing; complete host permission maintenance before switching traffic")
+	}
+	parent := filepath.Dir(activePath)
 	if err := os.MkdirAll(parent, 0o750); err != nil {
 		return err
 	}
-	if info, err := os.Lstat(runtime.Config.ActivePath); err == nil && info.Mode()&os.ModeSymlink == 0 {
+	if info, err := os.Lstat(activePath); err == nil && info.Mode()&os.ModeSymlink == 0 {
 		return errors.New("active path is not a symlink")
 	}
 	// The selected slot must be part of the next systemd boot before routing
@@ -1145,7 +1152,7 @@ func (runtime *HostRuntime) SwitchActive(ctx context.Context, slot string) error
 		return err
 	}
 	defer os.Remove(temporary)
-	if err := os.Rename(temporary, runtime.Config.ActivePath); err != nil {
+	if err := os.Rename(temporary, activePath); err != nil {
 		return &UncertainError{Cause: err}
 	}
 	directory, err := os.Open(parent)
@@ -1462,7 +1469,11 @@ func (runtime *HostRuntime) socket(slot string) string {
 }
 
 func (runtime *HostRuntime) activeSlot() (string, error) {
-	target, err := os.Readlink(runtime.Config.ActivePath)
+	activePath, err := EffectiveActivePath(runtime.Config.ActivePath)
+	if err != nil {
+		return "", err
+	}
+	target, err := os.Readlink(activePath)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", errors.New("active link is missing")
 	}
@@ -1471,7 +1482,7 @@ func (runtime *HostRuntime) activeSlot() (string, error) {
 	}
 	target = filepath.Clean(target)
 	if !filepath.IsAbs(target) {
-		target = filepath.Join(filepath.Dir(runtime.Config.ActivePath), target)
+		target = filepath.Join(filepath.Dir(activePath), target)
 	}
 	for _, slot := range []string{"blue", "green"} {
 		if target == filepath.Join(runtime.Config.ReleaseRoot, "slots", slot) {

@@ -1,0 +1,14 @@
+[Unit]
+Description=Agent VM deployment controller API socket
+
+[Socket]
+ListenStream=/run/agent-vm-native/deployd.sock
+FileDescriptorName=agent-vm-deploy
+SocketUser=root
+SocketGroup=agent-vm-deploy
+SocketMode=0660
+DirectoryMode=0750
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

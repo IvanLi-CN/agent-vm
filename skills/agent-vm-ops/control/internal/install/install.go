@@ -136,7 +136,11 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		return finishExisting(ctx, report, input)
 	}
 	// Recheck after locking: a concurrent installer may have completed preflight.
-	if _, err := os.Lstat("/var/lib/agent-vm-native/active"); !errors.Is(err, os.ErrNotExist) {
+	activePath, err := deployd.EffectiveActivePath(deployd.Defaults().ActivePath)
+	if err != nil {
+		return report, err
+	}
+	if _, err := os.Lstat(activePath); !errors.Is(err, os.ErrNotExist) {
 		return report, errors.New("installation changed after preflight; rerun read-only preflight")
 	}
 	cfg, err := LoadConfig(input.Config)
@@ -262,6 +266,7 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		"agent-vm-native@.service", "agent-vm-deployd.service", "agent-vm-rqlite.service", "agent-vm-caddy.service",
 		"agent-vm-observe.socket", "agent-vm-observe@.service", "agent-vm-deploy-host.socket", "agent-vm-deploy-host@.service",
 		"agent-vm-slot-relay.socket", "agent-vm-slot-relay@.service",
+		"agent-vm-deployd.socket",
 	} {
 		source := filepath.Join(input.Materials, "assets/systemd", unit)
 		if unit == "agent-vm-native@.service" || unit == "agent-vm-deployd.service" {
@@ -311,6 +316,9 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		return report, nil
 	}
 	if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-rqlite.service", "agent-vm-deployd.service"); err != nil {
+		return report, err
+	}
+	if err := prepareFreshRoute(deployd.Defaults().ActivePath, deployd.ManagedRoute); err != nil {
 		return report, err
 	}
 	client := deployd.Client{Socket: "/run/agent-vm-native/deployd.sock", Timeout: 30 * time.Minute}

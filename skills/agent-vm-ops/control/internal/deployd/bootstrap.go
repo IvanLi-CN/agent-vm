@@ -134,7 +134,11 @@ func (manager *Manager) finishBootstrap(ctx context.Context, tx store.Transactio
 }
 
 func (runtime *HostRuntime) CheckBootstrapRecovery(context.Context) error {
-	for _, path := range []string{runtime.Config.ActivePath, runtime.Config.Migration.LegacyStateDB} {
+	activePath, err := EffectiveActivePath(runtime.Config.ActivePath)
+	if err != nil {
+		return err
+	}
+	for _, path := range []string{activePath, runtime.Config.Migration.LegacyStateDB} {
 		if path == "" {
 			return errors.New("bootstrap requires fixed legacy state path")
 		}

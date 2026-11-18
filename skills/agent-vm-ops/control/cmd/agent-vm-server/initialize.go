@@ -10,6 +10,7 @@ import (
 	"os"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/manifest"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
@@ -43,7 +44,12 @@ func initializeState(args []string) error {
 	if os.Geteuid() != 0 {
 		return errors.New("initialize-state requires local root")
 	}
-	for _, path := range []string{"/var/lib/agent-vm-native/active", "/var/lib/agent-vm-native/state.sqlite3"} {
+	defaults := deployd.Defaults()
+	activePath, err := deployd.EffectiveActivePath(defaults.ActivePath)
+	if err != nil {
+		return err
+	}
+	for _, path := range []string{activePath, defaults.Migration.LegacyStateDB} {
 		if _, err := os.Lstat(path); !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("fresh initialization requires absent legacy state and active link: %s", path)
 		}
