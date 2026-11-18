@@ -31,6 +31,9 @@ func installLayoutFixture(t *testing.T, root, slot string, consolidated bool) st
 		if err := os.WriteFile(destination, data, os.FileMode(mode)); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.Chmod(destination, os.FileMode(mode)); err != nil {
+			t.Fatal(err)
+		}
 		digest := sha256.Sum256(data)
 		artifacts = append(artifacts, map[string]any{"name": name, "path": path, "role": role, "mode": mode, "sha256": hex.EncodeToString(digest[:])})
 	}
