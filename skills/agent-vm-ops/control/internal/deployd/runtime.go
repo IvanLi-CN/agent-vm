@@ -35,6 +35,10 @@ type HostRuntime struct {
 	stagedProcess       map[string]processIdentity
 	quiesced            map[string]quiescenceEvidence
 	legacyAuthorityLock *native.AuthorityLock
+	legacyRelayMu       sync.Mutex
+	legacyRelayConn     net.Conn
+	legacyRelayOwner    legacyLeaseOwner
+	legacyRelayGrants   map[string]controllerrole.Lease
 }
 
 const deploymentContractMajor = 1
@@ -1708,7 +1712,7 @@ func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, pat
 			for _, slot := range []string{"blue", "green"} {
 				request := slotRelayRequest{Slot: slot, Method: method, Path: path, Body: body}
 				if runtime.socket(slot) == socket && request.valid() {
-					return requestSlotRelay(ctx, request, timeout)
+					return runtime.relayHistoricalSlot(ctx, request, timeout)
 				}
 			}
 		}

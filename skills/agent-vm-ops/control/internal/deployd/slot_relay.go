@@ -1,6 +1,7 @@
 package deployd
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/protocol"
 )
 
@@ -19,7 +21,8 @@ const slotRelayResponseLimit = 4 * 1024 * 1024
 
 type slotRelayRequest struct {
 	Slot, Method, Path string
-	Body               json.RawMessage
+	Body               json.RawMessage `json:",omitempty"`
+	WatchLeaseOwner    bool            `json:",omitempty"`
 }
 
 type slotRelayResponse struct {
@@ -28,6 +31,9 @@ type slotRelayResponse struct {
 }
 
 func (request slotRelayRequest) valid() bool {
+	if request.WatchLeaseOwner {
+		return request.Slot == "" && request.Method == "" && request.Path == "" && len(request.Body) == 0
+	}
 	if validSlot(request.Slot) != nil || !protocol.DeploymentSlotRoute(request.Method, request.Path) || len(request.Body) > protocol.DeploymentSlotBodyLimit {
 		return false
 	}
@@ -54,9 +60,17 @@ func RunSlotRelay(input *os.File) error {
 	if err := conn.SetDeadline(time.Now().Add(4 * time.Second)); err != nil {
 		return err
 	}
+	reader := bufio.NewReader(io.LimitReader(conn, slotRelayRequestLimit+1))
+	line, err := reader.ReadBytes('\n')
 	var request slotRelayRequest
-	if err := readSlotRelayMessage(conn, slotRelayRequestLimit, &request); err != nil || !request.valid() {
+	if err != nil || readSlotRelayMessage(bytes.NewReader(line), slotRelayRequestLimit, &request) != nil || !request.valid() {
 		return errors.New("invalid slot relay request")
+	}
+	if request.WatchLeaseOwner {
+		return watchLegacyLeaseOwner(conn, reader)
+	}
+	if _, err := reader.ReadByte(); err != io.EOF {
+		return errors.New("slot relay request contains trailing data")
 	}
 	if err := conn.SetDeadline(time.Now().Add(245 * time.Second)); err != nil {
 		return err
@@ -74,8 +88,70 @@ func RunSlotRelay(input *os.File) error {
 	return json.NewEncoder(conn).Encode(slotRelayResponse{Body: result, Status: status})
 }
 
+type legacyLeaseOwner struct {
+	PID       int
+	StartTime string
+}
+
+func watchLegacyLeaseOwner(conn net.Conn, reader *bufio.Reader) error {
+	pid := os.Getpid()
+	owner := legacyLeaseOwner{PID: pid, StartTime: controllerrole.ProcessStartToken(pid)}
+	if owner.StartTime == "" {
+		return errors.New("legacy lease witness identity unavailable")
+	}
+	if err := json.NewEncoder(conn).Encode(owner); err != nil {
+		return err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return err
+	}
+	// Closing the authenticated caller's socket ends this process and causes
+	// old slots to fence their lease using their original process check.
+	if _, err := reader.ReadByte(); err != io.EOF {
+		return errors.New("legacy lease witness connection interrupted")
+	}
+	return nil
+}
+
+func connectLegacyLeaseOwner(ctx context.Context) (net.Conn, legacyLeaseOwner, error) {
+	var owner legacyLeaseOwner
+	dialer := net.Dialer{}
+	conn, err := dialer.DialContext(ctx, "unix", slotRelaySocket)
+	if err != nil {
+		return nil, owner, err
+	}
+	owner, err = readLegacyLeaseOwner(ctx, conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, owner, err
+	}
+	return conn, owner, nil
+}
+
+func readLegacyLeaseOwner(ctx context.Context, conn net.Conn) (legacyLeaseOwner, error) {
+	var owner legacyLeaseOwner
+	deadline := time.Now().Add(4 * time.Second)
+	if end, ok := ctx.Deadline(); ok && end.Before(deadline) {
+		deadline = end
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		return owner, err
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
+	if err := json.NewEncoder(conn).Encode(slotRelayRequest{WatchLeaseOwner: true}); err != nil {
+		return owner, err
+	}
+	reply, err := bufio.NewReader(io.LimitReader(conn, 512)).ReadBytes('\n')
+	if err != nil || readSlotRelayMessage(bytes.NewReader(reply), 512, &owner) != nil || owner.PID <= 0 ||
+		owner.StartTime == "" || owner.StartTime != controllerrole.ProcessStartToken(owner.PID) {
+		return owner, errors.New("legacy lease witness identity could not be verified")
+	}
+	return owner, conn.SetDeadline(time.Time{})
+}
+
 func requestSlotRelay(ctx context.Context, request slotRelayRequest, timeout time.Duration) (map[string]any, int, error) {
-	if !request.valid() {
+	if request.WatchLeaseOwner || !request.valid() {
 		return nil, 0, errors.New("invalid slot relay request")
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)

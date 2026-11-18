@@ -55,6 +55,7 @@ func runServe(args []string) error {
 	}
 	defer database.Close()
 	runtime := deployd.NewHostRuntime(config)
+	defer runtime.CloseLegacyLeaseOwner()
 	manager := deployd.NewManagerWithMigration(database, runtime, runtime, config.LeaseDuration(), time.Now)
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

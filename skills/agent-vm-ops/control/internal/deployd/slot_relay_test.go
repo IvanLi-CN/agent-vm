@@ -2,9 +2,36 @@ package deployd
 
 import (
 	"net/http"
+	"os"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 )
+
+func TestHistoricalLeaseRecognitionRequiresExactGrant(t *testing.T) {
+	pid := os.Getpid()
+	token := controllerrole.ProcessStartToken(pid)
+	if token == "" {
+		t.Skip("requires Linux process identity")
+	}
+	runtime := NewHostRuntime(Defaults())
+	lease := controllerrole.Lease{Slot: "blue", Term: 42, Generation: 7, LeaseID: "known", Nonce: "nonce", OwnerPID: pid, OwnerStartTime: token, Expiry: time.Now().UTC().Add(time.Minute)}
+	runtime.legacyRelayGrants = map[string]controllerrole.Lease{"blue": lease}
+	matched := map[string]any{"lease": &lease}
+	runtime.normalizeHistoricalLease("blue", matched)
+	if _, ok := matched["lease"].(controllerrole.Lease); !ok {
+		t.Fatal("confirmed lease was not recognized")
+	}
+	other := lease
+	other.Generation++
+	mismatched := map[string]any{"lease": &other}
+	runtime.normalizeHistoricalLease("blue", mismatched)
+	if mismatched["lease"] != &other {
+		t.Fatal("a different generation was recognized as a confirmed lease")
+	}
+}
 
 func TestSlotRelayOnlyAllowsDeploymentOperations(t *testing.T) {
 	for _, tc := range []struct {

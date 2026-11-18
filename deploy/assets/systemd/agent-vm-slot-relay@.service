@@ -13,4 +13,3 @@ ProtectHome=yes
 PrivateTmp=yes
 ProtectSystem=strict
 RestrictAddressFamilies=AF_UNIX
-RuntimeMaxSec=250s
