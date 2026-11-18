@@ -4,10 +4,10 @@
 
 ## 渲染
 
-复制[示例配置](observability.config.json.example)，替换部署方负责的所有占位符，然后把资源包渲染到输出目录：
+复制[示例配置](../assets/observability/observability.config.json.example)，替换部署方负责的所有占位符，然后把资源包渲染到输出目录：
 
 ```bash
-bun deploy/scripts/render_observability_dashboard.ts \
+bun "<skill-dir>/scripts/render_observability_dashboard.ts" \
   --config /path/to/agent-vm-observability.json \
   --output-dir /path/to/deployment/grafana/generated \
   --force
@@ -45,7 +45,7 @@ bun deploy/scripts/render_observability_dashboard.ts \
 渲染器在写入前会验证三个 dashboard。已经渲染的资源包也可以直接检查：
 
 ```bash
-bun deploy/scripts/validate_observability_dashboard.ts \
+bun "<skill-dir>/scripts/validate_observability_dashboard.ts" \
   --dashboard /path/to/deployment/grafana/generated/current/agent-vm-observability.json \
   --provisioning /path/to/deployment/grafana/generated/agent-vm-observability.yml
 ```
@@ -53,7 +53,7 @@ bun deploy/scripts/validate_observability_dashboard.ts \
 验证 `agent-vm-observability-inventory.json` 时使用 inventory profile：
 
 ```bash
-bun deploy/scripts/validate_observability_dashboard.ts \
+bun "<skill-dir>/scripts/validate_observability_dashboard.ts" \
   --dashboard /path/to/deployment/grafana/generated/current/agent-vm-observability-inventory.json \
   --provisioning /path/to/deployment/grafana/generated/agent-vm-observability.yml \
   --profile inventory
@@ -63,10 +63,10 @@ bun deploy/scripts/validate_observability_dashboard.ts \
 
 容量与业务清单查询必须先筛选 `agent_vm_deployd_slot_selected == 1`，再以 `sum without (slot)` 合并活动槽位序列。这样时间范围跨越蓝绿切换时，同一业务指标仍只有一条序列和一个图例；不能先汇总两个槽位，也不能补零掩盖缺失观测。Deployd 角色看板保留 `slot` 标签，用于直接比较双槽位。
 
-可使用 Prometheus 自带的 `promtool` 执行[蓝绿查询回归](selected-slot.test.yml)：
+可使用 Prometheus 自带的 `promtool` 执行[蓝绿查询回归](../assets/observability/selected-slot.test.yml)：
 
 ```bash
-promtool test rules deploy/observability/selected-slot.test.yml
+promtool test rules "<skill-dir>/assets/observability/selected-slot.test.yml"
 ```
 
 该测试同时提供双槽位样本，验证切换前后业务值始终为一份且标签稳定；没有可确认的活动槽位时必须返回空结果，不能伪造零值。

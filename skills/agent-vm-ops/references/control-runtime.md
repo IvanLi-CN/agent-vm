@@ -10,7 +10,7 @@ native 控制宿主和 disk-growth guest 要求 Linux、procfs、观测到的 cg
 
 控制宿主必须提供 Incus、systemd、OpenSSH、conntrack-tools、`ss` 和 filesystem-capacity 工具。 Guest growth 要求直接由分区承载的 ext4 或 xfs root，以及 `findmnt`、`lsblk`、`blockdev`、`growpart` 和 `resize2fs` 或 `xfs_growfs`。拓扑未知、工具缺失、virtual-disk size 过期或增长后的容量无法验证时，不能报告成功。工具执行成功本身不足够：disk、partition 和 filesystem 测量必须满足请求大小及现有的 95% filesystem threshold。
 
-客户端和 guest source transaction 直接在 Bun 中运行。按照[发布合同](../../../docs/specs/agent-vm/contracts/release.md)部署完整客户端包：`agent_vm.ts` 和 `sync_worktree.ts` 使用 `0755`，其余支持模块（包括 `host-config.ts`）使用 `0644`。本机 sidecar 对全部九个文件计算 hash。 Python 仍是人工 publisher/wrapper 和 release-policy tooling 边界；它不运行 client、controller 或 guest source fallback。 Source sync 依赖 client/source 合同规定的 Bun FFI、native `flock`、Linux `renameat2`、GNU `timeout`、Git 和 rsync。源文件暂存前必须在 managed image 中验证这些依赖；不得在请求期间安装 runtime。 Controller 的通用 image 前置条件可以独立于 Bun source action 额外包含 Python 等工具。
+客户端和 guest source transaction 直接在 Bun 中运行。按照 [v1.8.0 发布合同](https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/docs/specs/agent-vm/contracts/release.md) 部署完整客户端包：`agent_vm.ts` 和 `sync_worktree.ts` 使用 `0755`，其余支持模块（包括 `host-config.ts`）使用 `0644`。本机 sidecar 对全部九个文件计算 hash。 Python 仍是人工 publisher/wrapper 和 release-policy tooling 边界；它不运行 client、controller 或 guest source fallback。 Source sync 依赖 client/source 合同规定的 Bun FFI、native `flock`、Linux `renameat2`、GNU `timeout`、Git 和 rsync。源文件暂存前必须在 managed image 中验证这些依赖；不得在请求期间安装 runtime。 Controller 的通用 image 前置条件可以独立于 Bun source action 额外包含 Python 等工具。
 
 ## 持久化与传输兼容性
 
@@ -22,17 +22,16 @@ Native file lock 在独立进程之间保持可见。 Session-scoped lifecycle l
 
 ## 验证证据
 
-Fake Incus 和 guest-command 场景在不改变基础设施的情况下验证 controller 行为。使用真实 flock、SQLite、procfs、subprocess tree 和 pipe 的 Linux 测试验证隔离的 native OS 行为；Agent VM 检查还会验证 systemd 和 nested Incus system container，且不要求 KVM。可复现的 `scripts/agent_vm_native_acceptance.sh` runner 还会检查已安装的 format-2 bundle、systemd activation、直接 UDS 和 Bun bridge 请求、native-worker cleanup 以及 nested Incus system container。 Nested 路径使用 `security.nesting=true` 的 Incus system container，不要求 `/dev/kvm` 或 QEMU。只有在候选 bundle 安装完成后，才能在已授权的会话 Agent VM 内运行它。
+Fake Incus 和 guest-command 场景在不改变基础设施的情况下验证 controller 行为。使用真实 flock、SQLite、procfs、subprocess tree 和 pipe 的 Linux 测试验证隔离的 native OS 行为；Agent VM 检查还会验证 systemd 和 nested Incus system container，且不要求 KVM。仓库 checkout 的 `deploy/scripts/agent_vm_native_acceptance.sh` runner 还会检查已安装的 format-2 bundle、systemd activation、直接 UDS 和 Bun bridge 请求、native-worker cleanup 以及 nested Incus system container；它不是公开 Skill 的独立入口。Nested 路径使用 `security.nesting=true` 的 Incus system container，不要求 `/dev/kvm` 或 QEMU。只有在候选 bundle 安装完成后，才能在已授权的会话 Agent VM 内运行它。
 
-该 runner 的 `incus init` 会继承默认 profile，未显式设置 `security.privileged=false`；通过结果只能证明其实际生效的权限模式。非特权嵌套的范围、subordinate ID 授权及 Docker 验收必须按[嵌套权限手册](../../../deploy/docs/nested-incus.md)另外执行，保存 expanded config 和实际映射，不能用继承特权 profile 的结果替代。
+该 runner 的 `incus init` 会继承默认 profile，未显式设置 `security.privileged=false`；通过结果只能证明其实际生效的权限模式。非特权嵌套的范围、subordinate ID 授权及 Docker 验收必须按 [v1.8.0 嵌套权限手册](https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/deploy/docs/nested-incus.md) 另外执行，保存 expanded config 和实际映射，不能用继承特权 profile 的结果替代。
 
-在 source checkout 中、确保宿主机提供 Bun 和 Python 后运行以下聚焦验收套件：
+在安装后的 Skill 目录中、确保宿主机提供 Bun 和 Python 后运行以下聚焦验收套件：
 
 ```bash
-bun test skills/agent-vm-ops/tests/*.test.ts
-python3 -m unittest discover -s skills/agent-vm-ops/tests -p 'test_*.py'
-go -C skills/agent-vm-ops/control test ./...
-bun test skills/agent-vm/tests/*.test.ts
+bun test "<skill-dir>/tests/*.test.ts"
+python3 -m unittest discover -s "<skill-dir>/tests" -p 'test_*.py'
+go -C "<skill-dir>/control" test ./...
 
 # 在候选版本安装完成后，于会话 Agent VM 内运行：
 deploy/scripts/agent_vm_native_acceptance.sh
@@ -47,7 +46,7 @@ deploy/scripts/agent_vm_native_acceptance.sh
 | 05: lifecycle, reclaim and partial failures | `control-lifecycle.test.ts`, `control-resources.test.ts` |
 | 06: native process trees and bounded pipes | Linux CommandRunner cases in `control-kernel.test.ts` |
 | 07: guest growth and prerequisites | `guest-root-growth.test.ts`, guest prerequisite and stdin-bundle cases in the control suites |
-| 08: current client, release and systemd contracts | `control-process.test.ts`, `control-kernel.test.ts`, complete-package Python release/recovery tests and `skills/agent-vm/tests/transport.test.ts` and `client.test.ts` |
-| 09: installed Linux/systemd/nested-Incus acceptance | `scripts/agent_vm_native_acceptance.sh` |
+| 08: current client, release and systemd contracts | `control-process.test.ts`, `control-kernel.test.ts` and complete-package Python release/recovery tests in this Skill; the daily client tests remain repository CI coverage |
+| 09: installed Linux/systemd/nested-Incus acceptance | `deploy/scripts/agent_vm_native_acceptance.sh`（source checkout） |
 
 Linux case 会在其他平台上主动跳过；仅 macOS 运行通过不足以证明 native control host 合格。基线 SQL 和 request fixture 由已接受的前身 StateStore 在 SQL fixture 记录的 source revision 生成。测试直接消费这些字节，不导入已退役的实现。

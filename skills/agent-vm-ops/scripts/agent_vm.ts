@@ -1,0 +1,208 @@
+#!/usr/bin/env bun
+/** Protocol-4 request client. Control effects belong to the canonical Bun controller. */
+import { readFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { resolve, join } from "node:path";
+import { Client, attachDiagnosis, inherited, sessionId } from "./client.ts";
+import { CliError, Data, fail, integer, json, readJson, shellJoin } from "./client-io.ts";
+import { PROTOCOL, VERSION, runtimeRelease } from "./client-release.ts";
+import { sync, SyncFailure } from "./sync_worktree.ts";
+import { validName } from "./guest-source.ts";
+import { applyHostSelection, ensureConfig, loadHostConfig, resolveHost, configPath, setDefaultHost, bindProject, writeHostConfig } from "./host-config.ts";
+
+const HELP = `Usage: agent-vm [--host ALIAS] [--session-id ID] COMMAND [OPTIONS]
+Commands: version, help, doctor, status, acquire, renew, release, destroy, restart,
+  resize, ssh-info, ssh, exec -- ARGV, sync --name NAME, upload SOURCE DESTINATION,
+  download SOURCE DESTINATION, export PATH, port add|list|remove,
+  admin status|metrics|session list|drain enter|status|exit|reconcile|reconcile-session|gc.
+Scoped reconciliation: --session-id ID --task-id ID --generation N --pending-operation-id ID [--apply].
+Image selection: acquire --image NAME_OR_FULL_FINGERPRINT; image list.
+Mutation options: --operation-id ID. Resource options: --cpu N --memory SIZE --disk SIZE.
+Resize: --live (memory only) or --allow-restart. Use COMMAND --help for options.
+Recovery errors include bounded status guidance; add --explain to a session mutation or reconciliation command for a bounded metrics summary and read-only recovery preview.
+`;
+const paths: Record<string, string[]> = {
+  version: [], help: [], doctor: [], status: [], "image list": [],
+  acquire: ["image", "ssh-host-port", "cpu", "memory", "disk", "operation-id", "explain"],
+  renew: ["operation-id", "explain"], release: ["operation-id", "explain"], destroy: ["operation-id", "explain"], restart: ["operation-id", "explain"],
+  resize: ["cpu", "memory", "disk", "live", "allow-restart", "operation-id", "explain"],
+  "ssh-info": ["format"], ssh: [], exec: [], sync: ["name"], upload: [], download: [], export: [],
+  "port add": ["guest-port", "protocol", "host-port", "operation-id", "explain"], "port list": [], "port remove": ["protocol", "operation-id", "explain"],
+  "admin status": [], "admin metrics": [], "admin session list": [],
+  "admin drain enter": ["explain"], "admin drain status": [], "admin drain exit": ["explain"],
+  "admin reconcile": ["apply", "operation-id", "explain"], "admin gc": ["apply", "operation-id", "explain"],
+  "admin reconcile-session": ["task-id", "generation", "pending-operation-id", "apply", "operation-id", "explain"],
+  "config init": [], "config list": [], "config host add": ["transport", "control-host", "ca-file", "token-env", "token-file", "ssh-config", "identity-file", "known-hosts"], "config host set-default": [], "config project bind": [],
+};
+export interface Args { command: string; options: Data; positional: string[]; rest: string[]; }
+export function parseArgs(argv: string[]): Args {
+  const words: string[] = [], options: Data = Object.create(null), rest: string[] = [];
+  const flags = new Set(["live", "allow-restart", "apply", "explain"]);
+  for (let i = 0; i < argv.length; i++) {
+    const token = argv[i];
+    if (token === "--") { rest.push(...argv.slice(i)); break; }
+    if (token === "--version") return { command: "short-version", options, positional: [], rest };
+    if (token === "--help" || token === "-h") return { command: "help", options, positional: [], rest };
+    if (token.startsWith("--")) {
+      const [key, ...equals] = token.slice(2).split("=");
+      if (flags.has(key)) { if (equals.length) fail("invalid_request", `--${key} takes no value`); options[key] = true; }
+      else { const value = equals.length ? equals.join("=") : argv[++i]; if (value === undefined || value.startsWith("--")) fail("invalid_request", `--${key} requires a value`); options[key] = value; }
+    } else if (token.startsWith("-")) fail("invalid_request", `unsupported option: ${token}`);
+    else words.push(token);
+  }
+  const match = Object.keys(paths).sort((a, b) => b.split(" ").length - a.split(" ").length).find(p => p.split(" ").every((word, i) => words[i] === word));
+  if (!match) fail("unknown_command", "unknown or incomplete command");
+  for (const key of Object.keys(options)) if (!["session-id", "host"].includes(key) && !paths[match].includes(key)) fail("invalid_request", `unsupported option --${key} for ${match}`);
+  const positional = words.slice(match.split(" ").length), count = ["upload", "download"].includes(match) ? 2 : ["export", "port add", "port remove", "config host add", "config host set-default", "config project bind"].includes(match) ? 1 : 0;
+  if (!["ssh"].includes(match) && positional.length !== count) fail("invalid_request", "unexpected or missing positional arguments");
+  if (match === "sync" && !options.name || match === "port add" && !options["guest-port"]) fail("invalid_request", "required command option is missing");
+  if (options.live && options["allow-restart"]) fail("invalid_request", "--live and --allow-restart are mutually exclusive");
+  if (options.format && !["json", "ssh-config"].includes(options.format) || options.protocol && !["tcp", "udp"].includes(options.protocol)) fail("invalid_request", "unsupported option value");
+  for (const key of ["cpu", "ssh-host-port", "guest-port", "host-port"]) if (options[key] !== undefined) {
+    if (!/^[+-]?\d+$/.test(options[key])) fail("invalid_request", `--${key} must be an integer`);
+    const n = BigInt(options[key]); options[key] = n <= BigInt(Number.MAX_SAFE_INTEGER) && n >= BigInt(Number.MIN_SAFE_INTEGER) ? Number(n) : n;
+  }
+  if (rest.length && !["exec", "ssh"].includes(match)) fail("invalid_request", "unexpected command remainder");
+  return { command: match, options, positional, rest };
+}
+export function parseSize(value: string, memory: boolean): number | bigint {
+  const m = (memory ? /^(\d+)(MiB|GiB|M|G)$/i : /^(\d+)(GiB|G)$/i).exec(value);
+  if (!m) fail("invalid_size", memory ? "memory must use MiB, GiB, M or G" : "disk must use GiB or G");
+  const n = BigInt(m[1]) * (memory && /^g/i.test(m[2]) ? 1024n : 1n);
+  return n <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(n) : n;
+}
+export async function dispatch(args: Args, client = new Client(), native = inherited): Promise<Data | string | number> {
+  const { command: cmd, options: o, positional: pos, rest } = args;
+  if (cmd === "help") return HELP;
+  if (cmd === "short-version") { const release = runtimeRelease(); return `agent-vm ${release.version ?? VERSION}\n`; }
+  if (cmd === "version") { const release = runtimeRelease(), warnings: Data[] = []; return { version: release.version ?? VERSION, protocol: PROTOCOL, release, warnings }; }
+  if (cmd === "config init") return { path: ensureConfig(client.env) };
+  if (cmd === "config list") { const config = loadHostConfig(client.env); return { path: configPath(client.env), default_host: config.default_host ?? null, hosts: Object.fromEntries(Object.entries(config.hosts).map(([alias, profile]) => [alias, { transport: profile.transport, control_host: profile.control_host, ca_file: profile.ca_file ?? null, token_env: profile.token_env ?? null, token_file: profile.token_file ? "present" : null }])), projects: config.projects }; }
+  if (cmd === "config host set-default") return { path: setDefaultHost(pos[0], client.env), default_host: pos[0] };
+  if (cmd === "config project bind") return { path: bindProject(pos[0], client.env.AGENT_VM_PROJECT_REMOTE, client.env), host: pos[0] };
+  if (cmd === "config host add") {
+    const transport = o.transport; if (transport !== "https" && transport !== "ssh" || typeof o["control-host"] !== "string") fail("invalid_request", "config host add requires --transport https|ssh and --control-host");
+    const config = loadHostConfig(client.env); if (config.hosts[pos[0]]) fail("config_invalid", `host already exists: ${pos[0]}`);
+    config.hosts[pos[0]] = { transport, control_host: o["control-host"], ...(o["ca-file"] ? { ca_file: o["ca-file"] } : {}), ...(o["token-env"] ? { token_env: o["token-env"] } : {}), ...(o["token-file"] ? { token_file: o["token-file"] } : {}), ...(o["ssh-config"] ? { ssh_config: o["ssh-config"] } : {}), ...(o["identity-file"] ? { identity_file: o["identity-file"] } : {}), ...(o["known-hosts"] ? { known_hosts: o["known-hosts"] } : {}) };
+    return { path: writeHostConfig(config, client.env), host: pos[0] };
+  }
+  let selection = resolveHost(typeof o.host === "string" ? o.host : undefined, client.env);
+  applyHostSelection(selection, client.env);
+  if (cmd === "image list") { if (o["session-id"] !== undefined) fail("invalid_request", "image list does not accept --session-id"); return client.request("image-list", { session: null }); }
+  if (cmd === "admin metrics") { if (o["session-id"] !== undefined) fail("invalid_request", "admin metrics does not accept --session-id"); return client.request("admin-metrics", { session: null }); }
+  const session = sessionId(o["session-id"], !["doctor", "admin metrics"].includes(cmd), client.env);
+  if (session && typeof o.host !== "string" && cmd !== "acquire") {
+    try {
+      const saved = client.state(session);
+      if (typeof saved.host_alias === "string") {
+        selection = resolveHost(saved.host_alias, client.env);
+        applyHostSelection(selection, client.env);
+      }
+    } catch { /* legacy or not acquired yet */ }
+  }
+  const mutate = async (action: string, fields: Data = {}, generation?: number | bigint, operationId?: string): Promise<Data> => {
+    try {
+      return await client.request(action, { session, generation: generation ?? (["acquire", "drain-enter", "drain-exit", "admin-reconcile", "admin-gc"].includes(action) ? 0 : client.generation(session!)), write: true, operationId: operationId ?? o["operation-id"], fields });
+    } catch (error) {
+      if (action === "acquire") throw error;
+      throw await attachDiagnosis(error, client, session!, operationId ?? o["operation-id"], !!o.explain);
+    }
+  };
+  const resources = (): Data => ({ ...(o.cpu === undefined ? {} : { cpu: o.cpu }), ...(o.memory === undefined ? {} : { memory_mib: parseSize(o.memory, true) }), ...(o.disk === undefined ? {} : { disk_gib: parseSize(o.disk, false) }) });
+  if (["doctor", "status"].includes(cmd)) {
+    const response = await client.request(cmd, { session });
+    if (cmd === "status") client.reconcileServerState(session!, response.result);
+    return { ...response, host: { alias: selection.alias ?? null, transport: selection.transport, control_host: selection.control_host, compatibility: selection.compatibility } };
+  }
+  if (cmd === "acquire") {
+    const [key, publicKey] = await client.key(session!);
+    const acquireOperationId = o["operation-id"] || randomUUID();
+    let generation = (await client.request("status", { session })).result.generation;
+    if (!integer(generation) || generation < 0) fail("invalid_remote_response", "status has no valid generation");
+    if (o["operation-id"]) {
+      try { generation = readJson(client.operationPath(session!, o["operation-id"])).request.generation; }
+      catch (e: any) { if (e.code !== "ENOENT") fail("local_journal_invalid", "operation journal is unreadable"); }
+    }
+    let response: Data;
+    try {
+      response = await mutate(cmd, { public_key: publicKey, ...resources(), ...(o.image === undefined ? {} : { image: o.image }), ...(o["ssh-host-port"] === undefined ? {} : { ssh_host_port: o["ssh-host-port"] }) }, generation, acquireOperationId);
+    } catch (error) {
+      let diagnosis;
+      try { diagnosis = await attachDiagnosis(error, client, session!, acquireOperationId, !!o.explain); } catch { diagnosis = error; }
+      await client.recoverAcquireState(session!, key, acquireOperationId, generation, diagnosis instanceof Error && "detail" in diagnosis && (diagnosis as any).detail?.status ? { result: (diagnosis as any).detail.status } : undefined);
+      throw diagnosis;
+    }
+    const current = "current_state" in response ? response.current_state : response.result;
+    if (!current?.effective_lease) {
+      const recovered = await client.recoverAcquireState(session!, key, acquireOperationId, generation);
+      if (!recovered) client.persistRecoveryState(session!, key, current, acquireOperationId, generation);
+      fail("lease_unavailable", "replayed allocation no longer has an active lease; inspect status");
+    }
+    if (!client.saveState(session!, { session_id: session, task_id: current.task_id, generation: current.generation, private_key: key, cleanup_only: false, host_alias: selection.alias ?? null, host_transport: selection.transport, host_identity: selection.identity }))
+      fail("local_state_conflict", "successful acquire response conflicts with newer local session state");
+    return response;
+  }
+  if (["renew", "release", "destroy", "restart"].includes(cmd))
+    return mutate(cmd, {}, cmd === "release" || cmd === "destroy" ? client.generation(session!, true) : undefined);
+  if (cmd === "resize") {
+    if (o.live && (o.memory === undefined || o.cpu !== undefined || o.disk !== undefined)) fail("invalid_request", "--live requires only --memory; CPU/disk changes use --allow-restart");
+    return mutate(cmd, { allow_restart: !!o["allow-restart"], live_memory: !!o.live, ...resources() });
+  }
+  if (cmd.startsWith("port ")) {
+    const action = cmd.slice(5), generation = client.generation(session!);
+    if (action === "list") return client.request("port-list", { session, generation });
+    return mutate("port-" + action, { name: pos[0], port_protocol: o.protocol ?? "tcp", ...(action === "add" ? { vm_port: o["guest-port"], ...(o["host-port"] === undefined ? {} : { host_port: o["host-port"] }) } : {}) }, generation);
+  }
+  if (cmd.startsWith("admin ")) {
+    const action = cmd.slice(6);
+    if (action === "reconcile-session") {
+      if (typeof o["generation"] !== "string" || !/^[1-9]\d*$/.test(o["generation"]) || typeof o["task-id"] !== "string" || !/^[a-z0-9][a-z0-9-]{0,47}$/.test(o["task-id"]) || typeof o["pending-operation-id"] !== "string" || !/^[A-Za-z0-9_.:@/-]{1,160}$/.test(o["pending-operation-id"])) fail("invalid_request", "scoped reconciliation requires --task-id, positive --generation and --pending-operation-id");
+      const fields = { task_id: o["task-id"], pending_operation_id: o["pending-operation-id"], apply: !!o.apply };
+      if (!o.apply && o["operation-id"] !== undefined) fail("invalid_request", "dry run does not accept --operation-id");
+      try {
+        return await client.request("admin-reconcile-session", { session, generation: BigInt(o.generation), write: !!o.apply, operationId: o["operation-id"], fields });
+      } catch (error) {
+        throw await attachDiagnosis(error, client, session!, o["pending-operation-id"], !!o.explain, { taskId: o["task-id"], generation: BigInt(o.generation) });
+      }
+    }
+    if (action === "reconcile" || action === "gc") {
+      const apply = !!o.apply;
+      if (!apply && o["operation-id"] !== undefined) fail("invalid_request", "dry run does not accept --operation-id");
+      try {
+        return await client.request("admin-" + action, { session, generation: 0, write: apply, operationId: apply ? o["operation-id"] : undefined, fields: { apply } });
+      } catch (error) {
+        throw await attachDiagnosis(error, client, session!, apply ? o["operation-id"] : undefined, !!o.explain);
+      }
+    }
+    if (action === "status" || action === "session list") return client.request(action === "status" ? "admin-status" : "admin-session-list", { session });
+    if (action.startsWith("drain ")) { const drain = action.slice(6); return drain === "status" ? client.request("drain-status", { session }) : mutate("drain-" + drain, {}, 0); }
+    return mutate("admin-" + action, { apply: !!o.apply }, 0);
+  }
+  if (cmd === "sync") {
+    if (!validName(o.name)) fail("invalid_name", "--name must be one safe path segment");
+    return sync(o.name, { cli: [process.execPath, join(import.meta.dir, "agent_vm.ts")], sessionId: session! });
+  }
+  if (cmd === "exec" && (rest[0] !== "--" || rest.length < 2 || rest.some(v => v.includes("\0")))) fail("invalid_request", "exec requires -- followed by a program and its arguments");
+  if (["upload", "download", "export"].includes(cmd)) {
+    const remote = cmd === "upload" ? pos[1] : pos[0];
+    if (!remote.startsWith("/") || remote.includes("\0")) fail("invalid_path", "remote path must be absolute");
+  }
+  const [response, , config] = await client.sshInfo(session!);
+  if (cmd === "ssh-info") return o.format === "ssh-config" ? readFileSync(config, "utf8") : response;
+  if (cmd === "ssh") return native(["ssh", "-F", config, "agent-vm", ...pos, ...rest.slice(rest[0] === "--" ? 1 : 0)]);
+  if (cmd === "exec") return native(["ssh", "-F", config, "-o", "BatchMode=yes", "--", "agent-vm", shellJoin(rest.slice(1))]);
+  if (cmd === "export") return native(["ssh", "-F", config, "-o", "BatchMode=yes", "--", "agent-vm", shellJoin(["tar", "-C", "/", "-cf", "-", "--", pos[0].replace(/^\/+/, "") || "."])]);
+  if (cmd === "upload" || cmd === "download") {
+    const local = resolve(cmd === "upload" ? pos[0] : pos[1]), remote = "agent-vm:" + (cmd === "upload" ? pos[1] : pos[0]);
+    return native(["scp", "-F", config, "-o", "BatchMode=yes", "--", ...(cmd === "upload" ? [local, remote] : [remote, local])]);
+  }
+  fail("unknown_command", "unknown command");
+}
+export async function main(argv = process.argv.slice(2)): Promise<number> {
+  try { const result = await dispatch(parseArgs(argv)); if (typeof result === "number") return result; process.stdout.write(typeof result === "string" ? result : json(result) + "\n"); return 0; }
+  catch (e) {
+    const error = e instanceof CliError ? e : new CliError("client_failed", e instanceof Error ? e.message : String(e), undefined, e instanceof SyncFailure ? e.code : 3);
+    process.stderr.write(json({ ok: false, error: error.asDict() }) + "\n"); return error.exitCode;
+  }
+}
+if (import.meta.main) process.exitCode = await main();

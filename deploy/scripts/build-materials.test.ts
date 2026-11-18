@@ -52,3 +52,53 @@ test('release materials archive requires the exact clean revision', async () => 
     expect(()=>buildMaterialsArchive(source,join(root,'dirty.tar'),revision)).toThrow('clean matching source revision');
   } finally {rmSync(root,{recursive:true,force:true});}
 });
+
+test('release materials project moved observability sources into the legacy package paths', async () => {
+  const {buildMaterialsArchive}=await import('./build-materials.ts');
+  const root=mkdtempSync(join(tmpdir(),'deployment-projection-'));
+  try {
+    const files: Array<[string, string]> = [
+      ['deploy/scripts/keep.sh', '#!/bin/sh\n'],
+      ['deploy/scripts/agent_vm_state_migration.ts', 'legacy migration\n'],
+      ['deploy/scripts/render_observability_dashboard.ts', 'legacy renderer\n'],
+      ['deploy/scripts/validate_observability_dashboard.ts', 'legacy validator\n'],
+      ['deploy/observability/obsolete.txt', 'legacy asset\n'],
+      ['skills/agent-vm-ops/scripts/agent_vm_state_migration.ts', 'ops migration\n'],
+      ['skills/agent-vm-ops/scripts/render_observability_dashboard.ts', 'ops renderer\n'],
+      ['skills/agent-vm-ops/scripts/validate_observability_dashboard.ts', 'ops validator\n'],
+      ['skills/agent-vm-ops/references/observability.md', 'ops reference\n'],
+      ['skills/agent-vm-ops/assets/observability/dashboard.json.template', 'ops dashboard\n'],
+    ];
+    for (const [relative, content] of files) {
+      const path = join(root, relative);
+      mkdirSync(path.slice(0, path.lastIndexOf('/')), { recursive: true });
+      writeFileSync(path, content);
+    }
+    const git=(args:string[])=>{
+      const result=Bun.spawnSync(['git','-C',root,...args],{stdout:'pipe',stderr:'pipe'});
+      expect(result.exitCode).toBe(0);return new TextDecoder().decode(result.stdout).trim();
+    };
+    git(['init','--initial-branch=main']);git(['add','.']);
+    git(['-c','user.name=Test','-c','user.email=test@example.invalid','commit','--signoff','-m','test: project deployment materials']);
+    const revision=git(['rev-parse','HEAD']);
+    const output=join(root,'materials.tar');
+    buildMaterialsArchive(root,output,revision);
+    const listing=Bun.spawnSync(['tar','-tf',output],{stdout:'pipe',stderr:'pipe'});
+    expect(listing.exitCode).toBe(0);
+    const members=new TextDecoder().decode(listing.stdout).trim().split('\n').filter(Boolean).sort();
+    expect(members).toEqual([
+      'materials-manifest.json',
+      'observability/README.md',
+      'observability/dashboard.json.template',
+      'scripts/agent_vm_state_migration.ts',
+      'scripts/keep.sh',
+      'scripts/render_observability_dashboard.ts',
+      'scripts/validate_observability_dashboard.ts',
+    ]);
+    const projected=Bun.spawnSync(['tar','-xOf',output,'scripts/render_observability_dashboard.ts'],{stdout:'pipe',stderr:'pipe'});
+    expect(new TextDecoder().decode(projected.stdout)).toBe('ops renderer\n');
+    const manifest=JSON.parse(new TextDecoder().decode(Bun.spawnSync(['tar','-xOf',output,'materials-manifest.json'],{stdout:'pipe',stderr:'pipe'}).stdout));
+    expect(manifest.source_revision).toBe(revision);
+    expect(manifest.files.map((file:{path:string})=>file.path).sort()).toEqual(members.filter((member)=>member!=='materials-manifest.json').sort());
+  } finally {rmSync(root,{recursive:true,force:true});}
+});

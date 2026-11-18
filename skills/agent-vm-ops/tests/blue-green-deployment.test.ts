@@ -146,7 +146,7 @@ test("CA generation and state preflight require operator evidence", () => {
     const signer = createEvidenceSigner(temporaryRoot);
     const invalidEvidence = join(temporaryRoot, "invalid.json");
     signedEvidence(invalidEvidence, evidencePayload(source, "invalid-0001", { workers_quiescent: false }), signer.privateKey);
-    const rejected = run([process.execPath, resolve(root, "deploy/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", invalidEvidence, "--evidence-public-key", signer.publicKey, "--output-dir", join(temporaryRoot, "rejected")]);
+    const rejected = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", invalidEvidence, "--evidence-public-key", signer.publicKey, "--output-dir", join(temporaryRoot, "rejected")]);
     expect(rejected.exitCode).not.toBe(0);
 
     const evidence = join(temporaryRoot, "evidence.json");
@@ -155,10 +155,10 @@ test("CA generation and state preflight require operator evidence", () => {
     const tampered = JSON.parse(readFileSync(evidence, "utf8"));
     tampered.payload.trusted_commit = "forged-commit";
     writeFileSync(tamperedEvidence, JSON.stringify(tampered), { mode: 0o600 });
-    const tamperedResult = run([process.execPath, resolve(root, "deploy/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", tamperedEvidence, "--evidence-public-key", signer.publicKey, "--output-dir", join(temporaryRoot, "tampered-output")]);
+    const tamperedResult = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", tamperedEvidence, "--evidence-public-key", signer.publicKey, "--output-dir", join(temporaryRoot, "tampered-output")]);
     expect(tamperedResult.exitCode).not.toBe(0);
     const migrationDir = join(temporaryRoot, "migration");
-    const preflight = run([process.execPath, resolve(root, "deploy/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", evidence, "--evidence-public-key", signer.publicKey, "--output-dir", migrationDir]);
+    const preflight = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/agent_vm_state_migration.ts"), "preflight", "--source", source, "--evidence", evidence, "--evidence-public-key", signer.publicKey, "--output-dir", migrationDir]);
     expect(preflight.exitCode).toBe(0);
     expect(existsSync(join(migrationDir, "state.sqlite3"))).toBe(true);
     const manifest = JSON.parse(readFileSync(join(migrationDir, "snapshot-manifest.json"), "utf8"));
@@ -170,7 +170,7 @@ test("CA generation and state preflight require operator evidence", () => {
     expect(blockedDatabase.exitCode).toBe(0);
     const blockedEvidence = join(temporaryRoot, "blocked-evidence.json");
     signedEvidence(blockedEvidence, evidencePayload(blockedSource, "blocked-0001"), signer.privateKey);
-    const blocked = run([process.execPath, resolve(root, "deploy/scripts/agent_vm_state_migration.ts"), "preflight", "--source", blockedSource, "--evidence", blockedEvidence, "--evidence-public-key", signer.publicKey, "--output-dir", join(temporaryRoot, "blocked-output")]);
+    const blocked = run([process.execPath, resolve(root, "skills/agent-vm-ops/scripts/agent_vm_state_migration.ts"), "preflight", "--source", blockedSource, "--evidence", blockedEvidence, "--evidence-public-key", signer.publicKey, "--output-dir", join(temporaryRoot, "blocked-output")]);
     expect(blocked.exitCode).not.toBe(0);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
