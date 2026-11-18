@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent VM historical slot relay
+
+[Service]
+Type=exec
+User=agent-vm-server
+Group=agent-vm-web
+ExecStart=/opt/agent-vm-native/bin/agent-vm-deploy slot-relay
+StandardInput=socket
+StandardOutput=journal
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RuntimeMaxSec=250s

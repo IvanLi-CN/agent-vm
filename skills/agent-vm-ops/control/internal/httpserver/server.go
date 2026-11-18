@@ -98,7 +98,7 @@ func (s *Server) handlerWithDeployUID(deployUID int) http.Handler {
 				return
 			}
 			uid := os.Getuid()
-			deploymentRequest := deploymentSlotRoute(c.Request.Method, c.Request.URL.Path)
+			deploymentRequest := protocol.DeploymentSlotRoute(c.Request.Method, c.Request.URL.Path)
 			if uid != conn.uid && (!deploymentRequest || (conn.uid != deployUID && conn.uid != 0)) {
 				writeJSON(c, http.StatusForbidden, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("peer_unauthorized", "Unix peer credentials are not authorized", nil)}, 2)
 				c.Abort()
@@ -141,7 +141,7 @@ func (s *Server) deploymentObservation(c *gin.Context) {
 func (s *Server) control(c *gin.Context) {
 	limit := int64(maxBodyBytes)
 	if c.GetBool("deployment_slot_control") {
-		limit = 4096
+		limit = protocol.DeploymentSlotBodyLimit
 	}
 	reader := http.MaxBytesReader(c.Writer, c.Request.Body, limit)
 	defer c.Request.Body.Close()
@@ -155,7 +155,7 @@ func (s *Server) control(c *gin.Context) {
 		writeError(c, err, nil)
 		return
 	}
-	if c.GetBool("deployment_slot_control") && !deploymentSlotAction(request) {
+	if c.GetBool("deployment_slot_control") && !protocol.DeploymentSlotAction(request) {
 		writeJSON(c, http.StatusForbidden, map[string]any{"ok": false, "protocol": protocol.Version, "error": protocol.NewError("peer_unauthorized", "Unix peer credentials are not authorized for this action", nil)}, 2)
 		return
 	}
@@ -165,29 +165,6 @@ func (s *Server) control(c *gin.Context) {
 		return
 	}
 	writeJSON(c, http.StatusOK, response, 0)
-}
-
-func deploymentSlotRoute(method, path string) bool {
-	switch path {
-	case "/internal/v1/health", "/internal/v1/deployment-observation":
-		return method == http.MethodGet
-	case "/internal/v1/controller-role", "/internal/v1/traffic-role", "/internal/v1/recovery-marker", "/internal/v1/control":
-		return method == http.MethodPost
-	default:
-		return false
-	}
-}
-
-func deploymentSlotAction(request protocol.Request) bool {
-	action, _ := request["action"].(string)
-	switch action {
-	case "admin-metrics", "admin-status", "doctor", "drain-status":
-		return true
-	case "drain-enter", "drain-exit":
-		return request["session_id"] == "release-agent-vm-deployd"
-	default:
-		return false
-	}
 }
 
 func (s *Server) health(c *gin.Context) {

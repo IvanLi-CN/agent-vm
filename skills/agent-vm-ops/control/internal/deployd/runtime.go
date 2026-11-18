@@ -1671,25 +1671,13 @@ func validateSourceResult(action string, result map[string]any) error {
 }
 
 func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, path string, value any) (map[string]any, int, error) {
-	var body io.Reader
+	var body json.RawMessage
 	if value != nil {
 		encoded, err := json.Marshal(value)
 		if err != nil {
 			return nil, 0, err
 		}
-		body = bytes.NewReader(encoded)
-	}
-	transport := &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, "unix", socket)
-	}}
-	defer transport.CloseIdleConnections()
-	request, err := http.NewRequestWithContext(ctx, method, "http://unix"+path, body)
-	if err != nil {
-		return nil, 0, err
-	}
-	if value != nil {
-		request.Header.Set("Content-Type", "application/json")
+		body = encoded
 	}
 	timeout := 10 * time.Second
 	if path == "/internal/v1/control" {
@@ -1697,7 +1685,43 @@ func (runtime *HostRuntime) slotRequest(ctx context.Context, socket, method, pat
 			timeout = 240 * time.Second
 		}
 	}
-	response, err := (&http.Client{Transport: transport, Timeout: timeout}).Do(request)
+	result, status, err := callSlot(ctx, socket, method, path, body, timeout, -1)
+	if err == nil && status == http.StatusForbidden && isDeployAccount(os.Geteuid()) && runtime.Config.BlueSocket == Defaults().BlueSocket && runtime.Config.GreenSocket == Defaults().GreenSocket {
+		failure, _ := result["error"].(map[string]any)
+		if failure["code"] == "peer_unauthorized" {
+			for _, slot := range []string{"blue", "green"} {
+				request := slotRelayRequest{Slot: slot, Method: method, Path: path, Body: body}
+				if runtime.socket(slot) == socket && request.valid() {
+					return requestSlotRelay(ctx, request, timeout)
+				}
+			}
+		}
+	}
+	return result, status, err
+}
+
+func callSlot(ctx context.Context, socket, method, path string, body json.RawMessage, timeout time.Duration, expectedUID int) (map[string]any, int, error) {
+	transport := &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		var dialer net.Dialer
+		conn, err := dialer.DialContext(ctx, "unix", socket)
+		if err == nil && expectedUID >= 0 {
+			uid, peerErr := peerUID(conn)
+			if peerErr != nil || uid != expectedUID {
+				_ = conn.Close()
+				return nil, errors.New("slot socket is not owned by the server account")
+			}
+		}
+		return conn, err
+	}}
+	defer transport.CloseIdleConnections()
+	request, err := http.NewRequestWithContext(ctx, method, "http://unix"+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(body) != 0 {
+		request.Header.Set("Content-Type", "application/json")
+	}
+	response, err := (&http.Client{Transport: transport, Timeout: timeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}).Do(request)
 	if err != nil {
 		return nil, 0, err
 	}

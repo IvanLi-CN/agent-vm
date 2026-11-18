@@ -250,6 +250,7 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	for _, unit := range []string{
 		"agent-vm-native@.service", "agent-vm-deployd.service", "agent-vm-rqlite.service", "agent-vm-caddy.service",
 		"agent-vm-observe.socket", "agent-vm-observe@.service", "agent-vm-deploy-host.socket", "agent-vm-deploy-host@.service",
+		"agent-vm-slot-relay.socket", "agent-vm-slot-relay@.service",
 	} {
 		source := filepath.Join(input.Materials, "assets/systemd", unit)
 		if unit == "agent-vm-native@.service" || unit == "agent-vm-deployd.service" {
@@ -272,7 +273,7 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	if err := command(ctx, "systemctl", "daemon-reload"); err != nil {
 		return report, err
 	}
-	if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-observe.socket", "agent-vm-deploy-host.socket"); err != nil {
+	if err := command(ctx, "systemctl", "enable", "--now", "agent-vm-observe.socket", "agent-vm-deploy-host.socket", "agent-vm-slot-relay.socket"); err != nil {
 		return report, err
 	}
 	if report.Mode == "legacy" {
