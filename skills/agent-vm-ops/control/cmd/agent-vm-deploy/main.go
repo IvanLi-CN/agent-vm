@@ -84,14 +84,23 @@ func run(args []string) error {
 	slot := flags.String("slot", "", "target slot")
 	bundle := flags.String("bundle", "", "verified release bundle")
 	action := flags.String("action", "", "recovery action")
-	timeoutSeconds := flags.Int("timeout", 60, "request timeout in seconds")
+	timeoutSeconds := flags.Int("timeout", 0, "request timeout in seconds (defaults to the command's operation budget)")
 	jsonOutput := flags.Bool("json", false, "output JSON")
 	if err := flags.Parse(args[1:]); err != nil {
 		return err
 	}
 	_ = jsonOutput
-	if command == "migrate" && *timeoutSeconds == 60 {
-		*timeoutSeconds = 9000
+	explicitTimeout := false
+	flags.Visit(func(option *flag.Flag) { explicitTimeout = explicitTimeout || option.Name == "timeout" })
+	if !explicitTimeout {
+		switch {
+		case command == "migrate":
+			*timeoutSeconds = 9000
+		case command == "rollback" || (command == "recover" && *action == "rollback"):
+			*timeoutSeconds = 480
+		default:
+			*timeoutSeconds = 60
+		}
 	}
 	if *timeoutSeconds <= 0 {
 		return errors.New("timeout must be positive")

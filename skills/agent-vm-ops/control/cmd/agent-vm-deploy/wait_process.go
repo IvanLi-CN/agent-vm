@@ -9,6 +9,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os/exec"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -26,10 +29,20 @@ func runWaitProcess(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*timeout)*time.Second)
 	defer cancel()
-	return waitSlotProcess(ctx, "/run/agent-vm-native/"+*slot+"/app.sock")
+	return waitSlotProcess(ctx, "/run/agent-vm-native/"+*slot+"/app.sock", func(ctx context.Context) error {
+		unit := "agent-vm-native@" + *slot + ".service"
+		output, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property=MainPID", "--value").Output()
+		if err != nil {
+			return fmt.Errorf("inspect slot main process: %w", err)
+		}
+		if pid, err := strconv.Atoi(strings.TrimSpace(string(output))); err != nil || pid <= 0 {
+			return errors.New("systemd slot main process exited before exposing its health interface")
+		}
+		return nil
+	})
 }
 
-func waitSlotProcess(ctx context.Context, socket string) error {
+func waitSlotProcess(ctx context.Context, socket string, checkMainProcess func(context.Context) error) error {
 	transport := &http.Transport{Proxy: nil, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return (&net.Dialer{}).DialContext(ctx, "unix", socket)
 	}}
@@ -38,6 +51,11 @@ func waitSlotProcess(ctx context.Context, socket string) error {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if checkMainProcess != nil {
+			if err := checkMainProcess(ctx); err != nil {
+				return err
+			}
+		}
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://unix/internal/v1/health", nil)
 		if err != nil {
 			return err

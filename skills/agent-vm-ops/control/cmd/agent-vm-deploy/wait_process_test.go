@@ -35,7 +35,7 @@ func TestWaitProcessAcceptsFencedProcessWithoutControllerReadiness(t *testing.T)
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if err := waitSlotProcess(ctx, listener.Addr().String()); err != nil {
+	if err := waitSlotProcess(ctx, listener.Addr().String(), nil); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -43,7 +43,7 @@ func TestWaitProcessAcceptsFencedProcessWithoutControllerReadiness(t *testing.T)
 func TestWaitProcessRejectsMissingProcessAndBoundsStartup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
-	if err := waitSlotProcess(ctx, filepath.Join(t.TempDir(), "missing")); !errors.Is(err, context.DeadlineExceeded) {
+	if err := waitSlotProcess(ctx, filepath.Join(t.TempDir(), "missing"), nil); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("missing process accepted or deadline lost: %v", err)
 	}
 	for _, args := range [][]string{{"wait-process"}, {"wait-process", "--slot", "../blue"}, {"wait-process", "--slot", "blue", "--timeout", "56"}} {
@@ -55,5 +55,22 @@ func TestWaitProcessRejectsMissingProcessAndBoundsStartup(t *testing.T) {
 		if err := run(args); err == nil {
 			t.Fatalf("invalid authority startup arguments accepted: %v", args)
 		}
+	}
+}
+
+func TestWaitProcessReturnsWhenSystemdMainProcessExits(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	exited := errors.New("main process has exited")
+	calls := 0
+	err := waitSlotProcess(ctx, filepath.Join(t.TempDir(), "missing"), func(context.Context) error {
+		calls++
+		if calls == 2 {
+			return exited
+		}
+		return nil
+	})
+	if !errors.Is(err, exited) {
+		t.Fatalf("startup should stop waiting for the exited process: %v", err)
 	}
 }
