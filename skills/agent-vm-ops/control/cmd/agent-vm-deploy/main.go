@@ -37,6 +37,12 @@ func run(args []string) error {
 	if args[0] == "serve" {
 		return runServe(args[1:])
 	}
+	if args[0] == "host-action" {
+		if len(args) != 1 {
+			return errors.New("host-action is a systemd socket handler")
+		}
+		return deployd.RunHostAction(os.Stdin)
+	}
 	if args[0] == "install" {
 		return runInstall(args[1:])
 	}

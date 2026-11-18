@@ -24,6 +24,7 @@
   Caddyfile
   caddy.env
   rqlite/auth.json
+  backup/{auth.json,ca.crt}
   tls/caddy/{server.crt,server.key}
   tls/rqlite/{server.crt,server.key}
   deployd.json
@@ -78,6 +79,8 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 ## rqlite 配置
 
 将 `rqlite-auth.json.example` 复制为受保护的 `/etc/agent-vm-native/rqlite/auth.json`，再由部署方填入 secret。rqlite unit 将 HTTP 和 Raft 绑定到回环地址，并启用 HTTPS 与 HTTP authentication。
+
+恢复点客户端只读取 `migration.rqlite_backup_auth_file` 和 `migration.rqlite_backup_ca_file`；独立凭据文件只包含 `agent-vm-backup` 的密码，由安装器从认证输入导出。备份账号必须有 `backup` 和 `query`，不能有 `execute`，且不能与业务账号复用密码。旧 SQLite 导入仍使用其受保护的原有认证配置。
 
 每个槽位的 state URL、认证信息和 CA 信任路径必须由部署配置提供，不能写入 release manifest、公开 dashboard 或仓库测试 fixture。Deployd 迁移使用 `deployd.json` 中的 `migration.rqlite_url` 和 `migration.rqlite_unit`，不读取业务 SQLite 之外的隐藏配置。
 

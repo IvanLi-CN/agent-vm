@@ -88,6 +88,11 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 		add(errors.New("running systemd is required"))
 	}
 	if configErr == nil {
+		if auth, err := protectedRead(cfg.Files["rqlite_auth"]); err != nil {
+			add(err)
+		} else if _, err := deployd.ExportBackupCredential(auth); err != nil {
+			add(err)
+		}
 		var blue config.Config
 		for _, slot := range []string{"blue", "green"} {
 			c, e := config.Load(cfg.Files[slot+"_config"])
@@ -147,7 +152,7 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 // The general daemon supports custom layouts; the installer owns only the
 // fixed service stack and must never redirect migration reads or deletions.
 func validateMigrationLayout(got, want deployd.MigrationConfig) error {
-	if got.LegacySocket != want.LegacySocket || got.LegacyUnit != want.LegacyUnit || got.LegacyStateDB != want.LegacyStateDB || got.RQLiteUnit != want.RQLiteUnit || got.RQLiteCAFile != want.RQLiteCAFile || got.RQLiteAuthFile != want.RQLiteAuthFile || got.RecoveryDirectory != want.RecoveryDirectory || got.RQLiteURL != "https://127.0.0.1:4001" {
+	if got.LegacySocket != want.LegacySocket || got.LegacyUnit != want.LegacyUnit || got.LegacyStateDB != want.LegacyStateDB || got.RQLiteUnit != want.RQLiteUnit || got.RQLiteCAFile != want.RQLiteCAFile || got.RQLiteAuthFile != want.RQLiteAuthFile || got.RQLiteBackupAuth != want.RQLiteBackupAuth || got.RQLiteBackupCA != want.RQLiteBackupCA || got.RecoveryDirectory != want.RecoveryDirectory || got.RQLiteURL != "https://127.0.0.1:4001" {
 		return errors.New("installer requires fixed local migration paths and rqlite authority")
 	}
 	return nil

@@ -226,6 +226,9 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 			return report, err
 		}
 	}
+	if err := installBackupInputs(cfg); err != nil {
+		return report, err
+	}
 	if report.Mode != "legacy" {
 		if err := installProductFiles(product, "/opt/agent-vm-native"); err != nil {
 			return report, err
@@ -331,6 +334,26 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 	report.Mode = "installed"
 	report.Next = "verify VM lifecycle and Prometheus integration using deploy/docs/acceptance.md"
 	return report, nil
+}
+
+func installBackupInputs(cfg Config) error {
+	auth, err := protectedRead(cfg.Files["rqlite_auth"])
+	if err != nil {
+		return err
+	}
+	credential, err := deployd.ExportBackupCredential(auth)
+	if err != nil {
+		return err
+	}
+	ca, err := protectedRead(cfg.Files["rqlite_certificate"])
+	if err != nil {
+		return err
+	}
+	migration := deployd.Defaults().Migration
+	if err := installFile(migration.RQLiteBackupAuth, credential, 0640, "agent-vm-deploy"); err != nil {
+		return err
+	}
+	return installFile(migration.RQLiteBackupCA, ca, 0640, "agent-vm-deploy")
 }
 
 func finishExisting(ctx context.Context, report Report, input Inputs) (Report, error) {

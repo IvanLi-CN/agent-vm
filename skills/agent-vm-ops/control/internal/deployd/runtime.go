@@ -1731,8 +1731,34 @@ func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) 
 	if !strings.HasPrefix(unit, "agent-vm-native@") || !strings.HasSuffix(unit, ".service") {
 		return errors.New("unsupported systemd unit")
 	}
+	slot := strings.TrimSuffix(strings.TrimPrefix(unit, "agent-vm-native@"), ".service")
+	if err := validSlot(slot); err != nil {
+		return err
+	}
+	if isDeployAccount(os.Geteuid()) {
+		defaults := Defaults()
+		if runtime.Config.ReleaseRoot != defaults.ReleaseRoot {
+			return errors.New("deployment host actions require the installed release root")
+		}
+		request := hostAction{Action: action, Slot: slot}
+		if action == "start" || action == "restart" {
+			metadata, err := releaseManifest.LoadMetadata(filepath.Join(runtime.Config.ReleaseRoot, "slots", slot, "release-manifest.json"))
+			if err != nil {
+				return err
+			}
+			switch metadata.ServerBinary {
+			case "agent-vm-server":
+				request.Layout = "server"
+			case "agent-vm-control":
+				request.Layout = "control"
+			default:
+				return errors.New("unsupported slot layout")
+			}
+			request.Rollback, _ = ctx.Value(rollbackUnitKey{}).(bool)
+		}
+		return dispatchHostAction(ctx, request)
+	}
 	if action == "start" || action == "restart" {
-		slot := strings.TrimSuffix(strings.TrimPrefix(unit, "agent-vm-native@"), ".service")
 		rollback, _ := ctx.Value(rollbackUnitKey{}).(bool)
 		if err := runtime.configureSlotUnit(ctx, slot, rollback); err != nil {
 			return err

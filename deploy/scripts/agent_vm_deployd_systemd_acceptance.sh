@@ -259,7 +259,7 @@ if [[ -n "$recovery_fixture" ]]; then
   install -m 0644 "$AGENT_VM_TEST_RECOVERY_RQLITE_CA" /etc/agent-vm-native/recovery-ca.crt
   install -m 0640 "$AGENT_VM_TEST_RECOVERY_RQLITE_AUTH" /etc/agent-vm-native/recovery-auth.json
   state_authority="$(printf 'rqlite:%s/' "$recovery_fixture" | sha256sum | cut -d ' ' -f 1)"
-  migration_config=", \"migration\": {\"rqlite_url\": \"$recovery_fixture\", \"rqlite_ca_file\": \"/etc/agent-vm-native/recovery-ca.crt\", \"rqlite_auth_file\": \"/etc/agent-vm-native/recovery-auth.json\"}"
+  migration_config=", \"migration\": {\"rqlite_url\": \"$recovery_fixture\", \"rqlite_backup_ca_file\": \"/etc/agent-vm-native/recovery-ca.crt\", \"rqlite_backup_auth_file\": \"/etc/agent-vm-native/recovery-auth.json\"}"
 fi
 
 for slot in blue green; do

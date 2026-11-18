@@ -346,7 +346,7 @@ func (runtime *HostRuntime) recoveryClient() (*http.Client, string, string, erro
 		(endpoint.Path != "" && endpoint.Path != "/") || endpoint.RawQuery != "" || endpoint.Fragment != "" {
 		return nil, "", "", errors.New("rqlite recovery requires the configured HTTPS authority address")
 	}
-	ca, err := readRecoveryConfig(config.RQLiteCAFile, false)
+	ca, err := readRecoveryConfig(config.RQLiteBackupCA, false)
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -354,28 +354,80 @@ func (runtime *HostRuntime) recoveryClient() (*http.Client, string, string, erro
 	if !pool.AppendCertsFromPEM(ca) {
 		return nil, "", "", errors.New("rqlite recovery CA is invalid")
 	}
-	auth, err := readRecoveryConfig(config.RQLiteAuthFile, true)
+	auth, err := readRecoveryConfig(config.RQLiteBackupAuth, true)
 	if err != nil {
 		return nil, "", "", err
 	}
-	var users []struct{ Username, Password string }
+	var credential backupCredential
+	if json.Unmarshal(auth, &credential) != nil || !validBackupPassword(credential.Password) {
+		return nil, "", "", errors.New("rqlite recovery credential is invalid")
+	}
+	return &http.Client{
+		Transport:     &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		Timeout:       5 * time.Minute,
+	}, strings.TrimRight(endpoint.String(), "/"), credential.Password, nil
+}
+
+type backupCredential struct {
+	Password string `json:"password"`
+}
+
+func validBackupPassword(value string) bool {
+	return strings.TrimSpace(value) != "" && !strings.HasPrefix(value, "<")
+}
+
+// ExportBackupCredential selects only the identity used by the backup client.
+func ExportBackupCredential(auth []byte) ([]byte, error) {
+	var users []struct {
+		Username string   `json:"username"`
+		Password string   `json:"password"`
+		Perms    []string `json:"perms"`
+	}
 	if json.Unmarshal(auth, &users) != nil {
-		return nil, "", "", errors.New("rqlite recovery credentials are invalid")
+		return nil, errors.New("invalid rqlite authentication input")
+	}
+	var selected string
+	for _, user := range users {
+		if user.Username != "agent-vm-backup" {
+			continue
+		}
+		if selected != "" || !validBackupPassword(user.Password) {
+			return nil, errors.New("invalid or duplicate rqlite backup credential")
+		}
+		perms := make(map[string]bool)
+		for _, perm := range user.Perms {
+			switch perm {
+			case "backup", "query", "ready", "status":
+				perms[perm] = true
+			default:
+				return nil, errors.New("rqlite backup identity exceeds permitted access")
+			}
+		}
+		if !perms["backup"] || !perms["query"] {
+			return nil, errors.New("rqlite backup identity needs backup and query permissions")
+		}
+		selected = user.Password
+	}
+	if selected == "" {
+		return nil, errors.New("rqlite backup credential is missing")
 	}
 	for _, user := range users {
-		if user.Username == "agent-vm-backup" && user.Password != "" && !strings.HasPrefix(user.Password, "<") {
-			return &http.Client{
-				Transport:     &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
-				CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-				Timeout:       5 * time.Minute,
-			}, strings.TrimRight(endpoint.String(), "/"), user.Password, nil
+		if user.Username != "agent-vm-backup" && user.Password == selected {
+			return nil, errors.New("rqlite backup password must not be shared with another identity")
 		}
 	}
-	return nil, "", "", errors.New("rqlite backup credential is missing")
+	return json.Marshal(backupCredential{Password: selected})
 }
 
 func readRecoveryConfig(path string, secret bool) ([]byte, error) {
-	info, err := os.Lstat(path)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, errors.New("cannot open protected rqlite recovery configuration")
+	}
+	file := os.NewFile(uintptr(fd), path)
+	defer file.Close()
+	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o022 != 0 ||
 		(secret && info.Mode().Perm()&0o037 != 0) || info.Size() > 1<<20 {
 		return nil, errors.New("rqlite recovery configuration is not a protected regular file")
@@ -384,7 +436,11 @@ func readRecoveryConfig(path string, secret bool) ([]byte, error) {
 	if !ok || stat.Uid != 0 && stat.Uid != uint32(os.Geteuid()) {
 		return nil, errors.New("rqlite recovery configuration has an untrusted owner")
 	}
-	return os.ReadFile(path)
+	data, err := io.ReadAll(io.LimitReader(file, 1<<20+1))
+	if err == nil && len(data) > 1<<20 {
+		return nil, errors.New("rqlite recovery configuration is too large")
+	}
+	return data, err
 }
 
 const recoveryMarkerQuery = "SELECT value FROM meta WHERE key='deployment_recovery_marker'"

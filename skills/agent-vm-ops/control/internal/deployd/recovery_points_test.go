@@ -22,6 +22,28 @@ type exhaustedRecoveryRuntime struct {
 	requests []string
 }
 
+func TestExportBackupCredential(t *testing.T) {
+	const backup = `{"username":"agent-vm-backup","password":"test-backup","perms":["backup","query"]}`
+	const control = `{"username":"agent-vm-control","password":"test-control","perms":["execute","query"]}`
+	got, err := ExportBackupCredential([]byte("[" + control + "," + backup + "]"))
+	if err != nil || string(got) != `{"password":"test-backup"}` {
+		t.Fatal("installer did not export exactly the backup credential")
+	}
+	for name, auth := range map[string]string{
+		"missing":         "[" + control + "]",
+		"duplicate":       "[" + backup + "," + backup + "]",
+		"write allowed":   "[" + strings.Replace(backup, `"query"`, `"query","execute"`, 1) + "]",
+		"no query":        "[" + strings.Replace(backup, `,"query"`, "", 1) + "]",
+		"shared password": "[" + backup + "," + strings.Replace(control, "test-control", "test-backup", 1) + "]",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ExportBackupCredential([]byte(auth)); err == nil {
+				t.Fatal("invalid backup identity was accepted")
+			}
+		})
+	}
+}
+
 func (*exhaustedRecoveryRuntime) RecoveryAuthority() string { return "authority-1" }
 
 func (runtime *exhaustedRecoveryRuntime) CreateRecoveryPoint(_ context.Context, _, purpose, _ string, _ map[string]bool, _ time.Time) error {

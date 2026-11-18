@@ -1,0 +1,16 @@
+[Unit]
+Description=Agent VM fixed deployment host action
+
+[Service]
+Type=exec
+User=root
+ExecStart=/opt/agent-vm-native/bin/agent-vm-deploy host-action
+StandardInput=socket
+StandardOutput=journal
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/systemd/system
+RestrictAddressFamilies=AF_UNIX
+RuntimeMaxSec=70s

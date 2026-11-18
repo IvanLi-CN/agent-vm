@@ -38,7 +38,7 @@ sudo tar --extract --file /var/tmp/agent-vm-install/deployment-materials.tar \
 | Web/OIDC | 在两个槽位配置的 `management` 中启用 Web，使用 [`web.json.example`](../assets/web.json.example) 的 `management` 子树，填写实际 issuer、client ID、secret、external origin、redirect URI 和管理员主体；具体字段以 [Web 合同](../../docs/specs/agent-vm/contracts/management-api.md) 为准。 |
 | `deployd.json` | 以 [`deployd.json.example`](../assets/deployd.json.example) 为基础，保留固定状态、socket、slot 和 active 路径；本机观测使用 loopback 监听，跨主机接入另见[观测说明](observability.md)。 |
 | `Caddyfile`、`caddy.env` | 复制 [`Caddyfile.example`](../assets/blue-green/Caddyfile.example) 和 [`caddy.env.example`](../assets/blue-green/caddy.env.example)，填写已注册域名。Caddy 只代理 active 槽位，不代理指标。 |
-| `rqlite-auth.json` | 根据 [`rqlite-auth.json.example`](../assets/blue-green/rqlite-auth.json.example) 设置独立的 control 和 backup 凭据；control 凭据必须与两个槽位的 `state_db` 一致。 |
+| `rqlite-auth.json` | 根据 [`rqlite-auth.json.example`](../assets/blue-green/rqlite-auth.json.example) 设置独立的 control 和 backup 凭据；control 凭据必须与两个槽位的 `state_db` 一致。安装器只向备份客户端导出 backup 密码，拒绝给该账号授予普通业务写权限。 |
 | `rqlite.crt`、`rqlite.key` | 匹配的服务端证书与私钥；证书必须包含 IP SAN `127.0.0.1`。槽位和初始化命令通过固定 `SSL_CERT_FILE` 信任该证书。 |
 | `caddy.crt`、`caddy.key` | 覆盖已注册域名的匹配证书与私钥。 |
 

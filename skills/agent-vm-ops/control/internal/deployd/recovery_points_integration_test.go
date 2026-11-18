@@ -24,8 +24,8 @@ func TestRealRQLiteRecoveryPoint(t *testing.T) {
 	defer cancel()
 	config := Defaults()
 	config.Migration.RQLiteURL = endpoint
-	config.Migration.RQLiteCAFile = os.Getenv("AGENT_VM_TEST_RECOVERY_RQLITE_CA")
-	config.Migration.RQLiteAuthFile = os.Getenv("AGENT_VM_TEST_RECOVERY_RQLITE_AUTH")
+	config.Migration.RQLiteBackupCA = os.Getenv("AGENT_VM_TEST_RECOVERY_RQLITE_CA")
+	config.Migration.RQLiteBackupAuth = os.Getenv("AGENT_VM_TEST_RECOVERY_RQLITE_AUTH")
 	config.Migration.RecoveryDirectory = filepath.Join(t.TempDir(), "recovery")
 	runtime := NewHostRuntime(config)
 	client, _, _, err := runtime.recoveryClient()

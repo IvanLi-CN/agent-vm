@@ -27,6 +27,8 @@ type MigrationConfig struct {
 	RQLiteUnit          string `json:"rqlite_unit"`
 	RQLiteCAFile        string `json:"rqlite_ca_file"`
 	RQLiteAuthFile      string `json:"rqlite_auth_file"`
+	RQLiteBackupAuth    string `json:"rqlite_backup_auth_file"`
+	RQLiteBackupCA      string `json:"rqlite_backup_ca_file"`
 	RecoveryDirectory   string `json:"recovery_directory"`
 	DrainTimeoutSeconds int64  `json:"drain_timeout_seconds"`
 	WriterCheckSeconds  int64  `json:"writer_check_seconds"`
@@ -69,6 +71,8 @@ func Defaults() Config {
 			RQLiteUnit:          "agent-vm-rqlite.service",
 			RQLiteCAFile:        "/etc/agent-vm-native/tls/rqlite/server.crt",
 			RQLiteAuthFile:      "/etc/agent-vm-native/rqlite/auth.json",
+			RQLiteBackupAuth:    "/etc/agent-vm-native/backup/auth.json",
+			RQLiteBackupCA:      "/etc/agent-vm-native/backup/ca.crt",
 			RecoveryDirectory:   "/var/lib/agent-vm-native/migration",
 			DrainTimeoutSeconds: 8100,
 			WriterCheckSeconds:  1,
@@ -151,11 +155,13 @@ func (config Config) Validate() error {
 
 func (config MigrationConfig) Validate() error {
 	for name, value := range map[string]string{
-		"migration.legacy_socket":      config.LegacySocket,
-		"migration.legacy_state_db":    config.LegacyStateDB,
-		"migration.rqlite_ca_file":     config.RQLiteCAFile,
-		"migration.rqlite_auth_file":   config.RQLiteAuthFile,
-		"migration.recovery_directory": config.RecoveryDirectory,
+		"migration.legacy_socket":           config.LegacySocket,
+		"migration.legacy_state_db":         config.LegacyStateDB,
+		"migration.rqlite_ca_file":          config.RQLiteCAFile,
+		"migration.rqlite_auth_file":        config.RQLiteAuthFile,
+		"migration.rqlite_backup_auth_file": config.RQLiteBackupAuth,
+		"migration.rqlite_backup_ca_file":   config.RQLiteBackupCA,
+		"migration.recovery_directory":      config.RecoveryDirectory,
 	} {
 		if value == "" || !filepath.IsAbs(value) {
 			return fmt.Errorf("deployd config invalid: %s must be an absolute path", name)
