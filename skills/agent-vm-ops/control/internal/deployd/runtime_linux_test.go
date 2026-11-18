@@ -130,8 +130,9 @@ func TestRealSystemdRollbackCrashBudget(t *testing.T) {
 		return nil
 	}
 	ctx = context.WithValue(ctx, rollbackStartKey{}, claim)
-	if err := runtime.startRollbackPrevious(ctx, "blue"); err == nil || !strings.Contains(err.Error(), "three starts") {
-		t.Fatalf("rollback result: %v", err)
+	result := runtime.startRollbackPrevious(ctx, "blue")
+	if result == nil || !strings.Contains(result.Error(), "three starts") {
+		t.Fatalf("rollback result: %v", result)
 	}
 	if claimed != 3 {
 		t.Fatalf("starts=%d, want 3", claimed)
@@ -139,9 +140,9 @@ func TestRealSystemdRollbackCrashBudget(t *testing.T) {
 	if err := runtime.startRollbackPrevious(ctx, "blue"); err == nil || claimed != 3 {
 		t.Fatalf("exhausted retry budget restarted old slot: %d %v", claimed, err)
 	}
-	output, err := exec.Command("systemctl", "show", "agent-vm-native@blue.service", "--property=Restart", "--property=MainPID").Output()
+	output, err := exec.Command("systemctl", "show", "agent-vm-native@blue.service", "--property=Restart", "--property=MainPID", "--property=LoadState", "--property=ExecStart", "--property=ConditionResult", "--property=DropInPaths", "--property=Result").Output()
 	if err != nil || !strings.Contains(string(output), "Restart=no") || !strings.Contains(string(output), "MainPID=0") {
-		t.Fatalf("crashing slot not stopped: %s %v", output, err)
+		t.Fatalf("crashing slot not stopped: %s %v; rollback result: %v", output, err, result)
 	}
 	executable := filepath.Join(root, "slots", "blue", "bin", "agent-vm-server")
 	journal, err := exec.Command("journalctl", "-u", "agent-vm-native@blue.service", "--no-pager", "--output=cat", "--grep="+executable).Output()
