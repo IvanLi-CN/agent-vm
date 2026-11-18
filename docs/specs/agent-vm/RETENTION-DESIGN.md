@@ -1,6 +1,6 @@
 # Agent VM retention and voluntary release
 
-This accepted design explains why Agent VM retention follows expected task continuation rather than individual validation phases. [Agent VM specification](SPEC.md#lifecycle) is the normative lifecycle contract; [agent-vm CLI contract](contracts/cli.md) defines the public operation boundary. This document is design background, not another operating entrypoint.
+This accepted design explains why Agent VM retention follows expected task continuation rather than individual validation phases. [Agent VM specification](SPEC.md#生命周期) is the normative lifecycle contract; [agent-vm CLI contract](contracts/cli.md) defines the public operation boundary. This document is design background, not another operating entrypoint.
 
 ## Retention and closure boundary
 
@@ -12,6 +12,6 @@ An expected continuation is a reason to retain an effective lease, not an indepe
 
 [agent-vm](../../../skills/agent-vm/SKILL.md#retain-and-renew) owns the retention, renewal and Finish procedure. The consuming engineering workflow invokes it at the relevant phase and closure points. This keeps one operating policy while preserving the consumer's independent review, CI and publication duties.
 
-[Implementation coverage](contracts/cli.md#reclamation-and-retry-behavior) records the public retry and cleanup boundary separately from native deployment and live-model evidence. Closure is established by observed lease/access/guest state; a command dispatch or prior expiry cannot substitute for that observation. Existing data-loss authorization remains unchanged.
+[Implementation coverage](contracts/cli.md#回收与重试行为) records the public retry and cleanup boundary separately from native deployment and live-model evidence. Closure is established by observed lease/access/guest state; a command dispatch or prior expiry cannot substitute for that observation. Existing data-loss authorization remains unchanged.
 
 This document clarifies retention policy only; it does not add a CLI, control-process, timer or deployment requirement.

@@ -7,13 +7,22 @@ import { resolve } from 'node:path';
 function sourceWatch(): Plugin {
   return { name: 'documentation-source-watch', configureServer(server) {
     const root = resolve(import.meta.dirname, '..');
-    server.watcher.add([resolve(root, 'docs'), resolve(root, 'GLOSSARY.md'), resolve(root, 'README.md')]);
+    const sourceDirs = ['docs', 'deploy', 'images'].map(path => resolve(root, path));
+    const rootFiles = ['README.md', 'PRODUCT.md', 'CONTRIBUTING.md', 'GLOSSARY.md', 'DESIGN.md'].map(path => resolve(root, path));
+    const siteFiles = [resolve(root, 'docs-site/content/catalog.ts'), resolve(root, 'docs-site/app/page-tree.ts')];
+    const watched = [...sourceDirs, ...rootFiles, ...siteFiles];
+    server.watcher.add(watched);
     let timer: ReturnType<typeof setTimeout>;
     server.watcher.on('all', (_, path) => {
-      if (!path.startsWith(resolve(root, 'docs') + '/') && path !== resolve(root, 'GLOSSARY.md') && path !== resolve(root, 'README.md')) return;
+      const sourceChanged = sourceDirs.some(dir => path === dir || path.startsWith(dir + '/')) || rootFiles.includes(path);
+      const siteChanged = siteFiles.includes(path);
+      if (!sourceChanged && !siteChanged) return;
       clearTimeout(timer);
       timer = setTimeout(() => {
-        try { execFileSync('bun', ['content/generate.ts'], { cwd: import.meta.dirname, stdio: 'inherit' }); server.ws.send({ type: 'full-reload' }); }
+        try {
+          if (sourceChanged || siteChanged && path.endsWith('catalog.ts')) execFileSync('bun', ['content/generate.ts'], { cwd: import.meta.dirname, stdio: 'inherit' });
+          server.ws.send({ type: 'full-reload' });
+        }
         catch (error) { server.config.logger.error(String(error)); }
       }, 100);
     });

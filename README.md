@@ -23,6 +23,8 @@ The [system architecture](docs/architecture/system.md) is the single architectur
 
 See the [documentation guide](docs/README.md) for architecture, specifications, decisions and operations.
 
+For a first session, read the [quickstart](docs/usage/quickstart.md), then [connections](docs/usage/connections.md) and [daily workflows](docs/usage/workflows.md). Maintainers can use the [console guide](docs/usage/console.md), [image guide](docs/usage/images.md) and [troubleshooting guide](docs/usage/troubleshooting.md). The project-level product requirements live in [PRODUCT.md](PRODUCT.md); the complete publication and exclusion inventory is [docs/DOCUMENTATION-INDEX.md](docs/DOCUMENTATION-INDEX.md).
+
 ## Management console design
 
 The built-in Web management console targets managed images and existing Agent

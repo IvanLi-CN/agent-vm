@@ -61,7 +61,7 @@ export function Mermaid({ code }: { code: string }) {
     renderQueue = renderQueue.catch(() => {}).then(render).catch(() => {
       if (!cancelled) {
         setDiagram(undefined);
-        setError('图表无法呈现，请检查构建来源中的 Mermaid 语法。');
+        setError('图表无法呈现，请在 GitHub 原始文件中检查 Mermaid 语法。');
       }
     });
     return () => { cancelled = true; };
