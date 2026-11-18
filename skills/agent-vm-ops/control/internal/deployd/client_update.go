@@ -45,6 +45,57 @@ func prepareBlueGreen(ctx context.Context, call updateCall, targetSlot, bundle s
 	return blueGreenStep(ctx, call, result.ID, "verify", PhaseControllerHandoff, "active", map[string]any{"transaction_id": result.ID})
 }
 
+// ResumeBlueGreenPreparation resolves a lost acknowledgement from the existing
+// coordinator's status. It never stages a second transaction or activates.
+func (client Client) ResumeBlueGreenPreparation(ctx context.Context, stagingID, previous, target, expectedID string) (UpdateReceipt, error) {
+	return resumeBlueGreenPreparation(ctx, client.Call, stagingID, previous, target, expectedID)
+}
+
+func resumeBlueGreenPreparation(ctx context.Context, call updateCall, stagingID, previous, target, expectedID string) (UpdateReceipt, error) {
+	if stagingID == "" || validSlot(previous) != nil || validSlot(target) != nil || previous == target {
+		return UpdateReceipt{}, errors.New("blue-green recovery requires a staging ID and two distinct fixed slots")
+	}
+	payload, _, err := call(ctx, "GET", "/v1/status", nil)
+	if err != nil {
+		return UpdateReceipt{}, err
+	}
+	var status struct {
+		OK    bool `json:"ok"`
+		Value struct {
+			Observed     RuntimeSnapshot `json:"observation"`
+			Transactions []struct {
+				updateAcknowledgement
+				StagingID        string `json:"staging_id"`
+				Previous         string `json:"previous_slot"`
+				Target           string `json:"target_slot"`
+				RecoveryRequired bool   `json:"recovery_required"`
+			} `json:"transactions"`
+		} `json:"value"`
+	}
+	if json.Unmarshal(payload, &status) != nil || !status.OK || status.Value.Observed.ActiveSlot != previous ||
+		len(status.Value.Transactions) != 1 {
+		return UpdateReceipt{}, errors.New("original deployment transaction could not be identified")
+	}
+	tx := status.Value.Transactions[0]
+	if tx.ID == "" || (expectedID != "" && tx.ID != expectedID) || tx.StagingID != stagingID ||
+		tx.Previous != previous || tx.Target != target {
+		return UpdateReceipt{}, errors.New("active deployment transaction does not match the reserved candidate")
+	}
+	receipt := UpdateReceipt{ID: tx.ID, Action: "recover", Payload: payload}
+	if tx.RecoveryRequired || tx.State != "active" {
+		return receipt, errors.New("original deployment transaction requires explicit recovery")
+	}
+	switch tx.Phase {
+	case PhaseStandbyValidation:
+		return blueGreenStep(ctx, call, tx.ID, "verify", PhaseControllerHandoff, "active", map[string]any{"transaction_id": tx.ID})
+	case PhaseControllerHandoff:
+		receipt.Action = "verify"
+		return receipt, nil
+	default:
+		return receipt, errors.New("original deployment transaction is not at a preparation phase")
+	}
+}
+
 func activateBlueGreen(ctx context.Context, call updateCall, prepared UpdateReceipt) (UpdateReceipt, error) {
 	if prepared.ID == "" || prepared.Action != "verify" {
 		return prepared, errors.New("blue-green activation requires a verified candidate")

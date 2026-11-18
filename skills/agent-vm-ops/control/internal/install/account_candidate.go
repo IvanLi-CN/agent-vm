@@ -2,9 +2,11 @@ package install
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -28,6 +30,13 @@ func prepareAccountCandidate(ctx context.Context, input Inputs, product string, 
 	staging := filepath.Join(deployd.Defaults().ReleaseRoot, "release-staging")
 	bundle, stagingID, err := stageAccountBundle(staging, input.Bundle, report.BundleSHA256)
 	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			prior := filepath.Join(staging, stagingID)
+			if err := verifyReservedAccountBundle(prior, report.BundleSHA256); err != nil {
+				return deployd.UpdateReceipt{}, err
+			}
+			return client.ResumeBlueGreenPreparation(ctx, stagingID, report.ActiveSlot, target, "")
+		}
 		return deployd.UpdateReceipt{}, err
 	}
 	if err := prepareLegacyCandidateUnit(ctx, report.ActiveSlot, input, product, report.SourceRevision); err != nil {
@@ -38,6 +47,21 @@ func prepareAccountCandidate(ctx context.Context, input Inputs, product string, 
 		return receipt, fmt.Errorf("inspect original deployment transaction for staging ID %s before retrying: %w", stagingID, err)
 	}
 	return receipt, nil
+}
+
+func verifyReservedAccountBundle(directory, expected string) error {
+	file, err := materialFile(directory, "product.tar")
+	if err != nil {
+		return fmt.Errorf("read reserved migration bundle: %w", err)
+	}
+	defer file.Close()
+	digest := sha256.New()
+	const limit = 256 << 20
+	size, err := io.Copy(digest, io.LimitReader(file, limit+1))
+	if err != nil || size > limit || hex.EncodeToString(digest.Sum(nil)) != expected {
+		return errors.New("reserved migration bundle failed digest verification")
+	}
+	return nil
 }
 
 // Reserve the deterministic staging ID before asking the coordinator to do
