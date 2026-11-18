@@ -14,6 +14,8 @@ func TestHostActionRejectsUntrustedOperations(t *testing.T) {
 		"arbitrary argument":  `{"action":"stop","slot":"blue","unit":"sshd.service"}`,
 		"non-bootstrap slot":  `{"action":"initialize","slot":"green"}`,
 		"arbitrary init mode": `{"action":"resume-initialize","slot":"blue","layout":"control"}`,
+		"restore disabled":    `{"action":"restore-restart-policy","slot":"blue","layout":"server","rollback":true}`,
+		"restore unsafe path": `{"action":"restore-restart-policy","slot":"blue","layout":"/bin/sh"}`,
 		"second request":      `{"action":"stop","slot":"green"}{}`,
 		"oversized request":   `{"action":"stop","slot":"green"}` + strings.Repeat(" ", 512),
 	} {
@@ -34,6 +36,13 @@ func TestHostActionRejectsUntrustedOperations(t *testing.T) {
 	})
 	if err != nil || got != (hostAction{Action: "restart", Slot: "green", Layout: "control", Rollback: true}) {
 		t.Fatalf("expected fixed legacy rollback request, got %#v (%v)", got, err)
+	}
+	err = handleHostAction(t.Context(), strings.NewReader(`{"action":"restore-restart-policy","slot":"blue","layout":"server"}`), func(_ context.Context, action hostAction) error {
+		got = action
+		return nil
+	})
+	if err != nil || got != (hostAction{Action: "restore-restart-policy", Slot: "blue", Layout: "server"}) {
+		t.Fatalf("expected fixed policy restoration request, got %#v (%v)", got, err)
 	}
 }
 

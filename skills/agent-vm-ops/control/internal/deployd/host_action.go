@@ -34,9 +34,12 @@ func (action hostAction) validate() error {
 		return err
 	}
 	switch action.Action {
-	case "start", "restart":
+	case "start", "restart", "restore-restart-policy":
 		if action.Layout != "server" && action.Layout != "control" {
 			return errors.New("invalid slot binary layout")
+		}
+		if action.Action == "restore-restart-policy" && action.Rollback {
+			return errors.New("restart policy restoration requires the normal policy")
 		}
 	case "stop", "enable", "reset-failed":
 		if action.Layout != "" || action.Rollback {
@@ -226,7 +229,7 @@ func applyHostAction(ctx context.Context, action hostAction) error {
 	run := func(args ...string) error {
 		return exec.CommandContext(ctx, "/usr/bin/systemctl", args...).Run()
 	}
-	if action.Action == "start" || action.Action == "restart" {
+	if action.Action == "start" || action.Action == "restart" || action.Action == "restore-restart-policy" {
 		dir := filepath.Join("/etc/systemd/system", unit+".d")
 		if err := checkHostUnitDirectory(dir); err != nil {
 			return err
@@ -258,6 +261,9 @@ func applyHostAction(ctx context.Context, action hostAction) error {
 		}
 		if err := requireHostSlotProperty(ctx, unit, "Restart", restart); err != nil {
 			return err
+		}
+		if action.Action == "restore-restart-policy" {
+			return requireHostSlotProperty(ctx, unit, "User", slotUser)
 		}
 	}
 	if action.Action == "start" || action.Action == "restart" || action.Action == "enable" {

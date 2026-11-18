@@ -1772,7 +1772,7 @@ func callSlot(ctx context.Context, socket, method, path string, body json.RawMes
 }
 
 func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) error {
-	if action != "start" && action != "stop" && action != "restart" && action != "enable" && action != "reset-failed" {
+	if action != "start" && action != "stop" && action != "restart" && action != "enable" && action != "reset-failed" && action != "restore-restart-policy" {
 		return errors.New("unsupported systemd action")
 	}
 	if action == "reset-failed" && unit != "agent-vm-native@blue.service" && unit != "agent-vm-native@green.service" {
@@ -1791,7 +1791,7 @@ func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) 
 			return errors.New("deployment host actions require the installed release root")
 		}
 		request := hostAction{Action: action, Slot: slot}
-		if action == "start" || action == "restart" {
+		if action == "start" || action == "restart" || action == "restore-restart-policy" {
 			metadata, err := releaseManifest.LoadMetadata(filepath.Join(runtime.Config.ReleaseRoot, "slots", slot, "release-manifest.json"))
 			if err != nil {
 				return err
@@ -1804,9 +1804,14 @@ func (runtime *HostRuntime) systemctl(ctx context.Context, action, unit string) 
 			default:
 				return errors.New("unsupported slot layout")
 			}
-			request.Rollback, _ = ctx.Value(rollbackUnitKey{}).(bool)
+			if action != "restore-restart-policy" {
+				request.Rollback, _ = ctx.Value(rollbackUnitKey{}).(bool)
+			}
 		}
 		return dispatchHostAction(ctx, request)
+	}
+	if action == "restore-restart-policy" {
+		return runtime.configureSlotUnit(ctx, slot, false)
 	}
 	if action == "start" || action == "restart" {
 		rollback, _ := ctx.Value(rollbackUnitKey{}).(bool)
@@ -2115,7 +2120,7 @@ func (runtime *HostRuntime) startRollbackPrevious(ctx context.Context, slot stri
 			last = runtime.waitSlot(startCtx, slot)
 		}
 		if last == nil {
-			return runtime.configureSlotUnit(ctx, slot, false)
+			return runtime.systemctl(ctx, "restore-restart-policy", "agent-vm-native@"+slot+".service")
 		}
 		// Retry only a process proven to have exited, never an unavailable live service.
 		output, err := exec.CommandContext(ctx, "systemctl", "show", "agent-vm-native@"+slot+".service", "--property=ActiveState", "--property=MainPID").Output()
