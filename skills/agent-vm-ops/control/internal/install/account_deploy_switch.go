@@ -217,6 +217,9 @@ func copyStoppedDeploymentJournal(ctx context.Context, cfg deployd.Config, uid, 
 		return err
 	}
 	defer lock.Close()
+	if err := transferRecoveryOwnership(ctx, cfg.Migration.RecoveryDirectory, uid, gid); err != nil {
+		return fmt.Errorf("transfer deployment recovery material: %w", err)
+	}
 	if err := copyAccountJournal(ctx, cfg.Database, deployd.DedicatedDatabase, uid, gid); err != nil {
 		return err
 	}
