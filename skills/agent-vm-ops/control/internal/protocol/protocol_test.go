@@ -185,6 +185,22 @@ func TestValidateCompatibilityReturnsReleaseWarning(t *testing.T) {
 	}
 }
 
+func TestValidateCompatibilityAcceptsLegacyProtocolIdentityWithoutWarning(t *testing.T) {
+	release := testRelease()
+	request := Request{
+		"protocol": Version, "action": "status",
+		"compatibility": map[string]any{
+			"release_id": LegacyProtocolReleaseID, "protocol": Version, "action": "status",
+			"request":           map[string]any{"schema": 1, "semantic_revision": 1},
+			"accepted_response": map[string]any{"schema_min": 1, "schema_max": 1, "semantic_min": 1, "semantic_max": 1},
+		},
+	}
+	warnings, control := ValidateCompatibility(request, release)
+	if control != nil || len(warnings) != 0 {
+		t.Fatalf("warnings=%#v control=%#v", warnings, control)
+	}
+}
+
 func TestSuccessIncludesServerTimeForFormatTwoClients(t *testing.T) {
 	response := Success(Request{"protocol": Version, "action": "status", "session_id": "s"}, map[string]any{})
 	if value, ok := response["server_time"].(string); !ok || strings.TrimSpace(value) == "" {

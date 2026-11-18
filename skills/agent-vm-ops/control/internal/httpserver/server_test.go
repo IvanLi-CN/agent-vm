@@ -166,6 +166,42 @@ func TestUDSControlHealthAndSnapshotRoutes(t *testing.T) {
 	}
 }
 
+func TestControlHTTPAcceptsLegacyIdentityWithoutReleaseWarning(t *testing.T) {
+	root := t.TempDir()
+	store, err := state.OpenForTest(filepath.Join(root, "state.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	actions := make(map[string]protocol.ActionCompatibility, len(protocol.Actions))
+	for action := range protocol.Actions {
+		actions[action] = protocol.ActionCompatibility{
+			Request: protocol.Schema{Schema: 1, SemanticRevision: 1}, Response: protocol.Schema{Schema: 1, SemanticRevision: 1},
+			RequestWindow: protocol.CompatibilityWindow{SchemaMin: 1, SchemaMax: 1, SemanticMin: 1, SemanticMax: 1}, ResponseWindow: protocol.CompatibilityWindow{SchemaMin: 1, SchemaMax: 1, SemanticMin: 1, SemanticMax: 1},
+		}
+	}
+	releaseID := strings.Repeat("a", 40)
+	service := lifecycle.New(store, config.Defaults(), lifecycle.Options{Release: &protocol.ReleaseMetadata{ReleaseID: releaseID, SourceRevision: releaseID, Protocol: protocol.Version, Transport: "go-request", ManifestPresent: true, ArtifactsVerified: true, Actions: actions}})
+	service.MarkReady()
+	body := []byte(`{"protocol":4,"action":"status","session_id":"http-legacy","compatibility":{"release_id":"legacy-protocol-4","protocol":4,"action":"status","request":{"schema":1,"semantic_revision":1},"accepted_response":{"schema_min":1,"schema_max":1,"semantic_min":1,"semantic_max":1}}}`)
+	request := httptest.NewRequest(http.MethodPost, "/internal/v1/control", bytes.NewReader(body))
+	recorder := httptest.NewRecorder()
+	New(service).Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", recorder.Code, recorder.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(recorder.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["ok"] != true || response["release"].(map[string]any)["release_id"] != releaseID {
+		t.Fatalf("response = %#v", response)
+	}
+	if warnings, ok := response["warnings"].([]any); !ok || len(warnings) != 0 {
+		t.Fatalf("unexpected warnings = %#v", response["warnings"])
+	}
+}
+
 func TestDeployPeerCannotDispatchGuestMutations(t *testing.T) {
 	// Deliberately leave the business service nil: denied requests must never
 	// reach dispatch or a role handler.
