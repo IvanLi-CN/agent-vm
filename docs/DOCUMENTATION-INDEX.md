@@ -113,6 +113,7 @@
 - `docs/adr/0052-client-runtime-release-boundary.md`
 - `docs/adr/0053-image-names-and-operation-pinning.md`
 - `docs/adr/0054-agent-vm-deployment-input-and-recovery-policy.md`
+- [root SSH 请求身份](adr/0055-root-ssh-request-identity.md)：已接受的安全边界决定，通过本索引阅读，未作为独立站点导航。
 
 ### 提案：索引访问
 

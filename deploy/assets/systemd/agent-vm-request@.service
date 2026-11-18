@@ -1,0 +1,15 @@
+[Unit]
+Description=Agent VM SSH request identity adapter
+
+[Service]
+Type=exec
+User=root
+ExecStart=/opt/agent-vm-native/bin/agent-vm-deploy request-relay
+StandardInput=socket
+StandardOutput=journal
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RuntimeMaxSec=610s

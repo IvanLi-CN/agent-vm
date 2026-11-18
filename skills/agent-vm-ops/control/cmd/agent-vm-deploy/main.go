@@ -64,6 +64,18 @@ func run(args []string) error {
 		}
 		return deployd.RunSlotRelay(os.Stdin)
 	}
+	if args[0] == "request-relay" {
+		if len(args) != 1 {
+			return errors.New("request-relay is a systemd socket handler")
+		}
+		return deployd.RunRequestRelay(os.Stdin)
+	}
+	if args[0] == "request-relay-child" {
+		if len(args) != 2 {
+			return errors.New("request-relay-child requires one fixed slot")
+		}
+		return deployd.RunRequestRelayChild(args[1], os.Stdin, os.Stdout)
+	}
 	if args[0] == "install" {
 		return runInstall(args[1:])
 	}

@@ -29,6 +29,7 @@ func TestHandoffHelpersKeepServiceRestrictions(t *testing.T) {
 	for _, tc := range []struct{ unit, action string }{
 		{"agent-vm-deploy-host@.service", "host-action"},
 		{"agent-vm-slot-relay@.service", "slot-relay"},
+		{"agent-vm-request@.service", "request-relay"},
 	} {
 		t.Run(tc.action, func(t *testing.T) {
 			source, err := os.ReadFile(filepath.Join("../../../../..", "deploy/assets/systemd", tc.unit))

@@ -18,6 +18,8 @@ CLI 见 [v1.8.0 命令合同](https://github.com/IvanLi-CN/agent-vm/blob/v1.8.0/
 Alias 和 address 必须来自明确的运维配置；日常 VM SSH 使用 task connection information。Mutation 的记录应保留解析出的 alias、transport 和目标身份。
 Mutation 前检查精确的 candidate revision/checksum、component version、native unit、Incus project/pool/network/profile 和 CT-local filesystem capacity。
 
+服务账户迁移时，SSH 请求使用 root 专用 `/run/agent-vm-native/control.sock`，不能继续直连活跃槽 `app.sock`。新入口由安装器在候选启动前启用；它按实际槽位 UID 转发，包括历史版本回退。连接资料切换后须检查普通 `status` 和业务操作，不能用 `doctor` 或部署状态替代。按需转发进程不改变两个常驻服务的专用账户。
+
 计划维护时进入 `agent-vm admin drain enter`，检查 drain status，等待 effective lease 结束，并确认 cleanup 已关闭 NAT/flow 且停止 container。
 Drain 拒绝新的 lease 和 restart admission，允许在线 retrieval/release，不会静默延长 deadline。
 已经越过短 admission fence 的 restart 可以在不持有 global lock 的情况下完成。

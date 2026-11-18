@@ -15,6 +15,10 @@ function resolveSocket(): string {
   const configured = process.env.AGENT_VM_GO_CONTROL_SOCKET;
   if (configured) return configured;
   try {
+    const entry = lstatSync(DEFAULT_SOCKET);
+    if (entry.isSocket() && entry.uid === 0 && (entry.mode & 0o777) === 0o600) return DEFAULT_SOCKET;
+  } catch { /* Historical installations may not have the root request entry. */ }
+  try {
     // Keep the active path authoritative after the first cutover. lstat also
     // treats a not-yet-ready socket symlink as present, so we fail closed
     // instead of falling back to a retired singleton controller.

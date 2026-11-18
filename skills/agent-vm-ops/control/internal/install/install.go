@@ -267,6 +267,7 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		"agent-vm-observe.socket", "agent-vm-observe@.service", "agent-vm-deploy-host.socket", "agent-vm-deploy-host@.service",
 		"agent-vm-slot-relay.socket", "agent-vm-slot-relay@.service",
 		"agent-vm-deployd.socket",
+		"agent-vm-request.socket", "agent-vm-request@.service",
 	} {
 		source := filepath.Join(input.Materials, "assets/systemd", unit)
 		if unit == "agent-vm-native@.service" || unit == "agent-vm-deployd.service" {
