@@ -22,8 +22,9 @@ import (
 const protocol = 4
 
 type configuration struct {
-	Slot   string `json:"slot"`
-	Socket string `json:"socket"`
+	Slot      string `json:"slot"`
+	Socket    string `json:"socket"`
+	Authority string `json:"authority"`
 }
 
 type releaseManifest struct {
@@ -81,6 +82,9 @@ func run(args []string) error {
 }
 
 func serve(config configuration, manifest releaseManifest) error {
+	if config.Authority == "" {
+		config.Authority = "authority-1"
+	}
 	if err := os.MkdirAll(filepath.Dir(config.Socket), 0o750); err != nil {
 		return err
 	}
@@ -116,7 +120,7 @@ func serve(config configuration, manifest releaseManifest) error {
 			"ok":                       true,
 			"protocol":                 protocol,
 			"process_ready":            true,
-			"state_authority":          "authority-1",
+			"state_authority":          config.Authority,
 			"ready":                    true,
 			"controller_owned":         controller,
 			"controller_lease_renewal": true,

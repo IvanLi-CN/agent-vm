@@ -406,7 +406,11 @@ go -C "$repository_root/skills/agent-vm-ops/control" test ./internal/deployd -ru
 }
 
 [[ "${AGENT_VM_REAL_SYSTEMD:-0}" == 1 ]] || fail "real Agent VM acceptance requires AGENT_VM_REAL_SYSTEMD=1"
-bash "$repository_root/skills/agent-vm-ops/scripts/agent_vm_deployd_systemd_acceptance.sh" >"$proof_dir/deployd-systemd-acceptance.json" 2>&1 || {
+AGENT_VM_TEST_RECOVERY_RQLITE_URL="$rqlite_base" \
+AGENT_VM_TEST_RECOVERY_RQLITE_CA="$ca_dir/ca.crt" \
+AGENT_VM_TEST_RECOVERY_RQLITE_AUTH="$proof_dir/auth.json" \
+AGENT_VM_TEST_RECOVERY_RQLITE_CONTROL="$control_secret" \
+  bash "$repository_root/skills/agent-vm-ops/scripts/agent_vm_deployd_systemd_acceptance.sh" >"$proof_dir/deployd-systemd-acceptance.json" 2>&1 || {
   cat "$proof_dir/deployd-systemd-acceptance.json" >&2
   fail "real Deployd systemd acceptance failed"
 }
