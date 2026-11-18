@@ -1337,10 +1337,16 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 				current, observeErr := manager.observe(ctx, transaction.ID)
 				incumbent := current.Slots[transaction.TargetSlot]
 				standby := current.Slots[transaction.PreviousSlot]
+				stopped := standby.CountersKnown
+				if verifier, ok := manager.Runtime.(interface {
+					verifyFailedRollbackSlotStopped(context.Context, string) bool
+				}); !stopped && ok {
+					stopped = verifier.verifyFailedRollbackSlotStopped(ctx, transaction.PreviousSlot)
+				}
 				if observeErr == nil && validObservation(current, manager.Clock().UTC()) &&
 					current.ActiveSlot == transaction.TargetSlot && current.ControllerSlot == transaction.TargetSlot &&
 					incumbent.Ready && incumbent.ControllerOwned && incumbent.TrafficAccepting &&
-					incumbent.StateAuthority == previousAuthority && standby.CountersKnown &&
+					incumbent.StateAuthority == previousAuthority && stopped &&
 					!standby.ProcessUp && !standby.ControllerOwned && !standby.TrafficAccepting {
 					_, recordErr := manager.Store.Transition(ctx, transaction.ID, PhaseRollback, PhaseRollback, "failed",
 						"rollback_start_attempts_exhausted", "deployd", map[string]any{"active_slot": current.ActiveSlot}, manager.Clock().UTC())

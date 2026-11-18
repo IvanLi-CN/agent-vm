@@ -1901,6 +1901,27 @@ func (runtime *HostRuntime) systemdSlotStopped(ctx context.Context, slot string)
 	return systemdSlotStoppedProperties(parseSystemdProperties(string(output)))
 }
 
+func (runtime *HostRuntime) verifyFailedRollbackSlotStopped(ctx context.Context, slot string) bool {
+	if validSlot(slot) != nil {
+		return false
+	}
+	unit := "agent-vm-native@" + slot + ".service"
+	stopped := func() bool {
+		output, err := exec.CommandContext(ctx, "systemctl", "show", unit,
+			"--property=LoadState", "--property=ActiveState", "--property=SubState",
+			"--property=MainPID", "--property=FragmentPath", "--property=Slice",
+			"--property=ControlGroup", "--property=KillMode", "--property=Delegate").Output()
+		properties := parseSystemdProperties(string(output))
+		const slice = `system-agent\x2dvm\x2dnative.slice`
+		group := "/system.slice/" + slice + "/" + unit
+		return err == nil && systemdSlotStoppedProperties(properties) &&
+			properties["Slice"] == slice && properties["Delegate"] == "no" &&
+			properties["KillMode"] == "control-group" &&
+			(properties["ControlGroup"] == "" || properties["ControlGroup"] == group)
+	}
+	return stopped() && native.VerifyStoppedSlotCgroup(slot) == nil && stopped()
+}
+
 func systemdSlotStoppedProperties(properties map[string]string) bool {
 	return properties["LoadState"] == "loaded" &&
 		properties["ActiveState"] == "inactive" &&

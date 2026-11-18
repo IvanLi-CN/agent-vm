@@ -139,6 +139,14 @@ func recoveryOperationsClear(output []byte) error {
 	return nil
 }
 
+func VerifyStoppedSlotCgroup(slot string) error {
+	if slot != "blue" && slot != "green" {
+		return errors.New("invalid control slot")
+	}
+	group := filepath.Join(`/sys/fs/cgroup/system.slice/system-agent\x2dvm\x2dnative.slice`, "agent-vm-native@"+slot+".service")
+	return checkRecoveryCgroup(group, 0)
+}
+
 func checkRecoveryCgroup(directory string, self int) error {
 	info, err := os.Lstat(directory)
 	if errors.Is(err, os.ErrNotExist) && self == 0 {
