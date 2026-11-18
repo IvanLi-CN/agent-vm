@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -12,6 +13,7 @@ import (
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/manifest"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/state"
 )
 
 // PreflightAccountMigration checks the active release that would become the
@@ -55,7 +57,7 @@ func PreflightAccountMigration(ctx context.Context, input Inputs) (Report, error
 	}
 	report.PreviousSource = metadata.SourceRevision
 	for _, slot := range []string{"blue", "green"} {
-		if err := checkAccountMigrationConfig(slot, cfg.Files[slot+"_config"]); err != nil {
+		if err := checkAccountMigrationConfig(slot, cfg.Files[slot+"_config"], active.StateAuthority); err != nil {
 			return fail(err)
 		}
 	}
@@ -94,7 +96,7 @@ func accountMigrationActive(data []byte, now time.Time) (deployd.RuntimeSnapshot
 	return snapshot, active, nil
 }
 
-func checkAccountMigrationConfig(slot, input string) error {
+func checkAccountMigrationConfig(slot, input, activeAuthority string) error {
 	path := filepath.Join("/etc/agent-vm-native/slots", slot, "config.json")
 	if _, err := protectedRead(path); err != nil {
 		return fmt.Errorf("installed %s configuration is not protected", slot)
@@ -104,7 +106,18 @@ func checkAccountMigrationConfig(slot, input string) error {
 	if currentErr != nil || nextErr != nil || !sameAccountMigrationEnvironment(slot, current, next) {
 		return fmt.Errorf("host account migration would change the %s slot state authority or Incus environment", slot)
 	}
+	if !matchesLiveAccountMigrationAuthority(next.StateDB, activeAuthority) {
+		return fmt.Errorf("configured %s slot rqlite authority does not match the live service", slot)
+	}
 	return nil
+}
+
+func matchesLiveAccountMigrationAuthority(dsn, observed string) bool {
+	if observed == "" || config.ValidateInstallationAuthority(dsn) != nil {
+		return false
+	}
+	endpoint, err := url.Parse(dsn)
+	return err == nil && state.RQLiteAuthorityIdentity(*endpoint) == observed
 }
 
 func sameAccountMigrationEnvironment(slot string, current, next config.Config) bool {
