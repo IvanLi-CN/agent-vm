@@ -1318,6 +1318,9 @@ func (manager *Manager) rollback(ctx context.Context, transaction store.Transact
 		}
 	}
 	rollbackCtx := context.WithValue(ctx, rollbackStartKey{}, func() error { return manager.Store.ConsumeRollbackStart(ctx, transaction.ID) })
+	rollbackCtx = context.WithValue(rollbackCtx, rollbackReadyKey{}, func(waitCtx context.Context, slot string) error {
+		return manager.waitForReady(waitCtx, transaction.ID, slot)
+	})
 	if preparer, ok := manager.Runtime.(interface {
 		PrepareRollback(context.Context, string, string, SlotObservation) error
 	}); ok {

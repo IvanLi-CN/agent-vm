@@ -1374,6 +1374,13 @@ func (runtime *HostRuntime) Rollback(ctx context.Context, target, previous strin
 	if err := runtime.ExitDrain(ctx, previous); err != nil {
 		return fmt.Errorf("exit rollback drain on slot %s: %w", previous, err)
 	}
+	waitReady, ok := ctx.Value(rollbackReadyKey{}).(func(context.Context, string) error)
+	if !ok {
+		return errors.New("rollback requires a readiness wait before enabling traffic")
+	}
+	if err := waitReady(ctx, previous); err != nil {
+		return err
+	}
 	if err := runtime.EnableTraffic(ctx, previous); err != nil {
 		return err
 	}
@@ -2096,6 +2103,7 @@ func (runtime *HostRuntime) configureSlotUnit(ctx context.Context, slot string, 
 }
 
 type rollbackStartKey struct{}
+type rollbackReadyKey struct{}
 type rollbackUnitKey struct{}
 
 var errRollbackStartsExhausted = errors.New("rollback previous version failed after three starts")
