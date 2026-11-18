@@ -414,6 +414,7 @@ func runInstall(args []string) error {
 	materials := flags.String("materials", "", "matching verified deployment materials directory")
 	apply := flags.Bool("apply", false, "apply installation after preflight")
 	checkAccounts := flags.Bool("check-account-migration", false, "check the existing host before a service account migration")
+	accountProof := flags.String("account-migration-proof", "", "protected acceptance record authorizing service account migration")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -423,6 +424,9 @@ func runInstall(args []string) error {
 	if *apply && *checkAccounts {
 		return errors.New("--check-account-migration is read-only and cannot be combined with --apply")
 	}
+	if *accountProof != "" && !*apply {
+		return errors.New("--account-migration-proof requires --apply")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
 	input := install.Inputs{Config: *config, Bundle: *bundle, Materials: *materials}
@@ -430,6 +434,8 @@ func runInstall(args []string) error {
 	var err error
 	if *checkAccounts {
 		report, err = install.PreflightAccountMigration(ctx, input)
+	} else if *accountProof != "" {
+		report, err = install.ApplyAccountMigration(ctx, input, *accountProof)
 	} else if *apply {
 		report, err = install.Apply(ctx, input)
 	} else {

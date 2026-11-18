@@ -168,7 +168,7 @@ func checkPreparedAccountCandidate(data []byte, id, stagingID string, report Rep
 	if !snapshot.Consistent || !snapshot.FreshUntil.After(now) || snapshot.ActiveSlot != report.ActiveSlot ||
 		snapshot.ControllerSlot != report.ActiveSlot || !active.ProcessUp || !active.Ready || !active.ControllerOwned ||
 		!active.TrafficAccepting || active.Draining || active.SourceRevision != report.PreviousSource ||
-		active.ReleaseID != report.previousReleaseID || report.previousAuthority == "" || active.StateAuthority != report.previousAuthority ||
+		active.ReleaseID != report.PreviousReleaseID || report.previousAuthority == "" || active.StateAuthority != report.previousAuthority ||
 		!standby.ProcessUp || !standby.ProcessReady || standby.ControllerOwned || standby.TrafficAccepting ||
 		standby.SourceRevision != report.SourceRevision || standby.StateAuthority != report.previousAuthority {
 		return errors.New("prepared account migration no longer has a serving incumbent and a fenced candidate on the same state backend")

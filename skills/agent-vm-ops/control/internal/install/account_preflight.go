@@ -58,7 +58,7 @@ func PreflightAccountMigration(ctx context.Context, input Inputs) (Report, error
 	}
 	report.PreviousSource = metadata.SourceRevision
 	report.previousAuthority = active.StateAuthority
-	report.previousReleaseID = metadata.ReleaseID
+	report.PreviousReleaseID = metadata.ReleaseID
 	previous, err := config.Load(targets[snapshot.ActiveSlot+"_config"].path)
 	if err != nil {
 		return fail(err)

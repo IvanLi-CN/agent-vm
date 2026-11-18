@@ -13,7 +13,7 @@ func TestPreparedAccountCandidateKeepsIncumbentServing(t *testing.T) {
 	now := time.Now().UTC()
 	report := Report{
 		ActiveSlot: "blue", PreviousSource: "previous", SourceRevision: "candidate",
-		previousAuthority: "rqlite", previousReleaseID: "previous-release",
+		previousAuthority: "rqlite", PreviousReleaseID: "previous-release",
 	}
 	tests := []struct {
 		name   string
@@ -54,7 +54,7 @@ func TestPreparedAccountCandidateKeepsIncumbentServing(t *testing.T) {
 				Consistent: true, ActiveSlot: "blue", ControllerSlot: "blue", FreshUntil: now.Add(time.Second),
 				Slots: map[string]deployd.SlotObservation{
 					"blue": {ProcessUp: true, Ready: true, ControllerOwned: true, TrafficAccepting: true,
-						ReleaseID: report.previousReleaseID, SourceRevision: report.PreviousSource, StateAuthority: report.previousAuthority},
+						ReleaseID: report.PreviousReleaseID, SourceRevision: report.PreviousSource, StateAuthority: report.previousAuthority},
 					"green": {ProcessUp: true, ProcessReady: true, SourceRevision: report.SourceRevision, StateAuthority: report.previousAuthority},
 				},
 			}

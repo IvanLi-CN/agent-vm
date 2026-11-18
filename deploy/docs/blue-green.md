@@ -118,6 +118,15 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 旧版回退槽通过该服务的私有挂载读取和写入共享锁目录。预检要求 Incus 存储路径及已有锁目录均由 root 保护，路径中不能有符号链接。部署不授予主服务对 Incus 存储池的写权限。
 
+只有在隔离 Linux 主机上用相同产物完成账户迁移、连续登录和业务读写检查，并证明原版本能以专用账户回退后，才将该次验收的身份记录作为宿主维护输入。记录是 root 持有的 JSON 文件，`schema_version` 为 1；`previous_source_revision`、`previous_release_id`、`candidate_source_revision`、`candidate_bundle_sha256`、`materials_manifest_sha256` 分别绑定验收使用的版本和产物。不要用生产预检结果代替隔离验收。
+
+```sh
+agent-vm-deploy install --config <输入> --bundle <正式产品包> \
+  --materials <资料目录> --apply --account-migration-proof <验收记录>
+```
+
+命令先核对正式发布和验收记录，再使用现有蓝绿事务准备并激活候选槽。命令返回事务 ID 后如果报错，先用 `agent-vm-deploy transaction --transaction <ID>` 检查原事务和当前槽位，避免重新发起切换。只有部署控制服务已用专用账户接管并确认新槽持有原状态权威，命令才报告迁移完成。
+
 候选包的 `deployment_contract` major 在 stage 前由部署控制服务预检；缺失字段按 legacy v1 兼容，major 不兼容时不创建事务、不启动候选。日常更新通过 SSH 在控制宿主调用 `agent-vm-deploy update`，默认在控制宿主下载并核对当前架构的正式发布包：
 
 ```sh

@@ -19,14 +19,17 @@ import (
 type Inputs struct{ Config, Bundle, Materials string }
 type Report struct {
 	Mode              string   `json:"mode"`
+	Version           string   `json:"version,omitempty"`
 	SourceRevision    string   `json:"source_revision,omitempty"`
 	BundleSHA256      string   `json:"bundle_sha256,omitempty"`
+	MaterialsSHA256   string   `json:"materials_manifest_sha256,omitempty"`
+	TransactionID     string   `json:"transaction_id,omitempty"`
 	ActiveSlot        string   `json:"active_slot,omitempty"`
 	PreviousSource    string   `json:"previous_source_revision,omitempty"`
+	PreviousReleaseID string   `json:"previous_release_id,omitempty"`
 	Blockers          []string `json:"blockers"`
 	Next              string   `json:"next"`
 	previousAuthority string
-	previousReleaseID string
 }
 
 // Preflight never creates directories, records, locks or extracted artifacts.
@@ -51,9 +54,14 @@ func Preflight(ctx context.Context, input Inputs) (Report, error) {
 		f.Close()
 		add(e)
 		if e == nil {
+			report.Version = metadata.Version
 			report.SourceRevision = metadata.SourceRevision
 			_, e = ValidateMaterials(input.Materials, metadata.SourceRevision)
 			add(e)
+			if e == nil {
+				report.MaterialsSHA256, e = digestFile(filepath.Join(input.Materials, "materials-manifest.json"))
+				add(e)
+			}
 		}
 		report.BundleSHA256, e = digestFile(input.Bundle)
 		add(e)
