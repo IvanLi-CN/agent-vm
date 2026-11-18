@@ -46,3 +46,23 @@ func TestHandoffHelpersKeepServiceRestrictions(t *testing.T) {
 		})
 	}
 }
+
+func TestMigratedSlotProbesUseVerifiedMaintenanceBinary(t *testing.T) {
+	steady, migration, err := slotAccountDropIns(filepath.Join("../../../../..", "deploy"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, content := range [][]byte{steady, migration} {
+		for _, command := range []string{
+			"ExecStartPre=" + migrationDeployBinary + " wait-authority",
+			"ExecStartPost=\nExecStartPost=" + migrationDeployBinary + " wait-process",
+		} {
+			if !bytes.Contains(content, []byte(command)) {
+				t.Errorf("missing required slot probe %q", command)
+			}
+		}
+		if bytes.Contains(content, []byte("/opt/agent-vm-native/bin/agent-vm-deploy")) {
+			t.Fatal("migrated slot probe still invokes the root-only legacy binary")
+		}
+	}
+}

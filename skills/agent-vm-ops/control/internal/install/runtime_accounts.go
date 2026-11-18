@@ -51,6 +51,16 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot string, input In
 	if err := copyInstall(filepath.Join(product, "bin", "agent-vm-deploy"), migrationDeployBinary, 0755, ""); err != nil {
 		return err
 	}
+	// The legacy installation creates these root-owned directories with mode
+	// 0750. Permit traversal to the verified helper without opening its old bin.
+	for _, dir := range []string{"/opt/agent-vm-native", filepath.Dir(migrationDeployBinary)} {
+		if err := safeParents(dir); err != nil {
+			return err
+		}
+		if err := os.Chmod(dir, 0751); err != nil {
+			return err
+		}
+	}
 	if err := prepareMigrationObserver(ctx, materials); err != nil {
 		return err
 	}
@@ -74,7 +84,13 @@ func slotAccountDropIns(materials string) (account, migration []byte, err error)
 	if err != nil {
 		return nil, nil, err
 	}
-	return account, append(append(bytes.Clone(account), '\n'), access...), nil
+	pre := []byte("ExecStartPre=" + migrationDeployBinary + " wait-authority --slot %i --timeout 55\n")
+	post := []byte("ExecStartPost=\nExecStartPost=" + migrationDeployBinary + " wait-process --slot %i --timeout 55\n")
+	steady := append(append(bytes.Clone(account), []byte("\n[Service]\nExecStartPre=\n")...), pre...)
+	steady = append(steady, post...)
+	during := append(append(bytes.Clone(account), '\n'), access...)
+	during = append(during, pre...)
+	return steady, append(during, post...), nil
 }
 
 // finalizeSlotAccounts is called after successful activation, while the old
