@@ -46,7 +46,7 @@ func prepareLegacyCandidateUnit(ctx context.Context, activeSlot string, input In
 	if err := prepareCandidateAccess(ctx, candidate, input); err != nil {
 		return err
 	}
-	if err := copyInstall(filepath.Join(product, "bin", "agent-vm-deploy"), migrationDeployBinary, 0700, ""); err != nil {
+	if err := copyInstall(filepath.Join(product, "bin", "agent-vm-deploy"), migrationDeployBinary, 0755, ""); err != nil {
 		return err
 	}
 	if err := prepareMigrationObserver(ctx, materials); err != nil {

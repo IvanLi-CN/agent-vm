@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,68 @@ import (
 )
 
 const deploymentUnit = "agent-vm-deployd.service"
+
+// handoffDeploymentUnit keeps the incumbent unit definition in place up to
+// the point the journal transfer succeeds. The passed materials are from the
+// verified, private installation snapshot.
+func handoffDeploymentUnit(ctx context.Context, handoff deployd.AccountHandoff, materials string) error {
+	account, err := os.ReadFile(filepath.Join(materials, "assets/systemd/fresh-deploy-account.conf"))
+	if err != nil {
+		return err
+	}
+	steady, adopt := deploymentAccountDropIns(account)
+	const directory = "/etc/systemd/system/" + deploymentUnit + ".d"
+	active := filepath.Join(directory, "20-service-account.conf")
+	temporary := filepath.Join(directory, "21-account-handoff.conf")
+	if err := switchDeploymentAccount(ctx, handoff, func(ctx context.Context) error {
+		// Publish the startup-only instruction first. Neither file takes
+		// effect until the following daemon-reload.
+		if err := installFile(temporary, adopt, 0644, ""); err != nil {
+			return err
+		}
+		if err := installFile(active, steady, 0644, ""); err != nil {
+			return err
+		}
+		if err := command(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
+			return err
+		}
+		return command(ctx, "/usr/bin/systemctl", "start", deploymentUnit)
+	}); err != nil {
+		return err
+	}
+	if err := removeAccountHandoffDropIn(temporary, adopt); err != nil {
+		return fmt.Errorf("controller adopted; cannot clear startup-only unit configuration: %w", err)
+	}
+	if err := command(ctx, "/usr/bin/systemctl", "daemon-reload"); err != nil {
+		return fmt.Errorf("controller adopted; systemd configuration reload failed: %w", err)
+	}
+	return nil
+}
+
+func deploymentAccountDropIns(account []byte) (steady, adopt []byte) {
+	const command = migrationDeployBinary + " serve --config /etc/agent-vm-native/deployd.json"
+	steady = append(bytes.Clone(account), []byte("\n[Service]\nExecStart=\nExecStart="+command+"\n")...)
+	adopt = []byte("[Service]\nExecStart=\nExecStart=" + command + " --adopt-account-handoff\n")
+	return
+}
+
+func removeAccountHandoffDropIn(path string, expected []byte) error {
+	if err := safeParents(filepath.Dir(path)); err != nil {
+		return err
+	}
+	info, err := os.Lstat(path)
+	if err != nil || !rootProtected(info, 0) || !info.Mode().IsRegular() || info.Mode().Perm() != 0644 {
+		return errors.New("startup-only unit configuration is not a protected root-owned file")
+	}
+	actual, err := os.ReadFile(path)
+	if err != nil || !bytes.Equal(actual, expected) {
+		return errors.New("startup-only unit configuration changed")
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	return syncDir(filepath.Dir(path))
+}
 
 // switchDeploymentAccount is the final host handoff, after the new slot is
 // serving and the old slot is stopped. The caller holds the release-update

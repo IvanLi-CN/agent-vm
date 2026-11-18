@@ -2,12 +2,27 @@ package install
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/controllerrole"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 )
+
+func TestDeploymentAccountUsesAdoptionOnlyDuringHandoff(t *testing.T) {
+	account, err := os.ReadFile(filepath.Join("../../../../..", "deploy/assets/systemd/fresh-deploy-account.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	steady, adopt := deploymentAccountDropIns(account)
+	if !strings.HasPrefix(string(steady), string(account)) || !strings.Contains(string(steady), "\nExecStart="+migrationDeployBinary+" serve --config /etc/agent-vm-native/deployd.json\n") ||
+		strings.Contains(string(steady), "--adopt-account-handoff") || !strings.Contains(string(adopt), "\nExecStart=\nExecStart="+migrationDeployBinary+" serve --config /etc/agent-vm-native/deployd.json --adopt-account-handoff\n") {
+		t.Fatalf("invalid steady or temporary drop-in:\n%s\n%s", steady, adopt)
+	}
+}
 
 func TestDedicatedHandoffRequiresNewOwnerOnSameRouteAndAuthority(t *testing.T) {
 	now := time.Now()
