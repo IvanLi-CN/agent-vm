@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { test, expect, type Page } from '@playwright/test';
 
 const cliTitle = readFileSync(new URL('../../docs/specs/agent-vm/contracts/cli.md', import.meta.url), 'utf8').match(/^# (.+)$/m)![1];
+const sourceIdentity = JSON.parse(readFileSync(new URL('../.generated/source.json', import.meta.url), 'utf8')).identity as { revision: string };
 
 async function navigation(page: Page) {
   if (page.viewportSize()!.width < 768) {
@@ -12,7 +13,7 @@ async function navigation(page: Page) {
   return page.locator('#nd-sidebar');
 }
 
-test('home leads directly to real documents and their build snapshots', async ({ page }) => {
+test('home leads directly to real documents and their GitHub source', async ({ page }) => {
   await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Agent VM 文档', exact: true })).toBeVisible();
   await expect(page.locator('.docs-home')).not.toContainText('本次设计');
@@ -20,9 +21,10 @@ test('home leads directly to real documents and their build snapshots', async ({
   await expect(page).toHaveURL(/\/docs\/overview$/);
   await expect(page).toHaveTitle('项目概览 | Agent VM 文档');
   await expect(page.locator('article h1')).toContainText('Agent VM');
-  await page.getByRole('link', { name: '查看构建来源', exact: true }).click();
-  await expect(page.getByRole('heading', { name: '构建来源', exact: true })).toBeVisible();
-  await expect(page.locator('pre')).toContainText('# Agent VM');
+  await expect(page.locator('.document-path code')).toHaveText('README.md');
+  const githubLink = page.getByRole('link', { name: '在 GitHub 查看', exact: true });
+  await expect(githubLink).toHaveAttribute('target', '_blank');
+  await expect(githubLink).toHaveAttribute('href', `https://github.com/IvanLi-CN/agent-vm/blob/${sourceIdentity.revision}/README.md`);
   await page.goto('/source?path=docs%2Fspecs%2Fdocumentation-review%2FSPEC.md&line=5');
   await expect(page.locator('#L5')).toBeInViewport();
 });
@@ -118,6 +120,11 @@ test('native folders share controls and open the current document ancestry', asy
 test('library disclosure and copy controls retain accurate source content', async ({ page, context }) => {
   await context.grantPermissions(['clipboard-read', 'clipboard-write']);
   await page.goto('/docs/docs-site-design');
+  const documentPath = page.locator('.document-path');
+  await expect(documentPath.locator('code')).toHaveText('docs/proposals/agent-vm-documentation-stack.md');
+  await documentPath.getByRole('button', { name: '复制文档路径', exact: true }).click();
+  await expect(documentPath.getByRole('status')).toHaveText('文档路径已复制');
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('docs/proposals/agent-vm-documentation-stack.md');
   const footer = page.locator('.site-footer');
   const source = footer.getByRole('button', { name: '文档来源', exact: true });
   await source.focus();

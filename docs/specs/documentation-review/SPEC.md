@@ -163,3 +163,5 @@ None
 ![可交互的图表大视图](assets/diagram-expanded.png)
 
 ![文档组织与编写规范](assets/documentation-guide.png)
+
+![文档路径直达 GitHub 原文](assets/document-github-source.png)

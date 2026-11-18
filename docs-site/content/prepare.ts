@@ -24,6 +24,6 @@ export async function prepareBody(path: string, text: string, title=path, compil
   } catch (error) {
     if (!(error instanceof VFileMessage || error instanceof YAMLParseError || error instanceof DocumentSyntaxError)) throw error;
     const message = error instanceof Error ? error.message : String(error);
-    return { error: message, text: `---\ntitle: ${JSON.stringify(title)}\n---\n\n# 正文无法呈现\n\n此来源存在语法问题。请使用页面上方的“查看构建来源”检查实际正文。\n\n来源：\`${path}\`\n\n\`\`\`text\n${message.replaceAll('```', '~~~')}\n\`\`\`\n` };
+    return { error: message, text: `---\ntitle: ${JSON.stringify(title)}\n---\n\n# 正文无法呈现\n\n此来源存在语法问题。请使用页面上方的“在 GitHub 查看”检查实际正文。\n\n来源：\`${path}\`\n\n\`\`\`text\n${message.replaceAll('```', '~~~')}\n\`\`\`\n` };
   }
 }

@@ -17,7 +17,13 @@ a[href='#nd-page']:focus { position: fixed; z-index: 60; width: auto; height: au
 .document-list li { padding: 1rem 0; border-bottom: 1px solid var(--color-fd-border); }
 .document-list a { font-weight: 600; }
 .document-list p { color: var(--color-fd-muted-foreground); font-size: .875rem; }
-.document-source { font-size: .75rem; color: var(--color-fd-muted-foreground); }
+.document-path { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1.5rem; padding-bottom: .75rem; border-bottom: 1px solid var(--color-fd-border); color: var(--color-fd-muted-foreground); font-size: .75rem; }
+.document-path-value { display: flex; min-width: 0; align-items: baseline; gap: .5rem; }
+.document-path-label { flex: 0 0 auto; }
+.document-path code { min-width: 0; overflow-wrap: anywhere; color: var(--color-fd-foreground); }
+.document-path-actions { display: flex; flex: 0 0 auto; align-items: center; gap: .25rem; }
+.document-path-actions a, .document-path-actions button { white-space: nowrap; }
+@media (max-width: 767px) { .document-path { align-items: stretch; flex-direction: column; gap: .5rem; } .document-path-actions { justify-content: flex-start; } }
 .diagram { min-width: 0; max-width: 100%; margin: 1.5rem 0; }
 .diagram-viewport { position: relative; max-width: 100%; overflow: hidden; padding: 3rem 1rem 1rem; border: 1px solid var(--color-fd-border); border-radius: .75rem; background: var(--color-fd-background); }
 .diagram-canvas:focus-visible { outline: 2px solid var(--color-fd-ring); outline-offset: 3px; }
