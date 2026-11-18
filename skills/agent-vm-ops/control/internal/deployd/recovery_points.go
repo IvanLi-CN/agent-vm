@@ -201,7 +201,7 @@ func (runtime *HostRuntime) writeRecoveryMarker(ctx context.Context, client *htt
 		}
 		body, status, err := runtime.slotRequest(ctx, runtime.socket(slot), http.MethodPost, recoveryMarkerRoute, map[string]string{"id": id})
 		defaults := Defaults()
-		if status == http.StatusNotFound && runtime.Config.BlueSocket == defaults.BlueSocket && runtime.Config.GreenSocket == defaults.GreenSocket {
+		if missingRecoveryMarkerRoute(status) && runtime.Config.BlueSocket == defaults.BlueSocket && runtime.Config.GreenSocket == defaults.GreenSocket {
 			payload, _ := json.Marshal(map[string]string{"id": id})
 			body, status, err = requestSlotRelay(ctx, slotRelayRequest{Slot: slot, Method: http.MethodPost, Path: recoveryMarkerRoute, Body: payload}, 10*time.Second)
 		}

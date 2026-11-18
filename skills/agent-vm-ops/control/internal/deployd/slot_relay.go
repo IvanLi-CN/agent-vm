@@ -103,7 +103,7 @@ func RunSlotRelay(input *os.File) error {
 		request.Body = nil
 	}
 	result, status, err := callSlot(ctx, runtime.socket(request.Slot), request.Method, request.Path, request.Body, 240*time.Second, os.Getuid())
-	if request.Path == recoveryMarkerRoute && status == http.StatusNotFound {
+	if request.Path == recoveryMarkerRoute && missingRecoveryMarkerRoute(status) {
 		if err := runtime.writeHistoricalRecoveryMarker(ctx, request.Slot, request.recoveryMarkerID()); err != nil {
 			return err
 		}
@@ -113,6 +113,10 @@ func RunSlotRelay(input *os.File) error {
 		return err
 	}
 	return json.NewEncoder(conn).Encode(slotRelayResponse{Body: result, Status: status})
+}
+
+func missingRecoveryMarkerRoute(status int) bool {
+	return status == http.StatusNotFound || status == http.StatusMethodNotAllowed
 }
 
 // Historical slots have no marker route. Reuse the server identity and only

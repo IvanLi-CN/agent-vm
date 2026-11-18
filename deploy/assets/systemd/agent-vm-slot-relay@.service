@@ -5,6 +5,7 @@ Description=Agent VM historical slot relay
 Type=exec
 User=agent-vm-server
 Group=agent-vm-web
+SupplementaryGroups=agent-vm-server
 ExecStart=/opt/agent-vm-native/bin/agent-vm-deploy slot-relay
 StandardInput=socket
 StandardOutput=journal
