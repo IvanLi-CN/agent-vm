@@ -112,6 +112,8 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 目标宿主须用 `agent-vm-deploy` 专用账户运行部署服务，并为两个槽位配置 `agent-vm-server` 专用账户。旧安装仍以 root 运行时，普通 `update` 会在获取产物或修改槽位前拒绝。不要用底层阶段命令绕过账户迁移，也不要在旧槽仍以 root 运行时把该槽的程序目录交给常驻账户写入。
 
+对已有安装，可使用同一正式版本的 `agent-vm-deploy install --config <输入> --bundle <产品包> --materials <资料目录> --check-account-migration` 进行只读预检。预检返回候选包摘要、现役槽位和上一版本源码修订；它要求现役槽健康且独占控制权、没有未完成部署事务、现场程序与清单一致，并且候选沿用同一 rqlite 和 Incus 环境。预检不能与 `--apply` 一起使用，通过预检也不能替代旧版在专用账户下的隔离回退验证。
+
 候选包的 `deployment_contract` major 在 stage 前由部署控制服务预检；缺失字段按 legacy v1 兼容，major 不兼容时不创建事务、不启动候选。日常更新通过 SSH 在控制宿主调用 `agent-vm-deploy update`，默认在控制宿主下载并核对当前架构的正式发布包：
 
 ```sh
