@@ -177,7 +177,7 @@ func (runtime *HostRuntime) prepareBootstrap(ctx context.Context, bundle string,
 	if err := runtime.CheckBootstrap(ctx); err != nil {
 		return err
 	}
-	if err := runtime.stageBundle("blue", bundle); err != nil {
+	if err := runtime.stageBundle(ctx, "blue", bundle); err != nil {
 		return err
 	}
 	metadata, err := releaseManifest.LoadMetadata(filepath.Join(runtime.Config.ReleaseRoot, "slots", "blue", "release-manifest.json"))

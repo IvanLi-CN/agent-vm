@@ -34,3 +34,24 @@ func TestHostActionRejectsUntrustedOperations(t *testing.T) {
 		t.Fatalf("expected fixed legacy rollback request, got %#v (%v)", got, err)
 	}
 }
+
+func TestSlotIdentityRequiresConfiguredAndRunningUnprivilegedUser(t *testing.T) {
+	for _, output := range []string{
+		"MainPID=123\nUser=root\n",
+		"MainPID=123\nUser=\n",
+		"MainPID=123\nUser=agent-vm-server\nUser=root\n",
+		"MainPID=-1\nUser=agent-vm-server\n",
+	} {
+		if _, err := unprivilegedSlotPID(output); err == nil {
+			t.Errorf("accepted invalid systemd identity %q", output)
+		}
+	}
+	pid, err := unprivilegedSlotPID("MainPID=123\nUser=agent-vm-server\n")
+	if err != nil || pid != 123 {
+		t.Fatalf("valid systemd identity returned pid=%d err=%v", pid, err)
+	}
+	if !processUsesSlotUID("Name:\tagent-vm-server\nUid:\t997\t997\t997\t997\n", "997") ||
+		processUsesSlotUID("Name:\tagent-vm-server\nUid:\t997\t997\t0\t997\n", "997") {
+		t.Fatal("expected all process UIDs to match the dedicated account")
+	}
+}

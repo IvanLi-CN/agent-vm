@@ -486,7 +486,7 @@ func (runtime *HostRuntime) Stage(ctx context.Context, slot, bundle string) erro
 		return fmt.Errorf("cannot stage over active slot %s", slot)
 	}
 	previousProcess, previousProcessOK := runtime.readProcessIdentity(ctx, slot)
-	if err := runtime.stageBundle(slot, bundle); err != nil {
+	if err := runtime.stageBundle(ctx, slot, bundle); err != nil {
 		return err
 	}
 	if err := runtime.systemctl(ctx, "restart", "agent-vm-native@"+slot+".service"); err != nil {
@@ -634,7 +634,12 @@ func inspectBundle(bundle string) (map[string]any, []byte, []byte, os.FileMode, 
 	return manifest, manifestBytes, controlBytes, controlInfo.Mode().Perm(), nil
 }
 
-func (runtime *HostRuntime) stageBundle(slot, bundle string) error {
+func (runtime *HostRuntime) stageBundle(ctx context.Context, slot, bundle string) error {
+	if isDeployAccount(os.Geteuid()) {
+		if err := verifyUnprivilegedSlots(ctx); err != nil {
+			return err
+		}
+	}
 	root := filepath.Join(runtime.Config.ReleaseRoot, "slots")
 	if err := os.MkdirAll(root, 0o750); err != nil {
 		return fmt.Errorf("prepare slot root: %w", err)

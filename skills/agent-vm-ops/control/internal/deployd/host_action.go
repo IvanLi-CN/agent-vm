@@ -59,6 +59,59 @@ func isServiceAccount(uid int, name string) bool {
 	return err == nil && account.Uid == strconv.Itoa(uid)
 }
 
+// Staging can replace binaries by renaming slot directories. These paths must
+// no longer be used by a root slot when writable by the deployment account.
+func verifyUnprivilegedSlots(ctx context.Context) error {
+	account, err := user.Lookup(slotUser)
+	if err != nil || account.Uid == "0" {
+		return errors.New("slot account missing; complete host permission maintenance before staging")
+	}
+	for _, slot := range []string{"blue", "green"} {
+		unit := "agent-vm-native@" + slot + ".service"
+		output, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property=User", "--property=MainPID").Output()
+		if err != nil {
+			return fmt.Errorf("cannot verify systemd identity of slot %s", slot)
+		}
+		pid, err := unprivilegedSlotPID(string(output))
+		if err != nil {
+			return fmt.Errorf("slot %s: %w", slot, err)
+		}
+		if pid != 0 {
+			status, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "status"))
+			if err != nil || !processUsesSlotUID(string(status), account.Uid) {
+				return fmt.Errorf("slot %s process identity is unverified; complete host permission maintenance before staging", slot)
+			}
+		}
+	}
+	return nil
+}
+
+func unprivilegedSlotPID(output string) (int, error) {
+	values := make(map[string]string, 2)
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if _, exists := values[key]; !ok || exists {
+			return 0, errors.New("invalid systemd slot identity")
+		}
+		values[key] = value
+	}
+	pid, err := strconv.Atoi(values["MainPID"])
+	if len(values) != 2 || values["User"] != slotUser || err != nil || pid < 0 {
+		return 0, errors.New("slot must use the dedicated service account; complete host permission maintenance before staging")
+	}
+	return pid, nil
+}
+
+func processUsesSlotUID(status, uid string) bool {
+	for _, line := range strings.Split(status, "\n") {
+		if value, found := strings.CutPrefix(line, "Uid:"); found {
+			ids := strings.Fields(value)
+			return len(ids) == 4 && ids[0] == uid && ids[1] == uid && ids[2] == uid && ids[3] == uid
+		}
+	}
+	return false
+}
+
 // RunHostAction handles one connected Unix socket provided by systemd.
 func RunHostAction(input *os.File) error {
 	if os.Geteuid() != 0 {
