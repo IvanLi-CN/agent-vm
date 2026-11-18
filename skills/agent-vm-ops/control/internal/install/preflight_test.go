@@ -2,12 +2,48 @@ package install
 
 import (
 	"context"
-	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
+	"errors"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 )
+
+func TestWaitDaemonBoundsAnUnansweredStatusRequest(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "avm-install-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := filepath.Join(dir, "deploy.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	server := &http.Server{Handler: http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		<-r.Context().Done()
+	})}
+	defer server.Close()
+	go func() { _ = server.Serve(listener) }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = waitDaemon(ctx, deployd.Client{Socket: socket, Timeout: time.Minute}, 300*time.Millisecond)
+	select {
+	case <-started:
+	default:
+		t.Fatal("status request never reached the server")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+		t.Fatalf("waitDaemon = %v; parent context = %v", err, ctx.Err())
+	}
+}
 
 func TestPreflightReportsMultipleBlockersWithoutWriting(t *testing.T) {
 	root := t.TempDir()

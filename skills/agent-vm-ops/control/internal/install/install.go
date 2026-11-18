@@ -86,20 +86,21 @@ func command(ctx context.Context, name string, args ...string) error {
 	}
 	return nil
 }
-func waitDaemon(ctx context.Context, client deployd.Client) error {
-	timer := time.NewTimer(30 * time.Second)
-	defer timer.Stop()
+func waitDaemon(ctx context.Context, client deployd.Client, timeout time.Duration) error {
+	readyCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if _, _, err := client.Call(ctx, "GET", "/v1/status", nil); err == nil {
+		if _, _, err := client.Call(readyCtx, "GET", "/v1/status", nil); err == nil {
 			return nil
 		}
 		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-			return errors.New("Deployd readiness timed out")
+		case <-readyCtx.Done():
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			return fmt.Errorf("Deployd readiness timed out: %w", readyCtx.Err())
 		case <-ticker.C:
 		}
 	}
@@ -289,7 +290,7 @@ func Apply(ctx context.Context, input Inputs) (Report, error) {
 		return report, err
 	}
 	client := deployd.Client{Socket: "/run/agent-vm-native/deployd.sock", Timeout: 30 * time.Minute}
-	if err := waitDaemon(ctx, client); err != nil {
+	if err := waitDaemon(ctx, client, 30*time.Second); err != nil {
 		return report, err
 	}
 	// A running rqlite unit can still be electing a leader. Keep the install

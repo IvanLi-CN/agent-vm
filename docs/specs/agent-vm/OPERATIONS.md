@@ -57,24 +57,20 @@ Backup 必须记录不早于最后可信提交的 coverage boundary；
 ### 恢复材料保留与删除
 
 迁移源 SQLite snapshot/export、rqlite backup/snapshot、deployd `deployment.sqlite3` recovery copy（如有）、backup tail、manifest、tail-evidence 和 recovery authorization record 都是恢复材料。
-蓝绿 `stage`、`activate` 和 `rollback` 只处理服务槽位与流量，不创建、替换或删除状态后端备份。
+蓝绿部署的 `stage` 和显式 `rollback` 在改变槽位角色前，由部署控制服务创建并验证 rqlite 恢复点。激活失败后的自动补偿复用原事务的恢复点。切槽始终使用同一 rqlite，不恢复快照到现役数据库。
 
-恢复材料的默认上限是三个已验证恢复点、三十天候选年龄和 1 GiB 总硬上限。
+同一 rqlite 业务状态权威最多保留三个已验证恢复点，蓝绿槽位共用计数；最新两个始终受保护。最旧的第三个满三十天，且没有有效租约、进行中的切换、当前回退目标或未完成部署事务保护时，才可按恢复点 ID 审计清理。数量或容量不足且无法清理时，返回 `backup_storage_exhausted`，当前槽继续服务。
 1 GiB 是实际占用上限，不是预分配空间，也不存在体积下限；
 小数据库按实际大小保留。
-最后两个可验证恢复点始终受保护；
-迁移源 SQLite snapshot 在迁移 finalized、目标 rqlite 摘要完成校验后保留七天，完成标记中的保留截止时间是清理依据。
+迁移源 SQLite snapshot 计入字节预算，不计入三个 rqlite 恢复点；迁移 finalized、目标 rqlite 摘要完成校验后至少保留七天，完成标记中的保留截止时间是清理依据。
 
-迁移或恢复事务未进入 `finalized` 前禁止删除任何恢复材料。
-进入 `finalized` 后，只有在新的隔离恢复验证完成、没有 pending/unknown operation 或未解决的 `needs_recovery`、迁移源保留期已到期，并且清理后仍保留两个可验证恢复点时，材料才可进入 `purge_eligible`。
+实际执行迁移或恢复时，相关事务未进入 `finalized` 前禁止删除该事务引用的恢复材料。该生命周期的材料进入 `purge_eligible` 仍要求完成新的隔离恢复验证、没有 pending/unknown operation 或未解决的 `needs_recovery`、迁移源保留期已到期，并且清理后仍保留两个可验证恢复点。部署恢复点按上段的 Q11 保留规则处理。
 
-Deployd 只读取、创建和清理自己负责的迁移源 SQLite snapshot；
-它不读取、创建或删除 rqlite 的业务 backup/snapshot。
-迁移 snapshot 在迁移完成并通过目标摘要验证后保留七天，由 Deployd 每小时按完成标记的截止时间清理；
+部署控制服务只管理自身创建的恢复材料，包括部署恢复点和一次性迁移源 SQLite snapshot；其他来源的备份由其操作者管理。
+迁移 snapshot 由部署控制服务每小时按完成标记的截止时间清理；
 活动迁移和 `needs_recovery` 事务引用的 snapshot 不得删除。
 唯一 finalized 迁移事务、完成标记和目标摘要不清理，因此 snapshot 删除后仍可验证 rqlite 是否被重置。
-它按数量、年龄或总字节预算任一超限清理最旧的可删除材料。
-清理后仍无空间时，报告 `backup_storage_exhausted` 并拒绝新的备份或状态迁移，不删除受保护恢复点，也不影响正常蓝绿切换。
+清理后仍无空间时，拒绝需要新恢复点的部署操作或状态迁移，保留受保护材料和当前槽的服务。
 
 该上限还要求状态数据库自身有界。
 `operations`、`audit`、`management_operations` 和 `management_audit` 中已完成且不再被恢复流程引用的历史记录，默认保留三十天后回收；
