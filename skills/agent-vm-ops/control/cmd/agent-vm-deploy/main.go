@@ -52,6 +52,12 @@ func run(args []string) error {
 	if args[0] == "legacy-incus" {
 		return runLegacyIncus(args[1:])
 	}
+	if args[0] == "prepare-legacy-slot-access" {
+		if len(args) != 2 {
+			return errors.New("prepare-legacy-slot-access requires one fixed slot")
+		}
+		return install.PrepareLegacySlotAccess(args[1])
+	}
 	if args[0] == "slot-relay" {
 		if len(args) != 1 {
 			return errors.New("slot-relay is a systemd socket handler")

@@ -3,10 +3,60 @@ package install
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/manifest"
 )
+
+// prepareLegacyCandidateUnit is called with privately staged and validated
+// installation inputs under the release-update lock, before the incumbent daemon
+// receives a stage request.
+func prepareLegacyCandidateUnit(ctx context.Context, activeSlot, materials, product, revision string) error {
+	var candidate string
+	switch activeSlot {
+	case "blue":
+		candidate = "green"
+	case "green":
+		candidate = "blue"
+	default:
+		return errors.New("account migration requires a known active slot")
+	}
+	meta, err := manifest.LoadMetadata(filepath.Join(product, "release-manifest.json"))
+	if err != nil || !meta.ArtifactsVerified || meta.SourceRevision != revision {
+		return errors.New("migration maintenance executable does not match the candidate release")
+	}
+	defaults := deployd.Defaults()
+	route, err := deployd.EffectiveActivePath(defaults.ActivePath)
+	if err != nil || validateAccountMigrationRoute(route, filepath.Join(defaults.ReleaseRoot, "slots", activeSlot)) != nil {
+		return errors.New("active slot changed before preparing the migration candidate")
+	}
+	unit := "agent-vm-native@" + candidate + ".service"
+	status, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property=ActiveState", "--property=MainPID").Output()
+	if err != nil || !stoppedAccountSlot(string(status)) {
+		return errors.New("account migration requires the candidate slot to be stopped")
+	}
+	if err := copyInstall(filepath.Join(product, "bin", "agent-vm-deploy"), "/opt/agent-vm-native/maintenance/agent-vm-deploy", 0700, ""); err != nil {
+		return err
+	}
+	dir := filepath.Join("/etc/systemd/system", unit+".d")
+	account, err := os.ReadFile(filepath.Join(materials, "assets/systemd", "fresh-slot-account.conf"))
+	if err != nil {
+		return err
+	}
+	access, err := os.ReadFile(filepath.Join(materials, "assets/systemd", "legacy-slot-access.conf"))
+	if err != nil {
+		return err
+	}
+	dropIn := append(append(account, '\n'), access...)
+	if err := installFile(filepath.Join(dir, "19-account-migration.conf"), dropIn, 0644, ""); err != nil {
+		return err
+	}
+	return command(ctx, "/usr/bin/systemctl", "daemon-reload")
+}
 
 func prepareFreshAccounts(ctx context.Context, materials string) error {
 	if err := command(ctx, "systemctl", "daemon-reload"); err != nil {
