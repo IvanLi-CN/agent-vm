@@ -44,7 +44,7 @@ sudo tar --extract --file /var/tmp/agent-vm-install/deployment-materials.tar \
 | `caddy.crt`、`caddy.key` | 覆盖已注册域名的匹配证书与私钥。 |
 
 ```sh
-sudo chmod 0600 /etc/agent-vm-install-inputs/install.json /etc/agent-vm-install-inputs/blue.json /etc/agent-vm-install-inputs/green.json /etc/agent-vm-install-inputs/deployd.json /etc/agent-vm-install-inputs/Caddyfile /etc/agent-vm-install-inputs/caddy.env /etc/agent-vm-install-inputs/rqlite-auth.json /etc/agent-vm-install-inputs/rqlite.crt /etc/agent-vm-install-inputs/rqlite.key /etc/agent-vm-install-inputs/caddy.crt /etc/agent-vm-install-inputs/caddy.key
+sudo chmod 0600 /etc/agent-vm-install-inputs/install.json /etc/agent-vm-install-inputs/blue.json /etc/agent-vm-install-inputs/green.json /etc/agent-vm-install-inputs/deployd.json /etc/agent-vm-install-inputs/Caddyfile /etc/agent-vm-install-inputs/caddy.env /etc/agent-vm-install-inputs/rqlite-auth.json /etc/agent-vm-install-inputs/rqlite.crt /etc/agent-vm-install-inputs/rqlite.key /etc/agent-vm-install-inputs/caddy.crt /etc/agent-vm-install-inputs/caddy.key /etc/agent-vm-install-inputs/incus-client.crt /etc/agent-vm-install-inputs/incus-client.key /etc/agent-vm-install-inputs/incus-server.crt
 ```
 
 ## 预检与安装

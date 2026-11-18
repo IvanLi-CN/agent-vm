@@ -110,6 +110,8 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 ## 普通蓝绿切换
 
+目标宿主须用 `agent-vm-deploy` 专用账户运行部署服务，并为两个槽位配置 `agent-vm-server` 专用账户。旧安装仍以 root 运行时，普通 `update` 会在获取产物或修改槽位前拒绝。不要用底层阶段命令绕过账户迁移，也不要在旧槽仍以 root 运行时把该槽的程序目录交给常驻账户写入。
+
 候选包的 `deployment_contract` major 在 stage 前由部署控制服务预检；缺失字段按 legacy v1 兼容，major 不兼容时不创建事务、不启动候选。日常更新通过 SSH 在控制宿主调用 `agent-vm-deploy update`，默认在控制宿主下载并核对当前架构的正式发布包：
 
 ```sh

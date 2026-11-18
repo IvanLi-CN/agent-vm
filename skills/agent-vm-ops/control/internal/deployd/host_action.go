@@ -248,14 +248,24 @@ func applyHostAction(ctx context.Context, action hostAction) error {
 		if err := run("daemon-reload"); err != nil {
 			return err
 		}
-		for key, want := range map[string]string{"User": slotUser, "Restart": restart} {
-			current, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property="+key, "--value").Output()
-			if err != nil || strings.TrimSpace(string(current)) != want {
-				return fmt.Errorf("systemd did not load required slot %s", key)
-			}
+		if err := requireHostSlotProperty(ctx, unit, "Restart", restart); err != nil {
+			return err
+		}
+	}
+	if action.Action == "start" || action.Action == "restart" || action.Action == "enable" {
+		if err := requireHostSlotProperty(ctx, unit, "User", slotUser); err != nil {
+			return err
 		}
 	}
 	return run(action.Action, unit)
+}
+
+func requireHostSlotProperty(ctx context.Context, unit, key, want string) error {
+	current, err := exec.CommandContext(ctx, "/usr/bin/systemctl", "show", unit, "--property="+key, "--value").Output()
+	if err != nil || strings.TrimSpace(string(current)) != want {
+		return fmt.Errorf("systemd did not load required slot %s", key)
+	}
+	return nil
 }
 
 func checkHostUnitDirectory(dir string) error {

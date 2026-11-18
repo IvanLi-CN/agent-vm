@@ -10,11 +10,13 @@ Agent VM 在已具备 Incus 运行条件的 Linux 控制环境中运行。Caddy 
 
 ## 操作入口
 
-从[首次安装步骤](../deploy/docs/install.md)准备受保护输入，运行 `agent-vm-deploy install --config <输入> --bundle <产品包> --materials <资料目录>` 进行只读预检，确认无阻塞后以相同输入加 `--apply` 执行安装。已有安装的线上升级由目标服务器上的 `agent-vm-deploy update --version <semver> --source-revision <sha>` 完成；该命令在服务器本地选择架构、下载并校验正式 release，再把候选交给 deployd 执行 blue-green 事务。Agent 不下载或上传产品 bundle。部署资料布局与配置示例见 [deploy/README.md](../deploy/README.md)。安装路径、双槽位角色、旧状态迁移、升级、有限回滚及恢复细节见[蓝绿部署手册](../deploy/docs/blue-green.md)。全新安装和旧环境迁移必须区别处理，普通蓝绿升级不能替换业务数据库。
+从[首次安装步骤](../deploy/docs/install.md)准备受保护输入，运行 `agent-vm-deploy install --config <输入> --bundle <产品包> --materials <资料目录>` 进行只读预检，确认无阻塞后以相同输入加 `--apply` 执行安装。常规升级由目标服务器上的 `agent-vm-deploy update --version <semver> --source-revision <sha>` 下载并校验当前架构的正式发布包；需要使用目标服务器上已有的完整包时，给同一命令传入 `--bundle`。两种入口沿用同一部署事务和恢复点门禁。部署资料布局与配置示例见 [deploy/README.md](../deploy/README.md)。已有安装的账户前置条件、更新、回退和恢复见[蓝绿部署手册](../deploy/docs/blue-green.md#普通蓝绿切换)。
 
 ## 固定安装布局
 
 当前服务端包仅提供 `/opt/agent-vm-native/bin/agent-vm-server` 与 `/opt/agent-vm-native/bin/agent-vm-deploy`；后者以 `serve` 子命令运行槽位外部署服务。既有 `agent-vm-deployd.service`、配置和 socket 名称不变，新包没有旧名称别名。历史完整包保留读取能力，槽位按已验证 manifest 选择自己的可执行路径。槽位外的 server request adapter 与槽位业务服务使用各自的 manifest，不可只替换其中一个路径。
+
+全新安装以 `agent-vm-server` 和 `agent-vm-deploy` 两个专用账户分别运行主服务和部署服务。root 保留安装、运维 CLI 以及固定的宿主辅助操作；常驻账户不应获得 sudo 或 Incus 管理 socket 权限。[首次安装指南](../deploy/docs/install.md#准备受保护输入)列出了所需的 Incus 项目凭据和 rqlite 凭据。
 
 ## 验收
 
