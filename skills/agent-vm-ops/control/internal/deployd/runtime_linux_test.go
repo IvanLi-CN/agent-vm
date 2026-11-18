@@ -90,7 +90,7 @@ func TestRealSystemdRollbackCrashBudget(t *testing.T) {
 	installLayoutFixture(t, root, "blue", true)
 	// The verified ELF header has no executable program: systemd must observe an actual startup crash.
 	extra := "/etc/systemd/system/agent-vm-native@blue.service.d/20-crash-test.conf"
-	if err := os.WriteFile(extra, []byte("[Service]\nExecStartPre=\nExecStartPost=\n"), 0644); err != nil {
+	if err := os.WriteFile(extra, []byte("[Unit]\nStartLimitIntervalSec=0\n[Service]\nExecStartPre=\nExecStartPost=\n"), 0644); err != nil {
 		t.Fatal(err)
 	}
 	defer func() {
@@ -98,11 +98,6 @@ func TestRealSystemdRollbackCrashBudget(t *testing.T) {
 		_ = os.Remove(extra)
 		_ = exec.Command("systemctl", "daemon-reload").Run()
 	}()
-	// Earlier acceptance stages reuse this unit; its start-rate history must
-	// not reject the deliberately crashing executable before it runs.
-	if output, err := exec.Command("systemctl", "reset-failed", "agent-vm-native@blue.service").CombinedOutput(); err != nil {
-		t.Fatalf("reset test unit start-rate history: %s: %v", output, err)
-	}
 	cfg := Defaults()
 	cfg.ReleaseRoot = root
 	cfg.BlueSocket = filepath.Join(root, "missing.sock")
