@@ -1992,16 +1992,29 @@ func (runtime *HostRuntime) configureSlotUnit(ctx context.Context, slot string, 
 	}
 	content := "[Unit]\nConditionPathExists=\nConditionPathExists=" + binary + "\nConditionPathExists=/etc/agent-vm-native/slots/" + slot + "/config.json\n[Service]\nExecStart=\nExecStart=" + binary + " serve --config /etc/agent-vm-native/slots/" + slot + "/config.json --manifest " + manifestPath + "\nRestart=" + restart + "\n"
 	target := filepath.Join(dir, "10-release.conf")
-	if existing, err := os.ReadFile(target); err == nil && string(existing) == content {
+	existing, err := os.ReadFile(target)
+	if err != nil || string(existing) != content {
+		if err := os.WriteFile(target+".tmp", []byte(content), 0644); err != nil {
+			return err
+		}
+		if err := os.Rename(target+".tmp", target); err != nil {
+			return err
+		}
+	} else if !rollback {
 		return nil
 	}
-	if err := os.WriteFile(target+".tmp", []byte(content), 0644); err != nil {
+	if err := exec.CommandContext(ctx, "systemctl", "daemon-reload").Run(); err != nil {
 		return err
 	}
-	if err := os.Rename(target+".tmp", target); err != nil {
-		return err
+	if rollback {
+		// An interrupted deploy may have updated the file before systemd
+		// reloaded it. Verify the loaded policy before consuming a real start.
+		policy, err := exec.CommandContext(ctx, "systemctl", "show", "agent-vm-native@"+slot+".service", "--property=Restart", "--value").Output()
+		if err != nil || strings.TrimSpace(string(policy)) != "no" {
+			return errors.New("systemd rollback automatic restart could not be disabled")
+		}
 	}
-	return exec.CommandContext(ctx, "systemctl", "daemon-reload").Run()
+	return nil
 }
 
 type rollbackStartKey struct{}
