@@ -1,6 +1,7 @@
 package install
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -61,8 +62,40 @@ func PreflightAccountMigration(ctx context.Context, input Inputs) (Report, error
 			return fail(err)
 		}
 	}
+	if err := checkInstalledBackupReader(ctx, cfg, paths.Migration); err != nil {
+		return fail(err)
+	}
 	report.Next = "bind isolated rollback compatibility evidence to the reported previous source revision and candidate bundle digest before migration"
 	return report, nil
+}
+
+func checkInstalledBackupReader(ctx context.Context, cfg Config, paths deployd.MigrationConfig) error {
+	installed, err := protectedRead(paths.RQLiteAuthFile)
+	if err != nil {
+		return errors.New("cannot read the protected rqlite authentication file on the installed host")
+	}
+	provided, err := protectedRead(cfg.Files["rqlite_auth"])
+	if err != nil {
+		return errors.New("cannot read the supplied rqlite authentication file")
+	}
+	credential, err := matchingBackupCredential(installed, provided)
+	if err != nil {
+		return err
+	}
+	ca, err := protectedRead(cfg.Files["rqlite_certificate"])
+	if err != nil {
+		return errors.New("cannot read the supplied rqlite TLS certificate")
+	}
+	return deployd.ProbeInstalledBackupReader(ctx, ca, credential)
+}
+
+func matchingBackupCredential(installed, supplied []byte) ([]byte, error) {
+	current, currentErr := deployd.ExportBackupCredential(installed)
+	input, inputErr := deployd.ExportBackupCredential(supplied)
+	if currentErr != nil || inputErr != nil || !bytes.Equal(current, input) {
+		return nil, errors.New("installed rqlite and supplied inputs do not have matching restricted backup credentials")
+	}
+	return current, nil
 }
 
 func accountMigrationActive(data []byte, now time.Time) (deployd.RuntimeSnapshot, deployd.SlotObservation, error) {

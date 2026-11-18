@@ -78,3 +78,19 @@ func TestAccountMigrationChecksObservedRQLiteAuthority(t *testing.T) {
 		})
 	}
 }
+
+func TestAccountMigrationRequiresInstalledRestrictedBackupCredential(t *testing.T) {
+	current := []byte(`[{"username":"agent-vm-backup","password":"fixture-backup","perms":["backup","query"]}]`)
+	if _, err := matchingBackupCredential(current, current); err != nil {
+		t.Fatal(err)
+	}
+	for _, installed := range []string{
+		`[]`,
+		`[{"username":"agent-vm-backup","password":"another-password","perms":["backup","query"]}]`,
+		`[{"username":"agent-vm-backup","password":"fixture-backup","perms":["backup","query","execute"]}]`,
+	} {
+		if _, err := matchingBackupCredential([]byte(installed), current); err == nil {
+			t.Fatal("incompatible installed credential was accepted")
+		}
+	}
+}

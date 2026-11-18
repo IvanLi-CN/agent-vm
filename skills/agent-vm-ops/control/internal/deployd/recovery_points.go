@@ -371,23 +371,47 @@ func (runtime *HostRuntime) recoveryClient() (*http.Client, string, string, erro
 	if err != nil {
 		return nil, "", "", err
 	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(ca) {
-		return nil, "", "", errors.New("rqlite recovery CA is invalid")
-	}
 	auth, err := readRecoveryConfig(config.RQLiteBackupAuth, true)
 	if err != nil {
 		return nil, "", "", err
 	}
+	client, password, err := newRecoveryClient(ca, auth)
+	return client, strings.TrimRight(endpoint.String(), "/"), password, err
+}
+
+// ProbeInstalledBackupReader verifies that the supplied credentials and CA
+// work against the live, local authority without changing business state.
+func ProbeInstalledBackupReader(ctx context.Context, ca, auth []byte) error {
+	client, password, err := newRecoveryClient(ca, auth)
+	if err != nil {
+		return err
+	}
+	defer client.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	const expected = "agent-vm-backup-preflight"
+	got, err := recoverySQL(ctx, client, "https://127.0.0.1:4001", "/db/query?level=linearizable",
+		"agent-vm-backup", password, []string{"SELECT '" + expected + "'"})
+	if err != nil || len(got.Values) != 1 || len(got.Values[0]) != 1 || got.Values[0][0] != expected {
+		return errors.New("live rqlite did not confirm the restricted backup identity over TLS")
+	}
+	return nil
+}
+
+func newRecoveryClient(ca, auth []byte) (*http.Client, string, error) {
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(ca) {
+		return nil, "", errors.New("rqlite recovery CA is invalid")
+	}
 	var credential backupCredential
 	if json.Unmarshal(auth, &credential) != nil || !validBackupPassword(credential.Password) {
-		return nil, "", "", errors.New("rqlite recovery credential is invalid")
+		return nil, "", errors.New("rqlite recovery credential is invalid")
 	}
 	return &http.Client{
 		Transport:     &http.Transport{TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}},
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 		Timeout:       5 * time.Minute,
-	}, strings.TrimRight(endpoint.String(), "/"), credential.Password, nil
+	}, credential.Password, nil
 }
 
 type backupCredential struct {
