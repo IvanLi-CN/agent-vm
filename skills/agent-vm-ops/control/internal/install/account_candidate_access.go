@@ -48,6 +48,7 @@ func prepareCandidateAccess(ctx context.Context, slot string, input Inputs) erro
 		{"agent-vm-native.conf", filepath.Dir(targetFile)},
 		{"agent-vm-native.conf", "/etc/agent-vm-native/incus"},
 		{"agent-vm-fresh-accounts.conf", deployd.ServerRuntimeHome},
+		{"agent-vm-fresh-accounts.conf", deployd.ServerLockDir},
 	} {
 		if err := command(ctx, "/usr/bin/systemd-tmpfiles", "--create", "--prefix="+rule.prefix, filepath.Join(assets, "tmpfiles.d", rule.file)); err != nil {
 			return err

@@ -7,8 +7,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
+	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/config"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/deployd"
 	"github.com/IvanLi-CN/agent-vm/skills/agent-vm-ops/control/internal/manifest"
 )
@@ -106,9 +108,21 @@ func finalizeSlotAccounts(ctx context.Context, input Inputs, active string) erro
 	if err != nil {
 		return err
 	}
+	previous, err := config.Load(targets[rollback+"_config"].path)
+	if err != nil {
+		return err
+	}
+	legacyMount, err := legacySlotLockMount(previous.StoragePath)
+	if err != nil {
+		return err
+	}
 	for _, slot := range []string{rollback, active} {
 		dir := filepath.Join("/etc/systemd/system", "agent-vm-native@"+slot+".service.d")
-		if err := installFile(filepath.Join(dir, "20-service-account.conf"), account, 0644, ""); err != nil {
+		content := account
+		if slot == rollback {
+			content = append(append(bytes.Clone(account), '\n'), legacyMount...)
+		}
+		if err := installFile(filepath.Join(dir, "20-service-account.conf"), content, 0644, ""); err != nil {
 			return err
 		}
 	}
@@ -120,6 +134,31 @@ func finalizeSlotAccounts(ctx context.Context, input Inputs, active string) erro
 		return err
 	}
 	return deployd.VerifyUnprivilegedSlots(ctx)
+}
+
+var systemdStoragePath = regexp.MustCompile(`^(/[A-Za-z0-9._-]+)+$`)
+
+func legacySlotLockMount(storagePath string) ([]byte, error) {
+	if !systemdStoragePath.MatchString(storagePath) || filepath.Clean(storagePath) != storagePath {
+		return nil, errors.New("legacy slot requires a literal absolute Incus storage path")
+	}
+	target := filepath.Join(storagePath, "locks")
+	check := target
+	if _, err := os.Lstat(target); errors.Is(err, os.ErrNotExist) {
+		check = storagePath
+	}
+	for path := check; ; path = filepath.Dir(path) {
+		info, err := os.Lstat(path)
+		if err != nil || !rootProtected(info, 0) || !info.IsDir() {
+			return nil, errors.New("legacy slot lock mount requires protected storage directories")
+		}
+		if path == "/" {
+			break
+		}
+	}
+	// Old releases derive the lock path from the pool. The private mount lets
+	// both releases share the same lock files without giving the slot pool access.
+	return []byte("BindPaths=" + deployd.ServerLockDir + ":" + target + "\n"), nil
 }
 
 func prepareMigrationObserver(ctx context.Context, materials string) error {

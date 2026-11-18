@@ -116,6 +116,8 @@ Grafana 只查询 Prometheus。核心指标包括 `agent_vm_deployd_snapshot_fre
 
 候选槽的配置输入须与该槽宿主上已安装的配置逐字节一致；账户迁移只调整服务账户的读取权限。预检还核对输入中的专用备份身份与宿主已安装的 rqlite 认证配置一致，并用提供的 TLS 证书对现役 rqlite 执行一次线性一致的只读查询。这一步不创建恢复点，也不变更 rqlite 权限。
 
+旧版回退槽通过该服务的私有挂载读取和写入共享锁目录。预检要求 Incus 存储路径及已有锁目录均由 root 保护，路径中不能有符号链接。部署不授予主服务对 Incus 存储池的写权限。
+
 候选包的 `deployment_contract` major 在 stage 前由部署控制服务预检；缺失字段按 legacy v1 兼容，major 不兼容时不创建事务、不启动候选。日常更新通过 SSH 在控制宿主调用 `agent-vm-deploy update`，默认在控制宿主下载并核对当前架构的正式发布包：
 
 ```sh

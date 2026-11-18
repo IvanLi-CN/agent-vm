@@ -53,6 +53,7 @@ type Config struct {
 
 const DedicatedDatabase = "/var/lib/agent-vm-native/deployment/runtime/deployment.sqlite3"
 const ServerRuntimeHome = "/var/lib/agent-vm-native/server"
+const ServerLockDir = "/var/lib/agent-vm-native/server-locks"
 
 func (config *Config) SelectRuntimeDatabase(uid int) error {
 	if isDeployAccount(uid) && config.Database == Defaults().Database {

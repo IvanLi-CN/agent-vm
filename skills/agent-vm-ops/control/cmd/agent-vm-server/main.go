@@ -133,7 +133,7 @@ func serve(args []string) error {
 	managementStateSupported := len(release.StateReads) > 0 && len(release.StateWrites) > 0
 	lockDir := filepath.Join(cfg.StoragePath, "locks")
 	if deployd.IsServerAccount(os.Geteuid()) {
-		lockDir = filepath.Join(deployd.ServerRuntimeHome, "locks")
+		lockDir = deployd.ServerLockDir
 		if cfg.Management.Upload.Enabled {
 			cfg.Management.Upload.StagingPath = filepath.Join(deployd.ServerRuntimeHome, "image-staging")
 		}
